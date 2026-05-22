@@ -30,6 +30,18 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+def _is_k8s_status(exc: BaseException, status: int) -> bool:
+    """Duck-type a K8s API exception by `.status`.
+
+    Catching by ``ApiException`` class fails under test isolation problems —
+    if another test file replaces ``kubernetes.client.exceptions`` in
+    ``sys.modules`` after this module captured ``ApiException``, the running
+    code's class binding diverges from what tests raise. Comparing by the
+    K8s-API-error-shape attribute sidesteps the class identity hazard.
+    """
+    return getattr(exc, "status", None) == status
+
+
 class SessionRouterService:
     """Idempotent K8s Service + Ingress lifecycle for sessions."""
 
@@ -93,10 +105,12 @@ class SessionRouterService:
                     namespace=self._namespace,
                     body=self._service_body(thread_id, name, pod_name, pod_uid),
                 )
-            except ApiException as e:
-                if e.status != 409:
+            except Exception as e:
+                # 409 = a racing writer beat us; the resource exists. Anything
+                # else propagates. Duck-type on `.status` rather than the
+                # ApiException class — see _is_k8s_status docstring.
+                if not _is_k8s_status(e, 409):
                     raise
-                # 409 = a racing writer beat us. The resource exists, we're done.
 
         # Ingress
         if not await self._exists(self._networking_api.read_namespaced_ingress, name):
@@ -106,10 +120,9 @@ class SessionRouterService:
                     namespace=self._namespace,
                     body=self._ingress_body(thread_id, name, pod_name, pod_uid),
                 )
-            except ApiException as e:
-                if e.status != 409:
+            except Exception as e:
+                if not _is_k8s_status(e, 409):
                     raise
-                # 409 = a racing writer beat us. The resource exists, we're done.
 
         return f"/p/{thread_id}"
 
@@ -124,14 +137,15 @@ class SessionRouterService:
         ):
             try:
                 await self._call(delete_fn, name=name, namespace=self._namespace)
-            except ApiException as e:
-                if e.status != 404:
-                    logger.warning(
-                        "teardown_route: %s on %s returned %s",
-                        delete_fn.__name__,
-                        name,
-                        e.status,
-                    )
+            except Exception as e:
+                if _is_k8s_status(e, 404):
+                    continue
+                logger.warning(
+                    "teardown_route: %s on %s returned %s",
+                    delete_fn.__name__,
+                    name,
+                    getattr(e, "status", "?"),
+                )
 
     # --------------------------------------------------------------------- #
     # Helpers
@@ -141,8 +155,8 @@ class SessionRouterService:
         try:
             await self._call(read_fn, name=name, namespace=self._namespace)
             return True
-        except ApiException as e:
-            if e.status == 404:
+        except Exception as e:
+            if _is_k8s_status(e, 404):
                 return False
             raise
 
