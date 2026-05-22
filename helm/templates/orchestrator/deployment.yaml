@@ -262,6 +262,21 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: SRW_ACCESS_TOKEN_REFRESH_SKEW_S
+            # Session router config (docs/features/direct_session_websockets.md)
+            - name: SESSION_JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.sessionRouter.jwtSecretName | default (printf "%s-session-jwt" (include "srw.fullname" .)) }}
+                  key: jwt-secret
+                  optional: true
+            - name: SESSION_JWT_TTL_S
+              value: {{ .Values.sessionRouter.jwtTtlSeconds | default 60 | quote }}
+            - name: SESSION_INGRESS_HOST
+              value: {{ .Values.sessionRouter.ingressHost | default (printf "api.%s" .Values.global.domain) | quote }}
+            - name: SESSION_INGRESS_CLASS
+              value: {{ .Values.sessionRouter.ingressClass | default "traefik" | quote }}
+            - name: SESSION_INGRESS_NAMESPACE
+              value: {{ .Release.Namespace | quote }}
             # MCP auth
             - name: MCP_INTERNAL_KEY
               valueFrom:

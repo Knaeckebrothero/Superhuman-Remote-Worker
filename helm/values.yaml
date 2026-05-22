@@ -1021,6 +1021,32 @@ ide:
   maxConcurrentPerUser: "2"
   codeServerImage: "codercom/code-server:latest"
 
+# -----------------------------------------------------------------------------
+# Session router — Direct Session WebSockets
+# (docs/features/direct_session_websockets.md)
+# -----------------------------------------------------------------------------
+sessionRouter:
+  # Tier-1 ingress controller — tested in CI + dev cluster.
+  # nginx-ingress, HAProxy ingress, Istio Gateway are Tier-2: should work
+  # via the standard Ingress API but not exercised by the test suite.
+  ingressClass: traefik
+
+  # Hostname used in per-session Ingress rules. Defaults to api.<global.domain>
+  # when empty.
+  ingressHost: ""
+
+  # JWT signing key shared by orchestrator + agent pods. REQUIRED to enable
+  # the new flow. Leave empty during development; set in values-prod.yaml
+  # (or --set-string sessionRouter.jwtSecret=...) at install time.
+  jwtSecret: ""
+  jwtSecretName: ""  # defaults to <release>-session-jwt
+  jwtTtlSeconds: 60
+
+  # Extra annotations merged into every per-session Ingress resource.
+  # Use this for ingress-controller-specific WS tuning (e.g. nginx-ingress
+  # proxy-read-timeout).
+  annotations: {}
+
 # =============================================================================
 # NATS Messaging (optional)
 # =============================================================================
