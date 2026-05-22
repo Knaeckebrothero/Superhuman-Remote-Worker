@@ -1432,6 +1432,16 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
             return
         await handle_persistent_websocket(ws)
 
+    # External path the per-session Ingress routes to (the cockpit dials
+    # wss://api.<domain>/p/<thread_id>/ws?t=<jwt>). The {thread_id} path param
+    # is unused — the bound thread is enforced by _validate_session_token
+    # against SESSION_BOUND_THREAD_ID + the JWT's tid claim.
+    @app.websocket("/p/{thread_id}/ws")
+    async def ws_session(ws: WebSocket, thread_id: str):
+        if not await _validate_session_token(ws):
+            return
+        await handle_persistent_websocket(ws)
+
     return app
 
 
