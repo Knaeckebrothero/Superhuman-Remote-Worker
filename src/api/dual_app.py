@@ -1108,8 +1108,14 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
 
         return await pa.handle_api_approve(request)
 
-    @app.websocket("/ws/chat")
-    async def ws_chat(ws: WebSocket):
+    async def _do_ws_chat(ws: WebSocket) -> None:
+        """Shared WS handler for both /ws/chat and /p/{thread_id}/ws.
+
+        The two routes exist so the agent answers both the legacy direct path
+        (/ws/chat, used by local dev with websocat and any cluster-internal
+        callers) and the external path that the per-session Ingress forwards
+        through Traefik (/p/<thread_id>/ws — cockpit's new direct-WS path).
+        """
         global _pending_exit_task
 
         # Validate the session JWT carried as ?t={token}.
@@ -1155,5 +1161,16 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
         # docs/issues/persistent_session_dual_mode_phase1_gap.md for why
         # this delegation matters.
         await pa.handle_persistent_websocket(ws)
+
+    @app.websocket("/ws/chat")
+    async def ws_chat(ws: WebSocket):
+        await _do_ws_chat(ws)
+
+    @app.websocket("/p/{thread_id}/ws")
+    async def ws_session(ws: WebSocket, thread_id: str):
+        # thread_id is enforced by _validate_session_token against
+        # SESSION_BOUND_THREAD_ID + the JWT's tid claim — the path param is
+        # only here so the Ingress's /p/<tid>/ws path matches a FastAPI route.
+        await _do_ws_chat(ws)
 
     return app
