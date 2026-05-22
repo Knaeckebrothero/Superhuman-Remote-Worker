@@ -463,7 +463,8 @@ class NatsBridge:
         if payload_tid != subject_tid:
             logger.warning(
                 "session.events: payload tid %r != subject tid %r — dropped",
-                payload_tid, subject_tid,
+                payload_tid,
+                subject_tid,
             )
             return
 

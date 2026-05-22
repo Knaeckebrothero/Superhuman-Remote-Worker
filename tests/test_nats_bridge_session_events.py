@@ -18,18 +18,18 @@ async def test_session_event_with_matching_thread_id_broadcasts(monkeypatch):
     db.get_thread.return_value = {"id": "t1", "user_id": "u1", "agent_id": "agent-xyz"}
 
     feed = MagicMock()
-    monkeypatch.setattr(
-        "orchestrator.services.nats_bridge.notification_feed", feed
-    )
+    monkeypatch.setattr("orchestrator.services.nats_bridge.notification_feed", feed)
     bridge._db = db
 
     msg = MagicMock()
     msg.subject = "session.events.t1"
-    msg.data = json.dumps({
-        "thread_id": "t1",
-        "method": "permission.request",
-        "params": {"tool": "shell", "args": "rm -rf /"},
-    }).encode()
+    msg.data = json.dumps(
+        {
+            "thread_id": "t1",
+            "method": "permission.request",
+            "params": {"tool": "shell", "args": "rm -rf /"},
+        }
+    ).encode()
 
     await bridge._on_session_event(msg)
 
@@ -49,18 +49,18 @@ async def test_session_event_with_mismatched_thread_id_dropped(monkeypatch):
     db.get_thread.return_value = {"id": "t1", "user_id": "u1"}
 
     feed = MagicMock()
-    monkeypatch.setattr(
-        "orchestrator.services.nats_bridge.notification_feed", feed
-    )
+    monkeypatch.setattr("orchestrator.services.nats_bridge.notification_feed", feed)
     bridge._db = db
 
     msg = MagicMock()
     msg.subject = "session.events.t1"
-    msg.data = json.dumps({
-        "thread_id": "OTHER-thread",
-        "method": "permission.request",
-        "params": {},
-    }).encode()
+    msg.data = json.dumps(
+        {
+            "thread_id": "OTHER-thread",
+            "method": "permission.request",
+            "params": {},
+        }
+    ).encode()
 
     await bridge._on_session_event(msg)
 
@@ -77,9 +77,7 @@ async def test_session_event_with_unknown_thread_dropped(monkeypatch):
     db.get_thread.return_value = None
 
     feed = MagicMock()
-    monkeypatch.setattr(
-        "orchestrator.services.nats_bridge.notification_feed", feed
-    )
+    monkeypatch.setattr("orchestrator.services.nats_bridge.notification_feed", feed)
     bridge._db = db
 
     msg = MagicMock()
@@ -98,9 +96,7 @@ async def test_session_event_with_invalid_json_dropped(monkeypatch):
 
     bridge = NatsBridge(url="nats://test")
     feed = MagicMock()
-    monkeypatch.setattr(
-        "orchestrator.services.nats_bridge.notification_feed", feed
-    )
+    monkeypatch.setattr("orchestrator.services.nats_bridge.notification_feed", feed)
 
     msg = MagicMock()
     msg.subject = "session.events.t1"
@@ -117,9 +113,7 @@ async def test_session_event_with_malformed_subject_dropped(monkeypatch):
 
     bridge = NatsBridge(url="nats://test")
     feed = MagicMock()
-    monkeypatch.setattr(
-        "orchestrator.services.nats_bridge.notification_feed", feed
-    )
+    monkeypatch.setattr("orchestrator.services.nats_bridge.notification_feed", feed)
 
     msg = MagicMock()
     msg.subject = "wrong.shape"

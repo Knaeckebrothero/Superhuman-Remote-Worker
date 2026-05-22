@@ -12,6 +12,7 @@ def k8s_core_api():
     """Mock CoreV1Api with read returning 404 (resource missing) by default."""
     api = MagicMock()
     from kubernetes.client.exceptions import ApiException
+
     api.read_namespaced_service.side_effect = ApiException(status=404)
     return api
 
@@ -21,6 +22,7 @@ def k8s_networking_api():
     """Mock NetworkingV1Api with read returning 404 by default."""
     api = MagicMock()
     from kubernetes.client.exceptions import ApiException
+
     api.read_namespaced_ingress.side_effect = ApiException(status=404)
     return api
 
@@ -99,11 +101,10 @@ async def test_teardown_route_deletes_both_resources(
 
 
 @pytest.mark.asyncio
-async def test_teardown_route_swallows_404(
-    svc, k8s_core_api, k8s_networking_api
-):
+async def test_teardown_route_swallows_404(svc, k8s_core_api, k8s_networking_api):
     """Deleting a missing resource is not an error."""
     from kubernetes.client.exceptions import ApiException
+
     k8s_core_api.delete_namespaced_service.side_effect = ApiException(status=404)
     k8s_networking_api.delete_namespaced_ingress.side_effect = ApiException(status=404)
 
@@ -117,6 +118,7 @@ async def test_ensure_route_tolerates_409_on_race(
     """If a concurrent writer beats us to creating the resource, the create
     call returns 409. ensure_route must treat that as success, not raise."""
     from kubernetes.client.exceptions import ApiException
+
     # Reads still 404 (we think it doesn't exist).
     # Creates return 409 (a racing writer created it just now).
     k8s_core_api.create_namespaced_service.side_effect = ApiException(status=409)

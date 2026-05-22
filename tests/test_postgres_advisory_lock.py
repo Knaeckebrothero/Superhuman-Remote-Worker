@@ -45,7 +45,7 @@ async def test_advisory_lock_executes_correct_sql_with_derived_key():
     assert call_args.args[0] == "SELECT pg_advisory_xact_lock($1)"
     key = call_args.args[1]
     assert isinstance(key, int)
-    assert -(2**63) <= key < 2**63   # fits in signed bigint
+    assert -(2**63) <= key < 2**63  # fits in signed bigint
 
 
 @pytest.mark.asyncio
@@ -55,6 +55,7 @@ async def test_advisory_lock_key_is_stable_per_thread_id():
 
     def derive(tid: str) -> int:
         import hashlib
+
         h = hashlib.blake2b(tid.encode(), digest_size=8).digest()
         return int.from_bytes(h, byteorder="big", signed=True)
 
@@ -74,9 +75,11 @@ async def test_advisory_lock_releases_connection_on_exception():
     txn_cm.__aenter__.return_value = None
     # Track whether __aexit__ was called.
     exit_called = []
+
     async def aexit(*args, **kwargs):
         exit_called.append(args)
         return False
+
     txn_cm.__aexit__ = aexit
     conn.transaction = MagicMock(return_value=txn_cm)
 

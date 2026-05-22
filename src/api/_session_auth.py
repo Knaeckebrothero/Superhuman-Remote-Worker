@@ -62,7 +62,8 @@ async def validate_session_token(ws: WebSocket) -> bool:
     if str(claims.get("tid") or "") != bound_tid:
         logger.warning(
             "ws_chat: token tid %r != bound %r — rejecting",
-            claims.get("tid"), bound_tid,
+            claims.get("tid"),
+            bound_tid,
         )
         await ws.accept()
         await ws.close(code=4403, reason="session token mismatch")

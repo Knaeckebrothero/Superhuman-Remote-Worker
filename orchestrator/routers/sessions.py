@@ -41,6 +41,7 @@ def _get_db() -> Any:
     inside the handler body.
     """
     from main import postgres_db  # type: ignore
+
     return postgres_db
 
 
@@ -163,6 +164,7 @@ async def _do_prepare(
 
             # Create the route resource.
             from main import session_router  # type: ignore
+
             await session_router.ensure_route(
                 thread_id=thread_id,
                 pod_name=agent["hostname"],
@@ -220,6 +222,7 @@ async def _wait_for_binding(thread_id: str, timeout_s: int) -> bool:
 async def _wait_for_ready(pod_ip: str, pod_port: int, timeout_s: int) -> bool:
     """Poll the agent pod's /ready until it returns ready=true, or wall-clock timeout."""
     import httpx
+
     deadline = asyncio.get_event_loop().time() + timeout_s
     interval = 2
     while asyncio.get_event_loop().time() < deadline:
@@ -280,6 +283,7 @@ async def get_connection(
         raise HTTPException(status_code=409, detail="agent not ready")
 
     from main import session_tokens  # type: ignore
+
     token, expires_at = session_tokens.mint(
         user_id=str(user["id"]),
         thread_id=thread_id,
