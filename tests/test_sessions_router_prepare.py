@@ -16,17 +16,21 @@ def app(monkeypatch):
 
     # Override require_approved_user dependency to return a fixed user.
     from security.auth import require_approved_user
+
     app.dependency_overrides[require_approved_user] = lambda: {
-        "id": "u1", "is_approved": True
+        "id": "u1",
+        "is_approved": True,
     }
 
     fake_db = AsyncMock()
-    fake_db.get_thread = AsyncMock(return_value={
-        "id": "t1",
-        "user_id": "u1",
-        "agent_id": None,
-        "config_name": "persistent_defaults",
-    })
+    fake_db.get_thread = AsyncMock(
+        return_value={
+            "id": "t1",
+            "user_id": "u1",
+            "agent_id": None,
+            "config_name": "persistent_defaults",
+        }
+    )
     # advisory lock context manager
     lock_cm = AsyncMock()
     lock_cm.__aenter__.return_value = None
@@ -68,9 +72,7 @@ def test_prepare_returns_404_for_missing_thread(app):
 def test_prepare_returns_403_when_thread_owned_by_other_user(app):
     """POST /prepare returns 403 if caller is not the thread owner."""
     fastapi_app, fake_db = app
-    fake_db.get_thread.return_value = {
-        "id": "t1", "user_id": "OTHER", "agent_id": None
-    }
+    fake_db.get_thread.return_value = {"id": "t1", "user_id": "OTHER", "agent_id": None}
     client = TestClient(fastapi_app)
 
     resp = client.post("/api/sessions/t1/prepare", json={})
@@ -108,10 +110,12 @@ async def test_do_prepare_emits_phases_for_warm_thread(monkeypatch):
     # Mock the readiness probe to immediately return ready=true.
     async def _ready_ok(pod_ip, pod_port, timeout_s):
         return True
+
     monkeypatch.setattr(sessions_mod, "_wait_for_ready", _ready_ok, raising=True)
 
     # Mock session_router on main.
     import sys
+
     fake_main = MagicMock()
     fake_main.session_router = AsyncMock()
     fake_main.session_router.ensure_route = AsyncMock(return_value="/p/t1")
@@ -148,12 +152,17 @@ async def test_do_prepare_emits_failed_when_pod_not_ready(monkeypatch):
 
     db = AsyncMock()
     db.get_thread.return_value = {
-        "id": "t1", "user_id": "u1", "agent_id": "agent-xyz",
+        "id": "t1",
+        "user_id": "u1",
+        "agent_id": "agent-xyz",
         "config_name": "persistent_defaults",
     }
     db.get_agent.return_value = {
-        "id": "agent-xyz", "pod_ip": "10.0.0.5", "pod_port": 8001,
-        "hostname": "srw-agent-x", "pod_uid": "uid",
+        "id": "agent-xyz",
+        "pod_ip": "10.0.0.5",
+        "pod_port": 8001,
+        "hostname": "srw-agent-x",
+        "pod_uid": "uid",
     }
     lock_cm = AsyncMock()
     lock_cm.__aenter__.return_value = None
@@ -164,9 +173,11 @@ async def test_do_prepare_emits_failed_when_pod_not_ready(monkeypatch):
     # Readiness times out.
     async def _ready_timeout(pod_ip, pod_port, timeout_s):
         return False
+
     monkeypatch.setattr(sessions_mod, "_wait_for_ready", _ready_timeout, raising=True)
 
     import sys
+
     fake_main = MagicMock()
     fake_main.session_router = AsyncMock()
     fake_main.session_router.ensure_route = AsyncMock()
@@ -176,8 +187,10 @@ async def test_do_prepare_emits_failed_when_pod_not_ready(monkeypatch):
     monkeypatch.setattr(sessions_mod, "notification_feed", feed, raising=True)
 
     await sessions_mod._do_prepare(
-        thread_id="t1", user_id="u1",
-        config_name="persistent_defaults", config_override=None,
+        thread_id="t1",
+        user_id="u1",
+        config_name="persistent_defaults",
+        config_override=None,
     )
 
     states = [call.args[2]["state"] for call in feed.broadcast.call_args_list]
@@ -200,12 +213,15 @@ def test_connection_returns_ws_url_and_token_when_ready(monkeypatch):
 
     app = FastAPI()
     app.dependency_overrides[require_approved_user] = lambda: {
-        "id": "u1", "is_approved": True
+        "id": "u1",
+        "is_approved": True,
     }
 
     fake_db = AsyncMock()
     fake_db.get_thread.return_value = {
-        "id": "t1", "user_id": "u1", "agent_id": "agent-xyz",
+        "id": "t1",
+        "user_id": "u1",
+        "agent_id": "agent-xyz",
     }
     fake_db.get_agent.return_value = {
         "id": "agent-xyz",
@@ -215,11 +231,13 @@ def test_connection_returns_ws_url_and_token_when_ready(monkeypatch):
         "hostname": "srw-agent-x",
     }
     from orchestrator.routers import sessions as sessions_mod
+
     monkeypatch.setattr(sessions_mod, "_get_db", lambda: fake_db, raising=False)
 
     # Inject a real SessionTokenService that the endpoint can use.
     test_tokens = SessionTokenService(secret="test-secret-do-not-use", ttl_seconds=60)
     import sys
+
     fake_main = MagicMock()
     fake_main.session_tokens = test_tokens
     monkeypatch.setitem(sys.modules, "main", fake_main)
@@ -245,12 +263,14 @@ def test_connection_returns_425_when_thread_unbound(monkeypatch):
 
     app = FastAPI()
     app.dependency_overrides[require_approved_user] = lambda: {
-        "id": "u1", "is_approved": True
+        "id": "u1",
+        "is_approved": True,
     }
 
     fake_db = AsyncMock()
     fake_db.get_thread.return_value = {"id": "t1", "user_id": "u1", "agent_id": None}
     from orchestrator.routers import sessions as sessions_mod
+
     monkeypatch.setattr(sessions_mod, "_get_db", lambda: fake_db, raising=False)
 
     app.include_router(sessions_router)
@@ -267,11 +287,13 @@ def test_connection_returns_404_for_missing_thread(monkeypatch):
 
     app = FastAPI()
     app.dependency_overrides[require_approved_user] = lambda: {
-        "id": "u1", "is_approved": True
+        "id": "u1",
+        "is_approved": True,
     }
     fake_db = AsyncMock()
     fake_db.get_thread.return_value = None
     from orchestrator.routers import sessions as sessions_mod
+
     monkeypatch.setattr(sessions_mod, "_get_db", lambda: fake_db, raising=False)
 
     app.include_router(sessions_router)
@@ -288,13 +310,17 @@ def test_connection_returns_403_when_other_user(monkeypatch):
 
     app = FastAPI()
     app.dependency_overrides[require_approved_user] = lambda: {
-        "id": "u1", "is_approved": True
+        "id": "u1",
+        "is_approved": True,
     }
     fake_db = AsyncMock()
     fake_db.get_thread.return_value = {
-        "id": "t1", "user_id": "OTHER", "agent_id": "agent-xyz",
+        "id": "t1",
+        "user_id": "OTHER",
+        "agent_id": "agent-xyz",
     }
     from orchestrator.routers import sessions as sessions_mod
+
     monkeypatch.setattr(sessions_mod, "_get_db", lambda: fake_db, raising=False)
 
     app.include_router(sessions_router)
@@ -312,16 +338,22 @@ def test_connection_returns_409_when_agent_not_ready(monkeypatch):
 
     app = FastAPI()
     app.dependency_overrides[require_approved_user] = lambda: {
-        "id": "u1", "is_approved": True
+        "id": "u1",
+        "is_approved": True,
     }
     fake_db = AsyncMock()
     fake_db.get_thread.return_value = {
-        "id": "t1", "user_id": "u1", "agent_id": "agent-xyz",
+        "id": "t1",
+        "user_id": "u1",
+        "agent_id": "agent-xyz",
     }
     fake_db.get_agent.return_value = {
-        "id": "agent-xyz", "pod_ip": None, "status": "booting",
+        "id": "agent-xyz",
+        "pod_ip": None,
+        "status": "booting",
     }
     from orchestrator.routers import sessions as sessions_mod
+
     monkeypatch.setattr(sessions_mod, "_get_db", lambda: fake_db, raising=False)
 
     app.include_router(sessions_router)

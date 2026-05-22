@@ -237,15 +237,13 @@ class TestInlinePrivilegeGates:
         full-access tokens) returns silently. This test catches that.
         """
         main_py = (
-            pathlib.Path(__file__).resolve().parents[1]
-            / "orchestrator"
-            / "main.py"
+            pathlib.Path(__file__).resolve().parents[1] / "orchestrator" / "main.py"
         ).read_text()
 
         # Locate the endpoint body
         marker = "async def create_mcp_token("
         assert marker in main_py, "Endpoint signature changed — update test"
-        body = main_py[main_py.index(marker):]
+        body = main_py[main_py.index(marker) :]
         # The privilege gate sits within the first ~50 lines
         gate_window = body[: body.index("\n@app.")]
 
@@ -269,18 +267,20 @@ class TestInlinePrivilegeGates:
         a partial revert (one fixed, one not) is caught.
         """
         main_py = (
-            pathlib.Path(__file__).resolve().parents[1]
-            / "orchestrator"
-            / "main.py"
+            pathlib.Path(__file__).resolve().parents[1] / "orchestrator" / "main.py"
         ).read_text()
 
         marker = "async def create_api_key("
         assert marker in main_py, "Endpoint signature changed — update test"
-        body = main_py[main_py.index(marker):]
+        body = main_py[main_py.index(marker) :]
         gate_window = body[: body.index("\n@app.")]
 
         gate_line = next(
-            (line for line in gate_window.splitlines() if '"admin" in requested' in line),
+            (
+                line
+                for line in gate_window.splitlines()
+                if '"admin" in requested' in line
+            ),
             None,
         )
         assert gate_line is not None, (

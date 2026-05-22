@@ -136,13 +136,15 @@ _nats_client = None  # Lazily initialized.
 # Methods that the orchestrator's nats_bridge subscribes to and forwards
 # to the SSE notification feed. Keep in sync with the event_type_map in
 # orchestrator/services/nats_bridge.py:_on_session_event.
-_NOTIFICATION_METHODS = frozenset({
-    "permission.request",
-    "vm_upgrade.needed",
-    "approve",
-    "deny",
-    "ready",
-})
+_NOTIFICATION_METHODS = frozenset(
+    {
+        "permission.request",
+        "vm_upgrade.needed",
+        "approve",
+        "deny",
+        "ready",
+    }
+)
 
 
 async def _ensure_nats_client():
@@ -155,6 +157,7 @@ async def _ensure_nats_client():
         return None
     try:
         import nats
+
         _nats_client = await nats.connect(url)
         return _nats_client
     except Exception as e:
