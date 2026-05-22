@@ -110,6 +110,19 @@ type PermissionMode = 'supervised' | 'auto_accept' | 'autonomous';
 export type NarrationMode = 'silent' | 'verbose' | 'auto';
 
 /**
+ * Response payload for ``GET /api/sessions/{thread_id}/connection`` — the
+ * canonical WS URL + JWT for a bound session. The cockpit dials the WS at
+ * `ws_url` directly (routed to the agent pod by the orchestrator's edge
+ * proxy). See orchestrator/routers/sessions.py for the response shape.
+ */
+interface ConnectionPayload {
+    state: 'ready';
+    ws_url: string;
+    token: string;
+    expires_at: number;
+}
+
+/**
  * Persistent agent session client. See file header for transport rationale.
  *
  * All state is exposed as Angular signals for reactive UI updates.
@@ -247,6 +260,13 @@ export class PersistentChatService {
     private controlWsReconnectTimer: ReturnType<typeof setTimeout> | null = null;
     private controlWsReconnectAttempt = 0;
     private intentionalClose = false;
+    /**
+     * Guard against double-opening the control WS while an async
+     * /connection (or /prepare → SSE ready → /connection) fetch is in
+     * flight. Distinct from `controlWs` (which is null during the fetch
+     * window — _ensureControlWs() must not race past).
+     */
+    private controlWsOpening = false;
 
     /**
      * Connect to a persistent agent session.
@@ -287,7 +307,7 @@ export class PersistentChatService {
 
         this.intentionalClose = false;
         await this._openSse(threadId);
-        this._openControlWs(threadId);
+        await this._openControlWs(threadId);
     }
 
     /**
@@ -558,16 +578,150 @@ export class PersistentChatService {
 
     // ── Control WS (slash commands + permission decisions) ───────────────
 
-    private _openControlWs(threadId: string): void {
-        const apiUrl = environment.apiUrl;
-        const wsBase = apiUrl.replace(/\/api\/?$/, '').replace(/^http/, 'ws');
-        const url = `${wsBase}/ws/persistent/${threadId}`;
+    /**
+     * Resolve the canonical WS URL + token for the session via the
+     * orchestrator REST endpoints (Tasks 6 + 7), then open the WebSocket.
+     *
+     * Two REST steps, joined by the SSE notification feed:
+     *
+     *   1. GET /api/sessions/{tid}/connection
+     *      → 200 (ready): {ws_url, token, expires_at}. Open WS directly.
+     *      → 425 (not bound yet): cold start, fall through to step 2.
+     *
+     *   2. POST /api/sessions/{tid}/prepare → 202 {state: provisioning}
+     *      → wait for `session.lifecycle` SSE event with state=ready
+     *      → GET /connection again, then open WS.
+     *
+     * Errors here are swallowed: the WS open is best-effort (the SSE
+     * receive path is the primary signal). User-initiated commands that
+     * need the WS will reopen via _ensureControlWs() on demand.
+     */
+    private async _openControlWs(threadId: string): Promise<void> {
+        if (this.controlWsOpening) return;
+        this.controlWsOpening = true;
+        try {
+            const connection = await this._resolveConnection(threadId);
+            if (this.intentionalClose || this.threadId() !== threadId) return;
+            this._installControlWs(threadId, connection.ws_url);
+        } catch {
+            // Resolution failed — leave controlWs null; _ensureControlWs
+            // (driven by user clicks) or the reconnect loop will retry.
+            if (!this.intentionalClose && this.threadId() === threadId) {
+                this._scheduleControlWsReconnect(threadId);
+            }
+        } finally {
+            this.controlWsOpening = false;
+        }
+    }
 
-        this.controlWs = new WebSocket(url);
-        this.controlWs.onclose = () => {
+    /**
+     * Resolve the {ws_url, token} for a thread. Drives the cold-start
+     * (prepare + lifecycle) path when /connection returns 425.
+     */
+    private async _resolveConnection(threadId: string): Promise<ConnectionPayload> {
+        try {
+            return await this._fetchConnection(threadId);
+        } catch (err: any) {
+            if (err?.status !== 425) throw err;
+            // Not bound yet — cold start.
+            await this._waitForLifecycleReady(threadId, async () => {
+                await firstValueFrom(
+                    this.http.post<{ state: string }>(
+                        `${environment.apiUrl}/sessions/${threadId}/prepare`,
+                        {},
+                    ),
+                );
+            });
+            return await this._fetchConnection(threadId);
+        }
+    }
+
+    private async _fetchConnection(threadId: string): Promise<ConnectionPayload> {
+        return await firstValueFrom(
+            this.http.get<ConnectionPayload>(
+                `${environment.apiUrl}/sessions/${threadId}/connection`,
+            ),
+        );
+    }
+
+    /**
+     * Open a transient SSE on `/notifications/events`, kick off the
+     * provided action (typically the POST /prepare), and resolve when the
+     * `session.lifecycle` event with `state="ready"` arrives for this
+     * thread. Rejects on `state="failed"`. Always closes the SSE before
+     * returning so it doesn't leak past the cold-start window.
+     */
+    private _waitForLifecycleReady(
+        threadId: string,
+        kickOff: () => Promise<void>,
+    ): Promise<void> {
+        return new Promise<void>((resolve, reject) => {
+            const lifecycleEs = new EventSource(
+                `${environment.apiUrl}/notifications/events`,
+                {withCredentials: true},
+            );
+            let settled = false;
+            const cleanup = () => {
+                if (settled) return;
+                settled = true;
+                try {
+                    lifecycleEs.close();
+                } catch {
+                    // ignore
+                }
+            };
+            lifecycleEs.onmessage = (event: MessageEvent) => {
+                let data: any;
+                try {
+                    data = JSON.parse(event.data);
+                } catch {
+                    return;
+                }
+                if (data?.type !== 'session.lifecycle') return;
+                if (data.thread_id !== threadId) return;
+                if (data.state === 'ready') {
+                    cleanup();
+                    resolve();
+                } else if (data.state === 'failed') {
+                    cleanup();
+                    reject(new Error(data.reason || 'session preparation failed'));
+                } else if (typeof data.state === 'string') {
+                    // Render provisioning/booting in the startup card.
+                    this.zone.run(() => this.startupPhase.set(data.state));
+                }
+            };
+            lifecycleEs.onerror = () => {
+                // Transient browser-side retry is fine — only treat closed as
+                // fatal so we don't leak the EventSource on auth failure.
+                if (lifecycleEs.readyState === EventSource.CLOSED) {
+                    cleanup();
+                    reject(new Error('notification feed closed'));
+                }
+            };
+            // Fire the kick-off action after the EventSource is constructed so
+            // we don't miss the first emission. Even if `ready` arrives
+            // synchronously (test scenario) we'll catch it via the onmessage
+            // handler installed above.
+            kickOff().catch((e) => {
+                cleanup();
+                reject(e);
+            });
+        });
+    }
+
+    private _installControlWs(threadId: string, wsUrl: string): void {
+        this.controlWs = new WebSocket(wsUrl);
+        this.controlWs.onclose = (event: CloseEvent) => {
             this.controlWs = null;
             if (this.intentionalClose) return;
             if (this.threadId() !== threadId) return;
+            // 4401 = expired/invalid token (Task 8). The agent is still
+            // bound — just need a fresh token. Skip /prepare and re-fetch
+            // /connection directly.
+            if ((event && (event as CloseEvent).code) === 4401) {
+                void this._reopenWithFreshToken(threadId);
+                return;
+            }
             // Tiny linear backoff — primary connection signal lives on the SSE
             // so we don't need the WS aggressively reconnecting.
             this._scheduleControlWsReconnect(threadId);
@@ -607,6 +761,27 @@ export class PersistentChatService {
         };
     }
 
+    /**
+     * Re-fetch /connection (skip /prepare — the agent is still bound) and
+     * reopen the control WS with the fresh token. Triggered by a 4401
+     * close on the WS.
+     */
+    private async _reopenWithFreshToken(threadId: string): Promise<void> {
+        if (this.controlWsOpening) return;
+        this.controlWsOpening = true;
+        try {
+            const connection = await this._fetchConnection(threadId);
+            if (this.intentionalClose || this.threadId() !== threadId) return;
+            this._installControlWs(threadId, connection.ws_url);
+        } catch {
+            if (!this.intentionalClose && this.threadId() === threadId) {
+                this._scheduleControlWsReconnect(threadId);
+            }
+        } finally {
+            this.controlWsOpening = false;
+        }
+    }
+
     private _scheduleControlWsReconnect(threadId: string): void {
         if (this.controlWsReconnectAttempt >= CONTROL_WS_RECONNECT_MAX_ATTEMPTS) {
             // Give up silently; user actions that need the WS will reopen
@@ -620,7 +795,7 @@ export class PersistentChatService {
             this.controlWsReconnectTimer = null;
             if (this.intentionalClose) return;
             if (this.threadId() !== threadId) return;
-            this._openControlWs(threadId);
+            void this._openControlWs(threadId);
         }, delay);
     }
 
@@ -632,8 +807,9 @@ export class PersistentChatService {
         if (!tid) return;
         if (this.controlWs?.readyState === WebSocket.OPEN) return;
         if (this.controlWs?.readyState === WebSocket.CONNECTING) return;
+        if (this.controlWsOpening) return;
         this.controlWsReconnectAttempt = 0;
-        this._openControlWs(tid);
+        void this._openControlWs(tid);
     }
 
     /** Send a control-plane command. If the WS isn't open, open it; the
