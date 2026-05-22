@@ -287,6 +287,61 @@ GITEA_OIDC_CLIENT_SECRET=<random 32-char string>   # Gitea ↔ bundled Keycloak
 OPENCLOUD_KEYCLOAK_CLIENT_SECRET=<random 32-char string>   # OpenCloud ↔ bundled Keycloak
 CLOUD_SERVICE_USER=srw-agent
 CLOUD_SERVICE_PASSWORD=<random 32-char string>
+
+# --- Stubs: keys the chart's pods reference unconditionally ------------------
+# The chart's pod templates read these keys via `secretKeyRef` without
+# `optional: true` and without an enclosing `{{ if .Values.X.enabled }}`
+# guard. The keys must therefore EXIST in the Secret or pods fail to start
+# with `couldn't find key X in Secret srw/srw-secrets`. Empty values are
+# valid — the underlying features stay off because the corresponding
+# `*.enabled` knobs in §6 are off. This is a chart gap; expect these to be
+# either gated or marked `optional: true` in a future chart release.
+
+# Email — orchestrator + Keycloak read SMTP_USER/SMTP_PASSWORD unconditionally
+SMTP_USER=
+SMTP_PASSWORD=
+IMAP_USER=
+IMAP_PASSWORD=
+MAIL_DOMAIN=
+
+# pgadmin OIDC — Keycloak realm bootstrap references it even when pgadmin.enabled=false
+PGADMIN_OIDC_CLIENT_SECRET=
+
+# Nextcloud — orchestrator references these keys (we run OpenCloud, not Nextcloud)
+NEXTCLOUD_ADMIN_USER=
+NEXTCLOUD_ADMIN_PASSWORD=
+NEXTCLOUD_AGENT_USER=
+NEXTCLOUD_AGENT_PASSWORD=
+NEXTCLOUD_OIDC_CLIENT_SECRET=
+NEXTCLOUD_S3_ACCESS_KEY=
+NEXTCLOUD_S3_SECRET_KEY=
+
+# Object storage — orchestrator references these (S3 backend off in this install)
+S3_ACCESS_KEY=
+S3_SECRET_KEY=
+
+# WebDAV default datasource — orchestrator references these
+DEFAULT_DS_WEBDAV_USERNAME=
+DEFAULT_DS_WEBDAV_PASSWORD=
+
+# Notifications — orchestrator references all of these
+SLACK_WEBHOOK_URL=
+DISCORD_WEBHOOK_URL=
+NTFY_URL=
+NTFY_TOPIC=
+NTFY_TOKEN=
+
+# MCP — orchestrator + Keycloak reference these (mcp.enabled=false in this install)
+MCP_OIDC_CLIENT_SECRET=
+MCP_INTERNAL_KEY=
+
+# Codex proxy — orchestrator references (codexProxy.enabled=false)
+CODEX_MANAGEMENT_KEY=
+
+# Keycloak bootstrap Job — realm-init container reads these
+KC_ADMIN_USER=
+KC_ADMIN_PASSWORD=
+KC_CLIENT_SECRET=
 ```
 
 > The chart auto-provisions the bundled Keycloak's realm, the Gitea OAuth
@@ -595,23 +650,43 @@ sudo /usr/local/bin/k3s-uninstall.sh
 
 ## 14. Secret schema (this install)
 
+The table below uses three values in the **Required** column:
+
+- **value** — key must be present **and non-empty**. Pods fail closed if the
+  value is missing.
+- **key-only** — key must **exist in the Secret** but the value can be an
+  empty string. The chart's pod templates read these via `secretKeyRef`
+  without `optional: true`, so kubelet rejects pod startup if the key is
+  absent. The feature itself stays off as long as the matching `*.enabled`
+  knob in §6 is off. (Chart gap; tracked for a future release.)
+- **omittable** — chart marks the `secretKeyRef` `optional: true`. Safe to
+  omit the key entirely.
+
 | Key | Required | Notes |
 |---|---|---|
-| `APP_ENCRYPTION_KEY` | always | base64 32 bytes. Loss = unrecoverable encrypted credentials |
-| `POSTGRES_USER` / `POSTGRES_PASSWORD` | always | bundled Postgres |
-| `VECTOR_POSTGRES_USER` / `VECTOR_POSTGRES_PASSWORD` | always | bundled pgvector |
-| `KEYCLOAK_ADMIN_USER` / `KEYCLOAK_ADMIN_PASSWORD` | always | bundled Keycloak admin login |
-| `KC_DB_PASSWORD` | always | Keycloak's dedicated Postgres |
-| `KC_REALM_ADMIN_PASSWORD` | always | realm-level admin (for kcadm bootstrap) |
-| `GITEA_ADMIN_USER` / `GITEA_ADMIN_PASSWORD` | always | bundled Gitea admin login |
-| `GITEA_OIDC_CLIENT_SECRET` | always | Gitea ↔ Keycloak OAuth |
-| `OPENCLOUD_KEYCLOAK_CLIENT_SECRET` | always | OpenCloud ↔ Keycloak OAuth |
-| `CLOUD_SERVICE_USER` / `CLOUD_SERVICE_PASSWORD` | always | agent's account on OpenCloud |
-| `MCP_OIDC_CLIENT_SECRET` | only if `mcp.enabled=true` | |
-| `NEO4J_USERNAME` / `NEO4J_PASSWORD` | only if `neo4j.enabled=true` | no `/` in the password |
-| `SMTP_HOST` / `SMTP_PORT` / `SMTP_USER` / `SMTP_PASSWORD` / `SMTP_FROM` | only if email features enabled | trivial to wire in if mailcow is reachable |
-| `NTFY_URL` / `NTFY_TOPIC` / `NTFY_TOKEN` | optional | push notifications |
-| `DISCORD_WEBHOOK_URL` / `SLACK_WEBHOOK_URL` | optional | chat notifications |
+| `APP_ENCRYPTION_KEY` | value | base64 32 bytes. Loss = unrecoverable encrypted credentials |
+| `POSTGRES_USER` / `POSTGRES_PASSWORD` | value | bundled Postgres |
+| `VECTOR_POSTGRES_USER` / `VECTOR_POSTGRES_PASSWORD` | value | bundled pgvector |
+| `KEYCLOAK_ADMIN_USER` / `KEYCLOAK_ADMIN_PASSWORD` | value | bundled Keycloak admin login |
+| `KC_DB_PASSWORD` | value | Keycloak's dedicated Postgres |
+| `KC_REALM_ADMIN_PASSWORD` | value | realm-level admin (for kcadm bootstrap) |
+| `GITEA_ADMIN_USER` / `GITEA_ADMIN_PASSWORD` | value | bundled Gitea admin login |
+| `GITEA_OIDC_CLIENT_SECRET` | value | Gitea ↔ Keycloak OAuth |
+| `OPENCLOUD_KEYCLOAK_CLIENT_SECRET` | value | OpenCloud ↔ Keycloak OAuth |
+| `CLOUD_SERVICE_USER` / `CLOUD_SERVICE_PASSWORD` | value | agent's account on OpenCloud |
+| `SMTP_USER` / `SMTP_PASSWORD` | key-only | orchestrator + Keycloak read these regardless of email config. Set values to wire SMTP. |
+| `IMAP_USER` / `IMAP_PASSWORD` | key-only | orchestrator reads these regardless of inbound-email config |
+| `MAIL_DOMAIN` | key-only | orchestrator reads it regardless of email config |
+| `PGADMIN_OIDC_CLIENT_SECRET` | key-only | Keycloak realm bootstrap reads it even when `pgadmin.enabled=false` |
+| `NEXTCLOUD_ADMIN_USER` / `NEXTCLOUD_ADMIN_PASSWORD` / `NEXTCLOUD_AGENT_USER` / `NEXTCLOUD_AGENT_PASSWORD` / `NEXTCLOUD_OIDC_CLIENT_SECRET` / `NEXTCLOUD_S3_ACCESS_KEY` / `NEXTCLOUD_S3_SECRET_KEY` | key-only | orchestrator references these; we run OpenCloud not Nextcloud |
+| `S3_ACCESS_KEY` / `S3_SECRET_KEY` | key-only | orchestrator references these; S3 backend off in this install |
+| `DEFAULT_DS_WEBDAV_USERNAME` / `DEFAULT_DS_WEBDAV_PASSWORD` | key-only | orchestrator references; off by default |
+| `SLACK_WEBHOOK_URL` / `DISCORD_WEBHOOK_URL` / `NTFY_URL` / `NTFY_TOPIC` / `NTFY_TOKEN` | key-only | orchestrator references all of them; populate to enable the corresponding channel |
+| `MCP_OIDC_CLIENT_SECRET` / `MCP_INTERNAL_KEY` | key-only | required keys for MCP wiring even when `mcp.enabled=false`. Set values when enabling MCP. |
+| `CODEX_MANAGEMENT_KEY` | key-only | orchestrator references it even when `codexProxy.enabled=false` |
+| `KC_ADMIN_USER` / `KC_ADMIN_PASSWORD` / `KC_CLIENT_SECRET` | key-only | Keycloak bootstrap Job reads these |
+| `NEO4J_USERNAME` / `NEO4J_PASSWORD` | value (only if `neo4j.enabled=true`) | no `/` in the password — `NEO4J_AUTH` is split on the first slash |
+| `SMTP_HOST` / `SMTP_PORT` / `SMTP_FROM` / `SMTP_USE_TLS` / `SMTP_TRUST_SELF_SIGNED` | omittable | sourced from values.yaml `email.smtp.*` rather than the Secret |
 
 **Not in the Secret** (configured post-install via Admin UI, stored
 encrypted in DB): `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GROQ_API_KEY`,

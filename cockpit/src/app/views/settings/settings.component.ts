@@ -680,6 +680,9 @@ const EXPIRY_OPTIONS = [
                 <option value="365">{{ 'settings.mcp.expiry365' | transloco }}</option>
               </app-select>
             </div>
+            @if (createError(); as err) {
+              <p class="form-error" role="alert">{{ err }}</p>
+            }
             <app-button
               variant="primary"
               size="md"
@@ -1514,6 +1517,7 @@ export class SettingsComponent implements OnInit {
     return v == null ? '' : String(v);
   });
   readonly creating = signal(false);
+  readonly createError = signal<string | null>(null);
   readonly newToken = signal<McpTokenCreateResponse | null>(null);
   readonly copied = signal(false);
   readonly snippetCopied = signal(false);
@@ -2074,6 +2078,7 @@ export class SettingsComponent implements OnInit {
     const name = this.newName().trim();
     if (!name) return;
     this.creating.set(true);
+    this.createError.set(null);
     this.newToken.set(null);
     this.copied.set(false);
 
@@ -2089,7 +2094,12 @@ export class SettingsComponent implements OnInit {
           this.newName.set('');
           this.creating.set(false);
         },
-        error: () => this.creating.set(false),
+        error: (err) => {
+          this.creating.set(false);
+          const detail =
+            (err?.error?.detail as string | undefined) ?? 'Create failed';
+          this.createError.set(detail);
+        },
       });
   }
 
