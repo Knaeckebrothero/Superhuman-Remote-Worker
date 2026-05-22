@@ -913,40 +913,27 @@ export class PersistentChatService {
     /**
      * Resume an ended session and reconnect.
      *
-     * Two endpoints, one SSE-driven progress feed:
-     *
-     *   - POST /persistent/threads/{tid}/resume — required for ended threads:
-     *     flips status from 'ended' → 'created', clears the stale agent_id,
-     *     and kicks off a background reprovision. Idempotent under the
-     *     per-thread advisory lock.
-     *   - POST /sessions/{tid}/prepare — the canonical lifecycle-event source.
-     *     Runs in parallel with /resume; whichever path acquires the lock
-     *     first does the actual provisioning, the other observes the binding
-     *     and emits "ready".
-     *
-     * Both endpoints are kicked off inside `_waitForLifecycleReady` so the
-     * notification-feed SSE is already open before the first emit. /prepare
-     * always emits "provisioning" up-front, so the resume card shows the
-     * full provisioning → booting → ready sequence regardless of which
-     * background task wins the race.
+     * /resume is required for ended threads — it flips status from 'ended'
+     * → 'created' and clears the stale agent_id, kicking off a background
+     * reprovision. From there we just call `connect()`, which routes through
+     * `_openControlWs → _resolveConnection`: a `GET /connection` 425 falls
+     * through to `_waitForLifecycleReady` driving `POST /prepare` against
+     * the lifecycle SSE feed. The advisory lock in the orchestrator
+     * serialises /resume's reprovision with /prepare's _do_prepare so we
+     * don't double-provision (docs/issues/persistent_thread_double_provisioning_race.md).
      */
     async resumeSession(): Promise<void> {
         const threadId = this.threadId();
         if (!threadId) return;
         this.isSessionPaused.set(false);
         try {
-            await this._waitForLifecycleReady(threadId, async () => {
-                await firstValueFrom(
-                    this.http.post(`${environment.apiUrl}/persistent/threads/${threadId}/resume`, {})
-                );
-                await firstValueFrom(
-                    this.http.post(`${environment.apiUrl}/sessions/${threadId}/prepare`, {})
-                );
-            });
+            await firstValueFrom(
+                this.http.post(`${environment.apiUrl}/persistent/threads/${threadId}/resume`, {})
+            );
         } catch (err) {
-            // _waitForLifecycleReady rejects on state=failed or transport
-            // error. Fall through to connect() — _resolveConnection will
-            // surface a useful error if the session can't actually open.
+            // /resume may 409 if the thread isn't actually 'ended' (e.g. a
+            // double-click). Fall through to connect() either way — its
+            // cold-start path is self-healing.
         }
         await this.connect(threadId);
     }
