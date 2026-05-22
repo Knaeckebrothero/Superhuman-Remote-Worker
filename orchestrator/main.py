@@ -10414,15 +10414,52 @@ async def register_agent(
             build_sha=registration.build_sha,
             pod_uid=registration.pod_uid,
         )
-        # Bind persistent agent to its thread
+        # Bind persistent agent to its thread. Defense-in-depth against the
+        # double-provisioning race (docs/issues/persistent_thread_double_provisioning_race.md):
+        # take the per-thread advisory lock and refuse the bind if a *different*
+        # live agent already owns this thread — turns a silent overwrite into
+        # a loud 409 the orphan pod can react to by shutting down.
         if registration.agent_mode == "persistent" and registration.thread_id:
-            try:
-                await postgres_db.update_thread_agent(
-                    registration.thread_id, result["agent_id"]
-                )
-            except Exception as bind_err:
-                logger.warning(f"Thread binding failed (non-fatal): {bind_err}")
+            new_id = str(result["agent_id"])
+            async with postgres_db.thread_advisory_lock(registration.thread_id):
+                thread = await postgres_db.get_thread(registration.thread_id)
+                existing_id = thread.get("agent_id") if thread else None
+                if existing_id and str(existing_id) != new_id:
+                    existing = await postgres_db.get_agent(str(existing_id))
+                    existing_status = (existing or {}).get("status")
+                    if existing and existing_status not in (
+                        None,
+                        "offline",
+                        "failed",
+                    ):
+                        logger.warning(
+                            "register_agent: duplicate persistent registration "
+                            "for thread %s; winner=%s loser=%s — refusing.",
+                            registration.thread_id,
+                            existing_id,
+                            new_id,
+                        )
+                        try:
+                            await postgres_db.delete_agent(new_id)
+                        except Exception as del_err:
+                            logger.warning(
+                                "register_agent: failed to roll back loser %s: %s",
+                                new_id,
+                                del_err,
+                            )
+                        raise HTTPException(
+                            status_code=409,
+                            detail="thread already bound to another live agent",
+                        )
+                try:
+                    await postgres_db.update_thread_agent(
+                        registration.thread_id, new_id
+                    )
+                except Exception as bind_err:
+                    logger.warning(f"Thread binding failed (non-fatal): {bind_err}")
         return AgentRegistrationResponse(**result)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
@@ -11701,41 +11738,57 @@ async def create_thread(
                 pids: list,
                 ds_ids: list[str] | None,
             ) -> None:
-                # Try to attach an idle dual-mode agent from the warm pool
-                # first — this is instant (no image pull or pod boot needed).
-                idle_agent = await _find_idle_persistent_agent()
-                if idle_agent:
-                    resolved_ds = await postgres_db.resolve_datasources_for_thread(
-                        datasource_ids=ds_ids, project_ids=pids
-                    )
-                    ds_payload = _build_datasources_payload(resolved_ds)
-                    attach_co = co
-                    if resolved_ds:
-                        attach_co = _build_datasource_tool_override(resolved_ds, co)
-                    ok = await _send_session_attach(
-                        idle_agent, tid, attach_co, pids, datasources=ds_payload
-                    )
-                    if ok:
+                # Serialise concurrent provisioning attempts for the same
+                # thread (docs/issues/persistent_thread_double_provisioning_race.md).
+                # Re-check `agent_id` inside the lock: another path (or a
+                # retry of this one) may have already bound an agent while
+                # we waited.
+                async with postgres_db.thread_advisory_lock(tid):
+                    cur = await postgres_db.get_thread(tid)
+                    if cur and cur.get("agent_id"):
                         logger.info(
-                            "Thread %s: attached to idle pool agent %s",
+                            "Thread %s: already bound to agent %s — "
+                            "skipping duplicate provision.",
                             tid,
-                            idle_agent["hostname"],
+                            cur["agent_id"],
                         )
                         return
 
-                # No idle agent available — create a dedicated session pod.
-                pod_name = await agent_provisioner.provision_agent(
-                    purpose="session", thread_id=tid, config_name=cfg
-                )
-                if pod_name:
-                    return
+                    # Try to attach an idle dual-mode agent from the warm pool
+                    # first — this is instant (no image pull or pod boot needed).
+                    idle_agent = await _find_idle_persistent_agent()
+                    if idle_agent:
+                        resolved_ds = await postgres_db.resolve_datasources_for_thread(
+                            datasource_ids=ds_ids, project_ids=pids
+                        )
+                        ds_payload = _build_datasources_payload(resolved_ds)
+                        attach_co = co
+                        if resolved_ds:
+                            attach_co = _build_datasource_tool_override(resolved_ds, co)
+                        ok = await _send_session_attach(
+                            idle_agent, tid, attach_co, pids, datasources=ds_payload
+                        )
+                        if ok:
+                            logger.info(
+                                "Thread %s: attached to idle pool agent %s",
+                                tid,
+                                idle_agent["hostname"],
+                            )
+                            return
 
-                logger.error(
-                    "Thread %s: no idle agents and pod provisioning failed. "
-                    "Check image availability, RBAC, node resources, "
-                    "or increase MAX_AGENTS.",
-                    tid,
-                )
+                    # No idle agent available — create a dedicated session pod.
+                    pod_name = await agent_provisioner.provision_agent(
+                        purpose="session", thread_id=tid, config_name=cfg
+                    )
+                    if pod_name:
+                        return
+
+                    logger.error(
+                        "Thread %s: no idle agents and pod provisioning failed. "
+                        "Check image availability, RBAC, node resources, "
+                        "or increase MAX_AGENTS.",
+                        tid,
+                    )
 
             asyncio.create_task(
                 _provision_or_assign(
@@ -12219,44 +12272,62 @@ async def resume_thread(
         config_name = thread.get("config_name", "persistent_defaults")
 
         async def _reprovision(tid: str, cfg: str) -> None:
-            # Try idle pool agent first (instant attach, no pod boot).
-            idle_agent = await _find_idle_persistent_agent()
-            if idle_agent:
-                co = thread.get("config_override") or {}
-                if isinstance(co, str):
-                    try:
-                        co = json.loads(co)
-                    except (json.JSONDecodeError, TypeError):
-                        co = {}
-                pids = thread.get("project_ids") or []
-                resolved_ds = await postgres_db.resolve_datasources_for_thread(
-                    project_ids=pids
-                )
-                ds_payload = _build_datasources_payload(resolved_ds)
-                if resolved_ds:
-                    co = _build_datasource_tool_override(resolved_ds, co)
-                ok = await _send_session_attach(
-                    idle_agent, tid, co, pids, datasources=ds_payload
-                )
-                if ok:
+            # Serialise concurrent provisioning attempts for the same
+            # thread (docs/issues/persistent_thread_double_provisioning_race.md).
+            # A concurrent /prepare or /resume on the same thread blocks
+            # here; the second arrival observes the binding written by
+            # the first and exits. Lifecycle SSE events for the cockpit's
+            # resume progress card come from /api/sessions/{tid}/prepare,
+            # which the cockpit drives in parallel with this endpoint.
+            async with postgres_db.thread_advisory_lock(tid):
+                cur = await postgres_db.get_thread(tid)
+                if cur and cur.get("agent_id"):
                     logger.info(
-                        "Thread %s: resumed via idle pool agent %s",
+                        "Thread %s: already bound to agent %s — "
+                        "skipping duplicate reprovision.",
                         tid,
-                        idle_agent["hostname"],
+                        cur["agent_id"],
                     )
                     return
 
-            # No idle agent — create a dedicated session pod.
-            pod_name = await agent_provisioner.provision_agent(
-                purpose="session", thread_id=tid, config_name=cfg
-            )
-            if pod_name:
-                return
+                # Try idle pool agent first (instant attach, no pod boot).
+                idle_agent = await _find_idle_persistent_agent()
+                if idle_agent:
+                    co = thread.get("config_override") or {}
+                    if isinstance(co, str):
+                        try:
+                            co = json.loads(co)
+                        except (json.JSONDecodeError, TypeError):
+                            co = {}
+                    pids = thread.get("project_ids") or []
+                    resolved_ds = await postgres_db.resolve_datasources_for_thread(
+                        project_ids=pids
+                    )
+                    ds_payload = _build_datasources_payload(resolved_ds)
+                    if resolved_ds:
+                        co = _build_datasource_tool_override(resolved_ds, co)
+                    ok = await _send_session_attach(
+                        idle_agent, tid, co, pids, datasources=ds_payload
+                    )
+                    if ok:
+                        logger.info(
+                            "Thread %s: resumed via idle pool agent %s",
+                            tid,
+                            idle_agent["hostname"],
+                        )
+                        return
 
-            logger.error(
-                "Thread %s: resume failed — no idle agents and pod provisioning failed",
-                tid,
-            )
+                # No idle agent — create a dedicated session pod.
+                pod_name = await agent_provisioner.provision_agent(
+                    purpose="session", thread_id=tid, config_name=cfg
+                )
+                if pod_name:
+                    return
+
+                logger.error(
+                    "Thread %s: resume failed — no idle agents and pod provisioning failed",
+                    tid,
+                )
 
         asyncio.create_task(_reprovision(thread_id, config_name))
     elif persistent_provisioner.is_available:

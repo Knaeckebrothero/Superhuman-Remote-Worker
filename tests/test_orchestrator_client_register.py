@@ -75,3 +75,34 @@ async def test_register_payload_pod_uid_empty_when_env_unset(monkeypatch):
     assert ok is True
     payload = fake_http.post.call_args.kwargs["json"]
     assert payload["pod_uid"] == ""
+
+
+@pytest.mark.asyncio
+async def test_register_returns_false_on_409_duplicate(monkeypatch):
+    """When the orchestrator returns 409 (duplicate persistent registration —
+    see docs/issues/persistent_thread_double_provisioning_race.md Approach 4),
+    register() must return False so the agent lifespan can skip _attach_session
+    and avoid competing with the legitimate owner of the thread."""
+    client = OrchestratorClient(
+        orchestrator_url="http://test-orch:8085",
+        pod_ip="10.0.0.5",
+        pod_port=8001,
+        hostname="srw-agent-test",
+        config_name="defaults",
+        pid=1234,
+    )
+
+    fake_http = AsyncMock()
+    fake_http.post = AsyncMock(
+        return_value=MagicMock(
+            status_code=409,
+            text='{"detail":"thread already bound to another live agent"}',
+        )
+    )
+    client._client = fake_http
+
+    ok = await client.register(
+        agent_mode="persistent", thread_id="00000000-0000-0000-0000-000000000001"
+    )
+
+    assert ok is False, "409 must propagate as False so caller can skip attach"

@@ -412,6 +412,7 @@ async def lifespan(app: FastAPI):
 
     # 2. Connect to orchestrator
     orchestrator_url = os.getenv("ORCHESTRATOR_URL", "http://localhost:8085")
+    dedicated_register_ok = True
     if orchestrator_url:
         try:
             _orchestrator_client = create_orchestrator_client_from_env(
@@ -447,10 +448,21 @@ async def lifespan(app: FastAPI):
 
                     _thread_id = str(uuid.uuid4())
 
-                await _orchestrator_client.register(
+                # The orchestrator now refuses duplicate persistent registrations
+                # (409 — see docs/issues/persistent_thread_double_provisioning_race.md).
+                # On refusal, skip the session attach below so the orphan pod
+                # doesn't compete with the legitimate owner for this thread.
+                dedicated_register_ok = await _orchestrator_client.register(
                     agent_mode="persistent",
                     thread_id=_thread_id,
                 )
+                if not dedicated_register_ok:
+                    logger.error(
+                        "Orchestrator refused persistent registration for "
+                        "thread %s — pod will stay up but will NOT attach a "
+                        "session (likely a duplicate-provision race).",
+                        _thread_id,
+                    )
 
             # Start heartbeat
             def _heartbeat_status():
@@ -471,8 +483,10 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("No ORCHESTRATOR_URL — running standalone")
 
-    # If we have a thread_id (dedicated mode), set up the session immediately
-    if _thread_id:
+    # If we have a thread_id (dedicated mode) and registration succeeded, set
+    # up the session immediately. If register was refused (409), skip the
+    # attach — the legitimate owner already holds this thread.
+    if _thread_id and dedicated_register_ok:
         # Fallback: generate UUID if still None (standalone mode)
         if _thread_id is None:
             import uuid
@@ -480,6 +494,12 @@ async def lifespan(app: FastAPI):
             _thread_id = str(uuid.uuid4())
 
         await _attach_session(_thread_id)
+    elif _thread_id and not dedicated_register_ok:
+        logger.info(
+            "Skipping session attach for thread %s — orchestrator refused "
+            "registration.",
+            _thread_id,
+        )
     else:
         logger.info(
             "Pool mode: waiting for session assignment via POST /session/attach"

@@ -271,31 +271,46 @@ export class PersistentChatService {
     /**
      * Connect to a persistent agent session.
      *
-     * Loads thread metadata + transcript history from REST, then opens the
-     * SSE stream (replay-from-cursor when we have one cached) and the
-     * control WS.
+     * Cold path (new thread or thread switch): load thread metadata +
+     * transcript history from REST, then open SSE (replay-from-cursor when
+     * we have one cached) and the control WS.
+     *
+     * Same-thread fast path: skip the reset + loadHistory, just refresh
+     * transports. This preserves the in-flight assistant turn through
+     * chat-page re-mounts and other reconnects against the same thread
+     * (docs/issues/persistent_chat_lost_assistant_turn_on_mid_turn_reload.md
+     * §Approach 1). loadHistory's GET /messages only returns *persisted*
+     * rows; during streaming the AI message isn't in thread_messages yet,
+     * so re-running it mid-turn would replace the visible streaming turn
+     * with just the user message and drop subsequent SSE events (the
+     * reducer no-ops `token`/`thinking`/`tool.*` events when
+     * `activeAssistantTurnId === null`).
      */
     async connect(threadId: string): Promise<void> {
+        const sameThread = this.threadId() === threadId && this.historyLoaded();
         this.disconnect();
-        this.dispatch({type: 'reset', threadId});
         this.connectionState.set('connecting');
         this.error.set(null);
-        this.historyLoaded.set(false);
-        this.sessionReady.set(false);
-        this.startupPhase.set(null);
-        this.pendingMessage.set(null);
-        this.sessionTitle.set(null);
-        this.modelName.set(null);
-        this.temperature.set(0);
-        this.turnCount.set(0);
-        this.ncSessionFolder.set(null);
-        this.cloudSessionUrl.set(null);
-        this.tasks.set([]);
-        this.undoAvailable.set(false);
-        this.isSessionPaused.set(false);
+        if (!sameThread) {
+            // Cold path: wipe and refetch.
+            this.dispatch({type: 'reset', threadId});
+            this.historyLoaded.set(false);
+            this.sessionReady.set(false);
+            this.startupPhase.set(null);
+            this.pendingMessage.set(null);
+            this.sessionTitle.set(null);
+            this.modelName.set(null);
+            this.temperature.set(0);
+            this.turnCount.set(0);
+            this.ncSessionFolder.set(null);
+            this.cloudSessionUrl.set(null);
+            this.tasks.set([]);
+            this.undoAvailable.set(false);
+            this.isSessionPaused.set(false);
 
-        this.threadId.set(threadId);
-        await this.loadHistory(threadId);
+            this.threadId.set(threadId);
+            await this.loadHistory(threadId);
+        }
         await this.loadThreadMeta(threadId);
 
         // Don't auto-connect to ended sessions — render the read-only resume
@@ -896,15 +911,43 @@ export class PersistentChatService {
     }
 
     /**
-     * Resume a paused/idle session: POST to resume endpoint, then reconnect.
+     * Resume an ended session and reconnect.
+     *
+     * Two endpoints, one SSE-driven progress feed:
+     *
+     *   - POST /persistent/threads/{tid}/resume — required for ended threads:
+     *     flips status from 'ended' → 'created', clears the stale agent_id,
+     *     and kicks off a background reprovision. Idempotent under the
+     *     per-thread advisory lock.
+     *   - POST /sessions/{tid}/prepare — the canonical lifecycle-event source.
+     *     Runs in parallel with /resume; whichever path acquires the lock
+     *     first does the actual provisioning, the other observes the binding
+     *     and emits "ready".
+     *
+     * Both endpoints are kicked off inside `_waitForLifecycleReady` so the
+     * notification-feed SSE is already open before the first emit. /prepare
+     * always emits "provisioning" up-front, so the resume card shows the
+     * full provisioning → booting → ready sequence regardless of which
+     * background task wins the race.
      */
     async resumeSession(): Promise<void> {
         const threadId = this.threadId();
         if (!threadId) return;
         this.isSessionPaused.set(false);
-        await firstValueFrom(
-            this.http.post(`${environment.apiUrl}/persistent/threads/${threadId}/resume`, {})
-        );
+        try {
+            await this._waitForLifecycleReady(threadId, async () => {
+                await firstValueFrom(
+                    this.http.post(`${environment.apiUrl}/persistent/threads/${threadId}/resume`, {})
+                );
+                await firstValueFrom(
+                    this.http.post(`${environment.apiUrl}/sessions/${threadId}/prepare`, {})
+                );
+            });
+        } catch (err) {
+            // _waitForLifecycleReady rejects on state=failed or transport
+            // error. Fall through to connect() — _resolveConnection will
+            // surface a useful error if the session can't actually open.
+        }
         await this.connect(threadId);
     }
 

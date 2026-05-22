@@ -91,8 +91,11 @@ def test_prepare_returns_403_when_thread_owned_by_other_user(app):
 @pytest.mark.asyncio
 async def test_do_prepare_emits_phases_for_warm_thread(monkeypatch):
     """When the thread already has an agent_id and the pod is ready,
-    _do_prepare skips provisioning, runs the readiness probe, calls
-    session_router.ensure_route, and emits booting then ready."""
+    _do_prepare skips the actual provision work, runs the readiness probe,
+    calls session_router.ensure_route, and emits provisioning → booting →
+    ready. "provisioning" is emitted up-front (before lock acquisition) so
+    the cockpit's progress UI surfaces the phase even when /resume's
+    sibling reprovision wins the race to bind the agent_id."""
     from orchestrator.routers import sessions as sessions_mod
 
     db = AsyncMock()
@@ -141,9 +144,11 @@ async def test_do_prepare_emits_phases_for_warm_thread(monkeypatch):
         config_override=None,
     )
 
-    # Expected phase sequence: booting → ready (no provisioning, agent was already bound).
+    # Expected phase sequence: provisioning (up-front) → booting → ready.
+    # Agent was already bound, but "provisioning" is still emitted so the
+    # cockpit's resume card surfaces the phase regardless of who won the race.
     states = [call.args[2]["state"] for call in feed.broadcast.call_args_list]
-    assert states == ["booting", "ready"]
+    assert states == ["provisioning", "booting", "ready"]
 
     # ensure_route called with correct pod info.
     fake_main.session_router.ensure_route.assert_called_once_with(

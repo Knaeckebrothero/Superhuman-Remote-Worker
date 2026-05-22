@@ -193,9 +193,42 @@ describe('turn-reducer — text/thinking deltas', () => {
         expect(thoughts[1].content).toBe('reflect');
     });
 
-    it('deltas without an active turn are dropped silently', () => {
+    it('deltas without an active turn open a recovered placeholder turn (Approach 2)', () => {
+        // Defense-in-depth from
+        // docs/issues/persistent_chat_lost_assistant_turn_on_mid_turn_reload.md:
+        // when streaming events arrive with activeAssistantTurnId === null
+        // (e.g. SSE replay cursor is past turn.started after a mid-turn
+        // reconnect), the reducer now synthesises a placeholder turn so the
+        // partial state is visible instead of silently lost.
         const state = play([{type: 'token', content: 'orphan', timestamp: 1000}]);
-        expect(state.turns).toEqual([]);
+        expect(state.turns).toHaveLength(1);
+        const turn = state.turns[0];
+        expect(turn.kind).toBe('assistant');
+        if (turn.kind !== 'assistant') throw new Error('expected assistant turn');
+        expect(turn.recovered).toBe(true);
+        expect(turn.id).toBe('recovered:1000');
+        expect(turn.status).toBe('streaming');
+        expect(turn.events).toHaveLength(1);
+        expect(turn.events[0].kind).toBe('text');
+        expect(state.activeAssistantTurnId).toBe('recovered:1000');
+    });
+
+    it('turn_completed promotes a recovered placeholder to the real turn id', () => {
+        // When the real turn.completed event finally arrives after a
+        // placeholder was synthesised by orphan deltas, the placeholder is
+        // renamed to the real turn id and closed — so the bubble doesn't
+        // hang in "streaming" forever.
+        const state = play([
+            {type: 'token', content: 'orphan content', timestamp: 1000},
+            {type: 'turn_completed', turnId: 'real-turn-id', finishedAt: 2000},
+        ]);
+        expect(state.turns).toHaveLength(1);
+        const turn = state.turns[0];
+        if (turn.kind !== 'assistant') throw new Error('expected assistant turn');
+        expect(turn.id).toBe('real-turn-id');
+        expect(turn.status).toBe('done');
+        expect(turn.finishedAt).toBe(2000);
+        expect(state.activeAssistantTurnId).toBeNull();
     });
 
     it('block ids are stable: ${turnId}.b<index>', () => {
