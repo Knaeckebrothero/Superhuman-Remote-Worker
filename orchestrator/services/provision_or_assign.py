@@ -126,9 +126,7 @@ async def provision_or_assign(
                 thread_row = await postgres_db.get_thread(tid)
                 agent = await postgres_db.get_agent(str(thread_row["agent_id"]))
                 if not agent or not agent.get("pod_ip"):
-                    lifecycle_emit(
-                        uid, tid, "failed", reason="agent has no pod_ip"
-                    )
+                    lifecycle_emit(uid, tid, "failed", reason="agent has no pod_ip")
                     return
                 pod_ip = agent["pod_ip"]
                 pod_port = int(agent.get("pod_port", 8001))
