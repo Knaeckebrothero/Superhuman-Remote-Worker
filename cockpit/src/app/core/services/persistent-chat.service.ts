@@ -1,4 +1,4 @@
-import {computed, inject, Injectable, NgZone, signal} from '@angular/core';
+import {computed, effect, inject, Injectable, NgZone, signal} from '@angular/core';
 import {HttpClient} from '@angular/common/http';
 import {firstValueFrom} from 'rxjs';
 import {environment} from '../environment';
@@ -16,6 +16,7 @@ import {
 } from '../models/turn.model';
 import {ApiService} from './api.service';
 import {IndexedDbService} from './indexed-db.service';
+import {NotificationService} from './notification.service';
 import {reduce, ReducerAction} from './turn-reducer';
 import {AppToastService} from '../../ui/toast';
 
@@ -134,6 +135,42 @@ export class PersistentChatService {
     private readonly cache = inject(IndexedDbService);
     private readonly zone = inject(NgZone);
     private readonly toast = inject(AppToastService);
+    private readonly notifications = inject(NotificationService);
+
+    constructor() {
+        // Single source of truth for the "Starting session" card phase
+        // transitions. The orchestrator emits session.lifecycle events on
+        // the user's always-on /notifications/events SSE from every
+        // binding path (provision_or_assign for the create-thread fast
+        // path, _do_prepare for the cold path). Subscribe via the
+        // NotificationService signal so the SSE feed isn't opened twice.
+        effect(() => {
+            const event = this.notifications.lifecycleEvent();
+            const tid = this.threadId();
+            if (!event || !tid || event.thread_id !== tid) return;
+            // Once the session is actually live, ignore further lifecycle
+            // events (a duplicate from a racing /prepare must not regress
+            // the UI). isStartingSession also gates rendering on
+            // sessionReady, so the card hides naturally.
+            if (this.sessionReady()) return;
+            switch (event.state) {
+                case 'provisioning':
+                case 'booting':
+                    this.startupPhase.set(event.state);
+                    break;
+                case 'ready':
+                    // Server says the agent is session-ready; the cockpit
+                    // is now opening the WS — that's the "establishing
+                    // connection" phase. session.state arriving on the WS
+                    // will flip sessionReady=true and hide the card.
+                    this.startupPhase.set('connecting');
+                    break;
+                case 'failed':
+                    this.error.set(event.reason || 'session preparation failed');
+                    break;
+            }
+        });
+    }
 
     // --- Connection state ---
     readonly connectionState = signal<ConnectionState>('disconnected');
@@ -630,25 +667,58 @@ export class PersistentChatService {
     }
 
     /**
-     * Resolve the {ws_url, token} for a thread. Drives the cold-start
-     * (prepare + lifecycle) path when /connection returns 425.
+     * Resolve the {ws_url, token} for a thread. On 425 (no binding yet)
+     * POST /prepare to kick off provisioning, then poll /connection until
+     * 200 — the always-on NotificationService SSE drives the
+     * "Starting session" card via lifecycle events in parallel, so this
+     * function only owns the token fetch, not the UI phase rendering.
      */
     private async _resolveConnection(threadId: string): Promise<ConnectionPayload> {
         try {
             return await this._fetchConnection(threadId);
         } catch (err: any) {
             if (err?.status !== 425) throw err;
-            // Not bound yet — cold start.
-            await this._waitForLifecycleReady(threadId, async () => {
-                await firstValueFrom(
-                    this.http.post<{ state: string }>(
-                        `${environment.apiUrl}/sessions/${threadId}/prepare`,
-                        {},
-                    ),
-                );
-            });
-            return await this._fetchConnection(threadId);
+            // Not bound yet — kick off /prepare and poll /connection until
+            // the orchestrator binds an agent and the agent's /ready flips
+            // true. (The cockpit's startup card is rendered by the
+            // session.lifecycle effect in the constructor; we just wait
+            // here for the token.)
+            await firstValueFrom(
+                this.http.post<{ state: string }>(
+                    `${environment.apiUrl}/sessions/${threadId}/prepare`,
+                    {},
+                ),
+            );
+            return await this._pollConnectionUntilReady(threadId);
         }
+    }
+
+    /**
+     * Poll GET /connection until it returns 200. Backoff: 1s, capped at
+     * 2s. Aborts if the user navigates away (threadId() changes) or the
+     * service is intentionally closed. Bounded by READY_TIMEOUT_MS so a
+     * stuck attach surfaces as an error instead of polling forever.
+     */
+    private async _pollConnectionUntilReady(threadId: string): Promise<ConnectionPayload> {
+        const READY_TIMEOUT_MS = 180_000;
+        const deadline = Date.now() + READY_TIMEOUT_MS;
+        let interval = 1_000;
+        while (Date.now() < deadline) {
+            if (this.intentionalClose || this.threadId() !== threadId) {
+                throw new Error('connection cancelled');
+            }
+            try {
+                return await this._fetchConnection(threadId);
+            } catch (err: any) {
+                if (err?.status === 425 || err?.status === 409) {
+                    await new Promise((r) => setTimeout(r, interval));
+                    interval = Math.min(2_000, interval + 250);
+                    continue;
+                }
+                throw err;
+            }
+        }
+        throw new Error('session preparation timed out');
     }
 
     private async _fetchConnection(threadId: string): Promise<ConnectionPayload> {
@@ -657,71 +727,6 @@ export class PersistentChatService {
                 `${environment.apiUrl}/sessions/${threadId}/connection`,
             ),
         );
-    }
-
-    /**
-     * Open a transient SSE on `/notifications/events`, kick off the
-     * provided action (typically the POST /prepare), and resolve when the
-     * `session.lifecycle` event with `state="ready"` arrives for this
-     * thread. Rejects on `state="failed"`. Always closes the SSE before
-     * returning so it doesn't leak past the cold-start window.
-     */
-    private _waitForLifecycleReady(
-        threadId: string,
-        kickOff: () => Promise<void>,
-    ): Promise<void> {
-        return new Promise<void>((resolve, reject) => {
-            const lifecycleEs = new EventSource(
-                `${environment.apiUrl}/notifications/events`,
-                {withCredentials: true},
-            );
-            let settled = false;
-            const cleanup = () => {
-                if (settled) return;
-                settled = true;
-                try {
-                    lifecycleEs.close();
-                } catch {
-                    // ignore
-                }
-            };
-            lifecycleEs.onmessage = (event: MessageEvent) => {
-                let data: any;
-                try {
-                    data = JSON.parse(event.data);
-                } catch {
-                    return;
-                }
-                if (data?.type !== 'session.lifecycle') return;
-                if (data.thread_id !== threadId) return;
-                if (data.state === 'ready') {
-                    cleanup();
-                    resolve();
-                } else if (data.state === 'failed') {
-                    cleanup();
-                    reject(new Error(data.reason || 'session preparation failed'));
-                } else if (typeof data.state === 'string') {
-                    // Render provisioning/booting in the startup card.
-                    this.zone.run(() => this.startupPhase.set(data.state));
-                }
-            };
-            lifecycleEs.onerror = () => {
-                // Transient browser-side retry is fine — only treat closed as
-                // fatal so we don't leak the EventSource on auth failure.
-                if (lifecycleEs.readyState === EventSource.CLOSED) {
-                    cleanup();
-                    reject(new Error('notification feed closed'));
-                }
-            };
-            // Fire the kick-off action after the EventSource is constructed so
-            // we don't miss the first emission. Even if `ready` arrives
-            // synchronously (test scenario) we'll catch it via the onmessage
-            // handler installed above.
-            kickOff().catch((e) => {
-                cleanup();
-                reject(e);
-            });
-        });
     }
 
     private _installControlWs(threadId: string, wsUrl: string): void {
@@ -1224,10 +1229,6 @@ export class PersistentChatService {
         const now = Date.now();
 
         switch (data.method) {
-            case 'status':
-                this.startupPhase.set((params['phase'] as string) || null);
-                break;
-
             case 'session.state':
                 if (params['permission_mode']) {
                     this.permissionMode.set(params['permission_mode'] as PermissionMode);

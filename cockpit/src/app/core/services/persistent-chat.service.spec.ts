@@ -1,10 +1,12 @@
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest';
-import {Injector, NgZone, runInInjectionContext} from '@angular/core';
+import {NgZone, signal} from '@angular/core';
+import {TestBed} from '@angular/core/testing';
 import {HttpClient} from '@angular/common/http';
 import {of, throwError} from 'rxjs';
 import {PersistentChatService} from './persistent-chat.service';
 import {ApiService} from './api.service';
 import {IndexedDbService} from './indexed-db.service';
+import {NotificationService} from './notification.service';
 import {AppToastService} from '../../ui/toast';
 import {
     AssistantTurn,
@@ -127,9 +129,14 @@ function createService(opts: {
 
     // NgZone stub: just run callbacks synchronously. Tests don't depend on
     // change-detection scheduling, only on signal mutations being observed.
+    // NOTE: we don't provide this as the NgZone token because Angular's
+    // ChangeDetectionScheduler subscribes to NgZone's onStable/onMicrotaskEmpty
+    // streams. TestBed's default NgZoneNoop satisfies that contract; this stub
+    // is unused in the TestBed configuration but kept for reference.
     const mockZone: any = {
         run: <T>(fn: () => T) => fn(),
     };
+    void mockZone;
 
     const mockToast: any = {
         show: vi.fn(),
@@ -170,18 +177,38 @@ function createService(opts: {
     (MockWebSocketCtor as any).CONNECTING = 0;
     (globalThis as any).WebSocket = MockWebSocketCtor;
 
-    const injector = Injector.create({
+    // Minimal NotificationService stub — just the lifecycleEvent signal
+    // the PersistentChatService constructor effect reads. Tests fire phase
+    // transitions by setting this signal directly.
+    const mockNotifications: any = {
+        lifecycleEvent: signal<{thread_id: string; state: string; reason?: string} | null>(null),
+    };
+
+    // TestBed gives us the ChangeDetectionScheduler that effect() needs.
+    // Manual Injector.create() doesn't wire that up. We let TestBed use
+    // its default NgZone — the scheduler subscribes to its lifecycle
+    // streams, and a thin stub would break that subscription.
+    TestBed.resetTestingModule();
+    TestBed.configureTestingModule({
         providers: [
             {provide: HttpClient, useValue: mockHttp},
             {provide: ApiService, useValue: mockApi},
             {provide: IndexedDbService, useValue: mockCache},
-            {provide: NgZone, useValue: mockZone},
             {provide: AppToastService, useValue: mockToast},
+            {provide: NotificationService, useValue: mockNotifications},
+            PersistentChatService,
         ],
     });
-
-    const service = runInInjectionContext(injector, () => new PersistentChatService());
-    return {service, mockHttp, mockApi, mockCache, sseInstances, wsInstances};
+    const service = TestBed.inject(PersistentChatService);
+    return {
+        service,
+        mockHttp,
+        mockApi,
+        mockCache,
+        sseInstances,
+        wsInstances,
+        notifications: mockNotifications,
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -1030,23 +1057,6 @@ describe('PersistentChatService — control WS frame filtering', () => {
         ws.onmessage?.({data: JSON.stringify(frame)} as MessageEvent);
     }
 
-    it('dispatches status frames from the control WS into startupPhase', async () => {
-        const {service, wsInstances} = await readySession();
-        expect(service.startupPhase()).toBeNull();
-
-        fireWsFrame(wsInstances[0], {
-            method: 'status',
-            params: {phase: 'provisioning', elapsed_s: 2, timeout_s: 300},
-        });
-        expect(service.startupPhase()).toBe('provisioning');
-
-        fireWsFrame(wsInstances[0], {method: 'status', params: {phase: 'booting'}});
-        expect(service.startupPhase()).toBe('booting');
-
-        fireWsFrame(wsInstances[0], {method: 'status', params: {phase: 'connecting'}});
-        expect(service.startupPhase()).toBe('connecting');
-    });
-
     it('drops _seq-stamped frames on the control WS to avoid double-dispatch with SSE', async () => {
         const {service, wsInstances} = await readySession();
         const turnsBefore = service.turns().length;
@@ -1195,13 +1205,14 @@ describe('PersistentChatService — direct session WS (prepare + connection)', (
         expect(ctx.wsInstances[0].url).toBe('wss://api.example.com/p/t1/ws?t=tok-warm');
     });
 
-    it('cold start (425 → prepare → SSE ready → /connection): full sequence opens WS at final ws_url', async () => {
+    it('cold start (425 → prepare → poll /connection until ready): WS opens at final ws_url', async () => {
         const ctx = createService();
 
-        // First /connection call → 425 (not bound). Second call → ready.
+        // /connection: 425, then 425 again (still booting), then 200.
         ctx.mockHttp.get.mockImplementation(
             connectGetMock({
                 connectionResponses: [
+                    throwError(() => ({status: 425})),
                     throwError(() => ({status: 425})),
                     of({
                         state: 'ready',
@@ -1213,7 +1224,6 @@ describe('PersistentChatService — direct session WS (prepare + connection)', (
             }),
         );
 
-        // POST /prepare returns 202 {state: provisioning}.
         ctx.mockHttp.post.mockImplementation((url: string) => {
             if (url.endsWith('/api/sessions/t2/prepare')) {
                 return of({state: 'provisioning'});
@@ -1221,44 +1231,88 @@ describe('PersistentChatService — direct session WS (prepare + connection)', (
             return of({});
         });
 
-        const connectPromise = ctx.service.connect('t2');
+        await ctx.service.connect('t2');
 
-        // Allow microtasks to flush so /prepare is called and the lifecycle
-        // EventSource is opened on /notifications/events.
-        await new Promise((r) => setTimeout(r, 0));
-        await new Promise((r) => setTimeout(r, 0));
-
-        // Find the lifecycle EventSource (on /notifications/events).
-        const lifecycleEs = ctx.sseInstances.find((es) => es.url.includes('/notifications/events'));
-        expect(lifecycleEs).toBeDefined();
-
-        // Fire the ready lifecycle event.
-        fireSseMessage(lifecycleEs!, {
-            type: 'session.lifecycle',
-            thread_id: 't2',
-            state: 'ready',
-        });
-
-        await connectPromise;
-
-        // POST /prepare was called.
+        // POST /prepare was called exactly once.
         const prepareCalls = ctx.mockHttp.post.mock.calls.filter((c: any) =>
             String(c[0]).endsWith('/api/sessions/t2/prepare'),
         );
         expect(prepareCalls).toHaveLength(1);
 
-        // GET /connection was called twice (initial 425, then post-ready).
+        // GET /connection was called until it succeeded.
         const connCalls = ctx.mockHttp.get.mock.calls.filter((c: any) =>
             String(c[0]).endsWith('/api/sessions/t2/connection'),
         );
-        expect(connCalls.length).toBe(2);
+        expect(connCalls.length).toBeGreaterThanOrEqual(2);
 
-        // WebSocket opened at the URL returned by the second /connection call.
+        // WS opened at the URL returned by the successful /connection.
         const sessionWs = ctx.wsInstances.find((ws) =>
             String(ws.url || '').includes('wss://api.example.com/p/t2/ws'),
         );
         expect(sessionWs).toBeDefined();
         expect(sessionWs.url).toBe('wss://api.example.com/p/t2/ws?t=tok-cold');
+
+        // No transient SSE on /notifications/events is opened — phase
+        // signals come from the always-on NotificationService feed (owned
+        // by the app shell), not from a per-connect listener.
+        const lifecycleEs = ctx.sseInstances.find((es) =>
+            es.url.includes('/notifications/events'),
+        );
+        expect(lifecycleEs).toBeUndefined();
+    });
+
+    it('NotificationService lifecycle events update startupPhase for the active thread', async () => {
+        const ctx = createService();
+        ctx.mockHttp.get.mockImplementation(
+            connectGetMock({
+                connectionResponses: [
+                    of({
+                        state: 'ready',
+                        ws_url: 'wss://api.example.com/p/t-life/ws?t=tok',
+                        token: 'tok',
+                        expires_at: 0,
+                    }),
+                ],
+            }),
+        );
+        await ctx.service.connect('t-life');
+
+        // The constructor effect filters on threadId() — confirm the
+        // active thread matches before firing events.
+        expect(ctx.service.threadId()).toBe('t-life');
+
+        ctx.notifications.lifecycleEvent.set({
+            thread_id: 't-life',
+            state: 'provisioning',
+        });
+        // Flush the constructor effect so it observes the signal change.
+        TestBed.tick();
+        expect(ctx.service.startupPhase()).toBe('provisioning');
+
+        ctx.notifications.lifecycleEvent.set({
+            thread_id: 't-life',
+            state: 'booting',
+        });
+        TestBed.tick();
+        expect(ctx.service.startupPhase()).toBe('booting');
+
+        ctx.notifications.lifecycleEvent.set({
+            thread_id: 't-life',
+            state: 'ready',
+        });
+        TestBed.tick();
+        // 'ready' from the server means agent is session-ready — the
+        // cockpit now opens the WS, which is the "connecting" phase
+        // client-side.
+        expect(ctx.service.startupPhase()).toBe('connecting');
+
+        // Events for a different thread are ignored.
+        ctx.notifications.lifecycleEvent.set({
+            thread_id: 'other-thread',
+            state: 'provisioning',
+        });
+        TestBed.tick();
+        expect(ctx.service.startupPhase()).toBe('connecting');
     });
 
     it('WS close code 4401 re-fetches /connection and reopens WS with the fresh token', async () => {
