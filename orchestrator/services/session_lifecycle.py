@@ -68,12 +68,28 @@ async def wait_for_ready(pod_ip: str, pod_port: int, timeout_s: int) -> bool:
     deadline = asyncio.get_event_loop().time() + timeout_s
     interval = 2
     while asyncio.get_event_loop().time() < deadline:
-        try:
-            async with httpx.AsyncClient(timeout=2) as client:
-                resp = await client.get(f"http://{pod_ip}:{pod_port}/ready")
-                if resp.status_code == 200 and resp.json().get("ready"):
-                    return True
-        except Exception:
-            pass
+        if await probe_ready(pod_ip, pod_port):
+            return True
         await asyncio.sleep(interval)
     return False
+
+
+async def probe_ready(pod_ip: str, pod_port: int) -> bool:
+    """Single-shot probe of the agent pod's /ready endpoint.
+
+    Returns True iff the agent's three-way ``_session_ready()`` check
+    passes. Treats connection errors (pod down, Uvicorn not yet
+    listening, timeout) as "not ready" — same shape as ``wait_for_ready``'s
+    inner check, factored out so ``GET /connection`` can verify the
+    binding is actually serveable before minting a token. Without this,
+    ``/connection`` returns 200 based on ``agent.status`` alone, the
+    cockpit opens the WS during the attach window, Traefik 503s every
+    attempt, and the reconnect loop runs out before the pod's
+    K8s endpoint converges.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=2) as client:
+            resp = await client.get(f"http://{pod_ip}:{pod_port}/ready")
+            return resp.status_code == 200 and bool(resp.json().get("ready"))
+    except Exception:
+        return False
