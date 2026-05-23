@@ -260,6 +260,13 @@ def test_connection_returns_ws_url_and_token_when_ready(monkeypatch):
 
     monkeypatch.setattr(sessions_mod, "_get_db", lambda: fake_db, raising=False)
 
+    # /connection probes the agent's /ready before minting; stub it to
+    # always pass so we exercise the 200 path.
+    async def _probe_ok(pod_ip, pod_port):
+        return True
+
+    monkeypatch.setattr(sessions_mod, "probe_ready", _probe_ok, raising=True)
+
     # Inject a real SessionTokenService and a fake session_router.
     test_tokens = SessionTokenService(secret="test-secret-do-not-use", ttl_seconds=60)
     import sys
@@ -378,3 +385,43 @@ def test_connection_returns_409_when_agent_not_ready(monkeypatch):
     client = TestClient(app)
     resp = client.get("/api/sessions/t1/connection")
     assert resp.status_code == 409
+
+
+def test_connection_returns_425_when_pod_not_session_ready(monkeypatch):
+    """If the agent is bound but its /ready endpoint reports not ready
+    (Uvicorn still in lifespan / _attach_session not finished), return
+    425 so the cockpit's _pollConnectionUntilReady waits instead of
+    opening a WS that would 503 at Traefik."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from orchestrator.routers.sessions import router as sessions_router
+
+    app = FastAPI()
+    _install_fake_auth(monkeypatch)
+    fake_db = AsyncMock()
+    fake_db.get_thread.return_value = {
+        "id": "t1",
+        "user_id": "u1",
+        "agent_id": "agent-xyz",
+    }
+    fake_db.get_agent.return_value = {
+        "id": "agent-xyz",
+        "pod_ip": "10.0.0.5",
+        "pod_port": 8001,
+        "status": "ready",  # heartbeat-reported, but pod still mid-attach
+        "hostname": "srw-agent-x",
+        "pod_uid": "uid",
+    }
+    from orchestrator.routers import sessions as sessions_mod
+
+    monkeypatch.setattr(sessions_mod, "_get_db", lambda: fake_db, raising=False)
+
+    async def _probe_not_ready(pod_ip, pod_port):
+        return False
+
+    monkeypatch.setattr(sessions_mod, "probe_ready", _probe_not_ready, raising=True)
+
+    app.include_router(sessions_router)
+    client = TestClient(app)
+    resp = client.get("/api/sessions/t1/connection")
+    assert resp.status_code == 425
