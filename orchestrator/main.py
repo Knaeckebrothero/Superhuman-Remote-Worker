@@ -326,11 +326,14 @@ SUBJOB_CLEANUP_FILES = [
     "output/job_completion.json",
 ]
 
+# Only job-scoped scratch belongs here. Do NOT add content/input dirs such as
+# documents/ or reference/: a subjob branch is forked from the parent, so
+# deleting such a dir here propagates the deletion onto the parent's branch at
+# squash-merge time and destroys the parent's deliverables.
+# See docs/issues/subjob_merge_clobbers_parent_deliverables.md.
 SUBJOB_CLEANUP_DIRS = [
     "archive",
     "tools",
-    "documents",
-    "reference",
 ]
 
 
@@ -368,6 +371,25 @@ async def _squash_merge_subjob(job_id: str) -> dict[str, Any] | None:
     if not gitea_client.is_initialized:
         logger.warning(f"Gitea not initialized — cannot squash-merge subjob {job_id}")
         return None
+
+    # Critic subjobs must NOT be merged into the parent's deliverable branch.
+    # A critic produces a review verdict (consumed from the DB, not from merged
+    # files); merging its branch back propagates the pre-merge cleanup's
+    # deletions onto the parent and destroys the parent's deliverables.
+    # See docs/issues/subjob_merge_clobbers_parent_deliverables.md.
+    job_context = job.get("context") or {}
+    if isinstance(job_context, str):
+        try:
+            job_context = json.loads(job_context)
+        except (json.JSONDecodeError, ValueError):
+            job_context = {}
+    if isinstance(job_context, dict) and job_context.get("verification_target"):
+        logger.info(
+            f"Subjob {job_id} is a critic — skipping squash merge "
+            f"(review must not mutate the deliverable branch)"
+        )
+        await postgres_db.update_job_merge_status(job_id, merge_status="skipped")
+        return {"status": "skipped", "reason": "critic-not-merged"}
 
     repo_name = job["repo_name"]
     subjob_branch = job["branch_name"]
