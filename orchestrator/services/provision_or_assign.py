@@ -138,9 +138,7 @@ async def provision_or_assign(
         if needs_binding_wait:
             bind_timeout_s = int(os.environ.get("AGENT_BIND_TIMEOUT_S", "300"))
             if not await wait_for_binding(tid, bind_timeout_s):
-                lifecycle_emit(
-                    uid, tid, "failed", reason="agent failed to register"
-                )
+                lifecycle_emit(uid, tid, "failed", reason="agent failed to register")
                 return
             thread_row = await postgres_db.get_thread(tid)
             agent = await postgres_db.get_agent(str(thread_row["agent_id"]))
