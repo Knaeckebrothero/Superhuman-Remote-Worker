@@ -115,6 +115,14 @@ async def _do_prepare(
 
     Serializes concurrent prepares on the same thread via advisory lock.
     Broadcasts ``session.lifecycle`` SSE events at each phase change.
+
+    Locking strategy: the advisory lock is held ONLY across the
+    decide-who-provisions critical section. ``wait_for_binding`` and
+    ``wait_for_ready`` run AFTER the lock is released — the fresh-pod
+    path's agent registers via ``POST /api/agents/register``, which
+    acquires the SAME advisory lock for its duplicate-rejection check,
+    so holding it across the wait deadlocks both for the asyncpg query
+    timeout (~60s).
     """
     db = _get_db()
 
@@ -128,6 +136,7 @@ async def _do_prepare(
     # agent is already bound, we still went through a "preparing" phase
     # before we got there.
     _emit("provisioning")
+    needs_binding_wait = False
     try:
         async with db.thread_advisory_lock(thread_id):
             thread = await db.get_thread(thread_id)
@@ -135,47 +144,56 @@ async def _do_prepare(
                 _emit("failed", reason="thread vanished")
                 return
 
-            # Provisioning (if needed).
+            # Provisioning (if needed). Only kick off the bind here; the
+            # wait happens after the lock is released so the new pod's
+            # /register can acquire it.
             if not thread.get("agent_id"):
                 await _provision_agent_for_thread(
                     thread_id=thread_id,
                     config_name=config_name or "persistent_defaults",
                     config_override=config_override,
                 )
-                # Wait for agent registration.
-                bind_timeout_s = int(os.environ.get("AGENT_BIND_TIMEOUT_S", "300"))
-                if not await wait_for_binding(thread_id, bind_timeout_s):
-                    _emit("failed", reason="agent failed to register")
-                    return
+                needs_binding_wait = True
 
-            # Readiness probe.
-            _emit("booting")
-            thread = await db.get_thread(thread_id)
-            agent_id = thread["agent_id"]
-            agent = await db.get_agent(str(agent_id))
-            if not agent or not agent.get("pod_ip"):
-                _emit("failed", reason="agent has no pod_ip")
+        # Lock released. For fresh-pod paths, wait for the agent's
+        # /register to write threads.agent_id (which needs the lock we
+        # just dropped). For idle-pool paths, _send_session_attach has
+        # already set agent_id via the orchestrator's own DB connection,
+        # so wait_for_binding returns immediately.
+        if needs_binding_wait:
+            bind_timeout_s = int(os.environ.get("AGENT_BIND_TIMEOUT_S", "300"))
+            if not await wait_for_binding(thread_id, bind_timeout_s):
+                _emit("failed", reason="agent failed to register")
                 return
 
-            ready_timeout_s = int(os.environ.get("WS_READY_TIMEOUT_S", "180"))
-            if not await wait_for_ready(
-                pod_ip=agent["pod_ip"],
-                pod_port=int(agent.get("pod_port", 8001)),
-                timeout_s=ready_timeout_s,
-            ):
-                _emit("failed", reason="agent /ready timeout")
-                return
+        # Readiness probe.
+        _emit("booting")
+        thread = await db.get_thread(thread_id)
+        agent_id = thread["agent_id"]
+        agent = await db.get_agent(str(agent_id))
+        if not agent or not agent.get("pod_ip"):
+            _emit("failed", reason="agent has no pod_ip")
+            return
 
-            # Create the route resource.
-            from main import session_router  # type: ignore
+        ready_timeout_s = int(os.environ.get("WS_READY_TIMEOUT_S", "180"))
+        if not await wait_for_ready(
+            pod_ip=agent["pod_ip"],
+            pod_port=int(agent.get("pod_port", 8001)),
+            timeout_s=ready_timeout_s,
+        ):
+            _emit("failed", reason="agent /ready timeout")
+            return
 
-            await session_router.ensure_route(
-                thread_id=thread_id,
-                pod_name=agent["hostname"],
-                pod_uid=agent.get("pod_uid", ""),
-            )
+        # Create the route resource.
+        from main import session_router  # type: ignore
 
-            _emit("ready")
+        await session_router.ensure_route(
+            thread_id=thread_id,
+            pod_name=agent["hostname"],
+            pod_uid=agent.get("pod_uid", ""),
+        )
+
+        _emit("ready")
     except Exception as e:
         logger.exception("prepare failed for thread %s: %s", thread_id, e)
         _emit("failed", reason=str(e))
