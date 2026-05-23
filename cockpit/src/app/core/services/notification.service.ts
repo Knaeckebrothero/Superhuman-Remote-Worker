@@ -18,6 +18,17 @@ export interface SessionEvent {
     created_at: string;
 }
 
+/**
+ * One session-lifecycle phase transition emitted by the orchestrator while
+ * a session is starting up. Single source of truth for the cockpit's
+ * "Starting session" card — see notification.service.connectSSE().
+ */
+export interface LifecycleEvent {
+    thread_id: string;
+    state: 'provisioning' | 'booting' | 'ready' | 'failed' | (string & {});
+    reason?: string;
+}
+
 @Injectable({ providedIn: 'root' })
 export class NotificationService {
   private readonly http = inject(HttpClient);
@@ -38,6 +49,13 @@ export class NotificationService {
 
     /** Persistent session events (permission requests, VM upgrades, waiting). */
     readonly sessionEvents = signal<SessionEvent[]>([]);
+
+    /**
+     * Latest session.lifecycle phase transition (or null if none seen this
+     * session). Consumers filter by `thread_id` to react only to events
+     * matching the thread they care about. Cleared on disconnectSSE.
+     */
+    readonly lifecycleEvent = signal<LifecycleEvent | null>(null);
 
   /** Derived: only unread notifications. */
   readonly unreadNotifications = computed(() =>
@@ -129,6 +147,20 @@ export class NotificationService {
               this.sessionEvents.update((events) =>
                   events.filter((e) => e.thread_id !== data.thread_id),
               );
+          } else if (data.type === 'session.lifecycle') {
+              // Single source of truth for the cockpit's "Starting
+              // session" card phase transitions. Both server-side
+              // binding paths (orchestrator/services/provision_or_assign.py
+              // for the create-thread fast path, and
+              // orchestrator/routers/sessions.py::_do_prepare for the
+              // cold path) emit on this channel — the cockpit's
+              // PersistentChatService reacts via an effect() that
+              // filters on the active thread id.
+              this.lifecycleEvent.set({
+                  thread_id: data.thread_id,
+                  state: data.state,
+                  reason: data.reason,
+              });
           }
         } catch {
           // Ignore parse errors (keepalive, malformed events)
@@ -151,6 +183,7 @@ export class NotificationService {
       this.eventSource.close();
       this.eventSource = null;
       this.isConnected.set(false);
+      this.lifecycleEvent.set(null);
     }
   }
 }

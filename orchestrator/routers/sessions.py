@@ -26,7 +26,8 @@ from fastapi import APIRouter, HTTPException, Request, status
 from pydantic import BaseModel, Field
 
 from security.auth import require_approved_user
-from services.notification_feed import notification_feed
+from services.session_lifecycle import emit as lifecycle_emit
+from services.session_lifecycle import wait_for_binding, wait_for_ready
 
 logger = logging.getLogger(__name__)
 
@@ -118,11 +119,7 @@ async def _do_prepare(
     db = _get_db()
 
     def _emit(state: str, **extra: Any) -> None:
-        notification_feed.broadcast(
-            user_id,
-            "session.lifecycle",
-            {"thread_id": thread_id, "state": state, **extra},
-        )
+        lifecycle_emit(user_id, thread_id, state, **extra)
 
     # Emit "provisioning" up-front so the cockpit's progress card surfaces
     # the phase even when a sibling path (POST /resume) wins the race and
@@ -147,7 +144,7 @@ async def _do_prepare(
                 )
                 # Wait for agent registration.
                 bind_timeout_s = int(os.environ.get("AGENT_BIND_TIMEOUT_S", "300"))
-                if not await _wait_for_binding(thread_id, bind_timeout_s):
+                if not await wait_for_binding(thread_id, bind_timeout_s):
                     _emit("failed", reason="agent failed to register")
                     return
 
@@ -161,7 +158,7 @@ async def _do_prepare(
                 return
 
             ready_timeout_s = int(os.environ.get("WS_READY_TIMEOUT_S", "180"))
-            if not await _wait_for_ready(
+            if not await wait_for_ready(
                 pod_ip=agent["pod_ip"],
                 pod_port=int(agent.get("pod_port", 8001)),
                 timeout_s=ready_timeout_s,
@@ -211,37 +208,6 @@ async def _provision_agent_for_thread(
     await agent_provisioner.provision_agent(
         purpose="session", thread_id=thread_id, config_name=config_name
     )
-
-
-async def _wait_for_binding(thread_id: str, timeout_s: int) -> bool:
-    """Poll the DB until thread.agent_id is set, or wall-clock timeout."""
-    db = _get_db()
-    deadline = asyncio.get_event_loop().time() + timeout_s
-    interval = 2
-    while asyncio.get_event_loop().time() < deadline:
-        thread = await db.get_thread(thread_id)
-        if thread and thread.get("agent_id"):
-            return True
-        await asyncio.sleep(interval)
-    return False
-
-
-async def _wait_for_ready(pod_ip: str, pod_port: int, timeout_s: int) -> bool:
-    """Poll the agent pod's /ready until it returns ready=true, or wall-clock timeout."""
-    import httpx
-
-    deadline = asyncio.get_event_loop().time() + timeout_s
-    interval = 2
-    while asyncio.get_event_loop().time() < deadline:
-        try:
-            async with httpx.AsyncClient(timeout=2) as client:
-                resp = await client.get(f"http://{pod_ip}:{pod_port}/ready")
-                if resp.status_code == 200 and resp.json().get("ready"):
-                    return True
-        except Exception:
-            pass
-        await asyncio.sleep(interval)
-    return False
 
 
 # --------------------------------------------------------------------------- #

@@ -123,7 +123,7 @@ async def test_do_prepare_emits_phases_for_warm_thread(monkeypatch):
     async def _ready_ok(pod_ip, pod_port, timeout_s):
         return True
 
-    monkeypatch.setattr(sessions_mod, "_wait_for_ready", _ready_ok, raising=True)
+    monkeypatch.setattr(sessions_mod, "wait_for_ready", _ready_ok, raising=True)
 
     # Mock session_router on main.
     import sys
@@ -133,9 +133,18 @@ async def test_do_prepare_emits_phases_for_warm_thread(monkeypatch):
     fake_main.session_router.ensure_route = AsyncMock(return_value="/p/t1")
     monkeypatch.setitem(sys.modules, "main", fake_main)
 
-    # Capture broadcasts.
-    feed = MagicMock()
-    monkeypatch.setattr(sessions_mod, "notification_feed", feed, raising=True)
+    # Capture lifecycle emits at the call site inside sessions.py — patching
+    # the bound `lifecycle_emit` name avoids the dual-module-path problem
+    # (orchestrator.services.session_lifecycle vs services.session_lifecycle
+    # under pytest's two-rooted sys.path).
+    emit_calls: list[dict] = []
+
+    def _capture_emit(user_id, thread_id, state, **extra):
+        emit_calls.append(
+            {"user_id": user_id, "thread_id": thread_id, "state": state, **extra}
+        )
+
+    monkeypatch.setattr(sessions_mod, "lifecycle_emit", _capture_emit, raising=True)
 
     await sessions_mod._do_prepare(
         thread_id="t1",
@@ -147,7 +156,7 @@ async def test_do_prepare_emits_phases_for_warm_thread(monkeypatch):
     # Expected phase sequence: provisioning (up-front) → booting → ready.
     # Agent was already bound, but "provisioning" is still emitted so the
     # cockpit's resume card surfaces the phase regardless of who won the race.
-    states = [call.args[2]["state"] for call in feed.broadcast.call_args_list]
+    states = [c["state"] for c in emit_calls]
     assert states == ["provisioning", "booting", "ready"]
 
     # ensure_route called with correct pod info.
@@ -188,7 +197,7 @@ async def test_do_prepare_emits_failed_when_pod_not_ready(monkeypatch):
     async def _ready_timeout(pod_ip, pod_port, timeout_s):
         return False
 
-    monkeypatch.setattr(sessions_mod, "_wait_for_ready", _ready_timeout, raising=True)
+    monkeypatch.setattr(sessions_mod, "wait_for_ready", _ready_timeout, raising=True)
 
     import sys
 
@@ -197,8 +206,14 @@ async def test_do_prepare_emits_failed_when_pod_not_ready(monkeypatch):
     fake_main.session_router.ensure_route = AsyncMock()
     monkeypatch.setitem(sys.modules, "main", fake_main)
 
-    feed = MagicMock()
-    monkeypatch.setattr(sessions_mod, "notification_feed", feed, raising=True)
+    emit_calls: list[dict] = []
+
+    def _capture_emit(user_id, thread_id, state, **extra):
+        emit_calls.append(
+            {"user_id": user_id, "thread_id": thread_id, "state": state, **extra}
+        )
+
+    monkeypatch.setattr(sessions_mod, "lifecycle_emit", _capture_emit, raising=True)
 
     await sessions_mod._do_prepare(
         thread_id="t1",
@@ -207,7 +222,7 @@ async def test_do_prepare_emits_failed_when_pod_not_ready(monkeypatch):
         config_override=None,
     )
 
-    states = [call.args[2]["state"] for call in feed.broadcast.call_args_list]
+    states = [c["state"] for c in emit_calls]
     assert "failed" in states
     fake_main.session_router.ensure_route.assert_not_called()
 
