@@ -11731,67 +11731,11 @@ async def create_thread(
                 "config_name", "persistent_defaults"
             )
 
-            async def _provision_or_assign(
-                tid: str,
-                cfg: str,
-                co: dict,
-                pids: list,
-                ds_ids: list[str] | None,
-            ) -> None:
-                # Serialise concurrent provisioning attempts for the same
-                # thread (docs/issues/persistent_thread_double_provisioning_race.md).
-                # Re-check `agent_id` inside the lock: another path (or a
-                # retry of this one) may have already bound an agent while
-                # we waited.
-                async with postgres_db.thread_advisory_lock(tid):
-                    cur = await postgres_db.get_thread(tid)
-                    if cur and cur.get("agent_id"):
-                        logger.info(
-                            "Thread %s: already bound to agent %s — "
-                            "skipping duplicate provision.",
-                            tid,
-                            cur["agent_id"],
-                        )
-                        return
-
-                    # Try to attach an idle dual-mode agent from the warm pool
-                    # first — this is instant (no image pull or pod boot needed).
-                    idle_agent = await _find_idle_persistent_agent()
-                    if idle_agent:
-                        resolved_ds = await postgres_db.resolve_datasources_for_thread(
-                            datasource_ids=ds_ids, project_ids=pids
-                        )
-                        ds_payload = _build_datasources_payload(resolved_ds)
-                        attach_co = co
-                        if resolved_ds:
-                            attach_co = _build_datasource_tool_override(resolved_ds, co)
-                        ok = await _send_session_attach(
-                            idle_agent, tid, attach_co, pids, datasources=ds_payload
-                        )
-                        if ok:
-                            logger.info(
-                                "Thread %s: attached to idle pool agent %s",
-                                tid,
-                                idle_agent["hostname"],
-                            )
-                            return
-
-                    # No idle agent available — create a dedicated session pod.
-                    pod_name = await agent_provisioner.provision_agent(
-                        purpose="session", thread_id=tid, config_name=cfg
-                    )
-                    if pod_name:
-                        return
-
-                    logger.error(
-                        "Thread %s: no idle agents and pod provisioning failed. "
-                        "Check image availability, RBAC, node resources, "
-                        "or increase MAX_AGENTS.",
-                        tid,
-                    )
+            from services.provision_or_assign import provision_or_assign
 
             asyncio.create_task(
-                _provision_or_assign(
+                provision_or_assign(
+                    str(user["id"]),
                     thread_id,
                     effective_config,
                     config_override,

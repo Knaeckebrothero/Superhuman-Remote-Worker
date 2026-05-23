@@ -1511,7 +1511,9 @@ export class InboxPageComponent implements OnInit, OnDestroy {
   });
 
   ngOnInit(): void {
-    this.actionCenter.initSSE();
+    // SSE is opened at app-shell init (App constructor effect) so it's
+    // already up by the time the user navigates to Inbox. initSSE() is
+    // idempotent — this call is removed; keep the rest of the bring-up.
     this.actionCenter.refreshAll();
     this.sudo.loadRules();
 

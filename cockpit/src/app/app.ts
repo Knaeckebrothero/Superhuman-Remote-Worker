@@ -6,6 +6,7 @@ import {ComponentRegistryService} from './core/services/component-registry.servi
 import {ViewportService} from './core/services/viewport.service';
 import {UserService} from './core/services/user.service';
 import {SidebarService} from './core/services/sidebar.service';
+import {ActionCenterService} from './core/services/action-center.service';
 // Debug-only components
 import {PlaceholderAComponent} from './debug/components/placeholders/placeholder-a.component';
 import {PlaceholderBComponent} from './debug/components/placeholders/placeholder-b.component';
@@ -199,6 +200,7 @@ export class App implements OnInit {
   readonly userService = inject(UserService);
   private readonly registry = inject(ComponentRegistryService);
   readonly sidebar = inject(SidebarService);
+  private readonly actionCenter = inject(ActionCenterService);
 
   readonly showSidebar = computed(
     () => this.userService.isAuthenticated() && this.userService.isApproved(),
@@ -220,6 +222,19 @@ export class App implements OnInit {
         document.body.style.overflow = 'hidden';
       } else {
         document.body.style.overflow = '';
+      }
+    });
+
+    // Open the always-on notification SSE as soon as the user is signed
+    // in and approved. Previously this was lazy-initialised inside the
+    // Inbox page's ngOnInit, which meant `/notifications/events` wasn't
+    // open while the user was on /sessions creating a new chat — so
+    // `session.lifecycle` events never reached the cockpit before they
+    // were emitted. ``initSSE()`` is idempotent (guarded by its own
+    // `sseInitialized` flag), safe to call any time the predicate flips.
+    effect(() => {
+      if (this.userService.isAuthenticated() && this.userService.isApproved()) {
+        this.actionCenter.initSSE();
       }
     });
   }
