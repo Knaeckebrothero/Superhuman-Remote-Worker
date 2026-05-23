@@ -427,6 +427,165 @@ class TestSquashMergeSubjob:
 
 
 # ===========================================================================
+# _squash_merge_subjob — must not clobber parent deliverables
+# ===========================================================================
+
+
+class _StatefulFakeGitea:
+    """Gitea client fake that models per-branch file trees, so a test can
+    observe whether a subjob merge clobbers parent files.
+
+    - ``delete_file`` removes a path from the given branch's tree.
+    - ``list_contents`` returns the *immediate* file entries under a dir on a
+      ref (mirrors the real client's non-recursive listing).
+    - ``merge_pr`` models a squash merge as overlaying the head branch's tree
+      onto the base branch — the faithful reproduction of how a deletion on
+      the head branch propagates onto base.
+    """
+
+    def __init__(self, trees: dict[str, dict[str, str]]):
+        self.trees: dict[str, dict[str, str]] = {b: dict(t) for b, t in trees.items()}
+        self.is_initialized = True
+        self._prs: dict[int, tuple[str, str]] = {}
+
+    async def delete_file(self, repo, file_path, message, branch=None):
+        self.trees.get(branch, {}).pop(file_path, None)
+        return True
+
+    async def list_contents(self, repo, path="", ref=None):
+        tree = self.trees.get(ref, {})
+        prefix = f"{path}/"
+        return [
+            {"type": "file", "path": p}
+            for p in tree
+            if p.startswith(prefix) and "/" not in p[len(prefix) :]
+        ]
+
+    async def create_pr(self, repo, title, head, base="main", body=""):
+        number = len(self._prs) + 1
+        self._prs[number] = (head, base)
+        return {"number": number}
+
+    async def merge_pr(
+        self, repo, pr_index, merge_strategy="merge", delete_branch_after_merge=False
+    ):
+        head, base = self._prs[pr_index]
+        self.trees[base] = dict(self.trees[head])  # squash overlay
+        return True
+
+
+class TestSquashMergeDoesNotClobberParent:
+    """A subjob merge must never delete the parent's deliverables.
+
+    Regression tests for docs/issues/subjob_merge_clobbers_parent_deliverables.md.
+    """
+
+    @pytest.mark.asyncio
+    async def test_critic_subjob_is_not_merged(self):
+        """A critic (context.verification_target set) must NOT be squash-merged.
+        Merging it propagates the pre-merge cleanup's deletions onto the parent
+        and destroys the parent's deliverables."""
+        base_branch = "main"  # root parent -> base = "main"
+        critic_branch = "subjob/crit1234/critic"
+        # The critic branch is forked from the parent, so it inherits the
+        # parent's corpus under documents/.
+        fake = _StatefulFakeGitea(
+            {
+                base_branch: {
+                    "documents/report.pdf": "PARENT CORPUS",
+                    "src/app.py": "code",
+                },
+                critic_branch: {
+                    "documents/report.pdf": "PARENT CORPUS",
+                    "src/app.py": "code",
+                    "output/critic_verdict.json": "{}",
+                },
+            }
+        )
+        critic = {
+            "id": "critic-uuid",
+            "parent_job_id": "parent-uuid",
+            "branch_name": critic_branch,
+            "repo_name": "job-parent12",
+            "config_name": "critic",
+            "description": "Verify deliverables of job parent-uuid",
+            "context": {"verification_target": "parent-uuid", "verification_round": 0},
+        }
+        parent = {"branch_name": None}
+
+        with (
+            patch(f"{MODULE}.postgres_db") as mock_db,
+            patch(f"{MODULE}.gitea_client", fake),
+        ):
+            mock_db.get_job = AsyncMock(
+                side_effect=lambda jid: {
+                    "critic-uuid": critic,
+                    "parent-uuid": parent,
+                }.get(jid)
+            )
+            mock_db.update_job_merge_status = AsyncMock()
+
+            result = await orch_main._squash_merge_subjob("critic-uuid")
+
+        assert result == {"status": "skipped", "reason": "critic-not-merged"}
+        # The parent's corpus is untouched because no merge happened.
+        assert fake.trees[base_branch]["documents/report.pdf"] == "PARENT CORPUS"
+
+    @pytest.mark.asyncio
+    async def test_subjob_merge_preserves_parent_documents(self):
+        """A non-critic subjob merge must not delete the parent's files under
+        documents/ — those are deliverables/inputs, not job-scoped scratch —
+        while still merging the subjob's genuine new output."""
+        base_branch = "main"
+        subjob_branch = "subjob/work1234/creator"
+        # Forked from base, so the subjob branch inherits the parent's corpus.
+        fake = _StatefulFakeGitea(
+            {
+                base_branch: {
+                    "documents/corpus.pdf": "CORPUS",
+                    "src/app.py": "v1",
+                },
+                subjob_branch: {
+                    "documents/corpus.pdf": "CORPUS",
+                    "src/app.py": "v1",
+                    "output/result.md": "new deliverable",
+                    "workspace.md": "scratch",
+                },
+            }
+        )
+        subjob = {
+            "id": "work-uuid",
+            "parent_job_id": "parent-uuid",
+            "branch_name": subjob_branch,
+            "repo_name": "job-parent12",
+            "config_name": "creator",
+            "description": "Build feature",
+            # no verification_target -> not a critic
+        }
+        parent = {"branch_name": None}
+
+        with (
+            patch(f"{MODULE}.postgres_db") as mock_db,
+            patch(f"{MODULE}.gitea_client", fake),
+        ):
+            mock_db.get_job = AsyncMock(
+                side_effect=lambda jid: {
+                    "work-uuid": subjob,
+                    "parent-uuid": parent,
+                }.get(jid)
+            )
+            mock_db.update_job_merge_status = AsyncMock()
+
+            result = await orch_main._squash_merge_subjob("work-uuid")
+
+        assert result["status"] == "merged"
+        # The parent's documents/ corpus survives the merge...
+        assert fake.trees[base_branch]["documents/corpus.pdf"] == "CORPUS"
+        # ...and the subjob's genuine new output is merged in.
+        assert "output/result.md" in fake.trees[base_branch]
+
+
+# ===========================================================================
 # delete_job Gitea cleanup
 # ===========================================================================
 
@@ -653,7 +812,11 @@ class TestSubjobCleanupConstants:
         assert "plan.md" in orch_main.SUBJOB_CLEANUP_FILES
         assert "todos.yaml" in orch_main.SUBJOB_CLEANUP_FILES
 
-    def test_cleanup_dirs_contains_archive(self):
+    def test_cleanup_dirs_are_scratch_only(self):
+        # Only job-scoped scratch — never content/input dirs, which a subjob
+        # inherits from the parent and would delete from it at squash-merge.
+        # See docs/issues/subjob_merge_clobbers_parent_deliverables.md.
         assert "archive" in orch_main.SUBJOB_CLEANUP_DIRS
         assert "tools" in orch_main.SUBJOB_CLEANUP_DIRS
-        assert "documents" in orch_main.SUBJOB_CLEANUP_DIRS
+        assert "documents" not in orch_main.SUBJOB_CLEANUP_DIRS
+        assert "reference" not in orch_main.SUBJOB_CLEANUP_DIRS
