@@ -27,7 +27,7 @@ from pydantic import BaseModel, Field
 
 from security.auth import require_approved_user
 from services.session_lifecycle import emit as lifecycle_emit
-from services.session_lifecycle import wait_for_binding, wait_for_ready
+from services.session_lifecycle import probe_ready, wait_for_binding, wait_for_ready
 
 logger = logging.getLogger(__name__)
 
@@ -273,6 +273,21 @@ async def get_connection(
         raise HTTPException(status_code=409, detail="agent unavailable")
     if agent.get("status") not in ("ready", "working", "session"):
         raise HTTPException(status_code=409, detail="agent not ready")
+
+    # Verify the agent is actually session-ready before minting a token.
+    # ``agent.status`` is set by the heartbeat (~60s lag), and an idle
+    # pool agent that just received SESSION_ATTACH still reads "ready"
+    # for that window even though its ``_attach_session`` hasn't
+    # finished. For fresh-pod path, Uvicorn doesn't even start serving
+    # until ``_attach_session`` completes — so the WS would 503 at
+    # Traefik until K8s sees the pod's /ready flip true and updates
+    # endpoints. ``probe_ready`` is the truthful signal here: 425 makes
+    # the cockpit's ``_pollConnectionUntilReady`` wait (180s window)
+    # instead of opening WS into the void and burning through its
+    # 8-attempt reconnect budget before K8s converges.
+    pod_port_int = int(agent.get("pod_port", 8001))
+    if not await probe_ready(str(agent["pod_ip"]), pod_port_int):
+        raise HTTPException(status_code=425, detail="session not ready")
 
     # Make /connection self-healing: any code path that binds an agent to a
     # thread (POST /prepare, the legacy resume in main.py, orchestrator restart
