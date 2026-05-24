@@ -423,6 +423,15 @@ async def _graft_subjob_output(job_id: str) -> dict[str, Any] | None:
     }
 
 
+async def _maybe_graft_completed_subjob(job: dict[str, Any]) -> dict[str, Any] | None:
+    """Graft any completed subjob's output onto its parent. Applies uniformly
+    to scholar, delegation children, and any other subjob; critic is skipped
+    inside _graft_subjob_output. Root jobs (no parent) are ignored."""
+    if not job.get("parent_job_id"):
+        return None
+    return await _graft_subjob_output(str(job["id"]))
+
+
 # Files to delete from subjob branch before squash merge (job-scoped working files).
 SUBJOB_CLEANUP_FILES = [
     "workspace.md",
@@ -7653,12 +7662,11 @@ async def complete_job(
                         f"Failed to send freeze notification for {job_id}: {e}"
                     )
 
-        # 2. Subjob merge (if this is a subjob with a branch)
-        # Skip auto-merge for delegation children — parent reviews and merges
-        if job.get("parent_job_id") and job.get("creation_order") is None:
-            merge_result = await _squash_merge_subjob(job_id)
-            if merge_result:
-                actions.append("subjob branch merged")
+        # 2. Subjob output graft (uniform for all subjob types; critic skipped inside)
+        if job.get("parent_job_id"):
+            graft_result = await _maybe_graft_completed_subjob(job)
+            if graft_result and graft_result.get("status") == "grafted":
+                actions.append(f"subjob output grafted to {graft_result['output_path']}")
 
         # 3. Handle critic verdict (if this is a critic job)
         try:
