@@ -365,6 +365,15 @@ async def _graft_subjob_output(job_id: str) -> dict[str, Any] | None:
         await postgres_db.update_job_merge_status(job_id, merge_status="skipped")
         return {"status": "skipped", "reason": "critic-not-merged"}
 
+    # Idempotency: never graft twice — a second run would copy the output under
+    # a fresh ordinal and duplicate it. If a graft path is already recorded, skip.
+    if isinstance(ctx, dict) and ctx.get("graft_output_path"):
+        return {
+            "status": "skipped",
+            "reason": "already-grafted",
+            "output_path": ctx["graft_output_path"],
+        }
+
     repo_name = job["repo_name"]
     subjob_branch = job["branch_name"]
     short_id = str(job_id)[:8]
@@ -4192,7 +4201,7 @@ async def subjob_merge(request: Request, job_id: str) -> dict[str, Any]:
         if not job.get("parent_job_id"):
             raise HTTPException(
                 status_code=400,
-                detail="Only subjobs (with parent_job_id) can be squash-merged",
+                detail="Only subjobs (with parent_job_id) can be grafted",
             )
 
         result = await _graft_subjob_output(job_id)

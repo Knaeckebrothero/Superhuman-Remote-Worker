@@ -564,6 +564,36 @@ class TestGraftSubjobOutput:
         assert result["output_path"] == "outputs/002-scholar-sub-uuid"
         assert fake.trees["main"]["outputs/002-scholar-sub-uuid/y.md"] == b"new"
 
+    @pytest.mark.asyncio
+    async def test_already_grafted_is_skipped(self):
+        # Re-invoking after a graft must NOT copy the output again under a new
+        # ordinal. The recorded graft_output_path short-circuits the function.
+        fake = _GraftFakeGitea(
+            {
+                "main": {"outputs/001-scholar-sub-uuid/x.md": b"prev"},
+                "subjob/1234abcd/scholar": {"output/y.md": b"new"},
+            }
+        )
+        already = _subjob(context={"graft_output_path": "outputs/001-scholar-sub-uuid"})
+        with (
+            patch(f"{MODULE}.postgres_db") as db,
+            patch(f"{MODULE}.gitea_client", fake),
+        ):
+            db.get_job = AsyncMock(
+                side_effect=lambda j: {"sub-uuid-1234abcd": already, "parent-uuid": {"branch_name": None}}.get(j)
+            )
+            db.update_job_merge_status = AsyncMock()
+            db.update_job_context = AsyncMock()
+
+            result = await orch_main._graft_subjob_output("sub-uuid-1234abcd")
+
+        assert result["status"] == "skipped"
+        assert result["reason"] == "already-grafted"
+        assert result["output_path"] == "outputs/001-scholar-sub-uuid"
+        # No second ordinal folder created; context not rewritten.
+        assert not any(k.startswith("outputs/002-") for k in fake.trees["main"])
+        db.update_job_context.assert_not_called()
+
 
 class TestCompletionGraftWiring:
     @pytest.mark.asyncio
@@ -596,7 +626,14 @@ class TestCompletionGraftWiring:
 class TestScholarOutputPointer:
     @pytest.mark.asyncio
     async def test_scholar_completion_sets_parent_output_dir_to_graft_path(self):
-        scholar = {
+        # The in-memory scholar passed to the handler predates the graft's
+        # context write, so it LACKS graft_output_path. The DB row (re-fetched)
+        # has it. This guards the re-fetch: reading the in-memory ctx yields None.
+        scholar_in_memory = {
+            "id": "sch-1", "parent_job_id": "par-1", "status": "completed",
+            "context": {"scholar_target": "par-1"},
+        }
+        scholar_fresh = {
             "id": "sch-1", "parent_job_id": "par-1", "status": "completed",
             "context": {"scholar_target": "par-1", "graft_output_path": "outputs/003-scholar-sch1"},
         }
@@ -608,12 +645,57 @@ class TestScholarOutputPointer:
 
         with patch(f"{MODULE}.postgres_db") as db:
             db.get_job = AsyncMock(
-                side_effect=lambda j: {"sch-1": scholar, "par-1": parent}.get(j)
+                side_effect=lambda j: {"sch-1": scholar_fresh, "par-1": parent}.get(j)
             )
             db.update_job_context = AsyncMock(side_effect=upd_ctx)
             db.update_job_status = AsyncMock()
             with patch(f"{MODULE}._trigger_dispatch"):
-                await orch_main._handle_scholar_completion(scholar, [])
+                await orch_main._handle_scholar_completion(scholar_in_memory, [])
 
         assert captured["par-1"]["scholar_output_dir"] == "outputs/003-scholar-sch1"
         assert captured["par-1"]["scholar_completed"] is True
+
+
+class TestDelegationOutputPathPopulation:
+    """The resume builder must surface each child's graft_output_path as output_path."""
+
+    @pytest.mark.asyncio
+    async def test_child_results_carry_graft_output_path(self):
+        # Graft writes graft_output_path into each child's DB context; the
+        # delegation resume builder must read it back as output_path. Locks the
+        # producer->consumer key contract for _handle_delegation_child_completion.
+        job = {"id": "child-1", "parent_job_id": "par-1", "creation_order": 1}
+        parent = {"id": "par-1", "status": "waiting", "context": {}}
+        children = [
+            {
+                "id": "c0", "creation_order": 0, "status": "completed",
+                "config_name": "scholar", "branch_name": "subjob/c0/scholar",
+                "context": {"graft_output_path": "outputs/001-scholar-c0"},
+                "freeze_data": {"summary": "did X"},
+            },
+            {
+                "id": "c1", "creation_order": 1, "status": "completed",
+                "config_name": "developer", "branch_name": "subjob/c1/developer",
+                "context": {},  # produced no output -> no graft path
+                "freeze_data": {},
+            },
+        ]
+        captured = {}
+
+        async def upd_ctx(jid, ctx):
+            captured[jid] = ctx
+
+        with patch(f"{MODULE}.postgres_db") as db:
+            db.all_delegation_children_terminal = AsyncMock(return_value=True)
+            db.get_job = AsyncMock(side_effect=lambda j: {"par-1": parent}.get(j))
+            db.get_delegation_children = AsyncMock(return_value=children)
+            db.update_job_context = AsyncMock(side_effect=upd_ctx)
+            db.update_job_status = AsyncMock()
+            with patch(f"{MODULE}._trigger_dispatch"):
+                await orch_main._handle_delegation_child_completion(job, [])
+
+        results = captured["par-1"]["delegation_results"]
+        by_order = {r["creation_order"]: r for r in results}
+        assert by_order[0]["output_path"] == "outputs/001-scholar-c0"
+        assert by_order[0]["config_name"] == "scholar"
+        assert by_order[1]["output_path"] is None
