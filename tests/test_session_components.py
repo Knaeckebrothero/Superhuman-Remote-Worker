@@ -69,3 +69,38 @@ def test_normalize_tool_message_becomes_tool_result_component():
     assert comp.tool_results == [{"tool_call_id": "call_1", "content": "file contents"}]
     assert comp.text is None
     assert comp.tool_calls == []
+
+
+import pytest
+from src.llm.session_components import components_to_provider_messages
+
+
+def test_rebuild_chat_completions_request_from_components():
+    comps = [
+        MessageComponents(role="human", text="read a.txt", provider="openai-chat"),
+        MessageComponents(role="ai", text="ok", provider="openai-chat",
+            tool_calls=[{"name": "read_file", "args": {"path": "a.txt"},
+                         "id": "call_1", "type": "tool_call"}]),
+        MessageComponents(role="tool", provider="openai-chat",
+            tool_results=[{"tool_call_id": "call_1", "content": "file body"}]),
+    ]
+    out = components_to_provider_messages(comps, target_provider="openai-chat")
+    assert out == [
+        {"role": "user", "content": "read a.txt"},
+        {"role": "assistant", "content": "ok", "tool_calls": [
+            {"id": "call_1", "type": "function",
+             "function": {"name": "read_file", "arguments": '{"path": "a.txt"}'}}]},
+        {"role": "tool", "tool_call_id": "call_1", "content": "file body"},
+    ]
+
+
+def test_assistant_without_tool_calls_omits_key():
+    comps = [MessageComponents(role="ai", text="hello", provider="openai-chat")]
+    assert components_to_provider_messages(comps, target_provider="openai-chat") == \
+        [{"role": "assistant", "content": "hello"}]
+
+
+def test_non_cc_provider_replay_is_forward_compat():
+    comps = [MessageComponents(role="ai", text="x", provider="anthropic")]
+    with pytest.raises(NotImplementedError):
+        components_to_provider_messages(comps, target_provider="anthropic")
