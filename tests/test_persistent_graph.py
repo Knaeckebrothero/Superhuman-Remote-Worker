@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from langchain_core.messages import (
     AIMessage,
+    AIMessageChunk,
     BaseMessage,
     HumanMessage,
     SystemMessage,
@@ -2746,3 +2747,67 @@ class TestVMUpgradeDetection:
         )
 
         on_upgrade.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Streamed-response normalization (regression:
+# persistent_session_empty_chunk_history_corruption)
+# ---------------------------------------------------------------------------
+
+
+class TestStreamedResponseNormalization:
+    """A streamed AIMessageChunk must never land in history as a raw chunk,
+    and an empty interrupted partial must be dropped rather than appended —
+    otherwise the next turn's request serialization raises
+    'TypeError: Got unknown type ...' ("malformed response")."""
+
+    @pytest.mark.asyncio
+    async def test_normal_streamed_chunk_appended_as_concrete_ai_message(self):
+        messages = [SystemMessage(content="sys"), HumanMessage(content="go")]
+
+        await _execute_turn(
+            llm_with_tools=_make_streaming_llm(AIMessageChunk(content="answer")),
+            tool_map={},
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
+            messages=messages,
+            callbacks=_make_callbacks(),
+            llm_timeout=600,
+            auxiliary_llm=None,
+            workspace_content=None,
+            config=_make_config(),
+        )
+
+        ai = [m for m in messages if isinstance(m, AIMessage)]
+        assert len(ai) == 1
+        assert type(ai[0]) is AIMessage  # concrete, not AIMessageChunk
+        assert ai[0].content == "answer"
+
+    @pytest.mark.asyncio
+    async def test_empty_interrupted_partial_is_not_appended(self):
+        messages = [SystemMessage(content="sys"), HumanMessage(content="go")]
+        # check_interrupt: False at top-of-loop (line 434), then "graceful"
+        # mid-stream (line 574) so the partial-handling path runs.
+        check = MagicMock(side_effect=[False, "graceful"])
+
+        result = await _execute_turn(
+            llm_with_tools=_make_streaming_llm(
+                AIMessageChunk(content="", id="lc_run--019e5adc-0945-7b73")
+            ),
+            tool_map={},
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
+            messages=messages,
+            callbacks=_make_callbacks(check_interrupt=check),
+            llm_timeout=600,
+            auxiliary_llm=None,
+            workspace_content=None,
+            config=_make_config(),
+        )
+
+        assert result.interrupted is True
+        # The empty partial must NOT be in history (neither chunk nor concrete).
+        assert len(messages) == 2
+        assert not any(isinstance(m, AIMessage) for m in messages)

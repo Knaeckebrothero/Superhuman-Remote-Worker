@@ -30,6 +30,7 @@ from langchain_core.messages import (
 
 from .core.context import ContextManager
 from .llm.reasoning_chat import extract_reasoning_text_from_block
+from .llm.response_guards import coerce_to_ai_message, finalize_streamed_response
 from .services.image_content import extract_image_tags, make_multimodal_user_message
 
 logger = logging.getLogger(__name__)
@@ -677,13 +678,21 @@ async def _execute_turn(
                         )
                     elif response:
                         # graceful (or legacy bool True): strip incomplete
-                        # tool calls from partial response and keep it.
+                        # tool calls from partial response and keep it — but
+                        # only if it carries real content. An empty partial is
+                        # a raw streaming chunk that, left in history, makes the
+                        # next turn's request serialization raise "Got unknown
+                        # type" (see persistent_session_empty_chunk_history_
+                        # corruption). finalize_streamed_response coerces the
+                        # chunk to a concrete AIMessage and drops it if empty.
                         if hasattr(response, "tool_calls"):
                             response.tool_calls = []
                         if hasattr(response, "invalid_tool_calls"):
                             response.invalid_tool_calls = []
-                        messages.append(response)
-                        messages_added += 1
+                        final = finalize_streamed_response(response)
+                        if final is not None:
+                            messages.append(final)
+                            messages_added += 1
                     return TurnResult(
                         turn_id=0,
                         messages_added=messages_added,
@@ -830,8 +839,11 @@ async def _execute_turn(
                 )
                 await callbacks.on_token(response_content)
 
-        # Sanitize for Responses API compatibility (null IDs from OpenRouter)
-        response = _sanitize_ai_response(response)
+        # Coerce a streamed chunk to a concrete AIMessage before it enters
+        # history (the next turn's request serialization rejects raw chunk
+        # types), then sanitize for Responses API compatibility (null IDs
+        # from OpenRouter).
+        response = _sanitize_ai_response(coerce_to_ai_message(response))
 
         # Add AI response to message history
         messages.append(response)
