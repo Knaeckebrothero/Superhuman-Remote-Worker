@@ -12,6 +12,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import secrets
 import sys
 import time
@@ -313,6 +314,22 @@ async def resolve_job_repo(job_id: str) -> tuple[str, str | None]:
 
     # Non-project legacy jobs: repo named job-{full-uuid}
     return f"job-{job_id}", None
+
+
+async def _next_output_ordinal(repo_name: str, base_branch: str) -> str:
+    """Return the next zero-padded ordinal for `outputs/<n>-...` on base_branch.
+
+    Per-repo, recency-ordered. Sequential (no async subjobs), so max+1 is race-free.
+    """
+    entries = await gitea_client.list_contents(repo_name, "outputs", ref=base_branch) or []
+    nums = []
+    for entry in entries:
+        if entry.get("type") == "dir":
+            m = re.match(r"(\d+)-", entry.get("name", ""))
+            if m:
+                nums.append(int(m.group(1)))
+    nxt = (max(nums) + 1) if nums else 1
+    return f"{nxt:03d}"
 
 
 # Files to delete from subjob branch before squash merge (job-scoped working files).

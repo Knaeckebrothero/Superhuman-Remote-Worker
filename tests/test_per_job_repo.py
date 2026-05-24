@@ -820,3 +820,42 @@ class TestSubjobCleanupConstants:
         assert "tools" in orch_main.SUBJOB_CLEANUP_DIRS
         assert "documents" not in orch_main.SUBJOB_CLEANUP_DIRS
         assert "reference" not in orch_main.SUBJOB_CLEANUP_DIRS
+
+
+# ===========================================================================
+# _next_output_ordinal
+# ===========================================================================
+
+
+class _OutputsFake:
+    """Minimal gitea fake exposing list_contents for an `outputs/` dir."""
+
+    def __init__(self, outputs_dirs: list[str]):
+        # outputs_dirs: directory names directly under outputs/, e.g. ["001-scholar-aa"]
+        self._dirs = outputs_dirs
+        self.is_initialized = True
+
+    async def list_contents(self, repo, path="", ref=None):
+        if path != "outputs":
+            return []
+        return [{"name": d, "path": f"outputs/{d}", "type": "dir"} for d in self._dirs]
+
+
+class TestNextOutputOrdinal:
+    @pytest.mark.asyncio
+    async def test_first_ordinal_is_001(self):
+        fake = _OutputsFake([])
+        with patch(f"{MODULE}.gitea_client", fake):
+            assert await orch_main._next_output_ordinal("job-x", "main") == "001"
+
+    @pytest.mark.asyncio
+    async def test_increments_past_highest(self):
+        fake = _OutputsFake(["001-scholar-aa", "002-critic-bb", "010-developer-cc"])
+        with patch(f"{MODULE}.gitea_client", fake):
+            assert await orch_main._next_output_ordinal("job-x", "main") == "011"
+
+    @pytest.mark.asyncio
+    async def test_ignores_non_numbered_entries(self):
+        fake = _OutputsFake(["notes", "003-scholar-dd"])
+        with patch(f"{MODULE}.gitea_client", fake):
+            assert await orch_main._next_output_ordinal("job-x", "main") == "004"
