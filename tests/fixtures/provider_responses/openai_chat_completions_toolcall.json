@@ -1,0 +1,36 @@
+{
+  "_fixture_note": "REAL response captured 2026-05-24 from srw-codex-proxy:8317/v1/chat/completions for model gpt-5.5 (prompt forced a get_weather tool call). The proxy wraps a Responses backend in a Chat Completions envelope (note object=chat.completion, while id has a resp_ prefix). reasoning_content was null here (reasoning_tokens=0); it is a flat string field when populated, NOT Responses-API reasoning items. This is the canonical shape the agent's langchain ChatOpenAI sees.",
+  "id": "resp_0693a1eaa8bda7b9016a13665e314c819185e6acb4a6eeed07",
+  "object": "chat.completion",
+  "created": 1779656286,
+  "model": "gpt-5.5",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": null,
+        "reasoning_content": null,
+        "tool_calls": [
+          {
+            "id": "call_iFsaLzXUZcwGc7XLtQHGcdv5",
+            "type": "function",
+            "function": {
+              "name": "get_weather",
+              "arguments": "{\"city\":\"Paris\"}"
+            }
+          }
+        ]
+      },
+      "finish_reason": "tool_calls",
+      "native_finish_reason": "tool_calls"
+    }
+  ],
+  "usage": {
+    "completion_tokens": 18,
+    "total_tokens": 422,
+    "prompt_tokens": 404,
+    "prompt_tokens_details": {"cached_tokens": 0},
+    "completion_tokens_details": {"reasoning_tokens": 0}
+  }
+}
