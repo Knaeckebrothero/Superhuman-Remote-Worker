@@ -141,8 +141,6 @@ class TestCreateGitTools:
             "git_diff",
             "git_status",
             "git_tags",
-            "git_merge_squash",
-            "git_worktree_cleanup",
         }
         assert tool_names == expected
 
@@ -374,10 +372,7 @@ class TestGitToolsInactive:
         tools = create_git_tools(ctx)
 
         # Tools with required params need minimal valid input
-        required_args = {
-            "git_merge_squash": {"branch": "test"},
-            "git_worktree_cleanup": {"branch": "test"},
-        }
+        required_args = {}
         for tool in tools:
             args = required_args.get(tool.name, {})
             result = tool.invoke(args)
