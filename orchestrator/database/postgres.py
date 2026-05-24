@@ -2135,11 +2135,26 @@ class PostgresDB:
             # preserved against the agent's reported status. The agent's
             # heartbeat would otherwise overwrite drain intent on the next
             # 5s tick. Phase 1 replaces this with a separate intent column.
+            #
+            # Offline pin: once the lifecycle reconciler has marked the agent
+            # offline (because its pod is gone), a late in-flight heartbeat
+            # from the pod's SIGTERM grace period must not be allowed to
+            # resurrect the row back to 'ready'. An agent that wants to
+            # rejoin must re-/register, which mints a new agent_id.
+            # Without this guard, ``_find_idle_persistent_agent`` cheerfully
+            # matches the dead row (most-recent ``last_heartbeat`` puts it
+            # at the top of the pool query) and ``_send_session_attach``
+            # binds the thread to a pod that's about to disappear — see
+            # the 2026-05-24 thread 352144ea regression.
             if metrics:
                 result = await conn.execute(
                     f"""
                     UPDATE agents
-                    SET status = CASE WHEN status = 'draining' THEN 'draining' ELSE $1 END,
+                    SET status = CASE
+                                   WHEN status = 'draining' THEN 'draining'
+                                   WHEN status = 'offline'  THEN 'offline'
+                                   ELSE $1
+                                 END,
                         current_job_id = $2,
                         last_heartbeat = CURRENT_TIMESTAMP,
                         metadata = metadata || $3::jsonb
@@ -2155,7 +2170,11 @@ class PostgresDB:
                 result = await conn.execute(
                     f"""
                     UPDATE agents
-                    SET status = CASE WHEN status = 'draining' THEN 'draining' ELSE $1 END,
+                    SET status = CASE
+                                   WHEN status = 'draining' THEN 'draining'
+                                   WHEN status = 'offline'  THEN 'offline'
+                                   ELSE $1
+                                 END,
                         current_job_id = $2,
                         last_heartbeat = CURRENT_TIMESTAMP
                         {"  , last_completed_at = CURRENT_TIMESTAMP" if set_completed else ""}
@@ -2169,7 +2188,12 @@ class PostgresDB:
             if result != "UPDATE 1":
                 return None
 
-            effective_status = "draining" if prev_status == "draining" else status
+            if prev_status == "draining":
+                effective_status = "draining"
+            elif prev_status == "offline":
+                effective_status = "offline"
+            else:
+                effective_status = status
             return {
                 "previous_status": prev_status,
                 "effective_status": effective_status,
