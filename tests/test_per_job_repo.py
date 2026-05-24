@@ -771,32 +771,26 @@ class TestSubjobMergeEndpoint:
             assert result["status"] == "skipped"
 
     @pytest.mark.asyncio
-    async def test_returns_merge_result(self):
-        """Happy path: returns merged result from _squash_merge_subjob."""
+    async def test_returns_graft_result(self):
+        """Happy path: returns graft result from _graft_subjob_output."""
         job = {
             "parent_job_id": "parent-id",
-            "branch_name": "subjob/abc/creator",
+            "branch_name": "subjob/abc/scholar",
             "repo_name": "job-parent",
         }
 
         with (
             patch(f"{MODULE}.postgres_db") as mock_db,
-            patch(
-                f"{MODULE}._squash_merge_subjob", new_callable=AsyncMock
-            ) as mock_merge,
+            patch(f"{MODULE}._graft_subjob_output", new_callable=AsyncMock) as mock_graft,
             _bypass_require_internal(),
         ):
             mock_db.get_job = AsyncMock(return_value=job)
-            mock_merge.return_value = {
-                "status": "merged",
-                "pr_number": 42,
-                "base_branch": "main",
-            }
+            mock_graft.return_value = {"status": "grafted", "output_path": "outputs/001-scholar-abc"}
 
             result = await orch_main.subjob_merge(_stub_request(), "subjob-id")
-            assert result["status"] == "merged"
+            assert result["status"] == "grafted"
             assert result["job_id"] == "subjob-id"
-            assert result["pr_number"] == 42
+            assert result["output_path"] == "outputs/001-scholar-abc"
 
 
 # ===========================================================================
