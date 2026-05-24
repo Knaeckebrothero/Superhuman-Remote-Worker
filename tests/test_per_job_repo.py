@@ -1051,3 +1051,29 @@ class TestCompletionGraftWiring:
             res = await orch_main._maybe_graft_completed_subjob({"id": "r", "parent_job_id": None})
         assert res is None
         g.assert_not_called()
+
+
+class TestScholarOutputPointer:
+    @pytest.mark.asyncio
+    async def test_scholar_completion_sets_parent_output_dir_to_graft_path(self):
+        scholar = {
+            "id": "sch-1", "parent_job_id": "par-1", "status": "completed",
+            "context": {"scholar_target": "par-1", "graft_output_path": "outputs/003-scholar-sch1"},
+        }
+        parent = {"id": "par-1", "status": "waiting", "context": {}}
+        captured = {}
+
+        async def upd_ctx(jid, ctx):
+            captured[jid] = ctx
+
+        with patch(f"{MODULE}.postgres_db") as db:
+            db.get_job = AsyncMock(
+                side_effect=lambda j: {"sch-1": scholar, "par-1": parent}.get(j)
+            )
+            db.update_job_context = AsyncMock(side_effect=upd_ctx)
+            db.update_job_status = AsyncMock()
+            with patch(f"{MODULE}._trigger_dispatch"):
+                await orch_main._handle_scholar_completion(scholar, [])
+
+        assert captured["par-1"]["scholar_output_dir"] == "outputs/003-scholar-sch1"
+        assert captured["par-1"]["scholar_completed"] is True

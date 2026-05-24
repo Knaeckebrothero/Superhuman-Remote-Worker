@@ -6723,9 +6723,10 @@ async def _handle_scholar_completion(
 ) -> None:
     """After a scholar subjob completes or fails, unblock its parent job.
 
-    The scholar's branch has already been merged by ``_squash_merge_subjob``
-    (called earlier in ``complete_job``).  We just need to transition the
-    parent from 'waiting' to 'created' so the dispatcher picks it up.
+    The scholar's ``output/`` has already been grafted onto the parent branch by
+    ``_graft_subjob_output`` (called earlier in ``complete_job``); here we point
+    the parent at that grafted ``outputs/`` folder and transition it from
+    'waiting' to 'created' so the dispatcher picks it up.
     """
     parent_job_id = job.get("parent_job_id")
     if parent_job_id is None:
@@ -6780,7 +6781,17 @@ async def _handle_scholar_completion(
         )
     else:
         parent_ctx["scholar_completed"] = True
-        parent_ctx["scholar_output_dir"] = "research"
+        # The graft (run earlier in complete_job) wrote graft_output_path to the
+        # scholar's DB context; the in-memory `job` here predates that write, so
+        # re-fetch to read the freshly-grafted outputs/ path (None if no output).
+        fresh = await postgres_db.get_job(job_id)
+        fresh_ctx = (fresh or {}).get("context") or {}
+        if isinstance(fresh_ctx, str):
+            try:
+                fresh_ctx = json.loads(fresh_ctx)
+            except (json.JSONDecodeError, ValueError):
+                fresh_ctx = {}
+        parent_ctx["scholar_output_dir"] = (fresh_ctx or {}).get("graft_output_path")
         logger.info(f"Scholar {job_id} completed — unblocking parent {target_id}")
         actions.append(f"scholar {job_id} completed, parent {target_id} unblocked")
 
