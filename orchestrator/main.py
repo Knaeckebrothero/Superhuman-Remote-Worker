@@ -6862,12 +6862,21 @@ async def _handle_delegation_child_completion(
                 freeze = {}
         freeze = freeze or {}
 
+        child_ctx = child.get("context") or {}
+        if isinstance(child_ctx, str):
+            try:
+                child_ctx = json.loads(child_ctx)
+            except (json.JSONDecodeError, ValueError):
+                child_ctx = {}
+        child_output_path = (child_ctx or {}).get("graft_output_path")
+
         child_results.append(
             {
                 "job_id": child_id,
                 "description": child.get("description", ""),
                 "status": child_status,
                 "config_name": child.get("config_name", "default"),
+                "output_path": child_output_path,
                 "creation_order": child.get("creation_order"),
                 "branch_name": child.get("branch_name"),
                 "worktree_path": child.get("worktree_path"),
@@ -6997,12 +7006,21 @@ async def _check_delegation_timeouts() -> int:
                         freeze_child = {}
                 freeze_child = freeze_child or {}
 
+                child_ctx = child.get("context") or {}
+                if isinstance(child_ctx, str):
+                    try:
+                        child_ctx = json.loads(child_ctx)
+                    except (json.JSONDecodeError, ValueError):
+                        child_ctx = {}
+                child_output_path = (child_ctx or {}).get("graft_output_path")
+
                 child_results.append(
                     {
                         "job_id": child_id,
                         "description": child.get("description", ""),
                         "status": child.get("status", "unknown"),
                         "config_name": child.get("config_name", "default"),
+                        "output_path": child_output_path,
                         "creation_order": child.get("creation_order"),
                         "branch_name": child.get("branch_name"),
                         "summary": freeze_child.get("summary", ""),
