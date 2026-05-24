@@ -350,11 +350,16 @@ class TestSubjobMergeEndpoint:
 
         with (
             patch(f"{MODULE}.postgres_db") as mock_db,
-            patch(f"{MODULE}._graft_subjob_output", new_callable=AsyncMock) as mock_graft,
+            patch(
+                f"{MODULE}._graft_subjob_output", new_callable=AsyncMock
+            ) as mock_graft,
             _bypass_require_internal(),
         ):
             mock_db.get_job = AsyncMock(return_value=job)
-            mock_graft.return_value = {"status": "grafted", "output_path": "outputs/001-scholar-abc"}
+            mock_graft.return_value = {
+                "status": "grafted",
+                "output_path": "outputs/001-scholar-abc",
+            }
 
             result = await orch_main.subjob_merge(_stub_request(), "subjob-id")
             assert result["status"] == "grafted"
@@ -464,11 +469,11 @@ class TestGraftSubjobOutput:
             {
                 "main": {"documents/corpus.pdf": b"PARENT", "src/app.py": b"code"},
                 "subjob/1234abcd/scholar": {
-                    "documents/corpus.pdf": b"PARENT",   # inherited from fork
+                    "documents/corpus.pdf": b"PARENT",  # inherited from fork
                     "src/app.py": b"code",
                     "output/ideas/idea.md": b"# idea",
                     "output/report.pdf": b"\x89PDFbytes",
-                    "workspace.md": b"scratch",          # NOT under output/
+                    "workspace.md": b"scratch",  # NOT under output/
                 },
             }
         )
@@ -477,7 +482,10 @@ class TestGraftSubjobOutput:
             patch(f"{MODULE}.gitea_client", fake),
         ):
             db.get_job = AsyncMock(
-                side_effect=lambda j: {"sub-uuid-1234abcd": _subjob(), "parent-uuid": {"branch_name": None}}.get(j)
+                side_effect=lambda j: {
+                    "sub-uuid-1234abcd": _subjob(),
+                    "parent-uuid": {"branch_name": None},
+                }.get(j)
             )
             db.update_job_merge_status = AsyncMock()
             db.update_job_context = AsyncMock()
@@ -487,12 +495,20 @@ class TestGraftSubjobOutput:
         assert result["status"] == "grafted"
         assert result["output_path"] == "outputs/001-scholar-sub-uuid"
         # output/ contents relocated under the namespaced dir, prefix stripped:
-        assert fake.trees["main"]["outputs/001-scholar-sub-uuid/ideas/idea.md"] == b"# idea"
-        assert fake.trees["main"]["outputs/001-scholar-sub-uuid/report.pdf"] == b"\x89PDFbytes"
+        assert (
+            fake.trees["main"]["outputs/001-scholar-sub-uuid/ideas/idea.md"]
+            == b"# idea"
+        )
+        assert (
+            fake.trees["main"]["outputs/001-scholar-sub-uuid/report.pdf"]
+            == b"\x89PDFbytes"
+        )
         # parent content untouched; scratch + inherited tree NOT propagated:
         assert fake.trees["main"]["documents/corpus.pdf"] == b"PARENT"
         assert "outputs/001-scholar-sub-uuid/workspace.md" not in fake.trees["main"]
-        db.update_job_merge_status.assert_awaited_with("sub-uuid-1234abcd", merge_status="grafted")
+        db.update_job_merge_status.assert_awaited_with(
+            "sub-uuid-1234abcd", merge_status="grafted"
+        )
 
     @pytest.mark.asyncio
     async def test_critic_grafts_nothing(self):
@@ -512,7 +528,10 @@ class TestGraftSubjobOutput:
             patch(f"{MODULE}.gitea_client", fake),
         ):
             db.get_job = AsyncMock(
-                side_effect=lambda j: {"sub-uuid-1234abcd": critic, "parent-uuid": {"branch_name": None}}.get(j)
+                side_effect=lambda j: {
+                    "sub-uuid-1234abcd": critic,
+                    "parent-uuid": {"branch_name": None},
+                }.get(j)
             )
             db.update_job_merge_status = AsyncMock()
             db.update_job_context = AsyncMock()
@@ -532,7 +551,10 @@ class TestGraftSubjobOutput:
             patch(f"{MODULE}.gitea_client", fake),
         ):
             db.get_job = AsyncMock(
-                side_effect=lambda j: {"sub-uuid-1234abcd": _subjob(), "parent-uuid": {"branch_name": None}}.get(j)
+                side_effect=lambda j: {
+                    "sub-uuid-1234abcd": _subjob(),
+                    "parent-uuid": {"branch_name": None},
+                }.get(j)
             )
             db.update_job_merge_status = AsyncMock()
             db.update_job_context = AsyncMock()
@@ -554,7 +576,10 @@ class TestGraftSubjobOutput:
             patch(f"{MODULE}.gitea_client", fake),
         ):
             db.get_job = AsyncMock(
-                side_effect=lambda j: {"sub-uuid-1234abcd": _subjob(), "parent-uuid": {"branch_name": None}}.get(j)
+                side_effect=lambda j: {
+                    "sub-uuid-1234abcd": _subjob(),
+                    "parent-uuid": {"branch_name": None},
+                }.get(j)
             )
             db.update_job_merge_status = AsyncMock()
             db.update_job_context = AsyncMock()
@@ -580,7 +605,10 @@ class TestGraftSubjobOutput:
             patch(f"{MODULE}.gitea_client", fake),
         ):
             db.get_job = AsyncMock(
-                side_effect=lambda j: {"sub-uuid-1234abcd": already, "parent-uuid": {"branch_name": None}}.get(j)
+                side_effect=lambda j: {
+                    "sub-uuid-1234abcd": already,
+                    "parent-uuid": {"branch_name": None},
+                }.get(j)
             )
             db.update_job_merge_status = AsyncMock()
             db.update_job_context = AsyncMock()
@@ -603,11 +631,17 @@ class TestCompletionGraftWiring:
 
         async def fake_graft(job_id):
             called["job_id"] = job_id
-            return {"status": "grafted", "output_path": "outputs/001-developer-deadbeef"}
+            return {
+                "status": "grafted",
+                "output_path": "outputs/001-developer-deadbeef",
+            }
 
         child = {
-            "id": "deadbeef-child", "parent_job_id": "p", "creation_order": 0,
-            "branch_name": "subjob/deadbeef/developer", "repo_name": "job-p",
+            "id": "deadbeef-child",
+            "parent_job_id": "p",
+            "creation_order": 0,
+            "branch_name": "subjob/deadbeef/developer",
+            "repo_name": "job-p",
             "config_name": "developer",
         }
         with patch(f"{MODULE}._graft_subjob_output", side_effect=fake_graft):
@@ -618,7 +652,9 @@ class TestCompletionGraftWiring:
     @pytest.mark.asyncio
     async def test_no_graft_for_root_job(self):
         with patch(f"{MODULE}._graft_subjob_output", new_callable=AsyncMock) as g:
-            res = await orch_main._maybe_graft_completed_subjob({"id": "r", "parent_job_id": None})
+            res = await orch_main._maybe_graft_completed_subjob(
+                {"id": "r", "parent_job_id": None}
+            )
         assert res is None
         g.assert_not_called()
 
@@ -630,12 +666,19 @@ class TestScholarOutputPointer:
         # context write, so it LACKS graft_output_path. The DB row (re-fetched)
         # has it. This guards the re-fetch: reading the in-memory ctx yields None.
         scholar_in_memory = {
-            "id": "sch-1", "parent_job_id": "par-1", "status": "completed",
+            "id": "sch-1",
+            "parent_job_id": "par-1",
+            "status": "completed",
             "context": {"scholar_target": "par-1"},
         }
         scholar_fresh = {
-            "id": "sch-1", "parent_job_id": "par-1", "status": "completed",
-            "context": {"scholar_target": "par-1", "graft_output_path": "outputs/003-scholar-sch1"},
+            "id": "sch-1",
+            "parent_job_id": "par-1",
+            "status": "completed",
+            "context": {
+                "scholar_target": "par-1",
+                "graft_output_path": "outputs/003-scholar-sch1",
+            },
         }
         parent = {"id": "par-1", "status": "waiting", "context": {}}
         captured = {}
@@ -668,14 +711,20 @@ class TestDelegationOutputPathPopulation:
         parent = {"id": "par-1", "status": "waiting", "context": {}}
         children = [
             {
-                "id": "c0", "creation_order": 0, "status": "completed",
-                "config_name": "scholar", "branch_name": "subjob/c0/scholar",
+                "id": "c0",
+                "creation_order": 0,
+                "status": "completed",
+                "config_name": "scholar",
+                "branch_name": "subjob/c0/scholar",
                 "context": {"graft_output_path": "outputs/001-scholar-c0"},
                 "freeze_data": {"summary": "did X"},
             },
             {
-                "id": "c1", "creation_order": 1, "status": "completed",
-                "config_name": "developer", "branch_name": "subjob/c1/developer",
+                "id": "c1",
+                "creation_order": 1,
+                "status": "completed",
+                "config_name": "developer",
+                "branch_name": "subjob/c1/developer",
                 "context": {},  # produced no output -> no graft path
                 "freeze_data": {},
             },

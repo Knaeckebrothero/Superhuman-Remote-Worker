@@ -1,4 +1,5 @@
 """Unit test for GiteaClient.change_files (batch multi-file single commit)."""
+
 import os
 import sys
 from pathlib import Path
@@ -45,6 +46,14 @@ async def test_change_files_posts_batch_create_payload():
     assert body["branch"] == "main"
     assert body["message"] == "Graft outputs/001-scholar-abcd1234"
     assert body["files"] == [
-        {"operation": "create", "path": "outputs/001-scholar-abcd1234/a.md", "content": "YQ=="},
-        {"operation": "create", "path": "outputs/001-scholar-abcd1234/b.bin", "content": "Yg=="},
+        {
+            "operation": "create",
+            "path": "outputs/001-scholar-abcd1234/a.md",
+            "content": "YQ==",
+        },
+        {
+            "operation": "create",
+            "path": "outputs/001-scholar-abcd1234/b.bin",
+            "content": "Yg==",
+        },
     ]
