@@ -547,6 +547,12 @@ class TestSaveThreadMessage:
                     "metrics": None,
                     "tool_call_id": None,
                     "thinking": None,
+                    "reasoning": None,
+                    "tool_results": None,
+                    "provider": None,
+                    "provider_raw": None,
+                    "additional_kwargs": None,
+                    "response_metadata": None,
                 },
             )
 
