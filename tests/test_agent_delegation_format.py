@@ -1,4 +1,5 @@
 """Delegation resume message must reference grafted outputs, not branch merges."""
+
 import os
 import sys
 from pathlib import Path
@@ -16,14 +17,17 @@ def test_format_references_output_paths_not_branches():
     msg = _format_delegation_results(
         [
             {
-                "creation_order": 0, "status": "completed", "job_id": "c0",
-                "config_name": "scholar", "summary": "found X",
+                "creation_order": 0,
+                "status": "completed",
+                "job_id": "c0",
+                "config_name": "scholar",
+                "summary": "found X",
                 "output_path": "outputs/001-scholar-c0aaaaaa",
             },
         ]
     )
     assert "outputs/001-scholar-c0aaaaaa" in msg
-    assert "scholar" in msg                 # config_name rendered (was the 'config' bug)
-    assert "git diff" not in msg.lower()    # no branch-merge instructions
+    assert "scholar" in msg  # config_name rendered (was the 'config' bug)
+    assert "git diff" not in msg.lower()  # no branch-merge instructions
     assert "squash-merg" not in msg.lower()
     assert "git_merge_squash" not in msg

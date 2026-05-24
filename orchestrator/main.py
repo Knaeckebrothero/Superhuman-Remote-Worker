@@ -321,7 +321,9 @@ async def _next_output_ordinal(repo_name: str, base_branch: str) -> str:
 
     Per-repo, recency-ordered. Sequential (no async subjobs), so max+1 is race-free.
     """
-    entries = await gitea_client.list_contents(repo_name, "outputs", ref=base_branch) or []
+    entries = (
+        await gitea_client.list_contents(repo_name, "outputs", ref=base_branch) or []
+    )
     nums = []
     for entry in entries:
         if entry.get("type") == "dir":
@@ -400,11 +402,16 @@ async def _graft_subjob_output(job_id: str) -> dict[str, Any] | None:
         data = await gitea_client.get_file_bytes(repo_name, path, ref=subjob_branch)
         if data is None:
             logger.warning(f"Graft {job_id}: failed to read {path}; aborting graft")
-            await postgres_db.update_job_merge_status(job_id, merge_status="graft-failed")
+            await postgres_db.update_job_merge_status(
+                job_id, merge_status="graft-failed"
+            )
             return {"status": "error", "reason": "read-failed", "path": path}
-        rel = path[len("output/"):]
+        rel = path[len("output/") :]
         files.append(
-            {"path": f"{dest}/{rel}", "content_b64": base64.b64encode(data).decode("ascii")}
+            {
+                "path": f"{dest}/{rel}",
+                "content_b64": base64.b64encode(data).decode("ascii"),
+            }
         )
 
     ok = await gitea_client.change_files(
@@ -452,7 +459,6 @@ def _deep_merge_dicts(base: dict[str, Any], override: dict[str, Any]) -> dict[st
         else:
             result[key] = value
     return result
-
 
 
 # =============================================================================
@@ -7563,7 +7569,9 @@ async def complete_job(
         if job.get("parent_job_id"):
             graft_result = await _maybe_graft_completed_subjob(job)
             if graft_result and graft_result.get("status") == "grafted":
-                actions.append(f"subjob output grafted to {graft_result['output_path']}")
+                actions.append(
+                    f"subjob output grafted to {graft_result['output_path']}"
+                )
 
         # 3. Handle critic verdict (if this is a critic job)
         try:

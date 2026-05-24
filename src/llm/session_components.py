@@ -4,6 +4,7 @@ Converts a LangChain response into four normalized components (reasoning, text,
 tool calls, tool results) PLUS the verbatim provider-raw payload, and back into a
 provider request. See docs/features/persistent_session_source_of_truth.md (D2/D6).
 """
+
 from __future__ import annotations
 
 import json
@@ -55,10 +56,12 @@ def normalize_response(
     if isinstance(message, ToolMessage):
         return MessageComponents(
             role="tool",
-            tool_results=[{
-                "tool_call_id": message.tool_call_id,
-                "content": message.content,
-            }],
+            tool_results=[
+                {
+                    "tool_call_id": message.tool_call_id,
+                    "content": message.content,
+                }
+            ],
             provider=provider,
         )
 
@@ -87,14 +90,16 @@ def _tool_calls_to_cc(tool_calls: List[dict]) -> List[dict]:
     cc = []
     for tc in tool_calls:
         args = tc.get("args", {})
-        cc.append({
-            "id": tc.get("id"),
-            "type": "function",
-            "function": {
-                "name": tc.get("name"),
-                "arguments": args if isinstance(args, str) else json.dumps(args),
-            },
-        })
+        cc.append(
+            {
+                "id": tc.get("id"),
+                "type": "function",
+                "function": {
+                    "name": tc.get("name"),
+                    "arguments": args if isinstance(args, str) else json.dumps(args),
+                },
+            }
+        )
     return cc
 
 
@@ -118,15 +123,23 @@ def components_to_provider_messages(
     for c in components:
         if c.role == "tool":
             for tr in c.tool_results:
-                out.append({"role": "tool",
-                            "tool_call_id": tr["tool_call_id"],
-                            "content": tr["content"]})
+                out.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tr["tool_call_id"],
+                        "content": tr["content"],
+                    }
+                )
         elif c.role == "ai":
             msg = {"role": "assistant", "content": c.text or ""}
             if c.tool_calls:
                 msg["tool_calls"] = _tool_calls_to_cc(c.tool_calls)
             out.append(msg)
         else:
-            out.append({"role": "user" if c.role in ("human", "user") else c.role,
-                        "content": c.text or ""})
+            out.append(
+                {
+                    "role": "user" if c.role in ("human", "user") else c.role,
+                    "content": c.text or "",
+                }
+            )
     return out

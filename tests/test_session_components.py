@@ -38,17 +38,36 @@ from src.llm.session_components import MessageComponents, normalize_response
 def test_normalize_ai_message_extracts_four_components_and_raw():
     raw_response = {
         "object": "chat.completion",
-        "choices": [{"message": {
-            "role": "assistant", "content": "Reading the file.",
-            "reasoning_content": "Let me read it.",
-            "tool_calls": [{"id": "call_1", "type": "function",
-                            "function": {"name": "read_file",
-                                         "arguments": '{"path": "a.txt"}'}}]}}],
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "Reading the file.",
+                    "reasoning_content": "Let me read it.",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "read_file",
+                                "arguments": '{"path": "a.txt"}',
+                            },
+                        }
+                    ],
+                }
+            }
+        ],
     }
     msg = AIMessage(
         content="Reading the file.",
-        tool_calls=[{"name": "read_file", "args": {"path": "a.txt"},
-                     "id": "call_1", "type": "tool_call"}],
+        tool_calls=[
+            {
+                "name": "read_file",
+                "args": {"path": "a.txt"},
+                "id": "call_1",
+                "type": "tool_call",
+            }
+        ],
         additional_kwargs={"reasoning_content": "Let me read it."},
         response_metadata={"model_name": "gpt-5.5"},
     )
@@ -56,8 +75,14 @@ def test_normalize_ai_message_extracts_four_components_and_raw():
     assert isinstance(comp, MessageComponents)
     assert comp.text == "Reading the file."
     assert comp.reasoning == "Let me read it."
-    assert comp.tool_calls == [{"name": "read_file", "args": {"path": "a.txt"},
-                                "id": "call_1", "type": "tool_call"}]
+    assert comp.tool_calls == [
+        {
+            "name": "read_file",
+            "args": {"path": "a.txt"},
+            "id": "call_1",
+            "type": "tool_call",
+        }
+    ]
     assert comp.provider == "openai-chat"
     assert comp.provider_raw == raw_response
     assert comp.response_metadata == {"model_name": "gpt-5.5"}
@@ -78,26 +103,48 @@ from src.llm.session_components import components_to_provider_messages
 def test_rebuild_chat_completions_request_from_components():
     comps = [
         MessageComponents(role="human", text="read a.txt", provider="openai-chat"),
-        MessageComponents(role="ai", text="ok", provider="openai-chat",
-            tool_calls=[{"name": "read_file", "args": {"path": "a.txt"},
-                         "id": "call_1", "type": "tool_call"}]),
-        MessageComponents(role="tool", provider="openai-chat",
-            tool_results=[{"tool_call_id": "call_1", "content": "file body"}]),
+        MessageComponents(
+            role="ai",
+            text="ok",
+            provider="openai-chat",
+            tool_calls=[
+                {
+                    "name": "read_file",
+                    "args": {"path": "a.txt"},
+                    "id": "call_1",
+                    "type": "tool_call",
+                }
+            ],
+        ),
+        MessageComponents(
+            role="tool",
+            provider="openai-chat",
+            tool_results=[{"tool_call_id": "call_1", "content": "file body"}],
+        ),
     ]
     out = components_to_provider_messages(comps, target_provider="openai-chat")
     assert out == [
         {"role": "user", "content": "read a.txt"},
-        {"role": "assistant", "content": "ok", "tool_calls": [
-            {"id": "call_1", "type": "function",
-             "function": {"name": "read_file", "arguments": '{"path": "a.txt"}'}}]},
+        {
+            "role": "assistant",
+            "content": "ok",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": '{"path": "a.txt"}'},
+                }
+            ],
+        },
         {"role": "tool", "tool_call_id": "call_1", "content": "file body"},
     ]
 
 
 def test_assistant_without_tool_calls_omits_key():
     comps = [MessageComponents(role="ai", text="hello", provider="openai-chat")]
-    assert components_to_provider_messages(comps, target_provider="openai-chat") == \
-        [{"role": "assistant", "content": "hello"}]
+    assert components_to_provider_messages(comps, target_provider="openai-chat") == [
+        {"role": "assistant", "content": "hello"}
+    ]
 
 
 def test_non_cc_provider_replay_is_forward_compat():
