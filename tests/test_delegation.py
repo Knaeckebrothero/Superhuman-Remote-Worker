@@ -397,19 +397,19 @@ class TestDelegationResumeFormat:
             {
                 "job_id": "child-001",
                 "creation_order": 0,
-                "config": "scholar",
+                "config_name": "scholar",
                 "status": "completed",
                 "confidence": 0.85,
-                "branch_name": "subagent/0",
+                "output_path": "outputs/001-scholar-child001",
                 "summary": "Found 23 relevant papers.",
             },
             {
                 "job_id": "child-002",
                 "creation_order": 1,
-                "config": "developer",
+                "config_name": "developer",
                 "status": "failed",
                 "confidence": None,
-                "branch_name": "subagent/1",
+                "output_path": None,
                 "summary": "Build failed due to missing dependency.",
             },
         ]
@@ -422,9 +422,11 @@ class TestDelegationResumeFormat:
         assert "scholar" in msg
         assert "developer" in msg
         assert "0.85" in msg
-        assert "subagent/0" in msg
-        assert "subagent/1" in msg
-        assert "git diff" in msg.lower() or "git_diff" in msg
+        # Deliverables are grafted outputs/ folders now — no branches to merge.
+        assert "outputs/001-scholar-child001" in msg
+        assert "git diff" not in msg.lower()
+        assert "git_diff" not in msg
+        assert "squash-merg" not in msg.lower()
 
     def test_empty_results(self):
         from src.agent import _format_delegation_results
