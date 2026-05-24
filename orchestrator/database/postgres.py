@@ -2936,29 +2936,47 @@ class PostgresDB:
         metrics: Optional[dict] = None,
         tool_call_id: Optional[str] = None,
         thinking: Optional[str] = None,
+        reasoning: Optional[Any] = None,
+        tool_results: Optional[Any] = None,
+        provider: Optional[str] = None,
+        provider_raw: Optional[Any] = None,
+        additional_kwargs: Optional[dict] = None,
+        response_metadata: Optional[dict] = None,
     ) -> str:
         """Save a message to thread_messages. Fire-and-forget safe.
 
         ``tool_call_id`` is set only on role='tool' rows and links the result
         back to the AIMessage's tool_calls[].id. ``thinking`` is set only on
         role='ai' rows that carry reasoning content. See migration 0011.
+        Rows are append-only; the component columns (reasoning, tool_results,
+        provider, provider_raw, additional_kwargs, response_metadata) are
+        nullable and were added in migration 0019.
         """
         async with self.acquire() as conn:
             row = await conn.fetchrow(
                 """
                 INSERT INTO thread_messages
                     (thread_id, role, content, tool_calls, turn_number,
-                     metrics, tool_call_id, thinking)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id
+                     metrics, tool_call_id, thinking,
+                     reasoning, tool_results, provider, provider_raw,
+                     additional_kwargs, response_metadata)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                RETURNING id
                 """,
                 thread_id,
                 role,
                 content,
-                json.dumps(tool_calls) if tool_calls else None,
+                json.dumps(tool_calls) if tool_calls is not None else None,
                 turn_number,
-                json.dumps(metrics) if metrics else None,
+                json.dumps(metrics) if metrics is not None else None,
                 tool_call_id,
                 thinking,
+                json.dumps(reasoning) if reasoning is not None else None,
+                json.dumps(tool_results) if tool_results is not None else None,
+                provider,
+                json.dumps(provider_raw) if provider_raw is not None else None,
+                json.dumps(additional_kwargs) if additional_kwargs is not None else None,
+                json.dumps(response_metadata) if response_metadata is not None else None,
             )
             # Update thread activity + turn count
             await conn.execute(

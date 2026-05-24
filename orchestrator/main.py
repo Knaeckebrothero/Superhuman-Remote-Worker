@@ -10530,6 +10530,13 @@ class AgentThreadMessageRequest(BaseModel):
     tool_call_id: str | None = None
     # Reasoning content captured from role='ai' rows. See migration 0011.
     thinking: str | None = None
+    # Component columns added in migration 0019 — all optional/nullable.
+    reasoning: Any | None = None
+    tool_results: Any | None = None
+    provider: str | None = None
+    provider_raw: Any | None = None
+    additional_kwargs: dict | None = None
+    response_metadata: dict | None = None
 
 
 @app.post("/api/agents/threads")
@@ -11227,6 +11234,12 @@ async def agent_save_message(
             metrics=body.metrics,
             tool_call_id=body.tool_call_id,
             thinking=body.thinking,
+            reasoning=body.reasoning,
+            tool_results=body.tool_results,
+            provider=body.provider,
+            provider_raw=body.provider_raw,
+            additional_kwargs=body.additional_kwargs,
+            response_metadata=body.response_metadata,
         )
         return {"message_id": message_id, "status": "saved"}
     except Exception as e:
