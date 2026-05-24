@@ -859,3 +859,167 @@ class TestNextOutputOrdinal:
         fake = _OutputsFake(["notes", "003-scholar-dd"])
         with patch(f"{MODULE}.gitea_client", fake):
             assert await orch_main._next_output_ordinal("job-x", "main") == "004"
+
+
+import base64 as _b64
+
+# ===========================================================================
+# _graft_subjob_output
+# ===========================================================================
+
+
+class _GraftFakeGitea:
+    """Models per-branch trees as {branch: {path: bytes}} and the graft I/O.
+
+    - list_tree(ref) -> [{path, type:"blob"}] for that branch
+    - get_file_bytes(path, ref) -> bytes
+    - list_contents("outputs", ref) -> dir entries under outputs/ on that branch
+    - change_files(branch, files) -> add files (base64) to that branch's tree
+    """
+
+    def __init__(self, trees: dict[str, dict[str, bytes]]):
+        self.trees = {b: dict(t) for b, t in trees.items()}
+        self.is_initialized = True
+
+    async def list_tree(self, repo, ref):
+        return [{"path": p, "type": "blob"} for p in self.trees.get(ref, {})]
+
+    async def get_file_bytes(self, repo, file_path, ref=None):
+        return self.trees.get(ref, {}).get(file_path)
+
+    async def list_contents(self, repo, path="", ref=None):
+        if path != "outputs":
+            return []
+        names = set()
+        for p in self.trees.get(ref, {}):
+            if p.startswith("outputs/"):
+                names.add(p.split("/")[1])
+        return [{"name": n, "path": f"outputs/{n}", "type": "dir"} for n in names]
+
+    async def change_files(self, repo, branch, files, message):
+        tree = self.trees.setdefault(branch, {})
+        for f in files:
+            tree[f["path"]] = _b64.b64decode(f["content_b64"])
+        return True
+
+
+def _subjob(**over):
+    base = {
+        "id": "sub-uuid-1234abcd",
+        "parent_job_id": "parent-uuid",
+        "branch_name": "subjob/1234abcd/scholar",
+        "repo_name": "job-parent12",
+        "config_name": "scholar",
+        "description": "research",
+        "context": {},
+    }
+    base.update(over)
+    return base
+
+
+class TestGraftSubjobOutput:
+    @pytest.mark.asyncio
+    async def test_grafts_output_to_namespaced_dir_and_leaves_parent_untouched(self):
+        fake = _GraftFakeGitea(
+            {
+                "main": {"documents/corpus.pdf": b"PARENT", "src/app.py": b"code"},
+                "subjob/1234abcd/scholar": {
+                    "documents/corpus.pdf": b"PARENT",   # inherited from fork
+                    "src/app.py": b"code",
+                    "output/ideas/idea.md": b"# idea",
+                    "output/report.pdf": b"\x89PDFbytes",
+                    "workspace.md": b"scratch",          # NOT under output/
+                },
+            }
+        )
+        with (
+            patch(f"{MODULE}.postgres_db") as db,
+            patch(f"{MODULE}.gitea_client", fake),
+        ):
+            db.get_job = AsyncMock(
+                side_effect=lambda j: {"sub-uuid-1234abcd": _subjob(), "parent-uuid": {"branch_name": None}}.get(j)
+            )
+            db.update_job_merge_status = AsyncMock()
+            db.update_job_context = AsyncMock()
+
+            result = await orch_main._graft_subjob_output("sub-uuid-1234abcd")
+
+        assert result["status"] == "grafted"
+        assert result["output_path"] == "outputs/001-scholar-sub-uuid"
+        # output/ contents relocated under the namespaced dir, prefix stripped:
+        assert fake.trees["main"]["outputs/001-scholar-sub-uuid/ideas/idea.md"] == b"# idea"
+        assert fake.trees["main"]["outputs/001-scholar-sub-uuid/report.pdf"] == b"\x89PDFbytes"
+        # parent content untouched; scratch + inherited tree NOT propagated:
+        assert fake.trees["main"]["documents/corpus.pdf"] == b"PARENT"
+        assert "outputs/001-scholar-sub-uuid/workspace.md" not in fake.trees["main"]
+        db.update_job_merge_status.assert_awaited_with("sub-uuid-1234abcd", merge_status="grafted")
+
+    @pytest.mark.asyncio
+    async def test_critic_grafts_nothing(self):
+        fake = _GraftFakeGitea(
+            {
+                "main": {"src/app.py": b"code"},
+                "subjob/1234abcd/critic": {"output/reviews/r.md": b"review"},
+            }
+        )
+        critic = _subjob(
+            config_name="critic",
+            branch_name="subjob/1234abcd/critic",
+            context={"verification_target": "parent-uuid"},
+        )
+        with (
+            patch(f"{MODULE}.postgres_db") as db,
+            patch(f"{MODULE}.gitea_client", fake),
+        ):
+            db.get_job = AsyncMock(
+                side_effect=lambda j: {"sub-uuid-1234abcd": critic, "parent-uuid": {"branch_name": None}}.get(j)
+            )
+            db.update_job_merge_status = AsyncMock()
+            db.update_job_context = AsyncMock()
+
+            result = await orch_main._graft_subjob_output("sub-uuid-1234abcd")
+
+        assert result == {"status": "skipped", "reason": "critic-not-merged"}
+        assert all(not k.startswith("outputs/") for k in fake.trees["main"])
+
+    @pytest.mark.asyncio
+    async def test_no_output_skipped(self):
+        fake = _GraftFakeGitea(
+            {"main": {}, "subjob/1234abcd/scholar": {"workspace.md": b"scratch"}}
+        )
+        with (
+            patch(f"{MODULE}.postgres_db") as db,
+            patch(f"{MODULE}.gitea_client", fake),
+        ):
+            db.get_job = AsyncMock(
+                side_effect=lambda j: {"sub-uuid-1234abcd": _subjob(), "parent-uuid": {"branch_name": None}}.get(j)
+            )
+            db.update_job_merge_status = AsyncMock()
+            db.update_job_context = AsyncMock()
+
+            result = await orch_main._graft_subjob_output("sub-uuid-1234abcd")
+
+        assert result == {"status": "skipped", "reason": "no-output"}
+
+    @pytest.mark.asyncio
+    async def test_ordinal_increments_when_outputs_exist(self):
+        fake = _GraftFakeGitea(
+            {
+                "main": {"outputs/001-scholar-old/x.md": b"old"},
+                "subjob/1234abcd/scholar": {"output/y.md": b"new"},
+            }
+        )
+        with (
+            patch(f"{MODULE}.postgres_db") as db,
+            patch(f"{MODULE}.gitea_client", fake),
+        ):
+            db.get_job = AsyncMock(
+                side_effect=lambda j: {"sub-uuid-1234abcd": _subjob(), "parent-uuid": {"branch_name": None}}.get(j)
+            )
+            db.update_job_merge_status = AsyncMock()
+            db.update_job_context = AsyncMock()
+
+            result = await orch_main._graft_subjob_output("sub-uuid-1234abcd")
+
+        assert result["output_path"] == "outputs/002-scholar-sub-uuid"
+        assert fake.trees["main"]["outputs/002-scholar-sub-uuid/y.md"] == b"new"

@@ -332,6 +332,97 @@ async def _next_output_ordinal(repo_name: str, base_branch: str) -> str:
     return f"{nxt:03d}"
 
 
+async def _graft_subjob_output(job_id: str) -> dict[str, Any] | None:
+    """Graft a completed subjob's ``output/`` onto its parent's branch.
+
+    Copies the subjob branch's ``output/`` subtree to
+    ``outputs/<n>-<config>-<short_id>/`` on the parent branch in a single
+    commit. Purely additive — never modifies/deletes parent content, so
+    collisions and clobbering are impossible. Critic subjobs graft nothing
+    (verdict is consumed from the DB). Replaces ``_squash_merge_subjob``.
+    See docs/superpowers/specs/2026-05-24-subjob-output-merge-model-design.md.
+    """
+    import base64
+
+    job = await postgres_db.get_job(job_id)
+    if not job or not job.get("parent_job_id"):
+        return None
+    if not job.get("branch_name") or not job.get("repo_name"):
+        logger.debug(f"Subjob {job_id} has no branch/repo — skipping graft")
+        return None
+    if not gitea_client.is_initialized:
+        logger.warning(f"Gitea not initialized — cannot graft subjob {job_id}")
+        return None
+
+    # Critic contributes nothing to the branch (verdict lives in the DB).
+    ctx = job.get("context") or {}
+    if isinstance(ctx, str):
+        try:
+            ctx = json.loads(ctx)
+        except (json.JSONDecodeError, ValueError):
+            ctx = {}
+    if isinstance(ctx, dict) and ctx.get("verification_target"):
+        await postgres_db.update_job_merge_status(job_id, merge_status="skipped")
+        return {"status": "skipped", "reason": "critic-not-merged"}
+
+    repo_name = job["repo_name"]
+    subjob_branch = job["branch_name"]
+    short_id = str(job_id)[:8]
+    config_name = job.get("config_name") or "subjob"
+
+    parent = await postgres_db.get_job(str(job["parent_job_id"]))
+    base_branch = (parent.get("branch_name") if parent else None) or "main"
+
+    tree = await gitea_client.list_tree(repo_name, ref=subjob_branch) or []
+    output_blobs = [
+        e["path"]
+        for e in tree
+        if e.get("type") == "blob" and e["path"].startswith("output/")
+    ]
+    if not output_blobs:
+        await postgres_db.update_job_merge_status(job_id, merge_status="skipped")
+        return {"status": "skipped", "reason": "no-output"}
+
+    ordinal = await _next_output_ordinal(repo_name, base_branch)
+    dest = f"outputs/{ordinal}-{config_name}-{short_id}"
+
+    files: list[dict] = []
+    for path in output_blobs:
+        data = await gitea_client.get_file_bytes(repo_name, path, ref=subjob_branch)
+        if data is None:
+            logger.warning(f"Graft {job_id}: failed to read {path}; aborting graft")
+            await postgres_db.update_job_merge_status(job_id, merge_status="graft-failed")
+            return {"status": "error", "reason": "read-failed", "path": path}
+        rel = path[len("output/"):]
+        files.append(
+            {"path": f"{dest}/{rel}", "content_b64": base64.b64encode(data).decode("ascii")}
+        )
+
+    ok = await gitea_client.change_files(
+        repo_name, base_branch, files, message=f"Graft {dest} from subjob {short_id}"
+    )
+    if not ok:
+        await postgres_db.update_job_merge_status(job_id, merge_status="graft-failed")
+        return {"status": "error", "reason": "write-failed"}
+
+    await postgres_db.update_job_merge_status(job_id, merge_status="grafted")
+    new_ctx = dict(ctx)
+    new_ctx["graft_output_path"] = dest
+    await postgres_db.update_job_context(job_id, new_ctx)
+
+    logger.info(
+        f"Grafted subjob {short_id}/{config_name} output ({len(files)} files) "
+        f"to {base_branch}:{dest}"
+    )
+    return {
+        "status": "grafted",
+        "base_branch": base_branch,
+        "output_path": dest,
+        "ordinal": ordinal,
+        "files": len(files),
+    }
+
+
 # Files to delete from subjob branch before squash merge (job-scoped working files).
 SUBJOB_CLEANUP_FILES = [
     "workspace.md",
