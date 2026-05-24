@@ -6,6 +6,7 @@ provider request. See docs/features/persistent_session_source_of_truth.md (D2/D6
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from typing import Any, List, Optional
 
@@ -79,3 +80,53 @@ def normalize_response(
         text=_content_text(message.content),
         provider=provider,
     )
+
+
+def _tool_calls_to_cc(tool_calls: List[dict]) -> List[dict]:
+    """LangChain tool_calls ({name, args, id}) -> Chat Completions wire shape."""
+    cc = []
+    for tc in tool_calls:
+        args = tc.get("args", {})
+        cc.append({
+            "id": tc.get("id"),
+            "type": "function",
+            "function": {
+                "name": tc.get("name"),
+                "arguments": args if isinstance(args, str) else json.dumps(args),
+            },
+        })
+    return cc
+
+
+def components_to_provider_messages(
+    components: List["MessageComponents"],
+    target_provider: str = "openai-chat",
+) -> list:
+    """Rebuild a provider request (message array) from stored components.
+
+    v1 implements the live Chat Completions path: normalized reconstruction
+    (assistant content + tool_calls; tool results as role=tool). ``provider_raw``
+    is audit/forward-compat and is NOT replayed here. Verbatim-raw replay for the
+    real Responses API / Anthropic is forward-compat (raises NotImplementedError).
+    """
+    if target_provider != "openai-chat":
+        raise NotImplementedError(
+            f"verbatim-raw replay for provider {target_provider!r} is forward-compat; "
+            "v1 supports normalized Chat Completions reconstruction only"
+        )
+    out: list = []
+    for c in components:
+        if c.role == "tool":
+            for tr in c.tool_results:
+                out.append({"role": "tool",
+                            "tool_call_id": tr["tool_call_id"],
+                            "content": tr["content"]})
+        elif c.role == "ai":
+            msg = {"role": "assistant", "content": c.text or ""}
+            if c.tool_calls:
+                msg["tool_calls"] = _tool_calls_to_cc(c.tool_calls)
+            out.append(msg)
+        else:
+            out.append({"role": "user" if c.role in ("human", "user") else c.role,
+                        "content": c.text or ""})
+    return out
