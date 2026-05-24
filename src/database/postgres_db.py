@@ -348,23 +348,35 @@ class PostgresDB:
 
         result = []
         for row in rows:
-            result.append({
-                "id": str(row["id"]),
-                "role": row["role"],
-                "content": row["content"],
-                "tool_calls": _j(row["tool_calls"]) if row["tool_calls"] else None,
-                "turn_number": row["turn_number"],
-                "metrics": _j(row["metrics"]) if row["metrics"] else None,
-                "tool_call_id": row["tool_call_id"],
-                "thinking": row["thinking"],
-                "reasoning": _j(row["reasoning"]) if row["reasoning"] else None,
-                "tool_results": _j(row["tool_results"]) if row["tool_results"] else None,
-                "provider": row["provider"],
-                "provider_raw": _j(row["provider_raw"]) if row["provider_raw"] else None,
-                "additional_kwargs": _j(row["additional_kwargs"]) if row["additional_kwargs"] else None,
-                "response_metadata": _j(row["response_metadata"]) if row["response_metadata"] else None,
-                "created_at": row["created_at"].isoformat() if row["created_at"] else None,
-            })
+            result.append(
+                {
+                    "id": str(row["id"]),
+                    "role": row["role"],
+                    "content": row["content"],
+                    "tool_calls": _j(row["tool_calls"]) if row["tool_calls"] else None,
+                    "turn_number": row["turn_number"],
+                    "metrics": _j(row["metrics"]) if row["metrics"] else None,
+                    "tool_call_id": row["tool_call_id"],
+                    "thinking": row["thinking"],
+                    "reasoning": _j(row["reasoning"]) if row["reasoning"] else None,
+                    "tool_results": _j(row["tool_results"])
+                    if row["tool_results"]
+                    else None,
+                    "provider": row["provider"],
+                    "provider_raw": _j(row["provider_raw"])
+                    if row["provider_raw"]
+                    else None,
+                    "additional_kwargs": _j(row["additional_kwargs"])
+                    if row["additional_kwargs"]
+                    else None,
+                    "response_metadata": _j(row["response_metadata"])
+                    if row["response_metadata"]
+                    else None,
+                    "created_at": row["created_at"].isoformat()
+                    if row["created_at"]
+                    else None,
+                }
+            )
         return result
 
     # =========================================================================
