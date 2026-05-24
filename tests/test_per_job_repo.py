@@ -1023,3 +1023,31 @@ class TestGraftSubjobOutput:
 
         assert result["output_path"] == "outputs/002-scholar-sub-uuid"
         assert fake.trees["main"]["outputs/002-scholar-sub-uuid/y.md"] == b"new"
+
+
+class TestCompletionGraftWiring:
+    @pytest.mark.asyncio
+    async def test_graft_fires_for_delegation_child(self):
+        # A delegation child has creation_order set; the old gate skipped it.
+        called = {}
+
+        async def fake_graft(job_id):
+            called["job_id"] = job_id
+            return {"status": "grafted", "output_path": "outputs/001-developer-deadbeef"}
+
+        child = {
+            "id": "deadbeef-child", "parent_job_id": "p", "creation_order": 0,
+            "branch_name": "subjob/deadbeef/developer", "repo_name": "job-p",
+            "config_name": "developer",
+        }
+        with patch(f"{MODULE}._graft_subjob_output", side_effect=fake_graft):
+            res = await orch_main._maybe_graft_completed_subjob(child)
+        assert called["job_id"] == "deadbeef-child"
+        assert res["status"] == "grafted"
+
+    @pytest.mark.asyncio
+    async def test_no_graft_for_root_job(self):
+        with patch(f"{MODULE}._graft_subjob_output", new_callable=AsyncMock) as g:
+            res = await orch_main._maybe_graft_completed_subjob({"id": "r", "parent_job_id": None})
+        assert res is None
+        g.assert_not_called()
