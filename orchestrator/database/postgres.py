@@ -2975,8 +2975,12 @@ class PostgresDB:
                 json.dumps(tool_results) if tool_results is not None else None,
                 provider,
                 json.dumps(provider_raw) if provider_raw is not None else None,
-                json.dumps(additional_kwargs) if additional_kwargs is not None else None,
-                json.dumps(response_metadata) if response_metadata is not None else None,
+                json.dumps(additional_kwargs)
+                if additional_kwargs is not None
+                else None,
+                json.dumps(response_metadata)
+                if response_metadata is not None
+                else None,
             )
             # Update thread activity + turn count
             await conn.execute(

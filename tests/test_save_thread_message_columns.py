@@ -15,7 +15,10 @@ async def test_save_thread_message_inserts_component_columns():
     db.acquire = MagicMock(return_value=cm)
 
     await db.save_thread_message(
-        thread_id="t1", role="ai", content="hi", turn_number=1,
+        thread_id="t1",
+        role="ai",
+        content="hi",
+        turn_number=1,
         provider="openai-chat",
         provider_raw={"object": "chat.completion", "id": "cc_1"},
         reasoning="thinking",
@@ -42,8 +45,12 @@ def test_request_model_accepts_component_fields():
 
     from orchestrator.main import AgentThreadMessageRequest  # noqa: PLC0415
 
-    m = AgentThreadMessageRequest(role="ai", content="hi", provider="openai-chat",
-                                  provider_raw={"object": "chat.completion", "id": "cc_1"},
-                                  reasoning="x")
+    m = AgentThreadMessageRequest(
+        role="ai",
+        content="hi",
+        provider="openai-chat",
+        provider_raw={"object": "chat.completion", "id": "cc_1"},
+        reasoning="x",
+    )
     assert m.provider == "openai-chat"
     assert m.provider_raw["id"] == "cc_1"
