@@ -29,3 +29,43 @@ def test_codex_proxy_returns_chat_completions_shape():
     assert tc["type"] == "function"
     assert tc["function"]["name"] == "get_weather"
     assert isinstance(tc["function"]["arguments"], str)  # arguments is a JSON string
+
+
+from langchain_core.messages import AIMessage, ToolMessage
+from src.llm.session_components import MessageComponents, normalize_response
+
+
+def test_normalize_ai_message_extracts_four_components_and_raw():
+    raw_response = {
+        "object": "chat.completion",
+        "choices": [{"message": {
+            "role": "assistant", "content": "Reading the file.",
+            "reasoning_content": "Let me read it.",
+            "tool_calls": [{"id": "call_1", "type": "function",
+                            "function": {"name": "read_file",
+                                         "arguments": '{"path": "a.txt"}'}}]}}],
+    }
+    msg = AIMessage(
+        content="Reading the file.",
+        tool_calls=[{"name": "read_file", "args": {"path": "a.txt"},
+                     "id": "call_1", "type": "tool_call"}],
+        additional_kwargs={"reasoning_content": "Let me read it."},
+        response_metadata={"model_name": "gpt-5.5"},
+    )
+    comp = normalize_response(msg, provider="openai-chat", raw_output=raw_response)
+    assert isinstance(comp, MessageComponents)
+    assert comp.text == "Reading the file."
+    assert comp.reasoning == "Let me read it."
+    assert comp.tool_calls == [{"name": "read_file", "args": {"path": "a.txt"},
+                                "id": "call_1", "type": "tool_call"}]
+    assert comp.provider == "openai-chat"
+    assert comp.provider_raw == raw_response
+    assert comp.response_metadata == {"model_name": "gpt-5.5"}
+
+
+def test_normalize_tool_message_becomes_tool_result_component():
+    tm = ToolMessage(content="file contents", tool_call_id="call_1")
+    comp = normalize_response(tm, provider="openai-chat", raw_output=None)
+    assert comp.tool_results == [{"tool_call_id": "call_1", "content": "file contents"}]
+    assert comp.text is None
+    assert comp.tool_calls == []
