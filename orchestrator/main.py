@@ -4317,12 +4317,12 @@ async def delete_job(request: Request, job_id: str) -> dict[str, str]:
 
 @app.post("/api/jobs/{job_id}/subjob-merge")
 async def subjob_merge(request: Request, job_id: str) -> dict[str, Any]:
-    """Squash-merge a completed subjob's branch into its parent's branch.
+    """Graft a completed subjob's output/ onto its parent's branch.
     **Internal** (P4b) — requires ``X-Internal-Key``. Ingress strips this
     path.
 
     Called by the agent after a subjob completes (autonomy=full auto-completion).
-    Performs pre-merge cleanup of job-scoped files, then squash merges.
+    Grafts the subjob's output/ onto the parent as a namespaced outputs/ folder.
     """
     await require_internal(request)
     try:
@@ -4336,7 +4336,7 @@ async def subjob_merge(request: Request, job_id: str) -> dict[str, Any]:
                 detail="Only subjobs (with parent_job_id) can be squash-merged",
             )
 
-        result = await _squash_merge_subjob(job_id)
+        result = await _graft_subjob_output(job_id)
         if result is None:
             return {"status": "skipped", "reason": "no branch/repo configured"}
 
@@ -6338,10 +6338,10 @@ async def approve_job(
 
         logger.info(f"Job {job_id} approved (gitea={wrote_to_gitea})")
 
-        # Squash-merge subjob branch into parent if applicable
+        # Graft subjob output onto parent branch if applicable
         merge_result = None
         if job.get("parent_job_id"):
-            merge_result = await _squash_merge_subjob(job_id)
+            merge_result = await _graft_subjob_output(job_id)
 
         # Agent is freed after completion — trigger dispatcher
         _trigger_dispatch()
