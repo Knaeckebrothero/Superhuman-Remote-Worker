@@ -86,6 +86,7 @@ from .core.response_validator import validate_response
 from .core.state import UniversalAgentState
 from .core.workspace import WorkspaceManager
 from .llm.exceptions import ContextOverflowError
+from .llm.response_guards import is_degenerate_response
 from .managers import TodoManager, TodoStatus, PlanManager, MemoryManager
 from .services.guardrails import format_nudge
 from .services.image_content import extract_image_tags, make_multimodal_user_message
@@ -415,7 +416,7 @@ def _check_empty_response_streak(
         Tuple of (new_streak, should_fail). On a non-empty response the
         streak resets to 0 and should_fail is False.
     """
-    if content_len == 0 and tool_calls_count == 0:
+    if is_degenerate_response(content_len, tool_calls_count):
         new_streak = current_streak + 1
         return new_streak, new_streak > threshold
     return 0, False
