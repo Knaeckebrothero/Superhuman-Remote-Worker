@@ -339,7 +339,7 @@ async def _graft_subjob_output(job_id: str) -> dict[str, Any] | None:
     ``outputs/<n>-<config>-<short_id>/`` on the parent branch in a single
     commit. Purely additive — never modifies/deletes parent content, so
     collisions and clobbering are impossible. Critic subjobs graft nothing
-    (verdict is consumed from the DB). Replaces ``_squash_merge_subjob``.
+    (verdict is consumed from the DB).
     See docs/superpowers/specs/2026-05-24-subjob-output-merge-model-design.md.
     """
     import base64
@@ -432,28 +432,6 @@ async def _maybe_graft_completed_subjob(job: dict[str, Any]) -> dict[str, Any] |
     return await _graft_subjob_output(str(job["id"]))
 
 
-# Files to delete from subjob branch before squash merge (job-scoped working files).
-SUBJOB_CLEANUP_FILES = [
-    "workspace.md",
-    "plan.md",
-    "todos.yaml",
-    "instructions.md",
-    "task_brief.md",
-    "output/job_frozen.json",
-    "output/job_completion.json",
-]
-
-# Only job-scoped scratch belongs here. Do NOT add content/input dirs such as
-# documents/ or reference/: a subjob branch is forked from the parent, so
-# deleting such a dir here propagates the deletion onto the parent's branch at
-# squash-merge time and destroys the parent's deliverables.
-# See docs/issues/subjob_merge_clobbers_parent_deliverables.md.
-SUBJOB_CLEANUP_DIRS = [
-    "archive",
-    "tools",
-]
-
-
 def _deep_merge_dicts(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
     """Deep merge two dicts. Override wins for scalars/lists; dicts merge recursively."""
     result = base.copy()
@@ -466,125 +444,6 @@ def _deep_merge_dicts(base: dict[str, Any], override: dict[str, Any]) -> dict[st
             result[key] = value
     return result
 
-
-async def _squash_merge_subjob(job_id: str) -> dict[str, Any] | None:
-    """Squash-merge a completed subjob's branch into its parent's branch.
-
-    Pre-merge cleanup: deletes job-scoped files from the subjob branch
-    before creating the PR, so the parent's workspace.md / plan.md are
-    not overwritten.
-
-    Returns:
-        Merge result dict, or None if merge was skipped/not applicable.
-    """
-    job = await postgres_db.get_job(job_id)
-    if not job or not job.get("parent_job_id"):
-        return None
-
-    if not job.get("branch_name") or not job.get("repo_name"):
-        logger.debug(f"Subjob {job_id} has no branch/repo — skipping squash merge")
-        return None
-
-    if not gitea_client.is_initialized:
-        logger.warning(f"Gitea not initialized — cannot squash-merge subjob {job_id}")
-        return None
-
-    # Critic subjobs must NOT be merged into the parent's deliverable branch.
-    # A critic produces a review verdict (consumed from the DB, not from merged
-    # files); merging its branch back propagates the pre-merge cleanup's
-    # deletions onto the parent and destroys the parent's deliverables.
-    # See docs/issues/subjob_merge_clobbers_parent_deliverables.md.
-    job_context = job.get("context") or {}
-    if isinstance(job_context, str):
-        try:
-            job_context = json.loads(job_context)
-        except (json.JSONDecodeError, ValueError):
-            job_context = {}
-    if isinstance(job_context, dict) and job_context.get("verification_target"):
-        logger.info(
-            f"Subjob {job_id} is a critic — skipping squash merge "
-            f"(review must not mutate the deliverable branch)"
-        )
-        await postgres_db.update_job_merge_status(job_id, merge_status="skipped")
-        return {"status": "skipped", "reason": "critic-not-merged"}
-
-    repo_name = job["repo_name"]
-    subjob_branch = job["branch_name"]
-    short_id = str(job_id)[:8]
-
-    # Determine the base branch (parent's branch, or main if parent is root)
-    parent = await postgres_db.get_job(str(job["parent_job_id"]))
-    base_branch = (parent.get("branch_name") if parent else None) or "main"
-
-    # Pre-merge cleanup: delete job-scoped files from subjob branch
-    for file_path in SUBJOB_CLEANUP_FILES:
-        await gitea_client.delete_file(
-            repo_name,
-            file_path,
-            f"Pre-merge cleanup: remove {file_path}",
-            branch=subjob_branch,
-        )
-
-    # Delete job-scoped directories (list contents then delete each file)
-    for dir_path in SUBJOB_CLEANUP_DIRS:
-        entries = await gitea_client.list_contents(
-            repo_name, dir_path, ref=subjob_branch
-        )
-        if entries:
-            for entry in entries:
-                if entry.get("type") == "file":
-                    await gitea_client.delete_file(
-                        repo_name,
-                        entry["path"],
-                        f"Pre-merge cleanup: remove {entry['path']}",
-                        branch=subjob_branch,
-                    )
-
-    # Create PR for squash merge
-    config_name = job.get("config_name", "subjob")
-    pr_title = f"Subjob {short_id}/{config_name}: {(job.get('description') or 'completed')[:60]}"
-    pr = await gitea_client.create_pr(
-        repo_name,
-        title=pr_title,
-        head=subjob_branch,
-        base=base_branch,
-        body=f"Squash merge subjob `{job_id}` (`{config_name}`) into parent branch.",
-    )
-
-    if pr is None:
-        logger.info(
-            f"Subjob {short_id} PR creation returned None — "
-            f"branch may have no changes vs {base_branch}"
-        )
-        await postgres_db.update_job_merge_status(job_id, merge_status="skipped")
-        return {"status": "skipped", "reason": "no changes"}
-
-    # Squash merge
-    merged = await gitea_client.merge_pr(
-        repo_name,
-        pr["number"],
-        merge_strategy="squash",
-        delete_branch_after_merge=False,
-    )
-
-    if not merged:
-        logger.warning(
-            f"Squash merge failed for subjob {short_id} (PR #{pr['number']})"
-        )
-        await postgres_db.update_job_merge_status(job_id, merge_status="conflict")
-        return {"status": "conflict", "pr_number": pr["number"]}
-
-    await postgres_db.update_job_merge_status(job_id, merge_status="merged")
-    logger.info(
-        f"Squash-merged subjob {short_id}/{config_name} into {base_branch} "
-        f"(PR #{pr['number']})"
-    )
-
-    return {
-        "status": "merged",
-        "pr_number": pr["number"],
-        "base_branch": base_branch,
-    }
 
 
 # =============================================================================
