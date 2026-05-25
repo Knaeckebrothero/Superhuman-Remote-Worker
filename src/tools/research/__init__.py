@@ -20,15 +20,16 @@ def create_research_tools(context: ToolContext) -> List[Any]:
     Returns:
         List of LangChain tool functions
     """
-    from .browser import create_browser_tools
     from .papers import create_paper_tools
     from .web import create_web_tools
     from .workflow import create_workflow_tools
 
+    # Autonomous browser tools (browse_website / download_from_website) were
+    # deprecated; the main agent drives the browser via the direct browser_*
+    # tools instead. See docs/features/browser_workspace_executor.md.
     tools = []
     tools.extend(create_web_tools(context))
     tools.extend(create_paper_tools(context))
-    tools.extend(create_browser_tools(context))
     tools.extend(create_workflow_tools(context))
     return tools
 
