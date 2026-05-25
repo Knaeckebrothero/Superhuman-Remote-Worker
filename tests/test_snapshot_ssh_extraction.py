@@ -96,9 +96,7 @@ class TestStreamExtractSnapshot:
     @pytest.mark.asyncio
     async def test_returns_rc_and_stderr_on_failure(self, tar_file):
         fake = _fake_proc(returncode=1, stderr=b"tar: short read")
-        with patch(
-            "asyncio.create_subprocess_exec", new=AsyncMock(return_value=fake)
-        ):
+        with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=fake)):
             rc, stderr = await stream_extract_snapshot(
                 "h", 22, tar_file, key_path="/tmp/k"
             )
