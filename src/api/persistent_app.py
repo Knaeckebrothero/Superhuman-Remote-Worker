@@ -22,6 +22,7 @@ from ._session_auth import validate_session_token as _validate_session_token
 from .orchestrator_client import OrchestratorClient, create_orchestrator_client_from_env
 from .persistent_session import PersistentSession
 from ..tools.registry import TOOL_REGISTRY
+from ..core.archiver import inflight_tool_call
 from ..agent import UniversalAgent
 from ..llm.reasoning_chat import extract_reasoning_text_from_block
 from ..persistent_graph import (
@@ -1620,6 +1621,20 @@ async def handle_persistent_websocket(ws: WebSocket) -> None:
 
     # Send current session state so this client can sync. Direct send —
     # this is the welcome frame, only the connecting client cares.
+    #
+    # running_tool: if the loop is blocked in a tool call right now, tell this
+    # (re)attaching client which command is running so it can render a "running
+    # command" card instead of a blank "Connecting…". The in-flight AIMessage +
+    # tool_call lives only in memory (not persisted until the turn ends), so a
+    # cold reload mid-turn can't recover it from REST history — this welcome
+    # frame is the only channel for it.
+    running_tool = inflight_tool_call(_session.messages) if _tool_inflight else None
+    if running_tool is not None:
+        running_tool = {
+            "id": running_tool["id"],
+            "tool": running_tool["tool"],
+            "args": _safe_serialize(running_tool["args"]),
+        }
     await _ws_send(
         ws,
         "session.state",
@@ -1631,6 +1646,7 @@ async def handle_persistent_websocket(ws: WebSocket) -> None:
             "message_count": len(_session.messages),
             "model": _session.config.llm.model,
             "temperature": _session.config.llm.temperature,
+            "running_tool": running_tool,
         },
     )
 

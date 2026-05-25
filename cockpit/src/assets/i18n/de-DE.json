@@ -1341,7 +1341,8 @@
       "appliedChanges": "(Änderungen angewendet)",
       "searching": "Suche: {{query}}",
       "running": "Läuft: {{tool}}",
-      "result": "Ergebnis: {{tool}}"
+      "result": "Ergebnis: {{tool}}",
+      "waitingForCommand": "Der Agent wartet, bis dieser Befehl abgeschlossen ist."
     },
     "errors": {
       "writeFailed": "Schreiben von {{path}} fehlgeschlagen"

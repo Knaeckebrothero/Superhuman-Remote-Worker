@@ -81,6 +81,83 @@ class TestGetAgentMetrics:
 
 
 # ---------------------------------------------------------------------------
+# 3.1b inflight_tool_call() — running-command snapshot for (re)attach
+# ---------------------------------------------------------------------------
+
+
+class TestInflightToolCall:
+    """inflight_tool_call() identifies the command a (re)attaching client should
+    surface as 'running' from the agent's in-memory messages (which aren't yet
+    persisted, so REST history can't show them mid-turn)."""
+
+    def test_trailing_unanswered_tool_call_is_inflight(self):
+        from src.core.archiver import inflight_tool_call
+
+        messages = [
+            HumanMessage(content="build it"),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "tc1",
+                        "name": "run_command",
+                        "args": {"command": "python ingest.py --reset"},
+                    }
+                ],
+            ),
+        ]
+        rt = inflight_tool_call(messages)
+        assert rt is not None
+        assert rt["id"] == "tc1"
+        assert rt["tool"] == "run_command"
+        assert rt["args"]["command"] == "python ingest.py --reset"
+
+    def test_answered_tool_call_is_not_inflight(self):
+        from src.core.archiver import inflight_tool_call
+
+        messages = [
+            HumanMessage(content="build it"),
+            AIMessage(
+                content="",
+                tool_calls=[{"id": "tc1", "name": "run_command", "args": {}}],
+            ),
+            ToolMessage(content="Exit code: 0", tool_call_id="tc1"),
+        ]
+        assert inflight_tool_call(messages) is None
+
+    def test_no_tool_calls_is_none(self):
+        from src.core.archiver import inflight_tool_call
+
+        messages = [HumanMessage(content="hi"), AIMessage(content="hello")]
+        assert inflight_tool_call(messages) is None
+
+    def test_only_last_tool_calling_turn_counts(self):
+        from src.core.archiver import inflight_tool_call
+
+        messages = [
+            AIMessage(
+                content="",
+                tool_calls=[{"id": "old", "name": "read_file", "args": {}}],
+            ),
+            ToolMessage(content="done", tool_call_id="old"),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "new",
+                        "name": "run_command",
+                        "args": {"command": "sleep 99"},
+                    }
+                ],
+            ),
+        ]
+        rt = inflight_tool_call(messages)
+        assert rt is not None
+        assert rt["id"] == "new"
+        assert rt["tool"] == "run_command"
+
+
+# ---------------------------------------------------------------------------
 # 3.2 _safe_serialize()
 # ---------------------------------------------------------------------------
 

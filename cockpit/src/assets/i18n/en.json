@@ -1341,7 +1341,8 @@
       "appliedChanges": "(applied changes)",
       "searching": "Searching: {{query}}",
       "running": "Running: {{tool}}",
-      "result": "Result: {{tool}}"
+      "result": "Result: {{tool}}",
+      "waitingForCommand": "The agent is waiting for this command to finish."
     },
     "errors": {
       "writeFailed": "Failed to write {{path}}"
