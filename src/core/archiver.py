@@ -124,6 +124,42 @@ def _message_to_dict(msg: BaseMessage) -> Dict[str, Any]:
     return result
 
 
+def inflight_tool_call(messages: Sequence[BaseMessage]) -> Optional[Dict[str, Any]]:
+    """Return the assistant tool call that is currently executing, or None.
+
+    The persistent turn loop appends the ``AIMessage`` carrying ``tool_calls`` to
+    history *before* running the tools, then appends one ``ToolMessage`` per call
+    as each finishes. So a tool_call on the most recent tool-calling ``AIMessage``
+    that has no matching ``ToolMessage`` is one still in flight — exactly the
+    command a (re)attaching client should surface as "running" while the turn is
+    blocked, since that in-memory message is not persisted to the DB until the
+    turn ends (so REST history can't show it).
+
+    Returns ``{"id", "tool", "args"}`` for the first unanswered call on the last
+    tool-calling assistant message, or None when nothing is in flight.
+    """
+    answered: set = set()
+    last_calls: Optional[List[Dict[str, Any]]] = None
+    for msg in messages:
+        if isinstance(msg, ToolMessage):
+            tool_call_id = getattr(msg, "tool_call_id", None)
+            if tool_call_id:
+                answered.add(tool_call_id)
+        elif isinstance(msg, AIMessage) and getattr(msg, "tool_calls", None):
+            last_calls = msg.tool_calls
+    if not last_calls:
+        return None
+    for tc in last_calls:
+        tool_call_id = tc.get("id", "")
+        if tool_call_id not in answered:
+            return {
+                "id": tool_call_id,
+                "tool": tc.get("name", ""),
+                "args": tc.get("args", {}),
+            }
+    return None
+
+
 class LLMArchiver:
     """Archives LLM requests and responses to MongoDB.
 

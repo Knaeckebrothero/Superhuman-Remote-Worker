@@ -33,6 +33,7 @@ from ...tools.shell.shell_manager import (
     INTERACTIVE_PROMPT_TEMPLATE,
     NO_CHANGE_TIMEOUT_SECONDS,
     NONINTERACTIVE_ENV_EXPORT,
+    STILL_RUNNING_HARDCAP_TEMPLATE,
     STILL_RUNNING_TEMPLATE,
     SUDO_FREEZE_SENTINEL,
     build_sentinel_command,
@@ -970,6 +971,7 @@ class RemoteBackend(WorkspaceBackend):
                         return STILL_RUNNING_TEMPLATE.format(
                             tab=tab_name,
                             elapsed=elapsed,
+                            quiet=time.monotonic() - stall_start,
                             terminal_state=terminal_state,
                         )
 
@@ -980,7 +982,7 @@ class RemoteBackend(WorkspaceBackend):
                 )
                 tab.pending_sentinel = sentinel
                 tab.last_activity = datetime.now(timezone.utc)
-                return STILL_RUNNING_TEMPLATE.format(
+                return STILL_RUNNING_HARDCAP_TEMPLATE.format(
                     tab=tab_name, elapsed=timeout, terminal_state=terminal_state
                 )
 

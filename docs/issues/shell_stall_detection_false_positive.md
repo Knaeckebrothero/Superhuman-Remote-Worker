@@ -6,13 +6,30 @@ tags:
   - terminal
 related:
   - "[[persistent_session_empty_chunk_history_corruption]]"
+  - "[[shell_backend_duplication]]"
 ---
 
 # Shell tools — long commands falsely flagged "requires interactive input", trapping the agent in a `shell_read` polling loop
 
 **Reported**: 2026-05-25
-**Status**: Fixed on branch `fix/shell-stall-detection` (pending merge) — adopted OpenHands-style "still running" semantics in both shell backends (soft no-change timeout over the full buffer, honest still-running result, colliding-command guard, explicit-timeout opt-out, non-interactive env). Original analysis and fix options retained below for context.
+**Status**: Fixed and **E2E-validated on dev** (session `576f2c29`, 2026-05-25) — adopted OpenHands-style "still running" semantics in both shell backends (soft no-change timeout over the full buffer, honest still-running result, colliding-command guard, explicit-timeout opt-out, non-interactive env). The Issue #1 false "interactive input" misfire no longer occurs. Original analysis and fix options retained below for context.
 **Severity**: High for any task that installs heavy deps. A normal `pip install` is misreported as broken, the install keeps running invisibly, and the shared `default` tab becomes unusable for the rest of the turn.
+
+## E2E validation (dev session `576f2c29`, 2026-05-25)
+
+Re-ran the same class of task (Stadur Süd RAG build: heavy installs + a long `python ingest.py --reset`) on dev after deploy. Confirmed working:
+
+- **Issue #1 resolved.** Zero `Command requires interactive input` across all 198 messages. Long/quiet commands now return the honest `Exit code: -1 / --- still running --- … (this is NOT an error)`. The heavy `pip install` (torch/CUDA) that broke `c934b963` completed with `Exit code: 0`.
+- **Colliding-guard works.** A second command on the busy `default` tab was rejected (`…previous command still running; your new command was NOT executed…`) instead of silently head-of-line-blocking.
+- **Non-interactive env + `_send_and_wait` marker work.** Tabs init with `export PAGER=cat … PIP_PROGRESS_BAR=off …; cd …; echo __READY_…__`; no env leak into command output.
+- **Both timeouts fire.** Soft (30s no-change → reported ~32s) and hard (600s cap) both returned control honestly without killing the process.
+
+**Residual gap (not a regression, not the shell layer's bug):** the agent still fell into a long `shell_read` polling loop on a genuinely-long command — `python ingest.py --reset`, which its own generated `rag.py` ran as a CPU `HuggingFaceEmbeddings` pass over 11,890 chunks (ignoring the provided internal embedding API), so the command was effectively hung. The fix made the loop *honest* (correct "still running" + colliding-guard) but did not make the model *escalate*: it never re-ran with an explicit `timeout`, moved the work to an async/background tab, or sent C-c. This blocked the turn for minutes and is what surfaced the `persistent_ws_connecting_during_long_tool` "Connecting…" symptom.
+
+**Follow-up fixes landed (2026-05-25, both backends + cockpit):**
+- **Steer the model off the polling loop.** The shared still-running message now reports the real quiet window and frames the escalation as *prevention* (set an explicit `timeout` up front for slow/quiet work incl. data ingestion/embedding) rather than tight polling; the `run_command`/`shell_execute` docstrings teach the same. The `COLLIDING_COMMAND_TEMPLATE` is now **mode-neutral** — it no longer tells a stateless `run_command`/`shell_read` agent to "send C-c in keys mode / use a different tab" (which it can't); those options live in the persistent `shell_execute` docstring.
+- **Hard-cap wording (the minor bug below).** The hard-timeout path now uses a distinct `STILL_RUNNING_HARDCAP_TEMPLATE` that says only that the time limit was reached and does **not** claim "no new output" (a redrawing progress bar can keep emitting while still hitting the cap). The soft path reports the true no-change duration.
+- **Running-command card on (re)attach.** The `session.state` welcome frame now carries `running_tool` (derived from `_tool_inflight` + `archiver.inflight_tool_call(_session.messages)` — the trailing assistant tool_call with no matching `ToolMessage`), and the cockpit renders a "running command" card (`pickRunningCommandCard`, suppressed when the call is already in a visible turn). This is the only channel for the in-flight call on a cold reload mid-turn, since it isn't persisted to the DB until the turn ends — see `persistent_ws_connecting_during_long_tool`. (Full in-flight *message-tail* reconstruction on cold reload is still deferred; the card covers "what's running".)
 
 ## Incident
 

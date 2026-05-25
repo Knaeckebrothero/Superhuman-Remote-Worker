@@ -146,31 +146,54 @@ NONINTERACTIVE_ENV_EXPORT = (
     "PIP_DISABLE_PIP_VERSION_CHECK=1"
 )
 
-# Returned when a command is still running but has produced no new output for
-# NO_CHANGE_TIMEOUT_SECONDS (or hit the hard timeout). Leads with
-# "Exit code: -1" so downstream parsers read it as "not finished" (distinct
-# from success 0 and generic failure 1). This is NOT an error — the process
-# keeps running on its tab; the model can poll, interact, or wait.
+# Returned when a command has produced no new output for NO_CHANGE_TIMEOUT_SECONDS
+# (the soft no-change timeout). Leads with "Exit code: -1" so downstream parsers
+# read it as "not finished" (distinct from success 0 and generic failure 1).
+# This is NOT an error — the process keeps running on its tab.
+#
+# Guidance here is mode-NEUTRAL: it must be valid even for the least-capable tool
+# set (stateless run_command + shell_read, which cannot send keys, abort, or use
+# other tabs). Tool-specific options (C-c, extra tabs) are taught by the
+# persistent shell_execute tool's own docstring, not baked in here.
 STILL_RUNNING_TEMPLATE = (
     "Exit code: -1\n"
     "--- still running ---\n"
-    "Command on tab '{tab}' is still running: no new output for {elapsed:.0f}s "
-    "and it has not completed yet (this is NOT an error — the process is still "
-    "executing in the background).\n"
-    "Read the tab again to wait for more output. For known long-running work "
-    "(large pip/torch installs, builds) set an explicit timeout. Do not send "
-    "another command to this tab until it finishes.\n"
+    "Command on tab '{tab}' has been running {elapsed:.0f}s with no new output "
+    "in the last {quiet:.0f}s — it has NOT finished (this is NOT an error; the "
+    "process is still executing on the tab).\n"
+    "Read the tab again after a moment to check for new output or completion; "
+    "the tab stays busy until it finishes, so don't send it another command yet "
+    "and don't poll in a tight loop. Tip: for work you expect to be slow or "
+    "quiet (large installs, builds, data ingestion/embedding, downloads), pass "
+    "an explicit `timeout` when you START the command so the call waits for the "
+    "full duration instead of returning here.\n"
+    "--- terminal state ---\n{terminal_state}"
+)
+
+# Returned when a command hits the hard timeout cap (the maximum a single call
+# will wait) without completing. Distinct from the soft message above: the
+# process may have been emitting output the whole time, so this must NOT claim
+# the output went quiet.
+STILL_RUNNING_HARDCAP_TEMPLATE = (
+    "Exit code: -1\n"
+    "--- still running ---\n"
+    "Command on tab '{tab}' is still running after {elapsed:.0f}s — that is the "
+    "maximum wait for one call, not an error, and it may still be producing "
+    "output.\n"
+    "Read the tab again to keep monitoring; the tab stays busy until it "
+    "finishes. If you expect it to take much longer, start such commands with a "
+    "larger explicit `timeout`.\n"
     "--- terminal state ---\n{terminal_state}"
 )
 
 # Returned when a new command is sent to a tab whose previous command is still
 # running. The new command is NOT executed (avoids head-of-line blocking the
-# tab with two interleaved commands).
+# tab with two interleaved commands). Mode-NEUTRAL guidance only (see above).
 COLLIDING_COMMAND_TEMPLATE = (
     "Tab '{tab}' has a previous command still running; your new command was "
     "NOT executed.\n"
-    "Wait for it to finish (read the tab to monitor), interrupt it (send C-c "
-    "in keys mode), or run on a different tab.\n"
+    "Wait for it to finish before sending another command here — read the tab "
+    "to monitor its progress.\n"
     "--- terminal state ---\n{terminal_state}"
 )
 
@@ -1017,6 +1040,7 @@ class ShellManager:
                         return STILL_RUNNING_TEMPLATE.format(
                             tab=tab_name,
                             elapsed=elapsed,
+                            quiet=time.monotonic() - stall_start,
                             terminal_state=terminal_state,
                         )
 
@@ -1027,7 +1051,7 @@ class ShellManager:
                 terminal_state = self._capture_terminal_state(tab, sentinel, pre_count)
                 tab.pending_sentinel = sentinel
                 tab.last_activity = datetime.now(timezone.utc)
-                return STILL_RUNNING_TEMPLATE.format(
+                return STILL_RUNNING_HARDCAP_TEMPLATE.format(
                     tab=tab_name, elapsed=timeout, terminal_state=terminal_state
                 )
 

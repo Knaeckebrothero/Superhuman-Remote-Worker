@@ -745,3 +745,40 @@ class TestNoChangeContract:
         assert "keys" in out.lower()
         # Distinct from the still-running state.
         assert "Exit code: -1" not in out
+
+    def test_soft_timeout_reports_quiet_window(self, fast_manager):
+        """The soft (no-change) still-running message reports how long output
+        has been quiet — distinct from the hard-cap message."""
+        out = fast_manager.run_sync("sleep 20")  # no timeout -> soft (2s) fires
+        assert "still running" in out.lower()
+        assert "no new output in the last" in out.lower()
+        # Soft path is NOT the hard-cap wording.
+        assert "maximum wait" not in out.lower()
+
+    def test_hard_cap_message_does_not_claim_no_new_output(self, fast_manager):
+        """Regression: the hard-timeout path used to reuse the soft template and
+        report 'no new output for {cap}s', falsely implying silence even when a
+        process was emitting a redrawing progress bar the whole time. The
+        hard-cap message must NOT claim quiet."""
+        # Explicit timeout disables the soft timer; sleep never completes, so the
+        # loop exits at the 3s hard cap.
+        out = fast_manager.run_sync("sleep 30", timeout=3)
+        assert "still running" in out.lower()
+        assert "Exit code: -1" in out
+        assert "maximum wait" in out.lower()  # distinct hard-cap wording
+        assert "no new output" not in out.lower()  # must NOT claim silence
+
+    def test_colliding_message_is_mode_neutral(self, fast_manager):
+        """The colliding-command guard must not advise actions a stateless
+        run_command/shell_read agent cannot take (keys mode, other tabs) — that
+        guidance belongs to the persistent shell_execute tool, not the shared
+        backend message."""
+        first = fast_manager.run_sync("sleep 20")
+        assert "still running" in first.lower()
+        second = fast_manager.run_sync("echo SHOULD_NOT_RUN")
+        assert "not executed" in second.lower()
+        assert "keys mode" not in second.lower()
+        assert "different tab" not in second.lower()
+        # Release the tab for cleanup.
+        fast_manager.send("default", "C-c", enter=False)
+        time.sleep(1.0)

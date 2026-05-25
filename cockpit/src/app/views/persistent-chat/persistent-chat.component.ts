@@ -18,7 +18,7 @@ import {Router, RouterLink} from '@angular/router';
 import {firstValueFrom, Subscription} from 'rxjs';
 import {MarkdownComponent} from 'ngx-markdown';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
-import {ChatAttachment, PermissionRequest, PersistentChatService, ToolCallInfo,} from '../../core/services/persistent-chat.service';
+import {ChatAttachment, PermissionRequest, PersistentChatService, RunningToolInfo, ToolCallInfo,} from '../../core/services/persistent-chat.service';
 import {
     AssistantTurn,
     countEvents,
@@ -227,6 +227,26 @@ export function canComposeDuringSession(isConnected: boolean, isStartingSession:
  */
 export function pickCurrentStartupStep<T extends {state: string}>(steps: readonly T[]): T | null {
     return steps.find((s) => s.state === 'active') ?? steps[steps.length - 1] ?? null;
+}
+
+/**
+ * The running-command card to surface on (re)attach, or null. Suppressed when
+ * the in-flight tool call is already rendered inside a visible turn (warm
+ * reconnect) so it isn't double-shown; surfaced when it isn't (cold reload
+ * mid-turn, where the in-flight turn isn't in REST history yet).
+ */
+export function pickRunningCommandCard(
+    runningTool: RunningToolInfo | null,
+    turns: readonly Turn[],
+): RunningToolInfo | null {
+    if (!runningTool) return null;
+    for (const turn of turns) {
+        if (!isAssistantTurn(turn)) continue;
+        for (const ev of turn.events) {
+            if (ev.kind === 'tool_call' && ev.id === runningTool.id) return null;
+        }
+    }
+    return runningTool;
 }
 
 @Component({
@@ -724,6 +744,23 @@ export function pickCurrentStartupStep<T extends {state: string}>(steps: readonl
           </div>
         }
 
+        <!-- Running-command card — shown on (re)attach when the agent is
+             blocked in a tool call that isn't already rendered in a visible
+             turn (cold reload mid-turn: the in-flight turn isn't in REST
+             history yet). Reuses the .mile marker styles (no new SCSS). -->
+        @if (runningCommandCard(); as rc) {
+          <div class="mile">
+            <div class="mile-label">{{ 'chat.stream.running' | transloco:{ tool: rc.tool } }}</div>
+            <div class="mile-detail">
+              <app-icon size="sm" class="mile-detail-icon">progress_activity</app-icon>
+              @if (formatToolArgs(rc.args); as a) {
+                <code class="mile-args">{{ a }}</code>
+              }
+            </div>
+            <div class="mile-title">{{ 'chat.stream.waitingForCommand' | transloco }}</div>
+          </div>
+        }
+
         <!-- Ended-session end-marker + resume card — replaces the composer
              when the thread is in 'ended' status. -->
         @if (chat.threadStatus() === 'ended') {
@@ -1054,6 +1091,15 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     private readonly router = inject(Router);
     private readonly toast = inject(AppToastService);
     private readonly errors = inject(ErrorMessageService);
+
+    /**
+     * The running-command card to show on (re)attach (or null). Surfaces the
+     * agent's in-flight tool call when it isn't already visible in a turn — see
+     * pickRunningCommandCard.
+     */
+    readonly runningCommandCard = computed(() =>
+        pickRunningCommandCard(this.chat.runningTool(), this.chat.turns()),
+    );
 
     @ViewChild('messagesContainer') messagesContainer!: ElementRef<HTMLDivElement>;
     @ViewChild('inputEl') inputEl!: ElementRef<HTMLTextAreaElement>;
