@@ -204,11 +204,12 @@ class TestProxyConfigToBrowserUse:
 class TestBrowserToolsMetadata:
     """Tests for browser tools metadata."""
 
-    def test_metadata_has_all_tools(self):
+    def test_autonomous_tools_deprecated(self):
         from src.tools.research.browser import BROWSER_TOOLS_METADATA
 
-        assert "browse_website" in BROWSER_TOOLS_METADATA
-        assert "download_from_website" in BROWSER_TOOLS_METADATA
+        # browse_website / download_from_website were deprecated in favor of the
+        # direct browser_* tools. See docs/features/browser_workspace_executor.md.
+        assert BROWSER_TOOLS_METADATA == {}
 
     def test_metadata_category(self):
         from src.tools.research.browser import BROWSER_TOOLS_METADATA
@@ -274,60 +275,6 @@ class TestGetBrowserConfig:
         assert custom_path.exists()
 
 
-class TestExtractResult:
-    """Tests for _extract_result helper."""
-
-    def test_extract_from_final_result(self):
-        from src.tools.research.browser import _extract_result
-
-        history = MagicMock()
-        history.final_result.return_value = "Extracted text content"
-
-        result = _extract_result(history)
-        assert result == "Extracted text content"
-
-    def test_extract_from_last_action(self):
-        from src.tools.research.browser import _extract_result
-
-        history = MagicMock()
-        history.final_result.return_value = None
-        entry = MagicMock()
-        entry.result = "Action result text"
-        history.history = [entry]
-
-        result = _extract_result(history)
-        assert result == "Action result text"
-
-    def test_truncates_long_action_results(self):
-        from src.tools.research.browser import _extract_result
-
-        # final_result returns None, so it falls through to last action result
-        history = MagicMock()
-        history.final_result.return_value = None
-        entry = MagicMock()
-        entry.result = "x" * 6000
-        history.history = [entry]
-
-        result = _extract_result(history)
-        assert len(result) <= 5100  # 5000 + "\n... (truncated)"
-        assert "truncated" in result
-
-    def test_does_not_truncate_final_result(self):
-        from src.tools.research.browser import _extract_result
-
-        history = MagicMock()
-        history.final_result.return_value = "x" * 6000
-
-        result = _extract_result(history)
-        assert len(result) == 6000
-
-    def test_handles_none_history(self):
-        from src.tools.research.browser import _extract_result
-
-        result = _extract_result(None)
-        assert "no result" in result.lower()
-
-
 class TestFindNewFiles:
     """Tests for _find_new_files helper."""
 
@@ -376,51 +323,6 @@ class TestFindNewFiles:
 
         files = _find_new_files(Path("/nonexistent/directory"), max_age_seconds=60)
         assert files == []
-
-
-class TestCreateBrowserTools:
-    """Tests for create_browser_tools factory."""
-
-    def test_creates_two_tools(self, mock_tool_context):
-        from src.tools.research.browser import create_browser_tools
-
-        tools = create_browser_tools(mock_tool_context)
-        assert len(tools) == 2
-        names = {t.name for t in tools}
-        assert names == {"browse_website", "download_from_website"}
-
-    @pytest.mark.asyncio
-    async def test_browse_website_handles_exception(self, mock_tool_context):
-        from src.tools.research.browser import create_browser_tools
-
-        tools = create_browser_tools(mock_tool_context)
-        browse = next(t for t in tools if t.name == "browse_website")
-
-        # Simulate browser-use raising during execution
-        with patch(
-            "src.tools.research.browser._get_browser_llm",
-            side_effect=Exception("LLM not configured"),
-        ):
-            result = await browse.ainvoke(
-                {"url": "https://example.com", "task": "test"}
-            )
-
-        assert "failed" in result.lower() or "error" in result.lower()
-
-    @pytest.mark.asyncio
-    async def test_download_from_website_handles_exception(self, mock_tool_context):
-        from src.tools.research.browser import create_browser_tools
-
-        tools = create_browser_tools(mock_tool_context)
-        download = next(t for t in tools if t.name == "download_from_website")
-
-        with patch(
-            "src.tools.research.browser._get_browser_llm",
-            side_effect=Exception("LLM not configured"),
-        ):
-            result = await download.ainvoke({"url": "https://example.com"})
-
-        assert "failed" in result.lower() or "error" in result.lower()
 
 
 # ── Remote browser (CDP) tests ────────────────────────────────────
@@ -902,9 +804,9 @@ class TestResearchToolsRegistry:
         assert "download_paper" in metadata
         assert "get_paper_info" in metadata
 
-        # Browser tools
-        assert "browse_website" in metadata
-        assert "download_from_website" in metadata
+        # Autonomous browser tools were deprecated (direct browser_* tools instead)
+        assert "browse_website" not in metadata
+        assert "download_from_website" not in metadata
 
         # Workflow tools
         assert "research_topic" in metadata
@@ -922,6 +824,121 @@ class TestResearchToolsRegistry:
         assert "search_papers" in names
         assert "download_paper" in names
         assert "get_paper_info" in names
-        assert "browse_website" in names
-        assert "download_from_website" in names
         assert "research_topic" in names
+        # Autonomous browser tools were deprecated
+        assert "browse_website" not in names
+        assert "download_from_website" not in names
+
+
+# ── Browser-exec dispatch tests (workspace executor) ───────────────
+
+
+class TestToolContextBrowserExec:
+    """Tests for ToolContext.browser_exec stdout-JSON parsing."""
+
+    @pytest.mark.asyncio
+    async def test_parses_json_stdout(self):
+        from src.tools.context import ToolContext
+
+        fake = MagicMock()
+        fake.workspace_manager.backend.exec_command = MagicMock(
+            return_value='{"dom": "x", "url": "https://e.com", "title": "E"}'
+        )
+        result = await ToolContext.browser_exec(fake, "navigate", url="https://e.com")
+        assert result["url"] == "https://e.com"
+        cmd = fake.workspace_manager.backend.exec_command.call_args[0][0]
+        assert cmd.startswith("browser-exec navigate --json")
+
+    @pytest.mark.asyncio
+    async def test_non_json_becomes_error(self):
+        from src.tools.context import ToolContext
+
+        fake = MagicMock()
+        fake.workspace_manager.backend.exec_command = MagicMock(
+            return_value="Traceback: boom"
+        )
+        result = await ToolContext.browser_exec(fake, "snapshot")
+        assert "error" in result
+
+    @pytest.mark.asyncio
+    async def test_empty_output_becomes_error(self):
+        from src.tools.context import ToolContext
+
+        fake = MagicMock()
+        fake.workspace_manager.backend.exec_command = MagicMock(return_value="")
+        result = await ToolContext.browser_exec(fake, "snapshot")
+        assert "error" in result
+
+    @pytest.mark.asyncio
+    async def test_parses_last_stdout_line(self):
+        from src.tools.context import ToolContext
+
+        fake = MagicMock()
+        fake.workspace_manager.backend.exec_command = MagicMock(
+            return_value='noise on stdout\n{"url": "u", "dom": "d"}'
+        )
+        result = await ToolContext.browser_exec(fake, "snapshot")
+        assert result["url"] == "u"
+
+
+class TestBrowserDirectDispatch:
+    """Direct browser tools route to browser_exec on a remote workspace."""
+
+    def _ctx(self, mock_remote_tool_context, exec_result):
+        ctx = mock_remote_tool_context
+        ctx.browser_exec = AsyncMock(return_value=exec_result)
+        ctx.should_include_screenshots = MagicMock(return_value=False)
+        ctx.get_max_dom_chars = MagicMock(return_value=40000)
+        return ctx
+
+    @pytest.mark.asyncio
+    async def test_navigate_dispatches_and_wraps_nonce(self, mock_remote_tool_context):
+        from src.tools.research.browser_direct import create_browser_direct_tools
+
+        ctx = self._ctx(
+            mock_remote_tool_context,
+            {"dom": "[1]<button>Go</button>", "url": "https://e.com", "title": "E"},
+        )
+        tools = {t.name: t for t in create_browser_direct_tools(ctx)}
+        result = await tools["browser_navigate"].ainvoke({"url": "https://example.com"})
+
+        ctx.browser_exec.assert_awaited_once()
+        assert ctx.browser_exec.await_args[0][0] == "navigate"
+        assert ctx.browser_exec.await_args[1]["url"] == "https://example.com"
+        assert "nonce" in result
+        assert "page_content nonce=" in result["dom"]
+
+    @pytest.mark.asyncio
+    async def test_invalid_url_short_circuits(self, mock_remote_tool_context):
+        from src.tools.research.browser_direct import create_browser_direct_tools
+
+        ctx = self._ctx(mock_remote_tool_context, {})
+        tools = {t.name: t for t in create_browser_direct_tools(ctx)}
+        result = await tools["browser_navigate"].ainvoke({"url": "file:///etc/passwd"})
+
+        assert "error" in result
+        ctx.browser_exec.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_click_passes_ref(self, mock_remote_tool_context):
+        from src.tools.research.browser_direct import create_browser_direct_tools
+
+        ctx = self._ctx(
+            mock_remote_tool_context, {"dom": "d", "url": "u", "title": "t"}
+        )
+        tools = {t.name: t for t in create_browser_direct_tools(ctx)}
+        await tools["browser_click"].ainvoke({"ref": 42})
+
+        assert ctx.browser_exec.await_args[0][0] == "click"
+        assert ctx.browser_exec.await_args[1]["ref"] == 42
+
+    @pytest.mark.asyncio
+    async def test_exec_error_returned_unwrapped(self, mock_remote_tool_context):
+        from src.tools.research.browser_direct import create_browser_direct_tools
+
+        ctx = self._ctx(mock_remote_tool_context, {"error": "navigate failed: boom"})
+        tools = {t.name: t for t in create_browser_direct_tools(ctx)}
+        result = await tools["browser_navigate"].ainvoke({"url": "https://example.com"})
+
+        assert result == {"error": "navigate failed: boom"}
+        assert "nonce" not in result

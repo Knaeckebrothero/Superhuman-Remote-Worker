@@ -3,21 +3,33 @@
 Gives the agent fine-grained control over a persistent Chromium instance:
 navigate, inspect DOM, click, type, select, scroll, screenshot, back, close.
 
-Vision mode (screenshots in results) auto-selects based on the model's
-multimodal capability from settings_matrix.yaml.
+Execution model:
+  * Remote workspace (the normal case): each action is dispatched to the
+    workspace-side ``browser-exec`` daemon over SSH via
+    ``ToolContext.browser_exec()``. Chrome's CDP stays on the workspace
+    loopback — it never crosses the pod boundary. See
+    docs/features/browser_workspace_executor.md.
+  * Local/dev (no remote workspace): browser-use runs in-process here.
 
-Uses browser-use's BrowserSession for low-level CDP interaction. The
-session is managed by ToolContext (lazy-start, health-check, reconnect).
+Either way, this module keeps the agent-side logic — URL validation and
+content-nonce wrapping — and returns the same shape to the LLM:
+``{dom, url, title, screenshot?, tabs?}`` with numbered ``[N]`` element refs.
 
-Requires: pip install browser-use>=0.11.0
+Vision mode (screenshots in results) auto-selects from the model's
+multimodal capability (settings_matrix.yaml).
+
+Requires: pip install browser-use>=0.11.0 (local mode only; the workspace
+image ships browser-use for the remote daemon).
 """
 
+import asyncio
 import base64
 import logging
 from typing import Any, Dict, List, Optional
 
 from langchain_core.tools import tool
 
+from .browser import _is_remote_browser
 from .browser_security import validate_url_with_config, wrap_with_nonce
 from ..context import ToolContext
 
@@ -110,39 +122,37 @@ BROWSER_DIRECT_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
 }
 
 
-# ── Helpers ──────────────────────────────────────────────────────────
+# ── Local (in-process) execution — dev mode only ─────────────────────
+#
+# These mirror the workspace-side browser-exec daemon. On a remote workspace
+# the agent never runs them; it calls ToolContext.browser_exec() instead.
 
 
-async def _get_page_state(context: ToolContext, session: Any) -> Dict[str, Any]:
-    """Get current page state (DOM + optional screenshot)."""
+async def _local_page_state(session: Any, args: Dict[str, Any]) -> Dict[str, Any]:
+    """Build raw page state (DOM + optional screenshot). No nonce wrap here."""
     from browser_use.dom.service import DomService
 
     dom_service = DomService(browser_session=session)
     serialized_state, _, _ = await dom_service.get_serialized_dom_tree()
 
     dom_text = serialized_state.llm_representation()
-    max_chars = context.get_max_dom_chars()
+    max_chars = int(args.get("max_dom_chars", 40000))
     if len(dom_text) > max_chars:
         dom_text = dom_text[:max_chars] + "\n... (DOM truncated)"
 
-    url = await session.get_current_page_url()
-    title = await session.get_current_page_title()
-
     result: Dict[str, Any] = {
-        "url": url,
-        "title": title,
+        "url": await session.get_current_page_url(),
+        "title": await session.get_current_page_title(),
         "dom": dom_text,
     }
 
-    # Include screenshot if model supports vision
-    if context.should_include_screenshots():
+    if args.get("include_screenshot"):
         try:
             screenshot_bytes = await session.take_screenshot()
             result["screenshot"] = base64.b64encode(screenshot_bytes).decode()
         except Exception as e:
             logger.debug(f"Screenshot failed: {e}")
 
-    # Include tab list
     try:
         tabs = await session.get_tabs()
         if tabs and len(tabs) > 1:
@@ -152,11 +162,10 @@ async def _get_page_state(context: ToolContext, session: Any) -> Dict[str, Any]:
     except Exception:
         pass
 
-    return wrap_with_nonce(result)
+    return result
 
 
 async def _click_element(session: Any, ref: int) -> None:
-    """Click an element by its index in the selector map."""
     from browser_use.browser.events import ClickElementEvent
 
     node = await session.get_element_by_index(ref)
@@ -170,7 +179,6 @@ async def _click_element(session: Any, ref: int) -> None:
 
 
 async def _type_text(session: Any, ref: int, text: str, clear: bool = True) -> None:
-    """Type text into an element by its index."""
     from browser_use.browser.events import TypeTextEvent
 
     node = await session.get_element_by_index(ref)
@@ -184,7 +192,6 @@ async def _type_text(session: Any, ref: int, text: str, clear: bool = True) -> N
 
 
 async def _select_option(session: Any, ref: int, value: str) -> None:
-    """Select a dropdown option by element index."""
     from browser_use.browser.events import SelectDropdownOptionEvent
 
     node = await session.get_element_by_index(ref)
@@ -202,18 +209,78 @@ async def _select_option(session: Any, ref: int, value: str) -> None:
 async def _scroll(
     session: Any, direction: str, amount: int = 500, ref: Optional[int] = None
 ) -> None:
-    """Scroll the page or a specific element."""
     from browser_use.browser.events import ScrollEvent
 
     node = None
     if ref is not None:
         node = await session.get_element_by_index(ref)
-
     event = session.event_bus.dispatch(
         ScrollEvent(direction=direction, amount=amount, node=node)
     )
     await event
     await event.event_result(raise_if_any=True)
+
+
+async def _local_action(
+    context: ToolContext, action: str, args: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Execute one action in-process against a local BrowserSession."""
+    session = await context.get_browser_session()
+
+    if action == "navigate":
+        await session.navigate_to(args["url"])
+        return await _local_page_state(session, args)
+    if action == "snapshot":
+        return await _local_page_state(session, args)
+    if action == "screenshot":
+        screenshot_bytes = await session.take_screenshot()
+        return {
+            "url": await session.get_current_page_url(),
+            "title": await session.get_current_page_title(),
+            "screenshot": base64.b64encode(screenshot_bytes).decode(),
+        }
+    if action == "click":
+        await _click_element(session, int(args["ref"]))
+        return await _local_page_state(session, args)
+    if action == "type":
+        await _type_text(
+            session,
+            int(args["ref"]),
+            args.get("text", ""),
+            clear=args.get("clear", True),
+        )
+        return await _local_page_state(session, args)
+    if action == "select":
+        await _select_option(session, int(args["ref"]), args["value"])
+        return await _local_page_state(session, args)
+    if action == "scroll":
+        ref = args.get("ref")
+        await _scroll(
+            session,
+            args.get("direction", "down"),
+            int(args.get("amount", 500)),
+            int(ref) if ref is not None else None,
+        )
+        return await _local_page_state(session, args)
+    if action == "back":
+        page = await session.get_current_page()
+        if page is not None:
+            await page.evaluate("() => { window.history.back(); }")
+            await asyncio.sleep(0.5)
+        return await _local_page_state(session, args)
+
+    return {"error": f"unknown action: {action}"}
+
+
+async def _run_action(context: ToolContext, action: str, **args: Any) -> Dict[str, Any]:
+    """Dispatch a browser action: remote → browser-exec, local → in-process."""
+    if _is_remote_browser(context):
+        return await context.browser_exec(action, **args)
+    try:
+        return await _local_action(context, action, args)
+    except Exception as e:
+        logger.error(f"local browser {action} failed: {e}", exc_info=True)
+        return {"error": f"{action} failed: {e}"}
 
 
 # ── Tool factory ─────────────────────────────────────────────────────
@@ -229,6 +296,13 @@ def create_browser_direct_tools(context: ToolContext) -> List[Any]:
         List of LangChain tool functions
     """
     browser_cfg = context.config.get("browser", {})
+
+    def _state_args() -> Dict[str, Any]:
+        """Per-call flags that shape page-state results (computed agent-side)."""
+        return {
+            "include_screenshot": context.should_include_screenshots(),
+            "max_dom_chars": context.get_max_dom_chars(),
+        }
 
     @tool
     async def browser_navigate(url: str) -> dict:
@@ -249,13 +323,8 @@ def create_browser_direct_tools(context: ToolContext) -> List[Any]:
         except ValueError as e:
             return {"error": str(e)}
 
-        try:
-            session = await context.get_browser_session()
-            await session.navigate_to(url)
-            return await _get_page_state(context, session)
-        except Exception as e:
-            logger.error(f"browser_navigate failed: {e}", exc_info=True)
-            return {"error": f"Navigation failed: {e}"}
+        result = await _run_action(context, "navigate", url=url, **_state_args())
+        return result if "error" in result else wrap_with_nonce(result)
 
     @tool
     async def browser_snapshot() -> dict:
@@ -268,12 +337,8 @@ def create_browser_direct_tools(context: ToolContext) -> List[Any]:
         Returns:
             Page state with dom, url, title, and optionally screenshot
         """
-        try:
-            session = await context.get_browser_session()
-            return await _get_page_state(context, session)
-        except Exception as e:
-            logger.error(f"browser_snapshot failed: {e}", exc_info=True)
-            return {"error": f"Snapshot failed: {e}"}
+        result = await _run_action(context, "snapshot", **_state_args())
+        return result if "error" in result else wrap_with_nonce(result)
 
     @tool
     async def browser_click(ref: int) -> dict:
@@ -288,15 +353,8 @@ def create_browser_direct_tools(context: ToolContext) -> List[Any]:
         Returns:
             Updated page state after the click
         """
-        try:
-            session = await context.get_browser_session()
-            await _click_element(session, ref)
-            return await _get_page_state(context, session)
-        except ValueError as e:
-            return {"error": str(e)}
-        except Exception as e:
-            logger.error(f"browser_click failed: {e}", exc_info=True)
-            return {"error": f"Click failed: {e}"}
+        result = await _run_action(context, "click", ref=ref, **_state_args())
+        return result if "error" in result else wrap_with_nonce(result)
 
     @tool
     async def browser_type(ref: int, text: str, clear: bool = True) -> dict:
@@ -310,15 +368,10 @@ def create_browser_direct_tools(context: ToolContext) -> List[Any]:
         Returns:
             Updated page state after typing
         """
-        try:
-            session = await context.get_browser_session()
-            await _type_text(session, ref, text, clear=clear)
-            return await _get_page_state(context, session)
-        except ValueError as e:
-            return {"error": str(e)}
-        except Exception as e:
-            logger.error(f"browser_type failed: {e}", exc_info=True)
-            return {"error": f"Type failed: {e}"}
+        result = await _run_action(
+            context, "type", ref=ref, text=text, clear=clear, **_state_args()
+        )
+        return result if "error" in result else wrap_with_nonce(result)
 
     @tool
     async def browser_select(ref: int, value: str) -> dict:
@@ -331,15 +384,10 @@ def create_browser_direct_tools(context: ToolContext) -> List[Any]:
         Returns:
             Updated page state after selection
         """
-        try:
-            session = await context.get_browser_session()
-            await _select_option(session, ref, value)
-            return await _get_page_state(context, session)
-        except ValueError as e:
-            return {"error": str(e)}
-        except Exception as e:
-            logger.error(f"browser_select failed: {e}", exc_info=True)
-            return {"error": f"Select failed: {e}"}
+        result = await _run_action(
+            context, "select", ref=ref, value=value, **_state_args()
+        )
+        return result if "error" in result else wrap_with_nonce(result)
 
     @tool
     async def browser_scroll(
@@ -360,13 +408,15 @@ def create_browser_direct_tools(context: ToolContext) -> List[Any]:
         if direction not in ("up", "down", "left", "right"):
             return {"error": f"Invalid direction: {direction}. Use up/down/left/right."}
 
-        try:
-            session = await context.get_browser_session()
-            await _scroll(session, direction, amount, ref)
-            return await _get_page_state(context, session)
-        except Exception as e:
-            logger.error(f"browser_scroll failed: {e}", exc_info=True)
-            return {"error": f"Scroll failed: {e}"}
+        result = await _run_action(
+            context,
+            "scroll",
+            direction=direction,
+            amount=amount,
+            ref=ref,
+            **_state_args(),
+        )
+        return result if "error" in result else wrap_with_nonce(result)
 
     @tool
     async def browser_screenshot() -> dict:
@@ -379,19 +429,7 @@ def create_browser_direct_tools(context: ToolContext) -> List[Any]:
         Returns:
             Dict with screenshot (base64), url, and title
         """
-        try:
-            session = await context.get_browser_session()
-            screenshot_bytes = await session.take_screenshot()
-            url = await session.get_current_page_url()
-            title = await session.get_current_page_title()
-            return {
-                "url": url,
-                "title": title,
-                "screenshot": base64.b64encode(screenshot_bytes).decode(),
-            }
-        except Exception as e:
-            logger.error(f"browser_screenshot failed: {e}", exc_info=True)
-            return {"error": f"Screenshot failed: {e}"}
+        return await _run_action(context, "screenshot")
 
     @tool
     async def browser_back() -> dict:
@@ -400,19 +438,8 @@ def create_browser_direct_tools(context: ToolContext) -> List[Any]:
         Returns:
             Updated page state after navigating back
         """
-        try:
-            session = await context.get_browser_session()
-            page = await session.get_current_page()
-            if page is not None:
-                await page.evaluate("() => { window.history.back(); }")
-                # Wait briefly for navigation
-                import asyncio
-
-                await asyncio.sleep(0.5)
-            return await _get_page_state(context, session)
-        except Exception as e:
-            logger.error(f"browser_back failed: {e}", exc_info=True)
-            return {"error": f"Back navigation failed: {e}"}
+        result = await _run_action(context, "back", **_state_args())
+        return result if "error" in result else wrap_with_nonce(result)
 
     @tool
     async def browser_close() -> str:
