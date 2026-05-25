@@ -33,6 +33,21 @@ def manager():
     sm.cleanup()
 
 
+@pytest.fixture
+def fast_manager():
+    """ShellManager with a short no-change timeout for fast soft-timeout tests."""
+    job_id = str(uuid.uuid4())
+    sm = ShellManager(
+        job_id=job_id,
+        max_tabs=4,
+        scrollback_limit=1000,
+        default_timeout=30,
+        no_change_timeout=2.0,
+    )
+    yield sm
+    sm.cleanup()
+
+
 def _make_context(manager, mode="stateless"):
     """Create a mock ToolContext with the given shell mode."""
     context = MagicMock()
@@ -142,7 +157,10 @@ class TestRunCommand:
                 "timeout": 2,
             }
         )
-        assert "timed out" in result.lower() or "timeout" in result.lower()
+        # Explicit timeout -> hard cap; reported still-running (not killed,
+        # not an error), no longer "timed out".
+        assert "still running" in result.lower()
+        assert "Exit code: -1" in result
 
     def test_timeout_capped_at_600(self, manager):
         """Timeout values above 600 should be capped."""
@@ -227,6 +245,44 @@ class TestRunCommand:
             }
         )
         assert "Exit code: 7" in result
+
+    def _get_run_command_for(self, mgr):
+        context = _make_context(mgr, mode="stateless")
+        tools = create_shell_tools(context)
+        return next(t for t in tools if t.name == "run_command")
+
+    def test_still_running_passthrough_not_error(self, fast_manager):
+        """A quiet long command yields an honest 'still running' result — not
+        the old 'requires interactive input' error (the original bug)."""
+        tool = self._get_run_command_for(fast_manager)
+        result = tool.invoke({"command": "sleep 20"})  # no timeout -> soft applies
+        assert "still running" in result.lower()
+        assert "Exit code: -1" in result
+        assert "requires interactive input" not in result.lower()
+
+    def test_explicit_timeout_disables_soft_timeout(self, fast_manager):
+        """An explicit timeout disables the 2s soft timeout, so a quiet command
+        runs to completion instead of returning still-running."""
+        tool = self._get_run_command_for(fast_manager)
+        result = tool.invoke(
+            {"command": "echo start; sleep 4; echo done", "timeout": 600}
+        )
+        assert "Exit code: 0" in result
+        assert "done" in result
+
+    def test_noninteractive_env_injected(self, manager):
+        """Fresh tabs get pagers/prompts/progress-bars disabled."""
+        tool = self._get_run_command(manager)
+        result = tool.invoke(
+            {
+                "command": (
+                    "echo PAGER=$PAGER GTP=$GIT_TERMINAL_PROMPT PB=$PIP_PROGRESS_BAR"
+                )
+            }
+        )
+        assert "PAGER=cat" in result
+        assert "GTP=0" in result
+        assert "PB=off" in result
 
 
 class TestToolNameAliasing:

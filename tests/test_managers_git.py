@@ -749,6 +749,20 @@ class TestParseShellRunOutput:
         assert result.returncode == 1
         assert "waiting for input" in result.stderr
 
+    def test_parse_still_running(self):
+        """A still-running result -> non-zero return with a clear stderr."""
+        gm = self._make_gm()
+        output = (
+            "Exit code: -1\n--- still running ---\n"
+            "Command on tab 'git' is still running: no new output for 30s and "
+            "it has not completed yet (this is NOT an error ...).\n"
+            "--- terminal state ---\n(partial output)"
+        )
+        result = gm._parse_shell_run_output(output, ["clone", "https://x"])
+        assert result.returncode == -1
+        assert "still running" in result.stderr.lower()
+        assert result.stdout == ""
+
     def test_parse_malformed_exit_code(self):
         """Parse malformed Exit code line."""
         gm = self._make_gm()

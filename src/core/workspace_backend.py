@@ -315,7 +315,7 @@ class WorkspaceBackend(ABC):
     def shell_run(
         self,
         command: str,
-        timeout: int = 120,
+        timeout: Optional[int] = None,
         tab_name: str = "default",
         working_dir: Optional[str] = None,
     ) -> str:
@@ -323,7 +323,9 @@ class WorkspaceBackend(ABC):
 
         Args:
             command: Shell command to execute.
-            timeout: Timeout in seconds.
+            timeout: Hard timeout in seconds. None enables the soft no-change
+                timeout (yields a "still running" result on quiet commands); an
+                explicit value disables it and only the hard timeout applies.
             tab_name: Tab to execute in.
             working_dir: Working directory (relative to workspace root).
 
