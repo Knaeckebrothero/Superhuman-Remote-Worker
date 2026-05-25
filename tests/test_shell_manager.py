@@ -206,8 +206,11 @@ class TestRunSync:
         assert "line3" in output
 
     def test_timeout_handling(self, manager):
+        # Explicit timeout -> hard cap; command is reported still-running
+        # (not killed, not an error) rather than "timed out".
         output = manager.run_sync("sleep 30", timeout=1)
-        assert "timed out" in output.lower()
+        assert "still running" in output.lower()
+        assert "Exit code: -1" in output
         assert "--- terminal state ---" in output
 
     def test_blocked_command(self, manager):
@@ -374,19 +377,21 @@ class TestInteractiveDetection:
         assert "--- terminal state ---" in output
         assert "Password:" in output
 
-    def test_stall_detection(self, manager):
-        """Commands that stall (no output change) should return early."""
-        # 'read' with no prompt just waits silently
+    def test_stall_detection(self, fast_manager):
+        """A silent command with no explicit timeout yields an honest
+        'still running' result after the soft no-change timeout — NOT an
+        interactive-input error."""
+        # 'read' with no prompt just waits silently; no explicit timeout so the
+        # soft no-change timeout (2s in fast_manager) applies.
         start = time.monotonic()
-        output = manager.run_sync("read answer", timeout=15)
+        output = fast_manager.run_sync("read answer")
         elapsed = time.monotonic() - start
         assert "--- terminal state ---" in output
-        assert (
-            "waiting for input" in output.lower()
-            or "no output change" in output.lower()
-        )
-        # Should detect stall within ~7s (1s grace + 5s threshold + margin)
-        assert elapsed < 10
+        assert "still running" in output.lower()
+        assert "Exit code: -1" in output
+        assert "requires interactive input" not in output.lower()
+        # Soft timeout ~2s + 1s grace + margin.
+        assert elapsed < 8
 
     def test_normal_command_unaffected(self, manager):
         """Normal commands should still work via sentinel detection."""
@@ -406,12 +411,13 @@ class TestInteractiveDetection:
         assert "--- terminal state ---" not in output
 
     def test_timeout_includes_visible_content(self, manager):
-        """Timeout should include what's visible in the terminal."""
+        """A still-running result should include what's visible in the terminal."""
         output = manager.run_sync(
             'echo "visible-marker-12345"; sleep 30',
             timeout=2,
         )
-        assert "timed out" in output.lower()
+        assert "still running" in output.lower()
+        assert "Exit code: -1" in output
         assert "--- terminal state ---" in output
         assert "visible-marker-12345" in output
 
@@ -646,3 +652,96 @@ class TestShellTab:
         assert meta["type"] == "shell"
         assert "created_at" in meta
         assert "last_activity" in meta
+
+
+@pytest.fixture
+def fast_manager():
+    """ShellManager with a short no-change timeout so soft-timeout tests are
+    fast. Hard timeout (default_timeout) stays high so it doesn't fire first."""
+    job_id = str(uuid.uuid4())
+    sm = ShellManager(
+        job_id=job_id,
+        max_tabs=4,
+        scrollback_limit=1000,
+        default_timeout=30,
+        no_change_timeout=2.0,
+    )
+    yield sm
+    sm.cleanup()
+
+
+class TestNoChangeContract:
+    """The OpenHands-style 'still running' contract for quiet/long commands."""
+
+    def test_soft_timeout_returns_still_running_not_error(self, fast_manager):
+        # No explicit timeout -> soft no-change timeout (2s) applies.
+        out = fast_manager.run_sync("sleep 20")
+        assert "Exit code: -1" in out
+        assert "still running" in out.lower()
+        assert "--- terminal state ---" in out
+        # Must NOT be the interactive-prompt state (distinct from still-running).
+        assert "interactive prompt detected" not in out.lower()
+        assert "requires interactive input" not in out.lower()
+        # The tab is marked busy so a colliding command can be rejected.
+        assert fast_manager._tabs["default"].pending_sentinel is not None
+
+    def test_steady_output_completes_not_still_running(self, fast_manager):
+        # Output changes every 1s (< 2s threshold) -> never a stall.
+        out = fast_manager.run_sync(
+            "for i in 1 2 3 4 5 6; do echo step_$i; sleep 1; done"
+        )
+        assert "Exit code: 0" in out
+        assert "step_6" in out
+        assert "still running" not in out.lower()
+
+    def test_explicit_timeout_disables_soft_timeout(self, fast_manager):
+        # Explicit timeout -> soft timeout disabled; only the hard cap applies.
+        start = time.monotonic()
+        out = fast_manager.run_sync("sleep 6", timeout=5)
+        elapsed = time.monotonic() - start
+        # Did NOT trip the 2s soft timer; ran until the 5s hard cap.
+        assert elapsed >= 4.5
+        assert "Exit code: -1" in out
+        assert "still running" in out.lower()
+
+    def test_colliding_command_rejected_then_recovers(self, fast_manager):
+        first = fast_manager.run_sync("sleep 20")
+        assert "still running" in first.lower()
+        # A new command must be refused, not silently queued behind the sleep.
+        second = fast_manager.run_sync("echo SHOULD_NOT_RUN")
+        assert "not executed" in second.lower()
+        # Interrupt the running command; the tab must then accept commands again.
+        fast_manager.send("default", "C-c", enter=False)
+        time.sleep(1.5)
+        third = fast_manager.run_sync("echo RECOVERED")
+        assert "Exit code: 0" in third
+        assert "RECOVERED" in third
+
+    def test_fresh_tab_has_no_false_colliding_guard(self, fast_manager):
+        fast_manager.ensure_tab("build")
+        out = fast_manager.run_sync("echo ok", tab_name="build")
+        assert "Exit code: 0" in out
+        assert "ok" in out
+        assert "not executed" not in out.lower()
+
+    def test_completion_wins_over_soft_timeout(self):
+        # A command that completes well within the no-change window is reported
+        # completed, never 'still running' (sentinel check precedes the stall
+        # check each poll).
+        sm = ShellManager(
+            job_id=str(uuid.uuid4()), default_timeout=30, no_change_timeout=3.0
+        )
+        try:
+            out = sm.run_sync("sleep 2; echo done")
+            assert "Exit code: 0" in out
+            assert "done" in out
+            assert "still running" not in out.lower()
+        finally:
+            sm.cleanup()
+
+    def test_interactive_prompt_is_honest_hint_not_still_running(self, fast_manager):
+        out = fast_manager.run_sync('echo "Continue? [y/N]"; read x')
+        assert "interactive prompt detected" in out.lower()
+        assert "keys" in out.lower()
+        # Distinct from the still-running state.
+        assert "Exit code: -1" not in out

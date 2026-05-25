@@ -114,7 +114,9 @@ line 177
 
 **30-line tail by default.** Most commands produce output where only the end matters (did it pass? what error?). The model gets the last 30 lines. If it needs more, it uses `shell_read` — the same tool that already exists. This prevents output bloat without losing information.
 
-**No keys mode, no async.** Interactive prompts (passwords, y/n) are not supported. If a command hits an interactive prompt, `run_command` returns early with the prompt text as an error, telling the model the command needs a non-interactive form (e.g., `sshpass`, `yes |`, `-y` flags). This forces the model into stateless patterns it's trained on, rather than letting it attempt stateful prompt resolution (which is where things go wrong).
+**Quiet/long commands return "still running", not an error.** If a command produces no new output for ~30s (a big `pip install`, a build, a download), `run_command` returns an honest "still running" result (`Exit code: -1`) — the command keeps running. The model can poll with `shell_read`, or pass an explicit `timeout` (which disables the no-change check and waits the full duration). A tab with a still-running command rejects the next command until it finishes, instead of silently interleaving them. (This replaced an earlier heuristic that mislabeled any 5s-quiet command as "waiting for input" — see `docs/issues/shell_stall_detection_false_positive.md`.)
+
+**Interactive prompts → non-interactive form.** Genuine prompts (passwords, y/n) can't be answered from stateless `run_command`, so it returns the prompt text and steers the model to a non-interactive form (e.g., `sshpass`, `yes |`, `-y` flags). This keeps the model in the stateless patterns it's trained on, rather than stateful prompt resolution (which is where things go wrong).
 
 **SSH via sshpass.** Yes, repeating `sshpass -p $PASS ssh user@host "cmd"` every time is verbose. But it's what the model knows how to do. Each command is self-contained, no session state to track, no credential confusion. The context bloat from repetition is real but far less damaging than the bloat from 35 shells, 20+ helper scripts, and credential cycling that happens when the model tries to manage SSH sessions.
 
@@ -127,7 +129,7 @@ Compared to the persistent shell issues documented in `docs/issues/job_debug2.md
 | Problem | Persistent Mode | Stateless Mode |
 |---------|----------------|----------------|
 | Shell proliferation (35 tabs) | Model creates tabs freely | Single hidden tab |
-| Blocked tab cascading | Model opens new tab for prompts | Prompt returned as error, model uses non-interactive form |
+| Blocked / busy tab cascading | Model opens new tab for prompts | Busy tab rejects new commands; quiet commands report "still running" (poll or set `timeout`); prompts steered to non-interactive form |
 | Helper script proliferation | Model writes paramiko scripts to avoid SSH complexity | Model uses sshpass directly (its training prior) |
 | Credential confusion | Model guesses passwords interactively | Model must provide credentials in the command (forces lookup first) |
 | Max-tabs errors + cleanup cycles | Hits limit, burns calls closing tabs | No tab limit to hit |

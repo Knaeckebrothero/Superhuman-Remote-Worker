@@ -11,7 +11,7 @@ related:
 # Shell tools — long commands falsely flagged "requires interactive input", trapping the agent in a `shell_read` polling loop
 
 **Reported**: 2026-05-25
-**Status**: Root cause confirmed from session history + source. No fix implemented (fix plan pending — see options below).
+**Status**: Fixed on branch `fix/shell-stall-detection` (pending merge) — adopted OpenHands-style "still running" semantics in both shell backends (soft no-change timeout over the full buffer, honest still-running result, colliding-command guard, explicit-timeout opt-out, non-interactive env). Original analysis and fix options retained below for context.
 **Severity**: High for any task that installs heavy deps. A normal `pip install` is misreported as broken, the install keeps running invisibly, and the shared `default` tab becomes unusable for the rest of the turn.
 
 ## Incident

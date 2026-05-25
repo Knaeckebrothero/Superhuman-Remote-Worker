@@ -26,39 +26,26 @@ try:
 except ImportError:
     paramiko = None  # Deferred — only needed when backend: remote is used
 
-from ...tools.shell.shell_manager import SUDO_FREEZE_SENTINEL, build_sentinel_command
+from ...tools.shell.shell_manager import (
+    COLLIDING_COMMAND_TEMPLATE,
+    HARD_TIMEOUT_CAP_SECONDS,
+    INTERACTIVE_PROMPT_PATTERNS,
+    INTERACTIVE_PROMPT_TEMPLATE,
+    NO_CHANGE_TIMEOUT_SECONDS,
+    NONINTERACTIVE_ENV_EXPORT,
+    STILL_RUNNING_TEMPLATE,
+    SUDO_FREEZE_SENTINEL,
+    build_sentinel_command,
+    compute_no_change_state,
+    prompt_is_ready,
+)
 from ..workspace_backend import WorkspaceBackend, WorkspaceUnavailableError
 
 logger = logging.getLogger(__name__)
 
-# Seconds of unchanged output before declaring a stall
-STALL_DETECTION_SECONDS = 5.0
-
-# Patterns that indicate the terminal is waiting for interactive input
-INTERACTIVE_PROMPT_PATTERNS = [
-    (
-        re.compile(
-            r"\[y/n\]|\[Y/n\]|\[y/N\]|\[N/y\]|\(yes/no\)|\(yes/no/\[fingerprint\]\)",
-            re.IGNORECASE,
-        ),
-        "confirmation prompt",
-    ),
-    (re.compile(r"(?:password|passphrase)\s*:", re.IGNORECASE), "password prompt"),
-    (
-        re.compile(r"Are you sure you want to continue connecting", re.IGNORECASE),
-        "SSH host key verification",
-    ),
-    (
-        re.compile(r"Install package '.*?' to provide command", re.IGNORECASE),
-        "package install prompt",
-    ),
-    (re.compile(r"\[sudo\] password for", re.IGNORECASE), "sudo password prompt"),
-    (
-        re.compile(r"press any key|press enter to continue|hit enter", re.IGNORECASE),
-        "press key prompt",
-    ),
-    (re.compile(r"enter passphrase", re.IGNORECASE), "passphrase prompt"),
-]
+# Stall/timeout constants, interactive-prompt patterns and message templates
+# are shared from shell_manager (imported above) to keep the local and remote
+# shell backends in lock-step.
 
 # Tab name validation
 TAB_NAME_PATTERN = re.compile(r"^[a-z0-9-]{1,20}$")
@@ -82,6 +69,8 @@ class _RemoteTab:
         self.name = name
         self.tab_type = tab_type
         self.read_cursor: int = 0
+        # Sentinel of a still-running command holding this tab (colliding guard).
+        self.pending_sentinel: Optional[str] = None
         self.created_at: datetime = datetime.now(timezone.utc)
         self.last_activity: datetime = datetime.now(timezone.utc)
 
@@ -112,6 +101,7 @@ class RemoteBackend(WorkspaceBackend):
         job_id: str = "",
         scrollback_limit: int = 5000,
         default_timeout: int = 120,
+        no_change_timeout: float = NO_CHANGE_TIMEOUT_SECONDS,
         max_tabs: int = 15,
         blocked_commands: Optional[List[str]] = None,
         sandbox_cwd: Optional[str] = None,
@@ -133,6 +123,7 @@ class RemoteBackend(WorkspaceBackend):
         self._job_id = job_id
         self._scrollback_limit = scrollback_limit
         self._default_timeout = default_timeout
+        self._no_change_timeout = no_change_timeout
         self._max_tabs = max_tabs
         self._connect_timeout = connect_timeout
         self._max_retries = max_retries
@@ -660,6 +651,24 @@ class RemoteBackend(WorkspaceBackend):
     # Shell operations — remote tmux over SSH
     # =========================================================================
 
+    def _send_and_wait(self, tab_name: str, command: str, timeout: float = 5.0) -> None:
+        """Send a setup command and block until it has run (marker prints).
+
+        Mirrors ShellManager._send_and_wait so tab-creation preamble (env, cd)
+        settles before the first user command instead of racing it.
+        """
+        marker = f"__READY_{uuid.uuid4().hex[:8]}__"
+        self._tmux_send_keys(tab_name, f"{command}; echo {marker}", enter=True)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                lines = self._tmux_capture(tab_name)
+            except Exception:
+                return
+            if any(ln.strip() == marker for ln in lines):
+                return
+            time.sleep(0.1)
+
     def _init_shell(self) -> None:
         """Initialize the remote tmux session."""
         if self._shell_initialized:
@@ -680,10 +689,12 @@ class RemoteBackend(WorkspaceBackend):
             f"tmux set-option -t {self._session_name} history-limit {self._scrollback_limit}"
         )
 
-        # Set working directory
+        # Non-interactive env + working directory; wait for it to settle so the
+        # preamble doesn't fold into the first command's output.
+        setup = NONINTERACTIVE_ENV_EXPORT
         if self._sandbox_cwd:
-            self._tmux_send_keys("default", f"cd {self._sandbox_cwd}", enter=True)
-            time.sleep(0.2)
+            setup += f"; cd {self._sandbox_cwd}"
+        self._send_and_wait("default", setup)
 
         # Register default tab
         self._tabs["default"] = _RemoteTab(name="default", tab_type="shell")
@@ -760,14 +771,7 @@ class RemoteBackend(WorkspaceBackend):
 
     def _detect_blocked_tab(self, all_lines: List[str]) -> Optional[str]:
         """Pre-flight check: is the tab stuck on a prompt right now?"""
-        last_nonblank = ""
-        for line in reversed(all_lines):
-            stripped = line.strip()
-            if stripped:
-                last_nonblank = stripped
-                break
-
-        if last_nonblank and last_nonblank[-1] in ("$", "#", "%"):
+        if prompt_is_ready(all_lines):
             return None
 
         check_lines = all_lines[-3:] if len(all_lines) >= 3 else all_lines
@@ -782,7 +786,7 @@ class RemoteBackend(WorkspaceBackend):
     def shell_run(
         self,
         command: str,
-        timeout: int = 120,
+        timeout: Optional[int] = None,
         tab_name: str = "default",
         working_dir: Optional[str] = None,
     ) -> str:
@@ -796,7 +800,12 @@ class RemoteBackend(WorkspaceBackend):
         if blocked:
             return blocked
 
-        timeout = min(timeout, 600)
+        # Explicit timeout disables the soft no-change timeout; only the hard
+        # timeout bounds the command then.
+        soft_enabled = timeout is None
+        if timeout is None:
+            timeout = self._default_timeout
+        timeout = min(timeout, HARD_TIMEOUT_CAP_SECONDS)
         sentinel = f"__DONE_{uuid.uuid4().hex[:12]}__"
 
         if tab_name not in self._tabs:
@@ -825,6 +834,20 @@ class RemoteBackend(WorkspaceBackend):
                     f"send C-c to cancel, or use a different tab.\n"
                     f"--- terminal state ---\n{terminal_state}"
                 )
+
+            # Colliding-command guard: a previous command may still be running.
+            if tab.pending_sentinel is not None:
+                prev_done = any(
+                    ln.strip().startswith(tab.pending_sentinel) for ln in pre_lines
+                )
+                if prev_done or prompt_is_ready(pre_lines):
+                    tab.pending_sentinel = None
+                else:
+                    state_lines = [ln for ln in pre_lines if ln.strip()][-30:]
+                    terminal_state = "\n".join(state_lines) or "(empty)"
+                    return COLLIDING_COMMAND_TEMPLATE.format(
+                        tab=tab_name, terminal_state=terminal_state
+                    )
 
             # Change directory if needed
             if working_dir:
@@ -875,6 +898,9 @@ class RemoteBackend(WorkspaceBackend):
                     except (ValueError, IndexError):
                         exit_code = 1
 
+                    # Command finished — tab is no longer busy.
+                    tab.pending_sentinel = None
+
                     if start_marker is not None:
                         # Multi-line wrap path: locate the start marker output
                         # line and extract everything between it and the sentinel.
@@ -908,7 +934,7 @@ class RemoteBackend(WorkspaceBackend):
                     output_text = "\n".join(output_lines).strip()
                     break
 
-                # Interactive prompt detection
+                # Genuine interactive prompt (waiting for input)
                 elapsed = time.monotonic() - start_time
                 if elapsed > 1.0:
                     prompt_type = self._detect_interactive_prompt(all_lines)
@@ -916,58 +942,54 @@ class RemoteBackend(WorkspaceBackend):
                         terminal_state = self._capture_terminal_state(
                             tab_name, sentinel, pre_count
                         )
-                        if working_dir and self._sandbox_cwd:
-                            self._tmux_send_keys(
-                                tab_name, f"cd {self._sandbox_cwd}", enter=True
-                            )
-                            time.sleep(0.1)
+                        # Command owns the pane; don't cwd-restore into it.
+                        tab.pending_sentinel = sentinel
                         tab.last_activity = datetime.now(timezone.utc)
-                        return (
-                            f"Interactive prompt detected ({prompt_type}). "
-                            f"Use keys mode to respond.\n"
-                            f"--- terminal state ---\n{terminal_state}"
+                        return INTERACTIVE_PROMPT_TEMPLATE.format(
+                            prompt_type=prompt_type,
+                            tab=tab_name,
+                            terminal_state=terminal_state,
                         )
 
-                    # Stall detection
-                    content_hash = hash(tuple(all_lines[-20:]))
-                    if content_hash == last_content_hash:
-                        if stall_start is None:
-                            stall_start = time.monotonic()
-                        elif time.monotonic() - stall_start >= STALL_DETECTION_SECONDS:
-                            terminal_state = self._capture_terminal_state(
-                                tab_name, sentinel, pre_count
-                            )
-                            if working_dir and self._sandbox_cwd:
-                                self._tmux_send_keys(
-                                    tab_name, f"cd {self._sandbox_cwd}", enter=True
-                                )
-                                time.sleep(0.1)
-                            tab.last_activity = datetime.now(timezone.utc)
-                            return (
-                                f"Command appears to be waiting for input "
-                                f"(no output change for {STALL_DETECTION_SECONDS:.0f}s). "
-                                f"Use keys mode to respond or C-c to cancel.\n"
-                                f"--- terminal state ---\n{terminal_state}"
-                            )
-                    else:
-                        stall_start = None
-                    last_content_hash = content_hash
+                    # Soft no-change timeout (command still running)
+                    last_content_hash, stall_start, timed_out = compute_no_change_state(
+                        all_lines,
+                        last_content_hash,
+                        stall_start,
+                        time.monotonic(),
+                        soft_enabled,
+                        self._no_change_timeout,
+                    )
+                    if timed_out:
+                        terminal_state = self._capture_terminal_state(
+                            tab_name, sentinel, pre_count
+                        )
+                        # Leave it running; don't cwd-restore into a busy pane.
+                        tab.pending_sentinel = sentinel
+                        tab.last_activity = datetime.now(timezone.utc)
+                        return STILL_RUNNING_TEMPLATE.format(
+                            tab=tab_name,
+                            elapsed=elapsed,
+                            terminal_state=terminal_state,
+                        )
 
-            # Restore working directory
+            # Hard timeout: loop exited without the sentinel -> still running.
+            if exit_code is None:
+                terminal_state = self._capture_terminal_state(
+                    tab_name, sentinel, pre_count
+                )
+                tab.pending_sentinel = sentinel
+                tab.last_activity = datetime.now(timezone.utc)
+                return STILL_RUNNING_TEMPLATE.format(
+                    tab=tab_name, elapsed=timeout, terminal_state=terminal_state
+                )
+
+            # Completed — restore working directory if it was changed.
             if working_dir and self._sandbox_cwd:
                 self._tmux_send_keys(tab_name, f"cd {self._sandbox_cwd}", enter=True)
                 time.sleep(0.1)
 
             tab.last_activity = datetime.now(timezone.utc)
-
-            if exit_code is None:
-                terminal_state = self._capture_terminal_state(
-                    tab_name, sentinel, pre_count
-                )
-                return (
-                    f"Command timed out after {timeout}s: {command}\n"
-                    f"--- terminal state ---\n{terminal_state}"
-                )
 
             # Format output
             parts = [f"Exit code: {exit_code}"]
@@ -1144,10 +1166,12 @@ class RemoteBackend(WorkspaceBackend):
         # Create new tmux window
         self._exec(f"tmux new-window -t {self._session_name} -n {name} -d")
 
-        # Set working directory
-        if self._sandbox_cwd and tab_type in ("shell", "process"):
-            self._tmux_send_keys(name, f"cd {self._sandbox_cwd}", enter=True)
-            time.sleep(0.2)
+        # Non-interactive env + working directory (shell/process tabs only).
+        if tab_type in ("shell", "process"):
+            setup = NONINTERACTIVE_ENV_EXPORT
+            if self._sandbox_cwd:
+                setup += f"; cd {self._sandbox_cwd}"
+            self._send_and_wait(name, setup)
 
         # Run initial command
         if command:
