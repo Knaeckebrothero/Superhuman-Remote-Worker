@@ -926,6 +926,18 @@ class GitManager:
         lines = output.split("\n", 1)
         first_line = lines[0].strip()
 
+        # A still-running result (soft/hard no-change timeout) is not a normal
+        # completion. Surface it as a non-zero result with a clear stderr so git
+        # callers don't mistake the explanatory text for command stdout.
+        if "--- still running ---" in output:
+            return subprocess.CompletedProcess(
+                args=cmd,
+                returncode=-1,
+                stdout="",
+                stderr="git command did not complete (still running / timed out).\n"
+                + output,
+            )
+
         if first_line.startswith("Exit code:"):
             try:
                 exit_code = int(first_line.split(":", 1)[1].strip())
