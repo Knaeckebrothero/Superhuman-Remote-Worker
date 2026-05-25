@@ -482,8 +482,12 @@ export class PersistentChatService {
         this._stopSseWatchdog();
 
         const cursor = await this.cache.getThreadCursor(threadId);
-        const cursorQuery = cursor ? `?last_event_id=${encodeURIComponent(`${cursor.epoch}:${cursor.seq}`)}` : '';
-        const url = `${environment.apiUrl}/persistent/threads/${threadId}/stream${cursorQuery}`;
+        // ngsw-bypass keeps the Angular service worker out of the SSE path. Its
+        // /api/** dataGroup otherwise buffers the stream body (which never ends),
+        // stalling EventSource.onopen ~20s. The param's presence alone is enough.
+        const params = new URLSearchParams({'ngsw-bypass': 'true'});
+        if (cursor) params.set('last_event_id', `${cursor.epoch}:${cursor.seq}`);
+        const url = `${environment.apiUrl}/persistent/threads/${threadId}/stream?${params.toString()}`;
 
         // withCredentials true so the srw_session cookie rides along on the
         // cross-origin SSE handshake.

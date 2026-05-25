@@ -152,7 +152,8 @@ export class SudoService {
   connectSSE(): void {
     if (this.eventSource) return;
 
-    this.eventSource = new EventSource(`${this.baseUrl}/sudo/events`, {
+    // ngsw-bypass keeps the service worker from buffering this SSE stream.
+    this.eventSource = new EventSource(`${this.baseUrl}/sudo/events?ngsw-bypass=true`, {
       withCredentials: true,
     });
 
