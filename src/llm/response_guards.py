@@ -16,12 +16,13 @@ user as "The assistant returned a malformed response." See
 
 from typing import Any, List, Optional
 
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, BaseMessage, RemoveMessage
 
 __all__ = [
     "is_degenerate_response",
     "coerce_to_ai_message",
     "finalize_streamed_response",
+    "strip_removal_markers",
 ]
 
 
@@ -82,3 +83,18 @@ def finalize_streamed_response(response: Any) -> Optional[AIMessage]:
     if is_degenerate_response(_text_len(msg.content), len(tool_calls)):
         return None
     return msg
+
+
+def strip_removal_markers(messages: List[BaseMessage]) -> List[BaseMessage]:
+    """Drop ``RemoveMessage`` markers before sending history to the LLM.
+
+    ``ContextManager.ensure_within_limits`` returns a LangGraph reducer delta
+    (``RemoveMessage`` markers + summary + fresh recent copies). A LangGraph
+    graph applies the markers through its ``add_messages`` reducer; the
+    persistent interactive loop has no reducer, so left in place the markers
+    reach ``langchain_openai._convert_message_to_dict``, which rejects them
+    with ``TypeError: Got unknown type ...`` — surfaced to the user as "The
+    assistant returned a malformed response." The summary and recent copies
+    already carry the compacted state, so the markers are pure noise here.
+    """
+    return [m for m in messages if not isinstance(m, RemoveMessage)]

@@ -30,7 +30,11 @@ from langchain_core.messages import (
 
 from .core.context import ContextManager
 from .llm.reasoning_chat import extract_reasoning_text_from_block
-from .llm.response_guards import coerce_to_ai_message, finalize_streamed_response
+from .llm.response_guards import (
+    coerce_to_ai_message,
+    finalize_streamed_response,
+    strip_removal_markers,
+)
 from .services.image_content import extract_image_tags, make_multimodal_user_message
 
 logger = logging.getLogger(__name__)
@@ -502,6 +506,13 @@ async def _execute_turn(
                 config.context_management, "max_summary_length", 10000
             ),
         )
+        # ensure_within_limits returns a LangGraph reducer delta (RemoveMessage
+        # markers + summary + fresh copies). This loop has no reducer to apply
+        # them; left in, the markers reach _convert_message_to_dict and raise
+        # "Got unknown type" → "malformed response". The worker graph strips
+        # them too (src/graph.py). Strip before the compaction-checkpoint check
+        # so len(prepared) reflects the real compacted message count.
+        prepared = strip_removal_markers(prepared)
 
         # Auto-compaction happened — commit + push workspace to Gitea as checkpoint
         if len(prepared) < pre_compact_len and tool_context:
