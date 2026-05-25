@@ -391,8 +391,20 @@
         padding: 48px 0 24px;
       }
 
-      .startup-wrapper.resume {
-        padding: 24px 0;
+      /* Slim startup status strip — chrome above the message list, shown once
+         a turn exists while the session is still starting. Reuses the inner
+         .startup-step row (replaces the old .startup-wrapper.resume overlay
+         that floated over messages). */
+      .startup-banner {
+        flex: 0 0 auto;
+        padding: 7px 16px;
+        background: color-mix(in srgb, var(--accent-color, #3399D6) 8%, var(--panel-bg));
+        border-bottom: 1px solid var(--border-color, var(--surface-0));
+        border-left: 3px solid var(--accent-color);
+      }
+
+      .startup-banner .startup-step {
+        font-size: 14px;
       }
 
       .startup-card {
