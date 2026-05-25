@@ -98,7 +98,10 @@ orchestrator:
       memory: "256Mi"
       cpu: "100m"
     limits:
-      memory: "1Gi"
+      # 2Gi (was 1Gi): headroom for a rare, unattributed transient memory
+      # spike observed during session resume that OOM-killed the pod (steady
+      # state is ~150-280Mi). Stopgap, not a diagnosed leak.
+      memory: "2Gi"
       cpu: "500m"
   # -- Auto-assign jobs to idle agents
   autoAssignEnabled: "true"

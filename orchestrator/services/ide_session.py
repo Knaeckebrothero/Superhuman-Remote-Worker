@@ -19,6 +19,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Any, Optional
 
 from services import resolve_ssh_key_path
+from services.ssh_helpers import stream_extract_snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -787,7 +788,6 @@ class IdeSessionService:
         self, job_id: str, ssh_host: str, ssh_port: int
     ) -> None:
         """Download snapshot from S3 and extract into the VM via SSH."""
-        import asyncio
         import tempfile
 
         if not self._snapshot_service:
@@ -811,38 +811,15 @@ class IdeSessionService:
                     "No SSH key available for snapshot extraction (job %s)",
                     job_id,
                 )
-            ssh_cmd = [
-                "ssh",
-                *(["-i", key_path] if key_path else []),
-                "-o",
-                "StrictHostKeyChecking=no",
-                "-o",
-                "UserKnownHostsFile=/dev/null",
-                "-o",
-                "ConnectTimeout=10",
-                "-p",
-                str(ssh_port),
-                f"agent-host@{ssh_host}",
-                "zstd -d | tar -xf - -C /",
-            ]
-
-            proc = await asyncio.create_subprocess_exec(
-                *ssh_cmd,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+            rc, stderr = await stream_extract_snapshot(
+                ssh_host, ssh_port, tar_path, key_path=key_path
             )
 
-            with open(tar_path, "rb") as f:
-                tar_data = f.read()
-
-            stdout, stderr = await proc.communicate(input=tar_data)
-
-            if proc.returncode != 0:
+            if rc != 0:
                 logger.warning(
                     "Snapshot extraction had errors for job %s (rc=%d): %s",
                     job_id,
-                    proc.returncode,
+                    rc,
                     stderr.decode(errors="replace")[:500],
                 )
 

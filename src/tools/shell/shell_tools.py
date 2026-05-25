@@ -237,13 +237,19 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
         building projects, git operations, file system commands, deploying,
         checking logs, SSH via sshpass, and any other shell task.
 
-        LONG-RUNNING / QUIET COMMANDS: if a command produces no new output for
-        ~30s (e.g. a large `pip install`, a build, a download) it is reported as
-        "still running" with `Exit code: -1` — NOT an error; the command keeps
-        running. For work you know will be slow or quiet, pass an explicit
-        `timeout` (e.g. 600) to disable the no-change check and wait that long.
-        Otherwise call shell_read() to poll until it finishes. Don't re-issue the
-        same command — a busy tab rejects new commands until it completes.
+        LONG-RUNNING / QUIET COMMANDS: a command that produces no new output for
+        ~30s (a large `pip install`, a build, a big download, data ingestion or
+        embedding) is reported as "still running" with `Exit code: -1` — this is
+        NOT an error; the command keeps running on the tab.
+          - Best: when you already expect a command to be slow or quiet, pass an
+            explicit `timeout` (e.g. 300-600) up front, so THIS call waits for
+            the full duration and returns the real exit code.
+          - If you do get "still running", call shell_read() once after a short
+            wait to check progress — do NOT poll in a tight loop. The tab is busy
+            until the command finishes, so re-issuing it (or any other command)
+            is rejected. If the output stays completely unchanged for a long
+            time, the command may be stuck — reconsider the approach rather than
+            polling forever.
 
         INTERACTIVE INPUT: run_command cannot answer prompts (password, y/n).
         Use a non-interactive form instead:
@@ -334,14 +340,17 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
 
         Modes:
           Default (sync): Runs the command and waits for it to finish. Returns
-              exit code + stdout. If the command produces no new output for ~30s
-              it returns "still running" (Exit code: -1) — not an error; poll
-              with shell_read, send input/C-c with keys=True, or pass an explicit
-              `timeout` for known long work. A tab with a still-running command
-              rejects new commands until it finishes. If the command hits an
-              interactive prompt (password, y/n, host key, etc.), it returns
-              early with the prompt text so you can respond with keys=True. After
-              responding, the tab works normally for subsequent commands.
+              exit code + stdout. If it produces no new output for ~30s it
+              returns "still running" (Exit code: -1) — not an error; the command
+              keeps running on the tab. Then you can: poll with shell_read (once
+              after a wait, NOT in a tight loop), stop it with keys=True "C-c",
+              run other work on a different `name` tab, or — best for work you
+              expect to be slow/quiet — re-run it with an explicit `timeout`
+              (e.g. 600) so the call waits the full duration. A tab with a
+              still-running command rejects new commands until it finishes. If
+              the command hits an interactive prompt (password, y/n, host key,
+              etc.), it returns early with the prompt text so you can respond
+              with keys=True. After responding, the tab works normally again.
           keys=True: Send raw keystrokes. Text input (passwords, "yes", "y")
               auto-submits with Enter. Control keys ("C-c", "Up", "Escape")
               are sent as-is. Send "Enter" alone to press Enter without text.

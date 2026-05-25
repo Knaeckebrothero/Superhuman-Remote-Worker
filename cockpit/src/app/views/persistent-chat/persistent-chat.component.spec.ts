@@ -4,7 +4,9 @@ import {
     canComposeDuringSession,
     isStartupBannerVisible,
     pickCurrentStartupStep,
+    pickRunningCommandCard,
 } from './persistent-chat.component';
+import {AssistantTurn} from '../../core/models/turn.model';
 
 /**
  * These cover the three decisions behind the "always-on chat + startup
@@ -68,5 +70,41 @@ describe('pickCurrentStartupStep', () => {
 
     it('returns null for an empty list', () => {
         expect(pickCurrentStartupStep([])).toBeNull();
+    });
+});
+
+describe('pickRunningCommandCard', () => {
+    const rt = {id: 'tc1', tool: 'run_command', args: {command: 'sleep 99'}};
+
+    it('returns null when nothing is running', () => {
+        expect(pickRunningCommandCard(null, [])).toBeNull();
+    });
+
+    it('surfaces the running tool when it is not yet in any turn (cold reattach mid-turn)', () => {
+        // Cold reload mid-turn: REST history lacks the in-flight turn, so the
+        // only signal is the welcome frame's running_tool — show the card.
+        expect(pickRunningCommandCard(rt, [])).toEqual(rt);
+    });
+
+    it('suppresses the card when the tool call is already in a visible turn (warm reconnect)', () => {
+        // Warm reconnect: the turn (with its own tool card) is still on screen,
+        // so the standalone card would double-render — suppress it.
+        const turn: AssistantTurn = {
+            kind: 'assistant',
+            id: 't1',
+            status: 'streaming',
+            startedAt: 0,
+            events: [
+                {
+                    kind: 'tool_call',
+                    id: 'tc1',
+                    tool: 'run_command',
+                    args: {},
+                    status: 'running',
+                    startedAt: 0,
+                },
+            ],
+        };
+        expect(pickRunningCommandCard(rt, [turn])).toBeNull();
     });
 });

@@ -89,6 +89,18 @@ export interface ToolCallInfo {
     decision?: 'approved' | 'denied';
 }
 
+/**
+ * The tool call the agent is currently blocked on, delivered in the
+ * session.state welcome frame so a (re)attaching client can render a
+ * running-command card even when the in-flight turn isn't in REST history yet
+ * (it's persisted only at turn end).
+ */
+export interface RunningToolInfo {
+    id: string;
+    tool: string;
+    args: Record<string, unknown>;
+}
+
 /** Permission request from the agent. */
 export interface PermissionRequest {
     /** Tool call id — correlates the eventual decision back to the call. */
@@ -228,6 +240,13 @@ export class PersistentChatService {
     readonly permissionMode = signal<PermissionMode>('supervised');
     readonly pendingPermission = signal<PermissionRequest | null>(null);
 
+    // --- Running-command snapshot ---
+    // Set from the session.state welcome frame on (re)attach when the loop is
+    // blocked in a tool call; cleared when that tool completes or the turn ends.
+    // Lets the UI show a "running command" card instead of a blank "Connecting…"
+    // during a long mid-turn block (the in-flight turn isn't in REST history).
+    readonly runningTool = signal<RunningToolInfo | null>(null);
+
     // --- Narration state ---
     readonly narrationMode = signal<NarrationMode>('auto');
 
@@ -344,6 +363,7 @@ export class PersistentChatService {
             this.tasks.set([]);
             this.undoAvailable.set(false);
             this.isSessionPaused.set(false);
+            this.runningTool.set(null);
 
             this.threadId.set(threadId);
             await this.loadHistory(threadId);
@@ -1245,6 +1265,14 @@ export class PersistentChatService {
                 if (params['temperature'] != null) {
                     this.temperature.set(params['temperature'] as number);
                 }
+                // Running-command snapshot: only act when the key is present so
+                // a metadata-only session.state from another channel can't clobber it.
+                if ('running_tool' in params) {
+                    const rt = params['running_tool'] as Partial<RunningToolInfo> | null;
+                    this.runningTool.set(
+                        rt && rt.tool ? {id: rt.id ?? '', tool: rt.tool, args: rt.args ?? {}} : null,
+                    );
+                }
                 this.markSessionReady();
                 break;
 
@@ -1316,6 +1344,9 @@ export class PersistentChatService {
                     isError: !!params['is_error'],
                     timestamp: now,
                 });
+                if (this.runningTool()?.id === ((params['id'] as string) || '')) {
+                    this.runningTool.set(null);
+                }
                 break;
 
             case 'permission.request': {
@@ -1339,12 +1370,14 @@ export class PersistentChatService {
                     this.dispatch({type: 'turn_completed', turnId, finishedAt: now});
                 }
                 this.isInterrupting.set(false);
+                this.runningTool.set(null);
                 break;
             }
 
             case 'interrupt.ack':
                 this._closeActiveTurnIfAny('turn_interrupted');
                 this.isInterrupting.set(false);
+                this.runningTool.set(null);
                 break;
 
             case 'mode.changed':
