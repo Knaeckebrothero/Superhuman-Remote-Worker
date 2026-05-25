@@ -219,6 +219,16 @@ class SessionRouterService:
                 "type": "ClusterIP",
                 "selector": {"srw.io/thread-id": thread_id},
                 "ports": [{"port": 8001, "targetPort": 8001}],
+                # The orchestrator is the authoritative readiness gate: it won't
+                # mint a token / return 200 from /connection until probe_ready()
+                # confirms the agent answers /ready on its pod IP. Gating the
+                # Service *additionally* on the pod's k8s readinessProbe
+                # (initialDelaySeconds=30) only opens a ~30s window where
+                # /connection says "ready" but the Service has no endpoints, so
+                # the cockpit's WS fails and reconnect-loops. Publishing
+                # not-ready addresses closes that gap — traffic only arrives
+                # after /connection 200 anyway.
+                "publishNotReadyAddresses": True,
             },
         }
 

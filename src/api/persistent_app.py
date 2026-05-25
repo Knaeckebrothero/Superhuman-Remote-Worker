@@ -2654,12 +2654,66 @@ def _safe_serialize(obj: Any) -> Any:
         return str(obj)
 
 
+def _repair_tool_pairing(messages: list) -> list:
+    """Drop tool calls/results that lost their partner during reconstruction.
+
+    Both the OpenAI Responses API and Anthropic reject a history where an
+    assistant tool/function call has no matching result (or a result has no
+    matching call) — a 400 "No tool output found for function call ...". On
+    resume this can happen if a tool result was never persisted (an interrupted
+    turn) or, historically, if a fixed-size restore window sliced a parallel
+    tool-call batch. Keep only calls and results whose ids match on both sides;
+    assistant messages left with neither text nor calls are dropped.
+    """
+    from langchain_core.messages import AIMessage, ToolMessage
+
+    call_ids = {
+        tc.get("id")
+        for m in messages
+        if isinstance(m, AIMessage)
+        for tc in (getattr(m, "tool_calls", None) or [])
+        if tc.get("id")
+    }
+    result_ids = {
+        m.tool_call_id
+        for m in messages
+        if isinstance(m, ToolMessage) and getattr(m, "tool_call_id", "")
+    }
+    valid_ids = call_ids & result_ids
+
+    repaired: list = []
+    for m in messages:
+        if isinstance(m, AIMessage):
+            tool_calls = getattr(m, "tool_calls", None) or []
+            kept = [tc for tc in tool_calls if tc.get("id") in valid_ids]
+            if len(kept) != len(tool_calls):
+                m = AIMessage(content=m.content, tool_calls=kept, id=m.id)
+            if not kept and not m.content:
+                continue  # empty assistant turn carries no information
+            repaired.append(m)
+        elif isinstance(m, ToolMessage):
+            if getattr(m, "tool_call_id", "") in valid_ids:
+                repaired.append(m)
+            # else: orphaned result — drop
+        else:
+            repaired.append(m)
+    return repaired
+
+
 async def _restore_session_messages() -> None:
     """Restore LangChain message history from DB into session.messages.
 
     Called during lifespan startup. On a fresh session this is a no-op.
     On pod restart or session resume, this restores the LLM's conversation
     context so it doesn't start with amnesia.
+
+    Loads the *full* conversation (no message-count cap) and then bounds the
+    working context with ContextManager.ensure_within_limits — the same
+    token-driven compaction a live turn uses (src/persistent_graph.py). The raw
+    conversation always stays in thread_messages for the user to view; only the
+    in-memory LLM context is compacted. Truncating to a fixed message count
+    instead would both lose recent context and risk slicing a tool-call batch
+    (orphaned function_call → Responses API 400).
     """
     if not _session or not _agent or not _agent.postgres_conn or not _thread_id:
         return
@@ -2668,16 +2722,19 @@ async def _restore_session_messages() -> None:
         import uuid as _uuid
         from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
+        from ..llm.response_guards import strip_removal_markers
+
         db_messages = await _agent.postgres_conn.get_thread_messages_history(
             thread_id=_thread_id,
-            limit=500,
+            limit=None,  # full conversation; compaction (below) bounds the context
         )
 
         if not db_messages:
             return
 
         restored: list = []
-        # Track tool_call_ids from the last AIMessage for ToolMessage pairing
+        # Fallback positional pairing for legacy rows whose tool_call_id column
+        # is NULL (predates the column); current rows carry it explicitly.
         pending_tool_call_ids: list[str] = []
 
         for db_msg in db_messages:
@@ -2685,10 +2742,10 @@ async def _restore_session_messages() -> None:
             content = db_msg["content"] or ""
             tool_calls = db_msg.get("tool_calls")
 
-            # Generate a fresh UUID per restored message. Without an `id`,
-            # `RemoveMessage(id=...)` in compaction is a no-op — meaning a
-            # resumed session that needs compaction can never shrink. The
-            # ID is a LangGraph state key, not user-facing or persisted.
+            # Fresh UUID per restored message. Without an `id`,
+            # `RemoveMessage(id=...)` in compaction is a no-op — a resumed
+            # session that needs compaction could never shrink. The ID is a
+            # LangGraph state key, not user-facing or persisted.
             msg_id = str(_uuid.uuid4())
 
             if role in ("human", "user"):
@@ -2705,18 +2762,19 @@ async def _restore_session_messages() -> None:
                         }
                         for tc in tool_calls
                     ]
-                    pending_tool_call_ids = [tc["id"] for tc in lc_tool_calls]
-                else:
-                    pending_tool_call_ids = []
+                pending_tool_call_ids = [tc["id"] for tc in lc_tool_calls]
                 restored.append(
                     AIMessage(content=content, tool_calls=lc_tool_calls, id=msg_id)
                 )
 
             elif role == "tool":
-                # Pair with the next pending tool_call_id from the last AIMessage
-                tool_call_id = (
+                # Prefer the persisted tool_call_id; fall back to positional
+                # pairing for legacy rows that predate the column. Pop either
+                # way so the fallback queue stays aligned.
+                fallback_id = (
                     pending_tool_call_ids.pop(0) if pending_tool_call_ids else ""
                 )
+                tool_call_id = db_msg.get("tool_call_id") or fallback_id
                 restored.append(
                     ToolMessage(
                         content=content,
@@ -2727,14 +2785,42 @@ async def _restore_session_messages() -> None:
 
             # Skip system messages — the loop adds a fresh one from current config
 
+        # Defense-in-depth: drop any call/result orphaned by an interrupted
+        # persist (full load already eliminates truncation orphans).
+        restored = _repair_tool_pairing(restored)
+
+        # Bound the working context the way a live turn does. Summarizes to
+        # (summary + recent) when over the token budget, else passes through.
+        # ensure_within_limits returns a LangGraph reducer delta; this loop has
+        # no reducer, so strip the RemoveMessage markers to materialize it.
+        ctx_mgr = getattr(_session, "context_manager", None)
+        aux = getattr(_session, "auxiliary_llm", None)
+        if ctx_mgr and aux and restored:
+            try:
+                bounded = await ctx_mgr.ensure_within_limits(
+                    restored,
+                    aux,
+                    max_summary_length=getattr(
+                        _session.config.context_management,
+                        "max_summary_length",
+                        10000,
+                    ),
+                )
+                restored = strip_removal_markers(bounded)
+            except Exception as e:
+                logger.warning(
+                    "Compaction during restore failed "
+                    f"(non-fatal, keeping full history): {e}"
+                )
+
         if restored:
             _session.messages.extend(restored)
-            # Set turn_count from the last message's turn_number
+            # Set turn_count from the last stored message's turn_number
             last_turn = max((m.get("turn_number") or 0 for m in db_messages), default=0)
             _session.turn_count = last_turn
             logger.info(
                 f"Restored {len(restored)} messages for thread {_thread_id} "
-                f"(last turn: {last_turn})"
+                f"(from {len(db_messages)} stored; last turn: {last_turn})"
             )
 
     except Exception as e:
