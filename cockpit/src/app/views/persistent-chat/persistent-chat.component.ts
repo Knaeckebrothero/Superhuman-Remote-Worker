@@ -189,6 +189,46 @@ const CATEGORY_LABELS: Record<string, string> = {
     evaluation: 'Evaluation',
 };
 
+/**
+ * Pure decision helpers for the session-startup UX. Exported (and unit
+ * tested in persistent-chat.component.spec.ts) so the logic is verified
+ * without a full component render — see automations-page.component.spec.ts
+ * for the same split.
+ */
+
+/**
+ * Whether the slim startup banner should show: only once a turn already
+ * exists while the session is still starting (a queued message, or a resumed
+ * session's history). The @empty centered card covers the no-turns case, so
+ * the two are mutually exclusive — the card never floats over the message
+ * list (the old .startup-wrapper.resume overlay bug). Hides automatically
+ * when the session goes ready (isStartingSession → false).
+ */
+export function isStartupBannerVisible(isStartingSession: boolean, turnCount: number): boolean {
+    return isStartingSession && turnCount > 0;
+}
+
+/**
+ * Whether the composer should accept input: while connected OR while the
+ * session is still starting (so the user can type from t=0 and have the
+ * message queued + auto-sent on session.state). Deliberately false during a
+ * mid-session reconnect (connected=false, starting=false) — markSessionReady
+ * flushes the pending queue only once, so a message queued then would never
+ * send.
+ */
+export function canComposeDuringSession(isConnected: boolean, isStartingSession: boolean): boolean {
+    return isConnected || isStartingSession;
+}
+
+/**
+ * The startup step to surface in the banner: the active one, or the last
+ * step as a fallback when none is active (the brief gap where every phase is
+ * recorded done before sessionReady flips). Null for an empty list.
+ */
+export function pickCurrentStartupStep<T extends {state: string}>(steps: readonly T[]): T | null {
+    return steps.find((s) => s.state === 'active') ?? steps[steps.length - 1] ?? null;
+}
+
 @Component({
     selector: 'app-persistent-chat',
     standalone: true,
@@ -425,6 +465,23 @@ const CATEGORY_LABELS: Record<string, string> = {
         </details>
       </ng-template>
 
+      <!-- Startup banner: slim, non-scrolling status strip shown once a turn
+           exists while the session is still starting. Reuses the .startup-step
+           row so it matches the centered card; replaces the old floating
+           .startup-wrapper.resume overlay so the card never sits over the
+           message list. Auto-hides when sessionReady flips. -->
+      @if (startupBannerVisible()) {
+        <div class="startup-banner">
+          @if (currentStartupStep(); as step) {
+            <div class="startup-step state-active">
+              <span class="step-spinner" aria-hidden="true"></span>
+              <span class="step-label">{{ ('chat.startup.steps.' + step.key) | transloco }}</span>
+              <time class="step-time">{{ formatElapsed(step.elapsedMs) }}</time>
+            </div>
+          }
+        </div>
+      }
+
       <!-- Messages -->
       <div class="messages" #messagesContainer (scroll)="onMessagesScroll()">
         @for (turn of chat.turns(); track turn.id; let isLast = $last) {
@@ -622,17 +679,6 @@ const CATEGORY_LABELS: Record<string, string> = {
           }
         }
 
-        <!-- Startup/resume card: shown when history exists but session not yet ready.
-             Gated on isStartingSession so it only renders during an active start
-             (creating thread, handshaking, or waiting for the agent-ready
-             frame) — never after a user-initiated disconnect, which nulls
-             threadStatus and would otherwise leave the spinner running. -->
-        @if (chat.turns().length && !chat.isStreaming() && chat.isStartingSession()) {
-          <div class="startup-wrapper resume">
-            <ng-container *ngTemplateOutlet="startupCardTpl"></ng-container>
-          </div>
-        }
-
         <ng-template #startupCardTpl>
           <div class="startup-card">
             <div class="startup-card-head">
@@ -760,7 +806,7 @@ const CATEGORY_LABELS: Record<string, string> = {
         <div
           class="composer"
           [class.focused]="inputFocused()"
-          [class.disabled]="!chat.isConnected()"
+          [class.disabled]="!canCompose()"
           [class.recording]="isRecording()"
         >
           <!-- Slash command autocomplete -->
@@ -867,7 +913,7 @@ const CATEGORY_LABELS: Record<string, string> = {
               (focus)="inputFocused.set(true)"
               (blur)="inputFocused.set(false)"
               [placeholder]="inputPlaceholder()"
-              [disabled]="!chat.isConnected()"
+              [disabled]="!canCompose()"
               rows="1"
             ></textarea>
           }
@@ -1132,6 +1178,27 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         });
     });
 
+    /** The startup step to surface in the slim banner (active, or last as a fallback). */
+    readonly currentStartupStep = computed(() => pickCurrentStartupStep(this.startupSteps()));
+
+    /**
+     * Show the slim startup banner once a turn exists while still starting —
+     * mutually exclusive with the @empty centered card, so the card never
+     * floats over the message list.
+     */
+    readonly startupBannerVisible = computed(() =>
+        isStartupBannerVisible(this.chat.isStartingSession(), this.chat.turns().length),
+    );
+
+    /**
+     * Whether the composer accepts input: during startup (type + queue +
+     * flush on ready) and while connected; false during a mid-session
+     * reconnect.
+     */
+    readonly canCompose = computed(() =>
+        canComposeDuringSession(this.chat.isConnected(), this.chat.isStartingSession()),
+    );
+
     stepIcon(state: 'done' | 'active' | 'todo'): string {
         if (state === 'done') return 'check_circle';
         if (state === 'active') return 'progress_activity';
@@ -1314,8 +1381,8 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         // Track language changes so placeholder re-translates when i18n switches.
         this.i18n.activeLang();
         if (this.isShowingReconnectBanner()) return this.transloco.translate('chat.input.reconnecting');
+        if (this.chat.isStartingSession()) return this.transloco.translate('chat.input.sessionStarting');
         if (!this.chat.isConnected()) return this.transloco.translate('chat.input.connect');
-        if (this.chat.isConnected() && !this.chat.sessionReady()) return this.transloco.translate('chat.input.sessionStarting');
         if (this.chat.isInterrupting()) return this.transloco.translate('chat.input.stopping');
         if (this.chat.isStreaming()) return this.transloco.translate('chat.input.working');
         if (this.chat.isUploadingAttachments()) return this.transloco.translate('chat.input.uploading');
@@ -1331,7 +1398,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
 
     readonly canSend = computed(
         () =>
-            this.chat.isConnected() &&
+            this.canCompose() &&
             (this.inputText.trim().length > 0 || this.chat.pendingAttachments().length > 0) &&
             !this.isPendingSend(),
     );
