@@ -9,12 +9,18 @@ persistent_session_empty_chunk_history_corruption):
 - finalize_streamed_response — coerce + drop degenerate (returns None)
 """
 
-from langchain_core.messages import AIMessage, AIMessageChunk
+from langchain_core.messages import (
+    AIMessage,
+    AIMessageChunk,
+    RemoveMessage,
+    SystemMessage,
+)
 
 from src.llm.response_guards import (
     coerce_to_ai_message,
     finalize_streamed_response,
     is_degenerate_response,
+    strip_removal_markers,
 )
 
 
@@ -80,3 +86,37 @@ class TestFinalizeStreamedResponse:
         result = finalize_streamed_response(msg)
         assert result is not None
         assert result.tool_calls == [tc]
+
+
+class TestStripRemovalMarkers:
+    """ContextManager.summarize_and_compact returns a LangGraph reducer delta:
+    RemoveMessage markers (one per evicted message) + summary + fresh recent
+    copies. The persistent loop has no reducer to apply them, and
+    langchain_openai._convert_message_to_dict rejects RemoveMessage with
+    "Got unknown type ..." — surfaced to the user as "The assistant returned a
+    malformed response." So markers must be dropped before the LLM call.
+    """
+
+    def test_markers_are_removed(self):
+        # The exact shape that crashed session 576f2c29: markers carrying the
+        # run-ids of evicted streamed messages.
+        msgs = [
+            RemoveMessage(id="lc_run--019e5ebd-13fc-7940-9c1f-a491020411d5"),
+            SystemMessage(content="[Summary of prior work]\n..."),
+            AIMessage(content="recent turn"),
+        ]
+        result = strip_removal_markers(msgs)
+        assert not any(isinstance(m, RemoveMessage) for m in result)
+
+    def test_non_markers_preserved_in_order(self):
+        summary = SystemMessage(content="summary")
+        recent = AIMessage(content="recent")
+        msgs = [RemoveMessage(id="a"), summary, RemoveMessage(id="b"), recent]
+        assert strip_removal_markers(msgs) == [summary, recent]
+
+    def test_list_without_markers_is_unchanged(self):
+        msgs = [SystemMessage(content="s"), AIMessage(content="a")]
+        assert strip_removal_markers(msgs) == msgs
+
+    def test_empty_list(self):
+        assert strip_removal_markers([]) == []
