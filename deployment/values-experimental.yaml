@@ -39,9 +39,9 @@ image:
   orchestrator:
     tag: sha-e78db27
   agent:
-    tag: sha-e78db27
+    tag: sha-57a84be
   cockpit:
-    tag: sha-fa3a064
+    tag: sha-57a84be
   mcp:
     tag: sha-c8592ec
   workspace:
