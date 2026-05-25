@@ -23,6 +23,7 @@ from src.api.persistent_app import (
     _handle_vm_upgrade,
     _poll_vm_ready,
     _poll_workspace_ready,
+    _repair_tool_pairing,
     _safe_serialize,
     _save_message,
     _save_turn_ai_messages,
@@ -288,6 +289,151 @@ class TestRestoreSessionMessageIds:
         )
         # IDs must be unique (UUIDs).
         assert len(set(ids)) == len(ids), "restored message IDs must be unique"
+
+
+class TestRestoreSessionToolPairing:
+    """Resume must never emit a tool call without its result.
+
+    Regression for the Responses API 400 "No tool output found for function
+    call ..." hit when resuming session b4478b88: the restore path capped at
+    500 messages and sliced a 5-call parallel tool batch, orphaning two
+    function calls. Resume now loads the full conversation and repairs any
+    residual orphan before the first LLM call.
+    """
+
+    @pytest.mark.asyncio
+    async def test_loads_full_conversation_not_capped(self):
+        """Restore must request the entire conversation (limit=None)."""
+        from src.api import persistent_app as pa
+
+        mock_session = MagicMock()
+        mock_session.messages = []
+        mock_session.context_manager = None  # skip compaction in this test
+        mock_agent = MagicMock()
+        mock_agent.postgres_conn = MagicMock()
+        get_history = AsyncMock(
+            return_value=[
+                {"role": "user", "content": "hi", "tool_calls": None, "turn_number": 1},
+            ]
+        )
+        mock_agent.postgres_conn.get_thread_messages_history = get_history
+
+        with (
+            patch.object(pa, "_session", mock_session),
+            patch.object(pa, "_agent", mock_agent),
+            patch.object(pa, "_thread_id", "thread-full"),
+        ):
+            await pa._restore_session_messages()
+
+        get_history.assert_awaited_once()
+        assert get_history.await_args.kwargs.get("limit", "MISSING") is None, (
+            "resume must load the full conversation (limit=None), got "
+            f"{get_history.await_args.kwargs}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_orphaned_tool_calls_pruned_on_restore(self):
+        """An assistant batch missing some results is repaired, not orphaned."""
+        from src.api import persistent_app as pa
+
+        # 5 parallel tool calls, only 3 results persisted (the b4478b88 shape).
+        history = [
+            {
+                "role": "user",
+                "content": "build it",
+                "tool_calls": None,
+                "turn_number": 1,
+            },
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": f"call_{i}", "name": "read_file", "args": {}}
+                    for i in range(5)
+                ],
+                "turn_number": 1,
+            },
+            {
+                "role": "tool",
+                "content": "r0",
+                "tool_call_id": "call_0",
+                "tool_calls": None,
+                "turn_number": 1,
+            },
+            {
+                "role": "tool",
+                "content": "r1",
+                "tool_call_id": "call_1",
+                "tool_calls": None,
+                "turn_number": 1,
+            },
+            {
+                "role": "tool",
+                "content": "r2",
+                "tool_call_id": "call_2",
+                "tool_calls": None,
+                "turn_number": 1,
+            },
+        ]
+
+        mock_session = MagicMock()
+        mock_session.messages = []
+        mock_session.context_manager = None  # isolate the pairing repair
+        mock_agent = MagicMock()
+        mock_agent.postgres_conn = MagicMock()
+        mock_agent.postgres_conn.get_thread_messages_history = AsyncMock(
+            return_value=history
+        )
+
+        with (
+            patch.object(pa, "_session", mock_session),
+            patch.object(pa, "_agent", mock_agent),
+            patch.object(pa, "_thread_id", "thread-orphan"),
+        ):
+            await pa._restore_session_messages()
+
+        msgs = mock_session.messages
+        call_ids = {
+            tc["id"]
+            for m in msgs
+            if isinstance(m, AIMessage)
+            for tc in (m.tool_calls or [])
+        }
+        result_ids = {m.tool_call_id for m in msgs if isinstance(m, ToolMessage)}
+        # Invariant the Responses API enforces: calls and results match exactly.
+        assert call_ids == result_ids == {"call_0", "call_1", "call_2"}, (
+            f"unpaired tool calls/results remain: calls={call_ids} results={result_ids}"
+        )
+
+    def test_repair_drops_orphan_result_with_no_call(self):
+        """A tool result whose call is absent is dropped."""
+        ai = AIMessage(
+            content="ok", tool_calls=[{"id": "a", "name": "f", "args": {}}], id="1"
+        )
+        good = ToolMessage(content="ra", tool_call_id="a", id="2")
+        orphan = ToolMessage(content="rb", tool_call_id="b", id="3")
+        out = _repair_tool_pairing([ai, good, orphan])
+        assert orphan not in out
+        assert good in out
+        assert {m.tool_call_id for m in out if isinstance(m, ToolMessage)} == {"a"}
+
+    def test_repair_keeps_fully_paired_history_unchanged(self):
+        """Well-formed history passes through with pairing intact."""
+        ai = AIMessage(
+            content="",
+            tool_calls=[
+                {"id": "a", "name": "f", "args": {}},
+                {"id": "b", "name": "g", "args": {}},
+            ],
+            id="1",
+        )
+        t_a = ToolMessage(content="ra", tool_call_id="a", id="2")
+        t_b = ToolMessage(content="rb", tool_call_id="b", id="3")
+        human = HumanMessage(content="next", id="4")
+        out = _repair_tool_pairing([ai, t_a, t_b, human])
+        assert len(out) == 4
+        kept_ai = next(m for m in out if isinstance(m, AIMessage))
+        assert {tc["id"] for tc in kept_ai.tool_calls} == {"a", "b"}
 
 
 # ---------------------------------------------------------------------------

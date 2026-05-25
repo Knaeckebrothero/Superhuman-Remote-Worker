@@ -322,12 +322,19 @@ class PostgresDB:
     async def get_thread_messages_history(
         self,
         thread_id: str,
-        limit: int = 200,
+        limit: Optional[int] = 200,
         offset: int = 0,
     ) -> List[Dict[str, Any]]:
-        """Load thread message history for session resume. Ordered by turn_number, created_at ASC."""
-        rows = await self.fetch(
-            """
+        """Load thread message history. Ordered by turn_number, created_at ASC.
+
+        Pass ``limit=None`` to load the entire conversation. Session resume
+        uses this: the LLM working context is bounded afterwards by
+        ContextManager.ensure_within_limits (token-driven compaction), not by
+        truncating stored history. A fixed message cap can slice a parallel
+        tool-call batch and orphan a function call, which the Responses API
+        rejects with a 400.
+        """
+        query = """
             SELECT id, role, content, tool_calls, turn_number, metrics,
                    tool_call_id, thinking, reasoning, tool_results,
                    provider, provider_raw, additional_kwargs, response_metadata,
@@ -335,13 +342,15 @@ class PostgresDB:
             FROM thread_messages
             WHERE thread_id = $1
             ORDER BY turn_number ASC, created_at ASC
-                LIMIT $2
-            OFFSET $3
-            """,
-            thread_id,
-            limit,
-            offset,
-        )
+        """
+        params: List[Any] = [thread_id]
+        if limit is not None:
+            params.append(limit)
+            query += f"\n            LIMIT ${len(params)}"
+        params.append(offset)
+        query += f"\n            OFFSET ${len(params)}"
+
+        rows = await self.fetch(query, *params)
 
         def _j(v):
             return json.loads(v) if isinstance(v, (str, bytes)) else v
