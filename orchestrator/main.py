@@ -5414,6 +5414,11 @@ async def notification_sse_events(request: Request) -> StreamingResponse:
 
     async def event_stream():
         try:
+            # Kickstart: flush immediately so EventSource.onopen fires at once and
+            # buffering proxies (Cloudflare Tunnel, Traefik) don't idle-timeout
+            # before the first byte — otherwise the next byte is the 30s keepalive
+            # below. Comments (`:`-prefixed) are ignored by EventSource.
+            yield ": open\n\n"
             while True:
                 try:
                     event = await asyncio.wait_for(queue.get(), timeout=30)
@@ -5626,6 +5631,11 @@ async def sudo_sse_events(request: Request) -> StreamingResponse:
 
     async def event_stream():
         try:
+            # Kickstart: flush immediately so EventSource.onopen fires at once and
+            # buffering proxies (Cloudflare Tunnel, Traefik) don't idle-timeout
+            # before the first byte — otherwise the next byte is the 30s keepalive
+            # below. Comments (`:`-prefixed) are ignored by EventSource.
+            yield ": open\n\n"
             while True:
                 # Check if client disconnected
                 if await request.is_disconnected():
@@ -12535,6 +12545,16 @@ async def thread_event_stream(thread_id: str, request: Request) -> StreamingResp
             cursor_seq = None
 
     async def event_stream():
+        # Kickstart: flush a comment immediately so the browser EventSource
+        # fires `onopen` at once and buffering intermediaries (Cloudflare
+        # Tunnel, Traefik) don't hold the response headers / idle-timeout the
+        # connection waiting for the first body byte. Without this, a connect
+        # whose cursor is already at the tail sends nothing until the ~20s
+        # keepalive ping below — stalling the SSE receive path ~20s. Comments
+        # (lines starting with `:`) are ignored by EventSource, so this is
+        # side-effect-free on the client.
+        yield ": open\n\n"
+
         # Mismatched epoch → force re-sync.
         if cursor_epoch is not None and cursor_epoch != server_epoch:
             async with postgres_db.acquire() as conn:
