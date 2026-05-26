@@ -42,7 +42,12 @@ sentence-transformers>=2.2.0
 pgvector>=0.2.0
 langchain-postgres>=0.0.6
 langdetect>=1.0.9
-fastapi>=0.109.0
+# Exclude fastapi 0.136.3 — OSV MAL-2026-4750 (Amazon Inspector heuristic) flags it
+# for adding an undocumented `fastar` dep to the `[standard]` extra. We install plain
+# fastapi (no `[standard]`) so `fastar` is never pulled, but pip-audit matches on the
+# version regardless. Skip just this release; floor stays open so a clean 0.136.4+ is
+# picked up automatically. Tighten to `<0.136` if upstream confirms a real compromise.
+fastapi>=0.109.0,!=0.136.3
 uvicorn>=0.27.0
 httpx>=0.26.0
 # Retry primitives for the main-cloud backend layer (transitive via
