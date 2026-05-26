@@ -2805,6 +2805,29 @@ class LlmEndpointUpdate(BaseModel):
     allow_insecure: bool = False
 
 
+class PromptOverrideCreate(BaseModel):
+    """Request body for creating or replacing a prompt override.
+
+    ``kind`` is the resolver subsection; ``name`` is the resolver entry_type
+    (e.g. 'persona', 'systemprompt'). ``family=None`` means a global default.
+    """
+
+    family: str | None = Field(None, max_length=64)
+    kind: Literal["prompts", "instructions"]
+    name: str = Field(..., min_length=1, max_length=128)
+    content: str = Field(..., min_length=1)
+    content_format: Literal["text", "markdown", "jinja", "yaml"] = "text"
+    notes: str | None = None
+
+
+class PromptOverrideUpdate(BaseModel):
+    """Update an existing override's content; family/kind/name are immutable."""
+
+    content: str = Field(..., min_length=1)
+    content_format: Literal["text", "markdown", "jinja", "yaml"] = "text"
+    notes: str | None = None
+
+
 LLM_MODEL_CAPABILITIES = ("chat", "vision", "embedding", "auxiliary", "whisper", "tts")
 
 
@@ -15279,6 +15302,144 @@ async def _maybe_schedule_discovery(provider: str, api_key: str) -> None:
         await postgres_db.set_system_api_key_discovery_cache(provider, payload)
 
     asyncio.create_task(_probe())
+
+
+# =============================================================================
+# Admin -> Prompts (DB-backed prompt overrides, v1)
+# =============================================================================
+
+
+def load_prompt_catalog() -> list[dict[str, Any]]:
+    """Human-facing descriptions for editable prompt keys.
+
+    Read from config/prompts/catalog.yaml (shipped with the image). Missing
+    file -> empty list.
+    """
+    import yaml
+
+    from src.core.loader import get_project_root
+
+    path = get_project_root() / "config" / "prompts" / "catalog.yaml"
+    if not path.exists():
+        return []
+    return yaml.safe_load(path.read_text()) or []
+
+
+def _prompt_catalog_entry(kind: str, name: str) -> dict[str, Any] | None:
+    for entry in load_prompt_catalog():
+        if entry.get("kind") == kind and entry.get("name") == name:
+            return entry
+    return None
+
+
+def read_bundled_prompt(kind: str, family: str | None, name: str) -> str:
+    """Read the shipped (bundled) content for (kind, family, name), bypassing overrides."""
+    from src.core.loader import InstructionMatrixResolver, PromptMatrixResolver
+
+    resolver_cls = {
+        "prompts": PromptMatrixResolver,
+        "instructions": InstructionMatrixResolver,
+    }.get(kind)
+    if resolver_cls is None:
+        raise HTTPException(status_code=400, detail=f"unknown kind: {kind!r}")
+    resolver = resolver_cls(None, family or "default")
+    try:
+        return resolver.load(name, bundled_only=True)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="no bundled default for that key")
+
+
+@app.get("/api/admin/prompts/overrides")
+async def admin_list_prompt_overrides(request: Request) -> list[dict[str, Any]]:
+    """List all prompt overrides (system-wide)."""
+    await _require_admin(request)
+    return await postgres_db.list_prompt_overrides()
+
+
+@app.get("/api/admin/prompts/overrides/{override_id}")
+async def admin_get_prompt_override(
+    request: Request, override_id: str
+) -> dict[str, Any]:
+    """Fetch a single prompt override by id."""
+    await _require_admin(request)
+    row = await postgres_db.get_prompt_override(override_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="override not found")
+    return row
+
+
+@app.post("/api/admin/prompts/overrides")
+async def admin_create_prompt_override(
+    request: Request, body: PromptOverrideCreate
+) -> dict[str, Any]:
+    """Create or replace the override for (family, kind, name)."""
+    user = await _require_admin(request)
+    return await postgres_db.upsert_prompt_override(
+        family=body.family,
+        kind=body.kind,
+        name=body.name,
+        content=body.content,
+        content_format=body.content_format,
+        notes=body.notes,
+        user_id=user.get("id"),
+    )
+
+
+@app.put("/api/admin/prompts/overrides/{override_id}")
+async def admin_update_prompt_override(
+    request: Request, override_id: str, body: PromptOverrideUpdate
+) -> dict[str, Any]:
+    """Update an existing override's content (family/kind/name are immutable)."""
+    user = await _require_admin(request)
+    existing = await postgres_db.get_prompt_override(override_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="override not found")
+    return await postgres_db.upsert_prompt_override(
+        family=existing["family"],
+        kind=existing["kind"],
+        name=existing["name"],
+        content=body.content,
+        content_format=body.content_format,
+        notes=body.notes,
+        user_id=user.get("id"),
+    )
+
+
+@app.delete("/api/admin/prompts/overrides/{override_id}")
+async def admin_delete_prompt_override(
+    request: Request, override_id: str
+) -> dict[str, Any]:
+    """Delete an override (reset to the bundled default)."""
+    await _require_admin(request)
+    if not await postgres_db.delete_prompt_override(override_id):
+        raise HTTPException(status_code=404, detail="override not found")
+    return {"deleted": True}
+
+
+@app.get("/api/admin/prompts/catalog")
+async def admin_prompt_catalog(request: Request) -> list[dict[str, Any]]:
+    """List the editable prompt keys with human descriptions."""
+    await _require_admin(request)
+    return load_prompt_catalog()
+
+
+@app.get("/api/admin/prompts/bundled/{family}/{kind}/{name}")
+async def admin_get_bundled_prompt(
+    request: Request, family: str, kind: str, name: str
+) -> dict[str, Any]:
+    """Return the bundled (shipped) default for a key, plus its catalog entry.
+
+    ``family='_'`` stands in for the global/default family.
+    """
+    await _require_admin(request)
+    fam = None if family == "_" else family
+    return {
+        "family": fam,
+        "kind": kind,
+        "name": name,
+        "content": read_bundled_prompt(kind, fam, name),
+        "catalog": _prompt_catalog_entry(kind, name),
+    }
 
 
 @app.get("/api/admin/providers/endpoints")
