@@ -300,6 +300,15 @@
     }
   },
   "admin": {
+    "prompts": {
+      "messages": {
+        "saveEmpty": "Nothing to save — pick a prompt and enter content.",
+        "saved": "Override saved — applies to future jobs.",
+        "saveFailed": "Failed to save override.",
+        "removed": "Override removed — back to the bundled default.",
+        "removeFailed": "Failed to remove override."
+      }
+    },
     "providers": {
       "title": "Providers",
       "desc": "System-scoped LLM providers, custom endpoints, and default models. Changes apply to every user.",

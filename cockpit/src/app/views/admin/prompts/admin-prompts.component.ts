@@ -6,6 +6,7 @@ import {
   OnInit,
   signal,
 } from '@angular/core';
+import {TranslocoService} from '@jsverse/transloco';
 import {SidebarToggleComponent} from '../../../shell/sidebar-toggle/sidebar-toggle.component';
 import {
   AdminPromptsService,
@@ -192,6 +193,7 @@ const FAMILIES = ['gemma', 'gpt_5', 'gpt_oss', 'minimax', 'codex', 'codex_spark'
 export class AdminPromptsComponent implements OnInit {
   readonly admin = inject(AdminPromptsService);
   private readonly toast = inject(AppToastService);
+  private readonly transloco = inject(TranslocoService);
 
   readonly families = FAMILIES;
 
@@ -242,7 +244,7 @@ export class AdminPromptsComponent implements OnInit {
   save(): void {
     const entry = this.selectedEntry();
     if (!entry || !this.overrideContent().trim()) {
-      this.toast.danger('Nothing to save — pick a prompt and enter content.');
+      this.toast.danger(this.transloco.translate('admin.prompts.messages.saveEmpty'));
       return;
     }
     this.saving.set(true);
@@ -256,11 +258,11 @@ export class AdminPromptsComponent implements OnInit {
       .subscribe({
         next: () => {
           this.saving.set(false);
-          this.toast.success('Override saved — applies to future jobs.');
+          this.toast.success(this.transloco.translate('admin.prompts.messages.saved'));
         },
         error: () => {
           this.saving.set(false);
-          this.toast.danger('Failed to save override.');
+          this.toast.danger(this.transloco.translate('admin.prompts.messages.saveFailed'));
         },
       });
   }
@@ -273,11 +275,11 @@ export class AdminPromptsComponent implements OnInit {
       next: () => {
         this.saving.set(false);
         this.overrideContent.set('');
-        this.toast.success('Override removed — back to the bundled default.');
+        this.toast.success(this.transloco.translate('admin.prompts.messages.removed'));
       },
       error: () => {
         this.saving.set(false);
-        this.toast.danger('Failed to remove override.');
+        this.toast.danger(this.transloco.translate('admin.prompts.messages.removeFailed'));
       },
     });
   }

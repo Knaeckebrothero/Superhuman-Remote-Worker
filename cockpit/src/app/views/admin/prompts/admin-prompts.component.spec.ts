@@ -4,6 +4,7 @@ import {of} from 'rxjs';
 import {AdminPromptsComponent} from './admin-prompts.component';
 import {AdminPromptsService} from '../../../core/services/admin-prompts.service';
 import {AppToastService} from '../../../ui/toast/toast.service';
+import {TranslocoService} from '@jsverse/transloco';
 
 const PERSONA_OVERRIDE = {
   id: 'o1', family: null, kind: 'prompts', name: 'persona', content: 'EXISTING',
@@ -32,6 +33,7 @@ function make(opts?: {overrides?: any[]; catalog?: any[]}) {
     providers: [
       {provide: AdminPromptsService, useValue: admin},
       {provide: AppToastService, useValue: toast},
+      {provide: TranslocoService, useValue: {translate: (k: string) => k}},
     ],
   });
   const component = runInInjectionContext(injector, () => new AdminPromptsComponent());
