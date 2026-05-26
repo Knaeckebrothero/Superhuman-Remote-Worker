@@ -66,6 +66,9 @@ COPY --chown=srw:srw src/ ./src/
 # Copy agent config directory (expert definitions, defaults, prompts, templates)
 COPY --chown=srw:srw config/ ./config/
 
+# Marker so get_project_root() finds /app (no .git in container)
+RUN touch /app/pyproject.toml && chown srw:srw /app/pyproject.toml
+
 USER srw
 
 EXPOSE 8085
