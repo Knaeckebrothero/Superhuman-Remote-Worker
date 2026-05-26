@@ -1071,7 +1071,9 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                         f"Loaded {len(_rows)} prompt override(s) for family {_family}"
                     )
                 except Exception as e:
-                    logger.warning(f"Failed to load prompt overrides (using bundled): {e}")
+                    logger.warning(
+                        f"Failed to load prompt overrides (using bundled): {e}"
+                    )
 
             try:
                 import uuid as _uuid
