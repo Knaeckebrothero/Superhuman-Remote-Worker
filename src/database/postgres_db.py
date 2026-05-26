@@ -106,6 +106,7 @@ class PostgresDB:
         # Initialize namespaces
         self.jobs = JobsNamespace(self)
         self.citations = CitationsNamespace(self)
+        self.prompts = PromptsNamespace(self)
 
         logger.info("PostgresDB initialized (not connected yet)")
 
@@ -730,6 +731,29 @@ class JobsNamespace:
     ) -> List[Dict[str, Any]]:
         """Synchronous wrapper for list()."""
         return PostgresDB._run_async(self.list(status, limit, offset))
+
+
+class PromptsNamespace:
+    """Prompt-override reads for the agent's resolution path."""
+
+    def __init__(self, db: PostgresDB):
+        self.db = db
+
+    async def list_overrides_for_family(self, family: str) -> List[Dict[str, Any]]:
+        """Return override rows for <family> plus global (NULL-family) rows.
+
+        Read once per job at first run; the result is loaded into the loader's
+        process map and frozen into resolved_config.
+        """
+        rows = await self.db.fetch(
+            """
+            SELECT family, kind, name, content, content_format
+            FROM prompt_overrides
+            WHERE family = $1 OR family IS NULL
+            """,
+            family,
+        )
+        return [self.db._row_to_dict(row) for row in rows]
 
 
 class CitationsNamespace:
