@@ -36,7 +36,11 @@ _PROMPT_OVERRIDES: Dict[str, Dict[tuple, str]] = {}
 
 def _is_prompt_db_overrides_enabled() -> bool:
     """True when DB-backed prompt overrides are turned on via env."""
-    return os.getenv("PROMPT_DB_OVERRIDES_ENABLED", "").lower().strip() in ("true", "1", "yes")
+    return os.getenv("PROMPT_DB_OVERRIDES_ENABLED", "").lower().strip() in (
+        "true",
+        "1",
+        "yes",
+    )
 
 
 def set_prompt_overrides(rows: List[Dict[str, Any]]) -> None:

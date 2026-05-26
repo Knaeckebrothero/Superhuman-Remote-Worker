@@ -19,14 +19,24 @@ async def test_upsert_prompt_override_uses_on_conflict():
     from orchestrator.database.postgres import PostgresDB
 
     db = PostgresDB.__new__(PostgresDB)  # bypass real pool init
-    db.fetchrow = AsyncMock(return_value={
-        "id": "abc", "family": "gemma", "kind": "prompts",
-        "name": "persona", "content": "C",
-    })
+    db.fetchrow = AsyncMock(
+        return_value={
+            "id": "abc",
+            "family": "gemma",
+            "kind": "prompts",
+            "name": "persona",
+            "content": "C",
+        }
+    )
 
     row = await db.upsert_prompt_override(
-        family="gemma", kind="prompts", name="persona",
-        content="C", content_format="text", notes=None, user_id=None,
+        family="gemma",
+        kind="prompts",
+        name="persona",
+        content="C",
+        content_format="text",
+        notes=None,
+        user_id=None,
     )
 
     sql = db.fetchrow.call_args.args[0]
@@ -40,6 +50,7 @@ async def test_upsert_prompt_override_uses_on_conflict():
 # main is imported inside the test bodies so this file still collects locally
 # where main's heavy deps (aiosmtplib, ...) are absent.
 # ---------------------------------------------------------------------------
+
 
 def _import_main():
     import sys
@@ -56,7 +67,7 @@ def _import_main():
 def _registered_routes(app) -> set:
     out = set()
     for route in app.routes:
-        for m in (getattr(route, "methods", None) or set()):
+        for m in getattr(route, "methods", None) or set():
             out.add((m, getattr(route, "path", "")))
     return out
 
@@ -79,7 +90,9 @@ def test_prompt_override_routes_registered():
 def test_prompt_override_create_model_validates():
     PromptOverrideCreate = _import_main().PromptOverrideCreate
 
-    ok = PromptOverrideCreate(family="gemma", kind="prompts", name="persona", content="x")
+    ok = PromptOverrideCreate(
+        family="gemma", kind="prompts", name="persona", content="x"
+    )
     assert ok.content_format == "text"  # default
     with pytest.raises(Exception):
         PromptOverrideCreate(family=None, kind="bogus", name="persona", content="x")
