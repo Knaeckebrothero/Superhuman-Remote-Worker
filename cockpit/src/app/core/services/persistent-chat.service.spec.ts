@@ -907,6 +907,34 @@ describe('PersistentChatService — REST sends', () => {
         expect(ctx.service.error()).toBeNull();
     });
 
+    it('rolls back the optimistic bubble and resolves false on a hard POST failure', async () => {
+        const ctx = await readySession();
+        ctx.mockHttp.post.mockReturnValue(
+            throwError(() => ({status: 500, error: {detail: 'boom'}})),
+        );
+        const ok = await ctx.service.sendMessage('will fail');
+        expect(ok).toBe(false);
+        // The optimistic UserTurn is removed so the composer can restore the
+        // draft for retry; the error banner explains why.
+        const stillThere = ctx.service
+            .turns()
+            .some((t) => isUserTurn(t) && t.content === 'will fail');
+        expect(stillThere).toBe(false);
+        expect(ctx.service.error()).not.toBeNull();
+    });
+
+    it('keeps the bubble and resolves true on a 409 dup', async () => {
+        const ctx = await readySession();
+        ctx.mockHttp.post.mockReturnValue(throwError(() => ({status: 409})));
+        const ok = await ctx.service.sendMessage('dup');
+        expect(ok).toBe(true);
+        const present = ctx.service
+            .turns()
+            .some((t) => isUserTurn(t) && t.content === 'dup');
+        expect(present).toBe(true);
+        expect(ctx.service.error()).toBeNull();
+    });
+
     it('interrupt POSTs to /interrupt', async () => {
         const ctx = await readySession();
         await ctx.service.interrupt();
@@ -916,6 +944,87 @@ describe('PersistentChatService — REST sends', () => {
         );
         expect(intCall).toBeDefined();
         expect(ctx.service.isInterrupting()).toBe(true);
+    });
+});
+
+describe('PersistentChatService — resume re-validation (visibility/online)', () => {
+    let originalEs: any;
+    let originalWs: any;
+
+    beforeEach(() => {
+        originalEs = (globalThis as any).EventSource;
+        originalWs = (globalThis as any).WebSocket;
+    });
+
+    afterEach(() => {
+        (globalThis as any).EventSource = originalEs;
+        (globalThis as any).WebSocket = originalWs;
+        vi.clearAllMocks();
+    });
+
+    async function connectOpen(threadId: string) {
+        const ctx = createService();
+        ctx.mockHttp.get.mockImplementation(() =>
+            of({status: 'active', total_turns: 0, messages: [], total: 0}),
+        );
+        await ctx.service.connect(threadId);
+        await new Promise((r) => setTimeout(r, 0));
+        fireSseOpen(ctx.sseInstances[0]);
+        return ctx;
+    }
+
+    it('force-reopens a stale SSE when the tab regains liveness (online event)', async () => {
+        const ctx = await connectOpen('thread-resume-stale');
+        const first = ctx.sseInstances[0];
+        // Simulate the watchdog having been frozen while the tab was
+        // backgrounded: the last SSE event is now past the 45s threshold.
+        (ctx.service as any).sseLastEventAt = Date.now() - 60_000;
+
+        window.dispatchEvent(new Event('online'));
+        await new Promise((r) => setTimeout(r, 0));
+
+        expect(first.close).toHaveBeenCalled();
+        expect(ctx.sseInstances.length).toBe(2);
+        expect(ctx.service.connectionState()).toBe('connecting');
+    });
+
+    it('does not tear down a healthy SSE on resume', async () => {
+        const ctx = await connectOpen('thread-resume-fresh');
+        const first = ctx.sseInstances[0];
+        // Fresh liveness — an event arrived just now.
+        (ctx.service as any).sseLastEventAt = Date.now();
+
+        window.dispatchEvent(new Event('online'));
+        await new Promise((r) => setTimeout(r, 0));
+
+        expect(first.close).not.toHaveBeenCalled();
+        expect(ctx.sseInstances.length).toBe(1);
+    });
+
+    it('is a no-op when there is no active thread', async () => {
+        const ctx = createService();
+        // No connect() — threadId is null.
+        window.dispatchEvent(new Event('online'));
+        await new Promise((r) => setTimeout(r, 0));
+        expect(ctx.sseInstances.length).toBe(0);
+    });
+
+    it('re-ensures the control WS when the SSE recovers (slaved liveness)', async () => {
+        const ctx = await connectOpen('thread-ws-slave');
+        expect(ctx.wsInstances.length).toBe(1);
+
+        // Simulate the control WS having silently died — on a real drop the
+        // readyState moves to CLOSED, but no onclose fires to reconnect it.
+        (ctx.service as any).controlWs.readyState = 3; // CLOSED
+
+        // Force an SSE reconnect; firing open on the new stream is the
+        // "wasReconnecting" path, which re-ensures the control WS.
+        ctx.service.reconnectNow();
+        await new Promise((r) => setTimeout(r, 0));
+        fireSseOpen(ctx.sseInstances[1]);
+        await new Promise((r) => setTimeout(r, 0));
+
+        expect(ctx.wsInstances.length).toBe(2);
     });
 });
 

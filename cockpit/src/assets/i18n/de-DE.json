@@ -854,6 +854,12 @@
       "temp": "Temp. {{value}}",
       "turn": "Zug {{count}}"
     },
+    "turn": {
+      "collapsedEmpty": "Nur Werkzeugaufrufe",
+      "thoughtCount": "{{count}} Gedanken",
+      "textCount": "{{count}} Textblöcke",
+      "toolCount": "{{count}} Werkzeugaufrufe"
+    },
     "settings": {
       "mode": "Modus",
       "narration": "Erzählung",
