@@ -1,5 +1,9 @@
 # FastAPI backend dependencies for Debug Cockpit
-fastapi>=0.115.0
+# Exclude fastapi 0.136.3 — OSV MAL-2026-4750 (undocumented `fastar` dep in the
+# `[standard]` extra). We use uvicorn[standard], not fastapi[standard], so `fastar`
+# is never installed; this pins out the flagged release so the orchestrator image
+# stays reproducible and off the advisory. See top-level requirements.txt for detail.
+fastapi>=0.115.0,!=0.136.3
 uvicorn[standard]>=0.34.0
 asyncpg>=0.30.0
 motor>=3.3.0
