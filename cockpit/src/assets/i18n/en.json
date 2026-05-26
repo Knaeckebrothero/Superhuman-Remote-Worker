@@ -854,6 +854,12 @@
       "temp": "temp {{value}}",
       "turn": "Turn {{count}}"
     },
+    "turn": {
+      "collapsedEmpty": "Tool calls only",
+      "thoughtCount": "{{count}} thoughts",
+      "textCount": "{{count}} text blocks",
+      "toolCount": "{{count}} tool calls"
+    },
     "settings": {
       "mode": "Mode",
       "narration": "Narration",

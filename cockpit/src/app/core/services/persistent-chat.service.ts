@@ -1,4 +1,4 @@
-import {computed, effect, inject, Injectable, NgZone, signal} from '@angular/core';
+import {computed, DestroyRef, effect, inject, Injectable, NgZone, signal} from '@angular/core';
 import {HttpClient} from '@angular/common/http';
 import {firstValueFrom} from 'rxjs';
 import {environment} from '../environment';
@@ -148,6 +148,7 @@ export class PersistentChatService {
     private readonly zone = inject(NgZone);
     private readonly toast = inject(AppToastService);
     private readonly notifications = inject(NotificationService);
+    private readonly destroyRef = inject(DestroyRef);
 
     constructor() {
         // Single source of truth for the "Starting session" card phase
@@ -182,6 +183,27 @@ export class PersistentChatService {
                     break;
             }
         });
+
+        // Re-validate the connection whenever the user returns to the tab.
+        // The SSE liveness watchdog is a setInterval, which browsers freeze on
+        // a backgrounded tab (~5 min) — so a silent drop goes unnoticed until
+        // the user comes back. These DOM listeners fire outside Angular's zone,
+        // hence zone.run. Registered once on this root singleton and torn down
+        // via DestroyRef (matters for test isolation, not prod lifetime).
+        if (typeof document !== 'undefined') {
+            const onWake = () => this.zone.run(() => this._revalidateConnection());
+            const onVisible = () => {
+                if (document.visibilityState === 'visible') onWake();
+            };
+            document.addEventListener('visibilitychange', onVisible);
+            window.addEventListener('online', onWake);
+            window.addEventListener('focus', onWake);
+            this.destroyRef.onDestroy(() => {
+                document.removeEventListener('visibilitychange', onVisible);
+                window.removeEventListener('online', onWake);
+                window.removeEventListener('focus', onWake);
+            });
+        }
     }
 
     // --- Connection state ---
@@ -508,6 +530,11 @@ export class PersistentChatService {
                 // loop_crash even though the title was generated and persisted.
                 if (wasReconnecting && this.threadId() === threadId) {
                     void this.loadThreadMeta(threadId);
+                    // Slave the control WS to SSE recovery: the WS has no
+                    // liveness probe of its own, so re-establish it whenever
+                    // the (monitored) SSE recovers. Idempotent — bails if the
+                    // WS is already open/connecting.
+                    this._ensureControlWs();
                 }
             });
         };
@@ -587,6 +614,32 @@ export class PersistentChatService {
         if (this.sseWatchdogTimer) {
             clearInterval(this.sseWatchdogTimer);
             this.sseWatchdogTimer = null;
+        }
+    }
+
+    /**
+     * Re-validate liveness on tab resume (visibilitychange / online / focus).
+     * The SSE is the single liveness authority: if it isn't OPEN or has gone
+     * silent past the watchdog timeout, force a reopen (replay-from-cursor);
+     * then ensure the control WS — which has no probe of its own — is back.
+     * No-op when there's no active, live session.
+     */
+    private _revalidateConnection(): void {
+        if (this.intentionalClose) return;
+        const tid = this.threadId();
+        if (!tid) return;
+        if (this.threadStatus() === 'ended') return;
+        const sseStale =
+            !this.sse ||
+            this.sse.readyState !== EventSource.OPEN ||
+            Date.now() - this.sseLastEventAt > SSE_WATCHDOG_TIMEOUT_MS;
+        if (sseStale) {
+            // Closes + reopens the SSE and sets connectionState='connecting';
+            // the reopen's onopen also re-ensures the control WS (Change 2).
+            this.reconnectNow();
+        } else {
+            // SSE healthy but the WS may have silently dropped — re-ensure it.
+            this._ensureControlWs();
         }
     }
 
@@ -1018,23 +1071,23 @@ export class PersistentChatService {
      *  receives. The displayed user message keeps the original text and
      *  shows uploaded files as separate attachment chips.
      */
-    async sendMessage(content: string): Promise<void> {
+    async sendMessage(content: string): Promise<boolean> {
         const trimmed = content.trim();
 
         // Slash commands bypass attachment logic.
         if (trimmed.startsWith('/')) {
-            if (this.handleSlashCommand(trimmed)) return;
+            if (this.handleSlashCommand(trimmed)) return true;
         }
 
         const queued = this.pendingAttachments();
-        if (!trimmed && queued.length === 0) return;
+        if (!trimmed && queued.length === 0) return true;
 
         let uploaded: ThreadUploadedFile[] = [];
         if (queued.length > 0) {
             const threadId = this.threadId();
             if (!threadId) {
                 this.attachmentError.set('Cannot upload: no active thread');
-                return;
+                return false;
             }
             const files = queued.filter((p) => p.file).map((p) => p.file);
             this.isUploadingAttachments.set(true);
@@ -1051,7 +1104,7 @@ export class PersistentChatService {
                     p.error = msg;
                 });
                 this.attachmentError.set(msg);
-                return;
+                return false;
             } finally {
                 this.isUploadingAttachments.set(false);
             }
@@ -1076,9 +1129,10 @@ export class PersistentChatService {
 
         // Add to local conversation — content is the user's typed text
         // only; uploaded files render as separate attachment chips.
+        const localId = makeLocalId('user');
         this.dispatch({
             type: 'user_message',
-            id: makeLocalId('user'),
+            id: localId,
             content: trimmed,
             attachments: attachments.length > 0 ? attachments : undefined,
             timestamp: Date.now(),
@@ -1087,17 +1141,27 @@ export class PersistentChatService {
         // If session isn't ready yet, queue and send when ready.
         if (!this.sessionReady()) {
             this.pendingMessage.set(sendContent);
-            return;
+            return true;
         }
 
         this.isWaitingForInput.set(false);
-        await this._postInput(sendContent);
+        const ok = await this._postInput(sendContent);
+        if (!ok) {
+            // Hard send failure — roll back the optimistic bubble so the
+            // composer can restore the draft for retry (the error banner set
+            // by _postInput explains why). A 409 dup is treated as success.
+            this.dispatch({type: 'remove_turn', id: localId});
+            return false;
+        }
+        return true;
     }
 
-    /** POST the input to the orchestrator's REST endpoint. */
-    private async _postInput(content: string): Promise<void> {
+    /** POST the input to the orchestrator's REST endpoint. Returns true when
+     *  the input was accepted (or a 409 dup — the reply still streams via
+     *  SSE), false on a hard failure so the caller can roll back. */
+    private async _postInput(content: string): Promise<boolean> {
         const tid = this.threadId();
-        if (!tid) return;
+        if (!tid) return false;
         try {
             await firstValueFrom(
                 this.http.post<{ accepted: boolean; turn_id: number }>(
@@ -1105,12 +1169,14 @@ export class PersistentChatService {
                     {content}
                 )
             );
+            return true;
         } catch (err: any) {
-            // 409 means a duplicate POST landed for the same turn — surface
-            // the existing inflight turn_id and otherwise ignore; the user
-            // sees the response stream via SSE.
-            if (err?.status === 409) return;
+            // 409 means a duplicate POST landed for the same turn — the user
+            // still sees the response stream via SSE, so treat it as success
+            // and keep the optimistic bubble.
+            if (err?.status === 409) return true;
             this.error.set(this.sanitizeError(err?.error?.detail || err?.message));
+            return false;
         }
     }
 

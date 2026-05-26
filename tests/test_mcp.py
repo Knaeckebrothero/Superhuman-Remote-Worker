@@ -292,6 +292,17 @@ class TestFormatPersistentThreadMessages:
         result = self.fmt(data)
         assert "..." in result
 
+    def test_full_content_not_truncated(self):
+        long_content = "x" * 600
+        data = {
+            "thread_id": "tid-1",
+            "messages": [_make_message(content=long_content)],
+            "total": 1,
+        }
+        result = self.fmt(data, full_content=True)
+        assert long_content in result
+        assert "..." not in result
+
     def test_shows_tool_calls(self):
         msg = _make_message()
         msg["tool_calls"] = [
