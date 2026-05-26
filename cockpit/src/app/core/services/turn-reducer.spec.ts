@@ -69,6 +69,37 @@ describe('turn-reducer — user_message / system_message', () => {
     });
 });
 
+describe('turn-reducer — remove_turn', () => {
+    it('removes the turn with the matching id and leaves the others', () => {
+        const state = play([
+            {type: 'user_message', id: 'u1', content: 'first', timestamp: 100},
+            {type: 'user_message', id: 'u2', content: 'second', timestamp: 200},
+            {type: 'remove_turn', id: 'u1'},
+        ]);
+        expect(state.turns).toHaveLength(1);
+        expect(state.turns[0].id).toBe('u2');
+    });
+
+    it('is a no-op when no turn matches the id', () => {
+        const state = play([
+            {type: 'user_message', id: 'u1', content: 'hi', timestamp: 100},
+            {type: 'remove_turn', id: 'nope'},
+        ]);
+        expect(state.turns).toHaveLength(1);
+        expect(state.turns[0].id).toBe('u1');
+    });
+
+    it('does not disturb the active assistant turn', () => {
+        const state = play([
+            {type: 'user_message', id: 'u1', content: 'hi', timestamp: 100},
+            {type: 'turn_started', turnId: 't1', startedAt: 200},
+            {type: 'remove_turn', id: 'u1'},
+        ]);
+        expect(state.turns.find((t) => t.id === 'u1')).toBeUndefined();
+        expect(state.activeAssistantTurnId).toBe('t1');
+    });
+});
+
 describe('turn-reducer — turn lifecycle', () => {
     it('turn_started opens an empty assistant turn and marks it active', () => {
         const state = play([{type: 'turn_started', turnId: 't1', startedAt: 1000, model: 'opus'}]);

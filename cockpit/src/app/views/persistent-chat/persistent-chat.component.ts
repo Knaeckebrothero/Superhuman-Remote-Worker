@@ -1508,8 +1508,15 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         // Clear textarea immediately — sendMessage is async because of uploads.
         this.inputText = '';
         this.autoScroll = true;
-        // Fire-and-forget. Errors are surfaced via chat.attachmentError().
-        void this.chat.sendMessage(text);
+        // Fire-and-forget. On a hard send failure the service rolls back the
+        // optimistic bubble; restore the draft so the user can retry (unless
+        // they've already started typing a new one). The error banner set by
+        // the service explains why.
+        void this.chat.sendMessage(text).then((ok) => {
+            if (ok === false && !this.inputText.trim()) {
+                this.inputText = text;
+            }
+        });
 
         // Resize textarea back
         setTimeout(() => {

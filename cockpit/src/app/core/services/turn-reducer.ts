@@ -79,7 +79,8 @@ export type ReducerAction =
         toolUseId: string;
         decision: 'approved' | 'denied';
         timestamp: number;
-    };
+    }
+    | { type: 'remove_turn'; id: string };
 
 export function reduce(state: ConversationState, action: ReducerAction): ConversationState {
     switch (action.type) {
@@ -106,6 +107,16 @@ export function reduce(state: ConversationState, action: ReducerAction): Convers
                         timestamp: action.timestamp,
                     },
                 ],
+            };
+
+        case 'remove_turn':
+            // Roll back an optimistic turn (e.g. a user message whose POST
+            // hard-failed) by id. Safe: every Turn carries a unique id and
+            // activeAssistantTurnId is untouched (the removed turn is a user
+            // turn, never the streaming assistant turn).
+            return {
+                ...state,
+                turns: state.turns.filter((t) => t.id !== action.id),
             };
 
         case 'system_message':

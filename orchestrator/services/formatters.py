@@ -2458,8 +2458,14 @@ def format_created_thread(result: dict[str, Any], config_name: str, title: str) 
     )
 
 
-def format_persistent_thread_messages(data: dict[str, Any]) -> str:
-    """Format persistent thread message history."""
+def format_persistent_thread_messages(
+    data: dict[str, Any], full_content: bool = False
+) -> str:
+    """Format persistent thread message history.
+
+    Content is truncated to a 500-char preview per message by default; pass
+    ``full_content=True`` to emit the complete body of each message.
+    """
     thread_id = data.get("thread_id", "?")
     messages = data.get("messages", [])
     total = data.get("total", len(messages))
@@ -2476,7 +2482,10 @@ def format_persistent_thread_messages(data: dict[str, Any]) -> str:
 
         lines.append(f"  [{turn}] {role} ({created}):")
         if content:
-            preview = content[:500] + "..." if len(content) > 500 else content
+            if full_content:
+                preview = content
+            else:
+                preview = content[:500] + "..." if len(content) > 500 else content
             for line in preview.split("\n"):
                 lines.append(f"    {line}")
 
