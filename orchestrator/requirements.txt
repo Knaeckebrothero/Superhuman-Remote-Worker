@@ -20,7 +20,12 @@ tenacity>=8.0.0
 python-multipart>=0.0.18
 pyyaml>=6.0
 nats-py>=2.9.0
-kubernetes>=28.0.0
+# 36.0.0 shipped a broken in-cluster auth: load_incluster_config() stores the SA
+# token under api_key['authorization'] but the generated client reads 'BearerToken',
+# so the Authorization header is empty -> 401 on every K8s API call (broke agent
+# provisioning). Fixed in 36.0.1. The <37 cap stops the previously-unbounded
+# requirement from floating into a future untested major and reintroducing this.
+kubernetes>=28.0.0,!=36.0.0,<37.0.0
 python-keycloak>=4.0.0
 PyJWT[crypto]>=2.8.0
 argon2-cffi>=23.1.0
