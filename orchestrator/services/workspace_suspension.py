@@ -483,7 +483,7 @@ class WorkspaceSuspensionService:
                 await self._vm_provisioner.delete_thread_vm(thread_id)
                 await self._db.merge_thread_vm_context(thread_id, suspended_ctx)
             else:
-                await self._container_provisioner.delete_thread_workspace(thread_id)
+                await self._container_provisioner.delete_workspace(WorkspaceOwner.session(thread_id))
                 suspended_ctx.update({"pod_ip": None, "pod_name": None})
                 await self._db.merge_thread_workspace_context(thread_id, suspended_ctx)
 
@@ -589,8 +589,8 @@ class WorkspaceSuspensionService:
 
             else:
                 # K8s container (default)
-                ok = await self._container_provisioner.create_thread_workspace(
-                    thread_id
+                ok = await self._container_provisioner.create_workspace(
+                    WorkspaceOwner.session(thread_id)
                 )
                 if not ok:
                     logger.error(
