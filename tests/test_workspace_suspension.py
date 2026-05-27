@@ -828,6 +828,52 @@ class TestDispatchStatusHandling:
 
 
 # =============================================================================
+# Test: restore(owner) — owner-keyed dispatch
+# =============================================================================
+
+
+class TestRestoreOwnerDispatch:
+    """Tests for WorkspaceSuspensionService.restore(owner).
+
+    Verifies that the owner-keyed router dispatches to the correct underlying
+    method.  Uses direct AsyncMock patching rather than a fully wired service
+    to keep these tests fast and isolated from the heavy restore logic.
+    """
+
+    @pytest.mark.asyncio
+    async def test_restore_job_calls_restore_workspace(self):
+        """restore(job owner) must delegate to restore_workspace(job_id)."""
+        from services.workspace_lifecycle import WorkspaceOwner as WO
+
+        svc = make_service()
+        svc.restore_workspace = AsyncMock(return_value=True)
+        svc.restore_thread_workspace = AsyncMock(return_value=True)
+
+        owner = WO.job("j1")
+        result = await svc.restore(owner)
+
+        assert result is True
+        svc.restore_workspace.assert_awaited_once_with("j1")
+        svc.restore_thread_workspace.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_restore_session_calls_restore_thread_workspace(self):
+        """restore(session owner) must delegate to restore_thread_workspace(thread_id)."""
+        from services.workspace_lifecycle import WorkspaceOwner as WO
+
+        svc = make_service()
+        svc.restore_workspace = AsyncMock(return_value=True)
+        svc.restore_thread_workspace = AsyncMock(return_value=True)
+
+        owner = WO.session("t1")
+        result = await svc.restore(owner)
+
+        assert result is True
+        svc.restore_thread_workspace.assert_awaited_once_with("t1")
+        svc.restore_workspace.assert_not_awaited()
+
+
+# =============================================================================
 # Test: heartbeat activity tracking (replicated logic)
 # =============================================================================
 

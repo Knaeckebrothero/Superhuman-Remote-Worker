@@ -4,8 +4,10 @@ See docs/features/unified_workspace_provisioning.md.
 """
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
-from typing import Literal
+from enum import Enum
+from typing import Literal, Optional
 
 OwnerKind = Literal["job", "session"]
 
@@ -42,3 +44,65 @@ class WorkspaceOwner:
     def network_tier_kind(self) -> str:
         # Arg expected by ContainerProvisioner._resolve_network_tier / DB.
         return "job" if self.kind == "job" else "thread"
+
+
+class EnsureOutcome(Enum):
+    READY = "ready"      # workspace usable now → caller may dispatch
+    PENDING = "pending"  # in progress (creating/restoring/created) → caller retries next cycle
+    FAILED = "failed"    # creation failed / terminal → caller decides policy
+
+
+@dataclass
+class EnsureResult:
+    outcome: EnsureOutcome
+    status: Optional[str] = None
+
+
+async def _create(owner: "WorkspaceOwner", provisioner, ws_config) -> "EnsureResult":
+    ok = await provisioner.create_workspace(owner, **(ws_config or {}))
+    return EnsureResult(
+        EnsureOutcome.PENDING if ok else EnsureOutcome.FAILED,
+        status="creating" if ok else "failed",
+    )
+
+
+async def ensure_workspace(
+    owner: "WorkspaceOwner",
+    *,
+    provisioner,
+    suspension,
+    current_status: Optional[str],
+    ws_config: Optional[dict] = None,
+) -> "EnsureResult":
+    """Idempotently drive owner's workspace toward 'ready'. Owner-agnostic
+    extraction of the job dispatcher's container branch (main.py).
+
+    Behavior notes (intentional):
+    * 'failed' is owner-aware: SESSIONS self-heal (recreate); JOBS surface FAILED
+      so the dispatcher fails the job — preserving the original dispatcher behavior
+      (a job with a failed workspace fails; it does not silently retry forever).
+    * 'suspended' kicks off restore as a FIRE-AND-FORGET task (restore is slow:
+      pod create + SSH snapshot extract) and returns PENDING — matching the
+      original `asyncio.create_task(restore_workspace(...))`; awaiting would block
+      the dispatcher loop.
+    * No drift check (status 'ready' → READY unconditionally) — matches the original
+      dispatcher, which did no live-pod probe on 'ready'. (Drift recovery is a
+      deferred enhancement.)
+    """
+    s = current_status
+    if s in (None, "", "deleted", "none"):
+        # No live workspace → (re)create one (both kinds).
+        return await _create(owner, provisioner, ws_config)
+    if s == "failed":
+        if owner.kind == "session":
+            return await _create(owner, provisioner, ws_config)
+        return EnsureResult(EnsureOutcome.FAILED, status="failed")
+    if s == "suspended":
+        asyncio.create_task(suspension.restore(owner))
+        return EnsureResult(EnsureOutcome.PENDING, status="restoring")
+    if s in ("created", "creating", "restoring", "suspending", "pending"):
+        return EnsureResult(EnsureOutcome.PENDING, status=s)
+    if s == "ready":
+        return EnsureResult(EnsureOutcome.READY, status="ready")
+    # Unknown / unexpected status — wait (the dispatcher skips and retries).
+    return EnsureResult(EnsureOutcome.PENDING, status=s)

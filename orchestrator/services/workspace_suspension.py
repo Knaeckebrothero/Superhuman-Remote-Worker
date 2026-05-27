@@ -391,6 +391,12 @@ class WorkspaceSuspensionService:
                     stderr.decode(errors="replace")[:500],
                 )
 
+    async def restore(self, owner: WorkspaceOwner) -> bool:
+        """Owner-keyed restore: job -> restore_workspace, session -> restore_thread_workspace."""
+        if owner.kind == "job":
+            return await self.restore_workspace(owner.id)
+        return await self.restore_thread_workspace(owner.id)
+
     # =========================================================================
     # Thread suspension (mirrors job suspension for persistent agent threads)
     # =========================================================================
