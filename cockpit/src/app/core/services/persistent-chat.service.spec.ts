@@ -125,6 +125,10 @@ function createService(opts: {
         ),
         setThreadCursor: vi.fn().mockResolvedValue(undefined),
         deleteThreadCursor: vi.fn().mockResolvedValue(undefined),
+        getThreadMessages: vi.fn().mockResolvedValue([]),
+        getNewestCachedCreatedAt: vi.fn().mockResolvedValue(null),
+        upsertThreadMessages: vi.fn().mockResolvedValue(undefined),
+        clearThreadMessages: vi.fn().mockResolvedValue(undefined),
     };
 
     // NgZone stub: just run callbacks synchronously. Tests don't depend on
@@ -296,6 +300,101 @@ describe('PersistentChatService — render windowing', () => {
         expect(service.visibleTurns().length).toBe(100);
         service.resetWindow();
         expect(service.visibleTurns().length).toBe(50);
+    });
+});
+
+describe('PersistentChatService — message cache (loadHistory)', () => {
+    let originalEs: any;
+    let originalWs: any;
+
+    beforeEach(() => {
+        originalEs = (globalThis as any).EventSource;
+        originalWs = (globalThis as any).WebSocket;
+    });
+
+    afterEach(() => {
+        (globalThis as any).EventSource = originalEs;
+        (globalThis as any).WebSocket = originalWs;
+        vi.clearAllMocks();
+    });
+
+    it('full-loads when nothing is cached (no ?after=) and caches the result', async () => {
+        const {service, mockHttp, mockCache} = createService();
+        mockHttp.get.mockImplementation((url: string) => {
+            if (url.includes('/messages')) {
+                return of({
+                    messages: [
+                        {id: 'm1', role: 'human', content: 'hi', tool_calls: null, turn_number: 1, created_at: '2026-05-15T08:00:00Z'},
+                    ],
+                    total: 1,
+                });
+            }
+            return of({status: 'active', total_turns: 1});
+        });
+
+        await service.connect('thread-nocache');
+
+        const msgUrls = mockHttp.get.mock.calls
+            .map((c: any) => c[0] as string)
+            .filter((u: string) => u.includes('/messages'));
+        expect(msgUrls.length).toBeGreaterThan(0);
+        expect(msgUrls.every((u: string) => !u.includes('after='))).toBe(true);
+        expect(mockCache.upsertThreadMessages).toHaveBeenCalled(); // cached for next time
+        expect(service.turns().length).toBe(1);
+    });
+
+    it('paints cached history first, then refreshes incrementally via ?after=', async () => {
+        const {service, mockHttp, mockCache} = createService();
+        mockCache.getThreadMessages.mockResolvedValue([
+            {id: 'm1', threadId: 'thread-cache', role: 'human', content: 'old', tool_calls: null, turn_number: 1, created_at: '2026-05-15T08:00:00Z'},
+        ]);
+        mockHttp.get.mockImplementation((url: string) => {
+            if (url.includes('/messages')) {
+                // Server returns one NEW message after the cached cursor.
+                return of({
+                    messages: [
+                        {id: 'm2', role: 'ai', content: 'new reply', tool_calls: null, turn_number: 2, created_at: '2026-05-15T08:01:00Z'},
+                    ],
+                    total: 2,
+                });
+            }
+            return of({status: 'active', total_turns: 2});
+        });
+
+        await service.connect('thread-cache');
+
+        const msgUrls = mockHttp.get.mock.calls
+            .map((c: any) => c[0] as string)
+            .filter((u: string) => u.includes('/messages'));
+        expect(msgUrls.some((u: string) => u.includes('after='))).toBe(true);
+        expect(mockCache.upsertThreadMessages).toHaveBeenCalled();
+        // Merged cached + fetched: user (m1) then assistant (m2).
+        const turns = service.turns();
+        expect(turns.length).toBe(2);
+        expect(turns[0].kind).toBe('user');
+        expect(turns[1].kind).toBe('assistant');
+    });
+
+    it('renders a role="summary" history row as a compaction banner', async () => {
+        const {service, mockHttp} = createService();
+        mockHttp.get.mockImplementation((url: string) => {
+            if (url.includes('/messages')) {
+                return of({
+                    messages: [
+                        {id: 'u1', role: 'human', content: 'hi', tool_calls: null, turn_number: 1, created_at: '2026-05-15T08:00:00Z'},
+                        {id: 's1', role: 'summary', content: 'We discussed X and Y.', tool_calls: null, turn_number: 2, created_at: '2026-05-15T08:01:00Z'},
+                    ],
+                    total: 2,
+                });
+            }
+            return of({status: 'active', total_turns: 2});
+        });
+
+        await service.connect('thread-summary');
+
+        const banner = service.turns().find((t: {kind: string}) => t.kind === 'compaction');
+        expect(banner).toBeTruthy();
+        expect((banner as {summary: string}).summary).toBe('We discussed X and Y.');
     });
 });
 

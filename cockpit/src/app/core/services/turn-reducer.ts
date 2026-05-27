@@ -80,7 +80,8 @@ export type ReducerAction =
         decision: 'approved' | 'denied';
         timestamp: number;
     }
-    | { type: 'remove_turn'; id: string };
+    | { type: 'remove_turn'; id: string }
+    | { type: 'add_compaction'; id: string; summary: string; timestamp: number };
 
 export function reduce(state: ConversationState, action: ReducerAction): ConversationState {
     switch (action.type) {
@@ -118,6 +119,25 @@ export function reduce(state: ConversationState, action: ReducerAction): Convers
                 ...state,
                 turns: state.turns.filter((t) => t.id !== action.id),
             };
+
+        case 'add_compaction': {
+            // A compaction boundary banner. Idempotent by id (stable
+            // `compaction-<turn>`), so SSE replay replaces rather than
+            // duplicates. activeAssistantTurnId is untouched.
+            const turn: Turn = {
+                kind: 'compaction',
+                id: action.id,
+                summary: action.summary,
+                timestamp: action.timestamp,
+            };
+            const idx = state.turns.findIndex((t) => t.id === action.id);
+            if (idx >= 0) {
+                const turns = [...state.turns];
+                turns[idx] = turn;
+                return {...state, turns};
+            }
+            return {...state, turns: [...state.turns, turn]};
+        }
 
         case 'system_message':
             return {

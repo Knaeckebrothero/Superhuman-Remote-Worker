@@ -483,20 +483,48 @@ export class PersistentChatService {
      */
     private async loadHistory(threadId: string): Promise<void> {
         try {
-            const resp = await firstValueFrom(
-                this.http.get<{ messages: HistoryMessage[]; total: number }>(
-                    `${environment.apiUrl}/persistent/threads/${threadId}/messages`
-                )
-            );
+            // 1. Cache-first: paint the cached conversation immediately (zero
+            //    latency on reopen). Empty when this thread isn't cached yet.
+            const cached = await this.cache.getThreadMessages(threadId);
+            if (cached.length) {
+                this.dispatch({type: 'load_history', threadId, turns: historyToTurns(cached)});
+                this.resetWindow();
+                this.historyLoaded.set(true);
+            }
 
-            if (resp.messages?.length) {
-                const turns = historyToTurns(resp.messages);
-                this.dispatch({type: 'load_history', threadId, turns});
-                this.resetWindow(); // render the tail after a (re)load
+            // 2. Refresh from the server. With a cache, fetch only what's newer
+            //    (?after=<newest cached>, inclusive); otherwise the full thread.
+            const newest = cached.length ? cached[cached.length - 1].created_at : null;
+            const url = newest
+                ? `${environment.apiUrl}/persistent/threads/${threadId}/messages` +
+                  `?after=${encodeURIComponent(newest)}`
+                : `${environment.apiUrl}/persistent/threads/${threadId}/messages`;
+            const resp = await firstValueFrom(
+                this.http.get<{messages: HistoryMessage[]; total: number}>(url),
+            );
+            const fetched = resp.messages ?? [];
+
+            // 3. Append to the cache by id (never full-replace — that loses
+            //    history). Best-effort: a no-op when IndexedDB is unavailable.
+            if (fetched.length) {
+                void this.cache.upsertThreadMessages(
+                    fetched.map((m) => ({...m, threadId})),
+                );
+            }
+
+            // 4. Render the merged set. Merge in memory (dedup by id) rather than
+            //    reading the cache back, so the render is correct even when
+            //    IndexedDB is unavailable. Skip the re-render when the cache was
+            //    already current (nothing new fetched).
+            if (fetched.length || !cached.length) {
+                const merged = mergeMessagesById(cached, fetched);
+                this.dispatch({type: 'load_history', threadId, turns: historyToTurns(merged)});
+                this.resetWindow();
             }
             this.historyLoaded.set(true);
         } catch {
-            // History load failure is non-fatal — proceed with empty history
+            // Network failure is non-fatal — any cached transcript was already
+            // painted above; just mark history loaded.
             this.historyLoaded.set(true);
         }
     }
@@ -1511,11 +1539,20 @@ export class PersistentChatService {
                 }
                 break;
 
-            case 'context.compacted':
-                this._systemMessage(
-                    `Context compacted: ${params['before']} → ${params['after']} messages`,
-                );
+            case 'context.compacted': {
+                // Show a compaction banner. Stable id (compaction-<turn>) keeps
+                // SSE replay idempotent; the reducer replaces rather than dupes.
+                const turn = params['turn'];
+                const compactionId =
+                    turn != null ? `compaction-${turn}` : makeLocalId('compaction');
+                this.dispatch({
+                    type: 'add_compaction',
+                    id: compactionId,
+                    summary: (params['summary'] as string) ?? '',
+                    timestamp: Date.now(),
+                });
                 break;
+            }
 
             case 'session.ended':
                 this._systemMessage('Session ended.');
@@ -1692,6 +1729,25 @@ function makeLocalId(prefix: string): string {
  *   without a matching call (pre-0011 historical data) are dropped — same
  *   user-visible behavior as before this migration.
  */
+/**
+ * Merge two message lists by `id` (server rows win on conflict), sorted in
+ * display order (created_at, then turn_number, then id). Combines the
+ * IndexedDB cache with an `?after=` incremental fetch without depending on a
+ * cache read-back, so it's correct even when IndexedDB is unavailable.
+ */
+function mergeMessagesById(a: HistoryMessage[], b: HistoryMessage[]): HistoryMessage[] {
+    const byId = new Map<string, HistoryMessage>();
+    for (const m of a) byId.set(m.id, m);
+    for (const m of b) byId.set(m.id, m);
+    return Array.from(byId.values()).sort((x, y) => {
+        const c = (x.created_at ?? '').localeCompare(y.created_at ?? '');
+        if (c !== 0) return c;
+        const t = (x.turn_number ?? 0) - (y.turn_number ?? 0);
+        if (t !== 0) return t;
+        return x.id.localeCompare(y.id);
+    });
+}
+
 function historyToTurns(messages: HistoryMessage[]): Turn[] {
     const turns: Turn[] = [];
     const turnByNumber = new Map<number, AssistantTurn>();
@@ -1701,9 +1757,21 @@ function historyToTurns(messages: HistoryMessage[]): Turn[] {
         const isUser = ['human', 'user', 'HumanMessageChunk'].includes(m.role);
         const isAssistant = ['ai', 'assistant', 'AIMessageChunk'].includes(m.role);
         const isTool = m.role === 'tool' || m.role === 'ToolMessageChunk';
-        if (!isUser && !isAssistant && !isTool) continue;
 
         const ts = m.created_at ? Date.parse(m.created_at) || Date.now() : Date.now();
+
+        // Compaction boundary marker (role='summary') → a divider banner.
+        if (m.role === 'summary') {
+            turns.push({
+                kind: 'compaction',
+                id: m.id,
+                summary: m.content ?? '',
+                timestamp: ts,
+            });
+            continue;
+        }
+
+        if (!isUser && !isAssistant && !isTool) continue;
 
         if (isUser) {
             const u: UserTurn = {

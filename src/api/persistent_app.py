@@ -23,6 +23,7 @@ from .orchestrator_client import OrchestratorClient, create_orchestrator_client_
 from .persistent_session import PersistentSession
 from ..tools.registry import TOOL_REGISTRY
 from ..core.archiver import inflight_tool_call
+from ..core.context import extract_summary_text
 from ..agent import UniversalAgent
 from ..llm.reasoning_chat import extract_reasoning_text_from_block
 from ..persistent_graph import (
@@ -1667,6 +1668,7 @@ async def handle_persistent_websocket(ws: WebSocket) -> None:
             on_error=_loop_on_error,
             check_interrupt=_loop_check_interrupt,
             on_vm_upgrade_needed=_loop_on_vm_upgrade_needed,
+            on_context_compacted=_loop_on_context_compacted,
         )
         _loop_task = asyncio.create_task(
             run_persistent_loop(
@@ -2612,6 +2614,58 @@ async def _loop_on_vm_upgrade_needed(freeze_data: Dict[str, Any]) -> None:
     )
 
 
+async def _record_compaction(
+    summary_text: Optional[str],
+    before: int,
+    after: int,
+    trigger: str,
+    ws: Optional[WebSocket] = None,
+) -> None:
+    """Notify the client of a context compaction and persist a display-only
+    marker row.
+
+    The ``role='summary'`` row makes the banner survive reload; the agent's own
+    resume path excludes it (``src/database/postgres_db.py``) so it never
+    re-enters the LLM context. A non-None ``ws`` sends the live event over the
+    control socket (manual ``/compact``); the auto path passes ``ws=None`` to
+    use the broadcast/SSE channel the loop already feeds.
+    """
+    turn = _session.turn_count if _session else None
+    params = {
+        "before": before,
+        "after": after,
+        "trigger": trigger,
+        "summary": summary_text,
+        "turn": turn,
+    }
+    try:
+        if ws is not None:
+            await _ws_send(ws, "context.compacted", params)
+        else:
+            _broadcast("context.compacted", params)
+    except Exception as e:
+        logger.debug(f"Failed to emit context.compacted (non-fatal): {e}")
+
+    if summary_text and _orchestrator_client and _thread_id:
+        try:
+            await _orchestrator_client.save_thread_message(
+                thread_id=_thread_id,
+                role="summary",
+                content=summary_text,
+                turn_number=turn,
+                metrics={"before": before, "after": after, "trigger": trigger},
+            )
+        except Exception as e:
+            logger.warning(f"Failed to persist compaction marker (non-fatal): {e}")
+
+
+async def _loop_on_context_compacted(
+    summary_text: str, before: int, after: int
+) -> None:
+    """Auto-summarization fired inside the loop — persist + broadcast a banner."""
+    await _record_compaction(summary_text, before, after, trigger="auto", ws=None)
+
+
 async def _loop_completion_handler(loop_task: asyncio.Task) -> None:
     """Wait for the persistent loop to finish, then run reason-appropriate cleanup.
 
@@ -2991,14 +3045,9 @@ async def _handle_compact(ws: WebSocket, focus: str = "") -> None:
         )
         after_count = len(_session.messages)
 
-        await _ws_send(
-            ws,
-            "context.compacted",
-            {
-                "before": before_count,
-                "after": after_count,
-                "focus": focus,
-            },
+        summary_text = extract_summary_text(_session.messages)
+        await _record_compaction(
+            summary_text, before_count, after_count, trigger="manual", ws=ws
         )
         logger.info(f"Manual compaction: {before_count} → {after_count} messages")
 
