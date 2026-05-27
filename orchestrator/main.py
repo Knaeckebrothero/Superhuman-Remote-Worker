@@ -197,6 +197,10 @@ from services.workspace_lifecycle import (  # noqa: E402
     WorkspaceOwner,
     ensure_workspace,
 )
+from services.session_provisioner import (  # noqa: E402
+    ensure_session_workspace,
+    reconcile_session_workspaces,
+)
 from services.docker_provisioner import docker_provisioner  # noqa: E402
 from services.persistent_provisioner import persistent_provisioner  # noqa: E402
 from services.agent_provisioner import agent_provisioner  # noqa: E402
@@ -668,11 +672,15 @@ async def ide_session_ttl_sweeper(shutdown_event: asyncio.Event) -> None:
 
 
 async def workspace_idle_sweeper(shutdown_event: asyncio.Event) -> None:
-    """Background task that suspends idle workspace containers to S3.
+    """Background loop: suspends idle workspace containers to S3 AND reconciles
+    failed session workspaces.
 
-    Runs every 60 seconds. Checks workspace containers for jobs in
-    paused/pending_review/waiting_for_reply statuses against the
-    configured idle timeout (WORKSPACE_IDLE_TIMEOUT, default 30 min).
+    Runs every 60 seconds. Suspends workspace containers for jobs in
+    paused/pending_review/waiting_for_reply statuses past the configured idle
+    timeout (WORKSPACE_IDLE_TIMEOUT, default 30 min). Then re-ensures workspaces
+    for active sessions whose workspace container is in a non-ready, non-in-progress
+    state (e.g. 'failed') — the session-side equivalent of the job dispatcher's
+    per-cycle workspace reconcile.
     """
     logger.info("Workspace idle sweeper started")
     while not shutdown_event.is_set():
@@ -689,6 +697,22 @@ async def workspace_idle_sweeper(shutdown_event: asyncio.Event) -> None:
                     )
         except Exception as e:
             logger.error("Error in workspace idle sweeper: %s", e)
+
+        # Session workspace reconcile (safety-net): recreate failed/missing
+        # workspaces for active sessions. Runs regardless of whether idle
+        # suspension is enabled — recovering a wedged workspace is independent
+        # of idle policy. This is the session-side equivalent of the job
+        # dispatcher's per-cycle workspace reconcile.
+        # (reconcile_session_workspaces never raises; the try/except is a
+        # belt-and-suspenders guard so a future change can't kill this loop.)
+        try:
+            await reconcile_session_workspaces(
+                db=postgres_db,
+                provisioner=container_provisioner,
+                suspension=workspace_suspension_service,
+            )
+        except Exception as e:
+            logger.error("Error in session workspace reconcile: %s", e)
 
         try:
             await asyncio.wait_for(shutdown_event.wait(), timeout=60.0)
@@ -12358,17 +12382,18 @@ async def resume_thread(
             persistent_provisioner.create_agent_pod(thread_id, config_name=config_name)
         )
 
-    metadata = thread.get("metadata") or {}
-    if isinstance(metadata, str):
-        try:
-            metadata = json.loads(metadata)
-        except (json.JSONDecodeError, TypeError):
-            metadata = {}
-    ws_ctx = metadata.get("workspace_container") or {}
-    if ws_ctx.get("status") == "suspended" and workspace_suspension_service.is_enabled:
-        asyncio.create_task(
-            workspace_suspension_service.restore_thread_workspace(thread_id)
+    # Ensure the session workspace is provisioned/restored (idempotent): restores
+    # a suspended workspace, recreates a failed/missing one. Fire-and-forget so
+    # resume stays fast — the agent tolerates a not-yet-ready workspace and the
+    # periodic reconcile retries on failure.
+    asyncio.create_task(
+        ensure_session_workspace(
+            thread_id,
+            db=postgres_db,
+            provisioner=container_provisioner,
+            suspension=workspace_suspension_service,
         )
+    )
 
     return {"status": "created", "thread_id": thread_id}
 
