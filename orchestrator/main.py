@@ -192,7 +192,11 @@ from services.builder_dispatch import execute_server_tool as _dispatch_server_to
 from services.nats_bridge import nats_bridge  # noqa: E402
 from services.vm_provisioner import vm_provisioner  # noqa: E402
 from services.container_provisioner import container_provisioner  # noqa: E402
-from services.workspace_lifecycle import WorkspaceOwner  # noqa: E402
+from services.workspace_lifecycle import (  # noqa: E402
+    EnsureOutcome,
+    WorkspaceOwner,
+    ensure_workspace,
+)
 from services.docker_provisioner import docker_provisioner  # noqa: E402
 from services.persistent_provisioner import persistent_provisioner  # noqa: E402
 from services.agent_provisioner import agent_provisioner  # noqa: E402
@@ -2120,58 +2124,17 @@ async def _try_dispatch_pending_jobs() -> None:
                 elif _job_needs_sandbox(job):
                     container_ctx = _get_container_context(job)
                     container_status = container_ctx.get("status")
-                    if not container_status:
-                        # Container needed but not provisioned — provision now.
-                        # Priority: K8s in-cluster → Docker Compose → K8s via kubeconfig.
-                        # This prevents a local kubeconfig from shadowing Docker Compose
-                        # when running the orchestrator outside the cluster.
-                        use_k8s = container_provisioner.is_available and (
-                            container_provisioner.in_cluster
-                            or not docker_provisioner.is_available
-                        )
-                        if use_k8s:
-                            # Kubernetes mode: create pod on demand
-                            logger.info(
-                                "Dispatcher: job %s provisioning workspace container "
-                                "(VM not available or not requested)",
-                                job_id,
-                            )
-                            config_override = job.get("config_override") or {}
-                            if isinstance(config_override, str):
-                                config_override = json.loads(config_override)
-                            ws_cfg = config_override.get("workspace", {}).get(
-                                "container", {}
-                            )
-                            ok = await container_provisioner.create_workspace(
-                                WorkspaceOwner.job(job_id),
-                                cpu=ws_cfg.get("cpu", "500m"),
-                                memory=ws_cfg.get("memory", "1Gi"),
-                                cpu_limit=ws_cfg.get("cpu_limit", "2000m"),
-                                memory_limit=ws_cfg.get("memory_limit", "4Gi"),
-                                image=ws_cfg.get("image"),
-                            )
-                            if ok:
-                                logger.info(
-                                    "Dispatcher: auto-provisioned workspace container for job %s",
-                                    job_id,
-                                )
-                            else:
-                                logger.error(
-                                    "Dispatcher: workspace container provisioning failed "
-                                    "for job %s. Failing job.",
-                                    job_id,
-                                )
-                                await postgres_db.update_job_status(
-                                    job_id,
-                                    status="failed",
-                                    error_message=(
-                                        "Workspace container could not be created. "
-                                        "Check orchestrator logs for details (image pull "
-                                        "failures, insufficient resources, RBAC issues)."
-                                    ),
-                                )
-                        elif docker_provisioner.is_available:
-                            # Docker Compose mode: assign from static pool
+                    # K8s in-cluster takes priority; a local kubeconfig must not
+                    # shadow Docker Compose when running outside the cluster.
+                    use_k8s = container_provisioner.is_available and (
+                        container_provisioner.in_cluster
+                        or not docker_provisioner.is_available
+                    )
+                    # States that mean "no live workspace yet" → (re)create.
+                    needs_create = container_status in (None, "", "deleted", "none")
+                    if needs_create and not use_k8s:
+                        # Docker Compose pool / no-provisioner CREATE path (unchanged).
+                        if docker_provisioner.is_available:
                             logger.info(
                                 "Dispatcher: job %s assigning workspace from "
                                 "Docker Compose pool",
@@ -2200,44 +2163,69 @@ async def _try_dispatch_pending_jobs() -> None:
                                 ),
                             )
                         continue  # Skip — wait for container to become ready
-                    elif container_status == "suspended":
-                        # Container was suspended to S3 — restore it
-                        asyncio.create_task(
-                            workspace_suspension_service.restore_workspace(job_id)
-                        )
-                        continue
-                    elif container_status in (
-                        "restoring",
-                        "suspending",
-                        "creating",
-                    ):
-                        # In-progress lifecycle operation — wait
-                        continue
-                    elif container_status == "failed":
-                        # Provisioning failed — fail the job with the error
-                        error = container_ctx.get("error", "unknown error")
+                    # K8s create (when status absent) + all lifecycle states route
+                    # through the shared, owner-agnostic state machine.
+                    config_override = job.get("config_override") or {}
+                    if isinstance(config_override, str):
+                        config_override = json.loads(config_override)
+                    ws_cfg = config_override.get("workspace", {}).get("container", {})
+                    res = await ensure_workspace(
+                        WorkspaceOwner.job(job_id),
+                        provisioner=container_provisioner,
+                        suspension=workspace_suspension_service,
+                        current_status=container_status,
+                        ws_config={
+                            k: ws_cfg[k]
+                            for k in (
+                                "cpu",
+                                "memory",
+                                "cpu_limit",
+                                "memory_limit",
+                                "image",
+                            )
+                            if k in ws_cfg
+                        },
+                    )
+                    if res.outcome is EnsureOutcome.FAILED:
+                        if container_status == "failed":
+                            error = container_ctx.get("error", "unknown error")
+                            msg = f"Workspace container failed: {error}"
+                        else:
+                            msg = (
+                                "Workspace container could not be created. Check "
+                                "orchestrator logs for details (image pull failures, "
+                                "insufficient resources, RBAC issues)."
+                            )
                         logger.error(
-                            "Dispatcher: workspace container failed for job %s: %s. "
+                            "Dispatcher: workspace ensure failed for job %s: %s. "
                             "Failing job.",
                             job_id,
-                            error,
+                            msg,
                         )
                         await postgres_db.update_job_status(
-                            job_id,
-                            status="failed",
-                            error_message=(f"Workspace container failed: {error}"),
+                            job_id, status="failed", error_message=msg
                         )
                         continue
-                    elif container_status != "ready":
-                        # Unknown status — log and skip
-                        logger.warning(
-                            "Dispatcher: job %s has unexpected workspace container "
-                            "status '%s' — skipping",
-                            job_id,
-                            container_status,
-                        )
-                        continue
-                    # else: container is ready, proceed with dispatch
+                    if res.outcome is EnsureOutcome.PENDING:
+                        if container_status not in (
+                            None,
+                            "",
+                            "deleted",
+                            "none",
+                            "created",
+                            "creating",
+                            "restoring",
+                            "suspending",
+                            "pending",
+                        ):
+                            logger.warning(
+                                "Dispatcher: job %s has unexpected workspace "
+                                "container status %r — waiting",
+                                job_id,
+                                container_status,
+                            )
+                        continue  # in progress — wait for next cycle
+                    # READY → proceed with dispatch
                     logger.info("Dispatcher: job %s using workspace container", job_id)
                 else:
                     # No VM or container provisioning needed — check if a workspace
