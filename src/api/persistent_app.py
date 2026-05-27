@@ -109,6 +109,13 @@ _loop_user_queue: Optional[asyncio.Queue] = None
 # sites (pre-LLM, mid-astream, between tool calls). Legacy WS interrupt
 # path uses the same flag — sets "hard" when no tool is inflight.
 _loop_interrupt_flag: Optional[str] = None
+# Hard-interrupt signal (phase 3). Set alongside _loop_interrupt_flag="hard"
+# so the loop can tear down a blocked LLM / auxiliary await (e.g. a hung
+# summarization read) immediately, instead of waiting for the cooperative
+# check_interrupt poll — which can't fire while the turn is parked in a
+# network read. Created in _attach_session, set in the interrupt handlers
+# when no tool is in flight, cleared whenever the flag is consumed.
+_hard_interrupt_event: Optional[asyncio.Event] = None
 _loop_last_user_content: List[str] = [""]
 
 # True while a tool call is mid-`ainvoke`. Read by POST /api/interrupt to
@@ -1144,8 +1151,10 @@ async def _attach_session(
     # the loop can keep reading input / responding to interrupts across
     # transport churn. Cleared in _terminate_session.
     global _loop_user_queue, _loop_interrupt_flag, _loop_last_user_content
+    global _hard_interrupt_event
     _loop_user_queue = asyncio.Queue()
     _loop_interrupt_flag = None
+    _hard_interrupt_event = asyncio.Event()
     _loop_last_user_content = [""]
 
     # Phase 2 event-log cursor init. The current epoch lives on the threads
@@ -1233,6 +1242,7 @@ async def _terminate_session(reason: str) -> None:
     """
     global _session, _thread_id, _sessions_served, _loop_task
     global _loop_user_queue, _loop_interrupt_flag, _loop_last_user_content
+    global _hard_interrupt_event
     global _events_epoch, _next_seq, _tool_inflight
 
     if not _session:
@@ -1301,6 +1311,7 @@ async def _terminate_session(reason: str) -> None:
     # ensures stale entries don't accumulate across sessions.
     _loop_user_queue = None
     _loop_interrupt_flag = None
+    _hard_interrupt_event = None
     _loop_last_user_content = [""]
     _subscribers.clear()
 
@@ -1553,6 +1564,11 @@ async def handle_api_interrupt() -> JSONResponse:
         return JSONResponse({"error": "Session not active"}, status_code=503)
     mode = "graceful" if _tool_inflight else "hard"
     _loop_interrupt_flag = mode
+    # Hard interrupt with no tool in flight ⇒ the loop is parked in an LLM /
+    # auxiliary await; signal it to cancel that await immediately rather than
+    # waiting for the next cooperative check_interrupt poll.
+    if mode == "hard" and _hard_interrupt_event is not None:
+        _hard_interrupt_event.set()
     logger.info(
         "Interrupt received via REST (mode=%s, tool_inflight=%s)",
         mode,
@@ -1710,6 +1726,7 @@ async def handle_persistent_websocket(ws: WebSocket) -> None:
             check_interrupt=_loop_check_interrupt,
             on_vm_upgrade_needed=_loop_on_vm_upgrade_needed,
             on_context_compacted=_loop_on_context_compacted,
+            hard_interrupt_event=_hard_interrupt_event,
         )
         _loop_task = asyncio.create_task(
             run_persistent_loop(
@@ -1798,6 +1815,8 @@ async def handle_persistent_websocket(ws: WebSocket) -> None:
                 # partial AIMessage). See persistent_graph check sites.
                 mode = "graceful" if _tool_inflight else "hard"
                 _loop_interrupt_flag = mode
+                if mode == "hard" and _hard_interrupt_event is not None:
+                    _hard_interrupt_event.set()
                 await _ws_send(ws, "interrupt.ack", {"mode": mode})
                 logger.info("Interrupt acknowledged (mode=%s)", mode)
 
@@ -2186,6 +2205,11 @@ def _loop_check_interrupt() -> Optional[str]:
     mode = _loop_interrupt_flag
     if mode is not None:
         _loop_interrupt_flag = None
+        # Keep the hard-interrupt event in lock-step with the flag: consuming
+        # the interrupt (here, or via the streaming/compaction race below)
+        # resets the signal so it doesn't leak into the next turn.
+        if _hard_interrupt_event is not None:
+            _hard_interrupt_event.clear()
         return mode
     return None
 

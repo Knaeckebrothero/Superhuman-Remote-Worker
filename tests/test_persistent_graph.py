@@ -2811,3 +2811,122 @@ class TestStreamedResponseNormalization:
         # The empty partial must NOT be in history (neither chunk nor concrete).
         assert len(messages) == 2
         assert not any(isinstance(m, AIMessage) for m in messages)
+
+
+class TestHardInterruptHelpers:
+    """Phase-3 immediate hard-interrupt cancellation primitives.
+
+    These race an in-flight LLM / auxiliary await against a hard-interrupt
+    event so a hung network read is torn down at once, instead of waiting for
+    the cooperative check_interrupt poll (which can't fire while parked).
+    """
+
+    @pytest.mark.asyncio
+    async def test_await_passthrough_when_no_event(self):
+        from src.persistent_graph import _await_or_hard_interrupt
+
+        async def quick():
+            return "done"
+
+        result, interrupted = await _await_or_hard_interrupt(quick(), None)
+        assert result == "done"
+        assert interrupted is False
+
+    @pytest.mark.asyncio
+    async def test_await_completes_when_event_idle(self):
+        from src.persistent_graph import _await_or_hard_interrupt
+
+        async def quick():
+            return 42
+
+        result, interrupted = await _await_or_hard_interrupt(quick(), asyncio.Event())
+        assert result == 42
+        assert interrupted is False
+
+    @pytest.mark.asyncio
+    async def test_await_cancels_blocked_coro_on_event(self):
+        from src.persistent_graph import _await_or_hard_interrupt
+
+        event = asyncio.Event()
+        cancelled = {"v": False}
+
+        async def hang():
+            try:
+                await asyncio.sleep(30)
+                return "never"
+            except asyncio.CancelledError:
+                cancelled["v"] = True
+                raise
+
+        async def fire():
+            await asyncio.sleep(0.01)
+            event.set()
+
+        fire_task = asyncio.create_task(fire())
+        result, interrupted = await _await_or_hard_interrupt(hang(), event)
+        await fire_task
+
+        assert interrupted is True
+        assert result is None
+        # The blocked await must actually be torn down, not just abandoned.
+        assert cancelled["v"] is True
+
+    @pytest.mark.asyncio
+    async def test_await_propagates_coro_exception(self):
+        from src.persistent_graph import _await_or_hard_interrupt
+
+        async def boom():
+            raise ValueError("kaboom")
+
+        with pytest.raises(ValueError, match="kaboom"):
+            await _await_or_hard_interrupt(boom(), asyncio.Event())
+
+    @pytest.mark.asyncio
+    async def test_stream_yields_chunks_then_stop(self):
+        from src.persistent_graph import _stream_next_or_hard_interrupt
+
+        async def gen():
+            yield "a"
+            yield "b"
+
+        aiter = gen().__aiter__()
+        event = asyncio.Event()
+        assert await _stream_next_or_hard_interrupt(aiter, event) == ("a", "chunk")
+        assert await _stream_next_or_hard_interrupt(aiter, event) == ("b", "chunk")
+        assert await _stream_next_or_hard_interrupt(aiter, event) == (None, "stop")
+
+    @pytest.mark.asyncio
+    async def test_stream_passthrough_when_no_event(self):
+        from src.persistent_graph import _stream_next_or_hard_interrupt
+
+        async def gen():
+            yield "only"
+
+        aiter = gen().__aiter__()
+        assert await _stream_next_or_hard_interrupt(aiter, None) == ("only", "chunk")
+        assert await _stream_next_or_hard_interrupt(aiter, None) == (None, "stop")
+
+    @pytest.mark.asyncio
+    async def test_stream_interrupts_hung_read(self):
+        from src.persistent_graph import _stream_next_or_hard_interrupt
+
+        started = asyncio.Event()
+
+        async def hanging_gen():
+            started.set()
+            await asyncio.sleep(30)  # never yields — simulates a hung read
+            yield "never"
+
+        aiter = hanging_gen().__aiter__()
+        event = asyncio.Event()
+
+        async def fire():
+            await started.wait()
+            event.set()
+
+        fire_task = asyncio.create_task(fire())
+        chunk, status = await _stream_next_or_hard_interrupt(aiter, event)
+        await fire_task
+
+        assert chunk is None
+        assert status == "interrupt"
