@@ -219,7 +219,7 @@ class WorkspaceInstanceManager:
         labels = inst.metadata.get("labels") or {}
         try:
             if "srw/thread-id" in labels:
-                await self._provisioner.delete_thread_workspace(bound)
+                await self._provisioner.delete_workspace(WorkspaceOwner.session(bound))
             else:
                 await self._provisioner.delete_workspace(WorkspaceOwner.job(bound))
         except Exception:
