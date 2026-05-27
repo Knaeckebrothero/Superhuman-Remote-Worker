@@ -1844,6 +1844,7 @@ class TestTerminateSession:
         mod._subscribers["ghost"] = _asyncio.Queue()
         mod._loop_user_queue = _asyncio.Queue()
         mod._loop_interrupt_flag = "hard"
+        mod._hard_interrupt_event = _asyncio.Event()
         mod._loop_last_user_content = ["something"]
         mod._tool_inflight = True
         mod._events_epoch = 7
@@ -1861,6 +1862,7 @@ class TestTerminateSession:
         assert mod._subscribers == {}
         assert mod._loop_user_queue is None
         assert mod._loop_interrupt_flag is None
+        assert mod._hard_interrupt_event is None
         assert mod._loop_last_user_content == [""]
         assert mod._tool_inflight is False
         assert mod._events_epoch == 0
@@ -2059,6 +2061,7 @@ class TestLoopCheckInterrupt:
 
         mod._loop_interrupt_flag = None
         mod._tool_inflight = False
+        mod._hard_interrupt_event = None
 
     def test_returns_none_when_flag_not_set(self):
         import src.api.persistent_app as mod
@@ -2079,6 +2082,70 @@ class TestLoopCheckInterrupt:
         mod._loop_interrupt_flag = "graceful"
         assert mod._loop_check_interrupt() == "graceful"
         assert mod._loop_check_interrupt() is None
+
+    def test_consuming_clears_hard_interrupt_event(self):
+        """Consuming the flag resets the hard-interrupt event in lock-step so
+        it doesn't leak into the next turn's streaming/compaction race."""
+        import asyncio as _asyncio
+
+        import src.api.persistent_app as mod
+
+        mod._hard_interrupt_event = _asyncio.Event()
+        mod._hard_interrupt_event.set()
+        mod._loop_interrupt_flag = "hard"
+
+        assert mod._loop_check_interrupt() == "hard"
+        assert mod._hard_interrupt_event.is_set() is False
+        mod._hard_interrupt_event = None
+
+
+class TestHandleApiInterruptHardEvent:
+    """handle_api_interrupt fires the hard-interrupt event only when no tool is
+    in flight (mode=hard) — so the loop can cancel a parked LLM/aux await."""
+
+    def setup_method(self):
+        import src.api.persistent_app as mod
+
+        mod._loop_interrupt_flag = None
+        mod._tool_inflight = False
+        mod._hard_interrupt_event = None
+
+    def teardown_method(self):
+        import src.api.persistent_app as mod
+
+        mod._session = None
+        mod._tool_inflight = False
+        mod._hard_interrupt_event = None
+
+    @pytest.mark.asyncio
+    async def test_hard_mode_sets_event(self):
+        import asyncio as _asyncio
+
+        import src.api.persistent_app as mod
+
+        mod._session = MagicMock()
+        mod._tool_inflight = False  # no tool in flight ⇒ hard
+        mod._hard_interrupt_event = _asyncio.Event()
+
+        await mod.handle_api_interrupt()
+
+        assert mod._loop_interrupt_flag == "hard"
+        assert mod._hard_interrupt_event.is_set() is True
+
+    @pytest.mark.asyncio
+    async def test_graceful_mode_leaves_event_unset(self):
+        import asyncio as _asyncio
+
+        import src.api.persistent_app as mod
+
+        mod._session = MagicMock()
+        mod._tool_inflight = True  # tool mid-ainvoke ⇒ graceful (never cancel)
+        mod._hard_interrupt_event = _asyncio.Event()
+
+        await mod.handle_api_interrupt()
+
+        assert mod._loop_interrupt_flag == "graceful"
+        assert mod._hard_interrupt_event.is_set() is False
 
 
 # ---------------------------------------------------------------------------

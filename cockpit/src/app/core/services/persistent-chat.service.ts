@@ -1,4 +1,4 @@
-import {computed, DestroyRef, effect, inject, Injectable, NgZone, signal} from '@angular/core';
+import {computed, DestroyRef, effect, inject, Injectable, NgZone, signal, untracked} from '@angular/core';
 import {HttpClient} from '@angular/common/http';
 import {firstValueFrom} from 'rxjs';
 import {environment} from '../environment';
@@ -62,6 +62,13 @@ const CONTROL_WS_RECONNECT_MAX_ATTEMPTS = 8;
 // hours later. See `docs/issues/persistent_chat_silent_disconnect.md`.
 const SSE_WATCHDOG_INTERVAL_MS = 5000;
 const SSE_WATCHDOG_TIMEOUT_MS = 45000;
+
+// After an interrupt POST we wait for the agent to emit `interrupt.ack` /
+// `turn.completed` over SSE to clear the "Stopping…" state. If that frame is
+// lost (silently-stalled stream) the button would wedge forever — re-clicks
+// early-return. If nothing clears it within this window, force an SSE reopen
+// (replay-from-cursor) which re-delivers the durable turn boundary.
+const INTERRUPT_ACK_TIMEOUT_MS = 8000;
 
 /** Attachment chip shown alongside a user message. */
 export interface ChatAttachment {
@@ -181,6 +188,19 @@ export class PersistentChatService {
                 case 'failed':
                     this.error.set(event.reason || 'session preparation failed');
                     break;
+            }
+        });
+
+        // Invariant: "Stopping…" (isInterrupting) only makes sense while a turn
+        // is actually streaming. Whenever streaming ends — turn completed, the
+        // turn closed on disconnect, or a reconnect re-synced past it — clear
+        // the flag and its fallback timer. This is the safety net that stops a
+        // lost interrupt.ack/turn.completed frame from wedging the button: any
+        // path that drops the active turn also drops "Stopping…".
+        effect(() => {
+            if (!this.isStreaming() && untracked(() => this.isInterrupting())) {
+                this.isInterrupting.set(false);
+                this._clearInterruptFallback();
             }
         });
 
@@ -367,6 +387,10 @@ export class PersistentChatService {
 
     private sse: EventSource | null = null;
     private sseWatchdogTimer: ReturnType<typeof setInterval> | null = null;
+    // One-shot fallback: force a reconnect if "Stopping…" doesn't clear after
+    // an interrupt POST (lost ack frame). Armed in interrupt(), cleared by the
+    // isInterrupting invariant effect.
+    private interruptFallbackTimer: ReturnType<typeof setTimeout> | null = null;
     private sseLastEventAt = 0;
     private controlWs: WebSocket | null = null;
     private controlWsReconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1327,9 +1351,9 @@ export class PersistentChatService {
     /** Interrupt the current turn — REST POST. */
     async interrupt(): Promise<void> {
         if (this.isInterrupting()) return;
-        this.isInterrupting.set(true);
         const tid = this.threadId();
         if (!tid) return;
+        this.isInterrupting.set(true);
         try {
             await firstValueFrom(
                 this.http.post(`${environment.apiUrl}/persistent/threads/${tid}/interrupt`, {})
@@ -1338,10 +1362,38 @@ export class PersistentChatService {
             // Interrupt failures are rare and the SSE will surface the next
             // turn boundary regardless — log and reset the flag.
             this.isInterrupting.set(false);
+            this._clearInterruptFallback();
             console.warn('[persistent-chat] interrupt failed:', err);
+            return;
         }
-        // On success, the agent emits `interrupt.ack` over SSE and the
-        // handler below resets isInterrupting/isStreaming/currentTurnId.
+        // On success the agent emits `interrupt.ack` / `turn.completed` over
+        // SSE and the handlers reset isInterrupting. Arm a fallback in case
+        // that frame never arrives (stalled stream): force a reconnect so the
+        // durable turn boundary replays from cursor and clears "Stopping…".
+        this._armInterruptFallback();
+    }
+
+    /** Arm the one-shot stuck-"Stopping…" fallback (see interrupt()). */
+    private _armInterruptFallback(): void {
+        this._clearInterruptFallback();
+        this.interruptFallbackTimer = setTimeout(() => {
+            this.interruptFallbackTimer = null;
+            if (this.isInterrupting()) {
+                console.warn(
+                    '[persistent-chat] interrupt ack not seen within ' +
+                    `${INTERRUPT_ACK_TIMEOUT_MS}ms — forcing reconnect to re-sync`
+                );
+                this.reconnectNow();
+            }
+        }, INTERRUPT_ACK_TIMEOUT_MS);
+    }
+
+    /** Cancel the stuck-"Stopping…" fallback timer if armed. */
+    private _clearInterruptFallback(): void {
+        if (this.interruptFallbackTimer) {
+            clearTimeout(this.interruptFallbackTimer);
+            this.interruptFallbackTimer = null;
+        }
     }
 
     /** Stop a pending permission prompt + halt the turn so the user can
