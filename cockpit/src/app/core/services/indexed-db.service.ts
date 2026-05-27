@@ -8,12 +8,13 @@ import {
   CachedAuditEntry,
   CachedChatEntry,
   CachedGraphDelta,
+  CachedThreadMessage,
   JobCacheMetadata,
   ThreadCursor,
 } from '../models/cache.model';
 
 /** Current cache schema version */
-const CACHE_VERSION = 3;
+const CACHE_VERSION = 4;
 
 /**
  * Dexie database class for cockpit cache.
@@ -25,6 +26,7 @@ class CockpitDatabase extends Dexie {
   graphDeltas!: Table<CachedGraphDelta>;
   jobMetadata!: Table<JobCacheMetadata>;
   threadCursors!: Table<ThreadCursor>;
+  threadMessages!: Table<CachedThreadMessage>;
 
   constructor() {
     super('cockpit-cache');
@@ -52,6 +54,16 @@ class CockpitDatabase extends Dexie {
       jobMetadata: 'jobId',
       // New: SSE replay cursors keyed by threadId, used by PersistentChatService.
       threadCursors: 'threadId',
+    });
+    this.version(4).stores({
+      // v3 tables unchanged.
+      auditEntries: 'id, jobId, [jobId+index], [jobId+stepType+index]',
+      chatEntries: 'id, jobId, [jobId+timestamp]',
+      graphDeltas: 'id, jobId, [jobId+index]',
+      jobMetadata: 'jobId',
+      threadCursors: 'threadId',
+      // New: full per-thread message cache for the persistent-chat display.
+      threadMessages: 'id, threadId, [threadId+createdAt]',
     });
   }
 }
@@ -407,6 +419,48 @@ export class IndexedDbService {
     await this.db.threadCursors.delete(threadId);
   }
 
+  // ===== Thread Messages (full conversation cache) =====
+
+  /**
+   * All cached messages for a thread, ascending by `created_at`. Empty when the
+   * thread hasn't been cached yet. Feed straight into `historyToTurns`.
+   */
+  async getThreadMessages(threadId: string): Promise<CachedThreadMessage[]> {
+    if (!this.db) return [];
+    return this.db.threadMessages
+      .where('[threadId+createdAt]')
+      .between([threadId, Dexie.minKey], [threadId, Dexie.maxKey], true, true)
+      .toArray();
+  }
+
+  /**
+   * The newest cached `created_at` for a thread, or `null` when nothing is
+   * cached. Used as the `?after=` cursor to fetch only what we've missed.
+   */
+  async getNewestCachedCreatedAt(threadId: string): Promise<string | null> {
+    if (!this.db) return null;
+    const row = await this.db.threadMessages
+      .where('[threadId+createdAt]')
+      .between([threadId, Dexie.minKey], [threadId, Dexie.maxKey], true, true)
+      .last();
+    return row?.created_at ?? null;
+  }
+
+  /**
+   * Upsert messages by `id` (append-only in practice — never full-replace,
+   * which would lose history). Idempotent: re-receiving a row overwrites it.
+   */
+  async upsertThreadMessages(rows: CachedThreadMessage[]): Promise<void> {
+    if (!this.db || rows.length === 0) return;
+    await this.db.threadMessages.bulkPut(rows);
+  }
+
+  /** Drop a thread's cached messages (e.g. manual cache reset). */
+  async clearThreadMessages(threadId: string): Promise<void> {
+    if (!this.db) return;
+    await this.db.threadMessages.where('threadId').equals(threadId).delete();
+  }
+
   // ===== Cache Management =====
 
   /**
@@ -433,6 +487,7 @@ export class IndexedDbService {
       this.db.graphDeltas.clear(),
       this.db.jobMetadata.clear(),
       this.db.threadCursors.clear(),
+      this.db.threadMessages.clear(),
     ]);
   }
 

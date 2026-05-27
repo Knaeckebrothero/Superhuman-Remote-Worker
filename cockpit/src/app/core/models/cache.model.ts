@@ -83,3 +83,28 @@ export interface ThreadCursor {
   /** ISO timestamp of the last cursor update — useful for stale-cursor cleanup. */
   updatedAt: string;
 }
+
+/**
+ * Cached persistent-thread message — mirrors the orchestrator's
+ * `thread_messages` display row plus the owning `threadId`. The full
+ * conversation is cached so the cockpit can paint instantly on reopen and
+ * catch up on reconnect via an `?after=` cursor instead of re-downloading the
+ * whole thread. Keyed by message `id`; upsert-by-id keeps the cache a
+ * contiguous prefix (never full-replaced — that would lose history).
+ */
+export interface CachedThreadMessage {
+  /** thread_messages.id — primary key, unique per message. */
+  id: string;
+  /** Owning thread UUID — index for per-thread queries. */
+  threadId: string;
+  role: string;
+  content: string | null;
+  tool_calls:
+    | { name: string; args: Record<string, unknown>; id: string; decision?: 'approved' | 'denied' }[]
+    | null;
+  turn_number: number | null;
+  tool_call_id?: string | null;
+  thinking?: string | null;
+  /** ISO-8601; lexicographically sortable — the `[threadId+createdAt]` index. */
+  created_at: string | null;
+}

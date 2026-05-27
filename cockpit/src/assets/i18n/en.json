@@ -882,6 +882,10 @@
       "resuming": "Resuming...",
       "resumeFailed": "Failed to resume session"
     },
+    "compaction": {
+      "banner": "Context summarized",
+      "viewSummary": "View summary"
+    },
     "empty": {
       "title": "What shall we conquer today?",
       "subtitle": "The agent is connected and listening. Issue a brief, or pick a starting point below."

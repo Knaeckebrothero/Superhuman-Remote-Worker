@@ -516,6 +516,21 @@ export function pickRunningCommandCard(
                 </div>
               </div>
             }
+            @case ('compaction') {
+              <!-- Compaction boundary: divider banner (reuses .session-divider),
+                   expandable to the summary so the user sees the agent's state. -->
+              <div class="session-divider">
+                <span class="divider-line"></span>
+                <span class="divider-text">{{ 'chat.compaction.banner' | transloco }}</span>
+                <span class="divider-line"></span>
+              </div>
+              @if (turn.summary) {
+                <details class="compaction-summary">
+                  <summary>{{ 'chat.compaction.viewSummary' | transloco }}</summary>
+                  <div class="compaction-summary-body">{{ turn.summary }}</div>
+                </details>
+              }
+            }
             @case ('user') {
               <div class="message message-user" [class.historical]="turn.historical">
                 <div class="avatar">

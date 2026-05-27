@@ -342,6 +342,7 @@ class PostgresDB:
                    created_at
             FROM thread_messages
             WHERE thread_id = $1
+              AND role <> 'summary'
             ORDER BY turn_number ASC, created_at ASC
         """
         params: List[Any] = [thread_id]

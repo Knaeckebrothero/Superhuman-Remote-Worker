@@ -28,7 +28,7 @@ from langchain_core.messages import (
     ToolMessage,
 )
 
-from .core.context import ContextManager
+from .core.context import ContextManager, extract_summary_text
 from .llm.reasoning_chat import extract_reasoning_text_from_block
 from .llm.response_guards import (
     coerce_to_ai_message,
@@ -148,6 +148,11 @@ class PersistentLoopCallbacks:
 
     # Notify client that a VM upgrade is needed (sudo detected, optional)
     on_vm_upgrade_needed: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None
+
+    # Notify the transport that automatic summarization compacted the context,
+    # so it can persist a display marker + show a banner. Optional.
+    # Args: (summary_text, before_count, after_count).
+    on_context_compacted: Optional[Callable[[str, int, int], Awaitable[None]]] = None
 
 
 async def run_persistent_loop(
@@ -514,19 +519,31 @@ async def _execute_turn(
         # so len(prepared) reflects the real compacted message count.
         prepared = strip_removal_markers(prepared)
 
-        # Auto-compaction happened — commit + push workspace to Gitea as checkpoint
-        if len(prepared) < pre_compact_len and tool_context:
-            ws_mgr = getattr(tool_context, "workspace_manager", None)
-            git_mgr = getattr(ws_mgr, "git_manager", None) if ws_mgr else None
-            if git_mgr and git_mgr.is_active:
+        # Auto-compaction happened this turn — surface it for display, then
+        # commit + push the workspace to Gitea as a checkpoint.
+        if len(prepared) < pre_compact_len:
+            summary_text = extract_summary_text(prepared)
+            if summary_text and callbacks.on_context_compacted:
                 try:
-                    if git_mgr.has_uncommitted_changes():
-                        git_mgr.commit(
-                            f"Auto-compaction checkpoint ({pre_compact_len} → {len(prepared)} msgs)"
-                        )
-                    git_mgr.push()
+                    await callbacks.on_context_compacted(
+                        summary_text, pre_compact_len, len(prepared)
+                    )
                 except Exception as e:
-                    logger.debug(f"Git push on auto-compaction failed (non-fatal): {e}")
+                    logger.debug(f"on_context_compacted failed (non-fatal): {e}")
+            if tool_context:
+                ws_mgr = getattr(tool_context, "workspace_manager", None)
+                git_mgr = getattr(ws_mgr, "git_manager", None) if ws_mgr else None
+                if git_mgr and git_mgr.is_active:
+                    try:
+                        if git_mgr.has_uncommitted_changes():
+                            git_mgr.commit(
+                                f"Auto-compaction checkpoint ({pre_compact_len} → {len(prepared)} msgs)"
+                            )
+                        git_mgr.push()
+                    except Exception as e:
+                        logger.debug(
+                            f"Git push on auto-compaction failed (non-fatal): {e}"
+                        )
 
         # --- LLM call with streaming ---
         response_content = ""
