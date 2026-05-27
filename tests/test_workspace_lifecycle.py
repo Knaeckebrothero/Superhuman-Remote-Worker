@@ -13,7 +13,7 @@ from orchestrator.services.workspace_lifecycle import WorkspaceOwner  # noqa: E4
 def test_owner_job_naming_and_labels():
     o = WorkspaceOwner.job("abcdef0123456789")
     assert o.kind == "job"
-    assert o.pod_name == "workspace-abcdef012345"      # 12-char id truncation
+    assert o.pod_name == "workspace-abcdef012345"  # 12-char id truncation
     assert o.label_key == "srw/job-id"
     assert o.component_label == "workspace"
     assert o.network_tier_kind == "job"

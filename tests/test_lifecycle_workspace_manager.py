@@ -379,7 +379,9 @@ class TestDrain:
             metadata={"labels": {"srw/thread-id": "t1"}},
         )
         await mgr.drain(inst, grace_s=10)
-        container.delete_workspace.assert_awaited_once_with(WorkspaceOwner.session("t1"))
+        container.delete_workspace.assert_awaited_once_with(
+            WorkspaceOwner.session("t1")
+        )
 
     @pytest.mark.asyncio
     async def test_drain_skipped_without_bound(self):
