@@ -3,6 +3,7 @@ import {describe, expect, it} from 'vitest';
 import {
     canComposeDuringSession,
     isStartupBannerVisible,
+    pickCodeServerUrlToOpen,
     pickCurrentStartupStep,
     pickRunningCommandCard,
 } from './persistent-chat.component';
@@ -106,5 +107,32 @@ describe('pickRunningCommandCard', () => {
             ],
         };
         expect(pickRunningCommandCard(rt, [turn])).toBeNull();
+    });
+});
+
+describe('pickCodeServerUrlToOpen', () => {
+    // The pre-flight-then-open wiring (HTTP through the auth interceptor,
+    // window.open, idle-session 401 → re-login) is exercised by Playwright on
+    // the dev cluster; here we cover the pure open/skip decision.
+    it('returns the code-server URL when the workspace is active', () => {
+        expect(
+            pickCodeServerUrlToOpen({status: 'active', code_server_url: 'https://api/x/proxy/'}),
+        ).toBe('https://api/x/proxy/');
+    });
+
+    it('returns null when the status is not active (e.g. restoring)', () => {
+        expect(
+            pickCodeServerUrlToOpen({status: 'restoring', code_server_url: 'https://api/x/proxy/'}),
+        ).toBeNull();
+    });
+
+    it('returns null when active but no URL is present', () => {
+        expect(pickCodeServerUrlToOpen({status: 'active'})).toBeNull();
+    });
+
+    it('returns null when the pre-flight fetch yielded null (swallowed 401 → interceptor re-login)', () => {
+        // getThreadIdeStatus swallows a 401 to null *after* the auth interceptor
+        // has kicked off re-login; the button must not open a tab in that case.
+        expect(pickCodeServerUrlToOpen(null)).toBeNull();
     });
 });
