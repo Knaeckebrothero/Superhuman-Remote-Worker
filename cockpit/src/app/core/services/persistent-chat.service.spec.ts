@@ -1754,3 +1754,85 @@ describe('PersistentChatService — attachments', () => {
         expect(service.pendingAttachments()).toEqual([]);
     });
 });
+
+describe('PersistentChatService — interrupt self-healing', () => {
+    let originalEs: any;
+    let originalWs: any;
+
+    beforeEach(() => {
+        originalEs = (globalThis as any).EventSource;
+        originalWs = (globalThis as any).WebSocket;
+        vi.useFakeTimers();
+    });
+
+    afterEach(() => {
+        vi.useRealTimers();
+        (globalThis as any).EventSource = originalEs;
+        (globalThis as any).WebSocket = originalWs;
+        vi.clearAllMocks();
+    });
+
+    // Connect, open the SSE, and start a turn so isStreaming() is true and
+    // "Stopping…" is meaningful.
+    async function setupStreaming() {
+        const ctx = createService();
+        ctx.mockHttp.get.mockImplementation(() =>
+            of({status: 'active', total_turns: 0, messages: [], total: 0}),
+        );
+        await ctx.service.connect('thread-int');
+        await vi.advanceTimersByTimeAsync(0); // drain _openSse microtasks
+        const es = ctx.sseInstances[0];
+        fireSseOpen(es);
+        fireSseMessage(es, {method: 'turn.started', params: {turn_id: 1}}, '1:1');
+        return {...ctx, es};
+    }
+
+    it('forces a reconnect if the interrupt ack never arrives', async () => {
+        const {service} = await setupStreaming();
+        const reconnectSpy = vi
+            .spyOn(service, 'reconnectNow')
+            .mockImplementation(() => {});
+
+        await service.interrupt();
+        expect(service.isInterrupting()).toBe(true);
+        expect(reconnectSpy).not.toHaveBeenCalled();
+
+        // No interrupt.ack / turn.completed arrives — fallback fires at ~8s and
+        // forces a replay-from-cursor reconnect to re-sync.
+        await vi.advanceTimersByTimeAsync(8_001);
+
+        expect(reconnectSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not reconnect when the turn boundary arrives in time', async () => {
+        const {service, es} = await setupStreaming();
+        const reconnectSpy = vi
+            .spyOn(service, 'reconnectNow')
+            .mockImplementation(() => {});
+
+        await service.interrupt();
+        // turn.completed lands promptly and clears "Stopping…".
+        fireSseMessage(es, {method: 'turn.completed', params: {turn_id: 1}}, '1:9');
+        expect(service.isInterrupting()).toBe(false);
+
+        await vi.advanceTimersByTimeAsync(8_001);
+        expect(reconnectSpy).not.toHaveBeenCalled();
+    });
+
+    it('clears a stuck isInterrupting when the connection drops (invariant)', async () => {
+        const {service} = await setupStreaming();
+
+        await service.interrupt();
+        expect(service.isInterrupting()).toBe(true);
+        expect(service.isStreaming()).toBe(true);
+
+        // disconnect() closes the active turn but does not explicitly reset
+        // isInterrupting — the invariant effect (not streaming ⇒ not stopping)
+        // is what must clear it.
+        service.disconnect();
+        TestBed.tick();
+
+        expect(service.isStreaming()).toBe(false);
+        expect(service.isInterrupting()).toBe(false);
+    });
+});
