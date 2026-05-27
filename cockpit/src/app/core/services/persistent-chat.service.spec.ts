@@ -232,6 +232,73 @@ describe('PersistentChatService — initial state', () => {
     });
 });
 
+describe('PersistentChatService — render windowing', () => {
+    function makeTurns(n: number) {
+        return Array.from({length: n}, (_, i) => ({
+            kind: 'user' as const,
+            id: `u${i}`,
+            content: `m${i}`,
+            timestamp: i,
+        }));
+    }
+
+    function seed(service: PersistentChatService, n: number): void {
+        service.conversation.set({
+            threadId: 't-window',
+            turns: makeTurns(n),
+            activeAssistantTurnId: null,
+        });
+    }
+
+    it('renders all turns when under the window size', () => {
+        const {service} = createService();
+        seed(service, 30);
+        expect(service.visibleTurns().length).toBe(30);
+        expect(service.hasOlderTurns()).toBe(false);
+    });
+
+    it('renders only the most recent window when over the size', () => {
+        const {service} = createService();
+        seed(service, 120);
+        const visible = service.visibleTurns();
+        expect(visible.length).toBe(50);
+        expect(visible[0].id).toBe('u70'); // slice(-50) of 120
+        expect(visible[49].id).toBe('u119');
+        expect(service.hasOlderTurns()).toBe(true);
+    });
+
+    it('loadOlderTurns widens the window by the step, capped at length', () => {
+        const {service} = createService();
+        seed(service, 120);
+        service.loadOlderTurns();
+        expect(service.visibleTurns().length).toBe(100);
+        expect(service.hasOlderTurns()).toBe(true);
+        service.loadOlderTurns(); // 150 → capped at 120
+        expect(service.visibleTurns().length).toBe(120);
+        expect(service.hasOlderTurns()).toBe(false);
+    });
+
+    it('growWindow anchors the visible top by the delta', () => {
+        const {service} = createService();
+        seed(service, 120);
+        const topBefore = service.visibleTurns()[0].id; // u70
+        seed(service, 123); // 3 more turns present
+        service.growWindow(3);
+        const visible = service.visibleTurns();
+        expect(visible.length).toBe(53);
+        expect(visible[0].id).toBe(topBefore); // visible top unchanged
+    });
+
+    it('resetWindow re-bounds to the default window', () => {
+        const {service} = createService();
+        seed(service, 120);
+        service.loadOlderTurns();
+        expect(service.visibleTurns().length).toBe(100);
+        service.resetWindow();
+        expect(service.visibleTurns().length).toBe(50);
+    });
+});
+
 describe('PersistentChatService — connect()', () => {
     let originalEs: any;
     let originalWs: any;
