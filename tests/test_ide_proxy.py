@@ -321,11 +321,12 @@ class TestCreateIdePod:
     def test_ide_pod_name_format(self):
         """IDE pod uses 'ide-' prefix with truncated job_id."""
         from orchestrator.services.container_provisioner import ContainerProvisioner
+        from services.workspace_lifecycle import WorkspaceOwner
 
         provisioner = ContainerProvisioner()
         manifest = provisioner._build_pod_manifest(
             pod_name="ide-abc123456789",
-            job_id="abc123456789-full-uuid",
+            owner=WorkspaceOwner.job("abc123456789-full-uuid"),
             image="test:latest",
             cpu="250m",
             memory="512Mi",
@@ -338,11 +339,12 @@ class TestCreateIdePod:
     def test_ide_pod_label_override(self):
         """create_ide_pod overrides the component label to 'ide-session'."""
         from orchestrator.services.container_provisioner import ContainerProvisioner
+        from services.workspace_lifecycle import WorkspaceOwner
 
         provisioner = ContainerProvisioner()
         manifest = provisioner._build_pod_manifest(
             pod_name="ide-test123",
-            job_id="test123-full-uuid",
+            owner=WorkspaceOwner.job("test123-full-uuid"),
             image="test:latest",
             cpu="250m",
             memory="512Mi",
