@@ -100,6 +100,8 @@ async def ensure_workspace(
     if s == "suspended":
         asyncio.create_task(suspension.restore(owner))
         return EnsureResult(EnsureOutcome.PENDING, status="restoring")
+    # "Already progressing" set — keep in sync with the NOT IN clause in
+    # PostgresDB.list_threads_needing_workspace (database/postgres.py).
     if s in ("created", "creating", "restoring", "suspending", "pending"):
         return EnsureResult(EnsureOutcome.PENDING, status=s)
     if s == "ready":
