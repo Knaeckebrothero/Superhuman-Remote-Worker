@@ -126,6 +126,11 @@ agent:
   config: "defaults"
   port: "8001"
   persistentConfig: "interactive"
+  # -- Apply admin-curated DB prompt overrides (prompt_overrides table) to
+  # provisioned agents. Default OFF (prod-safe); the dev/experimental values
+  # file turns it on. Gates only the agent's prompt resolver — not the
+  # orchestrator or the admin UI (overrides remain editable regardless).
+  promptDbOverridesEnabled: "false"
   resources:
     requests:
       memory: "512Mi"

@@ -46,6 +46,12 @@ data:
   AGENT_PORT: {{ .Values.agent.port | quote }}
   PERSISTENT_AGENT_CONFIG: {{ .Values.agent.persistentConfig | quote }}
 
+  # Apply DB-backed prompt overrides (admin-curated rows in the prompt_overrides
+  # table) to dynamically provisioned agents. Read by the agent prompt loader
+  # (src/core/loader.py) via envFrom on this shared ConfigMap. Default-off
+  # chart-wide (prod-safe); the dev/experimental values file turns it on.
+  PROMPT_DB_OVERRIDES_ENABLED: {{ .Values.agent.promptDbOverridesEnabled | default "false" | quote }}
+
   # OIDC / SSO — works with internal Keycloak or external OIDC provider
   KEYCLOAK_URL: {{ include "srw.keycloakInternalUrl" . | quote }}
   KEYCLOAK_ISSUER_URL: {{ include "srw.authUrl" . | quote }}
