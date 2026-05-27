@@ -5,6 +5,7 @@ Jobs get workspace reconcile from the main dispatcher loop; sessions never did,
 so a workspace wedged at 'failed'/missing for an active session never recovered.
 This module closes that gap with an idempotent ensure + a periodic safety-net.
 """
+
 from __future__ import annotations
 
 import json
