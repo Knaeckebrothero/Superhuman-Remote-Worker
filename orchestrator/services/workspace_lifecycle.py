@@ -2,6 +2,7 @@
 
 See docs/features/unified_workspace_provisioning.md.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -47,9 +48,9 @@ class WorkspaceOwner:
 
 
 class EnsureOutcome(Enum):
-    READY = "ready"      # workspace usable now → caller may dispatch
+    READY = "ready"  # workspace usable now → caller may dispatch
     PENDING = "pending"  # in progress (creating/restoring/created) → caller retries next cycle
-    FAILED = "failed"    # creation failed / terminal → caller decides policy
+    FAILED = "failed"  # creation failed / terminal → caller decides policy
 
 
 @dataclass

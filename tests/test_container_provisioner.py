@@ -709,7 +709,9 @@ class TestCreateWorkspace:
         )
         provisioner._core_api = mock_core_api
 
-        result = await provisioner.create_workspace(WorkspaceOwner.job("test-job-123456"))
+        result = await provisioner.create_workspace(
+            WorkspaceOwner.job("test-job-123456")
+        )
 
         assert result is False
         # Should have set failed status
@@ -738,7 +740,9 @@ class TestDeleteWorkspace:
         mock_core_api.delete_namespaced_pod = MagicMock()
         provisioner._core_api = mock_core_api
 
-        result = await provisioner.delete_workspace(WorkspaceOwner.job("test-job-123456"))
+        result = await provisioner.delete_workspace(
+            WorkspaceOwner.job("test-job-123456")
+        )
 
         assert result is True
         mock_core_api.delete_namespaced_pod.assert_called_once()
@@ -769,7 +773,9 @@ class TestDeleteWorkspace:
         error.status = 404
         mock_core_api.delete_namespaced_pod = MagicMock(side_effect=error)
 
-        result = await provisioner.delete_workspace(WorkspaceOwner.job("test-job-123456"))
+        result = await provisioner.delete_workspace(
+            WorkspaceOwner.job("test-job-123456")
+        )
         assert result is True
 
     @pytest.mark.asyncio
@@ -782,7 +788,9 @@ class TestDeleteWorkspace:
         provisioner = ContainerProvisioner()
         provisioner._k8s_available = False
 
-        result = await provisioner.delete_workspace(WorkspaceOwner.job("test-job-123456"))
+        result = await provisioner.delete_workspace(
+            WorkspaceOwner.job("test-job-123456")
+        )
         assert result is False
 
 

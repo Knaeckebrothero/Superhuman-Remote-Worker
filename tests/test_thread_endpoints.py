@@ -106,7 +106,9 @@ async def agent_create_thread(
                 thread_id, {"git_remote_url": git_remote_url, "repo_name": repo_name}
             )
     if provisioner.is_available:
-        asyncio.create_task(provisioner.create_workspace(WorkspaceOwner.session(thread_id)))
+        asyncio.create_task(
+            provisioner.create_workspace(WorkspaceOwner.session(thread_id))
+        )
     return {"thread_id": thread_id, "status": "created"}
 
 

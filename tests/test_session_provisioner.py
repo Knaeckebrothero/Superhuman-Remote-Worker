@@ -55,7 +55,9 @@ async def test_ensure_skips_missing_thread():
     db = AsyncMock()
     db.get_thread = AsyncMock(return_value=None)
     prov = AsyncMock()
-    res = await ensure_session_workspace("gone", db=db, provisioner=prov, suspension=AsyncMock())
+    res = await ensure_session_workspace(
+        "gone", db=db, provisioner=prov, suspension=AsyncMock()
+    )
     assert res is None
     prov.create_workspace.assert_not_called()
 
@@ -72,7 +74,9 @@ async def test_ensure_handles_str_metadata_ready():
         }
     )
     prov = AsyncMock()
-    res = await ensure_session_workspace("t1", db=db, provisioner=prov, suspension=AsyncMock())
+    res = await ensure_session_workspace(
+        "t1", db=db, provisioner=prov, suspension=AsyncMock()
+    )
     assert res.outcome == EnsureOutcome.READY
     prov.create_workspace.assert_not_called()
 
@@ -94,7 +98,9 @@ async def test_reconcile_iterates_and_counts():
     db.get_thread = AsyncMock(side_effect=_get_thread)
     prov = AsyncMock()
     prov.create_workspace = AsyncMock(return_value=True)
-    n = await reconcile_session_workspaces(db=db, provisioner=prov, suspension=AsyncMock())
+    n = await reconcile_session_workspaces(
+        db=db, provisioner=prov, suspension=AsyncMock()
+    )
     assert n == 2
     assert prov.create_workspace.await_count == 2
 
@@ -113,17 +119,25 @@ async def test_reconcile_empty_is_noop():
 async def test_reconcile_survives_one_thread_failing():
     """One bad thread must not abort the whole sweep."""
     db = AsyncMock()
-    db.list_threads_needing_workspace = AsyncMock(return_value=[{"id": "bad"}, {"id": "good"}])
+    db.list_threads_needing_workspace = AsyncMock(
+        return_value=[{"id": "bad"}, {"id": "good"}]
+    )
 
     async def _get_thread(tid):
         if tid == "bad":
             raise RuntimeError("boom")
-        return {"id": tid, "status": "active", "metadata": {"workspace_container": {"status": "failed"}}}
+        return {
+            "id": tid,
+            "status": "active",
+            "metadata": {"workspace_container": {"status": "failed"}},
+        }
 
     db.get_thread = AsyncMock(side_effect=_get_thread)
     prov = AsyncMock()
     prov.create_workspace = AsyncMock(return_value=True)
-    n = await reconcile_session_workspaces(db=db, provisioner=prov, suspension=AsyncMock())
+    n = await reconcile_session_workspaces(
+        db=db, provisioner=prov, suspension=AsyncMock()
+    )
     assert n == 1  # only "good" succeeded; "bad" was caught
 
 
