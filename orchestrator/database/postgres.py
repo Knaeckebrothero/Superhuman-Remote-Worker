@@ -19,7 +19,7 @@ import re
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional, Any, List, Dict
+from typing import Optional, Any, List, Dict, Tuple
 from uuid import UUID
 
 try:
@@ -2995,47 +2995,118 @@ class PostgresDB:
             )
         return str(row["id"])
 
+    @staticmethod
+    def _thread_message_to_dict(row: Any) -> Dict[str, Any]:
+        """Map a ``thread_messages`` row to the cockpit display shape."""
+        return {
+            "id": str(row["id"]),
+            "role": row["role"],
+            "content": row["content"],
+            "tool_calls": json.loads(row["tool_calls"]) if row["tool_calls"] else None,
+            "turn_number": row["turn_number"],
+            "metrics": json.loads(row["metrics"]) if row["metrics"] else None,
+            "tool_call_id": row["tool_call_id"],
+            "thinking": row["thinking"],
+            "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+        }
+
     async def get_thread_messages_history(
         self,
         thread_id: str,
-        limit: int = 200,
+        limit: Optional[int] = None,
         offset: int = 0,
     ) -> List[Dict[str, Any]]:
-        """Load thread message history for session resume. Ordered by created_at ASC."""
+        """Load thread message history for the cockpit display path, ascending.
+
+        ``limit=None`` (the default) loads the **entire** conversation. The
+        cockpit caches the full thread client-side and windows the render
+        itself, so the display path must not truncate. The old default of 200
+        sliced long threads to their oldest 200 rows — the "only the first
+        message shows" bug; the agent copy in ``src/database/postgres_db.py``
+        was fixed earlier but this display copy was missed.
+
+        Pass an explicit ``limit``/``offset`` for the legacy oldest-first paged
+        read still used by the MCP inspection tool. For backfill / reconnect
+        catch-up use ``get_thread_messages_page``.
+
+        Ordering is ``created_at ASC`` with ``turn_number, id`` tiebreakers so
+        parallel tool calls written in the same instant stay deterministic.
+        """
+        query = (
+            "SELECT id, role, content, tool_calls, turn_number, metrics, "
+            "tool_call_id, thinking, created_at FROM thread_messages "
+            "WHERE thread_id = $1 "
+            "ORDER BY created_at ASC, turn_number ASC, id ASC"
+        )
+        params: List[Any] = [thread_id]
+        if limit is not None:
+            params.append(limit)
+            query += f" LIMIT ${len(params)}"
+            params.append(offset)
+            query += f" OFFSET ${len(params)}"
         async with self.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT id, role, content, tool_calls, turn_number, metrics,
-                       tool_call_id, thinking, created_at
-                FROM thread_messages
-                WHERE thread_id = $1
-                ORDER BY created_at ASC
-                    LIMIT $2
-                OFFSET $3
-                """,
-                thread_id,
-                limit,
-                offset,
-            )
-        result = []
-        for row in rows:
-            msg = {
-                "id": str(row["id"]),
-                "role": row["role"],
-                "content": row["content"],
-                "tool_calls": json.loads(row["tool_calls"])
-                if row["tool_calls"]
-                else None,
-                "turn_number": row["turn_number"],
-                "metrics": json.loads(row["metrics"]) if row["metrics"] else None,
-                "tool_call_id": row["tool_call_id"],
-                "thinking": row["thinking"],
-                "created_at": row["created_at"].isoformat()
-                if row["created_at"]
-                else None,
-            }
-            result.append(msg)
-        return result
+            rows = await conn.fetch(query, *params)
+        return [self._thread_message_to_dict(r) for r in rows]
+
+    async def get_thread_messages_page(
+        self,
+        thread_id: str,
+        before: Optional[datetime] = None,
+        after: Optional[datetime] = None,
+        limit: Optional[int] = None,
+    ) -> Tuple[List[Dict[str, Any]], bool]:
+        """Cursor-paged thread message read for the cockpit display (Phase 2).
+
+        Supply exactly one of ``before`` / ``after``:
+
+        - ``before``: backfill — the newest rows at-or-before the cursor, up to
+          ``limit``, returned ascending.
+        - ``after``: catch-up — rows at-or-after the cursor, up to ``limit``,
+          ascending.
+
+        Cursor bounds are **inclusive**; the cockpit dedups by ``id``, so rows
+        that tie on ``created_at`` at the window edge are never dropped. Returns
+        ``(messages_ascending, has_more)`` — ``has_more`` is whether further
+        rows exist beyond the window in the paging direction (older for
+        ``before``, newer for ``after``).
+        """
+        clauses = ["thread_id = $1"]
+        params: List[Any] = [thread_id]
+        if before is not None:
+            params.append(before)
+            clauses.append(f"created_at <= ${len(params)}")
+            descending = True
+        elif after is not None:
+            params.append(after)
+            clauses.append(f"created_at >= ${len(params)}")
+            descending = False
+        else:
+            descending = False
+
+        order = (
+            "created_at DESC, turn_number DESC, id DESC"
+            if descending
+            else "created_at ASC, turn_number ASC, id ASC"
+        )
+        query = (
+            "SELECT id, role, content, tool_calls, turn_number, metrics, "
+            "tool_call_id, thinking, created_at FROM thread_messages "
+            f"WHERE {' AND '.join(clauses)} ORDER BY {order}"
+        )
+        if limit is not None:
+            params.append(limit + 1)  # probe one extra row to detect has_more
+            query += f" LIMIT ${len(params)}"
+
+        async with self.acquire() as conn:
+            rows = list(await conn.fetch(query, *params))
+
+        has_more = False
+        if limit is not None and len(rows) > limit:
+            has_more = True
+            rows = rows[:limit]
+        if descending:
+            rows.reverse()  # normalize to ascending for display
+        return [self._thread_message_to_dict(r) for r in rows], has_more
 
     async def get_thread_message_count(self, thread_id: str) -> int:
         """Get total message count for a thread."""
