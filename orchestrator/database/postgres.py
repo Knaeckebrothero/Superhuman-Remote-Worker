@@ -2574,6 +2574,33 @@ class PostgresDB:
             )
         return [dict(row) for row in rows]
 
+    async def list_threads_needing_workspace(self) -> List[Dict[str, Any]]:
+        """Active sessions whose workspace_container entry exists but is not ready or
+        in-progress (e.g. 'failed') — candidates for the session reconcile to re-ensure.
+
+        The positive ``status = 'active'`` filter excludes every non-active thread
+        (ended, suspended, awaiting_user, ...) — i.e. anything not currently running.
+        Requiring a workspace_container entry means sessions that never provisioned a
+        workspace are never spuriously created.
+
+        The excluded workspace statuses below are the "already progressing" set; keep
+        them in sync with ensure_workspace's in-progress guard in
+        services/workspace_lifecycle.py (plus 'ready'). Drift is low-impact: a missed
+        status just gets re-selected and no-op'd by ensure_workspace.
+        """
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, metadata
+                FROM threads
+                WHERE status = 'active'
+                  AND metadata->'workspace_container' IS NOT NULL
+                  AND COALESCE(metadata->'workspace_container'->>'status', '') NOT IN
+                      ('ready', 'creating', 'restoring', 'created', 'pending', 'suspending')
+                """,
+            )
+        return [dict(r) for r in rows]
+
     async def end_thread(self, thread_id: str) -> None:
         """End a persistent thread."""
         async with self.acquire() as conn:
