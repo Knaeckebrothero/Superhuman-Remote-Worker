@@ -84,6 +84,7 @@ from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 from fastapi.responses import (  # noqa: E402
     HTMLResponse,
     JSONResponse,
+    RedirectResponse,
     Response,
     StreamingResponse,
 )
@@ -7903,6 +7904,18 @@ _PROXY_HOP_HEADERS = frozenset(
 )
 
 
+def _is_browser_navigation(request: Request) -> bool:
+    """True for a top-level browser navigation (vs an XHR / sub-resource).
+
+    Browsers send ``Sec-Fetch-Mode: navigate`` on top-level navigations;
+    code-server's own asset/XHR sub-requests send ``cors``/``no-cors``.
+    Fall back to an HTML-preferring Accept header for older browsers.
+    """
+    if request.headers.get("sec-fetch-mode") == "navigate":
+        return True
+    return "text/html" in request.headers.get("accept", "")
+
+
 @app.api_route(
     "/api/ide/{job_id}/proxy/{path:path}",
     methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"],
@@ -7924,7 +7937,17 @@ async def ide_proxy_http(request: Request, job_id: str, path: str = ""):
 
     # H1: close the zero-auth hole — pre-fix, any caller knowing (or guessing)
     # the job/thread UUID got full code-server access (file r/w, terminal).
-    user = await require_approved_user(request, postgres_db)
+    try:
+        user = await require_approved_user(request, postgres_db)
+    except HTTPException as exc:
+        # A top-level browser navigation can only carry the BFF cookie. When
+        # that session has idle-expired, send the browser through the cockpit
+        # login instead of dumping raw 401 JSON. Only the no-session 401
+        # redirects — 403 (pending approval / IDE access denied) stays an error
+        # so an authenticated-but-unauthorized user never loops through login.
+        if exc.status_code == 401 and _is_browser_navigation(request):
+            return RedirectResponse("/auth/login?return_to=/", status_code=302)
+        raise
     if not await user_can_access_ide_entity(user, postgres_db, job_id):
         logger.warning(
             "IDE HTTP: user %s denied access to entity %s",

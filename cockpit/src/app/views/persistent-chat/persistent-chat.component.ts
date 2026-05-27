@@ -251,6 +251,18 @@ export function pickRunningCommandCard(
     return runningTool;
 }
 
+/**
+ * Decide whether the IDE button should open code-server, and to which URL.
+ * Returns the code-server URL only when the workspace is active; null
+ * otherwise — including when the pre-flight status fetch returned null (a
+ * swallowed 401 the auth interceptor has already turned into a re-login).
+ */
+export function pickCodeServerUrlToOpen(status: IdeSessionStatus | null): string | null {
+    return status?.status === 'active' && status.code_server_url
+        ? status.code_server_url
+        : null;
+}
+
 @Component({
     selector: 'app-persistent-chat',
     standalone: true,
@@ -318,7 +330,7 @@ export function pickRunningCommandCard(
                 </button>
               }
               @if (ide.status === 'active' && ide.code_server_url) {
-                <button class="ide-btn" (click)="openIde(ide.code_server_url!)" [title]="'chat.header.ideActiveTooltip' | transloco">
+                <button class="ide-btn" (click)="openCodeServer()" [title]="'chat.header.ideActiveTooltip' | transloco">
                   <app-icon size="sm" class="ide-icon">code</app-icon>
                   {{ 'chat.header.ideButton' | transloco }}
                 </button>
@@ -2050,6 +2062,20 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
 
     openIde(url: string): void {
         window.open(url, '_blank');
+    }
+
+    openCodeServer(): void {
+        // Pre-flight the IDE status through the auth interceptor before opening:
+        // the XHR validates/bumps the BFF session and, on a 401 (idle-expired
+        // session), the interceptor redirects to re-login — so a direct
+        // window.open never dumps raw 401 JSON. Mirrors job-list.component.ts.
+        const threadId = this.chat.threadId();
+        if (!threadId) return;
+        this.api.getThreadIdeStatus(threadId).subscribe(status => {
+            this.ideStatus.set(status);
+            const url = pickCodeServerUrlToOpen(status);
+            if (url) window.open(url, '_blank');
+        });
     }
 
     openSessionFiles(): void {
