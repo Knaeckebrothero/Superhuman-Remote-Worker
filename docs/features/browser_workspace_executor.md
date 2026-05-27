@@ -1,6 +1,6 @@
 # Browser Workspace Executor — Move CDP control onto the workspace
 
-> **Status**: Phases 1+2 implemented + unit-tested (2026-05-25); autonomous mode deprecated (Phase 3 dropped). Pending workspace+agent image rebuild and deploy; not yet exercised end-to-end on the cluster. Phase 4 (remove the 9222 exposure) is blocked on migrating `papers.py` (see §10/R6).
+> **Status**: Phases 1+2 implemented + **validated end-to-end on the dev cluster (2026-05-27)** — navigate / snapshot (persistent) / screenshot / click / shutdown all confirmed against a live workspace pod. Autonomous deprecated (Phase 3 dropped). Cluster validation surfaced **two bugs in the first deployed cut (`sha-310acc2`)**, both fixed + re-validated via a patched copy: (1) browser-use's default launch omits `--no-sandbox` → Chromium can't start in the pod; (2) `DomService.get_serialized_dom_tree()` doesn't populate the session selector map → `click`/`type`/`select` fail with "ref not found". Fix uses `chromium_sandbox=False` + container args, and `get_browser_state_summary()`. **Fix is uncommitted — needs a workspace image rebuild to ship.** Phase 4 (remove the 9222 exposure) still blocked on migrating `papers.py` (see §10/R6).
 > **Created**: 2026-05-25
 > **Trigger**: Remote browser automation is broken cluster-wide (diagnosed from session `b4478b88`). See "Root cause" below.
 >
