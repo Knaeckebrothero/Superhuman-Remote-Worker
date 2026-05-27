@@ -17,6 +17,7 @@ from typing import Any, Optional
 
 from services import resolve_ssh_key_path
 from services.ssh_helpers import stream_extract_snapshot
+from services.workspace_lifecycle import WorkspaceOwner
 
 logger = logging.getLogger(__name__)
 
@@ -180,7 +181,9 @@ class WorkspaceSuspensionService:
                 await self._db.merge_vm_context(job_id, suspended_ctx)
             else:
                 # K8s container (default)
-                await self._container_provisioner.delete_workspace(job_id)
+                await self._container_provisioner.delete_workspace(
+                    WorkspaceOwner.job(job_id)
+                )
                 suspended_ctx.update({"pod_ip": None, "pod_name": None})
                 await self._db.merge_workspace_container_context(job_id, suspended_ctx)
 
@@ -277,7 +280,9 @@ class WorkspaceSuspensionService:
 
             else:
                 # K8s container (default): create a fresh pod
-                ok = await self._container_provisioner.create_workspace(job_id)
+                ok = await self._container_provisioner.create_workspace(
+                    WorkspaceOwner.job(job_id)
+                )
                 if not ok:
                     logger.error("Failed to create pod for restore of job %s", job_id)
                     await self._db.merge_workspace_container_context(
