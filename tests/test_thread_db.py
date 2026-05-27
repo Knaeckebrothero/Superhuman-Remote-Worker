@@ -509,6 +509,108 @@ class TestGetThreadMessagesHistory:
             "created_at",
         }
 
+    @pytest.mark.asyncio
+    async def test_full_load_omits_limit_clause(self):
+        """No limit ⇒ load the entire conversation (the Bug #1 fix)."""
+        conn = _mock_conn()
+        conn.fetch = AsyncMock(return_value=[])
+        db = _make_db_with_conn(conn)
+
+        await db.get_thread_messages_history("tid-1")
+        sql = " ".join(conn.fetch.call_args[0][0].split())
+        assert "LIMIT" not in sql
+        # query + thread_id only — no limit/offset bound params
+        assert len(conn.fetch.call_args[0]) == 2
+
+
+# =============================================================================
+# get_thread_messages_page (cursor paging)
+# =============================================================================
+
+
+class TestGetThreadMessagesPage:
+    """Tests for the cursor-paged get_thread_messages_page method."""
+
+    def _row(self, mid: str, ts):
+        return {
+            "id": UUID(mid),
+            "role": "user",
+            "content": "hi",
+            "tool_calls": None,
+            "turn_number": 1,
+            "metrics": None,
+            "tool_call_id": None,
+            "thinking": None,
+            "created_at": ts,
+        }
+
+    @pytest.mark.asyncio
+    async def test_before_inclusive_desc_reversed_to_asc(self):
+        t_old = datetime(2026, 3, 30, 10, 0, 0, tzinfo=timezone.utc)
+        t_new = datetime(2026, 3, 30, 11, 0, 0, tzinfo=timezone.utc)
+        conn = _mock_conn()
+        # DB returns DESC (newest first); the method must reverse to ascending.
+        conn.fetch = AsyncMock(
+            return_value=[
+                self._row("cccccccc-1111-2222-3333-444444444401", t_new),
+                self._row("cccccccc-1111-2222-3333-444444444402", t_old),
+            ]
+        )
+        db = _make_db_with_conn(conn)
+
+        cursor = datetime(2026, 3, 30, 12, 0, 0, tzinfo=timezone.utc)
+        messages, has_more = await db.get_thread_messages_page(
+            "tid-1", before=cursor, limit=50
+        )
+        sql = " ".join(conn.fetch.call_args[0][0].split())
+        assert "created_at <= $2" in sql
+        assert "ORDER BY created_at DESC" in sql
+        assert has_more is False
+        assert messages[0]["created_at"] == t_old.isoformat()
+        assert messages[1]["created_at"] == t_new.isoformat()
+
+    @pytest.mark.asyncio
+    async def test_before_has_more_drops_probe_row(self):
+        ts = datetime(2026, 3, 30, 10, 0, 0, tzinfo=timezone.utc)
+        rows = [
+            self._row("cccccccc-0000-0000-0000-00000000000%d" % i, ts) for i in range(3)
+        ]
+        conn = _mock_conn()
+        conn.fetch = AsyncMock(return_value=rows)
+        db = _make_db_with_conn(conn)
+
+        messages, has_more = await db.get_thread_messages_page(
+            "tid-1", before=ts, limit=2
+        )
+        sql = " ".join(conn.fetch.call_args[0][0].split())
+        assert "LIMIT $3" in sql  # limit + 1 probe
+        assert conn.fetch.call_args[0][3] == 3  # the limit+1 bound
+        assert has_more is True
+        assert len(messages) == 2
+
+    @pytest.mark.asyncio
+    async def test_after_inclusive_asc_not_reversed(self):
+        t_a = datetime(2026, 3, 30, 10, 0, 0, tzinfo=timezone.utc)
+        t_b = datetime(2026, 3, 30, 11, 0, 0, tzinfo=timezone.utc)
+        conn = _mock_conn()
+        conn.fetch = AsyncMock(
+            return_value=[
+                self._row("cccccccc-1111-2222-3333-44444444440a", t_a),
+                self._row("cccccccc-1111-2222-3333-44444444440b", t_b),
+            ]
+        )
+        db = _make_db_with_conn(conn)
+
+        messages, has_more = await db.get_thread_messages_page(
+            "tid-1", after=t_a, limit=50
+        )
+        sql = " ".join(conn.fetch.call_args[0][0].split())
+        assert "created_at >= $2" in sql
+        assert "ORDER BY created_at ASC" in sql
+        assert has_more is False
+        assert messages[0]["created_at"] == t_a.isoformat()
+        assert messages[1]["created_at"] == t_b.isoformat()
+
 
 # =============================================================================
 # 6.9: get_thread_message_count
