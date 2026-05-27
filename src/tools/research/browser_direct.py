@@ -129,35 +129,38 @@ BROWSER_DIRECT_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
 
 
 async def _local_page_state(session: Any, args: Dict[str, Any]) -> Dict[str, Any]:
-    """Build raw page state (DOM + optional screenshot). No nonce wrap here."""
-    from browser_use.dom.service import DomService
+    """Build raw page state (DOM + optional screenshot). No nonce wrap here.
 
-    dom_service = DomService(browser_session=session)
-    serialized_state, _, _ = await dom_service.get_serialized_dom_tree()
+    Uses get_browser_state_summary so the session selector map is populated
+    for subsequent ref-based actions (click/type/select) — mirrors browser-exec.
+    """
+    include_shot = bool(args.get("include_screenshot"))
+    summary = await session.get_browser_state_summary(include_screenshot=include_shot)
 
-    dom_text = serialized_state.llm_representation()
+    dom_text = summary.dom_state.llm_representation()
     max_chars = int(args.get("max_dom_chars", 40000))
     if len(dom_text) > max_chars:
         dom_text = dom_text[:max_chars] + "\n... (DOM truncated)"
 
     result: Dict[str, Any] = {
-        "url": await session.get_current_page_url(),
-        "title": await session.get_current_page_title(),
+        "url": summary.url,
+        "title": summary.title,
         "dom": dom_text,
     }
 
-    if args.get("include_screenshot"):
-        try:
-            screenshot_bytes = await session.take_screenshot()
-            result["screenshot"] = base64.b64encode(screenshot_bytes).decode()
-        except Exception as e:
-            logger.debug(f"Screenshot failed: {e}")
+    if include_shot and summary.screenshot:
+        result["screenshot"] = summary.screenshot
 
     try:
-        tabs = await session.get_tabs()
+        tabs = summary.tabs
         if tabs and len(tabs) > 1:
             result["tabs"] = [
-                {"id": t.id, "url": t.url, "title": t.title} for t in tabs
+                {
+                    "id": getattr(t, "target_id", getattr(t, "id", None)),
+                    "url": getattr(t, "url", None),
+                    "title": getattr(t, "title", None),
+                }
+                for t in tabs
             ]
     except Exception:
         pass

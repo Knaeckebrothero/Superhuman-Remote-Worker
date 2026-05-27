@@ -93,10 +93,16 @@ class BrowserDaemon:
                 await self._close_session()
 
         Path(PROFILE_DIR).mkdir(parents=True, exist_ok=True)
-        # Mirrors the agent's local-mode launch (context.get_browser_session):
-        # browser-use launches Chromium via Playwright using
-        # PLAYWRIGHT_BROWSERS_PATH. No CDP port, no remote debugging.
-        session = BrowserSession(headless=True, user_data_dir=PROFILE_DIR)
+        # browser-use launches Chromium via Playwright (PLAYWRIGHT_BROWSERS_PATH).
+        # No CDP port, no remote debugging. The workspace pod can't run Chromium's
+        # sandbox (no user namespaces), so disable it and avoid /dev/shm + GPU —
+        # the same flags the old _start_remote_chromium used.
+        session = BrowserSession(
+            headless=True,
+            user_data_dir=PROFILE_DIR,
+            chromium_sandbox=False,
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+        )
         await session.start()
         self._session = session
         log("Chromium session started")
@@ -113,34 +119,39 @@ class BrowserDaemon:
     # ── action handlers (mirror browser_direct.py helpers) ──
 
     async def _page_state(self, session, args: dict) -> dict:
-        from browser_use.dom.service import DomService
+        # get_browser_state_summary builds the DOM, populates the selector map
+        # (so get_element_by_index works for click/type/select), and captures a
+        # screenshot — all in one call. (DomService.get_serialized_dom_tree does
+        # NOT populate the session selector map, which breaks ref-based actions.)
+        include_shot = bool(args.get("include_screenshot"))
+        summary = await session.get_browser_state_summary(
+            include_screenshot=include_shot
+        )
 
-        dom_service = DomService(browser_session=session)
-        serialized_state, _, _ = await dom_service.get_serialized_dom_tree()
-
-        dom_text = serialized_state.llm_representation()
+        dom_text = summary.dom_state.llm_representation()
         max_chars = int(args.get("max_dom_chars", 40000))
         if len(dom_text) > max_chars:
             dom_text = dom_text[:max_chars] + "\n... (DOM truncated)"
 
         result: dict = {
-            "url": await session.get_current_page_url(),
-            "title": await session.get_current_page_title(),
+            "url": summary.url,
+            "title": summary.title,
             "dom": dom_text,
         }
 
-        if args.get("include_screenshot"):
-            try:
-                shot = await session.take_screenshot()
-                result["screenshot"] = base64.b64encode(shot).decode()
-            except Exception as e:
-                log(f"screenshot failed: {e}")
+        if include_shot and summary.screenshot:
+            result["screenshot"] = summary.screenshot  # already base64
 
         try:
-            tabs = await session.get_tabs()
+            tabs = summary.tabs
             if tabs and len(tabs) > 1:
                 result["tabs"] = [
-                    {"id": t.id, "url": t.url, "title": t.title} for t in tabs
+                    {
+                        "id": getattr(t, "target_id", getattr(t, "id", None)),
+                        "url": getattr(t, "url", None),
+                        "title": getattr(t, "title", None),
+                    }
+                    for t in tabs
                 ]
         except Exception:
             pass
