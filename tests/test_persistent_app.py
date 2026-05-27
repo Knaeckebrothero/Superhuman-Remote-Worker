@@ -2472,3 +2472,187 @@ class TestStartStopWatchdogs:
         with patch.object(pa, "_watchdog_tasks", [task]):
             result = await task
         assert result == "completed-normally"
+
+
+# ---------------------------------------------------------------------------
+# WorkspaceNotReady — Task 5: de-race persistent-agent startup
+# ---------------------------------------------------------------------------
+
+
+class TestWorkspaceNotReadyException:
+    """WorkspaceNotReady is a RuntimeError subclass."""
+
+    def test_is_subclass_of_runtime_error(self):
+        from src.api.persistent_app import WorkspaceNotReady
+
+        assert issubclass(WorkspaceNotReady, RuntimeError)
+
+    def test_can_be_caught_as_runtime_error(self):
+        from src.api.persistent_app import WorkspaceNotReady
+
+        with pytest.raises(RuntimeError):
+            raise WorkspaceNotReady("test message")
+
+    def test_message_is_preserved(self):
+        from src.api.persistent_app import WorkspaceNotReady
+
+        exc = WorkspaceNotReady("some message")
+        assert "some message" in str(exc)
+
+
+class TestAttachSessionRaisesWorkspaceNotReady:
+    """_attach_session raises WorkspaceNotReady when _poll_workspace_ready returns None."""
+
+    @pytest.mark.asyncio
+    async def test_raises_workspace_not_ready_when_poll_returns_none(self):
+        from src.api import persistent_app as pa
+        from src.api.persistent_app import WorkspaceNotReady
+
+        mock_client = AsyncMock()
+
+        with patch.object(pa, "_session", None):
+            with patch.object(pa, "_orchestrator_client", mock_client):
+                with patch.object(
+                    pa, "_poll_workspace_ready", new=AsyncMock(return_value=None)
+                ):
+                    with pytest.raises(WorkspaceNotReady):
+                        await pa._attach_session("t1")
+
+    @pytest.mark.asyncio
+    async def test_raises_contains_descriptive_message(self):
+        from src.api import persistent_app as pa
+        from src.api.persistent_app import WorkspaceNotReady
+
+        mock_client = AsyncMock()
+
+        with patch.object(pa, "_session", None):
+            with patch.object(pa, "_orchestrator_client", mock_client):
+                with patch.object(
+                    pa, "_poll_workspace_ready", new=AsyncMock(return_value=None)
+                ):
+                    with pytest.raises(WorkspaceNotReady, match="workspace"):
+                        await pa._attach_session("t1")
+
+    @pytest.mark.asyncio
+    async def test_double_attach_guard_still_raises_plain_runtime_error(self):
+        """The :626 double-attach guard must remain a plain RuntimeError, not WorkspaceNotReady."""
+        from src.api import persistent_app as pa
+        from src.api.persistent_app import WorkspaceNotReady
+
+        mock_session = MagicMock()
+
+        with patch.object(pa, "_session", mock_session):
+            with pytest.raises(RuntimeError) as exc_info:
+                await pa._attach_session("t1")
+        # It must NOT be WorkspaceNotReady
+        assert not isinstance(exc_info.value, WorkspaceNotReady)
+        assert "already attached" in str(exc_info.value)
+
+
+class TestExitWorkspaceNotReadyHelper:
+    """_exit_workspace_not_ready calls os._exit(0) with best-effort deregister."""
+
+    @pytest.mark.asyncio
+    async def test_exit_workspace_not_ready_calls_os_exit_zero(self):
+        """The handler helper invokes os._exit(0)."""
+        from src.api import persistent_app as pa
+        from src.api.persistent_app import WorkspaceNotReady
+
+        mock_client = MagicMock()
+        mock_client.stop_heartbeat = MagicMock()
+        mock_client.deregister = AsyncMock()
+        mock_client.close = AsyncMock()
+
+        exc = WorkspaceNotReady("timed out")
+
+        with patch.object(pa, "_orchestrator_client", mock_client):
+            with patch.object(pa, "_heartbeat_task", None):
+                with patch("os._exit", side_effect=SystemExit(0)) as mock_exit:
+                    with pytest.raises(SystemExit):
+                        await pa._exit_workspace_not_ready("thread-1", exc)
+
+        mock_exit.assert_called_once_with(0)
+
+    @pytest.mark.asyncio
+    async def test_exit_workspace_not_ready_cancels_heartbeat_task(self):
+        """When a heartbeat task exists, it is cancelled during clean exit."""
+        from src.api import persistent_app as pa
+        from src.api.persistent_app import WorkspaceNotReady
+
+        mock_task = MagicMock()
+        mock_client = MagicMock()
+        mock_client.stop_heartbeat = MagicMock()
+        mock_client.deregister = AsyncMock()
+        mock_client.close = AsyncMock()
+
+        exc = WorkspaceNotReady("no workspace")
+
+        with patch.object(pa, "_orchestrator_client", mock_client):
+            with patch.object(pa, "_heartbeat_task", mock_task):
+                with patch("os._exit", side_effect=SystemExit(0)) as mock_exit:
+                    with pytest.raises(SystemExit):
+                        await pa._exit_workspace_not_ready("thread-1", exc)
+
+        mock_task.cancel.assert_called_once()
+        mock_exit.assert_called_once_with(0)
+
+    @pytest.mark.asyncio
+    async def test_exit_workspace_not_ready_attempts_deregister(self):
+        """Best-effort deregister is awaited before os._exit."""
+        from src.api import persistent_app as pa
+        from src.api.persistent_app import WorkspaceNotReady
+
+        deregister = AsyncMock()
+        close = AsyncMock()
+        mock_client = MagicMock()
+        mock_client.stop_heartbeat = MagicMock()
+        mock_client.deregister = deregister
+        mock_client.close = close
+
+        exc = WorkspaceNotReady("no workspace")
+
+        with patch.object(pa, "_orchestrator_client", mock_client):
+            with patch.object(pa, "_heartbeat_task", None):
+                with patch("os._exit", side_effect=SystemExit(0)):
+                    with pytest.raises(SystemExit):
+                        await pa._exit_workspace_not_ready("thread-1", exc)
+
+        deregister.assert_awaited_once()
+        close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_exit_workspace_not_ready_no_client_still_exits(self):
+        """Even without an orchestrator client, os._exit(0) is called."""
+        from src.api import persistent_app as pa
+        from src.api.persistent_app import WorkspaceNotReady
+
+        exc = WorkspaceNotReady("no workspace")
+
+        with patch.object(pa, "_orchestrator_client", None):
+            with patch.object(pa, "_heartbeat_task", None):
+                with patch("os._exit", side_effect=SystemExit(0)) as mock_exit:
+                    with pytest.raises(SystemExit):
+                        await pa._exit_workspace_not_ready("thread-1", exc)
+
+        mock_exit.assert_called_once_with(0)
+
+    @pytest.mark.asyncio
+    async def test_exit_workspace_not_ready_deregister_failure_still_exits(self):
+        """A deregister exception is swallowed; os._exit(0) is still called."""
+        from src.api import persistent_app as pa
+        from src.api.persistent_app import WorkspaceNotReady
+
+        mock_client = MagicMock()
+        mock_client.stop_heartbeat = MagicMock()
+        mock_client.deregister = AsyncMock(side_effect=RuntimeError("network error"))
+        mock_client.close = AsyncMock()
+
+        exc = WorkspaceNotReady("no workspace")
+
+        with patch.object(pa, "_orchestrator_client", mock_client):
+            with patch.object(pa, "_heartbeat_task", None):
+                with patch("os._exit", side_effect=SystemExit(0)) as mock_exit:
+                    with pytest.raises(SystemExit):
+                        await pa._exit_workspace_not_ready("thread-1", exc)
+
+        mock_exit.assert_called_once_with(0)
