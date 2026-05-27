@@ -13,7 +13,7 @@ import logging
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, NoReturn, Optional
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
@@ -147,6 +147,15 @@ _NOTIFICATION_METHODS = frozenset(
         "ready",
     }
 )
+
+
+class WorkspaceNotReady(RuntimeError):
+    """The session's workspace container never became ready in time.
+
+    Subclasses RuntimeError so existing ``except RuntimeError`` handlers (e.g.
+    the pool-mode /session/attach path) keep catching it, while the lifespan
+    startup can catch it specifically to exit cleanly instead of crash-looping.
+    """
 
 
 async def _ensure_nats_client():
@@ -390,6 +399,33 @@ def _get_agent_metrics() -> Optional[Dict[str, Any]]:
         return None
 
 
+async def _exit_workspace_not_ready(thread_id: str, exc: WorkspaceNotReady) -> NoReturn:
+    """Handle WorkspaceNotReady during lifespan startup: best-effort deregister then exit.
+
+    Exits the process with status 0 (pod Completed, not Failed) so Kubernetes
+    does not restart-loop the pod.  The orchestrator's session reconciler will
+    recover the workspace and bind a fresh agent on the next interaction.
+    """
+    logger.info(
+        "Workspace not ready for thread %s (%s) — exiting cleanly so the "
+        "orchestrator can rebind once the workspace recovers (not a crash).",
+        thread_id,
+        exc,
+    )
+    if _orchestrator_client:
+        try:
+            _orchestrator_client.stop_heartbeat()
+            if _heartbeat_task:
+                _heartbeat_task.cancel()
+            await _orchestrator_client.deregister()
+            await _orchestrator_client.close()
+        except Exception as de:
+            logger.warning(
+                "Best-effort deregister on workspace-not-ready failed: %s", de
+            )
+    os._exit(0)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize persistent agent, register with orchestrator, start heartbeat."""
@@ -495,7 +531,12 @@ async def lifespan(app: FastAPI):
 
             _thread_id = str(uuid.uuid4())
 
-        await _attach_session(_thread_id)
+        try:
+            await _attach_session(_thread_id)
+        except WorkspaceNotReady as e:
+            # Workspace raced us / is wedged: exit cleanly (status 0) instead of
+            # crashing, so K8s doesn't restart-loop. See _exit_workspace_not_ready.
+            await _exit_workspace_not_ready(_thread_id, e)
     elif _thread_id and not dedicated_register_ok:
         logger.info(
             "Skipping session attach for thread %s — orchestrator refused "
@@ -641,7 +682,7 @@ async def _attach_session(
                 f"Workspace container ready: {workspace_override['remote']['host']}"
             )
         else:
-            raise RuntimeError(
+            raise WorkspaceNotReady(
                 "No workspace container provisioned for thread. "
                 "Cannot attach session without an isolated workspace."
             )
