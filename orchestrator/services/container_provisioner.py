@@ -20,6 +20,8 @@ import logging
 import os
 from typing import Any, Optional
 
+from services.workspace_lifecycle import WorkspaceOwner
+
 logger = logging.getLogger(__name__)
 
 try:
@@ -152,17 +154,17 @@ class ContainerProvisioner:
 
     async def create_workspace(
         self,
-        job_id: str,
+        owner: WorkspaceOwner,
         cpu: str = "500m",
         memory: str = "1Gi",
         cpu_limit: str = "2000m",
         memory_limit: str = "4Gi",
         image: Optional[str] = None,
     ) -> bool:
-        """Create a workspace container for a job.
+        """Create a workspace container for a job or persistent thread.
 
         Args:
-            job_id: Job UUID.
+            owner: WorkspaceOwner identifying the job or session.
             cpu: CPU request.
             memory: Memory request.
             cpu_limit: CPU limit.
@@ -175,15 +177,17 @@ class ContainerProvisioner:
         if not self._k8s_available:
             return False
 
-        pod_name = f"workspace-{job_id[:12]}"
+        pod_name = owner.pod_name
         workspace_image = image or self._workspace_image
-        network_tier = await self._resolve_network_tier(job_id, kind="job")
+        network_tier = await self._resolve_network_tier(
+            owner.id, kind=owner.network_tier_kind
+        )
 
         # emptyDir by default — storage dies with the pod, no cleanup needed.
-        # Each job gets a fresh container; isolation is the pod boundary.
+        # Each job/session gets a fresh container; isolation is the pod boundary.
         pod_manifest = self._build_pod_manifest(
             pod_name=pod_name,
-            job_id=job_id,
+            owner=owner,
             image=workspace_image,
             cpu=cpu,
             memory=memory,
@@ -198,9 +202,14 @@ class ContainerProvisioner:
                 namespace=self._namespace,
                 body=pod_manifest,
             )
-            logger.info("Workspace container created: %s (job %s)", pod_name, job_id)
+            logger.info(
+                "Workspace container created: %s (%s %s)",
+                pod_name,
+                owner.kind,
+                owner.id,
+            )
             await self._set_context(
-                job_id,
+                owner,
                 {
                     "status": "created",
                     "pod_name": pod_name,
@@ -212,36 +221,41 @@ class ContainerProvisioner:
             pod_ip = await self._wait_for_ready(pod_name, timeout=120)
             if pod_ip:
                 await self._set_context(
-                    job_id,
+                    owner,
                     {"status": "ready", "pod_ip": pod_ip, "port": 30022},
                 )
                 logger.info(
-                    "Workspace container ready: %s @ %s (job %s)",
+                    "Workspace container ready: %s @ %s (%s %s)",
                     pod_name,
                     pod_ip,
-                    job_id,
+                    owner.kind,
+                    owner.id,
                 )
             else:
                 logger.warning(
-                    "Workspace container created but not ready within timeout: %s (job %s)",
+                    "Workspace container created but not ready within timeout: %s (%s %s)",
                     pod_name,
-                    job_id,
+                    owner.kind,
+                    owner.id,
                 )
-                await self._set_context(job_id, {"status": "creating"})
+                await self._set_context(owner, {"status": "creating"})
 
             return True
         except Exception as e:
             logger.error(
-                "Failed to create workspace container for job %s: %s", job_id, e
+                "Failed to create workspace container for %s %s: %s",
+                owner.kind,
+                owner.id,
+                e,
             )
             await self._set_context(
-                job_id,
+                owner,
                 {"status": "failed", "error": str(e)},
             )
             return False
 
-    async def delete_workspace(self, job_id: str) -> bool:
-        """Delete the workspace container for a job.
+    async def delete_workspace(self, owner: WorkspaceOwner) -> bool:
+        """Delete the workspace container for a job or persistent thread.
 
         Returns:
             True if deleted, False otherwise.
@@ -249,7 +263,7 @@ class ContainerProvisioner:
         if not self._k8s_available:
             return False
 
-        pod_name = f"workspace-{job_id[:12]}"
+        pod_name = owner.pod_name
 
         try:
             await asyncio.to_thread(
@@ -258,31 +272,43 @@ class ContainerProvisioner:
                 namespace=self._namespace,
                 grace_period_seconds=10,
             )
-            logger.info("Workspace container deleted: %s (job %s)", pod_name, job_id)
-            await self._set_context(job_id, {"status": "deleted"})
+            logger.info(
+                "Workspace container deleted: %s (%s %s)",
+                pod_name,
+                owner.kind,
+                owner.id,
+            )
+            await self._set_context(owner, {"status": "deleted"})
             return True
         except Exception as e:
             # 404 is fine — pod already gone
             if hasattr(e, "status") and e.status == 404:
                 logger.debug(
-                    "Workspace container already deleted: %s (job %s)",
+                    "Workspace container already deleted: %s (%s %s)",
                     pod_name,
-                    job_id,
+                    owner.kind,
+                    owner.id,
                 )
                 return True
             logger.error(
-                "Failed to delete workspace container for job %s: %s", job_id, e
+                "Failed to delete workspace container for %s %s: %s",
+                owner.kind,
+                owner.id,
+                e,
             )
             return False
 
-    async def delete_workspace_pvc(self, job_id: str) -> bool:
-        """Delete the PVC for a job workspace if one exists.
+    async def delete_workspace_pvc(self, owner: WorkspaceOwner) -> bool:
+        """Delete the PVC for a job or thread workspace if one exists.
 
         With emptyDir (default), there is no PVC — storage dies with the pod.
         This method is kept for backward compatibility: it cleans up PVCs
         from workspaces created before the emptyDir switch.
         """
-        pvc_name = f"pvc-workspace-{job_id[:12]}"
+        if owner.kind == "job":
+            pvc_name = f"pvc-workspace-{owner.id[:12]}"
+        else:
+            pvc_name = f"pvc-ws-thread-{owner.id[:12]}"
         return await self._delete_pvc(pvc_name)
 
     async def release_workspace(self, job_id: str) -> bool:
@@ -294,8 +320,9 @@ class ContainerProvisioner:
         Returns:
             True if deletion succeeded (snapshot failure is non-fatal).
         """
+        owner = WorkspaceOwner.job(job_id)
         # Get pod IP for SSH-based snapshot
-        status = await self.get_workspace_status(job_id)
+        status = await self.get_workspace_status(owner)
         if (
             self._snapshot_service
             and self._snapshot_service.is_available
@@ -318,8 +345,8 @@ class ContainerProvisioner:
                     "Workspace snapshot failed for job %s — deleting anyway", job_id
                 )
 
-        deleted = await self.delete_workspace(job_id)
-        await self.delete_workspace_pvc(job_id)
+        deleted = await self.delete_workspace(owner)
+        await self.delete_workspace_pvc(owner)
         return deleted
 
     async def release_thread_workspace(self, thread_id: str) -> bool:
@@ -331,7 +358,7 @@ class ContainerProvisioner:
         if not self._k8s_available:
             return False
 
-        pod_name = f"ws-thread-{thread_id[:12]}"
+        pod_name = WorkspaceOwner.session(thread_id).pod_name
 
         # Get pod IP for snapshot
         try:
@@ -376,7 +403,7 @@ class ContainerProvisioner:
         await self.delete_thread_workspace_pvc(thread_id)
         return deleted
 
-    async def get_workspace_status(self, job_id: str) -> Optional[dict]:
+    async def get_workspace_status(self, owner: WorkspaceOwner) -> Optional[dict]:
         """Query the workspace container status.
 
         Returns:
@@ -385,7 +412,7 @@ class ContainerProvisioner:
         if not self._k8s_available:
             return None
 
-        pod_name = f"workspace-{job_id[:12]}"
+        pod_name = owner.pod_name
 
         try:
             pod = await asyncio.to_thread(
@@ -401,7 +428,7 @@ class ContainerProvisioner:
                 ready = all(cs.ready for cs in pod.status.container_statuses)
 
             return {
-                "job_id": job_id,
+                "owner_id": owner.id,
                 "pod_name": pod_name,
                 "phase": phase,
                 "pod_ip": pod_ip,
@@ -410,7 +437,12 @@ class ContainerProvisioner:
         except Exception as e:
             if hasattr(e, "status") and e.status == 404:
                 return None
-            logger.debug("Workspace status query failed for job %s: %s", job_id, e)
+            logger.debug(
+                "Workspace status query failed for %s %s: %s",
+                owner.kind,
+                owner.id,
+                e,
+            )
             return None
 
     # =========================================================================
@@ -447,7 +479,7 @@ class ContainerProvisioner:
 
         pod_manifest = self._build_pod_manifest(
             pod_name=pod_name,
-            job_id=job_id,
+            owner=WorkspaceOwner.job(job_id),
             image=self._workspace_image,
             cpu=cpu,
             memory=memory,
@@ -585,12 +617,12 @@ class ContainerProvisioner:
             return False
 
     def _build_workspace_labels(
-        self, job_id: str, network_tier: str = DEFAULT_NETWORK_TIER
+        self, owner: WorkspaceOwner, network_tier: str = DEFAULT_NETWORK_TIER
     ) -> dict[str, str]:
         labels = {
             "app": "srw-workspace",
-            "srw/job-id": job_id,
-            "srw/component": "workspace",
+            owner.label_key: owner.id,
+            "srw/component": owner.component_label,
             # Fleet-wide selector shared with KubeVirt VM workspaces.
             # See docs/features/workspace_network_policy_unification.md
             "srw.io/component": "agent-workspace",
@@ -630,7 +662,7 @@ class ContainerProvisioner:
     def _build_pod_manifest(
         self,
         pod_name: str,
-        job_id: str,
+        owner: WorkspaceOwner,
         image: str,
         cpu: str,
         memory: str,
@@ -646,7 +678,7 @@ class ContainerProvisioner:
             "metadata": {
                 "name": pod_name,
                 "namespace": self._namespace,
-                "labels": self._build_workspace_labels(job_id, network_tier),
+                "labels": self._build_workspace_labels(owner, network_tier),
             },
             "spec": {
                 "restartPolicy": "Never",
@@ -789,169 +821,42 @@ class ContainerProvisioner:
 
         return None
 
-    async def _set_context(self, job_id: str, updates: dict) -> None:
-        """Atomically merge updates into the job's context.workspace_container key."""
+    async def _set_context(self, owner: WorkspaceOwner, updates: dict) -> None:
+        """Atomically merge updates into the workspace context for a job or session."""
         if not self._db:
             return
 
         try:
-            await self._db.merge_workspace_container_context(job_id, updates)
+            if owner.kind == "job":
+                await self._db.merge_workspace_container_context(owner.id, updates)
+            else:
+                await self._db.merge_thread_workspace_context(owner.id, updates)
         except Exception:
             logger.exception(
-                "Failed to update workspace container context for job %s",
-                job_id,
+                "Failed to update workspace container context for %s %s",
+                owner.kind,
+                owner.id,
             )
 
     # =========================================================================
-    # Thread workspace (persistent agent sessions)
+    # Thread workspace shims (unmigrated callers keep working until Task 6)
     # =========================================================================
 
-    async def create_thread_workspace(
-        self,
-        thread_id: str,
-        cpu: str = "500m",
-        memory: str = "1Gi",
-        cpu_limit: str = "2000m",
-        memory_limit: str = "4Gi",
-        image: Optional[str] = None,
-    ) -> bool:
-        """Create a workspace container for a persistent thread.
-
-        Same as create_workspace() but stores context in threads.metadata
-        instead of jobs.context.
-
-        Args:
-            thread_id: Thread UUID.
-            cpu: CPU request.
-            memory: Memory request.
-            cpu_limit: CPU limit.
-            memory_limit: Memory limit.
-            image: Workspace image override.
-
-        Returns:
-            True if pod creation succeeded, False otherwise.
-        """
-        if not self._k8s_available:
-            return False
-
-        pod_name = f"ws-thread-{thread_id[:12]}"
-        workspace_image = image or self._workspace_image
-        network_tier = await self._resolve_network_tier(thread_id, kind="thread")
-
-        # emptyDir by default — storage dies with the pod, no cleanup needed.
-        # Each session gets a fresh container; isolation is the pod boundary.
-        pod_manifest = self._build_pod_manifest(
-            pod_name=pod_name,
-            job_id=thread_id,  # Reuse job_id label slot for thread_id
-            image=workspace_image,
-            cpu=cpu,
-            memory=memory,
-            cpu_limit=cpu_limit,
-            memory_limit=memory_limit,
-            network_tier=network_tier,
-        )
-
-        # Override labels for thread identification
-        pod_manifest["metadata"]["labels"]["srw/thread-id"] = thread_id
-        pod_manifest["metadata"]["labels"]["srw/component"] = "thread-workspace"
-
-        try:
-            await asyncio.to_thread(
-                self._core_api.create_namespaced_pod,
-                namespace=self._namespace,
-                body=pod_manifest,
-            )
-            logger.info("Thread workspace created: %s (thread %s)", pod_name, thread_id)
-            await self._set_thread_context(
-                thread_id,
-                {
-                    "status": "created",
-                    "pod_name": pod_name,
-                    "namespace": self._namespace,
-                },
-            )
-
-            pod_ip = await self._wait_for_ready(pod_name, timeout=120)
-            if pod_ip:
-                await self._set_thread_context(
-                    thread_id,
-                    {"status": "ready", "pod_ip": pod_ip, "port": 30022},
-                )
-                logger.info(
-                    "Thread workspace ready: %s @ %s (thread %s)",
-                    pod_name,
-                    pod_ip,
-                    thread_id,
-                )
-            else:
-                logger.warning(
-                    "Thread workspace not ready within timeout: %s (thread %s)",
-                    pod_name,
-                    thread_id,
-                )
-                await self._set_thread_context(thread_id, {"status": "creating"})
-
-            return True
-        except Exception as e:
-            logger.error("Failed to create thread workspace for %s: %s", thread_id, e)
-            await self._set_thread_context(
-                thread_id,
-                {"status": "failed", "error": str(e)},
-            )
-            return False
+    async def create_thread_workspace(self, thread_id: str, **kw) -> bool:
+        """Shim: delegate to create_workspace(WorkspaceOwner.session(thread_id))."""
+        return await self.create_workspace(WorkspaceOwner.session(thread_id), **kw)
 
     async def delete_thread_workspace(self, thread_id: str) -> bool:
-        """Delete the workspace container for a persistent thread.
-
-        Returns:
-            True if deleted, False otherwise.
-        """
-        if not self._k8s_available:
-            return False
-
-        pod_name = f"ws-thread-{thread_id[:12]}"
-
-        try:
-            await asyncio.to_thread(
-                self._core_api.delete_namespaced_pod,
-                name=pod_name,
-                namespace=self._namespace,
-                grace_period_seconds=10,
-            )
-            logger.info("Thread workspace deleted: %s (thread %s)", pod_name, thread_id)
-            await self._set_thread_context(thread_id, {"status": "deleted"})
-            return True
-        except Exception as e:
-            if hasattr(e, "status") and e.status == 404:
-                logger.debug(
-                    "Thread workspace already deleted: %s (thread %s)",
-                    pod_name,
-                    thread_id,
-                )
-                return True
-            logger.error("Failed to delete thread workspace for %s: %s", thread_id, e)
-            return False
+        """Shim: delegate to delete_workspace(WorkspaceOwner.session(thread_id))."""
+        return await self.delete_workspace(WorkspaceOwner.session(thread_id))
 
     async def delete_thread_workspace_pvc(self, thread_id: str) -> bool:
-        """Delete the PVC for a thread workspace if one exists.
-
-        With emptyDir (default), there is no PVC — storage dies with the pod.
-        Kept for backward compatibility with existing PVCs.
-        """
-        pvc_name = f"pvc-ws-thread-{thread_id[:12]}"
-        return await self._delete_pvc(pvc_name)
+        """Shim: delegate to delete_workspace_pvc(WorkspaceOwner.session(thread_id))."""
+        return await self.delete_workspace_pvc(WorkspaceOwner.session(thread_id))
 
     async def _set_thread_context(self, thread_id: str, updates: dict) -> None:
-        """Atomically merge updates into thread's metadata.workspace_container."""
-        if not self._db:
-            return
-
-        try:
-            await self._db.merge_thread_workspace_context(thread_id, updates)
-        except Exception:
-            logger.exception(
-                "Failed to update thread workspace context for %s", thread_id
-            )
+        """Shim: delegate to _set_context(WorkspaceOwner.session(thread_id))."""
+        await self._set_context(WorkspaceOwner.session(thread_id), updates)
 
 
 # Module-level singleton
