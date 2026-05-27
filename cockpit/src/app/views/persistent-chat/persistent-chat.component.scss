@@ -845,6 +845,28 @@
         white-space: nowrap;
       }
 
+      /* Compaction summary — expandable under the divider banner. */
+      .compaction-summary {
+        max-width: 80%;
+        margin: 0 auto 8px;
+        font-size: 12px;
+      }
+      .compaction-summary > summary {
+        cursor: pointer;
+        text-align: center;
+        font-size: 10px;
+        color: var(--text-muted);
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+      }
+      .compaction-summary-body {
+        margin-top: 6px;
+        padding: 8px 10px;
+        white-space: pre-wrap;
+        border-left: 2px solid var(--border, var(--surface-1));
+        border-radius: var(--radius-tag);
+      }
+
       @keyframes spin {
         to { transform: rotate(360deg); }
       }

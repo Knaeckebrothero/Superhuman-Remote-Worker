@@ -882,6 +882,10 @@
       "resuming": "Wird fortgesetzt...",
       "resumeFailed": "Sitzung konnte nicht fortgesetzt werden"
     },
+    "compaction": {
+      "banner": "Kontext zusammengefasst",
+      "viewSummary": "Zusammenfassung anzeigen"
+    },
     "empty": {
       "title": "Was wollen wir heute erobern?",
       "subtitle": "Der Agent ist verbunden und bereit. Stelle eine Aufgabe oder wähle unten einen Startpunkt."

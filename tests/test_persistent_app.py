@@ -978,7 +978,7 @@ class TestHandleCompact:
 
     @pytest.mark.asyncio
     async def test_sends_compacted_event_with_counts(self):
-        """Sends context.compacted event with before/after/focus."""
+        """Sends context.compacted event with before/after/trigger."""
         ws = AsyncMock()
         mock_session = MagicMock()
         mock_session.messages = [
@@ -1004,7 +1004,41 @@ class TestHandleCompact:
         assert compacted_call is not None
         assert compacted_call["params"]["before"] == 2
         assert compacted_call["params"]["after"] == 1
-        assert compacted_call["params"]["focus"] == "my focus"
+        assert compacted_call["params"]["trigger"] == "manual"
+
+    @pytest.mark.asyncio
+    async def test_persists_summary_marker_when_summary_present(self):
+        """A 'summary' compaction persists a display-only role='summary' row."""
+        ws = AsyncMock()
+        mock_session = MagicMock()
+        mock_session.messages = [
+            SystemMessage(content="sys"),
+            HumanMessage(content="q"),
+        ]
+        mock_session.turn_count = 7
+        mock_session.context_manager.summarize_and_compact = AsyncMock(
+            return_value=[
+                SystemMessage(content="sys"),
+                SystemMessage(content="[Summary of prior work]\nWe did X and Y."),
+            ]
+        )
+        mock_session.config.context_management.max_summary_length = 10000
+        mock_session.workspace_manager = None
+        mock_client = AsyncMock()
+
+        with (
+            patch("src.api.persistent_app._session", mock_session),
+            patch("src.api.persistent_app._orchestrator_client", mock_client),
+            patch("src.api.persistent_app._thread_id", "tid-1"),
+        ):
+            await _handle_compact(ws, "")
+
+        mock_client.save_thread_message.assert_awaited_once()
+        kwargs = mock_client.save_thread_message.call_args.kwargs
+        assert kwargs["role"] == "summary"
+        assert "We did X and Y." in kwargs["content"]
+        assert kwargs["turn_number"] == 7
+        assert kwargs["metrics"]["trigger"] == "manual"
 
     @pytest.mark.asyncio
     async def test_git_commit_and_push_on_compaction(self):

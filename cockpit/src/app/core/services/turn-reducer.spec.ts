@@ -505,3 +505,28 @@ describe('turn-reducer — replay idempotency', () => {
         expect(turn.status).toBe('done');
     });
 });
+
+describe('turn-reducer — add_compaction', () => {
+    it('appends a compaction banner turn', () => {
+        const state = play([
+            {type: 'user_message', id: 'u1', content: 'hi', timestamp: 100},
+            {type: 'add_compaction', id: 'compaction-3', summary: 'We did X.', timestamp: 200},
+        ]);
+        expect(state.turns).toHaveLength(2);
+        const c = state.turns[1];
+        expect(c.kind).toBe('compaction');
+        expect(c.id).toBe('compaction-3');
+        if (c.kind === 'compaction') expect(c.summary).toBe('We did X.');
+    });
+
+    it('is idempotent by id (replay replaces, no duplicate)', () => {
+        const state = play([
+            {type: 'add_compaction', id: 'compaction-3', summary: 'first', timestamp: 200},
+            {type: 'add_compaction', id: 'compaction-3', summary: 'updated', timestamp: 200},
+        ]);
+        expect(state.turns).toHaveLength(1);
+        const c = state.turns[0];
+        expect(c.kind).toBe('compaction');
+        if (c.kind === 'compaction') expect(c.summary).toBe('updated');
+    });
+});
