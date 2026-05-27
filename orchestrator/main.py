@@ -10673,7 +10673,7 @@ async def agent_create_thread(
                 thread_id, {"status": "pending"}
             )
             asyncio.create_task(
-                container_provisioner.create_thread_workspace(thread_id)
+                container_provisioner.create_workspace(WorkspaceOwner.session(thread_id))
             )
 
         return {"thread_id": thread_id, "status": "created"}
@@ -11676,7 +11676,7 @@ async def create_thread(
 
             # Kubernetes mode: create pod on demand
             async def _provision_thread_workspace(tid: str) -> None:
-                ok = await container_provisioner.create_thread_workspace(tid)
+                ok = await container_provisioner.create_workspace(WorkspaceOwner.session(tid))
                 if not ok:
                     logger.error(
                         "Thread %s: workspace container provisioning failed. "

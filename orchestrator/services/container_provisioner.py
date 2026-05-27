@@ -358,7 +358,8 @@ class ContainerProvisioner:
         if not self._k8s_available:
             return False
 
-        pod_name = WorkspaceOwner.session(thread_id).pod_name
+        owner = WorkspaceOwner.session(thread_id)
+        pod_name = owner.pod_name
 
         # Get pod IP for snapshot
         try:
@@ -399,8 +400,8 @@ class ContainerProvisioner:
                     thread_id,
                 )
 
-        deleted = await self.delete_thread_workspace(thread_id)
-        await self.delete_thread_workspace_pvc(thread_id)
+        deleted = await self.delete_workspace(owner)
+        await self.delete_workspace_pvc(owner)
         return deleted
 
     async def get_workspace_status(self, owner: WorkspaceOwner) -> Optional[dict]:
@@ -837,26 +838,6 @@ class ContainerProvisioner:
                 owner.kind,
                 owner.id,
             )
-
-    # =========================================================================
-    # Thread workspace shims (unmigrated callers keep working until Task 6)
-    # =========================================================================
-
-    async def create_thread_workspace(self, thread_id: str, **kw) -> bool:
-        """Shim: delegate to create_workspace(WorkspaceOwner.session(thread_id))."""
-        return await self.create_workspace(WorkspaceOwner.session(thread_id), **kw)
-
-    async def delete_thread_workspace(self, thread_id: str) -> bool:
-        """Shim: delegate to delete_workspace(WorkspaceOwner.session(thread_id))."""
-        return await self.delete_workspace(WorkspaceOwner.session(thread_id))
-
-    async def delete_thread_workspace_pvc(self, thread_id: str) -> bool:
-        """Shim: delegate to delete_workspace_pvc(WorkspaceOwner.session(thread_id))."""
-        return await self.delete_workspace_pvc(WorkspaceOwner.session(thread_id))
-
-    async def _set_thread_context(self, thread_id: str, updates: dict) -> None:
-        """Shim: delegate to _set_context(WorkspaceOwner.session(thread_id))."""
-        await self._set_context(WorkspaceOwner.session(thread_id), updates)
 
 
 # Module-level singleton
