@@ -258,6 +258,40 @@ export class PersistentChatService {
     readonly isInterrupting = signal(false);
     readonly historyLoaded = signal(false);
 
+    // --- Render windowing (display-only) ---
+    // The full conversation lives in `turns`; the component renders only the
+    // most recent `windowSize` turns so the DOM stays bounded on long threads
+    // (a single thread can be 800+ turns). `loadOlderTurns` widens the window on
+    // scroll-up; `growWindow` keeps the visible top anchored when new turns
+    // stream in below a scrolled-away user; `resetWindow` re-bounds the DOM on
+    // (re)load and once the user is back at the bottom.
+    private readonly DEFAULT_WINDOW = 50;
+    private readonly WINDOW_STEP = 50;
+    readonly windowSize = signal(this.DEFAULT_WINDOW);
+    readonly visibleTurns = computed(() => {
+        const all = this.turns();
+        const n = this.windowSize();
+        return all.length <= n ? all : all.slice(-n);
+    });
+    readonly hasOlderTurns = computed(() => this.turns().length > this.windowSize());
+
+    /** Widen the render window toward the start of the conversation. */
+    loadOlderTurns(): void {
+        this.windowSize.update((n) =>
+            Math.min(n + this.WINDOW_STEP, this.turns().length),
+        );
+    }
+
+    /** Anchor the visible top while turns stream in below a scrolled-away user. */
+    growWindow(delta: number): void {
+        if (delta > 0) this.windowSize.update((n) => n + delta);
+    }
+
+    /** Re-bound the DOM to the most recent window (on (re)load / back at bottom). */
+    resetWindow(): void {
+        this.windowSize.set(this.DEFAULT_WINDOW);
+    }
+
     // --- Permission state ---
     readonly permissionMode = signal<PermissionMode>('supervised');
     readonly pendingPermission = signal<PermissionRequest | null>(null);
@@ -458,6 +492,7 @@ export class PersistentChatService {
             if (resp.messages?.length) {
                 const turns = historyToTurns(resp.messages);
                 this.dispatch({type: 'load_history', threadId, turns});
+                this.resetWindow(); // render the tail after a (re)load
             }
             this.historyLoaded.set(true);
         } catch {

@@ -1,4 +1,5 @@
 import {
+    afterNextRender,
     AfterViewChecked,
     Component,
     computed,
@@ -6,6 +7,7 @@ import {
     ElementRef,
     HostListener,
     inject,
+    Injector,
     OnDestroy,
     OnInit,
     signal,
@@ -504,7 +506,7 @@ export function pickRunningCommandCard(
 
       <!-- Messages -->
       <div class="messages" #messagesContainer (scroll)="onMessagesScroll()">
-        @for (turn of chat.turns(); track turn.id; let isLast = $last) {
+        @for (turn of chat.visibleTurns(); track turn.id; let isLast = $last) {
           @switch (turn.kind) {
             @case ('system') {
               <div class="message message-system">
@@ -1091,6 +1093,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     private readonly router = inject(Router);
     private readonly toast = inject(AppToastService);
     private readonly errors = inject(ErrorMessageService);
+    private readonly injector = inject(Injector);
 
     /**
      * The running-command card to show on (re)attach (or null). Surfaces the
@@ -1268,6 +1271,8 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
 
     private autoScroll = true;
     private lastSeenMessageCount = 0;
+    /** Suppresses the scroll handler while restoring position after prepending older turns. */
+    private isRestoringScroll = false;
 
     constructor() {
         // Start/stop IDE polling when connection state changes
@@ -1318,6 +1323,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
             } else if (away && len > this.lastSeenMessageCount) {
                 const delta = len - this.lastSeenMessageCount;
                 this.newMessageCount.update(n => n + delta);
+                this.chat.growWindow(delta); // anchor the visible top while scrolled away
             } else if (!away) {
                 this.newMessageCount.set(0);
             }
@@ -1895,12 +1901,19 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     onMessagesScroll(): void {
         const el = this.messagesContainer?.nativeElement;
         if (!el) return;
+        // Ignore the programmatic scroll we trigger while restoring position.
+        if (this.isRestoringScroll) return;
+        // Near the top → widen the window toward older history (scroll-preserving).
+        if (el.scrollTop < 120 && this.chat.hasOlderTurns()) {
+            this.loadOlderHistory();
+        }
         // If user is within 80px of the bottom, re-enable auto-scroll; otherwise pause it.
         const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
         this.autoScroll = nearBottom;
         this.scrolledAway.set(!nearBottom);
         if (nearBottom) {
             this.newMessageCount.set(0);
+            this.chat.resetWindow(); // re-bound the DOM once back at the bottom
         }
     }
 
@@ -1908,8 +1921,35 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         this.autoScroll = true;
         this.scrolledAway.set(false);
         this.newMessageCount.set(0);
+        this.chat.resetWindow();
         this.lastSeenMessageCount = this.chat.turns().length;
         this.scrollToBottom();
+    }
+
+    /**
+     * Widen the render window toward older history, preserving scroll position
+     * so the viewport doesn't jump when older turns are prepended. The window
+     * grows over the already-loaded conversation (no network call) — the
+     * scroll-delta restore is salvaged from Advanced-LLM-Chat's scroll solution.
+     */
+    private loadOlderHistory(): void {
+        const el = this.messagesContainer?.nativeElement;
+        if (!el) return;
+        const prevHeight = el.scrollHeight;
+        const prevTop = el.scrollTop;
+        this.isRestoringScroll = true;
+        this.chat.loadOlderTurns();
+        afterNextRender(
+            () => {
+                const cur = this.messagesContainer?.nativeElement;
+                if (cur) {
+                    cur.scrollTop = prevTop + (cur.scrollHeight - prevHeight);
+                }
+                // Release after the synthetic scroll event has fired and been ignored.
+                setTimeout(() => (this.isRestoringScroll = false), 50);
+            },
+            {injector: this.injector},
+        );
     }
 
     selectSlashCommand(cmd: SlashCommand): void {
@@ -2163,7 +2203,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
      * the boundary between session reload and live activity.
      */
     showSessionDividerAfter(turn: Turn, index: number): boolean {
-        const next = this.chat.turns()[index + 1];
+        const next = this.chat.visibleTurns()[index + 1];
         if (!next) return false;
         const turnHistorical = (turn.kind === 'assistant' || turn.kind === 'user') && !!turn.historical;
         const nextHistorical = (next.kind === 'assistant' || next.kind === 'user') && !!next.historical;
