@@ -192,6 +192,7 @@ from services.builder_dispatch import execute_server_tool as _dispatch_server_to
 from services.nats_bridge import nats_bridge  # noqa: E402
 from services.vm_provisioner import vm_provisioner  # noqa: E402
 from services.container_provisioner import container_provisioner  # noqa: E402
+from services.workspace_lifecycle import WorkspaceOwner  # noqa: E402
 from services.docker_provisioner import docker_provisioner  # noqa: E402
 from services.persistent_provisioner import persistent_provisioner  # noqa: E402
 from services.agent_provisioner import agent_provisioner  # noqa: E402
@@ -2142,7 +2143,7 @@ async def _try_dispatch_pending_jobs() -> None:
                                 "container", {}
                             )
                             ok = await container_provisioner.create_workspace(
-                                job_id=job_id,
+                                WorkspaceOwner.job(job_id),
                                 cpu=ws_cfg.get("cpu", "500m"),
                                 memory=ws_cfg.get("memory", "1Gi"),
                                 cpu_limit=ws_cfg.get("cpu_limit", "2000m"),

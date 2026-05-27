@@ -17,6 +17,7 @@ from orchestrator.services.lifecycle import (
     WorkspaceInstanceManager,
     expected_workspace_shas,
 )
+from services.workspace_lifecycle import WorkspaceOwner
 
 
 # =============================================================================
@@ -365,7 +366,7 @@ class TestDrain:
             metadata={"labels": {"srw/job-id": "job1"}},
         )
         await mgr.drain(inst, grace_s=10)
-        container.delete_workspace.assert_awaited_once_with("job1")
+        container.delete_workspace.assert_awaited_once_with(WorkspaceOwner.job("job1"))
         container.delete_thread_workspace.assert_not_called()
 
     @pytest.mark.asyncio
