@@ -6,7 +6,7 @@ defaultNamespace: agent-vms
 helm:
   releaseName: srw-vm
   chart: "oci://ghcr.io/knaeckebrothero/charts/srw-dev-vm-cluster"
-  version: "0.0.0-dev.sha-ef27477"
+  version: "0.0.0-dev.sha-2d42530"
   takeOwnership: true
   values:
     license:
