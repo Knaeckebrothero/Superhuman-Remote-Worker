@@ -12388,25 +12388,67 @@ async def resume_thread(
 async def get_thread_messages_history(
     thread_id: str,
     request: Request,
-    limit: int = 200,
+    limit: Optional[int] = None,
+    before: Optional[str] = None,
+    after: Optional[str] = None,
     offset: int = 0,
 ) -> dict[str, Any]:
-    """Load message history for a thread (for session resume).
+    """Load message history for a persistent thread, ascending (chronological).
 
-    Returns messages ordered by created_at ASC. Paginated.
-    Load this via REST before opening the WebSocket connection.
+    Default (no params) returns the **entire** conversation — the cockpit caches
+    the full thread client-side and windows the render itself, so the display
+    must not be truncated. Cursor paging (mutually exclusive, ISO-8601):
+
+    - ``before=<ts>``: backfill — newest messages at-or-before the cursor, up to
+      ``limit``.
+    - ``after=<ts>``:  catch-up — messages at-or-after the cursor, up to ``limit``.
+
+    A bare ``limit`` with no cursor keeps the legacy oldest-first paged read
+    (``offset`` honored) used by the MCP inspection tool. Returns
+    ``{messages, total, has_more, thread_id}``.
     """
     user, thread = await require_thread_owner(request, postgres_db, thread_id)
 
-    messages = await postgres_db.get_thread_messages_history(
-        thread_id=thread_id,
-        limit=min(limit, 500),
-        offset=offset,
-    )
+    def _parse_cursor(value: Optional[str]) -> Optional[datetime]:
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            raise HTTPException(
+                status_code=400, detail=f"Invalid ISO-8601 timestamp: {value!r}"
+            )
+
+    before_dt = _parse_cursor(before)
+    after_dt = _parse_cursor(after)
+    if before_dt is not None and after_dt is not None:
+        raise HTTPException(
+            status_code=400, detail="Pass at most one of 'before' / 'after'"
+        )
+
+    capped_limit = min(limit, 500) if limit is not None else None
+
+    if before_dt is not None or after_dt is not None:
+        messages, has_more = await postgres_db.get_thread_messages_page(
+            thread_id=thread_id,
+            before=before_dt,
+            after=after_dt,
+            limit=capped_limit,
+        )
+    else:
+        messages = await postgres_db.get_thread_messages_history(
+            thread_id=thread_id,
+            limit=capped_limit,
+            offset=offset,
+        )
+        # Legacy paged read: a full page implies there may be more.
+        has_more = capped_limit is not None and len(messages) == capped_limit
+
     total = await postgres_db.get_thread_message_count(thread_id)
     return {
         "messages": messages,
         "total": total,
+        "has_more": has_more,
         "thread_id": thread_id,
     }
 
