@@ -98,12 +98,12 @@ Five operational items, each independently shippable. Together they're a single 
 | # | Item | Risk it closes | Effort | Status |
 |---|---|---|---|---|
 | 1 | **Keycloak self-registration fix** — wire SMTP for `VERIFY_EMAIL` (or skip-verify for dev); add the realm-level `user` role to `default-roles-srw` | Strangers literally can't sign up today; also blocks live E2E cross-user verification of the entire M1.A surface | ~2h | Open ([memory](../.claude/projects/-home-ghost-Repositories-Superhuman-Remote-Worker/memory/project_keycloak_self_registration_broken.md)) |
-| 2 | **Chromium profile per-job** — `/tmp/agent-chromium-cdp-profile` → `…-{job_id}` + teardown hook (`src/tools/research/browser.py:101`) | Cookies / logged-in sessions from job A persist into job B on the same agent pod | ~2h | Open |
-| 3 | **MongoDB TTL** on `llm_requests` + `agent_audit` (pick window: 90d? 1y?) | Prompts/responses hoarded indefinitely; privacy posture; GDPR retention story | ~1h | Open |
+| 2 | **Chromium profile per-job** — `/tmp/agent-chromium-cdp-profile` → `…-{job_id}` + teardown hook (`src/tools/research/browser.py:101`) | Cookies / logged-in sessions from job A persist into job B on the same agent pod | ~2h | Closed 2026-05-28 — workspace pod is already torn down after every job, so cross-job profile contamination can't happen. Intra-job delegation subagents do share the profile, which is benign (and sometimes beneficial — shared login state across the same job's research steps). |
+| 3 | **MongoDB TTL** on `llm_requests` + `agent_audit` (pick window: 90d? 1y?) | Prompts/responses hoarded indefinitely; privacy posture; GDPR retention story | ~1h | Deferred 2026-05-28 — will be folded into the planned MongoDB→Postgres migration; retention policy will be set there in one place rather than partially-applied to MongoDB now. |
 | 4 | **Cross-user 403 audit log** — emit a structured event when any `security/access.py` helper raises 403 | Today 1000 probe attempts → 1000 silent 403s; no detection signal | ~3h | Open |
 | 5 | **View-as PR 4** — `view_as_user: bool` + `real_is_admin: bool` on the per-request audit row; remaining matrix walk-through across non-Jobs list pages | Investigators can't tell whether an admin action ran in fleet mode or shadow mode | ~½d | Open |
 
-**Recommended landing order:** **#1 first** (smallest fix, biggest test-unblock — every subsequent M1 item benefits from being able to provision a real second user), then #2 / #3 / #4 / #5 in any order.
+**Recommended landing order:** **#1 first** (smallest fix, biggest test-unblock — every subsequent M1 item benefits from being able to provision a real second user), then **#4 and #5** in any order. #2 + #3 closed/deferred 2026-05-28 per their Status column above.
 
 **Larger follow-on to #1 — cockpit-owned auth UI (~5–9 days).** Once the SMTP + default-role fix lands and proves the Keycloak-themed register page works, the natural next iteration is replacing Keycloak's themed pages with cockpit-native forms (password login + register, social providers, optional magic-link email-only sign-in). Design captured 2026-05-28 at [features/cockpit_owned_auth_ui.md](features/cockpit_owned_auth_ui.md). Three independently-shippable slices; not blocking the M1.B quick wins but is the v1 unlock for public-facing signup.
 
@@ -124,13 +124,13 @@ Five operational items, each independently shippable. Together they're a single 
 
 ### M1.D — Abuse prevention (design pending, ~6–9d total)
 
-The previous "Out of scope (Phase 1)" line listed rate limiting as "not now". For strangers on AWS it's table stakes.
+The previous "Out of scope (Phase 1)" line listed rate limiting as "not now". For strangers on AWS it's table stakes — **but most of the load lands on the billing layer rather than here.** Per the [SaaS billing model](features/saas_billing_and_metering.md) (wallet-funded, OpenRouter-style markup on LLM + compute), abuse-by-mining is **economically uninteresting** (renting a dedicated VM beats our marked-up infra on raw compute every time), and runaway-cost concerns are bounded by the user's wallet balance + per-job cost gate. **M1.D therefore becomes defense-in-depth + pre-billing safety net + data-exfiltration prevention** rather than the primary abuse defense. Reframed 2026-05-28.
 
 | # | Item | What it prevents | Rough effort |
 |---|---|---|---|
-| 1 | **Per-user API rate limiting** | UUID enumeration, endpoint hammering, LLM-cost runaway. Per-user (not per-IP) so paid-tier hooks attach later. | 2–3d (FastAPI middleware — slowapi or hand-rolled; per-route caps via decorator; Redis-backed counter to survive orchestrator restarts/scaling) |
-| 2 | **K8s `ResourceQuota` + `LimitRange` per agent pod** | One user OOM-ing the cluster, CPU saturation, accidentally-infinite agent loops | 2–3d (Helm chart: per-user namespace OR labels-based quota; container CPU/RAM caps already exist on the pool but per-user totals don't; concurrent-jobs-per-user enforcement at dispatch time) |
-| 3 | **Workspace egress `NetworkPolicy`** | Crypto-mining from your AWS IPs, port scanning, spam relay, ending up on an IP reputation list | 2–3d (default-deny egress + allowlist for LLM endpoints + Git + an opt-in per-user "permitted destinations" list; needs a CNI that supports egress policies — Cilium or Calico) |
+| 1 | **Per-user API rate limiting** | UUID enumeration, endpoint hammering, **pre-billing-era runaway costs** (until the billing gate is wired), abuse of non-cost-bearing endpoints (login, register, lookups — billing doesn't gate these). Per-user (not per-IP) so paid-tier hooks attach later. | 2–3d (FastAPI middleware — slowapi or hand-rolled; per-route caps via decorator; Redis-backed counter to survive orchestrator restarts/scaling) |
+| 2 | **K8s `ResourceQuota` + `LimitRange` per agent pod** | One user OOM-ing the cluster, CPU saturation, accidentally-infinite agent loops. Bounded blast radius even within a tier when a user's wallet has credit to keep firing requests — billing controls cost but not per-pod resource usage. | 2–3d (Helm chart: per-user namespace OR labels-based quota; container CPU/RAM caps already exist on the pool but per-user totals don't; concurrent-jobs-per-user enforcement at dispatch time) |
+| 3 | **Workspace egress `NetworkPolicy`** | **Data exfiltration** (primary concern — a malicious LLM agent could try to upload workspace contents to attacker-controlled endpoints; or a compromised dependency could phone home with secrets the workspace has access to). Also: port scanning, spam relay, IP-reputation hits. **Cryptomining is NOT a primary concern** — the billing markup defeats it economically. | 2–3d (default-deny egress + allowlist for LLM endpoints + Git + an opt-in per-user "permitted destinations" list; needs a CNI that supports egress policies — Cilium or Calico) |
 
 Each needs a short design doc before implementation — these are new territory, not "wire up an existing primitive". Bundleable in parallel, but writing the designs is the bottleneck.
 
@@ -154,10 +154,11 @@ Triggered by the post-P4b finding that admins were god-mode by default and could
 Pre-launch checklist. **Every line must be ✅ before opening signups beyond invited beta users.**
 
 - [x] **M1.A** — every API endpoint gated; inventory test enforces; admin view-as toggle live
-- [ ] **M1.B** — Keycloak self-reg works for strangers; Chromium per-job; MongoDB TTL; 403 audit log; view-as PR 4
+- [ ] **M1.B** — Keycloak self-reg works for strangers; 403 audit log; view-as PR 4 (Chromium per-job + MongoDB TTL closed/deferred 2026-05-28)
 - [ ] **M1.C** — cloud storage per-user OAuth (the actual blocker)
-- [ ] **M1.D** — rate limiting + pod quotas + workspace egress allowlist (designs written *and* implementations shipped)
+- [ ] **M1.D** — pod quotas + workspace egress allowlist + pre-billing rate limit (designs written *and* implementations shipped)
 - [ ] **M1.E** — user self-deletion + data export
+- [ ] **Billing + usage metering** — wallet schema, per-user attribution audit, debit gate, Cockpit usage page ([design doc](features/saas_billing_and_metering.md), implementation comes after design + before public signup)
 
 When all five tick, **M1 is done** and you can open signups to strangers without burning either user data or your AWS bill.
 
@@ -883,7 +884,7 @@ The API gates close the application-layer leaks. The following still share state
 
 What this doc covers: **data isolation and abuse prevention** for individual subscribers (M1) and organizations (M2). Everything else is deliberately someone else's problem:
 
-- **Payments / billing / metering / Stripe integration.** Subscription product surface, not isolation.
+- **Payments / billing / metering / Stripe integration.** Subscription product surface, not isolation. But **wallet-funded billing + usage metering is part of M1 SaaS readiness as a parallel track**, documented separately at [features/saas_billing_and_metering.md](features/saas_billing_and_metering.md). Without it, opening signups exposes our LLM credit bill to anonymous demand. (Stripe wiring, ToS-around-billing, and pricing-page UI remain out of scope of *both* docs.)
 - **ToS, AUP, cookie banners, privacy-policy text.** Legal, not engineering.
 - **GDPR DPA, SOC2, ISO27001 paperwork.** The engineering primitives (user self-deletion, data export, retention, audit log) are in M1.E + M1.B; the paperwork around them is not.
 - **Marketing / pricing pages / signup funnel UI.** Cockpit's `/auth/login` flow is what we ship.
@@ -897,16 +898,18 @@ What this doc covers: **data isolation and abuse prevention** for individual sub
 
 ## Next steps
 
-**M1.A (API isolation) is done.** Everything else for M1 is the work this doc tracks. Concrete ordered plan:
+**M1.A (API isolation) is done.** Everything else for M1 is the work this doc tracks. Concrete ordered plan (refreshed 2026-05-28):
 
 1. **M1.B #1 — Keycloak self-registration (~2h).** Smallest fix, biggest unblock. Wire SMTP for `VERIFY_EMAIL` (or skip-verify in dev) + add `user` to `default-roles-srw`. Every later step benefits from being able to provision a real second user.
-2. **M1.B #2–#5 — remaining quick-win hygiene (~5h).** Chromium per-job, MongoDB TTL, 403 audit log, view-as PR 4. Independent; parallelizable.
-3. **M1.C — Cloud storage per-user OAuth (~1–2 weeks).** The actual hosted-product blocker. Don't open signups beyond invited beta users until this lands.
-4. **M1.D — Abuse prevention designs + implementations (~6–9d).** Rate limiting, K8s ResourceQuota/LimitRange per pod, workspace egress NetworkPolicy. Three independent designs, parallelizable; writing the designs is the bottleneck.
-5. **M1.E — User account lifecycle (~3–5d).** Self-deletion + data export.
-6. **M1 readiness gate clears** — open signups to strangers.
-7. **M2 only when demand is real** — organizations layer, per-org primitives, realm strategy.
+2. **M1.B #4 + #5 — remaining quick-win hygiene (~½ day total).** Cross-user 403 audit log + view-as PR 4. Independent; parallelizable. (M1.B #2 Chromium per-job + #3 MongoDB TTL closed/deferred 2026-05-28 — see table above.)
+3. **Billing + usage metering design doc** — parallel-track to M1 isolation work, started 2026-05-28 as a stub at [features/saas_billing_and_metering.md](features/saas_billing_and_metering.md). Captures the wallet-funded business model + open questions (per-user attribution audit on `llm_requests`, compute-time attribution gaps, wallet/balance schema, debit gate, Cockpit usage UI). Implementation comes after the design fills in but **before public signup** — without it, anonymous demand bills our LLM credits.
+4. **M1.C — Cloud storage per-user OAuth (~1–2 weeks).** The actual file-isolation hosted-product blocker. Don't open signups beyond invited beta users until this lands.
+5. **M1.D — Abuse prevention designs + implementations (~6–9d).** Pod quotas, workspace egress NetworkPolicy, pre-billing-era rate limiting. Three independent designs, parallelizable; writing the designs is the bottleneck. Reframed 2026-05-28 — billing carries most of the abuse load; M1.D is now defense-in-depth + data-exfiltration prevention.
+6. **M1.E — User account lifecycle (~3–5d).** Self-deletion + data export.
+7. **Cockpit-owned auth UI (~5–9d)** — larger follow-on to M1.B #1, design at [features/cockpit_owned_auth_ui.md](features/cockpit_owned_auth_ui.md). Replaces Keycloak themed pages with cockpit-native login + register + social + magic-link. Not blocking, but is the v1 unlock for a polished public-facing signup.
+8. **M1 readiness gate clears** — open signups to strangers.
+9. **M2 only when demand is real** — organizations layer, per-org primitives, realm strategy.
 
-**Quickest credibility moves (today):** M1.B #1 + #2 + #3 + #4 + #5 are a single short sprint (~1 day total). Doing them now closes 5 of the 10 remaining-gap rows in [Where we are now](#where-we-are-now-2026-05-18) and unblocks live cross-user testing for everything else.
+**Quickest credibility moves:** M1.B #1 + #4 + #5 are a single short sprint (~1 day total). Doing them now closes the remaining quick-win gap rows in [Where we are now](#where-we-are-now-2026-05-18) and unblocks live cross-user testing for everything else.
 
-**The big one:** M1.C (cloud storage per-user OAuth). Until that lands, every user-file read is one bug away from cross-tenant exposure. Plan it as the next initiative after M1.B.
+**The big ones:** M1.C (cloud storage per-user OAuth) is the file-isolation blocker; the billing-doc + implementation is the cost-isolation blocker. Both must land before opening signups beyond invited beta. Plan them as the next two big initiatives after M1.B.
