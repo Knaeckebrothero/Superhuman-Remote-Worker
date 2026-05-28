@@ -151,7 +151,7 @@ data:
           ],
           "attributes": {
             "post.logout.redirect.uris": "{{ include "srw.cockpitUrl" . }}/*##{{ include "srw.apiUrl" . }}/*",
-            "backchannel.logout.url": "{{ include "srw.apiUrl" . }}/auth/backchannel-logout",
+            "backchannel.logout.url": "{{ include "srw.orchestratorInternalUrl" . }}/auth/backchannel-logout",
             "backchannel.logout.session.required": "true",
             "backchannel.logout.revoke.offline.tokens": "false"
           },
@@ -736,6 +736,13 @@ spec:
               value: {{ include "srw.apiUrl" . | quote }}
             - name: COCKPIT_URL
               value: {{ include "srw.cockpitUrl" . | quote }}
+            # Internal Service URL — used for backchannel-logout callbacks
+            # the Keycloak pod fires itself. Routing via the public ingress
+            # fails in any cluster where the pod can't resolve the public
+            # hostname (split-DNS, k3d's `localhost` loopback hijack); also
+            # cheaper and avoids re-traversing TLS for a server→server hop.
+            - name: ORCHESTRATOR_INTERNAL_URL
+              value: {{ include "srw.orchestratorInternalUrl" . | quote }}
             {{- if .Values.email.enabled }}
             - name: SMTP_HOST
               valueFrom:
@@ -836,7 +843,7 @@ spec:
                           -s "serviceAccountsEnabled=false" \
                           -s "redirectUris=[\"http://localhost:8085/auth/callback\",\"$API_URL/auth/callback\",\"$COCKPIT_URL/auth/callback\"]" \
                           -s "webOrigins=[\"$API_URL\",\"$COCKPIT_URL\"]" \
-                          -s "attributes.\"backchannel.logout.url\"=$API_URL/auth/backchannel-logout" \
+                          -s "attributes.\"backchannel.logout.url\"=$ORCHESTRATOR_INTERNAL_URL/auth/backchannel-logout" \
                           -s "attributes.\"backchannel.logout.session.required\"=true" \
                           -s "attributes.\"backchannel.logout.revoke.offline.tokens\"=false" 2>/dev/null \
                           || echo "WARN: kcadm cockpit-bff create failed"
@@ -850,7 +857,7 @@ spec:
                           -s "clientAuthenticatorType=client-secret" \
                           -s "redirectUris=[\"http://localhost:8085/auth/callback\",\"$API_URL/auth/callback\",\"$COCKPIT_URL/auth/callback\"]" \
                           -s "webOrigins=[\"$API_URL\",\"$COCKPIT_URL\"]" \
-                          -s "attributes.\"backchannel.logout.url\"=$API_URL/auth/backchannel-logout" \
+                          -s "attributes.\"backchannel.logout.url\"=$ORCHESTRATOR_INTERNAL_URL/auth/backchannel-logout" \
                           -s "attributes.\"backchannel.logout.session.required\"=true" 2>/dev/null \
                           || echo "WARN: kcadm cockpit-bff update failed"
                       fi
