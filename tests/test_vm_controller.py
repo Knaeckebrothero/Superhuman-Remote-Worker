@@ -210,6 +210,20 @@ def _make_controller(headscale_available: bool = True) -> VMController:
     return ctrl
 
 
+@pytest.fixture(autouse=True)
+def _scoped_orchestrator_id():
+    """Patch the module-level ORCHESTRATOR_ID for every test in this file.
+
+    The controller reads ORCHESTRATOR_ID at module import time and uses it
+    to scope vm.lifecycle.* subjects. Real deployments set the env var via
+    Helm; tests use this fixture so existing assertions on subject names
+    keep working with a stable "test-oid" suffix. The dedicated
+    TestOrchestratorIdRequired class below opts out by patching to "".
+    """
+    with patch("vm.controller.controller.ORCHESTRATOR_ID", "test-oid"):
+        yield
+
+
 @pytest.fixture
 def controller():
     return _make_controller(headscale_available=True)
@@ -562,7 +576,7 @@ class TestHandleCreate:
         # Verify status published
         controller.nc.publish.assert_awaited()
         subject, raw = controller.nc.publish.call_args[0]
-        assert subject == "vm.lifecycle.status"
+        assert subject == "vm.lifecycle.status.test-oid"
         payload = json.loads(raw.decode())
         assert payload["status"] == "created"
         assert payload["job_id"] == SAMPLE_JOB_CONFIG["job_id"]
@@ -994,7 +1008,7 @@ class TestHandleStatusQuery:
 
     @pytest.mark.asyncio
     async def test_status_query_no_reply_publishes_to_status_subject(self, controller):
-        """When msg.reply is None, status is published to vm.lifecycle.status."""
+        """When msg.reply is None, status is published to vm.lifecycle.status.{oid}."""
         job_id = "no-reply"
         controller.k8s_client.get_namespaced_custom_object.return_value = {
             "metadata": {"name": f"agent-vm-{job_id}"},
@@ -1009,7 +1023,7 @@ class TestHandleStatusQuery:
         await controller.handle_status_query(msg)
 
         subject = controller.nc.publish.call_args[0][0]
-        assert subject == "vm.lifecycle.status"
+        assert subject == "vm.lifecycle.status.test-oid"
 
     @pytest.mark.asyncio
     async def test_status_query_vm_not_found_error(self, controller):
@@ -1028,7 +1042,7 @@ class TestHandleStatusQuery:
 
     @pytest.mark.asyncio
     async def test_status_query_error_without_reply(self, controller):
-        """Error without reply subject publishes to vm.lifecycle.status."""
+        """Error without reply subject publishes to vm.lifecycle.status.{oid}."""
         controller.k8s_client.get_namespaced_custom_object.side_effect = Exception(
             "Server Error"
         )
@@ -1037,7 +1051,7 @@ class TestHandleStatusQuery:
         await controller.handle_status_query(msg)
 
         subject = controller.nc.publish.call_args[0][0]
-        assert subject == "vm.lifecycle.status"
+        assert subject == "vm.lifecycle.status.test-oid"
         payload = json.loads(controller.nc.publish.call_args[0][1].decode())
         assert payload["status"] == "query_failed"
 
@@ -1131,12 +1145,12 @@ class TestPublishStatus:
 
     @pytest.mark.asyncio
     async def test_publish_status_success(self, controller):
-        """_publish_status publishes JSON to vm.lifecycle.status."""
+        """_publish_status publishes JSON to vm.lifecycle.status.{oid}."""
         payload = {"job_id": "test", "status": "created", "vm_name": "agent-vm-test"}
         await controller._publish_status("test", payload)
 
         subject, raw = controller.nc.publish.call_args[0]
-        assert subject == "vm.lifecycle.status"
+        assert subject == "vm.lifecycle.status.test-oid"
         assert json.loads(raw.decode()) == payload
 
     @pytest.mark.asyncio
@@ -1159,7 +1173,7 @@ class TestPublishStatus:
 
     @pytest.mark.asyncio
     async def test_publish_status_subject_is_always_lifecycle_status(self, controller):
-        """_publish_status always uses the vm.lifecycle.status subject."""
+        """_publish_status always uses the vm.lifecycle.status.{oid} subject."""
         for payload in [
             {"status": "created"},
             {"status": "deleted"},
@@ -1167,7 +1181,9 @@ class TestPublishStatus:
         ]:
             controller.nc.publish.reset_mock()
             await controller._publish_status("any-job", payload)
-            assert controller.nc.publish.call_args[0][0] == "vm.lifecycle.status"
+            assert (
+                controller.nc.publish.call_args[0][0] == "vm.lifecycle.status.test-oid"
+            )
 
 
 # =============================================================================
@@ -1191,9 +1207,13 @@ class TestRunAndShutdown:
             await controller.run()
 
         subjects = [call[0][0] for call in controller.nc.subscribe.call_args_list]
-        assert "vm.lifecycle.create" in subjects
-        assert "vm.lifecycle.delete" in subjects
-        assert "vm.lifecycle.get" in subjects
+        assert "vm.lifecycle.create.test-oid" in subjects
+        assert "vm.lifecycle.delete.test-oid" in subjects
+        assert "vm.lifecycle.get.test-oid" in subjects
+        # Regression: flat subjects must NOT be subscribed
+        assert "vm.lifecycle.create" not in subjects
+        assert "vm.lifecycle.delete" not in subjects
+        assert "vm.lifecycle.get" not in subjects
 
     @pytest.mark.asyncio
     async def test_run_calls_init_sequence_in_order(self, controller):
@@ -1343,9 +1363,50 @@ class TestRunAndShutdown:
                 getattr(cb, "__name__", None) or getattr(cb, "__func__", cb).__name__
             )
 
-        assert cb_map["vm.lifecycle.create"] == "handle_create"
-        assert cb_map["vm.lifecycle.delete"] == "handle_delete"
-        assert cb_map["vm.lifecycle.get"] == "handle_status_query"
+        assert cb_map["vm.lifecycle.create.test-oid"] == "handle_create"
+        assert cb_map["vm.lifecycle.delete.test-oid"] == "handle_delete"
+        assert cb_map["vm.lifecycle.get.test-oid"] == "handle_status_query"
+
+
+# =============================================================================
+# Tests: ORCHESTRATOR_ID gating
+# =============================================================================
+
+
+class TestOrchestratorIdRequired:
+    """run() refuses to subscribe to flat vm.lifecycle.* subjects.
+
+    Without per-orchestrator scoping the controller would race other
+    controllers sharing the NATS hub and provision duplicate VMs for every
+    create request. The startup-time sys.exit(1) is the failsafe.
+    """
+
+    @pytest.mark.asyncio
+    async def test_run_exits_when_orchestrator_id_unset(self, controller):
+        controller._shutdown.set()
+        with (
+            patch("vm.controller.controller.ORCHESTRATOR_ID", ""),
+            patch.object(controller, "load_template"),
+            patch.object(controller, "init_k8s"),
+            patch.object(controller, "connect_nats", new_callable=AsyncMock),
+        ):
+            with pytest.raises(SystemExit) as exc:
+                await controller.run()
+            assert exc.value.code == 1
+
+    @pytest.mark.asyncio
+    async def test_run_does_not_subscribe_when_orchestrator_id_unset(self, controller):
+        controller._shutdown.set()
+        with (
+            patch("vm.controller.controller.ORCHESTRATOR_ID", ""),
+            patch.object(controller, "load_template"),
+            patch.object(controller, "init_k8s"),
+            patch.object(controller, "connect_nats", new_callable=AsyncMock),
+        ):
+            with pytest.raises(SystemExit):
+                await controller.run()
+
+        controller.nc.subscribe.assert_not_awaited()
 
 
 # =============================================================================
