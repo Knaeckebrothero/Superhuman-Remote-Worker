@@ -373,13 +373,20 @@ k3d cluster list             # see all clusters and their state
 
 Stopping the cluster also frees host port 443 — important if you also access the live homelab cluster from this machine on the same domain.
 
-### Fast inner loop with Tilt (optional)
+### Fast inner loop with Tilt (recommended)
 
-Tilt watches the repo and live-syncs source files into the running pods so a Python edit shows up in the orchestrator without a rebuild-import-rollout cycle. With Tilt running, editing `orchestrator/*.py` takes <5 s to take effect; without it, ~30 s. Tilt is opt-in — everything in this section is optional and the `helm install` path above continues to work standalone.
+Tilt watches the repo and live-syncs source files into the running pods (or rebuilds + rolls them for the agent), so edits take effect locally in seconds — no commit → CI → image-build → Fleet-sync → rollout round trip. **All four components are covered**:
 
-Design and rationale: [`docs/features/tilt_inner_loop_dev.md`](docs/features/tilt_inner_loop_dev.md).
+| Component | Loop | Edit-to-effect |
+|-----------|------|-----------------|
+| Orchestrator | `live_update` sync + `uvicorn --reload` | ~3 s |
+| Cockpit | `live_update` sync + `ng serve` HMR | ~5 s (~36 ms ng compile + Vite push) |
+| MCP | `live_update` sync + `watchfiles` wrapper | ~10–15 s (watchfiles + Tilt debounce) |
+| Agent | full image rebuild + helm fan-out + Reloader bounce | ~50 s (~8 s warm docker build + orchestrator restart) |
 
-**One-time install** (binaries to `~/.local/bin/`, no sudo):
+Tilt is opt-in but is now the **default development workflow**. The `helm install` path above still works standalone for people without Tilt installed. Design and rationale: [`docs/features/tilt_inner_loop_dev.md`](docs/features/tilt_inner_loop_dev.md).
+
+**One-time install** (binary to `~/.local/bin/`, no sudo):
 
 ```bash
 TILT_VER=0.37.3
@@ -397,28 +404,48 @@ tilt version
 
 This bootstrap is idempotent — it runs `scripts/local-dev-up.sh` underneath (cluster + cert-manager + namespace + vm-ssh-key Secret), then adds the `srw-session-jwt` Secret, syncs the current Traefik ClusterIP into `values-local.yaml`'s `opencloud.hostAliases` entry, and finally runs `tilt up` in the foreground. Press Ctrl-C to stop Tilt (the cluster keeps running; use `k3d cluster stop srw` to stop that too).
 
-While Tilt is running:
+#### The Plan → Develop → Verify workflow
 
-- **Tilt UI** at `https://localhost:10350` — per-resource logs, restart buttons, live-update status.
-- **Cockpit** at `https://localhost/` — same as the non-Tilt path. Log in as `test`/`test`.
-- **Edit `orchestrator/main.py`** (or any orchestrator/src/config Python file) → uvicorn `--reload` re-imports the module in-place, the change is live within seconds. Watch the orchestrator pod's logs in the Tilt UI for the `WatchFiles detected changes` line.
-- **Edit `orchestrator/requirements.txt`** → Tilt rebuilds the dev image (fall_back_on the live-update path) and rolls the pod.
+The point of having Tilt + a local prod-parity cluster is that **every change can be verified locally before it ships**. The loop:
 
-**Scope today (Slice 1)**: orchestrator only. Cockpit, agent, and MCP still use the chart's GHCR images. Cockpit HMR + agent rebuild-automation arrive in later slices — see the design doc for the planned phases.
+1. **Plan**: design doc under `docs/features/` or `docs/issues/` (whatever fits). Get alignment on scope + acceptance before you start editing.
+2. **Develop**: edit the relevant source. Tilt handles the rebuild/sync automatically — watch the Tilt UI at `https://localhost:10350` for the affected resource going green again.
+3. **Verify locally** — do not push until this passes:
+   - **Unit/lint tests** at file granularity:
+     - Python: `pytest tests/test_<area>.py -x -q --tb=short` + `ruff check src/ orchestrator/ tests/`
+     - Cockpit: `cd cockpit && npm test` or a single spec via `npx vitest run src/path/to/foo.spec.ts`
+   - **Cockpit / UX changes**: open `https://localhost/` in a browser (or Playwright), exercise the actual feature, watch the cockpit pod's `ng serve` logs in the Tilt UI for HMR updates.
+   - **Orchestrator / API changes**: hit the live endpoint from inside the cluster — `kubectl --context=k3d-srw -n srw exec deploy/srw-orchestrator -c orchestrator -- curl -sf http://localhost:8085/api/...` — or from a logged-in cockpit, or via cookies set after `test`/`test` login.
+   - **Agent / graph changes**: create a session or job through cockpit (UI → New Session / New Job), then `kubectl --context=k3d-srw -n srw logs -l srw/managed-by=agent-provisioner -f` to watch the spawned agent pod react.
+   - **MCP / tool changes**: `kubectl --context=k3d-srw -n srw exec deploy/srw-orchestrator -c orchestrator -- curl -sf http://srw-mcp:8055/health`. For actual tool calls, port-forward and point a Claude Code MCP client at the local URL: `kubectl --context=k3d-srw -n srw port-forward svc/srw-mcp 8055:8055`.
+   - **Cross-component flows** (e.g. orchestrator → agent → workspace): walk the README smoke test under "Local Kubernetes Setup (k3d)" — login, new session, new job — and confirm pod states with `kubectl get pods -n srw`.
+4. **Commit + push** only after local verification passes. The CI/CD path (build → GHCR → Fleet sync → homelab rollout) takes ~30 min, so catching a regression locally first is several rounds of feedback faster than catching it on the dev cluster.
+
+A failed verification ≠ ready to push. Iterate on local until the smoke test you'd want a reviewer to run is green.
+
+#### Per-component edit signals
+
+What to watch for in the Tilt UI / pod logs to confirm an edit actually took effect:
+
+- **Orchestrator** (`orchestrator/*.py`, `src/*.py`, `config/*`): orchestrator pod log shows `WatchFiles detected changes in '/app/...'` followed by a uvicorn worker re-import. Hit `kubectl ... curl http://localhost:8085/api/health` to confirm.
+- **Cockpit** (`cockpit/src/**/*.ts|html|scss`): cockpit pod log shows `Component update sent to client(s)` (CSS) or `Page reload required` (TS/HTML). Browser auto-refreshes within ~5 s. If `[vite] connected.` is missing from the browser console, the HMR WebSocket dropped — refresh.
+- **MCP** (`orchestrator/mcp/*.py`, `orchestrator/services/formatters.py`): mcp pod log shows `watchfiles: N changes detected` followed by the FastMCP banner with the (potentially updated) server name. `/health` returns 200 within ~10 s.
+- **Agent** (`src/*.py`, `config/*`, `agent.py`): srw-agent image rebuilds (visible in Tilt UI), helm upgrade fans the new `tilt-<hash>` tag into `srw-config`'s `PERSISTENT_AGENT_IMAGE`, Stakater Reloader rolls the orchestrator, **next** session/job picks up the new code. Existing agent pods are unaffected (they hold the old image — agent pods are per-job, not long-running).
+- **Requirements / Dockerfile edits**: trigger `fall_back_on` → full image rebuild + roll. Cold rebuild is ~3-5 min the first time after a `tilt down`; warm is ~10-20 s thanks to the cache mounts in `Dockerfile.*.dev`.
 
 **Common operations under Tilt**:
 
 ```bash
-tilt down                                    # remove the Helm release + stop watching
-tilt trigger srw-orchestrator                # force-rebuild the orchestrator image
+tilt down                                    # stop watching + remove the Helm release
+tilt trigger srw-agent                       # force-rebuild any component
 tilt args -- --port 10351                    # run the Tilt UI on a different port
 ```
 
 **Known limitations**:
 
-- The dev image runs as root (Tilt's file sync needs write access to `/app`). This is fine for local dev; the production image still drops privileges to `srw`.
 - `uvicorn --reload` doesn't reload changes to the lifespan/startup phase — if you edit `lifespan()` itself, force a restart from the Tilt UI.
-- The orchestrator-only scope means a code change in `src/` (which both orchestrator and agent share) only affects the orchestrator's running copy; the next provisioned agent pod still uses the old image. Agent live-rebuild ships in Slice 3.
+- Agent pods are baked at provision time (`restartPolicy: Never`) — a `src/` edit affects the *next* session, not in-flight agent pods. End an active session and start a new one to pick up the change.
+- Reloader bouncing the orchestrator on an agent image change incurs a ~30 s orchestrator restart. Acceptable for dev, ugly if you're hammering agent edits.
 
 ### Updating the install
 

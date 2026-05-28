@@ -275,5 +275,10 @@ then, the local image import above is required.
 5. Update the README troubleshooting section with whatever turns out to be
    the final answer (Path A or B).
 
-The `Tilt` inner-loop work (Stage 3 from the original plan) is still open
-and untouched. That's the next thing after login works.
+## History
+
+The `Tilt` inner-loop work (Stage 3 from the original plan) shipped
+2026-05-28 across four slices — orchestrator + cockpit + agent + MCP all
+covered. Design doc + per-component timings at
+`docs/features/tilt_inner_loop_dev.md`. README "Fast inner loop with
+Tilt" subsection has the Plan → Develop → Verify workflow.
