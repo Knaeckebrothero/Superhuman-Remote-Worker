@@ -91,7 +91,11 @@ IP_RECHECK_INTERVAL = daemon_mod.IP_RECHECK_INTERVAL
 
 def _make_config(**overrides) -> dict:
     """Create a minimal daemon config dict."""
-    base = {"nats_url": "nats://localhost:4222", "job_id": "test-job-001"}
+    base = {
+        "nats_url": "nats://localhost:4222",
+        "job_id": "test-job-001",
+        "orchestrator_id": "test-orch-001",
+    }
     base.update(overrides)
     return base
 
@@ -130,12 +134,17 @@ class TestLoadConfig:
 
     def test_loads_from_env_vars(self):
         """load_config reads NATS_URL and JOB_ID from environment."""
-        env = {"NATS_URL": "nats://10.0.0.1:4222", "JOB_ID": "job-abc-123"}
+        env = {
+            "NATS_URL": "nats://10.0.0.1:4222",
+            "JOB_ID": "job-abc-123",
+            "ORCHESTRATOR_ID": "orch-1",
+        }
         with patch.dict(os.environ, env, clear=False):
             config = load_config()
 
         assert config["nats_url"] == "nats://10.0.0.1:4222"
         assert config["job_id"] == "job-abc-123"
+        assert config["orchestrator_id"] == "orch-1"
 
     def test_loads_job_config_file(self, tmp_path):
         """load_config merges keys from the job config JSON file."""
@@ -143,7 +152,11 @@ class TestLoadConfig:
         config_file = tmp_path / "job-config.json"
         config_file.write_text(json.dumps(job_config))
 
-        env = {"NATS_URL": "nats://localhost:4222", "JOB_ID": "job-xyz"}
+        env = {
+            "NATS_URL": "nats://localhost:4222",
+            "JOB_ID": "job-xyz",
+            "ORCHESTRATOR_ID": "orch-1",
+        }
         with (
             patch.dict(os.environ, env, clear=False),
             patch.object(daemon_mod, "JOB_CONFIG_FILE", config_file),
@@ -178,6 +191,18 @@ class TestLoadConfig:
 
         assert exc_info.value.code == 1
 
+    def test_exits_when_orchestrator_id_missing(self):
+        """load_config calls sys.exit(1) when ORCHESTRATOR_ID is not set."""
+        env = {"NATS_URL": "nats://localhost:4222", "JOB_ID": "job-123"}
+        with (
+            patch.dict(os.environ, env, clear=False),
+            patch.dict(os.environ, {"ORCHESTRATOR_ID": ""}, clear=False),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            load_config()
+
+        assert exc_info.value.code == 1
+
     def test_exits_when_both_missing(self):
         """load_config calls sys.exit(1) when both vars are missing."""
         with (
@@ -193,7 +218,11 @@ class TestLoadConfig:
         config_file = tmp_path / "job-config.json"
         config_file.write_text("{invalid json!")
 
-        env = {"NATS_URL": "nats://localhost:4222", "JOB_ID": "job-xyz"}
+        env = {
+            "NATS_URL": "nats://localhost:4222",
+            "JOB_ID": "job-xyz",
+            "ORCHESTRATOR_ID": "orch-1",
+        }
         with (
             patch.dict(os.environ, env, clear=False),
             patch.object(daemon_mod, "JOB_CONFIG_FILE", config_file),
@@ -207,7 +236,11 @@ class TestLoadConfig:
     def test_handles_missing_job_config_file(self):
         """load_config works fine when job config file does not exist."""
         non_existent = Path("/tmp/nonexistent-job-config.json")
-        env = {"NATS_URL": "nats://localhost:4222", "JOB_ID": "job-abc"}
+        env = {
+            "NATS_URL": "nats://localhost:4222",
+            "JOB_ID": "job-abc",
+            "ORCHESTRATOR_ID": "orch-1",
+        }
         with (
             patch.dict(os.environ, env, clear=False),
             patch.object(daemon_mod, "JOB_CONFIG_FILE", non_existent),
@@ -223,7 +256,11 @@ class TestLoadConfig:
         config_file = tmp_path / "job-config.json"
         config_file.write_text(json.dumps(job_config))
 
-        env = {"NATS_URL": "nats://localhost:4222", "JOB_ID": "env-job-id"}
+        env = {
+            "NATS_URL": "nats://localhost:4222",
+            "JOB_ID": "env-job-id",
+            "ORCHESTRATOR_ID": "orch-1",
+        }
         with (
             patch.dict(os.environ, env, clear=False),
             patch.object(daemon_mod, "JOB_CONFIG_FILE", config_file),
@@ -667,7 +704,7 @@ class TestRegister:
         subject = args[0][0]
         payload = json.loads(args[0][1].decode())
 
-        assert subject == "agent.vm.test-job-001.register"
+        assert subject == "agent.vm.test-orch-001.test-job-001.register"
         assert payload["job_id"] == "test-job-001"
         assert payload["hostname"] == "vm-agent-42"
         assert payload["ip"] == "100.64.1.10"
@@ -687,7 +724,7 @@ class TestRegister:
 
     @pytest.mark.asyncio
     async def test_uses_correct_nats_subject(self, connected_daemon):
-        """register uses agent.vm.{job_id}.register as the NATS subject."""
+        """register uses agent.vm.{orchestrator_id}.{job_id}.register as the NATS subject."""
         connected_daemon.job_id = "my-special-job-99"
 
         with (
@@ -698,7 +735,7 @@ class TestRegister:
             await connected_daemon.register()
 
         subject = connected_daemon.nc.publish.call_args[0][0]
-        assert subject == "agent.vm.my-special-job-99.register"
+        assert subject == "agent.vm.test-orch-001.my-special-job-99.register"
 
 
 # =============================================================================
@@ -866,7 +903,7 @@ class TestHeartbeatLoop:
         subject = args[0][0]
         payload = json.loads(args[0][1].decode())
 
-        assert subject == "agent.vm.test-job-001.heartbeat"
+        assert subject == "agent.vm.test-orch-001.test-job-001.heartbeat"
         assert payload["job_id"] == "test-job-001"
         assert payload["agent_pid"] == 4321
         assert payload["agent_running"] is True
@@ -1188,7 +1225,7 @@ class TestAgentMonitorLoop:
 
     @pytest.mark.asyncio
     async def test_uses_correct_nats_subject(self, connected_daemon, tmp_path):
-        """agent_monitor_loop publishes to agent.vm.{job_id}.status."""
+        """agent_monitor_loop publishes to agent.vm.{orchestrator_id}.{job_id}.status."""
         exit_code_file = tmp_path / "agent.exit_code"
         exit_code_file.write_text("0\n")
 
@@ -1217,7 +1254,7 @@ class TestAgentMonitorLoop:
             )
 
         subject = connected_daemon.nc.publish.call_args[0][0]
-        assert subject == "agent.vm.test-job-001.status"
+        assert subject == "agent.vm.test-orch-001.test-job-001.status"
 
     @pytest.mark.asyncio
     async def test_handles_malformed_exit_code_file(self, connected_daemon, tmp_path):
@@ -1717,7 +1754,7 @@ class TestDaemonRun:
 
         mock_nc.subscribe.assert_called_once()
         subject = mock_nc.subscribe.call_args[0][0]
-        assert subject == "agent.vm.test-job-001.control"
+        assert subject == "agent.vm.test-orch-001.test-job-001.control"
 
 
 # =============================================================================
