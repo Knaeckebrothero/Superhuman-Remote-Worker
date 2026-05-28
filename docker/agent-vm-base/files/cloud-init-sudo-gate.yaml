@@ -1,8 +1,10 @@
 # Cloud-init additions for the sudo approval gate.
 #
 # Merge these into the VM template's cloud-init user-data section.
-# The placeholders ${NATS_URL} and ${JOB_ID} are substituted by the
-# VM controller's render_template() method at VM creation time.
+# The placeholders ${NATS_URL}, ${JOB_ID}, and ${ORCHESTRATOR_ID} are
+# substituted by the VM controller's render_template() method at VM
+# creation time. ORCHESTRATOR_ID is used to scope NATS subjects so
+# multiple SRW installs can safely share a NATS hub.
 #
 # This file is NOT used directly — it documents what needs to be added
 # to the KubeVirt VM template ConfigMap.
@@ -15,6 +17,7 @@ write_files:
     content: |
       NATS_URL=${NATS_URL}
       JOB_ID=${JOB_ID}
+      ORCHESTRATOR_ID=${ORCHESTRATOR_ID}
       VM_ID=agent-vm-${JOB_ID}
 
 # --- Add to runcmd: ---

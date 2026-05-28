@@ -55,14 +55,20 @@ def load_config() -> dict:
     """Load configuration from environment and job config file."""
     nats_url = os.environ.get("NATS_URL")
     job_id = os.environ.get("JOB_ID")
+    orchestrator_id = (os.environ.get("ORCHESTRATOR_ID") or "").strip()
 
-    if not nats_url or not job_id:
+    if not nats_url or not job_id or not orchestrator_id:
         log.error(
-            "NATS_URL and JOB_ID must be set (via /etc/default/management-daemon)"
+            "NATS_URL, JOB_ID, and ORCHESTRATOR_ID must be set "
+            "(via /etc/default/management-daemon)"
         )
         sys.exit(1)
 
-    config = {"nats_url": nats_url, "job_id": job_id}
+    config = {
+        "nats_url": nats_url,
+        "job_id": job_id,
+        "orchestrator_id": orchestrator_id,
+    }
 
     if JOB_CONFIG_FILE.exists():
         try:
@@ -162,6 +168,7 @@ class ManagementDaemon:
         self.config = config
         self.job_id = config["job_id"]
         self.nats_url = config["nats_url"]
+        self.orchestrator_id = config["orchestrator_id"]
         self.nc = None
         self._shutdown = asyncio.Event()
         self._agent_exit_reported = False
@@ -226,7 +233,7 @@ class ManagementDaemon:
             "pid": os.getpid(),
         }
 
-        subject = f"agent.vm.{self.job_id}.register"
+        subject = f"agent.vm.{self.orchestrator_id}.{self.job_id}.register"
         await self.nc.publish(subject, json.dumps(payload).encode())
         log.info("Registered: subject=%s, ip=%s, hostname=%s", subject, ip, hostname)
 
@@ -274,7 +281,7 @@ class ManagementDaemon:
 
     async def heartbeat_loop(self):
         """Publish periodic heartbeats with resource usage."""
-        subject = f"agent.vm.{self.job_id}.heartbeat"
+        subject = f"agent.vm.{self.orchestrator_id}.{self.job_id}.heartbeat"
 
         while not self._shutdown.is_set():
             try:
@@ -308,7 +315,7 @@ class ManagementDaemon:
 
     async def agent_monitor_loop(self):
         """Monitor the agent process and report exit status."""
-        subject = f"agent.vm.{self.job_id}.status"
+        subject = f"agent.vm.{self.orchestrator_id}.{self.job_id}.status"
         agent_was_running = False
 
         while not self._shutdown.is_set():
@@ -459,7 +466,7 @@ class ManagementDaemon:
         await self.register()
 
         # Subscribe to control commands
-        control_subject = f"agent.vm.{self.job_id}.control"
+        control_subject = f"agent.vm.{self.orchestrator_id}.{self.job_id}.control"
         await self.nc.subscribe(control_subject, cb=self._on_control)
         log.info("Subscribed to %s", control_subject)
 
