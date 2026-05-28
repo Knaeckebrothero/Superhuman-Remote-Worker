@@ -23,6 +23,12 @@ docker/vpn/research.conf
 .mcp.json
 .playwright-mcp/*
 
+# Tilt — local runtime state + downloaded extensions cache.
+# The Tiltfile itself IS committed (it's the dev-loop recipe).
+.tilt-state/
+tilt_modules/
+.tiltbuild/
+
 # Python virtual environment
 venv/
 env/
