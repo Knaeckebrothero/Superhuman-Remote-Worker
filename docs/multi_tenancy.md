@@ -105,6 +105,8 @@ Five operational items, each independently shippable. Together they're a single 
 
 **Recommended landing order:** **#1 first** (smallest fix, biggest test-unblock — every subsequent M1 item benefits from being able to provision a real second user), then #2 / #3 / #4 / #5 in any order.
 
+**Larger follow-on to #1 — cockpit-owned auth UI (~5–9 days).** Once the SMTP + default-role fix lands and proves the Keycloak-themed register page works, the natural next iteration is replacing Keycloak's themed pages with cockpit-native forms (password login + register, social providers, optional magic-link email-only sign-in). Design captured 2026-05-28 at [features/cockpit_owned_auth_ui.md](features/cockpit_owned_auth_ui.md). Three independently-shippable slices; not blocking the M1.B quick wins but is the v1 unlock for public-facing signup.
+
 ### M1.C — Cloud storage per-user OAuth (~1–2 weeks)
 
 **The actual hosted-product blocker.** `src/services/cloud_sync/` authenticates to OpenCloud (and BYO Nextcloud) as a single shared admin service account; every user's files live under that one identity, namespaced by path. A path-scoping bug → user A reads user B's files. This is the only remaining place in the system where a single bug in our code = cross-user file exposure.
