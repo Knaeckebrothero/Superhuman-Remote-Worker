@@ -1,6 +1,6 @@
 """Tests for the session router service — Service + Ingress per session."""
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 

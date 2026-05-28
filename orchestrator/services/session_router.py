@@ -285,5 +285,3 @@ class SessionRouterService:
             },
             "spec": spec,
         }
-
-    # noqa: keep blank line below for original structure
