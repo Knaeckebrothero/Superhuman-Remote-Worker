@@ -575,6 +575,49 @@
         word-break: break-word;
       }
 
+      .user-text-collapsible {
+        > .user-text-summary {
+          display: flex;
+          align-items: baseline;
+          gap: 6px;
+          cursor: pointer;
+          list-style: none;
+          color: var(--text-primary);
+
+          &::-webkit-details-marker { display: none; }
+          &::marker { display: none; }
+
+          &:hover { color: var(--text-secondary); }
+
+          .user-text-preview {
+            flex: 1;
+            min-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+          }
+
+          .user-text-hint {
+            flex-shrink: 0;
+            color: var(--text-muted);
+            font-size: 12px;
+          }
+
+          .user-text-hint-open { display: none; }
+        }
+
+        &[open] > .user-text-summary {
+          .user-text-preview,
+          .user-text-hint-closed { display: none; }
+
+          .user-text-hint-open { display: inline; }
+        }
+
+        > .user-text {
+          margin-top: 4px;
+        }
+      }
+
       /* historical messages use session divider instead of dimming */
 
       .system-message {
@@ -700,6 +743,7 @@
         border-radius: 0;
         background: var(--surface-0);
         overflow: hidden;
+        max-width: min(720px, 100%);
       }
 
       .tool-head {

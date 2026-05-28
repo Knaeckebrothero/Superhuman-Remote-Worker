@@ -272,6 +272,7 @@ session_router = SessionRouterService(
     ingress_host=os.environ.get("SESSION_INGRESS_HOST", "api.example.com"),
     ingress_class=os.environ.get("SESSION_INGRESS_CLASS", "traefik"),
     annotations=_session_annotations,
+    tls_secret_name=os.environ.get("SESSION_INGRESS_TLS_SECRET") or None,
 )
 
 _session_jwt_secret = os.environ.get("SESSION_JWT_SECRET", "")

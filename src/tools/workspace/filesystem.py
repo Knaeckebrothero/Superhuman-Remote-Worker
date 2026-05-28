@@ -393,8 +393,7 @@ def create_filesystem_tools(context: ToolContext) -> List[Any]:
                 if full_path.is_dir():
                     return f"Exists (directory): {path}"
                 else:
-                    size = workspace.get_size(path)
-                    return f"Exists (file): {path} ({size:,} bytes)"
+                    return f"Exists (file): {path}"
             else:
                 return f"Not found: {path}"
 

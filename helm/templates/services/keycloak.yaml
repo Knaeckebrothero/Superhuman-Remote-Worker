@@ -834,8 +834,8 @@ spec:
                           -s "standardFlowEnabled=true" \
                           -s "directAccessGrantsEnabled=false" \
                           -s "serviceAccountsEnabled=false" \
-                          -s "redirectUris=[\"http://localhost:8085/auth/callback\",\"$API_URL/auth/callback\"]" \
-                          -s "webOrigins=[\"$API_URL\"]" \
+                          -s "redirectUris=[\"http://localhost:8085/auth/callback\",\"$API_URL/auth/callback\",\"$COCKPIT_URL/auth/callback\"]" \
+                          -s "webOrigins=[\"$API_URL\",\"$COCKPIT_URL\"]" \
                           -s "attributes.\"backchannel.logout.url\"=$API_URL/auth/backchannel-logout" \
                           -s "attributes.\"backchannel.logout.session.required\"=true" \
                           -s "attributes.\"backchannel.logout.revoke.offline.tokens\"=false" 2>/dev/null \
@@ -848,8 +848,8 @@ spec:
                         $KC update "clients/$BFFID" -r {{ .Values.keycloak.realm }} \
                           -s "publicClient=false" \
                           -s "clientAuthenticatorType=client-secret" \
-                          -s "redirectUris=[\"http://localhost:8085/auth/callback\",\"$API_URL/auth/callback\"]" \
-                          -s "webOrigins=[\"$API_URL\"]" \
+                          -s "redirectUris=[\"http://localhost:8085/auth/callback\",\"$API_URL/auth/callback\",\"$COCKPIT_URL/auth/callback\"]" \
+                          -s "webOrigins=[\"$API_URL\",\"$COCKPIT_URL\"]" \
                           -s "attributes.\"backchannel.logout.url\"=$API_URL/auth/backchannel-logout" \
                           -s "attributes.\"backchannel.logout.session.required\"=true" 2>/dev/null \
                           || echo "WARN: kcadm cockpit-bff update failed"
