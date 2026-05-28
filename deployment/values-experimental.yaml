@@ -41,11 +41,11 @@ image:
   agent:
     tag: sha-10b5a7d
   cockpit:
-    tag: sha-10b5a7d
+    tag: sha-bcc9b5c
   mcp:
     tag: sha-55ebd17
   workspace:
-    tag: sha-310acc2
+    tag: sha-bcc9b5c
 # -----------------------------------------------------------------------------
 # Secrets — External Secrets Operator (Vault-backed)
 # -----------------------------------------------------------------------------
