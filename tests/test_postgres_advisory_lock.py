@@ -51,7 +51,6 @@ async def test_advisory_lock_executes_correct_sql_with_derived_key():
 @pytest.mark.asyncio
 async def test_advisory_lock_key_is_stable_per_thread_id():
     """Same thread_id → same lock key. Different thread_ids → different keys (very likely)."""
-    from orchestrator.database.postgres import PostgresDB
 
     def derive(tid: str) -> int:
         import hashlib
