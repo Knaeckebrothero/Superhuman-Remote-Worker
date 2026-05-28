@@ -199,6 +199,19 @@ Centralized so every URL helper picks up local-dev (no-TLS) deployments.
 {{- end }}
 
 {{/*
+Internal cluster URL for the orchestrator. Used by other in-cluster pods
+that POST to the orchestrator without round-tripping through the public
+ingress (Keycloak's backchannel-logout callback, future webhook receivers).
+Bypassing the ingress avoids two foot-guns: pods can't always resolve the
+public hostname (split-DNS, the `localhost` loopback-hijack on k3d, etc.),
+and even when they can, the public path is slower and may pin TLS certs
+the in-cluster CA bundle doesn't trust.
+*/}}
+{{- define "srw.orchestratorInternalUrl" -}}
+{{- printf "http://%s-orchestrator:8085" (include "srw.fullname" .) -}}
+{{- end }}
+
+{{/*
 Internal cluster URL for Keycloak — used by orchestrator for back-channel JWKS fetches.
 */}}
 {{- define "srw.keycloakInternalUrl" -}}

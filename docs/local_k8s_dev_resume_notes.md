@@ -1,4 +1,29 @@
-# Local K8s Dev — Resume Notes (2026-05-21)
+# Local K8s Dev — Resume Notes (2026-05-21, updated 2026-05-28)
+
+> **2026-05-28 update:** Path B (same-origin chart restructure) landed. The
+> 3rd-party-cookie refresh loop is fixed. Both `/api` and `/auth` now route
+> through the cockpit host (`https://localhost/`), so the session cookie is
+> first-party and works in Brave/Firefox without browser configuration.
+> Patches in this section: new `auth.bff.sameOriginApi` value flag (default
+> `false`); cockpit ingress conditionally adds `/api` and `/auth` path rules
+> to the orchestrator service; `SRW_BFF_REDIRECT_URI` and env.js `apiUrl`
+> both use the cockpit origin when the flag is on; Keycloak postStart hook
+> now always whitelists both api.* and cockpit-host callback URLs (additive,
+> safe for prod). `deployment/values-local{,.example}.yaml` sets
+> `sameOriginApi: true` and reverts `cookieSamesite` back to `"lax"` (the
+> `"none"` workaround is no longer required).
+>
+> Remaining open items: the orchestrator code change to `bff.py` (the
+> `_cookie_samesite()` helper + `SRW_COOKIE_SAMESITE` env wiring in
+> `deployment.yaml`) is still in the local tree only — needs a commit so CI
+> rebuilds `:latest`. Until then the local image-import workaround is still
+> needed on a fresh cluster. Same goes for all the chart patches landed in
+> the original session.
+
+---
+
+# Original notes (2026-05-21)
+
 
 Snapshot of where we got to setting up a production-parity local Kubernetes
 dev environment on k3d. **Almost there** — the chart deploys, certs validate,

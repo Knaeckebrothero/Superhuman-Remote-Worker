@@ -211,10 +211,22 @@ workspace:
   storageSize: "10Gi"
 
 # -----------------------------------------------------------------------------
-# OpenCloud — pin storage to match existing PVC (K8s rejects shrinks)
+# OpenCloud — pin storage to match existing PVC (K8s rejects shrinks).
+# OIDC needs split-DNS workaround: auth.localhost won't resolve from inside
+# the pod (RFC 6761 says every container thinks `localhost` = its own loopback)
+# so the proxy's verifier can't fetch JWKS. We hostAliases-map it to Traefik's
+# ClusterIP and accept the mkcert-issued cert via oidcInsecureTls. Same wound
+# as the customer's air-gapped server VLAN; this is the local-dev variant.
+# Traefik's ClusterIP is stable for the life of the cluster — re-check after
+# `k3d cluster delete && create`.
 # -----------------------------------------------------------------------------
 opencloud:
   dataStorageSize: "64Gi"
+  oidcInsecureTls: true
+  hostAliases:
+    - ip: "10.43.248.175"
+      hostnames:
+        - "auth.localhost"
 
 # -----------------------------------------------------------------------------
 # Logging — verbose during local dev
