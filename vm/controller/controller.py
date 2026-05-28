@@ -50,6 +50,11 @@ log = logging.getLogger("vm-controller")
 
 # Configuration from environment
 NATS_URL = os.environ.get("NATS_URL", "nats://nats-leaf.nats.svc.cluster.local:4222")
+# Per-orchestrator scope for vm.lifecycle.* subjects. Required when the
+# controller and its orchestrator share a NATS hub with other SRW
+# installations; without it the controller would receive every orchestrator's
+# vm.lifecycle.create and provision duplicate VMs.
+ORCHESTRATOR_ID = os.environ.get("ORCHESTRATOR_ID", "").strip()
 VM_TEMPLATE_PATH = os.environ.get("VM_TEMPLATE_PATH", "/config/vm-template.yaml")
 VM_NAMESPACE = os.environ.get("VM_NAMESPACE", "agent-vms")
 DEFAULT_VM_IMAGE = os.environ.get(
@@ -274,8 +279,7 @@ class VMController:
         status = vm.get("status", {})
         conditions = status.get("conditions", [])
         ready = any(
-            c.get("type") == "Ready" and c.get("status") == "True"
-            for c in conditions
+            c.get("type") == "Ready" and c.get("status") == "True" for c in conditions
         )
         return {
             "job_id": job_id,
@@ -416,12 +420,13 @@ class VMController:
         return web.json_response({"status": "ok"})
 
     async def _publish_status(self, job_id: str, payload: dict):
-        """Publish a status message on vm.lifecycle.status (NATS only)."""
+        """Publish a status message on vm.lifecycle.status.{ORCHESTRATOR_ID}
+        (NATS only)."""
         if not self.nc:
             return
         try:
             await self.nc.publish(
-                "vm.lifecycle.status",
+                f"vm.lifecycle.status.{ORCHESTRATOR_ID}",
                 json.dumps(payload).encode(),
             )
         except Exception:
@@ -457,12 +462,26 @@ class VMController:
         await self.headscale.init()
 
         if TRANSPORT in ("nats", "both"):
+            if not ORCHESTRATOR_ID:
+                log.error(
+                    "ORCHESTRATOR_ID is required for NATS transport — refusing to "
+                    "subscribe to flat vm.lifecycle.* (would cross-talk on shared hub)"
+                )
+                sys.exit(1)
             await self.connect_nats()
-            await self.nc.subscribe("vm.lifecycle.create", cb=self.handle_create)
-            await self.nc.subscribe("vm.lifecycle.delete", cb=self.handle_delete)
-            await self.nc.subscribe("vm.lifecycle.get", cb=self.handle_status_query)
+            suffix = f".{ORCHESTRATOR_ID}"
+            await self.nc.subscribe(
+                f"vm.lifecycle.create{suffix}", cb=self.handle_create
+            )
+            await self.nc.subscribe(
+                f"vm.lifecycle.delete{suffix}", cb=self.handle_delete
+            )
+            await self.nc.subscribe(
+                f"vm.lifecycle.get{suffix}", cb=self.handle_status_query
+            )
             log.info(
-                "Subscribed to vm.lifecycle.{create,delete,get} — waiting for NATS requests"
+                "Subscribed to vm.lifecycle.{create,delete,get}.%s — waiting for NATS requests",
+                ORCHESTRATOR_ID,
             )
 
         if TRANSPORT in ("http", "both"):

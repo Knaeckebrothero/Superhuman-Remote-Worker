@@ -295,6 +295,17 @@ Setting both nats.internal=true and nats.url is a chart-render error
 {{- end }}
 
 {{/*
+Per-orchestrator id used to scope vm.lifecycle.* NATS subjects. Defaults to
+the chart fullname (srw, srw-prod, …) so single-cluster installs Just Work;
+override .Values.orchestratorId when sharing a NATS hub across orchestrators
+so each one binds disjoint vm.lifecycle.*.{id} subjects. Must match the paired
+VM controller chart's orchestratorId.
+*/}}
+{{- define "srw.orchestratorId" -}}
+{{- default (include "srw.fullname" .) .Values.orchestratorId -}}
+{{- end }}
+
+{{/*
 Effective Vault path the bootstrap ExternalSecret reads from.
   - If keycloak.bootstrap.adminCredentialsVaultPath is set explicitly, use it.
   - Otherwise fall back to externalSecrets.vaultPath (the main bundle).

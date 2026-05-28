@@ -202,6 +202,9 @@ data:
   # NATS — when nats.internal=true, points at the in-cluster Service;
   # otherwise the user-supplied .Values.nats.url (empty disables VM lifecycle).
   NATS_URL: {{ include "srw.natsUrl" . | quote }}
+  # Per-orchestrator id used to scope vm.lifecycle.* NATS subjects. Must match
+  # the paired VM controller chart's orchestratorId.
+  ORCHESTRATOR_ID: {{ include "srw.orchestratorId" . | quote }}
 
   # VM Controller (HTTP transport, same-cluster mode). Empty when
   # vmController.enabled=false or transport=nats — orchestrator falls back
