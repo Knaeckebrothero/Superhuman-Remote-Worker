@@ -674,6 +674,12 @@ spec:
                   name: {{ include "srw.configMapName" . }}
                   key: NATS_URL
                   optional: true
+            - name: ORCHESTRATOR_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: ORCHESTRATOR_ID
+                  optional: true
             - name: VM_TEMPLATE_PATH
               valueFrom:
                 configMapKeyRef:

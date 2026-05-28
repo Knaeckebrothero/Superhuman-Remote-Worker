@@ -1099,6 +1099,16 @@ sessionRouter:
   annotations: {}
 
 # =============================================================================
+# Orchestrator identity
+# =============================================================================
+# Per-orchestrator id used to scope vm.lifecycle.* NATS subjects when sharing
+# a NATS hub across SRW installations. Empty (default) falls back to the chart
+# fullname (e.g. "srw", "srw-prod") via the srw.orchestratorId helper. Must
+# match the paired VM controller's `orchestratorId` value on the vm-cluster
+# chart, otherwise publishes drop silently on the controller side.
+orchestratorId: ""
+
+# =============================================================================
 # NATS Messaging (optional)
 # =============================================================================
 # Used by the orchestrator for VM lifecycle commands when VMs are involved.
