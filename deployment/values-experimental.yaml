@@ -16,13 +16,11 @@ license:
 # regardless of how Fleet derives the Helm release name. Keeps DNS names
 # under the 63-char label limit and matches the hostnames assumed in Vault.
 fullnameOverride: srw
-
 # Scope vm.lifecycle.* NATS subjects to this orchestrator. Must match the dev
 # VM controller's `orchestratorId` (deployment-vms/srw-vm-controller/fleet.yaml).
 # Without this, the helper falls back to fullnameOverride ("srw") which doesn't
 # match the controller's "srw-dev" → publishes drop silently.
 orchestratorId: srw-dev
-
 # Connect to the shared homelab NATS hub (Fleet-managed in the HomeLab repo at
 # deployments_managed/nats/). The hub bridges to leaf NATS instances on the
 # vm cluster so VM lifecycle commands can flow cross-cluster.
@@ -49,9 +47,9 @@ global:
 # -----------------------------------------------------------------------------
 image:
   orchestrator:
-    tag: sha-62d9783
+    tag: sha-ef9facf
   agent:
-    tag: sha-10b5a7d
+    tag: sha-ef9facf
   cockpit:
     tag: sha-bcc9b5c
   mcp:
