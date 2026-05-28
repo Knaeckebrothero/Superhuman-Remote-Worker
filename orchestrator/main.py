@@ -253,7 +253,7 @@ vector_db = PostgresDB(
 )
 
 # Session router singletons — see docs/features/direct_session_websockets.md
-import json as _session_json
+import json as _session_json  # noqa: E402
 
 _session_annotations_raw = os.environ.get("SESSION_INGRESS_ANNOTATIONS", "{}")
 try:

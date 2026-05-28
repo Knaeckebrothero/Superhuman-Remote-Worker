@@ -31,8 +31,8 @@ def test_codex_proxy_returns_chat_completions_shape():
     assert isinstance(tc["function"]["arguments"], str)  # arguments is a JSON string
 
 
-from langchain_core.messages import AIMessage, ToolMessage
-from src.llm.session_components import MessageComponents, normalize_response
+from langchain_core.messages import AIMessage, ToolMessage  # noqa: E402
+from src.llm.session_components import MessageComponents, normalize_response  # noqa: E402
 
 
 def test_normalize_ai_message_extracts_four_components_and_raw():
@@ -96,8 +96,8 @@ def test_normalize_tool_message_becomes_tool_result_component():
     assert comp.tool_calls == []
 
 
-import pytest
-from src.llm.session_components import components_to_provider_messages
+import pytest  # noqa: E402
+from src.llm.session_components import components_to_provider_messages  # noqa: E402
 
 
 def test_rebuild_chat_completions_request_from_components():

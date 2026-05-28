@@ -137,8 +137,8 @@ _next_seq: int = 0
 # re-broadcast them onto the SSE notification feed. Replaces the orchestrator's
 # old per-WS-frame inspection. Non-fatal: if NATS is unconfigured or down,
 # WS subscribers still get the event — only the SSE notification mirror is lost.
-import json as _json
-import os as _os
+import json as _json  # noqa: E402
+import os as _os  # noqa: E402
 
 _nats_client = None  # Lazily initialized.
 

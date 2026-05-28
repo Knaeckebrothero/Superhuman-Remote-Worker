@@ -406,7 +406,7 @@ class TestNextOutputOrdinal:
             assert await orch_main._next_output_ordinal("job-x", "main") == "004"
 
 
-import base64 as _b64
+import base64 as _b64  # noqa: E402
 
 # ===========================================================================
 # _graft_subjob_output
