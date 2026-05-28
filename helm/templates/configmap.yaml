@@ -66,7 +66,10 @@ data:
 
   # Cookie BFF — orchestrator-issued sessions for the cockpit.
   # See docs/features/auth_bff_and_api_tokens.md.
-  SRW_BFF_REDIRECT_URI: {{ printf "%s/auth/callback" (include "srw.apiUrl" .) | quote }}
+  # When sameOriginApi=true, the BFF redirect lives on the cockpit origin
+  # (path-routed to the orchestrator) so the OIDC callback and the cockpit
+  # share an origin and the session cookie is first-party.
+  SRW_BFF_REDIRECT_URI: {{ printf "%s/auth/callback" (ternary (include "srw.cockpitUrl" .) (include "srw.apiUrl" .) .Values.auth.bff.sameOriginApi) | quote }}
   SRW_SPA_BASE_URL: {{ include "srw.cockpitUrl" . | quote }}
   # auth.bff.cookieDomain semantics:
   #   "auto" (default) → ".<global.domain>" (rides on cockpit + api subdomains)

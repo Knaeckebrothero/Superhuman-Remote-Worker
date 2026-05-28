@@ -2686,16 +2686,37 @@ async def _record_compaction(
     trigger: str,
     ws: Optional[WebSocket] = None,
 ) -> None:
-    """Notify the client of a context compaction and persist a display-only
-    marker row.
+    """Notify the client of a context compaction and persist a restorable
+    checkpoint row.
 
-    The ``role='summary'`` row makes the banner survive reload; the agent's own
-    resume path excludes it (``src/database/postgres_db.py``) so it never
-    re-enters the LLM context. A non-None ``ws`` sends the live event over the
-    control socket (manual ``/compact``); the auto path passes ``ws=None`` to
-    use the broadcast/SSE channel the loop already feeds.
+    The ``role='summary'`` row drives two things: (1) the "Context summarized"
+    banner survives reload, and (2) it's a restore checkpoint — resume reads
+    ``metrics.boundary_turn`` and loads ``[summary] + history(since_turn=B)``
+    instead of the full pre-compaction history (see
+    ``_restore_session_messages``). The agent's history query excludes
+    ``role='summary'`` (``src/database/postgres_db.py``) so the row never
+    re-enters the LLM context.
+
+    Boundary semantics: ``boundary_turn = turn_count - 1`` is the last
+    *fully-saved* turn. At auto-compaction (mid-turn) the current turn's user
+    message is saved but its AI/tool messages save only at turn-complete; on
+    resume reloading ``turn_number > boundary_turn`` recaptures the whole
+    current turn once it's persisted — lossless, with at most minor in-turn
+    overlap that ``_repair_tool_pairing`` and re-bounding clean. The same rule
+    is safe for manual ``/compact`` and resume-time compaction (where all turns
+    are already fully saved).
+
+    A non-None ``ws`` sends the live event over the control socket (manual
+    ``/compact``); the auto and resume paths pass ``ws=None`` to use the
+    broadcast/SSE channel.
     """
     turn = _session.turn_count if _session else None
+    # Type-guard: defensive against an unexpected turn_count type so an
+    # arithmetic glitch never kills event emission. In production turn_count
+    # is always int (initialized to 0 in PersistentSession); the guard mainly
+    # protects test mocks where a bare MagicMock attribute slips through.
+    turn_int = turn if isinstance(turn, int) else 0
+    boundary_turn = max(turn_int - 1, 0)
     params = {
         "before": before,
         "after": after,
@@ -2718,7 +2739,12 @@ async def _record_compaction(
                 role="summary",
                 content=summary_text,
                 turn_number=turn,
-                metrics={"before": before, "after": after, "trigger": trigger},
+                metrics={
+                    "before": before,
+                    "after": after,
+                    "trigger": trigger,
+                    "boundary_turn": boundary_turn,
+                },
             )
         except Exception as e:
             logger.warning(f"Failed to persist compaction marker (non-fatal): {e}")
@@ -2819,6 +2845,71 @@ def _repair_tool_pairing(messages: list) -> list:
     return repaired
 
 
+def _db_rows_to_lc_messages(db_messages: list) -> list:
+    """Convert ``thread_messages`` rows to LangChain messages with fresh UUIDs.
+
+    Shared by the restore paths (Path A checkpoint+tail, Path B full load).
+    Falls back to positional pairing of tool results for legacy rows whose
+    ``tool_call_id`` column is NULL (predates the column); current rows carry
+    it explicitly. Skips system rows — the loop adds a fresh system from the
+    current config. ``role='summary'`` rows are already excluded by the DB
+    query.
+    """
+    import uuid as _uuid
+    from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+
+    restored: list = []
+    pending_tool_call_ids: list[str] = []
+
+    for db_msg in db_messages:
+        role = db_msg["role"]
+        content = db_msg["content"] or ""
+        tool_calls = db_msg.get("tool_calls")
+
+        # Fresh UUID per restored message. Without an `id`,
+        # `RemoveMessage(id=...)` in compaction is a no-op — a resumed
+        # session that needs compaction could never shrink. The ID is a
+        # LangGraph state key, not user-facing or persisted.
+        msg_id = str(_uuid.uuid4())
+
+        if role in ("human", "user"):
+            restored.append(HumanMessage(content=content, id=msg_id))
+
+        elif role in ("ai", "assistant"):
+            lc_tool_calls = []
+            if tool_calls:
+                lc_tool_calls = [
+                    {
+                        "id": tc.get("id", ""),
+                        "name": tc.get("name", ""),
+                        "args": tc.get("args", {}),
+                    }
+                    for tc in tool_calls
+                ]
+            pending_tool_call_ids = [tc["id"] for tc in lc_tool_calls]
+            restored.append(
+                AIMessage(content=content, tool_calls=lc_tool_calls, id=msg_id)
+            )
+
+        elif role == "tool":
+            # Prefer the persisted tool_call_id; fall back to positional
+            # pairing for legacy rows that predate the column. Pop either
+            # way so the fallback queue stays aligned.
+            fallback_id = pending_tool_call_ids.pop(0) if pending_tool_call_ids else ""
+            tool_call_id = db_msg.get("tool_call_id") or fallback_id
+            restored.append(
+                ToolMessage(
+                    content=content,
+                    tool_call_id=tool_call_id,
+                    id=msg_id,
+                )
+            )
+
+        # Skip system rows — the loop adds a fresh one from current config
+
+    return restored
+
+
 async def _restore_session_messages() -> None:
     """Restore LangChain message history from DB into session.messages.
 
@@ -2826,83 +2917,109 @@ async def _restore_session_messages() -> None:
     On pod restart or session resume, this restores the LLM's conversation
     context so it doesn't start with amnesia.
 
-    Loads the *full* conversation (no message-count cap) and then bounds the
-    working context with ContextManager.ensure_within_limits — the same
-    token-driven compaction a live turn uses (src/persistent_graph.py). The raw
-    conversation always stays in thread_messages for the user to view; only the
-    in-memory LLM context is compacted. Truncating to a fixed message count
-    instead would both lose recent context and risk slicing a tool-call batch
-    (orphaned function_call → Responses API 400).
+    Two paths:
+
+    * **Path A — checkpoint resume:** if a ``role='summary'`` row exists with
+      a ``metrics.boundary_turn`` set, restore
+      ``[SystemMessage(summary)] + history(since_turn=boundary_turn)``. The
+      summary covers turns ≤ boundary_turn; the tail covers everything after.
+      This avoids re-loading the full pre-checkpoint history and
+      re-summarizing on every resume — the fix for the OOM observed on a
+      793-message / 395k-token thread.
+
+    * **Path B — full load (back-compat):** no checkpoint, or
+      ``boundary_turn`` missing (rows that predate this feature). Load the
+      full log and let ``ensure_within_limits`` bound it the same way a live
+      turn would. If that re-summarization actually compacts, persist a
+      fresh checkpoint via ``_record_compaction(trigger="resume")`` so
+      subsequent resumes hit Path A and the "Context summarized" banner
+      appears.
+
+    The raw conversation always stays in ``thread_messages`` for the user to
+    view (cockpit reads it via a separate orchestrator-side query); only the
+    in-memory LLM context is bounded.
     """
     if not _session or not _agent or not _agent.postgres_conn or not _thread_id:
         return
 
     try:
         import uuid as _uuid
-        from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+        from langchain_core.messages import SystemMessage
 
         from ..llm.response_guards import strip_removal_markers
 
+        ctx_mgr = getattr(_session, "context_manager", None)
+        aux = getattr(_session, "auxiliary_llm", None)
+        max_summary_length = getattr(
+            _session.config.context_management, "max_summary_length", 10000
+        )
+
+        ckpt = await _agent.postgres_conn.get_latest_compaction_checkpoint(_thread_id)
+        boundary_turn = ckpt.get("boundary_turn") if ckpt else None
+
+        # ============================================================
+        # Path A — checkpoint resume
+        # ============================================================
+        if ckpt is not None and boundary_turn is not None:
+            db_messages = await _agent.postgres_conn.get_thread_messages_history(
+                thread_id=_thread_id,
+                limit=None,
+                since_turn=boundary_turn,
+            )
+
+            summary_msg = SystemMessage(
+                content=f"[Summary of prior work]\n{ckpt['summary']}",
+                id=str(_uuid.uuid4()),
+            )
+            restored: list = [summary_msg, *_db_rows_to_lc_messages(db_messages)]
+
+            # Defense-in-depth: drop any tool call/result orphaned by an
+            # interrupted persist (e.g. the prior pod died mid-turn before
+            # the tool result was saved). find_safe_slice_start already
+            # guaranteed the live cut never orphaned a pair.
+            restored = _repair_tool_pairing(restored)
+
+            if ctx_mgr and aux and restored:
+                try:
+                    bounded = await ctx_mgr.ensure_within_limits(
+                        restored,
+                        aux,
+                        max_summary_length=max_summary_length,
+                    )
+                    restored = strip_removal_markers(bounded)
+                except Exception as e:
+                    logger.warning(
+                        "Re-bound during checkpoint restore failed "
+                        f"(non-fatal, keeping uncompacted): {e}"
+                    )
+
+            if restored:
+                _session.messages.extend(restored)
+                tail_turn_max = max(
+                    (m.get("turn_number") or 0 for m in db_messages),
+                    default=boundary_turn,
+                )
+                _session.turn_count = max(tail_turn_max, boundary_turn)
+                logger.info(
+                    f"Restored from checkpoint at turn {boundary_turn} for "
+                    f"thread {_thread_id} ({len(restored)} msgs in context; "
+                    f"tail of {len(db_messages)} raw rows; "
+                    f"turn_count={_session.turn_count})"
+                )
+            return
+
+        # ============================================================
+        # Path B — full load (back-compat)
+        # ============================================================
         db_messages = await _agent.postgres_conn.get_thread_messages_history(
             thread_id=_thread_id,
-            limit=None,  # full conversation; compaction (below) bounds the context
+            limit=None,
         )
 
         if not db_messages:
             return
 
-        restored: list = []
-        # Fallback positional pairing for legacy rows whose tool_call_id column
-        # is NULL (predates the column); current rows carry it explicitly.
-        pending_tool_call_ids: list[str] = []
-
-        for db_msg in db_messages:
-            role = db_msg["role"]
-            content = db_msg["content"] or ""
-            tool_calls = db_msg.get("tool_calls")
-
-            # Fresh UUID per restored message. Without an `id`,
-            # `RemoveMessage(id=...)` in compaction is a no-op — a resumed
-            # session that needs compaction could never shrink. The ID is a
-            # LangGraph state key, not user-facing or persisted.
-            msg_id = str(_uuid.uuid4())
-
-            if role in ("human", "user"):
-                restored.append(HumanMessage(content=content, id=msg_id))
-
-            elif role in ("ai", "assistant"):
-                lc_tool_calls = []
-                if tool_calls:
-                    lc_tool_calls = [
-                        {
-                            "id": tc.get("id", ""),
-                            "name": tc.get("name", ""),
-                            "args": tc.get("args", {}),
-                        }
-                        for tc in tool_calls
-                    ]
-                pending_tool_call_ids = [tc["id"] for tc in lc_tool_calls]
-                restored.append(
-                    AIMessage(content=content, tool_calls=lc_tool_calls, id=msg_id)
-                )
-
-            elif role == "tool":
-                # Prefer the persisted tool_call_id; fall back to positional
-                # pairing for legacy rows that predate the column. Pop either
-                # way so the fallback queue stays aligned.
-                fallback_id = (
-                    pending_tool_call_ids.pop(0) if pending_tool_call_ids else ""
-                )
-                tool_call_id = db_msg.get("tool_call_id") or fallback_id
-                restored.append(
-                    ToolMessage(
-                        content=content,
-                        tool_call_id=tool_call_id,
-                        id=msg_id,
-                    )
-                )
-
-            # Skip system messages — the loop adds a fresh one from current config
+        restored = _db_rows_to_lc_messages(db_messages)
 
         # Defense-in-depth: drop any call/result orphaned by an interrupted
         # persist (full load already eliminates truncation orphans).
@@ -2910,20 +3027,15 @@ async def _restore_session_messages() -> None:
 
         # Bound the working context the way a live turn does. Summarizes to
         # (summary + recent) when over the token budget, else passes through.
-        # ensure_within_limits returns a LangGraph reducer delta; this loop has
-        # no reducer, so strip the RemoveMessage markers to materialize it.
-        ctx_mgr = getattr(_session, "context_manager", None)
-        aux = getattr(_session, "auxiliary_llm", None)
+        # ensure_within_limits returns a LangGraph reducer delta; this loop
+        # has no reducer, so strip the RemoveMessage markers to materialize it.
+        pre_compact_len = len(restored)
         if ctx_mgr and aux and restored:
             try:
                 bounded = await ctx_mgr.ensure_within_limits(
                     restored,
                     aux,
-                    max_summary_length=getattr(
-                        _session.config.context_management,
-                        "max_summary_length",
-                        10000,
-                    ),
+                    max_summary_length=max_summary_length,
                 )
                 restored = strip_removal_markers(bounded)
             except Exception as e:
@@ -2941,6 +3053,28 @@ async def _restore_session_messages() -> None:
                 f"Restored {len(restored)} messages for thread {_thread_id} "
                 f"(from {len(db_messages)} stored; last turn: {last_turn})"
             )
+
+            # If a real compaction happened during resume, persist a
+            # checkpoint (writes a role='summary' row with boundary_turn)
+            # so subsequent resumes hit Path A and the banner appears.
+            # Path A itself does NOT re-write here — the existing row
+            # already drives the banner via the cockpit's history render
+            # (avoids the live/history banner double-render).
+            if len(restored) < pre_compact_len:
+                summary_text = extract_summary_text(restored)
+                if summary_text:
+                    try:
+                        await _record_compaction(
+                            summary_text,
+                            pre_compact_len,
+                            len(restored),
+                            trigger="resume",
+                            ws=None,
+                        )
+                    except Exception as e:
+                        logger.debug(
+                            f"Resume compaction checkpoint failed (non-fatal): {e}"
+                        )
 
     except Exception as e:
         logger.warning(f"Failed to restore session messages (non-fatal): {e}")

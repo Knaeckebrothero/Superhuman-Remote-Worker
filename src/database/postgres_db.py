@@ -325,6 +325,7 @@ class PostgresDB:
         thread_id: str,
         limit: Optional[int] = 200,
         offset: int = 0,
+        since_turn: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """Load thread message history. Ordered by turn_number, created_at ASC.
 
@@ -334,6 +335,11 @@ class PostgresDB:
         truncating stored history. A fixed message cap can slice a parallel
         tool-call batch and orphan a function call, which the Responses API
         rejects with a 400.
+
+        Pass ``since_turn=N`` to load only rows with ``turn_number > N``. The
+        resume-from-checkpoint path uses this to skip the pre-checkpoint
+        history that the summary row already covers (see
+        ``get_latest_compaction_checkpoint``).
         """
         query = """
             SELECT id, role, content, tool_calls, turn_number, metrics,
@@ -343,9 +349,12 @@ class PostgresDB:
             FROM thread_messages
             WHERE thread_id = $1
               AND role <> 'summary'
-            ORDER BY turn_number ASC, created_at ASC
         """
         params: List[Any] = [thread_id]
+        if since_turn is not None:
+            params.append(since_turn)
+            query += f"\n              AND turn_number > ${len(params)}"
+        query += "\n            ORDER BY turn_number ASC, created_at ASC"
         if limit is not None:
             params.append(limit)
             query += f"\n            LIMIT ${len(params)}"
@@ -389,6 +398,47 @@ class PostgresDB:
                 }
             )
         return result
+
+    async def get_latest_compaction_checkpoint(
+        self, thread_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Return the latest compaction checkpoint for this thread, if any.
+
+        Reads the newest ``role='summary'`` row (which the main history query
+        excludes). Used by the resume path: if a checkpoint exists, restore
+        ``[summary] + history(since_turn=boundary_turn)`` instead of the full
+        log — avoids re-loading hundreds of messages and re-summarizing from
+        scratch.
+
+        Rolling compactions merge prior summaries into a single new row, so the
+        newest row always carries the cumulative summary. Returns ``None`` when
+        no compaction has been persisted yet (back-compat: fall back to full
+        load). ``boundary_turn`` may be ``None`` on rows written before the
+        checkpoint feature shipped — caller must also fall back in that case.
+        """
+        query = """
+            SELECT content, metrics, turn_number
+            FROM thread_messages
+            WHERE thread_id = $1
+              AND role = 'summary'
+            ORDER BY turn_number DESC NULLS LAST, created_at DESC
+            LIMIT 1
+        """
+        row = await self.fetchrow(query, thread_id)
+        if row is None:
+            return None
+
+        metrics_raw = row["metrics"]
+        metrics = (
+            json.loads(metrics_raw)
+            if isinstance(metrics_raw, (str, bytes))
+            else metrics_raw
+        ) or {}
+        return {
+            "summary": row["content"] or "",
+            "boundary_turn": metrics.get("boundary_turn"),
+            "turn_number": row["turn_number"],
+        }
 
     # =========================================================================
     # SYNC WRAPPERS (for scripts and other sync contexts)

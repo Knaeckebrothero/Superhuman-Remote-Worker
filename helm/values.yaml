@@ -202,6 +202,14 @@ auth:
     # `api.localhost` — Chrome treats those as cross-site, so Lax blocks the
     # session cookie on the cockpit's XHR to the API). "none" requires Secure.
     cookieSamesite: "lax"
+    # -- When true, route /api/* and /auth/* on the cockpit host through the
+    # orchestrator (path-based routing on the cockpit ingress). Makes cockpit
+    # and API same-origin → session cookie is first-party → works in every
+    # browser regardless of 3rd-party cookie policy. The api.* ingress stays
+    # in place (other consumers may use it). Use this for split-host local
+    # dev. In prod where cockpit and api share a base domain, leave false
+    # (cross-subdomain is already same-site).
+    sameOriginApi: false
     # -- Idle session expiry (seconds). Validator rejects a session whose
     # last_seen_at is older than now() - this.
     sessionIdleTimeoutSeconds: 1800

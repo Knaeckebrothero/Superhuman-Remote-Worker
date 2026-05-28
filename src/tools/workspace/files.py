@@ -872,9 +872,8 @@ def create_file_tools(context: ToolContext) -> List[Any]:
                 context._snapshot_callback(path)
 
             workspace.write_file(path, content)
-            size = len(content.encode("utf-8"))
 
-            return f"Written: {path} ({size:,} bytes)"
+            return f"Written: {path}"
 
         except ValueError as e:
             return f"Error: {str(e)}"
@@ -957,14 +956,12 @@ def create_file_tools(context: ToolContext) -> List[Any]:
             if position == "end":
                 new_content = content + new_string
                 workspace.write_file(path, new_content)
-                size = len(new_content.encode("utf-8"))
-                return f"Appended to: {path} ({size:,} bytes)"
+                return f"Appended to: {path}"
 
             if position == "start":
                 new_content = new_string + content
                 workspace.write_file(path, new_content)
-                size = len(new_content.encode("utf-8"))
-                return f"Prepended to: {path} ({size:,} bytes)"
+                return f"Prepended to: {path}"
 
             # Replace mode (default) - requires old_string
             if not old_string:
@@ -993,8 +990,7 @@ def create_file_tools(context: ToolContext) -> List[Any]:
             new_content = content.replace(old_string, new_string, 1)
             workspace.write_file(path, new_content)
 
-            size = len(new_content.encode("utf-8"))
-            return f"Edited: {path} ({size:,} bytes)"
+            return f"Edited: {path}"
 
         except ValueError as e:
             return f"Error: {str(e)}"

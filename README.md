@@ -400,6 +400,8 @@ k3d cluster delete srw                     # destroy the whole cluster (includin
   ```
 - **`PersistentVolumeClaim ... is invalid: ... storage: Forbidden: field can not be less than previous value`** — you tried to shrink a PVC. Either bump the size back up in `values-local.yaml` or delete the PVC and re-upgrade (`kubectl -n srw delete pvc <name>`).
 - **Keycloak in `CreateContainerConfigError` for missing secret keys** — the realm import references env vars for every OIDC client (even disabled ones). Check that all keys from `values-local.example.yaml` are present in `values-local.yaml`.
+- **`https://localhost/` returns 404 right after `k3d cluster start srw`** — Traefik's endpoint discovery can go stale through a long idle (the pod restart cascade after `k3d cluster stop`/`start` sometimes leaves Traefik holding empty endpoint state). Kick it: `kubectl --context=k3d-srw -n kube-system rollout restart deploy/traefik`.
+- **Login lands in a 401-refresh loop in Brave/Firefox** — the chart defaults to `auth.bff.sameOriginApi: true` in `values-local.example.yaml` so the cockpit and BFF share an origin and the session cookie is first-party. If you flipped that off, either flip it back on or allowlist `[*.]localhost` for cookies in the browser. Symptom in orchestrator logs: `GET /auth/callback 302` immediately followed by `GET /api/auth/me 401` on repeat.
 
 ## Development Setup
 

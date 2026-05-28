@@ -279,6 +279,14 @@ spec:
               value: {{ .Release.Namespace | quote }}
             - name: SESSION_INGRESS_ANNOTATIONS
               value: {{ .Values.sessionRouter.annotations | default dict | toJson | quote }}
+            {{- if .Values.sessionRouter.tlsSecretName }}
+            # Per-session Ingress emits a `tls:` block so the browser can open
+            # wss:// on the same TLS entrypoint as the cockpit. Only needed
+            # for split-host edges (cluster-internal LBs without their own
+            # ACME flow, local dev with mkcert, etc.).
+            - name: SESSION_INGRESS_TLS_SECRET
+              value: {{ .Values.sessionRouter.tlsSecretName | quote }}
+            {{- end }}
             # Name + key of the Secret holding the shared HS256 JWT key.
             # The orchestrator passes both through to dynamically-provisioned
             # agent pod manifests (services/agent_provisioner.py) so the
