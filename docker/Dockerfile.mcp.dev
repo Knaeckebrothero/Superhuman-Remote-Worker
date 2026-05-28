@@ -1,0 +1,83 @@
+# syntax=docker/dockerfile:1.7
+# =============================================================================
+# MCP Server Dockerfile (Tilt dev variant)
+# =============================================================================
+#
+# Differences vs docker/Dockerfile.mcp (prod):
+#
+#   1. **BuildKit cache mounts on every download step** for the same
+#      reason as Dockerfile.agent.dev — prod's `--no-cache-dir` and apt
+#      list deletion make layers non-deterministic and kill BuildKit's
+#      cache on warm rebuilds. See docs/features/tilt_inner_loop_dev.md
+#      for the full diagnosis.
+#   2. **watchfiles wrapper instead of plain `python run.py`** — Tilt's
+#      live_update sync drops new files into /app, and `watchfiles`
+#      restarts the FastMCP process. ~5 s edit-to-new-code vs ~15-30 s
+#      for a full image rebuild + pod roll.
+#   3. **No HEALTHCHECK**: K8s probes own liveness/readiness in the dev
+#      cluster; dockerd-side HEALTHCHECK is redundant.
+#
+# Layer ordering matches prod so the iteration loop hits Docker's
+# layer cache for everything except the MCP source files — and Tilt's
+# docker_build live_update keeps those files out of the rebuild path
+# until a fall_back trigger (requirements.txt or Dockerfile.mcp.dev edit)
+# fires.
+# =============================================================================
+
+FROM python:3.11-slim
+
+LABEL maintainer="SRW Team"
+LABEL description="MCP Server (Tilt dev image)"
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+RUN groupadd -r srw && useradd -r -g srw srw
+
+WORKDIR /app
+
+# curl kept for any in-pod debugging; we don't ship a HEALTHCHECK.
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    rm -f /etc/apt/apt.conf.d/docker-clean && \
+    apt-get update && apt-get install -y --no-install-recommends curl
+
+# Install MCP deps. Drop --no-cache-dir so pip uses the cache mount.
+COPY orchestrator/mcp/requirements.txt .
+RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+    pip install -r requirements.txt
+
+# Auto-reload wrapper. `watchfiles` is the canonical tool (it's what
+# uvicorn --reload uses under the hood); CLI usage is `watchfiles <cmd>
+# <path>`. The --filter python flag restricts reloads to .py file
+# changes (skips spurious restarts on .pyc / __pycache__ writes).
+RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+    pip install watchfiles
+
+# Source code LAST. live_update will sync these paths into the running
+# container without a rebuild for ordinary edits.
+COPY --chown=srw:srw orchestrator/mcp/ ./
+# formatters module imported by server.py
+COPY --chown=srw:srw orchestrator/services/formatters.py ./services/formatters.py
+COPY --chown=srw:srw orchestrator/services/__init__.py ./services/__init__.py
+
+# /app and /app/services are created by COPY/WORKDIR with root ownership;
+# `USER srw` then can't write into them, which kills Tilt's live_update
+# sync (it needs to land synced files inside /app and may create temp
+# files in /app/ itself). Chown the tree so srw owns it end-to-end.
+# Prod doesn't hit this because prod never live_updates.
+RUN chown -R srw:srw /app
+
+USER srw
+
+ENV MCP_TRANSPORT=http \
+    MCP_HOST=0.0.0.0 \
+    MCP_PORT=8000 \
+    COCKPIT_API_URL=http://orchestrator:8085
+
+EXPOSE 8000
+
+# watchfiles signature: `watchfiles <python-callable-or-shell-cmd> <path-to-watch>`
+# Passing `--filter python` and the watch path /app keeps the watcher
+# scope tight to .py file changes under the synced source tree.
+CMD ["watchfiles", "--filter", "python", "python run.py", "/app"]

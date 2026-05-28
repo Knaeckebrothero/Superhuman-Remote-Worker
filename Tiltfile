@@ -175,6 +175,77 @@ docker_build(
 )
 
 # -----------------------------------------------------------------------------
+# MCP — FastMCP HTTP server bridging Claude Code → orchestrator REST API.
+# Small, stateless, restart-tolerant. We use live_update sync into /app
+# plus a `watchfiles` wrapper in the dev Dockerfile so source edits
+# trigger a process restart without rebuilding the image. ~3-5 s loop.
+#
+# fall_back_on covers the cases where live_update can't help (requirements
+# bump, Dockerfile change, formatters touch from outside mcp/).
+# -----------------------------------------------------------------------------
+docker_build(
+    'srw-mcp',
+    context='.',
+    dockerfile='docker/Dockerfile.mcp.dev',
+    live_update=[
+        fall_back_on([
+            'docker/Dockerfile.mcp.dev',
+            'orchestrator/mcp/requirements.txt',
+        ]),
+        # Layout matches the Dockerfile's COPYs:
+        #   orchestrator/mcp/   → /app/
+        #   orchestrator/services/formatters.py  → /app/services/formatters.py
+        # The services/__init__.py is copied during build and is small +
+        # rarely touched, so it falls into the same sync — `formatters.py`
+        # is the only file outside mcp/ that's imported by server.py.
+        sync('orchestrator/mcp/', '/app/'),
+        sync('orchestrator/services/formatters.py', '/app/services/formatters.py'),
+    ],
+    ignore=[
+        '**/__pycache__',
+        '**/*.pyc',
+        '**/*.pyo',
+        # Cross-component dirs the mcp build doesn't care about.
+        'src/',
+        'config/',
+        'cockpit/',
+        'helm/',
+        'docs/',
+        'deployment/',
+        'scripts/',
+        'tests/',
+        'workspace/',
+        'agent.py',
+        'init.py',
+        # Other orchestrator code outside of mcp/ + the two synced files
+        # would otherwise trigger fall_back via context-content hash.
+        # `!` negation re-includes the two files the Dockerfile COPYs
+        # from orchestrator/services/.
+        'orchestrator/api/',
+        'orchestrator/auth/',
+        'orchestrator/database/',
+        'orchestrator/dispatch/',
+        'orchestrator/routers/',
+        # services/ uses `*` (not trailing `/`) so `!` negation can
+        # re-include specific files. Excluding the dir outright would
+        # prune the descent and break negation.
+        'orchestrator/services/*',
+        '!orchestrator/services/formatters.py',
+        '!orchestrator/services/__init__.py',
+        'orchestrator/main.py',
+        'orchestrator/requirements.txt',
+        'docker/Dockerfile.orchestrator*',
+        'docker/Dockerfile.agent*',
+        'docker/Dockerfile.cockpit*',
+        'docker/Dockerfile.workspace*',
+        '*.md',
+        '.git/',
+        '.playwright-mcp/',
+        '.tilt-state/',
+    ],
+)
+
+# -----------------------------------------------------------------------------
 # Helm chart — same chart as production. Values stack (last wins):
 #   1. helm/values.yaml                      chart defaults
 #   2. deployment/values-local.yaml          gitignored — dev secrets +
@@ -184,8 +255,8 @@ docker_build(
 #                                            IfNotPresent + prewarm disabled +
 #                                            cockpit envJs mountPath redirect
 #
-# image_keys auto-substitutes the Tilt-built images. MCP is still on GHCR
-# until Slice 4.
+# image_keys auto-substitutes the Tilt-built images for all four
+# components — Slice 4 closed the gap for MCP.
 # -----------------------------------------------------------------------------
 helm_resource(
     'srw',
@@ -195,10 +266,11 @@ helm_resource(
         '--values=deployment/values-local.yaml',
         '--values=deployment/values-tilt.yaml',
     ],
-    image_deps=['srw-orchestrator', 'srw-cockpit', 'srw-agent'],
+    image_deps=['srw-orchestrator', 'srw-cockpit', 'srw-agent', 'srw-mcp'],
     image_keys=[
         ('image.orchestrator.repository', 'image.orchestrator.tag'),
         ('image.cockpit.repository', 'image.cockpit.tag'),
         ('image.agent.repository', 'image.agent.tag'),
+        ('image.mcp.repository', 'image.mcp.tag'),
     ],
 )

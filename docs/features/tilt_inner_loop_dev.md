@@ -1,6 +1,6 @@
 # Tilt-based inner-loop dev environment
 
-**Status**: Slices 1 + 2 + 3 ✅ shipped + live-verified 2026-05-28.
+**Status**: All four slices ✅ shipped + live-verified 2026-05-28.
 - Slice 1 (orchestrator live_update via uvicorn `--reload`): ~3 s end-to-end
   from save to new code serving.
 - Slice 2 (cockpit `ng serve` HMR via live_update sync into `/app/src`):
@@ -8,10 +8,9 @@
   contains edited text via Traefik.
 - Slice 3 (agent rebuild + orchestrator bounce): full rebuild loop end-to-end,
   with Stakater Reloader handling the orchestrator restart so the original
-  doc's `restart_on` wiring turned out unnecessary.
-
-Slice 4 (MCP) still pending. Stage 3 of the local-k8s-dev plan referenced
-in `docs/local_k8s_dev_resume_notes.md:278`.
+  doc's `restart_on` wiring turned out unnecessary. Warm rebuild ~8 s after
+  Dockerfile cache-mount fix.
+- Slice 4 (MCP live_update + watchfiles): ~10 s edit-to-restarted-with-new-code.
 
 ## Problem
 
@@ -393,18 +392,53 @@ orchestrator rebuild (~35 s observed) on the next change. The
 orchestrator rebuild isn't otherwise wasteful but it adds to the
 edit-to-ready wall clock when chaining agent edits.
 
-### Slice 4 — MCP live_update + docs cleanup (~1 h)
+### Slice 4 — MCP live_update + docs cleanup ✅ shipped 2026-05-28
 
-- MCP `Dockerfile.mcp.dev` + Tiltfile entry (mirrors orchestrator).
-- README + CLAUDE.md edits to point at the Tilt path.
-- `project_local_k8s_dev.md` + `project_compose_stack_deprecation.md`
-  memory updates: Stage 3 ✅ done, Tiltfile lives at repo root.
-- Move `docs/local_k8s_dev_resume_notes.md:278` line into a "history"
-  section since Stage 3 is no longer open.
+Final shape:
 
-Acceptance: full smoke-test from README passes under Tilt; cluster
-torn down with `tilt down`; standalone `helm install` (without
-Tilt) still works.
+- `docker/Dockerfile.mcp.dev` (new): apt + pip cache mounts (same
+  pattern as Dockerfile.agent.dev). `watchfiles` installed as the CMD
+  wrapper so a sync into `/app/` triggers an automatic process restart
+  of `python run.py`. No HEALTHCHECK (K8s probes own that).
+- Tiltfile addition: `docker_build('srw-mcp', ...)` with `live_update`
+  syncing `orchestrator/mcp/` → `/app/` and
+  `orchestrator/services/formatters.py` → `/app/services/formatters.py`.
+  `fall_back_on` catches Dockerfile + requirements.txt edits. Big
+  `ignore=` list keeps the watcher tight (cockpit/, src/, agent code,
+  other orchestrator/ subdirs).
+- `helm_resource()` gets `srw-mcp` in `image_deps` and
+  `('image.mcp.repository', 'image.mcp.tag')` in `image_keys`. K8s
+  rolling update on tag change (MCP doesn't reference any reloader-
+  watched ConfigMap, so no Reloader involvement needed).
+
+**Two snags worth recording.**
+
+1. **Negation in `ignore=` requires `*` not `/` trailing.** First cut
+   excluded `orchestrator/services/` with a trailing slash and then
+   `!orchestrator/services/formatters.py` to re-include the one file
+   the Dockerfile needs. Tilt/dockerignore won't descend into a
+   pruned directory, so the negation was dead. The working pattern is
+   `orchestrator/services/*` (without trailing slash, with star) —
+   that prunes the contents but keeps the directory traversable, so
+   the `!` re-include actually fires. Visible as a build error of the
+   form `failed to compute cache key: "/orchestrator/services/__init__.py":
+   not found`.
+2. **Tilt's live_update needs `/app/` writable by the runtime user.**
+   The prod Dockerfile (and our first dev cut) does `COPY --chown=srw:srw
+   orchestrator/mcp/ ./` then `USER srw`, but `/app/` itself is created
+   by WORKDIR as root-owned `drwxr-xr-x`. Tilt's sync runs as `srw` and
+   wants to write into `/app/`, so it failed with `command terminated
+   with exit code 2`. Fixed with a single `RUN chown -R srw:srw /app`
+   right before `USER srw`. Prod doesn't hit this because prod never
+   live_updates.
+
+Acceptance (verified): edit `orchestrator/mcp/server.py` →
+`lastFileTimeSynced` updates within ~5 s → watchfiles restarts the
+python process inside the pod → new server name shows in logs within
+**~10 s of save**. No image rebuild, no pod roll. The MCP `/health`
+endpoint stays up the whole time except for the ~1 s restart window
+(observed one `503 Service Unavailable` followed by `200 OK` in
+matching test logs).
 
 ## Files touched
 
@@ -413,7 +447,7 @@ Tilt) still works.
 - `cockpit/Dockerfile.cockpit.dev` ✅
 - `docker/Dockerfile.orchestrator.dev` ✅
 - `docker/Dockerfile.agent.dev` ✅
-- `docker/Dockerfile.mcp.dev` (Slice 4)
+- `docker/Dockerfile.mcp.dev` ✅
 - `deployment/values-tilt.yaml` ✅
 - `scripts/local-dev-tilt-up.sh` ✅
 - `docs/features/tilt_inner_loop_dev.md` (this doc) ✅
@@ -442,7 +476,9 @@ Tilt) still works.
       updates → Reloader bounces → new orchestrator runs new tag).
       Warm docker build is ~8 s with cache mounts; total edit-to-ready
       is ~85-95 s dominated by Tilt debounce + orchestrator pod restart.
-- [ ] MCP edit loop: save → MCP server responds with new code in <5 s.
+- [x] MCP edit loop: save → MCP server responds with new code in
+      ~10 s (Tilt sync + watchfiles restart). Measured edit-to-restart
+      9.8 s with watchfiles wrapping `python run.py`.
 - [ ] README smoke-test passes (cockpit login, session, job, Gitea SSO,
       OpenCloud SSO) under Tilt.
 - [ ] `tilt down` cleanly stops everything; PVCs survive (DB +
