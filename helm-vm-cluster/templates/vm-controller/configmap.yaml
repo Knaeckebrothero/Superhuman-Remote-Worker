@@ -90,6 +90,7 @@ data:
                       content: |
                         NATS_URL=${NATS_URL}
                         JOB_ID=${JOB_ID}
+                        ORCHESTRATOR_ID=${ORCHESTRATOR_ID}
                     - path: /run/agent/job-config.json
                       permissions: '0644'
                       content: |
@@ -100,13 +101,15 @@ data:
                           "cpu_cores": ${CPU_CORES},
                           "memory": "${MEMORY}",
                           "description": "${DESCRIPTION}",
-                          "nats_url": "${NATS_URL}"
+                          "nats_url": "${NATS_URL}",
+                          "orchestrator_id": "${ORCHESTRATOR_ID}"
                         }
                     - path: /etc/default/sudo-gated
                       permissions: '0644'
                       content: |
                         NATS_URL=${NATS_URL}
                         JOB_ID=${JOB_ID}
+                        ORCHESTRATOR_ID=${ORCHESTRATOR_ID}
                         VM_ID=agent-vm-${JOB_ID}
                     - path: /home/agent-host/.ssh/authorized_keys
                       permissions: '0600'

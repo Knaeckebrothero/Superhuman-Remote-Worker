@@ -128,6 +128,11 @@ class VMController:
             # Always use the local leaf node URL — the VM runs on this cluster,
             # not the orchestrator's cluster where the job's nats_url points.
             "${NATS_URL}": NATS_URL,
+            # Per-orchestrator scope for the management-daemon + sudo-gated
+            # NATS subjects inside the VM. Burned into /etc/default by
+            # cloud-init so the in-VM publishers reach this orchestrator's
+            # scoped subscribe wildcards.
+            "${ORCHESTRATOR_ID}": ORCHESTRATOR_ID,
             "${DESCRIPTION}": job_config.get("description", ""),
             # CDI DataVolume storage
             "${VM_STORAGE_CLASS}": VM_STORAGE_CLASS,

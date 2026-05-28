@@ -184,12 +184,14 @@ async def _ensure_nats_client():
 
 
 async def emit_session_event(method: str, params: dict) -> None:
-    """Publish a notification event to ``session.events.{tid}`` on NATS.
+    """Publish a notification event to ``session.events.{oid}.{tid}`` on NATS.
 
     Mirrors what _broadcast does to WS subscribers but for the
     orchestrator's bridge. Methods not in _NOTIFICATION_METHODS are
     skipped. Failures are non-fatal: if NATS is down, the WS subscribers
-    still get the event.
+    still get the event. If NATS is configured but ORCHESTRATOR_ID is
+    unset the publish is refused (the bridge subscribes to scoped subjects
+    and won't see flat ones — better to log a warning than silently no-op).
     """
     if method not in _NOTIFICATION_METHODS:
         return
@@ -199,9 +201,21 @@ async def emit_session_event(method: str, params: dict) -> None:
     nc = await _ensure_nats_client()
     if not nc:
         return
-    payload = {"thread_id": tid, "method": method, "params": params}
+    oid = (_os.environ.get("ORCHESTRATOR_ID") or "").strip()
+    if not oid:
+        logger.warning(
+            "agent pod: ORCHESTRATOR_ID unset — refusing session.events publish "
+            "(would publish to a subject the orchestrator does not subscribe to)"
+        )
+        return
+    payload = {
+        "thread_id": tid,
+        "method": method,
+        "params": params,
+        "orchestrator_id": oid,
+    }
     try:
-        await nc.publish(f"session.events.{tid}", _json.dumps(payload).encode())
+        await nc.publish(f"session.events.{oid}.{tid}", _json.dumps(payload).encode())
     except Exception as e:
         logger.warning("agent pod: NATS publish failed: %s", e)
 

@@ -116,6 +116,7 @@ sudo tee /etc/default/management-daemon > /dev/null <<'EOF'
 # Overwritten by cloud-init at VM creation time
 NATS_URL=
 JOB_ID=
+ORCHESTRATOR_ID=
 EOF
 
 # -----------------------------------------------------------------------------
@@ -192,6 +193,7 @@ sudo tee /etc/default/sudo-gated > /dev/null <<'SGEOF'
 # Overwritten by cloud-init at VM creation time
 NATS_URL=
 JOB_ID=
+ORCHESTRATOR_ID=
 VM_ID=
 SGEOF
 

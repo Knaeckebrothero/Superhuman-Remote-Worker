@@ -131,6 +131,7 @@ spec:
             userData: |
               NATS_URL=${NATS_URL}
               JOB_ID=${JOB_ID}
+              ORCHESTRATOR_ID=${ORCHESTRATOR_ID}
               AGENT_CONFIG=${AGENT_CONFIG}
               DESCRIPTION=${DESCRIPTION}
               TAILSCALE_AUTH_KEY=${TAILSCALE_AUTH_KEY}
@@ -361,6 +362,17 @@ class TestRenderTemplate:
             "cloudInitNoCloud"
         ]["userData"]
         assert "TAILSCALE_AUTH_KEY=\n" in user_data
+
+    def test_render_injects_orchestrator_id(self, controller):
+        """ORCHESTRATOR_ID is substituted into cloud-init so the in-VM
+        management-daemon publishes to per-orchestrator scoped subjects."""
+        config = {"job_id": "test-id"}
+        result = controller.render_template(config, tailscale_auth_key="")
+
+        user_data = result["spec"]["template"]["spec"]["volumes"][1][
+            "cloudInitNoCloud"
+        ]["userData"]
+        assert "ORCHESTRATOR_ID=test-oid" in user_data
 
     def test_render_injects_headscale_url_from_env(self, controller):
         """HEADSCALE_URL is read from environment and injected."""
