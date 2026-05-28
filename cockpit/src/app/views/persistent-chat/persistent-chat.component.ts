@@ -487,15 +487,16 @@ export function pickCodeServerUrlToOpen(status: IdeSessionStatus | null): string
 
       <!-- Per-event card templates (referenced by the turn loop below). -->
       <ng-template #thoughtCard let-event>
-        <details class="thinking-block event-thought"
-                 [attr.open]="event.status === 'streaming' || chat.narrationMode() === 'verbose' ? '' : null">
+        <details class="thinking-block event-thought" open>
           <summary class="thinking-header">
             <app-icon size="sm" class="thinking-icon">psychology</app-icon>
             <span class="thinking-label">
               {{ (event.status === 'streaming' ? 'chat.thinking.now' : 'chat.thinking.past') | transloco }}
             </span>
           </summary>
-          <div class="thinking-content">{{ event.content }}</div>
+          <div class="thinking-content">
+            <markdown [data]="event.content"></markdown>
+          </div>
         </details>
       </ng-template>
 
@@ -550,7 +551,18 @@ export function pickCodeServerUrlToOpen(status: IdeSessionStatus | null): string
                 </div>
                 <div class="message-body">
                   @if (turn.content) {
-                    <div class="user-text">{{ turn.content }}</div>
+                    @if (isUserMessageLong(turn.content)) {
+                      <details class="user-text-collapsible">
+                        <summary class="user-text-summary">
+                          <span class="user-text-preview">{{ userMessagePreview(turn.content) }}</span>
+                          <span class="user-text-hint user-text-hint-closed">[…]</span>
+                          <span class="user-text-hint user-text-hint-open">▴</span>
+                        </summary>
+                        <div class="user-text">{{ turn.content }}</div>
+                      </details>
+                    } @else {
+                      <div class="user-text">{{ turn.content }}</div>
+                    }
                   }
                   @if (turn.attachments?.length) {
                     <div class="user-attachments">
@@ -2237,6 +2249,33 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     /** Last text event in a turn — used as the collapsed-view headline. */
     lastTextEvent(turn: AssistantTurn): TextEvent | undefined {
         return lastTextOf(turn);
+    }
+
+    /**
+     * Threshold for autocollapsing user messages. Content with more than this
+     * many lines folds into a <details> summary so a multi-screen prompt
+     * doesn't dominate the scroll.
+     */
+    private readonly USER_MESSAGE_COLLAPSE_LINES = 8;
+
+    /** True when a user message exceeds the autocollapse line threshold. */
+    isUserMessageLong(content: string): boolean {
+        if (!content) return false;
+        let lines = 1;
+        for (let i = 0; i < content.length; i++) {
+            if (content.charCodeAt(i) === 10) {
+                lines++;
+                if (lines > this.USER_MESSAGE_COLLAPSE_LINES) return true;
+            }
+        }
+        return false;
+    }
+
+    /** First line of a user message — shown in the collapsed summary. */
+    userMessagePreview(content: string): string {
+        if (!content) return '';
+        const newlineIdx = content.indexOf('\n');
+        return newlineIdx === -1 ? content : content.slice(0, newlineIdx);
     }
 
     /**

@@ -8,7 +8,7 @@ data:
   env.js: |
     (function(window) {
       window['env'] = window['env'] || {};
-      window['env']['apiUrl'] = '{{ include "srw.apiUrl" . }}/api';
+      window['env']['apiUrl'] = '{{ ternary (include "srw.cockpitUrl" .) (include "srw.apiUrl" .) .Values.auth.bff.sameOriginApi }}/api';
       window['env']['giteaUrl'] = '{{ include "srw.gitUrl" . }}/srw';
       window['env']['dozzleUrl'] = '{{ include "srw.urlScheme" . }}://{{ include "srw.dozzleHost" . }}';
       window['env']['minioConsoleUrl'] = '{{ include "srw.urlScheme" . }}://{{ include "srw.minioHost" . }}';

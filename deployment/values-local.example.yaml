@@ -40,7 +40,11 @@ auth:
   bff:
     cookieSecure: "1"
     cookieDomain: ""
-    cookieSamesite: "none"
+    # Same-origin path routing on the cockpit ingress. The cockpit and the
+    # orchestrator BFF share an origin → the session cookie is first-party →
+    # works in Brave/Firefox without disabling their 3rd-party cookie blockers.
+    sameOriginApi: true
+    cookieSamesite: "lax"
 
 # -----------------------------------------------------------------------------
 # Secrets — chart-managed (dev only). Production uses ESO/Vault.

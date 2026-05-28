@@ -51,6 +51,7 @@ class SessionRouterService:
         ingress_host: str,
         ingress_class: str = "traefik",
         annotations: Optional[dict[str, str]] = None,
+        tls_secret_name: Optional[str] = None,
         # Injected for testability; lazy-resolved in production.
         core_api: Any = None,
         networking_api: Any = None,
@@ -59,6 +60,10 @@ class SessionRouterService:
         self._ingress_host = ingress_host
         self._ingress_class = ingress_class
         self._annotations = annotations or {}
+        # Local dev needs the per-session Ingress to be on the same TLS
+        # entrypoint as the cockpit (mkcert/cert-manager). When set, the
+        # Ingress gets a `tls:` block + websecure entrypoint annotation.
+        self._tls_secret_name = tls_secret_name
         self._core_api = core_api
         self._networking_api = networking_api
 
@@ -235,6 +240,36 @@ class SessionRouterService:
     def _ingress_body(
         self, thread_id: str, name: str, pod_name: str, pod_uid: str
     ) -> dict[str, Any]:
+        annotations = dict(self._annotations)
+        spec: dict[str, Any] = {
+            "ingressClassName": self._ingress_class,
+            "rules": [
+                {
+                    "host": self._ingress_host,
+                    "http": {
+                        "paths": [
+                            {
+                                "path": f"/p/{thread_id}",
+                                "pathType": "Prefix",
+                                "backend": {
+                                    "service": {
+                                        "name": name,
+                                        "port": {"number": 8001},
+                                    }
+                                },
+                            }
+                        ]
+                    },
+                }
+            ],
+        }
+        if self._tls_secret_name:
+            spec["tls"] = [
+                {
+                    "hosts": [self._ingress_host],
+                    "secretName": self._tls_secret_name,
+                }
+            ]
         return {
             "apiVersion": "networking.k8s.io/v1",
             "kind": "Ingress",
@@ -245,29 +280,9 @@ class SessionRouterService:
                     "srw.io/thread-id": thread_id,
                     "srw.io/managed-by": "orchestrator",
                 },
-                "annotations": dict(self._annotations),
+                "annotations": annotations,
                 "ownerReferences": [self._owner_ref(pod_name, pod_uid)],
             },
-            "spec": {
-                "ingressClassName": self._ingress_class,
-                "rules": [
-                    {
-                        "host": self._ingress_host,
-                        "http": {
-                            "paths": [
-                                {
-                                    "path": f"/p/{thread_id}",
-                                    "pathType": "Prefix",
-                                    "backend": {
-                                        "service": {
-                                            "name": name,
-                                            "port": {"number": 8001},
-                                        }
-                                    },
-                                }
-                            ]
-                        },
-                    }
-                ],
-            },
+            "spec": spec,
         }
+    # noqa: keep blank line below for original structure

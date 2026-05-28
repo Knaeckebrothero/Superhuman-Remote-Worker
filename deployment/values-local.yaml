@@ -20,6 +20,24 @@ license:
 
 fullnameOverride: srw
 
+# Override image refs with locally-built copies that contain commits from
+# develop HEAD that aren't yet in the published GHCR `:latest` tag (k8s v36
+# auth pin, pod_uid downward-API, legacy WS removal + /p session-router).
+# Drop these blocks once CI publishes a fresh `:latest`.
+image:
+  orchestrator:
+    repository: docker.io/library/srw-orchestrator
+    tag: local-fix
+    pullPolicy: IfNotPresent
+  cockpit:
+    repository: docker.io/library/srw-cockpit
+    tag: local-fix
+    pullPolicy: IfNotPresent
+  agent:
+    repository: docker.io/library/srw-agent
+    tag: local-fix
+    pullPolicy: IfNotPresent
+
 global:
   domain: "localhost"
   # imagePullSecrets:
@@ -36,7 +54,13 @@ auth:
   bff:
     cookieSecure: "1"
     cookieDomain: ""
-    cookieSamesite: "none"
+    # Same-origin path routing on the cockpit ingress. The cockpit and the
+    # orchestrator BFF share an origin → the session cookie is first-party →
+    # works in Brave/Firefox without disabling their 3rd-party cookie blockers.
+    sameOriginApi: true
+    # samesite=lax is enough now (same-origin); "none" was only needed when
+    # the cockpit XHR'd cross-site to api.localhost.
+    cookieSamesite: "lax"
 
 # -----------------------------------------------------------------------------
 # Secrets — chart-managed (dev only). APP_ENCRYPTION_KEY is set explicitly so
@@ -196,3 +220,25 @@ opencloud:
 # Logging — verbose during local dev
 # -----------------------------------------------------------------------------
 logLevel: "DEBUG"
+
+# -----------------------------------------------------------------------------
+# Session router — direct-WS session endpoints. Without this, GET /connection
+# 500s with NoneType .mint (session_tokens guarded behind SESSION_JWT_SECRET).
+#   kubectl -n srw create secret generic srw-session-jwt \
+#     --from-literal=jwt-secret="$(openssl rand -base64 48 | tr -d '\n' | head -c 64)"
+# Then point this overlay at it. ingressHost: localhost so ws_url stays
+# same-origin (matches the /p path rule in the cockpit ingress).
+# -----------------------------------------------------------------------------
+sessionRouter:
+  jwtSecretName: "srw-session-jwt"
+  jwtSecretKey: "jwt-secret"
+  jwtTtlSeconds: 60
+  ingressHost: "localhost"
+  ingressClass: "traefik"
+  # Reuse the cockpit's mkcert-issued TLS secret so per-session Ingresses
+  # land on the same websecure entrypoint. Without this, session Ingresses
+  # serve only on the HTTP port and the browser's wss:// fails handshake.
+  tlsSecretName: "srw-cockpit-tls"
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: "websecure"
+    traefik.ingress.kubernetes.io/router.tls: "true"

@@ -42,6 +42,43 @@ spec:
     - host: {{ $cockpitHost }}
       http:
         paths:
+          {{- if .Values.auth.bff.sameOriginApi }}
+          # Same-origin API: /api, /auth, /ws (control-plane WebSocket), and
+          # /p (session-router WebSocket) on the cockpit host route to the
+          # orchestrator. Avoids cross-site cookies for split-host local dev.
+          # Without these, browser blocks 3rd-party cookies on the API XHRs;
+          # without /ws, WebSocket upgrades hit the cockpit SPA and fail with
+          # "Unexpected response code: 200".
+          # Order matters — longest-prefix-first so traefik matches these
+          # before the cockpit catch-all.
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $fullName }}-orchestrator
+                port:
+                  number: 8085
+          - path: /auth
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $fullName }}-orchestrator
+                port:
+                  number: 8085
+          - path: /ws
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $fullName }}-orchestrator
+                port:
+                  number: 8085
+          # /p is intentionally NOT routed by the cockpit ingress — the
+          # session router creates a per-session Ingress under that prefix
+          # that points directly at the agent pod. Adding a /p Prefix here
+          # would shadow it (Traefik picks the longer-prefix match, but the
+          # per-session Ingress is "longer" only because of the {tid} suffix,
+          # not the literal /p prefix — they collide).
+          {{- end }}
           - path: /
             pathType: Prefix
             backend:

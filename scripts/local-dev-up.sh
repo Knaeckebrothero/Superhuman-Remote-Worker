@@ -102,13 +102,15 @@ $KCTL create namespace "$NAMESPACE" --dry-run=client -o yaml | $KCTL apply -f - 
 if $KCTL -n "$NAMESPACE" get secret srw-vm-ssh-key >/dev/null 2>&1; then
   skip "secret srw-vm-ssh-key already exists in namespace $NAMESPACE"
 else
-  log "generating dummy VM SSH keypair (not used locally — orchestrator just mounts the Secret)"
+  log "generating dummy VM SSH keypair (not used locally — orchestrator + workspace pods mount this Secret)"
   TMPDIR=$(mktemp -d)
   trap 'rm -rf "$TMPDIR"' EXIT
   ssh-keygen -t ed25519 -f "$TMPDIR/key" -N "" -C "srw-local@dev" -q
+  # Key names must match what the chart expects: ssh-privatekey (orchestrator,
+  # mounted via subPath) + ssh-publickey (workspace pod authorized_keys seed).
   $KCTL -n "$NAMESPACE" create secret generic srw-vm-ssh-key \
-    --from-file=id_ed25519="$TMPDIR/key" \
-    --from-file=id_ed25519.pub="$TMPDIR/key.pub"
+    --from-file=ssh-privatekey="$TMPDIR/key" \
+    --from-file=ssh-publickey="$TMPDIR/key.pub"
   ok "vm-ssh-key Secret created"
 fi
 
