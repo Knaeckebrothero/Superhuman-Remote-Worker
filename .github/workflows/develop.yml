@@ -377,8 +377,14 @@ jobs:
             orchestrator/mcp/ orchestrator/services/formatters.py \
             orchestrator/services/__init__.py docker/Dockerfile.mcp)
 
+          # docker/browser-exec is COPY'd into the workspace image at build time
+          # (see Dockerfile.workspace §2c), so changes to it must rebuild the
+          # workspace image. Missing this path caused a0ce92d2's browser-exec
+          # fix to sit unbuilt while sha-310acc2 (the broken first cut) stayed
+          # deployed. See docs/features/browser_workspace_executor.md.
           WORKSPACE=$(has_changes "$SHA_WORKSPACE" \
-            docker/Dockerfile.workspace docker/workspace-entrypoint.sh .playwright-version)
+            docker/Dockerfile.workspace docker/workspace-entrypoint.sh \
+            docker/browser-exec .playwright-version)
 
           VM_CONTROLLER=$(has_changes "$SHA_VM_CONTROLLER" \
             vm/controller/)
