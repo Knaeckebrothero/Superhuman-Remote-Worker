@@ -30,6 +30,23 @@ global:
   # imagePullSecrets:
   #   - name: ghcr-pull-secret
 
+# Image override — use ONLY when GHCR `:latest` is older than the chart on
+# `develop` HEAD (rare; CI rebuilds on every push). The README troubleshooting
+# section has the docker build + k3d image import commands.
+# image:
+#   orchestrator:
+#     repository: docker.io/library/srw-orchestrator
+#     tag: local-fix
+#     pullPolicy: IfNotPresent
+#   cockpit:
+#     repository: docker.io/library/srw-cockpit
+#     tag: local-fix
+#     pullPolicy: IfNotPresent
+#   agent:
+#     repository: docker.io/library/srw-agent
+#     tag: local-fix
+#     pullPolicy: IfNotPresent
+
 # -----------------------------------------------------------------------------
 # Cockpit BFF — HTTPS via mkcert CAIssuer, cookies are Secure. Domain left
 # empty = host-only cookies. `Domain=.localhost` triggers a "public suffix"
@@ -176,5 +193,57 @@ databases:
 workspace:
   accessMode: "ReadWriteOnce"
   storageSize: "10Gi"
+
+# -----------------------------------------------------------------------------
+# Session router — direct-WS session endpoints. The orchestrator mints a JWT
+# at /api/sessions/{tid}/connection that the cockpit uses to open the WS to
+# the agent pod. Without a SESSION_JWT_SECRET, /connection 500s and sessions
+# never come up.
+#
+#   kubectl -n srw create secret generic srw-session-jwt \
+#     --from-literal=jwt-secret="$(openssl rand -base64 48 | tr -d '\n' | head -c 64)"
+#
+# `ingressHost: localhost` keeps the WS same-origin with the cockpit (matches
+# the `/p` route already in the cockpit ingress).
+# `tlsSecretName: srw-cockpit-tls` reuses the mkcert cert so per-session
+# Ingresses land on the same websecure entrypoint.
+# -----------------------------------------------------------------------------
+sessionRouter:
+  jwtSecretName: "srw-session-jwt"
+  jwtSecretKey: "jwt-secret"
+  jwtTtlSeconds: 60
+  ingressHost: "localhost"
+  ingressClass: "traefik"
+  tlsSecretName: "srw-cockpit-tls"
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: "websecure"
+    traefik.ingress.kubernetes.io/router.tls: "true"
+
+# -----------------------------------------------------------------------------
+# OpenCloud — local-dev OIDC workaround.
+#
+# OpenCloud's proxy dereferences OC_OIDC_ISSUER (must stay public, since it
+# string-matches the `iss` claim on every JWT) to fetch JWKS / discovery from
+# inside the pod. On k3d, `auth.localhost` resolves to the pod's own loopback
+# (RFC 6761), so the verifier can't reach Keycloak and every request 401s
+# with "failed to verify access token". Same wound as a customer's air-gapped
+# server VLAN where the public hostname only resolves on the corporate LAN.
+#
+# Two-knob workaround:
+#   1. hostAliases routes `auth.localhost` to Traefik's ClusterIP, so the
+#      proxy hits the cluster's own ingress instead of its loopback.
+#   2. oidcInsecureTls lets the proxy accept the mkcert-issued cert Traefik
+#      presents (OpenCloud's bundled CAs don't include the local root).
+#
+# Traefik's ClusterIP is stable for the life of the cluster but changes after
+# `k3d cluster delete && create`. Re-grab it with:
+#   kubectl -n kube-system get svc traefik -o jsonpath='{.spec.clusterIP}'
+# -----------------------------------------------------------------------------
+opencloud:
+  oidcInsecureTls: true
+  hostAliases:
+    - ip: "10.43.248.175"
+      hostnames:
+        - "auth.localhost"
 
 logLevel: "DEBUG"
