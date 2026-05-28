@@ -20,23 +20,19 @@ license:
 
 fullnameOverride: srw
 
-# Override image refs with locally-built copies that contain commits from
-# develop HEAD that aren't yet in the published GHCR `:latest` tag (k8s v36
-# auth pin, pod_uid downward-API, legacy WS removal + /p session-router).
-# Drop these blocks once CI publishes a fresh `:latest`.
-image:
-  orchestrator:
-    repository: docker.io/library/srw-orchestrator
-    tag: local-fix
-    pullPolicy: IfNotPresent
-  cockpit:
-    repository: docker.io/library/srw-cockpit
-    tag: local-fix
-    pullPolicy: IfNotPresent
-  agent:
-    repository: docker.io/library/srw-agent
-    tag: local-fix
-    pullPolicy: IfNotPresent
+# No image overrides — cockpit/agent/mcp pull from GHCR `:latest`.
+# When running with Tilt (`tilt up`), the orchestrator image is overridden
+# by the Tiltfile via helm_resource's image_keys (see Tiltfile at repo root).
+# When running standalone (`helm install` without Tilt), all four components
+# pull from GHCR.
+#
+# If you need to pin to a locally-built image temporarily (e.g. GHCR :latest
+# lags develop HEAD), uncomment the relevant block:
+#
+# image:
+#   orchestrator: { repository: docker.io/library/srw-orchestrator, tag: local-fix, pullPolicy: IfNotPresent }
+#   cockpit:      { repository: docker.io/library/srw-cockpit,      tag: local-fix, pullPolicy: IfNotPresent }
+#   agent:        { repository: docker.io/library/srw-agent,        tag: local-fix, pullPolicy: IfNotPresent }
 
 global:
   domain: "localhost"
@@ -224,7 +220,7 @@ opencloud:
   dataStorageSize: "64Gi"
   oidcInsecureTls: true
   hostAliases:
-    - ip: "10.43.248.175"
+    - ip: "10.43.216.95"
       hostnames:
         - "auth.localhost"
 

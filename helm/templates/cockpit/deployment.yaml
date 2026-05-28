@@ -64,8 +64,20 @@ spec:
             - containerPort: 4000
           volumeMounts:
             - name: env-js
-              mountPath: /usr/share/nginx/html/assets/env.js
+              mountPath: {{ .Values.cockpit.envJs.mountPath | quote }}
               subPath: env.js
+          {{- if .Values.cockpit.startupProbe.enabled }}
+          # Tilt-mode `ng serve` cold-compile takes 30-90s; without a startup
+          # probe the readiness/liveness probes SIGTERM the container before
+          # the dev server is ready to respond.
+          startupProbe:
+            httpGet:
+              path: /
+              port: 4000
+            initialDelaySeconds: {{ .Values.cockpit.startupProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.cockpit.startupProbe.periodSeconds }}
+            failureThreshold: {{ .Values.cockpit.startupProbe.failureThreshold }}
+          {{- end }}
           livenessProbe:
             httpGet:
               path: /

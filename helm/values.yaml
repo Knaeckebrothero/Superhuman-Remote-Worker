@@ -166,6 +166,26 @@ cockpit:
     limits:
       memory: "512Mi"
       cpu: "250m"
+
+  # Where the chart-rendered env.js ConfigMap mounts inside the cockpit
+  # container. Defaults to the nginx static-asset path (production image
+  # serves it verbatim). Tilt-mode dev image overrides this to land the
+  # file in Angular's source tree so `ng serve` picks it up — set via
+  # `deployment/values-tilt.yaml`.
+  envJs:
+    mountPath: "/usr/share/nginx/html/assets/env.js"
+
+  # Opt-in startupProbe. Production nginx is ready in ~1 s so the existing
+  # liveness probe's 30 s initialDelaySeconds is fine; Tilt-mode `ng serve`
+  # cold-compile takes 30-90 s and trips the readiness probe before the
+  # dev server can respond. Enabling this gives compile time without
+  # slowing prod startup detection (which keeps using liveness/readiness).
+  startupProbe:
+    enabled: false
+    initialDelaySeconds: 10
+    periodSeconds: 5
+    failureThreshold: 30   # ≈10+5×30 = 160 s grace
+
   # NOTE: Model groups, presets, and builder model lists were removed in the
   # DB-backed LLM config migration. Cockpit now reads the catalog from
   # `GET /api/models`, which is the authoritative source (system endpoints

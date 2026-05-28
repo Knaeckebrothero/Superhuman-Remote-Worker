@@ -373,6 +373,53 @@ k3d cluster list             # see all clusters and their state
 
 Stopping the cluster also frees host port 443 — important if you also access the live homelab cluster from this machine on the same domain.
 
+### Fast inner loop with Tilt (optional)
+
+Tilt watches the repo and live-syncs source files into the running pods so a Python edit shows up in the orchestrator without a rebuild-import-rollout cycle. With Tilt running, editing `orchestrator/*.py` takes <5 s to take effect; without it, ~30 s. Tilt is opt-in — everything in this section is optional and the `helm install` path above continues to work standalone.
+
+Design and rationale: [`docs/features/tilt_inner_loop_dev.md`](docs/features/tilt_inner_loop_dev.md).
+
+**One-time install** (binaries to `~/.local/bin/`, no sudo):
+
+```bash
+TILT_VER=0.37.3
+curl -fsSL https://github.com/tilt-dev/tilt/releases/download/v${TILT_VER}/tilt.${TILT_VER}.linux.x86_64.tar.gz \
+  | tar -xz -C ~/.local/bin/ tilt
+chmod +x ~/.local/bin/tilt
+tilt version
+```
+
+**Run Tilt**:
+
+```bash
+./scripts/local-dev-tilt-up.sh
+```
+
+This bootstrap is idempotent — it runs `scripts/local-dev-up.sh` underneath (cluster + cert-manager + namespace + vm-ssh-key Secret), then adds the `srw-session-jwt` Secret, syncs the current Traefik ClusterIP into `values-local.yaml`'s `opencloud.hostAliases` entry, and finally runs `tilt up` in the foreground. Press Ctrl-C to stop Tilt (the cluster keeps running; use `k3d cluster stop srw` to stop that too).
+
+While Tilt is running:
+
+- **Tilt UI** at `https://localhost:10350` — per-resource logs, restart buttons, live-update status.
+- **Cockpit** at `https://localhost/` — same as the non-Tilt path. Log in as `test`/`test`.
+- **Edit `orchestrator/main.py`** (or any orchestrator/src/config Python file) → uvicorn `--reload` re-imports the module in-place, the change is live within seconds. Watch the orchestrator pod's logs in the Tilt UI for the `WatchFiles detected changes` line.
+- **Edit `orchestrator/requirements.txt`** → Tilt rebuilds the dev image (fall_back_on the live-update path) and rolls the pod.
+
+**Scope today (Slice 1)**: orchestrator only. Cockpit, agent, and MCP still use the chart's GHCR images. Cockpit HMR + agent rebuild-automation arrive in later slices — see the design doc for the planned phases.
+
+**Common operations under Tilt**:
+
+```bash
+tilt down                                    # remove the Helm release + stop watching
+tilt trigger srw-orchestrator                # force-rebuild the orchestrator image
+tilt args -- --port 10351                    # run the Tilt UI on a different port
+```
+
+**Known limitations**:
+
+- The dev image runs as root (Tilt's file sync needs write access to `/app`). This is fine for local dev; the production image still drops privileges to `srw`.
+- `uvicorn --reload` doesn't reload changes to the lifespan/startup phase — if you edit `lifespan()` itself, force a restart from the Tilt UI.
+- The orchestrator-only scope means a code change in `src/` (which both orchestrator and agent share) only affects the orchestrator's running copy; the next provisioned agent pod still uses the old image. Agent live-rebuild ships in Slice 3.
+
 ### Updating the install
 
 After editing `values-local.yaml`:
