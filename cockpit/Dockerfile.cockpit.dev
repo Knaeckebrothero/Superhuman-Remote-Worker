@@ -1,0 +1,46 @@
+# =============================================================================
+# Cockpit Dockerfile — DEV variant for Tilt-driven inner-loop dev
+# =============================================================================
+#
+# Differences from production `Dockerfile.cockpit`:
+#   - Single stage: no builder + nginx split; this image IS the Angular
+#     dev server.
+#   - Runs `ng serve` so Tilt's live_update sync into /app/src triggers
+#     Angular's incremental rebuild + HMR push to the browser (~1–3 s loop).
+#   - Listens on port 4000 to match the chart's containerPort + probes.
+#   - `--poll 2000` falls back to polling since inotify rarely propagates
+#     across the docker/containerd volume boundary.
+#   - `--allowed-hosts=true` maps to Vite's `server.allowedHosts: true`,
+#     so requests routed through the chart Service / Traefik aren't
+#     rejected as cross-host. (Angular 21 retired the older
+#     `--disable-host-check` webpack-dev-server flag.)
+#
+# Production parity is intentionally not preserved; this image is dev-only.
+# =============================================================================
+
+FROM node:22-alpine
+
+WORKDIR /app
+
+# Install dependencies first as a cacheable layer. `npm ci` is reproducible
+# (lockfile-driven) and fails fast on drift.
+COPY cockpit/package.json cockpit/package-lock.json /app/
+RUN npm ci
+
+# Copy the rest of the project (src, public, angular.json, configs, scripts).
+COPY cockpit/ /app/
+
+# Prebuild Monaco into public/monaco — production build does this via the
+# `prebuild` npm hook; the dev image needs it at runtime since ng serve
+# serves /public verbatim.
+RUN node scripts/copy-monaco.mjs
+
+EXPOSE 4000
+
+# (Build trigger: this file's content drives the Tilt image hash.)
+
+CMD ["npx", "ng", "serve", \
+     "--host", "0.0.0.0", \
+     "--port", "4000", \
+     "--poll", "2000", \
+     "--allowed-hosts=true"]

@@ -1,0 +1,76 @@
+# =============================================================================
+# Orchestrator Dockerfile — DEV variant for Tilt-driven inner-loop dev
+# =============================================================================
+#
+# Differences from the production `Dockerfile.orchestrator`:
+#   - Runs uvicorn with --reload + --reload-dir so Tilt's live_update sync
+#     into /app picks up file changes without a full pod restart.
+#   - Drops the non-root `srw` user — Tilt's sync writes to /app and a
+#     permission mismatch trips the sync.
+#   - Same builder stage + same runtime apt set, so the build cache mostly
+#     overlaps with the prod image (you don't pay a separate cold build).
+#
+# Production parity is intentionally not preserved; this image is dev-only.
+# `docs/features/tilt_inner_loop_dev.md` has the design rationale.
+# =============================================================================
+
+FROM python:3.11-slim AS builder
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY orchestrator/requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
+
+# -----------------------------------------------------------------------------
+# Dev runtime
+# -----------------------------------------------------------------------------
+FROM python:3.11-slim
+
+LABEL maintainer="SRW Team"
+LABEL description="Orchestrator API — dev image with uvicorn --reload"
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/app \
+    PORT=8085
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libpq5 \
+    curl \
+    openssh-client \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
+
+# Layout matches the prod image: orchestrator content goes directly under /app
+# (so `from services.foo import bar` resolves), src and config keep their
+# package names.
+COPY orchestrator/ /app/
+COPY src/ /app/src/
+COPY config/ /app/config/
+
+# Marker so get_project_root() finds /app (no .git in container)
+RUN touch /app/pyproject.toml
+
+EXPOSE 8085
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+    CMD curl -f http://localhost:${PORT}/api/health || exit 1
+
+# uvicorn --reload re-imports changed modules without restarting the container.
+# --reload-dir keeps the watcher off bytecode caches and tests/.
+CMD ["uvicorn", "main:app", \
+     "--host", "0.0.0.0", \
+     "--port", "8085", \
+     "--reload", \
+     "--reload-dir", "/app", \
+     "--reload-dir", "/app/src", \
+     "--reload-dir", "/app/config"]
