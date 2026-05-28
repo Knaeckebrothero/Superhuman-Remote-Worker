@@ -226,17 +226,24 @@ class TestConnect:
         # Verify subscriptions were created (4 VM lifecycle + 1 sudo + 1 session.events)
         assert mock_nc.subscribe.call_count == 6
 
-        # Check subscription subjects — vm.lifecycle.status is scoped per
-        # orchestrator; other broadcast subjects stay flat in PR-1 (covered
-        # in PR-2).
+        # All broadcast subjects are per-orchestrator scoped.
         subjects = [call.args[0] for call in mock_nc.subscribe.call_args_list]
         assert "vm.lifecycle.status.srw-test" in subjects
-        assert "vm.lifecycle.status" not in subjects  # regression: flat subject gone
-        assert "agent.vm.*.register" in subjects
-        assert "agent.vm.*.heartbeat" in subjects
-        assert "agent.vm.*.status" in subjects
-        assert "sudo.request.>" in subjects
-        assert "session.events.>" in subjects
+        assert "agent.vm.srw-test.*.register" in subjects
+        assert "agent.vm.srw-test.*.heartbeat" in subjects
+        assert "agent.vm.srw-test.*.status" in subjects
+        assert "sudo.request.srw-test.>" in subjects
+        assert "session.events.srw-test.>" in subjects
+        # Regression: legacy flat subjects must not appear
+        for flat in (
+            "vm.lifecycle.status",
+            "agent.vm.*.register",
+            "agent.vm.*.heartbeat",
+            "agent.vm.*.status",
+            "sudo.request.>",
+            "session.events.>",
+        ):
+            assert flat not in subjects
 
     @pytest.mark.asyncio
     async def test_connect_stores_on_vm_ready_callback(self, mock_nats_module, mock_db):
@@ -582,9 +589,9 @@ class TestSendControl:
         mock_nc.publish.assert_awaited_once()
 
         call_args = mock_nc.publish.call_args
-        assert call_args.args[0] == "agent.vm.test-job-123.control"
+        assert call_args.args[0] == "agent.vm.srw-test.test-job-123.control"
         payload = json.loads(call_args.args[1].decode())
-        assert payload == {"action": "freeze"}
+        assert payload == {"action": "freeze", "orchestrator_id": "srw-test"}
 
     @pytest.mark.asyncio
     async def test_send_resume(self, bridge, mock_nc):
@@ -592,7 +599,7 @@ class TestSendControl:
 
         assert result is True
         payload = json.loads(mock_nc.publish.call_args.args[1].decode())
-        assert payload == {"action": "resume"}
+        assert payload == {"action": "resume", "orchestrator_id": "srw-test"}
 
     @pytest.mark.asyncio
     async def test_send_terminate(self, bridge, mock_nc):
@@ -600,14 +607,20 @@ class TestSendControl:
 
         assert result is True
         payload = json.loads(mock_nc.publish.call_args.args[1].decode())
-        assert payload == {"action": "terminate"}
+        assert payload == {"action": "terminate", "orchestrator_id": "srw-test"}
 
     @pytest.mark.asyncio
     async def test_send_control_subject_format(self, bridge, mock_nc):
-        """Verify the subject includes the job_id."""
+        """Verify the scoped subject embeds orchestrator_id and job_id."""
         await bridge.send_control("abc-def-ghi", "freeze")
         subject = mock_nc.publish.call_args.args[0]
-        assert subject == "agent.vm.abc-def-ghi.control"
+        assert subject == "agent.vm.srw-test.abc-def-ghi.control"
+
+    @pytest.mark.asyncio
+    async def test_send_control_refused_when_id_unset(self, unscoped_bridge, mock_nc):
+        result = await unscoped_bridge.send_control("test-job-123", "freeze")
+        assert result is False
+        mock_nc.publish.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_send_control_returns_false_when_unavailable(
@@ -1515,11 +1528,12 @@ class TestSubjectScoping:
         mock_nc.request.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_connect_skips_vm_status_subscribe_when_id_unset(
+    async def test_connect_skips_all_subscribes_when_id_unset(
         self, mock_nats_module, mock_db, monkeypatch
     ):
-        """The non-VM subscriptions still happen so other features keep working;
-        only vm.lifecycle.status is skipped."""
+        """When ORCHESTRATOR_ID is unset, ALL broadcast subscribes are
+        skipped — the bridge refuses to fall back to flat subjects which
+        would cross-talk on a shared NATS hub."""
         from orchestrator.services.nats_bridge import NatsBridge
 
         mock_nc = AsyncMock()
@@ -1535,12 +1549,8 @@ class TestSubjectScoping:
         ):
             await b.connect(db=mock_db)
 
-        subjects = [call.args[0] for call in mock_nc.subscribe.call_args_list]
-        assert not any(s.startswith("vm.lifecycle.status") for s in subjects)
-        # Regression: agent/sudo/session subs are PR-2 work, must still happen
-        assert "agent.vm.*.register" in subjects
-        assert "sudo.request.>" in subjects
-        assert "session.events.>" in subjects
+        # No subscribes at all — neither scoped nor flat.
+        mock_nc.subscribe.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_create_does_not_publish_to_flat_subject(self, bridge, mock_nc):

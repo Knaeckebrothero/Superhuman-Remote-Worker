@@ -22,7 +22,7 @@ async def test_session_event_with_matching_thread_id_broadcasts(monkeypatch):
     bridge._db = db
 
     msg = MagicMock()
-    msg.subject = "session.events.t1"
+    msg.subject = "session.events.srw-test.t1"
     msg.data = json.dumps(
         {
             "thread_id": "t1",
@@ -53,7 +53,7 @@ async def test_session_event_with_mismatched_thread_id_dropped(monkeypatch):
     bridge._db = db
 
     msg = MagicMock()
-    msg.subject = "session.events.t1"
+    msg.subject = "session.events.srw-test.t1"
     msg.data = json.dumps(
         {
             "thread_id": "OTHER-thread",
@@ -81,7 +81,7 @@ async def test_session_event_with_unknown_thread_dropped(monkeypatch):
     bridge._db = db
 
     msg = MagicMock()
-    msg.subject = "session.events.nonexistent"
+    msg.subject = "session.events.srw-test.nonexistent"
     msg.data = json.dumps({"thread_id": "nonexistent", "method": "x"}).encode()
 
     await bridge._on_session_event(msg)
@@ -99,7 +99,7 @@ async def test_session_event_with_invalid_json_dropped(monkeypatch):
     monkeypatch.setattr("orchestrator.services.nats_bridge.notification_feed", feed)
 
     msg = MagicMock()
-    msg.subject = "session.events.t1"
+    msg.subject = "session.events.srw-test.t1"
     msg.data = b"not-json-at-all"
 
     await bridge._on_session_event(msg)  # Must not raise.
@@ -108,7 +108,7 @@ async def test_session_event_with_invalid_json_dropped(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_session_event_with_malformed_subject_dropped(monkeypatch):
-    """Subject not matching session.events.{tid} is dropped."""
+    """Subject not matching session.events.{oid}.{tid} is dropped."""
     from orchestrator.services.nats_bridge import NatsBridge
 
     bridge = NatsBridge(url="nats://test")
@@ -117,6 +117,24 @@ async def test_session_event_with_malformed_subject_dropped(monkeypatch):
 
     msg = MagicMock()
     msg.subject = "wrong.shape"
+    msg.data = json.dumps({"thread_id": "t1", "method": "permission.request"}).encode()
+
+    await bridge._on_session_event(msg)
+    feed.broadcast.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_session_event_with_legacy_three_token_subject_dropped(monkeypatch):
+    """A legacy flat session.events.{tid} subject (no orchestrator scope)
+    no longer matches the 4-token parser — drop it instead of misrouting."""
+    from orchestrator.services.nats_bridge import NatsBridge
+
+    bridge = NatsBridge(url="nats://test")
+    feed = MagicMock()
+    monkeypatch.setattr("orchestrator.services.nats_bridge.notification_feed", feed)
+
+    msg = MagicMock()
+    msg.subject = "session.events.t1"
     msg.data = json.dumps({"thread_id": "t1", "method": "permission.request"}).encode()
 
     await bridge._on_session_event(msg)

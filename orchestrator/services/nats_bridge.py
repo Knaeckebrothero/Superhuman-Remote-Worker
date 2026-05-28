@@ -9,20 +9,22 @@ installed, all operations gracefully return False/None and the system works
 identically without it (same pattern as MongoDB in database/mongodb.py).
 
 Subjects published:
-  vm.lifecycle.create.{oid}    Request VM creation
-  vm.lifecycle.delete.{oid}    Request VM teardown
-  vm.lifecycle.get.{oid}       Request/reply for live VM status
-  agent.vm.{job_id}.control    Freeze/resume/terminate agent process (PR-2: scope to .{oid})
+  vm.lifecycle.create.{oid}         Request VM creation
+  vm.lifecycle.delete.{oid}         Request VM teardown
+  vm.lifecycle.get.{oid}            Request/reply for live VM status
+  agent.vm.{oid}.{job_id}.control   Freeze/resume/terminate agent process
 
 Subjects subscribed:
-  vm.lifecycle.status.{oid}    VM Controller status updates
-  agent.vm.*.register          Management Daemon registration (PR-2: scope to .{oid})
-  agent.vm.*.heartbeat         Management Daemon heartbeats (PR-2: scope to .{oid})
-  agent.vm.*.status            Management Daemon agent exit status (PR-2: scope to .{oid})
+  vm.lifecycle.status.{oid}         VM Controller status updates
+  agent.vm.{oid}.*.register         Management Daemon registration
+  agent.vm.{oid}.*.heartbeat        Management Daemon heartbeats
+  agent.vm.{oid}.*.status           Management Daemon agent exit status
+  sudo.request.{oid}.>              Sudo approval requests from sudo-gated daemons
+  session.events.{oid}.>            Agent pod notification events (session.events.{oid}.{tid})
 
 {oid} is the value of the ORCHESTRATOR_ID env var (Helm: .Values.orchestratorId,
 defaults to chart fullname). Required to safely share a NATS hub with other
-SRW orchestrators — empty value refuses to publish/subscribe vm.lifecycle.*.
+SRW orchestrators — empty value refuses to publish/subscribe.
 """
 
 import json
@@ -145,33 +147,48 @@ class NatsBridge:
                 reconnect_time_wait=2,
             )
 
-            # Subscribe to VM lifecycle subjects (4 specific subscriptions)
-            status_subj = self._subj("vm.lifecycle.status")
-            if status_subj is None:
+            # Subscribe to VM lifecycle subjects. All broadcast subjects are
+            # per-orchestrator scoped so multiple SRW installs can share a
+            # NATS hub without cross-talk. Refuse to fall back to flat
+            # subjects when ORCHESTRATOR_ID is unset — that would re-introduce
+            # cross-talk on a shared hub.
+            if not self._orchestrator_id:
                 logger.error(
-                    "Skipping vm.lifecycle.status subscribe — ORCHESTRATOR_ID unset"
+                    "Skipping all NATS subscribes — ORCHESTRATOR_ID unset. "
+                    "Set ORCHESTRATOR_ID (Helm: orchestratorId value) to enable."
                 )
             else:
-                await self._nc.subscribe(status_subj, cb=self._on_vm_lifecycle_status)
-            await self._nc.subscribe("agent.vm.*.register", cb=self._on_daemon_register)
-            await self._nc.subscribe(
-                "agent.vm.*.heartbeat", cb=self._on_daemon_heartbeat
-            )
-            await self._nc.subscribe("agent.vm.*.status", cb=self._on_daemon_status)
+                oid = self._orchestrator_id
+                await self._nc.subscribe(
+                    f"vm.lifecycle.status.{oid}", cb=self._on_vm_lifecycle_status
+                )
+                await self._nc.subscribe(
+                    f"agent.vm.{oid}.*.register", cb=self._on_daemon_register
+                )
+                await self._nc.subscribe(
+                    f"agent.vm.{oid}.*.heartbeat", cb=self._on_daemon_heartbeat
+                )
+                await self._nc.subscribe(
+                    f"agent.vm.{oid}.*.status", cb=self._on_daemon_status
+                )
 
-            # Subscribe to sudo approval requests (from sudo-gated daemons)
-            from .sudo_gate import sudo_gate
+                # Subscribe to sudo approval requests (from sudo-gated daemons)
+                from .sudo_gate import sudo_gate
 
-            sudo_gate.connect(db=db, nc=self._nc)
-            await self._nc.subscribe("sudo.request.>", cb=sudo_gate.on_sudo_request)
+                sudo_gate.connect(db=db, nc=self._nc)
+                await self._nc.subscribe(
+                    f"sudo.request.{oid}.>", cb=sudo_gate.on_sudo_request
+                )
 
-            # Session event re-broadcast: agent pods publish notification
-            # events to session.events.{thread_id}; we forward to the SSE
-            # feed after filtering. The defense-in-depth payload-level
-            # thread_id check guards against a misbehaving pod publishing
-            # for another thread. See docs/issues/nats_subject_acl_hardening.md
-            # for the deferred transport-layer enforcement.
-            await self._nc.subscribe("session.events.>", cb=self._on_session_event)
+                # Session event re-broadcast: agent pods publish notification
+                # events to session.events.{oid}.{thread_id}; we forward to
+                # the SSE feed after filtering. The defense-in-depth
+                # payload-level thread_id check guards against a misbehaving
+                # pod publishing for another thread. See
+                # docs/issues/nats_subject_acl_hardening.md.
+                await self._nc.subscribe(
+                    f"session.events.{oid}.>", cb=self._on_session_event
+                )
 
             self._available = True
             logger.info("NATS bridge connected: %s", self._url)
@@ -349,8 +366,15 @@ class NatsBridge:
         if not self._available:
             return False
 
-        payload = {"action": action}
-        subject = f"agent.vm.{job_id}.control"
+        if not self._orchestrator_id:
+            logger.error(
+                "Refusing agent.vm.*.control publish for job %s — ORCHESTRATOR_ID unset",
+                job_id,
+            )
+            return False
+
+        payload = {"action": action, "orchestrator_id": self._orchestrator_id}
+        subject = f"agent.vm.{self._orchestrator_id}.{job_id}.control"
         try:
             await self._nc.publish(subject, json.dumps(payload).encode())
             logger.info("Sent control '%s' to %s", action, subject)
@@ -494,7 +518,7 @@ class NatsBridge:
             logger.exception("Error handling daemon heartbeat")
 
     async def _on_session_event(self, msg: Any) -> None:
-        """Forward a session.events.{tid} event to the SSE notification feed.
+        """Forward a session.events.{oid}.{tid} event to the SSE notification feed.
 
         Defense-in-depth: the payload's claimed thread_id must match the
         subject's thread_id AND must resolve to an existing thread in DB.
@@ -507,12 +531,19 @@ class NatsBridge:
             logger.warning("session.events: invalid JSON: %s", e)
             return
 
-        # Extract thread_id from subject ("session.events.{tid}").
-        subject_parts = msg.subject.split(".")
-        if len(subject_parts) != 3 or subject_parts[0:2] != ["session", "events"]:
+        # Extract thread_id from subject ("session.events.{oid}.{tid}"). The
+        # subscriber wildcard is `session.events.{oid}.>` so only this
+        # orchestrator's events arrive here; the oid token in subject_parts[2]
+        # is informational (already filtered by NATS).
+        subject_parts = msg.subject.split(".", 3)
+        if (
+            len(subject_parts) != 4
+            or subject_parts[0:2] != ["session", "events"]
+            or not subject_parts[3]
+        ):
             logger.warning("session.events: malformed subject: %s", msg.subject)
             return
-        subject_tid = subject_parts[2]
+        subject_tid = subject_parts[3]
         payload_tid = payload.get("thread_id")
 
         if payload_tid != subject_tid:
