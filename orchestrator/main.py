@@ -725,6 +725,54 @@ async def workspace_idle_sweeper(shutdown_event: asyncio.Event) -> None:
     logger.info("Workspace idle sweeper stopped")
 
 
+async def code_server_settings_sweeper(shutdown_event: asyncio.Event) -> None:
+    """Background loop: reconcile per-user code-server IDE settings.
+
+    Workspaces are network-isolated from the orchestrator (egress is denied), so
+    instead of the workspace pushing changes, the orchestrator pulls inward on a
+    ~10-minute cycle: it reads each active workspace's code-server config files
+    (settings.json, keybindings.json, snippets) over SSH and merges any newer
+    edits into the owning user's stored settings (``users.settings['ide']``).
+    Conflict resolution is by filesystem mtime — newest wins, per file — so the
+    cycle order across a user's workspaces doesn't matter. See
+    orchestrator/services/ide_settings.py.
+    """
+    if os.environ.get("IDE_SETTINGS_SYNC_ENABLED", "true").lower() not in (
+        "1",
+        "true",
+        "yes",
+    ):
+        logger.info("Code-server settings sweeper disabled (IDE_SETTINGS_SYNC_ENABLED)")
+        return
+
+    from services.ide_settings import (
+        IdeSettingsStore,
+        pull_ide_config,
+        reconcile_ide_settings,
+    )
+
+    interval = float(os.environ.get("IDE_SETTINGS_SYNC_INTERVAL_S", "600"))
+    store = IdeSettingsStore(postgres_db)
+    logger.info("Code-server settings sweeper started (interval=%.0fs)", interval)
+    while not shutdown_event.is_set():
+        try:
+            workspaces = await postgres_db.list_active_ide_workspaces()
+            if workspaces:
+                count = await reconcile_ide_settings(store, workspaces, pull_ide_config)
+                if count:
+                    logger.info("IDE settings sweeper: synced %d file(s)", count)
+        except Exception as e:
+            logger.error("Error in code-server settings sweeper: %s", e)
+
+        try:
+            await asyncio.wait_for(shutdown_event.wait(), timeout=interval)
+            break
+        except asyncio.TimeoutError:
+            pass
+
+    logger.info("Code-server settings sweeper stopped")
+
+
 async def snapshot_gc_sweeper(shutdown_event: asyncio.Event) -> None:
     """Background task that runs snapshot garbage collection daily.
 
@@ -3385,6 +3433,9 @@ async def lifespan(app: FastAPI):
     attention_sleep_task = asyncio.create_task(attention_sleep_sweeper(_shutdown_event))
     ide_sweeper_task = asyncio.create_task(ide_session_ttl_sweeper(_shutdown_event))
     ws_sweeper_task = asyncio.create_task(workspace_idle_sweeper(_shutdown_event))
+    ide_settings_sweeper_task = asyncio.create_task(
+        code_server_settings_sweeper(_shutdown_event)
+    )
     gc_sweeper_task = asyncio.create_task(snapshot_gc_sweeper(_shutdown_event))
     imap_task = asyncio.create_task(imap_poll_loop(_shutdown_event))
     digest_task = asyncio.create_task(quiet_hours_digest_loop(_shutdown_event))
@@ -3461,6 +3512,7 @@ async def lifespan(app: FastAPI):
     await attention_sleep_task
     await ide_sweeper_task
     await ws_sweeper_task
+    await ide_settings_sweeper_task
     await gc_sweeper_task
     await imap_task
     await digest_task

@@ -1,0 +1,429 @@
+"""Per-user code-server IDE settings store.
+
+Persists a user's small code-server config (``settings.json``,
+``keybindings.json``, snippets) under ``users.settings['ide']['files']`` and
+reconciles config pulled from workspaces using filesystem mtimes — newest wins,
+per file.
+
+Storage shape::
+
+    users.settings = {
+        "ide": {"files": {
+            "settings.json":        {"content": "...", "mtime": 1716800000.0},
+            "keybindings.json":     {"content": "...", "mtime": 1716800012.0},
+            "snippets/python.json": {"content": "...", "mtime": 1716799000.0},
+        }},
+        # ...other unrelated user settings live alongside "ide"...
+    }
+
+``PostgresDB.update_user_settings`` is a SHALLOW top-level ``||`` JSONB merge, so
+writing ``{"ide": ...}`` replaces the whole ``ide`` value rather than deep-merging
+it. To avoid clobbering sibling files (or sibling ``ide`` sub-keys) we
+read-modify-write the entire ``ide`` subtree. This is safe because the only
+writer — the reconciler sweeper — is single-threaded.
+
+Conflict resolution is purely mtime-based: an applied file wins only if its mtime
+is strictly newer than what is stored. That makes ``apply_pulled_files`` order-
+independent across workspaces — the newest edit wins no matter which workspace is
+reconciled first.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import binascii
+import json
+import logging
+from typing import Any, Awaitable, Callable, Optional
+
+logger = logging.getLogger(__name__)
+
+# code-server's user-data dir (set via --user-data-dir in the workspace image).
+CODE_SERVER_USER_DIR = "/var/lib/code-server/User"
+# Top-level config files we track (snippets/* are discovered dynamically).
+TRACKED_FILES = ("settings.json", "keybindings.json")
+SNIPPETS_SUBDIR = "snippets"
+
+# SSH ports: workspace containers run sshd on 30022; VMs on 22.
+DEFAULT_WS_SSH_PORT = 30022
+DEFAULT_VM_SSH_PORT = 22
+
+# Markers framing each file in the remote pull script's stdout. Content is
+# base64-encoded between them so arbitrary bytes/newlines survive transport.
+_FILE_MARKER = "__SRWFILE__"
+_END_MARKER = "__SRWEND__"
+
+
+def build_pull_script() -> str:
+    """Remote shell script that emits each tracked config file with its mtime.
+
+    Output is a sequence of ``__SRWFILE__<name>\\t<mtime>`` headers, the file's
+    base64 body, and an ``__SRWEND__`` terminator. Names are relative to the
+    code-server User dir, so snippets come through as ``snippets/<file>``.
+    """
+    return (
+        f"cd {CODE_SERVER_USER_DIR} 2>/dev/null || exit 0\n"
+        f"for f in {' '.join(TRACKED_FILES)} {SNIPPETS_SUBDIR}/*; do\n"
+        '  [ -f "$f" ] || continue\n'
+        '  m=$(stat -c %Y "$f" 2>/dev/null) || continue\n'
+        f'  printf \'{_FILE_MARKER}%s\\t%s\\n\' "$f" "$m"\n'
+        '  base64 "$f"\n'
+        f"  printf '{_END_MARKER}\\n'\n"
+        "done\n"
+    )
+
+
+def parse_pull_output(stdout: str) -> dict[str, dict]:
+    """Parse :func:`build_pull_script` output into ``{name: {content, mtime}}``.
+
+    Malformed sections (bad base64, non-numeric mtime, non-utf8) are skipped
+    rather than raising — a single corrupt file must not abort the whole pull.
+    """
+    result: dict[str, dict] = {}
+    lines = stdout.split("\n")
+    i, n = 0, len(lines)
+    while i < n:
+        line = lines[i]
+        if not line.startswith(_FILE_MARKER):
+            i += 1
+            continue
+        name, _, mtime_s = line[len(_FILE_MARKER) :].partition("\t")
+        i += 1
+        body: list[str] = []
+        while i < n and lines[i] != _END_MARKER:
+            body.append(lines[i].strip())
+            i += 1
+        try:
+            content = base64.b64decode("".join(body)).decode("utf-8")
+            mtime = float(mtime_s)
+        except (binascii.Error, ValueError, UnicodeDecodeError):
+            logger.warning("ide_settings: skipping unparseable config file %r", name)
+        else:
+            if name:
+                result[name] = {"content": content, "mtime": mtime}
+        i += 1  # step past the end marker
+    return result
+
+
+def resolve_ssh_target(context: dict) -> Optional[tuple[str, int]]:
+    """Resolve a workspace context to an ``(ssh_host, ssh_port)`` pair.
+
+    Mirrors the precedence the snapshot/suspension path uses, extended to
+    restored IDE sessions: container → VM, preferring an in-cluster pod IP over a
+    VM's Tailscale ssh_host. Returns None when no reachable target exists.
+    """
+    ws = context.get("workspace_container") or {}
+    vm = context.get("vm") or {}
+    ide = context.get("ide_session") or {}
+
+    host = (
+        ws.get("pod_ip")
+        or ws.get("host")
+        or ide.get("pod_ip")
+        or vm.get("ssh_host")
+        or vm.get("pod_ip")
+    )
+    if not host:
+        return None
+
+    if ws.get("pod_ip") or ws.get("host"):
+        port = ws.get("port") or DEFAULT_WS_SSH_PORT
+    elif ide.get("pod_ip"):
+        port = ide.get("ssh_port") or DEFAULT_WS_SSH_PORT
+    else:
+        port = vm.get("ssh_port") or DEFAULT_VM_SSH_PORT
+    return host, int(port)
+
+
+def _shq(s: str) -> str:
+    """POSIX single-quote-escape ``s`` for safe embedding in a shell command."""
+    return "'" + s.replace("'", "'\\''") + "'"
+
+
+def build_seed_script(files: dict[str, dict]) -> str:
+    """Shell script that writes ``files`` into the code-server User dir.
+
+    Content is delivered base64-encoded (binary-safe), each file's mtime is set
+    with ``touch -d @<mtime>`` so an untouched seeded session never looks newer
+    than the store, and ownership is reset to ``agent-host`` at the end. This same
+    script is both mounted into workspace containers (as a ConfigMap ``seed.sh``
+    the entrypoint runs) and piped over SSH to VMs on ready / IDE-session restore.
+    """
+    if not files:
+        return "exit 0\n"
+
+    parts: list[str] = [f"mkdir -p {CODE_SERVER_USER_DIR}/{SNIPPETS_SUBDIR}\n"]
+    for name, entry in files.items():
+        path = f"{CODE_SERVER_USER_DIR}/{name}"
+        qpath = _shq(path)
+        b64 = base64.b64encode((entry.get("content") or "").encode("utf-8")).decode(
+            "ascii"
+        )
+        parts.append(f'mkdir -p "$(dirname {qpath})"\n')
+        parts.append(f"base64 -d > {qpath} <<'__SRWB64__'\n{b64}\n__SRWB64__\n")
+        mtime = entry.get("mtime")
+        if mtime is not None:
+            parts.append(f"touch -d @{mtime} {qpath}\n")
+    parts.append(f"chown -R agent-host:agent-host {CODE_SERVER_USER_DIR}\n")
+    return "".join(parts)
+
+
+# Runner signature: (host, port, remote_script, key_path, timeout) -> (rc, stdout, stderr)
+SshRunner = Callable[..., Awaitable[tuple[int, Any, Any]]]
+
+
+async def _default_ssh_runner(
+    host: str, port: int, script: str, key_path: Optional[str] = None, timeout: int = 20
+) -> tuple[int, bytes, bytes]:
+    """Run ``script`` on ``agent-host@host`` over SSH; return (rc, stdout, stderr)."""
+    # Lazy import keeps this module import-light (no ssh/subprocess deps at import
+    # time), mirroring ssh_helpers' own design.
+    from services.ssh_helpers import build_agent_ssh_cmd
+
+    cmd = build_agent_ssh_cmd(host, port, script, key_path=key_path)
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        raise
+    return proc.returncode, stdout, stderr
+
+
+async def pull_ide_config(
+    ssh_host: str,
+    ssh_port: int,
+    *,
+    key_path: Optional[str] = None,
+    timeout: int = 20,
+    _runner: Optional[SshRunner] = None,
+) -> dict[str, dict]:
+    """Read the code-server config files from a workspace over SSH.
+
+    Returns ``{name: {content, mtime}}`` (possibly empty). Never raises — any SSH
+    failure, timeout, or non-zero exit yields an empty dict so the reconciler can
+    skip an unreachable workspace and move on.
+    """
+    runner = _runner or _default_ssh_runner
+    try:
+        rc, stdout, stderr = await runner(
+            ssh_host, ssh_port, build_pull_script(), key_path=key_path, timeout=timeout
+        )
+    except Exception as e:  # noqa: BLE001 — must not abort the sweep
+        logger.warning(
+            "ide_settings: pull failed for %s:%s — %s", ssh_host, ssh_port, e
+        )
+        return {}
+    if rc != 0:
+        err = (
+            stderr.decode("utf-8", "replace")
+            if isinstance(stderr, (bytes, bytearray))
+            else (stderr or "")
+        )
+        logger.info(
+            "ide_settings: pull rc=%s for %s:%s — %s", rc, ssh_host, ssh_port, err[:200]
+        )
+        return {}
+    text = (
+        stdout.decode("utf-8", "replace")
+        if isinstance(stdout, (bytes, bytearray))
+        else (stdout or "")
+    )
+    return parse_pull_output(text)
+
+
+async def seed_ide_config(
+    ssh_host: str,
+    ssh_port: int,
+    files: dict[str, dict],
+    *,
+    key_path: Optional[str] = None,
+    timeout: int = 20,
+    _runner: Optional[SshRunner] = None,
+) -> bool:
+    """Write the user's stored config into a workspace over SSH (restore path).
+
+    Returns True on success. Never raises — a failed seed must not block restore.
+    """
+    if not files:
+        return True
+    runner = _runner or _default_ssh_runner
+    try:
+        rc, _stdout, stderr = await runner(
+            ssh_host,
+            ssh_port,
+            build_seed_script(files),
+            key_path=key_path,
+            timeout=timeout,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "ide_settings: seed failed for %s:%s — %s", ssh_host, ssh_port, e
+        )
+        return False
+    if rc != 0:
+        err = (
+            stderr.decode("utf-8", "replace")
+            if isinstance(stderr, (bytes, bytearray))
+            else (stderr or "")
+        )
+        logger.warning(
+            "ide_settings: seed rc=%s for %s:%s — %s", rc, ssh_host, ssh_port, err[:200]
+        )
+        return False
+    return True
+
+
+async def seed_ide_config_for_user(
+    db: Any,
+    user_id: Optional[str],
+    ssh_host: str,
+    ssh_port: int,
+    *,
+    key_path: Optional[str] = None,
+    _runner: Optional[SshRunner] = None,
+) -> bool:
+    """Seed a user's stored code-server config into a workspace over SSH.
+
+    Convenience wrapper used by the VM-ready and IDE-session-restore paths
+    (containers seed via ConfigMap instead). No-ops cleanly when there's no user
+    or no stored config. Never raises.
+    """
+    if not user_id:
+        return True
+    files = await IdeSettingsStore(db).get_ide_files(str(user_id))
+    if not files:
+        return True
+    return await seed_ide_config(
+        ssh_host, ssh_port, files, key_path=key_path, _runner=_runner
+    )
+
+
+PullFn = Callable[[str, int], Awaitable[dict]]
+
+
+def _coerce_context(context: Any) -> dict:
+    """Accept a context that may arrive as a dict or a JSON string."""
+    if isinstance(context, str):
+        try:
+            return json.loads(context)
+        except (json.JSONDecodeError, TypeError):
+            return {}
+    return context or {}
+
+
+async def reconcile_ide_settings(
+    store: IdeSettingsStore, workspaces: list[dict], pull_fn: PullFn
+) -> int:
+    """Pull config from each active workspace and merge into per-user storage.
+
+    ``workspaces`` is a list of ``{"user_id", "context"}`` rows. Each is resolved
+    to an SSH target, pulled, and applied. Order-independent: the store keeps the
+    newest mtime per file, so two workspaces of the same user converge on the
+    latest edit regardless of iteration order. A failure on one workspace is
+    logged and skipped — it never aborts the sweep.
+
+    Returns the total number of files updated across all users this cycle.
+    """
+    updated_total = 0
+    for ws in workspaces:
+        user_id = ws.get("user_id")
+        if not user_id:
+            continue
+        target = resolve_ssh_target(_coerce_context(ws.get("context")))
+        if not target:
+            continue
+        host, port = target
+        try:
+            pulled = await pull_fn(host, port)
+        except Exception as e:  # noqa: BLE001 — one bad workspace must not abort
+            logger.warning(
+                "ide_settings: reconcile pull failed for %s:%s — %s", host, port, e
+            )
+            continue
+        if not pulled:
+            continue
+        try:
+            updated = await store.apply_pulled_files(str(user_id), pulled)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "ide_settings: reconcile apply failed for user %s — %s", user_id, e
+            )
+            continue
+        if updated:
+            logger.info(
+                "ide_settings: updated %d file(s) for user %s from %s",
+                len(updated),
+                user_id,
+                host,
+            )
+        updated_total += len(updated)
+    return updated_total
+
+
+class IdeSettingsStore:
+    """Read/write per-user code-server config in ``users.settings['ide']``."""
+
+    def __init__(self, db: Any) -> None:
+        self._db = db
+
+    async def get_ide_files(self, user_id: str) -> dict[str, dict]:
+        """Return the stored config files: ``{name: {"content", "mtime"}}``.
+
+        Empty dict when the user has no stored IDE config.
+        """
+        settings = await self._db.get_user_settings(user_id)
+        if not isinstance(settings, dict):
+            return {}
+        ide = settings.get("ide")
+        files = ide.get("files") if isinstance(ide, dict) else None
+        return dict(files) if isinstance(files, dict) else {}
+
+    async def apply_pulled_files(
+        self, user_id: str, pulled: dict[str, dict]
+    ) -> list[str]:
+        """Merge freshly-pulled config files into the user's store.
+
+        ``pulled`` maps a file name (e.g. ``"settings.json"``,
+        ``"snippets/python.json"``) to ``{"content": str, "mtime": float}``. A
+        file is written only if it is new or its mtime is strictly newer than the
+        stored copy. Returns the names actually updated.
+        """
+        if not pulled:
+            return []
+
+        settings = await self._db.get_user_settings(user_id)
+        if not isinstance(settings, dict):
+            settings = {}
+        ide = (
+            dict(settings.get("ide") or {})
+            if isinstance(settings.get("ide"), dict)
+            else {}
+        )
+        files = (
+            dict(ide.get("files") or {}) if isinstance(ide.get("files"), dict) else {}
+        )
+
+        updated: list[str] = []
+        for name, entry in pulled.items():
+            mtime = entry.get("mtime")
+            if mtime is None:
+                continue
+            existing = files.get(name)
+            if existing is None or mtime > existing.get("mtime", float("-inf")):
+                files[name] = {"content": entry.get("content", ""), "mtime": mtime}
+                updated.append(name)
+
+        if not updated:
+            return []
+
+        ide["files"] = files
+        await self._db.update_user_settings(user_id, {"ide": ide})
+        return updated

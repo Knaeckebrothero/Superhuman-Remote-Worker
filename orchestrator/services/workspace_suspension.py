@@ -134,6 +134,24 @@ class WorkspaceSuspensionService:
         if ws_status != "ready":
             return False
 
+        # Opportunistic final code-server config pull while the workspace is
+        # still alive — shrinks the worst-case IDE-settings loss window below the
+        # sweeper interval on a clean suspend/teardown. Best-effort.
+        try:
+            user_id = job.get("user_id")
+            if user_id:
+                from services.ide_settings import IdeSettingsStore, pull_ide_config
+
+                pulled = await pull_ide_config(ssh_host, int(ssh_port))
+                if pulled:
+                    await IdeSettingsStore(self._db).apply_pulled_files(
+                        str(user_id), pulled
+                    )
+        except Exception:
+            logger.debug(
+                "ide settings teardown pull failed for job %s", job_id, exc_info=True
+            )
+
         # Mark as suspending (prevents re-entry from sweeper)
         if ws_ctx:
             await self._db.merge_workspace_container_context(
