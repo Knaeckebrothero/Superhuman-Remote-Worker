@@ -136,4 +136,16 @@ Preserved so nothing is lost, even where it overlaps with the triage above.
 
 ## Decision log
 
-_To be filled in as items ship._
+- **2026-05-29 — Slice 1 shipped.** All five easy wins landed and were verified on the local k3d cluster (Tilt live-reload):
+  1. `(0 bytes)` annotation removed from `write_file` / `edit_file` / `file_exists` tool results (`src/tools/workspace/files.py`, `filesystem.py`).
+  2. Markdown rendering in the thought-card body (`#thoughtCard` now uses `<markdown [data]="event.content">`).
+  3. Reasoning cards auto-expand (`#thoughtCard` `<details … open>`).
+  4. Tool-card max-width capped at `min(720px, 100%)`.
+  5. Long user messages (>8 lines) auto-collapse to a first-line preview with `[…]` / `▴` hint (verified end-to-end in session `e5d67e12`).
+
+  Items #2/#3/#4 confirmed present in the served bundle + stylesheet; #5 verified visually in a live session; #1 verified in source + unit tests. Changes left uncommitted for the user to land.
+
+- **2026-05-29 — Slice 2 #6 (code styling) implemented.** Investigation found the *basic* `<pre>`/`<code>` styling was already in place (the `.message-body ::ng-deep` markdown block cascades to both the thought card and text events, both of which live inside `.message-body`), and PrismJS is already loaded globally (`angular.json` scripts) so ngx-markdown already emits `.token.*` spans on fenced code in the chat. The only missing piece was the **token colour theme** — the "different colors for code" item the triage had marked *deferred*. Turned out near-free, so wired it.
+  - **Placement decision:** put the theme in a new **global** partial `cockpit/src/styles/_code-highlight.scss` (`@use`d from `styles.scss`), **not** in the component SCSS. Rationale: (a) the persistent-chat component stylesheet is already at the documented style-budget ceiling (`docs/issues/persistent_chat_component_style_budget.md` — "don't grow it"), and a component-scoped copy added ~0.7KB to it; the global partial adds zero to the component budget; (b) a Prism token theme is global by nature (that is how Prism themes ship — unscoped `.token.*`); (c) it gives one source of truth so the chat and the instruction builder colour code identically, and sets up a future DRY cleanup (the builder can drop its inline `:host ::ng-deep .token.*` copy and `@use` this partial).
+  - Palette mirrors `instruction-builder.component.ts` exactly (VS Code dark). The builder's inline rules keep higher specificity and still win locally, so this is additive — no regression there.
+  - **Verified locally:** `styles.scss` compiles clean and emits the token rules; chat component SCSS back to its pre-change size. **Pending:** live visual confirmation on the k3d cluster (cluster was stopped during this work) — open a session/historical thread with a fenced code block and confirm tokens are coloured.

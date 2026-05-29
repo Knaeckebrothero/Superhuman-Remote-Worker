@@ -1,0 +1,60 @@
+// =============================================================================
+// PrismJS syntax-highlight token theme (VS Code dark palette)
+//
+// PrismJS is loaded globally (angular.json `scripts`) and ngx-markdown emits
+// `.token.*` spans on fenced code blocks — but no Prism *theme* stylesheet is
+// loaded, so without these rules the tokens render monochrome. This is that
+// theme: one global source of truth so every <markdown> surface (persistent
+// chat, instruction builder, …) colours code identically.
+//
+// Palette mirrors the colours instruction-builder.component.ts declared inline
+// before this partial existed. Unscoped on purpose — that is how Prism themes
+// ship, and `.token` classes are only ever produced by Prism. Component-scoped
+// rules (e.g. the builder's inline `:host ::ng-deep .token.*`) keep higher
+// specificity and still win locally, so this is additive, not a regression.
+// =============================================================================
+
+.token.comment,
+.token.prolog,
+.token.doctype,
+.token.cdata {
+  color: #6a9955;
+}
+
+.token.keyword {
+  color: #569cd6;
+}
+
+.token.string,
+.token.attr-value {
+  color: #ce9178;
+}
+
+.token.function {
+  color: #dcdcaa;
+}
+
+.token.number {
+  color: #b5cea8;
+}
+
+.token.operator {
+  color: #d4d4d4;
+}
+
+.token.class-name {
+  color: #4ec9b0;
+}
+
+.token.variable {
+  color: #9cdcfe;
+}
+
+.token.punctuation {
+  color: #d4d4d4;
+}
+
+.token.boolean,
+.token.constant {
+  color: #569cd6;
+}
