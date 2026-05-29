@@ -27,6 +27,7 @@ defaults to chart fullname). Required to safely share a NATS hub with other
 SRW orchestrators — empty value refuses to publish/subscribe.
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -463,6 +464,14 @@ class NatsBridge:
             else:
                 await self._set_vm_context(job_id, vm_updates)
 
+            # Seed the owner-user's code-server config into the freshly-ready VM
+            # (theme/keybindings/snippets). Fire-and-forget so the register
+            # handler isn't blocked on SSH; the helper is best-effort.
+            if ssh_host:
+                asyncio.create_task(
+                    self._seed_vm_ide_config(job_id, is_thread, ssh_host, ssh_port)
+                )
+
             # Trigger callback (e.g. dispatch)
             if self._on_vm_ready:
                 try:
@@ -471,6 +480,29 @@ class NatsBridge:
                     logger.exception("on_vm_ready callback failed")
         except Exception:
             logger.exception("Error handling daemon register")
+
+    async def _seed_vm_ide_config(
+        self, entity_id: str, is_thread: bool, ssh_host: str, ssh_port: int
+    ) -> None:
+        """Seed the owner-user's code-server config into a freshly-ready VM.
+
+        Best-effort: resolves the job/thread owner, then writes their stored
+        settings/keybindings/snippets over SSH. Never raises.
+        """
+        if not self._db:
+            return
+        try:
+            from services.ide_settings import seed_ide_config_for_user
+
+            row = (
+                await self._db.get_thread(entity_id)
+                if is_thread
+                else await self._db.get_job(entity_id)
+            )
+            user_id = row.get("user_id") if isinstance(row, dict) else None
+            await seed_ide_config_for_user(self._db, user_id, ssh_host, ssh_port)
+        except Exception:
+            logger.debug("ide seed (vm) failed for %s", entity_id, exc_info=True)
 
     async def _on_daemon_heartbeat(self, msg) -> None:
         """Handle agent.vm.*.heartbeat — periodic health updates.

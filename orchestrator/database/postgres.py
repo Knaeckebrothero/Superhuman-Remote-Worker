@@ -5775,6 +5775,55 @@ class PostgresDB:
             )
             return result == "UPDATE 1"
 
+    async def list_active_ide_workspaces(self) -> List[Dict[str, Any]]:
+        """Return active IDE-enabled workspaces (jobs + threads).
+
+        Used by the code-server settings sweeper to know which workspaces to pull
+        config from. A workspace counts as active when it has a ready container,
+        a ready VM, or an active/idle restored IDE session. Each row is
+        ``{"entity_type", "id", "user_id", "context"}``; ``context`` is the raw
+        JSONB (jobs.context / threads.metadata) and may be a JSON string.
+        """
+        out: List[Dict[str, Any]] = []
+        async with self.acquire() as conn:
+            job_rows = await conn.fetch(
+                """
+                SELECT id, user_id, context
+                FROM jobs
+                WHERE context->'ide_session'->>'status' IN ('active', 'idle')
+                   OR context->'workspace_container'->>'status' = 'ready'
+                   OR context->'vm'->>'status' = 'ready'
+                """
+            )
+            for r in job_rows:
+                out.append(
+                    {
+                        "entity_type": "job",
+                        "id": str(r["id"]),
+                        "user_id": str(r["user_id"]) if r["user_id"] else None,
+                        "context": r["context"],
+                    }
+                )
+            thread_rows = await conn.fetch(
+                """
+                SELECT id, user_id, metadata
+                FROM threads
+                WHERE metadata->'ide_session'->>'status' IN ('active', 'idle')
+                   OR metadata->'workspace_container'->>'status' = 'ready'
+                   OR metadata->'vm'->>'status' = 'ready'
+                """
+            )
+            for r in thread_rows:
+                out.append(
+                    {
+                        "entity_type": "thread",
+                        "id": str(r["id"]),
+                        "user_id": str(r["user_id"]) if r["user_id"] else None,
+                        "context": r["metadata"],
+                    }
+                )
+        return out
+
     # =========================================================================
     # USER OPERATIONS
     # =========================================================================

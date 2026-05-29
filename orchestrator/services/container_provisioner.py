@@ -183,6 +183,11 @@ class ContainerProvisioner:
             owner.id, kind=owner.network_tier_kind
         )
 
+        # Seed the user's saved code-server config (theme/keybindings/snippets)
+        # into the pod before it starts. Best-effort — never blocks provisioning.
+        seed_files = await self._resolve_ide_seed_files(owner)
+        seed_cm = await self._create_seed_configmap(pod_name, seed_files)
+
         # emptyDir by default — storage dies with the pod, no cleanup needed.
         # Each job/session gets a fresh container; isolation is the pod boundary.
         pod_manifest = self._build_pod_manifest(
@@ -194,14 +199,17 @@ class ContainerProvisioner:
             cpu_limit=cpu_limit,
             memory_limit=memory_limit,
             network_tier=network_tier,
+            seed_configmap=seed_cm,
         )
 
         try:
-            await asyncio.to_thread(
+            created_pod = await asyncio.to_thread(
                 self._core_api.create_namespaced_pod,
                 namespace=self._namespace,
                 body=pod_manifest,
             )
+            # Make the pod own the seed ConfigMap so K8s GCs it on teardown.
+            await self._adopt_configmap(seed_cm, created_pod)
             logger.info(
                 "Workspace container created: %s (%s %s)",
                 pod_name,
@@ -248,6 +256,8 @@ class ContainerProvisioner:
                 owner.id,
                 e,
             )
+            # Don't leave the seed ConfigMap orphaned if the pod never came up.
+            await self._delete_seed_configmap(pod_name)
             await self._set_context(
                 owner,
                 {"status": "failed", "error": str(e)},
@@ -278,6 +288,7 @@ class ContainerProvisioner:
                 owner.kind,
                 owner.id,
             )
+            await self._delete_seed_configmap(pod_name)
             await self._set_context(owner, {"status": "deleted"})
             return True
         except Exception as e:
@@ -478,26 +489,32 @@ class ContainerProvisioner:
         pod_name = f"ide-{job_id[:12]}"
         network_tier = await self._resolve_network_tier(job_id, kind="job")
 
+        owner = WorkspaceOwner.job(job_id)
+        seed_files = await self._resolve_ide_seed_files(owner)
+        seed_cm = await self._create_seed_configmap(pod_name, seed_files)
+
         pod_manifest = self._build_pod_manifest(
             pod_name=pod_name,
-            owner=WorkspaceOwner.job(job_id),
+            owner=owner,
             image=self._workspace_image,
             cpu=cpu,
             memory=memory,
             cpu_limit=cpu_limit,
             memory_limit=memory_limit,
             network_tier=network_tier,
+            seed_configmap=seed_cm,
         )
 
         # Override labels to distinguish IDE pods from workspace pods
         pod_manifest["metadata"]["labels"]["srw/component"] = "ide-session"
 
         try:
-            await asyncio.to_thread(
+            created_pod = await asyncio.to_thread(
                 self._core_api.create_namespaced_pod,
                 namespace=self._namespace,
                 body=pod_manifest,
             )
+            await self._adopt_configmap(seed_cm, created_pod)
             logger.info("IDE pod created: %s (job %s)", pod_name, job_id)
 
             pod_ip = await self._wait_for_ready(pod_name, timeout=90)
@@ -539,9 +556,11 @@ class ContainerProvisioner:
                 grace_period_seconds=5,
             )
             logger.info("IDE pod deleted: %s (job %s)", pod_name, job_id)
+            await self._delete_seed_configmap(pod_name)
             return True
         except Exception as e:
             if hasattr(e, "status") and e.status == 404:
+                await self._delete_seed_configmap(pod_name)
                 return True
             logger.error("Failed to delete IDE pod for job %s: %s", job_id, e)
             return False
@@ -660,6 +679,136 @@ class ContainerProvisioner:
             return DEFAULT_NETWORK_TIER
         return tier or DEFAULT_NETWORK_TIER
 
+    # =========================================================================
+    # code-server settings seeding
+    # =========================================================================
+
+    async def _resolve_ide_seed_files(self, owner: WorkspaceOwner) -> dict:
+        """Fetch the owner-user's stored code-server config. ``{}`` on any miss."""
+        if not self._db:
+            return {}
+        try:
+            if owner.kind == "job":
+                row = await self._db.get_job(owner.id)
+            else:
+                row = await self._db.get_thread(owner.id)
+            if not isinstance(row, dict):
+                return {}
+            user_id = row.get("user_id")
+            if not user_id:
+                return {}
+            from services.ide_settings import IdeSettingsStore
+
+            return await IdeSettingsStore(self._db).get_ide_files(str(user_id))
+        except Exception as e:
+            logger.warning(
+                "ide seed: failed to resolve config for %s %s: %s",
+                owner.kind,
+                owner.id,
+                e,
+            )
+            return {}
+
+    def _seed_configmap_name(self, pod_name: str) -> str:
+        return f"code-server-config-{pod_name}"
+
+    async def _create_seed_configmap(self, pod_name: str, files: dict) -> Optional[str]:
+        """Create a ConfigMap carrying a self-contained ``seed.sh`` for the pod.
+
+        Returns the ConfigMap name, or None when there is nothing to seed (or on
+        failure — seeding is best-effort and must never block provisioning).
+        """
+        if not files or not self._core_api:
+            return None
+        from services.ide_settings import build_seed_script
+
+        cm_name = self._seed_configmap_name(pod_name)
+        body = {
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {"name": cm_name, "namespace": self._namespace},
+            "data": {"seed.sh": build_seed_script(files)},
+        }
+        try:
+            await asyncio.to_thread(
+                self._core_api.create_namespaced_config_map,
+                namespace=self._namespace,
+                body=body,
+            )
+            return cm_name
+        except Exception as e:
+            if getattr(e, "status", None) == 409:
+                # Stale ConfigMap from a prior attempt — refresh its contents.
+                try:
+                    await asyncio.to_thread(
+                        self._core_api.replace_namespaced_config_map,
+                        name=cm_name,
+                        namespace=self._namespace,
+                        body=body,
+                    )
+                    return cm_name
+                except Exception as e2:
+                    logger.warning(
+                        "ide seed: replace configmap %s failed: %s", cm_name, e2
+                    )
+                    return None
+            logger.warning("ide seed: create configmap %s failed: %s", cm_name, e)
+            return None
+
+    async def _adopt_configmap(self, cm_name: Optional[str], pod_obj: Any) -> None:
+        """Set the pod as the ConfigMap's owner so K8s GCs it on teardown.
+
+        Best-effort: a failure here just means we fall back to the explicit
+        delete in ``delete_workspace``/``delete_ide_pod``.
+        """
+        if not cm_name or not self._core_api or pod_obj is None:
+            return
+        try:
+            uid = pod_obj.metadata.uid
+            name = pod_obj.metadata.name
+        except Exception:
+            return
+        if not uid:
+            return
+        patch = {
+            "metadata": {
+                "ownerReferences": [
+                    {
+                        "apiVersion": "v1",
+                        "kind": "Pod",
+                        "name": name,
+                        "uid": uid,
+                        "controller": True,
+                        "blockOwnerDeletion": False,
+                    }
+                ]
+            }
+        }
+        try:
+            await asyncio.to_thread(
+                self._core_api.patch_namespaced_config_map,
+                name=cm_name,
+                namespace=self._namespace,
+                body=patch,
+            )
+        except Exception as e:
+            logger.debug("ide seed: adopt configmap %s failed: %s", cm_name, e)
+
+    async def _delete_seed_configmap(self, pod_name: str) -> None:
+        """Delete a pod's seed ConfigMap (idempotent; ignores 404)."""
+        if not self._core_api:
+            return
+        cm_name = self._seed_configmap_name(pod_name)
+        try:
+            await asyncio.to_thread(
+                self._core_api.delete_namespaced_config_map,
+                name=cm_name,
+                namespace=self._namespace,
+            )
+        except Exception as e:
+            if getattr(e, "status", None) != 404:
+                logger.debug("ide seed: delete configmap %s failed: %s", cm_name, e)
+
     def _build_pod_manifest(
         self,
         pod_name: str,
@@ -671,9 +820,16 @@ class ContainerProvisioner:
         memory_limit: str,
         network_tier: str = DEFAULT_NETWORK_TIER,
         pvc_name: Optional[str] = None,
+        seed_configmap: Optional[str] = None,
     ) -> dict:
-        """Build the Kubernetes Pod manifest for a workspace container."""
-        return {
+        """Build the Kubernetes Pod manifest for a workspace container.
+
+        When ``seed_configmap`` is given, the named ConfigMap (carrying a
+        ``seed.sh`` that writes the user's code-server config) is mounted at
+        ``/mnt/code-server-config`` so the entrypoint can apply it before
+        code-server starts.
+        """
+        manifest = {
             "apiVersion": "v1",
             "kind": "Pod",
             "metadata": {
@@ -793,6 +949,21 @@ class ContainerProvisioner:
                 ],
             },
         }
+        if seed_configmap:
+            manifest["spec"]["containers"][0]["volumeMounts"].append(
+                {
+                    "name": "code-server-config",
+                    "mountPath": "/mnt/code-server-config",
+                    "readOnly": True,
+                }
+            )
+            manifest["spec"]["volumes"].append(
+                {
+                    "name": "code-server-config",
+                    "configMap": {"name": seed_configmap, "defaultMode": 0o644},
+                }
+            )
+        return manifest
 
     async def _wait_for_ready(self, pod_name: str, timeout: int = 120) -> Optional[str]:
         """Poll until the workspace pod is Running and has an IP.
