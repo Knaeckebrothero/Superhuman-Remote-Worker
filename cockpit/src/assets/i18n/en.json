@@ -300,6 +300,15 @@
     }
   },
   "admin": {
+    "prompts": {
+      "messages": {
+        "saveEmpty": "Nothing to save — pick a prompt and enter content.",
+        "saved": "Override saved — applies to future jobs.",
+        "saveFailed": "Failed to save override.",
+        "removed": "Override removed — back to the bundled default.",
+        "removeFailed": "Failed to remove override."
+      }
+    },
     "providers": {
       "title": "Providers",
       "desc": "System-scoped LLM providers, custom endpoints, and default models. Changes apply to every user.",
@@ -845,6 +854,12 @@
       "temp": "temp {{value}}",
       "turn": "Turn {{count}}"
     },
+    "turn": {
+      "collapsedEmpty": "Tool calls only",
+      "thoughtCount": "{{count}} thoughts",
+      "textCount": "{{count}} text blocks",
+      "toolCount": "{{count}} tool calls"
+    },
     "settings": {
       "mode": "Mode",
       "narration": "Narration",
@@ -866,6 +881,10 @@
       "resumeSession": "Resume Session",
       "resuming": "Resuming...",
       "resumeFailed": "Failed to resume session"
+    },
+    "compaction": {
+      "banner": "Context summarized",
+      "viewSummary": "View summary"
     },
     "empty": {
       "title": "What shall we conquer today?",
@@ -1341,7 +1360,8 @@
       "appliedChanges": "(applied changes)",
       "searching": "Searching: {{query}}",
       "running": "Running: {{tool}}",
-      "result": "Result: {{tool}}"
+      "result": "Result: {{tool}}",
+      "waitingForCommand": "The agent is waiting for this command to finish."
     },
     "errors": {
       "writeFailed": "Failed to write {{path}}"

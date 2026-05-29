@@ -69,6 +69,37 @@ describe('turn-reducer — user_message / system_message', () => {
     });
 });
 
+describe('turn-reducer — remove_turn', () => {
+    it('removes the turn with the matching id and leaves the others', () => {
+        const state = play([
+            {type: 'user_message', id: 'u1', content: 'first', timestamp: 100},
+            {type: 'user_message', id: 'u2', content: 'second', timestamp: 200},
+            {type: 'remove_turn', id: 'u1'},
+        ]);
+        expect(state.turns).toHaveLength(1);
+        expect(state.turns[0].id).toBe('u2');
+    });
+
+    it('is a no-op when no turn matches the id', () => {
+        const state = play([
+            {type: 'user_message', id: 'u1', content: 'hi', timestamp: 100},
+            {type: 'remove_turn', id: 'nope'},
+        ]);
+        expect(state.turns).toHaveLength(1);
+        expect(state.turns[0].id).toBe('u1');
+    });
+
+    it('does not disturb the active assistant turn', () => {
+        const state = play([
+            {type: 'user_message', id: 'u1', content: 'hi', timestamp: 100},
+            {type: 'turn_started', turnId: 't1', startedAt: 200},
+            {type: 'remove_turn', id: 'u1'},
+        ]);
+        expect(state.turns.find((t) => t.id === 'u1')).toBeUndefined();
+        expect(state.activeAssistantTurnId).toBe('t1');
+    });
+});
+
 describe('turn-reducer — turn lifecycle', () => {
     it('turn_started opens an empty assistant turn and marks it active', () => {
         const state = play([{type: 'turn_started', turnId: 't1', startedAt: 1000, model: 'opus'}]);
@@ -193,9 +224,42 @@ describe('turn-reducer — text/thinking deltas', () => {
         expect(thoughts[1].content).toBe('reflect');
     });
 
-    it('deltas without an active turn are dropped silently', () => {
+    it('deltas without an active turn open a recovered placeholder turn (Approach 2)', () => {
+        // Defense-in-depth from
+        // docs/issues/persistent_chat_lost_assistant_turn_on_mid_turn_reload.md:
+        // when streaming events arrive with activeAssistantTurnId === null
+        // (e.g. SSE replay cursor is past turn.started after a mid-turn
+        // reconnect), the reducer now synthesises a placeholder turn so the
+        // partial state is visible instead of silently lost.
         const state = play([{type: 'token', content: 'orphan', timestamp: 1000}]);
-        expect(state.turns).toEqual([]);
+        expect(state.turns).toHaveLength(1);
+        const turn = state.turns[0];
+        expect(turn.kind).toBe('assistant');
+        if (turn.kind !== 'assistant') throw new Error('expected assistant turn');
+        expect(turn.recovered).toBe(true);
+        expect(turn.id).toBe('recovered:1000');
+        expect(turn.status).toBe('streaming');
+        expect(turn.events).toHaveLength(1);
+        expect(turn.events[0].kind).toBe('text');
+        expect(state.activeAssistantTurnId).toBe('recovered:1000');
+    });
+
+    it('turn_completed promotes a recovered placeholder to the real turn id', () => {
+        // When the real turn.completed event finally arrives after a
+        // placeholder was synthesised by orphan deltas, the placeholder is
+        // renamed to the real turn id and closed — so the bubble doesn't
+        // hang in "streaming" forever.
+        const state = play([
+            {type: 'token', content: 'orphan content', timestamp: 1000},
+            {type: 'turn_completed', turnId: 'real-turn-id', finishedAt: 2000},
+        ]);
+        expect(state.turns).toHaveLength(1);
+        const turn = state.turns[0];
+        if (turn.kind !== 'assistant') throw new Error('expected assistant turn');
+        expect(turn.id).toBe('real-turn-id');
+        expect(turn.status).toBe('done');
+        expect(turn.finishedAt).toBe(2000);
+        expect(state.activeAssistantTurnId).toBeNull();
     });
 
     it('block ids are stable: ${turnId}.b<index>', () => {
@@ -439,5 +503,30 @@ describe('turn-reducer — replay idempotency', () => {
         // thought, text, tool_call, thought — boundary detection at work
         expect(kinds).toEqual(['thought', 'text', 'tool_call', 'thought']);
         expect(turn.status).toBe('done');
+    });
+});
+
+describe('turn-reducer — add_compaction', () => {
+    it('appends a compaction banner turn', () => {
+        const state = play([
+            {type: 'user_message', id: 'u1', content: 'hi', timestamp: 100},
+            {type: 'add_compaction', id: 'compaction-3', summary: 'We did X.', timestamp: 200},
+        ]);
+        expect(state.turns).toHaveLength(2);
+        const c = state.turns[1];
+        expect(c.kind).toBe('compaction');
+        expect(c.id).toBe('compaction-3');
+        if (c.kind === 'compaction') expect(c.summary).toBe('We did X.');
+    });
+
+    it('is idempotent by id (replay replaces, no duplicate)', () => {
+        const state = play([
+            {type: 'add_compaction', id: 'compaction-3', summary: 'first', timestamp: 200},
+            {type: 'add_compaction', id: 'compaction-3', summary: 'updated', timestamp: 200},
+        ]);
+        expect(state.turns).toHaveLength(1);
+        const c = state.turns[0];
+        expect(c.kind).toBe('compaction');
+        if (c.kind === 'compaction') expect(c.summary).toBe('updated');
     });
 });

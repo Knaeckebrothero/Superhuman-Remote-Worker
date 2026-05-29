@@ -151,7 +151,7 @@ data:
           ],
           "attributes": {
             "post.logout.redirect.uris": "{{ include "srw.cockpitUrl" . }}/*##{{ include "srw.apiUrl" . }}/*",
-            "backchannel.logout.url": "{{ include "srw.apiUrl" . }}/auth/backchannel-logout",
+            "backchannel.logout.url": "{{ include "srw.orchestratorInternalUrl" . }}/auth/backchannel-logout",
             "backchannel.logout.session.required": "true",
             "backchannel.logout.revoke.offline.tokens": "false"
           },
@@ -242,9 +242,9 @@ data:
               }
             }
           ]
-        },
+        }
         {{- if .Values.nextcloud.enabled }}
-        {
+        ,{
           "clientId": "nextcloud",
           "name": "Nextcloud",
           "description": "Cloud storage",
@@ -270,9 +270,10 @@ data:
             "email",
             "groups"
           ]
-        },
+        }
         {{- end }}
-        {
+        {{- if .Values.pgadmin.enabled }}
+        ,{
           "clientId": "pgadmin",
           "name": "pgAdmin",
           "description": "Database administration UI (optional)",
@@ -297,8 +298,10 @@ data:
             "profile",
             "email"
           ]
-        },
-        {
+        }
+        {{- end }}
+        {{- if .Values.mcp.enabled }}
+        ,{
           "clientId": "mcp-server",
           "name": "MCP OAuth Bridge",
           "description": "MCP server OAuth proxy — enables Claude.ai, ChatGPT, and other OAuth-based AI platforms to connect via OIDC",
@@ -325,6 +328,7 @@ data:
             "roles"
           ]
         }
+        {{- end }}
       ],
       "users": [
         {
@@ -687,11 +691,13 @@ spec:
                   name: {{ include "srw.secretName" . }}
                   key: NEXTCLOUD_OIDC_CLIENT_SECRET
             {{- end }}
+            {{- if .Values.pgadmin.enabled }}
             - name: PGADMIN_OIDC_CLIENT_SECRET
               valueFrom:
                 secretKeyRef:
                   name: {{ include "srw.secretName" . }}
                   key: PGADMIN_OIDC_CLIENT_SECRET
+            {{- end }}
             - name: OPENCLOUD_KEYCLOAK_CLIENT_SECRET
               valueFrom:
                 secretKeyRef:
@@ -704,12 +710,14 @@ spec:
                   name: {{ include "srw.configMapName" . }}
                   key: OPENCLOUD_PUBLIC_URL
                   optional: true
+            {{- if .Values.mcp.enabled }}
             - name: MCP_OIDC_CLIENT_SECRET
               valueFrom:
                 secretKeyRef:
                   name: {{ include "srw.secretName" . }}
                   key: MCP_OIDC_CLIENT_SECRET
                   optional: true
+            {{- end }}
             # Cockpit BFF — flips the cockpit client from public-PKCE to
             # confidential when a value is present. Absence keeps the
             # client public (pre-BFF behavior). See
@@ -728,6 +736,14 @@ spec:
               value: {{ include "srw.apiUrl" . | quote }}
             - name: COCKPIT_URL
               value: {{ include "srw.cockpitUrl" . | quote }}
+            # Internal Service URL — used for backchannel-logout callbacks
+            # the Keycloak pod fires itself. Routing via the public ingress
+            # fails in any cluster where the pod can't resolve the public
+            # hostname (split-DNS, k3d's `localhost` loopback hijack); also
+            # cheaper and avoids re-traversing TLS for a server→server hop.
+            - name: ORCHESTRATOR_INTERNAL_URL
+              value: {{ include "srw.orchestratorInternalUrl" . | quote }}
+            {{- if .Values.email.enabled }}
             - name: SMTP_HOST
               valueFrom:
                 configMapKeyRef:
@@ -743,6 +759,7 @@ spec:
                 secretKeyRef:
                   name: {{ include "srw.secretName" . }}
                   key: SMTP_PASSWORD
+            {{- end }}
           lifecycle:
             postStart:
               exec:
@@ -776,8 +793,12 @@ spec:
                                 "nextcloud:$NEXTCLOUD_OIDC_CLIENT_SECRET" \
                                 {{- end }}
                                 "opencloud-orchestrator:$OPENCLOUD_KEYCLOAK_CLIENT_SECRET" \
+                                {{- if .Values.pgadmin.enabled }}
                                 "pgadmin:$PGADMIN_OIDC_CLIENT_SECRET" \
+                                {{- end }}
+                                {{- if .Values.mcp.enabled }}
                                 "mcp-server:$MCP_OIDC_CLIENT_SECRET" \
+                                {{- end }}
                                 "${BFF_CLIENT_ID:-cockpit-bff}:$KC_CLIENT_SECRET"; do
                       CID="${pair%%:*}"; SEC="${pair#*:}"
                       [ -z "$SEC" ] && continue
@@ -820,9 +841,9 @@ spec:
                           -s "standardFlowEnabled=true" \
                           -s "directAccessGrantsEnabled=false" \
                           -s "serviceAccountsEnabled=false" \
-                          -s "redirectUris=[\"http://localhost:8085/auth/callback\",\"$API_URL/auth/callback\"]" \
-                          -s "webOrigins=[\"$API_URL\"]" \
-                          -s "attributes.\"backchannel.logout.url\"=$API_URL/auth/backchannel-logout" \
+                          -s "redirectUris=[\"http://localhost:8085/auth/callback\",\"$API_URL/auth/callback\",\"$COCKPIT_URL/auth/callback\"]" \
+                          -s "webOrigins=[\"$API_URL\",\"$COCKPIT_URL\"]" \
+                          -s "attributes.\"backchannel.logout.url\"=$ORCHESTRATOR_INTERNAL_URL/auth/backchannel-logout" \
                           -s "attributes.\"backchannel.logout.session.required\"=true" \
                           -s "attributes.\"backchannel.logout.revoke.offline.tokens\"=false" 2>/dev/null \
                           || echo "WARN: kcadm cockpit-bff create failed"
@@ -834,9 +855,9 @@ spec:
                         $KC update "clients/$BFFID" -r {{ .Values.keycloak.realm }} \
                           -s "publicClient=false" \
                           -s "clientAuthenticatorType=client-secret" \
-                          -s "redirectUris=[\"http://localhost:8085/auth/callback\",\"$API_URL/auth/callback\"]" \
-                          -s "webOrigins=[\"$API_URL\"]" \
-                          -s "attributes.\"backchannel.logout.url\"=$API_URL/auth/backchannel-logout" \
+                          -s "redirectUris=[\"http://localhost:8085/auth/callback\",\"$API_URL/auth/callback\",\"$COCKPIT_URL/auth/callback\"]" \
+                          -s "webOrigins=[\"$API_URL\",\"$COCKPIT_URL\"]" \
+                          -s "attributes.\"backchannel.logout.url\"=$ORCHESTRATOR_INTERNAL_URL/auth/backchannel-logout" \
                           -s "attributes.\"backchannel.logout.session.required\"=true" 2>/dev/null \
                           || echo "WARN: kcadm cockpit-bff update failed"
                       fi

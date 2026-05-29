@@ -133,6 +133,17 @@ spec:
       {{- end }}
       securityContext:
         fsGroup: 1000
+      {{- with .Values.opencloud.hostAliases }}
+      # Map the public auth hostname to an in-cluster address so the proxy's
+      # OIDC verifier can fetch JWKS without leaving the cluster. OpenCloud's
+      # verifier dereferences OC_OIDC_ISSUER (which must stay public to match
+      # the `iss` claim) for the .well-known fetch — and in any split-DNS
+      # cluster (k3d's `localhost` loopback, customer air-gapped server VLAN)
+      # that public hostname won't resolve from inside the pod. Typically
+      # set to Traefik's ClusterIP so we hit the cluster's own ingress.
+      hostAliases:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       initContainers:
         - name: wait-for-keycloak
           image: busybox:1.36
@@ -172,16 +183,37 @@ spec:
               value: "groups"
             - name: PROXY_OIDC_REWRITE_WELLKNOWN
               value: "true"
-            # OIDC — browser login via Keycloak
+            # OIDC — browser login via Keycloak. The browser uses the public
+            # URL (WEB_OIDC_METADATA_URL, served by the cockpit). The proxy
+            # pod itself uses the in-cluster Service URL for JWKS / discovery
+            # fetches because the public hostname isn't always reachable from
+            # inside the pod (split-DNS on the customer's air-gapped cluster,
+            # `localhost` loopback-hijack on k3d, etc.). OC_OIDC_ISSUER keeps
+            # the public URL because it must match the `iss` claim Keycloak
+            # mints into tokens (driven by KC_HOSTNAME). Keycloak emits
+            # backchannel URLs based on the inbound Host header
+            # (KC_HOSTNAME_BACKCHANNEL_DYNAMIC=true) so the discovery doc the
+            # proxy fetches at the internal URL points jwks_uri at the
+            # internal URL too — no further hop to the public hostname.
             - name: WEB_OIDC_CLIENT_ID
               value: "opencloud-web"
             - name: WEB_OIDC_METADATA_URL
               value: "{{ include "srw.authUrl" . }}/realms/{{ .Values.keycloak.realm }}/.well-known/openid-configuration"
-            # Issuer must match the `iss` claim in Keycloak tokens.
             - name: OC_OIDC_ISSUER
               value: "{{ include "srw.authUrl" . }}/realms/{{ .Values.keycloak.realm }}"
             - name: OC_OIDC_ENDPOINT_URL
               value: "{{ include "srw.authUrl" . }}/realms/{{ .Values.keycloak.realm }}"
+            {{- if .Values.opencloud.oidcInsecureTls }}
+            # When the proxy hits OC_OIDC_ISSUER through a hostAliases-mapped
+            # in-cluster Traefik (k3d/customer air-gapped), the cert chain
+            # is the cluster's local CA (mkcert in dev) and won't validate
+            # against OpenCloud's bundled roots. This skips TLS verification
+            # on OIDC fetches only — not a general TLS bypass.
+            - name: OC_INSECURE
+              value: "true"
+            - name: PROXY_OIDC_INSECURE
+              value: "true"
+            {{- end }}
             - name: OC_LOG_LEVEL
               value: "info"
             - name: OC_ADMIN_USER_ID

@@ -6,7 +6,7 @@ name: develop
 #   - Lint is non-blocking — ruff format auto-commits fixes on push
 #   - Tests and builds are change-based (only run when relevant files change)
 #   - Images get SHA + :experimental tags (no version tags)
-#   - Helm chart published as "srw-dev" with 0.0.0-dev.sha.<hash> versions
+#   - Helm chart published as "srw-dev" with 0.0.0-dev.sha-<hash> versions
 #   - deploy-experimental updates fleet.yaml chart version + image tags
 #
 # PR vs push behavior:
@@ -377,8 +377,14 @@ jobs:
             orchestrator/mcp/ orchestrator/services/formatters.py \
             orchestrator/services/__init__.py docker/Dockerfile.mcp)
 
+          # docker/browser-exec is COPY'd into the workspace image at build time
+          # (see Dockerfile.workspace §2c), so changes to it must rebuild the
+          # workspace image. Missing this path caused a0ce92d2's browser-exec
+          # fix to sit unbuilt while sha-310acc2 (the broken first cut) stayed
+          # deployed. See docs/features/browser_workspace_executor.md.
           WORKSPACE=$(has_changes "$SHA_WORKSPACE" \
-            docker/Dockerfile.workspace docker/workspace-entrypoint.sh .playwright-version)
+            docker/Dockerfile.workspace docker/workspace-entrypoint.sh \
+            docker/browser-exec .playwright-version)
 
           VM_CONTROLLER=$(has_changes "$SHA_VM_CONTROLLER" \
             vm/controller/)
@@ -1048,7 +1054,7 @@ jobs:
   # Publish dev Helm chart + update deployment config for Fleet.
   #
   # Publishes the chart as "srw-dev" with a semver pre-release version
-  # (0.0.0-dev.sha.<hash>), then updates fleet.yaml with the chart version
+  # (0.0.0-dev.sha-<hash>), then updates fleet.yaml with the chart version
   # and values-experimental.yaml with the new image tags, all in one commit.
   # ---------------------------------------------------------------------------
   deploy-experimental:
@@ -1102,7 +1108,10 @@ jobs:
         id: tag
         run: |
           echo "sha=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
-          echo "chart_version=0.0.0-dev.sha.${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          # Note: hyphen (not dot) before the SHA so the segment stays
+          # alphanumeric — a purely-numeric segment like "0439848" would be
+          # rejected by semver as a numeric identifier with a leading zero.
+          echo "chart_version=0.0.0-dev.sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
 
       # -- Publish dev chart (only when helm/ changed or any build succeeded) --
       - name: Package and push dev chart

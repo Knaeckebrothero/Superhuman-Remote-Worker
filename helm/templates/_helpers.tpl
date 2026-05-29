@@ -199,6 +199,19 @@ Centralized so every URL helper picks up local-dev (no-TLS) deployments.
 {{- end }}
 
 {{/*
+Internal cluster URL for the orchestrator. Used by other in-cluster pods
+that POST to the orchestrator without round-tripping through the public
+ingress (Keycloak's backchannel-logout callback, future webhook receivers).
+Bypassing the ingress avoids two foot-guns: pods can't always resolve the
+public hostname (split-DNS, the `localhost` loopback-hijack on k3d, etc.),
+and even when they can, the public path is slower and may pin TLS certs
+the in-cluster CA bundle doesn't trust.
+*/}}
+{{- define "srw.orchestratorInternalUrl" -}}
+{{- printf "http://%s-orchestrator:8085" (include "srw.fullname" .) -}}
+{{- end }}
+
+{{/*
 Internal cluster URL for Keycloak — used by orchestrator for back-channel JWKS fetches.
 */}}
 {{- define "srw.keycloakInternalUrl" -}}
@@ -279,6 +292,17 @@ Setting both nats.internal=true and nats.url is a chart-render error
 {{- else -}}
 {{- .Values.nats.url -}}
 {{- end -}}
+{{- end }}
+
+{{/*
+Per-orchestrator id used to scope vm.lifecycle.* NATS subjects. Defaults to
+the chart fullname (srw, srw-prod, …) so single-cluster installs Just Work;
+override .Values.orchestratorId when sharing a NATS hub across orchestrators
+so each one binds disjoint vm.lifecycle.*.{id} subjects. Must match the paired
+VM controller chart's orchestratorId.
+*/}}
+{{- define "srw.orchestratorId" -}}
+{{- default (include "srw.fullname" .) .Values.orchestratorId -}}
 {{- end }}
 
 {{/*

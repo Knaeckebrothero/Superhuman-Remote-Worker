@@ -34,6 +34,27 @@ from pydantic import BaseModel, Field, model_validator
 logger = logging.getLogger(__name__)
 
 
+def extract_summary_text(messages: List[BaseMessage]) -> Optional[str]:
+    """Return the most recent '[Summary of prior work]' summary content with the
+    prefix stripped, or None when no summary is present.
+
+    The summary is written by ``summarize_and_compact`` as a
+    ``SystemMessage(content=f"[Summary of prior work]\\n{summary}")``. Callers use
+    this to surface the summary for the compaction display banner after
+    ``ensure_within_limits`` / ``summarize_and_compact`` runs.
+    """
+    prefix = "[Summary of prior work]"
+    for m in reversed(messages):
+        content = getattr(m, "content", None)
+        if (
+            isinstance(m, SystemMessage)
+            and isinstance(content, str)
+            and prefix in content
+        ):
+            return content.split(prefix, 1)[1].strip()
+    return None
+
+
 class ConversationSummary(BaseModel):
     """Structured summary — forces the model to stop after valid JSON.
 

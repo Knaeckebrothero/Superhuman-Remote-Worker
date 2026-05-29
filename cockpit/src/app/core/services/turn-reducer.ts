@@ -79,7 +79,9 @@ export type ReducerAction =
         toolUseId: string;
         decision: 'approved' | 'denied';
         timestamp: number;
-    };
+    }
+    | { type: 'remove_turn'; id: string }
+    | { type: 'add_compaction'; id: string; summary: string; timestamp: number };
 
 export function reduce(state: ConversationState, action: ReducerAction): ConversationState {
     switch (action.type) {
@@ -107,6 +109,35 @@ export function reduce(state: ConversationState, action: ReducerAction): Convers
                     },
                 ],
             };
+
+        case 'remove_turn':
+            // Roll back an optimistic turn (e.g. a user message whose POST
+            // hard-failed) by id. Safe: every Turn carries a unique id and
+            // activeAssistantTurnId is untouched (the removed turn is a user
+            // turn, never the streaming assistant turn).
+            return {
+                ...state,
+                turns: state.turns.filter((t) => t.id !== action.id),
+            };
+
+        case 'add_compaction': {
+            // A compaction boundary banner. Idempotent by id (stable
+            // `compaction-<turn>`), so SSE replay replaces rather than
+            // duplicates. activeAssistantTurnId is untouched.
+            const turn: Turn = {
+                kind: 'compaction',
+                id: action.id,
+                summary: action.summary,
+                timestamp: action.timestamp,
+            };
+            const idx = state.turns.findIndex((t) => t.id === action.id);
+            if (idx >= 0) {
+                const turns = [...state.turns];
+                turns[idx] = turn;
+                return {...state, turns};
+            }
+            return {...state, turns: [...state.turns, turn]};
+        }
 
         case 'system_message':
             return {
@@ -166,19 +197,52 @@ export function reduce(state: ConversationState, action: ReducerAction): Convers
         case 'turn_completed':
         case 'turn_interrupted': {
             const finalStatus = action.type === 'turn_interrupted' ? 'interrupted' : 'done';
+            const directMatch = state.turns.some(
+                (t) => t.kind === 'assistant' && t.id === action.turnId,
+            );
+            // Defense-in-depth: if no turn matches the real turnId but the
+            // active turn is a placeholder synthesised by appendDelta /
+            // updateActiveTurn (recovered === true), promote it to the real
+            // id before closing — otherwise the streaming bubble would
+            // hang forever (see
+            // docs/issues/persistent_chat_lost_assistant_turn_on_mid_turn_reload.md
+            // §Approach 2).
+            const activeId = state.activeAssistantTurnId;
+            const activeTurn =
+                activeId
+                    ? state.turns.find(
+                          (t): t is AssistantTurn =>
+                              t.kind === 'assistant' && t.id === activeId,
+                      )
+                    : null;
+            const shouldPromote =
+                !directMatch && activeTurn != null && activeTurn.recovered === true;
             return {
                 ...state,
                 turns: state.turns.map((t) => {
-                    if (t.kind !== 'assistant' || t.id !== action.turnId) return t;
-                    return {
-                        ...t,
-                        events: closeOpenEvents(t.events, action.finishedAt),
-                        status: finalStatus,
-                        finishedAt: action.finishedAt,
-                    };
+                    if (t.kind !== 'assistant') return t;
+                    if (t.id === action.turnId) {
+                        return {
+                            ...t,
+                            events: closeOpenEvents(t.events, action.finishedAt),
+                            status: finalStatus,
+                            finishedAt: action.finishedAt,
+                        };
+                    }
+                    if (shouldPromote && t.id === activeId) {
+                        return {
+                            ...t,
+                            id: action.turnId,
+                            recovered: undefined,
+                            events: closeOpenEvents(t.events, action.finishedAt),
+                            status: finalStatus,
+                            finishedAt: action.finishedAt,
+                        };
+                    }
+                    return t;
                 }),
                 activeAssistantTurnId:
-                    state.activeAssistantTurnId === action.turnId
+                    state.activeAssistantTurnId === action.turnId || shouldPromote
                         ? null
                         : state.activeAssistantTurnId,
             };
@@ -191,7 +255,7 @@ export function reduce(state: ConversationState, action: ReducerAction): Convers
             return appendDelta(state, 'thought', action.content, action.timestamp);
 
         case 'tool_started':
-            return updateActiveTurn(state, (turn) => {
+            return updateActiveTurn(ensurePlaceholderTurn(state, action.timestamp), (turn) => {
                 const closed = closeOpenEvents(turn.events, action.timestamp);
                 const idx = closed.findIndex(
                     (e) => e.kind === 'tool_call' && e.id === action.toolUseId,
@@ -222,7 +286,7 @@ export function reduce(state: ConversationState, action: ReducerAction): Convers
             });
 
         case 'tool_completed':
-            return updateActiveTurn(state, (turn) => {
+            return updateActiveTurn(ensurePlaceholderTurn(state, action.timestamp), (turn) => {
                 const idx = turn.events.findIndex(
                     (e) => e.kind === 'tool_call' && e.id === action.toolUseId,
                 );
@@ -253,7 +317,7 @@ export function reduce(state: ConversationState, action: ReducerAction): Convers
             });
 
         case 'permission_request':
-            return updateActiveTurn(state, (turn) => {
+            return updateActiveTurn(ensurePlaceholderTurn(state, action.timestamp), (turn) => {
                 const idx = turn.events.findIndex(
                     (e) => e.kind === 'tool_call' && e.id === action.toolUseId,
                 );
@@ -274,7 +338,7 @@ export function reduce(state: ConversationState, action: ReducerAction): Convers
             });
 
         case 'permission_decision':
-            return updateActiveTurn(state, (turn) => {
+            return updateActiveTurn(ensurePlaceholderTurn(state, action.timestamp), (turn) => {
                 const idx = turn.events.findIndex(
                     (e) => e.kind === 'tool_call' && e.id === action.toolUseId,
                 );
@@ -339,14 +403,49 @@ function closeOpenEvents(events: TurnEvent[], timestamp: number): TurnEvent[] {
     });
 }
 
+/**
+ * Open a synthetic placeholder assistant turn when streaming events arrive
+ * without an `activeAssistantTurnId` — typically because `connect()` reset
+ * state on a mid-turn reconnect and the SSE replay cursor is past the
+ * `turn.started` event (so the reducer never saw it).
+ *
+ * The placeholder absorbs subsequent token / thinking / tool events so the
+ * UI surfaces partial state instead of silently losing the turn. When the
+ * real `turn.completed` (or `turn.interrupted`) finally arrives, the
+ * placeholder is promoted to the real turn id and closed — see the
+ * `turn_completed` case above. See
+ * docs/issues/persistent_chat_lost_assistant_turn_on_mid_turn_reload.md
+ * §Approach 2.
+ */
+function ensurePlaceholderTurn(
+    state: ConversationState,
+    timestamp: number,
+): ConversationState {
+    if (state.activeAssistantTurnId) return state;
+    const placeholderId = `recovered:${timestamp}`;
+    const placeholder: AssistantTurn = {
+        kind: 'assistant',
+        id: placeholderId,
+        events: [],
+        status: 'streaming',
+        startedAt: timestamp,
+        recovered: true,
+    };
+    return {
+        ...state,
+        turns: [...state.turns, placeholder],
+        activeAssistantTurnId: placeholderId,
+    };
+}
+
 function appendDelta(
     state: ConversationState,
     eventKind: 'text' | 'thought',
     content: string,
     timestamp: number,
 ): ConversationState {
-    if (!state.activeAssistantTurnId) return state;
-    return updateActiveTurn(state, (turn) => {
+    const seeded = ensurePlaceholderTurn(state, timestamp);
+    return updateActiveTurn(seeded, (turn) => {
         const last = turn.events[turn.events.length - 1];
         if (last && last.kind === eventKind) {
             const lastTyped = last as TextEvent | ThoughtEvent;

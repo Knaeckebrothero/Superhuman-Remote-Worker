@@ -267,7 +267,9 @@ async def update_automation(
     return updated or row
 
 
-@router.delete("/{automation_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/{automation_id}", status_code=status.HTTP_204_NO_CONTENT, response_model=None
+)
 async def delete_automation(request: Request, automation_id: str) -> None:
     """Hard-delete. Past spawned jobs survive — the back-link in
     ``jobs.context['automation_id']`` becomes orphaned, intentional.

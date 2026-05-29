@@ -160,7 +160,10 @@ auxiliary:
   base_url: null
   temperature: 0.0
   max_iterations: 15
-  timeout: 120
+  # Bounded for the interactive path: auxiliary work (summarization, memory,
+  # knowledge) runs inline on the turn's critical path, so a hung endpoint
+  # mustn't stall a turn for two minutes. Failures fall back / skip gracefully.
+  timeout: 45
   tasks:
     extract_memories:
       enabled: true

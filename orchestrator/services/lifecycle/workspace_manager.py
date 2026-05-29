@@ -22,6 +22,7 @@ import os
 from typing import Any
 
 from .types import Instance
+from services.workspace_lifecycle import WorkspaceOwner
 
 logger = logging.getLogger(__name__)
 
@@ -83,10 +84,9 @@ class WorkspaceInstanceManager:
         instances: list[Instance] = []
         for pod in pods:
             labels = pod.metadata.labels or {}
-            # Thread workspaces carry BOTH srw/job-id and srw/thread-id
-            # (the job_id slot is reused for thread_id by the
-            # provisioner). Check thread-id first so we hit the right
-            # table.
+            # Job workspaces carry srw/job-id; thread (session) workspaces
+            # carry srw/thread-id. Check thread-id first so we route to the
+            # right table.
             thread_id = labels.get("srw/thread-id")
             job_id = labels.get("srw/job-id") if not thread_id else None
             metadata: dict[str, Any] = {
@@ -219,9 +219,9 @@ class WorkspaceInstanceManager:
         labels = inst.metadata.get("labels") or {}
         try:
             if "srw/thread-id" in labels:
-                await self._provisioner.delete_thread_workspace(bound)
+                await self._provisioner.delete_workspace(WorkspaceOwner.session(bound))
             else:
-                await self._provisioner.delete_workspace(bound)
+                await self._provisioner.delete_workspace(WorkspaceOwner.job(bound))
         except Exception:
             logger.exception("Failed to delete workspace pod %s", inst.id)
 

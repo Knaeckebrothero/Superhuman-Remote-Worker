@@ -46,6 +46,12 @@ data:
   AGENT_PORT: {{ .Values.agent.port | quote }}
   PERSISTENT_AGENT_CONFIG: {{ .Values.agent.persistentConfig | quote }}
 
+  # Apply DB-backed prompt overrides (admin-curated rows in the prompt_overrides
+  # table) to dynamically provisioned agents. Read by the agent prompt loader
+  # (src/core/loader.py) via envFrom on this shared ConfigMap. Default-off
+  # chart-wide (prod-safe); the dev/experimental values file turns it on.
+  PROMPT_DB_OVERRIDES_ENABLED: {{ .Values.agent.promptDbOverridesEnabled | default "false" | quote }}
+
   # OIDC / SSO — works with internal Keycloak or external OIDC provider
   KEYCLOAK_URL: {{ include "srw.keycloakInternalUrl" . | quote }}
   KEYCLOAK_ISSUER_URL: {{ include "srw.authUrl" . | quote }}
@@ -60,7 +66,10 @@ data:
 
   # Cookie BFF — orchestrator-issued sessions for the cockpit.
   # See docs/features/auth_bff_and_api_tokens.md.
-  SRW_BFF_REDIRECT_URI: {{ printf "%s/auth/callback" (include "srw.apiUrl" .) | quote }}
+  # When sameOriginApi=true, the BFF redirect lives on the cockpit origin
+  # (path-routed to the orchestrator) so the OIDC callback and the cockpit
+  # share an origin and the session cookie is first-party.
+  SRW_BFF_REDIRECT_URI: {{ printf "%s/auth/callback" (ternary (include "srw.cockpitUrl" .) (include "srw.apiUrl" .) .Values.auth.bff.sameOriginApi) | quote }}
   SRW_SPA_BASE_URL: {{ include "srw.cockpitUrl" . | quote }}
   # auth.bff.cookieDomain semantics:
   #   "auto" (default) → ".<global.domain>" (rides on cockpit + api subdomains)
@@ -193,6 +202,9 @@ data:
   # NATS — when nats.internal=true, points at the in-cluster Service;
   # otherwise the user-supplied .Values.nats.url (empty disables VM lifecycle).
   NATS_URL: {{ include "srw.natsUrl" . | quote }}
+  # Per-orchestrator id used to scope vm.lifecycle.* NATS subjects. Must match
+  # the paired VM controller chart's orchestratorId.
+  ORCHESTRATOR_ID: {{ include "srw.orchestratorId" . | quote }}
 
   # VM Controller (HTTP transport, same-cluster mode). Empty when
   # vmController.enabled=false or transport=nats — orchestrator falls back

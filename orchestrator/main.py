@@ -12,6 +12,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import secrets
 import sys
 import time
@@ -83,6 +84,7 @@ from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 from fastapi.responses import (  # noqa: E402
     HTMLResponse,
     JSONResponse,
+    RedirectResponse,
     Response,
     StreamingResponse,
 )
@@ -132,6 +134,7 @@ from security.credential_files import (  # noqa: E402
 from security.csrf import CSRFMiddleware  # noqa: E402
 from auth import bff_router  # noqa: E402
 from routers import automations_router  # noqa: E402
+from routers.sessions import router as sessions_router  # noqa: E402
 from services.cron_dispatcher import cron_dispatcher_loop  # noqa: E402
 from services.workspace import workspace_service  # noqa: E402
 from services.gitea import GiteaClient  # noqa: E402
@@ -190,9 +193,20 @@ from services.builder_dispatch import execute_server_tool as _dispatch_server_to
 from services.nats_bridge import nats_bridge  # noqa: E402
 from services.vm_provisioner import vm_provisioner  # noqa: E402
 from services.container_provisioner import container_provisioner  # noqa: E402
+from services.workspace_lifecycle import (  # noqa: E402
+    EnsureOutcome,
+    WorkspaceOwner,
+    ensure_workspace,
+)
+from services.session_provisioner import (  # noqa: E402
+    ensure_session_workspace,
+    reconcile_session_workspaces,
+)
 from services.docker_provisioner import docker_provisioner  # noqa: E402
 from services.persistent_provisioner import persistent_provisioner  # noqa: E402
 from services.agent_provisioner import agent_provisioner  # noqa: E402
+from services.session_router import SessionRouterService  # noqa: E402
+from services.session_tokens import SessionTokenService  # noqa: E402
 from services.lifecycle import (  # noqa: E402
     AgentInstanceManager,
     InstanceLifecycleReconciler,
@@ -238,6 +252,42 @@ vector_db = PostgresDB(
     migrations_dir=MIGRATIONS_VECTOR_DIR,
 )
 
+# Session router singletons — see docs/features/direct_session_websockets.md
+import json as _session_json  # noqa: E402
+
+_session_annotations_raw = os.environ.get("SESSION_INGRESS_ANNOTATIONS", "{}")
+try:
+    _session_annotations = _session_json.loads(_session_annotations_raw)
+    if not isinstance(_session_annotations, dict):
+        _session_annotations = {}
+except (ValueError, TypeError):
+    logger.warning(
+        "SESSION_INGRESS_ANNOTATIONS env not valid JSON: %r — falling back to {}",
+        _session_annotations_raw,
+    )
+    _session_annotations = {}
+
+session_router = SessionRouterService(
+    namespace=os.environ.get("SESSION_INGRESS_NAMESPACE", "default"),
+    ingress_host=os.environ.get("SESSION_INGRESS_HOST", "api.example.com"),
+    ingress_class=os.environ.get("SESSION_INGRESS_CLASS", "traefik"),
+    annotations=_session_annotations,
+    tls_secret_name=os.environ.get("SESSION_INGRESS_TLS_SECRET") or None,
+)
+
+_session_jwt_secret = os.environ.get("SESSION_JWT_SECRET", "")
+if _session_jwt_secret:
+    session_tokens = SessionTokenService(
+        secret=_session_jwt_secret,
+        ttl_seconds=int(os.environ.get("SESSION_JWT_TTL_S", "60")),
+    )
+else:
+    # Allow boot without session_tokens (e.g., during chart install before
+    # the Secret is set). Calls to GET /connection will fail at runtime
+    # with a clear error.
+    session_tokens = None  # type: ignore[assignment]
+    logger.warning("SESSION_JWT_SECRET not set — direct WS session endpoints will fail")
+
 
 async def resolve_job_repo(job_id: str) -> tuple[str, str | None]:
     """Resolve the Gitea repo name and branch for a job.
@@ -277,23 +327,136 @@ async def resolve_job_repo(job_id: str) -> tuple[str, str | None]:
     return f"job-{job_id}", None
 
 
-# Files to delete from subjob branch before squash merge (job-scoped working files).
-SUBJOB_CLEANUP_FILES = [
-    "workspace.md",
-    "plan.md",
-    "todos.yaml",
-    "instructions.md",
-    "task_brief.md",
-    "output/job_frozen.json",
-    "output/job_completion.json",
-]
+async def _next_output_ordinal(repo_name: str, base_branch: str) -> str:
+    """Return the next zero-padded ordinal for `outputs/<n>-...` on base_branch.
 
-SUBJOB_CLEANUP_DIRS = [
-    "archive",
-    "tools",
-    "documents",
-    "reference",
-]
+    Per-repo, recency-ordered. Sequential (no async subjobs), so max+1 is race-free.
+    """
+    entries = (
+        await gitea_client.list_contents(repo_name, "outputs", ref=base_branch) or []
+    )
+    nums = []
+    for entry in entries:
+        if entry.get("type") == "dir":
+            m = re.match(r"(\d+)-", entry.get("name", ""))
+            if m:
+                nums.append(int(m.group(1)))
+    nxt = (max(nums) + 1) if nums else 1
+    return f"{nxt:03d}"
+
+
+async def _graft_subjob_output(job_id: str) -> dict[str, Any] | None:
+    """Graft a completed subjob's ``output/`` onto its parent's branch.
+
+    Copies the subjob branch's ``output/`` subtree to
+    ``outputs/<n>-<config>-<short_id>/`` on the parent branch in a single
+    commit. Purely additive — never modifies/deletes parent content, so
+    collisions and clobbering are impossible. Critic subjobs graft nothing
+    (verdict is consumed from the DB).
+    See docs/superpowers/specs/2026-05-24-subjob-output-merge-model-design.md.
+    """
+    import base64
+
+    job = await postgres_db.get_job(job_id)
+    if not job or not job.get("parent_job_id"):
+        return None
+    if not job.get("branch_name") or not job.get("repo_name"):
+        logger.debug(f"Subjob {job_id} has no branch/repo — skipping graft")
+        return None
+    if not gitea_client.is_initialized:
+        logger.warning(f"Gitea not initialized — cannot graft subjob {job_id}")
+        return None
+
+    # Critic contributes nothing to the branch (verdict lives in the DB).
+    ctx = job.get("context") or {}
+    if isinstance(ctx, str):
+        try:
+            ctx = json.loads(ctx)
+        except (json.JSONDecodeError, ValueError):
+            ctx = {}
+    if isinstance(ctx, dict) and ctx.get("verification_target"):
+        await postgres_db.update_job_merge_status(job_id, merge_status="skipped")
+        return {"status": "skipped", "reason": "critic-not-merged"}
+
+    # Idempotency: never graft twice — a second run would copy the output under
+    # a fresh ordinal and duplicate it. If a graft path is already recorded, skip.
+    if isinstance(ctx, dict) and ctx.get("graft_output_path"):
+        return {
+            "status": "skipped",
+            "reason": "already-grafted",
+            "output_path": ctx["graft_output_path"],
+        }
+
+    repo_name = job["repo_name"]
+    subjob_branch = job["branch_name"]
+    short_id = str(job_id)[:8]
+    config_name = job.get("config_name") or "subjob"
+
+    parent = await postgres_db.get_job(str(job["parent_job_id"]))
+    base_branch = (parent.get("branch_name") if parent else None) or "main"
+
+    tree = await gitea_client.list_tree(repo_name, ref=subjob_branch) or []
+    output_blobs = [
+        e["path"]
+        for e in tree
+        if e.get("type") == "blob" and e["path"].startswith("output/")
+    ]
+    if not output_blobs:
+        await postgres_db.update_job_merge_status(job_id, merge_status="skipped")
+        return {"status": "skipped", "reason": "no-output"}
+
+    ordinal = await _next_output_ordinal(repo_name, base_branch)
+    dest = f"outputs/{ordinal}-{config_name}-{short_id}"
+
+    files: list[dict] = []
+    for path in output_blobs:
+        data = await gitea_client.get_file_bytes(repo_name, path, ref=subjob_branch)
+        if data is None:
+            logger.warning(f"Graft {job_id}: failed to read {path}; aborting graft")
+            await postgres_db.update_job_merge_status(
+                job_id, merge_status="graft-failed"
+            )
+            return {"status": "error", "reason": "read-failed", "path": path}
+        rel = path[len("output/") :]
+        files.append(
+            {
+                "path": f"{dest}/{rel}",
+                "content_b64": base64.b64encode(data).decode("ascii"),
+            }
+        )
+
+    ok = await gitea_client.change_files(
+        repo_name, base_branch, files, message=f"Graft {dest} from subjob {short_id}"
+    )
+    if not ok:
+        await postgres_db.update_job_merge_status(job_id, merge_status="graft-failed")
+        return {"status": "error", "reason": "write-failed"}
+
+    await postgres_db.update_job_merge_status(job_id, merge_status="grafted")
+    new_ctx = dict(ctx)
+    new_ctx["graft_output_path"] = dest
+    await postgres_db.update_job_context(job_id, new_ctx)
+
+    logger.info(
+        f"Grafted subjob {short_id}/{config_name} output ({len(files)} files) "
+        f"to {base_branch}:{dest}"
+    )
+    return {
+        "status": "grafted",
+        "base_branch": base_branch,
+        "output_path": dest,
+        "ordinal": ordinal,
+        "files": len(files),
+    }
+
+
+async def _maybe_graft_completed_subjob(job: dict[str, Any]) -> dict[str, Any] | None:
+    """Graft any completed subjob's output onto its parent. Applies uniformly
+    to scholar, delegation children, and any other subjob; critic is skipped
+    inside _graft_subjob_output. Root jobs (no parent) are ignored."""
+    if not job.get("parent_job_id"):
+        return None
+    return await _graft_subjob_output(str(job["id"]))
 
 
 def _deep_merge_dicts(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -307,107 +470,6 @@ def _deep_merge_dicts(base: dict[str, Any], override: dict[str, Any]) -> dict[st
         else:
             result[key] = value
     return result
-
-
-async def _squash_merge_subjob(job_id: str) -> dict[str, Any] | None:
-    """Squash-merge a completed subjob's branch into its parent's branch.
-
-    Pre-merge cleanup: deletes job-scoped files from the subjob branch
-    before creating the PR, so the parent's workspace.md / plan.md are
-    not overwritten.
-
-    Returns:
-        Merge result dict, or None if merge was skipped/not applicable.
-    """
-    job = await postgres_db.get_job(job_id)
-    if not job or not job.get("parent_job_id"):
-        return None
-
-    if not job.get("branch_name") or not job.get("repo_name"):
-        logger.debug(f"Subjob {job_id} has no branch/repo — skipping squash merge")
-        return None
-
-    if not gitea_client.is_initialized:
-        logger.warning(f"Gitea not initialized — cannot squash-merge subjob {job_id}")
-        return None
-
-    repo_name = job["repo_name"]
-    subjob_branch = job["branch_name"]
-    short_id = str(job_id)[:8]
-
-    # Determine the base branch (parent's branch, or main if parent is root)
-    parent = await postgres_db.get_job(str(job["parent_job_id"]))
-    base_branch = (parent.get("branch_name") if parent else None) or "main"
-
-    # Pre-merge cleanup: delete job-scoped files from subjob branch
-    for file_path in SUBJOB_CLEANUP_FILES:
-        await gitea_client.delete_file(
-            repo_name,
-            file_path,
-            f"Pre-merge cleanup: remove {file_path}",
-            branch=subjob_branch,
-        )
-
-    # Delete job-scoped directories (list contents then delete each file)
-    for dir_path in SUBJOB_CLEANUP_DIRS:
-        entries = await gitea_client.list_contents(
-            repo_name, dir_path, ref=subjob_branch
-        )
-        if entries:
-            for entry in entries:
-                if entry.get("type") == "file":
-                    await gitea_client.delete_file(
-                        repo_name,
-                        entry["path"],
-                        f"Pre-merge cleanup: remove {entry['path']}",
-                        branch=subjob_branch,
-                    )
-
-    # Create PR for squash merge
-    config_name = job.get("config_name", "subjob")
-    pr_title = f"Subjob {short_id}/{config_name}: {(job.get('description') or 'completed')[:60]}"
-    pr = await gitea_client.create_pr(
-        repo_name,
-        title=pr_title,
-        head=subjob_branch,
-        base=base_branch,
-        body=f"Squash merge subjob `{job_id}` (`{config_name}`) into parent branch.",
-    )
-
-    if pr is None:
-        logger.info(
-            f"Subjob {short_id} PR creation returned None — "
-            f"branch may have no changes vs {base_branch}"
-        )
-        await postgres_db.update_job_merge_status(job_id, merge_status="skipped")
-        return {"status": "skipped", "reason": "no changes"}
-
-    # Squash merge
-    merged = await gitea_client.merge_pr(
-        repo_name,
-        pr["number"],
-        merge_strategy="squash",
-        delete_branch_after_merge=False,
-    )
-
-    if not merged:
-        logger.warning(
-            f"Squash merge failed for subjob {short_id} (PR #{pr['number']})"
-        )
-        await postgres_db.update_job_merge_status(job_id, merge_status="conflict")
-        return {"status": "conflict", "pr_number": pr["number"]}
-
-    await postgres_db.update_job_merge_status(job_id, merge_status="merged")
-    logger.info(
-        f"Squash-merged subjob {short_id}/{config_name} into {base_branch} "
-        f"(PR #{pr['number']})"
-    )
-
-    return {
-        "status": "merged",
-        "pr_number": pr["number"],
-        "base_branch": base_branch,
-    }
 
 
 # =============================================================================
@@ -612,11 +674,15 @@ async def ide_session_ttl_sweeper(shutdown_event: asyncio.Event) -> None:
 
 
 async def workspace_idle_sweeper(shutdown_event: asyncio.Event) -> None:
-    """Background task that suspends idle workspace containers to S3.
+    """Background loop: suspends idle workspace containers to S3 AND reconciles
+    failed session workspaces.
 
-    Runs every 60 seconds. Checks workspace containers for jobs in
-    paused/pending_review/waiting_for_reply statuses against the
-    configured idle timeout (WORKSPACE_IDLE_TIMEOUT, default 30 min).
+    Runs every 60 seconds. Suspends workspace containers for jobs in
+    paused/pending_review/waiting_for_reply statuses past the configured idle
+    timeout (WORKSPACE_IDLE_TIMEOUT, default 30 min). Then re-ensures workspaces
+    for active sessions whose workspace container is in a non-ready, non-in-progress
+    state (e.g. 'failed') — the session-side equivalent of the job dispatcher's
+    per-cycle workspace reconcile.
     """
     logger.info("Workspace idle sweeper started")
     while not shutdown_event.is_set():
@@ -633,6 +699,22 @@ async def workspace_idle_sweeper(shutdown_event: asyncio.Event) -> None:
                     )
         except Exception as e:
             logger.error("Error in workspace idle sweeper: %s", e)
+
+        # Session workspace reconcile (safety-net): recreate failed/missing
+        # workspaces for active sessions. Runs regardless of whether idle
+        # suspension is enabled — recovering a wedged workspace is independent
+        # of idle policy. This is the session-side equivalent of the job
+        # dispatcher's per-cycle workspace reconcile.
+        # (reconcile_session_workspaces never raises; the try/except is a
+        # belt-and-suspenders guard so a future change can't kill this loop.)
+        try:
+            await reconcile_session_workspaces(
+                db=postgres_db,
+                provisioner=container_provisioner,
+                suspension=workspace_suspension_service,
+            )
+        except Exception as e:
+            logger.error("Error in session workspace reconcile: %s", e)
 
         try:
             await asyncio.wait_for(shutdown_event.wait(), timeout=60.0)
@@ -2068,58 +2150,17 @@ async def _try_dispatch_pending_jobs() -> None:
                 elif _job_needs_sandbox(job):
                     container_ctx = _get_container_context(job)
                     container_status = container_ctx.get("status")
-                    if not container_status:
-                        # Container needed but not provisioned — provision now.
-                        # Priority: K8s in-cluster → Docker Compose → K8s via kubeconfig.
-                        # This prevents a local kubeconfig from shadowing Docker Compose
-                        # when running the orchestrator outside the cluster.
-                        use_k8s = container_provisioner.is_available and (
-                            container_provisioner.in_cluster
-                            or not docker_provisioner.is_available
-                        )
-                        if use_k8s:
-                            # Kubernetes mode: create pod on demand
-                            logger.info(
-                                "Dispatcher: job %s provisioning workspace container "
-                                "(VM not available or not requested)",
-                                job_id,
-                            )
-                            config_override = job.get("config_override") or {}
-                            if isinstance(config_override, str):
-                                config_override = json.loads(config_override)
-                            ws_cfg = config_override.get("workspace", {}).get(
-                                "container", {}
-                            )
-                            ok = await container_provisioner.create_workspace(
-                                job_id=job_id,
-                                cpu=ws_cfg.get("cpu", "500m"),
-                                memory=ws_cfg.get("memory", "1Gi"),
-                                cpu_limit=ws_cfg.get("cpu_limit", "2000m"),
-                                memory_limit=ws_cfg.get("memory_limit", "4Gi"),
-                                image=ws_cfg.get("image"),
-                            )
-                            if ok:
-                                logger.info(
-                                    "Dispatcher: auto-provisioned workspace container for job %s",
-                                    job_id,
-                                )
-                            else:
-                                logger.error(
-                                    "Dispatcher: workspace container provisioning failed "
-                                    "for job %s. Failing job.",
-                                    job_id,
-                                )
-                                await postgres_db.update_job_status(
-                                    job_id,
-                                    status="failed",
-                                    error_message=(
-                                        "Workspace container could not be created. "
-                                        "Check orchestrator logs for details (image pull "
-                                        "failures, insufficient resources, RBAC issues)."
-                                    ),
-                                )
-                        elif docker_provisioner.is_available:
-                            # Docker Compose mode: assign from static pool
+                    # K8s in-cluster takes priority; a local kubeconfig must not
+                    # shadow Docker Compose when running outside the cluster.
+                    use_k8s = container_provisioner.is_available and (
+                        container_provisioner.in_cluster
+                        or not docker_provisioner.is_available
+                    )
+                    # States that mean "no live workspace yet" → (re)create.
+                    needs_create = container_status in (None, "", "deleted", "none")
+                    if needs_create and not use_k8s:
+                        # Docker Compose pool / no-provisioner CREATE path (unchanged).
+                        if docker_provisioner.is_available:
                             logger.info(
                                 "Dispatcher: job %s assigning workspace from "
                                 "Docker Compose pool",
@@ -2148,44 +2189,69 @@ async def _try_dispatch_pending_jobs() -> None:
                                 ),
                             )
                         continue  # Skip — wait for container to become ready
-                    elif container_status == "suspended":
-                        # Container was suspended to S3 — restore it
-                        asyncio.create_task(
-                            workspace_suspension_service.restore_workspace(job_id)
-                        )
-                        continue
-                    elif container_status in (
-                        "restoring",
-                        "suspending",
-                        "creating",
-                    ):
-                        # In-progress lifecycle operation — wait
-                        continue
-                    elif container_status == "failed":
-                        # Provisioning failed — fail the job with the error
-                        error = container_ctx.get("error", "unknown error")
+                    # K8s create (when status absent) + all lifecycle states route
+                    # through the shared, owner-agnostic state machine.
+                    config_override = job.get("config_override") or {}
+                    if isinstance(config_override, str):
+                        config_override = json.loads(config_override)
+                    ws_cfg = config_override.get("workspace", {}).get("container", {})
+                    res = await ensure_workspace(
+                        WorkspaceOwner.job(job_id),
+                        provisioner=container_provisioner,
+                        suspension=workspace_suspension_service,
+                        current_status=container_status,
+                        ws_config={
+                            k: ws_cfg[k]
+                            for k in (
+                                "cpu",
+                                "memory",
+                                "cpu_limit",
+                                "memory_limit",
+                                "image",
+                            )
+                            if k in ws_cfg
+                        },
+                    )
+                    if res.outcome is EnsureOutcome.FAILED:
+                        if container_status == "failed":
+                            error = container_ctx.get("error", "unknown error")
+                            msg = f"Workspace container failed: {error}"
+                        else:
+                            msg = (
+                                "Workspace container could not be created. Check "
+                                "orchestrator logs for details (image pull failures, "
+                                "insufficient resources, RBAC issues)."
+                            )
                         logger.error(
-                            "Dispatcher: workspace container failed for job %s: %s. "
+                            "Dispatcher: workspace ensure failed for job %s: %s. "
                             "Failing job.",
                             job_id,
-                            error,
+                            msg,
                         )
                         await postgres_db.update_job_status(
-                            job_id,
-                            status="failed",
-                            error_message=(f"Workspace container failed: {error}"),
+                            job_id, status="failed", error_message=msg
                         )
                         continue
-                    elif container_status != "ready":
-                        # Unknown status — log and skip
-                        logger.warning(
-                            "Dispatcher: job %s has unexpected workspace container "
-                            "status '%s' — skipping",
-                            job_id,
-                            container_status,
-                        )
-                        continue
-                    # else: container is ready, proceed with dispatch
+                    if res.outcome is EnsureOutcome.PENDING:
+                        if container_status not in (
+                            None,
+                            "",
+                            "deleted",
+                            "none",
+                            "created",
+                            "creating",
+                            "restoring",
+                            "suspending",
+                            "pending",
+                        ):
+                            logger.warning(
+                                "Dispatcher: job %s has unexpected workspace "
+                                "container status %r — waiting",
+                                job_id,
+                                container_status,
+                            )
+                        continue  # in progress — wait for next cycle
+                    # READY → proceed with dispatch
                     logger.info("Dispatcher: job %s using workspace container", job_id)
                 else:
                     # No VM or container provisioning needed — check if a workspace
@@ -2444,6 +2510,14 @@ class AgentRegistration(BaseModel):
     thread_id: str | None = Field(None, description="Thread UUID for persistent agents")
     build_sha: str | None = Field(
         None, description="Build commit SHA baked into the agent image"
+    )
+    pod_uid: str | None = Field(
+        None,
+        description=(
+            "K8s-assigned metadata.uid of the agent pod, self-reported via "
+            "the Kubernetes downward API. Used by the session router to "
+            "stamp ownerReferences on per-session Service/Ingress resources."
+        ),
     )
 
 
@@ -2744,6 +2818,29 @@ class LlmEndpointUpdate(BaseModel):
     api_key: str | None = None
     clear_api_key: bool = False
     allow_insecure: bool = False
+
+
+class PromptOverrideCreate(BaseModel):
+    """Request body for creating or replacing a prompt override.
+
+    ``kind`` is the resolver subsection; ``name`` is the resolver entry_type
+    (e.g. 'persona', 'systemprompt'). ``family=None`` means a global default.
+    """
+
+    family: str | None = Field(None, max_length=64)
+    kind: Literal["prompts", "instructions"]
+    name: str = Field(..., min_length=1, max_length=128)
+    content: str = Field(..., min_length=1)
+    content_format: Literal["text", "markdown", "jinja", "yaml"] = "text"
+    notes: str | None = None
+
+
+class PromptOverrideUpdate(BaseModel):
+    """Update an existing override's content; family/kind/name are immutable."""
+
+    content: str = Field(..., min_length=1)
+    content_format: Literal["text", "markdown", "jinja", "yaml"] = "text"
+    notes: str | None = None
 
 
 LLM_MODEL_CAPABILITIES = ("chat", "vision", "embedding", "auxiliary", "whisper", "tts")
@@ -3512,6 +3609,7 @@ app.include_router(bff_router)
 app.include_router(graph_router)
 app.include_router(uploads_router)
 app.include_router(automations_router)
+app.include_router(sessions_router)
 
 
 @app.get("/api/tables")
@@ -4131,12 +4229,12 @@ async def delete_job(request: Request, job_id: str) -> dict[str, str]:
 
 @app.post("/api/jobs/{job_id}/subjob-merge")
 async def subjob_merge(request: Request, job_id: str) -> dict[str, Any]:
-    """Squash-merge a completed subjob's branch into its parent's branch.
+    """Graft a completed subjob's output/ onto its parent's branch.
     **Internal** (P4b) — requires ``X-Internal-Key``. Ingress strips this
     path.
 
     Called by the agent after a subjob completes (autonomy=full auto-completion).
-    Performs pre-merge cleanup of job-scoped files, then squash merges.
+    Grafts the subjob's output/ onto the parent as a namespaced outputs/ folder.
     """
     await require_internal(request)
     try:
@@ -4147,10 +4245,10 @@ async def subjob_merge(request: Request, job_id: str) -> dict[str, Any]:
         if not job.get("parent_job_id"):
             raise HTTPException(
                 status_code=400,
-                detail="Only subjobs (with parent_job_id) can be squash-merged",
+                detail="Only subjobs (with parent_job_id) can be grafted",
             )
 
-        result = await _squash_merge_subjob(job_id)
+        result = await _graft_subjob_output(job_id)
         if result is None:
             return {"status": "skipped", "reason": "no branch/repo configured"}
 
@@ -5354,6 +5452,11 @@ async def notification_sse_events(request: Request) -> StreamingResponse:
 
     async def event_stream():
         try:
+            # Kickstart: flush immediately so EventSource.onopen fires at once and
+            # buffering proxies (Cloudflare Tunnel, Traefik) don't idle-timeout
+            # before the first byte — otherwise the next byte is the 30s keepalive
+            # below. Comments (`:`-prefixed) are ignored by EventSource.
+            yield ": open\n\n"
             while True:
                 try:
                     event = await asyncio.wait_for(queue.get(), timeout=30)
@@ -5566,6 +5669,11 @@ async def sudo_sse_events(request: Request) -> StreamingResponse:
 
     async def event_stream():
         try:
+            # Kickstart: flush immediately so EventSource.onopen fires at once and
+            # buffering proxies (Cloudflare Tunnel, Traefik) don't idle-timeout
+            # before the first byte — otherwise the next byte is the 30s keepalive
+            # below. Comments (`:`-prefixed) are ignored by EventSource.
+            yield ": open\n\n"
             while True:
                 # Check if client disconnected
                 if await request.is_disconnected():
@@ -6152,10 +6260,10 @@ async def approve_job(
 
         logger.info(f"Job {job_id} approved (gitea={wrote_to_gitea})")
 
-        # Squash-merge subjob branch into parent if applicable
+        # Graft subjob output onto parent branch if applicable
         merge_result = None
         if job.get("parent_job_id"):
-            merge_result = await _squash_merge_subjob(job_id)
+            merge_result = await _graft_subjob_output(job_id)
 
         # Agent is freed after completion — trigger dispatcher
         _trigger_dispatch()
@@ -6537,9 +6645,10 @@ async def _handle_scholar_completion(
 ) -> None:
     """After a scholar subjob completes or fails, unblock its parent job.
 
-    The scholar's branch has already been merged by ``_squash_merge_subjob``
-    (called earlier in ``complete_job``).  We just need to transition the
-    parent from 'waiting' to 'created' so the dispatcher picks it up.
+    The scholar's ``output/`` has already been grafted onto the parent branch by
+    ``_graft_subjob_output`` (called earlier in ``complete_job``); here we point
+    the parent at that grafted ``outputs/`` folder and transition it from
+    'waiting' to 'created' so the dispatcher picks it up.
     """
     parent_job_id = job.get("parent_job_id")
     if parent_job_id is None:
@@ -6594,7 +6703,17 @@ async def _handle_scholar_completion(
         )
     else:
         parent_ctx["scholar_completed"] = True
-        parent_ctx["scholar_output_dir"] = "research"
+        # The graft (run earlier in complete_job) wrote graft_output_path to the
+        # scholar's DB context; the in-memory `job` here predates that write, so
+        # re-fetch to read the freshly-grafted outputs/ path (None if no output).
+        fresh = await postgres_db.get_job(job_id)
+        fresh_ctx = (fresh or {}).get("context") or {}
+        if isinstance(fresh_ctx, str):
+            try:
+                fresh_ctx = json.loads(fresh_ctx)
+            except (json.JSONDecodeError, ValueError):
+                fresh_ctx = {}
+        parent_ctx["scholar_output_dir"] = (fresh_ctx or {}).get("graft_output_path")
         logger.info(f"Scholar {job_id} completed — unblocking parent {target_id}")
         actions.append(f"scholar {job_id} completed, parent {target_id} unblocked")
 
@@ -6665,12 +6784,21 @@ async def _handle_delegation_child_completion(
                 freeze = {}
         freeze = freeze or {}
 
+        child_ctx = child.get("context") or {}
+        if isinstance(child_ctx, str):
+            try:
+                child_ctx = json.loads(child_ctx)
+            except (json.JSONDecodeError, ValueError):
+                child_ctx = {}
+        child_output_path = (child_ctx or {}).get("graft_output_path")
+
         child_results.append(
             {
                 "job_id": child_id,
                 "description": child.get("description", ""),
                 "status": child_status,
                 "config_name": child.get("config_name", "default"),
+                "output_path": child_output_path,
                 "creation_order": child.get("creation_order"),
                 "branch_name": child.get("branch_name"),
                 "worktree_path": child.get("worktree_path"),
@@ -6800,12 +6928,21 @@ async def _check_delegation_timeouts() -> int:
                         freeze_child = {}
                 freeze_child = freeze_child or {}
 
+                child_ctx = child.get("context") or {}
+                if isinstance(child_ctx, str):
+                    try:
+                        child_ctx = json.loads(child_ctx)
+                    except (json.JSONDecodeError, ValueError):
+                        child_ctx = {}
+                child_output_path = (child_ctx or {}).get("graft_output_path")
+
                 child_results.append(
                     {
                         "job_id": child_id,
                         "description": child.get("description", ""),
                         "status": child.get("status", "unknown"),
                         "config_name": child.get("config_name", "default"),
+                        "output_path": child_output_path,
                         "creation_order": child.get("creation_order"),
                         "branch_name": child.get("branch_name"),
                         "summary": freeze_child.get("summary", ""),
@@ -7476,12 +7613,13 @@ async def complete_job(
                         f"Failed to send freeze notification for {job_id}: {e}"
                     )
 
-        # 2. Subjob merge (if this is a subjob with a branch)
-        # Skip auto-merge for delegation children — parent reviews and merges
-        if job.get("parent_job_id") and job.get("creation_order") is None:
-            merge_result = await _squash_merge_subjob(job_id)
-            if merge_result:
-                actions.append("subjob branch merged")
+        # 2. Subjob output graft (uniform for all subjob types; critic skipped inside)
+        if job.get("parent_job_id"):
+            graft_result = await _maybe_graft_completed_subjob(job)
+            if graft_result and graft_result.get("status") == "grafted":
+                actions.append(
+                    f"subjob output grafted to {graft_result['output_path']}"
+                )
 
         # 3. Handle critic verdict (if this is a critic job)
         try:
@@ -7767,6 +7905,18 @@ _PROXY_HOP_HEADERS = frozenset(
 )
 
 
+def _is_browser_navigation(request: Request) -> bool:
+    """True for a top-level browser navigation (vs an XHR / sub-resource).
+
+    Browsers send ``Sec-Fetch-Mode: navigate`` on top-level navigations;
+    code-server's own asset/XHR sub-requests send ``cors``/``no-cors``.
+    Fall back to an HTML-preferring Accept header for older browsers.
+    """
+    if request.headers.get("sec-fetch-mode") == "navigate":
+        return True
+    return "text/html" in request.headers.get("accept", "")
+
+
 @app.api_route(
     "/api/ide/{job_id}/proxy/{path:path}",
     methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"],
@@ -7788,7 +7938,17 @@ async def ide_proxy_http(request: Request, job_id: str, path: str = ""):
 
     # H1: close the zero-auth hole — pre-fix, any caller knowing (or guessing)
     # the job/thread UUID got full code-server access (file r/w, terminal).
-    user = await require_approved_user(request, postgres_db)
+    try:
+        user = await require_approved_user(request, postgres_db)
+    except HTTPException as exc:
+        # A top-level browser navigation can only carry the BFF cookie. When
+        # that session has idle-expired, send the browser through the cockpit
+        # login instead of dumping raw 401 JSON. Only the no-session 401
+        # redirects — 403 (pending approval / IDE access denied) stays an error
+        # so an authenticated-but-unauthorized user never loops through login.
+        if exc.status_code == 401 and _is_browser_navigation(request):
+            return RedirectResponse("/auth/login?return_to=/", status_code=302)
+        raise
     if not await user_can_access_ide_entity(user, postgres_db, job_id):
         logger.warning(
             "IDE HTTP: user %s denied access to entity %s",
@@ -10365,16 +10525,54 @@ async def register_agent(
             agent_mode=registration.agent_mode,
             thread_id=registration.thread_id,
             build_sha=registration.build_sha,
+            pod_uid=registration.pod_uid,
         )
-        # Bind persistent agent to its thread
+        # Bind persistent agent to its thread. Defense-in-depth against the
+        # double-provisioning race (docs/issues/persistent_thread_double_provisioning_race.md):
+        # take the per-thread advisory lock and refuse the bind if a *different*
+        # live agent already owns this thread — turns a silent overwrite into
+        # a loud 409 the orphan pod can react to by shutting down.
         if registration.agent_mode == "persistent" and registration.thread_id:
-            try:
-                await postgres_db.update_thread_agent(
-                    registration.thread_id, result["agent_id"]
-                )
-            except Exception as bind_err:
-                logger.warning(f"Thread binding failed (non-fatal): {bind_err}")
+            new_id = str(result["agent_id"])
+            async with postgres_db.thread_advisory_lock(registration.thread_id):
+                thread = await postgres_db.get_thread(registration.thread_id)
+                existing_id = thread.get("agent_id") if thread else None
+                if existing_id and str(existing_id) != new_id:
+                    existing = await postgres_db.get_agent(str(existing_id))
+                    existing_status = (existing or {}).get("status")
+                    if existing and existing_status not in (
+                        None,
+                        "offline",
+                        "failed",
+                    ):
+                        logger.warning(
+                            "register_agent: duplicate persistent registration "
+                            "for thread %s; winner=%s loser=%s — refusing.",
+                            registration.thread_id,
+                            existing_id,
+                            new_id,
+                        )
+                        try:
+                            await postgres_db.delete_agent(new_id)
+                        except Exception as del_err:
+                            logger.warning(
+                                "register_agent: failed to roll back loser %s: %s",
+                                new_id,
+                                del_err,
+                            )
+                        raise HTTPException(
+                            status_code=409,
+                            detail="thread already bound to another live agent",
+                        )
+                try:
+                    await postgres_db.update_thread_agent(
+                        registration.thread_id, new_id
+                    )
+                except Exception as bind_err:
+                    logger.warning(f"Thread binding failed (non-fatal): {bind_err}")
         return AgentRegistrationResponse(**result)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
@@ -10402,6 +10600,13 @@ class AgentThreadMessageRequest(BaseModel):
     tool_call_id: str | None = None
     # Reasoning content captured from role='ai' rows. See migration 0011.
     thinking: str | None = None
+    # Component columns added in migration 0019 — all optional/nullable.
+    reasoning: Any | None = None
+    tool_results: Any | None = None
+    provider: str | None = None
+    provider_raw: Any | None = None
+    additional_kwargs: dict | None = None
+    response_metadata: dict | None = None
 
 
 @app.post("/api/agents/threads")
@@ -10492,7 +10697,9 @@ async def agent_create_thread(
                 thread_id, {"status": "pending"}
             )
             asyncio.create_task(
-                container_provisioner.create_thread_workspace(thread_id)
+                container_provisioner.create_workspace(
+                    WorkspaceOwner.session(thread_id)
+                )
             )
 
         return {"thread_id": thread_id, "status": "created"}
@@ -11099,6 +11306,12 @@ async def agent_save_message(
             metrics=body.metrics,
             tool_call_id=body.tool_call_id,
             thinking=body.thinking,
+            reasoning=body.reasoning,
+            tool_results=body.tool_results,
+            provider=body.provider,
+            provider_raw=body.provider_raw,
+            additional_kwargs=body.additional_kwargs,
+            response_metadata=body.response_metadata,
         )
         return {"message_id": message_id, "status": "saved"}
     except Exception as e:
@@ -11489,7 +11702,9 @@ async def create_thread(
 
             # Kubernetes mode: create pod on demand
             async def _provision_thread_workspace(tid: str) -> None:
-                ok = await container_provisioner.create_thread_workspace(tid)
+                ok = await container_provisioner.create_workspace(
+                    WorkspaceOwner.session(tid)
+                )
                 if not ok:
                     logger.error(
                         "Thread %s: workspace container provisioning failed. "
@@ -11646,51 +11861,11 @@ async def create_thread(
                 "config_name", "persistent_defaults"
             )
 
-            async def _provision_or_assign(
-                tid: str,
-                cfg: str,
-                co: dict,
-                pids: list,
-                ds_ids: list[str] | None,
-            ) -> None:
-                # Try to attach an idle dual-mode agent from the warm pool
-                # first — this is instant (no image pull or pod boot needed).
-                idle_agent = await _find_idle_persistent_agent()
-                if idle_agent:
-                    resolved_ds = await postgres_db.resolve_datasources_for_thread(
-                        datasource_ids=ds_ids, project_ids=pids
-                    )
-                    ds_payload = _build_datasources_payload(resolved_ds)
-                    attach_co = co
-                    if resolved_ds:
-                        attach_co = _build_datasource_tool_override(resolved_ds, co)
-                    ok = await _send_session_attach(
-                        idle_agent, tid, attach_co, pids, datasources=ds_payload
-                    )
-                    if ok:
-                        logger.info(
-                            "Thread %s: attached to idle pool agent %s",
-                            tid,
-                            idle_agent["hostname"],
-                        )
-                        return
-
-                # No idle agent available — create a dedicated session pod.
-                pod_name = await agent_provisioner.provision_agent(
-                    purpose="session", thread_id=tid, config_name=cfg
-                )
-                if pod_name:
-                    return
-
-                logger.error(
-                    "Thread %s: no idle agents and pod provisioning failed. "
-                    "Check image availability, RBAC, node resources, "
-                    "or increase MAX_AGENTS.",
-                    tid,
-                )
+            from services.provision_or_assign import provision_or_assign
 
             asyncio.create_task(
-                _provision_or_assign(
+                provision_or_assign(
+                    str(user["id"]),
                     thread_id,
                     effective_config,
                     config_override,
@@ -12171,44 +12346,62 @@ async def resume_thread(
         config_name = thread.get("config_name", "persistent_defaults")
 
         async def _reprovision(tid: str, cfg: str) -> None:
-            # Try idle pool agent first (instant attach, no pod boot).
-            idle_agent = await _find_idle_persistent_agent()
-            if idle_agent:
-                co = thread.get("config_override") or {}
-                if isinstance(co, str):
-                    try:
-                        co = json.loads(co)
-                    except (json.JSONDecodeError, TypeError):
-                        co = {}
-                pids = thread.get("project_ids") or []
-                resolved_ds = await postgres_db.resolve_datasources_for_thread(
-                    project_ids=pids
-                )
-                ds_payload = _build_datasources_payload(resolved_ds)
-                if resolved_ds:
-                    co = _build_datasource_tool_override(resolved_ds, co)
-                ok = await _send_session_attach(
-                    idle_agent, tid, co, pids, datasources=ds_payload
-                )
-                if ok:
+            # Serialise concurrent provisioning attempts for the same
+            # thread (docs/issues/persistent_thread_double_provisioning_race.md).
+            # A concurrent /prepare or /resume on the same thread blocks
+            # here; the second arrival observes the binding written by
+            # the first and exits. Lifecycle SSE events for the cockpit's
+            # resume progress card come from /api/sessions/{tid}/prepare,
+            # which the cockpit drives in parallel with this endpoint.
+            async with postgres_db.thread_advisory_lock(tid):
+                cur = await postgres_db.get_thread(tid)
+                if cur and cur.get("agent_id"):
                     logger.info(
-                        "Thread %s: resumed via idle pool agent %s",
+                        "Thread %s: already bound to agent %s — "
+                        "skipping duplicate reprovision.",
                         tid,
-                        idle_agent["hostname"],
+                        cur["agent_id"],
                     )
                     return
 
-            # No idle agent — create a dedicated session pod.
-            pod_name = await agent_provisioner.provision_agent(
-                purpose="session", thread_id=tid, config_name=cfg
-            )
-            if pod_name:
-                return
+                # Try idle pool agent first (instant attach, no pod boot).
+                idle_agent = await _find_idle_persistent_agent()
+                if idle_agent:
+                    co = thread.get("config_override") or {}
+                    if isinstance(co, str):
+                        try:
+                            co = json.loads(co)
+                        except (json.JSONDecodeError, TypeError):
+                            co = {}
+                    pids = thread.get("project_ids") or []
+                    resolved_ds = await postgres_db.resolve_datasources_for_thread(
+                        project_ids=pids
+                    )
+                    ds_payload = _build_datasources_payload(resolved_ds)
+                    if resolved_ds:
+                        co = _build_datasource_tool_override(resolved_ds, co)
+                    ok = await _send_session_attach(
+                        idle_agent, tid, co, pids, datasources=ds_payload
+                    )
+                    if ok:
+                        logger.info(
+                            "Thread %s: resumed via idle pool agent %s",
+                            tid,
+                            idle_agent["hostname"],
+                        )
+                        return
 
-            logger.error(
-                "Thread %s: resume failed — no idle agents and pod provisioning failed",
-                tid,
-            )
+                # No idle agent — create a dedicated session pod.
+                pod_name = await agent_provisioner.provision_agent(
+                    purpose="session", thread_id=tid, config_name=cfg
+                )
+                if pod_name:
+                    return
+
+                logger.error(
+                    "Thread %s: resume failed — no idle agents and pod provisioning failed",
+                    tid,
+                )
 
         asyncio.create_task(_reprovision(thread_id, config_name))
     elif persistent_provisioner.is_available:
@@ -12217,17 +12410,18 @@ async def resume_thread(
             persistent_provisioner.create_agent_pod(thread_id, config_name=config_name)
         )
 
-    metadata = thread.get("metadata") or {}
-    if isinstance(metadata, str):
-        try:
-            metadata = json.loads(metadata)
-        except (json.JSONDecodeError, TypeError):
-            metadata = {}
-    ws_ctx = metadata.get("workspace_container") or {}
-    if ws_ctx.get("status") == "suspended" and workspace_suspension_service.is_enabled:
-        asyncio.create_task(
-            workspace_suspension_service.restore_thread_workspace(thread_id)
+    # Ensure the session workspace is provisioned/restored (idempotent): restores
+    # a suspended workspace, recreates a failed/missing one. Fire-and-forget so
+    # resume stays fast — the agent tolerates a not-yet-ready workspace and the
+    # periodic reconcile retries on failure.
+    asyncio.create_task(
+        ensure_session_workspace(
+            thread_id,
+            db=postgres_db,
+            provisioner=container_provisioner,
+            suspension=workspace_suspension_service,
         )
+    )
 
     return {"status": "created", "thread_id": thread_id}
 
@@ -12236,25 +12430,67 @@ async def resume_thread(
 async def get_thread_messages_history(
     thread_id: str,
     request: Request,
-    limit: int = 200,
+    limit: Optional[int] = None,
+    before: Optional[str] = None,
+    after: Optional[str] = None,
     offset: int = 0,
 ) -> dict[str, Any]:
-    """Load message history for a thread (for session resume).
+    """Load message history for a persistent thread, ascending (chronological).
 
-    Returns messages ordered by created_at ASC. Paginated.
-    Load this via REST before opening the WebSocket connection.
+    Default (no params) returns the **entire** conversation — the cockpit caches
+    the full thread client-side and windows the render itself, so the display
+    must not be truncated. Cursor paging (mutually exclusive, ISO-8601):
+
+    - ``before=<ts>``: backfill — newest messages at-or-before the cursor, up to
+      ``limit``.
+    - ``after=<ts>``:  catch-up — messages at-or-after the cursor, up to ``limit``.
+
+    A bare ``limit`` with no cursor keeps the legacy oldest-first paged read
+    (``offset`` honored) used by the MCP inspection tool. Returns
+    ``{messages, total, has_more, thread_id}``.
     """
     user, thread = await require_thread_owner(request, postgres_db, thread_id)
 
-    messages = await postgres_db.get_thread_messages_history(
-        thread_id=thread_id,
-        limit=min(limit, 500),
-        offset=offset,
-    )
+    def _parse_cursor(value: Optional[str]) -> Optional[datetime]:
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            raise HTTPException(
+                status_code=400, detail=f"Invalid ISO-8601 timestamp: {value!r}"
+            )
+
+    before_dt = _parse_cursor(before)
+    after_dt = _parse_cursor(after)
+    if before_dt is not None and after_dt is not None:
+        raise HTTPException(
+            status_code=400, detail="Pass at most one of 'before' / 'after'"
+        )
+
+    capped_limit = min(limit, 500) if limit is not None else None
+
+    if before_dt is not None or after_dt is not None:
+        messages, has_more = await postgres_db.get_thread_messages_page(
+            thread_id=thread_id,
+            before=before_dt,
+            after=after_dt,
+            limit=capped_limit,
+        )
+    else:
+        messages = await postgres_db.get_thread_messages_history(
+            thread_id=thread_id,
+            limit=capped_limit,
+            offset=offset,
+        )
+        # Legacy paged read: a full page implies there may be more.
+        has_more = capped_limit is not None and len(messages) == capped_limit
+
     total = await postgres_db.get_thread_message_count(thread_id)
     return {
         "messages": messages,
         "total": total,
+        "has_more": has_more,
         "thread_id": thread_id,
     }
 
@@ -12416,6 +12652,16 @@ async def thread_event_stream(thread_id: str, request: Request) -> StreamingResp
             cursor_seq = None
 
     async def event_stream():
+        # Kickstart: flush a comment immediately so the browser EventSource
+        # fires `onopen` at once and buffering intermediaries (Cloudflare
+        # Tunnel, Traefik) don't hold the response headers / idle-timeout the
+        # connection waiting for the first body byte. Without this, a connect
+        # whose cursor is already at the tail sends nothing until the ~20s
+        # keepalive ping below — stalling the SSE receive path ~20s. Comments
+        # (lines starting with `:`) are ignored by EventSource, so this is
+        # side-effect-free on the client.
+        yield ": open\n\n"
+
         # Mismatched epoch → force re-sync.
         if cursor_epoch is not None and cursor_epoch != server_epoch:
             async with postgres_db.acquire() as conn:
@@ -13667,402 +13913,6 @@ async def synthesize_thread_message_tts(
     return Response(content=audio, media_type="audio/mpeg")
 
 
-# --- Session notification helpers (used by WS proxy) ---
-
-_SESSION_NOTIFY_METHODS = {"permission.request", "vm_upgrade.needed", "ready"}
-_SESSION_RESOLVE_METHODS = {"approve", "deny"}
-
-
-def _inspect_session_event(
-    raw: str,
-    thread_id: str,
-    user_id: str,
-    thread_title: str,
-    config_name: str | None,
-) -> None:
-    """Inspect an agent→browser WS frame and broadcast SSE if notification-worthy."""
-    if not user_id:
-        return
-    try:
-        event = json.loads(raw)
-        method = event.get("method")
-        if method not in _SESSION_NOTIFY_METHODS:
-            return
-
-        from services.notification_feed import notification_feed
-        import uuid as _uuid
-
-        params = event.get("params") or {}
-        event_id = str(_uuid.uuid4())
-
-        type_map = {
-            "permission.request": "session.permission_request",
-            "vm_upgrade.needed": "session.vm_upgrade",
-            "ready": "session.waiting",
-        }
-
-        notification_feed.broadcast(
-            user_id=user_id,
-            event_type=type_map[method],
-            data={
-                "event_id": event_id,
-                "thread_id": thread_id,
-                "title": thread_title,
-                "config_name": config_name,
-                "tool": params.get("tool"),
-                "args": params.get("args"),
-                "reason": params.get("reason"),
-                "command": params.get("command"),
-            },
-        )
-    except (json.JSONDecodeError, Exception):
-        pass
-
-
-def _inspect_browser_event(
-    raw: str,
-    thread_id: str,
-    user_id: str,
-) -> None:
-    """Inspect a browser→agent WS frame and broadcast resolve if approve/deny."""
-    if not user_id:
-        return
-    try:
-        event = json.loads(raw)
-        method = event.get("method")
-        if method not in _SESSION_RESOLVE_METHODS:
-            return
-
-        from services.notification_feed import notification_feed
-
-        notification_feed.broadcast(
-            user_id=user_id,
-            event_type="session.resolved",
-            data={"thread_id": thread_id, "resolution": method},
-        )
-    except (json.JSONDecodeError, Exception):
-        pass
-
-
-@app.websocket("/ws/persistent/{thread_id}")
-async def persistent_ws_proxy(ws: WebSocket, thread_id: str):
-    """Proxy WebSocket connection to a persistent agent pod.
-
-    Looks up the agent serving this thread and forwards WebSocket frames
-    bidirectionally. Follows the same pattern as the IDE proxy.
-    """
-    # Must accept before we can send/close — FastAPI raises 500 otherwise
-    await ws.accept()
-
-    # Cookie auth: browsers send the BFF session cookie on WS handshake
-    # automatically when the URL is on the API host. Closes the prior
-    # zero-auth hole — pre-BFF, this endpoint accepted any caller who
-    # knew (or guessed) the thread UUID. See
-    # docs/features/auth_bff_and_api_tokens.md §1.1.
-    user = await resolve_ws_user(ws, postgres_db)
-    if not user:
-        await ws.close(code=4401, reason="Authentication required")
-        return
-    if not user.get("is_approved"):
-        await ws.close(code=4403, reason="Account pending approval")
-        return
-
-    # Resolve thread → agent → pod_ip
-    thread = await postgres_db.get_thread(thread_id)
-    if not thread:
-        await ws.close(code=4404, reason="Thread not found")
-        return
-
-    # Thread ownership: a session can only attach to its own threads. The
-    # cockpit's persistent-chat UI already enforces this in its REST flow,
-    # but the WS handshake is a separate trust boundary.
-    if str(thread.get("user_id") or "") != str(user["id"]):
-        logger.warning(
-            "WS: user %s tried to attach to thread %s owned by %s",
-            user["id"],
-            thread_id,
-            thread.get("user_id"),
-        )
-        await ws.close(code=4403, reason="Thread access denied")
-        return
-
-    # Restore suspended workspace before connecting to agent
-    metadata = thread.get("metadata") or {}
-    if isinstance(metadata, str):
-        try:
-            metadata = json.loads(metadata)
-        except (json.JSONDecodeError, TypeError):
-            metadata = {}
-    ws_ctx = metadata.get("workspace_container") or {}
-    ws_status = ws_ctx.get("status")
-    if ws_status == "failed":
-        error = ws_ctx.get("error", "unknown error")
-        logger.error("Thread %s workspace container failed: %s", thread_id, error)
-        await ws.close(
-            code=4503,
-            reason=f"Workspace container failed: {error}",
-        )
-        return
-    if ws_status == "suspended" and workspace_suspension_service.is_enabled:
-        logger.info("Restoring suspended workspace for thread %s", thread_id)
-        ok = await workspace_suspension_service.restore_thread_workspace(thread_id)
-        if not ok:
-            await ws.close(code=4503, reason="Failed to restore workspace")
-            return
-
-    # If agent_id is set but the agent is offline, clear the stale binding
-    # so we can re-provision.  This handles the case where the desktop cockpit
-    # opens the WS directly (without calling the resume endpoint first).
-    # Also clear when the agent is alive but no longer holds this thread —
-    # this catches /session/attach failures where the agent reset its local
-    # _pod_state to IDLE (heartbeat → status=ready, thread_id=NULL) but the
-    # release-agent POST didn't reach us (e.g. orchestrator restart).
-    if thread.get("agent_id"):
-        bound_agent = await postgres_db.get_agent(str(thread["agent_id"]))
-        is_missing = not bound_agent
-        is_offline = bool(bound_agent) and bound_agent.get("status") == "offline"
-        is_session_lost = (
-            bool(bound_agent)
-            and bound_agent.get("status") == "ready"
-            and str(bound_agent.get("thread_id") or "") != thread_id
-        )
-        if is_missing or is_offline or is_session_lost:
-            reason = (
-                "missing"
-                if is_missing
-                else "offline"
-                if is_offline
-                else "ready-without-session"
-            )
-            logger.warning(
-                "Thread %s: bound agent %s is %s — clearing stale binding",
-                thread_id,
-                thread.get("agent_id"),
-                reason,
-            )
-            await postgres_db.resume_thread(thread_id)
-            thread = await postgres_db.get_thread(thread_id)
-
-    if not thread.get("agent_id"):
-        # On-demand: try idle pool agent first (instant), then new pod.
-        if agent_provisioner.is_available:
-            config_name = thread.get("config_name", "persistent_defaults")
-
-            async def _ws_provision(
-                tid: str,
-                cfg: str,
-                thr: dict,
-            ) -> None:
-                # Pool-first: attach an idle dual-mode agent (no boot).
-                idle_agent = await _find_idle_persistent_agent()
-                if idle_agent:
-                    co = thr.get("config_override") or {}
-                    if isinstance(co, str):
-                        try:
-                            co = json.loads(co)
-                        except (json.JSONDecodeError, TypeError):
-                            co = {}
-                    pids = thr.get("project_ids") or []
-                    resolved_ds = await postgres_db.resolve_datasources_for_thread(
-                        project_ids=pids
-                    )
-                    ds_payload = _build_datasources_payload(resolved_ds)
-                    if resolved_ds:
-                        co = _build_datasource_tool_override(resolved_ds, co)
-                    ok = await _send_session_attach(
-                        idle_agent,
-                        tid,
-                        co,
-                        pids,
-                        datasources=ds_payload,
-                    )
-                    if ok:
-                        logger.info(
-                            "Thread %s: WS attached to idle pool agent %s",
-                            tid,
-                            idle_agent["hostname"],
-                        )
-                        return
-
-                # Fallback: create a dedicated session pod.
-                await agent_provisioner.provision_agent(
-                    purpose="session", thread_id=tid, config_name=cfg
-                )
-
-            asyncio.create_task(_ws_provision(thread_id, config_name, thread))
-        elif persistent_provisioner.is_available:
-            pod_status = await persistent_provisioner.get_pod_status(thread_id)
-            if not pod_status:
-                config_name = thread.get("config_name", "persistent_defaults")
-                asyncio.create_task(
-                    persistent_provisioner.create_agent_pod(
-                        thread_id, config_name=config_name
-                    )
-                )
-
-        # Poll for agent registration (agent calls /api/agents/register on startup).
-        # Budget must accommodate a cold pull of the agent image — on a fresh
-        # tag, kubelet image pull alone can take 2–3 minutes per node.
-        await ws.send_json({"method": "status", "params": {"phase": "provisioning"}})
-        bind_timeout_s = int(os.environ.get("AGENT_BIND_TIMEOUT_S", "300"))
-        bind_interval_s = 2
-        bind_iterations = max(1, bind_timeout_s // bind_interval_s)
-        agent_bound = False
-        for i in range(bind_iterations):
-            await asyncio.sleep(bind_interval_s)
-            thread = await postgres_db.get_thread(thread_id)
-            if thread and thread.get("agent_id"):
-                agent_bound = True
-                break
-            # Periodic progress ping so the cockpit doesn't sit silent for
-            # minutes on a cold agent image pull.
-            if i > 0 and i % 5 == 0:
-                try:
-                    await ws.send_json(
-                        {
-                            "method": "status",
-                            "params": {
-                                "phase": "provisioning",
-                                "elapsed_s": (i + 1) * bind_interval_s,
-                                "timeout_s": bind_timeout_s,
-                            },
-                        }
-                    )
-                except Exception:
-                    pass
-
-        if not agent_bound:
-            await ws.close(code=4503, reason="Agent failed to start within timeout")
-            return
-
-    agent = await postgres_db.get_agent(str(thread["agent_id"]))
-    if not agent:
-        await ws.close(code=4503, reason="Agent not available")
-        return
-
-    pod_ip = agent.get("pod_ip")
-    pod_port = agent.get("pod_port", 8001)
-    if not pod_ip:
-        await ws.close(code=4503, reason="Agent has no IP")
-        return
-
-    # Wait for agent readiness before proxying WS.
-    # Budget must outlast the agent's own _poll_workspace_ready (120s) plus
-    # margin for image pulls — a cold workspace image pull can take ~130s.
-    await ws.send_json({"method": "status", "params": {"phase": "booting"}})
-    ready_timeout_s = int(os.environ.get("WS_READY_TIMEOUT_S", "180"))
-    poll_interval_s = 2
-    iterations = max(1, ready_timeout_s // poll_interval_s)
-    agent_ready = False
-    for i in range(iterations):
-        try:
-            async with httpx.AsyncClient(timeout=2) as client:
-                resp = await client.get(f"http://{pod_ip}:{pod_port}/ready")
-                if resp.status_code == 200:
-                    try:
-                        body = resp.json()
-                        if body.get("ready", False):
-                            agent_ready = True
-                            break
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-        # Periodic progress ping so the cockpit doesn't sit silent for minutes
-        # on a cold image pull. Every 5 iterations ≈ every 10s.
-        if i > 0 and i % 5 == 0:
-            try:
-                await ws.send_json(
-                    {
-                        "method": "status",
-                        "params": {
-                            "phase": "booting",
-                            "elapsed_s": i * poll_interval_s,
-                            "timeout_s": ready_timeout_s,
-                        },
-                    }
-                )
-            except Exception:
-                pass
-        await asyncio.sleep(poll_interval_s)
-
-    if not agent_ready:
-        await ws.close(code=4503, reason="Agent not ready within timeout")
-        return
-
-    await ws.send_json({"method": "status", "params": {"phase": "connecting"}})
-
-    upstream_url = f"ws://{pod_ip}:{pod_port}/ws/chat"
-    logger.info(f"Proxying WS for thread {thread_id} to {upstream_url}")
-
-    try:
-        import websockets
-
-        async with websockets.connect(
-            upstream_url,
-            max_size=16 * 1024 * 1024,
-            ping_interval=30,
-            close_timeout=5,
-        ) as upstream:
-
-            async def agent_to_browser():
-                try:
-                    async for message in upstream:
-                        if isinstance(message, str):
-                            # Inspect for notification-worthy events
-                            _inspect_session_event(
-                                message,
-                                thread_id,
-                                str(thread.get("user_id") or ""),
-                                thread.get("title") or "Session",
-                                thread.get("config_name"),
-                            )
-                            await ws.send_text(message)
-                        else:
-                            await ws.send_bytes(message)
-                except Exception:
-                    pass
-
-            async def browser_to_agent_with_inspect():
-                """Relay browser→agent, inspecting for approve/deny to clear notifications."""
-                try:
-                    while True:
-                        data = await ws.receive_text()
-                        _inspect_browser_event(
-                            data,
-                            thread_id,
-                            str(thread.get("user_id") or ""),
-                        )
-                        await upstream.send(data)
-                except WebSocketDisconnect:
-                    pass
-                except Exception:
-                    pass
-
-            # Run both directions concurrently
-            done, pending = await asyncio.wait(
-                [
-                    asyncio.create_task(browser_to_agent_with_inspect()),
-                    asyncio.create_task(agent_to_browser()),
-                ],
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            for task in pending:
-                task.cancel()
-
-    except ImportError:
-        logger.error("websockets package not installed — WS proxy unavailable")
-        await ws.close(code=4500, reason="Server misconfigured")
-    except Exception as e:
-        logger.error(f"WS proxy error for thread {thread_id}: {e}")
-    finally:
-        try:
-            await ws.close()
-        except Exception:
-            pass
-        logger.info(f"WS proxy ended for thread {thread_id}")
-
-
 @app.get("/api/jobs/{job_id}/logs")
 async def get_job_logs(
     request: Request,
@@ -14865,7 +14715,7 @@ async def create_mcp_token(request: Request, body: McpTokenCreate) -> dict[str, 
             status_code=400,
             detail="Invalid scope. Use 'user', 'all', or 'project:<uuid>'",
         )
-    if scope == "all" and not user.get("is_admin", False):
+    if scope == "all" and not user.get("real_is_admin", False):
         raise HTTPException(
             status_code=403, detail="Only admins can create full-access tokens"
         )
@@ -15026,7 +14876,7 @@ async def create_api_key(request: Request, body: ApiKeyCreate) -> dict[str, Any]
             status_code=400,
             detail=f"Unknown scopes: {sorted(bad)}",
         )
-    if "admin" in requested and not user.get("is_admin", False):
+    if "admin" in requested and not user.get("real_is_admin", False):
         raise HTTPException(
             status_code=403, detail="Only admins can issue admin-scoped tokens"
         )
@@ -15536,6 +15386,144 @@ async def _maybe_schedule_discovery(provider: str, api_key: str) -> None:
         await postgres_db.set_system_api_key_discovery_cache(provider, payload)
 
     asyncio.create_task(_probe())
+
+
+# =============================================================================
+# Admin -> Prompts (DB-backed prompt overrides, v1)
+# =============================================================================
+
+
+def load_prompt_catalog() -> list[dict[str, Any]]:
+    """Human-facing descriptions for editable prompt keys.
+
+    Read from config/prompts/catalog.yaml (shipped with the image). Missing
+    file -> empty list.
+    """
+    import yaml
+
+    from src.core.loader import get_project_root
+
+    path = get_project_root() / "config" / "prompts" / "catalog.yaml"
+    if not path.exists():
+        return []
+    return yaml.safe_load(path.read_text()) or []
+
+
+def _prompt_catalog_entry(kind: str, name: str) -> dict[str, Any] | None:
+    for entry in load_prompt_catalog():
+        if entry.get("kind") == kind and entry.get("name") == name:
+            return entry
+    return None
+
+
+def read_bundled_prompt(kind: str, family: str | None, name: str) -> str:
+    """Read the shipped (bundled) content for (kind, family, name), bypassing overrides."""
+    from src.core.loader import InstructionMatrixResolver, PromptMatrixResolver
+
+    resolver_cls = {
+        "prompts": PromptMatrixResolver,
+        "instructions": InstructionMatrixResolver,
+    }.get(kind)
+    if resolver_cls is None:
+        raise HTTPException(status_code=400, detail=f"unknown kind: {kind!r}")
+    resolver = resolver_cls(None, family or "default")
+    try:
+        return resolver.load(name, bundled_only=True)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="no bundled default for that key")
+
+
+@app.get("/api/admin/prompts/overrides")
+async def admin_list_prompt_overrides(request: Request) -> list[dict[str, Any]]:
+    """List all prompt overrides (system-wide)."""
+    await _require_admin(request)
+    return await postgres_db.list_prompt_overrides()
+
+
+@app.get("/api/admin/prompts/overrides/{override_id}")
+async def admin_get_prompt_override(
+    request: Request, override_id: str
+) -> dict[str, Any]:
+    """Fetch a single prompt override by id."""
+    await _require_admin(request)
+    row = await postgres_db.get_prompt_override(override_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="override not found")
+    return row
+
+
+@app.post("/api/admin/prompts/overrides")
+async def admin_create_prompt_override(
+    request: Request, body: PromptOverrideCreate
+) -> dict[str, Any]:
+    """Create or replace the override for (family, kind, name)."""
+    user = await _require_admin(request)
+    return await postgres_db.upsert_prompt_override(
+        family=body.family,
+        kind=body.kind,
+        name=body.name,
+        content=body.content,
+        content_format=body.content_format,
+        notes=body.notes,
+        user_id=user.get("id"),
+    )
+
+
+@app.put("/api/admin/prompts/overrides/{override_id}")
+async def admin_update_prompt_override(
+    request: Request, override_id: str, body: PromptOverrideUpdate
+) -> dict[str, Any]:
+    """Update an existing override's content (family/kind/name are immutable)."""
+    user = await _require_admin(request)
+    existing = await postgres_db.get_prompt_override(override_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="override not found")
+    return await postgres_db.upsert_prompt_override(
+        family=existing["family"],
+        kind=existing["kind"],
+        name=existing["name"],
+        content=body.content,
+        content_format=body.content_format,
+        notes=body.notes,
+        user_id=user.get("id"),
+    )
+
+
+@app.delete("/api/admin/prompts/overrides/{override_id}")
+async def admin_delete_prompt_override(
+    request: Request, override_id: str
+) -> dict[str, Any]:
+    """Delete an override (reset to the bundled default)."""
+    await _require_admin(request)
+    if not await postgres_db.delete_prompt_override(override_id):
+        raise HTTPException(status_code=404, detail="override not found")
+    return {"deleted": True}
+
+
+@app.get("/api/admin/prompts/catalog")
+async def admin_prompt_catalog(request: Request) -> list[dict[str, Any]]:
+    """List the editable prompt keys with human descriptions."""
+    await _require_admin(request)
+    return load_prompt_catalog()
+
+
+@app.get("/api/admin/prompts/bundled/{family}/{kind}/{name}")
+async def admin_get_bundled_prompt(
+    request: Request, family: str, kind: str, name: str
+) -> dict[str, Any]:
+    """Return the bundled (shipped) default for a key, plus its catalog entry.
+
+    ``family='_'`` stands in for the global/default family.
+    """
+    await _require_admin(request)
+    fam = None if family == "_" else family
+    return {
+        "family": fam,
+        "kind": kind,
+        "name": name,
+        "content": read_bundled_prompt(kind, fam, name),
+        "catalog": _prompt_catalog_entry(kind, name),
+    }
 
 
 @app.get("/api/admin/providers/endpoints")

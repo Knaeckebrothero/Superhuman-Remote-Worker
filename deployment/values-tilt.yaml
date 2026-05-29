@@ -1,0 +1,62 @@
+# =============================================================================
+# Tilt-mode overlay — applied on top of values-local.yaml when running with
+# `tilt up`. Committed to git (no secrets here).
+#
+# This file exists because two chart-default settings break Tilt's
+# locally-built image tags:
+#
+#   1. `imagePullPolicy: Always` (chart default for every component) makes
+#      the kubelet query a registry for a tag like `tilt-abc123` that
+#      doesn't exist on GHCR. ImagePullBackOff.
+#   2. `workspace.prewarm.enabled: true` runs a DaemonSet that pre-pulls
+#      the agent and workspace images with `imagePullPolicy: Always`
+#      regardless of the chart's image.* values. Same ImagePullBackOff
+#      on Tilt-built tags. Disable for Tilt.
+#
+# Everything else carries over from values-local.yaml (LLM keys, dev
+# passwords, sessionRouter wiring, the OpenCloud hostAliases trick).
+# =============================================================================
+
+image:
+  orchestrator:
+    pullPolicy: IfNotPresent
+  cockpit:
+    pullPolicy: IfNotPresent
+  agent:
+    pullPolicy: IfNotPresent
+  mcp:
+    pullPolicy: IfNotPresent
+  workspace:
+    pullPolicy: IfNotPresent
+
+# Pre-warm DaemonSet pulls with `Always` and would crash on Tilt-built tags.
+# Side-effect: agent/workspace pods pull on first session/job spawn rather
+# than at cluster boot. ~10–30 s slower first-session experience; acceptable.
+workspace:
+  prewarm:
+    enabled: false
+
+# Cockpit dev image runs `ng serve`, which serves files from the Angular
+# source tree at /app/src/assets/. Land the chart-rendered env.js there so
+# Tilt-mode browsers get correct (Traefik-routed) URLs without having to
+# edit the committed cockpit/src/assets/env.js. The Tiltfile excludes this
+# path from the live_update sync so the ConfigMap mount wins.
+cockpit:
+  envJs:
+    mountPath: "/app/src/assets/env.js"
+  # ng serve cold-compile is ~30-90s, much longer than the chart's default
+  # readiness probe (5s + 3*5s = 20s budget). Enable the startupProbe so
+  # kubelet waits for the dev server to come online before applying
+  # liveness/readiness.
+  startupProbe:
+    enabled: true
+  # Prod nginx serves static files cheaply (250m CPU is fine). Tilt-mode
+  # `ng serve` runs an esbuild compiler; needs ≥1 CPU to compile in
+  # reasonable time and ~1.5 GB to avoid OOM during type-check + bundle.
+  resources:
+    requests:
+      memory: "512Mi"
+      cpu: "500m"
+    limits:
+      memory: "2Gi"
+      cpu: "2000m"

@@ -15,6 +15,7 @@ Coverage matrix (per design doc § PR 1):
 See docs/features/admin_view_as_user.md.
 """
 
+import pathlib
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import UUID
 
@@ -186,3 +187,106 @@ class TestRequireAdminContract:
         with _patch_current_user(regular_user):
             user = await auth.require_approved_user(_request("user"), MagicMock())
         assert user.get("real_is_admin") is False
+
+
+# =============================================================================
+# Inline admin privilege gates inside otherwise non-admin endpoints
+# =============================================================================
+#
+# Some endpoints are not fully admin-only but contain an inline check that
+# escalates privileges for specific scopes:
+#   - ``create_mcp_token`` (main.py): scope ``"all"`` requires admin
+#   - ``create_api_key`` (main.py):   scope ``"admin"`` requires admin
+#
+# These gates MUST consult ``real_is_admin`` — otherwise an admin in
+# "View as user" mode gets a 403 when trying to exercise their privilege
+# (regression on dev cluster 2026-05-22, cockpit silently swallowed the
+# 403 and the user saw "nothing happened" on click).
+#
+# The endpoints live behind orchestrator/main.py's heavy import graph, so
+# we don't exercise them via TestClient here. Two complementary tests:
+#   1. Contract: ``require_approved_user`` exposes ``real_is_admin`` so
+#      a gate using it passes for shadowed admins.
+#   2. Source-pattern: the two specific gates in main.py reference
+#      ``real_is_admin``, not the shadowed ``is_admin``.
+
+
+class TestInlinePrivilegeGates:
+    """Inline admin gates inside non-admin endpoints must use real_is_admin."""
+
+    @pytest.mark.asyncio
+    async def test_admin_in_shadow_passes_real_is_admin_gate(self, admin_user):
+        """An admin with view-as=user header must still satisfy a
+        ``not user.get("real_is_admin", False)`` privilege check.
+        """
+        with _patch_current_user(admin_user):
+            user = await auth.require_approved_user(_request("user"), MagicMock())
+
+        privileged_scope = True  # e.g. scope == "all" or "admin" in scopes
+        blocked = privileged_scope and not user.get("real_is_admin", False)
+        assert not blocked, (
+            "Admin in view-as mode must keep privileged scopes — "
+            "inline gates must check real_is_admin, not is_admin"
+        )
+
+    def test_create_mcp_token_admin_gate_uses_real_is_admin(self):
+        """``create_mcp_token`` scope=='all' check must use real_is_admin.
+
+        Source-pattern guard. If someone reverts the gate to ``is_admin``
+        the dev-cluster regression (admin in view-as=user can't create
+        full-access tokens) returns silently. This test catches that.
+        """
+        main_py = (
+            pathlib.Path(__file__).resolve().parents[1] / "orchestrator" / "main.py"
+        ).read_text()
+
+        # Locate the endpoint body
+        marker = "async def create_mcp_token("
+        assert marker in main_py, "Endpoint signature changed — update test"
+        body = main_py[main_py.index(marker) :]
+        # The privilege gate sits within the first ~50 lines
+        gate_window = body[: body.index("\n@app.")]
+
+        gate_line = next(
+            (line for line in gate_window.splitlines() if 'scope == "all"' in line),
+            None,
+        )
+        assert gate_line is not None, (
+            "Did not find the 'scope == \"all\"' privilege gate"
+        )
+        assert "real_is_admin" in gate_line, (
+            f"Privilege gate must check real_is_admin, not is_admin "
+            f"(otherwise admins in view-as mode get a false 403). "
+            f"Found: {gate_line.strip()!r}"
+        )
+
+    def test_create_api_key_admin_gate_uses_real_is_admin(self):
+        """``create_api_key`` 'admin' scope check must use real_is_admin.
+
+        Same bug pattern as create_mcp_token — kept as a separate test so
+        a partial revert (one fixed, one not) is caught.
+        """
+        main_py = (
+            pathlib.Path(__file__).resolve().parents[1] / "orchestrator" / "main.py"
+        ).read_text()
+
+        marker = "async def create_api_key("
+        assert marker in main_py, "Endpoint signature changed — update test"
+        body = main_py[main_py.index(marker) :]
+        gate_window = body[: body.index("\n@app.")]
+
+        gate_line = next(
+            (
+                line
+                for line in gate_window.splitlines()
+                if '"admin" in requested' in line
+            ),
+            None,
+        )
+        assert gate_line is not None, (
+            "Did not find the '\"admin\" in requested' privilege gate"
+        )
+        assert "real_is_admin" in gate_line, (
+            f"PAT admin-scope gate must check real_is_admin, not is_admin. "
+            f"Found: {gate_line.strip()!r}"
+        )

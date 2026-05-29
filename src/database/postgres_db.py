@@ -106,6 +106,7 @@ class PostgresDB:
         # Initialize namespaces
         self.jobs = JobsNamespace(self)
         self.citations = CitationsNamespace(self)
+        self.prompts = PromptsNamespace(self)
 
         logger.info("PostgresDB initialized (not connected yet)")
 
@@ -322,40 +323,122 @@ class PostgresDB:
     async def get_thread_messages_history(
         self,
         thread_id: str,
-        limit: int = 200,
+        limit: Optional[int] = 200,
         offset: int = 0,
+        since_turn: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
-        """Load thread message history for session resume. Ordered by created_at ASC."""
-        rows = await self.fetch(
-            """
-            SELECT id, role, content, tool_calls, turn_number, metrics, created_at
+        """Load thread message history. Ordered by turn_number, created_at ASC.
+
+        Pass ``limit=None`` to load the entire conversation. Session resume
+        uses this: the LLM working context is bounded afterwards by
+        ContextManager.ensure_within_limits (token-driven compaction), not by
+        truncating stored history. A fixed message cap can slice a parallel
+        tool-call batch and orphan a function call, which the Responses API
+        rejects with a 400.
+
+        Pass ``since_turn=N`` to load only rows with ``turn_number > N``. The
+        resume-from-checkpoint path uses this to skip the pre-checkpoint
+        history that the summary row already covers (see
+        ``get_latest_compaction_checkpoint``).
+        """
+        query = """
+            SELECT id, role, content, tool_calls, turn_number, metrics,
+                   tool_call_id, thinking, reasoning, tool_results,
+                   provider, provider_raw, additional_kwargs, response_metadata,
+                   created_at
             FROM thread_messages
             WHERE thread_id = $1
-            ORDER BY created_at ASC
-                LIMIT $2
-            OFFSET $3
-            """,
-            thread_id,
-            limit,
-            offset,
-        )
+              AND role <> 'summary'
+        """
+        params: List[Any] = [thread_id]
+        if since_turn is not None:
+            params.append(since_turn)
+            query += f"\n              AND turn_number > ${len(params)}"
+        query += "\n            ORDER BY turn_number ASC, created_at ASC"
+        if limit is not None:
+            params.append(limit)
+            query += f"\n            LIMIT ${len(params)}"
+        params.append(offset)
+        query += f"\n            OFFSET ${len(params)}"
+
+        rows = await self.fetch(query, *params)
+
+        def _j(v):
+            return json.loads(v) if isinstance(v, (str, bytes)) else v
+
         result = []
         for row in rows:
-            msg = {
-                "id": str(row["id"]),
-                "role": row["role"],
-                "content": row["content"],
-                "tool_calls": json.loads(row["tool_calls"])
-                if row["tool_calls"]
-                else None,
-                "turn_number": row["turn_number"],
-                "metrics": json.loads(row["metrics"]) if row["metrics"] else None,
-                "created_at": row["created_at"].isoformat()
-                if row["created_at"]
-                else None,
-            }
-            result.append(msg)
+            result.append(
+                {
+                    "id": str(row["id"]),
+                    "role": row["role"],
+                    "content": row["content"],
+                    "tool_calls": _j(row["tool_calls"]) if row["tool_calls"] else None,
+                    "turn_number": row["turn_number"],
+                    "metrics": _j(row["metrics"]) if row["metrics"] else None,
+                    "tool_call_id": row["tool_call_id"],
+                    "thinking": row["thinking"],
+                    "reasoning": _j(row["reasoning"]) if row["reasoning"] else None,
+                    "tool_results": _j(row["tool_results"])
+                    if row["tool_results"]
+                    else None,
+                    "provider": row["provider"],
+                    "provider_raw": _j(row["provider_raw"])
+                    if row["provider_raw"]
+                    else None,
+                    "additional_kwargs": _j(row["additional_kwargs"])
+                    if row["additional_kwargs"]
+                    else None,
+                    "response_metadata": _j(row["response_metadata"])
+                    if row["response_metadata"]
+                    else None,
+                    "created_at": row["created_at"].isoformat()
+                    if row["created_at"]
+                    else None,
+                }
+            )
         return result
+
+    async def get_latest_compaction_checkpoint(
+        self, thread_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Return the latest compaction checkpoint for this thread, if any.
+
+        Reads the newest ``role='summary'`` row (which the main history query
+        excludes). Used by the resume path: if a checkpoint exists, restore
+        ``[summary] + history(since_turn=boundary_turn)`` instead of the full
+        log — avoids re-loading hundreds of messages and re-summarizing from
+        scratch.
+
+        Rolling compactions merge prior summaries into a single new row, so the
+        newest row always carries the cumulative summary. Returns ``None`` when
+        no compaction has been persisted yet (back-compat: fall back to full
+        load). ``boundary_turn`` may be ``None`` on rows written before the
+        checkpoint feature shipped — caller must also fall back in that case.
+        """
+        query = """
+            SELECT content, metrics, turn_number
+            FROM thread_messages
+            WHERE thread_id = $1
+              AND role = 'summary'
+            ORDER BY turn_number DESC NULLS LAST, created_at DESC
+            LIMIT 1
+        """
+        row = await self.fetchrow(query, thread_id)
+        if row is None:
+            return None
+
+        metrics_raw = row["metrics"]
+        metrics = (
+            json.loads(metrics_raw)
+            if isinstance(metrics_raw, (str, bytes))
+            else metrics_raw
+        ) or {}
+        return {
+            "summary": row["content"] or "",
+            "boundary_turn": metrics.get("boundary_turn"),
+            "turn_number": row["turn_number"],
+        }
 
     # =========================================================================
     # SYNC WRAPPERS (for scripts and other sync contexts)
@@ -699,6 +782,29 @@ class JobsNamespace:
     ) -> List[Dict[str, Any]]:
         """Synchronous wrapper for list()."""
         return PostgresDB._run_async(self.list(status, limit, offset))
+
+
+class PromptsNamespace:
+    """Prompt-override reads for the agent's resolution path."""
+
+    def __init__(self, db: PostgresDB):
+        self.db = db
+
+    async def list_overrides_for_family(self, family: str) -> List[Dict[str, Any]]:
+        """Return override rows for <family> plus global (NULL-family) rows.
+
+        Read once per job at first run; the result is loaded into the loader's
+        process map and frozen into resolved_config.
+        """
+        rows = await self.db.fetch(
+            """
+            SELECT family, kind, name, content, content_format
+            FROM prompt_overrides
+            WHERE family = $1 OR family IS NULL
+            """,
+            family,
+        )
+        return [self.db._row_to_dict(row) for row in rows]
 
 
 class CitationsNamespace:

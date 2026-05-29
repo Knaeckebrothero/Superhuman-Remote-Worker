@@ -1,0 +1,447 @@
+#!/usr/bin/env python3
+"""browser-exec — workspace-side browser executor.
+
+Drives a headless Chromium *locally* on the workspace and exposes one
+browser action per invocation. The agent calls this over SSH
+(``backend.exec_command("browser-exec <action> --json '<args>'")``), so the
+Chrome DevTools Protocol never leaves the workspace's loopback interface —
+no cross-pod CDP, no debugging port exposed on the pod network.
+
+Two modes, one entrypoint:
+
+* ``browser-exec serve`` — long-lived daemon. Holds a persistent browser-use
+  ``BrowserSession`` (so element refs and page state survive between calls)
+  and answers requests on a unix socket.
+* ``browser-exec <action> [--json '<args>']`` — client. Connects to the
+  daemon (auto-spawning it on first use), sends the action, prints a single
+  JSON object to **stdout**, and exits. All diagnostics go to **stderr** so
+  the agent can parse stdout unambiguously.
+
+The action mechanics mirror ``src/tools/research/browser_direct.py`` exactly
+so the agent-facing output (``{dom, url, title, screenshot, tabs}`` with
+``[N]`` element refs) is unchanged. URL validation and content-nonce wrapping
+stay on the agent side — this program only executes.
+
+Requires browser-use + Playwright Chromium in the workspace image. Chromium
+is resolved via ``PLAYWRIGHT_BROWSERS_PATH`` (set in Dockerfile.workspace),
+the same way the agent's local-mode browser launches.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import base64
+import json
+import os
+import socket
+import subprocess
+import sys
+from pathlib import Path
+
+SOCKET_PATH = os.environ.get("BROWSER_EXEC_SOCKET", "/tmp/browser-exec.sock")
+DAEMON_LOG = os.environ.get("BROWSER_EXEC_LOG", "/tmp/browser-exec.log")
+# user_data_dir for the persistent profile (cookies/localStorage survive a
+# Chromium restart). Defaults under the agent-host home so it's workspace-local.
+PROFILE_DIR = os.environ.get(
+    "BROWSER_EXEC_PROFILE",
+    str(Path.home() / ".browser-profile"),
+)
+
+# Actions that take a positional integer ``ref`` from a prior snapshot.
+VALID_ACTIONS = {
+    "navigate",
+    "snapshot",
+    "click",
+    "type",
+    "select",
+    "scroll",
+    "screenshot",
+    "back",
+    "shutdown",
+}
+
+
+def log(msg: str) -> None:
+    """Diagnostics to stderr (never stdout — stdout is the JSON channel)."""
+    print(f"[browser-exec] {msg}", file=sys.stderr, flush=True)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Daemon: holds the persistent browser-use session
+# ─────────────────────────────────────────────────────────────────────
+
+
+class BrowserDaemon:
+    """Owns a single persistent ``BrowserSession`` and runs actions on it."""
+
+    def __init__(self) -> None:
+        self._session = None
+        self._lock = asyncio.Lock()
+        self.should_exit = False
+
+    async def _get_session(self):
+        """Return a healthy BrowserSession, (re)starting Chromium if needed."""
+        from browser_use import BrowserSession
+
+        if self._session is not None:
+            try:
+                await self._session.get_current_page_url()
+                return self._session
+            except Exception:
+                log("session unhealthy, restarting")
+                await self._close_session()
+
+        Path(PROFILE_DIR).mkdir(parents=True, exist_ok=True)
+        # browser-use launches Chromium via Playwright (PLAYWRIGHT_BROWSERS_PATH).
+        # No CDP port, no remote debugging. The workspace pod can't run Chromium's
+        # sandbox (no user namespaces), so disable it and avoid /dev/shm + GPU —
+        # the same flags the old _start_remote_chromium used.
+        session = BrowserSession(
+            headless=True,
+            user_data_dir=PROFILE_DIR,
+            chromium_sandbox=False,
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+        )
+        await session.start()
+        self._session = session
+        log("Chromium session started")
+        return session
+
+    async def _close_session(self) -> None:
+        if self._session is not None:
+            try:
+                await self._session.stop()
+            except Exception:
+                pass
+            self._session = None
+
+    # ── action handlers (mirror browser_direct.py helpers) ──
+
+    async def _page_state(self, session, args: dict) -> dict:
+        # get_browser_state_summary builds the DOM, populates the selector map
+        # (so get_element_by_index works for click/type/select), and captures a
+        # screenshot — all in one call. (DomService.get_serialized_dom_tree does
+        # NOT populate the session selector map, which breaks ref-based actions.)
+        include_shot = bool(args.get("include_screenshot"))
+        summary = await session.get_browser_state_summary(
+            include_screenshot=include_shot
+        )
+
+        dom_text = summary.dom_state.llm_representation()
+        max_chars = int(args.get("max_dom_chars", 40000))
+        if len(dom_text) > max_chars:
+            dom_text = dom_text[:max_chars] + "\n... (DOM truncated)"
+
+        result: dict = {
+            "url": summary.url,
+            "title": summary.title,
+            "dom": dom_text,
+        }
+
+        if include_shot and summary.screenshot:
+            result["screenshot"] = summary.screenshot  # already base64
+
+        try:
+            tabs = summary.tabs
+            if tabs and len(tabs) > 1:
+                result["tabs"] = [
+                    {
+                        "id": getattr(t, "target_id", getattr(t, "id", None)),
+                        "url": getattr(t, "url", None),
+                        "title": getattr(t, "title", None),
+                    }
+                    for t in tabs
+                ]
+        except Exception:
+            pass
+
+        return result
+
+    async def _click(self, session, ref: int) -> None:
+        from browser_use.browser.events import ClickElementEvent
+
+        node = await session.get_element_by_index(ref)
+        if node is None:
+            raise ValueError(
+                f"Element ref={ref} not found. Use snapshot to get current refs."
+            )
+        event = session.event_bus.dispatch(ClickElementEvent(node=node))
+        await event
+        await event.event_result(raise_if_any=True)
+
+    async def _type(self, session, ref: int, text: str, clear: bool = True) -> None:
+        from browser_use.browser.events import TypeTextEvent
+
+        node = await session.get_element_by_index(ref)
+        if node is None:
+            raise ValueError(
+                f"Element ref={ref} not found. Use snapshot to get current refs."
+            )
+        event = session.event_bus.dispatch(
+            TypeTextEvent(node=node, text=text, clear=clear)
+        )
+        await event
+        await event.event_result(raise_if_any=True)
+
+    async def _select(self, session, ref: int, value: str) -> None:
+        from browser_use.browser.events import SelectDropdownOptionEvent
+
+        node = await session.get_element_by_index(ref)
+        if node is None:
+            raise ValueError(
+                f"Element ref={ref} not found. Use snapshot to get current refs."
+            )
+        event = session.event_bus.dispatch(
+            SelectDropdownOptionEvent(node=node, option=value)
+        )
+        await event
+        await event.event_result(raise_if_any=True)
+
+    async def _scroll(
+        self, session, direction: str, amount: int = 500, ref=None
+    ) -> None:
+        from browser_use.browser.events import ScrollEvent
+
+        node = None
+        if ref is not None:
+            node = await session.get_element_by_index(ref)
+        event = session.event_bus.dispatch(
+            ScrollEvent(direction=direction, amount=amount, node=node)
+        )
+        await event
+        await event.event_result(raise_if_any=True)
+
+    async def _back(self, session) -> None:
+        page = await session.get_current_page()
+        if page is not None:
+            await page.evaluate("() => { window.history.back(); }")
+            await asyncio.sleep(0.5)
+
+    async def handle(self, req: dict) -> dict:
+        """Dispatch one request to the live session. Always returns a dict."""
+        action = req.get("action")
+        args = req.get("args") or {}
+
+        if action not in VALID_ACTIONS:
+            return {"error": f"unknown action: {action!r}"}
+
+        # Serialize: browser-use sessions are not concurrency-safe, and the
+        # agent issues actions one at a time anyway.
+        async with self._lock:
+            try:
+                if action == "shutdown":
+                    await self._close_session()
+                    self.should_exit = True
+                    return {"ok": True}
+
+                session = await self._get_session()
+
+                if action == "navigate":
+                    await session.navigate_to(args["url"])
+                    return await self._page_state(session, args)
+                if action == "snapshot":
+                    return await self._page_state(session, args)
+                if action == "screenshot":
+                    shot = await session.take_screenshot()
+                    return {
+                        "url": await session.get_current_page_url(),
+                        "title": await session.get_current_page_title(),
+                        "screenshot": base64.b64encode(shot).decode(),
+                    }
+                if action == "click":
+                    await self._click(session, int(args["ref"]))
+                    return await self._page_state(session, args)
+                if action == "type":
+                    await self._type(
+                        session,
+                        int(args["ref"]),
+                        args.get("text", ""),
+                        clear=bool(args.get("clear", True)),
+                    )
+                    return await self._page_state(session, args)
+                if action == "select":
+                    await self._select(session, int(args["ref"]), args["value"])
+                    return await self._page_state(session, args)
+                if action == "scroll":
+                    ref = args.get("ref")
+                    await self._scroll(
+                        session,
+                        args.get("direction", "down"),
+                        int(args.get("amount", 500)),
+                        int(ref) if ref is not None else None,
+                    )
+                    return await self._page_state(session, args)
+                if action == "back":
+                    await self._back(session)
+                    return await self._page_state(session, args)
+            except KeyError as e:
+                return {"error": f"{action}: missing required argument {e}"}
+            except Exception as e:
+                return {"error": f"{action} failed: {e}"}
+
+        return {"error": f"unhandled action: {action}"}
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Daemon server (unix socket, newline-delimited JSON: one req/resp per conn)
+# ─────────────────────────────────────────────────────────────────────
+
+
+async def _serve() -> int:
+    daemon = BrowserDaemon()
+
+    async def on_conn(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        try:
+            line = await reader.readline()
+            if not line:
+                return
+            req = json.loads(line.decode())
+            resp = await daemon.handle(req)
+            writer.write(json.dumps(resp).encode() + b"\n")
+            await writer.drain()
+        except Exception as e:
+            try:
+                writer.write(json.dumps({"error": f"daemon error: {e}"}).encode() + b"\n")
+                await writer.drain()
+            except Exception:
+                pass
+        finally:
+            try:
+                writer.close()
+            except Exception:
+                pass
+            if daemon.should_exit:
+                # graceful shutdown after responding to a 'shutdown' request
+                asyncio.get_event_loop().call_soon(_stop_server)
+
+    stop_event = asyncio.Event()
+
+    def _stop_server():
+        stop_event.set()
+
+    # Stale socket cleanup; bail out if another daemon already owns it.
+    if os.path.exists(SOCKET_PATH):
+        if _ping(SOCKET_PATH):
+            log("another daemon is already running; exiting")
+            return 0
+        try:
+            os.unlink(SOCKET_PATH)
+        except OSError:
+            pass
+
+    server = await asyncio.start_unix_server(on_conn, path=SOCKET_PATH)
+    try:
+        os.chmod(SOCKET_PATH, 0o600)
+    except OSError:
+        pass
+    log(f"listening on {SOCKET_PATH}")
+    async with server:
+        await stop_event.wait()
+    log("shutting down")
+    try:
+        os.unlink(SOCKET_PATH)
+    except OSError:
+        pass
+    return 0
+
+
+def _ping(path: str) -> bool:
+    """True if a daemon is accepting connections on the socket."""
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(1.0)
+            s.connect(path)
+        return True
+    except OSError:
+        return False
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Client
+# ─────────────────────────────────────────────────────────────────────
+
+
+def _spawn_daemon() -> None:
+    """Start the daemon detached, logging to DAEMON_LOG."""
+    log_fh = open(DAEMON_LOG, "a")
+    subprocess.Popen(
+        [sys.executable, os.path.abspath(__file__), "serve"],
+        stdout=log_fh,
+        stderr=log_fh,
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+def _request(req: bytes, timeout: float) -> bytes:
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+        s.settimeout(timeout)
+        s.connect(SOCKET_PATH)
+        s.sendall(req)
+        s.shutdown(socket.SHUT_WR)
+        buf = b""
+        while not buf.endswith(b"\n"):
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+        return buf
+
+
+def run_client(action: str, args: dict, timeout: float) -> int:
+    """Send one action; print the JSON reply to stdout. Returns exit code."""
+    req = json.dumps({"action": action, "args": args}).encode() + b"\n"
+
+    last_err = None
+    for attempt in range(12):  # ~ up to 6s of daemon spin-up
+        try:
+            resp = _request(req, timeout)
+            sys.stdout.write(resp.decode().rstrip("\n") + "\n")
+            return 0
+        except (ConnectionRefusedError, FileNotFoundError, OSError) as e:
+            last_err = e
+            if attempt == 0:
+                log("daemon not running, spawning")
+                _spawn_daemon()
+            import time
+
+            time.sleep(0.5)
+
+    print(json.dumps({"error": f"could not reach browser-exec daemon: {last_err}"}))
+    return 1
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Entrypoint
+# ─────────────────────────────────────────────────────────────────────
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(prog="browser-exec")
+    parser.add_argument("action", help="serve | " + " | ".join(sorted(VALID_ACTIONS)))
+    parser.add_argument("--json", default="{}", help="JSON-encoded action arguments")
+    parser.add_argument(
+        "--timeout", type=float, default=180.0, help="client socket timeout (s)"
+    )
+    ns = parser.parse_args(argv)
+
+    if ns.action == "serve":
+        try:
+            return asyncio.run(_serve())
+        except KeyboardInterrupt:
+            return 0
+
+    try:
+        args = json.loads(ns.json)
+        if not isinstance(args, dict):
+            raise ValueError("--json must encode an object")
+    except ValueError as e:
+        print(json.dumps({"error": f"bad --json: {e}"}))
+        return 1
+
+    return run_client(ns.action, args, ns.timeout)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

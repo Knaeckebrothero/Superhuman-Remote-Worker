@@ -66,6 +66,13 @@ export interface AssistantTurn {
     totals?: { inputTokens?: number; outputTokens?: number; costUsd?: number };
     /** True for turns rehydrated from REST history (not streamed live this session). */
     historical?: boolean;
+    /** True for turns synthesised by the reducer to absorb streaming events
+     * that arrived without a preceding `turn.started` (e.g. SSE replay
+     * cursor past the start event after a mid-turn reconnect). See
+     * docs/issues/persistent_chat_lost_assistant_turn_on_mid_turn_reload.md
+     * §Approach 2. The turn gets promoted to the real id (or closed) when
+     * `turn.completed` / `turn.interrupted` finally arrives. */
+    recovered?: boolean;
 }
 
 export interface UserTurn {
@@ -88,7 +95,21 @@ export interface SystemTurn {
     timestamp: number;
 }
 
-export type Turn = AssistantTurn | UserTurn | SystemTurn;
+/**
+ * Compaction boundary — emitted when the agent summarized the conversation
+ * (manual `/compact` or automatic `ensure_within_limits`). Renders as a
+ * centered divider banner (like the session-ended marker), expandable to the
+ * summary text, so the user can see the exact state the agent works from.
+ */
+export interface CompactionTurn {
+    kind: 'compaction';
+    id: string;
+    /** The summary the agent produced. May be empty when unavailable. */
+    summary: string;
+    timestamp: number;
+}
+
+export type Turn = AssistantTurn | UserTurn | SystemTurn | CompactionTurn;
 
 /**
  * Top-level conversation state held in PersistentChatService.
@@ -122,6 +143,10 @@ export function isUserTurn(t: Turn): t is UserTurn {
 
 export function isSystemTurn(t: Turn): t is SystemTurn {
     return t.kind === 'system';
+}
+
+export function isCompactionTurn(t: Turn): t is CompactionTurn {
+    return t.kind === 'compaction';
 }
 
 export function isThought(e: TurnEvent): e is ThoughtEvent {

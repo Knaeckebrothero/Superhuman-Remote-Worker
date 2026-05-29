@@ -262,12 +262,48 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: SRW_ACCESS_TOKEN_REFRESH_SKEW_S
-            # MCP auth
+            # Session router config (docs/features/direct_session_websockets.md)
+            - name: SESSION_JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.sessionRouter.jwtSecretName | default (printf "%s-session-jwt" (include "srw.fullname" .)) }}
+                  key: {{ .Values.sessionRouter.jwtSecretKey | default "jwt-secret" }}
+                  optional: true
+            - name: SESSION_JWT_TTL_S
+              value: {{ .Values.sessionRouter.jwtTtlSeconds | default 60 | quote }}
+            - name: SESSION_INGRESS_HOST
+              value: {{ .Values.sessionRouter.ingressHost | default (printf "api.%s" .Values.global.domain) | quote }}
+            - name: SESSION_INGRESS_CLASS
+              value: {{ .Values.sessionRouter.ingressClass | default "traefik" | quote }}
+            - name: SESSION_INGRESS_NAMESPACE
+              value: {{ .Release.Namespace | quote }}
+            - name: SESSION_INGRESS_ANNOTATIONS
+              value: {{ .Values.sessionRouter.annotations | default dict | toJson | quote }}
+            {{- if .Values.sessionRouter.tlsSecretName }}
+            # Per-session Ingress emits a `tls:` block so the browser can open
+            # wss:// on the same TLS entrypoint as the cockpit. Only needed
+            # for split-host edges (cluster-internal LBs without their own
+            # ACME flow, local dev with mkcert, etc.).
+            - name: SESSION_INGRESS_TLS_SECRET
+              value: {{ .Values.sessionRouter.tlsSecretName | quote }}
+            {{- end }}
+            # Name + key of the Secret holding the shared HS256 JWT key.
+            # The orchestrator passes both through to dynamically-provisioned
+            # agent pod manifests (services/agent_provisioner.py) so the
+            # pod's JWT validator (src/api/_session_auth.py) can resolve the
+            # same secret/key pair and verify handshake tokens.
+            - name: SESSION_JWT_SECRET_NAME
+              value: {{ .Values.sessionRouter.jwtSecretName | default (printf "%s-session-jwt" (include "srw.fullname" .)) | quote }}
+            - name: SESSION_JWT_SECRET_KEY
+              value: {{ .Values.sessionRouter.jwtSecretKey | default "jwt-secret" | quote }}
+            # MCP auth (only when mcp pod is deployed)
+            {{- if .Values.mcp.enabled }}
             - name: MCP_INTERNAL_KEY
               valueFrom:
                 secretKeyRef:
                   name: {{ include "srw.secretName" . }}
                   key: MCP_INTERNAL_KEY
+            {{- end }}
             # CORS
             - name: CORS_ORIGINS
               valueFrom:
@@ -455,16 +491,21 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: S3_ENDPOINT
+            # S3 credentials are optional — when absent the orchestrator
+            # detects "no S3" via empty S3_ENDPOINT and disables snapshots
+            # / external IDE session storage.
             - name: S3_ACCESS_KEY
               valueFrom:
                 secretKeyRef:
                   name: {{ include "srw.secretName" . }}
                   key: S3_ACCESS_KEY
+                  optional: true
             - name: S3_SECRET_KEY
               valueFrom:
                 secretKeyRef:
                   name: {{ include "srw.secretName" . }}
                   key: S3_SECRET_KEY
+                  optional: true
             - name: S3_BUCKET
               valueFrom:
                 configMapKeyRef:
@@ -522,6 +563,7 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: SMTP_PORT
+            {{- if .Values.email.enabled }}
             - name: SMTP_USER
               valueFrom:
                 secretKeyRef:
@@ -532,6 +574,7 @@ spec:
                 secretKeyRef:
                   name: {{ include "srw.secretName" . }}
                   key: SMTP_PASSWORD
+            {{- end }}
             - name: SMTP_USE_TLS
               valueFrom:
                 configMapKeyRef:
@@ -558,6 +601,7 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: IMAP_PORT
+            {{- if .Values.email.enabled }}
             - name: IMAP_USER
               valueFrom:
                 secretKeyRef:
@@ -568,6 +612,7 @@ spec:
                 secretKeyRef:
                   name: {{ include "srw.secretName" . }}
                   key: IMAP_PASSWORD
+            {{- end }}
             - name: IMAP_USE_SSL
               valueFrom:
                 configMapKeyRef:
@@ -628,6 +673,12 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: NATS_URL
+                  optional: true
+            - name: ORCHESTRATOR_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: ORCHESTRATOR_ID
                   optional: true
             - name: VM_TEMPLATE_PATH
               valueFrom:

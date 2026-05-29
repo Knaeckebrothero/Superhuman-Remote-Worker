@@ -127,8 +127,142 @@ INTERACTIVE_PROMPT_PATTERNS = [
     (re.compile(r"enter passphrase", re.IGNORECASE), "passphrase prompt"),
 ]
 
-# Seconds of unchanged output before declaring a stall (command waiting for input)
-STALL_DETECTION_SECONDS = 5.0
+# Seconds of *no new output* before a still-running command yields control back
+# to the model (the "soft" no-change timeout). Generous on purpose: heavy
+# installs/builds (e.g. pip downloading torch + CUDA wheels) routinely go quiet
+# for many seconds without waiting for input. Matches OpenHands' default.
+NO_CHANGE_TIMEOUT_SECONDS = 30.0
+
+# Absolute ceiling on how long a single synchronous command may block, even
+# when the caller passes a larger timeout.
+HARD_TIMEOUT_CAP_SECONDS = 600
+
+# Non-interactive environment applied to every fresh shell, so that pagers,
+# progress bars and credential prompts can't stall the no-change detector or
+# hang the command. (Deliberately does NOT set TERM=dumb — too disruptive.)
+NONINTERACTIVE_ENV_EXPORT = (
+    "export PAGER=cat GIT_PAGER=cat GIT_TERMINAL_PROMPT=0 GIT_ASKPASS= "
+    "SSH_ASKPASS= DEBIAN_FRONTEND=noninteractive PIP_PROGRESS_BAR=off "
+    "PIP_DISABLE_PIP_VERSION_CHECK=1"
+)
+
+# Returned when a command has produced no new output for NO_CHANGE_TIMEOUT_SECONDS
+# (the soft no-change timeout). Leads with "Exit code: -1" so downstream parsers
+# read it as "not finished" (distinct from success 0 and generic failure 1).
+# This is NOT an error — the process keeps running on its tab.
+#
+# Guidance here is mode-NEUTRAL: it must be valid even for the least-capable tool
+# set (stateless run_command + shell_read, which cannot send keys, abort, or use
+# other tabs). Tool-specific options (C-c, extra tabs) are taught by the
+# persistent shell_execute tool's own docstring, not baked in here.
+STILL_RUNNING_TEMPLATE = (
+    "Exit code: -1\n"
+    "--- still running ---\n"
+    "Command on tab '{tab}' has been running {elapsed:.0f}s with no new output "
+    "in the last {quiet:.0f}s — it has NOT finished (this is NOT an error; the "
+    "process is still executing on the tab).\n"
+    "Read the tab again after a moment to check for new output or completion; "
+    "the tab stays busy until it finishes, so don't send it another command yet "
+    "and don't poll in a tight loop. Tip: for work you expect to be slow or "
+    "quiet (large installs, builds, data ingestion/embedding, downloads), pass "
+    "an explicit `timeout` when you START the command so the call waits for the "
+    "full duration instead of returning here.\n"
+    "--- terminal state ---\n{terminal_state}"
+)
+
+# Returned when a command hits the hard timeout cap (the maximum a single call
+# will wait) without completing. Distinct from the soft message above: the
+# process may have been emitting output the whole time, so this must NOT claim
+# the output went quiet.
+STILL_RUNNING_HARDCAP_TEMPLATE = (
+    "Exit code: -1\n"
+    "--- still running ---\n"
+    "Command on tab '{tab}' is still running after {elapsed:.0f}s — that is the "
+    "maximum wait for one call, not an error, and it may still be producing "
+    "output.\n"
+    "Read the tab again to keep monitoring; the tab stays busy until it "
+    "finishes. If you expect it to take much longer, start such commands with a "
+    "larger explicit `timeout`.\n"
+    "--- terminal state ---\n{terminal_state}"
+)
+
+# Returned when a new command is sent to a tab whose previous command is still
+# running. The new command is NOT executed (avoids head-of-line blocking the
+# tab with two interleaved commands). Mode-NEUTRAL guidance only (see above).
+COLLIDING_COMMAND_TEMPLATE = (
+    "Tab '{tab}' has a previous command still running; your new command was "
+    "NOT executed.\n"
+    "Wait for it to finish before sending another command here — read the tab "
+    "to monitor its progress.\n"
+    "--- terminal state ---\n{terminal_state}"
+)
+
+# Returned when the command is genuinely blocked on an interactive prompt
+# (password, y/n, etc.). Unlike a no-change stall, this one really does need
+# input — the model should respond in keys mode.
+INTERACTIVE_PROMPT_TEMPLATE = (
+    "Interactive prompt detected ({prompt_type}). The command is waiting for "
+    "input on tab '{tab}'.\n"
+    "Respond by sending the expected input (or a control key like C-c to "
+    "cancel) in keys mode.\n"
+    "--- terminal state ---\n{terminal_state}"
+)
+
+
+def compute_no_change_state(
+    all_lines: List[str],
+    prev_hash: Optional[int],
+    stall_start: Optional[float],
+    now: float,
+    soft_enabled: bool,
+    threshold: float,
+) -> Tuple[int, Optional[float], bool]:
+    """Track whether a running command's output has gone quiet long enough.
+
+    Hashes the FULL captured buffer (not just the visible tail) so output
+    scrolling anywhere — e.g. a long ``pip`` download printing above the
+    visible lines — counts as activity and resets the clock. The previous
+    implementation hashed only ``all_lines[-20:]`` and so mistook steady
+    long-running work for a stall.
+
+    Args:
+        all_lines: Current full pane capture, as lines.
+        prev_hash: Hash returned by the previous call (None on the first poll).
+        stall_start: Monotonic time the current no-change streak began, or None.
+        now: Current monotonic time.
+        soft_enabled: Whether the soft no-change timeout applies. When the
+            caller supplied an explicit timeout this is False, so only the
+            caller's hard timeout bounds the command.
+        threshold: Seconds of no change before declaring a soft timeout.
+
+    Returns:
+        ``(new_hash, new_stall_start, timed_out)``. ``timed_out`` is True only
+        when ``soft_enabled`` and output has been unchanged for >= ``threshold``.
+    """
+    new_hash = hash(tuple(all_lines))
+    if new_hash != prev_hash:
+        # Output changed (or first observation) -> reset the no-change clock.
+        return new_hash, None, False
+    # Output unchanged since the previous poll.
+    if stall_start is None:
+        stall_start = now
+    timed_out = soft_enabled and (now - stall_start >= threshold)
+    return new_hash, stall_start, timed_out
+
+
+def prompt_is_ready(all_lines: List[str]) -> bool:
+    """True when the shell appears idle at a prompt.
+
+    The last non-blank line ending in ``$``, ``#`` or ``%`` means bash is back
+    at its prompt — i.e. a previously-running command has finished or been
+    interrupted, even when its completion sentinel never printed (e.g. after a
+    C-c). Used by the colliding-command guard to know when a tab is free again.
+    """
+    for line in reversed(all_lines):
+        stripped = line.strip()
+        if stripped:
+            return stripped[-1] in ("$", "#", "%")
+    return False
 
 
 @dataclass
@@ -140,6 +274,9 @@ class ShellTab:
     window: Any  # libtmux.Window
     pane: Any  # libtmux.Pane
     read_cursor: int = 0  # Line index for since_cursor reads
+    # Sentinel of a command that hit the soft/hard timeout and is still running
+    # on this tab. While set, new commands are refused (colliding-command guard).
+    pending_sentinel: Optional[str] = None
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     last_activity: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
@@ -174,6 +311,7 @@ class ShellManager:
         max_tabs: int = 15,
         scrollback_limit: int = 5000,
         default_timeout: int = 120,
+        no_change_timeout: float = NO_CHANGE_TIMEOUT_SECONDS,
         blocked_commands: Optional[List[str]] = None,
         sandbox_cwd: Optional[str] = None,
         backend: Optional[Any] = None,
@@ -185,7 +323,10 @@ class ShellManager:
             job_id: Unique job identifier (used in session name)
             max_tabs: Maximum number of concurrent shell tabs
             scrollback_limit: Tmux history-limit per pane
-            default_timeout: Default timeout for run_sync in seconds
+            default_timeout: Default (hard) timeout for run_sync in seconds
+            no_change_timeout: Seconds of no new output before a still-running
+                               command yields control back (soft timeout).
+                               Disabled when the caller passes an explicit timeout.
             blocked_commands: Commands to block (None = use defaults)
             sandbox_cwd: Working directory to restrict commands to (None = no restriction)
             backend: Optional workspace backend with shell support. When provided
@@ -200,6 +341,7 @@ class ShellManager:
         self.max_tabs = max_tabs
         self.scrollback_limit = scrollback_limit
         self.default_timeout = default_timeout
+        self.no_change_timeout = no_change_timeout
         self.sandbox_cwd = sandbox_cwd
         self._backend = backend
         self.sudo_action = sudo_action
@@ -265,15 +407,42 @@ class ShellManager:
             pane=default_pane,
         )
 
-        # Set working directory if sandbox_cwd is set
+        # Run setup (non-interactive env + optional cd) and wait for it to
+        # finish so the preamble fully settles and never folds into the first
+        # command's captured output.
+        setup = NONINTERACTIVE_ENV_EXPORT
         if self.sandbox_cwd:
-            default_pane.send_keys(f"cd {self.sandbox_cwd}", enter=True)
-            time.sleep(0.1)
+            setup += f"; cd {self.sandbox_cwd}"
+        self._send_and_wait(default_pane, setup)
 
         logger.info(
             f"ShellManager initialized: session={session_name}, "
             f"tabs={list(self._tabs.keys())}"
         )
+
+    def _send_and_wait(self, pane, command: str, timeout: float = 5.0) -> None:
+        """Send a setup command and block until it has run.
+
+        Appends a unique marker and polls until the marker prints on its own
+        line, confirming the command finished and the prompt returned. Used for
+        tab-creation preamble (env export, cd) so it fully settles before the
+        first user command — otherwise a race could fold the preamble into that
+        command's captured output.
+        """
+        marker = f"__READY_{uuid.uuid4().hex[:8]}__"
+        pane.send_keys(f"{command}; echo {marker}", enter=True)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                captured = pane.capture_pane(start="-{}".format(self.scrollback_limit))
+            except Exception:
+                return
+            lines = (
+                captured.splitlines() if isinstance(captured, str) else list(captured)
+            )
+            if any(ln.strip() == marker for ln in lines):
+                return
+            time.sleep(0.05)
 
     def _ensure_session_alive(self) -> None:
         """Recreate the tmux session if it has died externally."""
@@ -303,9 +472,10 @@ class ShellManager:
             pane=default_pane,
         )
 
+        setup = NONINTERACTIVE_ENV_EXPORT
         if self.sandbox_cwd:
-            default_pane.send_keys(f"cd {self.sandbox_cwd}", enter=True)
-            time.sleep(0.1)
+            setup += f"; cd {self.sandbox_cwd}"
+        self._send_and_wait(default_pane, setup)
 
     def ensure_tab(self, name: str) -> ShellTab:
         """Get an existing tab or auto-create a new shell tab.
@@ -401,10 +571,14 @@ class ShellManager:
         )
         pane = window.active_pane
 
-        # Set working directory if sandbox_cwd is set and this is a shell-like tab
-        if self.sandbox_cwd and tab_type in ("shell", "process"):
-            pane.send_keys(f"cd {self.sandbox_cwd}", enter=True)
-            time.sleep(0.1)
+        # Non-interactive env + working directory (shell/process tabs only —
+        # REPLs/SSH manage their own environment). Wait for the preamble to
+        # settle so it doesn't fold into the first command's output.
+        if tab_type in ("shell", "process"):
+            setup = NONINTERACTIVE_ENV_EXPORT
+            if self.sandbox_cwd:
+                setup += f"; cd {self.sandbox_cwd}"
+            self._send_and_wait(pane, setup)
 
         # Run initial command if provided
         if command:
@@ -643,9 +817,14 @@ class ShellManager:
         if blocked:
             return blocked
 
+        # An explicit timeout disables the soft no-change timeout (the caller is
+        # telling us the command is expected to run long / quietly); only the
+        # hard timeout then bounds it.
+        soft_enabled = timeout is None
+
         if self._use_backend:
-            if timeout is None:
-                timeout = self.default_timeout
+            # Pass timeout through as-is (None => soft timeout enabled). The
+            # backend derives soft/hard exactly as the local path does below.
             return self._backend.shell_run(
                 command,
                 timeout=timeout,
@@ -655,7 +834,7 @@ class ShellManager:
 
         if timeout is None:
             timeout = self.default_timeout
-        timeout = min(timeout, 600)  # Cap at 10 minutes
+        timeout = min(timeout, HARD_TIMEOUT_CAP_SECONDS)
 
         sentinel = f"__DONE_{uuid.uuid4().hex[:12]}__"
         tab = self._get_tab(tab_name)
@@ -679,6 +858,8 @@ class ShellManager:
             else:
                 pre_check_lines = list(pre_lines)
 
+            # Pre-flight 1: a genuine interactive prompt is already visible.
+            # Give the specific "answer the prompt" guidance.
             existing_prompt = self._detect_blocked_tab(pre_check_lines, tab)
             if existing_prompt:
                 state_lines = [ln for ln in pre_check_lines if ln.strip()][-30:]
@@ -695,6 +876,25 @@ class ShellManager:
                     f"send C-c to cancel, or use a different tab.\n"
                     f"--- terminal state ---\n{terminal_state}"
                 )
+
+            # Pre-flight 2: colliding-command guard. A previous command on this
+            # tab hit the soft/hard timeout and may still be running. If neither
+            # its completion sentinel nor a fresh prompt has appeared, refuse the
+            # new command rather than queuing it behind the running one — which
+            # would head-of-line block the tab.
+            if tab.pending_sentinel is not None:
+                prev_done = any(
+                    ln.strip().startswith(tab.pending_sentinel)
+                    for ln in pre_check_lines
+                )
+                if prev_done or prompt_is_ready(pre_check_lines):
+                    tab.pending_sentinel = None
+                else:
+                    state_lines = [ln for ln in pre_check_lines if ln.strip()][-30:]
+                    terminal_state = "\n".join(state_lines) or "(empty)"
+                    return COLLIDING_COMMAND_TEMPLATE.format(
+                        tab=tab_name, terminal_state=terminal_state
+                    )
 
             # Change directory if needed
             if working_dir:
@@ -752,6 +952,9 @@ class ShellManager:
                     except (ValueError, IndexError):
                         exit_code = 1
 
+                    # Command finished — tab is no longer busy.
+                    tab.pending_sentinel = None
+
                     if start_marker is not None:
                         # Multi-line wrap path: locate the start marker output
                         # line and extract everything between it and the sentinel.
@@ -789,8 +992,8 @@ class ShellManager:
                     output_text = "\n".join(output_lines).strip()
                     break
 
-                # --- Early exit: interactive prompt detection ---
-                # Only check after the command has had time to produce output
+                # --- Early exit: genuine interactive prompt ---
+                # Only check after the command has had time to produce output.
                 elapsed = time.monotonic() - start_time
                 if elapsed > 1.0:
                     prompt_type = self._detect_interactive_prompt(all_lines, tab)
@@ -802,57 +1005,62 @@ class ShellManager:
                             f"Interactive prompt detected ({prompt_type}) "
                             f"after {elapsed:.1f}s for: {command}"
                         )
-                        if working_dir and self.sandbox_cwd:
-                            tab.pane.send_keys(f"cd {self.sandbox_cwd}", enter=True)
-                            time.sleep(0.1)
+                        # Command is waiting for input and owns the pane — don't
+                        # send a cwd-restore into it. Mark busy so a follow-up
+                        # command is guarded until the prompt is resolved.
+                        tab.pending_sentinel = sentinel
                         tab.last_activity = datetime.now(timezone.utc)
-                        return (
-                            f"Interactive prompt detected ({prompt_type}). "
-                            f"Use keys mode to respond.\n"
-                            f"--- terminal state ---\n{terminal_state}"
+                        return INTERACTIVE_PROMPT_TEMPLATE.format(
+                            prompt_type=prompt_type,
+                            tab=tab_name,
+                            terminal_state=terminal_state,
                         )
 
-                    # --- Stall detection ---
-                    content_hash = hash(tuple(all_lines[-20:]))
-                    if content_hash == last_content_hash:
-                        if stall_start is None:
-                            stall_start = time.monotonic()
-                        elif time.monotonic() - stall_start >= STALL_DETECTION_SECONDS:
-                            terminal_state = self._capture_terminal_state(
-                                tab, sentinel, pre_count
-                            )
-                            logger.debug(
-                                f"Output stall detected after {elapsed:.1f}s "
-                                f"for: {command}"
-                            )
-                            if working_dir and self.sandbox_cwd:
-                                tab.pane.send_keys(f"cd {self.sandbox_cwd}", enter=True)
-                                time.sleep(0.1)
-                            tab.last_activity = datetime.now(timezone.utc)
-                            return (
-                                f"Command appears to be waiting for input "
-                                f"(no output change for "
-                                f"{STALL_DETECTION_SECONDS:.0f}s). "
-                                f"Use keys mode to respond or C-c to cancel.\n"
-                                f"--- terminal state ---\n{terminal_state}"
-                            )
-                    else:
-                        stall_start = None
-                    last_content_hash = content_hash
+                    # --- Soft no-change timeout (command still running) ---
+                    last_content_hash, stall_start, timed_out = compute_no_change_state(
+                        all_lines,
+                        last_content_hash,
+                        stall_start,
+                        time.monotonic(),
+                        soft_enabled,
+                        self.no_change_timeout,
+                    )
+                    if timed_out:
+                        terminal_state = self._capture_terminal_state(
+                            tab, sentinel, pre_count
+                        )
+                        logger.debug(
+                            f"No output change for {self.no_change_timeout:.0f}s "
+                            f"(still running) for: {command}"
+                        )
+                        # Leave the command running; don't cwd-restore into a
+                        # busy pane. Mark busy for the colliding-command guard.
+                        tab.pending_sentinel = sentinel
+                        tab.last_activity = datetime.now(timezone.utc)
+                        return STILL_RUNNING_TEMPLATE.format(
+                            tab=tab_name,
+                            elapsed=elapsed,
+                            quiet=time.monotonic() - stall_start,
+                            terminal_state=terminal_state,
+                        )
 
-            # Restore working directory if changed
+            # Hard timeout: the loop exited without seeing the sentinel, so the
+            # command is still running. Report it as still-running (not killed,
+            # not an error) and leave the pane alone (no cwd-restore).
+            if exit_code is None:
+                terminal_state = self._capture_terminal_state(tab, sentinel, pre_count)
+                tab.pending_sentinel = sentinel
+                tab.last_activity = datetime.now(timezone.utc)
+                return STILL_RUNNING_HARDCAP_TEMPLATE.format(
+                    tab=tab_name, elapsed=timeout, terminal_state=terminal_state
+                )
+
+            # Completed — restore working directory if it was changed.
             if working_dir and self.sandbox_cwd:
                 tab.pane.send_keys(f"cd {self.sandbox_cwd}", enter=True)
                 time.sleep(0.1)
 
             tab.last_activity = datetime.now(timezone.utc)
-
-            if exit_code is None:
-                terminal_state = self._capture_terminal_state(tab, sentinel, pre_count)
-                return (
-                    f"Command timed out after {timeout}s: {command}\n"
-                    f"--- terminal state ---\n{terminal_state}"
-                )
 
             # Format output
             parts = [f"Exit code: {exit_code}"]
@@ -976,16 +1184,8 @@ class ShellManager:
         if self._check_alternate_screen(tab):
             return "alternate screen (editor/pager)"
 
-        # If the last non-blank line looks like a normal shell prompt
-        # (ends with $ or # or %), the tab is ready — not blocked.
-        last_nonblank = ""
-        for line in reversed(all_lines):
-            stripped = line.strip()
-            if stripped:
-                last_nonblank = stripped
-                break
-
-        if last_nonblank and last_nonblank[-1] in ("$", "#", "%"):
+        # If the shell is sitting at a ready prompt, the tab is not blocked.
+        if prompt_is_ready(all_lines):
             return None
 
         # Check last 3 lines (tighter window than the 5-line polling check)

@@ -81,37 +81,35 @@ def _format_delegation_results(delegation_results: list) -> str:
     """Format delegation child results as a human-readable message.
 
     Injected into the parent's graph state as a HumanMessage on delegation
-    resume so the agent can review each child's outcome.
+    resume. Each child's deliverables live at its grafted ``outputs/<n>-...``
+    folder on this branch — the parent READS them (and integrates anything
+    that must become real code itself); there are no branches to merge.
     """
     lines = [
         "## Delegation Results",
         "",
         f"All {len(delegation_results)} subagent(s) have completed. "
-        "Review each child's changes below, then merge or resume with feedback.",
+        "Each one's deliverables have been added to this branch under its "
+        "`outputs/` folder. Review them below, then integrate what you need.",
         "",
     ]
     for child in delegation_results:
         status = child.get("status", "unknown")
-        emoji = "completed" if status == "completed" else status
-        lines.append(f"### Child {child.get('creation_order', '?')}: {emoji}")
+        lines.append(f"### Child {child.get('creation_order', '?')}: {status}")
         lines.append(f"- **Job ID**: {child.get('job_id', 'unknown')}")
-        lines.append(f"- **Config**: {child.get('config', 'unknown')}")
+        lines.append(f"- **Config**: {child.get('config_name', 'unknown')}")
         lines.append(f"- **Status**: {status}")
         if child.get("confidence") is not None:
             lines.append(f"- **Confidence**: {child['confidence']}")
-        if child.get("branch_name"):
-            lines.append(f"- **Branch**: {child['branch_name']}")
+        if child.get("output_path"):
+            lines.append(f"- **Output**: `{child['output_path']}/`")
         if child.get("summary"):
             lines.append(f"- **Summary**: {child['summary']}")
         lines.append("")
-        lines.append(
-            f"To review: `git diff main..{child.get('branch_name', 'subagent/?')}`"
-        )
-        lines.append("")
 
     lines.append(
-        "Use `git_diff` to review each branch. Approve by squash-merging "
-        "in creation order, or resume a child with feedback if changes need revision."
+        "Use `read_file`/`list_files` on each child's `outputs/<n>-...` folder to "
+        "review its deliverables, then integrate the parts you need into your own work."
     )
     return "\n".join(lines)
 
@@ -1052,8 +1050,32 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
 
         # Freeze resolved config on first run (not resume)
         if self.postgres_conn and not resume and not _config_from_db:
+            from .core.loader import (
+                serialize_resolved_config,
+                set_prompt_overrides,
+                _is_prompt_db_overrides_enabled,
+            )
+
+            # Load DB prompt overrides first so they're captured in the freeze
+            # below (flag-gated; fail-open to bundled defaults on any error).
+            if _is_prompt_db_overrides_enabled():
+                try:
+                    from .core.model_registry import family_of
+
+                    _family = family_of(self.config.llm.model)
+                    _rows = await self.postgres_conn.prompts.list_overrides_for_family(
+                        _family
+                    )
+                    set_prompt_overrides(_rows)
+                    logger.info(
+                        f"Loaded {len(_rows)} prompt override(s) for family {_family}"
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to load prompt overrides (using bundled): {e}"
+                    )
+
             try:
-                from .core.loader import serialize_resolved_config
                 import uuid as _uuid
 
                 resolved = serialize_resolved_config(

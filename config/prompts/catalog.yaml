@@ -1,0 +1,29 @@
+# Human-facing descriptions for editable prompt keys (DB-backed prompt editor).
+# Each entry: kind (resolver subsection) + name (resolver entry_type) + a title
+# and description. Drives the admin "what is this prompt / where is it used"
+# text and the bundled-default view. v1 surfaces the core prompt-kind keys;
+# add entries here (and wire the resolver) to expose more.
+- kind: prompts
+  name: systemprompt
+  title: "System prompt (framework scaffold)"
+  description: >-
+    Framework system prompt. The expert persona is injected into it as
+    {expert_identity}. Rebuilt on every LLM call and survives compaction.
+- kind: prompts
+  name: persona
+  title: "Expert persona / identity"
+  description: >-
+    Injected as {expert_identity} on every call. Defines who the agent is and
+    how it thinks.
+- kind: prompts
+  name: strategic
+  title: "Strategic-phase directive"
+  description: "Appended during strategic (planning / reflection) phases."
+- kind: prompts
+  name: tactical
+  title: "Tactical-phase directive"
+  description: "Appended during tactical (execution) phases."
+- kind: prompts
+  name: summarization
+  title: "Summarization (compaction) prompt"
+  description: "Used when the conversation is compacted to free context."

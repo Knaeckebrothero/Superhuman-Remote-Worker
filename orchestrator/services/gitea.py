@@ -518,6 +518,55 @@ class GiteaClient:
             logger.warning(f"Failed to write {file_path} to {repo_name}: {e}")
             return False
 
+    async def change_files(
+        self,
+        repo_name: str,
+        branch: str,
+        files: list[dict],
+        message: str,
+    ) -> bool:
+        """Create multiple files in a SINGLE commit via Gitea's ChangeFiles API.
+
+        Args:
+            repo_name: Repository name.
+            branch: Target branch.
+            files: list of ``{"path": str, "content_b64": str}`` — each created
+                (base64 content keeps binary files byte-faithful).
+            message: Commit message.
+
+        Returns:
+            True on success, False otherwise.
+        """
+        if not self._initialized:
+            return False
+        if not files:
+            return True
+
+        client = self._get_client()
+        payload = {
+            "branch": branch,
+            "message": message,
+            "files": [
+                {"operation": "create", "path": f["path"], "content": f["content_b64"]}
+                for f in files
+            ],
+        }
+        try:
+            resp = await client.post(
+                f"{self._url}/api/v1/repos/{self._user}/{repo_name}/contents",
+                json=payload,
+            )
+            if resp.status_code in (200, 201):
+                return True
+            logger.warning(
+                f"change_files failed for {repo_name}@{branch} "
+                f"(status {resp.status_code}): {resp.text[:200]}"
+            )
+            return False
+        except Exception as e:
+            logger.warning(f"change_files failed for {repo_name}@{branch}: {e}")
+            return False
+
     async def delete_file(
         self,
         repo_name: str,

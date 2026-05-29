@@ -1,4 +1,5 @@
 import {
+    afterNextRender,
     AfterViewChecked,
     Component,
     computed,
@@ -6,6 +7,7 @@ import {
     ElementRef,
     HostListener,
     inject,
+    Injector,
     OnDestroy,
     OnInit,
     signal,
@@ -18,7 +20,7 @@ import {Router, RouterLink} from '@angular/router';
 import {firstValueFrom, Subscription} from 'rxjs';
 import {MarkdownComponent} from 'ngx-markdown';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
-import {ChatAttachment, PermissionRequest, PersistentChatService, ToolCallInfo,} from '../../core/services/persistent-chat.service';
+import {ChatAttachment, PermissionRequest, PersistentChatService, RunningToolInfo, ToolCallInfo,} from '../../core/services/persistent-chat.service';
 import {
     AssistantTurn,
     countEvents,
@@ -189,6 +191,78 @@ const CATEGORY_LABELS: Record<string, string> = {
     evaluation: 'Evaluation',
 };
 
+/**
+ * Pure decision helpers for the session-startup UX. Exported (and unit
+ * tested in persistent-chat.component.spec.ts) so the logic is verified
+ * without a full component render — see automations-page.component.spec.ts
+ * for the same split.
+ */
+
+/**
+ * Whether the slim startup banner should show: only once a turn already
+ * exists while the session is still starting (a queued message, or a resumed
+ * session's history). The @empty centered card covers the no-turns case, so
+ * the two are mutually exclusive — the card never floats over the message
+ * list (the old .startup-wrapper.resume overlay bug). Hides automatically
+ * when the session goes ready (isStartingSession → false).
+ */
+export function isStartupBannerVisible(isStartingSession: boolean, turnCount: number): boolean {
+    return isStartingSession && turnCount > 0;
+}
+
+/**
+ * Whether the composer should accept input: while connected OR while the
+ * session is still starting (so the user can type from t=0 and have the
+ * message queued + auto-sent on session.state). Deliberately false during a
+ * mid-session reconnect (connected=false, starting=false) — markSessionReady
+ * flushes the pending queue only once, so a message queued then would never
+ * send.
+ */
+export function canComposeDuringSession(isConnected: boolean, isStartingSession: boolean): boolean {
+    return isConnected || isStartingSession;
+}
+
+/**
+ * The startup step to surface in the banner: the active one, or the last
+ * step as a fallback when none is active (the brief gap where every phase is
+ * recorded done before sessionReady flips). Null for an empty list.
+ */
+export function pickCurrentStartupStep<T extends {state: string}>(steps: readonly T[]): T | null {
+    return steps.find((s) => s.state === 'active') ?? steps[steps.length - 1] ?? null;
+}
+
+/**
+ * The running-command card to surface on (re)attach, or null. Suppressed when
+ * the in-flight tool call is already rendered inside a visible turn (warm
+ * reconnect) so it isn't double-shown; surfaced when it isn't (cold reload
+ * mid-turn, where the in-flight turn isn't in REST history yet).
+ */
+export function pickRunningCommandCard(
+    runningTool: RunningToolInfo | null,
+    turns: readonly Turn[],
+): RunningToolInfo | null {
+    if (!runningTool) return null;
+    for (const turn of turns) {
+        if (!isAssistantTurn(turn)) continue;
+        for (const ev of turn.events) {
+            if (ev.kind === 'tool_call' && ev.id === runningTool.id) return null;
+        }
+    }
+    return runningTool;
+}
+
+/**
+ * Decide whether the IDE button should open code-server, and to which URL.
+ * Returns the code-server URL only when the workspace is active; null
+ * otherwise — including when the pre-flight status fetch returned null (a
+ * swallowed 401 the auth interceptor has already turned into a re-login).
+ */
+export function pickCodeServerUrlToOpen(status: IdeSessionStatus | null): string | null {
+    return status?.status === 'active' && status.code_server_url
+        ? status.code_server_url
+        : null;
+}
+
 @Component({
     selector: 'app-persistent-chat',
     standalone: true,
@@ -256,7 +330,7 @@ const CATEGORY_LABELS: Record<string, string> = {
                 </button>
               }
               @if (ide.status === 'active' && ide.code_server_url) {
-                <button class="ide-btn" (click)="openIde(ide.code_server_url!)" [title]="'chat.header.ideActiveTooltip' | transloco">
+                <button class="ide-btn" (click)="openCodeServer()" [title]="'chat.header.ideActiveTooltip' | transloco">
                   <app-icon size="sm" class="ide-icon">code</app-icon>
                   {{ 'chat.header.ideButton' | transloco }}
                 </button>
@@ -413,21 +487,39 @@ const CATEGORY_LABELS: Record<string, string> = {
 
       <!-- Per-event card templates (referenced by the turn loop below). -->
       <ng-template #thoughtCard let-event>
-        <details class="thinking-block event-thought"
-                 [attr.open]="event.status === 'streaming' || chat.narrationMode() === 'verbose' ? '' : null">
+        <details class="thinking-block event-thought" open>
           <summary class="thinking-header">
             <app-icon size="sm" class="thinking-icon">psychology</app-icon>
             <span class="thinking-label">
               {{ (event.status === 'streaming' ? 'chat.thinking.now' : 'chat.thinking.past') | transloco }}
             </span>
           </summary>
-          <div class="thinking-content">{{ event.content }}</div>
+          <div class="thinking-content">
+            <markdown [data]="event.content"></markdown>
+          </div>
         </details>
       </ng-template>
 
+      <!-- Startup banner: slim, non-scrolling status strip shown once a turn
+           exists while the session is still starting. Reuses the .startup-step
+           row so it matches the centered card; replaces the old floating
+           .startup-wrapper.resume overlay so the card never sits over the
+           message list. Auto-hides when sessionReady flips. -->
+      @if (startupBannerVisible()) {
+        <div class="startup-banner">
+          @if (currentStartupStep(); as step) {
+            <div class="startup-step state-active">
+              <span class="step-spinner" aria-hidden="true"></span>
+              <span class="step-label">{{ ('chat.startup.steps.' + step.key) | transloco }}</span>
+              <time class="step-time">{{ formatElapsed(step.elapsedMs) }}</time>
+            </div>
+          }
+        </div>
+      }
+
       <!-- Messages -->
       <div class="messages" #messagesContainer (scroll)="onMessagesScroll()">
-        @for (turn of chat.turns(); track turn.id; let isLast = $last) {
+        @for (turn of chat.visibleTurns(); track turn.id; let isLast = $last) {
           @switch (turn.kind) {
             @case ('system') {
               <div class="message message-system">
@@ -437,6 +529,21 @@ const CATEGORY_LABELS: Record<string, string> = {
                 </div>
               </div>
             }
+            @case ('compaction') {
+              <!-- Compaction boundary: divider banner (reuses .session-divider),
+                   expandable to the summary so the user sees the agent's state. -->
+              <div class="session-divider">
+                <span class="divider-line"></span>
+                <span class="divider-text">{{ 'chat.compaction.banner' | transloco }}</span>
+                <span class="divider-line"></span>
+              </div>
+              @if (turn.summary) {
+                <details class="compaction-summary">
+                  <summary>{{ 'chat.compaction.viewSummary' | transloco }}</summary>
+                  <div class="compaction-summary-body">{{ turn.summary }}</div>
+                </details>
+              }
+            }
             @case ('user') {
               <div class="message message-user" [class.historical]="turn.historical">
                 <div class="avatar">
@@ -444,7 +551,18 @@ const CATEGORY_LABELS: Record<string, string> = {
                 </div>
                 <div class="message-body">
                   @if (turn.content) {
-                    <div class="user-text">{{ turn.content }}</div>
+                    @if (isUserMessageLong(turn.content)) {
+                      <details class="user-text-collapsible">
+                        <summary class="user-text-summary">
+                          <span class="user-text-preview">{{ userMessagePreview(turn.content) }}</span>
+                          <span class="user-text-hint user-text-hint-closed">[…]</span>
+                          <span class="user-text-hint user-text-hint-open">▴</span>
+                        </summary>
+                        <div class="user-text">{{ turn.content }}</div>
+                      </details>
+                    } @else {
+                      <div class="user-text">{{ turn.content }}</div>
+                    }
                   }
                   @if (turn.attachments?.length) {
                     <div class="user-attachments">
@@ -622,17 +740,6 @@ const CATEGORY_LABELS: Record<string, string> = {
           }
         }
 
-        <!-- Startup/resume card: shown when history exists but session not yet ready.
-             Gated on isStartingSession so it only renders during an active start
-             (creating thread, handshaking, or waiting for the agent-ready
-             frame) — never after a user-initiated disconnect, which nulls
-             threadStatus and would otherwise leave the spinner running. -->
-        @if (chat.turns().length && !chat.isStreaming() && chat.isStartingSession()) {
-          <div class="startup-wrapper resume">
-            <ng-container *ngTemplateOutlet="startupCardTpl"></ng-container>
-          </div>
-        }
-
         <ng-template #startupCardTpl>
           <div class="startup-card">
             <div class="startup-card-head">
@@ -675,6 +782,23 @@ const CATEGORY_LABELS: Record<string, string> = {
               <app-button variant="info" size="sm" (clicked)="approveAndAutoAccept()">{{ 'chat.permission.autoAccept' | transloco }}</app-button>
               <app-button variant="danger" size="sm" (clicked)="chat.stop()">{{ 'chat.permission.stop' | transloco }}</app-button>
             </div>
+          </div>
+        }
+
+        <!-- Running-command card — shown on (re)attach when the agent is
+             blocked in a tool call that isn't already rendered in a visible
+             turn (cold reload mid-turn: the in-flight turn isn't in REST
+             history yet). Reuses the .mile marker styles (no new SCSS). -->
+        @if (runningCommandCard(); as rc) {
+          <div class="mile">
+            <div class="mile-label">{{ 'chat.stream.running' | transloco:{ tool: rc.tool } }}</div>
+            <div class="mile-detail">
+              <app-icon size="sm" class="mile-detail-icon">progress_activity</app-icon>
+              @if (formatToolArgs(rc.args); as a) {
+                <code class="mile-args">{{ a }}</code>
+              }
+            </div>
+            <div class="mile-title">{{ 'chat.stream.waitingForCommand' | transloco }}</div>
           </div>
         }
 
@@ -760,7 +884,7 @@ const CATEGORY_LABELS: Record<string, string> = {
         <div
           class="composer"
           [class.focused]="inputFocused()"
-          [class.disabled]="!chat.isConnected()"
+          [class.disabled]="!canCompose()"
           [class.recording]="isRecording()"
         >
           <!-- Slash command autocomplete -->
@@ -867,7 +991,7 @@ const CATEGORY_LABELS: Record<string, string> = {
               (focus)="inputFocused.set(true)"
               (blur)="inputFocused.set(false)"
               [placeholder]="inputPlaceholder()"
-              [disabled]="!chat.isConnected()"
+              [disabled]="!canCompose()"
               rows="1"
             ></textarea>
           }
@@ -1008,6 +1132,16 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     private readonly router = inject(Router);
     private readonly toast = inject(AppToastService);
     private readonly errors = inject(ErrorMessageService);
+    private readonly injector = inject(Injector);
+
+    /**
+     * The running-command card to show on (re)attach (or null). Surfaces the
+     * agent's in-flight tool call when it isn't already visible in a turn — see
+     * pickRunningCommandCard.
+     */
+    readonly runningCommandCard = computed(() =>
+        pickRunningCommandCard(this.chat.runningTool(), this.chat.turns()),
+    );
 
     @ViewChild('messagesContainer') messagesContainer!: ElementRef<HTMLDivElement>;
     @ViewChild('inputEl') inputEl!: ElementRef<HTMLTextAreaElement>;
@@ -1132,6 +1266,27 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         });
     });
 
+    /** The startup step to surface in the slim banner (active, or last as a fallback). */
+    readonly currentStartupStep = computed(() => pickCurrentStartupStep(this.startupSteps()));
+
+    /**
+     * Show the slim startup banner once a turn exists while still starting —
+     * mutually exclusive with the @empty centered card, so the card never
+     * floats over the message list.
+     */
+    readonly startupBannerVisible = computed(() =>
+        isStartupBannerVisible(this.chat.isStartingSession(), this.chat.turns().length),
+    );
+
+    /**
+     * Whether the composer accepts input: during startup (type + queue +
+     * flush on ready) and while connected; false during a mid-session
+     * reconnect.
+     */
+    readonly canCompose = computed(() =>
+        canComposeDuringSession(this.chat.isConnected(), this.chat.isStartingSession()),
+    );
+
     stepIcon(state: 'done' | 'active' | 'todo'): string {
         if (state === 'done') return 'check_circle';
         if (state === 'active') return 'progress_activity';
@@ -1155,6 +1310,8 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
 
     private autoScroll = true;
     private lastSeenMessageCount = 0;
+    /** Suppresses the scroll handler while restoring position after prepending older turns. */
+    private isRestoringScroll = false;
 
     constructor() {
         // Start/stop IDE polling when connection state changes
@@ -1205,6 +1362,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
             } else if (away && len > this.lastSeenMessageCount) {
                 const delta = len - this.lastSeenMessageCount;
                 this.newMessageCount.update(n => n + delta);
+                this.chat.growWindow(delta); // anchor the visible top while scrolled away
             } else if (!away) {
                 this.newMessageCount.set(0);
             }
@@ -1314,8 +1472,8 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         // Track language changes so placeholder re-translates when i18n switches.
         this.i18n.activeLang();
         if (this.isShowingReconnectBanner()) return this.transloco.translate('chat.input.reconnecting');
+        if (this.chat.isStartingSession()) return this.transloco.translate('chat.input.sessionStarting');
         if (!this.chat.isConnected()) return this.transloco.translate('chat.input.connect');
-        if (this.chat.isConnected() && !this.chat.sessionReady()) return this.transloco.translate('chat.input.sessionStarting');
         if (this.chat.isInterrupting()) return this.transloco.translate('chat.input.stopping');
         if (this.chat.isStreaming()) return this.transloco.translate('chat.input.working');
         if (this.chat.isUploadingAttachments()) return this.transloco.translate('chat.input.uploading');
@@ -1331,7 +1489,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
 
     readonly canSend = computed(
         () =>
-            this.chat.isConnected() &&
+            this.canCompose() &&
             (this.inputText.trim().length > 0 || this.chat.pendingAttachments().length > 0) &&
             !this.isPendingSend(),
     );
@@ -1395,8 +1553,15 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         // Clear textarea immediately — sendMessage is async because of uploads.
         this.inputText = '';
         this.autoScroll = true;
-        // Fire-and-forget. Errors are surfaced via chat.attachmentError().
-        void this.chat.sendMessage(text);
+        // Fire-and-forget. On a hard send failure the service rolls back the
+        // optimistic bubble; restore the draft so the user can retry (unless
+        // they've already started typing a new one). The error banner set by
+        // the service explains why.
+        void this.chat.sendMessage(text).then((ok) => {
+            if (ok === false && !this.inputText.trim()) {
+                this.inputText = text;
+            }
+        });
 
         // Resize textarea back
         setTimeout(() => {
@@ -1775,12 +1940,19 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     onMessagesScroll(): void {
         const el = this.messagesContainer?.nativeElement;
         if (!el) return;
+        // Ignore the programmatic scroll we trigger while restoring position.
+        if (this.isRestoringScroll) return;
+        // Near the top → widen the window toward older history (scroll-preserving).
+        if (el.scrollTop < 120 && this.chat.hasOlderTurns()) {
+            this.loadOlderHistory();
+        }
         // If user is within 80px of the bottom, re-enable auto-scroll; otherwise pause it.
         const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
         this.autoScroll = nearBottom;
         this.scrolledAway.set(!nearBottom);
         if (nearBottom) {
             this.newMessageCount.set(0);
+            this.chat.resetWindow(); // re-bound the DOM once back at the bottom
         }
     }
 
@@ -1788,8 +1960,35 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         this.autoScroll = true;
         this.scrolledAway.set(false);
         this.newMessageCount.set(0);
+        this.chat.resetWindow();
         this.lastSeenMessageCount = this.chat.turns().length;
         this.scrollToBottom();
+    }
+
+    /**
+     * Widen the render window toward older history, preserving scroll position
+     * so the viewport doesn't jump when older turns are prepended. The window
+     * grows over the already-loaded conversation (no network call) — the
+     * scroll-delta restore is salvaged from Advanced-LLM-Chat's scroll solution.
+     */
+    private loadOlderHistory(): void {
+        const el = this.messagesContainer?.nativeElement;
+        if (!el) return;
+        const prevHeight = el.scrollHeight;
+        const prevTop = el.scrollTop;
+        this.isRestoringScroll = true;
+        this.chat.loadOlderTurns();
+        afterNextRender(
+            () => {
+                const cur = this.messagesContainer?.nativeElement;
+                if (cur) {
+                    cur.scrollTop = prevTop + (cur.scrollHeight - prevHeight);
+                }
+                // Release after the synthetic scroll event has fired and been ignored.
+                setTimeout(() => (this.isRestoringScroll = false), 50);
+            },
+            {injector: this.injector},
+        );
     }
 
     selectSlashCommand(cmd: SlashCommand): void {
@@ -1875,6 +2074,20 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
 
     openIde(url: string): void {
         window.open(url, '_blank');
+    }
+
+    openCodeServer(): void {
+        // Pre-flight the IDE status through the auth interceptor before opening:
+        // the XHR validates/bumps the BFF session and, on a 401 (idle-expired
+        // session), the interceptor redirects to re-login — so a direct
+        // window.open never dumps raw 401 JSON. Mirrors job-list.component.ts.
+        const threadId = this.chat.threadId();
+        if (!threadId) return;
+        this.api.getThreadIdeStatus(threadId).subscribe(status => {
+            this.ideStatus.set(status);
+            const url = pickCodeServerUrlToOpen(status);
+            if (url) window.open(url, '_blank');
+        });
     }
 
     openSessionFiles(): void {
@@ -2039,11 +2252,38 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     }
 
     /**
+     * Threshold for autocollapsing user messages. Content with more than this
+     * many lines folds into a <details> summary so a multi-screen prompt
+     * doesn't dominate the scroll.
+     */
+    private readonly USER_MESSAGE_COLLAPSE_LINES = 8;
+
+    /** True when a user message exceeds the autocollapse line threshold. */
+    isUserMessageLong(content: string): boolean {
+        if (!content) return false;
+        let lines = 1;
+        for (let i = 0; i < content.length; i++) {
+            if (content.charCodeAt(i) === 10) {
+                lines++;
+                if (lines > this.USER_MESSAGE_COLLAPSE_LINES) return true;
+            }
+        }
+        return false;
+    }
+
+    /** First line of a user message — shown in the collapsed summary. */
+    userMessagePreview(content: string): string {
+        if (!content) return '';
+        const newlineIdx = content.indexOf('\n');
+        return newlineIdx === -1 ? content : content.slice(0, newlineIdx);
+    }
+
+    /**
      * True when the current turn is historical and the next turn isn't —
      * the boundary between session reload and live activity.
      */
     showSessionDividerAfter(turn: Turn, index: number): boolean {
-        const next = this.chat.turns()[index + 1];
+        const next = this.chat.visibleTurns()[index + 1];
         if (!next) return false;
         const turnHistorical = (turn.kind === 'assistant' || turn.kind === 'user') && !!turn.historical;
         const nextHistorical = (next.kind === 'assistant' || next.kind === 'user') && !!next.historical;

@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from langchain_core.messages import (
     AIMessage,
+    AIMessageChunk,
     BaseMessage,
     HumanMessage,
     SystemMessage,
@@ -2746,3 +2747,186 @@ class TestVMUpgradeDetection:
         )
 
         on_upgrade.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Streamed-response normalization (regression:
+# persistent_session_empty_chunk_history_corruption)
+# ---------------------------------------------------------------------------
+
+
+class TestStreamedResponseNormalization:
+    """A streamed AIMessageChunk must never land in history as a raw chunk,
+    and an empty interrupted partial must be dropped rather than appended —
+    otherwise the next turn's request serialization raises
+    'TypeError: Got unknown type ...' ("malformed response")."""
+
+    @pytest.mark.asyncio
+    async def test_normal_streamed_chunk_appended_as_concrete_ai_message(self):
+        messages = [SystemMessage(content="sys"), HumanMessage(content="go")]
+
+        await _execute_turn(
+            llm_with_tools=_make_streaming_llm(AIMessageChunk(content="answer")),
+            tool_map={},
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
+            messages=messages,
+            callbacks=_make_callbacks(),
+            llm_timeout=600,
+            auxiliary_llm=None,
+            workspace_content=None,
+            config=_make_config(),
+        )
+
+        ai = [m for m in messages if isinstance(m, AIMessage)]
+        assert len(ai) == 1
+        assert type(ai[0]) is AIMessage  # concrete, not AIMessageChunk
+        assert ai[0].content == "answer"
+
+    @pytest.mark.asyncio
+    async def test_empty_interrupted_partial_is_not_appended(self):
+        messages = [SystemMessage(content="sys"), HumanMessage(content="go")]
+        # check_interrupt: False at top-of-loop (line 434), then "graceful"
+        # mid-stream (line 574) so the partial-handling path runs.
+        check = MagicMock(side_effect=[False, "graceful"])
+
+        result = await _execute_turn(
+            llm_with_tools=_make_streaming_llm(
+                AIMessageChunk(content="", id="lc_run--019e5adc-0945-7b73")
+            ),
+            tool_map={},
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
+            messages=messages,
+            callbacks=_make_callbacks(check_interrupt=check),
+            llm_timeout=600,
+            auxiliary_llm=None,
+            workspace_content=None,
+            config=_make_config(),
+        )
+
+        assert result.interrupted is True
+        # The empty partial must NOT be in history (neither chunk nor concrete).
+        assert len(messages) == 2
+        assert not any(isinstance(m, AIMessage) for m in messages)
+
+
+class TestHardInterruptHelpers:
+    """Phase-3 immediate hard-interrupt cancellation primitives.
+
+    These race an in-flight LLM / auxiliary await against a hard-interrupt
+    event so a hung network read is torn down at once, instead of waiting for
+    the cooperative check_interrupt poll (which can't fire while parked).
+    """
+
+    @pytest.mark.asyncio
+    async def test_await_passthrough_when_no_event(self):
+        from src.persistent_graph import _await_or_hard_interrupt
+
+        async def quick():
+            return "done"
+
+        result, interrupted = await _await_or_hard_interrupt(quick(), None)
+        assert result == "done"
+        assert interrupted is False
+
+    @pytest.mark.asyncio
+    async def test_await_completes_when_event_idle(self):
+        from src.persistent_graph import _await_or_hard_interrupt
+
+        async def quick():
+            return 42
+
+        result, interrupted = await _await_or_hard_interrupt(quick(), asyncio.Event())
+        assert result == 42
+        assert interrupted is False
+
+    @pytest.mark.asyncio
+    async def test_await_cancels_blocked_coro_on_event(self):
+        from src.persistent_graph import _await_or_hard_interrupt
+
+        event = asyncio.Event()
+        cancelled = {"v": False}
+
+        async def hang():
+            try:
+                await asyncio.sleep(30)
+                return "never"
+            except asyncio.CancelledError:
+                cancelled["v"] = True
+                raise
+
+        async def fire():
+            await asyncio.sleep(0.01)
+            event.set()
+
+        fire_task = asyncio.create_task(fire())
+        result, interrupted = await _await_or_hard_interrupt(hang(), event)
+        await fire_task
+
+        assert interrupted is True
+        assert result is None
+        # The blocked await must actually be torn down, not just abandoned.
+        assert cancelled["v"] is True
+
+    @pytest.mark.asyncio
+    async def test_await_propagates_coro_exception(self):
+        from src.persistent_graph import _await_or_hard_interrupt
+
+        async def boom():
+            raise ValueError("kaboom")
+
+        with pytest.raises(ValueError, match="kaboom"):
+            await _await_or_hard_interrupt(boom(), asyncio.Event())
+
+    @pytest.mark.asyncio
+    async def test_stream_yields_chunks_then_stop(self):
+        from src.persistent_graph import _stream_next_or_hard_interrupt
+
+        async def gen():
+            yield "a"
+            yield "b"
+
+        aiter = gen().__aiter__()
+        event = asyncio.Event()
+        assert await _stream_next_or_hard_interrupt(aiter, event) == ("a", "chunk")
+        assert await _stream_next_or_hard_interrupt(aiter, event) == ("b", "chunk")
+        assert await _stream_next_or_hard_interrupt(aiter, event) == (None, "stop")
+
+    @pytest.mark.asyncio
+    async def test_stream_passthrough_when_no_event(self):
+        from src.persistent_graph import _stream_next_or_hard_interrupt
+
+        async def gen():
+            yield "only"
+
+        aiter = gen().__aiter__()
+        assert await _stream_next_or_hard_interrupt(aiter, None) == ("only", "chunk")
+        assert await _stream_next_or_hard_interrupt(aiter, None) == (None, "stop")
+
+    @pytest.mark.asyncio
+    async def test_stream_interrupts_hung_read(self):
+        from src.persistent_graph import _stream_next_or_hard_interrupt
+
+        started = asyncio.Event()
+
+        async def hanging_gen():
+            started.set()
+            await asyncio.sleep(30)  # never yields — simulates a hung read
+            yield "never"
+
+        aiter = hanging_gen().__aiter__()
+        event = asyncio.Event()
+
+        async def fire():
+            await started.wait()
+            event.set()
+
+        fire_task = asyncio.create_task(fire())
+        chunk, status = await _stream_next_or_hard_interrupt(aiter, event)
+        await fire_task
+
+        assert chunk is None
+        assert status == "interrupt"

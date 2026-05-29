@@ -10,6 +10,7 @@ This module provides the canonical async PostgreSQL interface using asyncpg with
 This is the canonical database layer for the orchestrator.
 """
 
+import hashlib
 import json
 import logging
 import math
@@ -18,7 +19,7 @@ import re
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional, Any, List, Dict
+from typing import Optional, Any, List, Dict, Tuple
 from uuid import UUID
 
 try:
@@ -1973,6 +1974,7 @@ class PostgresDB:
         agent_mode: str = "worker",
         thread_id: str | None = None,
         build_sha: str | None = None,
+        pod_uid: str | None = None,
     ) -> Dict[str, Any]:
         """Register a new agent or update existing one.
 
@@ -2028,7 +2030,8 @@ class PostgresDB:
                             registered_at = CURRENT_TIMESTAMP,
                             agent_mode    = $6,
                             thread_id     = $7,
-                            metadata = COALESCE(metadata, '{}') || $8::jsonb
+                            metadata = COALESCE(metadata, '{}') || $8::jsonb,
+                            pod_uid       = COALESCE(NULLIF($9, ''), pod_uid)
                         WHERE id = $5
                         """,
                         pod_ip,
@@ -2039,6 +2042,7 @@ class PostgresDB:
                         agent_mode,
                         thread_id,
                         json.dumps({"build_sha": build_sha or ""}),
+                        pod_uid,
                     )
                     return {
                         "agent_id": str(agent_id),
@@ -2048,8 +2052,8 @@ class PostgresDB:
             # Create new agent
             row = await conn.fetchrow(
                 """
-                INSERT INTO agents (config_name, hostname, pod_ip, pod_port, pid, agent_mode, thread_id, metadata)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
+                INSERT INTO agents (config_name, hostname, pod_ip, pod_port, pid, agent_mode, thread_id, metadata, pod_uid)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, NULLIF($9, ''))
                 RETURNING id
                 """,
                 config_name,
@@ -2060,6 +2064,7 @@ class PostgresDB:
                 agent_mode,
                 thread_id,
                 json.dumps({"build_sha": build_sha or ""}),
+                pod_uid,
             )
 
             return {
@@ -2130,11 +2135,26 @@ class PostgresDB:
             # preserved against the agent's reported status. The agent's
             # heartbeat would otherwise overwrite drain intent on the next
             # 5s tick. Phase 1 replaces this with a separate intent column.
+            #
+            # Offline pin: once the lifecycle reconciler has marked the agent
+            # offline (because its pod is gone), a late in-flight heartbeat
+            # from the pod's SIGTERM grace period must not be allowed to
+            # resurrect the row back to 'ready'. An agent that wants to
+            # rejoin must re-/register, which mints a new agent_id.
+            # Without this guard, ``_find_idle_persistent_agent`` cheerfully
+            # matches the dead row (most-recent ``last_heartbeat`` puts it
+            # at the top of the pool query) and ``_send_session_attach``
+            # binds the thread to a pod that's about to disappear — see
+            # the 2026-05-24 thread 352144ea regression.
             if metrics:
                 result = await conn.execute(
                     f"""
                     UPDATE agents
-                    SET status = CASE WHEN status = 'draining' THEN 'draining' ELSE $1 END,
+                    SET status = CASE
+                                   WHEN status = 'draining' THEN 'draining'
+                                   WHEN status = 'offline'  THEN 'offline'
+                                   ELSE $1
+                                 END,
                         current_job_id = $2,
                         last_heartbeat = CURRENT_TIMESTAMP,
                         metadata = metadata || $3::jsonb
@@ -2150,7 +2170,11 @@ class PostgresDB:
                 result = await conn.execute(
                     f"""
                     UPDATE agents
-                    SET status = CASE WHEN status = 'draining' THEN 'draining' ELSE $1 END,
+                    SET status = CASE
+                                   WHEN status = 'draining' THEN 'draining'
+                                   WHEN status = 'offline'  THEN 'offline'
+                                   ELSE $1
+                                 END,
                         current_job_id = $2,
                         last_heartbeat = CURRENT_TIMESTAMP
                         {"  , last_completed_at = CURRENT_TIMESTAMP" if set_completed else ""}
@@ -2164,7 +2188,12 @@ class PostgresDB:
             if result != "UPDATE 1":
                 return None
 
-            effective_status = "draining" if prev_status == "draining" else status
+            if prev_status == "draining":
+                effective_status = "draining"
+            elif prev_status == "offline":
+                effective_status = "offline"
+            else:
+                effective_status = status
             return {
                 "previous_status": prev_status,
                 "effective_status": effective_status,
@@ -2191,7 +2220,7 @@ class PostgresDB:
                     """
                     SELECT id, config_name, hostname, pod_ip, pod_port, pid,
                            status, current_job_id, registered_at, last_heartbeat,
-                           last_completed_at, metadata
+                           last_completed_at, metadata, pod_uid
                     FROM agents
                     WHERE status = $1
                     ORDER BY last_heartbeat DESC
@@ -2205,7 +2234,7 @@ class PostgresDB:
                     """
                     SELECT id, config_name, hostname, pod_ip, pod_port, pid,
                            status, current_job_id, registered_at, last_heartbeat,
-                           last_completed_at, metadata
+                           last_completed_at, metadata, pod_uid
                     FROM agents
                     ORDER BY last_heartbeat DESC
                     LIMIT $1
@@ -2234,7 +2263,7 @@ class PostgresDB:
                 """
                 SELECT id, config_name, hostname, pod_ip, pod_port, pid,
                        status, current_job_id, thread_id,
-                       registered_at, last_heartbeat, metadata
+                       registered_at, last_heartbeat, metadata, pod_uid
                 FROM agents
                 WHERE id = $1
                 """,
@@ -2442,7 +2471,7 @@ class PostgresDB:
                 """
                 SELECT id, config_name, hostname, pod_ip, pod_port, pid,
                        status, current_job_id, registered_at, last_heartbeat,
-                       last_completed_at, metadata
+                       last_completed_at, metadata, pod_uid
                 FROM agents
                 WHERE status = 'ready'
                   AND COALESCE(agent_mode, 'worker') IN ('worker', 'dual')
@@ -2482,6 +2511,26 @@ class PostgresDB:
                 title,
             )
         return str(row["id"])
+
+    @asynccontextmanager
+    async def thread_advisory_lock(self, thread_id: str):
+        """Postgres advisory lock keyed by ``thread_id``.
+
+        Pattern matches the schema-migration lock at
+        ``orchestrator/database/migrate.py:157``. The lock key is a stable
+        hash of the thread_id (Postgres advisory locks take a bigint key).
+        Used by ``POST /api/sessions/{thread_id}/prepare`` to serialize
+        concurrent prepare calls — see
+        ``docs/issues/persistent_thread_double_provisioning_race.md``.
+        """
+        h = hashlib.blake2b(thread_id.encode(), digest_size=8).digest()
+        key = int.from_bytes(h, byteorder="big", signed=True)
+
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute("SELECT pg_advisory_xact_lock($1)", key)
+                yield
+                # Lock auto-released at transaction end.
 
     async def get_thread(self, thread_id: str) -> Dict[str, Any] | None:
         """Get thread by ID."""
@@ -2524,6 +2573,33 @@ class PostgresDB:
                 *params,
             )
         return [dict(row) for row in rows]
+
+    async def list_threads_needing_workspace(self) -> List[Dict[str, Any]]:
+        """Active sessions whose workspace_container entry exists but is not ready or
+        in-progress (e.g. 'failed') — candidates for the session reconcile to re-ensure.
+
+        The positive ``status = 'active'`` filter excludes every non-active thread
+        (ended, suspended, awaiting_user, ...) — i.e. anything not currently running.
+        Requiring a workspace_container entry means sessions that never provisioned a
+        workspace are never spuriously created.
+
+        The excluded workspace statuses below are the "already progressing" set; keep
+        them in sync with ensure_workspace's in-progress guard in
+        services/workspace_lifecycle.py (plus 'ready'). Drift is low-impact: a missed
+        status just gets re-selected and no-op'd by ensure_workspace.
+        """
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, metadata
+                FROM threads
+                WHERE status = 'active'
+                  AND metadata->'workspace_container' IS NOT NULL
+                  AND COALESCE(metadata->'workspace_container'->>'status', '') NOT IN
+                      ('ready', 'creating', 'restoring', 'created', 'pending', 'suspending')
+                """,
+            )
+        return [dict(r) for r in rows]
 
     async def end_thread(self, thread_id: str) -> None:
         """End a persistent thread."""
@@ -2887,29 +2963,51 @@ class PostgresDB:
         metrics: Optional[dict] = None,
         tool_call_id: Optional[str] = None,
         thinking: Optional[str] = None,
+        reasoning: Optional[Any] = None,
+        tool_results: Optional[Any] = None,
+        provider: Optional[str] = None,
+        provider_raw: Optional[Any] = None,
+        additional_kwargs: Optional[dict] = None,
+        response_metadata: Optional[dict] = None,
     ) -> str:
         """Save a message to thread_messages. Fire-and-forget safe.
 
         ``tool_call_id`` is set only on role='tool' rows and links the result
         back to the AIMessage's tool_calls[].id. ``thinking`` is set only on
         role='ai' rows that carry reasoning content. See migration 0011.
+        Rows are append-only; the component columns (reasoning, tool_results,
+        provider, provider_raw, additional_kwargs, response_metadata) are
+        nullable and were added in migration 0019.
         """
         async with self.acquire() as conn:
             row = await conn.fetchrow(
                 """
                 INSERT INTO thread_messages
                     (thread_id, role, content, tool_calls, turn_number,
-                     metrics, tool_call_id, thinking)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id
+                     metrics, tool_call_id, thinking,
+                     reasoning, tool_results, provider, provider_raw,
+                     additional_kwargs, response_metadata)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                RETURNING id
                 """,
                 thread_id,
                 role,
                 content,
-                json.dumps(tool_calls) if tool_calls else None,
+                json.dumps(tool_calls) if tool_calls is not None else None,
                 turn_number,
-                json.dumps(metrics) if metrics else None,
+                json.dumps(metrics) if metrics is not None else None,
                 tool_call_id,
                 thinking,
+                json.dumps(reasoning) if reasoning is not None else None,
+                json.dumps(tool_results) if tool_results is not None else None,
+                provider,
+                json.dumps(provider_raw) if provider_raw is not None else None,
+                json.dumps(additional_kwargs)
+                if additional_kwargs is not None
+                else None,
+                json.dumps(response_metadata)
+                if response_metadata is not None
+                else None,
             )
             # Update thread activity + turn count
             await conn.execute(
@@ -2924,47 +3022,118 @@ class PostgresDB:
             )
         return str(row["id"])
 
+    @staticmethod
+    def _thread_message_to_dict(row: Any) -> Dict[str, Any]:
+        """Map a ``thread_messages`` row to the cockpit display shape."""
+        return {
+            "id": str(row["id"]),
+            "role": row["role"],
+            "content": row["content"],
+            "tool_calls": json.loads(row["tool_calls"]) if row["tool_calls"] else None,
+            "turn_number": row["turn_number"],
+            "metrics": json.loads(row["metrics"]) if row["metrics"] else None,
+            "tool_call_id": row["tool_call_id"],
+            "thinking": row["thinking"],
+            "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+        }
+
     async def get_thread_messages_history(
         self,
         thread_id: str,
-        limit: int = 200,
+        limit: Optional[int] = None,
         offset: int = 0,
     ) -> List[Dict[str, Any]]:
-        """Load thread message history for session resume. Ordered by created_at ASC."""
+        """Load thread message history for the cockpit display path, ascending.
+
+        ``limit=None`` (the default) loads the **entire** conversation. The
+        cockpit caches the full thread client-side and windows the render
+        itself, so the display path must not truncate. The old default of 200
+        sliced long threads to their oldest 200 rows — the "only the first
+        message shows" bug; the agent copy in ``src/database/postgres_db.py``
+        was fixed earlier but this display copy was missed.
+
+        Pass an explicit ``limit``/``offset`` for the legacy oldest-first paged
+        read still used by the MCP inspection tool. For backfill / reconnect
+        catch-up use ``get_thread_messages_page``.
+
+        Ordering is ``created_at ASC`` with ``turn_number, id`` tiebreakers so
+        parallel tool calls written in the same instant stay deterministic.
+        """
+        query = (
+            "SELECT id, role, content, tool_calls, turn_number, metrics, "
+            "tool_call_id, thinking, created_at FROM thread_messages "
+            "WHERE thread_id = $1 "
+            "ORDER BY created_at ASC, turn_number ASC, id ASC"
+        )
+        params: List[Any] = [thread_id]
+        if limit is not None:
+            params.append(limit)
+            query += f" LIMIT ${len(params)}"
+            params.append(offset)
+            query += f" OFFSET ${len(params)}"
         async with self.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT id, role, content, tool_calls, turn_number, metrics,
-                       tool_call_id, thinking, created_at
-                FROM thread_messages
-                WHERE thread_id = $1
-                ORDER BY created_at ASC
-                    LIMIT $2
-                OFFSET $3
-                """,
-                thread_id,
-                limit,
-                offset,
-            )
-        result = []
-        for row in rows:
-            msg = {
-                "id": str(row["id"]),
-                "role": row["role"],
-                "content": row["content"],
-                "tool_calls": json.loads(row["tool_calls"])
-                if row["tool_calls"]
-                else None,
-                "turn_number": row["turn_number"],
-                "metrics": json.loads(row["metrics"]) if row["metrics"] else None,
-                "tool_call_id": row["tool_call_id"],
-                "thinking": row["thinking"],
-                "created_at": row["created_at"].isoformat()
-                if row["created_at"]
-                else None,
-            }
-            result.append(msg)
-        return result
+            rows = await conn.fetch(query, *params)
+        return [self._thread_message_to_dict(r) for r in rows]
+
+    async def get_thread_messages_page(
+        self,
+        thread_id: str,
+        before: Optional[datetime] = None,
+        after: Optional[datetime] = None,
+        limit: Optional[int] = None,
+    ) -> Tuple[List[Dict[str, Any]], bool]:
+        """Cursor-paged thread message read for the cockpit display (Phase 2).
+
+        Supply exactly one of ``before`` / ``after``:
+
+        - ``before``: backfill — the newest rows at-or-before the cursor, up to
+          ``limit``, returned ascending.
+        - ``after``: catch-up — rows at-or-after the cursor, up to ``limit``,
+          ascending.
+
+        Cursor bounds are **inclusive**; the cockpit dedups by ``id``, so rows
+        that tie on ``created_at`` at the window edge are never dropped. Returns
+        ``(messages_ascending, has_more)`` — ``has_more`` is whether further
+        rows exist beyond the window in the paging direction (older for
+        ``before``, newer for ``after``).
+        """
+        clauses = ["thread_id = $1"]
+        params: List[Any] = [thread_id]
+        if before is not None:
+            params.append(before)
+            clauses.append(f"created_at <= ${len(params)}")
+            descending = True
+        elif after is not None:
+            params.append(after)
+            clauses.append(f"created_at >= ${len(params)}")
+            descending = False
+        else:
+            descending = False
+
+        order = (
+            "created_at DESC, turn_number DESC, id DESC"
+            if descending
+            else "created_at ASC, turn_number ASC, id ASC"
+        )
+        query = (
+            "SELECT id, role, content, tool_calls, turn_number, metrics, "
+            "tool_call_id, thinking, created_at FROM thread_messages "
+            f"WHERE {' AND '.join(clauses)} ORDER BY {order}"
+        )
+        if limit is not None:
+            params.append(limit + 1)  # probe one extra row to detect has_more
+            query += f" LIMIT ${len(params)}"
+
+        async with self.acquire() as conn:
+            rows = list(await conn.fetch(query, *params))
+
+        has_more = False
+        if limit is not None and len(rows) > limit:
+            has_more = True
+            rows = rows[:limit]
+        if descending:
+            rows.reverse()  # normalize to ascending for display
+        return [self._thread_message_to_dict(r) for r in rows], has_more
 
     async def get_thread_message_count(self, thread_id: str) -> int:
         """Get total message count for a thread."""
@@ -4805,6 +4974,71 @@ class PostgresDB:
                 provider,
             )
             return result == "DELETE 1"
+
+    # --- Prompt overrides (DB-backed prompt editor, v1) ----------------------
+
+    async def list_prompt_overrides(self) -> List[Dict[str, Any]]:
+        """List all prompt overrides (global rows first, then by family)."""
+        rows = await self.fetch(
+            "SELECT * FROM prompt_overrides ORDER BY family NULLS FIRST, kind, name"
+        )
+        return [dict(r) for r in rows]
+
+    async def get_prompt_override(self, override_id: str) -> Optional[Dict[str, Any]]:
+        """Fetch a single prompt override by id, or None."""
+        row = await self.fetchrow(
+            "SELECT * FROM prompt_overrides WHERE id = $1", UUID(str(override_id))
+        )
+        return dict(row) if row else None
+
+    async def upsert_prompt_override(
+        self,
+        *,
+        family: str | None,
+        kind: str,
+        name: str,
+        content: str,
+        content_format: str = "text",
+        notes: str | None = None,
+        user_id: Any = None,
+    ) -> Dict[str, Any]:
+        """Create or replace the override for (family, kind, name).
+
+        The conflict target is the ``uq_prompt_override`` expression index
+        ``(COALESCE(family,''), kind, name)``. ``created_by`` and ``updated_by``
+        are both set to the acting user on insert; only ``updated_by`` changes
+        on update.
+        """
+        row = await self.fetchrow(
+            """
+            INSERT INTO prompt_overrides
+                (family, kind, name, content, content_format, notes,
+                 created_by, updated_by)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $7)
+            ON CONFLICT (COALESCE(family, ''), kind, name) DO UPDATE
+            SET content = EXCLUDED.content,
+                content_format = EXCLUDED.content_format,
+                notes = EXCLUDED.notes,
+                updated_by = EXCLUDED.updated_by,
+                updated_at = CURRENT_TIMESTAMP
+            RETURNING *
+            """,
+            family,
+            kind,
+            name,
+            content,
+            content_format,
+            notes,
+            UUID(str(user_id)) if user_id else None,
+        )
+        return dict(row)
+
+    async def delete_prompt_override(self, override_id: str) -> bool:
+        """Delete a prompt override by id. Returns True iff a row was removed."""
+        result = await self.execute(
+            "DELETE FROM prompt_overrides WHERE id = $1", UUID(str(override_id))
+        )
+        return result == "DELETE 1"
 
     async def set_system_api_key_discovery_cache(
         self,

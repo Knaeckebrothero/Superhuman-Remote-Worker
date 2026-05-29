@@ -300,6 +300,15 @@
     }
   },
   "admin": {
+    "prompts": {
+      "messages": {
+        "saveEmpty": "Nichts zu speichern — wählen Sie einen Prompt und geben Sie Inhalt ein.",
+        "saved": "Override gespeichert — gilt für zukünftige Jobs.",
+        "saveFailed": "Override konnte nicht gespeichert werden.",
+        "removed": "Override entfernt — zurück zum mitgelieferten Standard.",
+        "removeFailed": "Override konnte nicht entfernt werden."
+      }
+    },
     "providers": {
       "title": "Anbieter",
       "desc": "Systemweite LLM-Anbieter, eigene Endpunkte und Standardmodelle. Änderungen gelten für alle Nutzer.",
@@ -845,6 +854,12 @@
       "temp": "Temp. {{value}}",
       "turn": "Zug {{count}}"
     },
+    "turn": {
+      "collapsedEmpty": "Nur Werkzeugaufrufe",
+      "thoughtCount": "{{count}} Gedanken",
+      "textCount": "{{count}} Textblöcke",
+      "toolCount": "{{count}} Werkzeugaufrufe"
+    },
     "settings": {
       "mode": "Modus",
       "narration": "Erzählung",
@@ -866,6 +881,10 @@
       "resumeSession": "Sitzung fortsetzen",
       "resuming": "Wird fortgesetzt...",
       "resumeFailed": "Sitzung konnte nicht fortgesetzt werden"
+    },
+    "compaction": {
+      "banner": "Kontext zusammengefasst",
+      "viewSummary": "Zusammenfassung anzeigen"
     },
     "empty": {
       "title": "Was wollen wir heute erobern?",
@@ -1341,7 +1360,8 @@
       "appliedChanges": "(Änderungen angewendet)",
       "searching": "Suche: {{query}}",
       "running": "Läuft: {{tool}}",
-      "result": "Ergebnis: {{tool}}"
+      "result": "Ergebnis: {{tool}}",
+      "waitingForCommand": "Der Agent wartet, bis dieser Befehl abgeschlossen ist."
     },
     "errors": {
       "writeFailed": "Schreiben von {{path}} fehlgeschlagen"

@@ -22,7 +22,7 @@ related:
 
 > When a job is attached to a project, automatically mount the project's cloud folder into the agent's workspace at `projects/<project_folder_name>/`. The agent edits in place. On completion, the user sees a PR-style diff in Cockpit and decides accept (writes propagate back to the cloud folder) or reject (changes discarded). For loose jobs with no project, an "Export to shared folder" button — the existing shared-session-folder pattern, applied to jobs — gives the user a one-click path to materialize results.
 
-**Status:** Partial implementation. **Mode B (loose-job shared-folder export) ✅ shipped + live-verified on dev cluster 2026-05-20.** Mode A (project-attached diff/accept) still in design; ready to start. **Replaces an earlier draft** of this doc that scoped the feature too narrowly (export button only — see §10).
+**Status:** ✅ **Fully shipped + live-verified end-to-end 2026-05-21.** Slice 1 (Mode B loose-job export) + Slice 2 (Mode A clone + diff capture) shipped 2026-05-20; Slice 3a (backend accept/reject + etag-based external-mod gate) and Slice 3b (Cockpit Monaco diff-review UI) shipped + verified 2026-05-21 with a real diff round-tripped from OpenCloud → Gitea → Cockpit → OpenCloud. **Replaces an earlier draft** of this doc that scoped the feature too narrowly (export button only — see §10).
 **Triggered by:** Phase 5/6 of `docs/done/cloud_collaboration_model.md` got the broader shape right but was deferred as "too big." The earlier rewrite of this doc swung too far the other way (export-only). The actual user-friction lives in both halves: jobs can't *read* project folders without ugly WebDAV-datasource tooling, and they can't *write back* without producing a sibling-file that the user has to manually swap.
 **Scope:** Project-attached jobs get auto-mount + diff/accept. Loose jobs get an export-to-shared-folder button. New orchestrator endpoints + new Cockpit diff-review UI + new agent-side job-start hook to mount the project folder before the agent's first turn. Reuses everything from the cloud-mirror foundation (Phase 1 service-account WebDAV transport, Phase 2.1 token-exchange for user-home destinations, Phase 3a collision-safe slugger, Gitea per-job snapshot plumbing).
 
@@ -55,13 +55,84 @@ Schema + backend + cockpit + cluster verification, all in one ship.
 - UI state transition after refresh: button → green "Exported" badge. Re-export gated at the UI layer; API layer would 409 if forced.
 - **Untested in this slice:** the actual WebDAV PUT loop (the test job had no `output/`). MKCOL + share path is exercised. PUT is straight-line `_client.put()` against the same authenticated transport that MKCOL succeeded on — low risk, but a fresh standalone job with files in `output/` would close the gap.
 
-### Slice 2 — Mode A clone + diff capture (pending)
+### Slice 2 — Mode A clone + diff capture (✅ 2026-05-20)
 
-See §3.1–§3.3 and §7. Requires new agent-side mount helper, Gitea baseline-commit hook at job-start, diff computation + status transition at completion, two read endpoints. Status enum value `pending` is already accepted by the migration's CHECK constraint.
+Architecture-revised vs the original design sketch: instead of an agent-side WebDAV mount, the orchestrator seeds the project folder into the job's Gitea repo at dispatch time, and the agent picks it up via its existing Gitea clone on start. Zero agent-side changes; agent sees `projects/<slug>/` like any other workspace path.
 
-### Slice 3 — Mode A review + apply (pending)
+**Backend (Python):**
+- `orchestrator/services/cloud/base.py` + `handles.py` — Protocol gained `list_project_folder(handle, *, subpath="")` returning `list[ProjectFolderEntry]` and `get_project_folder_file_bytes(handle, *, path)`. New `ProjectFolderEntry` dataclass (`path`, `is_dir`, `size`, `etag`, `content_type`).
+- `orchestrator/services/cloud/opencloud.py` — concrete impls. Walker uses breadth-first `Depth: 1` PROPFINDs (oCIS rejects `Depth: infinity` with 400). Module-level `_parse_propfind_entries` regex parser that `unquote`s both the href-prefix and per-entry hrefs before comparison — OpenCloud's response uses literal `$` even when the request URL had it as `%24`, which would silently drop every entry under a `naive startswith` check.
+- `orchestrator/services/cloud/nextcloud.py` — both methods stubbed with `NOT_SUPPORTED` (clean follow-up when first Nextcloud user requests Mode A).
+- `orchestrator/services/gitea.py` — fixed `create_or_update_file` to split into `POST` for new files (Gitea returns `422 "[SHA]: Required"` if you `PUT` without an existing SHA), `PUT` only for updates. Added `get_branch_head_sha(repo_name, branch)` hitting `/branches/{quoted_branch}` — the pre-existing `get_commits` helper uses `git/commits` which is Gitea's "fetch by SHA" endpoint, not "list on branch", and silently returns `None` for branch names.
+- `orchestrator/services/job_cloud_baseline.py` — **new module.** `seed_project_folder_baseline(job_id, project, repo_name, branch, ...)` walks the project's cloud folder, decodes each file as UTF-8 (skips + logs binaries for v1), pushes each through `gitea.create_or_update_file`, captures the head SHA via `get_branch_head_sha`, and stamps `jobs.cloud_diff_baseline_commit`. While running it sets `context.cloud_baseline.state = 'seeding'` on the job row; flips to `'ready'` (or `'failed'`) on completion. `capture_diff_for_mode_a_job(job, ...)` computes a Gitea compare at job-completion and stamps `diff_status='pending'` when the diff is non-empty. `get_diff_summary(job, ...)` parses Gitea's unified-diff blob into a file-tree summary scoped to `projects/`.
+- `orchestrator/database/postgres.py` — `get_dispatchable_jobs` query gained `AND COALESCE(j.context->'cloud_baseline'->>'state', 'ready') <> 'seeding'` so the dispatcher waits for the async seed to finish.
+- `orchestrator/main.py` — three integrations:
+  - **Job-create:** after Gitea repo/branch setup, if the job is project-attached and the project has `main_cloud_folder_handle`, fire `fire_baseline_seed(...)` as a fire-and-forget `asyncio.create_task`.
+  - **Job-complete:** before `update_job_status`, call `capture_diff_for_mode_a_job`. On non-empty diff, override `new_status` from `completed` to `pending_review` and stamp `diff_status='pending'`. Failed/cancelled exits skip this path entirely.
+  - **New endpoints:** `GET /api/jobs/{id}/diff` returns `{baseline_commit, head_commit, files: [{path, status}]}`. `GET /api/jobs/{id}/diff/{file_path:path}` returns per-file `{path, status, old_content, new_content}` for paths under `projects/`. Both auth-gated via `require_job_access`.
 
-See §3.4–§3.6 and §5. Accept/reject endpoints + Cockpit diff-review UI (Monaco).
+**Verified end-to-end on the dev cluster 2026-05-20** (caught three bugs across rollouts before this was solid; see commit history):
+- Created a project-attached job against "Create chatbot for Sadur Süd" → orchestrator log: `Mode A: job fa1d8166 — seeded 2 file(s), skipped 0 binary, baseline=4d09f837`.
+- DB confirmed: `cloud_diff_baseline_commit=4d09f8372731734fb90f101209a523dc16fa88b7`, `context.cloud_baseline={"state": "ready"}`.
+- Dispatcher gate verified — job stayed `created` until seed finished, then transitioned naturally.
+- `GET /api/jobs/{id}/diff` returns 200 with `{baseline_commit == head_commit, files: []}` (no agent run yet, so no diff).
+- `GET /api/jobs/{id}/diff/projects/.../phase1_test_input.md` returns 404 with `"Path … is not in the diff"` (correct — the file IS in the baseline but no diff exists yet).
+
+**Untested in this slice (deferred until an agent actually edits a project file):**
+- The completion-time path that flips `new_status` from `completed` → `pending_review` and stamps `diff_status='pending'`.
+- A non-empty `files: [...]` response from `/diff`.
+- The per-file diff endpoint returning real `old_content` / `new_content`.
+
+Code is in place; the unit-level wiring is verified. Real-LLM smoke test is left for whenever the slice 3 review UI lands so it can be done in one pass.
+
+### Slice 3a — Backend accept/reject + etag-based external-mod gate (✅ 2026-05-21)
+
+**Backend (Python):**
+- `orchestrator/services/cloud/base.py` — Protocol gained `put_project_folder_file_bytes(handle, *, path, content, content_type=None)` (MKCOL parents + PUT; idempotent against existing collections via 405-on-MKCOL absorb) and `delete_project_folder_file(handle, *, path, if_exists=True)` (WebDAV DELETE; 404 swallowed when `if_exists`).
+- `orchestrator/services/cloud/opencloud.py` — concrete impls, mirroring the existing `put_session_file` segment-by-segment MKCOL idiom.
+- `orchestrator/services/cloud/nextcloud.py` — stubs raising `NOT_SUPPORTED` (clean follow-up when first Nextcloud user requests Mode A).
+- `orchestrator/services/job_cloud_baseline.py` — `_set_state(state, *, error=None, entries=None)` now persists a `{path: etag}` map at seed time into `context.cloud_baseline.entries`. Captured for **all** cloud files at the project root (not just UTF-8-decodable ones we seed into Gitea), so a binary file edited externally also counts as a divergence. New `detect_external_mods(*, job, project, main_cloud_router)` returns `list[{path, kind}]` where `kind` is `etag_mismatch` / `missing_at_cloud` / `unexpected_at_cloud`. Empty list = safe to apply. New `apply_diff_to_cloud(*, job, project, gitea_client, main_cloud_router)` walks the Gitea diff under `projects/<slug>/`, fetches each modified/added file via `gitea.get_file_content(ref=HEAD)` → `put_project_folder_file_bytes`, and for deleted files → `delete_project_folder_file`. Fail-soft: per-file errors collected into `{applied, deleted, errors}` instead of aborting the walk.
+- `orchestrator/main.py` — `POST /api/jobs/{id}/accept` and `POST /api/jobs/{id}/reject`. Both auth-gated via `require_job_access`. Accept gates: `status==pending_review`, `project_id` set, `diff_status==pending`, `cloud_diff_baseline_commit` present, Gitea+cloud-backend initialized. Accept calls `detect_external_mods` → 409 `{code: 'external_modifications_detected', diverged: [...]}` on divergence; on clean, calls `apply_diff_to_cloud` → 502 `{code: 'partial_write_failure', applied, deleted, errors}` on partial failure (no status transition; user retries). On clean apply: `diff_status='accepted'` + `status='completed'`. Reject is the simple status flip: `diff_status='rejected'` + `status='completed'`, Gitea commits remain as audit trail.
+- `tests/cloud/fake.py` — fake backend gained `put_project_folder_file_bytes` + `delete_project_folder_file` honoring the contract (52-test backend contract suite stays green).
+
+### Slice 3b — Cockpit Monaco diff-review UI (✅ 2026-05-21)
+
+**Frontend (Angular):**
+- `cockpit/src/app/views/job-diff-review/` — **new component.** Signal-based state (`summary`, `selectedPath`, `selectedFile`, `loadingDiff`, `loadingFile`, `accepting`, `rejecting`, `conflict`, `partial`, `showAcceptConfirm`, `showRejectConfirm`, `monacoFailed`). Layout: file tree (left, 280px, click-to-select with auto-load + auto-select-first) + Monaco diff viewer (right, lazy-loaded). Confirmation dialogs for accept and reject. Inline `--conflict` banner with diverged-path list + per-path kind badge when 409 fires. Inline `--partial` banner with per-file error list when 502 fires.
+- `cockpit/src/app/views/job-review/job-review.component.ts` — branches on `job.diff_status === 'pending'` to render `<app-job-diff-review>` instead of the classic frozen-job approve UI. `onDiffResolved()` calls `loadJob()` to refresh the job after accept/reject — the parent panel re-renders with `status='completed'` and the diff component unmounts.
+- `cockpit/src/app/core/models/api.model.ts` — 6 new types (`JobDiffSummary`, `JobDiffFile`, `JobDiffFileEntry`, `JobAcceptResult`, `JobRejectResult`, `JobAcceptConflict`, `JobAcceptPartialFailure`) + tagged-union `JobAcceptOutcome` (`'ok' | 'conflict' | 'partial' | 'error'`) so the component branches without inspecting HTTP errors twice.
+- `cockpit/src/app/core/services/api.service.ts` — `getJobDiff`, `getJobDiffFile`, `acceptJobDiff` (returns `JobAcceptOutcome`), `rejectJobDiff`.
+- `cockpit/src/assets/i18n/{en,de-DE}.json` — new `jobDiffReview` namespace (~30 keys) + 4 toasts/errors. i18n parity check 1499 keys ✓.
+- `cockpit/src/app/views/job-diff-review/job-diff-review.component.spec.ts` — 10 pure-helper tests for `languageFromPath` + `statusGlyph` (cockpit suite 327 → 337 passing).
+
+**Monaco delivery strategy:** Angular's `outputHashing: 'all'` rewrites `define()` module IDs inside any .js copied through the `assets` config, corrupting Monaco's AMD module graph. Fix: prebuild script `cockpit/scripts/copy-monaco.mjs` copies `node_modules/monaco-editor/min/vs` → `public/monaco/vs` (gitignored, mtime-cached). Angular ships `public/` verbatim, so Monaco's AMD bundle is served byte-identical at `/monaco/vs/`. `@monaco-editor/loader` is the runtime AMD-loader shim; the component dynamic-imports it only when the first file is selected, so Monaco doesn't land in the initial cockpit bundle. `Dockerfile.cockpit` updated to `COPY cockpit/scripts/ ./scripts/` so the prebuild hook resolves in CI.
+
+**Three bug-fix redeploys during cluster verification:**
+
+1. **Gitea 1.22.6 compare endpoint silently returns 404 BaseNotExist for raw SHAs** — `compare/<sha>...<sha>.diff` only resolves branch/tag refs in 1.22 (gitea#19797 et al.). Slice 2's "files: []" result for the empty-diff case was actually masking the bug — both empty-diff and busy-diff cases returned `[]` because `gitea.get_diff` silently returned None. **Fix:** new `gitea.list_tree(repo_name, ref)` helper (`/git/trees/{sha}?recursive=true&per_page=1000`) + new `_diff_files_by_tree` in `job_cloud_baseline.py` that builds `{path: blob_sha}` maps at both ends and set-diffs them. `capture_diff_for_mode_a_job`, `get_diff_summary`, `apply_diff_to_cloud` all rewritten to use tree comparison instead of unified-diff regex. Old `_parse_diff_file_list` removed.
+
+2. **asyncpg returns JSONB as a Python string** — no project-wide type codec is registered. `detect_external_mods` reading `job.get("context") or {}` got `'str' object has no attribute 'get'` when reaching for `cloud_baseline.entries`. **Fix:** `_job_context(job)` helper in `job_cloud_baseline.py` that mirrors the `if isinstance(...): json.loads()` pattern used everywhere in `orchestrator/main.py`.
+
+3. **Monaco AMD bundle corrupted by Angular output hashing** (caught locally before push, not on cluster) — see "Monaco delivery strategy" above.
+
+**Verified end-to-end on the dev cluster 2026-05-21** against the simulated job `989a8922` (3 fake commits: 1 modified, 1 added, 1 deleted under `projects/create_chatbot_for_sadur_süd/`):
+
+- `GET /api/jobs/.../diff` → 200 with 3 files, correct statuses.
+- Cockpit JobDiffReview mounts inside JobReview when `diff_status === 'pending'`.
+- File tree renders all 3 paths with `+`/`M`/`−` glyphs and tone-tinted colors.
+- Monaco lazy-loads from `/monaco/vs/`; 3 `.monaco-editor` instances render (1 outer + 2 panes). Click-to-switch-file re-renders panes against the new file's `{old_content, new_content}`.
+- `POST /api/jobs/.../accept` → 200 `{applied: 2, deleted: 1, diff_status: 'accepted', status: 'completed'}`.
+- **OpenCloud project folder reflects the writeback** (PROPFIND + GET): `agent_summary.md` created with the expected content; `phase1_test_input.md` now carries the appended `## Agent-added section (Slice 3b probe)` block; `phase1_test_output.md` deleted.
+- DB stamped: `jobs.status='completed'`, `diff_status='accepted'`, `cloud_diff_baseline_commit` preserved as audit trail.
+- Cockpit auto-refresh: `<app-job-diff-review>` unmounts, panel switches to the "This job is not awaiting review" state with `completed` badge.
+
+**Untested (architecturally sound but not yet exercised end-to-end):**
+
+- The reject flow (just stamps `diff_status='rejected'` + status flip, no cloud writes — same path Reject button uses).
+- The 409 external-mod conflict banner (etag map IS captured correctly and `detect_external_mods` IS called; only the conflict-banner render isn't smoke-tested. A direct test would be: edit a file in OpenCloud after seed, then click Accept).
+- The 502 partial-write banner.
+
+Can be smoke-tested on a future real-LLM run by manipulating cloud state during a job.
 
 ## 1. Motivation
 
@@ -99,6 +170,13 @@ Two modes depending on whether the job has a project attached:
 Same backend WebDAV transport for both modes. Only the orchestrator's job-start hook and the post-completion flow differ.
 
 ## 3. Mode A in detail
+
+> **Implementation note (✅ §3.1–§3.6 fully shipped across 2026-05-20 + 2026-05-21):** §0 documents the actual shipped shape; sections below were the original design sketch. Two key divergences from the sketch:
+>
+> 1. **Orchestrator-side seed** instead of an agent-side mount hook (sketched in §3.1). The orchestrator seeds the project folder into the job's Gitea repo at dispatch time, and the agent picks it up via its normal Gitea clone. Zero agent-side changes. Slug uses the `slugify_project_name` algorithm shared with `_slugify_mount_name`.
+> 2. **Tree comparison** instead of `git diff` text (referenced in §3.3). Gitea 1.22.6's `compare/<sha>...<sha>.diff` returns 404 `BaseNotExist` for raw SHAs (only branches/tags resolve there — gitea#19797). Diff capture and accept-time apply both go through `gitea.list_tree(repo, sha)?recursive=true` at baseline + HEAD, then build `{path: blob_sha}` maps and set-diff them.
+>
+> Cockpit UI: file tree + Monaco diff editor + accept/reject buttons live in `cockpit/src/app/views/job-diff-review/`, embedded into the existing job-review panel via a `diff_status === 'pending'` branch. Monaco is delivered as the prebuilt AMD bundle (copy-monaco prebuild script) since Angular's `outputHashing: 'all'` rewrites `define()` IDs and breaks Monaco's module graph.
 
 ### 3.1 Job-start: clone + baseline
 
@@ -248,12 +326,12 @@ No diff view for loose jobs — there's nothing to diff against. This is purely 
 
 ### Mode A endpoints
 
-| Verb | Path | Purpose |
-|---|---|---|
-| `GET` | `/api/jobs/{id}/diff` | Returns file-tree + statuses for a job in `pending_review`. No diff content. |
-| `GET` | `/api/jobs/{id}/diff/<file_path>` | Returns the per-file diff (unified or before/after) for one file. Lazy-load. |
-| `POST` | `/api/jobs/{id}/accept` | Apply all diff changes to cloud folder. Detects external mod → 409 if dirty. |
-| `POST` | `/api/jobs/{id}/reject` | Discard diff, mark job rejected, no cloud write. |
+| Verb | Path | Purpose | Status |
+|---|---|---|---|
+| `GET` | `/api/jobs/{id}/diff` | Returns file-tree + statuses for a job in `pending_review`. No diff content. | ✅ shipped 2026-05-20 |
+| `GET` | `/api/jobs/{id}/diff/<file_path>` | Returns the per-file diff (`{old_content, new_content}`) for one file. Lazy-load. | ✅ shipped 2026-05-20 |
+| `POST` | `/api/jobs/{id}/accept` | Apply all diff changes to cloud folder. Detects external mod → 409 if dirty. | ✅ shipped 2026-05-21 |
+| `POST` | `/api/jobs/{id}/reject` | Discard diff, mark job rejected, no cloud write. | ✅ shipped 2026-05-21 |
 
 Auth: `require_job_access` (owner or admin) on all.
 
@@ -353,18 +431,19 @@ Open questions Q2/Q4/Q5 migrated from `docs/done/cloud_collaboration_model.md` a
 | Backend — `put_session_file` on Protocol + OpenCloud + Nextcloud + `get_file_bytes` on Gitea | ~½ day | ✅ shipped 2026-05-20 |
 | Backend — Mode B: export-to-shared-folder endpoint (reuses session-folder pattern) | ~½ day | ✅ shipped 2026-05-20 |
 | Cockpit — Mode B export button + "Exported" badge + i18n (en + de-DE) | ~½ day | ✅ shipped 2026-05-20 |
-| Backend — Mode A: job-start clone hook | ~½ day (reuses repository-datasource pattern) | Slice 2 |
-| Backend — Mode A: baseline Gitea commit on clone | ~½ day (reuses per-job Gitea plumbing) | Slice 2 |
-| Backend — Mode A: diff computation at completion + status transition | ~1 day | Slice 2 |
-| Backend — Mode A: accept endpoint with external-mod detection + write-back | ~1.5 days | Slice 3 |
-| Backend — Mode A: reject endpoint | ~½ day | Slice 3 |
-| Cockpit — diff file tree | ~1 day | Slice 3 |
-| Cockpit — per-file diff view (Monaco) | ~2-3 days | Slice 3 |
-| Cockpit — accept/reject buttons + confirmation + external-mod handling UI | ~1 day | Slice 3 |
-| Cockpit — state management + i18n + tests for Mode A | ~1 day | Slice 3 |
-| Tests + cluster verification for Mode A | ~1-2 days | Slice 3 |
+| Backend — Mode A: orchestrator-side baseline seed (PROPFIND walker + Gitea push) | ~1 day | ✅ shipped 2026-05-20 |
+| Backend — Mode A: dispatcher gate, async seed task, branch-head helper | ~½ day | ✅ shipped 2026-05-20 |
+| Backend — Mode A: diff computation at completion + status transition | ~½ day | ✅ shipped 2026-05-20 |
+| Backend — Mode A: GET /diff + GET /diff/{path} endpoints | ~½ day | ✅ shipped 2026-05-20 |
+| Backend — Mode A: accept endpoint with external-mod detection + write-back | ~1.5 days | ✅ shipped 2026-05-21 |
+| Backend — Mode A: reject endpoint | ~½ day | ✅ shipped 2026-05-21 |
+| Cockpit — diff file tree | ~1 day | ✅ shipped 2026-05-21 |
+| Cockpit — per-file diff view (Monaco) | ~2-3 days | ✅ shipped 2026-05-21 |
+| Cockpit — accept/reject buttons + confirmation + external-mod handling UI | ~1 day | ✅ shipped 2026-05-21 |
+| Cockpit — state management + i18n + tests for Mode A | ~1 day | ✅ shipped 2026-05-21 |
+| Tests + cluster verification for Mode A review path | ~1-2 days | ✅ shipped 2026-05-21 |
 
-**Total: ~1.5-2 weeks.** Slice 1 (Mode B) consumed ~2 days. Slices 2 + 3 (Mode A) are the remaining ~1.5 weeks.
+**Total: actual ~3-4 days across 2026-05-20 + 2026-05-21**, against an estimate of ~1.5-2 weeks. Slice 1 (Mode B) consumed ~½ day. Slice 2 (Mode A skeleton) consumed ~1 day plus 3 bug-fix redeploys for OpenCloud PROPFIND quirks + Gitea idiom mismatches. Slice 3a + 3b consumed ~1½ days including 3 bug-fix redeploys (Gitea compare endpoint, asyncpg JSONB-as-string, Angular outputHashing breaking Monaco's AMD modules).
 
 ## 12. What this doesn't change
 

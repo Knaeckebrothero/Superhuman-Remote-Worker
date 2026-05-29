@@ -263,67 +263,44 @@ sudo CAROOT="$HOME/.local/share/mkcert" mkcert -install                # system 
 
 Sanity check: `docker run --rm hello-world`, `k3d version`, `kubectl version --client`, `helm version`, `mkcert -CAROOT`.
 
-### 1. Create the cluster
+### 1. Bootstrap the cluster
 
 ```bash
-k3d cluster create srw \
-  --servers 1 \
-  --port "80:80@loadbalancer" \
-  --port "443:443@loadbalancer" \
-  --registry-create srw-registry:0.0.0.0:5000
+./scripts/local-dev-up.sh
 ```
 
-Single node, host ports 80/443 mapped to the cluster's traefik, plus a local image registry on `localhost:5000` for later (Tilt/Skaffold workflows).
+Idempotent — re-runs are safe. Creates the k3d cluster (host ports 80/443 → Traefik, local image registry on `localhost:5000`), installs cert-manager, registers a `mkcert-issuer` ClusterIssuer wrapping your mkcert root CA, creates the `srw` namespace, and seeds a dummy `srw-vm-ssh-key` Secret (the orchestrator mounts it unconditionally for VM workspaces; locally a stub is fine).
 
-### 2. Install cert-manager + a mkcert ClusterIssuer
+The script's behaviour is documented inline; if anything fails it bails out with a clear message rather than silently continuing.
 
-The chart's ingresses request TLS certs via cert-manager. Locally we issue them from your mkcert root CA so browsers trust them without a security warning.
+### 2. Set the OpenCloud OIDC workaround address
+
+OpenCloud's proxy needs to reach Keycloak from inside the pod, and on k3d `auth.localhost` resolves to the pod's own loopback. `values-local.example.yaml` ships a `hostAliases` block that maps `auth.localhost` to Traefik's ClusterIP — but that IP is determined at cluster-create time, so grab it now:
 
 ```bash
-helm repo add jetstack https://charts.jetstack.io --force-update
-helm install cert-manager jetstack/cert-manager \
-  --namespace cert-manager --create-namespace \
-  --version v1.16.2 --set crds.enabled=true
-
-# Wait for cert-manager to be ready
-kubectl -n cert-manager rollout status deploy/cert-manager
-kubectl -n cert-manager rollout status deploy/cert-manager-webhook
-kubectl -n cert-manager rollout status deploy/cert-manager-cainjector
-
-# Wrap mkcert's CA as a cert-manager ClusterIssuer
-kubectl -n cert-manager create secret tls mkcert-ca-key-pair \
-  --cert="$HOME/.local/share/mkcert/rootCA.pem" \
-  --key="$HOME/.local/share/mkcert/rootCA-key.pem"
-
-kubectl apply -f - <<'EOF'
-apiVersion: cert-manager.io/v1
-kind: ClusterIssuer
-metadata: { name: mkcert-issuer }
-spec: { ca: { secretName: mkcert-ca-key-pair } }
-EOF
+kubectl --context=k3d-srw -n kube-system get svc traefik -o jsonpath='{.spec.clusterIP}'
 ```
 
-### 3. Bootstrap the SRW namespace + VM SSH key secret
+Note the value — you'll paste it into `values-local.yaml` in the next step (under `opencloud.hostAliases[0].ip`). It's stable for the life of the cluster and only needs to be re-grabbed after `k3d cluster delete && create`.
 
-The orchestrator mounts a `srw-vm-ssh-key` Secret unconditionally (for VM workspaces in prod). Locally, a dummy keypair is fine.
+### 3. Mint the session-router JWT secret
+
+The orchestrator mints short-lived JWTs to authorize browser → agent WebSocket handshakes. Without this Secret, `/api/sessions/{tid}/connection` 500s and sessions never come up.
 
 ```bash
-kubectl create namespace srw
-
-ssh-keygen -t ed25519 -f /tmp/vm-key -N "" -q
-kubectl -n srw create secret generic srw-vm-ssh-key \
-  --from-file=id_ed25519=/tmp/vm-key \
-  --from-file=id_ed25519.pub=/tmp/vm-key.pub
-rm /tmp/vm-key /tmp/vm-key.pub
+kubectl --context=k3d-srw -n srw create secret generic srw-session-jwt \
+  --from-literal=jwt-secret="$(openssl rand -base64 48 | tr -d '\n' | head -c 64)"
 ```
 
-### 4. Copy the local values file and install the chart
+### 4. Copy the values template and install the chart
 
 ```bash
 cp deployment/values-local.example.yaml deployment/values-local.yaml
-$EDITOR deployment/values-local.yaml   # paste at least one LLM key (OPENAI_API_KEY / ANTHROPIC_API_KEY / GROQ_API_KEY)
+$EDITOR deployment/values-local.yaml
+# - paste at least one LLM key (OPENAI_API_KEY / ANTHROPIC_API_KEY / GROQ_API_KEY)
+# - paste the Traefik ClusterIP from step 2 into opencloud.hostAliases[0].ip
 
-helm install srw ./helm -n srw -f deployment/values-local.yaml
+helm install srw ./helm -n srw --kube-context=k3d-srw -f deployment/values-local.yaml
 ```
 
 `deployment/values-local.yaml` is gitignored (it holds your LLM keys). Everything else in it is dev-only stub credentials.
@@ -331,7 +308,7 @@ helm install srw ./helm -n srw -f deployment/values-local.yaml
 ### 5. Wait for pods, then log in
 
 ```bash
-kubectl -n srw get pods -w
+kubectl --context=k3d-srw -n srw get pods -w
 # Ctrl-C once all pods are 1/1 Running (the orchestrator takes longest — ~5 init containers chained on database/keycloak/gitea readiness)
 ```
 
@@ -354,6 +331,38 @@ The `test` user is pre-seeded in the Keycloak realm with `admin` + `user` roles,
 
 `*.localhost` resolves to `::1` automatically (RFC 6761 + glibc `myhostname` NSS), so there's no DNS config to do.
 
+### Smoke-testing the install
+
+Quick checklist after a fresh `helm install` (or after recreating the cluster). Each step exercises an independent slice of the stack.
+
+**1. Cockpit + Keycloak login** — open `https://localhost/`, log in as `test`/`test`. Lands on `/builder`. If you land in a refresh loop, jump to the matching troubleshooting entry below.
+
+**2. Sessions (persistent agent + WS)** — Sessions → **New Session** → pick any expert (e.g. Scholar) → **Create Session**. Expected sequence in the UI:
+
+- "Creating thread" ✓ within 1 s
+- "Provisioning agent" ✓ within ~10 s (k8s pulls the agent + workspace images on the first run)
+- "Booting agent runtime" ✓
+- "Establishing connection" ✓ → "What shall we conquer today?" greeting
+
+Type a one-liner and send it. If you have a working LLM key, the assistant streams a reply within seconds. If the only error in the right-rail is *"Incorrect API key provided…"*, the platform is fine — you just need to set a real LLM key in `values-local.yaml` and `helm upgrade`.
+
+You can also confirm the agent and workspace pods exist:
+
+```bash
+kubectl --context=k3d-srw -n srw get pods -l app.kubernetes.io/component=agent
+kubectl --context=k3d-srw -n srw get pods -l app.kubernetes.io/component=workspace
+```
+
+**3. Jobs (worker dispatch)** — Create → enter any short description → pick an expert → **Create Job**. Expected:
+
+- A row appears under Jobs with status `created` then `processing`.
+- A worker agent pod (`srw-agent-j-*`) spins up.
+- Status flips to `completed` or `failed` depending on whether the LLM key works. Either is a pass for *infrastructure*: it proves the orchestrator dispatched, the agent provisioned, the completion callback fired, and the pod recycled.
+
+**4. Gitea SSO** — open `https://git.localhost/`, click **Sign In** → **Sign in with Keycloak**. Should land on `test - Dashboard` without a manual credentials step.
+
+**5. OpenCloud SSO** — open `https://cloud.localhost/`. Should redirect through Keycloak and land on `Personal - OpenCloud` (`/files/spaces/personal/test`). If you land on `/access-denied`, the OpenCloud OIDC workaround isn't applied — see Troubleshooting (almost always: stale `hostAliases` IP).
+
 ### Daily usage
 
 ```bash
@@ -363,6 +372,80 @@ k3d cluster list             # see all clusters and their state
 ```
 
 Stopping the cluster also frees host port 443 — important if you also access the live homelab cluster from this machine on the same domain.
+
+### Fast inner loop with Tilt (recommended)
+
+Tilt watches the repo and live-syncs source files into the running pods (or rebuilds + rolls them for the agent), so edits take effect locally in seconds — no commit → CI → image-build → Fleet-sync → rollout round trip. **All four components are covered**:
+
+| Component | Loop | Edit-to-effect |
+|-----------|------|-----------------|
+| Orchestrator | `live_update` sync + `uvicorn --reload` | ~3 s |
+| Cockpit | `live_update` sync + `ng serve` HMR | ~5 s (~36 ms ng compile + Vite push) |
+| MCP | `live_update` sync + `watchfiles` wrapper | ~10–15 s (watchfiles + Tilt debounce) |
+| Agent | full image rebuild + helm fan-out + Reloader bounce | ~50 s (~8 s warm docker build + orchestrator restart) |
+
+Tilt is opt-in but is now the **default development workflow**. The `helm install` path above still works standalone for people without Tilt installed. Design and rationale: [`docs/features/tilt_inner_loop_dev.md`](docs/features/tilt_inner_loop_dev.md).
+
+**One-time install** (binary to `~/.local/bin/`, no sudo):
+
+```bash
+TILT_VER=0.37.3
+curl -fsSL https://github.com/tilt-dev/tilt/releases/download/v${TILT_VER}/tilt.${TILT_VER}.linux.x86_64.tar.gz \
+  | tar -xz -C ~/.local/bin/ tilt
+chmod +x ~/.local/bin/tilt
+tilt version
+```
+
+**Run Tilt**:
+
+```bash
+./scripts/local-dev-tilt-up.sh
+```
+
+This bootstrap is idempotent — it runs `scripts/local-dev-up.sh` underneath (cluster + cert-manager + namespace + vm-ssh-key Secret), then adds the `srw-session-jwt` Secret, syncs the current Traefik ClusterIP into `values-local.yaml`'s `opencloud.hostAliases` entry, and finally runs `tilt up` in the foreground. Press Ctrl-C to stop Tilt (the cluster keeps running; use `k3d cluster stop srw` to stop that too).
+
+#### The Plan → Develop → Verify workflow
+
+The point of having Tilt + a local prod-parity cluster is that **every change can be verified locally before it ships**. The loop:
+
+1. **Plan**: design doc under `docs/features/` or `docs/issues/` (whatever fits). Get alignment on scope + acceptance before you start editing.
+2. **Develop**: edit the relevant source. Tilt handles the rebuild/sync automatically — watch the Tilt UI at `https://localhost:10350` for the affected resource going green again.
+3. **Verify locally** — do not push until this passes:
+   - **Unit/lint tests** at file granularity:
+     - Python: `pytest tests/test_<area>.py -x -q --tb=short` + `ruff check src/ orchestrator/ tests/`
+     - Cockpit: `cd cockpit && npm test` or a single spec via `npx vitest run src/path/to/foo.spec.ts`
+   - **Cockpit / UX changes**: open `https://localhost/` in a browser (or Playwright), exercise the actual feature, watch the cockpit pod's `ng serve` logs in the Tilt UI for HMR updates.
+   - **Orchestrator / API changes**: hit the live endpoint from inside the cluster — `kubectl --context=k3d-srw -n srw exec deploy/srw-orchestrator -c orchestrator -- curl -sf http://localhost:8085/api/...` — or from a logged-in cockpit, or via cookies set after `test`/`test` login.
+   - **Agent / graph changes**: create a session or job through cockpit (UI → New Session / New Job), then `kubectl --context=k3d-srw -n srw logs -l srw/managed-by=agent-provisioner -f` to watch the spawned agent pod react.
+   - **MCP / tool changes**: `kubectl --context=k3d-srw -n srw exec deploy/srw-orchestrator -c orchestrator -- curl -sf http://srw-mcp:8055/health`. For actual tool calls, port-forward and point a Claude Code MCP client at the local URL: `kubectl --context=k3d-srw -n srw port-forward svc/srw-mcp 8055:8055`.
+   - **Cross-component flows** (e.g. orchestrator → agent → workspace): walk the README smoke test under "Local Kubernetes Setup (k3d)" — login, new session, new job — and confirm pod states with `kubectl get pods -n srw`.
+4. **Commit + push** only after local verification passes. The CI/CD path (build → GHCR → Fleet sync → homelab rollout) takes ~30 min, so catching a regression locally first is several rounds of feedback faster than catching it on the dev cluster.
+
+A failed verification ≠ ready to push. Iterate on local until the smoke test you'd want a reviewer to run is green.
+
+#### Per-component edit signals
+
+What to watch for in the Tilt UI / pod logs to confirm an edit actually took effect:
+
+- **Orchestrator** (`orchestrator/*.py`, `src/*.py`, `config/*`): orchestrator pod log shows `WatchFiles detected changes in '/app/...'` followed by a uvicorn worker re-import. Hit `kubectl ... curl http://localhost:8085/api/health` to confirm.
+- **Cockpit** (`cockpit/src/**/*.ts|html|scss`): cockpit pod log shows `Component update sent to client(s)` (CSS) or `Page reload required` (TS/HTML). Browser auto-refreshes within ~5 s. If `[vite] connected.` is missing from the browser console, the HMR WebSocket dropped — refresh.
+- **MCP** (`orchestrator/mcp/*.py`, `orchestrator/services/formatters.py`): mcp pod log shows `watchfiles: N changes detected` followed by the FastMCP banner with the (potentially updated) server name. `/health` returns 200 within ~10 s.
+- **Agent** (`src/*.py`, `config/*`, `agent.py`): srw-agent image rebuilds (visible in Tilt UI), helm upgrade fans the new `tilt-<hash>` tag into `srw-config`'s `PERSISTENT_AGENT_IMAGE`, Stakater Reloader rolls the orchestrator, **next** session/job picks up the new code. Existing agent pods are unaffected (they hold the old image — agent pods are per-job, not long-running).
+- **Requirements / Dockerfile edits**: trigger `fall_back_on` → full image rebuild + roll. Cold rebuild is ~3-5 min the first time after a `tilt down`; warm is ~10-20 s thanks to the cache mounts in `Dockerfile.*.dev`.
+
+**Common operations under Tilt**:
+
+```bash
+tilt down                                    # stop watching + remove the Helm release
+tilt trigger srw-agent                       # force-rebuild any component
+tilt args -- --port 10351                    # run the Tilt UI on a different port
+```
+
+**Known limitations**:
+
+- `uvicorn --reload` doesn't reload changes to the lifespan/startup phase — if you edit `lifespan()` itself, force a restart from the Tilt UI.
+- Agent pods are baked at provision time (`restartPolicy: Never`) — a `src/` edit affects the *next* session, not in-flight agent pods. End an active session and start a new one to pick up the change.
+- Reloader bouncing the orchestrator on an agent image change incurs a ~30 s orchestrator restart. Acceptable for dev, ugly if you're hammering agent edits.
 
 ### Updating the install
 
@@ -400,6 +483,27 @@ k3d cluster delete srw                     # destroy the whole cluster (includin
   ```
 - **`PersistentVolumeClaim ... is invalid: ... storage: Forbidden: field can not be less than previous value`** — you tried to shrink a PVC. Either bump the size back up in `values-local.yaml` or delete the PVC and re-upgrade (`kubectl -n srw delete pvc <name>`).
 - **Keycloak in `CreateContainerConfigError` for missing secret keys** — the realm import references env vars for every OIDC client (even disabled ones). Check that all keys from `values-local.example.yaml` are present in `values-local.yaml`.
+- **`https://localhost/` returns 404 right after `k3d cluster start srw`** — Traefik's endpoint discovery can go stale through a long idle (the pod restart cascade after `k3d cluster stop`/`start` sometimes leaves Traefik holding empty endpoint state). Kick it: `kubectl --context=k3d-srw -n kube-system rollout restart deploy/traefik`.
+- **Login lands in a 401-refresh loop in Brave/Firefox** — the chart defaults to `auth.bff.sameOriginApi: true` in `values-local.example.yaml` so the cockpit and BFF share an origin and the session cookie is first-party. If you flipped that off, either flip it back on or allowlist `[*.]localhost` for cookies in the browser. Symptom in orchestrator logs: `GET /auth/callback 302` immediately followed by `GET /api/auth/me 401` on repeat.
+- **New session stuck on "Provisioning agent" / WebSocket errors `Unexpected response code: 200`** — usually the cockpit's Service Worker (`ngsw-worker.js`) is serving stale assets that point at the legacy `/ws/persistent/...` WS path (which the orchestrator no longer hosts). In DevTools → Application → Service Workers, **Unregister** all SWs and clear caches under Storage, then hard-reload. Programmatic version:
+  ```js
+  (await navigator.serviceWorker.getRegistrations()).forEach(r => r.unregister());
+  (await caches.keys()).forEach(k => caches.delete(k));
+  ```
+- **OpenCloud lands on `/access-denied`, logs show `connect: connection refused` to `auth.localhost`** — the `hostAliases` IP in `values-local.yaml` no longer matches Traefik's ClusterIP (typically after `k3d cluster delete && create`). Re-grab it and `helm upgrade`:
+  ```bash
+  kubectl --context=k3d-srw -n kube-system get svc traefik -o jsonpath='{.spec.clusterIP}'
+  $EDITOR deployment/values-local.yaml   # update opencloud.hostAliases[0].ip
+  helm upgrade srw ./helm -n srw --kube-context=k3d-srw -f deployment/values-local.yaml
+  kubectl --context=k3d-srw -n srw rollout restart deploy/srw-opencloud
+  ```
+- **`/api/sessions/.../connection` returns 500 with `'NoneType' object has no attribute 'mint'`** — `srw-session-jwt` Secret was never created. See setup step 3.
+- **Cluster looks healthy but the cockpit / orchestrator behave oddly after pulling latest develop** — the published GHCR `:latest` images can lag the chart on `develop` HEAD. If you suspect skew (e.g., a recently-merged backend change has no effect, or the cockpit JS bundle is missing a route the chart now expects), rebuild affected images locally and point the chart at them:
+  ```bash
+  docker build -f docker/Dockerfile.orchestrator -t srw-orchestrator:local-fix .
+  k3d image import srw-orchestrator:local-fix -c srw
+  ```
+  Then set `image.orchestrator.{repository,tag,pullPolicy: IfNotPresent}` in `values-local.yaml` (the example file has a commented template). Same shape for cockpit and agent.
 
 ## Development Setup
 

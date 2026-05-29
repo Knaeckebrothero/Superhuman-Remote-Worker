@@ -5,6 +5,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from orchestrator.services.workspace_lifecycle import WorkspaceOwner
+
 
 class TestContainerProvisionerInit:
     """Tests for ContainerProvisioner initialization."""
@@ -81,7 +83,7 @@ class TestPodManifest:
         provisioner = ContainerProvisioner()
         manifest = provisioner._build_pod_manifest(
             pod_name="workspace-abc123",
-            job_id="abc123-full-uuid",
+            owner=WorkspaceOwner.job("abc123-full-uuid"),
             image="test-image:latest",
             cpu="500m",
             memory="1Gi",
@@ -111,7 +113,7 @@ class TestPodManifest:
         provisioner = ContainerProvisioner()
         manifest = provisioner._build_pod_manifest(
             pod_name="workspace-abc",
-            job_id="abc",
+            owner=WorkspaceOwner.job("abc"),
             image="test:latest",
             cpu="500m",
             memory="1Gi",
@@ -130,7 +132,7 @@ class TestPodManifest:
         provisioner = ContainerProvisioner()
         manifest = provisioner._build_pod_manifest(
             pod_name="workspace-abc123",
-            job_id="abc123-full-uuid",
+            owner=WorkspaceOwner.job("abc123-full-uuid"),
             image="test-image:v2",
             cpu="1000m",
             memory="2Gi",
@@ -168,7 +170,7 @@ class TestPodManifest:
 
         manifest = provisioner._build_pod_manifest(
             pod_name="workspace-abc123",
-            job_id="abc123",
+            owner=WorkspaceOwner.job("abc123"),
             image="test:latest",
             cpu="500m",
             memory="1Gi",
@@ -193,7 +195,7 @@ class TestPodManifest:
         provisioner = ContainerProvisioner()
         manifest = provisioner._build_pod_manifest(
             pod_name="workspace-abc123",
-            job_id="abc123",
+            owner=WorkspaceOwner.job("abc123"),
             image="test:latest",
             cpu="500m",
             memory="1Gi",
@@ -212,7 +214,7 @@ class TestPodManifest:
         provisioner = ContainerProvisioner()
         manifest = provisioner._build_pod_manifest(
             pod_name="workspace-abc123",
-            job_id="abc123",
+            owner=WorkspaceOwner.job("abc123"),
             image="test:latest",
             cpu="500m",
             memory="1Gi",
@@ -231,7 +233,7 @@ class TestPodManifest:
         provisioner = ContainerProvisioner()
         manifest = provisioner._build_pod_manifest(
             pod_name="workspace-abc123",
-            job_id="abc123",
+            owner=WorkspaceOwner.job("abc123"),
             image="test:latest",
             cpu="500m",
             memory="1Gi",
@@ -256,7 +258,7 @@ class TestPodManifest:
         provisioner = ContainerProvisioner()
         manifest = provisioner._build_pod_manifest(
             pod_name="workspace-abc123",
-            job_id="abc123",
+            owner=WorkspaceOwner.job("abc123"),
             image="test:latest",
             cpu="500m",
             memory="1Gi",
@@ -370,7 +372,7 @@ class TestSecurityHardening:
         provisioner = ContainerProvisioner()
         return provisioner._build_pod_manifest(
             pod_name="workspace-test",
-            job_id="test-job-id",
+            owner=WorkspaceOwner.job("test-job-id"),
             image="test:latest",
             cpu="500m",
             memory="1Gi",
@@ -596,7 +598,9 @@ class TestCreateWorkspace:
             provisioner, "_wait_for_ready", new_callable=AsyncMock
         ) as mock_wait:
             mock_wait.return_value = "10.42.0.100"
-            result = await provisioner.create_workspace("test-job-id-123456")
+            result = await provisioner.create_workspace(
+                WorkspaceOwner.job("test-job-id-123456")
+            )
 
         assert result is True
         # Verify pod was created
@@ -614,7 +618,9 @@ class TestCreateWorkspace:
         provisioner = ContainerProvisioner()
         provisioner._k8s_available = False
 
-        result = await provisioner.create_workspace("test-job-id-123456")
+        result = await provisioner.create_workspace(
+            WorkspaceOwner.job("test-job-id-123456")
+        )
         assert result is False
 
     @pytest.mark.asyncio
@@ -637,7 +643,9 @@ class TestCreateWorkspace:
             provisioner, "_wait_for_ready", new_callable=AsyncMock
         ) as mock_wait:
             mock_wait.return_value = "10.42.0.100"
-            await provisioner.create_workspace("abcdef123456-rest-of-uuid")
+            await provisioner.create_workspace(
+                WorkspaceOwner.job("abcdef123456-rest-of-uuid")
+            )
 
         # Verify via the context update — pod_name should be workspace-abcdef12345
         context_calls = provisioner._db.merge_workspace_container_context.call_args_list
@@ -670,7 +678,7 @@ class TestCreateWorkspace:
         ) as mock_wait:
             mock_wait.return_value = "10.42.0.100"
             await provisioner.create_workspace(
-                "test-job-123456",
+                WorkspaceOwner.job("test-job-123456"),
                 cpu="1000m",
                 memory="2Gi",
                 cpu_limit="4000m",
@@ -701,7 +709,9 @@ class TestCreateWorkspace:
         )
         provisioner._core_api = mock_core_api
 
-        result = await provisioner.create_workspace("test-job-123456")
+        result = await provisioner.create_workspace(
+            WorkspaceOwner.job("test-job-123456")
+        )
 
         assert result is False
         # Should have set failed status
@@ -730,7 +740,9 @@ class TestDeleteWorkspace:
         mock_core_api.delete_namespaced_pod = MagicMock()
         provisioner._core_api = mock_core_api
 
-        result = await provisioner.delete_workspace("test-job-123456")
+        result = await provisioner.delete_workspace(
+            WorkspaceOwner.job("test-job-123456")
+        )
 
         assert result is True
         mock_core_api.delete_namespaced_pod.assert_called_once()
@@ -761,7 +773,9 @@ class TestDeleteWorkspace:
         error.status = 404
         mock_core_api.delete_namespaced_pod = MagicMock(side_effect=error)
 
-        result = await provisioner.delete_workspace("test-job-123456")
+        result = await provisioner.delete_workspace(
+            WorkspaceOwner.job("test-job-123456")
+        )
         assert result is True
 
     @pytest.mark.asyncio
@@ -774,7 +788,9 @@ class TestDeleteWorkspace:
         provisioner = ContainerProvisioner()
         provisioner._k8s_available = False
 
-        result = await provisioner.delete_workspace("test-job-123456")
+        result = await provisioner.delete_workspace(
+            WorkspaceOwner.job("test-job-123456")
+        )
         assert result is False
 
 
@@ -810,7 +826,9 @@ class TestGetWorkspaceStatus:
             "orchestrator.services.container_provisioner.asyncio.to_thread",
             side_effect=fake_to_thread,
         ):
-            result = await provisioner.get_workspace_status("test-job-123456")
+            result = await provisioner.get_workspace_status(
+                WorkspaceOwner.job("test-job-123456")
+            )
 
         assert result is not None
         assert result["phase"] == "Running"
@@ -834,7 +852,9 @@ class TestGetWorkspaceStatus:
         mock_core_api.read_namespaced_pod = MagicMock(side_effect=error)
         provisioner._core_api = mock_core_api
 
-        result = await provisioner.get_workspace_status("test-job-123456")
+        result = await provisioner.get_workspace_status(
+            WorkspaceOwner.job("test-job-123456")
+        )
         assert result is None
 
     @pytest.mark.asyncio
@@ -847,7 +867,9 @@ class TestGetWorkspaceStatus:
         provisioner = ContainerProvisioner()
         provisioner._k8s_available = False
 
-        result = await provisioner.get_workspace_status("test-job-123456")
+        result = await provisioner.get_workspace_status(
+            WorkspaceOwner.job("test-job-123456")
+        )
         assert result is None
 
 
@@ -966,3 +988,41 @@ class TestDispatchHelpers:
         job = {"context": "not-valid-json"}
         ctx = self._get_container_context(job)
         assert ctx == {}
+
+
+class TestOwnerKeyedWorkspace:
+    """Tests for WorkspaceOwner-keyed provisioning (Task 2 refactor)."""
+
+    @pytest.mark.asyncio
+    async def test_create_workspace_session_uses_thread_naming_and_store(
+        self, monkeypatch
+    ):
+        """create_workspace(WorkspaceOwner.session(...)) uses thread pod name,
+        srw/thread-id label, and calls merge_thread_workspace_context (not job)."""
+        from orchestrator.services.container_provisioner import ContainerProvisioner
+
+        provisioner = ContainerProvisioner()
+        provisioner._k8s_available = True
+        provisioner._namespace = "test-ns"
+        provisioner._db = AsyncMock()
+        provisioner._db.merge_thread_workspace_context = AsyncMock(return_value=True)
+        provisioner._db.merge_workspace_container_context = AsyncMock(return_value=True)
+
+        mock_core_api = MagicMock()
+        mock_core_api.create_namespaced_pod = MagicMock()
+        provisioner._core_api = mock_core_api
+
+        monkeypatch.setattr(
+            provisioner, "_wait_for_ready", AsyncMock(return_value="10.0.0.5")
+        )
+
+        ok = await provisioner.create_workspace(WorkspaceOwner.session("thread-abc"))
+
+        assert ok is True
+        body = mock_core_api.create_namespaced_pod.call_args.kwargs["body"]
+        assert body["metadata"]["name"] == "ws-thread-thread-abc"
+        assert body["metadata"]["labels"]["srw/thread-id"] == "thread-abc"
+        assert body["metadata"]["labels"]["srw/component"] == "thread-workspace"
+        assert "srw/job-id" not in body["metadata"]["labels"]
+        provisioner._db.merge_thread_workspace_context.assert_awaited()
+        provisioner._db.merge_workspace_container_context.assert_not_called()

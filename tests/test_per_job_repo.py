@@ -1,4 +1,4 @@
-"""Tests for the per-job repo model (resolve_job_repo, _squash_merge_subjob, etc.)."""
+"""Tests for the per-job repo model (resolve_job_repo, _graft_subjob_output, etc.)."""
 
 import os
 import sys
@@ -152,278 +152,6 @@ class TestResolveJobRepo:
             repo, branch = await orch_main.resolve_job_repo("full-uuid-here")
             assert repo == "job-full-uuid-here"
             assert branch is None
-
-
-# ===========================================================================
-# _squash_merge_subjob
-# ===========================================================================
-
-
-class TestSquashMergeSubjob:
-    """Tests for _squash_merge_subjob()."""
-
-    @pytest.mark.asyncio
-    async def test_returns_none_for_non_subjob(self):
-        """Root job (no parent_job_id) should return None."""
-        with patch(f"{MODULE}.postgres_db") as mock_db:
-            mock_db.get_job = AsyncMock(return_value={"parent_job_id": None})
-
-            result = await orch_main._squash_merge_subjob("root-job-id")
-            assert result is None
-
-    @pytest.mark.asyncio
-    async def test_returns_none_when_job_not_found(self):
-        with patch(f"{MODULE}.postgres_db") as mock_db:
-            mock_db.get_job = AsyncMock(return_value=None)
-
-            result = await orch_main._squash_merge_subjob("missing-id")
-            assert result is None
-
-    @pytest.mark.asyncio
-    async def test_returns_none_without_branch_or_repo(self):
-        """Subjob without branch/repo should be skipped."""
-        job = {"parent_job_id": "parent-id", "branch_name": None, "repo_name": None}
-        with patch(f"{MODULE}.postgres_db") as mock_db:
-            mock_db.get_job = AsyncMock(return_value=job)
-
-            result = await orch_main._squash_merge_subjob("subjob-id")
-            assert result is None
-
-    @pytest.mark.asyncio
-    async def test_returns_none_when_gitea_not_initialized(self):
-        job = {
-            "parent_job_id": "parent-id",
-            "branch_name": "subjob/abc/creator",
-            "repo_name": "job-parent",
-        }
-        with (
-            patch(f"{MODULE}.postgres_db") as mock_db,
-            patch(f"{MODULE}.gitea_client") as mock_gitea,
-        ):
-            mock_db.get_job = AsyncMock(return_value=job)
-            mock_gitea.is_initialized = False
-
-            result = await orch_main._squash_merge_subjob("subjob-id")
-            assert result is None
-
-    @pytest.mark.asyncio
-    async def test_successful_squash_merge(self):
-        """Full happy-path: cleanup -> PR -> merge -> status update."""
-        subjob = {
-            "id": "subjob-uuid",
-            "parent_job_id": "parent-uuid",
-            "branch_name": "subjob/abcd1234/creator",
-            "repo_name": "job-parent12",
-            "config_name": "creator",
-            "description": "Do something important",
-        }
-        parent = {"branch_name": None}  # root parent -> base = "main"
-
-        with (
-            patch(f"{MODULE}.postgres_db") as mock_db,
-            patch(f"{MODULE}.gitea_client") as mock_gitea,
-        ):
-            mock_db.get_job = AsyncMock(
-                side_effect=lambda jid: {
-                    "subjob-uuid": subjob,
-                    "parent-uuid": parent,
-                }.get(jid)
-            )
-            mock_db.update_job_merge_status = AsyncMock()
-
-            mock_gitea.is_initialized = True
-            mock_gitea.delete_file = AsyncMock()
-            mock_gitea.list_contents = AsyncMock(return_value=[])
-            mock_gitea.create_pr = AsyncMock(return_value={"number": 42})
-            mock_gitea.merge_pr = AsyncMock(return_value=True)
-
-            result = await orch_main._squash_merge_subjob("subjob-uuid")
-
-            assert result == {
-                "status": "merged",
-                "pr_number": 42,
-                "base_branch": "main",
-            }
-
-            # Verify cleanup files were deleted
-            assert mock_gitea.delete_file.await_count == len(
-                orch_main.SUBJOB_CLEANUP_FILES
-            )
-
-            # Verify PR created with squash
-            mock_gitea.create_pr.assert_awaited_once()
-            mock_gitea.merge_pr.assert_awaited_once_with(
-                "job-parent12",
-                42,
-                merge_strategy="squash",
-                delete_branch_after_merge=False,
-            )
-
-            mock_db.update_job_merge_status.assert_awaited_once_with(
-                "subjob-uuid", merge_status="merged"
-            )
-
-    @pytest.mark.asyncio
-    async def test_pr_creation_returns_none_skips_merge(self):
-        """When PR creation returns None (no changes), merge is skipped."""
-        subjob = {
-            "id": "subjob-uuid",
-            "parent_job_id": "parent-uuid",
-            "branch_name": "subjob/abcd1234/creator",
-            "repo_name": "job-parent12",
-            "config_name": "creator",
-            "description": "Task",
-        }
-        parent = {"branch_name": None}
-
-        with (
-            patch(f"{MODULE}.postgres_db") as mock_db,
-            patch(f"{MODULE}.gitea_client") as mock_gitea,
-        ):
-            mock_db.get_job = AsyncMock(
-                side_effect=lambda jid: {
-                    "subjob-uuid": subjob,
-                    "parent-uuid": parent,
-                }.get(jid)
-            )
-            mock_db.update_job_merge_status = AsyncMock()
-
-            mock_gitea.is_initialized = True
-            mock_gitea.delete_file = AsyncMock()
-            mock_gitea.list_contents = AsyncMock(return_value=[])
-            mock_gitea.create_pr = AsyncMock(return_value=None)
-
-            result = await orch_main._squash_merge_subjob("subjob-uuid")
-
-            assert result == {"status": "skipped", "reason": "no changes"}
-            mock_db.update_job_merge_status.assert_awaited_once_with(
-                "subjob-uuid", merge_status="skipped"
-            )
-            mock_gitea.merge_pr.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_merge_failure_returns_conflict(self):
-        """When merge_pr returns False, status is conflict."""
-        subjob = {
-            "id": "sub-id",
-            "parent_job_id": "parent-id",
-            "branch_name": "subjob/sub12345/validator",
-            "repo_name": "job-parent12",
-            "config_name": "validator",
-            "description": "Verify",
-        }
-        parent = {"branch_name": "subjob/parent-br/creator"}
-
-        with (
-            patch(f"{MODULE}.postgres_db") as mock_db,
-            patch(f"{MODULE}.gitea_client") as mock_gitea,
-        ):
-            mock_db.get_job = AsyncMock(
-                side_effect=lambda jid: {
-                    "sub-id": subjob,
-                    "parent-id": parent,
-                }.get(jid)
-            )
-            mock_db.update_job_merge_status = AsyncMock()
-
-            mock_gitea.is_initialized = True
-            mock_gitea.delete_file = AsyncMock()
-            mock_gitea.list_contents = AsyncMock(return_value=[])
-            mock_gitea.create_pr = AsyncMock(return_value={"number": 99})
-            mock_gitea.merge_pr = AsyncMock(return_value=False)
-
-            result = await orch_main._squash_merge_subjob("sub-id")
-
-            assert result == {"status": "conflict", "pr_number": 99}
-            mock_db.update_job_merge_status.assert_awaited_once_with(
-                "sub-id", merge_status="conflict"
-            )
-
-    @pytest.mark.asyncio
-    async def test_directory_cleanup_deletes_files_in_dirs(self):
-        """Cleanup dirs: list_contents -> delete each file entry."""
-        subjob = {
-            "id": "sub-id",
-            "parent_job_id": "parent-id",
-            "branch_name": "subjob/sub12345/creator",
-            "repo_name": "job-parent12",
-            "config_name": "creator",
-            "description": "Work",
-        }
-        parent = {"branch_name": None}
-
-        dir_entries = [
-            {"type": "file", "path": "archive/todos_phase_1.yaml"},
-            {"type": "file", "path": "archive/phase_1_retrospective.md"},
-            {"type": "dir", "path": "archive/subdir"},  # dirs should be skipped
-        ]
-
-        with (
-            patch(f"{MODULE}.postgres_db") as mock_db,
-            patch(f"{MODULE}.gitea_client") as mock_gitea,
-        ):
-            mock_db.get_job = AsyncMock(
-                side_effect=lambda jid: {
-                    "sub-id": subjob,
-                    "parent-id": parent,
-                }.get(jid)
-            )
-            mock_db.update_job_merge_status = AsyncMock()
-
-            mock_gitea.is_initialized = True
-            mock_gitea.delete_file = AsyncMock()
-            # Return dir_entries only for "archive", empty for other dirs
-            mock_gitea.list_contents = AsyncMock(
-                side_effect=lambda repo, path, ref=None: dir_entries
-                if path == "archive"
-                else []
-            )
-            mock_gitea.create_pr = AsyncMock(return_value={"number": 1})
-            mock_gitea.merge_pr = AsyncMock(return_value=True)
-
-            await orch_main._squash_merge_subjob("sub-id")
-
-            # Count: SUBJOB_CLEANUP_FILES (individual files) + 2 file entries from archive dir
-            total_delete_calls = len(orch_main.SUBJOB_CLEANUP_FILES) + 2
-            assert mock_gitea.delete_file.await_count == total_delete_calls
-
-    @pytest.mark.asyncio
-    async def test_base_branch_from_parent_branch(self):
-        """When parent has a branch_name, squash merges into that branch."""
-        subjob = {
-            "id": "sub-id",
-            "parent_job_id": "parent-id",
-            "branch_name": "subjob/sub12345/validator",
-            "repo_name": "job-parent12",
-            "config_name": "validator",
-            "description": "Check",
-        }
-        parent = {"branch_name": "subjob/parent-br/creator"}
-
-        with (
-            patch(f"{MODULE}.postgres_db") as mock_db,
-            patch(f"{MODULE}.gitea_client") as mock_gitea,
-        ):
-            mock_db.get_job = AsyncMock(
-                side_effect=lambda jid: {
-                    "sub-id": subjob,
-                    "parent-id": parent,
-                }.get(jid)
-            )
-            mock_db.update_job_merge_status = AsyncMock()
-
-            mock_gitea.is_initialized = True
-            mock_gitea.delete_file = AsyncMock()
-            mock_gitea.list_contents = AsyncMock(return_value=[])
-            mock_gitea.create_pr = AsyncMock(return_value={"number": 5})
-            mock_gitea.merge_pr = AsyncMock(return_value=True)
-
-            result = await orch_main._squash_merge_subjob("sub-id")
-
-            assert result["base_branch"] == "subjob/parent-br/creator"
-            # Verify PR was created against parent's branch
-            call_kwargs = mock_gitea.create_pr.call_args
-            assert call_kwargs.kwargs["base"] == "subjob/parent-br/creator"
 
 
 # ===========================================================================
@@ -612,48 +340,411 @@ class TestSubjobMergeEndpoint:
             assert result["status"] == "skipped"
 
     @pytest.mark.asyncio
-    async def test_returns_merge_result(self):
-        """Happy path: returns merged result from _squash_merge_subjob."""
+    async def test_returns_graft_result(self):
+        """Happy path: returns graft result from _graft_subjob_output."""
         job = {
             "parent_job_id": "parent-id",
-            "branch_name": "subjob/abc/creator",
+            "branch_name": "subjob/abc/scholar",
             "repo_name": "job-parent",
         }
 
         with (
             patch(f"{MODULE}.postgres_db") as mock_db,
             patch(
-                f"{MODULE}._squash_merge_subjob", new_callable=AsyncMock
-            ) as mock_merge,
+                f"{MODULE}._graft_subjob_output", new_callable=AsyncMock
+            ) as mock_graft,
             _bypass_require_internal(),
         ):
             mock_db.get_job = AsyncMock(return_value=job)
-            mock_merge.return_value = {
-                "status": "merged",
-                "pr_number": 42,
-                "base_branch": "main",
+            mock_graft.return_value = {
+                "status": "grafted",
+                "output_path": "outputs/001-scholar-abc",
             }
 
             result = await orch_main.subjob_merge(_stub_request(), "subjob-id")
-            assert result["status"] == "merged"
+            assert result["status"] == "grafted"
             assert result["job_id"] == "subjob-id"
-            assert result["pr_number"] == 42
+            assert result["output_path"] == "outputs/001-scholar-abc"
 
 
 # ===========================================================================
-# SUBJOB_CLEANUP constants
+# _next_output_ordinal
 # ===========================================================================
 
 
-class TestSubjobCleanupConstants:
-    """Verify the cleanup lists contain expected entries."""
+class _OutputsFake:
+    """Minimal gitea fake exposing list_contents for an `outputs/` dir."""
 
-    def test_cleanup_files_contains_workspace(self):
-        assert "workspace.md" in orch_main.SUBJOB_CLEANUP_FILES
-        assert "plan.md" in orch_main.SUBJOB_CLEANUP_FILES
-        assert "todos.yaml" in orch_main.SUBJOB_CLEANUP_FILES
+    def __init__(self, outputs_dirs: list[str]):
+        # outputs_dirs: directory names directly under outputs/, e.g. ["001-scholar-aa"]
+        self._dirs = outputs_dirs
+        self.is_initialized = True
 
-    def test_cleanup_dirs_contains_archive(self):
-        assert "archive" in orch_main.SUBJOB_CLEANUP_DIRS
-        assert "tools" in orch_main.SUBJOB_CLEANUP_DIRS
-        assert "documents" in orch_main.SUBJOB_CLEANUP_DIRS
+    async def list_contents(self, repo, path="", ref=None):
+        if path != "outputs":
+            return []
+        return [{"name": d, "path": f"outputs/{d}", "type": "dir"} for d in self._dirs]
+
+
+class TestNextOutputOrdinal:
+    @pytest.mark.asyncio
+    async def test_first_ordinal_is_001(self):
+        fake = _OutputsFake([])
+        with patch(f"{MODULE}.gitea_client", fake):
+            assert await orch_main._next_output_ordinal("job-x", "main") == "001"
+
+    @pytest.mark.asyncio
+    async def test_increments_past_highest(self):
+        fake = _OutputsFake(["001-scholar-aa", "002-critic-bb", "010-developer-cc"])
+        with patch(f"{MODULE}.gitea_client", fake):
+            assert await orch_main._next_output_ordinal("job-x", "main") == "011"
+
+    @pytest.mark.asyncio
+    async def test_ignores_non_numbered_entries(self):
+        fake = _OutputsFake(["notes", "003-scholar-dd"])
+        with patch(f"{MODULE}.gitea_client", fake):
+            assert await orch_main._next_output_ordinal("job-x", "main") == "004"
+
+
+import base64 as _b64  # noqa: E402
+
+# ===========================================================================
+# _graft_subjob_output
+# ===========================================================================
+
+
+class _GraftFakeGitea:
+    """Models per-branch trees as {branch: {path: bytes}} and the graft I/O.
+
+    - list_tree(ref) -> [{path, type:"blob"}] for that branch
+    - get_file_bytes(path, ref) -> bytes
+    - list_contents("outputs", ref) -> dir entries under outputs/ on that branch
+    - change_files(branch, files) -> add files (base64) to that branch's tree
+    """
+
+    def __init__(self, trees: dict[str, dict[str, bytes]]):
+        self.trees = {b: dict(t) for b, t in trees.items()}
+        self.is_initialized = True
+
+    async def list_tree(self, repo, ref):
+        return [{"path": p, "type": "blob"} for p in self.trees.get(ref, {})]
+
+    async def get_file_bytes(self, repo, file_path, ref=None):
+        return self.trees.get(ref, {}).get(file_path)
+
+    async def list_contents(self, repo, path="", ref=None):
+        if path != "outputs":
+            return []
+        names = set()
+        for p in self.trees.get(ref, {}):
+            if p.startswith("outputs/"):
+                names.add(p.split("/")[1])
+        return [{"name": n, "path": f"outputs/{n}", "type": "dir"} for n in names]
+
+    async def change_files(self, repo, branch, files, message):
+        tree = self.trees.setdefault(branch, {})
+        for f in files:
+            tree[f["path"]] = _b64.b64decode(f["content_b64"])
+        return True
+
+
+def _subjob(**over):
+    base = {
+        "id": "sub-uuid-1234abcd",
+        "parent_job_id": "parent-uuid",
+        "branch_name": "subjob/1234abcd/scholar",
+        "repo_name": "job-parent12",
+        "config_name": "scholar",
+        "description": "research",
+        "context": {},
+    }
+    base.update(over)
+    return base
+
+
+class TestGraftSubjobOutput:
+    @pytest.mark.asyncio
+    async def test_grafts_output_to_namespaced_dir_and_leaves_parent_untouched(self):
+        fake = _GraftFakeGitea(
+            {
+                "main": {"documents/corpus.pdf": b"PARENT", "src/app.py": b"code"},
+                "subjob/1234abcd/scholar": {
+                    "documents/corpus.pdf": b"PARENT",  # inherited from fork
+                    "src/app.py": b"code",
+                    "output/ideas/idea.md": b"# idea",
+                    "output/report.pdf": b"\x89PDFbytes",
+                    "workspace.md": b"scratch",  # NOT under output/
+                },
+            }
+        )
+        with (
+            patch(f"{MODULE}.postgres_db") as db,
+            patch(f"{MODULE}.gitea_client", fake),
+        ):
+            db.get_job = AsyncMock(
+                side_effect=lambda j: {
+                    "sub-uuid-1234abcd": _subjob(),
+                    "parent-uuid": {"branch_name": None},
+                }.get(j)
+            )
+            db.update_job_merge_status = AsyncMock()
+            db.update_job_context = AsyncMock()
+
+            result = await orch_main._graft_subjob_output("sub-uuid-1234abcd")
+
+        assert result["status"] == "grafted"
+        assert result["output_path"] == "outputs/001-scholar-sub-uuid"
+        # output/ contents relocated under the namespaced dir, prefix stripped:
+        assert (
+            fake.trees["main"]["outputs/001-scholar-sub-uuid/ideas/idea.md"]
+            == b"# idea"
+        )
+        assert (
+            fake.trees["main"]["outputs/001-scholar-sub-uuid/report.pdf"]
+            == b"\x89PDFbytes"
+        )
+        # parent content untouched; scratch + inherited tree NOT propagated:
+        assert fake.trees["main"]["documents/corpus.pdf"] == b"PARENT"
+        assert "outputs/001-scholar-sub-uuid/workspace.md" not in fake.trees["main"]
+        db.update_job_merge_status.assert_awaited_with(
+            "sub-uuid-1234abcd", merge_status="grafted"
+        )
+
+    @pytest.mark.asyncio
+    async def test_critic_grafts_nothing(self):
+        fake = _GraftFakeGitea(
+            {
+                "main": {"src/app.py": b"code"},
+                "subjob/1234abcd/critic": {"output/reviews/r.md": b"review"},
+            }
+        )
+        critic = _subjob(
+            config_name="critic",
+            branch_name="subjob/1234abcd/critic",
+            context={"verification_target": "parent-uuid"},
+        )
+        with (
+            patch(f"{MODULE}.postgres_db") as db,
+            patch(f"{MODULE}.gitea_client", fake),
+        ):
+            db.get_job = AsyncMock(
+                side_effect=lambda j: {
+                    "sub-uuid-1234abcd": critic,
+                    "parent-uuid": {"branch_name": None},
+                }.get(j)
+            )
+            db.update_job_merge_status = AsyncMock()
+            db.update_job_context = AsyncMock()
+
+            result = await orch_main._graft_subjob_output("sub-uuid-1234abcd")
+
+        assert result == {"status": "skipped", "reason": "critic-not-merged"}
+        assert all(not k.startswith("outputs/") for k in fake.trees["main"])
+
+    @pytest.mark.asyncio
+    async def test_no_output_skipped(self):
+        fake = _GraftFakeGitea(
+            {"main": {}, "subjob/1234abcd/scholar": {"workspace.md": b"scratch"}}
+        )
+        with (
+            patch(f"{MODULE}.postgres_db") as db,
+            patch(f"{MODULE}.gitea_client", fake),
+        ):
+            db.get_job = AsyncMock(
+                side_effect=lambda j: {
+                    "sub-uuid-1234abcd": _subjob(),
+                    "parent-uuid": {"branch_name": None},
+                }.get(j)
+            )
+            db.update_job_merge_status = AsyncMock()
+            db.update_job_context = AsyncMock()
+
+            result = await orch_main._graft_subjob_output("sub-uuid-1234abcd")
+
+        assert result == {"status": "skipped", "reason": "no-output"}
+
+    @pytest.mark.asyncio
+    async def test_ordinal_increments_when_outputs_exist(self):
+        fake = _GraftFakeGitea(
+            {
+                "main": {"outputs/001-scholar-old/x.md": b"old"},
+                "subjob/1234abcd/scholar": {"output/y.md": b"new"},
+            }
+        )
+        with (
+            patch(f"{MODULE}.postgres_db") as db,
+            patch(f"{MODULE}.gitea_client", fake),
+        ):
+            db.get_job = AsyncMock(
+                side_effect=lambda j: {
+                    "sub-uuid-1234abcd": _subjob(),
+                    "parent-uuid": {"branch_name": None},
+                }.get(j)
+            )
+            db.update_job_merge_status = AsyncMock()
+            db.update_job_context = AsyncMock()
+
+            result = await orch_main._graft_subjob_output("sub-uuid-1234abcd")
+
+        assert result["output_path"] == "outputs/002-scholar-sub-uuid"
+        assert fake.trees["main"]["outputs/002-scholar-sub-uuid/y.md"] == b"new"
+
+    @pytest.mark.asyncio
+    async def test_already_grafted_is_skipped(self):
+        # Re-invoking after a graft must NOT copy the output again under a new
+        # ordinal. The recorded graft_output_path short-circuits the function.
+        fake = _GraftFakeGitea(
+            {
+                "main": {"outputs/001-scholar-sub-uuid/x.md": b"prev"},
+                "subjob/1234abcd/scholar": {"output/y.md": b"new"},
+            }
+        )
+        already = _subjob(context={"graft_output_path": "outputs/001-scholar-sub-uuid"})
+        with (
+            patch(f"{MODULE}.postgres_db") as db,
+            patch(f"{MODULE}.gitea_client", fake),
+        ):
+            db.get_job = AsyncMock(
+                side_effect=lambda j: {
+                    "sub-uuid-1234abcd": already,
+                    "parent-uuid": {"branch_name": None},
+                }.get(j)
+            )
+            db.update_job_merge_status = AsyncMock()
+            db.update_job_context = AsyncMock()
+
+            result = await orch_main._graft_subjob_output("sub-uuid-1234abcd")
+
+        assert result["status"] == "skipped"
+        assert result["reason"] == "already-grafted"
+        assert result["output_path"] == "outputs/001-scholar-sub-uuid"
+        # No second ordinal folder created; context not rewritten.
+        assert not any(k.startswith("outputs/002-") for k in fake.trees["main"])
+        db.update_job_context.assert_not_called()
+
+
+class TestCompletionGraftWiring:
+    @pytest.mark.asyncio
+    async def test_graft_fires_for_delegation_child(self):
+        # A delegation child has creation_order set; the old gate skipped it.
+        called = {}
+
+        async def fake_graft(job_id):
+            called["job_id"] = job_id
+            return {
+                "status": "grafted",
+                "output_path": "outputs/001-developer-deadbeef",
+            }
+
+        child = {
+            "id": "deadbeef-child",
+            "parent_job_id": "p",
+            "creation_order": 0,
+            "branch_name": "subjob/deadbeef/developer",
+            "repo_name": "job-p",
+            "config_name": "developer",
+        }
+        with patch(f"{MODULE}._graft_subjob_output", side_effect=fake_graft):
+            res = await orch_main._maybe_graft_completed_subjob(child)
+        assert called["job_id"] == "deadbeef-child"
+        assert res["status"] == "grafted"
+
+    @pytest.mark.asyncio
+    async def test_no_graft_for_root_job(self):
+        with patch(f"{MODULE}._graft_subjob_output", new_callable=AsyncMock) as g:
+            res = await orch_main._maybe_graft_completed_subjob(
+                {"id": "r", "parent_job_id": None}
+            )
+        assert res is None
+        g.assert_not_called()
+
+
+class TestScholarOutputPointer:
+    @pytest.mark.asyncio
+    async def test_scholar_completion_sets_parent_output_dir_to_graft_path(self):
+        # The in-memory scholar passed to the handler predates the graft's
+        # context write, so it LACKS graft_output_path. The DB row (re-fetched)
+        # has it. This guards the re-fetch: reading the in-memory ctx yields None.
+        scholar_in_memory = {
+            "id": "sch-1",
+            "parent_job_id": "par-1",
+            "status": "completed",
+            "context": {"scholar_target": "par-1"},
+        }
+        scholar_fresh = {
+            "id": "sch-1",
+            "parent_job_id": "par-1",
+            "status": "completed",
+            "context": {
+                "scholar_target": "par-1",
+                "graft_output_path": "outputs/003-scholar-sch1",
+            },
+        }
+        parent = {"id": "par-1", "status": "waiting", "context": {}}
+        captured = {}
+
+        async def upd_ctx(jid, ctx):
+            captured[jid] = ctx
+
+        with patch(f"{MODULE}.postgres_db") as db:
+            db.get_job = AsyncMock(
+                side_effect=lambda j: {"sch-1": scholar_fresh, "par-1": parent}.get(j)
+            )
+            db.update_job_context = AsyncMock(side_effect=upd_ctx)
+            db.update_job_status = AsyncMock()
+            with patch(f"{MODULE}._trigger_dispatch"):
+                await orch_main._handle_scholar_completion(scholar_in_memory, [])
+
+        assert captured["par-1"]["scholar_output_dir"] == "outputs/003-scholar-sch1"
+        assert captured["par-1"]["scholar_completed"] is True
+
+
+class TestDelegationOutputPathPopulation:
+    """The resume builder must surface each child's graft_output_path as output_path."""
+
+    @pytest.mark.asyncio
+    async def test_child_results_carry_graft_output_path(self):
+        # Graft writes graft_output_path into each child's DB context; the
+        # delegation resume builder must read it back as output_path. Locks the
+        # producer->consumer key contract for _handle_delegation_child_completion.
+        job = {"id": "child-1", "parent_job_id": "par-1", "creation_order": 1}
+        parent = {"id": "par-1", "status": "waiting", "context": {}}
+        children = [
+            {
+                "id": "c0",
+                "creation_order": 0,
+                "status": "completed",
+                "config_name": "scholar",
+                "branch_name": "subjob/c0/scholar",
+                "context": {"graft_output_path": "outputs/001-scholar-c0"},
+                "freeze_data": {"summary": "did X"},
+            },
+            {
+                "id": "c1",
+                "creation_order": 1,
+                "status": "completed",
+                "config_name": "developer",
+                "branch_name": "subjob/c1/developer",
+                "context": {},  # produced no output -> no graft path
+                "freeze_data": {},
+            },
+        ]
+        captured = {}
+
+        async def upd_ctx(jid, ctx):
+            captured[jid] = ctx
+
+        with patch(f"{MODULE}.postgres_db") as db:
+            db.all_delegation_children_terminal = AsyncMock(return_value=True)
+            db.get_job = AsyncMock(side_effect=lambda j: {"par-1": parent}.get(j))
+            db.get_delegation_children = AsyncMock(return_value=children)
+            db.update_job_context = AsyncMock(side_effect=upd_ctx)
+            db.update_job_status = AsyncMock()
+            with patch(f"{MODULE}._trigger_dispatch"):
+                await orch_main._handle_delegation_child_completion(job, [])
+
+        results = captured["par-1"]["delegation_results"]
+        by_order = {r["creation_order"]: r for r in results}
+        assert by_order[0]["output_path"] == "outputs/001-scholar-c0"
+        assert by_order[0]["config_name"] == "scholar"
+        assert by_order[1]["output_path"] is None

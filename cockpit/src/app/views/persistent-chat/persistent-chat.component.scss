@@ -391,8 +391,20 @@
         padding: 48px 0 24px;
       }
 
-      .startup-wrapper.resume {
-        padding: 24px 0;
+      /* Slim startup status strip — chrome above the message list, shown once
+         a turn exists while the session is still starting. Reuses the inner
+         .startup-step row (replaces the old .startup-wrapper.resume overlay
+         that floated over messages). */
+      .startup-banner {
+        flex: 0 0 auto;
+        padding: 7px 16px;
+        background: color-mix(in srgb, var(--accent-color, #3399D6) 8%, var(--panel-bg));
+        border-bottom: 1px solid var(--border-color, var(--surface-0));
+        border-left: 3px solid var(--accent-color);
+      }
+
+      .startup-banner .startup-step {
+        font-size: 14px;
       }
 
       .startup-card {
@@ -563,6 +575,49 @@
         word-break: break-word;
       }
 
+      .user-text-collapsible {
+        > .user-text-summary {
+          display: flex;
+          align-items: baseline;
+          gap: 6px;
+          cursor: pointer;
+          list-style: none;
+          color: var(--text-primary);
+
+          &::-webkit-details-marker { display: none; }
+          &::marker { display: none; }
+
+          &:hover { color: var(--text-secondary); }
+
+          .user-text-preview {
+            flex: 1;
+            min-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+          }
+
+          .user-text-hint {
+            flex-shrink: 0;
+            color: var(--text-muted);
+            font-size: 12px;
+          }
+
+          .user-text-hint-open { display: none; }
+        }
+
+        &[open] > .user-text-summary {
+          .user-text-preview,
+          .user-text-hint-closed { display: none; }
+
+          .user-text-hint-open { display: inline; }
+        }
+
+        > .user-text {
+          margin-top: 4px;
+        }
+      }
+
       /* historical messages use session divider instead of dimming */
 
       .system-message {
@@ -688,6 +743,7 @@
         border-radius: 0;
         background: var(--surface-0);
         overflow: hidden;
+        max-width: min(720px, 100%);
       }
 
       .tool-head {
@@ -831,6 +887,28 @@
         text-transform: uppercase;
         letter-spacing: 0.5px;
         white-space: nowrap;
+      }
+
+      /* Compaction summary — expandable under the divider banner. */
+      .compaction-summary {
+        max-width: 80%;
+        margin: 0 auto 8px;
+        font-size: 12px;
+      }
+      .compaction-summary > summary {
+        cursor: pointer;
+        text-align: center;
+        font-size: 10px;
+        color: var(--text-muted);
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+      }
+      .compaction-summary-body {
+        margin-top: 6px;
+        padding: 8px 10px;
+        white-space: pre-wrap;
+        border-left: 2px solid var(--border, var(--surface-1));
+        border-radius: var(--radius-tag);
       }
 
       @keyframes spin {

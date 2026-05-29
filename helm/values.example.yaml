@@ -155,6 +155,37 @@ ingress:
     issuerName: letsencrypt-prod
 
 # -----------------------------------------------------------------------------
+# Session router — Direct Session WebSockets
+# (docs/features/direct_session_websockets.md)
+#
+# Generate a strong key with:  openssl rand -hex 32
+# Then pass at install time so it never lives in the repo:
+#   helm install srw ./helm \
+#     --set-string sessionRouter.jwtSecret="$(openssl rand -hex 32)"
+# -----------------------------------------------------------------------------
+sessionRouter:
+  ingressClass: nginx          # match your cluster's controller (Tier-1: traefik)
+  ingressHost: ""              # default: api.<global.domain>
+
+  # Layout A — chart renders a standalone Secret. Pass the random value at
+  # install time:  --set-string sessionRouter.jwtSecret="$(openssl rand -hex 32)"
+  jwtSecret: ""                # REQUIRED for Layout A
+  # jwtSecretName: ""          # defaults to <release>-session-jwt
+  # jwtSecretKey: "jwt-secret"
+
+  # Layout B — key already lives on an existing Secret (e.g. ESO-synced from
+  # Vault, sealed-secrets, etc.). Leave jwtSecret empty so the standalone
+  # Secret isn't rendered; point the chart at the existing bundle:
+  #   jwtSecret: ""
+  #   jwtSecretName: srw                  # the bundle Secret your release already has
+  #   jwtSecretKey: SESSION_JWT_SECRET    # the key inside that bundle
+
+  jwtTtlSeconds: 60
+  # annotations:
+  #   nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+  #   nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+
+# -----------------------------------------------------------------------------
 # Sizing — defaults are dev-friendly. Adjust for production load.
 # -----------------------------------------------------------------------------
 agent:

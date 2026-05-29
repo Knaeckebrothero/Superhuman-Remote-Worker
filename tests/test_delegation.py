@@ -397,19 +397,19 @@ class TestDelegationResumeFormat:
             {
                 "job_id": "child-001",
                 "creation_order": 0,
-                "config": "scholar",
+                "config_name": "scholar",
                 "status": "completed",
                 "confidence": 0.85,
-                "branch_name": "subagent/0",
+                "output_path": "outputs/001-scholar-child001",
                 "summary": "Found 23 relevant papers.",
             },
             {
                 "job_id": "child-002",
                 "creation_order": 1,
-                "config": "developer",
+                "config_name": "developer",
                 "status": "failed",
                 "confidence": None,
-                "branch_name": "subagent/1",
+                "output_path": None,
                 "summary": "Build failed due to missing dependency.",
             },
         ]
@@ -422,9 +422,11 @@ class TestDelegationResumeFormat:
         assert "scholar" in msg
         assert "developer" in msg
         assert "0.85" in msg
-        assert "subagent/0" in msg
-        assert "subagent/1" in msg
-        assert "git diff" in msg.lower() or "git_diff" in msg
+        # Deliverables are grafted outputs/ folders now — no branches to merge.
+        assert "outputs/001-scholar-child001" in msg
+        assert "git diff" not in msg.lower()
+        assert "git_diff" not in msg
+        assert "squash-merg" not in msg.lower()
 
     def test_empty_results(self):
         from src.agent import _format_delegation_results
@@ -564,140 +566,6 @@ class TestDelegationDepthCheck:
 
         result = await _check_delegation_depth(ctx, max_depth=1)
         assert result is None  # Fail open
-
-
-# ===========================================================================
-# Phase 2: TestGitMergeSquashTool — git_merge_squash tool
-# ===========================================================================
-
-
-class TestGitMergeSquashTool:
-    """Test git_merge_squash tool via the git tools module."""
-
-    @pytest.fixture
-    def git_repo(self, tmp_path):
-        """Create a real git repo with an initial commit."""
-        repo_path = tmp_path / "repo"
-        repo_path.mkdir()
-        subprocess.run(["git", "init"], cwd=repo_path, capture_output=True)
-        subprocess.run(
-            ["git", "config", "user.email", "test@test.com"],
-            cwd=repo_path,
-            capture_output=True,
-        )
-        subprocess.run(
-            ["git", "config", "user.name", "Test"],
-            cwd=repo_path,
-            capture_output=True,
-        )
-        (repo_path / "README.md").write_text("# Test Repo")
-        subprocess.run(["git", "add", "."], cwd=repo_path, capture_output=True)
-        subprocess.run(
-            ["git", "commit", "-m", "Initial commit"],
-            cwd=repo_path,
-            capture_output=True,
-        )
-        return repo_path
-
-    def test_git_merge_squash_tool_loads(self, git_repo):
-        """Verify git_merge_squash is created by create_git_tools."""
-        from src.managers.git_manager import GitManager
-        from src.tools.context import ToolContext
-        from src.tools.git.git_tools import create_git_tools
-
-        gm = GitManager(git_repo)
-        ws = MagicMock()
-        ws.git_manager = gm
-        ws.is_initialized = True
-        ctx = ToolContext(workspace_manager=ws)
-        tools = create_git_tools(ctx)
-        tool_names = [t.name for t in tools]
-        assert "git_merge_squash" in tool_names
-        assert "git_worktree_cleanup" in tool_names
-
-    def test_git_merge_squash_tool_executes(self, git_repo):
-        """End-to-end: create branch, make changes, merge via tool."""
-        from src.managers.git_manager import GitManager
-        from src.tools.context import ToolContext
-        from src.tools.git.git_tools import create_git_tools
-
-        gm = GitManager(git_repo)
-
-        # Create worktree + branch
-        gm.worktree_add(".worktrees/sub0", "subagent/0")
-        wt_path = git_repo / ".worktrees" / "sub0"
-        (wt_path / "result.txt").write_text("subagent output")
-        subprocess.run(["git", "add", "."], cwd=wt_path, capture_output=True)
-        subprocess.run(
-            ["git", "commit", "-m", "Add result"],
-            cwd=wt_path,
-            capture_output=True,
-        )
-
-        ws = MagicMock()
-        ws.git_manager = gm
-        ws.is_initialized = True
-        ctx = ToolContext(workspace_manager=ws)
-        tools = create_git_tools(ctx)
-        merge_tool = next(t for t in tools if t.name == "git_merge_squash")
-
-        result = merge_tool.invoke({"branch": "subagent/0"})
-        assert "successfully" in result.lower() or "squash" in result.lower()
-        assert (git_repo / "result.txt").exists()
-
-
-# ===========================================================================
-# Phase 2: TestWorktreeCleanupTool — git_worktree_cleanup tool
-# ===========================================================================
-
-
-class TestWorktreeCleanupTool:
-    """Test git_worktree_cleanup tool."""
-
-    @pytest.fixture
-    def git_repo(self, tmp_path):
-        repo_path = tmp_path / "repo"
-        repo_path.mkdir()
-        subprocess.run(["git", "init"], cwd=repo_path, capture_output=True)
-        subprocess.run(
-            ["git", "config", "user.email", "test@test.com"],
-            cwd=repo_path,
-            capture_output=True,
-        )
-        subprocess.run(
-            ["git", "config", "user.name", "Test"],
-            cwd=repo_path,
-            capture_output=True,
-        )
-        (repo_path / "README.md").write_text("# Test Repo")
-        subprocess.run(["git", "add", "."], cwd=repo_path, capture_output=True)
-        subprocess.run(
-            ["git", "commit", "-m", "Initial commit"],
-            cwd=repo_path,
-            capture_output=True,
-        )
-        return repo_path
-
-    def test_cleanup_removes_worktree_and_branch(self, git_repo):
-        from src.managers.git_manager import GitManager
-        from src.tools.context import ToolContext
-        from src.tools.git.git_tools import create_git_tools
-
-        gm = GitManager(git_repo)
-        gm.worktree_add(".worktrees/subagent_0", "subagent/0")
-
-        ws = MagicMock()
-        ws.git_manager = gm
-        ws.is_initialized = True
-        ctx = ToolContext(workspace_manager=ws)
-        tools = create_git_tools(ctx)
-        cleanup_tool = next(t for t in tools if t.name == "git_worktree_cleanup")
-
-        result = cleanup_tool.invoke({"branch": "subagent/0"})
-        assert "removed worktree" in result.lower()
-
-        # Verify worktree is gone
-        assert not (git_repo / ".worktrees" / "subagent_0").exists()
 
 
 # ===========================================================================

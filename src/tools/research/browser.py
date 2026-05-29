@@ -18,7 +18,6 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from langchain_core.tools import tool
 
 from ..context import ToolContext
 
@@ -27,24 +26,12 @@ logger = logging.getLogger(__name__)
 CDP_PORT = 9222
 
 
-BROWSER_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
-    "browse_website": {
-        "module": "research.browser",
-        "function": "browse_website",
-        "description": "Navigate website and extract information",
-        "category": "research",
-        "short_description": "Use browser to navigate and extract web content.",
-        "phases": ["tactical"],
-    },
-    "download_from_website": {
-        "module": "research.browser",
-        "function": "download_from_website",
-        "description": "Download file from website using browser automation",
-        "category": "research",
-        "short_description": "Navigate to URL and download file (PDF, etc.).",
-        "phases": ["tactical"],
-    },
-}
+BROWSER_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {}
+# Autonomous browser sub-agent tools (browse_website / download_from_website)
+# were deprecated in favor of the direct browser_* tools, driven by the main
+# agent via the workspace browser-exec daemon. The helpers below are retained
+# because papers.py still uses them for its PDF-download fallback.
+# See docs/features/browser_workspace_executor.md.
 
 
 # ── Remote Chromium lifecycle ─────────────────────────────────────────
@@ -336,227 +323,7 @@ def _get_documents_dir(context: ToolContext) -> Path:
     return Path("./downloads")
 
 
-# ── Tool factory ──────────────────────────────────────────────────────
-
-
-def create_browser_tools(context: ToolContext) -> List[Any]:
-    """Create browser automation tools.
-
-    Args:
-        context: ToolContext with workspace_manager and config
-
-    Returns:
-        List of LangChain tool functions
-    """
-
-    @tool
-    async def browse_website(
-        url: str,
-        task: str,
-        use_vision: bool = False,
-    ) -> str:
-        """Delegate a browsing task to an autonomous browser agent.
-
-        Best for simple extraction, multi-page research, or bulk URL processing.
-        The browser agent runs independently and returns a text summary.
-        For step-by-step interaction or visual verification, use browser_navigate instead.
-
-        Args:
-            url: Starting URL to navigate to
-            task: Natural language description of what to do (e.g., "Find the abstract and authors")
-            use_vision: Use screenshot-based navigation instead of DOM (default False, requires multimodal LLM)
-
-        Returns:
-            Extracted information or task completion status
-        """
-        try:
-            from browser_use import Agent, Browser
-        except ImportError:
-            return (
-                "Error: browser-use package not installed.\n"
-                "Install with: pip install browser-use"
-            )
-
-        remote = _is_remote_browser(context)
-        browser = None
-        try:
-            llm = _get_browser_llm(context)
-            browser_kwargs = _get_browser_config(context)
-            browser = Browser(**browser_kwargs)
-
-            full_task = f"Go to {url} and {task}"
-            agent = Agent(
-                task=full_task,
-                llm=llm,
-                browser=browser,
-                use_vision=use_vision,
-                max_actions_per_step=4,
-            )
-
-            history = await agent.run()
-            result = _extract_result(history)
-            return result
-
-        except Exception as e:
-            logger.error(f"Browser automation error: {e}", exc_info=True)
-            return f"Browser automation failed: {e}"
-        finally:
-            if browser is not None:
-                try:
-                    await browser.stop()
-                except Exception:
-                    pass
-            if remote:
-                _stop_remote_chromium(context.workspace_manager.backend)
-
-    @tool
-    async def download_from_website(
-        url: str,
-        download_task: str = "Find and click the download PDF button",
-    ) -> str:
-        """Download a file from a website using browser automation.
-
-        Useful for publisher pages with JavaScript download buttons,
-        pages requiring cookie acceptance, or complex navigation to
-        reach download links.
-
-        For paywalled content, ensure you're connected to institutional
-        VPN or have proxy configured before using this tool.
-
-        Args:
-            url: Page URL containing the download link
-            download_task: Instructions for finding and clicking the download (default: "Find and click the download PDF button")
-
-        Returns:
-            Path to downloaded file or error message
-        """
-        try:
-            from browser_use import Agent, Browser
-        except ImportError:
-            return (
-                "Error: browser-use package not installed.\n"
-                "Install with: pip install browser-use"
-            )
-
-        remote = _is_remote_browser(context)
-        browser = None
-        try:
-            llm = _get_browser_llm(context)
-
-            if remote:
-                browser_kwargs = _get_browser_config(context)
-            else:
-                dest_dir = _get_documents_dir(context)
-                dest_dir.mkdir(parents=True, exist_ok=True)
-                browser_kwargs = _get_browser_config(context, downloads_path=dest_dir)
-
-            browser = Browser(**browser_kwargs)
-
-            full_task = (
-                f"Go to {url} and {download_task}. Wait for the download to complete."
-            )
-            agent = Agent(
-                task=full_task,
-                llm=llm,
-                browser=browser,
-                use_vision=False,
-                max_actions_per_step=4,
-            )
-
-            history = await agent.run()
-
-            # Check for downloaded files
-            if remote:
-                backend = context.workspace_manager.backend
-                new_files = _find_new_files_remote(backend, "documents")
-                if new_files:
-                    rel_path = new_files[0]
-                    file_size = backend.stat(rel_path)
-                    file_name = Path(rel_path).name
-                    _register_downloaded_file(context, rel_path, name=file_name)
-                    return (
-                        f"Downloaded file: {file_name}\n"
-                        f"Path: {rel_path}\n"
-                        f"Size: {file_size:,} bytes"
-                    )
-            else:
-                downloaded_files = _find_new_files(dest_dir)
-                if downloaded_files:
-                    downloaded_path = downloaded_files[0]
-                    _register_downloaded_file(
-                        context,
-                        str(downloaded_path),
-                        name=downloaded_path.name,
-                    )
-                    return (
-                        f"Downloaded file: {downloaded_path.name}\n"
-                        f"Path: {downloaded_path}\n"
-                        f"Size: {downloaded_path.stat().st_size:,} bytes"
-                    )
-
-            result = _extract_result(history)
-            return f"Download may have failed. Agent report:\n{result}"
-
-        except Exception as e:
-            logger.error(f"Browser download error: {e}", exc_info=True)
-            return f"Browser download failed: {e}"
-        finally:
-            if browser is not None:
-                try:
-                    await browser.stop()
-                except Exception:
-                    pass
-            if remote:
-                _stop_remote_chromium(context.workspace_manager.backend)
-
-    return [browse_website, download_from_website]
-
-
 # ── Helpers ───────────────────────────────────────────────────────────
-
-
-def _extract_result(history) -> str:
-    """Extract the final result from browser-use agent history.
-
-    Args:
-        history: AgentHistory from browser-use agent.run()
-
-    Returns:
-        Formatted result string
-    """
-    if history is None:
-        return "Browser agent completed but returned no result."
-
-    # browser-use returns an AgentHistoryList
-    # Try to get the final result
-    try:
-        # The history object has a final_result() method in newer versions
-        if hasattr(history, "final_result"):
-            result = history.final_result()
-            if result:
-                return str(result)
-
-        # Fall back to getting the last action result
-        if hasattr(history, "history") and history.history:
-            last_entry = history.history[-1]
-            if hasattr(last_entry, "result"):
-                result = last_entry.result
-                if result:
-                    # Truncate if too long
-                    result_str = str(result)
-                    if len(result_str) > 5000:
-                        return result_str[:5000] + "\n... (truncated)"
-                    return result_str
-
-        # Try string representation as last resort
-        result_str = str(history)
-        if len(result_str) > 5000:
-            return result_str[:5000] + "\n... (truncated)"
-        return result_str
-
-    except Exception as e:
-        logger.debug(f"Could not extract result from history: {e}")
-        return "Browser agent completed. Check workspace documents for any downloaded files."
 
 
 def _find_new_files(directory: Path, max_age_seconds: int = 60) -> List[Path]:

@@ -174,6 +174,11 @@ class OrchestratorClient:
             "agent_mode": agent_mode,
             "thread_id": thread_id,
             "build_sha": os.environ.get("BUILD_SHA", ""),
+            # Injected via Kubernetes downward API by agent_provisioner; empty
+            # outside of K8s (local dev). The orchestrator persists this on
+            # the agents row so the session router can construct K8s
+            # ownerReferences on per-session Service/Ingress resources.
+            "pod_uid": os.environ.get("POD_UID", ""),
         }
 
         try:
@@ -248,11 +253,19 @@ class OrchestratorClient:
         metrics: dict | None = None,
         tool_call_id: str | None = None,
         thinking: str | None = None,
+        reasoning: object | None = None,
+        tool_results: object | None = None,
+        provider: str | None = None,
+        provider_raw: object | None = None,
+        additional_kwargs: dict | None = None,
+        response_metadata: dict | None = None,
     ) -> bool:
         """Save a message to thread history via orchestrator REST. Fire-and-forget safe.
 
         ``tool_call_id`` is set only for role='tool' rows; ``thinking`` for
-        role='ai' rows that carry reasoning content.
+        role='ai' rows that carry reasoning content. The component columns
+        (reasoning, tool_results, provider, provider_raw, additional_kwargs,
+        response_metadata) are optional and were added in migration 0019.
         """
         if not self._client:
             return False
@@ -266,6 +279,12 @@ class OrchestratorClient:
             "metrics": metrics,
             "tool_call_id": tool_call_id,
             "thinking": thinking,
+            "reasoning": reasoning,
+            "tool_results": tool_results,
+            "provider": provider,
+            "provider_raw": provider_raw,
+            "additional_kwargs": additional_kwargs,
+            "response_metadata": response_metadata,
         }
 
         try:

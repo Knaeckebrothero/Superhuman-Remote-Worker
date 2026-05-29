@@ -87,7 +87,7 @@ class TestHeartbeatPreservesDraining:
             status="ready",
         )
         sql = conn.execute.call_args[0][0]
-        assert "CASE WHEN status = 'draining'" in sql
+        assert "WHEN status = 'draining'" in sql
 
     @pytest.mark.asyncio
     async def test_returns_none_when_agent_missing(self):
@@ -98,6 +98,63 @@ class TestHeartbeatPreservesDraining:
             status="ready",
         )
         assert result is None
+
+
+class TestHeartbeatPreservesOffline:
+    """Heartbeat must not let a late grace-period heartbeat resurrect an
+    agent that the lifecycle reconciler has already marked offline. See
+    the 2026-05-24 stale-pod regression (thread 352144ea): the dying
+    pod's last in-flight heartbeat flipped its row back to ready,
+    ``_find_idle_persistent_agent`` matched it (most-recent
+    ``last_heartbeat`` puts it at the top of the pool query), and the
+    new thread got bound to a pod that disappeared seconds later.
+    """
+
+    @pytest.mark.asyncio
+    async def test_offline_preserved_when_agent_reports_ready(self):
+        db, _ = _make_db_with_mocked_acquire(prev_status="offline")
+        result = await db.heartbeat(
+            agent_id="00000000-0000-0000-0000-000000000001",
+            status="ready",
+        )
+        assert result is not None
+        assert result["previous_status"] == "offline"
+        assert result["effective_status"] == "offline"
+
+    @pytest.mark.asyncio
+    async def test_offline_preserved_when_agent_reports_working(self):
+        db, _ = _make_db_with_mocked_acquire(prev_status="offline")
+        result = await db.heartbeat(
+            agent_id="00000000-0000-0000-0000-000000000001",
+            status="working",
+            current_job_id="11111111-1111-1111-1111-111111111111",
+        )
+        assert result["effective_status"] == "offline"
+
+    @pytest.mark.asyncio
+    async def test_offline_preserved_when_metrics_present(self):
+        # Same guard must apply to the metrics-bearing branch — both SQL
+        # paths share the CASE expression that pins offline.
+        db, _ = _make_db_with_mocked_acquire(prev_status="offline")
+        result = await db.heartbeat(
+            agent_id="00000000-0000-0000-0000-000000000001",
+            status="ready",
+            metrics={"cpu": 0.1},
+        )
+        assert result["effective_status"] == "offline"
+
+    @pytest.mark.asyncio
+    async def test_sql_pins_offline_in_case_expression(self):
+        # Belt-and-braces: the issued SQL must include the offline branch
+        # of the CASE, so a future refactor that drops it triggers a
+        # test failure rather than a silent regression.
+        db, conn = _make_db_with_mocked_acquire(prev_status="offline")
+        await db.heartbeat(
+            agent_id="00000000-0000-0000-0000-000000000001",
+            status="ready",
+        )
+        sql = conn.execute.call_args[0][0]
+        assert "WHEN status = 'offline'" in sql
 
 
 class TestHeartbeatReturnsIntents:

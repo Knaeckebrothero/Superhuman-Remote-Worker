@@ -1,4 +1,4 @@
-import {computed, inject, Injectable, NgZone, signal} from '@angular/core';
+import {computed, DestroyRef, effect, inject, Injectable, NgZone, signal, untracked} from '@angular/core';
 import {HttpClient} from '@angular/common/http';
 import {firstValueFrom} from 'rxjs';
 import {environment} from '../environment';
@@ -16,6 +16,7 @@ import {
 } from '../models/turn.model';
 import {ApiService} from './api.service';
 import {IndexedDbService} from './indexed-db.service';
+import {NotificationService} from './notification.service';
 import {reduce, ReducerAction} from './turn-reducer';
 import {AppToastService} from '../../ui/toast';
 
@@ -62,6 +63,13 @@ const CONTROL_WS_RECONNECT_MAX_ATTEMPTS = 8;
 const SSE_WATCHDOG_INTERVAL_MS = 5000;
 const SSE_WATCHDOG_TIMEOUT_MS = 45000;
 
+// After an interrupt POST we wait for the agent to emit `interrupt.ack` /
+// `turn.completed` over SSE to clear the "Stopping…" state. If that frame is
+// lost (silently-stalled stream) the button would wedge forever — re-clicks
+// early-return. If nothing clears it within this window, force an SSE reopen
+// (replay-from-cursor) which re-delivers the durable turn boundary.
+const INTERRUPT_ACK_TIMEOUT_MS = 8000;
+
 /** Attachment chip shown alongside a user message. */
 export interface ChatAttachment {
     name: string;
@@ -88,6 +96,18 @@ export interface ToolCallInfo {
     decision?: 'approved' | 'denied';
 }
 
+/**
+ * The tool call the agent is currently blocked on, delivered in the
+ * session.state welcome frame so a (re)attaching client can render a
+ * running-command card even when the in-flight turn isn't in REST history yet
+ * (it's persisted only at turn end).
+ */
+export interface RunningToolInfo {
+    id: string;
+    tool: string;
+    args: Record<string, unknown>;
+}
+
 /** Permission request from the agent. */
 export interface PermissionRequest {
     /** Tool call id — correlates the eventual decision back to the call. */
@@ -110,6 +130,19 @@ type PermissionMode = 'supervised' | 'auto_accept' | 'autonomous';
 export type NarrationMode = 'silent' | 'verbose' | 'auto';
 
 /**
+ * Response payload for ``GET /api/sessions/{thread_id}/connection`` — the
+ * canonical WS URL + JWT for a bound session. The cockpit dials the WS at
+ * `ws_url` directly (routed to the agent pod by the orchestrator's edge
+ * proxy). See orchestrator/routers/sessions.py for the response shape.
+ */
+interface ConnectionPayload {
+    state: 'ready';
+    ws_url: string;
+    token: string;
+    expires_at: number;
+}
+
+/**
  * Persistent agent session client. See file header for transport rationale.
  *
  * All state is exposed as Angular signals for reactive UI updates.
@@ -121,6 +154,77 @@ export class PersistentChatService {
     private readonly cache = inject(IndexedDbService);
     private readonly zone = inject(NgZone);
     private readonly toast = inject(AppToastService);
+    private readonly notifications = inject(NotificationService);
+    private readonly destroyRef = inject(DestroyRef);
+
+    constructor() {
+        // Single source of truth for the "Starting session" card phase
+        // transitions. The orchestrator emits session.lifecycle events on
+        // the user's always-on /notifications/events SSE from every
+        // binding path (provision_or_assign for the create-thread fast
+        // path, _do_prepare for the cold path). Subscribe via the
+        // NotificationService signal so the SSE feed isn't opened twice.
+        effect(() => {
+            const event = this.notifications.lifecycleEvent();
+            const tid = this.threadId();
+            if (!event || !tid || event.thread_id !== tid) return;
+            // Once the session is actually live, ignore further lifecycle
+            // events (a duplicate from a racing /prepare must not regress
+            // the UI). isStartingSession also gates rendering on
+            // sessionReady, so the card hides naturally.
+            if (this.sessionReady()) return;
+            switch (event.state) {
+                case 'provisioning':
+                case 'booting':
+                    this.startupPhase.set(event.state);
+                    break;
+                case 'ready':
+                    // Server says the agent is session-ready; the cockpit
+                    // is now opening the WS — that's the "establishing
+                    // connection" phase. session.state arriving on the WS
+                    // will flip sessionReady=true and hide the card.
+                    this.startupPhase.set('connecting');
+                    break;
+                case 'failed':
+                    this.error.set(event.reason || 'session preparation failed');
+                    break;
+            }
+        });
+
+        // Invariant: "Stopping…" (isInterrupting) only makes sense while a turn
+        // is actually streaming. Whenever streaming ends — turn completed, the
+        // turn closed on disconnect, or a reconnect re-synced past it — clear
+        // the flag and its fallback timer. This is the safety net that stops a
+        // lost interrupt.ack/turn.completed frame from wedging the button: any
+        // path that drops the active turn also drops "Stopping…".
+        effect(() => {
+            if (!this.isStreaming() && untracked(() => this.isInterrupting())) {
+                this.isInterrupting.set(false);
+                this._clearInterruptFallback();
+            }
+        });
+
+        // Re-validate the connection whenever the user returns to the tab.
+        // The SSE liveness watchdog is a setInterval, which browsers freeze on
+        // a backgrounded tab (~5 min) — so a silent drop goes unnoticed until
+        // the user comes back. These DOM listeners fire outside Angular's zone,
+        // hence zone.run. Registered once on this root singleton and torn down
+        // via DestroyRef (matters for test isolation, not prod lifetime).
+        if (typeof document !== 'undefined') {
+            const onWake = () => this.zone.run(() => this._revalidateConnection());
+            const onVisible = () => {
+                if (document.visibilityState === 'visible') onWake();
+            };
+            document.addEventListener('visibilitychange', onVisible);
+            window.addEventListener('online', onWake);
+            window.addEventListener('focus', onWake);
+            this.destroyRef.onDestroy(() => {
+                document.removeEventListener('visibilitychange', onVisible);
+                window.removeEventListener('online', onWake);
+                window.removeEventListener('focus', onWake);
+            });
+        }
+    }
 
     // --- Connection state ---
     readonly connectionState = signal<ConnectionState>('disconnected');
@@ -174,9 +278,50 @@ export class PersistentChatService {
     readonly isInterrupting = signal(false);
     readonly historyLoaded = signal(false);
 
+    // --- Render windowing (display-only) ---
+    // The full conversation lives in `turns`; the component renders only the
+    // most recent `windowSize` turns so the DOM stays bounded on long threads
+    // (a single thread can be 800+ turns). `loadOlderTurns` widens the window on
+    // scroll-up; `growWindow` keeps the visible top anchored when new turns
+    // stream in below a scrolled-away user; `resetWindow` re-bounds the DOM on
+    // (re)load and once the user is back at the bottom.
+    private readonly DEFAULT_WINDOW = 50;
+    private readonly WINDOW_STEP = 50;
+    readonly windowSize = signal(this.DEFAULT_WINDOW);
+    readonly visibleTurns = computed(() => {
+        const all = this.turns();
+        const n = this.windowSize();
+        return all.length <= n ? all : all.slice(-n);
+    });
+    readonly hasOlderTurns = computed(() => this.turns().length > this.windowSize());
+
+    /** Widen the render window toward the start of the conversation. */
+    loadOlderTurns(): void {
+        this.windowSize.update((n) =>
+            Math.min(n + this.WINDOW_STEP, this.turns().length),
+        );
+    }
+
+    /** Anchor the visible top while turns stream in below a scrolled-away user. */
+    growWindow(delta: number): void {
+        if (delta > 0) this.windowSize.update((n) => n + delta);
+    }
+
+    /** Re-bound the DOM to the most recent window (on (re)load / back at bottom). */
+    resetWindow(): void {
+        this.windowSize.set(this.DEFAULT_WINDOW);
+    }
+
     // --- Permission state ---
     readonly permissionMode = signal<PermissionMode>('supervised');
     readonly pendingPermission = signal<PermissionRequest | null>(null);
+
+    // --- Running-command snapshot ---
+    // Set from the session.state welcome frame on (re)attach when the loop is
+    // blocked in a tool call; cleared when that tool completes or the turn ends.
+    // Lets the UI show a "running command" card instead of a blank "Connecting…"
+    // during a long mid-turn block (the in-flight turn isn't in REST history).
+    readonly runningTool = signal<RunningToolInfo | null>(null);
 
     // --- Narration state ---
     readonly narrationMode = signal<NarrationMode>('auto');
@@ -242,40 +387,67 @@ export class PersistentChatService {
 
     private sse: EventSource | null = null;
     private sseWatchdogTimer: ReturnType<typeof setInterval> | null = null;
+    // One-shot fallback: force a reconnect if "Stopping…" doesn't clear after
+    // an interrupt POST (lost ack frame). Armed in interrupt(), cleared by the
+    // isInterrupting invariant effect.
+    private interruptFallbackTimer: ReturnType<typeof setTimeout> | null = null;
     private sseLastEventAt = 0;
     private controlWs: WebSocket | null = null;
     private controlWsReconnectTimer: ReturnType<typeof setTimeout> | null = null;
     private controlWsReconnectAttempt = 0;
     private intentionalClose = false;
+    /**
+     * Guard against double-opening the control WS while an async
+     * /connection (or /prepare → SSE ready → /connection) fetch is in
+     * flight. Distinct from `controlWs` (which is null during the fetch
+     * window — _ensureControlWs() must not race past).
+     */
+    private controlWsOpening = false;
 
     /**
      * Connect to a persistent agent session.
      *
-     * Loads thread metadata + transcript history from REST, then opens the
-     * SSE stream (replay-from-cursor when we have one cached) and the
-     * control WS.
+     * Cold path (new thread or thread switch): load thread metadata +
+     * transcript history from REST, then open SSE (replay-from-cursor when
+     * we have one cached) and the control WS.
+     *
+     * Same-thread fast path: skip the reset + loadHistory, just refresh
+     * transports. This preserves the in-flight assistant turn through
+     * chat-page re-mounts and other reconnects against the same thread
+     * (docs/issues/persistent_chat_lost_assistant_turn_on_mid_turn_reload.md
+     * §Approach 1). loadHistory's GET /messages only returns *persisted*
+     * rows; during streaming the AI message isn't in thread_messages yet,
+     * so re-running it mid-turn would replace the visible streaming turn
+     * with just the user message and drop subsequent SSE events (the
+     * reducer no-ops `token`/`thinking`/`tool.*` events when
+     * `activeAssistantTurnId === null`).
      */
     async connect(threadId: string): Promise<void> {
+        const sameThread = this.threadId() === threadId && this.historyLoaded();
         this.disconnect();
-        this.dispatch({type: 'reset', threadId});
         this.connectionState.set('connecting');
         this.error.set(null);
-        this.historyLoaded.set(false);
-        this.sessionReady.set(false);
-        this.startupPhase.set(null);
-        this.pendingMessage.set(null);
-        this.sessionTitle.set(null);
-        this.modelName.set(null);
-        this.temperature.set(0);
-        this.turnCount.set(0);
-        this.ncSessionFolder.set(null);
-        this.cloudSessionUrl.set(null);
-        this.tasks.set([]);
-        this.undoAvailable.set(false);
-        this.isSessionPaused.set(false);
+        if (!sameThread) {
+            // Cold path: wipe and refetch.
+            this.dispatch({type: 'reset', threadId});
+            this.historyLoaded.set(false);
+            this.sessionReady.set(false);
+            this.startupPhase.set(null);
+            this.pendingMessage.set(null);
+            this.sessionTitle.set(null);
+            this.modelName.set(null);
+            this.temperature.set(0);
+            this.turnCount.set(0);
+            this.ncSessionFolder.set(null);
+            this.cloudSessionUrl.set(null);
+            this.tasks.set([]);
+            this.undoAvailable.set(false);
+            this.isSessionPaused.set(false);
+            this.runningTool.set(null);
 
-        this.threadId.set(threadId);
-        await this.loadHistory(threadId);
+            this.threadId.set(threadId);
+            await this.loadHistory(threadId);
+        }
         await this.loadThreadMeta(threadId);
 
         // Don't auto-connect to ended sessions — render the read-only resume
@@ -287,7 +459,7 @@ export class PersistentChatService {
 
         this.intentionalClose = false;
         await this._openSse(threadId);
-        this._openControlWs(threadId);
+        await this._openControlWs(threadId);
     }
 
     /**
@@ -335,19 +507,48 @@ export class PersistentChatService {
      */
     private async loadHistory(threadId: string): Promise<void> {
         try {
-            const resp = await firstValueFrom(
-                this.http.get<{ messages: HistoryMessage[]; total: number }>(
-                    `${environment.apiUrl}/persistent/threads/${threadId}/messages`
-                )
-            );
+            // 1. Cache-first: paint the cached conversation immediately (zero
+            //    latency on reopen). Empty when this thread isn't cached yet.
+            const cached = await this.cache.getThreadMessages(threadId);
+            if (cached.length) {
+                this.dispatch({type: 'load_history', threadId, turns: historyToTurns(cached)});
+                this.resetWindow();
+                this.historyLoaded.set(true);
+            }
 
-            if (resp.messages?.length) {
-                const turns = historyToTurns(resp.messages);
-                this.dispatch({type: 'load_history', threadId, turns});
+            // 2. Refresh from the server. With a cache, fetch only what's newer
+            //    (?after=<newest cached>, inclusive); otherwise the full thread.
+            const newest = cached.length ? cached[cached.length - 1].created_at : null;
+            const url = newest
+                ? `${environment.apiUrl}/persistent/threads/${threadId}/messages` +
+                  `?after=${encodeURIComponent(newest)}`
+                : `${environment.apiUrl}/persistent/threads/${threadId}/messages`;
+            const resp = await firstValueFrom(
+                this.http.get<{messages: HistoryMessage[]; total: number}>(url),
+            );
+            const fetched = resp.messages ?? [];
+
+            // 3. Append to the cache by id (never full-replace — that loses
+            //    history). Best-effort: a no-op when IndexedDB is unavailable.
+            if (fetched.length) {
+                void this.cache.upsertThreadMessages(
+                    fetched.map((m) => ({...m, threadId})),
+                );
+            }
+
+            // 4. Render the merged set. Merge in memory (dedup by id) rather than
+            //    reading the cache back, so the render is correct even when
+            //    IndexedDB is unavailable. Skip the re-render when the cache was
+            //    already current (nothing new fetched).
+            if (fetched.length || !cached.length) {
+                const merged = mergeMessagesById(cached, fetched);
+                this.dispatch({type: 'load_history', threadId, turns: historyToTurns(merged)});
+                this.resetWindow();
             }
             this.historyLoaded.set(true);
         } catch {
-            // History load failure is non-fatal — proceed with empty history
+            // Network failure is non-fatal — any cached transcript was already
+            // painted above; just mark history loaded.
             this.historyLoaded.set(true);
         }
     }
@@ -390,8 +591,12 @@ export class PersistentChatService {
         this._stopSseWatchdog();
 
         const cursor = await this.cache.getThreadCursor(threadId);
-        const cursorQuery = cursor ? `?last_event_id=${encodeURIComponent(`${cursor.epoch}:${cursor.seq}`)}` : '';
-        const url = `${environment.apiUrl}/persistent/threads/${threadId}/stream${cursorQuery}`;
+        // ngsw-bypass keeps the Angular service worker out of the SSE path. Its
+        // /api/** dataGroup otherwise buffers the stream body (which never ends),
+        // stalling EventSource.onopen ~20s. The param's presence alone is enough.
+        const params = new URLSearchParams({'ngsw-bypass': 'true'});
+        if (cursor) params.set('last_event_id', `${cursor.epoch}:${cursor.seq}`);
+        const url = `${environment.apiUrl}/persistent/threads/${threadId}/stream?${params.toString()}`;
 
         // withCredentials true so the srw_session cookie rides along on the
         // cross-origin SSE handshake.
@@ -412,6 +617,11 @@ export class PersistentChatService {
                 // loop_crash even though the title was generated and persisted.
                 if (wasReconnecting && this.threadId() === threadId) {
                     void this.loadThreadMeta(threadId);
+                    // Slave the control WS to SSE recovery: the WS has no
+                    // liveness probe of its own, so re-establish it whenever
+                    // the (monitored) SSE recovers. Idempotent — bails if the
+                    // WS is already open/connecting.
+                    this._ensureControlWs();
                 }
             });
         };
@@ -494,6 +704,32 @@ export class PersistentChatService {
         }
     }
 
+    /**
+     * Re-validate liveness on tab resume (visibilitychange / online / focus).
+     * The SSE is the single liveness authority: if it isn't OPEN or has gone
+     * silent past the watchdog timeout, force a reopen (replay-from-cursor);
+     * then ensure the control WS — which has no probe of its own — is back.
+     * No-op when there's no active, live session.
+     */
+    private _revalidateConnection(): void {
+        if (this.intentionalClose) return;
+        const tid = this.threadId();
+        if (!tid) return;
+        if (this.threadStatus() === 'ended') return;
+        const sseStale =
+            !this.sse ||
+            this.sse.readyState !== EventSource.OPEN ||
+            Date.now() - this.sseLastEventAt > SSE_WATCHDOG_TIMEOUT_MS;
+        if (sseStale) {
+            // Closes + reopens the SSE and sets connectionState='connecting';
+            // the reopen's onopen also re-ensures the control WS (Change 2).
+            this.reconnectNow();
+        } else {
+            // SSE healthy but the WS may have silently dropped — re-ensure it.
+            this._ensureControlWs();
+        }
+    }
+
     private _handleSseFrame(event: MessageEvent): void {
         // event.lastEventId is "<epoch>:<seq>". Save before dispatch so a
         // dispatch error doesn't lose our place — the SSE replay logic
@@ -558,16 +794,118 @@ export class PersistentChatService {
 
     // ── Control WS (slash commands + permission decisions) ───────────────
 
-    private _openControlWs(threadId: string): void {
-        const apiUrl = environment.apiUrl;
-        const wsBase = apiUrl.replace(/\/api\/?$/, '').replace(/^http/, 'ws');
-        const url = `${wsBase}/ws/persistent/${threadId}`;
+    /**
+     * Resolve the canonical WS URL + token for the session via the
+     * orchestrator REST endpoints (Tasks 6 + 7), then open the WebSocket.
+     *
+     * Two REST steps, joined by the SSE notification feed:
+     *
+     *   1. GET /api/sessions/{tid}/connection
+     *      → 200 (ready): {ws_url, token, expires_at}. Open WS directly.
+     *      → 425 (not bound yet): cold start, fall through to step 2.
+     *
+     *   2. POST /api/sessions/{tid}/prepare → 202 {state: provisioning}
+     *      → wait for `session.lifecycle` SSE event with state=ready
+     *      → GET /connection again, then open WS.
+     *
+     * Errors here are swallowed: the WS open is best-effort (the SSE
+     * receive path is the primary signal). User-initiated commands that
+     * need the WS will reopen via _ensureControlWs() on demand.
+     */
+    private async _openControlWs(threadId: string): Promise<void> {
+        if (this.controlWsOpening) return;
+        this.controlWsOpening = true;
+        try {
+            const connection = await this._resolveConnection(threadId);
+            if (this.intentionalClose || this.threadId() !== threadId) return;
+            this._installControlWs(threadId, connection.ws_url);
+        } catch {
+            // Resolution failed — leave controlWs null; _ensureControlWs
+            // (driven by user clicks) or the reconnect loop will retry.
+            if (!this.intentionalClose && this.threadId() === threadId) {
+                this._scheduleControlWsReconnect(threadId);
+            }
+        } finally {
+            this.controlWsOpening = false;
+        }
+    }
 
-        this.controlWs = new WebSocket(url);
-        this.controlWs.onclose = () => {
+    /**
+     * Resolve the {ws_url, token} for a thread. On 425 (no binding yet)
+     * POST /prepare to kick off provisioning, then poll /connection until
+     * 200 — the always-on NotificationService SSE drives the
+     * "Starting session" card via lifecycle events in parallel, so this
+     * function only owns the token fetch, not the UI phase rendering.
+     */
+    private async _resolveConnection(threadId: string): Promise<ConnectionPayload> {
+        try {
+            return await this._fetchConnection(threadId);
+        } catch (err: any) {
+            if (err?.status !== 425) throw err;
+            // Not bound yet — kick off /prepare and poll /connection until
+            // the orchestrator binds an agent and the agent's /ready flips
+            // true. (The cockpit's startup card is rendered by the
+            // session.lifecycle effect in the constructor; we just wait
+            // here for the token.)
+            await firstValueFrom(
+                this.http.post<{ state: string }>(
+                    `${environment.apiUrl}/sessions/${threadId}/prepare`,
+                    {},
+                ),
+            );
+            return await this._pollConnectionUntilReady(threadId);
+        }
+    }
+
+    /**
+     * Poll GET /connection until it returns 200. Backoff: 1s, capped at
+     * 2s. Aborts if the user navigates away (threadId() changes) or the
+     * service is intentionally closed. Bounded by READY_TIMEOUT_MS so a
+     * stuck attach surfaces as an error instead of polling forever.
+     */
+    private async _pollConnectionUntilReady(threadId: string): Promise<ConnectionPayload> {
+        const READY_TIMEOUT_MS = 180_000;
+        const deadline = Date.now() + READY_TIMEOUT_MS;
+        let interval = 1_000;
+        while (Date.now() < deadline) {
+            if (this.intentionalClose || this.threadId() !== threadId) {
+                throw new Error('connection cancelled');
+            }
+            try {
+                return await this._fetchConnection(threadId);
+            } catch (err: any) {
+                if (err?.status === 425 || err?.status === 409) {
+                    await new Promise((r) => setTimeout(r, interval));
+                    interval = Math.min(2_000, interval + 250);
+                    continue;
+                }
+                throw err;
+            }
+        }
+        throw new Error('session preparation timed out');
+    }
+
+    private async _fetchConnection(threadId: string): Promise<ConnectionPayload> {
+        return await firstValueFrom(
+            this.http.get<ConnectionPayload>(
+                `${environment.apiUrl}/sessions/${threadId}/connection`,
+            ),
+        );
+    }
+
+    private _installControlWs(threadId: string, wsUrl: string): void {
+        this.controlWs = new WebSocket(wsUrl);
+        this.controlWs.onclose = (event: CloseEvent) => {
             this.controlWs = null;
             if (this.intentionalClose) return;
             if (this.threadId() !== threadId) return;
+            // 4401 = expired/invalid token (Task 8). The agent is still
+            // bound — just need a fresh token. Skip /prepare and re-fetch
+            // /connection directly.
+            if ((event && (event as CloseEvent).code) === 4401) {
+                void this._reopenWithFreshToken(threadId);
+                return;
+            }
             // Tiny linear backoff — primary connection signal lives on the SSE
             // so we don't need the WS aggressively reconnecting.
             this._scheduleControlWsReconnect(threadId);
@@ -607,6 +945,27 @@ export class PersistentChatService {
         };
     }
 
+    /**
+     * Re-fetch /connection (skip /prepare — the agent is still bound) and
+     * reopen the control WS with the fresh token. Triggered by a 4401
+     * close on the WS.
+     */
+    private async _reopenWithFreshToken(threadId: string): Promise<void> {
+        if (this.controlWsOpening) return;
+        this.controlWsOpening = true;
+        try {
+            const connection = await this._fetchConnection(threadId);
+            if (this.intentionalClose || this.threadId() !== threadId) return;
+            this._installControlWs(threadId, connection.ws_url);
+        } catch {
+            if (!this.intentionalClose && this.threadId() === threadId) {
+                this._scheduleControlWsReconnect(threadId);
+            }
+        } finally {
+            this.controlWsOpening = false;
+        }
+    }
+
     private _scheduleControlWsReconnect(threadId: string): void {
         if (this.controlWsReconnectAttempt >= CONTROL_WS_RECONNECT_MAX_ATTEMPTS) {
             // Give up silently; user actions that need the WS will reopen
@@ -620,7 +979,7 @@ export class PersistentChatService {
             this.controlWsReconnectTimer = null;
             if (this.intentionalClose) return;
             if (this.threadId() !== threadId) return;
-            this._openControlWs(threadId);
+            void this._openControlWs(threadId);
         }, delay);
     }
 
@@ -632,8 +991,9 @@ export class PersistentChatService {
         if (!tid) return;
         if (this.controlWs?.readyState === WebSocket.OPEN) return;
         if (this.controlWs?.readyState === WebSocket.CONNECTING) return;
+        if (this.controlWsOpening) return;
         this.controlWsReconnectAttempt = 0;
-        this._openControlWs(tid);
+        void this._openControlWs(tid);
     }
 
     /** Send a control-plane command. If the WS isn't open, open it; the
@@ -720,15 +1080,30 @@ export class PersistentChatService {
     }
 
     /**
-     * Resume a paused/idle session: POST to resume endpoint, then reconnect.
+     * Resume an ended session and reconnect.
+     *
+     * /resume is required for ended threads — it flips status from 'ended'
+     * → 'created' and clears the stale agent_id, kicking off a background
+     * reprovision. From there we just call `connect()`, which routes through
+     * `_openControlWs → _resolveConnection`: a `GET /connection` 425 falls
+     * through to `_waitForLifecycleReady` driving `POST /prepare` against
+     * the lifecycle SSE feed. The advisory lock in the orchestrator
+     * serialises /resume's reprovision with /prepare's _do_prepare so we
+     * don't double-provision (docs/issues/persistent_thread_double_provisioning_race.md).
      */
     async resumeSession(): Promise<void> {
         const threadId = this.threadId();
         if (!threadId) return;
         this.isSessionPaused.set(false);
-        await firstValueFrom(
-            this.http.post(`${environment.apiUrl}/persistent/threads/${threadId}/resume`, {})
-        );
+        try {
+            await firstValueFrom(
+                this.http.post(`${environment.apiUrl}/persistent/threads/${threadId}/resume`, {})
+            );
+        } catch (err) {
+            // /resume may 409 if the thread isn't actually 'ended' (e.g. a
+            // double-click). Fall through to connect() either way — its
+            // cold-start path is self-healing.
+        }
         await this.connect(threadId);
     }
 
@@ -783,23 +1158,23 @@ export class PersistentChatService {
      *  receives. The displayed user message keeps the original text and
      *  shows uploaded files as separate attachment chips.
      */
-    async sendMessage(content: string): Promise<void> {
+    async sendMessage(content: string): Promise<boolean> {
         const trimmed = content.trim();
 
         // Slash commands bypass attachment logic.
         if (trimmed.startsWith('/')) {
-            if (this.handleSlashCommand(trimmed)) return;
+            if (this.handleSlashCommand(trimmed)) return true;
         }
 
         const queued = this.pendingAttachments();
-        if (!trimmed && queued.length === 0) return;
+        if (!trimmed && queued.length === 0) return true;
 
         let uploaded: ThreadUploadedFile[] = [];
         if (queued.length > 0) {
             const threadId = this.threadId();
             if (!threadId) {
                 this.attachmentError.set('Cannot upload: no active thread');
-                return;
+                return false;
             }
             const files = queued.filter((p) => p.file).map((p) => p.file);
             this.isUploadingAttachments.set(true);
@@ -816,7 +1191,7 @@ export class PersistentChatService {
                     p.error = msg;
                 });
                 this.attachmentError.set(msg);
-                return;
+                return false;
             } finally {
                 this.isUploadingAttachments.set(false);
             }
@@ -841,9 +1216,10 @@ export class PersistentChatService {
 
         // Add to local conversation — content is the user's typed text
         // only; uploaded files render as separate attachment chips.
+        const localId = makeLocalId('user');
         this.dispatch({
             type: 'user_message',
-            id: makeLocalId('user'),
+            id: localId,
             content: trimmed,
             attachments: attachments.length > 0 ? attachments : undefined,
             timestamp: Date.now(),
@@ -852,17 +1228,27 @@ export class PersistentChatService {
         // If session isn't ready yet, queue and send when ready.
         if (!this.sessionReady()) {
             this.pendingMessage.set(sendContent);
-            return;
+            return true;
         }
 
         this.isWaitingForInput.set(false);
-        await this._postInput(sendContent);
+        const ok = await this._postInput(sendContent);
+        if (!ok) {
+            // Hard send failure — roll back the optimistic bubble so the
+            // composer can restore the draft for retry (the error banner set
+            // by _postInput explains why). A 409 dup is treated as success.
+            this.dispatch({type: 'remove_turn', id: localId});
+            return false;
+        }
+        return true;
     }
 
-    /** POST the input to the orchestrator's REST endpoint. */
-    private async _postInput(content: string): Promise<void> {
+    /** POST the input to the orchestrator's REST endpoint. Returns true when
+     *  the input was accepted (or a 409 dup — the reply still streams via
+     *  SSE), false on a hard failure so the caller can roll back. */
+    private async _postInput(content: string): Promise<boolean> {
         const tid = this.threadId();
-        if (!tid) return;
+        if (!tid) return false;
         try {
             await firstValueFrom(
                 this.http.post<{ accepted: boolean; turn_id: number }>(
@@ -870,12 +1256,14 @@ export class PersistentChatService {
                     {content}
                 )
             );
+            return true;
         } catch (err: any) {
-            // 409 means a duplicate POST landed for the same turn — surface
-            // the existing inflight turn_id and otherwise ignore; the user
-            // sees the response stream via SSE.
-            if (err?.status === 409) return;
+            // 409 means a duplicate POST landed for the same turn — the user
+            // still sees the response stream via SSE, so treat it as success
+            // and keep the optimistic bubble.
+            if (err?.status === 409) return true;
             this.error.set(this.sanitizeError(err?.error?.detail || err?.message));
+            return false;
         }
     }
 
@@ -963,9 +1351,9 @@ export class PersistentChatService {
     /** Interrupt the current turn — REST POST. */
     async interrupt(): Promise<void> {
         if (this.isInterrupting()) return;
-        this.isInterrupting.set(true);
         const tid = this.threadId();
         if (!tid) return;
+        this.isInterrupting.set(true);
         try {
             await firstValueFrom(
                 this.http.post(`${environment.apiUrl}/persistent/threads/${tid}/interrupt`, {})
@@ -974,10 +1362,38 @@ export class PersistentChatService {
             // Interrupt failures are rare and the SSE will surface the next
             // turn boundary regardless — log and reset the flag.
             this.isInterrupting.set(false);
+            this._clearInterruptFallback();
             console.warn('[persistent-chat] interrupt failed:', err);
+            return;
         }
-        // On success, the agent emits `interrupt.ack` over SSE and the
-        // handler below resets isInterrupting/isStreaming/currentTurnId.
+        // On success the agent emits `interrupt.ack` / `turn.completed` over
+        // SSE and the handlers reset isInterrupting. Arm a fallback in case
+        // that frame never arrives (stalled stream): force a reconnect so the
+        // durable turn boundary replays from cursor and clears "Stopping…".
+        this._armInterruptFallback();
+    }
+
+    /** Arm the one-shot stuck-"Stopping…" fallback (see interrupt()). */
+    private _armInterruptFallback(): void {
+        this._clearInterruptFallback();
+        this.interruptFallbackTimer = setTimeout(() => {
+            this.interruptFallbackTimer = null;
+            if (this.isInterrupting()) {
+                console.warn(
+                    '[persistent-chat] interrupt ack not seen within ' +
+                    `${INTERRUPT_ACK_TIMEOUT_MS}ms — forcing reconnect to re-sync`
+                );
+                this.reconnectNow();
+            }
+        }, INTERRUPT_ACK_TIMEOUT_MS);
+    }
+
+    /** Cancel the stuck-"Stopping…" fallback timer if armed. */
+    private _clearInterruptFallback(): void {
+        if (this.interruptFallbackTimer) {
+            clearTimeout(this.interruptFallbackTimer);
+            this.interruptFallbackTimer = null;
+        }
     }
 
     /** Stop a pending permission prompt + halt the turn so the user can
@@ -1018,10 +1434,6 @@ export class PersistentChatService {
         const now = Date.now();
 
         switch (data.method) {
-            case 'status':
-                this.startupPhase.set((params['phase'] as string) || null);
-                break;
-
             case 'session.state':
                 if (params['permission_mode']) {
                     this.permissionMode.set(params['permission_mode'] as PermissionMode);
@@ -1037,6 +1449,14 @@ export class PersistentChatService {
                 }
                 if (params['temperature'] != null) {
                     this.temperature.set(params['temperature'] as number);
+                }
+                // Running-command snapshot: only act when the key is present so
+                // a metadata-only session.state from another channel can't clobber it.
+                if ('running_tool' in params) {
+                    const rt = params['running_tool'] as Partial<RunningToolInfo> | null;
+                    this.runningTool.set(
+                        rt && rt.tool ? {id: rt.id ?? '', tool: rt.tool, args: rt.args ?? {}} : null,
+                    );
                 }
                 this.markSessionReady();
                 break;
@@ -1109,6 +1529,9 @@ export class PersistentChatService {
                     isError: !!params['is_error'],
                     timestamp: now,
                 });
+                if (this.runningTool()?.id === ((params['id'] as string) || '')) {
+                    this.runningTool.set(null);
+                }
                 break;
 
             case 'permission.request': {
@@ -1132,12 +1555,14 @@ export class PersistentChatService {
                     this.dispatch({type: 'turn_completed', turnId, finishedAt: now});
                 }
                 this.isInterrupting.set(false);
+                this.runningTool.set(null);
                 break;
             }
 
             case 'interrupt.ack':
                 this._closeActiveTurnIfAny('turn_interrupted');
                 this.isInterrupting.set(false);
+                this.runningTool.set(null);
                 break;
 
             case 'mode.changed':
@@ -1166,11 +1591,20 @@ export class PersistentChatService {
                 }
                 break;
 
-            case 'context.compacted':
-                this._systemMessage(
-                    `Context compacted: ${params['before']} → ${params['after']} messages`,
-                );
+            case 'context.compacted': {
+                // Show a compaction banner. Stable id (compaction-<turn>) keeps
+                // SSE replay idempotent; the reducer replaces rather than dupes.
+                const turn = params['turn'];
+                const compactionId =
+                    turn != null ? `compaction-${turn}` : makeLocalId('compaction');
+                this.dispatch({
+                    type: 'add_compaction',
+                    id: compactionId,
+                    summary: (params['summary'] as string) ?? '',
+                    timestamp: Date.now(),
+                });
                 break;
+            }
 
             case 'session.ended':
                 this._systemMessage('Session ended.');
@@ -1347,6 +1781,25 @@ function makeLocalId(prefix: string): string {
  *   without a matching call (pre-0011 historical data) are dropped — same
  *   user-visible behavior as before this migration.
  */
+/**
+ * Merge two message lists by `id` (server rows win on conflict), sorted in
+ * display order (created_at, then turn_number, then id). Combines the
+ * IndexedDB cache with an `?after=` incremental fetch without depending on a
+ * cache read-back, so it's correct even when IndexedDB is unavailable.
+ */
+function mergeMessagesById(a: HistoryMessage[], b: HistoryMessage[]): HistoryMessage[] {
+    const byId = new Map<string, HistoryMessage>();
+    for (const m of a) byId.set(m.id, m);
+    for (const m of b) byId.set(m.id, m);
+    return Array.from(byId.values()).sort((x, y) => {
+        const c = (x.created_at ?? '').localeCompare(y.created_at ?? '');
+        if (c !== 0) return c;
+        const t = (x.turn_number ?? 0) - (y.turn_number ?? 0);
+        if (t !== 0) return t;
+        return x.id.localeCompare(y.id);
+    });
+}
+
 function historyToTurns(messages: HistoryMessage[]): Turn[] {
     const turns: Turn[] = [];
     const turnByNumber = new Map<number, AssistantTurn>();
@@ -1356,9 +1809,21 @@ function historyToTurns(messages: HistoryMessage[]): Turn[] {
         const isUser = ['human', 'user', 'HumanMessageChunk'].includes(m.role);
         const isAssistant = ['ai', 'assistant', 'AIMessageChunk'].includes(m.role);
         const isTool = m.role === 'tool' || m.role === 'ToolMessageChunk';
-        if (!isUser && !isAssistant && !isTool) continue;
 
         const ts = m.created_at ? Date.parse(m.created_at) || Date.now() : Date.now();
+
+        // Compaction boundary marker (role='summary') → a divider banner.
+        if (m.role === 'summary') {
+            turns.push({
+                kind: 'compaction',
+                id: m.id,
+                summary: m.content ?? '',
+                timestamp: ts,
+            });
+            continue;
+        }
+
+        if (!isUser && !isAssistant && !isTool) continue;
 
         if (isUser) {
             const u: UserTurn = {

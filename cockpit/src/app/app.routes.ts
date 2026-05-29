@@ -17,6 +17,7 @@ import {DatasourcesPageComponent} from './views/datasources/datasources-page.com
 import {AutomationsPageComponent} from './views/automations/automations-page.component';
 import {AdminLlmComponent} from './views/admin/llm/admin-llm.component';
 import {AdminUsersComponent} from './views/admin/users/admin-users.component';
+import {AdminPromptsComponent} from './views/admin/prompts/admin-prompts.component';
 import {authGuard} from './core/guards/auth.guard';
 import {adminGuard} from './core/guards/admin.guard';
 import {projectAccessGuard} from './core/guards/project-access.guard';
@@ -41,6 +42,7 @@ export const routes: Routes = [
   { path: 'admin/providers', redirectTo: 'admin/llm' },
   { path: 'admin/models', redirectTo: 'admin/llm' },
   { path: 'admin/users', component: AdminUsersComponent, canActivate: [authGuard, adminGuard] },
+  { path: 'admin/prompts', component: AdminPromptsComponent, canActivate: [authGuard, adminGuard] },
   { path: 'debug', component: DebugPageComponent, canActivate: [authGuard] },
 
   // Redirects for old bookmarks

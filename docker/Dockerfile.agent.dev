@@ -1,0 +1,175 @@
+# syntax=docker/dockerfile:1.7
+# =============================================================================
+# Universal Agent Dockerfile (Tilt dev variant)
+# =============================================================================
+#
+# Why this exists vs docker/Dockerfile.agent (the prod image):
+#
+#   1. **BuildKit cache mounts on every download step.** Prod's Dockerfile
+#      strips apt/pip caches at the end of each RUN ("--no-cache-dir",
+#      "rm -rf /var/lib/apt/lists/*") to keep the published image small.
+#      For dev iteration that's the wrong trade — the layer-cache miss
+#      rate is ~100% on these instructions because pip/apt install
+#      timestamps make the resulting layer non-deterministic, so on every
+#      rebuild we'd re-download ~5 min of packages from PyPI / Debian /
+#      playwright CDN. The fix is `RUN --mount=type=cache,...`: a
+#      persistent build-side mount that survives layer invalidation. The
+#      RUN layer still rebuilds, but the download is served from cache.
+#      Final image is still small because the cache mount is NOT included
+#      in the image.
+#   2. **No HEALTHCHECK**: K8s probes own liveness/readiness in the dev
+#      cluster; the dockerd-side HEALTHCHECK is redundant and just slows
+#      pod startup.
+#   3. **No CitationEngine build-arg path**: Tilt always builds from the
+#      published pip dep; if you're iterating on CitationEngine itself,
+#      edit the agent Dockerfile directly.
+#   4. **No BUILD_SHA stamping**: the Tilt loop tags `tilt-<hash>`, and
+#      SHA-based drift detection (agent_manager.py) is intentionally a
+#      no-op in dev.
+#
+# Layer ordering is identical to prod so the iteration loop hits Docker's
+# layer cache for everything except `src/`, `config/`, `agent.py` — and
+# Tilt's docker_build `only=` list pins watching to exactly those paths.
+#
+# Live_update is intentionally not configured for the agent (agent pods
+# have restartPolicy: Never and are baked-in per-job — see Non-goals in
+# the tilt_inner_loop_dev.md design doc). Instead we rely on:
+#   1. Tilt rebuilds + pushes srw-agent:tilt-<hash> on save.
+#   2. helm_resource re-renders the chart's ConfigMap with the new tag.
+#   3. Stakater Reloader (already in chart, reloader.stakater.com/auto=true
+#      on the orchestrator Deployment) bounces the orchestrator.
+#   4. AgentProvisioner re-reads PERSISTENT_AGENT_IMAGE at init time and
+#      provisions the next agent pod with the new tag.
+# =============================================================================
+
+FROM python:3.11-slim AS builder
+
+WORKDIR /app
+
+# Build deps in a separate apt run so the cache mount can survive across
+# unrelated source edits.
+# `sharing=locked` because two parallel builds writing to the same apt
+# state would race; the lock serialises them.
+# We intentionally do NOT `rm -rf /var/lib/apt/lists/*` here — apt's
+# package lists live in the cache mount, which is excluded from the
+# image automatically.
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    rm -f /etc/apt/apt.conf.d/docker-clean && \
+    apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    libpq-dev \
+    git
+
+# Pip cache mount: ~700 MB of CPU torch + dependency wheels. With the
+# mount, a re-run only re-extracts site-packages; without it, a 37 s
+# fresh download every rebuild.
+# `pip install` (no `--no-cache-dir`) populates ~/.cache/pip which is
+# the mount target.
+RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+    pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+COPY requirements.txt .
+RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+    pip install -r requirements.txt
+
+# =============================================================================
+# Runtime image
+# =============================================================================
+FROM python:3.11-slim
+
+LABEL maintainer="SRW Team"
+LABEL description="Universal Agent (Tilt dev image)"
+
+RUN groupadd -r srw && useradd -r -g srw -m srw
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/app \
+    AGENT_CONFIG=defaults \
+    AGENT_PORT=8001 \
+    PLAYWRIGHT_BROWSERS_PATH=/opt/playwright
+
+WORKDIR /app
+
+# NodeSource bootstrap — kept in its own layer because the curl|bash
+# pattern is non-cacheable in interesting ways and we want the failure
+# blast radius small.
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    rm -f /etc/apt/apt.conf.d/docker-clean && \
+    apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
+    && curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+
+# Big runtime package set. With the cache mount, the rebuild path is
+# "apt resolves dependency graph + installs from cache" — fast (~30 s on
+# our box). Without the mount it's a fresh ~2 min download.
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends \
+    libpq5 \
+    curl \
+    git \
+    poppler-utils \
+    ffmpeg \
+    ripgrep \
+    jq \
+    nodejs \
+    build-essential \
+    cmake \
+    python3-dev \
+    libffi-dev \
+    vim-tiny \
+    less \
+    tree \
+    htop \
+    procps \
+    net-tools \
+    iproute2 \
+    dnsutils \
+    openssh-client \
+    zip \
+    unzip \
+    tmux
+
+COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
+
+# Playwright install. We mount /opt/playwright as a cache so the ~300 MB
+# Chromium + ~30 MB ffmpeg + ~250 MB headless-shell downloads survive
+# layer invalidation. The browsers themselves are then copied out of the
+# cache mount into the image at the end of this RUN — without the copy
+# they'd vanish with the mount when the layer commits.
+RUN --mount=type=cache,target=/var/playwright-cache,sharing=locked \
+    --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    PLAYWRIGHT_BROWSERS_PATH=/var/playwright-cache \
+    playwright install --with-deps chromium && \
+    mkdir -p /opt/playwright && \
+    cp -an /var/playwright-cache/. /opt/playwright/
+
+# Source code LAST — these three COPYs are what Tilt's docker_build
+# `only=` list pins to.
+COPY --chown=srw:srw src/ ./src/
+COPY --chown=srw:srw config/ ./config/
+COPY --chown=srw:srw agent.py ./
+
+RUN touch /app/pyproject.toml && chown srw:srw /app/pyproject.toml
+
+RUN mkdir -p /app/workspace /app/logs && \
+    chown -R srw:srw /app/workspace /app/logs
+
+RUN mkdir -p /home/srw/.local/bin /home/srw/.local/lib/python3.11/site-packages \
+             /home/srw/.npm-global /home/srw/.cache \
+    && chown -R srw:srw /home/srw
+
+ENV PIP_TARGET=/home/srw/.local/lib/python3.11/site-packages \
+    PATH="/home/srw/.local/bin:/home/srw/.npm-global/bin:${PATH}" \
+    npm_config_prefix=/home/srw/.npm-global
+
+USER srw
+
+EXPOSE 8001
+EXPOSE 8002
+
+CMD ["sh", "-c", "python agent.py --config ${AGENT_CONFIG} --port ${AGENT_PORT} --host 0.0.0.0"]

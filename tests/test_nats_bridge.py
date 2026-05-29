@@ -86,8 +86,14 @@ def mock_db():
 
 
 @pytest.fixture
-def bridge(mock_nats_module, mock_nc):
-    """Create a NatsBridge instance with a connected mock NATS client."""
+def bridge(mock_nats_module, mock_nc, monkeypatch):
+    """Create a NatsBridge instance with a connected mock NATS client.
+
+    Sets ORCHESTRATOR_ID=srw-test so all vm.lifecycle.* subjects are scoped
+    (matching how the bridge runs in production). Tests for the unset-id
+    refusal path use the dedicated `unscoped_bridge` fixture below.
+    """
+    monkeypatch.setenv("ORCHESTRATOR_ID", "srw-test")
     from orchestrator.services.nats_bridge import NatsBridge
 
     b = NatsBridge(url="nats://test:4222")
@@ -104,12 +110,30 @@ def bridge_with_db(bridge, mock_db):
 
 
 @pytest.fixture
-def disconnected_bridge(mock_nats_module):
+def disconnected_bridge(mock_nats_module, monkeypatch):
     """Create a NatsBridge that is not connected (available=False)."""
+    monkeypatch.setenv("ORCHESTRATOR_ID", "srw-test")
     from orchestrator.services.nats_bridge import NatsBridge
 
     b = NatsBridge(url="nats://test:4222")
     b._available = False
+    return b
+
+
+@pytest.fixture
+def unscoped_bridge(mock_nats_module, mock_nc, monkeypatch):
+    """A connected NatsBridge with ORCHESTRATOR_ID explicitly unset.
+
+    Exercises the failsafe path: publish/subscribe to vm.lifecycle.* MUST
+    refuse rather than fall back to flat subjects (which would cross-talk
+    on a shared NATS hub).
+    """
+    monkeypatch.delenv("ORCHESTRATOR_ID", raising=False)
+    from orchestrator.services.nats_bridge import NatsBridge
+
+    b = NatsBridge(url="nats://test:4222")
+    b._nc = mock_nc
+    b._available = True
     return b
 
 
@@ -177,13 +201,14 @@ class TestConnect:
     """Tests for NatsBridge.connect()."""
 
     @pytest.mark.asyncio
-    async def test_connect_success(self, mock_nats_module, mock_db):
+    async def test_connect_success(self, mock_nats_module, mock_db, monkeypatch):
         from orchestrator.services.nats_bridge import NatsBridge
 
         mock_nc = AsyncMock()
         mock_nc.subscribe = AsyncMock()
         mock_nats_module.connect = AsyncMock(return_value=mock_nc)
 
+        monkeypatch.setenv("ORCHESTRATOR_ID", "srw-test")
         bridge = NatsBridge(url="nats://test:4222")
 
         mock_sudo_gate = MagicMock()
@@ -198,16 +223,27 @@ class TestConnect:
         assert bridge._nc is mock_nc
         assert bridge._db is mock_db
 
-        # Verify subscriptions were created (4 VM lifecycle + 1 sudo)
-        assert mock_nc.subscribe.call_count == 5
+        # Verify subscriptions were created (4 VM lifecycle + 1 sudo + 1 session.events)
+        assert mock_nc.subscribe.call_count == 6
 
-        # Check subscription subjects
+        # All broadcast subjects are per-orchestrator scoped.
         subjects = [call.args[0] for call in mock_nc.subscribe.call_args_list]
-        assert "vm.lifecycle.status" in subjects
-        assert "agent.vm.*.register" in subjects
-        assert "agent.vm.*.heartbeat" in subjects
-        assert "agent.vm.*.status" in subjects
-        assert "sudo.request.>" in subjects
+        assert "vm.lifecycle.status.srw-test" in subjects
+        assert "agent.vm.srw-test.*.register" in subjects
+        assert "agent.vm.srw-test.*.heartbeat" in subjects
+        assert "agent.vm.srw-test.*.status" in subjects
+        assert "sudo.request.srw-test.>" in subjects
+        assert "session.events.srw-test.>" in subjects
+        # Regression: legacy flat subjects must not appear
+        for flat in (
+            "vm.lifecycle.status",
+            "agent.vm.*.register",
+            "agent.vm.*.heartbeat",
+            "agent.vm.*.status",
+            "sudo.request.>",
+            "session.events.>",
+        ):
+            assert flat not in subjects
 
     @pytest.mark.asyncio
     async def test_connect_stores_on_vm_ready_callback(self, mock_nats_module, mock_db):
@@ -359,7 +395,7 @@ class TestRequestVmCreate:
         mock_nc.publish.assert_awaited_once()
 
         call_args = mock_nc.publish.call_args
-        assert call_args.args[0] == "vm.lifecycle.create"
+        assert call_args.args[0] == "vm.lifecycle.create.srw-test"
 
         payload = json.loads(call_args.args[1].decode())
         assert payload["job_id"] == "test-job-123"
@@ -368,6 +404,7 @@ class TestRequestVmCreate:
         assert payload["memory"] == "8Gi"
         assert payload["nats_url"] == "nats://test:4222"
         assert payload["description"] == "Test job description"
+        assert payload["orchestrator_id"] == "srw-test"
         assert "vm_image" not in payload  # Not provided, should be absent
 
     @pytest.mark.asyncio
@@ -449,10 +486,10 @@ class TestRequestVmDelete:
         mock_nc.publish.assert_awaited_once()
 
         call_args = mock_nc.publish.call_args
-        assert call_args.args[0] == "vm.lifecycle.delete"
+        assert call_args.args[0] == "vm.lifecycle.delete.srw-test"
 
         payload = json.loads(call_args.args[1].decode())
-        assert payload == {"job_id": "test-job-456"}
+        assert payload == {"job_id": "test-job-456", "orchestrator_id": "srw-test"}
 
     @pytest.mark.asyncio
     async def test_delete_updates_vm_context(self, bridge_with_db, mock_db):
@@ -501,9 +538,9 @@ class TestQueryVmStatus:
         mock_nc.request.assert_awaited_once()
 
         call_args = mock_nc.request.call_args
-        assert call_args.args[0] == "vm.lifecycle.get"
+        assert call_args.args[0] == "vm.lifecycle.get.srw-test"
         payload = json.loads(call_args.args[1].decode())
-        assert payload == {"job_id": "test-job-789"}
+        assert payload == {"job_id": "test-job-789", "orchestrator_id": "srw-test"}
         assert call_args.kwargs["timeout"] == 5.0
 
     @pytest.mark.asyncio
@@ -552,9 +589,9 @@ class TestSendControl:
         mock_nc.publish.assert_awaited_once()
 
         call_args = mock_nc.publish.call_args
-        assert call_args.args[0] == "agent.vm.test-job-123.control"
+        assert call_args.args[0] == "agent.vm.srw-test.test-job-123.control"
         payload = json.loads(call_args.args[1].decode())
-        assert payload == {"action": "freeze"}
+        assert payload == {"action": "freeze", "orchestrator_id": "srw-test"}
 
     @pytest.mark.asyncio
     async def test_send_resume(self, bridge, mock_nc):
@@ -562,7 +599,7 @@ class TestSendControl:
 
         assert result is True
         payload = json.loads(mock_nc.publish.call_args.args[1].decode())
-        assert payload == {"action": "resume"}
+        assert payload == {"action": "resume", "orchestrator_id": "srw-test"}
 
     @pytest.mark.asyncio
     async def test_send_terminate(self, bridge, mock_nc):
@@ -570,14 +607,20 @@ class TestSendControl:
 
         assert result is True
         payload = json.loads(mock_nc.publish.call_args.args[1].decode())
-        assert payload == {"action": "terminate"}
+        assert payload == {"action": "terminate", "orchestrator_id": "srw-test"}
 
     @pytest.mark.asyncio
     async def test_send_control_subject_format(self, bridge, mock_nc):
-        """Verify the subject includes the job_id."""
+        """Verify the scoped subject embeds orchestrator_id and job_id."""
         await bridge.send_control("abc-def-ghi", "freeze")
         subject = mock_nc.publish.call_args.args[0]
-        assert subject == "agent.vm.abc-def-ghi.control"
+        assert subject == "agent.vm.srw-test.abc-def-ghi.control"
+
+    @pytest.mark.asyncio
+    async def test_send_control_refused_when_id_unset(self, unscoped_bridge, mock_nc):
+        result = await unscoped_bridge.send_control("test-job-123", "freeze")
+        assert result is False
+        mock_nc.publish.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_send_control_returns_false_when_unavailable(
@@ -1422,3 +1465,125 @@ class TestEdgeCases:
         ide_updates = ide_call.args[1]
         assert ide_updates["status"] == "idle"
         assert ide_updates["code_server_connections"] == -1
+
+
+# =============================================================================
+# Test: per-orchestrator subject scoping (vm.lifecycle.*)
+# =============================================================================
+
+
+class TestSubjectScoping:
+    """ORCHESTRATOR_ID env var scopes vm.lifecycle.* subjects so multiple
+    orchestrators can safely share a NATS hub.
+
+    Failsafe behavior: if NATS_URL is set but ORCHESTRATOR_ID is unset, the
+    bridge refuses to publish/subscribe rather than fall back to flat
+    subjects (which would re-introduce cross-talk).
+    """
+
+    def test_init_reads_orchestrator_id(self, mock_nats_module, monkeypatch):
+        from orchestrator.services.nats_bridge import NatsBridge
+
+        monkeypatch.setenv("ORCHESTRATOR_ID", "srw-dev")
+        b = NatsBridge(url="nats://test:4222")
+        assert b._orchestrator_id == "srw-dev"
+
+    def test_init_orchestrator_id_blank_when_unset(self, mock_nats_module, monkeypatch):
+        from orchestrator.services.nats_bridge import NatsBridge
+
+        monkeypatch.delenv("ORCHESTRATOR_ID", raising=False)
+        b = NatsBridge(url="nats://test:4222")
+        assert b._orchestrator_id == ""
+
+    def test_init_orchestrator_id_stripped(self, mock_nats_module, monkeypatch):
+        from orchestrator.services.nats_bridge import NatsBridge
+
+        monkeypatch.setenv("ORCHESTRATOR_ID", "  srw-dev  \n")
+        b = NatsBridge(url="nats://test:4222")
+        assert b._orchestrator_id == "srw-dev"
+
+    def test_subj_returns_scoped_subject(self, bridge):
+        assert bridge._subj("vm.lifecycle.create") == "vm.lifecycle.create.srw-test"
+        assert bridge._subj("vm.lifecycle.status") == "vm.lifecycle.status.srw-test"
+
+    def test_subj_returns_none_when_id_unset(self, unscoped_bridge):
+        assert unscoped_bridge._subj("vm.lifecycle.create") is None
+
+    @pytest.mark.asyncio
+    async def test_create_refused_when_id_unset(self, unscoped_bridge, mock_nc):
+        result = await unscoped_bridge.request_vm_create(job_id="job-x")
+        assert result is False
+        mock_nc.publish.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_delete_refused_when_id_unset(self, unscoped_bridge, mock_nc):
+        result = await unscoped_bridge.request_vm_delete(job_id="job-x")
+        assert result is False
+        mock_nc.publish.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_query_refused_when_id_unset(self, unscoped_bridge, mock_nc):
+        result = await unscoped_bridge.query_vm_status("job-x")
+        assert result is None
+        mock_nc.request.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_connect_skips_all_subscribes_when_id_unset(
+        self, mock_nats_module, mock_db, monkeypatch
+    ):
+        """When ORCHESTRATOR_ID is unset, ALL broadcast subscribes are
+        skipped — the bridge refuses to fall back to flat subjects which
+        would cross-talk on a shared NATS hub."""
+        from orchestrator.services.nats_bridge import NatsBridge
+
+        mock_nc = AsyncMock()
+        mock_nc.subscribe = AsyncMock()
+        mock_nats_module.connect = AsyncMock(return_value=mock_nc)
+
+        monkeypatch.delenv("ORCHESTRATOR_ID", raising=False)
+        b = NatsBridge(url="nats://test:4222")
+
+        mock_sudo_module = MagicMock()
+        with patch.dict(
+            "sys.modules", {"orchestrator.services.sudo_gate": mock_sudo_module}
+        ):
+            await b.connect(db=mock_db)
+
+        # No subscribes at all — neither scoped nor flat.
+        mock_nc.subscribe.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_create_does_not_publish_to_flat_subject(self, bridge, mock_nc):
+        await bridge.request_vm_create(job_id="job-regression")
+        subject = mock_nc.publish.call_args.args[0]
+        assert subject == "vm.lifecycle.create.srw-test"
+        assert subject != "vm.lifecycle.create"
+
+    @pytest.mark.asyncio
+    async def test_delete_does_not_publish_to_flat_subject(self, bridge, mock_nc):
+        await bridge.request_vm_delete(job_id="job-regression")
+        subject = mock_nc.publish.call_args.args[0]
+        assert subject != "vm.lifecycle.delete"
+
+    @pytest.mark.asyncio
+    async def test_query_does_not_request_flat_subject(self, bridge, mock_nc):
+        mock_nc.request = AsyncMock(
+            return_value=MagicMock(data=json.dumps({"status": "x"}).encode())
+        )
+        await bridge.query_vm_status("job-regression")
+        subject = mock_nc.request.call_args.args[0]
+        assert subject != "vm.lifecycle.get"
+
+    def test_compose_dev_path_silent_when_both_unset(
+        self, mock_nats_module, monkeypatch
+    ):
+        """Compose dev with no NATS_URL and no ORCHESTRATOR_ID is a silent
+        no-op, same as before this change (graceful degradation preserved)."""
+        from orchestrator.services.nats_bridge import NatsBridge
+
+        monkeypatch.delenv("NATS_URL", raising=False)
+        monkeypatch.delenv("ORCHESTRATOR_ID", raising=False)
+        b = NatsBridge()
+        assert b._url is None
+        assert b._orchestrator_id == ""
+        assert b.is_available is False

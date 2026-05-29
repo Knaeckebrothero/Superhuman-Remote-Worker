@@ -17,6 +17,7 @@ from orchestrator.services.lifecycle import (
     WorkspaceInstanceManager,
     expected_workspace_shas,
 )
+from services.workspace_lifecycle import WorkspaceOwner
 
 
 # =============================================================================
@@ -49,7 +50,6 @@ def _make_manager(
     pod_list.items = pods or []
     container._core_api.list_namespaced_pod.return_value = pod_list
     container.delete_workspace = AsyncMock(return_value=True)
-    container.delete_thread_workspace = AsyncMock(return_value=True)
 
     suspension = MagicMock()
     suspension.is_enabled = suspension_enabled
@@ -162,8 +162,10 @@ class TestListInstances:
 
     @pytest.mark.asyncio
     async def test_thread_workspace_uses_thread_table(self):
-        # Thread workspaces carry both job-id (slot reuse) and thread-id;
-        # the manager must hit the threads table, not the jobs table.
+        # Legacy pre-migration pods carried BOTH srw/job-id and srw/thread-id
+        # (the old job-id-slot-reuse hack). New pods carry only srw/thread-id,
+        # but during a rolling deploy old dual-label pods still exist — the
+        # manager must route them to the threads table (via srw/thread-id).
         pod = _make_pod(
             "ws-thread-xyz",
             labels={
@@ -365,11 +367,10 @@ class TestDrain:
             metadata={"labels": {"srw/job-id": "job1"}},
         )
         await mgr.drain(inst, grace_s=10)
-        container.delete_workspace.assert_awaited_once_with("job1")
-        container.delete_thread_workspace.assert_not_called()
+        container.delete_workspace.assert_awaited_once_with(WorkspaceOwner.job("job1"))
 
     @pytest.mark.asyncio
-    async def test_thread_drain_calls_thread_delete(self):
+    async def test_thread_drain_calls_delete_workspace_with_session_owner(self):
         mgr, container, *_ = _make_manager()
         inst = Instance(
             kind="workspace",
@@ -378,8 +379,9 @@ class TestDrain:
             metadata={"labels": {"srw/thread-id": "t1"}},
         )
         await mgr.drain(inst, grace_s=10)
-        container.delete_thread_workspace.assert_awaited_once_with("t1")
-        container.delete_workspace.assert_not_called()
+        container.delete_workspace.assert_awaited_once_with(
+            WorkspaceOwner.session("t1")
+        )
 
     @pytest.mark.asyncio
     async def test_drain_skipped_without_bound(self):
@@ -387,7 +389,6 @@ class TestDrain:
         inst = Instance(kind="workspace", id="x", bound_to=None, metadata={})
         await mgr.drain(inst, grace_s=10)
         container.delete_workspace.assert_not_called()
-        container.delete_thread_workspace.assert_not_called()
 
 
 class TestDeleteNoopWhenK8sUnavailable:

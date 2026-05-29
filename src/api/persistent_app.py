@@ -13,14 +13,17 @@ import logging
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, NoReturn, Optional
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
+from ._session_auth import validate_session_token as _validate_session_token
 from .orchestrator_client import OrchestratorClient, create_orchestrator_client_from_env
 from .persistent_session import PersistentSession
 from ..tools.registry import TOOL_REGISTRY
+from ..core.archiver import inflight_tool_call
+from ..core.context import extract_summary_text
 from ..agent import UniversalAgent
 from ..llm.reasoning_chat import extract_reasoning_text_from_block
 from ..persistent_graph import (
@@ -106,6 +109,13 @@ _loop_user_queue: Optional[asyncio.Queue] = None
 # sites (pre-LLM, mid-astream, between tool calls). Legacy WS interrupt
 # path uses the same flag — sets "hard" when no tool is inflight.
 _loop_interrupt_flag: Optional[str] = None
+# Hard-interrupt signal (phase 3). Set alongside _loop_interrupt_flag="hard"
+# so the loop can tear down a blocked LLM / auxiliary await (e.g. a hung
+# summarization read) immediately, instead of waiting for the cooperative
+# check_interrupt poll — which can't fire while the turn is parked in a
+# network read. Created in _attach_session, set in the interrupt handlers
+# when no tool is in flight, cleared whenever the flag is consumed.
+_hard_interrupt_event: Optional[asyncio.Event] = None
 _loop_last_user_content: List[str] = [""]
 
 # True while a tool call is mid-`ainvoke`. Read by POST /api/interrupt to
@@ -118,6 +128,96 @@ _tool_inflight: bool = False
 # in _attach_session with epoch bump on cold restart; cleared on terminate.
 _events_epoch: int = 0
 _next_seq: int = 0
+
+# ---------------------------------------------------------------------------
+# NATS notification publishing (Direct Session WebSockets, Task 9)
+# ---------------------------------------------------------------------------
+# The agent pod mirrors notification-worthy _broadcast events onto NATS subject
+# ``session.events.{tid}`` so the orchestrator's nats_bridge (Task 5) can
+# re-broadcast them onto the SSE notification feed. Replaces the orchestrator's
+# old per-WS-frame inspection. Non-fatal: if NATS is unconfigured or down,
+# WS subscribers still get the event — only the SSE notification mirror is lost.
+import json as _json  # noqa: E402
+import os as _os  # noqa: E402
+
+_nats_client = None  # Lazily initialized.
+
+# Methods that the orchestrator's nats_bridge subscribes to and forwards
+# to the SSE notification feed. Keep in sync with the event_type_map in
+# orchestrator/services/nats_bridge.py:_on_session_event.
+_NOTIFICATION_METHODS = frozenset(
+    {
+        "permission.request",
+        "vm_upgrade.needed",
+        "approve",
+        "deny",
+        "ready",
+    }
+)
+
+
+class WorkspaceNotReady(RuntimeError):
+    """The session's workspace container never became ready in time.
+
+    Subclasses RuntimeError so existing ``except RuntimeError`` handlers (e.g.
+    the pool-mode /session/attach path) keep catching it, while the lifespan
+    startup can catch it specifically to exit cleanly instead of crash-looping.
+    """
+
+
+async def _ensure_nats_client():
+    """Lazy NATS connection. Returns None if NATS is unconfigured."""
+    global _nats_client
+    if _nats_client is not None:
+        return _nats_client
+    url = _os.environ.get("NATS_URL")
+    if not url:
+        return None
+    try:
+        import nats
+
+        _nats_client = await nats.connect(url)
+        return _nats_client
+    except Exception as e:
+        logger.warning("agent pod: NATS connect failed: %s", e)
+        return None
+
+
+async def emit_session_event(method: str, params: dict) -> None:
+    """Publish a notification event to ``session.events.{oid}.{tid}`` on NATS.
+
+    Mirrors what _broadcast does to WS subscribers but for the
+    orchestrator's bridge. Methods not in _NOTIFICATION_METHODS are
+    skipped. Failures are non-fatal: if NATS is down, the WS subscribers
+    still get the event. If NATS is configured but ORCHESTRATOR_ID is
+    unset the publish is refused (the bridge subscribes to scoped subjects
+    and won't see flat ones — better to log a warning than silently no-op).
+    """
+    if method not in _NOTIFICATION_METHODS:
+        return
+    tid = _os.environ.get("SESSION_BOUND_THREAD_ID", "")
+    if not tid:
+        return
+    nc = await _ensure_nats_client()
+    if not nc:
+        return
+    oid = (_os.environ.get("ORCHESTRATOR_ID") or "").strip()
+    if not oid:
+        logger.warning(
+            "agent pod: ORCHESTRATOR_ID unset — refusing session.events publish "
+            "(would publish to a subject the orchestrator does not subscribe to)"
+        )
+        return
+    payload = {
+        "thread_id": tid,
+        "method": method,
+        "params": params,
+        "orchestrator_id": oid,
+    }
+    try:
+        await nc.publish(f"session.events.{oid}.{tid}", _json.dumps(payload).encode())
+    except Exception as e:
+        logger.warning("agent pod: NATS publish failed: %s", e)
 
 
 def _session_ready() -> bool:
@@ -320,6 +420,33 @@ def _get_agent_metrics() -> Optional[Dict[str, Any]]:
         return None
 
 
+async def _exit_workspace_not_ready(thread_id: str, exc: WorkspaceNotReady) -> NoReturn:
+    """Handle WorkspaceNotReady during lifespan startup: best-effort deregister then exit.
+
+    Exits the process with status 0 (pod Completed, not Failed) so Kubernetes
+    does not restart-loop the pod.  The orchestrator's session reconciler will
+    recover the workspace and bind a fresh agent on the next interaction.
+    """
+    logger.info(
+        "Workspace not ready for thread %s (%s) — exiting cleanly so the "
+        "orchestrator can rebind once the workspace recovers (not a crash).",
+        thread_id,
+        exc,
+    )
+    if _orchestrator_client:
+        try:
+            _orchestrator_client.stop_heartbeat()
+            if _heartbeat_task:
+                _heartbeat_task.cancel()
+            await _orchestrator_client.deregister()
+            await _orchestrator_client.close()
+        except Exception as de:
+            logger.warning(
+                "Best-effort deregister on workspace-not-ready failed: %s", de
+            )
+    os._exit(0)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize persistent agent, register with orchestrator, start heartbeat."""
@@ -344,6 +471,7 @@ async def lifespan(app: FastAPI):
 
     # 2. Connect to orchestrator
     orchestrator_url = os.getenv("ORCHESTRATOR_URL", "http://localhost:8085")
+    dedicated_register_ok = True
     if orchestrator_url:
         try:
             _orchestrator_client = create_orchestrator_client_from_env(
@@ -379,10 +507,21 @@ async def lifespan(app: FastAPI):
 
                     _thread_id = str(uuid.uuid4())
 
-                await _orchestrator_client.register(
+                # The orchestrator now refuses duplicate persistent registrations
+                # (409 — see docs/issues/persistent_thread_double_provisioning_race.md).
+                # On refusal, skip the session attach below so the orphan pod
+                # doesn't compete with the legitimate owner for this thread.
+                dedicated_register_ok = await _orchestrator_client.register(
                     agent_mode="persistent",
                     thread_id=_thread_id,
                 )
+                if not dedicated_register_ok:
+                    logger.error(
+                        "Orchestrator refused persistent registration for "
+                        "thread %s — pod will stay up but will NOT attach a "
+                        "session (likely a duplicate-provision race).",
+                        _thread_id,
+                    )
 
             # Start heartbeat
             def _heartbeat_status():
@@ -403,15 +542,28 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("No ORCHESTRATOR_URL — running standalone")
 
-    # If we have a thread_id (dedicated mode), set up the session immediately
-    if _thread_id:
+    # If we have a thread_id (dedicated mode) and registration succeeded, set
+    # up the session immediately. If register was refused (409), skip the
+    # attach — the legitimate owner already holds this thread.
+    if _thread_id and dedicated_register_ok:
         # Fallback: generate UUID if still None (standalone mode)
         if _thread_id is None:
             import uuid
 
             _thread_id = str(uuid.uuid4())
 
-        await _attach_session(_thread_id)
+        try:
+            await _attach_session(_thread_id)
+        except WorkspaceNotReady as e:
+            # Workspace raced us / is wedged: exit cleanly (status 0) instead of
+            # crashing, so K8s doesn't restart-loop. See _exit_workspace_not_ready.
+            await _exit_workspace_not_ready(_thread_id, e)
+    elif _thread_id and not dedicated_register_ok:
+        logger.info(
+            "Skipping session attach for thread %s — orchestrator refused "
+            "registration.",
+            _thread_id,
+        )
     else:
         logger.info(
             "Pool mode: waiting for session assignment via POST /session/attach"
@@ -551,7 +703,7 @@ async def _attach_session(
                 f"Workspace container ready: {workspace_override['remote']['host']}"
             )
         else:
-            raise RuntimeError(
+            raise WorkspaceNotReady(
                 "No workspace container provisioned for thread. "
                 "Cannot attach session without an isolated workspace."
             )
@@ -1013,8 +1165,10 @@ async def _attach_session(
     # the loop can keep reading input / responding to interrupts across
     # transport churn. Cleared in _terminate_session.
     global _loop_user_queue, _loop_interrupt_flag, _loop_last_user_content
+    global _hard_interrupt_event
     _loop_user_queue = asyncio.Queue()
     _loop_interrupt_flag = None
+    _hard_interrupt_event = asyncio.Event()
     _loop_last_user_content = [""]
 
     # Phase 2 event-log cursor init. The current epoch lives on the threads
@@ -1102,6 +1256,7 @@ async def _terminate_session(reason: str) -> None:
     """
     global _session, _thread_id, _sessions_served, _loop_task
     global _loop_user_queue, _loop_interrupt_flag, _loop_last_user_content
+    global _hard_interrupt_event
     global _events_epoch, _next_seq, _tool_inflight
 
     if not _session:
@@ -1170,6 +1325,7 @@ async def _terminate_session(reason: str) -> None:
     # ensures stale entries don't accumulate across sessions.
     _loop_user_queue = None
     _loop_interrupt_flag = None
+    _hard_interrupt_event = None
     _loop_last_user_content = [""]
     _subscribers.clear()
 
@@ -1359,6 +1515,19 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
 
     @app.websocket("/ws/chat")
     async def ws_chat(ws: WebSocket):
+        # Validate the session JWT carried as ?t={token}.
+        if not await _validate_session_token(ws):
+            return
+        await handle_persistent_websocket(ws)
+
+    # External path the per-session Ingress routes to (the cockpit dials
+    # wss://api.<domain>/p/<thread_id>/ws?t=<jwt>). The {thread_id} path param
+    # is unused — the bound thread is enforced by _validate_session_token
+    # against SESSION_BOUND_THREAD_ID + the JWT's tid claim.
+    @app.websocket("/p/{thread_id}/ws")
+    async def ws_session(ws: WebSocket, thread_id: str):
+        if not await _validate_session_token(ws):
+            return
         await handle_persistent_websocket(ws)
 
     return app
@@ -1409,6 +1578,11 @@ async def handle_api_interrupt() -> JSONResponse:
         return JSONResponse({"error": "Session not active"}, status_code=503)
     mode = "graceful" if _tool_inflight else "hard"
     _loop_interrupt_flag = mode
+    # Hard interrupt with no tool in flight ⇒ the loop is parked in an LLM /
+    # auxiliary await; signal it to cancel that await immediately rather than
+    # waiting for the next cooperative check_interrupt poll.
+    if mode == "hard" and _hard_interrupt_event is not None:
+        _hard_interrupt_event.set()
     logger.info(
         "Interrupt received via REST (mode=%s, tool_inflight=%s)",
         mode,
@@ -1519,6 +1693,20 @@ async def handle_persistent_websocket(ws: WebSocket) -> None:
 
     # Send current session state so this client can sync. Direct send —
     # this is the welcome frame, only the connecting client cares.
+    #
+    # running_tool: if the loop is blocked in a tool call right now, tell this
+    # (re)attaching client which command is running so it can render a "running
+    # command" card instead of a blank "Connecting…". The in-flight AIMessage +
+    # tool_call lives only in memory (not persisted until the turn ends), so a
+    # cold reload mid-turn can't recover it from REST history — this welcome
+    # frame is the only channel for it.
+    running_tool = inflight_tool_call(_session.messages) if _tool_inflight else None
+    if running_tool is not None:
+        running_tool = {
+            "id": running_tool["id"],
+            "tool": running_tool["tool"],
+            "args": _safe_serialize(running_tool["args"]),
+        }
     await _ws_send(
         ws,
         "session.state",
@@ -1530,6 +1718,7 @@ async def handle_persistent_websocket(ws: WebSocket) -> None:
             "message_count": len(_session.messages),
             "model": _session.config.llm.model,
             "temperature": _session.config.llm.temperature,
+            "running_tool": running_tool,
         },
     )
 
@@ -1550,6 +1739,8 @@ async def handle_persistent_websocket(ws: WebSocket) -> None:
             on_error=_loop_on_error,
             check_interrupt=_loop_check_interrupt,
             on_vm_upgrade_needed=_loop_on_vm_upgrade_needed,
+            on_context_compacted=_loop_on_context_compacted,
+            hard_interrupt_event=_hard_interrupt_event,
         )
         _loop_task = asyncio.create_task(
             run_persistent_loop(
@@ -1638,6 +1829,8 @@ async def handle_persistent_websocket(ws: WebSocket) -> None:
                 # partial AIMessage). See persistent_graph check sites.
                 mode = "graceful" if _tool_inflight else "hard"
                 _loop_interrupt_flag = mode
+                if mode == "hard" and _hard_interrupt_event is not None:
+                    _hard_interrupt_event.set()
                 await _ws_send(ws, "interrupt.ack", {"mode": mode})
                 logger.info("Interrupt acknowledged (mode=%s)", mode)
 
@@ -1850,6 +2043,12 @@ def _broadcast(method: str, params: Dict[str, Any]) -> None:
                     method,
                 )
 
+    # Mirror notification-worthy events to NATS so the orchestrator's
+    # bridge can fan them out to the SSE notification feed. Non-blocking,
+    # non-fatal on failure.
+    if method in _NOTIFICATION_METHODS:
+        asyncio.create_task(emit_session_event(method, params))
+
     # Fire-and-forget DB write. Doesn't block the broadcast — if persistence
     # fails the live subscribers still received the frame; only the SSE
     # replay path loses a row.
@@ -2020,6 +2219,11 @@ def _loop_check_interrupt() -> Optional[str]:
     mode = _loop_interrupt_flag
     if mode is not None:
         _loop_interrupt_flag = None
+        # Keep the hard-interrupt event in lock-step with the flag: consuming
+        # the interrupt (here, or via the streaming/compaction race below)
+        # resets the signal so it doesn't leak into the next turn.
+        if _hard_interrupt_event is not None:
+            _hard_interrupt_event.clear()
         return mode
     return None
 
@@ -2489,6 +2693,84 @@ async def _loop_on_vm_upgrade_needed(freeze_data: Dict[str, Any]) -> None:
     )
 
 
+async def _record_compaction(
+    summary_text: Optional[str],
+    before: int,
+    after: int,
+    trigger: str,
+    ws: Optional[WebSocket] = None,
+) -> None:
+    """Notify the client of a context compaction and persist a restorable
+    checkpoint row.
+
+    The ``role='summary'`` row drives two things: (1) the "Context summarized"
+    banner survives reload, and (2) it's a restore checkpoint — resume reads
+    ``metrics.boundary_turn`` and loads ``[summary] + history(since_turn=B)``
+    instead of the full pre-compaction history (see
+    ``_restore_session_messages``). The agent's history query excludes
+    ``role='summary'`` (``src/database/postgres_db.py``) so the row never
+    re-enters the LLM context.
+
+    Boundary semantics: ``boundary_turn = turn_count - 1`` is the last
+    *fully-saved* turn. At auto-compaction (mid-turn) the current turn's user
+    message is saved but its AI/tool messages save only at turn-complete; on
+    resume reloading ``turn_number > boundary_turn`` recaptures the whole
+    current turn once it's persisted — lossless, with at most minor in-turn
+    overlap that ``_repair_tool_pairing`` and re-bounding clean. The same rule
+    is safe for manual ``/compact`` and resume-time compaction (where all turns
+    are already fully saved).
+
+    A non-None ``ws`` sends the live event over the control socket (manual
+    ``/compact``); the auto and resume paths pass ``ws=None`` to use the
+    broadcast/SSE channel.
+    """
+    turn = _session.turn_count if _session else None
+    # Type-guard: defensive against an unexpected turn_count type so an
+    # arithmetic glitch never kills event emission. In production turn_count
+    # is always int (initialized to 0 in PersistentSession); the guard mainly
+    # protects test mocks where a bare MagicMock attribute slips through.
+    turn_int = turn if isinstance(turn, int) else 0
+    boundary_turn = max(turn_int - 1, 0)
+    params = {
+        "before": before,
+        "after": after,
+        "trigger": trigger,
+        "summary": summary_text,
+        "turn": turn,
+    }
+    try:
+        if ws is not None:
+            await _ws_send(ws, "context.compacted", params)
+        else:
+            _broadcast("context.compacted", params)
+    except Exception as e:
+        logger.debug(f"Failed to emit context.compacted (non-fatal): {e}")
+
+    if summary_text and _orchestrator_client and _thread_id:
+        try:
+            await _orchestrator_client.save_thread_message(
+                thread_id=_thread_id,
+                role="summary",
+                content=summary_text,
+                turn_number=turn,
+                metrics={
+                    "before": before,
+                    "after": after,
+                    "trigger": trigger,
+                    "boundary_turn": boundary_turn,
+                },
+            )
+        except Exception as e:
+            logger.warning(f"Failed to persist compaction marker (non-fatal): {e}")
+
+
+async def _loop_on_context_compacted(
+    summary_text: str, before: int, after: int
+) -> None:
+    """Auto-summarization fired inside the loop — persist + broadcast a banner."""
+    await _record_compaction(summary_text, before, after, trigger="auto", ws=None)
+
+
 async def _loop_completion_handler(loop_task: asyncio.Task) -> None:
     """Wait for the persistent loop to finish, then run reason-appropriate cleanup.
 
@@ -2531,88 +2813,282 @@ def _safe_serialize(obj: Any) -> Any:
         return str(obj)
 
 
+def _repair_tool_pairing(messages: list) -> list:
+    """Drop tool calls/results that lost their partner during reconstruction.
+
+    Both the OpenAI Responses API and Anthropic reject a history where an
+    assistant tool/function call has no matching result (or a result has no
+    matching call) — a 400 "No tool output found for function call ...". On
+    resume this can happen if a tool result was never persisted (an interrupted
+    turn) or, historically, if a fixed-size restore window sliced a parallel
+    tool-call batch. Keep only calls and results whose ids match on both sides;
+    assistant messages left with neither text nor calls are dropped.
+    """
+    from langchain_core.messages import AIMessage, ToolMessage
+
+    call_ids = {
+        tc.get("id")
+        for m in messages
+        if isinstance(m, AIMessage)
+        for tc in (getattr(m, "tool_calls", None) or [])
+        if tc.get("id")
+    }
+    result_ids = {
+        m.tool_call_id
+        for m in messages
+        if isinstance(m, ToolMessage) and getattr(m, "tool_call_id", "")
+    }
+    valid_ids = call_ids & result_ids
+
+    repaired: list = []
+    for m in messages:
+        if isinstance(m, AIMessage):
+            tool_calls = getattr(m, "tool_calls", None) or []
+            kept = [tc for tc in tool_calls if tc.get("id") in valid_ids]
+            if len(kept) != len(tool_calls):
+                m = AIMessage(content=m.content, tool_calls=kept, id=m.id)
+            if not kept and not m.content:
+                continue  # empty assistant turn carries no information
+            repaired.append(m)
+        elif isinstance(m, ToolMessage):
+            if getattr(m, "tool_call_id", "") in valid_ids:
+                repaired.append(m)
+            # else: orphaned result — drop
+        else:
+            repaired.append(m)
+    return repaired
+
+
+def _db_rows_to_lc_messages(db_messages: list) -> list:
+    """Convert ``thread_messages`` rows to LangChain messages with fresh UUIDs.
+
+    Shared by the restore paths (Path A checkpoint+tail, Path B full load).
+    Falls back to positional pairing of tool results for legacy rows whose
+    ``tool_call_id`` column is NULL (predates the column); current rows carry
+    it explicitly. Skips system rows — the loop adds a fresh system from the
+    current config. ``role='summary'`` rows are already excluded by the DB
+    query.
+    """
+    import uuid as _uuid
+    from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+
+    restored: list = []
+    pending_tool_call_ids: list[str] = []
+
+    for db_msg in db_messages:
+        role = db_msg["role"]
+        content = db_msg["content"] or ""
+        tool_calls = db_msg.get("tool_calls")
+
+        # Fresh UUID per restored message. Without an `id`,
+        # `RemoveMessage(id=...)` in compaction is a no-op — a resumed
+        # session that needs compaction could never shrink. The ID is a
+        # LangGraph state key, not user-facing or persisted.
+        msg_id = str(_uuid.uuid4())
+
+        if role in ("human", "user"):
+            restored.append(HumanMessage(content=content, id=msg_id))
+
+        elif role in ("ai", "assistant"):
+            lc_tool_calls = []
+            if tool_calls:
+                lc_tool_calls = [
+                    {
+                        "id": tc.get("id", ""),
+                        "name": tc.get("name", ""),
+                        "args": tc.get("args", {}),
+                    }
+                    for tc in tool_calls
+                ]
+            pending_tool_call_ids = [tc["id"] for tc in lc_tool_calls]
+            restored.append(
+                AIMessage(content=content, tool_calls=lc_tool_calls, id=msg_id)
+            )
+
+        elif role == "tool":
+            # Prefer the persisted tool_call_id; fall back to positional
+            # pairing for legacy rows that predate the column. Pop either
+            # way so the fallback queue stays aligned.
+            fallback_id = pending_tool_call_ids.pop(0) if pending_tool_call_ids else ""
+            tool_call_id = db_msg.get("tool_call_id") or fallback_id
+            restored.append(
+                ToolMessage(
+                    content=content,
+                    tool_call_id=tool_call_id,
+                    id=msg_id,
+                )
+            )
+
+        # Skip system rows — the loop adds a fresh one from current config
+
+    return restored
+
+
 async def _restore_session_messages() -> None:
     """Restore LangChain message history from DB into session.messages.
 
     Called during lifespan startup. On a fresh session this is a no-op.
     On pod restart or session resume, this restores the LLM's conversation
     context so it doesn't start with amnesia.
+
+    Two paths:
+
+    * **Path A — checkpoint resume:** if a ``role='summary'`` row exists with
+      a ``metrics.boundary_turn`` set, restore
+      ``[SystemMessage(summary)] + history(since_turn=boundary_turn)``. The
+      summary covers turns ≤ boundary_turn; the tail covers everything after.
+      This avoids re-loading the full pre-checkpoint history and
+      re-summarizing on every resume — the fix for the OOM observed on a
+      793-message / 395k-token thread.
+
+    * **Path B — full load (back-compat):** no checkpoint, or
+      ``boundary_turn`` missing (rows that predate this feature). Load the
+      full log and let ``ensure_within_limits`` bound it the same way a live
+      turn would. If that re-summarization actually compacts, persist a
+      fresh checkpoint via ``_record_compaction(trigger="resume")`` so
+      subsequent resumes hit Path A and the "Context summarized" banner
+      appears.
+
+    The raw conversation always stays in ``thread_messages`` for the user to
+    view (cockpit reads it via a separate orchestrator-side query); only the
+    in-memory LLM context is bounded.
     """
     if not _session or not _agent or not _agent.postgres_conn or not _thread_id:
         return
 
     try:
         import uuid as _uuid
-        from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+        from langchain_core.messages import SystemMessage
 
+        from ..llm.response_guards import strip_removal_markers
+
+        ctx_mgr = getattr(_session, "context_manager", None)
+        aux = getattr(_session, "auxiliary_llm", None)
+        max_summary_length = getattr(
+            _session.config.context_management, "max_summary_length", 10000
+        )
+
+        ckpt = await _agent.postgres_conn.get_latest_compaction_checkpoint(_thread_id)
+        boundary_turn = ckpt.get("boundary_turn") if ckpt else None
+
+        # ============================================================
+        # Path A — checkpoint resume
+        # ============================================================
+        if ckpt is not None and boundary_turn is not None:
+            db_messages = await _agent.postgres_conn.get_thread_messages_history(
+                thread_id=_thread_id,
+                limit=None,
+                since_turn=boundary_turn,
+            )
+
+            summary_msg = SystemMessage(
+                content=f"[Summary of prior work]\n{ckpt['summary']}",
+                id=str(_uuid.uuid4()),
+            )
+            restored: list = [summary_msg, *_db_rows_to_lc_messages(db_messages)]
+
+            # Defense-in-depth: drop any tool call/result orphaned by an
+            # interrupted persist (e.g. the prior pod died mid-turn before
+            # the tool result was saved). find_safe_slice_start already
+            # guaranteed the live cut never orphaned a pair.
+            restored = _repair_tool_pairing(restored)
+
+            if ctx_mgr and aux and restored:
+                try:
+                    bounded = await ctx_mgr.ensure_within_limits(
+                        restored,
+                        aux,
+                        max_summary_length=max_summary_length,
+                    )
+                    restored = strip_removal_markers(bounded)
+                except Exception as e:
+                    logger.warning(
+                        "Re-bound during checkpoint restore failed "
+                        f"(non-fatal, keeping uncompacted): {e}"
+                    )
+
+            if restored:
+                _session.messages.extend(restored)
+                tail_turn_max = max(
+                    (m.get("turn_number") or 0 for m in db_messages),
+                    default=boundary_turn,
+                )
+                _session.turn_count = max(tail_turn_max, boundary_turn)
+                logger.info(
+                    f"Restored from checkpoint at turn {boundary_turn} for "
+                    f"thread {_thread_id} ({len(restored)} msgs in context; "
+                    f"tail of {len(db_messages)} raw rows; "
+                    f"turn_count={_session.turn_count})"
+                )
+            return
+
+        # ============================================================
+        # Path B — full load (back-compat)
+        # ============================================================
         db_messages = await _agent.postgres_conn.get_thread_messages_history(
             thread_id=_thread_id,
-            limit=500,
+            limit=None,
         )
 
         if not db_messages:
             return
 
-        restored: list = []
-        # Track tool_call_ids from the last AIMessage for ToolMessage pairing
-        pending_tool_call_ids: list[str] = []
+        restored = _db_rows_to_lc_messages(db_messages)
 
-        for db_msg in db_messages:
-            role = db_msg["role"]
-            content = db_msg["content"] or ""
-            tool_calls = db_msg.get("tool_calls")
+        # Defense-in-depth: drop any call/result orphaned by an interrupted
+        # persist (full load already eliminates truncation orphans).
+        restored = _repair_tool_pairing(restored)
 
-            # Generate a fresh UUID per restored message. Without an `id`,
-            # `RemoveMessage(id=...)` in compaction is a no-op — meaning a
-            # resumed session that needs compaction can never shrink. The
-            # ID is a LangGraph state key, not user-facing or persisted.
-            msg_id = str(_uuid.uuid4())
-
-            if role in ("human", "user"):
-                restored.append(HumanMessage(content=content, id=msg_id))
-
-            elif role in ("ai", "assistant"):
-                lc_tool_calls = []
-                if tool_calls:
-                    lc_tool_calls = [
-                        {
-                            "id": tc.get("id", ""),
-                            "name": tc.get("name", ""),
-                            "args": tc.get("args", {}),
-                        }
-                        for tc in tool_calls
-                    ]
-                    pending_tool_call_ids = [tc["id"] for tc in lc_tool_calls]
-                else:
-                    pending_tool_call_ids = []
-                restored.append(
-                    AIMessage(content=content, tool_calls=lc_tool_calls, id=msg_id)
+        # Bound the working context the way a live turn does. Summarizes to
+        # (summary + recent) when over the token budget, else passes through.
+        # ensure_within_limits returns a LangGraph reducer delta; this loop
+        # has no reducer, so strip the RemoveMessage markers to materialize it.
+        pre_compact_len = len(restored)
+        if ctx_mgr and aux and restored:
+            try:
+                bounded = await ctx_mgr.ensure_within_limits(
+                    restored,
+                    aux,
+                    max_summary_length=max_summary_length,
                 )
-
-            elif role == "tool":
-                # Pair with the next pending tool_call_id from the last AIMessage
-                tool_call_id = (
-                    pending_tool_call_ids.pop(0) if pending_tool_call_ids else ""
+                restored = strip_removal_markers(bounded)
+            except Exception as e:
+                logger.warning(
+                    "Compaction during restore failed "
+                    f"(non-fatal, keeping full history): {e}"
                 )
-                restored.append(
-                    ToolMessage(
-                        content=content,
-                        tool_call_id=tool_call_id,
-                        id=msg_id,
-                    )
-                )
-
-            # Skip system messages — the loop adds a fresh one from current config
 
         if restored:
             _session.messages.extend(restored)
-            # Set turn_count from the last message's turn_number
+            # Set turn_count from the last stored message's turn_number
             last_turn = max((m.get("turn_number") or 0 for m in db_messages), default=0)
             _session.turn_count = last_turn
             logger.info(
                 f"Restored {len(restored)} messages for thread {_thread_id} "
-                f"(last turn: {last_turn})"
+                f"(from {len(db_messages)} stored; last turn: {last_turn})"
             )
+
+            # If a real compaction happened during resume, persist a
+            # checkpoint (writes a role='summary' row with boundary_turn)
+            # so subsequent resumes hit Path A and the banner appears.
+            # Path A itself does NOT re-write here — the existing row
+            # already drives the banner via the cockpit's history render
+            # (avoids the live/history banner double-render).
+            if len(restored) < pre_compact_len:
+                summary_text = extract_summary_text(restored)
+                if summary_text:
+                    try:
+                        await _record_compaction(
+                            summary_text,
+                            pre_compact_len,
+                            len(restored),
+                            trigger="resume",
+                            ws=None,
+                        )
+                    except Exception as e:
+                        logger.debug(
+                            f"Resume compaction checkpoint failed (non-fatal): {e}"
+                        )
 
     except Exception as e:
         logger.warning(f"Failed to restore session messages (non-fatal): {e}")
@@ -2782,14 +3258,9 @@ async def _handle_compact(ws: WebSocket, focus: str = "") -> None:
         )
         after_count = len(_session.messages)
 
-        await _ws_send(
-            ws,
-            "context.compacted",
-            {
-                "before": before_count,
-                "after": after_count,
-                "focus": focus,
-            },
+        summary_text = extract_summary_text(_session.messages)
+        await _record_compaction(
+            summary_text, before_count, after_count, trigger="manual", ws=ws
         )
         logger.info(f"Manual compaction: {before_count} → {after_count} messages")
 

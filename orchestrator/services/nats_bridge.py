@@ -9,16 +9,22 @@ installed, all operations gracefully return False/None and the system works
 identically without it (same pattern as MongoDB in database/mongodb.py).
 
 Subjects published:
-  vm.lifecycle.create          Request VM creation
-  vm.lifecycle.delete          Request VM teardown
-  vm.lifecycle.get             Request/reply for live VM status
-  agent.vm.{job_id}.control    Freeze/resume/terminate agent process
+  vm.lifecycle.create.{oid}         Request VM creation
+  vm.lifecycle.delete.{oid}         Request VM teardown
+  vm.lifecycle.get.{oid}            Request/reply for live VM status
+  agent.vm.{oid}.{job_id}.control   Freeze/resume/terminate agent process
 
 Subjects subscribed:
-  vm.lifecycle.status          VM Controller status updates
-  agent.vm.*.register          Management Daemon registration
-  agent.vm.*.heartbeat         Management Daemon heartbeats
-  agent.vm.*.status            Management Daemon agent exit status
+  vm.lifecycle.status.{oid}         VM Controller status updates
+  agent.vm.{oid}.*.register         Management Daemon registration
+  agent.vm.{oid}.*.heartbeat        Management Daemon heartbeats
+  agent.vm.{oid}.*.status           Management Daemon agent exit status
+  sudo.request.{oid}.>              Sudo approval requests from sudo-gated daemons
+  session.events.{oid}.>            Agent pod notification events (session.events.{oid}.{tid})
+
+{oid} is the value of the ORCHESTRATOR_ID env var (Helm: .Values.orchestratorId,
+defaults to chart fullname). Required to safely share a NATS hub with other
+SRW orchestrators — empty value refuses to publish/subscribe.
 """
 
 import json
@@ -36,6 +42,8 @@ except ImportError:
     nats = None
     NatsClient = None
     NATS_AVAILABLE = False
+
+from .notification_feed import notification_feed
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +68,11 @@ class NatsBridge:
             )
 
         self._url = url or os.getenv("NATS_URL")
+        # Per-orchestrator scoping for vm.lifecycle.* subjects. When this is
+        # blank we refuse to publish/subscribe to scoped subjects rather than
+        # silently falling back to flat ones — flat subjects re-introduce
+        # cross-talk on a shared NATS hub (see docs/issues/nats_subject_acl_hardening.md).
+        self._orchestrator_id = (os.getenv("ORCHESTRATOR_ID") or "").strip()
         self._nc: Optional[Any] = None
         self._db: Optional[Any] = None
         self._on_vm_ready: Optional[Callable] = None
@@ -69,11 +82,28 @@ class NatsBridge:
 
         if not self._url:
             logger.info("NATS_URL not configured. VM lifecycle features disabled.")
+        elif not self._orchestrator_id:
+            logger.warning(
+                "NATS_URL set but ORCHESTRATOR_ID is empty — vm.lifecycle.* "
+                "publishes and subscribes will be refused. Set ORCHESTRATOR_ID "
+                "(via Helm orchestratorId value) to enable VM features."
+            )
 
     @property
     def is_available(self) -> bool:
         """Check if NATS is connected and available."""
         return self._available
+
+    def _subj(self, leaf: str) -> Optional[str]:
+        """Append our orchestrator id to a vm.lifecycle subject.
+
+        Returns None when ORCHESTRATOR_ID is unset; callers MUST skip the
+        publish/subscribe rather than fall back to the flat subject — flat
+        subjects would re-introduce cross-talk on a shared NATS hub.
+        """
+        if not self._orchestrator_id:
+            return None
+        return f"{leaf}.{self._orchestrator_id}"
 
     # =========================================================================
     # Lifecycle
@@ -117,21 +147,48 @@ class NatsBridge:
                 reconnect_time_wait=2,
             )
 
-            # Subscribe to VM lifecycle subjects (4 specific subscriptions)
-            await self._nc.subscribe(
-                "vm.lifecycle.status", cb=self._on_vm_lifecycle_status
-            )
-            await self._nc.subscribe("agent.vm.*.register", cb=self._on_daemon_register)
-            await self._nc.subscribe(
-                "agent.vm.*.heartbeat", cb=self._on_daemon_heartbeat
-            )
-            await self._nc.subscribe("agent.vm.*.status", cb=self._on_daemon_status)
+            # Subscribe to VM lifecycle subjects. All broadcast subjects are
+            # per-orchestrator scoped so multiple SRW installs can share a
+            # NATS hub without cross-talk. Refuse to fall back to flat
+            # subjects when ORCHESTRATOR_ID is unset — that would re-introduce
+            # cross-talk on a shared hub.
+            if not self._orchestrator_id:
+                logger.error(
+                    "Skipping all NATS subscribes — ORCHESTRATOR_ID unset. "
+                    "Set ORCHESTRATOR_ID (Helm: orchestratorId value) to enable."
+                )
+            else:
+                oid = self._orchestrator_id
+                await self._nc.subscribe(
+                    f"vm.lifecycle.status.{oid}", cb=self._on_vm_lifecycle_status
+                )
+                await self._nc.subscribe(
+                    f"agent.vm.{oid}.*.register", cb=self._on_daemon_register
+                )
+                await self._nc.subscribe(
+                    f"agent.vm.{oid}.*.heartbeat", cb=self._on_daemon_heartbeat
+                )
+                await self._nc.subscribe(
+                    f"agent.vm.{oid}.*.status", cb=self._on_daemon_status
+                )
 
-            # Subscribe to sudo approval requests (from sudo-gated daemons)
-            from .sudo_gate import sudo_gate
+                # Subscribe to sudo approval requests (from sudo-gated daemons)
+                from .sudo_gate import sudo_gate
 
-            sudo_gate.connect(db=db, nc=self._nc)
-            await self._nc.subscribe("sudo.request.>", cb=sudo_gate.on_sudo_request)
+                sudo_gate.connect(db=db, nc=self._nc)
+                await self._nc.subscribe(
+                    f"sudo.request.{oid}.>", cb=sudo_gate.on_sudo_request
+                )
+
+                # Session event re-broadcast: agent pods publish notification
+                # events to session.events.{oid}.{thread_id}; we forward to
+                # the SSE feed after filtering. The defense-in-depth
+                # payload-level thread_id check guards against a misbehaving
+                # pod publishing for another thread. See
+                # docs/issues/nats_subject_acl_hardening.md.
+                await self._nc.subscribe(
+                    f"session.events.{oid}.>", cb=self._on_session_event
+                )
 
             self._available = True
             logger.info("NATS bridge connected: %s", self._url)
@@ -187,6 +244,15 @@ class NatsBridge:
         if entity_type == "thread":
             self._thread_vm_ids.add(job_id)
 
+        subject = self._subj("vm.lifecycle.create")
+        if subject is None:
+            logger.error(
+                "Refusing vm.lifecycle.create publish for %s %s — ORCHESTRATOR_ID unset",
+                entity_type,
+                job_id,
+            )
+            return False
+
         payload = {
             "job_id": job_id,
             "agent_config": agent_config,
@@ -194,16 +260,17 @@ class NatsBridge:
             "memory": memory,
             "nats_url": self._url,
             "description": description,
+            "orchestrator_id": self._orchestrator_id,
         }
         if vm_image:
             payload["vm_image"] = vm_image
 
         try:
             await self._nc.publish(
-                "vm.lifecycle.create",
+                subject,
                 json.dumps(payload).encode(),
             )
-            logger.info("Published vm.lifecycle.create for %s %s", entity_type, job_id)
+            logger.info("Published %s for %s %s", subject, entity_type, job_id)
 
             # Update context to reflect provisioning state
             if entity_type == "thread":
@@ -213,7 +280,8 @@ class NatsBridge:
             return True
         except Exception as e:
             logger.error(
-                "Failed to publish vm.lifecycle.create for %s %s: %s",
+                "Failed to publish %s for %s %s: %s",
+                subject,
                 entity_type,
                 job_id,
                 e,
@@ -229,19 +297,25 @@ class NatsBridge:
         if not self._available:
             return False
 
-        payload = {"job_id": job_id}
+        subject = self._subj("vm.lifecycle.delete")
+        if subject is None:
+            logger.error(
+                "Refusing vm.lifecycle.delete publish for job %s — ORCHESTRATOR_ID unset",
+                job_id,
+            )
+            return False
+
+        payload = {"job_id": job_id, "orchestrator_id": self._orchestrator_id}
         try:
             await self._nc.publish(
-                "vm.lifecycle.delete",
+                subject,
                 json.dumps(payload).encode(),
             )
-            logger.info("Published vm.lifecycle.delete for job %s", job_id)
+            logger.info("Published %s for job %s", subject, job_id)
             await self._set_vm_context(job_id, {"status": "deleting"})
             return True
         except Exception as e:
-            logger.error(
-                "Failed to publish vm.lifecycle.delete for job %s: %s", job_id, e
-            )
+            logger.error("Failed to publish %s for job %s: %s", subject, job_id, e)
             return False
 
     async def query_vm_status(
@@ -259,10 +333,18 @@ class NatsBridge:
         if not self._available:
             return None
 
-        payload = {"job_id": job_id}
+        subject = self._subj("vm.lifecycle.get")
+        if subject is None:
+            logger.error(
+                "Refusing vm.lifecycle.get for job %s — ORCHESTRATOR_ID unset",
+                job_id,
+            )
+            return None
+
+        payload = {"job_id": job_id, "orchestrator_id": self._orchestrator_id}
         try:
             response = await self._nc.request(
-                "vm.lifecycle.get",
+                subject,
                 json.dumps(payload).encode(),
                 timeout=timeout,
             )
@@ -284,8 +366,15 @@ class NatsBridge:
         if not self._available:
             return False
 
-        payload = {"action": action}
-        subject = f"agent.vm.{job_id}.control"
+        if not self._orchestrator_id:
+            logger.error(
+                "Refusing agent.vm.*.control publish for job %s — ORCHESTRATOR_ID unset",
+                job_id,
+            )
+            return False
+
+        payload = {"action": action, "orchestrator_id": self._orchestrator_id}
+        subject = f"agent.vm.{self._orchestrator_id}.{job_id}.control"
         try:
             await self._nc.publish(subject, json.dumps(payload).encode())
             logger.info("Sent control '%s' to %s", action, subject)
@@ -427,6 +516,77 @@ class NatsBridge:
 
         except Exception:
             logger.exception("Error handling daemon heartbeat")
+
+    async def _on_session_event(self, msg: Any) -> None:
+        """Forward a session.events.{oid}.{tid} event to the SSE notification feed.
+
+        Defense-in-depth: the payload's claimed thread_id must match the
+        subject's thread_id AND must resolve to an existing thread in DB.
+        Tracked for transport-layer hardening in
+        docs/issues/nats_subject_acl_hardening.md.
+        """
+        try:
+            payload = json.loads(msg.data.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError) as e:
+            logger.warning("session.events: invalid JSON: %s", e)
+            return
+
+        # Extract thread_id from subject ("session.events.{oid}.{tid}"). The
+        # subscriber wildcard is `session.events.{oid}.>` so only this
+        # orchestrator's events arrive here; the oid token in subject_parts[2]
+        # is informational (already filtered by NATS).
+        subject_parts = msg.subject.split(".", 3)
+        if (
+            len(subject_parts) != 4
+            or subject_parts[0:2] != ["session", "events"]
+            or not subject_parts[3]
+        ):
+            logger.warning("session.events: malformed subject: %s", msg.subject)
+            return
+        subject_tid = subject_parts[3]
+        payload_tid = payload.get("thread_id")
+
+        if payload_tid != subject_tid:
+            logger.warning(
+                "session.events: payload tid %r != subject tid %r — dropped",
+                payload_tid,
+                subject_tid,
+            )
+            return
+
+        if self._db is None:
+            return
+        thread = await self._db.get_thread(subject_tid)
+        if not thread:
+            logger.debug("session.events: unknown thread %s — dropped", subject_tid)
+            return
+
+        user_id = str(thread.get("user_id") or "")
+        if not user_id:
+            return
+
+        # Map the pod's event method to a notification feed event type.
+        method = payload.get("method", "")
+        event_type_map = {
+            "permission.request": "session.permission_request",
+            "vm_upgrade.needed": "session.vm_upgrade",
+            "approve": "session.resolved",
+            "deny": "session.resolved",
+            "ready": "session.waiting",
+        }
+        event_type = event_type_map.get(method)
+        if not event_type:
+            return
+
+        notification_feed.broadcast(
+            user_id,
+            event_type,
+            {
+                "thread_id": subject_tid,
+                "method": method,
+                "params": payload.get("params", {}),
+            },
+        )
 
     async def _on_daemon_status(self, msg) -> None:
         """Handle agent.vm.*.status — agent process exited.

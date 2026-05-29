@@ -433,9 +433,11 @@ class ReasoningCapturingClient(httpx.Client):
         key_ring: Optional["KeyRing"] = None,
         **kwargs,
     ):
-        # Apply timeout if specified
+        # Apply timeout if specified. Granular: bound connect (and write/pool)
+        # tightly so a dead endpoint fails fast, while keeping the read budget
+        # at the full `timeout` so legitimately slow generations aren't cut off.
         if timeout is not None:
-            kwargs["timeout"] = httpx.Timeout(timeout)
+            kwargs["timeout"] = httpx.Timeout(timeout, connect=min(10.0, timeout))
         super().__init__(*args, **kwargs)
 
         self._last_reasoning_content: Optional[str] = None
@@ -653,8 +655,10 @@ class AsyncReasoningCapturingClient(httpx.AsyncClient):
         key_ring: Optional["KeyRing"] = None,
         **kwargs,
     ):
+        # Granular timeout (see sibling builder above): short connect so a dead
+        # endpoint fails fast; read budget stays at the full `timeout`.
         if timeout is not None:
-            kwargs["timeout"] = httpx.Timeout(timeout)
+            kwargs["timeout"] = httpx.Timeout(timeout, connect=min(10.0, timeout))
         super().__init__(*args, **kwargs)
 
         self._last_reasoning_content: Optional[str] = None

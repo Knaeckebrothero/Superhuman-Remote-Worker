@@ -28,8 +28,13 @@ from langchain_core.messages import (
     ToolMessage,
 )
 
-from .core.context import ContextManager
+from .core.context import ContextManager, extract_summary_text
 from .llm.reasoning_chat import extract_reasoning_text_from_block
+from .llm.response_guards import (
+    coerce_to_ai_message,
+    finalize_streamed_response,
+    strip_removal_markers,
+)
 from .services.image_content import extract_image_tags, make_multimodal_user_message
 
 logger = logging.getLogger(__name__)
@@ -143,6 +148,114 @@ class PersistentLoopCallbacks:
 
     # Notify client that a VM upgrade is needed (sudo detected, optional)
     on_vm_upgrade_needed: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None
+
+    # Notify the transport that automatic summarization compacted the context,
+    # so it can persist a display marker + show a banner. Optional.
+    # Args: (summary_text, before_count, after_count).
+    on_context_compacted: Optional[Callable[[str, int, int], Awaitable[None]]] = None
+
+    # Set by the transport alongside a "hard" interrupt so the loop can cancel
+    # a blocked LLM / auxiliary await immediately — the cooperative
+    # check_interrupt poll can't fire while the turn is parked in a network
+    # read. Raced against the streaming and compaction awaits only; never
+    # against tool execution (which must run to completion to avoid leaking
+    # side effects — that path stays cooperative). Optional: None ⇒
+    # cooperative-only interrupts (back-compat for callers that don't set it).
+    hard_interrupt_event: Optional[asyncio.Event] = None
+
+
+# Sentinel returned by _safe_anext on stream exhaustion. Avoids letting
+# StopAsyncIteration escape a coroutine wrapped in a Task, where it interacts
+# badly with the Future machinery.
+_STREAM_DONE = object()
+
+
+async def _safe_anext(aiter: Any) -> Any:
+    """``__anext__`` that returns ``_STREAM_DONE`` on exhaustion instead of
+    raising StopAsyncIteration, so the call can be wrapped in a Task safely."""
+    try:
+        return await aiter.__anext__()
+    except StopAsyncIteration:
+        return _STREAM_DONE
+
+
+async def _stream_next_or_hard_interrupt(
+    aiter: Any, hard_event: Optional[asyncio.Event]
+) -> tuple[Any, str]:
+    """Pull the next chunk from an LLM stream, abandoning the read if a hard
+    interrupt fires first.
+
+    Returns ``(chunk, status)`` where status is one of:
+      - ``"chunk"``     — ``chunk`` is the next streamed item.
+      - ``"stop"``      — the stream is exhausted.
+      - ``"interrupt"`` — a hard interrupt fired; the in-flight read was
+                          cancelled so a hung network read is torn down at once.
+    """
+    if hard_event is None:
+        result = await _safe_anext(aiter)
+        return (None, "stop") if result is _STREAM_DONE else (result, "chunk")
+
+    nxt = asyncio.ensure_future(_safe_anext(aiter))
+    intr = asyncio.ensure_future(hard_event.wait())
+    try:
+        await asyncio.wait({nxt, intr}, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        if not intr.done():
+            intr.cancel()
+        try:
+            await intr
+        except asyncio.CancelledError:
+            pass
+
+    if nxt.done() and not nxt.cancelled():
+        result = nxt.result()
+        return (None, "stop") if result is _STREAM_DONE else (result, "chunk")
+
+    # Interrupt won the race — cancel the in-flight chunk read.
+    nxt.cancel()
+    try:
+        await nxt
+    except asyncio.CancelledError:
+        pass
+    return None, "interrupt"
+
+
+async def _await_or_hard_interrupt(
+    coro: Awaitable[Any], hard_event: Optional[asyncio.Event]
+) -> tuple[Any, bool]:
+    """Await ``coro``, abandoning it if ``hard_event`` fires first.
+
+    Returns ``(result, interrupted)``. On interrupt the in-flight coroutine is
+    cancelled so a blocked network read (LLM / summarization) is torn down at
+    once instead of parking until its own timeout. Used only for LLM /
+    auxiliary awaits — never for tool execution.
+    """
+    if hard_event is None:
+        return await coro, False
+
+    op = asyncio.ensure_future(coro)
+    intr = asyncio.ensure_future(hard_event.wait())
+    try:
+        await asyncio.wait({op, intr}, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        if not intr.done():
+            intr.cancel()
+        try:
+            await intr
+        except asyncio.CancelledError:
+            pass
+
+    if op.done() and not op.cancelled():
+        return op.result(), False  # re-raises coro's exception, if any
+
+    op.cancel()
+    try:
+        await op
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        pass
+    return None, True
 
 
 async def run_persistent_loop(
@@ -492,29 +605,63 @@ async def _execute_turn(
             except Exception as e:
                 logger.warning(f"Knowledge injection failed (non-fatal): {e}")
 
-        # Context compaction if needed
+        # Context compaction if needed. Raced against a hard interrupt: the
+        # summarization LLM call here is the worst offender for parking the
+        # turn (a hung endpoint can hold it for the full auxiliary timeout),
+        # so a hard "stop" must be able to tear it down at once.
         pre_compact_len = len(prepared)
-        prepared = await context_manager.ensure_within_limits(
-            prepared,
-            auxiliary_llm,
-            max_summary_length=getattr(
-                config.context_management, "max_summary_length", 10000
+        prepared, compact_interrupted = await _await_or_hard_interrupt(
+            context_manager.ensure_within_limits(
+                prepared,
+                auxiliary_llm,
+                max_summary_length=getattr(
+                    config.context_management, "max_summary_length", 10000
+                ),
             ),
+            callbacks.hard_interrupt_event,
         )
+        if compact_interrupted:
+            logger.info("Hard interrupt during context compaction — ending turn")
+            callbacks.check_interrupt()  # consume the flag + clear the event
+            return TurnResult(
+                turn_id=0,
+                messages_added=messages_added,
+                tool_calls_made=tool_calls_made,
+                interrupted=True,
+            )
+        # ensure_within_limits returns a LangGraph reducer delta (RemoveMessage
+        # markers + summary + fresh copies). This loop has no reducer to apply
+        # them; left in, the markers reach _convert_message_to_dict and raise
+        # "Got unknown type" → "malformed response". The worker graph strips
+        # them too (src/graph.py). Strip before the compaction-checkpoint check
+        # so len(prepared) reflects the real compacted message count.
+        prepared = strip_removal_markers(prepared)
 
-        # Auto-compaction happened — commit + push workspace to Gitea as checkpoint
-        if len(prepared) < pre_compact_len and tool_context:
-            ws_mgr = getattr(tool_context, "workspace_manager", None)
-            git_mgr = getattr(ws_mgr, "git_manager", None) if ws_mgr else None
-            if git_mgr and git_mgr.is_active:
+        # Auto-compaction happened this turn — surface it for display, then
+        # commit + push the workspace to Gitea as a checkpoint.
+        if len(prepared) < pre_compact_len:
+            summary_text = extract_summary_text(prepared)
+            if summary_text and callbacks.on_context_compacted:
                 try:
-                    if git_mgr.has_uncommitted_changes():
-                        git_mgr.commit(
-                            f"Auto-compaction checkpoint ({pre_compact_len} → {len(prepared)} msgs)"
-                        )
-                    git_mgr.push()
+                    await callbacks.on_context_compacted(
+                        summary_text, pre_compact_len, len(prepared)
+                    )
                 except Exception as e:
-                    logger.debug(f"Git push on auto-compaction failed (non-fatal): {e}")
+                    logger.debug(f"on_context_compacted failed (non-fatal): {e}")
+            if tool_context:
+                ws_mgr = getattr(tool_context, "workspace_manager", None)
+                git_mgr = getattr(ws_mgr, "git_manager", None) if ws_mgr else None
+                if git_mgr and git_mgr.is_active:
+                    try:
+                        if git_mgr.has_uncommitted_changes():
+                            git_mgr.commit(
+                                f"Auto-compaction checkpoint ({pre_compact_len} → {len(prepared)} msgs)"
+                            )
+                        git_mgr.push()
+                    except Exception as e:
+                        logger.debug(
+                            f"Git push on auto-compaction failed (non-fatal): {e}"
+                        )
 
         # --- LLM call with streaming ---
         response_content = ""
@@ -529,7 +676,24 @@ async def _execute_turn(
                 # below broke early; None otherwise. Legacy bool callbacks
                 # land as True here and are treated as "graceful".
                 streaming_interrupted: Any = None
-                async for chunk in llm_with_tools.astream(prepared):
+                # Manual iteration (vs. `async for`) so a hard interrupt can
+                # cancel a hung chunk read mid-stream instead of waiting for
+                # the next chunk to arrive before the cooperative check below.
+                _stream = llm_with_tools.astream(prepared)
+                _aiter = _stream.__aiter__()
+                while True:
+                    chunk, _stream_status = await _stream_next_or_hard_interrupt(
+                        _aiter, callbacks.hard_interrupt_event
+                    )
+                    if _stream_status == "interrupt":
+                        logger.info(
+                            "Hard interrupt during LLM streaming — cancelling stream"
+                        )
+                        callbacks.check_interrupt()  # consume flag + clear event
+                        streaming_interrupted = "hard"
+                        break
+                    if _stream_status == "stop":
+                        break
                     chunks.append(chunk)
                     # Extract and stream text content
                     if hasattr(chunk, "content") and chunk.content:
@@ -677,13 +841,21 @@ async def _execute_turn(
                         )
                     elif response:
                         # graceful (or legacy bool True): strip incomplete
-                        # tool calls from partial response and keep it.
+                        # tool calls from partial response and keep it — but
+                        # only if it carries real content. An empty partial is
+                        # a raw streaming chunk that, left in history, makes the
+                        # next turn's request serialization raise "Got unknown
+                        # type" (see persistent_session_empty_chunk_history_
+                        # corruption). finalize_streamed_response coerces the
+                        # chunk to a concrete AIMessage and drops it if empty.
                         if hasattr(response, "tool_calls"):
                             response.tool_calls = []
                         if hasattr(response, "invalid_tool_calls"):
                             response.invalid_tool_calls = []
-                        messages.append(response)
-                        messages_added += 1
+                        final = finalize_streamed_response(response)
+                        if final is not None:
+                            messages.append(final)
+                            messages_added += 1
                     return TurnResult(
                         turn_id=0,
                         messages_added=messages_added,
@@ -830,8 +1002,11 @@ async def _execute_turn(
                 )
                 await callbacks.on_token(response_content)
 
-        # Sanitize for Responses API compatibility (null IDs from OpenRouter)
-        response = _sanitize_ai_response(response)
+        # Coerce a streamed chunk to a concrete AIMessage before it enters
+        # history (the next turn's request serialization rejects raw chunk
+        # types), then sanitize for Responses API compatibility (null IDs
+        # from OpenRouter).
+        response = _sanitize_ai_response(coerce_to_ai_message(response))
 
         # Add AI response to message history
         messages.append(response)

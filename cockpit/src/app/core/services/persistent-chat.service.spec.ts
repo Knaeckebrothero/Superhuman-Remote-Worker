@@ -1,10 +1,12 @@
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest';
-import {Injector, NgZone, runInInjectionContext} from '@angular/core';
+import {NgZone, signal} from '@angular/core';
+import {TestBed} from '@angular/core/testing';
 import {HttpClient} from '@angular/common/http';
 import {of, throwError} from 'rxjs';
 import {PersistentChatService} from './persistent-chat.service';
 import {ApiService} from './api.service';
 import {IndexedDbService} from './indexed-db.service';
+import {NotificationService} from './notification.service';
 import {AppToastService} from '../../ui/toast';
 import {
     AssistantTurn,
@@ -123,13 +125,22 @@ function createService(opts: {
         ),
         setThreadCursor: vi.fn().mockResolvedValue(undefined),
         deleteThreadCursor: vi.fn().mockResolvedValue(undefined),
+        getThreadMessages: vi.fn().mockResolvedValue([]),
+        getNewestCachedCreatedAt: vi.fn().mockResolvedValue(null),
+        upsertThreadMessages: vi.fn().mockResolvedValue(undefined),
+        clearThreadMessages: vi.fn().mockResolvedValue(undefined),
     };
 
     // NgZone stub: just run callbacks synchronously. Tests don't depend on
     // change-detection scheduling, only on signal mutations being observed.
+    // NOTE: we don't provide this as the NgZone token because Angular's
+    // ChangeDetectionScheduler subscribes to NgZone's onStable/onMicrotaskEmpty
+    // streams. TestBed's default NgZoneNoop satisfies that contract; this stub
+    // is unused in the TestBed configuration but kept for reference.
     const mockZone: any = {
         run: <T>(fn: () => T) => fn(),
     };
+    void mockZone;
 
     const mockToast: any = {
         show: vi.fn(),
@@ -170,18 +181,38 @@ function createService(opts: {
     (MockWebSocketCtor as any).CONNECTING = 0;
     (globalThis as any).WebSocket = MockWebSocketCtor;
 
-    const injector = Injector.create({
+    // Minimal NotificationService stub — just the lifecycleEvent signal
+    // the PersistentChatService constructor effect reads. Tests fire phase
+    // transitions by setting this signal directly.
+    const mockNotifications: any = {
+        lifecycleEvent: signal<{thread_id: string; state: string; reason?: string} | null>(null),
+    };
+
+    // TestBed gives us the ChangeDetectionScheduler that effect() needs.
+    // Manual Injector.create() doesn't wire that up. We let TestBed use
+    // its default NgZone — the scheduler subscribes to its lifecycle
+    // streams, and a thin stub would break that subscription.
+    TestBed.resetTestingModule();
+    TestBed.configureTestingModule({
         providers: [
             {provide: HttpClient, useValue: mockHttp},
             {provide: ApiService, useValue: mockApi},
             {provide: IndexedDbService, useValue: mockCache},
-            {provide: NgZone, useValue: mockZone},
             {provide: AppToastService, useValue: mockToast},
+            {provide: NotificationService, useValue: mockNotifications},
+            PersistentChatService,
         ],
     });
-
-    const service = runInInjectionContext(injector, () => new PersistentChatService());
-    return {service, mockHttp, mockApi, mockCache, sseInstances, wsInstances};
+    const service = TestBed.inject(PersistentChatService);
+    return {
+        service,
+        mockHttp,
+        mockApi,
+        mockCache,
+        sseInstances,
+        wsInstances,
+        notifications: mockNotifications,
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -202,6 +233,168 @@ describe('PersistentChatService — initial state', () => {
         expect(service.narrationMode()).toBe('auto');
         expect(service.reconnectAttempt()).toBe(0);
         expect(service.reconnectGaveUp()).toBe(false);
+    });
+});
+
+describe('PersistentChatService — render windowing', () => {
+    function makeTurns(n: number) {
+        return Array.from({length: n}, (_, i) => ({
+            kind: 'user' as const,
+            id: `u${i}`,
+            content: `m${i}`,
+            timestamp: i,
+        }));
+    }
+
+    function seed(service: PersistentChatService, n: number): void {
+        service.conversation.set({
+            threadId: 't-window',
+            turns: makeTurns(n),
+            activeAssistantTurnId: null,
+        });
+    }
+
+    it('renders all turns when under the window size', () => {
+        const {service} = createService();
+        seed(service, 30);
+        expect(service.visibleTurns().length).toBe(30);
+        expect(service.hasOlderTurns()).toBe(false);
+    });
+
+    it('renders only the most recent window when over the size', () => {
+        const {service} = createService();
+        seed(service, 120);
+        const visible = service.visibleTurns();
+        expect(visible.length).toBe(50);
+        expect(visible[0].id).toBe('u70'); // slice(-50) of 120
+        expect(visible[49].id).toBe('u119');
+        expect(service.hasOlderTurns()).toBe(true);
+    });
+
+    it('loadOlderTurns widens the window by the step, capped at length', () => {
+        const {service} = createService();
+        seed(service, 120);
+        service.loadOlderTurns();
+        expect(service.visibleTurns().length).toBe(100);
+        expect(service.hasOlderTurns()).toBe(true);
+        service.loadOlderTurns(); // 150 → capped at 120
+        expect(service.visibleTurns().length).toBe(120);
+        expect(service.hasOlderTurns()).toBe(false);
+    });
+
+    it('growWindow anchors the visible top by the delta', () => {
+        const {service} = createService();
+        seed(service, 120);
+        const topBefore = service.visibleTurns()[0].id; // u70
+        seed(service, 123); // 3 more turns present
+        service.growWindow(3);
+        const visible = service.visibleTurns();
+        expect(visible.length).toBe(53);
+        expect(visible[0].id).toBe(topBefore); // visible top unchanged
+    });
+
+    it('resetWindow re-bounds to the default window', () => {
+        const {service} = createService();
+        seed(service, 120);
+        service.loadOlderTurns();
+        expect(service.visibleTurns().length).toBe(100);
+        service.resetWindow();
+        expect(service.visibleTurns().length).toBe(50);
+    });
+});
+
+describe('PersistentChatService — message cache (loadHistory)', () => {
+    let originalEs: any;
+    let originalWs: any;
+
+    beforeEach(() => {
+        originalEs = (globalThis as any).EventSource;
+        originalWs = (globalThis as any).WebSocket;
+    });
+
+    afterEach(() => {
+        (globalThis as any).EventSource = originalEs;
+        (globalThis as any).WebSocket = originalWs;
+        vi.clearAllMocks();
+    });
+
+    it('full-loads when nothing is cached (no ?after=) and caches the result', async () => {
+        const {service, mockHttp, mockCache} = createService();
+        mockHttp.get.mockImplementation((url: string) => {
+            if (url.includes('/messages')) {
+                return of({
+                    messages: [
+                        {id: 'm1', role: 'human', content: 'hi', tool_calls: null, turn_number: 1, created_at: '2026-05-15T08:00:00Z'},
+                    ],
+                    total: 1,
+                });
+            }
+            return of({status: 'active', total_turns: 1});
+        });
+
+        await service.connect('thread-nocache');
+
+        const msgUrls = mockHttp.get.mock.calls
+            .map((c: any) => c[0] as string)
+            .filter((u: string) => u.includes('/messages'));
+        expect(msgUrls.length).toBeGreaterThan(0);
+        expect(msgUrls.every((u: string) => !u.includes('after='))).toBe(true);
+        expect(mockCache.upsertThreadMessages).toHaveBeenCalled(); // cached for next time
+        expect(service.turns().length).toBe(1);
+    });
+
+    it('paints cached history first, then refreshes incrementally via ?after=', async () => {
+        const {service, mockHttp, mockCache} = createService();
+        mockCache.getThreadMessages.mockResolvedValue([
+            {id: 'm1', threadId: 'thread-cache', role: 'human', content: 'old', tool_calls: null, turn_number: 1, created_at: '2026-05-15T08:00:00Z'},
+        ]);
+        mockHttp.get.mockImplementation((url: string) => {
+            if (url.includes('/messages')) {
+                // Server returns one NEW message after the cached cursor.
+                return of({
+                    messages: [
+                        {id: 'm2', role: 'ai', content: 'new reply', tool_calls: null, turn_number: 2, created_at: '2026-05-15T08:01:00Z'},
+                    ],
+                    total: 2,
+                });
+            }
+            return of({status: 'active', total_turns: 2});
+        });
+
+        await service.connect('thread-cache');
+
+        const msgUrls = mockHttp.get.mock.calls
+            .map((c: any) => c[0] as string)
+            .filter((u: string) => u.includes('/messages'));
+        expect(msgUrls.some((u: string) => u.includes('after='))).toBe(true);
+        expect(mockCache.upsertThreadMessages).toHaveBeenCalled();
+        // Merged cached + fetched: user (m1) then assistant (m2).
+        const turns = service.turns();
+        expect(turns.length).toBe(2);
+        expect(turns[0].kind).toBe('user');
+        expect(turns[1].kind).toBe('assistant');
+    });
+
+    it('renders a role="summary" history row as a compaction banner', async () => {
+        const {service, mockHttp} = createService();
+        mockHttp.get.mockImplementation((url: string) => {
+            if (url.includes('/messages')) {
+                return of({
+                    messages: [
+                        {id: 'u1', role: 'human', content: 'hi', tool_calls: null, turn_number: 1, created_at: '2026-05-15T08:00:00Z'},
+                        {id: 's1', role: 'summary', content: 'We discussed X and Y.', tool_calls: null, turn_number: 2, created_at: '2026-05-15T08:01:00Z'},
+                    ],
+                    total: 2,
+                });
+            }
+            return of({status: 'active', total_turns: 2});
+        });
+
+        await service.connect('thread-summary');
+
+        const banner = service.turns().find((t: {kind: string}) => t.kind === 'compaction');
+        expect(banner).toBeTruthy();
+        expect((banner as {summary: string}).summary).toBe('We discussed X and Y.');
     });
 });
 
@@ -880,6 +1073,34 @@ describe('PersistentChatService — REST sends', () => {
         expect(ctx.service.error()).toBeNull();
     });
 
+    it('rolls back the optimistic bubble and resolves false on a hard POST failure', async () => {
+        const ctx = await readySession();
+        ctx.mockHttp.post.mockReturnValue(
+            throwError(() => ({status: 500, error: {detail: 'boom'}})),
+        );
+        const ok = await ctx.service.sendMessage('will fail');
+        expect(ok).toBe(false);
+        // The optimistic UserTurn is removed so the composer can restore the
+        // draft for retry; the error banner explains why.
+        const stillThere = ctx.service
+            .turns()
+            .some((t) => isUserTurn(t) && t.content === 'will fail');
+        expect(stillThere).toBe(false);
+        expect(ctx.service.error()).not.toBeNull();
+    });
+
+    it('keeps the bubble and resolves true on a 409 dup', async () => {
+        const ctx = await readySession();
+        ctx.mockHttp.post.mockReturnValue(throwError(() => ({status: 409})));
+        const ok = await ctx.service.sendMessage('dup');
+        expect(ok).toBe(true);
+        const present = ctx.service
+            .turns()
+            .some((t) => isUserTurn(t) && t.content === 'dup');
+        expect(present).toBe(true);
+        expect(ctx.service.error()).toBeNull();
+    });
+
     it('interrupt POSTs to /interrupt', async () => {
         const ctx = await readySession();
         await ctx.service.interrupt();
@@ -889,6 +1110,87 @@ describe('PersistentChatService — REST sends', () => {
         );
         expect(intCall).toBeDefined();
         expect(ctx.service.isInterrupting()).toBe(true);
+    });
+});
+
+describe('PersistentChatService — resume re-validation (visibility/online)', () => {
+    let originalEs: any;
+    let originalWs: any;
+
+    beforeEach(() => {
+        originalEs = (globalThis as any).EventSource;
+        originalWs = (globalThis as any).WebSocket;
+    });
+
+    afterEach(() => {
+        (globalThis as any).EventSource = originalEs;
+        (globalThis as any).WebSocket = originalWs;
+        vi.clearAllMocks();
+    });
+
+    async function connectOpen(threadId: string) {
+        const ctx = createService();
+        ctx.mockHttp.get.mockImplementation(() =>
+            of({status: 'active', total_turns: 0, messages: [], total: 0}),
+        );
+        await ctx.service.connect(threadId);
+        await new Promise((r) => setTimeout(r, 0));
+        fireSseOpen(ctx.sseInstances[0]);
+        return ctx;
+    }
+
+    it('force-reopens a stale SSE when the tab regains liveness (online event)', async () => {
+        const ctx = await connectOpen('thread-resume-stale');
+        const first = ctx.sseInstances[0];
+        // Simulate the watchdog having been frozen while the tab was
+        // backgrounded: the last SSE event is now past the 45s threshold.
+        (ctx.service as any).sseLastEventAt = Date.now() - 60_000;
+
+        window.dispatchEvent(new Event('online'));
+        await new Promise((r) => setTimeout(r, 0));
+
+        expect(first.close).toHaveBeenCalled();
+        expect(ctx.sseInstances.length).toBe(2);
+        expect(ctx.service.connectionState()).toBe('connecting');
+    });
+
+    it('does not tear down a healthy SSE on resume', async () => {
+        const ctx = await connectOpen('thread-resume-fresh');
+        const first = ctx.sseInstances[0];
+        // Fresh liveness — an event arrived just now.
+        (ctx.service as any).sseLastEventAt = Date.now();
+
+        window.dispatchEvent(new Event('online'));
+        await new Promise((r) => setTimeout(r, 0));
+
+        expect(first.close).not.toHaveBeenCalled();
+        expect(ctx.sseInstances.length).toBe(1);
+    });
+
+    it('is a no-op when there is no active thread', async () => {
+        const ctx = createService();
+        // No connect() — threadId is null.
+        window.dispatchEvent(new Event('online'));
+        await new Promise((r) => setTimeout(r, 0));
+        expect(ctx.sseInstances.length).toBe(0);
+    });
+
+    it('re-ensures the control WS when the SSE recovers (slaved liveness)', async () => {
+        const ctx = await connectOpen('thread-ws-slave');
+        expect(ctx.wsInstances.length).toBe(1);
+
+        // Simulate the control WS having silently died — on a real drop the
+        // readyState moves to CLOSED, but no onclose fires to reconnect it.
+        (ctx.service as any).controlWs.readyState = 3; // CLOSED
+
+        // Force an SSE reconnect; firing open on the new stream is the
+        // "wasReconnecting" path, which re-ensures the control WS.
+        ctx.service.reconnectNow();
+        await new Promise((r) => setTimeout(r, 0));
+        fireSseOpen(ctx.sseInstances[1]);
+        await new Promise((r) => setTimeout(r, 0));
+
+        expect(ctx.wsInstances.length).toBe(2);
     });
 });
 
@@ -1030,23 +1332,6 @@ describe('PersistentChatService — control WS frame filtering', () => {
         ws.onmessage?.({data: JSON.stringify(frame)} as MessageEvent);
     }
 
-    it('dispatches status frames from the control WS into startupPhase', async () => {
-        const {service, wsInstances} = await readySession();
-        expect(service.startupPhase()).toBeNull();
-
-        fireWsFrame(wsInstances[0], {
-            method: 'status',
-            params: {phase: 'provisioning', elapsed_s: 2, timeout_s: 300},
-        });
-        expect(service.startupPhase()).toBe('provisioning');
-
-        fireWsFrame(wsInstances[0], {method: 'status', params: {phase: 'booting'}});
-        expect(service.startupPhase()).toBe('booting');
-
-        fireWsFrame(wsInstances[0], {method: 'status', params: {phase: 'connecting'}});
-        expect(service.startupPhase()).toBe('connecting');
-    });
-
     it('drops _seq-stamped frames on the control WS to avoid double-dispatch with SSE', async () => {
         const {service, wsInstances} = await readySession();
         const turnsBefore = service.turns().length;
@@ -1122,6 +1407,233 @@ describe('PersistentChatService — control WS frame filtering', () => {
         const {service, wsInstances} = await readySession();
         wsInstances[0].onmessage?.({data: 'not-json{'} as MessageEvent);
         expect(service.startupPhase()).toBeNull();
+    });
+});
+
+describe('PersistentChatService — direct session WS (prepare + connection)', () => {
+    let originalEs: any;
+    let originalWs: any;
+
+    beforeEach(() => {
+        originalEs = (globalThis as any).EventSource;
+        originalWs = (globalThis as any).WebSocket;
+    });
+
+    afterEach(() => {
+        (globalThis as any).EventSource = originalEs;
+        (globalThis as any).WebSocket = originalWs;
+        vi.clearAllMocks();
+    });
+
+    /** Build a URL-aware GET mock that handles all the endpoints connect() hits. */
+    function connectGetMock(opts: {
+        connectionResponses?: any[];  // array of values/errors to return on successive /connection calls
+        threadMeta?: Record<string, unknown>;
+        messages?: any[];
+    } = {}) {
+        const connectionResponses = opts.connectionResponses ?? [
+            of({state: 'ready', ws_url: 'wss://api.example.com/p/t/ws?t=jwt', token: 'jwt', expires_at: 0}),
+        ];
+        let connectionCallIdx = 0;
+        return (url: string) => {
+            if (url.includes('/api/sessions/') && url.endsWith('/connection')) {
+                const r = connectionResponses[Math.min(connectionCallIdx, connectionResponses.length - 1)];
+                connectionCallIdx += 1;
+                return r;
+            }
+            if (url.endsWith('/messages')) {
+                return of({messages: opts.messages ?? [], total: 0});
+            }
+            return of(opts.threadMeta ?? {status: 'active', total_turns: 0});
+        };
+    }
+
+    it('warm reconnect (already bound): GETs /connection, opens WS at returned ws_url, skips /prepare', async () => {
+        const ctx = createService();
+        ctx.mockHttp.get.mockImplementation(
+            connectGetMock({
+                connectionResponses: [
+                    of({
+                        state: 'ready',
+                        ws_url: 'wss://api.example.com/p/t1/ws?t=tok-warm',
+                        token: 'tok-warm',
+                        expires_at: 0,
+                    }),
+                ],
+            }),
+        );
+
+        await ctx.service.connect('t1');
+
+        // GET /api/sessions/t1/connection was called.
+        const getUrls = ctx.mockHttp.get.mock.calls.map((c: any) => c[0]);
+        expect(getUrls.some((u: string) => u.endsWith('/api/sessions/t1/connection'))).toBe(true);
+
+        // POST /api/sessions/t1/prepare was NOT called.
+        const prepareCalls = ctx.mockHttp.post.mock.calls.filter((c: any) =>
+            String(c[0]).endsWith('/api/sessions/t1/prepare'),
+        );
+        expect(prepareCalls).toHaveLength(0);
+
+        // WebSocket was opened at the URL returned by /connection.
+        expect(ctx.wsInstances).toHaveLength(1);
+        expect(ctx.wsInstances[0].url).toBe('wss://api.example.com/p/t1/ws?t=tok-warm');
+    });
+
+    it('cold start (425 → prepare → poll /connection until ready): WS opens at final ws_url', async () => {
+        const ctx = createService();
+
+        // /connection: 425, then 425 again (still booting), then 200.
+        ctx.mockHttp.get.mockImplementation(
+            connectGetMock({
+                connectionResponses: [
+                    throwError(() => ({status: 425})),
+                    throwError(() => ({status: 425})),
+                    of({
+                        state: 'ready',
+                        ws_url: 'wss://api.example.com/p/t2/ws?t=tok-cold',
+                        token: 'tok-cold',
+                        expires_at: 0,
+                    }),
+                ],
+            }),
+        );
+
+        ctx.mockHttp.post.mockImplementation((url: string) => {
+            if (url.endsWith('/api/sessions/t2/prepare')) {
+                return of({state: 'provisioning'});
+            }
+            return of({});
+        });
+
+        await ctx.service.connect('t2');
+
+        // POST /prepare was called exactly once.
+        const prepareCalls = ctx.mockHttp.post.mock.calls.filter((c: any) =>
+            String(c[0]).endsWith('/api/sessions/t2/prepare'),
+        );
+        expect(prepareCalls).toHaveLength(1);
+
+        // GET /connection was called until it succeeded.
+        const connCalls = ctx.mockHttp.get.mock.calls.filter((c: any) =>
+            String(c[0]).endsWith('/api/sessions/t2/connection'),
+        );
+        expect(connCalls.length).toBeGreaterThanOrEqual(2);
+
+        // WS opened at the URL returned by the successful /connection.
+        const sessionWs = ctx.wsInstances.find((ws) =>
+            String(ws.url || '').includes('wss://api.example.com/p/t2/ws'),
+        );
+        expect(sessionWs).toBeDefined();
+        expect(sessionWs.url).toBe('wss://api.example.com/p/t2/ws?t=tok-cold');
+
+        // No transient SSE on /notifications/events is opened — phase
+        // signals come from the always-on NotificationService feed (owned
+        // by the app shell), not from a per-connect listener.
+        const lifecycleEs = ctx.sseInstances.find((es) =>
+            es.url.includes('/notifications/events'),
+        );
+        expect(lifecycleEs).toBeUndefined();
+    });
+
+    it('NotificationService lifecycle events update startupPhase for the active thread', async () => {
+        const ctx = createService();
+        ctx.mockHttp.get.mockImplementation(
+            connectGetMock({
+                connectionResponses: [
+                    of({
+                        state: 'ready',
+                        ws_url: 'wss://api.example.com/p/t-life/ws?t=tok',
+                        token: 'tok',
+                        expires_at: 0,
+                    }),
+                ],
+            }),
+        );
+        await ctx.service.connect('t-life');
+
+        // The constructor effect filters on threadId() — confirm the
+        // active thread matches before firing events.
+        expect(ctx.service.threadId()).toBe('t-life');
+
+        ctx.notifications.lifecycleEvent.set({
+            thread_id: 't-life',
+            state: 'provisioning',
+        });
+        // Flush the constructor effect so it observes the signal change.
+        TestBed.tick();
+        expect(ctx.service.startupPhase()).toBe('provisioning');
+
+        ctx.notifications.lifecycleEvent.set({
+            thread_id: 't-life',
+            state: 'booting',
+        });
+        TestBed.tick();
+        expect(ctx.service.startupPhase()).toBe('booting');
+
+        ctx.notifications.lifecycleEvent.set({
+            thread_id: 't-life',
+            state: 'ready',
+        });
+        TestBed.tick();
+        // 'ready' from the server means agent is session-ready — the
+        // cockpit now opens the WS, which is the "connecting" phase
+        // client-side.
+        expect(ctx.service.startupPhase()).toBe('connecting');
+
+        // Events for a different thread are ignored.
+        ctx.notifications.lifecycleEvent.set({
+            thread_id: 'other-thread',
+            state: 'provisioning',
+        });
+        TestBed.tick();
+        expect(ctx.service.startupPhase()).toBe('connecting');
+    });
+
+    it('WS close code 4401 re-fetches /connection and reopens WS with the fresh token', async () => {
+        const ctx = createService();
+        ctx.mockHttp.get.mockImplementation(
+            connectGetMock({
+                connectionResponses: [
+                    of({
+                        state: 'ready',
+                        ws_url: 'wss://api.example.com/p/t3/ws?t=tok-A',
+                        token: 'tok-A',
+                        expires_at: 0,
+                    }),
+                    of({
+                        state: 'ready',
+                        ws_url: 'wss://api.example.com/p/t3/ws?t=tok-B',
+                        token: 'tok-B',
+                        expires_at: 0,
+                    }),
+                ],
+            }),
+        );
+
+        await ctx.service.connect('t3');
+
+        // The first WS should be at the first ws_url.
+        expect(ctx.wsInstances).toHaveLength(1);
+        expect(ctx.wsInstances[0].url).toBe('wss://api.example.com/p/t3/ws?t=tok-A');
+
+        // Fire a 4401 close on the first WS.
+        ctx.wsInstances[0].onclose?.({code: 4401, reason: 'token expired'} as CloseEvent);
+
+        // Let microtasks flush so the re-fetch + WS reopen happens.
+        await new Promise((r) => setTimeout(r, 0));
+        await new Promise((r) => setTimeout(r, 0));
+
+        // /connection was called again (twice total: initial + post-4401 refresh).
+        const connCalls = ctx.mockHttp.get.mock.calls.filter((c: any) =>
+            String(c[0]).endsWith('/api/sessions/t3/connection'),
+        );
+        expect(connCalls.length).toBeGreaterThanOrEqual(2);
+
+        // A new WS was opened at the refreshed ws_url.
+        expect(ctx.wsInstances.length).toBeGreaterThanOrEqual(2);
+        const secondWs = ctx.wsInstances[ctx.wsInstances.length - 1];
+        expect(secondWs.url).toBe('wss://api.example.com/p/t3/ws?t=tok-B');
     });
 });
 
@@ -1240,5 +1752,87 @@ describe('PersistentChatService — attachments', () => {
         expect(service.pendingAttachments()).toEqual([b]);
         service.clearAttachments();
         expect(service.pendingAttachments()).toEqual([]);
+    });
+});
+
+describe('PersistentChatService — interrupt self-healing', () => {
+    let originalEs: any;
+    let originalWs: any;
+
+    beforeEach(() => {
+        originalEs = (globalThis as any).EventSource;
+        originalWs = (globalThis as any).WebSocket;
+        vi.useFakeTimers();
+    });
+
+    afterEach(() => {
+        vi.useRealTimers();
+        (globalThis as any).EventSource = originalEs;
+        (globalThis as any).WebSocket = originalWs;
+        vi.clearAllMocks();
+    });
+
+    // Connect, open the SSE, and start a turn so isStreaming() is true and
+    // "Stopping…" is meaningful.
+    async function setupStreaming() {
+        const ctx = createService();
+        ctx.mockHttp.get.mockImplementation(() =>
+            of({status: 'active', total_turns: 0, messages: [], total: 0}),
+        );
+        await ctx.service.connect('thread-int');
+        await vi.advanceTimersByTimeAsync(0); // drain _openSse microtasks
+        const es = ctx.sseInstances[0];
+        fireSseOpen(es);
+        fireSseMessage(es, {method: 'turn.started', params: {turn_id: 1}}, '1:1');
+        return {...ctx, es};
+    }
+
+    it('forces a reconnect if the interrupt ack never arrives', async () => {
+        const {service} = await setupStreaming();
+        const reconnectSpy = vi
+            .spyOn(service, 'reconnectNow')
+            .mockImplementation(() => {});
+
+        await service.interrupt();
+        expect(service.isInterrupting()).toBe(true);
+        expect(reconnectSpy).not.toHaveBeenCalled();
+
+        // No interrupt.ack / turn.completed arrives — fallback fires at ~8s and
+        // forces a replay-from-cursor reconnect to re-sync.
+        await vi.advanceTimersByTimeAsync(8_001);
+
+        expect(reconnectSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not reconnect when the turn boundary arrives in time', async () => {
+        const {service, es} = await setupStreaming();
+        const reconnectSpy = vi
+            .spyOn(service, 'reconnectNow')
+            .mockImplementation(() => {});
+
+        await service.interrupt();
+        // turn.completed lands promptly and clears "Stopping…".
+        fireSseMessage(es, {method: 'turn.completed', params: {turn_id: 1}}, '1:9');
+        expect(service.isInterrupting()).toBe(false);
+
+        await vi.advanceTimersByTimeAsync(8_001);
+        expect(reconnectSpy).not.toHaveBeenCalled();
+    });
+
+    it('clears a stuck isInterrupting when the connection drops (invariant)', async () => {
+        const {service} = await setupStreaming();
+
+        await service.interrupt();
+        expect(service.isInterrupting()).toBe(true);
+        expect(service.isStreaming()).toBe(true);
+
+        // disconnect() closes the active turn but does not explicitly reset
+        // isInterrupting — the invariant effect (not streaming ⇒ not stopping)
+        // is what must clear it.
+        service.disconnect();
+        TestBed.tick();
+
+        expect(service.isStreaming()).toBe(false);
+        expect(service.isInterrupting()).toBe(false);
     });
 });

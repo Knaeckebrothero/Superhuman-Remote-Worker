@@ -227,7 +227,7 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
     @tool
     def run_command(
         command: str,
-        timeout: int = 120,
+        timeout: Optional[int] = None,
         tail: int = 30,
     ) -> str:
         """Execute a shell command and return its output.
@@ -237,9 +237,22 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
         building projects, git operations, file system commands, deploying,
         checking logs, SSH via sshpass, and any other shell task.
 
-        If the command requires interactive input (password prompt, y/n
-        confirmation), it will return an error. Use non-interactive
-        alternatives instead:
+        LONG-RUNNING / QUIET COMMANDS: a command that produces no new output for
+        ~30s (a large `pip install`, a build, a big download, data ingestion or
+        embedding) is reported as "still running" with `Exit code: -1` — this is
+        NOT an error; the command keeps running on the tab.
+          - Best: when you already expect a command to be slow or quiet, pass an
+            explicit `timeout` (e.g. 300-600) up front, so THIS call waits for
+            the full duration and returns the real exit code.
+          - If you do get "still running", call shell_read() once after a short
+            wait to check progress — do NOT poll in a tight loop. The tab is busy
+            until the command finishes, so re-issuing it (or any other command)
+            is rejected. If the output stays completely unchanged for a long
+            time, the command may be stuck — reconsider the approach rather than
+            polling forever.
+
+        INTERACTIVE INPUT: run_command cannot answer prompts (password, y/n).
+        Use a non-interactive form instead:
           - SSH: sshpass -p 'pass' ssh -o StrictHostKeyChecking=no user@host "cmd"
           - apt/dnf: use -y flag
           - git: configure credential helper
@@ -256,8 +269,11 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
         Args:
             command: Shell command to execute (e.g., "pytest tests/ -x",
                 "git status", "curl -s https://api.example.com/health").
-            timeout: Maximum seconds to wait (default 120, max 600).
-                Use 600 for sudo commands (approval may take minutes).
+            timeout: Max seconds to wait (max 600). Omit for normal commands —
+                a quiet command then returns "still running" after ~30s. Set an
+                explicit value for known long/quiet work (installs, builds) to
+                wait the full duration without a no-change interruption, or for
+                sudo commands (approval may take minutes).
             tail: Max stdout lines to return (default 30). Increase for
                 verbose output (test suites, builds, logs).
 
@@ -267,21 +283,28 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
         try:
             sm.ensure_tab("default")
 
-            output = sm.run_sync(command, tab_name="default", timeout=min(timeout, 600))
+            output = sm.run_sync(command, tab_name="default", timeout=timeout)
 
             # Sudo intercept: trigger freeze for VM upgrade
             freeze_msg = _check_sudo_freeze(output, command, context)
             if freeze_msg:
                 return freeze_msg
 
-            # Interactive prompt → error (model should use non-interactive alternatives)
-            if (
-                "Interactive prompt detected" in output
-                or "Command appears to be waiting for input" in output
-            ):
+            # Still-running (soft/hard no-change timeout) is NOT an error — the
+            # command keeps running. Pass it through so the model can poll with
+            # shell_read or re-run with a higher timeout.
+            if "--- still running ---" in output:
+                output = _apply_tail(output, tail)
+                return _truncate_output(output, max_output_chars, "output")
+
+            # Genuine interactive prompt: stateless run_command can't answer it,
+            # so steer the model toward a non-interactive form.
+            if "Interactive prompt detected" in output:
                 return (
-                    f"Error: Command requires interactive input.\n"
-                    f"Use non-interactive alternatives (sshpass, -y flags, etc.).\n"
+                    f"Error: Command requires interactive input, which "
+                    f"run_command cannot provide.\n"
+                    f"Use a non-interactive form instead (sshpass, -y flags, "
+                    f"`yes |`, etc.).\n"
                     f"{output}"
                 )
 
@@ -303,6 +326,7 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
         tail: int = 30,
         is_async: bool = False,
         keys: bool = False,
+        timeout: Optional[int] = None,
     ) -> str:
         """Execute a command or send keystrokes in a persistent terminal tab.
 
@@ -316,10 +340,17 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
 
         Modes:
           Default (sync): Runs the command and waits for it to finish. Returns
-              exit code + stdout. If the command hits an interactive prompt
-              (password, y/n, host key, etc.), it returns early with the prompt
-              text so you can respond with keys=True. After responding, the tab
-              works normally for subsequent commands.
+              exit code + stdout. If it produces no new output for ~30s it
+              returns "still running" (Exit code: -1) — not an error; the command
+              keeps running on the tab. Then you can: poll with shell_read (once
+              after a wait, NOT in a tight loop), stop it with keys=True "C-c",
+              run other work on a different `name` tab, or — best for work you
+              expect to be slow/quiet — re-run it with an explicit `timeout`
+              (e.g. 600) so the call waits the full duration. A tab with a
+              still-running command rejects new commands until it finishes. If
+              the command hits an interactive prompt (password, y/n, host key,
+              etc.), it returns early with the prompt text so you can respond
+              with keys=True. After responding, the tab works normally again.
           keys=True: Send raw keystrokes. Text input (passwords, "yes", "y")
               auto-submits with Enter. Control keys ("C-c", "Up", "Escape")
               are sent as-is. Send "Enter" alone to press Enter without text.
@@ -349,6 +380,10 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
                 long-running background processes. NOT needed for SSH.
             keys: Send raw keystrokes. Text auto-submits with Enter;
                 control keys (C-c, Up, Escape, etc.) are sent as-is.
+            timeout: Max seconds to wait in sync mode (max 600). Omit for the
+                default no-change behavior (~30s quiet → "still running"); set
+                an explicit value for known long/quiet work (large installs,
+                builds) to wait the full duration.
 
         Returns:
             [Shells: tab1 | tab2 | ...] header + command output.
@@ -388,7 +423,7 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
 
             else:
                 # Sync mode: sentinel-based wait for completion
-                output = sm.run_sync(command, tab_name=name)
+                output = sm.run_sync(command, tab_name=name, timeout=timeout)
                 # Sudo intercept: trigger freeze for VM upgrade
                 freeze_msg = _check_sudo_freeze(output, command, context)
                 if freeze_msg:

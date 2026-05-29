@@ -22,6 +22,7 @@ if _orchestrator_dir not in sys.path:
     sys.path.insert(0, _orchestrator_dir)
 
 from orchestrator.services.workspace_suspension import WorkspaceSuspensionService  # noqa: E402
+from services.workspace_lifecycle import WorkspaceOwner  # noqa: E402
 
 
 # =============================================================================
@@ -156,7 +157,9 @@ class TestSuspendWorkspace:
             source_type="pod",
         )
         # Pod deleted
-        svc._container_provisioner.delete_workspace.assert_awaited_once_with(job["id"])
+        svc._container_provisioner.delete_workspace.assert_awaited_once_with(
+            WorkspaceOwner.job(job["id"])
+        )
         # Status transitions: suspending → suspended
         calls = svc._db.merge_workspace_container_context.call_args_list
         assert calls[0][0] == (job["id"], {"status": "suspending"})
@@ -702,7 +705,7 @@ class TestMultipleContainerSweep:
         assert count == 1
         # Pod only deleted for the second (successful) one
         svc._container_provisioner.delete_workspace.assert_awaited_once_with(
-            "bbbbbbbb-2222-2222-2222-222222222222"
+            WorkspaceOwner.job("bbbbbbbb-2222-2222-2222-222222222222")
         )
 
 
@@ -731,7 +734,9 @@ class TestSuspendRestoreRoundTrip:
         )
 
         # Verify pod was deleted
-        svc._container_provisioner.delete_workspace.assert_awaited_once_with(job_id)
+        svc._container_provisioner.delete_workspace.assert_awaited_once_with(
+            WorkspaceOwner.job(job_id)
+        )
 
         # Reset mocks for restore phase
         svc._snapshot_service.capture_vm_snapshot.reset_mock()
@@ -754,7 +759,9 @@ class TestSuspendRestoreRoundTrip:
         assert ok is True
 
         # Pod created
-        svc._container_provisioner.create_workspace.assert_awaited_once_with(job_id)
+        svc._container_provisioner.create_workspace.assert_awaited_once_with(
+            WorkspaceOwner.job(job_id)
+        )
 
         # Snapshot extracted to new pod IP
         mock_extract.assert_awaited_once_with(job_id, "10.0.0.99", ssh_port=22)
@@ -818,6 +825,52 @@ class TestDispatchStatusHandling:
 
     def test_deleted_skips(self):
         assert self._should_dispatch({"status": "deleted"}) == "skip"
+
+
+# =============================================================================
+# Test: restore(owner) — owner-keyed dispatch
+# =============================================================================
+
+
+class TestRestoreOwnerDispatch:
+    """Tests for WorkspaceSuspensionService.restore(owner).
+
+    Verifies that the owner-keyed router dispatches to the correct underlying
+    method.  Uses direct AsyncMock patching rather than a fully wired service
+    to keep these tests fast and isolated from the heavy restore logic.
+    """
+
+    @pytest.mark.asyncio
+    async def test_restore_job_calls_restore_workspace(self):
+        """restore(job owner) must delegate to restore_workspace(job_id)."""
+        from services.workspace_lifecycle import WorkspaceOwner as WO
+
+        svc = make_service()
+        svc.restore_workspace = AsyncMock(return_value=True)
+        svc.restore_thread_workspace = AsyncMock(return_value=True)
+
+        owner = WO.job("j1")
+        result = await svc.restore(owner)
+
+        assert result is True
+        svc.restore_workspace.assert_awaited_once_with("j1")
+        svc.restore_thread_workspace.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_restore_session_calls_restore_thread_workspace(self):
+        """restore(session owner) must delegate to restore_thread_workspace(thread_id)."""
+        from services.workspace_lifecycle import WorkspaceOwner as WO
+
+        svc = make_service()
+        svc.restore_workspace = AsyncMock(return_value=True)
+        svc.restore_thread_workspace = AsyncMock(return_value=True)
+
+        owner = WO.session("t1")
+        result = await svc.restore(owner)
+
+        assert result is True
+        svc.restore_thread_workspace.assert_awaited_once_with("t1")
+        svc.restore_workspace.assert_not_awaited()
 
 
 # =============================================================================

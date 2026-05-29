@@ -122,8 +122,9 @@ class ToolContext:
     _job_metadata: Dict[str, Any] = field(
         default_factory=dict
     )  # job_id, project_id, priority, config_name, repo_name
-    _browser_session: Optional[Any] = None  # browser_use.BrowserSession
-    _browser_cdp_url: Optional[str] = None  # CDP WebSocket URL for remote
+    _browser_session: Optional[Any] = (
+        None  # browser_use.BrowserSession (local/dev mode)
+    )
     _browser_started: bool = False  # Whether Chromium has been started
 
     def __post_init__(self):
@@ -654,12 +655,12 @@ class ToolContext:
         return snapshot_cfg.get("max_dom_chars", 40000)
 
     async def get_browser_session(self) -> Any:
-        """Lazy-start Chromium and return a persistent BrowserSession.
+        """Lazy-start a local (in-process) Chromium and return a BrowserSession.
 
-        On first call, starts a local or remote Chromium instance.
-        On subsequent calls, health-checks the existing session and
-        reconnects if needed. The user_data_dir preserves state across
-        restarts.
+        Local/dev mode only — remote workspaces drive the browser through
+        ``browser_exec()`` (the workspace-side browser-exec daemon) so CDP
+        never crosses the pod boundary. On subsequent calls, health-checks
+        the existing session and restarts if needed.
 
         Returns:
             browser_use.BrowserSession instance
@@ -700,16 +701,8 @@ class ToolContext:
             "user_data_dir": user_data_dir,
         }
 
-        # Remote browser via CDP
-        from .research.browser import _is_remote_browser, _start_remote_chromium
-
-        if _is_remote_browser(self):
-            backend = self.workspace_manager.backend
-            backend.mkdir("documents")
-            cdp_url = _start_remote_chromium(backend, backend.resolve_path("documents"))
-            self._browser_cdp_url = cdp_url
-            kwargs = {"cdp_url": cdp_url}
-
+        # Local in-process launch only. Remote workspaces never reach here —
+        # the direct browser tools route to browser_exec() instead.
         session = BrowserSession(**kwargs)
         await session.start()
         self._browser_session = session
@@ -717,8 +710,40 @@ class ToolContext:
         logger.info("Browser session started")
         return session
 
+    async def browser_exec(self, action: str, **args: Any) -> Dict[str, Any]:
+        """Run one browser action on the workspace via the browser-exec helper.
+
+        Drives Chromium on the workspace over SSH (``exec_command``) rather
+        than speaking CDP across the pod boundary. The workspace daemon holds
+        the persistent session so element refs survive between calls. Returns
+        the parsed JSON result, or an ``{"error": ...}`` dict on any failure.
+
+        See docs/features/browser_workspace_executor.md.
+        """
+        import asyncio
+        import json as _json
+        import shlex
+
+        backend = self.workspace_manager.backend
+        payload = _json.dumps(args)
+        cmd = f"browser-exec {shlex.quote(action)} --json {shlex.quote(payload)}"
+        try:
+            # exec_command is blocking SSH; keep the event loop responsive.
+            out = await asyncio.to_thread(backend.exec_command, cmd, 200)
+        except Exception as e:
+            return {"error": f"browser-exec call failed: {e}"}
+
+        out = (out or "").strip()
+        if not out:
+            return {"error": "browser-exec returned no output"}
+        try:
+            # The client prints exactly one JSON line to stdout.
+            return _json.loads(out.splitlines()[-1])
+        except Exception:
+            return {"error": f"browser-exec returned non-JSON: {out[:500]}"}
+
     async def _close_browser_session(self) -> None:
-        """Close the browser session without stopping remote Chromium."""
+        """Close the local in-process browser session (dev mode)."""
         if self._browser_session is not None:
             try:
                 await self._browser_session.stop()
@@ -728,15 +753,17 @@ class ToolContext:
 
     async def close_browser(self) -> None:
         """Kill Chromium and cleanup. Called on job/session end."""
+        # Local in-process session (dev mode).
         await self._close_browser_session()
 
-        # Stop remote Chromium if we started it
-        if self._browser_cdp_url is not None and self.has_workspace():
-            from .research.browser import _is_remote_browser, _stop_remote_chromium
+        # Remote: tell the workspace browser-exec daemon to shut down.
+        from .research.browser import _is_remote_browser
 
-            if _is_remote_browser(self):
-                _stop_remote_chromium(self.workspace_manager.backend)
-            self._browser_cdp_url = None
+        if _is_remote_browser(self):
+            try:
+                await self.browser_exec("shutdown")
+            except Exception as e:
+                logger.debug(f"browser-exec shutdown failed: {e}")
 
         self._browser_started = False
         logger.info("Browser cleaned up")

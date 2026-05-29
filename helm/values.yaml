@@ -98,7 +98,10 @@ orchestrator:
       memory: "256Mi"
       cpu: "100m"
     limits:
-      memory: "1Gi"
+      # 2Gi (was 1Gi): headroom for a rare, unattributed transient memory
+      # spike observed during session resume that OOM-killed the pod (steady
+      # state is ~150-280Mi). Stopgap, not a diagnosed leak.
+      memory: "2Gi"
       cpu: "500m"
   # -- Auto-assign jobs to idle agents
   autoAssignEnabled: "true"
@@ -123,6 +126,11 @@ agent:
   config: "defaults"
   port: "8001"
   persistentConfig: "interactive"
+  # -- Apply admin-curated DB prompt overrides (prompt_overrides table) to
+  # provisioned agents. Default OFF (prod-safe); the dev/experimental values
+  # file turns it on. Gates only the agent's prompt resolver — not the
+  # orchestrator or the admin UI (overrides remain editable regardless).
+  promptDbOverridesEnabled: "false"
   resources:
     requests:
       memory: "512Mi"
@@ -158,6 +166,26 @@ cockpit:
     limits:
       memory: "512Mi"
       cpu: "250m"
+
+  # Where the chart-rendered env.js ConfigMap mounts inside the cockpit
+  # container. Defaults to the nginx static-asset path (production image
+  # serves it verbatim). Tilt-mode dev image overrides this to land the
+  # file in Angular's source tree so `ng serve` picks it up — set via
+  # `deployment/values-tilt.yaml`.
+  envJs:
+    mountPath: "/usr/share/nginx/html/assets/env.js"
+
+  # Opt-in startupProbe. Production nginx is ready in ~1 s so the existing
+  # liveness probe's 30 s initialDelaySeconds is fine; Tilt-mode `ng serve`
+  # cold-compile takes 30-90 s and trips the readiness probe before the
+  # dev server can respond. Enabling this gives compile time without
+  # slowing prod startup detection (which keeps using liveness/readiness).
+  startupProbe:
+    enabled: false
+    initialDelaySeconds: 10
+    periodSeconds: 5
+    failureThreshold: 30   # ≈10+5×30 = 160 s grace
+
   # NOTE: Model groups, presets, and builder model lists were removed in the
   # DB-backed LLM config migration. Cockpit now reads the catalog from
   # `GET /api/models`, which is the authoritative source (system endpoints
@@ -194,6 +222,14 @@ auth:
     # `api.localhost` — Chrome treats those as cross-site, so Lax blocks the
     # session cookie on the cockpit's XHR to the API). "none" requires Secure.
     cookieSamesite: "lax"
+    # -- When true, route /api/* and /auth/* on the cockpit host through the
+    # orchestrator (path-based routing on the cockpit ingress). Makes cockpit
+    # and API same-origin → session cookie is first-party → works in every
+    # browser regardless of 3rd-party cookie policy. The api.* ingress stays
+    # in place (other consumers may use it). Use this for split-host local
+    # dev. In prod where cockpit and api share a base domain, leave false
+    # (cross-subdomain is already same-site).
+    sameOriginApi: false
     # -- Idle session expiry (seconds). Validator rejects a session whose
     # last_seen_at is older than now() - this.
     sessionIdleTimeoutSeconds: 1800
@@ -1020,6 +1056,57 @@ ide:
   sessionMaxLifetime: "240"
   maxConcurrentPerUser: "2"
   codeServerImage: "codercom/code-server:latest"
+
+# -----------------------------------------------------------------------------
+# Session router — Direct Session WebSockets
+# (docs/features/direct_session_websockets.md)
+# -----------------------------------------------------------------------------
+sessionRouter:
+  # Tier-1 ingress controller — tested in CI + dev cluster.
+  # nginx-ingress, HAProxy ingress, Istio Gateway are Tier-2: should work
+  # via the standard Ingress API but not exercised by the test suite.
+  ingressClass: traefik
+
+  # Hostname used in per-session Ingress rules. Defaults to api.<global.domain>
+  # when empty.
+  ingressHost: ""
+
+  # JWT signing key shared by orchestrator + agent pods. REQUIRED to enable
+  # the new flow.
+  #
+  # Two layouts:
+  #
+  #   Layout A (standalone Secret, simplest for dev / non-Vault):
+  #     Set ``jwtSecret`` to a 32+ byte random string. The chart renders a
+  #     dedicated K8s Secret named ``<release>-session-jwt`` (override via
+  #     ``jwtSecretName``) with the value at key ``jwt-secret``.
+  #     `--set-string sessionRouter.jwtSecret="$(openssl rand -hex 32)"`
+  #
+  #   Layout B (key on an existing bundled Secret, e.g. ESO-synced from Vault):
+  #     Leave ``jwtSecret`` empty (so the standalone Secret render is skipped).
+  #     Point ``jwtSecretName`` at the existing Secret (e.g. ``srw``) and set
+  #     ``jwtSecretKey`` to the key within that bundle (e.g.
+  #     ``SESSION_JWT_SECRET``). The bundle's owner (ESO, sealed-secrets, etc.)
+  #     populates it.
+  jwtSecret: ""
+  jwtSecretName: ""  # defaults to <release>-session-jwt (Layout A)
+  jwtSecretKey: "jwt-secret"  # key within the Secret; "jwt-secret" matches Layout A's standalone render
+  jwtTtlSeconds: 60
+
+  # Extra annotations merged into every per-session Ingress resource.
+  # Use this for ingress-controller-specific WS tuning (e.g. nginx-ingress
+  # proxy-read-timeout).
+  annotations: {}
+
+# =============================================================================
+# Orchestrator identity
+# =============================================================================
+# Per-orchestrator id used to scope vm.lifecycle.* NATS subjects when sharing
+# a NATS hub across SRW installations. Empty (default) falls back to the chart
+# fullname (e.g. "srw", "srw-prod") via the srw.orchestratorId helper. Must
+# match the paired VM controller's `orchestratorId` value on the vm-cluster
+# chart, otherwise publishes drop silently on the controller side.
+orchestratorId: ""
 
 # =============================================================================
 # NATS Messaging (optional)

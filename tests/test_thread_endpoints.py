@@ -27,6 +27,8 @@ from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import pytest
 
+from services.workspace_lifecycle import WorkspaceOwner
+
 
 # =============================================================================
 # Replicated endpoint logic — mirrors orchestrator/main.py handlers
@@ -104,7 +106,9 @@ async def agent_create_thread(
                 thread_id, {"git_remote_url": git_remote_url, "repo_name": repo_name}
             )
     if provisioner.is_available:
-        asyncio.create_task(provisioner.create_thread_workspace(thread_id))
+        asyncio.create_task(
+            provisioner.create_workspace(WorkspaceOwner.session(thread_id))
+        )
     return {"thread_id": thread_id, "status": "created"}
 
 
@@ -230,7 +234,7 @@ async def end_thread(
 
     # Container cleanup
     if container_provisioner.is_available:
-        await container_provisioner.delete_thread_workspace(thread_id)
+        await container_provisioner.delete_workspace(WorkspaceOwner.session(thread_id))
 
     # VM cleanup
     vm_ctx = metadata.get("vm") or {}
@@ -424,8 +428,8 @@ def _mock_gitea(initialized=False):
 def _mock_provisioner(available=False):
     p = AsyncMock()
     type(p).is_available = PropertyMock(return_value=available)
-    p.create_thread_workspace = AsyncMock()
-    p.delete_thread_workspace = AsyncMock()
+    p.create_workspace = AsyncMock()
+    p.delete_workspace = AsyncMock()
     return p
 
 
@@ -536,8 +540,8 @@ class TestAgentCreateThread:
 
         # Give the background task a chance to be scheduled
         await asyncio.sleep(0)
-        prov.create_thread_workspace.assert_awaited_once_with(
-            "aaaaaaaa-1111-2222-3333-444444444444"
+        prov.create_workspace.assert_awaited_once_with(
+            WorkspaceOwner.session("aaaaaaaa-1111-2222-3333-444444444444")
         )
 
     @pytest.mark.asyncio
@@ -549,7 +553,7 @@ class TestAgentCreateThread:
         await agent_create_thread(db, gitea, prov)
 
         await asyncio.sleep(0)
-        prov.create_thread_workspace.assert_not_awaited()
+        prov.create_workspace.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_returns_500_on_db_exception(self):
@@ -1057,7 +1061,7 @@ class TestEndThread:
             _mock_gitea(),
             "tid-1",
         )
-        prov.delete_thread_workspace.assert_awaited_once_with("tid-1")
+        prov.delete_workspace.assert_awaited_once_with(WorkspaceOwner.session("tid-1"))
 
     @pytest.mark.asyncio
     async def test_deletes_vm_when_provisioned(self):

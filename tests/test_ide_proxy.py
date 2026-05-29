@@ -6,6 +6,8 @@ import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from fastapi import HTTPException
+from fastapi.responses import RedirectResponse
 
 
 # =============================================================================
@@ -321,11 +323,12 @@ class TestCreateIdePod:
     def test_ide_pod_name_format(self):
         """IDE pod uses 'ide-' prefix with truncated job_id."""
         from orchestrator.services.container_provisioner import ContainerProvisioner
+        from services.workspace_lifecycle import WorkspaceOwner
 
         provisioner = ContainerProvisioner()
         manifest = provisioner._build_pod_manifest(
             pod_name="ide-abc123456789",
-            job_id="abc123456789-full-uuid",
+            owner=WorkspaceOwner.job("abc123456789-full-uuid"),
             image="test:latest",
             cpu="250m",
             memory="512Mi",
@@ -338,11 +341,12 @@ class TestCreateIdePod:
     def test_ide_pod_label_override(self):
         """create_ide_pod overrides the component label to 'ide-session'."""
         from orchestrator.services.container_provisioner import ContainerProvisioner
+        from services.workspace_lifecycle import WorkspaceOwner
 
         provisioner = ContainerProvisioner()
         manifest = provisioner._build_pod_manifest(
             pod_name="ide-test123",
-            job_id="test123-full-uuid",
+            owner=WorkspaceOwner.job("test123-full-uuid"),
             image="test:latest",
             cpu="250m",
             memory="512Mi",
@@ -459,3 +463,112 @@ class TestProxyHopHeaders:
         assert "authorization" in hop_headers
         assert "connection" in hop_headers
         assert "transfer-encoding" in hop_headers
+
+
+# =============================================================================
+# ide_proxy_http — graceful auth for browser navigations (BFF idle-session UX)
+# =============================================================================
+
+
+class TestIsBrowserNavigation:
+    """Unit tests for the _is_browser_navigation request classifier."""
+
+    @staticmethod
+    def _req(headers: dict[str, str]):
+        req = MagicMock()
+        req.headers = headers
+        return req
+
+    def test_sec_fetch_mode_navigate(self):
+        from main import _is_browser_navigation
+
+        assert _is_browser_navigation(self._req({"sec-fetch-mode": "navigate"})) is True
+
+    def test_sec_fetch_mode_cors_is_not_navigation(self):
+        from main import _is_browser_navigation
+
+        # code-server's own asset/XHR sub-requests — must NOT be treated as navs.
+        req = self._req({"sec-fetch-mode": "cors", "accept": "application/json"})
+        assert _is_browser_navigation(req) is False
+
+    def test_accept_html_fallback(self):
+        from main import _is_browser_navigation
+
+        # Older browsers without Sec-Fetch-Mode: fall back to Accept: text/html.
+        req = self._req({"accept": "text/html,application/xhtml+xml"})
+        assert _is_browser_navigation(req) is True
+
+    def test_no_signal_is_not_navigation(self):
+        from main import _is_browser_navigation
+
+        assert _is_browser_navigation(self._req({})) is False
+
+
+class TestIdeProxyHttpAuthRedirect:
+    """ide_proxy_http turns a no-session 401 on a top-level browser navigation
+    into a 302 to the cockpit login, while leaving XHR/sub-resource 401s and all
+    403s (pending approval / IDE access denied) as raw errors — never looping an
+    authenticated-but-unauthorized user through login."""
+
+    @staticmethod
+    def _req(headers: dict[str, str]):
+        req = MagicMock()
+        req.headers = headers
+        req.cookies = {}
+        return req
+
+    @pytest.mark.asyncio
+    async def test_navigation_401_redirects_to_login(self):
+        import main
+
+        with patch(
+            "main.require_approved_user",
+            AsyncMock(
+                side_effect=HTTPException(status_code=401, detail="Not authenticated")
+            ),
+        ):
+            resp = await main.ide_proxy_http(
+                self._req({"sec-fetch-mode": "navigate"}), "thread-123", ""
+            )
+
+        assert isinstance(resp, RedirectResponse)
+        assert resp.status_code == 302
+        assert resp.headers["location"] == "/auth/login?return_to=/"
+
+    @pytest.mark.asyncio
+    async def test_xhr_401_is_not_redirected(self):
+        import main
+
+        with patch(
+            "main.require_approved_user",
+            AsyncMock(
+                side_effect=HTTPException(status_code=401, detail="Not authenticated")
+            ),
+        ):
+            with pytest.raises(HTTPException) as exc_info:
+                await main.ide_proxy_http(
+                    self._req({"sec-fetch-mode": "cors", "accept": "application/json"}),
+                    "thread-123",
+                    "",
+                )
+
+        assert exc_info.value.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_navigation_403_is_not_redirected(self):
+        import main
+
+        with patch(
+            "main.require_approved_user",
+            AsyncMock(
+                side_effect=HTTPException(
+                    status_code=403, detail="Account pending approval."
+                )
+            ),
+        ):
+            with pytest.raises(HTTPException) as exc_info:
+                await main.ide_proxy_http(
+                    self._req({"sec-fetch-mode": "navigate"}), "thread-123", ""
+                )
+
+        assert exc_info.value.status_code == 403

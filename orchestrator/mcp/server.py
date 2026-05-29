@@ -2806,6 +2806,7 @@ async def get_persistent_thread_messages(
     thread_id: str,
     limit: int = 50,
     offset: int = 0,
+    full_content: bool = False,
 ) -> str:
     """Get message history for a persistent thread session.
 
@@ -2816,6 +2817,9 @@ async def get_persistent_thread_messages(
         thread_id: Thread UUID to get messages for
         limit: Maximum messages to return (1-500, default 50)
         offset: Pagination offset (default 0)
+        full_content: If True, emit each message's content in full instead of
+            the default 500-char preview. Pair with a small ``limit`` — full
+            bodies can be very large.
 
     Returns:
         Formatted message history
@@ -2829,7 +2833,7 @@ async def get_persistent_thread_messages(
     data = await client.get_persistent_thread_messages(
         thread_id, limit=limit, offset=offset
     )
-    return fmt.format_persistent_thread_messages(data)
+    return fmt.format_persistent_thread_messages(data, full_content=full_content)
 
 
 @mcp.tool
