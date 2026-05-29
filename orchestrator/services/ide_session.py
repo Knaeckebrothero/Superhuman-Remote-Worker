@@ -489,6 +489,21 @@ class IdeSessionService:
         elif source == "gitea":
             await self._clone_gitea_to_vm(job_id, job, ssh_host, ssh_port)
 
+        # Seed the user's saved code-server config. The per-user store wins over
+        # whatever the snapshot carried — IDE prefs are a user-level concept.
+        try:
+            from services.ide_settings import seed_ide_config_for_user
+
+            await seed_ide_config_for_user(
+                self._db, job.get("user_id"), ssh_host, ssh_port
+            )
+        except Exception:
+            logger.warning(
+                "Failed to seed code-server config for IDE session %s",
+                job_id,
+                exc_info=True,
+            )
+
         # Code-server should already be running from base image
         code_server_url = _build_code_server_url(job_id)
 

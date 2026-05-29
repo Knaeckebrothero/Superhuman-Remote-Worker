@@ -37,6 +37,18 @@ if [ -f /tmp/ssh-pubkey/ssh-publickey ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# 2b. Seed per-user code-server config (theme / keybindings / snippets)
+#     The orchestrator mounts a ConfigMap carrying a self-contained seed.sh
+#     that writes the user's stored config into /var/lib/code-server/User and
+#     sets each file's mtime (so the settings sweeper won't re-pull an
+#     untouched seed). Runs as root before the su to agent-host below, so its
+#     chown succeeds. Best-effort — a failure must not stop the workspace.
+# ---------------------------------------------------------------------------
+if [ -f /mnt/code-server-config/seed.sh ]; then
+    sh /mnt/code-server-config/seed.sh || echo "code-server seed failed (non-fatal)" >&2
+fi
+
+# ---------------------------------------------------------------------------
 # 3. Start code-server as agent-host (background)
 #    --user-data-dir and --extensions-dir outside home keep the IDE file
 #    explorer clean. Opens /home/agent-host/workspace as the workspace root.
