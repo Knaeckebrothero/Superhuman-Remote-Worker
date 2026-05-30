@@ -572,6 +572,12 @@ spec:
     accessControlAllowHeaders:
       - "Content-Type"
       - "Authorization"
+      # X-CSRF: cookie-BFF CSRF token sent by the cockpit on every mutating
+      # request (auth.interceptor.ts) and required by the orchestrator
+      # CSRFMiddleware. Without it the preflight rejects all POST/PUT/PATCH/DELETE.
+      - "X-CSRF"
+      # X-Admin-View-As: set by the cockpit view-as interceptor for admin view-as.
+      - "X-Admin-View-As"
     accessControlAllowOriginList:
       - {{ include "srw.cockpitUrl" . | quote }}
     accessControlMaxAge: 86400
