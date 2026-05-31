@@ -204,7 +204,7 @@ UI depth is intentionally minimal for v1, matching the prompt editor's altitude;
 
 ## 10. Migration, flag & back-compat
 
-- **Table/endpoint/flag rename (recommended).** Because the feature is **dev-only** (flag is `false` in `helm/values.yaml`, `true` only in `deployment/values-experimental.yaml`) with low/no production data, now is the cheapest time to rename `prompt_overrides` → `config_overrides`, `/api/admin/prompts/*` → `/api/admin/config/*`, and `PROMPT_DB_OVERRIDES_ENABLED` → `CONFIG_DB_OVERRIDES_ENABLED`, avoiding a permanent misnomer. Keep the old env var as a deprecated alias for one release; update `configmap.yaml` + `values-experimental.yaml`. *(Lower-churn fallback: keep all the `prompt*` names and just add `value_json` + widen `kind`/the API/UI in place. Functionally identical; uglier names.)*
+- **Full rename now (locked).** The feature is **dev-only** (flag `false` in `helm/values.yaml`, `true` only in `deployment/values-experimental.yaml`) with low/no production data, so we rename in one push: `prompt_overrides` → `config_overrides`, `/api/admin/prompts/*` → `/api/admin/config/*`, `PROMPT_DB_OVERRIDES_ENABLED` → `CONFIG_DB_OVERRIDES_ENABLED` (helm value `configDbOverridesEnabled`), and the Cockpit `/admin/config` page. No deprecated aliases. **The table rename happens in a new migration `0022` (`ALTER TABLE … RENAME`)** — the already-applied `0021` file is never edited (the migration runner checksums it).
 - **Back-compat:** existing prompt/instruction override rows are untouched by the rename + column add. Resume path unchanged. Prod stays off.
 - **Data path correctness:** depends on the orchestrator's `get_project_root()` marker fix already in `docker/Dockerfile.orchestrator:69-70` (the bundled/file reads rely on it).
 
@@ -219,11 +219,12 @@ UI depth is intentionally minimal for v1, matching the prompt editor's altitude;
 
 ---
 
-## 12. Open decisions to confirm
+## 12. Decisions (locked with the user, 2026-05-31)
 
-1. **Rename vs keep `prompt_*` names** (table / `/api/admin/...` path / env flag). Recommended: rename now (dev-only, cheapest). Acceptable: keep names, extend in place.
-2. **Settings granularity:** per-leaf rows (recommended) vs one `value_json` blob per `(family, settings)`.
-3. **Flag:** rename to `CONFIG_DB_OVERRIDES_ENABLED` (with alias) vs reuse `PROMPT_DB_OVERRIDES_ENABLED` as-is.
+1. **Full rename now** (`prompt_* → config_*`): table, `/api/admin/config/*`, `CONFIG_DB_OVERRIDES_ENABLED`, loader/DB/Pydantic identifiers, and the Cockpit page (`/admin/config`). No deprecated aliases — one push, verified on the k3d-local cluster.
+2. **Per-leaf settings rows** (`name` = `temperature`, `limits.context_threshold_tokens`, …); `value_json` holds the typed value.
+3. **Basic UI now**: rename the existing admin page to `/admin/config` and add minimal `value_json` editing for settings/guardrails (the picker is already catalog-driven).
+4. Implementation plan: `docs/superpowers/plans/2026-05-31-config-matrix-db-overrides.md` (Phases A rename → B backend → C UI → D k3d).
 
 ## 13. Deferred / roadmap
 
