@@ -858,7 +858,8 @@
       "collapsedEmpty": "Tool calls only",
       "thoughtCount": "{{count}} thoughts",
       "textCount": "{{count}} text blocks",
-      "toolCount": "{{count}} tool calls"
+      "toolCount": "{{count}} tool calls",
+      "toolGroup": "{{count}}× tool calls"
     },
     "diff": {
       "replace": "Diff",
