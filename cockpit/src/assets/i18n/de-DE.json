@@ -858,7 +858,8 @@
       "collapsedEmpty": "Nur Werkzeugaufrufe",
       "thoughtCount": "{{count}} Gedanken",
       "textCount": "{{count}} Textblöcke",
-      "toolCount": "{{count}} Werkzeugaufrufe"
+      "toolCount": "{{count}} Werkzeugaufrufe",
+      "toolGroup": "{{count}}× Werkzeugaufrufe"
     },
     "diff": {
       "replace": "Diff",

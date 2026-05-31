@@ -24,8 +24,10 @@ import {ChatAttachment, PermissionRequest, PersistentChatService, RunningToolInf
 import {
     AssistantTurn,
     countEvents,
+    EventGroup,
     firstSentence,
     firstTextOf,
+    groupEvents,
     isAssistantTurn,
     isSystemTurn,
     isUserTurn,
@@ -666,30 +668,51 @@ interface FileEditView {
                          elements that defeat nowrap. -->
                     <span class="turn-headline">{{ collapsedHeadline(turn) }}</span>
                   } @else {
-                    <!-- Expanded: every event rendered as its own card. -->
-                    @for (event of turn.events; track event.id) {
-                      @switch (event.kind) {
-                        @case ('thought') {
-                          @if (chat.narrationMode() !== 'silent') {
-                            <ng-container [ngTemplateOutlet]="thoughtCard" [ngTemplateOutletContext]="{ $implicit: event }"></ng-container>
+                    <!-- Expanded: events rendered as cards, with consecutive
+                         tool runs grouped (#10). A run of TOOL_GROUP_THRESHOLD+
+                         tools collapses into one disclosure; shorter runs and
+                         every thought/text render individually. -->
+                    @for (group of groupedEvents(turn); track group.id) {
+                      @if (group.kind === 'tools') {
+                        @if (isLongToolRun(group.tools)) {
+                          <!-- Collapsed run: "N× tool calls", auto-open on error/denied. -->
+                          <details class="tool-group" [attr.open]="toolGroupHasProblem(group.tools) ? '' : null">
+                            <summary class="tool-group-head">
+                              <app-icon size="sm" class="tool-group-chevron">chevron_right</app-icon>
+                              <span class="tool-group-label">{{ 'chat.turn.toolGroup' | transloco:{count: group.tools.length} }}</span>
+                              <span class="tool-group-names">{{ toolGroupSummary(group.tools) }}</span>
+                            </summary>
+                            <div class="tool-group-body">
+                              <ng-container [ngTemplateOutlet]="toolDetails" [ngTemplateOutletContext]="{ $implicit: group.tools }"></ng-container>
+                            </div>
+                          </details>
+                        } @else {
+                          <!-- Short run: each tool inline, exactly as before. -->
+                          @for (event of group.tools; track event.id) {
+                            <div class="event-tool">
+                              <ng-container [ngTemplateOutlet]="toolDetails" [ngTemplateOutletContext]="{ $implicit: [event] }"></ng-container>
+                              @if (event.decision; as d) {
+                                <div class="mile-resolved" [class.approved]="d === 'approved'" [class.rejected]="d === 'denied'">
+                                  <app-icon size="sm" class="mile-resolved-icon">{{ d === 'approved' ? 'check_circle' : 'block' }}</app-icon>
+                                  <span class="resolved-label">{{ ('chat.approval.badge.' + d) | transloco }}</span>
+                                  <span class="resolved-title">{{ event.tool }}</span>
+                                </div>
+                              }
+                            </div>
                           }
                         }
-                        @case ('text') {
-                          <div class="event-text">
-                            <markdown [data]="event.content"></markdown>
-                          </div>
-                        }
-                        @case ('tool_call') {
-                          <div class="event-tool">
-                            <ng-container [ngTemplateOutlet]="toolDetails" [ngTemplateOutletContext]="{ $implicit: [event] }"></ng-container>
-                            @if (event.decision; as d) {
-                              <div class="mile-resolved" [class.approved]="d === 'approved'" [class.rejected]="d === 'denied'">
-                                <app-icon size="sm" class="mile-resolved-icon">{{ d === 'approved' ? 'check_circle' : 'block' }}</app-icon>
-                                <span class="resolved-label">{{ ('chat.approval.badge.' + d) | transloco }}</span>
-                                <span class="resolved-title">{{ event.tool }}</span>
-                              </div>
+                      } @else {
+                        @switch (group.event.kind) {
+                          @case ('thought') {
+                            @if (chat.narrationMode() !== 'silent') {
+                              <ng-container [ngTemplateOutlet]="thoughtCard" [ngTemplateOutletContext]="{ $implicit: group.event }"></ng-container>
                             }
-                          </div>
+                          }
+                          @case ('text') {
+                            <div class="event-text">
+                              <markdown [data]="group.event.content"></markdown>
+                            </div>
+                          }
                         }
                       }
                     }
@@ -2278,6 +2301,34 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     /** Per-type event counts for the chevron badge. */
     turnEventCounts(turn: AssistantTurn) {
         return countEvents(turn);
+    }
+
+    /**
+     * Intra-turn tool grouping (Slice 3 / #10). A run of this many or more
+     * consecutive tool calls collapses into a single "N× tool calls"
+     * disclosure; shorter runs render inline. A run is broken by any
+     * thought/text, so `[tool,tool,thought,tool,tool]` stays two groups.
+     */
+    private readonly TOOL_GROUP_THRESHOLD = 4;
+
+    /** Coalesce a turn's events into render groups (consecutive tools merged). */
+    groupedEvents(turn: AssistantTurn): EventGroup[] {
+        return groupEvents(turn.events);
+    }
+
+    /** A tool run this long or longer collapses into a single group disclosure. */
+    isLongToolRun(tools: ToolCallEvent[]): boolean {
+        return tools.length >= this.TOOL_GROUP_THRESHOLD;
+    }
+
+    /** True if a grouped run should auto-open: any member errored or was denied. */
+    toolGroupHasProblem(tools: ToolCallEvent[]): boolean {
+        return tools.some((t) => t.status === 'error' || t.status === 'denied' || t.resultStatus === 'error');
+    }
+
+    /** Human one-liner of the distinct tools in a run ("read_file, edit_file x2"). */
+    toolGroupSummary(tools: ToolCallEvent[]): string {
+        return this.groupToolCallsHuman(tools);
     }
 
     /** Last text event in a turn — used for the TTS "read aloud" button. */
