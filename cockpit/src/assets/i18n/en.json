@@ -860,6 +860,13 @@
       "textCount": "{{count}} text blocks",
       "toolCount": "{{count}} tool calls"
     },
+    "diff": {
+      "replace": "Diff",
+      "append": "Appended",
+      "prepend": "Prepended",
+      "write": "Written",
+      "truncated": "+{{count}} more lines"
+    },
     "settings": {
       "mode": "Mode",
       "narration": "Narration",

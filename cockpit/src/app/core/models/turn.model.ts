@@ -174,6 +174,42 @@ export function lastTextOf(turn: AssistantTurn): TextEvent | undefined {
 }
 
 /**
+ * Returns the first text event in a turn. The agent's opening line usually
+ * states what it's about to do, which makes a far more useful collapsed
+ * headline than the trailing text (often just "Done."). Symmetric with
+ * lastTextOf.
+ */
+export function firstTextOf(turn: AssistantTurn): TextEvent | undefined {
+    for (const e of turn.events) {
+        if (isText(e)) return e;
+    }
+    return undefined;
+}
+
+/**
+ * First sentence of a (possibly markdown) block, for a one-line headline.
+ * Drops leading markdown markers, collapses whitespace, cuts at the first
+ * sentence terminator at/after a sensible minimum length, and caps the
+ * result. Returns '' for empty/whitespace input.
+ */
+export function firstSentence(text: string, maxLen = 140): string {
+    if (!text) return '';
+    // Strip a leading markdown marker (#, >, bullet) then collapse whitespace
+    // so the headline reads as prose rather than raw source.
+    let s = text.trim().replace(/^[#>\s]*[-*]?\s*/, '').replace(/\s+/g, ' ').trim();
+    if (!s) return '';
+    for (let i = 11; i < s.length; i++) {
+        const ch = s[i];
+        if ((ch === '.' || ch === '!' || ch === '?') && (i + 1 >= s.length || s[i + 1] === ' ')) {
+            s = s.slice(0, i + 1);
+            break;
+        }
+    }
+    if (s.length > maxLen) s = s.slice(0, maxLen - 1).trimEnd() + '…';
+    return s;
+}
+
+/**
  * Per-type event counts for the collapsed-turn badge.
  */
 export interface TurnEventCounts {

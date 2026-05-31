@@ -58,3 +58,55 @@
 .token.constant {
   color: #569cd6;
 }
+
+// Light theme (travertine) — the dark palette above washes out on the light
+// cream code background (pale-yellow functions, light-grey punctuation become
+// near-invisible). Override with the VS Code Light+ palette, which is legible
+// on light. Scoped under .theme-travertine (on <body>) so it only applies on
+// the light theme; .theme-senate / default keep the dark palette above.
+.theme-travertine {
+  .token.comment,
+  .token.prolog,
+  .token.doctype,
+  .token.cdata {
+    color: #008000;
+  }
+
+  .token.keyword {
+    color: #0000ff;
+  }
+
+  .token.string,
+  .token.attr-value {
+    color: #a31515;
+  }
+
+  .token.function {
+    color: #795e26;
+  }
+
+  .token.number {
+    color: #098658;
+  }
+
+  .token.operator {
+    color: #383838;
+  }
+
+  .token.class-name {
+    color: #267f99;
+  }
+
+  .token.variable {
+    color: #001080;
+  }
+
+  .token.punctuation {
+    color: #383838;
+  }
+
+  .token.boolean,
+  .token.constant {
+    color: #0000ff;
+  }
+}

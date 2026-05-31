@@ -396,13 +396,22 @@ chmod +x ~/.local/bin/tilt
 tilt version
 ```
 
-**Run Tilt**:
+**Run Tilt — first time (or after `k3d cluster delete && create`)**:
 
 ```bash
 ./scripts/local-dev-tilt-up.sh
 ```
 
-This bootstrap is idempotent — it runs `scripts/local-dev-up.sh` underneath (cluster + cert-manager + namespace + vm-ssh-key Secret), then adds the `srw-session-jwt` Secret, syncs the current Traefik ClusterIP into `values-local.yaml`'s `opencloud.hostAliases` entry, and finally runs `tilt up` in the foreground. Press Ctrl-C to stop Tilt (the cluster keeps running; use `k3d cluster stop srw` to stop that too).
+This bootstrap is idempotent — it runs `scripts/local-dev-up.sh` underneath (cluster + cert-manager + namespace + vm-ssh-key Secret), then adds the `srw-session-jwt` Secret, syncs the current Traefik ClusterIP into `values-local.yaml`'s `opencloud.hostAliases` entry, and finally runs `tilt up` in the foreground.
+
+**Run Tilt — subsequent sessions**: the cluster, secrets, and Helm release persist across `k3d cluster stop/start`, and the Traefik ClusterIP is stable for the life of the cluster, so you don't need the bootstrap again. Just bring the cluster back and start Tilt directly (always cluster first, then Tilt — Tilt deploys *into* a running cluster):
+
+```bash
+k3d cluster start srw   # if it was stopped
+tilt up                 # from the repo root; Tilt UI at https://localhost:10350
+```
+
+Press Ctrl-C to stop Tilt (the cluster keeps running; use `k3d cluster stop srw` to stop that too). The bootstrap script is always safe to re-run if you're unsure — it skips anything already in place.
 
 #### The Plan → Develop → Verify workflow
 

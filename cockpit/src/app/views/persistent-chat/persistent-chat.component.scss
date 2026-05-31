@@ -512,6 +512,9 @@
         display: flex;
         gap: 10px;
         max-width: 90%;
+        /* Pin the avatar to the top so it sits beside the first line of a
+           tall bubble rather than centering against it (#9). */
+        align-items: flex-start;
       }
 
       .message-user {
@@ -532,6 +535,10 @@
         justify-content: center;
         flex-shrink: 0;
         background: var(--surface-0);
+        /* Hairline ring + soft shadow so the avatar reads as a distinct
+           element on both light and dark themes (#9). */
+        border: 1px solid color-mix(in srgb, var(--border-color) 60%, transparent);
+        box-shadow: 0 1px 2px rgba(0, 0, 0, 0.15);
       }
 
       .message-user .avatar {
@@ -838,6 +845,84 @@
         font-family: 'JetBrains Mono', monospace;
         line-height: 1.4;
         color: var(--text-secondary);
+      }
+
+      /* #7: diff/content view inside an edit_file/write_file tool card.
+         Overrides .tool-body's padding (diff-head/body carry their own). */
+      .tool-diff {
+        padding: 0;
+      }
+
+      .diff-head {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 6px 12px;
+        font-size: 11px;
+        color: var(--text-muted);
+        border-bottom: 1px solid var(--border-color, var(--surface-0));
+      }
+
+      .diff-mode-icon {
+        color: var(--accent-color);
+      }
+
+      .diff-mode {
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+      }
+
+      .diff-path {
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        font-family: 'JetBrains Mono', monospace;
+        color: var(--text-secondary);
+      }
+
+      .diff-body {
+        max-height: 320px;
+        overflow: auto;
+        padding: 4px 0;
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 11px;
+        line-height: 1.45;
+      }
+
+      .diff-line {
+        display: flex;
+        padding: 0 8px;
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+
+      .diff-line .diff-sign {
+        width: 1ch;
+        flex-shrink: 0;
+        opacity: 0.55;
+        user-select: none;
+      }
+
+      .diff-line .diff-text {
+        flex: 1;
+        min-width: 0;
+      }
+
+      .diff-line.add {
+        background: color-mix(in srgb, var(--success) 18%, transparent);
+      }
+
+      .diff-line.del {
+        background: color-mix(in srgb, var(--danger) 18%, transparent);
+      }
+
+      .diff-truncated {
+        padding: 4px 12px;
+        font-size: 11px;
+        font-style: italic;
+        color: var(--text-muted);
       }
 
       /* Inline tool progress (streaming) */
@@ -2120,12 +2205,6 @@
   @include m.truncate;
   color: var(--text-primary);
   font-size: v.$font-size-sm;
-}
-
-.turn-headline-empty {
-  color: var(--text-muted);
-  font-style: italic;
-  font-size: v.$font-size-xs;
 }
 
 .event-tool + .event-tool { margin-top: v.$space-xs; }

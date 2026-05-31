@@ -24,6 +24,8 @@ import {ChatAttachment, PermissionRequest, PersistentChatService, RunningToolInf
 import {
     AssistantTurn,
     countEvents,
+    firstSentence,
+    firstTextOf,
     isAssistantTurn,
     isSystemTurn,
     isUserTurn,
@@ -34,6 +36,7 @@ import {
     Turn,
     TurnEvent,
 } from '../../core/models/turn.model';
+import {DiffLine, lineDiff} from '../../core/util/line-diff';
 import {ApiService, IdeSessionStatus} from '../../core/services/api.service';
 import {ModelService} from '../../core/services/model.service';
 import {I18nService} from '../../core/services/i18n.service';
@@ -263,6 +266,17 @@ export function pickCodeServerUrlToOpen(status: IdeSessionStatus | null): string
         : null;
 }
 
+/** Structured diff/content view for a file-mutating tool card (#7). */
+interface FileEditView {
+    path: string;
+    /** Drives the header label + icon: 'replace' renders a true diff;
+     *  the rest are all-additions (no "before" is available). */
+    mode: 'replace' | 'append' | 'prepend' | 'write';
+    lines: DiffLine[];
+    /** Lines dropped by the render cap, if any (shown as a "+N more" footer). */
+    truncated: number;
+}
+
 @Component({
     selector: 'app-persistent-chat',
     standalone: true,
@@ -477,7 +491,30 @@ export function pickCodeServerUrlToOpen(status: IdeSessionStatus | null): string
                   {{ translateStatus(tc.status) }}
                 </span>
               </summary>
-              @if (tc.result) {
+              @if (fileEditView(tc); as fev) {
+                <!-- #7: diff/content view for edit_file/write_file, built from
+                     the call args. 'replace' is a true old→new diff; the rest
+                     are all-additions (no "before" available). -->
+                <div class="tool-body tool-diff">
+                  <div class="diff-head">
+                    <app-icon size="sm" class="diff-mode-icon">{{ fev.mode === 'write' ? 'note_add' : 'difference' }}</app-icon>
+                    <span class="diff-mode">{{ ('chat.diff.' + fev.mode) | transloco }}</span>
+                    @if (fev.path) {
+                      <span class="diff-path">{{ fev.path }}</span>
+                    }
+                  </div>
+                  <div class="diff-body">
+                    @for (ln of fev.lines; track $index) {
+                      <div class="diff-line" [class.add]="ln.type === 'add'" [class.del]="ln.type === 'del'">
+                        <span class="diff-sign">{{ diffSign(ln.type) }}</span><span class="diff-text">{{ ln.text }}</span>
+                      </div>
+                    }
+                  </div>
+                  @if (fev.truncated > 0) {
+                    <div class="diff-truncated">{{ 'chat.diff.truncated' | transloco:{count: fev.truncated} }}</div>
+                  }
+                </div>
+              } @else if (tc.result) {
                 <div class="tool-body"><pre class="tool-result">{{ tc.result }}</pre></div>
               }
             </details>
@@ -622,15 +659,12 @@ export function pickCodeServerUrlToOpen(status: IdeSessionStatus | null): string
                   }
 
                   @if (isCollapsed) {
-                    <!-- Collapsed: single-line preview of the final text
-                         event. Plain text (not <markdown>) so the truncate
-                         mixin works — markdown emits inner block elements
-                         that defeat nowrap. -->
-                    @if (last) {
-                      <span class="turn-headline">{{ last.content }}</span>
-                    } @else {
-                      <span class="turn-headline-empty">{{ 'chat.turn.collapsedEmpty' | transloco }}</span>
-                    }
+                    <!-- Collapsed: one-line headline — first sentence of the
+                         agent's opening text, or a tool/thought digest when
+                         there's no text (#8). Plain text (not <markdown>) so
+                         the truncate mixin works — markdown emits inner block
+                         elements that defeat nowrap. -->
+                    <span class="turn-headline">{{ collapsedHeadline(turn) }}</span>
                   } @else {
                     <!-- Expanded: every event rendered as its own card. -->
                     @for (event of turn.events; track event.id) {
@@ -2246,9 +2280,71 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         return countEvents(turn);
     }
 
-    /** Last text event in a turn — used as the collapsed-view headline. */
+    /** Last text event in a turn — used for the TTS "read aloud" button. */
     lastTextEvent(turn: AssistantTurn): TextEvent | undefined {
         return lastTextOf(turn);
+    }
+
+    /**
+     * Headline for a collapsed assistant turn (#8). Prefers the first sentence
+     * of the agent's opening text (more useful than the trailing "Done."); when
+     * the turn has no text, falls back to a tool/thought digest.
+     */
+    collapsedHeadline(turn: AssistantTurn): string {
+        const first = firstTextOf(turn);
+        const sentence = first ? firstSentence(first.content) : '';
+        if (sentence) return sentence;
+        const c = countEvents(turn);
+        if (c.tools > 0) return this.transloco.translate('chat.turn.toolCount', {count: c.tools});
+        if (c.thoughts > 0) return this.transloco.translate('chat.turn.thoughtCount', {count: c.thoughts});
+        return this.transloco.translate('chat.turn.collapsedEmpty');
+    }
+
+    /** Render cap for a single diff card — bounds DOM for huge write_file bodies. */
+    private readonly DIFF_LINE_CAP = 400;
+
+    /**
+     * Diff/content view for an edit_file / write_file tool card (#7), built
+     * straight from the call args (no backend round-trip): edit_file replace
+     * carries old_string→new_string so we show a real diff; append/prepend/
+     * write have no "before" and render as all-additions. Returns null for any
+     * other tool, and for failed calls (so the error message shows instead of a
+     * diff that never applied).
+     */
+    fileEditView(tc: ToolCallEvent): FileEditView | null {
+        if (tc.status === 'error') return null;
+        const args = tc.args || {};
+        const str = (k: string): string => (typeof args[k] === 'string' ? (args[k] as string) : '');
+        const path = str('path');
+        let mode: FileEditView['mode'];
+        let lines: DiffLine[];
+        if (tc.tool === 'write_file') {
+            mode = 'write';
+            lines = lineDiff('', str('content'));
+        } else if (tc.tool === 'edit_file') {
+            const position = str('position');
+            if (position === 'end') {
+                mode = 'append';
+                lines = lineDiff('', str('new_string'));
+            } else if (position === 'start') {
+                mode = 'prepend';
+                lines = lineDiff('', str('new_string'));
+            } else {
+                mode = 'replace';
+                lines = lineDiff(str('old_string'), str('new_string'));
+            }
+        } else {
+            return null;
+        }
+        if (lines.length === 0) return null;
+        const truncated = Math.max(0, lines.length - this.DIFF_LINE_CAP);
+        if (truncated > 0) lines = lines.slice(0, this.DIFF_LINE_CAP);
+        return {path, mode, lines, truncated};
+    }
+
+    /** Gutter sign for a diff line. */
+    diffSign(type: DiffLine['type']): string {
+        return type === 'add' ? '+' : type === 'del' ? '-' : ' ';
     }
 
     /**
