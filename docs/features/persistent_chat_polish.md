@@ -20,7 +20,7 @@ related:
 
 > Round of UX polish items surfaced by a session test on the dev cluster. The big-rocks rendering work (turn cards, tool-result/thinking durability, streaming reasoning capture) shipped 2026-05-17–19 — this doc captures the residual paper cuts and the next steps that build on top of it.
 
-**Status:** Backlog — triaged, not yet sliced into PRs.
+**Status:** Slices 1 & 2 ✅ shipped + verified (local k3d + live on the dev cluster). Slice 3 ✅ shipped + verified on local k3d (optional dev pass pending a push). Slices 4–6 and the separate workstreams remain backlog. See the decision log for per-item detail.
 **Filed:** 2026-05-20
 **Source:** Self-test of a fresh persistent session after `session_turn_rendering` Phase 1 + reasoning capture went live.
 
@@ -32,7 +32,7 @@ This doc captures the full list verbatim and triages it into shippable slices so
 
 ## Triage
 
-### Slice 1 — Easy wins (one PR, ~half a day)
+### Slice 1 — Easy wins (one PR, ~half a day) — ✅ SHIPPED
 
 Pure renderer/style changes, no schema, no protocol. Verifiable end-to-end in one Playwright pass.
 
@@ -42,16 +42,18 @@ Pure renderer/style changes, no schema, no protocol. Verifiable end-to-end in on
 4. **Tool card max-width** — CSS only. `.tool-card { max-width: min(720px, 100%); }` so cards stop spanning the viewport.
 5. **Autocollapse long user messages** — wrap `.user-text` in a `<details>` when line count exceeds a threshold (~8 lines feels right); summary shows first line + "[...]" hint.
 
-### Slice 2 — Single-component polish (one PR each, ~1–2 days each)
+### Slice 2 — Single-component polish (one PR each, ~1–2 days each) — ✅ SHIPPED
 
-Each touches one component or one render path. No cross-cutting work.
+Each touches one component or one render path. No cross-cutting work. **All four (#6–#9) shipped + verified** locally (seeded historical thread) and live on the dev cluster (`gpt-5.4-mini` streaming session) on 2026-05-31. #6's Prism theme was made theme-aware (light/travertine palette) during verification. The one tiny follow-up (#8 `firstSentence()` not stripping a leading code-fence) was fixed afterward — see the decision log.
 
 6. **Code-block styling in markdown output** — basic `<code>`/`<pre>` styling (background, padding, monospaced). Full syntax highlighting (highlight.js / Prism / Shiki) is a separate decision; defer until we see it actually matters in real reasoning text.
 7. **Diff view for `edit_file` / `write_file` tool cards** — render a unified diff (use `diff2html` or a small homegrown formatter) instead of the raw post-state. Needs `before` content, which we may or may not have stored — confirm before scoping.
 8. **Improve the collapsed-turn summary line** — today the collapsed AssistantTurn shows the last line of content, which is often "Done." or a tool name. Replace with: first text event's first sentence, or "Used N tools, wrote M files" digest. (Builds on Phase 2 of [[session_turn_rendering]].)
 9. **Chat bubble visual refresh** — user/assistant avatars, alignment, padding. Cosmetic, but the gap is visible.
 
-### Slice 3 — Sequential-element grouping (1 week-ish)
+### Slice 3 — Sequential-element grouping (1 week-ish) — ✅ SHIPPED (verified on local k3d)
+
+Built render-time in ~half a day, not the estimated week (the existing flat event model + array-taking `#toolDetails` template made it a pure view-model step). Unit-tested, build-clean, and live-verified on the local k3d cluster (seeded historical thread, all five behaviors incl. the no-merge-across-thought constraint). See the decision log. Optional dev-cluster pass pending a push, as with Slice 2.
 
 10. **Group consecutive same-kind events** — render a run of N tool calls as a single "10× tools" collapsible. Critically: a `[tool, tool, thought, tool, tool]` sequence must render as `[2× tools, thought, 2× tools]`, not collapsed into one group. This is Phase 2 of [[session_turn_rendering]] proper — runs entirely in `turn-reducer.ts` and the template.
 
@@ -164,3 +166,20 @@ Preserved so nothing is lost, even where it overlaps with the triage above.
   - Verified on the running pod by `kubectl cp`-ing the working-tree files into Tilt's `ng serve` (cluster was started without `tilt up`, and the baked image predated `c8f1b315` so the theme files were missing from the pod). These pod-side copies are **ephemeral** — the durable changes live uncommitted in the working tree.
 
 - **2026-05-31 — Tilt build confirmed; live-streaming verification blocked by infra (not Slice 2).** With `tilt up` running, Tilt rebuilt cockpit + orchestrator from the working tree — the new cockpit *image* contains all Slice 2 + theme-aware changes (durable, not the earlier ephemeral `cp`). Attempted a real live session (Developer expert) to exercise the streaming render path: **agent provisioning + session connect now work** (vs the prior `/ready` timeout), but the first turn failed with **LLM `401 "Incorrect API key provided: not-needed"`** — the local cluster's only configured model (gemma-4 → `RedHatAI/gemma-4-31B-it-FP8-Dynamic`) points at an OpenAI-compatible endpoint with an unset key. So the live stream can't be exercised until a working model key/endpoint is set in `values-local.yaml` / admin LLM. **No Slice 2 gap**: the rendering is fully covered by the seeded-historical verification (identical components) + the turn-reducer unit tests (live event production). Incidental: the duplicate-agent-provision race recurred (2 pods, one stuck → repeated HTTP 425 on `/api/sessions/{id}/connection`), and the session ran **Supervised despite selecting Auto-accept** — reconfirming Slice 6 bug #18 (autonomy not carried into the session). Both pre-existing, separate from this doc's UX items.
+
+- **2026-05-31 — Slice 2 fully live-verified on the dev cluster.** After deploy to `cockpit.superhuman-remote-worker.com`, ran a real Developer/gpt-5.4-mini session (LLM works there). Live streaming path confirmed end-to-end: thought cards streamed **markdown** (auto-expanded), the `write_file` tool cards rendered live **"Written" diffs** (green `+` lines, real tool calls), the final reply showed a **syntax-coloured** `python` code block, and collapsing the turn produced a headline. The dev cluster also defaults to **travertine (light)**, so this confirms the **theme-aware `_code-highlight.scss` is deployed and legible** (keyword `#0000ff`, string `#a31515`, etc.). Avatar ring/shadow + `align-items:flex-start` confirmed. (#7 replace/old→new diff was covered by the earlier seed; gpt-5.4-mini happened to use `write_file` twice rather than `edit_file`.)
+  - **Minor follow-up found (#8):** `firstSentence()` strips leading `#`/`>`/`-`/`*` markers but **not** code-fence backticks, so a turn whose *first* text is a fenced code block collapses to a headline like `` ```python def greet(name): … ``` ``. Cosmetic, edge-case (agents usually emit prose before code); fix = strip a leading ```` ``` ```` fence in `firstSentence`. Not blocking. **Fixed 2026-05-31:** `firstSentence()` now strips an opening *and* closing code fence (`` ```lang … ``` ``) before the existing marker/whitespace pipeline, so a code-first turn headlines as the code's first line. +2 spec cases (10 pass).
+  - Bug #18 (Auto-accept → Supervised) reproduces on dev too. Test session deleted afterward; only `cockpit.superhuman-remote-worker.com` state touched (no infra changes — Fleet owns it).
+
+- **2026-05-31 — Slice 3 (#10, consecutive-element grouping) implemented.** Built as a **render-time** concern, not a reducer change — the model contract already says *"the renderer is free to merge them visually without distorting the data"* (`turn.model.ts`), and the shared `#toolDetails` template already takes an array of tools (we previously passed it one-element arrays). So the reducer/SSE stream is untouched; grouping is a pure view-model step. (The doc's earlier "runs in `turn-reducer.ts`" line was wrong — coalescing in the reducer would distort the event stream and complicate streaming/replay.)
+  - **`groupEvents(events): EventGroup[]`** added to `turn.model.ts` — walks the flat event list, coalescing *consecutive* `tool_call`s into one `tools` run, broken by any thought/text. So `[tool,tool,thought,tool,tool]` → `[tools(2), thought, tools(2)]`, never one merged group. Pure function, 6 spec cases incl. that exact constraint.
+  - **Template:** the expanded turn loop now iterates `groupedEvents(turn)`. A run of **≥ 4** (`TOOL_GROUP_THRESHOLD`, the chosen knob) renders as a native `<details class="tool-group">` "N× tool calls" disclosure (with a `groupToolCallsHuman` name summary) that expands to the existing `#toolDetails` list; runs of 1–3 render inline exactly as before; thought/text unchanged. The group **auto-opens when any member errored or was denied** (`toolGroupHasProblem`), so failures are never hidden behind a collapsed run.
+  - **i18n:** `chat.turn.toolGroup` ("{{count}}× tool calls" / "{{count}}× Werkzeugaufrufe"). **SCSS:** lean `.tool-group*` block (chevron rotates 90° on open, mirroring `.tool-summary-line`); component stylesheet now 35.40 kB — over the 32 kB *warn* (already was, at 34.67 kB) but under the 40 kB *error* cap. **Budget not bumped** (per the style-budget memory; the split refactor is the real fix).
+  - **Verified (unit/build):** `turn.model.spec.ts` 16/16; full cockpit suite **418/418**; `npm run build` clean (template type-check passes — Angular 21 narrows the `EventGroup` discriminated union in `@if`/`@switch`). Changes uncommitted.
+  - **Verified (live on local k3d, 2026-05-31).** Confirmed the pod ran the synced code (`groupEvents` in the pod source, `ng serve` clean compile), seeded a historical thread (`aaaaaaaa-…-0001`, owner = local `test`) covering every branch, and drove it via Playwright (0 relevant console errors — only the pre-existing `index.html markLoaded` noise). All five behaviors confirmed in the rendered UI:
+    1. **Run ≥4 collapses** to "N× tool calls" with a `groupToolCallsHuman` summary — a 5-tool turn → "5× tool calls" ("Reading graph.py x3, Grep, List dir").
+    2. **Run <4 stays inline** — a 2-tool turn rendered two separate cards, no group wrapper.
+    3. **No-merge-across-thought** — `[tool×4, thought, tool×4]` rendered as `[4× group][thought card][4× group]`, *not* one "8× tools" group (the doc's critical constraint).
+    4. **Collapsed by default**, and a collapsed group **expands on click** (native `<details>`) to the full card list.
+    5. **Auto-open on problem** — a 4-tool group containing a *denied* `run_command` auto-opened, surfacing the "Denied" card.
+    Screenshot at repo root `slice3-tool-grouping.png`. Seed fixture left in the local DB for inspection (delete with `DELETE FROM thread_messages/threads WHERE … = 'aaaaaaaa-…-0001'`). Live-streaming *formation* of groups during an in-flight turn wasn't separately exercised (local LLM key still 401) — but it runs the identical `turn.events → groupEvents` path the reducer feeds, which is unit-covered. A dev push is the optional belt-and-suspenders, as with Slice 2.
