@@ -860,6 +860,13 @@
       "textCount": "{{count}} Textblöcke",
       "toolCount": "{{count}} Werkzeugaufrufe"
     },
+    "diff": {
+      "replace": "Diff",
+      "append": "Angehängt",
+      "prepend": "Vorangestellt",
+      "write": "Geschrieben",
+      "truncated": "+{{count}} weitere Zeilen"
+    },
     "settings": {
       "mode": "Modus",
       "narration": "Erzählung",
