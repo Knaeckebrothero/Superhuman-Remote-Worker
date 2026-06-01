@@ -246,3 +246,55 @@ def test_resolve_guardrails_applies_override(monkeypatch):
         .get("extra")
         is None
     )
+
+
+def test_apply_settings_overrides_mutates_config(monkeypatch):
+    _reset()
+    monkeypatch.setenv("CONFIG_DB_OVERRIDES_ENABLED", "true")
+    from src.core.loader import (
+        AgentConfig,
+        LimitsConfig,
+        LLMConfig,
+        apply_settings_overrides,
+    )
+
+    cfg = AgentConfig(
+        agent_id="t",
+        display_name="t",
+        llm=LLMConfig(model="google/gemma-4-31b", temperature=0.0),
+        limits=LimitsConfig(),
+    )
+    loader.set_config_overrides(
+        [
+            {"family": "gemma", "kind": "settings", "name": "temperature", "value_json": 1.0},
+            {
+                "family": "gemma",
+                "kind": "settings",
+                "name": "limits.context_threshold_tokens",
+                "value_json": 123000,
+            },
+        ]
+    )
+    assert apply_settings_overrides(cfg) is True
+    assert cfg.llm.temperature == 1.0
+    assert cfg.limits.context_threshold_tokens == 123000
+
+
+def test_apply_settings_overrides_noop_without_rows(monkeypatch):
+    _reset()
+    monkeypatch.setenv("CONFIG_DB_OVERRIDES_ENABLED", "true")
+    from src.core.loader import (
+        AgentConfig,
+        LimitsConfig,
+        LLMConfig,
+        apply_settings_overrides,
+    )
+
+    cfg = AgentConfig(
+        agent_id="t",
+        display_name="t",
+        llm=LLMConfig(model="google/gemma-4-31b", temperature=0.3),
+        limits=LimitsConfig(),
+    )
+    assert apply_settings_overrides(cfg) is False
+    assert cfg.llm.temperature == 0.3

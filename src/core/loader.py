@@ -556,6 +556,28 @@ def _apply_settings_matrix(
     return data
 
 
+def apply_settings_overrides(config: "AgentConfig") -> bool:
+    """Apply ONLY the DB settings override on top of an already-resolved config,
+    in place. File/expert settings are already baked in by load_agent_config; this
+    writes just the DB delta, so it never clobbers non-overridden values. Call at
+    job start after set_config_overrides(), before LLM (re)creation and the freeze.
+    Returns True if anything changed. No-op when flag off or no settings rows."""
+    override = _settings_override_for(family_of(config.llm.model))
+    if not override:
+        return False
+    changed = False
+    for key, val in override.items():
+        if key == "limits" and isinstance(val, dict):
+            for lk, lv in val.items():
+                if hasattr(config.limits, lk) and getattr(config.limits, lk) != lv:
+                    setattr(config.limits, lk, lv)
+                    changed = True
+        elif hasattr(config.llm, key) and getattr(config.llm, key) != val:
+            setattr(config.llm, key, val)
+            changed = True
+    return changed
+
+
 class FileResolver:
     """Resolves template files with deployment override support.
 
