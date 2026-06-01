@@ -45,6 +45,38 @@ async def test_upsert_config_override_uses_on_conflict():
     assert row["content"] == "C"
 
 
+@pytest.mark.asyncio
+async def test_upsert_settings_override_persists_value_json():
+    from unittest.mock import AsyncMock
+
+    from orchestrator.database.postgres import PostgresDB
+
+    db = PostgresDB.__new__(PostgresDB)
+    db.fetchrow = AsyncMock(
+        return_value={
+            "id": "x",
+            "kind": "settings",
+            "name": "temperature",
+            "value_json": 1.0,
+        }
+    )
+
+    row = await db.upsert_config_override(
+        family="gemma",
+        kind="settings",
+        name="temperature",
+        content=None,
+        content_format=None,
+        value_json=1.0,
+        notes=None,
+        user_id=None,
+    )
+
+    sql = db.fetchrow.call_args.args[0]
+    assert "value_json" in sql and "ON CONFLICT" in sql
+    assert row["value_json"] == 1.0
+
+
 # ---------------------------------------------------------------------------
 # Route registration + model validation (import main; CI-gated — see header).
 # main is imported inside the test bodies so this file still collects locally

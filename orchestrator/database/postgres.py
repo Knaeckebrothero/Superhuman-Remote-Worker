@@ -4997,27 +4997,31 @@ class PostgresDB:
         family: str | None,
         kind: str,
         name: str,
-        content: str,
-        content_format: str = "text",
+        content: str | None = None,
+        content_format: str | None = "text",
+        value_json: Any = None,
         notes: str | None = None,
         user_id: Any = None,
     ) -> Dict[str, Any]:
         """Create or replace the override for (family, kind, name).
 
-        The conflict target is the ``uq_config_override`` expression index
-        ``(COALESCE(family,''), kind, name)``. ``created_by`` and ``updated_by``
-        are both set to the acting user on insert; only ``updated_by`` changes
-        on update.
+        Text kinds (prompts, instructions) populate ``content``; structured kinds
+        (settings, guardrails) populate ``value_json``. The conflict target is the
+        ``uq_config_override`` expression index ``(COALESCE(family,''), kind,
+        name)``. ``created_by`` and ``updated_by`` are both set to the acting user
+        on insert; only ``updated_by`` changes on update.
         """
+        vj = json.dumps(value_json) if value_json is not None else None
         row = await self.fetchrow(
             """
             INSERT INTO config_overrides
-                (family, kind, name, content, content_format, notes,
+                (family, kind, name, content, content_format, value_json, notes,
                  created_by, updated_by)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $7)
+            VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $8)
             ON CONFLICT (COALESCE(family, ''), kind, name) DO UPDATE
             SET content = EXCLUDED.content,
                 content_format = EXCLUDED.content_format,
+                value_json = EXCLUDED.value_json,
                 notes = EXCLUDED.notes,
                 updated_by = EXCLUDED.updated_by,
                 updated_at = CURRENT_TIMESTAMP
@@ -5028,6 +5032,7 @@ class PostgresDB:
             name,
             content,
             content_format,
+            vj,
             notes,
             UUID(str(user_id)) if user_id else None,
         )
