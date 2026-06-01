@@ -1,8 +1,8 @@
 import {describe, expect, it, vi} from 'vitest';
 import {Injector, runInInjectionContext, signal} from '@angular/core';
 import {of} from 'rxjs';
-import {AdminPromptsComponent} from './admin-prompts.component';
-import {AdminPromptsService} from '../../../core/services/admin-prompts.service';
+import {AdminConfigComponent} from './admin-config.component';
+import {AdminConfigService} from '../../../core/services/admin-config.service';
 import {AppToastService} from '../../../ui/toast/toast.service';
 import {TranslocoService} from '@jsverse/transloco';
 
@@ -31,16 +31,16 @@ function make(opts?: {overrides?: any[]; catalog?: any[]}) {
   const toast = {success: vi.fn(), danger: vi.fn(), info: vi.fn()};
   const injector = Injector.create({
     providers: [
-      {provide: AdminPromptsService, useValue: admin},
+      {provide: AdminConfigService, useValue: admin},
       {provide: AppToastService, useValue: toast},
       {provide: TranslocoService, useValue: {translate: (k: string) => k}},
     ],
   });
-  const component = runInInjectionContext(injector, () => new AdminPromptsComponent());
+  const component = runInInjectionContext(injector, () => new AdminConfigComponent());
   return {component, admin, toast};
 }
 
-describe('AdminPromptsComponent', () => {
+describe('AdminConfigComponent', () => {
   it('loads catalog + overrides on init', () => {
     const {component, admin} = make();
     component.ngOnInit();

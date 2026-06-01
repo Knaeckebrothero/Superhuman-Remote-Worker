@@ -130,11 +130,11 @@ import {ViewModeToggleComponent} from '../view-mode-toggle/view-mode-toggle.comp
             </a>
             <a
               class="nav-link"
-              routerLink="/admin/prompts"
+              routerLink="/admin/config"
               routerLinkActive="active"
             >
               <app-icon size="md" class="nav-icon">edit_note</app-icon>
-              Admin · Prompts
+              Admin · Config
             </a>
           }
         </div>
