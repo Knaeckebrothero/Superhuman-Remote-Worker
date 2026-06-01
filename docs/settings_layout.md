@@ -278,7 +278,7 @@ Agent: _setup_job_tools()
   ├─ generic → inject env vars from credentials
   └─ repository → git clone into ./repos/{slug}/
   ↓
-workspace.md gets datasource index + KB gets retrieval-optimized notes
+datasources.md gets datasource index + KB gets retrieval-optimized notes
 ```
 
 **Resolved**: CLI clients (psql, cypher-shell, mongosh) are installed in `Dockerfile.workspace` and `provision.sh`. Agent CLI commands are proxied to workspaces via SSH.

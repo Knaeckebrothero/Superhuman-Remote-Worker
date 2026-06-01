@@ -3,7 +3,7 @@
 Processes datasource configs received from the orchestrator: connects managed
 connectors, injects env vars for CLI access, clones repositories, materializes
 credential files (kubeconfig, ssh_key, generic_file), and builds a datasource
-index for workspace.md.
+index for datasources.md.
 """
 
 import logging
@@ -703,10 +703,11 @@ def inject_datasource_index(
     ds_configs: List[Dict[str, Any]],
     workspace_manager: Any,
 ) -> None:
-    """Inject a compact datasource index into workspace.md.
+    """Inject a compact datasource index into datasources.md.
 
     Lists every datasource with its specific named access method so the
-    agent knows how to connect to each one.
+    agent knows how to connect to each one. The system prompts point the
+    agent at datasources.md for connection names.
     """
     lines = ["\n\n## Available Datasources\n"]
 
@@ -796,10 +797,13 @@ def inject_datasource_index(
         lines.append("")
 
     try:
-        existing = workspace_manager.read_file("workspace.md")
-        workspace_manager.write_file("workspace.md", existing + "\n".join(lines))
+        try:
+            existing = workspace_manager.read_file("datasources.md")
+        except (FileNotFoundError, ValueError, OSError):
+            existing = ""
+        workspace_manager.write_file("datasources.md", existing + "\n".join(lines))
         logger.info(
-            "Injected datasource index (%d entries) into workspace.md",
+            "Injected datasource index (%d entries) into datasources.md",
             len(ds_configs),
         )
     except Exception as e:

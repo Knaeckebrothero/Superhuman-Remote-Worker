@@ -1277,46 +1277,7 @@ class TestSwapBackend:
 
 
 # ---------------------------------------------------------------------------
-# 2.11 get_workspace_content()
-# ---------------------------------------------------------------------------
-
-
-class TestGetWorkspaceContent:
-    def test_returns_workspace_md_content(self):
-        session = _make_session()
-        mock_wm = MagicMock()
-        mock_wm.read_file.return_value = "# Workspace\nSome content"
-        session.workspace_manager = mock_wm
-
-        result = session.get_workspace_content()
-        assert result == "# Workspace\nSome content"
-        mock_wm.read_file.assert_called_once_with("workspace.md")
-
-    def test_returns_empty_when_workspace_manager_none(self):
-        session = _make_session()
-        session.workspace_manager = None
-
-        assert session.get_workspace_content() == ""
-
-    def test_returns_empty_on_file_not_found(self):
-        session = _make_session()
-        mock_wm = MagicMock()
-        mock_wm.read_file.side_effect = FileNotFoundError
-        session.workspace_manager = mock_wm
-
-        assert session.get_workspace_content() == ""
-
-    def test_returns_empty_on_os_error(self):
-        session = _make_session()
-        mock_wm = MagicMock()
-        mock_wm.read_file.side_effect = OSError("permission denied")
-        session.workspace_manager = mock_wm
-
-        assert session.get_workspace_content() == ""
-
-
-# ---------------------------------------------------------------------------
-# 2.12 cleanup()
+# 2.11 cleanup()
 # ---------------------------------------------------------------------------
 
 

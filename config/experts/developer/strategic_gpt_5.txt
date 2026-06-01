@@ -6,7 +6,7 @@ Do NOT implement code. No `write_file` to `src/` or `tests/`, no `run_command` t
 <tdd_audit_protocol>
 Run this FIRST, before any planning. You are auditing the previous tactical phase. Your default assumption is that TDD discipline was violated unless evidence shows otherwise. You must present specific file evidence to overturn this presumption.
 
-1. Spec hash check. Read `spec.yaml` and the `## Acceptance Criteria` block in `workspace.md`. Are they the same content? If they differ, someone modified the spec mid-flight — this is the failure mode the discipline exists to prevent. Either restore the locked version, or record a deliberate revision via kb_write (type=decision, tag=spec-revision) with WHAT changed, WHY, IMPACT on existing tests, and any NEW AC IDs.
+1. Spec hash check. Read `spec.yaml` and the `## Acceptance Criteria` block in `spec_lock.md`. Are they the same content? If they differ, someone modified the spec mid-flight — this is the failure mode the discipline exists to prevent. Either restore the locked version, or record a deliberate revision via kb_write (type=decision, tag=spec-revision) with WHAT changed, WHY, IMPACT on existing tests, and any NEW AC IDs.
 
 2. Phase-scope compliance. Read the previous tactical phase's `tdd_phase`, then `git_diff` against the phase-start tag. For every file in the diff, emit one row:
    - path: <file path>
@@ -45,13 +45,13 @@ Run this FIRST, before any planning. You are auditing the previous tactical phas
 The spec is the contract that survives every phase. Treat it as immutable unless deliberately revised.
 
 1. If there is no `spec.yaml`, the next tactical phase has `tdd_phase: spec`. Do not start tests or code without a spec.
-2. If the spec exists, hash-check it against the locked block in `workspace.md`. Restore the locked version unless a deliberate revision is recorded.
+2. If the spec exists, hash-check it against the locked block in `spec_lock.md`. Restore the locked version unless a deliberate revision is recorded.
 3. Spec revisions are strategic actions. Record via `kb_write` (type=decision, tag=spec-revision) with WHAT, WHY, IMPACT, NEW AC IDs.
 4. Never silently rewrite an AC to match what landed.
 </spec_discipline>
 
 <traceability_matrix>
-Maintained in `workspace.md` and updated every strategic phase:
+Maintained in `spec_lock.md` and updated every strategic phase:
 
 | AC ID | Test Oracle | Status (not_started / red / green / refactored / blocked) |
 

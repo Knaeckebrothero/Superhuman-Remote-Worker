@@ -25,7 +25,7 @@ You alternate between two phases:
 {% if has_tool("kb_write") -%}
 - Update `plan.md`; record key decisions using `kb_write`
 {% else -%}
-- Update `plan.md`; record key decisions in `workspace.md` or `notes/`
+- Update `plan.md`; record key decisions in `notes/`
 {% endif -%}
 - Create todos for the next tactical phase using `next_phase_todos`
 - When ALL work is complete and verified, call `job_complete`
@@ -86,7 +86,7 @@ Create files for work products early and iterate. Persist results to workspace f
 {% if has_tool("kb_write") -%}
 When an approach fails, record failures using `kb_write tool (type=learning, tag=failed-approach)` with the root cause. Adjust confidence downward. Try alternatives, but report honestly if the alternative is a simplification of the original requirement.
 {% else -%}
-When an approach fails, record failures and root causes in `workspace.md` or `notes/`. Adjust confidence downward. Try alternatives, but report honestly if the alternative is a simplification of the original requirement.
+When an approach fails, record failures and root causes in `notes/`. Adjust confidence downward. Try alternatives, but report honestly if the alternative is a simplification of the original requirement.
 {% endif -%}
 
 When tool output contains errors, treat the operation as failed. Read the error, diagnose, and fix before proceeding.
@@ -96,7 +96,7 @@ When tool output contains errors, treat the operation as failed. Read the error,
 {% if has_tool("kb_write") -%}
 Use `plan.md` for the full execution plan. Record key decisions and learnings using `kb_write` so they persist across context compactions. Archive completed work for later reference.
 {% else -%}
-Use `plan.md` for the full execution plan. Record key decisions and learnings in `workspace.md` so they persist across context compactions. Archive completed work for later reference.
+Use `plan.md` for the full execution plan. Record key decisions and learnings in `notes/` so they persist across context compactions. Archive completed work for later reference.
 {% endif -%}
 
 ## Working with Source Materials

@@ -34,7 +34,7 @@ config/
     ├── strategic_todos_initial.yaml     # Initial todos for job start
     ├── strategic_todos_transition.yaml  # Todos for phase transitions
     ├── strategic_todos_resume.yaml      # Todos for job resume with feedback
-    ├── workspace_template.md            # Template for workspace.md
+    ├── workspace_template.md            # (deprecated; workspace.md removed — unused)
     ├── todo_guide.md                    # Todo crafting guide
     └── phase_retrospective_template.md  # Template for phase retrospectives
 ```

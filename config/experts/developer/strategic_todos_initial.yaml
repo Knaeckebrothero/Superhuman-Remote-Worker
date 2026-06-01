@@ -102,7 +102,7 @@ todos:
       The plan must follow the TDD lifecycle. Every non-trivial task is shaped as:
 
       1. **Spec phase** — Produce spec.yaml with EARS acceptance criteria. Lock it into
-         workspace.md's PROTECTED `## Acceptance Criteria` section.
+         spec_lock.md's PROTECTED `## Acceptance Criteria` section.
       2. **Red phase(s)** — For each batch of related AC, write failing tests. Each test
          must fail with AssertionError (not ImportError) before the green phase begins.
       3. **Green phase(s)** — Minimum implementation to make the red tests pass. No
@@ -121,7 +121,7 @@ todos:
       ## Phases
       | # | tdd_phase   | Scope                                     | AC IDs       |
       |---|--------------|-------------------------------------------|--------------|
-      | 1 | spec         | Produce spec.yaml + lock to workspace.md  | (defines)    |
+      | 1 | spec         | Produce spec.yaml + lock to spec_lock.md  | (defines)    |
       | 2 | red          | Tests for happy-path AC                   | AC-1, AC-2   |
       | 3 | green        | Implementation for happy-path AC          | AC-1, AC-2   |
       | 4 | red          | Tests for edge/error-case AC              | AC-3, AC-4   |
@@ -159,7 +159,7 @@ todos:
       the TDD phase types, exit gates, and forbidden test patterns.
 
       The FIRST tactical phase has `tdd_phase: spec`. Create 3-5 todos that will produce
-      spec.yaml and lock it into workspace.md. Each todo must reference tdd_phase=spec
+      spec.yaml and lock it into spec_lock.md. Each todo must reference tdd_phase=spec
       and may not touch `src/` or `tests/`.
 
       Suggested first-phase (spec) todos:
@@ -177,7 +177,7 @@ todos:
           Unwanted-behavior / Optional) and name a test_oracle path that matches this repo's
           test layout (recorded in kb during todo 2 above)."
 
-      3. "Lock spec into workspace.md's PROTECTED `## Acceptance Criteria` section. Copy
+      3. "Lock spec into spec_lock.md's PROTECTED `## Acceptance Criteria` section. Copy
           the AC block verbatim. Initialize the traceability matrix table with each AC at
           status `not_started`."
 

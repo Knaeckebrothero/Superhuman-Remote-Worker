@@ -2212,11 +2212,14 @@
 .event-tool + .event-tool { margin-top: v.$space-xs; }
 .turn-bubble.dimmed { opacity: 0.7; }
 
-// #10 — collapsed "N× tool calls" disclosure for a run of consecutive tools.
+// #10 — folded "N× tool calls" disclosure for a run of consecutive tools.
+// Cornerless (no box) — mirrors the reasoning .thinking-block's left accent so
+// the two foldable affordances read alike. (The "Tool calls → Expanded" display
+// pref suppresses this wrapper entirely; runs then render as plain inline cards.)
 .tool-group {
-  border: 1px solid var(--border-color);
-  border-radius: var(--radius-control);
-  overflow: hidden;
+  margin: 4px 0;
+  border-left: 2px solid var(--border, var(--surface-1));
+  border-radius: var(--radius-tag);
 }
 
 .tool-group-head {

@@ -47,7 +47,7 @@ Every memory must stand alone. A reader months later, with no access to the orig
 - Routine tool calls with predictable outcomes (file reads, simple searches, ls/grep)
 - Raw data or file contents — distill the insight, do not paste the data
 - Agent planning monologue ("I will now...", "Let me think...")
-- Content from system injection messages (workspace.md content, memory blocks, instructions)
+- Content from system injection messages (memory blocks, knowledge notes, instructions)
 - Framework mechanics (todo guide rules, phase transition patterns, knowledge base internals)
 - Todo completion logistics — already in context; do not re-store what was completed
 - Information already in the knowledge base — it persists automatically, no memory needed

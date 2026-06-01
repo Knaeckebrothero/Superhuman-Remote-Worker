@@ -10,7 +10,7 @@ Every developer phase is one of these types. The strategic phase chooses; the ta
 
 | `tdd_phase` | Goal | Writes Allowed | Writes Forbidden | Exit Gate |
 |---|---|---|---|---|
-| `spec` | Define `spec.yaml` with EARS acceptance criteria | workspace root (spec.yaml, workspace.md, plan.md) | `src/`, `tests/` | spec.yaml exists, AC have IDs and test_oracle, locked into workspace.md |
+| `spec` | Define `spec.yaml` with EARS acceptance criteria | workspace root (spec.yaml, spec_lock.md, plan.md) | `src/`, `tests/` | spec.yaml exists, AC have IDs and test_oracle, locked into spec_lock.md |
 | `red` | Write failing tests | `tests/` | `src/` | Every in-scope AC has a test that fails with AssertionError (not ImportError) |
 | `green` | Minimum implementation to pass tests | `src/` | `tests/` | All in-scope tests pass; no test edits; full suite green |
 | `refactor` | Improve structure while keeping green | `src/` | `tests/` | All previously-green tests stay green |
@@ -19,7 +19,7 @@ Every developer phase is one of these types. The strategic phase chooses; the ta
 **Pick exactly one tdd_phase per tactical phase.** Mixing types in one phase is the failure mode that erases the TDD discipline.
 
 **Target: 5-10 todos per tactical phase.** Adapt based on complexity:
-- Spec phase: 3-5 todos (interview, write spec, lock to workspace.md, init matrix)
+- Spec phase: 3-5 todos (interview, write spec, lock to spec_lock.md, init matrix)
 - Red phase: 1 todo per behavior under test (target 5-8)
 - Green phase: 1 todo per failing test (target 5-8)
 - Refactor phase: 3-5 focused structural changes
@@ -29,7 +29,7 @@ Every developer phase is one of these types. The strategic phase chooses; the ta
 
 ## Every Todo Must Trace to the Spec
 
-Every red/green/refactor todo names the **AC ID(s) it serves** in its content (e.g., `AC-1`, `AC-2`). After the phase, the traceability matrix in `workspace.md` shows the AC status. Todos that don't trace to any AC are scope creep — either add the AC to the spec (deliberately, recorded), or drop the todo.
+Every red/green/refactor todo names the **AC ID(s) it serves** in its content (e.g., `AC-1`, `AC-2`). After the phase, the traceability matrix in `spec_lock.md` shows the AC status. Todos that don't trace to any AC are scope creep — either add the AC to the spec (deliberately, recorded), or drop the todo.
 
 ---
 
@@ -41,7 +41,7 @@ Every todo must be specific enough to act on immediately.
 
 | Phase | Vague (fails) | Execution-ready (works) |
 |---|---|---|
-| spec | "Define the requirements" | "Interview user about magic-link TTL extension via kb_search of related decisions. Produce spec.yaml with 2-4 EARS acceptance criteria covering: (1) link click resets deadline, (2) watchdog skips awaiting threads. Each AC has an ID and test_oracle path. Lock spec into workspace.md `## Acceptance Criteria` section." |
+| spec | "Define the requirements" | "Interview user about magic-link TTL extension via kb_search of related decisions. Produce spec.yaml with 2-4 EARS acceptance criteria covering: (1) link click resets deadline, (2) watchdog skips awaiting threads. Each AC has an ID and test_oracle path. Lock spec into spec_lock.md `## Acceptance Criteria` section." |
 | red | "Write tests for the feature" | "Write failing test for AC-1 in repo/tests/test_persistent_ttl.py::test_magic_link_extends_deadline. Cover: thread in awaiting_user state, magic_link_clicked event arrives, awaiting_user_deadline must equal now + ttl_default. Follow fixture style from repo/tests/test_persistent_chat.py. Run `pytest tests/test_persistent_ttl.py::test_magic_link_extends_deadline -x -v` — confirm AssertionError, NOT ImportError." |
 | red | "Add a test for the bug" | "Write regression test for AC-3 (auth bypass on empty session) in repo/tests/test_auth.py::test_empty_session_rejected. Cover: empty string session token returns 401. Follow style from repo/tests/test_auth.py::test_invalid_token. Run `pytest tests/test_auth.py::test_empty_session_rejected -x -v` — must fail with assertion mismatch on status code." |
 | green | "Implement the endpoint" | "Make AC-1 test pass: in repo/src/persistent/lifecycle.py:handle_event, add MagicLinkClicked branch that sets thread.awaiting_user_deadline = now() + ttl_default. Reference pattern: repo/src/persistent/lifecycle.py:handle_idle. Forbidden: editing tests/. Run `pytest tests/test_persistent_ttl.py -x` — must go red → green; then `pytest tests/ -x` — full suite stays green." |
@@ -73,11 +73,11 @@ Example todos:
 {% if has_tool("kb_search") -%}
 - "Read task_brief.md and instructions.md in full. Search kb (`kb_search`) for prior decisions related to this feature. Record findings via kb_write (type=learning, tag=prior-context)."
 {% else -%}
-- "Read task_brief.md and instructions.md in full. Note all prior context in workspace.md."
+- "Read task_brief.md and instructions.md in full. Note all prior context in spec_lock.md."
 {% endif -%}
 - "Explore the existing codebase to identify the test framework, test command, and a 2-3 representative tests that match the style we'll need. Record framework + test command via kb_write (type=learning, tag=repository)."
 - "Write spec.yaml with EARS acceptance criteria covering [describe scope]. Each AC has an ID (AC-1, AC-2, ...), an EARS statement, and a test_oracle path. Include `not_included` (explicit scope boundaries) and `done_when` (exact commands)."
-- "Lock spec into workspace.md `## Acceptance Criteria` section (PROTECTED). Initialize the traceability matrix with each AC at `not_started`."
+- "Lock spec into spec_lock.md `## Acceptance Criteria` section (PROTECTED). Initialize the traceability matrix with each AC at `not_started`."
 
 ### 2. Red Phase (write failing tests)
 
@@ -135,7 +135,7 @@ For RED phase:
 2. Pytest output — does the new test ID appear in the failure list?
 3. Failure type — is it `AssertionError`/assertion mismatch? Or is it `ImportError`/`CollectionError`/`SyntaxError`?
 4. Forbidden test pattern check — search the diff for `assert True`, `pytest.skip`, `xfail`, empty bodies, tautologies, etc.
-5. Traceability — is the AC ID updated in `workspace.md`?
+5. Traceability — is the AC ID updated in `spec_lock.md`?
 
 For GREEN phase:
 1. `git_diff` — only files under `src/` (or config/migration paths) changed? Anything under `tests/`? STOP.

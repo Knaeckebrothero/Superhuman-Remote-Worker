@@ -56,17 +56,17 @@ todos:
       INSTEAD OF: Creating notes for information already captured — search first.
       Instead of skipping failed approaches — they are critical for preventing loops.
       {% else -%}
-      REFLECT on project context: Review and update workspace.md.
+      REFLECT on project context: Review and record learnings in notes/.
 
-      After the retrospective, update workspace.md with learnings:
-      (1) Review existing notes in workspace.md for relevance.
+      After the retrospective, capture learnings in notes/ files:
+      (1) Review existing notes/ for relevance.
       (2) Record new decisions with reasoning in notes/decisions.md.
-      (3) Record discovered facts (IDs, paths, configurations) in workspace.md under "## Facts".
-      (4) Record failed approaches in workspace.md under "## Failed Approaches"
+      (3) Record discovered facts (IDs, paths, configurations) in notes/facts.md.
+      (4) Record failed approaches in notes/failed_approaches.md
           with the reason they failed — this prevents retrying the same strategy.
-      (5) If any existing notes in workspace.md are now outdated, update or remove them.
+      (5) If any existing notes are now outdated, update or remove them.
 
-      COMPLETION CRITERIA: workspace.md updated with decisions, facts, and failed
+      COMPLETION CRITERIA: notes/ updated with decisions, facts, and failed
       approaches from the completed phase.
 
       INSTEAD OF: Skipping failed approaches — they are critical for preventing loops.
