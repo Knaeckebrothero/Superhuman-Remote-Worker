@@ -42,13 +42,14 @@ const FAMILIES = ['gemma', 'gpt_5', 'gpt_oss', 'minimax', 'codex', 'codex_spark'
         <h1 class="page-title">Configuration Overrides</h1>
       </div>
       <p class="page-desc">
-        Override the bundled prompt files from the database. Saved edits apply to
-        <strong>future</strong> jobs at dispatch — no redeploy. Clearing an override
-        falls back to the shipped default.
+        Override the bundled config (prompts, instructions, settings, guardrails)
+        from the database. Saved edits apply to <strong>future</strong> jobs at
+        dispatch — no redeploy. Clearing an override falls back to the shipped
+        default.
       </p>
 
       <section class="admin-section">
-        <h2 class="section-title">Pick a prompt</h2>
+        <h2 class="section-title">Pick a config key</h2>
         <div class="picker-row">
           <app-form-field label="Model family">
             <app-select [value]="familyValue()" (changed)="onFamilyChange($event)">
@@ -58,9 +59,9 @@ const FAMILIES = ['gemma', 'gpt_5', 'gpt_oss', 'minimax', 'codex', 'codex_spark'
               }
             </app-select>
           </app-form-field>
-          <app-form-field label="Prompt">
+          <app-form-field label="Config key">
             <app-select [value]="keyValue()" (changed)="onKeyChange($event)">
-              <option value="">— select a prompt —</option>
+              <option value="">— select a config key —</option>
               @for (e of admin.catalog(); track e.name) {
                 <option [value]="e.name">{{ e.title }}</option>
               }
@@ -80,14 +81,18 @@ const FAMILIES = ['gemma', 'gpt_5', 'gpt_oss', 'minimax', 'codex', 'codex_spark'
           <p class="section-desc">{{ entry.description }}</p>
 
           <div class="editor-grid">
-            <app-form-field label="Bundled default (read-only)">
+            <app-form-field
+              [label]="isStructured() ? 'Bundled default (JSON, read-only)' : 'Bundled default (read-only)'"
+            >
               <app-textarea [value]="bundledContent()" [disabled]="true" [rows]="14" />
             </app-form-field>
             <app-form-field
-              label="Override"
-              [hint]="hasOverride()
-                ? 'Editing the active override.'
-                : 'No override yet — saving creates one.'"
+              [label]="isStructured() ? 'Override (JSON)' : 'Override'"
+              [hint]="isStructured()
+                ? 'Edit as JSON — validated server-side against the catalog.'
+                : (hasOverride()
+                  ? 'Editing the active override.'
+                  : 'No override yet — saving creates one.')"
             >
               <app-textarea
                 [value]="overrideContent()"
@@ -210,6 +215,12 @@ export class AdminConfigComponent implements OnInit {
 
   readonly keyValue = computed(() => this.selectedEntry()?.name ?? '');
 
+  /** Structured kinds (settings, guardrails) edit a JSON value, not text. */
+  readonly isStructured = computed(() => {
+    const k = this.selectedEntry()?.kind;
+    return k === 'settings' || k === 'guardrails';
+  });
+
   readonly existingOverride = computed<ConfigOverride | null>(() => {
     const entry = this.selectedEntry();
     if (!entry) return null;
@@ -243,7 +254,38 @@ export class AdminConfigComponent implements OnInit {
 
   save(): void {
     const entry = this.selectedEntry();
-    if (!entry || !this.overrideContent().trim()) {
+    if (!entry) return;
+
+    if (this.isStructured()) {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(this.overrideContent());
+      } catch {
+        this.toast.danger(this.transloco.translate('admin.config.messages.invalidJson'));
+        return;
+      }
+      this.saving.set(true);
+      this.admin
+        .createOverride({
+          family: this.selectedFamily(),
+          kind: entry.kind,
+          name: entry.name,
+          value_json: parsed,
+        })
+        .subscribe({
+          next: () => {
+            this.saving.set(false);
+            this.toast.success(this.transloco.translate('admin.config.messages.saved'));
+          },
+          error: () => {
+            this.saving.set(false);
+            this.toast.danger(this.transloco.translate('admin.config.messages.saveFailed'));
+          },
+        });
+      return;
+    }
+
+    if (!this.overrideContent().trim()) {
       this.toast.danger(this.transloco.translate('admin.config.messages.saveEmpty'));
       return;
     }
@@ -292,9 +334,27 @@ export class AdminConfigComponent implements OnInit {
       this.overrideContent.set('');
       return;
     }
-    this.overrideContent.set(this.existingOverride()?.content ?? '');
+    const structured = this.isStructured();
+    if (!structured) {
+      this.overrideContent.set(this.existingOverride()?.content ?? '');
+    }
     this.admin.getBundled(this.selectedFamily(), entry.kind, entry.name).subscribe({
-      next: (b) => this.bundledContent.set(b.content),
+      next: (b) => {
+        if (structured) {
+          const bundledStr = JSON.stringify(b.content ?? null, null, 2);
+          this.bundledContent.set(bundledStr);
+          const existing = this.existingOverride();
+          const hasVal =
+            existing != null &&
+            existing.value_json !== undefined &&
+            existing.value_json !== null;
+          this.overrideContent.set(
+            hasVal ? JSON.stringify(existing!.value_json, null, 2) : bundledStr,
+          );
+        } else {
+          this.bundledContent.set(typeof b.content === 'string' ? b.content : '');
+        }
+      },
       error: () => this.bundledContent.set(''),
     });
   }

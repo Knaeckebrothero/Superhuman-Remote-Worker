@@ -106,4 +106,46 @@ describe('AdminConfigComponent', () => {
     component.resetToBundled();
     expect(admin.deleteOverride).not.toHaveBeenCalled();
   });
+
+  // --- structured kinds (settings / guardrails) ---
+
+  const SETTINGS_CATALOG = [
+    {kind: 'settings', name: 'temperature', title: 'Temp', description: 'd', type: 'number'},
+  ];
+
+  function makeSettings() {
+    const ctx = make({catalog: SETTINGS_CATALOG});
+    ctx.admin.getBundled.mockReturnValue(
+      of({family: null, kind: 'settings', name: 'temperature', content: 0.3, catalog: null}),
+    );
+    return ctx;
+  }
+
+  it('seeds a settings editor from the bundled value as JSON', () => {
+    const {component} = makeSettings();
+    component.onKeyChange('temperature');
+    expect(component.isStructured()).toBe(true);
+    expect(component.bundledContent()).toBe('0.3');
+    expect(component.overrideContent()).toBe('0.3'); // no override -> seeded from bundled
+  });
+
+  it('save() POSTs parsed value_json for a settings key', () => {
+    const {component, admin, toast} = makeSettings();
+    component.onKeyChange('temperature');
+    component.overrideContent.set('0.7');
+    component.save();
+    expect(admin.createOverride).toHaveBeenCalledWith({
+      family: null, kind: 'settings', name: 'temperature', value_json: 0.7,
+    });
+    expect(toast.success).toHaveBeenCalled();
+  });
+
+  it('save() rejects invalid JSON for a structured key', () => {
+    const {component, admin, toast} = makeSettings();
+    component.onKeyChange('temperature');
+    component.overrideContent.set('not json');
+    component.save();
+    expect(admin.createOverride).not.toHaveBeenCalled();
+    expect(toast.danger).toHaveBeenCalled();
+  });
 });

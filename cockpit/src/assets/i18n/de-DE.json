@@ -302,11 +302,12 @@
   "admin": {
     "config": {
       "messages": {
-        "saveEmpty": "Nichts zu speichern — wählen Sie einen Prompt und geben Sie Inhalt ein.",
+        "saveEmpty": "Nichts zu speichern — wählen Sie einen Konfigurationsschlüssel und geben Sie einen Wert ein.",
         "saved": "Override gespeichert — gilt für zukünftige Jobs.",
         "saveFailed": "Override konnte nicht gespeichert werden.",
         "removed": "Override entfernt — zurück zum mitgelieferten Standard.",
-        "removeFailed": "Override konnte nicht entfernt werden."
+        "removeFailed": "Override konnte nicht entfernt werden.",
+        "invalidJson": "Ungültiges JSON — bitte Syntax korrigieren und erneut versuchen."
       }
     },
     "providers": {

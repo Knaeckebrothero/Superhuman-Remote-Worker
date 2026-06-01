@@ -302,11 +302,12 @@
   "admin": {
     "config": {
       "messages": {
-        "saveEmpty": "Nothing to save — pick a prompt and enter content.",
+        "saveEmpty": "Nothing to save — pick a config key and enter a value.",
         "saved": "Override saved — applies to future jobs.",
         "saveFailed": "Failed to save override.",
         "removed": "Override removed — back to the bundled default.",
-        "removeFailed": "Failed to remove override."
+        "removeFailed": "Failed to remove override.",
+        "invalidJson": "Invalid JSON — fix the syntax and try again."
       }
     },
     "providers": {
