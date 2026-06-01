@@ -501,6 +501,31 @@ def resolve_model_settings(
     return settings
 
 
+def bundled_settings_for_family(family: str, name: str) -> Any:
+    """File-resolved settings leaf for <family> (default ⊕ family), ignoring DB
+    overrides. ``name`` may be a dotted path into limits (e.g.
+    'limits.context_threshold_tokens'). Returns None if the leaf is absent."""
+    matrix = _load_settings_matrix(None)
+    default_settings = matrix.get("default", {})
+    family_settings = matrix.get(family, {}) if family != "default" else {}
+    settings = deep_merge(default_settings, family_settings)
+    node: Any = settings
+    for part in name.split("."):
+        if not isinstance(node, dict):
+            return None
+        node = node.get(part)
+    return node
+
+
+def bundled_guardrails_for_family(family: str) -> Dict[str, Any]:
+    """File-resolved guardrails ({tool_examples, nudges}) for <family>, ignoring
+    DB overrides."""
+    matrix = _load_guardrails_matrix(None)
+    default_guardrails = matrix.get("default", {})
+    family_guardrails = matrix.get(family, {}) if family != "default" else {}
+    return deep_merge(default_guardrails, family_guardrails)
+
+
 def _apply_settings_matrix(
     data: Dict[str, Any],
     expert_llm_keys: set,

@@ -89,7 +89,7 @@ from fastapi.responses import (  # noqa: E402
     StreamingResponse,
 )
 
-from pydantic import BaseModel, Field  # noqa: E402
+from pydantic import BaseModel, Field, model_validator  # noqa: E402
 
 from database import (  # noqa: E402
     PostgresDB,
@@ -2869,25 +2869,49 @@ class LlmEndpointUpdate(BaseModel):
 
 
 class ConfigOverrideCreate(BaseModel):
-    """Request body for creating or replacing a prompt override.
+    """Request body for creating or replacing a config override.
 
-    ``kind`` is the resolver subsection; ``name`` is the resolver entry_type
-    (e.g. 'persona', 'systemprompt'). ``family=None`` means a global default.
+    ``kind`` selects the config subsection. Text kinds (prompts, instructions)
+    populate ``content``; structured kinds (settings, guardrails) populate
+    ``value_json``. ``name`` is the resolver entry_type / settings leaf (dotted
+    for limits, e.g. 'limits.context_threshold_tokens'). ``family=None`` means a
+    global default.
     """
 
     family: str | None = Field(None, max_length=64)
-    kind: Literal["prompts", "instructions"]
+    kind: Literal["prompts", "instructions", "settings", "guardrails"]
     name: str = Field(..., min_length=1, max_length=128)
-    content: str = Field(..., min_length=1)
+    content: str | None = Field(None, min_length=1)
     content_format: Literal["text", "markdown", "jinja", "yaml"] = "text"
+    value_json: Any = None
     notes: str | None = None
+
+    @model_validator(mode="after")
+    def _check_payload(self) -> "ConfigOverrideCreate":
+        """Enforce the content/value_json XOR by kind (mirrors the DB check)."""
+        if self.kind in ("prompts", "instructions"):
+            if self.content is None:
+                raise ValueError(f"{self.kind} override requires 'content'")
+            if self.value_json is not None:
+                raise ValueError(f"{self.kind} override must not set 'value_json'")
+        else:  # settings, guardrails
+            if self.value_json is None:
+                raise ValueError(f"{self.kind} override requires 'value_json'")
+            if self.content is not None:
+                raise ValueError(f"{self.kind} override must not set 'content'")
+        return self
 
 
 class ConfigOverrideUpdate(BaseModel):
-    """Update an existing override's content; family/kind/name are immutable."""
+    """Update an existing override's payload; family/kind/name are immutable.
 
-    content: str = Field(..., min_length=1)
+    The acting kind is taken from the stored row, so the route picks ``content``
+    (text kinds) or ``value_json`` (structured kinds).
+    """
+
+    content: str | None = Field(None, min_length=1)
     content_format: Literal["text", "markdown", "jinja", "yaml"] = "text"
+    value_json: Any = None
     notes: str | None = None
 
 
@@ -15468,9 +15492,60 @@ def _config_catalog_entry(kind: str, name: str) -> dict[str, Any] | None:
     return None
 
 
-def read_bundled_config(kind: str, family: str | None, name: str) -> str:
-    """Read the shipped (bundled) content for (kind, family, name), bypassing overrides."""
-    from src.core.loader import InstructionMatrixResolver, PromptMatrixResolver
+def validate_override_value(kind: str, name: str, value: Any) -> None:
+    """Validate a structured (settings/guardrails) override value against the
+    catalog. Raises HTTPException(422) on unknown key, wrong type, or out-of-bounds.
+
+    Text kinds are validated by the Pydantic model (min_length) and are a no-op
+    here. Fail-closed on write; reads stay fail-open (see the loader).
+    """
+    if kind not in ("settings", "guardrails"):
+        return
+    entry = _config_catalog_entry(kind, name)
+    if entry is None:
+        raise HTTPException(status_code=422, detail=f"unknown {kind} key: {name!r}")
+    vtype = entry.get("type")
+    if vtype in ("number", "integer"):
+        # bool is a subclass of int — reject it for numeric leaves.
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise HTTPException(status_code=422, detail=f"{name} must be a {vtype}")
+        if vtype == "integer" and isinstance(value, float) and not value.is_integer():
+            raise HTTPException(status_code=422, detail=f"{name} must be an integer")
+        lo, hi = entry.get("min"), entry.get("max")
+        if lo is not None and value < lo:
+            raise HTTPException(status_code=422, detail=f"{name} must be >= {lo}")
+        if hi is not None and value > hi:
+            raise HTTPException(status_code=422, detail=f"{name} must be <= {hi}")
+    elif vtype == "boolean":
+        if not isinstance(value, bool):
+            raise HTTPException(status_code=422, detail=f"{name} must be a boolean")
+    elif vtype == "enum":
+        choices = entry.get("enum", [])
+        if value not in choices:
+            raise HTTPException(status_code=422, detail=f"{name} must be one of {choices}")
+    elif vtype == "json":
+        if not isinstance(value, dict):
+            raise HTTPException(status_code=422, detail=f"{name} must be a JSON object")
+    # Unknown/absent type -> accept (forward-compatible with new catalog types).
+
+
+def read_bundled_config(kind: str, family: str | None, name: str) -> Any:
+    """Read the shipped (bundled) value for (kind, family, name), bypassing overrides.
+
+    Returns text for prompts/instructions; the file-resolved value for settings
+    (a single leaf) and guardrails (the {tool_examples, nudges} dict).
+    """
+    from src.core.loader import (
+        InstructionMatrixResolver,
+        PromptMatrixResolver,
+        bundled_guardrails_for_family,
+        bundled_settings_for_family,
+    )
+
+    if kind == "settings":
+        return bundled_settings_for_family(family or "default", name)
+    if kind == "guardrails":
+        return bundled_guardrails_for_family(family or "default")
 
     resolver_cls = {
         "prompts": PromptMatrixResolver,
@@ -15510,12 +15585,16 @@ async def admin_create_config_override(
 ) -> dict[str, Any]:
     """Create or replace the override for (family, kind, name)."""
     user = await _require_admin(request)
+    is_text = body.kind in ("prompts", "instructions")
+    if not is_text:
+        validate_override_value(body.kind, body.name, body.value_json)
     return await postgres_db.upsert_config_override(
         family=body.family,
         kind=body.kind,
         name=body.name,
         content=body.content,
-        content_format=body.content_format,
+        content_format=body.content_format if is_text else None,
+        value_json=body.value_json,
         notes=body.notes,
         user_id=user.get("id"),
     )
@@ -15525,17 +15604,30 @@ async def admin_create_config_override(
 async def admin_update_config_override(
     request: Request, override_id: str, body: ConfigOverrideUpdate
 ) -> dict[str, Any]:
-    """Update an existing override's content (family/kind/name are immutable)."""
+    """Update an existing override's payload (family/kind/name are immutable)."""
     user = await _require_admin(request)
     existing = await postgres_db.get_config_override(override_id)
     if not existing:
         raise HTTPException(status_code=404, detail="override not found")
+    kind = existing["kind"]
+    if kind in ("prompts", "instructions"):
+        if body.content is None:
+            raise HTTPException(status_code=422, detail="content is required for this kind")
+        content, content_format, value_json = body.content, body.content_format, None
+    else:  # settings, guardrails
+        if body.value_json is None:
+            raise HTTPException(
+                status_code=422, detail="value_json is required for this kind"
+            )
+        validate_override_value(kind, existing["name"], body.value_json)
+        content, content_format, value_json = None, None, body.value_json
     return await postgres_db.upsert_config_override(
         family=existing["family"],
-        kind=existing["kind"],
+        kind=kind,
         name=existing["name"],
-        content=body.content,
-        content_format=body.content_format,
+        content=content,
+        content_format=content_format,
+        value_json=value_json,
         notes=body.notes,
         user_id=user.get("id"),
     )
