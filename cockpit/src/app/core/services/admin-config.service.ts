@@ -3,17 +3,23 @@ import {HttpClient} from '@angular/common/http';
 import {catchError, Observable, of, tap} from 'rxjs';
 import {environment} from '../environment';
 
-export type ConfigKind = 'prompts' | 'instructions';
+export type ConfigKind = 'prompts' | 'instructions' | 'settings' | 'guardrails';
 export type ConfigContentFormat = 'text' | 'markdown' | 'jinja' | 'yaml';
+export type ConfigValueType = 'number' | 'integer' | 'boolean' | 'enum' | 'json';
 
-/** A DB-backed override row (mirrors orchestrator config_overrides). */
+/**
+ * A DB-backed override row (mirrors orchestrator config_overrides). Text kinds
+ * (prompts, instructions) carry `content`; structured kinds (settings,
+ * guardrails) carry `value_json`.
+ */
 export interface ConfigOverride {
   id: string;
   family: string | null; // null = global (all families)
   kind: ConfigKind;
   name: string;
-  content: string;
-  content_format: ConfigContentFormat;
+  content: string | null;
+  content_format: ConfigContentFormat | null;
+  value_json?: unknown;
   notes: string | null;
   created_by: string | null;
   updated_by: string | null;
@@ -21,20 +27,31 @@ export interface ConfigOverride {
   updated_at: string | null;
 }
 
-/** A human description of an editable prompt key (config/prompts/catalog.yaml). */
+/**
+ * A human description of an editable config key (config/prompts/catalog.yaml).
+ * Settings/guardrails entries also carry `type` (+ optional bounds/enum) so the
+ * UI renders typed editors.
+ */
 export interface ConfigCatalogEntry {
   kind: ConfigKind;
   name: string;
   title: string;
   description: string;
+  type?: ConfigValueType;
+  min?: number;
+  max?: number;
+  enum?: unknown[];
 }
 
-/** The bundled (shipped) default for a key, plus its catalog entry. */
+/**
+ * The bundled (shipped) default for a key, plus its catalog entry. `content` is
+ * text for prompts/instructions and a JSON value for settings/guardrails.
+ */
 export interface ConfigBundled {
   family: string | null;
   kind: string;
   name: string;
-  content: string;
+  content: unknown;
   catalog: ConfigCatalogEntry | null;
 }
 
@@ -42,8 +59,9 @@ export interface ConfigOverrideCreate {
   family: string | null;
   kind: ConfigKind;
   name: string;
-  content: string;
+  content?: string | null;
   content_format?: ConfigContentFormat;
+  value_json?: unknown;
   notes?: string | null;
 }
 
