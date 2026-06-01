@@ -151,6 +151,29 @@ def _extract_rate_limit_delay(error: Exception) -> Optional[float]:
     return 90.0
 
 
+def _is_codex_auth_unavailable(exc: BaseException) -> bool:
+    """True if a 401 is a Codex/OAuth-proxy *token-unavailable* error rather
+    than a genuinely-bad API key.
+
+    The Codex proxy (CLIProxyAPI) surfaces an invalidated/expired OAuth token
+    — or one stuck mid-refresh — as ``code: auth_unavailable`` /
+    "invalidated oauth token for user". Unlike a bad API key, that clears after
+    a proxy re-auth or the next token refresh, so the caller retries (bounded)
+    instead of failing the job permanently. Inspects a single exception; the
+    caller walks the ``__cause__`` chain.
+    """
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        err_obj = body.get("error") or {}
+        if isinstance(err_obj, dict):
+            code = (err_obj.get("code") or "").lower()
+            msg = (err_obj.get("message") or "").lower()
+            if code == "auth_unavailable" or "invalidated oauth token" in msg:
+                return True
+    text = str(exc).lower()
+    return "auth_unavailable" in text or "invalidated oauth token" in text
+
+
 def _classify_llm_error(error: Exception) -> str:
     """Classify an LLM exception as ``permanent``, ``rate_limit``, or ``transient``.
 
@@ -207,6 +230,12 @@ def _classify_llm_error(error: Exception) -> str:
                                 return "permanent"
                     # 400 without a parseable body — be conservative, retry.
                     return "transient"
+                if status_code == 401 and _is_codex_auth_unavailable(current):
+                    # Codex/OAuth-proxy token invalidated or mid-refresh —
+                    # recoverable by a proxy re-auth + resume, so retry rather
+                    # than fail the job. A genuinely-bad API key carries no
+                    # ``auth_unavailable`` marker and stays "permanent" below.
+                    return "auth_unavailable"
                 return "permanent"
             if 500 <= status_code < 600:
                 return "transient"
@@ -239,6 +268,8 @@ def _classify_llm_error(error: Exception) -> str:
         current = nxt if nxt is not current else None
 
     error_str = str(error).lower()
+    if "auth_unavailable" in error_str or "invalidated oauth token" in error_str:
+        return "auth_unavailable"
     if "model" in error_str and (
         "not found" in error_str or "does not exist" in error_str
     ):
@@ -1820,6 +1851,15 @@ def create_execute_node(
                             f"[{job_id}] Rate limit hit (attempt {attempt + 1}/{retry_manager.max_retries}), "
                             f"waiting {delay:.0f}s before retry: {e}"
                         )
+                    elif classification == "auth_unavailable":
+                        # Give the Codex/CLIProxyAPI proxy time to refresh or
+                        # re-auth the OAuth token before retrying the blip.
+                        delay = max(delay, 15.0)
+                        logger.warning(
+                            f"[{job_id}] Codex/OAuth token unavailable (attempt "
+                            f"{attempt + 1}/{retry_manager.max_retries}), waiting "
+                            f"{delay:.0f}s for proxy token refresh: {e}"
+                        )
                     else:
                         logger.warning(
                             f"[{job_id}] LLM error (attempt {attempt + 1}/{retry_manager.max_retries}), "
@@ -1831,8 +1871,21 @@ def create_execute_node(
                     attempt += 1
                     continue
 
-                # Max retries exceeded
-                logger.error(f"[{job_id}] LLM error after {attempt + 1} attempts: {e}")
+                # Max retries exceeded. A Codex/OAuth token-unavailable error
+                # is recoverable by re-authenticating the proxy and resuming
+                # from the checkpoint — surface that in the message so the
+                # operator knows the run isn't lost.
+                auth_hint = (
+                    " [Codex/LLM OAuth token unavailable after retries — the "
+                    "proxy token is invalidated or stuck mid-refresh. "
+                    "Re-authenticate the Codex proxy (Admin → Models), then "
+                    "resume this job from its checkpoint.]"
+                    if classification == "auth_unavailable"
+                    else ""
+                )
+                logger.error(
+                    f"[{job_id}] LLM error after {attempt + 1} attempts: {e}{auth_hint}"
+                )
 
                 # Audit error
                 if auditor:
@@ -1845,7 +1898,7 @@ def create_execute_node(
                         data={
                             "error": {
                                 "type": "llm_error",
-                                "message": str(e)[:500],
+                                "message": (str(e)[:500] + auth_hint),
                                 "recoverable": True,
                                 "attempts": attempt + 1,
                             }
@@ -1857,7 +1910,7 @@ def create_execute_node(
 
                 return {
                     "error": {
-                        "message": str(e),
+                        "message": str(e) + auth_hint,
                         "type": "llm_error",
                         "recoverable": True,
                     },
