@@ -140,3 +140,74 @@ async def test_config_overrides_namespace_lists_family_and_global():
     assert "FROM config_overrides" in sql
     assert "family = $1 OR family IS NULL" in sql
     assert fake_db.fetch.call_args.args[1] == "gemma"
+
+
+# ---------------------------------------------------------------------------
+# Structured (settings / guardrails) override accessors — Phase B.
+# ---------------------------------------------------------------------------
+
+
+def test_settings_override_assembles_and_merges(monkeypatch):
+    _reset()
+    monkeypatch.setenv("CONFIG_DB_OVERRIDES_ENABLED", "true")
+    loader.set_config_overrides(
+        [
+            {"family": None, "kind": "settings", "name": "temperature", "value_json": 0.7},
+            {"family": "gemma", "kind": "settings", "name": "temperature", "value_json": 1.0},
+            {
+                "family": "gemma",
+                "kind": "settings",
+                "name": "limits.context_threshold_tokens",
+                "value_json": 120000,
+            },
+        ]
+    )
+    assert loader._settings_override_for("gemma") == {
+        "temperature": 1.0,
+        "limits": {"context_threshold_tokens": 120000},
+    }
+    assert loader._settings_override_for("other") == {"temperature": 0.7}
+
+
+def test_guardrails_override_merges(monkeypatch):
+    _reset()
+    monkeypatch.setenv("CONFIG_DB_OVERRIDES_ENABLED", "true")
+    loader.set_config_overrides(
+        [
+            {
+                "family": None,
+                "kind": "guardrails",
+                "name": "guardrails",
+                "value_json": {"nudges": {"a": 1}},
+            },
+            {
+                "family": "gemma",
+                "kind": "guardrails",
+                "name": "guardrails",
+                "value_json": {"tool_examples": {"b": 2}},
+            },
+        ]
+    )
+    assert loader._guardrails_override_for("gemma") == {
+        "nudges": {"a": 1},
+        "tool_examples": {"b": 2},
+    }
+
+
+def test_structured_overrides_empty_when_flag_off(monkeypatch):
+    _reset()
+    monkeypatch.delenv("CONFIG_DB_OVERRIDES_ENABLED", raising=False)
+    loader.set_config_overrides(
+        [{"family": "gemma", "kind": "settings", "name": "temperature", "value_json": 1.0}]
+    )
+    assert loader._settings_override_for("gemma") == {}
+    assert loader._guardrails_override_for("gemma") == {}
+
+
+def test_set_overrides_parses_jsonb_string(monkeypatch):
+    _reset()
+    monkeypatch.setenv("CONFIG_DB_OVERRIDES_ENABLED", "true")
+    loader.set_config_overrides(
+        [{"family": "gemma", "kind": "settings", "name": "temperature", "value_json": "1.0"}]
+    )
+    assert loader._settings_override_for("gemma") == {"temperature": 1.0}

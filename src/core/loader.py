@@ -25,13 +25,15 @@ VALID_AUTONOMY_LEVELS = {"full", "review", "partial", "guided", "dependent"}
 # DB-backed config overrides (CONFIG_DB_OVERRIDES_ENABLED)
 # =============================================================================
 # Populated once per job by the agent at first run (before
-# serialize_resolved_config), then read synchronously by the resolver. Map:
-# family -> {(kind, name): content}; global (NULL-family) overrides live under
-# the "" key. One job per agent process at a time, so a module-level map is safe.
-# When the flag is off (or no row matches), _db_lookup returns None and
-# resolution falls through to the bundled config/ files — identical to today.
+# serialize_resolved_config), then read synchronously by the resolver. Two maps,
+# keyed family -> {(kind, name): value}; global (NULL-family) overrides live
+# under the "" key. Text kinds (prompts, instructions) carry resolved content;
+# structured kinds (settings, guardrails) carry parsed JSON values. One job per
+# agent process at a time, so module-level maps are safe. When the flag is off
+# (or no row matches), resolution falls through to the bundled config/ files.
 
-_CONFIG_OVERRIDES: Dict[str, Dict[tuple, str]] = {}
+_CONFIG_OVERRIDES: Dict[str, Dict[tuple, str]] = {}  # text kinds: (kind, name) -> content
+_VALUE_OVERRIDES: Dict[str, Dict[tuple, Any]] = {}  # structured kinds: (kind, name) -> value
 
 
 def _is_config_db_overrides_enabled() -> bool:
@@ -44,23 +46,36 @@ def _is_config_db_overrides_enabled() -> bool:
 
 
 def set_config_overrides(rows: List[Dict[str, Any]]) -> None:
-    """Load override rows into the process map (replaces any previous set).
+    """Load override rows into the process maps (replaces any previous set).
 
-    Each row needs keys: family (str|None), kind, name, content. Rows with a
-    NULL/empty family are stored under the "" (global) bucket.
+    Text kinds (prompts, instructions) carry ``content``; structured kinds
+    (settings, guardrails) carry ``value_json``. NULL/empty family -> "" bucket.
     """
-    mapping: Dict[str, Dict[tuple, str]] = {}
+    import json as _json
+
+    text_map: Dict[str, Dict[tuple, str]] = {}
+    value_map: Dict[str, Dict[tuple, Any]] = {}
     for row in rows:
         fam = row.get("family") or ""
-        mapping.setdefault(fam, {})[(row["kind"], row["name"])] = row["content"]
-    global _CONFIG_OVERRIDES
-    _CONFIG_OVERRIDES = mapping
+        kind = row["kind"]
+        if kind in ("prompts", "instructions"):
+            if row.get("content") is not None:
+                text_map.setdefault(fam, {})[(kind, row["name"])] = row["content"]
+        elif kind in ("settings", "guardrails"):
+            val = row.get("value_json")
+            if isinstance(val, str):  # asyncpg JSONB w/o codec -> str
+                val = _json.loads(val)
+            value_map.setdefault(fam, {})[(kind, row["name"])] = val
+    global _CONFIG_OVERRIDES, _VALUE_OVERRIDES
+    _CONFIG_OVERRIDES = text_map
+    _VALUE_OVERRIDES = value_map
 
 
 def clear_config_overrides() -> None:
-    """Drop all process-local prompt overrides (used between jobs and in tests)."""
-    global _CONFIG_OVERRIDES
+    """Drop all process-local overrides (used between jobs and in tests)."""
+    global _CONFIG_OVERRIDES, _VALUE_OVERRIDES
     _CONFIG_OVERRIDES = {}
+    _VALUE_OVERRIDES = {}
 
 
 def _db_lookup(kind: str, family: str, name: str) -> Optional[str]:
@@ -78,6 +93,49 @@ def _db_lookup(kind: str, family: str, name: str) -> Optional[str]:
     if global_map is not None and (kind, name) in global_map:
         return global_map[(kind, name)]
     return None
+
+
+def _expand_dotted(flat: Dict[str, Any]) -> Dict[str, Any]:
+    """Expand dotted keys ('limits.x') into nested dicts ({'limits': {'x': ...}})."""
+    out: Dict[str, Any] = {}
+    for key, val in flat.items():
+        parts = key.split(".")
+        node = out
+        for part in parts[:-1]:
+            node = node.setdefault(part, {})
+        node[parts[-1]] = val
+    return out
+
+
+def _settings_override_for(family: str) -> Dict[str, Any]:
+    """DB settings override for <family> (global then family) as a nested dict
+    ready to deep_merge onto file settings. {} when flag off or no rows."""
+    if not _is_config_db_overrides_enabled():
+        return {}
+
+    def collect(fam: str) -> Dict[str, Any]:
+        flat = {
+            name: val
+            for (kind, name), val in _VALUE_OVERRIDES.get(fam, {}).items()
+            if kind == "settings"
+        }
+        return _expand_dotted(flat)
+
+    return deep_merge(collect(""), collect(family))
+
+
+def _guardrails_override_for(family: str) -> Dict[str, Any]:
+    """DB guardrails override ({tool_examples, nudges}) for <family>. {} when off."""
+    if not _is_config_db_overrides_enabled():
+        return {}
+
+    def collect(fam: str) -> Dict[str, Any]:
+        for (kind, name), val in _VALUE_OVERRIDES.get(fam, {}).items():
+            if kind == "guardrails":
+                return val if isinstance(val, dict) else {}
+        return {}
+
+    return deep_merge(collect(""), collect(family))
 
 
 # =============================================================================
