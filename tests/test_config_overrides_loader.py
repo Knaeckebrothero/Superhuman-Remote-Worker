@@ -224,3 +224,25 @@ def test_resolve_model_settings_applies_override(monkeypatch):
         loader.resolve_model_settings("google/gemma-4-31b", bundled_only=True)["temperature"]
         != 1.0
     )
+
+
+def test_resolve_guardrails_applies_override(monkeypatch):
+    _reset()
+    monkeypatch.setenv("CONFIG_DB_OVERRIDES_ENABLED", "true")
+    loader.set_config_overrides(
+        [
+            {
+                "family": "gemma",
+                "kind": "guardrails",
+                "name": "guardrails",
+                "value_json": {"nudges": {"extra": "be careful"}},
+            }
+        ]
+    )
+    assert loader.resolve_guardrails("google/gemma-4-31b")["nudges"]["extra"] == "be careful"
+    assert (
+        loader.resolve_guardrails("google/gemma-4-31b", bundled_only=True)
+        .get("nudges", {})
+        .get("extra")
+        is None
+    )
