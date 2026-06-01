@@ -447,7 +447,7 @@ def _load_guardrails_matrix(
 
 
 def resolve_guardrails(
-    model: str, deployment_dir: Optional[str] = None
+    model: str, deployment_dir: Optional[str] = None, *, bundled_only: bool = False
 ) -> Dict[str, Any]:
     """Resolve the merged guardrails dict for a model.
 
@@ -466,7 +466,10 @@ def resolve_guardrails(
     matrix = _load_guardrails_matrix(deployment_dir)
     default_guardrails = matrix.get("default", {})
     family_guardrails = matrix.get(family, {}) if family != "default" else {}
-    return deep_merge(default_guardrails, family_guardrails)
+    merged = deep_merge(default_guardrails, family_guardrails)
+    if not bundled_only:
+        merged = deep_merge(merged, _guardrails_override_for(family))
+    return merged
 
 
 def resolve_model_settings(
