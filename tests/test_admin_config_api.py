@@ -165,3 +165,21 @@ def test_catalog_has_settings_and_guardrails_keys():
     by_key = {(e["kind"], e["name"]): e for e in entries}
     assert by_key[("settings", "temperature")]["type"] == "number"
     assert ("guardrails", "guardrails") in by_key
+
+
+def test_settings_override_create_model_validates():
+    Create = _import_main().ConfigOverrideCreate
+
+    ok = Create(family="gemma", kind="settings", name="temperature", value_json=1.0)
+    assert ok.value_json == 1.0 and ok.content is None
+    with pytest.raises(Exception):
+        Create(family="gemma", kind="prompts", name="persona")  # text needs content
+    with pytest.raises(Exception):
+        Create(family="gemma", kind="settings", name="temperature")  # structured needs value_json
+
+
+def test_validate_override_value_checks_catalog():
+    m = _import_main()
+    with pytest.raises(Exception):
+        m.validate_override_value("settings", "temperature", 9.0)  # > max
+    m.validate_override_value("settings", "temperature", 1.0)  # ok
