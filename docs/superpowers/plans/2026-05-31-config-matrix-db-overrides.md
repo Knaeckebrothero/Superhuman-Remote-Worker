@@ -622,10 +622,13 @@ Log into Cockpit (`https://localhost`, `test`/`test`), open **Admin · Config**,
 
 Dispatch a **gemma-family** job (Create → New Job). Then confirm the freeze captured the override:
 ```bash
+# NOTE: resolved_config nests the agent config under "agent" (serialize_resolved_config
+# returns {"agent": asdict(config), "prompts": ..., ...}), so the path is
+# agent->llm->temperature — NOT llm->temperature. Verified 2026-06-01 in-pod.
 kubectl -n srw exec deploy/srw-orchestrator -- \
-  psql "$DATABASE_URL" -c "SELECT resolved_config->'llm'->>'temperature' FROM jobs ORDER BY created_at DESC LIMIT 1;"
+  psql "$DATABASE_URL" -c "SELECT resolved_config->'agent'->'llm'->>'temperature' FROM jobs ORDER BY created_at DESC LIMIT 1;"
 ```
-Expected: `1.0`. Delete the override → next gemma job reverts to the file default (`0.0`).
+Expected: `1`. Delete the override → next gemma job reverts to the file default (`0.3`).
 
 - [ ] **Step 4: Verify the family-key canonicalization** (pre-existing risk)
 
