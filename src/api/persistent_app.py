@@ -1109,7 +1109,7 @@ async def _attach_session(
                     e,
                 )
 
-    # Inject datasource index into workspace.md (after workspace is initialized)
+    # Inject datasource index into datasources.md (after workspace is initialized)
     if datasources and _session.workspace_manager:
         try:
             _inject_ds_index(datasources, _session.workspace_manager)
@@ -1752,7 +1752,6 @@ async def handle_persistent_websocket(ws: WebSocket) -> None:
                 callbacks=callbacks,
                 messages=_session.messages,
                 auxiliary_llm=_session.auxiliary_llm,
-                workspace_content=_session.get_workspace_content,
                 recall_store=_session.recall_store,
                 knowledge_store=_session.knowledge_store,
                 project_id=_session.project_id,

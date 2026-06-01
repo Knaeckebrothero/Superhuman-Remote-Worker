@@ -1,9 +1,9 @@
 """Memory manager for nested loop graph architecture.
 
-This module provides the MemoryManager for reading and writing the
-workspace memory file (workspace.md). This file serves as the agent's
-long-term memory, similar to CLAUDE.md - it's always available in
-the system prompt.
+DEPRECATED: workspace.md was removed in favor of the project knowledge
+base (kb_*) + memory system (RecallStore). This MemoryManager is retained
+for backward compatibility but is no longer wired into prompt injection —
+the graph injects recalled memories and knowledge notes instead.
 
 The MemoryManager is a service (stateless) - it reads/writes directly
 to the workspace filesystem without holding state in memory.
@@ -22,9 +22,10 @@ logger = logging.getLogger(__name__)
 class MemoryManager:
     """Service for workspace.md (long-term memory) operations.
 
-    The MemoryManager provides access to the agent's persistent memory file.
-    workspace.md is always injected into the system prompt (like CLAUDE.md)
-    and survives context compaction.
+    DEPRECATED: workspace.md is no longer injected into the system prompt.
+    The project knowledge base (kb_*) and memory system (RecallStore) provide
+    long-term memory that survives context compaction. Retained for backward
+    compatibility only.
 
     Design principles:
     - Stateless service: No in-memory state

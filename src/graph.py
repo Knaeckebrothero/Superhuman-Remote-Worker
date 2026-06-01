@@ -40,7 +40,7 @@ Phase Alternation:
 - Strategic phases use predefined todos for planning/reflection
 - Tactical phases use todos.yaml written by the strategic agent
 - Messages are cleared at each phase transition
-- workspace.md persists across phases for long-term memory
+- the project knowledge base and memory system provide long-term memory across phases
 """
 
 import json
@@ -636,7 +636,7 @@ def create_execute_node(
         strategic_llm_with_tools: LLM for strategic (planning) phases
         tactical_llm_with_tools: LLM for tactical (execution) phases
         todo_manager: TodoManager for task tracking
-        memory_manager: MemoryManager for workspace.md access
+        memory_manager: MemoryManager (legacy; workspace.md no longer used)
         workspace_manager: WorkspaceManager for file operations
         config: Agent configuration
         context_mgr: ContextManager for context window management
@@ -727,7 +727,7 @@ def create_execute_node(
         # Build messages for LLM
         prepared_messages = []
 
-        # Get phase-aware system prompt (workspace.md and todos are injected as transient messages below)
+        # Get phase-aware system prompt (todos, memory, and knowledge are injected as transient messages below)
         phase_number = state.get("phase_number", 0)
         phase_name = "strategic" if is_strategic else "tactical"
         phase_llm_config = config.llm.get_phase_config(phase_name)
@@ -997,7 +997,7 @@ def create_execute_node(
                                 f"[{job_id}] Phase instruction file not found: {entry.file}"
                             )
 
-        # Inject transient messages (todos, workspace.md, instruction files)
+        # Inject transient messages (todos, memory, knowledge, instruction files)
         _inject_transient_messages(prepared_messages)
 
         # Step 3: Add rest of conversation (excluding all SystemMessages)
@@ -1050,7 +1050,7 @@ def create_execute_node(
                     if "[Summary of prior work]" in msg.content:
                         prepared_messages.append(msg)
 
-            # Re-inject ALL transient messages (todos + workspace.md + instruction files)
+            # Re-inject ALL transient messages (todos + memory + knowledge + instruction files)
             _inject_transient_messages(prepared_messages)
             logger.debug(
                 f"[{job_id}] Re-injected transient messages after safety compaction"
@@ -3456,7 +3456,7 @@ def build_phase_alternation_graph(
         config: Agent configuration
         workspace: WorkspaceManager instance
         todo_manager: TodoManager instance (must be the same one used by tools)
-        workspace_template: Template content for workspace.md
+        workspace_template: Deprecated/unused (workspace.md removed)
         checkpointer: Optional LangGraph checkpointer for state persistence.
             When provided, enables resume after crash using the same thread_id.
         auxiliary_llm: AuxiliaryLLM instance for summarization and support tasks.
@@ -3727,7 +3727,7 @@ def build_nested_loop_graph(
         system_prompt_template: Deprecated - ignored (phase prompts used instead)
         workspace: WorkspaceManager instance
         todo_manager: TodoManager instance (must be same one used by tools)
-        workspace_template: Template content for workspace.md
+        workspace_template: Deprecated/unused (workspace.md removed)
         checkpointer: Optional LangGraph checkpointer
         use_phase_alternation: Deprecated - ignored (always True)
 

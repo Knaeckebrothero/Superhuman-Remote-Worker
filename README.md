@@ -673,21 +673,25 @@ All experts share the same universal agent codebase. Worker-mode experts extend 
 
 Agents run in `dual` mode by default, accepting both jobs and persistent sessions.
 
-### Workspace-Centric Memory
+### Knowledge & Memory
 
-Long-term memory lives in files, not in the LLM context window:
+Long-term memory lives outside the LLM context window in two always-on systems, both injected into every call as transient messages:
 
-- `workspace.md` — Injected into every LLM call, survives context compaction
+- **Knowledge base** — Project-scoped notes written via `kb_write` (decisions, learnings, facts), retrieved by hybrid search. Shared across jobs in a project.
+- **Memory system (RecallStore)** — Hybrid dense+sparse search (pgvector) with TTL-managed memories scoped to projects. An auxiliary LLM extracts memories asynchronously while the agent continues working.
+
+File-based artifacts complement these:
+
 - `plan.md` — Strategic plan, updated at phase boundaries
+- `notes/` — Working notes the agent writes during a job
+- `datasources.md` — Connection reference (names, repo clone paths, kube contexts) for attached datasources
 - `archive/` — Phase retrospectives and completed task lists
-
-Cross-job knowledge sharing uses the **RecallStore** — a hybrid dense+sparse search system (pgvector) with TTL-managed memories scoped to projects. An auxiliary LLM extracts memories asynchronously while the agent continues working.
 
 This means the agent can work on tasks that exceed any single context window, and knowledge accumulates across jobs.
 
 ## Debugging
 
-- **Workspace files** (inside the workspace container, SSH in to look): `workspace.md`, `todos.yaml`, `plan.md`, `output/`
+- **Workspace files** (inside the workspace container, SSH in to look): `plan.md`, `todos.yaml`, `notes/`, `datasources.md`, `output/`
 - **Checkpoints**: `workspace/checkpoints/job_<id>.db` (SQLite, on the agent host)
 - **Logs**: `workspace/logs/job_<id>.log`
 - **Phase snapshots**: `workspace/phase_snapshots/job_<id>/phase_<n>/`

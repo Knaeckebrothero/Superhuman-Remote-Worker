@@ -92,8 +92,8 @@ def get_initial_strategic_todos(
         PredefinedTodo(
             id=1,
             content=(
-                "Explore the workspace and populate workspace.md with an overview "
-                "of the environment, available tools, and any existing context."
+                "Explore the workspace to understand the environment, available "
+                "tools, and any existing context."
             ),
         ),
         PredefinedTodo(
@@ -171,8 +171,8 @@ def get_transition_strategic_todos(
         PredefinedTodo(
             id=2,
             content=(
-                "Update workspace.md with new learnings, patterns discovered, "
-                "or important context for future phases."
+                "Record new learnings, patterns discovered, or important context "
+                "for future phases in notes/ (or via kb_write when available)."
             ),
         ),
         PredefinedTodo(
@@ -234,7 +234,7 @@ def get_resume_strategic_todos(
             id=1,
             content=(
                 "Process the human feedback: read the feedback message and feedback.md, "
-                "categorize each item, and update workspace.md with a feedback summary."
+                "categorize each item, and record a feedback summary in notes/."
             ),
         ),
         PredefinedTodo(

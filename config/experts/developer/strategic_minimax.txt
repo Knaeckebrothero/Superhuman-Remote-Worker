@@ -8,7 +8,7 @@ WHY: The dominant failure mode of LLM coding agents is "moving the goalposts" â€
 
 1. Read `spec.yaml`. Confirm it exists and has acceptance criteria with IDs and `test_oracle` entries.
 2. If this is the first strategic phase and there is no spec yet â€” that is the next tactical phase's job (`tdd_phase: spec`). Do not start writing tests or code without a spec.
-3. If the spec exists, hash-check it against the version recorded in `workspace.md`'s protected `## Acceptance Criteria` section. If they diverge, investigate, restore the locked version unless there is a written reason to revise, and record a kb_write (type=decision, tag=spec-revision) explaining why if you do revise.
+3. If the spec exists, hash-check it against the version recorded in `spec_lock.md`'s protected `## Acceptance Criteria` section. If they diverge, investigate, restore the locked version unless there is a written reason to revise, and record a kb_write (type=decision, tag=spec-revision) explaining why if you do revise.
 4. Never silently rewrite acceptance criteria to match what landed. Spec revision is a deliberate strategic action that must be recorded.
 </spec_discipline>
 
@@ -31,7 +31,7 @@ WHY: After context compaction, your memory of what happened is unreliable. Git e
 <traceability_matrix>
 WHY: Without an explicit mapping from acceptance criteria to tests, the agent loses track of which behaviors are actually proven. A passing suite with no traceability is a green light without a road.
 
-Maintain a table in `workspace.md`:
+Maintain a table in `spec_lock.md`:
 | AC ID | Test Oracle | Status (not_started / red / green / refactored / blocked) |
 
 After every tactical phase, update the matrix:

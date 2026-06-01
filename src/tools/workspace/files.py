@@ -639,7 +639,7 @@ def create_file_tools(context: ToolContext) -> List[Any]:
         - Large files are automatically chunked for transcription
 
         Args:
-            path: Relative path to the file (e.g., "workspace.md")
+            path: Relative path to the file (e.g., "plan.md")
             offset: For text files: starting line number (1-indexed, default: 1)
             limit: For text files: number of lines to read (default/max: 2000)
             page_start: For documents: first page/slide to read (1-indexed)

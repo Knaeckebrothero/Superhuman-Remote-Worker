@@ -871,6 +871,8 @@
     "settings": {
       "mode": "Mode",
       "narration": "Narration",
+      "reasoning": "Reasoning",
+      "toolCalls": "Tool calls",
       "model": "Model",
       "temperature": "Temperature: {{value}}",
       "modeSupervised": "Supervised",
@@ -878,7 +880,11 @@
       "modeAutonomous": "Autonomous",
       "narrationAuto": "Auto",
       "narrationVerbose": "Verbose",
-      "narrationSilent": "Silent"
+      "narrationSilent": "Silent",
+      "reasoningExpanded": "Expanded",
+      "reasoningCollapsed": "Collapsed",
+      "toolCallsExpanded": "Expanded",
+      "toolCallsCollapsed": "Collapsed"
     },
     "tasks": {
       "header": "Tasks {{done}}/{{total}}",

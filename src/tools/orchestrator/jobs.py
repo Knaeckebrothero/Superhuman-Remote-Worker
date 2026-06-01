@@ -62,7 +62,7 @@ ORCHESTRATOR_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "description": (
             "Read a file from a worker job's workspace. Use this to inspect "
             "the worker's output, plan, or workspace notes. Common files: "
-            "workspace.md, plan.md, output/*.md"
+            "plan.md, notes/, output/*.md"
         ),
         "category": "orchestrator",
         "short_description": "Read a file from a job's workspace.",
@@ -297,7 +297,7 @@ def create_orchestrator_tools(context: ToolContext) -> List[Any]:
 
         Args:
             job_id: The job UUID
-            path: Relative file path (e.g., workspace.md, plan.md, output/result.md)
+            path: Relative file path (e.g., plan.md, notes/decisions.md, output/result.md)
 
         Returns:
             File contents or error message

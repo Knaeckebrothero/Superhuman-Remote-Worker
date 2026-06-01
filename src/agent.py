@@ -774,12 +774,11 @@ class UniversalAgent:
         return resolver.load("workspace_template")
 
     def _inject_repo_context_to_workspace(self, git_url: str, git_branch: str) -> None:
-        """Append repository context to workspace.md after clone.
+        """Append repository (workspace git) context to datasources.md after clone.
 
-        This gives the agent persistent knowledge of the git remote URL,
-        branch, and Gitea API endpoint so it can push and create PRs.
-        The info survives context compaction since workspace.md is re-injected
-        on every LLM call.
+        This gives the agent a persistent reference for the git remote URL,
+        branch, and Gitea API endpoint so it can push and create PRs. The
+        system prompts point the agent at datasources.md for connection details.
         """
         from urllib.parse import urlparse
 
@@ -820,11 +819,14 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
 ```
 """
         try:
-            existing = self._workspace_manager.read_file("workspace.md")
-            self._workspace_manager.write_file("workspace.md", existing + section)
-            logger.info("Injected repository context into workspace.md")
+            try:
+                existing = self._workspace_manager.read_file("datasources.md")
+            except (FileNotFoundError, ValueError, OSError):
+                existing = ""
+            self._workspace_manager.write_file("datasources.md", existing + section)
+            logger.info("Injected repository context into datasources.md")
         except Exception as e:
-            logger.warning(f"Failed to inject repo context into workspace.md: {e}")
+            logger.warning(f"Failed to inject repo context into datasources.md: {e}")
 
     async def _setup_job_workspace(
         self,
@@ -1181,7 +1183,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         # VM recovery: seed fresh VM workspace from last snapshot if needed
         if resume and workspace_backend and workspace_backend.supports_shell:
             try:
-                if not workspace_backend.exists("workspace.md"):
+                if not workspace_backend.exists("task_brief.md"):
                     logger.info(
                         f"VM workspace is fresh — seeding from last snapshot for job {job_id}"
                     )
@@ -1377,7 +1379,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         self._workspace_manager.write_file("task_brief.md", "".join(brief_parts))
         logger.debug("Wrote task_brief.md to workspace")
 
-        # Process initial_files from config (e.g., workspace.md template)
+        # Process initial_files from config (templates seeded into the workspace)
         if self.config.workspace.initial_files:
             config_dir = Path(__file__).parent.parent / "config" / "agents"
             for dest_path, source_path in self.config.workspace.initial_files.items():
@@ -1443,7 +1445,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             except Exception as e:
                 logger.error(f"Git clone failed: {e}")
 
-            # Inject repo context into workspace.md if clone succeeded
+            # Inject repo context into datasources.md if clone succeeded
             if repo_dir.exists() and any(repo_dir.iterdir()):
                 self._inject_repo_context_to_workspace(git_url, git_branch)
 
@@ -2139,7 +2141,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                     pass
 
     def _inject_datasource_index(self, ds_configs: list) -> None:
-        """Inject a compact datasource index into workspace.md.
+        """Inject a compact datasource index into datasources.md.
 
         This ensures the agent always knows what datasources are available,
         even before KB retrieval fires. Full details are in the knowledge base.
@@ -2170,12 +2172,15 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                 lines.append(f"- **{name}** ({ds_type})")
 
         try:
-            existing = self._workspace_manager.read_file("workspace.md")
+            try:
+                existing = self._workspace_manager.read_file("datasources.md")
+            except (FileNotFoundError, ValueError, OSError):
+                existing = ""
             self._workspace_manager.write_file(
-                "workspace.md", existing + "\n".join(lines)
+                "datasources.md", existing + "\n".join(lines)
             )
             logger.info(
-                f"Injected datasource index ({len(ds_configs)} entries) into workspace.md"
+                f"Injected datasource index ({len(ds_configs)} entries) into datasources.md"
             )
         except Exception as e:
             logger.warning(f"Failed to inject datasource index: {e}")
