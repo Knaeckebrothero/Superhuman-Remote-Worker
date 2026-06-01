@@ -269,6 +269,41 @@ export function pickCodeServerUrlToOpen(status: IdeSessionStatus | null): string
         : null;
 }
 
+/**
+ * Pull file payloads out of a paste's clipboard items (#11 paste-to-attach),
+ * dropping the `kind: 'string'` entries (plain text / HTML) so a text paste
+ * falls through to the textarea untouched. Clipboard images frequently arrive
+ * as a nameless blob — synthesize a stable, collision-free filename so the
+ * attachment chip has a label and the agent hint reads sensibly. Pure and
+ * DOM-creation-free (takes the item list, takes `now` instead of calling
+ * Date.now()) so the selection logic is unit-testable; the component handler
+ * does the async preview + signal update.
+ */
+export function extractClipboardFiles(
+    items: DataTransferItemList | null | undefined,
+    now: number,
+): File[] {
+    if (!items) return [];
+    const files: File[] = [];
+    for (const item of Array.from(items)) {
+        if (item.kind !== 'file') continue;
+        const file = item.getAsFile();
+        if (!file) continue;
+        if (file.name) {
+            files.push(file);
+        } else {
+            const ext = (file.type.split('/')[1] || 'bin').split(';')[0];
+            files.push(
+                new File([file], `pasted-${now}-${files.length}.${ext}`, {
+                    type: file.type,
+                    lastModified: now,
+                }),
+            );
+        }
+    }
+    return files;
+}
+
 /** Structured diff/content view for a file-mutating tool card (#7). */
 interface FileEditView {
     path: string;
@@ -1057,6 +1092,7 @@ interface FileEditView {
               (ngModelChange)="onInputChange($event)"
               (input)="autoResizeInput()"
               (keydown)="onKeydown($event)"
+              (paste)="onPaste($event)"
               (focus)="inputFocused.set(true)"
               (blur)="inputFocused.set(false)"
               [placeholder]="inputPlaceholder()"
@@ -1676,6 +1712,21 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         this.chat.addAttachments(previews);
         // Allow re-selecting the same file later.
         input.value = '';
+    }
+
+    /**
+     * Paste-to-attach (#11): when the clipboard carries files — a screenshot,
+     * a copied image, or a file from the OS file manager — divert them into
+     * the same attachment flow as the Attach button and drag-drop, rather than
+     * letting the browser paste a data URL (or nothing) into the textarea.
+     * Plain-text pastes carry no file items, so they fall through untouched.
+     */
+    async onPaste(event: ClipboardEvent): Promise<void> {
+        const files = extractClipboardFiles(event.clipboardData?.items, Date.now());
+        if (files.length === 0) return; // text paste — let the default run
+        event.preventDefault();
+        const previews = await this.fileHandling.createFilePreviews(files);
+        if (previews.length > 0) this.chat.addAttachments(previews);
     }
 
     /** Drop one queued attachment. */
