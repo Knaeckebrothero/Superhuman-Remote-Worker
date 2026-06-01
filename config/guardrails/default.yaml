@@ -55,7 +55,7 @@ tool_examples:
         git_diff()                                                          # uncommitted changes
         git_diff(ref1="HEAD~5")                                             # last 5 commits vs working dir
         git_diff(ref1="phase-1-tactical-complete", ref2="HEAD")             # between tag and HEAD
-        git_diff(file_path="workspace.md")                                  # uncommitted changes in one file
+        git_diff(file_path="plan.md")                                  # uncommitted changes in one file
 
   git_status: |-
     Example output (clean):
@@ -71,7 +71,7 @@ tool_examples:
           + updated.md
 
         Modified (1):
-          M workspace.md
+          M plan.md
 
   git_tags: |-
     Examples:
@@ -272,7 +272,7 @@ nudges:
   # Sites: src/core/phase.py on_tactical_phase_complete()
   # Placeholders: {phase_number}
   phase_transition_tactical_to_strategic: |-
-    [PHASE_TRANSITION] Tactical phase complete. Entering strategic phase {phase_number}. Review what was accomplished, update workspace.md and plan.md, then either stage todos for the next tactical phase using the `next_phase_todos` tool or invoke the `job_complete` tool.
+    [PHASE_TRANSITION] Tactical phase complete. Entering strategic phase {phase_number}. Review what was accomplished, update plan.md and record key learnings, then either stage todos for the next tactical phase using the `next_phase_todos` tool or invoke the `job_complete` tool.
 
   # ----- src/managers/todo.py -----
 

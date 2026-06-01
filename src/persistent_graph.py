@@ -7,7 +7,7 @@ calls (with permission checks), and repeats.
 
 Reuses the same shared infrastructure as the worker graph:
 - ContextManager for token counting and compaction
-- Transient injection for workspace.md
+- Transient injection for memory and knowledge
 - AuxiliaryLLM for summarization
 - load_tools / ToolContext for tool loading
 """
@@ -267,7 +267,6 @@ async def run_persistent_loop(
     callbacks: PersistentLoopCallbacks,
     messages: List[BaseMessage],
     auxiliary_llm: Optional[Any] = None,
-    workspace_content: Optional[Callable[[], str]] = None,
     recall_store: Optional[Any] = None,
     knowledge_store: Optional[Any] = None,
     project_id: Optional[str] = None,
@@ -291,7 +290,6 @@ async def run_persistent_loop(
         callbacks: Transport callbacks (WebSocket I/O)
         messages: Mutable message list (persisted across turns)
         auxiliary_llm: For summarization during compaction
-        workspace_content: Callable returning current workspace.md content
         recall_store: RecallStore instance for memory injection/extraction
         knowledge_store: KnowledgeStore instance for knowledge injection
         project_id: Project UUID string for scoped knowledge queries (backward compat)
@@ -364,7 +362,6 @@ async def run_persistent_loop(
                 callbacks=callbacks,
                 llm_timeout=llm_timeout,
                 auxiliary_llm=auxiliary_llm,
-                workspace_content=workspace_content,
                 config=config,
                 recall_store=recall_store,
                 knowledge_store=knowledge_store,
@@ -437,7 +434,6 @@ async def _execute_turn(
     callbacks: PersistentLoopCallbacks,
     llm_timeout: float,
     auxiliary_llm: Optional[Any],
-    workspace_content: Optional[Callable[[], str]],
     config: Any,
     recall_store: Optional[Any] = None,
     knowledge_store: Optional[Any] = None,
@@ -552,20 +548,7 @@ async def _execute_turn(
                 interrupted=True,
             )
 
-        # Inject workspace.md as transient system context if available
         prepared = list(messages)
-        if workspace_content:
-            ws_content = workspace_content()
-            if ws_content:
-                # Insert workspace context after system message
-                ws_msg = SystemMessage(
-                    content=f"<workspace_memory>\n{ws_content}\n</workspace_memory>"
-                )
-                # Find insertion point (after system message, before conversation)
-                insert_idx = (
-                    1 if prepared and isinstance(prepared[0], SystemMessage) else 0
-                )
-                prepared.insert(insert_idx, ws_msg)
 
         # Inject memory and knowledge as transient tool-call pairs
         if memory_block:
@@ -573,14 +556,9 @@ async def _execute_turn(
                 from .core.memory_injection import create_memory_injection_messages
 
                 mem_ai, mem_tool = create_memory_injection_messages(memory_block)
-                # Insert after workspace injection, before conversation
+                # Insert after the system message, before conversation
                 inject_idx = (
-                    2
-                    if workspace_content
-                    and prepared
-                    and len(prepared) > 1
-                    and isinstance(prepared[1], SystemMessage)
-                    else 1
+                    1 if prepared and isinstance(prepared[0], SystemMessage) else 0
                 )
                 prepared.insert(inject_idx, mem_ai)
                 prepared.insert(inject_idx + 1, mem_tool)

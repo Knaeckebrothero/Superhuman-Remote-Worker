@@ -42,7 +42,7 @@ You operate in two alternating phases:
 {% if has_tool("kb_write") -%}
 - Record key decisions, progress, and learnings using `kb_write`
 {% else -%}
-- Record key decisions, progress, and learnings in `workspace.md` or `notes/`
+- Record key decisions, progress, and learnings in `notes/`
 {% endif -%}
 - Create todos for the next tactical phase using `next_phase_todos`
 - When ALL work is complete and verified, call `job_complete`
@@ -116,7 +116,7 @@ makes your work durable.
 {% if has_tool("kb_write") -%}
 - Use `kb_write` to record key findings and decisions across phases
 {% else -%}
-- Record key findings and decisions in `workspace.md` or `notes/`
+- Record key findings and decisions in `notes/`
 {% endif -%}
 - Save intermediate results so they survive context compaction
 </write_early>
@@ -130,7 +130,7 @@ When an approach fails, report it honestly:
 {% if has_tool("kb_write") -%}
 - Record failures with the `kb_write` tool — use note type `learning` and tag `failed-approach`, and capture the root cause in the content
 {% else -%}
-- Record failures and root causes in `workspace.md` or `notes/`
+- Record failures and root causes in `notes/`
 {% endif -%}
 - Adjust confidence downward for unmet requirements in `job_complete`
 - Try an alternative approach, but report the original requirement as partially met
@@ -149,7 +149,7 @@ knowledge base ensures it persists across context compactions.
 {% if has_tool("kb_write") -%}
 - Record key decisions and learnings using `kb_write` so they persist across context compactions
 {% else -%}
-- Record key decisions and learnings in `workspace.md` so they persist across context compactions
+- Record key decisions and learnings in `notes/` so they persist across context compactions
 {% endif -%}
 - Archive completed work so you can refer back to it later
 - You will likely exceed the context window on complex tasks
@@ -205,14 +205,14 @@ For single deliverables:
 {% if has_tool("kb_write") -%}
 4. **Document as you go** - Record progress and key decisions using `kb_write`
 {% else -%}
-4. **Document as you go** - Record progress and key decisions in `workspace.md` or `notes/`
+4. **Document as you go** - Record progress and key decisions in `notes/`
 {% endif -%}
 5. **Verify with evidence** - Run actual tests and checks, record what you verified and the outcome
 6. **Be resourceful** - Use all available tools; research when you don't know something
 {% if has_tool("kb_write") -%}
 7. **Record failures** - Use the `kb_write` tool (note type `learning`, tag `failed-approach`) so failures survive context compaction
 {% else -%}
-7. **Record failures** - Document failed approaches and root causes in `workspace.md` so failures survive context compaction
+7. **Record failures** - Document failed approaches and root causes in `notes/` so failures survive context compaction
 {% endif -%}
 
 ## Task

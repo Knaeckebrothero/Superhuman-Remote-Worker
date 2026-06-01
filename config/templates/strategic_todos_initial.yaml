@@ -29,15 +29,15 @@ todos:
       COMPLETION CRITERIA: Knowledge notes created for all four categories above
       (verify with kb_list). instructions.md and task_brief.md have been read in full.
       {% else -%}
-      Then persist critical rules in workspace files:
-      - Required output files (exact paths and formats) → note in workspace.md under "## Deliverables"
-      - Style/language constraints (tone, formatting, language) → note in workspace.md under "## Constraints"
-      - Hard rules (things explicitly forbidden or required) → note in workspace.md under "## Hard Rules"
-      - Delivery expectations (what "done" looks like) → note in workspace.md under "## Acceptance Criteria"
+      Then persist critical rules to a notes/ file so they survive compaction:
+      - Required output files (exact paths and formats) → notes/task_rules.md under "## Deliverables"
+      - Style/language constraints (tone, formatting, language) → notes/task_rules.md under "## Constraints"
+      - Hard rules (things explicitly forbidden or required) → notes/task_rules.md under "## Hard Rules"
+      - Delivery expectations (what "done" looks like) → notes/task_rules.md under "## Acceptance Criteria"
 
-      These notes persist in workspace.md across context compaction.
+      The memory system also recalls key context automatically across compaction.
 
-      COMPLETION CRITERIA: Critical rules recorded in workspace.md under the four
+      COMPLETION CRITERIA: Critical rules recorded in notes/task_rules.md under the four
       categories above. instructions.md and task_brief.md have been read in full.
       {% endif -%}
 
@@ -108,18 +108,18 @@ todos:
       INSTEAD OF: Skipping this step — prior knowledge from the same project can save
       significant work. Instead of creating notes that duplicate existing ones — search first.
       {% else -%}
-      REVIEW PROJECT CONTEXT: Check workspace.md and plan.md for existing context.
+      REVIEW PROJECT CONTEXT: Check plan.md and notes/ for existing context.
 
       Review any prior context available in the workspace:
-      (1) Read workspace.md for any existing decisions or constraints.
-      (2) Read plan.md if it exists from a prior phase.
+      (1) Read plan.md if it exists from a prior phase.
+      (2) Check notes/ for any decisions or constraints recorded earlier.
       (3) Check archive/ for any retrospectives from previous phases.
 
-      Record initial state in workspace.md if not already present:
+      Record initial state in notes/ if not already present:
       - The current job's objective under "## Goal"
       - Any facts discovered during exploration (IDs, paths, configurations) under "## Facts"
 
-      COMPLETION CRITERIA: workspace.md reviewed and updated with goal and discovered facts.
+      COMPLETION CRITERIA: prior context reviewed; goal and discovered facts recorded in notes/.
 
       INSTEAD OF: Skipping this step — prior context can save significant work.
       {% endif -%}

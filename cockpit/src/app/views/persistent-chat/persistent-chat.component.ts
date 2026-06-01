@@ -44,6 +44,7 @@ import {ApiService, IdeSessionStatus} from '../../core/services/api.service';
 import {ModelService} from '../../core/services/model.service';
 import {I18nService} from '../../core/services/i18n.service';
 import {FileHandlingService} from '../../core/services/file-handling.service';
+import {ChatPreferencesService} from '../../core/services/chat-preferences.service';
 import {DeviceCapabilitiesService} from '../../core/services/device-capabilities.service';
 import {VoiceRecordingService} from '../../core/services/voice-recording.service';
 import {FilePreview, FileType} from '../../core/models/file.model';
@@ -304,6 +305,21 @@ export function extractClipboardFiles(
     return files;
 }
 
+/**
+ * Whether a run of consecutive tool calls should render as the folded
+ * "N× tool calls" disclosure vs. plain inline cards. A run folds only when the
+ * user hasn't chosen the always-inline "Tool calls → Expanded" preference AND
+ * it's long enough to be worth grouping (Slice 3 threshold). When expanded, no
+ * run folds — every call renders inline with no fold control, like a short run.
+ */
+export function shouldFoldToolRun(
+    toolCount: number,
+    toolCallsExpanded: boolean,
+    threshold: number,
+): boolean {
+    return !toolCallsExpanded && toolCount >= threshold;
+}
+
 /** Structured diff/content view for a file-mutating tool card (#7). */
 interface FileEditView {
     path: string;
@@ -438,6 +454,24 @@ interface FileEditView {
             </app-select>
           </div>
           <div class="settings-row">
+            <label class="settings-label">{{ 'chat.settings.reasoning' | transloco }}</label>
+            <app-select size="sm" [fullWidth]="false"
+                        [value]="chatPrefs.reasoningExpanded() ? 'expanded' : 'collapsed'"
+                        (changed)="onReasoningDefaultChange($event)">
+              <option value="expanded">{{ 'chat.settings.reasoningExpanded' | transloco }}</option>
+              <option value="collapsed">{{ 'chat.settings.reasoningCollapsed' | transloco }}</option>
+            </app-select>
+          </div>
+          <div class="settings-row">
+            <label class="settings-label">{{ 'chat.settings.toolCalls' | transloco }}</label>
+            <app-select size="sm" [fullWidth]="false"
+                        [value]="chatPrefs.toolCallsExpanded() ? 'expanded' : 'collapsed'"
+                        (changed)="onToolCallsDefaultChange($event)">
+              <option value="expanded">{{ 'chat.settings.toolCallsExpanded' | transloco }}</option>
+              <option value="collapsed">{{ 'chat.settings.toolCallsCollapsed' | transloco }}</option>
+            </app-select>
+          </div>
+          <div class="settings-row">
             <label class="settings-label">{{ 'chat.settings.model' | transloco }}</label>
             <app-select size="sm" [fullWidth]="false"
                         [value]="chat.modelName()"
@@ -562,7 +596,7 @@ interface FileEditView {
 
       <!-- Per-event card templates (referenced by the turn loop below). -->
       <ng-template #thoughtCard let-event>
-        <details class="thinking-block event-thought" open>
+        <details class="thinking-block event-thought" [attr.open]="chatPrefs.reasoningExpanded() ? '' : null">
           <summary class="thinking-header">
             <app-icon size="sm" class="thinking-icon">psychology</app-icon>
             <span class="thinking-label">
@@ -721,8 +755,9 @@ interface FileEditView {
                          every thought/text render individually. -->
                     @for (group of groupedEvents(turn); track group.id) {
                       @if (group.kind === 'tools') {
-                        @if (isLongToolRun(group.tools)) {
-                          <!-- Collapsed run: "N× tool calls", auto-open on error/denied. -->
+                        @if (foldToolRun(group.tools)) {
+                          <!-- Folded run: cornerless "N× tool calls", auto-open on error/denied.
+                               Suppressed entirely when Tool calls → Expanded (every run inline). -->
                           <details class="tool-group" [attr.open]="toolGroupHasProblem(group.tools) ? '' : null">
                             <summary class="tool-group-head">
                               <app-icon size="sm" class="tool-group-chevron">chevron_right</app-icon>
@@ -1232,6 +1267,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     private readonly i18n = inject(I18nService);
     private readonly http = inject(HttpClient);
     private readonly fileHandling = inject(FileHandlingService);
+    readonly chatPrefs = inject(ChatPreferencesService);
     private readonly deviceCapabilities = inject(DeviceCapabilitiesService);
     private readonly voiceRecording = inject(VoiceRecordingService);
     private readonly router = inject(Router);
@@ -2176,6 +2212,20 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         }
     }
 
+    /** Display-only: whether reasoning ("thinking") blocks open expanded by default. */
+    onReasoningDefaultChange(value: string | null): void {
+        if (value === 'expanded' || value === 'collapsed') {
+            this.chatPrefs.setReasoningExpanded(value === 'expanded');
+        }
+    }
+
+    /** Display-only: whether tool-call runs render inline ("expanded") or folded. */
+    onToolCallsDefaultChange(value: string | null): void {
+        if (value === 'expanded' || value === 'collapsed') {
+            this.chatPrefs.setToolCallsExpanded(value === 'expanded');
+        }
+    }
+
     onModelSelect(model: string | null): void {
         if (model) {
             this.chat.modelName.set(model);
@@ -2379,9 +2429,17 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         return groupEvents(turn.events);
     }
 
-    /** A tool run this long or longer collapses into a single group disclosure. */
-    isLongToolRun(tools: ToolCallEvent[]): boolean {
-        return tools.length >= this.TOOL_GROUP_THRESHOLD;
+    /**
+     * Whether this tool run renders as the folded "N× tool calls" disclosure.
+     * Folds only long runs, and only while the user hasn't opted into the
+     * always-inline "Tool calls → Expanded" display preference.
+     */
+    foldToolRun(tools: ToolCallEvent[]): boolean {
+        return shouldFoldToolRun(
+            tools.length,
+            this.chatPrefs.toolCallsExpanded(),
+            this.TOOL_GROUP_THRESHOLD,
+        );
     }
 
     /** True if a grouped run should auto-open: any member errored or was denied. */

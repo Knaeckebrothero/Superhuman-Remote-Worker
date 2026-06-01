@@ -2615,7 +2615,7 @@ def get_phase_system_prompt(
     5. Render remaining placeholders ({agent_display_name}, etc.)
     6. Render Jinja2 conditionals ({% if has_tool("kb_write") %} etc.)
 
-    Note: workspace.md and todos are injected as transient messages
+    Note: todos, memory, and knowledge are injected as transient messages
     in graph.py, not included in the system prompt.
 
     Args:

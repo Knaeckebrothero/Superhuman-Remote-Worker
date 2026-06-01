@@ -7,6 +7,7 @@ import {
     pickCodeServerUrlToOpen,
     pickCurrentStartupStep,
     pickRunningCommandCard,
+    shouldFoldToolRun,
 } from './persistent-chat.component';
 import {AssistantTurn} from '../../core/models/turn.model';
 
@@ -211,5 +212,31 @@ describe('extractClipboardFiles', () => {
         const blob = new File(['x'], '', {type: ''});
         const out = extractClipboardFiles(itemList([clipItem('file', blob)]), NOW);
         expect(out[0].name).toBe(`pasted-${NOW}-0.bin`);
+    });
+});
+
+describe('shouldFoldToolRun', () => {
+    const T = 4; // TOOL_GROUP_THRESHOLD
+
+    it('folds a long run when the Tool calls preference is Collapsed (default)', () => {
+        expect(shouldFoldToolRun(4, false, T)).toBe(true);
+        expect(shouldFoldToolRun(10, false, T)).toBe(true);
+    });
+
+    it('keeps a short run inline regardless of preference', () => {
+        expect(shouldFoldToolRun(1, false, T)).toBe(false);
+        expect(shouldFoldToolRun(3, false, T)).toBe(false);
+        expect(shouldFoldToolRun(3, true, T)).toBe(false);
+    });
+
+    it('never folds when Tool calls is Expanded — every run renders inline', () => {
+        // The whole point of the "inline" setting: no fold control, even for 50 calls.
+        expect(shouldFoldToolRun(4, true, T)).toBe(false);
+        expect(shouldFoldToolRun(50, true, T)).toBe(false);
+    });
+
+    it('treats the threshold as inclusive (>=); one below stays inline', () => {
+        expect(shouldFoldToolRun(T, false, T)).toBe(true);
+        expect(shouldFoldToolRun(T - 1, false, T)).toBe(false);
     });
 });

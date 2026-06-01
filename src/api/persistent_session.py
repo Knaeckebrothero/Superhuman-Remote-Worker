@@ -659,15 +659,6 @@ class PersistentSession:
             f"({getattr(new_backend, '_host', 'local')})"
         )
 
-    def get_workspace_content(self) -> str:
-        """Read current workspace.md content for transient injection."""
-        if not self.workspace_manager:
-            return ""
-        try:
-            return self.workspace_manager.read_file("workspace.md")
-        except (FileNotFoundError, OSError):
-            return ""
-
     async def cleanup(self) -> None:
         """Clean up session resources."""
         if self.shell_manager:

@@ -1091,7 +1091,6 @@ class TestExecuteTurnInterrupt:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
         )
 
@@ -1150,7 +1149,6 @@ class TestExecuteTurnInterrupt:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
             tool_context=tool_ctx,
         )
@@ -1191,7 +1189,6 @@ class TestExecuteTurnMemoryRetrieval:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
             recall_store=recall,
         )
@@ -1218,7 +1215,6 @@ class TestExecuteTurnMemoryRetrieval:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
             recall_store=recall,
         )
@@ -1245,7 +1241,6 @@ class TestExecuteTurnMemoryRetrieval:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
             recall_store=recall,
         )
@@ -1272,7 +1267,6 @@ class TestExecuteTurnMemoryRetrieval:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
             recall_store=recall,
         )
@@ -1300,7 +1294,6 @@ class TestExecuteTurnMemoryRetrieval:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
             recall_store=recall,
         )
@@ -1333,7 +1326,6 @@ class TestExecuteTurnKnowledgeRetrieval:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
             knowledge_store=ks,
             project_id="550e8400-e29b-41d4-a716-446655440000",
@@ -1363,7 +1355,6 @@ class TestExecuteTurnKnowledgeRetrieval:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
             knowledge_store=ks,
             project_id=None,
@@ -1388,7 +1379,6 @@ class TestExecuteTurnKnowledgeRetrieval:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
             knowledge_store=None,
             project_id="550e8400-e29b-41d4-a716-446655440000",
@@ -1415,7 +1405,6 @@ class TestExecuteTurnKnowledgeRetrieval:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
             knowledge_store=ks,
             project_id="550e8400-e29b-41d4-a716-446655440000",
@@ -1445,7 +1434,6 @@ class TestExecuteTurnKnowledgeRetrieval:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
             knowledge_store=ks,
             project_ids=[pid1, pid2],
@@ -1463,88 +1451,6 @@ class TestExecuteTurnKnowledgeRetrieval:
 
 class TestTransientInjection:
     @pytest.mark.asyncio
-    async def test_workspace_injected_after_system_message(self):
-        """Workspace content injected as SystemMessage at index 1."""
-        captured_prepared = []
-
-        async def _ensure(msgs, *a, **kw):
-            captured_prepared.extend(msgs)
-            return msgs
-
-        messages = [SystemMessage(content="sys"), HumanMessage(content="hi")]
-        callbacks = _make_callbacks()
-
-        await _execute_turn(
-            llm_with_tools=_make_streaming_llm(_make_llm_response("ok")),
-            tool_map={},
-            context_manager=AsyncMock(ensure_within_limits=_ensure),
-            messages=messages,
-            callbacks=callbacks,
-            llm_timeout=600,
-            auxiliary_llm=None,
-            workspace_content=lambda: "workspace content here",
-            config=_make_config(),
-        )
-
-        # Index 0: system, Index 1: workspace, Index 2+: conversation
-        assert isinstance(captured_prepared[1], SystemMessage)
-        assert "<workspace_memory>" in captured_prepared[1].content
-        assert "workspace content here" in captured_prepared[1].content
-
-    @pytest.mark.asyncio
-    async def test_no_workspace_injection_when_content_empty(self):
-        """No workspace injection when workspace_content returns empty."""
-        captured_prepared = []
-
-        async def _ensure(msgs, *a, **kw):
-            captured_prepared.extend(msgs)
-            return msgs
-
-        messages = [SystemMessage(content="sys"), HumanMessage(content="hi")]
-        callbacks = _make_callbacks()
-
-        await _execute_turn(
-            llm_with_tools=_make_streaming_llm(_make_llm_response("ok")),
-            tool_map={},
-            context_manager=AsyncMock(ensure_within_limits=_ensure),
-            messages=messages,
-            callbacks=callbacks,
-            llm_timeout=600,
-            auxiliary_llm=None,
-            workspace_content=lambda: "",
-            config=_make_config(),
-        )
-
-        # Should be just system + human (no workspace injection)
-        assert len(captured_prepared) == 2
-
-    @pytest.mark.asyncio
-    async def test_no_workspace_injection_when_callable_none(self):
-        """No workspace injection when workspace_content is None."""
-        captured_prepared = []
-
-        async def _ensure(msgs, *a, **kw):
-            captured_prepared.extend(msgs)
-            return msgs
-
-        messages = [SystemMessage(content="sys"), HumanMessage(content="hi")]
-        callbacks = _make_callbacks()
-
-        await _execute_turn(
-            llm_with_tools=_make_streaming_llm(_make_llm_response("ok")),
-            tool_map={},
-            context_manager=AsyncMock(ensure_within_limits=_ensure),
-            messages=messages,
-            callbacks=callbacks,
-            llm_timeout=600,
-            auxiliary_llm=None,
-            workspace_content=None,
-            config=_make_config(),
-        )
-
-        assert len(captured_prepared) == 2
-
-    @pytest.mark.asyncio
     async def test_prepared_is_copy_not_original(self):
         """Transient injections go into a copy, not the original messages list."""
         messages = [SystemMessage(content="sys"), HumanMessage(content="hi")]
@@ -1560,7 +1466,6 @@ class TestTransientInjection:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=lambda: "ws content",
             config=_make_config(),
         )
 
@@ -1613,7 +1518,6 @@ class TestContextCompaction:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
             tool_context=tool_ctx,
         )
@@ -1654,7 +1558,6 @@ class TestContextCompaction:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
             tool_context=tool_ctx,
         )
@@ -1695,7 +1598,6 @@ class TestLLMStreaming:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
         )
 
@@ -1733,7 +1635,6 @@ class TestLLMStreaming:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
         )
 
@@ -1764,7 +1665,6 @@ class TestLLMStreaming:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
         )
 
@@ -1797,7 +1697,6 @@ class TestLLMStreaming:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
         )
 
@@ -1828,7 +1727,6 @@ class TestLLMStreaming:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
         )
 
@@ -1865,7 +1763,6 @@ class TestLLMStreaming:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
         )
 
@@ -1925,7 +1822,6 @@ class TestLLMStreaming:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
         )
 
@@ -1970,7 +1866,6 @@ class TestLLMStreamingFallback:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
         )
 
@@ -2007,7 +1902,6 @@ class TestLLMStreamingFallback:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
         )
 
@@ -2040,7 +1934,6 @@ class TestLLMStreamingFallback:
                 callbacks=callbacks,
                 llm_timeout=600,
                 auxiliary_llm=None,
-                workspace_content=None,
                 config=_make_config(),
             )
 
@@ -2074,7 +1967,6 @@ class TestLLMStreamingFallback:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
         )
 
@@ -2112,7 +2004,6 @@ class TestLLMTimeout:
             callbacks=callbacks,
             llm_timeout=10,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
         )
 
@@ -2167,7 +2058,6 @@ class TestToolExecutionLoop:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
             tool_context=tool_ctx,
         )
@@ -2219,7 +2109,6 @@ class TestToolExecutionLoop:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
         )
 
@@ -2267,7 +2156,6 @@ class TestToolExecutionLoop:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
         )
 
@@ -2316,7 +2204,6 @@ class TestToolExecutionLoop:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
             tool_context=tool_ctx,
         )
@@ -2365,7 +2252,6 @@ class TestToolExecutionLoop:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
             tool_context=tool_ctx,
         )
@@ -2419,7 +2305,6 @@ class TestToolExecutionLoop:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
             tool_context=tool_ctx,
         )
@@ -2466,7 +2351,6 @@ class TestToolExecutionLoop:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
             tool_context=tool_ctx,
         )
@@ -2491,7 +2375,6 @@ class TestToolExecutionLoop:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
         )
 
@@ -2548,7 +2431,6 @@ class TestVMUpgradeDetection:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
             tool_context=tool_ctx,
         )
@@ -2598,7 +2480,6 @@ class TestVMUpgradeDetection:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
             tool_context=tool_ctx,
         )
@@ -2646,7 +2527,6 @@ class TestVMUpgradeDetection:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
             tool_context=tool_ctx,
         )
@@ -2693,7 +2573,6 @@ class TestVMUpgradeDetection:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
             tool_context=None,
         )
@@ -2741,7 +2620,6 @@ class TestVMUpgradeDetection:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
             tool_context=tool_ctx,
         )
@@ -2775,7 +2653,6 @@ class TestStreamedResponseNormalization:
             callbacks=_make_callbacks(),
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
         )
 
@@ -2803,7 +2680,6 @@ class TestStreamedResponseNormalization:
             callbacks=_make_callbacks(check_interrupt=check),
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
         )
 

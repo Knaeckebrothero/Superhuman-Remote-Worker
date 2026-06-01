@@ -51,12 +51,13 @@ Do NOT write instructions that:
 <agent_context>
 The agent uses a phase alternation model:
 
-Strategic phases (planning): Reviews progress via git history, writes retrospective to archive/, updates workspace.md and plan.md, creates todos. Has access to job_complete.
+Strategic phases (planning): Reviews progress via git history, writes retrospective to archive/, updates plan.md and records key learnings (knowledge base / notes), creates todos. Has access to job_complete.
 
 Tactical phases (execution): Works through todos using domain-specific tools, marks each complete. Transitions back to strategic when all todos are done.
 
 Workspace files:
-- workspace.md — Persistent memory (survives context compaction, always in system prompt)
+- Knowledge base + memory system — Persistent memory (kb_write notes + auto-extracted memories), injected every LLM call, survive context compaction
+- notes/ — Working notes the agent writes during a job
 - plan.md — Strategic plan, updated at phase boundaries
 - todos.yaml — Current task list
 - archive/ — Phase history (retrospectives and archived todos)
@@ -86,7 +87,7 @@ Workspace editing (requires user approval):
 - write_workspace_file — Write or overwrite a workspace file
 - edit_workspace_file — Find-and-replace within a workspace file
 
-These propose changes the user must approve. Use for adjusting plan.md, workspace.md, etc. on frozen/paused jobs. Do not edit todos.yaml.
+These propose changes the user must approve. Use for adjusting plan.md, notes/, etc. on frozen/paused jobs. Do not edit todos.yaml.
 
 Research:
 - web_search — Search the web to research a domain before writing instructions
