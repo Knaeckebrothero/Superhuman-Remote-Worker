@@ -152,3 +152,16 @@ def test_config_catalog_yaml_has_core_keys():
     entries = yaml.safe_load(path.read_text())
     keys = {(e["kind"], e["name"]) for e in entries}
     assert {("prompts", "persona"), ("prompts", "systemprompt")}.issubset(keys)
+
+
+def test_catalog_has_settings_and_guardrails_keys():
+    from pathlib import Path
+
+    import yaml
+
+    entries = yaml.safe_load(
+        (Path(__file__).parent.parent / "config/prompts/catalog.yaml").read_text()
+    )
+    by_key = {(e["kind"], e["name"]): e for e in entries}
+    assert by_key[("settings", "temperature")]["type"] == "number"
+    assert ("guardrails", "guardrails") in by_key
