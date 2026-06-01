@@ -15522,7 +15522,9 @@ def validate_override_value(kind: str, name: str, value: Any) -> None:
     elif vtype == "enum":
         choices = entry.get("enum", [])
         if value not in choices:
-            raise HTTPException(status_code=422, detail=f"{name} must be one of {choices}")
+            raise HTTPException(
+                status_code=422, detail=f"{name} must be one of {choices}"
+            )
     elif vtype == "json":
         if not isinstance(value, dict):
             raise HTTPException(status_code=422, detail=f"{name} must be a JSON object")
@@ -15612,7 +15614,9 @@ async def admin_update_config_override(
     kind = existing["kind"]
     if kind in ("prompts", "instructions"):
         if body.content is None:
-            raise HTTPException(status_code=422, detail="content is required for this kind")
+            raise HTTPException(
+                status_code=422, detail="content is required for this kind"
+            )
         content, content_format, value_json = body.content, body.content_format, None
     else:  # settings, guardrails
         if body.value_json is None:
