@@ -13,7 +13,7 @@ import pytest
 
 
 @pytest.mark.asyncio
-async def test_upsert_prompt_override_uses_on_conflict():
+async def test_upsert_config_override_uses_on_conflict():
     from unittest.mock import AsyncMock
 
     from orchestrator.database.postgres import PostgresDB
@@ -29,7 +29,7 @@ async def test_upsert_prompt_override_uses_on_conflict():
         }
     )
 
-    row = await db.upsert_prompt_override(
+    row = await db.upsert_config_override(
         family="gemma",
         kind="prompts",
         name="persona",
@@ -40,7 +40,7 @@ async def test_upsert_prompt_override_uses_on_conflict():
     )
 
     sql = db.fetchrow.call_args.args[0]
-    assert "INSERT INTO prompt_overrides" in sql
+    assert "INSERT INTO config_overrides" in sql
     assert "ON CONFLICT" in sql and "DO UPDATE" in sql
     assert row["content"] == "C"
 
@@ -73,44 +73,44 @@ def _registered_routes(app) -> set:
 
 
 OVERRIDE_ROUTES = {
-    ("GET", "/api/admin/prompts/overrides"),
-    ("POST", "/api/admin/prompts/overrides"),
-    ("GET", "/api/admin/prompts/overrides/{override_id}"),
-    ("PUT", "/api/admin/prompts/overrides/{override_id}"),
-    ("DELETE", "/api/admin/prompts/overrides/{override_id}"),
+    ("GET", "/api/admin/config/overrides"),
+    ("POST", "/api/admin/config/overrides"),
+    ("GET", "/api/admin/config/overrides/{override_id}"),
+    ("PUT", "/api/admin/config/overrides/{override_id}"),
+    ("DELETE", "/api/admin/config/overrides/{override_id}"),
 }
 
 
-def test_prompt_override_routes_registered():
+def test_config_override_routes_registered():
     registered = _registered_routes(_import_main().app)
     missing = [r for r in OVERRIDE_ROUTES if r not in registered]
     assert not missing, f"missing routes: {missing}"
 
 
-def test_prompt_override_create_model_validates():
-    PromptOverrideCreate = _import_main().PromptOverrideCreate
+def test_config_override_create_model_validates():
+    ConfigOverrideCreate = _import_main().ConfigOverrideCreate
 
-    ok = PromptOverrideCreate(
+    ok = ConfigOverrideCreate(
         family="gemma", kind="prompts", name="persona", content="x"
     )
     assert ok.content_format == "text"  # default
     with pytest.raises(Exception):
-        PromptOverrideCreate(family=None, kind="bogus", name="persona", content="x")
+        ConfigOverrideCreate(family=None, kind="bogus", name="persona", content="x")
 
 
 CATALOG_ROUTES = {
-    ("GET", "/api/admin/prompts/catalog"),
-    ("GET", "/api/admin/prompts/bundled/{family}/{kind}/{name}"),
+    ("GET", "/api/admin/config/catalog"),
+    ("GET", "/api/admin/config/bundled/{family}/{kind}/{name}"),
 }
 
 
-def test_prompt_catalog_and_bundled_routes_registered():
+def test_config_catalog_and_bundled_routes_registered():
     registered = _registered_routes(_import_main().app)
     missing = [r for r in CATALOG_ROUTES if r not in registered]
     assert not missing, f"missing routes: {missing}"
 
 
-def test_prompt_catalog_yaml_has_core_keys():
+def test_config_catalog_yaml_has_core_keys():
     # Reads the shipped catalog directly (no main import) so it runs locally.
     from pathlib import Path
 

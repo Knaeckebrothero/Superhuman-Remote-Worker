@@ -1054,21 +1054,21 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         if self.postgres_conn and not resume and not _config_from_db:
             from .core.loader import (
                 serialize_resolved_config,
-                set_prompt_overrides,
-                _is_prompt_db_overrides_enabled,
+                set_config_overrides,
+                _is_config_db_overrides_enabled,
             )
 
             # Load DB prompt overrides first so they're captured in the freeze
             # below (flag-gated; fail-open to bundled defaults on any error).
-            if _is_prompt_db_overrides_enabled():
+            if _is_config_db_overrides_enabled():
                 try:
                     from .core.model_registry import family_of
 
                     _family = family_of(self.config.llm.model)
-                    _rows = await self.postgres_conn.prompts.list_overrides_for_family(
+                    _rows = await self.postgres_conn.config_overrides.list_overrides_for_family(
                         _family
                     )
-                    set_prompt_overrides(_rows)
+                    set_config_overrides(_rows)
                     logger.info(
                         f"Loaded {len(_rows)} prompt override(s) for family {_family}"
                     )

@@ -106,7 +106,7 @@ class PostgresDB:
         # Initialize namespaces
         self.jobs = JobsNamespace(self)
         self.citations = CitationsNamespace(self)
-        self.prompts = PromptsNamespace(self)
+        self.config_overrides = ConfigOverridesNamespace(self)
 
         logger.info("PostgresDB initialized (not connected yet)")
 
@@ -784,7 +784,7 @@ class JobsNamespace:
         return PostgresDB._run_async(self.list(status, limit, offset))
 
 
-class PromptsNamespace:
+class ConfigOverridesNamespace:
     """Prompt-override reads for the agent's resolution path."""
 
     def __init__(self, db: PostgresDB):
@@ -799,7 +799,7 @@ class PromptsNamespace:
         rows = await self.db.fetch(
             """
             SELECT family, kind, name, content, content_format
-            FROM prompt_overrides
+            FROM config_overrides
             WHERE family = $1 OR family IS NULL
             """,
             family,

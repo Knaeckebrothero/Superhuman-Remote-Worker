@@ -11,13 +11,13 @@ import src.core.loader as loader
 
 
 def _reset():
-    loader.clear_prompt_overrides()
+    loader.clear_config_overrides()
 
 
 def test_db_lookup_returns_none_when_flag_off(monkeypatch):
     _reset()
-    monkeypatch.delenv("PROMPT_DB_OVERRIDES_ENABLED", raising=False)
-    loader.set_prompt_overrides(
+    monkeypatch.delenv("CONFIG_DB_OVERRIDES_ENABLED", raising=False)
+    loader.set_config_overrides(
         [
             {"family": "gemma", "kind": "prompts", "name": "persona", "content": "X"},
         ]
@@ -27,8 +27,8 @@ def test_db_lookup_returns_none_when_flag_off(monkeypatch):
 
 def test_db_lookup_family_specific_hit(monkeypatch):
     _reset()
-    monkeypatch.setenv("PROMPT_DB_OVERRIDES_ENABLED", "true")
-    loader.set_prompt_overrides(
+    monkeypatch.setenv("CONFIG_DB_OVERRIDES_ENABLED", "true")
+    loader.set_config_overrides(
         [
             {
                 "family": "gemma",
@@ -46,8 +46,8 @@ def test_db_lookup_family_specific_hit(monkeypatch):
 
 def test_db_lookup_global_fallback_and_precedence(monkeypatch):
     _reset()
-    monkeypatch.setenv("PROMPT_DB_OVERRIDES_ENABLED", "1")
-    loader.set_prompt_overrides(
+    monkeypatch.setenv("CONFIG_DB_OVERRIDES_ENABLED", "1")
+    loader.set_config_overrides(
         [
             {"family": None, "kind": "prompts", "name": "persona", "content": "GLOBAL"},
             {
@@ -68,19 +68,19 @@ def test_db_lookup_global_fallback_and_precedence(monkeypatch):
 
 def test_clear_overrides(monkeypatch):
     _reset()
-    monkeypatch.setenv("PROMPT_DB_OVERRIDES_ENABLED", "true")
-    loader.set_prompt_overrides(
+    monkeypatch.setenv("CONFIG_DB_OVERRIDES_ENABLED", "true")
+    loader.set_config_overrides(
         [
             {"family": "gemma", "kind": "prompts", "name": "persona", "content": "X"},
         ]
     )
-    loader.clear_prompt_overrides()
+    loader.clear_config_overrides()
     assert loader._db_lookup("prompts", "gemma", "persona") is None
 
 
 def test_matrix_load_prefers_override_then_bundled(monkeypatch):
     _reset()
-    monkeypatch.setenv("PROMPT_DB_OVERRIDES_ENABLED", "true")
+    monkeypatch.setenv("CONFIG_DB_OVERRIDES_ENABLED", "true")
     from src.core.loader import PromptMatrixResolver
 
     resolver = PromptMatrixResolver(None, "gemma")
@@ -88,7 +88,7 @@ def test_matrix_load_prefers_override_then_bundled(monkeypatch):
     monkeypatch.setattr(resolver, "resolve_filename", lambda et: "persona.txt")
     monkeypatch.setattr(resolver._file_resolver, "load", lambda fn: "BUNDLED")
 
-    loader.set_prompt_overrides(
+    loader.set_config_overrides(
         [
             {
                 "family": "gemma",
@@ -105,10 +105,10 @@ def test_matrix_load_prefers_override_then_bundled(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_prompts_namespace_lists_family_and_global():
+async def test_config_overrides_namespace_lists_family_and_global():
     from unittest.mock import AsyncMock, MagicMock
 
-    from src.database.postgres_db import PromptsNamespace
+    from src.database.postgres_db import ConfigOverridesNamespace
 
     fake_db = MagicMock()
     fake_db.fetch = AsyncMock(
@@ -124,7 +124,7 @@ async def test_prompts_namespace_lists_family_and_global():
     )
     fake_db._row_to_dict = lambda r: dict(r)
 
-    ns = PromptsNamespace(fake_db)
+    ns = ConfigOverridesNamespace(fake_db)
     rows = await ns.list_overrides_for_family("gemma")
 
     assert rows == [
@@ -137,6 +137,6 @@ async def test_prompts_namespace_lists_family_and_global():
         }
     ]
     sql = fake_db.fetch.call_args.args[0]
-    assert "FROM prompt_overrides" in sql
+    assert "FROM config_overrides" in sql
     assert "family = $1 OR family IS NULL" in sql
     assert fake_db.fetch.call_args.args[1] == "gemma"
