@@ -119,6 +119,7 @@ async def test_config_overrides_namespace_lists_family_and_global():
                 "name": "persona",
                 "content": "X",
                 "content_format": "text",
+                "value_json": None,
             },
         ]
     )
@@ -134,10 +135,12 @@ async def test_config_overrides_namespace_lists_family_and_global():
             "name": "persona",
             "content": "X",
             "content_format": "text",
+            "value_json": None,
         }
     ]
     sql = fake_db.fetch.call_args.args[0]
     assert "FROM config_overrides" in sql
+    assert "value_json" in sql
     assert "family = $1 OR family IS NULL" in sql
     assert fake_db.fetch.call_args.args[1] == "gemma"
 

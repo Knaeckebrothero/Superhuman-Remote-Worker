@@ -785,7 +785,7 @@ class JobsNamespace:
 
 
 class ConfigOverridesNamespace:
-    """Prompt-override reads for the agent's resolution path."""
+    """Config-override reads for the agent's resolution path."""
 
     def __init__(self, db: PostgresDB):
         self.db = db
@@ -798,7 +798,7 @@ class ConfigOverridesNamespace:
         """
         rows = await self.db.fetch(
             """
-            SELECT family, kind, name, content, content_format
+            SELECT family, kind, name, content, content_format, value_json
             FROM config_overrides
             WHERE family = $1 OR family IS NULL
             """,
