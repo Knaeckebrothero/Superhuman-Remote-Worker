@@ -1046,20 +1046,18 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             or metadata.get("config_upload_id")
             or metadata.get("config_override")
         )
-        if (not _config_from_db and config_dirty) or _config_from_db:
-            logger.info("Config changed for this job — recreating LLMs")
-            self._create_phase_llms()
 
-        # Freeze resolved config on first run (not resume)
+        # Load DB config overrides (flag-gated; fail-open). MUST precede
+        # _create_phase_llms() so settings overrides reach the LLMs, and precede
+        # the freeze so they're captured. Prompts/instructions/guardrails resolve
+        # lazily from the process map; settings are eager -> apply onto self.config.
         if self.postgres_conn and not resume and not _config_from_db:
             from .core.loader import (
-                serialize_resolved_config,
+                apply_settings_overrides,
                 set_config_overrides,
                 _is_config_db_overrides_enabled,
             )
 
-            # Load DB prompt overrides first so they're captured in the freeze
-            # below (flag-gated; fail-open to bundled defaults on any error).
             if _is_config_db_overrides_enabled():
                 try:
                     from .core.model_registry import family_of
@@ -1069,16 +1067,28 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                         _family
                     )
                     set_config_overrides(_rows)
+                    if apply_settings_overrides(self.config):
+                        config_dirty = True
                     logger.info(
-                        f"Loaded {len(_rows)} prompt override(s) for family {_family}"
+                        f"Loaded {len(_rows)} config override(s) for family {_family}"
                     )
                 except Exception as e:
                     logger.warning(
-                        f"Failed to load prompt overrides (using bundled): {e}"
+                        f"Failed to load config overrides (using bundled): {e}"
                     )
 
+        if (not _config_from_db and config_dirty) or _config_from_db:
+            logger.info("Config changed for this job — recreating LLMs")
+            self._create_phase_llms()
+
+        # Freeze resolved config on first run (not resume). The overrides loaded
+        # above are captured here: settings via self.config, prompts/instructions
+        # via the resolver reading the process map.
+        if self.postgres_conn and not resume and not _config_from_db:
             try:
                 import uuid as _uuid
+
+                from .core.loader import serialize_resolved_config
 
                 resolved = serialize_resolved_config(
                     self.config, model=self.config.llm.model
