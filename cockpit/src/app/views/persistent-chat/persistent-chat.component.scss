@@ -2149,8 +2149,10 @@
 //
 // One AssistantTurn renders as a .turn-bubble. Per-event cards (.event-thought
 // wraps .thinking-block; .event-text wraps markdown; .event-tool wraps
-// .tool-card) live inside .turn-body. The chevron toggles whole-turn collapse
-// to show just .turn-headline (the final TextEvent).
+// .tool-card) live inside .turn-body. The chevron folds the lead-up (reasoning
+// + tool calls); the collapsed view keeps the final answer (.turn-final-answer,
+// the trailing text run) rendered in full, falling back to a one-line
+// .turn-headline only when the turn has no closing prose.
 // =============================================================================
 
 .turn-body {
