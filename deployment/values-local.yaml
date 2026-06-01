@@ -160,6 +160,8 @@ ingress:
 # Cap maxAgents so a runaway provisioner can't eat the dev box.
 # -----------------------------------------------------------------------------
 agent:
+  # Phase D verification: apply DB config overrides (config_overrides table) to jobs.
+  configDbOverridesEnabled: "true"
   pool:
     minAgents: "0"
     buffer: "0"
