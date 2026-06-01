@@ -469,7 +469,9 @@ def resolve_guardrails(
     return deep_merge(default_guardrails, family_guardrails)
 
 
-def resolve_model_settings(model: str, deployment_dir: str = None) -> Dict[str, Any]:
+def resolve_model_settings(
+    model: str, deployment_dir: str = None, *, bundled_only: bool = False
+) -> Dict[str, Any]:
     """Resolve settings matrix values for a given model.
 
     Returns the merged default + family-specific settings (flat LLM keys only,
@@ -488,6 +490,8 @@ def resolve_model_settings(model: str, deployment_dir: str = None) -> Dict[str, 
     default_settings = matrix.get("default", {})
     family_settings = matrix.get(family, {}) if family != "default" else {}
     settings = deep_merge(default_settings, family_settings)
+    if not bundled_only:
+        settings = deep_merge(settings, _settings_override_for(family))
 
     # Strip 'limits' — callers want LLM inference params only
     settings.pop("limits", None)
@@ -521,6 +525,7 @@ def _apply_settings_matrix(
     default_settings = matrix.get("default", {})
     family_settings = matrix.get(family, {}) if family != "default" else {}
     settings = deep_merge(default_settings, family_settings)
+    settings = deep_merge(settings, _settings_override_for(family))
 
     if not settings:
         return data
