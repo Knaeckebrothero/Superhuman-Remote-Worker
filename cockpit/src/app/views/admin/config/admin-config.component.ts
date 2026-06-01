@@ -9,10 +9,10 @@ import {
 import {TranslocoService} from '@jsverse/transloco';
 import {SidebarToggleComponent} from '../../../shell/sidebar-toggle/sidebar-toggle.component';
 import {
-  AdminPromptsService,
-  PromptCatalogEntry,
-  PromptOverride,
-} from '../../../core/services/admin-prompts.service';
+  AdminConfigService,
+  ConfigCatalogEntry,
+  ConfigOverride,
+} from '../../../core/services/admin-config.service';
 import {AppSelectComponent} from '../../../ui/select';
 import {AppTextareaComponent} from '../../../ui/textarea';
 import {AppButtonComponent} from '../../../ui/button';
@@ -24,7 +24,7 @@ import {AppToastService} from '../../../ui/toast/toast.service';
 const FAMILIES = ['gemma', 'gpt_5', 'gpt_oss', 'minimax', 'codex', 'codex_spark'];
 
 @Component({
-  selector: 'app-admin-prompts',
+  selector: 'app-admin-config',
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [
@@ -39,7 +39,7 @@ const FAMILIES = ['gemma', 'gpt_5', 'gpt_oss', 'minimax', 'codex', 'codex_spark'
     <div class="admin-page">
       <div class="page-header">
         <app-sidebar-toggle />
-        <h1 class="page-title">Prompt Overrides</h1>
+        <h1 class="page-title">Configuration Overrides</h1>
       </div>
       <p class="page-desc">
         Override the bundled prompt files from the database. Saved edits apply to
@@ -190,15 +190,15 @@ const FAMILIES = ['gemma', 'gpt_5', 'gpt_oss', 'minimax', 'codex', 'codex_spark'
     }
   `],
 })
-export class AdminPromptsComponent implements OnInit {
-  readonly admin = inject(AdminPromptsService);
+export class AdminConfigComponent implements OnInit {
+  readonly admin = inject(AdminConfigService);
   private readonly toast = inject(AppToastService);
   private readonly transloco = inject(TranslocoService);
 
   readonly families = FAMILIES;
 
   readonly familyValue = signal<string>('_'); // '_' = global in the picker
-  readonly selectedEntry = signal<PromptCatalogEntry | null>(null);
+  readonly selectedEntry = signal<ConfigCatalogEntry | null>(null);
   readonly bundledContent = signal<string>('');
   readonly overrideContent = signal<string>('');
   readonly saving = signal(false);
@@ -210,7 +210,7 @@ export class AdminPromptsComponent implements OnInit {
 
   readonly keyValue = computed(() => this.selectedEntry()?.name ?? '');
 
-  readonly existingOverride = computed<PromptOverride | null>(() => {
+  readonly existingOverride = computed<ConfigOverride | null>(() => {
     const entry = this.selectedEntry();
     if (!entry) return null;
     const fam = this.selectedFamily();
@@ -244,7 +244,7 @@ export class AdminPromptsComponent implements OnInit {
   save(): void {
     const entry = this.selectedEntry();
     if (!entry || !this.overrideContent().trim()) {
-      this.toast.danger(this.transloco.translate('admin.prompts.messages.saveEmpty'));
+      this.toast.danger(this.transloco.translate('admin.config.messages.saveEmpty'));
       return;
     }
     this.saving.set(true);
@@ -258,11 +258,11 @@ export class AdminPromptsComponent implements OnInit {
       .subscribe({
         next: () => {
           this.saving.set(false);
-          this.toast.success(this.transloco.translate('admin.prompts.messages.saved'));
+          this.toast.success(this.transloco.translate('admin.config.messages.saved'));
         },
         error: () => {
           this.saving.set(false);
-          this.toast.danger(this.transloco.translate('admin.prompts.messages.saveFailed'));
+          this.toast.danger(this.transloco.translate('admin.config.messages.saveFailed'));
         },
       });
   }
@@ -275,11 +275,11 @@ export class AdminPromptsComponent implements OnInit {
       next: () => {
         this.saving.set(false);
         this.overrideContent.set('');
-        this.toast.success(this.transloco.translate('admin.prompts.messages.removed'));
+        this.toast.success(this.transloco.translate('admin.config.messages.removed'));
       },
       error: () => {
         this.saving.set(false);
-        this.toast.danger(this.transloco.translate('admin.prompts.messages.removeFailed'));
+        this.toast.danger(this.transloco.translate('admin.config.messages.removeFailed'));
       },
     });
   }
