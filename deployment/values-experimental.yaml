@@ -86,6 +86,10 @@ dozzle:
   enabled: true
 codexProxy:
   enabled: true
+  # Pinned (was chart-default :latest) to pick up the Codex identity-obfuscation
+  # fixes (v7.1.30–39) that stop OpenAI invalidating the OAuth token after a
+  # handful of requests. Bump deliberately; upstream ships multiple/day.
+  image: docker.io/eceasy/cli-proxy-api:v7.1.39
 # -----------------------------------------------------------------------------
 # Cloud storage — OpenCloud bundled (chart default)
 # -----------------------------------------------------------------------------
