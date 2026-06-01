@@ -35,6 +35,7 @@ import {
     TextEvent,
     ThoughtEvent,
     ToolCallEvent,
+    trailingText,
     Turn,
     TurnEvent,
 } from '../../core/models/turn.model';
@@ -637,9 +638,10 @@ interface FileEditView {
                   <app-icon size="sm" class="avatar-icon">smart_toy</app-icon>
                 </div>
                 <div class="message-body turn-body">
-                  <!-- Whole-turn chevron: collapses every event into the
-                       per-type badge summary + last-text headline. Hidden
-                       when the turn has 0–1 events (nothing to collapse). -->
+                  <!-- Whole-turn chevron: folds the lead-up (reasoning + tool
+                       calls) behind the per-type badge summary, leaving the
+                       final answer visible. Hidden when the turn has 0–1 events
+                       (nothing to collapse). -->
                   @if (turn.events.length > 1) {
                     <button type="button"
                             class="turn-chevron"
@@ -661,12 +663,22 @@ interface FileEditView {
                   }
 
                   @if (isCollapsed) {
-                    <!-- Collapsed: one-line headline — first sentence of the
-                         agent's opening text, or a tool/thought digest when
-                         there's no text (#8). Plain text (not <markdown>) so
-                         the truncate mixin works — markdown emits inner block
-                         elements that defeat nowrap. -->
-                    <span class="turn-headline">{{ collapsedHeadline(turn) }}</span>
+                    <!-- Collapsed: fold the lead-up (opening text, reasoning,
+                         tool calls) but keep the final answer — the prose after
+                         the last tool/thought — fully rendered as markdown (#8
+                         refinement). The chevron + count badge signal the hidden
+                         work. When the turn ends on a tool/thought (no closing
+                         prose), fall back to a one-line headline (plain text so
+                         the truncate mixin works; markdown emits block elements
+                         that defeat nowrap). -->
+                    @let answer = finalAnswer(turn);
+                    @if (answer) {
+                      <div class="event-text turn-final-answer">
+                        <markdown [data]="answer"></markdown>
+                      </div>
+                    } @else {
+                      <span class="turn-headline">{{ collapsedHeadline(turn) }}</span>
+                    }
                   } @else {
                     <!-- Expanded: events rendered as cards, with consecutive
                          tool runs grouped (#10). A run of TOOL_GROUP_THRESHOLD+
@@ -2271,9 +2283,9 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
 
     /**
      * Auto-collapse threshold: assistant turns with more than this many events
-     * collapse to the headline-only view by default once they're done. Streaming
-     * turns are never auto-collapsed. The user can override either way via the
-     * chevron, in which case userTurnCollapsed wins.
+     * fold their lead-up by default once they're done (the final answer stays
+     * visible). Streaming turns are never auto-collapsed. The user can override
+     * either way via the chevron, in which case userTurnCollapsed wins.
      */
     private readonly AUTO_COLLAPSE_THRESHOLD = 8;
 
@@ -2337,9 +2349,19 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     }
 
     /**
-     * Headline for a collapsed assistant turn (#8). Prefers the first sentence
-     * of the agent's opening text (more useful than the trailing "Done."); when
-     * the turn has no text, falls back to a tool/thought digest.
+     * The turn's final answer — the trailing prose after the last tool/thought.
+     * Stays fully visible when the turn is collapsed (only the lead-up folds).
+     * Empty when the turn ends on a tool/thought, in which case the collapsed
+     * view falls back to {@link collapsedHeadline}.
+     */
+    finalAnswer(turn: AssistantTurn): string {
+        return trailingText(turn);
+    }
+
+    /**
+     * One-line fallback headline for a collapsed turn that has no closing prose
+     * (ends on a tool/thought). Prefers the first sentence of the agent's
+     * opening text; otherwise a tool/thought digest.
      */
     collapsedHeadline(turn: AssistantTurn): string {
         const first = firstTextOf(turn);

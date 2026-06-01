@@ -8,6 +8,7 @@ import {
     TextEvent,
     ThoughtEvent,
     ToolCallEvent,
+    trailingText,
 } from './turn.model';
 
 function mkTurn(events: AssistantTurn['events']): AssistantTurn {
@@ -65,6 +66,39 @@ describe('firstSentence', () => {
     it('returns empty string for blank or empty input', () => {
         expect(firstSentence('   ')).toBe('');
         expect(firstSentence('')).toBe('');
+    });
+});
+
+describe('trailingText', () => {
+    it('returns the closing prose after the last tool call', () => {
+        const t = mkTurn([txt('b0', 'plan'), tool('b1'), txt('b2', 'Here is the result.')]);
+        expect(trailingText(t)).toBe('Here is the result.');
+    });
+
+    it('joins multiple trailing text blocks with a blank line', () => {
+        const t = mkTurn([tool('b0'), txt('b1', 'First.'), txt('b2', 'Second.')]);
+        expect(trailingText(t)).toBe('First.\n\nSecond.');
+    });
+
+    it('returns "" when the turn ends on a tool call (no closing prose)', () => {
+        expect(trailingText(mkTurn([txt('b0', 'doing'), tool('b1')]))).toBe('');
+    });
+
+    it('returns "" when the turn ends on a thought', () => {
+        expect(trailingText(mkTurn([txt('b0', 'hi'), tht('b1')]))).toBe('');
+    });
+
+    it('returns the whole text for an all-text turn', () => {
+        expect(trailingText(mkTurn([txt('b0', 'only answer.')]))).toBe('only answer.');
+    });
+
+    it('returns "" for an empty turn', () => {
+        expect(trailingText(mkTurn([]))).toBe('');
+    });
+
+    it('keeps only the final text run, folding earlier interleaved text', () => {
+        const t = mkTurn([txt('b0', 'lead'), tool('b1'), txt('b2', 'mid'), tool('b3'), txt('b4', 'final.')]);
+        expect(trailingText(t)).toBe('final.');
     });
 });
 

@@ -187,6 +187,26 @@ export function firstTextOf(turn: AssistantTurn): TextEvent | undefined {
 }
 
 /**
+ * The turn's "final answer": the trailing run of text events with no tool call
+ * or thought after them — the prose the model ended the turn on. This is the
+ * part worth keeping fully visible even when the turn is collapsed; collapsing
+ * folds only the lead-up (opening text, reasoning, tool calls), never the
+ * answer. Multiple trailing text blocks are joined with a blank line.
+ *
+ * Returns '' when the turn ends on a tool call or thought (no closing prose) or
+ * has no events — callers fall back to the one-line headline in that case.
+ */
+export function trailingText(turn: AssistantTurn): string {
+    const parts: string[] = [];
+    for (let i = turn.events.length - 1; i >= 0; i--) {
+        const e = turn.events[i];
+        if (!isText(e)) break;
+        parts.push(e.content);
+    }
+    return parts.reverse().join('\n\n').trim();
+}
+
+/**
  * First sentence of a (possibly markdown) block, for a one-line headline.
  * Drops leading markdown markers, collapses whitespace, cuts at the first
  * sentence terminator at/after a sensible minimum length, and caps the
