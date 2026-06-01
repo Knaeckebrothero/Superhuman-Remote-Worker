@@ -155,8 +155,18 @@ def test_settings_override_assembles_and_merges(monkeypatch):
     monkeypatch.setenv("CONFIG_DB_OVERRIDES_ENABLED", "true")
     loader.set_config_overrides(
         [
-            {"family": None, "kind": "settings", "name": "temperature", "value_json": 0.7},
-            {"family": "gemma", "kind": "settings", "name": "temperature", "value_json": 1.0},
+            {
+                "family": None,
+                "kind": "settings",
+                "name": "temperature",
+                "value_json": 0.7,
+            },
+            {
+                "family": "gemma",
+                "kind": "settings",
+                "name": "temperature",
+                "value_json": 1.0,
+            },
             {
                 "family": "gemma",
                 "kind": "settings",
@@ -201,7 +211,14 @@ def test_structured_overrides_empty_when_flag_off(monkeypatch):
     _reset()
     monkeypatch.delenv("CONFIG_DB_OVERRIDES_ENABLED", raising=False)
     loader.set_config_overrides(
-        [{"family": "gemma", "kind": "settings", "name": "temperature", "value_json": 1.0}]
+        [
+            {
+                "family": "gemma",
+                "kind": "settings",
+                "name": "temperature",
+                "value_json": 1.0,
+            }
+        ]
     )
     assert loader._settings_override_for("gemma") == {}
     assert loader._guardrails_override_for("gemma") == {}
@@ -211,7 +228,14 @@ def test_set_overrides_parses_jsonb_string(monkeypatch):
     _reset()
     monkeypatch.setenv("CONFIG_DB_OVERRIDES_ENABLED", "true")
     loader.set_config_overrides(
-        [{"family": "gemma", "kind": "settings", "name": "temperature", "value_json": "1.0"}]
+        [
+            {
+                "family": "gemma",
+                "kind": "settings",
+                "name": "temperature",
+                "value_json": "1.0",
+            }
+        ]
     )
     assert loader._settings_override_for("gemma") == {"temperature": 1.0}
 
@@ -220,11 +244,20 @@ def test_resolve_model_settings_applies_override(monkeypatch):
     _reset()
     monkeypatch.setenv("CONFIG_DB_OVERRIDES_ENABLED", "true")
     loader.set_config_overrides(
-        [{"family": "gemma", "kind": "settings", "name": "temperature", "value_json": 1.0}]
+        [
+            {
+                "family": "gemma",
+                "kind": "settings",
+                "name": "temperature",
+                "value_json": 1.0,
+            }
+        ]
     )
     assert loader.resolve_model_settings("google/gemma-4-31b")["temperature"] == 1.0
     assert (
-        loader.resolve_model_settings("google/gemma-4-31b", bundled_only=True)["temperature"]
+        loader.resolve_model_settings("google/gemma-4-31b", bundled_only=True)[
+            "temperature"
+        ]
         != 1.0
     )
 
@@ -242,7 +275,10 @@ def test_resolve_guardrails_applies_override(monkeypatch):
             }
         ]
     )
-    assert loader.resolve_guardrails("google/gemma-4-31b")["nudges"]["extra"] == "be careful"
+    assert (
+        loader.resolve_guardrails("google/gemma-4-31b")["nudges"]["extra"]
+        == "be careful"
+    )
     assert (
         loader.resolve_guardrails("google/gemma-4-31b", bundled_only=True)
         .get("nudges", {})
@@ -269,7 +305,12 @@ def test_apply_settings_overrides_mutates_config(monkeypatch):
     )
     loader.set_config_overrides(
         [
-            {"family": "gemma", "kind": "settings", "name": "temperature", "value_json": 1.0},
+            {
+                "family": "gemma",
+                "kind": "settings",
+                "name": "temperature",
+                "value_json": 1.0,
+            },
             {
                 "family": "gemma",
                 "kind": "settings",

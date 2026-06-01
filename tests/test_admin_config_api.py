@@ -175,7 +175,9 @@ def test_settings_override_create_model_validates():
     with pytest.raises(Exception):
         Create(family="gemma", kind="prompts", name="persona")  # text needs content
     with pytest.raises(Exception):
-        Create(family="gemma", kind="settings", name="temperature")  # structured needs value_json
+        Create(
+            family="gemma", kind="settings", name="temperature"
+        )  # structured needs value_json
 
 
 def test_validate_override_value_checks_catalog():

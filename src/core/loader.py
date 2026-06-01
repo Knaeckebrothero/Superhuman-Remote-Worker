@@ -32,8 +32,12 @@ VALID_AUTONOMY_LEVELS = {"full", "review", "partial", "guided", "dependent"}
 # agent process at a time, so module-level maps are safe. When the flag is off
 # (or no row matches), resolution falls through to the bundled config/ files.
 
-_CONFIG_OVERRIDES: Dict[str, Dict[tuple, str]] = {}  # text kinds: (kind, name) -> content
-_VALUE_OVERRIDES: Dict[str, Dict[tuple, Any]] = {}  # structured kinds: (kind, name) -> value
+_CONFIG_OVERRIDES: Dict[
+    str, Dict[tuple, str]
+] = {}  # text kinds: (kind, name) -> content
+_VALUE_OVERRIDES: Dict[
+    str, Dict[tuple, Any]
+] = {}  # structured kinds: (kind, name) -> value
 
 
 def _is_config_db_overrides_enabled() -> bool:
