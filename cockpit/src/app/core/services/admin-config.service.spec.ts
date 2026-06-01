@@ -2,7 +2,7 @@ import {describe, expect, it, vi} from 'vitest';
 import {Injector, runInInjectionContext} from '@angular/core';
 import {HttpClient} from '@angular/common/http';
 import {of} from 'rxjs';
-import {AdminPromptsService} from './admin-prompts.service';
+import {AdminConfigService} from './admin-config.service';
 
 function createService(mockHttp?: any) {
   const http = mockHttp ?? {
@@ -13,12 +13,12 @@ function createService(mockHttp?: any) {
   const injector = Injector.create({
     providers: [{provide: HttpClient, useValue: http}],
   });
-  const service = runInInjectionContext(injector, () => new AdminPromptsService());
+  const service = runInInjectionContext(injector, () => new AdminConfigService());
   return {service, http};
 }
 
-describe('AdminPromptsService', () => {
-  it('loads overrides from /admin/prompts/overrides', () => {
+describe('AdminConfigService', () => {
+  it('loads overrides from /admin/config/overrides', () => {
     const http = {
       get: vi.fn().mockReturnValue(
         of([
@@ -34,12 +34,12 @@ describe('AdminPromptsService', () => {
     const {service} = createService(http);
     service.loadOverrides();
     expect(http.get).toHaveBeenCalledWith(
-      expect.stringContaining('/admin/prompts/overrides'),
+      expect.stringContaining('/admin/config/overrides'),
     );
     expect(service.overrides()).toHaveLength(1);
   });
 
-  it('loads the catalog from /admin/prompts/catalog', () => {
+  it('loads the catalog from /admin/config/catalog', () => {
     const http = {
       get: vi.fn().mockReturnValue(
         of([{kind: 'prompts', name: 'persona', title: 'Persona', description: 'd'}]),
@@ -49,7 +49,7 @@ describe('AdminPromptsService', () => {
     const {service} = createService(http);
     service.loadCatalog();
     expect(http.get).toHaveBeenCalledWith(
-      expect.stringContaining('/admin/prompts/catalog'),
+      expect.stringContaining('/admin/config/catalog'),
     );
     expect(service.catalog()).toHaveLength(1);
   });
@@ -59,11 +59,11 @@ describe('AdminPromptsService', () => {
     const {service} = createService(http);
     service.getBundled(null, 'prompts', 'persona').subscribe();
     expect(http.get).toHaveBeenCalledWith(
-      expect.stringContaining('/admin/prompts/bundled/_/prompts/persona'),
+      expect.stringContaining('/admin/config/bundled/_/prompts/persona'),
     );
     service.getBundled('gemma', 'prompts', 'persona').subscribe();
     expect(http.get).toHaveBeenCalledWith(
-      expect.stringContaining('/admin/prompts/bundled/gemma/prompts/persona'),
+      expect.stringContaining('/admin/config/bundled/gemma/prompts/persona'),
     );
   });
 
@@ -78,7 +78,7 @@ describe('AdminPromptsService', () => {
       .createOverride({family: 'gemma', kind: 'prompts', name: 'persona', content: 'NEW'})
       .subscribe();
     expect(http.post).toHaveBeenCalledWith(
-      expect.stringContaining('/admin/prompts/overrides'),
+      expect.stringContaining('/admin/config/overrides'),
       expect.objectContaining({family: 'gemma', kind: 'prompts', name: 'persona', content: 'NEW'}),
     );
     expect(http.get).toHaveBeenCalled(); // tap() reload
@@ -93,7 +93,7 @@ describe('AdminPromptsService', () => {
     const {service} = createService(http);
     service.deleteOverride('abc').subscribe();
     expect(http.delete).toHaveBeenCalledWith(
-      expect.stringContaining('/admin/prompts/overrides/abc'),
+      expect.stringContaining('/admin/config/overrides/abc'),
     );
     expect(http.get).toHaveBeenCalled(); // tap() reload
   });

@@ -3,17 +3,17 @@ import {HttpClient} from '@angular/common/http';
 import {catchError, Observable, of, tap} from 'rxjs';
 import {environment} from '../environment';
 
-export type PromptKind = 'prompts' | 'instructions';
-export type PromptContentFormat = 'text' | 'markdown' | 'jinja' | 'yaml';
+export type ConfigKind = 'prompts' | 'instructions';
+export type ConfigContentFormat = 'text' | 'markdown' | 'jinja' | 'yaml';
 
-/** A DB-backed override row (mirrors orchestrator prompt_overrides). */
-export interface PromptOverride {
+/** A DB-backed override row (mirrors orchestrator config_overrides). */
+export interface ConfigOverride {
   id: string;
   family: string | null; // null = global (all families)
-  kind: PromptKind;
+  kind: ConfigKind;
   name: string;
   content: string;
-  content_format: PromptContentFormat;
+  content_format: ConfigContentFormat;
   notes: string | null;
   created_by: string | null;
   updated_by: string | null;
@@ -22,78 +22,78 @@ export interface PromptOverride {
 }
 
 /** A human description of an editable prompt key (config/prompts/catalog.yaml). */
-export interface PromptCatalogEntry {
-  kind: PromptKind;
+export interface ConfigCatalogEntry {
+  kind: ConfigKind;
   name: string;
   title: string;
   description: string;
 }
 
 /** The bundled (shipped) default for a key, plus its catalog entry. */
-export interface PromptBundled {
+export interface ConfigBundled {
   family: string | null;
   kind: string;
   name: string;
   content: string;
-  catalog: PromptCatalogEntry | null;
+  catalog: ConfigCatalogEntry | null;
 }
 
-export interface PromptOverrideCreate {
+export interface ConfigOverrideCreate {
   family: string | null;
-  kind: PromptKind;
+  kind: ConfigKind;
   name: string;
   content: string;
-  content_format?: PromptContentFormat;
+  content_format?: ConfigContentFormat;
   notes?: string | null;
 }
 
 /**
  * REST client for the admin prompt-overrides surface
- * (`/api/admin/prompts/*`). Every call is gated by `is_admin=TRUE`
+ * (`/api/admin/config/*`). Every call is gated by `is_admin=TRUE`
  * server-side; the client does not re-check. Auth + CSRF ride along via the
  * global auth interceptor.
  */
 @Injectable({providedIn: 'root'})
-export class AdminPromptsService {
+export class AdminConfigService {
   private readonly http = inject(HttpClient);
   private readonly baseUrl = environment.apiUrl;
 
-  readonly overrides = signal<PromptOverride[]>([]);
-  readonly catalog = signal<PromptCatalogEntry[]>([]);
+  readonly overrides = signal<ConfigOverride[]>([]);
+  readonly catalog = signal<ConfigCatalogEntry[]>([]);
 
   loadOverrides(): void {
     this.http
-      .get<PromptOverride[]>(`${this.baseUrl}/admin/prompts/overrides`)
-      .pipe(catchError(() => of([] as PromptOverride[])))
+      .get<ConfigOverride[]>(`${this.baseUrl}/admin/config/overrides`)
+      .pipe(catchError(() => of([] as ConfigOverride[])))
       .subscribe((rows) => this.overrides.set(rows));
   }
 
   loadCatalog(): void {
     this.http
-      .get<PromptCatalogEntry[]>(`${this.baseUrl}/admin/prompts/catalog`)
-      .pipe(catchError(() => of([] as PromptCatalogEntry[])))
+      .get<ConfigCatalogEntry[]>(`${this.baseUrl}/admin/config/catalog`)
+      .pipe(catchError(() => of([] as ConfigCatalogEntry[])))
       .subscribe((rows) => this.catalog.set(rows));
   }
 
   /** Bundled default for a key. A null family maps to the `_` URL segment. */
-  getBundled(family: string | null, kind: string, name: string): Observable<PromptBundled> {
+  getBundled(family: string | null, kind: string, name: string): Observable<ConfigBundled> {
     const fam = family ?? '_';
-    return this.http.get<PromptBundled>(
-      `${this.baseUrl}/admin/prompts/bundled/${fam}/${kind}/${name}`,
+    return this.http.get<ConfigBundled>(
+      `${this.baseUrl}/admin/config/bundled/${fam}/${kind}/${name}`,
     );
   }
 
   /** Create or replace the override for (family, kind, name) — backend upserts. */
-  createOverride(body: PromptOverrideCreate): Observable<PromptOverride> {
+  createOverride(body: ConfigOverrideCreate): Observable<ConfigOverride> {
     return this.http
-      .post<PromptOverride>(`${this.baseUrl}/admin/prompts/overrides`, body)
+      .post<ConfigOverride>(`${this.baseUrl}/admin/config/overrides`, body)
       .pipe(tap(() => this.loadOverrides()));
   }
 
   /** Delete an override (reset to bundled default). */
   deleteOverride(id: string): Observable<{deleted: boolean}> {
     return this.http
-      .delete<{deleted: boolean}>(`${this.baseUrl}/admin/prompts/overrides/${id}`)
+      .delete<{deleted: boolean}>(`${this.baseUrl}/admin/config/overrides/${id}`)
       .pipe(tap(() => this.loadOverrides()));
   }
 }
