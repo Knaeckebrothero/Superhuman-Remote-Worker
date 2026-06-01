@@ -22,7 +22,7 @@ VALID_AUTONOMY_LEVELS = {"full", "review", "partial", "guided", "dependent"}
 
 
 # =============================================================================
-# DB-backed prompt overrides (PROMPT_DB_OVERRIDES_ENABLED)
+# DB-backed config overrides (CONFIG_DB_OVERRIDES_ENABLED)
 # =============================================================================
 # Populated once per job by the agent at first run (before
 # serialize_resolved_config), then read synchronously by the resolver. Map:
@@ -31,19 +31,19 @@ VALID_AUTONOMY_LEVELS = {"full", "review", "partial", "guided", "dependent"}
 # When the flag is off (or no row matches), _db_lookup returns None and
 # resolution falls through to the bundled config/ files — identical to today.
 
-_PROMPT_OVERRIDES: Dict[str, Dict[tuple, str]] = {}
+_CONFIG_OVERRIDES: Dict[str, Dict[tuple, str]] = {}
 
 
-def _is_prompt_db_overrides_enabled() -> bool:
-    """True when DB-backed prompt overrides are turned on via env."""
-    return os.getenv("PROMPT_DB_OVERRIDES_ENABLED", "").lower().strip() in (
+def _is_config_db_overrides_enabled() -> bool:
+    """True when DB-backed config overrides are turned on via env."""
+    return os.getenv("CONFIG_DB_OVERRIDES_ENABLED", "").lower().strip() in (
         "true",
         "1",
         "yes",
     )
 
 
-def set_prompt_overrides(rows: List[Dict[str, Any]]) -> None:
+def set_config_overrides(rows: List[Dict[str, Any]]) -> None:
     """Load override rows into the process map (replaces any previous set).
 
     Each row needs keys: family (str|None), kind, name, content. Rows with a
@@ -53,14 +53,14 @@ def set_prompt_overrides(rows: List[Dict[str, Any]]) -> None:
     for row in rows:
         fam = row.get("family") or ""
         mapping.setdefault(fam, {})[(row["kind"], row["name"])] = row["content"]
-    global _PROMPT_OVERRIDES
-    _PROMPT_OVERRIDES = mapping
+    global _CONFIG_OVERRIDES
+    _CONFIG_OVERRIDES = mapping
 
 
-def clear_prompt_overrides() -> None:
+def clear_config_overrides() -> None:
     """Drop all process-local prompt overrides (used between jobs and in tests)."""
-    global _PROMPT_OVERRIDES
-    _PROMPT_OVERRIDES = {}
+    global _CONFIG_OVERRIDES
+    _CONFIG_OVERRIDES = {}
 
 
 def _db_lookup(kind: str, family: str, name: str) -> Optional[str]:
@@ -69,12 +69,12 @@ def _db_lookup(kind: str, family: str, name: str) -> Optional[str]:
     Returns None when the flag is off or no row matches, so callers fall through
     to bundled-file resolution.
     """
-    if not _is_prompt_db_overrides_enabled():
+    if not _is_config_db_overrides_enabled():
         return None
-    fam_map = _PROMPT_OVERRIDES.get(family)
+    fam_map = _CONFIG_OVERRIDES.get(family)
     if fam_map is not None and (kind, name) in fam_map:
         return fam_map[(kind, name)]
-    global_map = _PROMPT_OVERRIDES.get("")
+    global_map = _CONFIG_OVERRIDES.get("")
     if global_map is not None and (kind, name) in global_map:
         return global_map[(kind, name)]
     return None
@@ -728,7 +728,7 @@ class MatrixResolver:
     def load(self, entry_type: str, *, bundled_only: bool = False) -> str:
         """Resolve filename and load the content.
 
-        When DB-backed prompt overrides are enabled, an override for
+        When DB-backed config overrides are enabled, an override for
         ``(MATRIX_SUBSECTION, model_family, entry_type)`` is returned before any
         bundled file is read. Pass ``bundled_only=True`` to bypass overrides and
         always read the shipped ``config/`` file (used by the admin "bundled

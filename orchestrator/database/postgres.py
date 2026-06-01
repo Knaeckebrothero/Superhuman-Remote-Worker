@@ -4977,21 +4977,21 @@ class PostgresDB:
 
     # --- Prompt overrides (DB-backed prompt editor, v1) ----------------------
 
-    async def list_prompt_overrides(self) -> List[Dict[str, Any]]:
+    async def list_config_overrides(self) -> List[Dict[str, Any]]:
         """List all prompt overrides (global rows first, then by family)."""
         rows = await self.fetch(
-            "SELECT * FROM prompt_overrides ORDER BY family NULLS FIRST, kind, name"
+            "SELECT * FROM config_overrides ORDER BY family NULLS FIRST, kind, name"
         )
         return [dict(r) for r in rows]
 
-    async def get_prompt_override(self, override_id: str) -> Optional[Dict[str, Any]]:
+    async def get_config_override(self, override_id: str) -> Optional[Dict[str, Any]]:
         """Fetch a single prompt override by id, or None."""
         row = await self.fetchrow(
-            "SELECT * FROM prompt_overrides WHERE id = $1", UUID(str(override_id))
+            "SELECT * FROM config_overrides WHERE id = $1", UUID(str(override_id))
         )
         return dict(row) if row else None
 
-    async def upsert_prompt_override(
+    async def upsert_config_override(
         self,
         *,
         family: str | None,
@@ -5004,14 +5004,14 @@ class PostgresDB:
     ) -> Dict[str, Any]:
         """Create or replace the override for (family, kind, name).
 
-        The conflict target is the ``uq_prompt_override`` expression index
+        The conflict target is the ``uq_config_override`` expression index
         ``(COALESCE(family,''), kind, name)``. ``created_by`` and ``updated_by``
         are both set to the acting user on insert; only ``updated_by`` changes
         on update.
         """
         row = await self.fetchrow(
             """
-            INSERT INTO prompt_overrides
+            INSERT INTO config_overrides
                 (family, kind, name, content, content_format, notes,
                  created_by, updated_by)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $7)
@@ -5033,10 +5033,10 @@ class PostgresDB:
         )
         return dict(row)
 
-    async def delete_prompt_override(self, override_id: str) -> bool:
+    async def delete_config_override(self, override_id: str) -> bool:
         """Delete a prompt override by id. Returns True iff a row was removed."""
         result = await self.execute(
-            "DELETE FROM prompt_overrides WHERE id = $1", UUID(str(override_id))
+            "DELETE FROM config_overrides WHERE id = $1", UUID(str(override_id))
         )
         return result == "DELETE 1"
 

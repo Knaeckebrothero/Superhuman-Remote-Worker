@@ -131,7 +131,7 @@ agent:
   # Apply admin-curated DB prompt overrides to provisioned agents. ON here
   # (dev/experimental) so the admin Prompt-overrides UI takes effect; the
   # chart default (helm/values.yaml) keeps this OFF for prod.
-  promptDbOverridesEnabled: "true"
+  configDbOverridesEnabled: "true"
   tailscale:
     enabled: true
 # -----------------------------------------------------------------------------
