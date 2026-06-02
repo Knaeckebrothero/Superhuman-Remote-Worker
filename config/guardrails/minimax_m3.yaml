@@ -1,0 +1,14 @@
+# MiniMax M3 guardrails
+#
+# M3 is a reasoning model (MSA architecture, 1M-token context, native
+# multimodal) served via an OpenAI-compatible API (LangChain ChatOpenAI).
+# Tool calls use standard OpenAI parens-form serialization — everything in
+# `default.yaml` applies as-is.
+#
+# This file exists so the matrix has a guardrails entry for `minimax-m3`,
+# kept separate from `minimax.yaml` (M2.7) so any future M3-specific drift
+# can be added here without touching the matrix again.
+
+tool_examples: {}
+
+nudges: {}

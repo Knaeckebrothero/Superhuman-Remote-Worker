@@ -23,7 +23,7 @@ from .orchestrator_client import OrchestratorClient, create_orchestrator_client_
 from .persistent_session import PersistentSession
 from ..tools.registry import TOOL_REGISTRY
 from ..core.archiver import inflight_tool_call
-from ..core.context import extract_summary_text
+from ..core.context import extract_summary_text, repair_tool_pairing
 from ..agent import UniversalAgent
 from ..llm.reasoning_chat import extract_reasoning_text_from_block
 from ..persistent_graph import (
@@ -2812,50 +2812,11 @@ def _safe_serialize(obj: Any) -> Any:
         return str(obj)
 
 
-def _repair_tool_pairing(messages: list) -> list:
-    """Drop tool calls/results that lost their partner during reconstruction.
-
-    Both the OpenAI Responses API and Anthropic reject a history where an
-    assistant tool/function call has no matching result (or a result has no
-    matching call) — a 400 "No tool output found for function call ...". On
-    resume this can happen if a tool result was never persisted (an interrupted
-    turn) or, historically, if a fixed-size restore window sliced a parallel
-    tool-call batch. Keep only calls and results whose ids match on both sides;
-    assistant messages left with neither text nor calls are dropped.
-    """
-    from langchain_core.messages import AIMessage, ToolMessage
-
-    call_ids = {
-        tc.get("id")
-        for m in messages
-        if isinstance(m, AIMessage)
-        for tc in (getattr(m, "tool_calls", None) or [])
-        if tc.get("id")
-    }
-    result_ids = {
-        m.tool_call_id
-        for m in messages
-        if isinstance(m, ToolMessage) and getattr(m, "tool_call_id", "")
-    }
-    valid_ids = call_ids & result_ids
-
-    repaired: list = []
-    for m in messages:
-        if isinstance(m, AIMessage):
-            tool_calls = getattr(m, "tool_calls", None) or []
-            kept = [tc for tc in tool_calls if tc.get("id") in valid_ids]
-            if len(kept) != len(tool_calls):
-                m = AIMessage(content=m.content, tool_calls=kept, id=m.id)
-            if not kept and not m.content:
-                continue  # empty assistant turn carries no information
-            repaired.append(m)
-        elif isinstance(m, ToolMessage):
-            if getattr(m, "tool_call_id", "") in valid_ids:
-                repaired.append(m)
-            # else: orphaned result — drop
-        else:
-            repaired.append(m)
-    return repaired
+# Bidirectional tool-call pairing repair now lives in core.context so the live
+# persistent turn loop (persistent_graph) and this resume path share one
+# implementation. Alias preserves the private name used by the call sites below
+# and by tests/test_persistent_app.py.
+_repair_tool_pairing = repair_tool_pairing
 
 
 def _db_rows_to_lc_messages(db_messages: list) -> list:

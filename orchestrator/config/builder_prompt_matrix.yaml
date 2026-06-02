@@ -8,5 +8,8 @@ default:
 minimax:
   system_prompt: builder_system_prompt_minimax.md
 
+minimax-m3:
+  system_prompt: builder_system_prompt_minimax.md  # reuse the M2.7 builder prompt
+
 gpt-oss:
   system_prompt: builder_system_prompt_gpt_oss.md

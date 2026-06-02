@@ -23,6 +23,12 @@ minimax:
   top_k: 40
   min_p: 0.01           # MiniMax official recommendation for M2.7
 
+minimax-m3:
+  temperature: 1.0
+  top_p: 0.95
+  top_k: 40             # builder client passes top_k (unlike the OpenAI agent path)
+  min_p: 0.01           # MiniMax M-series recommendation
+
 gpt-5:
   reasoning_effort: high  # Responses API reasoning parameter
 

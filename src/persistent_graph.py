@@ -28,7 +28,7 @@ from langchain_core.messages import (
     ToolMessage,
 )
 
-from .core.context import ContextManager, extract_summary_text
+from .core.context import ContextManager, extract_summary_text, repair_tool_pairing
 from .llm.reasoning_chat import extract_reasoning_text_from_block
 from .llm.response_guards import (
     coerce_to_ai_message,
@@ -640,6 +640,16 @@ async def _execute_turn(
                         logger.debug(
                             f"Git push on auto-compaction failed (non-fatal): {e}"
                         )
+
+        # Repair tool-call pairing before the LLM call. Compaction thrash, an
+        # interrupted turn, or streamed parallel-tool corruption (langchain
+        # #34660) can leave a function_call_output without its function_call
+        # (or vice versa); the Responses API rejects that with a 400
+        # "No tool call found for function call output ...". The worker graph
+        # sanitizes at the same point (src/graph.py:867); the resume path
+        # repairs on restore (persistent_app). This is the equivalent guard for
+        # the live turn loop, which previously had none.
+        prepared = repair_tool_pairing(prepared)
 
         # --- LLM call with streaming ---
         response_content = ""

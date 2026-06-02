@@ -78,6 +78,19 @@ class TestFamilyOf:
     def test_codex_spark_beats_codex(self):
         assert family_of("gpt-5.3-codex-spark") == "codex-spark"
 
+    def test_minimax_m2_stays_minimax(self):
+        # M2.x must NOT be captured by the new minimax-m3 branch.
+        assert family_of("minimax-m2.7") == "minimax"
+        assert family_of("MiniMaxAI/MiniMax-M2.7") == "minimax"
+        assert family_of("openrouter/minimax/minimax-m2.7") == "minimax"
+
+    def test_minimax_m3_beats_generic_minimax(self):
+        # minimax-m3 is a substring superset of "minimax"; the M3 branch must
+        # win so M3 models pick up the 1M-context, multimodal matrix entry.
+        assert family_of("minimax-m3") == "minimax-m3"
+        assert family_of("MiniMaxAI/MiniMax-M3") == "minimax-m3"
+        assert family_of("openrouter/minimax/minimax-m3") == "minimax-m3"
+
     def test_unknown_returns_default(self):
         assert family_of("totally-unknown-model") == "default"
 

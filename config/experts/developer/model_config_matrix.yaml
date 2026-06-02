@@ -27,6 +27,12 @@ minimax:
     strategic: strategic_minimax.txt
     tactical: tactical_minimax.txt
 
+minimax-m3:
+  prompts:
+    persona: persona_minimax_m3.txt
+    strategic: strategic_minimax_m3.txt
+    tactical: tactical_minimax_m3.txt
+
 # gpt-5 and codex share the same prompt variant — codex aliases to gpt-5
 # in the global matrix (config/model_config_matrix.yaml) and the family
 # wire format / reasoning behavior are equivalent for our purposes.

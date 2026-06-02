@@ -2023,6 +2023,7 @@ def detect_reasoning_method(model: str, explicit_method: Optional[str] = None) -
         "claude-haiku",
         "gemini",
         "minimax",
+        "minimax-m3",
         "gemma",
     ):
         return "none"
