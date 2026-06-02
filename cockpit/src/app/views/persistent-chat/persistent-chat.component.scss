@@ -1666,6 +1666,20 @@
         border-radius: var(--radius-tag);
       }
 
+      /* Transient "Transcribing…" hint shown while STT runs after a recording.
+         The spinner reuses the existing .action-spinner-sm (currentColor). */
+      .transcribing-hint {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 8px 12px;
+        margin: 8px 10px 0;
+        background: var(--info-tint);
+        color: var(--info);
+        font-size: 12px;
+        border-radius: var(--radius-tag);
+      }
+
       /* Recording strip — replaces the textarea while recording. */
       .recording-strip {
         display: flex;
