@@ -181,6 +181,10 @@ def family_of(model_id: str, default: str = "default") -> str:
     if "gemma" in name:
         return "gemma"
     if "minimax" in name:
+        # M3 (MSA architecture, 1M context, native multimodal) ships its own
+        # prompt/settings family and must win over the generic minimax match.
+        if "m3" in name:
+            return "minimax-m3"
         return "minimax"
 
     return default

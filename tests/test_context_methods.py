@@ -8,7 +8,12 @@ trim_messages, and sanitize_message_history.
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
-from src.core.context import ContextManager, ContextConfig, sanitize_message_history
+from src.core.context import (
+    ContextManager,
+    ContextConfig,
+    repair_tool_pairing,
+    sanitize_message_history,
+)
 
 
 # =============================================================================
@@ -89,6 +94,93 @@ class TestSanitizeMessageHistory:
         ]
         result = sanitize_message_history(messages)
         assert len(result) == 2
+
+
+# =============================================================================
+# repair_tool_pairing (module-level function, shared by persistent loop + resume)
+# =============================================================================
+
+
+class TestRepairToolPairing:
+    """Bidirectional tool-call pairing repair.
+
+    Regression coverage for the persistent gpt-5.5 sessions that 400'd with
+    "No tool call found for function call output" — an orphaned ToolMessage
+    (result without its call) reaching the Responses API.
+    """
+
+    def test_empty_list(self):
+        assert repair_tool_pairing([]) == []
+
+    def test_valid_pair_preserved(self):
+        messages = [
+            AIMessage(
+                content="", tool_calls=[{"name": "read", "id": "tc1", "args": {}}]
+            ),
+            ToolMessage(content="ok", tool_call_id="tc1"),
+        ]
+        result = repair_tool_pairing(messages)
+        assert len(result) == 2
+
+    def test_drops_orphaned_result(self):
+        """Result without a matching call — the exact 400 case — is dropped."""
+        messages = [
+            HumanMessage(content="hi"),
+            ToolMessage(content="orphaned", tool_call_id="call_d27X"),
+        ]
+        result = repair_tool_pairing(messages)
+        assert len(result) == 1
+        assert isinstance(result[0], HumanMessage)
+
+    def test_strips_orphaned_call_drops_empty_message(self):
+        """Call without a result and no text — the AIMessage carries nothing."""
+        messages = [
+            AIMessage(
+                content="", tool_calls=[{"name": "read", "id": "tc1", "args": {}}]
+            ),
+        ]
+        result = repair_tool_pairing(messages)
+        assert result == []
+
+    def test_strips_orphaned_call_keeps_text(self):
+        """Call without a result but with text — keep the text, drop the call."""
+        messages = [
+            AIMessage(
+                content="here you go",
+                tool_calls=[{"name": "read", "id": "tc1", "args": {}}],
+            ),
+        ]
+        result = repair_tool_pairing(messages)
+        assert len(result) == 1
+        assert result[0].content == "here you go"
+        assert result[0].tool_calls == []
+
+    def test_partial_parallel_batch(self):
+        """Parallel batch where only one result survived: keep the matched
+        call+result, strip the dangling call."""
+        messages = [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {"name": "a", "id": "t1", "args": {}},
+                    {"name": "b", "id": "t2", "args": {}},
+                ],
+            ),
+            ToolMessage(content="r1", tool_call_id="t1"),
+        ]
+        result = repair_tool_pairing(messages)
+        assert len(result) == 2
+        assert [tc["id"] for tc in result[0].tool_calls] == ["t1"]
+        assert result[1].tool_call_id == "t1"
+
+    def test_preserves_plain_messages(self):
+        messages = [
+            SystemMessage(content="system"),
+            HumanMessage(content="user"),
+            AIMessage(content="assistant"),
+        ]
+        result = repair_tool_pairing(messages)
+        assert len(result) == 3
 
 
 # =============================================================================

@@ -23,14 +23,20 @@ config/
 │   ├── strategic.txt            # Strategic phase system prompt
 │   ├── tactical.txt             # Tactical phase system prompt
 │   ├── summarization_prompt.txt # Context compaction prompt
-│   ├── systemprompt_minimax.txt # MiniMax-optimized system prompt
-│   ├── persona_minimax.txt      # MiniMax-optimized persona
-│   ├── strategic_minimax.txt    # MiniMax-optimized strategic prompt
-│   ├── tactical_minimax.txt     # MiniMax-optimized tactical prompt
-│   └── summarization_prompt_minimax.txt  # MiniMax-optimized summarization
+│   ├── systemprompt_minimax.txt # MiniMax M2.7-optimized system prompt
+│   ├── persona_minimax.txt      # MiniMax M2.7-optimized persona
+│   ├── strategic_minimax.txt    # MiniMax M2.7-optimized strategic prompt
+│   ├── tactical_minimax.txt     # MiniMax M2.7-optimized tactical prompt
+│   ├── summarization_prompt_minimax.txt  # MiniMax M2.7-optimized summarization
+│   ├── systemprompt_minimax_m3.txt        # MiniMax M3 system prompt (1M ctx, multimodal)
+│   ├── persona_minimax_m3.txt             # MiniMax M3 persona
+│   ├── strategic_minimax_m3.txt           # MiniMax M3 strategic prompt
+│   ├── tactical_minimax_m3.txt            # MiniMax M3 tactical prompt
+│   └── summarization_prompt_minimax_m3.txt # MiniMax M3 summarization
 └── templates/                   # Instruction templates (non-prompt files)
     ├── instructions.md                  # Default agent instructions
-    ├── instructions_minimax.md          # MiniMax-optimized instructions
+    ├── instructions_minimax.md          # MiniMax M2.7-optimized instructions
+    ├── instructions_minimax_m3.md       # MiniMax M3 instructions (+ multimodal / long-context guidance)
     ├── strategic_todos_initial.yaml     # Initial todos for job start
     ├── strategic_todos_transition.yaml  # Todos for phase transitions
     ├── strategic_todos_resume.yaml      # Todos for job resume with feedback
@@ -341,12 +347,21 @@ default:
     model_max_context_tokens: 100000
     context_threshold_tokens: 80000
 
-minimax:
+minimax:              # MiniMax M2.7 — 204K context, text-only
   temperature: 1.0
   top_p: 0.95
   limits:
     model_max_context_tokens: 150000
     context_threshold_tokens: 100000
+
+minimax-m3:           # MiniMax M3 — 1M context (MSA), native multimodal; distinct family from minimax
+  temperature: 1.0
+  top_p: 0.95
+  multimodal: true
+  model_max_context_tokens: 1000000
+  limits:
+    model_max_context_tokens: 200000
+    context_threshold_tokens: 150000
 
 deepseek:
   model_max_context_tokens: 64000
