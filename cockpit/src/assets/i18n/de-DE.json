@@ -975,7 +975,9 @@
       "cameraDenied": "Kamerazugriff verweigert",
       "cameraError": "Kamera nicht verfügbar",
       "micDenied": "Mikrofonzugriff verweigert",
-      "micError": "Aufnahme konnte nicht gestartet werden"
+      "micError": "Aufnahme konnte nicht gestartet werden",
+      "transcribing": "Audio wird transkribiert…",
+      "transcribeError": "Transkription fehlgeschlagen — Audio wurde angehängt"
     },
     "tts": {
       "play": "Vorlesen",

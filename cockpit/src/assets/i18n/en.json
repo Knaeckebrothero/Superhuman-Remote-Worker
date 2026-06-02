@@ -975,7 +975,9 @@
       "cameraDenied": "Camera permission denied",
       "cameraError": "Could not access camera",
       "micDenied": "Microphone permission denied",
-      "micError": "Could not start recording"
+      "micError": "Could not start recording",
+      "transcribing": "Transcribing audio…",
+      "transcribeError": "Couldn't transcribe — audio attached as-is"
     },
     "tts": {
       "play": "Read aloud",
