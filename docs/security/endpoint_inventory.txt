@@ -172,6 +172,7 @@ POST   /api/persistent/threads/{thread_id}/interrupt                            
 GET    /api/persistent/threads/{thread_id}/messages                                     gated:require_thread_owner
 POST   /api/persistent/threads/{thread_id}/resume                                       gated:require_thread_owner
 GET    /api/persistent/threads/{thread_id}/stream                                       gated:require_thread_owner
+POST   /api/persistent/threads/{thread_id}/transcribe                                   gated:require_thread_owner
 POST   /api/persistent/threads/{thread_id}/tts                                          gated:require_thread_owner
 POST   /api/persistent/threads/{thread_id}/uploads                                      gated:require_thread_owner
 GET    /api/projects                                                                    gated:require_approved_user
