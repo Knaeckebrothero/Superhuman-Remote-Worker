@@ -1092,6 +1092,14 @@ interface FileEditView {
             </div>
           }
 
+          <!-- Transcribing indicator: brief, after a recording is confirmed -->
+          @if (isTranscribing()) {
+            <div class="transcribing-hint">
+              <span class="action-spinner-sm" aria-hidden="true"></span>
+              <span>{{ 'chat.composer.transcribing' | transloco }}</span>
+            </div>
+          }
+
           <!-- Recording mode: waveform + duration + controls -->
           @if (isRecording()) {
             <div class="recording-strip">
@@ -1194,7 +1202,7 @@ interface FileEditView {
               <button
                 type="button"
                 class="ctrl mic"
-                [disabled]="!chat.isConnected()"
+                [disabled]="!chat.isConnected() || isTranscribing()"
                 [title]="'chat.composer.recordVoice' | transloco"
                 (click)="startRecording()"
               >
@@ -1308,6 +1316,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     readonly attachmentMenuOpen = signal(false);
     readonly isRecording = signal(false);
     readonly recordingDuration = signal(0);
+    readonly isTranscribing = signal(false);
     readonly imagePreviewUrl = signal<string | null>(null);
     readonly imagePreviewName = signal<string>('');
     // Drag-and-drop overlay state. dragEnterCount handles the
@@ -1805,12 +1814,48 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         }
     }
 
-    /** Stop recording and queue the resulting blob as an attachment. */
+    /**
+     * Stop recording, transcribe the clip to editable composer text, and keep
+     * the audio attached.
+     *
+     * The transcript is appended into `inputText` (never clobbering a typed
+     * draft). Reactivity note: `inputText` is a plain field, so assigning it
+     * does NOT re-evaluate the `canSend` computed on its own — the
+     * `addAttachments` call below writes the `pendingAttachments` signal, which
+     * both enables Send and triggers the change-detection pass that re-syncs the
+     * textarea to show the transcript. Keep `addAttachments` as the last step.
+     */
     async stopRecording(): Promise<void> {
         if (!this.isRecording()) return;
         const result = await this.voiceRecording.stopRecording();
         if (!result || result.duration < 1) return;
         const preview = await this.fileHandling.createAudioFilePreview(result);
+
+        const threadId = this.chat.threadId();
+        if (threadId) {
+            this.isTranscribing.set(true);
+            try {
+                const res = await firstValueFrom(
+                    this.api.transcribeVoice(threadId, preview.file),
+                );
+                if (res && res !== 'unavailable' && res.text.trim()) {
+                    const transcript = res.text.trim();
+                    this.inputText = this.inputText.trim()
+                        ? `${this.inputText.trim()}\n\n${transcript}`
+                        : transcript;
+                    queueMicrotask(() => this.autoResizeInput());
+                } else if (res === null) {
+                    // Transport/server error — keep the audio, surface a notice.
+                    this.chat.attachmentError.set(
+                        this.transloco.translate('chat.composer.transcribeError'),
+                    );
+                }
+                // 'unavailable' (no STT model configured) → attach audio silently.
+            } finally {
+                this.isTranscribing.set(false);
+            }
+        }
+
         this.chat.addAttachments([preview]);
     }
 

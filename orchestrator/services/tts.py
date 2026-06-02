@@ -23,9 +23,8 @@ from typing import Any, Optional
 
 from openai import AsyncOpenAI
 
-from src.core.model_registry import (
-    UnknownModelError,
-    resolve_model as _resolve_model,
+from services.capability_credentials import (
+    resolve_capability_credentials as _resolve_capability_credentials,
 )
 
 logger = logging.getLogger(__name__)
@@ -100,55 +99,6 @@ def _needs_formulation(text: str) -> bool:
     if not text or len(text) < _FORMULATION_MIN_LEN:
         return False
     return any(hint in text for hint in _MARKDOWN_HINTS)
-
-
-async def _resolve_capability_credentials(
-    *,
-    capability: str,
-    user_settings: dict[str, Any],
-    user_id: str,
-    resolved_keys: dict[str, str],
-    postgres_db,
-) -> Optional[tuple[str, Optional[str], Optional[str]]]:
-    """Pick a model for ``capability`` and return (model, base_url, api_key).
-
-    Resolution mirrors ``_inject_env_key_credentials`` in main.py:
-      1. user_settings[default_<capability>_model]
-      2. system default for the capability
-      3. endpoint-anchored model → use endpoint base_url + api_key
-      4. built-in model → use api_key from resolved_keys[provider]
-    """
-    user_key = f"default_{capability}_model"
-    model_id: Optional[str] = user_settings.get(user_key)
-    if not model_id:
-        model_id = await postgres_db.resolve_default_for_capability(capability)
-    if not model_id:
-        return None
-
-    base_url: Optional[str] = None
-    api_key: Optional[str] = None
-
-    meta = None
-    try:
-        meta = await _resolve_model(model_id, user_id=user_id, capability=capability)
-    except UnknownModelError:
-        meta = None
-
-    if (
-        meta is not None
-        and meta.origin in ("custom", "system", "catalog")
-        and meta.endpoint_id
-    ):
-        endpoint_row = await postgres_db.get_user_llm_endpoint(meta.endpoint_id)
-        if endpoint_row:
-            base_url = endpoint_row.get("base_url")
-            api_key = endpoint_row.get("api_key")
-    else:
-        provider = meta.api_key_ref if meta is not None else None
-        if provider and provider in resolved_keys:
-            api_key = resolved_keys[provider]
-
-    return model_id, base_url, api_key
 
 
 async def _formulate_for_speech(

@@ -847,6 +847,41 @@ export class ApiService {
       );
   }
 
+  /**
+   * Transcribe a recorded voice message to text (speech-to-text).
+   *
+   * Returns:
+   *   - `{text}` on success,
+   *   - `'unavailable'` when the server returns 204 (no STT model configured) —
+   *     lets the caller fall back to attaching the audio silently,
+   *   - `null` on transport error (caller surfaces a notice, still attaches audio).
+   */
+  transcribeVoice(
+    threadId: string,
+    file: Blob,
+  ): Observable<{text: string} | 'unavailable' | null> {
+    const formData = new FormData();
+    const filename = file instanceof File ? file.name : 'voice.webm';
+    formData.append('audio', file, filename);
+    return this.http
+      .post<{text: string}>(
+        `${this.baseUrl}/persistent/threads/${threadId}/transcribe`,
+        formData,
+        {observe: 'response'},
+      )
+      .pipe(
+        map((resp) =>
+          resp.status === 204
+            ? ('unavailable' as const)
+            : (resp.body as {text: string}),
+        ),
+        catchError((error) => {
+          console.error(`Failed to transcribe audio for thread ${threadId}:`, error);
+          return of(null);
+        }),
+      );
+  }
+
   // ===== Job Management Endpoints =====
 
   /**

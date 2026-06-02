@@ -13989,6 +13989,48 @@ async def synthesize_thread_message_tts(
     return Response(content=audio, media_type="audio/mpeg")
 
 
+@app.post("/api/persistent/threads/{thread_id}/transcribe")
+async def transcribe_thread_audio_endpoint(
+    thread_id: str,
+    request: Request,
+    audio: UploadFile = File(...),
+) -> Response:
+    """Transcribe a recorded voice message to text (speech-to-text).
+
+    The cockpit composer POSTs the recorded blob here when the user stops
+    recording; the returned text is dropped into the message input (editable)
+    while the audio is also kept as an attachment. Transcription is server-side
+    via the user's configured Whisper model, with auto-detected language.
+
+    Returns:
+        ``{"text": "..."}`` on success. ``204 No Content`` when no STT model is
+        configured for the user (or transcription failed) — the cockpit then
+        just attaches the audio. ``400`` for empty audio; ``413`` when the clip
+        exceeds 25 MB (Whisper's hard limit).
+    """
+    from services.transcribe import transcribe_thread_audio
+
+    user, thread = await require_thread_owner(request, postgres_db, thread_id)
+
+    data = await audio.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty audio upload")
+    if len(data) > 25 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Audio too large (max 25 MB)")
+
+    text = await transcribe_thread_audio(
+        audio_bytes=data,
+        filename=audio.filename or "voice.webm",
+        user_id=str(user["id"]),
+        postgres_db=postgres_db,
+    )
+    if text is None:
+        # 204: STT disabled / not configured, or transcription failed. The
+        # cockpit treats this as "attach audio only" rather than an error.
+        return Response(status_code=204)
+    return JSONResponse({"text": text})
+
+
 @app.get("/api/jobs/{job_id}/logs")
 async def get_job_logs(
     request: Request,
