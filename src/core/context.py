@@ -261,6 +261,69 @@ def sanitize_message_history(messages: List[BaseMessage]) -> List[BaseMessage]:
     return result
 
 
+def repair_tool_pairing(messages: List[BaseMessage]) -> List[BaseMessage]:
+    """Drop tool calls/results that lost their partner.
+
+    Both the OpenAI Responses API and Anthropic reject a history where an
+    assistant tool/function call has no matching result, or a result has no
+    matching call, with a 400 ("No tool call found for function call output
+    ..." / "no tool output found for function call ..."). Unlike
+    ``sanitize_message_history`` (which only drops orphaned results), this is
+    bidirectional and also strips orphaned calls off assistant messages.
+
+    Orphans arise from context-compaction thrash, an interrupted turn (a tool
+    result that was never produced or persisted), or streamed parallel-tool
+    corruption (langchain #34660). Keep only calls and results whose ids match
+    on both sides; assistant messages left with neither text nor calls are
+    dropped.
+
+    Shared by the live persistent turn loop (``persistent_graph``) and the
+    session resume path (``persistent_app``) so both enforce the same
+    invariant before a strict-pairing API call.
+    """
+    call_ids = {
+        tc.get("id")
+        for m in messages
+        if isinstance(m, AIMessage)
+        for tc in (getattr(m, "tool_calls", None) or [])
+        if tc.get("id")
+    }
+    result_ids = {
+        m.tool_call_id
+        for m in messages
+        if isinstance(m, ToolMessage) and getattr(m, "tool_call_id", "")
+    }
+    valid_ids = call_ids & result_ids
+
+    repaired: List[BaseMessage] = []
+    dropped_results = 0
+    stripped_calls = 0
+    for m in messages:
+        if isinstance(m, AIMessage):
+            tool_calls = getattr(m, "tool_calls", None) or []
+            kept = [tc for tc in tool_calls if tc.get("id") in valid_ids]
+            if len(kept) != len(tool_calls):
+                stripped_calls += len(tool_calls) - len(kept)
+                m = AIMessage(content=m.content, tool_calls=kept, id=m.id)
+            if not kept and not m.content:
+                continue  # empty assistant turn carries no information
+            repaired.append(m)
+        elif isinstance(m, ToolMessage):
+            if getattr(m, "tool_call_id", "") in valid_ids:
+                repaired.append(m)
+            else:
+                dropped_results += 1  # orphaned result — drop
+        else:
+            repaired.append(m)
+
+    if dropped_results or stripped_calls:
+        logger.warning(
+            f"repair_tool_pairing: dropped {dropped_results} orphaned tool "
+            f"result(s), stripped {stripped_calls} orphaned tool call(s)"
+        )
+    return repaired
+
+
 # Try to import tiktoken for accurate token counting
 try:
     import tiktoken

@@ -20,8 +20,16 @@ import {AppFormFieldComponent} from '../../../ui/form-field';
 import {AppBadgeComponent} from '../../../ui/badge';
 import {AppToastService} from '../../../ui/toast/toast.service';
 
-/** Model families that can carry a family-specific override (v1). */
-const FAMILIES = ['gemma', 'gpt_5', 'gpt_oss', 'minimax', 'codex', 'codex_spark'];
+/**
+ * Model families that can carry a family-specific override (v1).
+ *
+ * Values MUST equal family_of()'s output (hyphen form): the picked value is
+ * stored verbatim in config_overrides.family and matched against
+ * family_of(model) at dispatch (migration 0021). The earlier underscore forms
+ * (gpt_5, gpt_oss, codex_spark) never resolved against the hyphenated family
+ * key — corrected here, and minimax-m3 added.
+ */
+const FAMILIES = ['gemma', 'gpt-5', 'gpt-oss', 'minimax', 'minimax-m3', 'codex', 'codex-spark'];
 
 @Component({
   selector: 'app-admin-config',

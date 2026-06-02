@@ -60,6 +60,9 @@ _FAMILY_RULES: list[tuple[re.Pattern, str | Callable[[re.Match], FamilyDetection
     (re.compile(r"gemini", re.IGNORECASE), "gemini"),
     # Other open-weight families
     (re.compile(r"gpt-oss", re.IGNORECASE), "gpt-oss"),
+    # minimax-m3 must beat the generic `minimax` rule below — real M3 IDs
+    # (e.g. `MiniMax-M3`, `minimax/minimax-m3`) contain the `minimax` substring.
+    (re.compile(r"minimax[-_]?m3", re.IGNORECASE), "minimax-m3"),
     (re.compile(r"minimax", re.IGNORECASE), "minimax"),
     (re.compile(r"deepseek", re.IGNORECASE), "deepseek"),
     (re.compile(r"kimi", re.IGNORECASE), "default"),

@@ -45,6 +45,7 @@ from orchestrator.services.family_matcher import detect_family
         # Open weights
         ("openai/gpt-oss-120b", "gpt-oss"),
         ("MiniMaxAI/MiniMax-M2.7", "minimax"),
+        ("MiniMaxAI/MiniMax-M3", "minimax-m3"),
         ("deepseek-v3", "deepseek"),
         # Kimi (Moonshot) → default per design (no custom prompts shipped)
         ("moonshotai/kimi-k2-instruct-0905", "default"),
@@ -116,3 +117,15 @@ def test_codex_spark_ordering_pins_against_regression() -> None:
     models silently route to the wrong matrix entry."""
     assert detect_family("codex-spark").family == "codex-spark"
     assert detect_family("gpt-5.3-codex-spark").family == "codex-spark"
+
+
+def test_minimax_m3_ordering_pins_against_regression() -> None:
+    """minimax-m3 IDs contain the "minimax" substring — if the rules table is
+    ever reordered so the plain `minimax` rule fires first, M3 models silently
+    route to the M2.7 matrix entry (wrong context window, no multimodal)."""
+    assert detect_family("minimax-m3").family == "minimax-m3"
+    assert detect_family("MiniMax-M3").family == "minimax-m3"
+    assert detect_family("minimax/minimax-m3").family == "minimax-m3"
+    assert detect_family("openrouter/minimax/minimax-m3").family == "minimax-m3"
+    # M2.x must stay on the generic minimax family, not get captured by M3.
+    assert detect_family("MiniMaxAI/MiniMax-M2.7").family == "minimax"
