@@ -779,16 +779,16 @@ class TestPerExpertMatrixExtended:
         with open(path, "w") as f:
             yaml.dump(expert_matrix, f)
 
-        data = {"llm": {"model": "deepseek-r1"}, "limits": {}}
+        data = {"llm": {"model": "deepseek-v4-pro"}, "limits": {}}
         _apply_settings_matrix(
             data, expert_llm_keys=set(), deployment_dir=str(tmp_path)
         )
 
         # Expert override for this one key
         assert data["limits"]["context_threshold_tokens"] == 42000
-        # Base deepseek entry for the rest
-        assert data["limits"]["model_max_context_tokens"] == 55000
-        assert data["limits"]["summarization_safe_limit"] == 45000
+        # Base deepseek (V4) entry for the rest
+        assert data["limits"]["model_max_context_tokens"] == 200000
+        assert data["limits"]["summarization_safe_limit"] == 180000
 
 
 # =============================================================================
@@ -804,7 +804,16 @@ class TestRealMatrixFamilies:
         [
             ("minimax-m2.7", 130000, 170000),  # M2.7: 204K context
             ("o3-mini", 130000, 170000),
-            ("deepseek-r1", 40000, 55000),
+            (
+                "deepseek-v4-pro",
+                150000,
+                200000,
+            ),  # V4 Pro: 1M context, 200K working window
+            (
+                "deepseek-v4-flash",
+                150000,
+                200000,
+            ),  # V4 Flash shares the deepseek family
             ("gemini-2.0-flash", 150000, 200000),
             ("gpt-oss-120b", 85000, 110000),
             ("some-unknown-model", 80000, 100000),  # default entry
@@ -829,7 +838,7 @@ class TestRealMatrixFamilies:
         assert data["llm"]["temperature"] == expected_temp
 
     def test_deepseek_top_p(self):
-        data = {"llm": {"model": "deepseek-r1"}}
+        data = {"llm": {"model": "deepseek-v4-pro"}}
         _apply_settings_matrix(data, expert_llm_keys=set())
         assert data["llm"]["top_p"] == 0.95
 
@@ -851,7 +860,7 @@ class TestUploadedConfigMatrix:
         uploaded = {
             "agent_id": "uploaded_agent",
             "display_name": "Uploaded Agent",
-            "llm": {"model": "deepseek-r1"},
+            "llm": {"model": "deepseek-v4-pro"},
         }
         config_file = tmp_path / "uploaded.yaml"
         with open(config_file, "w") as f:
@@ -859,9 +868,9 @@ class TestUploadedConfigMatrix:
 
         merged = load_uploaded_config(config_file)
 
-        # Deepseek limits from matrix
-        assert merged["limits"]["context_threshold_tokens"] == 40000
-        assert merged["limits"]["model_max_context_tokens"] == 55000
+        # Deepseek (V4) limits from matrix
+        assert merged["limits"]["context_threshold_tokens"] == 150000
+        assert merged["limits"]["model_max_context_tokens"] == 200000
 
     def test_uploaded_config_llm_keys_respected(self, tmp_path):
         """Uploaded config's explicit llm keys are not overridden by matrix."""

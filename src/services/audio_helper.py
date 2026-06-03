@@ -17,6 +17,7 @@ Follows the same pattern as VisionHelper:
 """
 
 import asyncio
+import json
 import logging
 import math
 import os
@@ -146,6 +147,36 @@ def _split_long_line(text: str, max_length: int, out: List[str]) -> None:
 
     if text:
         out.append(text)
+
+
+def _extract_transcript(result: object) -> str:
+    """Pull the transcript text out of whatever the STT endpoint returned.
+
+    Well-behaved endpoints (JSON response format) yield a ``Transcription``
+    object with a ``.text`` attribute. Some OpenAI-compatible servers instead
+    return a bare string or a ``{"text": "..."}`` JSON blob regardless of the
+    requested format — unwrap those so raw JSON never reaches the transcript.
+    """
+    text = getattr(result, "text", None)
+    if text is None:
+        if isinstance(result, dict):
+            text = result.get("text", "")
+        elif isinstance(result, str):
+            stripped = result.strip()
+            if stripped.startswith("{") and '"text"' in stripped:
+                try:
+                    parsed = json.loads(stripped)
+                except (ValueError, TypeError):
+                    parsed = None
+                if isinstance(parsed, dict):
+                    text = parsed.get("text", stripped)
+                else:
+                    text = stripped
+            else:
+                text = stripped
+        else:
+            text = ""
+    return (text or "").strip()
 
 
 class AudioHelper:
@@ -497,7 +528,7 @@ class AudioHelper:
         try:
             start = time.monotonic()
 
-            kwargs = {"model": self.model, "response_format": "text"}
+            kwargs = {"model": self.model}
             effective_language = language or self.default_language
             if effective_language:
                 kwargs["language"] = effective_language
@@ -512,8 +543,10 @@ class AudioHelper:
 
             latency_ms = int((time.monotonic() - start) * 1000)
 
-            # Whisper returns a string when response_format="text"
-            text = transcript if isinstance(transcript, str) else transcript.text
+            # Endpoints vary: a Transcription object (default JSON format), a
+            # bare string, or a `{"text": ...}` blob from non-compliant servers.
+            # Normalize all of them so raw JSON never leaks into the transcript.
+            text = _extract_transcript(transcript)
 
             # Archive with chunk metadata if applicable
             archive_file_name = original_file_name or file_path.name

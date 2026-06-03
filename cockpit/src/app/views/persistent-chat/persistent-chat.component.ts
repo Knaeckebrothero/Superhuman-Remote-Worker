@@ -649,7 +649,13 @@ interface FileEditView {
               @if (turn.summary) {
                 <details class="compaction-summary">
                   <summary>{{ 'chat.compaction.viewSummary' | transloco }}</summary>
-                  <div class="compaction-summary-body">{{ turn.summary }}</div>
+                  <!-- The agent's summary is markdown (headings, lists, code). Render it
+                       as such, reusing the chat's markdown cascade via the message-body
+                       class (its base styles are benign; the bubble styling is gated on
+                       .message-user/.message-assistant, which this isn't). -->
+                  <div class="compaction-summary-body message-body">
+                    <markdown [data]="turn.summary"></markdown>
+                  </div>
                 </details>
               }
             }

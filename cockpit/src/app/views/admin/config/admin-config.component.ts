@@ -19,6 +19,7 @@ import {AppButtonComponent} from '../../../ui/button';
 import {AppFormFieldComponent} from '../../../ui/form-field';
 import {AppBadgeComponent} from '../../../ui/badge';
 import {AppToastService} from '../../../ui/toast/toast.service';
+import {AgentLoopDiagramComponent} from './agent-loop-diagram.component';
 
 /**
  * Model families that can carry a family-specific override (v1).
@@ -29,7 +30,7 @@ import {AppToastService} from '../../../ui/toast/toast.service';
  * (gpt_5, gpt_oss, codex_spark) never resolved against the hyphenated family
  * key — corrected here, and minimax-m3 added.
  */
-const FAMILIES = ['gemma', 'gpt-5', 'gpt-oss', 'minimax', 'minimax-m3', 'codex', 'codex-spark'];
+const FAMILIES = ['gemma', 'gpt-5', 'gpt-oss', 'deepseek', 'minimax', 'minimax-m3', 'codex', 'codex-spark'];
 
 @Component({
   selector: 'app-admin-config',
@@ -42,6 +43,7 @@ const FAMILIES = ['gemma', 'gpt-5', 'gpt-oss', 'minimax', 'minimax-m3', 'codex',
     AppButtonComponent,
     AppFormFieldComponent,
     AppBadgeComponent,
+    AgentLoopDiagramComponent,
   ],
   template: `
     <div class="admin-page">
@@ -57,6 +59,16 @@ const FAMILIES = ['gemma', 'gpt-5', 'gpt-oss', 'minimax', 'minimax-m3', 'codex',
       </p>
 
       <section class="admin-section">
+        <h2 class="section-title">How prompts are used</h2>
+        <p class="section-desc">
+          Where each prompt and instruction file below runs in an agent's loop.
+          Workers (jobs) alternate strategic and tactical phase prompts;
+          persistent sessions use a single interactive prompt every turn.
+        </p>
+        <app-agent-loop-diagram />
+      </section>
+
+      <section class="admin-section">
         <h2 class="section-title">Pick a config key</h2>
         <div class="picker-row">
           <app-form-field label="Model family">
@@ -70,8 +82,12 @@ const FAMILIES = ['gemma', 'gpt-5', 'gpt-oss', 'minimax', 'minimax-m3', 'codex',
           <app-form-field label="Config key">
             <app-select [value]="keyValue()" (changed)="onKeyChange($event)">
               <option value="">— select a config key —</option>
-              @for (e of admin.catalog(); track e.name) {
-                <option [value]="e.name">{{ e.title }}</option>
+              @for (g of groupedCatalog(); track g.label) {
+                <optgroup [label]="g.label">
+                  @for (e of g.entries; track e.name) {
+                    <option [value]="e.name">{{ e.title }}</option>
+                  }
+                </optgroup>
               }
             </app-select>
           </app-form-field>
@@ -82,6 +98,9 @@ const FAMILIES = ['gemma', 'gpt-5', 'gpt-oss', 'minimax', 'minimax-m3', 'codex',
         <section class="admin-section">
           <div class="entry-head">
             <h2 class="section-title">{{ entry.title }}</h2>
+            @if (entry.group) {
+              <span class="entry-scope">{{ entry.group }}</span>
+            }
             @if (hasOverride()) {
               <app-badge tone="info" size="xs">override active</app-badge>
             }
@@ -184,7 +203,16 @@ const FAMILIES = ['gemma', 'gpt-5', 'gpt-oss', 'minimax', 'minimax-m3', 'codex',
     .entry-head {
       display: flex;
       align-items: center;
+      flex-wrap: wrap;
       gap: 10px;
+    }
+    .entry-scope {
+      font-size: 11px;
+      color: var(--text-muted);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-tag, 6px);
+      padding: 2px 8px;
+      white-space: nowrap;
     }
     .editor-grid {
       display: grid;
@@ -222,6 +250,28 @@ export class AdminConfigComponent implements OnInit {
   );
 
   readonly keyValue = computed(() => this.selectedEntry()?.name ?? '');
+
+  /**
+   * Catalog entries bucketed into <optgroup>s for the picker. Groups (and the
+   * entries within them) keep the catalog's order, so the picker reads
+   * shared → worker → persistent → settings → guardrails. Entries with no
+   * `group` fall into a trailing "Other" bucket.
+   */
+  readonly groupedCatalog = computed(() => {
+    const groups: {label: string; entries: ConfigCatalogEntry[]}[] = [];
+    const byLabel = new Map<string, ConfigCatalogEntry[]>();
+    for (const e of this.admin.catalog()) {
+      const label = e.group ?? 'Other';
+      let bucket = byLabel.get(label);
+      if (!bucket) {
+        bucket = [];
+        byLabel.set(label, bucket);
+        groups.push({label, entries: bucket});
+      }
+      bucket.push(e);
+    }
+    return groups;
+  });
 
   /** Structured kinds (settings, guardrails) edit a JSON value, not text. */
   readonly isStructured = computed(() => {
