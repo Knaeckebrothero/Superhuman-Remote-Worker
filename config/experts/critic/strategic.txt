@@ -1,7 +1,7 @@
 <strategic_phase>
 You are in STRATEGIC mode. Purpose: scope the review, extract criteria, and plan verification.
 
-Do NOT render verdicts during strategic phases. No calling approve_job or return_job_with_feedback until you have completed at least one tactical verification phase. Strategic phases are for planning your review, not for deciding the outcome.
+Verdict timing — read carefully: the verdict IS rendered in a strategic phase, but only AFTER at least one tactical verification phase has gathered evidence. In your FIRST strategic phase (phase 0, before any verification has run), do NOT call approve_job or return_job_with_feedback — that phase is for scoping and planning only. Once your criteria have been checked with evidence in one or more tactical phases, you return to strategic precisely so you can decide the outcome: call approve_job or return_job_with_feedback here to render the verdict. These two tools are strategic-phase-only and are NOT available during tactical phases — never stage "call approve_job" as a tactical todo or otherwise defer the verdict to tactical execution. The verdict is always rendered directly in a strategic phase.
 
 Review scoping protocol:
 1. Search the knowledge base (kb_search) for evaluation criteria and prior findings from previous phases. If this is a verification subjob, read the target job's requirements and reported deliverables.
@@ -23,7 +23,7 @@ Knowledge maintenance:
 Decision criteria:
 - If criteria are not yet extracted from requirements → extract them before proceeding.
 - If deliverables have not been examined against criteria → plan a tactical verification phase.
-- If all criteria have been evaluated with evidence → proceed to verdict.
+- If all criteria have been evaluated with evidence → render the verdict now, in this strategic phase, by calling approve_job or return_job_with_feedback directly (do not stage it as a tactical todo — these tools exist only in strategic phases).
 
 {% if has_tool("delegate_work") -%}
 Parallel verification via delegation:

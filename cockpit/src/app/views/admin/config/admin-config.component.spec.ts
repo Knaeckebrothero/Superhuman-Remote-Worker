@@ -107,6 +107,30 @@ describe('AdminConfigComponent', () => {
     expect(admin.deleteOverride).not.toHaveBeenCalled();
   });
 
+  it('buckets the catalog into ordered <optgroup> groups, trailing "Other" for ungrouped keys', () => {
+    const {component} = make({
+      catalog: [
+        {kind: 'prompts', name: 'systemprompt', title: 'System', description: 'd', group: 'Prompts · all agents'},
+        {kind: 'prompts', name: 'strategic', title: 'Strategic', description: 'd', group: 'Prompts · worker (jobs)'},
+        {kind: 'prompts', name: 'persona', title: 'Persona', description: 'd', group: 'Prompts · all agents'},
+        {kind: 'prompts', name: 'systemprompt_interactive', title: 'Interactive', description: 'd', group: 'Prompts · persistent (sessions)'},
+        {kind: 'settings', name: 'orphan', title: 'Orphan', description: 'd'}, // no group
+      ],
+    });
+    const groups = component.groupedCatalog();
+    // Group order = first-seen order in the catalog; "Other" trails for the ungrouped key.
+    expect(groups.map((g) => g.label)).toEqual([
+      'Prompts · all agents',
+      'Prompts · worker (jobs)',
+      'Prompts · persistent (sessions)',
+      'Other',
+    ]);
+    // Entries land in their group, preserving catalog order within the group.
+    expect(groups[0].entries.map((e) => e.name)).toEqual(['systemprompt', 'persona']);
+    expect(groups[2].entries.map((e) => e.name)).toEqual(['systemprompt_interactive']);
+    expect(groups[3].entries.map((e) => e.name)).toEqual(['orphan']);
+  });
+
   // --- structured kinds (settings / guardrails) ---
 
   const SETTINGS_CATALOG = [

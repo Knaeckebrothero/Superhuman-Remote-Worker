@@ -76,6 +76,11 @@ secrets:
     OPENAI_API_KEY: ""
     ANTHROPIC_API_KEY: ""
     GROQ_API_KEY: ""
+    # OpenRouter gateway — serves the DeepSeek V4 family (deepseek-v4-pro /
+    # deepseek-v4-flash) on Western infra. Add the provider key in Admin →
+    # Providers (or paste it here for local), then register the two models in
+    # Admin → Models with family "deepseek".
+    OPENROUTER_API_KEY: ""
 
     # --- App DBs ---
     POSTGRES_USER: "srw"
