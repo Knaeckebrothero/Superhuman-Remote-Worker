@@ -198,3 +198,103 @@ class TestPhaseOverrideCredentialInjection:
         assert "tactical" not in result.get("llm", {})
         assert "strategic" not in result.get("llm", {})
         assert "auxiliary" not in result
+
+
+# ---------------------------------------------------------------------------
+# System-anchored provider routing (provider_kind='system')
+#
+# A catalog row anchored to a system_api_keys provider (e.g. OpenRouter)
+# carries NO endpoint base_url — `_catalog_row_to_meta` leaves base_url=None
+# and only sets api_key_ref. The dispatcher used to inject just the api_key,
+# so the agent's create_llm fell back to the OpenAI factory default
+# (api.openai.com) and rejected the OpenRouter `sk-or-v1…` key with a 401
+# from platform.openai.com. The fix injects `meta.provider` (the factory
+# name) so OpenRouter rows route through _create_openrouter_llm → openrouter.ai.
+# ---------------------------------------------------------------------------
+
+OR_KEY = "sk-or-v1-test00000000000000000000000000000000000000000000fc51"
+
+
+@pytest.fixture
+def patched_main_openrouter(monkeypatch):
+    """Registry returns a system-anchored OpenRouter chat row (no endpoint,
+    base_url=None, api_key_ref='openrouter', provider='openrouter') and the
+    job resolves an OpenRouter system key."""
+
+    async def fake_resolve(model_id, user_id=None, capability="chat"):
+        if model_id == "minimax/minimax-m3":
+            return ModelMeta(
+                model_id="minimax/minimax-m3",
+                provider="openrouter",  # _factory_provider('openrouter')
+                family="minimax-m3",
+                display_name="MiniMax M3",
+                base_url=None,  # system rows carry no endpoint base_url
+                api_key_ref="openrouter",  # resolves system_api_keys['openrouter']
+                origin="catalog",
+                endpoint_id=None,
+            )
+        return None
+
+    monkeypatch.setattr(
+        main, "_resolve_model", AsyncMock(side_effect=fake_resolve), raising=True
+    )
+    monkeypatch.setattr(
+        main.postgres_db,
+        "get_user_llm_endpoint",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        main.postgres_db,
+        "resolve_api_keys_for_job",
+        AsyncMock(return_value={"openrouter": OR_KEY}),
+    )
+    monkeypatch.setattr(
+        main.postgres_db,
+        "get_user_settings",
+        AsyncMock(return_value={}),
+    )
+    monkeypatch.setattr(
+        main.postgres_db,
+        "resolve_default_for_capability",
+        AsyncMock(return_value=None),
+    )
+
+
+class TestSystemProviderRouting:
+    @pytest.mark.asyncio
+    async def test_main_llm_openrouter_row_injects_provider_and_key(
+        self, patched_main_openrouter
+    ):
+        """The exact M3 incident: a system OpenRouter chat model must carry
+        provider='openrouter' so the agent routes to openrouter.ai, not the
+        OpenAI factory default."""
+        override = {"llm": {"model": "minimax/minimax-m3"}}
+
+        result = await main._inject_dispatch_credentials(_job(), override)
+
+        assert result["llm"]["provider"] == "openrouter"
+        assert result["llm"]["api_key"] == OR_KEY
+
+    @pytest.mark.asyncio
+    async def test_phase_override_openrouter_row_injects_provider(
+        self, patched_main_openrouter
+    ):
+        """Phase overrides go through _inject_model_credentials — same fix
+        must reach them."""
+        override = {"llm": {"tactical": {"model": "minimax/minimax-m3"}}}
+
+        result = await main._inject_dispatch_credentials(_job(), override)
+
+        assert result["llm"]["tactical"]["provider"] == "openrouter"
+        assert result["llm"]["tactical"]["api_key"] == OR_KEY
+
+    @pytest.mark.asyncio
+    async def test_caller_pinned_provider_is_not_overwritten(
+        self, patched_main_openrouter
+    ):
+        """Injection is additive (setdefault) — an explicit provider wins."""
+        override = {"llm": {"model": "minimax/minimax-m3", "provider": "openai"}}
+
+        result = await main._inject_dispatch_credentials(_job(), override)
+
+        assert result["llm"]["provider"] == "openai"
