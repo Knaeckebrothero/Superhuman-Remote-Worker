@@ -174,6 +174,68 @@ class TestTranscribeService:
             )
         assert text == "spoken words"
 
+    @pytest.mark.asyncio
+    async def test_unwraps_json_string_blob(self):
+        """Non-compliant endpoints return a `{"text": ...}` JSON *string* instead
+        of a parsed object — the JSON must be unwrapped, not leaked verbatim."""
+        from services.transcribe import transcribe_thread_audio
+
+        cls, _ = _mock_openai('{"text": "Hey there"}')
+        with (
+            patch("services.transcribe.AsyncOpenAI", cls),
+            patch(
+                "services.transcribe.resolve_capability_credentials",
+                AsyncMock(return_value=("whisper-1", None, "sk-key")),
+            ),
+        ):
+            text = await transcribe_thread_audio(
+                audio_bytes=b"\x00",
+                filename="voice.webm",
+                user_id="u1",
+                postgres_db=_mock_db(),
+            )
+        assert text == "Hey there"
+
+    @pytest.mark.asyncio
+    async def test_handles_dict_result(self):
+        from services.transcribe import transcribe_thread_audio
+
+        cls, _ = _mock_openai({"text": "Hi"})
+        with (
+            patch("services.transcribe.AsyncOpenAI", cls),
+            patch(
+                "services.transcribe.resolve_capability_credentials",
+                AsyncMock(return_value=("whisper-1", None, "sk-key")),
+            ),
+        ):
+            text = await transcribe_thread_audio(
+                audio_bytes=b"\x00",
+                filename="voice.webm",
+                user_id="u1",
+                postgres_db=_mock_db(),
+            )
+        assert text == "Hi"
+
+    @pytest.mark.asyncio
+    async def test_plain_string_passthrough(self):
+        from services.transcribe import transcribe_thread_audio
+
+        cls, _ = _mock_openai("Just plain words")
+        with (
+            patch("services.transcribe.AsyncOpenAI", cls),
+            patch(
+                "services.transcribe.resolve_capability_credentials",
+                AsyncMock(return_value=("whisper-1", None, "sk-key")),
+            ),
+        ):
+            text = await transcribe_thread_audio(
+                audio_bytes=b"\x00",
+                filename="voice.webm",
+                user_id="u1",
+                postgres_db=_mock_db(),
+            )
+        assert text == "Just plain words"
+
 
 # ---------------------------------------------------------------------------
 # Endpoint: POST /api/persistent/threads/{thread_id}/transcribe

@@ -237,17 +237,32 @@ class TestTranscribe:
         assert call_kwargs.kwargs["prompt"] == "Technical discussion about APIs"
 
     @pytest.mark.asyncio
-    async def test_transcribe_response_format_text(
+    async def test_transcribe_does_not_force_text_format(
         self, audio_helper, mock_openai_client, tmp_audio
     ):
-        """Requests text response format."""
+        """Uses the SDK's default JSON format — never forces response_format=text,
+        which leaks `{"text": ...}` verbatim from endpoints that answer in JSON."""
         mock_client, _ = mock_openai_client
         mock_client.audio.transcriptions.create = AsyncMock(return_value="text")
 
         await audio_helper.transcribe(tmp_audio)
 
         call_kwargs = mock_client.audio.transcriptions.create.call_args
-        assert call_kwargs.kwargs["response_format"] == "text"
+        assert call_kwargs.kwargs.get("response_format") != "text"
+
+    @pytest.mark.asyncio
+    async def test_transcribe_unwraps_json_blob(
+        self, audio_helper, mock_openai_client, tmp_audio
+    ):
+        """A `{"text": ...}` JSON string from a non-compliant endpoint is unwrapped."""
+        mock_client, _ = mock_openai_client
+        mock_client.audio.transcriptions.create = AsyncMock(
+            return_value='{"text": "unwrapped transcript"}'
+        )
+
+        result = await audio_helper.transcribe(tmp_audio)
+
+        assert result == "unwrapped transcript"
 
 
 # =============================================================================

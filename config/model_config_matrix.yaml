@@ -119,18 +119,59 @@ o-series:
       summarization_chunk_size: 110000
       message_count_min_tokens: 80000
 
+# DeepSeek V4 family (released 2026-04-24). Covers BOTH variants — family_of()
+# maps `deepseek-v4-pro` (1.6T/49B) and `deepseek-v4-flash` (284B/13B) to this
+# single `deepseek` block; per-model differences (context window, reasoning
+# effort) ride on the catalog row, not here. Both are 1M-context HYBRID reasoning
+# models with a thinking mode, served OpenAI-compatible via OpenRouter (LangChain
+# ChatOpenAI) — so tool calls use the standard parens-form serialization and
+# reasoning comes back out-of-band (DeepSeek `reasoning_content`, OpenRouter
+# `reasoning`/`reasoning_details`), captured by src/llm/reasoning_chat.py.
+#
+# Prompts: forks the every-call scaffold (`systemprompt` + `systemprompt_interactive`),
+# the identity (`persona`), and the auxiliary-path prompts (`memory_extraction`,
+# `memory_assembler`, `curation`). The aux trio is forked because V4 Flash is wired
+# as the auxiliary model, so those background tasks actually run on DeepSeek and want
+# terse, structured-only output (the `<deepseek_output_contract>` block). The shared
+# behavioral tuning — output-length discipline (V4's signature verbosity) and
+# reasoning-channel hygiene — rides in these scaffolds. `strategic` / `tactical` /
+# `summarization` / `instructions` intentionally inherit `default`: they are
+# model-agnostic and DeepSeek's tool wire is the standard parens-form, so a fork
+# would add maintenance with no benefit. Fork the phase prompts only if real V4 runs
+# show a need.
 deepseek:
+  prompts:
+    # Worker-path scaffold + identity
+    systemprompt: systemprompt_deepseek.txt
+    persona: persona_deepseek.txt
+    # Interactive/persistent-session scaffold (V4 may serve sessions too)
+    systemprompt_interactive: systemprompt_interactive_deepseek.txt
+    # Auxiliary-path (memory + knowledge), loaded when V4 Flash is the aux model
+    memory_extraction: memory_extraction_prompt_deepseek.txt
+    memory_assembler: memory_assembler_prompt_deepseek.txt
+    curation: curation_prompt_deepseek.txt
+  guardrails:
+    file: deepseek.yaml
   settings:
+    # In THINKING mode DeepSeek V4 ignores temperature/top_p/penalties — tune the
+    # prompt, not sampling. These values apply only to any non-thinking fallback
+    # turn; DeepSeek's own guidance is temp 0.0 for code/agentic work. Reasoning
+    # effort defaults to `high` (auto-`max` for agent harnesses) and is set
+    # per-model via the catalog row's reasoningLevel, not here.
+    temperature: 0.0
     top_p: 0.95
-    multimodal: false
-    parallel_tool_calls: false  # DeepSeek parallel calls are unreliable
-    model_max_context_tokens: 64000
+    multimodal: false  # V4 Pro + Flash are text-only
+    parallel_tool_calls: false  # DeepSeek parallel tool calls remain unreliable
+    model_max_context_tokens: 1000000  # V4 Pro + Flash: 1M context (was 64K on V3/R1)
     limits:
-      model_max_context_tokens: 55000
-      context_threshold_tokens: 40000
-      summarization_safe_limit: 45000
-      summarization_chunk_size: 35000
-      message_count_min_tokens: 30000
+      # Cap the working window like the other 1M-class families (claude-opus,
+      # gpt-5, gemini, minimax-m3) to bound cost + avoid long-context drift.
+      # Revisit upward after real V4 runs.
+      model_max_context_tokens: 200000
+      context_threshold_tokens: 150000
+      summarization_safe_limit: 180000
+      summarization_chunk_size: 120000
+      message_count_min_tokens: 100000
 
 gemini:
   settings:

@@ -13,6 +13,7 @@ exactly like TTS. No caching: every recording is unique.
 from __future__ import annotations
 
 import io
+import json
 import logging
 from typing import Optional
 
@@ -21,6 +22,36 @@ from openai import AsyncOpenAI
 from services.capability_credentials import resolve_capability_credentials
 
 logger = logging.getLogger(__name__)
+
+
+def _extract_transcript(result: object) -> str:
+    """Pull the transcript text out of whatever the STT endpoint returned.
+
+    Well-behaved endpoints (JSON response format) yield a ``Transcription``
+    object with a ``.text`` attribute. Some OpenAI-compatible servers instead
+    return a bare string or a ``{"text": "..."}`` JSON blob regardless of the
+    requested format — unwrap those so raw JSON never reaches the composer.
+    """
+    text = getattr(result, "text", None)
+    if text is None:
+        if isinstance(result, dict):
+            text = result.get("text", "")
+        elif isinstance(result, str):
+            stripped = result.strip()
+            if stripped.startswith("{") and '"text"' in stripped:
+                try:
+                    parsed = json.loads(stripped)
+                except (ValueError, TypeError):
+                    parsed = None
+                if isinstance(parsed, dict):
+                    text = parsed.get("text", stripped)
+                else:
+                    text = stripped
+            else:
+                text = stripped
+        else:
+            text = ""
+    return (text or "").strip()
 
 
 async def transcribe_thread_audio(
@@ -67,11 +98,14 @@ async def transcribe_thread_audio(
     try:
         # The OpenAI SDK infers the audio format from the filename extension,
         # so pass a (name, fileobj) tuple carrying the real extension (.webm).
+        # Use the SDK's default JSON response format — NOT "text". With "text"
+        # the SDK returns the raw HTTP body, and OpenAI-compatible endpoints that
+        # answer with a JSON object even for a text request then leak the literal
+        # `{"text": "..."}` blob into the transcript.
         file_tuple = (filename or "voice.webm", io.BytesIO(audio_bytes))
         result = await client.audio.transcriptions.create(
             model=model,
             file=file_tuple,
-            response_format="text",
         )
     except Exception:
         logger.exception("Transcription failed for model %s", model)
@@ -79,7 +113,4 @@ async def transcribe_thread_audio(
     finally:
         await client.close()
 
-    # response_format="text" yields a plain string; guard for SDKs that wrap it.
-    text = result if isinstance(result, str) else getattr(result, "text", "")
-    text = (text or "").strip()
-    return text or None
+    return _extract_transcript(result) or None

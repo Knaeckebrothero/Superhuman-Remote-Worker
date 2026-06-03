@@ -991,7 +991,9 @@
       .compaction-summary-body {
         margin-top: 6px;
         padding: 8px 10px;
-        white-space: pre-wrap;
+        // No white-space: pre-wrap — the summary is markdown now (block elements
+        // structure it); pre-wrap would turn the inter-block newlines into gaps.
+        font-size: 12px; // hold the muted size; .message-body would otherwise bump it to 13px
         border-left: 2px solid var(--border, var(--surface-1));
         border-radius: var(--radius-tag);
       }

@@ -30,13 +30,15 @@ export interface ConfigOverride {
 /**
  * A human description of an editable config key (config/prompts/catalog.yaml).
  * Settings/guardrails entries also carry `type` (+ optional bounds/enum) so the
- * UI renders typed editors.
+ * UI renders typed editors. `group` is the <optgroup> the key is shown under in
+ * the picker (separates worker-only, persistent-only, and shared keys).
  */
 export interface ConfigCatalogEntry {
   kind: ConfigKind;
   name: string;
   title: string;
   description: string;
+  group?: string;
   type?: ConfigValueType;
   min?: number;
   max?: number;
