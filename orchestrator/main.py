@@ -945,6 +945,15 @@ async def _inject_dispatch_credentials(
             provider_for_key: str | None = meta.api_key_ref
         else:
             provider_for_key = _dispatch_llm_provider_fallback(job, config_override)
+        # Route to the right agent-side LLM factory. System-anchored catalog
+        # rows carry no endpoint base_url, so without an explicit provider the
+        # agent's create_llm defaults to the OpenAI factory (api.openai.com)
+        # and rejects e.g. an OpenRouter sk-or-v1 key. meta.provider already
+        # holds the factory name (_factory_provider); fall back to the
+        # key-inference result for registry misses.
+        factory_provider = meta.provider if meta is not None else provider_for_key
+        if factory_provider:
+            llm_over.setdefault("provider", factory_provider)
         if (
             provider_for_key
             and provider_for_key in resolved_keys
@@ -2014,6 +2023,13 @@ async def _inject_model_credentials(
         return
 
     provider = meta.api_key_ref if meta is not None else _provider_of_model(model_id)
+    # Inject the agent-side factory name so system-anchored rows (which carry
+    # no endpoint base_url) route to the correct LLM factory — e.g. an
+    # OpenRouter row → _create_openrouter_llm (openrouter.ai), not the OpenAI
+    # default at api.openai.com. meta.provider already holds the factory name.
+    factory_provider = meta.provider if meta is not None else provider
+    if factory_provider:
+        section.setdefault("provider", factory_provider)
     if (
         provider
         and resolved_keys
@@ -16011,6 +16027,30 @@ async def _validate_catalog_provider_ref(provider_kind: str, provider_ref: str) 
         )
 
 
+def _normalize_catalog_model_id(
+    provider_kind: str, provider_ref: str, model_id: str
+) -> str:
+    """Prepend the ``openrouter/`` routing prefix for system-anchored
+    OpenRouter rows.
+
+    OpenRouter routing in the agent keys off the ``openrouter/`` model-ID
+    prefix: ``_create_openrouter_llm`` strips it back to the gateway slug and
+    targets ``openrouter.ai``. A system-anchored OpenRouter row whose ID lacks
+    the prefix routes to the OpenAI factory default (``api.openai.com``) and
+    rejects the ``sk-or-v1`` key. Mirrors the seed convention
+    (``db_backed_model_catalog.md``) and ``discovery.py``'s auto-prepend.
+    No-op for endpoint rows (routed by their inline base_url) and any
+    non-OpenRouter provider.
+    """
+    if (
+        provider_kind == "system"
+        and provider_ref == "openrouter"
+        and not model_id.lower().startswith("openrouter/")
+    ):
+        return f"openrouter/{model_id}"
+    return model_id
+
+
 @app.get("/api/admin/providers/models")
 async def admin_list_catalog_models(
     request: Request,
@@ -16056,11 +16096,14 @@ async def admin_create_catalog_model(
     """
     await _require_admin(request)
     await _validate_catalog_provider_ref(body.provider_kind, body.provider_ref)
+    model_id = _normalize_catalog_model_id(
+        body.provider_kind, body.provider_ref, body.model_id
+    )
     try:
         row = await postgres_db.create_model(
             provider_kind=body.provider_kind,
             provider_ref=body.provider_ref,
-            model_id=body.model_id,
+            model_id=model_id,
             display_label=body.display_label,
             capabilities=body.capabilities,
             family=body.family,
@@ -16078,7 +16121,7 @@ async def admin_create_catalog_model(
                 status_code=409,
                 detail=(
                     f"Catalog row for ({body.provider_kind}/{body.provider_ref}, "
-                    f"{body.model_id}) already exists."
+                    f"{model_id}) already exists."
                 ),
             )
         raise
@@ -16098,6 +16141,7 @@ async def admin_update_catalog_model(
     """
     await _require_admin(request)
     fields = body.model_dump(exclude_unset=True)
+    existing = None
     if "provider_kind" in fields or "provider_ref" in fields:
         existing = await postgres_db.get_model(catalog_id)
         if existing is None:
@@ -16105,6 +16149,19 @@ async def admin_update_catalog_model(
         new_kind = fields.get("provider_kind", existing["provider_kind"])
         new_ref = fields.get("provider_ref", existing["provider_ref"])
         await _validate_catalog_provider_ref(new_kind, new_ref)
+    # Apply the same openrouter/ prefix normalization as create when the
+    # model_id is being (re)written. The effective provider_kind/ref may come
+    # from this patch or fall back to the existing row.
+    if "model_id" in fields:
+        if existing is None:
+            existing = await postgres_db.get_model(catalog_id)
+            if existing is None:
+                raise HTTPException(status_code=404, detail="Catalog row not found")
+        fields["model_id"] = _normalize_catalog_model_id(
+            fields.get("provider_kind", existing["provider_kind"]),
+            fields.get("provider_ref", existing["provider_ref"]),
+            fields["model_id"],
+        )
     try:
         row = await postgres_db.update_model(catalog_id, **fields)
     except ValueError as e:
