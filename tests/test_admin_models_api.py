@@ -37,6 +37,7 @@ from main import (  # noqa: E402
     CatalogModelUpdate,
     app,
 )
+import main  # noqa: E402
 from orchestrator.database.postgres import PostgresDB  # noqa: E402
 
 
@@ -623,3 +624,58 @@ class TestListByCapabilityAlphabetical:
         assert "enabled = TRUE" in sql
         assert "ORDER BY display_label ASC" in sql
         assert conn.fetch.await_args.args[1:] == ("auxiliary",)
+
+
+class TestNormalizeCatalogModelId:
+    """Write-time normalization of the ``openrouter/`` routing prefix.
+
+    A system-anchored OpenRouter catalog row must store its model_id WITH the
+    ``openrouter/`` prefix so the agent routes through _create_openrouter_llm
+    (which strips the prefix back to the gateway slug). Without it the row
+    routes to the OpenAI factory default (api.openai.com) and rejects the
+    sk-or-v1 key. Mirrors discovery.py's auto-prepend + the seed convention.
+    """
+
+    def test_prepends_prefix_for_system_openrouter_row(self):
+        assert (
+            main._normalize_catalog_model_id(
+                "system", "openrouter", "minimax/minimax-m3"
+            )
+            == "openrouter/minimax/minimax-m3"
+        )
+
+    def test_idempotent_when_prefix_already_present(self):
+        assert (
+            main._normalize_catalog_model_id(
+                "system", "openrouter", "openrouter/minimax/minimax-m3"
+            )
+            == "openrouter/minimax/minimax-m3"
+        )
+
+    def test_idempotent_is_case_insensitive(self):
+        assert (
+            main._normalize_catalog_model_id(
+                "system", "openrouter", "OpenRouter/minimax/minimax-m3"
+            )
+            == "OpenRouter/minimax/minimax-m3"
+        )
+
+    def test_other_system_providers_untouched(self):
+        # openai/anthropic/etc. resolve correctly without a routing prefix.
+        assert (
+            main._normalize_catalog_model_id("system", "openai", "gpt-5.5") == "gpt-5.5"
+        )
+        assert (
+            main._normalize_catalog_model_id("system", "anthropic", "claude-opus-4-7")
+            == "claude-opus-4-7"
+        )
+
+    def test_endpoint_rows_untouched(self):
+        # Endpoint rows route via the endpoint's inline base_url; prefixing
+        # would be sent verbatim to the gateway and 404.
+        assert (
+            main._normalize_catalog_model_id(
+                "endpoint", "some-endpoint-uuid", "minimax/minimax-m3"
+            )
+            == "minimax/minimax-m3"
+        )
