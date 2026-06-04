@@ -94,11 +94,17 @@ echo "Generating API key (TTL=$API_TTL)..."
 API_KEY=$(kubectl --context "$CONTEXT" -n "$NS" exec "$POD" -- \
   headscale apikeys create --expiration "$API_TTL")
 
-echo "Generating pre-auth key (reusable, tags=$PREAUTH_TAGS, TTL=$PREAUTH_TTL)..."
+echo "Generating pre-auth key (reusable, ephemeral, tags=$PREAUTH_TAGS, TTL=$PREAUTH_TTL)..."
+# --ephemeral is REQUIRED: agent pods use `tailscaled --state=mem:` + a unique
+# per-pod hostname, so each registration is throwaway. Without it, every pod
+# becomes a permanent node and they accumulate until the coordinator is
+# overloaded (2026-06-03 incident). Ephemeral nodes are GC'd 30m after going
+# offline. Do not remove on key rotation.
 AUTH_KEY=$(kubectl --context "$CONTEXT" -n "$NS" exec "$POD" -- \
   headscale preauthkeys create \
   --user "$USER_ID" \
   --reusable \
+  --ephemeral \
   --expiration "$PREAUTH_TTL" \
   --tags "$PREAUTH_TAGS")
 
