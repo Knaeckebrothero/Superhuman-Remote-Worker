@@ -13978,10 +13978,16 @@ async def synthesize_thread_message_tts(
         ``language`` (str, default ``"en"``) — selects the TTS voice.
 
     Returns:
-        ``audio/mpeg`` MP3 bytes. ``204 No Content`` when no TTS model is
-        configured for the user. ``502`` when the synthesis call fails.
+        JSON ``{"text": <spoken text>, "audio": <base64 MP3>}`` on success —
+        ``text`` is the formulation-rewritten version actually read aloud, so
+        the UI can surface it. ``204 No Content`` when no TTS model is
+        configured (the cockpit treats this as "feature off"). ``502`` when a
+        model is configured but synthesis fails — so the button shows an error
+        instead of silently doing nothing.
     """
-    from services.tts import generate_message_tts
+    import base64
+
+    from services.tts import TtsSynthesisError, generate_message_tts
 
     user, thread = await require_thread_owner(request, postgres_db, thread_id)
 
@@ -13991,18 +13997,25 @@ async def synthesize_thread_message_tts(
     reformulate = bool(body.get("reformulate", True))
     language = (body.get("language") or "en").strip() or "en"
 
-    audio = await generate_message_tts(
-        content=content,
-        language=language,
-        reformulate=reformulate,
-        user_id=str(user["id"]),
-        postgres_db=postgres_db,
-    )
-    if audio is None:
+    try:
+        result = await generate_message_tts(
+            content=content,
+            language=language,
+            reformulate=reformulate,
+            user_id=str(user["id"]),
+            postgres_db=postgres_db,
+        )
+    except TtsSynthesisError as exc:
+        raise HTTPException(status_code=502, detail="Speech synthesis failed") from exc
+
+    if result is None:
         # 204: TTS disabled / not configured. The cockpit treats this as a
         # disabled-feature signal rather than an error.
         return Response(status_code=204)
-    return Response(content=audio, media_type="audio/mpeg")
+    spoken_text, audio = result
+    return JSONResponse(
+        {"text": spoken_text, "audio": base64.b64encode(audio).decode("ascii")}
+    )
 
 
 @app.post("/api/persistent/threads/{thread_id}/transcribe")

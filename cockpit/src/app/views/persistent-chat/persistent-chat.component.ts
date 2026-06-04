@@ -10,8 +10,10 @@ import {
     Injector,
     OnDestroy,
     OnInit,
+    QueryList,
     signal,
     ViewChild,
+    ViewChildren,
 } from '@angular/core';
 import {NgTemplateOutlet, TitleCasePipe} from '@angular/common';
 import {HttpClient} from '@angular/common/http';
@@ -66,8 +68,10 @@ interface SlashCommand {
 
 interface TtsMessageState {
     audioUrl?: string;
+    /** The spoken (formulation-rewritten) text actually read aloud, when it
+     *  differs from the message — shown in the collapsible "Spoken version". */
+    text?: string;
     isGenerating: boolean;
-    isPlaying: boolean;
     error: boolean;
 }
 
@@ -815,34 +819,56 @@ interface FileEditView {
                     }
                   }
 
-                  <!-- TTS button on the turn's final text. -->
+                  <!-- Read aloud: the button generates speech; once generated it
+                       is replaced by a native <audio> player, with the spoken
+                       (markdown-stripped) text in a collapsible panel below. -->
                   @if (last && !streaming) {
                     <div class="message-actions">
-                      <button
-                        type="button"
-                        class="msg-action-btn tts-btn"
-                        [class.is-playing]="ttsS.isPlaying"
-                        [class.is-error]="ttsS.error"
-                        [disabled]="ttsS.isGenerating"
-                        [title]="(
-                          ttsS.isPlaying ? 'chat.tts.stop' :
-                          ttsS.isGenerating ? 'chat.tts.generating' :
-                          ttsS.error ? 'chat.tts.error' :
-                          'chat.tts.play'
-                        ) | transloco"
-                        (click)="toggleTts(ttsKey, last.content)"
-                      >
-                        @if (ttsS.isGenerating) {
-                          <span class="action-spinner-sm"></span>
-                        } @else if (ttsS.isPlaying) {
-                          <app-icon size="sm">stop</app-icon>
-                        } @else if (ttsS.error) {
-                          <app-icon size="sm">error_outline</app-icon>
-                        } @else {
-                          <app-icon size="sm">volume_up</app-icon>
-                        }
-                      </button>
+                      @if (ttsS.audioUrl) {
+                        <audio
+                          #ttsAudioEl
+                          class="tts-player"
+                          controls
+                          preload="metadata"
+                          [src]="ttsS.audioUrl"
+                          (loadedmetadata)="onPlayerReady($event)"
+                          (play)="onPlayerPlay($event)"
+                        ></audio>
+                      } @else {
+                        <button
+                          type="button"
+                          class="msg-action-btn tts-btn"
+                          [class.is-error]="ttsS.error"
+                          [disabled]="ttsS.isGenerating"
+                          [title]="(
+                            ttsS.isGenerating ? 'chat.tts.generating' :
+                            ttsS.error ? 'chat.tts.error' :
+                            'chat.tts.play'
+                          ) | transloco"
+                          (click)="toggleTts(ttsKey, last.content)"
+                        >
+                          @if (ttsS.isGenerating) {
+                            <span class="action-spinner-sm"></span>
+                          } @else if (ttsS.error) {
+                            <app-icon size="sm">error_outline</app-icon>
+                          } @else {
+                            <app-icon size="sm">volume_up</app-icon>
+                          }
+                        </button>
+                      }
                     </div>
+                    <!-- Spoken version: only shown when formulation actually
+                         rewrote the text (otherwise it would just mirror the
+                         message bubble). Collapsed by default, like reasoning. -->
+                    @if (ttsS.audioUrl && ttsS.text && ttsS.text.trim() !== last.content.trim()) {
+                      <details class="thinking-block tts-spoken">
+                        <summary class="thinking-header">
+                          <app-icon size="sm" class="thinking-icon">graphic_eq</app-icon>
+                          <span class="thinking-label">{{ 'chat.tts.spokenVersion' | transloco }}</span>
+                        </summary>
+                        <div class="thinking-content tts-spoken-text">{{ ttsS.text }}</div>
+                      </details>
+                    }
                   }
                 </div>
               </div>
@@ -1338,8 +1364,10 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     // Per-turn TTS state. Keyed by a stable string ("turn:<id>") so playback
     // state survives across re-renders even if the turn list is reordered.
     readonly ttsState = signal<Record<string, TtsMessageState>>({});
-    private currentTtsAudio: HTMLAudioElement | null = null;
-    private currentTtsKey: string | null = null;
+    // The native <audio> players (one per generated turn). Used to pause the
+    // others when one starts — browsers happily play several at once otherwise.
+    @ViewChildren('ttsAudioEl')
+    private ttsPlayers?: QueryList<ElementRef<HTMLAudioElement>>;
     // Tracks blob URLs we've created so we can revoke them on destroy.
     private readonly ttsBlobUrls = new Set<string>();
 
@@ -1679,17 +1707,8 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         if (this.isRecording()) {
             this.voiceRecording.cancelRecording();
         }
-        // Tear down TTS playback + free blob URLs.
-        if (this.currentTtsAudio) {
-            try {
-                this.currentTtsAudio.pause();
-                this.currentTtsAudio.src = '';
-            } catch {
-                // ignore
-            }
-            this.currentTtsAudio = null;
-            this.currentTtsKey = null;
-        }
+        // Free TTS blob URLs. The native <audio> elements are torn down with
+        // the component's DOM, which stops any in-flight playback.
         this.ttsBlobUrls.forEach((url) => URL.revokeObjectURL(url));
         this.ttsBlobUrls.clear();
     }
@@ -1959,9 +1978,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
 
     /** Read state for a given turn key (always returns a defaulted object). */
     ttsStateFor(key: string): TtsMessageState {
-        return (
-            this.ttsState()[key] ?? {isGenerating: false, isPlaying: false, error: false}
-        );
+        return this.ttsState()[key] ?? {isGenerating: false, error: false};
     }
 
     /** Mutate state for one turn key. */
@@ -1973,33 +1990,18 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     }
 
     /**
-     * Play, pause, or generate-then-play TTS for an assistant turn's final text.
-     *
-     * - First click: fetch the audio (formulation + synthesis on the server),
-     *   then start playback.
-     * - Subsequent clicks: toggle play/pause on the cached blob.
+     * Generate (and then reveal) the spoken audio for an assistant turn's
+     * final text. Playback is owned by the native <audio controls> element
+     * that appears once `audioUrl` is set — this method only does the one-time
+     * fetch (formulation + synthesis run server-side).
      */
     async toggleTts(key: string, content: string): Promise<void> {
-        const state = this.ttsStateFor(key);
         const threadId = this.chat.threadId();
         if (!threadId || !content.trim()) return;
+        const state = this.ttsStateFor(key);
+        // Already fetching, or already generated (the player owns it from here).
+        if (state.isGenerating || state.audioUrl) return;
 
-        // Stop any other turn that's playing.
-        if (this.currentTtsKey !== null && this.currentTtsKey !== key) {
-            this.stopCurrentTts();
-        }
-
-        if (state.isPlaying) {
-            this.stopCurrentTts();
-            return;
-        }
-
-        if (state.audioUrl) {
-            this.playCachedTts(key, state.audioUrl);
-            return;
-        }
-
-        // Need to fetch the audio first.
         this.setTtsState(key, {isGenerating: true, error: false});
         const lang = this.i18n.activeLang().startsWith('de') ? 'de' : 'en';
         let result;
@@ -2012,69 +2014,40 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
             this.setTtsState(key, {isGenerating: false, error: true});
             return;
         }
+        // 'unavailable' (204) = no TTS model configured → stay silent, no error.
+        // null = a real failure (incl. 502 synthesis error) → show error state.
         if (result === null || result === 'unavailable') {
-            this.setTtsState(key, {
-                isGenerating: false,
-                error: result === null,
-            });
+            this.setTtsState(key, {isGenerating: false, error: result === null});
             return;
         }
-        const url = URL.createObjectURL(result);
+        const url = URL.createObjectURL(result.audio);
         this.ttsBlobUrls.add(url);
-        this.setTtsState(key, {isGenerating: false, audioUrl: url, error: false});
-        this.playCachedTts(key, url);
-    }
-
-    private playCachedTts(key: string, url: string): void {
-        if (!this.currentTtsAudio) {
-            this.currentTtsAudio = new Audio();
-            this.currentTtsAudio.addEventListener('ended', () => this.onTtsEnded());
-            this.currentTtsAudio.addEventListener('pause', () => this.onTtsPaused());
-            this.currentTtsAudio.addEventListener('error', () => this.onTtsError());
-        }
-        this.currentTtsAudio.src = url;
-        this.currentTtsKey = key;
-        this.setTtsState(key, {isPlaying: true});
-        this.currentTtsAudio.play().catch((e) => {
-            console.error('TTS playback failed', e);
-            this.setTtsState(key, {isPlaying: false, error: true});
-            this.currentTtsKey = null;
+        this.setTtsState(key, {
+            isGenerating: false,
+            audioUrl: url,
+            text: result.text,
+            error: false,
         });
     }
 
-    private stopCurrentTts(): void {
-        if (!this.currentTtsAudio || this.currentTtsKey === null) return;
-        try {
-            this.currentTtsAudio.pause();
-            this.currentTtsAudio.currentTime = 0;
-        } catch {
-            // ignore
-        }
-        const k = this.currentTtsKey;
-        this.currentTtsKey = null;
-        this.setTtsState(k, {isPlaying: false});
+    /**
+     * Autoplay a freshly-revealed player (best-effort). Browsers may block
+     * autoplay after the async generation gap; the visible native controls
+     * then let the user press play.
+     */
+    onPlayerReady(event: Event): void {
+        (event.target as HTMLAudioElement).play().catch(() => {
+            /* autoplay blocked — native controls remain available */
+        });
     }
 
-    private onTtsEnded(): void {
-        if (this.currentTtsKey === null) return;
-        const k = this.currentTtsKey;
-        this.currentTtsKey = null;
-        this.setTtsState(k, {isPlaying: false});
-    }
-
-    private onTtsPaused(): void {
-        if (this.currentTtsKey === null || !this.currentTtsAudio) return;
-        const a = this.currentTtsAudio;
-        if (a.ended || a.currentTime === 0) return;
-        const k = this.currentTtsKey;
-        this.setTtsState(k, {isPlaying: false});
-    }
-
-    private onTtsError(): void {
-        if (this.currentTtsKey === null) return;
-        const k = this.currentTtsKey;
-        this.currentTtsKey = null;
-        this.setTtsState(k, {isPlaying: false, error: true});
+    /** Pause every other turn's player when one starts — one voice at a time. */
+    onPlayerPlay(event: Event): void {
+        const active = event.target as HTMLAudioElement;
+        this.ttsPlayers?.forEach((ref) => {
+            const el = ref.nativeElement;
+            if (el !== active && !el.paused) el.pause();
+        });
     }
 
     // ===== Drag-and-drop file handling =====

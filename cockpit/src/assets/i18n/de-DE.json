@@ -983,7 +983,8 @@
       "play": "Vorlesen",
       "stop": "Vorlesen stoppen",
       "generating": "Sprache wird erzeugt…",
-      "error": "Sprache fehlgeschlagen — zum Wiederholen klicken"
+      "error": "Sprache fehlgeschlagen — zum Wiederholen klicken",
+      "spokenVersion": "Gesprochene Fassung"
     },
     "code": {
       "expandHint": "Klicken zum Ausklappen",

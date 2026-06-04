@@ -1847,13 +1847,32 @@
         cursor: wait;
       }
 
-      .tts-btn.is-playing {
-        color: var(--accent-color);
-        border-color: var(--accent-color);
-      }
-
       .tts-btn.is-error {
         color: var(--danger, #c44);
+      }
+
+      /* Native <audio> player shown once a turn's speech is generated. The
+         surrounding .message-actions dims to 0.55 until hover — right for the
+         tiny button, but a player should stay fully visible (and a child can't
+         raise its parent's composited opacity, so override on the parent). */
+      .message-actions:has(.tts-player) {
+        opacity: 1;
+      }
+
+      .tts-player {
+        width: 100%;
+        max-width: 320px;
+        height: 32px;
+      }
+
+      /* "Spoken version" disclosure — reuses .thinking-block styling; the text
+         is already markdown-stripped prose, so just preserve its line breaks. */
+      .tts-spoken {
+        margin-top: 6px;
+      }
+
+      .tts-spoken .tts-spoken-text {
+        white-space: pre-wrap;
       }
 
       .action-spinner-sm {

@@ -983,7 +983,8 @@
       "play": "Read aloud",
       "stop": "Stop reading",
       "generating": "Generating speech…",
-      "error": "Speech failed — click to retry"
+      "error": "Speech failed — click to retry",
+      "spokenVersion": "Spoken version"
     },
     "code": {
       "expandHint": "Click to expand",

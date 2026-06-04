@@ -295,6 +295,19 @@ function hintsToCapabilities(
               </app-form-field>
             </div>
 
+            @if (formCapabilities().includes('tts')) {
+              <div class="form-row">
+                <app-form-field label="Voice (optional)">
+                  <app-input
+                    [value]="formVoice()"
+                    placeholder="e.g. af_heart, alloy, nova — depends on the TTS backend"
+                    [disabled]="creating()"
+                    (changed)="formVoice.set($event)"
+                  />
+                </app-form-field>
+              </div>
+            }
+
             @if (formError()) {
               <p class="form-error">{{ formError() }}</p>
             }
@@ -505,6 +518,10 @@ export class AdminModelsComponent implements OnInit {
   readonly formDisplayLabel = signal('');
   readonly formFamily = signal('default');
   readonly formContextWindow = signal<number | null>(null);
+  // Optional TTS voice (e.g. Kokoro af_heart, OpenAI alloy) — persisted into
+  // the catalog row's params_json and read by the TTS service. Only sent when
+  // the tts capability is selected.
+  readonly formVoice = signal('');
 
   // Mirror for the number input — keeps an empty string when null so the
   // input renders blank instead of "0".
@@ -708,6 +725,10 @@ export class AdminModelsComponent implements OnInit {
       this.formError.set('Select at least one capability.');
       return;
     }
+    const voice = this.formVoice().trim();
+    // Voice rides in the catalog row's params_json; only meaningful for TTS.
+    const paramsJson =
+      capabilities.includes('tts') && voice ? {voice} : undefined;
     this.creating.set(true);
     this.models
       .createModel({
@@ -718,12 +739,14 @@ export class AdminModelsComponent implements OnInit {
         capabilities,
         family: this.formFamily().trim(),
         context_window: this.formContextWindow() ?? null,
+        params_json: paramsJson,
       })
       .subscribe({
         next: () => {
           this.formModelId.set('');
           this.formDisplayLabel.set('');
           this.formContextWindow.set(null);
+          this.formVoice.set('');
           this.creating.set(false);
         },
         error: (err) => {
