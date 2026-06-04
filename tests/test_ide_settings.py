@@ -780,4 +780,6 @@ class TestSeedForUserInstallsExtensions:
         assert ok is True
         joined = "\n".join(scripts)
         assert "settings.json" in joined  # files seeded
-        assert "monokai.theme-monokai-pro-vscode@2.0.13" in joined  # extension installed
+        assert (
+            "monokai.theme-monokai-pro-vscode@2.0.13" in joined
+        )  # extension installed
