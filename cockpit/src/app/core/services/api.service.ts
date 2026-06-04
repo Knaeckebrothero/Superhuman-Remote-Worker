@@ -825,26 +825,45 @@ export class ApiService {
     threadId: string,
     content: string,
     options: {reformulate?: boolean; language?: string} = {},
-  ): Observable<Blob | 'unavailable' | null> {
+  ): Observable<{text: string; audio: Blob} | 'unavailable' | null> {
+    // The endpoint returns JSON {text, audio} where `text` is the spoken
+    // (formulation-rewritten) version actually read aloud and `audio` is the
+    // base64-encoded MP3. 204 → no TTS model configured ('unavailable');
+    // any error (incl. 502 synthesis failure) → null so the caller can show
+    // an error state.
     return this.http
-      .post(
+      .post<{text: string; audio: string}>(
         `${this.baseUrl}/persistent/threads/${threadId}/tts`,
         {
           content,
           reformulate: options.reformulate ?? true,
           language: options.language ?? 'en',
         },
-        {responseType: 'blob', observe: 'response'},
+        {observe: 'response'},
       )
       .pipe(
-        map((resp) =>
-          resp.status === 204 ? ('unavailable' as const) : (resp.body as Blob),
-        ),
+        map((resp) => {
+          if (resp.status === 204 || !resp.body) return 'unavailable' as const;
+          return {
+            text: resp.body.text ?? '',
+            audio: this.decodeBase64ToBlob(resp.body.audio, 'audio/mpeg'),
+          };
+        }),
         catchError((error) => {
           console.error(`Failed to generate TTS for thread ${threadId}:`, error);
           return of(null);
         }),
       );
+  }
+
+  /** Decode a base64 string into a typed Blob (used for TTS MP3 payloads). */
+  private decodeBase64ToBlob(base64: string, mime: string): Blob {
+    const binary = atob(base64 ?? '');
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    return new Blob([bytes], {type: mime});
   }
 
   /**

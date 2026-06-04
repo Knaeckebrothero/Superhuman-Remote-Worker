@@ -82,6 +82,13 @@ secrets:
     # Admin → Models with family "deepseek".
     OPENROUTER_API_KEY: ""
 
+    # --- Web search (Tavily) — a search engine, not an LLM, so it is NOT
+    # seeded into system_api_keys. It rides as a plain env var: this value
+    # lands in the `srw` Secret and every agent pod picks it up via envFrom
+    # (agent_provisioner.py). Get a key at https://app.tavily.com, paste it
+    # below, then `helm upgrade`. See docs/api_key_resolution.md.
+    TAVILY_API_KEY: ""
+
     # --- App DBs ---
     POSTGRES_USER: "srw"
     POSTGRES_PASSWORD: "dev_pg_password"

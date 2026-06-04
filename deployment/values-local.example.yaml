@@ -82,6 +82,12 @@ secrets:
     ANTHROPIC_API_KEY: ""
     GROQ_API_KEY: ""
 
+    # Web search key for the agent's web_search / extract / crawl / map tools.
+    # Tavily is a search engine, not an LLM — it is NOT DB-seeded; this value
+    # flows through the `srw` Secret into agent pods via envFrom. Get a key at
+    # https://app.tavily.com (free tier available), then `helm upgrade`.
+    TAVILY_API_KEY: ""
+
     # App DBs (dev passwords, never rotate locally)
     POSTGRES_USER: "srw"
     POSTGRES_PASSWORD: "dev_pg_password"
