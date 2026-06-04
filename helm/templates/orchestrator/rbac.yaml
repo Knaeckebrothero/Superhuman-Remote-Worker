@@ -35,6 +35,14 @@ rules:
   - apiGroups: [""]
     resources: ["persistentvolumeclaims"]
     verbs: ["create", "delete", "get", "list"]
+  # Per-workspace code-server settings seed ConfigMap (IdeSettingsStore →
+  # container_provisioner._create_seed_configmap). Created at provision,
+  # replaced on conflict (update), adopted via ownerReference (patch), and
+  # GC'd on teardown (delete). Without this the seed step 403s and the
+  # workspace boots with default IDE settings instead of the user's.
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["create", "delete", "get", "list", "patch", "update"]
   # Session router: per-session Service + Ingress lifecycle managed by
   # SessionRouterService when a thread binds to an agent. See
   # docs/features/direct_session_websockets.md §RBAC changes.

@@ -8,6 +8,7 @@ with fallback, timeout, tool execution loop, VM upgrade detection).
 """
 
 import asyncio
+import logging
 from typing import List
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -893,8 +894,123 @@ class TestAutoCommitGit:
         git_mgr.commit.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_push_fires_on_5th_turn(self):
-        """Git push fires when turn_count % 5 == 0, independent of commit."""
+    async def test_push_fires_every_committing_turn_not_throttled(self):
+        """Push fires on a normal turn even when turn_count is not a multiple
+        of 5 — the old every-5th-turn throttle is gone."""
+        response_with_tool = AIMessage(
+            content="",
+            tool_calls=[{"name": "test_tool", "args": {}, "id": "tc1"}],
+        )
+        final_response = _make_llm_response("ok")
+
+        stream_count = 0
+
+        async def _astream(messages, **kw):
+            nonlocal stream_count
+            stream_count += 1
+            if stream_count % 2 == 1:
+                yield response_with_tool
+            else:
+                yield final_response
+
+        llm = AsyncMock()
+        llm.reasoning = None
+        llm.astream = _astream
+
+        tool = _make_tool("test_tool", "r")
+
+        git_mgr = MagicMock()
+        git_mgr.is_active = True
+        git_mgr.has_uncommitted_changes.return_value = True
+        git_mgr.has_unpushed_commits.return_value = True
+        git_mgr.push.return_value = True
+
+        ws_mgr = MagicMock()
+        ws_mgr.git_manager = git_mgr
+        ws_mgr.read_file.return_value = ""
+
+        tool_ctx = MagicMock()
+        tool_ctx.workspace_manager = ws_mgr
+        tool_ctx.consume_freeze_request.return_value = None
+
+        turns = 0
+
+        async def _input():
+            nonlocal turns
+            turns += 1
+            if turns == 1:
+                return "turn 1"
+            raise asyncio.CancelledError
+
+        callbacks = _make_callbacks(get_user_input=_input)
+
+        await run_persistent_loop(
+            llm_with_tools=llm,
+            tools=[tool],
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
+            config=_make_config(),
+            system_prompt="sys",
+            callbacks=callbacks,
+            messages=[],
+            tool_context=tool_ctx,
+        )
+
+        # Turn 1 is not a multiple of 5, but the commit must still be pushed.
+        git_mgr.push.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_push_fires_on_no_tool_turn_when_commits_unpushed(self):
+        """Regression: a session ending on a no-tool turn must still flush
+        previously-committed-but-unpushed work to the remote."""
+        response = _make_llm_response("Just text, no tools")
+
+        git_mgr = MagicMock()
+        git_mgr.is_active = True
+        git_mgr.has_unpushed_commits.return_value = True
+        git_mgr.push.return_value = True
+
+        ws_mgr = MagicMock()
+        ws_mgr.git_manager = git_mgr
+        ws_mgr.read_file.return_value = ""
+
+        tool_ctx = MagicMock()
+        tool_ctx.workspace_manager = ws_mgr
+        tool_ctx.consume_freeze_request.return_value = None
+
+        turns = 0
+
+        async def _input():
+            nonlocal turns
+            turns += 1
+            if turns == 1:
+                return "thanks!"
+            raise asyncio.CancelledError
+
+        callbacks = _make_callbacks(get_user_input=_input)
+
+        await run_persistent_loop(
+            llm_with_tools=_make_streaming_llm(response),
+            tools=[],
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
+            config=_make_config(),
+            system_prompt="sys",
+            callbacks=callbacks,
+            messages=[],
+            tool_context=tool_ctx,
+        )
+
+        # No tools this turn, but unpushed commits exist → must still push.
+        git_mgr.push.assert_called_once()
+        git_mgr.commit.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_no_push_when_nothing_unpushed(self):
+        """Push is skipped (no needless network round-trip) when the branch has
+        no unpushed commits — even across a 5th turn the old throttle pushed on."""
         response_with_tool = AIMessage(
             content="",
             tool_calls=[{"name": "test_tool", "args": {}, "id": "tc1"}],
@@ -920,6 +1036,7 @@ class TestAutoCommitGit:
         git_mgr = MagicMock()
         git_mgr.is_active = True
         git_mgr.has_uncommitted_changes.return_value = False
+        git_mgr.has_unpushed_commits.return_value = False
 
         ws_mgr = MagicMock()
         ws_mgr.git_manager = git_mgr
@@ -953,8 +1070,74 @@ class TestAutoCommitGit:
             tool_context=tool_ctx,
         )
 
-        # push should have been called once (at turn 5)
-        git_mgr.push.assert_called_once()
+        git_mgr.push.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_push_failure_is_logged_as_warning(self, caplog):
+        """A failed push is surfaced (warning), not silently swallowed — the
+        commits remain only on the workspace pod until a later push succeeds."""
+        response_with_tool = AIMessage(
+            content="",
+            tool_calls=[{"name": "test_tool", "args": {}, "id": "tc1"}],
+        )
+        final_response = _make_llm_response("ok")
+
+        stream_count = 0
+
+        async def _astream(messages, **kw):
+            nonlocal stream_count
+            stream_count += 1
+            if stream_count == 1:
+                yield response_with_tool
+            else:
+                yield final_response
+
+        llm = AsyncMock()
+        llm.reasoning = None
+        llm.astream = _astream
+
+        tool = _make_tool("test_tool", "r")
+
+        git_mgr = MagicMock()
+        git_mgr.is_active = True
+        git_mgr.has_uncommitted_changes.return_value = False
+        git_mgr.has_unpushed_commits.return_value = True
+        git_mgr.push.return_value = False  # push fails
+
+        ws_mgr = MagicMock()
+        ws_mgr.git_manager = git_mgr
+        ws_mgr.read_file.return_value = ""
+
+        tool_ctx = MagicMock()
+        tool_ctx.workspace_manager = ws_mgr
+        tool_ctx.consume_freeze_request.return_value = None
+
+        turns = 0
+
+        async def _input():
+            nonlocal turns
+            turns += 1
+            if turns == 1:
+                return "go"
+            raise asyncio.CancelledError
+
+        callbacks = _make_callbacks(get_user_input=_input)
+
+        with caplog.at_level(logging.WARNING):
+            await run_persistent_loop(
+                llm_with_tools=llm,
+                tools=[tool],
+                context_manager=AsyncMock(
+                    ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+                ),
+                config=_make_config(),
+                system_prompt="sys",
+                callbacks=callbacks,
+                messages=[],
+                tool_context=tool_ctx,
+            )
+
+        assert "push failed" in caplog.text.lower()
 
     @pytest.mark.asyncio
     async def test_git_exception_is_non_fatal(self):
