@@ -18,6 +18,7 @@ from orchestrator.services.ide_settings import (
     CODE_SERVER_USER_DIR,
     IdeSettingsStore,
     OpenVsxClassifier,
+    build_extension_install_script,
     build_extensions_list_script,
     build_seed_script,
     parse_extensions_list,
@@ -670,3 +671,32 @@ class TestExtensionStore:
         )
         files = await store.get_ide_files(UID)
         assert files["settings.json"] == _f("x", 1.0)  # not clobbered by shallow merge
+
+
+class TestExtensionInstallScript:
+    def test_empty_is_noop(self):
+        assert build_extension_install_script({}) == "exit 0\n"
+
+    def test_only_openvsx_items_installed(self):
+        items = {
+            "monokai.theme-monokai-pro-vscode": {
+                "version": "2.0.13",
+                "source": "openvsx",
+                "theme": True,
+            },
+            "ms-python.python": {
+                "version": "2024.4.1",
+                "source": "openvsx",
+                "theme": False,
+            },
+            "acme.private": {"version": "1.0.0", "source": "bytes", "theme": False},
+        }
+        script = build_extension_install_script(items)
+        assert "monokai.theme-monokai-pro-vscode@2.0.13" in script
+        assert "ms-python.python@2024.4.1" in script
+        assert "acme.private" not in script  # bytes source not installed here
+        assert "--extensions-dir /var/lib/code-server/extensions" in script
+        # theme installs synchronously before the backgrounded block
+        theme_idx = script.index("monokai.theme-monokai-pro-vscode")
+        bg_idx = script.index("ms-python.python")
+        assert theme_idx < bg_idx
