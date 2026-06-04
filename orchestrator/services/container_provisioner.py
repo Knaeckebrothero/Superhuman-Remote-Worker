@@ -186,7 +186,8 @@ class ContainerProvisioner:
         # Seed the user's saved code-server config (theme/keybindings/snippets)
         # into the pod before it starts. Best-effort — never blocks provisioning.
         seed_files = await self._resolve_ide_seed_files(owner)
-        seed_cm = await self._create_seed_configmap(pod_name, seed_files)
+        seed_exts = await self._resolve_ide_extensions(owner)
+        seed_cm = await self._create_seed_configmap(pod_name, seed_files, seed_exts)
 
         # emptyDir by default — storage dies with the pod, no cleanup needed.
         # Each job/session gets a fresh container; isolation is the pod boundary.
@@ -491,7 +492,8 @@ class ContainerProvisioner:
 
         owner = WorkspaceOwner.job(job_id)
         seed_files = await self._resolve_ide_seed_files(owner)
-        seed_cm = await self._create_seed_configmap(pod_name, seed_files)
+        seed_exts = await self._resolve_ide_extensions(owner)
+        seed_cm = await self._create_seed_configmap(pod_name, seed_files, seed_exts)
 
         pod_manifest = self._build_pod_manifest(
             pod_name=pod_name,
@@ -709,25 +711,63 @@ class ContainerProvisioner:
             )
             return {}
 
+    async def _resolve_ide_extensions(self, owner: WorkspaceOwner) -> dict:
+        """Fetch the owner-user's stored extension manifest items. ``{}`` on miss."""
+        if not self._db:
+            return {}
+        try:
+            if owner.kind == "job":
+                row = await self._db.get_job(owner.id)
+            else:
+                row = await self._db.get_thread(owner.id)
+            if not isinstance(row, dict):
+                return {}
+            user_id = row.get("user_id")
+            if not user_id:
+                return {}
+            from services.ide_settings import IdeSettingsStore
+
+            return await IdeSettingsStore(self._db).get_extensions(str(user_id))
+        except Exception as e:
+            logger.warning(
+                "ide seed: failed to resolve extensions for %s %s: %s",
+                owner.kind,
+                owner.id,
+                e,
+            )
+            return {}
+
     def _seed_configmap_name(self, pod_name: str) -> str:
         return f"code-server-config-{pod_name}"
 
-    async def _create_seed_configmap(self, pod_name: str, files: dict) -> Optional[str]:
+    async def _create_seed_configmap(
+        self, pod_name: str, files: dict, extensions: Optional[dict] = None
+    ) -> Optional[str]:
         """Create a ConfigMap carrying a self-contained ``seed.sh`` for the pod.
 
-        Returns the ConfigMap name, or None when there is nothing to seed (or on
-        failure — seeding is best-effort and must never block provisioning).
+        ``seed.sh`` writes the user's config files and installs their Open-VSX
+        extensions (theme-first). Returns the ConfigMap name, or None when there
+        is nothing to seed (or on failure — seeding is best-effort and must never
+        block provisioning).
         """
-        if not files or not self._core_api:
+        if (not files and not extensions) or not self._core_api:
             return None
-        from services.ide_settings import build_seed_script
+        from services.ide_settings import (
+            build_extension_install_script,
+            build_seed_script,
+        )
 
         cm_name = self._seed_configmap_name(pod_name)
+        seed_sh = (
+            build_seed_script(files)
+            + "\n"
+            + build_extension_install_script(extensions or {})
+        )
         body = {
             "apiVersion": "v1",
             "kind": "ConfigMap",
             "metadata": {"name": cm_name, "namespace": self._namespace},
-            "data": {"seed.sh": build_seed_script(files)},
+            "data": {"seed.sh": seed_sh},
         }
         try:
             await asyncio.to_thread(
