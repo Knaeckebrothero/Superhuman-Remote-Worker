@@ -155,6 +155,53 @@ def parse_extensions_list(stdout: str) -> dict[str, dict]:
     return result
 
 
+OPEN_VSX_API = "https://open-vsx.org/api"
+
+# Fetch signature: (url) -> http_status_int
+VsxFetch = Callable[[str], Awaitable[int]]
+
+
+async def _default_vsx_fetch(url: str) -> int:
+    """GET an Open VSX API URL; return the HTTP status. Runs urllib in a thread to
+    stay dependency-light (no aiohttp import at module load)."""
+    import urllib.error
+    import urllib.request
+
+    def _get() -> int:
+        req = urllib.request.Request(url, method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                return resp.status
+        except urllib.error.HTTPError as e:
+            return e.code
+
+    return await asyncio.to_thread(_get)
+
+
+class OpenVsxClassifier:
+    """Classify an extension as installable from Open VSX (``"openvsx"``) or
+    requiring byte-copy (``"bytes"``). Caches by (id, version). On any error,
+    defaults to ``"bytes"`` — the safe side (we'll carry the bytes ourselves)."""
+
+    def __init__(self, fetch: Optional[VsxFetch] = None) -> None:
+        self._fetch = fetch or _default_vsx_fetch
+        self._cache: dict[tuple[str, str], str] = {}
+
+    async def classify(self, ext_id: str, version: str) -> str:
+        key = (ext_id, version)
+        if key in self._cache:
+            return self._cache[key]
+        ns, _, name = ext_id.partition(".")
+        url = f"{OPEN_VSX_API}/{ns}/{name}/{version}"
+        try:
+            status = await self._fetch(url)
+            source = "openvsx" if status == 200 else "bytes"
+        except Exception:  # noqa: BLE001 — classification must never raise
+            source = "bytes"
+        self._cache[key] = source
+        return source
+
+
 def resolve_ssh_target(context: dict) -> Optional[tuple[str, int]]:
     """Resolve a workspace context to an ``(ssh_host, ssh_port)`` pair.
 
