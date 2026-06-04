@@ -623,3 +623,50 @@ class TestOpenVsxClassifier:
 
         clf = OpenVsxClassifier(fetch=boom)
         assert await clf.classify("a.b", "1.0.0") == "bytes"
+
+
+class TestExtensionStore:
+    @pytest.mark.asyncio
+    async def test_apply_then_get_roundtrip(self):
+        db = FakeSettingsDB()
+        store = IdeSettingsStore(db)
+        items = {
+            "monokai.theme-monokai-pro-vscode": {
+                "version": "2.0.13",
+                "source": "openvsx",
+                "theme": True,
+            }
+        }
+        changed = await store.apply_extensions(UID, items)
+        assert changed == ["monokai.theme-monokai-pro-vscode"]
+        got = await store.get_extensions(UID)
+        assert got["monokai.theme-monokai-pro-vscode"]["version"] == "2.0.13"
+
+    @pytest.mark.asyncio
+    async def test_newer_version_wins_union_across_calls(self):
+        db = FakeSettingsDB()
+        store = IdeSettingsStore(db)
+        await store.apply_extensions(
+            UID, {"a.b": {"version": "1.0.0", "source": "openvsx", "theme": False}}
+        )
+        # second workspace has a.b older + a new extension c.d
+        await store.apply_extensions(
+            UID,
+            {
+                "a.b": {"version": "0.9.0", "source": "openvsx", "theme": False},
+                "c.d": {"version": "3.1.0", "source": "openvsx", "theme": False},
+            },
+        )
+        got = await store.get_extensions(UID)
+        assert got["a.b"]["version"] == "1.0.0"  # newer kept (union, not clobber)
+        assert got["c.d"]["version"] == "3.1.0"  # new one added
+
+    @pytest.mark.asyncio
+    async def test_apply_preserves_sibling_files_subtree(self):
+        db = FakeSettingsDB({UID: {"ide": {"files": {"settings.json": _f("x", 1.0)}}}})
+        store = IdeSettingsStore(db)
+        await store.apply_extensions(
+            UID, {"a.b": {"version": "1.0.0", "source": "openvsx", "theme": False}}
+        )
+        files = await store.get_ide_files(UID)
+        assert files["settings.json"] == _f("x", 1.0)  # not clobbered by shallow merge
