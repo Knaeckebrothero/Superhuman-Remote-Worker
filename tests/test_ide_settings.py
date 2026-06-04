@@ -741,3 +741,43 @@ class TestReconcileExtensions:
                 return "openvsx"
 
         assert await reconcile_extensions(store, workspaces, list_fn, FakeClf()) == 0
+
+
+class TestSeedForUserInstallsExtensions:
+    @pytest.mark.asyncio
+    async def test_seeds_files_and_installs_openvsx_extensions(self):
+        db = FakeSettingsDB(
+            {
+                UID: {
+                    "ide": {
+                        "files": {
+                            "settings.json": _f(
+                                '{"workbench.colorTheme":"Monokai Pro"}', 5.0
+                            )
+                        },
+                        "extensions": {
+                            "items": {
+                                "monokai.theme-monokai-pro-vscode": {
+                                    "version": "2.0.13",
+                                    "source": "openvsx",
+                                    "theme": True,
+                                }
+                            }
+                        },
+                    }
+                }
+            }
+        )
+        scripts = []
+
+        async def fake_runner(host, port, script, key_path=None, timeout=20):
+            scripts.append(script)
+            return 0, b"", b""
+
+        ok = await seed_ide_config_for_user(
+            db, UID, "10.0.0.5", 30022, _runner=fake_runner
+        )
+        assert ok is True
+        joined = "\n".join(scripts)
+        assert "settings.json" in joined  # files seeded
+        assert "monokai.theme-monokai-pro-vscode@2.0.13" in joined  # extension installed
