@@ -700,9 +700,7 @@ class GitManager:
 
             # Count commits reachable from HEAD but not from the remote-tracking
             # ref. Reads the local ref only — no fetch required.
-            result = self._run_git(
-                ["rev-list", "--count", f"{remote}/{branch}..HEAD"]
-            )
+            result = self._run_git(["rev-list", "--count", f"{remote}/{branch}..HEAD"])
             if result.returncode != 0:
                 # The remote-tracking ref doesn't exist yet (nothing has ever
                 # been pushed). Any commit on HEAD is therefore unpushed.

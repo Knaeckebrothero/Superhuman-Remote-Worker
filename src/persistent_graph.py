@@ -420,9 +420,7 @@ async def run_persistent_loop(
                 if tool_calls_this_turn > 0:
                     try:
                         if git_mgr.has_uncommitted_changes():
-                            if not git_mgr.commit(
-                                f"Auto-commit after turn {turn_id}"
-                            ):
+                            if not git_mgr.commit(f"Auto-commit after turn {turn_id}"):
                                 logger.warning(
                                     f"Turn {turn_id}: workspace auto-commit failed"
                                 )
