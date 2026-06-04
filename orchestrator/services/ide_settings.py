@@ -265,6 +265,40 @@ def build_seed_script(files: dict[str, dict]) -> str:
     return "".join(parts)
 
 
+def build_extension_install_script(items: dict[str, dict]) -> str:
+    """Shell that installs the user's Open-VSX extensions via the code-server CLI,
+    run as ``agent-host``. Theme providers install **synchronously first** so the
+    color theme is present when code-server first paints; the rest install in the
+    background. Only ``source == "openvsx"`` items are handled here — ``bytes``
+    items arrive via the orchestrator state stream (Phase B). Best-effort: a
+    single failed install must not abort the rest (``|| true``)."""
+    openvsx = {k: v for k, v in items.items() if v.get("source") == "openvsx"}
+    if not openvsx:
+        return "exit 0\n"
+
+    def _install(ext_id: str, version: str) -> str:
+        ref = _shq(f"{ext_id}@{version}")
+        return (
+            f"su -c 'code-server --install-extension {ref} "
+            f"--extensions-dir {EXTENSIONS_DIR}' agent-host || true\n"
+        )
+
+    themes = [(k, v["version"]) for k, v in openvsx.items() if v.get("theme")]
+    rest = [(k, v["version"]) for k, v in openvsx.items() if not v.get("theme")]
+
+    parts = [f"mkdir -p {EXTENSIONS_DIR}\n"]
+    for ext_id, version in themes:  # synchronous, theme-first
+        parts.append(_install(ext_id, version))
+    if rest:  # background the long tail
+        parts.append("(\n")
+        for ext_id, version in rest:
+            parts.append(_install(ext_id, version))
+        parts.append(f"chown -R agent-host:agent-host {EXTENSIONS_DIR}\n")
+        parts.append(") &\n")
+    parts.append(f"chown -R agent-host:agent-host {EXTENSIONS_DIR}\n")
+    return "".join(parts)
+
+
 # Runner signature: (host, port, remote_script, key_path, timeout) -> (rc, stdout, stderr)
 SshRunner = Callable[..., Awaitable[tuple[int, Any, Any]]]
 
