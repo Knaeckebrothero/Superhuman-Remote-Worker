@@ -405,20 +405,46 @@ async def run_persistent_loop(
         turn_metrics = result.metrics if result else None
         await callbacks.on_turn_complete(turn_id, turn_metrics)
 
-        # Auto-commit workspace changes after tool-executing turns.
-        # Push is throttled to every 5th turn so the upstream gets a
-        # checkpoint without paying a network round-trip per turn.
-        if tool_calls_this_turn > 0 and tool_context:
+        # Auto-commit workspace changes after tool-executing turns, then push
+        # so the remote — which the version-history UI reads — stays current.
+        # The push runs on EVERY turn (no turn-count throttle) and regardless
+        # of whether this turn used tools, so commits can't be stranded locally
+        # when a session ends on a no-tool turn. has_unpushed_commits() is a
+        # local-ref check, so turns with nothing to push skip the network.
+        # Commit/push failures are surfaced (warning) rather than swallowed:
+        # unpushed commits live only on the workspace pod until a push succeeds.
+        if tool_context:
             ws_mgr = getattr(tool_context, "workspace_manager", None)
             git_mgr = getattr(ws_mgr, "git_manager", None) if ws_mgr else None
             if git_mgr and git_mgr.is_active:
+                if tool_calls_this_turn > 0:
+                    try:
+                        if git_mgr.has_uncommitted_changes():
+                            if not git_mgr.commit(
+                                f"Auto-commit after turn {turn_id}"
+                            ):
+                                logger.warning(
+                                    f"Turn {turn_id}: workspace auto-commit failed"
+                                )
+                    except Exception:
+                        logger.warning(
+                            f"Turn {turn_id}: workspace auto-commit raised",
+                            exc_info=True,
+                        )
                 try:
-                    if git_mgr.has_uncommitted_changes():
-                        git_mgr.commit(f"Auto-commit after turn {turn_id}")
-                    if turn_count % 5 == 0:
-                        git_mgr.push()
-                except Exception as e:
-                    logger.debug(f"Git auto-commit/push failed (non-fatal): {e}")
+                    if git_mgr.has_unpushed_commits():
+                        if not git_mgr.push():
+                            logger.warning(
+                                f"Turn {turn_id}: workspace git push failed — "
+                                "unpushed commits remain only on the workspace "
+                                "pod and will not appear in the version history "
+                                "until a later push succeeds"
+                            )
+                except Exception:
+                    logger.warning(
+                        f"Turn {turn_id}: workspace git push raised",
+                        exc_info=True,
+                    )
 
         logger.info(
             f"Turn {turn_id} complete: {tool_calls_this_turn} tool calls, "

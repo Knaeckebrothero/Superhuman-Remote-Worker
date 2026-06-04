@@ -41,6 +41,19 @@ def initialized_git(temp_workspace):
     return gm
 
 
+@pytest.fixture
+def bare_remote():
+    """Create a local bare repository to act as a push remote."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        remote = Path(tmpdir) / "remote.git"
+        subprocess.run(
+            ["git", "init", "--bare", str(remote)],
+            check=True,
+            capture_output=True,
+        )
+        yield remote
+
+
 def git_available():
     """Check if git is available on the system."""
     return shutil.which("git") is not None
@@ -50,6 +63,41 @@ def git_available():
 pytestmark = pytest.mark.skipif(
     not git_available(), reason="Git not available on system"
 )
+
+
+class TestHasUnpushedCommits:
+    """Tests for has_unpushed_commits (drives per-turn push decisions)."""
+
+    def test_false_when_no_remote(self, initialized_git):
+        """No remote configured → nothing to push."""
+        assert initialized_git.has_unpushed_commits() is False
+
+    def test_true_when_remote_configured_but_never_pushed(
+        self, initialized_git, bare_remote
+    ):
+        """Remote exists but nothing pushed yet → the initial commit is unpushed."""
+        initialized_git.add_remote("origin", str(bare_remote))
+        assert initialized_git.has_unpushed_commits() is True
+
+    def test_false_after_push(self, initialized_git, bare_remote):
+        """After a successful push the branch is fully synced."""
+        initialized_git.add_remote("origin", str(bare_remote))
+        assert initialized_git.push() is True
+        assert initialized_git.has_unpushed_commits() is False
+
+    def test_true_after_new_commit_following_push(
+        self, initialized_git, temp_workspace, bare_remote
+    ):
+        """A commit made after the last push counts as unpushed."""
+        initialized_git.add_remote("origin", str(bare_remote))
+        initialized_git.push()
+        (temp_workspace / "new.txt").write_text("change")
+        initialized_git.commit("add new file")
+        assert initialized_git.has_unpushed_commits() is True
+
+    def test_false_when_inactive(self, git_manager):
+        """Uninitialized repo → False (no crash)."""
+        assert git_manager.has_unpushed_commits() is False
 
 
 class TestGitManagerInit:
