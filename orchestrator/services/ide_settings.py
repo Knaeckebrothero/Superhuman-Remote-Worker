@@ -498,6 +498,89 @@ async def reconcile_ide_settings(
     return updated_total
 
 
+# List-fn signature: (host, port) -> {id: {version, theme}}
+ListFn = Callable[[str, int], Awaitable[dict]]
+
+
+async def list_ide_extensions(
+    ssh_host: str,
+    ssh_port: int,
+    *,
+    key_path: Optional[str] = None,
+    timeout: int = 20,
+    _runner: Optional[SshRunner] = None,
+) -> dict[str, dict]:
+    """SSH into a workspace and return installed extensions. Never raises."""
+    runner = _runner or _default_ssh_runner
+    try:
+        rc, stdout, _ = await runner(
+            ssh_host,
+            ssh_port,
+            build_extensions_list_script(),
+            key_path=key_path,
+            timeout=timeout,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "ide_settings: ext-list failed for %s:%s — %s", ssh_host, ssh_port, e
+        )
+        return {}
+    if rc != 0:
+        return {}
+    text = (
+        stdout.decode("utf-8", "replace")
+        if isinstance(stdout, (bytes, bytearray))
+        else (stdout or "")
+    )
+    return parse_extensions_list(text)
+
+
+async def reconcile_extensions(
+    store: "IdeSettingsStore",
+    workspaces: list[dict],
+    list_fn: ListFn,
+    classifier: "OpenVsxClassifier",
+) -> int:
+    """For each workspace, list extensions, classify each (openvsx|bytes), and
+    merge into the user's manifest. Returns the count of ids added/bumped.
+    Order-independent and failure-isolated like ``reconcile_ide_settings``."""
+    changed_total = 0
+    for ws in workspaces:
+        user_id = ws.get("user_id")
+        if not user_id:
+            continue
+        target = resolve_ssh_target(_coerce_context(ws.get("context")))
+        if not target:
+            continue
+        host, port = target
+        try:
+            listed = await list_fn(host, port)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "ide_settings: ext reconcile list failed for %s:%s — %s", host, port, e
+            )
+            continue
+        if not listed:
+            continue
+        items: dict[str, dict] = {}
+        for ext_id, info in listed.items():
+            source = await classifier.classify(ext_id, info.get("version", ""))
+            items[ext_id] = {
+                "version": info.get("version", ""),
+                "source": source,
+                "theme": bool(info.get("theme")),
+            }
+        try:
+            changed = await store.apply_extensions(str(user_id), items)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "ide_settings: ext reconcile apply failed for user %s — %s", user_id, e
+            )
+            continue
+        changed_total += len(changed)
+    return changed_total
+
+
 def _ver_key(v: str) -> tuple:
     """Sort key for version strings: numeric-aware, falls back to string parts.
     ``"2.0.13"`` > ``"2.0.9"``; non-numeric segments compare lexicographically."""
