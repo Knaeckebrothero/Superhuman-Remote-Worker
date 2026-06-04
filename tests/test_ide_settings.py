@@ -17,7 +17,9 @@ import pytest
 from orchestrator.services.ide_settings import (
     CODE_SERVER_USER_DIR,
     IdeSettingsStore,
+    build_extensions_list_script,
     build_seed_script,
+    parse_extensions_list,
     parse_pull_output,
     pull_ide_config,
     reconcile_ide_settings,
@@ -554,3 +556,25 @@ class TestGetIdeFiles:
         db = FakeSettingsDB({UID: {"ide": {"version": 1}}})
         store = IdeSettingsStore(db)
         assert await store.get_ide_files(UID) == {}
+
+
+class TestExtensionList:
+    def test_parses_id_version_and_theme_flag(self):
+        out = (
+            "monokai.theme-monokai-pro-vscode@2.0.13\tTHEME\n"
+            "ms-python.python@2024.4.1\t-\n"
+            "garbage-line-no-tab\n"
+        )
+        result = parse_extensions_list(out)
+        assert result == {
+            "monokai.theme-monokai-pro-vscode": {"version": "2.0.13", "theme": True},
+            "ms-python.python": {"version": "2024.4.1", "theme": False},
+        }
+
+    def test_empty_output_is_empty_dict(self):
+        assert parse_extensions_list("") == {}
+
+    def test_list_script_targets_extensions_dir(self):
+        script = build_extensions_list_script()
+        assert "/var/lib/code-server/extensions" in script
+        assert "package.json" in script
