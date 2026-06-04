@@ -218,6 +218,8 @@ data:
   # Agent tailscale sidecar gate (read by AgentProvisioner). When "false",
   # dynamically provisioned agent pods skip the tailscale sidecar entirely.
   AGENT_TAILSCALE_ENABLED: {{ .Values.agent.tailscale.enabled | quote }}
+  # Sustained-dark window (seconds) for the agent tailscale sidecar liveness probe.
+  AGENT_TAILSCALE_DARK_TIMEOUT_SECONDS: {{ .Values.agent.tailscale.darkTimeoutSeconds | default 600 | quote }}
 
   # Workspace containers (per-job sandboxed execution environments)
   WORKSPACE_IMAGE: {{ printf "%s:%s" .Values.image.workspace.repository .Values.image.workspace.tag | quote }}
