@@ -1138,6 +1138,7 @@ class TestTailscaleSidecar:
         args = ts["args"][0]
         assert "kill -0" in args, "supervision loop must watch tailscaled"
         assert "BackendState" in args, "must re-up based on backend state"
+        assert "--peers=false" in args, "status check must skip the peer dump (slow on large tailnets)"
         assert args.count("tailscale up") >= 2, "initial auth + re-up"
         assert "wait $TSPID" not in args, "blocking tail must be replaced"
 
@@ -1145,6 +1146,8 @@ class TestTailscaleSidecar:
         ts = self._manifest_with_tailscale(dark_timeout=600)
         probe = ts["livenessProbe"]
         assert "BackendState" in probe["exec"]["command"][-1]
+        assert "--peers=false" in probe["exec"]["command"][-1], "probe must skip the peer dump"
+        assert probe["timeoutSeconds"] >= 5, "1s default is too short for `tailscale status`"
         assert probe["periodSeconds"] == 30
         assert probe["failureThreshold"] == 20  # ceil(600 / 30)
         assert probe["initialDelaySeconds"] >= 90  # startup auth must finish first

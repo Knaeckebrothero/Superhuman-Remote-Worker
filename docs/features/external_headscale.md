@@ -155,6 +155,10 @@ headscale-bootstrap.sh --help`. Notable knobs:
 | `VAULT_SRW_PATH` | `secret/homelab/superhuman-remote-worker/srw-secrets` | where `TAILSCALE_AUTH_KEY` goes |
 | `VAULT_VMS_PATH` | `secret/homelab/agent-vms/headscale-api-key` | where `api-key` goes |
 
+The agent pre-auth key is always created with `--ephemeral` (not a knob): agent
+pods are transient, so their nodes must be reaped by headscale's inactivity GC
+or they leak. See `docs/done/headscale_mesh.md`.
+
 The script doesn't touch the headscale URL — that hostname only lives in
 the standalone bundle's manifests (server config, cert, ingress route)
 and in the consumer-side env vars (`headscale.url` chart value;
