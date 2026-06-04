@@ -29,6 +29,16 @@ from services.capability_credentials import (
 
 logger = logging.getLogger(__name__)
 
+
+class TtsSynthesisError(RuntimeError):
+    """Raised when a TTS model *is* configured but synthesis fails (missing
+    key, upstream 5xx, timeout). Distinct from "no model configured" (which
+    returns ``None``) so the endpoint can answer ``502`` for a real failure
+    instead of the ``204`` "feature off" signal — i.e. the button surfaces an
+    error instead of silently doing nothing.
+    """
+
+
 # Cache caps. ~50 MP3s × ~200 KB each ≈ 10 MB. The cache is per-process
 # and resets on orchestrator restart — TTS audio isn't worth persisting
 # to disk.
@@ -94,6 +104,27 @@ def _voice_for_language(language: str) -> str:
     return DEFAULT_VOICE_EN
 
 
+async def _resolve_voice(model_id: str, language: str, postgres_db) -> str:
+    """Voice for ``model_id``: the catalog row's ``params_json.voice`` (set in
+    Admin → Providers) when present, else the per-language default.
+
+    Different TTS backends expose different voice catalogs (Kokoro ``af_*``,
+    Piper, OpenAI ``alloy``/``nova``), so the voice can't be one hardcoded name.
+    Reads the ``models`` catalog row; system/custom-endpoint models (no catalog
+    row) fall back to the language default. Any lookup error is non-fatal.
+    """
+    try:
+        row = await postgres_db.resolve_catalog_model(model_id, capability="tts")
+        params = (row or {}).get("params_json")
+        if isinstance(params, dict):
+            voice = (params.get("voice") or "").strip()
+            if voice:
+                return voice
+    except Exception:
+        logger.debug("Could not read params_json voice for %s; using default", model_id)
+    return _voice_for_language(language)
+
+
 def _needs_formulation(text: str) -> bool:
     """Cheap markdown sniffer to skip the formulation LLM when not useful."""
     if not text or len(text) < _FORMULATION_MIN_LEN:
@@ -121,7 +152,12 @@ async def _formulate_for_speech(
         logger.warning("Formulation skipped: no API key for model %s", model)
         return text
 
-    client = AsyncOpenAI(api_key=api_key, base_url=base_url, timeout=timeout)
+    # max_retries=0: a down/erroring endpoint must fail in seconds, not retry
+    # with backoff for minutes — the "Read aloud" button would otherwise appear
+    # to hang. (A 503 here previously stretched a single click to ~213s.)
+    client = AsyncOpenAI(
+        api_key=api_key, base_url=base_url, timeout=timeout, max_retries=0
+    )
     try:
         response = await client.chat.completions.create(
             model=model,
@@ -161,7 +197,12 @@ async def _synthesize_speech(
         logger.warning("TTS synthesis aborted: no API key for model %s", model)
         return None
 
-    client = AsyncOpenAI(api_key=api_key, base_url=base_url, timeout=timeout)
+    # max_retries=0: a down/erroring endpoint must fail in seconds, not retry
+    # with backoff for minutes — the "Read aloud" button would otherwise appear
+    # to hang. (A 503 here previously stretched a single click to ~213s.)
+    client = AsyncOpenAI(
+        api_key=api_key, base_url=base_url, timeout=timeout, max_retries=0
+    )
     try:
         response = await client.audio.speech.create(
             model=model,
@@ -184,12 +225,18 @@ async def generate_message_tts(
     reformulate: bool,
     user_id: str,
     postgres_db,
-) -> Optional[bytes]:
-    """End-to-end: formulate (optional) → synthesize → return MP3 bytes.
+) -> Optional[tuple[str, bytes]]:
+    """End-to-end: formulate (optional) → synthesize → ``(spoken_text, mp3)``.
 
-    Returns ``None`` when no TTS model is configured or synthesis fails.
-    Errors during formulation are non-fatal — synthesis falls back to raw
-    text in that case.
+    Returns the **spoken text** (the formulation-rewritten version actually
+    sent to the TTS model, or the raw content when formulation was skipped)
+    alongside the MP3 bytes, so the UI can show what was read aloud.
+
+    Returns ``None`` when no TTS model is configured (the endpoint maps this to
+    ``204``). Raises :class:`TtsSynthesisError` when a model *is* configured but
+    synthesis fails, so the endpoint can answer ``502`` rather than silently
+    no-op'ing. Errors during *formulation* remain non-fatal — synthesis falls
+    back to the raw text in that case.
     """
     if not content or not content.strip():
         return None
@@ -212,7 +259,7 @@ async def generate_message_tts(
         logger.info("No TTS model configured for user %s", user_id)
         return None
     tts_model, tts_base_url, tts_api_key = tts_creds
-    voice = _voice_for_language(language)
+    voice = await _resolve_voice(tts_model, language, postgres_db)
 
     speech_input = content
     if reformulate and _needs_formulation(content):
@@ -242,7 +289,7 @@ async def generate_message_tts(
         cached = _cache_get(_audio_cache, audio_key)
     if cached is not None:
         logger.debug("TTS audio cache hit")
-        return cached
+        return speech_input, cached
 
     audio = await _synthesize_speech(
         speech_input,
@@ -251,7 +298,12 @@ async def generate_message_tts(
         base_url=tts_base_url,
         api_key=tts_api_key,
     )
-    if audio:
-        async with _audio_lock:
-            _cache_put(_audio_cache, audio_key, audio, _AUDIO_CACHE_MAX)
-    return audio
+    if not audio:
+        # Model is configured but synthesis produced nothing (missing key,
+        # upstream error, timeout). Raise so the endpoint returns 502 — a 204
+        # here would be indistinguishable from "TTS not configured" and the
+        # button would silently do nothing.
+        raise TtsSynthesisError(f"TTS synthesis failed for model {tts_model}")
+    async with _audio_lock:
+        _cache_put(_audio_cache, audio_key, audio, _AUDIO_CACHE_MAX)
+    return speech_input, audio
