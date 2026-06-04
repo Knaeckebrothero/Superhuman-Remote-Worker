@@ -1168,7 +1168,7 @@ class AgentProvisioner:
                 # tolerates the space MarshalIndent puts after the JSON colon.
                 'while kill -0 "$TSPID" 2>/dev/null; do '
                 "if ! tailscale status --json 2>/dev/null | "
-                "grep -qE '\"BackendState\":[[:space:]]*\"Running\"'; then "
+                'grep -qE \'"BackendState":[[:space:]]*"Running"\'; then '
                 "tailscale up "
                 '--auth-key="${TS_AUTHKEY}" '
                 f'--login-server="{self._headscale_url}" '
@@ -1216,7 +1216,7 @@ class AgentProvisioner:
                                 "/bin/sh",
                                 "-c",
                                 "tailscale status --json 2>/dev/null | "
-                                "grep -qE '\"BackendState\":[[:space:]]*\"Running\"'",
+                                'grep -qE \'"BackendState":[[:space:]]*"Running"\'',
                             ]
                         },
                         "initialDelaySeconds": 120,
