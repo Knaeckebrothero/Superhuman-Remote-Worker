@@ -24,6 +24,7 @@ from orchestrator.services.ide_settings import (
     parse_extensions_list,
     parse_pull_output,
     pull_ide_config,
+    reconcile_extensions,
     reconcile_ide_settings,
     resolve_ssh_target,
     seed_ide_config_for_user,
@@ -700,3 +701,43 @@ class TestExtensionInstallScript:
         theme_idx = script.index("monokai.theme-monokai-pro-vscode")
         bg_idx = script.index("ms-python.python")
         assert theme_idx < bg_idx
+
+
+class TestReconcileExtensions:
+    @pytest.mark.asyncio
+    async def test_lists_classifies_and_stores(self):
+        db = FakeSettingsDB()
+        store = IdeSettingsStore(db)
+        workspaces = [
+            {"user_id": UID, "context": {"workspace_container": {"pod_ip": "10.0.0.1"}}}
+        ]
+
+        async def list_fn(host, port):
+            assert (host, port) == ("10.0.0.1", 30022)
+            return {"a.b": {"version": "1.0.0", "theme": True}}
+
+        class FakeClf:
+            async def classify(self, ext_id, version):
+                return "openvsx"
+
+        n = await reconcile_extensions(store, workspaces, list_fn, FakeClf())
+        assert n == 1
+        got = await store.get_extensions(UID)
+        assert got["a.b"] == {"version": "1.0.0", "source": "openvsx", "theme": True}
+
+    @pytest.mark.asyncio
+    async def test_unreachable_workspace_skipped(self):
+        db = FakeSettingsDB()
+        store = IdeSettingsStore(db)
+        workspaces = [
+            {"user_id": UID, "context": {"workspace_container": {"pod_ip": "10.0.0.1"}}}
+        ]
+
+        async def list_fn(host, port):
+            raise RuntimeError("ssh refused")
+
+        class FakeClf:
+            async def classify(self, ext_id, version):
+                return "openvsx"
+
+        assert await reconcile_extensions(store, workspaces, list_fn, FakeClf()) == 0
