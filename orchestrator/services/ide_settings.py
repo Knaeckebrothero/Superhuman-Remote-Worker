@@ -128,9 +128,9 @@ def build_extensions_list_script() -> str:
         "for d in */ ; do\n"
         '  pj="${d%/}/package.json"\n'
         '  [ -f "$pj" ] || continue\n'
-        "  pub=$(sed -n 's/.*\"publisher\"[: ]*\"\\([^\"]*\\)\".*/\\1/p' \"$pj\" | head -1)\n"
-        "  nm=$(sed -n 's/.*\"name\"[: ]*\"\\([^\"]*\\)\".*/\\1/p' \"$pj\" | head -1)\n"
-        "  ver=$(sed -n 's/.*\"version\"[: ]*\"\\([^\"]*\\)\".*/\\1/p' \"$pj\" | head -1)\n"
+        '  pub=$(sed -n \'s/.*"publisher"[: ]*"\\([^"]*\\)".*/\\1/p\' "$pj" | head -1)\n'
+        '  nm=$(sed -n \'s/.*"name"[: ]*"\\([^"]*\\)".*/\\1/p\' "$pj" | head -1)\n'
+        '  ver=$(sed -n \'s/.*"version"[: ]*"\\([^"]*\\)".*/\\1/p\' "$pj" | head -1)\n'
         '  [ -n "$pub" ] && [ -n "$nm" ] && [ -n "$ver" ] || continue\n'
         '  flag="-"\n'
         f'  grep -q \'"themes"\' "$pj" && flag="{_EXT_THEME_FLAG}"\n'
@@ -436,7 +436,9 @@ async def seed_ide_config_for_user(
     if not files and not extensions:
         return True
     runner = _runner or _default_ssh_runner
-    script = build_seed_script(files) + "\n" + build_extension_install_script(extensions)
+    script = (
+        build_seed_script(files) + "\n" + build_extension_install_script(extensions)
+    )
     try:
         rc, _out, stderr = await runner(
             ssh_host, ssh_port, script, key_path=key_path, timeout=60
@@ -711,9 +713,7 @@ class IdeSettingsStore:
             else {}
         )
         stored = (
-            dict(exts.get("items") or {})
-            if isinstance(exts.get("items"), dict)
-            else {}
+            dict(exts.get("items") or {}) if isinstance(exts.get("items"), dict) else {}
         )
 
         changed: list[str] = []
