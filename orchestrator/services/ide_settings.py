@@ -45,6 +45,13 @@ CODE_SERVER_USER_DIR = "/var/lib/code-server/User"
 TRACKED_FILES = ("settings.json", "keybindings.json")
 SNIPPETS_SUBDIR = "snippets"
 
+# Extensions live in a separate tree from the User config dir.
+EXTENSIONS_DIR = "/var/lib/code-server/extensions"
+GLOBAL_STORAGE_DIR = f"{CODE_SERVER_USER_DIR}/globalStorage"
+# Sentinel the entrypoint waits on while the orchestrator streams license/
+# globalStorage state into a freshly-provisioned workspace (Phase B).
+SEED_STATE_SENTINEL = "/var/lib/code-server/.ide-seed-state-done"
+
 # SSH ports: workspace containers run sshd on 30022; VMs on 22.
 DEFAULT_WS_SSH_PORT = 30022
 DEFAULT_VM_SSH_PORT = 22
@@ -103,6 +110,48 @@ def parse_pull_output(stdout: str) -> dict[str, dict]:
             if name:
                 result[name] = {"content": content, "mtime": mtime}
         i += 1  # step past the end marker
+    return result
+
+
+_EXT_THEME_FLAG = "THEME"
+
+
+def build_extensions_list_script() -> str:
+    """Remote shell: emit one ``<publisher>.<name>@<version>\\t<THEME|->`` line per
+    installed extension. The theme flag is set when the extension's package.json
+    declares a ``"themes"`` contribution, so the seed step can install theme
+    providers first. Parses package.json with line-wise sed (top-level fields are
+    one-per-line in published extensions); robust enough for ordering/inventory.
+    """
+    return (
+        f"cd {EXTENSIONS_DIR} 2>/dev/null || exit 0\n"
+        "for d in */ ; do\n"
+        '  pj="${d%/}/package.json"\n'
+        '  [ -f "$pj" ] || continue\n'
+        "  pub=$(sed -n 's/.*\"publisher\"[: ]*\"\\([^\"]*\\)\".*/\\1/p' \"$pj\" | head -1)\n"
+        "  nm=$(sed -n 's/.*\"name\"[: ]*\"\\([^\"]*\\)\".*/\\1/p' \"$pj\" | head -1)\n"
+        "  ver=$(sed -n 's/.*\"version\"[: ]*\"\\([^\"]*\\)\".*/\\1/p' \"$pj\" | head -1)\n"
+        '  [ -n "$pub" ] && [ -n "$nm" ] && [ -n "$ver" ] || continue\n'
+        '  flag="-"\n'
+        f'  grep -q \'"themes"\' "$pj" && flag="{_EXT_THEME_FLAG}"\n'
+        '  printf \'%s.%s@%s\\t%s\\n\' "$pub" "$nm" "$ver" "$flag"\n'
+        "done\n"
+    )
+
+
+def parse_extensions_list(stdout: str) -> dict[str, dict]:
+    """Parse :func:`build_extensions_list_script` output into
+    ``{ext_id: {"version": str, "theme": bool}}``. Lines without a tab are skipped.
+    """
+    result: dict[str, dict] = {}
+    for line in stdout.split("\n"):
+        if "\t" not in line:
+            continue
+        id_ver, _, flag = line.partition("\t")
+        ext_id, _, version = id_ver.rpartition("@")
+        if not ext_id or not version:
+            continue
+        result[ext_id] = {"version": version, "theme": flag.strip() == _EXT_THEME_FLAG}
     return result
 
 
