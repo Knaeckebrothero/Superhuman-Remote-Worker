@@ -17,6 +17,7 @@ import pytest
 from orchestrator.services.ide_settings import (
     CODE_SERVER_USER_DIR,
     IdeSettingsStore,
+    OpenVsxClassifier,
     build_extensions_list_script,
     build_seed_script,
     parse_extensions_list,
@@ -578,3 +579,47 @@ class TestExtensionList:
         script = build_extensions_list_script()
         assert "/var/lib/code-server/extensions" in script
         assert "package.json" in script
+
+
+class TestOpenVsxClassifier:
+    @pytest.mark.asyncio
+    async def test_available_returns_openvsx(self):
+        calls = []
+
+        async def fake_fetch(url):
+            calls.append(url)
+            return 200  # Open VSX has it
+
+        clf = OpenVsxClassifier(fetch=fake_fetch)
+        src = await clf.classify("monokai.theme-monokai-pro-vscode", "2.0.13")
+        assert src == "openvsx"
+        assert "monokai/theme-monokai-pro-vscode/2.0.13" in calls[0]
+
+    @pytest.mark.asyncio
+    async def test_missing_returns_bytes(self):
+        async def fake_fetch(url):
+            return 404
+
+        clf = OpenVsxClassifier(fetch=fake_fetch)
+        assert await clf.classify("acme.private", "1.0.0") == "bytes"
+
+    @pytest.mark.asyncio
+    async def test_result_is_cached(self):
+        n = {"calls": 0}
+
+        async def fake_fetch(url):
+            n["calls"] += 1
+            return 200
+
+        clf = OpenVsxClassifier(fetch=fake_fetch)
+        await clf.classify("a.b", "1.0.0")
+        await clf.classify("a.b", "1.0.0")
+        assert n["calls"] == 1  # cached by (id, version)
+
+    @pytest.mark.asyncio
+    async def test_fetch_error_defaults_to_bytes(self):
+        async def boom(url):
+            raise RuntimeError("network down")
+
+        clf = OpenVsxClassifier(fetch=boom)
+        assert await clf.classify("a.b", "1.0.0") == "bytes"
