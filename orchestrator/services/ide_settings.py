@@ -464,6 +464,15 @@ async def reconcile_ide_settings(
     return updated_total
 
 
+def _ver_key(v: str) -> tuple:
+    """Sort key for version strings: numeric-aware, falls back to string parts.
+    ``"2.0.13"`` > ``"2.0.9"``; non-numeric segments compare lexicographically."""
+    parts = []
+    for seg in str(v).replace("-", ".").split("."):
+        parts.append((0, int(seg)) if seg.isdigit() else (1, seg))
+    return tuple(parts)
+
+
 class IdeSettingsStore:
     """Read/write per-user code-server config in ``users.settings['ide']``."""
 
@@ -523,3 +532,63 @@ class IdeSettingsStore:
         ide["files"] = files
         await self._db.update_user_settings(user_id, {"ide": ide})
         return updated
+
+    async def get_extensions(self, user_id: str) -> dict[str, dict]:
+        """Return the stored extension manifest items: ``{id: {version, source, theme}}``."""
+        settings = await self._db.get_user_settings(user_id)
+        if not isinstance(settings, dict):
+            return {}
+        ide = settings.get("ide")
+        exts = ide.get("extensions") if isinstance(ide, dict) else None
+        items = exts.get("items") if isinstance(exts, dict) else None
+        return dict(items) if isinstance(items, dict) else {}
+
+    async def apply_extensions(self, user_id: str, items: dict[str, dict]) -> list[str]:
+        """Merge a workspace's installed extensions into the user's manifest.
+
+        Union across workspaces, newest-version-wins per id (so an extension
+        present only in workspace B survives a reconcile of workspace A). Returns
+        the ids added or version-bumped. Read-modify-writes the whole ``ide``
+        subtree because ``update_user_settings`` is a shallow merge.
+        """
+        if not items:
+            return []
+        settings = await self._db.get_user_settings(user_id)
+        if not isinstance(settings, dict):
+            settings = {}
+        ide = (
+            dict(settings.get("ide") or {})
+            if isinstance(settings.get("ide"), dict)
+            else {}
+        )
+        exts = (
+            dict(ide.get("extensions") or {})
+            if isinstance(ide.get("extensions"), dict)
+            else {}
+        )
+        stored = (
+            dict(exts.get("items") or {})
+            if isinstance(exts.get("items"), dict)
+            else {}
+        )
+
+        changed: list[str] = []
+        for ext_id, entry in items.items():
+            version = entry.get("version")
+            if not version:
+                continue
+            prev = stored.get(ext_id)
+            if prev is None or _ver_key(version) > _ver_key(prev.get("version", "")):
+                stored[ext_id] = {
+                    "version": version,
+                    "source": entry.get("source", "bytes"),
+                    "theme": bool(entry.get("theme", False)),
+                }
+                changed.append(ext_id)
+
+        if not changed:
+            return []
+        exts["items"] = stored
+        ide["extensions"] = exts
+        await self._db.update_user_settings(user_id, {"ide": ide})
+        return changed
