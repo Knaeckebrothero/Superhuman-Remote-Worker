@@ -142,6 +142,10 @@ agent:
   tailscale:
     enabled: false
     image: ghcr.io/tailscale/tailscale:v1.82.5
+    # -- Seconds the sidecar may stay disconnected before the liveness probe
+    # kills it and the tunnel_dark reaper recycles the pod. Widen on small
+    # deployments with long-idle pool agents; self-heal recovers transient loss.
+    darkTimeoutSeconds: 600
   # -- Pod Disruption Budget
   pdb:
     enabled: true
