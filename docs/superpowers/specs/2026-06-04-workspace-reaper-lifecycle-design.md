@@ -113,10 +113,17 @@ All computed **orchestrator-side, without touching the pod** unless noted.
 **`is_dirty(inst)`** = `work_marker(inst) > marker_at_last_snapshot`.
 - Threads: **`total_turns`** (verified to exist; monotonic; incremented only on
   real turns). A 0-turn thread reads clean → instant reap (3 of the 5).
-- Jobs: **OPEN — pick the cheapest monotonic counter.** Candidates: audit-entry
-  count, or completed-phase count. Resolve in the implementation plan. In
-  practice a completed job already received a completion snapshot, so it reads
-  clean and reaps without re-snapshotting regardless of which counter is used.
+- Jobs: **RESOLVED — no dirty-marker (asymmetric with threads).** `jobs` has no
+  Postgres turn counter, and the only monotonic job-activity signal
+  (`get_audit_count`) lives in MongoDB — a cross-store call we will not add to
+  the reconciler tick. Instead: terminal jobs (completed/failed/cancelled)
+  already receive a completion snapshot (`main.py:6038`), so they reap via that
+  existing capture; paused/idle jobs simply attempt a snapshot when reaped
+  (re-snapshotting an unchanged paused job is mildly wasteful but correct).
+  `is_dirty` therefore only does real work for threads (`total_turns`); for
+  jobs it returns a conservative "treat as dirty → attempt snapshot," and the
+  escape hatch bounds the unreachable case. Both observed leaked job pods are
+  handled correctly without a job marker.
 - **NOT `last_activity`** — it is contaminated: `merge_*_workspace_context` /
   `merge_*_snapshot_context` set `last_activity = CURRENT_TIMESTAMP` as a side
   effect (postgres.py:1564, 1603, 1640, 1714), so the reaper's own bookkeeping
@@ -247,12 +254,13 @@ CI (Py3.12) is the gate; local `pytest tests/` is env-noisy.
 
 ## Open questions
 
-1. **Jobs work-marker** for `is_dirty` — audit-entry count vs completed-phase
-   count. Resolve in the plan.
+1. ~~Jobs work-marker for `is_dirty`~~ — **RESOLVED**: no job marker; asymmetric
+   with threads (see *The predicates*).
 2. **`give_up` for PVC** — exact recreate-vs-leave semantics on a *dirty,
    unreachable, PVC-backed* pod (restart may restore reachability and let a
    later tick snapshot). Likely: recreate (reattach), don't force-delete the
-   PVC. Confirm against the migration spec's intent.
+   PVC. Deferred to the migration spec; for this spec the PVC arm is minimally
+   activated (designed-for, thin wrapper).
 
 ## References
 
