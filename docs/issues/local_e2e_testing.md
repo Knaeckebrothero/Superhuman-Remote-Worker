@@ -428,7 +428,7 @@ headscale-init:
   command: |
     sh -c '
       headscale users create agents 2>/dev/null || true
-      headscale preauthkeys create --user agents --reusable --expiration 24h > /shared/authkey
+      headscale preauthkeys create --user agents --reusable --ephemeral --expiration 24h > /shared/authkey
     '
   volumes:
     - shared_keys:/shared
