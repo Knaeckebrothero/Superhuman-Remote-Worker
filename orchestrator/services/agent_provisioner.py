@@ -1167,7 +1167,7 @@ class AgentProvisioner:
                 # liveness probe + the tunnel_dark reaper, not here. The grep
                 # tolerates the space MarshalIndent puts after the JSON colon.
                 'while kill -0 "$TSPID" 2>/dev/null; do '
-                "if ! tailscale status --json 2>/dev/null | "
+                "if ! tailscale status --json --peers=false 2>/dev/null | "
                 'grep -qE \'"BackendState":[[:space:]]*"Running"\'; then '
                 "tailscale up "
                 '--auth-key="${TS_AUTHKEY}" '
@@ -1210,17 +1210,22 @@ class AgentProvisioner:
                             "mountPath": "/var/lib/tailscale",
                         }
                     ],
+                    # status --peers=false skips the (huge, on a big tailnet)
+                    # peer list so the check stays well under timeoutSeconds;
+                    # plain `tailscale status --json` exceeds the default 1s on a
+                    # large tailnet and the kubelet kills a healthy sidecar.
                     "livenessProbe": {
                         "exec": {
                             "command": [
                                 "/bin/sh",
                                 "-c",
-                                "tailscale status --json 2>/dev/null | "
+                                "tailscale status --json --peers=false 2>/dev/null | "
                                 'grep -qE \'"BackendState":[[:space:]]*"Running"\'',
                             ]
                         },
                         "initialDelaySeconds": 120,
                         "periodSeconds": 30,
+                        "timeoutSeconds": 5,
                         "failureThreshold": dark_failures,
                     },
                     "resources": {

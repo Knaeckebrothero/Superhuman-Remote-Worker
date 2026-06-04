@@ -301,10 +301,12 @@ POST /api/v1/preauthkey
 
 > **Note:** The REST API `user` field takes a user ID (uint64), not the user name. Look up the ID via `GET /api/v1/user` or `headscale users list`.
 
-**Agent keys** — long-lived, reusable, stored in Vault/ESO:
+**Agent keys** — reusable **and ephemeral**, stored in Vault/ESO. Agent pods are
+transient (`tailscaled --state=mem:`, unique per-pod hostname), so without
+`--ephemeral` every pod becomes a permanent node and they leak (see Known Issues).
 
 ```bash
-headscale preauthkeys create --user srw --reusable=true --expiration 365d --tags tag:agent
+headscale preauthkeys create --user srw --reusable --ephemeral --expiration 365d --tags tag:agent
 ```
 
 **API key for the VM controller** — used to authenticate REST API calls:
@@ -587,12 +589,12 @@ Headscale ACLs control which nodes can talk to which. The policy is minimal:
 | Path | Key | Description | Rotation |
 |------|-----|-------------|----------|
 | `srw/headscale` | `api_key` | Headscale API key for VM controller | Default 90-day expiry, rotate before expiration |
-| `srw/headscale` | `agent_auth_key` | Reusable pre-auth key for agent pods (tag:agent) | Create with 365-day expiry, rotate annually |
+| `srw/headscale` | `agent_auth_key` | Reusable + ephemeral pre-auth key for agent pods (tag:agent) | Create with 365-day expiry, rotate annually |
 
 ## Security Considerations
 
 - **Ephemeral keys**: VM auth keys are single-use and expire in 10 minutes. A leaked key is useless after the VM claims it. Keys are bcrypt-hashed at rest (since v0.28).
-- **Ephemeral nodes**: VMs register as ephemeral nodes — Headscale automatically removes them after `ephemeral_node_inactivity_timeout` (default 30 minutes, minimum 65 seconds).
+- **Ephemeral nodes**: Both VMs and agent pods register as ephemeral nodes — Headscale automatically removes them after `ephemeral_node_inactivity_timeout` (default 30 minutes, minimum 65 seconds).
 - **ACL enforcement**: Tags restrict traffic — agents can only reach VMs on port 22, nothing else. ACLs are deny-by-default when the rules array is non-empty.
 - **DERP client verification**: Enabled by default — the embedded DERP relay queries Headscale to validate connecting clients, denying unknown nodes and preventing bandwidth abuse.
 - **No MagicDNS**: DNS resolution stays off. The system uses IP addresses, avoiding DNS-based attacks.
@@ -608,6 +610,7 @@ Headscale ACLs control which nodes can talk to which. The policy is minimal:
 - **Single-writer SQLite**: Never run more than one Headscale replica against the same PVC. StatefulSet with `replicas: 1` enforces this.
 - **Sequential upgrades**: Headscale v0.28 does not support direct upgrades from databases older than v0.25. Upgrade through each stable release sequentially.
 - **High node churn**: Many nodes with frequent map changes cause resource usage spikes. Monitor Headscale memory/CPU during periods of heavy VM creation/deletion.
+  - *2026-06-03 incident:* the agent pre-auth key was created without `--ephemeral`, so ~1,465 `tag:agent` nodes accumulated and overloaded the coordinator (~486m CPU, ~28s/registration), starving an unrelated tailscale sidecar (garage-proxy) into a crash loop. Fixed by making the agent key ephemeral + a self-healing sidecar loop + a `tunnel_dark` reaper. See `docs/superpowers/specs/2026-06-04-headscale-agent-ephemeral-keys-design.md`.
 
 ## Capacity and Performance
 
