@@ -420,20 +420,47 @@ async def seed_ide_config_for_user(
     key_path: Optional[str] = None,
     _runner: Optional[SshRunner] = None,
 ) -> bool:
-    """Seed a user's stored code-server config into a workspace over SSH.
+    """Seed a user's stored code-server config + extensions into a workspace over
+    SSH.
 
     Convenience wrapper used by the VM-ready and IDE-session-restore paths
-    (containers seed via ConfigMap instead). No-ops cleanly when there's no user
-    or no stored config. Never raises.
+    (containers seed via ConfigMap instead). Writes the config files and installs
+    the user's Open-VSX extensions (theme-first). No-ops cleanly when there's no
+    user or nothing stored. Never raises.
     """
     if not user_id:
         return True
-    files = await IdeSettingsStore(db).get_ide_files(str(user_id))
-    if not files:
+    store = IdeSettingsStore(db)
+    files = await store.get_ide_files(str(user_id))
+    extensions = await store.get_extensions(str(user_id))
+    if not files and not extensions:
         return True
-    return await seed_ide_config(
-        ssh_host, ssh_port, files, key_path=key_path, _runner=_runner
-    )
+    runner = _runner or _default_ssh_runner
+    script = build_seed_script(files) + "\n" + build_extension_install_script(extensions)
+    try:
+        rc, _out, stderr = await runner(
+            ssh_host, ssh_port, script, key_path=key_path, timeout=60
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "ide_settings: seed-for-user failed for %s:%s — %s", ssh_host, ssh_port, e
+        )
+        return False
+    if rc != 0:
+        err = (
+            stderr.decode("utf-8", "replace")
+            if isinstance(stderr, (bytes, bytearray))
+            else (stderr or "")
+        )
+        logger.warning(
+            "ide_settings: seed-for-user rc=%s for %s:%s — %s",
+            rc,
+            ssh_host,
+            ssh_port,
+            err[:200],
+        )
+        return False
+    return True
 
 
 PullFn = Callable[[str, int], Awaitable[dict]]
