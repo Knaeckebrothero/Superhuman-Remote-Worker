@@ -671,6 +671,51 @@ class GitManager:
             logger.warning(f"Push failed: {e}")
             return False
 
+    def has_unpushed_commits(
+        self, remote: str = "origin", branch: Optional[str] = None
+    ) -> bool:
+        """Check whether the local branch has commits not yet on the remote.
+
+        Compares HEAD against the local remote-tracking ref (e.g.
+        ``origin/main``), so it does NOT perform a network round-trip — it only
+        reads refs already on disk. Used to decide whether an end-of-turn push
+        is worthwhile.
+
+        Returns:
+            True if at least one local commit is not on the remote. False if
+            git is inactive, no remote is configured (nothing to push to), or
+            the branch is already fully pushed.
+        """
+        if not self.is_active or not self.has_remote(remote):
+            return False
+
+        try:
+            if branch is None:
+                result = self._run_git(["branch", "--show-current"])
+                branch = (
+                    result.stdout.strip()
+                    if result.returncode == 0 and result.stdout.strip()
+                    else "main"
+                )
+
+            # Count commits reachable from HEAD but not from the remote-tracking
+            # ref. Reads the local ref only — no fetch required.
+            result = self._run_git(
+                ["rev-list", "--count", f"{remote}/{branch}..HEAD"]
+            )
+            if result.returncode != 0:
+                # The remote-tracking ref doesn't exist yet (nothing has ever
+                # been pushed). Any commit on HEAD is therefore unpushed.
+                head = self._run_git(["rev-parse", "--verify", "HEAD"])
+                return head.returncode == 0
+            return int((result.stdout or "").strip() or "0") > 0
+        except Exception as e:
+            # Be conservative: if we can't tell, assume there may be unpushed
+            # work so the caller attempts a push rather than silently stranding
+            # commits on the workspace pod.
+            logger.debug(f"has_unpushed_commits check failed: {e}")
+            return True
+
     def pull(self, remote: str = "origin", branch: Optional[str] = None) -> bool:
         """Pull from remote (fast-forward only).
 
