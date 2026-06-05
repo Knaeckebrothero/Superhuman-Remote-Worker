@@ -876,6 +876,14 @@ class ContainerProvisioner:
                 "name": pod_name,
                 "namespace": self._namespace,
                 "labels": self._build_workspace_labels(owner, network_tier),
+                # GC backstop hook: marks the pod as owned by the lifecycle
+                # reconciler so a future K8s TTL/GC controller (or an age
+                # sweep) can reclaim a tail the reconciler missed. Bare pods
+                # have no ownerReference, so without this nothing external can
+                # ever clean them up.
+                "annotations": {
+                    "srw.io/managed-by": "lifecycle-reconciler",
+                },
             },
             "spec": {
                 "restartPolicy": "Never",
