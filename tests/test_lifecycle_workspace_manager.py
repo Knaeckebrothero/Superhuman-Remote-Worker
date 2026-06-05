@@ -453,6 +453,44 @@ class TestIsReachable:
         assert mgr._tcp_probe.await_count == 2
 
 
+class TestAttemptCounter:
+    @pytest.mark.asyncio
+    async def test_record_attempt_increments_job_context(self):
+        mgr, _, _, _, db = _make_manager()
+        db.merge_workspace_container_context = AsyncMock(return_value=True)
+        inst = Instance(kind="workspace", id="workspace-a", bound_to="j1",
+                        metadata={"labels": {"srw/job-id": "j1"},
+                                  "snapshot_attempts": 2})
+        await mgr.record_attempt(inst)
+        db.merge_workspace_container_context.assert_awaited_once_with(
+            "j1", {"snapshot_attempts": 3})
+
+    @pytest.mark.asyncio
+    async def test_record_attempt_increments_thread_context(self):
+        mgr, _, _, _, db = _make_manager()
+        db.merge_thread_workspace_context = AsyncMock(return_value=True)
+        inst = Instance(kind="workspace", id="ws-thread-a", bound_to="t1",
+                        metadata={"labels": {"srw/thread-id": "t1"},
+                                  "snapshot_attempts": 0})
+        await mgr.record_attempt(inst)
+        db.merge_thread_workspace_context.assert_awaited_once_with(
+            "t1", {"snapshot_attempts": 1})
+
+    @pytest.mark.asyncio
+    async def test_exhausted_true_at_threshold(self, monkeypatch):
+        monkeypatch.setenv("WORKSPACE_SNAPSHOT_MAX_ATTEMPTS", "5")
+        mgr, *_ = _make_manager()
+        inst = Instance(kind="workspace", id="x", metadata={"snapshot_attempts": 5})
+        assert await mgr.attempts_exhausted(inst) is True
+
+    @pytest.mark.asyncio
+    async def test_exhausted_false_below_threshold(self, monkeypatch):
+        monkeypatch.setenv("WORKSPACE_SNAPSHOT_MAX_ATTEMPTS", "5")
+        mgr, *_ = _make_manager()
+        inst = Instance(kind="workspace", id="x", metadata={"snapshot_attempts": 4})
+        assert await mgr.attempts_exhausted(inst) is False
+
+
 def test_pod_volume_is_ephemeral_helper():
     from orchestrator.services.lifecycle.workspace_manager import (
         _pod_volume_is_ephemeral,

@@ -290,6 +290,36 @@ class WorkspaceInstanceManager:
         self._reach_cache[host] = (now, ok)
         return ok
 
+    def _max_attempts(self) -> int:
+        try:
+            return int(os.environ.get("WORKSPACE_SNAPSHOT_MAX_ATTEMPTS", "5"))
+        except ValueError:
+            return 5
+
+    async def attempts_exhausted(self, inst: Instance) -> bool:
+        return (inst.metadata.get("snapshot_attempts") or 0) >= self._max_attempts()
+
+    async def record_attempt(self, inst: Instance) -> None:
+        """Persist an incremented snapshot-attempt counter to the bound row."""
+        if self._db is None:
+            return
+        bound = inst.bound_to
+        if not bound:
+            return
+        nxt = (inst.metadata.get("snapshot_attempts") or 0) + 1
+        labels = inst.metadata.get("labels") or {}
+        try:
+            if "srw/thread-id" in labels:
+                await self._db.merge_thread_workspace_context(
+                    bound, {"snapshot_attempts": nxt}
+                )
+            else:
+                await self._db.merge_workspace_container_context(
+                    bound, {"snapshot_attempts": nxt}
+                )
+        except Exception:
+            logger.exception("Failed to record snapshot attempt for %s", inst.id)
+
     async def snapshot(self, inst: Instance) -> str | None:
         """Capture the workspace contents to S3.
 
