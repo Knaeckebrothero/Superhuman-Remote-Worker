@@ -16,6 +16,7 @@ import pytest
 
 from orchestrator.services.ide_settings import (
     CODE_SERVER_USER_DIR,
+    GLOBAL_STORAGE_DIR,
     IdeSettingsStore,
     OpenVsxClassifier,
     build_extension_install_script,
@@ -865,3 +866,120 @@ class TestSeedProfile:
         )
         assert ok is True
         assert any(SEED_STATE_SENTINEL in s for s in scripts)
+
+
+class TestCaptureBytesExtension:
+    @pytest.mark.asyncio
+    async def test_resolves_platform_suffixed_folder(self):
+        # A bytes-source extension whose on-disk folder carries code-server's
+        # platform suffix (e.g. "<id>-<ver>-universal"). Capture must tar the
+        # REAL folder, not the bare "<id>-<ver>" guess.
+        db = FakeSettingsDB(
+            {
+                UID: {
+                    "ide": {
+                        "extensions": {
+                            "items": {
+                                "acme.private": {
+                                    "version": "1.2.3",
+                                    "source": "bytes",
+                                    "theme": False,
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        )
+        store = IdeSettingsStore(db)
+
+        async def runner(host, port, script, key_path=None, timeout=20):
+            if "sha256sum" in script:
+                return 0, b"NEWSIG  -\n", b""  # signature changed -> proceed
+            if "acme.private-1.2.3" in script:  # resolve-ext-dir script
+                return 0, b"acme.private-1.2.3-universal\n", b""
+            return 0, b"", b""
+
+        tarred = []
+
+        async def tar_fn(
+            host, port, remote_path, local_path, key_path=None, timeout=120
+        ):
+            tarred.append(remote_path)
+            return True
+
+        class FakeProfileStore:
+            def __init__(self):
+                self.put_bytes = None
+
+            async def ext_bytes_exists(self, *a, **k):
+                return False
+
+            async def put_globalstorage(self, *a, **k):
+                pass
+
+            async def put_ext_bytes(self, user_id, ext_id, version, path):
+                self.put_bytes = (ext_id, version)
+
+        ps = FakeProfileStore()
+        n = await capture_ide_profile(
+            store, UID, "h", 30022, ps, _runner=runner, _tar_fn=tar_fn
+        )
+
+        # globalStorage + the resolved bytes folder were tarred
+        assert any(t.endswith("/acme.private-1.2.3-universal") for t in tarred)
+        # NOT the bare guess
+        assert "/var/lib/code-server/extensions/acme.private-1.2.3" not in tarred
+        assert ps.put_bytes == ("acme.private", "1.2.3")
+        assert n == 2
+
+    @pytest.mark.asyncio
+    async def test_skips_when_folder_not_found(self):
+        db = FakeSettingsDB(
+            {
+                UID: {
+                    "ide": {
+                        "extensions": {
+                            "items": {
+                                "acme.private": {
+                                    "version": "9.9.9",
+                                    "source": "bytes",
+                                    "theme": False,
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        )
+        store = IdeSettingsStore(db)
+
+        async def runner(host, port, script, key_path=None, timeout=20):
+            if "sha256sum" in script:
+                return 0, b"NEWSIG  -\n", b""
+            return 0, b"", b""  # resolve finds nothing
+
+        tarred = []
+
+        async def tar_fn(
+            host, port, remote_path, local_path, key_path=None, timeout=120
+        ):
+            tarred.append(remote_path)
+            return True
+
+        class FakeProfileStore:
+            async def ext_bytes_exists(self, *a, **k):
+                return False
+
+            async def put_globalstorage(self, *a, **k):
+                pass
+
+            async def put_ext_bytes(self, *a, **k):
+                raise AssertionError("should not upload bytes when folder missing")
+
+        n = await capture_ide_profile(
+            store, UID, "h", 30022, FakeProfileStore(), _runner=runner, _tar_fn=tar_fn
+        )
+        # only globalStorage tarred; the bytes folder was never resolved
+        assert tarred == [GLOBAL_STORAGE_DIR]
+        assert n == 1
