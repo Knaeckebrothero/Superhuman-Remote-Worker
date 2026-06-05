@@ -323,6 +323,63 @@ class TestIsReapable:
 
 
 # =============================================================================
+# is_dirty (activity-based; threads total_turns, jobs conservative)
+# =============================================================================
+
+
+class TestIsDirty:
+    @pytest.mark.asyncio
+    async def test_thread_zero_turns_is_clean(self):
+        mgr, *_ = _make_manager()
+        inst = Instance(kind="workspace", id="x", bound_to="t1",
+                        metadata={"thread_status": "ended", "total_turns": 0,
+                                  "last_snapshot_turns": None})
+        assert await mgr.is_dirty(inst) is False
+
+    @pytest.mark.asyncio
+    async def test_thread_turns_ahead_of_snapshot_is_dirty(self):
+        mgr, *_ = _make_manager()
+        inst = Instance(kind="workspace", id="x", bound_to="t1",
+                        metadata={"thread_status": "ended", "total_turns": 5,
+                                  "last_snapshot_turns": 2})
+        assert await mgr.is_dirty(inst) is True
+
+    @pytest.mark.asyncio
+    async def test_thread_turns_equal_snapshot_is_clean(self):
+        mgr, *_ = _make_manager()
+        inst = Instance(kind="workspace", id="x", bound_to="t1",
+                        metadata={"thread_status": "ended", "total_turns": 3,
+                                  "last_snapshot_turns": 3})
+        assert await mgr.is_dirty(inst) is False
+
+    @pytest.mark.asyncio
+    async def test_thread_with_turns_never_snapshotted_is_dirty(self):
+        mgr, *_ = _make_manager()
+        inst = Instance(kind="workspace", id="x", bound_to="t1",
+                        metadata={"thread_status": "ended", "total_turns": 4,
+                                  "last_snapshot_turns": None})
+        assert await mgr.is_dirty(inst) is True
+
+    @pytest.mark.asyncio
+    async def test_terminal_job_with_snapshot_is_clean(self):
+        # Completed jobs get a completion snapshot — reap without re-capture.
+        mgr, *_ = _make_manager()
+        inst = Instance(kind="workspace", id="x", bound_to="j1",
+                        metadata={"job_status": "completed",
+                                  "snapshot_status": "available"})
+        assert await mgr.is_dirty(inst) is False
+
+    @pytest.mark.asyncio
+    async def test_job_without_snapshot_is_dirty(self):
+        # No job turn-counter → conservative: attempt a snapshot.
+        mgr, *_ = _make_manager()
+        inst = Instance(kind="workspace", id="x", bound_to="j1",
+                        metadata={"job_status": "pending_review",
+                                  "snapshot_status": None})
+        assert await mgr.is_dirty(inst) is True
+
+
+# =============================================================================
 # snapshot / restore
 # =============================================================================
 
