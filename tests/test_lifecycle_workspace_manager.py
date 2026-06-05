@@ -380,6 +380,54 @@ class TestIsDirty:
 
 
 # =============================================================================
+# is_state_ephemeral (volume-mode branch)
+# =============================================================================
+
+
+class TestIsStateEphemeral:
+    @pytest.mark.asyncio
+    async def test_emptydir_is_ephemeral(self):
+        mgr, *_ = _make_manager()
+        inst = Instance(kind="workspace", id="x", metadata={"volume_ephemeral": True})
+        assert await mgr.is_state_ephemeral(inst) is True
+
+    @pytest.mark.asyncio
+    async def test_pvc_is_not_ephemeral(self):
+        mgr, *_ = _make_manager()
+        inst = Instance(kind="workspace", id="x", metadata={"volume_ephemeral": False})
+        assert await mgr.is_state_ephemeral(inst) is False
+
+    @pytest.mark.asyncio
+    async def test_unknown_defaults_to_ephemeral(self):
+        # Default matches today's reality (emptyDir). Conservative for the
+        # current fleet; the PVC migration spec flips the default explicitly.
+        mgr, *_ = _make_manager()
+        inst = Instance(kind="workspace", id="x", metadata={})
+        assert await mgr.is_state_ephemeral(inst) is True
+
+
+def test_pod_volume_is_ephemeral_helper():
+    from orchestrator.services.lifecycle.workspace_manager import (
+        _pod_volume_is_ephemeral,
+    )
+
+    empty = _make_pod("w1")
+    vol_e = MagicMock()
+    vol_e.name = "workspace-data"
+    vol_e.persistent_volume_claim = None
+    vol_e.empty_dir = MagicMock()
+    empty.spec.volumes = [vol_e]
+    assert _pod_volume_is_ephemeral(empty) is True
+
+    pvc = _make_pod("w2")
+    vol_p = MagicMock()
+    vol_p.name = "workspace-data"
+    vol_p.persistent_volume_claim = MagicMock()
+    pvc.spec.volumes = [vol_p]
+    assert _pod_volume_is_ephemeral(pvc) is False
+
+
+# =============================================================================
 # snapshot / restore
 # =============================================================================
 
