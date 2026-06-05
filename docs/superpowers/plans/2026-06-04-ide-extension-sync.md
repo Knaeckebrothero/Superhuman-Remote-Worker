@@ -1,6 +1,6 @@
 # IDE Extension & Profile Sync Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Make a user's code-server extensions (and the license/state that unlocks paid ones like Monokai Pro) follow them into every new workspace, completing the per-user IDE persistence that today only covers config files.
 
@@ -9,6 +9,10 @@
 **Tech Stack:** Python 3.12 (asyncio), pytest, code-server CLI (`--install-extension`, `--list-extensions`), Open VSX REST API, boto3/MinIO (S3), Kubernetes ConfigMaps, POSIX shell (workspace entrypoint), Helm.
 
 **Spec:** `docs/superpowers/specs/2026-06-04-ide-extension-sync-design.md`
+
+> **STATUS — SHIPPED & VERIFIED (2026-06-05).** Phases A and B are implemented, unit-tested (62 tests green), committed on `develop`, deployed to dev, and live-verified. Two deviations surfaced during execution and are reflected in the code (not in the task bodies below):
+> - **B5/B6 entrypoint ordering fix (commit `0578e3fd`):** the sentinel wait deadlocked because the readiness probe is `tcpSocket:30022` (sshd) and the orchestrator only pushes state post-Ready. sshd now starts *before* the bounded wait (and anchors the container via `wait $SSHD_PID`), so the pod can reach Ready during the wait. Verified on workspace image `sha-ce443c0`: no timeout, globalStorage present before code-server's first paint.
+> - **B3 bytes-folder resolution fix (commit `c052f7c7`):** capture tarred a bare `EXTENSIONS_DIR/{id}-{ver}` (Step 3 / line ~1264 below), but code-server names folders `{id}-{ver}-{platform}` (e.g. `-universal`). `capture_ide_profile` now calls `_resolve_ext_dir()` to find the real folder first. Deployed on orchestrator `sha-c052f7c`.
 
 ---
 
@@ -36,7 +40,7 @@
 - Modify: `orchestrator/services/ide_settings.py` (add constants near line 43-50; add functions after `parse_pull_output`, ~line 107)
 - Test: `tests/test_ide_settings.py`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 # tests/test_ide_settings.py — add import and a new test class
@@ -68,12 +72,12 @@ class TestExtensionList:
         assert "package.json" in script
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/test_ide_settings.py::TestExtensionList -v`
 Expected: FAIL with `ImportError: cannot import name 'build_extensions_list_script'`
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 ```python
 # ide_settings.py — add near the other CODE_SERVER_* constants (~line 46)
@@ -123,12 +127,12 @@ def parse_extensions_list(stdout: str) -> dict[str, dict]:
     return result
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `pytest tests/test_ide_settings.py::TestExtensionList -v`
 Expected: PASS (3 passed)
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add orchestrator/services/ide_settings.py tests/test_ide_settings.py
@@ -143,7 +147,7 @@ git commit -m "feat(ide-ext): remote extension-list script + parser"
 - Modify: `orchestrator/services/ide_settings.py` (add after `parse_extensions_list`)
 - Test: `tests/test_ide_settings.py`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 from orchestrator.services.ide_settings import OpenVsxClassifier
@@ -193,12 +197,12 @@ class TestOpenVsxClassifier:
         assert await clf.classify("a.b", "1.0.0") == "bytes"
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/test_ide_settings.py::TestOpenVsxClassifier -v`
 Expected: FAIL with `ImportError: cannot import name 'OpenVsxClassifier'`
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 ```python
 # ide_settings.py
@@ -249,12 +253,12 @@ class OpenVsxClassifier:
         return source
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `pytest tests/test_ide_settings.py::TestOpenVsxClassifier -v`
 Expected: PASS (4 passed)
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add orchestrator/services/ide_settings.py tests/test_ide_settings.py
@@ -269,7 +273,7 @@ git commit -m "feat(ide-ext): Open VSX availability classifier with cache"
 - Modify: `orchestrator/services/ide_settings.py` (add methods to `IdeSettingsStore`, after `apply_pulled_files`)
 - Test: `tests/test_ide_settings.py`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 class TestExtensionStore:
@@ -310,12 +314,12 @@ class TestExtensionStore:
         assert files["settings.json"] == _f("x", 1.0)  # not clobbered by shallow merge
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/test_ide_settings.py::TestExtensionStore -v`
 Expected: FAIL with `AttributeError: 'IdeSettingsStore' object has no attribute 'apply_extensions'`
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 ```python
 # ide_settings.py — module-level helper
@@ -378,12 +382,12 @@ async def apply_extensions(self, user_id: str, items: dict[str, dict]) -> list[s
     return changed
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `pytest tests/test_ide_settings.py::TestExtensionStore -v`
 Expected: PASS (3 passed)
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add orchestrator/services/ide_settings.py tests/test_ide_settings.py
@@ -398,7 +402,7 @@ git commit -m "feat(ide-ext): per-user extension manifest store (union, newest-v
 - Modify: `orchestrator/services/ide_settings.py` (add after `build_seed_script`)
 - Test: `tests/test_ide_settings.py`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 from orchestrator.services.ide_settings import build_extension_install_script
@@ -425,12 +429,12 @@ class TestExtensionInstallScript:
         assert theme_idx < bg_idx
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/test_ide_settings.py::TestExtensionInstallScript -v`
 Expected: FAIL with `ImportError: cannot import name 'build_extension_install_script'`
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 ```python
 # ide_settings.py
@@ -468,12 +472,12 @@ def build_extension_install_script(items: dict[str, dict]) -> str:
     return "".join(parts)
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `pytest tests/test_ide_settings.py::TestExtensionInstallScript -v`
 Expected: PASS (2 passed)
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add orchestrator/services/ide_settings.py tests/test_ide_settings.py
@@ -488,7 +492,7 @@ git commit -m "feat(ide-ext): extension-install seed script (theme-first, openvs
 - Modify: `orchestrator/services/ide_settings.py` (add `reconcile_extensions` after `reconcile_ide_settings`)
 - Test: `tests/test_ide_settings.py`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 from orchestrator.services.ide_settings import reconcile_extensions
@@ -530,12 +534,12 @@ class TestReconcileExtensions:
         assert await reconcile_extensions(store, workspaces, list_fn, FakeClf()) == 0
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/test_ide_settings.py::TestReconcileExtensions -v`
 Expected: FAIL with `ImportError: cannot import name 'reconcile_extensions'`
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 ```python
 # ide_settings.py
@@ -605,12 +609,12 @@ async def reconcile_extensions(
     return changed_total
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `pytest tests/test_ide_settings.py::TestReconcileExtensions -v`
 Expected: PASS (2 passed)
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add orchestrator/services/ide_settings.py tests/test_ide_settings.py
@@ -625,7 +629,7 @@ git commit -m "feat(ide-ext): list + reconcile extensions into the user manifest
 - Modify: `orchestrator/main.py:728-760` (inside `code_server_settings_sweeper`)
 - Test: manual (sweeper is glue; covered by A5 unit tests + live verification A10)
 
-- [ ] **Step 1: Extend the sweeper loop body**
+- [x] **Step 1: Extend the sweeper loop body**
 
 In `code_server_settings_sweeper`, extend the import and the per-cycle work. Current import block (~line 748):
 
@@ -669,7 +673,7 @@ Inside the `while` loop, after the existing files reconcile (`count = await reco
                 logger.error("Error reconciling extensions: %s", e)
 ```
 
-- [ ] **Step 2: Verify it imports + compiles**
+- [x] **Step 2: Verify it imports + compiles**
 
 Run: `python -c "import ast,sys; ast.parse(open('orchestrator/main.py').read()); print('ok')"`
 Expected: `ok`
@@ -677,7 +681,7 @@ Expected: `ok`
 Run: `ruff check orchestrator/main.py orchestrator/services/ide_settings.py`
 Expected: `All checks passed!`
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add orchestrator/main.py
@@ -692,7 +696,7 @@ git commit -m "feat(ide-ext): reconcile extensions in the code-server settings s
 - Modify: `orchestrator/services/container_provisioner.py:686-733` (`_resolve_ide_seed_files`, `_create_seed_configmap`)
 - Test: manual + live (A10). The script content is unit-tested in A4.
 
-- [ ] **Step 1: Resolve extensions alongside files**
+- [x] **Step 1: Resolve extensions alongside files**
 
 `_resolve_ide_seed_files` (line 686) currently returns the user's `files` dict. Add a sibling resolver and have `_create_seed_configmap` compose both. Add a method next to `_resolve_ide_seed_files`:
 
@@ -711,7 +715,7 @@ async def _resolve_ide_extensions(self, owner: "WorkspaceOwner") -> dict:
         return {}
 ```
 
-- [ ] **Step 2: Compose `seed.sh` = files + extension installs**
+- [x] **Step 2: Compose `seed.sh` = files + extension installs**
 
 In `_create_seed_configmap` (line 715), it currently builds `data={"seed.sh": build_seed_script(files)}`. Change the call sites (lines 189 and 494) that compute `seed_files` to also pass extensions, and update `_create_seed_configmap` to accept and append the install script.
 
@@ -759,13 +763,13 @@ At the two call sites (lines ~189 and ~494), where `seed_files = await self._res
         seed_cm = await self._create_seed_configmap(pod_name, seed_files, seed_exts)
 ```
 
-- [ ] **Step 3: Verify compile + lint**
+- [x] **Step 3: Verify compile + lint**
 
 Run: `python -c "import ast; ast.parse(open('orchestrator/services/container_provisioner.py').read()); print('ok')"`
 Run: `ruff check orchestrator/services/container_provisioner.py`
 Expected: `ok` then `All checks passed!`
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add orchestrator/services/container_provisioner.py
@@ -781,7 +785,7 @@ git commit -m "feat(ide-ext): carry extension-install manifest in the seed Confi
 - Modify call sites: `orchestrator/services/nats_bridge.py` (`_seed_vm_ide_config`), `orchestrator/services/ide_session.py` (`_restore_vm_session`) — no signature change needed if we extend the helper.
 - Test: `tests/test_ide_settings.py`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 class TestSeedForUserInstallsExtensions:
@@ -804,12 +808,12 @@ class TestSeedForUserInstallsExtensions:
         assert "monokai.theme-monokai-pro-vscode@2.0.13" in joined         # extension installed
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/test_ide_settings.py::TestSeedForUserInstallsExtensions -v`
 Expected: FAIL — the extension ref is not in the seeded script yet.
 
-- [ ] **Step 3: Extend `seed_ide_config_for_user`**
+- [x] **Step 3: Extend `seed_ide_config_for_user`**
 
 ```python
 async def seed_ide_config_for_user(
@@ -844,12 +848,12 @@ async def seed_ide_config_for_user(
 
 (The `nats_bridge._seed_vm_ide_config` and `ide_session._restore_vm_session` call sites already call `seed_ide_config_for_user`, so they gain extension install for free.)
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `pytest tests/test_ide_settings.py::TestSeedForUserInstallsExtensions -v`
 Expected: PASS
 
-- [ ] **Step 5: Run the full module test + lint + commit**
+- [x] **Step 5: Run the full module test + lint + commit**
 
 Run: `pytest tests/test_ide_settings.py -v`
 Expected: all pass (existing + new)
@@ -866,8 +870,8 @@ git commit -m "feat(ide-ext): VM-ready/restore seed installs the user's extensio
 
 **Files:** none (verification). Mirrors how the file-sync was verified.
 
-- [ ] **Step 1:** In an active session's IDE, install a **free Open VSX** extension (e.g. a theme like "Dracula Official") and set it as the color theme.
-- [ ] **Step 2:** Confirm capture — wait one sweep (≤10 min), then:
+- [x] **Step 1:** In an active session's IDE, install a **free Open VSX** extension (e.g. a theme like "Dracula Official") and set it as the color theme.
+- [x] **Step 2:** Confirm capture — wait one sweep (≤10 min), then:
 
 ```bash
 kubectl --context main -n superhuman-remote-worker exec srw-postgres-0 -- \
@@ -875,7 +879,7 @@ kubectl --context main -n superhuman-remote-worker exec srw-postgres-0 -- \
 ```
 Expected: the extension id present with `"source": "openvsx"`.
 
-- [ ] **Step 3:** Provision a fresh session; once the pod is Running:
+- [x] **Step 3:** Provision a fresh session; once the pod is Running:
 
 ```bash
 WS=<new ws-thread pod>; kubectl --context main -n superhuman-remote-worker exec $WS -- \
@@ -883,8 +887,8 @@ WS=<new ws-thread pod>; kubectl --context main -n superhuman-remote-worker exec 
 ```
 Expected: the extension folder present; `--install-extension <id>@<ver>` in seed.sh.
 
-- [ ] **Step 4:** Open the new session's IDE; confirm the theme is applied on load.
-- [ ] **Step 5:** Commit nothing (verification only). If issues found, fix forward with new TDD tasks.
+- [x] **Step 4:** Open the new session's IDE; confirm the theme is applied on load.
+- [x] **Step 5:** Commit nothing (verification only). If issues found, fix forward with new TDD tasks.
 
 ---
 
@@ -896,7 +900,7 @@ Expected: the extension folder present; `--install-extension <id>@<ver>` in seed
 - Create: `orchestrator/services/ide_profile_store.py`
 - Test: `tests/test_ide_profile_store.py`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 # tests/test_ide_profile_store.py
@@ -964,12 +968,12 @@ async def test_ext_bytes_exists(tmp_path):
     assert await store.ext_bytes_exists(UID, "a.b", "1.0.0") is True
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/test_ide_profile_store.py -v`
 Expected: FAIL with `ModuleNotFoundError: No module named 'orchestrator.services.ide_profile_store'`
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 ```python
 # orchestrator/services/ide_profile_store.py
@@ -1051,12 +1055,12 @@ class IdeProfileStore:
         return await asyncio.to_thread(_do)
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `pytest tests/test_ide_profile_store.py -v`
 Expected: PASS (5 passed)
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add orchestrator/services/ide_profile_store.py tests/test_ide_profile_store.py
@@ -1071,7 +1075,7 @@ git commit -m "feat(ide-ext): S3 profile store for globalStorage + extension byt
 - Modify: `orchestrator/services/ide_settings.py`
 - Test: `tests/test_ide_settings.py`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 from orchestrator.services.ide_settings import build_signature_script, parse_signature
@@ -1089,9 +1093,9 @@ class TestSignature:
         assert parse_signature("") == ""
 ```
 
-- [ ] **Step 2: Run** `pytest tests/test_ide_settings.py::TestSignature -v` — FAIL (ImportError).
+- [x] **Step 2: Run** `pytest tests/test_ide_settings.py::TestSignature -v` — FAIL (ImportError).
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 ```python
 # ide_settings.py
@@ -1112,8 +1116,8 @@ def parse_signature(stdout: str) -> str:
     return stdout.strip().split()[0] if stdout.strip() else ""
 ```
 
-- [ ] **Step 4: Run** `pytest tests/test_ide_settings.py::TestSignature -v` — PASS.
-- [ ] **Step 5: Commit**
+- [x] **Step 4: Run** `pytest tests/test_ide_settings.py::TestSignature -v` — PASS.
+- [x] **Step 5: Commit**
 
 ```bash
 git add orchestrator/services/ide_settings.py tests/test_ide_settings.py
@@ -1128,7 +1132,7 @@ git commit -m "feat(ide-ext): cheap change-signature for extensions+globalStorag
 - Modify: `orchestrator/services/ide_settings.py` (add `capture_ide_profile`)
 - Test: `tests/test_ide_settings.py` (mock runner + fake profile store + monkeypatched subprocess)
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 class TestCaptureProfile:
@@ -1155,9 +1159,9 @@ class TestCaptureProfile:
 
 (Full capture wiring — SSH-tar of `globalStorage`/bytes via a `_tar_fn` injection — is exercised live in B8; the unit test pins the **signature-skip** fast path, which is the costly-path guard.)
 
-- [ ] **Step 2: Run** `pytest tests/test_ide_settings.py::TestCaptureProfile -v` — FAIL (ImportError).
+- [x] **Step 2: Run** `pytest tests/test_ide_settings.py::TestCaptureProfile -v` — FAIL (ImportError).
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 ```python
 # ide_settings.py — add to IdeSettingsStore: signature get/set helpers
@@ -1270,8 +1274,8 @@ async def capture_ide_profile(
     return uploaded
 ```
 
-- [ ] **Step 4: Run** `pytest tests/test_ide_settings.py::TestCaptureProfile -v` — PASS.
-- [ ] **Step 5: Commit**
+- [x] **Step 4: Run** `pytest tests/test_ide_settings.py::TestCaptureProfile -v` — PASS.
+- [x] **Step 5: Commit**
 
 ```bash
 git add orchestrator/services/ide_settings.py tests/test_ide_settings.py
@@ -1286,7 +1290,7 @@ git commit -m "feat(ide-ext): capture globalStorage + bytes extensions to S3 (si
 - Modify: `orchestrator/services/ide_settings.py` (add `seed_ide_profile`)
 - Test: `tests/test_ide_settings.py`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 class TestSeedProfile:
@@ -1315,9 +1319,9 @@ class TestSeedProfile:
 
 > NOTE for implementer: the test above needs a small async `_ok()` helper returning True and a `_push_fn` injection point that mirrors `_tar_fn` (pushes a local tar into the pod via `ssh ... 'zstd -d | tar -xf - -C /'`). Define `_push_fn` default `_ssh_untar_from_file` analogous to `_ssh_tar_to_file`. Write the helper test-first the same way (a runner-injected push) — keep the public `seed_ide_profile` signature stable.
 
-- [ ] **Step 2: Run** the test — FAIL (ImportError).
+- [x] **Step 2: Run** the test — FAIL (ImportError).
 
-- [ ] **Step 3: Implement** `_ssh_untar_from_file` (reverse of `_ssh_tar_to_file`: `cat local | ssh ... 'zstd -d | tar -xf - -C /'`) and:
+- [x] **Step 3: Implement** `_ssh_untar_from_file` (reverse of `_ssh_tar_to_file`: `cat local | ssh ... 'zstd -d | tar -xf - -C /'`) and:
 
 ```python
 async def seed_ide_profile(
@@ -1361,8 +1365,8 @@ async def seed_ide_profile(
         return False
 ```
 
-- [ ] **Step 4: Run** the test — PASS.
-- [ ] **Step 5: Commit**
+- [x] **Step 4: Run** the test — PASS.
+- [x] **Step 5: Commit**
 
 ```bash
 git add orchestrator/services/ide_settings.py tests/test_ide_settings.py
@@ -1376,7 +1380,7 @@ git commit -m "feat(ide-ext): restore globalStorage/bytes into a workspace + sen
 **Files:**
 - Modify: `docker/workspace-entrypoint.sh` (between section 2b at line 49 and code-server start at line 56)
 
-- [ ] **Step 1: Add the gated wait**
+- [x] **Step 1: Add the gated wait**
 
 After the `seed.sh` block (line 49), insert:
 
@@ -1397,12 +1401,12 @@ if [ -f /mnt/code-server-config/expect-state ]; then
 fi
 ```
 
-- [ ] **Step 2: Validate shell syntax**
+- [x] **Step 2: Validate shell syntax**
 
 Run: `bash -n docker/workspace-entrypoint.sh`
 Expected: no output (valid)
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add docker/workspace-entrypoint.sh
@@ -1417,7 +1421,7 @@ git commit -m "feat(ide-ext): entrypoint waits (bounded) for the state seed sent
 - Modify: `orchestrator/services/container_provisioner.py` (`_create_seed_configmap` adds the flag; add a post-provision `_seed_workspace_state` call after the pod is Ready)
 - Test: manual + live (B8)
 
-- [ ] **Step 1: Add the `expect-state` flag to the ConfigMap when state exists**
+- [x] **Step 1: Add the `expect-state` flag to the ConfigMap when state exists**
 
 In `_create_seed_configmap`, after composing `data["seed.sh"]`, when the user has a stored globalStorage signature or any `bytes` extension, add a marker file:
 
@@ -1432,7 +1436,7 @@ In `_create_seed_configmap`, after composing `data["seed.sh"]`, when the user ha
 
 (The ConfigMap is mounted at `/mnt/code-server-config`, so `expect-state` becomes `/mnt/code-server-config/expect-state`, matching the entrypoint check.) Thread `owner` into `_create_seed_configmap` or compute `needs_state` at the call site and pass a bool — keep the signature explicit: `_create_seed_configmap(pod_name, files, extensions, needs_state=False)`.
 
-- [ ] **Step 2: Stream state after the pod is Ready**
+- [x] **Step 2: Stream state after the pod is Ready**
 
 Add a method that the post-Ready path calls (containers don't have a daemon-register hook like VMs, so reuse the existing readiness wait in `create_workspace`/`create_ide_pod` — after the pod reports Ready and `pod_ip` is known):
 
@@ -1462,12 +1466,12 @@ Call it (as a fire-and-forget task) right after the pod becomes Ready in both `c
         asyncio.create_task(self._seed_workspace_state(owner, pod_ip))
 ```
 
-- [ ] **Step 3: Compile + lint**
+- [x] **Step 3: Compile + lint**
 
 Run: `python -c "import ast; ast.parse(open('orchestrator/services/container_provisioner.py').read()); print('ok')"`
 Run: `ruff check orchestrator/services/container_provisioner.py`
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add orchestrator/services/container_provisioner.py
@@ -1483,7 +1487,7 @@ git commit -m "feat(ide-ext): stream globalStorage/bytes state into Ready contai
 - Modify: `orchestrator/services/workspace_suspension.py` (opportunistic `capture_ide_profile` on graceful suspend)
 - Modify: `orchestrator/services/nats_bridge.py`, `ide_session.py` (after `seed_ide_config_for_user`, call `seed_ide_profile` for VM/restore)
 
-- [ ] **Step 1: Sweeper captures state (S3-gated)**
+- [x] **Step 1: Sweeper captures state (S3-gated)**
 
 In `code_server_settings_sweeper`, after the extension reconcile, when `snapshot_service.is_available`, build one `IdeProfileStore` and call `capture_ide_profile` per workspace:
 
@@ -1506,7 +1510,7 @@ In `code_server_settings_sweeper`, after the extension reconcile, when `snapshot
                             logger.warning("ide profile capture failed: %s", e)
 ```
 
-- [ ] **Step 2: Suspend + VM/restore hooks**
+- [x] **Step 2: Suspend + VM/restore hooks**
 
 In `workspace_suspension.py` graceful path (where the file pull already happens), add the same `capture_ide_profile` call for `job.get("user_id")`. In `nats_bridge._seed_vm_ide_config` and `ide_session._restore_vm_session`, after the existing `seed_ide_config_for_user(...)`, add (when S3 available):
 
@@ -1523,12 +1527,12 @@ In `workspace_suspension.py` graceful path (where the file pull already happens)
             )
 ```
 
-- [ ] **Step 3: Compile + lint all touched files**
+- [x] **Step 3: Compile + lint all touched files**
 
 Run: `python -c "import ast; [ast.parse(open(f).read()) for f in ['orchestrator/main.py','orchestrator/services/workspace_suspension.py','orchestrator/services/nats_bridge.py','orchestrator/services/ide_session.py']]; print('ok')"`
 Run: `ruff check orchestrator/`
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add orchestrator/main.py orchestrator/services/workspace_suspension.py orchestrator/services/nats_bridge.py orchestrator/services/ide_session.py
@@ -1541,8 +1545,8 @@ git commit -m "feat(ide-ext): capture state on sweep/suspend; seed state on VM-r
 
 **Files:** none (verification).
 
-- [ ] **Step 1:** In a session IDE, install **Monokai Pro**, enter its license key, set the theme. Also install a deliberately **non-Open-VSX** extension (to exercise the `bytes` path).
-- [ ] **Step 2:** Trigger capture (graceful suspend or wait a sweep). Confirm in S3:
+- [x] **Step 1:** In a session IDE, install **Monokai Pro**, enter its license key, set the theme. Also install a deliberately **non-Open-VSX** extension (to exercise the `bytes` path).
+- [x] **Step 2:** Trigger capture (graceful suspend or wait a sweep). Confirm in S3:
 
 ```bash
 kubectl --context main -n superhuman-remote-worker exec srw-postgres-0 -- \
@@ -1553,9 +1557,9 @@ kubectl --context main -n superhuman-remote-worker exec <orchestrator-pod> -- \
 ```
 Expected: `globalStorage.tar.zst` (and an `ext/<id>/<ver>.tar.zst` for the non-Open-VSX one).
 
-- [ ] **Step 3:** Provision a fresh session. Confirm the pod gets `/mnt/code-server-config/expect-state`, the sentinel `.ide-seed-state-done` appears, globalStorage is restored, and the bytes extension folder exists.
-- [ ] **Step 4:** Open the new IDE → **Monokai Pro active, no license nag** on first paint; the non-Open-VSX extension present.
-- [ ] **Step 5:** Verification only — no commit.
+- [x] **Step 3:** Provision a fresh session. Confirm the pod gets `/mnt/code-server-config/expect-state`, the sentinel `.ide-seed-state-done` appears, globalStorage is restored, and the bytes extension folder exists.
+- [x] **Step 4:** Open the new IDE → **Monokai Pro active, no license nag** on first paint; the non-Open-VSX extension present.
+- [x] **Step 5:** Verification only — no commit.
 
 ---
 
