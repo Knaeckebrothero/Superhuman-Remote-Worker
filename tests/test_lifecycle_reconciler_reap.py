@@ -39,11 +39,9 @@ class _StatefulNonReapable:
     async def is_idle(self, inst):
         return False
 
-    async def signal_drain_pending(self, inst):
-        ...
+    async def signal_drain_pending(self, inst): ...
 
-    async def drain(self, inst, grace_s):
-        ...
+    async def drain(self, inst, grace_s): ...
 
     async def delete(self, inst, grace_s):
         self.delete_calls.append(inst.id)
@@ -51,8 +49,7 @@ class _StatefulNonReapable:
     async def snapshot(self, inst):
         return None
 
-    async def restore(self, inst, snapshot_ref):
-        ...
+    async def restore(self, inst, snapshot_ref): ...
 
 
 def _stateful_mgr(
