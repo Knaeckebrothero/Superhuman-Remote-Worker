@@ -155,6 +155,26 @@ def parse_extensions_list(stdout: str) -> dict[str, dict]:
     return result
 
 
+def build_signature_script() -> str:
+    """Remote shell: a cheap content signature over the extensions dir and
+    globalStorage (paths + sizes + mtimes), hashed. Used to skip byte-copy when
+    nothing changed. ``find -printf`` is GNU; falls back to ``ls -laR`` if absent.
+    """
+    targets = f"{EXTENSIONS_DIR} {GLOBAL_STORAGE_DIR}"
+    return (
+        f"if find {targets} -maxdepth 0 >/dev/null 2>&1; then\n"
+        f"  (find {targets} -printf '%p %s %T@\\n' 2>/dev/null "
+        f"   || ls -laR {targets} 2>/dev/null) | sort | sha256sum\n"
+        "else echo ''; fi\n"
+    )
+
+
+def parse_signature(stdout: str) -> str:
+    """Take the first whitespace-delimited token (the sha256 hex) from the
+    signature script's stdout; empty string when there's nothing to hash."""
+    return stdout.strip().split()[0] if stdout.strip() else ""
+
+
 OPEN_VSX_API = "https://open-vsx.org/api"
 
 # Fetch signature: (url) -> http_status_int
