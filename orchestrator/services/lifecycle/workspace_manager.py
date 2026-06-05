@@ -365,6 +365,12 @@ class WorkspaceInstanceManager:
                 ssh_host=ssh_host,
                 ssh_port=30022,
                 source_type="pod",
+                entity_type=(
+                    "threads"
+                    if "srw/thread-id" in (inst.metadata.get("labels") or {})
+                    else "jobs"
+                ),
+                work_marker=inst.metadata.get("total_turns"),
             )
             if ok:
                 # Success clears the escape-hatch retry counter.
