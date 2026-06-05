@@ -274,6 +274,55 @@ class TestIsHealthy:
 
 
 # =============================================================================
+# is_reapable (teardown eligibility — superset of is_idle)
+# =============================================================================
+
+
+class TestIsReapable:
+    @pytest.mark.asyncio
+    async def test_completed_job_is_reapable(self):
+        mgr, *_ = _make_manager()
+        inst = Instance(kind="workspace", id="x", metadata={"job_status": "completed"})
+        assert await mgr.is_reapable(inst) is True
+
+    @pytest.mark.asyncio
+    async def test_failed_job_is_reapable(self):
+        mgr, *_ = _make_manager()
+        inst = Instance(kind="workspace", id="x", metadata={"job_status": "failed"})
+        assert await mgr.is_reapable(inst) is True
+
+    @pytest.mark.asyncio
+    async def test_paused_job_is_reapable(self):
+        mgr, *_ = _make_manager()
+        inst = Instance(kind="workspace", id="x", metadata={"job_status": "paused"})
+        assert await mgr.is_reapable(inst) is True
+
+    @pytest.mark.asyncio
+    async def test_processing_job_not_reapable(self):
+        mgr, *_ = _make_manager()
+        inst = Instance(kind="workspace", id="x", metadata={"job_status": "processing"})
+        assert await mgr.is_reapable(inst) is False
+
+    @pytest.mark.asyncio
+    async def test_ended_thread_is_reapable(self):
+        mgr, *_ = _make_manager()
+        inst = Instance(kind="workspace", id="x", metadata={"thread_status": "ended"})
+        assert await mgr.is_reapable(inst) is True
+
+    @pytest.mark.asyncio
+    async def test_active_thread_not_reapable(self):
+        mgr, *_ = _make_manager()
+        inst = Instance(kind="workspace", id="x", metadata={"thread_status": "active"})
+        assert await mgr.is_reapable(inst) is False
+
+    @pytest.mark.asyncio
+    async def test_no_status_not_reapable(self):
+        mgr, *_ = _make_manager()
+        inst = Instance(kind="workspace", id="x", metadata={})
+        assert await mgr.is_reapable(inst) is False
+
+
+# =============================================================================
 # snapshot / restore
 # =============================================================================
 
