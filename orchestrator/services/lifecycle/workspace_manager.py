@@ -106,6 +106,20 @@ class WorkspaceInstanceManager:
                 row = await self._fetch_thread(thread_id)
                 if row is not None:
                     metadata["thread_status"] = row.get("status")
+                    metadata["total_turns"] = row.get("total_turns") or 0
+                    md = row.get("metadata") or {}
+                    if isinstance(md, str):
+                        try:
+                            md = json.loads(md)
+                        except (json.JSONDecodeError, ValueError):
+                            md = {}
+                    ws = md.get("workspace_container") or {}
+                    metadata["workspace_status"] = ws.get("status")
+                    metadata["pod_ip"] = ws.get("pod_ip")
+                    metadata["last_snapshot_turns"] = ws.get("last_snapshot_turns")
+                    metadata["snapshot_attempts"] = ws.get("snapshot_attempts") or 0
+                    snap = md.get("snapshot") or {}
+                    metadata["snapshot_status"] = snap.get("status")
             elif job_id:
                 row = await self._fetch_job(job_id)
                 if row is not None:
@@ -119,6 +133,9 @@ class WorkspaceInstanceManager:
                     ws_ctx = ctx.get("workspace_container") or {}
                     metadata["workspace_status"] = ws_ctx.get("status")
                     metadata["pod_ip"] = ws_ctx.get("pod_ip")
+                    metadata["snapshot_attempts"] = ws_ctx.get("snapshot_attempts") or 0
+                    snap = ctx.get("snapshot") or {}
+                    metadata["snapshot_status"] = snap.get("status")
 
             instances.append(
                 Instance(
@@ -179,6 +196,34 @@ class WorkspaceInstanceManager:
         if thread_status:
             return thread_status in _TERMINAL_THREAD_STATUSES
         return False
+
+    async def is_dirty(self, inst: Instance) -> bool:
+        """True when the workspace may hold un-snapshotted state worth saving.
+
+        Threads: precise — current ``total_turns`` vs the turn count recorded
+        at last snapshot (``last_snapshot_turns``). Zero turns, or turns equal
+        to the snapshot, means clean.
+
+        Jobs: no monotonic turn counter exists in Postgres (audit count is in
+        Mongo — deliberately not consulted here). Conservative: a terminal job
+        with an existing snapshot is clean (it got a completion capture);
+        otherwise dirty (attempt a snapshot; the escape hatch bounds the
+        unreachable case).
+
+        NOTE: never reads ``last_activity`` — it is bumped by the orchestrator's
+        own context merges and cannot distinguish real work from bookkeeping.
+        """
+        thread_status = inst.metadata.get("thread_status")
+        if thread_status is not None:
+            turns = inst.metadata.get("total_turns") or 0
+            snap_turns = inst.metadata.get("last_snapshot_turns")
+            if snap_turns is None:
+                return turns > 0
+            return turns > snap_turns
+        # Job path: no turn counter.
+        if self._is_terminal(inst):
+            return inst.metadata.get("snapshot_status") != "available"
+        return True
 
     async def snapshot(self, inst: Instance) -> str | None:
         """Capture the workspace contents to S3.
@@ -294,7 +339,8 @@ class WorkspaceInstanceManager:
         try:
             async with self._db.acquire() as conn:
                 row = await conn.fetchrow(
-                    "SELECT id, status, ended_at, agent_id FROM threads WHERE id = $1",
+                    "SELECT id, status, ended_at, agent_id, total_turns, metadata "
+                    "FROM threads WHERE id = $1",
                     thread_id,
                 )
             return dict(row) if row else None
