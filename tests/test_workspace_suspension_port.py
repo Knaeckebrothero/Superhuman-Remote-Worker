@@ -1,4 +1,5 @@
 """Port resolution: pod workspaces use 30022, not the VM-shaped default 22."""
+
 from __future__ import annotations
 
 from orchestrator.services.workspace_suspension import _resolve_ssh_port

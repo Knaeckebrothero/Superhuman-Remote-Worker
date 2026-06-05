@@ -204,9 +204,7 @@ class InstanceLifecycleReconciler:
                     try:
                         await self._reap(manager, inst, stats)
                     except Exception:
-                        logger.exception(
-                            "Reap failed for kind=%s id=%s", kind, inst.id
-                        )
+                        logger.exception("Reap failed for kind=%s id=%s", kind, inst.id)
             report[kind] = stats
             if any(v for k, v in stats.items() if k != "listed"):
                 logger.info(

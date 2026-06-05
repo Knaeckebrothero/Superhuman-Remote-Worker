@@ -1,4 +1,5 @@
 """Reap-branch decision-flow tests for InstanceLifecycleReconciler.tick()."""
+
 from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock
@@ -12,8 +13,16 @@ from orchestrator.services.lifecycle import (
 )
 
 
-def _stateful_mgr(inst, *, healthy=True, reapable=True, dirty=False,
-                  reachable=False, exhausted=False, snapshot_ref=None):
+def _stateful_mgr(
+    inst,
+    *,
+    healthy=True,
+    reapable=True,
+    dirty=False,
+    reachable=False,
+    exhausted=False,
+    snapshot_ref=None,
+):
     mgr = MagicMock(spec=StatefulInstanceManager)
     mgr.kind = "workspace"
     mgr.expected_versions = AsyncMock(return_value=set())
