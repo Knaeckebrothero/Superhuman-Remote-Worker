@@ -175,6 +175,9 @@ class TestReconciler:
                 "drift": 0,
                 "drained": 0,
                 "skipped_busy": 0,
+                "reaped": 0,
+                "reap_attempts": 0,
+                "reap_forced": 0,
             }
         }
 

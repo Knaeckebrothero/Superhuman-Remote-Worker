@@ -21,7 +21,10 @@ from orchestrator.services.ide_settings import (
     build_extension_install_script,
     build_extensions_list_script,
     build_seed_script,
+    build_signature_script,
+    capture_ide_profile,
     parse_extensions_list,
+    parse_signature,
     parse_pull_output,
     pull_ide_config,
     reconcile_extensions,
@@ -783,3 +786,82 @@ class TestSeedForUserInstallsExtensions:
         assert (
             "monokai.theme-monokai-pro-vscode@2.0.13" in joined
         )  # extension installed
+
+
+class TestSignature:
+    def test_script_covers_extensions_and_globalstorage(self):
+        s = build_signature_script()
+        assert "/var/lib/code-server/extensions" in s
+        assert "/var/lib/code-server/User/globalStorage" in s
+        assert "sha256sum" in s
+
+    def test_parse_takes_first_token(self):
+        assert parse_signature("abc123  -\n") == "abc123"
+        assert parse_signature("") == ""
+
+
+class TestCaptureProfile:
+    @pytest.mark.asyncio
+    async def test_skips_when_signature_unchanged(self):
+        db = FakeSettingsDB({UID: {"ide": {"extensions": {"sig": "SAME"}}}})
+        store = IdeSettingsStore(db)
+
+        async def sig_runner(host, port, script, key_path=None, timeout=20):
+            return 0, b"SAME  -\n", b""
+
+        captured = {"called": False}
+
+        class FakeProfileStore:
+            async def put_globalstorage(self, *a, **k):
+                captured["called"] = True
+
+        n = await capture_ide_profile(
+            store,
+            UID,
+            "10.0.0.1",
+            30022,
+            FakeProfileStore(),
+            _runner=sig_runner,
+            _tar_fn=None,
+        )
+        assert n == 0 and captured["called"] is False
+
+
+class TestSeedProfile:
+    @pytest.mark.asyncio
+    async def test_extracts_globalstorage_and_touches_sentinel(self, tmp_path):
+        # profile store yields a blob; runner records the extract+sentinel script
+        scripts = []
+
+        async def _ok(*a, **k):
+            return True
+
+        class FakeProfileStore:
+            async def get_globalstorage(self, uid, path):
+                with open(path, "wb") as f:
+                    f.write(b"GS")
+                return True
+
+            async def get_ext_bytes(self, *a, **k):
+                return False
+
+        async def fake_runner(host, port, script, key_path=None, timeout=20):
+            scripts.append(script)
+            return 0, b"", b""
+
+        from orchestrator.services.ide_settings import (
+            SEED_STATE_SENTINEL,
+            seed_ide_profile,
+        )
+
+        ok = await seed_ide_profile(
+            user_id=UID,
+            ssh_host="h",
+            ssh_port=30022,
+            profile_store=FakeProfileStore(),
+            ext_items={},
+            _runner=fake_runner,
+            _push_fn=lambda *a, **k: _ok(),
+        )
+        assert ok is True
+        assert any(SEED_STATE_SENTINEL in s for s in scripts)
