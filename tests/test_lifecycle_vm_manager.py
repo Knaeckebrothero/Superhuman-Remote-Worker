@@ -203,14 +203,26 @@ class TestListInstances:
         # to the reconciler — otherwise reap/drift/crash re-fire every tick on
         # an already-torn-down VM (the force-delete loop seen on dev).
         jobs = [
-            {"id": "j-deleting", "status": "paused",
-             "context": {"vm": {"status": "deleting"}}},
-            {"id": "j-deleted", "status": "paused",
-             "context": {"vm": {"status": "deleted"}}},
-            {"id": "j-suspended", "status": "paused",
-             "context": {"vm": {"status": "suspended"}}},
-            {"id": "j-ready", "status": "paused",
-             "context": {"vm": {"status": "ready", "ssh_host": "10.0.0.9"}}},
+            {
+                "id": "j-deleting",
+                "status": "paused",
+                "context": {"vm": {"status": "deleting"}},
+            },
+            {
+                "id": "j-deleted",
+                "status": "paused",
+                "context": {"vm": {"status": "deleted"}},
+            },
+            {
+                "id": "j-suspended",
+                "status": "paused",
+                "context": {"vm": {"status": "suspended"}},
+            },
+            {
+                "id": "j-ready",
+                "status": "paused",
+                "context": {"vm": {"status": "ready", "ssh_host": "10.0.0.9"}},
+            },
         ]
         mgr, *_ = _make_manager(job_rows=jobs)
         instances = await mgr.list_instances()
