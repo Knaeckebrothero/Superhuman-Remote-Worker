@@ -825,3 +825,43 @@ class TestCaptureProfile:
             _tar_fn=None,
         )
         assert n == 0 and captured["called"] is False
+
+
+class TestSeedProfile:
+    @pytest.mark.asyncio
+    async def test_extracts_globalstorage_and_touches_sentinel(self, tmp_path):
+        # profile store yields a blob; runner records the extract+sentinel script
+        scripts = []
+
+        async def _ok(*a, **k):
+            return True
+
+        class FakeProfileStore:
+            async def get_globalstorage(self, uid, path):
+                with open(path, "wb") as f:
+                    f.write(b"GS")
+                return True
+
+            async def get_ext_bytes(self, *a, **k):
+                return False
+
+        async def fake_runner(host, port, script, key_path=None, timeout=20):
+            scripts.append(script)
+            return 0, b"", b""
+
+        from orchestrator.services.ide_settings import (
+            SEED_STATE_SENTINEL,
+            seed_ide_profile,
+        )
+
+        ok = await seed_ide_profile(
+            user_id=UID,
+            ssh_host="h",
+            ssh_port=30022,
+            profile_store=FakeProfileStore(),
+            ext_items={},
+            _runner=fake_runner,
+            _push_fn=lambda *a, **k: _ok(),
+        )
+        assert ok is True
+        assert any(SEED_STATE_SENTINEL in s for s in scripts)

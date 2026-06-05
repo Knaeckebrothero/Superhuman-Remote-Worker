@@ -750,6 +750,110 @@ async def capture_ide_profile(
     return uploaded
 
 
+async def _ssh_untar_from_file(
+    ssh_host: str,
+    ssh_port: int,
+    local_path: str,
+    *,
+    key_path: Optional[str] = None,
+    timeout: int = 120,
+) -> bool:
+    """Reverse of :func:`_ssh_tar_to_file`: stream a local ``.tar.zst`` into the
+    workspace via ``ssh ... 'zstd -d | tar -xf - -C /'``. The archive was created
+    with absolute paths (e.g. ``/var/lib/code-server/User/globalStorage``) so it
+    extracts back to the same location. Returns False on error."""
+    from services import resolve_ssh_key_path
+
+    kp = key_path if key_path is not None else resolve_ssh_key_path()
+    remote = "zstd -d | tar -xf - -C /"
+    cmd = [
+        "ssh",
+        *(["-i", kp] if kp else []),
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        "-o",
+        "ConnectTimeout=10",
+        "-p",
+        str(ssh_port),
+        f"agent-host@{ssh_host}",
+        remote,
+    ]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+        async def _feed() -> None:
+            with open(local_path, "rb") as f:
+                while True:
+                    chunk = f.read(1 << 20)
+                    if not chunk:
+                        break
+                    proc.stdin.write(chunk)
+                    await proc.stdin.drain()
+            proc.stdin.close()
+
+        await asyncio.wait_for(asyncio.gather(_feed(), proc.wait()), timeout=timeout)
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "ide_settings: untar seed failed %s:%s — %s", ssh_host, ssh_port, e
+        )
+        return False
+    return proc.returncode == 0
+
+
+async def seed_ide_profile(
+    *,
+    user_id: str,
+    ssh_host: str,
+    ssh_port: int,
+    profile_store: Any,
+    ext_items: dict,
+    key_path: Optional[str] = None,
+    _runner: Optional[SshRunner] = None,
+    _push_fn: Optional[Any] = None,
+) -> bool:
+    """Restore globalStorage (+ any bytes extensions) into a workspace, then touch
+    the sentinel the entrypoint waits on. Best-effort; returns True if the sentinel
+    was written. Never raises."""
+    import tempfile
+
+    runner = _runner or _default_ssh_runner
+    push = _push_fn or _ssh_untar_from_file
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".tar.zst", delete=True) as tmp:
+            if await profile_store.get_globalstorage(user_id, tmp.name):
+                await push(ssh_host, ssh_port, tmp.name, key_path=key_path)
+        for ext_id, info in (ext_items or {}).items():
+            if info.get("source") != "bytes":
+                continue
+            with tempfile.NamedTemporaryFile(suffix=".tar.zst", delete=True) as tmp:
+                if await profile_store.get_ext_bytes(
+                    user_id, ext_id, info.get("version", ""), tmp.name
+                ):
+                    await push(ssh_host, ssh_port, tmp.name, key_path=key_path)
+        # chown + sentinel
+        rc, _o, _e = await runner(
+            ssh_host,
+            ssh_port,
+            f"chown -R agent-host:agent-host {CODE_SERVER_USER_DIR} {EXTENSIONS_DIR} 2>/dev/null; "
+            f"touch {SEED_STATE_SENTINEL}\n",
+            key_path=key_path,
+            timeout=30,
+        )
+        return rc == 0
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "ide_settings: profile seed failed %s:%s — %s", ssh_host, ssh_port, e
+        )
+        return False
+
+
 def _ver_key(v: str) -> tuple:
     """Sort key for version strings: numeric-aware, falls back to string parts.
     ``"2.0.13"`` > ``"2.0.9"``; non-numeric segments compare lexicographically."""
