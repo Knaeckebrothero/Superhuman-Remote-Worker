@@ -44,6 +44,16 @@ _TERMINAL_THREAD_STATUSES = frozenset({"ended"})
 _REAPABLE_JOB_STATUSES = _IDLE_JOB_STATUSES | _TERMINAL_JOB_STATUSES
 _REAPABLE_THREAD_STATUSES = _IDLE_THREAD_STATUSES | _TERMINAL_THREAD_STATUSES
 
+# VM teardown is fire-and-forget to an external controller, and the DB
+# context.vm row persists (status flips to 'deleting', later 'deleted', or
+# 'suspended' on a clean suspend) until a fresh provision clears it. Unlike
+# workspace pods — which vanish from the live pod list once deleted — a
+# torn-down VM would otherwise stay enumerable and get re-reaped every tick.
+# Skip these statuses so reap/drift/crash don't loop on a VM that's already
+# gone or restorable-on-demand. ('deleted'/'none'/'suspended' are handled by
+# ensure_workspace on the next dispatch: recreate or restore.)
+_TORN_DOWN_VM_STATUSES = frozenset({"deleting", "deleted", "suspended"})
+
 
 def expected_vm_shas() -> set[str]:
     """SHAs from the configured default VM image tag.
@@ -400,6 +410,11 @@ class VMInstanceManager:
         scope = row["scope"]
         bound_id = row["bound_id"]
         vm_ctx = row["vm_ctx"]
+        # Already torn down / restorable-on-demand → not a live instance the
+        # reconciler should act on. Skip so reap/drift/crash don't loop on a
+        # VM whose teardown is already in flight (see _TORN_DOWN_VM_STATUSES).
+        if vm_ctx.get("status") in _TORN_DOWN_VM_STATUSES:
+            return None
         # Identity: prefer a backend-native id when present, otherwise
         # synthesize one from scope+bound_id so the reconciler can
         # log/distinguish even before the backend assigns one.
