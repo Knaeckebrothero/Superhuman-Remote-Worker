@@ -320,6 +320,30 @@ class WorkspaceInstanceManager:
         except Exception:
             logger.exception("Failed to record snapshot attempt for %s", inst.id)
 
+    async def give_up(self, inst: Instance, grace_s: int) -> None:
+        """Escape hatch: dirty + unreachable + attempts exhausted.
+
+        Ephemeral storage → delete the pod (state already unrecoverable).
+        PVC-backed → recreate the pod against the same PVC so the volume
+        reattaches; the PVC is NOT deleted. (PVC arm is minimally activated
+        this spec — full restore-by-reattach lands with the migration spec.)
+        """
+        bound = inst.bound_to
+        if not bound:
+            return
+        labels = inst.metadata.get("labels") or {}
+        owner = (
+            WorkspaceOwner.session(bound)
+            if "srw/thread-id" in labels
+            else WorkspaceOwner.job(bound)
+        )
+        await self.delete(inst, grace_s)
+        if not inst.metadata.get("volume_ephemeral", True):
+            try:
+                await self._provisioner.create_workspace(owner)
+            except Exception:
+                logger.exception("PVC give_up recreate failed for %s", inst.id)
+
     async def snapshot(self, inst: Instance) -> str | None:
         """Capture the workspace contents to S3.
 
@@ -342,7 +366,22 @@ class WorkspaceInstanceManager:
                 ssh_port=30022,
                 source_type="pod",
             )
-            return bound if ok else None
+            if ok:
+                # Success clears the escape-hatch retry counter.
+                labels = inst.metadata.get("labels") or {}
+                try:
+                    if "srw/thread-id" in labels:
+                        await self._db.merge_thread_workspace_context(
+                            bound, {"snapshot_attempts": 0}
+                        )
+                    else:
+                        await self._db.merge_workspace_container_context(
+                            bound, {"snapshot_attempts": 0}
+                        )
+                except Exception:
+                    logger.exception("Failed to reset attempts for %s", inst.id)
+                return bound
+            return None
         except Exception:
             logger.exception(
                 "Snapshot failed for workspace %s (bound=%s)", inst.id, bound
