@@ -19,6 +19,8 @@ import asyncio
 import json
 import logging
 import os
+import socket
+import time
 from typing import Any
 
 from .types import Instance
@@ -93,6 +95,11 @@ class WorkspaceInstanceManager:
         self._snapshot = snapshot_service
         self._db = db
         self._label_selector = label_selector
+        # Reachability probe cache: pod_ip -> (probed_at, ok). Single
+        # orchestrator process, so a plain dict is sufficient.
+        self._reach_cache: dict[str, tuple[float, bool]] = {}
+        self._reach_ttl_s: float = 30.0
+        self._clock = time.monotonic
 
     # -------------------------------------------------------------------------
     # Protocol implementation
@@ -252,6 +259,36 @@ class WorkspaceInstanceManager:
         ephemeral (today's fleet default) when the volume mode is unknown.
         """
         return bool(inst.metadata.get("volume_ephemeral", True))
+
+    async def _tcp_probe(self, host: str, port: int) -> bool:
+        """One-shot TCP connect with a short timeout. Overridable in tests."""
+
+        def _connect() -> bool:
+            try:
+                with socket.create_connection((host, port), timeout=5):
+                    return True
+            except OSError:
+                return False
+
+        return await asyncio.to_thread(_connect)
+
+    async def is_reachable(self, inst: Instance) -> bool:
+        """Cached liveness probe to the pod's SSH port (30022).
+
+        Used ONLY in the reap path to choose snapshot-vs-retry — never in
+        ``is_healthy`` (an unreachable busy pod must not be force-deleted over
+        a transient blip). Cached ~30s per pod IP.
+        """
+        host = inst.metadata.get("pod_ip")
+        if not host:
+            return False
+        now = self._clock()
+        cached = self._reach_cache.get(host)
+        if cached is not None and (now - cached[0]) < self._reach_ttl_s:
+            return cached[1]
+        ok = await self._tcp_probe(host, 30022)
+        self._reach_cache[host] = (now, ok)
+        return ok
 
     async def snapshot(self, inst: Instance) -> str | None:
         """Capture the workspace contents to S3.
