@@ -155,10 +155,21 @@ class WorkspaceSuspensionService:
             if user_id:
                 from services.ide_settings import IdeSettingsStore, pull_ide_config
 
+                store = IdeSettingsStore(self._db)
                 pulled = await pull_ide_config(ssh_host, int(ssh_port))
                 if pulled:
-                    await IdeSettingsStore(self._db).apply_pulled_files(
-                        str(user_id), pulled
+                    await store.apply_pulled_files(str(user_id), pulled)
+                # Capture license/globalStorage + bytes extensions to S3 (Phase B),
+                # signature-gated. Shrinks the state loss window on clean suspend.
+                if self._snapshot_service and self._snapshot_service.is_available:
+                    from services.ide_profile_store import IdeProfileStore
+                    from services.ide_settings import capture_ide_profile
+
+                    profile = IdeProfileStore(
+                        self._snapshot_service._s3, self._snapshot_service._bucket
+                    )
+                    await capture_ide_profile(
+                        store, str(user_id), ssh_host, int(ssh_port), profile
                     )
         except Exception:
             logger.debug(
