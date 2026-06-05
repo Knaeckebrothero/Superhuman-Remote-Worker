@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from .types import (
     Instance,
     InstanceLifecycleManager,
+    ReapableInstanceManager,
     StatefulInstanceManager,
 )
 
@@ -197,10 +198,13 @@ class InstanceLifecycleReconciler:
                                 inst.id,
                             )
 
-                # Stateful reap path: teardown-eligible workspaces/VMs whose
-                # bound work has finished or gone idle. Replaces the old
-                # keep-alive-on-snapshot-failure loop.
-                if isinstance(manager, StatefulInstanceManager):
+                # Reap path: teardown-eligible workspaces whose bound work has
+                # finished or gone idle. Replaces the old keep-alive-on-
+                # snapshot-failure loop. Gated on ReapableInstanceManager, NOT
+                # StatefulInstanceManager — VMs are stateful but don't implement
+                # the reap predicates (routing them here AttributeError'd every
+                # tick; see test_stateful_non_reapable_manager_is_skipped).
+                if isinstance(manager, ReapableInstanceManager):
                     try:
                         await self._reap(manager, inst, stats)
                     except Exception:

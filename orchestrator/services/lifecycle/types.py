@@ -136,3 +136,40 @@ class StatefulInstanceManager(InstanceLifecycleManager, Protocol):
     async def restore(self, inst: Instance, snapshot_ref: str) -> None:
         """Hydrate ``inst`` from the snapshot at ``snapshot_ref``."""
         ...
+
+
+@runtime_checkable
+class ReapableInstanceManager(StatefulInstanceManager, Protocol):
+    """A stateful manager that also supports the reaper's teardown decision
+    flow (clean/dirty gate + bounded snapshot-retry escape hatch).
+
+    The reconciler's reap branch gates on THIS protocol, not on
+    ``StatefulInstanceManager`` — VMs are stateful (snapshot/restore) but do
+    not implement the reap predicates, so they must not be routed through
+    ``_reap``. ``WorkspaceInstanceManager`` implements this; structural typing
+    means it qualifies automatically once all methods below exist.
+    """
+
+    async def is_reapable(self, inst: Instance) -> bool:
+        """True when the bound work no longer needs the instance."""
+        ...
+
+    async def is_dirty(self, inst: Instance) -> bool:
+        """True when there may be un-snapshotted state worth preserving."""
+        ...
+
+    async def is_reachable(self, inst: Instance) -> bool:
+        """True when the instance can currently be reached for a snapshot."""
+        ...
+
+    async def attempts_exhausted(self, inst: Instance) -> bool:
+        """True when bounded snapshot retries have been used up."""
+        ...
+
+    async def record_attempt(self, inst: Instance) -> None:
+        """Persist one more failed snapshot attempt."""
+        ...
+
+    async def give_up(self, inst: Instance, grace_s: int) -> None:
+        """Terminal action when a dirty instance can never be snapshotted."""
+        ...
