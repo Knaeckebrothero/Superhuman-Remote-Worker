@@ -49,6 +49,21 @@ if [ -f /mnt/code-server-config/seed.sh ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# 2c. Wait (bounded) for the orchestrator to deliver license/globalStorage
+#     state. Only when the seed ConfigMap signalled state is expected. The
+#     orchestrator streams the bundle in over SSH then touches the sentinel.
+#     Bounded so a slow/absent orchestrator can't wedge startup.
+# ---------------------------------------------------------------------------
+if [ -f /mnt/code-server-config/expect-state ]; then
+    i=0
+    while [ ! -f /var/lib/code-server/.ide-seed-state-done ] && [ "$i" -lt 30 ]; do
+        sleep 1; i=$((i+1))
+    done
+    [ -f /var/lib/code-server/.ide-seed-state-done ] || \
+        echo "ide state seed sentinel timed out after ${i}s (non-fatal)" >&2
+fi
+
+# ---------------------------------------------------------------------------
 # 3. Start code-server as agent-host (background)
 #    --user-data-dir and --extensions-dir outside home keep the IDE file
 #    explorer clean. Opens /home/agent-host/workspace as the workspace root.
