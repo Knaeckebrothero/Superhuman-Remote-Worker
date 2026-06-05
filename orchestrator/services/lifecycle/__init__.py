@@ -19,6 +19,7 @@ from .reconciler import (
 from .types import (
     Instance,
     InstanceLifecycleManager,
+    ReapableInstanceManager,
     StatefulInstanceManager,
 )
 from .vm_manager import (
@@ -36,6 +37,7 @@ __all__ = [
     "Instance",
     "InstanceLifecycleManager",
     "InstanceLifecycleReconciler",
+    "ReapableInstanceManager",
     "StatefulInstanceManager",
     "VMInstanceManager",
     "WorkspaceInstanceManager",
