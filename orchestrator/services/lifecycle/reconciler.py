@@ -247,17 +247,17 @@ class InstanceLifecycleReconciler:
         if await manager.attempts_exhausted(inst):
             await manager.give_up(inst, grace_s=0)
             stats["reap_forced"] += 1
-            # Data-loss signal: a dirty workspace we could never snapshot.
+            # Data-loss signal: a dirty instance we could never snapshot.
             # Logged (not a Prometheus counter — codebase has none) so
-            # log-based alerting can fire on it.
+            # log-based alerting can fire on it. Applies to any reapable kind
+            # (workspace, vm); kind-specific detail stays out of the message.
             logger.warning(
-                "Workspace reaper force-deleted dirty unreachable instance "
-                "kind=%s id=%s bound=%s volume_ephemeral=%s — state not "
-                "captured (snapshot attempts exhausted)",
+                "Lifecycle reaper force-deleted dirty unreachable instance "
+                "kind=%s id=%s bound=%s — state not captured "
+                "(snapshot attempts exhausted)",
                 manager.kind,
                 inst.id,
                 inst.bound_to,
-                inst.metadata.get("volume_ephemeral", True),
             )
         else:
             await manager.record_attempt(inst)
