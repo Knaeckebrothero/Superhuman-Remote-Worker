@@ -331,51 +331,85 @@ class TestIsDirty:
     @pytest.mark.asyncio
     async def test_thread_zero_turns_is_clean(self):
         mgr, *_ = _make_manager()
-        inst = Instance(kind="workspace", id="x", bound_to="t1",
-                        metadata={"thread_status": "ended", "total_turns": 0,
-                                  "last_snapshot_turns": None})
+        inst = Instance(
+            kind="workspace",
+            id="x",
+            bound_to="t1",
+            metadata={
+                "thread_status": "ended",
+                "total_turns": 0,
+                "last_snapshot_turns": None,
+            },
+        )
         assert await mgr.is_dirty(inst) is False
 
     @pytest.mark.asyncio
     async def test_thread_turns_ahead_of_snapshot_is_dirty(self):
         mgr, *_ = _make_manager()
-        inst = Instance(kind="workspace", id="x", bound_to="t1",
-                        metadata={"thread_status": "ended", "total_turns": 5,
-                                  "last_snapshot_turns": 2})
+        inst = Instance(
+            kind="workspace",
+            id="x",
+            bound_to="t1",
+            metadata={
+                "thread_status": "ended",
+                "total_turns": 5,
+                "last_snapshot_turns": 2,
+            },
+        )
         assert await mgr.is_dirty(inst) is True
 
     @pytest.mark.asyncio
     async def test_thread_turns_equal_snapshot_is_clean(self):
         mgr, *_ = _make_manager()
-        inst = Instance(kind="workspace", id="x", bound_to="t1",
-                        metadata={"thread_status": "ended", "total_turns": 3,
-                                  "last_snapshot_turns": 3})
+        inst = Instance(
+            kind="workspace",
+            id="x",
+            bound_to="t1",
+            metadata={
+                "thread_status": "ended",
+                "total_turns": 3,
+                "last_snapshot_turns": 3,
+            },
+        )
         assert await mgr.is_dirty(inst) is False
 
     @pytest.mark.asyncio
     async def test_thread_with_turns_never_snapshotted_is_dirty(self):
         mgr, *_ = _make_manager()
-        inst = Instance(kind="workspace", id="x", bound_to="t1",
-                        metadata={"thread_status": "ended", "total_turns": 4,
-                                  "last_snapshot_turns": None})
+        inst = Instance(
+            kind="workspace",
+            id="x",
+            bound_to="t1",
+            metadata={
+                "thread_status": "ended",
+                "total_turns": 4,
+                "last_snapshot_turns": None,
+            },
+        )
         assert await mgr.is_dirty(inst) is True
 
     @pytest.mark.asyncio
     async def test_terminal_job_with_snapshot_is_clean(self):
         # Completed jobs get a completion snapshot — reap without re-capture.
         mgr, *_ = _make_manager()
-        inst = Instance(kind="workspace", id="x", bound_to="j1",
-                        metadata={"job_status": "completed",
-                                  "snapshot_status": "available"})
+        inst = Instance(
+            kind="workspace",
+            id="x",
+            bound_to="j1",
+            metadata={"job_status": "completed", "snapshot_status": "available"},
+        )
         assert await mgr.is_dirty(inst) is False
 
     @pytest.mark.asyncio
     async def test_job_without_snapshot_is_dirty(self):
         # No job turn-counter → conservative: attempt a snapshot.
         mgr, *_ = _make_manager()
-        inst = Instance(kind="workspace", id="x", bound_to="j1",
-                        metadata={"job_status": "pending_review",
-                                  "snapshot_status": None})
+        inst = Instance(
+            kind="workspace",
+            id="x",
+            bound_to="j1",
+            metadata={"job_status": "pending_review", "snapshot_status": None},
+        )
         assert await mgr.is_dirty(inst) is True
 
 
@@ -458,23 +492,31 @@ class TestAttemptCounter:
     async def test_record_attempt_increments_job_context(self):
         mgr, _, _, _, db = _make_manager()
         db.merge_workspace_container_context = AsyncMock(return_value=True)
-        inst = Instance(kind="workspace", id="workspace-a", bound_to="j1",
-                        metadata={"labels": {"srw/job-id": "j1"},
-                                  "snapshot_attempts": 2})
+        inst = Instance(
+            kind="workspace",
+            id="workspace-a",
+            bound_to="j1",
+            metadata={"labels": {"srw/job-id": "j1"}, "snapshot_attempts": 2},
+        )
         await mgr.record_attempt(inst)
         db.merge_workspace_container_context.assert_awaited_once_with(
-            "j1", {"snapshot_attempts": 3})
+            "j1", {"snapshot_attempts": 3}
+        )
 
     @pytest.mark.asyncio
     async def test_record_attempt_increments_thread_context(self):
         mgr, _, _, _, db = _make_manager()
         db.merge_thread_workspace_context = AsyncMock(return_value=True)
-        inst = Instance(kind="workspace", id="ws-thread-a", bound_to="t1",
-                        metadata={"labels": {"srw/thread-id": "t1"},
-                                  "snapshot_attempts": 0})
+        inst = Instance(
+            kind="workspace",
+            id="ws-thread-a",
+            bound_to="t1",
+            metadata={"labels": {"srw/thread-id": "t1"}, "snapshot_attempts": 0},
+        )
         await mgr.record_attempt(inst)
         db.merge_thread_workspace_context.assert_awaited_once_with(
-            "t1", {"snapshot_attempts": 1})
+            "t1", {"snapshot_attempts": 1}
+        )
 
     @pytest.mark.asyncio
     async def test_exhausted_true_at_threshold(self, monkeypatch):
@@ -495,9 +537,12 @@ class TestGiveUp:
     @pytest.mark.asyncio
     async def test_ephemeral_give_up_deletes(self):
         mgr, container, *_ = _make_manager()
-        inst = Instance(kind="workspace", id="workspace-a", bound_to="j1",
-                        metadata={"labels": {"srw/job-id": "j1"},
-                                  "volume_ephemeral": True})
+        inst = Instance(
+            kind="workspace",
+            id="workspace-a",
+            bound_to="j1",
+            metadata={"labels": {"srw/job-id": "j1"}, "volume_ephemeral": True},
+        )
         await mgr.give_up(inst, grace_s=0)
         container.delete_workspace.assert_awaited_once_with(WorkspaceOwner.job("j1"))
 
@@ -506,9 +551,12 @@ class TestGiveUp:
         mgr, container, *_ = _make_manager()
         container.create_workspace = AsyncMock(return_value=True)
         container.delete_workspace_pvc = AsyncMock(return_value=True)
-        inst = Instance(kind="workspace", id="workspace-a", bound_to="j1",
-                        metadata={"labels": {"srw/job-id": "j1"},
-                                  "volume_ephemeral": False})
+        inst = Instance(
+            kind="workspace",
+            id="workspace-a",
+            bound_to="j1",
+            metadata={"labels": {"srw/job-id": "j1"}, "volume_ephemeral": False},
+        )
         await mgr.give_up(inst, grace_s=0)
         container.delete_workspace.assert_awaited_once_with(WorkspaceOwner.job("j1"))
         container.create_workspace.assert_awaited_once_with(WorkspaceOwner.job("j1"))
@@ -519,13 +567,17 @@ class TestGiveUp:
         mgr, _, _, snapshot, db = _make_manager()
         db.merge_workspace_container_context = AsyncMock(return_value=True)
         snapshot.capture_vm_snapshot = AsyncMock(return_value=True)
-        inst = Instance(kind="workspace", id="workspace-a", bound_to="j1",
-                        metadata={"labels": {"srw/job-id": "j1"},
-                                  "pod_ip": "10.0.0.5"})
+        inst = Instance(
+            kind="workspace",
+            id="workspace-a",
+            bound_to="j1",
+            metadata={"labels": {"srw/job-id": "j1"}, "pod_ip": "10.0.0.5"},
+        )
         ref = await mgr.snapshot(inst)
         assert ref == "j1"
         db.merge_workspace_container_context.assert_awaited_with(
-            "j1", {"snapshot_attempts": 0})
+            "j1", {"snapshot_attempts": 0}
+        )
 
 
 def test_pod_volume_is_ephemeral_helper():
