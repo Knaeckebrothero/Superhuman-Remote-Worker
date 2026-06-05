@@ -735,10 +735,13 @@ async def code_server_settings_sweeper(shutdown_event: asyncio.Event) -> None:
     from services.ide_settings import (
         IdeSettingsStore,
         OpenVsxClassifier,
+        _coerce_context,
+        capture_ide_profile,
         list_ide_extensions,
         pull_ide_config,
         reconcile_extensions,
         reconcile_ide_settings,
+        resolve_ssh_target,
     )
 
     interval = float(os.environ.get("IDE_SETTINGS_SYNC_INTERVAL_S", "600"))
@@ -762,6 +765,29 @@ async def code_server_settings_sweeper(shutdown_event: asyncio.Event) -> None:
                         )
                 except Exception as e:  # noqa: BLE001
                     logger.error("Error reconciling extensions: %s", e)
+
+                # Capture license/globalStorage + non-Open-VSX bytes to S3 when a
+                # workspace's content signature changed (Phase B). Signature-gated
+                # inside capture_ide_profile so most cycles are a cheap no-op.
+                if snapshot_service.is_available:
+                    from services.ide_profile_store import IdeProfileStore
+
+                    profile = IdeProfileStore(
+                        snapshot_service._s3, snapshot_service._bucket
+                    )
+                    for ws in workspaces:
+                        uid = ws.get("user_id")
+                        if not uid:
+                            continue
+                        tgt = resolve_ssh_target(_coerce_context(ws.get("context")))
+                        if not tgt:
+                            continue
+                        try:
+                            await capture_ide_profile(
+                                store, str(uid), tgt[0], tgt[1], profile
+                            )
+                        except Exception as e:  # noqa: BLE001
+                            logger.warning("ide profile capture failed: %s", e)
         except Exception as e:
             logger.error("Error in code-server settings sweeper: %s", e)
 
