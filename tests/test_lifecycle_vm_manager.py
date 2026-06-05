@@ -195,6 +195,28 @@ class TestListInstances:
         instances = await mgr.list_instances()
         assert instances == []
 
+    @pytest.mark.asyncio
+    async def test_skips_torn_down_vms(self):
+        # VMs are listed from DB context.vm (not live K8s pods), so a VM that
+        # has been deleted/suspended still has a context row until the external
+        # controller (or a later create) clears it. Those must NOT be surfaced
+        # to the reconciler — otherwise reap/drift/crash re-fire every tick on
+        # an already-torn-down VM (the force-delete loop seen on dev).
+        jobs = [
+            {"id": "j-deleting", "status": "paused",
+             "context": {"vm": {"status": "deleting"}}},
+            {"id": "j-deleted", "status": "paused",
+             "context": {"vm": {"status": "deleted"}}},
+            {"id": "j-suspended", "status": "paused",
+             "context": {"vm": {"status": "suspended"}}},
+            {"id": "j-ready", "status": "paused",
+             "context": {"vm": {"status": "ready", "ssh_host": "10.0.0.9"}}},
+        ]
+        mgr, *_ = _make_manager(job_rows=jobs)
+        instances = await mgr.list_instances()
+        ids = [i.bound_to for i in instances]
+        assert ids == ["j-ready"]
+
 
 # =============================================================================
 # is_healthy / is_idle
