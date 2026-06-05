@@ -674,32 +674,19 @@ async def ide_session_ttl_sweeper(shutdown_event: asyncio.Event) -> None:
 
 
 async def workspace_idle_sweeper(shutdown_event: asyncio.Event) -> None:
-    """Background loop: suspends idle workspace containers to S3 AND reconciles
-    failed session workspaces.
+    """Background loop: reconciles failed/missing session workspaces.
 
-    Runs every 60 seconds. Suspends workspace containers for jobs in
-    paused/pending_review/waiting_for_reply statuses past the configured idle
-    timeout (WORKSPACE_IDLE_TIMEOUT, default 30 min). Then re-ensures workspaces
-    for active sessions whose workspace container is in a non-ready, non-in-progress
-    state (e.g. 'failed') — the session-side equivalent of the job dispatcher's
-    per-cycle workspace reconcile.
+    Idle suspension and teardown now live in the lifecycle reconciler's reap
+    path (``services/lifecycle/reconciler.py`` → ``WorkspaceInstanceManager``),
+    which snapshots-then-deletes reapable workspaces and force-deletes ones it
+    can never reach (bounded retry) instead of keeping them alive forever.
+
+    This loop retains only the session-workspace recovery reconcile —
+    recreating failed/missing workspaces for active sessions — which is
+    independent of idle policy. Runs every 60 seconds.
     """
-    logger.info("Workspace idle sweeper started")
+    logger.info("Workspace idle sweeper started (reconcile-only)")
     while not shutdown_event.is_set():
-        try:
-            if workspace_suspension_service.is_enabled:
-                count = await workspace_suspension_service.check_idle_all()
-                if count:
-                    logger.info("Workspace sweeper: suspended %d job containers", count)
-                thread_count = await workspace_suspension_service.check_idle_threads()
-                if thread_count:
-                    logger.info(
-                        "Workspace sweeper: suspended %d thread containers",
-                        thread_count,
-                    )
-        except Exception as e:
-            logger.error("Error in workspace idle sweeper: %s", e)
-
         # Session workspace reconcile (safety-net): recreate failed/missing
         # workspaces for active sessions. Runs regardless of whether idle
         # suspension is enabled — recovering a wedged workspace is independent
