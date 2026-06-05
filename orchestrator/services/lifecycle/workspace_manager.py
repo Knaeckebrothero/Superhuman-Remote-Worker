@@ -32,6 +32,14 @@ _LABEL_SELECTOR = "srw.io/component=agent-workspace"
 _IDLE_JOB_STATUSES = frozenset({"paused", "pending_review", "waiting_for_reply"})
 _IDLE_THREAD_STATUSES = frozenset({"ended"})
 
+# Terminal = bound work is finished; nothing to preserve beyond an existing
+# snapshot. Reapable = the pod is no longer needed at all — the union of
+# suspendable-idle (snapshot + free) and terminal (clean up).
+_TERMINAL_JOB_STATUSES = frozenset({"completed", "failed", "cancelled"})
+_TERMINAL_THREAD_STATUSES = frozenset({"ended"})
+_REAPABLE_JOB_STATUSES = _IDLE_JOB_STATUSES | _TERMINAL_JOB_STATUSES
+_REAPABLE_THREAD_STATUSES = _IDLE_THREAD_STATUSES | _TERMINAL_THREAD_STATUSES
+
 
 def expected_workspace_shas() -> set[str]:
     """SHAs from the configured workspace image tag.
@@ -144,6 +152,32 @@ class WorkspaceInstanceManager:
             return thread_status in _IDLE_THREAD_STATUSES
         # No bound row → not safe to claim idle (pod may have been
         # created but DB context not yet persisted).
+        return False
+
+    async def is_reapable(self, inst: Instance) -> bool:
+        """True when the bound work no longer needs the pod.
+
+        Superset of ``is_idle``: adds terminal job/thread states. Terminal
+        instances get cleaned up; suspendable-idle ones get snapshot+freed.
+        A pod with no bound row is never reapable (context may be in flight).
+        """
+        job_status = inst.metadata.get("job_status")
+        thread_status = inst.metadata.get("thread_status")
+        if job_status:
+            return job_status in _REAPABLE_JOB_STATUSES
+        if thread_status:
+            return thread_status in _REAPABLE_THREAD_STATUSES
+        return False
+
+    def _is_terminal(self, inst: Instance) -> bool:
+        """Bound work is finished (vs merely paused) — nothing to preserve
+        beyond an existing snapshot."""
+        job_status = inst.metadata.get("job_status")
+        thread_status = inst.metadata.get("thread_status")
+        if job_status:
+            return job_status in _TERMINAL_JOB_STATUSES
+        if thread_status:
+            return thread_status in _TERMINAL_THREAD_STATUSES
         return False
 
     async def snapshot(self, inst: Instance) -> str | None:
