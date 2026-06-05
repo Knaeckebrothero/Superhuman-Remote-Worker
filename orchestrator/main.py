@@ -747,12 +747,16 @@ async def code_server_settings_sweeper(shutdown_event: asyncio.Event) -> None:
 
     from services.ide_settings import (
         IdeSettingsStore,
+        OpenVsxClassifier,
+        list_ide_extensions,
         pull_ide_config,
+        reconcile_extensions,
         reconcile_ide_settings,
     )
 
     interval = float(os.environ.get("IDE_SETTINGS_SYNC_INTERVAL_S", "600"))
     store = IdeSettingsStore(postgres_db)
+    classifier = OpenVsxClassifier()  # cache persists across cycles for this process
     logger.info("Code-server settings sweeper started (interval=%.0fs)", interval)
     while not shutdown_event.is_set():
         try:
@@ -761,6 +765,16 @@ async def code_server_settings_sweeper(shutdown_event: asyncio.Event) -> None:
                 count = await reconcile_ide_settings(store, workspaces, pull_ide_config)
                 if count:
                     logger.info("IDE settings sweeper: synced %d file(s)", count)
+                try:
+                    ext_changed = await reconcile_extensions(
+                        store, workspaces, list_ide_extensions, classifier
+                    )
+                    if ext_changed:
+                        logger.info(
+                            "IDE settings sweeper: synced %d extension(s)", ext_changed
+                        )
+                except Exception as e:  # noqa: BLE001
+                    logger.error("Error reconciling extensions: %s", e)
         except Exception as e:
             logger.error("Error in code-server settings sweeper: %s", e)
 
