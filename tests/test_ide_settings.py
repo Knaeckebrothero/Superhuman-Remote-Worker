@@ -21,7 +21,9 @@ from orchestrator.services.ide_settings import (
     build_extension_install_script,
     build_extensions_list_script,
     build_seed_script,
+    build_signature_script,
     parse_extensions_list,
+    parse_signature,
     parse_pull_output,
     pull_ide_config,
     reconcile_extensions,
@@ -783,3 +785,15 @@ class TestSeedForUserInstallsExtensions:
         assert (
             "monokai.theme-monokai-pro-vscode@2.0.13" in joined
         )  # extension installed
+
+
+class TestSignature:
+    def test_script_covers_extensions_and_globalstorage(self):
+        s = build_signature_script()
+        assert "/var/lib/code-server/extensions" in s
+        assert "/var/lib/code-server/User/globalStorage" in s
+        assert "sha256sum" in s
+
+    def test_parse_takes_first_token(self):
+        assert parse_signature("abc123  -\n") == "abc123"
+        assert parse_signature("") == ""
