@@ -278,9 +278,7 @@ class VMInstanceManager:
                             bound, {"snapshot_attempts": 0}
                         )
                     else:
-                        await self._db.merge_vm_context(
-                            bound, {"snapshot_attempts": 0}
-                        )
+                        await self._db.merge_vm_context(bound, {"snapshot_attempts": 0})
                 except Exception:
                     logger.exception("Failed to reset attempts for VM %s", inst.id)
                 return bound
