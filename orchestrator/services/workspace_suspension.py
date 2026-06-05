@@ -22,6 +22,19 @@ from services.workspace_lifecycle import WorkspaceOwner
 logger = logging.getLogger(__name__)
 
 
+def _resolve_ssh_port(ws_ctx: dict, vm_ctx: dict) -> int:
+    """Resolve the snapshot SSH port by workspace kind.
+
+    Container/pod workspaces run sshd on 30022; only true VM contexts use the
+    VM ssh_port (default 22). Previously both fell through to a VM-shaped 22
+    default, which silently broke pod snapshots when ``port`` was absent from
+    the stored context (the cause of the dev-cluster leaked-pod incident).
+    """
+    if ws_ctx:
+        return int(ws_ctx.get("port", 30022))
+    return int(vm_ctx.get("ssh_port", 22))
+
+
 class WorkspaceSuspensionService:
     """Coordinates idle suspension between SnapshotService and ContainerProvisioner.
 
@@ -125,7 +138,7 @@ class WorkspaceSuspensionService:
 
         # Determine SSH host for snapshot
         ssh_host = ws_ctx.get("pod_ip") or ws_ctx.get("host") or vm_ctx.get("ssh_host")
-        ssh_port = ws_ctx.get("port", vm_ctx.get("ssh_port", 22))
+        ssh_port = _resolve_ssh_port(ws_ctx, vm_ctx)
 
         if not ssh_host:
             return False
@@ -330,7 +343,7 @@ class WorkspaceSuspensionService:
                 return False
 
             # Extract snapshot into the workspace
-            ssh_port = int(ws_ctx.get("port", vm_ctx.get("ssh_port", 22)))
+            ssh_port = _resolve_ssh_port(ws_ctx, vm_ctx)
             await self._extract_snapshot(job_id, ssh_host, ssh_port=ssh_port)
 
             # Mark as ready
@@ -445,7 +458,7 @@ class WorkspaceSuspensionService:
         provisioner_type = ws_ctx.get("provisioner")
 
         ssh_host = ws_ctx.get("pod_ip") or ws_ctx.get("host") or vm_ctx.get("ssh_host")
-        ssh_port = ws_ctx.get("port", vm_ctx.get("ssh_port", 22))
+        ssh_port = _resolve_ssh_port(ws_ctx, vm_ctx)
 
         if not ssh_host:
             return False
@@ -649,7 +662,7 @@ class WorkspaceSuspensionService:
                 return False
 
             # Extract snapshot into the workspace
-            ssh_port = int(ws_ctx.get("port", vm_ctx.get("ssh_port", 22)))
+            ssh_port = _resolve_ssh_port(ws_ctx, vm_ctx)
             await self._extract_snapshot(
                 thread_id, ssh_host, ssh_port=ssh_port, entity_type="threads"
             )
