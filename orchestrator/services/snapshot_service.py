@@ -244,6 +244,7 @@ class SnapshotService:
         source_type: str = "vm",
         agent_config: str = "defaults",
         entity_type: str = "jobs",
+        work_marker: Optional[int] = None,
     ) -> bool:
         """Capture a VM environment snapshot via SSH tar and upload to S3.
 
@@ -407,13 +408,27 @@ class SnapshotService:
                 manifest["phase_number"] = phase_number
 
             # Upload to S3
-            return await self.upload_snapshot(
+            uploaded = await self.upload_snapshot(
                 job_id=job_id,
                 tar_path=tar_path,
                 manifest=manifest,
                 phase_number=phase_number,
                 entity_type=entity_type,
             )
+            # Record the work-marker (turn count at capture) into the workspace
+            # context so the lifecycle reaper's is_dirty can tell whether new
+            # work has happened since this snapshot. Written under
+            # workspace_container — the same key is_dirty reads.
+            if uploaded and work_marker is not None and self._db is not None:
+                marker = {"last_snapshot_turns": work_marker}
+                try:
+                    if entity_type == "threads":
+                        await self._db.merge_thread_workspace_context(job_id, marker)
+                    else:
+                        await self._db.merge_workspace_container_context(job_id, marker)
+                except Exception:
+                    logger.exception("Failed to stamp work-marker for %s", job_id)
+            return uploaded
 
         except Exception as e:
             logger.error(
