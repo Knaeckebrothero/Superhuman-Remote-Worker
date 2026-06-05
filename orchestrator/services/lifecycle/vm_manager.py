@@ -21,9 +21,12 @@ provisioner methods, not new lifecycle scaffolding.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
+import socket
+import time
 from typing import Any
 
 from .types import Instance
@@ -33,6 +36,13 @@ logger = logging.getLogger(__name__)
 
 _IDLE_JOB_STATUSES = frozenset({"paused", "pending_review", "waiting_for_reply"})
 _IDLE_THREAD_STATUSES = frozenset({"ended"})
+
+# Terminal = bound work finished; reapable = pod/VM no longer needed at all
+# (suspendable-idle ∪ terminal). Mirrors WorkspaceInstanceManager.
+_TERMINAL_JOB_STATUSES = frozenset({"completed", "failed", "cancelled"})
+_TERMINAL_THREAD_STATUSES = frozenset({"ended"})
+_REAPABLE_JOB_STATUSES = _IDLE_JOB_STATUSES | _TERMINAL_JOB_STATUSES
+_REAPABLE_THREAD_STATUSES = _IDLE_THREAD_STATUSES | _TERMINAL_THREAD_STATUSES
 
 
 def expected_vm_shas() -> set[str]:
@@ -85,6 +95,10 @@ class VMInstanceManager:
         self._suspension = suspension_service
         self._snapshot = snapshot_service
         self._db = db
+        # Reachability probe cache: ssh_host -> (probed_at, ok).
+        self._reach_cache: dict[str, tuple[float, bool]] = {}
+        self._reach_ttl_s: float = 30.0
+        self._clock = time.monotonic
 
     # -------------------------------------------------------------------------
     # Protocol implementation
@@ -123,6 +137,119 @@ class VMInstanceManager:
             return thread_status in _IDLE_THREAD_STATUSES
         return False
 
+    # -------------------------------------------------------------------------
+    # Reap path (ReapableInstanceManager) — mirrors WorkspaceInstanceManager,
+    # adjusted for VMs (ssh port default 22; vm_status='suspended' == clean;
+    # give_up is force-delete — no volume reattach this round).
+    # -------------------------------------------------------------------------
+
+    async def is_reapable(self, inst: Instance) -> bool:
+        """True when the bound work no longer needs the VM (idle ∪ terminal)."""
+        job_status = inst.metadata.get("job_status")
+        thread_status = inst.metadata.get("thread_status")
+        if job_status:
+            return job_status in _REAPABLE_JOB_STATUSES
+        if thread_status:
+            return thread_status in _REAPABLE_THREAD_STATUSES
+        return False
+
+    def _is_terminal(self, inst: Instance) -> bool:
+        job_status = inst.metadata.get("job_status")
+        thread_status = inst.metadata.get("thread_status")
+        if job_status:
+            return job_status in _TERMINAL_JOB_STATUSES
+        if thread_status:
+            return thread_status in _TERMINAL_THREAD_STATUSES
+        return False
+
+    async def is_dirty(self, inst: Instance) -> bool:
+        """True when the VM may hold un-snapshotted state worth saving.
+
+        Same logic as the workspace manager (threads use ``total_turns`` vs
+        ``last_snapshot_turns``; jobs are conservative), plus a VM wrinkle:
+        ``vm_status == 'suspended'`` means the VM was already snapshotted to S3
+        and torn down, so there is nothing left to lose — treat as clean.
+        Never reads ``last_activity`` (contaminated by context merges).
+        """
+        if inst.metadata.get("vm_status") == "suspended":
+            return False
+        thread_status = inst.metadata.get("thread_status")
+        if thread_status is not None:
+            turns = inst.metadata.get("total_turns") or 0
+            snap_turns = inst.metadata.get("last_snapshot_turns")
+            if snap_turns is None:
+                return turns > 0
+            return turns > snap_turns
+        if self._is_terminal(inst):
+            return inst.metadata.get("snapshot_status") != "available"
+        return True
+
+    async def _tcp_probe(self, host: str, port: int) -> bool:
+        """One-shot TCP connect with a short timeout. Overridable in tests."""
+
+        def _connect() -> bool:
+            try:
+                with socket.create_connection((host, port), timeout=5):
+                    return True
+            except OSError:
+                return False
+
+        return await asyncio.to_thread(_connect)
+
+    async def is_reachable(self, inst: Instance) -> bool:
+        """Cached liveness probe to the VM's SSH endpoint.
+
+        VMs run sshd on 22 by default (not 30022 like workspace pods). Used
+        only in the reap path to choose snapshot-vs-retry; cached ~30s per host.
+        """
+        host = inst.metadata.get("ssh_host")
+        if not host:
+            return False
+        port = int(inst.metadata.get("ssh_port") or 22)
+        now = self._clock()
+        cached = self._reach_cache.get(host)
+        if cached is not None and (now - cached[0]) < self._reach_ttl_s:
+            return cached[1]
+        ok = await self._tcp_probe(host, port)
+        self._reach_cache[host] = (now, ok)
+        return ok
+
+    def _max_attempts(self) -> int:
+        try:
+            return int(os.environ.get("WORKSPACE_SNAPSHOT_MAX_ATTEMPTS", "5"))
+        except ValueError:
+            return 5
+
+    async def attempts_exhausted(self, inst: Instance) -> bool:
+        return (inst.metadata.get("snapshot_attempts") or 0) >= self._max_attempts()
+
+    async def record_attempt(self, inst: Instance) -> None:
+        """Persist an incremented snapshot-attempt counter to the bound VM ctx."""
+        if self._db is None:
+            return
+        bound = inst.bound_to
+        if not bound:
+            return
+        nxt = (inst.metadata.get("snapshot_attempts") or 0) + 1
+        try:
+            if inst.metadata.get("scope") == "thread":
+                await self._db.merge_thread_vm_context(
+                    bound, {"snapshot_attempts": nxt}
+                )
+            else:
+                await self._db.merge_vm_context(bound, {"snapshot_attempts": nxt})
+        except Exception:
+            logger.exception("Failed to record snapshot attempt for VM %s", inst.id)
+
+    async def give_up(self, inst: Instance, grace_s: int) -> None:
+        """Escape hatch: dirty + unreachable + attempts exhausted.
+
+        VMs have no volume-reattach (delete is destructive; disks live behind
+        the external VM controller) — so the terminal action is force-delete.
+        Volume-reattach for VMs is a separate, controller-side design.
+        """
+        await self.delete(inst, grace_s)
+
     async def snapshot(self, inst: Instance) -> str | None:
         if self._snapshot is None or not getattr(self._snapshot, "is_available", False):
             return None
@@ -133,14 +260,31 @@ class VMInstanceManager:
         bound = inst.bound_to
         if not bound:
             return None
+        is_thread = inst.metadata.get("scope") == "thread"
         try:
             ok = await self._snapshot.capture_vm_snapshot(
                 job_id=bound,
                 ssh_host=ssh_host,
                 ssh_port=int(ssh_port),
                 source_type="vm",
+                entity_type="threads" if is_thread else "jobs",
+                work_marker=inst.metadata.get("total_turns"),
             )
-            return bound if ok else None
+            if ok:
+                # Success clears the escape-hatch retry counter.
+                try:
+                    if is_thread:
+                        await self._db.merge_thread_vm_context(
+                            bound, {"snapshot_attempts": 0}
+                        )
+                    else:
+                        await self._db.merge_vm_context(
+                            bound, {"snapshot_attempts": 0}
+                        )
+                except Exception:
+                    logger.exception("Failed to reset attempts for VM %s", inst.id)
+                return bound
+            return None
         except Exception:
             logger.exception("Snapshot failed for VM %s (bound=%s)", inst.id, bound)
             return None
@@ -213,7 +357,7 @@ class VMInstanceManager:
                 )
                 thread_rows = await conn.fetch(
                     """
-                    SELECT id, status, metadata
+                    SELECT id, status, total_turns, metadata
                     FROM threads
                     WHERE metadata->'vm' IS NOT NULL
                       AND metadata->'vm' <> '{}'::jsonb
@@ -234,6 +378,7 @@ class VMInstanceManager:
                     "bound_id": str(r["id"]),
                     "owner_status": r.get("status"),
                     "vm_ctx": vm_ctx,
+                    "snapshot_status": _coerce_jsonb(ctx.get("snapshot")).get("status"),
                 }
             )
         for r in thread_rows:
@@ -247,6 +392,8 @@ class VMInstanceManager:
                     "bound_id": str(r["id"]),
                     "owner_status": r.get("status"),
                     "vm_ctx": vm_ctx,
+                    "total_turns": r.get("total_turns") or 0,
+                    "snapshot_status": _coerce_jsonb(md.get("snapshot")).get("status"),
                 }
             )
         return rows
@@ -269,11 +416,16 @@ class VMInstanceManager:
             "ssh_host": vm_ctx.get("ssh_host") or vm_ctx.get("host"),
             "ssh_port": vm_ctx.get("ssh_port") or vm_ctx.get("port"),
             "provisioner": vm_ctx.get("provisioner"),
+            # Reap-path inputs (mirror WorkspaceInstanceManager).
+            "last_snapshot_turns": vm_ctx.get("last_snapshot_turns"),
+            "snapshot_attempts": vm_ctx.get("snapshot_attempts") or 0,
+            "snapshot_status": row.get("snapshot_status"),
         }
         if scope == "job":
             metadata["job_status"] = row.get("owner_status")
         else:
             metadata["thread_status"] = row.get("owner_status")
+            metadata["total_turns"] = row.get("total_turns") or 0
         return Instance(
             kind=self.kind,
             id=inst_id,
