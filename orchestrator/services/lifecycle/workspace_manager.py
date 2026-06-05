@@ -55,6 +55,23 @@ def expected_workspace_shas() -> set[str]:
     return shas
 
 
+def _pod_volume_is_ephemeral(pod: Any) -> bool:
+    """True if the pod's workspace-data volume is emptyDir (vs a PVC).
+
+    Defaults to True (ephemeral) when the volume can't be read — matches the
+    current fleet default and keeps the reaper conservative.
+    """
+    try:
+        for vol in pod.spec.volumes or []:
+            if getattr(vol, "name", None) == "workspace-data":
+                if getattr(vol, "persistent_volume_claim", None) is not None:
+                    return False
+                return getattr(vol, "empty_dir", None) is not None
+    except Exception:
+        pass
+    return True
+
+
 class WorkspaceInstanceManager:
     """Lifecycle manager for the workspace kind."""
 
@@ -101,6 +118,7 @@ class WorkspaceInstanceManager:
                 "pod_phase": pod.status.phase,
                 "labels": dict(labels),
                 "kind_label": labels.get("srw/component"),
+                "volume_ephemeral": _pod_volume_is_ephemeral(pod),
             }
             if thread_id:
                 row = await self._fetch_thread(thread_id)
@@ -224,6 +242,16 @@ class WorkspaceInstanceManager:
         if self._is_terminal(inst):
             return inst.metadata.get("snapshot_status") != "available"
         return True
+
+    async def is_state_ephemeral(self, inst: Instance) -> bool:
+        """True when pod-local storage dies with the pod (emptyDir).
+
+        Ephemeral → a crashed/unreachable pod's state is unrecoverable, so the
+        terminal action is delete-the-tombstone. PVC-backed → state survives on
+        the volume; the terminal action is recreate-pod-keep-PVC. Defaults to
+        ephemeral (today's fleet default) when the volume mode is unknown.
+        """
+        return bool(inst.metadata.get("volume_ephemeral", True))
 
     async def snapshot(self, inst: Instance) -> str | None:
         """Capture the workspace contents to S3.
