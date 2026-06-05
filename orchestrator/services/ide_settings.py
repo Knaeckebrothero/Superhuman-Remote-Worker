@@ -687,6 +687,46 @@ async def _ssh_tar_to_file(
     return proc.returncode == 0 and total > 0
 
 
+async def _resolve_ext_dir(
+    ssh_host: str,
+    ssh_port: int,
+    ext_id: str,
+    version: str,
+    *,
+    key_path: Optional[str] = None,
+    _runner: Optional[SshRunner] = None,
+) -> Optional[str]:
+    """Return the on-disk extension folder name for ``ext_id@version``.
+
+    code-server names extension folders ``<id>-<version>`` and often appends a
+    target-platform suffix (e.g. ``<id>-<version>-universal``). Checks the bare
+    form and the suffixed form (the trailing ``-`` keeps ``2.0.1`` from matching
+    ``2.0.13``). Returns the first match, or ``None`` if neither exists. Never
+    raises — used only to locate ``bytes``-source extensions for byte-copy."""
+    runner = _runner or _default_ssh_runner
+    script = (
+        f"cd {EXTENSIONS_DIR} 2>/dev/null || exit 0\n"
+        f'for d in "{ext_id}-{version}" "{ext_id}-{version}"-* ; do\n'
+        '  [ -d "$d" ] && { printf \'%s\\n\' "$d"; break; }\n'
+        "done\n"
+    )
+    try:
+        rc, out, _ = await runner(
+            ssh_host, ssh_port, script, key_path=key_path, timeout=20
+        )
+    except Exception:  # noqa: BLE001
+        return None
+    if rc != 0:
+        return None
+    text = (
+        out.decode("utf-8", "replace")
+        if isinstance(out, (bytes, bytearray))
+        else (out or "")
+    )
+    name = text.strip().split("\n")[0].strip() if text.strip() else ""
+    return name or None
+
+
 async def capture_ide_profile(
     store: "IdeSettingsStore",
     user_id: str,
@@ -738,8 +778,13 @@ async def capture_ide_profile(
         version = info.get("version", "")
         if await profile_store.ext_bytes_exists(user_id, ext_id, version):
             continue
+        folder = await _resolve_ext_dir(
+            ssh_host, ssh_port, ext_id, version, key_path=key_path, _runner=runner
+        )
+        if not folder:
+            continue
         with tempfile.NamedTemporaryFile(suffix=".tar.zst", delete=True) as tmp:
-            remote = f"{EXTENSIONS_DIR}/{ext_id}-{version}"
+            remote = f"{EXTENSIONS_DIR}/{folder}"
             if tar_fn and await tar_fn(
                 ssh_host, ssh_port, remote, tmp.name, key_path=key_path
             ):
