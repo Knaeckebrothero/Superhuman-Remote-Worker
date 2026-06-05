@@ -22,6 +22,7 @@ from orchestrator.services.ide_settings import (
     build_extensions_list_script,
     build_seed_script,
     build_signature_script,
+    capture_ide_profile,
     parse_extensions_list,
     parse_signature,
     parse_pull_output,
@@ -797,3 +798,30 @@ class TestSignature:
     def test_parse_takes_first_token(self):
         assert parse_signature("abc123  -\n") == "abc123"
         assert parse_signature("") == ""
+
+
+class TestCaptureProfile:
+    @pytest.mark.asyncio
+    async def test_skips_when_signature_unchanged(self):
+        db = FakeSettingsDB({UID: {"ide": {"extensions": {"sig": "SAME"}}}})
+        store = IdeSettingsStore(db)
+
+        async def sig_runner(host, port, script, key_path=None, timeout=20):
+            return 0, b"SAME  -\n", b""
+
+        captured = {"called": False}
+
+        class FakeProfileStore:
+            async def put_globalstorage(self, *a, **k):
+                captured["called"] = True
+
+        n = await capture_ide_profile(
+            store,
+            UID,
+            "10.0.0.1",
+            30022,
+            FakeProfileStore(),
+            _runner=sig_runner,
+            _tar_fn=None,
+        )
+        assert n == 0 and captured["called"] is False
