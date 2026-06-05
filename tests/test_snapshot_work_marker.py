@@ -1,4 +1,5 @@
 """capture_vm_snapshot stamps the work-marker into the workspace context."""
+
 from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -17,11 +18,14 @@ async def test_marker_written_to_thread_context_on_success():
     svc.upload_snapshot = AsyncMock(return_value=True)
 
     # Stub the SSH-tar pipeline so capture "succeeds" without a real pod.
-    with patch.object(
-        SnapshotService, "_collect_environment_info", AsyncMock(return_value={})
-    ), patch(
-        "orchestrator.services.snapshot_service.asyncio.create_subprocess_exec"
-    ) as cse:
+    with (
+        patch.object(
+            SnapshotService, "_collect_environment_info", AsyncMock(return_value={})
+        ),
+        patch(
+            "orchestrator.services.snapshot_service.asyncio.create_subprocess_exec"
+        ) as cse,
+    ):
         proc = MagicMock()
         proc.stdout.read = AsyncMock(side_effect=[b"data", b""])
         proc.stderr.read = AsyncMock(return_value=b"")
@@ -50,11 +54,14 @@ async def test_no_marker_write_when_work_marker_none():
     svc._db.merge_workspace_container_context = AsyncMock(return_value=True)
     svc.upload_snapshot = AsyncMock(return_value=True)
 
-    with patch.object(
-        SnapshotService, "_collect_environment_info", AsyncMock(return_value={})
-    ), patch(
-        "orchestrator.services.snapshot_service.asyncio.create_subprocess_exec"
-    ) as cse:
+    with (
+        patch.object(
+            SnapshotService, "_collect_environment_info", AsyncMock(return_value={})
+        ),
+        patch(
+            "orchestrator.services.snapshot_service.asyncio.create_subprocess_exec"
+        ) as cse,
+    ):
         proc = MagicMock()
         proc.stdout.read = AsyncMock(side_effect=[b"data", b""])
         proc.stderr.read = AsyncMock(return_value=b"")
