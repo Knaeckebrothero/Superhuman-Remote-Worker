@@ -406,6 +406,53 @@ class TestIsStateEphemeral:
         assert await mgr.is_state_ephemeral(inst) is True
 
 
+class TestIsReachable:
+    @pytest.mark.asyncio
+    async def test_reachable_when_connect_succeeds(self):
+        mgr, *_ = _make_manager()
+        mgr._tcp_probe = AsyncMock(return_value=True)
+        inst = Instance(kind="workspace", id="x", metadata={"pod_ip": "10.0.0.5"})
+        assert await mgr.is_reachable(inst) is True
+        mgr._tcp_probe.assert_awaited_once_with("10.0.0.5", 30022)
+
+    @pytest.mark.asyncio
+    async def test_unreachable_when_connect_fails(self):
+        mgr, *_ = _make_manager()
+        mgr._tcp_probe = AsyncMock(return_value=False)
+        inst = Instance(kind="workspace", id="x", metadata={"pod_ip": "10.0.0.5"})
+        assert await mgr.is_reachable(inst) is False
+
+    @pytest.mark.asyncio
+    async def test_unreachable_without_pod_ip(self):
+        mgr, *_ = _make_manager()
+        mgr._tcp_probe = AsyncMock(return_value=True)
+        inst = Instance(kind="workspace", id="x", metadata={})
+        assert await mgr.is_reachable(inst) is False
+        mgr._tcp_probe.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_result_is_cached(self):
+        mgr, *_ = _make_manager()
+        mgr._clock = lambda: 1000.0
+        mgr._tcp_probe = AsyncMock(return_value=True)
+        inst = Instance(kind="workspace", id="x", metadata={"pod_ip": "10.0.0.5"})
+        assert await mgr.is_reachable(inst) is True
+        assert await mgr.is_reachable(inst) is True
+        mgr._tcp_probe.assert_awaited_once()  # second call served from cache
+
+    @pytest.mark.asyncio
+    async def test_cache_expires(self):
+        mgr, *_ = _make_manager()
+        t = {"now": 1000.0}
+        mgr._clock = lambda: t["now"]
+        mgr._tcp_probe = AsyncMock(return_value=True)
+        inst = Instance(kind="workspace", id="x", metadata={"pod_ip": "10.0.0.5"})
+        await mgr.is_reachable(inst)
+        t["now"] = 1040.0  # > 30s TTL
+        await mgr.is_reachable(inst)
+        assert mgr._tcp_probe.await_count == 2
+
+
 def test_pod_volume_is_ephemeral_helper():
     from orchestrator.services.lifecycle.workspace_manager import (
         _pod_volume_is_ephemeral,
