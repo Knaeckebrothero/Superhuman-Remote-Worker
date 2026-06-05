@@ -14,6 +14,7 @@ import pytest
 
 from orchestrator.services.lifecycle import (
     Instance,
+    ReapableInstanceManager,
     StatefulInstanceManager,
     VMInstanceManager,
     expected_vm_shas,
@@ -346,3 +347,191 @@ class TestDelete:
         await mgr.delete(inst, grace_s=0)
         provisioner.delete_vm.assert_not_called()
         provisioner.delete_thread_vm.assert_not_called()
+
+
+# =============================================================================
+# Reap predicates (ReapableInstanceManager) — mirror workspace, VM-adjusted
+# =============================================================================
+
+
+class TestReapableProtocol:
+    def test_vm_manager_is_reapable_instance_manager(self):
+        mgr, *_ = _make_manager()
+        assert isinstance(mgr, ReapableInstanceManager)
+
+
+class TestIsReapable:
+    @pytest.mark.asyncio
+    async def test_completed_job_is_reapable(self):
+        mgr, *_ = _make_manager()
+        inst = Instance(kind="vm", id="x", metadata={"job_status": "completed"})
+        assert await mgr.is_reapable(inst) is True
+
+    @pytest.mark.asyncio
+    async def test_paused_job_is_reapable(self):
+        mgr, *_ = _make_manager()
+        inst = Instance(kind="vm", id="x", metadata={"job_status": "paused"})
+        assert await mgr.is_reapable(inst) is True
+
+    @pytest.mark.asyncio
+    async def test_processing_job_not_reapable(self):
+        mgr, *_ = _make_manager()
+        inst = Instance(kind="vm", id="x", metadata={"job_status": "processing"})
+        assert await mgr.is_reapable(inst) is False
+
+    @pytest.mark.asyncio
+    async def test_ended_thread_is_reapable(self):
+        mgr, *_ = _make_manager()
+        inst = Instance(kind="vm", id="x", metadata={"thread_status": "ended"})
+        assert await mgr.is_reapable(inst) is True
+
+    @pytest.mark.asyncio
+    async def test_no_status_not_reapable(self):
+        mgr, *_ = _make_manager()
+        inst = Instance(kind="vm", id="x", metadata={})
+        assert await mgr.is_reapable(inst) is False
+
+
+class TestIsDirty:
+    @pytest.mark.asyncio
+    async def test_thread_zero_turns_is_clean(self):
+        mgr, *_ = _make_manager()
+        inst = Instance(kind="vm", id="x", bound_to="t1",
+                        metadata={"thread_status": "ended", "total_turns": 0,
+                                  "last_snapshot_turns": None})
+        assert await mgr.is_dirty(inst) is False
+
+    @pytest.mark.asyncio
+    async def test_thread_turns_ahead_is_dirty(self):
+        mgr, *_ = _make_manager()
+        inst = Instance(kind="vm", id="x", bound_to="t1",
+                        metadata={"thread_status": "ended", "total_turns": 5,
+                                  "last_snapshot_turns": 2})
+        assert await mgr.is_dirty(inst) is True
+
+    @pytest.mark.asyncio
+    async def test_suspended_vm_is_clean(self):
+        # vm_status 'suspended' = already snapshotted to S3, nothing to lose.
+        mgr, *_ = _make_manager()
+        inst = Instance(kind="vm", id="x", bound_to="t1",
+                        metadata={"thread_status": "ended", "total_turns": 9,
+                                  "last_snapshot_turns": None,
+                                  "vm_status": "suspended"})
+        assert await mgr.is_dirty(inst) is False
+
+    @pytest.mark.asyncio
+    async def test_terminal_job_with_snapshot_is_clean(self):
+        mgr, *_ = _make_manager()
+        inst = Instance(kind="vm", id="x", bound_to="j1",
+                        metadata={"job_status": "completed",
+                                  "snapshot_status": "available"})
+        assert await mgr.is_dirty(inst) is False
+
+    @pytest.mark.asyncio
+    async def test_job_without_snapshot_is_dirty(self):
+        mgr, *_ = _make_manager()
+        inst = Instance(kind="vm", id="x", bound_to="j1",
+                        metadata={"job_status": "pending_review",
+                                  "snapshot_status": None})
+        assert await mgr.is_dirty(inst) is True
+
+
+class TestIsReachable:
+    @pytest.mark.asyncio
+    async def test_probes_vm_ssh_port_default_22(self):
+        mgr, *_ = _make_manager()
+        mgr._tcp_probe = AsyncMock(return_value=True)
+        inst = Instance(kind="vm", id="x", metadata={"ssh_host": "10.0.0.5"})
+        assert await mgr.is_reachable(inst) is True
+        mgr._tcp_probe.assert_awaited_once_with("10.0.0.5", 22)
+
+    @pytest.mark.asyncio
+    async def test_probes_explicit_ssh_port(self):
+        mgr, *_ = _make_manager()
+        mgr._tcp_probe = AsyncMock(return_value=True)
+        inst = Instance(kind="vm", id="x",
+                        metadata={"ssh_host": "10.0.0.5", "ssh_port": 2222})
+        assert await mgr.is_reachable(inst) is True
+        mgr._tcp_probe.assert_awaited_once_with("10.0.0.5", 2222)
+
+    @pytest.mark.asyncio
+    async def test_unreachable_without_host(self):
+        mgr, *_ = _make_manager()
+        mgr._tcp_probe = AsyncMock(return_value=True)
+        inst = Instance(kind="vm", id="x", metadata={})
+        assert await mgr.is_reachable(inst) is False
+        mgr._tcp_probe.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_result_is_cached(self):
+        mgr, *_ = _make_manager()
+        mgr._clock = lambda: 1000.0
+        mgr._tcp_probe = AsyncMock(return_value=True)
+        inst = Instance(kind="vm", id="x", metadata={"ssh_host": "10.0.0.5"})
+        await mgr.is_reachable(inst)
+        await mgr.is_reachable(inst)
+        mgr._tcp_probe.assert_awaited_once()
+
+
+class TestAttemptCounter:
+    @pytest.mark.asyncio
+    async def test_record_attempt_increments_job_vm_context(self):
+        mgr, _, _, _, db = _make_manager()
+        db.merge_vm_context = AsyncMock(return_value=True)
+        inst = Instance(kind="vm", id="x", bound_to="j1",
+                        metadata={"scope": "job", "snapshot_attempts": 2})
+        await mgr.record_attempt(inst)
+        db.merge_vm_context.assert_awaited_once_with("j1", {"snapshot_attempts": 3})
+
+    @pytest.mark.asyncio
+    async def test_record_attempt_increments_thread_vm_context(self):
+        mgr, _, _, _, db = _make_manager()
+        db.merge_thread_vm_context = AsyncMock(return_value=True)
+        inst = Instance(kind="vm", id="x", bound_to="t1",
+                        metadata={"scope": "thread", "snapshot_attempts": 0})
+        await mgr.record_attempt(inst)
+        db.merge_thread_vm_context.assert_awaited_once_with(
+            "t1", {"snapshot_attempts": 1})
+
+    @pytest.mark.asyncio
+    async def test_exhausted_at_threshold(self, monkeypatch):
+        monkeypatch.setenv("WORKSPACE_SNAPSHOT_MAX_ATTEMPTS", "5")
+        mgr, *_ = _make_manager()
+        inst = Instance(kind="vm", id="x", metadata={"snapshot_attempts": 5})
+        assert await mgr.attempts_exhausted(inst) is True
+
+    @pytest.mark.asyncio
+    async def test_not_exhausted_below_threshold(self, monkeypatch):
+        monkeypatch.setenv("WORKSPACE_SNAPSHOT_MAX_ATTEMPTS", "5")
+        mgr, *_ = _make_manager()
+        inst = Instance(kind="vm", id="x", metadata={"snapshot_attempts": 4})
+        assert await mgr.attempts_exhausted(inst) is False
+
+
+class TestGiveUp:
+    @pytest.mark.asyncio
+    async def test_give_up_force_deletes_job_vm(self):
+        mgr, provisioner, *_ = _make_manager()
+        inst = Instance(kind="vm", id="x", bound_to="j1", metadata={"scope": "job"})
+        await mgr.give_up(inst, grace_s=0)
+        provisioner.delete_vm.assert_awaited_once_with("j1")
+
+    @pytest.mark.asyncio
+    async def test_give_up_force_deletes_thread_vm(self):
+        mgr, provisioner, *_ = _make_manager()
+        inst = Instance(kind="vm", id="x", bound_to="t1", metadata={"scope": "thread"})
+        await mgr.give_up(inst, grace_s=0)
+        provisioner.delete_thread_vm.assert_awaited_once_with("t1")
+
+
+class TestSnapshotResetsAttempts:
+    @pytest.mark.asyncio
+    async def test_snapshot_success_resets_attempt_counter(self):
+        mgr, _, _, snapshot, db = _make_manager()
+        db.merge_vm_context = AsyncMock(return_value=True)
+        snapshot.capture_vm_snapshot = AsyncMock(return_value=True)
+        inst = Instance(kind="vm", id="x", bound_to="j1",
+                        metadata={"scope": "job", "ssh_host": "10.0.0.5"})
+        ref = await mgr.snapshot(inst)
+        assert ref == "j1"
+        db.merge_vm_context.assert_awaited_with("j1", {"snapshot_attempts": 0})

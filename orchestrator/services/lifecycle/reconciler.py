@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from .types import (
     Instance,
     InstanceLifecycleManager,
+    ReapableInstanceManager,
     StatefulInstanceManager,
 )
 
@@ -197,10 +198,13 @@ class InstanceLifecycleReconciler:
                                 inst.id,
                             )
 
-                # Stateful reap path: teardown-eligible workspaces/VMs whose
-                # bound work has finished or gone idle. Replaces the old
-                # keep-alive-on-snapshot-failure loop.
-                if isinstance(manager, StatefulInstanceManager):
+                # Reap path: teardown-eligible workspaces whose bound work has
+                # finished or gone idle. Replaces the old keep-alive-on-
+                # snapshot-failure loop. Gated on ReapableInstanceManager, NOT
+                # StatefulInstanceManager — VMs are stateful but don't implement
+                # the reap predicates (routing them here AttributeError'd every
+                # tick; see test_stateful_non_reapable_manager_is_skipped).
+                if isinstance(manager, ReapableInstanceManager):
                     try:
                         await self._reap(manager, inst, stats)
                     except Exception:
@@ -243,17 +247,17 @@ class InstanceLifecycleReconciler:
         if await manager.attempts_exhausted(inst):
             await manager.give_up(inst, grace_s=0)
             stats["reap_forced"] += 1
-            # Data-loss signal: a dirty workspace we could never snapshot.
+            # Data-loss signal: a dirty instance we could never snapshot.
             # Logged (not a Prometheus counter — codebase has none) so
-            # log-based alerting can fire on it.
+            # log-based alerting can fire on it. Applies to any reapable kind
+            # (workspace, vm); kind-specific detail stays out of the message.
             logger.warning(
-                "Workspace reaper force-deleted dirty unreachable instance "
-                "kind=%s id=%s bound=%s volume_ephemeral=%s — state not "
-                "captured (snapshot attempts exhausted)",
+                "Lifecycle reaper force-deleted dirty unreachable instance "
+                "kind=%s id=%s bound=%s — state not captured "
+                "(snapshot attempts exhausted)",
                 manager.kind,
                 inst.id,
                 inst.bound_to,
-                inst.metadata.get("volume_ephemeral", True),
             )
         else:
             await manager.record_attempt(inst)
