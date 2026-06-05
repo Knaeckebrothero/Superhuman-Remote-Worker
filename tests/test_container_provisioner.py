@@ -587,11 +587,21 @@ class TestDockerfileHardening:
     def test_entrypoint_does_not_run_as_user(self):
         """Entrypoint must run SSHD as root (required for user session management).
 
-        code-server runs as agent-host via su -c.
+        sshd is launched directly by the (root) entrypoint and the container is
+        anchored on it via `wait` (it is backgrounded before the state-sentinel
+        wait, not `exec`-ed as PID 1). code-server is the only thing dropped to
+        the unprivileged agent-host user via su -c.
         """
         content = self._read_file("docker/workspace-entrypoint.sh")
-        assert "exec /usr/sbin/sshd" in content
+        # sshd is launched directly — runs as root, never wrapped in su.
+        assert "/usr/sbin/sshd -D" in content
         assert "su -c" in content and "agent-host" in content
+        # The only su -c drop is for code-server; sshd must not run under su.
+        for line in content.splitlines():
+            if "su -c" in line:
+                assert "sshd" not in line, (
+                    f"sshd must run as root, not under su: {line!r}"
+                )
 
 
 class TestCreateWorkspace:
