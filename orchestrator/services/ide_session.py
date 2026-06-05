@@ -497,6 +497,29 @@ class IdeSessionService:
             await seed_ide_config_for_user(
                 self._db, job.get("user_id"), ssh_host, ssh_port
             )
+
+            # Restore license/globalStorage + non-Open-VSX bytes into the VM
+            # (Phase B). Best-effort; no-ops when S3 is unavailable.
+            user_id = job.get("user_id")
+            if (
+                user_id
+                and self._snapshot_service
+                and self._snapshot_service.is_available
+            ):
+                from services.ide_profile_store import IdeProfileStore
+                from services.ide_settings import IdeSettingsStore, seed_ide_profile
+
+                items = await IdeSettingsStore(self._db).get_extensions(str(user_id))
+                profile = IdeProfileStore(
+                    self._snapshot_service._s3, self._snapshot_service._bucket
+                )
+                await seed_ide_profile(
+                    user_id=str(user_id),
+                    ssh_host=ssh_host,
+                    ssh_port=ssh_port,
+                    profile_store=profile,
+                    ext_items=items,
+                )
         except Exception:
             logger.warning(
                 "Failed to seed code-server config for IDE session %s",

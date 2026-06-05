@@ -155,6 +155,26 @@ def parse_extensions_list(stdout: str) -> dict[str, dict]:
     return result
 
 
+def build_signature_script() -> str:
+    """Remote shell: a cheap content signature over the extensions dir and
+    globalStorage (paths + sizes + mtimes), hashed. Used to skip byte-copy when
+    nothing changed. ``find -printf`` is GNU; falls back to ``ls -laR`` if absent.
+    """
+    targets = f"{EXTENSIONS_DIR} {GLOBAL_STORAGE_DIR}"
+    return (
+        f"if find {targets} -maxdepth 0 >/dev/null 2>&1; then\n"
+        f"  (find {targets} -printf '%p %s %T@\\n' 2>/dev/null "
+        f"   || ls -laR {targets} 2>/dev/null) | sort | sha256sum\n"
+        "else echo ''; fi\n"
+    )
+
+
+def parse_signature(stdout: str) -> str:
+    """Take the first whitespace-delimited token (the sha256 hex) from the
+    signature script's stdout; empty string when there's nothing to hash."""
+    return stdout.strip().split()[0] if stdout.strip() else ""
+
+
 OPEN_VSX_API = "https://open-vsx.org/api"
 
 # Fetch signature: (url) -> http_status_int
@@ -610,6 +630,230 @@ async def reconcile_extensions(
     return changed_total
 
 
+# Tar-fn signature: (host, port, remote_path, local_path, *, key_path) -> ok
+TarFn = Callable[..., Awaitable[bool]]
+
+
+async def _ssh_tar_to_file(
+    ssh_host: str,
+    ssh_port: int,
+    remote_path: str,
+    local_path: str,
+    *,
+    key_path: Optional[str] = None,
+    timeout: int = 120,
+) -> bool:
+    """Stream ``ssh agent-host@host 'tar -cf - <remote_path> | zstd' > local`` —
+    the snapshot_service transport, narrowed to one path. Returns False on error.
+    """
+    from services import resolve_ssh_key_path
+
+    kp = key_path if key_path is not None else resolve_ssh_key_path()
+    remote = f"tar -cf - {remote_path} 2>/dev/null | zstd -1 -T0"
+    cmd = [
+        "ssh",
+        *(["-i", kp] if kp else []),
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        "-o",
+        "ConnectTimeout=10",
+        "-p",
+        str(ssh_port),
+        f"agent-host@{ssh_host}",
+        remote,
+    ]
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    )
+    total = 0
+    try:
+        with open(local_path, "wb") as f:
+            while True:
+                chunk = await asyncio.wait_for(
+                    proc.stdout.read(1 << 20), timeout=timeout
+                )
+                if not chunk:
+                    break
+                total += len(chunk)
+                f.write(chunk)
+        await proc.wait()
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "ide_settings: tar capture failed %s:%s — %s", ssh_host, ssh_port, e
+        )
+        return False
+    return proc.returncode == 0 and total > 0
+
+
+async def capture_ide_profile(
+    store: "IdeSettingsStore",
+    user_id: str,
+    ssh_host: str,
+    ssh_port: int,
+    profile_store: Any,
+    *,
+    key_path: Optional[str] = None,
+    _runner: Optional[SshRunner] = None,
+    _tar_fn: Optional[TarFn] = None,
+) -> int:
+    """If the workspace's extensions/globalStorage changed since last capture,
+    tar globalStorage (and any ``bytes`` extension's folder) to the S3 profile
+    store and record the new signature. Returns the number of blobs uploaded.
+    Never raises."""
+    import tempfile
+
+    runner = _runner or _default_ssh_runner
+    tar_fn = _tar_fn or _ssh_tar_to_file
+    try:
+        rc, out, _ = await runner(
+            ssh_host, ssh_port, build_signature_script(), key_path=key_path, timeout=30
+        )
+    except Exception:  # noqa: BLE001
+        return 0
+    if rc != 0:
+        return 0
+    sig = parse_signature(
+        out.decode("utf-8", "replace")
+        if isinstance(out, (bytes, bytearray))
+        else (out or "")
+    )
+    if not sig or sig == await store.get_ext_signature(user_id):
+        return 0
+
+    uploaded = 0
+    # globalStorage bundle
+    with tempfile.NamedTemporaryFile(suffix=".tar.zst", delete=True) as tmp:
+        if tar_fn and await tar_fn(
+            ssh_host, ssh_port, GLOBAL_STORAGE_DIR, tmp.name, key_path=key_path
+        ):
+            await profile_store.put_globalstorage(user_id, tmp.name)
+            uploaded += 1
+    # bytes extensions (only those classified bytes + not already stored)
+    items = await store.get_extensions(user_id)
+    for ext_id, info in items.items():
+        if info.get("source") != "bytes":
+            continue
+        version = info.get("version", "")
+        if await profile_store.ext_bytes_exists(user_id, ext_id, version):
+            continue
+        with tempfile.NamedTemporaryFile(suffix=".tar.zst", delete=True) as tmp:
+            remote = f"{EXTENSIONS_DIR}/{ext_id}-{version}"
+            if tar_fn and await tar_fn(
+                ssh_host, ssh_port, remote, tmp.name, key_path=key_path
+            ):
+                await profile_store.put_ext_bytes(user_id, ext_id, version, tmp.name)
+                uploaded += 1
+
+    await store.set_ext_signature(user_id, sig)
+    return uploaded
+
+
+async def _ssh_untar_from_file(
+    ssh_host: str,
+    ssh_port: int,
+    local_path: str,
+    *,
+    key_path: Optional[str] = None,
+    timeout: int = 120,
+) -> bool:
+    """Reverse of :func:`_ssh_tar_to_file`: stream a local ``.tar.zst`` into the
+    workspace via ``ssh ... 'zstd -d | tar -xf - -C /'``. The archive was created
+    with absolute paths (e.g. ``/var/lib/code-server/User/globalStorage``) so it
+    extracts back to the same location. Returns False on error."""
+    from services import resolve_ssh_key_path
+
+    kp = key_path if key_path is not None else resolve_ssh_key_path()
+    remote = "zstd -d | tar -xf - -C /"
+    cmd = [
+        "ssh",
+        *(["-i", kp] if kp else []),
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        "-o",
+        "ConnectTimeout=10",
+        "-p",
+        str(ssh_port),
+        f"agent-host@{ssh_host}",
+        remote,
+    ]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+        async def _feed() -> None:
+            with open(local_path, "rb") as f:
+                while True:
+                    chunk = f.read(1 << 20)
+                    if not chunk:
+                        break
+                    proc.stdin.write(chunk)
+                    await proc.stdin.drain()
+            proc.stdin.close()
+
+        await asyncio.wait_for(asyncio.gather(_feed(), proc.wait()), timeout=timeout)
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "ide_settings: untar seed failed %s:%s — %s", ssh_host, ssh_port, e
+        )
+        return False
+    return proc.returncode == 0
+
+
+async def seed_ide_profile(
+    *,
+    user_id: str,
+    ssh_host: str,
+    ssh_port: int,
+    profile_store: Any,
+    ext_items: dict,
+    key_path: Optional[str] = None,
+    _runner: Optional[SshRunner] = None,
+    _push_fn: Optional[Any] = None,
+) -> bool:
+    """Restore globalStorage (+ any bytes extensions) into a workspace, then touch
+    the sentinel the entrypoint waits on. Best-effort; returns True if the sentinel
+    was written. Never raises."""
+    import tempfile
+
+    runner = _runner or _default_ssh_runner
+    push = _push_fn or _ssh_untar_from_file
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".tar.zst", delete=True) as tmp:
+            if await profile_store.get_globalstorage(user_id, tmp.name):
+                await push(ssh_host, ssh_port, tmp.name, key_path=key_path)
+        for ext_id, info in (ext_items or {}).items():
+            if info.get("source") != "bytes":
+                continue
+            with tempfile.NamedTemporaryFile(suffix=".tar.zst", delete=True) as tmp:
+                if await profile_store.get_ext_bytes(
+                    user_id, ext_id, info.get("version", ""), tmp.name
+                ):
+                    await push(ssh_host, ssh_port, tmp.name, key_path=key_path)
+        # chown + sentinel
+        rc, _o, _e = await runner(
+            ssh_host,
+            ssh_port,
+            f"chown -R agent-host:agent-host {CODE_SERVER_USER_DIR} {EXTENSIONS_DIR} 2>/dev/null; "
+            f"touch {SEED_STATE_SENTINEL}\n",
+            key_path=key_path,
+            timeout=30,
+        )
+        return rc == 0
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "ide_settings: profile seed failed %s:%s — %s", ssh_host, ssh_port, e
+        )
+        return False
+
+
 def _ver_key(v: str) -> tuple:
     """Sort key for version strings: numeric-aware, falls back to string parts.
     ``"2.0.13"`` > ``"2.0.9"``; non-numeric segments compare lexicographically."""
@@ -736,3 +980,31 @@ class IdeSettingsStore:
         ide["extensions"] = exts
         await self._db.update_user_settings(user_id, {"ide": ide})
         return changed
+
+    async def get_ext_signature(self, user_id: str) -> str:
+        """Return the last-captured content signature for this user's extensions+
+        globalStorage, or empty string if none."""
+        settings = await self._db.get_user_settings(user_id)
+        ide = settings.get("ide") if isinstance(settings, dict) else None
+        exts = ide.get("extensions") if isinstance(ide, dict) else None
+        return exts.get("sig", "") if isinstance(exts, dict) else ""
+
+    async def set_ext_signature(self, user_id: str, sig: str) -> None:
+        """Record the content signature so a later sweep can skip an unchanged
+        capture. Read-modify-writes the whole ``ide`` subtree (shallow merge)."""
+        settings = await self._db.get_user_settings(user_id)
+        if not isinstance(settings, dict):
+            settings = {}
+        ide = (
+            dict(settings.get("ide") or {})
+            if isinstance(settings.get("ide"), dict)
+            else {}
+        )
+        exts = (
+            dict(ide.get("extensions") or {})
+            if isinstance(ide.get("extensions"), dict)
+            else {}
+        )
+        exts["sig"] = sig
+        ide["extensions"] = exts
+        await self._db.update_user_settings(user_id, {"ide": ide})

@@ -22,6 +22,19 @@ from services.workspace_lifecycle import WorkspaceOwner
 logger = logging.getLogger(__name__)
 
 
+def _resolve_ssh_port(ws_ctx: dict, vm_ctx: dict) -> int:
+    """Resolve the snapshot SSH port by workspace kind.
+
+    Container/pod workspaces run sshd on 30022; only true VM contexts use the
+    VM ssh_port (default 22). Previously both fell through to a VM-shaped 22
+    default, which silently broke pod snapshots when ``port`` was absent from
+    the stored context (the cause of the dev-cluster leaked-pod incident).
+    """
+    if ws_ctx:
+        return int(ws_ctx.get("port", 30022))
+    return int(vm_ctx.get("ssh_port", 22))
+
+
 class WorkspaceSuspensionService:
     """Coordinates idle suspension between SnapshotService and ContainerProvisioner.
 
@@ -125,7 +138,7 @@ class WorkspaceSuspensionService:
 
         # Determine SSH host for snapshot
         ssh_host = ws_ctx.get("pod_ip") or ws_ctx.get("host") or vm_ctx.get("ssh_host")
-        ssh_port = ws_ctx.get("port", vm_ctx.get("ssh_port", 22))
+        ssh_port = _resolve_ssh_port(ws_ctx, vm_ctx)
 
         if not ssh_host:
             return False
@@ -142,10 +155,21 @@ class WorkspaceSuspensionService:
             if user_id:
                 from services.ide_settings import IdeSettingsStore, pull_ide_config
 
+                store = IdeSettingsStore(self._db)
                 pulled = await pull_ide_config(ssh_host, int(ssh_port))
                 if pulled:
-                    await IdeSettingsStore(self._db).apply_pulled_files(
-                        str(user_id), pulled
+                    await store.apply_pulled_files(str(user_id), pulled)
+                # Capture license/globalStorage + bytes extensions to S3 (Phase B),
+                # signature-gated. Shrinks the state loss window on clean suspend.
+                if self._snapshot_service and self._snapshot_service.is_available:
+                    from services.ide_profile_store import IdeProfileStore
+                    from services.ide_settings import capture_ide_profile
+
+                    profile = IdeProfileStore(
+                        self._snapshot_service._s3, self._snapshot_service._bucket
+                    )
+                    await capture_ide_profile(
+                        store, str(user_id), ssh_host, int(ssh_port), profile
                     )
         except Exception:
             logger.debug(
@@ -330,7 +354,7 @@ class WorkspaceSuspensionService:
                 return False
 
             # Extract snapshot into the workspace
-            ssh_port = int(ws_ctx.get("port", vm_ctx.get("ssh_port", 22)))
+            ssh_port = _resolve_ssh_port(ws_ctx, vm_ctx)
             await self._extract_snapshot(job_id, ssh_host, ssh_port=ssh_port)
 
             # Mark as ready
@@ -445,7 +469,7 @@ class WorkspaceSuspensionService:
         provisioner_type = ws_ctx.get("provisioner")
 
         ssh_host = ws_ctx.get("pod_ip") or ws_ctx.get("host") or vm_ctx.get("ssh_host")
-        ssh_port = ws_ctx.get("port", vm_ctx.get("ssh_port", 22))
+        ssh_port = _resolve_ssh_port(ws_ctx, vm_ctx)
 
         if not ssh_host:
             return False
@@ -649,7 +673,7 @@ class WorkspaceSuspensionService:
                 return False
 
             # Extract snapshot into the workspace
-            ssh_port = int(ws_ctx.get("port", vm_ctx.get("ssh_port", 22)))
+            ssh_port = _resolve_ssh_port(ws_ctx, vm_ctx)
             await self._extract_snapshot(
                 thread_id, ssh_host, ssh_port=ssh_port, entity_type="threads"
             )

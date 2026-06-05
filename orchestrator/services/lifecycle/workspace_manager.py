@@ -19,6 +19,8 @@ import asyncio
 import json
 import logging
 import os
+import socket
+import time
 from typing import Any
 
 from .types import Instance
@@ -31,6 +33,14 @@ _LABEL_SELECTOR = "srw.io/component=agent-workspace"
 
 _IDLE_JOB_STATUSES = frozenset({"paused", "pending_review", "waiting_for_reply"})
 _IDLE_THREAD_STATUSES = frozenset({"ended"})
+
+# Terminal = bound work is finished; nothing to preserve beyond an existing
+# snapshot. Reapable = the pod is no longer needed at all — the union of
+# suspendable-idle (snapshot + free) and terminal (clean up).
+_TERMINAL_JOB_STATUSES = frozenset({"completed", "failed", "cancelled"})
+_TERMINAL_THREAD_STATUSES = frozenset({"ended"})
+_REAPABLE_JOB_STATUSES = _IDLE_JOB_STATUSES | _TERMINAL_JOB_STATUSES
+_REAPABLE_THREAD_STATUSES = _IDLE_THREAD_STATUSES | _TERMINAL_THREAD_STATUSES
 
 
 def expected_workspace_shas() -> set[str]:
@@ -45,6 +55,23 @@ def expected_workspace_shas() -> set[str]:
     if ":sha-" in tag:
         shas.add(tag.rsplit(":sha-", 1)[-1])
     return shas
+
+
+def _pod_volume_is_ephemeral(pod: Any) -> bool:
+    """True if the pod's workspace-data volume is emptyDir (vs a PVC).
+
+    Defaults to True (ephemeral) when the volume can't be read — matches the
+    current fleet default and keeps the reaper conservative.
+    """
+    try:
+        for vol in pod.spec.volumes or []:
+            if getattr(vol, "name", None) == "workspace-data":
+                if getattr(vol, "persistent_volume_claim", None) is not None:
+                    return False
+                return getattr(vol, "empty_dir", None) is not None
+    except Exception:
+        pass
+    return True
 
 
 class WorkspaceInstanceManager:
@@ -68,6 +95,11 @@ class WorkspaceInstanceManager:
         self._snapshot = snapshot_service
         self._db = db
         self._label_selector = label_selector
+        # Reachability probe cache: pod_ip -> (probed_at, ok). Single
+        # orchestrator process, so a plain dict is sufficient.
+        self._reach_cache: dict[str, tuple[float, bool]] = {}
+        self._reach_ttl_s: float = 30.0
+        self._clock = time.monotonic
 
     # -------------------------------------------------------------------------
     # Protocol implementation
@@ -93,11 +125,26 @@ class WorkspaceInstanceManager:
                 "pod_phase": pod.status.phase,
                 "labels": dict(labels),
                 "kind_label": labels.get("srw/component"),
+                "volume_ephemeral": _pod_volume_is_ephemeral(pod),
             }
             if thread_id:
                 row = await self._fetch_thread(thread_id)
                 if row is not None:
                     metadata["thread_status"] = row.get("status")
+                    metadata["total_turns"] = row.get("total_turns") or 0
+                    md = row.get("metadata") or {}
+                    if isinstance(md, str):
+                        try:
+                            md = json.loads(md)
+                        except (json.JSONDecodeError, ValueError):
+                            md = {}
+                    ws = md.get("workspace_container") or {}
+                    metadata["workspace_status"] = ws.get("status")
+                    metadata["pod_ip"] = ws.get("pod_ip")
+                    metadata["last_snapshot_turns"] = ws.get("last_snapshot_turns")
+                    metadata["snapshot_attempts"] = ws.get("snapshot_attempts") or 0
+                    snap = md.get("snapshot") or {}
+                    metadata["snapshot_status"] = snap.get("status")
             elif job_id:
                 row = await self._fetch_job(job_id)
                 if row is not None:
@@ -111,6 +158,9 @@ class WorkspaceInstanceManager:
                     ws_ctx = ctx.get("workspace_container") or {}
                     metadata["workspace_status"] = ws_ctx.get("status")
                     metadata["pod_ip"] = ws_ctx.get("pod_ip")
+                    metadata["snapshot_attempts"] = ws_ctx.get("snapshot_attempts") or 0
+                    snap = ctx.get("snapshot") or {}
+                    metadata["snapshot_status"] = snap.get("status")
 
             instances.append(
                 Instance(
@@ -146,6 +196,154 @@ class WorkspaceInstanceManager:
         # created but DB context not yet persisted).
         return False
 
+    async def is_reapable(self, inst: Instance) -> bool:
+        """True when the bound work no longer needs the pod.
+
+        Superset of ``is_idle``: adds terminal job/thread states. Terminal
+        instances get cleaned up; suspendable-idle ones get snapshot+freed.
+        A pod with no bound row is never reapable (context may be in flight).
+        """
+        job_status = inst.metadata.get("job_status")
+        thread_status = inst.metadata.get("thread_status")
+        if job_status:
+            return job_status in _REAPABLE_JOB_STATUSES
+        if thread_status:
+            return thread_status in _REAPABLE_THREAD_STATUSES
+        return False
+
+    def _is_terminal(self, inst: Instance) -> bool:
+        """Bound work is finished (vs merely paused) — nothing to preserve
+        beyond an existing snapshot."""
+        job_status = inst.metadata.get("job_status")
+        thread_status = inst.metadata.get("thread_status")
+        if job_status:
+            return job_status in _TERMINAL_JOB_STATUSES
+        if thread_status:
+            return thread_status in _TERMINAL_THREAD_STATUSES
+        return False
+
+    async def is_dirty(self, inst: Instance) -> bool:
+        """True when the workspace may hold un-snapshotted state worth saving.
+
+        Threads: precise — current ``total_turns`` vs the turn count recorded
+        at last snapshot (``last_snapshot_turns``). Zero turns, or turns equal
+        to the snapshot, means clean.
+
+        Jobs: no monotonic turn counter exists in Postgres (audit count is in
+        Mongo — deliberately not consulted here). Conservative: a terminal job
+        with an existing snapshot is clean (it got a completion capture);
+        otherwise dirty (attempt a snapshot; the escape hatch bounds the
+        unreachable case).
+
+        NOTE: never reads ``last_activity`` — it is bumped by the orchestrator's
+        own context merges and cannot distinguish real work from bookkeeping.
+        """
+        thread_status = inst.metadata.get("thread_status")
+        if thread_status is not None:
+            turns = inst.metadata.get("total_turns") or 0
+            snap_turns = inst.metadata.get("last_snapshot_turns")
+            if snap_turns is None:
+                return turns > 0
+            return turns > snap_turns
+        # Job path: no turn counter.
+        if self._is_terminal(inst):
+            return inst.metadata.get("snapshot_status") != "available"
+        return True
+
+    async def is_state_ephemeral(self, inst: Instance) -> bool:
+        """True when pod-local storage dies with the pod (emptyDir).
+
+        Ephemeral → a crashed/unreachable pod's state is unrecoverable, so the
+        terminal action is delete-the-tombstone. PVC-backed → state survives on
+        the volume; the terminal action is recreate-pod-keep-PVC. Defaults to
+        ephemeral (today's fleet default) when the volume mode is unknown.
+        """
+        return bool(inst.metadata.get("volume_ephemeral", True))
+
+    async def _tcp_probe(self, host: str, port: int) -> bool:
+        """One-shot TCP connect with a short timeout. Overridable in tests."""
+
+        def _connect() -> bool:
+            try:
+                with socket.create_connection((host, port), timeout=5):
+                    return True
+            except OSError:
+                return False
+
+        return await asyncio.to_thread(_connect)
+
+    async def is_reachable(self, inst: Instance) -> bool:
+        """Cached liveness probe to the pod's SSH port (30022).
+
+        Used ONLY in the reap path to choose snapshot-vs-retry — never in
+        ``is_healthy`` (an unreachable busy pod must not be force-deleted over
+        a transient blip). Cached ~30s per pod IP.
+        """
+        host = inst.metadata.get("pod_ip")
+        if not host:
+            return False
+        now = self._clock()
+        cached = self._reach_cache.get(host)
+        if cached is not None and (now - cached[0]) < self._reach_ttl_s:
+            return cached[1]
+        ok = await self._tcp_probe(host, 30022)
+        self._reach_cache[host] = (now, ok)
+        return ok
+
+    def _max_attempts(self) -> int:
+        try:
+            return int(os.environ.get("WORKSPACE_SNAPSHOT_MAX_ATTEMPTS", "5"))
+        except ValueError:
+            return 5
+
+    async def attempts_exhausted(self, inst: Instance) -> bool:
+        return (inst.metadata.get("snapshot_attempts") or 0) >= self._max_attempts()
+
+    async def record_attempt(self, inst: Instance) -> None:
+        """Persist an incremented snapshot-attempt counter to the bound row."""
+        if self._db is None:
+            return
+        bound = inst.bound_to
+        if not bound:
+            return
+        nxt = (inst.metadata.get("snapshot_attempts") or 0) + 1
+        labels = inst.metadata.get("labels") or {}
+        try:
+            if "srw/thread-id" in labels:
+                await self._db.merge_thread_workspace_context(
+                    bound, {"snapshot_attempts": nxt}
+                )
+            else:
+                await self._db.merge_workspace_container_context(
+                    bound, {"snapshot_attempts": nxt}
+                )
+        except Exception:
+            logger.exception("Failed to record snapshot attempt for %s", inst.id)
+
+    async def give_up(self, inst: Instance, grace_s: int) -> None:
+        """Escape hatch: dirty + unreachable + attempts exhausted.
+
+        Ephemeral storage → delete the pod (state already unrecoverable).
+        PVC-backed → recreate the pod against the same PVC so the volume
+        reattaches; the PVC is NOT deleted. (PVC arm is minimally activated
+        this spec — full restore-by-reattach lands with the migration spec.)
+        """
+        bound = inst.bound_to
+        if not bound:
+            return
+        labels = inst.metadata.get("labels") or {}
+        owner = (
+            WorkspaceOwner.session(bound)
+            if "srw/thread-id" in labels
+            else WorkspaceOwner.job(bound)
+        )
+        await self.delete(inst, grace_s)
+        if not inst.metadata.get("volume_ephemeral", True):
+            try:
+                await self._provisioner.create_workspace(owner)
+            except Exception:
+                logger.exception("PVC give_up recreate failed for %s", inst.id)
+
     async def snapshot(self, inst: Instance) -> str | None:
         """Capture the workspace contents to S3.
 
@@ -167,8 +365,29 @@ class WorkspaceInstanceManager:
                 ssh_host=ssh_host,
                 ssh_port=30022,
                 source_type="pod",
+                entity_type=(
+                    "threads"
+                    if "srw/thread-id" in (inst.metadata.get("labels") or {})
+                    else "jobs"
+                ),
+                work_marker=inst.metadata.get("total_turns"),
             )
-            return bound if ok else None
+            if ok:
+                # Success clears the escape-hatch retry counter.
+                labels = inst.metadata.get("labels") or {}
+                try:
+                    if "srw/thread-id" in labels:
+                        await self._db.merge_thread_workspace_context(
+                            bound, {"snapshot_attempts": 0}
+                        )
+                    else:
+                        await self._db.merge_workspace_container_context(
+                            bound, {"snapshot_attempts": 0}
+                        )
+                except Exception:
+                    logger.exception("Failed to reset attempts for %s", inst.id)
+                return bound
+            return None
         except Exception:
             logger.exception(
                 "Snapshot failed for workspace %s (bound=%s)", inst.id, bound
@@ -260,7 +479,8 @@ class WorkspaceInstanceManager:
         try:
             async with self._db.acquire() as conn:
                 row = await conn.fetchrow(
-                    "SELECT id, status, ended_at, agent_id FROM threads WHERE id = $1",
+                    "SELECT id, status, ended_at, agent_id, total_turns, metadata "
+                    "FROM threads WHERE id = $1",
                     thread_id,
                 )
             return dict(row) if row else None

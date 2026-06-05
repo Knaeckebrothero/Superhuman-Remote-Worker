@@ -501,6 +501,26 @@ class NatsBridge:
             )
             user_id = row.get("user_id") if isinstance(row, dict) else None
             await seed_ide_config_for_user(self._db, user_id, ssh_host, ssh_port)
+
+            # Restore license/globalStorage + non-Open-VSX bytes into the VM
+            # (Phase B). Best-effort; no-ops when S3 is unavailable.
+            from services.snapshot_service import snapshot_service
+
+            if user_id and snapshot_service.is_available:
+                from services.ide_profile_store import IdeProfileStore
+                from services.ide_settings import IdeSettingsStore, seed_ide_profile
+
+                items = await IdeSettingsStore(self._db).get_extensions(str(user_id))
+                profile = IdeProfileStore(
+                    snapshot_service._s3, snapshot_service._bucket
+                )
+                await seed_ide_profile(
+                    user_id=str(user_id),
+                    ssh_host=ssh_host,
+                    ssh_port=ssh_port,
+                    profile_store=profile,
+                    ext_items=items,
+                )
         except Exception:
             logger.debug("ide seed (vm) failed for %s", entity_id, exc_info=True)
 

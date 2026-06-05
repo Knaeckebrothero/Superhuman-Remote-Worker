@@ -4,9 +4,14 @@
 
 **Goal:** Stop workspace pods leaking forever by making the lifecycle reconciler reap teardown-eligible workspaces with a clean/dirty gate, a bounded snapshot-retry escape hatch, and a volume-mode branch — replacing the keep-alive-on-snapshot-failure loop.
 
-**Architecture:** Extend `WorkspaceInstanceManager` (a `StatefulInstanceManager`) with new predicates (`is_reapable`, `is_dirty`, `is_reachable`, `is_state_ephemeral`, `attempts_exhausted`) and actions (`record_attempt`, `give_up`). Add a stateful reap branch to `InstanceLifecycleReconciler.tick()` that runs them in order. Retire the suspend half of `workspace_idle_sweeper`. Add a snapshot work-marker, a default-22 port fix, owner-ref/TTL on pods, and Prometheus metrics.
+**Architecture:** Extend `WorkspaceInstanceManager` (a `StatefulInstanceManager`) with new predicates (`is_reapable`, `is_dirty`, `is_reachable`, `is_state_ephemeral`, `attempts_exhausted`) and actions (`record_attempt`, `give_up`). Add a stateful reap branch to `InstanceLifecycleReconciler.tick()` that runs them in order. Retire the suspend half of `workspace_idle_sweeper`. Add a snapshot work-marker, a default-22 port fix, owner-ref/TTL on pods, and reap-outcome observability via the reconciler's existing logged-stats dict.
 
-**Tech Stack:** Python 3.12 (CI gate), asyncio, pytest + pytest-asyncio, Kubernetes Python client, Postgres (asyncpg) for `jobs`/`threads`, Prometheus client. Spec: `docs/superpowers/specs/2026-06-04-workspace-reaper-lifecycle-design.md`.
+**Tech Stack:** Python 3.12 (CI gate), asyncio, pytest + pytest-asyncio, Kubernetes Python client, Postgres (asyncpg) for `jobs`/`threads`. Spec: `docs/superpowers/specs/2026-06-04-workspace-reaper-lifecycle-design.md`.
+
+**REVISION (2026-06-05, at execution time, post ide-ext merge):**
+- **Task 12 changed from Prometheus to logged-stats.** `prometheus_client` is NOT installed and the codebase uses NO Counter/Gauge metrics anywhere — observability is the reconciler's `stats`/`report` dict, emitted via `logger.info("Lifecycle tick kind=... {...}")`. Task 12 now ensures reap outcomes (`reaped`, `reap_attempts`, `reap_forced`) are in that dict (already added in Task 7) and adds a WARN log on each forced delete (the data-loss signal). No new dependency, no `metrics.py`.
+- **`_build_pod_manifest` signature confirmed** (Task 10): `(self, pod_name, owner, image, cpu, memory, cpu_limit, memory_limit, network_tier=DEFAULT_NETWORK_TIER, pvc_name=None, seed_configmap=None)`. ide-ext added `extensions` to `_create_seed_configmap`, NOT to `_build_pod_manifest` — Task 10's edit point (the `metadata` block, line ~875) is unaffected.
+- Implementation branch is `feat/workspace-reaper-lifecycle` (off freshly-merged `develop`), not `design/...`.
 
 **Key decisions baked in:**
 - Dirty signal keys on `threads.total_turns` (monotonic, real-turns-only), **never `last_activity`** (contaminated: `merge_*_context` bumps it).
