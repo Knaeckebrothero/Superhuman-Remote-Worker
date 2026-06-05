@@ -1,0 +1,276 @@
+- application [ref=e2]:
+  - generic [ref=e6]:
+    - toolbar "Title actions" [ref=e30]:
+      - button "Customize Layout..." [ref=e31] [cursor=pointer]: 
+      - checkbox "Toggle Primary Side Bar (Ctrl+B)" [checked] [ref=e32] [cursor=pointer]: 
+      - checkbox "Toggle Panel (Ctrl+J)" [ref=e33] [cursor=pointer]: 
+      - checkbox "Toggle Secondary Side Bar (Ctrl+Alt+B)" [ref=e34] [cursor=pointer]: 
+    - generic [ref=e39]:
+      - generic [ref=e41]:
+        - menubar [ref=e42]:
+          - menuitem "Application Menu" [ref=e43]:
+            - generic [ref=e44] [cursor=pointer]: 
+        - tablist "Active View Switcher" [ref=e47]:
+          - tab "Explorer (Ctrl+Shift+E)" [expanded] [selected] [ref=e48] [cursor=pointer]:
+            - generic "Explorer (Ctrl+Shift+E)" [ref=e49]: 
+          - tab "Search (Ctrl+Shift+F)" [ref=e50] [cursor=pointer]:
+            - generic "Search (Ctrl+Shift+F)" [ref=e51]: 
+          - tab "Source Control (Ctrl+Shift+G) - 62 pending changes" [ref=e52] [cursor=pointer]:
+            - generic "Source Control (Ctrl+Shift+G) - 62 pending changes" [ref=e53]: 
+            - generic "Source Control (Ctrl+Shift+G) - 62 pending changes" [ref=e54]:
+              - generic [ref=e55]: "62"
+          - tab "Run and Debug (Ctrl+Shift+D)" [ref=e56] [cursor=pointer]:
+            - generic "Run and Debug (Ctrl+Shift+D)" [ref=e57]: 
+          - tab "Extensions (Ctrl+Shift+X)" [ref=e58] [cursor=pointer]:
+            - generic "Extensions (Ctrl+Shift+X)" [ref=e59]: 
+        - toolbar "Manage" [ref=e62]:
+          - button "Accounts" [ref=e63] [cursor=pointer]:
+            - generic "Accounts" [ref=e64]: 
+          - button "Manage" [ref=e65] [cursor=pointer]:
+            - generic "Manage" [ref=e66]: 
+      - generic [ref=e67]:
+        - generic [ref=e68]:
+          - heading "Explorer" [level=2] [ref=e70]
+          - toolbar "Explorer actions" [ref=e74]:
+            - generic "Views and More Actions..." [ref=e77] [cursor=pointer]: 
+          - generic:
+            - generic:
+              - generic:
+                - toolbar
+        - generic [ref=e82]:
+          - generic [ref=e84]:
+            - 'button "Explorer Section: workspace" [expanded] [ref=e85] [cursor=pointer]':
+              - generic [ref=e86]: 
+              - text: 
+              - 'heading "Explorer Section: workspace" [level=3] [ref=e87]': workspace
+              - text:    
+            - tree "Files Explorer" [ref=e90]:
+              - generic [ref=e91]:
+                - treeitem "archive" [level=1] [ref=e92] [cursor=pointer]:
+                  - generic [ref=e93]:
+                    - generic [ref=e94]: 
+                    - generic "~/workspace/archive" [ref=e96]:
+                      - generic [ref=e99]: archive
+                - treeitem "output" [level=1] [ref=e100] [cursor=pointer]:
+                  - generic [ref=e101]:
+                    - generic [ref=e102]: 
+                    - generic "~/workspace/output" [ref=e104]:
+                      - generic [ref=e107]: output
+                - treeitem "reference" [level=1] [ref=e108] [cursor=pointer]:
+                  - generic [ref=e109]:
+                    - generic [ref=e110]: 
+                    - generic "~/workspace/reference" [ref=e112]:
+                      - generic [ref=e115]: reference
+                - treeitem "tools" [level=1] [ref=e116] [cursor=pointer]:
+                  - generic [ref=e117]:
+                    - generic [ref=e118]: 
+                    - generic "~/workspace/tools • Contains emphasized items" [ref=e120]:
+                      - generic [ref=e123]: tools
+                      - text: 
+                - treeitem "README.md" [level=1] [ref=e124] [cursor=pointer]:
+                  - generic "~/workspace/README.md" [ref=e127]:
+                    - text: 
+                    - generic [ref=e130]: README.md
+          - button "Outline Section" [ref=e133] [cursor=pointer]:
+            - generic [ref=e134]: 
+            - text: 
+            - heading "Outline" [level=3] [ref=e135]
+            - text:  
+          - button "Timeline Section" [ref=e138] [cursor=pointer]:
+            - generic [ref=e139]: 
+            - text: 
+            - heading "Timeline" [level=3] [ref=e140]
+            - text:    
+      - main [ref=e148]:
+        - generic [ref=e156]:
+          - generic [ref=e158] [cursor=pointer]:
+            - tablist [ref=e159]:
+              - tab "Welcome, preview" [selected] [ref=e160]:
+                - generic "Welcome" [ref=e161]:
+                  - generic [ref=e163]: Welcome
+                - toolbar "Tab actions" [ref=e166]:
+                  - button "Close (Ctrl+W)" [ref=e167]: 
+            - toolbar "Editor actions" [ref=e171]:
+              - button "Split Editor Right [Alt] Split Editor Down" [ref=e172]: 
+              - generic "More Actions..." [ref=e175]: 
+          - document "Overview of how to get up to speed with your editor." [ref=e178]:
+            - generic [ref=e179]:
+              - generic [ref=e181]:
+                - generic [ref=e182]:
+                  - generic [ref=e183]:
+                    - heading "Start" [level=2] [ref=e184]
+                    - list [ref=e185]:
+                      - listitem [ref=e186]:
+                        - button " New File..." [ref=e187] [cursor=pointer]:
+                          - generic [ref=e188]: 
+                          - text: New File...
+                      - listitem [ref=e189]:
+                        - button " Open File..." [ref=e190] [cursor=pointer]:
+                          - generic [ref=e191]: 
+                          - text: Open File...
+                      - listitem [ref=e192]:
+                        - button " Clone Git Repository..." [ref=e193] [cursor=pointer]:
+                          - generic [ref=e194]: 
+                          - text: Clone Git Repository...
+                  - generic [ref=e195]:
+                    - heading "Recent" [level=2] [ref=e196]
+                    - list [ref=e197]:
+                      - generic [ref=e198]:
+                        - text: You have no recent folders,
+                        - button "open a folder" [ref=e199] [cursor=pointer]
+                        - text: to start.
+                - generic [ref=e200]:
+                  - generic [ref=e201]:
+                    - heading "Next Up" [level=2] [ref=e202]
+                    - link "Deploy code-server for your team Provision software development environments on your infrastructure with Coder. Coder is a self-service portal which provisions via Terraform—Linux, macOS, Windows, x86, ARM, and, of course, Kubernetes based infrastructure. Get started " [ref=e203] [cursor=pointer]:
+                      - /url: https://cdr.co/code-server-to-coder
+                      - button "Deploy code-server for your team Provision software development environments on your infrastructure with Coder. Coder is a self-service portal which provisions via Terraform—Linux, macOS, Windows, x86, ARM, and, of course, Kubernetes based infrastructure. Get started " [ref=e204]:
+                        - heading "Deploy code-server for your team" [level=3] [ref=e205]
+                        - paragraph [ref=e206]: Provision software development environments on your infrastructure with Coder.
+                        - paragraph [ref=e207]: Coder is a self-service portal which provisions via Terraform—Linux, macOS, Windows, x86, ARM, and, of course, Kubernetes based infrastructure.
+                        - paragraph [ref=e208]:
+                          - text: Get started
+                          - generic [ref=e209]: 
+                        - img
+                  - generic [ref=e210]:
+                    - heading "Walkthroughs" [level=2] [ref=e211]
+                    - list [ref=e212]:
+                      - button " Get Started with VS Code for the Web Customize your editor, learn the basics, and start coding" [ref=e213]:
+                        - generic [ref=e215]: 
+                        - heading "Get Started with VS Code for the Web" [level=3] [ref=e217]
+                        - generic [ref=e218]: Customize your editor, learn the basics, and start coding
+                        - progressbar [ref=e220]:
+                          - generic "2 of 5 steps complete" [ref=e257]
+                      - button " Learn the Fundamentals" [ref=e222]:
+                        - generic [ref=e223]:
+                          - generic [ref=e224]: 
+                          - heading "Learn the Fundamentals" [level=3] [ref=e225]
+                - paragraph [ref=e227]:
+                  - checkbox "When checked, this page will be shown on startup." [checked] [ref=e228] [cursor=pointer]: 
+                  - generic [ref=e229] [cursor=pointer]: Show welcome page on startup
+              - generic [ref=e230]: 
+          - text: 
+    - status [ref=e233]:
+      - generic [ref=e234]:
+        - generic "remote" [ref=e235]:
+          - button "remote" [ref=e236] [cursor=pointer]:
+            - generic [ref=e237]: 
+        - generic "workspace (Git) - main*, Checkout Branch/Tag..." [ref=e238]:
+          - button "workspace (Git) - main*, Checkout Branch/Tag..." [ref=e239] [cursor=pointer]:
+            - generic [ref=e240]: 
+            - text: main*
+        - generic "workspace (Git) - Synchronize Changes" [ref=e241]:
+          - button "workspace (Git) - Synchronize Changes" [ref=e242] [cursor=pointer]:
+            - generic [ref=e243]: 
+        - generic "No Problems" [ref=e244]:
+          - button "No Problems" [ref=e245] [cursor=pointer]:
+            - generic [ref=e246]: 
+            - text: "0"
+            - generic [ref=e247]: 
+            - text: "0"
+        - generic "No Ports Forwarded" [ref=e248]:
+          - button "No Ports Forwarded" [ref=e249] [cursor=pointer]:
+            - generic [ref=e250]: 
+            - text: "0"
+      - generic [ref=e251]:
+        - generic "Notifications" [ref=e252]:
+          - button "Notifications" [ref=e253] [cursor=pointer]:
+            - generic [ref=e254]: 
+        - 'generic "Layout: de" [ref=e255]':
+          - 'button "Layout: de" [ref=e256] [cursor=pointer]'
+  - generic:
+    - alert
+    - alert
+  - generic [ref=e258]:
+    - generic:
+      - generic:
+        - toolbar
+      - generic:
+        - toolbar
+    - generic [ref=e259]:
+      - generic [ref=e261]:
+        - textbox "Type the name of a command to run." [active] [ref=e266]: ">"
+        - generic [ref=e268]: 655 Results
+      - generic:
+        - toolbar
+    - progressbar [ref=e269]
+    - listbox "Type the name of a command to run." [ref=e271]:
+      - generic [ref=e272]:
+        - 'option "Accounts: Manage Trusted Extensions For Account" [ref=e273] [cursor=pointer]':
+          - generic [ref=e276]:
+            - generic [ref=e283]: "Accounts: Manage Trusted Extensions For Account"
+            - toolbar [ref=e285]:
+              - button "Configure Keybinding" [ref=e286]: 
+        - option "Add Data Breakpoint at Address" [ref=e287] [cursor=pointer]:
+          - generic [ref=e290]:
+            - generic [ref=e297]: Add Data Breakpoint at Address
+            - generic:
+              - toolbar: 
+        - option "Add Function Breakpoint" [ref=e298] [cursor=pointer]:
+          - generic [ref=e301]:
+            - generic [ref=e308]: Add Function Breakpoint
+            - generic:
+              - toolbar: 
+        - option "Add XHR/fetch Breakpoint" [ref=e309] [cursor=pointer]:
+          - generic [ref=e312]:
+            - generic [ref=e319]: Add XHR/fetch Breakpoint
+            - generic:
+              - toolbar: 
+        - 'option "Calls: Show Call Hierarchy, Shift+Alt+H" [ref=e320] [cursor=pointer]':
+          - generic [ref=e323]:
+            - generic [ref=e326]:
+              - generic [ref=e330]: "Calls: Show Call Hierarchy"
+              - generic "Shift+Alt+H" [ref=e332]:
+                - generic [ref=e333]: Shift
+                - generic [ref=e334]: +
+                - generic [ref=e335]: Alt
+                - generic [ref=e336]: +
+                - generic [ref=e337]: H
+            - generic:
+              - toolbar: 
+        - 'option "Calls: Show Incoming Calls" [ref=e338] [cursor=pointer]':
+          - generic [ref=e341]:
+            - generic [ref=e348]: "Calls: Show Incoming Calls"
+            - generic:
+              - toolbar: 
+        - 'option "Calls: Show Outgoing Calls" [ref=e349] [cursor=pointer]':
+          - generic [ref=e352]:
+            - generic [ref=e359]: "Calls: Show Outgoing Calls"
+            - generic:
+              - toolbar: 
+        - option "Change End of Line Sequence" [ref=e360] [cursor=pointer]:
+          - generic [ref=e363]:
+            - generic [ref=e370]: Change End of Line Sequence
+            - generic:
+              - toolbar: 
+        - option "Change File Encoding" [ref=e371] [cursor=pointer]:
+          - generic [ref=e374]:
+            - generic [ref=e381]: Change File Encoding
+            - generic:
+              - toolbar: 
+        - option "Change Keyboard Layout" [ref=e382] [cursor=pointer]:
+          - generic [ref=e385]:
+            - generic [ref=e392]: Change Keyboard Layout
+            - generic:
+              - toolbar: 
+        - option "Change Language Mode, Control+K M" [ref=e393] [cursor=pointer]:
+          - generic [ref=e396]:
+            - generic [ref=e399]:
+              - generic [ref=e403]: Change Language Mode
+              - generic "Control+K M" [ref=e405]:
+                - generic [ref=e406]: Ctrl
+                - generic [ref=e407]: +
+                - generic [ref=e408]: K
+                - generic [ref=e409]: M
+            - generic:
+              - toolbar: 
+        - 'option "Chat: Reset Tool Confirmations" [ref=e410] [cursor=pointer]':
+          - generic [ref=e413]:
+            - generic [ref=e420]: "Chat: Reset Tool Confirmations"
+            - generic:
+              - toolbar: 
+        - option "Clear Command History" [ref=e421] [cursor=pointer]:
+          - generic [ref=e424]:
+            - generic [ref=e431]: Clear Command History
+            - generic:
+              - toolbar: 
