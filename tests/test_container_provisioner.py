@@ -104,6 +104,25 @@ class TestPodManifest:
         # back to internet-only.
         assert labels["srw.io/network-tier"] == "internet-only"
 
+    def test_manifest_has_lifecycle_annotation(self):
+        """Pods carry a lifecycle-managed annotation as a GC backstop hook."""
+        from orchestrator.services.container_provisioner import (
+            ContainerProvisioner,
+        )
+
+        provisioner = ContainerProvisioner()
+        manifest = provisioner._build_pod_manifest(
+            pod_name="workspace-abc123",
+            owner=WorkspaceOwner.job("abc123-full-uuid"),
+            image="test-image:latest",
+            cpu="500m",
+            memory="1Gi",
+            cpu_limit="2000m",
+            memory_limit="4Gi",
+        )
+        ann = manifest["metadata"].get("annotations", {})
+        assert ann.get("srw.io/managed-by") == "lifecycle-reconciler"
+
     def test_manifest_tier_label_home_allowed(self):
         """Explicitly passing network_tier='home-allowed' propagates to the pod label."""
         from orchestrator.services.container_provisioner import (
