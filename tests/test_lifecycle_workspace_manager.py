@@ -491,6 +491,43 @@ class TestAttemptCounter:
         assert await mgr.attempts_exhausted(inst) is False
 
 
+class TestGiveUp:
+    @pytest.mark.asyncio
+    async def test_ephemeral_give_up_deletes(self):
+        mgr, container, *_ = _make_manager()
+        inst = Instance(kind="workspace", id="workspace-a", bound_to="j1",
+                        metadata={"labels": {"srw/job-id": "j1"},
+                                  "volume_ephemeral": True})
+        await mgr.give_up(inst, grace_s=0)
+        container.delete_workspace.assert_awaited_once_with(WorkspaceOwner.job("j1"))
+
+    @pytest.mark.asyncio
+    async def test_pvc_give_up_recreates_keeps_pvc(self):
+        mgr, container, *_ = _make_manager()
+        container.create_workspace = AsyncMock(return_value=True)
+        container.delete_workspace_pvc = AsyncMock(return_value=True)
+        inst = Instance(kind="workspace", id="workspace-a", bound_to="j1",
+                        metadata={"labels": {"srw/job-id": "j1"},
+                                  "volume_ephemeral": False})
+        await mgr.give_up(inst, grace_s=0)
+        container.delete_workspace.assert_awaited_once_with(WorkspaceOwner.job("j1"))
+        container.create_workspace.assert_awaited_once_with(WorkspaceOwner.job("j1"))
+        container.delete_workspace_pvc.assert_not_called()  # PVC must survive
+
+    @pytest.mark.asyncio
+    async def test_snapshot_success_resets_attempt_counter(self):
+        mgr, _, _, snapshot, db = _make_manager()
+        db.merge_workspace_container_context = AsyncMock(return_value=True)
+        snapshot.capture_vm_snapshot = AsyncMock(return_value=True)
+        inst = Instance(kind="workspace", id="workspace-a", bound_to="j1",
+                        metadata={"labels": {"srw/job-id": "j1"},
+                                  "pod_ip": "10.0.0.5"})
+        ref = await mgr.snapshot(inst)
+        assert ref == "j1"
+        db.merge_workspace_container_context.assert_awaited_with(
+            "j1", {"snapshot_attempts": 0})
+
+
 def test_pod_volume_is_ephemeral_helper():
     from orchestrator.services.lifecycle.workspace_manager import (
         _pod_volume_is_ephemeral,
