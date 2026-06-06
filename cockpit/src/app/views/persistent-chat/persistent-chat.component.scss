@@ -1865,6 +1865,16 @@
         height: 32px;
       }
 
+      /* "Part i of N" line under the player for multi-chunk playback. */
+      .tts-progress {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        margin-top: 4px;
+        font-size: 12px;
+        color: var(--text-muted);
+      }
+
       /* "Spoken version" disclosure — reuses .thinking-block styling; the text
          is already markdown-stripped prose, so just preserve its line breaks. */
       .tts-spoken {

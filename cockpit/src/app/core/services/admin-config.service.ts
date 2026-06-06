@@ -1,6 +1,6 @@
 import {inject, Injectable, signal} from '@angular/core';
 import {HttpClient} from '@angular/common/http';
-import {catchError, Observable, of, tap} from 'rxjs';
+import {catchError, forkJoin, map, Observable, of, tap} from 'rxjs';
 import {environment} from '../environment';
 
 export type ConfigKind = 'prompts' | 'instructions' | 'settings' | 'guardrails';
@@ -68,6 +68,23 @@ export interface ConfigOverrideCreate {
 }
 
 /**
+ * The overrides API returns `value_json` as a JSON-encoded string (asyncpg
+ * hands JSONB back as text), e.g. `"true"`, `"1"`, `'{"nudges":[]}'`. Decode it
+ * once on read so consumers (settings form, guardrails editor) see real
+ * booleans / numbers / objects instead of strings.
+ */
+export function coerceOverrideValue(o: ConfigOverride): ConfigOverride {
+  if (typeof o.value_json === 'string') {
+    try {
+      return {...o, value_json: JSON.parse(o.value_json) as unknown};
+    } catch {
+      return o; // not JSON — leave as-is
+    }
+  }
+  return o;
+}
+
+/**
  * REST client for the admin prompt-overrides surface
  * (`/api/admin/config/*`). Every call is gated by `is_admin=TRUE`
  * server-side; the client does not re-check. Auth + CSRF ride along via the
@@ -84,7 +101,10 @@ export class AdminConfigService {
   loadOverrides(): void {
     this.http
       .get<ConfigOverride[]>(`${this.baseUrl}/admin/config/overrides`)
-      .pipe(catchError(() => of([] as ConfigOverride[])))
+      .pipe(
+        map((rows) => rows.map(coerceOverrideValue)),
+        catchError(() => of([] as ConfigOverride[])),
+      )
       .subscribe((rows) => this.overrides.set(rows));
   }
 
@@ -101,6 +121,23 @@ export class AdminConfigService {
     return this.http.get<ConfigBundled>(
       `${this.baseUrl}/admin/config/bundled/${fam}/${kind}/${name}`,
     );
+  }
+
+  /**
+   * Bundled defaults for several `settings` leaves at once, keyed by name.
+   * Powers the typed settings form (one round-trip per leaf, fanned out). An
+   * empty `names` resolves to `{}` without hitting the network.
+   */
+  getBundledSettings(
+    family: string | null,
+    names: string[],
+  ): Observable<Record<string, unknown>> {
+    if (names.length === 0) return of({});
+    const calls: Record<string, Observable<unknown>> = {};
+    for (const n of names) {
+      calls[n] = this.getBundled(family, 'settings', n).pipe(map((b) => b.content));
+    }
+    return forkJoin(calls);
   }
 
   /** Create or replace the override for (family, kind, name) — backend upserts. */

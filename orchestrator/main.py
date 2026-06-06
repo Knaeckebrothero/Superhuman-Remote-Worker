@@ -14045,6 +14045,49 @@ async def synthesize_thread_message_tts(
     )
 
 
+@app.post("/api/persistent/threads/{thread_id}/tts/plan")
+async def plan_thread_message_tts(
+    thread_id: str,
+    request: Request,
+    body: dict[str, Any] = Body(...),
+) -> Response:
+    """Plan a (possibly long) message into ordered, speakable chunks.
+
+    The client synthesizes each chunk via ``POST …/tts`` with
+    ``reformulate=false`` (chunks are already cleaned) and plays them as a
+    progressive playlist — so a long message reads start-to-finish without a
+    single multi-minute request and without truncation.
+
+    Body:
+        ``content`` (str, required) — the message text to read aloud.
+
+    Returns:
+        JSON ``{"chunks": [str, ...]}`` — one entry for a short message, several
+        (each ≤ 4096 chars, split at natural breakpoints) for a long one.
+        ``204`` when no TTS model is configured. ``502`` only on an unexpected
+        planner error (the planner has deterministic fallbacks, so this is rare).
+    """
+    from services.tts import plan_tts_chunks
+
+    user, thread = await require_thread_owner(request, postgres_db, thread_id)
+
+    content = (body.get("content") or "").strip()
+    if not content:
+        raise HTTPException(status_code=400, detail="Missing 'content' in request body")
+
+    try:
+        chunks = await plan_tts_chunks(
+            content=content, user_id=str(user["id"]), postgres_db=postgres_db
+        )
+    except Exception as exc:
+        logger.exception("TTS chunk planning failed for thread %s", thread_id)
+        raise HTTPException(status_code=502, detail="TTS planning failed") from exc
+
+    if chunks is None:
+        return Response(status_code=204)
+    return JSONResponse({"chunks": chunks})
+
+
 @app.post("/api/persistent/threads/{thread_id}/transcribe")
 async def transcribe_thread_audio_endpoint(
     thread_id: str,
