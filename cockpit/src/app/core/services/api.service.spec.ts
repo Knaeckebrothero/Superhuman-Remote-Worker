@@ -129,3 +129,51 @@ describe('ApiService.generateTTS', () => {
     expect(await pending).toBeNull();
   });
 });
+
+describe('ApiService.planTTS', () => {
+  let api: ApiService;
+  let httpMock: HttpTestingController;
+
+  beforeEach(() => {
+    TestBed.resetTestingModule();
+    TestBed.configureTestingModule({
+      providers: [
+        ApiService,
+        provideHttpClient(),
+        provideHttpClientTesting(),
+        {provide: AppToastService, useValue: {}},
+        {provide: TranslocoService, useValue: {translate: (k: string) => k}},
+        {provide: ErrorMessageService, useValue: {}},
+      ],
+    });
+    api = TestBed.inject(ApiService);
+    httpMock = TestBed.inject(HttpTestingController);
+  });
+
+  afterEach(() => httpMock.verify());
+
+  it('POSTs the content and returns the chunk array', async () => {
+    const pending = firstValueFrom(api.planTTS('thread-1', 'a long message'));
+    const req = httpMock.expectOne((r) =>
+      r.url.endsWith('/persistent/threads/thread-1/tts/plan'),
+    );
+    expect(req.request.method).toBe('POST');
+    expect(req.request.body.content).toBe('a long message');
+    req.flush({chunks: ['part one', 'part two']});
+    expect(await pending).toEqual(['part one', 'part two']);
+  });
+
+  it('maps a 204 response to "unavailable"', async () => {
+    const pending = firstValueFrom(api.planTTS('t', 'x'));
+    const req = httpMock.expectOne((r) => r.url.endsWith('/tts/plan'));
+    req.flush(null, {status: 204, statusText: 'No Content'});
+    expect(await pending).toBe('unavailable');
+  });
+
+  it('returns null on error', async () => {
+    const pending = firstValueFrom(api.planTTS('t', 'x'));
+    const req = httpMock.expectOne((r) => r.url.endsWith('/tts/plan'));
+    req.flush('boom', {status: 502, statusText: 'Bad Gateway'});
+    expect(await pending).toBeNull();
+  });
+});

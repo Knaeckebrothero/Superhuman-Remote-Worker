@@ -856,6 +856,34 @@ export class ApiService {
       );
   }
 
+  /**
+   * Plan a (possibly long) message into ordered, speakable chunks for
+   * sequential synthesis + playback. Returns the chunk texts, `'unavailable'`
+   * (204 — no TTS model configured), or `null` on error.
+   */
+  planTTS(
+    threadId: string,
+    content: string,
+  ): Observable<string[] | 'unavailable' | null> {
+    return this.http
+      .post<{chunks: string[]}>(
+        `${this.baseUrl}/persistent/threads/${threadId}/tts/plan`,
+        {content},
+        {observe: 'response'},
+      )
+      .pipe(
+        map((resp) =>
+          resp.status === 204 || !resp.body
+            ? ('unavailable' as const)
+            : (resp.body.chunks ?? []),
+        ),
+        catchError((error) => {
+          console.error(`Failed to plan TTS for thread ${threadId}:`, error);
+          return of(null);
+        }),
+      );
+  }
+
   /** Decode a base64 string into a typed Blob (used for TTS MP3 payloads). */
   private decodeBase64ToBlob(base64: string, mime: string): Blob {
     const binary = atob(base64 ?? '');

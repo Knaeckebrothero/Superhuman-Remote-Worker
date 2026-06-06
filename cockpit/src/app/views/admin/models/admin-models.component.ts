@@ -11,6 +11,7 @@ import {
   CatalogProviderKind,
   LlmEndpointDiscoveredModel,
 } from '../../../core/models/api.model';
+import {TTS_VOICE_CUSTOM, voicesForModelId} from '../../../core/models/tts-voices';
 import {AppButtonComponent} from '../../../ui/button';
 import {AppInputComponent} from '../../../ui/input';
 import {AppSelectComponent} from '../../../ui/select';
@@ -298,14 +299,40 @@ function hintsToCapabilities(
             @if (formCapabilities().includes('tts')) {
               <div class="form-row">
                 <app-form-field label="Voice (optional)">
-                  <app-input
-                    [value]="formVoice()"
-                    placeholder="e.g. af_heart, alloy, nova — depends on the TTS backend"
-                    [disabled]="creating()"
-                    (changed)="formVoice.set($event)"
-                  />
+                  @if (ttsVoiceOptions().length > 0) {
+                    <app-select
+                      [value]="formVoiceCustom() ? CUSTOM_VOICE : formVoice()"
+                      [disabled]="creating()"
+                      (changed)="onVoiceSelect($event)"
+                    >
+                      <option value="">(backend default)</option>
+                      @for (v of ttsVoiceOptions(); track v) {
+                        <option [value]="v">{{ v }}</option>
+                      }
+                      <option [value]="CUSTOM_VOICE">Custom…</option>
+                    </app-select>
+                  } @else {
+                    <app-input
+                      [value]="formVoice()"
+                      placeholder="e.g. af_heart, alloy — depends on the TTS backend"
+                      [disabled]="creating()"
+                      (changed)="formVoice.set($event)"
+                    />
+                  }
                 </app-form-field>
               </div>
+              @if (ttsVoiceOptions().length > 0 && formVoiceCustom()) {
+                <div class="form-row">
+                  <app-form-field label="Custom voice">
+                    <app-input
+                      [value]="formVoice()"
+                      placeholder="exact voice id (must match the backend)"
+                      [disabled]="creating()"
+                      (changed)="formVoice.set($event)"
+                    />
+                  </app-form-field>
+                </div>
+              }
             }
 
             @if (formError()) {
@@ -522,6 +549,10 @@ export class AdminModelsComponent implements OnInit {
   // the catalog row's params_json and read by the TTS service. Only sent when
   // the tts capability is selected.
   readonly formVoice = signal('');
+  // True when the operator picked "Custom…" (or the backend is unrecognized);
+  // then formVoice is a free-text voice id rather than a catalog selection.
+  readonly formVoiceCustom = signal(false);
+  protected readonly CUSTOM_VOICE = TTS_VOICE_CUSTOM;
 
   // Mirror for the number input — keeps an empty string when null so the
   // input renders blank instead of "0".
@@ -529,6 +560,10 @@ export class AdminModelsComponent implements OnInit {
     const v = this.formContextWindow();
     return v == null ? '' : String(v);
   });
+
+  /** Voices for the current model's backend (Kokoro/OpenAI); empty when the
+   *  backend isn't recognized → the form falls back to a free-text field. */
+  readonly ttsVoiceOptions = computed(() => voicesForModelId(this.formModelId()));
 
   // Discover-from-endpoint quick-fill state. Resets when the form provider
   // changes (any non-endpoint provider clears the list).
@@ -713,6 +748,18 @@ export class AdminModelsComponent implements OnInit {
     this.formContextWindow.set(Number.isFinite(n) ? n : null);
   }
 
+  /** Voice dropdown change: a real voice sets formVoice directly; the
+   *  "Custom…" sentinel switches to the free-text field. */
+  onVoiceSelect(value: string | null): void {
+    if (value === this.CUSTOM_VOICE) {
+      this.formVoiceCustom.set(true);
+      this.formVoice.set('');
+    } else {
+      this.formVoiceCustom.set(false);
+      this.formVoice.set(value ?? '');
+    }
+  }
+
   submit(): void {
     this.formError.set('');
     const [kind, ref] = this.formProviderKey().split(':') as [CatalogProviderKind, string];
@@ -747,6 +794,7 @@ export class AdminModelsComponent implements OnInit {
           this.formDisplayLabel.set('');
           this.formContextWindow.set(null);
           this.formVoice.set('');
+          this.formVoiceCustom.set(false);
           this.creating.set(false);
         },
         error: (err) => {
