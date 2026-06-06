@@ -984,7 +984,8 @@
       "stop": "Vorlesen stoppen",
       "generating": "Sprache wird erzeugt…",
       "error": "Sprache fehlgeschlagen — zum Wiederholen klicken",
-      "spokenVersion": "Gesprochene Fassung"
+      "spokenVersion": "Gesprochene Fassung",
+      "part": "Teil {{current}} von {{total}}"
     },
     "code": {
       "expandHint": "Klicken zum Ausklappen",

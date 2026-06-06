@@ -984,7 +984,8 @@
       "stop": "Stop reading",
       "generating": "Generating speech…",
       "error": "Speech failed — click to retry",
-      "spokenVersion": "Spoken version"
+      "spokenVersion": "Spoken version",
+      "part": "Part {{current}} of {{total}}"
     },
     "code": {
       "expandHint": "Click to expand",

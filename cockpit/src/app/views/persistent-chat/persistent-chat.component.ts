@@ -67,12 +67,20 @@ interface SlashCommand {
 }
 
 interface TtsMessageState {
+    /** Blob URL of the chunk currently loaded in the <audio> player. */
     audioUrl?: string;
-    /** The spoken (formulation-rewritten) text actually read aloud, when it
-     *  differs from the message — shown in the collapsible "Spoken version". */
+    /** The spoken (rewritten) text read aloud — all chunks joined — shown in
+     *  the collapsible "Spoken version" when it differs from the message. */
     text?: string;
     isGenerating: boolean;
     error: boolean;
+    // Playlist: long messages are synthesized + played as ordered chunks, each
+    // a separate short request. The single <audio> element walks the list.
+    chunks?: string[];
+    /** Lazily-synthesized blob URL per chunk (undefined until synthesized). */
+    chunkUrls?: (string | undefined)[];
+    /** Index of the chunk currently loaded in the player. */
+    index?: number;
 }
 
 interface Suggestion {
@@ -833,6 +841,7 @@ interface FileEditView {
                           [src]="ttsS.audioUrl"
                           (loadedmetadata)="onPlayerReady($event)"
                           (play)="onPlayerPlay($event)"
+                          (ended)="onPlayerEnded(ttsKey)"
                         ></audio>
                       } @else {
                         <button
@@ -857,6 +866,16 @@ interface FileEditView {
                         </button>
                       }
                     </div>
+                    <!-- Multi-chunk progress: which part is playing, with a
+                         spinner while the next chunk is being synthesized. -->
+                    @if (ttsS.chunks && ttsS.chunks.length > 1 && ttsS.audioUrl) {
+                      <div class="tts-progress">
+                        @if (ttsS.isGenerating) {
+                          <span class="action-spinner-sm"></span>
+                        }
+                        <span>{{ 'chat.tts.part' | transloco:{ current: (ttsS.index ?? 0) + 1, total: ttsS.chunks.length } }}</span>
+                      </div>
+                    }
                     <!-- Spoken version: only shown when formulation actually
                          rewrote the text (otherwise it would just mirror the
                          message bubble). Collapsed by default, like reasoning. -->
@@ -1990,44 +2009,117 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     }
 
     /**
-     * Generate (and then reveal) the spoken audio for an assistant turn's
-     * final text. Playback is owned by the native <audio controls> element
-     * that appears once `audioUrl` is set — this method only does the one-time
-     * fetch (formulation + synthesis run server-side).
+     * Read an assistant turn's final text aloud. Plans the message into ordered
+     * chunks (the server cleans + splits at natural breakpoints), synthesizes
+     * the first, reveals the <audio> player, and prefetches the next. Later
+     * chunks play via auto-advance (onPlayerEnded) — so a long message plays
+     * start-to-finish without one long request and without truncation.
      */
     async toggleTts(key: string, content: string): Promise<void> {
         const threadId = this.chat.threadId();
         if (!threadId || !content.trim()) return;
         const state = this.ttsStateFor(key);
-        // Already fetching, or already generated (the player owns it from here).
+        // Already planning/synthesizing, or already started (player owns it).
         if (state.isGenerating || state.audioUrl) return;
 
         this.setTtsState(key, {isGenerating: true, error: false});
-        const lang = this.i18n.activeLang().startsWith('de') ? 'de' : 'en';
-        let result;
+        let plan;
         try {
-            result = await firstValueFrom(
-                this.api.generateTTS(threadId, content, {language: lang, reformulate: true}),
-            );
+            plan = await firstValueFrom(this.api.planTTS(threadId, content));
         } catch (e) {
-            console.error('TTS generate threw', e);
+            console.error('TTS plan threw', e);
             this.setTtsState(key, {isGenerating: false, error: true});
             return;
         }
         // 'unavailable' (204) = no TTS model configured → stay silent, no error.
-        // null = a real failure (incl. 502 synthesis error) → show error state.
-        if (result === null || result === 'unavailable') {
-            this.setTtsState(key, {isGenerating: false, error: result === null});
+        // null = a real failure → show the error state.
+        if (plan === null || plan === 'unavailable') {
+            this.setTtsState(key, {isGenerating: false, error: plan === null});
             return;
         }
-        const url = URL.createObjectURL(result.audio);
-        this.ttsBlobUrls.add(url);
+        if (plan.length === 0) {
+            this.setTtsState(key, {isGenerating: false});
+            return;
+        }
         this.setTtsState(key, {
-            isGenerating: false,
-            audioUrl: url,
-            text: result.text,
-            error: false,
+            chunks: plan,
+            chunkUrls: new Array(plan.length),
+            text: plan.join('\n\n'),
+            index: 0,
         });
+        // Synthesize the first chunk, then reveal + autoplay the player.
+        const first = await this.synthTtsChunk(key, threadId, 0);
+        if (!first) {
+            this.setTtsState(key, {isGenerating: false, error: true});
+            return;
+        }
+        this.setTtsState(key, {isGenerating: false, audioUrl: first, error: false});
+        void this.prefetchTtsChunk(key, threadId, 1);
+    }
+
+    /** Synthesize chunk `i` (already cleaned by the plan, reformulate=false),
+     *  cache + return its blob URL, or null on failure. */
+    private async synthTtsChunk(
+        key: string,
+        threadId: string,
+        i: number,
+    ): Promise<string | null> {
+        const chunks = this.ttsStateFor(key).chunks;
+        if (!chunks || i < 0 || i >= chunks.length) return null;
+        const cached = this.ttsStateFor(key).chunkUrls?.[i];
+        if (cached) return cached;
+        const lang = this.i18n.activeLang().startsWith('de') ? 'de' : 'en';
+        let res;
+        try {
+            res = await firstValueFrom(
+                this.api.generateTTS(threadId, chunks[i], {language: lang, reformulate: false}),
+            );
+        } catch (e) {
+            console.error('TTS chunk synth threw', e);
+            return null;
+        }
+        if (res === null || res === 'unavailable') return null;
+        const url = URL.createObjectURL(res.audio);
+        this.ttsBlobUrls.add(url);
+        const urls = (this.ttsStateFor(key).chunkUrls ?? []).slice();
+        urls[i] = url;
+        this.setTtsState(key, {chunkUrls: urls});
+        return url;
+    }
+
+    /** Best-effort background synthesis of chunk `i` so it's ready when the
+     *  current one ends (hides per-chunk latency). */
+    private async prefetchTtsChunk(
+        key: string,
+        threadId: string,
+        i: number,
+    ): Promise<void> {
+        const chunks = this.ttsStateFor(key).chunks;
+        if (!chunks || i >= chunks.length) return;
+        if (this.ttsStateFor(key).chunkUrls?.[i]) return;
+        await this.synthTtsChunk(key, threadId, i);
+    }
+
+    /** Auto-advance the playlist when the current chunk finishes playing. */
+    async onPlayerEnded(key: string): Promise<void> {
+        const threadId = this.chat.threadId();
+        const state = this.ttsStateFor(key);
+        if (!threadId || !state.chunks) return;
+        const next = (state.index ?? 0) + 1;
+        if (next >= state.chunks.length) return; // whole message played
+        let url = state.chunkUrls?.[next];
+        if (!url) {
+            this.setTtsState(key, {isGenerating: true}); // brief buffering
+            url = (await this.synthTtsChunk(key, threadId, next)) ?? undefined;
+            this.setTtsState(key, {isGenerating: false});
+        }
+        if (!url) {
+            this.setTtsState(key, {error: true});
+            return;
+        }
+        // Changing audioUrl reloads the <audio> → onPlayerReady → autoplay.
+        this.setTtsState(key, {index: next, audioUrl: url});
+        void this.prefetchTtsChunk(key, threadId, next + 1);
     }
 
     /**

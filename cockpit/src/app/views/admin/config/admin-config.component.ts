@@ -2,10 +2,13 @@ import {
   ChangeDetectionStrategy,
   Component,
   computed,
+  effect,
   inject,
   OnInit,
   signal,
+  untracked,
 } from '@angular/core';
+import {forkJoin, Observable} from 'rxjs';
 import {TranslocoService} from '@jsverse/transloco';
 import {SidebarToggleComponent} from '../../../shell/sidebar-toggle/sidebar-toggle.component';
 import {
@@ -15,6 +18,8 @@ import {
 } from '../../../core/services/admin-config.service';
 import {AppSelectComponent} from '../../../ui/select';
 import {AppTextareaComponent} from '../../../ui/textarea';
+import {AppInputComponent} from '../../../ui/input';
+import {AppSwitchComponent} from '../../../ui/switch';
 import {AppButtonComponent} from '../../../ui/button';
 import {AppFormFieldComponent} from '../../../ui/form-field';
 import {AppBadgeComponent} from '../../../ui/badge';
@@ -40,6 +45,8 @@ const FAMILIES = ['gemma', 'gpt-5', 'gpt-oss', 'deepseek', 'minimax', 'minimax-m
     SidebarToggleComponent,
     AppSelectComponent,
     AppTextareaComponent,
+    AppInputComponent,
+    AppSwitchComponent,
     AppButtonComponent,
     AppFormFieldComponent,
     AppBadgeComponent,
@@ -93,6 +100,67 @@ const FAMILIES = ['gemma', 'gpt-5', 'gpt-oss', 'deepseek', 'minimax', 'minimax-m
           </app-form-field>
         </div>
       </section>
+
+      @if (settingsEntries().length) {
+        <section class="admin-section">
+          <div class="entry-head">
+            <h2 class="section-title">Inference settings</h2>
+            <span class="entry-scope">{{ familyLabel() }}</span>
+          </div>
+          <p class="section-desc">
+            LLM sampling + context limits for this model family, layered on the
+            bundled settings matrix. Leave a field empty to use the shipped
+            default. Saved edits apply to <strong>future</strong> jobs at
+            dispatch.
+          </p>
+
+          <div class="settings-form">
+            @for (e of settingsEntries(); track e.name) {
+              <div class="setting-row">
+                <div class="setting-label">
+                  <span class="setting-title">{{ e.title }}</span>
+                  <span class="setting-desc">{{ e.description }}</span>
+                </div>
+                <div class="setting-control">
+                  @if (e.type === 'boolean') {
+                    <app-switch
+                      [checked]="boolValue(e.name)"
+                      (changed)="setBool(e.name, $event)"
+                    />
+                  } @else {
+                    <app-input
+                      type="number"
+                      [value]="strValue(e.name)"
+                      (valueChange)="setStr(e.name, $event)"
+                      [placeholder]="bundledDisplay(e.name)"
+                      [fullWidth]="false"
+                    />
+                  }
+                  <div class="setting-flags">
+                    <span class="setting-default">default: {{ bundledDisplay(e.name) }}</span>
+                    @if (settingOverridden(e.name)) {
+                      <app-badge tone="info" size="xs">override</app-badge>
+                      <button type="button" class="setting-reset" (click)="resetSetting(e.name)">
+                        reset
+                      </button>
+                    }
+                  </div>
+                </div>
+              </div>
+            }
+          </div>
+
+          <div class="actions">
+            <app-button
+              variant="primary"
+              [loading]="savingSettings()"
+              (clicked)="saveSettings()"
+            >
+              Save settings
+            </app-button>
+          </div>
+        </section>
+      }
 
       @if (selectedEntry(); as entry) {
         <section class="admin-section">
@@ -229,6 +297,74 @@ const FAMILIES = ['gemma', 'gpt-5', 'gpt-oss', 'deepseek', 'minimax', 'minimax-m
       gap: 12px;
       margin-top: 16px;
     }
+    .settings-form {
+      display: flex;
+      flex-direction: column;
+    }
+    .setting-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 24px;
+      padding: 14px 0;
+      border-bottom: 1px solid var(--border-color);
+    }
+    .setting-row:last-child {
+      border-bottom: none;
+    }
+    .setting-label {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      min-width: 0;
+    }
+    .setting-title {
+      font-size: 14px;
+      font-weight: 500;
+      color: var(--text-primary);
+    }
+    .setting-desc {
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+    .setting-control {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-end;
+      gap: 6px;
+      flex-shrink: 0;
+    }
+    .setting-control app-input {
+      width: 150px;
+    }
+    .setting-flags {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .setting-default {
+      font-size: 11px;
+      color: var(--text-muted);
+    }
+    .setting-reset {
+      font-size: 11px;
+      color: var(--accent-color);
+      background: none;
+      border: none;
+      cursor: pointer;
+      padding: 0;
+      text-decoration: underline;
+    }
+    @media (max-width: 560px) {
+      .setting-row {
+        flex-direction: column;
+        align-items: stretch;
+        gap: 10px;
+      }
+      .setting-control {
+        align-items: stretch;
+      }
+    }
   `],
 })
 export class AdminConfigComponent implements OnInit {
@@ -254,13 +390,15 @@ export class AdminConfigComponent implements OnInit {
   /**
    * Catalog entries bucketed into <optgroup>s for the picker. Groups (and the
    * entries within them) keep the catalog's order, so the picker reads
-   * shared → worker → persistent → settings → guardrails. Entries with no
-   * `group` fall into a trailing "Other" bucket.
+   * shared → worker → persistent → guardrails. Entries with no `group` fall
+   * into a trailing "Other" bucket. `settings` are excluded — they have their
+   * own typed form rather than a per-key text editor.
    */
   readonly groupedCatalog = computed(() => {
     const groups: {label: string; entries: ConfigCatalogEntry[]}[] = [];
     const byLabel = new Map<string, ConfigCatalogEntry[]>();
     for (const e of this.admin.catalog()) {
+      if (e.kind === 'settings') continue;
       const label = e.group ?? 'Other';
       let bucket = byLabel.get(label);
       if (!bucket) {
@@ -272,6 +410,24 @@ export class AdminConfigComponent implements OnInit {
     }
     return groups;
   });
+
+  /** Settings leaves (temperature, top_p, …) rendered as the typed form. */
+  readonly settingsEntries = computed(() =>
+    this.admin.catalog().filter((e) => e.kind === 'settings'),
+  );
+
+  /** Human label for the family the settings form is scoped to. */
+  readonly familyLabel = computed(() =>
+    this.familyValue() === '_' ? 'Global (all families)' : this.familyValue(),
+  );
+
+  /** Bundled (shipped) value per settings leaf, for the selected family. */
+  readonly bundledSettings = signal<Record<string, unknown>>({});
+
+  /** Editable form state per settings leaf: string for numbers, bool for switches. */
+  readonly settingsForm = signal<Record<string, string | boolean>>({});
+
+  readonly savingSettings = signal(false);
 
   /** Structured kinds (settings, guardrails) edit a JSON value, not text. */
   readonly isStructured = computed(() => {
@@ -292,6 +448,18 @@ export class AdminConfigComponent implements OnInit {
   });
 
   readonly hasOverride = computed(() => this.existingOverride() !== null);
+
+  constructor() {
+    // Re-seed the settings form whenever the catalog arrives or the family
+    // changes. Reads of bundled/override values happen in the async callback
+    // (untracked), so this effect only depends on (family, catalog).
+    effect(() => {
+      const fam = this.selectedFamily();
+      const entries = this.settingsEntries();
+      if (entries.length === 0) return;
+      untracked(() => this.seedSettingsForm(fam, entries));
+    });
+  }
 
   ngOnInit(): void {
     this.admin.loadCatalog();
@@ -414,6 +582,162 @@ export class AdminConfigComponent implements OnInit {
         }
       },
       error: () => this.bundledContent.set(''),
+    });
+  }
+
+  // --- Settings form -----------------------------------------------------
+
+  strValue(name: string): string {
+    const v = this.settingsForm()[name];
+    return v == null ? '' : String(v);
+  }
+
+  boolValue(name: string): boolean {
+    return Boolean(this.settingsForm()[name]);
+  }
+
+  setStr(name: string, value: string): void {
+    this.settingsForm.update((f) => ({...f, [name]: value}));
+  }
+
+  setBool(name: string, value: boolean): void {
+    this.settingsForm.update((f) => ({...f, [name]: value}));
+  }
+
+  /** Display string for a leaf's bundled default ("—" when the matrix is silent). */
+  bundledDisplay(name: string): string {
+    const v = this.bundledSettings()[name];
+    return v == null ? '—' : String(v);
+  }
+
+  /** True when a DB override row exists for (selected family, settings, name). */
+  settingOverridden(name: string): boolean {
+    const fam = this.selectedFamily();
+    return this.admin
+      .overrides()
+      .some((o) => o.family === fam && o.kind === 'settings' && o.name === name);
+  }
+
+  /** Drop a single field back to its bundled default (committed on Save). */
+  resetSetting(name: string): void {
+    const entry = this.settingsEntries().find((e) => e.name === name);
+    const bundled = this.bundledSettings()[name];
+    const value =
+      entry?.type === 'boolean'
+        ? Boolean(bundled)
+        : bundled == null
+          ? ''
+          : String(bundled);
+    this.settingsForm.update((f) => ({...f, [name]: value}));
+  }
+
+  /** Fetch bundled defaults for the family and seed the form (override > bundled). */
+  seedSettingsForm(family: string | null, entries: ConfigCatalogEntry[]): void {
+    this.admin.getBundledSettings(family, entries.map((e) => e.name)).subscribe({
+      next: (bundled) => {
+        this.bundledSettings.set(bundled);
+        const overrides = untracked(() => this.admin.overrides());
+        const form: Record<string, string | boolean> = {};
+        for (const e of entries) {
+          const ov = overrides.find(
+            (o) => o.family === family && o.kind === 'settings' && o.name === e.name,
+          );
+          const eff = ov && ov.value_json != null ? ov.value_json : bundled[e.name];
+          form[e.name] =
+            e.type === 'boolean' ? Boolean(eff) : eff == null ? '' : String(eff);
+        }
+        this.settingsForm.set(form);
+      },
+      error: () => undefined,
+    });
+  }
+
+  /**
+   * Save the settings form for the current family. Diffs each leaf against its
+   * bundled default: changed → upsert an override, set-back-to-default →
+   * delete the override (keeps the DB delta thin). Validates numbers
+   * client-side before writing so out-of-bounds values fail fast.
+   */
+  saveSettings(): void {
+    const entries = this.settingsEntries();
+    const fam = this.selectedFamily();
+    const form = this.settingsForm();
+    const bundled = this.bundledSettings();
+    const overrides = this.admin.overrides();
+    const ops: Observable<unknown>[] = [];
+
+    for (const e of entries) {
+      const existing =
+        overrides.find(
+          (o) => o.family === fam && o.kind === 'settings' && o.name === e.name,
+        ) ?? null;
+
+      let val: number | boolean | null;
+      if (e.type === 'boolean') {
+        val = Boolean(form[e.name]);
+      } else {
+        const raw = String(form[e.name] ?? '').trim();
+        if (raw === '') {
+          val = null; // empty → fall back to bundled default
+        } else {
+          const n = Number(raw);
+          if (!Number.isFinite(n)) {
+            this.toast.danger(`${e.title} must be a number.`);
+            return;
+          }
+          if (e.type === 'integer' && !Number.isInteger(n)) {
+            this.toast.danger(`${e.title} must be a whole number.`);
+            return;
+          }
+          if (e.min != null && n < e.min) {
+            this.toast.danger(`${e.title} must be at least ${e.min}.`);
+            return;
+          }
+          if (e.max != null && n > e.max) {
+            this.toast.danger(`${e.title} must be at most ${e.max}.`);
+            return;
+          }
+          val = n;
+        }
+      }
+
+      const overrideVal =
+        existing && existing.value_json != null ? existing.value_json : undefined;
+      const sameAsBundled = val === null || val === bundled[e.name];
+      if (sameAsBundled) {
+        // Reset to default: drop the override row if one exists.
+        if (existing) ops.push(this.admin.deleteOverride(existing.id));
+      } else if (val !== overrideVal) {
+        // Changed from the current (override or bundled) value: upsert.
+        ops.push(
+          this.admin.createOverride({
+            family: fam,
+            kind: 'settings',
+            name: e.name,
+            value_json: val,
+          }),
+        );
+      }
+    }
+
+    if (ops.length === 0) {
+      this.toast.info('No setting changes to save.');
+      return;
+    }
+    this.savingSettings.set(true);
+    forkJoin(ops).subscribe({
+      next: () => {
+        this.savingSettings.set(false);
+        this.toast.success('Inference settings saved.');
+        // Refresh override rows so the badges / diff baseline update. The form
+        // already holds the saved values, so we don't re-seed (which could read
+        // overrides before this reload lands).
+        this.admin.loadOverrides();
+      },
+      error: () => {
+        this.savingSettings.set(false);
+        this.toast.danger('Failed to save settings.');
+      },
     });
   }
 }

@@ -1,5 +1,6 @@
 import {describe, expect, it, vi} from 'vitest';
-import {Injector, runInInjectionContext, signal} from '@angular/core';
+import {signal} from '@angular/core';
+import {TestBed} from '@angular/core/testing';
 import {of} from 'rxjs';
 import {AdminConfigComponent} from './admin-config.component';
 import {AdminConfigService} from '../../../core/services/admin-config.service';
@@ -27,16 +28,22 @@ function make(opts?: {overrides?: any[]; catalog?: any[]}) {
     ),
     createOverride: vi.fn().mockReturnValue(of({})),
     deleteOverride: vi.fn().mockReturnValue(of({deleted: true})),
+    getBundledSettings: vi.fn().mockReturnValue(of({})),
   };
   const toast = {success: vi.fn(), danger: vi.fn(), info: vi.fn()};
-  const injector = Injector.create({
+  // TestBed (not a bare Injector) so the constructor effect() resolves
+  // ChangeDetectionScheduler. The effect stays dormant without TestBed.tick(),
+  // which is fine — these tests drive the seed/save methods directly.
+  TestBed.resetTestingModule();
+  TestBed.configureTestingModule({
     providers: [
+      AdminConfigComponent,
       {provide: AdminConfigService, useValue: admin},
       {provide: AppToastService, useValue: toast},
       {provide: TranslocoService, useValue: {translate: (k: string) => k}},
     ],
   });
-  const component = runInInjectionContext(injector, () => new AdminConfigComponent());
+  const component = TestBed.inject(AdminConfigComponent);
   return {component, admin, toast};
 }
 
@@ -107,69 +114,165 @@ describe('AdminConfigComponent', () => {
     expect(admin.deleteOverride).not.toHaveBeenCalled();
   });
 
-  it('buckets the catalog into ordered <optgroup> groups, trailing "Other" for ungrouped keys', () => {
+  it('groups the dropdown by label and excludes settings (they have their own form)', () => {
     const {component} = make({
       catalog: [
         {kind: 'prompts', name: 'systemprompt', title: 'System', description: 'd', group: 'Prompts · all agents'},
         {kind: 'prompts', name: 'strategic', title: 'Strategic', description: 'd', group: 'Prompts · worker (jobs)'},
         {kind: 'prompts', name: 'persona', title: 'Persona', description: 'd', group: 'Prompts · all agents'},
         {kind: 'prompts', name: 'systemprompt_interactive', title: 'Interactive', description: 'd', group: 'Prompts · persistent (sessions)'},
-        {kind: 'settings', name: 'orphan', title: 'Orphan', description: 'd'}, // no group
+        {kind: 'settings', name: 'temperature', title: 'Temp', description: 'd', type: 'number', group: 'Inference settings'},
+        {kind: 'guardrails', name: 'orphan', title: 'Orphan', description: 'd'}, // no group
       ],
     });
     const groups = component.groupedCatalog();
-    // Group order = first-seen order in the catalog; "Other" trails for the ungrouped key.
+    // Group order = first-seen order in the catalog; "Other" trails the ungrouped key.
     expect(groups.map((g) => g.label)).toEqual([
       'Prompts · all agents',
       'Prompts · worker (jobs)',
       'Prompts · persistent (sessions)',
       'Other',
     ]);
+    // Settings never appear in the dropdown groups.
+    expect(groups.some((g) => g.entries.some((e) => e.kind === 'settings'))).toBe(false);
     // Entries land in their group, preserving catalog order within the group.
     expect(groups[0].entries.map((e) => e.name)).toEqual(['systemprompt', 'persona']);
     expect(groups[2].entries.map((e) => e.name)).toEqual(['systemprompt_interactive']);
     expect(groups[3].entries.map((e) => e.name)).toEqual(['orphan']);
   });
 
-  // --- structured kinds (settings / guardrails) ---
+  // --- structured kind in the dropdown: guardrails (settings moved to a form) ---
 
-  const SETTINGS_CATALOG = [
-    {kind: 'settings', name: 'temperature', title: 'Temp', description: 'd', type: 'number'},
+  const GUARDRAILS_CATALOG = [
+    {kind: 'guardrails', name: 'guardrails', title: 'Guardrails', description: 'd', type: 'json'},
   ];
 
-  function makeSettings() {
-    const ctx = make({catalog: SETTINGS_CATALOG});
+  function makeGuardrails() {
+    const ctx = make({catalog: GUARDRAILS_CATALOG});
     ctx.admin.getBundled.mockReturnValue(
-      of({family: null, kind: 'settings', name: 'temperature', content: 0.3, catalog: null}),
+      of({family: null, kind: 'guardrails', name: 'guardrails', content: {x: 1}, catalog: null}),
     );
     return ctx;
   }
 
-  it('seeds a settings editor from the bundled value as JSON', () => {
-    const {component} = makeSettings();
-    component.onKeyChange('temperature');
+  it('seeds the guardrails editor from the bundled value as JSON', () => {
+    const {component} = makeGuardrails();
+    component.onKeyChange('guardrails');
     expect(component.isStructured()).toBe(true);
-    expect(component.bundledContent()).toBe('0.3');
-    expect(component.overrideContent()).toBe('0.3'); // no override -> seeded from bundled
+    expect(component.bundledContent()).toBe('{\n  "x": 1\n}');
+    expect(component.overrideContent()).toBe('{\n  "x": 1\n}'); // no override -> seeded from bundled
   });
 
-  it('save() POSTs parsed value_json for a settings key', () => {
-    const {component, admin, toast} = makeSettings();
-    component.onKeyChange('temperature');
-    component.overrideContent.set('0.7');
+  it('save() POSTs parsed value_json for a structured key', () => {
+    const {component, admin, toast} = makeGuardrails();
+    component.onKeyChange('guardrails');
+    component.overrideContent.set('{"a": 2}');
     component.save();
     expect(admin.createOverride).toHaveBeenCalledWith({
-      family: null, kind: 'settings', name: 'temperature', value_json: 0.7,
+      family: null, kind: 'guardrails', name: 'guardrails', value_json: {a: 2},
     });
     expect(toast.success).toHaveBeenCalled();
   });
 
   it('save() rejects invalid JSON for a structured key', () => {
-    const {component, admin, toast} = makeSettings();
-    component.onKeyChange('temperature');
+    const {component, admin, toast} = makeGuardrails();
+    component.onKeyChange('guardrails');
     component.overrideContent.set('not json');
     component.save();
     expect(admin.createOverride).not.toHaveBeenCalled();
     expect(toast.danger).toHaveBeenCalled();
+  });
+
+  // --- settings form ---
+
+  const SETTINGS_FORM_CATALOG = [
+    {kind: 'settings', name: 'temperature', title: 'Temperature', description: 'd', type: 'number', min: 0, max: 2},
+    {kind: 'settings', name: 'parallel_tool_calls', title: 'Parallel', description: 'd', type: 'boolean'},
+  ];
+
+  function makeForm(overrides: any[] = []) {
+    const ctx = make({catalog: SETTINGS_FORM_CATALOG, overrides});
+    ctx.admin.getBundledSettings = vi
+      .fn()
+      .mockReturnValue(of({temperature: 0.3, parallel_tool_calls: false}));
+    return ctx;
+  }
+
+  function settingsOverride(name: string, value_json: unknown, id = 's1') {
+    return {
+      id, family: null, kind: 'settings', name, content: null, content_format: null,
+      value_json, notes: null, created_by: null, updated_by: null, created_at: null, updated_at: null,
+    };
+  }
+
+  it('settingsEntries selects only settings; they are absent from the dropdown', () => {
+    const {component} = makeForm();
+    expect(component.settingsEntries().map((e) => e.name)).toEqual([
+      'temperature', 'parallel_tool_calls',
+    ]);
+    expect(component.groupedCatalog()).toEqual([]);
+  });
+
+  it('seeds the form from bundled defaults when no override exists', () => {
+    const {component} = makeForm();
+    component.seedSettingsForm(null, component.settingsEntries());
+    expect(component.strValue('temperature')).toBe('0.3');
+    expect(component.boolValue('parallel_tool_calls')).toBe(false);
+    expect(component.settingOverridden('temperature')).toBe(false);
+  });
+
+  it('seeds an overridden field from the override value and flags it', () => {
+    const {component} = makeForm([settingsOverride('temperature', 1)]);
+    component.seedSettingsForm(null, component.settingsEntries());
+    expect(component.strValue('temperature')).toBe('1');
+    expect(component.settingOverridden('temperature')).toBe(true);
+  });
+
+  it('saveSettings upserts changed fields and deletes those reset to bundled', () => {
+    const {component, admin, toast} = makeForm([settingsOverride('temperature', 1)]);
+    component.seedSettingsForm(null, component.settingsEntries());
+    component.setStr('temperature', '0.3'); // back to bundled -> delete
+    component.setBool('parallel_tool_calls', true); // differs from bundled false -> upsert
+    component.saveSettings();
+    expect(admin.deleteOverride).toHaveBeenCalledWith('s1');
+    expect(admin.createOverride).toHaveBeenCalledWith({
+      family: null, kind: 'settings', name: 'parallel_tool_calls', value_json: true,
+    });
+    expect(toast.success).toHaveBeenCalled();
+  });
+
+  it('saveSettings is a no-op (no writes) when nothing differs from bundled', () => {
+    const {component, admin, toast} = makeForm();
+    component.seedSettingsForm(null, component.settingsEntries());
+    component.saveSettings();
+    expect(admin.createOverride).not.toHaveBeenCalled();
+    expect(admin.deleteOverride).not.toHaveBeenCalled();
+    expect(toast.info).toHaveBeenCalled();
+  });
+
+  it('saveSettings does not re-write an override whose value is unchanged', () => {
+    const {component, admin, toast} = makeForm([settingsOverride('temperature', 1)]);
+    component.seedSettingsForm(null, component.settingsEntries());
+    component.saveSettings(); // temperature still 1 (its override), parallel still bundled
+    expect(admin.createOverride).not.toHaveBeenCalled();
+    expect(admin.deleteOverride).not.toHaveBeenCalled();
+    expect(toast.info).toHaveBeenCalled();
+  });
+
+  it('saveSettings rejects out-of-range numbers before writing', () => {
+    const {component, admin, toast} = makeForm();
+    component.seedSettingsForm(null, component.settingsEntries());
+    component.setStr('temperature', '5'); // max is 2
+    component.saveSettings();
+    expect(admin.createOverride).not.toHaveBeenCalled();
+    expect(toast.danger).toHaveBeenCalled();
+  });
+
+  it('resetSetting drops a field back to its bundled default', () => {
+    const {component} = makeForm([settingsOverride('temperature', 1)]);
+    component.seedSettingsForm(null, component.settingsEntries());
+    expect(component.strValue('temperature')).toBe('1');
+    component.resetSetting('temperature');
+    expect(component.strValue('temperature')).toBe('0.3');
   });
 });

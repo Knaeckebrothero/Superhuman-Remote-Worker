@@ -35,6 +35,7 @@ def _clear_tts_caches():
 
     tts._audio_cache.clear()
     tts._formulation_cache.clear()
+    tts._plan_cache.clear()
     yield
 
 
@@ -67,6 +68,28 @@ def _mock_openai(*, speech=b"MP3", speech_error=None, chat_text="reworded"):
     client.close = AsyncMock()
     cls = MagicMock(return_value=client)
     return cls, client
+
+
+def _mock_openai_chat(content: str, *, finish_reason: str = "stop"):
+    """(class, client) whose chat.completions.create returns ``content`` with
+    the given finish_reason — for the chunk-planner tests."""
+    msg = MagicMock()
+    msg.content = content
+    choice = MagicMock(message=msg, finish_reason=finish_reason)
+    client = MagicMock()
+    client.chat.completions.create = AsyncMock(return_value=MagicMock(choices=[choice]))
+    client.close = AsyncMock()
+    cls = MagicMock(return_value=client)
+    return cls, client
+
+
+def _caps(tts=("kokoro-strix", None, "sk-key"), aux=("gemma-aux", None, "sk-key")):
+    """AsyncMock for _resolve_capability_credentials keyed on capability."""
+
+    def _resolve(*, capability, **_):
+        return {"tts": tts, "auxiliary": aux}.get(capability)
+
+    return AsyncMock(side_effect=_resolve)
 
 
 # ---------------------------------------------------------------------------
@@ -355,5 +378,192 @@ class TestTtsEndpoint:
             with pytest.raises(HTTPException) as exc:
                 await main.synthesize_thread_message_tts(
                     thread_id="t1", request=MagicMock(), body={"content": "   "}
+                )
+        assert exc.value.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# Chunk planning: splitter / gate / parser (pure) + plan_tts_chunks
+# ---------------------------------------------------------------------------
+
+
+class TestChunkSplitting:
+    def test_short_text_is_one_chunk(self):
+        from services.tts import _split_text_into_chunks
+
+        assert _split_text_into_chunks("Just a short line.") == ["Just a short line."]
+
+    def test_long_text_splits_under_limit(self):
+        from services.tts import TTS_CHUNK_LIMIT, _split_text_into_chunks
+
+        text = "\n\n".join(f"Paragraph number {i}. " * 30 for i in range(40))
+        chunks = _split_text_into_chunks(text)
+        assert len(chunks) > 1
+        assert all(len(c) <= TTS_CHUNK_LIMIT for c in chunks)
+
+    def test_enforce_limit_resplits_oversized(self):
+        from services.tts import TTS_CHUNK_LIMIT, _enforce_chunk_limit
+
+        out = _enforce_chunk_limit(["word " * 2000])  # ~10k, no breaks
+        assert len(out) > 1
+        assert all(len(c) <= TTS_CHUNK_LIMIT for c in out)
+
+    def test_parse_plain_array(self):
+        from services.tts import _parse_chunk_array
+
+        assert _parse_chunk_array('["a", "b"]') == ["a", "b"]
+
+    def test_parse_fenced_array(self):
+        from services.tts import _parse_chunk_array
+
+        assert _parse_chunk_array('```json\n["a", "b"]\n```') == ["a", "b"]
+
+    def test_parse_array_with_prose(self):
+        from services.tts import _parse_chunk_array
+
+        assert _parse_chunk_array('Sure! ["a", "b"] hope that helps') == ["a", "b"]
+
+    def test_parse_non_array_is_none(self):
+        from services.tts import _parse_chunk_array
+
+        assert _parse_chunk_array("I cannot do that") is None
+        assert _parse_chunk_array("") is None
+
+
+class TestPlanTtsChunks:
+    @pytest.mark.asyncio
+    async def test_none_when_no_tts_model(self):
+        from services.tts import plan_tts_chunks
+
+        with patch("services.tts._resolve_capability_credentials", _caps(tts=None)):
+            result = await plan_tts_chunks(
+                content="anything", user_id="u1", postgres_db=_mock_db()
+            )
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_uses_llm_chunks(self):
+        from services.tts import plan_tts_chunks
+
+        cls, _ = _mock_openai_chat('["First chunk.", "Second chunk."]')
+        with (
+            patch("services.tts.AsyncOpenAI", cls),
+            patch("services.tts._resolve_capability_credentials", _caps()),
+        ):
+            result = await plan_tts_chunks(
+                content="some markdown **message**",
+                user_id="u1",
+                postgres_db=_mock_db(),
+            )
+        assert result == ["First chunk.", "Second chunk."]
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_deterministic_without_aux(self):
+        from services.tts import TTS_CHUNK_LIMIT, plan_tts_chunks
+
+        long_text = "\n\n".join(f"Paragraph {i}. " * 40 for i in range(40))
+        with patch("services.tts._resolve_capability_credentials", _caps(aux=None)):
+            result = await plan_tts_chunks(
+                content=long_text, user_id="u1", postgres_db=_mock_db()
+            )
+        assert result is not None and len(result) > 1
+        assert all(len(c) <= TTS_CHUNK_LIMIT for c in result)
+
+    @pytest.mark.asyncio
+    async def test_falls_back_when_llm_unparseable(self):
+        from services.tts import plan_tts_chunks
+
+        cls, _ = _mock_openai_chat("Sorry, I can't help with that")
+        with (
+            patch("services.tts.AsyncOpenAI", cls),
+            patch("services.tts._resolve_capability_credentials", _caps()),
+        ):
+            result = await plan_tts_chunks(
+                content="short message", user_id="u1", postgres_db=_mock_db()
+            )
+        assert result == ["short message"]
+
+    @pytest.mark.asyncio
+    async def test_truncated_llm_output_falls_back(self):
+        from services.tts import plan_tts_chunks
+
+        cls, _ = _mock_openai_chat('["partial', finish_reason="length")
+        with (
+            patch("services.tts.AsyncOpenAI", cls),
+            patch("services.tts._resolve_capability_credentials", _caps()),
+        ):
+            result = await plan_tts_chunks(
+                content="short message", user_id="u1", postgres_db=_mock_db()
+            )
+        assert result == ["short message"]
+
+
+# ---------------------------------------------------------------------------
+# Endpoint: POST /api/persistent/threads/{thread_id}/tts/plan
+# ---------------------------------------------------------------------------
+
+
+class TestTtsPlanEndpoint:
+    def test_route_is_registered(self):
+        from main import app
+
+        routes = {
+            (m, getattr(r, "path", ""))
+            for r in app.routes
+            for m in (getattr(r, "methods", None) or set())
+        }
+        assert ("POST", "/api/persistent/threads/{thread_id}/tts/plan") in routes
+
+    @pytest.mark.asyncio
+    async def test_returns_chunks(self):
+        import main
+
+        with (
+            patch.object(
+                main,
+                "require_thread_owner",
+                AsyncMock(return_value=({"id": "u1"}, {"id": "t1"})),
+            ),
+            patch(
+                "services.tts.plan_tts_chunks",
+                AsyncMock(return_value=["chunk one", "chunk two"]),
+            ),
+        ):
+            resp = await main.plan_thread_message_tts(
+                thread_id="t1", request=MagicMock(), body={"content": "long message"}
+            )
+        assert resp.status_code == 200
+        assert json.loads(resp.body) == {"chunks": ["chunk one", "chunk two"]}
+
+    @pytest.mark.asyncio
+    async def test_204_when_not_configured(self):
+        import main
+
+        with (
+            patch.object(
+                main,
+                "require_thread_owner",
+                AsyncMock(return_value=({"id": "u1"}, {"id": "t1"})),
+            ),
+            patch("services.tts.plan_tts_chunks", AsyncMock(return_value=None)),
+        ):
+            resp = await main.plan_thread_message_tts(
+                thread_id="t1", request=MagicMock(), body={"content": "hello"}
+            )
+        assert resp.status_code == 204
+
+    @pytest.mark.asyncio
+    async def test_400_on_empty_content(self):
+        import main
+        from fastapi import HTTPException
+
+        with patch.object(
+            main,
+            "require_thread_owner",
+            AsyncMock(return_value=({"id": "u1"}, {"id": "t1"})),
+        ):
+            with pytest.raises(HTTPException) as exc:
+                await main.plan_thread_message_tts(
+                    thread_id="t1", request=MagicMock(), body={"content": ""}
                 )
         assert exc.value.status_code == 400
