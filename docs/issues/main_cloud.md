@@ -6,6 +6,7 @@ tags:
   - opencloud
   - webdav
   - architecture
+  - multi-tenancy
   - tech-debt
 aliases:
   - Main Cloud Issues
@@ -44,13 +45,14 @@ related:
 | 6 | No data migration on backend switch/removal | Medium | Config / hot-swap |
 | 7 | Duplicate module filenames `opencloud.py` / `nextcloud.py` in two packages | Medium | Naming |
 | 8 | "datasource" overloaded across three different concepts | Medium | Naming |
-| 9 | Helm ↔ app config naming mismatch (`cloud.externalBackend` vs `MAIN_CLOUD_*`, `CLOUD_SERVICE_*` vs `NEXTCLOUD_AGENT_*`) | Medium | Naming / config |
+| 9 | Helm ↔ app config naming mismatch — `CLOUD_SERVICE_*` is NOT the Nextcloud agent cred (confirmed) | Med → **High** (#7) | Naming / config |
 | 10 | Nextcloud byte-level project-folder methods are `NOT_SUPPORTED` stubs → Mode-A job export is OpenCloud-only | **High** | Implementation gap |
 | 11 | MS365 / Google are scaffold-only; the agent-side non-WebDAV refactor is unwritten | Medium | Implementation gap |
 | 12 | `NextcloudBackend` ignores its own `NextcloudSettings` class | Low | Implementation gap |
 | 13 | Silent cloud-sync failures → unsynced session with no surfaced error | **High** | Reliability |
 | 14 | Stale, self-contradicting doc claim (service account "can read any home Space") | Low | Docs |
 | 15 | Dev/prod backend divergence — dev no longer validates the prod path | Medium | Process |
+| 16 | Backend resolution bypasses the router seam (eager global `.active`) → blocks per-tenant resolution | **High** | Architecture |
 
 Severity is a working judgement, not a commitment.
 
@@ -176,19 +178,21 @@ Two problems compound:
 
 ---
 
-## Issue 9: Helm ↔ app config naming mismatch
+## Issue 9: Helm ↔ app config naming mismatch — `CLOUD_SERVICE_*` is NOT the Nextcloud agent cred (CONFIRMED)
 
-**Severity:** Medium.
+**Severity:** Medium generally → **High for task #7** (it silently breaks an external Nextcloud connect).
 
-**What:** Helm's surface (`cloud.externalBackend`, `cloud.externalUrl`, `cloud.externalServiceUrl`, `CLOUD_SERVICE_USER/PASSWORD`) does **not** match what the app actually reads (`MAIN_CLOUD_BACKEND`, `MAIN_CLOUD_URL`, `NEXTCLOUD_*` / `OPENCLOUD_*`). A translation layer in `helm/templates/configmap.yaml:176-196` maps one to the other.
+**What:** Helm's external-cloud surface advertises `CLOUD_SERVICE_USER` / `CLOUD_SERVICE_PASSWORD` as the cloud service-account creds (`values.yaml:736-738`, `ci/customer-external-values.yaml:61`), but the Nextcloud backend loader **never reads them**. They are two unrelated things and nothing maps one to the other.
 
-**Evidence:**
-- `cloud.externalBackend` → `MAIN_CLOUD_BACKEND`, and for nextcloud sets `NEXTCLOUD_URL`/`NEXTCLOUD_PUBLIC_URL` (`configmap.yaml:185-196`).
-- But the **loader** reads agent creds from `NEXTCLOUD_AGENT_USER`/`NEXTCLOUD_AGENT_PASSWORD` (`config.py:229-240`), while the Helm/ESO secret plumbing talks about `CLOUD_SERVICE_USER`/`CLOUD_SERVICE_PASSWORD` (`helm/templates/keycloak/bootstrap-externalsecret.yaml:70-77`, deployment `:476-486`). **Verify these line up** for an external Nextcloud — if `CLOUD_SERVICE_*` is not also surfaced as `NEXTCLOUD_AGENT_*`, the agent-service creds won't be read. (Open question flagged for task #7.)
+**Confirmed wiring (2026-06-05 end-to-end trace):**
+- **What the Nextcloud loader actually reads** (`orchestrator/services/cloud/config.py`, nextcloud branch ~`:207-245`): `NEXTCLOUD_ADMIN_USER` / `NEXTCLOUD_ADMIN_PASSWORD` / `NEXTCLOUD_AGENT_USER` / `NEXTCLOUD_AGENT_PASSWORD` (or `MAIN_CLOUD_*` aliases). Passwords are injected from the **main app Secret** `srw.secretName` (`deployment.yaml:382-398`).
+- **What `CLOUD_SERVICE_*` actually is:** a **Keycloak service-account** credential consumed by the Keycloak *bootstrap Job* to create/set-password a cloud user *in Keycloak* (`keycloak/bootstrap-job.yaml:145-155`, `bootstrap-configmap.yaml:225-262`), gated on `serviceAccounts.cloud.enabled`. It is also injected into the orchestrator pod (`deployment.yaml:476-486`) but `config.py` contains **zero** reads of `CLOUD_SERVICE_*`. It is an OIDC/OpenCloud-world artifact, irrelevant to Nextcloud basic-auth.
+- **Secondary gap — usernames:** the external-cloud configmap branch (`configmap.yaml:185-200`) sets only `NEXTCLOUD_URL` + `NEXTCLOUD_PUBLIC_URL`; it does **not** set `NEXTCLOUD_ADMIN_USER` / `NEXTCLOUD_AGENT_USER` (those exist only under `nextcloud.enabled`, `:167-168`). So for an external Nextcloud the usernames fall to the loader defaults `admin` / `agent-service`, and there is **no values knob** to override them (they're configMap keys, so a Vault entry won't reach them) — a chart gap if the real users are named differently.
+- **Plumbing note (good news):** the main app `ExternalSecret` uses `dataFrom: extract` over the whole Vault bundle (`external-secret.yaml:19-21`), so new secret keys flow through **without a chart change** — they just need to exist at `externalSecrets.vaultPath`.
 
-**Impact:** An operator setting `cloud.externalBackend: nextcloud` has to know the hidden mapping to predict which env vars (and which secret keys) actually take effect. Mis-wiring is silent (see Issue 5).
+**Impact:** An operator who follows the `values.yaml` comment and sets only `CLOUD_SERVICE_*` gets a Nextcloud backend on **dev-default creds** (`admin`/`admin`, `agent-service`/`agent-service-dev`, `config.py:228`/`:240`) → 401 against the real Nextcloud → swallowed silently (Issue 13). Empty workspace, no error — the exact original failure mode.
 
-**Direction:** Either rename the Helm surface to mirror the app env (`mainCloud.backend`, `mainCloud.url`, …) or document the mapping table explicitly in `values.yaml`. Resolve the `CLOUD_SERVICE_*` vs `NEXTCLOUD_AGENT_*` question.
+**Direction:** Fix the misleading `values.yaml:736-738` comment; either teach the loader to accept `CLOUD_SERVICE_*` as the Nextcloud agent cred, or stop injecting `CLOUD_SERVICE_*` for the Nextcloud backend. Expose `cloud.adminUser` / `cloud.agentUser` values for external backends. Wiring checklist in **Direction** below.
 
 ---
 
@@ -267,9 +271,55 @@ Two problems compound:
 
 ---
 
-## Triage notes (relative to current work)
+## Issue 16: Backend resolution bypasses the router seam (eager global `.active`)
 
-- **Blocks connecting Nextcloud on prod-private (task #7):** Issues **5** and **9** (wire secrets via Helm/ESO first, and don't trust a silent success), Issue **9**'s `CLOUD_SERVICE_*` vs `NEXTCLOUD_AGENT_*` open question, and Issue **10** (Mode-A job export won't work on Nextcloud yet).
-- **Independent / safe to do anytime:** Issues **7**, **8**, **12**, **14** (naming + docs hygiene).
-- **Strategic, not urgent:** Issues **1**, **2**, **11** (the data-plane seam / non-WebDAV story) — gated on `agent_cloud_tools.md` and the lean/feature-freeze posture.
+**Severity:** High — it's the actual foundation the rest of the cloud code sits on, *and* a present-day correctness hazard.
+
+**What:** Backend resolution is inconsistent. The orchestrator builds one global router at boot — `main_cloud_router = MainCloudRouter(build_backend())` (`orchestrator/main.py:238`) — and most call sites correctly resolve *per resource* through it: `for_project(row)` (`main.py:10957`), `for_thread(row)` (`:12339`), `for_backend(id)` (`:11042`, `:12095`, `:12112`, `:12217`, `:12240`). But several reach straight for the global `main_cloud_router.active`: Mode-B job export (`:9029`), thread/session setup (`:11904`), session re-provision (`:12415`). The router already keeps a *keyed* instance cache (`_legacy: dict[backend_id → backend]`), so the seam exists — it's just used inconsistently.
+
+**Impact:**
+- **Present-day correctness hazard.** Under the non-destructive switching the hot-swap enables, a project/thread pinned to backend A (via its `main_cloud_backend` column) can be served by `.active` = B after an admin swaps the active backend → operations land on the wrong cloud. The `.active` paths silently assume "the global backend is the right one for this resource," which is exactly what switching breaks.
+- **Foundation risk for multi-tenancy.** Per-org cloud (the planned SaaS direction) requires resolving the backend from request/job context (owner → org → backend). Every `.active` shortcut bakes in "one global cloud" at a call site that would then need refactoring when org-keying arrives. This — *not* config storage (env vs DB) and *not* the hot-swap admin UI — is the load-bearing seam: the ~20 consumers depend on *how they get a backend* (the router), never on *where config is stored*.
+
+**Direction:** Route **all** resolution through one context-keyed method (`for_project` / `for_thread`, plus a `for_owner(ctx)` / `for_org(org_id)` that returns the single global today); delete every direct `.active` read from call sites. Keep backends **stateful** (Keycloak service-token cache + httpx pools — re-minting per call would hammer Keycloak) behind the keyed instance cache, and generalize the cache key from `backend_id` toward owner/org. Add the owner/org parameter to the seam **now** (defaulted/ignored), so multi-tenancy later is "fill in the key," not a call-site refactor. The agent side is already per-session (handed cloud coordinates per job), so this change is contained to the orchestrator. See **Direction** below.
+
+---
+
+## Direction
+
+*Agreed approach as of 2026-06-05 — a decision record, not an implementation spec. Reconciles this log with the planned (but not-yet-sold) multi-tenant SaaS direction and the current feature-freeze / runway posture. A fuller plan gets written when any of this is scheduled.*
+
+**The principle.** The foundation the cloud code sits on is **backend resolution**, not config storage and not the hot-swap UI. Multi-tenancy = resolve the backend *per-org at every operation*. The current hot-swap (one global backend, mutated at runtime) is single-tenant and is **not** a step toward that — per-org needs per-org *rows* and per-org *resolution*, which the single global model does not pre-build. So: protect and generalize the resolution seam (Issue 16); treat config storage (env vs DB) as a leaf that can change later *behind* that seam; demote the hot-swap UI to a non-foundational convenience.
+
+**Decided approach, by area:**
+
+1. **Resolution seam (Issue 16) — the one foundational change.** Funnel all resolution through a context-keyed router method, kill `.active`, keep backends stateful behind a keyed instance cache, and add the owner/org parameter to the seam now. Cheap, regret-free, makes multi-tenancy "fill in the key" instead of a 20-site refactor — and fixes the present-day swap-correctness hazard along the way.
+
+2. **Config storage (Issues 5, 6).** Env/Helm is the canonical config path and stays so permanently for self-hosted / open-core installs (one deployment = one org). Fix the fail-loud footgun (Issue 5) regardless. Demote the live-swap UI — keep it only as a fail-loud, non-foundational convenience, or drop it. Per-org DB config — DB-authoritative, *seeded from env* like the LLM provider rows — is **deferred** until multi-tenant SaaS is actually sold, and is built keyed by org *then* (a single global DB row today buys nothing toward it).
+
+3. **Data plane / native APIs (Issues 1, 10, 11).** Deferred — Phase 5 of [[main_cloud_abstraction]], gated on the unwritten `agent_cloud_tools.md`. Optional cheaper interim *if* there's appetite: consolidate the agent file tier behind one WebDAV seam (still WebDAV) so nothing bypasses it — addresses Issues 2/7/8 without the native-API build. Implement Nextcloud's stubbed byte methods (Issue 10) only before relying on Mode-A job export on Nextcloud.
+
+4. **Naming + docs hygiene (Issues 7, 8, 9, 12, 14).** Independent and safe anytime; pick up opportunistically.
+
+**Sequencing — now vs later:**
+
+- **Worth touching under the freeze (cheap, regret-free, nothing to rip out later):** fail-loud config (Issue 5); the resolution-seam cleanup / kill `.active` (Issue 16); naming + docs hygiene as convenient.
+- **When multi-tenant SaaS is actually being sold:** per-org config table (seed-from-env), generalize the resolution key to org, per-tenant admin surface.
+- **When a customer forces non-WebDAV (MS365 / Google), or by deliberate choice:** write `agent_cloud_tools.md`, build the data-plane driver seam (Phase 5).
+
+**Why this order:** the cheapest items de-risk an *active* footgun (Issue 5) and protect the *foundation* (Issue 16); everything expensive or strategic is deferred behind real demand, consistent with ship-over-build. Crucially, **nothing here forces a foundation refactor later** — env config survives as the self-hosted default, and the resolution seam is made tenant-ready *in place* rather than rebuilt.
+
+**Relative to current work (tasks):**
+- **Connecting Nextcloud on prod-private (task #7)** is blocked by Issues **5** + **9** (the `CLOUD_SERVICE_*` vs `NEXTCLOUD_AGENT_*` question is now resolved — see checklist below) and limited by Issue **10** (Mode-A job export won't work on Nextcloud yet).
 - **Reverting the legacy Keycloak token-exchange flag (task #8)** is unrelated to these issues and stays safe once Nextcloud is verified (prod no longer uses OpenCloud impersonation).
+
+### External Nextcloud wiring — task #7 checklist (verified 2026-06-05)
+
+Traced Helm → ESO → env → loader. Because the main app `ExternalSecret` uses `dataFrom: extract` over the whole Vault bundle (`external-secret.yaml:19-21`), new keys flow through **without a chart change** — they just need to exist at `externalSecrets.vaultPath` under the names the loader reads.
+
+1. **Helm values:** `cloud.externalBackend: "nextcloud"`; `cloud.externalUrl: "https://<public>"` (→ `NEXTCLOUD_PUBLIC_URL`, required); `cloud.externalServiceUrl: "https://<server-to-server>"` (→ `NEXTCLOUD_URL`; defaults to externalUrl); `nextcloud.enabled: false`; `opencloud.enabled: false`.
+2. **Vault bundle** (at `externalSecrets.vaultPath`) — add keys **`NEXTCLOUD_ADMIN_PASSWORD`** and **`NEXTCLOUD_AGENT_PASSWORD`** (real values). **Not** `CLOUD_SERVICE_*` — the loader ignores those (Issue 9).
+3. **Usernames:** ensure the real Nextcloud has users named exactly **`admin`** and **`agent-service`** (loader defaults; the agent-service user in the `srw-agents` group with share perms per [[main_cloud_abstraction]]). Different names need a chart change today (Issue 9 username gap).
+4. **Verify present, not defaulted:** `GET /api/admin/system-settings/main_cloud` reports each secret env var's set/unset + length (`main.py:17026-17033`) — confirm both passwords show non-zero length (else you're silently on dev defaults).
+5. **Smoke-test the real mechanism:** the `agent-service` account can read a real user's home over WebDAV / the OCS share path resolves. Watch orchestrator logs for the silent `"Failed to start cloud workspace sync"` warning (Issue 13).
+6. **Remember Issue 10:** Mode-A job cloud baseline (seed-from-cloud / accept-back) is `NOT_SUPPORTED` on Nextcloud — gate or implement before relying on it.
