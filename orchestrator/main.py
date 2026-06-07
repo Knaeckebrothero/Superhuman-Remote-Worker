@@ -3392,6 +3392,36 @@ async def lifespan(app: FastAPI):
                 "rebuild failed — active backend stays on env-var config"
             )
 
+    # Issue 5: warn loudly if the *active* backend's required secrets are not
+    # present in the env — it is silently running on built-in DEV credentials
+    # and will fail at the first cloud call. Non-fatal (graceful-degradation
+    # convention + local/dev stacks legitimately set their own secrets), but no
+    # longer silent. The PUT/test endpoints refuse this at swap time; this
+    # catches a Helm-misconfigured deployment that booted straight into it.
+    try:
+        from services.cloud.config import missing_secret_envs
+
+        _active_id = main_cloud_router.active.backend_id
+        # Only trust the overlay's credentials_ref if the overlay actually drove
+        # the active backend; otherwise check the plain env path.
+        _active_overlay = (
+            _persisted_overlay
+            if _persisted_overlay
+            and (_persisted_overlay.get("value") or {}).get("backend_id") == _active_id
+            else None
+        )
+        _missing_secrets = missing_secret_envs(_active_id, _active_overlay)
+        if _missing_secrets:
+            logger.warning(
+                "Main cloud backend %r is active but required secret env var(s) "
+                "are unset: %s — it is running on built-in DEV credentials and "
+                "will fail at the first cloud call. Set them via Helm/Vault.",
+                _active_id,
+                ", ".join(sorted({m["env_var"] for m in _missing_secrets})),
+            )
+    except Exception as _e:
+        logger.debug("Main cloud secret presence check skipped at startup: %s", _e)
+
     # Initialize NATS bridge for VM lifecycle (graceful if unavailable)
     await nats_bridge.connect(db=postgres_db, on_vm_ready=_trigger_dispatch)
 
@@ -17156,7 +17186,7 @@ async def put_main_cloud_settings(
 
     # Validate the proposed config before persisting — raises on
     # missing required fields so we fail fast with a 422-style message.
-    from services.cloud.config import load_main_cloud_config
+    from services.cloud.config import load_main_cloud_config, missing_secret_envs
 
     probe_overlay = {
         "value": clean_value,
@@ -17168,6 +17198,26 @@ async def put_main_cloud_settings(
         raise HTTPException(
             status_code=400, detail=f"invalid main cloud config: {e}"
         ) from e
+
+    # Fail loud if the backend's real secrets are not wired (Issue 5). The
+    # loader above validates the *shape* but silently substitutes built-in dev
+    # defaults for missing secrets, so a config that could only ever connect
+    # with `admin` / `agent-service-dev` would otherwise persist + activate and
+    # fail much later at the first cloud call (surviving restarts). Refuse here,
+    # naming the exact env var(s) to set.
+    missing = missing_secret_envs(backend_id, probe_overlay)
+    if missing:
+        names = ", ".join(sorted({m["env_var"] for m in missing}))
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"secret env not set for backend {backend_id!r}: {names}. "
+                "Wire the secret(s) into the orchestrator env (Helm/Vault) or "
+                "point `credentials_ref` at a set env var, then retry. Refusing "
+                "to activate a backend that would fall back to built-in dev "
+                "credentials."
+            ),
+        )
 
     try:
         stored = await postgres_db.upsert_system_setting(
@@ -17229,6 +17279,23 @@ async def test_main_cloud_settings(
         "value": clean_value,
         "credentials_ref": credentials_ref,
     }
+
+    # Issue 5: surface unwired secrets as the precise reason, instead of letting
+    # the probe connect with built-in dev credentials and report a cryptic
+    # upstream-auth failure.
+    from services.cloud.config import missing_secret_envs
+
+    missing = missing_secret_envs(backend_id, probe_overlay)
+    if missing:
+        names = ", ".join(sorted({m["env_var"] for m in missing}))
+        return {
+            "ok": False,
+            "detail": (
+                f"secret env not set for backend {backend_id!r}: {names} "
+                "(would fall back to built-in dev credentials). Wire the "
+                "secret(s) or set `credentials_ref` before testing."
+            ),
+        }
 
     try:
         probe_backend = build_backend(db_overlay=probe_overlay)
