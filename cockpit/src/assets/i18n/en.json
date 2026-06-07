@@ -307,7 +307,20 @@
         "saveFailed": "Failed to save override.",
         "removed": "Override removed — back to the bundled default.",
         "removeFailed": "Failed to remove override.",
-        "invalidJson": "Invalid JSON — fix the syntax and try again."
+        "invalidJson": "Invalid JSON — fix the syntax and try again.",
+        "matchesDefault": "Already matches the shipped default — no override needed.",
+        "noChanges": "No changes to save.",
+        "fileUnsupported": "Unsupported file — drop a .txt or .md file.",
+        "fileTooLarge": "File too large — keep it under 1 MB.",
+        "fileLoaded": "Loaded {{name}} — review and save to apply.",
+        "fileReadError": "Could not read that file.",
+        "settingMustBeNumber": "{{title}} must be a number.",
+        "settingMustBeInteger": "{{title}} must be a whole number.",
+        "settingMin": "{{title}} must be at least {{min}}.",
+        "settingMax": "{{title}} must be at most {{max}}.",
+        "noSettingChanges": "No setting changes to save.",
+        "settingsSaved": "Inference settings saved.",
+        "settingsSaveFailed": "Failed to save settings."
       }
     },
     "providers": {
