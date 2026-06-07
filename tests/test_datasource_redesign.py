@@ -155,12 +155,12 @@ def _build_webdav_note(name: str, desc: str, is_read_only: bool) -> str:
     if desc:
         lines.append(f"\n{desc}")
     lines.append("\n### Available Tools")
-    lines.append("- `cloud_list` — list files and directories")
-    lines.append("- `cloud_read` — read file contents")
-    lines.append("- `cloud_info` — get file metadata")
+    lines.append("- `webdav_list` — list files and directories")
+    lines.append("- `webdav_read` — read file contents")
+    lines.append("- `webdav_info` — get file metadata")
     if not is_read_only:
-        lines.append("- `cloud_write` — write/upload files")
-        lines.append("- `cloud_delete` — delete files")
+        lines.append("- `webdav_write` — write/upload files")
+        lines.append("- `webdav_delete` — delete files")
     return "\n".join(lines)
 
 
@@ -354,16 +354,16 @@ class TestWebdavNote:
     def test_readwrite(self):
         content = _build_webdav_note("Files", "Shared storage", False)
         assert "**Access:** read-write" in content
-        assert "`cloud_write`" in content
-        assert "`cloud_delete`" in content
+        assert "`webdav_write`" in content
+        assert "`webdav_delete`" in content
 
     def test_readonly(self):
         content = _build_webdav_note("Files", "", True)
         assert "**Access:** read-only" in content
-        assert "cloud_write" not in content
-        assert "cloud_delete" not in content
-        assert "`cloud_list`" in content
-        assert "`cloud_read`" in content
+        assert "webdav_write" not in content
+        assert "webdav_delete" not in content
+        assert "`webdav_list`" in content
+        assert "`webdav_read`" in content
 
 
 class TestBuildDatasourceNoteContent:

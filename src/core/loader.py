@@ -1179,7 +1179,7 @@ class ToolsConfig:
     shell: List[str] = field(default_factory=list)
     evaluation: List[str] = field(default_factory=list)
     knowledge: List[str] = field(default_factory=list)
-    cloud: List[str] = field(default_factory=list)
+    webdav: List[str] = field(default_factory=list)
     communication: List[str] = field(default_factory=list)
     delegation: List[str] = field(default_factory=list)
     orchestrator: List[str] = field(default_factory=list)
@@ -1637,7 +1637,7 @@ def load_agent_config(
         shell=tools_data.get("shell", tools_data.get("coding", [])),
         evaluation=tools_data.get("evaluation", []),
         knowledge=tools_data.get("knowledge", []),
-        cloud=tools_data.get("cloud", []),
+        webdav=tools_data.get("webdav", []),
         delegation=tools_data.get("delegation", []),
         orchestrator=tools_data.get("orchestrator", []),
     )
@@ -1838,7 +1838,7 @@ def load_agent_config_from_dict(
         shell=tools_data.get("shell", tools_data.get("coding", [])),
         evaluation=tools_data.get("evaluation", []),
         knowledge=tools_data.get("knowledge", []),
-        cloud=tools_data.get("cloud", []),
+        webdav=tools_data.get("webdav", []),
         delegation=tools_data.get("delegation", []),
         orchestrator=tools_data.get("orchestrator", []),
     )
@@ -3063,7 +3063,7 @@ def get_all_tool_names(config: AgentConfig) -> List[str]:
         + config.tools.shell
         + config.tools.evaluation
         + config.tools.knowledge
-        + config.tools.cloud
+        + config.tools.webdav
         + config.tools.communication
         + config.tools.delegation
         + config.tools.orchestrator

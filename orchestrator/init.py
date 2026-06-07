@@ -1098,26 +1098,11 @@ async def _backfill_cloud_folders(db) -> None:
                     nextcloud_folder_id=legacy_folder_id,
                 )
 
-                # Create a project-scoped WebDAV datasource if none exists
-                existing_ds = await db.list_project_datasources(project_id)
-                has_webdav = any(ds["type"] == "webdav" for ds in existing_ds)
-                if not has_webdav:
-                    webdav_url = backend.get_project_folder_webdav_url(folder_handle)
-                    if webdav_url:
-                        ds = await db.create_datasource(
-                            name=f"Cloud Storage ({project_name})",
-                            ds_type="webdav",
-                            connection_url=webdav_url,
-                            description=(
-                                f"Shared file storage for project '{project_name}'"
-                            ),
-                            credentials=backend.webdav_credentials,
-                        )
-                        await db.link_datasource_to_project(
-                            project_id=project_id,
-                            datasource_id=str(ds["id"]),
-                            read_only=False,
-                        )
+                # The project working folder is intentionally NOT attached as a
+                # `webdav` datasource — it is cloned into job/session workspaces
+                # (Mode-A baseline / `projects/` sync mount), so a datasource here
+                # would double-expose the same files through the webdav_* tools.
+                # See docs/issues/main_cloud.md (Issue 1 / Issue 8).
 
                 backfilled += 1
                 logger.info(
