@@ -1152,7 +1152,24 @@ async def _attach_session(
                     len(_session.workspace_sync),
                 )
         except Exception as e:
+            # The coordinator build or initial pull failed. Historically this
+            # was swallowed to a warning and the session then ran unsynced for
+            # its entire life with no signal — the exact mechanism behind the
+            # prod-private "files didn't clone, but I saw no error" incident
+            # (docs/issues/main_cloud.md Issue 13). Surface it to the cockpit
+            # over the same workspace_sync.error channel the turn-loop uses
+            # (_resilient_cloud_sync), so the operator sees a degraded-sync
+            # state instead of silence.
             logger.warning(f"Failed to start cloud workspace sync: {e}")
+            _broadcast(
+                "workspace_sync.error",
+                {
+                    "op": "initial_pull",
+                    "turn_id": 0,
+                    "message": str(e),
+                    "degraded": True,
+                },
+            )
             _session.workspace_sync = None
 
     # Restore message history from DB (for session resume)
