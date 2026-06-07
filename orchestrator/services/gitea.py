@@ -23,13 +23,25 @@ class GiteaClient:
     """Async HTTP client for Gitea API.
 
     Reads configuration from environment variables:
-        GITEA_URL: Base URL of the Gitea instance (e.g. http://gitea:3000)
+        GITEA_INTERNAL_URL: In-cluster service URL for the orchestrator's
+            own API calls (e.g. http://srw-gitea:3000). Preferred base.
+        GITEA_URL: Browser-facing base URL (e.g. https://git.localhost).
+            Used only as a fallback for the API base; may resolve to
+            loopback and be unreachable from inside the cluster.
         GITEA_ADMIN_USER: Admin username to create/use
         GITEA_ADMIN_PASSWORD: Admin password
     """
 
     def __init__(self) -> None:
-        self._url = os.environ.get("GITEA_URL", "").rstrip("/")
+        # Server-to-server API base: prefer the in-cluster URL so the
+        # orchestrator can always reach Gitea from inside the pod. GITEA_URL
+        # (browser-facing, e.g. https://git.localhost) may resolve to
+        # loopback in-cluster and be unreachable here. Clone/web URLs handed
+        # to users are built separately (see _build_clone_url, which also
+        # prefers the internal URL).
+        self._url = (
+            os.environ.get("GITEA_INTERNAL_URL") or os.environ.get("GITEA_URL", "")
+        ).rstrip("/")
         self._user = os.environ.get("GITEA_ADMIN_USER", "srw")
         self._password = os.environ.get("GITEA_ADMIN_PASSWORD", "srw_gitea")
         self._initialized = False

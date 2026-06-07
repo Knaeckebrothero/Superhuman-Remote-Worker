@@ -18,9 +18,12 @@ v1 limitations (deferred to v2):
   skipped from the baseline. Binary files in the project folder will
   not appear in the diff. Acceptable for the thesis/document workflows
   this feature primarily targets; revisit when first user hits it.
-* OpenCloud-only — Nextcloud's ``list_project_folder`` /
-  ``get_project_folder_file_bytes`` are stubs that raise
-  ``NOT_SUPPORTED``. Adding Group Folders PROPFIND is a clean follow-up.
+
+Both the OpenCloud and Nextcloud backends implement the byte-level
+project-folder methods this module relies on
+(``list_project_folder`` / ``get_project_folder_file_bytes`` /
+``put_project_folder_file_bytes`` / ``delete_project_folder_file``), so
+Mode A works on either active backend.
 """
 
 from __future__ import annotations

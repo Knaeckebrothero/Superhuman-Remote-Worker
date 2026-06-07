@@ -3845,12 +3845,15 @@ async def _generate_title(messages: List[Any], auxiliary_llm: Any) -> Optional[s
                 HM(content="\n".join(sample)),
             ]
         )
+        auxiliary_llm.health.record_success("title_generation")
         text = getattr(response, "content", None) or ""
         title = text.strip()[:100] if text.strip() else None
         if not title:
             logger.debug("Title generation returned empty response")
         return title
     except Exception as e:
+        if auxiliary_llm is not None:
+            auxiliary_llm.health.record_failure("title_generation", e)
         logger.warning(f"Title generation error: {e}")
         return None
 

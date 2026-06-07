@@ -34,6 +34,7 @@ from urllib.parse import quote
 
 import httpx
 
+from ._propfind import parse_propfind_entries
 from .base import HealthStatus, UserHome
 from .errors import CloudBackendError, CloudBackendErrorKind
 from .handles import (
@@ -495,39 +496,151 @@ class NextcloudBackend:
             f"{self._agent_user}/{mountpoint}/"
         )
 
+    def _groupfolder_dav_base(self, handle: ProjectFolderHandle) -> str:
+        """WebDAV base path (no trailing slash) for a Group Folder's bytes.
+
+        ``agent-service`` is a member of ``srw-agents``, which has access to
+        every project Group Folder, so it reaches the folder's contents via
+        the groupfolders DAV endpoint keyed by mountpoint — the same path
+        ``get_project_folder_webdav_url`` exposes to agents. The mountpoint
+        lives in the handle's ``vendor_meta`` (stamped at create time by
+        ``ensure_project_folder``).
+        """
+        mountpoint = handle.vendor_meta.get("mountpoint")
+        if not mountpoint:
+            raise CloudBackendError(
+                CloudBackendErrorKind.INVALID_REQUEST,
+                "project folder handle has no mountpoint "
+                f"(native_id={handle.native_id!r})",
+                backend=self.backend_id,
+                retryable=False,
+            )
+        return (
+            f"/remote.php/dav/groupfolders/{self._agent_user}/"
+            f"{quote(mountpoint, safe='')}"
+        )
+
     async def list_project_folder(
         self,
         handle: ProjectFolderHandle,
         *,
         subpath: str = "",
     ) -> list[ProjectFolderEntry]:
-        """Not yet implemented for Nextcloud.
+        """Recursive enumeration of a Group Folder via repeated ``Depth: 1``
+        PROPFIND.
 
-        Mode A baseline-seed currently ships OpenCloud-only
-        (docs/done/job_cloud_export.md §0). Add Group Folders
-        PROPFIND walk when first Nextcloud user requests Mode A.
+        sabre/dav disables ``Depth: infinity`` by default, so — like the
+        OpenCloud backend — we walk the tree breadth-first, one ``Depth: 1``
+        PROPFIND per directory. Returns every descendant (files +
+        directories); order is breadth-first.
         """
-        raise CloudBackendError(
-            CloudBackendErrorKind.NOT_SUPPORTED,
-            "list_project_folder not implemented on the Nextcloud backend yet",
-            backend=self.backend_id,
-            retryable=False,
-        )
+        self._ensure_ready()
+        base_path = self._groupfolder_dav_base(handle)
+        # Strip this prefix off every href so callers get paths relative to
+        # the folder root.
+        href_prefix = f"{base_path}/"
 
+        all_entries: list[ProjectFolderEntry] = []
+        # Breadth-first queue of subpaths to expand. Empty string = root.
+        queue: list[str] = [subpath.strip("/")]
+        seen: set[str] = set()
+        while queue:
+            current = queue.pop(0)
+            if current in seen:
+                continue
+            seen.add(current)
+            safe_sub = quote(current, safe="/")
+            url_path = f"{base_path}/{safe_sub}" if safe_sub else base_path
+            entries = await self._propfind_depth_one(url_path, href_prefix)
+            for entry in entries:
+                # Depth=1 only returns immediate children; defensive guard
+                # against an entry that falls outside ``current``.
+                if current and not entry.path.startswith(current.rstrip("/") + "/"):
+                    if entry.path != current:
+                        continue
+                all_entries.append(entry)
+                if entry.is_dir and entry.path not in seen:
+                    queue.append(entry.path)
+        return all_entries
+
+    async def _propfind_depth_one(
+        self, url_path: str, href_prefix: str
+    ) -> list[ProjectFolderEntry]:
+        """Single ``Depth: 1`` PROPFIND that returns one folder's children.
+
+        Sent with no body — sabre/dav returns the standard live properties
+        (``resourcetype``, ``getcontentlength``, ``getetag``,
+        ``getcontenttype``) by default, which is what
+        ``parse_propfind_entries`` reads.
+        """
+        try:
+            resp = await self._client.request(
+                "PROPFIND",
+                url_path,
+                headers={"Depth": "1"},
+                auth=(self._agent_user, self._agent_password),
+            )
+        except httpx.HTTPError as e:
+            raise self._map_http_error(e) from e
+        if resp.status_code == 404:
+            raise CloudBackendError(
+                CloudBackendErrorKind.NOT_FOUND,
+                f"path {url_path} not found",
+                backend=self.backend_id,
+                status_code=404,
+            )
+        if resp.status_code != 207:
+            raise CloudBackendError(
+                CloudBackendErrorKind.UNKNOWN,
+                f"unexpected PROPFIND status {resp.status_code} for {url_path}",
+                backend=self.backend_id,
+                status_code=resp.status_code,
+                raw={"body": resp.text[:500]},
+            )
+        return parse_propfind_entries(resp.text, href_prefix=href_prefix)
+
+    @instrument_backend_op("get_project_folder_file_bytes")
     async def get_project_folder_file_bytes(
         self,
         handle: ProjectFolderHandle,
         *,
         path: str,
     ) -> bytes:
-        """Not yet implemented for Nextcloud — see list_project_folder."""
-        raise CloudBackendError(
-            CloudBackendErrorKind.NOT_SUPPORTED,
-            "get_project_folder_file_bytes not implemented on the Nextcloud backend yet",
-            backend=self.backend_id,
-            retryable=False,
-        )
+        """GET one file out of a Group Folder."""
+        self._ensure_ready()
+        base_path = self._groupfolder_dav_base(handle)
+        rel = path.lstrip("/")
+        if not rel:
+            raise CloudBackendError(
+                CloudBackendErrorKind.INVALID_REQUEST,
+                "get_project_folder_file_bytes: path must be non-empty",
+                backend=self.backend_id,
+                retryable=False,
+            )
+        url = f"{base_path}/{quote(rel, safe='/')}"
+        try:
+            resp = await self._client.get(
+                url, auth=(self._agent_user, self._agent_password)
+            )
+        except httpx.HTTPError as e:
+            raise self._map_http_error(e) from e
+        if resp.status_code == 404:
+            raise CloudBackendError(
+                CloudBackendErrorKind.NOT_FOUND,
+                f"file {path!r} not found in group folder {handle.native_id}",
+                backend=self.backend_id,
+                status_code=404,
+            )
+        if resp.status_code != 200:
+            raise CloudBackendError(
+                CloudBackendErrorKind.UNKNOWN,
+                f"GET file {path!r}: unexpected status {resp.status_code}",
+                backend=self.backend_id,
+                status_code=resp.status_code,
+            )
+        return resp.content
 
+    @instrument_backend_op("put_project_folder_file_bytes")
     async def put_project_folder_file_bytes(
         self,
         handle: ProjectFolderHandle,
@@ -536,14 +649,54 @@ class NextcloudBackend:
         content: bytes,
         content_type: Optional[str] = None,
     ) -> None:
-        """Not yet implemented for Nextcloud — see list_project_folder."""
-        raise CloudBackendError(
-            CloudBackendErrorKind.NOT_SUPPORTED,
-            "put_project_folder_file_bytes not implemented on the Nextcloud backend yet",
-            backend=self.backend_id,
-            retryable=False,
-        )
+        """PUT one file into a Group Folder, MKCOL-ing parents on the way.
 
+        Same MKCOL-each-segment-then-PUT idiom as ``put_session_file``.
+        Used by the Mode A accept flow to write the agent's accepted edits
+        back to the cloud folder.
+        """
+        self._ensure_ready()
+        base_path = self._groupfolder_dav_base(handle)
+        rel = path.strip("/")
+        if not rel:
+            raise CloudBackendError(
+                CloudBackendErrorKind.INVALID_REQUEST,
+                "put_project_folder_file_bytes: path must be non-empty",
+                backend=self.backend_id,
+                retryable=False,
+            )
+        segments = rel.split("/")
+        parents = segments[:-1]
+        try:
+            for i in range(len(parents)):
+                partial = "/".join(parents[: i + 1])
+                url = f"{base_path}/{quote(partial, safe='/')}"
+                resp = await self._client.request(
+                    "MKCOL",
+                    url,
+                    auth=(self._agent_user, self._agent_password),
+                )
+                # 201 = created, 405 = already exists — both fine.
+                if resp.status_code in (201, 405):
+                    continue
+                resp.raise_for_status()
+
+            put_url = f"{base_path}/{quote(rel, safe='/')}"
+            headers: dict[str, str] = {}
+            if content_type:
+                headers["Content-Type"] = content_type
+            put_resp = await self._client.put(
+                put_url,
+                headers=headers,
+                content=content,
+                auth=(self._agent_user, self._agent_password),
+            )
+            if put_resp.status_code not in (200, 201, 204):
+                put_resp.raise_for_status()
+        except httpx.HTTPError as e:
+            raise self._map_http_error(e) from e
+
+    @instrument_backend_op("delete_project_folder_file")
     async def delete_project_folder_file(
         self,
         handle: ProjectFolderHandle,
@@ -551,12 +704,40 @@ class NextcloudBackend:
         path: str,
         if_exists: bool = True,
     ) -> None:
-        """Not yet implemented for Nextcloud — see list_project_folder."""
+        """DELETE one file from a Group Folder."""
+        self._ensure_ready()
+        base_path = self._groupfolder_dav_base(handle)
+        rel = path.strip("/")
+        if not rel:
+            raise CloudBackendError(
+                CloudBackendErrorKind.INVALID_REQUEST,
+                "delete_project_folder_file: path must be non-empty",
+                backend=self.backend_id,
+                retryable=False,
+            )
+        url = f"{base_path}/{quote(rel, safe='/')}"
+        try:
+            resp = await self._client.delete(
+                url, auth=(self._agent_user, self._agent_password)
+            )
+        except httpx.HTTPError as e:
+            raise self._map_http_error(e) from e
+        if resp.status_code in (200, 204):
+            return
+        if resp.status_code == 404:
+            if if_exists:
+                return
+            raise CloudBackendError(
+                CloudBackendErrorKind.NOT_FOUND,
+                f"file {path!r} not found in group folder {handle.native_id}",
+                backend=self.backend_id,
+                status_code=404,
+            )
         raise CloudBackendError(
-            CloudBackendErrorKind.NOT_SUPPORTED,
-            "delete_project_folder_file not implemented on the Nextcloud backend yet",
+            CloudBackendErrorKind.UNKNOWN,
+            f"DELETE file {path!r}: unexpected status {resp.status_code}",
             backend=self.backend_id,
-            retryable=False,
+            status_code=resp.status_code,
         )
 
     # ------------------------------------------------------------- Session folders
