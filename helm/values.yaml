@@ -677,6 +677,12 @@ keycloak:
 nextcloud:
   enabled: false
   internal: true
+  # Primary storage backend. true = S3 object storage via OBJECTSTORE_S3_* (the
+  # prod-private layout, requires an external bucket e.g. minio.minio.svc). false =
+  # local filesystem on the PVC at /var/www/html/data — used by the k3d overlay,
+  # which has no MinIO. Default true preserves existing prod behaviour.
+  objectStore:
+    enabled: true
   image: docker.io/library/nextcloud:31-apache
   replicas: 0
   storageClass: ""

@@ -125,9 +125,13 @@ secrets:
     CLOUD_SERVICE_USER: "agent"
     CLOUD_SERVICE_PASSWORD: "dev_cloud_password"
 
-    # --- Nextcloud (disabled but chart still wires the keys) ---
-    NEXTCLOUD_ADMIN_PASSWORD: "stub"
-    NEXTCLOUD_AGENT_PASSWORD: "stub"
+    # --- Nextcloud (main-cloud backend on local k3d — see nextcloud: block below) ---
+    # Real values: the same Secret feeds both the Nextcloud pod (its setup hook
+    # creates the agent-service user with NEXTCLOUD_AGENT_PASSWORD) and the
+    # orchestrator (admin = OCS/groupfolders, agent = WebDAV). They MUST match.
+    NEXTCLOUD_ADMIN_PASSWORD: "dev_nc_admin"
+    NEXTCLOUD_AGENT_PASSWORD: "dev_nc_agent"
+    # S3 keys unused while nextcloud.objectStore.enabled=false (filesystem on PVC).
     NEXTCLOUD_S3_ACCESS_KEY: "stub"
     NEXTCLOUD_S3_SECRET_KEY: "stub"
 
@@ -221,7 +225,23 @@ workspace:
   storageSize: "10Gi"
 
 # -----------------------------------------------------------------------------
-# OpenCloud — pin storage to match existing PVC (K8s rejects shrinks).
+# Main cloud backend — Nextcloud (validating the prod-private Nextcloud path on
+# k3d; see docs/issues/main_cloud.md Issue 15). OpenCloud is disabled below so
+# the configmap selects MAIN_CLOUD_BACKEND=nextcloud and the orchestrator's
+# NEXTCLOUD_* env block turns on. replicas:1 (chart default is 0).
+# objectStore.enabled:false stores files on the PVC (no MinIO in k3d).
+# Switch back to OpenCloud: nextcloud.enabled=false + drop opencloud.enabled.
+# -----------------------------------------------------------------------------
+nextcloud:
+  enabled: true
+  internal: true
+  replicas: 1
+  objectStore:
+    enabled: false
+
+# -----------------------------------------------------------------------------
+# OpenCloud — DISABLED while validating Nextcloud (see above). Storage/OIDC
+# settings kept so the switch-back is a one-line flip.
 # OIDC needs split-DNS workaround: auth.localhost won't resolve from inside
 # the pod (RFC 6761 says every container thinks `localhost` = its own loopback)
 # so the proxy's verifier can't fetch JWKS. We hostAliases-map it to Traefik's
@@ -231,6 +251,7 @@ workspace:
 # `k3d cluster delete && create`.
 # -----------------------------------------------------------------------------
 opencloud:
+  enabled: false
   dataStorageSize: "64Gi"
   oidcInsecureTls: true
   hostAliases:
