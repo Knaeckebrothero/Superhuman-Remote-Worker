@@ -376,6 +376,16 @@ export class PersistentChatService {
     // --- File undo ---
     readonly undoAvailable = signal(false);
 
+    // --- Cloud sync degraded (initial cloud->workspace seed failed) ---
+    /**
+     * True when this session's initial cloud->workspace sync failed: the
+     * workspace may be missing files from the cloud, and edits will NOT be
+     * saved back to the cloud for the session's lifetime. Sticky for the
+     * session (reset on each (re)connect). See docs/issues/main_cloud.md
+     * Issue 13.
+     */
+    readonly cloudSyncDegraded = signal(false);
+
     // --- Creating state (thread being created via API before connect) ---
     readonly isCreating = signal(false);
 
@@ -427,6 +437,7 @@ export class PersistentChatService {
         this.disconnect();
         this.connectionState.set('connecting');
         this.error.set(null);
+        this.cloudSyncDegraded.set(false);
         if (!sameThread) {
             // Cold path: wipe and refetch.
             this.dispatch({type: 'reset', threadId});
@@ -1660,11 +1671,25 @@ export class PersistentChatService {
 
             case 'workspace_sync.error': {
                 const op = (params['op'] as string) || 'sync';
-                const turn = params['turn_id'] as number | undefined;
-                const turnLabel = turn != null ? ` on turn ${turn}` : '';
-                this.toast.warning(
-                    `Workspace sync (${op}) failed${turnLabel}. Your changes are in the workspace but not yet in OpenCloud. Will retry on next turn.`,
-                );
+                // The initial cloud->workspace seed failed (degraded:true,
+                // op:'initial_pull'): sync is OFF for the whole session — the
+                // workspace may be missing files from the cloud and edits will
+                // NOT be saved back. That is worse than a per-turn push/pull
+                // retry, so surface it as a sticky danger toast + a session-long
+                // flag instead of a misleading "will retry next turn" note.
+                if (params['degraded'] === true || op === 'initial_pull') {
+                    this.cloudSyncDegraded.set(true);
+                    this.toast.danger(
+                        `Cloud sync could not start for this session. The workspace may be missing files from the cloud, and changes won't be saved back to it. ${this.sanitizeError(params['message'] as string)}`,
+                        {duration: 0},
+                    );
+                } else {
+                    const turn = params['turn_id'] as number | undefined;
+                    const turnLabel = turn != null ? ` on turn ${turn}` : '';
+                    this.toast.warning(
+                        `Workspace sync (${op}) failed${turnLabel}. Your changes are in the workspace but not yet saved to the cloud. Will retry on next turn.`,
+                    );
+                }
                 break;
             }
 
