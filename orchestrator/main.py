@@ -174,7 +174,6 @@ from seed.llm_config import ensure_codex_proxy_endpoint  # noqa: E402
 # them here so callers don't each do lazy imports.
 from src.core.model_registry import (  # noqa: E402
     UnknownModelError,
-    family_of as _model_family,
     resolve_model as _resolve_model,
 )
 from src.utils.ssh_key import (  # noqa: E402
@@ -987,6 +986,13 @@ async def _inject_dispatch_credentials(
             and "api_key" not in llm_over
         ):
             llm_over["api_key"] = resolved_keys[provider_for_key]
+
+    # Per-model context window: drive the agent's working window from the
+    # catalog/admin value. Lands in llm.model_max_context_tokens (a flat llm
+    # key) so it survives the agent-side settings-matrix re-run and becomes the
+    # base for the derived limits. Truthy guard rejects None and an explicit 0.
+    if meta is not None and meta.context_window:
+        llm_over.setdefault("model_max_context_tokens", meta.context_window)
 
     if resolved_keys:
         _ENV_KEY_MAP = {"vision": "VISION_API_KEY"}
@@ -2035,6 +2041,13 @@ async def _inject_model_credentials(
         meta = await _resolve_model(model_id, user_id=user_id, capability=capability)
     except UnknownModelError:
         meta = None
+
+    # Per-model context window (chat capability only — auxiliary/vision sections
+    # carry their own windows and aren't derived this way). Set before the
+    # endpoint/provider branches so it also reaches endpoint-backed (self-hosted)
+    # models. setdefault keeps a caller-pinned value; truthy guard skips None/0.
+    if capability == "chat" and meta is not None and meta.context_window:
+        section.setdefault("model_max_context_tokens", meta.context_window)
 
     if (
         meta is not None
@@ -9026,7 +9039,10 @@ async def export_job_to_shared_folder(request: Request, job_id: str) -> dict[str
             ),
         )
 
-    backend = main_cloud_router.active
+    # Fresh loose-job export folder — no project/thread row to pin to yet,
+    # so resolve via the owner seam (returns the active backend today;
+    # per-org under multi-tenancy). Issue 16, docs/issues/main_cloud.md.
+    backend = main_cloud_router.for_owner(user)
     if not backend.is_initialized:
         raise HTTPException(status_code=503, detail="Cloud backend not available.")
     if not gitea_client.is_initialized:
@@ -11901,7 +11917,11 @@ async def create_thread(
                         )
 
         async def _setup_main_cloud() -> None:
-            backend = main_cloud_router.active
+            # Fresh session folder for a new thread — resolve via the owner
+            # seam (active today). The thread row is stamped with this
+            # backend's id below, so resume/delete later dispatch via
+            # for_thread. Issue 16, docs/issues/main_cloud.md.
+            backend = main_cloud_router.for_owner(user)
             if not backend.is_initialized and backend.is_configured:
                 await backend.ensure_initialized()
             if not backend.is_initialized:
@@ -12412,7 +12432,11 @@ async def resume_thread(
         async def _late_cloud_setup(
             tid: str, usr: dict, existing_handle: str | None
         ) -> None:
-            backend = main_cloud_router.active
+            # Pinned: this thread already exists and carries its origin
+            # backend in main_cloud_backend. Dispatch via for_thread so a
+            # later active-backend swap can't re-provision it on the wrong
+            # cloud (Issue 16). Mirrors the delete path above (~:12339).
+            backend = main_cloud_router.for_thread(thread)
             if not backend.is_initialized and backend.is_configured:
                 await backend.ensure_initialized()
             if not backend.is_initialized:
@@ -14529,58 +14553,6 @@ def _load_settings_matrix(config_dir: Path) -> dict[str, Any]:
         else:
             _settings_matrix_cache = {}
     return _settings_matrix_cache
-
-
-def _apply_settings_matrix_to_config(
-    merged: dict[str, Any],
-    expert_llm_keys: set[str],
-    config_dir: Path,
-    expert_dir: Path | None = None,
-) -> dict[str, Any]:
-    """Apply settings_matrix model-family defaults to a merged config dict.
-
-    Mirrors the agent's _apply_settings_matrix() in src/core/loader.py.
-    Flat keys go to merged["llm"] (skipping expert_llm_keys).
-    Limits go to merged["limits"] (matrix is sole source).
-    """
-    base_matrix = _load_settings_matrix(config_dir)
-
-    # Support per-expert model_config_matrix.yaml override (settings
-    # subsection only — prompts/instructions are loaded by the agent loader).
-    matrix = dict(base_matrix)
-    if expert_dir and expert_dir != config_dir:
-        expert_matrix_path = expert_dir / "model_config_matrix.yaml"
-        if expert_matrix_path.exists():
-            with open(expert_matrix_path) as f:
-                expert_parsed = yaml.safe_load(f) or {}
-            expert_settings = _project_settings_subsection(expert_parsed)
-            matrix = _deep_merge(matrix, expert_settings)
-
-    llm_data = merged.get("llm", {})
-    model = llm_data.get("model", "gpt-4o")
-    family = _model_family(model)
-
-    default_settings = matrix.get("default", {})
-    family_settings = matrix.get(family, {}) if family != "default" else {}
-    settings = _deep_merge(default_settings, family_settings)
-
-    if not settings:
-        return base_matrix
-
-    # Apply flat keys -> merged["llm"] (skip keys explicitly set in expert)
-    for key, value in settings.items():
-        if key == "limits":
-            continue
-        if key not in expert_llm_keys:
-            merged.setdefault("llm", {})[key] = value
-
-    # Apply limits -> merged["limits"] (matrix is sole source of truth)
-    limits_settings = settings.get("limits")
-    if isinstance(limits_settings, dict):
-        for key, value in limits_settings.items():
-            merged.setdefault("limits", {})[key] = value
-
-    return base_matrix
 
 
 def _load_expert_detail(expert_id: str) -> dict[str, Any]:
@@ -17431,8 +17403,9 @@ async def create_user(body: UserCreate, request: Request) -> dict[str, Any]:
         )
         await _create_gitea_repo_for_project(user, project)
 
-        # Create personal WebDAV datasource for the default project
-        backend = main_cloud_router.active
+        # Create personal WebDAV datasource for the default project.
+        # Fresh owner provisioning — resolve via the owner seam (Issue 16).
+        backend = main_cloud_router.for_owner(user)
         if backend.is_initialized and body.email:
             try:
                 # Phase 1: the Nextcloud adapter treats the email as the

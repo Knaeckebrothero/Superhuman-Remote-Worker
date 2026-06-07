@@ -23,6 +23,8 @@ import {AppSwitchComponent} from '../../../ui/switch';
 import {AppButtonComponent} from '../../../ui/button';
 import {AppFormFieldComponent} from '../../../ui/form-field';
 import {AppBadgeComponent} from '../../../ui/badge';
+import {AppIconButtonComponent} from '../../../ui/icon-button';
+import {AppIconComponent} from '../../../ui/icon';
 import {AppToastService} from '../../../ui/toast/toast.service';
 import {AgentLoopDiagramComponent} from './agent-loop-diagram.component';
 
@@ -50,6 +52,8 @@ const FAMILIES = ['gemma', 'gpt-5', 'gpt-oss', 'deepseek', 'minimax', 'minimax-m
     AppButtonComponent,
     AppFormFieldComponent,
     AppBadgeComponent,
+    AppIconButtonComponent,
+    AppIconComponent,
     AgentLoopDiagramComponent,
   ],
   template: `
@@ -76,29 +80,20 @@ const FAMILIES = ['gemma', 'gpt-5', 'gpt-oss', 'deepseek', 'minimax', 'minimax-m
       </section>
 
       <section class="admin-section">
-        <h2 class="section-title">Pick a config key</h2>
-        <div class="picker-row">
-          <app-form-field label="Model family">
-            <app-select [value]="familyValue()" (changed)="onFamilyChange($event)">
-              <option value="_">Global (all families)</option>
-              @for (f of families; track f) {
-                <option [value]="f">{{ f }}</option>
-              }
-            </app-select>
-          </app-form-field>
-          <app-form-field label="Config key">
-            <app-select [value]="keyValue()" (changed)="onKeyChange($event)">
-              <option value="">— select a config key —</option>
-              @for (g of groupedCatalog(); track g.label) {
-                <optgroup [label]="g.label">
-                  @for (e of g.entries; track e.name) {
-                    <option [value]="e.name">{{ e.title }}</option>
-                  }
-                </optgroup>
-              }
-            </app-select>
-          </app-form-field>
-        </div>
+        <h2 class="section-title">Model family</h2>
+        <p class="section-desc">
+          Scopes the inference settings and the prompt/instruction overrides
+          below. <strong>Global</strong> applies to every family; pick a family to
+          layer a more specific override on top.
+        </p>
+        <app-form-field label="Model family">
+          <app-select [value]="familyValue()" (changed)="onFamilyChange($event)">
+            <option value="_">Global (all families)</option>
+            @for (f of families; track f) {
+              <option [value]="f">{{ f }}</option>
+            }
+          </app-select>
+        </app-form-field>
       </section>
 
       @if (settingsEntries().length) {
@@ -162,40 +157,95 @@ const FAMILIES = ['gemma', 'gpt-5', 'gpt-oss', 'deepseek', 'minimax', 'minimax-m
         </section>
       }
 
-      @if (selectedEntry(); as entry) {
-        <section class="admin-section">
-          <div class="entry-head">
-            <h2 class="section-title">{{ entry.title }}</h2>
+      <section class="admin-section">
+        <h2 class="section-title">Prompt &amp; instruction overrides</h2>
+        <p class="section-desc">
+          Pick a file to see its shipped default and layer a database override for
+          the selected family. Saved edits apply to <strong>future</strong> jobs at
+          dispatch.
+        </p>
+
+        <app-form-field label="Config key">
+          <app-select [value]="keyValue()" (changed)="onKeyChange($event)">
+            <option value="">— select a config key —</option>
+            @for (g of groupedCatalog(); track g.label) {
+              <optgroup [label]="g.label">
+                @for (e of g.entries; track e.name) {
+                  <option [value]="e.name">{{ e.title }}</option>
+                }
+              </optgroup>
+            }
+          </app-select>
+        </app-form-field>
+
+        @if (selectedEntry(); as entry) {
+          <div class="entry-head entry-head--sub">
+            <span class="entry-title">{{ entry.title }}</span>
             @if (entry.group) {
               <span class="entry-scope">{{ entry.group }}</span>
             }
+            <span class="entry-scope">{{ familyLabel() }}</span>
             @if (hasOverride()) {
               <app-badge tone="info" size="xs">override active</app-badge>
             }
           </div>
-          <p class="section-desc">{{ entry.description }}</p>
+          <p class="entry-desc">{{ entry.description }}</p>
 
-          <div class="editor-grid">
-            <app-form-field
-              [label]="isStructured() ? 'Bundled default (JSON, read-only)' : 'Bundled default (read-only)'"
-            >
-              <app-textarea [value]="bundledContent()" [disabled]="true" [rows]="14" />
-            </app-form-field>
-            <app-form-field
-              [label]="isStructured() ? 'Override (JSON)' : 'Override'"
-              [hint]="isStructured()
-                ? 'Edit as JSON — validated server-side against the catalog.'
-                : (hasOverride()
-                  ? 'Editing the active override.'
-                  : 'No override yet — saving creates one.')"
+          <div class="editor-field">
+            <div class="editor-toolbar">
+              <span class="editor-toolbar__label">{{ editorLabel() }}</span>
+              <div class="editor-toolbar__actions">
+                <input
+                  #fileInput
+                  type="file"
+                  class="visually-hidden"
+                  accept=".txt,.md,.markdown,.json,.yaml,.yml,.jinja,.j2,text/*"
+                  (change)="onFileSelected($event)"
+                />
+                <app-icon-button
+                  size="sm"
+                  variant="ghost"
+                  ariaLabel="Upload a .txt or .md file"
+                  tooltip="Upload .txt / .md"
+                  (clicked)="fileInput.click()"
+                >
+                  <app-icon size="sm">upload_file</app-icon>
+                </app-icon-button>
+                <app-icon-button
+                  size="sm"
+                  variant="ghost"
+                  [ariaLabel]="copied() ? 'Copied' : 'Copy to clipboard'"
+                  [tooltip]="copied() ? 'Copied' : 'Copy'"
+                  (clicked)="copyEditor()"
+                >
+                  <app-icon size="sm">{{ copied() ? 'check' : 'content_copy' }}</app-icon>
+                </app-icon-button>
+              </div>
+            </div>
+            <div
+              class="editor-dropzone"
+              [class.is-drag]="dragActive()"
+              (dragover)="onDragOver($event)"
+              (dragleave)="onDragLeave($event)"
+              (drop)="onDrop($event)"
             >
               <app-textarea
                 [value]="overrideContent()"
                 (valueChange)="overrideContent.set($event)"
-                [rows]="14"
+                [rows]="20"
+                [ariaLabel]="entry.title"
               />
-            </app-form-field>
+              @if (dragActive()) {
+                <div class="editor-drop-hint">Drop a .txt or .md file to replace the content</div>
+              }
+            </div>
+            <p class="editor-hint">{{ editorHint() }}</p>
           </div>
+
+          <details class="bundled-details">
+            <summary>View shipped default (read-only)</summary>
+            <app-textarea [value]="bundledContent()" [readonly]="true" [rows]="14" />
+          </details>
 
           <div class="actions">
             <app-button variant="primary" [loading]="saving()" (clicked)="save()">
@@ -209,8 +259,10 @@ const FAMILIES = ['gemma', 'gpt-5', 'gpt-oss', 'deepseek', 'minimax', 'minimax-m
               Reset to bundled
             </app-button>
           </div>
-        </section>
-      }
+        } @else {
+          <p class="empty-hint">Select a config key to view and override its content.</p>
+        }
+      </section>
     </div>
   `,
   styles: [`
@@ -260,14 +312,6 @@ const FAMILIES = ['gemma', 'gpt-5', 'gpt-oss', 'deepseek', 'minimax', 'minimax-m
       color: var(--text-muted);
       margin-bottom: 20px;
     }
-    .picker-row {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 16px;
-    }
-    .picker-row app-form-field {
-      flex: 1 1 220px;
-    }
     .entry-head {
       display: flex;
       align-items: center;
@@ -282,15 +326,109 @@ const FAMILIES = ['gemma', 'gpt-5', 'gpt-oss', 'deepseek', 'minimax', 'minimax-m
       padding: 2px 8px;
       white-space: nowrap;
     }
-    .editor-grid {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 16px;
+    .entry-head--sub {
+      margin-top: 20px;
     }
-    @media (max-width: 720px) {
-      .editor-grid {
-        grid-template-columns: 1fr;
-      }
+    .entry-title {
+      font-size: 15px;
+      font-weight: 600;
+      color: var(--text-primary);
+    }
+    .entry-desc {
+      font-size: 13px;
+      color: var(--text-muted);
+      margin: 8px 0 16px 0;
+    }
+    .editor-field {
+      display: flex;
+      flex-direction: column;
+    }
+    .editor-toolbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 6px;
+    }
+    .editor-toolbar__label {
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--text-muted);
+    }
+    .editor-toolbar__actions {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+    .editor-dropzone {
+      position: relative;
+      border-radius: var(--radius-md, 8px);
+    }
+    .editor-dropzone.is-drag {
+      outline: 2px dashed var(--accent-color);
+      outline-offset: 2px;
+    }
+    .editor-dropzone.is-drag::after {
+      content: '';
+      position: absolute;
+      inset: 0;
+      background: color-mix(in srgb, var(--accent-color) 8%, transparent);
+      border-radius: inherit;
+      pointer-events: none;
+    }
+    .editor-drop-hint {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--accent-color);
+      pointer-events: none;
+    }
+    .editor-hint {
+      font-size: 12px;
+      color: var(--text-muted);
+      margin: 6px 0 0 0;
+    }
+    .bundled-details {
+      margin-top: 16px;
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-md, 8px);
+      padding: 0 12px;
+    }
+    .bundled-details > summary {
+      cursor: pointer;
+      font-size: 12px;
+      color: var(--text-muted);
+      padding: 10px 0;
+      user-select: none;
+    }
+    .bundled-details[open] > summary {
+      border-bottom: 1px solid var(--border-color);
+      margin-bottom: 12px;
+    }
+    .bundled-details app-textarea {
+      display: block;
+      margin-bottom: 12px;
+    }
+    .empty-hint {
+      font-size: 13px;
+      color: var(--text-muted);
+      margin: 20px 0 0 0;
+    }
+    .visually-hidden {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      margin: -1px;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      white-space: nowrap;
+      border: 0;
     }
     .actions {
       display: flex;
@@ -380,6 +518,12 @@ export class AdminConfigComponent implements OnInit {
   readonly overrideContent = signal<string>('');
   readonly saving = signal(false);
 
+  /** Transient "copied" state for the editor's copy-to-clipboard button. */
+  readonly copied = signal(false);
+
+  /** True while a file is dragged over the editor (drives the drop overlay). */
+  readonly dragActive = signal(false);
+
   /** The override's family value: null for the global ("_") option. */
   readonly selectedFamily = computed<string | null>(() =>
     this.familyValue() === '_' ? null : this.familyValue(),
@@ -449,6 +593,21 @@ export class AdminConfigComponent implements OnInit {
 
   readonly hasOverride = computed(() => this.existingOverride() !== null);
 
+  /** Uppercase tag above the editor: are we editing an override or the default? */
+  readonly editorLabel = computed(() =>
+    this.hasOverride() ? 'Override (editing)' : 'Shipped default — edit to override',
+  );
+
+  /** Context line under the editor explaining what Save will do. */
+  readonly editorHint = computed(() => {
+    if (this.isStructured()) {
+      return 'Edit as JSON — validated server-side against the catalog. Match the shipped default and save to clear the override.';
+    }
+    return this.hasOverride()
+      ? 'Editing the active override. Reset the field to the shipped default and save to remove it.'
+      : 'Showing the shipped default. Edit and save to create an override for this family.';
+  });
+
   constructor() {
     // Re-seed the settings form whenever the catalog arrives or the family
     // changes. Reads of bundled/override values happen in the async callback
@@ -458,6 +617,19 @@ export class AdminConfigComponent implements OnInit {
       const entries = this.settingsEntries();
       if (entries.length === 0) return;
       untracked(() => this.seedSettingsForm(fam, entries));
+    });
+
+    // Default-select the first config key once the catalog arrives so the
+    // editor is populated immediately — no empty gap below the picker. Only
+    // depends on the catalog; the untracked guard makes it a one-shot.
+    effect(() => {
+      const groups = this.groupedCatalog();
+      if (groups.length === 0) return;
+      untracked(() => {
+        if (this.selectedEntry()) return;
+        const first = groups[0]?.entries[0];
+        if (first) this.onKeyChange(first.name);
+      });
     });
   }
 
@@ -482,47 +654,56 @@ export class AdminConfigComponent implements OnInit {
     const entry = this.selectedEntry();
     if (!entry) return;
 
-    if (this.isStructured()) {
-      let parsed: unknown;
+    const structured = this.isStructured();
+    const current = this.overrideContent();
+    const bundled = this.bundledContent();
+    const existing = this.existingOverride();
+
+    // Validate before any write.
+    let parsed: unknown;
+    if (structured) {
       try {
-        parsed = JSON.parse(this.overrideContent());
+        parsed = JSON.parse(current);
       } catch {
         this.toast.danger(this.transloco.translate('admin.config.messages.invalidJson'));
         return;
       }
-      this.saving.set(true);
-      this.admin
-        .createOverride({
-          family: this.selectedFamily(),
-          kind: entry.kind,
-          name: entry.name,
-          value_json: parsed,
-        })
-        .subscribe({
-          next: () => {
-            this.saving.set(false);
-            this.toast.success(this.transloco.translate('admin.config.messages.saved'));
-          },
-          error: () => {
-            this.saving.set(false);
-            this.toast.danger(this.transloco.translate('admin.config.messages.saveFailed'));
-          },
-        });
-      return;
-    }
-
-    if (!this.overrideContent().trim()) {
+    } else if (!current.trim()) {
       this.toast.danger(this.transloco.translate('admin.config.messages.saveEmpty'));
       return;
     }
+
+    // The field matches the shipped default: the way to persist that is to have
+    // no override. Drop an existing one; otherwise there's nothing to do.
+    if (current === bundled) {
+      if (existing) {
+        this.resetToBundled();
+      } else {
+        this.toast.info('Already matches the shipped default — no override needed.');
+      }
+      return;
+    }
+
+    // Unchanged from the active override: nothing to write.
+    if (existing) {
+      const existingStr = structured
+        ? existing.value_json != null
+          ? JSON.stringify(existing.value_json, null, 2)
+          : ''
+        : existing.content ?? '';
+      if (current === existingStr) {
+        this.toast.info('No changes to save.');
+        return;
+      }
+    }
+
     this.saving.set(true);
     this.admin
-      .createOverride({
-        family: this.selectedFamily(),
-        kind: entry.kind,
-        name: entry.name,
-        content: this.overrideContent(),
-      })
+      .createOverride(
+        structured
+          ? {family: this.selectedFamily(), kind: entry.kind, name: entry.name, value_json: parsed}
+          : {family: this.selectedFamily(), kind: entry.kind, name: entry.name, content: current},
+      )
       .subscribe({
         next: () => {
           this.saving.set(false);
@@ -537,12 +718,16 @@ export class AdminConfigComponent implements OnInit {
 
   resetToBundled(): void {
     const existing = this.existingOverride();
-    if (!existing) return;
+    if (!existing) {
+      // No override to delete — just make sure the field shows the default.
+      this.overrideContent.set(this.bundledContent());
+      return;
+    }
     this.saving.set(true);
     this.admin.deleteOverride(existing.id).subscribe({
       next: () => {
         this.saving.set(false);
-        this.overrideContent.set('');
+        this.overrideContent.set(this.bundledContent());
         this.toast.success(this.transloco.translate('admin.config.messages.removed'));
       },
       error: () => {
@@ -552,7 +737,72 @@ export class AdminConfigComponent implements OnInit {
     });
   }
 
-  /** Re-seed the editor + bundled reference for the current (family, entry). */
+  // --- Editor convenience: copy + file load ------------------------------
+
+  /** Copy the current editor content to the clipboard (codeblock-style). */
+  copyEditor(): void {
+    void navigator.clipboard?.writeText(this.overrideContent()).then(() => {
+      this.copied.set(true);
+      setTimeout(() => this.copied.set(false), 1500);
+    });
+  }
+
+  onDragOver(event: DragEvent): void {
+    event.preventDefault();
+    this.dragActive.set(true);
+  }
+
+  onDragLeave(event: DragEvent): void {
+    event.preventDefault();
+    this.dragActive.set(false);
+  }
+
+  onDrop(event: DragEvent): void {
+    event.preventDefault();
+    this.dragActive.set(false);
+    const file = event.dataTransfer?.files?.[0];
+    if (file) this.loadFileIntoEditor(file);
+  }
+
+  onFileSelected(event: Event): void {
+    const input = event.target as HTMLInputElement;
+    const file = input.files?.[0];
+    if (file) this.loadFileIntoEditor(file);
+    input.value = ''; // let the same file be picked again
+  }
+
+  /**
+   * Read a dropped/picked text file into the editor. Review-then-save — this
+   * only fills the field; it does not persist. Rejects anything that isn't a
+   * small text file so a stray binary can't blow up the override.
+   */
+  loadFileIntoEditor(file: File): void {
+    const okExt = /\.(txt|md|markdown|json|ya?ml|jinja|j2)$/.test(file.name.toLowerCase());
+    const okMime =
+      !file.type || file.type.startsWith('text/') || file.type === 'application/json';
+    if (!okExt && !okMime) {
+      this.toast.danger('Unsupported file — drop a .txt or .md file.');
+      return;
+    }
+    if (file.size > 1024 * 1024) {
+      this.toast.danger('File too large — keep it under 1 MB.');
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+      this.overrideContent.set(String(reader.result ?? ''));
+      this.toast.success(`Loaded ${file.name} — review and save to apply.`);
+    };
+    reader.onerror = () => this.toast.danger('Could not read that file.');
+    reader.readAsText(file);
+  }
+
+  /**
+   * Re-seed the editor for the current (family, entry). The single editable
+   * field shows the effective value: the active override if one exists, else
+   * the shipped default. The bundled reference is kept for the collapsible
+   * "view shipped default" panel and the diff-aware Save.
+   */
   private refreshSelection(): void {
     const entry = this.selectedEntry();
     if (!entry) {
@@ -561,9 +811,6 @@ export class AdminConfigComponent implements OnInit {
       return;
     }
     const structured = this.isStructured();
-    if (!structured) {
-      this.overrideContent.set(this.existingOverride()?.content ?? '');
-    }
     this.admin.getBundled(this.selectedFamily(), entry.kind, entry.name).subscribe({
       next: (b) => {
         if (structured) {
@@ -578,10 +825,15 @@ export class AdminConfigComponent implements OnInit {
             hasVal ? JSON.stringify(existing!.value_json, null, 2) : bundledStr,
           );
         } else {
-          this.bundledContent.set(typeof b.content === 'string' ? b.content : '');
+          const bundledStr = typeof b.content === 'string' ? b.content : '';
+          this.bundledContent.set(bundledStr);
+          this.overrideContent.set(this.existingOverride()?.content ?? bundledStr);
         }
       },
-      error: () => this.bundledContent.set(''),
+      error: () => {
+        this.bundledContent.set('');
+        this.overrideContent.set(this.existingOverride()?.content ?? '');
+      },
     });
   }
 

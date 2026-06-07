@@ -391,7 +391,9 @@ async def _ensure_cloud_user(
     try:
         from main import main_cloud_router  # noqa: PLC0415
 
-        backend = main_cloud_router.active
+        # Fresh per-owner provisioning — resolve via the owner seam, not
+        # ``.active`` directly (Issue 16, docs/issues/main_cloud.md).
+        backend = main_cloud_router.for_owner({"keycloak_sub": sub, "email": email})
         if not backend.is_initialized:
             return
         await backend.ensure_user(

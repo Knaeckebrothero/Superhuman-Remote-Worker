@@ -401,13 +401,17 @@ class AuxiliaryLLM:
         self._job_id = job_id
         self._agent_type = agent_type
 
-    async def chain(self, task: AuxTask) -> BaseModel:
+    async def chain(self, task: AuxTask, timeout: Optional[float] = None) -> BaseModel:
         """Single LLM call: system prompt + context -> structured output.
 
         For tasks that need reasoning but no tool access.
 
         Args:
             task: AuxTask instance with system_prompt, build_context(), output_schema
+            timeout: Per-call timeout override (seconds). Defaults to
+                ``self.timeout``. Lets a long task (conversation summarization)
+                request a larger budget without widening the short interactive
+                default that protects every other aux task.
 
         Returns:
             Pydantic model instance matching task.output_schema
@@ -426,7 +430,7 @@ class AuxiliaryLLM:
         start = time.monotonic()
         raw_result = await asyncio.wait_for(
             structured_llm.ainvoke(messages),
-            timeout=self.timeout,
+            timeout=timeout if timeout is not None else self.timeout,
         )
         latency_ms = int((time.monotonic() - start) * 1000)
 

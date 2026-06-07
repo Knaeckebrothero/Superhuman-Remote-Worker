@@ -19,6 +19,23 @@ from src.core.loader import (
 )
 from src.core.model_registry import family_of
 
+# Limit-leaf fractions mirror the *_FRACTION constants in src/core/loader.py.
+# The four derived leaves are int(base * fraction); model_max_context_tokens is
+# the base itself. Tests assert this relationship rather than hand-pinned magics.
+FRACTIONS = {
+    "context_threshold_tokens": 0.80,
+    "summarization_safe_limit": 0.90,
+    "summarization_chunk_size": 0.60,
+    "message_count_min_tokens": 0.40,
+}
+
+
+def derived(base: int) -> dict:
+    """Expected limits block for a given working-window base."""
+    out = {k: int(base * f) for k, f in FRACTIONS.items()}
+    out["model_max_context_tokens"] = int(base)
+    return out
+
 
 @pytest.fixture(autouse=True)
 def clear_settings_matrix_cache():
@@ -68,9 +85,11 @@ class TestLoadSettingsMatrix:
         # Verify limits sub-dict exists
         assert "limits" in matrix["minimax"]
         assert isinstance(matrix["minimax"]["limits"], dict)
-        # Verify default entry has limits
+        # Verify default entry has limits — only the working-window base
+        # survives in the matrix; the derived leaves are computed at load.
         assert "limits" in matrix["default"]
-        assert matrix["default"]["limits"]["context_threshold_tokens"] == 80000
+        assert matrix["default"]["limits"]["model_max_context_tokens"] == 100000
+        assert "context_threshold_tokens" not in matrix["default"]["limits"]
 
     def test_caches_result(self):
         """The unified file is parsed once per path; the projection (the
@@ -163,7 +182,7 @@ class TestApplySettingsMatrixLimits:
         _apply_settings_matrix(data, expert_llm_keys=set())
         # Settings matrix overrides: family values override default
         assert data["limits"]["model_max_context_tokens"] == 170000
-        assert data["limits"]["context_threshold_tokens"] == 130000
+        assert data["limits"]["context_threshold_tokens"] == 136000
 
     def test_limits_key_not_leaked_to_llm(self):
         """The 'limits' sub-dict must NOT be set on data['llm']."""
@@ -198,7 +217,7 @@ class TestApplySettingsMatrixLimits:
         data = {"llm": {"model": "minimax-m2.7"}}
         _apply_settings_matrix(data, expert_llm_keys=set())
         assert "limits" in data
-        assert data["limits"]["context_threshold_tokens"] == 130000
+        assert data["limits"]["context_threshold_tokens"] == 136000
 
     def test_default_entry_used_for_unknown_family(self):
         """Unknown model gets default entry limits."""
@@ -213,7 +232,7 @@ class TestApplySettingsMatrixLimits:
         data = {"llm": {"model": "minimax-m2.7"}, "limits": {}}
         _apply_settings_matrix(data, expert_llm_keys=set())
         # minimax entry overrides default
-        assert data["limits"]["context_threshold_tokens"] == 130000
+        assert data["limits"]["context_threshold_tokens"] == 136000
         assert data["limits"]["model_max_context_tokens"] == 170000
 
     def test_matrix_is_sole_source_for_limits(self):
@@ -224,7 +243,7 @@ class TestApplySettingsMatrixLimits:
         }
         _apply_settings_matrix(data, expert_llm_keys=set())
         # Matrix overwrites even pre-existing limits values
-        assert data["limits"]["context_threshold_tokens"] == 130000
+        assert data["limits"]["context_threshold_tokens"] == 136000
 
 
 # =============================================================================
@@ -234,16 +253,18 @@ class TestApplySettingsMatrixLimits:
 
 class TestPerExpertMatrix:
     def test_expert_matrix_merges_over_base(self, tmp_path):
-        """Expert's model_config_matrix.yaml overrides base matrix values."""
-        # Write an expert model_config_matrix.yaml that overrides minimax
-        # settings (the unified shape — the same file that also carries
-        # `prompts:` and `instructions:` sections in real expert dirs).
+        """Expert's model_config_matrix.yaml overrides base matrix values.
+
+        The working window is set via limits.model_max_context_tokens (the
+        base); the threshold/safe/chunk/msg-min leaves derive from it, so an
+        expert resizes the window by overriding the base, not the leaves.
+        """
         expert_matrix = {
             "minimax": {
                 "settings": {
                     "temperature": 0.7,
                     "limits": {
-                        "context_threshold_tokens": 90000,
+                        "model_max_context_tokens": 150000,
                     },
                 },
             },
@@ -259,10 +280,8 @@ class TestPerExpertMatrix:
 
         # Expert matrix overrides temperature
         assert data["llm"]["temperature"] == 0.7
-        # Expert matrix overrides context_threshold_tokens
-        assert data["limits"]["context_threshold_tokens"] == 90000
-        # Other limits still come from base matrix minimax entry
-        assert data["limits"]["model_max_context_tokens"] == 170000
+        # Expert overrides the working base; the leaves derive from it.
+        assert data["limits"] == derived(150000)
 
     def test_no_expert_matrix_uses_base(self, tmp_path):
         """Missing expert model_config_matrix.yaml falls back to base."""
@@ -274,7 +293,7 @@ class TestPerExpertMatrix:
 
         # Values come from base matrix
         assert data["llm"]["temperature"] == 1.0
-        assert data["limits"]["context_threshold_tokens"] == 130000
+        assert data["limits"]["context_threshold_tokens"] == 136000
 
 
 # =============================================================================
@@ -434,12 +453,12 @@ class TestSettingsMatrixIntegration:
 
         config = loader.load_agent_config(str(config_file))
 
-        # Settings matrix should have overridden defaults.yaml limits
-        assert config.limits.context_threshold_tokens == 130000
+        # Derived from the minimax working base (170000) via the limit fractions.
         assert config.limits.model_max_context_tokens == 170000
-        assert config.limits.summarization_safe_limit == 160000
-        assert config.limits.summarization_chunk_size == 110000
-        assert config.limits.message_count_min_tokens == 80000
+        assert config.limits.context_threshold_tokens == 136000  # 170000 * 0.80
+        assert config.limits.summarization_safe_limit == 153000  # 170000 * 0.90
+        assert config.limits.summarization_chunk_size == 102000  # 170000 * 0.60
+        assert config.limits.message_count_min_tokens == 68000  # 170000 * 0.40
 
     def test_unknown_model_gets_default_limits(self, tmp_path):
         """Unknown model family gets default entry limits."""
@@ -457,11 +476,11 @@ class TestSettingsMatrixIntegration:
 
         config = loader.load_agent_config(str(config_file))
 
-        assert config.limits.context_threshold_tokens == 80000
         assert config.limits.model_max_context_tokens == 100000
-        assert config.limits.summarization_safe_limit == 90000
-        assert config.limits.summarization_chunk_size == 80000
-        assert config.limits.message_count_min_tokens == 50000
+        assert config.limits.context_threshold_tokens == 80000  # 100000 * 0.80
+        assert config.limits.summarization_safe_limit == 90000  # 100000 * 0.90
+        assert config.limits.summarization_chunk_size == 60000  # 100000 * 0.60
+        assert config.limits.message_count_min_tokens == 40000  # 100000 * 0.40
 
     def test_load_agent_config_with_deployment_dir_matrix(self, tmp_path):
         """Expert directory with model_config_matrix.yaml flows through load_agent_config."""
@@ -483,7 +502,7 @@ class TestSettingsMatrixIntegration:
             "minimax": {
                 "settings": {
                     "limits": {
-                        "context_threshold_tokens": 95000,
+                        "model_max_context_tokens": 150000,
                     },
                 },
             },
@@ -495,10 +514,9 @@ class TestSettingsMatrixIntegration:
             str(config_file), deployment_dir=str(expert_dir)
         )
 
-        # Expert matrix overrides this one limit
-        assert config.limits.context_threshold_tokens == 95000
-        # Other minimax limits from base matrix unchanged
-        assert config.limits.model_max_context_tokens == 170000
+        # Expert resizes the working base; the leaves derive from it.
+        assert config.limits.model_max_context_tokens == 150000
+        assert config.limits.context_threshold_tokens == 120000  # 150000 * 0.80
 
 
 # =============================================================================
@@ -677,22 +695,28 @@ class TestApplySettingsMatrixEdgeCases:
         assert data["limits"]["message_count_threshold"] == 300
         assert data["limits"]["tool_retry_count"] == 5
         # But matrix limits are also applied
-        assert data["limits"]["context_threshold_tokens"] == 130000
+        assert data["limits"]["context_threshold_tokens"] == 136000
 
-    def test_all_real_families_have_limits(self):
-        """Every family in the real settings_matrix.yaml has a limits sub-dict."""
+    def test_all_real_families_have_base_only(self):
+        """Every family carries limits.model_max_context_tokens (the working
+        base) and must NOT hand-author the derived leaves (they're computed)."""
         matrix = _load_settings_matrix()
+        derived_leaves = {
+            "context_threshold_tokens",
+            "summarization_safe_limit",
+            "summarization_chunk_size",
+            "message_count_min_tokens",
+        }
         for family, settings in matrix.items():
             assert "limits" in settings, f"Family '{family}' missing limits"
             limits = settings["limits"]
-            for key in [
-                "model_max_context_tokens",
-                "context_threshold_tokens",
-                "summarization_safe_limit",
-                "summarization_chunk_size",
-                "message_count_min_tokens",
-            ]:
-                assert key in limits, f"Family '{family}' missing limits.{key}"
+            assert "model_max_context_tokens" in limits, (
+                f"Family '{family}' missing limits.model_max_context_tokens (base)"
+            )
+            leaked = derived_leaves & set(limits)
+            assert not leaked, (
+                f"Family '{family}' hand-authors derived leaves: {leaked}"
+            )
 
 
 # =============================================================================
@@ -706,8 +730,8 @@ class TestPerExpertMatrixExtended:
         expert_matrix = {
             "default": {
                 "settings": {
-                    "model_max_context_tokens": 256000,
-                    "limits": {"context_threshold_tokens": 200000},
+                    "model_max_context_tokens": 256000,  # nominal / API ceiling
+                    "limits": {"model_max_context_tokens": 200000},  # working base
                 },
             },
         }
@@ -720,11 +744,9 @@ class TestPerExpertMatrixExtended:
             data, expert_llm_keys=set(), deployment_dir=str(tmp_path)
         )
 
-        # Expert overrode default entry
+        # Nominal (top-level) override flows to llm; leaves derive from the base.
         assert data["llm"]["model_max_context_tokens"] == 256000
-        assert data["limits"]["context_threshold_tokens"] == 200000
-        # Other default limits still present (base default not overridden)
-        assert data["limits"]["summarization_safe_limit"] == 90000
+        assert data["limits"] == derived(200000)
 
     def test_expert_adds_new_family_with_limits(self, tmp_path):
         """Expert can define a new family that the base doesn't have."""
@@ -764,13 +786,16 @@ class TestPerExpertMatrixExtended:
         )
         assert data["limits"]["context_threshold_tokens"] == 80000
 
-    def test_expert_partial_limits_merge(self, tmp_path):
-        """Expert overrides one limit key; others come from base family."""
+    def test_expert_override_of_derived_leaf_is_ignored(self, tmp_path):
+        """A derived leaf set in an expert matrix is clobbered by the derivation
+        (the base, not the leaf, is the knob). Overriding the base is the way."""
         expert_matrix = {
             "deepseek": {
                 "settings": {
                     "limits": {
+                        # The hand-set leaf is ignored; the base wins and derives.
                         "context_threshold_tokens": 42000,
+                        "model_max_context_tokens": 160000,
                     },
                 },
             },
@@ -784,11 +809,9 @@ class TestPerExpertMatrixExtended:
             data, expert_llm_keys=set(), deployment_dir=str(tmp_path)
         )
 
-        # Expert override for this one key
-        assert data["limits"]["context_threshold_tokens"] == 42000
-        # Base deepseek (V4) entry for the rest
-        assert data["limits"]["model_max_context_tokens"] == 200000
-        assert data["limits"]["summarization_safe_limit"] == 180000
+        # The 42000 leaf is discarded; everything derives from base 160000.
+        assert data["limits"] == derived(160000)
+        assert data["limits"]["context_threshold_tokens"] == 128000  # 160000 * 0.80
 
 
 # =============================================================================
@@ -800,30 +823,22 @@ class TestRealMatrixFamilies:
     """Verify each family's limits from the real settings_matrix.yaml file."""
 
     @pytest.mark.parametrize(
-        "model,expected_ctx,expected_max",
+        "model,base",
         [
-            ("minimax-m2.7", 130000, 170000),  # M2.7: 204K context
-            ("o3-mini", 130000, 170000),
-            (
-                "deepseek-v4-pro",
-                150000,
-                200000,
-            ),  # V4 Pro: 1M context, 200K working window
-            (
-                "deepseek-v4-flash",
-                150000,
-                200000,
-            ),  # V4 Flash shares the deepseek family
-            ("gemini-2.0-flash", 150000, 200000),
-            ("gpt-oss-120b", 85000, 110000),
-            ("some-unknown-model", 80000, 100000),  # default entry
+            ("minimax-m2.7", 170000),  # M2.7: 204K nominal, 170K working base
+            ("o3-mini", 170000),
+            ("deepseek-v4-pro", 200000),  # V4 Pro: 1M nominal, 200K working base
+            ("deepseek-v4-flash", 200000),  # shares the deepseek family
+            ("gemini-2.0-flash", 200000),
+            ("gpt-oss-120b", 110000),
+            ("some-unknown-model", 100000),  # default entry
         ],
     )
-    def test_family_limits(self, model, expected_ctx, expected_max):
+    def test_family_limits(self, model, base):
         data = {"llm": {"model": model}, "limits": {}}
         _apply_settings_matrix(data, expert_llm_keys=set())
-        assert data["limits"]["context_threshold_tokens"] == expected_ctx
-        assert data["limits"]["model_max_context_tokens"] == expected_max
+        # Every leaf derives from the family's working base.
+        assert data["limits"] == derived(base)
 
     @pytest.mark.parametrize(
         "model,expected_temp",
@@ -868,9 +883,9 @@ class TestUploadedConfigMatrix:
 
         merged = load_uploaded_config(config_file)
 
-        # Deepseek (V4) limits from matrix
-        assert merged["limits"]["context_threshold_tokens"] == 150000
+        # Deepseek (V4) limits derived from the matrix base (200000).
         assert merged["limits"]["model_max_context_tokens"] == 200000
+        assert merged["limits"]["context_threshold_tokens"] == 160000  # 200000 * 0.80
 
     def test_uploaded_config_llm_keys_respected(self, tmp_path):
         """Uploaded config's explicit llm keys are not overridden by matrix."""
@@ -905,3 +920,73 @@ class TestUploadedConfigMatrix:
 
         assert merged["limits"]["context_threshold_tokens"] == 80000
         assert merged["limits"]["model_max_context_tokens"] == 100000
+
+
+# =============================================================================
+# Context-window base resolution + per-model override (the derivation feature)
+# =============================================================================
+
+
+class TestContextWindowBaseResolution:
+    def test_no_override_uses_conservative_family_base(self):
+        """Without a per-model override the base is the family's conservative
+        limits.model_max_context_tokens — NOT the (much larger) nominal. The
+        nominal stays on the llm block as the Layer-1 ceiling."""
+        data = {"llm": {"model": "minimax-m3"}}
+        _apply_settings_matrix(data, expert_llm_keys=set())
+        # Base is the 200k working window, not the 1M nominal — the M3 trap.
+        assert data["limits"] == derived(200000)
+        assert data["llm"]["model_max_context_tokens"] == 1000000
+
+    def test_explicit_override_becomes_base_and_survives_matrix(self):
+        """A per-model window present in expert_llm_keys (the dispatch-injected
+        case) becomes the base, survives the matrix re-apply, and re-derives
+        every leaf."""
+        data = {"llm": {"model": "minimax-m3", "model_max_context_tokens": 32000}}
+        _apply_settings_matrix(
+            data, expert_llm_keys={"model", "model_max_context_tokens"}
+        )
+        # Injected window is NOT overwritten by the family nominal.
+        assert data["llm"]["model_max_context_tokens"] == 32000
+        # Every leaf derives from the 32k working window.
+        assert data["limits"] == derived(32000)
+
+    def test_override_above_family_base_is_honored_no_clamp(self):
+        """The admin field is the cap: a 512k override beats the family's
+        conservative 200k base with no clamp."""
+        data = {"llm": {"model": "claude-opus-4-8", "model_max_context_tokens": 512000}}
+        _apply_settings_matrix(
+            data, expert_llm_keys={"model", "model_max_context_tokens"}
+        )
+        assert data["limits"] == derived(512000)
+
+    def test_falsy_override_falls_back_to_family_base(self):
+        """A falsy override (0) falls back to the family base rather than
+        producing zero-sized limits (belt-and-suspenders for the dispatch guard)."""
+        data = {"llm": {"model": "minimax-m3", "model_max_context_tokens": 0}}
+        _apply_settings_matrix(
+            data, expert_llm_keys={"model", "model_max_context_tokens"}
+        )
+        assert data["limits"] == derived(200000)
+
+    def test_per_model_window_in_config_drives_limits_end_to_end(self, tmp_path):
+        """Full parse: a model_max_context_tokens in the config llm block (same
+        mechanism dispatch uses via override) drives config.limits."""
+        expert = {
+            "$extends": "defaults",
+            "agent_id": "a",
+            "display_name": "A",
+            "llm": {"model": "some-self-hosted", "model_max_context_tokens": 32000},
+        }
+        config_file = tmp_path / "config.yaml"
+        with open(config_file, "w") as f:
+            yaml.dump(expert, f)
+
+        config = loader.load_agent_config(str(config_file))
+
+        assert config.llm.model_max_context_tokens == 32000
+        assert config.limits.model_max_context_tokens == 32000
+        assert config.limits.context_threshold_tokens == 25600  # 32000 * 0.80
+        assert config.limits.summarization_safe_limit == 28800  # 32000 * 0.90
+        assert config.limits.summarization_chunk_size == 19200  # 32000 * 0.60
+        assert config.limits.message_count_min_tokens == 12800  # 32000 * 0.40

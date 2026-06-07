@@ -116,6 +116,15 @@ class MainCloudRouter:
 
     @property
     def active(self) -> MainCloudBackend:
+        """The current global backend.
+
+        Call sites should NOT read this directly to act on a resource —
+        resolve through ``for_project`` / ``for_thread`` / ``for_owner`` so a
+        live backend swap can't land an operation on the wrong cloud
+        (Issue 16, docs/issues/main_cloud.md). ``active`` is for the admin
+        config surface (reporting / editing *which* backend is active) and is
+        the value those seams return today.
+        """
         return self._active
 
     def for_backend(self, backend_id: str | None) -> MainCloudBackend:
@@ -148,6 +157,24 @@ class MainCloudRouter:
     def for_thread(self, thread_row: dict[str, Any]) -> MainCloudBackend:
         """Dispatch to the backend that originally created this thread."""
         return self.for_backend(thread_row.get("main_cloud_backend"))
+
+    def for_owner(self, owner: dict[str, Any] | None = None) -> MainCloudBackend:
+        """Resolve the backend for a *fresh* create on behalf of an owner.
+
+        Call sites that mint a brand-new cloud resource (a session folder, a
+        loose-job export folder, a user's personal storage) have no
+        ``main_cloud_backend`` column to dispatch on yet — the resource is
+        created on, and then stamped with, the active backend. Routing those
+        creates through this seam (instead of reading ``active`` directly)
+        keeps *all* backend acquisition going through the router.
+
+        ``owner`` is the user/owner context. It is **reserved** for per-org
+        resolution (owner → org → backend) under multi-tenancy; today every
+        owner resolves to the single global active backend. Adding the
+        parameter now means multi-tenancy later is "fill in the key" here,
+        not a call-site refactor. See Issue 16 in docs/issues/main_cloud.md.
+        """
+        return self._active
 
     async def ensure_initialized(self) -> bool:
         """Initialize the active backend. Called from the FastAPI lifespan."""

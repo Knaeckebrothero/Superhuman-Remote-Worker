@@ -640,12 +640,26 @@ class AgentProvisioner:
         # container's logs, else the agent's.
         target = "tailscale" if category == "tunnel_dark" else "agent"
         exit_code: Any = None
+        reason: Any = None
+        signal: Any = None
         for cs in getattr(pod.status, "container_statuses", None) or []:
             if cs.name != target:
                 continue
             terminated = getattr(getattr(cs, "state", None), "terminated", None)
+            if terminated is None:
+                # Container may have restarted (e.g. OOMKilled then restarted):
+                # the kill reason lives in last_state.terminated, not state.
+                terminated = getattr(
+                    getattr(cs, "last_state", None), "terminated", None
+                )
             if terminated is not None:
                 exit_code = getattr(terminated, "exit_code", None)
+                # reason distinguishes OOMKilled (kernel, memory) from Error
+                # (e.g. liveness-probe SIGKILL on a frozen loop) — the one
+                # signal that tells us which failure mode a 137 exit actually
+                # was. Without it, exit_code=137 alone is ambiguous.
+                reason = getattr(terminated, "reason", None)
+                signal = getattr(terminated, "signal", None)
             break
 
         try:
@@ -660,21 +674,26 @@ class AgentProvisioner:
         except Exception as e:
             logger.warning(
                 "Reap log capture: failed to fetch logs for pod=%s "
-                "(category=%s, exit_code=%s): %s",
+                "(category=%s, exit_code=%s, reason=%s, signal=%s): %s",
                 pod_name,
                 category,
                 exit_code,
+                reason,
+                signal,
                 e,
             )
             return
 
         logger.warning(
             "Reap log capture: pod=%s category=%s phase=%s exit_code=%s "
+            "reason=%s signal=%s "
             "logs_below_marker_BEGIN\n%s\nlogs_below_marker_END pod=%s",
             pod_name,
             category,
             pod.status.phase,
             exit_code,
+            reason,
+            signal,
             log_tail or "(empty)",
             pod_name,
         )
