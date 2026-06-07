@@ -306,7 +306,7 @@ class TestToolNameAliasing:
         config.tools.evaluation = []
         config.tools.knowledge = []
         config.tools.communication = []
-        config.tools.cloud = []
+        config.tools.webdav = []
         config.tools.delegation = []
         config.tools.orchestrator = []
         config.extra = {"shell": {"mode": "stateless"}}
@@ -334,7 +334,7 @@ class TestToolNameAliasing:
         config.tools.evaluation = []
         config.tools.knowledge = []
         config.tools.communication = []
-        config.tools.cloud = []
+        config.tools.webdav = []
         config.tools.delegation = []
         config.tools.orchestrator = []
         config.extra = {"shell": {"mode": "persistent"}}
@@ -362,7 +362,7 @@ class TestToolNameAliasing:
         config.tools.evaluation = []
         config.tools.knowledge = []
         config.tools.communication = []
-        config.tools.cloud = []
+        config.tools.webdav = []
         config.tools.delegation = []
         config.tools.orchestrator = []
         config.extra = {}  # No shell config at all

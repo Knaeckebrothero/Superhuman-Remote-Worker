@@ -5,8 +5,8 @@ attached as a datasource. Read tools (list, read, info) are always available.
 Write tools (write, delete) are only injected when the datasource is not
 marked read-only.
 
-Connection is established by the agent's _create_datasource_connection() and
-injected via ToolContext.get_datasource("webdav").
+Connection is established by datasource_setup.create_datasource_connection()
+and injected via ToolContext.get_datasource("webdav").
 """
 
 import logging
@@ -20,39 +20,39 @@ from ..context import ToolContext
 logger = logging.getLogger(__name__)
 
 
-CLOUD_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
-    "cloud_list": {
-        "module": "cloud.webdav",
-        "function": "cloud_list",
-        "category": "cloud",
+WEBDAV_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
+    "webdav_list": {
+        "module": "webdav.tools",
+        "function": "webdav_list",
+        "category": "webdav",
         "phases": ["strategic", "tactical"],
         "description": "List files and folders in WebDAV",
     },
-    "cloud_read": {
-        "module": "cloud.webdav",
-        "function": "cloud_read",
-        "category": "cloud",
+    "webdav_read": {
+        "module": "webdav.tools",
+        "function": "webdav_read",
+        "category": "webdav",
         "phases": ["strategic", "tactical"],
         "description": "Download a file from WebDAV into the workspace",
     },
-    "cloud_info": {
-        "module": "cloud.webdav",
-        "function": "cloud_info",
-        "category": "cloud",
+    "webdav_info": {
+        "module": "webdav.tools",
+        "function": "webdav_info",
+        "category": "webdav",
         "phases": ["strategic", "tactical"],
         "description": "Get metadata about a file or folder in WebDAV",
     },
-    "cloud_write": {
-        "module": "cloud.webdav",
-        "function": "cloud_write",
-        "category": "cloud",
+    "webdav_write": {
+        "module": "webdav.tools",
+        "function": "webdav_write",
+        "category": "webdav",
         "phases": ["tactical"],
         "description": "Upload a file from the workspace to WebDAV",
     },
-    "cloud_delete": {
-        "module": "cloud.webdav",
-        "function": "cloud_delete",
-        "category": "cloud",
+    "webdav_delete": {
+        "module": "webdav.tools",
+        "function": "webdav_delete",
+        "category": "webdav",
         "phases": ["tactical"],
         "description": "Delete a file or folder from WebDAV",
     },
@@ -75,7 +75,7 @@ def create_webdav_tools(context: ToolContext) -> List[Any]:
     workspace = context.workspace_manager
 
     @tool
-    def cloud_list(path: str = "/", recursive: bool = False) -> str:
+    def webdav_list(path: str = "/", recursive: bool = False) -> str:
         """List files and folders in WebDAV.
 
         Args:
@@ -130,7 +130,7 @@ def create_webdav_tools(context: ToolContext) -> List[Any]:
             return f"Error listing {path}: {e}"
 
     @tool
-    def cloud_read(path: str, target: str = "") -> str:
+    def webdav_read(path: str, target: str = "") -> str:
         """Download a file from WebDAV into the workspace.
 
         Args:
@@ -157,7 +157,7 @@ def create_webdav_tools(context: ToolContext) -> List[Any]:
             return f"Error downloading {path}: {e}"
 
     @tool
-    def cloud_info(path: str) -> str:
+    def webdav_info(path: str) -> str:
         """Get metadata about a file or folder in WebDAV.
 
         Args:
@@ -185,7 +185,7 @@ def create_webdav_tools(context: ToolContext) -> List[Any]:
             return f"Error getting info for {path}: {e}"
 
     @tool
-    def cloud_write(source: str, remote_path: str) -> str:
+    def webdav_write(source: str, remote_path: str) -> str:
         """Upload a file from the workspace to WebDAV.
 
         Args:
@@ -215,7 +215,7 @@ def create_webdav_tools(context: ToolContext) -> List[Any]:
             return f"Error uploading {source} to {remote_path}: {e}"
 
     @tool
-    def cloud_delete(path: str) -> str:
+    def webdav_delete(path: str) -> str:
         """Delete a file or folder from WebDAV.
 
         Args:
@@ -230,7 +230,7 @@ def create_webdav_tools(context: ToolContext) -> List[Any]:
         except Exception as e:
             return f"Error deleting {path}: {e}"
 
-    return [cloud_list, cloud_read, cloud_info, cloud_write, cloud_delete]
+    return [webdav_list, webdav_read, webdav_info, webdav_write, webdav_delete]
 
 
 def _human_size(size_bytes: int) -> str:

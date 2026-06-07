@@ -777,14 +777,14 @@ async def _attach_session(
                 ],
             },
             "webdav": {
-                "category": "cloud",
-                "read": ["cloud_list", "cloud_read", "cloud_info"],
+                "category": "webdav",
+                "read": ["webdav_list", "webdav_read", "webdav_info"],
                 "write": [
-                    "cloud_list",
-                    "cloud_read",
-                    "cloud_info",
-                    "cloud_write",
-                    "cloud_delete",
+                    "webdav_list",
+                    "webdav_read",
+                    "webdav_info",
+                    "webdav_write",
+                    "webdav_delete",
                 ],
             },
         }
