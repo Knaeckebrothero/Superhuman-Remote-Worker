@@ -178,3 +178,63 @@ class TestReloadDispatchesLegacy:
         assert router.for_project(legacy_row) is old
         assert router.for_project(new_row) is new
         assert router.for_project(unknown_row) is new  # None → active
+
+    @pytest.mark.asyncio
+    async def test_for_thread_dispatches_to_demoted(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Issue 16 resume hazard: a thread created on the old backend must
+        still resolve to it after the active backend is swapped, so resume
+        re-provisioning (``main.py`` ``_late_cloud_setup``) does not land on
+        the wrong cloud."""
+        old = FakeMainCloudBackend(start_initialized=True)
+        new = _AltFakeBackend(start_initialized=False)
+        router = MainCloudRouter(old)
+
+        import orchestrator.services.cloud as cloud_pkg
+
+        monkeypatch.setattr(cloud_pkg, "build_backend", lambda *args, **kwargs: new)
+        ok = await router.reload_from_db(
+            {"value": {"backend_id": "fake-alt"}, "credentials_ref": None}
+        )
+        assert ok is True
+
+        pinned_to_old = {"main_cloud_backend": "fake"}
+        pinned_to_new = {"main_cloud_backend": "fake-alt"}
+        unpinned: dict[str, Any] = {}
+
+        assert router.for_thread(pinned_to_old) is old
+        assert router.for_thread(pinned_to_new) is new
+        assert router.for_thread(unpinned) is new  # None → active
+
+
+class TestForOwner:
+    """``for_owner`` is the resolution seam for *fresh* creates that aren't
+    tied to a project/thread row yet (Issue 16). It returns the active
+    backend today; the ``owner`` argument is reserved for per-org resolution
+    under multi-tenancy."""
+
+    def test_returns_active_ignoring_owner(self):
+        active = FakeMainCloudBackend(start_initialized=True)
+        router = MainCloudRouter(active)
+        assert router.for_owner({"id": "u1", "email": "a@b.c"}) is active
+        assert router.for_owner(None) is active
+        assert router.for_owner() is active
+
+    @pytest.mark.asyncio
+    async def test_fresh_create_follows_active_after_swap(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """A fresh create always lands on the *new* active backend after a
+        swap — never on a demoted legacy backend."""
+        old = FakeMainCloudBackend(start_initialized=True)
+        new = _AltFakeBackend(start_initialized=False)
+        router = MainCloudRouter(old)
+
+        import orchestrator.services.cloud as cloud_pkg
+
+        monkeypatch.setattr(cloud_pkg, "build_backend", lambda *args, **kwargs: new)
+        await router.reload_from_db(
+            {"value": {"backend_id": "fake-alt"}, "credentials_ref": None}
+        )
+        assert router.for_owner({"id": "u1"}) is new

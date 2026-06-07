@@ -385,10 +385,12 @@ class ContextConfig:
     placeholder_text: str = "[Result processed - see workspace if needed]"
     tool_retry_count: int = 3
     tool_retry_delay_seconds: float = 1.0
-    # Safety layer constants
+    # Safety layer constants — a base=100_000 instance of the limit fractions in
+    # src/core/loader.py (threshold .80 / safe .90 / chunk .60 / msg_min .40).
+    # Real values come from the matrix derivation; these are fallback-only.
     model_max_context_tokens: int = 100_000
     summarization_safe_limit: int = 90_000
-    summarization_chunk_size: int = 80_000
+    summarization_chunk_size: int = 60_000
     # Evidence-preservation filter: side effects and failures survive compaction
     # so the strategic-phase audit protocol can cite verbatim tool output.
     preserve_tool_names: Tuple[str, ...] = (
@@ -1242,7 +1244,13 @@ class ContextManager:
         )
 
         try:
-            result: ConversationSummary = await auxiliary.chain(task)
+            # Structured summarization gets the full, dedicated summarization
+            # budget — NOT the short interactive auxiliary.timeout that guards
+            # quick aux tasks (memory/titles). A large conversation can't be
+            # summarized under a schema in the ~120s aux window.
+            result: ConversationSummary = await auxiliary.chain(
+                task, timeout=self._summarization_timeout
+            )
 
             # Format into readable text
             parts = []
@@ -1299,7 +1307,13 @@ class ContextManager:
             return summary
 
         except Exception as e:
-            logger.error(f"Structured summarization failed: {e}", exc_info=True)
+            # Sequential, never raced: the structured pass ran and failed
+            # (timeout / schema / endpoint). Log it loudly with the traceback,
+            # then try the cheaper unstructured pass before giving up.
+            logger.error(
+                f"Structured summarization failed, falling back to unstructured: {e}",
+                exc_info=True,
+            )
 
             # Fallback: unstructured summarization using the raw LLM
             try:

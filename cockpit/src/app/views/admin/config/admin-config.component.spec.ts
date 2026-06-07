@@ -275,4 +275,54 @@ describe('AdminConfigComponent', () => {
     component.resetSetting('temperature');
     expect(component.strValue('temperature')).toBe('0.3');
   });
+
+  // --- single-field editor (bundled folded into one editable field) ---
+
+  it('seeds the single editable field from the bundled default when no override exists', () => {
+    const {component} = make();
+    component.onKeyChange('persona');
+    expect(component.bundledContent()).toBe('BUNDLED');
+    expect(component.overrideContent()).toBe('BUNDLED'); // field shows the effective value
+    expect(component.hasOverride()).toBe(false);
+    expect(component.editorLabel()).toContain('default');
+  });
+
+  it('save() is a no-op when the field is unchanged from the active override', () => {
+    const {component, admin, toast} = make({overrides: [PERSONA_OVERRIDE]});
+    component.onKeyChange('persona'); // field seeded to 'EXISTING'
+    component.save();
+    expect(admin.createOverride).not.toHaveBeenCalled();
+    expect(admin.deleteOverride).not.toHaveBeenCalled();
+    expect(toast.info).toHaveBeenCalled();
+  });
+
+  it('save() deletes the override when the field is reset back to the bundled default', () => {
+    const {component, admin, toast} = make({overrides: [PERSONA_OVERRIDE]});
+    component.onKeyChange('persona');
+    component.overrideContent.set('BUNDLED'); // matches the shipped default
+    component.save();
+    expect(admin.deleteOverride).toHaveBeenCalledWith('o1');
+    expect(admin.createOverride).not.toHaveBeenCalled();
+    expect(toast.success).toHaveBeenCalled();
+  });
+
+  it('save() with no override and a field matching bundled just informs', () => {
+    const {component, admin, toast} = make();
+    component.onKeyChange('persona'); // field seeded to 'BUNDLED', no override
+    component.save();
+    expect(admin.createOverride).not.toHaveBeenCalled();
+    expect(admin.deleteOverride).not.toHaveBeenCalled();
+    expect(toast.info).toHaveBeenCalled();
+  });
+
+  it('loadFileIntoEditor rejects a non-text file and leaves the field untouched', () => {
+    const {component, toast} = make();
+    component.onKeyChange('persona');
+    component.overrideContent.set('KEEP ME');
+    component.loadFileIntoEditor(
+      new File(['x'], 'evil.exe', {type: 'application/octet-stream'}),
+    );
+    expect(component.overrideContent()).toBe('KEEP ME');
+    expect(toast.danger).toHaveBeenCalled();
+  });
 });
