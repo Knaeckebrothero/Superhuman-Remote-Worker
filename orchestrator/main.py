@@ -9393,14 +9393,14 @@ def _build_datasource_tool_override(
             ],
         },
         "webdav": {
-            "category": "cloud",
-            "read": ["cloud_list", "cloud_read", "cloud_info"],
+            "category": "webdav",
+            "read": ["webdav_list", "webdav_read", "webdav_info"],
             "write": [
-                "cloud_list",
-                "cloud_read",
-                "cloud_info",
-                "cloud_write",
-                "cloud_delete",
+                "webdav_list",
+                "webdav_read",
+                "webdav_info",
+                "webdav_write",
+                "webdav_delete",
             ],
         },
     }
@@ -17620,22 +17620,14 @@ async def _ensure_project_cloud_resources(
                     project["main_cloud_folder_handle"] = folder_handle.to_db()
                     project["nextcloud_folder_id"] = legacy_id
 
-                    webdav_url = backend.get_project_folder_webdav_url(folder_handle)
-                    if webdav_url:
-                        ds = await postgres_db.create_datasource(
-                            name=f"Cloud Storage ({project_name})",
-                            ds_type="webdav",
-                            connection_url=webdav_url,
-                            description=(
-                                f"Shared file storage for project '{project_name}'"
-                            ),
-                            credentials=backend.webdav_credentials,
-                        )
-                        await postgres_db.link_datasource_to_project(
-                            project_id=project_id_str,
-                            datasource_id=str(ds["id"]),
-                            read_only=False,
-                        )
+                    # The project working folder is intentionally NOT attached
+                    # as a `webdav` datasource: job/session workspaces get the
+                    # folder cloned in (Mode-A baseline for jobs, the `projects/`
+                    # sync mount for sessions), so attaching it here would
+                    # double-expose the same files through the webdav_* tools.
+                    # webdav_* tools are reserved for clouds that are NOT cloned
+                    # (the personal home cloud + externally-attached WebDAV).
+                    # See docs/issues/main_cloud.md (Issue 1 / Issue 8).
                 except Exception as e:
                     logger.warning(
                         f"Failed to create cloud resources for project "
@@ -18741,12 +18733,12 @@ def _build_webdav_note(name: str, desc: str, is_read_only: bool) -> str:
     if desc:
         lines.append(f"\n{desc}")
     lines.append("\n### Available Tools")
-    lines.append("- `cloud_list` — list files and directories")
-    lines.append("- `cloud_read` — read file contents")
-    lines.append("- `cloud_info` — get file metadata")
+    lines.append("- `webdav_list` — list files and directories")
+    lines.append("- `webdav_read` — read file contents")
+    lines.append("- `webdav_info` — get file metadata")
     if not is_read_only:
-        lines.append("- `cloud_write` — write/upload files")
-        lines.append("- `cloud_delete` — delete files")
+        lines.append("- `webdav_write` — write/upload files")
+        lines.append("- `webdav_delete` — delete files")
     return "\n".join(lines)
 
 
