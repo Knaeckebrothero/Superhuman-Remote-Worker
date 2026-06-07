@@ -307,7 +307,20 @@
         "saveFailed": "Override konnte nicht gespeichert werden.",
         "removed": "Override entfernt — zurück zum mitgelieferten Standard.",
         "removeFailed": "Override konnte nicht entfernt werden.",
-        "invalidJson": "Ungültiges JSON — bitte Syntax korrigieren und erneut versuchen."
+        "invalidJson": "Ungültiges JSON — bitte Syntax korrigieren und erneut versuchen.",
+        "matchesDefault": "Entspricht bereits dem mitgelieferten Standard — kein Override nötig.",
+        "noChanges": "Keine Änderungen zu speichern.",
+        "fileUnsupported": "Nicht unterstützte Datei — bitte eine .txt- oder .md-Datei ablegen.",
+        "fileTooLarge": "Datei zu groß — bitte unter 1 MB halten.",
+        "fileLoaded": "{{name}} geladen — prüfen und speichern, um zu übernehmen.",
+        "fileReadError": "Diese Datei konnte nicht gelesen werden.",
+        "settingMustBeNumber": "{{title}} muss eine Zahl sein.",
+        "settingMustBeInteger": "{{title}} muss eine ganze Zahl sein.",
+        "settingMin": "{{title}} muss mindestens {{min}} sein.",
+        "settingMax": "{{title}} darf höchstens {{max}} sein.",
+        "noSettingChanges": "Keine Einstellungsänderungen zu speichern.",
+        "settingsSaved": "Inferenz-Einstellungen gespeichert.",
+        "settingsSaveFailed": "Einstellungen konnten nicht gespeichert werden."
       }
     },
     "providers": {
