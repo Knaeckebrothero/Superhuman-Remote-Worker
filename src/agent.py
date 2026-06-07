@@ -2970,6 +2970,12 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         """Get current agent status and metrics."""
         uptime = (datetime.utcnow() - self._start_time).total_seconds()
 
+        # Auxiliary-task health (memory/curation/titles). Surfaced here so a
+        # silently-degraded auxiliary model is visible on the status endpoint
+        # instead of only in rotating WARNING logs.
+        aux_llm = getattr(self, "_auxiliary_llm", None)
+        aux_health = aux_llm.health.snapshot() if aux_llm is not None else None
+
         return {
             "agent_id": self.config.agent_id,
             "display_name": self.config.display_name,
@@ -2984,4 +2990,5 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             "config": {
                 "model": self.config.llm.model,
             },
+            "auxiliary": aux_health,
         }

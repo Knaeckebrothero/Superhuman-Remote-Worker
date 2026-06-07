@@ -25,10 +25,11 @@ import logging
 import re
 import time
 from typing import Any, Optional
-from urllib.parse import quote, unquote
+from urllib.parse import quote
 
 import httpx
 
+from ._propfind import parse_propfind_entries
 from .base import HealthStatus, UserHome
 from .config import OpenCloudSettings
 from .errors import CloudBackendError, CloudBackendErrorKind
@@ -79,66 +80,6 @@ _FOLDER_EDITOR_ROLE_WEIGHT = 60  # "Can edit" — subfolder invite
 _FOLDER_EDITOR_ROLE_NAME = "Can edit"
 _AGENT_HOME_SPACE_NAME = "srw-agent-home"
 _TOKEN_CLOCK_SKEW_SECONDS = 30.0
-
-
-# PROPFIND response patterns — module-level so they compile once. Used by
-# list_project_folder to walk a Space recursively. The XML matches the
-# existing regex-based approach in _resolve_item_id rather than pulling
-# in a full XML parser; OpenCloud's PROPFIND output is structurally
-# regular enough that this is safe.
-_PROPFIND_RESPONSE_RE = re.compile(
-    r"<d:response[^>]*>(.*?)</d:response>", re.DOTALL | re.IGNORECASE
-)
-_PROPFIND_HREF_RE = re.compile(r"<d:href[^>]*>([^<]+)</d:href>", re.IGNORECASE)
-_PROPFIND_COLLECTION_RE = re.compile(r"<d:collection\s*/>", re.IGNORECASE)
-_PROPFIND_CONTENTLENGTH_RE = re.compile(
-    r"<d:getcontentlength[^>]*>(\d+)</d:getcontentlength>", re.IGNORECASE
-)
-_PROPFIND_ETAG_RE = re.compile(r"<d:getetag[^>]*>([^<]+)</d:getetag>", re.IGNORECASE)
-_PROPFIND_CONTENTTYPE_RE = re.compile(
-    r"<d:getcontenttype[^>]*>([^<]+)</d:getcontenttype>", re.IGNORECASE
-)
-
-
-def _parse_propfind_entries(xml: str, *, href_prefix: str) -> list[ProjectFolderEntry]:
-    """Pull file + directory entries out of a PROPFIND multistatus body.
-
-    ``href_prefix`` is the URL path prefix to strip so returned paths are
-    relative to the folder root (no leading slash). Both ``href_prefix``
-    and the ``<d:href>`` values are URL-decoded before comparison —
-    OpenCloud's response uses literal ``$`` in href even when the request
-    URL had it as ``%24``, which would otherwise break a naive
-    ``startswith`` check. Entries pointing at the root itself (empty path
-    after stripping) are dropped.
-    """
-    decoded_prefix = unquote(href_prefix)
-    entries: list[ProjectFolderEntry] = []
-    for resp in _PROPFIND_RESPONSE_RE.finditer(xml):
-        block = resp.group(1)
-        href_match = _PROPFIND_HREF_RE.search(block)
-        if not href_match:
-            continue
-        href = unquote(href_match.group(1).strip())
-        if not href.startswith(decoded_prefix):
-            continue
-        rel_path = href[len(decoded_prefix) :].rstrip("/")
-        if not rel_path:
-            # The folder root itself shows up first; skip it.
-            continue
-        is_dir = bool(_PROPFIND_COLLECTION_RE.search(block))
-        size_match = _PROPFIND_CONTENTLENGTH_RE.search(block)
-        etag_match = _PROPFIND_ETAG_RE.search(block)
-        ctype_match = _PROPFIND_CONTENTTYPE_RE.search(block)
-        entries.append(
-            ProjectFolderEntry(
-                path=rel_path,
-                is_dir=is_dir,
-                size=int(size_match.group(1)) if size_match else 0,
-                etag=etag_match.group(1).strip().strip('"') if etag_match else "",
-                content_type=ctype_match.group(1).strip() if ctype_match else "",
-            )
-        )
-    return entries
 
 
 class OpenCloudBackend:
@@ -779,7 +720,7 @@ class OpenCloudBackend:
                 status_code=resp.status_code,
                 raw={"body": resp.text[:500]},
             )
-        return _parse_propfind_entries(resp.text, href_prefix=href_prefix)
+        return parse_propfind_entries(resp.text, href_prefix=href_prefix)
 
     @instrument_backend_op("get_project_folder_file_bytes")
     async def get_project_folder_file_bytes(
