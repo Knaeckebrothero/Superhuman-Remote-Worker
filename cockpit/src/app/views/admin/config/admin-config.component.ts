@@ -679,7 +679,7 @@ export class AdminConfigComponent implements OnInit {
       if (existing) {
         this.resetToBundled();
       } else {
-        this.toast.info('Already matches the shipped default — no override needed.');
+        this.toast.info(this.transloco.translate('admin.config.messages.matchesDefault'));
       }
       return;
     }
@@ -692,7 +692,7 @@ export class AdminConfigComponent implements OnInit {
           : ''
         : existing.content ?? '';
       if (current === existingStr) {
-        this.toast.info('No changes to save.');
+        this.toast.info(this.transloco.translate('admin.config.messages.noChanges'));
         return;
       }
     }
@@ -781,19 +781,22 @@ export class AdminConfigComponent implements OnInit {
     const okMime =
       !file.type || file.type.startsWith('text/') || file.type === 'application/json';
     if (!okExt && !okMime) {
-      this.toast.danger('Unsupported file — drop a .txt or .md file.');
+      this.toast.danger(this.transloco.translate('admin.config.messages.fileUnsupported'));
       return;
     }
     if (file.size > 1024 * 1024) {
-      this.toast.danger('File too large — keep it under 1 MB.');
+      this.toast.danger(this.transloco.translate('admin.config.messages.fileTooLarge'));
       return;
     }
     const reader = new FileReader();
     reader.onload = () => {
       this.overrideContent.set(String(reader.result ?? ''));
-      this.toast.success(`Loaded ${file.name} — review and save to apply.`);
+      this.toast.success(
+        this.transloco.translate('admin.config.messages.fileLoaded', {name: file.name}),
+      );
     };
-    reader.onerror = () => this.toast.danger('Could not read that file.');
+    reader.onerror = () =>
+      this.toast.danger(this.transloco.translate('admin.config.messages.fileReadError'));
     reader.readAsText(file);
   }
 
@@ -934,19 +937,37 @@ export class AdminConfigComponent implements OnInit {
         } else {
           const n = Number(raw);
           if (!Number.isFinite(n)) {
-            this.toast.danger(`${e.title} must be a number.`);
+            this.toast.danger(
+              this.transloco.translate('admin.config.messages.settingMustBeNumber', {
+                title: e.title,
+              }),
+            );
             return;
           }
           if (e.type === 'integer' && !Number.isInteger(n)) {
-            this.toast.danger(`${e.title} must be a whole number.`);
+            this.toast.danger(
+              this.transloco.translate('admin.config.messages.settingMustBeInteger', {
+                title: e.title,
+              }),
+            );
             return;
           }
           if (e.min != null && n < e.min) {
-            this.toast.danger(`${e.title} must be at least ${e.min}.`);
+            this.toast.danger(
+              this.transloco.translate('admin.config.messages.settingMin', {
+                title: e.title,
+                min: e.min,
+              }),
+            );
             return;
           }
           if (e.max != null && n > e.max) {
-            this.toast.danger(`${e.title} must be at most ${e.max}.`);
+            this.toast.danger(
+              this.transloco.translate('admin.config.messages.settingMax', {
+                title: e.title,
+                max: e.max,
+              }),
+            );
             return;
           }
           val = n;
@@ -973,14 +994,14 @@ export class AdminConfigComponent implements OnInit {
     }
 
     if (ops.length === 0) {
-      this.toast.info('No setting changes to save.');
+      this.toast.info(this.transloco.translate('admin.config.messages.noSettingChanges'));
       return;
     }
     this.savingSettings.set(true);
     forkJoin(ops).subscribe({
       next: () => {
         this.savingSettings.set(false);
-        this.toast.success('Inference settings saved.');
+        this.toast.success(this.transloco.translate('admin.config.messages.settingsSaved'));
         // Refresh override rows so the badges / diff baseline update. The form
         // already holds the saved values, so we don't re-seed (which could read
         // overrides before this reload lands).
@@ -988,7 +1009,7 @@ export class AdminConfigComponent implements OnInit {
       },
       error: () => {
         this.savingSettings.set(false);
-        this.toast.danger('Failed to save settings.');
+        this.toast.danger(this.transloco.translate('admin.config.messages.settingsSaveFailed'));
       },
     });
   }
