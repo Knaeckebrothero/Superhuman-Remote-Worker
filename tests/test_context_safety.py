@@ -672,9 +672,11 @@ class TestContextSafetyIntegration:
         """Default config values should be safe for 100k effective context."""
         config = ContextConfig()
 
+        # Fallback defaults are a base=100k instance of the loader limit
+        # fractions (safe .90, chunk .60); real values come from the matrix.
         assert config.model_max_context_tokens == 100_000
         assert config.summarization_safe_limit == 90_000
-        assert config.summarization_chunk_size == 80_000
+        assert config.summarization_chunk_size == 60_000
         # Safe limit should leave room for prompt overhead
         assert config.summarization_safe_limit < config.model_max_context_tokens
         # Chunk size should be less than safe limit

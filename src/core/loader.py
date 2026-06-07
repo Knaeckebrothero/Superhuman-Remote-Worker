@@ -22,6 +22,23 @@ VALID_AUTONOMY_LEVELS = {"full", "review", "partial", "guided", "dependent"}
 
 
 # =============================================================================
+# Context-window limit fractions
+# =============================================================================
+# The context-management `limits` leaves are DERIVED as fixed fractions of a
+# single base context-window number (see _apply_settings_matrix). The base is
+# the admin/catalog per-model window when set (injected at dispatch into
+# llm.model_max_context_tokens), else the family's conservative
+# limits.model_max_context_tokens. Fractions are uniform across families:
+# threshold leaves headroom below the window so the summarizer/response have
+# room to work. Keep these in sync with the hardcoded LimitsConfig /
+# ContextConfig fallback defaults (which are a base=100_000 instance of these).
+CONTEXT_THRESHOLD_FRACTION = 0.80
+SUMMARIZATION_SAFE_FRACTION = 0.90
+SUMMARIZATION_CHUNK_FRACTION = 0.60
+MESSAGE_COUNT_MIN_FRACTION = 0.40
+
+
+# =============================================================================
 # DB-backed config overrides (CONFIG_DB_OVERRIDES_ENABLED)
 # =============================================================================
 # Populated once per job by the agent at first run (before
@@ -578,6 +595,28 @@ def _apply_settings_matrix(
         for key, value in limits_settings.items():
             data.setdefault("limits", {})[key] = value
             applied.append(f"limits.{key}={value}")
+
+    # Derive the working-window limit leaves from a single base context window.
+    # Base = the admin/catalog per-model window when explicitly overridden (it
+    # rides in llm.model_max_context_tokens and survived the flat-key loop above
+    # because it's in expert_llm_keys), else the family's conservative
+    # limits.model_max_context_tokens just applied. Invariant: no base config or
+    # expert YAML sets llm.model_max_context_tokens (see config/defaults.yaml),
+    # so its presence in expert_llm_keys means an explicit per-model override.
+    # Runs last so it is the sole authority for the derived leaves.
+    base = None
+    if "model_max_context_tokens" in expert_llm_keys:
+        base = (data.get("llm") or {}).get("model_max_context_tokens")
+    if not base:  # not overridden, or overridden with a falsy value (0/None)
+        base = (data.get("limits") or {}).get("model_max_context_tokens")
+    if base and base > 0:
+        lim = data.setdefault("limits", {})
+        lim["model_max_context_tokens"] = int(base)
+        lim["context_threshold_tokens"] = int(base * CONTEXT_THRESHOLD_FRACTION)
+        lim["summarization_safe_limit"] = int(base * SUMMARIZATION_SAFE_FRACTION)
+        lim["summarization_chunk_size"] = int(base * SUMMARIZATION_CHUNK_FRACTION)
+        lim["message_count_min_tokens"] = int(base * MESSAGE_COUNT_MIN_FRACTION)
+        applied.append(f"limits<-derived(base={int(base)})")
 
     if applied:
         logger.debug(f"Settings matrix ({family}): applied {', '.join(applied)}")
@@ -1168,18 +1207,16 @@ class ResponseValidationConfig:
 class LimitsConfig:
     """Execution limits configuration."""
 
-    context_threshold_tokens: int = (
-        80000  # Safety net default; real value from settings_matrix
-    )
+    # Derived-leaf fallbacks: a base=100_000 instance of the limit fractions
+    # (see CONTEXT_THRESHOLD_FRACTION et al.). Real values come from the matrix
+    # derivation; these only fire when a key is wholly absent (test/edge paths).
+    context_threshold_tokens: int = 80000  # 100_000 * 0.80
     message_count_threshold: int = 200
-    message_count_min_tokens: int = (
-        50000  # Safety net default; real value from settings_matrix
-    )
+    message_count_min_tokens: int = 40000  # 100_000 * 0.40
     tool_retry_count: int = 3
-    # Safety layer constants — real values come from settings_matrix.yaml
     model_max_context_tokens: int = 100000
-    summarization_safe_limit: int = 90000
-    summarization_chunk_size: int = 80000
+    summarization_safe_limit: int = 90000  # 100_000 * 0.90
+    summarization_chunk_size: int = 60000  # 100_000 * 0.60
     response_validation: ResponseValidationConfig = field(
         default_factory=ResponseValidationConfig
     )
@@ -1618,7 +1655,7 @@ def load_agent_config(
         tool_retry_count=limits_data.get("tool_retry_count", 3),
         model_max_context_tokens=limits_data.get("model_max_context_tokens", 100000),
         summarization_safe_limit=limits_data.get("summarization_safe_limit", 90000),
-        summarization_chunk_size=limits_data.get("summarization_chunk_size", 80000),
+        summarization_chunk_size=limits_data.get("summarization_chunk_size", 60000),
         response_validation=_parse_response_validation(
             limits_data.get("response_validation", {})
         ),
@@ -1819,7 +1856,7 @@ def load_agent_config_from_dict(
         tool_retry_count=limits_data.get("tool_retry_count", 3),
         model_max_context_tokens=limits_data.get("model_max_context_tokens", 100000),
         summarization_safe_limit=limits_data.get("summarization_safe_limit", 90000),
-        summarization_chunk_size=limits_data.get("summarization_chunk_size", 80000),
+        summarization_chunk_size=limits_data.get("summarization_chunk_size", 60000),
         response_validation=_parse_response_validation(
             limits_data.get("response_validation", {})
         ),

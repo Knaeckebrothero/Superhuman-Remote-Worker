@@ -298,3 +298,127 @@ class TestSystemProviderRouting:
         result = await main._inject_dispatch_credentials(_job(), override)
 
         assert result["llm"]["provider"] == "openai"
+
+
+# ---------------------------------------------------------------------------
+# Per-model context window injection
+#
+# A catalog/endpoint row's `context_window` drives the agent's working window:
+# it is injected into the section's `model_max_context_tokens` (a flat llm key),
+# survives the agent-side settings-matrix re-apply, and becomes the base for the
+# derived limits. The worker top-level llm gets it via the inline block; phase
+# sections (strategic/tactical, capability="chat") get it via
+# `_inject_model_credentials`. Auxiliary sections (capability="auxiliary") must
+# NOT — their window is not derived this way.
+# ---------------------------------------------------------------------------
+
+CTX_ENDPOINT_ID = "22222222-2222-2222-2222-222222222222"
+CTX_BASE_URL = "http://self-hosted:8000/v1"
+CTX_API_KEY = "sk-ctx-test"
+
+
+@pytest.fixture
+def patched_main_ctx(monkeypatch):
+    """`_resolve_model` returns endpoint-backed metas whose `context_window`
+    varies by model_id: 32000, None, or 0 (the explicit-zero signal)."""
+
+    windows = {"ctx-32k": 32000, "ctx-none": None, "ctx-zero": 0}
+
+    async def fake_resolve(model_id, user_id=None, capability="chat"):
+        if model_id in windows:
+            return ModelMeta(
+                model_id=model_id,
+                provider="openai",
+                family="default",
+                display_name=model_id,
+                origin="custom",
+                endpoint_id=CTX_ENDPOINT_ID,
+                api_key_ref="openai",
+                context_window=windows[model_id],
+            )
+        return None
+
+    monkeypatch.setattr(
+        main, "_resolve_model", AsyncMock(side_effect=fake_resolve), raising=True
+    )
+
+    async def fake_get_endpoint(endpoint_id):
+        if endpoint_id == CTX_ENDPOINT_ID:
+            return {
+                "id": CTX_ENDPOINT_ID,
+                "label": "self-hosted",
+                "base_url": CTX_BASE_URL,
+                "api_key": CTX_API_KEY,
+            }
+        return None
+
+    monkeypatch.setattr(
+        main.postgres_db,
+        "get_user_llm_endpoint",
+        AsyncMock(side_effect=fake_get_endpoint),
+    )
+    monkeypatch.setattr(
+        main.postgres_db, "resolve_api_keys_for_job", AsyncMock(return_value={})
+    )
+    monkeypatch.setattr(
+        main.postgres_db, "get_user_settings", AsyncMock(return_value={})
+    )
+    monkeypatch.setattr(
+        main.postgres_db,
+        "resolve_default_for_capability",
+        AsyncMock(return_value=None),
+    )
+
+
+class TestContextWindowInjection:
+    @pytest.mark.asyncio
+    async def test_top_level_window_injected(self, patched_main_ctx):
+        """A per-model context_window lands on the top-level llm section."""
+        result = await main._inject_dispatch_credentials(
+            _job(), {"llm": {"model": "ctx-32k"}}
+        )
+        assert result["llm"]["model_max_context_tokens"] == 32000
+        # Routing creds still injected alongside.
+        assert result["llm"]["base_url"] == CTX_BASE_URL
+
+    @pytest.mark.asyncio
+    async def test_none_window_not_injected(self, patched_main_ctx):
+        """No context_window → the key is absent (agent falls back to family)."""
+        result = await main._inject_dispatch_credentials(
+            _job(), {"llm": {"model": "ctx-none"}}
+        )
+        assert "model_max_context_tokens" not in result["llm"]
+
+    @pytest.mark.asyncio
+    async def test_zero_window_not_injected(self, patched_main_ctx):
+        """Explicit 0 is rejected by the truthy guard (Pydantic round-trips 0)."""
+        result = await main._inject_dispatch_credentials(
+            _job(), {"llm": {"model": "ctx-zero"}}
+        )
+        assert "model_max_context_tokens" not in result["llm"]
+
+    @pytest.mark.asyncio
+    async def test_caller_pinned_window_wins(self, patched_main_ctx):
+        """Injection is additive (setdefault) — an explicit window wins."""
+        result = await main._inject_dispatch_credentials(
+            _job(), {"llm": {"model": "ctx-32k", "model_max_context_tokens": 64000}}
+        )
+        assert result["llm"]["model_max_context_tokens"] == 64000
+
+    @pytest.mark.asyncio
+    async def test_chat_phase_section_gets_window(self, patched_main_ctx):
+        """Strategic/tactical phase pins (capability='chat') get the window."""
+        result = await main._inject_dispatch_credentials(
+            _job(), {"llm": {"tactical": {"model": "ctx-32k"}}}
+        )
+        assert result["llm"]["tactical"]["model_max_context_tokens"] == 32000
+
+    @pytest.mark.asyncio
+    async def test_auxiliary_section_does_not_get_window(self, patched_main_ctx):
+        """Capability gating: auxiliary sections are not context-window-derived,
+        but still get their routing creds."""
+        result = await main._inject_dispatch_credentials(
+            _job(), {"auxiliary": {"model": "ctx-32k"}}
+        )
+        assert result["auxiliary"]["base_url"] == CTX_BASE_URL
+        assert "model_max_context_tokens" not in result["auxiliary"]
