@@ -16,7 +16,7 @@ import json
 import logging
 import os
 import sys
-from typing import TYPE_CHECKING, AsyncIterator, Iterator, Optional
+from typing import TYPE_CHECKING, Any, AsyncIterator, Iterator, Optional
 
 import httpx
 from langchain_core.messages import AIMessageChunk
@@ -261,6 +261,37 @@ def _extract_responses_api_reasoning(message) -> None:
     )
 
 
+def _extract_text_from_reasoning_details(details: Any) -> Optional[str]:
+    """Extract readable text from OpenRouter reasoning_details blocks."""
+    if not isinstance(details, list):
+        return None
+
+    parts: list[str] = []
+    for item in details:
+        if not isinstance(item, dict):
+            continue
+        text = item.get("text")
+        if isinstance(text, str) and text:
+            parts.append(text)
+
+        for key in ("summary", "content"):
+            nested = item.get(key)
+            if isinstance(nested, str) and nested:
+                parts.append(nested)
+            elif isinstance(nested, list):
+                for nested_item in nested:
+                    if isinstance(nested_item, str) and nested_item:
+                        parts.append(nested_item)
+                    elif isinstance(nested_item, dict):
+                        nested_text = nested_item.get("text")
+                        if isinstance(nested_text, str) and nested_text:
+                            parts.append(nested_text)
+
+    if not parts:
+        return None
+    return "\n".join(parts)
+
+
 def _extract_reasoning_from_response(data: dict) -> Optional[str]:
     """Extract reasoning text from a chat completion response.
 
@@ -283,14 +314,9 @@ def _extract_reasoning_from_response(data: dict) -> Optional[str]:
         return msg["reasoning"]
 
     # 3. OpenRouter reasoning_details array
-    details = msg.get("reasoning_details")
-    if details and isinstance(details, list):
-        parts = []
-        for item in details:
-            if isinstance(item, dict) and item.get("text"):
-                parts.append(item["text"])
-        if parts:
-            return "\n".join(parts)
+    details_text = _extract_text_from_reasoning_details(msg.get("reasoning_details"))
+    if details_text:
+        return details_text
 
     return None
 
@@ -302,8 +328,7 @@ def _extract_reasoning_from_delta(delta: dict) -> Optional[str]:
     per-chunk ``delta`` object rather than a finished ``message``.
     Returns ``None`` when the chunk carries no readable reasoning text.
 
-    OpenRouter's ``reasoning_details`` array is excluded here intentionally
-    — it only appears on full responses, not in streaming deltas.
+    OpenRouter also streams ``reasoning_details`` arrays on some models.
     """
     if not isinstance(delta, dict):
         return None
@@ -313,6 +338,9 @@ def _extract_reasoning_from_delta(delta: dict) -> Optional[str]:
     r = delta.get("reasoning")
     if isinstance(r, str) and r:
         return r
+    details_text = _extract_text_from_reasoning_details(delta.get("reasoning_details"))
+    if details_text:
+        return details_text
     return None
 
 

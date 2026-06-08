@@ -1996,6 +1996,9 @@ class TestLLMStreaming:
         callbacks.on_token.assert_called_once_with(
             "⚠ The model returned an empty response. Please try again or switch models."
         )
+        assert messages[-1].content == (
+            "⚠ The model returned an empty response. Please try again or switch models."
+        )
         assert result.error is None
 
     @pytest.mark.asyncio

@@ -2533,6 +2533,10 @@ def _create_openrouter_llm(
         "api_key": api_key,
         "base_url": base_url,
         "max_retries": config.max_retries,
+        # OpenRouter supports its reasoning object on Chat Completions.
+        # LangChain infers the Responses API whenever ``reasoning`` is set,
+        # which is not compatible with all OpenRouter-routed models.
+        "use_responses_api": False,
     }
     if config.top_p is not None:
         llm_kwargs["top_p"] = config.top_p
