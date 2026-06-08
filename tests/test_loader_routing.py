@@ -247,6 +247,7 @@ class TestOpenRouterLLMCreation:
         call_kwargs = mock_chat.call_args[1]
         assert call_kwargs["model"] == "anthropic/claude-opus-4"
         assert call_kwargs["base_url"] == "https://openrouter.ai/api/v1"
+        assert call_kwargs["use_responses_api"] is False
 
     @patch.dict(os.environ, {"OPENROUTER_API_KEY": "sk-or-test-key"}, clear=False)
     @patch("src.core.loader.ReasoningChatOpenAI")
@@ -301,6 +302,7 @@ class TestOpenRouterLLMCreation:
         # reasoning is a first-class kwarg (not nested in model_kwargs)
         # to avoid LangChain warning about unknown model_kwargs
         assert call_kwargs["reasoning"] == {"effort": "high"}
+        assert call_kwargs["use_responses_api"] is False
         assert "reasoning" not in call_kwargs.get("model_kwargs", {})
 
     def test_missing_api_key_raises(self):
@@ -393,6 +395,7 @@ class TestOpenRouterReasoningFormat:
 
         call_kwargs = mock_chat.call_args[1]
         assert call_kwargs["reasoning"] == {"effort": "xhigh"}
+        assert call_kwargs["use_responses_api"] is False
 
     @patch.dict(os.environ, {"OPENROUTER_API_KEY": "sk-or-test-key"}, clear=False)
     @patch("src.core.loader.ReasoningChatOpenAI")
@@ -407,6 +410,7 @@ class TestOpenRouterReasoningFormat:
 
         call_kwargs = mock_chat.call_args[1]
         assert call_kwargs["reasoning"] == {"effort": "minimal"}
+        assert call_kwargs["use_responses_api"] is False
 
 
 class TestCodexLLMCreation:
