@@ -998,7 +998,9 @@
       "generating": "Sprache wird erzeugt…",
       "error": "Sprache fehlgeschlagen — zum Wiederholen klicken",
       "spokenVersion": "Gesprochene Fassung",
-      "part": "Teil {{current}} von {{total}}"
+      "part": "Teil {{current}} von {{total}}",
+      "preparing": "Audio wird vorbereitet…",
+      "generatingPart": "Teil {{current}} von {{total}} wird erzeugt…"
     },
     "code": {
       "expandHint": "Klicken zum Ausklappen",

@@ -1342,6 +1342,86 @@ class TestExecuteTurnInterrupt:
 
 
 # ---------------------------------------------------------------------------
+# 1.6 _execute_turn — incremental persistence (Phase 2)
+# ---------------------------------------------------------------------------
+
+
+class TestExecuteTurnIncrementalPersistence:
+    """persist_message must fire for each message the instant it's produced, so
+    a mid-turn crash keeps the tail (docs/issues/...midturn_message_loss.md)."""
+
+    def _sequenced_llm(self, responses):
+        """LLM whose astream yields a different response on each call."""
+        idx = [0]
+
+        async def _astream(messages, **kw):
+            r = responses[min(idx[0], len(responses) - 1)]
+            idx[0] += 1
+            yield r
+
+        llm = AsyncMock()
+        llm.reasoning = None
+        llm.astream = _astream
+        return llm
+
+    @pytest.mark.asyncio
+    async def test_persists_ai_and_tool_messages_as_produced(self):
+        ai_with_tool = AIMessage(
+            content="",
+            tool_calls=[{"name": "test_tool", "args": {}, "id": "tc1"}],
+        )
+        ai_final = AIMessage(content="done")
+
+        persisted = []
+        callbacks = _make_callbacks(
+            persist_message=AsyncMock(side_effect=lambda m: persisted.append(m))
+        )
+        messages = [SystemMessage(content="sys"), HumanMessage(content="go")]
+
+        await _execute_turn(
+            llm_with_tools=self._sequenced_llm([ai_with_tool, ai_final]),
+            tool_map={"test_tool": _make_tool("test_tool", "result")},
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
+            messages=messages,
+            callbacks=callbacks,
+            llm_timeout=600,
+            auxiliary_llm=None,
+            config=_make_config(),
+        )
+
+        # AIMessage(tool call) → ToolMessage(result) → AIMessage(final),
+        # each persisted the moment it entered history.
+        assert [getattr(m, "type", None) for m in persisted] == ["ai", "tool", "ai"]
+        assert persisted[0].tool_calls, "the AI step's tool calls must be persisted"
+        assert persisted[1].tool_call_id == "tc1", "tool result keeps its link"
+        # Every persisted message carries a stable id → reconciliation upserts.
+        assert all(getattr(m, "id", None) for m in persisted)
+
+    @pytest.mark.asyncio
+    async def test_no_persist_callback_is_a_noop(self):
+        """Back-compat: a turn runs fine when the transport wires no
+        persist_message (callback defaults to None)."""
+        callbacks = _make_callbacks()  # no persist_message
+        assert callbacks.persist_message is None
+        messages = [SystemMessage(content="sys"), HumanMessage(content="go")]
+        result = await _execute_turn(
+            llm_with_tools=self._sequenced_llm([AIMessage(content="hi")]),
+            tool_map={},
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
+            messages=messages,
+            callbacks=callbacks,
+            llm_timeout=600,
+            auxiliary_llm=None,
+            config=_make_config(),
+        )
+        assert result.messages_added >= 1
+
+
+# ---------------------------------------------------------------------------
 # 1.6 _execute_turn — memory retrieval
 # ---------------------------------------------------------------------------
 

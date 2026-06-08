@@ -134,3 +134,127 @@ async def test_get_latest_compaction_checkpoint_handles_missing_boundary_turn():
     assert result["boundary_turn"] is None, (
         "absent boundary_turn must surface as None so restore falls back to Path B"
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: seq-cursor resume (seq_gt) + boundary resolution
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_history_seq_gt_filters_and_orders_by_seq():
+    """Resume on the seq cursor: seq > S, ordered by seq ASC (insertion order)."""
+    db = PostgresDB.__new__(PostgresDB)
+    db.fetch = AsyncMock(return_value=[])
+    await db.get_thread_messages_history("t1", limit=None, seq_gt=42)
+    sql = " ".join(db.fetch.call_args[0][0].split())
+    assert "seq >" in sql, "seq_gt must add a seq filter"
+    assert "ORDER BY seq ASC" in sql, "seq cursor must order by seq, not turn"
+    assert "role <> 'summary'" in sql, "summary exclusion preserved"
+    assert 42 in db.fetch.call_args[0][1:], "boundary seq must be a bound param"
+
+
+@pytest.mark.asyncio
+async def test_history_without_seq_gt_keeps_turn_ordering():
+    """Back-compat: no seq_gt → original turn/created_at ordering, no seq filter."""
+    db = PostgresDB.__new__(PostgresDB)
+    db.fetch = AsyncMock(return_value=[])
+    await db.get_thread_messages_history("t1")
+    sql = " ".join(db.fetch.call_args[0][0].split())
+    assert "seq >" not in sql
+    assert "ORDER BY turn_number ASC" in sql
+
+
+@pytest.mark.asyncio
+async def test_get_seq_for_message_id_coerces_and_returns_seq():
+    import uuid
+
+    from src.database.postgres_db import _THREAD_MSG_ID_NS
+
+    db = PostgresDB.__new__(PostgresDB)
+    db.fetchrow = AsyncMock(return_value={"seq": 99})
+    seq = await db.get_seq_for_message_id("t1", "chatcmpl-xyz")
+    assert seq == 99
+    sql = " ".join(db.fetchrow.call_args[0][0].split())
+    assert "SELECT seq FROM thread_messages" in sql
+    # The provider id is coerced to its UUID row id for the lookup.
+    assert db.fetchrow.call_args[0][2] == str(
+        uuid.uuid5(_THREAD_MSG_ID_NS, "chatcmpl-xyz")
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_seq_for_message_id_returns_none_when_absent():
+    """Unpersisted boundary (transient injection / fresh resume id) → None."""
+    db = PostgresDB.__new__(PostgresDB)
+    db.fetchrow = AsyncMock(return_value=None)
+    assert await db.get_seq_for_message_id("t1", "m_x") is None
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_surfaces_boundary_seq():
+    db = PostgresDB.__new__(PostgresDB)
+    db.fetchrow = AsyncMock(
+        return_value={
+            "content": "summary",
+            "metrics": '{"boundary_turn": 7, "boundary_seq": 780}',
+            "turn_number": 8,
+        }
+    )
+    result = await db.get_latest_compaction_checkpoint("t1")
+    assert result["boundary_seq"] == 780
+    assert result["boundary_turn"] == 7
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: resume floor (newest_first)
+# ---------------------------------------------------------------------------
+
+
+def _full_row(mid, turn):
+    """A thread_messages row with every column the reader maps."""
+    return {
+        "id": mid,
+        "role": "ai",
+        "content": f"c{mid}",
+        "tool_calls": None,
+        "turn_number": turn,
+        "metrics": None,
+        "tool_call_id": None,
+        "thinking": None,
+        "reasoning": None,
+        "tool_results": None,
+        "provider": None,
+        "provider_raw": None,
+        "additional_kwargs": None,
+        "response_metadata": None,
+        "created_at": None,
+    }
+
+
+@pytest.mark.asyncio
+async def test_newest_first_selects_seq_desc_and_returns_chronological():
+    """The resume floor takes the NEWEST N (seq DESC + LIMIT) but hands them
+    back oldest→newest so the restored context reads chronologically."""
+    db = PostgresDB.__new__(PostgresDB)
+    # The DB returns rows newest-first under ORDER BY seq DESC.
+    db.fetch = AsyncMock(
+        return_value=[_full_row("n3", 3), _full_row("n2", 2), _full_row("n1", 1)]
+    )
+    rows = await db.get_thread_messages_history("t1", limit=1000, newest_first=True)
+    sql = " ".join(db.fetch.call_args[0][0].split())
+    assert "ORDER BY seq DESC" in sql, "newest_first must select by seq DESC"
+    assert "LIMIT" in sql, "the floor must cap the row count"
+    assert [r["id"] for r in rows] == ["n1", "n2", "n3"], "result must be chronological"
+
+
+@pytest.mark.asyncio
+async def test_newest_first_composes_with_seq_cursor():
+    """The floor and the boundary_seq cursor combine: newest N of seq > S."""
+    db = PostgresDB.__new__(PostgresDB)
+    db.fetch = AsyncMock(return_value=[])
+    await db.get_thread_messages_history("t1", limit=500, seq_gt=42, newest_first=True)
+    sql = " ".join(db.fetch.call_args[0][0].split())
+    assert "seq >" in sql and "ORDER BY seq DESC" in sql
+    args = db.fetch.call_args[0]
+    assert 42 in args[1:] and 500 in args[1:]
