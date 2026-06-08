@@ -577,6 +577,13 @@ class ContextManager:
         self.token_counter = self._default_counter
         self._state = ContextManagementState()
         self._summarization_timeout = summarization_timeout
+        # Set by summarize_and_compact to the id of the last message the newest
+        # summary covers (the summarized/kept boundary). The persistent-session
+        # transport reads it to record a message-granular `boundary_seq` on the
+        # summary row so resume loads `summary + messages after the boundary`
+        # instead of whole post-boundary turns. None when the last call did not
+        # actually compact. See docs/issues/persistent_session_midturn_message_loss.md.
+        self._last_compaction_boundary_id: Optional[str] = None
 
     def set_current_phase(self, phase: str) -> None:
         """Switch token counter to the appropriate phase-specific model.
@@ -1523,6 +1530,11 @@ class ContextManager:
         """
         from src.core.workspace_injection import is_workspace_injection_message
 
+        # Reset the boundary marker; only a real compaction (final return below)
+        # sets it. A no-op / skipped compaction leaves it None so the transport
+        # falls back to boundary_turn rather than recording a stale boundary_seq.
+        self._last_compaction_boundary_id = None
+
         # Filter out workspace injection messages BEFORE processing
         # They are transient and will be re-injected fresh after summarization
         messages = [m for m in messages if not is_workspace_injection_message(m)]
@@ -1714,6 +1726,17 @@ class ContextManager:
             f"Compacted {len(messages)} messages to {len(system_msgs) + 1 + len(fresh_recent)} "
             f"(summarized {len(messages_to_summarize)} messages{merged_summaries_info}, "
             f"removing {len(removal_markers)}, {messages_without_ids} without IDs)"
+        )
+
+        # Record the summarized/kept boundary for the persistent transport: the
+        # newest message the summary covers is original_conversation[safe_start-1]
+        # (original, not sanitized, so the id matches the persisted row). Its seq
+        # becomes boundary_seq, so resume loads exactly the messages after it
+        # (seq > boundary_seq), never whole post-boundary turns.
+        self._last_compaction_boundary_id = (
+            getattr(original_conversation[safe_start - 1], "id", None)
+            if safe_start >= 1
+            else None
         )
 
         # Return: removal markers + system messages + summary + fresh recent

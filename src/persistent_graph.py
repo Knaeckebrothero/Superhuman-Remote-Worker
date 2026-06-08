@@ -67,6 +67,22 @@ def _sanitize_ai_response(response: AIMessage) -> AIMessage:
     return response
 
 
+def _ensure_msg_id(msg: Any) -> Any:
+    """Stamp a stable id on a message that lacks one, at creation time.
+
+    Every persisted ``thread_messages`` row needs a deterministic key so that
+    incremental persistence and the turn-complete reconciliation pass upsert
+    onto one row (``ON CONFLICT (id)``) instead of duplicating, and so a
+    crash-resumed tail keeps the same ids. ``AIMessage`` already gets an id in
+    ``_sanitize_ai_response``; ``HumanMessage``/``ToolMessage`` do not, so we
+    stamp them here. Uses the same ``msg_`` prefix for a uniform id space.
+    See docs/issues/persistent_session_midturn_message_loss.md.
+    """
+    if getattr(msg, "id", None) is None:
+        msg.id = f"msg_{_uuid.uuid4().hex[:24]}"
+    return msg
+
+
 # Sentinel values for user input queue
 INTERRUPT_SENTINEL = "__INTERRUPT__"
 APPROVE_SENTINEL = "__APPROVE__"
@@ -153,6 +169,14 @@ class PersistentLoopCallbacks:
     # so it can persist a display marker + show a banner. Optional.
     # Args: (summary_text, before_count, after_count).
     on_context_compacted: Optional[Callable[[str, int, int], Awaitable[None]]] = None
+
+    # Persist a single message the instant the loop produces it (incremental
+    # durability — a mid-turn crash keeps the tail instead of discarding the
+    # whole in-flight turn). Called per AIMessage / ToolMessage as it is
+    # appended to history; the turn-complete save reconciles (fills in
+    # turn-level metrics / approval decisions via an idempotent upsert).
+    # Optional: None ⇒ persist only at turn-complete (back-compat).
+    persist_message: Optional[Callable[[Any], Awaitable[None]]] = None
 
     # Set by the transport alongside a "hard" interrupt so the loop can cancel
     # a blocked LLM / auxiliary await immediately — the cooperative
@@ -347,7 +371,7 @@ async def run_persistent_loop(
 
         turn_count += 1
         turn_id = turn_count
-        messages.append(HumanMessage(content=user_input))
+        messages.append(_ensure_msg_id(HumanMessage(content=user_input)))
 
         await callbacks.on_turn_start(turn_id)
         tool_calls_this_turn = 0
@@ -472,6 +496,17 @@ async def _execute_turn(
     """
     tool_calls_made = 0
     messages_added = 0
+
+    async def _persist(msg: Any) -> None:
+        """Persist a message the instant it's appended to history.
+
+        Incremental durability: a crash mid-turn keeps everything produced so
+        far instead of discarding the whole in-flight turn. No-op when the
+        transport didn't wire ``persist_message``; the turn-complete save
+        reconciles either way.
+        """
+        if callbacks.persist_message is not None:
+            await callbacks.persist_message(msg)
 
     # --- Memory retrieval (once per turn, before the inner loop) ---
     memory_block = ""
@@ -1023,6 +1058,9 @@ async def _execute_turn(
         # Add AI response to message history
         messages.append(response)
         messages_added += 1
+        # Persist the LLM step immediately — it carries the reasoning + tool
+        # calls and is the expensive bit to lose on a mid-turn crash.
+        await _persist(response)
 
         # No tool calls? Turn is done.
         if not hasattr(response, "tool_calls") or not response.tool_calls:
@@ -1035,12 +1073,15 @@ async def _execute_turn(
                 logger.info(f"Interrupt received before tool {tool_call['name']}")
                 for remaining in response.tool_calls[i:]:
                     messages.append(
-                        ToolMessage(
-                            content="Interrupted by user.",
-                            tool_call_id=remaining["id"],
+                        _ensure_msg_id(
+                            ToolMessage(
+                                content="Interrupted by user.",
+                                tool_call_id=remaining["id"],
+                            )
                         )
                     )
                     messages_added += 1
+                    await _persist(messages[-1])
                 return TurnResult(
                     turn_id=0,
                     messages_added=messages_added,
@@ -1058,12 +1099,15 @@ async def _execute_turn(
             )
             if not approved:
                 messages.append(
-                    ToolMessage(
-                        content="User denied this tool call.",
-                        tool_call_id=tool_call_id,
+                    _ensure_msg_id(
+                        ToolMessage(
+                            content="User denied this tool call.",
+                            tool_call_id=tool_call_id,
+                        )
                     )
                 )
                 messages_added += 1
+                await _persist(messages[-1])
                 continue
 
             # Notify client
@@ -1074,12 +1118,15 @@ async def _execute_turn(
             if tool is None:
                 error_result = f"Tool '{tool_name}' not found"
                 messages.append(
-                    ToolMessage(content=error_result, tool_call_id=tool_call_id)
+                    _ensure_msg_id(
+                        ToolMessage(content=error_result, tool_call_id=tool_call_id)
+                    )
                 )
                 await callbacks.on_tool_result(
                     tool_name, error_result, tool_call_id, is_error=True
                 )
                 messages_added += 1
+                await _persist(messages[-1])
                 continue
 
             is_error = False
@@ -1097,18 +1144,26 @@ async def _execute_turn(
             # HumanMessage so multimodal primary models actually see it.
             cleaned_str, extracted_images = extract_image_tags(result_str)
 
-            messages.append(ToolMessage(content=cleaned_str, tool_call_id=tool_call_id))
+            messages.append(
+                _ensure_msg_id(
+                    ToolMessage(content=cleaned_str, tool_call_id=tool_call_id)
+                )
+            )
             messages_added += 1
             tool_calls_made += 1
+            await _persist(messages[-1])
 
             if extracted_images:
                 messages.append(
-                    make_multimodal_user_message(
-                        text=(f"Image content from tool call {tool_call_id}:"),
-                        images=extracted_images,
+                    _ensure_msg_id(
+                        make_multimodal_user_message(
+                            text=(f"Image content from tool call {tool_call_id}:"),
+                            images=extracted_images,
+                        )
                     )
                 )
                 messages_added += 1
+                await _persist(messages[-1])
 
             await callbacks.on_tool_result(
                 tool_name, cleaned_str, tool_call_id, is_error=is_error

@@ -1851,28 +1851,70 @@
         color: var(--danger, #c44);
       }
 
-      /* Native <audio> player shown once a turn's speech is generated. The
-         surrounding .message-actions dims to 0.55 until hover — right for the
-         tiny button, but a player should stay fully visible (and a child can't
-         raise its parent's composited opacity, so override on the parent). */
-      .message-actions:has(.tts-player) {
+      /* The read-aloud control is a primary affordance — keep it large and
+         fully visible (not a subtle hover-dimmed action) so it isn't missed. */
+      .tts-btn {
+        width: 44px;
+        height: 44px;
+      }
+
+      .message-actions:has(.tts-btn) {
         opacity: 1;
       }
 
+      /* One audio player per section, stacked vertically. color-scheme:dark
+         renders the native controls in dark to fit the theme (vs the default
+         white pill). */
+      .tts-players {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        margin-top: 6px;
+      }
+
+      .tts-player-row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+
       .tts-player {
-        width: 100%;
-        max-width: 320px;
+        color-scheme: dark;
+        flex: 0 1 320px;
         height: 32px;
       }
 
-      /* "Part i of N" line under the player for multi-chunk playback. */
-      .tts-progress {
+      .tts-part {
+        font-size: 18px;
+        color: var(--text-muted);
+        white-space: nowrap;
+      }
+
+      /* "Generating part N…" (synthesizing) + "Preparing…" (planning) rows. */
+      .tts-prep,
+      .tts-status {
         display: flex;
         align-items: center;
-        gap: 6px;
-        margin-top: 4px;
-        font-size: 12px;
+        gap: 8px;
+        font-size: 18px;
         color: var(--text-muted);
+      }
+
+      .tts-prep {
+        margin-top: 6px;
+      }
+
+      .tts-status {
+        margin-top: 2px;
+      }
+
+      /* Larger spinner for the read-aloud status rows. The shared
+         .action-spinner-sm stays 12px elsewhere (e.g. the transcribe hint). */
+      .tts-prep .action-spinner-sm,
+      .tts-status .action-spinner-sm {
+        width: 22px;
+        height: 22px;
+        border-width: 3px;
       }
 
       /* "Spoken version" disclosure — reuses .thinking-block styling; the text
