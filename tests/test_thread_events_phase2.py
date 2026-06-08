@@ -226,7 +226,6 @@ class TestPersistentGraphInterruptModes:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=config,
         )
 
@@ -286,7 +285,6 @@ class TestPersistentGraphInterruptModes:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=config,
         )
 

@@ -20,7 +20,8 @@ import asyncio
 import logging
 import time
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, List, Optional, Type
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Type
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import (
@@ -364,6 +365,126 @@ def _get_model_name(llm: BaseChatModel) -> str:
     return "unknown"
 
 
+@dataclass
+class _TaskHealth:
+    """Outcome counters for one auxiliary task family (e.g. memory_extraction)."""
+
+    successes: int = 0
+    failures: int = 0
+    consecutive_failures: int = 0
+    last_error: Optional[str] = None
+    last_error_type: Optional[str] = None
+    last_failure_at: Optional[float] = None  # epoch seconds
+    last_success_at: Optional[float] = None
+
+
+class AuxHealth:
+    """Tracks auxiliary-task call outcomes so silent failures become visible.
+
+    Auxiliary tasks (memory extraction/curation/assembly, session title
+    generation) are deliberately *non-fatal*: their callers swallow exceptions
+    so a degraded auxiliary model never fails a job or a chat turn. The cost is
+    invisibility — on 2026-06-03 the auxiliary backend was unreachable for ~3
+    days and produced no user- or operator-facing signal (no memories, no
+    titles), because every failure logged at WARNING and was dropped.
+
+    This tracker turns *sustained* failure into a single, alertable ERROR and
+    exposes a snapshot via the agent status endpoint. It never changes control
+    flow — callers still swallow and continue — and is itself best-effort.
+
+    See docs/issues/surface_silent_aux_failures.md.
+    """
+
+    #: Consecutive failures (across any task) before the degraded ERROR fires.
+    ESCALATE_AFTER = 3
+    #: While degraded, re-emit the ERROR every Nth further failure so the alert
+    #: stays live without flooding the log.
+    REPEAT_EVERY = 20
+
+    def __init__(self, model: str = "unknown") -> None:
+        self.model = model
+        self._tasks: Dict[str, _TaskHealth] = {}
+        self._consecutive_failures = 0
+        self._degraded = False
+
+    def _task(self, task: str) -> _TaskHealth:
+        t = self._tasks.get(task)
+        if t is None:
+            t = _TaskHealth()
+            self._tasks[task] = t
+        return t
+
+    def record_success(self, task: str) -> None:
+        """Record a successful auxiliary call; clears any degraded state."""
+        t = self._task(task)
+        t.successes += 1
+        t.consecutive_failures = 0
+        t.last_success_at = time.time()
+        self._consecutive_failures = 0
+        if self._degraded:
+            self._degraded = False
+            logger.error(
+                "AUXILIARY MODEL RECOVERED: model=%s — task '%s' succeeded; "
+                "memory/curation/titles resume.",
+                self.model,
+                task,
+            )
+
+    def record_failure(self, task: str, exc: BaseException) -> None:
+        """Record a failed auxiliary call; escalates once it becomes sustained."""
+        t = self._task(task)
+        t.failures += 1
+        t.consecutive_failures += 1
+        t.last_error = str(exc)[:300]
+        t.last_error_type = type(exc).__name__
+        t.last_failure_at = time.time()
+        self._consecutive_failures += 1
+
+        n = self._consecutive_failures
+        should_log = False
+        if not self._degraded and n >= self.ESCALATE_AFTER:
+            self._degraded = True
+            should_log = True
+        elif self._degraded and (n - self.ESCALATE_AFTER) % self.REPEAT_EVERY == 0:
+            should_log = True
+        if should_log:
+            logger.error(
+                "AUXILIARY MODEL DEGRADED: model=%s — %d consecutive auxiliary "
+                "failures (latest task '%s': %s: %s). Memory extraction, "
+                "knowledge curation and session titles are silently disabled "
+                "until the auxiliary model is reachable again.",
+                self.model,
+                n,
+                task,
+                t.last_error_type,
+                t.last_error,
+            )
+
+    @property
+    def degraded(self) -> bool:
+        return self._degraded
+
+    def snapshot(self) -> Dict[str, Any]:
+        """JSON-serializable health summary for status endpoints."""
+        return {
+            "model": self.model,
+            "degraded": self._degraded,
+            "consecutive_failures": self._consecutive_failures,
+            "tasks": {
+                name: {
+                    "successes": t.successes,
+                    "failures": t.failures,
+                    "consecutive_failures": t.consecutive_failures,
+                    "last_error_type": t.last_error_type,
+                    "last_error": t.last_error,
+                    "last_failure_at": t.last_failure_at,
+                    "last_success_at": t.last_success_at,
+                }
+                for name, t in self._tasks.items()
+            },
+        }
+
+
 class AuxiliaryLLM:
     """Unified support task execution with chain and agent modes.
 
@@ -389,6 +510,8 @@ class AuxiliaryLLM:
         self._archiver = archiver
         self._job_id = job_id
         self._agent_type = agent_type or "unknown"
+        #: Observability for silent non-fatal failures (see AuxHealth).
+        self.health = AuxHealth(model=_get_model_name(llm))
 
     def set_job_context(
         self,
@@ -401,13 +524,17 @@ class AuxiliaryLLM:
         self._job_id = job_id
         self._agent_type = agent_type
 
-    async def chain(self, task: AuxTask) -> BaseModel:
+    async def chain(self, task: AuxTask, timeout: Optional[float] = None) -> BaseModel:
         """Single LLM call: system prompt + context -> structured output.
 
         For tasks that need reasoning but no tool access.
 
         Args:
             task: AuxTask instance with system_prompt, build_context(), output_schema
+            timeout: Per-call timeout override (seconds). Defaults to
+                ``self.timeout``. Lets a long task (conversation summarization)
+                request a larger budget without widening the short interactive
+                default that protects every other aux task.
 
         Returns:
             Pydantic model instance matching task.output_schema
@@ -426,7 +553,7 @@ class AuxiliaryLLM:
         start = time.monotonic()
         raw_result = await asyncio.wait_for(
             structured_llm.ainvoke(messages),
-            timeout=self.timeout,
+            timeout=timeout if timeout is not None else self.timeout,
         )
         latency_ms = int((time.monotonic() - start) * 1000)
 
@@ -655,9 +782,11 @@ async def extract_and_store_memories(
             f"Memory extraction: extracted {len(result.memories)}, "
             f"stored {stored_count} (phase {phase})"
         )
+        auxiliary_llm.health.record_success("memory_extraction")
         return stored_count
 
     except Exception as e:
+        auxiliary_llm.health.record_failure("memory_extraction", e)
         logger.warning(f"Memory extraction failed (non-fatal): {e}")
         return 0
 
@@ -725,9 +854,11 @@ async def curate_and_store_knowledge(
             f"Inline curation complete: {result.notes_created} created, "
             f"{result.notes_updated} updated — {result.summary}"
         )
+        auxiliary_llm.health.record_success("knowledge_curation")
         return result
 
     except Exception as e:
+        auxiliary_llm.health.record_failure("knowledge_curation", e)
         logger.warning(f"Inline curation failed (non-fatal): {e}")
         return None
 
@@ -830,9 +961,11 @@ async def assemble_memories(
             f"Memory assembly: {actions_count} TTL adjustments, "
             f"{gaps_count} gaps identified — {result.summary}"
         )
+        auxiliary_llm.health.record_success("memory_assembly")
         return result
 
     except Exception as e:
+        auxiliary_llm.health.record_failure("memory_assembly", e)
         logger.warning(f"Memory assembly failed (non-fatal): {e}")
         return None
 

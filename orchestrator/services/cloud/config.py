@@ -308,3 +308,79 @@ def _parse_int(value: Optional[str]) -> Optional[int]:
         return int(value)
     except ValueError:
         return None
+
+
+# Required (non-optional) secret fields per backend → the ordered env-var
+# fallbacks ``load_main_cloud_config`` reads for each. Keep in lockstep with
+# the ``_secret(...)`` calls in the loader above. ``oidc_client_secret`` is
+# intentionally absent — it is ``Optional`` on ``NextcloudSettings``.
+_REQUIRED_SECRET_ENVS: dict[str, dict[str, tuple[str, ...]]] = {
+    "nextcloud": {
+        "admin_password": ("MAIN_CLOUD_ADMIN_PASSWORD", "NEXTCLOUD_ADMIN_PASSWORD"),
+        "agent_password": ("MAIN_CLOUD_AGENT_PASSWORD", "NEXTCLOUD_AGENT_PASSWORD"),
+    },
+    "opencloud": {
+        "keycloak_client_secret": ("OPENCLOUD_KEYCLOAK_CLIENT_SECRET",),
+    },
+    "ms365": {
+        "client_secret": ("MS365_CLIENT_SECRET",),
+    },
+}
+
+
+def missing_secret_envs(
+    backend_id: str, db_overlay: Optional[dict] = None
+) -> list[dict]:
+    """Report which *required* secret env vars are unset for a backend config.
+
+    Mirrors the secret-resolution precedence of ``load_main_cloud_config``
+    (``credentials_ref`` override > legacy env-var fallbacks) but only inspects
+    *presence* — it never reads a secret's value and never falls back to the
+    built-in dev defaults the loader uses (``admin`` / ``agent-service-dev`` /
+    ``opencloud-orchestrator-local-secret``).
+
+    The loader keeps those dev defaults on purpose so a bare ``.env`` or a test
+    run "just works". This helper lets the admin endpoints **refuse to activate**
+    (PUT) or **warn before probing** (test) a backend whose real secrets are not
+    wired, instead of silently connecting with dev credentials and failing at
+    the first cloud call. See ``docs/issues/main_cloud.md`` Issue 5.
+
+    Returns one ``{"field", "env_var", "checked"}`` entry per missing secret; an
+    empty list means every required secret resolves to a non-empty value.
+    """
+    required = _REQUIRED_SECRET_ENVS.get(backend_id, {})
+    if not required:
+        return []
+
+    credentials_ref: Optional[str] = None
+    secret_fields: list[str] = []
+    if db_overlay:
+        credentials_ref = db_overlay.get("credentials_ref")
+        raw_value = db_overlay.get("value")
+        if isinstance(raw_value, dict):
+            secret_fields = raw_value.get("__secret_fields__", []) or []
+
+    missing: list[dict] = []
+    for field, env_fallbacks in required.items():
+        # credentials_ref ("env:NAME") wins when the overlay marks this field
+        # as credentials-ref-sourced — identical precedence to ``_secret()``.
+        if (
+            credentials_ref
+            and credentials_ref.startswith("env:")
+            and field in secret_fields
+        ):
+            env_name = credentials_ref[4:]
+            if not os.getenv(env_name):
+                missing.append(
+                    {"field": field, "env_var": env_name, "checked": [env_name]}
+                )
+            continue
+        if not _pick(*env_fallbacks):
+            missing.append(
+                {
+                    "field": field,
+                    "env_var": env_fallbacks[-1],
+                    "checked": list(env_fallbacks),
+                }
+            )
+    return missing

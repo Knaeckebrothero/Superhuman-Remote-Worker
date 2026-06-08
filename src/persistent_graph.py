@@ -7,7 +7,7 @@ calls (with permission checks), and repeats.
 
 Reuses the same shared infrastructure as the worker graph:
 - ContextManager for token counting and compaction
-- Transient injection for workspace.md
+- Transient injection for memory and knowledge
 - AuxiliaryLLM for summarization
 - load_tools / ToolContext for tool loading
 """
@@ -28,7 +28,7 @@ from langchain_core.messages import (
     ToolMessage,
 )
 
-from .core.context import ContextManager, extract_summary_text
+from .core.context import ContextManager, extract_summary_text, repair_tool_pairing
 from .llm.reasoning_chat import extract_reasoning_text_from_block
 from .llm.response_guards import (
     coerce_to_ai_message,
@@ -65,6 +65,37 @@ def _sanitize_ai_response(response: AIMessage) -> AIMessage:
                 block["id"] = response.id
 
     return response
+
+
+def _visible_content_len(content: Any) -> int:
+    """Length of user-visible text across supported message content shapes."""
+    if isinstance(content, str):
+        return len(content.strip())
+    if isinstance(content, list):
+        total = 0
+        for block in content:
+            if isinstance(block, str):
+                total += len(block.strip())
+            elif isinstance(block, dict) and block.get("text"):
+                total += len(str(block["text"]).strip())
+        return total
+    return 0
+
+
+def _ensure_msg_id(msg: Any) -> Any:
+    """Stamp a stable id on a message that lacks one, at creation time.
+
+    Every persisted ``thread_messages`` row needs a deterministic key so that
+    incremental persistence and the turn-complete reconciliation pass upsert
+    onto one row (``ON CONFLICT (id)``) instead of duplicating, and so a
+    crash-resumed tail keeps the same ids. ``AIMessage`` already gets an id in
+    ``_sanitize_ai_response``; ``HumanMessage``/``ToolMessage`` do not, so we
+    stamp them here. Uses the same ``msg_`` prefix for a uniform id space.
+    See docs/issues/persistent_session_midturn_message_loss.md.
+    """
+    if getattr(msg, "id", None) is None:
+        msg.id = f"msg_{_uuid.uuid4().hex[:24]}"
+    return msg
 
 
 # Sentinel values for user input queue
@@ -153,6 +184,14 @@ class PersistentLoopCallbacks:
     # so it can persist a display marker + show a banner. Optional.
     # Args: (summary_text, before_count, after_count).
     on_context_compacted: Optional[Callable[[str, int, int], Awaitable[None]]] = None
+
+    # Persist a single message the instant the loop produces it (incremental
+    # durability — a mid-turn crash keeps the tail instead of discarding the
+    # whole in-flight turn). Called per AIMessage / ToolMessage as it is
+    # appended to history; the turn-complete save reconciles (fills in
+    # turn-level metrics / approval decisions via an idempotent upsert).
+    # Optional: None ⇒ persist only at turn-complete (back-compat).
+    persist_message: Optional[Callable[[Any], Awaitable[None]]] = None
 
     # Set by the transport alongside a "hard" interrupt so the loop can cancel
     # a blocked LLM / auxiliary await immediately — the cooperative
@@ -267,7 +306,6 @@ async def run_persistent_loop(
     callbacks: PersistentLoopCallbacks,
     messages: List[BaseMessage],
     auxiliary_llm: Optional[Any] = None,
-    workspace_content: Optional[Callable[[], str]] = None,
     recall_store: Optional[Any] = None,
     knowledge_store: Optional[Any] = None,
     project_id: Optional[str] = None,
@@ -291,7 +329,6 @@ async def run_persistent_loop(
         callbacks: Transport callbacks (WebSocket I/O)
         messages: Mutable message list (persisted across turns)
         auxiliary_llm: For summarization during compaction
-        workspace_content: Callable returning current workspace.md content
         recall_store: RecallStore instance for memory injection/extraction
         knowledge_store: KnowledgeStore instance for knowledge injection
         project_id: Project UUID string for scoped knowledge queries (backward compat)
@@ -349,7 +386,7 @@ async def run_persistent_loop(
 
         turn_count += 1
         turn_id = turn_count
-        messages.append(HumanMessage(content=user_input))
+        messages.append(_ensure_msg_id(HumanMessage(content=user_input)))
 
         await callbacks.on_turn_start(turn_id)
         tool_calls_this_turn = 0
@@ -364,7 +401,6 @@ async def run_persistent_loop(
                 callbacks=callbacks,
                 llm_timeout=llm_timeout,
                 auxiliary_llm=auxiliary_llm,
-                workspace_content=workspace_content,
                 config=config,
                 recall_store=recall_store,
                 knowledge_store=knowledge_store,
@@ -408,20 +444,44 @@ async def run_persistent_loop(
         turn_metrics = result.metrics if result else None
         await callbacks.on_turn_complete(turn_id, turn_metrics)
 
-        # Auto-commit workspace changes after tool-executing turns.
-        # Push is throttled to every 5th turn so the upstream gets a
-        # checkpoint without paying a network round-trip per turn.
-        if tool_calls_this_turn > 0 and tool_context:
+        # Auto-commit workspace changes after tool-executing turns, then push
+        # so the remote — which the version-history UI reads — stays current.
+        # The push runs on EVERY turn (no turn-count throttle) and regardless
+        # of whether this turn used tools, so commits can't be stranded locally
+        # when a session ends on a no-tool turn. has_unpushed_commits() is a
+        # local-ref check, so turns with nothing to push skip the network.
+        # Commit/push failures are surfaced (warning) rather than swallowed:
+        # unpushed commits live only on the workspace pod until a push succeeds.
+        if tool_context:
             ws_mgr = getattr(tool_context, "workspace_manager", None)
             git_mgr = getattr(ws_mgr, "git_manager", None) if ws_mgr else None
             if git_mgr and git_mgr.is_active:
+                if tool_calls_this_turn > 0:
+                    try:
+                        if git_mgr.has_uncommitted_changes():
+                            if not git_mgr.commit(f"Auto-commit after turn {turn_id}"):
+                                logger.warning(
+                                    f"Turn {turn_id}: workspace auto-commit failed"
+                                )
+                    except Exception:
+                        logger.warning(
+                            f"Turn {turn_id}: workspace auto-commit raised",
+                            exc_info=True,
+                        )
                 try:
-                    if git_mgr.has_uncommitted_changes():
-                        git_mgr.commit(f"Auto-commit after turn {turn_id}")
-                    if turn_count % 5 == 0:
-                        git_mgr.push()
-                except Exception as e:
-                    logger.debug(f"Git auto-commit/push failed (non-fatal): {e}")
+                    if git_mgr.has_unpushed_commits():
+                        if not git_mgr.push():
+                            logger.warning(
+                                f"Turn {turn_id}: workspace git push failed — "
+                                "unpushed commits remain only on the workspace "
+                                "pod and will not appear in the version history "
+                                "until a later push succeeds"
+                            )
+                except Exception:
+                    logger.warning(
+                        f"Turn {turn_id}: workspace git push raised",
+                        exc_info=True,
+                    )
 
         logger.info(
             f"Turn {turn_id} complete: {tool_calls_this_turn} tool calls, "
@@ -437,7 +497,6 @@ async def _execute_turn(
     callbacks: PersistentLoopCallbacks,
     llm_timeout: float,
     auxiliary_llm: Optional[Any],
-    workspace_content: Optional[Callable[[], str]],
     config: Any,
     recall_store: Optional[Any] = None,
     knowledge_store: Optional[Any] = None,
@@ -452,6 +511,17 @@ async def _execute_turn(
     """
     tool_calls_made = 0
     messages_added = 0
+
+    async def _persist(msg: Any) -> None:
+        """Persist a message the instant it's appended to history.
+
+        Incremental durability: a crash mid-turn keeps everything produced so
+        far instead of discarding the whole in-flight turn. No-op when the
+        transport didn't wire ``persist_message``; the turn-complete save
+        reconciles either way.
+        """
+        if callbacks.persist_message is not None:
+            await callbacks.persist_message(msg)
 
     # --- Memory retrieval (once per turn, before the inner loop) ---
     memory_block = ""
@@ -552,20 +622,7 @@ async def _execute_turn(
                 interrupted=True,
             )
 
-        # Inject workspace.md as transient system context if available
         prepared = list(messages)
-        if workspace_content:
-            ws_content = workspace_content()
-            if ws_content:
-                # Insert workspace context after system message
-                ws_msg = SystemMessage(
-                    content=f"<workspace_memory>\n{ws_content}\n</workspace_memory>"
-                )
-                # Find insertion point (after system message, before conversation)
-                insert_idx = (
-                    1 if prepared and isinstance(prepared[0], SystemMessage) else 0
-                )
-                prepared.insert(insert_idx, ws_msg)
 
         # Inject memory and knowledge as transient tool-call pairs
         if memory_block:
@@ -573,14 +630,9 @@ async def _execute_turn(
                 from .core.memory_injection import create_memory_injection_messages
 
                 mem_ai, mem_tool = create_memory_injection_messages(memory_block)
-                # Insert after workspace injection, before conversation
+                # Insert after the system message, before conversation
                 inject_idx = (
-                    2
-                    if workspace_content
-                    and prepared
-                    and len(prepared) > 1
-                    and isinstance(prepared[1], SystemMessage)
-                    else 1
+                    1 if prepared and isinstance(prepared[0], SystemMessage) else 0
                 )
                 prepared.insert(inject_idx, mem_ai)
                 prepared.insert(inject_idx + 1, mem_tool)
@@ -662,6 +714,16 @@ async def _execute_turn(
                         logger.debug(
                             f"Git push on auto-compaction failed (non-fatal): {e}"
                         )
+
+        # Repair tool-call pairing before the LLM call. Compaction thrash, an
+        # interrupted turn, or streamed parallel-tool corruption (langchain
+        # #34660) can leave a function_call_output without its function_call
+        # (or vice versa); the Responses API rejects that with a 400
+        # "No tool call found for function call output ...". The worker graph
+        # sanitizes at the same point (src/graph.py:867); the resume path
+        # repairs on restore (persistent_app). This is the equivalent guard for
+        # the live turn loop, which previously had none.
+        prepared = repair_tool_pairing(prepared)
 
         # --- LLM call with streaming ---
         response_content = ""
@@ -1007,10 +1069,19 @@ async def _execute_turn(
         # types), then sanitize for Responses API compatibility (null IDs
         # from OpenRouter).
         response = _sanitize_ai_response(coerce_to_ai_message(response))
+        if (
+            response_content
+            and not getattr(response, "tool_calls", None)
+            and _visible_content_len(response.content) == 0
+        ):
+            response.content = response_content
 
         # Add AI response to message history
         messages.append(response)
         messages_added += 1
+        # Persist the LLM step immediately — it carries the reasoning + tool
+        # calls and is the expensive bit to lose on a mid-turn crash.
+        await _persist(response)
 
         # No tool calls? Turn is done.
         if not hasattr(response, "tool_calls") or not response.tool_calls:
@@ -1023,12 +1094,15 @@ async def _execute_turn(
                 logger.info(f"Interrupt received before tool {tool_call['name']}")
                 for remaining in response.tool_calls[i:]:
                     messages.append(
-                        ToolMessage(
-                            content="Interrupted by user.",
-                            tool_call_id=remaining["id"],
+                        _ensure_msg_id(
+                            ToolMessage(
+                                content="Interrupted by user.",
+                                tool_call_id=remaining["id"],
+                            )
                         )
                     )
                     messages_added += 1
+                    await _persist(messages[-1])
                 return TurnResult(
                     turn_id=0,
                     messages_added=messages_added,
@@ -1046,12 +1120,15 @@ async def _execute_turn(
             )
             if not approved:
                 messages.append(
-                    ToolMessage(
-                        content="User denied this tool call.",
-                        tool_call_id=tool_call_id,
+                    _ensure_msg_id(
+                        ToolMessage(
+                            content="User denied this tool call.",
+                            tool_call_id=tool_call_id,
+                        )
                     )
                 )
                 messages_added += 1
+                await _persist(messages[-1])
                 continue
 
             # Notify client
@@ -1062,12 +1139,15 @@ async def _execute_turn(
             if tool is None:
                 error_result = f"Tool '{tool_name}' not found"
                 messages.append(
-                    ToolMessage(content=error_result, tool_call_id=tool_call_id)
+                    _ensure_msg_id(
+                        ToolMessage(content=error_result, tool_call_id=tool_call_id)
+                    )
                 )
                 await callbacks.on_tool_result(
                     tool_name, error_result, tool_call_id, is_error=True
                 )
                 messages_added += 1
+                await _persist(messages[-1])
                 continue
 
             is_error = False
@@ -1085,18 +1165,26 @@ async def _execute_turn(
             # HumanMessage so multimodal primary models actually see it.
             cleaned_str, extracted_images = extract_image_tags(result_str)
 
-            messages.append(ToolMessage(content=cleaned_str, tool_call_id=tool_call_id))
+            messages.append(
+                _ensure_msg_id(
+                    ToolMessage(content=cleaned_str, tool_call_id=tool_call_id)
+                )
+            )
             messages_added += 1
             tool_calls_made += 1
+            await _persist(messages[-1])
 
             if extracted_images:
                 messages.append(
-                    make_multimodal_user_message(
-                        text=(f"Image content from tool call {tool_call_id}:"),
-                        images=extracted_images,
+                    _ensure_msg_id(
+                        make_multimodal_user_message(
+                            text=(f"Image content from tool call {tool_call_id}:"),
+                            images=extracted_images,
+                        )
                     )
                 )
                 messages_added += 1
+                await _persist(messages[-1])
 
             await callbacks.on_tool_result(
                 tool_name, cleaned_str, tool_call_id, is_error=is_error

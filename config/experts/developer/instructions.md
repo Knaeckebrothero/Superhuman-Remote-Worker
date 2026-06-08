@@ -44,7 +44,7 @@ Rules for the spec:
 - **Every AC names its `test_oracle`** — the specific test that proves the criterion. If a criterion has no oracle, it isn't an AC; it's a wish.
 - **`not_included` is mandatory** when scope is non-trivial. Explicit boundaries prevent scope creep.
 - **`done_when` lists exact commands** — not "tests pass" but `pytest tests/feature_x.py -x -v`.
-- **The spec is committed to `workspace.md`** in the PROTECTED `## Acceptance Criteria` section and is **not rewritten** to match what landed. If a criterion is wrong, surface it as `BLOCKED` and revise it in a strategic phase — never silently.
+- **The spec is committed to `spec_lock.md`** in the PROTECTED `## Acceptance Criteria` section and is **not rewritten** to match what landed. If a criterion is wrong, surface it as `BLOCKED` and revise it in a strategic phase — never silently.
 
 If the task brief is ambiguous, make reasonable assumptions, write them into `spec.yaml` under `assumptions:`, and proceed. Do not stall on missing detail you can reasonably infer; record what you assumed so it can be corrected.
 
@@ -75,9 +75,9 @@ Plan **one test per behavior**, not one test per AC. An AC can legitimately need
 Each tactical phase runs in one of four modes — `tdd_phase` is set by the strategic phase and stamped on every todo. (Note: this is the developer's TDD lifecycle stage and is distinct from the framework's `phase_type` which only distinguishes strategic vs tactical.)
 
 ### `spec` phase
-- Goal: produce or update `spec.yaml`. Run `kb_search` for prior decisions; interview if requirements are ambiguous; write EARS acceptance criteria; commit to `workspace.md`'s protected section.
+- Goal: produce or update `spec.yaml`. Run `kb_search` for prior decisions; interview if requirements are ambiguous; write EARS acceptance criteria; commit to `spec_lock.md`'s protected section.
 - **Forbidden**: any edit under `src/` or `tests/`.
-- Exit gate: `spec.yaml` exists, has >=1 AC with an ID and a `test_oracle`, hashed into `workspace.md`.
+- Exit gate: `spec.yaml` exists, has >=1 AC with an ID and a `test_oracle`, hashed into `spec_lock.md`.
 
 ### `red` phase — write failing tests
 - Goal: turn each AC into a test that fails for the right reason.
@@ -91,7 +91,7 @@ Each tactical phase runs in one of four modes — `tdd_phase` is set by the stra
   5. **RED-verify**: the test MUST fail with `AssertionError` (or framework-equivalent). If it fails with `ImportError`, `SyntaxError`, `CollectionError`, `ModuleNotFoundError`, or yields `0 collected`, the test is broken — fix the test, not the source. Do NOT mark the todo complete.
   6. Confirm via `git_diff` that the change is confined to `tests/`.
   7. `todo_complete` with evidence: test path, the exact failure line from pytest output, and the AC IDs the test covers.
-- Exit gate: every AC in the current scope has at least one test that fails with an assertion failure (not a collection or import error). Traceability matrix updated in `workspace.md`.
+- Exit gate: every AC in the current scope has at least one test that fails with an assertion failure (not a collection or import error). Traceability matrix updated in `spec_lock.md`.
 
 ### `green` phase — minimum implementation
 - Goal: make the failing tests pass with the minimum implementation.
@@ -158,7 +158,7 @@ After writing a test, run it and confirm:
 If any of these fail, the test is not honestly red. Fix it before proceeding.
 
 ### Traceability matrix (every strategic phase)
-Maintain a table in `workspace.md`:
+Maintain a table in `spec_lock.md`:
 
 ```
 | AC ID | Test Oracle                              | Status        |
@@ -207,7 +207,7 @@ When the spec's `done_when` commands pass and the traceability matrix is complet
 | `repo/` | Cloned repository — use `cd repo && ...` in `run_command`, or pass `repo/...` paths to workspace tools |
 | `repo/tests/` | Test files — writable in RED phase only |
 | `repo/src/` (or equivalent source dir) | Source — writable in GREEN/REFACTOR phases only |
-| workspace root | `spec.yaml`, `plan.md`, `workspace.md`, `todos.yaml` — management files |
+| workspace root | `spec.yaml`, `plan.md`, `spec_lock.md`, `todos.yaml` — management files |
 | `documents/` | Input documents — read-only |
 | `output/` | Deliverables — write with `write_file` |
 

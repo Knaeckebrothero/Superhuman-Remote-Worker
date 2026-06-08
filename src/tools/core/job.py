@@ -133,7 +133,7 @@ def create_job_tools(context: ToolContext) -> List[Any]:
 
         This tool marks the current strategic phase as "final". The job will
         complete after all remaining strategic todos are done (summarize,
-        update workspace.md, update plan.md).
+        record learnings, update plan.md).
 
         IMPORTANT: This tool can only be called during a strategic phase.
         If called from tactical phase, it will be rejected.

@@ -153,7 +153,7 @@ class TestSuspendWorkspace:
         svc._snapshot_service.capture_vm_snapshot.assert_awaited_once_with(
             job_id=job["id"],
             ssh_host="10.0.0.42",
-            ssh_port=22,
+            ssh_port=30022,
             source_type="pod",
         )
         # Pod deleted
@@ -267,7 +267,7 @@ class TestRestoreWorkspace:
         assert result is True
         svc._container_provisioner.create_workspace.assert_awaited_once()
         mock_extract.assert_awaited_once_with(
-            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "10.0.0.99", ssh_port=22
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "10.0.0.99", ssh_port=30022
         )
         # Status transitions: restoring → ready
         calls = svc._db.merge_workspace_container_context.call_args_list
@@ -730,7 +730,7 @@ class TestSuspendRestoreRoundTrip:
 
         # Verify snapshot was captured with the original pod IP
         svc._snapshot_service.capture_vm_snapshot.assert_awaited_once_with(
-            job_id=job_id, ssh_host="10.0.0.42", ssh_port=22, source_type="pod"
+            job_id=job_id, ssh_host="10.0.0.42", ssh_port=30022, source_type="pod"
         )
 
         # Verify pod was deleted
@@ -764,7 +764,7 @@ class TestSuspendRestoreRoundTrip:
         )
 
         # Snapshot extracted to new pod IP
-        mock_extract.assert_awaited_once_with(job_id, "10.0.0.99", ssh_port=22)
+        mock_extract.assert_awaited_once_with(job_id, "10.0.0.99", ssh_port=30022)
 
         # Final status is ready
         calls = svc._db.merge_workspace_container_context.call_args_list

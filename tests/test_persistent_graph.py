@@ -8,6 +8,7 @@ with fallback, timeout, tool execution loop, VM upgrade detection).
 """
 
 import asyncio
+import logging
 from typing import List
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -893,8 +894,123 @@ class TestAutoCommitGit:
         git_mgr.commit.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_push_fires_on_5th_turn(self):
-        """Git push fires when turn_count % 5 == 0, independent of commit."""
+    async def test_push_fires_every_committing_turn_not_throttled(self):
+        """Push fires on a normal turn even when turn_count is not a multiple
+        of 5 — the old every-5th-turn throttle is gone."""
+        response_with_tool = AIMessage(
+            content="",
+            tool_calls=[{"name": "test_tool", "args": {}, "id": "tc1"}],
+        )
+        final_response = _make_llm_response("ok")
+
+        stream_count = 0
+
+        async def _astream(messages, **kw):
+            nonlocal stream_count
+            stream_count += 1
+            if stream_count % 2 == 1:
+                yield response_with_tool
+            else:
+                yield final_response
+
+        llm = AsyncMock()
+        llm.reasoning = None
+        llm.astream = _astream
+
+        tool = _make_tool("test_tool", "r")
+
+        git_mgr = MagicMock()
+        git_mgr.is_active = True
+        git_mgr.has_uncommitted_changes.return_value = True
+        git_mgr.has_unpushed_commits.return_value = True
+        git_mgr.push.return_value = True
+
+        ws_mgr = MagicMock()
+        ws_mgr.git_manager = git_mgr
+        ws_mgr.read_file.return_value = ""
+
+        tool_ctx = MagicMock()
+        tool_ctx.workspace_manager = ws_mgr
+        tool_ctx.consume_freeze_request.return_value = None
+
+        turns = 0
+
+        async def _input():
+            nonlocal turns
+            turns += 1
+            if turns == 1:
+                return "turn 1"
+            raise asyncio.CancelledError
+
+        callbacks = _make_callbacks(get_user_input=_input)
+
+        await run_persistent_loop(
+            llm_with_tools=llm,
+            tools=[tool],
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
+            config=_make_config(),
+            system_prompt="sys",
+            callbacks=callbacks,
+            messages=[],
+            tool_context=tool_ctx,
+        )
+
+        # Turn 1 is not a multiple of 5, but the commit must still be pushed.
+        git_mgr.push.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_push_fires_on_no_tool_turn_when_commits_unpushed(self):
+        """Regression: a session ending on a no-tool turn must still flush
+        previously-committed-but-unpushed work to the remote."""
+        response = _make_llm_response("Just text, no tools")
+
+        git_mgr = MagicMock()
+        git_mgr.is_active = True
+        git_mgr.has_unpushed_commits.return_value = True
+        git_mgr.push.return_value = True
+
+        ws_mgr = MagicMock()
+        ws_mgr.git_manager = git_mgr
+        ws_mgr.read_file.return_value = ""
+
+        tool_ctx = MagicMock()
+        tool_ctx.workspace_manager = ws_mgr
+        tool_ctx.consume_freeze_request.return_value = None
+
+        turns = 0
+
+        async def _input():
+            nonlocal turns
+            turns += 1
+            if turns == 1:
+                return "thanks!"
+            raise asyncio.CancelledError
+
+        callbacks = _make_callbacks(get_user_input=_input)
+
+        await run_persistent_loop(
+            llm_with_tools=_make_streaming_llm(response),
+            tools=[],
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
+            config=_make_config(),
+            system_prompt="sys",
+            callbacks=callbacks,
+            messages=[],
+            tool_context=tool_ctx,
+        )
+
+        # No tools this turn, but unpushed commits exist → must still push.
+        git_mgr.push.assert_called_once()
+        git_mgr.commit.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_no_push_when_nothing_unpushed(self):
+        """Push is skipped (no needless network round-trip) when the branch has
+        no unpushed commits — even across a 5th turn the old throttle pushed on."""
         response_with_tool = AIMessage(
             content="",
             tool_calls=[{"name": "test_tool", "args": {}, "id": "tc1"}],
@@ -920,6 +1036,7 @@ class TestAutoCommitGit:
         git_mgr = MagicMock()
         git_mgr.is_active = True
         git_mgr.has_uncommitted_changes.return_value = False
+        git_mgr.has_unpushed_commits.return_value = False
 
         ws_mgr = MagicMock()
         ws_mgr.git_manager = git_mgr
@@ -953,8 +1070,74 @@ class TestAutoCommitGit:
             tool_context=tool_ctx,
         )
 
-        # push should have been called once (at turn 5)
-        git_mgr.push.assert_called_once()
+        git_mgr.push.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_push_failure_is_logged_as_warning(self, caplog):
+        """A failed push is surfaced (warning), not silently swallowed — the
+        commits remain only on the workspace pod until a later push succeeds."""
+        response_with_tool = AIMessage(
+            content="",
+            tool_calls=[{"name": "test_tool", "args": {}, "id": "tc1"}],
+        )
+        final_response = _make_llm_response("ok")
+
+        stream_count = 0
+
+        async def _astream(messages, **kw):
+            nonlocal stream_count
+            stream_count += 1
+            if stream_count == 1:
+                yield response_with_tool
+            else:
+                yield final_response
+
+        llm = AsyncMock()
+        llm.reasoning = None
+        llm.astream = _astream
+
+        tool = _make_tool("test_tool", "r")
+
+        git_mgr = MagicMock()
+        git_mgr.is_active = True
+        git_mgr.has_uncommitted_changes.return_value = False
+        git_mgr.has_unpushed_commits.return_value = True
+        git_mgr.push.return_value = False  # push fails
+
+        ws_mgr = MagicMock()
+        ws_mgr.git_manager = git_mgr
+        ws_mgr.read_file.return_value = ""
+
+        tool_ctx = MagicMock()
+        tool_ctx.workspace_manager = ws_mgr
+        tool_ctx.consume_freeze_request.return_value = None
+
+        turns = 0
+
+        async def _input():
+            nonlocal turns
+            turns += 1
+            if turns == 1:
+                return "go"
+            raise asyncio.CancelledError
+
+        callbacks = _make_callbacks(get_user_input=_input)
+
+        with caplog.at_level(logging.WARNING):
+            await run_persistent_loop(
+                llm_with_tools=llm,
+                tools=[tool],
+                context_manager=AsyncMock(
+                    ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+                ),
+                config=_make_config(),
+                system_prompt="sys",
+                callbacks=callbacks,
+                messages=[],
+                tool_context=tool_ctx,
+            )
+
+        assert "push failed" in caplog.text.lower()
 
     @pytest.mark.asyncio
     async def test_git_exception_is_non_fatal(self):
@@ -1091,7 +1274,6 @@ class TestExecuteTurnInterrupt:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
         )
 
@@ -1150,13 +1332,92 @@ class TestExecuteTurnInterrupt:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
             tool_context=tool_ctx,
         )
 
         assert result.interrupted is True
         assert result.tool_calls_made >= 1
+        assert result.messages_added >= 1
+
+
+# ---------------------------------------------------------------------------
+# 1.6 _execute_turn — incremental persistence (Phase 2)
+# ---------------------------------------------------------------------------
+
+
+class TestExecuteTurnIncrementalPersistence:
+    """persist_message must fire for each message the instant it's produced, so
+    a mid-turn crash keeps the tail (docs/issues/...midturn_message_loss.md)."""
+
+    def _sequenced_llm(self, responses):
+        """LLM whose astream yields a different response on each call."""
+        idx = [0]
+
+        async def _astream(messages, **kw):
+            r = responses[min(idx[0], len(responses) - 1)]
+            idx[0] += 1
+            yield r
+
+        llm = AsyncMock()
+        llm.reasoning = None
+        llm.astream = _astream
+        return llm
+
+    @pytest.mark.asyncio
+    async def test_persists_ai_and_tool_messages_as_produced(self):
+        ai_with_tool = AIMessage(
+            content="",
+            tool_calls=[{"name": "test_tool", "args": {}, "id": "tc1"}],
+        )
+        ai_final = AIMessage(content="done")
+
+        persisted = []
+        callbacks = _make_callbacks(
+            persist_message=AsyncMock(side_effect=lambda m: persisted.append(m))
+        )
+        messages = [SystemMessage(content="sys"), HumanMessage(content="go")]
+
+        await _execute_turn(
+            llm_with_tools=self._sequenced_llm([ai_with_tool, ai_final]),
+            tool_map={"test_tool": _make_tool("test_tool", "result")},
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
+            messages=messages,
+            callbacks=callbacks,
+            llm_timeout=600,
+            auxiliary_llm=None,
+            config=_make_config(),
+        )
+
+        # AIMessage(tool call) → ToolMessage(result) → AIMessage(final),
+        # each persisted the moment it entered history.
+        assert [getattr(m, "type", None) for m in persisted] == ["ai", "tool", "ai"]
+        assert persisted[0].tool_calls, "the AI step's tool calls must be persisted"
+        assert persisted[1].tool_call_id == "tc1", "tool result keeps its link"
+        # Every persisted message carries a stable id → reconciliation upserts.
+        assert all(getattr(m, "id", None) for m in persisted)
+
+    @pytest.mark.asyncio
+    async def test_no_persist_callback_is_a_noop(self):
+        """Back-compat: a turn runs fine when the transport wires no
+        persist_message (callback defaults to None)."""
+        callbacks = _make_callbacks()  # no persist_message
+        assert callbacks.persist_message is None
+        messages = [SystemMessage(content="sys"), HumanMessage(content="go")]
+        result = await _execute_turn(
+            llm_with_tools=self._sequenced_llm([AIMessage(content="hi")]),
+            tool_map={},
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
+            messages=messages,
+            callbacks=callbacks,
+            llm_timeout=600,
+            auxiliary_llm=None,
+            config=_make_config(),
+        )
         assert result.messages_added >= 1
 
 
@@ -1191,7 +1452,6 @@ class TestExecuteTurnMemoryRetrieval:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
             recall_store=recall,
         )
@@ -1218,7 +1478,6 @@ class TestExecuteTurnMemoryRetrieval:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
             recall_store=recall,
         )
@@ -1245,7 +1504,6 @@ class TestExecuteTurnMemoryRetrieval:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
             recall_store=recall,
         )
@@ -1272,7 +1530,6 @@ class TestExecuteTurnMemoryRetrieval:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
             recall_store=recall,
         )
@@ -1300,7 +1557,6 @@ class TestExecuteTurnMemoryRetrieval:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
             recall_store=recall,
         )
@@ -1333,7 +1589,6 @@ class TestExecuteTurnKnowledgeRetrieval:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
             knowledge_store=ks,
             project_id="550e8400-e29b-41d4-a716-446655440000",
@@ -1363,7 +1618,6 @@ class TestExecuteTurnKnowledgeRetrieval:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
             knowledge_store=ks,
             project_id=None,
@@ -1388,7 +1642,6 @@ class TestExecuteTurnKnowledgeRetrieval:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
             knowledge_store=None,
             project_id="550e8400-e29b-41d4-a716-446655440000",
@@ -1415,7 +1668,6 @@ class TestExecuteTurnKnowledgeRetrieval:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
             knowledge_store=ks,
             project_id="550e8400-e29b-41d4-a716-446655440000",
@@ -1445,7 +1697,6 @@ class TestExecuteTurnKnowledgeRetrieval:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
             knowledge_store=ks,
             project_ids=[pid1, pid2],
@@ -1463,88 +1714,6 @@ class TestExecuteTurnKnowledgeRetrieval:
 
 class TestTransientInjection:
     @pytest.mark.asyncio
-    async def test_workspace_injected_after_system_message(self):
-        """Workspace content injected as SystemMessage at index 1."""
-        captured_prepared = []
-
-        async def _ensure(msgs, *a, **kw):
-            captured_prepared.extend(msgs)
-            return msgs
-
-        messages = [SystemMessage(content="sys"), HumanMessage(content="hi")]
-        callbacks = _make_callbacks()
-
-        await _execute_turn(
-            llm_with_tools=_make_streaming_llm(_make_llm_response("ok")),
-            tool_map={},
-            context_manager=AsyncMock(ensure_within_limits=_ensure),
-            messages=messages,
-            callbacks=callbacks,
-            llm_timeout=600,
-            auxiliary_llm=None,
-            workspace_content=lambda: "workspace content here",
-            config=_make_config(),
-        )
-
-        # Index 0: system, Index 1: workspace, Index 2+: conversation
-        assert isinstance(captured_prepared[1], SystemMessage)
-        assert "<workspace_memory>" in captured_prepared[1].content
-        assert "workspace content here" in captured_prepared[1].content
-
-    @pytest.mark.asyncio
-    async def test_no_workspace_injection_when_content_empty(self):
-        """No workspace injection when workspace_content returns empty."""
-        captured_prepared = []
-
-        async def _ensure(msgs, *a, **kw):
-            captured_prepared.extend(msgs)
-            return msgs
-
-        messages = [SystemMessage(content="sys"), HumanMessage(content="hi")]
-        callbacks = _make_callbacks()
-
-        await _execute_turn(
-            llm_with_tools=_make_streaming_llm(_make_llm_response("ok")),
-            tool_map={},
-            context_manager=AsyncMock(ensure_within_limits=_ensure),
-            messages=messages,
-            callbacks=callbacks,
-            llm_timeout=600,
-            auxiliary_llm=None,
-            workspace_content=lambda: "",
-            config=_make_config(),
-        )
-
-        # Should be just system + human (no workspace injection)
-        assert len(captured_prepared) == 2
-
-    @pytest.mark.asyncio
-    async def test_no_workspace_injection_when_callable_none(self):
-        """No workspace injection when workspace_content is None."""
-        captured_prepared = []
-
-        async def _ensure(msgs, *a, **kw):
-            captured_prepared.extend(msgs)
-            return msgs
-
-        messages = [SystemMessage(content="sys"), HumanMessage(content="hi")]
-        callbacks = _make_callbacks()
-
-        await _execute_turn(
-            llm_with_tools=_make_streaming_llm(_make_llm_response("ok")),
-            tool_map={},
-            context_manager=AsyncMock(ensure_within_limits=_ensure),
-            messages=messages,
-            callbacks=callbacks,
-            llm_timeout=600,
-            auxiliary_llm=None,
-            workspace_content=None,
-            config=_make_config(),
-        )
-
-        assert len(captured_prepared) == 2
-
-    @pytest.mark.asyncio
     async def test_prepared_is_copy_not_original(self):
         """Transient injections go into a copy, not the original messages list."""
         messages = [SystemMessage(content="sys"), HumanMessage(content="hi")]
@@ -1560,7 +1729,6 @@ class TestTransientInjection:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=lambda: "ws content",
             config=_make_config(),
         )
 
@@ -1613,7 +1781,6 @@ class TestContextCompaction:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
             tool_context=tool_ctx,
         )
@@ -1654,7 +1821,6 @@ class TestContextCompaction:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
             tool_context=tool_ctx,
         )
@@ -1695,7 +1861,6 @@ class TestLLMStreaming:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
         )
 
@@ -1733,7 +1898,6 @@ class TestLLMStreaming:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
         )
 
@@ -1764,7 +1928,6 @@ class TestLLMStreaming:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
         )
 
@@ -1797,7 +1960,6 @@ class TestLLMStreaming:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
         )
 
@@ -1828,11 +1990,13 @@ class TestLLMStreaming:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
         )
 
         callbacks.on_token.assert_called_once_with(
+            "⚠ The model returned an empty response. Please try again or switch models."
+        )
+        assert messages[-1].content == (
             "⚠ The model returned an empty response. Please try again or switch models."
         )
         assert result.error is None
@@ -1865,7 +2029,6 @@ class TestLLMStreaming:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
         )
 
@@ -1925,7 +2088,6 @@ class TestLLMStreaming:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
         )
 
@@ -1970,7 +2132,6 @@ class TestLLMStreamingFallback:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
         )
 
@@ -2007,7 +2168,6 @@ class TestLLMStreamingFallback:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
         )
 
@@ -2040,7 +2200,6 @@ class TestLLMStreamingFallback:
                 callbacks=callbacks,
                 llm_timeout=600,
                 auxiliary_llm=None,
-                workspace_content=None,
                 config=_make_config(),
             )
 
@@ -2074,7 +2233,6 @@ class TestLLMStreamingFallback:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
         )
 
@@ -2112,7 +2270,6 @@ class TestLLMTimeout:
             callbacks=callbacks,
             llm_timeout=10,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
         )
 
@@ -2167,7 +2324,6 @@ class TestToolExecutionLoop:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
             tool_context=tool_ctx,
         )
@@ -2219,7 +2375,6 @@ class TestToolExecutionLoop:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
         )
 
@@ -2267,7 +2422,6 @@ class TestToolExecutionLoop:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
         )
 
@@ -2316,7 +2470,6 @@ class TestToolExecutionLoop:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
             tool_context=tool_ctx,
         )
@@ -2365,7 +2518,6 @@ class TestToolExecutionLoop:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
             tool_context=tool_ctx,
         )
@@ -2419,7 +2571,6 @@ class TestToolExecutionLoop:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
             tool_context=tool_ctx,
         )
@@ -2466,7 +2617,6 @@ class TestToolExecutionLoop:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
             tool_context=tool_ctx,
         )
@@ -2491,7 +2641,6 @@ class TestToolExecutionLoop:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
         )
 
@@ -2548,7 +2697,6 @@ class TestVMUpgradeDetection:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
             tool_context=tool_ctx,
         )
@@ -2598,7 +2746,6 @@ class TestVMUpgradeDetection:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
             tool_context=tool_ctx,
         )
@@ -2646,7 +2793,6 @@ class TestVMUpgradeDetection:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
             tool_context=tool_ctx,
         )
@@ -2693,7 +2839,6 @@ class TestVMUpgradeDetection:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
             tool_context=None,
         )
@@ -2741,7 +2886,6 @@ class TestVMUpgradeDetection:
             callbacks=callbacks,
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
             tool_context=tool_ctx,
         )
@@ -2775,7 +2919,6 @@ class TestStreamedResponseNormalization:
             callbacks=_make_callbacks(),
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
         )
 
@@ -2803,7 +2946,6 @@ class TestStreamedResponseNormalization:
             callbacks=_make_callbacks(check_interrupt=check),
             llm_timeout=600,
             auxiliary_llm=None,
-            workspace_content=None,
             config=_make_config(),
         )
 

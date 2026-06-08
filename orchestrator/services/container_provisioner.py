@@ -186,7 +186,11 @@ class ContainerProvisioner:
         # Seed the user's saved code-server config (theme/keybindings/snippets)
         # into the pod before it starts. Best-effort — never blocks provisioning.
         seed_files = await self._resolve_ide_seed_files(owner)
-        seed_cm = await self._create_seed_configmap(pod_name, seed_files)
+        seed_exts = await self._resolve_ide_extensions(owner)
+        seed_needs_state = await self._resolve_ide_needs_state(owner, seed_exts)
+        seed_cm = await self._create_seed_configmap(
+            pod_name, seed_files, seed_exts, needs_state=seed_needs_state
+        )
 
         # emptyDir by default — storage dies with the pod, no cleanup needed.
         # Each job/session gets a fresh container; isolation is the pod boundary.
@@ -239,6 +243,9 @@ class ContainerProvisioner:
                     owner.kind,
                     owner.id,
                 )
+                # Stream license/globalStorage state in (Phase B); fire-and-forget
+                # so it never blocks provisioning. No-ops when S3 is unavailable.
+                asyncio.create_task(self._seed_workspace_state(owner, pod_ip))
             else:
                 logger.warning(
                     "Workspace container created but not ready within timeout: %s (%s %s)",
@@ -491,7 +498,11 @@ class ContainerProvisioner:
 
         owner = WorkspaceOwner.job(job_id)
         seed_files = await self._resolve_ide_seed_files(owner)
-        seed_cm = await self._create_seed_configmap(pod_name, seed_files)
+        seed_exts = await self._resolve_ide_extensions(owner)
+        seed_needs_state = await self._resolve_ide_needs_state(owner, seed_exts)
+        seed_cm = await self._create_seed_configmap(
+            pod_name, seed_files, seed_exts, needs_state=seed_needs_state
+        )
 
         pod_manifest = self._build_pod_manifest(
             pod_name=pod_name,
@@ -520,6 +531,8 @@ class ContainerProvisioner:
             pod_ip = await self._wait_for_ready(pod_name, timeout=90)
             if pod_ip:
                 logger.info("IDE pod ready: %s @ %s (job %s)", pod_name, pod_ip, job_id)
+                # Stream license/globalStorage state in (Phase B); fire-and-forget.
+                asyncio.create_task(self._seed_workspace_state(owner, pod_ip))
                 return pod_ip
 
             logger.warning(
@@ -709,25 +722,152 @@ class ContainerProvisioner:
             )
             return {}
 
+    async def _resolve_ide_extensions(self, owner: WorkspaceOwner) -> dict:
+        """Fetch the owner-user's stored extension manifest items. ``{}`` on miss."""
+        if not self._db:
+            return {}
+        try:
+            if owner.kind == "job":
+                row = await self._db.get_job(owner.id)
+            else:
+                row = await self._db.get_thread(owner.id)
+            if not isinstance(row, dict):
+                return {}
+            user_id = row.get("user_id")
+            if not user_id:
+                return {}
+            from services.ide_settings import IdeSettingsStore
+
+            return await IdeSettingsStore(self._db).get_extensions(str(user_id))
+        except Exception as e:
+            logger.warning(
+                "ide seed: failed to resolve extensions for %s %s: %s",
+                owner.kind,
+                owner.id,
+                e,
+            )
+            return {}
+
+    async def _owner_user_id(self, owner: WorkspaceOwner) -> Optional[str]:
+        """Resolve the owning user_id for a job/thread workspace. None on miss."""
+        if not self._db:
+            return None
+        try:
+            if owner.kind == "job":
+                row = await self._db.get_job(owner.id)
+            else:
+                row = await self._db.get_thread(owner.id)
+            user_id = row.get("user_id") if isinstance(row, dict) else None
+            return str(user_id) if user_id else None
+        except Exception as e:
+            logger.warning(
+                "ide seed: failed to resolve user for %s %s: %s",
+                owner.kind,
+                owner.id,
+                e,
+            )
+            return None
+
+    async def _resolve_ide_needs_state(
+        self, owner: WorkspaceOwner, extensions: dict
+    ) -> bool:
+        """True when the orchestrator should stream license/globalStorage state
+        into this pod once Ready (and thus the entrypoint should wait on the
+        sentinel). True if any extension needs byte-copy, or the user has a
+        captured globalStorage signature (e.g. a paid theme's license)."""
+        if not extensions:
+            return False
+        if any(v.get("source") == "bytes" for v in extensions.values()):
+            return True
+        user_id = await self._owner_user_id(owner)
+        if not user_id:
+            return False
+        try:
+            from services.ide_settings import IdeSettingsStore
+
+            return bool(await IdeSettingsStore(self._db).get_ext_signature(user_id))
+        except Exception as e:
+            logger.warning(
+                "ide seed: needs-state resolve failed for %s %s: %s",
+                owner.kind,
+                owner.id,
+                e,
+            )
+            return False
+
+    async def _seed_workspace_state(self, owner: WorkspaceOwner, pod_ip: str) -> None:
+        """Stream globalStorage + bytes extensions into a freshly-Ready container
+        and touch the sentinel. Fire-and-forget; failure leaves the IDE usable
+        (extension binaries still arrived via Open VSX at boot)."""
+        if not self._db or not pod_ip:
+            return
+        snap = self._snapshot_service
+        if not snap or not snap.is_available:
+            return
+        user_id = await self._owner_user_id(owner)
+        if not user_id:
+            return
+        try:
+            from services.ide_profile_store import IdeProfileStore
+            from services.ide_settings import IdeSettingsStore, seed_ide_profile
+
+            items = await IdeSettingsStore(self._db).get_extensions(user_id)
+            profile = IdeProfileStore(snap._s3, snap._bucket)
+            await seed_ide_profile(
+                user_id=user_id,
+                ssh_host=pod_ip,
+                ssh_port=30022,
+                profile_store=profile,
+                ext_items=items,
+            )
+        except Exception as e:
+            logger.warning(
+                "ide seed: stream state failed for %s %s: %s",
+                owner.kind,
+                owner.id,
+                e,
+            )
+
     def _seed_configmap_name(self, pod_name: str) -> str:
         return f"code-server-config-{pod_name}"
 
-    async def _create_seed_configmap(self, pod_name: str, files: dict) -> Optional[str]:
+    async def _create_seed_configmap(
+        self,
+        pod_name: str,
+        files: dict,
+        extensions: Optional[dict] = None,
+        needs_state: bool = False,
+    ) -> Optional[str]:
         """Create a ConfigMap carrying a self-contained ``seed.sh`` for the pod.
 
-        Returns the ConfigMap name, or None when there is nothing to seed (or on
-        failure — seeding is best-effort and must never block provisioning).
+        ``seed.sh`` writes the user's config files and installs their Open-VSX
+        extensions (theme-first). When ``needs_state`` is set, an ``expect-state``
+        marker is added so the entrypoint waits (bounded) for the orchestrator to
+        stream license/globalStorage state in (Phase B). Returns the ConfigMap
+        name, or None when there is nothing to seed (or on failure — seeding is
+        best-effort and must never block provisioning).
         """
-        if not files or not self._core_api:
+        if (not files and not extensions) or not self._core_api:
             return None
-        from services.ide_settings import build_seed_script
+        from services.ide_settings import (
+            build_extension_install_script,
+            build_seed_script,
+        )
 
         cm_name = self._seed_configmap_name(pod_name)
+        seed_sh = (
+            build_seed_script(files)
+            + "\n"
+            + build_extension_install_script(extensions or {})
+        )
+        data = {"seed.sh": seed_sh}
+        if needs_state:
+            data["expect-state"] = "1"
         body = {
             "apiVersion": "v1",
             "kind": "ConfigMap",
             "metadata": {"name": cm_name, "namespace": self._namespace},
-            "data": {"seed.sh": build_seed_script(files)},
+            "data": data,
         }
         try:
             await asyncio.to_thread(
@@ -836,6 +976,14 @@ class ContainerProvisioner:
                 "name": pod_name,
                 "namespace": self._namespace,
                 "labels": self._build_workspace_labels(owner, network_tier),
+                # GC backstop hook: marks the pod as owned by the lifecycle
+                # reconciler so a future K8s TTL/GC controller (or an age
+                # sweep) can reclaim a tail the reconciler missed. Bare pods
+                # have no ownerReference, so without this nothing external can
+                # ever clean them up.
+                "annotations": {
+                    "srw.io/managed-by": "lifecycle-reconciler",
+                },
             },
             "spec": {
                 "restartPolicy": "Never",

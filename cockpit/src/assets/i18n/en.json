@@ -300,13 +300,27 @@
     }
   },
   "admin": {
-    "prompts": {
+    "config": {
       "messages": {
-        "saveEmpty": "Nothing to save — pick a prompt and enter content.",
+        "saveEmpty": "Nothing to save — pick a config key and enter a value.",
         "saved": "Override saved — applies to future jobs.",
         "saveFailed": "Failed to save override.",
         "removed": "Override removed — back to the bundled default.",
-        "removeFailed": "Failed to remove override."
+        "removeFailed": "Failed to remove override.",
+        "invalidJson": "Invalid JSON — fix the syntax and try again.",
+        "matchesDefault": "Already matches the shipped default — no override needed.",
+        "noChanges": "No changes to save.",
+        "fileUnsupported": "Unsupported file — drop a .txt or .md file.",
+        "fileTooLarge": "File too large — keep it under 1 MB.",
+        "fileLoaded": "Loaded {{name}} — review and save to apply.",
+        "fileReadError": "Could not read that file.",
+        "settingMustBeNumber": "{{title}} must be a number.",
+        "settingMustBeInteger": "{{title}} must be a whole number.",
+        "settingMin": "{{title}} must be at least {{min}}.",
+        "settingMax": "{{title}} must be at most {{max}}.",
+        "noSettingChanges": "No setting changes to save.",
+        "settingsSaved": "Inference settings saved.",
+        "settingsSaveFailed": "Failed to save settings."
       }
     },
     "providers": {
@@ -858,11 +872,21 @@
       "collapsedEmpty": "Tool calls only",
       "thoughtCount": "{{count}} thoughts",
       "textCount": "{{count}} text blocks",
-      "toolCount": "{{count}} tool calls"
+      "toolCount": "{{count}} tool calls",
+      "toolGroup": "{{count}}× tool calls"
+    },
+    "diff": {
+      "replace": "Diff",
+      "append": "Appended",
+      "prepend": "Prepended",
+      "write": "Written",
+      "truncated": "+{{count}} more lines"
     },
     "settings": {
       "mode": "Mode",
       "narration": "Narration",
+      "reasoning": "Reasoning",
+      "toolCalls": "Tool calls",
       "model": "Model",
       "temperature": "Temperature: {{value}}",
       "modeSupervised": "Supervised",
@@ -870,7 +894,11 @@
       "modeAutonomous": "Autonomous",
       "narrationAuto": "Auto",
       "narrationVerbose": "Verbose",
-      "narrationSilent": "Silent"
+      "narrationSilent": "Silent",
+      "reasoningExpanded": "Expanded",
+      "reasoningCollapsed": "Collapsed",
+      "toolCallsExpanded": "Expanded",
+      "toolCallsCollapsed": "Collapsed"
     },
     "tasks": {
       "header": "Tasks {{done}}/{{total}}",
@@ -960,13 +988,19 @@
       "cameraDenied": "Camera permission denied",
       "cameraError": "Could not access camera",
       "micDenied": "Microphone permission denied",
-      "micError": "Could not start recording"
+      "micError": "Could not start recording",
+      "transcribing": "Transcribing audio…",
+      "transcribeError": "Couldn't transcribe — audio attached as-is"
     },
     "tts": {
       "play": "Read aloud",
       "stop": "Stop reading",
       "generating": "Generating speech…",
-      "error": "Speech failed — click to retry"
+      "error": "Speech failed — click to retry",
+      "spokenVersion": "Spoken version",
+      "part": "Part {{current}} of {{total}}",
+      "preparing": "Preparing audio…",
+      "generatingPart": "Generating part {{current}} of {{total}}…"
     },
     "code": {
       "expandHint": "Click to expand",

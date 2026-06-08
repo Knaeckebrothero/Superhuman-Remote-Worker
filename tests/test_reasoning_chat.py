@@ -378,6 +378,27 @@ class TestExtractReasoningFromResponse:
         )
         assert _extract_reasoning_from_response(data) == "Valid part"
 
+    def test_reasoning_details_nested_text(self):
+        """Should extract readable nested text without storing encrypted blobs."""
+        data = self._make_response(
+            {
+                "reasoning_details": [
+                    {
+                        "type": "reasoning",
+                        "encrypted_content": "opaque",
+                        "summary": [{"text": "Summarized step."}],
+                    },
+                    {
+                        "type": "reasoning",
+                        "content": [{"text": "Detailed step."}],
+                    },
+                ]
+            }
+        )
+        assert (
+            _extract_reasoning_from_response(data) == "Summarized step.\nDetailed step."
+        )
+
 
 # =============================================================================
 # _dump_codex_raw_response
@@ -481,6 +502,27 @@ class TestExtractReasoningFromDelta:
     def test_non_string_value_returns_none(self):
         assert _extract_reasoning_from_delta({"reasoning_content": 42}) is None
 
+    def test_openrouter_reasoning_details_delta(self):
+        delta = {
+            "reasoning_details": [
+                {"type": "thinking", "text": "First chunk."},
+                {"type": "thinking", "text": "Second chunk."},
+            ]
+        }
+        assert _extract_reasoning_from_delta(delta) == "First chunk.\nSecond chunk."
+
+    def test_openrouter_reasoning_details_delta_nested_text(self):
+        delta = {
+            "reasoning_details": [
+                {
+                    "type": "reasoning",
+                    "encrypted_content": "opaque",
+                    "summary": [{"text": "Visible summary."}],
+                }
+            ]
+        }
+        assert _extract_reasoning_from_delta(delta) == "Visible summary."
+
 
 # =============================================================================
 # _SSEReasoningTap + _install_streaming_reasoning_tap
@@ -565,6 +607,38 @@ class TestSSEReasoningTap:
         for _ in tap.iter_bytes():
             pass
         assert tap.reasoning_content == "openrouter"
+
+    def test_openrouter_reasoning_details_field(self):
+        body = _sse_lines(
+            [
+                {
+                    "choices": [
+                        {
+                            "delta": {
+                                "reasoning_details": [
+                                    {"type": "thinking", "text": "mini"}
+                                ]
+                            }
+                        }
+                    ]
+                },
+                {
+                    "choices": [
+                        {
+                            "delta": {
+                                "reasoning_details": [
+                                    {"type": "thinking", "text": "max"}
+                                ]
+                            }
+                        }
+                    ]
+                },
+            ]
+        )
+        tap = _SSEReasoningTap(_FakeResponse(body))
+        for _ in tap.iter_bytes():
+            pass
+        assert tap.reasoning_content == "minimax"
 
     def test_malformed_json_is_skipped(self):
         body = (

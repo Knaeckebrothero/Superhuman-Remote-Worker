@@ -16,10 +16,19 @@ import pytest
 
 from orchestrator.services.ide_settings import (
     CODE_SERVER_USER_DIR,
+    GLOBAL_STORAGE_DIR,
     IdeSettingsStore,
+    OpenVsxClassifier,
+    build_extension_install_script,
+    build_extensions_list_script,
     build_seed_script,
+    build_signature_script,
+    capture_ide_profile,
+    parse_extensions_list,
+    parse_signature,
     parse_pull_output,
     pull_ide_config,
+    reconcile_extensions,
     reconcile_ide_settings,
     resolve_ssh_target,
     seed_ide_config_for_user,
@@ -554,3 +563,423 @@ class TestGetIdeFiles:
         db = FakeSettingsDB({UID: {"ide": {"version": 1}}})
         store = IdeSettingsStore(db)
         assert await store.get_ide_files(UID) == {}
+
+
+class TestExtensionList:
+    def test_parses_id_version_and_theme_flag(self):
+        out = (
+            "monokai.theme-monokai-pro-vscode@2.0.13\tTHEME\n"
+            "ms-python.python@2024.4.1\t-\n"
+            "garbage-line-no-tab\n"
+        )
+        result = parse_extensions_list(out)
+        assert result == {
+            "monokai.theme-monokai-pro-vscode": {"version": "2.0.13", "theme": True},
+            "ms-python.python": {"version": "2024.4.1", "theme": False},
+        }
+
+    def test_empty_output_is_empty_dict(self):
+        assert parse_extensions_list("") == {}
+
+    def test_list_script_targets_extensions_dir(self):
+        script = build_extensions_list_script()
+        assert "/var/lib/code-server/extensions" in script
+        assert "package.json" in script
+
+
+class TestOpenVsxClassifier:
+    @pytest.mark.asyncio
+    async def test_available_returns_openvsx(self):
+        calls = []
+
+        async def fake_fetch(url):
+            calls.append(url)
+            return 200  # Open VSX has it
+
+        clf = OpenVsxClassifier(fetch=fake_fetch)
+        src = await clf.classify("monokai.theme-monokai-pro-vscode", "2.0.13")
+        assert src == "openvsx"
+        assert "monokai/theme-monokai-pro-vscode/2.0.13" in calls[0]
+
+    @pytest.mark.asyncio
+    async def test_missing_returns_bytes(self):
+        async def fake_fetch(url):
+            return 404
+
+        clf = OpenVsxClassifier(fetch=fake_fetch)
+        assert await clf.classify("acme.private", "1.0.0") == "bytes"
+
+    @pytest.mark.asyncio
+    async def test_result_is_cached(self):
+        n = {"calls": 0}
+
+        async def fake_fetch(url):
+            n["calls"] += 1
+            return 200
+
+        clf = OpenVsxClassifier(fetch=fake_fetch)
+        await clf.classify("a.b", "1.0.0")
+        await clf.classify("a.b", "1.0.0")
+        assert n["calls"] == 1  # cached by (id, version)
+
+    @pytest.mark.asyncio
+    async def test_fetch_error_defaults_to_bytes(self):
+        async def boom(url):
+            raise RuntimeError("network down")
+
+        clf = OpenVsxClassifier(fetch=boom)
+        assert await clf.classify("a.b", "1.0.0") == "bytes"
+
+
+class TestExtensionStore:
+    @pytest.mark.asyncio
+    async def test_apply_then_get_roundtrip(self):
+        db = FakeSettingsDB()
+        store = IdeSettingsStore(db)
+        items = {
+            "monokai.theme-monokai-pro-vscode": {
+                "version": "2.0.13",
+                "source": "openvsx",
+                "theme": True,
+            }
+        }
+        changed = await store.apply_extensions(UID, items)
+        assert changed == ["monokai.theme-monokai-pro-vscode"]
+        got = await store.get_extensions(UID)
+        assert got["monokai.theme-monokai-pro-vscode"]["version"] == "2.0.13"
+
+    @pytest.mark.asyncio
+    async def test_newer_version_wins_union_across_calls(self):
+        db = FakeSettingsDB()
+        store = IdeSettingsStore(db)
+        await store.apply_extensions(
+            UID, {"a.b": {"version": "1.0.0", "source": "openvsx", "theme": False}}
+        )
+        # second workspace has a.b older + a new extension c.d
+        await store.apply_extensions(
+            UID,
+            {
+                "a.b": {"version": "0.9.0", "source": "openvsx", "theme": False},
+                "c.d": {"version": "3.1.0", "source": "openvsx", "theme": False},
+            },
+        )
+        got = await store.get_extensions(UID)
+        assert got["a.b"]["version"] == "1.0.0"  # newer kept (union, not clobber)
+        assert got["c.d"]["version"] == "3.1.0"  # new one added
+
+    @pytest.mark.asyncio
+    async def test_apply_preserves_sibling_files_subtree(self):
+        db = FakeSettingsDB({UID: {"ide": {"files": {"settings.json": _f("x", 1.0)}}}})
+        store = IdeSettingsStore(db)
+        await store.apply_extensions(
+            UID, {"a.b": {"version": "1.0.0", "source": "openvsx", "theme": False}}
+        )
+        files = await store.get_ide_files(UID)
+        assert files["settings.json"] == _f("x", 1.0)  # not clobbered by shallow merge
+
+
+class TestExtensionInstallScript:
+    def test_empty_is_noop(self):
+        assert build_extension_install_script({}) == "exit 0\n"
+
+    def test_only_openvsx_items_installed(self):
+        items = {
+            "monokai.theme-monokai-pro-vscode": {
+                "version": "2.0.13",
+                "source": "openvsx",
+                "theme": True,
+            },
+            "ms-python.python": {
+                "version": "2024.4.1",
+                "source": "openvsx",
+                "theme": False,
+            },
+            "acme.private": {"version": "1.0.0", "source": "bytes", "theme": False},
+        }
+        script = build_extension_install_script(items)
+        assert "monokai.theme-monokai-pro-vscode@2.0.13" in script
+        assert "ms-python.python@2024.4.1" in script
+        assert "acme.private" not in script  # bytes source not installed here
+        assert "--extensions-dir /var/lib/code-server/extensions" in script
+        # theme installs synchronously before the backgrounded block
+        theme_idx = script.index("monokai.theme-monokai-pro-vscode")
+        bg_idx = script.index("ms-python.python")
+        assert theme_idx < bg_idx
+
+
+class TestReconcileExtensions:
+    @pytest.mark.asyncio
+    async def test_lists_classifies_and_stores(self):
+        db = FakeSettingsDB()
+        store = IdeSettingsStore(db)
+        workspaces = [
+            {"user_id": UID, "context": {"workspace_container": {"pod_ip": "10.0.0.1"}}}
+        ]
+
+        async def list_fn(host, port):
+            assert (host, port) == ("10.0.0.1", 30022)
+            return {"a.b": {"version": "1.0.0", "theme": True}}
+
+        class FakeClf:
+            async def classify(self, ext_id, version):
+                return "openvsx"
+
+        n = await reconcile_extensions(store, workspaces, list_fn, FakeClf())
+        assert n == 1
+        got = await store.get_extensions(UID)
+        assert got["a.b"] == {"version": "1.0.0", "source": "openvsx", "theme": True}
+
+    @pytest.mark.asyncio
+    async def test_unreachable_workspace_skipped(self):
+        db = FakeSettingsDB()
+        store = IdeSettingsStore(db)
+        workspaces = [
+            {"user_id": UID, "context": {"workspace_container": {"pod_ip": "10.0.0.1"}}}
+        ]
+
+        async def list_fn(host, port):
+            raise RuntimeError("ssh refused")
+
+        class FakeClf:
+            async def classify(self, ext_id, version):
+                return "openvsx"
+
+        assert await reconcile_extensions(store, workspaces, list_fn, FakeClf()) == 0
+
+
+class TestSeedForUserInstallsExtensions:
+    @pytest.mark.asyncio
+    async def test_seeds_files_and_installs_openvsx_extensions(self):
+        db = FakeSettingsDB(
+            {
+                UID: {
+                    "ide": {
+                        "files": {
+                            "settings.json": _f(
+                                '{"workbench.colorTheme":"Monokai Pro"}', 5.0
+                            )
+                        },
+                        "extensions": {
+                            "items": {
+                                "monokai.theme-monokai-pro-vscode": {
+                                    "version": "2.0.13",
+                                    "source": "openvsx",
+                                    "theme": True,
+                                }
+                            }
+                        },
+                    }
+                }
+            }
+        )
+        scripts = []
+
+        async def fake_runner(host, port, script, key_path=None, timeout=20):
+            scripts.append(script)
+            return 0, b"", b""
+
+        ok = await seed_ide_config_for_user(
+            db, UID, "10.0.0.5", 30022, _runner=fake_runner
+        )
+        assert ok is True
+        joined = "\n".join(scripts)
+        assert "settings.json" in joined  # files seeded
+        assert (
+            "monokai.theme-monokai-pro-vscode@2.0.13" in joined
+        )  # extension installed
+
+
+class TestSignature:
+    def test_script_covers_extensions_and_globalstorage(self):
+        s = build_signature_script()
+        assert "/var/lib/code-server/extensions" in s
+        assert "/var/lib/code-server/User/globalStorage" in s
+        assert "sha256sum" in s
+
+    def test_parse_takes_first_token(self):
+        assert parse_signature("abc123  -\n") == "abc123"
+        assert parse_signature("") == ""
+
+
+class TestCaptureProfile:
+    @pytest.mark.asyncio
+    async def test_skips_when_signature_unchanged(self):
+        db = FakeSettingsDB({UID: {"ide": {"extensions": {"sig": "SAME"}}}})
+        store = IdeSettingsStore(db)
+
+        async def sig_runner(host, port, script, key_path=None, timeout=20):
+            return 0, b"SAME  -\n", b""
+
+        captured = {"called": False}
+
+        class FakeProfileStore:
+            async def put_globalstorage(self, *a, **k):
+                captured["called"] = True
+
+        n = await capture_ide_profile(
+            store,
+            UID,
+            "10.0.0.1",
+            30022,
+            FakeProfileStore(),
+            _runner=sig_runner,
+            _tar_fn=None,
+        )
+        assert n == 0 and captured["called"] is False
+
+
+class TestSeedProfile:
+    @pytest.mark.asyncio
+    async def test_extracts_globalstorage_and_touches_sentinel(self, tmp_path):
+        # profile store yields a blob; runner records the extract+sentinel script
+        scripts = []
+
+        async def _ok(*a, **k):
+            return True
+
+        class FakeProfileStore:
+            async def get_globalstorage(self, uid, path):
+                with open(path, "wb") as f:
+                    f.write(b"GS")
+                return True
+
+            async def get_ext_bytes(self, *a, **k):
+                return False
+
+        async def fake_runner(host, port, script, key_path=None, timeout=20):
+            scripts.append(script)
+            return 0, b"", b""
+
+        from orchestrator.services.ide_settings import (
+            SEED_STATE_SENTINEL,
+            seed_ide_profile,
+        )
+
+        ok = await seed_ide_profile(
+            user_id=UID,
+            ssh_host="h",
+            ssh_port=30022,
+            profile_store=FakeProfileStore(),
+            ext_items={},
+            _runner=fake_runner,
+            _push_fn=lambda *a, **k: _ok(),
+        )
+        assert ok is True
+        assert any(SEED_STATE_SENTINEL in s for s in scripts)
+
+
+class TestCaptureBytesExtension:
+    @pytest.mark.asyncio
+    async def test_resolves_platform_suffixed_folder(self):
+        # A bytes-source extension whose on-disk folder carries code-server's
+        # platform suffix (e.g. "<id>-<ver>-universal"). Capture must tar the
+        # REAL folder, not the bare "<id>-<ver>" guess.
+        db = FakeSettingsDB(
+            {
+                UID: {
+                    "ide": {
+                        "extensions": {
+                            "items": {
+                                "acme.private": {
+                                    "version": "1.2.3",
+                                    "source": "bytes",
+                                    "theme": False,
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        )
+        store = IdeSettingsStore(db)
+
+        async def runner(host, port, script, key_path=None, timeout=20):
+            if "sha256sum" in script:
+                return 0, b"NEWSIG  -\n", b""  # signature changed -> proceed
+            if "acme.private-1.2.3" in script:  # resolve-ext-dir script
+                return 0, b"acme.private-1.2.3-universal\n", b""
+            return 0, b"", b""
+
+        tarred = []
+
+        async def tar_fn(
+            host, port, remote_path, local_path, key_path=None, timeout=120
+        ):
+            tarred.append(remote_path)
+            return True
+
+        class FakeProfileStore:
+            def __init__(self):
+                self.put_bytes = None
+
+            async def ext_bytes_exists(self, *a, **k):
+                return False
+
+            async def put_globalstorage(self, *a, **k):
+                pass
+
+            async def put_ext_bytes(self, user_id, ext_id, version, path):
+                self.put_bytes = (ext_id, version)
+
+        ps = FakeProfileStore()
+        n = await capture_ide_profile(
+            store, UID, "h", 30022, ps, _runner=runner, _tar_fn=tar_fn
+        )
+
+        # globalStorage + the resolved bytes folder were tarred
+        assert any(t.endswith("/acme.private-1.2.3-universal") for t in tarred)
+        # NOT the bare guess
+        assert "/var/lib/code-server/extensions/acme.private-1.2.3" not in tarred
+        assert ps.put_bytes == ("acme.private", "1.2.3")
+        assert n == 2
+
+    @pytest.mark.asyncio
+    async def test_skips_when_folder_not_found(self):
+        db = FakeSettingsDB(
+            {
+                UID: {
+                    "ide": {
+                        "extensions": {
+                            "items": {
+                                "acme.private": {
+                                    "version": "9.9.9",
+                                    "source": "bytes",
+                                    "theme": False,
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        )
+        store = IdeSettingsStore(db)
+
+        async def runner(host, port, script, key_path=None, timeout=20):
+            if "sha256sum" in script:
+                return 0, b"NEWSIG  -\n", b""
+            return 0, b"", b""  # resolve finds nothing
+
+        tarred = []
+
+        async def tar_fn(
+            host, port, remote_path, local_path, key_path=None, timeout=120
+        ):
+            tarred.append(remote_path)
+            return True
+
+        class FakeProfileStore:
+            async def ext_bytes_exists(self, *a, **k):
+                return False
+
+            async def put_globalstorage(self, *a, **k):
+                pass
+
+            async def put_ext_bytes(self, *a, **k):
+                raise AssertionError("should not upload bytes when folder missing")
+
+        n = await capture_ide_profile(
+            store, UID, "h", 30022, FakeProfileStore(), _runner=runner, _tar_fn=tar_fn
+        )
+        # only globalStorage tarred; the bytes folder was never resolved
+        assert tarred == [GLOBAL_STORAGE_DIR]
+        assert n == 1

@@ -22,45 +22,81 @@ VALID_AUTONOMY_LEVELS = {"full", "review", "partial", "guided", "dependent"}
 
 
 # =============================================================================
-# DB-backed prompt overrides (PROMPT_DB_OVERRIDES_ENABLED)
+# Context-window limit fractions
+# =============================================================================
+# The context-management `limits` leaves are DERIVED as fixed fractions of a
+# single base context-window number (see _apply_settings_matrix). The base is
+# the admin/catalog per-model window when set (injected at dispatch into
+# llm.model_max_context_tokens), else the family's conservative
+# limits.model_max_context_tokens. Fractions are uniform across families:
+# threshold leaves headroom below the window so the summarizer/response have
+# room to work. Keep these in sync with the hardcoded LimitsConfig /
+# ContextConfig fallback defaults (which are a base=100_000 instance of these).
+CONTEXT_THRESHOLD_FRACTION = 0.80
+SUMMARIZATION_SAFE_FRACTION = 0.90
+SUMMARIZATION_CHUNK_FRACTION = 0.60
+MESSAGE_COUNT_MIN_FRACTION = 0.40
+
+
+# =============================================================================
+# DB-backed config overrides (CONFIG_DB_OVERRIDES_ENABLED)
 # =============================================================================
 # Populated once per job by the agent at first run (before
-# serialize_resolved_config), then read synchronously by the resolver. Map:
-# family -> {(kind, name): content}; global (NULL-family) overrides live under
-# the "" key. One job per agent process at a time, so a module-level map is safe.
-# When the flag is off (or no row matches), _db_lookup returns None and
-# resolution falls through to the bundled config/ files — identical to today.
+# serialize_resolved_config), then read synchronously by the resolver. Two maps,
+# keyed family -> {(kind, name): value}; global (NULL-family) overrides live
+# under the "" key. Text kinds (prompts, instructions) carry resolved content;
+# structured kinds (settings, guardrails) carry parsed JSON values. One job per
+# agent process at a time, so module-level maps are safe. When the flag is off
+# (or no row matches), resolution falls through to the bundled config/ files.
 
-_PROMPT_OVERRIDES: Dict[str, Dict[tuple, str]] = {}
+_CONFIG_OVERRIDES: Dict[
+    str, Dict[tuple, str]
+] = {}  # text kinds: (kind, name) -> content
+_VALUE_OVERRIDES: Dict[
+    str, Dict[tuple, Any]
+] = {}  # structured kinds: (kind, name) -> value
 
 
-def _is_prompt_db_overrides_enabled() -> bool:
-    """True when DB-backed prompt overrides are turned on via env."""
-    return os.getenv("PROMPT_DB_OVERRIDES_ENABLED", "").lower().strip() in (
+def _is_config_db_overrides_enabled() -> bool:
+    """True when DB-backed config overrides are turned on via env."""
+    return os.getenv("CONFIG_DB_OVERRIDES_ENABLED", "").lower().strip() in (
         "true",
         "1",
         "yes",
     )
 
 
-def set_prompt_overrides(rows: List[Dict[str, Any]]) -> None:
-    """Load override rows into the process map (replaces any previous set).
+def set_config_overrides(rows: List[Dict[str, Any]]) -> None:
+    """Load override rows into the process maps (replaces any previous set).
 
-    Each row needs keys: family (str|None), kind, name, content. Rows with a
-    NULL/empty family are stored under the "" (global) bucket.
+    Text kinds (prompts, instructions) carry ``content``; structured kinds
+    (settings, guardrails) carry ``value_json``. NULL/empty family -> "" bucket.
     """
-    mapping: Dict[str, Dict[tuple, str]] = {}
+    import json as _json
+
+    text_map: Dict[str, Dict[tuple, str]] = {}
+    value_map: Dict[str, Dict[tuple, Any]] = {}
     for row in rows:
         fam = row.get("family") or ""
-        mapping.setdefault(fam, {})[(row["kind"], row["name"])] = row["content"]
-    global _PROMPT_OVERRIDES
-    _PROMPT_OVERRIDES = mapping
+        kind = row["kind"]
+        if kind in ("prompts", "instructions"):
+            if row.get("content") is not None:
+                text_map.setdefault(fam, {})[(kind, row["name"])] = row["content"]
+        elif kind in ("settings", "guardrails"):
+            val = row.get("value_json")
+            if isinstance(val, str):  # asyncpg JSONB w/o codec -> str
+                val = _json.loads(val)
+            value_map.setdefault(fam, {})[(kind, row["name"])] = val
+    global _CONFIG_OVERRIDES, _VALUE_OVERRIDES
+    _CONFIG_OVERRIDES = text_map
+    _VALUE_OVERRIDES = value_map
 
 
-def clear_prompt_overrides() -> None:
-    """Drop all process-local prompt overrides (used between jobs and in tests)."""
-    global _PROMPT_OVERRIDES
-    _PROMPT_OVERRIDES = {}
+def clear_config_overrides() -> None:
+    """Drop all process-local overrides (used between jobs and in tests)."""
+    global _CONFIG_OVERRIDES, _VALUE_OVERRIDES
+    _CONFIG_OVERRIDES = {}
+    _VALUE_OVERRIDES = {}
 
 
 def _db_lookup(kind: str, family: str, name: str) -> Optional[str]:
@@ -69,15 +105,58 @@ def _db_lookup(kind: str, family: str, name: str) -> Optional[str]:
     Returns None when the flag is off or no row matches, so callers fall through
     to bundled-file resolution.
     """
-    if not _is_prompt_db_overrides_enabled():
+    if not _is_config_db_overrides_enabled():
         return None
-    fam_map = _PROMPT_OVERRIDES.get(family)
+    fam_map = _CONFIG_OVERRIDES.get(family)
     if fam_map is not None and (kind, name) in fam_map:
         return fam_map[(kind, name)]
-    global_map = _PROMPT_OVERRIDES.get("")
+    global_map = _CONFIG_OVERRIDES.get("")
     if global_map is not None and (kind, name) in global_map:
         return global_map[(kind, name)]
     return None
+
+
+def _expand_dotted(flat: Dict[str, Any]) -> Dict[str, Any]:
+    """Expand dotted keys ('limits.x') into nested dicts ({'limits': {'x': ...}})."""
+    out: Dict[str, Any] = {}
+    for key, val in flat.items():
+        parts = key.split(".")
+        node = out
+        for part in parts[:-1]:
+            node = node.setdefault(part, {})
+        node[parts[-1]] = val
+    return out
+
+
+def _settings_override_for(family: str) -> Dict[str, Any]:
+    """DB settings override for <family> (global then family) as a nested dict
+    ready to deep_merge onto file settings. {} when flag off or no rows."""
+    if not _is_config_db_overrides_enabled():
+        return {}
+
+    def collect(fam: str) -> Dict[str, Any]:
+        flat = {
+            name: val
+            for (kind, name), val in _VALUE_OVERRIDES.get(fam, {}).items()
+            if kind == "settings"
+        }
+        return _expand_dotted(flat)
+
+    return deep_merge(collect(""), collect(family))
+
+
+def _guardrails_override_for(family: str) -> Dict[str, Any]:
+    """DB guardrails override ({tool_examples, nudges}) for <family>. {} when off."""
+    if not _is_config_db_overrides_enabled():
+        return {}
+
+    def collect(fam: str) -> Dict[str, Any]:
+        for (kind, name), val in _VALUE_OVERRIDES.get(fam, {}).items():
+            if kind == "guardrails":
+                return val if isinstance(val, dict) else {}
+        return {}
+
+    return deep_merge(collect(""), collect(family))
 
 
 # =============================================================================
@@ -389,7 +468,7 @@ def _load_guardrails_matrix(
 
 
 def resolve_guardrails(
-    model: str, deployment_dir: Optional[str] = None
+    model: str, deployment_dir: Optional[str] = None, *, bundled_only: bool = False
 ) -> Dict[str, Any]:
     """Resolve the merged guardrails dict for a model.
 
@@ -408,10 +487,15 @@ def resolve_guardrails(
     matrix = _load_guardrails_matrix(deployment_dir)
     default_guardrails = matrix.get("default", {})
     family_guardrails = matrix.get(family, {}) if family != "default" else {}
-    return deep_merge(default_guardrails, family_guardrails)
+    merged = deep_merge(default_guardrails, family_guardrails)
+    if not bundled_only:
+        merged = deep_merge(merged, _guardrails_override_for(family))
+    return merged
 
 
-def resolve_model_settings(model: str, deployment_dir: str = None) -> Dict[str, Any]:
+def resolve_model_settings(
+    model: str, deployment_dir: str = None, *, bundled_only: bool = False
+) -> Dict[str, Any]:
     """Resolve settings matrix values for a given model.
 
     Returns the merged default + family-specific settings (flat LLM keys only,
@@ -430,10 +514,37 @@ def resolve_model_settings(model: str, deployment_dir: str = None) -> Dict[str, 
     default_settings = matrix.get("default", {})
     family_settings = matrix.get(family, {}) if family != "default" else {}
     settings = deep_merge(default_settings, family_settings)
+    if not bundled_only:
+        settings = deep_merge(settings, _settings_override_for(family))
 
     # Strip 'limits' — callers want LLM inference params only
     settings.pop("limits", None)
     return settings
+
+
+def bundled_settings_for_family(family: str, name: str) -> Any:
+    """File-resolved settings leaf for <family> (default ⊕ family), ignoring DB
+    overrides. ``name`` may be a dotted path into limits (e.g.
+    'limits.context_threshold_tokens'). Returns None if the leaf is absent."""
+    matrix = _load_settings_matrix(None)
+    default_settings = matrix.get("default", {})
+    family_settings = matrix.get(family, {}) if family != "default" else {}
+    settings = deep_merge(default_settings, family_settings)
+    node: Any = settings
+    for part in name.split("."):
+        if not isinstance(node, dict):
+            return None
+        node = node.get(part)
+    return node
+
+
+def bundled_guardrails_for_family(family: str) -> Dict[str, Any]:
+    """File-resolved guardrails ({tool_examples, nudges}) for <family>, ignoring
+    DB overrides."""
+    matrix = _load_guardrails_matrix(None)
+    default_guardrails = matrix.get("default", {})
+    family_guardrails = matrix.get(family, {}) if family != "default" else {}
+    return deep_merge(default_guardrails, family_guardrails)
 
 
 def _apply_settings_matrix(
@@ -463,6 +574,7 @@ def _apply_settings_matrix(
     default_settings = matrix.get("default", {})
     family_settings = matrix.get(family, {}) if family != "default" else {}
     settings = deep_merge(default_settings, family_settings)
+    settings = deep_merge(settings, _settings_override_for(family))
 
     if not settings:
         return data
@@ -484,10 +596,54 @@ def _apply_settings_matrix(
             data.setdefault("limits", {})[key] = value
             applied.append(f"limits.{key}={value}")
 
+    # Derive the working-window limit leaves from a single base context window.
+    # Base = the admin/catalog per-model window when explicitly overridden (it
+    # rides in llm.model_max_context_tokens and survived the flat-key loop above
+    # because it's in expert_llm_keys), else the family's conservative
+    # limits.model_max_context_tokens just applied. Invariant: no base config or
+    # expert YAML sets llm.model_max_context_tokens (see config/defaults.yaml),
+    # so its presence in expert_llm_keys means an explicit per-model override.
+    # Runs last so it is the sole authority for the derived leaves.
+    base = None
+    if "model_max_context_tokens" in expert_llm_keys:
+        base = (data.get("llm") or {}).get("model_max_context_tokens")
+    if not base:  # not overridden, or overridden with a falsy value (0/None)
+        base = (data.get("limits") or {}).get("model_max_context_tokens")
+    if base and base > 0:
+        lim = data.setdefault("limits", {})
+        lim["model_max_context_tokens"] = int(base)
+        lim["context_threshold_tokens"] = int(base * CONTEXT_THRESHOLD_FRACTION)
+        lim["summarization_safe_limit"] = int(base * SUMMARIZATION_SAFE_FRACTION)
+        lim["summarization_chunk_size"] = int(base * SUMMARIZATION_CHUNK_FRACTION)
+        lim["message_count_min_tokens"] = int(base * MESSAGE_COUNT_MIN_FRACTION)
+        applied.append(f"limits<-derived(base={int(base)})")
+
     if applied:
         logger.debug(f"Settings matrix ({family}): applied {', '.join(applied)}")
 
     return data
+
+
+def apply_settings_overrides(config: "AgentConfig") -> bool:
+    """Apply ONLY the DB settings override on top of an already-resolved config,
+    in place. File/expert settings are already baked in by load_agent_config; this
+    writes just the DB delta, so it never clobbers non-overridden values. Call at
+    job start after set_config_overrides(), before LLM (re)creation and the freeze.
+    Returns True if anything changed. No-op when flag off or no settings rows."""
+    override = _settings_override_for(family_of(config.llm.model))
+    if not override:
+        return False
+    changed = False
+    for key, val in override.items():
+        if key == "limits" and isinstance(val, dict):
+            for lk, lv in val.items():
+                if hasattr(config.limits, lk) and getattr(config.limits, lk) != lv:
+                    setattr(config.limits, lk, lv)
+                    changed = True
+        elif hasattr(config.llm, key) and getattr(config.llm, key) != val:
+            setattr(config.llm, key, val)
+            changed = True
+    return changed
 
 
 class FileResolver:
@@ -728,7 +884,7 @@ class MatrixResolver:
     def load(self, entry_type: str, *, bundled_only: bool = False) -> str:
         """Resolve filename and load the content.
 
-        When DB-backed prompt overrides are enabled, an override for
+        When DB-backed config overrides are enabled, an override for
         ``(MATRIX_SUBSECTION, model_family, entry_type)`` is returned before any
         bundled file is read. Pass ``bundled_only=True`` to bypass overrides and
         always read the shipped ``config/`` file (used by the admin "bundled
@@ -1023,7 +1179,7 @@ class ToolsConfig:
     shell: List[str] = field(default_factory=list)
     evaluation: List[str] = field(default_factory=list)
     knowledge: List[str] = field(default_factory=list)
-    cloud: List[str] = field(default_factory=list)
+    webdav: List[str] = field(default_factory=list)
     communication: List[str] = field(default_factory=list)
     delegation: List[str] = field(default_factory=list)
     orchestrator: List[str] = field(default_factory=list)
@@ -1051,18 +1207,16 @@ class ResponseValidationConfig:
 class LimitsConfig:
     """Execution limits configuration."""
 
-    context_threshold_tokens: int = (
-        80000  # Safety net default; real value from settings_matrix
-    )
+    # Derived-leaf fallbacks: a base=100_000 instance of the limit fractions
+    # (see CONTEXT_THRESHOLD_FRACTION et al.). Real values come from the matrix
+    # derivation; these only fire when a key is wholly absent (test/edge paths).
+    context_threshold_tokens: int = 80000  # 100_000 * 0.80
     message_count_threshold: int = 200
-    message_count_min_tokens: int = (
-        50000  # Safety net default; real value from settings_matrix
-    )
+    message_count_min_tokens: int = 40000  # 100_000 * 0.40
     tool_retry_count: int = 3
-    # Safety layer constants — real values come from settings_matrix.yaml
     model_max_context_tokens: int = 100000
-    summarization_safe_limit: int = 90000
-    summarization_chunk_size: int = 80000
+    summarization_safe_limit: int = 90000  # 100_000 * 0.90
+    summarization_chunk_size: int = 60000  # 100_000 * 0.60
     response_validation: ResponseValidationConfig = field(
         default_factory=ResponseValidationConfig
     )
@@ -1483,7 +1637,7 @@ def load_agent_config(
         shell=tools_data.get("shell", tools_data.get("coding", [])),
         evaluation=tools_data.get("evaluation", []),
         knowledge=tools_data.get("knowledge", []),
-        cloud=tools_data.get("cloud", []),
+        webdav=tools_data.get("webdav", []),
         delegation=tools_data.get("delegation", []),
         orchestrator=tools_data.get("orchestrator", []),
     )
@@ -1501,7 +1655,7 @@ def load_agent_config(
         tool_retry_count=limits_data.get("tool_retry_count", 3),
         model_max_context_tokens=limits_data.get("model_max_context_tokens", 100000),
         summarization_safe_limit=limits_data.get("summarization_safe_limit", 90000),
-        summarization_chunk_size=limits_data.get("summarization_chunk_size", 80000),
+        summarization_chunk_size=limits_data.get("summarization_chunk_size", 60000),
         response_validation=_parse_response_validation(
             limits_data.get("response_validation", {})
         ),
@@ -1684,7 +1838,7 @@ def load_agent_config_from_dict(
         shell=tools_data.get("shell", tools_data.get("coding", [])),
         evaluation=tools_data.get("evaluation", []),
         knowledge=tools_data.get("knowledge", []),
-        cloud=tools_data.get("cloud", []),
+        webdav=tools_data.get("webdav", []),
         delegation=tools_data.get("delegation", []),
         orchestrator=tools_data.get("orchestrator", []),
     )
@@ -1702,7 +1856,7 @@ def load_agent_config_from_dict(
         tool_retry_count=limits_data.get("tool_retry_count", 3),
         model_max_context_tokens=limits_data.get("model_max_context_tokens", 100000),
         summarization_safe_limit=limits_data.get("summarization_safe_limit", 90000),
-        summarization_chunk_size=limits_data.get("summarization_chunk_size", 80000),
+        summarization_chunk_size=limits_data.get("summarization_chunk_size", 60000),
         response_validation=_parse_response_validation(
             limits_data.get("response_validation", {})
         ),
@@ -1906,6 +2060,7 @@ def detect_reasoning_method(model: str, explicit_method: Optional[str] = None) -
         "claude-haiku",
         "gemini",
         "minimax",
+        "minimax-m3",
         "gemma",
     ):
         return "none"
@@ -2378,6 +2533,10 @@ def _create_openrouter_llm(
         "api_key": api_key,
         "base_url": base_url,
         "max_retries": config.max_retries,
+        # OpenRouter supports its reasoning object on Chat Completions.
+        # LangChain infers the Responses API whenever ``reasoning`` is set,
+        # which is not compatible with all OpenRouter-routed models.
+        "use_responses_api": False,
     }
     if config.top_p is not None:
         llm_kwargs["top_p"] = config.top_p
@@ -2615,7 +2774,7 @@ def get_phase_system_prompt(
     5. Render remaining placeholders ({agent_display_name}, etc.)
     6. Render Jinja2 conditionals ({% if has_tool("kb_write") %} etc.)
 
-    Note: workspace.md and todos are injected as transient messages
+    Note: todos, memory, and knowledge are injected as transient messages
     in graph.py, not included in the system prompt.
 
     Args:
@@ -2908,7 +3067,7 @@ def get_all_tool_names(config: AgentConfig) -> List[str]:
         + config.tools.shell
         + config.tools.evaluation
         + config.tools.knowledge
-        + config.tools.cloud
+        + config.tools.webdav
         + config.tools.communication
         + config.tools.delegation
         + config.tools.orchestrator

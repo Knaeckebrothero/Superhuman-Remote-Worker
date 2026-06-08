@@ -198,7 +198,10 @@ spec:
               value: "10.0.0.0/8 172.16.0.0/12 192.168.0.0/16"
             - name: OVERWRITEPROTOCOL
               value: "https"
-            # S3 primary storage (existing cluster MinIO)
+            {{- if .Values.nextcloud.objectStore.enabled }}
+            # S3 primary storage (existing cluster MinIO). Disable via
+            # nextcloud.objectStore.enabled=false to store files on the PVC
+            # (filesystem) instead — e.g. local k3d, which has no MinIO.
             - name: OBJECTSTORE_S3_BUCKET
               value: "srw-nextcloud"
             - name: OBJECTSTORE_S3_REGION
@@ -223,6 +226,7 @@ spec:
                 secretKeyRef:
                   name: {{ include "srw.secretName" . }}
                   key: NEXTCLOUD_S3_SECRET_KEY
+            {{- end }}
             # OIDC auto-configuration (used by before-starting hook)
             - name: NEXTCLOUD_OIDC_CLIENT_SECRET
               valueFrom:

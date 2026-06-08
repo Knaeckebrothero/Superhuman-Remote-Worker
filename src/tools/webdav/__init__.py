@@ -13,7 +13,7 @@ from typing import Any, Dict, List
 from ..context import ToolContext
 
 
-def create_cloud_tools(context: ToolContext) -> List[Any]:
+def create_webdav_tools(context: ToolContext) -> List[Any]:
     """Create all WebDAV tools with injected context.
 
     Args:
@@ -25,13 +25,13 @@ def create_cloud_tools(context: ToolContext) -> List[Any]:
     Raises:
         ValueError: If WebDAV datasource not available in context
     """
-    from .webdav import create_webdav_tools
+    from .tools import create_webdav_tools as _impl
 
-    return create_webdav_tools(context)
+    return _impl(context)
 
 
-def get_cloud_metadata() -> Dict[str, Dict[str, Any]]:
+def get_webdav_metadata() -> Dict[str, Dict[str, Any]]:
     """Get metadata for all WebDAV tools."""
-    from .webdav import CLOUD_TOOLS_METADATA
+    from .tools import WEBDAV_TOOLS_METADATA
 
-    return CLOUD_TOOLS_METADATA
+    return WEBDAV_TOOLS_METADATA

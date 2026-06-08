@@ -160,10 +160,13 @@ auxiliary:
   base_url: null
   temperature: 0.0
   max_iterations: 15
-  # Bounded for the interactive path: auxiliary work (summarization, memory,
-  # knowledge) runs inline on the turn's critical path, so a hung endpoint
-  # mustn't stall a turn for two minutes. Failures fall back / skip gracefully.
-  timeout: 45
+  # Bounded for the interactive path: short aux tasks (memory extraction,
+  # knowledge curation, titles) run inline on the turn's critical path, so a
+  # hung endpoint mustn't stall a turn for long. Failures fall back / skip
+  # gracefully. Summarization is the exception — it passes the larger,
+  # dedicated summarization_timeout (see ContextManager) because a big
+  # conversation can't be summarized under a schema within this window.
+  timeout: 120
   tasks:
     extract_memories:
       enabled: true

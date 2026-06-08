@@ -126,11 +126,11 @@ agent:
   config: "defaults"
   port: "8001"
   persistentConfig: "interactive"
-  # -- Apply admin-curated DB prompt overrides (prompt_overrides table) to
+  # -- Apply admin-curated DB config overrides (config_overrides table) to
   # provisioned agents. Default OFF (prod-safe); the dev/experimental values
   # file turns it on. Gates only the agent's prompt resolver — not the
   # orchestrator or the admin UI (overrides remain editable regardless).
-  promptDbOverridesEnabled: "false"
+  configDbOverridesEnabled: "false"
   resources:
     requests:
       memory: "512Mi"
@@ -142,6 +142,10 @@ agent:
   tailscale:
     enabled: false
     image: ghcr.io/tailscale/tailscale:v1.82.5
+    # -- Seconds the sidecar may stay disconnected before the liveness probe
+    # kills it and the tunnel_dark reaper recycles the pod. Widen on small
+    # deployments with long-idle pool agents; self-heal recovers transient loss.
+    darkTimeoutSeconds: 600
   # -- Pod Disruption Budget
   pdb:
     enabled: true
@@ -673,6 +677,12 @@ keycloak:
 nextcloud:
   enabled: false
   internal: true
+  # Primary storage backend. true = S3 object storage via OBJECTSTORE_S3_* (the
+  # prod-private layout, requires an external bucket e.g. minio.minio.svc). false =
+  # local filesystem on the PVC at /var/www/html/data — used by the k3d overlay,
+  # which has no MinIO. Default true preserves existing prod behaviour.
+  objectStore:
+    enabled: true
   image: docker.io/library/nextcloud:31-apache
   replicas: 0
   storageClass: ""
@@ -728,10 +738,14 @@ opencloud:
       memory: "1Gi"
       cpu: "500m"
 
-# -- External cloud storage (used when both opencloud.enabled and nextcloud.enabled are false).
-# Agent authenticates with a single service account (credentials in the secret as
-# CLOUD_SERVICE_USER / CLOUD_SERVICE_PASSWORD). Per-user OAuth/linking is configured
-# in-app as datasources, not by the chart.
+# -- External MAIN CLOUD backend (used when both opencloud.enabled and nextcloud.enabled
+# are false). This is the per-deployment file backend for home/session folders — distinct
+# from two other "cloud"/"datasource" concepts: (a) runtime `datasources` rows the app
+# creates per-user/project (configured in-app, NOT by the chart), and (b) a raw single-mount
+# WebDAV datasource (externalBackend: "webdav" + DEFAULT_DS_WEBDAV_*), which has no
+# MainCloudBackend at all. The backend reads its OWN creds — NEXTCLOUD_ADMIN/AGENT_* or
+# OPENCLOUD_KEYCLOAK_CLIENT_SECRET (see externalBackend below) — NOT CLOUD_SERVICE_*, which
+# is a Keycloak service-account cred consumed only by the Keycloak bootstrap Job.
 cloud:
   # -- Backend type: "nextcloud" | "opencloud" | "webdav" | "" (disables external cloud)
   externalBackend: ""

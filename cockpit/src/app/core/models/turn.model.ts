@@ -174,6 +174,70 @@ export function lastTextOf(turn: AssistantTurn): TextEvent | undefined {
 }
 
 /**
+ * Returns the first text event in a turn. The agent's opening line usually
+ * states what it's about to do, which makes a far more useful collapsed
+ * headline than the trailing text (often just "Done."). Symmetric with
+ * lastTextOf.
+ */
+export function firstTextOf(turn: AssistantTurn): TextEvent | undefined {
+    for (const e of turn.events) {
+        if (isText(e)) return e;
+    }
+    return undefined;
+}
+
+/**
+ * The turn's "final answer": the trailing run of text events with no tool call
+ * or thought after them — the prose the model ended the turn on. This is the
+ * part worth keeping fully visible even when the turn is collapsed; collapsing
+ * folds only the lead-up (opening text, reasoning, tool calls), never the
+ * answer. Multiple trailing text blocks are joined with a blank line.
+ *
+ * Returns '' when the turn ends on a tool call or thought (no closing prose) or
+ * has no events — callers fall back to the one-line headline in that case.
+ */
+export function trailingText(turn: AssistantTurn): string {
+    const parts: string[] = [];
+    for (let i = turn.events.length - 1; i >= 0; i--) {
+        const e = turn.events[i];
+        if (!isText(e)) break;
+        parts.push(e.content);
+    }
+    return parts.reverse().join('\n\n').trim();
+}
+
+/**
+ * First sentence of a (possibly markdown) block, for a one-line headline.
+ * Drops leading markdown markers, collapses whitespace, cuts at the first
+ * sentence terminator at/after a sensible minimum length, and caps the
+ * result. Returns '' for empty/whitespace input.
+ */
+export function firstSentence(text: string, maxLen = 140): string {
+    if (!text) return '';
+    // Strip a leading/trailing code fence (```lang … ```) so a turn whose first
+    // text is a fenced code block reads as the code's first line rather than
+    // literal backticks. Then drop a leading markdown marker (#, >, bullet) and
+    // collapse whitespace so the headline reads as prose, not raw source.
+    let s = text
+        .trim()
+        .replace(/^`{3,}[^\n]*\r?\n?/, '')
+        .replace(/\r?\n?`{3,}\s*$/, '')
+        .replace(/^[#>\s]*[-*]?\s*/, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+    if (!s) return '';
+    for (let i = 11; i < s.length; i++) {
+        const ch = s[i];
+        if ((ch === '.' || ch === '!' || ch === '?') && (i + 1 >= s.length || s[i + 1] === ' ')) {
+            s = s.slice(0, i + 1);
+            break;
+        }
+    }
+    if (s.length > maxLen) s = s.slice(0, maxLen - 1).trimEnd() + '…';
+    return s;
+}
+
+/**
  * Per-type event counts for the collapsed-turn badge.
  */
 export interface TurnEventCounts {
@@ -192,4 +256,50 @@ export function countEvents(turn: AssistantTurn): TurnEventCounts {
         else tools++;
     }
     return {thoughts, texts, tools};
+}
+
+// ---------------------------------------------------------------------------
+// Event grouping (render-time, Slice 3 / Phase 2 of session_turn_rendering)
+// ---------------------------------------------------------------------------
+
+/**
+ * A view-time grouping of a turn's events. Consecutive tool calls are
+ * coalesced into one `tools` run so the renderer can collapse long
+ * sequences ("4× tool calls") without distorting the underlying event
+ * stream (cf. the model contract above: "the renderer is free to merge
+ * them visually without distorting the data"). Thoughts and text always
+ * stand alone as `single` groups.
+ */
+export type EventGroup =
+    | {kind: 'single'; id: string; event: ThoughtEvent | TextEvent}
+    | {kind: 'tools'; id: string; tools: ToolCallEvent[]};
+
+/**
+ * Coalesce a turn's flat event list into render groups: runs of consecutive
+ * tool calls become one `tools` group; every thought/text breaks the run and
+ * becomes its own `single` group. So `[tool, tool, thought, tool, tool]`
+ * yields `[tools(2), single(thought), tools(2)]` — never one merged group.
+ *
+ * A group's `id` (= the first member's event id, stable across SSE replay)
+ * is suitable for `@for (… ; track group.id)`.
+ */
+export function groupEvents(events: TurnEvent[]): EventGroup[] {
+    const groups: EventGroup[] = [];
+    let run: ToolCallEvent[] = [];
+    const flush = () => {
+        if (run.length > 0) {
+            groups.push({kind: 'tools', id: run[0].id, tools: run});
+            run = [];
+        }
+    };
+    for (const e of events) {
+        if (isToolCall(e)) {
+            run.push(e);
+        } else {
+            flush();
+            groups.push({kind: 'single', id: e.id, event: e});
+        }
+    }
+    flush();
+    return groups;
 }

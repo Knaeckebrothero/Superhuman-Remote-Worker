@@ -49,9 +49,38 @@ if [ -f /mnt/code-server-config/seed.sh ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 3. Start code-server as agent-host (background)
-#    --user-data-dir and --extensions-dir outside home keep the IDE file
-#    explorer clean. Opens /home/agent-host/workspace as the workspace root.
+# 2c. Start SSHD (background) BEFORE the state wait.
+#     The orchestrator delivers license/globalStorage state over SSH, and the
+#     pod's readiness probe is on :30022 — the orchestrator only pushes state
+#     once the pod reports Ready. So sshd MUST be listening before we wait on
+#     the sentinel; otherwise the pod never goes Ready, the push never fires,
+#     and the wait below always times out. sshd is the container's lifecycle
+#     anchor (we `wait` on it at the end instead of `exec`-ing it).
+# ---------------------------------------------------------------------------
+/usr/sbin/sshd -D -e &
+SSHD_PID=$!
+
+# ---------------------------------------------------------------------------
+# 2d. Wait (bounded) for the orchestrator to deliver license/globalStorage
+#     state. Only when the seed ConfigMap signalled state is expected. The
+#     orchestrator streams the bundle in over SSH (now reachable, see 2c) then
+#     touches the sentinel. Bounded so a slow/absent orchestrator can't wedge
+#     startup — on timeout we start code-server anyway (state lands late).
+# ---------------------------------------------------------------------------
+if [ -f /mnt/code-server-config/expect-state ]; then
+    i=0
+    while [ ! -f /var/lib/code-server/.ide-seed-state-done ] && [ "$i" -lt 30 ]; do
+        sleep 1; i=$((i+1))
+    done
+    [ -f /var/lib/code-server/.ide-seed-state-done ] || \
+        echo "ide state seed sentinel timed out after ${i}s (non-fatal)" >&2
+fi
+
+# ---------------------------------------------------------------------------
+# 3. Start code-server as agent-host (background). Starts AFTER the state wait
+#    so globalStorage (paid-theme license etc.) is already in place on first
+#    paint. --user-data-dir and --extensions-dir outside home keep the IDE
+#    file explorer clean. Opens /home/agent-host/workspace as the root.
 # ---------------------------------------------------------------------------
 su -c 'code-server \
     --bind-addr 0.0.0.0:38080 \
@@ -60,6 +89,7 @@ su -c 'code-server \
     /home/agent-host/workspace' agent-host &
 
 # ---------------------------------------------------------------------------
-# 4. Start SSHD in foreground (PID 1 — container stays alive)
+# 4. Keep the container alive, anchored to SSHD (PID exits → container exits,
+#    same lifecycle as the previous `exec sshd`).
 # ---------------------------------------------------------------------------
-exec /usr/sbin/sshd -D -e
+wait "$SSHD_PID"

@@ -319,6 +319,43 @@ class TestEvaluationToolMetadata:
 
 
 # =============================================================================
+# Critic strategic-prompt verdict-timing regression
+# =============================================================================
+#
+# Guards against the 2026-06-03 deadlock (job 8a3fc7d1): the verdict tools
+# approve_job / return_job_with_feedback are strategic-only (asserted above),
+# but the critic strategic prompt told the agent "Do NOT render verdicts during
+# strategic phases" — leaving no phase where the agent could both call the tool
+# AND believe it was allowed to. The agent looped forever via todo_rewind.
+# See docs/tests/critic_verdict_deadlock_verification.md.
+
+CRITIC_PROMPT_DIR = project_root / "config" / "experts" / "critic"
+
+
+class TestCriticStrategicPromptVerdictTiming:
+    """The critic strategic prompt must agree with the strategic-only verdict tools."""
+
+    @pytest.mark.parametrize("fname", ["strategic.txt", "strategic_minimax.txt"])
+    def test_prompt_does_not_forbid_strategic_verdict(self, fname):
+        text = (CRITIC_PROMPT_DIR / fname).read_text(encoding="utf-8")
+        # The exact sentence that caused the 8a3fc7d1 deadlock.
+        assert "Do NOT render verdicts during strategic phases" not in text, (
+            f"{fname} forbids strategic verdicts, but approve_job/"
+            "return_job_with_feedback are strategic-only — this deadlocks the critic."
+        )
+
+    @pytest.mark.parametrize("fname", ["strategic.txt", "strategic_minimax.txt"])
+    def test_prompt_directs_verdict_into_strategic(self, fname):
+        text = (CRITIC_PROMPT_DIR / fname).read_text(encoding="utf-8")
+        assert "approve_job" in text
+        # The fix tells the agent these tools are strategic-only and must not be
+        # deferred to a tactical todo.
+        assert "strategic-phase-only" in text, (
+            f"{fname} lost the directive that the verdict tools are strategic-only."
+        )
+
+
+# =============================================================================
 # Round limit enforcement tests
 # =============================================================================
 

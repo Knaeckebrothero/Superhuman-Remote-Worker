@@ -250,7 +250,7 @@ Removing these cripples the agent. They should never appear in the UI.
 | **sql** (PostgreSQL) | sql_query, sql_schema | No tools — injects PGHOST/PGPORT/PGUSER/PGPASSWORD/PGDATABASE, expects `psql` | **psql not in agent Docker image** |
 | **graph** (Neo4j) | execute_cypher_query, get_database_schema | No tools — injects NEO4J_URI/USERNAME/PASSWORD, expects `cypher-shell` | **cypher-shell not in agent Docker image** |
 | **mongodb** | mongo_query, mongo_aggregate, mongo_schema | No tools — injects MONGOSH_URI, expects `mongosh` | **mongosh not in agent Docker image** |
-| **cloud** (WebDAV) | cloud_list, cloud_read, cloud_info | Always uses tools (adds cloud_write, cloud_delete). No CLI equivalent. | `cloud:` key missing from defaults.yaml |
+| **webdav** (datasource) | webdav_list, webdav_read, webdav_info | Always uses tools (adds webdav_write, webdav_delete). No CLI equivalent. | — |
 
 #### Hidden categories (no UI toggle)
 
@@ -278,7 +278,7 @@ Agent: _setup_job_tools()
   ├─ generic → inject env vars from credentials
   └─ repository → git clone into ./repos/{slug}/
   ↓
-workspace.md gets datasource index + KB gets retrieval-optimized notes
+datasources.md gets datasource index + KB gets retrieval-optimized notes
 ```
 
 **Resolved**: CLI clients (psql, cypher-shell, mongosh) are installed in `Dockerfile.workspace` and `provision.sh`. Agent CLI commands are proxied to workspaces via SSH.
@@ -331,7 +331,7 @@ Scholar/Critic/delegate_work = parent-child (shared workspace via worktrees). Or
 | 9 | Critic/Scholar enable delegation | **Resolved.** `delegate_work` and `resume_delegation_child` are fully implemented. Both critic and scholar configs already list both tools. No changes needed. | DONE |
 | 10 | Interactive disables knowledge entirely | **Enabled.** Replaced `knowledge: []` with full kb_* tool list (10 tools) in `config/experts/interactive/config.yaml`. Infrastructure was already wired (KnowledgeStore, Neo4j, project scoping). | DONE |
 | 11 | Re-enabling category restores defaults, not expert's list | **Not a bug.** Re-enabling an expert-disabled category correctly restores from defaults. Edge case: toggling off/on a custom subset loses the subset — low priority, revisit if needed. | Resolved |
-| 12 | `cloud:` key missing from defaults.yaml | Added `cloud: []` with datasource-injected comment, consistent with graph/sql/mongodb. | DONE |
+| 12 | `webdav:` tool-category key in defaults.yaml | Added `webdav: []` with datasource-injected comment, consistent with graph/sql/mongodb (originally `cloud:`, renamed 2026-06-07 — see [[webdav_datasource_tools]]). | DONE |
 | 13 | Neo4j has no separate write tool | **Split.** `execute_cypher_query` → `cypher_query` (read-only, blocks writes) + `cypher_execute` (write). `DS_TOOL_MAP` now gives read-only datasources only `cypher_query`. Audit queries match both new and legacy tool names. | DONE |
 
 ### Remaining Issues (not yet decided)

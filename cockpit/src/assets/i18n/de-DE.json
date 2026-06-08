@@ -300,13 +300,27 @@
     }
   },
   "admin": {
-    "prompts": {
+    "config": {
       "messages": {
-        "saveEmpty": "Nichts zu speichern — wählen Sie einen Prompt und geben Sie Inhalt ein.",
+        "saveEmpty": "Nichts zu speichern — wählen Sie einen Konfigurationsschlüssel und geben Sie einen Wert ein.",
         "saved": "Override gespeichert — gilt für zukünftige Jobs.",
         "saveFailed": "Override konnte nicht gespeichert werden.",
         "removed": "Override entfernt — zurück zum mitgelieferten Standard.",
-        "removeFailed": "Override konnte nicht entfernt werden."
+        "removeFailed": "Override konnte nicht entfernt werden.",
+        "invalidJson": "Ungültiges JSON — bitte Syntax korrigieren und erneut versuchen.",
+        "matchesDefault": "Entspricht bereits dem mitgelieferten Standard — kein Override nötig.",
+        "noChanges": "Keine Änderungen zu speichern.",
+        "fileUnsupported": "Nicht unterstützte Datei — bitte eine .txt- oder .md-Datei ablegen.",
+        "fileTooLarge": "Datei zu groß — bitte unter 1 MB halten.",
+        "fileLoaded": "{{name}} geladen — prüfen und speichern, um zu übernehmen.",
+        "fileReadError": "Diese Datei konnte nicht gelesen werden.",
+        "settingMustBeNumber": "{{title}} muss eine Zahl sein.",
+        "settingMustBeInteger": "{{title}} muss eine ganze Zahl sein.",
+        "settingMin": "{{title}} muss mindestens {{min}} sein.",
+        "settingMax": "{{title}} darf höchstens {{max}} sein.",
+        "noSettingChanges": "Keine Einstellungsänderungen zu speichern.",
+        "settingsSaved": "Inferenz-Einstellungen gespeichert.",
+        "settingsSaveFailed": "Einstellungen konnten nicht gespeichert werden."
       }
     },
     "providers": {
@@ -858,11 +872,21 @@
       "collapsedEmpty": "Nur Werkzeugaufrufe",
       "thoughtCount": "{{count}} Gedanken",
       "textCount": "{{count}} Textblöcke",
-      "toolCount": "{{count}} Werkzeugaufrufe"
+      "toolCount": "{{count}} Werkzeugaufrufe",
+      "toolGroup": "{{count}}× Werkzeugaufrufe"
+    },
+    "diff": {
+      "replace": "Diff",
+      "append": "Angehängt",
+      "prepend": "Vorangestellt",
+      "write": "Geschrieben",
+      "truncated": "+{{count}} weitere Zeilen"
     },
     "settings": {
       "mode": "Modus",
       "narration": "Erzählung",
+      "reasoning": "Reasoning",
+      "toolCalls": "Werkzeugaufrufe",
       "model": "Modell",
       "temperature": "Temperatur: {{value}}",
       "modeSupervised": "Beaufsichtigt",
@@ -870,7 +894,11 @@
       "modeAutonomous": "Autonom",
       "narrationAuto": "Automatisch",
       "narrationVerbose": "Ausführlich",
-      "narrationSilent": "Still"
+      "narrationSilent": "Still",
+      "reasoningExpanded": "Ausgeklappt",
+      "reasoningCollapsed": "Eingeklappt",
+      "toolCallsExpanded": "Ausgeklappt",
+      "toolCallsCollapsed": "Eingeklappt"
     },
     "tasks": {
       "header": "Aufgaben {{done}}/{{total}}",
@@ -960,13 +988,19 @@
       "cameraDenied": "Kamerazugriff verweigert",
       "cameraError": "Kamera nicht verfügbar",
       "micDenied": "Mikrofonzugriff verweigert",
-      "micError": "Aufnahme konnte nicht gestartet werden"
+      "micError": "Aufnahme konnte nicht gestartet werden",
+      "transcribing": "Audio wird transkribiert…",
+      "transcribeError": "Transkription fehlgeschlagen — Audio wurde angehängt"
     },
     "tts": {
       "play": "Vorlesen",
       "stop": "Vorlesen stoppen",
       "generating": "Sprache wird erzeugt…",
-      "error": "Sprache fehlgeschlagen — zum Wiederholen klicken"
+      "error": "Sprache fehlgeschlagen — zum Wiederholen klicken",
+      "spokenVersion": "Gesprochene Fassung",
+      "part": "Teil {{current}} von {{total}}",
+      "preparing": "Audio wird vorbereitet…",
+      "generatingPart": "Teil {{current}} von {{total}} wird erzeugt…"
     },
     "code": {
       "expandHint": "Klicken zum Ausklappen",

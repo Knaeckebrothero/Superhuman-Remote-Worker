@@ -610,3 +610,73 @@ class TestClassifyLlmError:
     def test_no_status_no_class_no_keyword_is_transient(self):
         """Catch-all: unknown exception → retry as today's behaviour."""
         assert _classify_llm_error(RuntimeError("something weird")) == "transient"
+
+    # --- Codex/OAuth-proxy token-unavailable: retryable, NOT permanent -----
+    # A ChatGPT/Codex OAuth token (via CLIProxyAPI) can be invalidated or stuck
+    # mid-refresh and return a 401 — recoverable by a proxy re-auth/refresh, so
+    # it must retry (bounded) rather than hard-fail the job like a bad API key.
+
+    def test_401_codex_auth_unavailable_code_is_retryable(self):
+        """401 with code=auth_unavailable → distinct retryable class."""
+        err = _make_sdk_error(
+            "AuthenticationError",
+            401,
+            body={
+                "error": {
+                    "message": "Encountered invalidated oauth token for user, failing request",
+                    "type": "authentication_error",
+                    "code": "auth_unavailable",
+                }
+            },
+        )
+        assert _classify_llm_error(err) == "auth_unavailable"
+
+    def test_401_invalidated_oauth_message_is_retryable(self):
+        """Detected via the message text even without the code field."""
+        err = _make_sdk_error(
+            "AuthenticationError",
+            401,
+            body={"error": {"message": "invalidated oauth token for user"}},
+        )
+        assert _classify_llm_error(err) == "auth_unavailable"
+
+    def test_401_genuine_bad_key_stays_permanent(self):
+        """A real bad-key 401 (no auth_unavailable marker) must still fail
+        fast — we did NOT make all 401s retryable."""
+        err = _make_sdk_error(
+            "AuthenticationError",
+            401,
+            body={
+                "error": {
+                    "message": "Incorrect API key provided",
+                    "type": "invalid_request_error",
+                    "code": "invalid_api_key",
+                }
+            },
+        )
+        assert _classify_llm_error(err) == "permanent"
+
+    def test_401_bare_auth_error_stays_permanent(self):
+        """401 with no body/markers → permanent (unchanged behaviour)."""
+        err = _make_sdk_error("AuthenticationError", 401)
+        assert _classify_llm_error(err) == "permanent"
+
+    def test_auth_unavailable_message_fallback(self):
+        """Stringified error (status_code/class stripped) still detected —
+        matches the shape that lands in audit logs."""
+        err = Exception(
+            "Error code: 401 - {'error': {'message': 'Encountered invalidated "
+            "oauth token for user, failing request', 'code': 'auth_unavailable'}}"
+        )
+        assert _classify_llm_error(err) == "auth_unavailable"
+
+    def test_auth_unavailable_walks_cause_chain(self):
+        """LangChain wraps the provider error — classifier must unwrap it."""
+        inner = _make_sdk_error(
+            "AuthenticationError",
+            401,
+            body={"error": {"code": "auth_unavailable"}},
+        )
+        outer = Exception("LangChain wrapper")
+        outer.__cause__ = inner
+        assert _classify_llm_error(outer) == "auth_unavailable"

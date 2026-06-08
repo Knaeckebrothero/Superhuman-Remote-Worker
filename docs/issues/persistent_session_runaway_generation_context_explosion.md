@@ -1,5 +1,10 @@
 # Persistent session — runaway generation poisons context, session unrecoverable
 
+> **2026-06-07 addendum:** the fix below is verified still intact. A *distinct,
+> still-open* exit-137 agent-pod kill (root cause untraced) on a large
+> gpt-5.5/codex session is documented at the bottom of this file — see
+> "Recurrence 2026-06-07".
+
 ## Symptom (observed 2026-05-11)
 
 Test session `7d845b7e-5e43-4fb1-8347-3a9c0b96947a` running `gemma-4-moe`
@@ -182,3 +187,119 @@ compaction rule) both shipped. Streaming-side runaway detector
 deferred — vLLM honors `max_tokens` correctly and the loader-side fix
 is sufficient for our current deployment; revisit if an endpoint is
 ever found that ignores the cap.
+
+---
+
+## Recurrence 2026-06-07 — distinct exit-137 agent-pod kill (root cause untraced)
+
+> The 2026-05-11 fix above is **verified still intact and is NOT implicated**
+> (see "Ruled out"). This documents a *different*, still-open failure mode in
+> the same persistent-session area. Kept here because the investigation started
+> from this doc (the symptom — "the agent stops after the summary" — looked like
+> a recurrence) and it shares the summarization machinery.
+
+### Symptom (dev deployment, ns `superhuman-remote-worker`)
+
+Session `05220a87-288c-4dcc-bc35-90aca82a37ee` ("Building a RAG Chatbot Demo",
+`gpt-5.5` via `srw-codex-proxy`, supervised, turn 11). User resumed and sent a
+message. The UI rendered `SESSION RESUMED → CONTEXT SUMMARIZED`, the agent
+**never continued**, and the send surfaced a red **`agent /ready timeout`**
+toast. A second student independently reported the same "agent doesn't continue
+after the summary" pattern, so it is not a one-off.
+
+### Timeline (UTC, orchestrator + reaped-agent logs)
+
+| Time | Event |
+|---|---|
+| 08:38:08 | Agent `ec33a336` (pod `srw-agent-s-06907673`) boots for the resume |
+| 08:38:10 | ⚠️ duplicate persistent registration race: winner `ec33a336`, loser `e0687a3c` (dedup refused the loser; harmless here) |
+| 08:39:31 | Structured summarization `TimeoutError` (45s aux cap) → unstructured fallback |
+| 08:39:46 | Fallback OK; compacted **793 → 12** messages; session attached |
+| 08:39:47 | Persistent loop started (69 tools); agent idle, awaiting input |
+| 08:42:09 | **Last heartbeat.** No 08:43:09 heartbeat — loop went silent, zero further log output |
+| ~08:43–08:44 | Agent container **SIGKILLed: `exit_code=137`, `phase=Running`** (reaper `category=crashed`) |
+| 08:44:14 | Reaper deletes the dead pod |
+| 08:44:16–25 | User's message → `POST /input` → `Agent forward failed … All connection attempts failed` → 503 |
+| 08:45:48 | Orphan sweep marks agent offline + **thread `ended`** |
+| 08:45:53 | Workspace snapshot (102 MB) + container deleted |
+| 08:51–08:54 | Retry: `GET /connection` → **409 flood** for 180s → `agent /ready timeout` |
+
+### Ruled out
+- **NOT the runaway/explosion of this doc.** Output is capped — `gpt-5.5`
+  resolved to `max_tokens=16384` via `_resolve_max_output_tokens`
+  (`loader.py:2114`, applied by `_create_codex_llm:2650`). Compaction was clean
+  (793→12, no `ContextOverflowError`); the oversized-`AIMessage` backstop
+  (`context.py:1554`) was neither needed nor triggered.
+- **NOT message-count memory.** 793 messages ≈ <1 MB — cannot explain a 2 Gi
+  kill. (This was an early wrong theory; arithmetic killed it.)
+
+### Still unexplained (the actual crash)
+The agent container was SIGKILLed (137) ~3 min after going idle
+post-compaction. Two candidates, **could not disambiguate**:
+- **OOM** at the 2 Gi persistent-agent limit (`agent_provisioner.py` default), or
+- **Liveness-probe kill** — `/health` (`persistent_app.py:1406`, a trivial
+  handler) runs with `timeoutSeconds: 1` + `failureThreshold: 3`
+  (`agent_provisioner.py:1094`); a frozen event loop (e.g. a GC pause) trips it.
+  Sibling pod `srw-agent-j-a7d8f8e0` demonstrably logged
+  `/health context deadline exceeded`, proving this misfires in the fleet.
+
+Untraceable post-hoc because: the reaper logged `exit_code` but **not**
+`terminated.reason` (the field that says `OOMKilled` vs `Error`); there is **no
+Prometheus** in the cluster; and the dead pod + the originating orchestrator
+pod's logs were gone by investigation time.
+
+### Knock-on: the session wedged (separate, still-open bug)
+Why the user saw `agent /ready timeout` instead of a clean recovery:
+- The orphan sweep ends the thread but **never clears `threads.agent_id`**
+  (`postgres.py:mark_orphaned_threads_ended` flips status only;
+  `mark_stuck_session_agents_ready` clears the agent→thread side, not
+  thread→agent). The thread stays bound to the dead agent.
+- `GET /api/sessions/{id}/connection` then returns **409 "agent not ready"**
+  (`routers/sessions.py:275`, agent `status=offline`). The cockpit's
+  `_pollConnectionUntilReady` treats 409/425 as "keep waiting"
+  (`persistent-chat.service.ts:877`) and never escalates.
+- `_do_prepare` only re-provisions `if not thread.get("agent_id")`
+  (`routers/sessions.py:150`); with the stale binding set it instead probes the
+  dead pod's `/ready` for 180s and emits `failed, reason="agent /ready timeout"`
+  (`routers/sessions.py:184`) — the exact toast.
+- Orphaned **jobs** get `recover_orphaned_jobs()` (re-dispatch); orphaned
+  **persistent threads** get only `mark_orphaned_threads_ended()` — **no
+  re-provision**. So an agent death wedges the session from the UI.
+
+### Changes shipped this round
+- **Reaper now logs `terminated.reason` + `signal`** alongside `exit_code`
+  (`agent_provisioner.py::_capture_agent_logs_before_reap`). The next exit-137
+  will say `OOMKilled` vs `Error` — the diagnostic we were missing. **This is
+  the bet: catch the next occurrence red-handed.**
+- **Summarization timeout decoupled from the interactive aux budget.** The
+  structured pass now passes the dedicated `summarization_timeout` (600s) via
+  `auxiliary.chain(task, timeout=…)` (`auxiliary.py`; `context.py`
+  `_single_pass_summarize`); `auxiliary.timeout` raised 45→120s
+  (`persistent_defaults.yaml`). The **same `Structured summarization failed:
+  TimeoutError`** appears in this doc's original 2026-05-11 log (120s then;
+  tightened to 45s on the persistent path), so this fixes a long-standing
+  symptom — but it is **not** the crash cause (the fallback succeeded; the agent
+  died ~2.5 min later while idle).
+
+### Open / next
+1. **Catch the next exit-137** via the new `terminated.reason` log, then decide:
+   memory bump (if `OOMKilled`) vs frozen-loop hunt (if `Error`). Cheap mitigation
+   meanwhile: relax `/health` liveness `timeoutSeconds` 1→5.
+2. **Recovery-gap fix** (own concern): clear `threads.agent_id` on orphan-end
+   and/or make `_do_prepare` re-provision a thread bound to an *offline* agent,
+   so a dead-agent session self-heals instead of wedging on 409.
+3. **ContextConfig under-wired on the persistent path** (`persistent_session.py`
+   builds `ContextConfig` with only `keep_recent_*`), so `gpt-5.5` (1.05M ctx)
+   sessions still compact at the 80k default and use a 100k/2 oversized
+   threshold — code-confirmed, separate.
+4. Residual from this doc's own deferred item: **codex-proxy may not honor
+   `max_tokens`** cleanly (reasoning models use `max_completion_tokens`); no
+   runaway seen on this session, but it's the gap that could re-open the
+   explosion path for gpt-5.x.
+
+### References
+- `orchestrator/services/agent_provisioner.py` — reaper log capture (the fix) + agent pod probes/limits
+- `orchestrator/routers/sessions.py:150,184,275` — `/prepare` + `/connection` (the wedge)
+- `orchestrator/database/postgres.py` — `mark_orphaned_threads_ended`, `mark_stuck_session_agents_ready`
+- `src/services/auxiliary.py`, `src/core/context.py`, `config/persistent_defaults.yaml` — summarization-timeout decoupling
+- `cockpit/src/app/core/services/persistent-chat.service.ts:867,877` — the 180s connection-poll budget

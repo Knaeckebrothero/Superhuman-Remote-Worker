@@ -321,6 +321,19 @@ spec:
             # provider key from system_api_keys (seeded via the llm-seed-job).
             # See docs/api_key_resolution.md for the wire-format vs config-source
             # split.
+            #
+            # TAVILY_API_KEY — the builder's web_search tool (builder_search.py)
+            # runs in-process here, not on an agent, so the orchestrator needs the
+            # key directly. Tavily is a search engine, not a DB-seeded LLM provider;
+            # it rides the shared Secret. Agents get the same key via envFrom in
+            # agent_provisioner.py. optional:true so installs without web search
+            # still start.
+            - name: TAVILY_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: TAVILY_API_KEY
+                  optional: true
             # BUILDER_MODEL + BUILDER_LLM_PROVIDER removed in chunk 7 of
             # models_yaml_removal — both resolved from the catalog at
             # request time (system_settings['llm.default_builder_model']
@@ -765,6 +778,12 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: AGENT_TAILSCALE_ENABLED
+                  optional: true
+            - name: AGENT_TAILSCALE_DARK_TIMEOUT_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: AGENT_TAILSCALE_DARK_TIMEOUT_SECONDS
                   optional: true
             - name: HEADSCALE_URL
               valueFrom:

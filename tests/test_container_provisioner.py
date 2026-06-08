@@ -104,6 +104,25 @@ class TestPodManifest:
         # back to internet-only.
         assert labels["srw.io/network-tier"] == "internet-only"
 
+    def test_manifest_has_lifecycle_annotation(self):
+        """Pods carry a lifecycle-managed annotation as a GC backstop hook."""
+        from orchestrator.services.container_provisioner import (
+            ContainerProvisioner,
+        )
+
+        provisioner = ContainerProvisioner()
+        manifest = provisioner._build_pod_manifest(
+            pod_name="workspace-abc123",
+            owner=WorkspaceOwner.job("abc123-full-uuid"),
+            image="test-image:latest",
+            cpu="500m",
+            memory="1Gi",
+            cpu_limit="2000m",
+            memory_limit="4Gi",
+        )
+        ann = manifest["metadata"].get("annotations", {})
+        assert ann.get("srw.io/managed-by") == "lifecycle-reconciler"
+
     def test_manifest_tier_label_home_allowed(self):
         """Explicitly passing network_tier='home-allowed' propagates to the pod label."""
         from orchestrator.services.container_provisioner import (
@@ -568,11 +587,21 @@ class TestDockerfileHardening:
     def test_entrypoint_does_not_run_as_user(self):
         """Entrypoint must run SSHD as root (required for user session management).
 
-        code-server runs as agent-host via su -c.
+        sshd is launched directly by the (root) entrypoint and the container is
+        anchored on it via `wait` (it is backgrounded before the state-sentinel
+        wait, not `exec`-ed as PID 1). code-server is the only thing dropped to
+        the unprivileged agent-host user via su -c.
         """
         content = self._read_file("docker/workspace-entrypoint.sh")
-        assert "exec /usr/sbin/sshd" in content
+        # sshd is launched directly — runs as root, never wrapped in su.
+        assert "/usr/sbin/sshd -D" in content
         assert "su -c" in content and "agent-host" in content
+        # The only su -c drop is for code-server; sshd must not run under su.
+        for line in content.splitlines():
+            if "su -c" in line:
+                assert "sshd" not in line, (
+                    f"sshd must run as root, not under su: {line!r}"
+                )
 
 
 class TestCreateWorkspace:

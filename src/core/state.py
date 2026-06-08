@@ -6,8 +6,9 @@ The state supports:
 - Outer loop (strategic planning at phase transitions)
 - Inner loop (tactical execution with todos)
 
-File-based memory (workspace.md, plan.md) provides persistence
-across context compaction, while state fields control loop flow.
+Persistence across context compaction comes from the memory/knowledge
+systems and file-based artifacts (plan.md, notes/), while state fields
+control loop flow.
 """
 
 from typing import Any, Dict, List, Optional, Annotated
@@ -27,7 +28,7 @@ class UniversalAgentState(TypedDict):
     4. Goal check: Continue outer loop or end
 
     File-based context:
-    - workspace.md: Long-term memory, always in system prompt
+    - memory system + knowledge base: long-term memory, injected each call
     - plan.md: Strategic direction, read at phase transitions
     - archive/: Completed todos by phase
 
@@ -50,7 +51,7 @@ class UniversalAgentState(TypedDict):
         last_observed_turn: Last turn when memory extraction ran (for interval tracking)
 
         # File-based context
-        workspace_memory: Contents of workspace.md for system prompt
+        workspace_memory: Legacy; unused (workspace.md removed), always ""
 
         # Execution control
         error: Error information if something went wrong
@@ -90,7 +91,7 @@ class UniversalAgentState(TypedDict):
     last_assembled_turn: int  # Last turn when memory assembler ran
 
     # File-based context (read from workspace into state)
-    workspace_memory: str  # Contents of workspace.md
+    workspace_memory: str  # Legacy; unused (workspace.md removed), always ""
 
     # Execution control
     error: Optional[Dict[str, Any]]
@@ -143,7 +144,7 @@ def create_initial_state(
     - initialized=False: Triggers initialization flow
     - phase_complete=False: Inner loop will run
     - goal_achieved=False: Outer loop will continue
-    - workspace_memory="": Will be populated from workspace.md
+    - workspace_memory="": Legacy field, no longer populated
 
     Args:
         job_id: Unique job identifier

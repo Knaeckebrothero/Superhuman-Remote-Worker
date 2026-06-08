@@ -1,29 +1,160 @@
-# Human-facing descriptions for editable prompt keys (DB-backed prompt editor).
-# Each entry: kind (resolver subsection) + name (resolver entry_type) + a title
-# and description. Drives the admin "what is this prompt / where is it used"
-# text and the bundled-default view. v1 surfaces the core prompt-kind keys;
-# add entries here (and wire the resolver) to expose more.
+# Human-facing descriptions for editable config keys (DB-backed config editor).
+# Each entry: kind (prompts | instructions | settings | guardrails) + name + a
+# title and description. A `group` label drives the <optgroup> the key is shown
+# under in the admin picker (and is echoed on the selected-key header), so the
+# list separates worker-only, persistent-only, and shared keys. Settings/
+# guardrails entries also carry a `type` (and optional min/max/enum) so the admin
+# UI renders typed editors and the API validates writes. Drives the admin "what
+# is this / where is it used" text and the bundled-default view. Add entries here
+# (and wire the resolver) to expose more. Group order below is preserved in the
+# UI, so keep each group's entries contiguous.
+
+# --- Prompts · shared by every agent (workers + persistent sessions) ----------
 - kind: prompts
   name: systemprompt
+  group: "Prompts · all agents"
   title: "System prompt (framework scaffold)"
   description: >-
     Framework system prompt. The expert persona is injected into it as
     {expert_identity}. Rebuilt on every LLM call and survives compaction.
 - kind: prompts
   name: persona
+  group: "Prompts · all agents"
   title: "Expert persona / identity"
   description: >-
     Injected as {expert_identity} on every call. Defines who the agent is and
     how it thinks.
 - kind: prompts
+  name: summarization
+  group: "Prompts · all agents"
+  title: "Summarization (compaction) prompt"
+  description: >-
+    Used when the conversation is compacted to free context. Runs in both worker
+    and persistent modes.
+
+# --- Prompts · worker (job) agents only ---------------------------------------
+# src/graph.py alternates these two each phase; persistent sessions never use
+# them.
+- kind: prompts
   name: strategic
+  group: "Prompts · worker (jobs)"
   title: "Strategic-phase directive"
   description: "Appended during strategic (planning / reflection) phases."
 - kind: prompts
   name: tactical
+  group: "Prompts · worker (jobs)"
   title: "Tactical-phase directive"
   description: "Appended during tactical (execution) phases."
+
+# --- Prompts · persistent (session) agents only -------------------------------
+# src/persistent_graph.py has no phases; this single prompt is the persistent-
+# mode counterpart to the worker's strategic/tactical directives.
 - kind: prompts
-  name: summarization
-  title: "Summarization (compaction) prompt"
-  description: "Used when the conversation is compacted to free context."
+  name: systemprompt_interactive
+  group: "Prompts · persistent (sessions)"
+  title: "Interactive system prompt"
+  description: >-
+    The single conversational prompt a persistent (interactive) session uses on
+    every turn. Resolves to a model-family variant
+    (systemprompt_interactive_<family>.txt) where one exists, else the base file.
+
+# --- Instructions · worker (job) agents only ----------------------------------
+# Workspace scaffolding + the strategic todo/phase system. Persistent sessions
+# use none of these (no phases, no todos); src/persistent_graph.py never loads
+# them. Resolved via InstructionMatrixResolver, so model-family variants apply
+# (e.g. instructions_minimax.md, todo_guide_gpt_oss.md). The vestigial
+# workspace_template.md is intentionally not exposed — workspace.md was removed.
+- kind: instructions
+  name: instructions
+  group: "Instructions · worker (jobs)"
+  title: "Agent instructions (instructions.md)"
+  description: >-
+    The worker's operating manual — role, working style, bias-to-action — written
+    into the workspace as instructions.md and read during planning. A Jinja
+    template ({% if has_tool(...) %} conditionals).
+- kind: instructions
+  name: strategic_todos_initial
+  group: "Instructions · worker (jobs)"
+  title: "Strategic todos · initial phase"
+  description: >-
+    The first strategic phase's todo list (YAML): explore the task, plan, set up
+    the knowledge base, and generate the first tactical todos.
+- kind: instructions
+  name: strategic_todos_transition
+  group: "Instructions · worker (jobs)"
+  title: "Strategic todos · phase transition"
+  description: >-
+    The review-reflect-adapt todo list (YAML) run between tactical phases.
+    Carries the stop condition — call job_complete when all deliverables are
+    done rather than inventing new work.
+- kind: instructions
+  name: strategic_todos_resume
+  group: "Instructions · worker (jobs)"
+  title: "Strategic todos · resume with feedback"
+  description: >-
+    The todo list (YAML) used when a frozen job is resumed with human feedback:
+    process the feedback, adapt the plan, and create corrective tactical todos.
+- kind: instructions
+  name: todo_guide
+  group: "Instructions · worker (jobs)"
+  title: "Todo crafting guide (todo_guide.md)"
+  description: >-
+    The guide an agent must read before calling next_phase_todos (3–7 focused
+    todos per phase). Written into the workspace as todo_guide.md.
+
+# --- Settings (LLM inference params + execution limits) -----------------------
+# `name` is the matrix leaf; dotted names (limits.*) target LimitsConfig fields.
+- kind: settings
+  name: temperature
+  group: "Inference settings"
+  type: number
+  min: 0.0
+  max: 2.0
+  title: "Sampling temperature"
+  description: >-
+    0 = deterministic. Reasoning models often require ~1.0. Applied per model
+    family on top of the bundled settings matrix.
+- kind: settings
+  name: top_p
+  group: "Inference settings"
+  type: number
+  min: 0.0
+  max: 1.0
+  title: "Top-p (nucleus sampling)"
+  description: "Probability-mass cutoff for nucleus sampling."
+- kind: settings
+  name: parallel_tool_calls
+  group: "Inference settings"
+  type: boolean
+  title: "Allow parallel tool calls"
+  description: "Whether the model may emit multiple tool calls per response."
+- kind: settings
+  name: model_max_context_tokens
+  group: "Inference settings"
+  type: integer
+  title: "Model context window (tokens)"
+  description: >-
+    Per-model context window used for budgeting. Overrides the bundled family
+    value.
+- kind: settings
+  name: limits.context_threshold_tokens
+  group: "Inference settings"
+  type: integer
+  title: "Context threshold (tokens)"
+  description: "Token count at which summarization / compaction is triggered."
+- kind: settings
+  name: limits.summarization_safe_limit
+  group: "Inference settings"
+  type: integer
+  title: "Summarization safe limit (tokens)"
+  description: "Upper safety bound kept free while summarizing."
+
+# --- Guardrails (tool examples + nudges) --------------------------------------
+- kind: guardrails
+  name: guardrails
+  group: "Guardrails"
+  type: json
+  title: "Guardrails (tool examples + nudges)"
+  description: >-
+    The {tool_examples, nudges} document, deep-merged onto the bundled default
+    for the family.

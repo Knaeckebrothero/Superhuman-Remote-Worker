@@ -23,7 +23,7 @@ from .orchestrator_client import OrchestratorClient, create_orchestrator_client_
 from .persistent_session import PersistentSession
 from ..tools.registry import TOOL_REGISTRY
 from ..core.archiver import inflight_tool_call
-from ..core.context import extract_summary_text
+from ..core.context import extract_summary_text, repair_tool_pairing
 from ..agent import UniversalAgent
 from ..llm.reasoning_chat import extract_reasoning_text_from_block
 from ..persistent_graph import (
@@ -81,6 +81,14 @@ _session_boot_ws_timeout_s: int = int(
     os.environ.get("SESSION_BOOT_WS_TIMEOUT_S", "600")
 )
 _thread_status_poll_s: int = int(os.environ.get("THREAD_STATUS_POLL_S", "60"))
+
+# Resume backstop: a hard ceiling on how many messages the restore read loads,
+# applied as `seq DESC LIMIT N` (newest N) so one pathological tail — thousands
+# of messages with no usable summary/boundary — can't OOM the agent on resume
+# (the exit-137 wedge). This is a floor, NOT the mechanism: boundary_seq (Path A)
+# normally bounds the tail to ~keep_recent, well under this. Generous so it never
+# trims a healthy session; logged when it does. Tunable via env.
+_resume_message_limit: int = int(os.environ.get("RESUME_MESSAGE_LIMIT", "1000"))
 
 # Subscriber registry for headless persistent sessions.
 #
@@ -777,14 +785,14 @@ async def _attach_session(
                 ],
             },
             "webdav": {
-                "category": "cloud",
-                "read": ["cloud_list", "cloud_read", "cloud_info"],
+                "category": "webdav",
+                "read": ["webdav_list", "webdav_read", "webdav_info"],
                 "write": [
-                    "cloud_list",
-                    "cloud_read",
-                    "cloud_info",
-                    "cloud_write",
-                    "cloud_delete",
+                    "webdav_list",
+                    "webdav_read",
+                    "webdav_info",
+                    "webdav_write",
+                    "webdav_delete",
                 ],
             },
         }
@@ -1109,7 +1117,7 @@ async def _attach_session(
                     e,
                 )
 
-    # Inject datasource index into workspace.md (after workspace is initialized)
+    # Inject datasource index into datasources.md (after workspace is initialized)
     if datasources and _session.workspace_manager:
         try:
             _inject_ds_index(datasources, _session.workspace_manager)
@@ -1121,12 +1129,14 @@ async def _attach_session(
     nc_folder = (
         workspace_override.get("nc_session_folder") if workspace_override else None
     )
+    cloud_degraded_hint = False
     if (not cloud_cfg or not nc_folder) and _orchestrator_client and _thread_id:
         try:
             ws_info = await _orchestrator_client.get_thread_workspace(_thread_id)
             if ws_info:
                 cloud_cfg = cloud_cfg or ws_info.get("cloud_sync")
                 nc_folder = nc_folder or ws_info.get("nc_session_folder")
+                cloud_degraded_hint = bool(ws_info.get("cloud_sync_degraded"))
         except Exception:
             pass
     # Back-compat: translate a bare nc_session_folder into the new schema
@@ -1152,8 +1162,46 @@ async def _attach_session(
                     len(_session.workspace_sync),
                 )
         except Exception as e:
+            # The coordinator build or initial pull failed. Historically this
+            # was swallowed to a warning and the session then ran unsynced for
+            # its entire life with no signal — the exact mechanism behind the
+            # prod-private "files didn't clone, but I saw no error" incident
+            # (docs/issues/main_cloud.md Issue 13). Surface it to the cockpit
+            # over the same workspace_sync.error channel the turn-loop uses
+            # (_resilient_cloud_sync), so the operator sees a degraded-sync
+            # state instead of silence.
             logger.warning(f"Failed to start cloud workspace sync: {e}")
+            _broadcast(
+                "workspace_sync.error",
+                {
+                    "op": "initial_pull",
+                    "turn_id": 0,
+                    "message": str(e),
+                    "degraded": True,
+                },
+            )
             _session.workspace_sync = None
+    elif cloud_degraded_hint:
+        # Cloud is up but the orchestrator resolved no sync target for this
+        # thread (session-folder provisioning failed upstream, so nc_session_folder
+        # and the project mounts are all empty). Surface the same degraded-sync
+        # state the failed-initial-pull path uses, instead of running silently
+        # unsynced for the session's whole life (docs/issues/main_cloud.md Issue 13).
+        logger.warning(
+            "Thread %s: main cloud is up but no sync target resolved — "
+            "session will run unsynced.",
+            _thread_id,
+        )
+        _broadcast(
+            "workspace_sync.error",
+            {
+                "op": "provision",
+                "turn_id": 0,
+                "message": "Cloud sync could not be set up for this session "
+                "(no sync target was provisioned).",
+                "degraded": True,
+            },
+        )
 
     # Restore message history from DB (for session resume)
     await _restore_session_messages()
@@ -1740,6 +1788,7 @@ async def handle_persistent_websocket(ws: WebSocket) -> None:
             check_interrupt=_loop_check_interrupt,
             on_vm_upgrade_needed=_loop_on_vm_upgrade_needed,
             on_context_compacted=_loop_on_context_compacted,
+            persist_message=_loop_persist_message,
             hard_interrupt_event=_hard_interrupt_event,
         )
         _loop_task = asyncio.create_task(
@@ -1752,7 +1801,6 @@ async def handle_persistent_websocket(ws: WebSocket) -> None:
                 callbacks=callbacks,
                 messages=_session.messages,
                 auxiliary_llm=_session.auxiliary_llm,
-                workspace_content=_session.get_workspace_content,
                 recall_store=_session.recall_store,
                 knowledge_store=_session.knowledge_store,
                 project_id=_session.project_id,
@@ -2617,12 +2665,14 @@ async def _loop_on_turn_start(turn_id: int) -> None:
         ):
             _broadcast("workspace_sync.pulled", {"turn_id": turn_id})
 
-    # Save user message to DB (bounded await — no messages lost on crash)
-    if _orchestrator_client and _loop_last_user_content[0]:
+    # Save user message straight to the DB (bounded await — no messages lost on
+    # crash). Direct write via the agent's own pool; the orchestrator REST hop is
+    # bypassed (see docs/issues/persistent_session_midturn_message_loss.md).
+    if _session.postgres_conn and _loop_last_user_content[0]:
         try:
             await asyncio.wait_for(
                 _save_message(
-                    _orchestrator_client,
+                    _session.postgres_conn,
                     _thread_id,
                     "user",
                     _loop_last_user_content[0],
@@ -2639,12 +2689,13 @@ async def _loop_on_turn_complete(turn_id: int, metrics: Optional[dict] = None) -
     if _session is None:
         return
     _broadcast("turn.completed", {"turn_id": turn_id})
-    # Save AI messages from this turn to DB (bounded await)
-    if _orchestrator_client:
+    # Save AI messages from this turn straight to the DB (bounded await). Direct
+    # write via the agent's own pool — the orchestrator REST hop is bypassed.
+    if _session.postgres_conn:
         try:
             await asyncio.wait_for(
                 _save_turn_ai_messages(
-                    _orchestrator_client,
+                    _session.postgres_conn,
                     _thread_id,
                     _session.messages,
                     turn_id,
@@ -2676,6 +2727,38 @@ async def _loop_on_turn_complete(turn_id: int, metrics: Optional[dict] = None) -
             "push", _session.workspace_sync.push_all, turn_id
         ):
             _broadcast("workspace_sync.pushed", {"turn_id": turn_id})
+
+
+async def _loop_persist_message(msg: Any) -> None:
+    """Persist a single message the instant the loop produces it (incremental
+    durability — closes Symptom 1).
+
+    Bounded + non-fatal: a slow or failed write must never stall or crash the
+    turn, so it's wrapped in the same ``wait_for(timeout=5)`` + swallow pattern
+    as the turn-boundary saves. The turn-complete reconciliation
+    (``_save_turn_ai_messages``) re-saves the same rows idempotently, so a write
+    dropped here is recovered there for any turn that finishes; only a hard
+    mid-turn crash relies on what landed incrementally. Uses
+    ``_session.turn_count`` for the turn number — the loop callback carries no
+    turn id (same convention as ``_record_compaction``).
+    """
+    if _session is None or _session.postgres_conn is None or _thread_id is None:
+        return
+    try:
+        await asyncio.wait_for(
+            _persist_one_message(
+                _session.postgres_conn,
+                _thread_id,
+                msg,
+                _session.turn_count,
+                tool_decisions=dict(_session.tool_decisions),
+            ),
+            timeout=5.0,
+        )
+    except asyncio.TimeoutError:
+        logger.warning("Incremental message save timed out (5s) — proceeding")
+    except Exception as e:
+        logger.warning(f"Incremental message save failed (non-fatal): {e}")
 
 
 async def _loop_on_error(message: str) -> None:
@@ -2746,9 +2829,25 @@ async def _record_compaction(
     except Exception as e:
         logger.debug(f"Failed to emit context.compacted (non-fatal): {e}")
 
-    if summary_text and _orchestrator_client and _thread_id:
+    if summary_text and _session and _session.postgres_conn and _thread_id:
+        # Resolve the message-granular boundary the summarizer just set (the id
+        # of the last message its summary covers) into a seq, so resume loads
+        # `summary + (seq > boundary_seq)` — the exact live tail — instead of the
+        # whole post-boundary turn(s). None ⇒ resume falls back to boundary_turn
+        # (e.g. resume-time compaction, whose restored messages carry fresh ids
+        # that don't resolve to a persisted row).
+        boundary_seq = None
+        ctx_mgr = getattr(_session, "context_manager", None)
+        boundary_id = getattr(ctx_mgr, "_last_compaction_boundary_id", None)
+        if boundary_id:
+            try:
+                boundary_seq = await _session.postgres_conn.get_seq_for_message_id(
+                    _thread_id, boundary_id
+                )
+            except Exception as e:
+                logger.debug(f"boundary_seq lookup failed (non-fatal): {e}")
         try:
-            await _orchestrator_client.save_thread_message(
+            await _session.postgres_conn.save_thread_message(
                 thread_id=_thread_id,
                 role="summary",
                 content=summary_text,
@@ -2758,6 +2857,7 @@ async def _record_compaction(
                     "after": after,
                     "trigger": trigger,
                     "boundary_turn": boundary_turn,
+                    "boundary_seq": boundary_seq,
                 },
             )
         except Exception as e:
@@ -2813,50 +2913,11 @@ def _safe_serialize(obj: Any) -> Any:
         return str(obj)
 
 
-def _repair_tool_pairing(messages: list) -> list:
-    """Drop tool calls/results that lost their partner during reconstruction.
-
-    Both the OpenAI Responses API and Anthropic reject a history where an
-    assistant tool/function call has no matching result (or a result has no
-    matching call) — a 400 "No tool output found for function call ...". On
-    resume this can happen if a tool result was never persisted (an interrupted
-    turn) or, historically, if a fixed-size restore window sliced a parallel
-    tool-call batch. Keep only calls and results whose ids match on both sides;
-    assistant messages left with neither text nor calls are dropped.
-    """
-    from langchain_core.messages import AIMessage, ToolMessage
-
-    call_ids = {
-        tc.get("id")
-        for m in messages
-        if isinstance(m, AIMessage)
-        for tc in (getattr(m, "tool_calls", None) or [])
-        if tc.get("id")
-    }
-    result_ids = {
-        m.tool_call_id
-        for m in messages
-        if isinstance(m, ToolMessage) and getattr(m, "tool_call_id", "")
-    }
-    valid_ids = call_ids & result_ids
-
-    repaired: list = []
-    for m in messages:
-        if isinstance(m, AIMessage):
-            tool_calls = getattr(m, "tool_calls", None) or []
-            kept = [tc for tc in tool_calls if tc.get("id") in valid_ids]
-            if len(kept) != len(tool_calls):
-                m = AIMessage(content=m.content, tool_calls=kept, id=m.id)
-            if not kept and not m.content:
-                continue  # empty assistant turn carries no information
-            repaired.append(m)
-        elif isinstance(m, ToolMessage):
-            if getattr(m, "tool_call_id", "") in valid_ids:
-                repaired.append(m)
-            # else: orphaned result — drop
-        else:
-            repaired.append(m)
-    return repaired
+# Bidirectional tool-call pairing repair now lives in core.context so the live
+# persistent turn loop (persistent_graph) and this resume path share one
+# implementation. Alias preserves the private name used by the call sites below
+# and by tests/test_persistent_app.py.
+_repair_tool_pairing = repair_tool_pairing
 
 
 def _db_rows_to_lc_messages(db_messages: list) -> list:
@@ -2970,16 +3031,37 @@ async def _restore_session_messages() -> None:
 
         ckpt = await _agent.postgres_conn.get_latest_compaction_checkpoint(_thread_id)
         boundary_turn = ckpt.get("boundary_turn") if ckpt else None
+        boundary_seq = ckpt.get("boundary_seq") if ckpt else None
 
         # ============================================================
         # Path A — checkpoint resume
         # ============================================================
-        if ckpt is not None and boundary_turn is not None:
-            db_messages = await _agent.postgres_conn.get_thread_messages_history(
-                thread_id=_thread_id,
-                limit=None,
-                since_turn=boundary_turn,
-            )
+        if ckpt is not None and (boundary_seq is not None or boundary_turn is not None):
+            if boundary_seq is not None:
+                # Message-granular cursor: load exactly the tail the summary does
+                # not cover (seq > boundary_seq), independent of turn size — the
+                # fix for the 793-message-turn OOM. Capped by the resume floor.
+                db_messages = await _agent.postgres_conn.get_thread_messages_history(
+                    thread_id=_thread_id,
+                    limit=_resume_message_limit,
+                    seq_gt=boundary_seq,
+                    newest_first=True,
+                )
+            else:
+                # Back-compat: summary rows written before boundary_seq shipped
+                # carry only boundary_turn — fall back to the turn cursor.
+                db_messages = await _agent.postgres_conn.get_thread_messages_history(
+                    thread_id=_thread_id,
+                    limit=_resume_message_limit,
+                    since_turn=boundary_turn,
+                    newest_first=True,
+                )
+            if len(db_messages) >= _resume_message_limit:
+                logger.warning(
+                    f"Resume floor hit on thread {_thread_id}: post-boundary tail "
+                    f"trimmed to newest {_resume_message_limit} messages (stale "
+                    f"boundary or a runaway tail) — bounded, but old context may drop"
+                )
 
             summary_msg = SystemMessage(
                 content=f"[Summary of prior work]\n{ckpt['summary']}",
@@ -3009,13 +3091,19 @@ async def _restore_session_messages() -> None:
 
             if restored:
                 _session.messages.extend(restored)
+                _bturn = boundary_turn or 0
                 tail_turn_max = max(
                     (m.get("turn_number") or 0 for m in db_messages),
-                    default=boundary_turn,
+                    default=_bturn,
                 )
-                _session.turn_count = max(tail_turn_max, boundary_turn)
+                _session.turn_count = max(tail_turn_max, _bturn)
+                cursor = (
+                    f"seq>{boundary_seq}"
+                    if boundary_seq is not None
+                    else f"turn>{boundary_turn}"
+                )
                 logger.info(
-                    f"Restored from checkpoint at turn {boundary_turn} for "
+                    f"Restored from checkpoint ({cursor}) for "
                     f"thread {_thread_id} ({len(restored)} msgs in context; "
                     f"tail of {len(db_messages)} raw rows; "
                     f"turn_count={_session.turn_count})"
@@ -3025,10 +3113,20 @@ async def _restore_session_messages() -> None:
         # ============================================================
         # Path B — full load (back-compat)
         # ============================================================
+        # No checkpoint to bound the load, so the resume floor is the only guard:
+        # take the newest N messages instead of the entire append-only log (the
+        # exit-137 OOM). ensure_within_limits then summarizes them and Path B
+        # writes a checkpoint so the next resume hits Path A.
         db_messages = await _agent.postgres_conn.get_thread_messages_history(
             thread_id=_thread_id,
-            limit=None,
+            limit=_resume_message_limit,
+            newest_first=True,
         )
+        if len(db_messages) >= _resume_message_limit:
+            logger.warning(
+                f"Resume floor hit on thread {_thread_id} (no checkpoint): loaded "
+                f"newest {_resume_message_limit} of a larger log — bounded to avoid OOM"
+            )
 
         if not db_messages:
             return
@@ -3103,8 +3201,16 @@ async def _save_message(
     turn_number: int,
     tool_call_id: Optional[str] = None,
     thinking: Optional[str] = None,
+    id: Optional[str] = None,
 ) -> None:
-    """Fire-and-forget: save a single message via orchestrator REST."""
+    """Fire-and-forget: save a single message by direct DB write.
+
+    ``client`` is the agent's ``PostgresDB`` (``_session.postgres_conn``); the
+    write no longer hops through the orchestrator REST endpoint. ``id`` is the
+    message's stable id when one exists (so a re-save upserts onto the same row);
+    ``None`` lets the DB layer mint a fresh UUID for single-shot rows like the
+    user message.
+    """
     try:
         await client.save_thread_message(
             thread_id=thread_id,
@@ -3114,6 +3220,7 @@ async def _save_message(
             turn_number=turn_number,
             tool_call_id=tool_call_id,
             thinking=thinking,
+            id=id,
         )
     except Exception as e:
         logger.warning(f"Failed to save message (non-fatal): {e}")
@@ -3160,6 +3267,79 @@ def _extract_thinking(msg: Any) -> Optional[str]:
     return rc or None
 
 
+# Normalize LangChain chunk types to persisted role strings (AIMessageChunk → ai).
+_ROLE_MAP = {
+    "ai": "ai",
+    "AIMessageChunk": "ai",
+    "human": "human",
+    "HumanMessageChunk": "human",
+    "tool": "tool",
+    "ToolMessageChunk": "tool",
+    "system": "system",
+    "SystemMessageChunk": "system",
+}
+
+
+async def _persist_one_message(
+    client: Any,
+    thread_id: str,
+    msg: Any,
+    turn_number: int,
+    *,
+    metrics: dict | None = None,
+    tool_decisions: Optional[Dict[str, str]] = None,
+) -> None:
+    """Serialize one LangChain message to a ``thread_messages`` row and upsert it.
+
+    The single serialization point shared by the **incremental** path (persist
+    each message the instant the loop produces it) and the **turn-complete
+    reconciliation** pass. Both pass the message's stable id, so they converge on
+    one row (``ON CONFLICT (id)``): the incremental write lands the content the
+    moment it exists (crash durability); reconciliation re-runs with the
+    turn-level ``metrics`` and approval ``tool_decisions`` and updates the same
+    row. ``seq`` is assigned once on first insert and preserved across the
+    update, so it stays a stable cursor.
+    """
+    raw_type = getattr(msg, "type", "unknown")
+    role = _ROLE_MAP.get(raw_type, raw_type)
+    content = msg.content if hasattr(msg, "content") else None
+    tc = None
+    if hasattr(msg, "tool_calls") and msg.tool_calls:
+        tc = []
+        for t in msg.tool_calls:
+            entry: Dict[str, Any] = {
+                "name": t.get("name"),
+                "args": t.get("args"),
+                "id": t.get("id"),
+            }
+            decision = (tool_decisions or {}).get(t.get("id") or "")
+            if decision:
+                entry["decision"] = decision
+            tc.append(entry)
+    # Extract reasoning content + tool-call back-reference BEFORE we flatten
+    # Anthropic's list-of-dicts content (which drops the thinking blocks).
+    thinking = _extract_thinking(msg) if role == "ai" else None
+    tool_call_id = getattr(msg, "tool_call_id", None) if role == "tool" else None
+    # Normalize content for Anthropic list-of-dicts format
+    if isinstance(content, list):
+        content = " ".join(
+            b.get("text", "") if isinstance(b, dict) else str(b) for b in content
+        )
+    # Attach metrics only to AI messages (not tool results)
+    msg_metrics = metrics if role == "ai" else None
+    await client.save_thread_message(
+        thread_id=thread_id,
+        role=role,
+        content=content,
+        tool_calls=tc,
+        turn_number=turn_number,
+        metrics=msg_metrics,
+        tool_call_id=tool_call_id,
+        thinking=thinking,
+        id=getattr(msg, "id", None),
+    )
+
+
 async def _save_turn_ai_messages(
     client: Any,
     thread_id: str,
@@ -3168,7 +3348,13 @@ async def _save_turn_ai_messages(
     metrics: dict | None = None,
     tool_decisions: Optional[Dict[str, str]] = None,
 ) -> None:
-    """Fire-and-forget: save AI + tool messages from the most recent turn via orchestrator REST.
+    """Fire-and-forget: save AI + tool messages from the most recent turn by direct DB write.
+
+    ``client`` is the agent's ``PostgresDB`` (``_session.postgres_conn``) — the
+    write goes straight to the pool, not through the orchestrator REST endpoint.
+    Each message carries a stable ``id`` (minted at creation), passed through so
+    this save upserts onto the same row a future incremental/reconciliation pass
+    would touch (``ON CONFLICT (id)``) rather than duplicating.
 
     ``tool_decisions`` carries the per-call supervised approval outcome
     (``tool_call_id -> 'approved' | 'denied'``) so the decision survives
@@ -3184,58 +3370,17 @@ async def _save_turn_ai_messages(
             to_save.append(msg)
         to_save.reverse()
 
+        # Reconcile each message: re-upsert via the shared serializer, now with
+        # turn-level metrics + approval decisions. Incremental writes already
+        # landed the content mid-turn; this updates the same rows (stable id).
         for msg in to_save:
-            raw_type = getattr(msg, "type", "unknown")
-            # Normalize LangChain chunk types: AIMessageChunk → ai, etc.
-            _role_map = {
-                "ai": "ai",
-                "AIMessageChunk": "ai",
-                "human": "human",
-                "HumanMessageChunk": "human",
-                "tool": "tool",
-                "ToolMessageChunk": "tool",
-                "system": "system",
-                "SystemMessageChunk": "system",
-            }
-            role = _role_map.get(raw_type, raw_type)
-            content = msg.content if hasattr(msg, "content") else None
-            tc = None
-            if hasattr(msg, "tool_calls") and msg.tool_calls:
-                tc = []
-                for t in msg.tool_calls:
-                    entry: Dict[str, Any] = {
-                        "name": t.get("name"),
-                        "args": t.get("args"),
-                        "id": t.get("id"),
-                    }
-                    decision = (tool_decisions or {}).get(t.get("id") or "")
-                    if decision:
-                        entry["decision"] = decision
-                    tc.append(entry)
-            # Extract reasoning content + tool-call back-reference BEFORE we
-            # flatten Anthropic's list-of-dicts content (which drops the
-            # thinking blocks).
-            thinking = _extract_thinking(msg) if role == "ai" else None
-            tool_call_id = (
-                getattr(msg, "tool_call_id", None) if role == "tool" else None
-            )
-            # Normalize content for Anthropic list-of-dicts format
-            if isinstance(content, list):
-                content = " ".join(
-                    b.get("text", "") if isinstance(b, dict) else str(b)
-                    for b in content
-                )
-            # Attach metrics only to AI messages (not tool results)
-            msg_metrics = metrics if role == "ai" else None
-            await client.save_thread_message(
-                thread_id=thread_id,
-                role=role,
-                content=content,
-                tool_calls=tc,
-                turn_number=turn_number,
-                metrics=msg_metrics,
-                tool_call_id=tool_call_id,
-                thinking=thinking,
+            await _persist_one_message(
+                client,
+                thread_id,
+                msg,
+                turn_number,
+                metrics=metrics,
+                tool_decisions=tool_decisions,
             )
     except Exception as e:
         logger.warning(f"Failed to save turn messages (non-fatal): {e}")
@@ -3868,12 +4013,15 @@ async def _generate_title(messages: List[Any], auxiliary_llm: Any) -> Optional[s
                 HM(content="\n".join(sample)),
             ]
         )
+        auxiliary_llm.health.record_success("title_generation")
         text = getattr(response, "content", None) or ""
         title = text.strip()[:100] if text.strip() else None
         if not title:
             logger.debug("Title generation returned empty response")
         return title
     except Exception as e:
+        if auxiliary_llm is not None:
+            auxiliary_llm.health.record_failure("title_generation", e)
         logger.warning(f"Title generation error: {e}")
         return None
 

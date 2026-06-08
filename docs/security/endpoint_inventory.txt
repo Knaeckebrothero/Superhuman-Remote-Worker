@@ -9,15 +9,15 @@
 #   unscoped               — no gate detected; CI snapshot test will fail
 
 GET    /api/actions/pending                                                             gated:require_approved_user
+GET    /api/admin/config/bundled/{family}/{kind}/{name}                                 admin:_require_admin
+GET    /api/admin/config/catalog                                                        admin:_require_admin
+GET    /api/admin/config/overrides                                                      admin:_require_admin
+POST   /api/admin/config/overrides                                                      admin:_require_admin
+DELETE /api/admin/config/overrides/{override_id}                                        admin:_require_admin
+GET    /api/admin/config/overrides/{override_id}                                        admin:_require_admin
+PUT    /api/admin/config/overrides/{override_id}                                        admin:_require_admin
 GET    /api/admin/families                                                              admin:_require_admin
 GET    /api/admin/families/detect                                                       admin:_require_admin
-GET    /api/admin/prompts/bundled/{family}/{kind}/{name}                                admin:_require_admin
-GET    /api/admin/prompts/catalog                                                       admin:_require_admin
-GET    /api/admin/prompts/overrides                                                     admin:_require_admin
-POST   /api/admin/prompts/overrides                                                     admin:_require_admin
-DELETE /api/admin/prompts/overrides/{override_id}                                       admin:_require_admin
-GET    /api/admin/prompts/overrides/{override_id}                                       admin:_require_admin
-PUT    /api/admin/prompts/overrides/{override_id}                                       admin:_require_admin
 GET    /api/admin/providers/codex/availability                                          admin:_require_admin
 GET    /api/admin/providers/defaults                                                    admin:_require_admin
 PUT    /api/admin/providers/defaults/{kind}                                             admin:_require_admin
@@ -172,7 +172,9 @@ POST   /api/persistent/threads/{thread_id}/interrupt                            
 GET    /api/persistent/threads/{thread_id}/messages                                     gated:require_thread_owner
 POST   /api/persistent/threads/{thread_id}/resume                                       gated:require_thread_owner
 GET    /api/persistent/threads/{thread_id}/stream                                       gated:require_thread_owner
+POST   /api/persistent/threads/{thread_id}/transcribe                                   gated:require_thread_owner
 POST   /api/persistent/threads/{thread_id}/tts                                          gated:require_thread_owner
+POST   /api/persistent/threads/{thread_id}/tts/plan                                     gated:require_thread_owner
 POST   /api/persistent/threads/{thread_id}/uploads                                      gated:require_thread_owner
 GET    /api/projects                                                                    gated:require_approved_user
 POST   /api/projects                                                                    gated:require_approved_user

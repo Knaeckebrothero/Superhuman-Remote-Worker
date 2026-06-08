@@ -233,6 +233,7 @@ describe('PersistentChatService — initial state', () => {
         expect(service.narrationMode()).toBe('auto');
         expect(service.reconnectAttempt()).toBe(0);
         expect(service.reconnectGaveUp()).toBe(false);
+        expect(service.cloudSyncDegraded()).toBe(false);
     });
 });
 
@@ -720,6 +721,41 @@ describe('PersistentChatService — SSE event dispatch', () => {
         const {service, es} = await setup();
         fireSseMessage(es, {method: 'error', params: {message: 'something broke'}}, '1:1');
         expect(service.error()).toContain('something broke');
+    });
+
+    it('marks cloudSyncDegraded on a degraded workspace_sync.error (initial pull)', async () => {
+        const {service, es} = await setup();
+        expect(service.cloudSyncDegraded()).toBe(false);
+        fireSseMessage(
+            es,
+            {
+                method: 'workspace_sync.error',
+                params: {
+                    op: 'initial_pull',
+                    turn_id: 0,
+                    message: 'token exchange 400',
+                    degraded: true,
+                },
+            },
+            '1:1',
+        );
+        // Sticky, session-long: the initial cloud->workspace seed failed, so
+        // sync is OFF for the whole session (not a per-turn retry).
+        expect(service.cloudSyncDegraded()).toBe(true);
+    });
+
+    it('does NOT mark cloudSyncDegraded for a retryable per-turn workspace_sync.error', async () => {
+        const {service, es} = await setup();
+        fireSseMessage(
+            es,
+            {
+                method: 'workspace_sync.error',
+                params: {op: 'push', turn_id: 3, message: 'transient 502'},
+            },
+            '1:1',
+        );
+        // Turn-loop push/pull failures retry next turn; not a degraded session.
+        expect(service.cloudSyncDegraded()).toBe(false);
     });
 });
 

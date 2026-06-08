@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from .types import (
     Instance,
     InstanceLifecycleManager,
+    ReapableInstanceManager,
     StatefulInstanceManager,
 )
 
@@ -120,6 +121,9 @@ class InstanceLifecycleReconciler:
                 "drift": 0,
                 "drained": 0,
                 "skipped_busy": 0,
+                "reaped": 0,
+                "reap_attempts": 0,
+                "reap_forced": 0,
             }
             try:
                 expected = await manager.expected_versions()
@@ -159,40 +163,52 @@ class InstanceLifecycleReconciler:
                         )
                     continue
 
-                if not self.is_drift(inst, expected):
-                    continue
-                stats["drift"] += 1
+                if self.is_drift(inst, expected):
+                    stats["drift"] += 1
 
-                # Soft signal: write the drain-pending hint on every
-                # drift, idle or busy. Cheap and idempotent. For agents
-                # this is the trigger that lets a busy worker react at
-                # its next phase boundary (Continue-as-New). For
-                # workspaces and VMs this is a no-op — they get drained
-                # the natural way once the bound work pauses.
-                try:
-                    await manager.signal_drain_pending(inst)
-                except Exception:
-                    logger.exception(
-                        "signal_drain_pending failed for kind=%s id=%s",
-                        kind,
-                        inst.id,
-                    )
+                    # Soft signal: write the drain-pending hint on every
+                    # drift, idle or busy. Cheap and idempotent. For agents
+                    # this is the trigger that lets a busy worker react at
+                    # its next phase boundary (Continue-as-New). For
+                    # workspaces and VMs this is a no-op — they get drained
+                    # the natural way once the bound work pauses.
+                    try:
+                        await manager.signal_drain_pending(inst)
+                    except Exception:
+                        logger.exception(
+                            "signal_drain_pending failed for kind=%s id=%s",
+                            kind,
+                            inst.id,
+                        )
 
-                if not await manager.is_idle(inst):
-                    stats["skipped_busy"] += 1
-                    continue
-                if drained >= cap or not self._budget.allow(kind):
-                    continue
-                try:
-                    await manager.drain(inst, grace_s=0)
-                    stats["drained"] += 1
-                    drained += 1
-                except Exception:
-                    logger.exception(
-                        "Drain failed for kind=%s id=%s",
-                        kind,
-                        inst.id,
-                    )
+                    if not await manager.is_idle(inst):
+                        stats["skipped_busy"] += 1
+                        # Not drained on drift, but may still be reapable
+                        # below if its bound work has finished/paused.
+                    elif drained < cap and self._budget.allow(kind):
+                        try:
+                            await manager.drain(inst, grace_s=0)
+                            stats["drained"] += 1
+                            drained += 1
+                            continue  # drained — nothing left to reap
+                        except Exception:
+                            logger.exception(
+                                "Drain failed for kind=%s id=%s",
+                                kind,
+                                inst.id,
+                            )
+
+                # Reap path: teardown-eligible workspaces whose bound work has
+                # finished or gone idle. Replaces the old keep-alive-on-
+                # snapshot-failure loop. Gated on ReapableInstanceManager, NOT
+                # StatefulInstanceManager — VMs are stateful but don't implement
+                # the reap predicates (routing them here AttributeError'd every
+                # tick; see test_stateful_non_reapable_manager_is_skipped).
+                if isinstance(manager, ReapableInstanceManager):
+                    try:
+                        await self._reap(manager, inst, stats)
+                    except Exception:
+                        logger.exception("Reap failed for kind=%s id=%s", kind, inst.id)
             report[kind] = stats
             if any(v for k, v in stats.items() if k != "listed"):
                 logger.info(
@@ -201,6 +217,51 @@ class InstanceLifecycleReconciler:
                     {k: v for k, v in stats.items() if v},
                 )
         return report
+
+    async def _reap(self, manager, inst, stats) -> None:
+        """Decision flow for tearing down a teardown-eligible stateful instance.
+
+        clean            -> delete now (no probe)
+        dirty+reachable  -> snapshot; delete if captured else record attempt
+        dirty+unreach    -> give_up if exhausted, else record attempt
+
+        Replaces the old keep-alive-on-snapshot-failure loop: an instance that
+        can never be snapshotted (gone/unreachable pod) is force-deleted after
+        a bounded number of attempts rather than retried forever.
+        """
+        if not await manager.is_reapable(inst):
+            return
+        if not await manager.is_dirty(inst):
+            await manager.delete(inst, grace_s=0)
+            stats["reaped"] += 1
+            return
+        if await manager.is_reachable(inst):
+            ref = await manager.snapshot(inst)
+            if ref:
+                await manager.delete(inst, grace_s=0)
+                stats["reaped"] += 1
+            else:
+                await manager.record_attempt(inst)
+                stats["reap_attempts"] += 1
+            return
+        if await manager.attempts_exhausted(inst):
+            await manager.give_up(inst, grace_s=0)
+            stats["reap_forced"] += 1
+            # Data-loss signal: a dirty instance we could never snapshot.
+            # Logged (not a Prometheus counter — codebase has none) so
+            # log-based alerting can fire on it. Applies to any reapable kind
+            # (workspace, vm); kind-specific detail stays out of the message.
+            logger.warning(
+                "Lifecycle reaper force-deleted dirty unreachable instance "
+                "kind=%s id=%s bound=%s — state not captured "
+                "(snapshot attempts exhausted)",
+                manager.kind,
+                inst.id,
+                inst.bound_to,
+            )
+        else:
+            await manager.record_attempt(inst)
+            stats["reap_attempts"] += 1
 
     @staticmethod
     def is_stateful(manager: InstanceLifecycleManager) -> bool:

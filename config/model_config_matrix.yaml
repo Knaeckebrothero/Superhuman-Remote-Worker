@@ -11,6 +11,17 @@
 # Resolution: per-section, expert family → expert default → base family →
 # base default → hardcoded fallback. Sections and keys missing for a family
 # fall through to `default`.
+#
+# Limits derivation: a family's `limits:` block carries ONLY
+# `model_max_context_tokens` — the conservative working-window BASE. The other
+# leaves (context_threshold_tokens, summarization_safe_limit,
+# summarization_chunk_size, message_count_min_tokens) are DERIVED at load as
+# fixed fractions of the base (see the *_FRACTION constants + _apply_settings_matrix
+# in src/core/loader.py); do not hand-author them here. When a model is added
+# with an explicit per-model context window (Admin → Models `context_window`),
+# that value overrides the base and the same fractions re-derive the leaves.
+# `settings.model_max_context_tokens` (the top-level one) stays the model's true
+# nominal/API ceiling for the Layer-1 safety check + output-token sizing.
 
 default:
   prompts:
@@ -39,10 +50,6 @@ default:
     model_max_context_tokens: 128000
     limits:
       model_max_context_tokens: 100000
-      context_threshold_tokens: 80000
-      summarization_safe_limit: 90000
-      summarization_chunk_size: 80000
-      message_count_min_tokens: 50000
 
 minimax:
   prompts:
@@ -63,10 +70,40 @@ minimax:
     model_max_context_tokens: 204800  # M2.7: 204,800 context, 131K max output
     limits:
       model_max_context_tokens: 170000
-      context_threshold_tokens: 130000
-      summarization_safe_limit: 160000
-      summarization_chunk_size: 110000
-      message_count_min_tokens: 80000
+
+# MiniMax M3 (released 2026-06-01) — distinct family from `minimax` (M2.7) so
+# the two coexist. M3 ships the MSA sparse-attention architecture, a 1M-token
+# context window, native image+video multimodality, and an optional thinking
+# toggle (on for agentic/long-horizon work). Served via an OpenAI-compatible
+# API (LangChain ChatOpenAI), so tool calls use standard parens-form
+# serialization and `default.yaml` guardrails apply.
+minimax-m3:
+  prompts:
+    systemprompt: systemprompt_minimax_m3.txt
+    persona: persona_minimax_m3.txt
+    strategic: strategic_minimax_m3.txt
+    tactical: tactical_minimax_m3.txt
+    summarization: summarization_prompt_minimax_m3.txt
+  instructions:
+    instructions: instructions_minimax_m3.md
+  guardrails:
+    file: minimax_m3.yaml
+  settings:
+    temperature: 1.0   # MiniMax recommends temp 1.0 for M-series reasoning models
+    top_p: 0.95        # MiniMax recommended top_p
+    # top_k: intentionally omitted. MiniMax recommends top_k=40, but the OpenAI
+    #   Chat Completions wire format (LangChain ChatOpenAI) has no top_k field,
+    #   so it would be silently dropped here. Same reason the `minimax` (M2.7)
+    #   family omits it; top_k/min_p live in the builder/native-client matrices
+    #   where the transport accepts them.
+    multimodal: true   # M3 is natively multimodal (image + video input)
+    parallel_tool_calls: true  # M3 supports continuous + parallel tool calls
+    model_max_context_tokens: 1000000  # M3: up to 1M context (>=512K guaranteed) via MSA
+    limits:
+      # MSA makes very long windows viable, but we cap the working window like
+      # the other 1M-class models (claude-opus, gpt-5, gemini) to bound cost and
+      # avoid long-context accuracy drift. Revisit upward after real M3 runs.
+      model_max_context_tokens: 200000
 
 o-series:
   settings:
@@ -76,23 +113,56 @@ o-series:
     model_max_context_tokens: 200000
     limits:
       model_max_context_tokens: 170000
-      context_threshold_tokens: 130000
-      summarization_safe_limit: 160000
-      summarization_chunk_size: 110000
-      message_count_min_tokens: 80000
 
+# DeepSeek V4 family (released 2026-04-24). Covers BOTH variants — family_of()
+# maps `deepseek-v4-pro` (1.6T/49B) and `deepseek-v4-flash` (284B/13B) to this
+# single `deepseek` block; per-model differences (context window, reasoning
+# effort) ride on the catalog row, not here. Both are 1M-context HYBRID reasoning
+# models with a thinking mode, served OpenAI-compatible via OpenRouter (LangChain
+# ChatOpenAI) — so tool calls use the standard parens-form serialization and
+# reasoning comes back out-of-band (DeepSeek `reasoning_content`, OpenRouter
+# `reasoning`/`reasoning_details`), captured by src/llm/reasoning_chat.py.
+#
+# Prompts: forks the every-call scaffold (`systemprompt` + `systemprompt_interactive`),
+# the identity (`persona`), and the auxiliary-path prompts (`memory_extraction`,
+# `memory_assembler`, `curation`). The aux trio is forked because V4 Flash is wired
+# as the auxiliary model, so those background tasks actually run on DeepSeek and want
+# terse, structured-only output (the `<deepseek_output_contract>` block). The shared
+# behavioral tuning — output-length discipline (V4's signature verbosity) and
+# reasoning-channel hygiene — rides in these scaffolds. `strategic` / `tactical` /
+# `summarization` / `instructions` intentionally inherit `default`: they are
+# model-agnostic and DeepSeek's tool wire is the standard parens-form, so a fork
+# would add maintenance with no benefit. Fork the phase prompts only if real V4 runs
+# show a need.
 deepseek:
+  prompts:
+    # Worker-path scaffold + identity
+    systemprompt: systemprompt_deepseek.txt
+    persona: persona_deepseek.txt
+    # Interactive/persistent-session scaffold (V4 may serve sessions too)
+    systemprompt_interactive: systemprompt_interactive_deepseek.txt
+    # Auxiliary-path (memory + knowledge), loaded when V4 Flash is the aux model
+    memory_extraction: memory_extraction_prompt_deepseek.txt
+    memory_assembler: memory_assembler_prompt_deepseek.txt
+    curation: curation_prompt_deepseek.txt
+  guardrails:
+    file: deepseek.yaml
   settings:
+    # In THINKING mode DeepSeek V4 ignores temperature/top_p/penalties — tune the
+    # prompt, not sampling. These values apply only to any non-thinking fallback
+    # turn; DeepSeek's own guidance is temp 0.0 for code/agentic work. Reasoning
+    # effort defaults to `high` (auto-`max` for agent harnesses) and is set
+    # per-model via the catalog row's reasoningLevel, not here.
+    temperature: 0.0
     top_p: 0.95
-    multimodal: false
-    parallel_tool_calls: false  # DeepSeek parallel calls are unreliable
-    model_max_context_tokens: 64000
+    multimodal: false  # V4 Pro + Flash are text-only
+    parallel_tool_calls: false  # DeepSeek parallel tool calls remain unreliable
+    model_max_context_tokens: 1000000  # V4 Pro + Flash: 1M context (was 64K on V3/R1)
     limits:
-      model_max_context_tokens: 55000
-      context_threshold_tokens: 40000
-      summarization_safe_limit: 45000
-      summarization_chunk_size: 35000
-      message_count_min_tokens: 30000
+      # Cap the working window like the other 1M-class families (claude-opus,
+      # gpt-5, gemini, minimax-m3) to bound cost + avoid long-context drift.
+      # Revisit upward after real V4 runs.
+      model_max_context_tokens: 200000
 
 gemini:
   settings:
@@ -103,10 +173,6 @@ gemini:
     model_max_context_tokens: 1000000
     limits:
       model_max_context_tokens: 200000
-      context_threshold_tokens: 150000
-      summarization_safe_limit: 180000
-      summarization_chunk_size: 120000
-      message_count_min_tokens: 100000
 
 claude-opus:
   settings:
@@ -116,10 +182,6 @@ claude-opus:
     model_max_context_tokens: 1000000  # Opus 4.6: 1M context, 128K max output
     limits:
       model_max_context_tokens: 200000
-      context_threshold_tokens: 150000
-      summarization_safe_limit: 180000
-      summarization_chunk_size: 120000
-      message_count_min_tokens: 100000
 
 gpt-5:
   prompts:
@@ -147,10 +209,6 @@ gpt-5:
     model_max_context_tokens: 1050000  # gpt-5.4: 1.05M, 128K max output
     limits:
       model_max_context_tokens: 200000
-      context_threshold_tokens: 150000
-      summarization_safe_limit: 180000
-      summarization_chunk_size: 120000
-      message_count_min_tokens: 100000
 
 codex:
   prompts:
@@ -174,10 +232,6 @@ codex:
     model_max_context_tokens: 400000  # gpt-5.3-codex: 400K context, 128K max output
     limits:
       model_max_context_tokens: 350000
-      context_threshold_tokens: 270000  # Stay under 272K to avoid accuracy degradation
-      summarization_safe_limit: 300000
-      summarization_chunk_size: 200000
-      message_count_min_tokens: 150000
 
 codex-spark:
   prompts:
@@ -197,10 +251,6 @@ codex-spark:
     model_max_context_tokens: 128000  # gpt-5.3-codex-spark: 128K context (distilled)
     limits:
       model_max_context_tokens: 110000
-      context_threshold_tokens: 85000
-      summarization_safe_limit: 100000
-      summarization_chunk_size: 75000
-      message_count_min_tokens: 60000
 
 gpt-oss:
   prompts:
@@ -228,10 +278,6 @@ gpt-oss:
     model_max_context_tokens: 131072  # True 128K context (MoE: 117B total, 5.1B active)
     limits:
       model_max_context_tokens: 110000
-      context_threshold_tokens: 85000
-      summarization_safe_limit: 100000
-      summarization_chunk_size: 75000
-      message_count_min_tokens: 60000
 
 # Gemma 4 has native system role, native multimodality, and strong Markdown
 # instruction following. Two integration challenges drove the variants below:
@@ -291,10 +337,6 @@ gemma:
     model_max_context_tokens: 131072  # Endpoint reports 131072 for current deployment
     limits:
       model_max_context_tokens: 110000
-      context_threshold_tokens: 85000
-      summarization_safe_limit: 100000
-      summarization_chunk_size: 75000
-      message_count_min_tokens: 60000
 
 # Model-specific overrides — add as needed:
 # claude-sonnet:

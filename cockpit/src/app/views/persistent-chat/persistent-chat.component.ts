@@ -10,8 +10,10 @@ import {
     Injector,
     OnDestroy,
     OnInit,
+    QueryList,
     signal,
     ViewChild,
+    ViewChildren,
 } from '@angular/core';
 import {NgTemplateOutlet, TitleCasePipe} from '@angular/common';
 import {HttpClient} from '@angular/common/http';
@@ -24,6 +26,10 @@ import {ChatAttachment, PermissionRequest, PersistentChatService, RunningToolInf
 import {
     AssistantTurn,
     countEvents,
+    EventGroup,
+    firstSentence,
+    firstTextOf,
+    groupEvents,
     isAssistantTurn,
     isSystemTurn,
     isUserTurn,
@@ -31,13 +37,16 @@ import {
     TextEvent,
     ThoughtEvent,
     ToolCallEvent,
+    trailingText,
     Turn,
     TurnEvent,
 } from '../../core/models/turn.model';
+import {DiffLine, lineDiff} from '../../core/util/line-diff';
 import {ApiService, IdeSessionStatus} from '../../core/services/api.service';
 import {ModelService} from '../../core/services/model.service';
 import {I18nService} from '../../core/services/i18n.service';
 import {FileHandlingService} from '../../core/services/file-handling.service';
+import {ChatPreferencesService} from '../../core/services/chat-preferences.service';
 import {DeviceCapabilitiesService} from '../../core/services/device-capabilities.service';
 import {VoiceRecordingService} from '../../core/services/voice-recording.service';
 import {FilePreview, FileType} from '../../core/models/file.model';
@@ -58,10 +67,22 @@ interface SlashCommand {
 }
 
 interface TtsMessageState {
-    audioUrl?: string;
     isGenerating: boolean;
-    isPlaying: boolean;
     error: boolean;
+    /** The spoken (rewritten) text read aloud — all chunks joined — shown in
+     *  the collapsible "Spoken version" when it differs from the message. */
+    text?: string;
+    // Each section is its own player. A long message plans into ordered chunks;
+    // we synthesize them in sequence, render a player as each becomes ready, and
+    // auto-advance between them while keeping every section individually replayable.
+    chunks?: string[];
+    /** Blob URL per chunk, filled as each is synthesized (undefined until then). */
+    chunkUrls?: (string | undefined)[];
+    /** Index currently being synthesized (drives the "Generating part N" status). */
+    synthIndex?: number;
+    /** Index that should start playing the moment its player is available — set
+     *  when the previous section ends before the next has finished synthesizing. */
+    playPending?: number;
 }
 
 interface Suggestion {
@@ -263,6 +284,67 @@ export function pickCodeServerUrlToOpen(status: IdeSessionStatus | null): string
         : null;
 }
 
+/**
+ * Pull file payloads out of a paste's clipboard items (#11 paste-to-attach),
+ * dropping the `kind: 'string'` entries (plain text / HTML) so a text paste
+ * falls through to the textarea untouched. Clipboard images frequently arrive
+ * as a nameless blob — synthesize a stable, collision-free filename so the
+ * attachment chip has a label and the agent hint reads sensibly. Pure and
+ * DOM-creation-free (takes the item list, takes `now` instead of calling
+ * Date.now()) so the selection logic is unit-testable; the component handler
+ * does the async preview + signal update.
+ */
+export function extractClipboardFiles(
+    items: DataTransferItemList | null | undefined,
+    now: number,
+): File[] {
+    if (!items) return [];
+    const files: File[] = [];
+    for (const item of Array.from(items)) {
+        if (item.kind !== 'file') continue;
+        const file = item.getAsFile();
+        if (!file) continue;
+        if (file.name) {
+            files.push(file);
+        } else {
+            const ext = (file.type.split('/')[1] || 'bin').split(';')[0];
+            files.push(
+                new File([file], `pasted-${now}-${files.length}.${ext}`, {
+                    type: file.type,
+                    lastModified: now,
+                }),
+            );
+        }
+    }
+    return files;
+}
+
+/**
+ * Whether a run of consecutive tool calls should render as the folded
+ * "N× tool calls" disclosure vs. plain inline cards. A run folds only when the
+ * user hasn't chosen the always-inline "Tool calls → Expanded" preference AND
+ * it's long enough to be worth grouping (Slice 3 threshold). When expanded, no
+ * run folds — every call renders inline with no fold control, like a short run.
+ */
+export function shouldFoldToolRun(
+    toolCount: number,
+    toolCallsExpanded: boolean,
+    threshold: number,
+): boolean {
+    return !toolCallsExpanded && toolCount >= threshold;
+}
+
+/** Structured diff/content view for a file-mutating tool card (#7). */
+interface FileEditView {
+    path: string;
+    /** Drives the header label + icon: 'replace' renders a true diff;
+     *  the rest are all-additions (no "before" is available). */
+    mode: 'replace' | 'append' | 'prepend' | 'write';
+    lines: DiffLine[];
+    /** Lines dropped by the render cap, if any (shown as a "+N more" footer). */
+    truncated: number;
+}
+
 @Component({
     selector: 'app-persistent-chat',
     standalone: true,
@@ -386,6 +468,24 @@ export function pickCodeServerUrlToOpen(status: IdeSessionStatus | null): string
             </app-select>
           </div>
           <div class="settings-row">
+            <label class="settings-label">{{ 'chat.settings.reasoning' | transloco }}</label>
+            <app-select size="sm" [fullWidth]="false"
+                        [value]="chatPrefs.reasoningExpanded() ? 'expanded' : 'collapsed'"
+                        (changed)="onReasoningDefaultChange($event)">
+              <option value="expanded">{{ 'chat.settings.reasoningExpanded' | transloco }}</option>
+              <option value="collapsed">{{ 'chat.settings.reasoningCollapsed' | transloco }}</option>
+            </app-select>
+          </div>
+          <div class="settings-row">
+            <label class="settings-label">{{ 'chat.settings.toolCalls' | transloco }}</label>
+            <app-select size="sm" [fullWidth]="false"
+                        [value]="chatPrefs.toolCallsExpanded() ? 'expanded' : 'collapsed'"
+                        (changed)="onToolCallsDefaultChange($event)">
+              <option value="expanded">{{ 'chat.settings.toolCallsExpanded' | transloco }}</option>
+              <option value="collapsed">{{ 'chat.settings.toolCallsCollapsed' | transloco }}</option>
+            </app-select>
+          </div>
+          <div class="settings-row">
             <label class="settings-label">{{ 'chat.settings.model' | transloco }}</label>
             <app-select size="sm" [fullWidth]="false"
                         [value]="chat.modelName()"
@@ -477,7 +577,30 @@ export function pickCodeServerUrlToOpen(status: IdeSessionStatus | null): string
                   {{ translateStatus(tc.status) }}
                 </span>
               </summary>
-              @if (tc.result) {
+              @if (fileEditView(tc); as fev) {
+                <!-- #7: diff/content view for edit_file/write_file, built from
+                     the call args. 'replace' is a true old→new diff; the rest
+                     are all-additions (no "before" available). -->
+                <div class="tool-body tool-diff">
+                  <div class="diff-head">
+                    <app-icon size="sm" class="diff-mode-icon">{{ fev.mode === 'write' ? 'note_add' : 'difference' }}</app-icon>
+                    <span class="diff-mode">{{ ('chat.diff.' + fev.mode) | transloco }}</span>
+                    @if (fev.path) {
+                      <span class="diff-path">{{ fev.path }}</span>
+                    }
+                  </div>
+                  <div class="diff-body">
+                    @for (ln of fev.lines; track $index) {
+                      <div class="diff-line" [class.add]="ln.type === 'add'" [class.del]="ln.type === 'del'">
+                        <span class="diff-sign">{{ diffSign(ln.type) }}</span><span class="diff-text">{{ ln.text }}</span>
+                      </div>
+                    }
+                  </div>
+                  @if (fev.truncated > 0) {
+                    <div class="diff-truncated">{{ 'chat.diff.truncated' | transloco:{count: fev.truncated} }}</div>
+                  }
+                </div>
+              } @else if (tc.result) {
                 <div class="tool-body"><pre class="tool-result">{{ tc.result }}</pre></div>
               }
             </details>
@@ -487,7 +610,7 @@ export function pickCodeServerUrlToOpen(status: IdeSessionStatus | null): string
 
       <!-- Per-event card templates (referenced by the turn loop below). -->
       <ng-template #thoughtCard let-event>
-        <details class="thinking-block event-thought" open>
+        <details class="thinking-block event-thought" [attr.open]="chatPrefs.reasoningExpanded() ? '' : null">
           <summary class="thinking-header">
             <app-icon size="sm" class="thinking-icon">psychology</app-icon>
             <span class="thinking-label">
@@ -540,7 +663,13 @@ export function pickCodeServerUrlToOpen(status: IdeSessionStatus | null): string
               @if (turn.summary) {
                 <details class="compaction-summary">
                   <summary>{{ 'chat.compaction.viewSummary' | transloco }}</summary>
-                  <div class="compaction-summary-body">{{ turn.summary }}</div>
+                  <!-- The agent's summary is markdown (headings, lists, code). Render it
+                       as such, reusing the chat's markdown cascade via the message-body
+                       class (its base styles are benign; the bubble styling is gated on
+                       .message-user/.message-assistant, which this isn't). -->
+                  <div class="compaction-summary-body message-body">
+                    <markdown [data]="turn.summary"></markdown>
+                  </div>
                 </details>
               }
             }
@@ -598,9 +727,10 @@ export function pickCodeServerUrlToOpen(status: IdeSessionStatus | null): string
                   <app-icon size="sm" class="avatar-icon">smart_toy</app-icon>
                 </div>
                 <div class="message-body turn-body">
-                  <!-- Whole-turn chevron: collapses every event into the
-                       per-type badge summary + last-text headline. Hidden
-                       when the turn has 0–1 events (nothing to collapse). -->
+                  <!-- Whole-turn chevron: folds the lead-up (reasoning + tool
+                       calls) behind the per-type badge summary, leaving the
+                       final answer visible. Hidden when the turn has 0–1 events
+                       (nothing to collapse). -->
                   @if (turn.events.length > 1) {
                     <button type="button"
                             class="turn-chevron"
@@ -622,40 +752,69 @@ export function pickCodeServerUrlToOpen(status: IdeSessionStatus | null): string
                   }
 
                   @if (isCollapsed) {
-                    <!-- Collapsed: single-line preview of the final text
-                         event. Plain text (not <markdown>) so the truncate
-                         mixin works — markdown emits inner block elements
-                         that defeat nowrap. -->
-                    @if (last) {
-                      <span class="turn-headline">{{ last.content }}</span>
+                    <!-- Collapsed: fold the lead-up (opening text, reasoning,
+                         tool calls) but keep the final answer — the prose after
+                         the last tool/thought — fully rendered as markdown (#8
+                         refinement). The chevron + count badge signal the hidden
+                         work. When the turn ends on a tool/thought (no closing
+                         prose), fall back to a one-line headline (plain text so
+                         the truncate mixin works; markdown emits block elements
+                         that defeat nowrap). -->
+                    @let answer = finalAnswer(turn);
+                    @if (answer) {
+                      <div class="event-text turn-final-answer">
+                        <markdown [data]="answer"></markdown>
+                      </div>
                     } @else {
-                      <span class="turn-headline-empty">{{ 'chat.turn.collapsedEmpty' | transloco }}</span>
+                      <span class="turn-headline">{{ collapsedHeadline(turn) }}</span>
                     }
                   } @else {
-                    <!-- Expanded: every event rendered as its own card. -->
-                    @for (event of turn.events; track event.id) {
-                      @switch (event.kind) {
-                        @case ('thought') {
-                          @if (chat.narrationMode() !== 'silent') {
-                            <ng-container [ngTemplateOutlet]="thoughtCard" [ngTemplateOutletContext]="{ $implicit: event }"></ng-container>
+                    <!-- Expanded: events rendered as cards, with consecutive
+                         tool runs grouped (#10). A run of TOOL_GROUP_THRESHOLD+
+                         tools collapses into one disclosure; shorter runs and
+                         every thought/text render individually. -->
+                    @for (group of groupedEvents(turn); track group.id) {
+                      @if (group.kind === 'tools') {
+                        @if (foldToolRun(group.tools)) {
+                          <!-- Folded run: cornerless "N× tool calls", auto-open on error/denied.
+                               Suppressed entirely when Tool calls → Expanded (every run inline). -->
+                          <details class="tool-group" [attr.open]="toolGroupHasProblem(group.tools) ? '' : null">
+                            <summary class="tool-group-head">
+                              <app-icon size="sm" class="tool-group-chevron">chevron_right</app-icon>
+                              <span class="tool-group-label">{{ 'chat.turn.toolGroup' | transloco:{count: group.tools.length} }}</span>
+                              <span class="tool-group-names">{{ toolGroupSummary(group.tools) }}</span>
+                            </summary>
+                            <div class="tool-group-body">
+                              <ng-container [ngTemplateOutlet]="toolDetails" [ngTemplateOutletContext]="{ $implicit: group.tools }"></ng-container>
+                            </div>
+                          </details>
+                        } @else {
+                          <!-- Short run: each tool inline, exactly as before. -->
+                          @for (event of group.tools; track event.id) {
+                            <div class="event-tool">
+                              <ng-container [ngTemplateOutlet]="toolDetails" [ngTemplateOutletContext]="{ $implicit: [event] }"></ng-container>
+                              @if (event.decision; as d) {
+                                <div class="mile-resolved" [class.approved]="d === 'approved'" [class.rejected]="d === 'denied'">
+                                  <app-icon size="sm" class="mile-resolved-icon">{{ d === 'approved' ? 'check_circle' : 'block' }}</app-icon>
+                                  <span class="resolved-label">{{ ('chat.approval.badge.' + d) | transloco }}</span>
+                                  <span class="resolved-title">{{ event.tool }}</span>
+                                </div>
+                              }
+                            </div>
                           }
                         }
-                        @case ('text') {
-                          <div class="event-text">
-                            <markdown [data]="event.content"></markdown>
-                          </div>
-                        }
-                        @case ('tool_call') {
-                          <div class="event-tool">
-                            <ng-container [ngTemplateOutlet]="toolDetails" [ngTemplateOutletContext]="{ $implicit: [event] }"></ng-container>
-                            @if (event.decision; as d) {
-                              <div class="mile-resolved" [class.approved]="d === 'approved'" [class.rejected]="d === 'denied'">
-                                <app-icon size="sm" class="mile-resolved-icon">{{ d === 'approved' ? 'check_circle' : 'block' }}</app-icon>
-                                <span class="resolved-label">{{ ('chat.approval.badge.' + d) | transloco }}</span>
-                                <span class="resolved-title">{{ event.tool }}</span>
-                              </div>
+                      } @else {
+                        @switch (group.event.kind) {
+                          @case ('thought') {
+                            @if (chat.narrationMode() !== 'silent') {
+                              <ng-container [ngTemplateOutlet]="thoughtCard" [ngTemplateOutletContext]="{ $implicit: group.event }"></ng-container>
                             }
-                          </div>
+                          }
+                          @case ('text') {
+                            <div class="event-text">
+                              <markdown [data]="group.event.content"></markdown>
+                            </div>
+                          }
                         }
                       }
                     }
@@ -670,34 +829,80 @@ export function pickCodeServerUrlToOpen(status: IdeSessionStatus | null): string
                     }
                   }
 
-                  <!-- TTS button on the turn's final text. -->
+                  <!-- Read aloud: the button generates speech; once generated it
+                       is replaced by a native <audio> player, with the spoken
+                       (markdown-stripped) text in a collapsible panel below. -->
                   @if (last && !streaming) {
-                    <div class="message-actions">
-                      <button
-                        type="button"
-                        class="msg-action-btn tts-btn"
-                        [class.is-playing]="ttsS.isPlaying"
-                        [class.is-error]="ttsS.error"
-                        [disabled]="ttsS.isGenerating"
-                        [title]="(
-                          ttsS.isPlaying ? 'chat.tts.stop' :
-                          ttsS.isGenerating ? 'chat.tts.generating' :
-                          ttsS.error ? 'chat.tts.error' :
-                          'chat.tts.play'
-                        ) | transloco"
-                        (click)="toggleTts(ttsKey, last.content)"
-                      >
-                        @if (ttsS.isGenerating) {
+                    @if (!ttsS.chunks) {
+                      @if (ttsS.isGenerating) {
+                        <!-- Planning: spinner + status, before any section exists. -->
+                        <div class="tts-prep">
                           <span class="action-spinner-sm"></span>
-                        } @else if (ttsS.isPlaying) {
-                          <app-icon size="sm">stop</app-icon>
-                        } @else if (ttsS.error) {
-                          <app-icon size="sm">error_outline</app-icon>
-                        } @else {
-                          <app-icon size="sm">volume_up</app-icon>
+                          <span class="tts-status-text">{{ 'chat.tts.preparing' | transloco }}</span>
+                        </div>
+                      } @else {
+                        <!-- The read button (or an error to retry). -->
+                        <div class="message-actions">
+                          <button
+                            type="button"
+                            class="msg-action-btn tts-btn"
+                            [class.is-error]="ttsS.error"
+                            [title]="(ttsS.error ? 'chat.tts.error' : 'chat.tts.play') | transloco"
+                            (click)="toggleTts(ttsKey, last.content)"
+                          >
+                            @if (ttsS.error) {
+                              <app-icon size="md">error_outline</app-icon>
+                            } @else {
+                              <app-icon size="md">volume_up</app-icon>
+                            }
+                          </button>
+                        </div>
+                      }
+                    } @else {
+                      <!-- One player per section, each appearing as it's ready,
+                           with a spinner + "Generating part N" trailing below. -->
+                      <div class="tts-players">
+                        @for (chunk of ttsS.chunks; track $index) {
+                          @if (ttsS.chunkUrls?.[$index]; as url) {
+                            <div class="tts-player-row">
+                              <audio
+                                #ttsAudioEl
+                                class="tts-player"
+                                controls
+                                preload="metadata"
+                                [attr.data-tts-key]="ttsKey"
+                                [attr.data-tts-index]="$index"
+                                [src]="url"
+                                (loadedmetadata)="onPlayerReady($event, ttsKey, $index)"
+                                (play)="onPlayerPlay($event)"
+                                (ended)="onChunkEnded(ttsKey, $index)"
+                              ></audio>
+                              @if (ttsS.chunks.length > 1) {
+                                <span class="tts-part">{{ 'chat.tts.part' | transloco:{ current: $index + 1, total: ttsS.chunks.length } }}</span>
+                              }
+                            </div>
+                          }
                         }
-                      </button>
-                    </div>
+                        @if (ttsS.isGenerating) {
+                          <div class="tts-status">
+                            <span class="action-spinner-sm"></span>
+                            <span class="tts-status-text">{{ 'chat.tts.generatingPart' | transloco:{ current: (ttsS.synthIndex ?? 0) + 1, total: ttsS.chunks.length } }}</span>
+                          </div>
+                        }
+                      </div>
+                    }
+                    <!-- Spoken version: only shown when formulation actually
+                         rewrote the text (otherwise it would just mirror the
+                         message bubble). Collapsed by default, like reasoning. -->
+                    @if (ttsS.chunks && ttsS.text && ttsS.text.trim() !== last.content.trim()) {
+                      <details class="thinking-block tts-spoken">
+                        <summary class="thinking-header">
+                          <app-icon size="sm" class="thinking-icon">graphic_eq</app-icon>
+                          <span class="thinking-label">{{ 'chat.tts.spokenVersion' | transloco }}</span>
+                        </summary>
+                        <div class="thinking-content tts-spoken-text">{{ ttsS.text }}</div>
+                      </details>
+                    }
                   }
                 </div>
               </div>
@@ -953,6 +1158,14 @@ export function pickCodeServerUrlToOpen(status: IdeSessionStatus | null): string
             </div>
           }
 
+          <!-- Transcribing indicator: brief, after a recording is confirmed -->
+          @if (isTranscribing()) {
+            <div class="transcribing-hint">
+              <span class="action-spinner-sm" aria-hidden="true"></span>
+              <span>{{ 'chat.composer.transcribing' | transloco }}</span>
+            </div>
+          }
+
           <!-- Recording mode: waveform + duration + controls -->
           @if (isRecording()) {
             <div class="recording-strip">
@@ -988,6 +1201,7 @@ export function pickCodeServerUrlToOpen(status: IdeSessionStatus | null): string
               (ngModelChange)="onInputChange($event)"
               (input)="autoResizeInput()"
               (keydown)="onKeydown($event)"
+              (paste)="onPaste($event)"
               (focus)="inputFocused.set(true)"
               (blur)="inputFocused.set(false)"
               [placeholder]="inputPlaceholder()"
@@ -1054,7 +1268,7 @@ export function pickCodeServerUrlToOpen(status: IdeSessionStatus | null): string
               <button
                 type="button"
                 class="ctrl mic"
-                [disabled]="!chat.isConnected()"
+                [disabled]="!chat.isConnected() || isTranscribing()"
                 [title]="'chat.composer.recordVoice' | transloco"
                 (click)="startRecording()"
               >
@@ -1127,6 +1341,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     private readonly i18n = inject(I18nService);
     private readonly http = inject(HttpClient);
     private readonly fileHandling = inject(FileHandlingService);
+    readonly chatPrefs = inject(ChatPreferencesService);
     private readonly deviceCapabilities = inject(DeviceCapabilitiesService);
     private readonly voiceRecording = inject(VoiceRecordingService);
     private readonly router = inject(Router);
@@ -1167,6 +1382,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     readonly attachmentMenuOpen = signal(false);
     readonly isRecording = signal(false);
     readonly recordingDuration = signal(0);
+    readonly isTranscribing = signal(false);
     readonly imagePreviewUrl = signal<string | null>(null);
     readonly imagePreviewName = signal<string>('');
     // Drag-and-drop overlay state. dragEnterCount handles the
@@ -1182,8 +1398,10 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     // Per-turn TTS state. Keyed by a stable string ("turn:<id>") so playback
     // state survives across re-renders even if the turn list is reordered.
     readonly ttsState = signal<Record<string, TtsMessageState>>({});
-    private currentTtsAudio: HTMLAudioElement | null = null;
-    private currentTtsKey: string | null = null;
+    // The native <audio> players (one per generated turn). Used to pause the
+    // others when one starts — browsers happily play several at once otherwise.
+    @ViewChildren('ttsAudioEl')
+    private ttsPlayers?: QueryList<ElementRef<HTMLAudioElement>>;
     // Tracks blob URLs we've created so we can revoke them on destroy.
     private readonly ttsBlobUrls = new Set<string>();
 
@@ -1523,17 +1741,8 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         if (this.isRecording()) {
             this.voiceRecording.cancelRecording();
         }
-        // Tear down TTS playback + free blob URLs.
-        if (this.currentTtsAudio) {
-            try {
-                this.currentTtsAudio.pause();
-                this.currentTtsAudio.src = '';
-            } catch {
-                // ignore
-            }
-            this.currentTtsAudio = null;
-            this.currentTtsKey = null;
-        }
+        // Free TTS blob URLs. The native <audio> elements are torn down with
+        // the component's DOM, which stops any in-flight playback.
         this.ttsBlobUrls.forEach((url) => URL.revokeObjectURL(url));
         this.ttsBlobUrls.clear();
     }
@@ -1609,6 +1818,21 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         input.value = '';
     }
 
+    /**
+     * Paste-to-attach (#11): when the clipboard carries files — a screenshot,
+     * a copied image, or a file from the OS file manager — divert them into
+     * the same attachment flow as the Attach button and drag-drop, rather than
+     * letting the browser paste a data URL (or nothing) into the textarea.
+     * Plain-text pastes carry no file items, so they fall through untouched.
+     */
+    async onPaste(event: ClipboardEvent): Promise<void> {
+        const files = extractClipboardFiles(event.clipboardData?.items, Date.now());
+        if (files.length === 0) return; // text paste — let the default run
+        event.preventDefault();
+        const previews = await this.fileHandling.createFilePreviews(files);
+        if (previews.length > 0) this.chat.addAttachments(previews);
+    }
+
     /** Drop one queued attachment. */
     removeAttachment(id: string): void {
         this.chat.removeAttachment(id);
@@ -1649,12 +1873,48 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         }
     }
 
-    /** Stop recording and queue the resulting blob as an attachment. */
+    /**
+     * Stop recording, transcribe the clip to editable composer text, and keep
+     * the audio attached.
+     *
+     * The transcript is appended into `inputText` (never clobbering a typed
+     * draft). Reactivity note: `inputText` is a plain field, so assigning it
+     * does NOT re-evaluate the `canSend` computed on its own — the
+     * `addAttachments` call below writes the `pendingAttachments` signal, which
+     * both enables Send and triggers the change-detection pass that re-syncs the
+     * textarea to show the transcript. Keep `addAttachments` as the last step.
+     */
     async stopRecording(): Promise<void> {
         if (!this.isRecording()) return;
         const result = await this.voiceRecording.stopRecording();
         if (!result || result.duration < 1) return;
         const preview = await this.fileHandling.createAudioFilePreview(result);
+
+        const threadId = this.chat.threadId();
+        if (threadId) {
+            this.isTranscribing.set(true);
+            try {
+                const res = await firstValueFrom(
+                    this.api.transcribeVoice(threadId, preview.file),
+                );
+                if (res && res !== 'unavailable' && res.text.trim()) {
+                    const transcript = res.text.trim();
+                    this.inputText = this.inputText.trim()
+                        ? `${this.inputText.trim()}\n\n${transcript}`
+                        : transcript;
+                    queueMicrotask(() => this.autoResizeInput());
+                } else if (res === null) {
+                    // Transport/server error — keep the audio, surface a notice.
+                    this.chat.attachmentError.set(
+                        this.transloco.translate('chat.composer.transcribeError'),
+                    );
+                }
+                // 'unavailable' (no STT model configured) → attach audio silently.
+            } finally {
+                this.isTranscribing.set(false);
+            }
+        }
+
         this.chat.addAttachments([preview]);
     }
 
@@ -1752,9 +2012,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
 
     /** Read state for a given turn key (always returns a defaulted object). */
     ttsStateFor(key: string): TtsMessageState {
-        return (
-            this.ttsState()[key] ?? {isGenerating: false, isPlaying: false, error: false}
-        );
+        return this.ttsState()[key] ?? {isGenerating: false, error: false};
     }
 
     /** Mutate state for one turn key. */
@@ -1766,108 +2024,145 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     }
 
     /**
-     * Play, pause, or generate-then-play TTS for an assistant turn's final text.
-     *
-     * - First click: fetch the audio (formulation + synthesis on the server),
-     *   then start playback.
-     * - Subsequent clicks: toggle play/pause on the cached blob.
+     * Read an assistant turn's final text aloud. Plans the message into ordered
+     * chunks (server cleans + splits at natural breakpoints), then synthesizes
+     * them in sequence — rendering a player as each section becomes ready and
+     * auto-advancing between them. Every section stays individually playable, so
+     * you can scrub back and forth afterwards.
      */
     async toggleTts(key: string, content: string): Promise<void> {
-        const state = this.ttsStateFor(key);
         const threadId = this.chat.threadId();
         if (!threadId || !content.trim()) return;
+        const state = this.ttsStateFor(key);
+        if (state.isGenerating || state.chunks) return; // already running or done
 
-        // Stop any other turn that's playing.
-        if (this.currentTtsKey !== null && this.currentTtsKey !== key) {
-            this.stopCurrentTts();
-        }
-
-        if (state.isPlaying) {
-            this.stopCurrentTts();
-            return;
-        }
-
-        if (state.audioUrl) {
-            this.playCachedTts(key, state.audioUrl);
-            return;
-        }
-
-        // Need to fetch the audio first.
         this.setTtsState(key, {isGenerating: true, error: false});
-        const lang = this.i18n.activeLang().startsWith('de') ? 'de' : 'en';
-        let result;
+        let plan;
         try {
-            result = await firstValueFrom(
-                this.api.generateTTS(threadId, content, {language: lang, reformulate: true}),
-            );
+            plan = await firstValueFrom(this.api.planTTS(threadId, content));
         } catch (e) {
-            console.error('TTS generate threw', e);
+            console.error('TTS plan threw', e);
             this.setTtsState(key, {isGenerating: false, error: true});
             return;
         }
-        if (result === null || result === 'unavailable') {
-            this.setTtsState(key, {
-                isGenerating: false,
-                error: result === null,
-            });
+        // 'unavailable' (204) = no TTS model configured → stay silent, no error.
+        // null = a real failure → show the error state.
+        if (plan === null || plan === 'unavailable') {
+            this.setTtsState(key, {isGenerating: false, error: plan === null});
             return;
         }
-        const url = URL.createObjectURL(result);
-        this.ttsBlobUrls.add(url);
-        this.setTtsState(key, {isGenerating: false, audioUrl: url, error: false});
-        this.playCachedTts(key, url);
+        if (plan.length === 0) {
+            this.setTtsState(key, {isGenerating: false});
+            return;
+        }
+        this.setTtsState(key, {
+            chunks: plan,
+            chunkUrls: new Array(plan.length),
+            text: plan.join('\n\n'),
+            playPending: 0, // the first section autoplays once it loads
+        });
+        // Synthesize sections in order; each renders as it's ready and the
+        // first autoplays. A later failure just stops the chain (earlier
+        // sections stay playable); the first failing is a hard error.
+        for (let i = 0; i < plan.length; i++) {
+            this.setTtsState(key, {synthIndex: i});
+            const url = await this.synthTtsChunk(key, threadId, i);
+            if (!url) {
+                if (i === 0) {
+                    // Nothing playable — reset to the read/error button to retry.
+                    this.setTtsState(key, {
+                        isGenerating: false,
+                        error: true,
+                        chunks: undefined,
+                        chunkUrls: undefined,
+                        text: undefined,
+                        synthIndex: undefined,
+                        playPending: undefined,
+                    });
+                } else {
+                    // Earlier sections stay playable; just stop the chain here.
+                    this.setTtsState(key, {isGenerating: false, synthIndex: undefined});
+                }
+                return;
+            }
+        }
+        this.setTtsState(key, {isGenerating: false, synthIndex: undefined});
     }
 
-    private playCachedTts(key: string, url: string): void {
-        if (!this.currentTtsAudio) {
-            this.currentTtsAudio = new Audio();
-            this.currentTtsAudio.addEventListener('ended', () => this.onTtsEnded());
-            this.currentTtsAudio.addEventListener('pause', () => this.onTtsPaused());
-            this.currentTtsAudio.addEventListener('error', () => this.onTtsError());
+    /** Synthesize chunk `i` (already cleaned by the plan, reformulate=false),
+     *  store + return its blob URL, or null on failure. */
+    private async synthTtsChunk(
+        key: string,
+        threadId: string,
+        i: number,
+    ): Promise<string | null> {
+        const chunks = this.ttsStateFor(key).chunks;
+        if (!chunks || i < 0 || i >= chunks.length) return null;
+        const cached = this.ttsStateFor(key).chunkUrls?.[i];
+        if (cached) return cached;
+        const lang = this.i18n.activeLang().startsWith('de') ? 'de' : 'en';
+        let res;
+        try {
+            res = await firstValueFrom(
+                this.api.generateTTS(threadId, chunks[i], {language: lang, reformulate: false}),
+            );
+        } catch (e) {
+            console.error('TTS chunk synth threw', e);
+            return null;
         }
-        this.currentTtsAudio.src = url;
-        this.currentTtsKey = key;
-        this.setTtsState(key, {isPlaying: true});
-        this.currentTtsAudio.play().catch((e) => {
-            console.error('TTS playback failed', e);
-            this.setTtsState(key, {isPlaying: false, error: true});
-            this.currentTtsKey = null;
+        if (res === null || res === 'unavailable') return null;
+        const url = URL.createObjectURL(res.audio);
+        this.ttsBlobUrls.add(url);
+        const urls = (this.ttsStateFor(key).chunkUrls ?? []).slice();
+        urls[i] = url;
+        this.setTtsState(key, {chunkUrls: urls});
+        return url;
+    }
+
+    /** Locate a turn's section player by index (data-attrs on each <audio>). */
+    private findTtsPlayer(key: string, index: number): HTMLAudioElement | null {
+        const ref = this.ttsPlayers?.find(
+            (r) =>
+                r.nativeElement.dataset['ttsKey'] === key &&
+                r.nativeElement.dataset['ttsIndex'] === String(index),
+        );
+        return ref?.nativeElement ?? null;
+    }
+
+    /**
+     * A section's player loaded. Autoplay it only if it's the one we're waiting
+     * for (the first section, or the one queued after the previous ended) — so
+     * sections synthesized in the background don't all start at once.
+     */
+    onPlayerReady(event: Event, key: string, index: number): void {
+        if (this.ttsStateFor(key).playPending !== index) return;
+        this.setTtsState(key, {playPending: undefined});
+        (event.target as HTMLAudioElement).play().catch(() => {
+            /* autoplay blocked — native controls remain available */
         });
     }
 
-    private stopCurrentTts(): void {
-        if (!this.currentTtsAudio || this.currentTtsKey === null) return;
-        try {
-            this.currentTtsAudio.pause();
-            this.currentTtsAudio.currentTime = 0;
-        } catch {
-            // ignore
+    /** Auto-advance: when a section ends, play the next one — or queue it if it
+     *  isn't synthesized yet (onPlayerReady picks it up when it loads). */
+    onChunkEnded(key: string, index: number): void {
+        const total = this.ttsStateFor(key).chunks?.length ?? 0;
+        const next = index + 1;
+        if (next >= total) return; // whole message played
+        const el = this.findTtsPlayer(key, next);
+        if (el) {
+            el.play().catch(() => {});
+        } else {
+            this.setTtsState(key, {playPending: next});
         }
-        const k = this.currentTtsKey;
-        this.currentTtsKey = null;
-        this.setTtsState(k, {isPlaying: false});
     }
 
-    private onTtsEnded(): void {
-        if (this.currentTtsKey === null) return;
-        const k = this.currentTtsKey;
-        this.currentTtsKey = null;
-        this.setTtsState(k, {isPlaying: false});
-    }
-
-    private onTtsPaused(): void {
-        if (this.currentTtsKey === null || !this.currentTtsAudio) return;
-        const a = this.currentTtsAudio;
-        if (a.ended || a.currentTime === 0) return;
-        const k = this.currentTtsKey;
-        this.setTtsState(k, {isPlaying: false});
-    }
-
-    private onTtsError(): void {
-        if (this.currentTtsKey === null) return;
-        const k = this.currentTtsKey;
-        this.currentTtsKey = null;
-        this.setTtsState(k, {isPlaying: false, error: true});
+    /** Pause every other player when one starts — one voice at a time. */
+    onPlayerPlay(event: Event): void {
+        const active = event.target as HTMLAudioElement;
+        this.ttsPlayers?.forEach((ref) => {
+            const el = ref.nativeElement;
+            if (el !== active && !el.paused) el.pause();
+        });
     }
 
     // ===== Drag-and-drop file handling =====
@@ -2056,6 +2351,20 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         }
     }
 
+    /** Display-only: whether reasoning ("thinking") blocks open expanded by default. */
+    onReasoningDefaultChange(value: string | null): void {
+        if (value === 'expanded' || value === 'collapsed') {
+            this.chatPrefs.setReasoningExpanded(value === 'expanded');
+        }
+    }
+
+    /** Display-only: whether tool-call runs render inline ("expanded") or folded. */
+    onToolCallsDefaultChange(value: string | null): void {
+        if (value === 'expanded' || value === 'collapsed') {
+            this.chatPrefs.setToolCallsExpanded(value === 'expanded');
+        }
+    }
+
     onModelSelect(model: string | null): void {
         if (model) {
             this.chat.modelName.set(model);
@@ -2214,9 +2523,9 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
 
     /**
      * Auto-collapse threshold: assistant turns with more than this many events
-     * collapse to the headline-only view by default once they're done. Streaming
-     * turns are never auto-collapsed. The user can override either way via the
-     * chevron, in which case userTurnCollapsed wins.
+     * fold their lead-up by default once they're done (the final answer stays
+     * visible). Streaming turns are never auto-collapsed. The user can override
+     * either way via the chevron, in which case userTurnCollapsed wins.
      */
     private readonly AUTO_COLLAPSE_THRESHOLD = 8;
 
@@ -2246,9 +2555,117 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         return countEvents(turn);
     }
 
-    /** Last text event in a turn — used as the collapsed-view headline. */
+    /**
+     * Intra-turn tool grouping (Slice 3 / #10). A run of this many or more
+     * consecutive tool calls collapses into a single "N× tool calls"
+     * disclosure; shorter runs render inline. A run is broken by any
+     * thought/text, so `[tool,tool,thought,tool,tool]` stays two groups.
+     */
+    private readonly TOOL_GROUP_THRESHOLD = 4;
+
+    /** Coalesce a turn's events into render groups (consecutive tools merged). */
+    groupedEvents(turn: AssistantTurn): EventGroup[] {
+        return groupEvents(turn.events);
+    }
+
+    /**
+     * Whether this tool run renders as the folded "N× tool calls" disclosure.
+     * Folds only long runs, and only while the user hasn't opted into the
+     * always-inline "Tool calls → Expanded" display preference.
+     */
+    foldToolRun(tools: ToolCallEvent[]): boolean {
+        return shouldFoldToolRun(
+            tools.length,
+            this.chatPrefs.toolCallsExpanded(),
+            this.TOOL_GROUP_THRESHOLD,
+        );
+    }
+
+    /** True if a grouped run should auto-open: any member errored or was denied. */
+    toolGroupHasProblem(tools: ToolCallEvent[]): boolean {
+        return tools.some((t) => t.status === 'error' || t.status === 'denied' || t.resultStatus === 'error');
+    }
+
+    /** Human one-liner of the distinct tools in a run ("read_file, edit_file x2"). */
+    toolGroupSummary(tools: ToolCallEvent[]): string {
+        return this.groupToolCallsHuman(tools);
+    }
+
+    /** Last text event in a turn — used for the TTS "read aloud" button. */
     lastTextEvent(turn: AssistantTurn): TextEvent | undefined {
         return lastTextOf(turn);
+    }
+
+    /**
+     * The turn's final answer — the trailing prose after the last tool/thought.
+     * Stays fully visible when the turn is collapsed (only the lead-up folds).
+     * Empty when the turn ends on a tool/thought, in which case the collapsed
+     * view falls back to {@link collapsedHeadline}.
+     */
+    finalAnswer(turn: AssistantTurn): string {
+        return trailingText(turn);
+    }
+
+    /**
+     * One-line fallback headline for a collapsed turn that has no closing prose
+     * (ends on a tool/thought). Prefers the first sentence of the agent's
+     * opening text; otherwise a tool/thought digest.
+     */
+    collapsedHeadline(turn: AssistantTurn): string {
+        const first = firstTextOf(turn);
+        const sentence = first ? firstSentence(first.content) : '';
+        if (sentence) return sentence;
+        const c = countEvents(turn);
+        if (c.tools > 0) return this.transloco.translate('chat.turn.toolCount', {count: c.tools});
+        if (c.thoughts > 0) return this.transloco.translate('chat.turn.thoughtCount', {count: c.thoughts});
+        return this.transloco.translate('chat.turn.collapsedEmpty');
+    }
+
+    /** Render cap for a single diff card — bounds DOM for huge write_file bodies. */
+    private readonly DIFF_LINE_CAP = 400;
+
+    /**
+     * Diff/content view for an edit_file / write_file tool card (#7), built
+     * straight from the call args (no backend round-trip): edit_file replace
+     * carries old_string→new_string so we show a real diff; append/prepend/
+     * write have no "before" and render as all-additions. Returns null for any
+     * other tool, and for failed calls (so the error message shows instead of a
+     * diff that never applied).
+     */
+    fileEditView(tc: ToolCallEvent): FileEditView | null {
+        if (tc.status === 'error') return null;
+        const args = tc.args || {};
+        const str = (k: string): string => (typeof args[k] === 'string' ? (args[k] as string) : '');
+        const path = str('path');
+        let mode: FileEditView['mode'];
+        let lines: DiffLine[];
+        if (tc.tool === 'write_file') {
+            mode = 'write';
+            lines = lineDiff('', str('content'));
+        } else if (tc.tool === 'edit_file') {
+            const position = str('position');
+            if (position === 'end') {
+                mode = 'append';
+                lines = lineDiff('', str('new_string'));
+            } else if (position === 'start') {
+                mode = 'prepend';
+                lines = lineDiff('', str('new_string'));
+            } else {
+                mode = 'replace';
+                lines = lineDiff(str('old_string'), str('new_string'));
+            }
+        } else {
+            return null;
+        }
+        if (lines.length === 0) return null;
+        const truncated = Math.max(0, lines.length - this.DIFF_LINE_CAP);
+        if (truncated > 0) lines = lines.slice(0, this.DIFF_LINE_CAP);
+        return {path, mode, lines, truncated};
+    }
+
+    /** Gutter sign for a diff line. */
+    diffSign(type: DiffLine['type']): string {
+        return type === 'add' ? '+' : type === 'del' ? '-' : ' ';
     }
 
     /**

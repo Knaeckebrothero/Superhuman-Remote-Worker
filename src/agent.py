@@ -774,12 +774,11 @@ class UniversalAgent:
         return resolver.load("workspace_template")
 
     def _inject_repo_context_to_workspace(self, git_url: str, git_branch: str) -> None:
-        """Append repository context to workspace.md after clone.
+        """Append repository (workspace git) context to datasources.md after clone.
 
-        This gives the agent persistent knowledge of the git remote URL,
-        branch, and Gitea API endpoint so it can push and create PRs.
-        The info survives context compaction since workspace.md is re-injected
-        on every LLM call.
+        This gives the agent a persistent reference for the git remote URL,
+        branch, and Gitea API endpoint so it can push and create PRs. The
+        system prompts point the agent at datasources.md for connection details.
         """
         from urllib.parse import urlparse
 
@@ -820,11 +819,14 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
 ```
 """
         try:
-            existing = self._workspace_manager.read_file("workspace.md")
-            self._workspace_manager.write_file("workspace.md", existing + section)
-            logger.info("Injected repository context into workspace.md")
+            try:
+                existing = self._workspace_manager.read_file("datasources.md")
+            except (FileNotFoundError, ValueError, OSError):
+                existing = ""
+            self._workspace_manager.write_file("datasources.md", existing + section)
+            logger.info("Injected repository context into datasources.md")
         except Exception as e:
-            logger.warning(f"Failed to inject repo context into workspace.md: {e}")
+            logger.warning(f"Failed to inject repo context into datasources.md: {e}")
 
     async def _setup_job_workspace(
         self,
@@ -1044,39 +1046,49 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             or metadata.get("config_upload_id")
             or metadata.get("config_override")
         )
-        if (not _config_from_db and config_dirty) or _config_from_db:
-            logger.info("Config changed for this job — recreating LLMs")
-            self._create_phase_llms()
 
-        # Freeze resolved config on first run (not resume)
+        # Load DB config overrides (flag-gated; fail-open). MUST precede
+        # _create_phase_llms() so settings overrides reach the LLMs, and precede
+        # the freeze so they're captured. Prompts/instructions/guardrails resolve
+        # lazily from the process map; settings are eager -> apply onto self.config.
         if self.postgres_conn and not resume and not _config_from_db:
             from .core.loader import (
-                serialize_resolved_config,
-                set_prompt_overrides,
-                _is_prompt_db_overrides_enabled,
+                apply_settings_overrides,
+                set_config_overrides,
+                _is_config_db_overrides_enabled,
             )
 
-            # Load DB prompt overrides first so they're captured in the freeze
-            # below (flag-gated; fail-open to bundled defaults on any error).
-            if _is_prompt_db_overrides_enabled():
+            if _is_config_db_overrides_enabled():
                 try:
                     from .core.model_registry import family_of
 
                     _family = family_of(self.config.llm.model)
-                    _rows = await self.postgres_conn.prompts.list_overrides_for_family(
+                    _rows = await self.postgres_conn.config_overrides.list_overrides_for_family(
                         _family
                     )
-                    set_prompt_overrides(_rows)
+                    set_config_overrides(_rows)
+                    if apply_settings_overrides(self.config):
+                        config_dirty = True
                     logger.info(
-                        f"Loaded {len(_rows)} prompt override(s) for family {_family}"
+                        f"Loaded {len(_rows)} config override(s) for family {_family}"
                     )
                 except Exception as e:
                     logger.warning(
-                        f"Failed to load prompt overrides (using bundled): {e}"
+                        f"Failed to load config overrides (using bundled): {e}"
                     )
 
+        if (not _config_from_db and config_dirty) or _config_from_db:
+            logger.info("Config changed for this job — recreating LLMs")
+            self._create_phase_llms()
+
+        # Freeze resolved config on first run (not resume). The overrides loaded
+        # above are captured here: settings via self.config, prompts/instructions
+        # via the resolver reading the process map.
+        if self.postgres_conn and not resume and not _config_from_db:
             try:
                 import uuid as _uuid
+
+                from .core.loader import serialize_resolved_config
 
                 resolved = serialize_resolved_config(
                     self.config, model=self.config.llm.model
@@ -1181,7 +1193,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         # VM recovery: seed fresh VM workspace from last snapshot if needed
         if resume and workspace_backend and workspace_backend.supports_shell:
             try:
-                if not workspace_backend.exists("workspace.md"):
+                if not workspace_backend.exists("task_brief.md"):
                     logger.info(
                         f"VM workspace is fresh — seeding from last snapshot for job {job_id}"
                     )
@@ -1377,7 +1389,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         self._workspace_manager.write_file("task_brief.md", "".join(brief_parts))
         logger.debug("Wrote task_brief.md to workspace")
 
-        # Process initial_files from config (e.g., workspace.md template)
+        # Process initial_files from config (templates seeded into the workspace)
         if self.config.workspace.initial_files:
             config_dir = Path(__file__).parent.parent / "config" / "agents"
             for dest_path, source_path in self.config.workspace.initial_files.items():
@@ -1443,7 +1455,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             except Exception as e:
                 logger.error(f"Git clone failed: {e}")
 
-            # Inject repo context into workspace.md if clone succeeded
+            # Inject repo context into datasources.md if clone succeeded
             if repo_dir.exists() and any(repo_dir.iterdir()):
                 self._inject_repo_context_to_workspace(git_url, git_branch)
 
@@ -2139,7 +2151,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                     pass
 
     def _inject_datasource_index(self, ds_configs: list) -> None:
-        """Inject a compact datasource index into workspace.md.
+        """Inject a compact datasource index into datasources.md.
 
         This ensures the agent always knows what datasources are available,
         even before KB retrieval fires. Full details are in the knowledge base.
@@ -2170,12 +2182,15 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                 lines.append(f"- **{name}** ({ds_type})")
 
         try:
-            existing = self._workspace_manager.read_file("workspace.md")
+            try:
+                existing = self._workspace_manager.read_file("datasources.md")
+            except (FileNotFoundError, ValueError, OSError):
+                existing = ""
             self._workspace_manager.write_file(
-                "workspace.md", existing + "\n".join(lines)
+                "datasources.md", existing + "\n".join(lines)
             )
             logger.info(
-                f"Injected datasource index ({len(ds_configs)} entries) into workspace.md"
+                f"Injected datasource index ({len(ds_configs)} entries) into datasources.md"
             )
         except Exception as e:
             logger.warning(f"Failed to inject datasource index: {e}")
@@ -2320,73 +2335,6 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
 
         elif ds_type == "mongodb":
             os.environ["MONGOSH_URI"] = url
-
-    def _create_datasource_connection(self, ds: Dict[str, Any]) -> Any:
-        """Create a connection to an external datasource.
-
-        Args:
-            ds: Datasource config dict with type, connection_url, credentials, etc.
-
-        Returns:
-            Connection object (e.g. Neo4jDB instance)
-
-        Raises:
-            NotImplementedError: If datasource type is not yet supported
-            ValueError: If datasource type is unknown
-        """
-        ds_type = ds["type"]
-        url = ds.get("connection_url") or ""
-        creds = ds.get("credentials") or {}
-
-        if ds_type == "neo4j":
-            from src.database.neo4j_db import Neo4jDB
-
-            db = Neo4jDB(
-                uri=url,
-                username=creds.get("username", "neo4j"),
-                password=creds.get("password", ""),
-            )
-            db.connect()
-            return db
-
-        elif ds_type == "postgresql":
-            import psycopg
-
-            conn = psycopg.connect(url, autocommit=False)
-            # Test connection
-            conn.execute("SELECT 1")
-            conn.rollback()  # Clean transaction state after test
-            return conn
-
-        elif ds_type == "mongodb":
-            from pymongo import MongoClient
-            from urllib.parse import urlparse
-
-            client = MongoClient(url, serverSelectionTimeoutMS=5000)
-            client.admin.command("ping")
-            # Extract database name from URL path
-            parsed = urlparse(url)
-            db_name = parsed.path.lstrip("/").split("?")[0] or "default"
-            db = client[db_name]
-            # Store client for cleanup (db object doesn't have close())
-            self._datasource_clients[ds_type] = client
-            return db
-
-        elif ds_type == "webdav":
-            from webdav3.client import Client
-
-            client = Client(
-                {
-                    "webdav_hostname": url,
-                    "webdav_login": creds.get("username"),
-                    "webdav_password": creds.get("password"),
-                }
-            )
-            client.list("/")  # Connection test
-            return client
-
-        else:
-            raise ValueError(f"Unknown datasource type: {ds_type}")
 
     def _close_datasource_connections(self) -> None:
         """Close all datasource connections opened for the current job."""
@@ -2955,6 +2903,12 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         """Get current agent status and metrics."""
         uptime = (datetime.utcnow() - self._start_time).total_seconds()
 
+        # Auxiliary-task health (memory/curation/titles). Surfaced here so a
+        # silently-degraded auxiliary model is visible on the status endpoint
+        # instead of only in rotating WARNING logs.
+        aux_llm = getattr(self, "_auxiliary_llm", None)
+        aux_health = aux_llm.health.snapshot() if aux_llm is not None else None
+
         return {
             "agent_id": self.config.agent_id,
             "display_name": self.config.display_name,
@@ -2969,4 +2923,5 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             "config": {
                 "model": self.config.llm.model,
             },
+            "auxiliary": aux_health,
         }

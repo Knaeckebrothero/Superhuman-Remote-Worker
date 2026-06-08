@@ -34,6 +34,8 @@ SYNC_IGNORE_PATTERNS = [
     "candidates/",
     "requirements/",
     "workspace.md",
+    "datasources.md",
+    "spec_lock.md",
     "plan.md",
 ]
 

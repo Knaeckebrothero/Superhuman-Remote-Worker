@@ -453,7 +453,7 @@ This mirrors [pg-mcp-server](https://github.com/stuzero/pg-mcp-server)'s approac
   Use `mongosh "$MONGO_EVENTS_URI"` — credentials pre-configured.
 
 ### Other
-- **Cloud Storage** (webdav, read-only) — `cloud_list`, `cloud_read` tools
+- **Cloud Storage** (webdav, read-only) — `webdav_list`, `webdav_read` tools
 - **External API** (generic) — `curl` via `$API_BASE_URL`, `$API_TOKEN`
 ```
 

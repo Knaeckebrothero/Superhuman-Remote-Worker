@@ -83,7 +83,21 @@ tools:
     - resume_delegation_child
   # SQL injected when system datasource attached (for reading job data, test results)
   sql: []
-  # Not needed
-  citation: []
+  # Citations: a research agent must back every factual claim with a source.
+  # research_guide.md (tactical phase) instructs cite_web / cite_document, so the
+  # tools must exist. Mirrors defaults.yaml's citation suite.
+  citation:
+    - cite_document
+    - cite_web
+    - list_sources
+    - get_citation
+    - list_citations
+    - edit_citation
+    - annotate_source
+    - get_annotations
+    - tag_source
+    - search_library
+    - generate_bibliography
+  # Graph + MongoDB auto-injected when a matching datasource is attached
   graph: []
   mongodb: []

@@ -89,6 +89,13 @@ class AgentProvisioner:
             "AGENT_TAILSCALE_ENABLED", "false"
         ).strip().lower() in ("true", "1", "yes")
         self._headscale_url: str = os.environ.get("HEADSCALE_URL", "").strip()
+        # Sustained-dark window for the tailscale sidecar liveness probe.
+        # After this long without a Running backend, the kubelet kills the
+        # sidecar and the tunnel_dark reaper recycles the pod. The self-heal
+        # loop recovers transient loss well inside this window.
+        self._tailscale_dark_timeout: int = int(
+            os.environ.get("AGENT_TAILSCALE_DARK_TIMEOUT_SECONDS", "600")
+        )
         # host/port for the agent's `wait-for-orchestrator` init container,
         # derived from the chart-injected ORCHESTRATOR_URL (default tracks
         # the dev release name).
@@ -424,6 +431,10 @@ class AgentProvisioner:
                 # MAX_AGENTS ceiling — the reaper will delete them.
                 if self._has_dead_agent_container(pod):
                     continue
+                # A live agent with a kubelet-killed tailscale sidecar is a
+                # tunnel_dark zombie awaiting reap — don't pin the ceiling.
+                if self._has_dead_tunnel_sidecar(pod):
+                    continue
                 purpose = (pod.metadata.labels or {}).get("srw/purpose", "job")
                 if purpose in result:
                     result[purpose] += 1
@@ -442,6 +453,23 @@ class AgentProvisioner:
         """
         for cs in getattr(pod.status, "container_statuses", None) or []:
             if cs.name != "agent":
+                continue
+            state = getattr(cs, "state", None)
+            if state and getattr(state, "terminated", None) is not None:
+                return True
+        return False
+
+    @staticmethod
+    def _has_dead_tunnel_sidecar(pod) -> bool:
+        """True if the "tailscale" sidecar container has terminated.
+
+        The kubelet kills the sidecar via its liveness probe after a sustained
+        dark window; with restartPolicy=Never it stays terminated. The agent
+        container may still be Running, so this is checked independently of
+        _has_dead_agent_container.
+        """
+        for cs in getattr(pod.status, "container_statuses", None) or []:
+            if cs.name != "tailscale":
                 continue
             state = getattr(cs, "state", None)
             if state and getattr(state, "terminated", None) is not None:
@@ -519,6 +547,7 @@ class AgentProvisioner:
         offline_threshold_minutes: int = 10,
         unstartable_grace_seconds: int = 300,
         crashed_grace_seconds: int = 60,
+        tunnel_dark_grace_seconds: int = 60,
     ) -> dict[str, int]:
         """Single-pass GC over managed agent pods.
 
@@ -530,6 +559,10 @@ class AgentProvisioner:
             terminated (any exit code) for at least ``crashed_grace_seconds``.
             Catches sidecar-pinned pods that never propagate to phase=Failed,
             including agents that crash before their first heartbeat.
+          - ``tunnel_dark``: phase == Running but the ``tailscale`` sidecar
+            terminated (kubelet killed it after a sustained dark window) for at
+            least ``tunnel_dark_grace_seconds``. The agent may still be up, but
+            with no tunnel it cannot reach its workspace — recycle it.
           - ``stale``: phase == Running but the agent's heartbeat has been
             offline in the DB for ``offline_threshold_minutes``.
           - ``unstartable``: phase == Pending with a terminal
@@ -541,6 +574,7 @@ class AgentProvisioner:
         stats = {
             "completed": 0,
             "crashed": 0,
+            "tunnel_dark": 0,
             "stale": 0,
             "drained": 0,
             "unstartable": 0,
@@ -568,6 +602,8 @@ class AgentProvisioner:
                 category = "completed"
             elif self._is_crashed(pod, crashed_grace_seconds):
                 category = "crashed"
+            elif self._is_tunnel_dark(pod, tunnel_dark_grace_seconds):
+                category = "tunnel_dark"
             elif self._is_stale_running(pod, offline_hostnames):
                 category = "stale"
             elif self._is_drained_running(pod, draining_hostnames):
@@ -600,13 +636,30 @@ class AgentProvisioner:
         Always exception-safe: a capture failure must never block the reap.
         """
         pod_name = pod.metadata.name
+        # tunnel_dark reaps the pod for a dead *sidecar*; capture that
+        # container's logs, else the agent's.
+        target = "tailscale" if category == "tunnel_dark" else "agent"
         exit_code: Any = None
+        reason: Any = None
+        signal: Any = None
         for cs in getattr(pod.status, "container_statuses", None) or []:
-            if cs.name != "agent":
+            if cs.name != target:
                 continue
             terminated = getattr(getattr(cs, "state", None), "terminated", None)
+            if terminated is None:
+                # Container may have restarted (e.g. OOMKilled then restarted):
+                # the kill reason lives in last_state.terminated, not state.
+                terminated = getattr(
+                    getattr(cs, "last_state", None), "terminated", None
+                )
             if terminated is not None:
                 exit_code = getattr(terminated, "exit_code", None)
+                # reason distinguishes OOMKilled (kernel, memory) from Error
+                # (e.g. liveness-probe SIGKILL on a frozen loop) — the one
+                # signal that tells us which failure mode a 137 exit actually
+                # was. Without it, exit_code=137 alone is ambiguous.
+                reason = getattr(terminated, "reason", None)
+                signal = getattr(terminated, "signal", None)
             break
 
         try:
@@ -614,28 +667,33 @@ class AgentProvisioner:
                 self._core_api.read_namespaced_pod_log,
                 name=pod_name,
                 namespace=self._namespace,
-                container="agent",
+                container=target,
                 tail_lines=500,
                 timestamps=True,
             )
         except Exception as e:
             logger.warning(
                 "Reap log capture: failed to fetch logs for pod=%s "
-                "(category=%s, exit_code=%s): %s",
+                "(category=%s, exit_code=%s, reason=%s, signal=%s): %s",
                 pod_name,
                 category,
                 exit_code,
+                reason,
+                signal,
                 e,
             )
             return
 
         logger.warning(
             "Reap log capture: pod=%s category=%s phase=%s exit_code=%s "
+            "reason=%s signal=%s "
             "logs_below_marker_BEGIN\n%s\nlogs_below_marker_END pod=%s",
             pod_name,
             category,
             pod.status.phase,
             exit_code,
+            reason,
+            signal,
             log_tail or "(empty)",
             pod_name,
         )
@@ -664,6 +722,29 @@ class AgentProvisioner:
             finished_at = getattr(terminated, "finished_at", None)
             if finished_at is None:
                 # Terminated but no timestamp yet — be conservative, wait.
+                return False
+            age = (datetime.now(timezone.utc) - finished_at).total_seconds()
+            return age >= grace_seconds
+        return False
+
+    @staticmethod
+    def _is_tunnel_dark(pod, grace_seconds: int) -> bool:
+        """Pod is Running but the tailscale sidecar terminated past the grace.
+
+        Brief grace mirrors _is_crashed (let final writes land). The long
+        hysteresis already happened in the kubelet liveness probe.
+        """
+        if pod.status.phase != "Running":
+            return False
+        for cs in getattr(pod.status, "container_statuses", None) or []:
+            if cs.name != "tailscale":
+                continue
+            state = getattr(cs, "state", None)
+            terminated = getattr(state, "terminated", None) if state else None
+            if terminated is None:
+                return False
+            finished_at = getattr(terminated, "finished_at", None)
+            if finished_at is None:
                 return False
             age = (datetime.now(timezone.utc) - finished_at).total_seconds()
             return age >= grace_seconds
@@ -1098,8 +1179,25 @@ class AgentProvisioner:
                 "--timeout=60s 2>&1; then "
                 'echo "Tailscale authenticated"; break; fi; '
                 'echo "Auth retry in 15s..."; sleep 15; done; '
-                "wait $TSPID"
+                # Supervision loop: re-up if the node loses its registration
+                # (headscale #2006 lastSeen false-GC, control-plane restart,
+                # network/DERP blip). `tailscale up` is idempotent when the
+                # backend is already Running. Permanent loss is handled by the
+                # liveness probe + the tunnel_dark reaper, not here. The grep
+                # tolerates the space MarshalIndent puts after the JSON colon.
+                'while kill -0 "$TSPID" 2>/dev/null; do '
+                "if ! tailscale status --json --peers=false 2>/dev/null | "
+                'grep -qE \'"BackendState":[[:space:]]*"Running"\'; then '
+                "tailscale up "
+                '--auth-key="${TS_AUTHKEY}" '
+                f'--login-server="{self._headscale_url}" '
+                '--hostname="${POD_NAME}" '
+                "--accept-dns=false --timeout=60s || true; "
+                "fi; sleep 30; done"
             )
+            # ceil(dark_timeout / 30s); >=1. The kubelet measures the sustained
+            # dark window via failureThreshold, so the reaper needs no timing.
+            dark_failures = max(1, (self._tailscale_dark_timeout + 29) // 30)
             containers.append(
                 {
                     "name": "tailscale",
@@ -1131,6 +1229,24 @@ class AgentProvisioner:
                             "mountPath": "/var/lib/tailscale",
                         }
                     ],
+                    # status --peers=false skips the (huge, on a big tailnet)
+                    # peer list so the check stays well under timeoutSeconds;
+                    # plain `tailscale status --json` exceeds the default 1s on a
+                    # large tailnet and the kubelet kills a healthy sidecar.
+                    "livenessProbe": {
+                        "exec": {
+                            "command": [
+                                "/bin/sh",
+                                "-c",
+                                "tailscale status --json --peers=false 2>/dev/null | "
+                                'grep -qE \'"BackendState":[[:space:]]*"Running"\'',
+                            ]
+                        },
+                        "initialDelaySeconds": 120,
+                        "periodSeconds": 30,
+                        "timeoutSeconds": 5,
+                        "failureThreshold": dark_failures,
+                    },
                     "resources": {
                         "requests": {"memory": "64Mi", "cpu": "50m"},
                         "limits": {"memory": "128Mi", "cpu": "200m"},

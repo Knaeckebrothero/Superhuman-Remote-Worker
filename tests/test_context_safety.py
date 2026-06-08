@@ -672,9 +672,11 @@ class TestContextSafetyIntegration:
         """Default config values should be safe for 100k effective context."""
         config = ContextConfig()
 
+        # Fallback defaults are a base=100k instance of the loader limit
+        # fractions (safe .90, chunk .60); real values come from the matrix.
         assert config.model_max_context_tokens == 100_000
         assert config.summarization_safe_limit == 90_000
-        assert config.summarization_chunk_size == 80_000
+        assert config.summarization_chunk_size == 60_000
         # Safe limit should leave room for prompt overhead
         assert config.summarization_safe_limit < config.model_max_context_tokens
         # Chunk size should be less than safe limit
@@ -793,3 +795,59 @@ class TestOversizedMessageCompaction:
             if isinstance(m, AIMessage) and "elided by compaction" in (m.content or "")
         ]
         assert stubs == [], "no substitution should occur for normal-sized messages"
+
+
+# Tests for the compaction boundary marker that drives message-granular resume
+# (docs/issues/persistent_session_midturn_message_loss.md, Phase 3).
+class TestCompactionBoundaryId:
+    """summarize_and_compact records the id of the last message its summary
+    covers, so the persistent transport can store a message-level boundary_seq."""
+
+    @pytest.mark.asyncio
+    async def test_records_boundary_at_last_summarized_message(
+        self, context_manager, mock_llm
+    ):
+        # keep_recent_messages=3, so 8 conversation messages → summarize the
+        # first 5 (no tool pairs to shift the safe slice), keep the last 3.
+        # The boundary is the newest summarized message: index 4 → "m4".
+        msgs = [
+            HumanMessage(content=f"u{i} " + "x" * 500, id=f"m{i}")
+            if i % 2 == 0
+            else AIMessage(content=f"a{i} " + "y" * 500, id=f"m{i}")
+            for i in range(8)
+        ]
+        result = await context_manager.summarize_and_compact(
+            messages=msgs, auxiliary=mock_llm
+        )
+        # Compaction actually happened (summary present).
+        assert any(
+            isinstance(m, SystemMessage)
+            and "[Summary of prior work]" in (m.content or "")
+            for m in result
+        )
+        assert context_manager._last_compaction_boundary_id == "m4"
+
+    @pytest.mark.asyncio
+    async def test_boundary_is_none_when_no_compaction(self, context_manager, mock_llm):
+        # Fewer messages than keep_recent → no-op compaction, boundary stays None
+        # so the transport falls back to boundary_turn rather than a stale seq.
+        msgs = [HumanMessage(content="hi", id="m0"), AIMessage(content="yo", id="m1")]
+        await context_manager.summarize_and_compact(messages=msgs, auxiliary=mock_llm)
+        assert context_manager._last_compaction_boundary_id is None
+
+    @pytest.mark.asyncio
+    async def test_boundary_reset_across_calls(self, context_manager, mock_llm):
+        # A real compaction sets the boundary; a subsequent no-op resets it to
+        # None (not left stale from the previous call).
+        big = [
+            HumanMessage(content=f"u{i} " + "x" * 500, id=f"m{i}")
+            if i % 2 == 0
+            else AIMessage(content=f"a{i} " + "y" * 500, id=f"m{i}")
+            for i in range(8)
+        ]
+        await context_manager.summarize_and_compact(messages=big, auxiliary=mock_llm)
+        assert context_manager._last_compaction_boundary_id == "m4"
+        await context_manager.summarize_and_compact(
+            messages=[HumanMessage(content="hi", id="x0")], auxiliary=mock_llm
+        )
+        assert context_manager._last_compaction_boundary_id is None

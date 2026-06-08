@@ -396,13 +396,22 @@ chmod +x ~/.local/bin/tilt
 tilt version
 ```
 
-**Run Tilt**:
+**Run Tilt — first time (or after `k3d cluster delete && create`)**:
 
 ```bash
 ./scripts/local-dev-tilt-up.sh
 ```
 
-This bootstrap is idempotent — it runs `scripts/local-dev-up.sh` underneath (cluster + cert-manager + namespace + vm-ssh-key Secret), then adds the `srw-session-jwt` Secret, syncs the current Traefik ClusterIP into `values-local.yaml`'s `opencloud.hostAliases` entry, and finally runs `tilt up` in the foreground. Press Ctrl-C to stop Tilt (the cluster keeps running; use `k3d cluster stop srw` to stop that too).
+This bootstrap is idempotent — it runs `scripts/local-dev-up.sh` underneath (cluster + cert-manager + namespace + vm-ssh-key Secret), then adds the `srw-session-jwt` Secret, syncs the current Traefik ClusterIP into `values-local.yaml`'s `opencloud.hostAliases` entry, and finally runs `tilt up` in the foreground.
+
+**Run Tilt — subsequent sessions**: the cluster, secrets, and Helm release persist across `k3d cluster stop/start`, and the Traefik ClusterIP is stable for the life of the cluster, so you don't need the bootstrap again. Just bring the cluster back and start Tilt directly (always cluster first, then Tilt — Tilt deploys *into* a running cluster):
+
+```bash
+k3d cluster start srw   # if it was stopped
+tilt up                 # from the repo root; Tilt UI at https://localhost:10350
+```
+
+Press Ctrl-C to stop Tilt (the cluster keeps running; use `k3d cluster stop srw` to stop that too). The bootstrap script is always safe to re-run if you're unsure — it skips anything already in place.
 
 #### The Plan → Develop → Verify workflow
 
@@ -664,21 +673,25 @@ All experts share the same universal agent codebase. Worker-mode experts extend 
 
 Agents run in `dual` mode by default, accepting both jobs and persistent sessions.
 
-### Workspace-Centric Memory
+### Knowledge & Memory
 
-Long-term memory lives in files, not in the LLM context window:
+Long-term memory lives outside the LLM context window in two always-on systems, both injected into every call as transient messages:
 
-- `workspace.md` — Injected into every LLM call, survives context compaction
+- **Knowledge base** — Project-scoped notes written via `kb_write` (decisions, learnings, facts), retrieved by hybrid search. Shared across jobs in a project.
+- **Memory system (RecallStore)** — Hybrid dense+sparse search (pgvector) with TTL-managed memories scoped to projects. An auxiliary LLM extracts memories asynchronously while the agent continues working.
+
+File-based artifacts complement these:
+
 - `plan.md` — Strategic plan, updated at phase boundaries
+- `notes/` — Working notes the agent writes during a job
+- `datasources.md` — Connection reference (names, repo clone paths, kube contexts) for attached datasources
 - `archive/` — Phase retrospectives and completed task lists
-
-Cross-job knowledge sharing uses the **RecallStore** — a hybrid dense+sparse search system (pgvector) with TTL-managed memories scoped to projects. An auxiliary LLM extracts memories asynchronously while the agent continues working.
 
 This means the agent can work on tasks that exceed any single context window, and knowledge accumulates across jobs.
 
 ## Debugging
 
-- **Workspace files** (inside the workspace container, SSH in to look): `workspace.md`, `todos.yaml`, `plan.md`, `output/`
+- **Workspace files** (inside the workspace container, SSH in to look): `plan.md`, `todos.yaml`, `notes/`, `datasources.md`, `output/`
 - **Checkpoints**: `workspace/checkpoints/job_<id>.db` (SQLite, on the agent host)
 - **Logs**: `workspace/logs/job_<id>.log`
 - **Phase snapshots**: `workspace/phase_snapshots/job_<id>/phase_<n>/`

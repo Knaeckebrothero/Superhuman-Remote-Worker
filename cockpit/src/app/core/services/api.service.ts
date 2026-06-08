@@ -825,23 +825,105 @@ export class ApiService {
     threadId: string,
     content: string,
     options: {reformulate?: boolean; language?: string} = {},
-  ): Observable<Blob | 'unavailable' | null> {
+  ): Observable<{text: string; audio: Blob} | 'unavailable' | null> {
+    // The endpoint returns JSON {text, audio} where `text` is the spoken
+    // (formulation-rewritten) version actually read aloud and `audio` is the
+    // base64-encoded MP3. 204 → no TTS model configured ('unavailable');
+    // any error (incl. 502 synthesis failure) → null so the caller can show
+    // an error state.
     return this.http
-      .post(
+      .post<{text: string; audio: string}>(
         `${this.baseUrl}/persistent/threads/${threadId}/tts`,
         {
           content,
           reformulate: options.reformulate ?? true,
           language: options.language ?? 'en',
         },
-        {responseType: 'blob', observe: 'response'},
+        {observe: 'response'},
+      )
+      .pipe(
+        map((resp) => {
+          if (resp.status === 204 || !resp.body) return 'unavailable' as const;
+          return {
+            text: resp.body.text ?? '',
+            audio: this.decodeBase64ToBlob(resp.body.audio, 'audio/mpeg'),
+          };
+        }),
+        catchError((error) => {
+          console.error(`Failed to generate TTS for thread ${threadId}:`, error);
+          return of(null);
+        }),
+      );
+  }
+
+  /**
+   * Plan a (possibly long) message into ordered, speakable chunks for
+   * sequential synthesis + playback. Returns the chunk texts, `'unavailable'`
+   * (204 — no TTS model configured), or `null` on error.
+   */
+  planTTS(
+    threadId: string,
+    content: string,
+  ): Observable<string[] | 'unavailable' | null> {
+    return this.http
+      .post<{chunks: string[]}>(
+        `${this.baseUrl}/persistent/threads/${threadId}/tts/plan`,
+        {content},
+        {observe: 'response'},
       )
       .pipe(
         map((resp) =>
-          resp.status === 204 ? ('unavailable' as const) : (resp.body as Blob),
+          resp.status === 204 || !resp.body
+            ? ('unavailable' as const)
+            : (resp.body.chunks ?? []),
         ),
         catchError((error) => {
-          console.error(`Failed to generate TTS for thread ${threadId}:`, error);
+          console.error(`Failed to plan TTS for thread ${threadId}:`, error);
+          return of(null);
+        }),
+      );
+  }
+
+  /** Decode a base64 string into a typed Blob (used for TTS MP3 payloads). */
+  private decodeBase64ToBlob(base64: string, mime: string): Blob {
+    const binary = atob(base64 ?? '');
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    return new Blob([bytes], {type: mime});
+  }
+
+  /**
+   * Transcribe a recorded voice message to text (speech-to-text).
+   *
+   * Returns:
+   *   - `{text}` on success,
+   *   - `'unavailable'` when the server returns 204 (no STT model configured) —
+   *     lets the caller fall back to attaching the audio silently,
+   *   - `null` on transport error (caller surfaces a notice, still attaches audio).
+   */
+  transcribeVoice(
+    threadId: string,
+    file: Blob,
+  ): Observable<{text: string} | 'unavailable' | null> {
+    const formData = new FormData();
+    const filename = file instanceof File ? file.name : 'voice.webm';
+    formData.append('audio', file, filename);
+    return this.http
+      .post<{text: string}>(
+        `${this.baseUrl}/persistent/threads/${threadId}/transcribe`,
+        formData,
+        {observe: 'response'},
+      )
+      .pipe(
+        map((resp) =>
+          resp.status === 204
+            ? ('unavailable' as const)
+            : (resp.body as {text: string}),
+        ),
+        catchError((error) => {
+          console.error(`Failed to transcribe audio for thread ${threadId}:`, error);
           return of(null);
         }),
       );

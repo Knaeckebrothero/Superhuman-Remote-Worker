@@ -380,6 +380,9 @@ class TestReconcilerTick:
             "drift": 1,
             "drained": 1,
             "skipped_busy": 0,
+            "reaped": 0,
+            "reap_attempts": 0,
+            "reap_forced": 0,
         }
 
     @pytest.mark.asyncio

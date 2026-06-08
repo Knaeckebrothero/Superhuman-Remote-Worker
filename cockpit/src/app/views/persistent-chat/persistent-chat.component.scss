@@ -512,6 +512,9 @@
         display: flex;
         gap: 10px;
         max-width: 90%;
+        /* Pin the avatar to the top so it sits beside the first line of a
+           tall bubble rather than centering against it (#9). */
+        align-items: flex-start;
       }
 
       .message-user {
@@ -532,6 +535,10 @@
         justify-content: center;
         flex-shrink: 0;
         background: var(--surface-0);
+        /* Hairline ring + soft shadow so the avatar reads as a distinct
+           element on both light and dark themes (#9). */
+        border: 1px solid color-mix(in srgb, var(--border-color) 60%, transparent);
+        box-shadow: 0 1px 2px rgba(0, 0, 0, 0.15);
       }
 
       .message-user .avatar {
@@ -840,6 +847,84 @@
         color: var(--text-secondary);
       }
 
+      /* #7: diff/content view inside an edit_file/write_file tool card.
+         Overrides .tool-body's padding (diff-head/body carry their own). */
+      .tool-diff {
+        padding: 0;
+      }
+
+      .diff-head {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 6px 12px;
+        font-size: 11px;
+        color: var(--text-muted);
+        border-bottom: 1px solid var(--border-color, var(--surface-0));
+      }
+
+      .diff-mode-icon {
+        color: var(--accent-color);
+      }
+
+      .diff-mode {
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+      }
+
+      .diff-path {
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        font-family: 'JetBrains Mono', monospace;
+        color: var(--text-secondary);
+      }
+
+      .diff-body {
+        max-height: 320px;
+        overflow: auto;
+        padding: 4px 0;
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 11px;
+        line-height: 1.45;
+      }
+
+      .diff-line {
+        display: flex;
+        padding: 0 8px;
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+
+      .diff-line .diff-sign {
+        width: 1ch;
+        flex-shrink: 0;
+        opacity: 0.55;
+        user-select: none;
+      }
+
+      .diff-line .diff-text {
+        flex: 1;
+        min-width: 0;
+      }
+
+      .diff-line.add {
+        background: color-mix(in srgb, var(--success) 18%, transparent);
+      }
+
+      .diff-line.del {
+        background: color-mix(in srgb, var(--danger) 18%, transparent);
+      }
+
+      .diff-truncated {
+        padding: 4px 12px;
+        font-size: 11px;
+        font-style: italic;
+        color: var(--text-muted);
+      }
+
       /* Inline tool progress (streaming) */
 
       .tool-progress {
@@ -906,7 +991,9 @@
       .compaction-summary-body {
         margin-top: 6px;
         padding: 8px 10px;
-        white-space: pre-wrap;
+        // No white-space: pre-wrap — the summary is markdown now (block elements
+        // structure it); pre-wrap would turn the inter-block newlines into gaps.
+        font-size: 12px; // hold the muted size; .message-body would otherwise bump it to 13px
         border-left: 2px solid var(--border, var(--surface-1));
         border-radius: var(--radius-tag);
       }
@@ -1581,6 +1668,20 @@
         border-radius: var(--radius-tag);
       }
 
+      /* Transient "Transcribing…" hint shown while STT runs after a recording.
+         The spinner reuses the existing .action-spinner-sm (currentColor). */
+      .transcribing-hint {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 8px 12px;
+        margin: 8px 10px 0;
+        background: var(--info-tint);
+        color: var(--info);
+        font-size: 12px;
+        border-radius: var(--radius-tag);
+      }
+
       /* Recording strip — replaces the textarea while recording. */
       .recording-strip {
         display: flex;
@@ -1746,13 +1847,84 @@
         cursor: wait;
       }
 
-      .tts-btn.is-playing {
-        color: var(--accent-color);
-        border-color: var(--accent-color);
-      }
-
       .tts-btn.is-error {
         color: var(--danger, #c44);
+      }
+
+      /* The read-aloud control is a primary affordance — keep it large and
+         fully visible (not a subtle hover-dimmed action) so it isn't missed. */
+      .tts-btn {
+        width: 44px;
+        height: 44px;
+      }
+
+      .message-actions:has(.tts-btn) {
+        opacity: 1;
+      }
+
+      /* One audio player per section, stacked vertically. color-scheme:dark
+         renders the native controls in dark to fit the theme (vs the default
+         white pill). */
+      .tts-players {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        margin-top: 6px;
+      }
+
+      .tts-player-row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+
+      .tts-player {
+        color-scheme: dark;
+        flex: 0 1 320px;
+        height: 32px;
+      }
+
+      .tts-part {
+        font-size: 18px;
+        color: var(--text-muted);
+        white-space: nowrap;
+      }
+
+      /* "Generating part N…" (synthesizing) + "Preparing…" (planning) rows. */
+      .tts-prep,
+      .tts-status {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 18px;
+        color: var(--text-muted);
+      }
+
+      .tts-prep {
+        margin-top: 6px;
+      }
+
+      .tts-status {
+        margin-top: 2px;
+      }
+
+      /* Larger spinner for the read-aloud status rows. The shared
+         .action-spinner-sm stays 12px elsewhere (e.g. the transcribe hint). */
+      .tts-prep .action-spinner-sm,
+      .tts-status .action-spinner-sm {
+        width: 22px;
+        height: 22px;
+        border-width: 3px;
+      }
+
+      /* "Spoken version" disclosure — reuses .thinking-block styling; the text
+         is already markdown-stripped prose, so just preserve its line breaks. */
+      .tts-spoken {
+        margin-top: 6px;
+      }
+
+      .tts-spoken .tts-spoken-text {
+        white-space: pre-wrap;
       }
 
       .action-spinner-sm {
@@ -2064,8 +2236,10 @@
 //
 // One AssistantTurn renders as a .turn-bubble. Per-event cards (.event-thought
 // wraps .thinking-block; .event-text wraps markdown; .event-tool wraps
-// .tool-card) live inside .turn-body. The chevron toggles whole-turn collapse
-// to show just .turn-headline (the final TextEvent).
+// .tool-card) live inside .turn-body. The chevron folds the lead-up (reasoning
+// + tool calls); the collapsed view keeps the final answer (.turn-final-answer,
+// the trailing text run) rendered in full, falling back to a one-line
+// .turn-headline only when the turn has no closing prose.
 // =============================================================================
 
 .turn-body {
@@ -2122,11 +2296,47 @@
   font-size: v.$font-size-sm;
 }
 
-.turn-headline-empty {
-  color: var(--text-muted);
-  font-style: italic;
-  font-size: v.$font-size-xs;
-}
-
 .event-tool + .event-tool { margin-top: v.$space-xs; }
 .turn-bubble.dimmed { opacity: 0.7; }
+
+// #10 — folded "N× tool calls" disclosure for a run of consecutive tools.
+// Cornerless (no box) — mirrors the reasoning .thinking-block's left accent so
+// the two foldable affordances read alike. (The "Tool calls → Expanded" display
+// pref suppresses this wrapper entirely; runs then render as plain inline cards.)
+.tool-group {
+  margin: 4px 0;
+  border-left: 2px solid var(--border, var(--surface-1));
+  border-radius: var(--radius-tag);
+}
+
+.tool-group-head {
+  display: flex;
+  align-items: center;
+  gap: v.$space-xs;
+  padding: 4px 8px;
+  cursor: pointer;
+  color: var(--text-muted);
+  font-size: v.$font-size-sm;
+  list-style: none;
+  transition: background 120ms ease;
+
+  &::-webkit-details-marker { display: none; }
+  &:hover { background: var(--hover); }
+}
+
+.tool-group-chevron {
+  font-size: 16px;
+  transition: transform 120ms ease;
+}
+.tool-group[open] > .tool-group-head .tool-group-chevron { transform: rotate(90deg); }
+
+.tool-group-label { font-weight: 600; color: var(--text-secondary); }
+
+.tool-group-names {
+  @include m.truncate;
+  flex: 1;
+  min-width: 0;
+  font-size: 11px;
+}
+
+.tool-group-body { padding: v.$space-xs; }

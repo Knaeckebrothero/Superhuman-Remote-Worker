@@ -60,6 +60,7 @@ def _make_pod(
     age_seconds=10,
     waiting_reason=None,
     agent_terminated_at=None,
+    tailscale_terminated_at=None,
 ):
     """Create a mock K8s pod object.
 
@@ -100,6 +101,14 @@ def _make_pod(
             seconds=agent_terminated_at
         )
         statuses.append(cs)
+    if tailscale_terminated_at is not None:
+        cs = MagicMock()
+        cs.name = "tailscale"
+        cs.state.waiting = None
+        cs.state.terminated.finished_at = datetime.now(timezone.utc) - timedelta(
+            seconds=tailscale_terminated_at
+        )
+        statuses.append(cs)
     pod.status.container_statuses = statuses
     pod.status.init_container_statuses = []
     return pod
@@ -125,6 +134,7 @@ class TestReapPods:
         assert result == {
             "completed": 0,
             "crashed": 0,
+            "tunnel_dark": 0,
             "stale": 0,
             "drained": 0,
             "unstartable": 0,
@@ -145,6 +155,7 @@ class TestReapPods:
         assert result == {
             "completed": 0,
             "crashed": 0,
+            "tunnel_dark": 0,
             "stale": 0,
             "drained": 0,
             "unstartable": 0,
@@ -336,6 +347,7 @@ class TestReapPods:
         assert result == {
             "completed": 0,
             "crashed": 0,
+            "tunnel_dark": 0,
             "stale": 0,
             "drained": 0,
             "unstartable": 0,
@@ -411,11 +423,72 @@ class TestReapPods:
         assert result == {
             "completed": 1,
             "crashed": 0,
+            "tunnel_dark": 0,
             "stale": 1,
             "drained": 0,
             "unstartable": 1,
         }
         assert p._core_api.delete_namespaced_pod.call_count == 3
+
+    @pytest.mark.asyncio
+    async def test_reaps_tunnel_dark_pod_past_grace(self):
+        # Agent container alive, but the kubelet killed the tailscale sidecar
+        # after a sustained dark window. The pod is useless — recycle it.
+        p, conn = _make_provisioner()
+        conn.fetch.return_value = []
+        pods_result = MagicMock()
+        pods_result.items = [
+            _make_pod("srw-agent-j-dark", phase="Running", tailscale_terminated_at=120),
+        ]
+        p._core_api.list_namespaced_pod.return_value = pods_result
+        with patch(
+            "orchestrator.services.agent_provisioner.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            result = await p.reap_pods()
+        assert result["tunnel_dark"] == 1
+        assert p._core_api.delete_namespaced_pod.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_preserves_tunnel_dark_pod_within_grace(self):
+        p, conn = _make_provisioner()
+        conn.fetch.return_value = []
+        pods_result = MagicMock()
+        pods_result.items = [
+            _make_pod("srw-agent-j-dark", phase="Running", tailscale_terminated_at=5),
+        ]
+        p._core_api.list_namespaced_pod.return_value = pods_result
+        with patch(
+            "orchestrator.services.agent_provisioner.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            result = await p.reap_pods()
+        assert result["tunnel_dark"] == 0
+        assert p._core_api.delete_namespaced_pod.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_dead_agent_takes_precedence_over_tunnel_dark(self):
+        # Both containers terminated → "crashed" (the agent dying is the more
+        # fundamental failure), not tunnel_dark.
+        p, conn = _make_provisioner()
+        conn.fetch.return_value = []
+        pods_result = MagicMock()
+        pods_result.items = [
+            _make_pod(
+                "srw-agent-j-both-dead",
+                phase="Running",
+                agent_terminated_at=120,
+                tailscale_terminated_at=120,
+            ),
+        ]
+        p._core_api.list_namespaced_pod.return_value = pods_result
+        with patch(
+            "orchestrator.services.agent_provisioner.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            result = await p.reap_pods()
+        assert result["crashed"] == 1
+        assert result["tunnel_dark"] == 0
 
 
 # =============================================================================
@@ -834,6 +907,23 @@ class TestActiveCountsByPurpose:
             result = await p.active_counts_by_purpose()
         assert result == {"job": 1, "session": 0, "total": 1}
 
+    @pytest.mark.asyncio
+    async def test_excludes_tunnel_dark_pods(self):
+        p, _ = _make_provisioner()
+        pods_result = MagicMock()
+        pods_result.items = [
+            _make_pod("j-ok", purpose="job"),
+            _make_pod("j-dark", purpose="job", tailscale_terminated_at=120),
+        ]
+        p._core_api.list_namespaced_pod.return_value = pods_result
+        with patch(
+            "orchestrator.services.agent_provisioner.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            counts = await p.active_counts_by_purpose()
+        assert counts["job"] == 1  # the tunnel-dark pod is not counted
+        assert counts["total"] == 1
+
 
 # =============================================================================
 # Pod manifest — labels & downward-API env
@@ -1014,3 +1104,60 @@ def test_pod_manifest_injects_session_jwt_secret_env_from_secretref(monkeypatch)
     assert jwt_entry["valueFrom"]["secretKeyRef"]["name"] == "my-release-session-jwt"
     assert jwt_entry["valueFrom"]["secretKeyRef"]["key"] == "jwt-secret"
     assert jwt_entry["valueFrom"]["secretKeyRef"]["optional"] is True
+
+
+# =============================================================================
+# TestTailscaleSidecar
+# =============================================================================
+
+
+class TestTailscaleSidecar:
+    """Tests for the tailscale sidecar built by _build_pod_manifest()."""
+
+    def _manifest_with_tailscale(self, dark_timeout=600):
+        p, _ = _make_provisioner()
+        p._tailscale_enabled = True
+        p._headscale_url = "https://headscale.test"
+        p._tailscale_dark_timeout = dark_timeout
+        manifest = p._build_pod_manifest(
+            pod_name="srw-agent-test",
+            purpose="job",
+            thread_id=None,
+            config_name="srw-config",
+            cpu_request="100m",
+            memory_request="256Mi",
+            cpu_limit="1000m",
+            memory_limit="2Gi",
+        )
+        return next(
+            c for c in manifest["spec"]["containers"] if c["name"] == "tailscale"
+        )
+
+    def test_sidecar_has_self_heal_loop(self):
+        ts = self._manifest_with_tailscale()
+        args = ts["args"][0]
+        assert "kill -0" in args, "supervision loop must watch tailscaled"
+        assert "BackendState" in args, "must re-up based on backend state"
+        assert "--peers=false" in args, (
+            "status check must skip the peer dump (slow on large tailnets)"
+        )
+        assert args.count("tailscale up") >= 2, "initial auth + re-up"
+        assert "wait $TSPID" not in args, "blocking tail must be replaced"
+
+    def test_sidecar_liveness_probe_default_threshold(self):
+        ts = self._manifest_with_tailscale(dark_timeout=600)
+        probe = ts["livenessProbe"]
+        assert "BackendState" in probe["exec"]["command"][-1]
+        assert "--peers=false" in probe["exec"]["command"][-1], (
+            "probe must skip the peer dump"
+        )
+        assert probe["timeoutSeconds"] >= 5, (
+            "1s default is too short for `tailscale status`"
+        )
+        assert probe["periodSeconds"] == 30
+        assert probe["failureThreshold"] == 20  # ceil(600 / 30)
+        assert probe["initialDelaySeconds"] >= 90  # startup auth must finish first
+
+    def test_sidecar_liveness_threshold_scales_with_timeout(self):
+        ts = self._manifest_with_tailscale(dark_timeout=300)
+        assert ts["livenessProbe"]["failureThreshold"] == 10  # ceil(300 / 30)

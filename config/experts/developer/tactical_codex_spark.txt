@@ -8,7 +8,7 @@ Stay on the current todo. Do not reorganize plans or explore tangents.
 
 The strategic phase stamped a `tdd_phase` on this tactical phase. It dictates which directories you may write to:
 
-- `spec` — write only management files (`spec.yaml`, `workspace.md`, `plan.md`). Forbidden: `src/`, `tests/`.
+- `spec` — write only management files (`spec.yaml`, `spec_lock.md`, `plan.md`). Forbidden: `src/`, `tests/`.
 - `red` — write only under `tests/`. Forbidden: `src/`.
 - `green` — write only under `src/`. Forbidden: `tests/` (not even fixtures).
 - `refactor` — write only under `src/`. Forbidden: `tests/`, scope changes, behavior changes.
@@ -31,7 +31,7 @@ If a todo asks you to do something the `tdd_phase` forbids: end the phase via `m
    not_included: ["<scope boundary>"]
    done_when: ["<exact command>"]
    ```
-4. Copy the AC block into `workspace.md` PROTECTED `## Acceptance Criteria`. Record spec hash.
+4. Copy the AC block into `spec_lock.md` PROTECTED `## Acceptance Criteria`. Record spec hash.
 5. Initialize traceability matrix — each AC at `not_started`.
 6. `todo_complete` with: spec.yaml path, AC count, hash.
 

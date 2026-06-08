@@ -274,6 +274,334 @@ class TestIsHealthy:
 
 
 # =============================================================================
+# is_reapable (teardown eligibility — superset of is_idle)
+# =============================================================================
+
+
+class TestIsReapable:
+    @pytest.mark.asyncio
+    async def test_completed_job_is_reapable(self):
+        mgr, *_ = _make_manager()
+        inst = Instance(kind="workspace", id="x", metadata={"job_status": "completed"})
+        assert await mgr.is_reapable(inst) is True
+
+    @pytest.mark.asyncio
+    async def test_failed_job_is_reapable(self):
+        mgr, *_ = _make_manager()
+        inst = Instance(kind="workspace", id="x", metadata={"job_status": "failed"})
+        assert await mgr.is_reapable(inst) is True
+
+    @pytest.mark.asyncio
+    async def test_paused_job_is_reapable(self):
+        mgr, *_ = _make_manager()
+        inst = Instance(kind="workspace", id="x", metadata={"job_status": "paused"})
+        assert await mgr.is_reapable(inst) is True
+
+    @pytest.mark.asyncio
+    async def test_processing_job_not_reapable(self):
+        mgr, *_ = _make_manager()
+        inst = Instance(kind="workspace", id="x", metadata={"job_status": "processing"})
+        assert await mgr.is_reapable(inst) is False
+
+    @pytest.mark.asyncio
+    async def test_ended_thread_is_reapable(self):
+        mgr, *_ = _make_manager()
+        inst = Instance(kind="workspace", id="x", metadata={"thread_status": "ended"})
+        assert await mgr.is_reapable(inst) is True
+
+    @pytest.mark.asyncio
+    async def test_active_thread_not_reapable(self):
+        mgr, *_ = _make_manager()
+        inst = Instance(kind="workspace", id="x", metadata={"thread_status": "active"})
+        assert await mgr.is_reapable(inst) is False
+
+    @pytest.mark.asyncio
+    async def test_no_status_not_reapable(self):
+        mgr, *_ = _make_manager()
+        inst = Instance(kind="workspace", id="x", metadata={})
+        assert await mgr.is_reapable(inst) is False
+
+
+# =============================================================================
+# is_dirty (activity-based; threads total_turns, jobs conservative)
+# =============================================================================
+
+
+class TestIsDirty:
+    @pytest.mark.asyncio
+    async def test_thread_zero_turns_is_clean(self):
+        mgr, *_ = _make_manager()
+        inst = Instance(
+            kind="workspace",
+            id="x",
+            bound_to="t1",
+            metadata={
+                "thread_status": "ended",
+                "total_turns": 0,
+                "last_snapshot_turns": None,
+            },
+        )
+        assert await mgr.is_dirty(inst) is False
+
+    @pytest.mark.asyncio
+    async def test_thread_turns_ahead_of_snapshot_is_dirty(self):
+        mgr, *_ = _make_manager()
+        inst = Instance(
+            kind="workspace",
+            id="x",
+            bound_to="t1",
+            metadata={
+                "thread_status": "ended",
+                "total_turns": 5,
+                "last_snapshot_turns": 2,
+            },
+        )
+        assert await mgr.is_dirty(inst) is True
+
+    @pytest.mark.asyncio
+    async def test_thread_turns_equal_snapshot_is_clean(self):
+        mgr, *_ = _make_manager()
+        inst = Instance(
+            kind="workspace",
+            id="x",
+            bound_to="t1",
+            metadata={
+                "thread_status": "ended",
+                "total_turns": 3,
+                "last_snapshot_turns": 3,
+            },
+        )
+        assert await mgr.is_dirty(inst) is False
+
+    @pytest.mark.asyncio
+    async def test_thread_with_turns_never_snapshotted_is_dirty(self):
+        mgr, *_ = _make_manager()
+        inst = Instance(
+            kind="workspace",
+            id="x",
+            bound_to="t1",
+            metadata={
+                "thread_status": "ended",
+                "total_turns": 4,
+                "last_snapshot_turns": None,
+            },
+        )
+        assert await mgr.is_dirty(inst) is True
+
+    @pytest.mark.asyncio
+    async def test_terminal_job_with_snapshot_is_clean(self):
+        # Completed jobs get a completion snapshot — reap without re-capture.
+        mgr, *_ = _make_manager()
+        inst = Instance(
+            kind="workspace",
+            id="x",
+            bound_to="j1",
+            metadata={"job_status": "completed", "snapshot_status": "available"},
+        )
+        assert await mgr.is_dirty(inst) is False
+
+    @pytest.mark.asyncio
+    async def test_job_without_snapshot_is_dirty(self):
+        # No job turn-counter → conservative: attempt a snapshot.
+        mgr, *_ = _make_manager()
+        inst = Instance(
+            kind="workspace",
+            id="x",
+            bound_to="j1",
+            metadata={"job_status": "pending_review", "snapshot_status": None},
+        )
+        assert await mgr.is_dirty(inst) is True
+
+
+# =============================================================================
+# is_state_ephemeral (volume-mode branch)
+# =============================================================================
+
+
+class TestIsStateEphemeral:
+    @pytest.mark.asyncio
+    async def test_emptydir_is_ephemeral(self):
+        mgr, *_ = _make_manager()
+        inst = Instance(kind="workspace", id="x", metadata={"volume_ephemeral": True})
+        assert await mgr.is_state_ephemeral(inst) is True
+
+    @pytest.mark.asyncio
+    async def test_pvc_is_not_ephemeral(self):
+        mgr, *_ = _make_manager()
+        inst = Instance(kind="workspace", id="x", metadata={"volume_ephemeral": False})
+        assert await mgr.is_state_ephemeral(inst) is False
+
+    @pytest.mark.asyncio
+    async def test_unknown_defaults_to_ephemeral(self):
+        # Default matches today's reality (emptyDir). Conservative for the
+        # current fleet; the PVC migration spec flips the default explicitly.
+        mgr, *_ = _make_manager()
+        inst = Instance(kind="workspace", id="x", metadata={})
+        assert await mgr.is_state_ephemeral(inst) is True
+
+
+class TestIsReachable:
+    @pytest.mark.asyncio
+    async def test_reachable_when_connect_succeeds(self):
+        mgr, *_ = _make_manager()
+        mgr._tcp_probe = AsyncMock(return_value=True)
+        inst = Instance(kind="workspace", id="x", metadata={"pod_ip": "10.0.0.5"})
+        assert await mgr.is_reachable(inst) is True
+        mgr._tcp_probe.assert_awaited_once_with("10.0.0.5", 30022)
+
+    @pytest.mark.asyncio
+    async def test_unreachable_when_connect_fails(self):
+        mgr, *_ = _make_manager()
+        mgr._tcp_probe = AsyncMock(return_value=False)
+        inst = Instance(kind="workspace", id="x", metadata={"pod_ip": "10.0.0.5"})
+        assert await mgr.is_reachable(inst) is False
+
+    @pytest.mark.asyncio
+    async def test_unreachable_without_pod_ip(self):
+        mgr, *_ = _make_manager()
+        mgr._tcp_probe = AsyncMock(return_value=True)
+        inst = Instance(kind="workspace", id="x", metadata={})
+        assert await mgr.is_reachable(inst) is False
+        mgr._tcp_probe.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_result_is_cached(self):
+        mgr, *_ = _make_manager()
+        mgr._clock = lambda: 1000.0
+        mgr._tcp_probe = AsyncMock(return_value=True)
+        inst = Instance(kind="workspace", id="x", metadata={"pod_ip": "10.0.0.5"})
+        assert await mgr.is_reachable(inst) is True
+        assert await mgr.is_reachable(inst) is True
+        mgr._tcp_probe.assert_awaited_once()  # second call served from cache
+
+    @pytest.mark.asyncio
+    async def test_cache_expires(self):
+        mgr, *_ = _make_manager()
+        t = {"now": 1000.0}
+        mgr._clock = lambda: t["now"]
+        mgr._tcp_probe = AsyncMock(return_value=True)
+        inst = Instance(kind="workspace", id="x", metadata={"pod_ip": "10.0.0.5"})
+        await mgr.is_reachable(inst)
+        t["now"] = 1040.0  # > 30s TTL
+        await mgr.is_reachable(inst)
+        assert mgr._tcp_probe.await_count == 2
+
+
+class TestAttemptCounter:
+    @pytest.mark.asyncio
+    async def test_record_attempt_increments_job_context(self):
+        mgr, _, _, _, db = _make_manager()
+        db.merge_workspace_container_context = AsyncMock(return_value=True)
+        inst = Instance(
+            kind="workspace",
+            id="workspace-a",
+            bound_to="j1",
+            metadata={"labels": {"srw/job-id": "j1"}, "snapshot_attempts": 2},
+        )
+        await mgr.record_attempt(inst)
+        db.merge_workspace_container_context.assert_awaited_once_with(
+            "j1", {"snapshot_attempts": 3}
+        )
+
+    @pytest.mark.asyncio
+    async def test_record_attempt_increments_thread_context(self):
+        mgr, _, _, _, db = _make_manager()
+        db.merge_thread_workspace_context = AsyncMock(return_value=True)
+        inst = Instance(
+            kind="workspace",
+            id="ws-thread-a",
+            bound_to="t1",
+            metadata={"labels": {"srw/thread-id": "t1"}, "snapshot_attempts": 0},
+        )
+        await mgr.record_attempt(inst)
+        db.merge_thread_workspace_context.assert_awaited_once_with(
+            "t1", {"snapshot_attempts": 1}
+        )
+
+    @pytest.mark.asyncio
+    async def test_exhausted_true_at_threshold(self, monkeypatch):
+        monkeypatch.setenv("WORKSPACE_SNAPSHOT_MAX_ATTEMPTS", "5")
+        mgr, *_ = _make_manager()
+        inst = Instance(kind="workspace", id="x", metadata={"snapshot_attempts": 5})
+        assert await mgr.attempts_exhausted(inst) is True
+
+    @pytest.mark.asyncio
+    async def test_exhausted_false_below_threshold(self, monkeypatch):
+        monkeypatch.setenv("WORKSPACE_SNAPSHOT_MAX_ATTEMPTS", "5")
+        mgr, *_ = _make_manager()
+        inst = Instance(kind="workspace", id="x", metadata={"snapshot_attempts": 4})
+        assert await mgr.attempts_exhausted(inst) is False
+
+
+class TestGiveUp:
+    @pytest.mark.asyncio
+    async def test_ephemeral_give_up_deletes(self):
+        mgr, container, *_ = _make_manager()
+        inst = Instance(
+            kind="workspace",
+            id="workspace-a",
+            bound_to="j1",
+            metadata={"labels": {"srw/job-id": "j1"}, "volume_ephemeral": True},
+        )
+        await mgr.give_up(inst, grace_s=0)
+        container.delete_workspace.assert_awaited_once_with(WorkspaceOwner.job("j1"))
+
+    @pytest.mark.asyncio
+    async def test_pvc_give_up_recreates_keeps_pvc(self):
+        mgr, container, *_ = _make_manager()
+        container.create_workspace = AsyncMock(return_value=True)
+        container.delete_workspace_pvc = AsyncMock(return_value=True)
+        inst = Instance(
+            kind="workspace",
+            id="workspace-a",
+            bound_to="j1",
+            metadata={"labels": {"srw/job-id": "j1"}, "volume_ephemeral": False},
+        )
+        await mgr.give_up(inst, grace_s=0)
+        container.delete_workspace.assert_awaited_once_with(WorkspaceOwner.job("j1"))
+        container.create_workspace.assert_awaited_once_with(WorkspaceOwner.job("j1"))
+        container.delete_workspace_pvc.assert_not_called()  # PVC must survive
+
+    @pytest.mark.asyncio
+    async def test_snapshot_success_resets_attempt_counter(self):
+        mgr, _, _, snapshot, db = _make_manager()
+        db.merge_workspace_container_context = AsyncMock(return_value=True)
+        snapshot.capture_vm_snapshot = AsyncMock(return_value=True)
+        inst = Instance(
+            kind="workspace",
+            id="workspace-a",
+            bound_to="j1",
+            metadata={"labels": {"srw/job-id": "j1"}, "pod_ip": "10.0.0.5"},
+        )
+        ref = await mgr.snapshot(inst)
+        assert ref == "j1"
+        db.merge_workspace_container_context.assert_awaited_with(
+            "j1", {"snapshot_attempts": 0}
+        )
+
+
+def test_pod_volume_is_ephemeral_helper():
+    from orchestrator.services.lifecycle.workspace_manager import (
+        _pod_volume_is_ephemeral,
+    )
+
+    empty = _make_pod("w1")
+    vol_e = MagicMock()
+    vol_e.name = "workspace-data"
+    vol_e.persistent_volume_claim = None
+    vol_e.empty_dir = MagicMock()
+    empty.spec.volumes = [vol_e]
+    assert _pod_volume_is_ephemeral(empty) is True
+
+    pvc = _make_pod("w2")
+    vol_p = MagicMock()
+    vol_p.name = "workspace-data"
+    vol_p.persistent_volume_claim = MagicMock()
+    pvc.spec.volumes = [vol_p]
+    assert _pod_volume_is_ephemeral(pvc) is False
+
+
+# =============================================================================
 # snapshot / restore
 # =============================================================================
 

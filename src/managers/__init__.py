@@ -9,8 +9,8 @@ nested loop workflow:
 - **PlanManager**: Service for plan.md operations. Reads the
   strategic plan at phase transitions.
 
-- **MemoryManager**: Service for workspace.md operations. Provides
-  long-term memory that's always in the system prompt.
+- **MemoryManager**: DEPRECATED service for workspace.md operations.
+  Superseded by the knowledge base + memory system (no longer injected).
 
 All managers are built on top of WorkspaceManager and operate on
 files in the job workspace.

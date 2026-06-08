@@ -102,7 +102,7 @@ _Document registration (`_register_initial_documents`):_
 - Each worker creates independent CitationEngine instance (thread safety)
 - Non-fatal — failures logged but don't block job
 
-_Datasource connections (`_create_datasource_connection`):_
+_Datasource connections (`datasource_setup.create_datasource_connection`):_
 - Neo4j — creates `Neo4jDB`, calls `connect()`
 - PostgreSQL — `psycopg.connect()`, test query, rollback
 - MongoDB — `MongoClient` with ping, extracts DB name from URL path

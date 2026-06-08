@@ -261,6 +261,69 @@ def sanitize_message_history(messages: List[BaseMessage]) -> List[BaseMessage]:
     return result
 
 
+def repair_tool_pairing(messages: List[BaseMessage]) -> List[BaseMessage]:
+    """Drop tool calls/results that lost their partner.
+
+    Both the OpenAI Responses API and Anthropic reject a history where an
+    assistant tool/function call has no matching result, or a result has no
+    matching call, with a 400 ("No tool call found for function call output
+    ..." / "no tool output found for function call ..."). Unlike
+    ``sanitize_message_history`` (which only drops orphaned results), this is
+    bidirectional and also strips orphaned calls off assistant messages.
+
+    Orphans arise from context-compaction thrash, an interrupted turn (a tool
+    result that was never produced or persisted), or streamed parallel-tool
+    corruption (langchain #34660). Keep only calls and results whose ids match
+    on both sides; assistant messages left with neither text nor calls are
+    dropped.
+
+    Shared by the live persistent turn loop (``persistent_graph``) and the
+    session resume path (``persistent_app``) so both enforce the same
+    invariant before a strict-pairing API call.
+    """
+    call_ids = {
+        tc.get("id")
+        for m in messages
+        if isinstance(m, AIMessage)
+        for tc in (getattr(m, "tool_calls", None) or [])
+        if tc.get("id")
+    }
+    result_ids = {
+        m.tool_call_id
+        for m in messages
+        if isinstance(m, ToolMessage) and getattr(m, "tool_call_id", "")
+    }
+    valid_ids = call_ids & result_ids
+
+    repaired: List[BaseMessage] = []
+    dropped_results = 0
+    stripped_calls = 0
+    for m in messages:
+        if isinstance(m, AIMessage):
+            tool_calls = getattr(m, "tool_calls", None) or []
+            kept = [tc for tc in tool_calls if tc.get("id") in valid_ids]
+            if len(kept) != len(tool_calls):
+                stripped_calls += len(tool_calls) - len(kept)
+                m = AIMessage(content=m.content, tool_calls=kept, id=m.id)
+            if not kept and not m.content:
+                continue  # empty assistant turn carries no information
+            repaired.append(m)
+        elif isinstance(m, ToolMessage):
+            if getattr(m, "tool_call_id", "") in valid_ids:
+                repaired.append(m)
+            else:
+                dropped_results += 1  # orphaned result — drop
+        else:
+            repaired.append(m)
+
+    if dropped_results or stripped_calls:
+        logger.warning(
+            f"repair_tool_pairing: dropped {dropped_results} orphaned tool "
+            f"result(s), stripped {stripped_calls} orphaned tool call(s)"
+        )
+    return repaired
+
+
 # Try to import tiktoken for accurate token counting
 try:
     import tiktoken
@@ -322,10 +385,12 @@ class ContextConfig:
     placeholder_text: str = "[Result processed - see workspace if needed]"
     tool_retry_count: int = 3
     tool_retry_delay_seconds: float = 1.0
-    # Safety layer constants
+    # Safety layer constants — a base=100_000 instance of the limit fractions in
+    # src/core/loader.py (threshold .80 / safe .90 / chunk .60 / msg_min .40).
+    # Real values come from the matrix derivation; these are fallback-only.
     model_max_context_tokens: int = 100_000
     summarization_safe_limit: int = 90_000
-    summarization_chunk_size: int = 80_000
+    summarization_chunk_size: int = 60_000
     # Evidence-preservation filter: side effects and failures survive compaction
     # so the strategic-phase audit protocol can cite verbatim tool output.
     preserve_tool_names: Tuple[str, ...] = (
@@ -512,6 +577,13 @@ class ContextManager:
         self.token_counter = self._default_counter
         self._state = ContextManagementState()
         self._summarization_timeout = summarization_timeout
+        # Set by summarize_and_compact to the id of the last message the newest
+        # summary covers (the summarized/kept boundary). The persistent-session
+        # transport reads it to record a message-granular `boundary_seq` on the
+        # summary row so resume loads `summary + messages after the boundary`
+        # instead of whole post-boundary turns. None when the last call did not
+        # actually compact. See docs/issues/persistent_session_midturn_message_loss.md.
+        self._last_compaction_boundary_id: Optional[str] = None
 
     def set_current_phase(self, phase: str) -> None:
         """Switch token counter to the appropriate phase-specific model.
@@ -1179,7 +1251,13 @@ class ContextManager:
         )
 
         try:
-            result: ConversationSummary = await auxiliary.chain(task)
+            # Structured summarization gets the full, dedicated summarization
+            # budget — NOT the short interactive auxiliary.timeout that guards
+            # quick aux tasks (memory/titles). A large conversation can't be
+            # summarized under a schema in the ~120s aux window.
+            result: ConversationSummary = await auxiliary.chain(
+                task, timeout=self._summarization_timeout
+            )
 
             # Format into readable text
             parts = []
@@ -1236,7 +1314,13 @@ class ContextManager:
             return summary
 
         except Exception as e:
-            logger.error(f"Structured summarization failed: {e}", exc_info=True)
+            # Sequential, never raced: the structured pass ran and failed
+            # (timeout / schema / endpoint). Log it loudly with the traceback,
+            # then try the cheaper unstructured pass before giving up.
+            logger.error(
+                f"Structured summarization failed, falling back to unstructured: {e}",
+                exc_info=True,
+            )
 
             # Fallback: unstructured summarization using the raw LLM
             try:
@@ -1446,6 +1530,11 @@ class ContextManager:
         """
         from src.core.workspace_injection import is_workspace_injection_message
 
+        # Reset the boundary marker; only a real compaction (final return below)
+        # sets it. A no-op / skipped compaction leaves it None so the transport
+        # falls back to boundary_turn rather than recording a stale boundary_seq.
+        self._last_compaction_boundary_id = None
+
         # Filter out workspace injection messages BEFORE processing
         # They are transient and will be re-injected fresh after summarization
         messages = [m for m in messages if not is_workspace_injection_message(m)]
@@ -1637,6 +1726,17 @@ class ContextManager:
             f"Compacted {len(messages)} messages to {len(system_msgs) + 1 + len(fresh_recent)} "
             f"(summarized {len(messages_to_summarize)} messages{merged_summaries_info}, "
             f"removing {len(removal_markers)}, {messages_without_ids} without IDs)"
+        )
+
+        # Record the summarized/kept boundary for the persistent transport: the
+        # newest message the summary covers is original_conversation[safe_start-1]
+        # (original, not sanitized, so the id matches the persisted row). Its seq
+        # becomes boundary_seq, so resume loads exactly the messages after it
+        # (seq > boundary_seq), never whole post-boundary turns.
+        self._last_compaction_boundary_id = (
+            getattr(original_conversation[safe_start - 1], "id", None)
+            if safe_start >= 1
+            else None
         )
 
         # Return: removal markers + system messages + summary + fresh recent

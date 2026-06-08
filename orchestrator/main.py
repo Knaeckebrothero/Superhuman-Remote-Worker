@@ -89,7 +89,7 @@ from fastapi.responses import (  # noqa: E402
     StreamingResponse,
 )
 
-from pydantic import BaseModel, Field  # noqa: E402
+from pydantic import BaseModel, Field, model_validator  # noqa: E402
 
 from database import (  # noqa: E402
     PostgresDB,
@@ -174,7 +174,6 @@ from seed.llm_config import ensure_codex_proxy_endpoint  # noqa: E402
 # them here so callers don't each do lazy imports.
 from src.core.model_registry import (  # noqa: E402
     UnknownModelError,
-    family_of as _model_family,
     resolve_model as _resolve_model,
 )
 from src.utils.ssh_key import (  # noqa: E402
@@ -674,32 +673,19 @@ async def ide_session_ttl_sweeper(shutdown_event: asyncio.Event) -> None:
 
 
 async def workspace_idle_sweeper(shutdown_event: asyncio.Event) -> None:
-    """Background loop: suspends idle workspace containers to S3 AND reconciles
-    failed session workspaces.
+    """Background loop: reconciles failed/missing session workspaces.
 
-    Runs every 60 seconds. Suspends workspace containers for jobs in
-    paused/pending_review/waiting_for_reply statuses past the configured idle
-    timeout (WORKSPACE_IDLE_TIMEOUT, default 30 min). Then re-ensures workspaces
-    for active sessions whose workspace container is in a non-ready, non-in-progress
-    state (e.g. 'failed') — the session-side equivalent of the job dispatcher's
-    per-cycle workspace reconcile.
+    Idle suspension and teardown now live in the lifecycle reconciler's reap
+    path (``services/lifecycle/reconciler.py`` → ``WorkspaceInstanceManager``),
+    which snapshots-then-deletes reapable workspaces and force-deletes ones it
+    can never reach (bounded retry) instead of keeping them alive forever.
+
+    This loop retains only the session-workspace recovery reconcile —
+    recreating failed/missing workspaces for active sessions — which is
+    independent of idle policy. Runs every 60 seconds.
     """
-    logger.info("Workspace idle sweeper started")
+    logger.info("Workspace idle sweeper started (reconcile-only)")
     while not shutdown_event.is_set():
-        try:
-            if workspace_suspension_service.is_enabled:
-                count = await workspace_suspension_service.check_idle_all()
-                if count:
-                    logger.info("Workspace sweeper: suspended %d job containers", count)
-                thread_count = await workspace_suspension_service.check_idle_threads()
-                if thread_count:
-                    logger.info(
-                        "Workspace sweeper: suspended %d thread containers",
-                        thread_count,
-                    )
-        except Exception as e:
-            logger.error("Error in workspace idle sweeper: %s", e)
-
         # Session workspace reconcile (safety-net): recreate failed/missing
         # workspaces for active sessions. Runs regardless of whether idle
         # suspension is enabled — recovering a wedged workspace is independent
@@ -747,12 +733,19 @@ async def code_server_settings_sweeper(shutdown_event: asyncio.Event) -> None:
 
     from services.ide_settings import (
         IdeSettingsStore,
+        OpenVsxClassifier,
+        _coerce_context,
+        capture_ide_profile,
+        list_ide_extensions,
         pull_ide_config,
+        reconcile_extensions,
         reconcile_ide_settings,
+        resolve_ssh_target,
     )
 
     interval = float(os.environ.get("IDE_SETTINGS_SYNC_INTERVAL_S", "600"))
     store = IdeSettingsStore(postgres_db)
+    classifier = OpenVsxClassifier()  # cache persists across cycles for this process
     logger.info("Code-server settings sweeper started (interval=%.0fs)", interval)
     while not shutdown_event.is_set():
         try:
@@ -761,6 +754,39 @@ async def code_server_settings_sweeper(shutdown_event: asyncio.Event) -> None:
                 count = await reconcile_ide_settings(store, workspaces, pull_ide_config)
                 if count:
                     logger.info("IDE settings sweeper: synced %d file(s)", count)
+                try:
+                    ext_changed = await reconcile_extensions(
+                        store, workspaces, list_ide_extensions, classifier
+                    )
+                    if ext_changed:
+                        logger.info(
+                            "IDE settings sweeper: synced %d extension(s)", ext_changed
+                        )
+                except Exception as e:  # noqa: BLE001
+                    logger.error("Error reconciling extensions: %s", e)
+
+                # Capture license/globalStorage + non-Open-VSX bytes to S3 when a
+                # workspace's content signature changed (Phase B). Signature-gated
+                # inside capture_ide_profile so most cycles are a cheap no-op.
+                if snapshot_service.is_available:
+                    from services.ide_profile_store import IdeProfileStore
+
+                    profile = IdeProfileStore(
+                        snapshot_service._s3, snapshot_service._bucket
+                    )
+                    for ws in workspaces:
+                        uid = ws.get("user_id")
+                        if not uid:
+                            continue
+                        tgt = resolve_ssh_target(_coerce_context(ws.get("context")))
+                        if not tgt:
+                            continue
+                        try:
+                            await capture_ide_profile(
+                                store, str(uid), tgt[0], tgt[1], profile
+                            )
+                        except Exception as e:  # noqa: BLE001
+                            logger.warning("ide profile capture failed: %s", e)
         except Exception as e:
             logger.error("Error in code-server settings sweeper: %s", e)
 
@@ -945,12 +971,28 @@ async def _inject_dispatch_credentials(
             provider_for_key: str | None = meta.api_key_ref
         else:
             provider_for_key = _dispatch_llm_provider_fallback(job, config_override)
+        # Route to the right agent-side LLM factory. System-anchored catalog
+        # rows carry no endpoint base_url, so without an explicit provider the
+        # agent's create_llm defaults to the OpenAI factory (api.openai.com)
+        # and rejects e.g. an OpenRouter sk-or-v1 key. meta.provider already
+        # holds the factory name (_factory_provider); fall back to the
+        # key-inference result for registry misses.
+        factory_provider = meta.provider if meta is not None else provider_for_key
+        if factory_provider:
+            llm_over.setdefault("provider", factory_provider)
         if (
             provider_for_key
             and provider_for_key in resolved_keys
             and "api_key" not in llm_over
         ):
             llm_over["api_key"] = resolved_keys[provider_for_key]
+
+    # Per-model context window: drive the agent's working window from the
+    # catalog/admin value. Lands in llm.model_max_context_tokens (a flat llm
+    # key) so it survives the agent-side settings-matrix re-run and becomes the
+    # base for the derived limits. Truthy guard rejects None and an explicit 0.
+    if meta is not None and meta.context_window:
+        llm_over.setdefault("model_max_context_tokens", meta.context_window)
 
     if resolved_keys:
         _ENV_KEY_MAP = {"vision": "VISION_API_KEY"}
@@ -2000,6 +2042,13 @@ async def _inject_model_credentials(
     except UnknownModelError:
         meta = None
 
+    # Per-model context window (chat capability only — auxiliary/vision sections
+    # carry their own windows and aren't derived this way). Set before the
+    # endpoint/provider branches so it also reaches endpoint-backed (self-hosted)
+    # models. setdefault keeps a caller-pinned value; truthy guard skips None/0.
+    if capability == "chat" and meta is not None and meta.context_window:
+        section.setdefault("model_max_context_tokens", meta.context_window)
+
     if (
         meta is not None
         and meta.origin in ("custom", "system", "catalog")
@@ -2014,6 +2063,13 @@ async def _inject_model_credentials(
         return
 
     provider = meta.api_key_ref if meta is not None else _provider_of_model(model_id)
+    # Inject the agent-side factory name so system-anchored rows (which carry
+    # no endpoint base_url) route to the correct LLM factory — e.g. an
+    # OpenRouter row → _create_openrouter_llm (openrouter.ai), not the OpenAI
+    # default at api.openai.com. meta.provider already holds the factory name.
+    factory_provider = meta.provider if meta is not None else provider
+    if factory_provider:
+        section.setdefault("provider", factory_provider)
     if (
         provider
         and resolved_keys
@@ -2868,26 +2924,50 @@ class LlmEndpointUpdate(BaseModel):
     allow_insecure: bool = False
 
 
-class PromptOverrideCreate(BaseModel):
-    """Request body for creating or replacing a prompt override.
+class ConfigOverrideCreate(BaseModel):
+    """Request body for creating or replacing a config override.
 
-    ``kind`` is the resolver subsection; ``name`` is the resolver entry_type
-    (e.g. 'persona', 'systemprompt'). ``family=None`` means a global default.
+    ``kind`` selects the config subsection. Text kinds (prompts, instructions)
+    populate ``content``; structured kinds (settings, guardrails) populate
+    ``value_json``. ``name`` is the resolver entry_type / settings leaf (dotted
+    for limits, e.g. 'limits.context_threshold_tokens'). ``family=None`` means a
+    global default.
     """
 
     family: str | None = Field(None, max_length=64)
-    kind: Literal["prompts", "instructions"]
+    kind: Literal["prompts", "instructions", "settings", "guardrails"]
     name: str = Field(..., min_length=1, max_length=128)
-    content: str = Field(..., min_length=1)
+    content: str | None = Field(None, min_length=1)
     content_format: Literal["text", "markdown", "jinja", "yaml"] = "text"
+    value_json: Any = None
     notes: str | None = None
 
+    @model_validator(mode="after")
+    def _check_payload(self) -> "ConfigOverrideCreate":
+        """Enforce the content/value_json XOR by kind (mirrors the DB check)."""
+        if self.kind in ("prompts", "instructions"):
+            if self.content is None:
+                raise ValueError(f"{self.kind} override requires 'content'")
+            if self.value_json is not None:
+                raise ValueError(f"{self.kind} override must not set 'value_json'")
+        else:  # settings, guardrails
+            if self.value_json is None:
+                raise ValueError(f"{self.kind} override requires 'value_json'")
+            if self.content is not None:
+                raise ValueError(f"{self.kind} override must not set 'content'")
+        return self
 
-class PromptOverrideUpdate(BaseModel):
-    """Update an existing override's content; family/kind/name are immutable."""
 
-    content: str = Field(..., min_length=1)
+class ConfigOverrideUpdate(BaseModel):
+    """Update an existing override's payload; family/kind/name are immutable.
+
+    The acting kind is taken from the stored row, so the route picks ``content``
+    (text kinds) or ``value_json`` (structured kinds).
+    """
+
+    content: str | None = Field(None, min_length=1)
     content_format: Literal["text", "markdown", "jinja", "yaml"] = "text"
+    value_json: Any = None
     notes: str | None = None
 
 
@@ -3311,6 +3391,36 @@ async def lifespan(app: FastAPI):
                 "Main cloud overlay present in system_settings.main_cloud but "
                 "rebuild failed — active backend stays on env-var config"
             )
+
+    # Issue 5: warn loudly if the *active* backend's required secrets are not
+    # present in the env — it is silently running on built-in DEV credentials
+    # and will fail at the first cloud call. Non-fatal (graceful-degradation
+    # convention + local/dev stacks legitimately set their own secrets), but no
+    # longer silent. The PUT/test endpoints refuse this at swap time; this
+    # catches a Helm-misconfigured deployment that booted straight into it.
+    try:
+        from services.cloud.config import missing_secret_envs
+
+        _active_id = main_cloud_router.active.backend_id
+        # Only trust the overlay's credentials_ref if the overlay actually drove
+        # the active backend; otherwise check the plain env path.
+        _active_overlay = (
+            _persisted_overlay
+            if _persisted_overlay
+            and (_persisted_overlay.get("value") or {}).get("backend_id") == _active_id
+            else None
+        )
+        _missing_secrets = missing_secret_envs(_active_id, _active_overlay)
+        if _missing_secrets:
+            logger.warning(
+                "Main cloud backend %r is active but required secret env var(s) "
+                "are unset: %s — it is running on built-in DEV credentials and "
+                "will fail at the first cloud call. Set them via Helm/Vault.",
+                _active_id,
+                ", ".join(sorted({m["env_var"] for m in _missing_secrets})),
+            )
+    except Exception as _e:
+        logger.debug("Main cloud secret presence check skipped at startup: %s", _e)
 
     # Initialize NATS bridge for VM lifecycle (graceful if unavailable)
     await nats_bridge.connect(db=postgres_db, on_vm_ready=_trigger_dispatch)
@@ -8959,7 +9069,10 @@ async def export_job_to_shared_folder(request: Request, job_id: str) -> dict[str
             ),
         )
 
-    backend = main_cloud_router.active
+    # Fresh loose-job export folder — no project/thread row to pin to yet,
+    # so resolve via the owner seam (returns the active backend today;
+    # per-org under multi-tenancy). Issue 16, docs/issues/main_cloud.md.
+    backend = main_cloud_router.for_owner(user)
     if not backend.is_initialized:
         raise HTTPException(status_code=503, detail="Cloud backend not available.")
     if not gitea_client.is_initialized:
@@ -9310,14 +9423,14 @@ def _build_datasource_tool_override(
             ],
         },
         "webdav": {
-            "category": "cloud",
-            "read": ["cloud_list", "cloud_read", "cloud_info"],
+            "category": "webdav",
+            "read": ["webdav_list", "webdav_read", "webdav_info"],
             "write": [
-                "cloud_list",
-                "cloud_read",
-                "cloud_info",
-                "cloud_write",
-                "cloud_delete",
+                "webdav_list",
+                "webdav_read",
+                "webdav_info",
+                "webdav_write",
+                "webdav_delete",
             ],
         },
     }
@@ -11050,6 +11163,20 @@ async def agent_get_thread_workspace(
     # Phase 1: project attachment + cloud mounts now live on thread_mounts.
     project_ids = await _thread_project_ids(thread_id)
     mount_rows = await postgres_db.list_thread_mounts(thread_id)
+    cloud_sync_cfg = _build_agent_cloud_sync(thread, mount_rows=mount_rows)
+    # Issue 13 follow-up: if the main cloud is up but this thread resolved NO
+    # sync target (session-folder provisioning failed upstream, or user-home /
+    # project-mount resolution produced nothing usable), the agent would
+    # otherwise run unsynced with no signal. Flag it so the agent surfaces the
+    # same degraded-sync state it shows for a failed initial pull, instead of
+    # silently skipping cloud sync for the session's whole life.
+    try:
+        _cloud_up = main_cloud_router.active.is_initialized
+    except Exception:
+        _cloud_up = False
+    cloud_sync_degraded = bool(
+        _cloud_up and not cloud_sync_cfg and not thread.get("nc_session_folder")
+    )
     return {
         "status": ws.get("status", "none"),
         # K8s provisioner uses pod_ip; Docker provisioner uses host — normalize
@@ -11077,7 +11204,9 @@ async def agent_get_thread_workspace(
         "nc_session_folder": thread.get("nc_session_folder"),
         # Structured cloud-sync config (backend + webdav URL + auth).
         # Agent consumes this via ``src.services.cloud_sync.build_workspace_sync``.
-        "cloud_sync": _build_agent_cloud_sync(thread, mount_rows=mount_rows),
+        "cloud_sync": cloud_sync_cfg,
+        # True when cloud is up but no sync target resolved (Issue 13 follow-up).
+        "cloud_sync_degraded": cloud_sync_degraded,
     }
 
 
@@ -11834,7 +11963,11 @@ async def create_thread(
                         )
 
         async def _setup_main_cloud() -> None:
-            backend = main_cloud_router.active
+            # Fresh session folder for a new thread — resolve via the owner
+            # seam (active today). The thread row is stamped with this
+            # backend's id below, so resume/delete later dispatch via
+            # for_thread. Issue 16, docs/issues/main_cloud.md.
+            backend = main_cloud_router.for_owner(user)
             if not backend.is_initialized and backend.is_configured:
                 await backend.ensure_initialized()
             if not backend.is_initialized:
@@ -12345,7 +12478,11 @@ async def resume_thread(
         async def _late_cloud_setup(
             tid: str, usr: dict, existing_handle: str | None
         ) -> None:
-            backend = main_cloud_router.active
+            # Pinned: this thread already exists and carries its origin
+            # backend in main_cloud_backend. Dispatch via for_thread so a
+            # later active-backend swap can't re-provision it on the wrong
+            # cloud (Issue 16). Mirrors the delete path above (~:12339).
+            backend = main_cloud_router.for_thread(thread)
             if not backend.is_initialized and backend.is_configured:
                 await backend.ensure_initialized()
             if not backend.is_initialized:
@@ -13938,10 +14075,16 @@ async def synthesize_thread_message_tts(
         ``language`` (str, default ``"en"``) — selects the TTS voice.
 
     Returns:
-        ``audio/mpeg`` MP3 bytes. ``204 No Content`` when no TTS model is
-        configured for the user. ``502`` when the synthesis call fails.
+        JSON ``{"text": <spoken text>, "audio": <base64 MP3>}`` on success —
+        ``text`` is the formulation-rewritten version actually read aloud, so
+        the UI can surface it. ``204 No Content`` when no TTS model is
+        configured (the cockpit treats this as "feature off"). ``502`` when a
+        model is configured but synthesis fails — so the button shows an error
+        instead of silently doing nothing.
     """
-    from services.tts import generate_message_tts
+    import base64
+
+    from services.tts import TtsSynthesisError, generate_message_tts
 
     user, thread = await require_thread_owner(request, postgres_db, thread_id)
 
@@ -13951,18 +14094,110 @@ async def synthesize_thread_message_tts(
     reformulate = bool(body.get("reformulate", True))
     language = (body.get("language") or "en").strip() or "en"
 
-    audio = await generate_message_tts(
-        content=content,
-        language=language,
-        reformulate=reformulate,
-        user_id=str(user["id"]),
-        postgres_db=postgres_db,
-    )
-    if audio is None:
+    try:
+        result = await generate_message_tts(
+            content=content,
+            language=language,
+            reformulate=reformulate,
+            user_id=str(user["id"]),
+            postgres_db=postgres_db,
+        )
+    except TtsSynthesisError as exc:
+        raise HTTPException(status_code=502, detail="Speech synthesis failed") from exc
+
+    if result is None:
         # 204: TTS disabled / not configured. The cockpit treats this as a
         # disabled-feature signal rather than an error.
         return Response(status_code=204)
-    return Response(content=audio, media_type="audio/mpeg")
+    spoken_text, audio = result
+    return JSONResponse(
+        {"text": spoken_text, "audio": base64.b64encode(audio).decode("ascii")}
+    )
+
+
+@app.post("/api/persistent/threads/{thread_id}/tts/plan")
+async def plan_thread_message_tts(
+    thread_id: str,
+    request: Request,
+    body: dict[str, Any] = Body(...),
+) -> Response:
+    """Plan a (possibly long) message into ordered, speakable chunks.
+
+    The client synthesizes each chunk via ``POST …/tts`` with
+    ``reformulate=false`` (chunks are already cleaned) and plays them as a
+    progressive playlist — so a long message reads start-to-finish without a
+    single multi-minute request and without truncation.
+
+    Body:
+        ``content`` (str, required) — the message text to read aloud.
+
+    Returns:
+        JSON ``{"chunks": [str, ...]}`` — one entry for a short message, several
+        (each ≤ 4096 chars, split at natural breakpoints) for a long one.
+        ``204`` when no TTS model is configured. ``502`` only on an unexpected
+        planner error (the planner has deterministic fallbacks, so this is rare).
+    """
+    from services.tts import plan_tts_chunks
+
+    user, thread = await require_thread_owner(request, postgres_db, thread_id)
+
+    content = (body.get("content") or "").strip()
+    if not content:
+        raise HTTPException(status_code=400, detail="Missing 'content' in request body")
+
+    try:
+        chunks = await plan_tts_chunks(
+            content=content, user_id=str(user["id"]), postgres_db=postgres_db
+        )
+    except Exception as exc:
+        logger.exception("TTS chunk planning failed for thread %s", thread_id)
+        raise HTTPException(status_code=502, detail="TTS planning failed") from exc
+
+    if chunks is None:
+        return Response(status_code=204)
+    return JSONResponse({"chunks": chunks})
+
+
+@app.post("/api/persistent/threads/{thread_id}/transcribe")
+async def transcribe_thread_audio_endpoint(
+    thread_id: str,
+    request: Request,
+    audio: UploadFile = File(...),
+) -> Response:
+    """Transcribe a recorded voice message to text (speech-to-text).
+
+    The cockpit composer POSTs the recorded blob here when the user stops
+    recording; the returned text is dropped into the message input (editable)
+    while the audio is also kept as an attachment. Transcription is server-side
+    via the user's configured Whisper model, with auto-detected language.
+
+    Returns:
+        ``{"text": "..."}`` on success. ``204 No Content`` when no STT model is
+        configured for the user (or transcription failed) — the cockpit then
+        just attaches the audio. ``400`` for empty audio; ``413`` when the clip
+        exceeds 25 MB (Whisper's hard limit).
+    """
+    from services.transcribe import transcribe_thread_audio
+
+    user, thread = await require_thread_owner(request, postgres_db, thread_id)
+
+    data = await audio.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty audio upload")
+    if len(data) > 25 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Audio too large (max 25 MB)")
+
+    text = await transcribe_thread_audio(
+        audio_bytes=data,
+        filename=audio.filename or "voice.webm",
+        user_id=str(user["id"]),
+        postgres_db=postgres_db,
+    )
+    if text is None:
+        # 204: STT disabled / not configured, or transcription failed. The
+        # cockpit treats this as "attach audio only" rather than an error.
+        return Response(status_code=204)
+    return JSONResponse({"text": text})
 
 
 @app.get("/api/jobs/{job_id}/logs")
@@ -14364,58 +14599,6 @@ def _load_settings_matrix(config_dir: Path) -> dict[str, Any]:
         else:
             _settings_matrix_cache = {}
     return _settings_matrix_cache
-
-
-def _apply_settings_matrix_to_config(
-    merged: dict[str, Any],
-    expert_llm_keys: set[str],
-    config_dir: Path,
-    expert_dir: Path | None = None,
-) -> dict[str, Any]:
-    """Apply settings_matrix model-family defaults to a merged config dict.
-
-    Mirrors the agent's _apply_settings_matrix() in src/core/loader.py.
-    Flat keys go to merged["llm"] (skipping expert_llm_keys).
-    Limits go to merged["limits"] (matrix is sole source).
-    """
-    base_matrix = _load_settings_matrix(config_dir)
-
-    # Support per-expert model_config_matrix.yaml override (settings
-    # subsection only — prompts/instructions are loaded by the agent loader).
-    matrix = dict(base_matrix)
-    if expert_dir and expert_dir != config_dir:
-        expert_matrix_path = expert_dir / "model_config_matrix.yaml"
-        if expert_matrix_path.exists():
-            with open(expert_matrix_path) as f:
-                expert_parsed = yaml.safe_load(f) or {}
-            expert_settings = _project_settings_subsection(expert_parsed)
-            matrix = _deep_merge(matrix, expert_settings)
-
-    llm_data = merged.get("llm", {})
-    model = llm_data.get("model", "gpt-4o")
-    family = _model_family(model)
-
-    default_settings = matrix.get("default", {})
-    family_settings = matrix.get(family, {}) if family != "default" else {}
-    settings = _deep_merge(default_settings, family_settings)
-
-    if not settings:
-        return base_matrix
-
-    # Apply flat keys -> merged["llm"] (skip keys explicitly set in expert)
-    for key, value in settings.items():
-        if key == "limits":
-            continue
-        if key not in expert_llm_keys:
-            merged.setdefault("llm", {})[key] = value
-
-    # Apply limits -> merged["limits"] (matrix is sole source of truth)
-    limits_settings = settings.get("limits")
-    if isinstance(limits_settings, dict):
-        for key, value in limits_settings.items():
-            merged.setdefault("limits", {})[key] = value
-
-    return base_matrix
 
 
 def _load_expert_detail(expert_id: str) -> dict[str, Any]:
@@ -15445,7 +15628,7 @@ async def _maybe_schedule_discovery(provider: str, api_key: str) -> None:
 # =============================================================================
 
 
-def load_prompt_catalog() -> list[dict[str, Any]]:
+def load_config_catalog() -> list[dict[str, Any]]:
     """Human-facing descriptions for editable prompt keys.
 
     Read from config/prompts/catalog.yaml (shipped with the image). Missing
@@ -15461,16 +15644,69 @@ def load_prompt_catalog() -> list[dict[str, Any]]:
     return yaml.safe_load(path.read_text()) or []
 
 
-def _prompt_catalog_entry(kind: str, name: str) -> dict[str, Any] | None:
-    for entry in load_prompt_catalog():
+def _config_catalog_entry(kind: str, name: str) -> dict[str, Any] | None:
+    for entry in load_config_catalog():
         if entry.get("kind") == kind and entry.get("name") == name:
             return entry
     return None
 
 
-def read_bundled_prompt(kind: str, family: str | None, name: str) -> str:
-    """Read the shipped (bundled) content for (kind, family, name), bypassing overrides."""
-    from src.core.loader import InstructionMatrixResolver, PromptMatrixResolver
+def validate_override_value(kind: str, name: str, value: Any) -> None:
+    """Validate a structured (settings/guardrails) override value against the
+    catalog. Raises HTTPException(422) on unknown key, wrong type, or out-of-bounds.
+
+    Text kinds are validated by the Pydantic model (min_length) and are a no-op
+    here. Fail-closed on write; reads stay fail-open (see the loader).
+    """
+    if kind not in ("settings", "guardrails"):
+        return
+    entry = _config_catalog_entry(kind, name)
+    if entry is None:
+        raise HTTPException(status_code=422, detail=f"unknown {kind} key: {name!r}")
+    vtype = entry.get("type")
+    if vtype in ("number", "integer"):
+        # bool is a subclass of int — reject it for numeric leaves.
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise HTTPException(status_code=422, detail=f"{name} must be a {vtype}")
+        if vtype == "integer" and isinstance(value, float) and not value.is_integer():
+            raise HTTPException(status_code=422, detail=f"{name} must be an integer")
+        lo, hi = entry.get("min"), entry.get("max")
+        if lo is not None and value < lo:
+            raise HTTPException(status_code=422, detail=f"{name} must be >= {lo}")
+        if hi is not None and value > hi:
+            raise HTTPException(status_code=422, detail=f"{name} must be <= {hi}")
+    elif vtype == "boolean":
+        if not isinstance(value, bool):
+            raise HTTPException(status_code=422, detail=f"{name} must be a boolean")
+    elif vtype == "enum":
+        choices = entry.get("enum", [])
+        if value not in choices:
+            raise HTTPException(
+                status_code=422, detail=f"{name} must be one of {choices}"
+            )
+    elif vtype == "json":
+        if not isinstance(value, dict):
+            raise HTTPException(status_code=422, detail=f"{name} must be a JSON object")
+    # Unknown/absent type -> accept (forward-compatible with new catalog types).
+
+
+def read_bundled_config(kind: str, family: str | None, name: str) -> Any:
+    """Read the shipped (bundled) value for (kind, family, name), bypassing overrides.
+
+    Returns text for prompts/instructions; the file-resolved value for settings
+    (a single leaf) and guardrails (the {tool_examples, nudges} dict).
+    """
+    from src.core.loader import (
+        InstructionMatrixResolver,
+        PromptMatrixResolver,
+        bundled_guardrails_for_family,
+        bundled_settings_for_family,
+    )
+
+    if kind == "settings":
+        return bundled_settings_for_family(family or "default", name)
+    if kind == "guardrails":
+        return bundled_guardrails_for_family(family or "default")
 
     resolver_cls = {
         "prompts": PromptMatrixResolver,
@@ -15485,82 +15721,101 @@ def read_bundled_prompt(kind: str, family: str | None, name: str) -> str:
         raise HTTPException(status_code=404, detail="no bundled default for that key")
 
 
-@app.get("/api/admin/prompts/overrides")
-async def admin_list_prompt_overrides(request: Request) -> list[dict[str, Any]]:
+@app.get("/api/admin/config/overrides")
+async def admin_list_config_overrides(request: Request) -> list[dict[str, Any]]:
     """List all prompt overrides (system-wide)."""
     await _require_admin(request)
-    return await postgres_db.list_prompt_overrides()
+    return await postgres_db.list_config_overrides()
 
 
-@app.get("/api/admin/prompts/overrides/{override_id}")
-async def admin_get_prompt_override(
+@app.get("/api/admin/config/overrides/{override_id}")
+async def admin_get_config_override(
     request: Request, override_id: str
 ) -> dict[str, Any]:
     """Fetch a single prompt override by id."""
     await _require_admin(request)
-    row = await postgres_db.get_prompt_override(override_id)
+    row = await postgres_db.get_config_override(override_id)
     if not row:
         raise HTTPException(status_code=404, detail="override not found")
     return row
 
 
-@app.post("/api/admin/prompts/overrides")
-async def admin_create_prompt_override(
-    request: Request, body: PromptOverrideCreate
+@app.post("/api/admin/config/overrides")
+async def admin_create_config_override(
+    request: Request, body: ConfigOverrideCreate
 ) -> dict[str, Any]:
     """Create or replace the override for (family, kind, name)."""
     user = await _require_admin(request)
-    return await postgres_db.upsert_prompt_override(
+    is_text = body.kind in ("prompts", "instructions")
+    if not is_text:
+        validate_override_value(body.kind, body.name, body.value_json)
+    return await postgres_db.upsert_config_override(
         family=body.family,
         kind=body.kind,
         name=body.name,
         content=body.content,
-        content_format=body.content_format,
+        content_format=body.content_format if is_text else None,
+        value_json=body.value_json,
         notes=body.notes,
         user_id=user.get("id"),
     )
 
 
-@app.put("/api/admin/prompts/overrides/{override_id}")
-async def admin_update_prompt_override(
-    request: Request, override_id: str, body: PromptOverrideUpdate
+@app.put("/api/admin/config/overrides/{override_id}")
+async def admin_update_config_override(
+    request: Request, override_id: str, body: ConfigOverrideUpdate
 ) -> dict[str, Any]:
-    """Update an existing override's content (family/kind/name are immutable)."""
+    """Update an existing override's payload (family/kind/name are immutable)."""
     user = await _require_admin(request)
-    existing = await postgres_db.get_prompt_override(override_id)
+    existing = await postgres_db.get_config_override(override_id)
     if not existing:
         raise HTTPException(status_code=404, detail="override not found")
-    return await postgres_db.upsert_prompt_override(
+    kind = existing["kind"]
+    if kind in ("prompts", "instructions"):
+        if body.content is None:
+            raise HTTPException(
+                status_code=422, detail="content is required for this kind"
+            )
+        content, content_format, value_json = body.content, body.content_format, None
+    else:  # settings, guardrails
+        if body.value_json is None:
+            raise HTTPException(
+                status_code=422, detail="value_json is required for this kind"
+            )
+        validate_override_value(kind, existing["name"], body.value_json)
+        content, content_format, value_json = None, None, body.value_json
+    return await postgres_db.upsert_config_override(
         family=existing["family"],
-        kind=existing["kind"],
+        kind=kind,
         name=existing["name"],
-        content=body.content,
-        content_format=body.content_format,
+        content=content,
+        content_format=content_format,
+        value_json=value_json,
         notes=body.notes,
         user_id=user.get("id"),
     )
 
 
-@app.delete("/api/admin/prompts/overrides/{override_id}")
-async def admin_delete_prompt_override(
+@app.delete("/api/admin/config/overrides/{override_id}")
+async def admin_delete_config_override(
     request: Request, override_id: str
 ) -> dict[str, Any]:
     """Delete an override (reset to the bundled default)."""
     await _require_admin(request)
-    if not await postgres_db.delete_prompt_override(override_id):
+    if not await postgres_db.delete_config_override(override_id):
         raise HTTPException(status_code=404, detail="override not found")
     return {"deleted": True}
 
 
-@app.get("/api/admin/prompts/catalog")
-async def admin_prompt_catalog(request: Request) -> list[dict[str, Any]]:
+@app.get("/api/admin/config/catalog")
+async def admin_config_catalog(request: Request) -> list[dict[str, Any]]:
     """List the editable prompt keys with human descriptions."""
     await _require_admin(request)
-    return load_prompt_catalog()
+    return load_config_catalog()
 
 
-@app.get("/api/admin/prompts/bundled/{family}/{kind}/{name}")
-async def admin_get_bundled_prompt(
+@app.get("/api/admin/config/bundled/{family}/{kind}/{name}")
+async def admin_get_bundled_config(
     request: Request, family: str, kind: str, name: str
 ) -> dict[str, Any]:
     """Return the bundled (shipped) default for a key, plus its catalog entry.
@@ -15573,8 +15828,8 @@ async def admin_get_bundled_prompt(
         "family": fam,
         "kind": kind,
         "name": name,
-        "content": read_bundled_prompt(kind, fam, name),
-        "catalog": _prompt_catalog_entry(kind, name),
+        "content": read_bundled_config(kind, fam, name),
+        "catalog": _config_catalog_entry(kind, name),
     }
 
 
@@ -15873,6 +16128,30 @@ async def _validate_catalog_provider_ref(provider_kind: str, provider_ref: str) 
         )
 
 
+def _normalize_catalog_model_id(
+    provider_kind: str, provider_ref: str, model_id: str
+) -> str:
+    """Prepend the ``openrouter/`` routing prefix for system-anchored
+    OpenRouter rows.
+
+    OpenRouter routing in the agent keys off the ``openrouter/`` model-ID
+    prefix: ``_create_openrouter_llm`` strips it back to the gateway slug and
+    targets ``openrouter.ai``. A system-anchored OpenRouter row whose ID lacks
+    the prefix routes to the OpenAI factory default (``api.openai.com``) and
+    rejects the ``sk-or-v1`` key. Mirrors the seed convention
+    (``db_backed_model_catalog.md``) and ``discovery.py``'s auto-prepend.
+    No-op for endpoint rows (routed by their inline base_url) and any
+    non-OpenRouter provider.
+    """
+    if (
+        provider_kind == "system"
+        and provider_ref == "openrouter"
+        and not model_id.lower().startswith("openrouter/")
+    ):
+        return f"openrouter/{model_id}"
+    return model_id
+
+
 @app.get("/api/admin/providers/models")
 async def admin_list_catalog_models(
     request: Request,
@@ -15918,11 +16197,14 @@ async def admin_create_catalog_model(
     """
     await _require_admin(request)
     await _validate_catalog_provider_ref(body.provider_kind, body.provider_ref)
+    model_id = _normalize_catalog_model_id(
+        body.provider_kind, body.provider_ref, body.model_id
+    )
     try:
         row = await postgres_db.create_model(
             provider_kind=body.provider_kind,
             provider_ref=body.provider_ref,
-            model_id=body.model_id,
+            model_id=model_id,
             display_label=body.display_label,
             capabilities=body.capabilities,
             family=body.family,
@@ -15940,7 +16222,7 @@ async def admin_create_catalog_model(
                 status_code=409,
                 detail=(
                     f"Catalog row for ({body.provider_kind}/{body.provider_ref}, "
-                    f"{body.model_id}) already exists."
+                    f"{model_id}) already exists."
                 ),
             )
         raise
@@ -15960,6 +16242,7 @@ async def admin_update_catalog_model(
     """
     await _require_admin(request)
     fields = body.model_dump(exclude_unset=True)
+    existing = None
     if "provider_kind" in fields or "provider_ref" in fields:
         existing = await postgres_db.get_model(catalog_id)
         if existing is None:
@@ -15967,6 +16250,19 @@ async def admin_update_catalog_model(
         new_kind = fields.get("provider_kind", existing["provider_kind"])
         new_ref = fields.get("provider_ref", existing["provider_ref"])
         await _validate_catalog_provider_ref(new_kind, new_ref)
+    # Apply the same openrouter/ prefix normalization as create when the
+    # model_id is being (re)written. The effective provider_kind/ref may come
+    # from this patch or fall back to the existing row.
+    if "model_id" in fields:
+        if existing is None:
+            existing = await postgres_db.get_model(catalog_id)
+            if existing is None:
+                raise HTTPException(status_code=404, detail="Catalog row not found")
+        fields["model_id"] = _normalize_catalog_model_id(
+            fields.get("provider_kind", existing["provider_kind"]),
+            fields.get("provider_ref", existing["provider_ref"]),
+            fields["model_id"],
+        )
     try:
         row = await postgres_db.update_model(catalog_id, **fields)
     except ValueError as e:
@@ -16906,7 +17202,7 @@ async def put_main_cloud_settings(
 
     # Validate the proposed config before persisting — raises on
     # missing required fields so we fail fast with a 422-style message.
-    from services.cloud.config import load_main_cloud_config
+    from services.cloud.config import load_main_cloud_config, missing_secret_envs
 
     probe_overlay = {
         "value": clean_value,
@@ -16918,6 +17214,26 @@ async def put_main_cloud_settings(
         raise HTTPException(
             status_code=400, detail=f"invalid main cloud config: {e}"
         ) from e
+
+    # Fail loud if the backend's real secrets are not wired (Issue 5). The
+    # loader above validates the *shape* but silently substitutes built-in dev
+    # defaults for missing secrets, so a config that could only ever connect
+    # with `admin` / `agent-service-dev` would otherwise persist + activate and
+    # fail much later at the first cloud call (surviving restarts). Refuse here,
+    # naming the exact env var(s) to set.
+    missing = missing_secret_envs(backend_id, probe_overlay)
+    if missing:
+        names = ", ".join(sorted({m["env_var"] for m in missing}))
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"secret env not set for backend {backend_id!r}: {names}. "
+                "Wire the secret(s) into the orchestrator env (Helm/Vault) or "
+                "point `credentials_ref` at a set env var, then retry. Refusing "
+                "to activate a backend that would fall back to built-in dev "
+                "credentials."
+            ),
+        )
 
     try:
         stored = await postgres_db.upsert_system_setting(
@@ -16979,6 +17295,23 @@ async def test_main_cloud_settings(
         "value": clean_value,
         "credentials_ref": credentials_ref,
     }
+
+    # Issue 5: surface unwired secrets as the precise reason, instead of letting
+    # the probe connect with built-in dev credentials and report a cryptic
+    # upstream-auth failure.
+    from services.cloud.config import missing_secret_envs
+
+    missing = missing_secret_envs(backend_id, probe_overlay)
+    if missing:
+        names = ", ".join(sorted({m["env_var"] for m in missing}))
+        return {
+            "ok": False,
+            "detail": (
+                f"secret env not set for backend {backend_id!r}: {names} "
+                "(would fall back to built-in dev credentials). Wire the "
+                "secret(s) or set `credentials_ref` before testing."
+            ),
+        }
 
     try:
         probe_backend = build_backend(db_overlay=probe_overlay)
@@ -17153,8 +17486,9 @@ async def create_user(body: UserCreate, request: Request) -> dict[str, Any]:
         )
         await _create_gitea_repo_for_project(user, project)
 
-        # Create personal WebDAV datasource for the default project
-        backend = main_cloud_router.active
+        # Create personal WebDAV datasource for the default project.
+        # Fresh owner provisioning — resolve via the owner seam (Issue 16).
+        backend = main_cloud_router.for_owner(user)
         if backend.is_initialized and body.email:
             try:
                 # Phase 1: the Nextcloud adapter treats the email as the
@@ -17369,22 +17703,14 @@ async def _ensure_project_cloud_resources(
                     project["main_cloud_folder_handle"] = folder_handle.to_db()
                     project["nextcloud_folder_id"] = legacy_id
 
-                    webdav_url = backend.get_project_folder_webdav_url(folder_handle)
-                    if webdav_url:
-                        ds = await postgres_db.create_datasource(
-                            name=f"Cloud Storage ({project_name})",
-                            ds_type="webdav",
-                            connection_url=webdav_url,
-                            description=(
-                                f"Shared file storage for project '{project_name}'"
-                            ),
-                            credentials=backend.webdav_credentials,
-                        )
-                        await postgres_db.link_datasource_to_project(
-                            project_id=project_id_str,
-                            datasource_id=str(ds["id"]),
-                            read_only=False,
-                        )
+                    # The project working folder is intentionally NOT attached
+                    # as a `webdav` datasource: job/session workspaces get the
+                    # folder cloned in (Mode-A baseline for jobs, the `projects/`
+                    # sync mount for sessions), so attaching it here would
+                    # double-expose the same files through the webdav_* tools.
+                    # webdav_* tools are reserved for clouds that are NOT cloned
+                    # (the personal home cloud + externally-attached WebDAV).
+                    # See docs/issues/main_cloud.md (Issue 1 / Issue 8).
                 except Exception as e:
                     logger.warning(
                         f"Failed to create cloud resources for project "
@@ -18490,12 +18816,12 @@ def _build_webdav_note(name: str, desc: str, is_read_only: bool) -> str:
     if desc:
         lines.append(f"\n{desc}")
     lines.append("\n### Available Tools")
-    lines.append("- `cloud_list` — list files and directories")
-    lines.append("- `cloud_read` — read file contents")
-    lines.append("- `cloud_info` — get file metadata")
+    lines.append("- `webdav_list` — list files and directories")
+    lines.append("- `webdav_read` — read file contents")
+    lines.append("- `webdav_info` — get file metadata")
     if not is_read_only:
-        lines.append("- `cloud_write` — write/upload files")
-        lines.append("- `cloud_delete` — delete files")
+        lines.append("- `webdav_write` — write/upload files")
+        lines.append("- `webdav_delete` — delete files")
     return "\n".join(lines)
 
 
