@@ -38,7 +38,12 @@ Env vars that participate:
 
 The legacy `vision` slot in `VALID_SYSTEM_API_KEY_PROVIDERS` is intentionally excluded — vision keys ride along on the per-endpoint inline `api_key` for custom endpoint rows.
 
-**Tavily is not a seedable provider.** Tavily is a web search engine, not an LLM, and is managed exclusively as a `TAVILY_API_KEY` env var sourced from a Vault-synced secret in production (see `helm/templates/agent/deployment.yaml`). It is not stored in `system_api_keys`/`user_api_keys`/`project_api_keys` and is not surfaced under Admin → Providers. Rotation: update Vault → re-render the secret → restart agent pods.
+**Tavily is not a seedable provider.** Tavily is a web search engine, not an LLM, and is managed exclusively as a `TAVILY_API_KEY` env var sourced from the shared application Secret (Vault-synced in production; chart-managed `secrets.values` in local dev). It has **two** runtime consumers, both reading from that Secret:
+
+- **Agent** pods — the `web_search`/`extract_webpage`/`crawl_website`/`map_website` tools (`src/tools/research/web.py`). Agents inherit the *entire* Secret via `envFrom` in `orchestrator/services/agent_provisioner.py` (there is no static agent Deployment — pods are provisioned on demand), so any key in the Secret is automatically present.
+- **Orchestrator** process — the instruction builder's in-process `web_search` (`orchestrator/services/builder_search.py:tavily_search`). The orchestrator Deployment lists env vars explicitly, so it pulls `TAVILY_API_KEY` via an explicit `secretKeyRef` (`optional: true`) in `helm/templates/orchestrator/deployment.yaml`. **Adding the key to the Secret alone does not reach the orchestrator** — the builder needs this entry.
+
+It is not stored in `system_api_keys`/`user_api_keys`/`project_api_keys` and is not surfaced under Admin → Providers. Rotation: update the Secret source (Vault bundle in prod, `secrets.values` in `values-local.yaml` for dev) → restart the orchestrator; newly provisioned agent pods pick up the new value automatically.
 
 ## What changed in this migration
 

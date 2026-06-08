@@ -738,10 +738,14 @@ opencloud:
       memory: "1Gi"
       cpu: "500m"
 
-# -- External cloud storage (used when both opencloud.enabled and nextcloud.enabled are false).
-# Agent authenticates with a single service account (credentials in the secret as
-# CLOUD_SERVICE_USER / CLOUD_SERVICE_PASSWORD). Per-user OAuth/linking is configured
-# in-app as datasources, not by the chart.
+# -- External MAIN CLOUD backend (used when both opencloud.enabled and nextcloud.enabled
+# are false). This is the per-deployment file backend for home/session folders — distinct
+# from two other "cloud"/"datasource" concepts: (a) runtime `datasources` rows the app
+# creates per-user/project (configured in-app, NOT by the chart), and (b) a raw single-mount
+# WebDAV datasource (externalBackend: "webdav" + DEFAULT_DS_WEBDAV_*), which has no
+# MainCloudBackend at all. The backend reads its OWN creds — NEXTCLOUD_ADMIN/AGENT_* or
+# OPENCLOUD_KEYCLOAK_CLIENT_SECRET (see externalBackend below) — NOT CLOUD_SERVICE_*, which
+# is a Keycloak service-account cred consumed only by the Keycloak bootstrap Job.
 cloud:
   # -- Backend type: "nextcloud" | "opencloud" | "webdav" | "" (disables external cloud)
   externalBackend: ""

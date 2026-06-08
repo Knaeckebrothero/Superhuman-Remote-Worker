@@ -27,12 +27,29 @@ from orchestrator.services.cloud import (
     NextcloudBackend,
     ProjectFolderHandle,
 )
+from orchestrator.services.cloud.config import NextcloudSettings
 
 NEXTCLOUD_BASE = "https://nc.example.com"
 AGENT_USER = "agent-service"
 # Mountpoint with a space → exercises URL-encoding end-to-end (the real
 # "NC Validation Project" group folder has one too).
 MOUNTPOINT = "Test Project"
+
+
+def _nc_test_settings() -> NextcloudSettings:
+    """Minimal valid ``NextcloudSettings`` for constructing the backend.
+
+    Only ``agent_user`` (→ the groupfolders DAV path) actually matters for
+    routing; the fake transport is injected via ``_install_fake`` afterwards.
+    """
+    return NextcloudSettings(
+        base_url=NEXTCLOUD_BASE,
+        public_url=NEXTCLOUD_BASE,
+        admin_user="admin",
+        admin_password="admin",
+        agent_user=AGENT_USER,
+        agent_password="agent-service-dev",
+    )
 
 
 def _base_prefix() -> str:
@@ -244,7 +261,7 @@ def _install_fake(backend: NextcloudBackend, fake: FakeNextcloud) -> None:
 class TestListProjectFolder:
     @pytest.mark.asyncio
     async def test_lists_nested_files(self):
-        be = NextcloudBackend()
+        be = NextcloudBackend(_nc_test_settings())
         fake = FakeNextcloud()
         fake.add_file("a.txt", b"hello")
         fake.add_file("sub/b.txt", b"world!!")
@@ -270,7 +287,7 @@ class TestListProjectFolder:
     async def test_etag_is_stable_across_calls(self):
         # External-mod detection compares baseline vs. live etags, so a
         # re-list of an unchanged file must yield the same etag.
-        be = NextcloudBackend()
+        be = NextcloudBackend(_nc_test_settings())
         fake = FakeNextcloud()
         fake.add_file("a.txt", b"hello")
         _install_fake(be, fake)
@@ -281,7 +298,7 @@ class TestListProjectFolder:
 
     @pytest.mark.asyncio
     async def test_empty_folder_has_no_files(self):
-        be = NextcloudBackend()
+        be = NextcloudBackend(_nc_test_settings())
         fake = FakeNextcloud()
         _install_fake(be, fake)
         entries = await be.list_project_folder(_handle())
@@ -289,7 +306,7 @@ class TestListProjectFolder:
 
     @pytest.mark.asyncio
     async def test_missing_mountpoint_raises_invalid_request(self):
-        be = NextcloudBackend()
+        be = NextcloudBackend(_nc_test_settings())
         _install_fake(be, FakeNextcloud())
         with pytest.raises(CloudBackendError) as ei:
             await be.list_project_folder(_handle(mountpoint=None))
@@ -302,7 +319,7 @@ class TestListProjectFolder:
 class TestGetBytes:
     @pytest.mark.asyncio
     async def test_returns_bytes(self):
-        be = NextcloudBackend()
+        be = NextcloudBackend(_nc_test_settings())
         fake = FakeNextcloud()
         fake.add_file("docs/readme.md", b"# hi\n")
         _install_fake(be, fake)
@@ -311,7 +328,7 @@ class TestGetBytes:
 
     @pytest.mark.asyncio
     async def test_binary_survives(self):
-        be = NextcloudBackend()
+        be = NextcloudBackend(_nc_test_settings())
         fake = FakeNextcloud()
         payload = bytes(range(256))
         fake.add_file("blob.bin", payload)
@@ -323,7 +340,7 @@ class TestGetBytes:
 
     @pytest.mark.asyncio
     async def test_missing_raises_not_found(self):
-        be = NextcloudBackend()
+        be = NextcloudBackend(_nc_test_settings())
         _install_fake(be, FakeNextcloud())
         with pytest.raises(CloudBackendError) as ei:
             await be.get_project_folder_file_bytes(_handle(), path="nope.txt")
@@ -331,7 +348,7 @@ class TestGetBytes:
 
     @pytest.mark.asyncio
     async def test_empty_path_raises_invalid_request(self):
-        be = NextcloudBackend()
+        be = NextcloudBackend(_nc_test_settings())
         _install_fake(be, FakeNextcloud())
         with pytest.raises(CloudBackendError) as ei:
             await be.get_project_folder_file_bytes(_handle(), path="")
@@ -344,7 +361,7 @@ class TestGetBytes:
 class TestPutBytes:
     @pytest.mark.asyncio
     async def test_creates_parents_and_round_trips(self):
-        be = NextcloudBackend()
+        be = NextcloudBackend(_nc_test_settings())
         fake = FakeNextcloud()
         _install_fake(be, fake)
         await be.put_project_folder_file_bytes(
@@ -362,7 +379,7 @@ class TestPutBytes:
 
     @pytest.mark.asyncio
     async def test_root_file_needs_no_parents(self):
-        be = NextcloudBackend()
+        be = NextcloudBackend(_nc_test_settings())
         fake = FakeNextcloud()
         _install_fake(be, fake)
         await be.put_project_folder_file_bytes(_handle(), path="top.txt", content=b"t")
@@ -371,7 +388,7 @@ class TestPutBytes:
 
     @pytest.mark.asyncio
     async def test_empty_path_raises_invalid_request(self):
-        be = NextcloudBackend()
+        be = NextcloudBackend(_nc_test_settings())
         _install_fake(be, FakeNextcloud())
         with pytest.raises(CloudBackendError) as ei:
             await be.put_project_folder_file_bytes(_handle(), path="", content=b"x")
@@ -384,7 +401,7 @@ class TestPutBytes:
 class TestDeleteFile:
     @pytest.mark.asyncio
     async def test_removes_file(self):
-        be = NextcloudBackend()
+        be = NextcloudBackend(_nc_test_settings())
         fake = FakeNextcloud()
         fake.add_file("gone.txt", b"x")
         _install_fake(be, fake)
@@ -393,14 +410,14 @@ class TestDeleteFile:
 
     @pytest.mark.asyncio
     async def test_missing_with_if_exists_true_is_noop(self):
-        be = NextcloudBackend()
+        be = NextcloudBackend(_nc_test_settings())
         _install_fake(be, FakeNextcloud())
         # No raise — the goal state ("gone") already holds.
         await be.delete_project_folder_file(_handle(), path="nope.txt")
 
     @pytest.mark.asyncio
     async def test_missing_with_if_exists_false_raises_not_found(self):
-        be = NextcloudBackend()
+        be = NextcloudBackend(_nc_test_settings())
         _install_fake(be, FakeNextcloud())
         with pytest.raises(CloudBackendError) as ei:
             await be.delete_project_folder_file(
@@ -415,7 +432,7 @@ class TestDeleteFile:
 class TestUninitialized:
     @pytest.mark.asyncio
     async def test_list_uninitialized_raises_unavailable(self):
-        be = NextcloudBackend()  # never wired to a client
+        be = NextcloudBackend(_nc_test_settings())  # never wired to a client
         with pytest.raises(CloudBackendError) as ei:
             await be.list_project_folder(_handle())
         assert ei.value.kind == CloudBackendErrorKind.UNAVAILABLE

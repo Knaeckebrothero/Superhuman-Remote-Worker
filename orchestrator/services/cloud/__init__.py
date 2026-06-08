@@ -66,11 +66,12 @@ def build_backend(
     values over the env-var defaults. This is what lets the cockpit
     admin panel change the active backend without a pod restart.
 
-    ``NextcloudBackend`` still reads env vars directly — the Pydantic
-    settings class exists for symmetry and validation but the legacy
-    adapter predates it and the behaviour is identical. When a
-    ``db_overlay`` is present, the overlay is still honored for the
-    backend_id decision but Nextcloud settings stay env-driven.
+    Both backends now consume a validated Pydantic settings object
+    (``NextcloudSettings`` / ``OpenCloudSettings``) built by
+    ``load_main_cloud_config`` — so the ``MAIN_CLOUD_*`` aliases, the
+    ``db_overlay``, and ``credentials_ref`` apply uniformly to both
+    (Issue 12). Earlier, ``NextcloudBackend`` read ``NEXTCLOUD_*`` env vars
+    directly in its constructor and ignored the overlay.
     """
     if backend_id is None:
         settings = load_main_cloud_config(db_overlay=db_overlay)
@@ -78,12 +79,16 @@ def build_backend(
         if backend_id == "opencloud":
             assert isinstance(settings, OpenCloudSettings)
             return OpenCloudBackend(settings)
-        # Nextcloud falls through to the env-var constructor below so
-        # legacy deployments that never set MAIN_CLOUD_BACKEND keep
-        # working with zero config churn.
+        if backend_id == "nextcloud":
+            assert isinstance(settings, NextcloudSettings)
+            return NextcloudBackend(settings)
 
     if backend_id == "nextcloud":
-        return NextcloudBackend()
+        settings = load_main_cloud_config(
+            backend_override="nextcloud", db_overlay=db_overlay
+        )
+        assert isinstance(settings, NextcloudSettings)
+        return NextcloudBackend(settings)
     if backend_id == "opencloud":
         settings = load_main_cloud_config(
             backend_override="opencloud", db_overlay=db_overlay

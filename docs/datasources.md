@@ -468,7 +468,7 @@ The orchestrator resolves datasources and sends them to the agent as part of the
 
 **2.4 — Agent Receives and Connects**
 - `_process_orchestrator_job()` in `src/api/app.py` passes `datasources` through to job metadata
-- `_setup_job_tools()` in `src/agent.py` reads `metadata["datasources"]`, creates connections via `_create_datasource_connection()`, and injects into `ToolContext.datasources`
+- `_setup_job_tools()` in `src/agent.py` reads `metadata["datasources"]`, builds connections via `datasource_setup.create_datasource_connection()` (`src/core/datasource_setup.py`), and injects into `ToolContext.datasources`
 - Currently supports Neo4j; PostgreSQL and MongoDB raise `NotImplementedError` (Phase 3)
 - Connections are closed in `_close_datasource_connections()` on job completion, failure, or cancellation
 
@@ -505,7 +505,7 @@ Added tool implementations for PostgreSQL and MongoDB datasource types, followin
 - Added `sql: []` and `mongodb: []` to `config/defaults.yaml` and `config/schema.json`
 
 **3.4 — Agent Connection Support**
-- Implemented `postgresql` and `mongodb` in `_create_datasource_connection()` (`src/agent.py`)
+- Implemented `postgresql` and `mongodb` in `create_datasource_connection()` (`src/core/datasource_setup.py`)
 - PostgreSQL: `psycopg.connect()` with connection test
 - MongoDB: `MongoClient` with ping test, database extracted from URL path
 - Added `_datasource_clients` dict for proper MongoDB client cleanup

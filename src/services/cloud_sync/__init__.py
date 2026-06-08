@@ -14,8 +14,8 @@ from typing import TYPE_CHECKING, Any, Optional
 
 from .base import SYNC_IGNORE_PATTERNS, WorkspaceSyncBase
 from .coordinator import CloudSyncError, MountSync, WorkspaceSyncCoordinator
-from .nextcloud import NextcloudWorkspaceSync
-from .opencloud import OpenCloudWorkspaceSync
+from .nextcloud_sync import NextcloudWorkspaceSync
+from .opencloud_sync import OpenCloudWorkspaceSync
 
 if TYPE_CHECKING:
     from ...core.workspace_backend import WorkspaceBackend
