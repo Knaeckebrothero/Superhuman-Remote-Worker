@@ -197,7 +197,9 @@ Options for where to store `path`, `sync_mode`, `branch`:
 
 ### 7. Agent-Side Implementation
 
-#### Connection Creation (`_create_datasource_connection`)
+#### Connection Creation (`create_datasource_connection`)
+
+> **Note (2026-06-08):** the live connection builder is `src/core/datasource_setup.py:create_datasource_connection` (the `src/agent.py` copy referenced in early drafts was a dead duplicate, removed 2026-06-08). The git/repo datasource ultimately shipped **not** via this builder but via the dispatch-time clone flow (cloned into `repos/<slug>/`; see `reference_repository_datasource_flow`), so the git proposal in this section is historical design intent.
 
 For database datasources, this method creates a connection object (Neo4jDB, psycopg conn, etc.). For git, the equivalent is cloning the repo and returning a `GitManager` instance:
 
@@ -250,7 +252,7 @@ Connection test: attempt clone to a temp directory, verify access, clean up.
 
 - Add `config` JSONB column to datasources table (migration)
 - Add `git` to `DS_TOOL_MAP` in orchestrator (tool category mapping)
-- Implement clone logic in `_create_datasource_connection`
+- Implement clone logic in `create_datasource_connection` (see note above — actually shipped via the dispatch clone flow)
 - Extend `GitManager` with credential-aware clone (HTTPS token URL building, SSH key file)
 - Add `repo_commit`, `repo_push`, `repo_pull` tools (write operations on external repos)
 - Extend existing git read tools with optional `repo` parameter

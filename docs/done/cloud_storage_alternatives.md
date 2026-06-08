@@ -53,7 +53,7 @@ These two positions are not in conflict if the storage layer is **swappable**. P
 
 | Capability | Who uses it | Where it lives |
 |---|---|---|
-| File list / read / write / delete / info | Agents (as tools) | `src/tools/cloud/webdav.py` (242 lines) |
+| File list / read / write / delete / info | Agents (as tools) | `src/tools/webdav/tools.py` (242 lines) |
 | Per-project Group Folder provisioning | Orchestrator (on project create) | `orchestrator/services/nextcloud_admin.py` (528 lines) |
 | Per-user home directory + OIDC identity mapping | End users via browser | Nextcloud `user_oidc` app + Keycloak |
 | Per-session folder for persistent threads | Orchestrator + agent | `src/services/workspace_sync.py` |
@@ -75,7 +75,7 @@ The Nextcloud-specific primitives we *do* use are: **Group Folders, OCS Provisio
 The integration sits at four distinct layers, ordered from most reusable to most coupled:
 
 1. **Agent tool layer (clean, backend-agnostic).**
-   `src/tools/cloud/webdav.py` exposes `cloud_list`, `cloud_read`, `cloud_write`, `cloud_delete`, `cloud_info`. The module docstring is explicit: *"Provides file access to WebDAV (Nextcloud, ownCloud, or any WebDAV server) attached as a datasource."* These tools are tied to the WebDAV *protocol*, not to Nextcloud. **For OpenCloud, this layer continues to work unchanged** — OpenCloud also speaks WebDAV.
+   `src/tools/webdav/tools.py` exposes `webdav_list`, `webdav_read`, `webdav_write`, `webdav_delete`, `webdav_info`. The module docstring is explicit: *"Provides file access to WebDAV (Nextcloud, ownCloud, or any WebDAV server) attached as a datasource."* These tools are tied to the WebDAV *protocol*, not to Nextcloud. **For OpenCloud, this layer continues to work unchanged** — OpenCloud also speaks WebDAV.
 
 2. **Datasource type (clean, protocol-level).**
    The orchestrator's `DS_TOOL_MAP` registers `webdav` as a first-class datasource type alongside PostgreSQL, MongoDB, Neo4j. Read-only flag toggles write-tool injection. The schema uses a generic `webdav` type; the only vendor-named column is `projects.nextcloud_folder_id`, which can be renamed or generalized.

@@ -27,7 +27,6 @@ Uses two Nextcloud APIs:
 from __future__ import annotations
 
 import logging
-import os
 import time
 from typing import Any, Optional
 from urllib.parse import quote
@@ -36,6 +35,7 @@ import httpx
 
 from ._propfind import parse_propfind_entries
 from .base import HealthStatus, UserHome
+from .config import NextcloudSettings
 from .errors import CloudBackendError, CloudBackendErrorKind
 from .handles import (
     GroupId,
@@ -76,15 +76,20 @@ class NextcloudBackend:
 
     backend_id = BACKEND_ID
 
-    def __init__(self) -> None:
-        self._base_url = os.getenv("NEXTCLOUD_URL", "http://localhost:8800").rstrip("/")
-        self._public_url = os.getenv("NEXTCLOUD_PUBLIC_URL", self._base_url).rstrip("/")
-        self._admin_user = os.getenv("NEXTCLOUD_ADMIN_USER", "admin")
-        self._admin_password = os.getenv("NEXTCLOUD_ADMIN_PASSWORD", "admin")
-        self._agent_user = os.getenv("NEXTCLOUD_AGENT_USER", "agent-service")
-        self._agent_password = os.getenv(
-            "NEXTCLOUD_AGENT_PASSWORD", "agent-service-dev"
-        )
+    def __init__(self, settings: NextcloudSettings) -> None:
+        # Phase 1.5 parity with OpenCloudBackend (Issue 12): consume a
+        # validated ``NextcloudSettings`` built by ``load_main_cloud_config``
+        # in ``build_backend`` rather than reading ``NEXTCLOUD_*`` env vars
+        # directly. The settings path honors the ``MAIN_CLOUD_*`` aliases, the
+        # DB overlay, and ``credentials_ref`` — all of which the old direct
+        # ``os.getenv`` constructor silently ignored.
+        self._settings = settings
+        self._base_url = str(settings.base_url).rstrip("/")
+        self._public_url = str(settings.public_url).rstrip("/")
+        self._admin_user = settings.admin_user
+        self._admin_password = settings.admin_password.get_secret_value()
+        self._agent_user = settings.agent_user
+        self._agent_password = settings.agent_password.get_secret_value()
         self._initialized = False
         self._client: Optional[httpx.AsyncClient] = None
         self._share_bucket = LeakyBucket(

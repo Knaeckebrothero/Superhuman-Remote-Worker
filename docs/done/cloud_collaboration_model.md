@@ -87,7 +87,7 @@ The current architecture has more of the right pieces than the fragmentation sug
 | Workspace ↔ cloud bidirectional sync | `src/services/cloud_sync/` (etag-based) | **Yes, extended** — sync runs against multiple cloud surfaces mounted into the workspace |
 | Per-subjob git worktrees on shared backend | [[subjob_worktree_sharing]] (shipped) | **Reuse pattern** — proven precedent for the v2+ branch layer |
 | Job promotion (move job → new project) | `POST /api/jobs/{job_id}/promote` | **Keep, add sibling** — new "accept job changes into project" verb |
-| Workspace files API (`cloud_*` tools) | `src/tools/cloud/` — vendor-neutral WebDAV | **Yes** — no changes needed |
+| Workspace files API (`webdav_*` tools) | `src/tools/webdav/` — vendor-neutral WebDAV | **Yes** — no changes needed |
 | Critic-driven review primitive | [[verification_phase]] | **Reuse** — the v1 job accept/diff UI builds on this |
 
 Two existing design docs frame the current behaviour:
@@ -385,7 +385,7 @@ If Keycloak returns `403` with `Client not allowed to exchange`, the impersonati
 
 #### Phase 2 locked decisions (implementation pass 2026-05-17)
 
-- **Row shape:** default-project attachment → `mount_kind='project_default'`, `source_kind='user_home'`, `target_path=''` (workspace root), `webdav_url` from `MainCloudBackend.get_user_home(resolve_user_identity(owner_email))`. Both Nextcloud and OpenCloud backends authenticate as a service account (admin basic-auth / Keycloak client-credentials), so they can read/write any user's home Space without per-user share grants.
+- **Row shape:** default-project attachment → `mount_kind='project_default'`, `source_kind='user_home'`, `target_path=''` (workspace root), `webdav_url` from `MainCloudBackend.get_user_home(resolve_user_identity(owner_email))`. ⚠️ **Corrected:** the original text here claimed both backends "can read/write any user's home Space without per-user share grants." That holds for **Nextcloud** (the backend authenticates as an *admin* over basic-auth, which can access any user's files) but is **false for OpenCloud** — its service account gets only LibreGraph admin *metadata* reads, not WebDAV *data* access to single-owner Personal Spaces, which is exactly why the Phase 2.1 token-exchange/impersonation exists (see the correction at `:320`).
 - **Owner discovery:** `postgres_db.get_project_members(project_id)` → pick the first row with `role == 'owner'`; resolve `owner_email + owner_display_name.lower()` through `MainCloudBackend.resolve_user_identity()`. This mirrors the existing user-home URL resolution at `orchestrator/main.py:get_project`.
 - **Session-folder collision policy: observable-state gate, not "default-project attached".** `_setup_main_cloud()` reads `thread_mounts` and skips `ensure_session_folder()` only when a `project_default` row with a non-null `webdav_url` is already present. If user-home resolution failed (transient backend hiccup, owner not yet provisioned, etc.) the legacy session folder is provisioned as a fallback so the thread never ends up with zero sync targets. This is the safer of the two policies I considered — strict gating on attachment would risk an empty workspace on a flaky backend.
 - **`_project_ids_from_mounts()` accepts `project_default`** alongside `project`, so the derived `project_ids` list stays consistent for datasource resolution and visibility checks. A default project is still a project attachment for downstream purposes.

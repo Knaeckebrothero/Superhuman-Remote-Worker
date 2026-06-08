@@ -47,7 +47,7 @@ Can we "plug in Claude Opus 4.6 and have it work like Claude Code"? **Architectu
 | **MongoDB** | 5 | mongo_query, mongo_insert, mongo_update, mongo_aggregate, mongo_schema |
 | **Graph** | 2 | execute_cypher_query, get_database_schema |
 | **Knowledge** | 10 | kb_write, kb_read, kb_update, kb_search, kb_list, kb_related, kb_provenance, kb_contradictions, kb_unanswered, kb_export |
-| **Cloud** | 5 | cloud_read, cloud_write, cloud_list, cloud_delete, cloud_info |
+| **WebDAV** | 5 | webdav_read, webdav_write, webdav_list, webdav_delete, webdav_info |
 | **Orchestrator** | 8 | create_worker_job, list_worker_jobs, get_worker_job, get_job_workspace_file, approve_worker_job, resume_worker_job, pause_worker_job, cancel_worker_job |
 
 ### 2b. Competitor Core Tools

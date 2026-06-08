@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock
 import httpx
 import pytest
 
-from src.services.cloud_sync.opencloud import (
+from src.services.cloud_sync.opencloud_sync import (
     OpenCloudWorkspaceSync,
     _looks_like_401,
 )
