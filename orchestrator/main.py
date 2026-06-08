@@ -11163,6 +11163,20 @@ async def agent_get_thread_workspace(
     # Phase 1: project attachment + cloud mounts now live on thread_mounts.
     project_ids = await _thread_project_ids(thread_id)
     mount_rows = await postgres_db.list_thread_mounts(thread_id)
+    cloud_sync_cfg = _build_agent_cloud_sync(thread, mount_rows=mount_rows)
+    # Issue 13 follow-up: if the main cloud is up but this thread resolved NO
+    # sync target (session-folder provisioning failed upstream, or user-home /
+    # project-mount resolution produced nothing usable), the agent would
+    # otherwise run unsynced with no signal. Flag it so the agent surfaces the
+    # same degraded-sync state it shows for a failed initial pull, instead of
+    # silently skipping cloud sync for the session's whole life.
+    try:
+        _cloud_up = main_cloud_router.active.is_initialized
+    except Exception:
+        _cloud_up = False
+    cloud_sync_degraded = bool(
+        _cloud_up and not cloud_sync_cfg and not thread.get("nc_session_folder")
+    )
     return {
         "status": ws.get("status", "none"),
         # K8s provisioner uses pod_ip; Docker provisioner uses host — normalize
@@ -11190,7 +11204,9 @@ async def agent_get_thread_workspace(
         "nc_session_folder": thread.get("nc_session_folder"),
         # Structured cloud-sync config (backend + webdav URL + auth).
         # Agent consumes this via ``src.services.cloud_sync.build_workspace_sync``.
-        "cloud_sync": _build_agent_cloud_sync(thread, mount_rows=mount_rows),
+        "cloud_sync": cloud_sync_cfg,
+        # True when cloud is up but no sync target resolved (Issue 13 follow-up).
+        "cloud_sync_degraded": cloud_sync_degraded,
     }
 
 

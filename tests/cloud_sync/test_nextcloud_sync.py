@@ -7,7 +7,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from src.services.cloud_sync.nextcloud import NextcloudWorkspaceSync
+from src.services.cloud_sync.nextcloud_sync import NextcloudWorkspaceSync
 
 
 class _FakeWebDavClient:

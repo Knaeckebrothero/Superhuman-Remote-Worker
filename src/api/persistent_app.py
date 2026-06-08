@@ -1121,12 +1121,14 @@ async def _attach_session(
     nc_folder = (
         workspace_override.get("nc_session_folder") if workspace_override else None
     )
+    cloud_degraded_hint = False
     if (not cloud_cfg or not nc_folder) and _orchestrator_client and _thread_id:
         try:
             ws_info = await _orchestrator_client.get_thread_workspace(_thread_id)
             if ws_info:
                 cloud_cfg = cloud_cfg or ws_info.get("cloud_sync")
                 nc_folder = nc_folder or ws_info.get("nc_session_folder")
+                cloud_degraded_hint = bool(ws_info.get("cloud_sync_degraded"))
         except Exception:
             pass
     # Back-compat: translate a bare nc_session_folder into the new schema
@@ -1171,6 +1173,27 @@ async def _attach_session(
                 },
             )
             _session.workspace_sync = None
+    elif cloud_degraded_hint:
+        # Cloud is up but the orchestrator resolved no sync target for this
+        # thread (session-folder provisioning failed upstream, so nc_session_folder
+        # and the project mounts are all empty). Surface the same degraded-sync
+        # state the failed-initial-pull path uses, instead of running silently
+        # unsynced for the session's whole life (docs/issues/main_cloud.md Issue 13).
+        logger.warning(
+            "Thread %s: main cloud is up but no sync target resolved — "
+            "session will run unsynced.",
+            _thread_id,
+        )
+        _broadcast(
+            "workspace_sync.error",
+            {
+                "op": "provision",
+                "turn_id": 0,
+                "message": "Cloud sync could not be set up for this session "
+                "(no sync target was provisioned).",
+                "degraded": True,
+            },
+        )
 
     # Restore message history from DB (for session resume)
     await _restore_session_messages()

@@ -18,9 +18,11 @@ related:
 
 # Project & Session Cloud Folders — Automatic Nextcloud Integration
 
+> **⚠️ Partly superseded (2026-06-07).** The **project folder** is now **cloned into the agent's workspace** (Mode-A baseline for jobs; the `projects/` sync mount for sessions) rather than reached through per-folder agent tools. Project provisioning **no longer** auto-attaches the folder as a `webdav` datasource, so jobs/sessions do **not** receive `webdav_*` tools for the project folder — they read and write it as ordinary workspace files. The `webdav_*` tools (renamed from `cloud_*`) are retained only for clouds that are **not** cloned: the user's personal home cloud and externally-attached WebDAV datasources. Passages below describing "the agent gets `webdav_*` tools for the project folder" reflect the original design. See [[webdav_datasource_tools]] and [[main_cloud]] (Issue 1 / Issue 8).
+
 Automatically provision Nextcloud folders at two scopes:
 
-1. **Project folders** — a Group Folder (Team Folder) per project. Users upload reference material; agents get `cloud_*` tool access. Personal projects map to the user's Nextcloud home directory.
+1. **Project folders** — a Group Folder (Team Folder) per project. Users upload reference material; agents get `webdav_*` tool access. Personal projects map to the user's Nextcloud home directory.
 2. **Session folders** — a per-session folder shared between the user and the persistent agent. Workspace files sync bidirectionally so user and AI can exchange files in real time.
 
 **Status:** All phases complete (1-7). Nextcloud init, NextcloudAdmin service, DB migration, lifecycle wiring, settings + override, cockpit UI, session cloud folders, session UI, backfill script.
@@ -61,7 +63,7 @@ User uploads documents, creates subfolders, organizes files
 User creates job in project
   │
   ├─→ Datasource resolution: project-scoped `webdav` datasource inherited (existing mechanism)
-  ├─→ Agent receives `cloud_*` tools (cloud_list, cloud_read, cloud_info, cloud_write, cloud_delete)
+  ├─→ Agent receives `webdav_*` tools (webdav_list, webdav_read, webdav_info, webdav_write, webdav_delete)
   └─→ Agent can browse, read, and (if allowed) write to the project's Nextcloud folder
 ```
 
@@ -101,7 +103,7 @@ Nextcloud/
 │   └── ...                     ← Default project datasource points here
 ```
 
-No prescribed subfolder structure — users organize files however they want. The agent can navigate the entire folder tree via `cloud_list`.
+No prescribed subfolder structure — users organize files however they want. The agent can navigate the entire folder tree via `webdav_list`.
 
 ## Agent WebDAV Access Strategy
 
@@ -252,9 +254,9 @@ The existing `DS_TOOL_MAP` already handles read-only vs. read-write:
 ```python
 DS_TOOL_MAP = {
     "webdav": {
-        "category": "cloud",
-        "read": ["cloud_list", "cloud_read", "cloud_info"],
-        "write": ["cloud_list", "cloud_read", "cloud_info", "cloud_write", "cloud_delete"],
+        "category": "webdav",
+        "read": ["webdav_list", "webdav_read", "webdav_info"],
+        "write": ["webdav_list", "webdav_read", "webdav_info", "webdav_write", "webdav_delete"],
     },
 }
 ```
@@ -654,17 +656,17 @@ async def update_project_cloud_storage(project_id, read_only: bool):
 
 ## Agent Perspective
 
-From the agent's point of view, nothing changes architecturally. The agent receives a WebDAV datasource in its `JobStartRequest.datasources` list and gets `cloud_*` tools — exactly the same as a manually configured WebDAV datasource. The automation is entirely on the orchestrator side.
+From the agent's point of view, nothing changes architecturally. The agent receives a WebDAV datasource in its `JobStartRequest.datasources` list and gets `webdav_*` tools — exactly the same as a manually configured WebDAV datasource. The automation is entirely on the orchestrator side.
 
 What the agent can do with the project folder:
 
 ```
-cloud_list("/")                          → browse folder structure
-cloud_list("/research-papers/")          → list files in a subfolder
-cloud_read("/specs.pdf")                 → download file to workspace
-cloud_info("/datasets/training.csv")     → check file size, modified date
-cloud_write("output/report.pdf", "/")    → upload from workspace to cloud (if read-write)
-cloud_delete("/old-draft.docx")          → delete file (if read-write)
+webdav_list("/")                          → browse folder structure
+webdav_list("/research-papers/")          → list files in a subfolder
+webdav_read("/specs.pdf")                 → download file to workspace
+webdav_info("/datasets/training.csv")     → check file size, modified date
+webdav_write("output/report.pdf", "/")    → upload from workspace to cloud (if read-write)
+webdav_delete("/old-draft.docx")          → delete file (if read-write)
 ```
 
 The agent sees all files and subfolders within the project's shared folder. Users manage the folder structure — the agent navigates whatever is there.
@@ -675,7 +677,7 @@ All Nextcloud operations in project lifecycle events must be **non-blocking and 
 
 - Project creation still succeeds (the project just won't have a cloud folder)
 - `nextcloud_folder_id` remains `NULL`, `cloud_storage_url` is not generated
-- No WebDAV datasource is created → jobs in this project don't get `cloud_*` tools
+- No WebDAV datasource is created → jobs in this project don't get `webdav_*` tools
 - The "Open Project Folder" button is hidden in the cockpit when `cloud_storage_url` is absent
 - Log a warning so admins know the integration is inactive
 
@@ -963,9 +965,9 @@ Session folders and project folders coexist and serve different purposes:
 | **Access** | All project members | Session owner + agent |
 | **Content** | Reference material, shared datasets | Working files, drafts, uploads |
 | **Mechanism** | Group Folder + project-scoped datasource | Personal folder + share + workspace sync |
-| **Agent access** | `cloud_*` tools (explicit read/write) | Transparent via workspace sync |
+| **Agent access** | `webdav_*` tools (explicit read/write) | Transparent via workspace sync |
 
-A persistent session in a project has access to **both**: the project folder via `cloud_*` tools (for reference material) and the session folder via direct workspace access (for working files). The agent can pull a file from the project folder (`cloud_read`) into the workspace, work on it, and the result syncs to the session folder for the user to review.
+A persistent session in a project has access to **both**: the project folder via `webdav_*` tools (for reference material) and the session folder via direct workspace access (for working files). The agent can pull a file from the project folder (`webdav_read`) into the workspace, work on it, and the result syncs to the session folder for the user to review.
 
 ## Scope and Deferral
 

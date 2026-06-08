@@ -12,6 +12,8 @@ Design document for introducing centralized identity management (Keycloak SSO) a
 
 **Status:** Design phase.
 
+> **Note (2026-06-07):** the agent cloud tools described below were renamed `cloud_*` → `webdav_*` and moved to `src/tools/webdav/`. Project *working* folders are now cloned into the agent workspace rather than reached via these tools; the `webdav_*` tools are retained for non-cloned clouds (personal home + BYO WebDAV datasources). See [[webdav_datasource_tools]].
+
 ## Problem: Identity Fragmentation
 
 The system is composed of multiple applications that each maintain their own user databases:
@@ -386,7 +388,7 @@ No single protocol covers all enterprise storage. Each will eventually need its 
 2. **WebDAV is a standard protocol** — if an enterprise uses ownCloud, Seafile, or any WebDAV-capable storage, the same connector works without changes
 3. **Nextcloud offers expansion potential** — messaging (Nextcloud Talk), collaborative editing (Nextcloud Office), calendar, mobile/desktop sync clients. We may not need these now, but they're there if we do.
 4. **Enterprise proprietary APIs get added later as separate datasource types** — `google_drive`, `onedrive`, `s3`, each with their own connector, following the exact same datasource pattern
-5. **The datasource abstraction protects us** — agent tools call `cloud_list`, `cloud_read`, `cloud_write` regardless of which connector is behind it
+5. **The datasource abstraction protects us** — agent tools call `webdav_list`, `webdav_read`, `webdav_write` regardless of which connector is behind it
 
 **Alternatives considered but rejected:**
 
@@ -499,51 +501,51 @@ Added to the orchestrator's `DS_TOOL_MAP` alongside `postgresql`, `neo4j`, `mong
 DS_TOOL_MAP = {
     # ... existing entries ...
     "webdav": {
-        "category": "cloud",
-        "read": ["cloud_list", "cloud_read", "cloud_info"],
-        "write": ["cloud_list", "cloud_read", "cloud_info", "cloud_write", "cloud_delete"],
+        "category": "webdav",
+        "read": ["webdav_list", "webdav_read", "webdav_info"],
+        "write": ["webdav_list", "webdav_read", "webdav_info", "webdav_write", "webdav_delete"],
     },
 }
 ```
 
-#### Agent Tools (`src/tools/cloud/`)
+#### Agent Tools (`src/tools/webdav/`)
 
 New tool category `cloud` with WebDAV-backed implementations. Initial scope is **read-only** — agents pull user-provided reference files into the workspace. Deliverables remain in the job's `output/` folder (accessed via Gitea or cockpit).
 
 | Tool | Purpose | Phase |
 |------|---------|-------|
-| `cloud_list(path, recursive)` | List files/folders at path | **Initial** |
-| `cloud_read(path, target)` | Download file from cloud storage to workspace | **Initial** |
-| `cloud_info(path)` | Get file metadata (size, modified, content type) | **Initial** |
-| `cloud_write(workspace_path, target_path)` | Upload workspace file to cloud storage | Future (when user-directed upload is needed) |
-| `cloud_delete(path)` | Delete file from cloud storage | Future |
+| `webdav_list(path, recursive)` | List files/folders at path | **Initial** |
+| `webdav_read(path, target)` | Download file from cloud storage to workspace | **Initial** |
+| `webdav_info(path)` | Get file metadata (size, modified, content type) | **Initial** |
+| `webdav_write(workspace_path, target_path)` | Upload workspace file to cloud storage | Future (when user-directed upload is needed) |
+| `webdav_delete(path)` | Delete file from cloud storage | Future |
 
 Implementation uses `webdavclient3` (Python WebDAV client library, added to `requirements.txt`).
 
 The tool factory receives the already-connected WebDAV client from `ToolContext` — the same pattern used by `create_graph_tools`, `create_sql_tools`, and `create_mongodb_tools`:
 
 ```python
-# src/tools/cloud/webdav.py
+# src/tools/webdav/tools.py
 from webdav3.client import Client
 
-def create_cloud_tools(context: ToolContext) -> list:
+def create_webdav_tools(context: ToolContext) -> list:
     # context.get_datasource() returns the Client instance created by
-    # _create_datasource_connection() — NOT the raw config dict
+    # datasource_setup.create_datasource_connection() — NOT the raw config dict
     client: Client = context.get_datasource("webdav")
 
     @tool
-    def cloud_list(path: str = "/", recursive: bool = False) -> str:
+    def webdav_list(path: str = "/", recursive: bool = False) -> str:
         """List files and folders in cloud storage."""
         return client.list(path, get_info=True)
 
     @tool
-    def cloud_read(path: str, target: str = "") -> str:
+    def webdav_read(path: str, target: str = "") -> str:
         """Download a file from cloud storage into the workspace."""
         local_path = context.workspace_manager.resolve_path(target or os.path.basename(path))
         client.download_sync(path, local_path)
         return f"Downloaded {path} to {local_path}"
 
-    # ... cloud_write, cloud_delete, cloud_info ...
+    # ... webdav_write, webdav_delete, webdav_info ...
 ```
 
 #### Tool Registry Integration
@@ -556,14 +558,14 @@ if "cloud" in tools_by_category:
     if not context.has_datasource("webdav"):
         logger.warning("Cloud tools require a webdav datasource — skipping")
     else:
-        from src.tools.cloud import create_cloud_tools
-        cloud_tools = create_cloud_tools(context)
+        from src.tools.webdav import create_webdav_tools
+        cloud_tools = create_webdav_tools(context)
         all_tools.extend(cloud_tools)
 ```
 
 #### Connection Factory
 
-Added to `src/agent.py` `_create_datasource_connection()`:
+Added to `src/core/datasource_setup.py` `create_datasource_connection()`:
 
 ```python
 elif ds_type == "webdav":
@@ -640,7 +642,7 @@ The datasource pattern makes it straightforward to add connectors for enterprise
 | `onedrive` | `msgraph-sdk-python` | When an enterprise uses Microsoft 365 |
 | `dropbox` | `dropbox` SDK | When an enterprise uses Dropbox Business |
 
-All connectors implement the same abstract tool interface (`cloud_list`, `cloud_read`, `cloud_write`, `cloud_info`, `cloud_delete`). The agent doesn't know or care which backend is behind the tools — the datasource type determines which connector is loaded, identical to how `sql_query` works the same whether the datasource is a local PostgreSQL or a cloud-hosted RDS instance.
+All connectors implement the same abstract tool interface (`webdav_list`, `webdav_read`, `webdav_write`, `webdav_info`, `webdav_delete`). The agent doesn't know or care which backend is behind the tools — the datasource type determines which connector is loaded, identical to how `sql_query` works the same whether the datasource is a local PostgreSQL or a cloud-hosted RDS instance.
 
 ---
 
@@ -665,8 +667,8 @@ All connectors implement the same abstract tool interface (`cloud_list`, `cloud_
 12. Create `agent-service` Nextcloud user with app password
 13. Add `webdavclient3` to `requirements.txt`
 14. Add `webdav` to `DS_TOOL_MAP` in orchestrator (`orchestrator/main.py`)
-15. Implement `src/tools/cloud/webdav.py` (`create_cloud_tools`) + register in `src/tools/registry.py`
-16. Add WebDAV connection factory branch to `src/agent.py` `_create_datasource_connection()`
+15. Implement `src/tools/webdav/tools.py` (`create_webdav_tools`) + register in `src/tools/registry.py`
+16. Add WebDAV connection factory branch to `src/core/datasource_setup.py` `create_datasource_connection()`
 17. Add `DEFAULT_DS_WEBDAV_*` env var handling to `init.py` / `orchestrator/init.py`
 
 ### Phase 4: Cockpit Integration
@@ -677,7 +679,7 @@ All connectors implement the same abstract tool interface (`cloud_list`, `cloud_
 ### Phase 5: Hardening
 21. Keycloak group → Nextcloud group sync for per-project access control
 22. Per-project service accounts for production isolation (auto-created with projects)
-23. `cloud_write` / `cloud_delete` tools (user-directed upload from agent to cloud storage)
+23. `webdav_write` / `webdav_delete` tools (user-directed upload from agent to cloud storage)
 24. Production domain configuration (`KC_HOSTNAME`, cookie domain, HTTPS termination)
 25. Audit logging for file access
 26. Quota management per project group folder
