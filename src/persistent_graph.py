@@ -67,6 +67,21 @@ def _sanitize_ai_response(response: AIMessage) -> AIMessage:
     return response
 
 
+def _visible_content_len(content: Any) -> int:
+    """Length of user-visible text across supported message content shapes."""
+    if isinstance(content, str):
+        return len(content.strip())
+    if isinstance(content, list):
+        total = 0
+        for block in content:
+            if isinstance(block, str):
+                total += len(block.strip())
+            elif isinstance(block, dict) and block.get("text"):
+                total += len(str(block["text"]).strip())
+        return total
+    return 0
+
+
 def _ensure_msg_id(msg: Any) -> Any:
     """Stamp a stable id on a message that lacks one, at creation time.
 
@@ -1054,6 +1069,12 @@ async def _execute_turn(
         # types), then sanitize for Responses API compatibility (null IDs
         # from OpenRouter).
         response = _sanitize_ai_response(coerce_to_ai_message(response))
+        if (
+            response_content
+            and not getattr(response, "tool_calls", None)
+            and _visible_content_len(response.content) == 0
+        ):
+            response.content = response_content
 
         # Add AI response to message history
         messages.append(response)
