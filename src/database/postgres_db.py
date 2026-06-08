@@ -27,6 +27,32 @@ logger = logging.getLogger(__name__)
 
 QUERIES_DIR = Path(__file__).parent / "queries" / "postgres"
 
+# Fixed namespace for deriving a UUID primary key from a non-UUID message id.
+# In-memory message ids are provider-issued (``chatcmpl-…``, ``resp_…``) or
+# locally minted (``msg_…``) — none are valid UUIDs, but ``thread_messages.id``
+# is a UUID column. uuid5 maps an id deterministically, so re-saving the same
+# message lands on the same row (``ON CONFLICT (id)`` dedup).
+_THREAD_MSG_ID_NS = uuid.UUID("4b9d8f7e-2c3a-5d6b-8e1f-0a1b2c3d4e5f")
+
+
+def _coerce_row_id(raw_id: Optional[str]) -> str:
+    """Map a caller-supplied message id to a valid UUID for ``thread_messages.id``.
+
+    Already-valid UUIDs (restored rows, the user-message fallback) pass through;
+    provider/minted ids are derived deterministically via uuid5 so the upsert is
+    idempotent across a message's incremental write and its turn-complete
+    reconciliation; ``None`` mints a fresh UUID for single-shot rows (user
+    message, summary). The DB row id has always been independent of the in-memory
+    message id (restore assigns a fresh uuid4 either way), so deriving it changes
+    no correlation — it only makes the key stable.
+    """
+    if not raw_id:
+        return str(uuid.uuid4())
+    try:
+        return str(uuid.UUID(str(raw_id)))
+    except (ValueError, AttributeError, TypeError):
+        return str(uuid.uuid5(_THREAD_MSG_ID_NS, str(raw_id)))
+
 
 class PostgresDB:
     """PostgreSQL database manager with async connection pooling.
@@ -326,6 +352,8 @@ class PostgresDB:
         limit: Optional[int] = 200,
         offset: int = 0,
         since_turn: Optional[int] = None,
+        seq_gt: Optional[int] = None,
+        newest_first: bool = False,
     ) -> List[Dict[str, Any]]:
         """Load thread message history. Ordered by turn_number, created_at ASC.
 
@@ -340,6 +368,20 @@ class PostgresDB:
         resume-from-checkpoint path uses this to skip the pre-checkpoint
         history that the summary row already covers (see
         ``get_latest_compaction_checkpoint``).
+
+        Pass ``seq_gt=S`` to load only rows with ``seq > S``, ordered by ``seq``
+        (exact insertion order). This is the message-granular resume cursor: a
+        compaction records ``boundary_seq`` = the seq of the last message its
+        summary covers, and resume loads ``summary + (seq > boundary_seq)`` — the
+        agent's real live tail — instead of whole post-boundary turns. Preferred
+        over ``since_turn`` when the checkpoint carries a ``boundary_seq``.
+
+        Pass ``newest_first=True`` (with a ``limit``) for the resume backstop:
+        the rows are selected ``seq DESC LIMIT N`` (the **newest** N, not the
+        oldest) and returned reversed to chronological order. This bounds the
+        restore so one pathological tail (thousands of messages) can't OOM even
+        when there's no usable summary/boundary; it is a floor, not the
+        mechanism. The caller logs when ``len(result) == limit`` (trimmed).
         """
         query = """
             SELECT id, role, content, tool_calls, turn_number, metrics,
@@ -351,10 +393,21 @@ class PostgresDB:
               AND role <> 'summary'
         """
         params: List[Any] = [thread_id]
+        if seq_gt is not None:
+            params.append(seq_gt)
+            query += f"\n              AND seq > ${len(params)}"
         if since_turn is not None:
             params.append(since_turn)
             query += f"\n              AND turn_number > ${len(params)}"
-        query += "\n            ORDER BY turn_number ASC, created_at ASC"
+        # newest_first: take the NEWEST `limit` rows (seq DESC), reversed to
+        # chronological below — the resume floor. Else order by seq (the seq
+        # cursor) or turn/created_at (legacy since_turn / full-load callers).
+        if newest_first:
+            query += "\n            ORDER BY seq DESC"
+        elif seq_gt is not None:
+            query += "\n            ORDER BY seq ASC"
+        else:
+            query += "\n            ORDER BY turn_number ASC, created_at ASC"
         if limit is not None:
             params.append(limit)
             query += f"\n            LIMIT ${len(params)}"
@@ -397,6 +450,10 @@ class PostgresDB:
                     else None,
                 }
             )
+        if newest_first:
+            # Selected newest-first to apply the LIMIT to the tail; hand back
+            # chronological so callers (resume) get oldest→newest as usual.
+            result.reverse()
         return result
 
     async def get_latest_compaction_checkpoint(
@@ -437,8 +494,134 @@ class PostgresDB:
         return {
             "summary": row["content"] or "",
             "boundary_turn": metrics.get("boundary_turn"),
+            "boundary_seq": metrics.get("boundary_seq"),
             "turn_number": row["turn_number"],
         }
+
+    async def get_seq_for_message_id(
+        self, thread_id: str, msg_id: str
+    ) -> Optional[int]:
+        """Return the persisted ``seq`` of a message by its in-memory id.
+
+        Resolves the summarized/kept boundary message
+        (``ContextManager._last_compaction_boundary_id``) into a ``boundary_seq``
+        for the summary row. The in-memory id is coerced the same way it was on
+        write (``_coerce_row_id``), so a provider/minted id resolves to its row.
+        Returns ``None`` when the message isn't persisted (a transient injection,
+        or a resume-time fresh-id message) — the caller then leaves
+        ``boundary_seq`` unset and falls back to ``boundary_turn``.
+        """
+        row = await self.fetchrow(
+            "SELECT seq FROM thread_messages WHERE thread_id = $1 AND id = $2",
+            thread_id,
+            _coerce_row_id(msg_id),
+        )
+        return row["seq"] if row else None
+
+    async def save_thread_message(
+        self,
+        thread_id: str,
+        role: str,
+        content: Optional[str] = None,
+        tool_calls: Optional[Any] = None,
+        turn_number: Optional[int] = None,
+        metrics: Optional[dict] = None,
+        tool_call_id: Optional[str] = None,
+        thinking: Optional[str] = None,
+        reasoning: Optional[Any] = None,
+        tool_results: Optional[Any] = None,
+        provider: Optional[str] = None,
+        provider_raw: Optional[Any] = None,
+        additional_kwargs: Optional[dict] = None,
+        response_metadata: Optional[dict] = None,
+        id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Persist a ``thread_messages`` row directly (no orchestrator hop).
+
+        The persistent agent already holds this asyncpg pool for resume reads and
+        config writes, so message writes go straight here instead of through
+        ``POST /api/agents/threads/{id}/messages`` (a pure pass-through). Two
+        properties this direct path adds, both load-bearing for the resume fix in
+        docs/issues/persistent_session_midturn_message_loss.md:
+
+        - **Caller-supplied ``id`` + idempotent upsert.** The agent mints a stable
+          id per message (``persistent_graph._ensure_msg_id`` /
+          ``_sanitize_ai_response``) and passes it here; ``_coerce_row_id`` maps
+          it to a valid UUID for the PK column (provider/minted ids aren't UUIDs).
+          ``ON CONFLICT (id) DO UPDATE`` means a message written incrementally and
+          then re-saved by the turn-complete reconciliation pass collapses onto
+          one row — no duplicates. ``id=None`` mints a fresh UUID (single-shot
+          rows like the user message and the summary, which are never re-saved).
+        - **``seq`` returned in the same round-trip.** ``RETURNING id, seq`` hands
+          back the row's monotonic insertion order, so a compaction can record
+          ``boundary_seq`` without a follow-up read.
+
+        Mirrors the orchestrator's column set and the ``threads`` activity bump.
+        ``tool_call_id`` is set only on role='tool' rows; ``thinking`` only on
+        role='ai' rows with reasoning. The component columns (reasoning,
+        tool_results, provider, provider_raw, additional_kwargs,
+        response_metadata) are nullable (migration 0019). The ``seq`` column and
+        its ``ON CONFLICT`` target arrived in migration 0023.
+        """
+        msg_id = _coerce_row_id(id)
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO thread_messages
+                    (id, thread_id, role, content, tool_calls, turn_number,
+                     metrics, tool_call_id, thinking,
+                     reasoning, tool_results, provider, provider_raw,
+                     additional_kwargs, response_metadata)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+                        $14, $15)
+                ON CONFLICT (id) DO UPDATE SET
+                    content           = EXCLUDED.content,
+                    tool_calls        = EXCLUDED.tool_calls,
+                    turn_number       = EXCLUDED.turn_number,
+                    metrics           = EXCLUDED.metrics,
+                    tool_call_id      = EXCLUDED.tool_call_id,
+                    thinking          = EXCLUDED.thinking,
+                    reasoning         = EXCLUDED.reasoning,
+                    tool_results      = EXCLUDED.tool_results,
+                    provider          = EXCLUDED.provider,
+                    provider_raw      = EXCLUDED.provider_raw,
+                    additional_kwargs = EXCLUDED.additional_kwargs,
+                    response_metadata = EXCLUDED.response_metadata
+                RETURNING id, seq
+                """,
+                msg_id,
+                thread_id,
+                role,
+                content,
+                json.dumps(tool_calls) if tool_calls is not None else None,
+                turn_number,
+                json.dumps(metrics) if metrics is not None else None,
+                tool_call_id,
+                thinking,
+                json.dumps(reasoning) if reasoning is not None else None,
+                json.dumps(tool_results) if tool_results is not None else None,
+                provider,
+                json.dumps(provider_raw) if provider_raw is not None else None,
+                json.dumps(additional_kwargs)
+                if additional_kwargs is not None
+                else None,
+                json.dumps(response_metadata)
+                if response_metadata is not None
+                else None,
+            )
+            # Bump thread activity + turn count (mirrors the orchestrator path so
+            # going direct doesn't regress last_activity / total_turns tracking).
+            await conn.execute(
+                """
+                UPDATE threads
+                SET last_activity = CURRENT_TIMESTAMP,
+                    total_turns   = GREATEST(total_turns, COALESCE($2, 0))
+                WHERE id = $1
+                """,
+                thread_id,
+                turn_number,
+            )
+        return {"id": str(row["id"]), "seq": row["seq"]}
 
     # =========================================================================
     # SYNC WRAPPERS (for scripts and other sync contexts)

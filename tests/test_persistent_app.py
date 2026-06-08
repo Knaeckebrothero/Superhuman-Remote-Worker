@@ -21,6 +21,8 @@ from src.api.persistent_app import (
     _handle_archive,
     _handle_compact,
     _handle_vm_upgrade,
+    _loop_persist_message,
+    _persist_one_message,
     _poll_vm_ready,
     _poll_workspace_ready,
     _repair_tool_pairing,
@@ -219,6 +221,7 @@ class TestSaveMessage:
             turn_number=1,
             tool_call_id=None,
             thinking=None,
+            id=None,
         )
 
     @pytest.mark.asyncio
@@ -300,14 +303,16 @@ class TestRestoreSessionToolPairing:
 
     Regression for the Responses API 400 "No tool output found for function
     call ..." hit when resuming session b4478b88: the restore path capped at
-    500 messages and sliced a 5-call parallel tool batch, orphaning two
-    function calls. Resume now loads the full conversation and repairs any
-    residual orphan before the first LLM call.
+    500 messages from the OLDEST end and sliced a 5-call parallel tool batch,
+    orphaning two function calls. Resume now loads a bounded NEWEST-N tail (the
+    resume floor) and repairs any residual orphan — including a batch sliced at
+    the floor — before the first LLM call.
     """
 
     @pytest.mark.asyncio
-    async def test_loads_full_conversation_not_capped(self):
-        """Restore must request the entire conversation (limit=None)."""
+    async def test_loads_newest_capped_tail(self):
+        """Restore loads the NEWEST N (resume floor), not an oldest-N truncation
+        — recent context is preserved while the load stays bounded."""
         from src.api import persistent_app as pa
 
         mock_session = MagicMock()
@@ -315,7 +320,7 @@ class TestRestoreSessionToolPairing:
         mock_session.context_manager = None  # skip compaction in this test
         mock_agent = MagicMock()
         mock_agent.postgres_conn = MagicMock()
-        # Path B: no compaction checkpoint → existing full-load behavior.
+        # Path B: no compaction checkpoint → bounded newest-N load.
         mock_agent.postgres_conn.get_latest_compaction_checkpoint = AsyncMock(
             return_value=None
         )
@@ -334,9 +339,14 @@ class TestRestoreSessionToolPairing:
             await pa._restore_session_messages()
 
         get_history.assert_awaited_once()
-        assert get_history.await_args.kwargs.get("limit", "MISSING") is None, (
-            "resume must load the full conversation (limit=None), got "
-            f"{get_history.await_args.kwargs}"
+        kwargs = get_history.await_args.kwargs
+        assert kwargs.get("newest_first") is True, (
+            "resume keeps the NEWEST messages (not an oldest-N truncation — the "
+            f"b4478b88 concern), got {kwargs}"
+        )
+        assert kwargs.get("limit") == pa._resume_message_limit, (
+            "the load is bounded by the resume floor; _repair_tool_pairing handles "
+            "any tool batch sliced at the floor"
         )
 
     @pytest.mark.asyncio
@@ -530,7 +540,7 @@ class TestRestoreFromCheckpoint:
 
     @pytest.mark.asyncio
     async def test_path_b_back_compat_when_no_checkpoint(self):
-        """No summary row → Path B: full load, no ``since_turn`` filter."""
+        """No summary row → Path B: bounded newest-N load, no ``since_turn``."""
         from src.api import persistent_app as pa
 
         mock_session = MagicMock()
@@ -559,7 +569,8 @@ class TestRestoreFromCheckpoint:
         assert kwargs.get("since_turn") is None, (
             f"Path B must not filter by since_turn; kwargs={kwargs}"
         )
-        assert kwargs.get("limit", "MISSING") is None, "Path B = full load"
+        assert kwargs.get("newest_first") is True, "Path B loads the newest-N tail"
+        assert kwargs.get("limit") == pa._resume_message_limit, "bounded by the floor"
 
     @pytest.mark.asyncio
     async def test_path_b_back_compat_when_boundary_turn_missing(self):
@@ -591,7 +602,8 @@ class TestRestoreFromCheckpoint:
 
         kwargs = get_history.await_args.kwargs
         assert kwargs.get("since_turn") is None
-        assert kwargs.get("limit", "MISSING") is None
+        assert kwargs.get("newest_first") is True
+        assert kwargs.get("limit") == pa._resume_message_limit
 
     @pytest.mark.asyncio
     async def test_path_b_records_resume_checkpoint_when_compacted(self):
@@ -637,19 +649,25 @@ class TestRestoreFromCheckpoint:
         mock_agent.postgres_conn.get_thread_messages_history = AsyncMock(
             return_value=history
         )
-        mock_client = AsyncMock()
+        # The resume-time checkpoint now writes straight to the DB via the
+        # session's pool (the same PostgresDB the agent reads from), not the
+        # orchestrator REST client.
+        mock_session.postgres_conn = mock_agent.postgres_conn
+        mock_session.postgres_conn.save_thread_message = AsyncMock(
+            return_value={"id": "m1", "seq": 1}
+        )
 
         with (
             patch.object(pa, "_session", mock_session),
             patch.object(pa, "_agent", mock_agent),
             patch.object(pa, "_thread_id", "thread-resume-compact"),
-            patch.object(pa, "_orchestrator_client", mock_client),
         ):
             await pa._restore_session_messages()
 
         # save_thread_message was called for the resume-time checkpoint.
-        mock_client.save_thread_message.assert_awaited()
-        kwargs = mock_client.save_thread_message.call_args.kwargs
+        writer = mock_session.postgres_conn.save_thread_message
+        writer.assert_awaited()
+        kwargs = writer.call_args.kwargs
         assert kwargs["role"] == "summary"
         assert kwargs["metrics"]["trigger"] == "resume", (
             f"resume-time compaction must persist trigger='resume'; "
@@ -740,6 +758,261 @@ class TestSaveTurnAiMessages:
 
         # Should not raise
         await _save_turn_ai_messages(client, "tid", messages, 1)
+
+
+# ---------------------------------------------------------------------------
+# 3.4a _persist_one_message() + _loop_persist_message() — incremental (Phase 2)
+# ---------------------------------------------------------------------------
+
+
+class TestPersistOneMessage:
+    """The shared serializer used by both the incremental path and the
+    turn-complete reconciliation — both pass the stable id so they converge."""
+
+    @pytest.mark.asyncio
+    async def test_serializes_ai_message_with_id_and_decision(self):
+        client = AsyncMock()
+        msg = AIMessage(
+            content="hi",
+            id="msg_ai1",
+            tool_calls=[{"name": "search", "args": {"q": "x"}, "id": "tc1"}],
+        )
+        await _persist_one_message(
+            client, "tid", msg, 3, tool_decisions={"tc1": "approved"}
+        )
+        kwargs = client.save_thread_message.call_args.kwargs
+        assert kwargs["role"] == "ai"
+        assert kwargs["turn_number"] == 3
+        assert kwargs["id"] == "msg_ai1"
+        assert kwargs["tool_calls"][0]["decision"] == "approved"
+
+    @pytest.mark.asyncio
+    async def test_tool_message_keeps_link_and_no_metrics(self):
+        client = AsyncMock()
+        msg = ToolMessage(content="result", tool_call_id="tc1", id="msg_t1")
+        await _persist_one_message(client, "tid", msg, 2, metrics={"tokens": 5})
+        kwargs = client.save_thread_message.call_args.kwargs
+        assert kwargs["role"] == "tool"
+        assert kwargs["tool_call_id"] == "tc1"
+        assert kwargs["id"] == "msg_t1"
+        assert kwargs["metrics"] is None, "metrics attach to AI rows only"
+
+
+class TestLoopPersistMessage:
+    @pytest.mark.asyncio
+    async def test_persists_via_session_pool_with_turn_count(self):
+        from src.api import persistent_app as pa
+
+        mock_session = MagicMock()
+        mock_session.turn_count = 4
+        mock_session.tool_decisions = {}
+        mock_session.postgres_conn.save_thread_message = AsyncMock(
+            return_value={"id": "m", "seq": 9}
+        )
+        with (
+            patch.object(pa, "_session", mock_session),
+            patch.object(pa, "_thread_id", "tid"),
+        ):
+            await _loop_persist_message(AIMessage(content="hi", id="msg_1"))
+        kwargs = mock_session.postgres_conn.save_thread_message.call_args.kwargs
+        assert kwargs["role"] == "ai"
+        assert kwargs["turn_number"] == 4, "turn number comes from _session.turn_count"
+        assert kwargs["id"] == "msg_1"
+
+    @pytest.mark.asyncio
+    async def test_noop_when_no_postgres_conn(self):
+        from src.api import persistent_app as pa
+
+        mock_session = MagicMock()
+        mock_session.postgres_conn = None
+        with (
+            patch.object(pa, "_session", mock_session),
+            patch.object(pa, "_thread_id", "tid"),
+        ):
+            await _loop_persist_message(AIMessage(content="hi"))  # must not raise
+
+    @pytest.mark.asyncio
+    async def test_non_fatal_on_db_error(self):
+        from src.api import persistent_app as pa
+
+        mock_session = MagicMock()
+        mock_session.turn_count = 1
+        mock_session.tool_decisions = {}
+        mock_session.postgres_conn.save_thread_message = AsyncMock(
+            side_effect=RuntimeError("db down")
+        )
+        with (
+            patch.object(pa, "_session", mock_session),
+            patch.object(pa, "_thread_id", "tid"),
+        ):
+            await _loop_persist_message(
+                AIMessage(content="hi", id="x")
+            )  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# 3.4c boundary_seq recording + seq-cursor resume (Phase 3)
+# ---------------------------------------------------------------------------
+
+
+class TestRecordCompactionBoundarySeq:
+    @pytest.mark.asyncio
+    async def test_resolves_boundary_id_to_seq_on_summary_row(self):
+        """When the summarizer set a boundary id, _record_compaction resolves it
+        to a seq and records boundary_seq alongside boundary_turn."""
+        from src.api import persistent_app as pa
+
+        mock_session = MagicMock()
+        mock_session.turn_count = 5
+        mock_session.context_manager._last_compaction_boundary_id = "msg_boundary"
+        mock_session.postgres_conn.get_seq_for_message_id = AsyncMock(return_value=780)
+        mock_session.postgres_conn.save_thread_message = AsyncMock(
+            return_value={"id": "s", "seq": 1}
+        )
+        with (
+            patch.object(pa, "_session", mock_session),
+            patch.object(pa, "_thread_id", "tid"),
+        ):
+            await pa._record_compaction(
+                "summary text", 100, 11, trigger="auto", ws=None
+            )
+
+        mock_session.postgres_conn.get_seq_for_message_id.assert_awaited_once_with(
+            "tid", "msg_boundary"
+        )
+        kwargs = mock_session.postgres_conn.save_thread_message.call_args.kwargs
+        assert kwargs["metrics"]["boundary_seq"] == 780
+        assert kwargs["metrics"]["boundary_turn"] == 4  # turn_count - 1
+
+    @pytest.mark.asyncio
+    async def test_boundary_seq_none_when_no_boundary_id(self):
+        """No boundary id (no real compaction / restore-time fresh ids) → the
+        seq lookup is skipped and boundary_seq is None (falls back to turn)."""
+        from src.api import persistent_app as pa
+
+        mock_session = MagicMock()
+        mock_session.turn_count = 2
+        mock_session.context_manager._last_compaction_boundary_id = None
+        mock_session.postgres_conn.get_seq_for_message_id = AsyncMock(return_value=999)
+        mock_session.postgres_conn.save_thread_message = AsyncMock(
+            return_value={"id": "s", "seq": 1}
+        )
+        with (
+            patch.object(pa, "_session", mock_session),
+            patch.object(pa, "_thread_id", "tid"),
+        ):
+            await pa._record_compaction("summary", 50, 8, trigger="manual", ws=None)
+
+        mock_session.postgres_conn.get_seq_for_message_id.assert_not_awaited()
+        kwargs = mock_session.postgres_conn.save_thread_message.call_args.kwargs
+        assert kwargs["metrics"]["boundary_seq"] is None
+
+
+class TestRestorePathACursor:
+    """Path A prefers the message-granular seq cursor, falling back to the turn
+    cursor only for old summary rows that predate boundary_seq."""
+
+    def _restore_env(self, ckpt):
+        from src.api import persistent_app as pa
+
+        mock_session = MagicMock()
+        mock_session.messages = []
+        mock_session.context_manager = None  # skip the re-bound pass
+        mock_agent = MagicMock()
+        mock_agent.postgres_conn.get_latest_compaction_checkpoint = AsyncMock(
+            return_value=ckpt
+        )
+        mock_agent.postgres_conn.get_thread_messages_history = AsyncMock(
+            return_value=[]
+        )
+        return pa, mock_session, mock_agent
+
+    @pytest.mark.asyncio
+    async def test_uses_seq_cursor_when_boundary_seq_present(self):
+        ckpt = {
+            "summary": "S",
+            "boundary_turn": 3,
+            "boundary_seq": 780,
+            "turn_number": 4,
+        }
+        pa, mock_session, mock_agent = self._restore_env(ckpt)
+        with (
+            patch.object(pa, "_session", mock_session),
+            patch.object(pa, "_agent", mock_agent),
+            patch.object(pa, "_thread_id", "tid"),
+        ):
+            await pa._restore_session_messages()
+        kwargs = mock_agent.postgres_conn.get_thread_messages_history.call_args.kwargs
+        assert kwargs.get("seq_gt") == 780, "must load the tail by seq cursor"
+        assert kwargs.get("since_turn") is None, "must not use the turn cursor"
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_turn_cursor_without_boundary_seq(self):
+        ckpt = {
+            "summary": "S",
+            "boundary_turn": 3,
+            "boundary_seq": None,  # old row, predates the feature
+            "turn_number": 4,
+        }
+        pa, mock_session, mock_agent = self._restore_env(ckpt)
+        with (
+            patch.object(pa, "_session", mock_session),
+            patch.object(pa, "_agent", mock_agent),
+            patch.object(pa, "_thread_id", "tid"),
+        ):
+            await pa._restore_session_messages()
+        kwargs = mock_agent.postgres_conn.get_thread_messages_history.call_args.kwargs
+        assert kwargs.get("since_turn") == 3, "old rows resume on the turn cursor"
+        assert kwargs.get("seq_gt") is None
+
+    @pytest.mark.asyncio
+    async def test_applies_resume_floor_params(self):
+        """Every resume read is capped: newest N (newest_first) of limit rows."""
+        ckpt = {
+            "summary": "S",
+            "boundary_turn": 3,
+            "boundary_seq": 780,
+            "turn_number": 4,
+        }
+        pa, mock_session, mock_agent = self._restore_env(ckpt)
+        with (
+            patch.object(pa, "_session", mock_session),
+            patch.object(pa, "_agent", mock_agent),
+            patch.object(pa, "_thread_id", "tid"),
+        ):
+            await pa._restore_session_messages()
+        kwargs = mock_agent.postgres_conn.get_thread_messages_history.call_args.kwargs
+        assert kwargs.get("newest_first") is True, "resume must use the newest-N floor"
+        assert kwargs.get("limit") == pa._resume_message_limit
+
+    @pytest.mark.asyncio
+    async def test_logs_when_resume_floor_trims(self, caplog):
+        """When the loaded tail hits the floor, a warning is emitted so a
+        silently-truncated restore is visible."""
+        import logging
+
+        ckpt = {
+            "summary": "S",
+            "boundary_turn": 3,
+            "boundary_seq": 780,
+            "turn_number": 4,
+        }
+        pa, mock_session, mock_agent = self._restore_env(ckpt)
+        # Return exactly the floor's worth of rows → trimmed.
+        mock_agent.postgres_conn.get_thread_messages_history = AsyncMock(
+            return_value=[
+                {"role": "ai", "content": "x", "tool_calls": None, "turn_number": 4}
+                for _ in range(pa._resume_message_limit)
+            ]
+        )
+        with (
+            patch.object(pa, "_session", mock_session),
+            patch.object(pa, "_agent", mock_agent),
+            patch.object(pa, "_thread_id", "tid"),
+            caplog.at_level(logging.WARNING),
+        ):
+            await pa._restore_session_messages()
+        assert any("Resume floor hit" in r.getMessage() for r in caplog.records)
 
 
 # ---------------------------------------------------------------------------
@@ -1250,17 +1523,19 @@ class TestHandleCompact:
         )
         mock_session.config.context_management.max_summary_length = 10000
         mock_session.workspace_manager = None
-        mock_client = AsyncMock()
+        mock_session.postgres_conn.save_thread_message = AsyncMock(
+            return_value={"id": "m1", "seq": 1}
+        )
 
         with (
             patch("src.api.persistent_app._session", mock_session),
-            patch("src.api.persistent_app._orchestrator_client", mock_client),
             patch("src.api.persistent_app._thread_id", "tid-1"),
         ):
             await _handle_compact(ws, "")
 
-        mock_client.save_thread_message.assert_awaited_once()
-        kwargs = mock_client.save_thread_message.call_args.kwargs
+        writer = mock_session.postgres_conn.save_thread_message
+        writer.assert_awaited_once()
+        kwargs = writer.call_args.kwargs
         assert kwargs["role"] == "summary"
         assert "We did X and Y." in kwargs["content"]
         assert kwargs["turn_number"] == 7
@@ -1287,16 +1562,17 @@ class TestHandleCompact:
         )
         mock_session.config.context_management.max_summary_length = 10000
         mock_session.workspace_manager = None
-        mock_client = AsyncMock()
+        mock_session.postgres_conn.save_thread_message = AsyncMock(
+            return_value={"id": "m1", "seq": 1}
+        )
 
         with (
             patch("src.api.persistent_app._session", mock_session),
-            patch("src.api.persistent_app._orchestrator_client", mock_client),
             patch("src.api.persistent_app._thread_id", "tid-1"),
         ):
             await _handle_compact(ws, "")
 
-        kwargs = mock_client.save_thread_message.call_args.kwargs
+        kwargs = mock_session.postgres_conn.save_thread_message.call_args.kwargs
         # boundary_turn = last fully-saved turn = turn_count - 1. At
         # auto-compaction the current turn's user msg is saved but its AI/tool
         # msgs are not yet — reloading turn > boundary recovers them once they
@@ -1317,16 +1593,17 @@ class TestHandleCompact:
         )
         mock_session.config.context_management.max_summary_length = 10000
         mock_session.workspace_manager = None
-        mock_client = AsyncMock()
+        mock_session.postgres_conn.save_thread_message = AsyncMock(
+            return_value={"id": "m1", "seq": 1}
+        )
 
         with (
             patch("src.api.persistent_app._session", mock_session),
-            patch("src.api.persistent_app._orchestrator_client", mock_client),
             patch("src.api.persistent_app._thread_id", "tid-1"),
         ):
             await _handle_compact(ws, "")
 
-        kwargs = mock_client.save_thread_message.call_args.kwargs
+        kwargs = mock_session.postgres_conn.save_thread_message.call_args.kwargs
         assert kwargs["metrics"]["boundary_turn"] == 0
 
     @pytest.mark.asyncio
