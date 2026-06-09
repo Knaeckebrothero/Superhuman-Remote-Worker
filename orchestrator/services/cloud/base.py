@@ -17,8 +17,8 @@ Phase 1.5 tightened the contract:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Optional, Protocol, runtime_checkable
+from dataclasses import dataclass, field
+from typing import Any, Literal, Optional, Protocol, runtime_checkable
 
 from .handles import (
     GroupId,
@@ -50,6 +50,54 @@ class UserHome:
     handle: ProjectFolderHandle
     browser_url: str
     webdav_url: Optional[str]
+
+
+@dataclass(frozen=True, slots=True)
+class CloudMountSubject:
+    """Identity context for a user-scoped cloud mount.
+
+    Backends use this only when the remote they are exposing belongs to a
+    specific user rather than to a service/project space.
+    """
+
+    user_id: Optional[str] = None
+    user_sub: Optional[str] = None
+    username: Optional[str] = None
+
+
+@dataclass(frozen=True, slots=True)
+class RcloneMountSpec:
+    """Provider-owned description of one rclone remote.
+
+    The orchestrator serializes this into the agent's ``cloud_mount`` payload.
+    The agent-side mount manager is intentionally generic: it writes the
+    rclone config and starts the mount without knowing provider business rules.
+    """
+
+    source_type: str
+    source_config: dict[str, Any]
+    auth: dict[str, Any] = field(default_factory=dict)
+    root: str = ""
+    provider_flags: list[str] = field(default_factory=list)
+    cache: dict[str, Any] = field(default_factory=dict)
+    required_capabilities: list[str] = field(
+        default_factory=lambda: ["rclone", "fuse", "rc"]
+    )
+
+    def to_payload(self) -> dict[str, Any]:
+        payload = {
+            "type": self.source_type,
+            "config": dict(self.source_config),
+        }
+        if self.root:
+            payload["root"] = self.root
+        return {
+            "source": payload,
+            "auth": dict(self.auth),
+            "provider_flags": list(self.provider_flags),
+            "cache": dict(self.cache),
+            "required_capabilities": list(self.required_capabilities),
+        }
 
 
 @runtime_checkable
@@ -276,3 +324,18 @@ class MainCloudBackend(Protocol):
         backend does not speak WebDAV (e.g. Microsoft Graph).
         """
         ...
+
+
+@runtime_checkable
+class SupportsRcloneMount(Protocol):
+    """Optional capability for backends that can expose handles via rclone."""
+
+    async def build_rclone_mount_spec(
+        self,
+        *,
+        handle: ProjectFolderHandle | SessionFolderHandle,
+        mount_kind: str,
+        target_path: str,
+        access: Literal["read_only", "read_write"],
+        subject: CloudMountSubject | None = None,
+    ) -> RcloneMountSpec: ...

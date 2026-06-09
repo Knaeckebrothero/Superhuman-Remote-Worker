@@ -315,6 +315,13 @@ This is the case the entire investigation started from. It ships after Phase 1 b
 - **Acceptance:** drop a file into the OpenCloud home root → agent reads it. Agent writes a file → user sees it in OpenCloud home.
 - **Risk:** user home can be very large. May need a size cap or a top-level scope filter ("only sync these subfolders"). Permission scope is broad — agent has full read/write on the user's home; the UX needs to make this deliberate.
 
+> **Superseded 2026-06-09:** The large-home risk materialized on a Nextcloud
+> deployment with a 100GB+ default folder. Current behavior keeps
+> `project_default` rows only as project-scoping records and no longer ships a
+> `webdav_url` for the user's home. Default-project sessions therefore use the
+> regular per-session cloud folder as the sync surface instead of cloning the
+> whole home directory.
+
 #### First implementation pass — broken (2026-05-17)
 
 First Phase 2 pass landed (commit `b984968`). End-to-end live test failed: the agent received the `project_default` mount but `PROPFIND /dav/spaces/<personal-space>/` returned 404 from OpenCloud. Diagnosis via cluster logs (`srw-opencloud` access log + `authprovider.go` line showing `type:USER_TYPE_SERVICE authenticated`): **OpenCloud Personal Spaces are single-owner**, the agent's service-account bearer token has no WebDAV access to them. My earlier claim that "both backends authenticate as service accounts, so they can read/write any user's home Space" was wrong — service accounts get LibreGraph admin reads (which is why `get_user_home()` returned a valid Space ID) but NOT WebDAV data access on user-owned Spaces.

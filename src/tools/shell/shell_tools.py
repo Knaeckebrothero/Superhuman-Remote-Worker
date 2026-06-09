@@ -14,6 +14,7 @@ Available in both strategic and tactical phases.
 """
 
 import logging
+import os
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -23,6 +24,10 @@ from langchain_core.tools import tool
 from .coding_tools import _truncate_output
 from .shell_manager import SUDO_FREEZE_SENTINEL
 from ..context import ToolContext
+from ...services.cloud_mount.guardrails import (
+    detect_cloud_scan_risk,
+    format_cloud_scan_guard_message,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +64,32 @@ def _scan_for_error_patterns(output: str) -> Optional[str]:
     if found:
         return f"⚠ Possible error in output: {', '.join(found)}. Read the output carefully before proceeding."
     return None
+
+
+def _cloud_scan_guard_decision(
+    command: str, context: ToolContext
+) -> tuple[Optional[str], bool]:
+    cloud_mount_cfg = context.get_config("cloud_mount", {})
+    if not isinstance(cloud_mount_cfg, dict) or not cloud_mount_cfg.get("active"):
+        return None, False
+
+    mode = str(
+        cloud_mount_cfg.get("scan_guard", os.getenv("SRW_CLOUD_SCAN_GUARD", "block"))
+    ).lower()
+    if mode in {"0", "off", "disabled", "false"}:
+        return None, False
+
+    risk = detect_cloud_scan_risk(command)
+    if risk is None:
+        return None, False
+
+    message = format_cloud_scan_guard_message(command, risk)
+    if mode == "warn":
+        return (
+            f"{message}\n\nThe command will still run because cloud_scan_guard=warn.",
+            False,
+        )
+    return message, True
 
 
 # Tmux special key names that should NOT get Enter appended in keys mode
@@ -283,7 +314,13 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
         try:
             sm.ensure_tab("default")
 
+            guard_msg, guard_blocks = _cloud_scan_guard_decision(command, context)
+            if guard_msg and guard_blocks:
+                return guard_msg
+
             output = sm.run_sync(command, tab_name="default", timeout=timeout)
+            if guard_msg:
+                output = f"{guard_msg}\n\n{output}"
 
             # Sudo intercept: trigger freeze for VM upgrade
             freeze_msg = _check_sudo_freeze(output, command, context)
@@ -409,6 +446,9 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
                 return f"{tab_header}\n{text}"
 
             elif is_async:
+                guard_msg, guard_blocks = _cloud_scan_guard_decision(command, context)
+                if guard_msg and guard_blocks:
+                    return f"{tab_header}\n{guard_msg}"
                 # Async mode: send command, wait briefly, return what appeared
                 sm.read(name, lines=1, since_cursor=False)  # snapshot cursor
                 result = sm.send(name, command, enter=True)
@@ -419,11 +459,18 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
                 time.sleep(0.5)
                 text, metadata = sm.read(name, since_cursor=True)
                 text = _truncate_output(text, max_output_chars, "shell output")
+                if guard_msg:
+                    text = f"{guard_msg}\n\n{text}"
                 return f"{tab_header}\n{text}"
 
             else:
+                guard_msg, guard_blocks = _cloud_scan_guard_decision(command, context)
+                if guard_msg and guard_blocks:
+                    return f"{tab_header}\n{guard_msg}"
                 # Sync mode: sentinel-based wait for completion
                 output = sm.run_sync(command, tab_name=name, timeout=timeout)
+                if guard_msg:
+                    output = f"{guard_msg}\n\n{output}"
                 # Sudo intercept: trigger freeze for VM upgrade
                 freeze_msg = _check_sudo_freeze(output, command, context)
                 if freeze_msg:

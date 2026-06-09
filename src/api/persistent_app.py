@@ -721,8 +721,16 @@ async def _attach_session(
         config_override = (workspace_override or {}).get("config_override")
     if not project_ids:
         project_ids = (workspace_override or {}).get("project_ids") or []
+    cloud_mount_cfg = (
+        workspace_override.get("cloud_mount") if workspace_override else None
+    )
     if (
-        (not config_override or not project_ids or not datasources)
+        (
+            not config_override
+            or not project_ids
+            or not datasources
+            or not cloud_mount_cfg
+        )
         and _orchestrator_client
         and _thread_id
     ):
@@ -735,6 +743,8 @@ async def _attach_session(
                     project_ids = ws_info.get("project_ids") or []
                 if not datasources:
                     datasources = ws_info.get("datasources")
+                if not cloud_mount_cfg:
+                    cloud_mount_cfg = ws_info.get("cloud_mount")
         except Exception:
             pass
 
@@ -946,7 +956,35 @@ async def _attach_session(
         vector_conn=getattr(_agent, "vector_conn", None),
         workspace_override=workspace_override,
         git_remote_url=git_remote_url,
+        cloud_mount_cfg=cloud_mount_cfg,
     )
+
+    cloud_mount_active = bool(
+        _session.cloud_mount_manager and _session.cloud_mount_manager.active
+    )
+    if cloud_mount_active:
+        _broadcast(
+            "cloud_mount.ready",
+            {
+                "mounts": [
+                    {
+                        "mount_id": m.mount_id,
+                        "mount_kind": m.mount_kind,
+                        "target_path": m.target_path,
+                        "workspace_name": m.workspace_name,
+                    }
+                    for m in _session.cloud_mount_manager.mounts
+                ]
+            },
+        )
+    elif _session.cloud_mount_error:
+        _broadcast(
+            "cloud_mount.error",
+            {
+                "message": _session.cloud_mount_error,
+                "degraded": True,
+            },
+        )
 
     # Clone repository datasources into the workspace (deferred from above).
     # Uses GitManager.clone() with the workspace backend so that repos are
@@ -1125,12 +1163,23 @@ async def _attach_session(
             logger.warning(f"Failed to inject datasource index: {e}")
 
     # Initialize cloud workspace sync if the orchestrator gave us a config
-    cloud_cfg = workspace_override.get("cloud_sync") if workspace_override else None
+    cloud_cfg = (
+        None
+        if cloud_mount_active
+        else workspace_override.get("cloud_sync")
+        if workspace_override
+        else None
+    )
     nc_folder = (
         workspace_override.get("nc_session_folder") if workspace_override else None
     )
     cloud_degraded_hint = False
-    if (not cloud_cfg or not nc_folder) and _orchestrator_client and _thread_id:
+    if (
+        not cloud_mount_active
+        and (not cloud_cfg or not nc_folder)
+        and _orchestrator_client
+        and _thread_id
+    ):
         try:
             ws_info = await _orchestrator_client.get_thread_workspace(_thread_id)
             if ws_info:
@@ -3826,7 +3875,12 @@ async def _poll_workspace_ready(
                 },
                 "git_remote_url": ws.get("git_remote_url"),
                 "config_override": ws.get("config_override"),
+                "project_ids": ws.get("project_ids") or [],
+                "datasources": ws.get("datasources"),
                 "nc_session_folder": ws.get("nc_session_folder"),
+                "cloud_sync": ws.get("cloud_sync"),
+                "cloud_mount": ws.get("cloud_mount"),
+                "cloud_sync_degraded": ws.get("cloud_sync_degraded"),
             }
 
         # Check container workspace
@@ -3844,7 +3898,12 @@ async def _poll_workspace_ready(
                 },
                 "git_remote_url": ws.get("git_remote_url"),
                 "config_override": ws.get("config_override"),
+                "project_ids": ws.get("project_ids") or [],
+                "datasources": ws.get("datasources"),
                 "nc_session_folder": ws.get("nc_session_folder"),
+                "cloud_sync": ws.get("cloud_sync"),
+                "cloud_mount": ws.get("cloud_mount"),
+                "cloud_sync_degraded": ws.get("cloud_sync_degraded"),
             }
         if status == "failed" and (not vm_status or vm_status == "failed"):
             logger.warning(f"Workspace provisioning failed: {ws}")
