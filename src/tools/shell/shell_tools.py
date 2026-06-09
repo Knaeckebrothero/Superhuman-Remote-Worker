@@ -25,6 +25,7 @@ from .coding_tools import _truncate_output
 from .shell_manager import SUDO_FREEZE_SENTINEL
 from ..context import ToolContext
 from ...services.cloud_mount.guardrails import (
+    command_touches_cloud_mount,
     detect_cloud_scan_risk,
     format_cloud_scan_guard_message,
 )
@@ -92,6 +93,32 @@ def _cloud_scan_guard_decision(
     return message, True
 
 
+def _cloud_cache_guard_decision(command: str, context: ToolContext) -> Optional[str]:
+    cloud_mount_cfg = context.get_config("cloud_mount", {})
+    if not isinstance(cloud_mount_cfg, dict) or not cloud_mount_cfg.get("active"):
+        return None
+    if not command_touches_cloud_mount(command):
+        return None
+    manager = cloud_mount_cfg.get("_manager")
+    if manager is None or not hasattr(manager, "cache_limit_message"):
+        return None
+    try:
+        return manager.cache_limit_message()
+    except Exception as exc:
+        logger.warning("Cloud cache guard check failed: %s", exc)
+        return None
+
+
+def _cloud_mount_manager(context: ToolContext) -> Any | None:
+    cloud_mount_cfg = context.get_config("cloud_mount", {})
+    if not isinstance(cloud_mount_cfg, dict) or not cloud_mount_cfg.get("active"):
+        return None
+    manager = cloud_mount_cfg.get("_manager")
+    if manager is None or not hasattr(manager, "status"):
+        return None
+    return manager
+
+
 # Tmux special key names that should NOT get Enter appended in keys mode
 TMUX_SPECIAL_KEYS = frozenset(
     {
@@ -151,6 +178,14 @@ SHELL_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "description": "Read scrollback output from a persistent terminal tab",
         "category": "shell",
         "short_description": "Read output from a terminal tab.",
+        "phases": ["strategic", "tactical"],
+    },
+    "srw_cloud_status": {
+        "module": "shell.shell_tools",
+        "function": "srw_cloud_status",
+        "description": "Show rclone cloud mount status, cache usage, and rclone RC stats",
+        "category": "shell",
+        "short_description": "Show cloud mount/cache status.",
         "phases": ["strategic", "tactical"],
     },
 }
@@ -256,6 +291,19 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
     )
 
     @tool
+    def srw_cloud_status() -> str:
+        """Show rclone cloud mount status and cache usage.
+
+        Use this before broad cloud work or when a cloud command is blocked by
+        the cache guard. The output includes mount paths, current VFS cache
+        usage, hard cache limits, and rclone RC status when available.
+        """
+        manager = _cloud_mount_manager(context)
+        if manager is None:
+            return "No active rclone cloud mount for this session."
+        return manager.status()
+
+    @tool
     def run_command(
         command: str,
         timeout: Optional[int] = None,
@@ -313,6 +361,10 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
         """
         try:
             sm.ensure_tab("default")
+
+            cache_guard_msg = _cloud_cache_guard_decision(command, context)
+            if cache_guard_msg:
+                return cache_guard_msg
 
             guard_msg, guard_blocks = _cloud_scan_guard_decision(command, context)
             if guard_msg and guard_blocks:
@@ -446,6 +498,10 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
                 return f"{tab_header}\n{text}"
 
             elif is_async:
+                cache_guard_msg = _cloud_cache_guard_decision(command, context)
+                if cache_guard_msg:
+                    return f"{tab_header}\n{cache_guard_msg}"
+
                 guard_msg, guard_blocks = _cloud_scan_guard_decision(command, context)
                 if guard_msg and guard_blocks:
                     return f"{tab_header}\n{guard_msg}"
@@ -464,6 +520,10 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
                 return f"{tab_header}\n{text}"
 
             else:
+                cache_guard_msg = _cloud_cache_guard_decision(command, context)
+                if cache_guard_msg:
+                    return f"{tab_header}\n{cache_guard_msg}"
+
                 guard_msg, guard_blocks = _cloud_scan_guard_decision(command, context)
                 if guard_msg and guard_blocks:
                     return f"{tab_header}\n{guard_msg}"
@@ -531,7 +591,7 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
             return f"{tab_header}\nError: {e}"
 
     if mode == "persistent":
-        return [shell_execute, shell_read]
+        return [shell_execute, shell_read, srw_cloud_status]
     else:
         # Stateless mode (default)
-        return [run_command, shell_read]
+        return [run_command, shell_read, srw_cloud_status]

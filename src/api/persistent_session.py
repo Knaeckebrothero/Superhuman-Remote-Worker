@@ -419,6 +419,7 @@ class PersistentSession:
                 "root": "/cloud",
                 "workspace_entry": "/workspace/cloud",
                 "scan_guard": self.config.extra.get("cloud_scan_guard", "block"),
+                "_manager": self.cloud_mount_manager,
             },
         }
         # Initialize session task manager
@@ -473,6 +474,10 @@ class PersistentSession:
         for name in _ORCHESTRATOR_TOOLS:
             if name not in tool_names:
                 tool_names.append(name)
+
+        if self.cloud_mount_manager and self.cloud_mount_manager.active:
+            if "srw_cloud_status" not in tool_names:
+                tool_names.append("srw_cloud_status")
 
         try:
             self.tools = load_tools(tool_names, self.tool_context)

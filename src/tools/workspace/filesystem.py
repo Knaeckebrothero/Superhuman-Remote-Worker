@@ -13,6 +13,10 @@ from typing import Any, Dict, List
 from langchain_core.tools import tool
 
 from ..context import ToolContext
+from ...services.cloud_mount.guardrails import (
+    format_workspace_cloud_search_guard_message,
+    workspace_search_touches_cloud,
+)
 from src.utils.pdf import PDFReader, format_document_info
 
 logger = logging.getLogger(__name__)
@@ -335,6 +339,14 @@ def create_filesystem_tools(context: ToolContext) -> List[Any]:
             Search results with file paths, line numbers, and matching lines
         """
         try:
+            cloud_mount_cfg = context.get_config("cloud_mount", {})
+            if (
+                isinstance(cloud_mount_cfg, dict)
+                and cloud_mount_cfg.get("active")
+                and workspace_search_touches_cloud(path)
+            ):
+                return format_workspace_cloud_search_guard_message(path)
+
             results = workspace.search_files(
                 query, path=path, case_sensitive=case_sensitive
             )

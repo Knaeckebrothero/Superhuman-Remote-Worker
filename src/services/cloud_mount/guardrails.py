@@ -15,6 +15,7 @@ from typing import Iterable
 
 _CLOUD_ROOTS = ("/cloud", "/workspace/cloud")
 _SHELL_OPERATORS = {"|", "||", "&&", ";", "&"}
+_WORKSPACE_CLOUD_ROOT = "cloud"
 
 
 @dataclass(frozen=True)
@@ -75,6 +76,33 @@ def detect_cloud_scan_risk(command: str) -> CloudScanRisk | None:
     return None
 
 
+def command_touches_cloud_mount(command: str) -> bool:
+    """Return True when an argv-parsable command names a cloud mount path."""
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return _mentions_cloud_path(command)
+    return _argv_touches_cloud(argv)
+
+
+def workspace_search_touches_cloud(path: str) -> bool:
+    """Return True when a workspace search path would include cloud mounts."""
+    normalized = _normalize_workspace_path(path)
+    return (
+        normalized == ""
+        or normalized == _WORKSPACE_CLOUD_ROOT
+        or normalized.startswith(f"{_WORKSPACE_CLOUD_ROOT}/")
+    )
+
+
+def workspace_path_touches_cloud(path: str) -> bool:
+    """Return True when a specific workspace path points into cloud mounts."""
+    normalized = _normalize_workspace_path(path)
+    return normalized == _WORKSPACE_CLOUD_ROOT or normalized.startswith(
+        f"{_WORKSPACE_CLOUD_ROOT}/"
+    )
+
+
 def format_cloud_scan_guard_message(command: str, risk: CloudScanRisk) -> str:
     return (
         "Cloud scan guard: this command was not run because it looks like a "
@@ -83,6 +111,17 @@ def format_cloud_scan_guard_message(command: str, risk: CloudScanRisk) -> str:
         f"Command: {command}\n\n"
         "Use a narrower file or directory under /workspace/cloud, run a metadata-only "
         "query first, or ask the operator before scanning a large cloud tree."
+    )
+
+
+def format_workspace_cloud_search_guard_message(path: str) -> str:
+    shown = path or "/"
+    return (
+        "Cloud scan guard: search_files was not run because the requested "
+        f"workspace path ({shown}) includes rclone-mounted cloud storage.\n\n"
+        "Use a narrower non-cloud workspace path, inspect a specific cloud "
+        "directory with list_files first, or use the cloud search/index path "
+        "when it is available."
     )
 
 
@@ -134,3 +173,24 @@ def _looks_like_complex_cloud_pipeline(argv: list[str]) -> bool:
         return False
     risky_commands = {"grep", "rg", "ag", "python", "python3", "node", "perl", "ruby"}
     return any(PurePosixPath(token).name in risky_commands for token in argv)
+
+
+def _normalize_workspace_path(path: str) -> str:
+    text = str(path or "").strip()
+    if text in {".", "/"}:
+        return ""
+    if text.startswith("/workspace/"):
+        text = text[len("/workspace/") :]
+    elif text == "/workspace":
+        text = ""
+    text = text.strip("/")
+    parts = []
+    for part in text.split("/"):
+        if part in {"", "."}:
+            continue
+        if part == "..":
+            if parts:
+                parts.pop()
+            continue
+        parts.append(part)
+    return "/".join(parts)
