@@ -16,9 +16,6 @@ docker/vpn/config
 docker/vpn/cluster.conf
 docker/vpn/research.conf
 
-# Keycloak realm config is now tracked — all secrets are ${env.VAR}
-# references resolved from .env at import time, not hardcoded in the JSON.
-
 # MCP configuration files
 .mcp.json
 .playwright-mcp/*
@@ -193,6 +190,8 @@ docs/_build/
 CLAUDE.md
 .claude
 .junie
+.codex
+.agents
 
 # Miscellaneous
 /.angular

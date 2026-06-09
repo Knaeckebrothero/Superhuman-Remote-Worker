@@ -141,9 +141,11 @@ from services.gitea import GiteaClient  # noqa: E402
 from services.keycloak_admin import KeycloakGroupSync  # noqa: E402
 from services.cloud import (  # noqa: E402
     CloudBackendError,
+    CloudMountSubject,
     MainCloudRouter,
     ProjectFolderHandle,
     SessionFolderHandle,
+    SupportsRcloneMount,
     UserId,
     build_backend,
 )
@@ -10878,6 +10880,10 @@ def _slugify_mount_name(name: str) -> str:
     return out or "project"
 
 
+def _cloud_workspace_driver() -> str:
+    return os.getenv("CLOUD_WORKSPACE_DRIVER", "sync").strip().lower() or "sync"
+
+
 def _should_skip_session_folder(mounts: list[dict[str, Any]]) -> bool:
     """Phase 4 (cloud_collaboration_model.md §9): is the legacy per-session
     cloud folder redundant for this thread?
@@ -10894,6 +10900,13 @@ def _should_skip_session_folder(mounts: list[dict[str, Any]]) -> bool:
     cloud surfaces — important for unattached sessions and for transient
     backend failures during mount resolution.
     """
+    if _cloud_workspace_driver() == "rclone_mount":
+        # The rclone driver falls back to mounting the regular session folder
+        # when a user-home/project mount cannot be represented safely. Keep that
+        # fallback provisioned instead of treating a WebDAV URL as proof that
+        # the runtime can mount the surface.
+        return False
+
     for m in mounts:
         if m.get("webdav_url"):
             return True
@@ -11163,7 +11176,21 @@ async def agent_get_thread_workspace(
     # Phase 1: project attachment + cloud mounts now live on thread_mounts.
     project_ids = await _thread_project_ids(thread_id)
     mount_rows = await postgres_db.list_thread_mounts(thread_id)
-    cloud_sync_cfg = _build_agent_cloud_sync(thread, mount_rows=mount_rows)
+    cloud_mount_cfg = await _build_agent_cloud_mount(
+        thread,
+        mount_rows=mount_rows,
+        metadata=metadata,
+    )
+    if cloud_mount_cfg:
+        cloud_sync_cfg = None
+    elif _cloud_workspace_driver() == "rclone_mount":
+        # rclone requested but unavailable/unsupported: fall back to the
+        # regular session folder only. Do not eagerly clone thread_mounts such
+        # as a default user home; that is the startup failure this driver is
+        # meant to avoid.
+        cloud_sync_cfg = _build_agent_cloud_sync(thread, mount_rows=[])
+    else:
+        cloud_sync_cfg = _build_agent_cloud_sync(thread, mount_rows=mount_rows)
     # Issue 13 follow-up: if the main cloud is up but this thread resolved NO
     # sync target (session-folder provisioning failed upstream, or user-home /
     # project-mount resolution produced nothing usable), the agent would
@@ -11175,7 +11202,10 @@ async def agent_get_thread_workspace(
     except Exception:
         _cloud_up = False
     cloud_sync_degraded = bool(
-        _cloud_up and not cloud_sync_cfg and not thread.get("nc_session_folder")
+        _cloud_up
+        and not cloud_mount_cfg
+        and not cloud_sync_cfg
+        and not thread.get("nc_session_folder")
     )
     return {
         "status": ws.get("status", "none"),
@@ -11205,6 +11235,9 @@ async def agent_get_thread_workspace(
         # Structured cloud-sync config (backend + webdav URL + auth).
         # Agent consumes this via ``src.services.cloud_sync.build_workspace_sync``.
         "cloud_sync": cloud_sync_cfg,
+        # Structured lazy cloud mount config. Mutually exclusive with
+        # cloud_sync for the same thread response.
+        "cloud_mount": cloud_mount_cfg,
         # True when cloud is up but no sync target resolved (Issue 13 follow-up).
         "cloud_sync_degraded": cloud_sync_degraded,
     }
@@ -12328,6 +12361,181 @@ def _build_agent_cloud_sync(
     return {
         "version": 2,
         "session_folder": session_folder_cfg,
+        "mounts": mounts_out,
+    }
+
+
+def _runtime_supports_rclone_mount(metadata: dict[str, Any]) -> bool:
+    """Whether this thread's current workspace runtime may receive cloud_mount."""
+    if _cloud_workspace_driver() != "rclone_mount":
+        return False
+    vm_ctx = metadata.get("vm") or {}
+    if vm_ctx.get("status") == "ready" and vm_ctx.get("ssh_host"):
+        return True
+    if os.getenv("CLOUD_RCLONE_ALLOW_CONTAINER", "").lower() in {"1", "true", "yes"}:
+        ws_ctx = metadata.get("workspace_container") or {}
+        return ws_ctx.get("status") == "ready" and bool(
+            ws_ctx.get("pod_ip") or ws_ctx.get("host")
+        )
+    return False
+
+
+def _cloud_mount_name(row: dict[str, Any], used: set[str]) -> str:
+    if row.get("mount_kind") == "project_default":
+        base = "home"
+    else:
+        target = str(row.get("target_path") or "").strip("/")
+        base = target.rsplit("/", 1)[-1] if target else "cloud"
+        base = _slugify_mount_name(base)
+    name = base
+    suffix = 2
+    while name in used:
+        name = f"{base}-{suffix}"
+        suffix += 1
+    used.add(name)
+    return name
+
+
+async def _build_rclone_mount_from_row(
+    row: dict[str, Any],
+    *,
+    workspace_name: str,
+) -> Optional[dict[str, Any]]:
+    backend_id = row.get("backend_id")
+    handle_str = row.get("cloud_handle")
+    if not backend_id or not handle_str:
+        return None
+    backend = main_cloud_router.for_backend(backend_id)
+    if not backend.is_initialized or not isinstance(backend, SupportsRcloneMount):
+        return None
+    try:
+        handle = ProjectFolderHandle.from_db(handle_str, backend=backend.backend_id)
+        subject = CloudMountSubject(
+            user_sub=row.get("target_user_sub"),
+            username=handle.vendor_meta.get("username"),
+        )
+        target_path = f"/cloud/{workspace_name}"
+        spec = await backend.build_rclone_mount_spec(
+            handle=handle,
+            mount_kind=str(row.get("mount_kind") or "project"),
+            target_path=target_path,
+            access="read_write",
+            subject=subject,
+        )
+    except CloudBackendError as e:
+        logger.info(
+            "Thread mount %s cannot use rclone (%s); considering fallback.",
+            row.get("id") or row.get("source_ref") or row.get("mount_kind"),
+            e.kind.value,
+        )
+        return None
+    except Exception as e:
+        logger.warning(
+            "Thread mount %s: failed to build rclone spec: %s",
+            row.get("id") or row.get("source_ref") or row.get("mount_kind"),
+            e,
+        )
+        return None
+
+    return {
+        "mount_id": str(row.get("id") or row.get("source_ref") or workspace_name),
+        "mount_kind": row.get("mount_kind"),
+        "backend": backend.backend_id,
+        "target_path": target_path,
+        "workspace_name": workspace_name,
+        "access": "read_write",
+        "source_ref": str(row.get("source_ref")) if row.get("source_ref") else None,
+        **spec.to_payload(),
+    }
+
+
+async def _build_rclone_session_mount(
+    thread: dict[str, Any],
+) -> Optional[dict[str, Any]]:
+    handle_str = thread.get("main_cloud_session_handle") or thread.get(
+        "nc_session_folder"
+    )
+    if not handle_str:
+        return None
+    backend_id = thread.get("main_cloud_backend") or None
+    backend = main_cloud_router.for_backend(backend_id)
+    if not backend.is_initialized or not isinstance(backend, SupportsRcloneMount):
+        return None
+    try:
+        handle = SessionFolderHandle.from_db(handle_str, backend=backend.backend_id)
+        spec = await backend.build_rclone_mount_spec(
+            handle=handle,
+            mount_kind="session_folder",
+            target_path="/cloud/home",
+            access="read_write",
+            subject=None,
+        )
+    except Exception as e:
+        logger.warning(
+            "Thread %s: failed to build rclone session-folder fallback: %s",
+            thread.get("id"),
+            e,
+        )
+        return None
+    return {
+        "mount_id": "legacy-session",
+        "mount_kind": "session_folder",
+        "backend": backend.backend_id,
+        "target_path": "/cloud/home",
+        "workspace_name": "home",
+        "access": "read_write",
+        **spec.to_payload(),
+    }
+
+
+async def _build_agent_cloud_mount(
+    thread: dict[str, Any],
+    *,
+    mount_rows: list[dict[str, Any]] | None,
+    metadata: dict[str, Any],
+) -> Optional[dict[str, Any]]:
+    """Build the rclone ``cloud_mount`` payload for capable runtimes.
+
+    v1 is all-or-fallback: if every requested thread_mount can be represented
+    safely, mount those. If any requested mount is unsupported, mount the
+    regular session folder instead when it exists. This prevents a default
+    user-home row from falling back to the eager clone path.
+    """
+    if not _runtime_supports_rclone_mount(metadata):
+        return None
+
+    rows = [
+        row
+        for row in (mount_rows or [])
+        if row.get("backend_id") and row.get("cloud_handle")
+    ]
+    used_names: set[str] = set()
+    mounted_rows: list[dict[str, Any]] = []
+    for row in rows:
+        workspace_name = _cloud_mount_name(row, used_names)
+        mounted = await _build_rclone_mount_from_row(row, workspace_name=workspace_name)
+        if mounted is None:
+            mounted_rows = []
+            break
+        mounted_rows.append(mounted)
+
+    fallback = False
+    mounts_out = mounted_rows
+    if not mounts_out or len(mounts_out) != len(rows):
+        session_mount = await _build_rclone_session_mount(thread)
+        if session_mount:
+            mounts_out = [session_mount]
+            fallback = bool(rows)
+
+    if not mounts_out:
+        return None
+
+    return {
+        "version": 1,
+        "driver": "rclone",
+        "cloud_root": "/cloud",
+        "workspace_entry": "cloud",
+        "fallback": fallback,
         "mounts": mounts_out,
     }
 

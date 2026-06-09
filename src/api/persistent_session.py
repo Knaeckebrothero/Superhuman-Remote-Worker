@@ -104,6 +104,9 @@ class PersistentSession:
 
     # Nextcloud workspace sync (initialized if session has nc_session_folder)
     workspace_sync: Optional[Any] = None
+    # Lazy rclone cloud mounts (initialized from cloud_mount payload)
+    cloud_mount_manager: Optional[Any] = None
+    cloud_mount_error: Optional[str] = None
 
     # Datasource connections keyed by type (for ToolContext)
     datasources: Dict[str, Any] = field(default_factory=dict)
@@ -128,6 +131,7 @@ class PersistentSession:
         vector_conn: Optional[Any] = None,
         workspace_override: Optional[Dict[str, Any]] = None,
         git_remote_url: Optional[str] = None,
+        cloud_mount_cfg: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Initialize session resources.
 
@@ -156,14 +160,18 @@ class PersistentSession:
             workspace_override=workspace_override, git_remote_url=git_remote_url
         )
 
-        # 2. Set up shell manager BEFORE tools so shell tools can detect it
+        # 2. Set up lazy cloud mounts before shell/tools so `/workspace/cloud`
+        #    exists when the agent starts using the workspace.
+        await self._setup_cloud_mount(cloud_mount_cfg)
+
+        # 3. Set up shell manager BEFORE tools so shell tools can detect it
         self._setup_shell_manager()
 
-        # 3. Initialize knowledge base connections BEFORE tools so knowledge
+        # 4. Initialize knowledge base connections BEFORE tools so knowledge
         #    tools can detect them via ToolContext.has_knowledge()
         self._setup_knowledge(vector_conn)
 
-        # 3b. Resolve the owning user from the thread row so tools can forward
+        # 4b. Resolve the owning user from the thread row so tools can forward
         #     X-MCP-User-Id on orchestrator calls (fixes the agent's read-job
         #     401 against require_approved_user / require_job_access endpoints).
         if postgres_conn is not None and self.user_id is None:
@@ -180,16 +188,16 @@ class PersistentSession:
                     e,
                 )
 
-        # 4. Create tool context and load tools
+        # 5. Create tool context and load tools
         self._setup_tools(postgres_conn)
 
-        # 5. Bind tools to LLM
+        # 6. Bind tools to LLM
         self._bind_tools()
 
-        # 6. Create context manager
+        # 7. Create context manager
         self._setup_context_manager()
 
-        # 7. Build system prompt (interactive mode has its own prompt files)
+        # 8. Build system prompt (interactive mode has its own prompt files)
         self.system_prompt = get_phase_system_prompt(
             self.config,
             is_strategic=False,
@@ -198,7 +206,7 @@ class PersistentSession:
             prompt_type="interactive",
         )
 
-        # 8. Set up memory (RecallStore) if enabled
+        # 9. Set up memory (RecallStore) if enabled
         self._setup_memory(postgres_conn, vector_conn)
 
         logger.info(
@@ -303,6 +311,33 @@ class PersistentSession:
             f"Workspace created at {self.workspace_manager.path} (backend=remote)"
         )
 
+    async def _setup_cloud_mount(
+        self, cloud_mount_cfg: Optional[Dict[str, Any]]
+    ) -> None:
+        """Start rclone-backed cloud mounts for this session, if configured."""
+        if not cloud_mount_cfg:
+            return
+        if not self.workspace_manager:
+            return
+        try:
+            from src.services.cloud_mount import RcloneMountManager
+
+            self.cloud_mount_manager = RcloneMountManager(
+                thread_id=self.thread_id,
+                cloud_cfg=cloud_mount_cfg,
+                workspace_backend=self.workspace_manager.backend,
+                workspace_root=self.workspace_manager.path,
+            )
+            await self.cloud_mount_manager.start_all()
+            logger.info(
+                "Cloud mount manager started with %d mount(s)",
+                len(self.cloud_mount_manager.mounts),
+            )
+        except Exception as e:
+            self.cloud_mount_error = str(e)
+            self.cloud_mount_manager = None
+            logger.warning("Failed to start cloud mount manager: %s", e)
+
     def _deploy_instruction_files(self) -> None:
         """Deploy instruction files from config to workspace.
 
@@ -377,6 +412,14 @@ class PersistentSession:
             **self.config.extra,
             "agent_id": self.config.agent_id,
             "multimodal": self.config.llm.multimodal,
+            "cloud_mount": {
+                "active": bool(
+                    self.cloud_mount_manager and self.cloud_mount_manager.active
+                ),
+                "root": "/cloud",
+                "workspace_entry": "/workspace/cloud",
+                "scan_guard": self.config.extra.get("cloud_scan_guard", "block"),
+            },
         }
         # Initialize session task manager
         from ..managers.session_tasks import SessionTaskManager
@@ -661,6 +704,13 @@ class PersistentSession:
 
     async def cleanup(self) -> None:
         """Clean up session resources."""
+        if self.cloud_mount_manager:
+            try:
+                await self.cloud_mount_manager.aclose()
+            except Exception as e:
+                logger.warning(f"Cloud mount cleanup error: {e}")
+            self.cloud_mount_manager = None
+
         if self.shell_manager:
             try:
                 self.shell_manager.cleanup()

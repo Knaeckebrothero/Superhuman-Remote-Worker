@@ -27,6 +27,8 @@ Uses two Nextcloud APIs:
 from __future__ import annotations
 
 import logging
+import os
+import re
 import time
 from typing import Any, Optional
 from urllib.parse import quote
@@ -34,7 +36,7 @@ from urllib.parse import quote
 import httpx
 
 from ._propfind import parse_propfind_entries
-from .base import HealthStatus, UserHome
+from .base import CloudMountSubject, HealthStatus, RcloneMountSpec, UserHome
 from .config import NextcloudSettings
 from .errors import CloudBackendError, CloudBackendErrorKind
 from .handles import (
@@ -111,6 +113,104 @@ class NextcloudBackend:
     def webdav_credentials(self) -> dict[str, str]:
         """Agent credentials for WebDAV access to Nextcloud folders."""
         return {"username": self._agent_user, "password": self._agent_password}
+
+    def _explicit_user_home_credentials(
+        self, handle: ProjectFolderHandle, subject: CloudMountSubject | None
+    ) -> dict[str, str] | None:
+        """Resolve explicit user-granted credentials for a user-home mount.
+
+        v1 intentionally does not pair ``/remote.php/dav/files/{user}/`` with
+        the agent-service password. For homelab/single-user deployments we
+        support an explicit app-password-style env pair:
+
+        * ``NEXTCLOUD_RCLONE_USER_HOME_USERNAME``
+        * ``NEXTCLOUD_RCLONE_USER_HOME_PASSWORD``
+
+        A username-specific password env is also accepted for multi-user test
+        deployments: ``NEXTCLOUD_RCLONE_USER_HOME_PASSWORD_<SANITIZED_USER>``.
+        """
+        username = (
+            handle.vendor_meta.get("username")
+            or (subject.username if subject else None)
+            or ""
+        )
+        username = str(username).strip()
+        if not username:
+            return None
+
+        configured_user = os.getenv("NEXTCLOUD_RCLONE_USER_HOME_USERNAME")
+        configured_password = os.getenv("NEXTCLOUD_RCLONE_USER_HOME_PASSWORD")
+        if configured_user and configured_password and configured_user == username:
+            return {"username": configured_user, "password": configured_password}
+
+        env_suffix = re.sub(r"[^A-Z0-9]+", "_", username.upper()).strip("_")
+        if env_suffix:
+            user_password = os.getenv(
+                f"NEXTCLOUD_RCLONE_USER_HOME_PASSWORD_{env_suffix}"
+            )
+            if user_password:
+                return {"username": username, "password": user_password}
+        return None
+
+    async def build_rclone_mount_spec(
+        self,
+        *,
+        handle: ProjectFolderHandle | SessionFolderHandle,
+        mount_kind: str,
+        target_path: str,
+        access: str,
+        subject: CloudMountSubject | None = None,
+    ) -> RcloneMountSpec:
+        """Build an rclone WebDAV spec for a Nextcloud-backed cloud surface."""
+        if isinstance(handle, SessionFolderHandle):
+            webdav_url = self.get_session_folder_webdav_url(handle)
+            creds = self.webdav_credentials
+        else:
+            if handle.vendor_meta.get("kind") == "user_home":
+                username = str(handle.vendor_meta.get("username") or "")
+                webdav_url = (
+                    f"{self._base_url}/remote.php/dav/files/{quote(username, safe='')}/"
+                    if username
+                    else None
+                )
+                creds = self._explicit_user_home_credentials(handle, subject) or {}
+            else:
+                webdav_url = self.get_project_folder_webdav_url(handle)
+                creds = self.webdav_credentials
+
+        if not webdav_url:
+            raise CloudBackendError(
+                CloudBackendErrorKind.INVALID_REQUEST,
+                f"cannot build rclone mount for {mount_kind}: missing WebDAV URL",
+                backend=self.backend_id,
+            )
+        if not creds.get("username") or not creds.get("password"):
+            raise CloudBackendError(
+                CloudBackendErrorKind.NOT_SUPPORTED,
+                f"cannot build rclone mount for {mount_kind}: missing safe WebDAV credentials",
+                backend=self.backend_id,
+            )
+
+        return RcloneMountSpec(
+            source_type="webdav",
+            source_config={
+                "url": webdav_url,
+                "vendor": "nextcloud",
+                "user": creds["username"],
+            },
+            auth={"type": "basic", "password": creds["password"]},
+            cache={
+                "vfs_cache_mode": "full",
+                "vfs_cache_max_size": "10G",
+                "vfs_cache_max_age": "24h",
+                "vfs_cache_min_free_space": "5G",
+                "dir_cache_time": "5m",
+                "poll_interval": "1m",
+                "vfs_read_chunk_size": "16M",
+                "vfs_read_chunk_size_limit": "128M",
+                "hard_cache_limit": "20G",
+            },
+        )
 
     # ---------------------------------------------------------------- Lifecycle
 
