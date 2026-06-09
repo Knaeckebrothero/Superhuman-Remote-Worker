@@ -21,6 +21,7 @@ from src.services.image_content import (
     IMAGE_DATA_TAG_TEMPLATE,
     PAGE_IMAGE_TAG_TEMPLATE,
 )
+from src.services.cloud_mount.guardrails import workspace_path_touches_cloud
 from src.utils.pdf import PDFReader, format_read_info
 from ..context import ToolContext
 
@@ -72,6 +73,22 @@ FILE_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "phases": ["strategic", "tactical"],
     },
 }
+
+
+def _cloud_cache_guard_for_path(context: ToolContext, path: str) -> Optional[str]:
+    cloud_mount_cfg = context.get_config("cloud_mount", {})
+    if not isinstance(cloud_mount_cfg, dict) or not cloud_mount_cfg.get("active"):
+        return None
+    if not workspace_path_touches_cloud(path):
+        return None
+    manager = cloud_mount_cfg.get("_manager")
+    if manager is None or not hasattr(manager, "cache_limit_message"):
+        return None
+    try:
+        return manager.cache_limit_message()
+    except Exception as exc:
+        logger.warning("Cloud cache guard check failed: %s", exc)
+        return None
 
 
 def _get_mime_type(file_path: Path) -> str:
@@ -653,6 +670,10 @@ def create_file_tools(context: ToolContext) -> List[Any]:
             For audio: includes text transcription of spoken content.
         """
         try:
+            cache_guard_msg = _cloud_cache_guard_for_path(context, path)
+            if cache_guard_msg:
+                return cache_guard_msg
+
             # Check file exists
             if not workspace.exists(path):
                 return f"Error: File not found: {path}"
@@ -838,6 +859,10 @@ def create_file_tools(context: ToolContext) -> List[Any]:
                 f"Use git tools to commit and push your results for delivery."
             )
 
+        cache_guard_msg = _cloud_cache_guard_for_path(context, path)
+        if cache_guard_msg:
+            return cache_guard_msg
+
         # Enforce word limit
         max_write_words = context.get_config("max_write_words", 10_000)
         word_count = len(content.split())
@@ -914,6 +939,10 @@ def create_file_tools(context: ToolContext) -> List[Any]:
             Confirmation message or error with guidance
         """
         try:
+            cache_guard_msg = _cloud_cache_guard_for_path(context, path)
+            if cache_guard_msg:
+                return cache_guard_msg
+
             if not workspace.exists(path):
                 return f"Error: File not found: {path}"
 
