@@ -410,6 +410,18 @@ spec:
                   name: {{ include "srw.secretName" . }}
                   key: NEXTCLOUD_AGENT_PASSWORD
                   optional: true
+            - name: NEXTCLOUD_RCLONE_USER_HOME_USERNAME
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: NEXTCLOUD_RCLONE_USER_HOME_USERNAME
+                  optional: true
+            - name: NEXTCLOUD_RCLONE_USER_HOME_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: NEXTCLOUD_RCLONE_USER_HOME_PASSWORD
+                  optional: true
             {{- end }}
             # Default WebDAV datasource (optional)
             - name: DEFAULT_DS_WEBDAV_URL
@@ -449,6 +461,11 @@ spec:
                   name: {{ include "srw.configMapName" . }}
                   key: MAIN_CLOUD_BACKEND
                   optional: true
+            - name: CLOUD_WORKSPACE_DRIVER
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: CLOUD_WORKSPACE_DRIVER
             {{- if or .Values.opencloud.enabled (eq (default "" .Values.cloud.externalBackend) "opencloud") }}
             # OpenCloud — bundled (opencloud.enabled=true) or external
             # (cloud.externalBackend=opencloud). Skipped entirely otherwise so

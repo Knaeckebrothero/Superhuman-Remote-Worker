@@ -275,6 +275,23 @@ def test_should_skip_session_folder_with_project_default_mount():
     assert _should_skip_session_folder(rows) is True
 
 
+def test_rclone_driver_keeps_session_folder_fallback(monkeypatch):
+    """With the lazy mount driver enabled, keep the regular session folder
+    provisioned so unsupported user-home auth has a safe fallback.
+    """
+    from main import _should_skip_session_folder
+
+    monkeypatch.setenv("CLOUD_WORKSPACE_DRIVER", "rclone_mount")
+    rows = [
+        {
+            "mount_kind": "project_default",
+            "target_path": "",
+            "webdav_url": "https://nc.test/remote.php/dav/files/alice/",
+        }
+    ]
+    assert _should_skip_session_folder(rows) is False
+
+
 def test_should_skip_session_folder_with_non_default_project_mount():
     """Phase 4: a regular ``project`` mount (non-default, under
     ``projects/<name>/``) also counts as a user-visible cloud surface
@@ -363,6 +380,128 @@ def test_should_skip_session_folder_returns_true_on_first_usable_mount():
         },
     ]
     assert _should_skip_session_folder(rows) is True
+
+
+@pytest.mark.asyncio
+async def test_build_agent_cloud_mount_falls_back_to_session_folder(monkeypatch):
+    """If a default user-home row lacks safe rclone credentials, the rclone
+    payload uses the regular session folder instead of the eager home clone.
+    """
+    from main import _build_agent_cloud_mount
+    from services.cloud import (
+        CloudBackendError,
+        CloudBackendErrorKind,
+        RcloneMountSpec,
+    )
+
+    class Backend:
+        backend_id = "nextcloud"
+        is_initialized = True
+
+        async def build_rclone_mount_spec(self, *, mount_kind, **kwargs):
+            if mount_kind != "session_folder":
+                raise CloudBackendError(
+                    CloudBackendErrorKind.NOT_SUPPORTED,
+                    "missing explicit user-home credentials",
+                    backend=self.backend_id,
+                )
+            return RcloneMountSpec(
+                source_type="webdav",
+                source_config={
+                    "url": "https://nc.test/remote.php/dav/files/agent/session/",
+                    "vendor": "nextcloud",
+                    "user": "agent-service",
+                },
+                auth={"type": "basic", "password": "agent-pass"},
+            )
+
+    monkeypatch.setenv("CLOUD_WORKSPACE_DRIVER", "rclone_mount")
+    router = MagicMock()
+    router.for_backend.return_value = Backend()
+    thread = {
+        "id": "thread-1",
+        "main_cloud_backend": "nextcloud",
+        "main_cloud_session_handle": "sessions/thread-1",
+    }
+    rows = [
+        {
+            "id": "mount-home",
+            "mount_kind": "project_default",
+            "target_path": "",
+            "source_ref": "p-default",
+            "backend_id": "nextcloud",
+            "cloud_handle": (
+                '{"backend":"nextcloud","native_id":"home:alice",'
+                '"vendor_meta":{"kind":"user_home","username":"alice"}}'
+            ),
+        }
+    ]
+
+    with patch("main.main_cloud_router", router):
+        payload = await _build_agent_cloud_mount(
+            thread,
+            mount_rows=rows,
+            metadata={"vm": {"status": "ready", "ssh_host": "10.0.0.5"}},
+        )
+
+    assert payload is not None
+    assert payload["driver"] == "rclone"
+    assert payload["fallback"] is True
+    assert len(payload["mounts"]) == 1
+    mount = payload["mounts"][0]
+    assert mount["mount_kind"] == "session_folder"
+    assert mount["target_path"] == "/cloud/home"
+    assert mount["workspace_name"] == "home"
+
+
+@pytest.mark.asyncio
+async def test_build_agent_cloud_mount_uses_supported_thread_mount(monkeypatch):
+    from main import _build_agent_cloud_mount
+    from services.cloud import RcloneMountSpec
+
+    class Backend:
+        backend_id = "nextcloud"
+        is_initialized = True
+
+        async def build_rclone_mount_spec(self, *, mount_kind, target_path, **kwargs):
+            return RcloneMountSpec(
+                source_type="webdav",
+                source_config={
+                    "url": "https://nc.test/remote.php/dav/files/alice/",
+                    "vendor": "nextcloud",
+                    "user": "alice",
+                },
+                auth={"type": "basic", "password": "app-pass"},
+            )
+
+    monkeypatch.setenv("CLOUD_WORKSPACE_DRIVER", "rclone_mount")
+    router = MagicMock()
+    router.for_backend.return_value = Backend()
+    rows = [
+        {
+            "id": "mount-home",
+            "mount_kind": "project_default",
+            "target_path": "",
+            "source_ref": "p-default",
+            "backend_id": "nextcloud",
+            "cloud_handle": (
+                '{"backend":"nextcloud","native_id":"home:alice",'
+                '"vendor_meta":{"kind":"user_home","username":"alice"}}'
+            ),
+        }
+    ]
+
+    with patch("main.main_cloud_router", router):
+        payload = await _build_agent_cloud_mount(
+            {"id": "thread-1"},
+            mount_rows=rows,
+            metadata={"vm": {"status": "ready", "ssh_host": "10.0.0.5"}},
+        )
+
+    assert payload is not None
+    assert payload["fallback"] is False
+    assert payload["mounts"][0]["mount_kind"] == "project_default"
+    assert payload["mounts"][0]["target_path"] == "/cloud/home"
 
 
 # ---------------------------------------------------------------------------

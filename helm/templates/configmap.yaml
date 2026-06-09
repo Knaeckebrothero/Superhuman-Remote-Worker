@@ -173,6 +173,14 @@ data:
   DEFAULT_DS_WEBDAV_READ_ONLY: {{ "false" | quote }}
   {{- end }}
 
+  # Main-cloud workspace data plane. "sync" preserves the legacy eager clone
+  # path; "rclone_mount" asks supported agent runtimes to expose cloud folders
+  # through lazy rclone/FUSE mounts instead.
+  CLOUD_WORKSPACE_DRIVER: {{ .Values.cloud.workspaceDriver | default "sync" | quote }}
+  {{- if .Values.cloud.nextcloudRcloneUserHomeUsername }}
+  NEXTCLOUD_RCLONE_USER_HOME_USERNAME: {{ .Values.cloud.nextcloudRcloneUserHomeUsername | quote }}
+  {{- end }}
+
   # Cloud backend — opencloud (bundled), nextcloud (bundled), external, or unset
   {{- if .Values.opencloud.enabled }}
   MAIN_CLOUD_BACKEND: {{ "opencloud" | quote }}

@@ -15,7 +15,14 @@ import asyncio
 import logging
 from typing import Any, Optional
 
-from .base import HealthStatus, MainCloudBackend, UserHome
+from .base import (
+    CloudMountSubject,
+    HealthStatus,
+    MainCloudBackend,
+    RcloneMountSpec,
+    SupportsRcloneMount,
+    UserHome,
+)
 from .config import (
     MainCloudConfig,
     MS365Settings,

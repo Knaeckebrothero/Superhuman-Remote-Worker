@@ -121,6 +121,8 @@ sudo eatmydata apt-get install -y \
     libsqlite3-dev \
     ripgrep \
     fd-find \
+    rclone \
+    fuse3 \
     poppler-utils \
     pandoc \
     python3 \

@@ -753,6 +753,12 @@ cloud:
   externalUrl: ""
   # -- Internal URL the agent calls server-to-server. Defaults to externalUrl when empty.
   externalServiceUrl: ""
+  # -- Main-cloud workspace data plane: "sync" (legacy eager clone) or
+  # "rclone_mount" (lazy rclone/FUSE mounts on supported VM runtimes).
+  workspaceDriver: "sync"
+  # -- Optional explicit Nextcloud username for rclone user-home mounts.
+  # Pair with Secret key NEXTCLOUD_RCLONE_USER_HOME_PASSWORD.
+  nextcloudRcloneUserHomeUsername: ""
 
 # =============================================================================
 # Workspace
