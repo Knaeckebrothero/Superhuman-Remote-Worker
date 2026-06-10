@@ -313,6 +313,7 @@ async def run_persistent_loop(
     tool_context: Optional[Any] = None,
     initial_turn_count: int = 0,
     get_current_tools: Optional[Callable[[], tuple]] = None,
+    memory_extraction_prompt: str = "",
 ) -> None:
     """Run the persistent interactive agent loop.
 
@@ -336,20 +337,20 @@ async def run_persistent_loop(
         get_current_tools: Optional callback returning (llm_with_tools, tools) —
             called at the start of each turn to pick up tool set changes
             (e.g. plan mode toggle).
+        memory_extraction_prompt: Matrix-resolved prompt for the background
+            memory-extraction task, threaded from session setup (MemoryConfig
+            carries no prompt attribute — docs/issues/memory_bugs.md B1).
     """
     # Build tool lookup map
     tool_map: Dict[str, Any] = {tool.name: tool for tool in tools}
     turn_count = initial_turn_count
     llm_timeout = getattr(config.llm, "timeout", 600) or 600
 
-    # Memory extraction config
+    # Memory extraction cadence. Deliberately a direct attribute read: a
+    # getattr fallback here is what let the phantom `extraction_interval`
+    # key hide for months (docs/issues/memory_bugs.md B1c).
     memory_config = getattr(config, "memory", None)
-    extraction_interval = (
-        getattr(memory_config, "extraction_interval", 5) if memory_config else 5
-    )
-    extraction_prompt = (
-        getattr(memory_config, "extraction_prompt", "") if memory_config else ""
-    )
+    extraction_interval = memory_config.observer_interval if memory_config else 5
     _last_extraction_turn = 0
 
     # Send system prompt as first message if not already present
@@ -432,7 +433,7 @@ async def run_persistent_loop(
                         auxiliary_llm=auxiliary_llm,
                         recall_store=recall_store,
                         messages=messages,
-                        memory_extraction_prompt=extraction_prompt,
+                        memory_extraction_prompt=memory_extraction_prompt,
                         source_turn_start=turn_count - extraction_interval,
                         source_turn_end=turn_count,
                     )
