@@ -146,6 +146,65 @@ class TestLoopExtractionWiring:
         extraction = await self._run_loop(turns=3, observer_interval=0, prompt="unused")
         extraction.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_real_extraction_pipeline_receives_threaded_prompt(self):
+        """End-to-end in-process: the REAL extract_and_store_memories runs and
+        the threaded prompt reaches the aux-LLM chain task; a memory write
+        lands in the recall store."""
+        from types import SimpleNamespace
+
+        count = 0
+
+        async def _input():
+            nonlocal count
+            count += 1
+            if count <= 1:
+                return "turn 1"
+            raise asyncio.CancelledError
+
+        memory = SimpleNamespace(
+            content="user prefers tabs",
+            summary="tabs",
+            keywords=["tabs"],
+            importance=0.6,
+            type="factual",
+            retrieval_messages=None,
+        )
+        aux = MagicMock()
+        aux.chain = AsyncMock(return_value=SimpleNamespace(memories=[memory]))
+        recall = MagicMock()
+        recall.store = AsyncMock(return_value="mem-id-1")
+
+        await run_persistent_loop(
+            llm_with_tools=_make_streaming_llm(),
+            tools=[],
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
+            config=_loop_config(observer_interval=1),
+            system_prompt="sys",
+            callbacks=_make_callbacks(get_user_input=_input),
+            messages=[],
+            recall_store=recall,
+            auxiliary_llm=aux,
+            memory_extraction_prompt="REAL PIPELINE PROMPT",
+        )
+        # Drain the fire-and-forget extraction task
+        pending = [
+            t
+            for t in asyncio.all_tasks()
+            if t is not asyncio.current_task() and not t.done()
+        ]
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+        aux.chain.assert_awaited_once()
+        task = aux.chain.call_args.args[0]
+        assert task.system_prompt == "REAL PIPELINE PROMPT"
+        recall.store.assert_awaited_once()
+        assert recall.store.call_args.kwargs["source"] == "observer"
+        assert recall.store.call_args.kwargs["content"] == "user prefers tabs"
+
 
 class TestTeardownExtraction:
     """B1 (a): session-end and idle-archive extraction actually runs.
