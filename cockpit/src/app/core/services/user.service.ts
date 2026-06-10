@@ -33,7 +33,7 @@ export class UserService {
   /** Always true — bootstrap completes before app render via APP_INITIALIZER. */
   readonly sessionReady = signal(true);
 
-  /** Whether the user's account has been approved by an admin (has 'user' role in Keycloak). */
+  /** Whether the user's account has been approved by an admin (app-side admission — the `users.is_approved` flag). */
   readonly isApproved = computed(() => this.currentUser()?.is_approved ?? false);
 
   /** Convenience: current user's ID (used by job-create, job-list, builder). */

@@ -5846,7 +5846,8 @@ class PostgresDB:
             rows = await conn.fetch(
                 """
                 SELECT id, display_name, avatar_color, email, default_project_id,
-                       is_admin, can_use_vm, created_at
+                       is_admin, can_use_vm, is_approved, approved_at, approved_by,
+                       created_at
                 FROM users
                 ORDER BY created_at ASC
                 LIMIT $1
@@ -5874,7 +5875,8 @@ class PostgresDB:
             row = await conn.fetchrow(
                 """
                 SELECT id, display_name, avatar_color, email, default_project_id,
-                       is_admin, can_use_vm, keycloak_sub, created_at
+                       is_admin, can_use_vm, is_approved, preferred_username,
+                       keycloak_sub, created_at
                 FROM users
                 WHERE id = $1
                 """,
@@ -5896,7 +5898,8 @@ class PostgresDB:
             row = await conn.fetchrow(
                 """
                 SELECT id, display_name, avatar_color, email, default_project_id,
-                       is_admin, can_use_vm, keycloak_sub, created_at
+                       is_admin, can_use_vm, is_approved, preferred_username,
+                       keycloak_sub, created_at
                 FROM users
                 WHERE keycloak_sub = $1
                 """,
@@ -5911,6 +5914,8 @@ class PostgresDB:
         email: str,
         display_name: str,
         is_admin: bool = False,
+        is_approved: bool = False,
+        preferred_username: str | None = None,
     ) -> Dict[str, Any]:
         """Create or update a user from OIDC claims (JIT provisioning).
 
@@ -5925,6 +5930,10 @@ class PostgresDB:
             email: Email from OIDC claims
             display_name: Display name from OIDC claims
             is_admin: Whether the user has the admin realm role
+            is_approved: Effective approval at JIT time (role_approved). Never
+                downgrades an existing row — merged with OR.
+            preferred_username: Keycloak preferred_username, persisted so
+                approval-time provisioning can rebuild the ensure-user payload.
 
         Returns:
             Full user dict
@@ -5942,22 +5951,35 @@ class PostgresDB:
                     email,
                 )
                 if existing:
-                    await conn.execute(
-                        "UPDATE users SET keycloak_sub = $1, is_admin = $2 WHERE id = $3",
+                    updated = await conn.fetchrow(
+                        """
+                        UPDATE users
+                        SET keycloak_sub = $1,
+                            is_admin = $2,
+                            is_approved = (is_approved OR $3),
+                            preferred_username = COALESCE($4, preferred_username)
+                        WHERE id = $5
+                        RETURNING is_approved, preferred_username
+                        """,
                         sub,
                         is_admin,
+                        is_approved,
+                        preferred_username,
                         existing["id"],
                     )
                     result = dict(existing)
                     result["keycloak_sub"] = sub
                     result["is_admin"] = is_admin
+                    result["is_approved"] = updated["is_approved"]
+                    result["preferred_username"] = updated["preferred_username"]
                     return result
 
             # Check if keycloak_sub already linked (concurrent request)
             existing_sub = await conn.fetchrow(
                 """
                 SELECT id, display_name, avatar_color, email, default_project_id,
-                       is_admin, can_use_vm, keycloak_sub, created_at
+                       is_admin, can_use_vm, is_approved, preferred_username,
+                       keycloak_sub, created_at
                 FROM users WHERE keycloak_sub = $1
                 """,
                 sub,
@@ -5976,10 +5998,14 @@ class PostgresDB:
                     ),
                     new_user AS (
                         INSERT INTO users (display_name, avatar_color, email, is_admin,
+                                          is_approved, approved_at, preferred_username,
                                           keycloak_sub, default_project_id)
-                        VALUES ($1, '#89b4fa', $2, $3, $4, (SELECT id FROM new_project))
+                        VALUES ($1, '#89b4fa', $2, $3, $4,
+                                CASE WHEN $4 THEN NOW() ELSE NULL END, $5, $6,
+                                (SELECT id FROM new_project))
                         RETURNING id, display_name, avatar_color, email, default_project_id,
-                                  is_admin, can_use_vm, keycloak_sub, created_at
+                                  is_admin, can_use_vm, is_approved, preferred_username,
+                                  keycloak_sub, created_at
                     ),
                     membership AS (
                         INSERT INTO project_members (project_id, user_id, role)
@@ -5991,6 +6017,8 @@ class PostgresDB:
                     display_name,
                     email,
                     is_admin,
+                    is_approved,
+                    preferred_username,
                     sub,
                 )
                 return dict(row)
@@ -6001,7 +6029,8 @@ class PostgresDB:
                     retry = await conn.fetchrow(
                         """
                         SELECT id, display_name, avatar_color, email, default_project_id,
-                               is_admin, can_use_vm, keycloak_sub, created_at
+                               is_admin, can_use_vm, is_approved, preferred_username,
+                               keycloak_sub, created_at
                         FROM users WHERE keycloak_sub = $1 OR LOWER(email) = LOWER($2)
                         LIMIT 1
                         """,
@@ -6134,6 +6163,9 @@ class PostgresDB:
         email: str | None = None,
         is_admin: bool | None = None,
         can_use_vm: bool | None = None,
+        is_approved: bool | None = None,
+        approved_at: datetime | None = None,
+        approved_by: str | None = None,
     ) -> bool:
         """Update a user.
 
@@ -6144,6 +6176,10 @@ class PostgresDB:
             email: New email address
             is_admin: New admin flag (admin-only callers)
             can_use_vm: New per-user VM grant (admin-only callers)
+            is_approved: New admission flag (admin-only callers)
+            approved_at: Approval timestamp to stamp (pair with is_approved=True;
+                omit on suspension so the original approval time survives)
+            approved_by: Admin UUID who approved (pair with is_approved=True)
 
         Returns:
             True if updated, False if not found
@@ -6182,6 +6218,23 @@ class PostgresDB:
             updates.append(f"can_use_vm = ${param_count}")
             values.append(bool(can_use_vm))
 
+        if is_approved is not None:
+            param_count += 1
+            updates.append(f"is_approved = ${param_count}")
+            values.append(bool(is_approved))
+
+        if approved_at is not None:
+            param_count += 1
+            updates.append(f"approved_at = ${param_count}")
+            values.append(approved_at)
+
+        if approved_by is not None:
+            param_count += 1
+            updates.append(f"approved_by = ${param_count}")
+            values.append(
+                UUID(approved_by) if isinstance(approved_by, str) else approved_by
+            )
+
         if not updates:
             return False
 
@@ -6194,6 +6247,51 @@ class PostgresDB:
             result = await conn.execute(query, *values)
 
         return result == "UPDATE 1"
+
+    async def approve_users(
+        self, user_ids: list[str], approved_by: str | None = None
+    ) -> list[str]:
+        """Bulk-approve users in a single transaction (admin-only callers).
+
+        Stamps ``is_approved=TRUE, approved_at=NOW(), approved_by=<admin>`` for
+        every id that resolves to an existing row, and returns the subset of
+        ids that matched. The caller maps any requested id missing from the
+        result to "not found". Idempotent — re-approving just re-stamps.
+
+        Args:
+            user_ids: User UUIDs to approve.
+            approved_by: Admin UUID performing the approval (NULL = system).
+
+        Returns:
+            List of matched user-id strings.
+        """
+        uuids: list[UUID] = []
+        for uid in user_ids:
+            try:
+                uuids.append(UUID(uid))
+            except (ValueError, TypeError, AttributeError):
+                continue
+        if not uuids:
+            return []
+        approver: UUID | None = None
+        if approved_by:
+            try:
+                approver = UUID(approved_by)
+            except (ValueError, TypeError, AttributeError):
+                approver = None
+
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                UPDATE users
+                SET is_approved = TRUE, approved_at = NOW(), approved_by = $2
+                WHERE id = ANY($1::uuid[])
+                RETURNING id
+                """,
+                uuids,
+                approver,
+            )
+        return [str(row["id"]) for row in rows]
 
     async def delete_user(self, user_id: str) -> bool:
         """Delete a user.
@@ -6307,6 +6405,12 @@ class PostgresDB:
                 "SELECT * FROM users WHERE is_admin = TRUE LIMIT 1"
             )
             return dict(row) if row else None
+
+    async def list_admin_user_ids(self) -> list[str]:
+        """Return ids of all admin users (fan-out target for notifications)."""
+        async with self.acquire() as conn:
+            rows = await conn.fetch("SELECT id FROM users WHERE is_admin = TRUE")
+        return [str(row["id"]) for row in rows]
 
     # =========================================================================
     # PROJECT OPERATIONS

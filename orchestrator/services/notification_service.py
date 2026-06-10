@@ -287,6 +287,84 @@ class NotificationService:
 
         return results
 
+    async def notify_admins_user_registered(
+        self,
+        new_user_id: str,
+        display_name: str | None = None,
+        email: str | None = None,
+    ) -> dict[str, Any]:
+        """Notify all admins that a new user registered and awaits approval.
+
+        Fan-out to every admin (app-side admission — an admin decides who gets
+        in). SSE is sent unconditionally (the in-app feed isn't subject to quiet
+        hours); email is sent per each admin's channel preference and skipped
+        during that admin's quiet hours, since a registration is not
+        safety-critical. Best-effort; failures are logged, never raised.
+
+        Mirrors :py:meth:`notify_automation_auto_disabled` (direct SSE +
+        ``send_system_notification``), not the job-shaped :py:meth:`dispatch`.
+        """
+        if not self._available or not self._db:
+            return {"error": "NotificationService not initialized"}
+
+        try:
+            admin_ids = await self._db.list_admin_user_ids()
+        except Exception as e:
+            logger.warning("Could not list admins for registration notify: %s", e)
+            return {"error": "admin lookup failed"}
+
+        label = display_name or email or "A new user"
+        suffix = f" ({email})" if email else ""
+        subject = f"New user pending approval: {label}"
+        body_md = (
+            f"**{label}**{suffix} just registered and is awaiting approval.\n\n"
+            "Review and approve pending users on the Users page in the cockpit."
+        )
+
+        results: dict[str, Any] = {"notified": 0}
+        for admin_id in admin_ids:
+            if admin_id == str(new_user_id):
+                continue  # a self-registered admin isn't pending anyway
+
+            # SSE — always (the in-app feed isn't quiet-houred).
+            if self._notification_feed:
+                try:
+                    self._notification_feed.broadcast(
+                        user_id=admin_id,
+                        event_type="user_registered",
+                        data={
+                            "user_id": str(new_user_id),
+                            "display_name": display_name,
+                            "email": email,
+                            "cockpit_url": f"{self._cockpit_url}/admin/users",
+                        },
+                    )
+                    results["notified"] += 1
+                except Exception as e:
+                    logger.warning("SSE broadcast failed for user_registered: %s", e)
+
+            # Email — per preference, skipped during the admin's quiet hours.
+            if not self._email_service:
+                continue
+            try:
+                channels = await self._get_user_channels(admin_id)
+                settings = await self._get_user_settings(admin_id)
+                if not channels.get("email", True) or self._is_in_quiet_hours(settings):
+                    continue
+                admin = await self._db.get_user(admin_id)
+                if admin and admin.get("email"):
+                    await self._email_service.send_system_notification(
+                        to=admin["email"],
+                        to_name=admin.get("display_name") or "Admin",
+                        subject=subject,
+                        body_md=body_md,
+                        cockpit_path="/admin/users",
+                    )
+            except Exception as e:
+                logger.warning("Registration email to admin %s failed: %s", admin_id, e)
+
+        return results
+
     async def dispatch_digest(
         self,
         user_id: str,
