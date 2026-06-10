@@ -825,7 +825,14 @@ class TestMcpAuthFallback:
         from security.auth import get_current_user
 
         user_id = str(uuid4())
-        user_record = {"id": user_id, "display_name": "MCP User", "email": "u@t.com"}
+        # Approval now flows from the user row (app-side admission); the MCP
+        # header path no longer force-sets is_approved, so the row must carry it.
+        user_record = {
+            "id": user_id,
+            "display_name": "MCP User",
+            "email": "u@t.com",
+            "is_approved": True,
+        }
 
         mock_request = _mock_request_with_headers(
             {
