@@ -1923,6 +1923,12 @@
     }
   },
   "toasts": {
+    "admin": {
+      "userRegistered": "New user pending approval: {{name}}"
+    },
+    "automations": {
+      "autoDisabled": "Automation '{{name}}' was auto-paused"
+    },
     "jobs": {
       "created": "Job created",
       "deleted": "Job deleted",
