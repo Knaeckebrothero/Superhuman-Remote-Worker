@@ -18,6 +18,23 @@ status: reference / ground-truth
 state" half of *ground-truth → optimal → roadmap*. The target design and the
 migration plan live in [[agent_memory_overhaul]].
 
+> **Post-audit deltas (step 0, merged to develop 2026-06-10 — #111/#112).** The
+> snapshot below predates these; adjust when reading:
+> - **B1 fixed**: persistent extraction now loads the real matrix prompt at session
+>   setup, honors `observer_interval`, and the session-end/idle-archive paths work
+>   for the first time (§3 observer row, §5 item 1, §7 observer row are stale).
+> - **B2 verified on live DBs**: zero HNSW indexes on dev AND prod, pgvector 0.8.2 —
+>   §5 item 3's "likely" is now "confirmed"; dense search IS a seq scan everywhere.
+> - **§6 catalog partially executed**: `MemoryObserver`, `memory_migrator.py`,
+>   `search_dense`/`search_sparse`/`get_recent`, `Neo4jDB._load_query`, and
+>   `tests/test_memory_observer.py`/`test_memory_migrator.py` are deleted. Still
+>   present: the `MemoryManager`/workspace-template family (tracked in
+>   `remove_workspace_md_vestiges.md`), `phase_archive`/`tool_error` enum values,
+>   `agent_id` column.
+> - **B9 dead knobs deleted** from `MemoryConfig` + both YAMLs (§1 config-knob row
+>   stale); **B3 honesty fix**: `persistent_defaults.yaml` no longer claims
+>   `assemble_memories` runs.
+
 Classification legend:
 
 - ✅ **WIRED** — present *and* called on the live runtime path

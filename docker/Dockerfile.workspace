@@ -13,6 +13,14 @@ FROM ubuntu:24.04
 ARG DEBIAN_FRONTEND=noninteractive
 ARG CODE_SERVER_VERSION=4.100.3
 ARG NODE_MAJOR=22
+# Pinned upstream rclone (Ubuntu's packaged 1.60.1-DEV predates the webdav
+# `infinitescale` vendor needed for OpenCloud mounts and lacks modern VFS
+# cache flags — see docs/features/rclone_cloud_mount.md §12). Keep version
+# and checksum in sync with docker/agent-vm-base/scripts/provision-stage1.sh.
+# SRW_ prefix is load-bearing: rclone parses RCLONE_* env vars as flags, so
+# an ARG named RCLONE_VERSION crashes `rclone version` inside the RUN.
+ARG SRW_RCLONE_VERSION=1.74.3
+ARG SRW_RCLONE_SHA256=408cde598307dedc26b7108553cb2147a8d2d12853100447e802f47454582ecc
 
 # ---------------------------------------------------------------------------
 # 0. Apt tuning: prefer Azure mirror (faster from GHA Azure runners) but keep
@@ -62,7 +70,6 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     zip \
     unzip \
     zstd \
-    rclone \
     fuse3 \
     # NOTE: sudo intentionally excluded — agent-host must not escalate to root
     ca-certificates \
@@ -117,6 +124,18 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         mongodb-mongosh \
         openjdk-17-jre-headless \
         cypher-shell
+
+# ---------------------------------------------------------------------------
+# 1c. rclone — pinned upstream release with checksum verification (not apt:
+#     Noble ships 1.60.1-DEV, too old for OpenCloud's webdav vendor). The deb
+#     replaces any distro rclone and lands in /usr/bin/rclone.
+# ---------------------------------------------------------------------------
+RUN curl -fsSL "https://downloads.rclone.org/v${SRW_RCLONE_VERSION}/rclone-v${SRW_RCLONE_VERSION}-linux-amd64.deb" \
+        -o /tmp/rclone.deb \
+    && echo "${SRW_RCLONE_SHA256}  /tmp/rclone.deb" | sha256sum -c - \
+    && dpkg -i /tmp/rclone.deb \
+    && rm /tmp/rclone.deb \
+    && rclone version
 
 # ---------------------------------------------------------------------------
 # 2. Node.js 22 + global packages

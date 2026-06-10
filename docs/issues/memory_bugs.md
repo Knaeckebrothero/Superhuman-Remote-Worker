@@ -15,15 +15,15 @@ Severity overview:
 
 | # | Bug | Severity | Effort | Status |
 |---|---|---|---|---|
-| B1 | Persistent memory extraction broken 3 ways (phantom config attrs) | **HIGH** | ~1 h | open |
-| B2 | 4096-dim HNSW indexes silently skipped → seq-scan retrieval | **HIGH** (verify first) | 0.5–1 d | open |
-| B3 | Assembler enabled-but-never-called in persistent sessions | MED-HIGH | 5 min (honesty) / ~1 d (wire) | open |
+| B1 | Persistent memory extraction broken 3 ways (phantom config attrs) | **HIGH** | ~1 h | **✅ fixed 2026-06-10** (PR #111, on develop) — live test pending |
+| B2 | 4096-dim HNSW indexes silently skipped → seq-scan retrieval | **HIGH** | 0.5–1 d | **verified 2026-06-10: confirmed on dev AND prod** — fix open |
+| B3 | Assembler enabled-but-never-called in persistent sessions | MED-HIGH | 5 min (honesty) / ~1 d (wire) | **honesty fix ✅ 2026-06-10** (PR #112) — wire-vs-retire deferred to overhaul Phase 5 |
 | B4 | No embedding-dimension guard → silent total memory outage | MED | ~2 h | open |
 | B5 | KB injection block has no token budget | MED | ~0.5 d | open |
 | B6 | Memory table is grow-only — nothing ever deletes rows | MED (slow burn) | policy + ~0.5 d | open |
 | B7 | KB dual-write drift, fail-open (note in Neo4j, invisible to retrieval) | MED-LOW | ~0.5 d | open |
 | B8 | Neo4j-down kills pgvector-only KB injection too | LOW-MED | small | open |
-| B9 | Dead/misleading config keys (tuning no-ops) | LOW (hygiene) | ~1 h | open |
+| B9 | Dead/misleading config keys (tuning no-ops) | LOW (hygiene) | ~1 h | **✅ keys deleted 2026-06-10** (PR #112) — enum nits still open |
 | B10 | Injection-strip prefix registry is silently fragile | LOW (latent) | test guard | open |
 
 ---
@@ -88,6 +88,30 @@ YAML knob is dead on the persistent path.
 **Why it matters:** persistent sessions are the primary interactive surface;
 all three heads degrade or kill extraction exactly there.
 
+**Status — FIXED 2026-06-10** (PR #111, merge `b9108b73` on develop):
+- New `resolve_memory_extraction_prompt()` in `src/api/persistent_session.py`
+  loads the prompt once at session setup via the prompt matrix (aux →
+  summarization → main model precedence, mirroring `graph.py`), stored on
+  `PersistentSession.memory_extraction_prompt`, and **re-resolved on runtime
+  `config.update`** (a model swap can change the prompt-matrix family).
+- Threaded as an explicit `memory_extraction_prompt` parameter into
+  `run_persistent_loop` and used at both `persistent_app.py` teardown sites.
+- The loop reads `memory_config.observer_interval` as a **direct attribute
+  access** — a future phantom attribute now fails loudly at loop start.
+- 10 regression tests in `tests/test_persistent_memory_extraction.py` pin the
+  wiring against the **real** `MemoryConfig` dataclass (MagicMock fabricating
+  phantom attrs is what let all three heads hide), incl. an in-process run of
+  the real `extract_and_store_memories` asserting the prompt reaches the
+  aux-LLM task.
+
+**Remaining: live verification on a real session** — all three signals have
+never been observable before, so confirm on k3d/dev:
+1. in-loop: `Memory extraction triggered at turn N` at the configured
+   `observer_interval`, and new `source='observer'` rows in `memories`;
+2. `/done` teardown: `Final memory extraction complete` (INFO — has never
+   logged once in production history);
+3. idle archive: `Idle archive: memory extraction complete`.
+
 ---
 
 ## B2 — All 4096-dim HNSW indexes are silently skipped (verify, then fix)
@@ -140,6 +164,21 @@ tuning (research Brief 03: measure first).
 Ships as a new migration under `migrations/vector/` (`.notx.sql` if using
 `CREATE INDEX CONCURRENTLY`) — never edit `vector_schema.sql`.
 
+**Step-1 verification result (2026-06-10) — CONFIRMED, worst case:**
+
+| DB | HNSW indexes on the 4 tables | pgvector |
+|---|---|---|
+| dev (`superhuman-remote-worker/srw-pgvector-0`) | **0 rows** | 0.8.2 |
+| prod (`srw-prod-private/srw-prod-pgvector-0`) | **0 rows** | 0.8.2 |
+
+Every dense retrieval — memories, trigger phrases, KB notes, sources — is a
+sequential scan on both clusters. pgvector 0.8.2 ≥ 0.7, so **fix option 1
+(halfvec expression index) is viable** and is the chosen direction: new
+`migrations/vector/` migration adding
+`USING hnsw ((embedding::halfvec(4096)) halfvec_cosine_ops)` per table +
+the matching `::halfvec(4096)` cast in the SQL search functions' ORDER BY.
+Fix not yet implemented.
+
 ---
 
 ## B3 — Assembler is enabled-but-never-called in persistent sessions
@@ -170,6 +209,11 @@ actively lies about it.
 overhaul (Phase 3/5 may replace or delete the assembler entirely — the
 research found consolidation efficacy unproven, so don't invest in wiring a
 component we may ablate away).
+
+**Status — honesty fix shipped 2026-06-10** (PR #112):
+`persistent_defaults.yaml` now sets `assemble_memories.enabled: false` with a
+comment pointing here. Wire-vs-retire stays an overhaul Phase-5 (ablation)
+decision.
 
 ---
 
@@ -287,6 +331,15 @@ Also truth-in-schema nits: `valid_memory_source` enum values
 **Fix:** delete the dead keys (or wire them), one comment per removal; drop
 or implement the dead enum values next time the constraint is touched.
 
+**Status — keys deleted 2026-06-10** (PR #112): all seven removed from the
+`MemoryConfig` dataclass, `_parse_memory_config`, and both defaults YAMLs
+(NOTE comment in `defaults.yaml` points at the real knobs:
+`auxiliary.model` and the `EMBEDDING_*` env vars). `_parse_memory_config`
+reads keys explicitly, so stray copies in stored `resolved_config` JSONB are
+ignored harmlessly. Still open: the `phase_archive`/`tool_error` enum nits
+(need a vector migration — fold into the next migration that touches the
+constraint).
+
 ---
 
 ## B10 — Injection-strip prefix registry is silently fragile
@@ -307,22 +360,28 @@ fails loudly when someone adds a fourth injection type.
 
 ## Cleanup (not bugs) — tracked elsewhere
 
-~1,600 lines of confirmed-dead code (`MemoryObserver`, `MemoryManager`,
-`memory_migrator.py`, `Neo4jDB._load_query` + phantom `queries/neo4j/` dir,
-dead `search_*` helpers, orphaned `tests/test_memory_observer.py`) are
-cataloged in `docs/features/agent_memory_current_state.md` §6. The
-`MemoryManager`/workspace-template family is already tracked in
-`docs/issues/remove_workspace_md_vestiges.md`; fold the rest into that sweep
-rather than duplicating here.
+**✅ Swept 2026-06-10** (PR #112, ~2,300 lines): `MemoryObserver`,
+`memory_migrator.py`, `Neo4jDB._load_query` + `QUERIES_DIR`, the dead
+`search_*`/`get_recent` helpers, `tests/test_memory_observer.py`,
+`tests/test_memory_migrator.py`, and the migrator/dead-helper test sections
+in `test_knowledge_phase3.py`/`test_recall_store.py` — each re-verified
+zero-callers by grep before deletion. Deliberately left: the
+`MemoryManager`/workspace-template family (tracked in
+`docs/issues/remove_workspace_md_vestiges.md` — NB its `MemoryManager` name
+collides with the overhaul's new abstraction, so that removal should land
+before Phase 1) and the equally-dead `_load_query` twins in
+`src/database/postgres_db.py:250` / `orchestrator/database/postgres.py:443`
+(outside the audited catalog; remove opportunistically).
 
 ## Suggested order
 
-1. **B1** — highest value-per-hour in the repo right now; pure bug, no design
-   dependency. Unblocks trustworthy extraction on the primary path.
-2. **B2 step 1** (the two SQL queries) — 5 minutes against dev DB; determines
-   whether B2 is a real perf cliff or already fine.
-3. **B3 honesty fix + B9** — stop the config lying before any tuning work
-   begins (otherwise the overhaul's A/Bs will "tune" dead knobs).
-4. **B4** — cheap prevention for a failure class that has already bitten once.
+1. ~~**B1**~~ ✅ fixed 2026-06-10 — live verification on a real session still
+   pending (see B1 status above for the three signals to confirm).
+2. ~~**B2 step 1**~~ ✅ verified 2026-06-10 — it IS a real perf cliff on both
+   clusters; the halfvec migration (step 2) is now the open work item.
+3. ~~**B3 honesty fix + B9**~~ ✅ shipped 2026-06-10.
+4. **B4** — cheap prevention for a failure class that has already bitten
+   once. ← next open item.
 5. B5/B6/B7/B8/B10 — batch opportunistically or alongside overhaul phases
-   that touch the same files.
+   that touch the same files. B2 step 2 (halfvec migration) slots naturally
+   before Phase 3's `ef_search` tuning.
