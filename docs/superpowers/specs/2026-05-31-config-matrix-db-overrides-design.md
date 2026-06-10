@@ -1,7 +1,7 @@
 # DB-Backed Config Matrix Overrides — Design
 
-**Status:** v1 designed, not yet implemented.
-**Date:** 2026-05-31
+**Status:** ✅ Implemented + k3d-verified (Phases A–D, 2026-06-01). The Cockpit UI then grew **beyond** the minimal v1 scope across three follow-on rounds — grouped picker + exposed instructions/interactive prompt (2026-06-03), typed settings form (2026-06-06), and a layout + single-field editor with copy/upload (2026-06-07). See §9 "As-built" and the plan's "Current state".
+**Date:** 2026-05-31 (design); last updated 2026-06-07 (as-built)
 **Builds on:** [`docs/features/prompt_editing_page.md`](../../features/prompt_editing_page.md) and [`docs/superpowers/plans/2026-05-26-prompt-overrides-v1.md`](../plans/2026-05-26-prompt-overrides-v1.md) (the shipped prompt-overrides feature this generalizes).
 
 > **TL;DR** — The prompt-overrides feature already lets admins override prompt/instruction *content* in Postgres, with the bundled file as an immutable floor. This extends the same "thin DB delta on a baked-file floor" model to the **rest of the model-config matrix** — `settings` (LLM inference params + `limits`) and `guardrails` — so every config value an operator might tune lives in the DB, not in the image. The motivation is **horizontal scalability / HA**: N stateless orchestrator replicas converge on edited config from shared Postgres with no redeploy and no writable volume. We do **not** move the whole matrix into the DB and we do **not** add a per-expert dimension (separate future feature).
@@ -200,6 +200,15 @@ Extend the existing admin page (`cockpit/src/app/views/admin/prompts/` + `admin-
 
 UI depth is intentionally minimal for v1, matching the prompt editor's altitude; richer UX is deferrable.
 
+**As-built (updated 2026-06-07 — shipped past the "minimal v1" intent above).** The page settled into three stacked, family-scoped cards plus an explanatory diagram. **No backend/resolution code changed** — the resolver already handled every kind; the only non-Cockpit edits were catalog *data* (`config/prompts/catalog.yaml` gained `group:` fields + the instruction/interactive entries):
+
+- **"How prompts are used" diagram** (`agent-loop-diagram.component.ts`) — contrasts the worker loop (alternating `strategic`/`tactical` prompts) with the persistent loop (one `systemprompt_interactive` per turn), and where instruction files inject, so an operator knows *which* key drives *which* path before editing.
+- **Model family** card at the top — one selector that scopes both the settings form and the prompt/instruction overrides below (`Global` = `NULL` family).
+- **Inference settings** card — the `settings` kind was **pulled out of the key selector** into a dedicated typed form (number inputs + a toggle for `parallel_tool_calls`, each with a `default: …` hint, per-field reset, and an "override" badge). **Diff-aware Save**: each leaf is compared to its bundled default → changed = upsert, set-back-to-default = delete, unchanged = no-op, keeping the DB delta thin.
+- **Prompt & instruction overrides** card — the catalog-driven picker (now grouped via a `group:` field into *all-agents / worker / persistent / instructions / guardrails* `<optgroup>`s) is **integrated into the editor card** and **default-selects the first key**, so the editor is never a blank gap below the picker. The planned two-column *bundled \| override* pair collapsed into **one editable field** seeded with the effective value (override if present, else bundled); the shipped default moved to a collapsible read-only panel. Added a codeblock-style **copy** button and **drag-and-drop / file-upload** (`.txt`/`.md`/…) into the field. Save is diff-aware (edit back to the default → deletes the override).
+
+Two kinds the plumbing always supported but the original catalog never listed were exposed here too: the persistent **`systemprompt_interactive`** prompt and all **instructions** (`instructions`, `strategic_todos_{initial,transition,resume}`, `todo_guide`). The structured **guardrails** kind still uses the JSON textarea, with the `value_json`-as-JSON-string decode fixed once at the service boundary (`coerceOverrideValue`).
+
 ---
 
 ## 10. Migration, flag & back-compat
@@ -228,4 +237,4 @@ UI depth is intentionally minimal for v1, matching the prompt editor's altitude;
 
 ## 13. Deferred / roadmap
 
-Per-expert overrides (own feature) · structural/whole-matrix-in-DB editing · reconcile-on-redeploy (`helm_managed_settings.md`) · live in-flight updates · richer Cockpit UX · edit-history audit log beyond `created_by`/`updated_by`.
+Per-expert overrides (own feature) · structural/whole-matrix-in-DB editing · reconcile-on-redeploy (`helm_managed_settings.md`) · live in-flight updates · edit-history audit log beyond `created_by`/`updated_by`. *(Richer Cockpit UX — once deferred here — was since built; see §9 "As-built".)*
