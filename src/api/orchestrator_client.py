@@ -15,6 +15,19 @@ from pydantic import BaseModel
 logger = logging.getLogger(__name__)
 
 
+class DuplicateThreadBinding(RuntimeError):
+    """Raised when a thread-bound registration loses the provisioning race.
+
+    The orchestrator returns HTTP 409 ("thread already bound to another live
+    agent") when a second agent pod tries to register for a thread that a
+    different live agent already owns. The losing pod must exit cleanly rather
+    than linger: it still carries the ``srw.io/thread-id`` label, so it stays in
+    the per-session Service's endpoints (which sets ``publishNotReadyAddresses``)
+    and black-holes ~half the cockpit's connection attempts until reaped. See
+    docs/done/persistent_thread_double_provisioning_race.md.
+    """
+
+
 class UploadedFileInfo(BaseModel):
     """Metadata for a single uploaded file."""
 
@@ -159,7 +172,11 @@ class OrchestratorClient:
             thread_id: Thread UUID for persistent mode
 
         Returns:
-            True if registration succeeded, False otherwise
+            True if registration succeeded, False on a transient/other failure.
+
+        Raises:
+            DuplicateThreadBinding: on a 409 for a thread-bound registration
+                (another live agent already owns the thread).
         """
         if not self._client:
             await self.connect()
@@ -183,28 +200,40 @@ class OrchestratorClient:
 
         try:
             response = await self._client.post(url, json=payload)
-
-            if response.status_code == 200:
-                data = response.json()
-                self.agent_id = data.get("agent_id")
-                self.heartbeat_interval = data.get("heartbeat_interval_seconds", 60)
-                logger.info(
-                    f"Registered with orchestrator as agent {self.agent_id}, "
-                    f"heartbeat interval: {self.heartbeat_interval}s"
-                )
-                return True
-            else:
-                logger.error(
-                    f"Failed to register with orchestrator: {response.status_code} - {response.text}"
-                )
-                return False
-
         except httpx.RequestError as e:
             logger.error(f"Failed to connect to orchestrator for registration: {e}")
             return False
         except Exception as e:
             logger.error(f"Unexpected error during registration: {e}")
             return False
+
+        if response.status_code == 200:
+            data = response.json()
+            self.agent_id = data.get("agent_id")
+            self.heartbeat_interval = data.get("heartbeat_interval_seconds", 60)
+            logger.info(
+                f"Registered with orchestrator as agent {self.agent_id}, "
+                f"heartbeat interval: {self.heartbeat_interval}s"
+            )
+            return True
+
+        # A thread-bound registration that loses the provisioning race gets a
+        # 409 ("thread already bound to another live agent"). Surface it as a
+        # typed signal so the dedicated-mode startup path can exit cleanly
+        # instead of lingering as an orphan that pollutes the per-session
+        # Service endpoints. Worker/pool/dual registrations carry no thread_id
+        # and never receive this 409.
+        if response.status_code == 409 and thread_id is not None:
+            logger.error(
+                f"Orchestrator refused thread-bound registration for thread "
+                f"{thread_id} (409): {response.text}"
+            )
+            raise DuplicateThreadBinding(response.text)
+
+        logger.error(
+            f"Failed to register with orchestrator: {response.status_code} - {response.text}"
+        )
+        return False
 
     async def create_thread(
         self,

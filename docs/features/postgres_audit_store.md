@@ -1,6 +1,31 @@
 # Replace MongoDB Audit Store with PostgreSQL
 
-## Status: Proposed (revised 2026-05-02 after codebase + web research pass)
+## Status: Proposed (revised 2026-05-02; references re-verified 2026-06-10)
+
+> **Revision note (2026-06-10)** — file/line references below were
+> re-verified against the current tree. Material drift since 2026-05-02:
+>
+> 1. **Migration framework now exists.** Schema changes ship as numbered
+>    files applied by `orchestrator/database/migrate.py`
+>    (checksum-tracked, advisory-locked; see `docs/db_migration.md`).
+>    The audit DDL becomes `migrations/audit/0001_initial.sql`, not an
+>    `init.py`-applied `audit_schema.sql` — see Design § Schema.
+> 2. **Compose is on the way out.** The Docker Compose stack is slated
+>    for removal (`docs/issues/deprecate_docker_compose_stack.md`; k3d
+>    is the dev target since 2026-05-28). All Compose work below is
+>    conditional on sequencing — roadmap gate G6.
+> 3. **`helm/templates/agent/deployment.yaml` no longer exists.** Agent
+>    pods are provisioned dynamically and inherit env via `envFrom`
+>    (ConfigMap + Secret) — the agent-side env rename drops out.
+> 4. **The 2026-05-12 Mongo cascade outage** post-dates the last
+>    revision and strengthens the isolation motivation — see Problem § 6.
+> 5. **Mongo indexes got fixed** as the incident response
+>    (`ensure_indexes()` asserts declarations at every startup) — the
+>    index inventory in § Indexing is updated accordingly.
+> 6. **Persistent sessions don't touch Mongo.** Interactive sessions
+>    persist conversation to Postgres (`thread_messages`) directly;
+>    the audit Mongo is batch-worker-only, shrinking this swap's blast
+>    radius.
 
 ## Problem
 
@@ -23,7 +48,10 @@ Specifically:
    DocumentDB Postgres extension in January 2025, which now backs FerretDB
    2.0 — the industry is actively neutralising MongoDB's wire-protocol
    moat. SSPL pressure on vendors and their distribution chains is no
-   longer theoretical.
+   longer theoretical. Commercial packaging is now an active workstream
+   — `docs/strategy/2026-06-09-release-package-and-licensing.md` cites
+   the SSPL FAQ directly, so "no Mongo in the shipped stack" has a
+   concrete consumer.
 2. **Issue C** in `docs/issues/deployment_separation_of_concerns.md`:
    the homelab MongoDB runs without authentication. Replacing it with
    Postgres makes the auth problem go away by default — Postgres ships
@@ -40,12 +68,30 @@ Specifically:
    In a unified store this is a single SQL join.
 5. **Footprint**. The MongoDB layer is **two** classes, not one:
    `src/database/mongo_db.py` (338 LoC, sync, write-side) **and**
-   `orchestrator/database/mongodb.py` (923 LoC, async motor, owns the
-   cockpit-facing read API), plus `src/core/archiver.py` (1131 LoC).
+   `orchestrator/database/mongodb.py` (1028 LoC, async motor, owns the
+   cockpit-facing read API), plus `src/core/archiver.py` (1167 LoC).
    A Postgres-native adapter consolidates this into one async surface
    reusing the existing `PostgresDB` connection pool, retry semantics,
    and metrics — but realistic adapter LoC is closer to ~1500 than the
    ~600 originally estimated.
+6. **The 2026-05-12 cascade outage** (post-dates the previous revision
+   of this doc). A single misconfigured job looped writes into
+   `agent_audit`; the per-job `count_documents` enrichment then
+   COLLSCANed a 117K-doc collection (six of seven declared indexes had
+   never been created on the live DB), MongoDB pegged its CPU limit,
+   its liveness probe starved, and the restart loop ended with the
+   orchestrator OOMKilled and the API down. Full chain in
+   `docs/issues/orchestrator_mongodb_cascading_failure_resilience.md`.
+   The index link has since been fixed (`MongoDB.ensure_indexes()`
+   asserts the declarations on every orchestrator startup —
+   `orchestrator/database/mongodb.py:228`), but the incident is the
+   strongest argument yet for what this design already chose: a
+   dedicated instance the orchestrator can lose without going down
+   itself, with indexes owned by checksum-tracked migrations instead
+   of a bootstrap step that can silently not run. (Backpressure /
+   circuit-breaking is a separate fix class tracked in that issue;
+   this swap moots only the Mongo-specific links — auth, probe shape,
+   index bootstrap.)
 
 The use case is genuinely a fit for Postgres + JSONB:
 - All writes are inserts. The current Mongo code uses a two-phase pattern
@@ -87,12 +133,20 @@ endpoints (full list, not just the two named in the original draft):
 
 Plus three indirect consumers that enrich job rows with `audit_count`
 via per-job `count_documents` calls (N+1):
-`/api/jobs` (`main.py:3261-3287`), `/api/jobs/{id}` (`main.py:3313-3317`),
-`/api/projects/{id}/jobs` (`main.py:14422-14427`). The Postgres swap is
+`/api/jobs` (`main.py:3933-3936`), `/api/jobs/{id}` (`main.py:3953-3954`),
+`/api/projects/{id}/jobs` (`main.py:18740-18742`). The Postgres swap is
 an opportunity to collapse these into a single `SELECT ... GROUP BY job_id`.
 
 All reads are by `job_id` ± time range / step_type / tool name — no
 schema-flexible queries that would justify a document store.
+
+**Writers are batch workers only** (confirmed 2026-06-10): the
+`LLMArchiver` is wired into the worker graph (`src/graph.py`), while
+persistent sessions persist their conversation to Postgres directly
+(`thread_messages`, message-granular since migration
+`0023_thread_messages_seq.sql`) and `src/persistent_graph.py` never
+touches the archiver. Interactive-session traffic is therefore
+unaffected by this migration end to end.
 
 ### Out of scope (stays on Mongo, or is independent)
 
@@ -104,7 +158,7 @@ schema-flexible queries that would justify a document store.
   port 27017 must therefore stay (workspace shells need `mongosh`).
 - **`mongoExpress` chart toggle** — the dev UI for the audit Mongo. Drop
   it (along with the audit Mongo, the `srw.mongoHost` helper, the
-  `global.hostnames.mongo` value, the `ingress.yaml:278-315` mongo-express
+  `global.hostnames.mongo` value, the `ingress.yaml:443-481` mongo-express
   block, and the cockpit env-init `mongoExpressUrl` at
   `cockpit/deployment.yaml:17`) once cutover is complete. Replace with
   manual pgadmin registration of the new instance — the chart's
@@ -122,12 +176,16 @@ the audit trail's whole job is to survive when other things go wrong,
 and a busy-loop on the audit table should not contend with orchestrator
 latency-sensitive queries.
 
-In Compose: a new `postgres-audit` service, mirroring the
-`postgres-keycloak` pattern (which exists in all three compose files
-already — verified). In Helm: a new
-`databases.audit.{enabled,internal,externalUrl,...}` block and a new
-`helm/templates/databases/postgres-audit.yaml` template, copied from
-`postgres-keycloak.yaml`.
+In Helm: a new `databases.audit.{enabled,internal,externalUrl,...}`
+block and a new `helm/templates/databases/postgres-audit.yaml`
+template, copied from `postgres-keycloak.yaml`.
+
+In Compose: **conditional**. The Compose stack is slated for removal
+(`docs/issues/deprecate_docker_compose_stack.md` — local dev runs the
+Helm chart on k3d since 2026-05-28). If the deprecation lands first
+(recommended; roadmap gate G6), skip Compose entirely. Otherwise
+mirror the `postgres-keycloak` pattern as a `postgres-audit` service
+across the three compose files.
 
 Component label: `auditdb` (7 chars — fits the 52-char StatefulSet name
 budget with room to spare).
@@ -137,8 +195,25 @@ budget with room to spare).
 Three tables, one per current collection. JSONB for the variable-shape
 payloads, hard columns for the fields we actually filter and group by.
 Schemas widened from the original draft to capture every field the
-existing writer emits (verified against `src/core/archiver.py:328-726`
-and `:609-626`).
+existing writer emits (verified 2026-05-02 against
+`src/core/archiver.py:328-726` and `:609-626`; the file has since grown
+1131 → 1167 LoC, so re-derive exact ranges with grep at implementation
+time).
+
+**Delivery — migrations, not a schema snapshot (new since 2026-05-02)**:
+the repo now ships schema changes as numbered SQL files applied by the
+checksum-tracked runner in `orchestrator/database/migrate.py`
+(conventions and runbook in `docs/db_migration.md`). The DDL below
+therefore lands as `orchestrator/database/migrations/audit/0001_initial.sql`
+— a third migration family beside `app/` and `vector/` — applied at
+orchestrator startup through the same `run_migrations()` path.
+`PostgresDB` already takes a `migrations_dir` kwarg; add
+`MIGRATIONS_AUDIT_DIR` beside `MIGRATIONS_APP_DIR` /
+`MIGRATIONS_VECTOR_DIR` (`orchestrator/database/postgres.py:169-170`)
+and run the audit family against the audit pool in lifespan. There is
+no frozen `audit_schema.sql`, and `init.py` does not apply schema;
+later audit-schema changes are new numbered files (use the `.notx.sql`
+suffix for `CREATE INDEX CONCURRENTLY`-class operations).
 
 ```sql
 -- llm_requests: one row per LLM call (main loop + auxiliary).
@@ -210,7 +285,7 @@ ALTER TABLE agent_audit ALTER COLUMN metadata SET COMPRESSION lz4;
 CREATE INDEX agent_audit_job_id_idx     ON agent_audit (job_id, timestamp);
 CREATE INDEX agent_audit_job_type_idx   ON agent_audit (job_id, step_type, timestamp);
 CREATE INDEX agent_audit_request_idx    ON agent_audit (request_id);
--- Expression index for the graph-delta tool-name filter (graph_routes.py:152).
+-- Expression index for the graph-delta tool-name filter (graph_routes.py:144).
 CREATE INDEX agent_audit_tool_name_idx
     ON agent_audit ((payload -> 'tool' ->> 'name'))
     WHERE step_type = 'tool';
@@ -256,7 +331,7 @@ CREATE INDEX chat_history_request_id ON chat_history (request_id);
 The Mongo writer creates an `agent_audit` row at call dispatch with
 `tool.result_*` / `llm.response_*` fields null, then `update_one`s it
 with the result/response when the call returns
-(`archiver.py:842, :955`). Naively translated to Postgres this becomes
+(`archiver.py:878, :991`). Naively translated to Postgres this becomes
 an INSERT + UPDATE per call. **That triggers JSONB write
 amplification**: per Adyen and the MongoDB-team writeup on dev.to,
 JSONB UPDATEs in the presence of any expression / GIN index defeat HOT
@@ -282,7 +357,7 @@ Acceptable.
 The original draft proposed an `audit_sequence` table or per-job
 advisory lock + `MAX(seq)` to assign monotonic per-job seq numbers,
 mirroring the Mongo writer's `_get_next_step_number`
-(`archiver.py:235`). **That column is removed.** Use the global
+(`archiver.py:271`). **That column is removed.** Use the global
 `BIGSERIAL id` for ordering and compute per-job seq at read time:
 
 ```sql
@@ -321,13 +396,28 @@ extension, take pg_partman + jobmon and only own the parent ANALYZE.
 
 #### Indexing
 
-The Mongo indexes today are: `(job_id, step_number)` on `agent_audit`,
-`(job_id, timestamp)` on `llm_requests` and `chat_history`. We mirror
-with btree on `(job_id, timestamp)` for all three plus a covering
+The Mongo index inventory changed after the 2026-05-12 incident:
+`MONGODB_INDEX_DECLARATIONS` (`orchestrator/database/mongodb.py:80`)
+is now the single source of truth, asserted on every orchestrator
+startup via `ensure_indexes()` and consumed by `orchestrator/init.py`
+too. As of 2026-06-10 it declares 5 indexes on `llm_requests`
+(`job_id`, `agent_type`, `timestamp`, `model`, compound
+`(job_id, agent_type, timestamp DESC)`), 7 on `agent_audit` (`job_id`,
+`step_type`, `node_name`, `timestamp`, `(job_id, step_number)`,
+`(job_id, iteration, step_number)`, `(job_id, agent_type, step_type)`),
+and 2 on `chat_history` (`job_id`, `(job_id, timestamp)`).
+
+The Postgres set below deliberately does **not** copy that list
+one-for-one — several single-field Mongo indexes exist only because
+Mongo can't use compound-index prefixes as flexibly as Postgres btree
++ planner can. We mirror the query shapes instead: btree on
+`(job_id, timestamp)` for all three tables plus a covering
 `(job_id, step_type, timestamp)` on `agent_audit` (heavily used filter
 combo) and the expression index on `payload->'tool'->>'name'` for graph
-deltas. The metrics GIN index is new but cheap and lets the cockpit's
-"expensive jobs" queries use containment lookups.
+deltas. At implementation time, reconcile against the then-current
+declarations and `EXPLAIN` the actual cockpit queries before adding
+anything beyond this set. The metrics GIN index is new but cheap and
+lets the cockpit's "expensive jobs" queries use containment lookups.
 
 ### Adapter layer
 
@@ -359,7 +449,7 @@ sides expose the union of:
 - `get_audit_count(job_id)` — single-row helper used by enrichers
 - `iter_tool_calls(job_id)` — replaces the
   `mongodb._db["agent_audit"]` raw-cursor leak in
-  `graph_routes.py:142`. Either expose this method or refactor the
+  `graph_routes.py:144`. Either expose this method or refactor the
   helper to use `get_graph_deltas_bulk`.
 - `get_job_stats(job_id)` — aggregation SQL
 - `get_audit_stats(job_id)` — second aggregation
@@ -392,15 +482,17 @@ dict-shaped rows that match the existing response schema.
 - **Cache invalidation**: `cache.model.ts` `version: number` field must
   bump so existing IndexedDB entries with string IDs are discarded
   cleanly post-cutover.
-- **MCP server tool schemas**: `orchestrator/mcp/server.py` (lines 246,
-  270, 348, 1476, 1502, 1605) and `orchestrator/mcp/client.py` (153,
-  260, 558, 697, 1448) reference "MongoDB ObjectId (24 hex characters)"
-  in tool descriptions. Update to integer.
-- **Builder dispatch / tools** (`orchestrator/services/builder_dispatch.py`,
-  `builder_tools.py`, `formatters.py`) bake the same ObjectId
-  assumption into AI-builder tool schemas. Update.
+- **MCP server tool schemas**: the ObjectId-string assumption has
+  shrunk to three sites as of 2026-06-10 — `orchestrator/mcp/server.py:354`
+  and `orchestrator/mcp/client.py:263, :700` ("MongoDB ObjectId as
+  string (24 hex characters)"). Update to integer.
+- **Builder tools**: one remaining site,
+  `orchestrator/services/builder_tools.py:1072` ("MongoDB ObjectId (24
+  hex characters)" in a tool schema). `builder_dispatch.py` and
+  `formatters.py` no longer carry ObjectId references — the original
+  draft's longer lists are already cleaned up.
 - **Orchestrator route param** `/api/requests/{doc_id}` typed
-  `doc_id: str` in `main.py:7461` — change to `int`.
+  `doc_id: str` in `main.py:8445` — change to `int`.
 
 The wire field name `_id` *could* be kept for compatibility, but it's
 misleading once the value is a BIGINT. Recommend renaming to `id` in
@@ -420,23 +512,30 @@ clean cutover, not a rolling migration.
 2. Land the helm chart additions (`databases.audit.*`,
    `postgres-audit.yaml`, `AUDIT_DB_URL` + `AUDIT_DB_PASSWORD` Secret
    keys).
-3. Land the compose additions (`postgres-audit` service +
-   `postgres_audit_data` volume, mirrored across the three compose
-   files; `wait-for-auditdb` initContainer in orchestrator deployment).
+3. *(Conditional — skip if the Compose deprecation has landed, gate
+   G6)* compose additions: `postgres-audit` service +
+   `postgres_audit_data` volume across the three compose files. The
+   `wait-for-auditdb` initContainer in the orchestrator Helm
+   deployment lands with step 2 regardless.
 4. Land the cockpit type updates and the `request.service.ts` regex
    fix; bump `cache.model.ts` version.
-5. Stand up the new instance in dev, point `AUDIT_BACKEND=postgres`,
-   run a job end-to-end, verify cockpit shows the audit trail and the
-   IndexedDB sync (bulk + version endpoints) still works.
+5. Stand up the new instance locally (k3d + `./helm`, the verified dev
+   loop), point `AUDIT_BACKEND=postgres`, run a job end-to-end, verify
+   cockpit shows the audit trail and the IndexedDB sync (bulk +
+   version endpoints) still works.
 6. Flip the default to `postgres`. Drop `mongoExpress`,
    `databases.mongodb.*`, `srw.mongoHost`, `global.hostnames.mongo`,
-   `src/database/mongo_db.py`, `orchestrator/database/mongodb.py`,
-   `LLMArchiver`'s Mongo-specific code paths, and the
-   `mongo_to_pg_audit` adapter shim.
+   `src/database/mongo_db.py`, `orchestrator/database/mongodb.py`
+   (including `MONGODB_INDEX_DECLARATIONS` / `ensure_indexes` — DDL is
+   the migration runner's job now), `LLMArchiver`'s Mongo-specific
+   code paths, and the `mongo_to_pg_audit` adapter shim.
 7. Update `init.py` + `orchestrator/init.py` — replace
    `mongodump`/`mongorestore` shell-out with `pg_dump --jobs=N`/
    `pg_restore` (partitioned tables parallelize natively), drop
-   `--skip-mongodb` CLI flag, rename `MONGODB_URL` references.
+   `--skip-mongodb` CLI flag and the Mongo index-bootstrap path
+   (`orchestrator/init.py:1576-1593`), rename `MONGODB_URL`
+   references. Schema application itself is **not** init.py's job —
+   the migration runner owns DDL.
 8. Wipe the test cluster, redeploy, sanity-check.
 
 **No data migration**. If we ever need it, mongoexport + a Python
@@ -468,8 +567,8 @@ and stays as-is.
 
 **What we lose / what we pay**:
 - Aggregation pipelines are simpler in Mongo's syntax than equivalent
-  SQL, but the four pipelines we actually use (`archiver.py:457, :482,
-  :1018, :1046`) are shallow `$match` / `$group` and translate
+  SQL, but the four pipelines we actually use (`archiver.py:510, :530,
+  :1066, :1093`) are shallow `$match` / `$group` and translate
   directly. ~50 LoC of SQL total.
 - Schema-on-read flexibility for new event types: gone. Adding a new
   `call_type` or a new `step_type` requires no schema change (it's
@@ -499,16 +598,21 @@ and stays as-is.
 
 - `orchestrator/database/audit_store.py` — async asyncpg audit adapter
   (writer + reader surface), ~1200 LoC.
-- `orchestrator/database/audit_schema.sql` — DDL with idempotent
-  `CREATE TABLE IF NOT EXISTS`, per-table autovacuum settings, LZ4
-  compression, partition bootstrap (or `pg_partman` setup), expression
-  index for tool-name lookups. Applied by `orchestrator/init.py`.
+- `orchestrator/database/migrations/audit/0001_initial.sql` — DDL per
+  Design § Schema: 3 partitioned tables, per-table autovacuum settings,
+  LZ4 compression, indexes, partition bootstrap (or `pg_partman`
+  setup), the "no GIN on `agent_audit.payload`" comment. Applied by
+  the existing migration runner: add `MIGRATIONS_AUDIT_DIR` beside the
+  app/vector constants (`orchestrator/database/postgres.py:169-170`)
+  and a third `run_migrations()` invocation in the orchestrator
+  lifespan against the audit pool. No `audit_schema.sql` snapshot.
 - `helm/templates/databases/postgres-audit.yaml` — StatefulSet, PVC,
   Service. Copy of `postgres-keycloak.yaml`.
-- `requirements-dev.txt` — pin `testcontainers[postgres]` (the project
-  has no dev-deps file today; tests run on bare pytest+pytest-asyncio
-  in CI with no DB). Add to CI install line in `.github/workflows/
-  develop.yml:370` and `main.yml:173`.
+- `requirements-dev.txt` — pin `testcontainers[postgres]` (still no
+  dev-deps file as of 2026-06-10; tests run on bare
+  pytest+pytest-asyncio in CI with no DB). Add to the CI test-deps
+  install lines (`uv pip install ... pytest pytest-asyncio`) at
+  `.github/workflows/develop.yml:469` and `main.yml:244`.
 - `tests/_audit_db_fixture.py` — session-scoped `PostgresContainer`,
   function-scoped `TRUNCATE` reset. Mirrors the `_fs_backend.py`
   "test-only, never importable from src/" discipline.
@@ -530,83 +634,110 @@ and stays as-is.
   feature flag), delete after.
 - `orchestrator/database/mongodb.py` — keep the class until cutover
   (under the feature flag), delete after. **The original draft missed
-  this file entirely** (923 LoC, the read-side adapter the cockpit
-  depends on).
+  this file entirely** (1028 LoC, the read-side adapter the cockpit
+  depends on — grew since 2026-05-02 with `MONGODB_INDEX_DECLARATIONS`
+  + `ensure_indexes()`, the 2026-05-12 incident fix).
 - `src/database/__init__.py` — export `AuditStore` alongside `MongoDB`,
   remove `MongoDB` after cutover.
 - `orchestrator/database/__init__.py` — same.
 - `orchestrator/main.py` — replace `mongodb = MongoDB()` and the
   `mongodb.is_available` checks with `audit = AuditStore()` /
   `audit.is_available`. **~50 callsites** across imports, lifespan
-  init/shutdown, 9 audit endpoints, 3 N+1 enrichers (lines 84, 152,
-  162, 2846, 2864-2865, 3051, 3261-3287, 3313-3317, 7425, 7438, 7461,
-  7468, 7488, 7492, 7513, 7524, 7857, 7868, 7892, 7903, 7927, 7938,
-  7958, 7962, 10838, 10847, 14422-14427). Original draft's "~15
-  callsites" was a 3× undercount.
-- `orchestrator/graph_routes.py` — `set_mongodb()` becomes
-  `set_audit_store()`. Line 142's raw `mongodb._db["agent_audit"]`
+  init/shutdown, 9 audit endpoints, 3 N+1 enrichers. Re-verified
+  2026-06-10: imports 96/227, init 237, lifespan connect +
+  `ensure_indexes` 3325-3332 (the `ensure_indexes` call has **no
+  Postgres analogue** — the migration runner owns DDL; it just goes
+  away), graph_routes share 3391, disconnect 3672, enrichers
+  3933-3936 / 3953-3954 / 18740-18742, endpoints: `/audit` 8418/8431,
+  `/requests/{doc_id}` 8444-8459 (param → `int`), `/audit/timerange`
+  8487/8491, `/chat` 8514/8525, `/audit/bulk` 9328/9339, `/chat/bulk`
+  9365/9376, `/graph/bulk` 9402/9413, `/version` 9434/9438,
+  `/llm-requests` 14563/14572. The remaining "mongodb" hits in main.py
+  (datasource type enums, test-connection, tool catalogs — e.g. 2544,
+  9569, 9769, 9942-9949, 18998, 19077-19120) are **customer-datasource
+  surface, not this migration** — leave them.
+- `orchestrator/graph_routes.py` — `set_mongodb()` (line 20) becomes
+  `set_audit_store()`. Line 144's raw `mongodb._db["agent_audit"]`
   access is replaced with `audit.iter_tool_calls(job_id)`.
-- `orchestrator/init.py` — apply `audit_schema.sql` to `srw-auditdb`
-  on startup. Mirror the existing pattern for `srw-postgres` and
-  `srw-pgvector`. Replace `mongodump`/`mongorestore` shell-outs at
-  lines 637, 674, 1395, 1423, 1608, 1655 with `pg_dump`/`pg_restore`.
-  Drop `--skip-mongodb` CLI flag.
-- `init.py` — same backup/restore swap.
-- `orchestrator/mcp/server.py`, `orchestrator/mcp/client.py` — drop
-  ObjectId-string assumptions in tool schemas (lines listed in Cockpit
-  / API section).
-- `orchestrator/services/builder_dispatch.py`,
-  `orchestrator/services/builder_tools.py`,
-  `orchestrator/services/formatters.py` — same ObjectId cleanup.
+- `orchestrator/init.py` — replace `mongodump`/`mongorestore`
+  shell-outs (URL parse at 1491, dump 1646-1690, restore 1693-1740)
+  with `pg_dump`/`pg_restore`; drop the Mongo index-bootstrap path
+  (1576-1593, imports `MONGODB_INDEX_DECLARATIONS`); drop
+  `--skip-mongodb` (usage docstring line 19). **Do not** add schema
+  application here — the migration runner owns audit DDL.
+- `init.py` — same backup/restore swap; `--skip-mongodb` surface at
+  lines 23, 129-151, 177, 232-279, 514, 543, 630.
+- `orchestrator/mcp/server.py:354`, `orchestrator/mcp/client.py:263,
+  :700` — drop ObjectId-string assumptions in tool schemas (the only
+  three sites left as of 2026-06-10).
+- `orchestrator/services/builder_tools.py:1072` — same ObjectId
+  cleanup (last remaining builder site; `builder_dispatch.py` and
+  `formatters.py` are already clean).
 - `helm/values.yaml` — new `databases.audit.{enabled,internal,
   externalUrl,image,storageClass,storageSize,resources}` block (mirror
   the existing `databases.keycloak.*` block exactly). Default
-  `enabled: true, internal: true`. Remove `databases.mongodb.*` after
-  cutover. Remove `global.hostnames.mongo`.
+  `enabled: true, internal: true`. Remove `databases.mongodb.*` (now
+  lines 404-409), `global.hostnames.mongo` (now line 61), and the
+  `mongoExpress` block (now lines 866-868) after cutover.
 - `helm/values.example.yaml` — parallel external-postgres example.
   Replace `databases.mongodb` external block with `databases.audit`.
   Same change in `helm/ci/customer-external-values.yaml`.
-- `helm/templates/_helpers.tpl` — **the original draft was wrong
-  about `srw.vectorDbUrl`**: that helper does not exist. `DATABASE_URL`
-  and `VECTOR_DB_URL` are read directly from Secret keys
-  (`orchestrator/deployment.yaml:77-86`, `agent/deployment.yaml:64-73`).
-  Adopt the same pattern: `AUDIT_DB_URL` is a Secret key, fully
-  assembled (in internal mode by ESO/operator; in compose by env
-  interpolation). Drop `srw.mongodbUrl` (lines 347-353) and
-  `srw.mongoHost` (lines 325-327) after cutover; do **not** add a
-  `srw.auditDbUrl` helper unless we want a thin host-only template
-  for `wait-for-auditdb`.
-- `helm/templates/configmap.yaml` — drop `MONGODB_URL` line (currently
-  line 17). The new `AUDIT_DB_URL` lives in the Secret because it
-  carries credentials, matching how `DATABASE_URL`/`VECTOR_DB_URL`
-  are wired today.
+- `helm/templates/_helpers.tpl` — **the DSN convention changed again
+  since the 2026-05-02 revision**: Postgres connections are no longer
+  full-URL Secret keys. They're component parts — `POSTGRES_{USER,
+  PASSWORD}` via `secretKeyRef`, `POSTGRES_{HOST,PORT,DB}` via
+  `configMapKeyRef` (`orchestrator/deployment.yaml:80-104`, vector
+  variant at `:105-129`) — assembled in-process by
+  `utils/db_url.build_postgres_url(prefix, fallback_env=...)`. Adopt
+  exactly that: `AUDIT_POSTGRES_{USER,PASSWORD}` in the Secret,
+  `AUDIT_POSTGRES_{HOST,PORT,DB}` in the ConfigMap, and
+  `build_postgres_url("AUDIT_POSTGRES", fallback_env="AUDIT_DB_URL")`
+  in code (the fallback env covers external/BYO-DB mode). Drop
+  `srw.mongodbUrl` (now lines 481-487) and `srw.mongoHost` (now lines
+  408-409) after cutover; no `srw.auditDbUrl` helper needed.
+- `helm/templates/configmap.yaml` — drop the `MONGODB_URL` line (now
+  lines 30-31); add `AUDIT_POSTGRES_{HOST,PORT,DB}` keys mirroring the
+  existing `VECTOR_POSTGRES_*` trio.
 - `helm/templates/orchestrator/deployment.yaml` — `MONGODB_URL` env
-  var (lines 87-91) becomes `AUDIT_DB_URL` from Secret
-  (`secretKeyRef`); `wait-for-mongodb` initContainer (lines 37-41)
-  becomes `wait-for-auditdb` against `<fullname>-auditdb:5432`.
-- `helm/templates/agent/deployment.yaml` — same env-var rename
-  (lines 74-78). MCP deployment if present, same.
+  (now lines 130-134, `configMapKeyRef`) becomes the five
+  `AUDIT_POSTGRES_*` part envs (user/password via `secretKeyRef`,
+  host/port/db via `configMapKeyRef`, mirroring `VECTOR_POSTGRES_*`);
+  `wait-for-mongodb` initContainer (now lines 37-40) becomes
+  `wait-for-auditdb` against `<fullname>-auditdb:5432`.
+- **Agent side — no template change** (the 2026-05-02 draft's
+  `helm/templates/agent/deployment.yaml` no longer exists; only
+  `pdb.yaml`/`service.yaml` remain). Dynamic agent pods inherit the
+  full ConfigMap + Secret via `envFrom`
+  (`orchestrator/services/agent_provisioner.py:1060-1064`), so the new
+  `AUDIT_POSTGRES_*` keys reach agents automatically. The agent-side
+  change is in code: `src/core/archiver.py:209` gates archiving on
+  `MONGODB_URL` — switch to the `AUDIT_POSTGRES_*` parts /
+  `AUDIT_DB_URL` fallback. The MCP deployment
+  (`helm/templates/mcp/deployment.yaml`) has no Mongo env — nothing
+  to do there.
 - `helm/templates/secret.yaml` / `external-secret.yaml` — `dataFrom:
   extract:` is bulk-projected, no per-key template change needed. Just
-  document `AUDIT_DB_PASSWORD` and (external mode) `AUDIT_DB_URL` in
-  the Secret schema in `helm/README.md` (lines 202-208).
+  document `AUDIT_POSTGRES_USER` / `AUDIT_POSTGRES_PASSWORD` (and the
+  external-mode `AUDIT_DB_URL` fallback) in the Secret schema in
+  `helm/README.md` (§ "Secret schema", line 192).
 - `helm/README.md` — update Secret schema and component table; remove
   mongo-express row.
 - `helm/templates/cockpit/deployment.yaml:17` — drop `mongoExpressUrl`
   env-init field.
-- `helm/templates/ingress.yaml:11, 278-315` — drop mongo-express host
+- `helm/templates/ingress.yaml:11, 443-481` — drop mongo-express host
   + ingress block.
 - `docs/issues/deployment_separation_of_concerns.md` — once
   implemented, mark Issue C resolved with a forward reference here.
-- `docker-compose.yaml` / `docker-compose.dev.yaml` /
+- *(Conditional — gate G6; skip entirely if the Compose deprecation
+  per `docs/issues/deprecate_docker_compose_stack.md` lands first)*
+  `docker-compose.yaml` / `docker-compose.dev.yaml` /
   `docker-compose.local.yaml` — add `postgres-audit` service +
   `postgres_audit_data` volume (mirror `postgres-keycloak` shape;
   in dev expose port 5434). Replace `MONGODB_URL` env on orchestrator
-  / agent / mcp services with inline-assembled `AUDIT_DB_URL`
-  (matches existing `DATABASE_URL`/`VECTOR_DB_URL` compose pattern).
-  Replace `depends_on: mongodb` with `depends_on: postgres-audit`.
-  Drop `mongodb` and `mongo-express` services + `mongodb_data` volume
-  after cutover.
+  / agent / mcp services with the `AUDIT_POSTGRES_*` parts (or the
+  `AUDIT_DB_URL` fallback). Replace `depends_on: mongodb` with
+  `depends_on: postgres-audit`. Drop `mongodb` and `mongo-express`
+  services + `mongodb_data` volume after cutover.
 - `cockpit/src/app/core/models/audit.model.ts`,
   `cockpit/src/app/debug/request.model.ts`,
   `cockpit/src/app/core/models/chat.model.ts`,
@@ -614,17 +745,23 @@ and stays as-is.
   `id: number`. Bump `cache.model.ts` version.
 - `cockpit/src/app/debug/services/request.service.ts:60` — change
   ObjectId regex to `/^\d+$/` or remove.
-- `.github/workflows/develop.yml`, `.github/workflows/main.yml` — add
-  `-r requirements-dev.txt` to the test-deps install line.
+- `.github/workflows/develop.yml:469`, `.github/workflows/main.yml:244`
+  — add `-r requirements-dev.txt` to the test-deps install lines.
 
 ### Deleted (post-cutover)
 
 - `helm/templates/databases/mongodb.yaml`
-- `helm/templates/optional/mongo-express.yaml` (or wherever it lives)
+- `helm/templates/optional/mongo-express.yaml` (path confirmed)
 - `src/database/mongo_db.py`
-- `orchestrator/database/mongodb.py`
+- `orchestrator/database/mongodb.py` (takes
+  `MONGODB_INDEX_DECLARATIONS` / `ensure_indexes()` with it — the
+  migration runner owns audit DDL; also remove the import in
+  `orchestrator/init.py:1590`)
 - All `mongoExpress.*` chart values, `srw.mongodbUrl` /
   `srw.mongoHost` helpers, `global.hostnames.mongo`.
+- If Compose still exists at cleanup time: the `mongodb` /
+  `mongo-express` services + `mongodb_data` volume in all three
+  compose files.
 
 ## Verification
 
@@ -634,7 +771,7 @@ and stays as-is.
    `get_job_stats` aggregation correctness, `chat_history` round-trip,
    pagination and bulk endpoints, the `is_available=False` no-op
    branch, and `iter_tool_calls` parity with the old raw-cursor query.
-2. **Integration test** — run a full job in the dev compose stack
+2. **Integration test** — run a full job on the local k3d stack
    with `AUDIT_BACKEND=postgres`, then with `=mongodb`, diff the
    cockpit's audit pane and the `/api/jobs/{id}/audit` JSON response
    between the two. Should be byte-equivalent except for the `id`

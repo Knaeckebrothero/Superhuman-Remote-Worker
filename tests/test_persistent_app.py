@@ -3261,6 +3261,53 @@ class TestAttachSessionRaisesWorkspaceNotReady:
         assert "already attached" in str(exc_info.value)
 
 
+class TestExitDuplicateProvisionHelper:
+    """_exit_duplicate_provision calls os._exit(0) with best-effort deregister.
+
+    The losing pod of a provisioning race (orchestrator 409) must exit cleanly
+    so it drops out of the per-session Service endpoints, cleaning up only its
+    own agent record — never any thread-scoped resource (those belong to the
+    winning agent).
+    """
+
+    @pytest.mark.asyncio
+    async def test_exit_duplicate_provision_calls_os_exit_zero(self):
+        """The handler helper invokes os._exit(0) so the orphan pod completes."""
+        from src.api import persistent_app as pa
+
+        mock_client = MagicMock()
+        mock_client.stop_heartbeat = MagicMock()
+        mock_client.deregister = AsyncMock()
+        mock_client.close = AsyncMock()
+
+        with patch.object(pa, "_orchestrator_client", mock_client):
+            with patch.object(pa, "_heartbeat_task", None):
+                with patch("os._exit", side_effect=SystemExit(0)) as mock_exit:
+                    with pytest.raises(SystemExit):
+                        await pa._exit_duplicate_provision("thread-1")
+
+        mock_exit.assert_called_once_with(0)
+
+    @pytest.mark.asyncio
+    async def test_exit_duplicate_provision_best_effort_deregister(self):
+        """Best-effort self-deregister + close are awaited before os._exit."""
+        from src.api import persistent_app as pa
+
+        mock_client = MagicMock()
+        mock_client.stop_heartbeat = MagicMock()
+        mock_client.deregister = AsyncMock()
+        mock_client.close = AsyncMock()
+
+        with patch.object(pa, "_orchestrator_client", mock_client):
+            with patch.object(pa, "_heartbeat_task", None):
+                with patch("os._exit", side_effect=SystemExit(0)):
+                    with pytest.raises(SystemExit):
+                        await pa._exit_duplicate_provision("thread-1")
+
+        mock_client.deregister.assert_awaited_once()
+        mock_client.close.assert_awaited_once()
+
+
 class TestExitWorkspaceNotReadyHelper:
     """_exit_workspace_not_ready calls os._exit(0) with best-effort deregister."""
 

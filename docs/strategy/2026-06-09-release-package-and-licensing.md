@@ -13,9 +13,10 @@ related:
 
 # Release Package And Licensing Strategy
 
-**Date:** 2026-06-09  
-**Status:** Decision draft, not legal advice. Review with a lawyer before a
-public release or before accepting outside contributions.
+**Date:** 2026-06-09
+**Last updated:** 2026-06-10
+**Status:** Decision draft and session recap, not legal advice. Review with a
+lawyer before a public release or before accepting outside contributions.
 
 ## Short Recommendation
 
@@ -443,6 +444,264 @@ examples/
   docker-compose.eval.yaml
 ```
 
+## Session Recap For Resume
+
+This section captures the current thinking from the planning discussion so the
+thread can be resumed later without reconstructing the context.
+
+### Project Context
+
+The project started as a hobby/R&D system before agent tooling became a major
+industry wave. It has now grown into serious infrastructure: an orchestrator,
+agent runtime, isolated workspaces/VMs, jobs, persistent sessions, Cockpit, MCP,
+multi-database support, deployment assets, and a large design/issue knowledge
+base.
+
+The founder context matters:
+
+- solo developer
+- recently quit a working-student job
+- turned down a high-paying offer
+- wants to keep building technically interesting systems rather than optimize
+  purely for a classic product/company path
+- two pilot projects are close to testing
+- friends and a professor are interested in building something around the
+  system, but they have not yet worked on the project
+- a public name is still undecided
+- university collaboration may be relevant because the university is building
+  AI systems and may benefit from a self-hosted agent harness/control plane
+
+The emotional/product risk identified in the discussion: the project has many
+valid directions, and "one more prerequisite feature before organizing the
+roadmap" can loop forever. The near-term goal is consolidation and release of
+the core system, not more idea expansion.
+
+### Current System Model
+
+The working mental model is:
+
+> A self-hosted AI agent orchestration engine where a FastAPI control plane
+> provisions isolated workspaces/VMs, dispatches configurable agents into them,
+> exposes jobs and persistent sessions, and lets users review/approve outputs.
+
+Core pieces:
+
+- `agent.py` and `src/`: agent runtime, worker graph, persistent session loop,
+  tools, config, workspace handling
+- `orchestrator/`: control plane, APIs, job/session lifecycle, auth, dispatch,
+  provisioning, review, MCP integration
+- `orchestrator/mcp/`: MCP access to the system for coding agents
+- `config/`: experts, prompts, model/tool configuration
+- `helm/`, Compose, scripts: deployment and development paths
+- `cockpit/`: full Angular product UI, useful but too broad/messy for a first
+  public release requirement
+- `docs/`: private lab notebook plus raw material for curated public docs
+
+Important architectural observation: jobs, experts, sessions, review, status,
+results, and audit views are already API-backed control-plane flows. The public
+release does not need the full Cockpit to be useful.
+
+### Project Risks Identified
+
+The codebase is not "all trouble," but it has crossed from exploration into
+product/infrastructure territory. The risks are mostly consolidation risks:
+
+- too many possible products in one repo
+- `orchestrator/main.py` is too large and carries too much service logic
+- worker and persistent agent paths can drift
+- persistent chat is high-risk because it mixes SSE, REST, WebSocket,
+  IndexedDB, service-worker bypasses, permissions, media, and rendering
+- deployment surface is broad: native dev, Compose, k3d/Tilt, Helm, VM clusters
+- docs/code drift exists
+- private strategy notes, `HomeLab/`, and raw issue investigations are not
+  public-release-ready
+
+The conclusion was not "rewrite everything." The conclusion was: pick the
+release core, make one path usable, and avoid turning release prep into a
+frontend cleanup or monolith-refactor project.
+
+### Roadmap Position
+
+The companion roadmap is `docs/strategy/2026-06-09-roadmap-priorities.md`.
+
+Working strategic bet:
+
+> Single-tenant autonomous knowledge-work infrastructure: connect existing data
+> and documents, let agents process them in isolated workspaces, and give the
+> user a reviewable output with an audit trail.
+
+Near-term focus:
+
+1. define and prove one pilot demo path
+2. stabilize persistent session trust
+3. stabilize workspace/session lifecycle
+4. make one deployment path the supported path
+5. package the knowledge-base workflow as the understandable wedge
+
+Everything else goes to parking lot unless it directly supports those items.
+
+### Open Source Thesis
+
+The founder preference is strongly open-source-aligned. The reasoning:
+
+- private software may become less durable as AI coding agents make feature
+  replication cheaper
+- open-source projects can set standards, attract contributors, and become
+  ecosystem centers
+- Europe is moving toward open-source, digital sovereignty, open standards, and
+  public-sector reusable software
+- a serious open AI harness/control-plane could fit university, public-sector,
+  and EU funding narratives
+
+Useful positioning:
+
+> A European/open self-hosted AI agent orchestration standard and reference
+> implementation for auditable workspaces.
+
+This is stronger than "agent SaaS" when talking to universities, public-sector
+actors, standards-minded partners, or EU funding programs.
+
+### Licensing Direction
+
+Several models were discussed:
+
+- **MIT/Apache:** too permissive for this situation; allows straight resale and
+  weakens the ability to fund development.
+- **AGPL everything:** pure open source, strong trust/adoption, but does not
+  stop someone from hosting the unmodified system.
+- **Timescale-style source-available:** allows value-added/internal use but
+  blocks managed competing services; commercially attractive but not OSI open
+  source.
+- **AGPL core plus official product layer:** current preferred direction.
+
+Current working direction:
+
+> Release the agent/orchestration core under `AGPL-3.0-or-later`, include a
+> minimal operator UI/CLI, keep the polished Cockpit and managed distribution as
+> official product layers for now, and protect the brand through trademark
+> policy rather than no-SaaS licensing.
+
+This keeps the project genuinely open where it matters, while preserving a
+commercial path around official hosting, support, integrations, deployment,
+enterprise hardening, and the polished UI.
+
+### Public v0.1 Shape
+
+Public v0.1 should include:
+
+- agent runtime
+- orchestrator/control-plane APIs
+- MCP server
+- config/expert/tool framework
+- basic workspace provisioning
+- Helm/Compose evaluation install
+- protocol/API docs
+- minimal operator UI or CLI
+
+Public v0.1 should not require:
+
+- the full current Angular Cockpit
+- all internal docs
+- all `HomeLab/` deployment details
+- private strategy/funding notes
+- raw pilot/customer notes
+
+The public release should be useful, but not necessarily polished.
+
+### UI Decision
+
+The full Cockpit should not block the public release.
+
+Reasoning:
+
+- the founder dislikes UI design and wants to focus on agent/framework work
+- the current Cockpit is broad and messy
+- the core system can be operated through CRUD/control-plane APIs
+- a basic Streamlit/FastAPI/static operator UI could cover the minimum surface
+  quickly
+- public release should not become "clean up the Angular app first"
+
+Preferred UI path:
+
+1. ship backend/orchestrator/agent
+2. add minimal operator UI or CLI
+3. keep full Cockpit as official polished client
+4. later decide whether to release a cleaned subset of Cockpit
+
+Minimum UI surface:
+
+- create job from JSON/YAML
+- list jobs and statuses
+- inspect job details/log/audit summary
+- download/open outputs
+- approve/resume jobs
+- create/open a basic persistent session
+- send/receive plain text
+- view/edit expert config JSON/YAML
+
+### Docs Decision
+
+Do not publish `docs/` wholesale.
+
+The current docs directory is effectively a one-person lab notebook: sprints,
+issue tracker, idea collection, strategy notes, design drafts, and private
+infrastructure context. Public docs should be curated.
+
+Public docs should be rebuilt around:
+
+- quickstart
+- install
+- architecture
+- protocol/API docs
+- configuration
+- deployment
+- security
+- contributing
+- roadmap
+- known limitations
+
+After public release, GitHub Issues/Projects can become the public tracker.
+The private docs folder can remain the messy internal thinking space.
+
+### University / Funding Angle
+
+The university may be a valuable first ecosystem partner, not just a customer.
+The system could be positioned as infrastructure for AI research and internal
+AI deployment:
+
+- self-hosted
+- auditable
+- workspace-isolated
+- model/provider-flexible
+- compatible with local/on-prem constraints
+- useful for research, teaching, and public-sector-style deployments
+
+Potential funding/positioning narratives:
+
+- open European AI infrastructure
+- sovereign AI agent control plane
+- reference implementation for auditable autonomous workspaces
+- standards around agent job/session lifecycle, tool contracts, workspace
+  boundaries, and review/audit outputs
+
+EU/public funding is likely slow and paperwork-heavy, so it should not replace
+pilot/consulting/hosting revenue as near-term oxygen.
+
+### Immediate Next Actions
+
+Recommended next concrete steps:
+
+1. Pick a provisional public project name.
+2. Decide the public repo shape: same repo cleaned vs new release repo.
+3. Freeze the public v0.1 scope from this document.
+4. Audit the current MIT license state and contribution ownership.
+5. Create a release branch/package excluding private docs and `HomeLab/`.
+6. Add AGPL license text and trademark/contribution policy drafts.
+7. Build the minimal operator UI/CLI.
+8. Create curated public docs from the private docs.
+9. Run secret scanning and private-info review.
+10. Test the release package as if installed by a stranger.
+
 ## Release Sequence
 
 ### Phase 0: Legal/ownership freeze
@@ -481,14 +740,17 @@ examples/
 
 Recommended decision for now:
 
-> Publish a clean **source-visible single-tenant release package** under an
-> open-core/fair-source model. Use `AGPL-3.0-or-later` for the generic agent
-> runtime and `BUSL-1.1` or `FSL-1.1` for the full product shell. Permit
-> self-hosted/internal use. Require a commercial license for competing managed
-> hosting, resale, or embedding the full system as a paid service.
+> Publish a clean **AGPL orchestration-core release**: agent runtime,
+> orchestrator/control-plane APIs, MCP server, config/expert/tool framework,
+> basic workspace provisioning, deployment basics, protocol docs, and a minimal
+> operator UI/CLI. Keep the full Cockpit and managed distribution as the
+> official polished product layer for now. Use trademark policy and official
+> hosting/support/integration as the commercial path.
 
-This matches the actual goal: keep building, allow trust and pilots, but avoid
-giving away the exact hosted product as a free business for someone else.
+This matches the current goal: build in the open, set a standard, let people run
+and extend the system, and still preserve a realistic path to funding continued
+development through official hosting, university/pilot integrations, support,
+and enterprise deployment work.
 
 ## Sources To Review With Counsel
 
