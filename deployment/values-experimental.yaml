@@ -49,7 +49,7 @@ image:
   orchestrator:
     tag: sha-4830d12
   agent:
-    tag: sha-4830d12
+    tag: sha-b9108b7
   cockpit:
     tag: sha-4830d12
   mcp:
