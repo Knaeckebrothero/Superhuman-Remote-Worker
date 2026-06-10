@@ -251,6 +251,11 @@ auth:
 mcp:
   enabled: true
   replicas: 1
+  # -- Also route the MCP server under the cockpit host at /mcp (e.g.
+  # https://localhost/mcp on k3d). Convenience for local dev so a committed
+  # .mcp.json works without a dedicated mcp.<domain> cert/DNS. Leave off in
+  # prod, where the dedicated mcp.<domain> subdomain is the OAuth-client host.
+  exposeOnRootHost: false
   oauth:
     enabled: true
     clientId: "mcp-server"

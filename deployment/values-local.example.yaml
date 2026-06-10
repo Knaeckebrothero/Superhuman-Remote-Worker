@@ -140,6 +140,18 @@ secrets:
     DEFAULT_DS_WEBDAV_PASSWORD: ""
     CODEX_MANAGEMENT_KEY: "dev_codex_key"
     MCP_INTERNAL_KEY: "dev_mcp_internal_key"
+    # Fixed admin MCP token, seeded into the DB at orchestrator startup + on
+    # first admin login (gated on this var). Lets the committed .mcp.json.example
+    # authenticate against the local cluster out of the box. Dev-only — never
+    # set this in prod (admins mint tokens via the cockpit there).
+    MCP_DEV_TOKEN: "srw_dev_localtoken_do_not_use_in_production"
+
+# -----------------------------------------------------------------------------
+# MCP — expose under the cockpit host so the agent reaches it at
+# https://localhost/mcp (no dedicated mcp.localhost cert/DNS needed).
+# -----------------------------------------------------------------------------
+mcp:
+  exposeOnRootHost: true
 
 # -----------------------------------------------------------------------------
 # Ingress — TLS via mkcert CAIssuer (must be created out of band first)

@@ -2,8 +2,10 @@
   "mcpServers": {
     "orchestrator": {
       "type": "http",
-      "url": "http://localhost:8055/mcp",
-      "auth": "Bearer srw_dev_localtoken_do_not_use_in_production"
+      "url": "https://localhost/mcp",
+      "headers": {
+        "Authorization": "Bearer srw_dev_localtoken_do_not_use_in_production"
+      }
     }
   }
 }
