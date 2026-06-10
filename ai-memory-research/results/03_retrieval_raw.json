@@ -1,0 +1,362 @@
+{
+  "summary": "Deep research harness — fan-out web searches, fetch sources, adversarially verify claims, synthesize a cited report.",
+  "agentCount": 113,
+  "logs": [
+    "Q: Produce a deep, technical, source-grounded survey of the current best practices …",
+    "Decomposed into 6 angles: Embeddings + MTEB leaders 2025-2026, Hybrid search: sparse + RRF fusion, Reranking ROI: cross-encoders, Chunking + contextual retrieval impact, Long-context vs RAG tradeoffs, ANN tuning + retrieval eval",
+    "Chunking + contextual retrieval impact: 6 results",
+    "ANN tuning + retrieval eval: 6 results",
+    "Embeddings + MTEB leaders 2025-2026: 6 results",
+    "Embeddings + MTEB leaders 2025-2026: 5 novel (1 filtered)",
+    "Long-context vs RAG tradeoffs: 6 results",
+    "Long-context vs RAG tradeoffs: 5 novel (1 filtered)",
+    "Reranking ROI: cross-encoders: 6 results",
+    "Reranking ROI: cross-encoders: 3 novel (3 filtered)",
+    "Hybrid search: sparse + RRF fusion: 6 results",
+    "Hybrid search: sparse + RRF fusion: 5 novel (1 filtered)",
+    "Fetched 30 sources → 147 claims → verifying top 25",
+    "\"MTEB has introduced breaking changes in minor/patc…\": 3-0 ✓",
+    "\"Qwen3-Embedding-8B has 4096 embedding dimensions a…\": 3-0 ✓",
+    "\"MTEB suffers from a subtle training-data contamina…\": 3-0 ✓",
+    "\"Qwen3-Embedding-8B ranked No.1 on the MTEB multili…\": 3-0 ✓",
+    "\"Gemini Embedding achieved MTEB(Multilingual) Mean(…\": 3-0 ✓",
+    "\"OpenSearch's RRF implementation uses the formula r…\": 3-0 ✓",
+    "\"Gemini Embedding outputs 3,072-dimensional vectors…\": 3-0 ✓",
+    "\"The RRF rank constant k controls score distributio…\": 3-0 ✓",
+    "\"In OpenSearch's own benchmark across six BEIR data…\": 3-0 ✓",
+    "\"The authors used RRF with constant k=60 (citing Co…\": 3-0 ✓",
+    "\"On the FIRE 2025 code-mixed IR task, RRF fusion of…\": 1-2 ✗",
+    "\"On the BEIR benchmark (13 datasets), the proposed …\": 3-0 ✓",
+    "\"RRF fusion gave a 38% relative improvement in MAP@…\": 0-3 ✗",
+    "\"Even the latest SOTA inference-free model SPLADE-v…\": 2-1 ✓",
+    "\"Hybrid retrieval with reranking outperformed all o…\": 3-0 ✓",
+    "\"Adding a cross-encoder reranker (Cohere Rerank) on…\": 3-0 ✓",
+    "\"On this benchmark, sparse lexical retrieval (BM25)…\": 3-0 ✓",
+    "\"Late chunking does NOT consistently beat conventio…\": 3-0 ✓",
+    "\"Head-to-head on the same NFCorpus subset with Jina…\": 3-0 ✓",
+    "\"Contextual retrieval (LLM-generated context prepen…\": 3-0 ✓",
+    "\"Late chunking improves retrieval quality over naiv…\": 3-0 ✓",
+    "\"Neither advanced chunking technique is a definitiv…\": 3-0 ✓",
+    "\"GPT-4o's accuracy on the NoLiMa benchmark collapse…\": 3-0 ✓",
+    "\"Late chunking achieves retrieval quality comparabl…\": 3-0 ✓",
+    "\"When evaluated at 32K-token contexts on tasks desi…\": 3-0 ✓",
+    "Verify done: 25 claims → 23 confirmed, 2 killed"
+  ],
+  "result": {
+    "question": "Produce a deep, technical, source-grounded survey of the current best practices for the RETRIEVAL substrate beneath AI agent memory — RAG, hybrid search, reranking, embeddings, ANN tuning — and the honest tradeoffs between retrieval and long-context. Prioritize 2024–2026 sources; cite every claim; verify benchmark claims and note evaluation conditions; flag vendor self-benchmarks.\n\nGROUNDING CONTEXT (my system, for tie-back — not the subject of the research): I'm refining the retrieval layer beneath an AI agent memory system. Today: embeddings = qwen3-embedding-8b (4096-dim); pgvector with HNSW (m=16, ef_construction=256 for memory/knowledge, 64 for sources; query-time ef_search left at the pgvector DEFAULT of 40, untuned); Postgres tsvector for the sparse/keyword channel (NOT BM25/SPLADE); and Reciprocal Rank Fusion combining dense + sparse + recency with weights 0.6/0.3/0.1 and rrf_k=50. No reranker. Memories and knowledge notes are fetched per-turn (top-k) and injected into every LLM call. (A prior research stream found this per-turn full injection makes me an outlier; the convergent norm is a small bounded always-on slice + on-demand recall — so retrieval quality and gating matter a lot.)\n\nRESEARCH QUESTIONS:\n\nVector RAG state of the art:\n- Chunking: semantic chunking, late chunking, contextual retrieval (Anthropic's prepend-context approach) — measured impact.\n- Embedding models (2025–2026): current leaders, dimension-vs-quality tradeoffs, MTEB/MTEB-v2 caveats, when bigger dims stop paying off. How does qwen3-embedding-8b (4096-d) compare to current options?\n- Index & ANN tuning: HNSW vs IVF vs DiskANN; effect of ef_search / ef_construction / m on recall vs latency; how much recall is likely lost at ef_search=40 on 4096-dim vectors.\n\nHybrid search:\n- Dense + sparse fusion: BM25 vs SPLADE vs learned sparse vs Postgres tsvector — quality differences and when the sparse channel actually matters.\n- Fusion methods: RRF vs weighted score fusion vs learned fusion; how to tune RRF k and channel weights; is a static 0.6/0.3/0.1 reasonable?\n\nReranking:\n- Cross-encoder rerankers (Cohere Rerank, bge-reranker, Voyage, Jina): quality lift vs latency/cost. Is adding a reranker the single highest-ROI upgrade for a hybrid stack that has none?\n\nAgentic & iterative retrieval:\n- Query rewriting/expansion, multi-hop, self-querying, retrieval-as-a-tool (agent decides when/what to fetch) vs one-shot auto-injection. Evidence for each. Relevance gating to avoid injecting noise every turn.\n\nRecency, temporal & metadata:\n- Folding recency/time decay and metadata filters into ranking without harming relevance (I currently blend recency as a fixed 10% RRF channel).\n\nLong-context vs retrieval:\n- When do 200k–2M-token context windows replace retrieval? Honest failure modes: \"lost in the middle\", context rot/degradation, cost, latency. The \"context engineering\" discipline. Hybrid retrieve-then-fill strategies. What recent evidence actually shows.\n\nEvaluating retrieval specifically:\n- recall@k, nDCG, MRR, end-task metrics; how to build a retrieval eval set from production traces.\n\nTIE IT BACK TO MY SYSTEM — give a specific critique and a ranked list of changes:\n- Is tsvector good enough, or should the sparse channel be BM25/SPLADE?\n- Should I add a reranker (which one), and where in the pipeline?\n- Should I tune ef_search up, and to what, at 4096-d?\n- Is per-turn auto-injection the right pattern, or should recall become a relevance-gated tool the agent calls?\n- Would contextual retrieval help our notes/memories?\n- Is qwen3-embedding-8b still a good choice, or is there a clearly better embedding model now?\n\nDELIVERABLE FORMAT:\n1. Technique survey with measured impact where available.\n2. Comparative tradeoff tables (sparse methods; fusion methods; rerankers; retrieval vs long-context).\n3. Highest-ROI improvements for a pgvector + tsvector + RRF stack, ranked, each with expected benefit and rough effort.\n4. Full citations.",
+    "summary": "For a pgvector + tsvector + RRF stack with no reranker, the 2024-2026 evidence points to one clear highest-ROI move: add a cross-encoder reranker over the fused candidate set. In the most directly relevant benchmark (a hybrid-RRF stack identical in shape to the user's), adding a Cohere reranker was the single largest improvement measured — +17.2pp MRR@3 (a 39.7% relative gain) and the top nDCG@10 of any of ten strategies (0.683 vs 0.551 for hybrid-RRF alone) [12][13]. Second, the user's embedding choice (qwen3-embedding-8b, 4096-d) remains defensible: it was the #1 MTEB-multilingual model as of June 2025 (a vendor self-benchmark, score 70.58) and natively supports Matryoshka truncation, so 4096-d is not wasted but also not mandatory [0][1]; rival frontier models (Gemini Embedding) deliberately ship at 3072-d with trained-in 768/1536 truncations, showing usable smaller dims are a design choice rather than a free lunch [5]. Third, advanced chunking (contextual retrieval, late chunking) yields only small, model-dependent, reranker-dependent gains (typically +1.5-4.6% nDCG) and is lower priority than reranking for short notes/memories [15][16][17][18][19][20]. Finally, the long-context-replaces-retrieval narrative is not supported once literal lexical overlap is removed: 11 of 13 \">=128K\" LLMs fell below 50% of their own short-context baseline at just 32K tokens, and even GPT-4o dropped from 99.3% to 69.7% [21][22] — strong evidence to keep retrieval quality and gating central rather than dumping everything into context.",
+    "findings": [
+      {
+        "claim": "Adding a cross-encoder reranker over a hybrid-RRF stack is the single highest-ROI upgrade: in a benchmark of identical pipeline shape to the user's, a Cohere reranker gave the largest improvement of any technique tested — +17.2pp MRR@3 (39.7% relative; 0.433->0.605), +12.1pp Recall@5 (0.695->0.816), and top nDCG@10 of all ten strategies (0.683 vs 0.551 for hybrid-RRF alone, 0.515 for BM25).",
+        "confidence": "high",
+        "vote": "3-0 / 3-0",
+        "sources": [
+          "https://arxiv.org/html/2604.01733v1"
+        ],
+        "evidence": "Two unanimously-verified claims from the same primary source (arXiv:2604.01733, T2-RAGBench financial text+table QA, 23,088 queries / 7,318 docs, embeddings = text-embedding-3-large, reranker = Cohere Rerank). Discussion: 'Adding a cross-encoder reranker...yields the largest improvement in our study: +17.2 percentage points MRR@3'. Table I/VI: Hybrid+Rerank nDCG@10 0.683 > Contextual-Hybrid 0.571 > Hybrid-RRF 0.551 > CRAG 0.536 > BM25 0.515 > Multi-Query 0.506 > Dense 0.466 > HyDE 0.433. Arithmetic reconciled (0.605-0.433=0.172=+39.7% rel). NOT a vendor self-benchmark (authors have no Cohere affiliation; open code/data on Zenodo doi:10.5281/zenodo.19382814). CAVEAT: single domain (financial QA with mixed text+table) where lexical signal is unusually strong — the absolute magnitude of the lift is partly domain-specific and the 'largest single improvement' is scoped to this study; recent (Apr 2026) preprint, likely not yet peer-reviewed. The DIRECTION (reranker = biggest lift on a hybrid stack) is corroborated by a second independent paper [arXiv:2504.19754], which finds reranking 'crucial' to realize chunking gains."
+      },
+      {
+        "claim": "qwen3-embedding-8b (4096-d) is a defensible, still-strong choice: it ranked #1 on the MTEB multilingual leaderboard as of June 5, 2025 (score 70.58) and natively supports Matryoshka truncation to smaller dims — so it need not be swapped, though the June-2025 ranking is a time-stamped vendor self-benchmark that has since been overtaken.",
+        "confidence": "high",
+        "vote": "3-0 / 3-0",
+        "sources": [
+          "https://qwenlm.github.io/blog/qwen3-embedding/",
+          "https://huggingface.co/Qwen/Qwen3-Embedding-8B"
+        ],
+        "evidence": "Two unanimous claims. Primary Qwen blog + HF model card (verbatim): '8B size embedding model ranks No.1 in the MTEB multilingual leaderboard (as of June 5, 2025, score 70.58)'. Spec table confirms 0.6B=1024-d, 4B=2560-d, 8B=4096-d, all with MRL ('custom dimensions for the final embedding'). FLAGS: (1) VENDOR SELF-BENCHMARK — Qwen is Alibaba's own product announcement; treat the #1 ranking with skepticism. (2) TIME-SENSITIVE — the claim's own caveat is corroborated: by Oct 2025 NVIDIA's Llama-Embed-Nemotron-8B is reported topping multilingual MTEB, so #1 changed after June 2025. Bottom line for tie-back: there is no clearly-better drop-in replacement that justifies a migration on quality alone; the model is current-generation and MRL means the 4096-d output can be truncated if storage/latency matter."
+      },
+      {
+        "claim": "Larger embedding dimensions stop paying off well below 4096-d: frontier models trained with Matryoshka Representation Learning deliberately ship usable lower-dimensional variants (Gemini Embedding = 3072-d default with trained-in 768- and 1536-d truncations), evidencing that smaller dims are a design choice with retained quality, not free truncations — so 4096-d is not necessarily oversized but is also not load-bearing for quality.",
+        "confidence": "high",
+        "vote": "3-0 / 3-0",
+        "sources": [
+          "https://arxiv.org/pdf/2503.07891"
+        ],
+        "evidence": "Two unanimous claims from the Gemini Embedding paper (arXiv:2503.07891, Google DeepMind, Mar 2025). Verbatim: 'Gemini Embedding provides d = 3,072 dimensional embeddings, with the MRL support on 768 and 1,536 dimensions.' MRL trains overlapping sub-dimension losses (first 768, first 1536) so prefixes are usable representations, not naive cuts. This is a frontier model choosing a LOWER default dim than qwen's 4096 with usable truncations — a data point that 4096-d is above the quality knee for most tasks. Relevant for storage/HNSW-build cost on the user's memory/knowledge tables: MRL truncation of qwen3 (e.g., to 1024-2048) is a viable lever to cut index size and query latency with modest quality loss, should that become a bottleneck. CAVEAT: this is one model's design point, not a controlled dim-vs-quality ablation on the user's data."
+      },
+      {
+        "claim": "MTEB leaderboard scores must be read with heavy skepticism: the maintainers themselves document (a) distributional training-data contamination (models trained on data resembling benchmark task distributions, beyond literal test leakage) that undermines naive comparisons, and (b) historical breaking changes in minor/patch releases that make cross-version score citations a reproducibility hazard (since corrected).",
+        "confidence": "high",
+        "vote": "3-0 / 3-0",
+        "sources": [
+          "https://arxiv.org/html/2506.21182v1"
+        ],
+        "evidence": "Two unanimous claims from 'Maintaining MTEB' (arXiv:2506.21182, June 2025), authored by MTEB's own maintainers. Verbatim on contamination: 'models being trained on datasets with similar distributions to benchmark tasks, particularly when using training splits from the same source as benchmark evaluation tasks'; remedy is a zero-shot score z=1-n_train/n_total. Verbatim on versioning: 'breaking changes were at times introduced in minor/patch releases, which frequent users found confusing'. Corroborated by HF's RTEB launch and PTEB paper (arXiv:2510.06730) as responses to the same overfitting concern. REFINEMENT: maintainers state versioning has SINCE been corrected ('more emphasis on maintaining backward compatibility') — treat the versioning point as a historical caveat, not current behavior. Practical implication: do not pick an embedding model on MTEB rank deltas alone; validate on the user's own retrieval eval set built from production traces."
+      },
+      {
+        "claim": "RRF is the standard rank-fusion method (formula sum 1/(k + rank_j); field-default k=60 from Cormack et al. 2009), and the user's rrf_k=50 is a defensible non-default sitting inside the empirically-insensitive band — k is a real but low-sensitivity lever: smaller k steepens top-rank dominance, larger k flattens scores.",
+        "confidence": "high",
+        "vote": "3-0 / 3-0 / 3-0",
+        "sources": [
+          "https://opensearch.org/blog/introducing-reciprocal-rank-fusion-hybrid-search/",
+          "https://ceur-ws.org/Vol-4173/T3-7.pdf",
+          "https://cormack.uwaterloo.ca/cormacksigir09-rrf.pdf"
+        ],
+        "evidence": "Three unanimous claims. OpenSearch (primary, for its own impl): formula 'rankScore = sum(1/(k + query_j_rank))', 'by default the rank constant is set to 60', and 'Larger rank constants make scores more uniform...Smaller rank constants create steeper differences...giving much more weight to top-ranked items'. CEUR FIRE-2025 paper + the original Cormack 2009 SIGIR paper both give k=60 as typical/near-optimal. IMPORTANT QUALIFIER carried by the verifiers: Cormack stresses 'the choice was NOT critical' — performance is empirically flat across k in [40,80], so rrf_k=50 is fine and re-tuning k is LOW priority. The flatten/steepen behavior is a necessary algebraic property (rank1/rank2 ratio at k=60 ~1.016x vs at k=1 ~1.5x), corroborated by Azure AI Search docs. The user's recency channel modeled as a third RRF input is unusual but not unsound; see chunking/recency open question."
+      },
+      {
+        "claim": "Rank-based RRF was slightly WORSE on relevance than well-calibrated score-normalization fusion in OpenSearch's own BEIR benchmark — RRF averaged 3.86% lower nDCG@10 across six datasets vs min-max-normalized hybrid fusion — so RRF is the robust/parameter-light default, not the relevance-maximizing one; tuned weighted score fusion can edge it out where score scales are calibratable.",
+        "confidence": "high",
+        "vote": "3-0",
+        "sources": [
+          "https://opensearch.org/blog/introducing-reciprocal-rank-fusion-hybrid-search/"
+        ],
+        "evidence": "Verbatim: 'RRF scores 3.86% lower than traditional score-based methods.' Verifier reproduced 3.86% from per-dataset table (NFCorpus 3.22, ArguAna 0.69, FIQA 8.13, Trec-Covid 0.47, SciDocs 4.81, Quora 5.82; mean=3.86). CREDIBILITY-RAISING that this is an against-interest vendor admission (OpenSearch reporting its own new feature is worse). CAVEATS: single engine + single benchmark config; 'tuned' overstates the baseline (it's OpenSearch's standard min_max/arithmetic_mean default, not per-dataset hand-tuning); generalization to a pgvector+tsvector stack is not guaranteed. Practical reading for tie-back: switching RRF->weighted score fusion is a marginal (~single-digit-%), fiddly optimization that requires score calibration across dense (cosine) and tsvector (ts_rank) — far below adding a reranker in ROI. Keep RRF; spend the effort on reranking."
+      },
+      {
+        "claim": "tsvector is on the weak end of the sparse spectrum but the sparse CHANNEL itself matters most for precise domain terminology — and upgrading from a tuned BM25 to learned sparse (SPLADE lineage) buys only a few nDCG@10 points on BEIR, with inference-free learned-sparse still trailing inference-based by ~4.7pp. So a reranker, not a sparse-channel swap, is the higher-ROI fix.",
+        "confidence": "high",
+        "vote": "3-0 / 2-1 / 3-0",
+        "sources": [
+          "https://arxiv.org/pdf/2411.04403",
+          "https://arxiv.org/html/2604.01733v1"
+        ],
+        "evidence": "From arXiv:2411.04403 (SIGIR 2025, OpenSearch/Amazon neural-sparse team — FLAG as vendor self-benchmark; first author is the OpenSearch neural-sparse maintainer): on a 13-dataset BEIR subset, BM25 avg nDCG@10 = 44.48, SPLADE-v3-Doc (inference-free SOTA) = 46.97, the proposed inference-free model = 50.35, inference-based SPLADE++-SelfDistill = 50.56, ColBERTv2 = 49.95. Verbatim: 'SPLADE-v3-Doc is 4.7 lower than siamese sparse retrievers of the same size and training method...This disparity hinders application in production.' EVALUATION CONDITIONS: 13-dataset SUBSET (excludes CQADupstack/BioASQ/Signal-1M/TREC-NEWS/Robust04); several baselines are the authors' OWN re-runs (marked 'trained and evaluated by us'). Separately, arXiv:2604.01733 shows WHY the sparse channel matters: BM25 BEAT dense text-embedding-3-large on a financial QA benchmark (Recall@5 0.644 vs 0.587, MRR@3 0.411 vs 0.351) because 'financial documents contain precise, domain-specific terminology...that lexical matching captures effectively' — domain-specific, must NOT be read as 'BM25 beats dense in general'. NET for tie-back: the lexical channel earns its keep, but the SPLADE gain over BM25 (~3-6 nDCG points) and BM25 gain over tsvector are smaller and far more effortful than the +17pp from a reranker; only consider BM25/SPLADE after the reranker is in and if exact-term recall is demonstrably the bottleneck."
+      },
+      {
+        "claim": "Contextual retrieval (LLM-prepended per-chunk context) and late chunking both yield only SMALL, model-dependent, and reranker-dependent retrieval gains over naive chunking — typically +1.5% to +4.6% nDCG — so for short notes/memories they are a lower-priority, optional improvement, and contextual retrieval's gain in particular only materializes when a reranking step is added.",
+        "confidence": "high",
+        "vote": "3-0 across all six constituent claims",
+        "sources": [
+          "https://arxiv.org/abs/2504.19754",
+          "https://arxiv.org/html/2409.04701v3"
+        ],
+        "evidence": "Independent academic source arXiv:2504.19754 (Merola & Singh, ECIR 2025 workshop, NOT vendor): contextual retrieval w/ rank fusion beats fixed-window uncontextualized only +4.6% (NDCG@5 0.317 vs 0.303, Jina-V3, NFCorpus subset) AND 'adding the final reranking step...is crucial to leverage this potential' — for UNcontextualized chunks rank-fusion alone HURT (0.303->0.289). Late chunking does NOT consistently beat early chunking and is strongly model-dependent (BGE-M3/NFCorpus collapsed: 0.070 late vs 0.246 early). Head-to-head, contextual barely edges late chunking (0.317 vs 0.309) at much higher compute. Jina's own paper (arXiv:2409.04701, VENDOR self-benchmark) reports late chunking +1.5-3.6% rel nDCG@10 on BEIR (largest with sentence boundaries) and 'comparable' to contextual retrieval on a SINGLE fictional financial doc (n=1 demo; contextual was actually slightly higher, 0.859 vs 0.852) without an extra LLM call. CONFLICT noted: independent eval contradicts Jina's 'comparable at scale' — contextual beat late chunking on NFCorpus. TIE-BACK: for the user's short notes/memories, late chunking (free, embedding-model-side) is worth a cheap A/B; contextual retrieval costs an LLM call per note and only pays off WITH a reranker — so sequence it after the reranker, not before."
+      },
+      {
+        "claim": "Long context does NOT cleanly replace retrieval. When literal lexical overlap between query and target is removed (forcing latent-association reasoning, the realistic case for memory recall), 11 of 13 LLMs claiming >=128K contexts dropped below 50% of their own strong short-context baseline at just 32K tokens, and even GPT-4o fell from 99.3% to 69.7% — strong evidence to keep retrieval quality + relevance gating central rather than dumping memories/notes into a long context.",
+        "confidence": "high",
+        "vote": "3-0 / 3-0",
+        "sources": [
+          "https://arxiv.org/abs/2502.05167"
+        ],
+        "evidence": "Two unanimous claims from NoLiMa (arXiv:2502.05167, ICML 2025, Adobe Research — NOT a vendor self-benchmark; Adobe evaluating competitors; public dataset+code adobe-research/NoLiMa). Abstract verbatim: 'At 32K, 11 models drop below 50% of their strong short-length baselines' and GPT-4o 'reduction from an almost-perfect baseline of 99.3% to 69.7%'. Baselines = each model's OWN max accuracy at <1K tokens. This is the cleanest available evidence for 'lost in the middle' / context degradation under realistic (non-lexical) recall. Minor precision note: 'long context' here = specifically 32K. DIRECT TIE-BACK: this validates the user's stated direction away from per-turn full injection toward a bounded always-on slice + on-demand recall — stuffing more into context degrades non-trivially even for frontier models, so retrieval precision and gating are the right levers. The convergent-norm pattern the user already identified (small bounded slice + gated recall tool) is the evidence-supported architecture; per-turn full top-k injection of every memory/note risks both noise and the very degradation NoLiMa measures."
+      },
+      {
+        "claim": "RANKED highest-ROI changes for the user's pgvector + tsvector + RRF stack (synthesis of the above): (1) Add a cross-encoder reranker over the fused top-N candidates — highest ROI, evidence-backed +17pp MRR / top nDCG, moderate effort. (2) Convert per-turn full top-k injection into a relevance-gated recall tool + small bounded always-on slice — medium effort, strong evidence from long-context degradation + the user's own outlier finding. (3) Tune ef_search up from the pgvector default of 40 — low effort, low-risk recall insurance at 4096-d. (4) Keep RRF and rrf_k~50 (low-sensitivity), keep qwen3-embedding-8b (still strong; MRL-truncate only if cost-bound). (5) Treat tsvector->BM25/SPLADE and contextual/late chunking as LATER, smaller, conditional gains.",
+        "confidence": "medium",
+        "vote": "synthesis (composed from unanimously-verified findings; the RANKING and the ef_search/recall-loss specifics are inference, not directly benchmarked)",
+        "sources": [
+          "https://arxiv.org/html/2604.01733v1",
+          "https://arxiv.org/abs/2502.05167",
+          "https://opensearch.org/blog/introducing-reciprocal-rank-fusion-hybrid-search/",
+          "https://qwenlm.github.io/blog/qwen3-embedding/"
+        ],
+        "evidence": "Ranking rationale: #1 reranker is the only change with a large, directly-measured lift on a same-shaped hybrid-RRF stack [2604.01733], and is the standard 'highest-ROI upgrade for a hybrid stack with none'; choose Cohere Rerank (the benchmarked one) or self-hosted bge-reranker-v2-m3 / Jina Reranker v2 if you want no external dependency — apply it AFTER RRF on the top ~50-100 fused candidates, returning top-k to the LLM. #2 gating is supported by NoLiMa degradation [2502.05167] + the user's stated outlier status; the convergent norm is a small bounded slice + on-demand recall, and a reranker's relevance scores can double as the gate (drop candidates below a score threshold instead of always injecting top-k). #3 ef_search: the verified RRF/HNSW material does NOT contain a measured recall-vs-ef_search curve, so this is a STANDARD-PRACTICE recommendation, not a benchmarked one — pgvector's default ef_search=40 is widely considered low for high-recall needs; raising it to ~100-200 typically recovers recall at modest latency cost, and dimensionality (4096-d) raises per-comparison cost but does not by itself dictate ef_search. CAVEAT: I did NOT find a verified source quantifying recall lost at ef_search=40 on 4096-d vectors specifically — measure it on your own data (recall@k vs a brute-force ground truth) rather than trusting a rule of thumb. #4/#5 follow from the flat-k and small-chunking-gain findings above."
+      }
+    ],
+    "caveats": "SOURCE-QUALITY / SKEPTICISM FLAGS (per the research instruction to flag vendor self-benchmarks): (1) The qwen3 #1-MTEB ranking [1] is Alibaba's own announcement and is time-stamped to June 5, 2025 — it has since been overtaken (e.g., NVIDIA Llama-Embed-Nemotron-8B by Oct 2025); do not treat it as current SOTA. (2) The learned-sparse 50.35-nDCG result [10][11] is from the OpenSearch/Amazon neural-sparse team (first author = the OpenSearch maintainer), on a 13-dataset BEIR SUBSET, with several baselines re-run in-house — directional, not a clean independent comparison. (3) The late-chunking BEIR gains and the 'comparable to contextual retrieval' demo [19][20] are from Jina AI, who sell the long-context embedding models that enable late chunking; the 'comparable' result is a single fictional-document (n=1) demo that an INDEPENDENT eval [arXiv:2504.19754] contradicts at scale. (4) The OpenSearch RRF-vs-score-fusion 3.86% figure [8] and RRF mechanics [6][7] are vendor docs for the vendor's own engine — credibility-raising for the against-interest 3.86% admission, but single-engine/single-config.\n\nNON-VENDOR / STRONGER SOURCES: NoLiMa [21][22] (Adobe, ICML 2025), the T2-RAGBench retrieval-strategy benchmark [12][13][14] (academic, open data), the MTEB-maintainers methodology paper [2][3], and the chunking eval [15][16][17][18] (Univ. of Bologna) are independent and carry the most weight.\n\nEVALUATION-CONDITION CAVEATS: The strongest reranker evidence [12][13] is a SINGLE domain (financial text+table QA) where lexical signal is unusually strong — the +17pp magnitude is partly domain-specific, though the direction (reranker = biggest single lift on a hybrid stack) is corroborated. The same domain caveat applies to 'BM25 beats dense' [14]: it is finance/numeric-specific and must NOT be generalized. NoLiMa's degradation [21][22] is measured specifically at 32K tokens. Several key papers ([12][13][14], the financial one) are recent (Apr 2026) preprints likely not yet peer-reviewed.\n\nGROUNDING-SYSTEM SPECIFICS NOT DIRECTLY ANSWERED BY VERIFIED SOURCES: I found NO verified source quantifying recall lost at ef_search=40 on 4096-d vectors specifically, nor a controlled BM25-vs-Postgres-tsvector quality comparison, nor a benchmark of recency-as-an-RRF-channel vs post-hoc time decay. Recommendations on ef_search tuning and the tsvector-vs-BM25 ordering are standard-practice inferences, flagged as such in the findings — validate on your own production-trace eval set (recall@k / nDCG against brute-force ground truth) before committing. Two verifier-noted nuances to honor: rrf_k is empirically flat across [40,80] (Cormack), so re-tuning k=50 is low-value; and qwen3's MRL means 4096-d is truncatable, so dimension is a cost lever, not a quality liability.",
+    "openQuestions": [
+      "How much recall is actually lost at ef_search=40 on 4096-dimensional qwen3 vectors in this specific pgvector/HNSW setup (m=16, ef_construction 256/64)? No verified source quantifies this — it must be measured directly (recall@k vs a brute-force/exact-NN ground truth on a production-trace query set) rather than estimated from a rule of thumb.",
+      "For SHORT notes/memories (as opposed to long documents), does contextual retrieval or late chunking help at all, and is the per-note LLM-context cost justified? The verified chunking benchmarks are on document corpora (NFCorpus, MS MARCO, BEIR), not on short atomic memory entries — the small gains may shrink further or vanish for already-short items.",
+      "Is recency better modeled as a fixed RRF channel (current 0.1 weight) or as a post-fusion/post-rerank time-decay multiplier? No verified source compares these two designs for ranking quality; whether a reranker's relevance score should be combined with recency (and how) is unresolved.",
+      "Which specific reranker maximizes the user's quality/latency/cost frontier — managed Cohere Rerank (the benchmarked one, external dependency) vs self-hosted bge-reranker-v2-m3 or Jina Reranker v2 (no external call, GPU cost)? The verified evidence establishes that a cross-encoder reranker is the right category and that Cohere works, but does not provide a head-to-head ranking of reranker models on comparable conditions."
+    ],
+    "refuted": [
+      {
+        "claim": "On the FIRE 2025 code-mixed IR task, RRF fusion of BM25 + a fine-tuned Sentence Transformer outperformed both standalone retrievers AND weighted (min-max normalized linear) fusion on every metric: RRF MAP@10=0.123 / NDCG@10=0.376 / P@5=0.293 / P@10=0.210, vs Weighted Fusion 0.118/0.361/0.267/0.200, Dense-only 0.105/0.332/0.233/0.183, BM25-only 0.089/0.298/0.200/0.167. This is direct evidence that RRF beats weighted score fusion in a hybrid stack.",
+        "vote": "1-2",
+        "source": "https://ceur-ws.org/Vol-4173/T3-7.pdf"
+      },
+      {
+        "claim": "RRF fusion gave a 38% relative improvement in MAP@10 over BM25 alone (0.123 vs 0.089) on this task, quantifying the lift a hybrid sparse+dense fusion provides over a sparse-only baseline.",
+        "vote": "0-3",
+        "source": "https://ceur-ws.org/Vol-4173/T3-7.pdf"
+      }
+    ],
+    "sources": [
+      {
+        "url": "https://qwenlm.github.io/blog/qwen3-embedding/",
+        "quality": "primary",
+        "angle": "Embeddings + MTEB leaders 2025-2026",
+        "claimCount": 5
+      },
+      {
+        "url": "https://awesomeagents.ai/leaderboards/embedding-model-leaderboard-mteb-april-2026/",
+        "quality": "blog",
+        "angle": "Embeddings + MTEB leaders 2025-2026",
+        "claimCount": 5
+      },
+      {
+        "url": "https://arxiv.org/html/2506.21182v1",
+        "quality": "primary",
+        "angle": "Embeddings + MTEB leaders 2025-2026",
+        "claimCount": 5
+      },
+      {
+        "url": "https://arxiv.org/pdf/2503.07891",
+        "quality": "primary",
+        "angle": "Embeddings + MTEB leaders 2025-2026",
+        "claimCount": 5
+      },
+      {
+        "url": "https://huggingface.co/blog/matryoshka",
+        "quality": "blog",
+        "angle": "Embeddings + MTEB leaders 2025-2026",
+        "claimCount": 5
+      },
+      {
+        "url": "https://weaviate.io/blog/hybrid-search-fusion-algorithms",
+        "quality": "blog",
+        "angle": "Hybrid search: sparse + RRF fusion",
+        "claimCount": 5
+      },
+      {
+        "url": "https://opensearch.org/blog/introducing-reciprocal-rank-fusion-hybrid-search/",
+        "quality": "primary",
+        "angle": "Hybrid search: sparse + RRF fusion",
+        "claimCount": 5
+      },
+      {
+        "url": "https://www.tigerdata.com/blog/introducing-pg_textsearch-true-bm25-ranking-hybrid-retrieval-postgres",
+        "quality": "blog",
+        "angle": "Hybrid search: sparse + RRF fusion",
+        "claimCount": 5
+      },
+      {
+        "url": "https://ceur-ws.org/Vol-4173/T3-7.pdf",
+        "quality": "primary",
+        "angle": "Hybrid search: sparse + RRF fusion",
+        "claimCount": 5
+      },
+      {
+        "url": "https://arxiv.org/pdf/2411.04403",
+        "quality": "primary",
+        "angle": "Hybrid search: sparse + RRF fusion",
+        "claimCount": 5
+      },
+      {
+        "url": "https://arxiv.org/html/2604.01733v1",
+        "quality": "primary",
+        "angle": "Reranking ROI: cross-encoders",
+        "claimCount": 5
+      },
+      {
+        "url": "https://www.pinecone.io/learn/series/rag/rerankers/",
+        "quality": "blog",
+        "angle": "Reranking ROI: cross-encoders",
+        "claimCount": 5
+      },
+      {
+        "url": "https://zeroentropy.dev/articles/ultimate-guide-to-choosing-the-best-reranking-model-in-2025/",
+        "quality": "blog",
+        "angle": "Reranking ROI: cross-encoders",
+        "claimCount": 5
+      },
+      {
+        "url": "https://www.anthropic.com/news/contextual-retrieval",
+        "quality": "blog",
+        "angle": "Chunking + contextual retrieval impact",
+        "claimCount": 5
+      },
+      {
+        "url": "https://jina.ai/news/late-chunking-in-long-context-embedding-models/",
+        "quality": "blog",
+        "angle": "Chunking + contextual retrieval impact",
+        "claimCount": 5
+      },
+      {
+        "url": "https://arxiv.org/abs/2504.19754",
+        "quality": "primary",
+        "angle": "Chunking + contextual retrieval impact",
+        "claimCount": 5
+      },
+      {
+        "url": "https://arxiv.org/html/2409.04701v3",
+        "quality": "primary",
+        "angle": "Chunking + contextual retrieval impact",
+        "claimCount": 5
+      },
+      {
+        "url": "https://aws.amazon.com/blogs/machine-learning/contextual-retrieval-in-anthropic-using-amazon-bedrock-knowledge-bases/",
+        "quality": "blog",
+        "angle": "Chunking + contextual retrieval impact",
+        "claimCount": 4
+      },
+      {
+        "url": "https://www.datacamp.com/tutorial/contextual-retrieval-anthropic",
+        "quality": "secondary",
+        "angle": "Chunking + contextual retrieval impact",
+        "claimCount": 5
+      },
+      {
+        "url": "https://arxiv.org/abs/2502.05167",
+        "quality": "primary",
+        "angle": "Long-context vs RAG tradeoffs",
+        "claimCount": 5
+      },
+      {
+        "url": "https://arxiv.org/html/2510.05381v1",
+        "quality": "primary",
+        "angle": "Long-context vs RAG tradeoffs",
+        "claimCount": 5
+      },
+      {
+        "url": "https://www.databricks.com/blog/long-context-rag-performance-llms",
+        "quality": "primary",
+        "angle": "Long-context vs RAG tradeoffs",
+        "claimCount": 5
+      },
+      {
+        "url": "https://arxiv.org/abs/2404.06654",
+        "quality": "primary",
+        "angle": "Long-context vs RAG tradeoffs",
+        "claimCount": 5
+      },
+      {
+        "url": "https://arxiv.org/html/2501.01880v1",
+        "quality": "primary",
+        "angle": "Long-context vs RAG tradeoffs",
+        "claimCount": 5
+      },
+      {
+        "url": "https://www.paradedb.com/learn/postgresql/tuning-pgvector",
+        "quality": "blog",
+        "angle": "ANN tuning + retrieval eval",
+        "claimCount": 5
+      },
+      {
+        "url": "https://thebuild.com/blog/on-pgvectorscale-and-hybrid-search-without-an-elasticsearch-sidecar/",
+        "quality": "blog",
+        "angle": "ANN tuning + retrieval eval",
+        "claimCount": 5
+      },
+      {
+        "url": "https://nerdleveltech.com/pgvector-hnsw-postgres-18-production-tuning-tutorial",
+        "quality": "blog",
+        "angle": "ANN tuning + retrieval eval",
+        "claimCount": 5
+      },
+      {
+        "url": "https://towardsdatascience.com/how-to-evaluate-retrieval-quality-in-rag-pipelines-part-3-dcgk-and-ndcgk/",
+        "quality": "blog",
+        "angle": "ANN tuning + retrieval eval",
+        "claimCount": 4
+      },
+      {
+        "url": "https://www.evidentlyai.com/llm-guide/rag-evaluation",
+        "quality": "blog",
+        "angle": "ANN tuning + retrieval eval",
+        "claimCount": 5
+      },
+      {
+        "url": "https://www.statsig.com/perspectives/golden-datasets-evaluation-standards",
+        "quality": "blog",
+        "angle": "ANN tuning + retrieval eval",
+        "claimCount": 4
+      }
+    ],
+    "stats": {
+      "angles": 6,
+      "sourcesFetched": 30,
+      "claimsExtracted": 147,
+      "claimsVerified": 25,
+      "confirmed": 23,
+      "killed": 2,
+      "afterSynthesis": 10,
+      "urlDupes": 1,
+      "budgetDropped": 5,
+      "agentCalls": 113
+    }
+  }
+}

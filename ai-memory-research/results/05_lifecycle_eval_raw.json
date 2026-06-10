@@ -1,0 +1,337 @@
+{
+  "summary": "Deep research harness — fan-out web searches, fetch sources, adversarially verify claims, synthesize a cited report.",
+  "agentCount": 106,
+  "logs": [
+    "Q: Produce a deep, technical, source-grounded survey of (a) the operational LIFECYC…",
+    "Decomposed into 5 angles: evaluation harness & methodology (priority), benchmarks & their critiques (verify + flag vendors), extraction & salience — what to remember, consolidation, reflection & sleep-time compute, forgetting, decay & dedup/conflict resolution",
+    "extraction & salience — what to remember: 6 results",
+    "benchmarks & their critiques (verify + flag vendors): 6 results",
+    "evaluation harness & methodology (priority): 6 results",
+    "evaluation harness & methodology (priority): 4 novel (2 filtered)",
+    "forgetting, decay & dedup/conflict resolution: 6 results",
+    "forgetting, decay & dedup/conflict resolution: 4 novel (2 filtered)",
+    "consolidation, reflection & sleep-time compute: 6 results",
+    "consolidation, reflection & sleep-time compute: 4 novel (2 filtered)",
+    "Fetched 24 sources → 119 claims → verifying top 25",
+    "\"MemoryAgentBench decomposes memory evaluation into…\": 3-0 ✓",
+    "\"LongMemEval is a benchmark of 500 manually-curated…\": 2-1 ✓",
+    "\"Conflict Resolution is the universal failure point…\": 3-0 ✓",
+    "\"Commercial/agentic memory systems (Mem0, MemGPT) p…\": 3-0 ✓",
+    "\"Existing memory benchmarks are inadequate: LOCOMO …\": 3-0 ✓",
+    "\"Dataset construction uses a needle-in-a-haystack p…\": 3-0 ✓",
+    "\"Long-term memory is a hard, unsolved problem even …\": 3-0 ✓",
+    "\"The paper decomposes memory-augmented assistants i…\": 3-0 ✓",
+    "\"LOCOMO is a benchmark of 50 very long-term convers…\": 3-0 ✓",
+    "\"LLMs lag far behind humans on long-term conversati…\": 3-0 ✓",
+    "\"LOCOMO evaluates memory via a QA task with five re…\": 2-1 ✓",
+    "\"Even with perfect memory recall, the READING stage…\": 3-0 ✓",
+    "\"Retrieving top-relevant OBSERVATIONS (atomic extra…\": 2-1 ✓",
+    "\"Expanding the memory index keys with LLM-extracted…\": 2-1 ✓",
+    "\"LongMemEval is a 500-question benchmark (peer-revi…\": 1-2 ✗",
+    "\"Value granularity matters and the tradeoff is meas…\": 3-0 ✓",
+    "\"LOCOMO-Plus introduces a 'Level-2 Cognitive Memory…\": 3-0 ✓",
+    "\"The original LOCOMO benchmark is methodologically …\": 3-0 ✓",
+    "\"The benchmark validates LLM-as-judge for memory ev…\": 3-0 ✓",
+    "\"Across diverse models and memory systems there is …\": 2-1 ✓",
+    "\"Memory extraction is event-driven (triggered at en…\": 3-0 ✓",
+    "\"Adding topic-based extraction plus the RL-trained …\": 3-0 ✓",
+    "\"RMM's reranker is load-bearing for the RL-based re…\": 3-0 ✓",
+    "\"Iterative, feedback-driven memory extraction (self…\": 2-1 ✓",
+    "\"For downstream task accuracy, extraction completen…\": 3-0 ✓",
+    "Verify done: 25 claims → 24 confirmed, 1 killed"
+  ],
+  "result": {
+    "question": "Produce a deep, technical, source-grounded survey of (a) the operational LIFECYCLE of AI agent memory — what to remember, how to consolidate, how to forget — and (b) how to RIGOROUSLY EVALUATE a memory system. Evaluation is the PRIORITY: it is the capability my system most lacks and the precondition for safely improving anything else. Prioritize 2024–2026 sources; cite every claim; verify benchmark claims and note dataset construction + evaluation conditions; flag vendor self-benchmarks.\n\nGROUNDING CONTEXT (my system, for tie-back — not the subject of the research): A multi-tier AI agent platform. Storage = pgvector (auto-extracted \"RecallStore\" memories, hybrid dense+sparse+recency RRF) + Neo4j (explicit agent-authored knowledge notes); embeddings qwen3-embedding-8b (4096-d). TWO prior research streams already concluded: (1) we're an OUTLIER auto-injecting the full memory store + KB into EVERY LLM call; the convergent norm is a small bounded always-on slice + on-demand recall. (2) The highest-ROI retrieval change is adding a cross-encoder reranker over the fused candidates and converting per-turn full injection into a RELEVANCE-GATED recall tool (reranker score as the gate). BUT we have NO evaluation at all — we cannot tell whether the reranker, the gating threshold, ef_search tuning, or any lifecycle change makes memory better or worse. So this brief must especially nail: what eval harness to build FIRST, and how to A/B these specific changes.\n\nLIFECYCLE CURRENT STATE: an observer LLM extracts memories every ~5 turns; an assembler LLM consolidates every ~7 turns; new memories are TTL-pinned for ~10 turns then become retrieval-only; semantic dedup fires at cosine ≥ 0.85; importance is a single 0–1 score.\n\nRESEARCH QUESTIONS:\n\nLifecycle — what to remember:\n- Salience/importance scoring; what gets extracted vs dropped; trigger policies (fixed every-N-turns vs event-driven vs end-of-session vs reflection-driven); precision/recall tradeoffs of aggressive vs conservative extraction.\n\nLifecycle — extraction methods:\n- LLM fact/triple extraction, structured-output schemas, prompt patterns; single-pass vs multi-pass; cost vs quality; hallucinated-memory risk.\n\nLifecycle — dedup & conflict resolution:\n- Semantic dedup thresholds and pitfalls; merge vs append vs supersede; contradiction detection/resolution; update-in-place vs versioning.\n\nLifecycle — consolidation / reflection:\n- Turning raw episodes into abstracted knowledge; periodic background passes; sleep-time consolidation; hierarchical summarization; avoiding summary drift / information loss.\n\nLifecycle — forgetting & decay:\n- TTL vs decay functions vs usage-based retention; capacity management; principled forgetting research; does forgetting improve END-TASK accuracy (not just token savings)?\n\nEvaluation — benchmarks:\n- LOCOMO, LongMemEval, MSC (Multi-Session Chat), DMR (Deep Memory Retrieval), PerLTQA, and 2025–2026 successors. For each: what it measures, dataset construction, known criticisms (e.g. published LOCOMO critiques), which best mirrors a long-running, multi-session, project-scoped agent.\n\nEvaluation — metrics & methodology:\n- Retrieval recall, answer accuracy, temporal reasoning, consistency, latency, token cost, \"memory efficiency\"; how to A/B a memory change; offline eval harnesses; LLM-as-judge pitfalls and calibration; building a bespoke eval set from production traces.\n\nEvaluation — failure taxonomy:\n- Hallucinated memories, stale-fact errors, retrieval misses, over-retrieval/noise injection, contradiction survival, privacy/leakage across users or projects.\n\nTIE IT BACK TO MY SYSTEM:\n- Which lifecycle knobs (observer@5 turns, assembler@7, TTL@10, dedup@0.85, single importance score) are PROVEN to matter, and what do good defaults look like?\n- What eval harness should I stand up FIRST (smallest thing that gives a trustworthy signal), and which benchmark most resembles my long-running, project-scoped, multi-session agent?\n- How specifically should I A/B the reranker + relevance-gating changes from the prior brief?\n- What are the highest-confidence lifecycle changes (event-driven extraction, importance-at-write-time, real consolidation/reflection, a principled forgetting policy)?\n\nDELIVERABLE FORMAT:\n1. Lifecycle best-practices per stage (trigger → extract → dedup/resolve → consolidate → forget), with the evidence behind each.\n2. Evaluation playbook: benchmark comparison table, metric set, A/B methodology, LLM-as-judge guidance.\n3. \"First eval harness to build\" — concrete, minimal, trustworthy, tailored to my system.\n4. Prioritized lifecycle improvements, ranked by confidence × impact.\n5. Full citations.",
+    "summary": "The single most important finding for your priority (evaluation) is that the field has converged on a small set of academically-rigorous, publicly-released harnesses you can adopt almost wholesale: LongMemEval (ICLR 2025) is the best-fit benchmark for a long-running, multi-session, project-scoped agent because it tests five abilities most other benchmarks omit (information extraction, multi-session reasoning, temporal reasoning, KNOWLEDGE UPDATES, and ABSTENTION), ships human-annotated answer-location labels that let you compute Recall@k / NDCG@k directly, and validates a gpt-4o LLM-as-judge at >97% human agreement — giving you a turnkey template for a trustworthy offline harness. The literature also hands you a clean, A/B-able conceptual decomposition (index/retrieve/read with control points value/key/query/reading-strategy) plus hard evidence that several of your prior-brief hypotheses are correct: a lightweight reranker over candidates is load-bearing (RMM collapses from 60.2% to 31.0% accuracy if you fine-tune the retriever instead of adding a reranker, validating \"rerank, don't RL the embedder\"), and relevance-gated retrieval of atomic extracted facts beats dumping raw logs or summaries. On lifecycle, the strongest converged signal contradicts one of your defaults: event-driven (end-of-session) extraction with retrieve-top-K-then-LLM-decide ADD-vs-MERGE is the dominant pattern (RMM), and for downstream task accuracy extraction COMPLETENESS (recall) matters more than precision — a conservative high-precision extractor that stores few facts scores HIGHEST on memory accuracy but LOWEST on QA, so your single-importance-score conservative posture likely hurts end-task performance. The universal, still-largely-unsolved failure mode across every evaluated system is conflict/contradiction resolution (<=6-7% on multi-hop conflict for all 22 systems in MemoryAgentBench), which is exactly your stale-fact/supersede risk and the thing your eval must measure. Net: build a LongMemEval-style offline harness FIRST (with Recall@k + an >97%-calibrated LLM-judge + an explicit knowledge-update/abstention slice), then A/B the reranker and the relevance gate against it.",
+    "findings": [
+      {
+        "claim": "EVALUATION HARNESS TO BUILD FIRST: LongMemEval is the best-fit benchmark and a turnkey template. It is a 500-question, peer-reviewed (ICLR 2025) benchmark testing five long-term-memory abilities — information extraction, multi-session reasoning, temporal reasoning, KNOWLEDGE UPDATES, and ABSTENTION — that LoCoMo/MemoryBank/PerLTQA omit. Each question is a needle hidden in a length-configurable history of task-oriented human-AI dialogues (LongMemEval_S ~115k tokens / ~40 sessions; LongMemEval_M ~500 sessions / ~1.5M tokens), the system parses sessions online then answers at the end, it ships human-annotated answer-location labels enabling Recall@k and NDCG@k, and its gpt-4o-2024-08-06 LLM-as-judge achieved >97% agreement with human annotators. This is the smallest trustworthy harness for a long-running, multi-session, project-scoped agent.",
+        "confidence": "high",
+        "vote": "merged from [4] (2-1), [5] (3-0), [15] (3-0); [4]'s superlative is editorial but well-argued and consistent with how the literature positions LongMemEval vs LoCoMo",
+        "sources": [
+          "https://arxiv.org/abs/2410.10813",
+          "https://arxiv.org/pdf/2410.10813",
+          "https://github.com/xiaowu0162/LongMemEval"
+        ],
+        "evidence": "Abstract: 'five core long-term memory abilities... information extraction, multi-session reasoning, temporal reasoning, knowledge updates, and abstention. With 500 meticulously curated questions.' Construction: 'Inspired by the needle-in-a-haystack test (Kamradt, 2023)... LongMemEvalS with approximately 115k tokens per problem and LongMemEvalM with 500 sessions (around 1.5 million tokens).' Online-then-answer: 'During test time, the tested system observes S sequentially.' Judge + retrieval metrics (§3.3): 'we prompt-engineer the gpt-4o-2024-08-06 model... achieves more than 97% agreement with human experts... LongMemEval contains human-annotated answer location labels... We report Recall@k and NDCG@k.' Coverage gap vs others: 'All long-term memory benchmarks including recent ones such as LoCoMo also fail to evaluate recall of information provided by the assistant or reasoning with updated user information.' TIE-BACK: this is your first harness — it directly exercises the knowledge-update/supersede and abstention paths your system has never been measured on, and the answer-location labels let you score your pgvector+Neo4j retrieval in isolation (Recall@k/NDCG@k) before and after the reranker. CAVEAT: the calibrated judge is the headline >97% but dips to ~90% on single-session-preference and abstention (open-ended) categories; per-category sample sizes are small (Preferences=30, some subgroups ~6), so report per-category error bars and don't over-read single-category deltas. The distractor/filler sessions are sourced from other benchmarks; the EVIDENCE sessions where info is hidden are the genuine task-oriented dialogues."
+      },
+      {
+        "claim": "MEMORY DESIGN SPACE IS A/B-ABLE AS THREE STAGES (indexing -> retrieval -> reading) WITH FOUR CONTROL POINTS (value, key, query, reading strategy). Two control points have quantified, transferable wins: (1) fact-augmented KEY EXPANSION — concatenating LLM-extracted user facts onto the stored value-as-key — improves retrieval recall by 9.4 pp (recall@k) and downstream QA by 5.4 pp averaged across all tested models; (2) VALUE granularity matters — a single user-assistant 'round' is more optimal than whole sessions, while compressing further into individual extracted facts HARMS overall accuracy (information loss) but IMPROVES multi-session reasoning.",
+        "confidence": "high",
+        "vote": "merged from [7] (3-0), [12] (2-1, near-duplicate of [7]) and [14] (3-0); all from LongMemEval ablations",
+        "sources": [
+          "https://arxiv.org/abs/2410.10813",
+          "https://arxiv.org/pdf/2410.10813"
+        ],
+        "evidence": "Stages/control points: 'three stages for a memory-augmented assistant: (1) indexing... (2) retrieval... (3) reading'; CP1 Value, CP2 Key, CP3 Query, CP4 Reading Strategy. Key expansion: 'using a flat index with the memory values themselves as the keys is a strong baseline, further expanding the keys with extracted user facts improves both memory recall (9.4% higher recall@k) and downstream question answering (5.4% higher accuracy)' — '9.4%... and 5.4%... across all models.' Value granularity (§5.2): 'round is the more optimal granularity... While further compression into individual user facts harms overall performance due to information loss, it improves the multi-session reasoning accuracy.' TIE-BACK: this is the conceptual frame for your A/B program — hold value/query/reading fixed and vary one CP at a time. Key expansion directly suggests indexing your RecallStore memories with extracted-fact keys (not just the raw memory text) as a cheap retrieval win complementary to the reranker. The round-vs-fact tradeoff is a direct lever on your observer's extraction aggressiveness: facts help cross-session synthesis but lose detail. CAVEATS: key-expansion gain requires CONCATENATION (facts WITH the value); facts-ONLY keys underperform baseline. Both findings are reader-model-dependent (round>session is strong with GPT-4o, ~neutral with Llama-3.1-8B) and measured under a fixed token budget on one retrieval stack (Stella V5 1.5B dense) — 'directly transferable' to your qwen3-8b+RRF+reranker is reasonable extrapolation, not proven."
+      },
+      {
+        "claim": "READING IS A SEPARATE, EVALUABLE BOTTLENECK FROM RETRIEVAL. Even with PERFECT (oracle) memory recall, how retrieved memories are presented to the LLM changes QA accuracy by up to 10 absolute points across three LLMs (GPT-4o, Llama-3.1-70B, Llama-3.1-8B) via Chain-of-Note + a JSON/structured format. Retrieval quality alone is insufficient; the reading/presentation step must be measured independently.",
+        "confidence": "high",
+        "vote": "3-0",
+        "sources": [
+          "https://arxiv.org/pdf/2410.10813"
+        ],
+        "evidence": "Verbatim (§5.5): 'Even with perfect memory recall, accurately utilizing retrieved items is non-trivial. Applying Chain-of-Note (Yu et al., 2023) and structured data format (Yin et al., 2023) improves question answering accuracy by as much as 10 absolute points across three LLMs.' The 10-pt figure is the authors' own oracle-retrieval measurement (Fig 6), not a citation. TIE-BACK: your eval harness must separate two metrics — Recall@k (did the right memory surface?) and end-task accuracy (did the model USE it correctly?) — because a reranker that improves Recall@k can still leave end-task accuracy flat if the reading prompt is poor. Format your injected memories as structured blocks and consider a Chain-of-Note-style 'note then answer' read step as a separate A/B arm. 'as much as 10' is an upper bound, not uniform across models; 'structured format' is specifically JSON in the paper."
+      },
+      {
+        "claim": "RERANKER-OVER-CANDIDATES IS LOAD-BEARING; DO NOT FINE-TUNE THE EMBEDDING RETRIEVER INSTEAD. In RMM (Reflective Memory Management, ACL 2025), removing the lightweight reranker and instead fine-tuning the retriever with the same RL rewards COLLAPSES LongMemEval performance from Recall@5 58.8% / Acc 60.2% (with reranker) to 34.2% / 31.0% — worse than plain RAG (54.3% / 58.8%). Direct retriever RL causes catastrophic forgetting without large labeled data; a reranker refines retrieval 'without modifying the retriever itself, making it adaptable to any pre-trained retrieval model.'",
+        "confidence": "high",
+        "vote": "3-0 (Contriever ablation, Table 2; numbers verified verbatim)",
+        "sources": [
+          "https://aclanthology.org/2025.acl-long.413.pdf",
+          "https://arxiv.org/abs/2503.08026"
+        ],
+        "evidence": "Table 2 (Contriever + Gemini-1.5-Flash): RAG 54.3/58.8; +RR w/o reranker (retriever fine-tuned) 34.2/31.0; +RR with reranker 58.8/60.2. Verbatim: 'Retrospective Reflection alone without a reranker misaligns retrieved content... Directly updating the retriever using RL rewards requires extensive amounts of training data... Without sufficient data, it can lead to issues like catastrophic forgetting (McCloskey and Cohen, 1989).' Method: 'lightweight reranker... ensures efficient retrieval refinement without modifying the retriever itself, making it adaptable to any pre-trained retrieval model.' TIE-BACK: this is the strongest external validation of your prior brief's #1 recommendation — add a reranker over the fused candidates rather than touching qwen3-embedding-8b. It also warns against the tempting alternative of fine-tuning your embedder. NUANCE: RMM reranks Top-K DENSE candidates and its reranker is an RL-trained linear reranker tuned online via LLM-citation rewards, NOT the off-the-shelf cross-encoder your prior brief proposed and NOT over RRF-fused dense+sparse candidates; the directional lesson (rerank, don't RL the embedder; reranker is decisive) transfers, the exact mechanism does not. Peer-reviewed ACL 2025 main, not a vendor self-benchmark."
+      },
+      {
+        "claim": "EVENT-DRIVEN (END-OF-SESSION) EXTRACTION WITH RETRIEVE-TOP-K-THEN-LLM-DECIDE ADD-vs-MERGE IS THE DOMINANT LIFECYCLE PATTERN. RMM extracts memories only when a session ENDS (not every-N-turns), decomposing the session into topic-based memories; then for EACH new memory it retrieves the Top-K most semantically similar existing memories and an LLM decides whether to directly ADD it or MERGE/supersede an existing one (update-in-place). Full RMM (topic extraction + RL reranker) yields a measurable end-task win: 69.8% Recall@5 / 70.4% Acc on LongMemEval (GTE) vs RAG 62.4%/63.6% and Long-Context 57.4% Acc; abstract reports >10% accuracy improvement over the no-memory baseline (scores averaged over 3 runs).",
+        "confidence": "high",
+        "vote": "merged from [20] (3-0, mechanism) and [21] (3-0, results)",
+        "sources": [
+          "https://aclanthology.org/2025.acl-long.413.pdf",
+          "https://arxiv.org/abs/2503.08026"
+        ],
+        "evidence": "Algorithm 1: 'if session S ends then M <- ExtractMemory(S)'; Fig 2 caption: 'this process occurs at the conclusion of each session.' Dedup/conflict: 'for each extracted memory, we retrieve the Top-K most semantically similar memories already present in the memory bank... an LLM determines whether the extracted memory should be directly added... or merged with an existing memory into an updated one' (Appendix D.1.2: Add() and Merge(index, merged_summary), genuine update-in-place, no versioning). Results: GTE rows — RMM 33.4 METEOR/57.1 BERT/69.8 Recall@5/70.4 Acc; RAG 62.4/63.6; Long-Context 57.4 Acc; '>10% accuracy improvement over the baseline without memory management'; 'Scores are averaged over 3 runs.' TIE-BACK: this directly challenges your fixed observer@5-turns trigger — the converged pattern triggers extraction at SESSION END, which for your project-scoped agent maps to job/thread/phase boundaries. Your dedup-at-cosine>=0.85 is the cheap first pass, but the convergent design adds an LLM ADD-vs-MERGE decision over the Top-K neighbors (not a pure cosine threshold), which is what handles supersede/update-in-place. CAVEAT: RMM is an AUTHORS' self-benchmark with no independent reproduction; domain is personalized dialogue, not a coding agent; the reranker is RL-trained, not a stock cross-encoder."
+      },
+      {
+        "claim": "FOR DOWNSTREAM TASK ACCURACY, EXTRACTION COMPLETENESS (RECALL) BEATS PRECISION — CONSERVATIVE EXTRACTION HURTS. A conservative high-precision extractor that stores few facts (Memobase: 92.24% memory accuracy but only 14.55% integrity) underperforms on QA; in ProMem's own ablation the one-pass 'w/o MC & MV' variant attains the HIGHEST memory accuracy (92.64%) but the LOWEST QA accuracy (50.60%), and QA rises monotonically with integrity (50.60% -> 62.12%) as accuracy falls (92.64% -> 88.12%). Iterative, feedback-driven extraction (self-questioning + re-extraction of uncovered turns) more than doubles memory integrity over one-pass baselines: ProMem reaches 73.80% integrity on HaluMem (vs ~41-43% Mem0/Supermemory, 14.55% Memobase) and the best downstream QA (62.26%).",
+        "confidence": "high",
+        "vote": "merged from [23] (3-0) and [22] (2-1); both from ProMem on HaluMem, numbers cross-verified against the original HaluMem paper",
+        "sources": [
+          "https://arxiv.org/abs/2601.04463",
+          "https://arxiv.org/abs/2511.03506"
+        ],
+        "evidence": "Verbatim: 'for downstream tasks, recalling complete information is more critical than maintaining perfect precision on fewer facts.' Ablation Table 2: 'w/o MC & MV' = integrity 54.03 / accuracy 92.64 (highest) / QA 50.60 (lowest); Full ProMem integrity 73.80 / accuracy 88.12 / QA 62.12. Main Table 1: Memobase 14.55 integrity/92.24 acc/35.33 QA; Mem0 42.91/.../53.02; Supermemory 41.53/.../54.07; ProMem 73.80/89.47/62.26. Definitions per paper: 'Memory Integrity = recall of ground-truth facts'; 'Memory Accuracy = correctness of extracted entries, penalizes hallucinations.' Baselines independently match the original HaluMem paper. TIE-BACK: this is the strongest signal that your single-importance-score + conservative-extraction posture likely DEPRESSES end-task accuracy. The convergent design is multi-pass / self-questioning extraction that errs toward completeness, paired with downstream verification — not a high-precision filter at write time. Importance is better used to PRIORITIZE retrieval/forgetting than to gate what gets extracted. CAVEATS: ProMem is a method self-benchmark on essentially one benchmark (HaluMem, fully LLM-synthesized with injected distractors, only ~700 sessions human-validated); 'more than doubles' is exact only vs the weakest baseline (5.07x vs Memobase; 1.72-1.78x vs Mem0/Supermemory). The recall>precision lesson is the robust, generalizable part; the absolute ProMem numbers are very recent (Jan 2026) and unreplicated."
+      },
+      {
+        "claim": "CONFLICT / CONTRADICTION RESOLUTION IS THE UNIVERSAL, LARGELY-UNSOLVED FAILURE MODE — AND THE FAILURE TAXONOMY YOUR EVAL MUST COVER. MemoryAgentBench decomposes memory into four competencies — Accurate Retrieval, Test-Time Learning, Long-Range Understanding (integrating info across >=100k tokens), and Conflict Resolution (revise/overwrite/remove stale info) — rather than one accuracy score. Across 22 systems + 5 backbones, ALL methods score <=6-7% on MULTI-HOP conflict resolution and only long-context agents reach ~45-60% even on single-hop; stale-fact/supersede handling is essentially unsolved across the evaluated architectures (a 2026 deterministic recipe later pushes multi-hop to ~50%, confirming the difficulty rather than refuting it).",
+        "confidence": "high",
+        "vote": "merged from [0] (3-0) and [2] (3-0)",
+        "sources": [
+          "https://arxiv.org/html/2507.05257v1",
+          "https://arxiv.org/abs/2507.05257"
+        ],
+        "evidence": "Four competencies (§1): 'Accurate Retrieval... Test-Time Learning... Long-Range Understanding... integrate information distributed across extended contexts (>=100k tokens)... Conflict Resolution: The skill to revise, overwrite, or remove previously stored information when faced with contradictory evidence.' Conflict results (FactConsolidation): 'all methods fail on the multi-hop situation (with achieving at most 6% accuracy)'; FactCon-SH GPT-4o 60.0, GPT-4o-mini 45.0, Claude-3.7 43.0, BM25 RAG 56.0. All systems used the same backbone (GPT-4o-mini) for the controlled comparison. TIE-BACK: this is your concrete failure taxonomy — instrument your eval for all four, but especially Conflict Resolution, because it IS your stale-fact / dedup-survival / supersede risk and the field's #1 open problem. Your cosine>=0.85 dedup + single importance score do NOTHING for multi-hop contradictions (where two old facts jointly imply a now-false answer). Build an explicit contradiction-survival probe (inject a fact, later supersede it, then query) into your harness. CAVEATS: conflict datasets are synthetic (counterfactual edits from MQUAKE); phrase as 'unsolved across the methods MemoryAgentBench evaluated (<=7% multi-hop)' — a June-2026 deterministic recipe reaches 51.5% multi-hop / 94.8% single-hop, so 'unsolvable' would overreach. The 'failure taxonomy' label is the synthesizer's paraphrase; the paper says 'competencies.'"
+      },
+      {
+        "claim": "VENDOR/COMMERCIAL MEMORY SYSTEMS UNDERPERFORM ON THIRD-PARTY BENCHMARKS — FLAG SELF-BENCHMARKS. On MemoryAgentBench (a third-party academic benchmark, all systems on the same GPT-4o-mini backbone), Mem0 scored 4.8% on NIAH-MQ retrieval and 0.8% on long-range summarization, and MemGPT 8.8% on NIAH-MQ, attributed to information loss (extraction discards content) and single-pass retrieval — directly contradicting vendor self-benchmarks.",
+        "confidence": "high",
+        "vote": "3-0",
+        "sources": [
+          "https://arxiv.org/html/2507.05257v1"
+        ],
+        "evidence": "Table 2: Mem0 NIAH-MQ 4.8, Mem0 inf-Bench-Sum 0.8, MemGPT NIAH-MQ 8.8. '“commercial memory agents such as MemGPT and Mem0 exhibit limited performance across a broad range of benchmarks”.' Attribution: 'Mem0 depends on extracting factual knowledge... an approach that inherently discards a substantial portion of the original content'; 'In the case of Mem0, retrieval is typically performed a single time, similar to conventional RAG.' TIE-BACK: when you read Mem0/Zep/Supermemory headline LoCoMo numbers (often 90%+), discount them — those are self-benchmarks on a contested dataset (see Finding 8). The 'extraction discards content' weakness is the SAME information-loss tradeoff Finding 6 quantifies: your reflexive auto-extraction can lose detail; pairing extraction with raw-round retrieval (Finding 2) mitigates it. NUANCE: 'single-pass retrieval' is specifically Mem0's weakness; the paper notes MemGPT 'permits multiple retrieval iterations,' so the single-pass attribution applies cleanly only to Mem0. The imposed 4096 chunk size for Mem0/Cognee is a fairness caveat the authors acknowledge, not a refutation."
+      },
+      {
+        "claim": "RETRIEVING TOP-RELEVANT ATOMIC OBSERVATIONS BEATS RAW LOGS, LONG-CONTEXT, AND SUMMARIES — VALIDATING RELEVANCE-GATED RECALL. On LoCoMo, feeding the top-5 relevant extracted OBSERVATIONS instead of raw conversation logs gave ~5% F1 improvement for GPT-3.5-turbo; long-context models did NOT beat the base model; and session SUMMARIES did not significantly help despite high recall (information lost in dialog->summary conversion). The benefit 'falters with an increase in the number of retrieved observations,' explicitly motivating reducing the signal-to-noise ratio.",
+        "confidence": "high",
+        "vote": "2-1 (numbers verbatim; the long-context finding is partly drawn from the event-summarization task but is independently corroborated in the QA section)",
+        "sources": [
+          "https://arxiv.org/abs/2402.17753"
+        ],
+        "evidence": "'There is a noticeable 5% improvement with gpt-3.5-turbo when the input is top 5 relevant observations instead of pure conversation logs'; '...falters with an increase in the number of retrieved observations, suggesting that it is important to reduce the signal-to-noise (SNR) ratio.' 'Contrary to expectations, the long-context model does not surpass the base model.' 'using session summaries as context does not significantly improve the performance despite high recall accuracies, likely due to loss of information.' TIE-BACK: this is direct support for converting your per-turn FULL injection into a relevance-gated recall of a SMALL set of top atomic memories (your prior brief's #2). The 'falters with more retrieved observations / reduce SNR' result is the empirical case for a gate THRESHOLD (reranker score) rather than top-k-of-everything, and it argues against summary-only memory. CAVEATS: GPT-3.5-era (Feb 2024) directional finding; LoCoMo has documented reliability critiques (Finding 8) so treat as directional, not a precise effect size; the long-context-doesn't-help sentence is from the summarization task but the QA section independently shows long-context adversarial accuracy collapsing to 2.1% via hallucination."
+      },
+      {
+        "claim": "FACTUAL-RECALL BENCHMARKS OVERSTATE TRUE MEMORY CAPABILITY; LOCOMO IS METHODOLOGICALLY FLAWED AND THE EVAL FRONTIER IS MOVING TO COGNITIVE/IMPLICIT MEMORY. LoCoMo equates conversational memory with explicit factual recall and relies on task-disclosed prompting + string-matching metrics, which 'can be systematically misleading, even for factual memory.' LoCoMo-Plus (2026) adds a Level-2 Cognitive Memory axis (causal, state, goal, value) testing implicit constraints inferred from prior interactions; across diverse models/memory systems there is a large LoCoMo->LoCoMo-Plus gap (Gemini-2.5-Pro 71.78->45.72, a 26.06-pt drop; A-Mem 59.64->42.44).",
+        "confidence": "high",
+        "vote": "merged from [16] (3-0), [17] (3-0), [18] (2-1)",
+        "sources": [
+          "https://arxiv.org/html/2602.10715v1"
+        ],
+        "evidence": "'they largely equate conversational memory with explicit factual recall... task-disclosed prompting and string-matching metrics—can be systematically misleading, even for factual memory.' Level-2: 'causal, state, goal, and value... which jointly shape appropriate behavior'; tests 'implicit constraints inferred from prior interactions, such as user state, goals, preferences, values, or causal context.' Table 1: Gemini-2.5-Pro 71.78/45.72/26.06; A-Mem 59.64/42.44/17.20; 'LoCoMo-Plus exposes a persistent and unresolved challenge across diverse modeling choices.' Independent audits (penfieldlabs) found ~6.4% of LoCoMo's answer key wrong and its judge accepts up to 63% of intentionally-wrong answers. TIE-BACK: do NOT pick LoCoMo as your primary harness, and treat your reranker A/B's LoCoMo deltas with suspicion — string-matching + flawed gold answers make it a poor discriminator. For a project agent whose value is applying inferred user goals/preferences across sessions, the cognitive-memory axis is exactly what you ultimately want to measure (after the LongMemEval baseline harness is in place). CAVEATS: LoCoMo-Plus is an author self-benchmark with metric-shift (LLM-judged constraint-consistency vs old EM/F1) and ~0.8 human-judge agreement; it is not apples-to-apples re-asking of the same questions."
+      },
+      {
+        "claim": "BENCHMARKS PRODUCE A LARGE, DISCRIMINATING SIGNAL — THE HEADROOM AN EVAL HARNESS SURFACES IS REAL. On LongMemEval_S, long-context LLMs show a 30-60% performance drop, and state-of-the-art commercial chat systems achieve only 30-70% accuracy in a setting MUCH SIMPLER than LongMemEval_S. On LoCoMo (GPT-3.5 era), the best LLM scored ~37.8 F1 vs a human baseline of 87.9 F1 (a ~50-point gap). Long-term memory is hard and unsolved enough that a proper harness reliably separates good from bad configurations.",
+        "confidence": "high",
+        "vote": "merged from [6] (3-0) and [10] (3-0)",
+        "sources": [
+          "https://arxiv.org/abs/2410.10813",
+          "https://arxiv.org/abs/2402.17753"
+        ],
+        "evidence": "LongMemEval: 'long-context LLMs show a 30% to 60% performance decline when tasked with reading the entire LongMemEvalS history'; 'state-of-the-art commercial systems (such as GPT-4o) only achieve 30%~70% accuracy in a setting much simpler than LongMemEvalS' (concrete: ChatGPT 37%, Coze 64% drops). LoCoMo: Human 87.9 F1, GPT-3.5-turbo-16K 37.8 F1, ~50-pt gap; 'these models still substantially lag behind human performance... prone to generating hallucinations.' TIE-BACK: this is the justification that your eval will MEASURE something — these tasks have wide dynamic range, so a reranker or gating change that helps will move the needle visibly (and one that hurts will too). CAVEAT (time-sensitivity): LoCoMo's 37.8 is GPT-3.5-era; by 2026 several systems report 79-94% on LoCoMo, so 'unsolved' overstates the CURRENT state for LoCoMo specifically — but LongMemEval's 30-70% headroom remains current, and the discriminating-signal point holds regardless."
+      },
+      {
+        "claim": "EXISTING BENCHMARKS ARE INADEQUATE IN SPECIFIC, ACTIONABLE WAYS — MOTIVATING INCREMENTAL MULTI-TURN EVALUATION AND A BESPOKE PRODUCTION-TRACE SET. LOCOMO (~9K tokens, per MemoryAgentBench's count) is too short to challenge current models; LongMemEval has limited topical diversity and less realistic interaction patterns; and general long-context datasets that 'provide the entire context in a single block are not directly applicable to evaluating memory agents.' This motivates an incremental multi-turn INJECTION design (sessions arrive sequentially) over single-block long-context evaluation.",
+        "confidence": "high",
+        "vote": "3-0",
+        "sources": [
+          "https://arxiv.org/html/2507.05257v1"
+        ],
+        "evidence": "'Early benchmarks such as LOCOMO (~9k tokens)... no longer challenge current models'; 'LongMemEval uses synthetic conversations with limited topical diversity, making the dialogues less realistic'; 'datasets that provide the entire context in a single block are not directly applicable to evaluating memory agents.' TIE-BACK: the structural lesson is that your harness should feed sessions INCREMENTALLY (mirroring how your agent ingests turns/jobs over time), not dump a single block — and because no public benchmark perfectly matches a project-scoped coding agent, your second-stage harness should be a BESPOKE eval set distilled from your own production traces (real jobs/threads with known later-referenced facts), scored with a LongMemEval-style answer-location + LLM-judge methodology. CAVEAT: the '~9K tokens' figure for LoCoMo is MemoryAgentBench's count; the original LoCoMo paper reports ~9.2K avg (Finding 8), while some counts cite 17-26K depending on scope — the 'too short' conclusion is the robust part."
+      }
+    ],
+    "caveats": "DATASET-CONSTRUCTION AND BENCHMARK-RELIABILITY CAVEATS (the brief asked these be flagged): (1) ALL of the major benchmarks here are SYNTHETIC. LoCoMo is LLM-agent-generated from personas + temporal event graphs then human-edited (~50 dialogues, avg 19.3 sessions, 304.9 turns, ~9,209 tokens each, 7,512 QA pairs in the PAPER across single-hop/multi-hop/temporal/open-domain/adversarial). LongMemEval embeds 500 hand-curated questions into needle-in-a-haystack histories with filler sessions sourced from OTHER benchmarks. HaluMem is fully LLM-synthesized with injected adversarial distractors (only ~700 sessions human-validated). MemoryAgentBench's conflict set is counterfactual edits from MQUAKE. None is naturally-occurring multi-session agent traffic — hence the recommendation to build a bespoke production-trace eval as stage two. (2) LoCoMo has WELL-DOCUMENTED published critiques: the publicly RELEASED dataset has only ~1,986 QA pairs (vs 7,512 in the paper), independent audits found ~6.4% of the answer key wrong and the judge accepting up to 63% of intentionally-wrong answers, conversations are short enough that a full-context baseline can beat memory systems, and it has no knowledge-update tests. Treat LoCoMo as a directional/foundational citation, NOT your primary discriminating harness. (3) VENDOR/AUTHOR SELF-BENCHMARK FLAGS: RMM (Finding 4,5), ProMem (Finding 6), and LoCoMo-Plus (Finding 10) are all authors-propose-both-method-and/or-metric with no independent reproduction yet; their RELATIVE/directional conclusions (reranker is load-bearing; recall>precision; factual benchmarks overstate capability) are the trustworthy parts, the absolute headline numbers are not yet replicated. Commercial systems' own LoCoMo numbers (Mem0/Zep/Supermemory at 90%+) are contradicted by the third-party MemoryAgentBench (Mem0 4.8% NIAH-MQ). (4) MODEL/STACK TRANSFER: most quantified wins are tied to specific reader models and retrieval stacks (Stella-1.5B, GTE, Contriever; GPT-4o/Gemini-1.5-Flash readers) — effect sizes will differ on your qwen3-embedding-8b + RRF + cross-encoder + your actual LLMs, which is precisely why standing up the eval harness BEFORE the reranker is the load-bearing recommendation. (5) TIME-SENSITIVITY: the field is moving fast (MemoryAgentBench Jul-2025, ProMem Jan-2026, LoCoMo-Plus Feb-2026, a deterministic conflict-resolution recipe ~Jun-2026); 'unsolved' claims for conflict resolution and for LoCoMo are already being qualified by 2026 successors. (6) NOTHING in the verified corpus directly validates your SPECIFIC numeric defaults (observer@5, assembler@7, TTL@10, dedup@0.85, single 0-1 importance) — the literature validates the SHAPE of better policy (event/boundary-driven extraction, completeness-biased multi-pass extraction, LLM ADD-vs-MERGE over Top-K neighbors rather than a pure cosine threshold, relevance-GATED recall over full injection, a reranker over candidates) but not your exact constants, which only your own harness can tune.",
+    "openQuestions": [
+      "FORGETTING/DECAY — EVIDENCE GAP: The verified corpus contains NO study that isolates whether principled forgetting/decay (TTL vs decay-function vs usage-based retention) IMPROVES end-task accuracy rather than merely saving tokens. The closest signal is indirect (over-retrieval injects noise and the top-5-observations benefit 'falters' as you retrieve more, per LoCoMo) — implying capacity management helps via SNR, but no direct ablation of a forgetting policy on downstream accuracy was confirmed. This is a genuine hole the brief asked about; your own harness may be the fastest way to answer it for your system (A/B TTL@10 vs decay vs usage-based, measured on Recall@k + end-task).",
+      "CONSOLIDATION / SLEEP-TIME REFLECTION — UNDER-EVIDENCED: Beyond RMM's per-session topic decomposition and ADD/MERGE, the corpus did not surface verified results on hierarchical summarization, periodic background 'sleep-time' consolidation passes, or quantified summary-drift/information-loss mitigation. The summaries-don't-help-despite-high-recall finding (LoCoMo) is a CAUTION against naive summarization, but the positive design for drift-free consolidation (your assembler@7) is unproven in the verified set.",
+      "OPTIMAL TRIGGER GRANULARITY FOR A PROJECT/CODING AGENT: RMM validates END-OF-SESSION extraction for DIALOGUE agents, but your agent's natural boundaries are job/thread/phase transitions, not chat sessions. Whether per-phase, per-job, or reflection-driven (e.g. on contradiction or on goal-change) extraction is best for a long-running project-scoped agent is unestablished — no benchmark in the corpus targets a coding/project agent specifically, which is why a bespoke production-trace harness is the only way to settle it.",
+      "RERANKER + RELEVANCE-GATE A/B PROTOCOL SPECIFICS: The corpus confirms a reranker is load-bearing and gating reduces noise, but does not provide a validated procedure for choosing the GATE THRESHOLD (reranker-score cutoff) or for jointly tuning ef_search + rerank-k + gate-threshold. Recommended approach (synthesized, not directly cited): on the LongMemEval-style harness, fix retrieval and sweep (a) reranker on/off, (b) rerank-k, (c) gate threshold, reporting Recall@k/NDCG@k AND end-task accuracy AND latency/token-cost per arm, with per-category breakdowns and the >97%-calibrated LLM-judge — but the optimal operating point is system-specific and unproven externally."
+    ],
+    "refuted": [
+      {
+        "claim": "LongMemEval is a 500-question benchmark (peer-reviewed, ICLR 2025) that decomposes long-term chat memory into five abilities — information extraction, multi-session reasoning, knowledge updates, temporal reasoning, and abstention — across seven question types, and explicitly criticizes prior benchmarks (LoCoMo, MemoryBank, PerLTQA) for not evaluating recall of assistant-provided information or reasoning over updated user info. This makes it the best-fitting benchmark for a long-running, multi-session, project-scoped agent.",
+        "vote": "1-2",
+        "source": "https://arxiv.org/pdf/2410.10813"
+      }
+    ],
+    "sources": [
+      {
+        "url": "https://arxiv.org/html/2507.05257v1",
+        "quality": "primary",
+        "angle": "evaluation harness & methodology (priority)",
+        "claimCount": 5
+      },
+      {
+        "url": "https://www.braintrust.dev/articles/what-is-llm-as-a-judge",
+        "quality": "blog",
+        "angle": "evaluation harness & methodology (priority)",
+        "claimCount": 5
+      },
+      {
+        "url": "https://www.langchain.com/articles/llm-as-a-judge",
+        "quality": "blog",
+        "angle": "evaluation harness & methodology (priority)",
+        "claimCount": 5
+      },
+      {
+        "url": "https://arxiv.org/abs/2410.10813",
+        "quality": "primary",
+        "angle": "evaluation harness & methodology (priority)",
+        "claimCount": 5
+      },
+      {
+        "url": "https://arxiv.org/abs/2402.17753",
+        "quality": "primary",
+        "angle": "benchmarks & their critiques (verify + flag vendors)",
+        "claimCount": 5
+      },
+      {
+        "url": "https://arxiv.org/pdf/2410.10813",
+        "quality": "primary",
+        "angle": "benchmarks & their critiques (verify + flag vendors)",
+        "claimCount": 5
+      },
+      {
+        "url": "https://arxiv.org/html/2602.10715v1",
+        "quality": "primary",
+        "angle": "benchmarks & their critiques (verify + flag vendors)",
+        "claimCount": 5
+      },
+      {
+        "url": "https://mem0.ai/blog/state-of-ai-agent-memory-2026",
+        "quality": "blog",
+        "angle": "benchmarks & their critiques (verify + flag vendors)",
+        "claimCount": 5
+      },
+      {
+        "url": "https://aclanthology.org/2025.acl-long.413.pdf",
+        "quality": "primary",
+        "angle": "benchmarks & their critiques (verify + flag vendors)",
+        "claimCount": 5
+      },
+      {
+        "url": "https://github.com/milla-jovovich/mempalace/issues/214",
+        "quality": "forum",
+        "angle": "benchmarks & their critiques (verify + flag vendors)",
+        "claimCount": 5
+      },
+      {
+        "url": "https://arxiv.org/abs/2601.04463",
+        "quality": "primary",
+        "angle": "extraction & salience — what to remember",
+        "claimCount": 5
+      },
+      {
+        "url": "https://arxiv.org/abs/2511.03506",
+        "quality": "primary",
+        "angle": "extraction & salience — what to remember",
+        "claimCount": 5
+      },
+      {
+        "url": "https://arxiv.org/abs/2503.08026",
+        "quality": "primary",
+        "angle": "extraction & salience — what to remember",
+        "claimCount": 5
+      },
+      {
+        "url": "https://arxiv.org/html/2603.07670v1",
+        "quality": "secondary",
+        "angle": "extraction & salience — what to remember",
+        "claimCount": 5
+      },
+      {
+        "url": "https://arxiv.org/pdf/2604.07877",
+        "quality": "primary",
+        "angle": "extraction & salience — what to remember",
+        "claimCount": 5
+      },
+      {
+        "url": "https://lilianweng.github.io/posts/2023-06-23-agent/",
+        "quality": "blog",
+        "angle": "extraction & salience — what to remember",
+        "claimCount": 5
+      },
+      {
+        "url": "https://arxiv.org/abs/2504.13171",
+        "quality": "primary",
+        "angle": "consolidation, reflection & sleep-time compute",
+        "claimCount": 5
+      },
+      {
+        "url": "https://www.letta.com/blog/sleep-time-compute",
+        "quality": "blog",
+        "angle": "consolidation, reflection & sleep-time compute",
+        "claimCount": 5
+      },
+      {
+        "url": "https://ar5iv.labs.arxiv.org/html/2304.03442",
+        "quality": "primary",
+        "angle": "consolidation, reflection & sleep-time compute",
+        "claimCount": 5
+      },
+      {
+        "url": "https://arxiv.org/abs/2308.15022",
+        "quality": "primary",
+        "angle": "consolidation, reflection & sleep-time compute",
+        "claimCount": 5
+      },
+      {
+        "url": "https://arxiv.org/html/2604.20006v1",
+        "quality": "primary",
+        "angle": "forgetting, decay & dedup/conflict resolution",
+        "claimCount": 5
+      },
+      {
+        "url": "https://mem0.ai/blog/memory-eviction-and-forgetting-in-ai-agents",
+        "quality": "blog",
+        "angle": "forgetting, decay & dedup/conflict resolution",
+        "claimCount": 5
+      },
+      {
+        "url": "https://github.com/mem0ai/mem0/issues/4896",
+        "quality": "forum",
+        "angle": "forgetting, decay & dedup/conflict resolution",
+        "claimCount": 4
+      },
+      {
+        "url": "https://arxiv.org/pdf/2601.18642",
+        "quality": "primary",
+        "angle": "forgetting, decay & dedup/conflict resolution",
+        "claimCount": 5
+      }
+    ],
+    "stats": {
+      "angles": 5,
+      "sourcesFetched": 24,
+      "claimsExtracted": 119,
+      "claimsVerified": 25,
+      "confirmed": 24,
+      "killed": 1,
+      "afterSynthesis": 12,
+      "urlDupes": 2,
+      "budgetDropped": 4,
+      "agentCalls": 106
+    }
+  }
+}

@@ -303,6 +303,18 @@ spec:
                 secretKeyRef:
                   name: {{ include "srw.secretName" . }}
                   key: MCP_INTERNAL_KEY
+            # MCP_DEV_TOKEN — dev-only fixed admin MCP token. When set, the
+            # orchestrator seeds this exact token for the admin user at startup
+            # and on first admin login (init._seed_admin_mcp_token) so a
+            # committed .mcp.json works out of the box against a local cluster.
+            # optional:true and unset in prod values — prod admins mint tokens
+            # via the cockpit, and an unset var means no auto-seed.
+            - name: MCP_DEV_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: MCP_DEV_TOKEN
+                  optional: true
             {{- end }}
             # CORS
             - name: CORS_ORIGINS

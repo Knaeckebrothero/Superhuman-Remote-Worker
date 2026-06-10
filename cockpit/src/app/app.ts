@@ -62,7 +62,7 @@ import {AppIconComponent} from './ui/icon';
               <app-icon size="inherit" class="pending-icon">hourglass_empty</app-icon>
               <h2>Account Pending Approval</h2>
               <p>Your account has been created but an administrator needs to approve it before you can access the system.</p>
-              <p class="pending-detail">You'll get full access once an admin assigns you the <strong>user</strong> role in Keycloak.</p>
+              <p class="pending-detail">You'll get full access as soon as an administrator approves your account.</p>
               <button class="pending-logout" (click)="userService.logout()">Logout</button>
             </div>
           </div>

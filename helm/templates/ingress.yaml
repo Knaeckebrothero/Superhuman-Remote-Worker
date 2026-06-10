@@ -79,6 +79,21 @@ spec:
           # per-session Ingress is "longer" only because of the {tid} suffix,
           # not the literal /p prefix — they collide).
           {{- end }}
+          {{- if and .Values.mcp.enabled .Values.mcp.exposeOnRootHost }}
+          # MCP on the cockpit host (local-dev convenience). Off by default;
+          # prod keeps the dedicated mcp.<domain> subdomain (the Keycloak
+          # OAuth-client host). FastMCP serves at /mcp and traefik preserves
+          # the path (no StripPrefix), so https://<cockpit>/mcp lands on
+          # srw-mcp:8055/mcp unchanged. Longest-prefix-first puts it ahead of
+          # the cockpit catch-all. Bearer-token auth works on either host.
+          - path: /mcp
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $fullName }}-mcp
+                port:
+                  number: 8055
+          {{- end }}
           - path: /
             pathType: Prefix
             backend:
