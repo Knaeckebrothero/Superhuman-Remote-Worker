@@ -248,6 +248,85 @@ def _session_ready() -> bool:
     )
 
 
+def _ensure_persistent_loop_started(
+    source: str,
+    client_id: str | None = None,
+) -> bool:
+    """Start the persistent turn loop once the session is fully attached.
+
+    Headless/SSE clients drive turns through REST and may never attach the
+    legacy control WebSocket. The loop therefore cannot be WebSocket-owned.
+    """
+    global _loop_task
+
+    if not _session_ready():
+        return False
+
+    if _loop_task is None or _loop_task.done():
+        callbacks = PersistentLoopCallbacks(
+            get_user_input=_loop_get_user_input,
+            on_token=_loop_on_token,
+            on_thinking=_loop_on_thinking,
+            on_tool_start=_loop_on_tool_start,
+            on_tool_result=_loop_on_tool_result,
+            permission_check=_loop_permission_check,
+            on_turn_start=_loop_on_turn_start,
+            on_turn_complete=_loop_on_turn_complete,
+            on_error=_loop_on_error,
+            check_interrupt=_loop_check_interrupt,
+            on_vm_upgrade_needed=_loop_on_vm_upgrade_needed,
+            on_context_compacted=_loop_on_context_compacted,
+            persist_message=_loop_persist_message,
+            hard_interrupt_event=_hard_interrupt_event,
+        )
+        _loop_task = asyncio.create_task(
+            run_persistent_loop(
+                llm_with_tools=_session.llm_with_tools,
+                tools=_session.tools,
+                context_manager=_session.context_manager,
+                config=_session.config,
+                system_prompt=_session.system_prompt,
+                callbacks=callbacks,
+                messages=_session.messages,
+                auxiliary_llm=_session.auxiliary_llm,
+                recall_store=_session.recall_store,
+                knowledge_store=_session.knowledge_store,
+                project_id=_session.project_id,
+                project_ids=_session.project_ids,
+                tool_context=_session.tool_context,
+                initial_turn_count=_session.turn_count,
+                get_current_tools=lambda: (
+                    _session.llm_with_tools,
+                    _session.tools,
+                ),
+            ),
+            name="persistent-loop",
+        )
+        asyncio.create_task(
+            _loop_completion_handler(_loop_task),
+            name="persistent-loop-completion",
+        )
+        logger.info(
+            "Persistent loop started: thread=%s source=%s",
+            _thread_id,
+            source,
+        )
+        return True
+
+    if client_id:
+        logger.info(
+            "Persistent loop already running, attached as subscriber client=%s",
+            client_id[:8],
+        )
+    else:
+        logger.info(
+            "Persistent loop already running: thread=%s source=%s",
+            _thread_id,
+            source,
+        )
+    return True
+
+
 async def _handle_heartbeat_intents(response: dict[str, Any]) -> None:
     """Heartbeat-response callback: react to orchestrator-set intents.
 
@@ -1189,7 +1268,7 @@ async def _attach_session(
         except Exception:
             pass
     # Back-compat: translate a bare nc_session_folder into the new schema
-    if not cloud_cfg and nc_folder:
+    if not cloud_mount_active and not cloud_cfg and nc_folder:
         cloud_cfg = _legacy_nc_cloud_cfg(nc_folder)
     if cloud_cfg:
         try:
@@ -1656,6 +1735,8 @@ async def handle_api_input(request: Request) -> JSONResponse:
             {"error": "content must be a non-empty string"},
             status_code=400,
         )
+    if not _ensure_persistent_loop_started("rest_input"):
+        return JSONResponse({"error": "Session not ready"}, status_code=503)
     _loop_last_user_content[0] = content
     await _loop_user_queue.put(content)
     return JSONResponse(
@@ -1822,57 +1903,7 @@ async def handle_persistent_websocket(ws: WebSocket) -> None:
     # Spawn the persistent loop if it isn't already running. Reconnecting
     # to a session whose loop is mid-turn just joins the broadcast — no
     # restart, no replay (replay arrives in chunk 2 via the event log).
-    global _loop_task
-    if _loop_task is None or _loop_task.done():
-        callbacks = PersistentLoopCallbacks(
-            get_user_input=_loop_get_user_input,
-            on_token=_loop_on_token,
-            on_thinking=_loop_on_thinking,
-            on_tool_start=_loop_on_tool_start,
-            on_tool_result=_loop_on_tool_result,
-            permission_check=_loop_permission_check,
-            on_turn_start=_loop_on_turn_start,
-            on_turn_complete=_loop_on_turn_complete,
-            on_error=_loop_on_error,
-            check_interrupt=_loop_check_interrupt,
-            on_vm_upgrade_needed=_loop_on_vm_upgrade_needed,
-            on_context_compacted=_loop_on_context_compacted,
-            persist_message=_loop_persist_message,
-            hard_interrupt_event=_hard_interrupt_event,
-        )
-        _loop_task = asyncio.create_task(
-            run_persistent_loop(
-                llm_with_tools=_session.llm_with_tools,
-                tools=_session.tools,
-                context_manager=_session.context_manager,
-                config=_session.config,
-                system_prompt=_session.system_prompt,
-                callbacks=callbacks,
-                messages=_session.messages,
-                auxiliary_llm=_session.auxiliary_llm,
-                recall_store=_session.recall_store,
-                knowledge_store=_session.knowledge_store,
-                project_id=_session.project_id,
-                project_ids=_session.project_ids,
-                tool_context=_session.tool_context,
-                initial_turn_count=_session.turn_count,
-                get_current_tools=lambda: (
-                    _session.llm_with_tools,
-                    _session.tools,
-                ),
-            ),
-            name="persistent-loop",
-        )
-        asyncio.create_task(
-            _loop_completion_handler(_loop_task),
-            name="persistent-loop-completion",
-        )
-        logger.info(f"Persistent loop started: thread={_thread_id}")
-    else:
-        logger.info(
-            f"Persistent loop already running, attached as subscriber "
-            f"client={client_id[:8]}"
-        )
+    _ensure_persistent_loop_started("websocket", client_id=client_id)
 
     # --- WebSocket receive loop ---
     global _loop_interrupt_flag

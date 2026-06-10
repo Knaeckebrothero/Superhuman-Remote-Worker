@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import sys
 import types
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -156,6 +157,47 @@ async def test_fresh_pod_path_emits_full_sequence(monkeypatch):
         ds_ids=None,
     )
 
+    states = [c["state"] for c in emit_calls]
+    assert states == ["provisioning", "booting", "ready"]
+
+
+@pytest.mark.asyncio
+async def test_fresh_pod_path_waits_when_agent_pod_marker_in_flight(monkeypatch):
+    """A sibling prepare/create path may already have created the pod but not
+    yet received the agent registration. Do not create a duplicate pod."""
+    fake_main = _install_fake_main(monkeypatch)
+    marker = {
+        "status": "created",
+        "pod_name": "srw-agent-s-existing",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    fake_main.postgres_db.get_thread = AsyncMock(
+        side_effect=[
+            {"id": "t1", "agent_id": None, "metadata": {"agent_pod": marker}},
+            {"id": "t1", "agent_id": "a-existing"},
+        ]
+    )
+    fake_main.postgres_db.get_agent = AsyncMock(
+        return_value={"id": "a-existing", "pod_ip": "10.0.0.9", "pod_port": 8001}
+    )
+    fake_main._find_idle_persistent_agent = AsyncMock(return_value=None)
+
+    emit_calls: list[dict] = []
+    _install_fake_lifecycle_module(monkeypatch, emit_calls)
+
+    from services.provision_or_assign import provision_or_assign
+
+    await provision_or_assign(
+        uid="u1",
+        tid="t1",
+        cfg="persistent_defaults",
+        co={},
+        pids=[],
+        ds_ids=None,
+    )
+
+    fake_main._find_idle_persistent_agent.assert_not_awaited()
+    fake_main.agent_provisioner.provision_agent.assert_not_awaited()
     states = [c["state"] for c in emit_calls]
     assert states == ["provisioning", "booting", "ready"]
 

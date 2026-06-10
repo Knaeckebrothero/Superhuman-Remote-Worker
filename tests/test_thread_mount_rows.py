@@ -504,6 +504,80 @@ async def test_build_agent_cloud_mount_uses_supported_thread_mount(monkeypatch):
     assert payload["mounts"][0]["target_path"] == "/cloud/home"
 
 
+@pytest.mark.asyncio
+async def test_build_agent_cloud_mount_uses_container_runtime_by_default(monkeypatch):
+    from main import _build_agent_cloud_mount
+    from services.cloud import RcloneMountSpec
+
+    class Backend:
+        backend_id = "nextcloud"
+        is_initialized = True
+
+        async def build_rclone_mount_spec(self, *, mount_kind, target_path, **kwargs):
+            assert mount_kind == "session_folder"
+            assert target_path == "/cloud/home"
+            return RcloneMountSpec(
+                source_type="webdav",
+                source_config={
+                    "url": "https://nc.test/remote.php/dav/files/agent/session/",
+                    "vendor": "nextcloud",
+                    "user": "agent-service",
+                },
+                auth={"type": "basic", "password": "agent-pass"},
+            )
+
+    monkeypatch.setenv("CLOUD_WORKSPACE_DRIVER", "rclone_mount")
+    monkeypatch.delenv("CLOUD_RCLONE_ALLOW_CONTAINER", raising=False)
+    router = MagicMock()
+    router.for_backend.return_value = Backend()
+    thread = {
+        "id": "thread-1",
+        "main_cloud_backend": "nextcloud",
+        "main_cloud_session_handle": "sessions/thread-1",
+    }
+
+    with patch("main.main_cloud_router", router):
+        payload = await _build_agent_cloud_mount(
+            thread,
+            mount_rows=[],
+            metadata={
+                "workspace_container": {
+                    "status": "ready",
+                    "pod_ip": "10.42.0.10",
+                }
+            },
+        )
+
+    assert payload is not None
+    assert payload["driver"] == "rclone"
+    assert payload["fallback"] is False
+    assert payload["mounts"][0]["mount_kind"] == "session_folder"
+
+
+@pytest.mark.asyncio
+async def test_build_agent_cloud_mount_container_runtime_can_be_disabled(monkeypatch):
+    from main import _build_agent_cloud_mount
+
+    monkeypatch.setenv("CLOUD_WORKSPACE_DRIVER", "rclone_mount")
+    monkeypatch.setenv("CLOUD_RCLONE_ALLOW_CONTAINER", "false")
+    payload = await _build_agent_cloud_mount(
+        {
+            "id": "thread-1",
+            "main_cloud_backend": "nextcloud",
+            "main_cloud_session_handle": "sessions/thread-1",
+        },
+        mount_rows=[],
+        metadata={
+            "workspace_container": {
+                "status": "ready",
+                "pod_ip": "10.42.0.10",
+            }
+        },
+    )
+
+    assert payload is None
+
+
 # ---------------------------------------------------------------------------
 # Phase 3a — multi-project mount path collision handling
 # ---------------------------------------------------------------------------

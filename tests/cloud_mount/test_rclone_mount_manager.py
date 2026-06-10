@@ -6,10 +6,12 @@ from src.services.cloud_mount import RcloneMountManager
 
 
 class FakeRemoteBackend:
-    def __init__(self) -> None:
+    def __init__(self, *, root: str | None = None) -> None:
         self.files: dict[str, str] = {}
         self.commands: list[tuple[str, int]] = []
         self.outputs_by_script: dict[str, str] = {}
+        if root is not None:
+            self.root = root
 
     def resolve_home_path(self, relative_path: str) -> str:
         return f"/home/agent-host/{relative_path}"
@@ -93,6 +95,51 @@ def test_starts_rclone_mount_and_installs_workspace_symlink():
     assert len(link_scripts) == 1
     assert "ln -sfn /cloud/home" in link_scripts[0]
     assert "${workspace}/cloud" in link_scripts[0]
+
+
+def test_cache_flags_are_gated_by_rclone_mount_help():
+    cfg = _cloud_mount_cfg()
+    cfg["mounts"][0]["cache"]["vfs_cache_min_free_space"] = "5G"
+    backend = FakeRemoteBackend()
+    manager = RcloneMountManager(
+        thread_id="thread-12345678",
+        cloud_cfg=cfg,
+        workspace_backend=backend,
+        workspace_root=Path("/home/agent-host/workspace"),
+    )
+
+    manager._start_all_sync()
+
+    script = next(
+        body
+        for path, body in backend.files.items()
+        if path.endswith("mount_srw-thread-1-home.sh")
+    )
+    mount_array = script.split("MOUNT_ARGS=(", 1)[1].split(")\n", 1)[0]
+    assert "--vfs-cache-min-free-space" not in mount_array
+    assert "MOUNT_HELP=" in script
+    assert "grep -Fq --" in script
+    assert "append_mount_flag --vfs-cache-min-free-space 5G" in script
+
+
+def test_workspace_link_uses_remote_backend_root_when_available():
+    backend = FakeRemoteBackend(root="/home/agent-host/workspace")
+    manager = RcloneMountManager(
+        thread_id="thread-12345678",
+        cloud_cfg=_cloud_mount_cfg(),
+        workspace_backend=backend,
+        workspace_root=Path("/workspace"),
+    )
+
+    manager._start_all_sync()
+
+    link_script = next(
+        body
+        for path, body in backend.files.items()
+        if path.endswith("install_cloud_links.sh")
+    )
+    assert "workspace=/home/agent-host/workspace" in link_script
+    assert "workspace=/workspace" not in link_script
 
 
 def test_mount_script_applies_default_filters_and_read_only_flag():

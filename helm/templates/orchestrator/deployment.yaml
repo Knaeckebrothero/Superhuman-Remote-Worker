@@ -466,6 +466,12 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: CLOUD_WORKSPACE_DRIVER
+            - name: CLOUD_RCLONE_ALLOW_CONTAINER
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: CLOUD_RCLONE_ALLOW_CONTAINER
+                  optional: true
             {{- if or .Values.opencloud.enabled (eq (default "" .Values.cloud.externalBackend) "opencloud") }}
             # OpenCloud — bundled (opencloud.enabled=true) or external
             # (cloud.externalBackend=opencloud). Skipped entirely otherwise so
@@ -740,6 +746,18 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: WORKSPACE_NAMESPACE
+                  optional: true
+            - name: WORKSPACE_FUSE_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: WORKSPACE_FUSE_ENABLED
+                  optional: true
+            - name: WORKSPACE_FUSE_PRIVILEGED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: WORKSPACE_FUSE_PRIVILEGED
                   optional: true
             - name: OPERATOR_HOME_ALLOWED_EMAIL
               valueFrom:

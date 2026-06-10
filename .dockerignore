@@ -26,6 +26,7 @@ env/
 
 # Workspace data (runtime, not build-time)
 workspace/
+orchestrator/workspace/
 backups/
 output/
 
@@ -55,6 +56,9 @@ project_documentation/
 
 # Advanced-LLM-Chat subproject (separate deployment)
 Advanced-LLM-Chat/
+
+# VM/containerDisk build outputs (not needed by app image builds)
+docker/agent-vm-base/
 
 # SQLite databases
 *.db

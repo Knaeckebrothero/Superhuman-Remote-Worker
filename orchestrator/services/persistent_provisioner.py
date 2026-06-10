@@ -16,6 +16,7 @@ For local development, persistent agents are started manually via:
 import asyncio
 import logging
 import os
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
@@ -170,8 +171,14 @@ class PersistentProvisioner:
             pvc_name, size="10Gi", labels={"srw/thread-id": thread_id}
         )
         if not pvc_ok:
+            now_iso = datetime.now(timezone.utc).isoformat()
             await self._set_thread_context(
-                thread_id, {"status": "failed", "error": "PVC creation failed"}
+                thread_id,
+                {
+                    "status": "failed",
+                    "error": "PVC creation failed",
+                    "updated_at": now_iso,
+                },
             )
             return False
 
@@ -193,12 +200,15 @@ class PersistentProvisioner:
                 body=manifest,
             )
             logger.info("Agent pod created: %s (thread %s)", pod_name, thread_id)
+            now_iso = datetime.now(timezone.utc).isoformat()
             await self._set_thread_context(
                 thread_id,
                 {
                     "status": "created",
                     "pod_name": pod_name,
                     "namespace": self._namespace,
+                    "created_at": now_iso,
+                    "updated_at": now_iso,
                 },
             )
 
@@ -207,7 +217,11 @@ class PersistentProvisioner:
             if pod_ip:
                 await self._set_thread_context(
                     thread_id,
-                    {"status": "ready", "pod_ip": pod_ip},
+                    {
+                        "status": "ready",
+                        "pod_ip": pod_ip,
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
+                    },
                 )
                 logger.info(
                     "Agent pod ready: %s @ %s (thread %s)",
@@ -221,7 +235,13 @@ class PersistentProvisioner:
                     pod_name,
                     thread_id,
                 )
-                await self._set_thread_context(thread_id, {"status": "creating"})
+                await self._set_thread_context(
+                    thread_id,
+                    {
+                        "status": "creating",
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
+                    },
+                )
 
             return True
         except Exception as e:
@@ -237,7 +257,11 @@ class PersistentProvisioner:
             logger.error("Failed to create agent pod for thread %s: %s", thread_id, e)
             await self._set_thread_context(
                 thread_id,
-                {"status": "failed", "error": str(e)},
+                {
+                    "status": "failed",
+                    "error": str(e),
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                },
             )
             return False
 
@@ -263,7 +287,13 @@ class PersistentProvisioner:
                 grace_period_seconds=30,
             )
             logger.info("Agent pod deleted: %s (thread %s)", pod_name, thread_id)
-            await self._set_thread_context(thread_id, {"status": "deleted"})
+            await self._set_thread_context(
+                thread_id,
+                {
+                    "status": "deleted",
+                    "deleted_at": datetime.now(timezone.utc).isoformat(),
+                },
+            )
             return True
         except Exception as e:
             if hasattr(e, "status") and e.status == 404:
@@ -271,6 +301,13 @@ class PersistentProvisioner:
                     "Agent pod already deleted: %s (thread %s)",
                     pod_name,
                     thread_id,
+                )
+                await self._set_thread_context(
+                    thread_id,
+                    {
+                        "status": "deleted",
+                        "deleted_at": datetime.now(timezone.utc).isoformat(),
+                    },
                 )
                 return True
             logger.error("Failed to delete agent pod for thread %s: %s", thread_id, e)

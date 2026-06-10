@@ -298,12 +298,12 @@ export class ModelGroupComponent {
     const baseModel = (llm?.['model'] as string) ?? null;
 
     this.strategicModel.set(
-      (strat?.['model'] as string) ?? baseModel ?? this.loadSavedModel('strategic'),
+      strat?.['model'] || baseModel ? null : this.loadSavedModel('strategic'),
     );
     this.tacticalModel.set(
-      (tact?.['model'] as string) ?? baseModel ?? this.loadSavedModel('tactical'),
+      tact?.['model'] || baseModel ? null : this.loadSavedModel('tactical'),
     );
-    this.sessionModel.set(baseModel ?? this.loadSavedModel('session'));
+    this.sessionModel.set(baseModel ? null : this.loadSavedModel('session'));
   }
 
   private loadSavedModel(key: keyof typeof STORAGE_KEYS): string | null {

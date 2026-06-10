@@ -59,6 +59,9 @@ async def provision_or_assign(
         wait_for_binding,
         wait_for_ready,
     )
+    from services.session_provisioning_state import (
+        agent_pod_provisioning_in_progress,
+    )
 
     lifecycle_emit(uid, tid, "provisioning")
     pod_ip: str | None = None
@@ -80,57 +83,64 @@ async def provision_or_assign(
                 # than double-emitting booting/ready.
                 return
 
-            # Try to attach an idle dual-mode agent from the warm pool
-            # first — this is instant (no image pull or pod boot needed).
-            # _send_session_attach writes threads.agent_id via the
-            # orchestrator's own DB connection, so the binding is visible
-            # to other lock-takers immediately on release.
-            idle_agent = await _find_idle_persistent_agent()
-            if idle_agent:
-                resolved_ds = await postgres_db.resolve_datasources_for_thread(
-                    datasource_ids=ds_ids, project_ids=pids
+            if agent_pod_provisioning_in_progress(cur):
+                logger.info(
+                    "Thread %s: agent pod already provisioning — waiting for binding.",
+                    tid,
                 )
-                ds_payload = _build_datasources_payload(resolved_ds)
-                attach_co = co
-                if resolved_ds:
-                    attach_co = _build_datasource_tool_override(resolved_ds, co)
-                ok = await _send_session_attach(
-                    idle_agent, tid, attach_co, pids, datasources=ds_payload
-                )
-                if ok:
-                    logger.info(
-                        "Thread %s: attached to idle pool agent %s",
-                        tid,
-                        idle_agent["hostname"],
-                    )
-                    pod_ip = idle_agent["pod_ip"]
-                    pod_port = int(idle_agent.get("pod_port", 8001))
-                # else fall through to fresh-pod path
-
-            if pod_ip is None:
-                # No idle agent (or pool attach failed) — create a
-                # dedicated session pod. Only kick off the creation here;
-                # the binding wait happens AFTER the lock is released, so
-                # the new pod's /register call can grab the same lock.
-                pod_name = await agent_provisioner.provision_agent(
-                    purpose="session", thread_id=tid, config_name=cfg
-                )
-                if not pod_name:
-                    logger.error(
-                        "Thread %s: no idle agents and pod "
-                        "provisioning failed. Check image "
-                        "availability, RBAC, node resources, "
-                        "or increase MAX_AGENTS.",
-                        tid,
-                    )
-                    lifecycle_emit(
-                        uid,
-                        tid,
-                        "failed",
-                        reason="no idle agents and pod provisioning failed",
-                    )
-                    return
                 needs_binding_wait = True
+            else:
+                # Try to attach an idle dual-mode agent from the warm pool
+                # first — this is instant (no image pull or pod boot needed).
+                # _send_session_attach writes threads.agent_id via the
+                # orchestrator's own DB connection, so the binding is visible
+                # to other lock-takers immediately on release.
+                idle_agent = await _find_idle_persistent_agent()
+                if idle_agent:
+                    resolved_ds = await postgres_db.resolve_datasources_for_thread(
+                        datasource_ids=ds_ids, project_ids=pids
+                    )
+                    ds_payload = _build_datasources_payload(resolved_ds)
+                    attach_co = co
+                    if resolved_ds:
+                        attach_co = _build_datasource_tool_override(resolved_ds, co)
+                    ok = await _send_session_attach(
+                        idle_agent, tid, attach_co, pids, datasources=ds_payload
+                    )
+                    if ok:
+                        logger.info(
+                            "Thread %s: attached to idle pool agent %s",
+                            tid,
+                            idle_agent["hostname"],
+                        )
+                        pod_ip = idle_agent["pod_ip"]
+                        pod_port = int(idle_agent.get("pod_port", 8001))
+                    # else fall through to fresh-pod path
+
+                if pod_ip is None:
+                    # No idle agent (or pool attach failed) — create a
+                    # dedicated session pod. Only kick off the creation here;
+                    # the binding wait happens AFTER the lock is released, so
+                    # the new pod's /register call can grab the same lock.
+                    pod_name = await agent_provisioner.provision_agent(
+                        purpose="session", thread_id=tid, config_name=cfg
+                    )
+                    if not pod_name:
+                        logger.error(
+                            "Thread %s: no idle agents and pod "
+                            "provisioning failed. Check image "
+                            "availability, RBAC, node resources, "
+                            "or increase MAX_AGENTS.",
+                            tid,
+                        )
+                        lifecycle_emit(
+                            uid,
+                            tid,
+                            "failed",
+                            reason="no idle agents and pod provisioning failed",
+                        )
+                        return
+                    needs_binding_wait = True
 
         # Lock released. The fresh-pod path now waits for the agent's
         # /register handler to write threads.agent_id (which needs the

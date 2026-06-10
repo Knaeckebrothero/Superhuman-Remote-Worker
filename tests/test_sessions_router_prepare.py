@@ -1,5 +1,6 @@
 """Tests for POST /api/sessions/{tid}/prepare and GET /api/sessions/{tid}/connection."""
 
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -30,6 +31,16 @@ def app(monkeypatch):
     app = FastAPI()
 
     _install_fake_auth(monkeypatch)
+
+    def _capture_background_task(coro):
+        coro.close()
+        return MagicMock()
+
+    monkeypatch.setattr(
+        "orchestrator.routers.sessions._schedule_prepare_task",
+        _capture_background_task,
+        raising=True,
+    )
 
     fake_db = AsyncMock()
     fake_db.get_thread = AsyncMock(
@@ -225,6 +236,95 @@ async def test_do_prepare_emits_failed_when_pod_not_ready(monkeypatch):
     states = [c["state"] for c in emit_calls]
     assert "failed" in states
     fake_main.session_router.ensure_route.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_do_prepare_waits_when_agent_pod_marker_in_flight(monkeypatch):
+    """If create-thread already created a session pod, prepare should wait
+    for that pod to register instead of provisioning a duplicate."""
+    from orchestrator.routers import sessions as sessions_mod
+
+    marker = {
+        "status": "created",
+        "pod_name": "srw-agent-s-existing",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    db = AsyncMock()
+    db.get_thread = AsyncMock(
+        side_effect=[
+            {
+                "id": "t1",
+                "user_id": "u1",
+                "agent_id": None,
+                "config_name": "persistent_defaults",
+                "metadata": {"agent_pod": marker},
+            },
+            {
+                "id": "t1",
+                "user_id": "u1",
+                "agent_id": "agent-xyz",
+                "config_name": "persistent_defaults",
+            },
+        ]
+    )
+    db.get_agent.return_value = {
+        "id": "agent-xyz",
+        "pod_ip": "10.0.0.5",
+        "pod_port": 8001,
+        "hostname": "srw-agent-s-existing",
+        "pod_uid": "k8s-uid-1",
+    }
+    lock_cm = AsyncMock()
+    lock_cm.__aenter__.return_value = None
+    lock_cm.__aexit__.return_value = False
+    db.thread_advisory_lock = MagicMock(return_value=lock_cm)
+    monkeypatch.setattr(sessions_mod, "_get_db", lambda: db, raising=False)
+
+    provision = AsyncMock()
+    monkeypatch.setattr(
+        sessions_mod, "_provision_agent_for_thread", provision, raising=True
+    )
+
+    async def _bound(*args, **kwargs):
+        return True
+
+    async def _ready_ok(pod_ip, pod_port, timeout_s):
+        return True
+
+    monkeypatch.setattr(sessions_mod, "wait_for_binding", _bound, raising=True)
+    monkeypatch.setattr(sessions_mod, "wait_for_ready", _ready_ok, raising=True)
+
+    import sys
+
+    fake_main = MagicMock()
+    fake_main.session_router = AsyncMock()
+    fake_main.session_router.ensure_route = AsyncMock(return_value="/p/t1")
+    monkeypatch.setitem(sys.modules, "main", fake_main)
+
+    emit_calls: list[dict] = []
+
+    def _capture_emit(user_id, thread_id, state, **extra):
+        emit_calls.append(
+            {"user_id": user_id, "thread_id": thread_id, "state": state, **extra}
+        )
+
+    monkeypatch.setattr(sessions_mod, "lifecycle_emit", _capture_emit, raising=True)
+
+    await sessions_mod._do_prepare(
+        thread_id="t1",
+        user_id="u1",
+        config_name="persistent_defaults",
+        config_override=None,
+    )
+
+    provision.assert_not_awaited()
+    states = [c["state"] for c in emit_calls]
+    assert states == ["provisioning", "booting", "ready"]
+    fake_main.session_router.ensure_route.assert_called_once_with(
+        thread_id="t1",
+        pod_name="srw-agent-s-existing",
+        pod_uid="k8s-uid-1",
+    )
 
 
 # --------------------------------------------------------------------------- #

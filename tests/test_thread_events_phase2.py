@@ -15,7 +15,7 @@ Covers:
 """
 
 import asyncio
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -414,3 +414,85 @@ class TestAgentRestInputEndpointsNoSession:
         finally:
             mod._session = None
             mod._loop_user_queue = None
+
+    @pytest.mark.asyncio
+    async def test_api_input_starts_loop_without_websocket(self):
+        """Direct/SSE sessions must not depend on a control WebSocket attach.
+
+        The REST endpoint used by Cockpit should both accept the message and
+        ensure the persistent loop is running, otherwise the input sits in
+        _loop_user_queue forever.
+        """
+        import json
+        from types import SimpleNamespace
+
+        from starlette.requests import Request
+
+        import src.api.persistent_app as mod
+
+        async def receive():
+            return {
+                "type": "http.request",
+                "body": json.dumps({"content": "hello from REST"}).encode(),
+                "more_body": False,
+            }
+
+        request = Request(
+            {
+                "type": "http",
+                "method": "POST",
+                "headers": [(b"content-type", b"application/json")],
+            },
+            receive,
+        )
+
+        seen_inputs: list[str] = []
+
+        async def fake_run_persistent_loop(**kwargs):
+            seen_inputs.append(await kwargs["callbacks"].get_user_input())
+
+        mod._thread_id = "thread-rest"
+        mod._loop_task = None
+        mod._loop_user_queue = asyncio.Queue()
+        mod._loop_last_user_content = [""]
+        mod._hard_interrupt_event = asyncio.Event()
+        mod._session = SimpleNamespace(
+            llm_with_tools=object(),
+            tools=[],
+            context_manager=object(),
+            config=SimpleNamespace(
+                llm=SimpleNamespace(timeout=1),
+                interactive=SimpleNamespace(idle_timeout_minutes=0),
+            ),
+            system_prompt="system",
+            messages=[],
+            auxiliary_llm=None,
+            recall_store=None,
+            knowledge_store=None,
+            project_id=None,
+            project_ids=[],
+            tool_context=None,
+            turn_count=0,
+            postgres_conn=None,
+        )
+
+        try:
+            with (
+                patch.object(
+                    mod,
+                    "run_persistent_loop",
+                    new=fake_run_persistent_loop,
+                ),
+                patch.object(mod, "_loop_completion_handler", new=AsyncMock()),
+            ):
+                response = await mod.handle_api_input(request)
+                assert response.status_code == 200
+                await asyncio.wait_for(mod._loop_task, timeout=1)
+
+            assert seen_inputs == ["hello from REST"]
+        finally:
+            mod._session = None
+            mod._thread_id = None
+            mod._loop_task = None
+            mod._loop_user_queue = None
+            mod._hard_interrupt_event = None
