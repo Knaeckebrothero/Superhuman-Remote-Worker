@@ -1,0 +1,314 @@
+{
+  "summary": "Deep research harness — fan-out web searches, fetch sources, adversarially verify claims, synthesize a cited report.",
+  "agentCount": 104,
+  "logs": [
+    "Q: Produce a deep, source-grounded survey of graph-based and TEMPORAL memory for AI…",
+    "Decomposed into 5 angles: Graph construction + ontology design from conversational text, Temporal / bi-temporal KG memory (Zep, Graphiti) + invalidation, GraphRAG + Leiden communities + cost-reduced variants, Skeptical evidence: independent replication of graph-vs-vector benchmarks, Graph+vector hybrid architecture, sync, and when graph is overkill",
+    "GraphRAG + Leiden communities + cost-reduced variants: 6 results",
+    "Temporal / bi-temporal KG memory (Zep, Graphiti) + invalidation: 6 results",
+    "Graph construction + ontology design from conversational text: 6 results",
+    "Graph construction + ontology design from conversational text: 4 novel (2 filtered)",
+    "Skeptical evidence: independent replication of graph-vs-vector benchmarks: 6 results",
+    "Skeptical evidence: independent replication of graph-vs-vector benchmarks: 3 novel (3 filtered)",
+    "Graph+vector hybrid architecture, sync, and when graph is overkill: 6 results",
+    "Graph+vector hybrid architecture, sync, and when graph is overkill: 3 novel (3 filtered)",
+    "Fetched 22 sources → 107 claims → verifying top 25",
+    "\"EDC decomposes KG construction into three sequenti…\": 3-0 ✓",
+    "\"A single framework can support both fixed/pre-defi…\": 3-0 ✓",
+    "\"The field has shifted from manually expert-designe…\": 3-0 ✓",
+    "\"When constructing knowledge graphs with LLMs, the …\": 3-0 ✓",
+    "\"Traditional staged KG-construction pipelines suffe…\": 3-0 ✓",
+    "\"LLM-empowered KG construction divides into schema-…\": 3-0 ✓",
+    "\"LLM-constructed knowledge graphs are systematicall…\": 1-2 ✗",
+    "\"Aggressively pruning an LLM-built KG IMPROVES (or …\": 1-2 ✗",
+    "\"LLM-based knowledge-graph construction was evaluat…\": 3-0 ✓",
+    "\"The benefit of a graph over plain vector retrieval…\": 1-2 ✗",
+    "\"Different LLMs produce structurally divergent know…\": 2-1 ✓",
+    "\"GraphRAG builds a graph index with an LLM in two s…\": 3-0 ✓",
+    "\"On the harder LongMemEval benchmark (conversations…\": 3-0 ✓",
+    "\"Zep/Graphiti uses an explicit bi-temporal model st…\": 3-0 ✓",
+    "\"Contradictions are resolved by edge invalidation r…\": 3-0 ✓",
+    "\"Conventional (vector) RAG fails on global, corpus-…\": 3-0 ✓",
+    "\"On a class of global sensemaking questions over da…\": 3-0 ✓",
+    "\"GraphRAG measurably beats vector/standard RAG on c…\": 3-0 ✓",
+    "\"LazyGraphRAG's data indexing cost is identical to …\": 3-0 ✓",
+    "\"At a query cost of just 4% of GraphRAG global sear…\": 0-3 ✗",
+    "\"Despite conceptual promise, GraphRAG systems frequ…\": 3-0 ✓",
+    "\"Microsoft GraphRAG's global mode with community su…\": 2-1 ✓",
+    "\"Vanilla vector RAG and GraphRAG are complementary …\": 3-0 ✓",
+    "\"On Level 2-3 (complex reasoning) questions, a grap…\": 3-0 ✓",
+    "\"On multi-hop QA, graph methods measurably beat van…\": 3-0 ✓",
+    "Verify done: 25 claims → 21 confirmed, 4 killed"
+  ],
+  "result": {
+    "question": "Produce a deep, source-grounded survey of graph-based and TEMPORAL memory for AI agents: how knowledge graphs are constructed from unstructured/conversational text, how temporal knowledge graphs model change over time, how such systems are maintained, and — critically — the HONEST evidence for when graphs beat plain vector retrieval for memory (vs when they're expensive over-engineering). Prioritize 2024–2026 sources; cite every claim; BE SKEPTICAL OF VENDOR SELF-BENCHMARKS (note evaluation setup and whether results were independently reproduced).\n\nGROUNDING CONTEXT (my system, for tie-back — not the subject of the research): I run a graph-based memory layer and want to know whether it's earning its keep. Today: an agent-authored Knowledge Base stored in Neo4j — typed `Note` nodes + `Tag`/`Keyword` nodes and typed edges (DERIVED_FROM, CONTRADICTS, SUPERSEDES, SUPPORTS, ANSWERS, DEPENDS_ON) — MIRRORED to a pgvector index for hybrid search. The graph is the source of truth; the vector index is a derived search mirror. We have a FIXED schema, NO temporal modeling, and NO community summarization. Notes are written by the agent (a `kb_write` tool) and by a background curator. CROSS-BRIEF CONTEXT from prior research streams: (a) we're an outlier auto-injecting the full store every turn (norm = bounded slice + on-demand recall); (b) the top retrieval fix is a cross-encoder reranker + relevance-gated recall; (c) the eval keystone is a LongMemEval-style harness; and crucially (d) CONFLICT/CONTRADICTION RESOLUTION is the field's #1 unsolved failure mode (all systems ≤6-7% on multi-hop conflict in MemoryAgentBench) — which is exactly our stale-fact/supersede risk. Temporal KGs are the leading proposed answer, so assess that directly.\n\nRESEARCH QUESTIONS:\n\nGraph construction from unstructured text:\n- LLM-driven entity & relation extraction; schema/ontology-guided vs open extraction; entity resolution/dedup; quality control and how extraction errors compound over time.\n\nGraphRAG (Microsoft) and variants:\n- Community detection (Leiden), hierarchical community summaries, global vs local query modes, indexing cost. LazyGraphRAG, nano-graphrag, and other cost-reduced variants. When does GraphRAG measurably beat vector RAG, and on what query types?\n\nTemporal / bi-temporal knowledge graphs (most relevant to memory):\n- Zep / Graphiti: event time vs ingestion time, edge invalidation, point-in-time queries, how contradictions are resolved as facts change. Capture this in depth — it's the model we lack and the proposed fix for the supersede/contradiction failure.\n- General bi-temporal modeling patterns for an evolving memory store.\n\nOntology design:\n- Fixed vs emergent schemas; how many node/edge types is healthy; when rich structure helps retrieval/reasoning vs when it adds noise and maintenance cost.\n\nContradiction & invalidation handling:\n- How graph memory systems supersede/retire stale facts (directly relevant to our CONTRADICTS / SUPERSEDES edges, which we currently set but don't really exploit). Best practices for \"update vs supersede vs delete\".\n\nGraph + vector hybrid:\n- Combining graph traversal with vector search — exactly our Neo4j + pgvector setup. Proven patterns (vector to find entry nodes, graph to expand; or graph to constrain, vector to rank)? Who keeps both in sync and how?\n\nMaintenance, cost & failure modes:\n- Graph drift, compounding extraction errors, write/latency cost, operational burden. When is a graph OVERKILL and a well-tuned vector store enough?\n\nEvidence (scrutinize hard):\n- Benchmarks comparing graph vs vector memory (e.g. Zep's LongMemEval/DMR claims, GraphRAG evals). Assess methodological rigor and independence; separate vendor claims from independent replication.\n\nTIE IT BACK TO MY SYSTEM:\n- Should we add BI-TEMPORAL modeling (valid-time + ingestion-time, edge invalidation) to our notes? What would it concretely buy us — and is it the right answer to the contradiction/supersede failure mode?\n- Should we add COMMUNITY SUMMARIZATION over the note graph?\n- Are our CONTRADICTS / SUPERSEDES edges worth keeping if we add a real invalidation policy — or dead weight as-is?\n- IS THE Neo4j GRAPH EARNING ITS KEEP given we also maintain a pgvector mirror, or could a vector store + lightweight metadata cover our actual query patterns? Give a clear-eyed verdict with the conditions under which each answer holds.\n\nDELIVERABLE FORMAT:\n1. Graph-construction & temporal-modeling best practices.\n2. Graph-vs-vector decision guidance (which query/memory types justify a graph; which don't).\n3. Verified-vs-claimed benchmark table for graph-memory systems.\n4. Concrete recommendations for our Neo4j + pgvector setup (add temporal? community summaries? simplify? keep?), ideally tied to the contradiction-resolution failure mode and the build plan from the prior briefs.\n5. Full citations.",
+    "summary": "The 2024-2026 literature converges on a task-dependent verdict: graphs measurably beat vector retrieval on multi-hop reasoning, corpus-wide \"sensemaking\"/summarization, and creative synthesis, but vector RAG matches or beats graphs on simple single-hop fact retrieval, where graph structure injects redundant/noisy context that actively degrades answer quality (GraphRAG-Bench, ICLR'26; Han et al. systematic eval). Neither subsumes the other — on MultiHop-RAG, 13.6% of queries are graph-only-answerable and 11.6% are RAG-only — so the right architecture is complementary/adaptive, not graph-everywhere. The strongest fit to the user's #1 failure mode (stale facts / contradiction) is the bi-temporal model in Zep/Graphiti: every edge stores four timestamps (valid-time t_valid/t_invalid + transaction-time t_created/t_expired), and contradictions are resolved by LLM-detected edge INVALIDATION (set old edge's t_invalid to new edge's t_valid, prioritize newer info) rather than deletion — a non-lossy, point-in-time-queryable supersede mechanism that is exactly what the user's CONTRADICTS/SUPERSEDES edges gesture at but do not enforce. On ontology design, the field has shifted toward bottom-up/induced and schema-free extraction (EDC; the LLM-KGC survey), and fixed single-prompt schemas hit a hard context-window ceiling as they grow richer — but evidence on graph QUALITY (the benefit largely comes from cross-document entity resolution; aggressive pruning preserves QA) was split-vote and is reported as a caveat, not a finding. The headline vendor benchmarks (Zep's LongMemEval 18.5% / 90%-latency claims; Microsoft GraphRAG's 72-83% comprehensiveness win rates) remain vendor-self-reported with no independent replication and known methodology issues (LLM-judge position/length bias; Zep's separate LoCoMo claim was corrected 84%→58% by a competitor) — treat as directional, not settled.",
+    "findings": [
+      {
+        "claim": "Graph construction from unstructured text is moving away from fixed single-prompt schemas toward staged open-extraction + post-hoc canonicalization (EDC) and bottom-up/schema-free induction. A fixed schema must be embedded in the extractor prompt and a richer ontology easily exceeds the LLM context window — a hard scaling ceiling for the single-prompt fixed-schema approach the user runs.",
+        "confidence": "high",
+        "vote": "3-0 across all four constituent claims",
+        "evidence": "EDC (EMNLP 2024, aclanthology.org/2024.emnlp-main.548) decomposes KGC into Extract (open IE) -> Define (schema) -> Canonicalize (post-hoc dedup/normalize), explicitly NOT extracting against a fixed schema in one shot, because 'the KG schema has to be included in the LLM prompt to generate valid triplets; larger and more complex schemas easily exceed the LLMs' context window length.' EDC supports BOTH a pre-defined target schema AND the schema-free case (auto-generates a schema + self-canonicalization) — this is the open-vs-fixed-ontology tradeoff directly. The LLM-KGC survey (arXiv 2510.20345v1, Oct 2025) frames the taxonomy as schema-based (explicit guidance, prioritizes consistency) vs schema-free (transcends templates, prioritizes flexibility) and states 'research focus has shifted from manually designing ontological hierarchies to automatically inducing schemas from unstructured or semi-structured data.' Caveat from verification: the survey scopes this as ONE of 'two complementary directions,' not wholesale abandonment of curated ontologies (top-down ontology guidance still actively defended for precision/consistency, e.g. ODKE+).",
+        "sources": [
+          "https://aclanthology.org/2024.emnlp-main.548/",
+          "https://arxiv.org/html/2510.20345v1"
+        ]
+      },
+      {
+        "claim": "LLM extraction is noisy, model-dependent, and its errors compound across staged pipelines — and the quality numbers reported for LLM-built KGs are often LLM-judged (not gold-standard) and inflated by the judge. This undermines trusting raw extraction-quality scores and is the engineering risk behind any agent-authored graph.",
+        "confidence": "high",
+        "vote": "claims 5,6 at 3-0; the model-divergence claim 7 at 2-1",
+        "evidence": "The LLM-KGC survey (arXiv 2510.20345v1) identifies 'Pipeline fragmentation, where the disjoint handling of construction stages causes cumulative error propagation' — i.e. extraction errors compound downstream (textbook IE consensus; the entire joint-extraction line exists to mitigate it). 'Are LLMs Effective KG Constructors?' (arXiv 2510.11297, Oct 2025) shows different LLMs produce structurally divergent graphs from identical input (GPT-3.5-Turbo: 9,547 nodes/8,084 edges vs o4-mini: 15,612/17,648 after initial extraction — +63% nodes, +118% edges; 1.66x node / 2.18x edge spread across 6 models), demonstrating extraction is highly model-dependent. That same paper used GPT-4.1 as the evaluator (no golden triples, since schema-free KGs have no single 'correct' graph) and found the judge 'tends to overestimate extraction results' — e.g. GPT-3.5-Turbo fails to separate list items yet still gets top accuracy/comprehensiveness/relevance scores (high 0-5-scale numbers like 4.48-4.99). NOTE: claim 7's word 'non-deterministic' is the synthesizer's, not a direct quote — the table strictly shows between-model variation, though the paper separately supports same-paragraph extraction variance. Independent-grade: these are neutral academic evaluations, NOT vendor self-benchmarks.",
+        "sources": [
+          "https://arxiv.org/html/2510.20345v1",
+          "https://arxiv.org/abs/2510.11297"
+        ]
+      },
+      {
+        "claim": "TEMPORAL / BI-TEMPORAL MODELING (Zep/Graphiti) is the field's concrete answer to the stale-fact/contradiction failure mode: every edge carries four timestamps separating WHEN A FACT WAS TRUE (valid-time) from WHEN THE SYSTEM LEARNED/RETIRED IT (transaction-time), and contradictions are resolved by non-lossy edge INVALIDATION, not deletion. This is precisely the model the user lacks and the proposed fix for the supersede/CONTRADICTS risk.",
+        "confidence": "high",
+        "vote": "3-0 on both the bi-temporal model and the invalidation mechanism (claims 9, 10)",
+        "evidence": "Zep paper (arXiv 2501.13956v1, Jan 2025) Section 2.2.3: 'On edges, four timestamps are stored' — t'_created and t'_expired in the transaction/ingestion timeline T' ('monitor when facts are created or invalidated in the system') and t_valid and t_invalid in the event/valid timeline T ('track the temporal range during which facts held true'). This is exactly valid-time + transaction-time. Contradiction resolution: 'The system employs an LLM to compare new edges against semantically related existing edges to identify potential contradictions. When the system identifies temporally overlapping contradictions, it invalidates the affected edges by setting their t_invalid to the t_valid of the invalidating edge' and 'consistently prioritizes new information.' Superseded facts are RETAINED with a validity end-date and remain point-in-time queryable (non-lossy supersede). CRITICAL independence note: these are ARCHITECTURE/mechanism claims (not performance claims), so vendor-skepticism does not weaken them — and they are independently corroborated by a Neo4j developer blog (separate company: 'uses temporal metadata to update or invalidate, but not discard, outdated information') and by the live open-source Graphiti codebase (getzep/graphiti edge_operations.py implements valid_at/invalid_at/expired_at; GitHub issues #893, #1489 confirm shipped). One real cost limitation noted by an independent source: many LLM calls per episode.",
+        "sources": [
+          "https://arxiv.org/html/2501.13956v1"
+        ]
+      },
+      {
+        "claim": "Zep's HEADLINE MEMORY BENCHMARK numbers are real-as-reported but entirely vendor-self-reported with no independent replication, and a sibling Zep benchmark claim was materially corrected by a competitor — so they should be read as directional evidence that temporal-graph memory CAN help, not as settled proof it beats vector memory.",
+        "confidence": "high",
+        "vote": "3-0 (claim 8) — with the skeptical caveat itself verified as accurate",
+        "evidence": "On LongMemEval (conversations averaging ~115,000 tokens), Zep reports up to 18.5% accuracy improvement over a full-context baseline (gpt-4o: 60.2% -> 71.2%), ~90% latency reduction (gpt-4o-mini: 31.3s -> 3.20s), and context compression from ~115k to ~1.6k tokens (arXiv 2501.13956v1). All numbers verbatim-match the paper, but the testing connected to 'Zep's service hosted in AWS' (vendor's own implementation). Verification actively searched for independent reproduction and found NONE that confirms the 71.2%/18.5% gpt-4o result; the only third-party figure (Vectorize 63.8%) is a different metric from a competing vendor and does not reproduce it. Skepticism is CORROBORATED, not contradicted: getzep/zep-papers issue #5 documents Zep's related LoCoMo claim being corrected 84% -> 58.44% by Mem0 (single-run reporting, config inconsistencies, miscalculation), and sources note Zep 'simplified the LongMemEval team's proposed test methodology.' Bottom line: the bi-temporal mechanism is solid; the magnitude of its benefit over a well-tuned vector store is NOT independently established.",
+        "sources": [
+          "https://arxiv.org/html/2501.13956v1"
+        ]
+      },
+      {
+        "claim": "GraphRAG (Microsoft) is a two-stage LLM index — derive an entity knowledge graph, then PREGENERATE community summaries for groups of closely related entities — and is motivated specifically by global, corpus-wide 'sensemaking' questions (e.g. 'main themes in the dataset?') that are query-focused summarization, NOT retrieval, tasks where vector RAG is weak. This defines the narrow query type where community summarization is justified.",
+        "confidence": "high",
+        "vote": "3-0 across all three constituent claims (11, 12, 13)",
+        "evidence": "Microsoft GraphRAG paper (arXiv 2404.16130, 'From Local to Global'): 'uses an LLM to build a graph index in two stages: first, to derive an entity knowledge graph from the source documents, then to pregenerate community summaries for all groups of closely related entities' then map-reduce summarizes per-community partial responses into a final answer. Motivation: 'RAG fails on global questions directed at an entire text corpus, such as What are the main themes in the dataset?, since this is inherently a query-focused summarization (QFS) task, rather than an explicit retrieval task.' On ~1M-token datasets, Microsoft reports GraphRAG gives 'substantial improvements over a conventional RAG baseline for both the comprehensiveness and diversity of generated answers' — but this is a Microsoft self-reported result on LLM-judged criteria (~70-83% comprehensiveness, 62-82% diversity win rates), NOT standard QA accuracy. An INDEPENDENT critique (arXiv 2506.06331) found the LLM-as-judge methodology has position bias (>30% win-rate swing on answer ordering), length bias, and trial bias — reinforcing that these win-rates are soft. Community detection uses Leiden (per the architecture); the user has NO community summarization today.",
+        "sources": [
+          "https://arxiv.org/abs/2404.16130",
+          "https://arxiv.org/abs/2506.06331"
+        ]
+      },
+      {
+        "claim": "The expensive community-summarization indexing step is largely avoidable: LazyGraphRAG indexes at the SAME cost as vector RAG (0.1% of full GraphRAG) by using NLP noun-phrase extraction instead of up-front LLM extraction/summarization and deferring all LLM use to query time. This is direct evidence that heavy graph indexing is often not required.",
+        "confidence": "medium",
+        "vote": "3-0 (claim 14), but downgraded because the 0.1% digit is vendor-self-reported and the related 'LazyGraphRAG wins on global too' claim was REFUTED 0-3",
+        "evidence": "Microsoft Research blog: 'LazyGraphRAG data indexing costs are identical to vector RAG and 0.1% of the costs of full GraphRAG' — it 'uses NLP noun phrase extraction to extract concepts and their co-occurrences' with summarization step 'None - the lazy approach defers all LLM use until query time.' Independent tech press (thestack.technology) repeats the exact figures; academic work (arXiv 2506.05690, 2505.24226) independently corroborates that LLM-heavy MS-GraphRAG indexing is far more expensive (~655K tokens, 710s) than lightweight/deferred frameworks. CAVEAT: this is a vendor blog and the precise 0.1% is Microsoft self-reported (secondary sources only echo it); the mechanism (no LLM at index time -> only embedding cost remains) is architecturally sound and uncontested. IMPORTANT: the stronger sibling claim — that LazyGraphRAG at 4% query cost beats ALL methods on BOTH local and global queries — was REFUTED (0-3 vote) and is excluded; do not rely on LazyGraphRAG superiority, only on its cost-parity-at-index-time.",
+        "sources": [
+          "https://www.microsoft.com/en-us/research/blog/lazygraphrag-setting-a-new-standard-for-quality-and-cost/",
+          "https://arxiv.org/html/2506.05690v3"
+        ]
+      },
+      {
+        "claim": "GRAPH-VS-VECTOR IS TASK-DEPENDENT, NOT GRAPH-DOMINANT (the core decision-guidance finding): graphs measurably win on multi-hop reasoning, contextual summarization, and creative synthesis; plain vector RAG matches or beats graphs on simple single-hop fact retrieval, where graph processing injects redundant/noisy context that DEGRADES answer quality. Independently replicated across two separate academic groups.",
+        "confidence": "high",
+        "vote": "3-0 across claims 15, 16, 18, 19, 20 (claim 17 at 2-1)",
+        "evidence": "GraphRAG-Bench / 'When to use Graphs in RAG' (arXiv 2506.05690v3, ICLR'26-accepted, academic NOT vendor): 'GraphRAG models show a clear advantage in complex reasoning, Contextual Summarize, and creative generation' while 'Basic RAG is comparable to or outperforms GraphRAG in simple fact retrieval tasks that does not require complex reasoning across connected concepts'; and bluntly, GraphRAG 'frequently underperform[s] vanilla RAG on many real-world tasks' because 'extra graph-based processing may introduce redundant or noisy information for simpler queries.' Quantified: HippoRAG hits 87.9-90.9% Evidence Recall on Level 2-3 (complex) questions vs basic RAG's 64.47%, but on simple fact retrieval basic RAG reaches 83.2% and BEATS HippoRAG (80.4%). INDEPENDENT REPLICATION — Han/Ma/Wang/Aggarwal/Tang systematic eval (arXiv 2502.11371): 'RAG and GraphRAG exhibit complementary strengths rather than a clear dominance'; on MultiHop-RAG, HippoRAG2 70.27% and Community-GraphRAG(Local) 69.01% vs RAG 67.02% (graph wins multi-hop, modest ~3pt margin), but on single-hop NQ, RAG 64.78% F1 beats RaptorRAG 60.04% (RAG wins single-hop); and 13.6% of queries are GraphRAG-only-answerable while 11.6% are RAG-only — neither subsumes the other. Method-dependence within graphs is large (KG-GraphRAG variants score only 41-48% even on multi-hop, LOSING to RAG) — graphs are not uniformly strong even within their winning category.",
+        "sources": [
+          "https://arxiv.org/html/2506.05690v3",
+          "https://arxiv.org/abs/2502.11371"
+        ]
+      },
+      {
+        "claim": "Community summarization and graph-global modes carry a measurable COST/NOISE liability: MS-GraphRAG global inflates prompts to ~40,000 tokens (LightRAG ~10,000), and that token accumulation introduces redundant information that degrades retrieval context relevance. Relevant to whether the user should ADD community summaries.",
+        "confidence": "medium",
+        "vote": "2-1 (claim 17) — downgraded due to a verified attribution-overreach nuance",
+        "evidence": "GraphRAG-Bench (arXiv 2506.05690v3): 'MS-GraphRAG(global), which incorporates a community-summarization mechanism, reaches a prompt size of up to 4x10^4 tokens. LightRAG also produces lengthy prompts (~10^4 tokens)... This excessive token accumulation often introduces redundant information, which in turn degrades context relevance during retrieval.' Corroborated by Microsoft's OWN materials: the LazyGraphRAG blog concedes full-GraphRAG summarization indexing is 'prohibitive,' and Microsoft's dynamic-community-selection blog notes global search 'includes many lower-level reports that are not informative to the user query.' VERIFIED NUANCE (why 2-1): the paper attributes prompt inflation BROADLY to 'GraphRAG's structured pipeline' (Observation 8) and runs NO ablation isolating community summarization as THE cause — and LightRAG produces comparably long prompts WITHOUT community summarization as its primary mechanism. So the token numbers and the relevance-degradation finding are exact, but 'community summarization is THE liability' is slightly stronger than what the source isolates (correlation, not proven causation). Treat as: graph-global token-inflation is real and hurts simple-query relevance; the specific blame on community summaries is suggestive, not proven.",
+        "sources": [
+          "https://arxiv.org/html/2506.05690v3",
+          "https://www.microsoft.com/en-us/research/blog/lazygraphrag-setting-a-new-standard-for-quality-and-cost/"
+        ]
+      },
+      {
+        "claim": "RECOMMENDATIONS FOR THE NEO4J + PGVECTOR SETUP (synthesized verdict tied to the contradiction-resolution failure mode and prior briefs).",
+        "confidence": "medium",
+        "vote": "Synthesis/inference grounded in the high-confidence findings above; not a single verified claim",
+        "evidence": "(1) ADD BI-TEMPORAL MODELING — YES, this is the highest-leverage change and the correct answer to the #1 failure mode. The CONTRADICTS/SUPERSEDES failure (all systems <=6-7% on multi-hop conflict per MemoryAgentBench, from the cross-brief) is precisely what Graphiti's four-timestamp edges + LLM-driven edge invalidation target (claims 9,10, 3-0, mechanism-level so vendor-skepticism does not apply). Concretely: add valid_from/valid_to (event-time) + ingested_at/retired_at (transaction-time) to Note edges/nodes, and on a detected supersede set the old fact's valid_to = new fact's valid_from rather than deleting it. This makes superseded facts non-lossy and point-in-time queryable, and lets injection filter to currently-valid facts. (2) CONTRADICTS/SUPERSEDES EDGES — KEEP, but they are largely DEAD WEIGHT AS-IS (set but not exploited, per the user's own framing). They become load-bearing only when paired with a real invalidation POLICY: SUPERSEDES should mechanically trigger setting valid_to/retired_at on the superseded note and EXCLUDE it from default injection; CONTRADICTS should surface a conflict for resolution rather than silently co-injecting both. Without a policy, prefer 'invalidate (timestamp) over delete' so history is recoverable. (3) COMMUNITY SUMMARIZATION — DEFAULT NO for memory. Community summaries (claim 11) are motivated by global corpus-wide SENSEMAKING / QFS over large static corpora (claim 12); they carry a measurable token-inflation/noise cost (claim 17) and lose on the simple-fact and targeted-recall queries that dominate agent memory (claims 15,16,18,19,20). They would only earn keep if the agent routinely asks 'what are the themes across all my notes?'-style global questions — and even then LazyGraphRAG-style deferred/noun-phrase indexing (claim 14) is cheaper than full Leiden+LLM summaries. (4) IS THE NEO4J GRAPH EARNING ITS KEEP given the pgvector mirror? CONDITIONAL. The literature says a graph earns keep when query patterns are multi-hop/relational (claims 15,16,19,20: graph-only-answerable queries exist) AND when cross-document entity connectivity matters. If the user's actual recall patterns are mostly single-hop 'find the relevant note(s)' (which the cross-brief's reranker + relevance-gated-recall fix implies), a well-tuned pgvector store + lightweight metadata (tags, timestamps, supersede pointers as columns) would cover them, and the Neo4j graph is closer to over-engineering. The graph clearly earns its keep IF either (a) bi-temporal invalidation + multi-hop traversal (DEPENDS_ON/DERIVED_FROM chains) is actually exercised at recall time, or (b) conflict-resolution is implemented as graph traversal over CONTRADICTS/SUPERSEDES. VERDICT: do not rip out Neo4j; instead make the graph earn its keep by adding bi-temporal invalidation and wiring SUPERSEDES into a real retire-and-exclude policy — that single change converts the largest existing liability (stale-fact injection) into the graph's strongest justification. Adding community summaries is the wrong next move.",
+        "sources": [
+          "https://arxiv.org/html/2501.13956v1",
+          "https://arxiv.org/html/2506.05690v3",
+          "https://arxiv.org/abs/2502.11371",
+          "https://arxiv.org/abs/2404.16130"
+        ]
+      }
+    ],
+    "caveats": "VENDOR-BENCHMARK SKEPTICISM (the brief's explicit demand): The two flagship 'graph memory beats vector' magnitude claims are NOT independently replicated. Zep's LongMemEval 18.5%/90%-latency numbers (claim 8) were measured on Zep's own AWS-hosted implementation; verification found no neutral reproduction, and a sibling Zep claim (LoCoMo) was corrected 84%->58% by a competitor. Microsoft GraphRAG's 72-83% comprehensiveness/diversity win rates (claim 13) are Microsoft-self-reported LLM-as-judge results with documented position/length/trial bias (arXiv 2506.06331), and are NOT standard QA accuracy. LazyGraphRAG's 0.1% indexing-cost figure (claim 14) is a Microsoft blog number echoed but not independently re-measured. Use all three as directional only.\n\nWHAT IS SOLID vs SOFT: The bi-temporal ARCHITECTURE and edge-invalidation MECHANISM (claims 9,10) are solid — they are descriptive of open-source code (getzep/graphiti), independently corroborated by Neo4j, and not performance claims, so they survive vendor-skepticism cleanly. The TASK-DEPENDENCE finding (graphs win multi-hop, lose single-hop) is the strongest evidence in this report: it is independently replicated across two separate academic groups (arXiv 2506.05690 ICLR'26 and arXiv 2502.11371), neither a vendor. By contrast, the magnitude of graph wins is modest and method-dependent (multi-hop margins ~3pt; some graph variants LOSE even on multi-hop).\n\nSPLIT VOTES / EXCLUDED EVIDENCE: Three KG-QUALITY claims from arXiv 2510.14271 were REFUTED 1-2 and are NOT in the findings: (a) that LLM KGs are systematically noisy/duplicate-ridden, (b) that pruning ~40% of a KG preserves/improves QA ('quality over size'), and (c) the Proposition-1 result that WITHOUT entity resolution Graph-RAG mathematically degrades to vanilla vector RAG. The third would have been the most decisive input to the 'is the graph earning its keep' verdict (it implies the graph's entire benefit is cross-document entity resolution), so its exclusion is a real gap — flagged as an open question. The LazyGraphRAG 'wins on global at 4% cost' claim was refuted 0-3 and excluded.\n\nINTERPRETIVE/SYNTHESIS CONTENT: The model-divergence claim's word 'non-deterministic' (claim 7, 2-1) overstates what the data shows (between-model variation, not proven run-to-run variance). The community-summarization-cost claim (claim 17, 2-1) is correct on numbers but the causal blame on community summaries specifically is correlation, not an ablation-proven cause. The final recommendation finding is explicitly synthesis/inference (medium confidence), not a verified claim — it is grounded in the high-confidence findings plus the user's stated cross-brief context (reranker + relevance-gated recall as the top retrieval fix; MemoryAgentBench <=6-7% multi-hop conflict; LongMemEval eval keystone), which the synthesizer did not independently re-verify.\n\nTIME-SENSITIVITY: This is a fast-moving area (most sources Oct 2025-Mar 2026). Graphiti is actively developed (live GitHub issues). The two academic graph-vs-vector benchmarks are very recent (mid-2025, ICLR'26) and could be superseded; their conclusions hold as of the verification window but are not yet 'textbook.' All sources are within the requested 2024-2026 priority window.",
+    "openQuestions": [
+      "Does the graph's benefit over a vector store come ENTIRELY from cross-document entity resolution? The arXiv 2510.14271 Proposition-1 claim (refuted 1-2 here, so excluded) argued exactly this — that without entity resolution Graph-RAG mathematically reduces to vanilla vector RAG. If true, it is decisive for the user's 'earning its keep' verdict (their Notes are agent-authored with typed Tag/Keyword nodes, not cross-document entity-resolved), and it deserves a dedicated re-verification pass.",
+      "What are the user's ACTUAL recall query patterns at runtime — single-hop 'find the relevant note' vs multi-hop traversal over DERIVED_FROM/DEPENDS_ON/SUPERSEDES chains? The whole graph-vs-vector verdict pivots on this, and it is answerable from the user's own logs (which tool calls / traversal depths fire on recall), not from the literature.",
+      "Has any NEUTRAL party reproduced Zep/Graphiti's bi-temporal memory benefit against a strong vector + recency-metadata baseline on LongMemEval (especially the multi-hop-conflict subset that maps to the user's failure mode)? No independent replication of the magnitude was found; this is the single most important missing datapoint for sizing the ROI of adding bi-temporal modeling.",
+      "What is the ongoing maintenance/latency cost of bi-temporal edge invalidation at the user's scale? Graphiti's invalidation runs many LLM calls per episode (one independent source flagged this); for an agent that already auto-injects the full store every turn, the added per-write LLM cost of contradiction-detection needs sizing before committing."
+    ],
+    "refuted": [
+      {
+        "claim": "LLM-constructed knowledge graphs are systematically noisy and redundant: LLMs fail to consistently link new mentions to previously-extracted entities (due to limited long-context recall), producing duplicate/alias entities (case, morphology, multilingual, abbreviation variants), and existing Graph-RAG systems (LightRAG, MS GraphRAG, HippoRAG) rely on string-matching that leaves most duplicates unresolved. This is the field's quantification of how extraction errors compound across a KG.",
+        "vote": "1-2",
+        "source": "https://arxiv.org/pdf/2510.14271"
+      },
+      {
+        "claim": "Aggressively pruning an LLM-built KG IMPROVES (or at worst preserves) downstream QA quality: removing ~40% of entities and relations via entity resolution + LLM-as-judge triple filtering raised win rates above 50% across four Graph-RAG variants on four datasets, and on the Mix/Legal datasets up to 70% of entities could be removed without hurting performance. This is direct evidence for 'KG quality over size' and that much graph structure is noise, not signal.",
+        "vote": "1-2",
+        "source": "https://arxiv.org/pdf/2510.14271"
+      },
+      {
+        "claim": "The benefit of a graph over plain vector retrieval comes ENTIRELY from the cross-document connectivity created by entity resolution/dedup: the authors prove (Proposition 1) that without entity resolution a Graph-RAG system mathematically degrades into vanilla (vector chunk) RAG, because the KG becomes a union of disconnected per-chunk subgraphs and retrieval reduces to selecting independent triples. Directly relevant to the 'is the graph earning its keep' verdict.",
+        "vote": "1-2",
+        "source": "https://arxiv.org/pdf/2510.14271"
+      },
+      {
+        "claim": "At a query cost of just 4% of GraphRAG global search, LazyGraphRAG outperforms all competing methods (including long-context vector RAG and GraphRAG variants) on both local AND global query types per head-to-head LLM-judged win rates — i.e., the expensive community-summarization indexing step is not required to win on global/sensemaking queries.",
+        "vote": "0-3",
+        "source": "https://www.microsoft.com/en-us/research/blog/lazygraphrag-setting-a-new-standard-for-quality-and-cost/"
+      }
+    ],
+    "sources": [
+      {
+        "url": "https://aclanthology.org/2024.emnlp-main.548/",
+        "quality": "primary",
+        "angle": "Graph construction + ontology design from conversational text",
+        "claimCount": 5
+      },
+      {
+        "url": "https://arxiv.org/html/2510.20345v1",
+        "quality": "primary",
+        "angle": "Graph construction + ontology design from conversational text",
+        "claimCount": 5
+      },
+      {
+        "url": "https://arxiv.org/pdf/2510.14271",
+        "quality": "primary",
+        "angle": "Graph construction + ontology design from conversational text",
+        "claimCount": 5
+      },
+      {
+        "url": "https://arxiv.org/abs/2510.11297",
+        "quality": "primary",
+        "angle": "Graph construction + ontology design from conversational text",
+        "claimCount": 5
+      },
+      {
+        "url": "https://arxiv.org/html/2501.13956v1",
+        "quality": "primary",
+        "angle": "Temporal / bi-temporal KG memory (Zep, Graphiti) + invalidation",
+        "claimCount": 5
+      },
+      {
+        "url": "https://neo4j.com/blog/developer/graphiti-knowledge-graph-memory/",
+        "quality": "blog",
+        "angle": "Temporal / bi-temporal KG memory (Zep, Graphiti) + invalidation",
+        "claimCount": 5
+      },
+      {
+        "url": "https://dev.to/juandastic/i-benchmarked-graphiti-vs-mem0-the-hidden-cost-of-context-blindness-in-ai-memory-4le3",
+        "quality": "blog",
+        "angle": "Temporal / bi-temporal KG memory (Zep, Graphiti) + invalidation",
+        "claimCount": 5
+      },
+      {
+        "url": "https://codex.danielvaughan.com/2026/03/30/graphiti-agent-memory-store/",
+        "quality": "blog",
+        "angle": "Temporal / bi-temporal KG memory (Zep, Graphiti) + invalidation",
+        "claimCount": 5
+      },
+      {
+        "url": "https://vectorize.io/articles/mem0-vs-zep",
+        "quality": "blog",
+        "angle": "Temporal / bi-temporal KG memory (Zep, Graphiti) + invalidation",
+        "claimCount": 5
+      },
+      {
+        "url": "https://github.com/getzep/graphiti/issues/1489",
+        "quality": "forum",
+        "angle": "Temporal / bi-temporal KG memory (Zep, Graphiti) + invalidation",
+        "claimCount": 4
+      },
+      {
+        "url": "https://arxiv.org/abs/2404.16130",
+        "quality": "primary",
+        "angle": "GraphRAG + Leiden communities + cost-reduced variants",
+        "claimCount": 4
+      },
+      {
+        "url": "https://www.microsoft.com/en-us/research/blog/lazygraphrag-setting-a-new-standard-for-quality-and-cost/",
+        "quality": "primary",
+        "angle": "GraphRAG + Leiden communities + cost-reduced variants",
+        "claimCount": 5
+      },
+      {
+        "url": "https://arxiv.org/html/2506.05690v3",
+        "quality": "primary",
+        "angle": "GraphRAG + Leiden communities + cost-reduced variants",
+        "claimCount": 5
+      },
+      {
+        "url": "https://arxiv.org/abs/2502.11371",
+        "quality": "primary",
+        "angle": "GraphRAG + Leiden communities + cost-reduced variants",
+        "claimCount": 5
+      },
+      {
+        "url": "https://www.microsoft.com/en-us/research/blog/benchmarkqed-automated-benchmarking-of-rag-systems/",
+        "quality": "primary",
+        "angle": "GraphRAG + Leiden communities + cost-reduced variants",
+        "claimCount": 5
+      },
+      {
+        "url": "https://github.com/gusye1234/nano-graphrag",
+        "quality": "primary",
+        "angle": "GraphRAG + Leiden communities + cost-reduced variants",
+        "claimCount": 5
+      },
+      {
+        "url": "https://github.com/getzep/zep-papers/issues/5",
+        "quality": "primary",
+        "angle": "Skeptical evidence: independent replication of graph-vs-vector benchmarks",
+        "claimCount": 4
+      },
+      {
+        "url": "https://arxiv.org/abs/2507.05257",
+        "quality": "primary",
+        "angle": "Skeptical evidence: independent replication of graph-vs-vector benchmarks",
+        "claimCount": 5
+      },
+      {
+        "url": "https://arxiv.org/html/2504.19413v1",
+        "quality": "primary",
+        "angle": "Skeptical evidence: independent replication of graph-vs-vector benchmarks",
+        "claimCount": 5
+      },
+      {
+        "url": "https://tianpan.co/blog/2026-04-09-graphrag-production-when-vector-search-hits-ceiling",
+        "quality": "blog",
+        "angle": "Graph+vector hybrid architecture, sync, and when graph is overkill",
+        "claimCount": 5
+      },
+      {
+        "url": "https://github.com/GraphRAG-Bench/GraphRAG-Benchmark",
+        "quality": "primary",
+        "angle": "Graph+vector hybrid architecture, sync, and when graph is overkill",
+        "claimCount": 5
+      },
+      {
+        "url": "https://neo4j.com/blog/agentic-ai/connected-context-and-persistent-memory-neo4j-providers-for-the-microsoft-agent-framework/",
+        "quality": "blog",
+        "angle": "Graph+vector hybrid architecture, sync, and when graph is overkill",
+        "claimCount": 5
+      }
+    ],
+    "stats": {
+      "angles": 5,
+      "sourcesFetched": 22,
+      "claimsExtracted": 107,
+      "claimsVerified": 25,
+      "confirmed": 21,
+      "killed": 4,
+      "afterSynthesis": 9,
+      "urlDupes": 2,
+      "budgetDropped": 6,
+      "agentCalls": 104
+    }
+  }
+}

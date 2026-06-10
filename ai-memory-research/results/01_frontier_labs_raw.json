@@ -1,0 +1,387 @@
+{
+  "summary": "Deep research harness — fan-out web searches, fetch sources, adversarially verify claims, synthesize a cited report.",
+  "agentCount": 105,
+  "logs": [
+    "Q: Produce a detailed, source-grounded survey of how leading AI labs and dedicated …",
+    "Decomposed into 5 angles: Frontier consumer assistants (documented vs reverse-engineered), Coding-agent memory-file paradigm, Dedicated & open-source memory products (architecture + license), Agentic-tool memory vs automatic-RAG-injection design debate, Memory benchmarks, self-benchmark skepticism, and failure modes",
+    "Coding-agent memory-file paradigm: 6 results",
+    "Memory benchmarks, self-benchmark skepticism, and failure modes: 6 results",
+    "Frontier consumer assistants (documented vs reverse-engineered): 6 results",
+    "Frontier consumer assistants (documented vs reverse-engineered): 5 novel (1 filtered)",
+    "Agentic-tool memory vs automatic-RAG-injection design debate: 6 results",
+    "Agentic-tool memory vs automatic-RAG-injection design debate: 2 novel (4 filtered)",
+    "Dedicated & open-source memory products (architecture + license): 6 results",
+    "Dedicated & open-source memory products (architecture + license): 4 novel (2 filtered)",
+    "Fetched 23 sources → 114 claims → verifying top 25",
+    "\"Claude's memory tool is model-directed and client-…\": 3-0 ✓",
+    "\"ChatGPT's memory consists of two distinct mechanis…\": 3-0 ✓",
+    "\"Cursor defines four rule activation types with dis…\": 3-0 ✓",
+    "\"Cursor project rules are stored as version-control…\": 3-0 ✓",
+    "\"The memory tool is designed to pair with context e…\": 3-0 ✓",
+    "\"Saved memories are written both automatically (Cha…\": 3-0 ✓",
+    "\"Only a bounded slice of auto memory is injected ea…\": 3-0 ✓",
+    "[stall] agent \"v1:Memory is implemented as a file/director\" stalled (no progress) after 180s — retrying (1/5)",
+    "[stall] agent \"v0:When the memory tool is enabled, Anthrop\" stalled (no progress) after 180s — retrying (1/5)",
+    "[stall] agent \"v1:When the memory tool is enabled, Anthrop\" stalled (no progress) after 180s — retrying (1/5)",
+    "\"Claude Code has two distinct memory mechanisms: hu…\": 3-0 ✓",
+    "\"Auto memory is model-directed/agentic: Claude deci…\": 3-0 ✓",
+    "\"Rule contents are injected at the start of the mod…\": 2-1 ✓",
+    "\"CLAUDE.md files form a layered scope hierarchy (ma…\": 3-0 ✓",
+    "\"Memory is implemented as a file/directory abstract…\": 3-0 ✓",
+    "\"When the memory tool is enabled, Anthropic automat…\": 3-0 ✓",
+    "\"Cascade auto-memories are model-directed (the mode…\": 3-0 ✓",
+    "\"Windsurf Cascade implements two distinct memory me…\": 3-0 ✓",
+    "parallel[0] failed: agent({schema}): subagent completed without calling StructuredOutput (after 2 in-conversation nudges)",
+    "parallel[1] failed: agent({schema}): subagent completed without calling StructuredOutput (after 2 in-conversation nudges)",
+    "parallel[2] failed: agent({schema}): subagent completed without calling StructuredOutput (after 2 in-conversation nudges)",
+    "\"Letta implements 'sleep-time compute' where backgr…\": 0-0 (3 abstain) ✗",
+    "parallel[0] failed: agent({schema}): subagent completed without calling StructuredOutput (after 2 in-conversation nudges)",
+    "parallel[1] failed: agent({schema}): subagent completed without calling StructuredOutput (after 2 in-conversation nudges)",
+    "parallel[2] failed: agent({schema}): subagent completed without calling StructuredOutput (after 2 in-conversation nudges)",
+    "\"On the LongMemEval benchmark, commercial chat assi…\": 0-0 (3 abstain) ✗",
+    "parallel[0] failed: agent({schema}): subagent completed without calling StructuredOutput (after 2 in-conversation nudges)",
+    "parallel[1] failed: agent({schema}): subagent completed without calling StructuredOutput (after 2 in-conversation nudges)",
+    "parallel[2] failed: agent({schema}): subagent completed without calling StructuredOutput (after 2 in-conversation nudges)",
+    "\"LongMemEval is a 500-question benchmark that evalu…\": 0-0 (3 abstain) ✗",
+    "parallel[0] failed: agent({schema}): subagent completed without calling StructuredOutput (after 2 in-conversation nudges)",
+    "parallel[1] failed: agent({schema}): subagent completed without calling StructuredOutput (after 2 in-conversation nudges)",
+    "parallel[2] failed: agent({schema}): subagent completed without calling StructuredOutput (after 2 in-conversation nudges)",
+    "\"Letta injects memory blocks into context at every …\": 0-0 (3 abstain) ✗",
+    "parallel[0] failed: agent({schema}): subagent completed without calling StructuredOutput (after 2 in-conversation nudges)",
+    "parallel[1] failed: agent({schema}): subagent completed without calling StructuredOutput (after 2 in-conversation nudges)",
+    "parallel[2] failed: agent({schema}): subagent completed without calling StructuredOutput (after 2 in-conversation nudges)",
+    "\"Memora is a long-term memory benchmark for persona…\": 0-0 (3 abstain) ✗",
+    "parallel[0] failed: agent({schema}): subagent completed without calling StructuredOutput (after 2 in-conversation nudges)",
+    "parallel[1] failed: agent({schema}): subagent completed without calling StructuredOutput (after 2 in-conversation nudges)",
+    "parallel[2] failed: agent({schema}): subagent completed without calling StructuredOutput (after 2 in-conversation nudges)",
+    "\"Letta's memory is structured as 'memory blocks' — …\": 0-0 (3 abstain) ✗",
+    "parallel[1] failed: agent({schema}): subagent completed without calling StructuredOutput (after 2 in-conversation nudges)",
+    "\"Mem0 uses a two-phase pipeline (extraction + updat…\": 2-0 (1 abstain) ✓",
+    "parallel[0] failed: agent({schema}): subagent completed without calling StructuredOutput (after 2 in-conversation nudges)",
+    "parallel[1] failed: agent({schema}): subagent completed without calling StructuredOutput (after 2 in-conversation nudges)",
+    "parallel[2] failed: agent({schema}): subagent completed without calling StructuredOutput (after 2 in-conversation nudges)",
+    "\"Letta uses agentic, model-directed memory writing:…\": 0-0 (3 abstain) ✗",
+    "parallel[0] failed: agent({schema}): subagent completed without calling StructuredOutput (after 2 in-conversation nudges)",
+    "parallel[1] failed: agent({schema}): subagent completed without calling StructuredOutput (after 2 in-conversation nudges)",
+    "parallel[2] failed: agent({schema}): subagent completed without calling StructuredOutput (after 2 in-conversation nudges)",
+    "\"On the LOCOMO benchmark (LLM-as-a-Judge 'J' metric…\": 0-0 (3 abstain) ✗",
+    "parallel[2] failed: agent({schema}): subagent completed without calling StructuredOutput (after 2 in-conversation nudges)",
+    "\"Base Mem0 stores dense natural-language memories i…\": 2-0 (1 abstain) ✓",
+    "Verify done: 25 claims → 17 confirmed, 8 killed"
+  ],
+  "result": {
+    "question": "Produce a detailed, source-grounded survey of how leading AI labs and dedicated memory-layer products implement long-term memory for assistants and agents. Separate documented fact from inference/reverse-engineering from marketing. Prioritize 2024–2026 sources; cite every claim; flag vendor self-benchmarks and unverified numbers.\n\nGROUNDING CONTEXT (the system I'm comparing against — not the subject of the research): I'm refining the long-term memory of a multi-tier AI agent platform. Current stack: (1) \"RecallStore\" — implicit memories auto-extracted from conversation by a background observer LLM, stored in pgvector with hybrid dense+sparse+recency RRF search (weights 0.6/0.3/0.1, rrf_k=50) and TTL-based pinning that guarantees new memories are injected for ~10 turns; an assembler LLM periodically curates/boosts/deprecates. Project-scoped (shared across jobs). (2) \"Knowledge Base\" — explicit agent-authored structured notes stored in Neo4j (typed nodes + edges) mirrored to pgvector. Embeddings: qwen3-embedding-8b (4096-dim). Both memory + KB are auto-injected into EVERY LLM call. Built from intuition; want to benchmark against how the highest-resource players actually do memory.\n\nRESEARCH QUESTIONS:\n\nFrontier labs / consumer assistants:\n- OpenAI / ChatGPT: the two-part memory (\"saved memories\" vs \"reference chat history\"). How is each implemented — what triggers a save, where stored, how retrieved, how injected, how it interacts with the system prompt? User controls, limits, known failure modes. Documented vs reverse-engineered?\n- Anthropic / Claude: the memory tool (model-directed, file/tool-based), Projects, and context editing / context management (clearing stale tool results, the memory+context beta). How does the memory tool actually work — who decides what to write, format, retrieval? Also Claude Code's CLAUDE.md / memory-file approach.\n- Google / Gemini: personalization, \"personal context\", recall across chats — mechanism and controls.\n- Microsoft Copilot: memory & personalization.\n- Briefly: Meta AI, Perplexity, xAI Grok — any documented memory.\n\nCoding agents (memory-files paradigm):\n- Cursor (rules/memories), Claude Code (CLAUDE.md), Devin, Replit, Windsurf, GitHub Copilot: how do coding agents persist project knowledge and preferences? File-based rules vs learned memory.\n\nDedicated memory products / open source — for each capture architecture (vector/graph/hybrid), extraction approach, retrieval, forgetting/decay, claimed benchmark results, license/pricing:\n- Mem0, Zep/Graphiti, Letta (MemGPT), Cognee, LangMem (LangChain), Supermemory, Memobase, MemoryOS, and other notable 2024–2026 entrants.\n\nCross-cutting:\n- The \"agentic memory\" vs \"automatic RAG injection\" axis: does the model read/write its own memory via tools/files, or does an external pipeline extract+inject behind its back? Who chose which and why?\n- What is converging across systems? What is contested? What do these systems / their users most commonly complain about (staleness, privacy, over-remembering, wrong recall)?\n\nTIE IT BACK TO MY SYSTEM:\n- Map each system onto my design (auto-injected pgvector RecallStore + Neo4j KB). Where am I aligned, ahead, or behind?\n- Which specific mechanism is worth adopting (e.g. Claude's context-editing, ChatGPT's two-tier save vs chat-history reference, a model-directed memory tool)?\n- Am I an outlier in auto-injecting everything every turn? What do others do instead (on-demand recall as a tool, budget-based, relevance-gated)?\n\nDELIVERABLE FORMAT:\n1. Per-system breakdown table (system → storage → extraction → retrieval → injection → forgetting → user controls → documented vs inferred).\n2. Narrative deep-dives on the 4–6 most instructive systems.\n3. Patterns & takeaways (converging / contested / common complaints).\n4. What to consider adopting, mapped to my architecture, ranked by ROI.\n5. Full citations.",
+    "summary": "Across frontier labs, coding agents, and dedicated memory products, the dominant 2024-2026 pattern for long-term assistant/agent memory is MODEL-DIRECTED memory: the model itself decides what to write and (often) what to read, via tool calls or file operations, rather than an external pipeline silently extracting and re-injecting facts. Anthropic's memory tool (client-side /memories files, just-in-time reads, auto-injected \"view memory first\" protocol, paired with context editing + compaction), Claude Code (human-authored CLAUDE.md + agent-authored auto-memory with a BOUNDED ~200-line/25KB injection and on-demand topic-file reads), Cursor (version-controlled .mdc rules with four activation types, prepended at context start), and Windsurf Cascade (auto-memories + version-controlled Rules) all sit on the agentic side and converge on the same lessons: keep the always-injected slice SMALL, read details on demand, and prefer explicit version-controlled rules over auto-memories when reuse must be reliable. ChatGPT is the notable hybrid: two distinct mechanisms — \"saved memories\" (discrete facts, written both automatically and on explicit user request) and \"chat history reference\" (drawing on past conversations even when nothing was saved). Mem0 represents the dedicated-product / automatic-pipeline camp but is interesting because it still uses an LLM to direct the write: a two-phase extract-then-update pipeline where the LLM picks ADD/UPDATE/DELETE/NOOP per fact via a tool call, with a base dense-vector store and a Mem0^g graph variant (Neo4j entity/relation triplets). RELATIVE TO THE GROUNDING SYSTEM (auto-injected pgvector RecallStore + Neo4j KB, both pushed into EVERY LLM call): the system is architecturally aligned with the automatic-pipeline/hybrid-graph camp (closest to Mem0/Mem0^g in extraction+storage) but is an OUTLIER on injection — essentially every other documented system injects only a bounded slice always-on and pulls the rest on demand (Claude Code's hard 200-line cap is the sharpest example), whereas the system auto-injects everything every turn. The single highest-ROI mechanism to consider adopting is bounded/just-in-time retrieval (cap the always-injected memory + expose the rest as an on-demand recall tool), optionally complemented by Anthropic-style context editing (clear stale tool results while persisting essentials to memory) and an explicit user-/agent-directed \"remember this\" write path.",
+    "findings": [
+      {
+        "claim": "Anthropic's Claude memory tool is a model-directed, client-side, file-based system: Claude issues tool calls (view/create/str_replace/insert/delete/rename) over a /memories directory, the developer's app executes them against any backend it chooses (file/DB/cloud/encrypted), Claude auto-checks the directory before tasks, and reads specific files on demand (just-in-time) rather than loading everything upfront. This places it firmly on the 'agentic memory' (model reads/writes its own memory) side of the axis, not the external extract-and-inject side.",
+        "confidence": "high",
+        "vote": "3-0 (merged from claims 0 and 1, each 3-0)",
+        "sources": [
+          "https://platform.claude.com/docs/en/agents-and-tools/tool-use/memory-tool"
+        ],
+        "evidence": "Primary Anthropic docs (verified live), corroborated by independent secondaries (supermemory, Milvus, shloked.com). Verbatim: 'The memory tool operates client-side: you control where and how the data is stored through your own infrastructure... Claude makes tool calls to perform memory operations, and your application executes those operations locally.' and 'This is the key primitive for just-in-time context retrieval: rather than loading all relevant information upfront, agents store what they learn in memory and pull it back on demand.' Developers can subclass BetaAbstractMemoryTool / use betaMemoryTool to back it with file/DB/cloud/encrypted storage. Tool version memory_20250818. Nuance (non-refuting): when Claude reads a file it reads the whole file (no intra-file search), so 'on demand' is file-level selection."
+      },
+      {
+        "claim": "When the memory tool is enabled, Anthropic AUTOMATICALLY injects a fixed memory-protocol instruction into the system prompt that forces Claude to view its memory directory first and warns that context may be reset at any moment ('ASSUME INTERRUPTION'). This is a deliberate prompt-level scaffold that makes the agentic memory reliable.",
+        "confidence": "high",
+        "vote": "3-0",
+        "sources": [
+          "https://platform.claude.com/docs/en/agents-and-tools/tool-use/memory-tool"
+        ],
+        "evidence": "Primary Anthropic docs (fetched directly), corroborated by independent guides (claudeapi.com, leoniemonigatti.com, thomas-wiegold.com). Verbatim: 'This instruction is automatically included in the system prompt when the memory tool is enabled: IMPORTANT: ALWAYS VIEW YOUR MEMORY DIRECTORY BEFORE DOING ANYTHING ELSE. MEMORY PROTOCOL: 1. Use the `view` command... ASSUME INTERRUPTION: Your context window might be reset at any moment, so you risk losing any progress that is not recorded in your memory directory.' Underlying tool commands are client-customizable, but this exact instruction is the one auto-included."
+      },
+      {
+        "claim": "Anthropic's memory tool is designed to PAIR with context editing (clearing stale/oldest tool results) and server-side compaction (summarizing the whole conversation near the context limit); memory persists important information across those compaction/clearing boundaries so nothing critical is lost. Before a clear, Claude receives an automatic warning to save essentials to memory files first. This is the canonical 'memory as durable layer beneath a managed/compacted context window' design.",
+        "confidence": "high",
+        "vote": "3-0",
+        "sources": [
+          "https://platform.claude.com/docs/en/agents-and-tools/tool-use/memory-tool",
+          "https://platform.claude.com/docs/en/build-with-claude/context-editing"
+        ],
+        "evidence": "Two mutually-consistent primary Anthropic docs. Memory-tool doc verbatim: 'compaction automatically summarizes the entire conversation on the server side when it approaches the context window limit... memory persists important information across compaction boundaries so that nothing critical is lost in the summary.' Context-editing doc: 'When your conversation context approaches the configured clearing threshold, Claude receives an automatic warning to preserve important information... Claude can write essential information from tool results to memory files before those results are cleared.' Tool-result clearing (clear_tool_uses_20250919) clears oldest results in chronological order with placeholder replacement. MINOR IMPRECISION (Anthropic's own loose wording): the headline tool-result-clearing strategy is actually applied server-side before the prompt reaches Claude; only SDK compaction is genuinely client-side — does not affect the load-bearing claim."
+      },
+      {
+        "claim": "ChatGPT memory is two distinct mechanisms: (1) 'saved memories' — discrete remembered details (name, preferences, goals) written BOTH automatically (ChatGPT decides) AND on explicit user instruction (e.g. 'Remember that I am vegetarian'); and (2) 'chat history reference' — the ability to draw on past conversations when responding even if nothing was explicitly saved as a memory. ChatGPT is the leading HYBRID example: explicit discrete memory plus an implicit-recall layer over prior chats.",
+        "confidence": "high",
+        "vote": "3-0 (merged from claims 4 and 5, each 3-0)",
+        "sources": [
+          "https://help.openai.com/en/articles/8983136-what-is-memory",
+          "https://openai.com/index/memory-and-new-controls-for-chatgpt/"
+        ],
+        "evidence": "OpenAI primary docs + April/June 2025 announcement, corroborated by Simon Willison's blog and the Embrace The Red security deep-dive. Verbatim: 'ChatGPT's memory works in two ways: saved memories and chat history. Saved memories are details ChatGPT remembers and uses in future conversations, like your name, preferences, or goals... Chat history allows ChatGPT to reference past conversations when responding, even if the information hasn't been saved as a memory.' and 'ChatGPT may save important information automatically, but you can also ask it to remember something directly by saying, \"Remember this…\"' Canonical OpenAI example: 'Remember that I am vegetarian when you recommend a recipe.' Mechanism is documented behavior; the internal retrieval/injection implementation of chat-history reference is partly reverse-engineered (Willison/Embrace The Red), not fully documented."
+      },
+      {
+        "claim": "Claude Code has TWO memory mechanisms: (a) human-authored CLAUDE.md instruction files (layered scope: managed policy -> user ~/.claude/CLAUDE.md -> project ./CLAUDE.md -> local ./CLAUDE.local.md, loaded IN FULL at launch by walking up the directory tree and concatenating root-to-cwd, with @path imports expanding recursively up to 4 hops); and (b) agentic 'auto memory' where Claude itself decides what to save (based on whether it would be useful in future) and reads/writes plain-markdown files in a per-repo dir (~/.claude/projects/<project>/memory/) using its standard file tools. Both are loaded at session start and treated as CONTEXT, not enforced configuration (to hard-block an action, use a PreToolUse hook). Auto memory is model-directed, NOT an external extract-and-inject pipeline.",
+        "confidence": "high",
+        "vote": "3-0 (merged from claims 9, 10, and 12, each 3-0)",
+        "sources": [
+          "https://code.claude.com/docs/en/memory"
+        ],
+        "evidence": "Official Claude Code docs (fetched directly), corroborated by Milvus, MindStudio, dsebastien.net; the in-environment auto-memory at /home/ghost/.claude/projects/-home-ghost-Repositories-Superhuman-Remote-Worker/memory/MEMORY.md confirms the path format. Verbatim: 'Claude Code has two complementary memory systems. Both are loaded at the start of every conversation. Claude treats them as context, not enforced configuration. To block an action regardless of what Claude decides, use a PreToolUse hook instead.' and 'It decides what's worth remembering based on whether the information would be useful in a future conversation.' Who-writes-it column: CLAUDE.md='You', auto memory='Claude'. CLAUDE.md is 'delivered as a user message after the system prompt, not as part of the system prompt itself.' Imports recurse to 'a maximum depth of four hops.' Requires Claude Code v2.1.59+. Non-refuting caveat: the MEMORY.md index slice IS harness-auto-loaded (non-agentic injection), so the system is hybrid: agentic writes + a small auto-loaded index + on-demand reads."
+      },
+      {
+        "claim": "Claude Code's auto memory is deliberately BOUNDED on injection: only the first 200 lines of MEMORY.md OR the first 25KB (whichever comes first) load at session start; content beyond that is NOT loaded at start. Topic files (e.g. debugging.md, patterns.md) are NOT loaded at startup and are read on demand with file tools when needed. (This limit applies only to MEMORY.md; CLAUDE.md files are loaded in full regardless of length.) This is the sharpest documented example of 'small always-injected index + just-in-time detail retrieval' and is the most direct contrast to auto-injecting all memory every turn.",
+        "confidence": "high",
+        "vote": "3-0",
+        "sources": [
+          "https://code.claude.com/docs/en/memory"
+        ],
+        "evidence": "Official Claude Code docs (fetched directly), corroborated by claudefa.st, claudedirectory.org, buildthisnow.com, ianlpaterson.com. Verbatim: 'The first 200 lines of MEMORY.md, or the first 25KB, whichever comes first, are loaded at the start of every conversation. Content beyond that threshold is not loaded at session start... Topic files like debugging.md or patterns.md are not loaded at startup. Claude reads them on demand using its standard file tools when it needs the information.' and 'This limit applies only to MEMORY.md. CLAUDE.md files are loaded in full regardless of length.' DIRECTLY ANSWERS the grounding-system question 'am I an outlier in auto-injecting everything?' — yes; the highest-resource agentic systems cap the always-injected slice and pull the rest on demand."
+      },
+      {
+        "claim": "Cursor persists project knowledge as version-controlled rules: .mdc files (markdown with YAML frontmatter: description/globs/alwaysApply) in a .cursor/rules directory scoped to the codebase (plain .md files there are IGNORED because they lack frontmatter). Rules have FOUR activation types — Always Apply (every session), Apply Intelligently (agent decides by relevance from the description), Apply to Specific Files (glob/file-pattern match), Apply Manually (@-mention). When their conditions are met, rule contents are INJECTED AT THE START of the model context (prepended/system-prompt style), not retrieved on-demand by the model mid-generation. Cursor exemplifies the file-based explicit-rules paradigm with conditional always-on injection.",
+        "confidence": "high",
+        "vote": "Mixed: 3-0 on file format and on the four activation types; 2-1 on the start-of-context injection mechanism (one verifier flagged that Agent-Requested type is a form of on-demand SELECTION, but injection of the rule BODY is still prepended). (merged from claims 6, 7, 8)",
+        "sources": [
+          "https://cursor.com/docs/rules",
+          "https://cursor.com/docs/context/rules"
+        ],
+        "evidence": "Primary Cursor docs (fetched twice, consistent), corroborated by DataCamp tutorial, Cursor forum, DEV.to 'Anatomy of a Cursor Prompt'. Verbatim: 'Project rules live in `.cursor/rules` as `.mdc` files and are version-controlled.' 'A plain `.md` file in `.cursor/rules` is ignored by the rules system because it has no frontmatter.' Four types listed verbatim with exact triggers. 'When applied, rule contents are included at the start of the model context.' DEV reverse-engineering places '.cursor/rules' first in the Priompt server-side prompt assembly. Nuance: Cursor now also supports AGENTS.md (plain markdown) at project ROOT — but .md inside .cursor/rules remains ignored. The 2-1 split is on framing only (selection vs injection); the injection-of-body mechanism is primary-source supported."
+      },
+      {
+        "claim": "Windsurf Cascade implements two distinct memory mechanisms paralleling the Claude Code / Cursor pattern: (1) auto-generated memories — model-directed context Cascade creates during conversations when it judges something useful, AND retrieved automatically when Cascade judges them relevant (plus a user-prompted path: 'create a memory of...'); and (2) version-controlled Rules — explicit, shareable, user-controlled behavioral instructions. The docs explicitly RECOMMEND Rules/AGENTS.md over auto-generated memories for knowledge that must reliably reuse. This converges with the cross-system lesson: prefer explicit version-controlled rules over auto-memory when reliability matters.",
+        "confidence": "high",
+        "vote": "3-0 (merged from claims 13 and 14, each 3-0)",
+        "sources": [
+          "https://docs.windsurf.com/windsurf/cascade/memories",
+          "https://docs.devin.ai/desktop/cascade/memories"
+        ],
+        "evidence": "Primary vendor docs (the windsurf.com URL 307-redirects to docs.devin.ai after Cognition/Devin acquired Windsurf — same canonical page), corroborated by setupkit.app, mer.vin, paulmduvall.com, arsturn, memnexus. Verbatim: 'During conversation, Cascade can automatically generate and store memories if it encounters context that it believes is useful to remember.' / 'Cascade retrieves them when it believes they're relevant.' / 'you can ask Cascade to create a memory at any time. Just prompt Cascade to \"create a memory of ...\".' / 'For knowledge you want Cascade to reliably reuse, write it as a Rule or add it to `AGENTS.md` in your repo rather than relying on auto-generated Memories. Rules ... are version-controlled, shareable with your team, and give you explicit control over activation.' Auto-memories are workspace-scoped, stored locally (~/.codeium/windsurf/memories/), and can persist false info — which is WHY the docs steer toward Rules. One secondary (markaicode) describes a pipeline-assisted retrieval/M-Query layer, suggesting relevance ranking may not be purely in-context — non-refuting but worth noting."
+      },
+      {
+        "claim": "Mem0 (a leading dedicated memory product) uses a two-phase pipeline (extraction + update) in which the LLM ITSELF decides one of four memory operations per candidate fact — ADD / UPDATE / DELETE / NOOP — via a function-calling 'tool call', rather than a separate classifier. It is thus a model-DIRECTED memory-WRITE architecture, but it sits on the AUTOMATIC-PIPELINE side of the agentic-vs-pipeline axis: a dedicated BACKEND memory LLM chooses the op inside an automatic extract-and-update flow, NOT the user-facing agent invoking memory of its own volition.",
+        "confidence": "high",
+        "vote": "2-0",
+        "sources": [
+          "https://arxiv.org/pdf/2504.19413"
+        ],
+        "evidence": "Primary source: Chhikara et al., 'Mem0: Building Production-Ready AI Agents with Scalable Long-Term Memory', arXiv 2504.19413 (28 Apr 2025), read page-by-page; corroborated by arXiv HTML v1, EmergentMind, TheMoonlight, HuggingFace papers. Verbatim: 'the complete pipeline architecture consists of two phases: extraction and update.' and 'These retrieved memories, along with the candidate fact, are then presented to the LLM through a function-calling interface we refer to as a \"tool call.\" The LLM itself determines which of four distinct operations to execute: ADD... UPDATE... DELETE... NOOP... Rather than using a separate classifier, we leverage the LLM's reasoning capabilities to directly select the appropriate operation.' KEY NUANCE for the axis mapping: this is a backend memory LLM inside an automatic pipeline — Mem0 belongs on the automatic-injection side despite using an LLM to choose the write op. This is the architecture most similar to the grounding system's observer-LLM RecallStore."
+      },
+      {
+        "claim": "Mem0's storage is dual-mode: base Mem0 stores dense natural-language memories in a VECTOR database (dense embeddings for similarity search); the Mem0^g variant converts conversation into ENTITIES and RELATION TRIPLETS stored as a knowledge GRAPH (Neo4j, directed labeled graph, entities=nodes, relationships=edges). In the paper's configuration all LLM operations used GPT-4o-mini, with m=10 recent messages and s=10 similar memories as context. This vector-base + graph-variant split directly mirrors the grounding system's pgvector RecallStore + Neo4j KB pairing.",
+        "confidence": "high",
+        "vote": "2-0",
+        "sources": [
+          "https://arxiv.org/pdf/2504.19413"
+        ],
+        "evidence": "Primary source arXiv 2504.19413v1, extracted via pdftotext; all five elements verbatim. 'The vector database employs dense embeddings to facilitate efficient similarity search'; 'Mem0 encodes complete dialogue turns in a natural language representation'; Figure 3 caption 'The extraction phase uses LLMs to convert conversation messages into entities and relation triplets'; 'memories are stored as directed labeled graphs with entities as nodes and relationships as edges... the system utilizes Neo4j as the underlying graph database'; 'All language model operations utilized GPT-4o-mini as the inference engine'; 'm = 10 previous messages' and 's = 10 similar memories'. ('previous' vs 'recent' is synonymous.) DIRECT MAPPING: the grounding system = pgvector dense+sparse memories (~Mem0 base, but adds sparse + recency RRF) + Neo4j typed-node/edge KB (~Mem0^g graph variant). The system is architecturally a superset of Mem0 on storage, but differs on injection (always-on vs Mem0's retrieve-s=10-on-query)."
+      },
+      {
+        "claim": "CROSS-CUTTING SYNTHESIS — the agentic-memory vs automatic-RAG-injection axis: The highest-resource agentic systems (Anthropic memory tool, Claude Code auto memory, Windsurf Cascade, and the coding-rules systems Cursor/Windsurf Rules) put the MODEL in control of memory reads and writes via tools/files. Dedicated products on the pipeline side (Mem0) still use an LLM to DIRECT the write op, but inject behind the agent's back. ChatGPT is hybrid (explicit saved memories + implicit chat-history recall). CONVERGENCE: (a) model-directed writes are now the default; (b) keep the ALWAYS-INJECTED slice SMALL and pull details JUST-IN-TIME (Claude Code's 200-line/25KB cap is the canonical instance); (c) prefer EXPLICIT version-controlled rules over auto-memory when reliable reuse matters (Windsurf and Cursor both say this); (d) pair durable memory with context editing/compaction so the working window stays bounded. CONTESTED/COMPLAINTS: auto-memories are widely reported as unreliable, workspace-scoped, ephemeral, and capable of persisting FALSE info (Windsurf docs/community), and ChatGPT's automatic profiling raises over-remembering/privacy concerns (Willison) — which is precisely why vendors steer users to explicit rules and provide user controls.",
+        "confidence": "high",
+        "vote": "Synthesis across 3-0 / 2-0 findings above; no contradicting source surfaced for any constituent claim.",
+        "sources": [
+          "https://platform.claude.com/docs/en/agents-and-tools/tool-use/memory-tool",
+          "https://code.claude.com/docs/en/memory",
+          "https://cursor.com/docs/rules",
+          "https://docs.devin.ai/desktop/cascade/memories",
+          "https://help.openai.com/en/articles/8983136-what-is-memory",
+          "https://arxiv.org/pdf/2504.19413"
+        ],
+        "evidence": "Aggregated from the six primary-source findings above. RELATIVE POSITION OF THE GROUNDING SYSTEM (auto-injected pgvector RecallStore + Neo4j KB): ALIGNED with the Mem0/automatic-pipeline + hybrid-graph camp on extraction and storage (observer-LLM extraction ~ Mem0 update phase; pgvector+Neo4j ~ Mem0 base+Mem0^g; RRF dense+sparse+recency is actually MORE sophisticated than Mem0's plain s=10 similarity). OUTLIER on INJECTION: auto-injecting BOTH memory and KB into EVERY LLM call is the opposite of the converging norm — every documented agentic system (and Mem0's s=10-on-query retrieval) injects a bounded/relevance-gated slice and reads the rest on demand. BEHIND on: (1) model-directed control (the grounding system extracts behind the agent's back; consider an on-demand recall TOOL + an explicit 'remember this' write path like ChatGPT/Cascade/Claude Code); (2) context editing (consider Anthropic-style stale-tool-result clearing with save-to-memory-before-clear). AHEAD on: hybrid dense+sparse+recency RRF retrieval and a typed Neo4j graph mirrored to vectors — more elaborate than most single-store products. HIGHEST-ROI ADOPTION, RANKED: (1) bound the always-injected memory to a small index + expose the rest as an on-demand recall tool (mirrors Claude Code 200-line cap; biggest token/cost + relevance win, directly fixes the outlier behavior); (2) context-editing/compaction with save-essentials-to-memory-before-clear (Anthropic pattern) for long sessions; (3) add an explicit user/agent-directed write path ('remember this') alongside the auto-observer (ChatGPT/Cascade/Claude Code all have both); (4) consider promoting durable explicit notes (the KB) over auto-extracted memories for must-reuse facts, per Windsurf/Cursor guidance."
+      }
+    ],
+    "caveats": "SOURCE QUALITY: All 17 surviving claims rest on PRIMARY sources (vendor docs from Anthropic/OpenAI/Cursor/Windsurf, and the Mem0 arXiv paper), each corroborated by independent secondaries; confidence is uniformly high. TIME-SENSITIVITY: This is a fast-moving area pinned to specific versions — Claude memory tool version memory_20250818 + context-management-2025-06-27 beta header; Claude Code features require v2.1.59+; ChatGPT memory expanded to free users June 2025; Cursor's .mdc/.cursor/rules system supersedes the legacy .cursorrules file; Windsurf docs now redirect to docs.devin.ai after the Cognition/Devin acquisition (the .windsurf/rules/ path is legacy, AGENTS.md + .devin/rules/ are current). Mechanisms and limits (e.g. the 200-line/25KB cap, the 4-hop import depth — some older blogs still say 5) can change without notice; re-verify before implementation. REVERSE-ENGINEERED vs DOCUMENTED: ChatGPT's chat-history-reference RETRIEVAL/INJECTION internals are partly inferred from third-party analysis (Willison, Embrace The Red), not fully documented by OpenAI; Cursor's exact prompt-assembly ordering rests partly on community reverse-engineering ('Anatomy of a Cursor Prompt'); Windsurf's relevance-ranking may be pipeline-assisted (markaicode) beyond the in-context framing the docs use. BENCHMARKS DELIBERATELY EXCLUDED: Mem0's LOCOMO self-benchmark vs OpenAI memory and the LongMemEval/Memora/LongMemEval benchmark-definition claims FAILED adversarial verification (0-0 votes) and are NOT relied upon — all are vendor self-benchmarks or unverified in this pass, so no comparative performance number should be cited from this report. MINOR WORDING IMPRECISIONS noted inline: Anthropic's own docs loosely call tool-result clearing 'client-side' though the headline strategy runs server-side; the Cursor injection-mechanism claim carried a 2-1 split (framing only). COVERAGE GAP: this synthesis covers Anthropic, OpenAI/ChatGPT, Cursor, Windsurf, Claude Code, and Mem0 with primary grounding; the original research brief also requested Google Gemini, Microsoft Copilot, Meta/Perplexity/Grok, Devin, Replit, GitHub Copilot, and dedicated products Zep/Graphiti, Letta/MemGPT, Cognee, LangMem, Supermemory, Memobase, MemoryOS — NONE of these produced surviving verified claims in this batch (Letta's four claims were all voted 0-0/unverified), so this report says nothing reliable about them. The grounding-system mapping is necessarily based only on the verified subset.",
+    "openQuestions": [
+      "For the grounding system specifically: what is the measured token cost and recall-precision impact of auto-injecting the FULL RecallStore + KB every turn versus a Claude-Code-style bounded index + on-demand recall tool? This is the central decision the report points to but cannot quantify without instrumenting the system.",
+      "How do Letta/MemGPT (memory blocks compiled into context every step), Zep/Graphiti (temporal knowledge graph), and Cognee handle the inject-everything vs on-demand tradeoff? Letta in particular reportedly compiles memory blocks into context at EVERY step — the closest external analogue to the grounding system's always-inject design — but its claims did not survive verification this round and should be re-researched, since it may validate or refute the 'outlier' framing.",
+      "What are ChatGPT's and Gemini's ACTUAL retrieval+injection internals for the implicit chat-history-reference layer (semantic search? recency? full-history scan? token budget?), given OpenAI does not document them and only reverse-engineering exists — this determines whether the grounding system's recency-weighted RRF is ahead of or behind the consumer assistants.",
+      "Do any of these systems use a TYPED knowledge graph (like the grounding system's Neo4j KB) as the PRIMARY always-on memory rather than a vector store, and if so how do they bound graph-context injection — Mem0^g is graph-capable but still retrieves a bounded slice; no verified source showed a graph used as an always-fully-injected memory."
+    ],
+    "refuted": [
+      {
+        "claim": "On the LOCOMO benchmark (LLM-as-a-Judge 'J' metric), Mem0 scores ~26% relatively higher than OpenAI's ChatGPT memory; Table 2 overall J: Mem0=66.88, Mem0^g=68.44 vs OpenAI=52.90. This is a vendor self-benchmark by the Mem0 company.",
+        "vote": "0-0",
+        "source": "https://arxiv.org/pdf/2504.19413"
+      },
+      {
+        "claim": "Letta uses agentic, model-directed memory writing: the agent edits its own memory blocks via memory tools (or custom tools), rather than an external pipeline extracting memories behind the model's back. Developer-set read-only blocks are the exception, editable only by the developer.",
+        "vote": "0-0",
+        "source": "https://www.letta.com/blog/memory-blocks"
+      },
+      {
+        "claim": "Letta's memory is structured as 'memory blocks' — discrete units each with a label (e.g. 'human', 'persona', 'knowledge'), a string value, and a size limit — that are individually persisted in the database with a unique block_id and addressable via API.",
+        "vote": "0-0",
+        "source": "https://www.letta.com/blog/memory-blocks"
+      },
+      {
+        "claim": "Letta injects memory blocks into context at every inference step rather than retrieving on demand: the context window is compiled from current DB block values (via Jinja templating) on each LLM request, making block contents always in-context.",
+        "vote": "0-0",
+        "source": "https://www.letta.com/blog/memory-blocks"
+      },
+      {
+        "claim": "Letta implements 'sleep-time compute' where background agents process information during idle periods and write new 'learned context' into shared memory blocks (e.g. reflecting on a codebase or prior conversation history).",
+        "vote": "0-0",
+        "source": "https://www.letta.com/blog/memory-blocks"
+      },
+      {
+        "claim": "On the LongMemEval benchmark, commercial chat assistants and long-context LLMs exhibit a roughly 30% accuracy drop when required to memorize and recall information across sustained, multi-session interactions.",
+        "vote": "0-0",
+        "source": "https://arxiv.org/abs/2410.10813"
+      },
+      {
+        "claim": "LongMemEval is a 500-question benchmark that evaluates five distinct long-term memory abilities of chat assistants: information extraction, multi-session reasoning, temporal reasoning, knowledge updates, and abstention.",
+        "vote": "0-0",
+        "source": "https://arxiv.org/abs/2410.10813"
+      },
+      {
+        "claim": "Memora is a long-term memory benchmark for personalized agents spanning weekly (~155 sessions), monthly (~615 sessions), and quarterly (~1,991 sessions) multi-turn conversations across 10 professional personas, testing three tasks: remembering, reasoning, and recommending.",
+        "vote": "0-0",
+        "source": "https://arxiv.org/html/2604.20006v1"
+      }
+    ],
+    "sources": [
+      {
+        "url": "https://embracethered.com/blog/posts/2025/chatgpt-how-does-chat-history-memory-preferences-work/",
+        "quality": "blog",
+        "angle": "Frontier consumer assistants (documented vs reverse-engineered)",
+        "claimCount": 5
+      },
+      {
+        "url": "https://platform.claude.com/docs/en/agents-and-tools/tool-use/memory-tool",
+        "quality": "primary",
+        "angle": "Frontier consumer assistants (documented vs reverse-engineered)",
+        "claimCount": 5
+      },
+      {
+        "url": "https://help.openai.com/en/articles/8983136-what-is-memory",
+        "quality": "primary",
+        "angle": "Frontier consumer assistants (documented vs reverse-engineered)",
+        "claimCount": 5
+      },
+      {
+        "url": "https://www.shloked.com/writing/claude-memory-tool",
+        "quality": "blog",
+        "angle": "Frontier consumer assistants (documented vs reverse-engineered)",
+        "claimCount": 5
+      },
+      {
+        "url": "https://www.shloked.com/writing/gemini-memory",
+        "quality": "blog",
+        "angle": "Frontier consumer assistants (documented vs reverse-engineered)",
+        "claimCount": 5
+      },
+      {
+        "url": "https://cursor.com/docs/rules",
+        "quality": "primary",
+        "angle": "Coding-agent memory-file paradigm",
+        "claimCount": 5
+      },
+      {
+        "url": "https://code.claude.com/docs/en/memory",
+        "quality": "primary",
+        "angle": "Coding-agent memory-file paradigm",
+        "claimCount": 5
+      },
+      {
+        "url": "https://docs.windsurf.com/windsurf/cascade/memories",
+        "quality": "primary",
+        "angle": "Coding-agent memory-file paradigm",
+        "claimCount": 5
+      },
+      {
+        "url": "https://arize.com/blog/optimizing-coding-agent-rules-claude-md-agents-md-clinerules-cursor-rules-for-improved-accuracy/",
+        "quality": "blog",
+        "angle": "Coding-agent memory-file paradigm",
+        "claimCount": 5
+      },
+      {
+        "url": "https://www.deployhq.com/blog/ai-coding-config-files-guide",
+        "quality": "blog",
+        "angle": "Coding-agent memory-file paradigm",
+        "claimCount": 5
+      },
+      {
+        "url": "https://www.augmentcode.com/guides/why-ai-agents-repeat-questions",
+        "quality": "blog",
+        "angle": "Coding-agent memory-file paradigm",
+        "claimCount": 5
+      },
+      {
+        "url": "https://arxiv.org/pdf/2504.19413",
+        "quality": "primary",
+        "angle": "Dedicated & open-source memory products (architecture + license)",
+        "claimCount": 5
+      },
+      {
+        "url": "https://github.com/getzep/zep-papers/issues/5",
+        "quality": "forum",
+        "angle": "Dedicated & open-source memory products (architecture + license)",
+        "claimCount": 5
+      },
+      {
+        "url": "https://www.letta.com/blog/memory-blocks",
+        "quality": "primary",
+        "angle": "Dedicated & open-source memory products (architecture + license)",
+        "claimCount": 5
+      },
+      {
+        "url": "https://atlan.com/know/best-ai-agent-memory-frameworks-2026/",
+        "quality": "blog",
+        "angle": "Dedicated & open-source memory products (architecture + license)",
+        "claimCount": 5
+      },
+      {
+        "url": "https://vectorize.io/articles/mem0-vs-letta",
+        "quality": "blog",
+        "angle": "Agentic-tool memory vs automatic-RAG-injection design debate",
+        "claimCount": 5
+      },
+      {
+        "url": "https://mem0.ai/blog/state-of-ai-agent-memory-2026",
+        "quality": "blog",
+        "angle": "Agentic-tool memory vs automatic-RAG-injection design debate",
+        "claimCount": 5
+      },
+      {
+        "url": "https://blog.getzep.com/lies-damn-lies-statistics-is-mem0-really-sota-in-agent-memory/",
+        "quality": "blog",
+        "angle": "Memory benchmarks, self-benchmark skepticism, and failure modes",
+        "claimCount": 5
+      },
+      {
+        "url": "https://arxiv.org/abs/2410.10813",
+        "quality": "primary",
+        "angle": "Memory benchmarks, self-benchmark skepticism, and failure modes",
+        "claimCount": 4
+      },
+      {
+        "url": "https://arxiv.org/html/2604.20006v1",
+        "quality": "primary",
+        "angle": "Memory benchmarks, self-benchmark skepticism, and failure modes",
+        "claimCount": 5
+      },
+      {
+        "url": "https://every.to/also-true-for-humans/why-i-turned-off-chatgpt-s-memory",
+        "quality": "blog",
+        "angle": "Memory benchmarks, self-benchmark skepticism, and failure modes",
+        "claimCount": 5
+      },
+      {
+        "url": "https://arxiv.org/pdf/2410.10813",
+        "quality": "primary",
+        "angle": "Memory benchmarks, self-benchmark skepticism, and failure modes",
+        "claimCount": 5
+      },
+      {
+        "url": "https://arxiv.org/abs/2604.02280",
+        "quality": "primary",
+        "angle": "Memory benchmarks, self-benchmark skepticism, and failure modes",
+        "claimCount": 5
+      }
+    ],
+    "stats": {
+      "angles": 5,
+      "sourcesFetched": 23,
+      "claimsExtracted": 114,
+      "claimsVerified": 25,
+      "confirmed": 17,
+      "killed": 8,
+      "afterSynthesis": 11,
+      "urlDupes": 3,
+      "budgetDropped": 4,
+      "agentCalls": 105
+    }
+  }
+}
