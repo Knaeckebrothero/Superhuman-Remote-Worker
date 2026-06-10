@@ -170,23 +170,50 @@ class OpenCloudBackend:
         only ever sees the short-lived access token, never the client
         secret. See docs/features/rclone_cloud_mount.md §11.
 
-        User-home mounts need token-exchange impersonation and are deferred
-        (feature doc Phase 6 step 3); they raise ``NOT_SUPPORTED`` so the
+        User-home mounts (Personal Spaces) use
+        ``auth.type = "keycloak_user_impersonation"``: the agent exchanges
+        its service token for a user-scoped token via RFC 8693
+        (``requested_subject``), because a Personal Space is owned by
+        exactly one user and the service account has no WebDAV access to
+        it. Requires the realm-management ``impersonation`` role on this
+        client's service account (granted by the bundled Keycloak setup).
+        Without a resolvable target sub they raise ``NOT_SUPPORTED`` so the
         thread takes the documented session-folder fallback.
         """
         self._ensure_ready()
+        auth: dict[str, Any] = {
+            "type": "keycloak_client_credentials",
+            "issuer": self._keycloak_issuer,
+            "client_id": self._client_id,
+            "client_secret": self._client_secret,
+        }
         if isinstance(handle, SessionFolderHandle):
             webdav_url = self.get_session_folder_webdav_url(handle)
-        elif handle.vendor_meta.get("kind") == "user_home":
-            raise CloudBackendError(
-                CloudBackendErrorKind.NOT_SUPPORTED,
-                f"cannot build rclone mount for {mount_kind}: OpenCloud "
-                "user-home mounts require impersonation token support "
-                "(not yet enabled); session-folder fallback applies",
-                backend=self.backend_id,
-            )
         else:
-            webdav_url = self.get_project_folder_webdav_url(handle)
+            # Always reconstruct from the internal base URL. The persisted
+            # vendor_meta webdav_url comes from the graph create/lookup
+            # response and is the PUBLIC URL — mounting that would hairpin
+            # all rclone traffic through the public edge (and fails on
+            # local k3d, where workspace pods cannot reach it at all).
+            # handle.native_id is the Space drive id for both project and
+            # user-home handles.
+            webdav_url = (
+                f"{self._base_url}/dav/spaces/{quote(handle.native_id, safe='')}/"
+                if handle.native_id
+                else None
+            )
+            if handle.vendor_meta.get("kind") == "user_home":
+                target_user_sub = (subject.user_sub if subject else None) or ""
+                if not target_user_sub:
+                    raise CloudBackendError(
+                        CloudBackendErrorKind.NOT_SUPPORTED,
+                        f"cannot build rclone mount for {mount_kind}: "
+                        "user-home mount has no target user sub for "
+                        "impersonation; session-folder fallback applies",
+                        backend=self.backend_id,
+                    )
+                auth["type"] = "keycloak_user_impersonation"
+                auth["target_user_sub"] = target_user_sub
 
         if not webdav_url:
             raise CloudBackendError(
@@ -203,12 +230,7 @@ class OpenCloudBackend:
                 # quirks. Exists from rclone 1.70.0 — enforced below.
                 "vendor": "infinitescale",
             },
-            auth={
-                "type": "keycloak_client_credentials",
-                "issuer": self._keycloak_issuer,
-                "client_id": self._client_id,
-                "client_secret": self._client_secret,
-            },
+            auth=auth,
             cache={
                 "vfs_cache_mode": "full",
                 "vfs_cache_max_size": "10G",

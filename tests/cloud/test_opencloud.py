@@ -24,6 +24,7 @@ from pydantic import SecretStr
 from orchestrator.services.cloud import (
     CloudBackendError,
     CloudBackendErrorKind,
+    CloudMountSubject,
     GroupId,
     OpenCloudBackend,
     OpenCloudSettings,
@@ -454,7 +455,40 @@ class TestRcloneMountSpec:
         assert spec.auth["type"] == "keycloak_client_credentials"
 
     @pytest.mark.asyncio
-    async def test_user_home_raises_not_supported(self):
+    async def test_user_home_with_sub_uses_impersonation_auth(self):
+        be = OpenCloudBackend(_settings())
+        _install_fake(be, FakeOpenCloud())
+        handle = ProjectFolderHandle(
+            backend="opencloud",
+            native_id="personal-drive-1",
+            vendor_meta={
+                "kind": "user_home",
+                "username": "user-1",
+                # Graph responses persist the PUBLIC URL — the spec builder
+                # must ignore it and reconstruct from the internal base.
+                "webdav_url": "https://cloud.public.example/dav/spaces/personal-drive-1",
+            },
+        )
+        spec = await be.build_rclone_mount_spec(
+            handle=handle,
+            mount_kind="project_default",
+            target_path="/cloud/home",
+            access="read_write",
+            subject=CloudMountSubject(user_sub="kc-sub-1234", username="user-1"),
+        )
+        # Internal base URL reconstruction — NOT the persisted vendor_meta
+        # webdav_url, which is the public URL from the graph response.
+        assert (
+            spec.source_config["url"]
+            == f"{OPENCLOUD_BASE}/dav/spaces/personal-drive-1/"
+        )
+        assert spec.auth["type"] == "keycloak_user_impersonation"
+        assert spec.auth["target_user_sub"] == "kc-sub-1234"
+        assert spec.auth["client_secret"] == "test-secret"
+        assert "token_helper" in spec.required_capabilities
+
+    @pytest.mark.asyncio
+    async def test_user_home_without_sub_raises_not_supported(self):
         be = OpenCloudBackend(_settings())
         _install_fake(be, FakeOpenCloud())
         handle = ProjectFolderHandle(
@@ -468,6 +502,7 @@ class TestRcloneMountSpec:
                 mount_kind="project_default",
                 target_path="/cloud/home",
                 access="read_write",
+                subject=CloudMountSubject(username="user-1"),
             )
         assert exc_info.value.kind == CloudBackendErrorKind.NOT_SUPPORTED
 
