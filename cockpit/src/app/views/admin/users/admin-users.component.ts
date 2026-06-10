@@ -1,7 +1,8 @@
-import {ChangeDetectionStrategy, Component, computed, inject, OnInit, signal} from '@angular/core';
+import {ChangeDetectionStrategy, Component, computed, effect, inject, OnInit, signal} from '@angular/core';
 import {SidebarToggleComponent} from '../../../shell/sidebar-toggle/sidebar-toggle.component';
 import {AdminUsersService} from '../../../core/services/admin-users.service';
 import {UserService} from '../../../core/services/user.service';
+import {NotificationService} from '../../../core/services/notification.service';
 import {User} from '../../../core/models/api.model';
 import {AppCheckboxComponent} from '../../../ui/checkbox';
 import {AppBadgeComponent} from '../../../ui/badge';
@@ -315,8 +316,16 @@ import {AppBadgeComponent} from '../../../ui/badge';
 export class AdminUsersComponent implements OnInit {
   protected readonly admin = inject(AdminUsersService);
   private readonly users = inject(UserService);
+  private readonly notifications = inject(NotificationService);
 
   readonly selfId = computed(() => this.users.currentUser()?.id ?? null);
+
+  /** Refresh the table live when a user_registered SSE frame arrives. */
+  private readonly _onUserRegistered = effect(() => {
+    if (this.notifications.adminUserRegistered()) {
+      this.admin.loadUsers();
+    }
+  });
 
   /** Table filter: all users vs. only those awaiting approval. */
   readonly filter = signal<'all' | 'pending'>('all');
