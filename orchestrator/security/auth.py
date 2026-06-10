@@ -290,6 +290,14 @@ async def _resolve_user_from_claims(claims: dict, db) -> dict:
             display_name=display_name,
         )
     )
+    # Dev-only: the moment the admin user first exists, seed the fixed dev MCP
+    # token so a committed .mcp.json authenticates without a manual mint or an
+    # orchestrator restart. Gated on MCP_DEV_TOKEN (unset in prod → skipped);
+    # the function is idempotent and the startup seed in main.py covers restarts.
+    if is_admin and os.environ.get("MCP_DEV_TOKEN", "").strip():
+        from init import _seed_admin_mcp_token
+
+        asyncio.create_task(_seed_admin_mcp_token(db))
     user["is_approved"] = is_approved
     user["preferred_username"] = claims.get("preferred_username")
     return user
