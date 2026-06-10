@@ -28,6 +28,7 @@ from pydantic import BaseModel, Field
 from security.auth import require_approved_user
 from services.session_lifecycle import emit as lifecycle_emit
 from services.session_lifecycle import probe_ready, wait_for_binding, wait_for_ready
+from services.session_provisioning_state import agent_pod_provisioning_in_progress
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +59,10 @@ class PrepareRequest(BaseModel):
 
 class PrepareResponse(BaseModel):
     state: str = Field(..., examples=["provisioning"])
+
+
+def _schedule_prepare_task(coro: Any) -> asyncio.Task[Any]:
+    return asyncio.create_task(coro)
 
 
 # --------------------------------------------------------------------------- #
@@ -93,7 +98,7 @@ async def prepare_session(
     # Fire-and-forget the actual work in a background task. Progress reaches
     # the cockpit via SSE. Idempotency is enforced by the advisory lock
     # inside _do_prepare.
-    asyncio.create_task(
+    _schedule_prepare_task(
         _do_prepare(
             thread_id=thread_id,
             user_id=str(user["id"]),
@@ -148,11 +153,18 @@ async def _do_prepare(
             # wait happens after the lock is released so the new pod's
             # /register can acquire it.
             if not thread.get("agent_id"):
-                await _provision_agent_for_thread(
-                    thread_id=thread_id,
-                    config_name=config_name or "persistent_defaults",
-                    config_override=config_override,
-                )
+                if agent_pod_provisioning_in_progress(thread):
+                    logger.info(
+                        "Thread %s: agent pod already provisioning — "
+                        "waiting for binding.",
+                        thread_id,
+                    )
+                else:
+                    await _provision_agent_for_thread(
+                        thread_id=thread_id,
+                        config_name=config_name or "persistent_defaults",
+                        config_override=config_override,
+                    )
                 needs_binding_wait = True
 
         # Lock released. For fresh-pod paths, wait for the agent's

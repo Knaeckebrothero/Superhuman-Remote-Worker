@@ -42,7 +42,6 @@ _DEFAULT_CACHE = {
     "vfs_cache_mode": "full",
     "vfs_cache_max_size": "10G",
     "vfs_cache_max_age": "24h",
-    "vfs_cache_min_free_space": "5G",
     "dir_cache_time": "5m",
     "poll_interval": "1m",
     "vfs_read_chunk_size": "16M",
@@ -147,7 +146,8 @@ class RcloneMountManager:
         self.thread_id = thread_id
         self.cloud_cfg = cloud_cfg or {}
         self.workspace_backend = workspace_backend
-        self.workspace_root = str(workspace_root)
+        remote_root = getattr(workspace_backend, "root", None)
+        self.workspace_root = str(remote_root or workspace_root)
         self._states: list[RcloneMountState] = []
 
     @property
@@ -346,9 +346,14 @@ class RcloneMountManager:
             "--daemon-timeout",
             "30s",
         ]
+        cache_flag_lines = []
         for key, flag in _CACHE_FLAG_MAP.items():
             if cache.get(key):
-                mount_args.extend([flag, str(cache[key])])
+                cache_flag_lines.append(
+                    "append_mount_flag "
+                    f"{shlex.quote(flag)} {shlex.quote(str(cache[key]))}"
+                )
+        cache_flag_block = "\n".join(cache_flag_lines) if cache_flag_lines else ":"
         if str(mount.get("access") or "").lower() == "read_only":
             mount_args.append("--read-only")
         for flag in mount.get("provider_flags") or []:
@@ -402,6 +407,17 @@ fi
 sort -u {shlex.quote(state.filter_path)} -o {shlex.quote(state.filter_path)}
 
 {mount_array}
+MOUNT_HELP="$(rclone mount --help 2>/dev/null || true)"
+append_mount_flag() {{
+  local flag="$1"
+  local value="$2"
+  if [ -z "${{MOUNT_HELP}}" ] || grep -Fq -- "${{flag}}" <<<"${{MOUNT_HELP}}"; then
+    MOUNT_ARGS+=("${{flag}}" "${{value}}")
+  else
+    printf 'Skipping unsupported rclone mount flag: %s\\n' "${{flag}}" >&2
+  fi
+}}
+{cache_flag_block}
 if [ -s {shlex.quote(state.filter_path)} ]; then
   MOUNT_ARGS+=(--exclude-from {shlex.quote(state.filter_path)})
 fi

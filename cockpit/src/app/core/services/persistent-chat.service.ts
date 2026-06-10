@@ -112,6 +112,8 @@ export interface RunningToolInfo {
 export interface PermissionRequest {
     /** Tool call id — correlates the eventual decision back to the call. */
     id: string;
+    /** Durable DB permission request id, when emitted by the backend. */
+    approvalId?: string;
     tool: string;
     args: Record<string, unknown>;
 }
@@ -829,6 +831,14 @@ export class PersistentChatService {
         try {
             const connection = await this._resolveConnection(threadId);
             if (this.intentionalClose || this.threadId() !== threadId) return;
+            // GET /connection only returns 200 after the orchestrator has a
+            // bound agent and the agent's /ready probe passes. That REST
+            // readiness is enough to unblock the composer; the control WS
+            // session.state frame remains a useful reconciliation signal, but
+            // must not be the only way to clear the startup card.
+            if (connection.state === 'ready') {
+                this.markSessionReady();
+            }
             this._installControlWs(threadId, connection.ws_url);
         } catch {
             // Resolution failed — leave controlWs null; _ensureControlWs
@@ -1338,7 +1348,7 @@ export class PersistentChatService {
                 timestamp: Date.now(),
             });
         }
-        this._sendControl({method: 'approve'});
+        this._resolvePermission(pending, 'approve');
     }
 
     /** Deny a pending permission request. */
@@ -1356,7 +1366,26 @@ export class PersistentChatService {
                 timestamp: Date.now(),
             });
         }
-        this._sendControl({method: 'deny'});
+        this._resolvePermission(pending, 'deny');
+    }
+
+    private _resolvePermission(
+        pending: PermissionRequest | null,
+        decision: 'approve' | 'deny',
+    ): void {
+        const threadId = this.threadId();
+        if (threadId && pending?.approvalId) {
+            const url =
+                `${environment.apiUrl}/persistent/threads/${threadId}` +
+                `/approve/${pending.approvalId}`;
+            this.http.post(url, {decision}).subscribe({
+                error: () => {
+                    this._sendControl({method: decision, approval_id: pending.approvalId});
+                },
+            });
+            return;
+        }
+        this._sendControl({method: decision});
     }
 
     /** Interrupt the current turn — REST POST. */
@@ -1549,7 +1578,13 @@ export class PersistentChatService {
                 const id = (params['id'] as string) || '';
                 const tool = (params['tool'] as string) || '';
                 const args = (params['args'] as Record<string, unknown>) || {};
-                this.pendingPermission.set({id, tool, args});
+                const approvalId = (params['approval_id'] as string) || undefined;
+                this.pendingPermission.set({
+                    id,
+                    ...(approvalId ? {approvalId} : {}),
+                    tool,
+                    args,
+                });
                 this.dispatch({
                     type: 'permission_request',
                     toolUseId: id,

@@ -12372,12 +12372,13 @@ def _runtime_supports_rclone_mount(metadata: dict[str, Any]) -> bool:
     vm_ctx = metadata.get("vm") or {}
     if vm_ctx.get("status") == "ready" and vm_ctx.get("ssh_host"):
         return True
-    if os.getenv("CLOUD_RCLONE_ALLOW_CONTAINER", "").lower() in {"1", "true", "yes"}:
-        ws_ctx = metadata.get("workspace_container") or {}
-        return ws_ctx.get("status") == "ready" and bool(
-            ws_ctx.get("pod_ip") or ws_ctx.get("host")
-        )
-    return False
+    allow_container = os.getenv("CLOUD_RCLONE_ALLOW_CONTAINER", "true").lower()
+    if allow_container in {"0", "false", "no", "off"}:
+        return False
+    ws_ctx = metadata.get("workspace_container") or {}
+    return ws_ctx.get("status") == "ready" and bool(
+        ws_ctx.get("pod_ip") or ws_ctx.get("host")
+    )
 
 
 def _cloud_mount_name(row: dict[str, Any], used: set[str]) -> str:

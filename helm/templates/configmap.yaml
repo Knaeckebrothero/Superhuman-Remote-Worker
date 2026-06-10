@@ -176,7 +176,8 @@ data:
   # Main-cloud workspace data plane. "sync" preserves the legacy eager clone
   # path; "rclone_mount" asks supported agent runtimes to expose cloud folders
   # through lazy rclone/FUSE mounts instead.
-  CLOUD_WORKSPACE_DRIVER: {{ .Values.cloud.workspaceDriver | default "sync" | quote }}
+  CLOUD_WORKSPACE_DRIVER: {{ .Values.cloud.workspaceDriver | default "rclone_mount" | quote }}
+  CLOUD_RCLONE_ALLOW_CONTAINER: {{ ternary "true" "false" .Values.cloud.rcloneMount.allowContainer | quote }}
   {{- if .Values.cloud.nextcloudRcloneUserHomeUsername }}
   NEXTCLOUD_RCLONE_USER_HOME_USERNAME: {{ .Values.cloud.nextcloudRcloneUserHomeUsername | quote }}
   {{- end }}
@@ -232,6 +233,8 @@ data:
   # Workspace containers (per-job sandboxed execution environments)
   WORKSPACE_IMAGE: {{ printf "%s:%s" .Values.image.workspace.repository .Values.image.workspace.tag | quote }}
   WORKSPACE_NAMESPACE: {{ .Release.Namespace | quote }}
+  WORKSPACE_FUSE_ENABLED: {{ ternary "true" "false" .Values.workspace.fuse.enabled | quote }}
+  WORKSPACE_FUSE_PRIVILEGED: {{ ternary "true" "false" .Values.workspace.fuse.privileged | quote }}
 
   # PR 3 — one-time seed knob for the homelab operator. Empty in SaaS deployments.
   # When set, orchestrator init flips this user's default project from

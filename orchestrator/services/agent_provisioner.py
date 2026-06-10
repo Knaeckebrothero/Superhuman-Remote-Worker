@@ -285,12 +285,15 @@ class AgentProvisioner:
 
             # For sessions, store pod info in thread metadata
             if purpose == "session" and thread_id:
+                now_iso = datetime.now(timezone.utc).isoformat()
                 await self._set_thread_context(
                     thread_id,
                     {
                         "status": "created",
                         "pod_name": pod_name,
                         "namespace": self._namespace,
+                        "created_at": now_iso,
+                        "updated_at": now_iso,
                     },
                 )
 
@@ -302,9 +305,14 @@ class AgentProvisioner:
 
             logger.error("Failed to create agent pod %s: %s", pod_name, e)
             if purpose == "session" and thread_id:
+                now_iso = datetime.now(timezone.utc).isoformat()
                 await self._set_thread_context(
                     thread_id,
-                    {"status": "failed", "error": str(e)},
+                    {
+                        "status": "failed",
+                        "error": str(e),
+                        "updated_at": now_iso,
+                    },
                 )
             return None
 
@@ -354,6 +362,13 @@ class AgentProvisioner:
 
             for pod in pods.items:
                 await self.delete_agent_pod(pod.metadata.name)
+            await self._set_thread_context(
+                thread_id,
+                {
+                    "status": "deleted",
+                    "deleted_at": datetime.now(timezone.utc).isoformat(),
+                },
+            )
             return True
         except Exception as e:
             logger.error(

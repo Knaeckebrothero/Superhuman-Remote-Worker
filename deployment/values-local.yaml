@@ -224,6 +224,9 @@ workspace:
   accessMode: "ReadWriteOnce"
   storageSize: "10Gi"
 
+cloud:
+  workspaceDriver: "rclone_mount"
+
 # -----------------------------------------------------------------------------
 # Main cloud backend — Nextcloud (validating the prod-private Nextcloud path on
 # k3d; see docs/issues/main_cloud.md Issue 15). OpenCloud is disabled below so

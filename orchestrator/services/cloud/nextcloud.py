@@ -203,7 +203,6 @@ class NextcloudBackend:
                 "vfs_cache_mode": "full",
                 "vfs_cache_max_size": "10G",
                 "vfs_cache_max_age": "24h",
-                "vfs_cache_min_free_space": "5G",
                 "dir_cache_time": "5m",
                 "poll_interval": "1m",
                 "vfs_read_chunk_size": "16M",

@@ -164,7 +164,7 @@ describe('ModelGroupComponent', () => {
   });
 
   describe('prefillFromConfig', () => {
-    it('should extract strategic and tactical models from config', () => {
+    it('should not treat config models as user overrides', () => {
       const {component} = createComponent();
       component.prefillFromConfig({
         llm: {
@@ -174,20 +174,22 @@ describe('ModelGroupComponent', () => {
         },
       });
 
-      expect(component.strategicModel()).toBe('strategic-override');
-      expect(component.tacticalModel()).toBe('tactical-override');
-      expect(component.sessionModel()).toBe('base-model');
+      expect(component.strategicModel()).toBeNull();
+      expect(component.tacticalModel()).toBeNull();
+      expect(component.sessionModel()).toBeNull();
+      expect(component.getOverrides()).toEqual({});
     });
 
-    it('should fall back to base model when phase models not set', () => {
+    it('should not send base config model as an override', () => {
       const {component} = createComponent();
       component.prefillFromConfig({
         llm: {model: 'gpt-5.4'},
       });
 
-      expect(component.strategicModel()).toBe('gpt-5.4');
-      expect(component.tacticalModel()).toBe('gpt-5.4');
-      expect(component.sessionModel()).toBe('gpt-5.4');
+      expect(component.strategicModel()).toBeNull();
+      expect(component.tacticalModel()).toBeNull();
+      expect(component.sessionModel()).toBeNull();
+      expect(component.getOverrides()).toEqual({});
     });
 
     it('should handle empty config', () => {
