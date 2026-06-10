@@ -12,6 +12,20 @@
 
 ---
 
+## Current state (2026-06-07)
+
+**✅ Phases A–D complete + k3d-verified (2026-06-01).** Migration `0022` applied on the real DB; the full UI→API→DB round-trip and the agent read→apply→freeze chain were verified in-pod, and a gemma-family job froze `resolved_config->'agent'->'llm'->>'temperature' = 1` from a DB override. Backend tests + `ruff` clean; committed on `develop`. Flag stays `false` in prod, `true` only in `values-experimental.yaml` and local `values-local.yaml`.
+
+**The Cockpit UI then grew past this plan's "basic structured editor" scope** in three follow-on rounds — all live-verified on k3d. **No orchestrator/agent resolution code changed** (the resolver already handled every kind); round 1 also edited `config/prompts/catalog.yaml` (catalog *data*), rounds 2–3 are cockpit-only:
+
+1. **Grouped picker + exposed keys (2026-06-03).** Picker keys bucket into `<optgroup>`s via a new `group:` field in `config/prompts/catalog.yaml`. Exposed two kinds the plumbing always supported but the catalog never listed: the persistent `systemprompt_interactive` prompt and all `instructions`. `workspace_template` deliberately left out (vestigial).
+2. **Typed settings form (2026-06-06).** `settings` pulled out of the key selector into a dedicated, family-scoped typed form (number inputs + a toggle) with diff-against-bundled Save (changed→upsert / reset→delete / unchanged→no-op), per-field reset, and override badges. Fixed a `value_json`-as-JSON-string decode bug (asyncpg returns JSONB as text) once at the service boundary (`coerceOverrideValue`), which also corrected the guardrails editor.
+3. **Layout + single-field editor (2026-06-07).** Reorganized into family-scope-on-top → settings → overrides; the key dropdown moved *inside* the editor card and default-selects the first key. The two-column *bundled \| override* pair collapsed into one editable field (seeded to the effective value) with a codeblock-style copy button, drag-and-drop / file-upload, a collapsible read-only "shipped default", and diff-aware Save.
+
+The spec's §9 "As-built" mirrors this. The per-step `[ ]` checkboxes below are the **original** implementation recipe (left as the historical record); Task C2's "single textarea / two-column" describes the minimal target, not the as-built UI.
+
+---
+
 ## Decisions (locked with the user)
 
 - **Full rename now** (`prompt_* → config_*`) across DB table, loader, agent, orchestrator DB, API routes, env flag, and the Cockpit page. No deprecated aliases — it's one push, tested on k3d-local.
@@ -51,7 +65,7 @@
 
 ---
 
-## PHASE A — Rename + storage migration
+## PHASE A — Rename + storage migration ✅
 
 ### Task A1: Migration 0022 — rename table + generalize storage
 
@@ -177,7 +191,7 @@ git commit -m "refactor(config-overrides): rename prompt_* -> config_* (table/lo
 
 ---
 
-## PHASE B — Backend feature (settings + guardrails)
+## PHASE B — Backend feature (settings + guardrails) ✅
 
 ### Task B1: Loader — generalize the override map + structured accessors
 
@@ -564,7 +578,7 @@ def test_catalog_has_settings_and_guardrails_keys():
 
 ---
 
-## PHASE C — Cockpit UI (rename + basic structured editing)
+## PHASE C — Cockpit UI (rename + basic structured editing) ✅
 
 ### Task C1: Rename the admin page `prompts → config`
 
@@ -593,7 +607,7 @@ The picker is already catalog-driven, so new kinds appear automatically once Tas
 
 ---
 
-## PHASE D — k3d end-to-end verification
+## PHASE D — k3d end-to-end verification ✅
 
 ### Task D1: Bring up k3d-local with the flag on, and verify
 
@@ -656,4 +670,4 @@ Expected: PASS / clean. CI (Py3.12) is the gate.
 **Migration safety:** 0021 is never edited; the rename + generalization happen in new 0022; RENAME preserves data; ON CONFLICT infers by expression so the unique-index rename is safe.
 
 ## Out of scope (separate work)
-- Per-expert overrides (own feature). · Reconcile-on-redeploy (`helm_managed_settings.md`). · Live in-flight updates. · Richer UI than the basic structured editor. · Fixing the `FAMILIES` hyphen/underscore mismatch (flagged in D1).
+- Per-expert overrides (own feature). · Reconcile-on-redeploy (`helm_managed_settings.md`). · Live in-flight updates. · ~~Richer UI than the basic structured editor~~ — originally out of scope, since **built** (see "Current state"). · ~~Fixing the `FAMILIES` hyphen/underscore mismatch (flagged in D1)~~ — since corrected (underscore forms dropped, `minimax-m3` added; see `admin-config.component.ts` `FAMILIES`).
