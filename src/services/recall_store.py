@@ -258,9 +258,6 @@ class RecallStore:
         # Config defaults (matches MemoryConfig dataclass)
         self.dedup_threshold = 0.85
         self.importance_threshold = 0.3
-        self.dense_results = 5
-        self.sparse_results = 5
-        self.recent_results = 3
         self.budget_tokens = 10000
         self.max_memories_per_injection = 150
         self.retrieval_importance_floor = 0.4
@@ -269,9 +266,6 @@ class RecallStore:
         if config is not None:
             self.dedup_threshold = getattr(config, "dedup_threshold", 0.85)
             self.importance_threshold = getattr(config, "importance_threshold", 0.3)
-            self.dense_results = getattr(config, "dense_results", 5)
-            self.sparse_results = getattr(config, "sparse_results", 5)
-            self.recent_results = getattr(config, "recent_results", 3)
             self.budget_tokens = getattr(config, "budget_tokens", 10000)
             self.max_memories_per_injection = getattr(
                 config, "max_memories_per_injection", 150
@@ -550,118 +544,6 @@ class RecallStore:
         if row:
             return MemoryRecord.from_row(dict(row))
         return None
-
-    # =========================================================================
-    # Retrieval
-    # =========================================================================
-
-    async def search_dense(
-        self,
-        embedding: List[float],
-        limit: Optional[int] = None,
-    ) -> List[MemoryRecord]:
-        """Search memories by dense vector similarity.
-
-        Args:
-            embedding: Query embedding vector
-            limit: Max results (default: self.dense_results)
-
-        Returns:
-            List of matching MemoryRecord objects
-        """
-        limit = limit or self.dense_results
-
-        scope_clause, scope_val = self._scope_where(1)
-        rows = await self.db.fetch(
-            f"""
-            SELECT *
-            FROM memories
-            WHERE {scope_clause} AND embedding IS NOT NULL
-            ORDER BY embedding <=> $2
-            LIMIT $3
-            """,
-            scope_val,
-            embedding,
-            limit,
-        )
-
-        # Update access tracking
-        if rows:
-            ids = [row["id"] for row in rows]
-            await self.db.execute(
-                """
-                UPDATE memories
-                SET access_count = access_count + 1,
-                    last_accessed = CURRENT_TIMESTAMP
-                WHERE id = ANY($1)
-                """,
-                ids,
-            )
-
-        return [MemoryRecord.from_row(dict(row)) for row in rows]
-
-    async def search_sparse(
-        self,
-        query_text: str,
-        limit: Optional[int] = None,
-    ) -> List[MemoryRecord]:
-        """Search memories by keyword/full-text search.
-
-        Args:
-            query_text: Text query for tsquery matching
-            limit: Max results (default: self.sparse_results)
-
-        Returns:
-            List of matching MemoryRecord objects
-        """
-        limit = limit or self.sparse_results
-
-        scope_clause, scope_val = self._scope_where(1)
-        rows = await self.db.fetch(
-            f"""
-            SELECT *,
-                   ts_rank_cd(sparse_keywords, websearch_to_tsquery('english', $2)) AS rank
-            FROM memories
-            WHERE {scope_clause}
-              AND sparse_keywords @@ websearch_to_tsquery('english', $2)
-            ORDER BY rank DESC
-            LIMIT $3
-            """,
-            scope_val,
-            query_text,
-            limit,
-        )
-
-        return [MemoryRecord.from_row(dict(row)) for row in rows]
-
-    async def get_recent(
-        self,
-        limit: Optional[int] = None,
-    ) -> List[MemoryRecord]:
-        """Get most recently created memories.
-
-        Args:
-            limit: Max results (default: self.recent_results)
-
-        Returns:
-            List of MemoryRecord objects ordered by creation time
-        """
-        limit = limit or self.recent_results
-
-        scope_clause, scope_val = self._scope_where(1)
-        rows = await self.db.fetch(
-            f"""
-            SELECT *
-            FROM memories
-            WHERE {scope_clause}
-            ORDER BY created_at DESC
-            LIMIT $2
-            """,
-            scope_val,
-            limit,
-        )
-
-        return [MemoryRecord.from_row(dict(row)) for row in rows]
 
     # =========================================================================
     # TTL Management

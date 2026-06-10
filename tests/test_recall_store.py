@@ -27,9 +27,6 @@ class MockMemoryConfig:
     enabled: bool = True
     budget_tokens: int = 5000
     max_memories_per_injection: int = 10
-    dense_results: int = 5
-    sparse_results: int = 5
-    recent_results: int = 3
     importance_threshold: float = 0.3
     dedup_threshold: float = 0.92
 
@@ -224,69 +221,6 @@ class TestStore:
 
 class TestRetrieval:
     """Test RecallStore retrieval methods."""
-
-    @pytest.mark.asyncio
-    async def test_search_dense(self, store, mock_db):
-        """search_dense() queries by vector similarity."""
-        mock_db.fetch.return_value = [
-            {
-                "id": uuid.uuid4(),
-                "job_id": store.job_id,
-                "content": "Memory 1",
-                "memory_type": "factual",
-                "source": "observer",
-                "importance": 0.9,
-                "token_count": 20,
-                "access_count": 0,
-                "keywords": ["test"],
-            }
-        ]
-
-        results = await store.search_dense([0.1] * 1536)
-        assert len(results) == 1
-        assert results[0].content == "Memory 1"
-
-    @pytest.mark.asyncio
-    async def test_search_sparse(self, store, mock_db):
-        """search_sparse() queries by tsvector matching."""
-        mock_db.fetch.return_value = [
-            {
-                "id": uuid.uuid4(),
-                "job_id": store.job_id,
-                "content": "JWT auth pattern",
-                "memory_type": "procedural",
-                "source": "todo",
-                "importance": 0.7,
-                "token_count": 15,
-                "access_count": 1,
-                "keywords": ["jwt", "auth"],
-                "rank": 0.5,
-            }
-        ]
-
-        results = await store.search_sparse("JWT authentication")
-        assert len(results) == 1
-        assert results[0].memory_type == "procedural"
-
-    @pytest.mark.asyncio
-    async def test_get_recent(self, store, mock_db):
-        """get_recent() returns most recently created memories."""
-        mock_db.fetch.return_value = [
-            {
-                "id": uuid.uuid4(),
-                "job_id": store.job_id,
-                "content": "Recent memory",
-                "memory_type": "factual",
-                "source": "observer",
-                "importance": 0.5,
-                "token_count": 10,
-                "access_count": 0,
-                "keywords": [],
-            }
-        ]
-
-        results = await store.get_recent(limit=3)
-        assert len(results) == 1
 
     @pytest.mark.asyncio
     async def test_retrieve_respects_budget(

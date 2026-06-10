@@ -441,6 +441,327 @@ class TestPostgresDBUserOps:
         result = await db.get_admin_user()
         assert result is None
 
+    @pytest.mark.asyncio
+    async def test_list_users_includes_approval_columns(self):
+        db = self._make_db()
+        rows = [
+            {
+                "id": uuid4(),
+                "display_name": "Pending",
+                "avatar_color": "#89b4fa",
+                "email": "p@test.com",
+                "default_project_id": uuid4(),
+                "is_admin": False,
+                "can_use_vm": False,
+                "is_approved": False,
+                "approved_at": None,
+                "approved_by": None,
+                "created_at": datetime.now(timezone.utc),
+            },
+        ]
+        self._mock_conn(db, fetch_return=rows)
+
+        result = await db.list_users()
+        assert result[0]["is_approved"] is False
+        assert "approved_at" in result[0]
+        assert "approved_by" in result[0]
+
+    @pytest.mark.asyncio
+    async def test_update_user_stamps_approval(self):
+        db = self._make_db()
+        conn = self._mock_conn(db, execute_return="UPDATE 1")
+
+        ok = await db.update_user(
+            str(uuid4()),
+            is_approved=True,
+            approved_at=datetime.now(timezone.utc),
+            approved_by=str(uuid4()),
+        )
+        assert ok is True
+        sql = conn.execute.call_args[0][0]
+        assert "is_approved = $" in sql
+        assert "approved_at = $" in sql
+        assert "approved_by = $" in sql
+
+    @pytest.mark.asyncio
+    async def test_update_user_suspension_omits_stamp(self):
+        # Suspension (is_approved=False) flips the flag but must NOT touch
+        # approved_at/approved_by — they survive as approval history.
+        db = self._make_db()
+        conn = self._mock_conn(db, execute_return="UPDATE 1")
+
+        ok = await db.update_user(str(uuid4()), is_approved=False)
+        assert ok is True
+        sql = conn.execute.call_args[0][0]
+        assert "is_approved = $" in sql
+        assert "approved_at" not in sql
+        assert "approved_by" not in sql
+
+    @pytest.mark.asyncio
+    async def test_approve_users_returns_matched_ids(self):
+        db = self._make_db()
+        id1, id2 = uuid4(), uuid4()
+        conn = self._mock_conn(db, fetch_return=[{"id": id1}, {"id": id2}])
+
+        result = await db.approve_users([str(id1), str(id2)], approved_by=str(uuid4()))
+        assert result == [str(id1), str(id2)]
+        sql = conn.fetch.call_args[0][0]
+        assert "is_approved = TRUE" in sql
+        assert "RETURNING id" in sql
+        passed_uuids = conn.fetch.call_args[0][1]
+        assert id1 in passed_uuids and id2 in passed_uuids
+
+    @pytest.mark.asyncio
+    async def test_approve_users_filters_invalid_ids(self):
+        db = self._make_db()
+        good = uuid4()
+        conn = self._mock_conn(db, fetch_return=[{"id": good}])
+
+        result = await db.approve_users([str(good), "not-a-uuid", ""])
+        assert result == [str(good)]
+        # Only the valid UUID is passed to the query.
+        assert conn.fetch.call_args[0][1] == [good]
+
+    @pytest.mark.asyncio
+    async def test_approve_users_all_invalid_skips_db(self):
+        db = self._make_db()
+        conn = self._mock_conn(db, fetch_return=[])
+
+        result = await db.approve_users(["nope", ""])
+        assert result == []
+        conn.fetch.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_list_admin_user_ids(self):
+        db = self._make_db()
+        id1, id2 = uuid4(), uuid4()
+        conn = self._mock_conn(db, fetch_return=[{"id": id1}, {"id": id2}])
+
+        result = await db.list_admin_user_ids()
+        assert result == [str(id1), str(id2)]
+        sql = conn.fetch.call_args[0][0]
+        assert "is_admin = TRUE" in sql
+
+
+class TestAppSideAdmission:
+    """App-side admission seam: the ``users.is_approved`` column owns approval,
+    with a transition-window write-through from the legacy Keycloak ``user``
+    role and PAT/MCP paths that no longer force approval. See
+    docs/features/app_side_admission.md.
+    """
+
+    def _db_with_user(self, user_row):
+        """Mock db whose get_user_by_keycloak_sub returns user_row and whose
+        acquire() yields a conn with a captured execute()."""
+        db = MagicMock()
+        db.get_user_by_keycloak_sub = AsyncMock(return_value=user_row)
+        conn = AsyncMock()
+        conn.execute = AsyncMock(return_value="UPDATE 1")
+        cm = AsyncMock()
+        cm.__aenter__ = AsyncMock(return_value=conn)
+        cm.__aexit__ = AsyncMock(return_value=False)
+        db.acquire = MagicMock(return_value=cm)
+        return db, conn
+
+    def _user_row(self, **over):
+        row = {
+            "id": uuid4(),
+            "display_name": "rowuser",
+            "avatar_color": "#89b4fa",
+            "email": "u@test.com",
+            "default_project_id": uuid4(),
+            "is_admin": False,
+            "can_use_vm": False,
+            "is_approved": False,
+            "preferred_username": "rowuser",
+            "keycloak_sub": "kc-1",
+            "created_at": datetime.now(timezone.utc),
+        }
+        row.update(over)
+        return row
+
+    def _claims(self, roles):
+        return {
+            "sub": "kc-1",
+            "email": "u@test.com",
+            "preferred_username": "rowuser",
+            "realm_access": {"roles": roles},
+        }
+
+    @pytest.mark.asyncio
+    async def test_write_through_migrates_legacy_role_holder(self):
+        from security.auth import _resolve_user_from_claims
+
+        db, conn = self._db_with_user(self._user_row(is_approved=False))
+        result = await _resolve_user_from_claims(self._claims(["user"]), db)
+
+        assert result["is_approved"] is True
+        # The role-holder's DB flag was stamped through on this request.
+        sql = conn.execute.call_args[0][0]
+        assert "is_approved = $" in sql
+
+    @pytest.mark.asyncio
+    async def test_pending_when_no_role_and_db_false(self):
+        from security.auth import _resolve_user_from_claims
+
+        db, _ = self._db_with_user(self._user_row(is_approved=False))
+        result = await _resolve_user_from_claims(self._claims([]), db)
+
+        assert result["is_approved"] is False
+        db.acquire.assert_not_called()  # nothing to write through
+
+    @pytest.mark.asyncio
+    async def test_db_approved_survives_absent_role(self):
+        from security.auth import _resolve_user_from_claims
+
+        db, _ = self._db_with_user(self._user_row(is_approved=True))
+        result = await _resolve_user_from_claims(self._claims([]), db)
+
+        # DB flag wins; an absent role never downgrades an approved user.
+        assert result["is_approved"] is True
+        db.acquire.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_resolve_pat_no_longer_forces_approval(self):
+        from security.auth import _resolve_pat
+
+        db = MagicMock()
+        db.get_auth_token_by_hash = AsyncMock(
+            return_value={
+                "id": uuid4(),
+                "user_id": uuid4(),
+                "kind": "api",
+                "scopes": [],
+            }
+        )
+        db.get_user = AsyncMock(
+            return_value={"id": uuid4(), "display_name": "x", "is_approved": False}
+        )
+        db.touch_auth_token = AsyncMock()
+        request = MagicMock()
+        request.headers = {}
+        request.client = MagicMock(host="127.0.0.1")
+
+        result = await _resolve_pat("ak_token", request, db)
+        # A suspended owner's PAT now reflects the row → denied downstream.
+        assert result["is_approved"] is False
+
+    @pytest.mark.asyncio
+    async def test_resolve_pat_approved_user_passes(self):
+        from security.auth import _resolve_pat
+
+        db = MagicMock()
+        db.get_auth_token_by_hash = AsyncMock(
+            return_value={
+                "id": uuid4(),
+                "user_id": uuid4(),
+                "kind": "api",
+                "scopes": [],
+            }
+        )
+        db.get_user = AsyncMock(
+            return_value={"id": uuid4(), "display_name": "x", "is_approved": True}
+        )
+        db.touch_auth_token = AsyncMock()
+        request = MagicMock()
+        request.headers = {}
+        request.client = MagicMock(host="127.0.0.1")
+
+        result = await _resolve_pat("ak_token", request, db)
+        assert result["is_approved"] is True
+
+    @pytest.mark.asyncio
+    async def test_ensure_user_provisioned_skips_without_sub(self):
+        # Admin-created / pre-OIDC rows have no keycloak_sub → no provisioning
+        # (they provision on their owner's first real OIDC login).
+        from security import auth
+
+        with (
+            patch.object(auth, "_ensure_cloud_user", new=AsyncMock()) as ec,
+            patch.object(auth, "_ensure_gitea_user", new=AsyncMock()) as eg,
+        ):
+            await auth.ensure_user_provisioned({"id": uuid4(), "email": "x@y.com"})
+        ec.assert_not_called()
+        eg.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_ensure_user_provisioned_fires_both_ensures(self):
+        import asyncio
+
+        from security import auth
+
+        with (
+            patch.object(auth, "_ensure_cloud_user", new=AsyncMock()) as ec,
+            patch.object(auth, "_ensure_gitea_user", new=AsyncMock()) as eg,
+        ):
+            await auth.ensure_user_provisioned(
+                {
+                    "id": uuid4(),
+                    "keycloak_sub": "kc-1",
+                    "email": "x@y.com",
+                    "display_name": "X",
+                    "preferred_username": "x",
+                }
+            )
+            await asyncio.sleep(0)  # let the scheduled tasks run
+            ec.assert_called_once()
+            eg.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_notify_admins_fans_out_sse_and_email(self):
+        from services.notification_service import NotificationService
+
+        svc = NotificationService()
+        feed = MagicMock()  # broadcast is sync
+        email = MagicMock()
+        email.send_system_notification = AsyncMock(return_value=True)
+        db = MagicMock()
+        admin1, admin2 = str(uuid4()), str(uuid4())
+        db.list_admin_user_ids = AsyncMock(return_value=[admin1, admin2])
+        db.get_user = AsyncMock(
+            side_effect=lambda uid: {
+                "id": uid,
+                "email": f"{uid}@x.com",
+                "display_name": "Admin",
+            }
+        )
+        svc.connect(db, email, feed)
+        svc._get_user_channels = AsyncMock(return_value={"email": True})
+        svc._get_user_settings = AsyncMock(return_value={})
+        svc._is_in_quiet_hours = MagicMock(return_value=False)
+
+        res = await svc.notify_admins_user_registered(
+            "new-user-id", display_name="New", email="new@x.com"
+        )
+        assert res["notified"] == 2
+        assert feed.broadcast.call_count == 2
+        assert email.send_system_notification.call_count == 2
+        assert feed.broadcast.call_args.kwargs["event_type"] == "user_registered"
+
+    @pytest.mark.asyncio
+    async def test_notify_admins_skips_email_in_quiet_hours(self):
+        from services.notification_service import NotificationService
+
+        svc = NotificationService()
+        feed = MagicMock()
+        email = MagicMock()
+        email.send_system_notification = AsyncMock(return_value=True)
+        db = MagicMock()
+        admin1 = str(uuid4())
+        db.list_admin_user_ids = AsyncMock(return_value=[admin1])
+        db.get_user = AsyncMock(
+            return_value={"id": admin1, "email": "a@x.com", "display_name": "A"}
+        )
+        svc.connect(db, email, feed)
+        svc._get_user_channels = AsyncMock(return_value={"email": True})
+        svc._get_user_settings = AsyncMock(return_value={})
+        svc._is_in_quiet_hours = MagicMock(return_value=True)  # in quiet hours
+
+        await svc.notify_admins_user_registered("new-user-id", display_name="New")
+        # SSE still fires (in-app isn't quiet-houred); email is suppressed.
+        assert feed.broadcast.call_count == 1
+        email.send_system_notification.assert_not_called()
+
 
 class TestUpsertDefaultUser:
     """Tests for PostgresDB.upsert_default_user with is_admin support."""
