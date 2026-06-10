@@ -45,6 +45,7 @@ POST   /api/admin/system-settings/main_cloud/test                               
 GET    /api/admin/system-settings/vm_workspaces                                         admin:_require_admin
 PUT    /api/admin/system-settings/vm_workspaces                                         admin:_require_admin
 GET    /api/admin/users                                                                 admin:_require_admin
+POST   /api/admin/users/approve                                                         admin:_require_admin
 PATCH  /api/admin/users/{user_id}                                                       admin:_require_admin
 GET    /api/agents                                                                      admin:_require_admin
 POST   /api/agents/register                                                             internal:require_internal

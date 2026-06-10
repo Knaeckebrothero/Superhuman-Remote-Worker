@@ -38,8 +38,7 @@ def _make_config(**overrides):
     cfg.llm.multimodal = True
     cfg.llm.parallel_tool_calls = overrides.get("parallel_tool_calls", False)
     cfg.memory.enabled = overrides.get("memory_enabled", False)
-    cfg.memory.extraction_interval = 5
-    cfg.memory.extraction_prompt = ""
+    cfg.memory.observer_interval = 5
     cfg.context_management.keep_recent_tool_results = 10
     cfg.context_management.keep_recent_messages = 50
     cfg.context_management.max_summary_length = 10000

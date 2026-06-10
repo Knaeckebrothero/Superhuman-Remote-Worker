@@ -142,17 +142,10 @@ memory:
   observer_interval: 5
   assembler_interval: 7
   default_ttl: 10
-  observer_model: null
-  observer_base_url: null
-  embedding_model: qwen3-embedding-8b
-  dense_results: 30
-  sparse_results: 30
-  recent_results: 15
   importance_threshold: 0.3
   dedup_threshold: 0.85
   retrieval_importance_floor: 0.4
   project_scoped: true
-  storage: postgres
 
 auxiliary:
   enabled: true
@@ -173,7 +166,10 @@ auxiliary:
     curate_knowledge:
       enabled: true
     assemble_memories:
-      enabled: true
+      # Worker-only: no persistent code path calls assemble_memories, so
+      # enabling it here is a no-op (docs/issues/memory_bugs.md B3). Whether
+      # to wire or retire the assembler is a memory-overhaul decision.
+      enabled: false
 
 interactive:
   permission_mode: supervised

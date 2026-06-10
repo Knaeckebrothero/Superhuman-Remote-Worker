@@ -197,6 +197,8 @@ export interface User {
   default_project_id?: string | null;
   is_admin?: boolean;
   is_approved?: boolean;
+  approved_at?: string | null;
+  approved_by?: string | null;
   can_use_vm?: boolean;
   created_at: string;
 }
