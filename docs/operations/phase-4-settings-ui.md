@@ -30,6 +30,7 @@ The UI shows:
 - **Does not migrate data.** Changing the active backend does not copy user files from the old backend to the new one. The Phase 2 "non-destructive switching" rules still apply: new projects land on the new backend, old projects stay where they were.
 - **Does not run on auth tokens.** The endpoints are admin-only (`_require_admin`) and reject every non-admin request with 403. Audit log entries surface as orchestrator info-level logs under `POST /api/admin/system-settings/main_cloud`.
 - **Does not persist across config wipes.** If an operator drops `system_settings.main_cloud` manually (via psql or the `DELETE` endpoint), the active backend rebuilds from env vars only. This is the intended "reset to defaults" behaviour.
+- **Does not reconfigure running sessions.** A live persistent session captures its cloud-sync config (backend + transport + auth) when the agent attaches and holds it for the session's life; a backend switch or out-of-band secret rotation only reaches it on the next resume. A switch *shouldn't* move a live session anyway — it's pinned to the backend its files live on — so the case that bites is a same-backend secret rotation (the session keeps using the stale credential and its workspace sync starts failing until resume). Sync failures surface to the user as a sticky toast but are not auto-healed. See §8.
 
 ## 4. REST API reference
 
@@ -115,3 +116,39 @@ Phase 4 deliberately did not move secrets into the database. The justification:
 - **The cockpit's admin UI would have to mask + transmit secrets.** HTTPS + Bearer tokens handle this fine in production, but dev/homelab setups running plain HTTP inside a podman network would regularly leak secrets to browser tabs, tcpdumps, and developer terminal history.
 
 The cost of keeping secrets in env vars is that rotation still requires a pod restart (or a manual `/api/admin/system-settings/main_cloud/reload` call after the env has been updated out of band). For Phase 4 that's the right tradeoff — non-secret config changes are frequent, secret rotations are rare.
+
+## 8. Hot-swap on Helm / GitOps: precedence, drift & prerequisites
+
+The UI is deployment-agnostic, but on a Helm/GitOps cluster the runtime swap interacts with the chart in two non-obvious ways. (The compose-era migration steps in [`phase-3-default-flip.md`](./phase-3-default-flip.md) §4 predate this UI and don't cover it.)
+
+### 8.1 The overlay wins over Helm — and survives `helm upgrade`
+
+A save writes a Postgres row (`system_settings.main_cloud`). `helm upgrade` re-renders the ConfigMap / Secret / Deployment but **never touches that row**. And the overlay outranks env: `load_main_cloud_config` resolves `backend_id` as `overlay.value.backend_id` > `MAIN_CLOUD_BACKEND` env, and non-secret overlay fields over their env equivalents; at boot, `lifespan()` initializes the env backend then re-applies the overlay on top (§6). So **once you hot-swap, the live backend is sticky** — a `helm upgrade` that still pins the old `MAIN_CLOUD_BACKEND` will *not* revert it. The Helm value is now only the bootstrap default and the fallback the overlay reverts to. Consequences:
+
+- **Silent drift.** Git/Helm say one backend, runtime is another. The Issue-5 boot warning only fires if the *active* backend's secrets are unset — if they're wired, the divergence is invisible in logs.
+- **The Helm value is the revert target.** `DELETE` (Reset to env defaults), or losing the overlay row (a DB restore predating the swap), silently falls back to the Helm default.
+- **Helm edits to the backend are inert while an overlay exists.** Editing `MAIN_CLOUD_BACKEND` + `helm upgrade` changes nothing at runtime; the overlay still wins. To change the backend you must PUT a new overlay or `DELETE` the existing one.
+- **Best practice:** treat a deliberate swap as two steps — swap live to validate, then update the Helm values to match so git stays the source of truth and the revert target is correct. The overlay is for live/experimental swaps; Helm is for the durable default.
+
+### 8.2 You can only hot-swap *to* a backend the chart already provisioned
+
+The chart wires each backend only when it's enabled (`opencloud.enabled` / `nextcloud.enabled` / `cloud.externalBackend`), so a swap target needs all of:
+
+- **Non-secret env** (URLs) — rendered in the ConfigMap behind an `if/elif` on the enabled backend.
+- **Secret env** (client secret / passwords) — `secretKeyRef`s in the orchestrator Deployment, gated per-backend (all `optional: true`). If the target's secret env is unset, the PUT refuses with a 400 (Issue 5) rather than silently falling back to dev creds.
+- **Keycloak identity (OpenCloud only).** The orchestrator authenticates to OpenCloud via a Keycloak `client_credentials` grant on the `opencloud-orchestrator` confidential client, whose service-account user must sit in the `opencloudAdmin` group. That client is created by the Keycloak **bootstrap Job** (or the bundled-Keycloak realm import), gated on `opencloud.enabled || cloud.externalBackend==opencloud`. **The runtime swap never provisions it** — `ensure_initialized()` only fetches a token.
+
+This makes the two directions asymmetric:
+
+- **→ Nextcloud** is easy: the orchestrator's Nextcloud path is basic auth (admin / agent-service password), no Keycloak service account. Just wire `NEXTCLOUD_ADMIN_PASSWORD` / `NEXTCLOUD_AGENT_PASSWORD`.
+- **→ OpenCloud** requires the `opencloud-orchestrator` client to exist. If you installed Nextcloud-only, the bootstrap Job skipped it, so a runtime swap to OpenCloud 401s at init — and you **cannot fix it from the UI**. Run `helm upgrade` with `opencloud.enabled=true` first (re-runs the bootstrap Job, idempotent), then do the runtime swap.
+- **To make a pair genuinely hot-swappable**, enable *both* backends in Helm at install (`opencloud.enabled=true` + `nextcloud.enabled=true`): the ConfigMap's `if/elif` still picks one as the env default, but both backends' secrets and the OpenCloud Keycloak client all get provisioned, so a runtime swap works in either direction.
+- **Keep `credentials_ref` aligned.** If the overlay points at a different env var than the one the bootstrap Job used to set the `opencloud-orchestrator` secret, the two drift and you get a 401 — use the same source on both sides.
+
+### 8.3 Follow-ups (low priority, not scheduled)
+
+Small robustness/UX improvements surfaced while writing this section:
+
+- **Pre-flight error for a missing Keycloak client.** A swap to OpenCloud whose client isn't bootstrapped surfaces a bare token 401; a pre-flight probe could turn it into an actionable message ("OpenCloud's Keycloak client isn't provisioned — enable `opencloud` in Helm and upgrade, then retry").
+- **Startup drift breadcrumb.** Log a line when the active backend (from overlay) differs from `MAIN_CLOUD_BACKEND` (the Helm default), so the silent Helm/runtime divergence is visible in pod logs.
+- **Live-session cloud-sync refresh.** Signal running sessions to re-pull their cloud-sync config on a swap/rotation instead of waiting for resume (see §3).

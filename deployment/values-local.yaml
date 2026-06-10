@@ -258,7 +258,7 @@ opencloud:
   dataStorageSize: "64Gi"
   oidcInsecureTls: true
   hostAliases:
-    - ip: "10.43.216.95"
+    - ip: "10.43.68.20"
       hostnames:
         - "auth.localhost"
 
