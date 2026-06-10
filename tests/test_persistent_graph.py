@@ -62,8 +62,7 @@ def _make_config(**overrides):
     cfg = MagicMock()
     cfg.llm.timeout = overrides.get("llm_timeout", 600)
     cfg.memory.enabled = overrides.get("memory_enabled", False)
-    cfg.memory.extraction_interval = overrides.get("extraction_interval", 5)
-    cfg.memory.extraction_prompt = overrides.get("extraction_prompt", "")
+    cfg.memory.observer_interval = overrides.get("observer_interval", 5)
     cfg.context_management.max_summary_length = 10000
     return cfg
 
@@ -619,7 +618,7 @@ class TestMemoryExtractionTrigger:
             raise asyncio.CancelledError
 
         callbacks = _make_callbacks(get_user_input=_input)
-        config = _make_config(extraction_interval=5)
+        config = _make_config(observer_interval=5)
         llm = _make_streaming_llm(_make_llm_response("ok"))
 
         mock_recall = MagicMock()
@@ -658,7 +657,7 @@ class TestMemoryExtractionTrigger:
             raise asyncio.CancelledError
 
         callbacks = _make_callbacks(get_user_input=_input)
-        config = _make_config(extraction_interval=5)
+        config = _make_config(observer_interval=5)
         llm = _make_streaming_llm(_make_llm_response("ok"))
 
         with patch("src.persistent_graph.asyncio.create_task") as mock_task:
@@ -691,7 +690,7 @@ class TestMemoryExtractionTrigger:
             raise asyncio.CancelledError
 
         callbacks = _make_callbacks(get_user_input=_input)
-        config = _make_config(extraction_interval=5)
+        config = _make_config(observer_interval=5)
         llm = _make_streaming_llm(_make_llm_response("ok"))
 
         with patch("src.persistent_graph.asyncio.create_task") as mock_task:
@@ -724,7 +723,7 @@ class TestMemoryExtractionTrigger:
             raise asyncio.CancelledError
 
         callbacks = _make_callbacks(get_user_input=_input)
-        config = _make_config(extraction_interval=0)
+        config = _make_config(observer_interval=0)
         llm = _make_streaming_llm(_make_llm_response("ok"))
 
         with patch("src.persistent_graph.asyncio.create_task") as mock_task:
@@ -757,7 +756,7 @@ class TestMemoryExtractionTrigger:
             raise asyncio.CancelledError
 
         callbacks = _make_callbacks(get_user_input=_input)
-        config = _make_config(extraction_interval=5)
+        config = _make_config(observer_interval=5)
         llm = _make_streaming_llm(_make_llm_response("ok"))
 
         mock_recall = MagicMock()
