@@ -474,6 +474,7 @@ class TestAgentRestInputEndpointsNoSession:
             tool_context=None,
             turn_count=0,
             postgres_conn=None,
+            memory_extraction_prompt="",
         )
 
         try:

@@ -89,10 +89,11 @@ async def get_current_user(request: Request, db) -> dict:
 
     Returns the full user record (id, display_name, avatar_color, email,
     default_project_id, is_admin, is_approved, keycloak_sub, created_at).
-    The ``is_approved`` flag is derived from the access token's realm
-    roles on every request, so granting/revoking the role in Keycloak
-    takes effect immediately (cookie path: at most one ``access_token``
-    refresh later).
+    The ``is_approved`` flag comes from the ``users.is_approved`` column
+    (app-side admission), OR-combined with the legacy Keycloak ``user`` role
+    during the transition. Because it's checked per request, an admin
+    suspending a user takes effect immediately (cookie path: at most one
+    ``access_token`` refresh later).
 
     Raises:
         HTTPException 401 if not authenticated or all paths fail.
@@ -217,8 +218,13 @@ async def _refresh_session_in_place(sess: dict, db) -> str | None:
 async def _resolve_user_from_claims(claims: dict, db) -> dict:
     """JIT-provision (or sync) the local user row from Keycloak claims.
 
-    Shared between cookie and Bearer paths. ``is_approved`` and
-    ``preferred_username`` are attached as transient fields (not in DB).
+    Shared between cookie and Bearer paths. Admission lives in the
+    ``users.is_approved`` column now (app-side admission): this function reads
+    that flag and OR-combines it with the legacy ``user`` realm role during the
+    transition window, writing the DB flag through for legacy role-holders on
+    their first request after deploy. ``preferred_username`` is persisted to
+    the row (approval-time provisioning needs it). The returned ``is_approved``
+    / ``preferred_username`` keys carry the effective values for this request.
     """
     sub = claims["sub"]
     email = claims.get("email", "")
@@ -230,7 +236,12 @@ async def _resolve_user_from_claims(claims: dict, db) -> dict:
     )
     realm_roles = claims.get("realm_access", {}).get("roles", [])
     is_admin = "admin" in realm_roles
-    is_approved = "user" in realm_roles or is_admin
+    # Keycloak answers authn only; admission lives in users.is_approved.
+    # `role_approved` is the legacy signal (the `user` realm role, or admin).
+    # During the transition it still grants access AND drives the write-through
+    # that migrates legacy role-holders onto the DB flag.
+    role_approved = "user" in realm_roles or is_admin
+    preferred_username = claims.get("preferred_username")
 
     user = await db.get_user_by_keycloak_sub(sub)
     if user:
@@ -241,6 +252,16 @@ async def _resolve_user_from_claims(claims: dict, db) -> dict:
             needs_update["display_name"] = display_name
         if user.get("is_admin") != is_admin:
             needs_update["is_admin"] = is_admin
+        if preferred_username and user.get("preferred_username") != preferred_username:
+            needs_update["preferred_username"] = preferred_username
+        db_approved = bool(user.get("is_approved"))
+        # Write-through migration: a legacy role-holder still FALSE in the DB
+        # self-migrates on this request. Never the reverse — absence of the
+        # role does not clear the flag (suspension is admin-driven only).
+        if role_approved and not db_approved:
+            needs_update["is_approved"] = True
+            needs_update["approved_at"] = datetime.now(UTC)
+            needs_update["approved_by"] = None
         if needs_update:
             async with db.acquire() as conn:
                 set_clause = ", ".join(
@@ -255,8 +276,8 @@ async def _resolve_user_from_claims(claims: dict, db) -> dict:
             logger.info(
                 "Updated user %s from OIDC claims: %s", sub, list(needs_update.keys())
             )
-        user["is_approved"] = is_approved
-        user["preferred_username"] = claims.get("preferred_username")
+        user["is_approved"] = db_approved or role_approved
+        user["preferred_username"] = preferred_username
         return user
 
     # First login — create local user row + seed cloud/Gitea in the background.
@@ -265,31 +286,45 @@ async def _resolve_user_from_claims(claims: dict, db) -> dict:
         email=email,
         display_name=display_name,
         is_admin=is_admin,
+        is_approved=role_approved,
+        preferred_username=preferred_username,
     )
+    # Effective approval reflects the OR-merge inside upsert: an admin-created
+    # or pre-seeded row can already be approved without carrying the role.
+    effective_approved = bool(user.get("is_approved"))
     logger.info(
         "JIT-provisioned user %s (sub=%s, admin=%s, approved=%s)",
         display_name,
         sub,
         is_admin,
-        is_approved,
+        effective_approved,
     )
-    asyncio.create_task(
-        _ensure_cloud_user(
-            sub=sub,
-            issuer=claims.get("iss", ""),
-            email=email,
-            display_name=display_name,
-            preferred_username=claims.get("preferred_username"),
+    if effective_approved:
+        # Approved on first login (admin, or a legacy `user` role-holder):
+        # pre-provision cloud + Gitea so their first thread/repo finds them.
+        asyncio.create_task(
+            _ensure_cloud_user(
+                sub=sub,
+                issuer=claims.get("iss", ""),
+                email=email,
+                display_name=display_name,
+                preferred_username=preferred_username,
+            )
         )
-    )
-    asyncio.create_task(
-        _ensure_gitea_user(
-            sub=sub,
-            email=email,
-            preferred_username=claims.get("preferred_username"),
-            display_name=display_name,
+        asyncio.create_task(
+            _ensure_gitea_user(
+                sub=sub,
+                email=email,
+                preferred_username=preferred_username,
+                display_name=display_name,
+            )
         )
-    )
+    else:
+        # New registrant is pending — do NOT provision cloud/Gitea accounts
+        # for someone no admin has admitted (closes the pre-approval resource
+        # leak). Provisioning runs at approval time instead, via
+        # ensure_user_provisioned. Tell the admins there's someone to review.
+        asyncio.create_task(_notify_admins_of_registration(user, email))
     # Dev-only: the moment the admin user first exists, seed the fixed dev MCP
     # token so a committed .mcp.json authenticates without a manual mint or an
     # orchestrator restart. Gated on MCP_DEV_TOKEN (unset in prod → skipped);
@@ -298,9 +333,64 @@ async def _resolve_user_from_claims(claims: dict, db) -> dict:
         from init import _seed_admin_mcp_token
 
         asyncio.create_task(_seed_admin_mcp_token(db))
-    user["is_approved"] = is_approved
-    user["preferred_username"] = claims.get("preferred_username")
+    user["is_approved"] = effective_approved
+    user["preferred_username"] = preferred_username
     return user
+
+
+async def ensure_user_provisioned(user_row: dict) -> None:
+    """Fire cloud + Gitea ensure-user for an approved user from row data.
+
+    Approval-time provisioning for app-side admission. The JIT ensures only
+    fire for users approved at first login; an app-side-approved user never
+    re-triggers them (the Keycloak ``user`` role is never assigned, so every
+    later login takes the existing-user branch). This is therefore the
+    provisioning path for users admitted via the cockpit. Both ensures are
+    idempotent, so re-running for an already-provisioned user is harmless.
+
+    Best-effort and non-blocking: the two ensures swallow and log their own
+    errors. A row without a ``keycloak_sub`` (admin-created / pre-OIDC) is
+    skipped — it provisions on its owner's first real OIDC login instead.
+    """
+    sub = (user_row.get("keycloak_sub") or "").strip()
+    if not sub:
+        return
+    email = user_row.get("email") or ""
+    display_name = user_row.get("display_name") or (
+        email.split("@")[0] if email else "User"
+    )
+    preferred_username = user_row.get("preferred_username")
+    asyncio.create_task(
+        _ensure_cloud_user(
+            sub=sub,
+            issuer="",  # resolved from the backend's configured issuer
+            email=email,
+            display_name=display_name,
+            preferred_username=preferred_username,
+        )
+    )
+    asyncio.create_task(
+        _ensure_gitea_user(
+            sub=sub,
+            email=email,
+            preferred_username=preferred_username,
+            display_name=display_name,
+        )
+    )
+
+
+async def _notify_admins_of_registration(user: dict, email: str) -> None:
+    """Best-effort: tell admins a new user registered and is awaiting approval."""
+    try:
+        from services.notification_service import notification_service
+
+        await notification_service.notify_admins_user_registered(
+            new_user_id=str(user["id"]),
+            display_name=user.get("display_name"),
+            email=email or None,
+        )
+    except Exception as e:
+        logger.warning("Registration notify failed: %s", e)
 
 
 async def _resolve_pat(token: str, request: Request, db) -> dict:
@@ -313,10 +403,9 @@ async def _resolve_pat(token: str, request: Request, db) -> dict:
 
     Returns the user dict with ``auth_method='pat'``, ``scopes`` (the
     PAT's action scopes from the row), and ``token_id`` for downstream
-    introspection. ``is_approved`` is forced True — a PAT could only have
-    been issued by an already-approved user via the cockpit, so role
-    revocation that follows would need to revoke the token, not silently
-    leave it usable.
+    introspection. Admission flows from the user row (``is_approved``): the
+    force-True is gone so that suspending a user also kills their PATs — if
+    the owner is no longer approved, the token stops working on the next call.
     """
     digest = hashlib.sha256(token.encode("ascii")).hexdigest()
     row = await db.get_auth_token_by_hash(digest)
@@ -331,7 +420,6 @@ async def _resolve_pat(token: str, request: Request, db) -> dict:
     user["auth_method"] = "pat"
     user["scopes"] = list(row.get("scopes") or [])
     user["token_id"] = str(row["id"])
-    user["is_approved"] = True
     return user
 
 
@@ -345,7 +433,8 @@ async def _resolve_legacy_mcp_token(token: str, request: Request, db) -> dict:
     token in the Authorization header — the consolidated auth surface
     advertised in the design doc.
 
-    Forces ``is_approved=True`` for the same reason as ``_resolve_pat``.
+    Admission flows from the user row for the same reason as ``_resolve_pat``
+    — suspending a user must also disable their MCP tokens.
     """
     digest = hashlib.sha256(token.encode("ascii")).hexdigest()
     row = await db.get_auth_token_by_hash(digest)
@@ -364,7 +453,6 @@ async def _resolve_legacy_mcp_token(token: str, request: Request, db) -> dict:
     legacy_scope = row.get("scope") or ""
     user["scopes"] = [legacy_scope] if legacy_scope else []
     user["token_id"] = str(row["id"])
-    user["is_approved"] = True
     return user
 
 
@@ -406,7 +494,9 @@ async def _ensure_cloud_user(
             return
         await backend.ensure_user(
             sub=sub,
-            issuer=issuer,
+            # No OIDC claims at approval time → fall back to the backend's
+            # configured Keycloak issuer.
+            issuer=issuer or getattr(backend, "_keycloak_issuer", "") or "",
             email=email,
             display_name=display_name,
             preferred_username=preferred_username,
@@ -477,7 +567,9 @@ async def _get_user_from_mcp_headers(request: Request, db) -> dict:
     if mcp_user_id and expected_key and internal_key == expected_key:
         user = await db.get_user(mcp_user_id)
         if user:
-            user["is_approved"] = True  # MCP tokens are pre-validated
+            # Admission flows from the user row — a suspended owner's MCP
+            # access stops here too (the header only proves the MCP server
+            # validated the token, not that the user is still admitted).
             user["auth_method"] = "mcp"
             mcp_scope = request.headers.get("X-MCP-Scope")
             user["scopes"] = [mcp_scope] if mcp_scope else []
@@ -488,11 +580,12 @@ async def _get_user_from_mcp_headers(request: Request, db) -> dict:
 
 
 async def require_approved_user(request: Request, db) -> dict:
-    """Like get_current_user but raises 403 if the user lacks the 'user' role.
+    """Like get_current_user but raises 403 if the user isn't approved.
 
-    Use this for all endpoints that require an approved account.
-    /api/auth/me should use get_current_user directly so the cockpit can
-    display a "pending approval" message.
+    Approval is the ``users.is_approved`` flag (app-side admission), resolved
+    onto the user dict by the auth path. Use this for all endpoints that
+    require an admitted account. /api/auth/me should use get_current_user
+    directly so the cockpit can display its "pending approval" screen.
 
     Admin shadow ("view as user"): when an admin request carries
     ``X-Admin-View-As: user``, the returned dict has ``is_admin=False`` so
@@ -508,7 +601,7 @@ async def require_approved_user(request: Request, db) -> dict:
     if not user.get("is_approved"):
         raise HTTPException(
             status_code=403,
-            detail="Account pending approval. An administrator must assign you the 'user' role.",
+            detail="Account pending approval. An administrator must approve your account.",
         )
     view_as = request.headers.get(VIEW_AS_HEADER, "").lower()
     if view_as == "user" and user.get("is_admin"):

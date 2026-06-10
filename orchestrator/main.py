@@ -104,6 +104,7 @@ from security.auth import (  # noqa: E402
     resolve_ws_user,
     cleanup_expired_tokens,
     cleanup_expired_sessions,
+    ensure_user_provisioned,
 )
 from security.access import (  # noqa: E402
     is_internal_call,
@@ -2807,6 +2808,13 @@ class AdminUserUpdate(BaseModel):
 
     is_admin: bool | None = None
     can_use_vm: bool | None = None
+    is_approved: bool | None = None
+
+
+class AdminBulkApprove(BaseModel):
+    """Admin-only body for bulk-approving pending users."""
+
+    user_ids: list[str] = Field(..., min_length=1, description="User UUIDs to approve")
 
 
 class McpTokenCreate(BaseModel):
@@ -17742,13 +17750,22 @@ async def create_user(body: UserCreate, request: Request) -> dict[str, Any]:
     upsert_user_from_oidc). This endpoint is for admin user management
     and tests.
     """
-    await _require_admin(request)
+    admin = await _require_admin(request)
     try:
         user, project = await postgres_db.create_user_with_default_project(
             display_name=body.display_name,
             avatar_color=body.avatar_color or "#89b4fa",
             email=body.email,
         )
+        # Admin creation *is* approval — admit immediately and stamp the
+        # approving admin so the audit trail and cockpit status are correct.
+        await postgres_db.update_user(
+            user_id=str(user["id"]),
+            is_approved=True,
+            approved_at=datetime.now(timezone.utc),
+            approved_by=str(admin.get("id")),
+        )
+        user["is_approved"] = True
         await _create_gitea_repo_for_project(user, project)
 
         # Create personal WebDAV datasource for the default project.
@@ -17835,8 +17852,12 @@ async def admin_patch_user(
 ) -> dict[str, str]:
     """Toggle privileged user flags (admin-only).
 
-    Accepts partial updates of ``is_admin`` and ``can_use_vm``. Refuses
-    to let an admin clear their own ``is_admin`` flag — lockout prevention.
+    Accepts partial updates of ``is_admin``, ``can_use_vm`` and
+    ``is_approved``. Setting ``is_approved=True`` admits the user and stamps
+    ``approved_at``/``approved_by``; setting it False is suspension — the flag
+    flips off (effective on the user's next request) while ``approved_at`` is
+    kept as history. Refuses to let an admin clear their own ``is_admin``
+    flag — lockout prevention.
     """
     admin = await _require_admin(request)
     if body.is_admin is False and str(admin.get("id")) == user_id:
@@ -17844,14 +17865,58 @@ async def admin_patch_user(
             status_code=400,
             detail="Admins cannot clear their own is_admin flag",
         )
+    approved_at = None
+    approved_by = None
+    if body.is_approved is True:
+        approved_at = datetime.now(timezone.utc)
+        approved_by = str(admin.get("id"))
     success = await postgres_db.update_user(
         user_id=user_id,
         is_admin=body.is_admin,
         can_use_vm=body.can_use_vm,
+        is_approved=body.is_approved,
+        approved_at=approved_at,
+        approved_by=approved_by,
     )
     if not success:
         raise HTTPException(status_code=404, detail=f"User '{user_id}' not found")
+    if body.is_approved is True:
+        # Admission just granted — provision cloud/Gitea from the row. The JIT
+        # ensures are gated on approval and never re-fire for an app-side
+        # approved user, so this is their provisioning path. Idempotent.
+        row = await postgres_db.get_user(user_id)
+        if row:
+            await ensure_user_provisioned(row)
     return {"status": "updated"}
+
+
+@app.post("/api/admin/users/approve")
+async def admin_bulk_approve_users(
+    body: AdminBulkApprove, request: Request
+) -> dict[str, Any]:
+    """Bulk-approve pending users (admin-only).
+
+    Stamps approval on every id that resolves to a real row in a single
+    transaction and reports per-id status. This is the workflow Keycloak's
+    console can't do (no bulk role assignment). Ids that don't match an
+    existing user come back as ``not_found`` rather than failing the batch.
+    """
+    admin = await _require_admin(request)
+    approved_ids = await postgres_db.approve_users(
+        body.user_ids, approved_by=str(admin.get("id"))
+    )
+    # Provision cloud/Gitea for each newly-approved user (idempotent; the JIT
+    # ensures never re-fire for app-side approvals).
+    for uid in approved_ids:
+        row = await postgres_db.get_user(uid)
+        if row:
+            await ensure_user_provisioned(row)
+    approved_set = set(approved_ids)
+    results = [
+        {"id": uid, "status": "approved" if uid in approved_set else "not_found"}
+        for uid in body.user_ids
+    ]
+    return {"approved_count": len(approved_set), "results": results}
 
 
 # =============================================================================

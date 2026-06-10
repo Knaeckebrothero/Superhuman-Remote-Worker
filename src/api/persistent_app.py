@@ -24,7 +24,7 @@ from .orchestrator_client import (
     OrchestratorClient,
     create_orchestrator_client_from_env,
 )
-from .persistent_session import PersistentSession
+from .persistent_session import PersistentSession, resolve_memory_extraction_prompt
 from ..tools.registry import TOOL_REGISTRY
 from ..core.archiver import inflight_tool_call
 from ..core.context import extract_summary_text, repair_tool_pairing
@@ -303,6 +303,7 @@ def _ensure_persistent_loop_started(
                     _session.llm_with_tools,
                     _session.tools,
                 ),
+                memory_extraction_prompt=_session.memory_extraction_prompt,
             ),
             name="persistent-loop",
         )
@@ -3678,6 +3679,11 @@ async def _handle_config_update(ws: WebSocket, config_override: Dict[str, Any]) 
                 aux_cfg.base_url or "default",
             )
 
+        # Re-resolve the memory-extraction prompt: its prompt-matrix family
+        # follows the auxiliary/summarization/main model that may have just
+        # changed.
+        _session.memory_extraction_prompt = resolve_memory_extraction_prompt(new_config)
+
         # Reset embedding singleton if embedding env keys changed.
         new_env_block = effective_override.get("env_keys") or {}
         if any(k in new_env_block for k in embedding_env_keys):
@@ -3774,8 +3780,7 @@ async def _handle_archive(ws: WebSocket) -> None:
                     auxiliary_llm=_session.auxiliary_llm,
                     recall_store=recall_store,
                     messages=_session.messages,
-                    memory_extraction_prompt=_session.config.memory.extraction_prompt
-                    or "",
+                    memory_extraction_prompt=_session.memory_extraction_prompt,
                 )
                 logger.info("Final memory extraction complete")
             except Exception as e:
@@ -3863,8 +3868,7 @@ async def _handle_idle_archive(ws: Optional[WebSocket] = None) -> None:
                     auxiliary_llm=_session.auxiliary_llm,
                     recall_store=recall_store,
                     messages=_session.messages,
-                    memory_extraction_prompt=_session.config.memory.extraction_prompt
-                    or "",
+                    memory_extraction_prompt=_session.memory_extraction_prompt,
                 )
                 logger.info("Idle archive: memory extraction complete")
             except Exception as e:

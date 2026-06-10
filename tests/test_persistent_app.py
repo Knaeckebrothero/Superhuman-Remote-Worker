@@ -1696,7 +1696,7 @@ class TestHandleArchive:
         mock_session.auxiliary_llm = MagicMock()
         mock_session.messages = []  # Empty — should skip extraction
         mock_session.postgres_conn = None
-        mock_session.config.memory.extraction_prompt = ""
+        mock_session.memory_extraction_prompt = ""
 
         with (
             patch("src.api.persistent_app._session", mock_session),
@@ -1715,7 +1715,7 @@ class TestHandleArchive:
         mock_session.auxiliary_llm = MagicMock()
         mock_session.messages = [HumanMessage(content="hi")]
         mock_session.postgres_conn = None
-        mock_session.config.memory.extraction_prompt = ""
+        mock_session.memory_extraction_prompt = ""
 
         with (
             patch("src.api.persistent_app._session", mock_session),
