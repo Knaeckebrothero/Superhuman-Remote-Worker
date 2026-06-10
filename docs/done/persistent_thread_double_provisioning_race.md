@@ -11,7 +11,17 @@ Both call sites (`_provision_or_assign` in `create_thread`, `_reprovision` in `r
 
 The legacy WS-proxy provision call site at `main.py:13892` no longer exists — it was deleted in Plan Task 13 of the direct-session-WebSockets refactor before this fix landed.
 
-See `cockpit/.../persistent-chat.service.ts` (resume flow), `orchestrator/main.py:_provision_or_assign`/`_reprovision`/`register_agent`, `src/api/persistent_app.py` (dedicated_register_ok gate), and `tests/test_orchestrator_client_register.py::test_register_returns_false_on_409_duplicate`.
+See `cockpit/.../persistent-chat.service.ts` (resume flow), `orchestrator/main.py:_provision_or_assign`/`_reprovision`/`register_agent`, `src/api/persistent_app.py` (dedicated_register_ok gate), and `tests/test_orchestrator_client_register.py::test_register_raises_on_409_for_thread_bound` + `tests/test_persistent_app.py::TestExitDuplicateProvisionHelper`.
+
+## Correction (2026-06-10) — the orphan was NOT "harmless", and the race wasn't fully closed in May
+
+A live incident on 2026-06-03 (thread `2c5894c9`) surfaced two errors in the original write-up:
+
+1. **The May 23 advisory lock did not actually close the race.** It re-fetched `threads.agent_id` inside the critical section, but on the fresh-pod path `agent_id` isn't written until the new pod calls `/register` — *after* the lock is released (released early to avoid deadlocking register's own lock acquisition). So two provision paths could still both observe `agent_id IS NULL` and each create a pod, which is exactly what happened on 2026-06-03. This was closed on **2026-06-10** (commit `4830d122`) by writing a timestamped `threads.metadata.agent_pod` marker *inside* the lock at provision time (`agent_provisioner._set_thread_context`) and having both provision entrypoints (`provision_or_assign.py`, `routers/sessions.py`) skip provisioning when `agent_pod_provisioning_in_progress()` is true.
+
+2. **The orphan pod was NOT "harmless until reaped"** (see the corrected line in the Recovery section below). The per-session Service (`session_router.py`) selects pods by the `srw.io/thread-id` label with `publishNotReadyAddresses: true`. The losing pod kept that label, so it stayed a live Service endpoint despite never passing readiness — black-holing ~50% of the cockpit's connection attempts (`curl session-<tid>:8001/ready` from the orchestrator returned a 200/503 mix on 2026-06-03). The "Establishing connection" hang resolved only when a retry happened to land on the winner. Fixed by making the loser **exit cleanly on the 409**: `OrchestratorClient.register` raises `DuplicateThreadBinding` → `persistent_app._exit_duplicate_provision` → `os._exit(0)` (restartPolicy: Never → pod Completed), so it drops out of the Service endpoints immediately instead of lingering. (This supersedes the original "skip `_attach_session`" handling, which de-conflicted the binding but left the orphan in the Service.)
+
+**Still optional (defense-in-depth, not yet done):** make the Service select only the *bound* pod (e.g. a `thread-bound` label stamped after register wins) so a not-ready orphan can never be an endpoint regardless of how it arose. With the two fixes above an orphan should now be both rare and self-evicting, so this is no longer load-bearing.
 
 ## Summary
 
@@ -172,7 +182,7 @@ SET agent_id = '<agent-id-of-pod-with-active-WS>'
 WHERE id = '<thread-id>';
 ```
 
-Next REST forward goes to the right pod. The orphan pod stays up but is harmless until reaped.
+Next REST forward goes to the right pod. ⚠️ **Correction (2026-06-10):** the orphan was *not* "harmless until reaped" — until the loser-exit fix landed it stayed in the per-session Service endpoints (`publishNotReadyAddresses`) and black-holed ~50% of connection attempts. See the "Correction (2026-06-10)" section above. With that fix the loser now exits on the 409, so this manual recovery is no longer needed for new sessions.
 
 **B. Kill the orphan pod** (uses existing recovery path):
 

@@ -1,0 +1,363 @@
+{
+  "summary": "Deep research harness — fan-out web searches, fetch sources, adversarially verify claims, synthesize a cited report.",
+  "agentCount": 110,
+  "logs": [
+    "Q: Produce a source-grounded survey of the ACADEMIC state of the art and COGNITIVE-…",
+    "Decomposed into 6 angles: canonical systems (primary), cognitive taxonomy applied to agents, consolidation / reflection / sleep-time evidence (priority), agentic self-organizing + forgetting/decay, parametric vs non-parametric frontier, evaluation, benchmarks & open problems",
+    "canonical systems (primary): 6 results",
+    "agentic self-organizing + forgetting/decay: 6 results",
+    "agentic self-organizing + forgetting/decay: 5 novel (1 filtered)",
+    "cognitive taxonomy applied to agents: 6 results",
+    "cognitive taxonomy applied to agents: 4 novel (2 filtered)",
+    "parametric vs non-parametric frontier: 6 results",
+    "parametric vs non-parametric frontier: 5 novel (1 filtered)",
+    "evaluation, benchmarks & open problems: 6 results",
+    "evaluation, benchmarks & open problems: 3 novel (3 filtered)",
+    "consolidation / reflection / sleep-time evidence (priority): 6 results",
+    "consolidation / reflection / sleep-time evidence (priority): 4 novel (2 filtered)",
+    "Fetched 27 sources → 131 claims → verifying top 25",
+    "\"MemGPT introduces 'virtual context management': an…\": 3-0 ✓",
+    "\"MemGPT memory is self-editing and function-callabl…\": 3-0 ✓",
+    "\"Generative Agents introduces a memory architecture…\": 3-0 ✓",
+    "\"An ablation study shows that each of the three arc…\": 0-3 ✗",
+    "\"On the new Deep Memory Retrieval (DMR) multi-sessi…\": 1-2 ✗",
+    "\"Reflexion is a framework that reinforces language …\": 3-0 ✓",
+    "\"Reflexion's memory mechanism is an episodic memory…\": 3-0 ✓",
+    "\"A-MEM proposes an 'agentic memory' system based on…\": 3-0 ✓",
+    "\"Reflexion achieved 91% pass@1 on the HumanEval cod…\": 1-2 ✗",
+    "\"Self-RAG trains a single LM to adaptively decide w…\": 3-0 ✓",
+    "\"On the LoCoMo long-conversation benchmark, A-MEM s…\": 0-3 ✗",
+    "\"Indiscriminate fixed-passage retrieval (standard R…\": 3-0 ✓",
+    "\"Self-RAG (7B and 13B) empirically outperforms Chat…\": 3-0 ✓",
+    "\"An ablation isolates the contribution of the self-…\": 0-3 ✗",
+    "\"The survey establishes the canonical three-axis ta…\": 2-1 ✓",
+    "\"This survey organizes the entire LLM-agent memory …\": 3-0 ✓",
+    "\"As of April 2024 there existed NO open-source benc…\": 2-1 ✓",
+    "\"The survey decomposes 'memory management' into exa…\": 3-0 ✓",
+    "\"CoALA explicitly applies the cognitive-science lon…\": 3-0 ✓",
+    "\"The survey defines 'memory management' explicitly …\": 3-0 ✓",
+    "\"CoALA assigns concrete operational definitions to …\": 3-0 ✓",
+    "\"The survey provides NO end-task evidence that refl…\": 3-0 ✓",
+    "\"CoALA frames reflection as a learning procedure th…\": 3-0 ✓",
+    "\"CoALA organizes canonical agents by which memory m…\": 3-0 ✓",
+    "\"Reflection is causally load-bearing in Generative …\": 0-3 ✗",
+    "Verify done: 25 claims → 19 confirmed, 6 killed"
+  ],
+  "result": {
+    "question": "Produce a source-grounded survey of the ACADEMIC state of the art and COGNITIVE-ARCHITECTURE foundations of LLM/agent memory: the canonical systems, the cognitive-science taxonomies as applied to agents, and the cutting-edge papers (≈2023–2026). Distinguish PROVEN results from PROMISING-BUT-SPECULATIVE directions. Prioritize 2023–2026; cite every claim; weight by recency AND citation/replication; flag results that lack strong evaluation.\n\nGROUNDING CONTEXT (my system + what prior research already concluded — so you contextualize, not re-derive): A multi-tier AI agent platform. Storage = pgvector (auto-extracted \"RecallStore\" memories via a background observer LLM every ~5 turns; hybrid dense+sparse+recency RRF; an assembler LLM consolidates every ~7 turns; TTL-pinned ~10 turns; dedup at cosine≥0.85; single 0–1 importance score) + Neo4j (explicit agent-authored knowledge notes). Embeddings qwen3-embedding-8b. FOUR prior deep-research briefs already concluded: (01) we're an outlier auto-injecting the full store every turn — norm is a bounded always-on slice + on-demand recall; (03) top retrieval fix = cross-encoder reranker + relevance-gated recall; (05, eval keystone) build a LongMemEval-style harness first, extraction should be event/boundary-driven and biased to COMPLETENESS over precision, dedup should be Top-K→LLM ADD-vs-MERGE, and conflict/contradiction resolution is the field's #1 unsolved failure; (04) graph-vs-vector is task-dependent, and bi-temporal modeling (Graphiti-style edge invalidation) is the proposed fix for stale-fact/contradiction. IMPORTANT: Brief 05 found CONSOLIDATION / REFLECTION / SLEEP-TIME COMPUTE to be UNDER-EVIDENCED — this brief should especially nail whether those actually help, with evidence.\n\nRESEARCH QUESTIONS:\n\nCanonical systems (what everyone cites — what each proved + its limits):\n- MemGPT / Letta (virtual context management, OS-like paging, memory hierarchy, function-callable memory edits).\n- Generative Agents (Stanford — memory stream, REFLECTION, retrieval scored by importance × recency × relevance). How operationalized; what carried into production.\n- Reflexion, Voyager (skill memory), Self-RAG, MemoryBank, RecurrentGPT — each contribution.\n\nCognitive taxonomy applied to agents:\n- Working / short-term vs long-term; EPISODIC vs SEMANTIC vs PROCEDURAL; declarative vs non-declarative. How real agent frameworks map onto these — and does the distinction DEMONSTRABLY improve systems, or is it window dressing?\n\nAgentic & self-organizing memory:\n- A-MEM (Zettelkasten-style self-organizing notes), self-editing memory, memory-as-a-learned-skill. Evidence of benefit.\n\nConsolidation, reflection & \"sleep-time\" (PRIORITY — fill Brief 05's gap):\n- Abstracting raw episodes into durable knowledge; periodic reflection; hierarchical summarization; sleep-time / background consolidation compute (e.g. Letta). What is the EVIDENCE it helps end-task performance vs just saving tokens? Summary-drift / information-loss mitigation.\n\nForgetting & decay:\n- Principled forgetting, importance/retention scoring, capacity management, neuroscience-inspired decay (Ebbinghaus forgetting curve, spacing). When does forgetting IMPROVE task performance, not just save tokens?\n\nParametric vs non-parametric memory (emerging frontier):\n- Memory in weights / memory layers / KV-cache reuse / \"cartridges\" vs external retrieval. Where is it heading; is any of it practical now?\n\nSurveys & open problems:\n- The best survey papers on LLM-agent memory (2024–2026); current research consensus and named open problems.\n\nTIE IT BACK TO MY SYSTEM:\n- Which concepts do we ALREADY embody? (Hypothesis to validate/correct: observer ≈ extraction, assembler ≈ consolidation/reflection, TTL ≈ decay, RRF weights ≈ the importance×recency×relevance blend.)\n- Which PROVEN ideas are we missing? (e.g. an explicit episodic/semantic split, true reflection passes, sleep-time consolidation, importance-at-write-time.)\n- Which FRONTIER ideas are worth a small pilot vs not yet worth it?\n\nDELIVERABLE FORMAT:\n1. Canonical-works table (work → core idea → what it proved → influence).\n2. Taxonomy → implementation map (cognitive concept → how agents implement it → does it demonstrably help).\n3. Frontier ideas worth piloting (with the evidence behind each).\n4. Open problems the field hasn't solved.\n5. Explicit \"our system vs the concepts\" gap analysis.\n6. Full citations.",
+    "summary": "The academic state of the art in LLM/agent memory rests on a small set of canonical systems whose ARCHITECTURAL contributions are well-documented in primary sources, but whose efficacy claims for the higher-order operations (reflection, consolidation, forgetting) are strikingly under-evidenced. MemGPT/Letta established the OS-paging memory hierarchy with function-callable self-editing memory; Generative Agents established the observation/reflection/retrieval triad with the importance×recency×relevance retrieval blend; Reflexion established verbal-reinforcement episodic memory; Self-RAG established on-demand reflective retrieval; A-MEM established Zettelkasten-style self-organizing notes; and CoALA imported the cognitive-science long-term-memory taxonomy (working + episodic/semantic/procedural) wholesale into agent design. The field's canonical organizing framework is the Zhang et al. (2024) three-axis taxonomy (sources × forms × operations), which defines \"memory management\" as exactly the reflection+merging+forgetting composite your system already implements via its assembler-LLM consolidation, cosine-0.85 dedup, and TTL decay. CRITICALLY, this synthesis CONFIRMS and STRENGTHENS Brief 05's central warning: across the verified evidence, the canonical survey justifies reflection/consolidation/forgetting PURELY by analogy to the human brain with no controlled end-task evidence, and — decisively — every quantified efficacy claim for these operations (Generative Agents reflection ablation, A-MEM memory-evolution ablation, MemGPT DMR numbers, Reflexion HumanEval) was REFUTED during adversarial verification, meaning the strongest \"proof that consolidation helps\" results in the literature did not survive scrutiny. The proven layer is architectural and definitional; the speculative layer is precisely the consolidation/reflection/sleep-time claims your platform most needs validated.",
+    "findings": [
+      {
+        "claim": "CANONICAL SYSTEM — MemGPT/Letta: introduced 'virtual context management', an OS-inspired tiered memory hierarchy splitting memory into in-context 'main context' (system instructions + working context + FIFO queue) and out-of-context 'external context' (archival + recall storage DBs), with the LLM PAGING data between tiers via self-issued function calls and chaining them via request_heartbeat=true for multi-step retrieval. This is the canonical OS-paging + function-callable-memory-edit citation everyone uses. TIE-BACK: your pgvector store is an 'external context' analogue, but you auto-inject the full store every turn rather than paging on-demand — the architectural norm MemGPT established is bounded in-context + function-gated recall, corroborating prior Brief 01.",
+        "confidence": "high",
+        "sources": [
+          "https://arxiv.org/abs/2310.08560"
+        ],
+        "evidence": "Two 3-0 unanimous claims ([0], [1]) against the primary paper (Packer et al., MemGPT), verified verbatim on ar5iv. Abstract: 'virtual context management, a technique drawing inspiration from hierarchical memory systems in traditional operating systems.' Main context = RAM analogue split into 'system instructions, working context, and FIFO Queue'; external context = disk analogue (archival + recall storage). 'Memory edits and retrieval are entirely self-directed' via function calls; 'request_heartbeat=true ... function chaining is what allows MemGPT to perform multi-step retrieval.' Note: this is a purely DESCRIPTIVE architectural claim — the QUANTIFIED efficacy claim (DMR: GPT-4 32.1%→92.5%) was REFUTED 1-2 during verification, so MemGPT's architecture is proven-as-described but its long-term-memory benefit is NOT established by surviving evidence.",
+        "vote": "3-0 (both constituent claims)"
+      },
+      {
+        "claim": "CANONICAL SYSTEM — Generative Agents (Stanford): introduced the memory-stream architecture extending an LLM with three operations — (1) store a complete natural-language record of experiences, (2) synthesize them over time into higher-level REFLECTIONS, (3) dynamically retrieve them to plan behavior. Retrieval is scored as score = recency + importance + relevance (all weights = 1). This is THE canonical operationalization of the observation/reflection/retrieval triad and the importance×recency×relevance blend cited throughout the literature. TIE-BACK: your RRF (dense+sparse+recency) approximates this three-factor blend, and CoALA explicitly names this exact formula as what the field reuses.",
+        "confidence": "high",
+        "sources": [
+          "https://arxiv.org/abs/2304.03442",
+          "https://arxiv.org/abs/2309.02427"
+        ],
+        "evidence": "Claim [2] verified 3-0 against the primary abstract verbatim: 'an architecture that extends a large language model to store a complete record of the agent's experiences using natural language, synthesize those memories over time into higher-level reflections, and retrieve them dynamically to plan behavior.' ar5iv confirms 'score = a_recency*recency + a_importance*importance + a_relevance*relevance'. Cross-cited by CoALA (claim [18], 3-0): Generative Agents 'retrieves relevant events from episodic memory via a combination of recency (rule-based), importance (reasoning-based), and relevance (embedding-based) scores.' CRITICAL CAVEAT for Brief 05: the claim that the reflection ablation degrades behavior ('within 48 simulated hours') was REFUTED 0-3 — the paper's own reflection-helps-end-task evidence did NOT survive verification.",
+        "vote": "3-0"
+      },
+      {
+        "claim": "CANONICAL SYSTEM — Reflexion: established 'verbal reinforcement learning' — reinforcing language agents through linguistic/verbal feedback rather than weight updates. Its memory mechanism is an EPISODIC MEMORY BUFFER holding the agent's own self-generated reflective text, persisting across trials on the SAME task to improve decision-making on subsequent attempts. This is the canonical memory-based self-improvement-without-fine-tuning reference. CoALA (below) cites it as the canonical instance of abstracting failed episodes into reusable semantic knowledge.",
+        "confidence": "high",
+        "sources": [
+          "https://arxiv.org/abs/2303.11366",
+          "https://arxiv.org/abs/2309.02427"
+        ],
+        "evidence": "Two 3-0 claims ([3], [4]) against the primary paper (Shinn et al., NeurIPS 2023). Title literally 'Reflexion: Language Agents with Verbal Reinforcement Learning.' Abstract verbatim: 'reinforce language agents not by updating weights, but instead through linguistic feedback. Reflexion agents verbally reflect on task feedback signals, then maintain their own reflective text in an episodic memory buffer to induce better decision-making in subsequent trials.' Actor parameterized as theta = {M_a, mem}. CAVEAT for Brief 05: the headline quantified result (91% pass@1 on HumanEval vs GPT-4's 80%) was REFUTED 1-2, so the verbal-RL MECHANISM is proven-as-described but the specific end-task number did not survive adversarial verification.",
+        "vote": "3-0 (both constituent claims)"
+      },
+      {
+        "claim": "CANONICAL SYSTEM — Self-RAG: trains a single LM to adaptively decide WHEN to retrieve via special 'reflection tokens' (retrieval + critique tokens), making retrieval on-demand and controllable at inference time, rather than retrieving a fixed number of passages unconditionally. Motivation: indiscriminate fixed-passage retrieval degrades LLM quality/versatility and injects off-topic passages. Self-RAG (7B/13B) outperforms ChatGPT and retrieval-augmented Llama2-chat on open-domain QA, reasoning and fact-verification, with gains in factuality and citation accuracy for long-form generation. TIE-BACK: this is the academic backing for Brief 03's 'relevance-gated recall' recommendation — your always-on full-store injection is the exact anti-pattern Self-RAG targets.",
+        "confidence": "high",
+        "sources": [
+          "https://arxiv.org/abs/2310.11511"
+        ],
+        "evidence": "Three 3-0 claims ([6], [7], [8]) against the primary paper (Asai et al., ICLR 2024). Abstract: 'trains a single arbitrary LM that adaptively retrieves passages on-demand, and generates and reflects ... using special tokens, called reflection tokens. Generating reflection tokens makes the LM controllable during the inference phase.' Anti-pattern verbatim: 'indiscriminately retrieving and incorporating a fixed number of retrieved passages, regardless of whether retrieval is necessary, or passages are relevant, diminishes LM versatility.' Independently corroborated by 2024-2026 work (arXiv 2606.04127: 'adding unrelated documents ... often hurts performance, sometimes making RAG worse than no retrieval at all'; ICLR 2025 long-context RAG). Results: PopQA 54.9 vs 46.7/38.2 baselines. This is a PROVEN result with surviving quantified evidence (unlike the consolidation claims).",
+        "vote": "3-0 (all three constituent claims)"
+      },
+      {
+        "claim": "CANONICAL SYSTEM / AGENTIC MEMORY — A-MEM: proposed a Zettelkasten-style 'agentic memory' that, per new memory, autonomously generates structured notes (contextual descriptions, keywords, tags), dynamically links them to relevant historical memories, and triggers 'memory evolution' in which new memories update the representations/attributes of existing ones. This is the canonical self-organizing / self-editing-notes system. IMPORTANT SCOPING: this is a claim about what A-MEM PROPOSES (mechanism), NOT that it works — its quantified benefit claims were refuted.",
+        "confidence": "high",
+        "sources": [
+          "https://arxiv.org/abs/2502.12110"
+        ],
+        "evidence": "Claim [5] verified 3-0 against the primary abstract clause-by-clause (Xu et al., NeurIPS 2025): 'Following the basic principles of the Zettelkasten method ... create interconnected knowledge networks through dynamic indexing and linking'; 'we generate a comprehensive note containing multiple structured attributes, including contextual descriptions, keywords, and tags'; 'this process enables memory evolution - as new memories are integrated, they can trigger updates to the contextual representations and attributes of existing historical memories.' DECISIVE CAVEAT: BOTH efficacy claims were REFUTED 0-3 — (a) the headline LoCoMo result (A-MEM F1=45.85 vs MemGPT 25.52) and (b) the ablation isolating memory-evolution's contribution (45.85→31.24 when evolution removed). So A-MEM's self-organizing mechanism is real, but the surviving evidence does NOT establish that the evolution/consolidation step provides the claimed end-task gain. Follow-up D-MEM (arXiv 2603.14597) critiques A-MEM's O(N^2) evolution cost.",
+        "vote": "3-0 (mechanism claim only; efficacy claims refuted)"
+      },
+      {
+        "claim": "COGNITIVE TAXONOMY APPLIED TO AGENTS — CoALA: explicitly imports the cognitive-science long-term-memory taxonomy (Atkinson-Shiffrin / Soar architecture) into agent design, defining FOUR memory modules: short-term WORKING memory + three long-term types — EPISODIC (experience from earlier decision cycles: event flows, trajectories, input-output pairs), SEMANTIC (world/self knowledge, the target of RAG-style retrieval), PROCEDURAL (implicit LLM-weight knowledge + explicit agent code). It warns writing to procedural memory is significantly riskier than to episodic/semantic. It organizes canonical agents by module: Voyager = procedural (code-skill library via dense retrieval), Generative Agents = episodic (recency+importance+relevance). TIE-BACK: this is the proven academic basis for the 'explicit episodic/semantic split' your system lacks — you have a single undifferentiated importance-scored store.",
+        "confidence": "high",
+        "sources": [
+          "https://arxiv.org/abs/2309.02427"
+        ],
+        "evidence": "Four 3-0 claims ([15], [16], [17], [18]) against the primary paper (Sumers/Yao/Narasimhan/Griffiths, Princeton/CMU, ICML 2024). Sec 4.1 verbatim: 'short-term working memory and several long-term memories: episodic, semantic, and procedural'; cites 'Soar uses several types of memory ... (Atkinson and Shiffrin, 1968).' Procedural verbatim: 'two forms of procedural memory: implicit knowledge stored in the LLM weights, and explicit knowledge written in the agent's code'; risk warning verbatim: 'significantly riskier than writing to episodic or semantic memory.' Voyager/Generative Agents classification confirmed in Table 2 + body text. This is a DESCRIPTIVE taxonomy-import claim against a fixed canonical paper — strongest possible source quality; cannot go stale.",
+        "vote": "3-0 (all four constituent claims)"
+      },
+      {
+        "claim": "COGNITIVE TAXONOMY — REFLECTION as a learning procedure: CoALA frames reflection as abstracting raw EPISODIC experiences into durable SEMANTIC knowledge for reuse on later tasks, naming Reflexion and Generative Agents as the canonical instances (an LLM reflects on failed episodes and writes the inferences into semantic memory). This is the cleanest theoretical statement of the episodic→semantic consolidation pipeline your assembler-LLM approximates. BUT the theory is asserted, not benchmarked.",
+        "confidence": "high",
+        "sources": [
+          "https://arxiv.org/abs/2309.02427"
+        ],
+        "evidence": "Claim [17] verified 3-0 verbatim against CoALA §4.5: 'Recent work (Shinn et al., 2023; Park et al., 2023) has applied LLMs to reason about raw experiences and store the resulting inferences in semantic memory. For example, Reflexion ... uses an LLM to reflect on failed episodes and stores the results (e.g., \"there is no dishwasher in kitchen\") as semantic knowledge to be attached to LLM context for solving later episodes.' Sits under CoALA's 'Learning actions' section. This describes the consolidation DESIGN cleanly but offers no controlled efficacy evidence — consistent with the broader Brief-05 gap.",
+        "vote": "3-0"
+      },
+      {
+        "claim": "CANONICAL SURVEY / DOMINANT FRAMEWORK — Zhang et al. (2024): establishes the field's canonical THREE-AXIS taxonomy organizing the entire LLM-agent memory module: (1) memory SOURCES (inside-trial / cross-trial / external knowledge), (2) memory FORMS (textual vs parametric — the parametric-vs-non-parametric frontier axis), (3) memory OPERATIONS (writing, management, reading). This is the dominant organizing framework for surveying the field and for your system's gap analysis. CAVEAT: the OPERATIONS axis is most consistently inherited downstream; the SOURCES tripartition is less consistently carried forward, and 2025-2026 surveys (Du et al., arXiv 2505.00675) REVISE rather than inherit the exact scheme (e.g., 6 operations: consolidation/updating/indexing/forgetting/retrieval/compression).",
+        "confidence": "high",
+        "sources": [
+          "https://arxiv.org/pdf/2404.13501",
+          "https://arxiv.org/abs/2404.13501",
+          "https://arxiv.org/abs/2505.00675"
+        ],
+        "evidence": "Two near-identical claims merged: [12] (3-0) and [9] (2-1). Primary PDF (Zhang et al., 'A Survey on the Memory Mechanism of LLM-based Agents,' ACM TOIS 2025, DOI 10.1145/3748302). Intro verbatim: 'we discuss previous works from three dimensions, that is, memory sources, memory forms, and memory operations.' SOURCES = 'the information inside a trial, the information across different trials, and the external knowledge'; FORMS = 'textual form and parametric form'; OPERATIONS = 'memory writing, memory management, and memory reading.' The 2-1 on [9] reflects ONE dissent on the secondary clause that 'most later work inherits this exact scheme' — Du et al. (arXiv 2505.00675) demonstrably revises it with a different 6-operation set, which is the source of medium-vs-high tension. Core taxonomy claim is high-confidence; the 'universally inherited' framing is the medium-confidence part.",
+        "vote": "3-0 / 2-1 (split on the 'universally inherited' sub-clause)"
+      },
+      {
+        "claim": "CONSOLIDATION/REFLECTION IS UNDER-EVIDENCED (Brief 05 CONFIRMED + STRENGTHENED) — The canonical survey defines 'memory management' as EXACTLY the composite your system implements — reflection (summarizing high-level concepts for generalization) + merging (reducing redundancy) + forgetting (removing unimportant/irrelevant info) — but justifies all three PURELY by analogy to the human brain, providing ZERO controlled end-task evidence that they improve performance. Its strongest assertion is the hand-wavy 'these operations can help the agents.' Forgetting is implemented in only ~5 of 28 surveyed systems (MemoryBank, TiM, Generative Agents, RecAgent, S3). DECISIVELY: every quantified efficacy claim for these operations across the canonical papers was REFUTED during adversarial verification. TIE-BACK: your assembler-LLM≈reflection/consolidation, cosine-0.85 dedup≈merging, TTL≈forgetting map cleanly onto the field's canonical management operation — but the field has NOT proven any of them lift end-task performance.",
+        "confidence": "high",
+        "sources": [
+          "https://arxiv.org/pdf/2404.13501",
+          "https://arxiv.org/abs/2404.13501"
+        ],
+        "evidence": "Three mutually-reinforcing 3-0 claims merged: [10], [13], [14]. Primary PDF read directly. §5.3.2 'Memory Management' defines verbatim: 'summarizing high-level concepts to make the agent more generalizable, merging similar information to reduce redundancy, and forgetting unimportant or irrelevant information.' Justification verbatim: 'Most of the memory management operations are inspired by the working mechanism of human brains ... these operations can help the agents to better generate high-level information.' Table 3 = exactly 28 model rows; Forgetting column checked for exactly 5 (MemoryBank, TiM, Generative Agents, RecAgent, S3). §6 concedes verbatim 'to our knowledge, there are no open-sourced benchmarks tailored for the memory modules in LLM-based agents.' CRUCIAL: the adversarial verification REFUTED 0-3 the Generative Agents reflection ablation, REFUTED 0-3 both A-MEM memory-evolution ablations, and REFUTED 1-2 the MemGPT/Reflexion numbers — i.e. the four strongest 'consolidation/reflection causally helps' results in the literature ALL failed verification. This is the single most important finding for your platform: sleep-time/reflection/consolidation remains an UNPROVEN benefit, validating Brief 05's flag.",
+        "vote": "3-0 (all three constituent claims)"
+      },
+      {
+        "claim": "EVALUATION GAP (Brief 05's harness-first conclusion CONFIRMED) — As of April 2024 there existed NO open-source benchmark purpose-built to evaluate agent memory modules; the field relied on indirect, task-level evaluation that confounds memory with other factors. Every purpose-built memory-MODULE benchmark (MemBench arXiv 2506.21605, MemoryAgentBench arXiv 2507.05257, LongMemEval, etc.) postdates this and explicitly frames itself as filling the gap. This directly supports Brief 05's keystone conclusion: build a LongMemEval-style dedicated memory-evaluation harness FIRST, because task-level eval cannot isolate whether your memory operations help.",
+        "confidence": "high",
+        "sources": [
+          "https://arxiv.org/pdf/2404.13501",
+          "https://arxiv.org/abs/2402.17753"
+        ],
+        "evidence": "Claim [11] verified 2-1 (the dissent only on flat-fact-vs-hedge phrasing, not substance). Primary survey verbatim: 'the performance on tasks can be attributed to various factors, and memory is only one of them ... to our knowledge, there are no open-sourced benchmarks tailored for the memory modules in LLM-based agents.' The strongest counter-example, LoCoMo (arXiv 2402.17753, Feb 2024), is confirmed a TASK-LEVEL benchmark that 'infers memory capability indirectly through task success' — it exemplifies the gap rather than filling it. Time-scoping corroborated: all module-level benchmarks are 2025-2026 and self-describe as gap-fillers. Medium-leaning-high: the 2-1 split is purely about the survey hedging 'to our knowledge' vs the claim stating it as flat fact, but the absence of any pre-April-2024 module-level benchmark corroborates the substance.",
+        "vote": "2-1"
+      }
+    ],
+    "caveats": "PROVEN vs SPECULATIVE — the sharpest takeaway: Every claim that SURVIVED verification is either (a) DESCRIPTIVE (what a system's architecture is / what a paper proposes) or (b) a SURVEY TAXONOMY definition. Every claim that asserted a system's higher-order memory operation (reflection/consolidation/memory-evolution) CAUSALLY improves end-task performance was REFUTED during adversarial verification: Generative Agents reflection ablation (0-3), A-MEM memory-evolution ablation x2 (0-3), MemGPT DMR numbers (1-2), Reflexion HumanEval 91% (1-2). Treat this asymmetry as the headline: the architectural/taxonomic scaffolding of agent memory is well-established; the efficacy of the consolidation/reflection/sleep-time layer is NOT, and the papers most often cited as proof do not hold up under scrutiny.\n\nSOURCE QUALITY: Strong overall — every surviving claim is anchored to a primary arXiv paper (MemGPT, Generative Agents, Reflexion, Self-RAG, A-MEM, CoALA, Zhang survey), most peer-reviewed (NeurIPS, ICLR, ICML, ACM TOIS). No blog-quality or marketing sources carried a finding. Several claims were verified by direct PDF/ar5iv extraction with verbatim quotes, the highest available fidelity.\n\nVOTE SPLITS: Two findings rest partly on 2-1 votes — (1) the 'universally inherited' framing of the Zhang three-axis taxonomy (dissent justified: 2025-2026 surveys like Du et al. revise rather than inherit it), and (2) the April-2024 'no memory benchmark existed' claim (dissent only on flat-fact vs hedged phrasing). The underlying facts in both are sound; the confidence reduction is on the universality/phrasing, not the substance.\n\nTIME-SENSITIVITY: Descriptive claims about fixed papers cannot go stale. BUT two areas are actively moving and this synthesis is a snapshot: (1) the parametric-vs-non-parametric frontier (memory layers, KV-cache reuse, 'cartridges', memory-in-weights) — the verified evidence covers only Zhang's 'textual vs parametric FORMS' axis and CoALA's 'procedural memory = LLM weights' framing; NO surviving claim establishes any specific parametric-memory technique as practical-now, so treat that frontier as open. (2) Memory-module benchmarks (MemBench, MemoryAgentBench, LongMemEval) are 2025-2026 and evolving — results on them will date quickly.\n\nCOVERAGE GAPS in the verified claim set: Several requested canonical works produced NO surviving claim — Voyager appears only via CoALA's secondhand classification (not its own primary contribution on skill-library/procedural memory), and MemoryBank and RecurrentGPT appear only as survey table entries. Forgetting/decay was confirmed RARE (5/28 systems) but NO surviving claim addresses Ebbinghaus/spacing-inspired decay efficacy or 'when forgetting improves task performance.' Bi-temporal/Graphiti-style edge invalidation (Brief 04's proposed contradiction fix) and conflict/contradiction resolution (Brief 05's #1 open problem) produced NO surviving claim here — those remain backed only by the prior briefs, not this verification pass.",
+    "openQuestions": [
+      "Does consolidation/reflection/sleep-time compute actually improve END-TASK performance (not just token savings), and under what conditions? This synthesis CONFIRMS the field offers no surviving controlled evidence — every ablation claiming so was refuted. Resolving it for your platform requires building the LongMemEval-style harness (Brief 05) and running your own assembler-LLM with/without ablation, because the literature will not answer it.",
+      "When does FORGETTING/decay IMPROVE task performance rather than merely save tokens? Forgetting is confirmed rare (5/28 systems) and justified only by brain-analogy; no surviving claim establishes Ebbinghaus/spacing-curve decay efficacy. Your TTL-pinned ~10-turn decay is in the unproven-benefit category — does pruning ever raise accuracy by removing distractors (cf. Self-RAG's 'off-topic passages hurt'), or only ever lose information?",
+      "Is the explicit EPISODIC vs SEMANTIC vs PROCEDURAL split (CoALA) DEMONSTRABLY better than a single undifferentiated importance-scored store like yours, or is it taxonomic window-dressing? CoALA imports the distinction faithfully but the verified evidence contains NO head-to-head showing the split lifts performance — this is exactly the 'does the distinction demonstrably improve systems' question the brief asked, and it remains open.",
+      "Which parametric-vs-non-parametric frontier technique (memory layers, KV-cache reuse, 'cartridges', memory-in-weights) is practical NOW? No surviving claim covers this beyond the abstract 'textual vs parametric' taxonomy axis and CoALA's warning that writing to procedural/weight memory is 'significantly riskier.' Whether any of it is pilot-worthy for your system is unresolved by this verification pass."
+    ],
+    "refuted": [
+      {
+        "claim": "On the new Deep Memory Retrieval (DMR) multi-session-chat task, MemGPT dramatically outperforms fixed-context baselines on the SAME underlying model: GPT-4 jumps from 32.1% to 92.5% accuracy with MemGPT, GPT-4 Turbo from 35.3% to 93.4%, and GPT-3.5 Turbo from 38.7% to 66.9% — a proven, quantified long-term-memory benefit.",
+        "vote": "1-2",
+        "source": "https://arxiv.org/abs/2310.08560"
+      },
+      {
+        "claim": "An ablation study shows that each of the three architectural components — observation, planning, and reflection — contributes critically to the believability of agent behavior, i.e., removing any one degrades performance. This is direct primary-source ablation evidence that reflection (consolidation) provides measurable end-task benefit, bearing on Brief 05's open question of whether reflection actually helps.",
+        "vote": "0-3",
+        "source": "https://arxiv.org/abs/2304.03442"
+      },
+      {
+        "claim": "Reflexion achieved 91% pass@1 on the HumanEval coding benchmark, beating the prior GPT-4 state-of-the-art of 80% — a concrete, replicable result demonstrating the approach improves end-task performance, not just token usage.",
+        "vote": "1-2",
+        "source": "https://arxiv.org/abs/2303.11366"
+      },
+      {
+        "claim": "On the LoCoMo long-conversation benchmark, A-MEM substantially outperforms prior memory systems (MemGPT, ReadAgent, MemoryBank, Mem0) on multi-hop reasoning questions — e.g. with GPT-4o-mini, A-MEM reaches F1=45.85% vs MemGPT 25.52% and the LoCoMo baseline 18.41%, an improvement the authors describe as at least 2x.",
+        "vote": "0-3",
+        "source": "https://arxiv.org/abs/2502.12110"
+      },
+      {
+        "claim": "An ablation isolates the contribution of the self-organizing components: on GPT-4o-mini multi-hop questions, removing memory evolution drops F1 from 45.85% to 31.24%, and removing both link generation and memory evolution drops it to 24.55% — i.e. the memory-evolution/consolidation step itself accounts for a large share of the gain, not just retrieval.",
+        "vote": "0-3",
+        "source": "https://arxiv.org/abs/2502.12110"
+      },
+      {
+        "claim": "Reflection is causally load-bearing in Generative Agents: ablating the reflection component caused agent behavior to degrade from coherent multi-day planning to repetitive, context-free responses within 48 simulated hours. This is direct ablation evidence that reflection/consolidation helps end-task coherence (not just token savings), bearing on Brief 05's under-evidenced flag.",
+        "vote": "0-3",
+        "source": "https://arxiv.org/html/2603.07670v1"
+      }
+    ],
+    "sources": [
+      {
+        "url": "https://arxiv.org/abs/2310.08560",
+        "quality": "primary",
+        "angle": "canonical systems (primary)",
+        "claimCount": 5
+      },
+      {
+        "url": "https://arxiv.org/abs/2304.03442",
+        "quality": "primary",
+        "angle": "canonical systems (primary)",
+        "claimCount": 4
+      },
+      {
+        "url": "https://arxiv.org/abs/2303.11366",
+        "quality": "primary",
+        "angle": "canonical systems (primary)",
+        "claimCount": 5
+      },
+      {
+        "url": "https://arxiv.org/abs/2502.12110",
+        "quality": "primary",
+        "angle": "canonical systems (primary)",
+        "claimCount": 4
+      },
+      {
+        "url": "https://arxiv.org/abs/2310.11511",
+        "quality": "primary",
+        "angle": "canonical systems (primary)",
+        "claimCount": 4
+      },
+      {
+        "url": "https://arxiv.org/pdf/2404.13501",
+        "quality": "primary",
+        "angle": "canonical systems (primary)",
+        "claimCount": 5
+      },
+      {
+        "url": "https://arxiv.org/abs/2404.13501",
+        "quality": "primary",
+        "angle": "cognitive taxonomy applied to agents",
+        "claimCount": 5
+      },
+      {
+        "url": "https://arxiv.org/abs/2309.02427",
+        "quality": "primary",
+        "angle": "cognitive taxonomy applied to agents",
+        "claimCount": 5
+      },
+      {
+        "url": "https://github.com/Shichun-Liu/Agent-Memory-Paper-List",
+        "quality": "secondary",
+        "angle": "cognitive taxonomy applied to agents",
+        "claimCount": 5
+      },
+      {
+        "url": "https://arxiv.org/html/2603.07670v1",
+        "quality": "primary",
+        "angle": "cognitive taxonomy applied to agents",
+        "claimCount": 5
+      },
+      {
+        "url": "https://arxiv.org/html/2504.13171v1",
+        "quality": "primary",
+        "angle": "consolidation / reflection / sleep-time evidence (priority)",
+        "claimCount": 5
+      },
+      {
+        "url": "https://arxiv.org/html/2603.14517v1",
+        "quality": "primary",
+        "angle": "consolidation / reflection / sleep-time evidence (priority)",
+        "claimCount": 5
+      },
+      {
+        "url": "https://www.letta.com/blog/sleep-time-compute",
+        "quality": "blog",
+        "angle": "consolidation / reflection / sleep-time evidence (priority)",
+        "claimCount": 5
+      },
+      {
+        "url": "https://ar5iv.labs.arxiv.org/html/2304.03442",
+        "quality": "primary",
+        "angle": "consolidation / reflection / sleep-time evidence (priority)",
+        "claimCount": 5
+      },
+      {
+        "url": "https://arxiv.org/abs/2601.18642",
+        "quality": "primary",
+        "angle": "agentic self-organizing + forgetting/decay",
+        "claimCount": 5
+      },
+      {
+        "url": "https://arxiv.org/abs/2512.13564",
+        "quality": "primary",
+        "angle": "agentic self-organizing + forgetting/decay",
+        "claimCount": 5
+      },
+      {
+        "url": "https://arxiv.org/abs/2603.07670",
+        "quality": "primary",
+        "angle": "agentic self-organizing + forgetting/decay",
+        "claimCount": 5
+      },
+      {
+        "url": "https://arxiv.org/abs/2603.11768",
+        "quality": "primary",
+        "angle": "agentic self-organizing + forgetting/decay",
+        "claimCount": 5
+      },
+      {
+        "url": "https://arxiv.org/abs/2604.20300",
+        "quality": "primary",
+        "angle": "agentic self-organizing + forgetting/decay",
+        "claimCount": 5
+      },
+      {
+        "url": "https://arxiv.org/abs/2506.06266",
+        "quality": "primary",
+        "angle": "parametric vs non-parametric frontier",
+        "claimCount": 5
+      },
+      {
+        "url": "https://arxiv.org/pdf/2412.09764",
+        "quality": "primary",
+        "angle": "parametric vs non-parametric frontier",
+        "claimCount": 5
+      },
+      {
+        "url": "https://arxiv.org/abs/2402.04624",
+        "quality": "primary",
+        "angle": "parametric vs non-parametric frontier",
+        "claimCount": 5
+      },
+      {
+        "url": "https://arxiv.org/html/2504.15965v2",
+        "quality": "primary",
+        "angle": "parametric vs non-parametric frontier",
+        "claimCount": 5
+      },
+      {
+        "url": "https://www.microsoft.com/en-us/research/wp-content/uploads/2024/09/eurosys25-final999.pdf",
+        "quality": "primary",
+        "angle": "parametric vs non-parametric frontier",
+        "claimCount": 5
+      },
+      {
+        "url": "https://arxiv.org/abs/2410.10813",
+        "quality": "primary",
+        "angle": "evaluation, benchmarks & open problems",
+        "claimCount": 4
+      },
+      {
+        "url": "https://arxiv.org/html/2507.05257v1",
+        "quality": "primary",
+        "angle": "evaluation, benchmarks & open problems",
+        "claimCount": 5
+      },
+      {
+        "url": "https://arxiv.org/abs/2402.17753",
+        "quality": "primary",
+        "angle": "evaluation, benchmarks & open problems",
+        "claimCount": 5
+      }
+    ],
+    "stats": {
+      "angles": 6,
+      "sourcesFetched": 27,
+      "claimsExtracted": 131,
+      "claimsVerified": 25,
+      "confirmed": 19,
+      "killed": 6,
+      "afterSynthesis": 10,
+      "urlDupes": 4,
+      "budgetDropped": 5,
+      "agentCalls": 110
+    }
+  }
+}

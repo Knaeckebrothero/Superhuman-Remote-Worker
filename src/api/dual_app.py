@@ -388,6 +388,21 @@ async def _reset_to_idle(source: str, *, skip_session_cleanup: bool = False) -> 
     logger.info("Agent returned to IDLE — ready for next task")
 
 
+async def _complete_stop(reset_source: str) -> None:
+    """Finish a cooperative stop (cancel/pause): reset to IDLE, then signal the
+    waiting cancel/pause handler.
+
+    Ordering is load-bearing. ``_reset_to_idle()`` calls ``_clear_stop()``,
+    which clears ``_stop_completed``; the cancel/pause handler is blocked on
+    that event, so it must be ``set()`` *after* the reset or the handler hangs
+    to its 120s timeout. Without the reset, ``_pod_state`` stays ``WORKING``
+    with no job — the zombie pattern (see
+    docs/done/worker_pod_state_zombie_on_cancel.md).
+    """
+    await _reset_to_idle(reset_source)
+    _stop_completed.set()
+
+
 # ---------------------------------------------------------------------------
 # Job processing (adapted from app.py)
 # ---------------------------------------------------------------------------
@@ -494,11 +509,12 @@ async def _process_orchestrator_job(
         # Handle cooperative stop vs normal completion
         if _stop_requested.is_set():
             reason = _stop_reason
-            _clear_stop()
             logger.info(f"Job {job_id} stopped gracefully (reason={reason})")
-            _current_job_id = None
-            _stop_completed.set()
-            return  # Don't exit — pause means orchestrator may want to reassign
+            # Reset to IDLE so the pod doesn't strand _pod_state=WORKING with no
+            # job (zombie). Don't exit — cancel/pause means the orchestrator may
+            # reassign/resume. See worker_pod_state_zombie_on_cancel.md.
+            await _complete_stop(f"job {reason}")
+            return
 
         result = final_state or {}
         logger.info(f"Job {job_id} completed: {result.get('should_stop')}")
@@ -782,9 +798,11 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
                     await _current_job_task
                 except asyncio.CancelledError:
                     pass
-            _current_job_id = None
-            _current_job_task = None
-            _clear_stop()
+            # The hard-killed task re-raises CancelledError without resetting
+            # _pod_state, so reset here or the pod strands at WORKING (zombie).
+            # _reset_to_idle also nulls _current_job_id/_task and clears stop
+            # state. See worker_pod_state_zombie_on_cancel.md.
+            await _reset_to_idle("cancel hard-kill")
             return {
                 "job_id": job_id,
                 "status": "cancelled",
@@ -880,9 +898,12 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
                         break
 
                 if _stop_requested.is_set():
-                    _clear_stop()
-                    _current_job_id = None
-                    _stop_completed.set()
+                    reason = _stop_reason
+                    logger.info(
+                        f"Resume of job {request.job_id} stopped gracefully "
+                        f"(reason={reason})"
+                    )
+                    await _complete_stop(f"job resume {reason}")
                     return
 
                 result = final_state or {}
