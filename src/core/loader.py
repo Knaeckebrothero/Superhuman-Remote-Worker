@@ -1266,17 +1266,10 @@ class MemoryConfig:
     observer_interval: int = 5
     assembler_interval: int = 7
     default_ttl: int = 10
-    observer_model: Optional[str] = None
-    observer_base_url: Optional[str] = None
-    embedding_model: str = "qwen3-embedding-8b"
-    dense_results: int = 30
-    sparse_results: int = 30
-    recent_results: int = 15
     importance_threshold: float = 0.3
     dedup_threshold: float = 0.85
     retrieval_importance_floor: float = 0.4
     project_scoped: bool = True
-    storage: str = "postgres"
 
 
 @dataclass
@@ -1473,17 +1466,10 @@ def _parse_memory_config(data: Dict[str, Any]) -> MemoryConfig:
         observer_interval=data.get("observer_interval", 5),
         assembler_interval=data.get("assembler_interval", 7),
         default_ttl=data.get("default_ttl", 10),
-        observer_model=data.get("observer_model"),
-        observer_base_url=data.get("observer_base_url"),
-        embedding_model=data.get("embedding_model", "qwen3-embedding-8b"),
-        dense_results=data.get("dense_results", 30),
-        sparse_results=data.get("sparse_results", 30),
-        recent_results=data.get("recent_results", 15),
         importance_threshold=data.get("importance_threshold", 0.3),
         dedup_threshold=data.get("dedup_threshold", 0.85),
         retrieval_importance_floor=data.get("retrieval_importance_floor", 0.4),
         project_scoped=data.get("project_scoped", True),
-        storage=data.get("storage", "postgres"),
     )
 
 

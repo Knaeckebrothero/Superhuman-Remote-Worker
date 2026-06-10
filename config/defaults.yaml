@@ -209,17 +209,13 @@ memory:
   observer_interval: 5             # Run observer every N turns
   assembler_interval: 7            # Run assembler every N turns (TTL curation)
   default_ttl: 10                  # Default TTL in turns for new memories (guaranteed injection)
-  observer_model: null             # null = use main LLM, or specify model
-  observer_base_url: null          # null = use main LLM_BASE_URL
-  embedding_model: qwen3-embedding-8b
-  dense_results: 30                # Top-K for dense vector search
-  sparse_results: 30               # Top-K for sparse/keyword search
-  recent_results: 15               # Number of recent memories to include
   importance_threshold: 0.3        # Minimum importance to store
   dedup_threshold: 0.85            # Cosine similarity threshold for dedup
   retrieval_importance_floor: 0.4  # Minimum importance for retrieval (memories below this are stored but not recalled)
   project_scoped: true             # When true, memories are shared across all jobs in the same project
-  storage: postgres                # Only option for v1
+  # NOTE: the observer runs on the auxiliary LLM (see `auxiliary:` below) and
+  # the embedding model comes from the EMBEDDING_* env vars — neither is
+  # configurable here (dead keys removed, docs/issues/memory_bugs.md B9).
 
 # Auxiliary LLM — unified support task system for background LLM tasks.
 # Handles memory extraction, knowledge curation, and other support tasks
