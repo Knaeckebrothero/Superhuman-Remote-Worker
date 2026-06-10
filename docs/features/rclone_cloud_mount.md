@@ -21,7 +21,8 @@ related:
 
 # Rclone Cloud Mount - Lazy Cloud Workspaces
 
-**Status:** Phase 1 v4 implemented 2026-06-09. Later hydration-budget
+**Status:** Phase 1 v4 implemented 2026-06-09. OpenCloud bearer-token mount
+plan refined 2026-06-10 (§11 decision + Phase 6). Later hydration-budget
 approvals and indexing/search phases remain pending.
 
 ## 1. Goal
@@ -566,11 +567,52 @@ sessions. Options:
 - use rclone WebDAV `bearer_token_command` to invoke a local token helper;
 - keep OpenCloud on the current sync path until token refresh is solved.
 
-**Decision:** use app-token/service credentials for stable service/project
-spaces when available. For user-scoped mounts, treat `bearer_token_command` with
-a local token helper as the long-term target. Until that helper is robust, fall
-back to the session-folder path rather than mounting a user home with a static
-short-lived bearer token.
+**Decision (refined 2026-06-10):** implement `SupportsRcloneMount` on
+OpenCloud with rclone's `webdav` backend (`vendor=infinitescale`) and
+`bearer_token_command` pointing at a runtime-local token helper.
+
+The helper does not mint tokens itself. The agent process already runs a full
+Keycloak token client for the OpenCloud sync path
+(`src/services/cloud_sync/opencloud_sync.py`: client-credentials minting,
+cached refresh ~30s before expiry, RFC 8693 token-exchange impersonation).
+That client is extracted into a shared module; the mount manager mints through
+it and pushes the short-lived access token into a mode-0600 file in the
+mount's runtime-only state dir. The helper script only reads that file. rclone
+re-runs `bearer_token_command` on a 401, so a token that went stale between
+refreshes self-heals on the next request.
+
+The auth payload mirrors the existing sync payload shape:
+`auth.type = "keycloak_client_credentials"` for service-owned spaces, or
+`"keycloak_user_impersonation"` plus `target_user_sub` for user homes. The
+Keycloak client secret travels only to the agent process — the workspace host
+never sees anything longer-lived than a ~5-minute access token. That is a
+stronger posture than the Nextcloud spec, which parks a long-lived service
+password in the workspace rclone config.
+
+Sequencing: service-token mode (session folders + project folders in the
+agent-home/project Spaces) ships first; user-home mounts via token-exchange
+impersonation follow after the refresh loop has soaked, because a write-path
+bug on a personal Space touches real user data while the agent-home Space is
+SRW-owned. Until then, user-home rows raise `NOT_SUPPORTED` and take the
+documented session-folder fallback (which itself becomes an rclone mount).
+Impersonation — not explicit user-granted credentials — is the accepted
+user-home model on OpenCloud: the sync path already uses it, and personal
+Spaces have exactly one owner, so there is no "share the home to the agent
+account" equivalent like Nextcloud has.
+
+App tokens via the `auth-app` service were considered and rejected as the
+primary path: they are deployment-dependent (the bundled chart does not run
+`auth-app`; BYO instances would each need it enabled) and they would park a
+long-lived secret on the workspace host. Revisit only if
+`bearer_token_command` proves unreliable in practice.
+
+OpenCloud mounts require a modern rclone in the workspace runtime: the
+`infinitescale` webdav vendor does not exist in Ubuntu Noble's packaged
+rclone 1.60.1-DEV. The workspace container and VM images therefore install a
+pinned upstream rclone (checksum-verified; v1.74.3 at time of writing, which
+has both `vendor=infinitescale` and `bearer_token_command` — verified against
+the release binary), and the mount manager preflights `rclone version` with a
+clear error instead of mounting with an unsupported vendor.
 
 ### Google Drive
 
@@ -840,6 +882,57 @@ approval path returned `/home/agent-host/workspace` and confirmed the rclone
 mount in the command output. Chat and embedding calls used the configured local
 model endpoint.
 
+### Phase 6 Step 2 — OpenCloud Bearer Mounts, Live k3d Validation (2026-06-10)
+
+Implemented and live-verified on local k3d with `opencloud.enabled=true`
+(bundled OpenCloud + bundled Keycloak, 900s access-token lifespan):
+
+- Shared Keycloak token client extracted to `src/services/keycloak_token.py`;
+  `opencloud_sync.py` delegates to it (all 22 sync tests unchanged-green).
+- `OpenCloudBackend.build_rclone_mount_spec` emits
+  `webdav`/`vendor=infinitescale` specs with
+  `auth.type=keycloak_client_credentials` and `min_rclone_version=1.70.0`
+  (the release that introduced the infinitescale vendor). User-home handles
+  raise `NOT_SUPPORTED` → documented session-folder fallback.
+- Mount manager mints the initial bearer in the agent process, seeds
+  `bearer.token` (0600) + `bearer-helper.sh` (0700) in the runtime state
+  dir, injects `bearer_token_command`, preflights `rclone version` with
+  `sort -V`, and runs a per-session refresh task that re-mints and
+  atomically re-pushes the token at expiry − 90s.
+- Live session `43cfa684` on k3d: one agent + one workspace pod;
+  `/cloud/home` mounted `fuse.rclone` against
+  `http://srw-opencloud:9200/dav/spaces/<agent-home>/sessions/43cfa684/`;
+  `/workspace/cloud` symlink; supervised `run_command` + `srw_cloud_status`
+  approved and answered correctly; **token refresh fired at 16:56:16 —
+  exactly expiry − 90s — and the mount served reads past the original
+  token's expiry with zero 401s in the rclone log**. The Keycloak client
+  secret never appears on the workspace host (verified by grep).
+- rclone 401-refresh behavior (re-running `bearer_token_command` and
+  retrying) was additionally proven against rclone v1.74.3 with a local
+  fake WebDAV server: stale token → 401 → helper re-invoked → retry
+  succeeded.
+
+Local-k3d-only findings (not code bugs; dev/prod topology unaffected):
+
+- **OpenCloud uploads were broken on local k3d across the board** (also
+  pre-existing for sync and orchestrator `put_session_file`): ocdav
+  forwards every upload body to the public data-gateway URL
+  (`https://cloud.localhost/data`), which no pod could resolve. Fixed by a
+  `coredns-custom` override mapping `cloud/auth/git.localhost` to
+  Traefik's ClusterIP (now part of `scripts/local-dev-up.sh`); after the
+  fix, server-mediated PUT returns 201. The override supersedes the
+  per-pod `hostAliases` workaround for `auth.localhost`.
+- **rclone tus uploads from workspace pods remain blocked locally** by two
+  deliberate guards: the workspace NetworkPolicy's cluster-CIDR egress
+  hardening (PATCH to Traefik's ClusterIP:443 refused) and the mkcert
+  TLS cert (untrusted by the workspace image). On dev/prod the public URL
+  resolves externally and the existing TCP/443 wildcard egress applies, so
+  the tus path is expected to work there — verify in Phase 6 step 4.
+  Local follow-ups if local write-through is wanted: (1) scoped workspace
+  egress rule to the in-cluster ingress (parity with what dev already
+  allows via public hairpin), (2) mkcert CA trust or an explicit
+  local-only insecure-TLS provider flag for the mount.
+
 ### Implemented Provider Contract
 
 - Added `CloudMountSubject`, `RcloneMountSpec`, and `SupportsRcloneMount` to the
@@ -992,8 +1085,13 @@ with rclone, `/home/agent-host/workspace/cloud` linked to `/cloud/home`, and
 - `.cloudignore` is implemented for rclone mounts, but not for the legacy sync
   path from Phase 0.
 - Background indexing and `srw-cloud-search` are not implemented.
-- OpenCloud user-scoped rclone mounts still need the token-helper strategy from
-  Section 11.
+- OpenCloud service-scoped rclone mounts (session/project Spaces) are
+  implemented via the bearer token helper (Phase 6 step 2). User-scoped
+  (personal Space) mounts still need the impersonation slice (Phase 6
+  step 3); until then they take the session-folder fallback.
+- On local k3d, rclone tus uploads from workspace pods are blocked by the
+  workspace NetworkPolicy + mkcert TLS trust (see Phase 6 step 2 findings);
+  reads, server-mediated PUTs, and all dev/prod topologies are unaffected.
 - Some clusters may reject `/dev/fuse`/`SYS_ADMIN` workspace pods; those
   deployments must use the explicit fallback flags above until their runtime
   profile supports FUSE.
@@ -1069,6 +1167,44 @@ Acceptance:
 - Keep `sync` as compatibility fallback for providers/runtimes without FUSE.
 - Retire eager clone/pull for main-cloud workspace surfaces where rclone is
   supported.
+
+### Phase 6 - OpenCloud bearer-token mounts
+
+Refined 2026-06-10; see the §11 OpenCloud decision for the full rationale.
+Motivated by the 2026-06-10 dev-cluster runbook result
+(`docs/tests/rclone_cloud_mount_dev_cluster.md` §13): dev runs
+`MAIN_CLOUD_BACKEND=opencloud`, so without this phase the orchestrator never
+emits `cloud_mount` there and every session takes the session-folder sync
+fallback.
+
+1. Pin upstream rclone in the workspace container and VM images
+   (checksum-verified deb, replaces Ubuntu's 1.60.1-DEV). Independent PR;
+   the existing Nextcloud k3d path is the regression test.
+2. Service-token mode: extract the Keycloak token client from
+   `opencloud_sync.py` into a shared module, implement
+   `OpenCloudBackend.build_rclone_mount_spec` for session/project Space
+   handles, and teach the mount manager the
+   `keycloak_client_credentials` auth type (token file + helper script +
+   `bearer_token_command` + per-session refresh loop). Validate on local k3d
+   with `MAIN_CLOUD_BACKEND=opencloud`. User-home rows raise `NOT_SUPPORTED`
+   and keep the session-folder fallback — which is now itself rclone-mounted,
+   so the full §13 runbook becomes exercisable on dev after this slice alone.
+3. User-home mounts via `keycloak_user_impersonation` token exchange, after
+   the refresh loop has soaked on SRW-owned spaces. Verify the realm has
+   token-exchange enabled (the sync Phase 2 user-home flow already depends
+   on it).
+4. Re-run the dev-cluster runbook; §13's "fallback-only" headline flips to a
+   real mount validation.
+
+Slice-2 acceptance criteria (beyond the Phase 1 list):
+
+- mount survives Keycloak access-token expiry: idle past the configured token
+  lifespan, then read again — rclone re-runs the token helper on 401 and the
+  read succeeds (check the realm/client token lifespan while verifying);
+- the Keycloak client secret never appears on the workspace host — only the
+  short-lived access-token file (mode 0600, runtime-only state dir);
+- rclone version preflight fails fast with an actionable error on runtimes
+  older than the pinned baseline.
 
 ## 16. Open Questions
 

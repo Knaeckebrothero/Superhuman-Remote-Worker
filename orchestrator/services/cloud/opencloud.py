@@ -30,7 +30,7 @@ from urllib.parse import quote
 import httpx
 
 from ._propfind import parse_propfind_entries
-from .base import HealthStatus, UserHome
+from .base import CloudMountSubject, HealthStatus, RcloneMountSpec, UserHome
 from .config import OpenCloudSettings
 from .errors import CloudBackendError, CloudBackendErrorKind
 from .handles import (
@@ -150,6 +150,78 @@ class OpenCloudBackend:
         legacy ``username``/``password`` plumbing silently falls back.
         """
         return {}
+
+    async def build_rclone_mount_spec(
+        self,
+        *,
+        handle: ProjectFolderHandle | SessionFolderHandle,
+        mount_kind: str,
+        target_path: str,
+        access: str,
+        subject: CloudMountSubject | None = None,
+    ) -> RcloneMountSpec:
+        """Build an rclone WebDAV spec for an OpenCloud Space surface.
+
+        OpenCloud WebDAV is OAuth-bearer-only, so the spec carries no static
+        credential. ``auth.type = "keycloak_client_credentials"`` tells the
+        agent-side mount manager to mint service-account tokens through the
+        shared ``KeycloakTokenClient`` and feed them to rclone via a
+        runtime-local ``bearer_token_command`` helper — the workspace host
+        only ever sees the short-lived access token, never the client
+        secret. See docs/features/rclone_cloud_mount.md §11.
+
+        User-home mounts need token-exchange impersonation and are deferred
+        (feature doc Phase 6 step 3); they raise ``NOT_SUPPORTED`` so the
+        thread takes the documented session-folder fallback.
+        """
+        self._ensure_ready()
+        if isinstance(handle, SessionFolderHandle):
+            webdav_url = self.get_session_folder_webdav_url(handle)
+        elif handle.vendor_meta.get("kind") == "user_home":
+            raise CloudBackendError(
+                CloudBackendErrorKind.NOT_SUPPORTED,
+                f"cannot build rclone mount for {mount_kind}: OpenCloud "
+                "user-home mounts require impersonation token support "
+                "(not yet enabled); session-folder fallback applies",
+                backend=self.backend_id,
+            )
+        else:
+            webdav_url = self.get_project_folder_webdav_url(handle)
+
+        if not webdav_url:
+            raise CloudBackendError(
+                CloudBackendErrorKind.INVALID_REQUEST,
+                f"cannot build rclone mount for {mount_kind}: missing WebDAV URL",
+                backend=self.backend_id,
+            )
+
+        return RcloneMountSpec(
+            source_type="webdav",
+            source_config={
+                "url": webdav_url,
+                # OCIS-lineage vendor: tus chunked uploads + OpenCloud
+                # quirks. Exists from rclone 1.70.0 — enforced below.
+                "vendor": "infinitescale",
+            },
+            auth={
+                "type": "keycloak_client_credentials",
+                "issuer": self._keycloak_issuer,
+                "client_id": self._client_id,
+                "client_secret": self._client_secret,
+            },
+            cache={
+                "vfs_cache_mode": "full",
+                "vfs_cache_max_size": "10G",
+                "vfs_cache_max_age": "24h",
+                "dir_cache_time": "5m",
+                "poll_interval": "1m",
+                "vfs_read_chunk_size": "16M",
+                "vfs_read_chunk_size_limit": "128M",
+                "hard_cache_limit": "20G",
+            },
+            required_capabilities=["rclone", "fuse", "rc", "token_helper"],
+            min_rclone_version="1.70.0",
+        )
 
     # ---------------------------------------------------------------- Lifecycle
 

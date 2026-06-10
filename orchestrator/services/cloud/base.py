@@ -83,6 +83,9 @@ class RcloneMountSpec:
     required_capabilities: list[str] = field(
         default_factory=lambda: ["rclone", "fuse", "rc"]
     )
+    # Lowest rclone release the runtime may use for this remote (e.g. the
+    # webdav `infinitescale` vendor only exists from 1.70.0). Empty = any.
+    min_rclone_version: str = ""
 
     def to_payload(self) -> dict[str, Any]:
         payload = {
@@ -91,13 +94,16 @@ class RcloneMountSpec:
         }
         if self.root:
             payload["root"] = self.root
-        return {
+        out = {
             "source": payload,
             "auth": dict(self.auth),
             "provider_flags": list(self.provider_flags),
             "cache": dict(self.cache),
             "required_capabilities": list(self.required_capabilities),
         }
+        if self.min_rclone_version:
+            out["min_rclone_version"] = self.min_rclone_version
+        return out
 
 
 @runtime_checkable

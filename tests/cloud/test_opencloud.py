@@ -28,6 +28,7 @@ from orchestrator.services.cloud import (
     OpenCloudBackend,
     OpenCloudSettings,
     ProjectFolderHandle,
+    SessionFolderHandle,
     ShareHandle,
     UserId,
 )
@@ -400,6 +401,110 @@ class TestUrlConstructors:
     def test_webdav_credentials_empty(self):
         be = OpenCloudBackend(_settings())
         assert be.webdav_credentials == {}
+
+
+# ----------------------------------------------------------- rclone mount spec
+
+
+class TestRcloneMountSpec:
+    @pytest.mark.asyncio
+    async def test_session_folder_spec_uses_bearer_command_auth(self):
+        be = OpenCloudBackend(_settings())
+        _install_fake(be, FakeOpenCloud())
+        handle = SessionFolderHandle(
+            backend="opencloud",
+            native_id="sessions/thread-1",
+            vendor_meta={"drive_id": "drive-agent-home"},
+        )
+        spec = await be.build_rclone_mount_spec(
+            handle=handle,
+            mount_kind="session_folder",
+            target_path="/cloud/home",
+            access="read_write",
+        )
+        assert spec.source_type == "webdav"
+        assert (
+            spec.source_config["url"]
+            == f"{OPENCLOUD_BASE}/dav/spaces/drive-agent-home/sessions/thread-1/"
+        )
+        assert spec.source_config["vendor"] == "infinitescale"
+        # Bearer flow: no static credential in the rclone source config.
+        assert "pass" not in spec.source_config
+        assert spec.auth["type"] == "keycloak_client_credentials"
+        assert spec.auth["issuer"] == KEYCLOAK_BASE
+        assert spec.auth["client_id"] == "opencloud-orchestrator"
+        assert spec.auth["client_secret"] == "test-secret"
+        assert "token_helper" in spec.required_capabilities
+        assert spec.min_rclone_version == "1.70.0"
+
+    @pytest.mark.asyncio
+    async def test_project_folder_spec_reconstructs_space_url(self):
+        be = OpenCloudBackend(_settings())
+        _install_fake(be, FakeOpenCloud())
+        handle = ProjectFolderHandle(
+            backend="opencloud", native_id="drive-42", vendor_meta={}
+        )
+        spec = await be.build_rclone_mount_spec(
+            handle=handle,
+            mount_kind="project",
+            target_path="/cloud/proj",
+            access="read_write",
+        )
+        assert spec.source_config["url"] == f"{OPENCLOUD_BASE}/dav/spaces/drive-42/"
+        assert spec.auth["type"] == "keycloak_client_credentials"
+
+    @pytest.mark.asyncio
+    async def test_user_home_raises_not_supported(self):
+        be = OpenCloudBackend(_settings())
+        _install_fake(be, FakeOpenCloud())
+        handle = ProjectFolderHandle(
+            backend="opencloud",
+            native_id="personal-drive-1",
+            vendor_meta={"kind": "user_home", "username": "user-1"},
+        )
+        with pytest.raises(CloudBackendError) as exc_info:
+            await be.build_rclone_mount_spec(
+                handle=handle,
+                mount_kind="project_default",
+                target_path="/cloud/home",
+                access="read_write",
+            )
+        assert exc_info.value.kind == CloudBackendErrorKind.NOT_SUPPORTED
+
+    @pytest.mark.asyncio
+    async def test_uninitialized_backend_raises_unavailable(self):
+        be = OpenCloudBackend(_settings())
+        handle = SessionFolderHandle(
+            backend="opencloud", native_id="sessions/t", vendor_meta={}
+        )
+        with pytest.raises(CloudBackendError) as exc_info:
+            await be.build_rclone_mount_spec(
+                handle=handle,
+                mount_kind="session_folder",
+                target_path="/cloud/home",
+                access="read_write",
+            )
+        assert exc_info.value.kind == CloudBackendErrorKind.UNAVAILABLE
+
+    @pytest.mark.asyncio
+    async def test_payload_carries_min_rclone_version(self):
+        be = OpenCloudBackend(_settings())
+        _install_fake(be, FakeOpenCloud())
+        handle = SessionFolderHandle(
+            backend="opencloud",
+            native_id="sessions/thread-1",
+            vendor_meta={"drive_id": "drive-agent-home"},
+        )
+        spec = await be.build_rclone_mount_spec(
+            handle=handle,
+            mount_kind="session_folder",
+            target_path="/cloud/home",
+            access="read_write",
+        )
+        payload = spec.to_payload()
+        assert payload["min_rclone_version"] == "1.70.0"
+        assert payload["source"]["config"]["vendor"] == "infinitescale"
+        assert payload["auth"]["type"] == "keycloak_client_credentials"
 
 
 # -------------------------------------------------------- Token + graph flows

@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from src.services.cloud_mount import RcloneMountManager
+import pytest
+
+import src.services.cloud_mount as cloud_mount_module
+from src.services.cloud_mount import RcloneMountError, RcloneMountManager
+from src.services.keycloak_token import BearerToken
 
 
 class FakeRemoteBackend:
@@ -217,3 +221,186 @@ def test_status_reports_cache_and_rc_stats_without_credentials():
     assert "mounted, cache 1.0 MiB / 20.0 GiB hard limit" in status
     assert 'core/stats: {"bytes":1048576}' in status
     assert manager.mounts[0].rc_pass not in status
+
+
+# ------------------------------------------------------- Keycloak bearer auth
+
+
+def _opencloud_mount_cfg() -> dict:
+    return {
+        "version": 1,
+        "driver": "rclone",
+        "cloud_root": "/cloud",
+        "workspace_entry": "cloud",
+        "mounts": [
+            {
+                "mount_id": "legacy-session",
+                "mount_kind": "session_folder",
+                "target_path": "/cloud/home",
+                "workspace_name": "home",
+                "backend": "opencloud",
+                "source": {
+                    "type": "webdav",
+                    "config": {
+                        "url": "https://oc.test/dav/spaces/drive-1/sessions/t1/",
+                        "vendor": "infinitescale",
+                    },
+                },
+                "auth": {
+                    "type": "keycloak_client_credentials",
+                    "issuer": "https://kc.test/realms/srw",
+                    "client_id": "opencloud-orchestrator",
+                    "client_secret": "kc-secret",
+                },
+                "cache": {"vfs_cache_max_size": "10G", "hard_cache_limit": "20G"},
+                "min_rclone_version": "1.70.0",
+            }
+        ],
+    }
+
+
+class FakeTokenClient:
+    instances: list["FakeTokenClient"] = []
+
+    def __init__(
+        self,
+        *,
+        issuer: str,
+        client_id: str,
+        client_secret: str,
+        target_user_sub: str | None = None,
+        **_: object,
+    ) -> None:
+        self.issuer = issuer
+        self.client_id = client_id
+        self.client_secret = client_secret
+        self.target_user_sub = target_user_sub
+        self.minted = 0
+        self.closed = False
+        self._token_expires_at = 10**9  # far-future monotonic deadline
+        FakeTokenClient.instances.append(self)
+
+    async def get_bearer(self, force_refresh: bool = False) -> BearerToken:
+        self.minted += 1
+        return BearerToken(
+            token=f"tok-{self.minted}", expires_at=self._token_expires_at
+        )
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+@pytest.fixture()
+def fake_token_client(monkeypatch):
+    FakeTokenClient.instances = []
+    monkeypatch.setattr(cloud_mount_module, "KeycloakTokenClient", FakeTokenClient)
+    yield FakeTokenClient
+    FakeTokenClient.instances = []
+
+
+@pytest.mark.asyncio
+async def test_keycloak_mount_uses_bearer_token_command(fake_token_client):
+    backend = FakeRemoteBackend()
+    manager = RcloneMountManager(
+        thread_id="thread-12345678",
+        cloud_cfg=_opencloud_mount_cfg(),
+        workspace_backend=backend,
+        workspace_root=Path("/home/agent-host/workspace"),
+    )
+
+    await manager.start_all()
+    try:
+        script = next(
+            body
+            for path, body in backend.files.items()
+            if path.endswith("mount_srw-thread-1-home.sh")
+        )
+        state = manager.mounts[0]
+        assert state.uses_keycloak_auth is True
+        # rclone remote authenticates via the helper, not a static credential.
+        assert "bearer_token_command" in script
+        assert state.token_helper_path in script
+        assert "tok-1" in script  # initial token seeded into the token file
+        assert f"chmod 600 {state.token_path}" in script
+        assert "pass " not in script.split("config create", 1)[1].split("\n", 1)[0]
+        # The Keycloak client secret must never reach the workspace runtime.
+        for body in backend.files.values():
+            assert "kc-secret" not in body
+        for command, _timeout in backend.commands:
+            assert "kc-secret" not in command
+        # Version preflight gates old runtimes with a clear error.
+        assert "required_ver=1.70.0" in script
+        assert "sort -V" in script
+        # Refresh loop is running for the keycloak mount.
+        assert manager._refresh_task is not None
+        assert fake_token_client.instances[0].minted == 1
+    finally:
+        await manager.aclose()
+
+    assert fake_token_client.instances[0].closed is True
+    assert manager._refresh_task is None
+
+
+@pytest.mark.asyncio
+async def test_keycloak_auth_missing_fields_raises(fake_token_client):
+    cfg = _opencloud_mount_cfg()
+    del cfg["mounts"][0]["auth"]["client_secret"]
+    manager = RcloneMountManager(
+        thread_id="thread-12345678",
+        cloud_cfg=cfg,
+        workspace_backend=FakeRemoteBackend(),
+        workspace_root=Path("/home/agent-host/workspace"),
+    )
+    with pytest.raises(RcloneMountError, match="issuer/client_id/client_secret"):
+        await manager.start_all()
+
+
+def test_mount_script_requires_prepared_token():
+    manager = RcloneMountManager(
+        thread_id="thread-12345678",
+        cloud_cfg=_opencloud_mount_cfg(),
+        workspace_backend=FakeRemoteBackend(),
+        workspace_root=Path("/home/agent-host/workspace"),
+    )
+    # _start_all_sync without the async token prep must refuse keycloak mounts.
+    with pytest.raises(RcloneMountError, match="no initial bearer token"):
+        manager._start_all_sync()
+
+
+def test_push_token_writes_tmp_then_moves_atomically():
+    backend = FakeRemoteBackend()
+    manager = RcloneMountManager(
+        thread_id="thread-12345678",
+        cloud_cfg=_opencloud_mount_cfg(),
+        workspace_backend=backend,
+        workspace_root=Path("/home/agent-host/workspace"),
+    )
+    manager._initial_tokens[0] = "tok-seed"
+    manager._start_all_sync()
+    state = manager.mounts[0]
+
+    manager._push_token_sync(state, "tok-fresh")
+
+    tmp_rel = f"{state.state_rel}/bearer.token.new"
+    assert backend.files[tmp_rel] == "tok-fresh\n"
+    last_command, _timeout = backend.commands[-1]
+    assert "chmod 600" in last_command
+    assert "mv -f" in last_command
+    assert state.token_path in last_command
+
+
+def test_unmount_script_removes_token_files():
+    backend = FakeRemoteBackend()
+    manager = RcloneMountManager(
+        thread_id="thread-12345678",
+        cloud_cfg=_opencloud_mount_cfg(),
+        workspace_backend=backend,
+        workspace_root=Path("/home/agent-host/workspace"),
+    )
+    manager._initial_tokens[0] = "tok-seed"
+    manager._start_all_sync()
+    state = manager.mounts[0]
+
+    script = manager._unmount_script(state)
+
+    assert f"rm -f {state.token_path} {state.token_helper_path}" in script
