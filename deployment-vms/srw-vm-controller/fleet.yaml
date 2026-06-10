@@ -6,7 +6,7 @@ defaultNamespace: agent-vms
 helm:
   releaseName: srw-vm
   chart: "oci://ghcr.io/knaeckebrothero/charts/srw-dev-vm-cluster"
-  version: "0.0.0-dev.sha-383b0a4"
+  version: "0.0.0-dev.sha-7ae23f7"
   takeOwnership: true
   values:
     license:
@@ -49,7 +49,7 @@ helm:
       vmController:
         tag: "sha-ef9facf"
     vmController:
-      defaultVmImage: "ghcr.io/knaeckebrothero/superhuman-remote-worker-agent-vm-base:sha-4830d12"
+      defaultVmImage: "ghcr.io/knaeckebrothero/superhuman-remote-worker-agent-vm-base:sha-7ae23f7"
 dependsOn: []
 # Cluster targeting handled by the dedicated GitRepo
 # (HomeLab/rancher_cluster/fleet-gitrepo-srw-vms.yaml) whose spec.targets
