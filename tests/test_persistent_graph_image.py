@@ -63,8 +63,7 @@ def _make_config(**overrides):
     cfg = MagicMock()
     cfg.llm.timeout = overrides.get("llm_timeout", 600)
     cfg.memory.enabled = overrides.get("memory_enabled", False)
-    cfg.memory.extraction_interval = overrides.get("extraction_interval", 5)
-    cfg.memory.extraction_prompt = overrides.get("extraction_prompt", "")
+    cfg.memory.observer_interval = overrides.get("observer_interval", 5)
     cfg.context_management.max_summary_length = 10000
     return cfg
 
