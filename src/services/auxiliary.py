@@ -163,8 +163,7 @@ class AuxAgentTask(AuxTask):
 class ExtractMemoriesTask(AuxTask):
     """Extract memories from a conversation segment.
 
-    Chain mode task that replaces MemoryObserver.extract_memories().
-    Prompt loaded from config/prompts/ via the prompt matrix.
+    Chain mode task. Prompt loaded from config/prompts/ via the prompt matrix.
     """
 
     def __init__(self, messages: List[BaseMessage], prompt: str, phase: int = 0):
@@ -712,7 +711,7 @@ class AuxiliaryLLM:
 
 
 # =============================================================================
-# Memory extraction helper (replaces MemoryObserver.observe / observe_phase_boundary)
+# Memory extraction helper
 # =============================================================================
 
 # Max messages to include in a single observation window
@@ -730,7 +729,6 @@ async def extract_and_store_memories(
 ) -> int:
     """Extract memories via AuxiliaryLLM and store them in RecallStore.
 
-    Replaces MemoryObserver.observe() and observe_phase_boundary().
     Runs the ExtractMemoriesTask in chain mode and stores each result.
 
     Args:
@@ -869,8 +867,6 @@ def _should_extract_memories(
     last_observed_turn: int,
 ) -> bool:
     """Check if memory extraction should run on this turn.
-
-    Equivalent to MemoryObserver.should_observe().
 
     Args:
         turn_count: Current turn count

@@ -11,16 +11,12 @@ Connection details come from the datasource connector system
 """
 
 import logging
-import re
-from pathlib import Path
 from typing import List, Dict, Any, Optional
 
 from neo4j import GraphDatabase
 from neo4j.exceptions import ServiceUnavailable, AuthError
 
 logger = logging.getLogger(__name__)
-
-QUERIES_DIR = Path(__file__).parent / "queries" / "neo4j"
 
 
 class Neo4jDB:
@@ -63,7 +59,6 @@ class Neo4jDB:
         self._password = password
 
         self.driver = None
-        self._queries: Dict[str, str] = {}  # Cache for loaded queries
 
         logger.info("Neo4jDB initialized (not connected yet)")
 
@@ -170,52 +165,6 @@ class Neo4jDB:
             logger.debug(f"Query: {query}")
             logger.debug(f"Parameters: {parameters}")
             raise
-
-    def _load_query(self, filename: str, query_name: str) -> str:
-        """Load a named Cypher query from a .cypher/.cql file.
-
-        Queries are cached after first load. Query files use the format:
-
-        ```cypher
-        // name: query_name
-        MATCH ...
-        RETURN ...;
-
-        // name: another_query
-        MATCH ...
-        ```
-
-        Args:
-            filename: Cypher file name (e.g., "finius.cypher")
-            query_name: Name of the query to load
-
-        Returns:
-            Cypher query string
-
-        Raises:
-            ValueError: If query not found in file
-        """
-        cache_key = f"{filename}:{query_name}"
-        if cache_key in self._queries:
-            return self._queries[cache_key]
-
-        file_path = QUERIES_DIR / filename
-        if not file_path.exists():
-            raise ValueError(f"Query file not found: {file_path}")
-
-        content = file_path.read_text()
-
-        # Parse named queries: // name: query_name
-        pattern = r"//\s*name:\s*(\w+)\s*\n(.*?)(?=//\s*name:|\Z)"
-        matches = re.findall(pattern, content, re.DOTALL)
-
-        for name, cypher in matches:
-            self._queries[f"{filename}:{name}"] = cypher.strip()
-
-        if cache_key not in self._queries:
-            raise ValueError(f"Query '{query_name}' not found in {filename}")
-
-        return self._queries[cache_key]
 
     def get_schema(self) -> Dict[str, Any]:
         """Retrieve the database schema.
