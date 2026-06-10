@@ -3,7 +3,20 @@
 Companion to `docs/features/postgres_audit_store.md` (the design doc).
 This roadmap sequences the work into 8 phases gated by objective exit
 criteria. Total estimated effort: **17-25 working days** (~3-4 calendar
-weeks for one engineer familiar with the codebase).
+weeks for one engineer familiar with the codebase); **~1-1.5 days less
+if the Compose deprecation lands first** (gate G6).
+
+> **Revision note (2026-06-10)** — re-verified against the current
+> tree alongside the design doc. The two structural changes: (1) the
+> audit DDL ships as a `migrations/audit/` family applied by the
+> existing migration runner, not an `audit_schema.sql` applied by
+> `init.py` (P1 + P5 reworked accordingly); (2) all Compose work is
+> now conditional on gate G6 — `docs/issues/deprecate_docker_compose_stack.md`
+> proposes deleting the Compose stack entirely (~2-2.5 eng-days, 5
+> PRs), and sequencing it first deletes the files P5 would otherwise
+> have to mirror. Validation venue is the local k3d cluster either
+> way. Line refs throughout updated to the 2026-06-10 tree; expect
+> further drift and re-grep at implementation time.
 
 ## Critical path
 
@@ -29,6 +42,7 @@ P5 (infrastructure) can start as soon as P1's schema is finalized
 | G3 | P6 | Performance within 20% of Mongo baseline? | Block cutover if no |
 | G4 | P7 | Wipe test cluster before flip? | Yes (per user authorization) |
 | G5 | P8 | Drop `pymongo` dep entirely? | No — customer datasource tools still need it |
+| G6 | P0 | Land the Compose deprecation first? | Yes — `docs/issues/deprecate_docker_compose_stack.md` deletes the three compose files P5 would otherwise mirror |
 
 ## Rollback strategy
 
@@ -56,6 +70,9 @@ working branch.
 - [ ] G0 decision recorded in this file: `pg_partman` or hand-rolled
 - [ ] G1 decision recorded: `testcontainers[postgres]` confirmed (no
       alternative has precedent in the repo)
+- [ ] G6 decision recorded: sequence the Compose deprecation
+      (`docs/issues/deprecate_docker_compose_stack.md`) before P5, or
+      keep the Compose mirroring in scope
 - [ ] Branch `feature/postgres-audit-store` cut from `develop`
 - [ ] Feature-flag plan documented (env var `AUDIT_BACKEND`, default
       `mongodb`, valid values `mongodb` / `postgres`, location:
@@ -84,20 +101,32 @@ without wrestling scaffolding.
 
 ### Deliverables
 
-- [ ] `orchestrator/database/audit_schema.sql` — DDL per the design
-      doc: 3 partitioned tables, per-table autovacuum settings, LZ4
-      compression, btree + expression indexes, the "no GIN on
-      `agent_audit.payload`" comment
+- [ ] `orchestrator/database/migrations/audit/0001_initial.sql` — DDL
+      per the design doc: 3 partitioned tables, per-table autovacuum
+      settings, LZ4 compression, btree + expression indexes, the "no
+      GIN on `agent_audit.payload`" comment. **(Reworked 2026-06-10:
+      the repo now ships schema as checksum-tracked migrations applied
+      by `orchestrator/database/migrate.py` — see
+      `docs/db_migration.md`. No `audit_schema.sql` snapshot, no
+      init.py application. Later audit-schema changes are new numbered
+      files; `.notx.sql` for `CREATE INDEX CONCURRENTLY`-class ops.)**
+- [ ] Runner wiring: add `MIGRATIONS_AUDIT_DIR` beside the app/vector
+      constants (`orchestrator/database/postgres.py:169-170`) and run
+      the audit family against the audit pool in the orchestrator
+      lifespan (third `run_migrations()` invocation)
 - [ ] If G0 = pg_partman: extension setup + `create_parent` calls in
-      schema; if hand-rolled: `partition_helper.py` with
+      the migration; if hand-rolled: `partition_helper.py` with
       advisory-locked creation, N+2 lookahead, parent ANALYZE,
       `DETACH ... CONCURRENTLY` retention (~60 LoC)
 - [ ] `requirements-dev.txt` (new file) with `testcontainers[postgres]`
 - [ ] `tests/_audit_db_fixture.py` — session-scoped `PostgresContainer`,
-      function-scoped `TRUNCATE` reset, schema bootstrap on container
-      start. Mirrors `tests/_fs_backend.py` "test-only" discipline
-- [ ] `.github/workflows/develop.yml:370` and
-      `.github/workflows/main.yml:173` — install
+      function-scoped `TRUNCATE` reset, migration bootstrap on container
+      start (run the audit family via `run_migrations()` so tests cover
+      the real DDL path). Mirrors `tests/_fs_backend.py` "test-only"
+      discipline
+- [ ] `.github/workflows/develop.yml:469` and
+      `.github/workflows/main.yml:244` (the `uv pip install ... pytest
+      pytest-asyncio` test-deps lines) — install
       `-r requirements-dev.txt`
 - [ ] `orchestrator/database/audit_store.py` — empty `AuditStore`
       class with method stubs that `raise NotImplementedError`,
@@ -208,10 +237,10 @@ internal-use helpers) and prove parity with the Mongo reader.
 - [ ] `get_audit_count(job_id)` — single-row helper
 - [ ] `iter_tool_calls(job_id)` — async iterator that replaces the
       `mongodb._db["agent_audit"]` raw-cursor leak in
-      `graph_routes.py:152`
+      `graph_routes.py:144`
 - [ ] `get_job_stats(job_id)` and `get_audit_stats(job_id)` —
       aggregation SQL translating the four Mongo pipelines
-      (`archiver.py:457, :482, :1018, :1046`)
+      (`archiver.py:510, :530, :1066, :1093`)
 - [ ] **Per-job seq computation** in read methods that need it: use
       `ROW_NUMBER() OVER (PARTITION BY job_id ORDER BY id)` rather
       than a stored `seq` column
@@ -255,18 +284,23 @@ against a local testcontainer or dev DB.
 #### Orchestrator
 
 - [ ] `orchestrator/main.py` — replace `mongodb = MongoDB()` (line
-      162) with `audit = make_audit_store()` (factory dispatches on
-      flag); update all ~50 callsites: 84 (import), 152 (graph_routes
-      import), 162 (init), 2846 (lifespan connect), 2864-2865 (share),
-      3051 (lifespan disconnect), 3261-3287 + 3313-3317 + 14422-14427
-      (3 N+1 enrichers — collapse to single grouped query), 7425/7438
-      (`/audit`), 7461/7468 (`/requests/{id}` — change `doc_id: str`
-      to `id: int`), 7488/7492 (`/audit/timerange`), 7513/7524
-      (`/chat`), 7857/7868 (`/audit/bulk`), 7892/7903 (`/chat/bulk`),
-      7927/7938 (`/graph/bulk`), 7958/7962 (`/version`), 10838/10847
-      (`/llm-requests`)
-- [ ] `orchestrator/graph_routes.py` — `set_mongodb()` →
-      `set_audit_store()`; line 142 raw-cursor leak →
+      237) with `audit = make_audit_store()` (factory dispatches on
+      flag); update all ~50 callsites (re-verified 2026-06-10): 96/227
+      (imports), 237 (init), 3325-3332 (lifespan connect +
+      `ensure_indexes` — the `ensure_indexes` call is simply deleted
+      on the Postgres path; the migration runner owns DDL), 3391
+      (graph_routes share), 3672 (lifespan disconnect), 3933-3936 +
+      3953-3954 + 18740-18742 (3 N+1 enrichers — collapse to single
+      grouped query), 8418/8431 (`/audit`), 8444-8459
+      (`/requests/{doc_id}` — change `doc_id: str` to `id: int`),
+      8487/8491 (`/audit/timerange`), 8514/8525 (`/chat`), 9328/9339
+      (`/audit/bulk`), 9365/9376 (`/chat/bulk`), 9402/9413
+      (`/graph/bulk`), 9434/9438 (`/version`), 14563/14572
+      (`/llm-requests`). Leave the "mongodb" hits that are
+      customer-datasource surface (type enums, test-connection, tool
+      catalogs)
+- [ ] `orchestrator/graph_routes.py` — `set_mongodb()` (line 20) →
+      `set_audit_store()`; line 144 raw-cursor leak →
       `audit.iter_tool_calls(job_id)`
 - [ ] `src/database/__init__.py` and `orchestrator/database/__init__.py`
       — export `AuditStore` alongside `MongoDB` (keep both during flag
@@ -274,17 +308,15 @@ against a local testcontainer or dev DB.
 
 #### MCP + builder
 
-- [ ] `orchestrator/mcp/server.py` lines 246, 270, 348, 1476, 1502,
-      1605-1616 — drop ObjectId-string assumptions in tool descriptions;
-      switch to integer
-- [ ] `orchestrator/mcp/client.py` lines 153, 260, 558, 697, 1448 —
-      same
-- [ ] `orchestrator/services/builder_dispatch.py` lines 106-113,
-      608-616, 664, 994, 1019 — same
-- [ ] `orchestrator/services/builder_tools.py` lines 584, 1063-1072,
-      1615, 1737 — same
-- [ ] `orchestrator/services/formatters.py` lines 222, 461, 573 —
-      drop "MongoDB ObjectId" docstrings, update format helpers
+- [ ] `orchestrator/mcp/server.py:354` and
+      `orchestrator/mcp/client.py:263, :700` — drop ObjectId-string
+      assumptions in tool descriptions; switch to integer.
+      (Re-verified 2026-06-10: these three sites are all that remain —
+      the longer original lists in `server.py`, `client.py`,
+      `builder_dispatch.py`, and `formatters.py` have since been
+      cleaned up independently.)
+- [ ] `orchestrator/services/builder_tools.py:1072` — same (last
+      remaining builder site)
 
 #### Cockpit
 
@@ -327,8 +359,9 @@ against a local testcontainer or dev DB.
 
 ## Phase 5 — Infrastructure (~2-3 days)
 
-**Goal**: stand up `srw-auditdb` in Helm and Compose. Can run partly in
-parallel with P2-P4 since it touches different files.
+**Goal**: stand up `srw-auditdb` in Helm (and Compose, only if G6
+keeps it). Can run partly in parallel with P2-P4 since it touches
+different files.
 
 ### Deliverables
 
@@ -345,37 +378,54 @@ parallel with P2-P4 since it touches different files.
 - [ ] `helm/values.example.yaml` — replace `databases.mongodb`
       external block with `databases.audit`; same in
       `helm/ci/customer-external-values.yaml`
-- [ ] `helm/templates/configmap.yaml:17` — drop `MONGODB_URL` line
-      (creds move to Secret per the existing
-      `DATABASE_URL`/`VECTOR_DB_URL` pattern)
-- [ ] `helm/templates/orchestrator/deployment.yaml:37-41` —
+- [ ] `helm/templates/configmap.yaml:30-31` — drop the `MONGODB_URL`
+      line; add `AUDIT_POSTGRES_{HOST,PORT,DB}` keys mirroring the
+      existing `VECTOR_POSTGRES_*` trio. **(Convention changed since
+      the original draft: Postgres DSNs are component parts assembled
+      in-process by `utils/db_url.build_postgres_url(prefix,
+      fallback_env=...)` — user/password from the Secret, host/port/db
+      from the ConfigMap — not full-URL Secret keys.)**
+- [ ] `helm/templates/orchestrator/deployment.yaml:37-40` —
       `wait-for-mongodb` initContainer → `wait-for-auditdb` against
       `<fullname>-auditdb:5432`
-- [ ] `helm/templates/orchestrator/deployment.yaml:87-91` —
-      `MONGODB_URL` env → `AUDIT_DB_URL` from Secret (`secretKeyRef`,
-      key `AUDIT_DB_URL`)
-- [ ] `helm/templates/agent/deployment.yaml:74-78` — same env-var
-      rename
-- [ ] If MCP deployment template exists with `MONGODB_URL`, same rename
-- [ ] `helm/README.md` lines 202-208 — document new Secret keys
-      (`AUDIT_DB_PASSWORD` for internal mode, `AUDIT_DB_URL` for
-      external mode)
+- [ ] `helm/templates/orchestrator/deployment.yaml:130-134` —
+      `MONGODB_URL` env (`configMapKeyRef`) → five `AUDIT_POSTGRES_*`
+      part envs (user/password via `secretKeyRef`, host/port/db via
+      `configMapKeyRef`), mirroring the `VECTOR_POSTGRES_*` block at
+      `:105-129`
+- [ ] Agent side: **no template change** — `helm/templates/agent/`
+      only holds `pdb.yaml`/`service.yaml` now; dynamic agent pods
+      inherit ConfigMap + Secret via `envFrom`
+      (`orchestrator/services/agent_provisioner.py:1060-1064`), so the
+      new keys flow automatically. Code change instead:
+      `src/core/archiver.py:209` gates archiving on `MONGODB_URL` —
+      switch to `build_postgres_url("AUDIT_POSTGRES",
+      fallback_env="AUDIT_DB_URL")`
+- [ ] MCP deployment (`helm/templates/mcp/deployment.yaml`) — verified
+      2026-06-10: no Mongo env, nothing to do
+- [ ] `helm/README.md` § "Secret schema" (line 192) — document
+      `AUDIT_POSTGRES_USER` / `AUDIT_POSTGRES_PASSWORD` (internal
+      mode) and the `AUDIT_DB_URL` fallback (external mode)
 - [ ] **Stage** mongo-express removal (don't delete yet — keep for
       P6 validation, delete in P8): mark `helm/templates/optional/
-      mongo-express.yaml`, `srw.mongoHost` helper (lines 325-327),
-      `global.hostnames.mongo` (line 47), `helm/templates/cockpit/
-      deployment.yaml:17` `mongoExpressUrl`, `helm/templates/
-      ingress.yaml:11, 278-315` for deletion in P8
+      mongo-express.yaml`, `srw.mongoHost` helper
+      (`_helpers.tpl:408-409`), `srw.mongodbUrl`
+      (`_helpers.tpl:481-487`), `global.hostnames.mongo`
+      (`values.yaml:61`), `mongoExpress.*` (`values.yaml:866-868`),
+      `helm/templates/cockpit/deployment.yaml:17` `mongoExpressUrl`,
+      `helm/templates/ingress.yaml:11, 443-481` for deletion in P8
 
-#### Compose (3 files)
+#### Compose (3 files) — **skip entirely if G6 = deprecation landed**
+
+The migration runner applies the audit DDL at orchestrator startup, so
+no `/docker-entrypoint-initdb.d/` mount is needed in any case — the
+container just needs an empty database.
 
 - [ ] `docker-compose.yaml` — new `postgres-audit` service block
-      (mirror `postgres-keycloak` shape from lines 55-69), with
-      `audit_schema.sql` mounted into `/docker-entrypoint-initdb.d/`;
-      new `postgres_audit_data` volume; orchestrator + agent + mcp
-      `MONGODB_URL` envs (lines 306, 427) → inline-assembled
-      `AUDIT_DB_URL`; `depends_on: mongodb` → `depends_on:
-      postgres-audit`
+      (mirror `postgres-keycloak` shape); new `postgres_audit_data`
+      volume; orchestrator + agent + mcp `MONGODB_URL` envs →
+      `AUDIT_POSTGRES_*` parts (or the `AUDIT_DB_URL` fallback);
+      `depends_on: mongodb` → `depends_on: postgres-audit`
 - [ ] `docker-compose.dev.yaml` — same; add
       `ports: - "${AUDIT_POSTGRES_PORT:-5434}:5432"` to expose for
       local debugging (mirrors pgvector dev port 5433)
@@ -385,32 +435,41 @@ parallel with P2-P4 since it touches different files.
 
 #### init.py / orchestrator/init.py
 
-- [ ] `orchestrator/init.py` — apply `audit_schema.sql` to
-      `srw-auditdb` on startup (mirror existing `schema.sql` and
-      `vector_schema.sql` idiom; idempotent `CREATE TABLE IF NOT
-      EXISTS`)
-- [ ] `orchestrator/init.py` lines 637, 674, 1395, 1423, 1608, 1655 —
-      replace `MONGODB_URL` references with `AUDIT_DB_URL` (audit
-      store path; `DEFAULT_DS_MONGODB_URL` for customer datasources
-      stays)
+- [ ] **No schema application here** — reworked 2026-06-10: the
+      migration runner (P1) owns audit DDL at orchestrator startup.
+      `init.py` keeps only seeding + backup/restore concerns
+- [ ] `orchestrator/init.py` — replace audit-store `MONGODB_URL`
+      references (1487, 1515, 1656, 1703) with the `AUDIT_POSTGRES_*`
+      / `AUDIT_DB_URL` resolution; `DEFAULT_DS_MONGODB_URL` for
+      customer datasources (701, 738) stays
 - [ ] `orchestrator/init.py` and `init.py` — replace `mongodump`/
-      `mongorestore` shell-out with `pg_dump --jobs=N`/`pg_restore`
+      `mongorestore` shell-out (URL parse 1491, dump 1646-1690,
+      restore 1693-1740) with `pg_dump --jobs=N`/`pg_restore`
       (partitioned tables parallelize natively); preserve existing
       CLI surface (`--backup`, `--restore`, etc.)
-- [ ] `init.py` — update or drop `--skip-mongodb` flag; rename to
-      `--skip-audit` if keeping the escape hatch
-- [ ] If pg_partman: ensure the extension is created before applying
-      the schema (one-time `CREATE EXTENSION IF NOT EXISTS pg_partman`)
+- [ ] `init.py` — update or drop `--skip-mongodb` flag (lines 23,
+      129-151, 177, 232-279, 514, 543, 630); rename to `--skip-audit`
+      if keeping the escape hatch. The Mongo index-bootstrap path in
+      `orchestrator/init.py:1576-1593` stays alive through the flag
+      window (Mongo backend must keep working until P7) and is
+      deleted in P8
+- [ ] If pg_partman: ensure the extension is created before the
+      migration runs (`CREATE EXTENSION IF NOT EXISTS pg_partman` as
+      the first statement of `0001_initial.sql`, or a custom image —
+      see Risks)
 
 ### Exit criteria
 
 - `helm template` renders cleanly for all three values shapes
   (internal, external, disabled) — test in P6
-- `podman-compose -f docker-compose.dev.yaml up -d postgres-audit`
-  starts the new container, schema applies, can connect via
-  `psql -h localhost -p 5434`
-- Full dev compose stack with `AUDIT_BACKEND=postgres` runs the
-  init.py bootstrap successfully
+- Local k3d: `helm upgrade srw ./helm -n srw -f
+  deployment/values-local.yaml` brings up `srw-auditdb`, the
+  orchestrator lifespan applies the audit migration family, and
+  `psql` in the pod shows the three partitioned tables
+- *(Only if G6 = Compose kept)* `podman-compose -f
+  docker-compose.dev.yaml up -d postgres-audit` starts the new
+  container and the orchestrator applies migrations against it
+  (`psql -h localhost -p 5434`)
 - Backup/restore round-trip on the new instance produces a usable
   snapshot
 
@@ -423,10 +482,11 @@ parallel with P2-P4 since it touches different files.
   image does NOT include pg_partman. Either switch image to
   `pgpartman/pgpartman:15` (or build a custom image) or fall back to
   hand-rolled. **Reconfirm G0 here** — this is the moment of truth.
-- **`docker-entrypoint-initdb.d` runs only on first volume init**.
-  Subsequent schema changes must come through `init.py`'s idempotent
-  bootstrap, not via re-mounting the file. Make sure
-  `audit_schema.sql` is `CREATE TABLE IF NOT EXISTS`.
+- **Migration ordering on first boot**: the orchestrator must apply
+  the audit migration family before the first archiver write and
+  before serving audit endpoints. The lifespan already sequences
+  app/vector migrations ahead of traffic — wire the audit family into
+  the same block, gated on the audit pool being reachable.
 
 ---
 
@@ -437,9 +497,11 @@ sound before flipping the default.
 
 ### Deliverables
 
-- [ ] **Integration test**: run a full job in dev compose with
-      `AUDIT_BACKEND=postgres`, then with `AUDIT_BACKEND=mongodb`,
-      diff the cockpit's audit pane and the JSON of all 9 endpoints
+- [ ] **Integration test**: run a full job on the local k3d cluster
+      with `AUDIT_BACKEND=postgres`, then with `AUDIT_BACKEND=mongodb`
+      (env override via `deployment/values-local.yaml`; Tilt gives the
+      fast loop), diff the cockpit's audit pane and the JSON of all 9
+      endpoints
       between the two. Differences expected: `id` field type
       (string ObjectId vs int), the second `event_phase='post'` row
       in the Postgres trace (cockpit must collapse to "latest" on
@@ -498,8 +560,9 @@ sound before flipping the default.
 - [ ] Change `AUDIT_BACKEND` default in `orchestrator/main.py` from
       `mongodb` to `postgres`
 - [ ] Update Helm/Compose env defaults to match
-- [ ] Wipe the test cluster (G4): drop the K8s namespace or
-      `podman-compose down -v`; redeploy from scratch
+- [ ] Wipe the test cluster (G4): drop the K8s namespace (locally:
+      `k3d cluster delete srw` + recreate; `podman-compose down -v`
+      only if Compose still exists); redeploy from scratch
 - [ ] Verify a fresh job runs end-to-end on the new default
 - [ ] Verify all 9 endpoints serve correctly under load
 - [ ] Mark Issue C (Mongo unauthenticated) resolved in
@@ -537,21 +600,27 @@ sound before flipping the default.
 ### Deliverables
 
 - [ ] Delete `src/database/mongo_db.py`
-- [ ] Delete `orchestrator/database/mongodb.py`
+- [ ] Delete `orchestrator/database/mongodb.py` (takes
+      `MONGODB_INDEX_DECLARATIONS` + `ensure_indexes()` with it)
+- [ ] Delete the Mongo index-bootstrap path in
+      `orchestrator/init.py:1576-1593` (imports
+      `MONGODB_INDEX_DECLARATIONS` from the deleted module) and the
+      `ensure_indexes` lifespan call in `orchestrator/main.py:3327-3332`
 - [ ] Delete `helm/templates/databases/mongodb.yaml`
-- [ ] Delete `helm/templates/optional/mongo-express.yaml` (or wherever
-      it lives)
-- [ ] Delete `srw.mongodbUrl` helper (`_helpers.tpl:347-353`)
-- [ ] Delete `srw.mongoHost` helper (`_helpers.tpl:325-327`)
-- [ ] Delete `global.hostnames.mongo` from `values.yaml:47`
-- [ ] Delete `databases.mongodb.*` from `values.yaml`,
+- [ ] Delete `helm/templates/optional/mongo-express.yaml`
+- [ ] Delete `srw.mongodbUrl` helper (`_helpers.tpl:481-487`)
+- [ ] Delete `srw.mongoHost` helper (`_helpers.tpl:408-409`)
+- [ ] Delete `global.hostnames.mongo` from `values.yaml:61`
+- [ ] Delete `databases.mongodb.*` (`values.yaml:404-409`) and
+      `mongoExpress.*` (`values.yaml:866-868`) from `values.yaml`,
       `values.example.yaml`, `customer-external-values.yaml`
 - [ ] Delete `helm/templates/cockpit/deployment.yaml:17`
       `mongoExpressUrl` env-init field
-- [ ] Delete `helm/templates/ingress.yaml:11, 278-315` mongo-express
+- [ ] Delete `helm/templates/ingress.yaml:11, 443-481` mongo-express
       block
-- [ ] Drop `mongodb` and `mongo-express` services from all 3 compose
-      files; drop `mongodb_data` volume
+- [ ] *(Only if Compose still exists — G6)* Drop `mongodb` and
+      `mongo-express` services from all 3 compose files; drop
+      `mongodb_data` volume
 - [ ] Drop the `AUDIT_BACKEND=mongodb` branch in
       `orchestrator/main.py`'s factory and the flag itself (it's now
       pinned to `postgres`); delete the corresponding env var
@@ -610,6 +679,12 @@ sound before flipping the default.
 
 **Calendar: 3-4 weeks** assuming normal context-switching, code review
 turnaround, and one engineer.
+
+With G6 = yes (Compose deprecation first), the three-compose-file
+mirroring drops out of P5 and the compose deletions drop out of P8 —
+roughly 1-1.5 days saved, plus one less topology to validate in P6.
+The deprecation itself is a separate ~2-2.5-day effort with
+independent value; it isn't charged to this project.
 
 ## Parallelization map (for two engineers)
 

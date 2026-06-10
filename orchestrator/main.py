@@ -104,6 +104,7 @@ from security.auth import (  # noqa: E402
     resolve_ws_user,
     cleanup_expired_tokens,
     cleanup_expired_sessions,
+    ensure_user_provisioned,
 )
 from security.access import (  # noqa: E402
     is_internal_call,
@@ -2807,6 +2808,13 @@ class AdminUserUpdate(BaseModel):
 
     is_admin: bool | None = None
     can_use_vm: bool | None = None
+    is_approved: bool | None = None
+
+
+class AdminBulkApprove(BaseModel):
+    """Admin-only body for bulk-approving pending users."""
+
+    user_ids: list[str] = Field(..., min_length=1, description="User UUIDs to approve")
 
 
 class McpTokenCreate(BaseModel):
@@ -3355,6 +3363,21 @@ async def lifespan(app: FastAPI):
             )
     except Exception as _e:
         logger.error("Datasource credentials backfill failed: %s", _e)
+
+    # Dev-only: seed a fixed admin MCP token from MCP_DEV_TOKEN so a committed
+    # .mcp.json works out of the box against a local cluster. Only fires when
+    # MCP_DEV_TOKEN is set (unset in prod → no-op, no surprise auto-generated
+    # token). Lives in lifespan (not init.py) for the same reason as the
+    # backfill above — init.py is not reliably invoked at deploy time. Idempotent
+    # and no-ops on a fresh DB with no admin yet; the JIT-provision path in
+    # security/auth.py re-fires it the moment the admin user is first created.
+    if os.environ.get("MCP_DEV_TOKEN", "").strip():
+        try:
+            from init import _seed_admin_mcp_token
+
+            await _seed_admin_mcp_token(postgres_db)
+        except Exception as _e:
+            logger.warning("MCP dev token seed at startup failed (non-fatal): %s", _e)
 
     # Wire the model registry's catalog lookup to the DB. The registry lives
     # in src/core/ and must not import orchestrator/, so the hook is injected
@@ -6051,6 +6074,20 @@ class JobResumeRequest(BaseModel):
     )
 
 
+def _resume_reject_should_requeue(status_code: int) -> bool:
+    """Whether an agent's rejection of a resume POST should re-queue the job for
+    auto-dispatch instead of surfacing a 502.
+
+    A 409 means the agent's DB ``status='ready'`` was stale — its pod is
+    actually non-idle (a zombie that leaked ``_pod_state=WORKING`` on a prior
+    cancel/pause, or an agent still finishing post-completion work) and refused
+    the resume. Re-queuing lets a genuinely-ready agent pick the job up. Any
+    other non-2xx is a real failure → 502. See
+    docs/done/worker_pod_state_zombie_on_cancel.md.
+    """
+    return status_code == 409
+
+
 @app.post("/api/jobs/{job_id}/resume")
 async def resume_job(
     req: Request,
@@ -6086,6 +6123,40 @@ async def resume_job(
                 detail=f"Job cannot be resumed (status: {job['status']}).",
             )
 
+        async def _queue_for_dispatch(message: str) -> dict[str, str]:
+            """Park the job as 'paused' (dispatchable, unassigned) and kick the
+            auto-dispatcher. Used both when no agent is ready and when the
+            picked agent rejects the resume (its DB 'ready' was stale). Stashes
+            feedback into context so it survives until a real agent picks it up.
+            """
+            feedback = request.feedback if request else None
+            if feedback:
+                ctx = job.get("context") or {}
+                if isinstance(ctx, str):
+                    try:
+                        ctx = json.loads(ctx)
+                    except json.JSONDecodeError:
+                        ctx = {}
+                ctx["queued_feedback"] = feedback
+                async with postgres_db.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE jobs SET context = $1::jsonb WHERE id = $2::uuid",
+                        json.dumps(ctx),
+                        job_id,
+                    )
+            async with postgres_db.acquire() as conn:
+                await conn.execute(
+                    "UPDATE jobs SET status = 'paused', assigned_agent_id = NULL, "
+                    "updated_at = CURRENT_TIMESTAMP WHERE id = $1::uuid",
+                    job_id,
+                )
+            logger.info(
+                f"Queued job {job_id} for auto-dispatch (previous status: "
+                f"{job['status']}, feedback: {bool(feedback)})"
+            )
+            _trigger_dispatch()
+            return {"status": "queued", "message": message, "job_id": job_id}
+
         # Determine which agent to use
         # Convert to string since DB returns asyncpg UUID objects
         assigned_agent_id = job.get("assigned_agent_id")
@@ -6105,42 +6176,11 @@ async def resume_job(
         if not agent or agent["status"] in ("offline", "failed", "working"):
             ready_agents = await postgres_db.list_agents(status="ready", limit=1)
             if not ready_agents:
-                # No agent available right now — queue job for auto-dispatch.
-                # Store feedback in context so it's available when dispatched,
-                # set status to 'paused' (dispatchable), and let the dispatcher
-                # pick it up when an agent becomes free.
-                feedback = request.feedback if request else None
-                if feedback:
-                    job_context = job.get("context") or {}
-                    if isinstance(job_context, str):
-                        try:
-                            job_context = json.loads(job_context)
-                        except json.JSONDecodeError:
-                            job_context = {}
-                    job_context["queued_feedback"] = feedback
-                    async with postgres_db.acquire() as conn:
-                        await conn.execute(
-                            "UPDATE jobs SET context = $1::jsonb WHERE id = $2::uuid",
-                            json.dumps(job_context),
-                            job_id,
-                        )
-
-                async with postgres_db.acquire() as conn:
-                    await conn.execute(
-                        "UPDATE jobs SET status = 'paused', assigned_agent_id = NULL, "
-                        "updated_at = CURRENT_TIMESTAMP WHERE id = $1::uuid",
-                        job_id,
-                    )
-                logger.info(
-                    f"No agents available — queued job {job_id} for auto-dispatch "
-                    f"(previous status: {job['status']}, feedback: {bool(feedback)})"
+                # No agent available right now — queue for auto-dispatch and let
+                # the dispatcher pick the job up when an agent becomes free.
+                return await _queue_for_dispatch(
+                    "No agents available, job queued for auto-dispatch"
                 )
-                _trigger_dispatch()
-                return {
-                    "status": "queued",
-                    "message": "No agents available, job queued for auto-dispatch",
-                    "job_id": job_id,
-                }
             agent = ready_agents[0]
             agent_id = str(agent["id"])
             logger.info(f"Auto-selected agent {agent_id} for job resume")
@@ -6235,6 +6275,30 @@ async def resume_job(
             )
 
         if response.status_code not in (200, 202):
+            if _resume_reject_should_requeue(response.status_code):
+                # The agent's DB 'ready' was stale — its pod is non-idle (a
+                # zombie, or still finishing prior work) and rejected the resume
+                # with 409. Demote it out of the ready pool and re-queue instead
+                # of surfacing a 502 to the user. See
+                # docs/done/worker_pod_state_zombie_on_cancel.md.
+                logger.warning(
+                    f"Agent {agent_id} rejected resume for job {job_id} (409, "
+                    f"stale 'ready'); demoting and re-queuing: {response.text}"
+                )
+                try:
+                    async with postgres_db.acquire() as conn:
+                        await conn.execute(
+                            "UPDATE agents SET status = 'working' "
+                            "WHERE id = $1::uuid AND status = 'ready'",
+                            agent_id,
+                        )
+                except Exception as demote_err:
+                    logger.warning(
+                        f"Could not demote stale agent {agent_id}: {demote_err}"
+                    )
+                return await _queue_for_dispatch(
+                    "Agent was not ready, job re-queued for auto-dispatch"
+                )
             raise HTTPException(
                 status_code=502,
                 detail=f"Agent rejected resume request: {response.text}",
@@ -17686,13 +17750,22 @@ async def create_user(body: UserCreate, request: Request) -> dict[str, Any]:
     upsert_user_from_oidc). This endpoint is for admin user management
     and tests.
     """
-    await _require_admin(request)
+    admin = await _require_admin(request)
     try:
         user, project = await postgres_db.create_user_with_default_project(
             display_name=body.display_name,
             avatar_color=body.avatar_color or "#89b4fa",
             email=body.email,
         )
+        # Admin creation *is* approval — admit immediately and stamp the
+        # approving admin so the audit trail and cockpit status are correct.
+        await postgres_db.update_user(
+            user_id=str(user["id"]),
+            is_approved=True,
+            approved_at=datetime.now(timezone.utc),
+            approved_by=str(admin.get("id")),
+        )
+        user["is_approved"] = True
         await _create_gitea_repo_for_project(user, project)
 
         # Create personal WebDAV datasource for the default project.
@@ -17779,8 +17852,12 @@ async def admin_patch_user(
 ) -> dict[str, str]:
     """Toggle privileged user flags (admin-only).
 
-    Accepts partial updates of ``is_admin`` and ``can_use_vm``. Refuses
-    to let an admin clear their own ``is_admin`` flag — lockout prevention.
+    Accepts partial updates of ``is_admin``, ``can_use_vm`` and
+    ``is_approved``. Setting ``is_approved=True`` admits the user and stamps
+    ``approved_at``/``approved_by``; setting it False is suspension — the flag
+    flips off (effective on the user's next request) while ``approved_at`` is
+    kept as history. Refuses to let an admin clear their own ``is_admin``
+    flag — lockout prevention.
     """
     admin = await _require_admin(request)
     if body.is_admin is False and str(admin.get("id")) == user_id:
@@ -17788,14 +17865,58 @@ async def admin_patch_user(
             status_code=400,
             detail="Admins cannot clear their own is_admin flag",
         )
+    approved_at = None
+    approved_by = None
+    if body.is_approved is True:
+        approved_at = datetime.now(timezone.utc)
+        approved_by = str(admin.get("id"))
     success = await postgres_db.update_user(
         user_id=user_id,
         is_admin=body.is_admin,
         can_use_vm=body.can_use_vm,
+        is_approved=body.is_approved,
+        approved_at=approved_at,
+        approved_by=approved_by,
     )
     if not success:
         raise HTTPException(status_code=404, detail=f"User '{user_id}' not found")
+    if body.is_approved is True:
+        # Admission just granted — provision cloud/Gitea from the row. The JIT
+        # ensures are gated on approval and never re-fire for an app-side
+        # approved user, so this is their provisioning path. Idempotent.
+        row = await postgres_db.get_user(user_id)
+        if row:
+            await ensure_user_provisioned(row)
     return {"status": "updated"}
+
+
+@app.post("/api/admin/users/approve")
+async def admin_bulk_approve_users(
+    body: AdminBulkApprove, request: Request
+) -> dict[str, Any]:
+    """Bulk-approve pending users (admin-only).
+
+    Stamps approval on every id that resolves to a real row in a single
+    transaction and reports per-id status. This is the workflow Keycloak's
+    console can't do (no bulk role assignment). Ids that don't match an
+    existing user come back as ``not_found`` rather than failing the batch.
+    """
+    admin = await _require_admin(request)
+    approved_ids = await postgres_db.approve_users(
+        body.user_ids, approved_by=str(admin.get("id"))
+    )
+    # Provision cloud/Gitea for each newly-approved user (idempotent; the JIT
+    # ensures never re-fire for app-side approvals).
+    for uid in approved_ids:
+        row = await postgres_db.get_user(uid)
+        if row:
+            await ensure_user_provisioned(row)
+    approved_set = set(approved_ids)
+    results = [
+        {"id": uid, "status": "approved" if uid in approved_set else "not_found"}
+        for uid in body.user_ids
+    ]
+    return {"approved_count": len(approved_set), "results": results}
 
 
 # =============================================================================
