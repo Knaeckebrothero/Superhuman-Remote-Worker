@@ -1923,6 +1923,12 @@
     }
   },
   "toasts": {
+    "admin": {
+      "userRegistered": "Neuer Benutzer wartet auf Freigabe: {{name}}"
+    },
+    "automations": {
+      "autoDisabled": "Automation '{{name}}' wurde automatisch pausiert"
+    },
     "jobs": {
       "created": "Job erstellt",
       "deleted": "Job gelöscht",
