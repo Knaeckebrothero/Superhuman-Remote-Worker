@@ -999,6 +999,20 @@ spec:
                             -s firstName=OpenCloud -s lastName=Orchestrator -s email=orchestrator@srw.local 2>/dev/null
                         fi
                       fi
+                      # Grant the realm-management `impersonation` role to the
+                      # service account: legacy V1 token-exchange only honors
+                      # `requested_subject` when the calling client may
+                      # impersonate users. Powers user-home (Personal Space)
+                      # mounts for sync (cloud_collaboration_model.md §9
+                      # Phase 2.1) and rclone (rclone_cloud_mount.md Phase 6
+                      # step 3). Idempotent — re-adding an existing mapping
+                      # is a no-op.
+                      if [ -n "$OCID" ]; then
+                        $KC add-roles -r {{ .Values.keycloak.realm }} \
+                          --uusername service-account-opencloud-orchestrator \
+                          --cclientid realm-management --rolename impersonation 2>/dev/null \
+                          || echo "impersonation role grant skipped (already present or realm-management missing)"
+                      fi
                       # Ensure `profile` client scope exists — realm-import only creates
                       # it on first boot, and the explicit clientScopes array in the
                       # realm JSON replaces Keycloak's built-in defaults. Without this,

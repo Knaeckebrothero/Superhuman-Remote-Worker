@@ -933,6 +933,43 @@ Local-k3d-only findings (not code bugs; dev/prod topology unaffected):
   allows via public hairpin), (2) mkcert CA trust or an explicit
   local-only insecure-TLS provider flag for the mount.
 
+### Phase 6 Step 3 — User-Home Impersonation Mounts, Live k3d Validation (2026-06-10)
+
+Implemented and live-verified the same day as step 2:
+
+- `build_rclone_mount_spec` user-home branch now emits
+  `auth.type = "keycloak_user_impersonation"` + `target_user_sub`
+  (from `CloudMountSubject.user_sub`, which the mount-row builder already
+  fills from `thread_mounts.target_user_sub`). Missing sub still raises
+  `NOT_SUPPORTED` → session-folder fallback. No agent-side changes were
+  needed — the mount manager and shared token client already handled the
+  impersonation auth type.
+- **Realm gap closed:** the `opencloud-orchestrator` service account never
+  held the realm-management `impersonation` role, so legacy V1
+  token-exchange with `requested_subject` was rejected realm-wide — the
+  sync path's impersonation mode (cloud_collaboration_model §9 Phase 2.1)
+  was wired in code but could never have worked. The bundled Keycloak
+  setup script now grants it idempotently.
+- **URL fix:** graph create/lookup responses persist the *public* WebDAV
+  URL in `vendor_meta.webdav_url` (e.g. `https://cloud.localhost/...`).
+  The spec builder now always reconstructs `{base_url}/dav/spaces/{id}/`
+  from the internal base for Space handles — mounting the public URL would
+  hairpin all rclone traffic through the public edge (and fails outright
+  on local k3d). Session folders already used the internal base.
+- Live proof (session `9fa5f8a0`): the default project's `project_default`
+  row produced a real rclone mount (mount_id = the thread_mounts row UUID,
+  not `legacy-session`); `/cloud/home` = fuse.rclone of the test user's
+  *personal* drive via the internal URL; a file seeded into the personal
+  Space through an impersonated PUT was listed and read through the
+  agent's mount — only the user-scoped token can access that Space, so
+  this proves the exchange end-to-end. Client secret verified absent from
+  the workspace.
+- Raw-exchange precheck from the orchestrator pod: exchange succeeds after
+  the role grant (900s tokens), `graph /me` identifies the target user.
+  Note: the personal drive only exists after the user's first OpenCloud
+  web login; before that `get_user_home` returns no drive and the row
+  builder falls back — working as designed.
+
 ### Implemented Provider Contract
 
 - Added `CloudMountSubject`, `RcloneMountSpec`, and `SupportsRcloneMount` to the
@@ -1085,10 +1122,11 @@ with rclone, `/home/agent-host/workspace/cloud` linked to `/cloud/home`, and
 - `.cloudignore` is implemented for rclone mounts, but not for the legacy sync
   path from Phase 0.
 - Background indexing and `srw-cloud-search` are not implemented.
-- OpenCloud service-scoped rclone mounts (session/project Spaces) are
-  implemented via the bearer token helper (Phase 6 step 2). User-scoped
-  (personal Space) mounts still need the impersonation slice (Phase 6
-  step 3); until then they take the session-folder fallback.
+- OpenCloud rclone mounts are implemented for session/project Spaces
+  (service token, Phase 6 step 2) and user homes (token-exchange
+  impersonation, Phase 6 step 3) — both live-verified on local k3d.
+  Remaining: the Phase 6 step 4 dev-cluster runbook re-run, which also
+  exercises tus uploads on real public-DNS topology.
 - On local k3d, rclone tus uploads from workspace pods are blocked by the
   workspace NetworkPolicy + mkcert TLS trust (see Phase 6 step 2 findings);
   reads, server-mediated PUTs, and all dev/prod topologies are unaffected.
@@ -1189,12 +1227,17 @@ fallback.
    with `MAIN_CLOUD_BACKEND=opencloud`. User-home rows raise `NOT_SUPPORTED`
    and keep the session-folder fallback — which is now itself rclone-mounted,
    so the full §13 runbook becomes exercisable on dev after this slice alone.
-3. User-home mounts via `keycloak_user_impersonation` token exchange, after
-   the refresh loop has soaked on SRW-owned spaces. Verify the realm has
-   token-exchange enabled (the sync Phase 2 user-home flow already depends
-   on it).
+3. DONE (2026-06-10, same day — see the step 3 delta in §14): user-home
+   mounts via `keycloak_user_impersonation` token exchange, live-verified
+   on local k3d. The realm-management `impersonation` role grant was
+   missing realm-wide and is now part of the bundled Keycloak setup; on
+   externally-managed Keycloak deployments it must be granted to the
+   OpenCloud orchestrator client's service account manually.
 4. Re-run the dev-cluster runbook; §13's "fallback-only" headline flips to a
-   real mount validation.
+   real mount validation, and tus uploads get exercised on real public-DNS
+   topology. Dev prerequisites: the impersonation grant lands with the next
+   Keycloak rollout of the updated chart; note dev sessions then mount the
+   user's real personal Space read-write.
 
 Slice-2 acceptance criteria (beyond the Phase 1 list):
 
