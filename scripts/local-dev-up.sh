@@ -114,6 +114,42 @@ else
   ok "vm-ssh-key Secret created"
 fi
 
+# --- 5. In-cluster DNS for *.localhost ingress hosts -------------------------
+# Pods cannot resolve cloud.localhost / auth.localhost / git.localhost (no
+# DNS exists for .localhost), but several in-cluster flows must reach the
+# ingress hostnames: OpenCloud's ocdav forwards every upload to its public
+# data-gateway URL (https://cloud.localhost/data), rclone tus uploads PATCH
+# the same URL from workspace pods, and OpenCloud's OIDC verifier fetches
+# JWKS from auth.localhost. Map them to Traefik's ClusterIP via the k3s
+# coredns-custom hook so every pod resolves them — supersedes per-pod
+# hostAliases workarounds. Idempotent; the ClusterIP is stable for the life
+# of the cluster (re-run this script after `k3d cluster delete && create`).
+TRAEFIK_IP=$($KCTL -n kube-system get svc traefik -o jsonpath='{.spec.clusterIP}' 2>/dev/null || true)
+if [ -z "$TRAEFIK_IP" ]; then
+  skip "traefik svc not up yet — re-run this script later to install the *.localhost DNS override"
+else
+  log "installing coredns-custom override: *.localhost ingress hosts -> $TRAEFIK_IP"
+  $KCTL apply -f - <<COREDNS_EOF >/dev/null
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: coredns-custom
+  namespace: kube-system
+data:
+  srw-localhost.server: |
+    cloud.localhost auth.localhost git.localhost:53 {
+        hosts {
+            $TRAEFIK_IP cloud.localhost
+            $TRAEFIK_IP auth.localhost
+            $TRAEFIK_IP git.localhost
+            fallthrough
+        }
+    }
+COREDNS_EOF
+  $KCTL -n kube-system rollout restart deploy/coredns >/dev/null
+  ok "coredns-custom override applied (cloud/auth/git.localhost -> $TRAEFIK_IP)"
+fi
+
 # --- Done -------------------------------------------------------------------
 cat <<EOF
 

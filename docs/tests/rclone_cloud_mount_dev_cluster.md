@@ -469,3 +469,63 @@ The dev-cluster smoke passes when all are true:
 - A shell command can read the workspace and mount state.
 - Broad cloud-scan guardrails block or warn as configured.
 - `srw_cloud_status` works without leaking credentials.
+
+---
+
+## 13. Run Results — 2026-06-10, dev cluster (`main` ctx / `superhuman-remote-worker` ns)
+
+Deployed state: orchestrator/agent `sha-383b0a4` → agent rolled to `sha-ea373fd`
+mid-run (see incident below), cockpit `sha-fbce77f`, workspace `sha-4830d12`,
+chart `0.0.0-dev.sha-ea373fd` (helm rev 227). All rclone commits
+(`407662b7`..`4830d122` + v5 fixes via PR #113) verified present in the
+deployed images.
+
+**Headline: dev runs `MAIN_CLOUD_BACKEND=opencloud`, and OpenCloud does not
+implement `SupportsRcloneMount`. The orchestrator therefore never emits a
+`cloud_mount` payload on this deployment — every session takes the documented
+session-folder fallback. The fuse-mount path itself (mount, `.cloudignore`,
+scan-guard active path, `srw_cloud_status` output, cache guard) is NOT
+exercisable on dev as configured; it remains validated only on local
+k3d + bundled Nextcloud (Phase 1 v5 smoke).**
+
+| Criterion | Result |
+|---|---|
+| §2.1 driver/FUSE env (`rclone_mount`, `CLOUD_RCLONE_ALLOW_CONTAINER=true`, `WORKSPACE_FUSE_ENABLED/PRIVILEGED=true`) | PASS |
+| §2.2 workspace image deps (rclone v1.60.1-DEV, fusermount3, /dev/fuse, `/cloud` owned by agent-host) | PASS |
+| §3 Cockpit session Connected + composer, no reload | PASS (×2 sessions) |
+| §3 system-default model injected (not expert YAML) | PASS (`injected system default chat model: gemma-4-moe`) |
+| §4 one agent pod + one workspace pod, no duplicates | PASS (session 1: dedicated `srw-agent-s-*`; session 2: pool attach; prepare race guard fired: "agent pod already provisioning — waiting for binding") |
+| §5 mount state | Fallback as designed: no `cloud_mount`, no symlink/fuse mount, OpenCloud session folder `sessions/<id>` created, sync coordinator started with exactly 1 mount, **no eager home clone** |
+| §6 REST input starts loop | PASS (`POST /input 200` → turn ran) |
+| §6 supervised approval live + durable REST | PASS (`POST .../approve/<approval_id> 200`) |
+| §6 model routing | PASS (chat/aux/embedding → `ai.h4ll.app` dev endpoints) |
+| §7 cloud-scan guard | N/A-as-designed: guard scoped to active cloud mounts; verified inactive in fallback (grep ran, exit 2) |
+| §8 `srw_cloud_status` | N/A-as-designed: tool correctly NOT bound without an active mount |
+| §9 `.cloudignore` | Skipped (requires real mount) |
+| §10 cleanup | PASS (pods deleted + snapshot captured, Gitea repo + OpenCloud session folder deleted, no stale services) |
+
+Incidents and observations:
+
+1. **Mid-run develop deploy killed the live session.** CI deploy commit
+   `e189f683` (agent → `sha-ea373fd`) landed during the test; Fleet synced,
+   Reloader bounced the orchestrator, and the lifecycle reconciler drained all
+   build-sha-drifted agent pods (`drift: 4, drained: 1, skipped_busy: 3`) —
+   including the just-created, *idle but user-attached* session agent. The UI
+   still showed `Connected`; the next input hit `Restoring suspended workspace`,
+   raced the half-deleted workspace pod (409), returned 503, and the session
+   showed "ended". Works-as-designed for drift-drain, but on dev every develop
+   push currently kills live idle sessions. Consider exempting session-bound
+   agents from drift-drain (or rebinding instead of draining).
+2. **`gemma-4-moe` (injected default) failed its first turn**: endpoint
+   returned HTTP 200 with an empty stream → `No generation chunks were
+   returned`. Known flaky homelab backend; retried on `gpt-5.4-mini`
+   successfully via the session-settings model switch.
+3. Minor cosmetics: ended-session header chip falls back to config name
+   (`developer`) instead of model; new-session form once rendered raw i18n key
+   `agentSettings.permissionModes.supervised.description`; developer expert
+   config references unknown tools `browse_website`/`download_from_website`
+   (tool-loading warning in agent log).
+
+To exercise the real mount path on dev infra, either implement OpenCloud
+`SupportsRcloneMount` (token-helper strategy from the feature doc §11) or point
+a dev deployment at a Nextcloud main-cloud backend.

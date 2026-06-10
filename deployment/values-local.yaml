@@ -254,7 +254,10 @@ nextcloud:
 # `k3d cluster delete && create`.
 # -----------------------------------------------------------------------------
 opencloud:
-  enabled: false
+  # TEMP 2026-06-10: enabled for OpenCloud rclone-mount slice-1 validation
+  # (feature doc Phase 6). configmap precedence picks opencloud over the
+  # still-enabled nextcloud block. Flip back to false to restore nextcloud.
+  enabled: true
   dataStorageSize: "64Gi"
   oidcInsecureTls: true
   hostAliases:

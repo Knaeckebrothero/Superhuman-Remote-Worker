@@ -15,9 +15,12 @@ import os
 import re
 import secrets
 import shlex
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from ..keycloak_token import KeycloakTokenClient
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +51,18 @@ _DEFAULT_CACHE = {
     "vfs_read_chunk_size_limit": "128M",
     "hard_cache_limit": "20G",
 }
+
+# Bearer-token auth types resolved through the shared Keycloak token client
+# (OpenCloud). The orchestrator never sends a static credential for these —
+# the agent process mints short-lived tokens and pushes them to the
+# workspace runtime, where rclone reads them via ``bearer_token_command``.
+_KEYCLOAK_AUTH_TYPES = {
+    "keycloak_client_credentials",
+    "keycloak_user_impersonation",
+}
+# Re-push tokens this long before expiry; never spin faster than the floor.
+_TOKEN_REFRESH_SAFETY_SECONDS = 60.0
+_TOKEN_REFRESH_MIN_INTERVAL_SECONDS = 30.0
 
 _SIZE_UNITS = {
     "": 1,
@@ -115,6 +130,12 @@ class RcloneMountState:
     rc_pass: str
     hard_cache_limit: str
     hard_cache_limit_bytes: int
+    # Home-relative twin of state_dir, for write_home_file pushes.
+    state_rel: str = ""
+    # Bearer-token plumbing (Keycloak auth modes only).
+    token_path: str = ""
+    token_helper_path: str = ""
+    uses_keycloak_auth: bool = False
 
 
 @dataclass(frozen=True)
@@ -149,6 +170,12 @@ class RcloneMountManager:
         remote_root = getattr(workspace_backend, "root", None)
         self.workspace_root = str(remote_root or workspace_root)
         self._states: list[RcloneMountState] = []
+        # Keycloak bearer plumbing, keyed by mount index in cloud_cfg order
+        # (same enumerate order as _start_all_sync, which is all-or-nothing,
+        # so self._states[i] corresponds to mount index i).
+        self._token_clients: dict[int, KeycloakTokenClient] = {}
+        self._initial_tokens: dict[int, str] = {}
+        self._refresh_task: asyncio.Task | None = None
 
     @property
     def active(self) -> bool:
@@ -225,12 +252,151 @@ class RcloneMountManager:
         return "\n".join(lines)
 
     async def start_all(self) -> None:
+        await self._prepare_keycloak_tokens()
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self._start_all_sync)
+        try:
+            await loop.run_in_executor(None, self._start_all_sync)
+        except Exception:
+            await self._aclose_token_clients()
+            raise
+        self._start_token_refresh()
 
     async def aclose(self) -> None:
+        if self._refresh_task is not None:
+            self._refresh_task.cancel()
+            try:
+                await self._refresh_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.debug("cloud mount token refresh task exit", exc_info=True)
+            self._refresh_task = None
+        await self._aclose_token_clients()
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, self._close_sync)
+
+    # ------------------------------------------------------- Keycloak bearers
+
+    async def _prepare_keycloak_tokens(self) -> None:
+        """Mint initial bearer tokens for Keycloak-auth mounts.
+
+        Runs in the agent's event loop *before* the blocking mount setup so
+        the generated mount scripts can seed the workspace-side token file.
+        The client secret never leaves the agent process — only the
+        short-lived access token is shipped to the workspace runtime.
+        """
+        for index, mount in enumerate(self.cloud_cfg.get("mounts") or []):
+            auth = mount.get("auth") or {}
+            if auth.get("type") not in _KEYCLOAK_AUTH_TYPES:
+                continue
+            issuer = str(auth.get("issuer") or "")
+            client_id = str(auth.get("client_id") or "")
+            client_secret = str(auth.get("client_secret") or "")
+            if not (issuer and client_id and client_secret):
+                raise RcloneMountError(
+                    f"mount {mount.get('mount_id') or index}: keycloak auth "
+                    "payload is missing issuer/client_id/client_secret"
+                )
+            client = KeycloakTokenClient(
+                issuer=issuer,
+                client_id=client_id,
+                client_secret=client_secret,
+                target_user_sub=str(auth.get("target_user_sub") or "") or None,
+            )
+            try:
+                bearer = await client.get_bearer()
+            except Exception as exc:
+                await client.aclose()
+                await self._aclose_token_clients()
+                raise RcloneMountError(
+                    f"mount {mount.get('mount_id') or index}: could not mint "
+                    f"initial bearer token: {exc}"
+                ) from exc
+            self._token_clients[index] = client
+            self._initial_tokens[index] = bearer.token
+
+    async def _aclose_token_clients(self) -> None:
+        for client in self._token_clients.values():
+            try:
+                await client.aclose()
+            except Exception:
+                pass
+        self._token_clients.clear()
+        self._initial_tokens.clear()
+
+    def _start_token_refresh(self) -> None:
+        if not self._token_clients or self._refresh_task is not None:
+            return
+        self._refresh_task = asyncio.create_task(
+            self._token_refresh_loop(),
+            name=f"cloud-mount-token-refresh-{self.thread_id[:8]}",
+        )
+
+    def _next_refresh_delay(self) -> float:
+        ttls = []
+        for client in self._token_clients.values():
+            # Same monotonic clock the token client stamps expiry with.
+            expires_at = getattr(client, "_token_expires_at", 0.0)
+            ttls.append(max(0.0, expires_at - time.monotonic()))
+        if not ttls:
+            return _TOKEN_REFRESH_MIN_INTERVAL_SECONDS
+        return max(
+            _TOKEN_REFRESH_MIN_INTERVAL_SECONDS,
+            min(ttls) - _TOKEN_REFRESH_SAFETY_SECONDS,
+        )
+
+    async def _token_refresh_loop(self) -> None:
+        """Re-mint and push bearer tokens before they expire.
+
+        rclone re-runs ``bearer_token_command`` when a request 401s, so a
+        push that lands late self-heals on the next remote call. Failures
+        here are logged and retried — never fatal to the session.
+        """
+        loop = asyncio.get_running_loop()
+        delay = self._next_refresh_delay()
+        while True:
+            try:
+                await asyncio.sleep(delay)
+                for index, client in self._token_clients.items():
+                    state = self._state_for_index(index)
+                    if state is None or not state.uses_keycloak_auth:
+                        continue
+                    bearer = await client.get_bearer(force_refresh=True)
+                    await loop.run_in_executor(
+                        None, self._push_token_sync, state, bearer.token
+                    )
+                delay = self._next_refresh_delay()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning(
+                    "cloud mount token refresh failed (thread=%s); retrying in %ss",
+                    self.thread_id,
+                    _TOKEN_REFRESH_MIN_INTERVAL_SECONDS,
+                    exc_info=True,
+                )
+                delay = _TOKEN_REFRESH_MIN_INTERVAL_SECONDS
+
+    def _state_for_index(self, index: int) -> RcloneMountState | None:
+        if 0 <= index < len(self._states):
+            return self._states[index]
+        return None
+
+    def _push_token_sync(self, state: RcloneMountState, token: str) -> None:
+        """Atomically replace the workspace-side token file.
+
+        Written to a sibling tmp path first, then ``mv``-ed over the live
+        file so rclone's helper never reads a half-written token. chmod is
+        re-applied because the tmp file is created with default SFTP mode.
+        """
+        tmp_rel = f"{state.state_rel}/bearer.token.new"
+        self.workspace_backend.write_home_file(tmp_rel, token + "\n")
+        tmp_abs = self.workspace_backend.resolve_home_path(tmp_rel)
+        self.workspace_backend.exec_command(
+            f"chmod 600 {shlex.quote(tmp_abs)} && "
+            f"mv -f {shlex.quote(tmp_abs)} {shlex.quote(state.token_path)}",
+            timeout=15,
+        )
 
     def _start_all_sync(self) -> None:
         if self.cloud_cfg.get("driver") != "rclone":
@@ -247,7 +413,9 @@ class RcloneMountManager:
         states: list[RcloneMountState] = []
         for index, mount in enumerate(self.cloud_cfg.get("mounts") or []):
             state = self._state_for_mount(mount, index)
-            script = self._mount_script(mount, state)
+            script = self._mount_script(
+                mount, state, initial_token=self._initial_tokens.get(index)
+            )
             self._run_remote_script(f"mount_{state.remote_name}.sh", script, timeout=90)
             states.append(state)
             logger.info(
@@ -284,6 +452,7 @@ class RcloneMountManager:
             )
             % 10000
         )
+        auth_type = str((mount.get("auth") or {}).get("type") or "")
         return RcloneMountState(
             mount_id=mount_id,
             mount_kind=str(mount.get("mount_kind") or "cloud"),
@@ -300,17 +469,43 @@ class RcloneMountManager:
             rc_pass=secrets.token_urlsafe(24),
             hard_cache_limit=hard_cache_limit,
             hard_cache_limit_bytes=hard_cache_limit_bytes,
+            state_rel=state_rel,
+            token_path=f"{state_dir}/bearer.token",
+            token_helper_path=f"{state_dir}/bearer-helper.sh",
+            uses_keycloak_auth=auth_type in _KEYCLOAK_AUTH_TYPES,
         )
 
-    def _mount_script(self, mount: dict[str, Any], state: RcloneMountState) -> str:
+    def _mount_script(
+        self,
+        mount: dict[str, Any],
+        state: RcloneMountState,
+        *,
+        initial_token: str | None = None,
+    ) -> str:
         source = mount.get("source") or {}
         source_type = str(source.get("type") or "")
         source_config = dict(source.get("config") or {})
         auth = mount.get("auth") or {}
+        token_setup_block = ":"
         if auth.get("type") == "basic" and auth.get("password"):
             source_config["pass"] = auth["password"]
+        elif auth.get("type") in _KEYCLOAK_AUTH_TYPES:
+            if not initial_token:
+                raise RcloneMountError(
+                    f"mount {state.mount_id}: no initial bearer token prepared "
+                    "for keycloak auth"
+                )
+            # rclone executes this helper to obtain (and on 401, re-obtain)
+            # the bearer; the agent-side refresh loop keeps the token file
+            # it reads fresh.
+            source_config["bearer_token_command"] = state.token_helper_path
+            token_setup_block = self._token_setup_block(state, initial_token)
         if not source_type or not source_config:
             raise RcloneMountError(f"mount {state.mount_id} has no rclone source")
+        min_rclone_version = str(mount.get("min_rclone_version") or "").strip()
+        version_check_block = (
+            self._version_check_block(min_rclone_version) if min_rclone_version else ":"
+        )
 
         create_args = [
             "rclone",
@@ -379,11 +574,13 @@ umask 077
 trap 'rc=$?; echo "{_FAILED} rc=${{rc}}"; exit "${{rc}}"' ERR
 
 command -v rclone >/dev/null
+{version_check_block}
 mkdir -p {shlex.quote(state.state_dir)} {shlex.quote(state.cache_dir)}
 if ! mkdir -p {shlex.quote(target_parent)} {shlex.quote(state.target_path)} 2>/dev/null; then
   sudo mkdir -p {shlex.quote(target_parent)} {shlex.quote(state.target_path)}
   sudo chown "$(id -u):$(id -g)" /cloud {shlex.quote(target_parent)} {shlex.quote(state.target_path)}
 fi
+{token_setup_block}
 
 if mountpoint -q {shlex.quote(state.target_path)}; then
   fusermount3 -u {shlex.quote(state.target_path)} 2>/dev/null || fusermount -u {shlex.quote(state.target_path)} 2>/dev/null || true
@@ -522,6 +719,7 @@ if [ -s {shlex.quote(state.pid_file)} ]; then
     kill -9 "${{pid}}" 2>/dev/null
   fi
 fi
+rm -f {shlex.quote(state.token_path)} {shlex.quote(state.token_helper_path)}
 echo "{_OK}"
 """
 
@@ -694,6 +892,53 @@ echo "{_OK}"
     @staticmethod
     def _bash_array(name: str, args: list[str]) -> str:
         return f"{name}=(" + " ".join(shlex.quote(arg) for arg in args) + ")"
+
+    def _token_setup_block(self, state: RcloneMountState, token: str) -> str:
+        """Seed the workspace-side bearer token file + read-only helper.
+
+        The helper only ever ``cat``s the token file; minting/refreshing
+        stays in the agent process. Created before ``rclone config create``
+        because the first remote call (the ``.cloudignore`` fetch) already
+        needs the bearer.
+        """
+        helper_script = (
+            "#!/usr/bin/env bash\n" + f"exec cat {shlex.quote(state.token_path)}\n"
+        )
+        return "\n".join(
+            [
+                self._write_text_file_block(state.token_path, token),
+                f"chmod 600 {shlex.quote(state.token_path)}",
+                self._write_text_file_block(state.token_helper_path, helper_script),
+                f"chmod 700 {shlex.quote(state.token_helper_path)}",
+            ]
+        )
+
+    @staticmethod
+    def _version_check_block(min_version: str) -> str:
+        """Fail fast with a clear message on too-old workspace rclone.
+
+        A mount failure here does not renegotiate the orchestrator's
+        fallback decision, so silent vendor misbehavior on an old rclone
+        would be confusing — better to name the version gap outright.
+        """
+        return "\n".join(
+            [
+                f"required_ver={shlex.quote(min_version)}",
+                'have_ver="$(rclone version 2>/dev/null'
+                " | sed -nE '1s/^rclone v([0-9]+(\\.[0-9]+)*).*/\\1/p')\"",
+                'if [ -z "${have_ver}" ]; then',
+                '  echo "cannot determine rclone version on the workspace runtime" >&2',
+                "  exit 1",
+                "fi",
+                'if [ "$(printf \'%s\\n%s\\n\' "${required_ver}" "${have_ver}"'
+                ' | sort -V | head -n1)" != "${required_ver}" ]; then',
+                '  echo "rclone ${have_ver} on the workspace runtime is older than'
+                " ${required_ver} required by this cloud mount -"
+                ' update the workspace image" >&2',
+                "  exit 1",
+                "fi",
+            ]
+        )
 
     @staticmethod
     def _write_text_file_block(path: str, content: str) -> str:

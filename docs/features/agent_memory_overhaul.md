@@ -28,9 +28,28 @@ related:
 > assembles the right memories for every LLM call — the model is a *consumer*, never the
 > manager. Build the seam first; everything else becomes a plugin behind it.
 
-**Status:** Design v2 / not started — restructured 2026-06-10 around the MemoryManager
-abstraction after design alignment (v1 of 2026-06-07 was phase-first; superseded, phases
-preserved below in new order). Next step: align acceptance criteria for Phase 1.
+**Status:** Design v2 / **step 0 implemented, Phase 1 not started** — restructured
+2026-06-10 around the MemoryManager abstraction after design alignment (v1 of
+2026-06-07 was phase-first; superseded, phases preserved below in new order).
+
+**Implementation log:**
+- **2026-06-10 — Step 0 (ground-clearing) merged to develop** as #111 + #112:
+  - **B1 fixed** (#111): persistent extraction repaired — matrix-resolved prompt
+    threaded from session setup into the loop + both teardown sites, real
+    `observer_interval` cadence, re-resolution on `config.update`; 10 regression
+    tests against the real `MemoryConfig` (`tests/test_persistent_memory_extraction.py`).
+  - **B2 verified**: **zero HNSW indexes on dev AND prod** (pgvector 0.8.2) —
+    all dense retrieval is a seq scan today; halfvec expression-index fix viable,
+    not yet implemented. `ef_search` tuning (Phase 3) is gated on that migration.
+  - **Dead-code sweep + B9 + B3 honesty** (#112, ~2,300 lines): memory_observer,
+    memory_migrator, dead search helpers, `_load_query`, their tests; dead
+    `MemoryConfig` knobs deleted from code + both YAMLs; persistent
+    `assemble_memories.enabled: false` (config no longer lies).
+- **Next: local/dev verification of the B1 fix on a real session** (the three
+  never-before-observable signals — in-loop extraction at the configured
+  interval, `/done` teardown extraction, idle-archive extraction; see
+  `memory_bugs.md` B1 status) — then Phase 1, starting with acceptance-criteria
+  alignment.
 **Companions:**
 - [`agent_memory_current_state.md`](agent_memory_current_state.md) — ground truth: every
   current capability classified wired/dead/conceptual with `file:line` evidence.
@@ -254,12 +273,12 @@ Ground truth with evidence: [`agent_memory_current_state.md`](agent_memory_curre
 | `RecallStore.retrieve()` two-tier: TTL-pinned tier = **whole non-expired set, relevance-blind, no LIMIT** (`recall_store.py:670`) + hybrid top-150 | always-inject = explicit **policy flag on few memories** (bounded); everything else earns injection through scoring + gate |
 | KB block: hardcoded 5 notes, **no token cap** (`graph.py:971`, `persistent_graph.py:594`) | KB = one bucket on the shared plane; one budget |
 | Query = top-todo+phase (worker) / last user msg (persistent) | unified **request digest** (recent window + task frame), §4 |
-| Observer every 5 turns + phase boundary; persistent: empty prompt + locked cadence (**B1**) | `capture()` events; boundary-driven extraction with turn fallback |
+| Observer every 5 turns + phase boundary; persistent: ~~empty prompt + locked cadence~~ (**B1 — fixed 2026-06-10**, persistent now at worker parity for extraction) | `capture()` events; boundary-driven extraction with turn fallback |
 | Assembler TTL boost/deprecate, **worker-only** (B3) | curation writer behind the seam, both paths, flag-controlled — and an explicit **ablation candidate** (P5) |
 | Dedup = cosine≥0.85 merge-on-write (`recall_store.py:356`) | ingestion verdict: top-K → aux-LLM ADD/UPDATE/MERGE/NOOP |
 | Trigger phrases (`retrieval_messages`, embedded, UNIONed in dense channel) — **our original idea, already wired** | kept and extended: the anticipatory channel gets a matching upgraded query side |
 | Neo4j: write-mostly, never read on hot path; edges ~empty (curator default-off) | graph retrieval = optional **plugin**; pgvector self-sufficient (fixes B8 coupling); keep/cut verdict in Phase 7 |
-| `MemoryConfig` knobs, several dead (B9) | `memory.*` config maps 1:1 to manager components; dead knobs deleted |
+| `MemoryConfig` knobs, several dead (B9 — **dead knobs deleted 2026-06-10**) | `memory.*` config maps 1:1 to manager components |
 | Grow-only table, no GC (B6) | GC writer + retention policy |
 
 ---
@@ -350,8 +369,10 @@ extension list and loses nothing.
 Phases 1–2 are **the commitment** (foundation + instrument). Phases 3+ are
 evidence-driven: each lands behind a `memory.*` flag, defaults to current behaviour, and
 flips only on a green harness delta (P5). Bug track B1–B10
-([`memory_bugs.md`](../issues/memory_bugs.md)) proceeds independently — B1 (1 h) and the
-B2 live-DB check (5 min) shouldn't wait for any of this.
+([`memory_bugs.md`](../issues/memory_bugs.md)) proceeds independently — **step 0 done
+2026-06-10**: B1 fixed, B2 verified-confirmed (halfvec migration now the open item),
+B3-honesty + B9 + vestigial-code sweep shipped. Next bug-track items: B1 live
+verification, then B4; B2's halfvec migration must land before Phase 3 tunes `ef_search`.
 
 ### Phase 1 — The foundation: MemoryManager seam · ~1–1.5 wk ← **start here**
 Extract all assembly + capture logic from `graph.py` / `persistent_graph.py` /
@@ -363,12 +384,15 @@ budgets, same injection messages) — a strangler refactor, not an improvement. 
 behaviour as the sole registered pipeline — the kernel arrives first, drivers follow.
 
 By construction this also:
-- **fixes B1** — persistent inherits the worker's prompt-matrix loading
-  (`load_auxiliary_prompt(config, "memory_extraction", …)`, `graph.py:3578`) and the real
-  `observer_interval`; the never-functional session-end/idle-archive extraction becomes a
-  working `capture(kind="session_end"|"idle_archive")`;
+- **absorbs the B1 fix** — B1 was fixed standalone 2026-06-10 (matrix prompt resolved at
+  session setup + threaded into loop and teardown sites, real `observer_interval`), so
+  Phase 1 transplants a *working* baseline; the session-end/idle-archive call sites
+  become `capture(kind="session_end"|"idle_archive")`, and the B1 regression suite
+  (`tests/test_persistent_memory_extraction.py`, pinned against the real `MemoryConfig`)
+  doubles as Phase-1 equivalence collateral;
 - **makes B3 truthful** — the assembler/curation writer is callable from both paths,
-  flag-controlled (wired to parity; whether it *survives* is Phase 5's ablation);
+  flag-controlled (config honesty-fixed to `enabled: false` on persistent 2026-06-10;
+  whether it *survives* is Phase 5's ablation);
 - unifies query formation (request digest: recent window + task frame) — *flagged*, since
   it's a behaviour change: `memory.query.digest` default off until Phase 2 measures it;
 - gives `AssembleStats` from day one (telemetry + future training data).
@@ -462,9 +486,10 @@ memory panel fed by `AssembleStats` provenance (optional stretch).
   included), `memory.extraction.trigger` (`turns|boundary`), `memory.bitemporal.enabled`,
   `memory.gc.{enabled,retention_days}`, `memory.buckets.*` (Phase 6),
   `memory.hnsw.ef_search`.
-- Delete the dead knobs (B9: `dense/sparse/recent_results`, `observer_model`,
-  `observer_base_url`, `embedding_model`, `storage`) during Phase 1 — don't carry lies
-  into the new interface.
+- ~~Delete the dead knobs (B9)~~ — **done 2026-06-10** (`dense/sparse/recent_results`,
+  `observer_model`, `observer_base_url`, `embedding_model`, `storage` removed from
+  `MemoryConfig`, the parser, and both defaults YAMLs); the new interface starts from an
+  honest config surface.
 - Every flag defaults to current behaviour; flip per-expert via `$extends` after green
   harness runs. Migrations as numbered files under `migrations/vector/` (`.notx.sql` for
   `CREATE INDEX CONCURRENTLY`); never edit the frozen `vector_schema.sql`.
