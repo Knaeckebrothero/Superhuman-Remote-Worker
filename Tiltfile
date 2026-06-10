@@ -246,6 +246,27 @@ docker_build(
 )
 
 # -----------------------------------------------------------------------------
+# Workspace — dynamically-created SSH/code-server workspaces. These pods are
+# spawned by the orchestrator, so Helm must receive the Tilt-built image tag via
+# image_keys just like the agent image.
+# -----------------------------------------------------------------------------
+docker_build(
+    'srw-workspace',
+    context='.',
+    dockerfile='docker/Dockerfile.workspace',
+    only=[
+        'docker/Dockerfile.workspace',
+        'docker/workspace-entrypoint.sh',
+        'docker/browser-exec',
+    ],
+    ignore=[
+        '.git/',
+        '.playwright-mcp/',
+        '.tilt-state/',
+    ],
+)
+
+# -----------------------------------------------------------------------------
 # Helm chart — same chart as production. Values stack (last wins):
 #   1. helm/values.yaml                      chart defaults
 #   2. deployment/values-local.yaml          gitignored — dev secrets +
@@ -255,8 +276,8 @@ docker_build(
 #                                            IfNotPresent + prewarm disabled +
 #                                            cockpit envJs mountPath redirect
 #
-# image_keys auto-substitutes the Tilt-built images for all four
-# components — Slice 4 closed the gap for MCP.
+# image_keys auto-substitutes the Tilt-built images for all runtime components,
+# including the dynamically-spawned workspace image.
 # -----------------------------------------------------------------------------
 helm_resource(
     'srw',
@@ -266,11 +287,18 @@ helm_resource(
         '--values=deployment/values-local.yaml',
         '--values=deployment/values-tilt.yaml',
     ],
-    image_deps=['srw-orchestrator', 'srw-cockpit', 'srw-agent', 'srw-mcp'],
+    image_deps=[
+        'srw-orchestrator',
+        'srw-cockpit',
+        'srw-agent',
+        'srw-mcp',
+        'srw-workspace',
+    ],
     image_keys=[
         ('image.orchestrator.repository', 'image.orchestrator.tag'),
         ('image.cockpit.repository', 'image.cockpit.tag'),
         ('image.agent.repository', 'image.agent.tag'),
         ('image.mcp.repository', 'image.mcp.tag'),
+        ('image.workspace.repository', 'image.workspace.tag'),
     ],
 )

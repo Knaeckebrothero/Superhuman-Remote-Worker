@@ -695,6 +695,25 @@ describe('PersistentChatService — SSE event dispatch', () => {
         });
     });
 
+    it('keeps approval_id from permission.request for durable approval', async () => {
+        const {service, es} = await setup();
+        fireSseMessage(es, {
+            method: 'permission.request',
+            params: {
+                id: 'tc-1',
+                approval_id: 'approval-1',
+                tool: 'run_command',
+                args: {cmd: 'ls'},
+            },
+        }, '1:1');
+        expect(service.pendingPermission()).toEqual({
+            id: 'tc-1',
+            approvalId: 'approval-1',
+            tool: 'run_command',
+            args: {cmd: 'ls'},
+        });
+    });
+
     it('promotes ready event to sessionReady=true and flushes a pending message', async () => {
         const {service, es, mockHttp} = await setup();
         // Stuff a pending message as if user typed while session wasn't ready.
@@ -1271,6 +1290,48 @@ describe('PersistentChatService — control WS (slash commands + permissions)', 
         expect(ctx.service.pendingPermission()).toBeNull();
     });
 
+    it('approve() resolves durable approval requests through REST', async () => {
+        const ctx = await readySession();
+        ctx.mockHttp.post.mockClear();
+        ctx.wsInstances[0].send.mockClear();
+        (ctx.service as any).pendingPermission.set({
+            id: 'tc-rest',
+            approvalId: 'approval-1',
+            tool: 'run_command',
+            args: {},
+        });
+
+        ctx.service.approve();
+
+        expect(ctx.mockHttp.post).toHaveBeenCalledWith(
+            expect.stringContaining('/persistent/threads/thread-c/approve/approval-1'),
+            {decision: 'approve'},
+        );
+        expect(ctx.wsInstances[0].send).not.toHaveBeenCalled();
+        expect(ctx.service.pendingPermission()).toBeNull();
+    });
+
+    it('deny() resolves durable approval requests through REST', async () => {
+        const ctx = await readySession();
+        ctx.mockHttp.post.mockClear();
+        ctx.wsInstances[0].send.mockClear();
+        (ctx.service as any).pendingPermission.set({
+            id: 'tc-deny-rest',
+            approvalId: 'approval-2',
+            tool: 'run_command',
+            args: {},
+        });
+
+        ctx.service.deny();
+
+        expect(ctx.mockHttp.post).toHaveBeenCalledWith(
+            expect.stringContaining('/persistent/threads/thread-c/approve/approval-2'),
+            {decision: 'deny'},
+        );
+        expect(ctx.wsInstances[0].send).not.toHaveBeenCalled();
+        expect(ctx.service.pendingPermission()).toBeNull();
+    });
+
     it('deny() sends {method: "deny"} and seeds the denied tool call in the active turn', async () => {
         const ctx = await readySession();
         // Real permission.request always fires inside a turn — set that up.
@@ -1514,6 +1575,7 @@ describe('PersistentChatService — direct session WS (prepare + connection)', (
         // WebSocket was opened at the URL returned by /connection.
         expect(ctx.wsInstances).toHaveLength(1);
         expect(ctx.wsInstances[0].url).toBe('wss://api.example.com/p/t1/ws?t=tok-warm');
+        expect(ctx.service.sessionReady()).toBe(true);
     });
 
     it('cold start (425 → prepare → poll /connection until ready): WS opens at final ws_url', async () => {
@@ -1562,6 +1624,7 @@ describe('PersistentChatService — direct session WS (prepare + connection)', (
         );
         expect(sessionWs).toBeDefined();
         expect(sessionWs.url).toBe('wss://api.example.com/p/t2/ws?t=tok-cold');
+        expect(ctx.service.sessionReady()).toBe(true);
 
         // No transient SSE on /notifications/events is opened — phase
         // signals come from the always-on NotificationService feed (owned
@@ -1591,6 +1654,8 @@ describe('PersistentChatService — direct session WS (prepare + connection)', (
         // The constructor effect filters on threadId() — confirm the
         // active thread matches before firing events.
         expect(ctx.service.threadId()).toBe('t-life');
+        ctx.service.sessionReady.set(false);
+        ctx.service.startupPhase.set(null);
 
         ctx.notifications.lifecycleEvent.set({
             thread_id: 't-life',

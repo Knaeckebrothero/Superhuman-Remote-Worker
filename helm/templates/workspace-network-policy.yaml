@@ -121,6 +121,26 @@ spec:
       ports:
         - protocol: TCP
           port: 3000
+    {{- if $.Values.nextcloud.enabled }}
+    # Nextcloud (rclone/WebDAV cloud mounts)
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "srw.componentSelectorLabels" (dict "context" $ "component" "nextcloud") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 80
+    {{- end }}
+    {{- if $.Values.opencloud.enabled }}
+    # OpenCloud (rclone/WebDAV cloud mounts)
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "srw.componentSelectorLabels" (dict "context" $ "component" "opencloud") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 9200
+    {{- end }}
     # PostgreSQL (App DB — for datasource shell tools like psql)
     - to:
         - podSelector:

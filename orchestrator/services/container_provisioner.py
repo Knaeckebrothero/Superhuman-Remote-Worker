@@ -41,6 +41,13 @@ except ImportError:
 DEFAULT_NETWORK_TIER = "internet-only"
 
 
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
 class ContainerProvisioner:
     """Workspace container provisioner using Kubernetes CoreV1Api.
 
@@ -67,6 +74,15 @@ class ContainerProvisioner:
         )
         self._storage_class: str = os.environ.get(
             "WORKSPACE_STORAGE_CLASS", "longhorn-ephemeral"
+        )
+        # rclone-backed cloud workspaces are the default container path. They
+        # need FUSE inside the workspace pod because the agent shell runs there.
+        self._fuse_enabled: bool = _env_flag("WORKSPACE_FUSE_ENABLED", True)
+        # In k3d/containerd and many managed clusters, /dev/fuse + SYS_ADMIN is
+        # still not enough because the default runtime profile blocks FUSE
+        # mounts. Keep this explicit so restricted deployments can opt out.
+        self._fuse_privileged: bool = self._fuse_enabled and _env_flag(
+            "WORKSPACE_FUSE_PRIVILEGED", True
         )
 
     @property
@@ -1002,7 +1018,11 @@ class ContainerProvisioner:
                 # Pod-level security: run SSHD as root for user session
                 # management (su to agent-host), but restrict everything else.
                 "securityContext": {
-                    "seccompProfile": {"type": "RuntimeDefault"},
+                    "seccompProfile": {
+                        "type": "Unconfined"
+                        if self._fuse_privileged
+                        else "RuntimeDefault"
+                    },
                 },
                 "containers": [
                     {
@@ -1020,12 +1040,14 @@ class ContainerProvisioner:
                                 "memory": memory_limit,
                             },
                         },
-                        # Container security hardening:
+                        # Container security profile:
                         # - Drop all capabilities, add back only what SSHD needs
+                        #   plus SYS_ADMIN for rclone/FUSE mounts when enabled.
                         # - SETUID/SETGID: user session switching
                         # - NET_BIND_SERVICE: bind to privileged ports (<1024)
                         # - CHOWN/DAC_OVERRIDE/FOWNER: file ownership for sessions
                         # - SYS_CHROOT: SSHD privilege separation
+                        # - SYS_ADMIN: required for container FUSE mounts
                         # - KILL: signal management
                         # - AUDIT_WRITE: PAM audit logging
                         # - allowPrivilegeEscalation: true (required for SSHD setuid)
@@ -1033,17 +1055,7 @@ class ContainerProvisioner:
                         "securityContext": {
                             "capabilities": {
                                 "drop": ["ALL"],
-                                "add": [
-                                    "CHOWN",
-                                    "DAC_OVERRIDE",
-                                    "FOWNER",
-                                    "SETGID",
-                                    "SETUID",
-                                    "NET_BIND_SERVICE",
-                                    "SYS_CHROOT",
-                                    "KILL",
-                                    "AUDIT_WRITE",
-                                ],
+                                "add": self._workspace_capabilities(),
                             },
                             "allowPrivilegeEscalation": True,
                         },
@@ -1097,6 +1109,23 @@ class ContainerProvisioner:
                 ],
             },
         }
+        if self._fuse_enabled:
+            if self._fuse_privileged:
+                manifest["spec"]["containers"][0]["securityContext"]["privileged"] = (
+                    True
+                )
+            manifest["spec"]["containers"][0]["volumeMounts"].append(
+                {
+                    "name": "dev-fuse",
+                    "mountPath": "/dev/fuse",
+                }
+            )
+            manifest["spec"]["volumes"].append(
+                {
+                    "name": "dev-fuse",
+                    "hostPath": {"path": "/dev/fuse", "type": "CharDevice"},
+                }
+            )
         if seed_configmap:
             manifest["spec"]["containers"][0]["volumeMounts"].append(
                 {
@@ -1112,6 +1141,22 @@ class ContainerProvisioner:
                 }
             )
         return manifest
+
+    def _workspace_capabilities(self) -> list[str]:
+        capabilities = [
+            "CHOWN",
+            "DAC_OVERRIDE",
+            "FOWNER",
+            "SETGID",
+            "SETUID",
+            "NET_BIND_SERVICE",
+            "SYS_CHROOT",
+            "KILL",
+            "AUDIT_WRITE",
+        ]
+        if self._fuse_enabled:
+            capabilities.append("SYS_ADMIN")
+        return capabilities
 
     async def _wait_for_ready(self, pod_name: str, timeout: int = 120) -> Optional[str]:
         """Poll until the workspace pod is Running and has an IP.

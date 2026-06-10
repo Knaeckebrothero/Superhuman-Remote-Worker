@@ -62,6 +62,8 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     zip \
     unzip \
     zstd \
+    rclone \
+    fuse3 \
     # NOTE: sudo intentionally excluded — agent-host must not escalate to root
     ca-certificates \
     gnupg \
@@ -138,7 +140,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 #     PLAYWRIGHT_VERSION must match .playwright-version (also consumed by
 #     provision.sh and requirements.txt). Path matches Dockerfile.agent:80.
 # ---------------------------------------------------------------------------
-ARG PLAYWRIGHT_VERSION
+ARG PLAYWRIGHT_VERSION=1.59.0
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     --mount=type=cache,target=/root/.cache/pip \
@@ -187,7 +189,8 @@ RUN mkdir -p /home/agent-host/.local/bin \
              /home/agent-host/.local/lib/python3/site-packages \
              /home/agent-host/.npm-global \
              /home/agent-host/.cache \
-    && chown -R agent-host:agent-host /home/agent-host
+             /cloud \
+    && chown -R agent-host:agent-host /home/agent-host /cloud
 
 ENV PIP_TARGET=/home/agent-host/.local/lib/python3/site-packages \
     PATH="/home/agent-host/.local/bin:/home/agent-host/.npm-global/bin:${PATH}" \

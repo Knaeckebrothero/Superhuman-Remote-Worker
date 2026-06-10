@@ -753,9 +753,12 @@ cloud:
   externalUrl: ""
   # -- Internal URL the agent calls server-to-server. Defaults to externalUrl when empty.
   externalServiceUrl: ""
-  # -- Main-cloud workspace data plane: "sync" (legacy eager clone) or
-  # "rclone_mount" (lazy rclone/FUSE mounts on supported VM runtimes).
-  workspaceDriver: "sync"
+  # -- Main-cloud workspace data plane: "rclone_mount" (lazy rclone/FUSE
+  # mounts) or "sync" (legacy eager clone).
+  workspaceDriver: "rclone_mount"
+  rcloneMount:
+    # -- Treat SSH workspace containers as rclone/FUSE-capable runtimes.
+    allowContainer: true
   # -- Optional explicit Nextcloud username for rclone user-home mounts.
   # Pair with Secret key NEXTCLOUD_RCLONE_USER_HOME_PASSWORD.
   nextcloudRcloneUserHomeUsername: ""
@@ -766,6 +769,14 @@ cloud:
 workspace:
   storageClass: ""
   storageSize: "20Gi"
+  fuse:
+    # -- Mount /dev/fuse and grant SYS_ADMIN to workspace containers so rclone
+    # mount can run where the agent shell executes.
+    enabled: true
+    # -- Use a privileged/unconfined runtime profile for FUSE workspaces. This
+    # is required by k3d/containerd and many managed cluster runtimes even when
+    # /dev/fuse and SYS_ADMIN are present.
+    privileged: true
   # -- Access mode for the shared workspace PVC. Production uses
   # ReadWriteMany (Longhorn). Single-node clusters with RWO-only storage
   # (k3s local-path) can override to "ReadWriteOnce".

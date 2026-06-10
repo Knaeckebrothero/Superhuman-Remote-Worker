@@ -9,6 +9,8 @@ health endpoints, _ws_send, create_persistent_app, on_turn callbacks.
 
 import json
 from datetime import datetime
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -2433,6 +2435,83 @@ class TestTerminateSession:
         assert mod._tool_inflight is False
         assert mod._events_epoch == 0
         assert mod._next_seq == 0
+
+
+# ---------------------------------------------------------------------------
+# 3.17.2b Attach-time cloud mount/sync selection
+# ---------------------------------------------------------------------------
+
+
+class TestAttachSessionCloudMount:
+    @pytest.mark.asyncio
+    async def test_active_cloud_mount_skips_legacy_nc_session_sync(self):
+        """A mounted cloud workspace must not also start legacy WebDAV sync."""
+        import src.api.persistent_app as mod
+
+        class FakeSession:
+            def __init__(self, *args, **kwargs):
+                self.cloud_mount_manager = SimpleNamespace(
+                    active=True,
+                    mounts=[
+                        SimpleNamespace(
+                            mount_id="legacy-session",
+                            mount_kind="session_folder",
+                            target_path="/cloud/home",
+                            workspace_name="home",
+                        )
+                    ],
+                )
+                self.cloud_mount_error = None
+                self.workspace_manager = SimpleNamespace(
+                    path=Path("/workspace"),
+                    backend=MagicMock(),
+                )
+                self.workspace_sync = None
+                self.postgres_conn = None
+
+            async def setup(self, **kwargs):
+                return None
+
+        workspace_override = {
+            "remote": {"host": "10.42.0.10"},
+            "nc_session_folder": "Sessions/thread-1",
+            "cloud_mount": {"version": 1, "driver": "rclone", "mounts": []},
+        }
+        fake_agent = SimpleNamespace(
+            config=object(),
+            _tactical_llm=None,
+            _llm=object(),
+            _auxiliary_llm=object(),
+            postgres_conn=None,
+            vector_conn=None,
+        )
+        fake_orchestrator = SimpleNamespace(
+            get_thread_workspace=AsyncMock(return_value=workspace_override)
+        )
+
+        mod._session = None
+        mod._thread_id = None
+        with (
+            patch.object(mod, "_agent", fake_agent),
+            patch.object(mod, "_orchestrator_client", fake_orchestrator),
+            patch.object(mod, "PersistentSession", FakeSession),
+            patch.object(
+                mod,
+                "_poll_workspace_ready",
+                new=AsyncMock(return_value=workspace_override),
+            ),
+            patch.object(mod, "_build_sync_coordinator") as build_sync,
+            patch.object(mod, "_restore_session_messages", new=AsyncMock()),
+            patch.object(mod, "_update_thread_status", new=AsyncMock()),
+            patch.object(mod, "_start_watchdogs"),
+        ):
+            try:
+                await mod._attach_session("thread-1")
+            finally:
+                mod._session = None
+                mod._thread_id = None
+
+        build_sync.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

@@ -28,6 +28,8 @@ class TestContainerProvisionerInit:
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("WORKSPACE_NAMESPACE", None)
             os.environ.pop("WORKSPACE_IMAGE", None)
+            os.environ.pop("WORKSPACE_FUSE_ENABLED", None)
+            os.environ.pop("WORKSPACE_FUSE_PRIVILEGED", None)
 
             from orchestrator.services.container_provisioner import (
                 ContainerProvisioner,
@@ -36,6 +38,8 @@ class TestContainerProvisionerInit:
             provisioner = ContainerProvisioner()
             assert provisioner._namespace == "superhuman-remote-worker"
             assert "workspace" in provisioner._workspace_image
+            assert provisioner._fuse_enabled is True
+            assert provisioner._fuse_privileged is True
 
     def test_custom_env_values(self):
         """Provisioner picks up custom environment variables."""
@@ -45,6 +49,7 @@ class TestContainerProvisionerInit:
                 "WORKSPACE_NAMESPACE": "custom-ns",
                 "WORKSPACE_IMAGE": "my-registry/workspace:v1",
                 "WORKSPACE_SSH_SECRET": "my-ssh-key",
+                "WORKSPACE_FUSE_ENABLED": "false",
             },
         ):
             from orchestrator.services.container_provisioner import (
@@ -55,6 +60,8 @@ class TestContainerProvisionerInit:
             assert provisioner._namespace == "custom-ns"
             assert provisioner._workspace_image == "my-registry/workspace:v1"
             assert provisioner._ssh_secret_name == "my-ssh-key"
+            assert provisioner._fuse_enabled is False
+            assert provisioner._fuse_privileged is False
 
     def test_connect_initializes_k8s(self):
         """connect() initializes the K8s client and stores db reference."""
@@ -285,11 +292,11 @@ class TestPodManifest:
             memory_limit="4Gi",
         )
 
-        # Pod-level: seccomp profile
+        # Pod-level: FUSE-capable default relaxes seccomp for rclone mount.
         pod_sc = manifest["spec"]["securityContext"]
-        assert pod_sc["seccompProfile"]["type"] == "RuntimeDefault"
+        assert pod_sc["seccompProfile"]["type"] == "Unconfined"
 
-        # Container-level: drop ALL, add back only SSHD essentials
+        # Container-level: drop ALL, add back SSHD essentials plus FUSE.
         container = manifest["spec"]["containers"][0]
         container_sc = container["securityContext"]
 
@@ -297,10 +304,12 @@ class TestPodManifest:
         added = set(container_sc["capabilities"]["add"])
         # SSHD needs these to function
         assert {"SETUID", "SETGID", "NET_BIND_SERVICE", "SYS_CHROOT"} <= added
-        # Dangerous capabilities must NOT be present
+        # rclone mount needs FUSE support in the workspace runtime.
+        assert "SYS_ADMIN" in added
+        assert container_sc["privileged"] is True
+        # Unrelated dangerous capabilities must NOT be present.
         assert "NET_RAW" not in added
         assert "SYS_PTRACE" not in added
-        assert "SYS_ADMIN" not in added
         assert "MKNOD" not in added
 
         # allowPrivilegeEscalation must be true (SSHD setuid requirement)
@@ -399,12 +408,12 @@ class TestSecurityHardening:
             memory_limit="4Gi",
         )
 
-    def test_no_privileged_container(self):
-        """Container must not run in privileged mode."""
+    def test_fuse_default_uses_privileged_container(self):
+        """Default rclone/FUSE runtime needs privileged mode on k3d."""
         manifest = self._build_manifest()
         container = manifest["spec"]["containers"][0]
         sc = container.get("securityContext", {})
-        assert sc.get("privileged") is not True
+        assert sc.get("privileged") is True
 
     def test_no_host_namespaces(self):
         """Pod must not share host namespaces (network, PID, IPC)."""
@@ -414,11 +423,14 @@ class TestSecurityHardening:
         assert spec.get("hostPID") is not True
         assert spec.get("hostIPC") is not True
 
-    def test_no_host_path_volumes(self):
-        """No volumes may use hostPath (prevents host filesystem access)."""
+    def test_only_fuse_host_path_volume(self):
+        """/dev/fuse is the only hostPath volume allowed by default."""
         manifest = self._build_manifest()
         for vol in manifest["spec"]["volumes"]:
-            assert "hostPath" not in vol, f"Volume {vol['name']} uses hostPath"
+            if "hostPath" not in vol:
+                continue
+            assert vol["name"] == "dev-fuse"
+            assert vol["hostPath"] == {"path": "/dev/fuse", "type": "CharDevice"}
 
     def test_capabilities_drop_all(self):
         """Container must drop ALL capabilities before adding specific ones."""
@@ -426,8 +438,8 @@ class TestSecurityHardening:
         container_sc = manifest["spec"]["containers"][0]["securityContext"]
         assert container_sc["capabilities"]["drop"] == ["ALL"]
 
-    def test_only_sshd_capabilities_added(self):
-        """Only the minimum capabilities required for SSHD are added back."""
+    def test_only_sshd_and_fuse_capabilities_added(self):
+        """Only SSHD essentials plus FUSE mount support are added back."""
         manifest = self._build_manifest()
         container_sc = manifest["spec"]["containers"][0]["securityContext"]
         added = set(container_sc["capabilities"]["add"])
@@ -442,18 +454,18 @@ class TestSecurityHardening:
             "SYS_CHROOT",
             "KILL",
             "AUDIT_WRITE",
+            "SYS_ADMIN",
         }
         assert added == expected, f"Unexpected capabilities: {added - expected}"
 
-    def test_dangerous_capabilities_excluded(self):
-        """Explicitly verify dangerous capabilities are never added."""
+    def test_unrelated_dangerous_capabilities_excluded(self):
+        """Only the FUSE-required elevated capability is added."""
         manifest = self._build_manifest()
         container_sc = manifest["spec"]["containers"][0]["securityContext"]
         added = set(container_sc["capabilities"]["add"])
         dangerous = {
             "NET_RAW",
             "SYS_PTRACE",
-            "SYS_ADMIN",
             "MKNOD",
             "DAC_READ_SEARCH",
             "SYS_RAWIO",
@@ -462,12 +474,67 @@ class TestSecurityHardening:
         }
         overlap = added & dangerous
         assert not overlap, f"Dangerous capabilities present: {overlap}"
+        assert "SYS_ADMIN" in added
 
-    def test_seccomp_profile_set(self):
-        """Pod must have RuntimeDefault seccomp profile."""
+    def test_fuse_can_be_disabled(self):
+        """Restricted clusters can opt out of the FUSE runtime profile."""
+        with patch.dict(os.environ, {"WORKSPACE_FUSE_ENABLED": "false"}):
+            from orchestrator.services.container_provisioner import ContainerProvisioner
+
+            provisioner = ContainerProvisioner()
+            manifest = provisioner._build_pod_manifest(
+                pod_name="workspace-test",
+                owner=WorkspaceOwner.job("test-job-id"),
+                image="test:latest",
+                cpu="500m",
+                memory="1Gi",
+                cpu_limit="2000m",
+                memory_limit="4Gi",
+            )
+
+        container = manifest["spec"]["containers"][0]
+        added = set(container["securityContext"]["capabilities"]["add"])
+        volumes = {v["name"]: v for v in manifest["spec"]["volumes"]}
+        mounts = {m["name"]: m for m in container["volumeMounts"]}
+        assert "SYS_ADMIN" not in added
+        assert "dev-fuse" not in volumes
+        assert "dev-fuse" not in mounts
+        assert container["securityContext"].get("privileged") is not True
+        assert manifest["spec"]["securityContext"]["seccompProfile"]["type"] == (
+            "RuntimeDefault"
+        )
+
+    def test_fuse_privileged_profile_can_be_disabled(self):
+        """Clusters that support non-privileged FUSE can keep the narrower profile."""
+        with patch.dict(os.environ, {"WORKSPACE_FUSE_PRIVILEGED": "false"}):
+            from orchestrator.services.container_provisioner import ContainerProvisioner
+
+            provisioner = ContainerProvisioner()
+            manifest = provisioner._build_pod_manifest(
+                pod_name="workspace-test",
+                owner=WorkspaceOwner.job("test-job-id"),
+                image="test:latest",
+                cpu="500m",
+                memory="1Gi",
+                cpu_limit="2000m",
+                memory_limit="4Gi",
+            )
+
+        container = manifest["spec"]["containers"][0]
+        added = set(container["securityContext"]["capabilities"]["add"])
+        volumes = {v["name"]: v for v in manifest["spec"]["volumes"]}
+        assert "SYS_ADMIN" in added
+        assert "dev-fuse" in volumes
+        assert container["securityContext"].get("privileged") is not True
+        assert manifest["spec"]["securityContext"]["seccompProfile"]["type"] == (
+            "RuntimeDefault"
+        )
+
+    def test_fuse_default_uses_unconfined_seccomp(self):
+        """Default rclone/FUSE runtime relaxes seccomp for FUSE mounts."""
         manifest = self._build_manifest()
         pod_sc = manifest["spec"]["securityContext"]
-        assert pod_sc["seccompProfile"]["type"] == "RuntimeDefault"
+        assert pod_sc["seccompProfile"]["type"] == "Unconfined"
 
     def test_single_container_only(self):
         """Pod must have exactly one container (no sidecars with elevated privs)."""
