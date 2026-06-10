@@ -26,6 +26,7 @@ from ..core.loader import (
     get_all_tool_names,
     get_phase_system_prompt,
     get_project_root,
+    load_auxiliary_prompt,
     render_instruction_content,
 )
 from ..core.workspace import WorkspaceManager, WorkspaceManagerConfig
@@ -34,6 +35,32 @@ from ..tools import ToolContext, load_tools, apply_instruction_enforcement
 from ..tools.description_manager import apply_description_overrides
 
 logger = logging.getLogger(__name__)
+
+
+def resolve_memory_extraction_prompt(config: AgentConfig) -> str:
+    """Load the memory-extraction prompt through the prompt matrix.
+
+    Mirrors the worker graph's resolution (graph.py): the auxiliary model
+    drives model-family resolution, falling back to the summarization phase
+    model, then the main model. ``MemoryConfig`` has no prompt attribute —
+    the prompt must be resolved here and threaded to every extraction call
+    site (docs/issues/memory_bugs.md B1).
+    """
+    aux_model = (
+        config.auxiliary.model
+        or config.llm.get_phase_config("summarization").model
+        or config.llm.model
+    )
+    try:
+        return load_auxiliary_prompt(config, "memory_extraction", model=aux_model)
+    except Exception as e:
+        logger.warning(
+            "Memory extraction prompt could not be loaded — extraction "
+            "will run without instructions: %s",
+            e,
+        )
+        return ""
+
 
 # Phase-specific tools that don't apply to interactive mode
 _EXCLUDED_TOOLS = frozenset(
@@ -76,6 +103,9 @@ class PersistentSession:
     tool_context: Optional[ToolContext] = None
     system_prompt: str = ""
     auxiliary_llm: Optional[Any] = None
+    # Matrix-resolved prompt for memory extraction; threaded into the loop
+    # and the teardown extraction sites (MemoryConfig carries no prompt).
+    memory_extraction_prompt: str = ""
     shell_manager: Optional[Any] = None
 
     # DB connections (for message persistence + memory)
@@ -154,6 +184,7 @@ class PersistentSession:
         self.vector_conn = vector_conn
         self.permission_mode = self.config.interactive.permission_mode
         self.narration_mode = self.config.interactive.narration_mode
+        self.memory_extraction_prompt = resolve_memory_extraction_prompt(self.config)
 
         # 1. Create workspace (with optional remote backend + git)
         await self._setup_workspace(
