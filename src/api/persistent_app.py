@@ -19,7 +19,11 @@ from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
 from ._session_auth import validate_session_token as _validate_session_token
-from .orchestrator_client import OrchestratorClient, create_orchestrator_client_from_env
+from .orchestrator_client import (
+    DuplicateThreadBinding,
+    OrchestratorClient,
+    create_orchestrator_client_from_env,
+)
 from .persistent_session import PersistentSession
 from ..tools.registry import TOOL_REGISTRY
 from ..core.archiver import inflight_tool_call
@@ -534,6 +538,37 @@ async def _exit_workspace_not_ready(thread_id: str, exc: WorkspaceNotReady) -> N
     os._exit(0)
 
 
+async def _exit_duplicate_provision(thread_id: str) -> NoReturn:
+    """Handle a lost provisioning race (409) during lifespan startup.
+
+    Another live agent already owns this thread, so this pod must not serve it.
+    We exit with status 0 (pod Completed under restartPolicy: Never, no restart
+    loop) so the pod drops out of the per-session Service's endpoints instead of
+    lingering as an orphan that black-holes ~half the cockpit's connection
+    attempts (the Service uses publishNotReadyAddresses, so a not-ready orphan
+    stays a live target). Only this pod's own agent record is cleaned up — never
+    any thread-scoped resource, which belongs to the winning agent.
+    """
+    logger.warning(
+        "Lost the provisioning race for thread %s — another live agent already "
+        "owns it; exiting cleanly so this orphan pod leaves the session Service "
+        "endpoints (not a crash).",
+        thread_id,
+    )
+    if _orchestrator_client:
+        try:
+            _orchestrator_client.stop_heartbeat()
+            if _heartbeat_task:
+                _heartbeat_task.cancel()
+            await _orchestrator_client.deregister()
+            await _orchestrator_client.close()
+        except Exception as de:
+            logger.warning(
+                "Best-effort deregister on duplicate-provision exit failed: %s", de
+            )
+    os._exit(0)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize persistent agent, register with orchestrator, start heartbeat."""
@@ -594,19 +629,23 @@ async def lifespan(app: FastAPI):
 
                     _thread_id = str(uuid.uuid4())
 
-                # The orchestrator now refuses duplicate persistent registrations
-                # (409 — see docs/issues/persistent_thread_double_provisioning_race.md).
-                # On refusal, skip the session attach below so the orphan pod
-                # doesn't compete with the legitimate owner for this thread.
+                # A thread-bound registration that loses the provisioning race
+                # raises DuplicateThreadBinding (orchestrator 409); the except
+                # clause below exits this pod cleanly so it leaves the
+                # per-session Service endpoints instead of black-holing
+                # connections. See
+                # docs/done/persistent_thread_double_provisioning_race.md.
+                # A False return here is a *different*, transient failure
+                # (network / 5xx): keep the pod up but session-less.
                 dedicated_register_ok = await _orchestrator_client.register(
                     agent_mode="persistent",
                     thread_id=_thread_id,
                 )
                 if not dedicated_register_ok:
                     logger.error(
-                        "Orchestrator refused persistent registration for "
-                        "thread %s — pod will stay up but will NOT attach a "
-                        "session (likely a duplicate-provision race).",
+                        "Persistent registration for thread %s failed "
+                        "(transient / non-409) — pod will stay up but will NOT "
+                        "attach a session.",
                         _thread_id,
                     )
 
@@ -623,6 +662,12 @@ async def lifespan(app: FastAPI):
                 )
             )
             logger.info("Registered with orchestrator as persistent agent")
+        except DuplicateThreadBinding:
+            # Lost the provisioning race for this thread (orchestrator 409).
+            # Exit cleanly so this orphan pod leaves the per-session Service
+            # endpoints; the winning agent keeps serving and the orchestrator
+            # does not rebind (the binding already exists). Does not return.
+            await _exit_duplicate_provision(_thread_id)
         except Exception as e:
             logger.warning(f"Failed to register with orchestrator (non-fatal): {e}")
             _orchestrator_client = None
