@@ -605,14 +605,33 @@ class PersistentSession:
         return restored
 
     def _setup_context_manager(self) -> None:
-        """Create context manager for token counting and compaction."""
+        """Create context manager for token counting and compaction.
+
+        Mirrors the worker path (``graph.py::build_phase_alternation_graph``):
+        the token thresholds come from the model-aware values the loader derives
+        as fractions of ``model_max_context_tokens`` (``config.limits.*``), NOT
+        the ``ContextConfig`` defaults. Without this a 1M-context session would
+        compact at the 80k fallback regardless of its real window. The
+        ``LimitsConfig`` defaults equal the ``ContextConfig`` defaults, so this
+        is a no-op when the derivation didn't fire (no regression).
+        """
         ctx = self.config.context_management
+        lim = self.config.limits
         self.context_manager = ContextManager(
             config=ContextConfig(
+                compaction_threshold_tokens=lim.context_threshold_tokens,
+                summarization_threshold_tokens=lim.context_threshold_tokens,
+                message_count_threshold=lim.message_count_threshold,
+                message_count_min_tokens=lim.message_count_min_tokens,
                 keep_recent_tool_results=ctx.keep_recent_tool_results,
                 keep_recent_messages=ctx.keep_recent_messages,
+                # Safety-layer constants (model-aware; see loader fractions)
+                model_max_context_tokens=lim.model_max_context_tokens,
+                summarization_safe_limit=lim.summarization_safe_limit,
+                summarization_chunk_size=lim.summarization_chunk_size,
             ),
             model=self.config.llm.model or "gpt-4",
+            summarization_timeout=self.config.llm.timeout or 600.0,
         )
 
     def _setup_shell_manager(self) -> None:
