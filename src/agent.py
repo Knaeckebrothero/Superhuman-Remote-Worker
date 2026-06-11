@@ -1657,6 +1657,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         """
         # Process datasources from job metadata (sent by orchestrator)
         from src.core.datasource_setup import (
+            clone_repository_datasources,
             inject_datasource_index,
             process_credential_files,
             process_datasources,
@@ -1666,14 +1667,24 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             self._job_metadata.get("datasources", []) if self._job_metadata else []
         )
         ws = self._workspace_manager
-        workspace_dir = getattr(ws, "workspace_dir", None) or os.getcwd()
+
+        # Repository datasources clone onto the workspace backend — never
+        # locally in the agent pod (the subprocess git-clone branch was
+        # removed; see docs/features/no_workspace_agent_mode.md §9.4).
+        repo_datasources = [ds for ds in ds_configs if ds.get("type") == "repository"]
+        non_repo_datasources = [
+            ds for ds in ds_configs if ds.get("type") != "repository"
+        ]
 
         datasources_dict, client_registry, cli_ds_types = process_datasources(
-            ds_configs, workspace_dir=workspace_dir
+            non_repo_datasources
         )
         # Track connections for cleanup
         self._datasource_connections.update(datasources_dict)
         self._datasource_clients.update(client_registry)
+
+        if repo_datasources:
+            clone_repository_datasources(repo_datasources, ws)
 
         # Materialize credential files (kubeconfig, ssh_key, generic_file).
         # Tracked in a manifest so _close_datasource_connections() can undo it.
@@ -2229,82 +2240,6 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             ds_type,
             f"- **{name}** ({ds_type}, read-write) — CLI via env vars",
         )
-
-    def _setup_repository_datasource(self, ds: Dict[str, Any]) -> None:
-        """Clone a repository into the workspace and configure git credentials.
-
-        The agent never sees raw tokens/SSH keys — credentials are
-        configured transparently via git credential helpers or SSH config.
-        """
-        import re
-        import subprocess
-
-        repo_url = ds.get("connection_url", "")
-        creds = ds.get("credentials") or {}
-        name = re.sub(r"[^a-z0-9]+", "-", ds.get("name", "repo").lower()).strip("-")
-        branch = ds.get("default_branch")
-
-        # Determine workspace path
-        ws = self._workspace_manager
-        workspace_dir = getattr(ws, "workspace_dir", None) or os.getcwd()
-        repos_dir = os.path.join(workspace_dir, "repos")
-        os.makedirs(repos_dir, exist_ok=True)
-        clone_path = os.path.join(repos_dir, name)
-
-        if os.path.exists(clone_path):
-            logger.info(f"Repository already exists at {clone_path}, skipping clone")
-            return
-
-        auth_method = creds.get("auth_method", "token")
-
-        if auth_method == "ssh":
-            # Write SSH key and configure
-            ssh_dir = os.path.expanduser("~/.ssh")
-            os.makedirs(ssh_dir, mode=0o700, exist_ok=True)
-            key_file = os.path.join(ssh_dir, f"repo_{name}")
-            with open(key_file, "w") as f:
-                f.write(creds.get("ssh_key", ""))
-            os.chmod(key_file, 0o600)
-
-            # Parse host from SSH URL
-            from urllib.parse import urlparse
-
-            parsed = urlparse(repo_url)
-            host = parsed.hostname or "github.com"
-
-            config_path = os.path.join(ssh_dir, "config")
-            with open(config_path, "a") as f:
-                f.write(
-                    f"\nHost {host}\n  IdentityFile {key_file}\n  StrictHostKeyChecking accept-new\n"
-                )
-
-        elif auth_method == "token" and creds.get("token"):
-            # Configure git credential helper
-            cred_file = os.path.expanduser("~/.git-credentials")
-            from urllib.parse import urlparse
-
-            parsed = urlparse(repo_url)
-            host = parsed.hostname or "github.com"
-            scheme = parsed.scheme or "https"
-            cred_line = f"{scheme}://oauth2:{creds['token']}@{host}"
-            with open(cred_file, "a") as f:
-                f.write(cred_line + "\n")
-            os.chmod(cred_file, 0o600)
-            subprocess.run(
-                ["git", "config", "--global", "credential.helper", "store"],
-                check=False,
-                capture_output=True,
-            )
-
-        # Clone
-        cmd = ["git", "clone", repo_url, clone_path]
-        if branch:
-            cmd.extend(["--branch", branch])
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        if result.returncode != 0:
-            logger.warning(f"Git clone failed: {result.stderr}")
-            raise RuntimeError(f"Failed to clone repository: {result.stderr}")
-        logger.info(f"Cloned repository to {clone_path}")
 
     def _inject_typed_env_vars(self, ds_type: str, ds: Dict[str, Any]) -> None:
         """Inject well-known environment variables for managed connector CLI access."""

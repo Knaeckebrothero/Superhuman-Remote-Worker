@@ -1,14 +1,21 @@
 """Shared datasource setup logic for both job agents and persistent sessions.
 
 Processes datasource configs received from the orchestrator: connects managed
-connectors, injects env vars for CLI access, clones repositories, materializes
-credential files (kubeconfig, ssh_key, generic_file), and builds a datasource
-index for datasources.md.
+connectors, injects env vars for CLI access, clones repositories onto the
+workspace backend, materializes credential files (kubeconfig, ssh_key,
+generic_file), and builds a datasource index for datasources.md.
+
+Repository datasources are cloned exclusively on the workspace via
+``clone_repository_datasources()`` (GitManager + shell-capable backend).
+There is no agent-local clone path — the former subprocess ``git clone``
+branch wrote credentials and repos onto the agent pod and was removed
+(docs/features/no_workspace_agent_mode.md §9.4).
 """
 
 import logging
 import os
 import re
+import shlex
 import subprocess
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
@@ -39,7 +46,6 @@ def _ds_slug_hyphen(name: str) -> str:
 
 def process_datasources(
     ds_configs: List[Dict[str, Any]],
-    workspace_dir: Optional[str] = None,
 ) -> Tuple[Dict[str, Any], Dict[str, Any], List[str]]:
     """Process datasource configs and create connections/env vars.
 
@@ -47,9 +53,13 @@ def process_datasources(
     connection profiles (pg_service.conf) or per-datasource env vars
     (MONGO_{SLUG}_URI, NEO4J_{SLUG}_URI).
 
+    Repository datasources are NOT handled here — callers filter them out
+    and clone via clone_repository_datasources() once the workspace backend
+    is ready. Any repository entry that still reaches this function is
+    skipped with a warning; there is no agent-local clone path.
+
     Args:
         ds_configs: List of datasource config dicts from the orchestrator.
-        workspace_dir: Workspace directory for repository cloning.
 
     Returns:
         Tuple of (datasources_dict, client_registry, cli_ds_types):
@@ -64,7 +74,6 @@ def process_datasources(
     # Group datasources by type for multi-source setup
     by_type: Dict[str, List[Dict[str, Any]]] = {}
     generic_list: List[Dict[str, Any]] = []
-    repo_list: List[Dict[str, Any]] = []
     read_only_list: List[Dict[str, Any]] = []
 
     for ds in ds_configs:
@@ -75,7 +84,12 @@ def process_datasources(
         if ds_type == "generic":
             generic_list.append(ds)
         elif ds_type == "repository":
-            repo_list.append(ds)
+            logger.warning(
+                "Repository datasource %r ignored by process_datasources(); "
+                "repos clone onto the workspace backend via "
+                "clone_repository_datasources().",
+                ds.get("name", "unnamed"),
+            )
         else:
             is_read_only = ds.get("project_read_only", False)
             if not is_read_only and ds_type in ("postgresql", "neo4j", "mongodb"):
@@ -94,13 +108,6 @@ def process_datasources(
             len(env_vars),
             ds.get("name", "unnamed"),
         )
-
-    # Repository datasources: clone repos
-    for ds in repo_list:
-        try:
-            setup_repository_datasource(ds, workspace_dir)
-        except Exception as e:
-            logger.warning("Failed to setup repository datasource: %s", e)
 
     # CLI-mode managed connectors: set up named connections
     if "postgresql" in by_type:
@@ -614,84 +621,179 @@ def create_datasource_connection(
 # ---------------------------------------------------------------------------
 
 
-def setup_repository_datasource(
-    ds: Dict[str, Any],
-    workspace_dir: Optional[str] = None,
+def clone_repository_datasources(
+    repo_datasources: List[Dict[str, Any]],
+    workspace_manager: Any,
 ) -> None:
-    """Clone a repository into the workspace and configure git credentials.
+    """Clone repository datasources onto the workspace backend.
 
-    Uses per-repo core.sshCommand for SSH auth, which avoids conflicts
-    when multiple repos share a hostname (e.g. two GitHub repos with
-    different deploy keys).
+    Every operation runs on the workspace: SSH key material lands in the
+    workspace home via ``backend.write_home_file``, host config via
+    ``backend.shell_run``, and the clone itself is
+    ``GitManager.clone(backend=...)`` (git on the workspace over SSH).
+
+    There is deliberately NO agent-local fallback: without a shell-capable
+    backend the datasources are skipped with an error. Repository
+    datasources require a full workspace — lite tiers reject them at
+    dispatch (docs/features/no_workspace_agent_mode.md §4/§7).
+
+    Args:
+        repo_datasources: Datasource config dicts of type "repository".
+        workspace_manager: WorkspaceManager whose backend hosts the clones;
+            successful clones are registered in its ``source_repos``.
     """
-    repo_url = ds.get("connection_url", "")
-    creds = ds.get("credentials") or {}
-    name = re.sub(r"[^a-z0-9]+", "-", ds.get("name", "repo").lower()).strip("-")
-    branch = ds.get("default_branch")
-
-    workspace_dir = workspace_dir or os.getcwd()
-    repos_dir = os.path.join(workspace_dir, "repos")
-    os.makedirs(repos_dir, exist_ok=True)
-    clone_path = os.path.join(repos_dir, name)
-
-    if os.path.exists(clone_path):
-        logger.info("Repository already exists at %s, skipping clone", clone_path)
+    if not repo_datasources:
         return
 
-    auth_method = creds.get("auth_method", "token")
-    clone_env = {**os.environ}
-
-    if auth_method == "ssh":
-        ssh_dir = os.path.expanduser("~/.ssh")
-        os.makedirs(ssh_dir, mode=0o700, exist_ok=True)
-        key_file = os.path.join(ssh_dir, f"repo_{name}")
-        with open(key_file, "w") as f:
-            f.write(creds.get("ssh_key", ""))
-        os.chmod(key_file, 0o600)
-
-        # Clone with explicit SSH command (avoids ~/.ssh/config conflicts)
-        ssh_cmd = f"ssh -i {key_file} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
-        clone_env["GIT_SSH_COMMAND"] = ssh_cmd
-
-    elif auth_method == "token" and creds.get("token"):
-        cred_file = os.path.expanduser("~/.git-credentials")
-        parsed = urlparse(repo_url)
-        host = parsed.hostname or "github.com"
-        scheme = parsed.scheme or "https"
-        cred_line = f"{scheme}://oauth2:{creds['token']}@{host}"
-        with open(cred_file, "a") as f:
-            f.write(cred_line + "\n")
-        os.chmod(cred_file, 0o600)
-        subprocess.run(
-            ["git", "config", "--global", "credential.helper", "store"],
-            check=False,
-            capture_output=True,
+    backend = getattr(workspace_manager, "backend", None)
+    if backend is None or not getattr(backend, "supports_shell", False):
+        logger.error(
+            "Repository datasources require a workspace backend with shell "
+            "support; skipping %d repository datasource(s), no local clone "
+            "fallback: %s",
+            len(repo_datasources),
+            ", ".join(ds.get("name", "unnamed") for ds in repo_datasources),
         )
+        return
 
-    cmd = ["git", "clone", repo_url, clone_path]
-    if branch:
-        cmd.extend(["--branch", branch])
-    result = subprocess.run(
-        cmd, capture_output=True, text=True, timeout=120, env=clone_env
-    )
-    if result.returncode != 0:
-        logger.warning("Git clone failed: %s", result.stderr)
-        raise RuntimeError(f"Failed to clone repository: {result.stderr}")
-    logger.info("Cloned repository to %s", clone_path)
+    from ..managers.git_manager import GitManager
+    from ..utils.git_url import repo_name_from_url
+    from ..utils.ssh_key import normalize_private_key
 
-    # Set persistent per-repo SSH command so future git ops use the right key
-    if auth_method == "ssh":
-        subprocess.run(
-            [
-                "git",
-                "config",
-                "core.sshCommand",
-                f"ssh -i {key_file} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new",
-            ],
-            cwd=clone_path,
-            check=False,
-            capture_output=True,
+    # Track repo names already assigned so we can append a numeric suffix
+    # when two datasources resolve to the same name (e.g. forks of the same
+    # upstream).
+    used_repo_names: set[str] = set()
+    for ds in repo_datasources:
+        # ds_name is the safe form of the user-supplied datasource label.
+        # It stays the SSH key filename and SSH config alias so that two
+        # datasources with different keys for the same repo don't clobber
+        # each other's auth material.
+        ds_name = (
+            re.sub(r"[^a-z0-9]+", "-", ds.get("name", "repo").lower()).strip("-")
+            or "repo"
         )
+        try:
+            repo_url = ds.get("connection_url", "")
+            branch = ds.get("default_branch")
+            creds = ds.get("credentials") or {}
+
+            # The clone directory and source_repos registry key use the
+            # upstream repo name; fall back to the datasource label only if
+            # URL parsing yields nothing usable.
+            base_repo_name = repo_name_from_url(repo_url, fallback=ds_name)
+            repo_name = base_repo_name
+            suffix = 2
+            while repo_name in used_repo_names:
+                repo_name = f"{base_repo_name}-{suffix}"
+                suffix += 1
+            if repo_name != base_repo_name:
+                logger.info(
+                    "Repo name collision for %s; cloning into %s instead",
+                    base_repo_name,
+                    repo_name,
+                )
+            used_repo_names.add(repo_name)
+
+            # Determine auth method: explicit field, or infer from
+            # credentials keys (ssh_key present → ssh).
+            auth_method = creds.get("auth_method")
+            if not auth_method:
+                if creds.get("ssh_key"):
+                    auth_method = "ssh"
+                elif creds.get("token"):
+                    auth_method = "token"
+
+            if auth_method == "ssh" and creds.get("ssh_key"):
+                # Normalize defensively: orchestrator validation already
+                # runs on save, but legacy rows in the datasources table
+                # may predate it. Cheap insurance.
+                ssh_key_text = normalize_private_key(creds["ssh_key"])
+
+                parsed = urlparse(repo_url)
+                host = parsed.hostname or "localhost"
+
+                # Write SSH key and configure on the workspace.
+                # write_home_file lands the key under $HOME without
+                # tripping the workspace-boundary check on write_file;
+                # resolve_home_path gives us the absolute path for the
+                # subsequent chmod and SSH config IdentityFile entry.
+                rel_key = f".ssh/repo_{ds_name}"
+                key_path = backend.resolve_home_path(rel_key)
+                backend.shell_run(
+                    "mkdir -p ~/.ssh && chmod 700 ~/.ssh",
+                    timeout=10,
+                    tab_name="git",
+                )
+                backend.write_home_file(rel_key, ssh_key_text)
+                backend.shell_run(
+                    f"chmod 600 {shlex.quote(key_path)}",
+                    timeout=10,
+                    tab_name="git",
+                )
+                # Append SSH config for this host
+                ssh_config = (
+                    f"\nHost {host}\n"
+                    f"  IdentityFile {key_path}\n"
+                    f"  StrictHostKeyChecking accept-new\n"
+                )
+                backend.shell_run(
+                    f"printf %s {shlex.quote(ssh_config)} >> ~/.ssh/config",
+                    timeout=10,
+                    tab_name="git",
+                )
+
+                # Convert HTTPS URL to SSH URL so git uses the key.
+                # strip("/") handles trailing slashes too — datasource URLs
+                # entered as `.../repo/` would otherwise become `repo/.git`,
+                # which GitHub's SSH server rejects.
+                if parsed.scheme in ("http", "https"):
+                    path = parsed.path.strip("/")
+                    if not path.endswith(".git"):
+                        path += ".git"
+                    repo_url = f"git@{host}:{path}"
+                    logger.info(
+                        "Converted HTTPS URL to SSH for %s: %s",
+                        ds_name,
+                        repo_url,
+                    )
+
+            elif (auth_method == "token" or not auth_method) and creds.get("token"):
+                parsed = urlparse(repo_url)
+                repo_url = parsed._replace(
+                    netloc=f"oauth2:{creds['token']}@{parsed.hostname}"
+                    + (f":{parsed.port}" if parsed.port else "")
+                ).geturl()
+
+            target = workspace_manager.path / "repos" / repo_name
+            remote_cwd = f"repos/{repo_name}"
+            git_mgr = GitManager.clone(
+                repo_url,
+                target,
+                backend=backend,
+                remote_cwd=remote_cwd,
+            )
+            if git_mgr:
+                if branch:
+                    git_mgr.checkout_branch(branch)
+                workspace_manager.source_repos[repo_name] = git_mgr
+                logger.info(
+                    "Cloned repository datasource %r into repos/%s",
+                    ds_name,
+                    repo_name,
+                )
+            else:
+                logger.warning(
+                    "Failed to clone repository datasource %r (target repos/%s)",
+                    ds_name,
+                    repo_name,
+                )
+        except Exception as e:
+            logger.warning(
+                "Failed to clone repository datasource %s: %s",
+                ds.get("name", "unnamed"),
+                e,
+            )
 
 
 # ---------------------------------------------------------------------------

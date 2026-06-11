@@ -19,7 +19,18 @@ related:
 
 # No-Workspace Agent Modes — `virtual` and `none` workspace tiers
 
-**Status:** Draft. Design discussed and v1 scope agreed 2026-06-10. Not started.
+**Status:** Draft. Design discussed and v1 scope agreed 2026-06-10.
+Prerequisite hardening in progress (serial order: prereqs before S1/S2 —
+building the lite backends first would arm the very fallbacks the prereqs
+remove): §9.2 browser fallback **removed 2026-06-11** (+133/−1431, agent
+image drops Playwright/Chromium entirely; also completed
+[[browser_workspace_executor]] Phase 4). §9.3 libtmux hard-off **done
+2026-06-11** (ShellManager is delegation-only and raises without a
+shell-capable backend; agent image drops tmux/libtmux). §9.4 clone audit
+**done 2026-06-11** — finding: the worker path WAS reachable (unfiltered
+datasources, clone into agent CWD); local branches removed, unified
+backend-only helper (§7). Remaining prereq: §9.1 egress NetworkPolicy
+(S4). S1-S3 not started.
 
 ## 1. Goal
 
@@ -215,14 +226,19 @@ nothing agent-driven can touch it — there are no file tools.
 - **Browser** — not registered; the local in-pod fallback is removed
   entirely per `docs/issues/remove_local_browser_fallback.md`.
 - **Git** — deferred, see §8.
-- **Repository datasources** — rejected at dispatch (§4). Note while
-  verifying: `process_datasources()` contains a *local subprocess* `git
-  clone` branch (`src/core/datasource_setup.py` ~:617-691); the session path
-  filters repository datasources out before calling it
-  (`persistent_app.py` ~:890-895) and clones via
-  `GitManager.clone(backend=...)` on the remote workspace instead. Audit
-  whether the worker path can reach the local branch and fold it into the
-  capability-not-inference cleanup.
+- **Repository datasources** — rejected at dispatch (§4).
+  **Audit done 2026-06-11, finding: the worker path COULD reach the local
+  branch** — `agent.py` passed job datasources unfiltered into
+  `process_datasources()`, whose subprocess `git clone` branch wrote SSH
+  keys/tokens into the agent pod's home and cloned into the agent process
+  CWD (`workspace_dir` fell back to `os.getcwd()`; `WorkspaceManager` has
+  no such attribute). Fixed: the local branch is deleted; both paths now
+  share `clone_repository_datasources()` (datasource_setup.py), which
+  requires a shell-capable backend and runs all auth + clone operations on
+  the workspace (`write_home_file` + `GitManager.clone(backend=...)`) —
+  no local fallback, shell-less backends skip with an error. The session
+  path's own local SSH-key else-branch and a dead duplicate
+  (`Agent._setup_repository_datasource`) were removed with it.
 
 Prompts: a lite instruction/persona variant that doesn't reference shell,
 git, or workspace conventions that don't exist in this tier
@@ -283,11 +299,24 @@ Ship with (or before) v1:
    a per-tenant tiering question (multi-tenancy M1.D), unchanged.
 2. **Local-browser fallback removal** —
    `docs/issues/remove_local_browser_fallback.md` (filed 2026-06-10).
+   **DONE 2026-06-11**: local path deleted, `browser_exec` errors loudly
+   without a workspace, agent image ships no Chromium, regression guard
+   (no `browser_use` import under `src/`) in the test suite.
 3. **ShellManager libtmux hard-off** — lite backends declare
    `supports_shell=False` and the local-tmux degradation must not be
    reachable (the bare-metal dev posture it served is deprecated with the
    Compose stack).
+   **DONE 2026-06-11**: the local libtmux path is deleted — ShellManager is
+   pure delegation and raises without a shell-capable backend; call sites
+   gate on `supports_shell` (no `which tmux` fallback); sudo/blocked-command
+   gating stays agent-side, ahead of delegation; libtmux + tmux dropped from
+   the agent image; regression guard (no `libtmux` import under `src/`) in
+   the test suite. The shared sentinel/stall helpers remain in
+   `shell_manager.py` for `RemoteBackend`.
 4. **`datasource_setup` local-clone audit** — §7.
+   **DONE 2026-06-11** — worker path was reachable (see §7 finding);
+   local-clone branches removed, unified backend-only
+   `clone_repository_datasources()` helper + capability gate + tests.
 
 ## 10. Roadmap beyond v1
 
