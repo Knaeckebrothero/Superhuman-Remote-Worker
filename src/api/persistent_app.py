@@ -991,8 +991,8 @@ async def _attach_session(
 
     # Process datasources: create connections, inject env vars, apply tool overrides
     # Note: repository cloning is deferred until AFTER the workspace is
-    # initialized so that repos land inside the session workspace directory
-    # (./workspace/job_{thread_id}/repos/) instead of the agent process CWD.
+    # initialized, then runs on the workspace backend (repos/<name> on the
+    # workspace container) — never on the agent pod.
     datasources_dict: Dict[str, Any] = {}
     datasource_clients: Dict[str, Any] = {}
     repo_datasources: List[Dict[str, Any]] = []
@@ -1008,7 +1008,7 @@ async def _attach_session(
             ds for ds in datasources if ds.get("type") != "repository"
         ]
         datasources_dict, datasource_clients, cli_ds_types = process_datasources(
-            non_repo_datasources, workspace_dir=os.getcwd()
+            non_repo_datasources
         )
 
         # Inject datasource tool categories into config_override so the
@@ -1228,173 +1228,12 @@ async def _attach_session(
         )
 
     # Clone repository datasources into the workspace (deferred from above).
-    # Uses GitManager.clone() with the workspace backend so that repos are
-    # cloned on the remote workspace container (not the agent pod).
+    # All clone/auth operations run on the workspace backend — there is no
+    # agent-local clone path (docs/features/no_workspace_agent_mode.md §9.4).
     if repo_datasources and _session.workspace_manager:
-        from ..managers.git_manager import GitManager
-        from ..utils.git_url import repo_name_from_url
-        from ..utils.ssh_key import normalize_private_key
-        import re as _re
+        from ..core.datasource_setup import clone_repository_datasources
 
-        ws_mgr = _session.workspace_manager
-        backend = ws_mgr.backend if hasattr(ws_mgr, "backend") else None
-        use_backend = backend is not None and getattr(backend, "supports_shell", False)
-        # Track repo names already assigned this session so we can append a
-        # numeric suffix when two datasources resolve to the same name (e.g.
-        # forks of the same upstream).
-        used_repo_names: set[str] = set()
-        for ds in repo_datasources:
-            # ds_name is the safe form of the user-supplied datasource label.
-            # We keep using it as the SSH key filename and SSH config alias
-            # so that two datasources with different keys for the same repo
-            # don't clobber each other's auth material.
-            ds_name = (
-                _re.sub(r"[^a-z0-9]+", "-", ds.get("name", "repo").lower()).strip("-")
-                or "repo"
-            )
-            try:
-                repo_url = ds.get("connection_url", "")
-                branch = ds.get("default_branch")
-                creds = ds.get("credentials") or {}
-
-                # The clone directory and source_repos registry key use the
-                # upstream repo name (Superhuman-Remote-Worker, not
-                # "read-only-version-of-..."). Fall back to the datasource
-                # label only if URL parsing yields nothing usable.
-                base_repo_name = repo_name_from_url(repo_url, fallback=ds_name)
-                repo_name = base_repo_name
-                suffix = 2
-                while repo_name in used_repo_names:
-                    repo_name = f"{base_repo_name}-{suffix}"
-                    suffix += 1
-                if repo_name != base_repo_name:
-                    logger.info(
-                        "Repo name collision for %s; cloning into %s instead",
-                        base_repo_name,
-                        repo_name,
-                    )
-                used_repo_names.add(repo_name)
-
-                # Determine auth method: explicit field, or infer from
-                # credentials keys (ssh_key present → ssh).
-                auth_method = creds.get("auth_method")
-                if not auth_method:
-                    if creds.get("ssh_key"):
-                        auth_method = "ssh"
-                    elif creds.get("token"):
-                        auth_method = "token"
-
-                if auth_method == "ssh" and creds.get("ssh_key"):
-                    import shlex
-                    from urllib.parse import urlparse
-
-                    # Normalize defensively: orchestrator validation already
-                    # runs on save, but legacy rows in the datasources table
-                    # may predate it. Cheap insurance.
-                    ssh_key_text = normalize_private_key(creds["ssh_key"])
-
-                    parsed = urlparse(repo_url)
-                    host = parsed.hostname or "localhost"
-
-                    if use_backend:
-                        # Write SSH key and configure on the remote container.
-                        # write_home_file lands the key under $HOME without
-                        # tripping the workspace-boundary check on write_file;
-                        # resolve_home_path gives us the absolute path for the
-                        # subsequent chmod and SSH config IdentityFile entry.
-                        rel_key = f".ssh/repo_{ds_name}"
-                        key_path = backend.resolve_home_path(rel_key)
-                        backend.shell_run(
-                            "mkdir -p ~/.ssh && chmod 700 ~/.ssh",
-                            timeout=10,
-                            tab_name="git",
-                        )
-                        backend.write_home_file(rel_key, ssh_key_text)
-                        backend.shell_run(
-                            f"chmod 600 {shlex.quote(key_path)}",
-                            timeout=10,
-                            tab_name="git",
-                        )
-                        # Append SSH config for this host
-                        ssh_config = (
-                            f"\nHost {host}\n"
-                            f"  IdentityFile {key_path}\n"
-                            f"  StrictHostKeyChecking accept-new\n"
-                        )
-                        backend.shell_run(
-                            f"printf %s {shlex.quote(ssh_config)} >> ~/.ssh/config",
-                            timeout=10,
-                            tab_name="git",
-                        )
-                    else:
-                        # Local: write SSH key to agent filesystem
-                        ssh_dir = os.path.expanduser("~/.ssh")
-                        os.makedirs(ssh_dir, mode=0o700, exist_ok=True)
-                        key_file = os.path.join(ssh_dir, f"repo_{ds_name}")
-                        with open(key_file, "w") as f:
-                            f.write(ssh_key_text)
-                        os.chmod(key_file, 0o600)
-                        config_path = os.path.join(ssh_dir, "config")
-                        with open(config_path, "a") as f:
-                            f.write(
-                                f"\nHost {host}\n"
-                                f"  IdentityFile {key_file}\n"
-                                f"  StrictHostKeyChecking accept-new\n"
-                            )
-
-                    # Convert HTTPS URL to SSH URL so git uses the key.
-                    # strip("/") handles trailing slashes too — datasource URLs
-                    # entered as `.../repo/` would otherwise become `repo/.git`,
-                    # which GitHub's SSH server rejects.
-                    if parsed.scheme in ("http", "https"):
-                        path = parsed.path.strip("/")
-                        if not path.endswith(".git"):
-                            path += ".git"
-                        repo_url = f"git@{host}:{path}"
-                        logger.info(
-                            "Converted HTTPS URL to SSH for %s: %s",
-                            ds_name,
-                            repo_url,
-                        )
-
-                elif (auth_method == "token" or not auth_method) and creds.get("token"):
-                    from urllib.parse import urlparse
-
-                    parsed = urlparse(repo_url)
-                    repo_url = parsed._replace(
-                        netloc=f"oauth2:{creds['token']}@{parsed.hostname}"
-                        + (f":{parsed.port}" if parsed.port else "")
-                    ).geturl()
-
-                target = ws_mgr.path / "repos" / repo_name
-                remote_cwd = f"repos/{repo_name}"
-                git_mgr = GitManager.clone(
-                    repo_url,
-                    target,
-                    backend=backend,
-                    remote_cwd=remote_cwd,
-                )
-                if git_mgr:
-                    if branch:
-                        git_mgr.checkout_branch(branch)
-                    ws_mgr.source_repos[repo_name] = git_mgr
-                    logger.info(
-                        "Cloned repository datasource %r into repos/%s",
-                        ds_name,
-                        repo_name,
-                    )
-                else:
-                    logger.warning(
-                        "Failed to clone repository datasource %r (target repos/%s)",
-                        ds_name,
-                        repo_name,
-                    )
-            except Exception as e:
-                logger.warning(
-                    "Failed to clone repository datasource %s: %s",
-                    ds.get("name", "unnamed"),
-                    e,
-                )
+        clone_repository_datasources(repo_datasources, _session.workspace_manager)
 
     # Inject datasource index into datasources.md (after workspace is initialized)
     if datasources and _session.workspace_manager:
