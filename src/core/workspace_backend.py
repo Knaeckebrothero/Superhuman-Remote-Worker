@@ -452,6 +452,19 @@ class WorkspaceBackend(ABC):
         """
         return False
 
+    @property
+    def supports_file_tools(self) -> bool:
+        """Whether file tools (read_file/write_file/list_files/…) are exposed
+        to the agent over this backend.
+
+        True for real workspaces and the ``virtual`` tier (object-store file
+        IO). False for the ``none`` tier's ScratchBackend, which exists only
+        for internal consumers (PlanManager, todo archive) and registers no
+        file tools (no_workspace_agent_mode.md §6). This gates *tool exposure*,
+        not the backend's intrinsic ability to do file IO.
+        """
+        return True
+
     # --- Lifecycle ---
 
     @abstractmethod

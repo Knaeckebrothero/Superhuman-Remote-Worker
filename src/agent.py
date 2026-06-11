@@ -1871,8 +1871,17 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             except Exception as e:
                 logger.warning(f"Failed to initialize knowledge base (non-fatal): {e}")
 
-        # Load tools from registry
+        # Load tools from registry, gated by what the workspace backend can
+        # actually support (no_workspace_agent_mode.md §3.2/§7): the lite tiers
+        # declare supports_shell=False so shell/browser/git are dropped, and
+        # none's ScratchBackend (supports_file_tools=False) also drops the file
+        # tools — enforcement-by-construction, independent of the config lists.
+        from .tools.registry import filter_tools_by_backend
+
         tool_names = get_all_tool_names(self.config)
+        tool_names = filter_tools_by_backend(
+            tool_names, self._workspace_manager.backend
+        )
 
         try:
             self._tools = load_tools(tool_names, context)
