@@ -180,6 +180,13 @@ from src.core.model_registry import (  # noqa: E402
     UnknownModelError,
     resolve_model as _resolve_model,
 )
+
+# Lite (no-workspace-pod) backend names. Canonical set lives agent-side in the
+# backend factory; imported (not re-declared) so the dispatch/provisioning
+# branches here can't drift from what the agent actually constructs.
+# (no_workspace_agent_mode.md §4) — importing the frozenset is cheap; the heavy
+# backend modules are lazy-imported inside the factory's functions.
+from src.core.backends.factory import LITE_BACKENDS  # noqa: E402
 from src.utils.ssh_key import (  # noqa: E402
     InvalidSSHKeyError,
     generate_ed25519_keypair as _generate_ed25519_keypair,
@@ -1352,6 +1359,41 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
                 f"provisioner={container_ctx.get('provisioner', 'k8s')})"
             )
 
+        # Inject lite workspace config (virtual/none — no SSH, no provisioning).
+        # The user's config_override already names the backend; here we attach
+        # the object-store mounts (virtual) with deployment-sourced credentials,
+        # in-flight only. A repository datasource needs a real workspace to
+        # clone into, so reject the combination up front (§4/§7).
+        if _backend_from_override(config_override) in LITE_BACKENDS:
+            repo_names = _repository_datasource_names(resolved_ds)
+            if repo_names:
+                msg = (
+                    "workspace.backend is a lite tier (virtual/none) but a "
+                    f"repository datasource is attached ({', '.join(repo_names)}). "
+                    "Repository datasources need a full workspace — use "
+                    "backend='sandbox' or 'vm', or detach the repository."
+                )
+                logger.error("Dispatch: job %s rejected — %s", job_id, msg)
+                await postgres_db.update_job_status(
+                    job_id=job_id, status="failed", error_message=msg
+                )
+                return False
+            try:
+                config_override = _inject_lite_workspace_config(
+                    config_override, prefix=f"jobs/{job_id}/"
+                )
+            except LiteWorkspaceConfigError as exc:
+                logger.error("Dispatch: job %s lite-config error: %s", job_id, exc)
+                await postgres_db.update_job_status(
+                    job_id=job_id, status="failed", error_message=str(exc)
+                )
+                return False
+            logger.info(
+                "Dispatch: job %s using lite workspace (backend=%s, no pod)",
+                job_id,
+                config_override["workspace"]["backend"],
+            )
+
         # Override workspace_path with worktree_path for subjobs on shared backends
         worktree_path = job.get("worktree_path")
         if worktree_path and config_override:
@@ -1484,6 +1526,38 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
                 f"Resume dispatch: injected VM workspace config for job {job_id} "
                 f"(host={vm_ctx['ssh_host']}:{vm_ctx.get('ssh_port', 22)})"
             )
+
+        # Re-inject lite workspace config on resume. Mounts + credentials are
+        # injected in-flight and never persisted to jobs.config_override, so the
+        # paused row only carries the bare backend — without this a resumed
+        # `virtual` job would reach the agent with no mounts and fail to build
+        # its backend. (Same rationale as the credential re-injection above.)
+        if _backend_from_override(config_override) in LITE_BACKENDS:
+            repo_names = _repository_datasource_names(resolved_ds)
+            if repo_names:
+                msg = (
+                    "workspace.backend is a lite tier (virtual/none) but a "
+                    f"repository datasource is attached ({', '.join(repo_names)}). "
+                    "Repository datasources need a full workspace — use "
+                    "backend='sandbox' or 'vm', or detach the repository."
+                )
+                logger.error("Resume dispatch: job %s rejected — %s", job_id, msg)
+                await postgres_db.update_job_status(
+                    job_id=job_id, status="failed", error_message=msg
+                )
+                return False
+            try:
+                config_override = _inject_lite_workspace_config(
+                    config_override, prefix=f"jobs/{job_id}/"
+                )
+            except LiteWorkspaceConfigError as exc:
+                logger.error(
+                    "Resume dispatch: job %s lite-config error: %s", job_id, exc
+                )
+                await postgres_db.update_job_status(
+                    job_id=job_id, status="failed", error_message=str(exc)
+                )
+                return False
 
         # Extract queued feedback (stored by resume endpoint when no agent was available)
         job_context = job.get("context") or {}
@@ -1679,6 +1753,18 @@ async def _send_session_attach(
 
     Returns True if the agent accepted the session.
     """
+    # Lite tiers (virtual/none) carry no SSH endpoint. For `virtual` we attach
+    # the object-store mounts here — deployment-sourced credentials, in-flight
+    # only (never persisted to the thread row), keyed under threads/<id>/.
+    # A misconfigured `virtual` deployment refuses the attach with a clear log.
+    try:
+        config_override = _inject_lite_workspace_config(
+            config_override, prefix=f"threads/{thread_id}/"
+        )
+    except LiteWorkspaceConfigError as exc:
+        logger.error("Session attach: thread %s lite-config error: %s", thread_id, exc)
+        return False
+
     agent_url = f"http://{agent['pod_ip']}:{agent['pod_port']}/session/attach"
     payload = {
         "thread_id": thread_id,
@@ -1725,6 +1811,137 @@ async def _send_session_attach(
     except Exception:
         logger.exception("Failed to send session attach to agent %s", agent["id"])
         return False
+
+
+class LiteWorkspaceConfigError(Exception):
+    """A ``virtual`` tier was requested but this deployment has no object store.
+
+    Raised by :func:`_inject_lite_workspace_config`; dispatch fails the job and
+    session-attach refuses, both with the actionable message carried here.
+    """
+
+
+def _backend_from_override(config_override: Any) -> Optional[str]:
+    """Extract ``workspace.backend`` from a (dict | JSON-string | None) override.
+
+    Mirrors the parsing the dispatch path already does for ``config_override``
+    so every caller reads the backend the same way.
+    """
+    co = config_override
+    if isinstance(co, str):
+        try:
+            co = json.loads(co)
+        except (json.JSONDecodeError, TypeError):
+            return None
+    if not isinstance(co, dict):
+        return None
+    ws = co.get("workspace")
+    if not isinstance(ws, dict):
+        return None
+    return ws.get("backend")
+
+
+def _virtual_workspace_rclone_spec() -> Optional[dict[str, Any]]:
+    """The deployment's object-store spec for the ``virtual`` tier, or None.
+
+    Built from env wired by Helm (``virtualWorkspace.rclone.*``):
+
+    - ``VIRTUAL_WORKSPACE_RCLONE_TYPE`` — rclone backend (``s3``/``webdav``/…,
+      or ``memory`` for a non-durable dev store). Empty ⇒ tier disabled (None).
+    - ``VIRTUAL_WORKSPACE_RCLONE_ROOT`` — bucket or ``bucket/subpath``.
+    - ``VIRTUAL_WORKSPACE_RCLONE_CONFIG`` — JSON object of rclone config
+      key/values (access_key_id, secret_access_key, endpoint, provider, …);
+      held in a Secret. Becomes ``RCLONE_CONFIG_*`` env in the agent, so it
+      never reaches argv.
+
+    Returns the ``{type, config, root}`` shape the agent's
+    ``object_store_from_spec`` consumes as ``rclone_spec`` (§4/§5).
+    """
+    rtype = os.environ.get("VIRTUAL_WORKSPACE_RCLONE_TYPE", "").strip()
+    if not rtype:
+        return None
+    config: dict[str, Any] = {}
+    raw = os.environ.get("VIRTUAL_WORKSPACE_RCLONE_CONFIG", "").strip()
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                config = parsed
+            else:
+                logger.error(
+                    "VIRTUAL_WORKSPACE_RCLONE_CONFIG is not a JSON object — ignoring"
+                )
+        except (json.JSONDecodeError, ValueError):
+            logger.error("VIRTUAL_WORKSPACE_RCLONE_CONFIG is not valid JSON — ignoring")
+    root = os.environ.get("VIRTUAL_WORKSPACE_RCLONE_ROOT", "").strip()
+    return {"type": rtype, "config": config, "root": root}
+
+
+def _inject_lite_workspace_config(
+    config_override: Optional[dict[str, Any]], *, prefix: str
+) -> Optional[dict[str, Any]]:
+    """Enrich ``config_override.workspace`` for the lite tiers (``virtual``/``none``).
+
+    No-op for any other backend. For ``virtual`` it attaches the object-store
+    ``mounts`` (credentials sourced from deployment env and injected *in-flight*
+    only — never persisted to the job/thread row, matching how dispatch keeps
+    API keys inline). For ``none`` it strips any stray mounts. Both force
+    ``git_versioning`` off (§8 — lite tiers have no git).
+
+    ``prefix`` is the object-store key prefix for this owner
+    (``jobs/<id>/`` for jobs, ``threads/<id>/`` for sessions).
+
+    Raises:
+        LiteWorkspaceConfigError: ``virtual`` requested but no object store is
+            configured for this deployment.
+    """
+    backend = _backend_from_override(config_override)
+    if backend not in LITE_BACKENDS:
+        return config_override
+
+    config_override = config_override or {}
+    ws = config_override.setdefault("workspace", {})
+    ws["backend"] = backend
+    ws["git_versioning"] = False
+
+    if backend == "virtual":
+        spec = _virtual_workspace_rclone_spec()
+        if spec is None:
+            raise LiteWorkspaceConfigError(
+                "workspace.backend='virtual' needs an object store, but this "
+                "deployment has none configured. Set virtualWorkspace.rclone.* "
+                "(VIRTUAL_WORKSPACE_RCLONE_TYPE/ROOT/CONFIG) to an S3/MinIO "
+                "bucket — or use backend='none' for a no-file-tools agent, or "
+                "'sandbox'/'vm' for a full workspace."
+            )
+        ws["mounts"] = [
+            {
+                "name": "workspace",
+                "rclone_spec": spec,
+                "prefix": prefix,
+                "access": "read_write",
+            }
+        ]
+    else:  # "none" — no file tools, so no object-store mounts
+        ws.pop("mounts", None)
+
+    return config_override
+
+
+def _repository_datasource_names(datasources: Any) -> list[str]:
+    """Names of any ``repository``-type datasources in a resolved list.
+
+    Repository datasources require a shell-capable workspace to clone into;
+    the lite tiers have none (§4/§7), so their presence is the tier boundary.
+    Returns a (possibly empty) list of human-readable names for the error.
+    """
+    names: list[str] = []
+    for ds in datasources or []:
+        if not isinstance(ds, dict):
+            continue
+        if (ds.get("type") or "").lower() == "repository":
+            names.append(str(ds.get("name") or ds.get("id") or "?"))
+    return names
 
 
 def _job_needs_vm(job: dict) -> bool:
@@ -1794,6 +2011,11 @@ def _job_needs_sandbox(job: dict) -> bool:
     if backend in ("sandbox", "container"):  # "container" is legacy
         return True
     if backend in ("vm", "remote"):  # "remote" is legacy for VM
+        return False
+    if backend in LITE_BACKENDS:
+        # virtual/none run with no workspace pod at all (no_workspace_agent_mode.md
+        # §4). Without this the next line would provision a sandbox whenever a
+        # provisioner is available — defeating the whole tier.
         return False
     # No explicit backend — default to sandbox if any provisioner is available
     return container_provisioner.is_available or docker_provisioner.is_available
@@ -4164,6 +4386,32 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
                 except Exception:
                     creator = None
             await _check_vm_permission(creator, job_needs_vm=True)
+
+        # Lite-tier guard: virtual/none agents have no shell-capable workspace
+        # to clone into, so a repository datasource is the tier boundary (§4).
+        # Reject at submit time with a clear 400 instead of a silent dispatch
+        # failure later. (The dispatcher re-checks resolved datasources too.)
+        lite_backend = _backend_from_override(config_override)
+        if lite_backend in LITE_BACKENDS and job.datasource_ids:
+            repo_names: list[str] = []
+            for ds_id in job.datasource_ids:
+                try:
+                    ds = await postgres_db.get_datasource(ds_id)
+                except Exception:
+                    ds = None
+                if ds and (ds.get("type") or "").lower() == "repository":
+                    repo_names.append(str(ds.get("name") or ds_id))
+            if repo_names:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"workspace.backend='{lite_backend}' is a lite tier and "
+                        f"cannot use repository datasources "
+                        f"({', '.join(repo_names)}). Use backend='sandbox' or "
+                        f"'vm' for coding workloads, or remove the repository "
+                        f"datasource."
+                    ),
+                )
 
         result = await postgres_db.create_job(
             description=job.description,
@@ -11011,8 +11259,14 @@ async def agent_create_thread(
                     {"git_remote_url": git_remote_url, "repo_name": repo_name},
                 )
 
-        # Provision workspace container in background if K8s is available (in-cluster only)
-        if container_provisioner.is_available and container_provisioner.in_cluster:
+        # Provision workspace container in background if K8s is available
+        # (in-cluster only) — unless this is a lite (virtual/none) session, which
+        # runs with no workspace pod at all (no_workspace_agent_mode.md §4).
+        if (
+            container_provisioner.is_available
+            and container_provisioner.in_cluster
+            and _backend_from_override(config_override) not in LITE_BACKENDS
+        ):
             await postgres_db.merge_thread_workspace_context(
                 thread_id, {"status": "pending"}
             )
@@ -12135,10 +12389,23 @@ async def create_thread(
         # Start image pull / pod creation immediately so it runs in parallel
         # with the Gitea + Nextcloud setup below.
         # Same priority as dispatcher: in-cluster K8s → Docker Compose → kubeconfig K8s
-        use_k8s = container_provisioner.is_available and (
-            container_provisioner.in_cluster or not docker_provisioner.is_available
+        # Lite (virtual/none) sessions run with no workspace pod — skip every
+        # provisioning path below (no_workspace_agent_mode.md §4). The session
+        # agent builds its lite backend from the mounts injected at attach.
+        lite_session = _backend_from_override(config_override) in LITE_BACKENDS
+        use_k8s = (
+            not lite_session
+            and container_provisioner.is_available
+            and (
+                container_provisioner.in_cluster or not docker_provisioner.is_available
+            )
         )
-        if use_k8s:
+        if lite_session:
+            logger.info(
+                "Thread %s: lite workspace backend — no workspace pod provisioned",
+                thread_id,
+            )
+        elif use_k8s:
             # Signal that workspace provisioning is starting so the agent
             # keeps polling instead of falling back to local mode immediately.
             await postgres_db.merge_thread_workspace_context(
