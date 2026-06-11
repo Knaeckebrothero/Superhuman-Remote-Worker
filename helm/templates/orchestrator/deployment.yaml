@@ -484,6 +484,28 @@ spec:
                   name: {{ include "srw.configMapName" . }}
                   key: CLOUD_RCLONE_ALLOW_CONTAINER
                   optional: true
+            # Virtual workspace tier (no_workspace_agent_mode.md §4/§5). type/root
+            # are non-secret (ConfigMap); the rclone config JSON carries
+            # credentials, so it comes from the bundled Secret. All optional —
+            # absent keys leave the tier disabled.
+            - name: VIRTUAL_WORKSPACE_RCLONE_TYPE
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: VIRTUAL_WORKSPACE_RCLONE_TYPE
+                  optional: true
+            - name: VIRTUAL_WORKSPACE_RCLONE_ROOT
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: VIRTUAL_WORKSPACE_RCLONE_ROOT
+                  optional: true
+            - name: VIRTUAL_WORKSPACE_RCLONE_CONFIG
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: VIRTUAL_WORKSPACE_RCLONE_CONFIG
+                  optional: true
             {{- if or .Values.opencloud.enabled (eq (default "" .Values.cloud.externalBackend) "opencloud") }}
             # OpenCloud — bundled (opencloud.enabled=true) or external
             # (cloud.externalBackend=opencloud). Skipped entirely otherwise so
