@@ -1616,6 +1616,10 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
 
     @app.get("/status")
     async def status():
+        # Embedding-path health (B4): degraded == dimension mismatch latched.
+        from src.services.embedding_service import peek_embedding_service
+
+        emb_service = peek_embedding_service()
         return JSONResponse(
             {
                 "mode": "persistent",
@@ -1627,6 +1631,9 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
                 "tools": [t.name for t in _session.tools]
                 if _session and _session.tools
                 else [],
+                "embedding": emb_service.health_snapshot()
+                if emb_service is not None
+                else None,
             }
         )
 

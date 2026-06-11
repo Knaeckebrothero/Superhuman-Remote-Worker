@@ -550,9 +550,14 @@ class AuxiliaryLLM:
         ]
 
         start = time.monotonic()
-        raw_result = await asyncio.wait_for(
-            structured_llm.ainvoke(messages),
-            timeout=timeout if timeout is not None else self.timeout,
+        raw_result = await self._invoke_aux(
+            asyncio.wait_for(
+                structured_llm.ainvoke(messages),
+                timeout=timeout if timeout is not None else self.timeout,
+            ),
+            task=task,
+            messages=messages,
+            start=start,
         )
         latency_ms = int((time.monotonic() - start) * 1000)
 
@@ -599,9 +604,14 @@ class AuxiliaryLLM:
         start = time.monotonic()
         tool_calls_made = 0
         for iteration in range(self.max_iterations):
-            response = await asyncio.wait_for(
-                llm_with_tools.ainvoke(messages),
-                timeout=self.timeout,
+            response = await self._invoke_aux(
+                asyncio.wait_for(
+                    llm_with_tools.ainvoke(messages),
+                    timeout=self.timeout,
+                ),
+                task=task,
+                messages=messages,
+                start=start,
             )
             messages.append(response)
 
@@ -652,9 +662,14 @@ class AuxiliaryLLM:
             )
         )
 
-        raw_result = await asyncio.wait_for(
-            structured_llm.ainvoke(messages),
-            timeout=self.timeout,
+        raw_result = await self._invoke_aux(
+            asyncio.wait_for(
+                structured_llm.ainvoke(messages),
+                timeout=self.timeout,
+            ),
+            task=task,
+            messages=messages,
+            start=start,
         )
         latency_ms = int((time.monotonic() - start) * 1000)
 
@@ -708,6 +723,62 @@ class AuxiliaryLLM:
             logger.warning(
                 f"Failed to archive auxiliary call ({task.__class__.__name__}): {e}"
             )
+
+    def _archive_error(
+        self,
+        task: AuxTask,
+        messages: List[BaseMessage],
+        exc: BaseException,
+        latency_ms: int,
+    ) -> None:
+        """Archive a FAILED auxiliary call so it surfaces in the debug view.
+
+        Auxiliary failures are swallowed as non-fatal by their callers, so
+        without this they leave no llm_requests row at all (unlike main-loop
+        failures, which surface via the job's error state). Fire-and-forget.
+        """
+        if not self._archiver or not self._job_id:
+            return
+        try:
+            task_class = task.__class__.__name__
+            call_type = _TASK_CALL_TYPES.get(task_class, "auxiliary")
+            self._archiver.archive_error(
+                job_id=self._job_id,
+                agent_type=self._agent_type,
+                messages=messages,
+                model=_get_model_name(self.llm),
+                error=str(exc),
+                error_type=type(exc).__name__,
+                latency_ms=latency_ms,
+                call_type=call_type,
+                auxiliary_metadata={"task_class": task_class},
+            )
+        except Exception as e:
+            logger.warning(
+                f"Failed to archive auxiliary error ({task.__class__.__name__}): {e}"
+            )
+
+    async def _invoke_aux(
+        self,
+        awaitable,
+        *,
+        task: AuxTask,
+        messages: List[BaseMessage],
+        start: float,
+    ):
+        """Await an auxiliary LLM call; archive an error row + re-raise on failure.
+
+        Centralizes the failure path for chain() and agent() so a failed
+        auxiliary call is recorded to llm_requests before the exception
+        propagates to the (swallowing) caller.
+        """
+        try:
+            return await awaitable
+        except Exception as exc:
+            self._archive_error(
+                task, messages, exc, int((time.monotonic() - start) * 1000)
+            )
+            raise
 
 
 # =============================================================================
@@ -774,7 +845,11 @@ async def extract_and_store_memories(
                 if mem_id:
                     stored_count += 1
             except Exception as e:
-                logger.warning(f"Memory extraction: failed to store memory: {e}")
+                logger.warning(
+                    "Memory extraction: failed to store memory: %s: %s",
+                    type(e).__name__,
+                    e,
+                )
 
         logger.info(
             f"Memory extraction: extracted {len(result.memories)}, "
@@ -785,7 +860,11 @@ async def extract_and_store_memories(
 
     except Exception as e:
         auxiliary_llm.health.record_failure("memory_extraction", e)
-        logger.warning(f"Memory extraction failed (non-fatal): {e}")
+        # Include the type — bare openai exceptions can format as "" (B1
+        # follow-up; same fix as persistent_graph retrieval logging).
+        logger.warning(
+            "Memory extraction failed (non-fatal): %s: %s", type(e).__name__, e
+        )
         return 0
 
 
@@ -857,7 +936,9 @@ async def curate_and_store_knowledge(
 
     except Exception as e:
         auxiliary_llm.health.record_failure("knowledge_curation", e)
-        logger.warning(f"Inline curation failed (non-fatal): {e}")
+        logger.warning(
+            "Inline curation failed (non-fatal): %s: %s", type(e).__name__, e
+        )
         return None
 
 
@@ -962,7 +1043,9 @@ async def assemble_memories(
 
     except Exception as e:
         auxiliary_llm.health.record_failure("memory_assembly", e)
-        logger.warning(f"Memory assembly failed (non-fatal): {e}")
+        logger.warning(
+            "Memory assembly failed (non-fatal): %s: %s", type(e).__name__, e
+        )
         return None
 
 

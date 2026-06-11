@@ -34,6 +34,27 @@ migration plan live in [[agent_memory_overhaul]].
 > - **B9 dead knobs deleted** from `MemoryConfig` + both YAMLs (§1 config-knob row
 >   stale); **B3 honesty fix**: `persistent_defaults.yaml` no longer claims
 >   `assemble_memories` runs.
+>
+> **Pre-flight deltas (2026-06-11, on develop).** Adjust further:
+> - **B1 live-verified on k3d** — a real 5-turn session produced observer rows at
+>   `observer_interval` and the `/done` teardown extraction fired (first time ever);
+>   §5 item 1 is fully closed.
+> - **B2 fixed** (migrations `vector/0002–0005`): §5 item 3 is stale twice over.
+>   The verify-then-fix is done — but `halfvec(4096)` was NOT viable (halfvec HNSW
+>   caps at 4000 dims); the shipped fix indexes + orders by
+>   `subvector(embedding, 1, 4000)::halfvec(4000)` in all five hybrid-search
+>   functions, with `hnsw.iterative_scan = relaxed_order` pinned per function.
+>   Premise correction: the scope btrees meant dense search was btree+sort per
+>   scope, not a table seq scan — the new indexes are the planner-gated hedge for
+>   scope growth. `ef_search` remains unset *by design* until overhaul Phase 3
+>   measures it. `source_embeddings` deliberately left unindexed (0 rows, no dense
+>   read path exists).
+> - **B4 fixed**: §5 item 4 is stale — `EmbeddingService` now dimension-checks every
+>   response against `EMBEDDING_DIMENSIONS` (default 4096), latches degraded with one
+>   ERROR + typed `EmbeddingDimensionError` + fail-fast, background-probes at both
+>   RecallStore init sites, and surfaces health on both agent status endpoints.
+> - **Aux logging**: the four memory catches in `auxiliary.py` now log
+>   `type(e).__name__`, so openai-style exceptions no longer log as empty strings.
 
 Classification legend:
 
@@ -206,7 +227,8 @@ default-off. **On current wiring, Neo4j is not earning its keep as a retrieval e
 ## 5. Bugs & latent risks (independent of the big overhaul)
 
 > Now tracked with severities, fix sketches, and a suggested order in
-> **`docs/issues/memory_bugs.md`** (B1–B10). Summary below kept for context.
+> **`docs/issues/memory_bugs.md`** (B1–B11; B1/B2/B4 fixed — see the delta
+> notes at the top of this doc). Summary below kept for context.
 
 1. **Persistent extraction is broken three ways by phantom config attributes.** `MemoryConfig`
    has no `extraction_interval`/`extraction_prompt` fields (the real key is `observer_interval`;

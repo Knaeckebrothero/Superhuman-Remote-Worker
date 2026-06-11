@@ -1808,6 +1808,11 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                 # Memory extraction is now handled by AuxiliaryLLM in the graph
                 # (see extract_and_store_memories in src/services/auxiliary.py)
 
+                # B4 guard: background-probe the endpoint's dimensionality so
+                # a misconfigured provider surfaces as one ERROR at init
+                # instead of a swallowed WARNING per write.
+                asyncio.create_task(embedding_service.verify_dimensions())
+
             except Exception as e:
                 logger.warning(f"Failed to initialize RecallStore (non-fatal): {e}")
 
@@ -2845,6 +2850,11 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         aux_llm = getattr(self, "_auxiliary_llm", None)
         aux_health = aux_llm.health.snapshot() if aux_llm is not None else None
 
+        # Embedding-path health (B4): degraded == dimension mismatch latched.
+        from src.services.embedding_service import peek_embedding_service
+
+        emb_service = peek_embedding_service()
+
         return {
             "agent_id": self.config.agent_id,
             "display_name": self.config.display_name,
@@ -2860,4 +2870,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                 "model": self.config.llm.model,
             },
             "auxiliary": aux_health,
+            "embedding": emb_service.health_snapshot()
+            if emb_service is not None
+            else None,
         }

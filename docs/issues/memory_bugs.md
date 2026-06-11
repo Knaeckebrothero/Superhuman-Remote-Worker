@@ -16,9 +16,9 @@ Severity overview:
 | # | Bug | Severity | Effort | Status |
 |---|---|---|---|---|
 | B1 | Persistent memory extraction broken 3 ways (phantom config attrs) | **HIGH** | ~1 h | **✅ fixed 2026-06-10** (PR #111) + **live-verified on k3d 2026-06-11** |
-| B2 | 4096-dim HNSW indexes silently skipped → seq-scan retrieval | **HIGH** | 0.5–1 d | **verified 2026-06-10: confirmed on dev AND prod** — fix open |
+| B2 | 4096-dim HNSW indexes silently skipped → seq-scan retrieval | **HIGH** | 0.5–1 d | **✅ fixed 2026-06-11** (migrations vector/0002–0005, subvector-4000 halfvec — see section for premise corrections) + verified on k3d |
 | B3 | Assembler enabled-but-never-called in persistent sessions | MED-HIGH | 5 min (honesty) / ~1 d (wire) | **honesty fix ✅ 2026-06-10** (PR #112) — wire-vs-retire deferred to overhaul Phase 5 |
-| B4 | No embedding-dimension guard → silent total memory outage | MED | ~2 h | open |
+| B4 | No embedding-dimension guard → silent total memory outage | MED | ~2 h | **✅ fixed 2026-06-11** (guard + probe + /status in EmbeddingService) |
 | B5 | KB injection block has no token budget | MED | ~0.5 d | open |
 | B6 | Memory table is grow-only — nothing ever deletes rows | MED (slow burn) | policy + ~0.5 d | open |
 | B7 | KB dual-write drift, fail-open (note in Neo4j, invisible to retrieval) | MED-LOW | ~0.5 d | open |
@@ -129,11 +129,12 @@ exercised — it shares the same fixed call path as the archive teardown and
 needs a 30-min wait; acceptable to leave to soak.
 
 Two small follow-ups noticed during the run:
-- `src/services/auxiliary.py`'s extraction catch logs bare `str(e)` → empty
-  message for openai-style exceptions (the identical bug already fixed in
-  `persistent_graph.py` retrieval handlers, see
+- ~~`src/services/auxiliary.py`'s extraction catch logs bare `str(e)` → empty
+  message for openai-style exceptions~~ **✅ fixed 2026-06-11**: the four
+  memory-relevant catches (store-loop, extraction, curation, assembly) now
+  log `type(e).__name__: e`, matching the `persistent_graph.py` retrieval
+  handlers (see
   `docs/issues/persistent_graph_misleading_embedding_connection_error.md`).
-  One-liner: log `type(e).__name__` too.
 - A failed in-loop extraction still advances `_last_extraction_turn`, so the
   next in-loop attempt is a full interval away; the teardown extraction is
   the safety net that recovered it here (fire-and-forget semantics, by design
@@ -239,7 +240,48 @@ sequential scan on both clusters. pgvector 0.8.2 ≥ 0.7, so **fix option 1
 `migrations/vector/` migration adding
 `USING hnsw ((embedding::halfvec(4096)) halfvec_cosine_ops)` per table +
 the matching `::halfvec(4096)` cast in the SQL search functions' ORDER BY.
-Fix not yet implemented.
+
+**Step-2 fix ✅ SHIPPED 2026-06-11 + verified on k3d** — migrations
+`vector/0002_hybrid_search_halfvec_casts.sql` (the five hybrid-search
+functions re-created with casts) + `0003/0004/0005_*.notx.sql` (one
+`CREATE INDEX CONCURRENTLY` per file — asyncpg runs a multi-statement
+string as one implicit transaction, which CONCURRENTLY rejects).
+
+Two premise corrections discovered during implementation:
+
+1. **`halfvec(4096)` HNSW is NOT viable** — halfvec HNSW caps at **4000**
+   dims (`ERROR: column cannot have more than 4000 dimensions for hnsw
+   index` on 0.8.2). The shipped fix is pgvector's documented >4000-dim
+   pattern: expression index + ORDER BY over
+   `subvector(embedding, 1, 4000)::halfvec(4000)` (both operands cast).
+   qwen3-embedding is MRL-trained, so prefix cosine tracks full cosine —
+   rank-identical to exact ordering on live rows (5/5 agreement).
+2. **"Every dense retrieval is a sequential scan" overstated the cliff.**
+   Every dense query is scope-filtered (`job_id`/`project_id`) and those
+   btrees exist (`idx_memories_job_type`, `idx_memories_project`,
+   `idx_knowledge_project`), so the actual plan was btree scope-scan +
+   sort — exact and *optimal at small scope sizes*. The real cliff is
+   per-scope growth (compounded by B6 grow-only). The new HNSW indexes are
+   the planner-gated hedge: small scopes keep btree+sort (planner verified
+   to prefer it), large scopes flip to HNSW.
+
+Also shipped: `SET hnsw.iterative_scan = relaxed_order` on all five
+functions — with the default `off`, a filtered HNSW scan stops after
+`ef_search` candidates and a scope filter can silently shrink/empty the
+dense channel; `relaxed_order` closes that trap before the planner ever
+flips. Deliberately skipped: `source_embeddings` index (0 rows on every
+cluster and **no dense read path exists anywhere** — the 0001 index attempt
+was speculative; add one when a read path appears) and `find_similar()`
+in `recall_store.py` (dedup threshold wants exact full-precision distance;
+not a hot path).
+
+k3d verification: all four migrations applied via the real orchestrator
+boot path (`✓ 0002 … (5 ms)` + 3 notx builds), 3 indexes `indisvalid=t`,
+`EXPLAIN` shows `Index Scan using idx_memories_embedding_halfvec` for the
+cast ORDER BY shape, and `memory_hybrid_search` returns the B1 thread's
+rows correctly ranked (RRF intact). Dev/prod pick the migrations up at
+next orchestrator deploy (builds are sub-second at 942/3332/169 rows).
+`ef_search` tuning remains Phase 3 of the overhaul — now actually possible.
 
 ---
 
@@ -299,6 +341,21 @@ probe string, compare `len(vector)` to the schema dim; on mismatch log ERROR,
 mark memory degraded in `AuxHealth`/status, and disable the subsystem loudly
 rather than letting every write fail quietly. Wire the same probe into
 `/status`.
+
+**✅ FIXED 2026-06-11** — guard lives in `EmbeddingService` itself so every
+caller is covered: each `embed`/`embed_batch` response is dimension-checked
+against `EMBEDDING_DIMENSIONS` (default 4096 = the schema); a mismatch logs
+one ERROR, latches `degraded_reason` for the process lifetime, raises typed
+`EmbeddingDimensionError`, and all subsequent calls fail fast without I/O
+(call sites keep swallowing — non-fatal as designed, but now loud + visible).
+`verify_dimensions()` background-probes at both RecallStore init sites
+(worker `agent.py`, persistent `persistent_session.py`); connectivity
+failures are deliberately inconclusive (no latch — transient ≠ misconfig).
+`health_snapshot()` surfaced as `"embedding"` on both status endpoints
+(worker `get_status()`, persistent `/status`) via `peek_embedding_service()`
+(never constructs on a status poll). Tests: `TestDimensionGuard` in
+`tests/test_embedding_service.py` (8 cases). The dead `memory.embedding_model`
+YAML-key aggravator was already deleted in the B9 sweep (#112).
 
 ---
 
@@ -439,11 +496,14 @@ before Phase 1) and the equally-dead `_load_query` twins in
 
 1. ~~**B1**~~ ✅ fixed 2026-06-10, live-verified on k3d 2026-06-11 (all
    signals green; see B1 status above).
-2. ~~**B2 step 1**~~ ✅ verified 2026-06-10 — it IS a real perf cliff on both
-   clusters; the halfvec migration (step 2) is now the open work item.
+2. ~~**B2**~~ ✅ complete — step 1 verified 2026-06-10; step 2 (subvector-4000
+   halfvec migrations vector/0002–0005) shipped + k3d-verified 2026-06-11.
 3. ~~**B3 honesty fix + B9**~~ ✅ shipped 2026-06-10.
-4. **B4** — cheap prevention for a failure class that has already bitten
-   once. ← next open item.
-5. B5/B6/B7/B8/B10 — batch opportunistically or alongside overhaul phases
-   that touch the same files. B2 step 2 (halfvec migration) slots naturally
-   before Phase 3's `ef_search` tuning.
+4. ~~**B4**~~ ✅ fixed 2026-06-11 (dimension guard + startup probe + /status).
+5. B5/B6/B7/B8/B10/B11 — absorbed by overhaul phases by design: B5 → Phase 1
+   `token_budget` policy; B8 → Phase 1 plugin decoupling; B10 → Phase 1
+   equivalence fixtures; B11 → Phase 1 `capture(kind="session_end")` hooking
+   `_terminate_session`; B3 wire-vs-retire → Phase 5 ablation; B6 → Phase 4
+   `gc` writer; B7 → graph-as-plugin restructure (Phase 1/7). Don't fix these
+   standalone first — Phase 1 pins current behaviour with fixtures, so the
+   old code should stay frozen until the seam lands.

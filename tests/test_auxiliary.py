@@ -660,3 +660,117 @@ class TestOutputSchemas:
             summary="Created 3 notes.",
         )
         assert result.notes_created == 3
+
+
+# =============================================================================
+# Failed-aux archiving — surface silent aux failures
+# (docs/issues/surface_silent_aux_failures.md)
+# =============================================================================
+
+
+class TestAuxErrorArchiving:
+    @pytest.mark.asyncio
+    async def test_chain_failure_archives_error_and_reraises(self):
+        mock_llm = MagicMock()
+        structured_mock = AsyncMock()
+        structured_mock.ainvoke = AsyncMock(
+            side_effect=ConnectionError("503 backend down")
+        )
+        mock_llm.with_structured_output = MagicMock(return_value=structured_mock)
+
+        archiver = MagicMock()
+        aux = AuxiliaryLLM(llm=mock_llm, timeout=5.0)
+        aux.set_job_context(archiver=archiver, job_id="job-123", agent_type="scholar")
+        task = ExtractMemoriesTask(messages=[], prompt=_TEST_MEMORY_PROMPT, phase=0)
+
+        with pytest.raises(ConnectionError):
+            await aux.chain(task)
+
+        archiver.archive_error.assert_called_once()
+        kwargs = archiver.archive_error.call_args.kwargs
+        assert kwargs["job_id"] == "job-123"
+        assert kwargs["call_type"] == "memory_extraction"
+        assert kwargs["error_type"] == "ConnectionError"
+        assert "503" in kwargs["error"]
+        # A failed call must not also archive a success row.
+        archiver.archive.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_archive_error_noop_without_job_context(self):
+        # Persistent-session path: no archiver wired -> must not crash, still raises.
+        mock_llm = MagicMock()
+        structured_mock = AsyncMock()
+        structured_mock.ainvoke = AsyncMock(side_effect=RuntimeError("boom"))
+        mock_llm.with_structured_output = MagicMock(return_value=structured_mock)
+
+        aux = AuxiliaryLLM(llm=mock_llm, timeout=5.0)  # no set_job_context
+        task = ExtractMemoriesTask(messages=[], prompt=_TEST_MEMORY_PROMPT, phase=0)
+
+        with pytest.raises(RuntimeError):
+            await aux.chain(task)
+
+    @pytest.mark.asyncio
+    async def test_successful_chain_archives_success_not_error(self):
+        mock_llm = _make_structured_llm(ExtractedMemories(memories=[]))
+        archiver = MagicMock()
+        aux = AuxiliaryLLM(llm=mock_llm)
+        aux.set_job_context(archiver=archiver, job_id="job-1", agent_type="scholar")
+        task = ExtractMemoriesTask(
+            messages=[HumanMessage(content="hi")],
+            prompt=_TEST_MEMORY_PROMPT,
+            phase=0,
+        )
+
+        await aux.chain(task)
+
+        archiver.archive.assert_called_once()
+        archiver.archive_error.assert_not_called()
+
+
+class TestArchiveError:
+    def _archiver(self, connected=True, inserted_id="deadbeef"):
+        from src.core.archiver import LLMArchiver
+
+        archiver = LLMArchiver(mongodb_url="")  # no eager connection
+        archiver._ensure_connected = MagicMock(return_value=connected)
+        archiver._collection = MagicMock()
+        archiver._collection.insert_one.return_value = MagicMock(
+            inserted_id=inserted_id
+        )
+        return archiver
+
+    def test_writes_error_document(self):
+        archiver = self._archiver()
+        doc_id = archiver.archive_error(
+            job_id="job-1",
+            agent_type="scholar",
+            messages=[HumanMessage(content="hello")],
+            model="gemma-4-moe",
+            error="503 All backends unavailable",
+            error_type="ConnectionError",
+            latency_ms=12,
+            call_type="memory_extraction",
+            auxiliary_metadata={"task_class": "ExtractMemoriesTask"},
+        )
+        assert doc_id == "deadbeef"
+        doc = archiver._collection.insert_one.call_args[0][0]
+        assert doc["status"] == "error"
+        assert doc["call_type"] == "memory_extraction"
+        assert doc["error"]["type"] == "ConnectionError"
+        assert "503" in doc["error"]["message"]
+        assert doc["response"] is None
+        assert doc["model"] == "gemma-4-moe"
+        assert doc["request"]["message_count"] == 1
+
+    def test_noop_when_disconnected(self):
+        archiver = self._archiver(connected=False)
+        out = archiver.archive_error(
+            job_id="j",
+            agent_type="a",
+            messages=[],
+            model="m",
+            error="e",
+            error_type="E",
+        )
+        assert out is None
+        archiver._collection.insert_one.assert_not_called()

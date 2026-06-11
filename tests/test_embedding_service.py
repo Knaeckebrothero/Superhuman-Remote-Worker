@@ -13,6 +13,7 @@ def mock_env(monkeypatch):
     monkeypatch.delenv("EMBEDDING_BASE_URL", raising=False)
     monkeypatch.delenv("EMBEDDING_MODEL", raising=False)
     monkeypatch.delenv("EMBEDDING_PROVIDER", raising=False)
+    monkeypatch.delenv("EMBEDDING_DIMENSIONS", raising=False)
 
 
 @pytest.fixture
@@ -87,8 +88,9 @@ class TestEmbeddingServiceEmbed:
     """Test embed() and embed_batch() methods."""
 
     @pytest.mark.asyncio
-    async def test_embed_single(self, mock_env, mock_openai_client):
+    async def test_embed_single(self, mock_env, monkeypatch, mock_openai_client):
         """embed() returns a vector from the API response."""
+        monkeypatch.setenv("EMBEDDING_DIMENSIONS", "3")
         mock_client, _ = mock_openai_client
         from src.services.embedding_service import EmbeddingService
 
@@ -109,8 +111,9 @@ class TestEmbeddingServiceEmbed:
         )
 
     @pytest.mark.asyncio
-    async def test_embed_batch(self, mock_env, mock_openai_client):
+    async def test_embed_batch(self, mock_env, monkeypatch, mock_openai_client):
         """embed_batch() returns vectors in input order."""
+        monkeypatch.setenv("EMBEDDING_DIMENSIONS", "1")
         mock_client, _ = mock_openai_client
         from src.services.embedding_service import EmbeddingService
 
@@ -140,6 +143,128 @@ class TestEmbeddingServiceEmbed:
         service = EmbeddingService()
         result = await service.embed_batch([])
         assert result == []
+
+
+class TestDimensionGuard:
+    """B4: dimension mismatch must latch loudly instead of failing quietly."""
+
+    def _mock_response(self, mock_client, vector):
+        mock_embedding = MagicMock()
+        mock_embedding.embedding = vector
+        mock_embedding.index = 0
+        mock_response = MagicMock()
+        mock_response.data = [mock_embedding]
+        mock_client.embeddings.create = AsyncMock(return_value=mock_response)
+
+    def test_default_expected_dimensions(self, mock_env, mock_openai_client):
+        """Defaults to the schema's vector(4096)."""
+        from src.services.embedding_service import EmbeddingService
+
+        assert EmbeddingService().expected_dimensions == 4096
+
+    @pytest.mark.asyncio
+    async def test_mismatch_raises_and_latches(self, mock_env, mock_openai_client):
+        """Wrong dimensionality raises EmbeddingDimensionError and latches."""
+        mock_client, _ = mock_openai_client
+        from src.services.embedding_service import (
+            EmbeddingDimensionError,
+            EmbeddingService,
+        )
+
+        self._mock_response(mock_client, [0.1, 0.2, 0.3])  # 3 != 4096
+        service = EmbeddingService()
+
+        with pytest.raises(EmbeddingDimensionError, match="3-dim"):
+            await service.embed("test")
+        assert service.degraded_reason is not None
+
+        # Second call fails fast without touching the API again.
+        mock_client.embeddings.create.reset_mock()
+        with pytest.raises(EmbeddingDimensionError):
+            await service.embed("test")
+        mock_client.embeddings.create.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_batch_mismatch_raises(self, mock_env, mock_openai_client):
+        """embed_batch() checks dimensions too."""
+        mock_client, _ = mock_openai_client
+        from src.services.embedding_service import (
+            EmbeddingDimensionError,
+            EmbeddingService,
+        )
+
+        self._mock_response(mock_client, [0.1])
+        service = EmbeddingService()
+
+        with pytest.raises(EmbeddingDimensionError):
+            await service.embed_batch(["a"])
+        assert service.degraded_reason is not None
+
+    @pytest.mark.asyncio
+    async def test_verify_dimensions_ok(
+        self, mock_env, monkeypatch, mock_openai_client
+    ):
+        """Probe returns True when dimensions match."""
+        monkeypatch.setenv("EMBEDDING_DIMENSIONS", "2")
+        mock_client, _ = mock_openai_client
+        from src.services.embedding_service import EmbeddingService
+
+        self._mock_response(mock_client, [0.1, 0.2])
+        service = EmbeddingService()
+
+        assert await service.verify_dimensions() is True
+        assert service.degraded_reason is None
+
+    @pytest.mark.asyncio
+    async def test_verify_dimensions_mismatch(self, mock_env, mock_openai_client):
+        """Probe returns False on mismatch and latches degraded."""
+        mock_client, _ = mock_openai_client
+        from src.services.embedding_service import EmbeddingService
+
+        self._mock_response(mock_client, [0.1, 0.2])
+        service = EmbeddingService()
+
+        assert await service.verify_dimensions() is False
+        assert service.degraded_reason is not None
+
+    @pytest.mark.asyncio
+    async def test_verify_dimensions_inconclusive(self, mock_env, mock_openai_client):
+        """Connectivity failures must NOT latch degraded (transient)."""
+        mock_client, _ = mock_openai_client
+        from src.services.embedding_service import EmbeddingService
+
+        mock_client.embeddings.create = AsyncMock(side_effect=ConnectionError("down"))
+        service = EmbeddingService()
+
+        assert await service.verify_dimensions() is None
+        assert service.degraded_reason is None
+
+    def test_health_snapshot(self, mock_env, mock_openai_client):
+        """Snapshot carries the degraded flag for /status."""
+        from src.services.embedding_service import EmbeddingService
+
+        service = EmbeddingService()
+        snap = service.health_snapshot()
+        assert snap["degraded"] is False
+        assert snap["expected_dimensions"] == 4096
+        assert snap["model"] == "qwen3-embedding-8b"
+
+        service.degraded_reason = "boom"
+        snap = service.health_snapshot()
+        assert snap["degraded"] is True
+        assert snap["degraded_reason"] == "boom"
+
+    def test_peek_does_not_construct(self, mock_env, mock_openai_client):
+        """peek_embedding_service() never builds the singleton."""
+        import src.services.embedding_service as mod
+
+        mod._embedding_service = None
+        assert mod.peek_embedding_service() is None
+        assert mod._embedding_service is None
+
+        s = mod.get_embedding_service()
+        assert mod.peek_embedding_service() is s
+        mod._embedding_service = None
 
 
 class TestEmbeddingProviders:
