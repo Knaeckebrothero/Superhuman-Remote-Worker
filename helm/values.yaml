@@ -1136,6 +1136,41 @@ s3:
   snapshotRetentionDays: "90"
 
 # =============================================================================
+# Virtual workspace tier (no_workspace_agent_mode.md §4/§5)
+# =============================================================================
+# Object store backing `workspace.backend: virtual` agents — file tools over
+# explicit rclone ops, no workspace pod, no PVC. The orchestrator injects this
+# as the agent's mount spec at dispatch/attach; per-job files land under
+# jobs/<id>/, sessions under threads/<id>/. Credentials travel in-flight only
+# (never persisted to the job/thread row) and reach rclone as RCLONE_CONFIG_*
+# env in the agent — never argv.
+#
+# Local-dev story (resolves the §13 open question):
+#   * dev / k3d  → type "memory": a non-durable, in-process store. A `virtual`
+#     job/session runs as a single pod and round-trips files within the agent's
+#     lifetime, with NO MinIO dependency. Not durable — files vanish on pod
+#     restart; fine for smoke tests, never a real target.
+#   * production → type "s3" against the existing MinIO (e.g. minio.minio.svc),
+#     with credentials in the bundled Secret key VIRTUAL_WORKSPACE_RCLONE_CONFIG
+#     (secrets.values for chart-managed secrets, or ESO/Vault).
+#
+# Empty `rclone.type` disables the tier: a `virtual` job/session then fails fast
+# with an actionable error (use `none`, `sandbox`, or `vm` instead).
+virtualWorkspace:
+  rclone:
+    # rclone backend type: "s3" | "webdav" | "memory" | "" (disabled).
+    type: ""
+    # Bucket or bucket/subpath, e.g. "srw-workspaces". Empty for type "memory".
+    root: ""
+    # The rclone config (access_key_id, secret_access_key, endpoint, provider,
+    # region | url, user, pass, …) is a JSON object supplied via the bundled
+    # Secret key VIRTUAL_WORKSPACE_RCLONE_CONFIG — e.g. under secrets.values:
+    #   VIRTUAL_WORKSPACE_RCLONE_CONFIG: |
+    #     {"provider":"Minio","access_key_id":"…","secret_access_key":"…",
+    #      "endpoint":"http://minio.minio.svc:9000"}
+    # type "memory" needs no config.
+
+# =============================================================================
 # IDE Sessions
 # =============================================================================
 ide:
