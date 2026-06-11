@@ -178,6 +178,13 @@ data:
   # through lazy rclone/FUSE mounts instead.
   CLOUD_WORKSPACE_DRIVER: {{ .Values.cloud.workspaceDriver | default "rclone_mount" | quote }}
   CLOUD_RCLONE_ALLOW_CONTAINER: {{ ternary "true" "false" .Values.cloud.rcloneMount.allowContainer | quote }}
+
+  # Virtual workspace tier (no_workspace_agent_mode.md §4/§5) — object store for
+  # `workspace.backend: virtual` agents. Empty type disables the tier (a virtual
+  # job/session then fails fast). Credentials live in the bundled Secret key
+  # VIRTUAL_WORKSPACE_RCLONE_CONFIG, wired separately on the orchestrator pod.
+  VIRTUAL_WORKSPACE_RCLONE_TYPE: {{ .Values.virtualWorkspace.rclone.type | default "" | quote }}
+  VIRTUAL_WORKSPACE_RCLONE_ROOT: {{ .Values.virtualWorkspace.rclone.root | default "" | quote }}
   {{- if .Values.cloud.nextcloudRcloneUserHomeUsername }}
   NEXTCLOUD_RCLONE_USER_HOME_USERNAME: {{ .Values.cloud.nextcloudRcloneUserHomeUsername | quote }}
   {{- end }}
