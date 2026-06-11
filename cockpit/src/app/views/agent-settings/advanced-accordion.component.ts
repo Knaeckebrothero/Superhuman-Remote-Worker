@@ -405,12 +405,17 @@ import {UserService} from '../../core/services/user.service';
                   @if (canUseVm()) {
                     <option value="vm">{{ 'advanced.options.vmQemu' | transloco }}</option>
                   }
+                  <option value="virtual">{{ 'advanced.options.virtual' | transloco }}</option>
+                  <option value="none">{{ 'advanced.options.none' | transloco }}</option>
                 </select>
                 @if (workspaceBackend() !== null) {
                   <button type="button" class="reset-btn" (click)="workspaceBackend.set(null); vmCpuCores.set(null); vmMemory.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
                 }
               </div>
             </div>
+            @if (isLiteBackend()) {
+              <p class="field-hint lite-hint">{{ (isNoneBackend() ? 'advanced.hints.noneBackend' : 'advanced.hints.virtualBackend') | transloco }}</p>
+            }
             @if ((workspaceBackend() ?? resolvedWorkspaceBackend()) === 'vm') {
               <div class="field-row" [class.modified]="vmCpuCores() !== null">
                 <label class="field-label">{{ 'advanced.labels.vmCpuCores' | transloco }}</label>
@@ -443,7 +448,7 @@ import {UserService} from '../../core/services/user.service';
                 <input type="number" class="form-input compact-input" min="0" step="1000"
                   [ngModel]="maxReadWords() ?? resolvedMaxReadWords()"
                   (ngModelChange)="maxReadWords.set($event); emitChange()"
-                  [disabled]="disabled()">
+                  [disabled]="disabled() || isNoneBackend()">
                 @if (maxReadWords() !== null) {
                   <button type="button" class="reset-btn" (click)="maxReadWords.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
                 }
@@ -455,7 +460,7 @@ import {UserService} from '../../core/services/user.service';
                 <input type="number" class="form-input compact-input" min="0" step="1000"
                   [ngModel]="maxWriteWords() ?? resolvedMaxWriteWords()"
                   (ngModelChange)="maxWriteWords.set($event); emitChange()"
-                  [disabled]="disabled()">
+                  [disabled]="disabled() || isNoneBackend()">
                 @if (maxWriteWords() !== null) {
                   <button type="button" class="reset-btn" (click)="maxWriteWords.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
                 }
@@ -466,7 +471,7 @@ import {UserService} from '../../core/services/user.service';
                 <input type="checkbox"
                   [checked]="gitVersioning() ?? resolvedGitVersioning()"
                   (change)="onGitVersioningChange($event)"
-                  [disabled]="disabled()">
+                  [disabled]="disabled() || isLiteBackend()">
                 <span>{{ 'advanced.labels.gitVersioning' | transloco }}</span>
               </label>
               @if (gitVersioning() !== null) {
@@ -491,7 +496,7 @@ import {UserService} from '../../core/services/user.service';
                 <select class="form-input"
                   [ngModel]="shellMode() ?? resolvedShellMode()"
                   (ngModelChange)="shellMode.set($event); emitChange()"
-                  [disabled]="disabled()">
+                  [disabled]="disabled() || isLiteBackend()">
                   <option value="stateless">{{ 'advanced.options.stateless' | transloco }}</option>
                   <option value="persistent">{{ 'advanced.options.persistent' | transloco }}</option>
                 </select>
@@ -505,7 +510,7 @@ import {UserService} from '../../core/services/user.service';
                 <input type="checkbox"
                   [checked]="shellSandbox() ?? resolvedShellSandbox()"
                   (change)="onShellSandboxChange($event)"
-                  [disabled]="disabled()">
+                  [disabled]="disabled() || isLiteBackend()">
                 <span>{{ 'advanced.labels.sandbox' | transloco }}</span>
               </label>
               @if (shellSandbox() !== null) {
@@ -518,7 +523,7 @@ import {UserService} from '../../core/services/user.service';
                 <input type="number" class="form-input compact-input" min="1"
                   [ngModel]="shellTimeout() ?? resolvedShellTimeout()"
                   (ngModelChange)="shellTimeout.set($event); emitChange()"
-                  [disabled]="disabled()">
+                  [disabled]="disabled() || isLiteBackend()">
                 @if (shellTimeout() !== null) {
                   <button type="button" class="reset-btn" (click)="shellTimeout.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
                 }
@@ -530,7 +535,7 @@ import {UserService} from '../../core/services/user.service';
                 <select class="form-input"
                   [ngModel]="sudoAction() ?? resolvedSudoAction()"
                   (ngModelChange)="sudoAction.set($event); emitChange()"
-                  [disabled]="disabled()">
+                  [disabled]="disabled() || isLiteBackend()">
                   <option value="freeze">{{ 'advanced.options.sudoFreeze' | transloco }}</option>
                   <option value="block">{{ 'advanced.options.sudoBlock' | transloco }}</option>
                   <option value="allow">{{ 'advanced.options.sudoAllow' | transloco }}</option>
@@ -569,7 +574,7 @@ import {UserService} from '../../core/services/user.service';
                 <input type="checkbox"
                   [checked]="browserHeadless() ?? resolvedBrowserHeadless()"
                   (change)="onBrowserHeadlessChange($event)"
-                  [disabled]="disabled()">
+                  [disabled]="disabled() || isLiteBackend()">
                 <span>{{ 'advanced.labels.browserHeadless' | transloco }}</span>
               </label>
               @if (browserHeadless() !== null) {
@@ -581,7 +586,7 @@ import {UserService} from '../../core/services/user.service';
                 <input type="checkbox"
                   [checked]="browserVision() ?? resolvedBrowserVision()"
                   (change)="onBrowserVisionChange($event)"
-                  [disabled]="disabled()">
+                  [disabled]="disabled() || isLiteBackend()">
                 <span>{{ 'advanced.labels.browserVision' | transloco }}</span>
               </label>
               @if (browserVision() !== null) {
@@ -784,6 +789,14 @@ import {UserService} from '../../core/services/user.service';
       font-size: 11px;
       color: var(--text-muted, #6c7086);
       margin-top: 2px;
+    }
+    .lite-hint {
+      margin: 4px 0 8px;
+      padding: 6px 9px;
+      line-height: 1.4;
+      border-left: 2px solid var(--accent-color, var(--accent-color));
+      background: var(--surface-1, rgba(127, 127, 127, 0.08));
+      border-radius: 3px;
     }
     .form-input {
       flex: 1;
@@ -1008,6 +1021,17 @@ export class AdvancedAccordionComponent {
     return (v ?? (this.mode() === 'job')) as boolean;
   });
 
+  // Effective backend = override → resolved config default. The lite tiers
+  // (`virtual`/`none`) run with no workspace container, so shell/browser/git
+  // tools are gated off server-side (no_workspace_agent_mode.md §7) and the
+  // form greys the matching controls. `none` additionally has no file tools.
+  readonly effectiveBackend = computed(() => this.workspaceBackend() ?? this.resolvedWorkspaceBackend());
+  readonly isLiteBackend = computed(() => {
+    const b = this.effectiveBackend();
+    return b === 'virtual' || b === 'none';
+  });
+  readonly isNoneBackend = computed(() => this.effectiveBackend() === 'none');
+
   readonly resolvedShellMode = computed(() => (this.r('shell.mode') ?? 'stateless') as string);
   readonly resolvedShellSandbox = computed(() => (this.r('shell.sandbox') ?? true) as boolean);
   readonly resolvedShellTimeout = computed(() => (this.r('shell.default_timeout') ?? 120) as number);
@@ -1161,7 +1185,11 @@ export class AdvancedAccordionComponent {
     if (this.keepRecentMessages() !== null) ctx['keep_recent_messages'] = this.keepRecentMessages();
     if (Object.keys(ctx).length) o['context_management'] = ctx;
 
-    // Workspace
+    // Workspace. Lite tiers (virtual/none) run with no container, so the gated
+    // tool categories' settings aren't emitted (no_workspace_agent_mode.md §7):
+    // git is forced off for any lite tier, file-size limits drop for `none`
+    // (no file tools), and the whole shell/browser fragments are skipped.
+    const lite = this.isLiteBackend();
     const ws: Record<string, unknown> = {};
     if (this.workspaceBackend() !== null) ws['backend'] = this.workspaceBackend();
     if (this.workspaceBackend() === 'vm') {
@@ -1170,25 +1198,32 @@ export class AdvancedAccordionComponent {
       if (this.vmMemory() !== null) vm['memory'] = this.vmMemory();
       if (Object.keys(vm).length) ws['vm'] = vm;
     }
-    if (this.maxReadWords() !== null) ws['max_read_words'] = this.maxReadWords();
-    if (this.maxWriteWords() !== null) ws['max_write_words'] = this.maxWriteWords();
-    if (this.gitVersioning() !== null) ws['git_versioning'] = this.gitVersioning();
+    if (!this.isNoneBackend()) {
+      if (this.maxReadWords() !== null) ws['max_read_words'] = this.maxReadWords();
+      if (this.maxWriteWords() !== null) ws['max_write_words'] = this.maxWriteWords();
+    }
+    if (!lite && this.gitVersioning() !== null) ws['git_versioning'] = this.gitVersioning();
     if (Object.keys(ws).length) o['workspace'] = ws;
 
-    // Shell
-    const sh: Record<string, unknown> = {};
-    if (this.shellMode() !== null) sh['mode'] = this.shellMode();
-    if (this.shellSandbox() !== null) sh['sandbox'] = this.shellSandbox();
-    if (this.shellTimeout() !== null) sh['default_timeout'] = this.shellTimeout();
-    if (this.sudoAction() !== null) sh['sudo_action'] = this.sudoAction();
-    if (Object.keys(sh).length) o['shell'] = sh;
+    // Shell — no shell tools on lite tiers, so skip the fragment entirely.
+    if (!lite) {
+      const sh: Record<string, unknown> = {};
+      if (this.shellMode() !== null) sh['mode'] = this.shellMode();
+      if (this.shellSandbox() !== null) sh['sandbox'] = this.shellSandbox();
+      if (this.shellTimeout() !== null) sh['default_timeout'] = this.shellTimeout();
+      if (this.sudoAction() !== null) sh['sudo_action'] = this.sudoAction();
+      if (Object.keys(sh).length) o['shell'] = sh;
+    }
 
-    // Research & Browser
+    // Research & Browser — browser tools are gated off on lite tiers; the proxy
+    // toggle stays (web_search egress still applies).
     if (this.proxyEnabled() !== null) o['research'] = { proxy: { enabled: this.proxyEnabled() } };
-    const br: Record<string, unknown> = {};
-    if (this.browserHeadless() !== null) br['headless'] = this.browserHeadless();
-    if (this.browserVision() !== null) br['use_vision'] = this.browserVision();
-    if (Object.keys(br).length) o['browser'] = br;
+    if (!lite) {
+      const br: Record<string, unknown> = {};
+      if (this.browserHeadless() !== null) br['headless'] = this.browserHeadless();
+      if (this.browserVision() !== null) br['use_vision'] = this.browserVision();
+      if (Object.keys(br).length) o['browser'] = br;
+    }
 
     // Auxiliary
     const aux: Record<string, unknown> = {};

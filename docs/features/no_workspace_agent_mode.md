@@ -408,8 +408,24 @@ observed demand.
 - **v1.1 — polish (hours-to-days, demand-driven):**
   - `workspace_changes` op-log tool (changed paths per phase, no diffs) if
     phase-review pressure appears before v2 lands.
-  - Cockpit tier picker — v1 selects the tier via `config_override` /
-    expert preset, no UI requirement; a first-class selector is polish.
+  - **Cockpit tier picker — DONE 2026-06-11.** The Advanced-settings accordion's
+    workspace `backend` selector (`advanced-accordion.component.ts`) now offers
+    `virtual` and `none` alongside `sandbox`/`vm`. Selecting a lite tier greys
+    the dependent controls — git-versioning, the whole Shell section, browser
+    headless/vision; `none` also greys the file-size limits — and shows an
+    explanatory hint, and `getOverrides()` stops emitting the gated
+    `shell`/`browser`/`git_versioning` fragments so the emitted `config_override`
+    stays clean. This mirrors the server-side capability gate (S3) in the UI
+    (no permission gating — lite tiers are lighter than `sandbox`, available to
+    all). en/de i18n + 4 spec tests; `npm run build` AOT-clean. **Validated live
+    on k3d via Playwright 2026-06-11** (logged into the running cockpit pod over
+    the live-synced `ng serve`): Create-Job → Advanced → Workspace lists all four
+    backends with resolved labels; selecting `virtual` greys git-versioning + the
+    whole Shell section + browser headless/vision and shows the hint, while file
+    limits + proxy stay enabled; `none` additionally greys the file limits and
+    switches the hint. Remaining Cockpit piece is §12 #8 (session-view affordance-
+    hiding: code-server/workspace links) — and the UI→`config_override`→dispatch
+    round-trip through the real form (form behaviour verified; submit not yet driven).
   - Revisit rclone-subprocess vs boto3 with production latency numbers.
 - **v2 — change tracking & cloud diff review (~1 week):** the §8 successor.
   `supports_change_tracking` journal + version stash; status/log/diff
@@ -497,7 +513,9 @@ tools on `none` — `Backend capability gate dropped N tool(s)`; web + datasourc
 actionable message), ✅ **#6** (`none` ran on `ScratchBackend`, completed, with
 **zero** file tools bound), ✅ **#7** (the auto-spawned scholar — a `sandbox`
 job — still got its workspace pod). ⛔ **#3** (web + SQL datasource) not run;
-⛔ **#8** (Cockpit affordances) is v1.1.
+⛔ **#8** (Cockpit affordances) is v1.1 — the workspace **tier picker** (the
+`virtual`/`none` selector + dependent-control greying) landed 2026-06-11 (§10);
+the session-view affordance-hiding (code-server/workspace links) remains.
 
 > Environment caveat (not the feature): on the dev cluster only a *chat* model
 > was configured, so *summarization/auxiliary* LLM calls fall back to

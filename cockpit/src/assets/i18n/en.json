@@ -1455,6 +1455,8 @@
     "options": {
       "container": "Container",
       "vmQemu": "VM (QEMU)",
+      "virtual": "Virtual (cloud files)",
+      "none": "None (no workspace)",
       "stateless": "Stateless",
       "persistent": "Persistent",
       "sudoFreeze": "Freeze (ask user)",
@@ -1463,7 +1465,9 @@
     },
     "hints": {
       "idleDisabled": "0 = disabled",
-      "autoPlaceholder": "auto"
+      "autoPlaceholder": "auto",
+      "virtualBackend": "Virtual workspaces run with no container — shell, browser, and git tools are disabled. File, web, database, and knowledge tools remain available.",
+      "noneBackend": "None runs with no workspace at all — shell, browser, git, and file tools are disabled. Web, database, and knowledge tools remain available."
     }
   },
   "jobReviewPage": {
