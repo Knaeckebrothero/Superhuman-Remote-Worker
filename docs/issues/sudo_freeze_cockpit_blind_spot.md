@@ -2,7 +2,7 @@
 
 **Date:** 2026-04-13
 **Status:** Open
-**Related:** `docs/issues/sudo_freeze_bypass_remote_backend.md` (the bypass that prevented freezes from firing at all)
+**Related:** `docs/done/sudo_freeze_bypass_remote_backend.md` (the bypass that prevented freezes from firing at all)
 
 ## Summary
 

@@ -92,6 +92,6 @@ out of scope; they belong in their own issue if/when they bite:
 
 ## Related
 
-- `docs/issues/session_folder_placement.md` — the layout question that
+- `docs/done/session_folder_placement.md` — the layout question that
   this investigation surfaced (project-bound vs cross-project session
   folders). Independent of these bugs but discovered together.

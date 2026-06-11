@@ -1253,7 +1253,7 @@ Cockpit models in `cockpit/src/app/core/models/api.model.ts` lose `nextcloud_fol
 - [[features/sso_and_cloud_storage]] — the original Keycloak + Nextcloud design (still accurate as the description of the current Nextcloud adapter)
 - [[features/project_cloud_folders]] — the project/session folder lifecycle this document re-implements behind an interface
 - [[datasources]] — datasource system overview
-- `docs/issues/nextcloud_oidc_username.md` — OIDC username quirk; relevant precedent for OpenCloud's `sub` claim requirement
+- `docs/done/nextcloud_oidc_username.md` — OIDC username quirk; relevant precedent for OpenCloud's `sub` claim requirement
 
 ## 13. Appendices — Research References
 

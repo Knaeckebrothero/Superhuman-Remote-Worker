@@ -134,7 +134,7 @@ Two small follow-ups noticed during the run:
   memory-relevant catches (store-loop, extraction, curation, assembly) now
   log `type(e).__name__: e`, matching the `persistent_graph.py` retrieval
   handlers (see
-  `docs/issues/persistent_graph_misleading_embedding_connection_error.md`).
+  `docs/done/persistent_graph_misleading_embedding_connection_error.md`).
 - A failed in-loop extraction still advances `_last_extraction_turn`, so the
   next in-loop attempt is a full interval away; the teardown extraction is
   the safety net that recovered it here (fire-and-forget semantics, by design

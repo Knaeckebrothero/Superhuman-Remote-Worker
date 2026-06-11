@@ -73,7 +73,7 @@ The existing `test_exits_when_thread_status_is_ended` and `test_does_not_exit_wh
 
 ## Why this didn't show up in Phase 5 smoke
 
-The Phase 5 smoke runbook (`docs/issues/headless_sessions_smoke_leaks_cluster_pods.md`) exercises the orchestrator-side attention-sleep watchdog by manipulating the `awaiting_user_since` column directly. It doesn't exercise the agent-side `_thread_status_watchdog` poll race with the agent's own `awaiting_user` flip — the two watchdogs were treated as independent components in test, so their interaction wasn't probed.
+The Phase 5 smoke runbook (`docs/done/headless_sessions_smoke_leaks_cluster_pods.md`) exercises the orchestrator-side attention-sleep watchdog by manipulating the `awaiting_user_since` column directly. It doesn't exercise the agent-side `_thread_status_watchdog` poll race with the agent's own `awaiting_user` flip — the two watchdogs were treated as independent components in test, so their interaction wasn't probed.
 
 The integration test that would have caught this is "attach a persistent agent to a thread, let one turn complete, leave it idle, and assert the pod is still up 90 s later". That probe should be added — see "Follow-ups" below.
 
@@ -90,5 +90,5 @@ The integration test that would have caught this is "attach a persistent agent t
 - `orchestrator/main.py:9599` — `GET /api/agents/threads/{thread_id}/lifecycle` (what the watchdog polls).
 - `orchestrator/main.py:9649` — `PUT /api/agents/threads/{thread_id}/status` handler (the `ended → _suspend_thread_resources` chain).
 - `docs/features/headless_persistent_sessions.md:116` — the design doc note that anticipated this exact thing.
-- `docs/issues/persistent_session_permission_check_race.md` — earlier watchdog work that audited `_detach_session()` callers and added the cancel-loop-first guard at commit `3a1d265`.
-- `docs/issues/headless_sessions_smoke_leaks_cluster_pods.md` — Phase 5 smoke runbook; the integration smoke gap noted above belongs here.
+- `docs/done/persistent_session_permission_check_race.md` — earlier watchdog work that audited `_detach_session()` callers and added the cancel-loop-first guard at commit `3a1d265`.
+- `docs/done/headless_sessions_smoke_leaks_cluster_pods.md` — Phase 5 smoke runbook; the integration smoke gap noted above belongs here.

@@ -166,5 +166,5 @@ Mirrors how other structural cleanups have been handled in this repo (e.g. `orch
 
 ## Related
 
-- `docs/issues/persistent_session_dual_mode_phase1_gap.md` — the previous round of consolidation between `dual_app` and `persistent_app` (WS handler + REST handlers).
+- `docs/done/persistent_session_dual_mode_phase1_gap.md` — the previous round of consolidation between `dual_app` and `persistent_app` (WS handler + REST handlers).
 - `docs/issues/orchestrator_main_py_monolith.md` — analogous structural cleanup for `orchestrator/main.py`; if decision (1) lands on router modules, the precedent set here informs that work.
