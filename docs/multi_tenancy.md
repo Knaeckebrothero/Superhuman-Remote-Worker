@@ -22,6 +22,19 @@ The historical Phase-1 audit and per-bundle implementation log are preserved und
 
 ## Where we are now (2026-05-18)
 
+> **Truth-up 2026-06-11** (code-verified; full reconciliation in
+> [`saas_roadmap.md`](saas_roadmap.md)). Three rows in the leak table below are
+> stale: **#4 closed** — replaced by [app-side admission](features/app_side_admission.md)
+> (`users.is_approved` + cockpit bulk-approve, shipped + tested 2026-06-10).
+> **#8 closed** — workspace egress hardening + per-tenant network tiering fully
+> shipped (migration `0016` → provisioner tier label → per-tier policies +
+> fail-closed fallback-deny). **#1 largely closed** — workspace cloud *mounts*
+> are now per-user via Keycloak token-exchange impersonation
+> ([rclone_cloud_mount.md](features/rclone_cloud_mount.md) Phase 6, validated on
+> k3d + dev 2026-06-10); residual: the personal WebDAV *datasource* still rides
+> the shared service account (`main.py:17863`), and BYO Nextcloud stays
+> env-var-credentialed by design.
+
 **API auth surface: fully closed.** Every HTTP endpoint (232 total) and every WebSocket endpoint (2 total) has an explicit gate. The endpoint inventory at `docs/security/endpoint_inventory.txt` reports **0 unscoped** (down from 55 at the C2 baseline). The snapshot test (`tests/test_endpoint_inventory.py`) enforces this going forward — no new endpoint can ship without a gate.
 
 **Coverage map:**
@@ -38,6 +51,7 @@ The historical Phase-1 audit and per-bundle implementation log are preserved und
 | Datasource credentials | Always redacted on REST (F3) | `redact_datasource[s]` helpers |
 | Job/project/thread/source/citation/sudo/stats/admin reads | Per-user OR project-member OR admin visibility | P2 G1-G5 |
 | Admin "view as user" toggle | `X-Admin-View-As: user` shadow header in `require_approved_user`; cockpit toggle + per-page pill | [Admin view-as design](features/admin_view_as_user.md) — PRs 1–3 shipped 2026-05-18 |
+| Denied-access audit | Every `access.py` 403 (+ `_require_admin`, IDE proxy) → `security_events` row (incl. `view_as`) + WARNING line; `GET /api/admin/security-events` | [security_event_log.md](features/security_event_log.md) — shipped 2026-06-11 |
 
 **Sharing model:** Project membership is the share unit. `project_members(project_id, user_id, role)` with `viewer/editor/owner` roles. Adding user B to project A (via `POST /api/projects/{id}/members`, owner-gated) gives them visibility into every job, file, datasource, knowledge note, and citation in that project. **No per-resource or public-link sharing today** — those would be product features, not auth gaps.
 
@@ -49,7 +63,7 @@ The historical Phase-1 audit and per-bundle implementation log are preserved und
 | 2 | **Chromium profile is per-agent, not per-job** (`/tmp/agent-chromium-cdp-profile`). Cookies/sessions persist across jobs on the same agent pod. | Medium | M1.B #2 | `src/tools/research/browser.py:101` |
 | 3 | **MongoDB has no retention/TTL** on `llm_requests` + `agent_audit`. Stale prompts/responses hoarded indefinitely. | Low | M1.B #3 | MongoDB indices |
 | 4 | **Keycloak self-registration broken** — `VERIFY_EMAIL` fires with no SMTP, and `default-roles-srw` doesn't carry the `user` role. Strangers can't sign up; also blocks live E2E cross-user verification. | **High** (onboarding broken) | M1.B #1 | Keycloak realm config |
-| 5 | **No audit log of cross-user 403 attempts.** 1000 probe attempts → 1000 silent 403s, no detection signal. | Medium | M1.B #4 | new — centralize in `access.py` |
+| 5 | ~~**No audit log of cross-user 403 attempts.**~~ **Closed 2026-06-11** — every `access.py` 403 (+ `_require_admin` + IDE proxy denials) now writes a `security_events` row + WARNING line. See [security_event_log.md](features/security_event_log.md). | ~~Medium~~ | M1.B #4 | `security/access.py` (`log_security_event`), migration 0025 |
 | 6 | **No per-user API rate limiting.** UUID enumeration / endpoint hammering / LLM-cost runaway are unprevented. | Medium (high for SaaS) | M1.D #1 | new — FastAPI middleware |
 | 7 | **No per-agent K8s `ResourceQuota` / `LimitRange`.** One user can OOM the cluster or saturate CPU. | Medium (high for SaaS) | M1.D #2 | new — Helm chart |
 | 8 | **Unrestricted workspace egress.** Agent pods can crypto-mine / port-scan / spam from your AWS IPs. | Medium (high for SaaS) | M1.D #3 | new — NetworkPolicy |
@@ -97,17 +111,29 @@ Five operational items, each independently shippable. Together they're a single 
 
 | # | Item | Risk it closes | Effort | Status |
 |---|---|---|---|---|
-| 1 | **Keycloak self-registration fix** — wire SMTP for `VERIFY_EMAIL` (or skip-verify for dev); add the realm-level `user` role to `default-roles-srw` | Strangers literally can't sign up today; also blocks live E2E cross-user verification of the entire M1.A surface | ~2h | Open ([memory](../.claude/projects/-home-ghost-Repositories-Superhuman-Remote-Worker/memory/project_keycloak_self_registration_broken.md)) |
+| 1 | **Keycloak self-registration fix** — wire SMTP for `VERIFY_EMAIL` (or skip-verify for dev); add the realm-level `user` role to `default-roles-srw` | Strangers literally can't sign up today; also blocks live E2E cross-user verification of the entire M1.A surface | ~2h | **Closed 2026-06-10** — superseded by [app-side admission](features/app_side_admission.md): `users.is_approved` DB flag + cockpit bulk-approve replaced the role-composite fix; legacy role-holders migrate via login write-through. S4 (drop the role fallback) pending soak. |
 | 2 | **Chromium profile per-job** — `/tmp/agent-chromium-cdp-profile` → `…-{job_id}` + teardown hook (`src/tools/research/browser.py:101`) | Cookies / logged-in sessions from job A persist into job B on the same agent pod | ~2h | Closed 2026-05-28 — workspace pod is already torn down after every job, so cross-job profile contamination can't happen. Intra-job delegation subagents do share the profile, which is benign (and sometimes beneficial — shared login state across the same job's research steps). |
 | 3 | **MongoDB TTL** on `llm_requests` + `agent_audit` (pick window: 90d? 1y?) | Prompts/responses hoarded indefinitely; privacy posture; GDPR retention story | ~1h | Deferred 2026-05-28 — will be folded into the planned MongoDB→Postgres migration; retention policy will be set there in one place rather than partially-applied to MongoDB now. |
-| 4 | **Cross-user 403 audit log** — emit a structured event when any `security/access.py` helper raises 403 | Today 1000 probe attempts → 1000 silent 403s; no detection signal | ~3h | Open |
-| 5 | **View-as PR 4** — `view_as_user: bool` + `real_is_admin: bool` on the per-request audit row; remaining matrix walk-through across non-Jobs list pages | Investigators can't tell whether an admin action ran in fleet mode or shadow mode | ~½d | Open |
+| 4 | **Cross-user 403 audit log** — emit a structured event when any `security/access.py` helper raises 403 | Today 1000 probe attempts → 1000 silent 403s; no detection signal | ~3h | **Shipped + k3d-verified 2026-06-11** — `security_events` table (migration 0025) + WARNING line, centralized in `access.py` (`log_security_event`/`_denied`, all 15 raise sites) + `_require_admin` (`admin_denied`) + both IDE proxy denials. Read path `GET /api/admin/security-events`; retention sweeper (90d default). 16 tests. Design: [security_event_log.md](features/security_event_log.md). |
+| 5 | **View-as PR 4** — `view_as_user: bool` + `real_is_admin: bool` on the per-request audit row; remaining matrix walk-through across non-Jobs list pages | Investigators can't tell whether an admin action ran in fleet mode or shadow mode | ~½d | Partially closed 2026-06-11: the **security-event** rows carry `view_as` + `real_is_admin` (shadowed-admin denials are distinguishable — live-verified). General per-request audit enrichment + the matrix walk remain open. |
 
-**Recommended landing order:** **#1 first** (smallest fix, biggest test-unblock — every subsequent M1 item benefits from being able to provision a real second user), then **#4 and #5** in any order. #2 + #3 closed/deferred 2026-05-28 per their Status column above.
+**Recommended landing order:** ~~#1 first~~ (closed 2026-06-10 via app-side admission), ~~then #4~~ (shipped 2026-06-11) — **#5's remainder** is the only open M1.B item. #2 + #3 closed/deferred 2026-05-28 per their Status column above.
 
 **Larger follow-on to #1 — cockpit-owned auth UI (~5–9 days).** Once the SMTP + default-role fix lands and proves the Keycloak-themed register page works, the natural next iteration is replacing Keycloak's themed pages with cockpit-native forms (password login + register, social providers, optional magic-link email-only sign-in). Design captured 2026-05-28 at [features/cockpit_owned_auth_ui.md](features/cockpit_owned_auth_ui.md). Three independently-shippable slices; not blocking the M1.B quick wins but is the v1 unlock for public-facing signup.
 
 ### M1.C — Cloud storage per-user OAuth (~1–2 weeks)
+
+> **Update 2026-06-11: largely shipped 2026-06-10**, via a different mechanism
+> than sketched below — Keycloak **token-exchange impersonation** (RFC 8693,
+> user-scoped bearer tokens minted per mount + refreshed ~expiry−90s) rather
+> than stored per-user refresh tokens. See
+> [rclone_cloud_mount.md](features/rclone_cloud_mount.md) Phase 6: live-validated
+> on k3d + dev; an impersonated token was proven to reach *only* that user's
+> Space; the client secret never reaches the workspace. **Residual:** the
+> personal WebDAV *datasource* is still minted with shared service-account
+> credentials (`main.py:17863`, `:12384`) and BYO Nextcloud keeps explicit
+> env-var credentials by design (v1 decision). The warning below now applies
+> only to that datasource path.
 
 **The actual hosted-product blocker.** `src/services/cloud_sync/` authenticates to OpenCloud (and BYO Nextcloud) as a single shared admin service account; every user's files live under that one identity, namespaced by path. A path-scoping bug → user A reads user B's files. This is the only remaining place in the system where a single bug in our code = cross-user file exposure.
 
@@ -134,6 +160,12 @@ The previous "Out of scope (Phase 1)" line listed rate limiting as "not now". Fo
 
 Each needs a short design doc before implementation — these are new territory, not "wire up an existing primitive". Bundleable in parallel, but writing the designs is the bottleneck.
 
+> **Update 2026-06-11:** **#3 is fully shipped** (egress `ipBlock … except`
+> hardening + per-tenant tier model + fail-closed fallback-deny; enforced by
+> K3s's embedded kube-router, no CNI swap needed — see
+> [workspace_network_isolation.md](features/workspace_network_isolation.md)).
+> #1 and #2 remain open, designs still to write.
+
 ### M1.E — User account lifecycle (design pending, ~3–5d total)
 
 Two flows SaaS needs that a single-org self-host doesn't.
@@ -154,9 +186,9 @@ Triggered by the post-P4b finding that admins were god-mode by default and could
 Pre-launch checklist. **Every line must be ✅ before opening signups beyond invited beta users.**
 
 - [x] **M1.A** — every API endpoint gated; inventory test enforces; admin view-as toggle live
-- [ ] **M1.B** — Keycloak self-reg works for strangers; 403 audit log; view-as PR 4 (Chromium per-job + MongoDB TTL closed/deferred 2026-05-28)
-- [ ] **M1.C** — cloud storage per-user OAuth (the actual blocker)
-- [ ] **M1.D** — pod quotas + workspace egress allowlist + pre-billing rate limit (designs written *and* implementations shipped)
+- [ ] **M1.B** — ~~self-reg/admission~~ ✅ 2026-06-10; ~~403 audit log~~ ✅ 2026-06-11 (security-event log, incl. `view_as` enrichment); **remaining: view-as PR 4 remainder** (general audit enrichment + matrix walk; Chromium per-job + MongoDB TTL closed/deferred 2026-05-28)
+- [ ] **M1.C** — ~~mount path~~ ✅ per-user via token-exchange impersonation 2026-06-10; **remaining: WebDAV datasource path off the shared service account**
+- [ ] **M1.D** — ~~egress~~ ✅ shipped; **remaining: pod quotas + pre-billing rate limit** (designs written *and* implementations shipped)
 - [ ] **M1.E** — user self-deletion + data export
 - [ ] **Billing + usage metering** — wallet schema, per-user attribution audit, debit gate, Cockpit usage page ([design doc](features/saas_billing_and_metering.md), implementation comes after design + before public signup)
 
@@ -901,7 +933,7 @@ What this doc covers: **data isolation and abuse prevention** for individual sub
 **M1.A (API isolation) is done.** Everything else for M1 is the work this doc tracks. Concrete ordered plan (refreshed 2026-05-28):
 
 1. **M1.B #1 — Keycloak self-registration (~2h).** Smallest fix, biggest unblock. Wire SMTP for `VERIFY_EMAIL` (or skip-verify in dev) + add `user` to `default-roles-srw`. Every later step benefits from being able to provision a real second user.
-2. **M1.B #4 + #5 — remaining quick-win hygiene (~½ day total).** Cross-user 403 audit log + view-as PR 4. Independent; parallelizable. (M1.B #2 Chromium per-job + #3 MongoDB TTL closed/deferred 2026-05-28 — see table above.)
+2. **M1.B #4 + #5 — remaining quick-win hygiene (~½ day total).** ~~Cross-user 403 audit log~~ ✅ shipped + k3d-verified 2026-06-11 ([security_event_log.md](features/security_event_log.md)) — also closed the security-event slice of #5 (`view_as`/`real_is_admin` on every denial row). Remaining: #5's general audit enrichment + matrix walk. (M1.B #2 Chromium per-job + #3 MongoDB TTL closed/deferred 2026-05-28 — see table above.)
 3. **Billing + usage metering design doc** — parallel-track to M1 isolation work, started 2026-05-28 as a stub at [features/saas_billing_and_metering.md](features/saas_billing_and_metering.md). Captures the wallet-funded business model + open questions (per-user attribution audit on `llm_requests`, compute-time attribution gaps, wallet/balance schema, debit gate, Cockpit usage UI). Implementation comes after the design fills in but **before public signup** — without it, anonymous demand bills our LLM credits.
 4. **M1.C — Cloud storage per-user OAuth (~1–2 weeks).** The actual file-isolation hosted-product blocker. Don't open signups beyond invited beta users until this lands.
 5. **M1.D — Abuse prevention designs + implementations (~6–9d).** Pod quotas, workspace egress NetworkPolicy, pre-billing-era rate limiting. Three independent designs, parallelizable; writing the designs is the bottleneck. Reframed 2026-05-28 — billing carries most of the abuse load; M1.D is now defense-in-depth + data-exfiltration prevention.

@@ -447,6 +447,31 @@ class OrchestratorClient:
             logger.warning(f"Thread status update failed (non-fatal): {e}")
             return False
 
+    async def suspend_thread(self, thread_id: str) -> bool:
+        """Request a clean drain-suspend of a thread (drift-drain path).
+
+        The orchestrator snapshots the workspace to S3, tears down the
+        workspace + agent pods, and flips the thread to 'suspended' so the
+        next user input resumes on a fresh agent. Generous timeout — the
+        snapshot of a large workspace takes a while and this call is the
+        last thing the pod does before exiting.
+
+        Returns:
+            True only if the orchestrator confirmed the suspend.
+        """
+        if not self._client:
+            return False
+        url = f"{self.orchestrator_url}/api/agents/threads/{thread_id}/suspend"
+        try:
+            r = await self._client.post(url, timeout=300.0)
+            if r.status_code != 200:
+                logger.warning(f"Thread suspend rejected: {r.status_code} - {r.text}")
+                return False
+            return bool(r.json().get("suspended"))
+        except Exception as e:
+            logger.warning(f"Thread suspend request failed: {e}")
+            return False
+
     async def release_thread_agent(self, thread_id: str) -> bool:
         """Clear threads.agent_id when this agent's session attach fails.
 

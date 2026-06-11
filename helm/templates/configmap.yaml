@@ -189,6 +189,11 @@ data:
   OPENCLOUD_PUBLIC_URL: {{ include "srw.cloudUrl" . | quote }}
   OPENCLOUD_KEYCLOAK_ISSUER: {{ printf "%s/realms/%s" (include "srw.keycloakInternalUrl" .) .Values.keycloak.realm | quote }}
   OPENCLOUD_KEYCLOAK_CLIENT_ID: {{ "opencloud-orchestrator" | quote }}
+  {{- if .Values.opencloud.mountInsecureTls }}
+  # Local-dev only: rclone mounts skip TLS verification on the tus
+  # data-gateway hop (mkcert edge cert). Never enable on real deployments.
+  OPENCLOUD_MOUNT_INSECURE_TLS: "true"
+  {{- end }}
   {{- else if .Values.nextcloud.enabled }}
   MAIN_CLOUD_BACKEND: {{ "nextcloud" | quote }}
   {{- else if .Values.cloud.externalBackend }}

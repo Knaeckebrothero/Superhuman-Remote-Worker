@@ -6293,6 +6293,125 @@ class PostgresDB:
             )
         return [str(row["id"]) for row in rows]
 
+    # ------------------------------------------------------------------
+    # Security events (denied-access audit) — security_event_log.md
+    # ------------------------------------------------------------------
+
+    async def record_security_event(
+        self,
+        *,
+        event_type: str,
+        resource_type: str,
+        user_id: str | None = None,
+        auth_method: str | None = None,
+        real_is_admin: bool = False,
+        view_as: bool = False,
+        resource_id: str | None = None,
+        method: str | None = None,
+        path: str | None = None,
+        detail: str | None = None,
+        client_ip: str | None = None,
+    ) -> None:
+        """Insert one denied-access audit row.
+
+        Callers (``security.access.log_security_event``) wrap this in
+        try/except — a failed insert must never block the 403 it
+        documents. A malformed ``user_id`` degrades to NULL rather than
+        failing: the row with method/path/ip is still worth keeping.
+        """
+        uid: UUID | None = None
+        if user_id:
+            try:
+                uid = UUID(str(user_id))
+            except (ValueError, TypeError, AttributeError):
+                uid = None
+        async with self.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO security_events
+                    (event_type, user_id, auth_method, real_is_admin, view_as,
+                     resource_type, resource_id, method, path, detail, client_ip)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                """,
+                event_type,
+                uid,
+                auth_method,
+                real_is_admin,
+                view_as,
+                resource_type,
+                str(resource_id) if resource_id is not None else None,
+                method,
+                path,
+                detail,
+                client_ip,
+            )
+
+    async def list_security_events(
+        self,
+        *,
+        limit: int = 100,
+        user_id: str | None = None,
+        event_type: str | None = None,
+        since: datetime | None = None,
+    ) -> List[Dict[str, Any]]:
+        """List denied-access events, newest first, with optional filters.
+
+        Args:
+            limit: Maximum rows (clamped to 1000).
+            user_id: Only events for this caller UUID.
+            event_type: Only this type (``access_denied`` / ``admin_denied``).
+            since: Only events at or after this timestamp.
+
+        Returns:
+            List of event dicts ordered by created_at DESC.
+        """
+        clauses: list[str] = []
+        params: list[Any] = []
+        if user_id:
+            try:
+                params.append(UUID(str(user_id)))
+                clauses.append(f"user_id = ${len(params)}")
+            except (ValueError, TypeError, AttributeError):
+                # Unparseable filter matches nothing rather than everything.
+                clauses.append("FALSE")
+        if event_type:
+            params.append(event_type)
+            clauses.append(f"event_type = ${len(params)}")
+        if since:
+            params.append(since)
+            clauses.append(f"created_at >= ${len(params)}")
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(max(1, min(int(limit), 1000)))
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                f"""
+                SELECT id, created_at, event_type, user_id, auth_method,
+                       real_is_admin, view_as, resource_type, resource_id,
+                       method, path, detail, client_ip
+                FROM security_events
+                {where}
+                ORDER BY created_at DESC
+                LIMIT ${len(params)}
+                """,
+                *params,
+            )
+        return [dict(row) for row in rows]
+
+    async def prune_security_events(self, retention_days: int = 90) -> int:
+        """Delete events older than ``retention_days``. Returns rows deleted."""
+        async with self.acquire() as conn:
+            count = await conn.fetchval(
+                """
+                WITH deleted AS (
+                    DELETE FROM security_events
+                    WHERE created_at < NOW() - make_interval(days => $1)
+                    RETURNING 1
+                ) SELECT COUNT(*) FROM deleted
+                """,
+                int(retention_days),
+            )
+        return int(count or 0)
+
     async def delete_user(self, user_id: str) -> bool:
         """Delete a user.
 

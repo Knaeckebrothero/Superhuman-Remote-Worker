@@ -318,6 +318,7 @@ The pill is absent in `'all'` mode (no need to draw attention).
   - Walk the admin-only pages (`/admin/llm`, `/admin/users`, Settings tabs) in `me` mode; confirm they all stay 200 (regression check on the `real_is_admin` flip).
   - Send `X-Admin-View-As: user` with a PAT (curl) and verify list endpoints narrow — the cookie path is proven; PATs go through the same `require_approved_user`, but explicit confirmation is cheap.
 - Add `view_as_user: bool` + `real_is_admin: bool` to the audit table the orchestrator writes per-request (MongoDB `agent_audit` or whatever the BFF/api-token request log is using). One-line insert payload change.
+  - **Partially landed 2026-06-11:** the denied-access security log ([security_event_log.md](security_event_log.md)) records `view_as` + `real_is_admin` on every 403/denial row — shadowed-admin denials are now distinguishable from genuine cross-user attempts (live-verified). The *general* per-request audit enrichment (successful requests) remains open.
 - No Helm default flip needed — default is `'all'` (locked).
 
 ## Future extensions (post-v1)

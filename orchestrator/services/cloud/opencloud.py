@@ -231,6 +231,12 @@ class OpenCloudBackend:
                 "vendor": "infinitescale",
             },
             auth=auth,
+            # Local-dev knob (OPENCLOUD_MOUNT_INSECURE_TLS): the tus PATCH
+            # hop targets the PUBLIC data-gateway URL, which on local k3d
+            # presents an mkcert cert the workspace image doesn't trust.
+            provider_flags=(
+                ["--no-check-certificate"] if self._settings.mount_insecure_tls else []
+            ),
             cache={
                 "vfs_cache_mode": "full",
                 "vfs_cache_max_size": "10G",

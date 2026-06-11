@@ -736,6 +736,22 @@ describe('PersistentChatService — SSE event dispatch', () => {
         expect(service.threadStatus()).toBe('ended');
     });
 
+    it('flips threadStatus to suspended (not ended) on session.suspended', async () => {
+        const {service, es} = await setup();
+        fireSseMessage(
+            es,
+            {
+                method: 'session.suspended',
+                params: {message: 'Session suspended for a platform update.'},
+            },
+            '1:1',
+        );
+        // Suspended threads stay live-resumable — the composer must remain
+        // enabled (no 'ended' resume card) and the next send wakes the session.
+        expect(service.threadStatus()).toBe('suspended');
+        expect(service.isWaitingForInput()).toBe(false);
+    });
+
     it('surfaces error frames via sanitized error signal', async () => {
         const {service, es} = await setup();
         fireSseMessage(es, {method: 'error', params: {message: 'something broke'}}, '1:1');

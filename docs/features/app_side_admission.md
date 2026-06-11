@@ -24,7 +24,12 @@ aliases:
 > Captured 2026-06-10 from the SaaS-readiness assessment follow-up conversation;
 > refined same day into an implementation design (code-verified seams + slices).
 
-**Status:** Designed / ready to implement, not started.
+**Status:** ✅ S1–S3 **shipped + tested 2026-06-10** (migration `0024`, seam
+flip + login write-through in `auth.py`, bulk `POST /api/admin/users/approve`
+in the endpoint inventory, cockpit pending list + `user_registered` SSE admin
+toast — commit `fbce77fb` and neighbors). **S4 (drop the `user`-role fallback)
+deliberately pending a soak window** — before dropping, glance at the admin
+page for role-holders who never logged in and approve them manually.
 **Triggered by:** [`saas_roadmap.md`](../saas_roadmap.md) Tier 0 flagged "Keycloak
 self-registration broken." Discussing it reframed the problem: registration *works*
 — what's missing is the **admission step** after it, and the current mechanism makes

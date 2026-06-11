@@ -108,6 +108,7 @@ from security.auth import (  # noqa: E402
 )
 from security.access import (  # noqa: E402
     is_internal_call,
+    log_security_event,
     mcp_scope_project_id,
     redact_datasource,
     redact_datasources,
@@ -3562,6 +3563,9 @@ async def lifespan(app: FastAPI):
     thread_events_prune_task = asyncio.create_task(
         thread_events_prune_sweeper(_shutdown_event)
     )
+    security_events_prune_task = asyncio.create_task(
+        security_events_prune_sweeper(_shutdown_event)
+    )
     headless_notify_task = asyncio.create_task(
         thread_permission_notify_sweeper(_shutdown_event)
     )
@@ -3643,6 +3647,7 @@ async def lifespan(app: FastAPI):
     await dispatcher_task
     await sudo_sweeper_task
     await thread_events_prune_task
+    await security_events_prune_task
     await headless_notify_task
     await attention_sleep_task
     await ide_sweeper_task
@@ -8178,10 +8183,13 @@ async def ide_proxy_http(request: Request, job_id: str, path: str = ""):
             return RedirectResponse("/auth/login?return_to=/", status_code=302)
         raise
     if not await user_can_access_ide_entity(user, postgres_db, job_id):
-        logger.warning(
-            "IDE HTTP: user %s denied access to entity %s",
-            user["id"],
-            job_id,
+        await log_security_event(
+            postgres_db,
+            user=user,
+            resource_type="ide_entity",
+            resource_id=job_id,
+            detail="IDE access denied",
+            request=request,
         )
         raise HTTPException(status_code=403, detail="IDE access denied")
 
@@ -8255,10 +8263,14 @@ async def ide_proxy_ws(ws: WebSocket, job_id: str, path: str = ""):
         await ws.close(code=4403, reason="Account pending approval")
         return
     if not await user_can_access_ide_entity(user, postgres_db, job_id):
-        logger.warning(
-            "IDE WS: user %s denied access to entity %s",
-            user["id"],
-            job_id,
+        await log_security_event(
+            postgres_db,
+            user=user,
+            resource_type="ide_entity",
+            resource_id=job_id,
+            detail="IDE access denied",
+            request=ws,
+            method="WS",
         )
         await ws.close(code=4403, reason="IDE access denied")
         return
@@ -11365,15 +11377,32 @@ async def agent_update_thread_status(
         )
     try:
         if body.status == "ended":
-            # Route through end_thread so ended_at gets stamped.
-            await postgres_db.end_thread(thread_id)
-            # Agent-initiated `ended` (idle timeout, drain, watchdog, WS
-            # disconnect) is almost always recoverable, not a user-intent
-            # delete — preserve the workspace via S3 snapshot so /resume
-            # can restore it. The user-facing DELETE handler still uses
-            # _release_thread_resources for true destruction.
-            # See docs/issues/persistent_session_permission_check_race.md.
-            asyncio.create_task(_suspend_thread_resources(thread_id))
+            # Guarded end (mirrors end_thread, which stays unguarded for
+            # user-intent call sites): a late agent-side 'ended' — e.g. the
+            # SIGTERM shutdown handler of a pod deleted mid-suspend, or the
+            # drain-suspend fallback racing a lost suspend response — must
+            # never clobber an orchestrator-driven 'suspended' thread.
+            async with postgres_db.acquire() as conn:
+                updated = await conn.fetchval(
+                    "UPDATE threads "
+                    "SET status = 'ended', ended_at = CURRENT_TIMESTAMP "
+                    "WHERE id = $1 AND status <> 'suspended' "
+                    "RETURNING id",
+                    thread_id,
+                )
+            if updated:
+                # Agent-initiated `ended` (idle timeout, watchdog, WS
+                # disconnect) is almost always recoverable, not a user-intent
+                # delete — preserve the workspace via S3 snapshot so /resume
+                # can restore it. The user-facing DELETE handler still uses
+                # _release_thread_resources for true destruction.
+                # See docs/issues/persistent_session_permission_check_race.md.
+                asyncio.create_task(_suspend_thread_resources(thread_id))
+            else:
+                logger.info(
+                    "Ignored agent 'ended' for thread %s — already suspended",
+                    thread_id,
+                )
         elif body.status == "awaiting_user":
             # Idempotent: preserve awaiting_user_since on repeated writes
             # (the agent's loop calls this on every untethered turn-complete
@@ -11416,6 +11445,63 @@ async def agent_update_thread_status(
         return {"status": body.status}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.post("/api/agents/threads/{thread_id}/suspend")
+async def agent_suspend_thread(request: Request, thread_id: str) -> dict[str, Any]:
+    """Clean drain-suspend requested by the thread's own agent. **Internal**
+    (P4b) — requires ``X-Internal-Key``. Ingress strips this path.
+
+    Called by a persistent agent that received ``intents.should_drain``
+    (stale build) while its loop is parked between turns. Converges on the
+    attention-sleep terminal state: workspace snapshotted to S3, workspace +
+    agent pods deleted, thread ``suspended`` with the agent binding cleared
+    so the next user input provisions a fresh (new-build) agent and walks
+    the existing suspended-restore path.
+
+    Returns ``{"suspended": bool, "status": <thread status>}``. The agent
+    falls back to the legacy 'ended' detach when ``suspended`` is false —
+    e.g. suspension service disabled, snapshot failure, or a thread already
+    past the point of suspending.
+    """
+    await require_internal(request)
+    thread = await postgres_db.get_thread(thread_id)
+    if not thread:
+        raise HTTPException(status_code=404, detail="Thread not found")
+    status = thread.get("status")
+    if status == "suspended":
+        # Idempotent — a retried call after a lost response must not fail.
+        return {"suspended": True, "status": "suspended"}
+    if status not in ("created", "active", "awaiting_user"):
+        return {"suspended": False, "status": status}
+    if not workspace_suspension_service.is_enabled:
+        return {"suspended": False, "status": status, "reason": "disabled"}
+
+    ok = await workspace_suspension_service.suspend_thread_workspace(thread_id)
+    if not ok:
+        return {"suspended": False, "status": status, "reason": "snapshot_failed"}
+
+    # CAS like the attention-sleep sweeper: don't clobber a state that moved
+    # under us mid-snapshot. agent_id is cleared because the requesting agent
+    # pod is already being deleted by suspend_thread_workspace — a stale
+    # binding would wedge the next attach on a dead agent.
+    async with postgres_db.acquire() as conn:
+        updated = await conn.fetchval(
+            "UPDATE threads "
+            "SET status = 'suspended', agent_id = NULL "
+            "WHERE id = $1 AND status IN ('created', 'active', 'awaiting_user') "
+            "RETURNING id",
+            thread_id,
+        )
+    if updated:
+        logger.info("Drain-suspend complete for thread %s", thread_id)
+    else:
+        logger.info(
+            "Drain-suspend for thread %s: workspace suspended but status "
+            "moved concurrently — restore path will handle wake",
+            thread_id,
+        )
+    return {"suspended": True, "status": "suspended" if updated else status}
 
 
 @app.post("/api/agents/threads/{thread_id}/release-agent")
@@ -13461,6 +13547,37 @@ async def thread_events_prune_sweeper(
         except asyncio.TimeoutError:
             pass
     logger.info("Thread-events prune sweeper stopped")
+
+
+async def security_events_prune_sweeper(shutdown_event: asyncio.Event) -> None:
+    """Background task that prunes the security_events audit log on retention.
+
+    Runs hourly (SECURITY_EVENTS_PRUNE_INTERVAL_S, default 3600). Deletes
+    rows older than SECURITY_EVENTS_RETENTION_DAYS (default 90). Bounds
+    table growth — writes happen on the post-auth 403 path, so any flood
+    is tied to a real account, but retention still caps the worst case.
+    Best-effort: survives transient DB errors by logging and continuing.
+    """
+    interval_s = int(os.environ.get("SECURITY_EVENTS_PRUNE_INTERVAL_S", "3600"))
+    retention_days = int(os.environ.get("SECURITY_EVENTS_RETENTION_DAYS", "90"))
+    logger.info(
+        "Security-events prune sweeper started (interval=%ds, retention=%dd)",
+        interval_s,
+        retention_days,
+    )
+    while not shutdown_event.is_set():
+        try:
+            deleted = await postgres_db.prune_security_events(retention_days)
+            if deleted:
+                logger.info("security_events prune: deleted=%d", deleted)
+        except Exception as e:
+            logger.warning("security_events prune error (non-fatal): %s", e)
+        try:
+            await asyncio.wait_for(shutdown_event.wait(), timeout=float(interval_s))
+            break
+        except asyncio.TimeoutError:
+            pass
+    logger.info("Security-events prune sweeper stopped")
 
 
 # =============================================================================
@@ -17049,6 +17166,17 @@ async def _require_admin(request: Request) -> dict[str, Any]:
     """
     user = await require_approved_user(request, postgres_db)
     if not user.get("real_is_admin", False):
+        # A non-admin reaching an admin endpoint is the strongest single
+        # probe signal we have — always leaves a security_events row.
+        await log_security_event(
+            postgres_db,
+            event_type="admin_denied",
+            user=user,
+            resource_type="admin_endpoint",
+            resource_id=getattr(getattr(request, "url", None), "path", None),
+            detail="Admin access required",
+            request=request,
+        )
         raise HTTPException(status_code=403, detail="Admin access required")
     return user
 
@@ -17917,6 +18045,42 @@ async def admin_bulk_approve_users(
         for uid in body.user_ids
     ]
     return {"approved_count": len(approved_set), "results": results}
+
+
+@app.get("/api/admin/security-events")
+async def admin_list_security_events(
+    request: Request,
+    limit: int = 100,
+    user_id: Optional[str] = None,
+    event_type: Optional[str] = None,
+    since: Optional[str] = None,
+) -> dict[str, Any]:
+    """List denied-access security events, newest first (admin-only).
+
+    The read path for the cross-user 403 audit log — every 403 raised by
+    a ``security/access.py`` gate (plus admin-gate and IDE-proxy denials)
+    lands in ``security_events``. Filters: ``user_id`` (the denied
+    caller), ``event_type`` (``access_denied`` / ``admin_denied``),
+    ``since`` (ISO 8601). Rows are pruned on retention
+    (``SECURITY_EVENTS_RETENTION_DAYS``, default 90). Design:
+    docs/features/security_event_log.md.
+    """
+    await _require_admin(request)
+    since_dt: Optional[datetime] = None
+    if since:
+        try:
+            since_dt = datetime.fromisoformat(since)
+        except ValueError:
+            raise HTTPException(
+                status_code=400, detail="'since' must be an ISO 8601 timestamp"
+            )
+    events = await postgres_db.list_security_events(
+        limit=limit,
+        user_id=user_id,
+        event_type=event_type,
+        since=since_dt,
+    )
+    return {"events": events, "count": len(events)}
 
 
 # =============================================================================

@@ -756,7 +756,13 @@ export interface PromoteRequest {
 // Persistent Thread (Session) Models
 // =============================================================================
 
-export type ThreadStatus = 'created' | 'active' | 'ended';
+/**
+ * 'awaiting_user' (headless natural pause) and 'suspended' (workspace
+ * snapshotted, pods torn down — attention-sleep or drift-drain) are both
+ * live-resumable: sending a message wakes the session on a fresh agent.
+ * Only 'ended' renders the resume card.
+ */
+export type ThreadStatus = 'created' | 'active' | 'awaiting_user' | 'suspended' | 'ended';
 
 /**
  * Persistent agent session thread.

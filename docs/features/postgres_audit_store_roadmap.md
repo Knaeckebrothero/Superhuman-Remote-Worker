@@ -6,6 +6,13 @@ criteria. Total estimated effort: **17-25 working days** (~3-4 calendar
 weeks for one engineer familiar with the codebase); **~1-1.5 days less
 if the Compose deprecation lands first** (gate G6).
 
+> **2026-06-11 — implementation package exists**:
+> `postgres_audit_store_implementation.md` closes every gate (G0
+> hand-rolled, G6 skip-Compose), carries the live-validated DDL, the
+> partition-module spec, the full adapter interface, and a 7-PR plan that
+> refines P0-P8 below. Read that first; this file remains the
+> phase/gate/exit-criteria reference.
+
 > **Revision note (2026-06-10)** — re-verified against the current
 > tree alongside the design doc. The two structural changes: (1) the
 > audit DDL ships as a `migrations/audit/` family applied by the
@@ -237,7 +244,7 @@ internal-use helpers) and prove parity with the Mongo reader.
 - [ ] `get_audit_count(job_id)` — single-row helper
 - [ ] `iter_tool_calls(job_id)` — async iterator that replaces the
       `mongodb._db["agent_audit"]` raw-cursor leak in
-      `graph_routes.py:144`
+      `graph_routes.py:142`
 - [ ] `get_job_stats(job_id)` and `get_audit_stats(job_id)` —
       aggregation SQL translating the four Mongo pipelines
       (`archiver.py:510, :530, :1066, :1093`)
@@ -290,17 +297,17 @@ against a local testcontainer or dev DB.
       `ensure_indexes` — the `ensure_indexes` call is simply deleted
       on the Postgres path; the migration runner owns DDL), 3391
       (graph_routes share), 3672 (lifespan disconnect), 3933-3936 +
-      3953-3954 + 18740-18742 (3 N+1 enrichers — collapse to single
+      3953-3954 + 18814-18816 (3 N+1 enrichers — collapse to single
       grouped query), 8418/8431 (`/audit`), 8444-8459
       (`/requests/{doc_id}` — change `doc_id: str` to `id: int`),
       8487/8491 (`/audit/timerange`), 8514/8525 (`/chat`), 9328/9339
       (`/audit/bulk`), 9365/9376 (`/chat/bulk`), 9402/9413
-      (`/graph/bulk`), 9434/9438 (`/version`), 14563/14572
+      (`/graph/bulk`), 9434/9438 (`/version`), 14623/14646
       (`/llm-requests`). Leave the "mongodb" hits that are
       customer-datasource surface (type enums, test-connection, tool
       catalogs)
 - [ ] `orchestrator/graph_routes.py` — `set_mongodb()` (line 20) →
-      `set_audit_store()`; line 144 raw-cursor leak →
+      `set_audit_store()`; line 142 raw-cursor leak →
       `audit.iter_tool_calls(job_id)`
 - [ ] `src/database/__init__.py` and `orchestrator/database/__init__.py`
       — export `AuditStore` alongside `MongoDB` (keep both during flag
@@ -411,7 +418,7 @@ different files.
       mongo-express.yaml`, `srw.mongoHost` helper
       (`_helpers.tpl:408-409`), `srw.mongodbUrl`
       (`_helpers.tpl:481-487`), `global.hostnames.mongo`
-      (`values.yaml:61`), `mongoExpress.*` (`values.yaml:866-868`),
+      (`values.yaml:61`), `mongoExpress.*` (`values.yaml:881-890`),
       `helm/templates/cockpit/deployment.yaml:17` `mongoExpressUrl`,
       `helm/templates/ingress.yaml:11, 443-481` for deletion in P8
 
@@ -511,6 +518,13 @@ sound before flipping the default.
       baseline.** If outside: profile, swap bulk reads to
       `asyncpg.copy_records_to_table`-style binary fetch. **G3 GATE:
       block cutover if not within target.**
+- [ ] **Concurrency smoke** (added 2026-06-10): ~100 concurrent
+      simulated writers driving the `AuditStore` write surface at
+      realistic per-agent cadence (~1 insert/sec each, mixed row
+      sizes) against the k3d instance. Record p50/p95 insert latency
+      and confirm the server-side backend count stays bounded (pooling
+      works). This — not single-job speed — is the enterprise-scale
+      scenario; see design doc § "Scale envelope".
 - [ ] **Helm renders**: three shapes — internal audit DB, external
       audit DB (`databases.audit.internal=false`), audit disabled
       (`databases.audit.enabled=false`, falls back to no-op archiver
@@ -611,8 +625,8 @@ sound before flipping the default.
 - [ ] Delete `srw.mongodbUrl` helper (`_helpers.tpl:481-487`)
 - [ ] Delete `srw.mongoHost` helper (`_helpers.tpl:408-409`)
 - [ ] Delete `global.hostnames.mongo` from `values.yaml:61`
-- [ ] Delete `databases.mongodb.*` (`values.yaml:404-409`) and
-      `mongoExpress.*` (`values.yaml:866-868`) from `values.yaml`,
+- [ ] Delete `databases.mongodb.*` (`values.yaml:404-418`) and
+      `mongoExpress.*` (`values.yaml:881-890`) from `values.yaml`,
       `values.example.yaml`, `customer-external-values.yaml`
 - [ ] Delete `helm/templates/cockpit/deployment.yaml:17`
       `mongoExpressUrl` env-init field

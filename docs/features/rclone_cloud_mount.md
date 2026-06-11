@@ -21,9 +21,11 @@ related:
 
 # Rclone Cloud Mount - Lazy Cloud Workspaces
 
-**Status:** Phase 1 v4 implemented 2026-06-09. OpenCloud bearer-token mount
-plan refined 2026-06-10 (§11 decision + Phase 6). Later hydration-budget
-approvals and indexing/search phases remain pending.
+**Status:** Phase 1 v4 implemented 2026-06-09. Phase 6 (OpenCloud
+bearer-token + impersonation mounts) implemented and fully validated on
+local k3d AND the dev cluster 2026-06-10 (§11 decision, Phase 6 steps 1–4,
+test doc §14). Later hydration-budget approvals and indexing/search phases
+remain pending.
 
 ## 1. Goal
 
@@ -933,6 +935,28 @@ Local-k3d-only findings (not code bugs; dev/prod topology unaffected):
   allows via public hairpin), (2) mkcert CA trust or an explicit
   local-only insecure-TLS provider flag for the mount.
 
+  **RESOLVED 2026-06-10 (same evening) — both follow-ups shipped as
+  opt-in local knobs and live-verified:**
+  - `workspace.networkPolicy.extraEgress` (Helm): raw egress rules
+    appended to every tier policy. The local overlay adds the in-cluster
+    Traefik hairpin (namespaceSelector `kube-system` + podSelector
+    `app.kubernetes.io/name: traefik`, post-DNAT pod ports 8443/8000) —
+    see `deployment/values-local.example.yaml`. Default `[]`; real
+    deployments don't need it.
+  - `opencloud.mountInsecureTls` (Helm) →
+    `OPENCLOUD_MOUNT_INSECURE_TLS` (orchestrator env) →
+    `OpenCloudSettings.mount_insecure_tls` → spec
+    `provider_flags=["--no-check-certificate"]`, riding the existing
+    provider_flags pass-through into the rclone mount command (no
+    agent-side changes). Only the tus data-gateway hop needs it — all
+    other mount traffic uses the internal plain-HTTP service URL.
+  - Verification: fresh session mount carried `--no-check-certificate`
+    on the live rclone process; a 6 MiB `dd` write to `/cloud/home`
+    landed server-side at exactly 6291456 bytes (fresh `rclone lsl`
+    PROPFIND) with zero error/refused/x509 lines in rclone.log — the
+    exact path that previously died with `connect: connection refused`
+    to the Traefik ClusterIP.
+
 ### Phase 6 Step 3 — User-Home Impersonation Mounts, Live k3d Validation (2026-06-10)
 
 Implemented and live-verified the same day as step 2:
@@ -970,6 +994,18 @@ Implemented and live-verified the same day as step 2:
   web login; before that `get_user_home` returns no drive and the row
   builder falls back — working as designed.
 
+### Phase 6 Step 4 — Dev Cluster Re-Run (2026-06-10 evening)
+
+Full results in `docs/tests/rclone_cloud_mount_dev_cluster.md` §14. Summary:
+on `sha-7ae23f7` the dev default-project session mounted the owner's real
+Personal Space via impersonation (mount_id = thread_mounts row UUID), the
+scan guard and `srw_cloud_status` ran their active paths for the first time
+on dev, the token refresh landed at expiry − 90s to the second (service
+mint + exchange per cycle), and **tus uploads through the public data
+gateway passed** — the one path local k3d cannot exercise. Phase 6 is
+complete; dev default-project sessions now mount the session owner's real
+Personal Space read-write.
+
 ### Implemented Provider Contract
 
 - Added `CloudMountSubject`, `RcloneMountSpec`, and `SupportsRcloneMount` to the
@@ -989,6 +1025,20 @@ Implemented and live-verified the same day as step 2:
 - If a default user-home mount lacks safe explicit credentials, the session uses
   the regular session-folder fallback instead of pairing the user's home URL with
   the agent-service password.
+- OpenCloud implements `SupportsRcloneMount` (Phase 6) with rclone's `webdav`
+  backend, `vendor=infinitescale`, and `min_rclone_version=1.70.0`. No static
+  credential is emitted — `auth.type` is `keycloak_client_credentials` for
+  session/project Spaces or `keycloak_user_impersonation` +
+  `target_user_sub` for user homes (Personal Spaces, resolved from
+  `thread_mounts.target_user_sub`). A user-home row without a target sub
+  raises `NOT_SUPPORTED` → session-folder fallback.
+- OpenCloud spec URLs are always reconstructed from the internal base
+  (`{base_url}/dav/spaces/{drive_id}/`); the public `webDavUrl` persisted
+  from graph responses is deliberately ignored.
+- OpenCloud impersonation requires the realm-management `impersonation`
+  role on the `opencloud-orchestrator` service account; the bundled
+  Keycloak setup script grants it idempotently (externally-managed realms
+  need a manual grant).
 
 ### Implemented Agent Runtime
 
@@ -1004,6 +1054,23 @@ Implemented and live-verified the same day as step 2:
 - Startup unmounts stale mountpoints at the target before starting the new
   session-owned rclone process.
 - rclone RC is enabled on localhost with per-session random credentials.
+- Keycloak bearer auth (Phase 6): for `keycloak_*` auth types the manager
+  mints the initial token in the agent process via the shared
+  `src/services/keycloak_token.py` client (client_credentials, plus RFC
+  8693 exchange in impersonation mode), seeds `bearer.token` (0600) and a
+  read-only `bearer-helper.sh` in the runtime state dir, and wires rclone
+  to it via `bearer_token_command`. A per-session refresh task re-mints and
+  atomically re-pushes the token (tmp file + `mv`) at expiry − 90s; rclone
+  re-runs the helper on a 401, so late pushes self-heal. The Keycloak
+  client secret never reaches the workspace host. Unmount removes the
+  token files.
+- Mount scripts preflight `rclone version` against the spec's
+  `min_rclone_version` (`sort -V`) and fail fast with an actionable error
+  on too-old runtimes.
+- The workspace container and VM images install a pinned upstream rclone
+  (checksum-verified, v1.74.3 at time of writing) instead of Ubuntu's
+  1.60.1-DEV. Build-arg names use an `SRW_` prefix because rclone parses
+  `RCLONE_*` environment variables as flags.
 - `.cloudignore` is fetched from the remote cloud root before mount startup,
   compiled into an rclone exclude file, and passed to `rclone mount` with
   `--exclude-from`.
@@ -1122,14 +1189,17 @@ with rclone, `/home/agent-host/workspace/cloud` linked to `/cloud/home`, and
 - `.cloudignore` is implemented for rclone mounts, but not for the legacy sync
   path from Phase 0.
 - Background indexing and `srw-cloud-search` are not implemented.
-- OpenCloud rclone mounts are implemented for session/project Spaces
-  (service token, Phase 6 step 2) and user homes (token-exchange
-  impersonation, Phase 6 step 3) — both live-verified on local k3d.
-  Remaining: the Phase 6 step 4 dev-cluster runbook re-run, which also
-  exercises tus uploads on real public-DNS topology.
-- On local k3d, rclone tus uploads from workspace pods are blocked by the
-  workspace NetworkPolicy + mkcert TLS trust (see Phase 6 step 2 findings);
-  reads, server-mediated PUTs, and all dev/prod topologies are unaffected.
+- OpenCloud rclone mounts are COMPLETE (Phase 6): session/project Spaces
+  via service token, user homes via token-exchange impersonation —
+  live-verified on local k3d and re-verified end-to-end on the dev cluster
+  including tus uploads (test doc §14). No OpenCloud-specific work remains
+  in this feature.
+- ~~On local k3d, rclone tus uploads from workspace pods are blocked by the
+  workspace NetworkPolicy + mkcert TLS trust~~ — RESOLVED 2026-06-10 via
+  two opt-in local knobs (`workspace.networkPolicy.extraEgress` Traefik
+  hairpin + `opencloud.mountInsecureTls`); 6 MiB tus write-through
+  verified on k3d. See the Phase 6 step 2 findings block. Defaults stay
+  off; dev/prod were never affected.
 - Some clusters may reject `/dev/fuse`/`SYS_ADMIN` workspace pods; those
   deployments must use the explicit fallback flags above until their runtime
   profile supports FUSE.
@@ -1215,29 +1285,27 @@ Motivated by the 2026-06-10 dev-cluster runbook result
 emits `cloud_mount` there and every session takes the session-folder sync
 fallback.
 
-1. Pin upstream rclone in the workspace container and VM images
-   (checksum-verified deb, replaces Ubuntu's 1.60.1-DEV). Independent PR;
-   the existing Nextcloud k3d path is the regression test.
-2. Service-token mode: extract the Keycloak token client from
-   `opencloud_sync.py` into a shared module, implement
+1. DONE (2026-06-10): pin upstream rclone in the workspace container and VM
+   images (checksum-verified deb, replaces Ubuntu's 1.60.1-DEV).
+2. DONE (2026-06-10 — see the step 2 delta in §14): service-token mode:
+   shared Keycloak token client extracted from `opencloud_sync.py`,
    `OpenCloudBackend.build_rclone_mount_spec` for session/project Space
-   handles, and teach the mount manager the
-   `keycloak_client_credentials` auth type (token file + helper script +
-   `bearer_token_command` + per-session refresh loop). Validate on local k3d
-   with `MAIN_CLOUD_BACKEND=opencloud`. User-home rows raise `NOT_SUPPORTED`
-   and keep the session-folder fallback — which is now itself rclone-mounted,
-   so the full §13 runbook becomes exercisable on dev after this slice alone.
+   handles, mount-manager `keycloak_client_credentials` support (token
+   file + helper script + `bearer_token_command` + per-session refresh
+   loop). Live-validated on local k3d with `MAIN_CLOUD_BACKEND=opencloud`.
 3. DONE (2026-06-10, same day — see the step 3 delta in §14): user-home
    mounts via `keycloak_user_impersonation` token exchange, live-verified
    on local k3d. The realm-management `impersonation` role grant was
    missing realm-wide and is now part of the bundled Keycloak setup; on
    externally-managed Keycloak deployments it must be granted to the
    OpenCloud orchestrator client's service account manually.
-4. Re-run the dev-cluster runbook; §13's "fallback-only" headline flips to a
-   real mount validation, and tus uploads get exercised on real public-DNS
-   topology. Dev prerequisites: the impersonation grant lands with the next
-   Keycloak rollout of the updated chart; note dev sessions then mount the
-   user's real personal Space read-write.
+4. DONE (2026-06-10 evening): dev-cluster runbook re-run on `sha-7ae23f7`
+   — full results in `docs/tests/rclone_cloud_mount_dev_cluster.md` §14.
+   Real user-home mount via impersonation, scan guard + `srw_cloud_status`
+   active paths, token refresh at expiry−90s to the second, and **tus
+   uploads through the public data gateway verified** (the one path local
+   k3d could not test). Phase 6 is complete; dev default-project sessions
+   now mount the owner's real Personal Space read-write.
 
 Slice-2 acceptance criteria (beyond the Phase 1 list):
 
