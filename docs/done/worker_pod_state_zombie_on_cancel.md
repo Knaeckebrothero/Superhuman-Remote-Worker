@@ -22,7 +22,7 @@ target that then rejects work with `409`. The resume endpoint trusts the DB
 `ready` with no liveness check and surfaces the rejection as a hard `502`.
 
 This is the **worker-route `_pod_state` drift** that
-[`agent_app_readiness_drift.md`](../issues/agent_app_readiness_drift.md) (line 101)
+[`agent_app_readiness_drift.md`](../done/agent_app_readiness_drift.md) (line 101)
 explicitly predicted: *"Worker routes are reimplemented across `app.py` and
 `dual_app.py`… `dual_app` adding a `_pod_state` pre-check. Same
 parallel-implementation pattern; the same kind of drift bug could land there."*
@@ -331,13 +331,13 @@ real `current_job_id`. Fix 1 prevents new ones; it can't un-strand existing ones
   reaper (`main.py:498,563`); the ~5/60 `ready`-window math is in "Why
   intermittent" above. No longer blocking.
 - **`_pod_state` relocation.** The proper fix in
-  [`agent_app_readiness_drift.md`](../issues/agent_app_readiness_drift.md) moves `_pod_state`
+  [`agent_app_readiness_drift.md`](../done/agent_app_readiness_drift.md) moves `_pod_state`
   into a shared `session_runtime` library. Fix 1 is small and urgent — land the
   three-site funnel first; the refactor inherits it.
 
 ## Related
 
-- [`agent_app_readiness_drift.md`](../issues/agent_app_readiness_drift.md) — sibling
+- [`agent_app_readiness_drift.md`](../done/agent_app_readiness_drift.md) — sibling
   `_pod_state`/readiness drift in the *session* path; predicted this worker-route
   variant; its app-unification refactor would relocate `_pod_state`.
 - [`agent_lifecycle_management.md`](../issues/agent_lifecycle_management.md) — the systemic

@@ -37,7 +37,7 @@ kept pointing at `gpt-oss-120b` and `gpt-5.2-pro`. The Cockpit's builder
 dropdown renders from the stale list; picking the new Gemma model routes to
 `api.openai.com` (because `LLM_BASE_URL=""` and no endpoint knows where Gemma
 lives) and OpenAI returns `invalid model ID`. Documented in
-`docs/issues/helm_deployment.md`.
+`docs/done/helm_deployment.md`.
 
 ## Scope
 

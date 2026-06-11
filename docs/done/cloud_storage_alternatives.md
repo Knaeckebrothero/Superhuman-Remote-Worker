@@ -266,7 +266,7 @@ Out of scope for this initiative:
 ## 8. Open Questions
 
 - **What port does OpenCloud get in `docker-compose.yaml`?** Nextcloud is on 8800. OpenCloud could go on 8810 (close to Nextcloud) or 8900 (currently used by the disposable Seafile test instance).
-- **Does OpenCloud's LibreGraph Connect cleanly hand off to Keycloak as the IdP, or are there subclaim mismatches similar to the ones we hit with Nextcloud?** (See `docs/issues/nextcloud_oidc_username.md`.)
+- **Does OpenCloud's LibreGraph Connect cleanly hand off to Keycloak as the IdP, or are there subclaim mismatches similar to the ones we hit with Nextcloud?** (See `docs/done/nextcloud_oidc_username.md`.)
 - **Does OpenCloud have an equivalent of Group Folders, or do we model project shares as user-shared folders under a service account?** This affects the `CloudBackendAdmin` interface design.
 - **How does OpenCloud handle quota?** Nextcloud has per-user and per-Group-Folder quotas. If OpenCloud only has per-user, the project-folder model has to change.
 - **Backup strategy for OpenCloud data on the homelab.** Likely the same large-S3-store solution that is planned for the user-facing cloud's backup role; needs to be confirmed.
@@ -278,4 +278,4 @@ Out of scope for this initiative:
 - `docs/features/project_cloud_folders.md` — project/session folder provisioning design
 - `docs/cloud_workspace.md` — workspace architecture
 - `docs/datasources.md` — datasource system overview
-- `docs/issues/nextcloud_oidc_username.md` — known OIDC username resolution issue (relevant precedent for OpenCloud OIDC integration)
+- `docs/done/nextcloud_oidc_username.md` — known OIDC username resolution issue (relevant precedent for OpenCloud OIDC integration)
