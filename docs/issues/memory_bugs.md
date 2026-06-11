@@ -25,6 +25,7 @@ Severity overview:
 | B8 | Neo4j-down kills pgvector-only KB injection too | LOW-MED | small | open |
 | B9 | Dead/misleading config keys (tuning no-ops) | LOW (hygiene) | ~1 h | **✅ keys deleted 2026-06-10** (PR #112) — enum nits still open |
 | B10 | Injection-strip prefix registry is silently fragile | LOW (latent) | test guard | open |
+| B11 | End-Session button (detach path) skips final extraction — only `/done` + idle extract | MED | small now / Phase-1 `capture()` properly | open (found 2026-06-10) |
 
 ---
 
@@ -111,6 +112,51 @@ never been observable before, so confirm on k3d/dev:
 2. `/done` teardown: `Final memory extraction complete` (INFO — has never
    logged once in production history);
 3. idle archive: `Idle archive: memory extraction complete`.
+
+*Live-verify attempt 2026-06-10 evening:* fix confirmed deployed on dev
+(session pods on build `7ae23f7`, `RecallStore initialized` + aux override
+clean); extraction pipeline itself confirmed healthy same day (fresh
+`source='observer'` row at 16:08 via aux gemma-4-moe + embeddings). Driving
+the two dev test threads to the 5-turn threshold was aborted: both threads
+were ended/deleted from the cockpit mid-test, and k3d was mid-Tilt-churn.
+**Still pending: one quiet session ≥5 turns, then `/done`.** Verify with:
+`SELECT created_at, source, left(content,60) FROM memories WHERE job_id =
+'<thread_id>' ORDER BY created_at;` on the vector DB + the two INFO lines in
+the agent pod log. NB the discovery below (B11) — ending via the cockpit
+✕-button does NOT exercise the teardown extraction; only `/done` and idle
+timeout do.
+
+---
+
+## B11 — Most real session endings skip final extraction (detach path has no capture)
+
+Found during the B1 live-verify attempt. There are **three** ways a session
+ends, and only two of them extract:
+
+| Ending | Path | Final extraction? |
+|---|---|---|
+| `/done` slash command | cockpit WS `{method:"archive"}` → `_handle_archive` | ✅ (since B1 fix) |
+| idle timeout | `IdleTimeoutError` → `_loop_completion_handler` → `_handle_idle_archive` | ✅ (since B1 fix) |
+| **cockpit End-Session button** | `DELETE /api/persistent/threads/{id}` → agent `/session/detach` → `_terminate_session` | ❌ never |
+
+`_terminate_session` (persistent_app.py) does git commit/push and resource
+cleanup but has no memory-extraction step, and it's also the route for
+drain, thread-status watchdog, boot-WS timeout, and shutdown. Since the
+✕-button is arguably the *most common* deliberate ending, the
+"capture the conversation before teardown" feature still misses most real
+endings even after B1.
+
+**Fix direction:** don't bolt extraction into `_terminate_session` ad-hoc —
+this is exactly the overhaul's Phase-1 `capture(kind="session_end")` event;
+route ALL terminate reasons through one capture call (with a
+guard against double-extraction when archive already ran). If a quick win
+is wanted earlier: call the same extraction block from `_terminate_session`
+when the loop didn't already archive (~the B1 pattern, one more call site).
+
+Related observation from the same investigation (cosmetic): `agents.status`
+can read `offline` for a pod that is Running but whose session app has
+exited — heartbeat bookkeeping, worth a glance when debugging "agent
+unreachable" forwarding errors.
 
 ---
 

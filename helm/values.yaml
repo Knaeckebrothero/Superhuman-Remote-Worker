@@ -735,6 +735,12 @@ opencloud:
       limits:
         cpu: "200m"
         memory: "128Mi"
+  # -- Local-dev only: rclone cloud mounts pass --no-check-certificate so the
+  # tus upload hop (ocdav redirects PATCHes to the PUBLIC data-gateway URL,
+  # which presents the mkcert edge cert on local k3d) passes TLS verification.
+  # Pair with workspace.networkPolicy.extraEgress for the in-cluster Traefik
+  # hairpin. Never enable on a real deployment.
+  mountInsecureTls: false
   resources:
     requests:
       memory: "256Mi"
@@ -839,6 +845,15 @@ workspace:
           - 10.42.0.0/16       # pod CIDR
           - 10.43.0.0/16       # service CIDR
           - 169.254.0.0/16     # link-local / cloud-metadata
+    # -- Extra egress rules appended verbatim to EVERY tier policy (raw
+    # NetworkPolicy egress entries). Intended for deployment-specific holes
+    # the cluster-CIDR hardening would otherwise close — e.g. local k3d adds
+    # an in-cluster Traefik hairpin so uploads addressed to the public edge
+    # hostname (OpenCloud's tus data gateway resolves to the Traefik
+    # ClusterIP via coredns-custom) can connect. Real deployments resolve
+    # those hostnames externally and don't need this. See
+    # deployment/values-local.example.yaml for the Traefik block.
+    extraEgress: []
   # -- Pre-pull the workspace image on every node via a DaemonSet, so a
   # freshly-built tag doesn't pay a ~2-minute cold pull penalty on the first
   # session-attach (which would exceed the orchestrator/agent readiness

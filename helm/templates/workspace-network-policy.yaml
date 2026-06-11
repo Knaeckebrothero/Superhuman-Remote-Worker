@@ -173,6 +173,11 @@ spec:
       ports:
         - protocol: TCP
           port: 27017
+    {{- with $.Values.workspace.networkPolicy.extraEgress }}
+    # Deployment-specific extra egress from the values overlay — e.g. local
+    # k3d's in-cluster Traefik hairpin for the OpenCloud tus data gateway.
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
     # No general internet beyond TCP 80/443 + Tailscale UDP. Workspaces
     # cannot reach each other (no podSelector matchLabels srw.io/component:
     # agent-workspace in any allowed source).

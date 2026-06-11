@@ -437,6 +437,30 @@ class TestRcloneMountSpec:
         assert spec.auth["client_secret"] == "test-secret"
         assert "token_helper" in spec.required_capabilities
         assert spec.min_rclone_version == "1.70.0"
+        # TLS verification stays on unless explicitly opted out.
+        assert spec.provider_flags == []
+
+    @pytest.mark.asyncio
+    async def test_mount_insecure_tls_adds_no_check_certificate(self):
+        # Local-dev knob (OPENCLOUD_MOUNT_INSECURE_TLS): the tus data-gateway
+        # hop presents the mkcert edge cert on local k3d.
+        settings = _settings().model_copy(update={"mount_insecure_tls": True})
+        be = OpenCloudBackend(settings)
+        _install_fake(be, FakeOpenCloud())
+        handle = SessionFolderHandle(
+            backend="opencloud",
+            native_id="sessions/thread-1",
+            vendor_meta={"drive_id": "drive-agent-home"},
+        )
+        spec = await be.build_rclone_mount_spec(
+            handle=handle,
+            mount_kind="session_folder",
+            target_path="/cloud/home",
+            access="read_write",
+        )
+        assert spec.provider_flags == ["--no-check-certificate"]
+        # The flag must survive into the agent payload.
+        assert spec.to_payload()["provider_flags"] == ["--no-check-certificate"]
 
     @pytest.mark.asyncio
     async def test_project_folder_spec_reconstructs_space_url(self):

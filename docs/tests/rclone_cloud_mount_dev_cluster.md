@@ -1,10 +1,12 @@
 # Rclone Cloud Mount - Dev Cluster Verification Runbook
 
 Manual end-to-end verification for
-`docs/features/rclone_cloud_mount.md`, especially the Phase 1 v4/v5 default
-path. This covers the real Kubernetes workspace runtime, FUSE/rclone, Cockpit
-session creation, REST input, supervised approval, and the default-project
-fallback behavior that unit tests cannot fully exercise.
+`docs/features/rclone_cloud_mount.md` — originally the Phase 1 v4/v5 default
+path (first run: §13, fallback-only on OpenCloud), re-run after Phase 6
+landed OpenCloud bearer/impersonation mounts (§14, full pass). Covers the
+real Kubernetes workspace runtime, FUSE/rclone, Cockpit session creation,
+REST input, supervised approval, guardrails, token refresh, and tus uploads
+that unit tests and local k3d cannot fully exercise.
 
 Target time: **30-45 minutes** after the dev image/chart has rolled out.
 
@@ -29,9 +31,28 @@ Core behavior:
 - Workspace container images include `rclone`, `fuse3`, `/cloud`, and FUSE
   security context support.
 - The Helm default workspace driver is now `rclone_mount`.
-- Nextcloud rclone specs use WebDAV behind the generic cloud abstraction.
-- Default user-home mounts require explicit safe credentials; otherwise the
-  session-folder fallback is mounted instead.
+- Nextcloud rclone specs use WebDAV + basic auth (agent-service credentials
+  for session/project folders; explicit user-granted credentials for default
+  user homes, else session-folder fallback).
+- OpenCloud rclone specs (Phase 6) use WebDAV `vendor=infinitescale` with
+  OAuth bearers: no static credential ships to the workspace. The agent
+  process mints Keycloak tokens through the shared `KeycloakTokenClient`
+  (`keycloak_client_credentials` for session/project Spaces;
+  `keycloak_user_impersonation` + RFC 8693 token exchange for user homes),
+  seeds a runtime-local token file + helper, points rclone at it via
+  `bearer_token_command`, and re-pushes a fresh token at expiry − 90s.
+  rclone re-runs the helper on a 401, so late pushes self-heal.
+- OpenCloud mounts always use the internal service URL
+  (`{base_url}/dav/spaces/{drive_id}/`), never the public `webDavUrl`
+  persisted from graph responses.
+- OpenCloud user-home (Personal Space) mounts require the realm-management
+  `impersonation` role on the `opencloud-orchestrator` service account —
+  granted automatically by the bundled Keycloak setup — and the target
+  user's personal drive, which materializes on their first OpenCloud web
+  login. Missing either → session-folder fallback (itself rclone-mounted).
+- A `min_rclone_version` preflight in the mount script fails fast on
+  workspace runtimes older than the spec requires (`infinitescale` needs
+  rclone ≥ 1.70.0; images now pin v1.74.3 upstream).
 
 Guardrails and status:
 
@@ -61,6 +82,16 @@ Known remaining gaps:
 - No cloud-wide index/vector/regex search layer yet.
 - The hard cache guard is a preflight guard; it does not police every byte during
   a long-running command after the command starts.
+- ~~Local k3d only: rclone tus uploads from workspace pods are blocked by the
+  workspace NetworkPolicy cluster-CIDR hardening + mkcert TLS trust~~ —
+  RESOLVED 2026-06-10 evening via two opt-in local knobs:
+  `workspace.networkPolicy.extraEgress` (in-cluster Traefik hairpin, pod
+  ports 8443/8000) + `opencloud.mountInsecureTls` (`--no-check-certificate`
+  via spec provider_flags, tus data-gateway hop only). Verified on k3d: a
+  6 MiB write to `/cloud/home` landed server-side intact, zero TLS/refused
+  errors. Both default off; dev/prod resolve the public hostname externally
+  and were never affected (proven by §14). Concrete values blocks in
+  `deployment/values-local.example.yaml`.
 
 ---
 
@@ -91,6 +122,12 @@ Expected deployment settings:
 - If testing default user-home mount on Nextcloud, explicit rclone user-home
   credentials are configured. If not configured, fallback to the session folder
   is expected and should be treated as a pass for fallback behavior.
+- If testing default user-home mount on OpenCloud: the realm-management
+  `impersonation` role must be granted to the `opencloud-orchestrator`
+  service account (bundled Keycloak setup does this; verify with kcadm on
+  externally-managed realms), and the session owner must have logged into
+  the OpenCloud web UI at least once so their personal drive exists. Missing
+  either → session-folder fallback, which is a pass for fallback behavior.
 
 Do not print or paste secret values while running this runbook.
 
@@ -529,3 +566,59 @@ Incidents and observations:
 To exercise the real mount path on dev infra, either implement OpenCloud
 `SupportsRcloneMount` (token-helper strategy from the feature doc §11) or point
 a dev deployment at a Nextcloud main-cloud backend.
+
+*(Superseded same day: OpenCloud `SupportsRcloneMount` was implemented as
+feature-doc Phase 6 and re-verified on dev — see §14.)*
+
+---
+
+## 14. Re-Run Results — 2026-06-10 evening, dev cluster (Phase 6 step 4)
+
+Deployed state: orchestrator/agent/workspace all `sha-7ae23f7` (= commit
+`7ae23f7e`, user-home impersonation mounts; parent `3e046a01`, bearer token
+management). Keycloak pod rolled ~37 min before the test; the realm-management
+`impersonation` role verified PRESENT on
+`service-account-opencloud-orchestrator` (realm `srw`, 900s access tokens).
+Test session: thread `3d8003e7-1029-4504-8c8b-a04e9db45136`, workspace
+`ws-thread-3d8003e7-102`, agent `srw-agent-s-7b6f755e`, run right after the
+deploy (no drift-drain interference this time).
+
+**Headline flipped vs §13: dev now emits `cloud_mount`. The default-project
+user-home row produced a real rclone mount (mount_id = the thread_mounts row
+UUID `e74fe522-…`, not `legacy-session`) of the logged-in user's OpenCloud
+Personal Space, via token-exchange impersonation.**
+
+| Criterion | Result |
+|---|---|
+| §2 workspace image deps | PASS — rclone v1.74.3 (pinned upstream), fusermount3, /dev/fuse |
+| §3 Cockpit session Connected + composer | PASS (system default `gemma-4-moe` injected AND worked this run — §13 incident 2 did not recur) |
+| §4 one agent + one workspace pod, no duplicates | PASS (exactly one `Agent pod created` for the thread) |
+| §5 mount state | **PASS — REAL MOUNT**: `/cloud/home` = `fuse.rclone` of `http://srw-opencloud:9200/dav/spaces/<personal-drive>/` (internal URL), listing the user's actual home content; `bearer.token` 0600; no secret material on the workspace |
+| §6 agent tool smoke + durable approvals | PASS (`POST …/approve/<id> 200` ×3) |
+| §7 cloud-scan guard (ACTIVE path — first time on dev) | PASS — `grep -R … /workspace/cloud` blocked; agent reported the block |
+| §8 `srw_cloud_status` (ACTIVE path) | PASS — mount target + 315 B / 20.0 GiB cache, no credentials leaked |
+| **tus write-through (untestable locally)** | **PASS** — file written through the fuse mount confirmed server-side by a fresh-process live PROPFIND in <15s; ZERO tus/upload errors in the rclone log; delete through the mount propagated equally fast |
+| Token refresh past expiry | PASS — `bearer.token` re-pushed at 19:06:11 = mount-start 18:52:41 + 900s − 30s skew − 60s safety, to the second; two Keycloak POSTs per cycle (service mint + RFC 8693 exchange), mode 600 preserved; zero 401s |
+| §10 cleanup | PASS — test file removed via the mount, session deleted, pods gone, user's other live session untouched |
+
+Phase 6 (OpenCloud rclone mounts) is hereby fully validated end-to-end on
+production-shaped infrastructure: lazy mounts, impersonated user-home access,
+bearer refresh, scan guard, status tool, and real tus uploads through the
+public data gateway.
+
+Remaining known limitation (local-only): ~~rclone tus uploads from workspace
+pods on local k3d are still blocked~~ — resolved later the same evening via
+the opt-in `workspace.networkPolicy.extraEgress` +
+`opencloud.mountInsecureTls` knobs and verified with a 6 MiB k3d
+write-through (see §0 known-gaps note and the feature doc Phase 6 step 2
+findings). Dev/prod unaffected either way, as this run proves.
+
+Operational note: with this live, every default-project dev session mounts
+the session owner's real Personal Space read-write at `/workspace/cloud`.
+The drift-drain hazard from §13 incident 1 was fixed the same evening
+(`docs/issues/session_agent_drift_drain_kills_idle_sessions.md` — drain is
+now a clean suspend for parked sessions, deferred for busy ones, k3d
+verified incl. a re-entrancy race found in run 1). The `suspended` terminal
+state needs one live check on dev (S3 snapshots) after the next deploy;
+locally the snapshot store is absent so the designed legacy-ended fallback
+engaged.

@@ -223,6 +223,27 @@ databases:
 workspace:
   accessMode: "ReadWriteOnce"
   storageSize: "10Gi"
+  networkPolicy:
+    # In-cluster Traefik hairpin: OpenCloud's ocdav forwards uploads (tus
+    # PATCH + plain PUT bodies) to the PUBLIC data-gateway URL
+    # (https://cloud.localhost/data), which coredns-custom resolves to the
+    # Traefik ClusterIP — inside the cluster-CIDR block the tier policies
+    # deny. This rule re-allows exactly the Traefik pods (post-DNAT pod
+    # ports: websecure=8443, web=8000). Pair with
+    # opencloud.mountInsecureTls for the mkcert cert on that hop.
+    extraEgress:
+      - to:
+          - namespaceSelector:
+              matchLabels:
+                kubernetes.io/metadata.name: kube-system
+            podSelector:
+              matchLabels:
+                app.kubernetes.io/name: traefik
+        ports:
+          - protocol: TCP
+            port: 8443
+          - protocol: TCP
+            port: 8000
 
 cloud:
   workspaceDriver: "rclone_mount"
@@ -260,6 +281,9 @@ opencloud:
   enabled: true
   dataStorageSize: "64Gi"
   oidcInsecureTls: true
+  # rclone mounts skip TLS verification on the public data-gateway hop
+  # (mkcert cert) — local-only, pairs with workspace.networkPolicy.extraEgress.
+  mountInsecureTls: true
   hostAliases:
     - ip: "10.43.68.20"
       hostnames:
