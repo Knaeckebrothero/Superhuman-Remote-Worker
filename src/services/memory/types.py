@@ -58,9 +58,14 @@ class CaptureEvent:
     kind: CaptureKind  # validated against CAPTURE_KINDS in __post_init__
     messages: List[BaseMessage] = field(default_factory=list)
     phase: int = 0
+    #: Current turn count at the event — interval writers gate and window
+    #: on this; teardown/boundary events may leave it 0.
+    turn_count: int = 0
     turn_start: Optional[int] = None
     turn_end: Optional[int] = None
-    #: Call-site extras that don't warrant a field yet (e.g. todo content).
+    #: Call-site extras that don't warrant a field yet (compaction passes
+    #: {"summary": ...}, todo_complete {"queued_memories": [...]},
+    #: turn_end {"current_injection_text": ...} for the assembler).
     extra: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -235,10 +240,21 @@ class MemoryRuntime:
     knowledge_store: Any = None
     auxiliary_llm: Any = None
     memory_config: Any = None  # src.core.loader.MemoryConfig
+    #: src.core.loader.AuxiliaryConfig — the legacy worker call sites gate
+    #: extraction/assembly on auxiliary.enabled + tasks[...].enabled.
+    auxiliary_config: Any = None
+    #: Read at event time, not bind time — persistent sessions re-resolve
+    #: the extraction prompt on config.update (B1 fix) by mutating this.
     extraction_prompt: Optional[str] = None
+    assembler_prompt: Optional[str] = None
     job_id: Optional[str] = None
     project_id: Optional[str] = None
     project_ids: List[str] = field(default_factory=list)
+    #: Per-store-call timeout in seconds. None = unbounded (the legacy
+    #: worker path); persistent sessions pass their existing 5 s guard —
+    #: each store await is bounded individually, so a hung memory lookup
+    #: never starves the KB lookup (matching the legacy split wait_fors).
+    retrieval_timeout: Optional[float] = None
     extra: Dict[str, Any] = field(default_factory=dict)
 
 
