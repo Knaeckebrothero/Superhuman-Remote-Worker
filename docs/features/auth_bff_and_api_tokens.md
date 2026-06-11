@@ -36,7 +36,7 @@ related:
 | 3 | Pre-auth state | **DB table** (`srw_pre_auth_states`) | No signing-key management |
 | 4 | Session lifetimes | **30 min idle / 30 days absolute** | Both env-tunable |
 | 5 | Cookie name | **`srw_session`** | Vendor-prefixed |
-| 6 | builder-stream `fetch()` interceptor bypass | **Separate issue doc** | See `docs/issues/cockpit_builder_stream_fetch_bypasses_auth.md` |
+| 6 | builder-stream `fetch()` interceptor bypass | **Separate issue doc** | See `docs/done/cockpit_builder_stream_fetch_bypasses_auth.md` |
 | 7 | PR 3 split | **Don't split** | Consolidation + UI ship together |
 | 8 | PAT default expiry | **1 year** | Internal-app threat model |
 | 9 | API key UI location | **Separate page** at `cockpit/src/app/views/settings/api-keys/` | Per `automations_v0.md` |
@@ -129,7 +129,7 @@ All 12 PR-3 probes passed end-to-end via Playwright + raw fetch from the cockpit
 ### What is NOT yet shipped
 
 - **PR 4** — scope-enforcement decorators on remaining endpoints (lock down the transitional permissive mode), `auth_audit` MongoDB rows per authenticated request, log redaction filter for plaintext token leaks. Optional post-v1.
-- **`builder-stream.service.ts:136` raw `fetch()` bypass** — out of scope per Decision #6, tracked separately in `docs/issues/cockpit_builder_stream_fetch_bypasses_auth.md`. The builder was already broken pre-PR-2 (no auth attached) and PR 2 neither regresses nor fixes it. Now that PAT-Bearer works orchestrator-side, a one-line `Authorization: Bearer …` addition would also work; cookie credentials (with `credentials: 'include'` + `X-CSRF: 1`) would be the cleaner fix.
+- **`builder-stream.service.ts:136` raw `fetch()` bypass** — out of scope per Decision #6, tracked separately in `docs/done/cockpit_builder_stream_fetch_bypasses_auth.md`. The builder was already broken pre-PR-2 (no auth attached) and PR 2 neither regresses nor fixes it. Now that PAT-Bearer works orchestrator-side, a one-line `Authorization: Bearer …` addition would also work; cookie credentials (with `credentials: 'include'` + `X-CSRF: 1`) would be the cleaner fix.
 
 ## Motivation
 
@@ -873,7 +873,7 @@ Discussion summary preserved for posterity:
 3. **Cookie name.** `srw_session`. Vendor-prefixed.
 4. **Session timeouts.** 30 min idle, 30 days absolute.
 5. **Keycloak client mode.** Confidential — required for BFF pattern (orchestrator authenticates at the token endpoint when exchanging a code).
-6. **`builder-stream.service.ts` interceptor bypass.** Filed as `docs/issues/cockpit_builder_stream_fetch_bypasses_auth.md`. Out of scope for this refactor.
+6. **`builder-stream.service.ts` interceptor bypass.** Filed as `docs/done/cockpit_builder_stream_fetch_bypasses_auth.md`. Out of scope for this refactor.
 7. **PR 3 split.** Don't split — consolidation + UI ship together to avoid a half-shipped state.
 8. **Token expiry default.** 1 year. Internal-app threat model; set-and-forget automation flows don't want quarterly rotation pain.
 9. **API key UI location.** Separate page at `views/settings/api-keys/` per `automations_v0.md`.

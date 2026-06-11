@@ -177,7 +177,7 @@ Write-up for discussion, not a decision. No code changes from this doc.
 Two things changed since this was written:
 
 1. **The OpenCloud share bugs referenced above are fixed** — see
-   `docs/issues/opencloud_share_bugs.md`. Both the role-weight
+   `docs/done/opencloud_share_bugs.md`. Both the role-weight
    disambiguation and the WebDAV-PROPFIND-based `_resolve_item_id`
    landed silently in commit `25283b3` (2026-04-23). The status-quo
    Option 3 path (`srw-agent-home/sessions/`, share per-session) works

@@ -126,7 +126,7 @@ The watchdog fix that landed in `fb3f571` closed the most violent failure mode (
 
 ## Why this didn't show up earlier
 
-Phase 1 of the headless-persistent-sessions design (`docs/features/headless_persistent_sessions.md`) was scoped against `src/api/persistent_app.py` — the "pure persistent mode" code path entered via `python agent.py --mode persistent`. The smoke runbook in `docs/issues/headless_sessions_smoke_leaks_cluster_pods.md` was also written against that mode.
+Phase 1 of the headless-persistent-sessions design (`docs/features/headless_persistent_sessions.md`) was scoped against `src/api/persistent_app.py` — the "pure persistent mode" code path entered via `python agent.py --mode persistent`. The smoke runbook in `docs/done/headless_sessions_smoke_leaks_cluster_pods.md` was also written against that mode.
 
 But the cluster's `Deployment` for `srw-agent` launches `python agent.py --config defaults --port 8001 --host 0.0.0.0`, which is **dual mode by default** (job dispatch + persistent sessions on the same pod). Dual mode routes WS traffic through `src/api/dual_app.py:_run_persistent_websocket`, a parallel implementation that predates Phase 1 and never had the keystone applied.
 
@@ -168,5 +168,5 @@ Either option needs a cluster-smoke test added (per the follow-up in [[persisten
 - `src/api/dual_app.py:325-369` — `_reset_to_idle` (detaches the session even in the loop branch).
 - `src/api/persistent_app.py` — the file where Phase 1's keystone *was* implemented. Compare its WS handler's finally block against `dual_app.py`'s.
 - `docs/features/headless_persistent_sessions.md` — Phase 1 design and the keystone contract.
-- `docs/issues/persistent_session_watchdog_kills_awaiting_user.md` — sibling issue; this was the first symptom of the dual-mode/persistent-app split.
+- `docs/done/persistent_session_watchdog_kills_awaiting_user.md` — sibling issue; this was the first symptom of the dual-mode/persistent-app split.
 - Cluster command verification: `kubectl get pods -n superhuman-remote-worker -l app=srw-agent -o jsonpath='{.items[0].spec.containers[?(@.name=="agent")].command}'` returns `["sh","-c","python agent.py --config defaults --port 8001 --host 0.0.0.0"]` — confirming no `--loop` flag.

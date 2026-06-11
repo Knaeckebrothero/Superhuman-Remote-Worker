@@ -196,7 +196,7 @@ existing k3d dev loops mid-flight.
 - `docs/issues/local_e2e_testing.md` — proposed an e2e harness against
   the Compose stack; if still relevant, retarget at k3d (the harness is
   cheaper to write against the chart we already test).
-- `docs/issues/helm_deployment.md` and `docs/issues/helm_fresh_deploy_issues.md`
+- `docs/done/helm_deployment.md` and `docs/issues/helm_fresh_deploy_issues.md`
   — chart-side polish items uncovered during the migration; track-adjacent
   to this work but not blockers.
 - `feedback_no_local_workspace.md` (memory) — already established that

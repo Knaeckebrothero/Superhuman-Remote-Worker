@@ -182,7 +182,7 @@ genuinely sequential single-topic tasks.
 - **Commits:** `66f1fd56` (added scholar/critic delegation, 2026-03-23);
   `59cb3d44` (developer direct-execution-default bias, 2026-05-13).
 - **Related:** `docs/issues/subjob_branch_merge_model.md`,
-  `docs/issues/subjob_merge_clobbers_parent_deliverables.md`,
+  `docs/done/subjob_merge_clobbers_parent_deliverables.md`,
   `docs/features/subagent_delegation.md` (delegation plumbing — all confirmed
   working here; this issue is purely about whether the model *chooses* to
   delegate).
