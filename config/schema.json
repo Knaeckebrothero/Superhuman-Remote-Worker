@@ -189,9 +189,9 @@
         },
         "backend": {
           "type": "string",
-          "enum": ["sandbox", "vm"],
+          "enum": ["sandbox", "vm", "virtual", "none"],
           "default": "sandbox",
-          "description": "Workspace backend type. 'sandbox' uses SSH/SFTP to an isolated workspace container. 'vm' uses SSH/SFTP to a KubeVirt VM with sudo gate for privileged operations. The agent never operates on its own filesystem."
+          "description": "Workspace backend type. 'sandbox' (SSH/SFTP to an isolated workspace container) and 'vm' (SSH/SFTP to a KubeVirt VM with sudo gate) get the full shell/git/browser toolset. The lite tiers run with no workspace pod (no_workspace_agent_mode.md): 'virtual' exposes object-store-backed file tools (no shell/git/browser); 'none' exposes no file tools at all. Shell/browser/git are gated off automatically for the lite tiers by backend capability, not by config. The agent never operates on its own filesystem."
         },
         "container": {
           "type": "object",

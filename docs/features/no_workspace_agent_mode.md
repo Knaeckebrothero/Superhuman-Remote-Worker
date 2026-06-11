@@ -61,8 +61,22 @@ agent's `create_lite_backend` and round-trips a file, so S1 and S2 are proven to
 agree without a cluster. **Local-dev story decided** (§13): dev/k3d uses the
 `memory` object store (set in `deployment/values-tilt.yaml`; non-durable,
 single-pod, no MinIO dependency); production points `virtualWorkspace.rclone`
-at MinIO S3. **Still not exercised on a real cluster** — that's the k3d smoke
-(§12). **S3** (lite profile + instruction template) remains.
+at MinIO S3. **Validated on `k3d-srw` 2026-06-11** (§12): `virtual` and `none`
+jobs each run as a single agent pod with no workspace pod/PVC, the agent boots
+the lite backend from the live dispatch payload (`Lite workspace backend ready
+(backend=virtual, no workspace pod)`), a `virtual` job wrote `notes/plan.md`
+into its `jobs/<id>/` object-store prefix and completed, and a
+`virtual`+`repository`-datasource job was rejected at creation (HTTP 400).
+
+**S3 (capability-gated tools) implemented + validated 2026-06-11** (§11/§12):
+tool binding is gated by backend capability — `registry.filter_tools_by_backend()`
+drops shell/browser/git when `not supports_shell` and the file tools when
+`not supports_file_tools` (a new ScratchBackend flag) — so on plain
+`config:default` a `virtual` job dropped all 16 shell/git/browser tools (keeping
+files + web) and a `none` job dropped those **plus** all file tools (§12 #4/#6,
+verified live). This replaces the originally sketched "lite presets" with
+enforcement-by-construction. Remaining: §12 #3 (web+SQL in one session) and #8
+(Cockpit affordances), plus an optional lite instruction variant.
 
 ## 1. Goal
 
@@ -255,13 +269,24 @@ nothing agent-driven can touch it — there are no file tools.
 - File tools (`read_file`, `write_file`, `edit_file`, `list_files`,
   `search_files`, `delete/move/copy/mkdir/stat`) — **`virtual` mode only**.
 
-**Excluded**, with enforcement:
+**Excluded**, enforced by **backend capability** — not by per-config tool
+lists (§3.2). `registry.filter_tools_by_backend()` runs at both bind seams
+(worker `agent.py`, session `persistent_session.py`) right after
+`get_all_tool_names`, and drops — by the backend's declared flags — whatever a
+lite tier can't support. So *any* config dispatched onto `virtual`/`none` gets
+the right toolset by construction; no lite-specific preset has to remember to
+omit anything.
 
-- **Shell** — not registered, *and* the ShellManager local-libtmux fallback
-  is hard-disabled (capability check, not config absence).
-- **Browser** — not registered; the local in-pod fallback is removed
-  entirely per `docs/issues/remove_local_browser_fallback.md`.
-- **Git** — deferred, see §8.
+- **Shell** — dropped when `not backend.supports_shell` (False on both lite
+  backends); the ShellManager local-libtmux fallback is also hard-disabled
+  (§9.3). `run_command`/`shell_read` are simply absent on a lite tier.
+- **Browser** — `browser_direct` dropped on the same `supports_shell` gate
+  (browser-exec needs the workspace pod); the in-pod fallback was removed
+  entirely (§9.2).
+- **Git** — `git` tools dropped on the same gate; `git_versioning` is also
+  forced off for lite (S1, §8). No git binary or repo exists in this tier.
+- **File tools** — dropped for `none` via `not backend.supports_file_tools`
+  (a new ABC flag, False on ScratchBackend; §6). `virtual` keeps them.
 - **Repository datasources** — rejected at dispatch (§4).
   **Audit done 2026-06-11, finding: the worker path COULD reach the local
   branch** — `agent.py` passed job datasources unfiltered into
@@ -280,9 +305,12 @@ nothing agent-driven can touch it — there are no file tools.
   datasource/proxy code the audit surfaced in
   [[datasource_legacy_dead_code]].
 
-Prompts: a lite instruction/persona variant that doesn't reference shell,
-git, or workspace conventions that don't exist in this tier
-(`config/templates/`, resolved per the existing matrix machinery).
+Prompts: with the toolset enforced by capability (above), the default
+instructions still *mention* shell/git/workspace conventions a lite tier
+lacks — harmless (those tools are absent) but slightly off-key. A lite
+instruction/persona variant that omits them is optional follow-up polish
+(`config/templates/`, resolved per the existing matrix machinery) — not
+required for v1, and deliberately not a parallel set of "lite presets".
 
 ## 8. Git: deferred — and why that's safe
 
@@ -426,9 +454,20 @@ observed demand.
   (400 at create, fail-job at dispatch), Helm values for the object-store
   endpoint (`virtualWorkspace.rclone.*`). Local-dev story decided: `memory`
   store in dev/k3d (`values-tilt.yaml`), MinIO S3 in prod. Unit + contract-
-  roundtrip tests green; not yet run on a real cluster (the §12 k3d smoke).
-- **S3 — config/profile (~0.5 day):** lite expert/profile config (tool
-  lists, `git_versioning: false`), lite instruction template, docs.
+  roundtrip tests green; **validated on k3d 2026-06-11** (§12 — #1/#2/#5/#7
+  pass; #4/#6 pass once S3's capability gate landed).
+- **S3 — capability-gated tools (~0.5 day): DONE 2026-06-11.** Reframed from
+  the originally sketched "lite presets" (which would have relied on every
+  preset author trimming the tool lists): tool binding is now gated by
+  *backend capability*. `registry.filter_tools_by_backend()` at both bind
+  seams drops `shell`/`browser_direct`/`git` when `not supports_shell`, and the
+  `workspace` file tools when `not supports_file_tools` (a new `WorkspaceBackend`
+  flag, False on ScratchBackend); `git_versioning` is already forced off for
+  lite (S1). Plus the `workspace.backend` schema enum (`virtual`/`none`) and
+  unit tests (`tests/test_lite_tool_gating.py`). Enforcement-by-construction:
+  any config on a lite tier gets the right toolset. **Validated on k3d
+  2026-06-11** (§12 #4/#6). Deferred (optional polish): a lite instruction
+  variant whose prose matches the trimmed toolset.
 - **S4 — egress NetworkPolicy (~0.5 day, parallel):** independent PR,
   protects full mode too. **DONE 2026-06-11 (ships default-off)** — see §9.1;
   per-deployment enablement tracked in
@@ -443,6 +482,27 @@ start immediately. v1 requires no Cockpit changes — the tier is selected via
 `config_override`/expert preset; the picker is v1.1 (§10).
 
 ## 12. Acceptance criteria (k3d smoke)
+
+**Smoke run on `k3d-srw` 2026-06-11 — S1–S3 validated end-to-end** (driven via
+the orchestrator internal API; dev `memory` object store): ✅ **#1** (both
+`virtual` and `none` ran as a single agent pod, no workspace pod/PVC; the agent
+booted the lite backend from the live dispatch payload — `Lite workspace backend
+ready (backend=virtual, no workspace pod)` — with files under the `jobs/<id>/`
+prefix), ✅ **#2** (a `virtual` job wrote `task_brief.md` + `notes/plan.md`
+through `VirtualWorkspaceBackend` and completed; deliverable enumerated),
+✅ **#4** (the S3 capability gate, on plain `config:default`, dropped all 16
+shell/git/browser tools on `virtual` and all 29 shell/git/browser **+ file**
+tools on `none` — `Backend capability gate dropped N tool(s)`; web + datasource
++ file (virtual) tools kept), ✅ **#5** (HTTP 400 at creation with the
+actionable message), ✅ **#6** (`none` ran on `ScratchBackend`, completed, with
+**zero** file tools bound), ✅ **#7** (the auto-spawned scholar — a `sandbox`
+job — still got its workspace pod). ⛔ **#3** (web + SQL datasource) not run;
+⛔ **#8** (Cockpit affordances) is v1.1.
+
+> Environment caveat (not the feature): on the dev cluster only a *chat* model
+> was configured, so *summarization/auxiliary* LLM calls fall back to
+> `OPENAI_API_KEY=not-needed` → 401 and the small model loops; jobs still
+> complete. Configure the summarization + auxiliary models to run cleanly.
 
 1. A `virtual` session/job starts with **exactly one pod** (agent; no
    workspace pod, no PVC) and reaches ready.

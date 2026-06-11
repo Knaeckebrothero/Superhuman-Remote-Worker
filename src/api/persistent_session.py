@@ -548,6 +548,14 @@ class PersistentSession:
             if "srw_cloud_status" not in tool_names:
                 tool_names.append("srw_cloud_status")
 
+        # Capability gate: drop tools the workspace backend can't support (lite
+        # tiers — no_workspace_agent_mode.md §3.2/§7). Mirrors the worker path.
+        from ..tools.registry import filter_tools_by_backend
+
+        tool_names = filter_tools_by_backend(
+            tool_names, getattr(self.workspace_manager, "backend", None)
+        )
+
         try:
             self.tools = load_tools(tool_names, self.tool_context)
         except ValueError as e:
