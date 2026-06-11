@@ -1505,7 +1505,15 @@ def _parse_memory_config(data: Dict[str, Any]) -> MemoryConfig:
         dedup_threshold=data.get("dedup_threshold", 0.85),
         retrieval_importance_floor=data.get("retrieval_importance_floor", 0.4),
         project_scoped=data.get("project_scoped", True),
-        manager_enabled=manager_data.get("enabled", False),
+        # Accept both shapes: the YAML nesting (`manager.enabled`) and the
+        # flat dataclass field (`manager_enabled`) that dataclasses.asdict()
+        # emits when dispatch paths round-trip a live config through
+        # deep_merge + re-parse (job config_override, session config
+        # assembly, config.update). Without the fallback the cutover flag
+        # silently resets to False on every dispatched job/session.
+        manager_enabled=bool(
+            manager_data.get("enabled", data.get("manager_enabled", False))
+        ),
         pipeline=pipeline,
     )
 

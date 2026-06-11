@@ -323,6 +323,7 @@ def _ensure_persistent_loop_started(
                     _session.tools,
                 ),
                 memory_extraction_prompt=_session.memory_extraction_prompt,
+                memory_service=_session.memory_service,
             ),
             name="persistent-loop",
         )
@@ -1488,6 +1489,29 @@ async def _terminate_session_inner(reason: str, *, mark_thread: bool = True) -> 
     # Cancel self-cleanup watchdogs first — we're about to do the cleanup
     # they would have triggered, no point letting them race the detach.
     _stop_watchdogs()
+
+    # B11: final memory capture for ALL terminate reasons — the ✕-button
+    # detach (and drain, watchdog, shutdown, …) historically skipped
+    # extraction entirely. Manager-mode only; the flag-off path keeps
+    # today's (skipping) behaviour. The guard flag stops a re-extraction
+    # when _handle_archive/_handle_idle_archive already captured. Must run
+    # before _session.cleanup() tears down the stores; contained like the
+    # sibling teardown steps — a memory failure must never skip cleanup.
+    if (
+        _session.memory_service is not None
+        and not _session.final_memory_extracted
+        and _session.messages
+    ):
+        try:
+            from ..services.memory import CaptureEvent
+
+            await _session.memory_service.capture(
+                CaptureEvent(kind="session_end", messages=_session.messages)
+            )
+            _session.final_memory_extracted = True
+            logger.info("Terminate(%s): final memory capture complete", reason)
+        except Exception as e:
+            logger.warning(f"Terminate memory capture failed (non-fatal): {e}")
 
     # Mark thread as ended (still resumable — `ended` is the only inactive
     # state). The drain-suspend path passes mark_thread=False: the
@@ -3685,6 +3709,17 @@ async def _handle_config_update(ws: WebSocket, config_override: Dict[str, Any]) 
         # changed.
         _session.memory_extraction_prompt = resolve_memory_extraction_prompt(new_config)
 
+        # Keep the MemoryManager runtime in lockstep: its writers read the
+        # auxiliary LLM and extraction prompt at event time, so mutating the
+        # runtime preserves the B1 hot-swap. memory_config is deliberately
+        # NOT re-pointed — the legacy loop freezes its extraction interval
+        # at loop start, and the writers must match that.
+        if _session.memory_service is not None:
+            _session.memory_service.runtime.auxiliary_llm = _session.auxiliary_llm
+            _session.memory_service.runtime.extraction_prompt = (
+                _session.memory_extraction_prompt
+            )
+
         # Reset embedding singleton if embedding env keys changed.
         new_env_block = effective_override.get("env_keys") or {}
         if any(k in new_env_block for k in embedding_env_keys):
@@ -3767,13 +3802,23 @@ async def _handle_archive(ws: WebSocket) -> None:
             except Exception as e:
                 logger.debug(f"Cloud sync aclose failed (non-fatal): {e}")
 
-        # 1. Extract final memories
+        # 1. Extract final memories.
+        # Manager path (memory overhaul Phase 1): the teardown_extractor
+        # writer reproduces the gates, the call, and the log line below;
+        # the guard flag stops _terminate_session from re-extracting (B11).
         recall_store = (
             getattr(_session.tool_context, "recall_store", None)
             if _session.tool_context
             else None
         )
-        if recall_store and _session.auxiliary_llm and _session.messages:
+        if _session.memory_service is not None:
+            from ..services.memory import CaptureEvent
+
+            await _session.memory_service.capture(
+                CaptureEvent(kind="session_end", messages=_session.messages)
+            )
+            _session.final_memory_extracted = True
+        elif recall_store and _session.auxiliary_llm and _session.messages:
             try:
                 from ..services.auxiliary import extract_and_store_memories
 
@@ -3855,13 +3900,22 @@ async def _handle_idle_archive(ws: Optional[WebSocket] = None) -> None:
         # the UI can flip to the resume card without waiting for a refresh.
         _broadcast("session.ended", {"thread_id": _thread_id, "reason": "idle_timeout"})
 
-        # 1. Extract memories
+        # 1. Extract memories.
+        # Manager path (memory overhaul Phase 1): the teardown_extractor
+        # writer reproduces the gates, the call, and the log line below.
         recall_store = (
             getattr(_session.tool_context, "recall_store", None)
             if _session.tool_context
             else None
         )
-        if recall_store and _session.auxiliary_llm and _session.messages:
+        if _session.memory_service is not None:
+            from ..services.memory import CaptureEvent
+
+            await _session.memory_service.capture(
+                CaptureEvent(kind="idle_archive", messages=_session.messages)
+            )
+            _session.final_memory_extracted = True
+        elif recall_store and _session.auxiliary_llm and _session.messages:
             try:
                 from ..services.auxiliary import extract_and_store_memories
 

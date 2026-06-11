@@ -216,6 +216,23 @@ memory:
   # NOTE: the observer runs on the auxiliary LLM (see `auxiliary:` below) and
   # the embedding model comes from the EMBEDDING_* env vars — neither is
   # configurable here (dead keys removed, docs/issues/memory_bugs.md B9).
+  # MemoryManager seam (memory overhaul Phase 1). manager.enabled is the
+  # cutover flag: true routes memory through the manager + the pipeline
+  # below; false keeps the legacy direct-store paths in the graph. The
+  # pipeline names resolve against MEMORY_PLUGIN_REGISTRY
+  # (src/services/memory/) — an unknown name fails loudly at setup.
+  manager:
+    enabled: true
+  pipeline:
+    retrievers:
+      - recall_two_tier              # TTL-pinned tier + hybrid search (RecallStore)
+      - kb_notes                     # Top-5 project knowledge notes
+    writers:
+      - interval_extractor           # Worker in-loop observer (modulo gate)
+      - phase_boundary_extractor     # Extraction at archive_phase
+      - memory_assembler             # TTL curation every assembler_interval turns
+      - compaction_memory            # Store compaction summaries
+      - queued_memory                # Flush todo_complete-queued memories
 
 # Auxiliary LLM — unified support task system for background LLM tasks.
 # Handles memory extraction, knowledge curation, and other support tasks

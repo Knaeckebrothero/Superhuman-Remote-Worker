@@ -28,8 +28,12 @@ related:
 > assembles the right memories for every LLM call — the model is a *consumer*, never the
 > manager. Build the seam first; everything else becomes a plugin behind it.
 
-**Status:** Design v2 / **step 0 + pre-flight bug track complete, Phase 1 in
-progress (slices 1–4 of 5 done)** — restructured 2026-06-10 around the MemoryManager
+**Status:** Design v2 / **step 0 + pre-flight bug track complete, Phase 1
+implementation complete (all 5 slices)** — the cutover wiring is live behind
+`memory.manager.enabled`, which ships **off**; what remains for Phase-1 closure
+is operational: live k3d verify (flag on) → flip the default → soak → delete
+the legacy blocks (the "zero direct store calls" acceptance is the
+post-deletion state). Restructured 2026-06-10 around the MemoryManager
 abstraction after design alignment (v1 of 2026-06-07 was phase-first; superseded,
 phases preserved below in new order). Every bug worth fixing *before* the seam is
 fixed (B1/B2/B4 + logging); the remaining bugs are absorbed by phases by design.
@@ -179,6 +183,68 @@ fixed (B1/B2/B4 + logging); the remaining bugs are absorbed by phases by design.
   background task — same calls, serialized (arguably kinder to the
   flaky aux router). Graphs/persistent_app untouched.
   Next: slice 5 (cutover behind `memory.manager.enabled`).
+- **2026-06-11 — Phase 1 slice 5: the cutover, wired behind the flag
+  (default off).** Both graphs now construct and route through the
+  manager when `memory.manager.enabled` is true. **Construction**:
+  worker in `build_phase_alternation_graph` (graph.py, right after the
+  store extraction — all deps in scope: stores via tool_context with
+  the legacy `has_knowledge()` gate, aux LLM post-fallback-wrap, both
+  matrix-resolved prompts, `retrieval_timeout=None`); persistent at the
+  end of `PersistentSession._setup_memory` (`retrieval_timeout=5.0`, no
+  assembler prompt; threaded into `run_persistent_loop` →
+  `_execute_turn` as a new `memory_service` param). The instance is
+  named `memory_service` throughout — `memory_manager` is taken in
+  graph.py by the vestigial workspace.md manager. Bind failures
+  (unknown pipeline name) deliberately **raise at setup** — a
+  misconfigured cutover must fail loudly, not limp on the legacy path
+  (the aux-outage lesson applied to construction). The persistent
+  `config.update` handler keeps the runtime in lockstep
+  (`auxiliary_llm` + `extraction_prompt` mutated for the B1 hot-swap;
+  `memory_config` deliberately NOT re-pointed — the legacy loop
+  freezes its interval at loop start). **Gating pattern**: every legacy
+  block stays byte-identical and gains a `memory_service is None`
+  guard term, with the manager branch alongside — read swaps splice
+  `payload.messages()` at the exact legacy positions (worker: inside
+  `_inject_transient_messages` after the todos message, so safety
+  rebuilds re-splice; persistent: after the SystemMessage each
+  inner-loop iteration), and the six write sites emit their
+  CaptureEvents (worker turn_end carries `turn_count`/`phase`/the
+  payload's memory-block text as `current_injection_text`; compaction
+  carries the summary; the drain emits only when the queue is
+  non-empty). The legacy debug signals ("Memory injection: N memories
+  retrieved", "Knowledge injection: N notes retrieved") are re-emitted
+  at the manager call sites so the k3d greps stay valid; the worker
+  `memory_inject` audit_step keeps its legacy `{count, total_tokens}`
+  shape fed from the payload's memory block and additionally carries
+  `stats` (= `AssembleStats.to_dict()` — the eval-harness/cockpit tap).
+  **B11 closed at flag-on**: `_terminate_session_inner` gained a
+  guarded, awaited `capture(session_end)` for ALL terminate reasons
+  (contained like its sibling teardown steps — memory must never skip
+  cleanup); `_handle_archive`/`_handle_idle_archive` set the
+  `final_memory_extracted` session flag so archive→terminate never
+  double-extracts. **Config**: the YAML pipeline defaults landed
+  (defaults.yaml: recall_two_tier+kb_notes / interval_extractor,
+  phase_boundary_extractor, memory_assembler, compaction_memory,
+  queued_memory; persistent_defaults.yaml:
+  persistent_interval_extractor, teardown_extractor) with
+  `manager.enabled: false`. **Tests**
+  (`tests/test_memory_cutover.py`, 19 cases): YAML defaults parse +
+  every shipped name binds (registry drift guard), construction
+  runtime-field pins for both modes (+ flag-off never constructs),
+  execute-node drive (query formation, splice position, legacy-store
+  spies untouched, audit shape, turn_end + compaction events,
+  interval-state keys absent from results), archive/tools-node event
+  pins, `_execute_turn` insertion pin, teardown + B11
+  exactly-once/guard pins, and **B10**: every message `assemble()`
+  emits must satisfy `is_workspace_injection_message` (manager renders
+  through the same `create_*_injection_messages`, and unrenderable
+  kinds contribute provenance-only blocks). Legacy-path test doubles
+  gained explicit `memory_service=None` (6× MagicMock archive sessions,
+  1× SimpleNamespace REST session, the B1 teardown `_make_session` —
+  the MagicMock-fabrication pattern; any future session-shaped mock
+  hitting memory paths needs the same). Remaining for Phase-1 closure:
+  k3d verify → flip → soak → delete legacy — step-by-step commands and
+  pass signals in the **Phase-1 closure runbook** under §5 Phase 1.
 **Companions:**
 - [`agent_memory_current_state.md`](agent_memory_current_state.md) — ground truth: every
   current capability classified wired/dead/conceptual with `file:line` evidence.
@@ -506,7 +572,7 @@ pre-flight (2026-06-11): B2 halfvec migrations shipped + k3d-verified (Phase 3's
 frozen until Phase-1 equivalence fixtures pin it (mapping in `memory_bugs.md`
 §Suggested order).
 
-### Phase 1 — The foundation: MemoryManager seam · ~1–1.5 wk ← **in progress: slices 1–4 of 5 done, cutover remains** (see implementation log)
+### Phase 1 — The foundation: MemoryManager seam · ~1–1.5 wk ← **implementation complete (slices 1–5); flag ships off — k3d verify → flip → soak → delete legacy remain** (see implementation log)
 Extract all assembly + capture logic from `graph.py` / `persistent_graph.py` /
 `persistent_app.py` into `src/services/memory/` behind the §2.1 interface. Both graphs
 hold one `MemoryManager`; neither touches `RecallStore`/`KnowledgeStore` directly. v1
@@ -534,6 +600,95 @@ worker-path payloads are byte-stable vs pre-refactor fixtures; persistent path a
 *parity with worker* (prompt loaded, cadence config-driven, teardown capture fires);
 `graph.py`/`persistent_graph.py` contain zero direct store calls; lint+tests at file
 granularity per CLAUDE.md verify loop.
+
+**Phase-1 closure runbook (status 2026-06-11: step 1 executed and PASSED —
+findings under step 1; step 2 staged in the working tree).** All code is on
+develop: seam + plugins (slices 1–4), cutover wiring + per-mode YAML pipelines +
+20 wiring tests (slice 5 + the step-1 round-trip regression). Closure is four
+steps; the unit suites can't cover step 1 (real stores, real aux LLM, real
+timing), and deleting legacy before step 3 would destroy the flag's rollback
+path.
+
+1. **Live k3d verify, flag on.**
+   - *Flip locally (don't commit):* set `manager: enabled: true` under `memory:`
+     in `config/defaults.yaml` + `config/persistent_defaults.yaml`. With Tilt
+     running, `config/*` propagates via the agent image rebuild (~50 s).
+     Worker-only surgical alternative: submit one job with
+     `config_override: {"memory": {"manager": {"enabled": true}}}` — agent.py
+     deep-merges overrides before config parsing.
+   - *Bind signal (both modes):* `MemoryManager bound: {...}` with the pipeline
+     summary at job start / session setup
+     (`kubectl --context=k3d-srw -n srw logs -l srw/managed-by=agent-provisioner -f`).
+     A typo'd pipeline name fails the job/session at setup **by design**.
+   - *Worker:* run a job in a project (so the KB path is live). Expect
+     `Memory injection: N memories retrieved` / `Knowledge injection: N notes
+     retrieved` once memories exist; the `memory_inject` audit steps now carry a
+     `stats` dict. Compaction-summary capture only fires on long jobs — optional.
+   - *Persistent:* session ≥ 5 turns → `Memory extraction triggered at turn 5`;
+     end via `/done` → `Final memory extraction complete`; **the new B11 path**:
+     end a session via the cockpit ✕-button (DELETE thread → `/session/detach`)
+     → `Terminate(rest_detach): final memory capture complete` — this log line
+     did not exist before slice 5. Idle-archive
+     (`Idle archive: memory extraction complete`) can be left to soak, as B1 was.
+   - *Rows:* `kubectl --context=k3d-srw -n srw exec sts/srw-pgvector -- psql -U
+     srw -d srw_vector -c "SELECT source, count(*) FROM memories WHERE created_at
+     > now() - interval '1 hour' GROUP BY source;"` — expect `observer` rows
+     (plus `compaction` on long jobs).
+   - *Failure surface:* grep the same logs for `failed (contained)` /
+     `Memory writer` warnings and check `stats.errors` in the audit data — both
+     should be empty. Containment means a broken plugin degrades loudly instead
+     of killing the turn, so the absence of warnings *is* the pass signal.
+
+   **Step-1 execution findings (2026-06-11, k3d — PASSED, three real catches).**
+   Verified live: bind logs in both modes with the right per-mode pipelines;
+   worker read path (`Memory injection: 2 memories retrieved` + `Knowledge
+   injection: 5 notes retrieved` on job `fbccb2e5`; audit `memory_inject` rows
+   carry legacy `count`/`total_tokens` plus the new `stats` dict —
+   `per_retriever {recall_two_tier: 2, kb_notes: 5}`, `errors: []`); worker
+   write path (interval extraction `extracted 2, stored 2`, phase-boundary +
+   compaction windows exercised, observer rows in pgvector for both the scholar
+   and main jobs); persistent in-loop (`Memory extraction triggered at turn 5`,
+   thread `774b31fc`); persistent teardown via `/done` archive (`extracted 3,
+   stored 3` + `Final memory extraction complete`, 3 pgvector rows, thread
+   `ee9c2df8`). Zero seam-layer containment warnings anywhere; the only
+   failures were aux-router `TimeoutError`s contained inside
+   `extract_and_store_memories`' non-fatal handler — identical to legacy (the
+   flaky router even tripped the `AUXILIARY MODEL DEGRADED` latch once). The
+   catches:
+   1. **Dispatch round-trip dropped the flag (FIXED).** Every dispatch path
+      re-parses the live config after `dataclasses.asdict()` + `deep_merge`
+      (job `config_override` in `src/agent.py`, session assembly and
+      `config.update` in `persistent_app.py`). `asdict` emits the flat
+      dataclass field `manager_enabled`; the parser read only the YAML nesting
+      `manager.enabled` → the flag silently reset to **False on every
+      dispatched job/session**. Fixed in `_parse_memory_config` (accepts both
+      shapes); pinned by `test_manager_flag_survives_dispatch_round_trip` in
+      the cutover suite.
+   2. **Sessions can bind the worker pipeline** through two pre-existing
+      config_name plumbing holes (bare `ThreadCreateRequest` defaults to
+      `"defaults"`; `/session/attach` pool reuse ignores the thread's
+      config_name) — post-cutover that silently drops `teardown_extractor`.
+      Filed as `docs/issues/session_config_name_plumbing.md`.
+   3. **The ✕-button signal above is unreachable on k8s**: the orchestrator's
+      thread DELETE deletes the agent pod directly (never calls
+      `/session/detach`), so `_terminate_session` — and with it the B11
+      capture — cannot fire on that route. The teardown writer was verified
+      through the archive route instead; the terminate guard rails were
+      observed via `Terminate(loop_complete) skipped — session teardown
+      already in progress`. Remaining gap + fix direction in memory_bugs.md
+      B11.
+   Also fixed en route (unrelated to memory): `docker/Dockerfile.agent.dev`
+   still carried the playwright layer that fc42d052 removed from the prod
+   Dockerfile — every Tilt agent rebuild had been failing since that commit.
+
+2. **Flip the default:** commit `manager: enabled: true` in both defaults files.
+3. **Soak on dev:** real workloads; watch the failure surface above. Rollback is
+   the one-line config revert — that is the flag's whole job.
+4. **Delete the legacy blocks:** remove the `memory_service is None` branches and
+   the direct-store code from graph.py / persistent_graph.py / persistent_app.py.
+   This is when the "zero direct store calls" acceptance is met; the equivalence
+   suites' verbatim reproductions become the reference copy of the old behaviour
+   and `tests/test_memory_cutover.py` keeps guarding the wiring.
 
 ### Phase 2 — Eval harness against the seam + baseline · ~1–1.5 wk
 A standalone offline harness (`eval/memory/`) that drives **`MemoryManager.assemble()`

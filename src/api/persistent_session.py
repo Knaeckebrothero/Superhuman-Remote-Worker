@@ -114,6 +114,13 @@ class PersistentSession:
     # Memory/knowledge stores (initialized during setup)
     recall_store: Optional[Any] = None
     knowledge_store: Optional[Any] = None
+    # MemoryManager seam (src.services.memory) — bound in _setup_memory()
+    # behind memory.manager.enabled; None keeps the legacy direct-store
+    # paths in persistent_graph.py and persistent_app.py.
+    memory_service: Optional[Any] = None
+    # B11 double-extraction guard: set after a manager-path session_end/
+    # idle_archive capture so _terminate_session doesn't re-extract.
+    final_memory_extracted: bool = False
     _knowledge_graph: Optional[Any] = None
     project_ids: List[str] = field(default_factory=list)
     # Owning user UUID (read from the threads row during setup). Plumbed
@@ -726,6 +733,38 @@ class PersistentSession:
                 logger.info("KnowledgeStore initialized for persistent session")
             except Exception as e:
                 logger.warning(f"Failed to initialize KnowledgeStore (non-fatal): {e}")
+
+        # MemoryManager seam (memory overhaul Phase 1, behind
+        # memory.manager.enabled). Constructed after both stores so the
+        # retriever factories bind real handles; the writers read
+        # auxiliary_llm/extraction_prompt from the runtime at event time,
+        # which is what lets the config.update handler hot-swap them
+        # (persistent_app.py keeps runtime in lockstep). Bind failures
+        # (unknown plugin name) raise — a misconfigured cutover fails at
+        # session setup, not silently mid-turn. Sessions without a
+        # vector_conn return above and keep the legacy (no-op) paths.
+        if self.config.memory.manager_enabled:
+            from src.services.memory import MemoryManager as MemorySeamManager
+            from src.services.memory import MemoryRuntime
+
+            self.memory_service = MemorySeamManager.from_config(
+                self.config.memory,
+                MemoryRuntime(
+                    recall_store=self.recall_store,
+                    knowledge_store=self.knowledge_store,
+                    auxiliary_llm=self.auxiliary_llm,
+                    memory_config=self.config.memory,
+                    auxiliary_config=self.config.auxiliary,
+                    extraction_prompt=self.memory_extraction_prompt,
+                    assembler_prompt=None,  # persistent mode has no assembler
+                    job_id=self.thread_id,
+                    project_id=self.project_id,
+                    project_ids=list(self.project_ids),
+                    # The legacy persistent path bounds each store call at
+                    # 5 s (_RETRIEVAL_TIMEOUT in persistent_graph.py).
+                    retrieval_timeout=5.0,
+                ),
+            )
 
     def swap_backend(self, new_backend: Any) -> None:
         """Hot-swap workspace backend at runtime (e.g. container → VM).

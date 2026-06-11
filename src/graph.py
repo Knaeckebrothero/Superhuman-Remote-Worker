@@ -657,6 +657,7 @@ def create_execute_node(
     memory_assembler_prompt: str = "",
     tool_context: Optional[ToolContext] = None,
     tool_names: Optional[List[str]] = None,
+    memory_service: Optional[Any] = None,
 ) -> Callable[[UniversalAgentState], Dict[str, Any]]:
     """Create the execute node with phase-specific LLM selection.
 
@@ -677,6 +678,10 @@ def create_execute_node(
         memory_extraction_prompt: Prompt for memory extraction task
         memory_assembler_prompt: Prompt for memory assembler task
         tool_names: List of loaded tool names for system prompt conditionals
+        memory_service: MemoryManager seam (src.services.memory) — when
+            bound, replaces the direct-store memory read/write paths in
+            this node (memory overhaul Phase 1 cutover); None keeps the
+            legacy paths.
     """
 
     # Extract tool schemas from bound LLMs once at creation time for archiving
@@ -839,8 +844,26 @@ def create_execute_node(
                 f"(removing {len(remove_markers)} old messages)"
             )
 
-        # Memory Light: store compaction summary as free-source memory
-        if recall_store and context_was_compacted:
+        # Memory Light: store compaction summary as free-source memory.
+        # Manager path (memory overhaul Phase 1): one capture() event —
+        # the compaction_memory writer reproduces the store call below.
+        if memory_service is not None and context_was_compacted:
+            summaries_count_after = (
+                len(context_mgr._state.summaries)
+                if hasattr(context_mgr, "_state")
+                else 0
+            )
+            if summaries_count_after > summaries_count_before:
+                from src.services.memory import CaptureEvent
+
+                await memory_service.capture(
+                    CaptureEvent(
+                        kind="compaction",
+                        phase=state.get("phase_number", 0),
+                        extra={"summary": context_mgr._state.summaries[-1]},
+                    )
+                )
+        elif recall_store and context_was_compacted:
             summaries_count_after = (
                 len(context_mgr._state.summaries)
                 if hasattr(context_mgr, "_state")
@@ -887,9 +910,66 @@ def create_execute_node(
 
         todos_injection_content = todo_manager.format_for_injection()
 
+        # MemoryManager seam read path (memory overhaul Phase 1 cutover).
+        # When bound, one assemble() replaces the two direct-store retrieval
+        # blocks below — those stay byte-identical for the flag-off path
+        # (pinned by tests/test_memory_worker_equivalence.py) and are
+        # skipped via the `memory_service is None` guard terms.
+        _manager_payload = None
+        _manager_memory_text = ""  # assembler's current_injection_text
+        if memory_service is not None:
+            from src.services.memory import AssembleRequest, TaskFrame
+            from src.services.memory.plugins.legacy import build_worker_query_text
+
+            _mm_pending = todo_manager.list_pending()
+            _mm_frame = TaskFrame(
+                top_todo=_mm_pending[0].content if _mm_pending else None,
+                phase_number=phase_number,
+                is_strategic=is_strategic,
+            )
+            _manager_payload = await memory_service.assemble(
+                AssembleRequest(
+                    query_text=build_worker_query_text(_mm_frame),
+                    task_frame=_mm_frame,
+                    budget_tokens=config.memory.budget_tokens,
+                    model=config.llm.model,
+                )
+            )
+            for _mm_block in _manager_payload.blocks:
+                if _mm_block.kind == "memory" and _mm_block.items:
+                    _manager_memory_text = _mm_block.content
+                    logger.debug(
+                        f"[{job_id}] Memory injection: "
+                        f"{len(_mm_block.items)} memories retrieved"
+                    )
+                    # Audit memory injection (legacy data shape + the
+                    # manager's stats — the eval-harness/cockpit tap)
+                    inject_auditor = get_archiver()
+                    if inject_auditor:
+                        inject_auditor.audit_step(
+                            job_id=job_id,
+                            agent_type=config.agent_id,
+                            step_type="memory_inject",
+                            node_name="execute",
+                            iteration=iteration,
+                            data={
+                                "count": len(_mm_block.items),
+                                "total_tokens": _mm_block.token_count,
+                                "stats": _manager_payload.stats.to_dict(),
+                            },
+                            metadata=state.get("metadata"),
+                            phase="strategic" if is_strategic else "tactical",
+                            phase_number=phase_number,
+                        )
+                elif _mm_block.kind == "knowledge" and _mm_block.items:
+                    logger.debug(
+                        f"[{job_id}] Knowledge injection: "
+                        f"{len(_mm_block.items)} notes retrieved"
+                    )
+
         # Memory Light: decrement TTLs then retrieve relevant memories for injection
         _memory_block = [""]  # mutable container for closure access
-        if recall_store:
+        if memory_service is None and recall_store:
             try:
                 await recall_store.decrement_ttl()
             except Exception as e:
@@ -943,7 +1023,7 @@ def create_execute_node(
             if tool_context and tool_context.has_knowledge()
             else None
         )
-        if knowledge_store and tool_context.project_id:
+        if memory_service is None and knowledge_store and tool_context.project_id:
             try:
                 import uuid as _uuid
 
@@ -986,6 +1066,13 @@ def create_execute_node(
             """Append transient injection messages (todos, memories, knowledge, instruction files)."""
             # Todo list as transient HumanMessage
             target_messages.append(create_todos_human_message(todos_injection_content))
+
+            # MemoryManager seam: the assembled payload replaces the legacy
+            # _memory_block/_knowledge_block branches below (both stay ""
+            # when the manager is bound). Safety rebuilds re-call this into
+            # a fresh list, so reusing the same pair objects is safe.
+            if _manager_payload is not None:
+                target_messages.extend(_manager_payload.messages())
 
             # Memory Light: inject recalled memories
             if _memory_block[0]:
@@ -1530,7 +1617,30 @@ def create_execute_node(
                 extraction_triggered = False
                 assembly_triggered = False
                 recall_store_exec = tool_context.recall_store if tool_context else None
-                if (
+
+                # Manager path (memory overhaul Phase 1): one fire-and-forget
+                # turn_end capture replaces the two create_tasks below. The
+                # interval_extractor/memory_assembler writers reproduce the
+                # gates and calls; interval state lives in the writers, so
+                # the last_observed_turn/last_assembled_turn state keys stop
+                # advancing (documented resume-window delta).
+                if memory_service is not None:
+                    import asyncio
+
+                    from src.services.memory import CaptureEvent
+
+                    asyncio.create_task(
+                        memory_service.capture(
+                            CaptureEvent(
+                                kind="turn_end",
+                                messages=messages,
+                                phase=phase_number,
+                                turn_count=new_turn_count,
+                                extra={"current_injection_text": _manager_memory_text},
+                            )
+                        )
+                    )
+                elif (
                     recall_store_exec
                     and config.auxiliary.enabled
                     and config.auxiliary.tasks.get("extract_memories", None)
@@ -1563,8 +1673,10 @@ def create_execute_node(
                         )
 
                 # Memory assembler: review conversation and adjust memory TTLs
+                # (manager path: rides the turn_end capture above)
                 if (
-                    recall_store_exec
+                    memory_service is None
+                    and recall_store_exec
                     and config.auxiliary.enabled
                     and config.auxiliary.tasks.get("assemble_memories", None)
                     and config.auxiliary.tasks["assemble_memories"].enabled
@@ -2012,6 +2124,7 @@ def create_archive_phase_node(
     workspace_manager: Optional[WorkspaceManager] = None,
     memory_extraction_prompt: str = "",
     curation_prompt: str = "",
+    memory_service: Optional[Any] = None,
 ) -> Callable[[UniversalAgentState], Dict[str, Any]]:
     """Create the archive_phase node.
 
@@ -2019,6 +2132,8 @@ def create_archive_phase_node(
     Also performs context compaction if configured.
     Creates phase snapshots for recovery if snapshot_manager is provided.
     Runs inline knowledge curation if knowledge base is available.
+    When memory_service (MemoryManager seam) is bound, the phase-boundary
+    extraction is emitted as a capture() event instead of the direct call.
     """
 
     async def archive_phase(state: UniversalAgentState) -> Dict[str, Any]:
@@ -2035,7 +2150,21 @@ def create_archive_phase_node(
         import asyncio
 
         # Memory Light: extract memories at phase boundary via AuxiliaryLLM (async, non-blocking)
-        if (
+        # Manager path (memory overhaul Phase 1): the phase_boundary_extractor
+        # writer reproduces the gates and the call below.
+        if memory_service is not None:
+            from src.services.memory import CaptureEvent
+
+            asyncio.create_task(
+                memory_service.capture(
+                    CaptureEvent(
+                        kind="phase_boundary",
+                        messages=messages,
+                        phase=phase_number,
+                    )
+                )
+            )
+        elif (
             recall_store
             and config.auxiliary.enabled
             and config.auxiliary.tasks.get("extract_memories", None)
@@ -2981,6 +3110,7 @@ def create_audited_tool_node(
     config: AgentConfig,
     recall_store=None,
     tool_context: Optional[ToolContext] = None,
+    memory_service: Optional[Any] = None,
 ) -> Callable[[UniversalAgentState], Dict[str, Any]]:
     """Create a tool node with audit logging, stuck detection, and tool masking.
 
@@ -3435,8 +3565,21 @@ def create_audited_tool_node(
                             error=content[:500] if is_error else None,
                         )
 
-        # Memory Light: flush queued memories from sync tool functions
-        if recall_store and tool_context:
+        # Memory Light: flush queued memories from sync tool functions.
+        # Manager path (memory overhaul Phase 1): the queued_memory writer
+        # reproduces the per-item store loop below.
+        if memory_service is not None and tool_context:
+            _queued = tool_context.drain_pending_memories()
+            if _queued:
+                from src.services.memory import CaptureEvent
+
+                await memory_service.capture(
+                    CaptureEvent(
+                        kind="todo_complete",
+                        extra={"queued_memories": _queued},
+                    )
+                )
+        elif recall_store and tool_context:
             for mem in tool_context.drain_pending_memories():
                 try:
                     await recall_store.store(**mem)
@@ -3596,6 +3739,42 @@ def build_phase_alternation_graph(
     # Extract RecallStore for memory injection and free sources
     recall_store = tool_context.recall_store if tool_context else None
 
+    # MemoryManager seam (memory overhaul Phase 1, docs/features/
+    # agent_memory_overhaul.md §5). Constructed only behind
+    # memory.manager.enabled; while None, every legacy direct-store path
+    # below runs unchanged (pinned by the equivalence suites). Named
+    # memory_service because memory_manager is taken by the vestigial
+    # workspace.md MemoryManager above. Bind failures (unknown plugin
+    # name in memory.pipeline) raise here — a misconfigured cutover must
+    # fail at setup, not limp silently on the legacy path.
+    memory_service = None
+    if config.memory.manager_enabled:
+        from src.services.memory import MemoryManager as MemorySeamManager
+        from src.services.memory import MemoryRuntime
+
+        memory_service = MemorySeamManager.from_config(
+            config.memory,
+            MemoryRuntime(
+                recall_store=recall_store,
+                # Same gate as the legacy execute block: knowledge needs
+                # both the store and the graph connection.
+                knowledge_store=(
+                    tool_context.knowledge_store
+                    if tool_context and tool_context.has_knowledge()
+                    else None
+                ),
+                auxiliary_llm=auxiliary_llm,
+                memory_config=config.memory,
+                auxiliary_config=config.auxiliary,
+                extraction_prompt=memory_extraction_prompt,
+                assembler_prompt=memory_assembler_prompt,
+                job_id=tool_context.job_id if tool_context else None,
+                project_id=tool_context.project_id if tool_context else None,
+                project_ids=list(tool_context.project_ids) if tool_context else [],
+                retrieval_timeout=None,  # worker path runs unbounded (legacy)
+            ),
+        )
+
     # Create graph
     workflow = StateGraph(UniversalAgentState)
 
@@ -3635,6 +3814,7 @@ def build_phase_alternation_graph(
         memory_assembler_prompt=memory_assembler_prompt,
         tool_context=tool_context,
         tool_names=_tool_names,
+        memory_service=memory_service,
     )
     check_todos = create_check_todos_node(todo_manager, config, tool_names=_tool_names)
     archive_phase = create_archive_phase_node(
@@ -3650,6 +3830,7 @@ def build_phase_alternation_graph(
         workspace_manager=workspace,
         memory_extraction_prompt=memory_extraction_prompt,
         curation_prompt=curation_prompt,
+        memory_service=memory_service,
     )
 
     handle_transition = create_handle_transition_node(
@@ -3668,6 +3849,7 @@ def build_phase_alternation_graph(
         config,
         recall_store=recall_store,
         tool_context=tool_context,
+        memory_service=memory_service,
     )
 
     # Add nodes to graph

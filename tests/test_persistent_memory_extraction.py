@@ -218,6 +218,7 @@ class TestTeardownExtraction:
     def _make_session(self) -> MagicMock:
         session = MagicMock()
         session.config.memory = MemoryConfig(enabled=True)
+        session.memory_service = None  # legacy path (manager flag off)
         session.memory_extraction_prompt = "TEARDOWN PROMPT"
         session.tool_context.recall_store = MagicMock()
         session.auxiliary_llm = MagicMock()
