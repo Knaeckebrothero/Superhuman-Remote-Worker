@@ -209,7 +209,8 @@ primary, runtime gate backup).
 - `docs/features/browser_workspace_executor.md` — the migration this completes.
 - `docs/issues/deprecate_docker_compose_stack.md` — removes the dev posture
   that justified the fallback; the sibling ShellManager → local-libtmux
-  degradation should die with it.
+  degradation should die with it (it did — removed 2026-06-11, see
+  `docs/features/no_workspace_agent_mode.md` §9.3).
 - `docs/issues/egress_proxy_pool.md` — future shared browser/egress pool
   (where browser capability for workspace-less "lite" agents would live).
 - Planned agent-pod egress NetworkPolicy (companion control: the agent pod

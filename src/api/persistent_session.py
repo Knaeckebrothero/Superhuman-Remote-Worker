@@ -10,7 +10,6 @@ and config without subclassing or modifying it.
 import asyncio
 import logging
 import os
-import shutil
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -635,12 +634,18 @@ class PersistentSession:
         )
 
     def _setup_shell_manager(self) -> None:
-        """Initialize shell manager, delegating to remote backend if available."""
-        ws_backend = self.workspace_manager.backend if self.workspace_manager else None
-        use_remote_shell = getattr(ws_backend, "supports_shell", False)
+        """Initialize the shell manager over a shell-capable workspace backend.
 
-        if not use_remote_shell and not shutil.which("tmux"):
-            logger.debug("tmux not found and no remote backend — shell tools disabled")
+        Shells run only on the workspace — there is no local (in-pod) tmux
+        fallback. Without a shell-capable backend, shell tools stay disabled.
+        """
+        ws_backend = self.workspace_manager.backend if self.workspace_manager else None
+
+        if not getattr(ws_backend, "supports_shell", False):
+            logger.info(
+                "Workspace backend does not support shell — shell tools "
+                "disabled (no local fallback)"
+            )
             return
 
         try:
@@ -656,12 +661,12 @@ class PersistentSession:
                 sandbox_cwd=str(self.workspace_manager.path)
                 if shell_config.get("sandbox", True)
                 else None,
-                backend=ws_backend if use_remote_shell else None,
+                backend=ws_backend,
                 sudo_action=shell_config.get("sudo_action", "freeze"),
             )
             if self.tool_context:
                 self.tool_context.shell_manager = self.shell_manager
-            logger.info(f"ShellManager initialized (remote={use_remote_shell})")
+            logger.info("ShellManager initialized (backend delegation)")
         except Exception as e:
             logger.warning(f"Failed to initialize ShellManager (non-fatal): {e}")
 
