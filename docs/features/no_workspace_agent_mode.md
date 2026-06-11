@@ -238,7 +238,11 @@ nothing agent-driven can touch it — there are no file tools.
   the workspace (`write_home_file` + `GitManager.clone(backend=...)`) —
   no local fallback, shell-less backends skip with an error. The session
   path's own local SSH-key else-branch and a dead duplicate
-  (`Agent._setup_repository_datasource`) were removed with it.
+  (`Agent._setup_repository_datasource`) were removed with it. Residuals
+  filed: `GitManager`'s own local-subprocess fallback (job-repo flows)
+  in [[gitmanager_local_git_fallback]], and the dead legacy
+  datasource/proxy code the audit surfaced in
+  [[datasource_legacy_dead_code]].
 
 Prompts: a lite instruction/persona variant that doesn't reference shell,
 git, or workspace conventions that don't exist in this tier

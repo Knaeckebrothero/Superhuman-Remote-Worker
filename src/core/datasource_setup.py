@@ -621,6 +621,41 @@ def create_datasource_connection(
 # ---------------------------------------------------------------------------
 
 
+def resolve_repo_clone_names(
+    repo_datasources: List[Dict[str, Any]],
+) -> List[str]:
+    """Return the clone-directory name for each repository datasource, in order.
+
+    The directory under ``repos/`` uses the upstream repo name from the URL
+    (falling back to the datasource-label slug), with a numeric suffix when
+    two datasources resolve to the same name (e.g. forks of one upstream).
+    Shared by clone_repository_datasources() and inject_datasource_index()
+    so the datasources.md index always points at the real clone paths.
+    """
+    from ..utils.git_url import repo_name_from_url
+
+    names: List[str] = []
+    used: set[str] = set()
+    for ds in repo_datasources:
+        ds_slug = (
+            re.sub(r"[^a-z0-9]+", "-", ds.get("name", "repo").lower()).strip("-")
+            or "repo"
+        )
+        base = repo_name_from_url(ds.get("connection_url", ""), fallback=ds_slug)
+        name = base
+        suffix = 2
+        while name in used:
+            name = f"{base}-{suffix}"
+            suffix += 1
+        if name != base:
+            logger.info(
+                "Repo name collision for %s; cloning into %s instead", base, name
+            )
+        used.add(name)
+        names.append(name)
+    return names
+
+
 def clone_repository_datasources(
     repo_datasources: List[Dict[str, Any]],
     workspace_manager: Any,
@@ -657,14 +692,10 @@ def clone_repository_datasources(
         return
 
     from ..managers.git_manager import GitManager
-    from ..utils.git_url import repo_name_from_url
     from ..utils.ssh_key import normalize_private_key
 
-    # Track repo names already assigned so we can append a numeric suffix
-    # when two datasources resolve to the same name (e.g. forks of the same
-    # upstream).
-    used_repo_names: set[str] = set()
-    for ds in repo_datasources:
+    clone_names = resolve_repo_clone_names(repo_datasources)
+    for ds, repo_name in zip(repo_datasources, clone_names):
         # ds_name is the safe form of the user-supplied datasource label.
         # It stays the SSH key filename and SSH config alias so that two
         # datasources with different keys for the same repo don't clobber
@@ -677,23 +708,6 @@ def clone_repository_datasources(
             repo_url = ds.get("connection_url", "")
             branch = ds.get("default_branch")
             creds = ds.get("credentials") or {}
-
-            # The clone directory and source_repos registry key use the
-            # upstream repo name; fall back to the datasource label only if
-            # URL parsing yields nothing usable.
-            base_repo_name = repo_name_from_url(repo_url, fallback=ds_name)
-            repo_name = base_repo_name
-            suffix = 2
-            while repo_name in used_repo_names:
-                repo_name = f"{base_repo_name}-{suffix}"
-                suffix += 1
-            if repo_name != base_repo_name:
-                logger.info(
-                    "Repo name collision for %s; cloning into %s instead",
-                    base_repo_name,
-                    repo_name,
-                )
-            used_repo_names.add(repo_name)
 
             # Determine auth method: explicit field, or infer from
             # credentials keys (ssh_key present → ssh).
@@ -836,10 +850,12 @@ def inject_datasource_index(
 
     if repos:
         lines.append("### Repositories")
-        for ds in repos:
-            slug = re.sub(r"[^a-z0-9]+", "-", ds.get("name", "repo").lower()).strip("-")
+        # Same name resolution as clone_repository_datasources() — the index
+        # must point at the directories the clones actually land in.
+        for ds, clone_name in zip(repos, resolve_repo_clone_names(repos)):
             lines.append(
-                f"- **{ds.get('name')}** — cloned at `./repos/{slug}/`, git pre-authenticated"
+                f"- **{ds.get('name')}** — cloned at `./repos/{clone_name}/`, "
+                f"git pre-authenticated"
             )
         lines.append("")
 

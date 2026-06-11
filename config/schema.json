@@ -659,7 +659,7 @@
           "type": "boolean",
           "default": true,
           "description": "Restrict working directory to workspace root"
-        },
+        }
       },
       "additionalProperties": false
     },
