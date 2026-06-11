@@ -45,10 +45,13 @@ related:
     memory_migrator, dead search helpers, `_load_query`, their tests; dead
     `MemoryConfig` knobs deleted from code + both YAMLs; persistent
     `assemble_memories.enabled: false` (config no longer lies).
-- **Next: local/dev verification of the B1 fix on a real session** (the three
-  never-before-observable signals — in-loop extraction at the configured
-  interval, `/done` teardown extraction, idle-archive extraction; see
-  `memory_bugs.md` B1 status) — then Phase 1, starting with acceptance-criteria
+- **2026-06-11 — B1 live-verified on k3d** (real session over the agent WS,
+  5 turns + `/done`): in-loop trigger fired at `observer_interval`,
+  `/done` teardown extracted+stored 5/5 `source='observer'` rows attributed
+  to the thread, `Final memory extraction complete` logged for the first
+  time ever. One aux-router timeout on the in-loop task (non-fatal, known
+  flaky backend) — details + two small follow-ups in `memory_bugs.md` B1.
+- **Next: Phase 1** (MemoryManager seam), starting with acceptance-criteria
   alignment.
 **Companions:**
 - [`agent_memory_current_state.md`](agent_memory_current_state.md) — ground truth: every
@@ -370,9 +373,10 @@ Phases 1–2 are **the commitment** (foundation + instrument). Phases 3+ are
 evidence-driven: each lands behind a `memory.*` flag, defaults to current behaviour, and
 flips only on a green harness delta (P5). Bug track B1–B10
 ([`memory_bugs.md`](../issues/memory_bugs.md)) proceeds independently — **step 0 done
-2026-06-10**: B1 fixed, B2 verified-confirmed (halfvec migration now the open item),
-B3-honesty + B9 + vestigial-code sweep shipped. Next bug-track items: B1 live
-verification, then B4; B2's halfvec migration must land before Phase 3 tunes `ef_search`.
+2026-06-10**: B1 fixed (live-verified on k3d 2026-06-11), B2 verified-confirmed
+(halfvec migration now the open item), B3-honesty + B9 + vestigial-code sweep
+shipped. Next bug-track item: B4; B2's halfvec migration must land before
+Phase 3 tunes `ef_search`.
 
 ### Phase 1 — The foundation: MemoryManager seam · ~1–1.5 wk ← **start here**
 Extract all assembly + capture logic from `graph.py` / `persistent_graph.py` /
