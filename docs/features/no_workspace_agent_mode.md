@@ -163,6 +163,17 @@ v1 options are a dev-only MinIO (small, optional) or pointing the spec at
 any rclone-supported remote (e.g. the bundled cloud via WebDAV) — it's
 config, not code. Decide in S2 when wiring values.
 
+**Considered alternative — shared filesystem gateway service.** The original
+sketch had a shared backend container handling the virtual filesystems for
+all lite agents. Rejected for the file layer in v1: it adds a network hop
+and a new SPOF, concentrates every tenant's storage credentials in one
+process (a per-agent typed client matches the existing trust model, where
+each agent process holds only its own job's keys), and provides nothing a
+typed S3 client doesn't. Shared services stay reserved for where they
+genuinely pay off — the pooled browser service, the python executor, and
+the search/index layer (§10) — which are heavy, stateful, or
+isolation-critical in ways plain file IO is not.
+
 ## 6. `ScratchBackend` (`none` mode)
 
 The graph's internal consumers (PlanManager, TodoManager archive, optional
@@ -240,7 +251,9 @@ every mutation flows through the backend *by construction* (no shell means
 no side-channel writes), so the backend can maintain a complete change
 journal: record `(phase, op, path, before/after ref)` on each write, stash
 prior versions via S3 object versioning or a `.history/` copy-on-write
-prefix, checkpoint markers at phase boundaries. Exposed as a
+prefix, checkpoint markers at phase boundaries. (rclone/S3 is only the
+transport here — no rclone feature provides tracking; the tracker is this
+journal plus the version stash, owned by us.) Exposed as a
 `supports_change_tracking` capability backing the same review-tool names
 (status/log/diff); git remains the implementation for full workspaces.
 
@@ -276,21 +289,39 @@ Ship with (or before) v1:
    Compose stack).
 4. **`datasource_setup` local-clone audit** — §7.
 
-## 10. Later phases (out of v1 scope)
+## 10. Roadmap beyond v1
 
-- **Change tracking / diff review** (§8 successor) — phase review + cloud
-  approve/revert.
-- **Pooled browser service** — the workspace `browser-exec` daemon deployed
-  as a claimable shared pool with workspace-grade NetworkPolicy; gives lite
-  agents real browsing. See also `docs/issues/egress_proxy_pool.md`.
-- **Python executor** — never in the agent pod (credentials, principle 1).
-  Warm-pool sandbox pods (claim → stage referenced files from the prefix →
-  execute → write outputs back → recycle) or ephemeral one-shot pods.
-- **Cloud surfaces for lite agents** — attaching the user's cloud
-  (Nextcloud/Drive) as additional explicit-op remotes through the same
-  `RcloneMountSpec` payload, with the hydration-guard thinking applied.
-- **Search/index layer** — shared service, also serves full-mode mounts
-  ([[rclone_cloud_mount]] §10).
+Dependency-ordered; v3 and v4 are independent of each other and can swap on
+observed demand.
+
+- **v1.1 — polish (hours-to-days, demand-driven):**
+  - `workspace_changes` op-log tool (changed paths per phase, no diffs) if
+    phase-review pressure appears before v2 lands.
+  - Cockpit tier picker — v1 selects the tier via `config_override` /
+    expert preset, no UI requirement; a first-class selector is polish.
+  - Revisit rclone-subprocess vs boto3 with production latency numbers.
+- **v2 — change tracking & cloud diff review (~1 week):** the §8 successor.
+  `supports_change_tracking` journal + version stash; status/log/diff
+  review tools for strategic phases in `virtual` mode; user-facing diff +
+  approve/revert for virtual surfaces reusing the [[job_cloud_export]]
+  Monaco review UI. (Diff/revert for full-mode FUSE-mounted clouds stays a
+  separate design — those writes bypass the backend.)
+- **v3 — python executor (~1-1.5 weeks):** the "occasional python tools"
+  from the original pitch; completes the lite tier for data/RAG workloads.
+  Never in the agent pod (§3.1). Warm-pool sandbox pods: claim → stage
+  referenced files from the job prefix → execute → write outputs back →
+  recycle; ephemeral one-shot pods are the simpler fallback shape.
+- **v4 — pooled browser service (~1 week):** the workspace `browser-exec`
+  daemon deployed as a claimable shared pool with workspace-grade
+  NetworkPolicy; gives lite agents real interactive browsing beyond Tavily
+  extract. Interacts with the egress/IP-reputation work
+  (`docs/issues/egress_proxy_pool.md`).
+- **v5 — cloud surfaces for lite agents (~2-3 days):** attach the user's
+  cloud (Nextcloud/OpenCloud/Drive) as additional explicit-op remotes
+  through the same `RcloneMountSpec` payload, with hydration-guard limits.
+  Pairs naturally with v2 (diff/approve on exactly those surfaces).
+- **Search/index layer (own track):** shared service serving lite and
+  full-mode mounts alike ([[rclone_cloud_mount]] §10); scoped separately.
 
 ## 11. Implementation slices
 
@@ -311,6 +342,12 @@ Ship with (or before) v1:
 
 ~2-3 days to a k3d-verified slice (S1-S3); S4 parallel.
 
+Ordering: S1 and S2 can proceed in parallel once the §4 payload contract is
+frozen; S3 lands last; S4 and the local-browser fallback removal
+(`docs/issues/remove_local_browser_fallback.md`) are independent and can
+start immediately. v1 requires no Cockpit changes — the tier is selected via
+`config_override`/expert preset; the picker is v1.1 (§10).
+
 ## 12. Acceptance criteria (k3d smoke)
 
 1. A `virtual` session/job starts with **exactly one pod** (agent; no
@@ -329,6 +366,8 @@ Ship with (or before) v1:
    no file tools were bound.
 7. Regression: a default `sandbox` job and a session on the same deploy
    behave unchanged.
+8. Cockpit: a lite session shows no workspace-pod affordances (code-server /
+   workspace links absent or hidden) and otherwise renders normally.
 
 ## 13. Open questions
 
