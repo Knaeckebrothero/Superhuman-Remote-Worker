@@ -47,15 +47,15 @@ global:
 # -----------------------------------------------------------------------------
 image:
   orchestrator:
-    tag: sha-5724893
+    tag: sha-da91db8
   agent:
-    tag: sha-5724893
+    tag: sha-da91db8
   cockpit:
     tag: sha-5724893
   mcp:
     tag: sha-55ebd17
   workspace:
-    tag: sha-7ae23f7
+    tag: sha-da91db8
 # -----------------------------------------------------------------------------
 # Secrets — External Secrets Operator (Vault-backed)
 # -----------------------------------------------------------------------------
