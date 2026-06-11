@@ -24,7 +24,7 @@ The historical Phase-1 audit and per-bundle implementation log are preserved und
 
 > **Truth-up 2026-06-11** (code-verified; full reconciliation in
 > [`saas_roadmap.md`](saas_roadmap.md)). Three rows in the leak table below are
-> stale: **#4 closed** — replaced by [app-side admission](features/app_side_admission.md)
+> stale: **#4 closed** — replaced by [app-side admission](done/app_side_admission.md)
 > (`users.is_approved` + cockpit bulk-approve, shipped + tested 2026-06-10).
 > **#8 closed** — workspace egress hardening + per-tenant network tiering fully
 > shipped (migration `0016` → provisioner tier label → per-tier policies +
@@ -111,7 +111,7 @@ Five operational items, each independently shippable. Together they're a single 
 
 | # | Item | Risk it closes | Effort | Status |
 |---|---|---|---|---|
-| 1 | **Keycloak self-registration fix** — wire SMTP for `VERIFY_EMAIL` (or skip-verify for dev); add the realm-level `user` role to `default-roles-srw` | Strangers literally can't sign up today; also blocks live E2E cross-user verification of the entire M1.A surface | ~2h | **Closed 2026-06-10** — superseded by [app-side admission](features/app_side_admission.md): `users.is_approved` DB flag + cockpit bulk-approve replaced the role-composite fix; legacy role-holders migrate via login write-through. S4 (drop the role fallback) pending soak. |
+| 1 | **Keycloak self-registration fix** — wire SMTP for `VERIFY_EMAIL` (or skip-verify for dev); add the realm-level `user` role to `default-roles-srw` | Strangers literally can't sign up today; also blocks live E2E cross-user verification of the entire M1.A surface | ~2h | **Closed 2026-06-10** — superseded by [app-side admission](done/app_side_admission.md): `users.is_approved` DB flag + cockpit bulk-approve replaced the role-composite fix; legacy role-holders migrate via login write-through. S4 (drop the role fallback) pending soak. |
 | 2 | **Chromium profile per-job** — `/tmp/agent-chromium-cdp-profile` → `…-{job_id}` + teardown hook (`src/tools/research/browser.py:101`) | Cookies / logged-in sessions from job A persist into job B on the same agent pod | ~2h | Closed 2026-05-28 — workspace pod is already torn down after every job, so cross-job profile contamination can't happen. Intra-job delegation subagents do share the profile, which is benign (and sometimes beneficial — shared login state across the same job's research steps). |
 | 3 | **MongoDB TTL** on `llm_requests` + `agent_audit` (pick window: 90d? 1y?) | Prompts/responses hoarded indefinitely; privacy posture; GDPR retention story | ~1h | Deferred 2026-05-28 — will be folded into the planned MongoDB→Postgres migration; retention policy will be set there in one place rather than partially-applied to MongoDB now. |
 | 4 | **Cross-user 403 audit log** — emit a structured event when any `security/access.py` helper raises 403 | Today 1000 probe attempts → 1000 silent 403s; no detection signal | ~3h | **Shipped + k3d-verified 2026-06-11** — `security_events` table (migration 0025) + WARNING line, centralized in `access.py` (`log_security_event`/`_denied`, all 15 raise sites) + `_require_admin` (`admin_denied`) + both IDE proxy denials. Read path `GET /api/admin/security-events`; retention sweeper (90d default). 16 tests. Design: [security_event_log.md](features/security_event_log.md). |
