@@ -140,6 +140,57 @@ def filter_tools_by_phase(tool_names: List[str], phase: str) -> List[str]:
     return filtered
 
 
+# Tool categories that need a workspace-backed execution environment. The lite
+# tiers (virtual/none) declare supports_shell=False — there is no workspace
+# pod — so none of these can run there.
+_EXECUTION_CATEGORIES = ("shell", "browser_direct", "git")
+
+
+def filter_tools_by_backend(tool_names: List[str], backend: Any) -> List[str]:
+    """Drop tools the workspace backend can't support (capability gate).
+
+    Enforcement-by-construction for the lite tiers
+    (``docs/features/no_workspace_agent_mode.md`` §3.2/§7): instead of trusting
+    each config's tool lists to omit them, tools are removed whenever the
+    backend doesn't declare the matching capability —
+
+    - ``not backend.supports_shell`` → drop ``shell``, ``browser_direct``,
+      ``git`` (all need a workspace-backed execution environment). This is what
+      ``WorkspaceBackend.supports_shell`` already promises: it "gates
+      ShellManager construction *and* shell tool registration".
+    - ``not backend.supports_file_tools`` → drop ``workspace`` (file) tools —
+      the ``none`` tier, whose ScratchBackend is internal-only (§6).
+
+    Everything else (web research, datasource SQL/graph/Mongo/WebDAV, knowledge,
+    core, communication, delegation, citation) passes through. ``backend=None``
+    is a no-op, so non-agent callers (docs, cockpit display) see the full set.
+    """
+    if backend is None:
+        return tool_names
+    drop_categories: set[str] = set()
+    if not getattr(backend, "supports_shell", False):
+        drop_categories.update(_EXECUTION_CATEGORIES)
+    if not getattr(backend, "supports_file_tools", True):
+        drop_categories.add("workspace")
+    if not drop_categories:
+        return tool_names
+    kept: List[str] = []
+    dropped: List[str] = []
+    for name in tool_names:
+        category = TOOL_REGISTRY.get(name, {}).get("category")
+        (dropped if category in drop_categories else kept).append(name)
+    if dropped:
+        logger.info(
+            "Backend capability gate dropped %d tool(s) %s "
+            "(supports_shell=%s, supports_file_tools=%s)",
+            len(dropped),
+            sorted(dropped),
+            getattr(backend, "supports_shell", False),
+            getattr(backend, "supports_file_tools", True),
+        )
+    return kept
+
+
 def get_tools_for_phase(phase: str) -> List[str]:
     """Get all tool names available in a given phase.
 

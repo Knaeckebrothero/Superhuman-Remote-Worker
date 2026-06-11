@@ -55,6 +55,13 @@ class ScratchBackend(WorkspaceBackend):
     def root_path(self) -> Path:
         return self._root_path
 
+    @property
+    def supports_file_tools(self) -> bool:
+        # `none` mode registers no file tools — ScratchBackend is internal-only
+        # (no_workspace_agent_mode.md §6). supports_shell stays the ABC default
+        # (False), so shell/browser/git are gated off too.
+        return False
+
     def _resolve(self, relative_path: str) -> Path:
         if not relative_path:
             return self._root_path.resolve()
