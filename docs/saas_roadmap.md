@@ -63,7 +63,7 @@ matches the strategic roadmap's bet. Open multi-tenant SaaS is a ~4–6 week
 hardening arc plus billing.
 
 > **Truth-up 2026-06-11 — both headline gaps closed within 24h of writing.**
-> (1) **Admission shipped**: [app-side admission](features/app_side_admission.md)
+> (1) **Admission shipped**: [app-side admission](done/app_side_admission.md)
 > S1–S3 implemented + tested 2026-06-10 (`users.is_approved`, cockpit
 > bulk-approve, registration toast; S4 role-fallback drop pending soak).
 > (2) **M1.C's mount path shipped**: workspace cloud mounts are per-user via
@@ -92,7 +92,7 @@ The [`multi_tenancy.md`](multi_tenancy.md) tracker was last trued-up
 | **A — Agent↔orchestrator boundary** | shipped | `X-Internal-Key` enforced in `auth.py:466` + `access.py:713` (`is_internal_request`); gates real endpoints in `main.py` | ✅ Real |
 | **D#3 — Workspace egress + tiering** | "new, design pending" / "PR3 deferred" | **Fully shipped:** migration `0016_project_network_tier.sql`; `init.py:1166` `_seed_operator_network_tier`; `container_provisioner.py:689` `_resolve_network_tier`; label stamped at `container_provisioner.py:680` (`srw.io/network-tier`); per-tier policies + fail-closed fallback-deny in `helm/templates/workspace-network-policy.yaml` | ✅ **Done — tracker stale** |
 | **C — Cloud per-user credentials** | "THE blocker", pending | **Mount path shipped 2026-06-10**: Keycloak token-exchange impersonation (`auth.type = keycloak_user_impersonation` + `target_user_sub`), user-scoped tokens refreshed at expiry−90s, validated k3d + dev — impersonated token reaches *only* that user's Space, client secret absent from workspace. Residual: personal WebDAV datasource on shared creds (`main.py:17863`); Nextcloud BYO env-var creds by design | ✅ **Mounts done; datasource path residual** |
-| **B#1 — Keycloak self-registration** | open | **Superseded + shipped 2026-06-10** as [app-side admission](features/app_side_admission.md): `users.is_approved` (migration `0024`) + login write-through migration + bulk `POST /api/admin/users/approve` + cockpit pending list/toast. S4 (drop `user`-role fallback) pending soak | ✅ Shipped (S1–S3) |
+| **B#1 — Keycloak self-registration** | open | **Superseded + shipped 2026-06-10** as [app-side admission](done/app_side_admission.md): `users.is_approved` (migration `0024`) + login write-through migration + bulk `POST /api/admin/users/approve` + cockpit pending list/toast. S4 (drop `user`-role fallback) pending soak | ✅ Shipped (S1–S3) |
 | **B#4 — Cross-user 403 audit log** | open | **Shipped + k3d-verified 2026-06-11**: `security_events` (migration `0025`) written from all 15 `access.py` raise sites via `log_security_event`/`_denied`, plus `_require_admin` (`admin_denied`) + IDE proxy denials; `GET /api/admin/security-events`; retention sweeper; 16 tests | ✅ Shipped |
 | **D#1 — Per-user API rate limiting** | pending | Only a per-*job* message rate limit (`main.py:4872`); no per-user API middleware | ❌ Not started |
 | **D#2 — Pod ResourceQuota/LimitRange** | pending | Zero `ResourceQuota`/`LimitRange` in the chart | ❌ Not started |
@@ -158,7 +158,7 @@ the fork decision flips later.
 
 1. **App-side admission** (supersedes the original "add `user` to the
    `default-roles-srw` composite" fix — direction changed 2026-06-10, see
-   [`app_side_admission.md`](features/app_side_admission.md)). Registration
+   [`app_side_admission.md`](done/app_side_admission.md)). Registration
    already works; the gap is the *admission step*. Move it from Keycloak role
    mappings into a `users.is_approved` DB flag + bulk-approve in the Cockpit
    admin Users page. **Highest leverage item in the whole plan** — until

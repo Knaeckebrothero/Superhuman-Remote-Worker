@@ -547,7 +547,7 @@ class TestAppSideAdmission:
     """App-side admission seam: the ``users.is_approved`` column owns approval,
     with a transition-window write-through from the legacy Keycloak ``user``
     role and PAT/MCP paths that no longer force approval. See
-    docs/features/app_side_admission.md.
+    docs/done/app_side_admission.md.
     """
 
     def _db_with_user(self, user_row):
