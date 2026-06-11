@@ -33,8 +33,21 @@ backend-only helper (§7). §9.1 egress NetworkPolicy (S4) **implemented
 2026-06-11, ships default-off** — policy + values + enablement checklist
 (`agent_egress_networkpolicy_enablement.md`); per-deployment enablement
 (verify LLM/Keycloak egress, add carve-outs, stage on dev) is the open
-follow-up. All four §9 prerequisites now landed in code; S1-S3 (the lite
-backends themselves) not started.
+follow-up. All four §9 prerequisites now landed in code.
+
+**S1 (agent side) implemented 2026-06-11** — 177 unit tests green: the
+`ObjectStore` seam + `InMemoryObjectStore` (`src/core/backends/object_store.py`),
+`VirtualWorkspaceBackend` (prefix-math object-store file ops, `virtual.py`),
+`RcloneObjectStore` (the §5 rclone transport, behind the swappable seam,
+`rclone.py`), `ScratchBackend` (`none` mode, `scratch.py`), a backend factory
+keyed on `workspace.backend` (`factory.py`), config support (`virtual`/`none`
++ `mounts` in loader `WorkspaceConfig`, resume-safe via `asdict`), the
+worker + session bootstrap seams (lite branch, git forced off per §8), and
+rclone in the agent image. The full WorkspaceBackend contract is exercised
+over the in-memory store. **Not yet exercised end-to-end** — that needs S2
+(an orchestrator that dispatches a `virtual`/`none` job) and a real object
+store. **S2** (orchestrator dispatch/skip-provisioning/validation/values) and
+**S3** (lite profile + instruction template) remain.
 
 ## 1. Goal
 
@@ -148,8 +161,12 @@ A new `WorkspaceBackend` implementation (the ABC in
   against the spec'd remote — rclone as subprocess in the agent pod. A
   boto3-direct implementation is an acceptable alternative if benchmarks
   favor it; the interface is identical and `boto3` is already used by the
-  orchestrator. Decision deferred to S1 implementation; default to rclone
-  for provider continuity with `RcloneMountSpec`.
+  orchestrator. **Resolved (S1): rclone**, built behind a swappable
+  `ObjectStore` seam (`src/core/backends/object_store.py`) so the backend's
+  logic + contract tests are transport-agnostic and boto3 stays a drop-in
+  alternative for the v1.1 latency revisit (§10). Tests run over an
+  `InMemoryObjectStore`; production credentials come from the `rclone_spec`
+  via `RCLONE_CONFIG_*` env (out of argv).
 - **No FUSE, no mount, no privileged pod.** This sidesteps the entire
   `/dev/fuse` + `SYS_ADMIN` + seccomp problem from [[rclone_cloud_mount]]
   §12, and the POSIX-semantics objection to S3 mounts (§11) — explicit ops
@@ -376,11 +393,15 @@ observed demand.
 
 ## 11. Implementation slices
 
-- **S1 — agent side (~1 day):** `VirtualWorkspaceBackend` (+ unit tests
-  against the same contract the FS test backend satisfies),
-  `ScratchBackend`, backend factory keyed on the payload `workspace.mode` at
-  the shared bootstrap seam (`app.py` / `dual_app.py` /
-  `persistent_session.py`), libtmux hard-off.
+- **S1 — agent side (~1 day): DONE 2026-06-11.** `VirtualWorkspaceBackend`
+  (+ contract tests over the in-memory store, the same contract the FS test
+  backend satisfies), `ScratchBackend`, an `ObjectStore` seam +
+  `RcloneObjectStore` transport, a backend factory keyed on
+  `workspace.backend` (`src/core/backends/factory.py`), config (`virtual`/
+  `none` + `mounts`), the worker (`agent.py`) and session
+  (`persistent_session.py`) bootstrap seams (lite branch; git forced off per
+  §8), rclone in the agent image, libtmux hard-off (done in §9.3). 177 unit
+  tests; not yet exercised end-to-end (needs S2 + a real object store).
 - **S2 — orchestrator side (~0.5-1 day):** `workspace.backend` enum
   extension, skip-provisioning branches in job dispatch + session prepare,
   payload emission (S3 prefix + creds from deployment config),
@@ -429,8 +450,9 @@ start immediately. v1 requires no Cockpit changes — the tier is selected via
   internal-creds trust model), vs per-job STS/scoped credentials (cleaner
   tenancy, more machinery — ties into multi-tenancy M1). Lean: prefix +
   shared internal key for v1, STS when MinIO/IAM is wired for it.
-- **rclone subprocess vs boto3** for the backend's op layer (S1 bench;
-  interface identical either way).
+- ~~**rclone subprocess vs boto3** for the backend's op layer~~ — **resolved
+  (S1): rclone**, behind the swappable `ObjectStore` seam (§5). boto3 stays a
+  drop-in alternative if the v1.1 latency revisit favors it.
 - **Local k3d object store:** dev-only MinIO vs WebDAV remote against the
   bundled cloud (S2).
 
