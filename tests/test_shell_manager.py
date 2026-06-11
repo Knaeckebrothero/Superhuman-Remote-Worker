@@ -1,606 +1,275 @@
-"""Tests for ShellManager (persistent tmux-backed terminal sessions).
+"""Tests for ShellManager (backend-delegating persistent shell sessions).
 
-These tests require tmux to be installed and accessible via PATH.
-Tests are automatically skipped if tmux is not available.
+ShellManager has no local execution path: it requires a workspace backend
+that declares ``supports_shell`` and forwards every operation to it (the
+live implementation is RemoteBackend, covered by test_workspace_backends.py;
+the pure sentinel/stall helpers are covered by test_shell_stall_logic.py).
+These tests run against a mock backend — no tmux required.
 """
 
-import shutil
-import time
+import re
 import uuid
+from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
-# Skip entire module if tmux is not available
-pytestmark = pytest.mark.skipif(
-    shutil.which("tmux") is None, reason="tmux not installed"
+from src.tools.shell.shell_manager import (
+    DEFAULT_BLOCKED_COMMANDS,
+    SUDO_FREEZE_SENTINEL,
+    ShellManager,
+    ShellTab,
 )
 
-from src.tools.shell.shell_manager import ShellManager, TAB_NAME_PATTERN  # noqa: E402
+
+def make_backend(**overrides):
+    """Mock workspace backend that declares shell support."""
+    backend = MagicMock()
+    backend.supports_shell = True
+    backend.shell_run.return_value = "Exit code: 0\n--- stdout ---\nok"
+    backend.shell_send.return_value = "Sent to 'default'"
+    backend.shell_read.return_value = ("output", {"tab": "default", "mode": "tail"})
+    backend.shell_read_with_offset.return_value = ("output", {"mode": "tail"})
+    backend.shell_open_tab.return_value = {"name": "new-tab", "type": "shell"}
+    backend.shell_close_tab.return_value = "Tab 'new-tab' closed"
+    backend.shell_list_tabs.return_value = [{"name": "default", "type": "shell"}]
+    backend.shell_format_tab_header.return_value = "[Shells: default]"
+    backend.shell_is_alive.return_value = True
+    for key, value in overrides.items():
+        setattr(backend, key, value)
+    return backend
 
 
 @pytest.fixture
-def manager():
-    """Create a ShellManager for testing and clean up after."""
-    job_id = str(uuid.uuid4())
-    sm = ShellManager(
-        job_id=job_id,
-        max_tabs=4,
-        scrollback_limit=1000,
-        default_timeout=10,
-    )
-    yield sm
-    sm.cleanup()
+def backend():
+    return make_backend()
 
 
-class TestShellManagerInit:
-    """Tests for ShellManager initialization."""
+@pytest.fixture
+def manager(backend):
+    return ShellManager(job_id=str(uuid.uuid4()), backend=backend)
 
-    def test_default_shell_tab_created(self, manager):
+
+class TestHardOff:
+    """ShellManager must refuse to construct without a shell-capable backend.
+
+    The local libtmux execution path was removed (the sibling of the
+    local-browser fallback removal, docs/issues/remove_local_browser_fallback.md);
+    a missing or shell-less backend must be a loud error, never a silent
+    degradation to in-pod execution.
+    """
+
+    def test_no_backend_raises(self):
+        with pytest.raises(RuntimeError, match="shell support"):
+            ShellManager(job_id=str(uuid.uuid4()))
+
+    def test_backend_without_shell_support_raises(self):
+        backend = MagicMock()
+        backend.supports_shell = False
+        with pytest.raises(RuntimeError, match="shell support"):
+            ShellManager(job_id=str(uuid.uuid4()), backend=backend)
+
+    def test_error_says_no_local_execution(self):
+        with pytest.raises(RuntimeError, match="workspace"):
+            ShellManager(job_id=str(uuid.uuid4()), backend=None)
+
+
+class TestNoLocalShellPath:
+    """The agent runtime must not contain an in-pod shell execution path."""
+
+    def test_libtmux_not_imported_under_src(self):
+        src_root = Path(__file__).resolve().parents[1] / "src"
+        pattern = re.compile(r"^\s*(?:from|import)\s+libtmux", re.MULTILINE)
+        offenders = sorted(
+            str(path.relative_to(src_root))
+            for path in src_root.rglob("*.py")
+            if pattern.search(path.read_text(encoding="utf-8"))
+        )
+        assert offenders == [], (
+            f"libtmux must not be imported in the agent runtime: {offenders}"
+        )
+
+
+class TestDelegation:
+    """Every operation forwards to the corresponding backend.shell_* method."""
+
+    def test_ensure_tab_delegates_and_tracks_stub(self, manager, backend):
+        tab = manager.ensure_tab("build")
+        backend.shell_ensure_tab.assert_called_once_with("build")
+        assert tab.name == "build"
+        assert manager.ensure_tab("build") is tab  # stub reused
+        assert backend.shell_ensure_tab.call_count == 2  # backend still consulted
+
+    def test_open_tab_delegates_and_returns_metadata(self, manager, backend):
+        backend.shell_open_tab.return_value = {"name": "py", "type": "repl"}
+        metadata = manager.open_tab("py", command="python3", tab_type=None)
+        backend.shell_open_tab.assert_called_once_with(
+            "py", command="python3", tab_type=None
+        )
+        assert metadata["type"] == "repl"
+        assert manager._tabs["py"].tab_type == "repl"
+
+    def test_send_delegates(self, manager, backend):
+        result = manager.send("default", "echo hi", enter=True)
+        backend.shell_send.assert_called_once_with("default", "echo hi", enter=True)
+        assert result == "Sent to 'default'"
+
+    def test_send_without_enter_delegates(self, manager, backend):
+        manager.send("default", "C-c", enter=False)
+        backend.shell_send.assert_called_once_with("default", "C-c", enter=False)
+
+    def test_read_delegates(self, manager, backend):
+        text, metadata = manager.read("default", lines=10, since_cursor=True)
+        backend.shell_read.assert_called_once_with(
+            "default", lines=10, since_cursor=True
+        )
+        assert text == "output"
+        assert metadata["tab"] == "default"
+
+    def test_read_with_offset_delegates(self, manager, backend):
+        manager.read_with_offset("default", lines=5, offset=100)
+        backend.shell_read_with_offset.assert_called_once_with(
+            "default", lines=5, offset=100
+        )
+
+    def test_close_tab_delegates_and_drops_stub(self, manager, backend):
+        manager.ensure_tab("temp")
+        result = manager.close_tab("temp")
+        backend.shell_close_tab.assert_called_once_with("temp")
+        assert "temp" not in manager._tabs
+        assert "closed" in result
+
+    def test_list_tabs_delegates(self, manager, backend):
         tabs = manager.list_tabs()
-        assert len(tabs) == 1
+        backend.shell_list_tabs.assert_called_once()
         assert tabs[0]["name"] == "default"
-        assert tabs[0]["type"] == "shell"
 
-    def test_session_is_alive(self, manager):
-        assert manager.is_alive() is True
-
-    def test_cleanup_kills_session(self):
-        job_id = str(uuid.uuid4())
-        sm = ShellManager(job_id=job_id)
-        assert sm.is_alive() is True
-        sm.cleanup()
-        assert sm.is_alive() is False
-
-
-class TestTabLifecycle:
-    """Tests for opening, listing, and closing tabs."""
-
-    def test_open_tab(self, manager):
-        result = manager.open_tab("test-tab")
-        assert result["name"] == "test-tab"
-        assert result["type"] == "shell"
-        assert len(manager.list_tabs()) == 2
-
-    def test_open_tab_with_command(self, manager):
-        result = manager.open_tab("my-proc", command="echo running")
-        assert result["name"] == "my-proc"
-        assert result["type"] == "process"
-
-    def test_close_tab(self, manager):
-        manager.open_tab("temp")
-        assert len(manager.list_tabs()) == 2
-        manager.close_tab("temp")
-        assert len(manager.list_tabs()) == 1
-
-    def test_close_nonexistent_tab(self, manager):
-        with pytest.raises(KeyError, match="not found"):
-            manager.close_tab("no-such-tab")
-
-    def test_duplicate_tab_rejected(self, manager):
-        manager.open_tab("my-tab")
-        with pytest.raises(ValueError, match="already exists"):
-            manager.open_tab("my-tab")
-
-
-class TestMaxTabs:
-    """Tests for max_tabs limit enforcement."""
-
-    def test_max_tabs_enforced(self, manager):
-        """Opening tabs beyond the limit raises ValueError."""
-        # manager fixture has max_tabs=4, default tab already uses 1 slot
-        manager.open_tab("tab-1")
-        manager.open_tab("tab-2")
-        manager.open_tab("tab-3")
-        assert len(manager.list_tabs()) == 4
-
-        with pytest.raises(ValueError, match="Maximum tabs") as exc_info:
-            manager.open_tab("tab-4")
-        assert "Close unused tabs first" in str(exc_info.value)
-        assert "default" in str(exc_info.value)  # lists open tabs
-
-    def test_can_open_after_closing(self, manager):
-        """After closing a tab, a new one can be opened within the limit."""
-        manager.open_tab("tab-1")
-        manager.open_tab("tab-2")
-        manager.open_tab("tab-3")
-        assert len(manager.list_tabs()) == 4
-
-        manager.close_tab("tab-2")
-        assert len(manager.list_tabs()) == 3
-
-        # Should succeed now
-        result = manager.open_tab("tab-new")
-        assert result["name"] == "tab-new"
-        assert len(manager.list_tabs()) == 4
-
-    def test_ensure_tab_respects_limit(self, manager):
-        """ensure_tab should also fail when the limit is reached."""
-        manager.open_tab("tab-1")
-        manager.open_tab("tab-2")
-        manager.open_tab("tab-3")
-
-        with pytest.raises(ValueError, match="Maximum tabs"):
-            manager.ensure_tab("tab-4")
-
-
-class TestEnsureTab:
-    """Tests for ensure_tab (auto-create on first use)."""
-
-    def test_returns_existing_tab(self, manager):
-        tab = manager.ensure_tab("default")
-        assert tab.name == "default"
-        assert len(manager.list_tabs()) == 1  # No new tab created
-
-    def test_creates_new_tab(self, manager):
-        tab = manager.ensure_tab("new-tab")
-        assert tab.name == "new-tab"
-        assert tab.tab_type == "shell"
-        assert len(manager.list_tabs()) == 2
-
-    def test_subsequent_calls_return_same_tab(self, manager):
-        tab1 = manager.ensure_tab("my-tab")
-        tab2 = manager.ensure_tab("my-tab")
-        assert tab1 is tab2
-        assert len(manager.list_tabs()) == 2
-
-
-class TestTabNaming:
-    """Tests for tab name validation."""
-
-    def test_valid_names(self):
-        assert TAB_NAME_PATTERN.match("default")
-        assert TAB_NAME_PATTERN.match("gpu-box")
-        assert TAB_NAME_PATTERN.match("test-123")
-        assert TAB_NAME_PATTERN.match("a")
-
-    def test_invalid_names(self):
-        assert not TAB_NAME_PATTERN.match("")
-        assert not TAB_NAME_PATTERN.match("UPPERCASE")
-        assert not TAB_NAME_PATTERN.match("has spaces")
-        assert not TAB_NAME_PATTERN.match("has_underscore")
-        assert not TAB_NAME_PATTERN.match("a" * 21)  # Too long
-        assert not TAB_NAME_PATTERN.match("special!chars")
-
-    def test_open_tab_invalid_name(self, manager):
-        with pytest.raises(ValueError, match="Invalid tab name"):
-            manager.open_tab("BAD_NAME!")
-
-
-class TestTypeAutoDetection:
-    """Tests for auto-detecting tab type from command."""
-
-    def test_ssh_detected(self, manager):
-        result = manager.open_tab("test-ssh", command="ssh user@host", tab_type=None)
-        assert result["type"] == "ssh"
-
-    def test_python_detected(self, manager):
-        result = manager.open_tab("py", command="python3 -i", tab_type=None)
-        assert result["type"] == "repl"
-
-    def test_explicit_type_overrides(self, manager):
-        result = manager.open_tab("custom", command="python3", tab_type="process")
-        assert result["type"] == "process"
-
-    def test_unknown_command_is_process(self, manager):
-        result = manager.open_tab("proc", command="my-custom-tool --flag")
-        assert result["type"] == "process"
-
-
-class TestRunSync:
-    """Tests for synchronous command execution."""
-
-    def test_basic_command(self, manager):
-        output = manager.run_sync("echo hello-world")
-        assert "Exit code: 0" in output
-        assert "hello-world" in output
-
-    def test_exit_code_captured(self, manager):
-        output = manager.run_sync("false")  # exits with code 1
-        assert "Exit code: 1" in output
-
-    def test_multiline_output(self, manager):
-        output = manager.run_sync("echo line1; echo line2; echo line3")
-        assert "Exit code: 0" in output
-        assert "line1" in output
-        assert "line2" in output
-        assert "line3" in output
-
-    def test_timeout_handling(self, manager):
-        # Explicit timeout -> hard cap; command is reported still-running
-        # (not killed, not an error) rather than "timed out".
-        output = manager.run_sync("sleep 30", timeout=1)
-        assert "still running" in output.lower()
-        assert "Exit code: -1" in output
-        assert "--- terminal state ---" in output
-
-    def test_blocked_command(self, manager):
-        output = manager.run_sync("shutdown now")
-        assert "blocked" in output.lower()
-
-    def test_no_output_command(self, manager):
-        output = manager.run_sync("true")
-        assert "Exit code: 0" in output
-
-    def test_named_tab_default(self, manager):
-        """Explicitly passing tab_name='default' works the same as default."""
-        output = manager.run_sync("echo named-tab-test", tab_name="default")
-        assert "Exit code: 0" in output
-        assert "named-tab-test" in output
-
-    def test_named_tab_custom_shell(self, manager):
-        """Can run sync commands on a custom shell-type tab."""
-        manager.open_tab("build", tab_type="shell")
-        output = manager.run_sync("echo build-output", tab_name="build")
-        assert "Exit code: 0" in output
-        assert "build-output" in output
-
-    def test_rejects_non_shell_tab(self, manager):
-        """run_sync raises ValueError on non-shell tabs (repl, ssh, etc.)."""
-        manager.open_tab("my-repl", command="echo running", tab_type="repl")
-        with pytest.raises(
-            ValueError, match="Synchronous execution only works on shell-type tabs"
-        ):
-            manager.run_sync("echo test", tab_name="my-repl")
-
-    def test_rejects_nonexistent_tab(self, manager):
-        """run_sync raises KeyError for tabs that don't exist."""
-        with pytest.raises(KeyError, match="not found"):
-            manager.run_sync("echo test", tab_name="no-such-tab")
-
-
-class TestSendAndRead:
-    """Tests for send/read workflow."""
-
-    def test_send_and_read(self, manager):
-        manager.send("default", "echo test-send-read")
-        time.sleep(0.5)
-        text, metadata = manager.read("default", lines=10)
-        assert "test-send-read" in text
-
-    def test_read_since_cursor(self, manager):
-        # First read to set cursor
-        manager.read("default", lines=50, since_cursor=False)
-
-        # Send new command
-        manager.send("default", "echo cursor-test-1234")
-        time.sleep(0.5)
-
-        # Read since cursor should only show new output
-        text, metadata = manager.read("default", since_cursor=True)
-        assert metadata["mode"] == "since_cursor"
-        assert "cursor-test-1234" in text
-
-    def test_send_then_read_since_cursor_pattern(self, manager):
-        """Test the async pattern: snapshot cursor, send, read since_cursor."""
-        manager.read("default", lines=1, since_cursor=False)
-        manager.send("default", "echo send-read-pattern-test")
-        time.sleep(0.5)
-        text, metadata = manager.read("default", since_cursor=True)
-        assert "send-read-pattern-test" in text
-        assert metadata["lines_returned"] > 0
-
-    def test_send_to_nonexistent_tab(self, manager):
-        with pytest.raises(KeyError, match="not found"):
-            manager.send("no-such-tab", "hello")
-
-    def test_read_nonexistent_tab(self, manager):
-        with pytest.raises(KeyError, match="not found"):
-            manager.read("no-such-tab")
-
-
-class TestReadWithOffset:
-    """Tests for read_with_offset (file-like scrollback reading)."""
-
-    def test_tail_mode_default(self, manager):
-        manager.run_sync("echo offset-test")
-        text, metadata = manager.read_with_offset("default", lines=10)
-        assert metadata["mode"] == "tail"
-        assert "offset-test" in text
-
-    def test_offset_mode(self, manager):
-        manager.run_sync("echo offset-line-test")
-        text, metadata = manager.read_with_offset("default", lines=5, offset=0)
-        assert metadata["mode"] == "offset"
-        assert metadata["offset"] == 0
-        assert metadata["lines_returned"] <= 5
-
-    def test_offset_beyond_buffer(self, manager):
-        text, metadata = manager.read_with_offset("default", lines=10, offset=99999)
-        assert metadata["lines_returned"] == 0
-        assert text == "(empty)"
-
-    def test_returns_total_lines(self, manager):
-        manager.run_sync("echo line1; echo line2; echo line3")
-        _, metadata = manager.read_with_offset("default", lines=50)
-        assert metadata["total_lines"] > 0
-
-
-class TestFormatTabHeader:
-    """Tests for format_tab_header."""
-
-    def test_single_tab(self, manager):
+    def test_format_tab_header_delegates(self, manager, backend):
         header = manager.format_tab_header()
+        backend.shell_format_tab_header.assert_called_once()
         assert header == "[Shells: default]"
 
-    def test_multiple_tabs(self, manager):
-        manager.open_tab("extra")
-        header = manager.format_tab_header()
-        assert "default" in header
-        assert "extra" in header
-        assert header.startswith("[Shells: ")
-        assert header.endswith("]")
-
-
-class TestPruneDeadTabs:
-    """Tests for dead tab pruning."""
-
-    def test_dead_tab_pruned(self, manager):
-        manager.open_tab("will-die")
-        assert len(manager.list_tabs()) == 2
-
-        # Kill the window directly via tmux
-        manager._tabs["will-die"].window.kill()
-
-        # Pruning should remove it
-        manager._prune_dead_tabs()
-        assert len(manager._tabs) == 1
-        assert "will-die" not in manager._tabs
-
-    def test_alive_tabs_preserved(self, manager):
-        manager.open_tab("alive")
-        manager._prune_dead_tabs()
-        assert "alive" in manager._tabs
-
-
-class TestInteractiveDetection:
-    """Tests for interactive prompt detection and early return."""
-
-    def test_confirmation_prompt_detected(self, manager):
-        """Commands that produce a [y/N] prompt should return early."""
-        output = manager.run_sync(
-            'echo "Continue? [y/N]"; read answer',
-            timeout=15,
+    def test_run_sync_delegates_with_args(self, manager, backend):
+        result = manager.run_sync(
+            "echo hi", timeout=42, working_dir="sub", tab_name="build"
         )
-        assert "--- terminal state ---" in output
-        assert "[y/N]" in output
-        assert (
-            "interactive prompt" in output.lower()
-            or "waiting for input" in output.lower()
+        backend.shell_run.assert_called_once_with(
+            "echo hi", timeout=42, tab_name="build", working_dir="sub"
         )
+        assert "Exit code: 0" in result
 
-    def test_password_prompt_detected(self, manager):
-        """Commands that produce a password prompt should return early."""
-        output = manager.run_sync(
-            'echo "Password:"; read -s pass',
-            timeout=15,
-        )
-        assert "--- terminal state ---" in output
-        assert "Password:" in output
+    def test_run_sync_passes_none_timeout(self, manager, backend):
+        """None timeout passes through so the backend applies its soft timeout."""
+        manager.run_sync("echo hi")
+        assert backend.shell_run.call_args[1]["timeout"] is None
 
-    def test_stall_detection(self, fast_manager):
-        """A silent command with no explicit timeout yields an honest
-        'still running' result after the soft no-change timeout — NOT an
-        interactive-input error."""
-        # 'read' with no prompt just waits silently; no explicit timeout so the
-        # soft no-change timeout (2s in fast_manager) applies.
-        start = time.monotonic()
-        output = fast_manager.run_sync("read answer")
-        elapsed = time.monotonic() - start
-        assert "--- terminal state ---" in output
-        assert "still running" in output.lower()
-        assert "Exit code: -1" in output
-        assert "requires interactive input" not in output.lower()
-        # Soft timeout ~2s + 1s grace + margin.
-        assert elapsed < 8
+    def test_cleanup_delegates_and_clears_stubs(self, manager, backend):
+        manager.ensure_tab("a")
+        manager.cleanup()
+        backend.shell_cleanup.assert_called_once()
+        assert manager._tabs == {}
 
-    def test_normal_command_unaffected(self, manager):
-        """Normal commands should still work via sentinel detection."""
-        output = manager.run_sync("echo hello-world")
-        assert "Exit code: 0" in output
-        assert "hello-world" in output
-        assert "--- terminal state ---" not in output
-
-    def test_slow_command_not_false_positive(self, manager):
-        """Commands that produce output slowly should not trigger stall detection."""
-        output = manager.run_sync(
-            'for i in 1 2 3; do echo "step $i"; sleep 1; done',
-            timeout=10,
-        )
-        assert "Exit code: 0" in output
-        assert "step 3" in output
-        assert "--- terminal state ---" not in output
-
-    def test_timeout_includes_visible_content(self, manager):
-        """A still-running result should include what's visible in the terminal."""
-        output = manager.run_sync(
-            'echo "visible-marker-12345"; sleep 30',
-            timeout=2,
-        )
-        assert "still running" in output.lower()
-        assert "Exit code: -1" in output
-        assert "--- terminal state ---" in output
-        assert "visible-marker-12345" in output
-
-    def test_blocked_tab_rejects_new_commands(self, manager):
-        """Commands sent to a tab stuck on a prompt should be rejected without executing."""
-        # First: create an interactive prompt on the tab
-        output1 = manager.run_sync(
-            'echo "Continue? [y/N]"; read answer',
-            timeout=15,
-        )
-        assert "--- terminal state ---" in output1
-
-        # Second: try to send a new command to the same (stuck) tab
-        output2 = manager.run_sync("echo should-not-run")
-        assert "blocked" in output2.lower()
-        assert "was not executed" in output2.lower()
-        assert "--- terminal state ---" in output2
-        # The original prompt should still be visible
-        assert "[y/N]" in output2
-
-    def test_blocked_tab_recovers_after_cancel(self, manager):
-        """After C-c on a stuck tab, new commands should work again."""
-        # Create an interactive prompt
-        manager.run_sync(
-            'echo "Continue? [y/N]"; read answer',
-            timeout=15,
-        )
-
-        # Cancel the prompt
-        manager.send("default", "C-c", enter=False)
-        time.sleep(0.5)
-
-        # Now a normal command should work
-        output = manager.run_sync("echo recovered-ok")
-        assert "Exit code:" in output
-        assert "recovered-ok" in output
+    def test_is_alive_delegates(self, manager, backend):
+        assert manager.is_alive() is True
+        backend.shell_is_alive.assert_called_once()
 
 
 class TestBlockedCommandSend:
-    """Tests for blocked command enforcement in send()."""
+    """Blocked-command enforcement in send() fires before delegation."""
 
-    def test_blocked_command_send(self, manager):
-        """send() blocks dangerous commands when enter=True."""
+    def test_blocked_command_send(self, manager, backend):
         result = manager.send("default", "shutdown now", enter=True)
         assert "blocked" in result.lower()
+        backend.shell_send.assert_not_called()
 
     def test_send_allows_non_blocked(self, manager):
-        """send() allows normal commands."""
         result = manager.send("default", "echo hello", enter=True)
         assert result == "Sent to 'default'"
 
-    def test_send_freezes_sudo_by_default(self, manager):
-        """send() returns freeze sentinel for sudo (default sudo_action=freeze)."""
-        from src.tools.shell.shell_manager import SUDO_FREEZE_SENTINEL
-
+    def test_send_freezes_sudo_by_default(self, manager, backend):
         result = manager.send("default", "sudo ls", enter=True)
         assert result == SUDO_FREEZE_SENTINEL
+        backend.shell_send.assert_not_called()
 
-    def test_send_allows_sudo_when_action_allow(self, manager):
-        """send() allows sudo when sudo_action='allow' (VM-backed agents)."""
-        manager.sudo_action = "allow"
+    def test_send_allows_sudo_when_action_allow(self, backend):
+        manager = ShellManager(
+            job_id=str(uuid.uuid4()), backend=backend, sudo_action="allow"
+        )
         result = manager.send("default", "sudo ls", enter=True)
         assert result == "Sent to 'default'"
-        manager.sudo_action = "freeze"  # restore
 
-    def test_send_blocks_sudo_when_action_block(self, manager):
-        """send() hard-blocks sudo when sudo_action='block'."""
-        manager.sudo_action = "block"
+    def test_send_blocks_sudo_when_action_block(self, backend):
+        manager = ShellManager(
+            job_id=str(uuid.uuid4()), backend=backend, sudo_action="block"
+        )
         result = manager.send("default", "sudo ls", enter=True)
         assert "blocked" in result.lower()
         assert "vm runtime" in result.lower()
-        manager.sudo_action = "freeze"  # restore
+        backend.shell_send.assert_not_called()
 
-    def test_send_skips_check_without_enter(self, manager):
+    def test_send_skips_check_without_enter(self, manager, backend):
         """send() with enter=False skips blocking (control keys, etc.)."""
         result = manager.send("default", "shutdown", enter=False)
         assert result == "Sent to 'default'"
+        backend.shell_send.assert_called_once()
 
-    def test_all_default_blocked_commands_in_send(self, manager):
-        """All default blocked commands are caught by send()."""
-        from src.tools.shell.shell_manager import DEFAULT_BLOCKED_COMMANDS
-
+    def test_all_default_blocked_commands_in_send(self, manager, backend):
         for cmd in DEFAULT_BLOCKED_COMMANDS:
             result = manager.send("default", f"{cmd} something", enter=True)
             assert "blocked" in result.lower(), f"{cmd} was not blocked by send()"
+        backend.shell_send.assert_not_called()
+
+    def test_custom_blocked_commands(self, backend):
+        manager = ShellManager(
+            job_id=str(uuid.uuid4()),
+            backend=backend,
+            blocked_commands=["rm"],
+        )
+        result = manager.send("default", "rm -rf /", enter=True)
+        assert "blocked" in result.lower()
+        # Default-blocked commands are replaced, not merged.
+        assert manager.send("default", "reboot", enter=True) == "Sent to 'default'"
 
 
 class TestRunSyncSudoFreeze:
-    """Tests for sudo freeze interception in run_sync()."""
+    """Sudo interception in run_sync() fires before delegation.
 
-    def test_run_sync_freezes_sudo_by_default(self, manager):
-        """run_sync() returns freeze sentinel for sudo (default sudo_action=freeze)."""
-        from src.tools.shell.shell_manager import SUDO_FREEZE_SENTINEL
-
-        result = manager.run_sync("sudo apt-get install -y libxml2-dev")
-        assert result == SUDO_FREEZE_SENTINEL
-
-    def test_run_sync_allows_sudo_when_action_allow(self, manager):
-        """run_sync() allows sudo when sudo_action='allow' (VM-backed agents)."""
-        manager.sudo_action = "allow"
-        result = manager.run_sync("sudo true")
-        # Should execute (or fail naturally), not return sentinel
-        assert "SUDO_FREEZE" not in result
-        manager.sudo_action = "freeze"
-
-    def test_run_sync_blocks_sudo_when_action_block(self, manager):
-        """run_sync() hard-blocks sudo when sudo_action='block'."""
-        manager.sudo_action = "block"
-        result = manager.run_sync("sudo ls")
-        assert "blocked" in result.lower()
-        manager.sudo_action = "freeze"
-
-
-class TestSudoFreezeWithBackend:
-    """Tests that sudo freeze works even when a backend is active.
-
-    This validates the fix for the early-return bypass: _check_blocked()
-    must run before backend delegation in both run_sync() and send().
+    This validates the early-return contract: _check_blocked() must run
+    before backend delegation in both run_sync() and send(), so the gate
+    cannot be bypassed by the delegating path.
     """
 
-    def test_run_sync_freezes_sudo_before_backend(self):
-        """run_sync() returns freeze sentinel without calling backend.shell_run()."""
-        from unittest.mock import MagicMock
-
-        from src.tools.shell.shell_manager import SUDO_FREEZE_SENTINEL, ShellManager
-
-        job_id = str(uuid.uuid4())
-        mock_backend = MagicMock()
-        mock_backend.supports_shell = True
-
-        sm = ShellManager(
-            job_id=job_id,
-            backend=mock_backend,
-            sudo_action="freeze",
-        )
-
-        result = sm.run_sync("sudo apt install foo")
+    def test_run_sync_freezes_sudo_by_default(self, manager, backend):
+        result = manager.run_sync("sudo apt-get install -y libxml2-dev")
         assert result == SUDO_FREEZE_SENTINEL
-        mock_backend.shell_run.assert_not_called()
-        sm.cleanup()
+        backend.shell_run.assert_not_called()
 
-    def test_send_freezes_sudo_before_backend(self):
-        """send() returns freeze sentinel without calling backend.shell_send()."""
-        from unittest.mock import MagicMock
-
-        from src.tools.shell.shell_manager import SUDO_FREEZE_SENTINEL, ShellManager
-
-        job_id = str(uuid.uuid4())
-        mock_backend = MagicMock()
-        mock_backend.supports_shell = True
-
-        sm = ShellManager(
-            job_id=job_id,
-            backend=mock_backend,
-            sudo_action="freeze",
+    def test_run_sync_allows_sudo_when_action_allow(self, backend):
+        manager = ShellManager(
+            job_id=str(uuid.uuid4()), backend=backend, sudo_action="allow"
         )
+        result = manager.run_sync("sudo true")
+        assert "SUDO_FREEZE" not in result
+        backend.shell_run.assert_called_once()
 
-        result = sm.send("default", "sudo ls", enter=True)
-        assert result == SUDO_FREEZE_SENTINEL
-        mock_backend.shell_send.assert_not_called()
-        sm.cleanup()
-
-    def test_non_sudo_delegates_to_backend(self):
-        """Non-sudo commands still delegate to the backend normally."""
-        from unittest.mock import MagicMock
-
-        from src.tools.shell.shell_manager import ShellManager
-
-        job_id = str(uuid.uuid4())
-        mock_backend = MagicMock()
-        mock_backend.supports_shell = True
-        mock_backend.shell_run.return_value = "Exit code: 0\n--- stdout ---\nhello"
-
-        sm = ShellManager(
-            job_id=job_id,
-            backend=mock_backend,
-            sudo_action="freeze",
+    def test_run_sync_blocks_sudo_when_action_block(self, backend):
+        manager = ShellManager(
+            job_id=str(uuid.uuid4()), backend=backend, sudo_action="block"
         )
+        result = manager.run_sync("sudo ls")
+        assert "blocked" in result.lower()
+        backend.shell_run.assert_not_called()
 
-        result = sm.run_sync("echo hello")
+    def test_run_sync_blocks_default_commands(self, manager, backend):
+        result = manager.run_sync("shutdown now")
+        assert "blocked" in result.lower()
+        backend.shell_run.assert_not_called()
+
+    def test_non_sudo_delegates_to_backend(self, manager, backend):
+        backend.shell_run.return_value = "Exit code: 0\n--- stdout ---\nhello"
+        result = manager.run_sync("echo hello")
         assert "hello" in result
-        mock_backend.shell_run.assert_called_once()
-        sm.cleanup()
+        backend.shell_run.assert_called_once()
 
 
 class TestApplyTailTerminalState:
@@ -643,142 +312,12 @@ class TestApplyTailTerminalState:
 
 
 class TestShellTab:
-    """Tests for ShellTab dataclass."""
+    """Tests for the ShellTab stub dataclass."""
 
-    def test_to_metadata(self, manager):
-        tab = manager._tabs["default"]
+    def test_to_metadata(self):
+        tab = ShellTab(name="default", tab_type="shell")
         meta = tab.to_metadata()
         assert meta["name"] == "default"
         assert meta["type"] == "shell"
         assert "created_at" in meta
         assert "last_activity" in meta
-
-
-@pytest.fixture
-def fast_manager():
-    """ShellManager with a short no-change timeout so soft-timeout tests are
-    fast. Hard timeout (default_timeout) stays high so it doesn't fire first."""
-    job_id = str(uuid.uuid4())
-    sm = ShellManager(
-        job_id=job_id,
-        max_tabs=4,
-        scrollback_limit=1000,
-        default_timeout=30,
-        no_change_timeout=2.0,
-    )
-    yield sm
-    sm.cleanup()
-
-
-class TestNoChangeContract:
-    """The OpenHands-style 'still running' contract for quiet/long commands."""
-
-    def test_soft_timeout_returns_still_running_not_error(self, fast_manager):
-        # No explicit timeout -> soft no-change timeout (2s) applies.
-        out = fast_manager.run_sync("sleep 20")
-        assert "Exit code: -1" in out
-        assert "still running" in out.lower()
-        assert "--- terminal state ---" in out
-        # Must NOT be the interactive-prompt state (distinct from still-running).
-        assert "interactive prompt detected" not in out.lower()
-        assert "requires interactive input" not in out.lower()
-        # The tab is marked busy so a colliding command can be rejected.
-        assert fast_manager._tabs["default"].pending_sentinel is not None
-
-    def test_steady_output_completes_not_still_running(self, fast_manager):
-        # Output changes every 1s (< 2s threshold) -> never a stall.
-        out = fast_manager.run_sync(
-            "for i in 1 2 3 4 5 6; do echo step_$i; sleep 1; done"
-        )
-        assert "Exit code: 0" in out
-        assert "step_6" in out
-        assert "still running" not in out.lower()
-
-    def test_explicit_timeout_disables_soft_timeout(self, fast_manager):
-        # Explicit timeout -> soft timeout disabled; only the hard cap applies.
-        start = time.monotonic()
-        out = fast_manager.run_sync("sleep 6", timeout=5)
-        elapsed = time.monotonic() - start
-        # Did NOT trip the 2s soft timer; ran until the 5s hard cap.
-        assert elapsed >= 4.5
-        assert "Exit code: -1" in out
-        assert "still running" in out.lower()
-
-    def test_colliding_command_rejected_then_recovers(self, fast_manager):
-        first = fast_manager.run_sync("sleep 20")
-        assert "still running" in first.lower()
-        # A new command must be refused, not silently queued behind the sleep.
-        second = fast_manager.run_sync("echo SHOULD_NOT_RUN")
-        assert "not executed" in second.lower()
-        # Interrupt the running command; the tab must then accept commands again.
-        fast_manager.send("default", "C-c", enter=False)
-        time.sleep(1.5)
-        third = fast_manager.run_sync("echo RECOVERED")
-        assert "Exit code: 0" in third
-        assert "RECOVERED" in third
-
-    def test_fresh_tab_has_no_false_colliding_guard(self, fast_manager):
-        fast_manager.ensure_tab("build")
-        out = fast_manager.run_sync("echo ok", tab_name="build")
-        assert "Exit code: 0" in out
-        assert "ok" in out
-        assert "not executed" not in out.lower()
-
-    def test_completion_wins_over_soft_timeout(self):
-        # A command that completes well within the no-change window is reported
-        # completed, never 'still running' (sentinel check precedes the stall
-        # check each poll).
-        sm = ShellManager(
-            job_id=str(uuid.uuid4()), default_timeout=30, no_change_timeout=3.0
-        )
-        try:
-            out = sm.run_sync("sleep 2; echo done")
-            assert "Exit code: 0" in out
-            assert "done" in out
-            assert "still running" not in out.lower()
-        finally:
-            sm.cleanup()
-
-    def test_interactive_prompt_is_honest_hint_not_still_running(self, fast_manager):
-        out = fast_manager.run_sync('echo "Continue? [y/N]"; read x')
-        assert "interactive prompt detected" in out.lower()
-        assert "keys" in out.lower()
-        # Distinct from the still-running state.
-        assert "Exit code: -1" not in out
-
-    def test_soft_timeout_reports_quiet_window(self, fast_manager):
-        """The soft (no-change) still-running message reports how long output
-        has been quiet — distinct from the hard-cap message."""
-        out = fast_manager.run_sync("sleep 20")  # no timeout -> soft (2s) fires
-        assert "still running" in out.lower()
-        assert "no new output in the last" in out.lower()
-        # Soft path is NOT the hard-cap wording.
-        assert "maximum wait" not in out.lower()
-
-    def test_hard_cap_message_does_not_claim_no_new_output(self, fast_manager):
-        """Regression: the hard-timeout path used to reuse the soft template and
-        report 'no new output for {cap}s', falsely implying silence even when a
-        process was emitting a redrawing progress bar the whole time. The
-        hard-cap message must NOT claim quiet."""
-        # Explicit timeout disables the soft timer; sleep never completes, so the
-        # loop exits at the 3s hard cap.
-        out = fast_manager.run_sync("sleep 30", timeout=3)
-        assert "still running" in out.lower()
-        assert "Exit code: -1" in out
-        assert "maximum wait" in out.lower()  # distinct hard-cap wording
-        assert "no new output" not in out.lower()  # must NOT claim silence
-
-    def test_colliding_message_is_mode_neutral(self, fast_manager):
-        """The colliding-command guard must not advise actions a stateless
-        run_command/shell_read agent cannot take (keys mode, other tabs) — that
-        guidance belongs to the persistent shell_execute tool, not the shared
-        backend message."""
-        first = fast_manager.run_sync("sleep 20")
-        assert "still running" in first.lower()
-        second = fast_manager.run_sync("echo SHOULD_NOT_RUN")
-        assert "not executed" in second.lower()
-        assert "keys mode" not in second.lower()
-        assert "different tab" not in second.lower()
-        # Release the tab for cleanup.
-        fast_manager.send("default", "C-c", enter=False)
-        time.sleep(1.0)

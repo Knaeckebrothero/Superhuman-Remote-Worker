@@ -86,8 +86,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certifi
     && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && rm -rf /var/lib/apt/lists/*
 
-# Install runtime + dev dependencies
-# The container IS the agent's computer — full toolset available.
+# Install runtime dependencies. Document/media processing runs in-process;
+# code execution (shell, browser) happens on the workspace, not in this pod.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq5 \
     curl \
@@ -112,7 +112,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     openssh-client \
     zip \
     unzip \
-    tmux \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy installed packages from builder (system-owned, read-only is fine)
