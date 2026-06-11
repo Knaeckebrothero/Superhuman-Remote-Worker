@@ -28,15 +28,23 @@ related:
 > assembles the right memories for every LLM call — the model is a *consumer*, never the
 > manager. Build the seam first; everything else becomes a plugin behind it.
 
-**Status:** Design v2 / **step 0 + pre-flight bug track complete, Phase 1
-implementation complete (all 5 slices)** — the cutover wiring is live behind
-`memory.manager.enabled`, which ships **off**; what remains for Phase-1 closure
-is operational: live k3d verify (flag on) → flip the default → soak → delete
-the legacy blocks (the "zero direct store calls" acceptance is the
-post-deletion state). Restructured 2026-06-10 around the MemoryManager
-abstraction after design alignment (v1 of 2026-06-07 was phase-first; superseded,
-phases preserved below in new order). Every bug worth fixing *before* the seam is
-fixed (B1/B2/B4 + logging); the remaining bugs are absorbed by phases by design.
+**Status:** Design v2 / **Phase 1 implementation complete + closure steps 1–2
+done (2026-06-11)** — the live k3d verify PASSED in both modes (three real
+catches found and fixed the same day: dispatch round-trip flag loss, session
+config_name plumbing incl. the dual-app attach route, and the k8s ✕-route
+closed via orchestrator detach-then-delete; see the closure runbook's step-1
+findings), and `memory.manager.enabled` is **on** in both defaults files
+(committed). What remains for Phase-1 closure is operational: **step 3 soak
+on dev** (passive — starts when the push rolls out; watch the seam failure
+surface, the flag stays the one-line rollback) → **step 4 delete the legacy
+blocks** (the "zero direct store calls" acceptance is the post-deletion
+state). **Phase 2 has started (2026-06-11): the eval harness skeleton is
+built and smoke-verified end-to-end** (`eval/memory/`, see its README) — it
+drives the seam offline and never touches what the soak exercises.
+Restructured 2026-06-10 around the MemoryManager abstraction after design
+alignment (v1 of 2026-06-07 was phase-first; superseded, phases preserved
+below in new order). Every bug worth fixing *before* the seam is fixed
+(B1/B2/B4 + logging); the remaining bugs are absorbed by phases by design.
 
 **Implementation log:**
 - **2026-06-10 — Step 0 (ground-clearing) merged to develop** as #111 + #112:
@@ -245,6 +253,36 @@ fixed (B1/B2/B4 + logging); the remaining bugs are absorbed by phases by design.
   hitting memory paths needs the same). Remaining for Phase-1 closure:
   k3d verify → flip → soak → delete legacy — step-by-step commands and
   pass signals in the **Phase-1 closure runbook** under §5 Phase 1.
+- **2026-06-11 — Phase 2 slice 1 (harness skeleton) shipped +
+  smoke-verified on real infra**: `eval/memory/` — LongMemEval loader
+  (typed records, committed tiny fixture, type-stratified subsetting),
+  the LongMemEval→seam mapping (question=project, haystack
+  session=job → memory `job_id` IS retrieval provenance; fresh uuid5
+  scopes per run), two ingestion modes (**seam**: production-faithful
+  replay emitting the exact persistent-loop assemble/capture sequence,
+  TTL dynamics included; **verbatim**: flat round-granularity index,
+  dedup off via `dedup_threshold: 1.01`, `remaining_turns=0` → pure
+  hybrid retrieval — the published-baseline + smoke arm), question-time
+  assemble + provenance collapse, Recall@k/NDCG@k/coverage/first-hit
+  vs answer-location labels with per-type aggregation, cost columns
+  (tokens injected, assemble latency), resume-safe JSONL runner +
+  markdown reports + arm-vs-arm deltas. Infra builders mirror
+  production construction sites (loader path = the expert reload;
+  manager = `_setup_memory`'s shape; vector DB via the agent-side
+  `PostgresDB` + the production migrations runner onto a dedicated
+  eval database). 38 offline tests (`tests/test_memory_eval_harness.py`,
+  fakes through the `HarnessHandles` factory seams). **Smoke (k3d
+  pgvector + real qwen3 embeddings + cluster aux routing)**: flat arm —
+  stored counts == round counts (dedup-off proof), evidence at rank 1;
+  seam arm — full chain fired (bind log, interval gate correctly closed
+  on short sessions, per-session `Final memory extraction complete`,
+  0-stored warning surfaced) and already produced the first honest
+  finding: gemma's conservative extraction stored 0 memories on most
+  short fixture sessions → single-session recall 0 (the brief-05
+  completeness-over-precision argument, now measurable). Remaining
+  Phase-2 slices: full **_S** runs (flat = published-baseline anchor,
+  seam = current-system baseline numbers), end-task LLM-judge,
+  contradiction-survival probe, recall-shape instrumentation.
 **Companions:**
 - [`agent_memory_current_state.md`](agent_memory_current_state.md) — ground truth: every
   current capability classified wired/dead/conceptual with `file:line` evidence.
@@ -572,7 +610,7 @@ pre-flight (2026-06-11): B2 halfvec migrations shipped + k3d-verified (Phase 3's
 frozen until Phase-1 equivalence fixtures pin it (mapping in `memory_bugs.md`
 §Suggested order).
 
-### Phase 1 — The foundation: MemoryManager seam · ~1–1.5 wk ← **implementation complete (slices 1–5); flag ships off — k3d verify → flip → soak → delete legacy remain** (see implementation log)
+### Phase 1 — The foundation: MemoryManager seam · ~1–1.5 wk ← **implementation + closure steps 1–2 complete (k3d verify PASSED, flag ON committed, step-1 catches fixed 2026-06-11); soak → delete legacy remain** (see implementation log + closure runbook)
 Extract all assembly + capture logic from `graph.py` / `persistent_graph.py` /
 `persistent_app.py` into `src/services/memory/` behind the §2.1 interface. Both graphs
 hold one `MemoryManager`; neither touches `RecallStore`/`KnowledgeStore` directly. v1
@@ -601,13 +639,14 @@ worker-path payloads are byte-stable vs pre-refactor fixtures; persistent path a
 `graph.py`/`persistent_graph.py` contain zero direct store calls; lint+tests at file
 granularity per CLAUDE.md verify loop.
 
-**Phase-1 closure runbook (status 2026-06-11: step 1 executed and PASSED —
-findings under step 1; step 2 staged in the working tree).** All code is on
-develop: seam + plugins (slices 1–4), cutover wiring + per-mode YAML pipelines +
-20 wiring tests (slice 5 + the step-1 round-trip regression). Closure is four
-steps; the unit suites can't cover step 1 (real stores, real aux LLM, real
-timing), and deleting legacy before step 3 would destroy the flag's rollback
-path.
+**Phase-1 closure runbook (status 2026-06-11: steps 1–2 DONE — step-1 verify
+PASSED with findings below, all catches fixed same day, flag ON committed;
+step 3 soak is current).** All code is on develop: seam + plugins (slices
+1–4), cutover wiring + per-mode YAML pipelines + 20 wiring tests (slice 5 +
+the step-1 round-trip regression) + the step-1 fix round
+(`tests/test_session_config_plumbing.py`, 12 pins). Closure is four steps;
+the unit suites can't cover step 1 (real stores, real aux LLM, real timing),
+and deleting legacy before step 3 would destroy the flag's rollback path.
 
 1. **Live k3d verify, flag on.**
    - *Flip locally (don't commit):* set `manager: enabled: true` under `memory:`
@@ -687,33 +726,54 @@ path.
    still carried the playwright layer that fc42d052 removed from the prod
    Dockerfile — every Tilt agent rebuild had been failing since that commit.
 
-2. **Flip the default:** commit `manager: enabled: true` in both defaults files.
-3. **Soak on dev:** real workloads; watch the failure surface above. Rollback is
-   the one-line config revert — that is the flag's whole job.
+2. **Flip the default** ✅ DONE 2026-06-11: `manager: enabled: true` committed in
+   both defaults files (with the step-1 fixes: loader round-trip, config_name
+   plumbing, detach-then-delete).
+3. **Soak on dev** ← CURRENT (passive — starts when the push rolls out via
+   CI → Fleet, ~30 min). Real workloads do the work; the check-in is a
+   five-minute grep, not a phase:
+   - *Seam failure surface (must stay empty):*
+     `kubectl --context=main -n superhuman-remote-worker logs -l srw/managed-by=agent-provisioner --since=24h | grep -E "failed \(contained\)|Memory writer"`
+     — these were ZERO on k3d; any hit is a real seam bug. Aux-router
+     `TimeoutError`s inside `Memory extraction failed (non-fatal)` are the
+     known flaky-router infra noise, identical to legacy — not a soak failure.
+   - *Rows keep accruing:* the pgvector `memories` count by `source`/day on
+     the dev vector DB; plus the usual signals (bind lines on new
+     jobs/sessions, "Final memory extraction complete" on session ends).
+   - *Exit criterion:* a few days of normal dev usage — multiple real jobs
+     AND sessions — with an empty seam surface. Rollback at any point is the
+     one-line config revert; that is the flag's whole job.
 4. **Delete the legacy blocks:** remove the `memory_service is None` branches and
    the direct-store code from graph.py / persistent_graph.py / persistent_app.py.
    This is when the "zero direct store calls" acceptance is met; the equivalence
    suites' verbatim reproductions become the reference copy of the old behaviour
    and `tests/test_memory_cutover.py` keeps guarding the wiring.
 
-### Phase 2 — Eval harness against the seam + baseline · ~1–1.5 wk
-A standalone offline harness (`eval/memory/`) that drives **`MemoryManager.assemble()`
-directly** — the seam makes this dramatically simpler than v1's plan (no graph spin-up).
-Sessions are ingested **incrementally** (memories accrue through `capture()` as in
-production, not batch-loaded). Reports per config arm:
-- **Retrieval:** Recall@k / NDCG@k vs answer-location labels (LongMemEval_S first; a
-  bespoke production-trace set second — no public benchmark matches a project-scoped
-  coding agent; avoid LoCoMo as primary, ~6.4% wrong answer key).
-- **End-task:** calibrated LLM-judge (>97% agreement target on a hand-labelled slice),
+### Phase 2 — Eval harness against the seam + baseline · ~1–1.5 wk ← **IN PROGRESS (skeleton shipped + smoke-verified 2026-06-11; runs in parallel with the Phase-1 soak)**
+A standalone offline harness (`eval/memory/` — **built**, run recipes +
+LongMemEval→seam mapping in [`eval/memory/README.md`](../../eval/memory/README.md))
+that drives **`MemoryManager.assemble()` directly** — the seam makes this
+dramatically simpler than v1's plan (no graph spin-up). Sessions are ingested
+**incrementally** (memories accrue through `capture()` as in production, not
+batch-loaded). Reports per config arm:
+- **Retrieval:** ✅ built — Recall@k / NDCG@k / coverage / first-hit vs answer-location
+  labels (LongMemEval_S first; a bespoke production-trace set second — no public
+  benchmark matches a project-scoped coding agent; avoid LoCoMo as primary, ~6.4%
+  wrong answer key).
+- **End-task:** ⬜ calibrated LLM-judge (>97% agreement target on a hand-labelled slice),
   scored **separately** from retrieval — reading is its own bottleneck (Chain-of-Note /
   answer-formatting swings QA up to +10 pt even at oracle recall, brief 05).
-- **Contradiction-survival probe:** store fact → supersede → query: current or stale?
-- **Cost:** tokens injected + assemble latency per arm.
-- **Ablation switches:** every plugin/policy on/off via config.
+- **Contradiction-survival probe:** ⬜ store fact → supersede → query: current or stale?
+- **Cost:** ✅ built — tokens injected + assemble latency per arm.
+- **Ablation switches:** ✅ built — arms deep-merge raw config overrides (the full
+  `memory.*` surface incl. pipeline lists) over any base YAML.
 Also: recall-shape instrumentation (single-hop vs multi-hop) starts accruing for the
-Phase-7 graph verdict.
-**Acceptance:** reproduces a published LongMemEval baseline within tolerance; A/Bs two
-configs and emits deltas; **baseline numbers for the current system recorded.**
+Phase-7 graph verdict (⬜).
+**Acceptance:** reproduces a published LongMemEval baseline within tolerance (⬜ —
+`flat_verbatim` on full _S vs the paper's round-granularity dense retrievers); A/Bs two
+configs and emits deltas (✅ mechanism — `report.py` comparison; smoke-verified on the
+fixture); **baseline numbers for the current system recorded** (⬜ —
+`persistent_current` on a stratified _S subset).
 
 ### Phase 3 — First plugin wave (measured): reranker + gate + bounded core · ~1–1.5 wk
 `reranker_service` (bge-reranker-v2-m3, CPU in-cluster) as a Scorer; ensemble gate
