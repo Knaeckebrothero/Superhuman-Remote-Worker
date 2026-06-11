@@ -11,7 +11,9 @@ from unittest.mock import MagicMock, patch
 
 from src.core.datasource_setup import (
     clone_repository_datasources,
+    inject_datasource_index,
     process_datasources,
+    resolve_repo_clone_names,
 )
 
 
@@ -138,6 +140,44 @@ class TestBackendClone:
             clone_repository_datasources([token_ds()], ws)
         assert ws.source_repos == {}
         assert any("Failed to clone" in r.message for r in caplog.records)
+
+
+class TestResolveRepoCloneNames:
+    """Clone-directory names: upstream repo name, label fallback, suffixes."""
+
+    def test_uses_upstream_repo_name_not_label(self):
+        names = resolve_repo_clone_names([token_ds(name="Read-only mirror")])
+        assert names == ["repo"]
+
+    def test_falls_back_to_label_slug_without_usable_url(self):
+        names = resolve_repo_clone_names([token_ds(name="My Repo!", url="")])
+        assert names == ["my-repo"]
+
+    def test_collision_gets_suffix(self):
+        names = resolve_repo_clone_names(
+            [token_ds(name="upstream"), token_ds(name="fork")]
+        )
+        assert names == ["repo", "repo-2"]
+
+
+class TestDatasourceIndexRepoPaths:
+    """datasources.md must point at the directories clones actually land in."""
+
+    def test_index_uses_clone_directory_names(self):
+        ws = MagicMock()
+        ws.read_file.side_effect = FileNotFoundError
+        written = {}
+        ws.write_file.side_effect = lambda path, content: written.update(
+            {path: content}
+        )
+
+        inject_datasource_index([token_ds(name="Read-only mirror of upstream")], ws)
+
+        content = written["datasources.md"]
+        assert "`./repos/repo/`" in content
+        # The old behavior used the datasource-label slug, which never
+        # matched the clone directory (upstream repo name).
+        assert "read-only-mirror-of-upstream" not in content
 
 
 class TestProcessDatasourcesRepoGuard:
