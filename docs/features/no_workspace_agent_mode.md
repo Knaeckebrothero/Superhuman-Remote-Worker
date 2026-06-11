@@ -19,8 +19,10 @@ related:
 
 # No-Workspace Agent Modes — `virtual` and `none` workspace tiers
 
-**Status:** Draft. Design discussed and v1 scope agreed 2026-06-10.
-Prerequisite hardening in progress (serial order: prereqs before S1/S2 —
+**Status:** **v1 + v1.1 implemented and k3d-validated; committed on `develop`,
+not yet pushed/deployed to dev (2026-06-11).** Design agreed 2026-06-10;
+per-slice implementation + validation detail follows.
+Prerequisite hardening complete (serial order: prereqs before S1/S2 —
 building the lite backends first would arm the very fallbacks the prereqs
 remove): §9.2 browser fallback **removed 2026-06-11** (+133/−1431, agent
 image drops Playwright/Chromium entirely; also completed
@@ -75,8 +77,19 @@ drops shell/browser/git when `not supports_shell` and the file tools when
 `config:default` a `virtual` job dropped all 16 shell/git/browser tools (keeping
 files + web) and a `none` job dropped those **plus** all file tools (§12 #4/#6,
 verified live). This replaces the originally sketched "lite presets" with
-enforcement-by-construction. Remaining: §12 #3 (web+SQL in one session) and #8
-(Cockpit affordances), plus an optional lite instruction variant.
+enforcement-by-construction.
+
+**v1.1 Cockpit tier picker implemented + k3d-validated 2026-06-11** (detail in
+§10): the Advanced-settings backend selector now offers `virtual`/`none` and
+greys the dependent controls to match the S3 gate (git-versioning, the whole
+Shell section, browser headless/vision; file-size limits too for `none`; proxy
+stays — web egress), with an explanatory hint; `getOverrides()` drops the gated
+fragments so the emitted `config_override` stays clean. Validated by `npm run
+build` (AOT-clean), vitest (9/9), and a live Playwright drive on k3d (dropdown +
+hint + full disable matrix for both tiers). Remaining — all optional, none
+blocks shipping: §12 #8 session-view affordance-hiding (code-server/workspace
+links), #3 web+SQL smoke, the UI→`config_override`→dispatch round-trip through
+the real form, and an optional lite instruction variant.
 
 ## 1. Goal
 
