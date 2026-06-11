@@ -1,0 +1,28 @@
+# Flat round-granularity index, no extraction LLM — two jobs in one:
+# (1) the published-baseline reproduction arm (LongMemEval reports
+#     round-granularity retrieval; this is our stack's equivalent:
+#     hybrid RRF over verbatim user+assistant rounds), used to sanity-
+#     check the harness's metric math against the paper's numbers;
+# (2) the cheap smoke arm — no aux-LLM cost, runs the full _S set.
+#
+# Rounds are stored with remaining_turns=0 (never TTL-pinned → pure
+# hybrid retrieval) and dedup is disabled (threshold > 1 can never fire)
+# so the index stays truly flat — a 0.85-cosine merge would silently
+# drop near-duplicate filler rounds and skew the baseline.
+name: flat_verbatim
+description: >
+  Verbatim round-level index, dedup off, no TTL pinning — published-
+  baseline reproduction + smoke arm.
+base_config: persistent_defaults
+
+config_overrides:
+  memory:
+    dedup_threshold: 1.01
+
+ingestion:
+  mode: verbatim
+  date_prefix: false
+  verbatim_importance: 0.5
+
+query:
+  ks: [1, 3, 5, 10]

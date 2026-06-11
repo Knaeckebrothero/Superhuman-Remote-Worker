@@ -56,15 +56,18 @@ migration plan live in [[agent_memory_overhaul]].
 > - **Aux logging**: the four memory catches in `auxiliary.py` now log
 >   `type(e).__name__`, so openai-style exceptions no longer log as empty strings.
 >
-> **Phase-1 seam deltas (2026-06-11, slices 1–5 on develop; closure step 1
-> PASSED on k3d the same day).** The cutover flag `memory.manager.enabled` is
-> flipped **on** in both defaults files (closure step 2) after the live k3d
-> verify — see "Step-1 execution findings" in the overhaul doc's closure
-> runbook for the evidence and the three catches (dispatch round-trip flag
-> loss, fixed in `_parse_memory_config`; session config_name plumbing holes →
-> `docs/issues/session_config_name_plumbing.md`; k8s thread-DELETE bypasses
-> `_terminate_session` → memory_bugs.md B11 addendum). Three things change how
-> this snapshot should be read:
+> **Phase-1 seam deltas (2026-06-11, slices 1–5 on develop; closure steps 1–2
+> done the same day).** The cutover flag `memory.manager.enabled` is **on** in
+> both defaults files (committed) after the live k3d verify PASSED — see
+> "Step-1 execution findings" in the overhaul doc's closure runbook for the
+> evidence and the three catches, **all fixed the same day** (dispatch
+> round-trip flag loss → `_parse_memory_config` accepts both shapes; session
+> config_name plumbing incl. the dual-app attach route →
+> `docs/issues/session_config_name_plumbing.md`, fixed + live-verified; k8s
+> thread-DELETE bypassing `_terminate_session` → closed via orchestrator
+> detach-then-delete, memory_bugs.md B11 ✅). Soak on dev is the current
+> closure step; legacy deletion follows it. Three things change how this
+> snapshot should be read:
 > - A parallel implementation of the full memory path exists in
 >   `src/services/memory/`: MemoryManager kernel, the `recall_two_tier`/`kb_notes`
 >   read plugins + transplanted injection mechanics, and seven capture writers

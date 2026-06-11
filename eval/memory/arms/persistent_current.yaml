@@ -1,0 +1,31 @@
+# The current production system, persistent-session shape — Phase-2's
+# "baseline numbers for the current system" arm.
+#
+# Ingestion replays every haystack session through the seam (capture
+# turn_end/session_end + the per-turn read path), so the elapsed
+# extraction gate, TTL pinning/decay, and dedup all behave exactly as a
+# live session. Costs real auxiliary-LLM calls per session — start with
+# --limit 10..20.
+name: persistent_current
+description: >
+  Seam replay of config/persistent_defaults.yaml (persistent writer set,
+  recall_two_tier + kb_notes read path) — the current system's baseline.
+base_config: persistent_defaults
+
+# The committed persistent_defaults auxiliary.model points at the cluster
+# router (key injected at dispatch in production). Local runs must route
+# extraction somewhere reachable — fill in your endpoint; the key comes
+# from the environment variable named by api_key_env, never this file.
+auxiliary:
+  # model: openai/gpt-oss-120b
+  # base_url: https://api.groq.com/openai/v1
+  # api_key_env: GROQ_API_KEY
+  timeout: 120
+
+ingestion:
+  mode: seam
+  read_path_per_turn: true
+  date_prefix: false
+
+query:
+  ks: [1, 3, 5, 10]

@@ -205,3 +205,7 @@ target/
 !.mvn/wrapper/maven-wrapper.jar
 !**/src/main/**/target/
 !**/src/test/**/target/
+
+# Memory eval harness — datasets are large downloads, runs are local artifacts
+eval/memory/data/
+eval/memory/runs/
