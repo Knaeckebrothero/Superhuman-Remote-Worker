@@ -1,8 +1,31 @@
 # Persistent sessions can silently run on the worker YAML (config_name plumbing)
 
-**Status**: open — found 2026-06-11 during the memory-overhaul Phase-1 closure
-step 1 (live k3d verify, flag on). Pre-existing plumbing, newly consequential
-once `memory.manager` pipelines became per-mode YAML choices.
+**Status**: FIXED + LIVE-VERIFIED on k3d 2026-06-11 (same day as found):
+- Hole A: `ThreadCreateRequest.config_name` default flipped to
+  `"persistent_defaults"` (orchestrator/main.py). Verified: bare
+  `POST /api/persistent/threads` → thread row stores `persistent_defaults`.
+- Hole B: `_send_session_attach` now carries the thread's `config_name` on
+  all three call sites (provision_or_assign k8s create path, compose create
+  path, resume path); agent-side, **BOTH** `/session/attach` routes forward
+  it — `persistent_app.py` AND `dual_app.py` (the job pool runs the dual
+  app; the first live verify missed that route — it answered 200 and
+  silently dropped the field). `_attach_session` resolves it via the new
+  `_load_expert_config()` (mirrors the worker job path's expert reload,
+  settings-matrix included) as the session base instead of the pod's boot
+  config. Unknown names raise → attach 500s/releases → the orchestrator
+  re-provisions with the right config. Verified live: bare-created thread
+  pool-attached to a worker-booted dual pod logged
+  `Attach: session base config 'persistent_defaults' (overrides pod boot
+  config)` and bound `['persistent_interval_extractor',
+  'teardown_extractor']` (thread `d09ee110`).
+- Bonus (same arc): the dual pod's `/session/detach` now terminates with
+  reason `"rest_detach"` (was the `"legacy"` back-compat shim), so the
+  documented `Terminate(rest_detach)` signal greps identically on pool pods.
+Pinned by `tests/test_session_config_plumbing.py` (12 cases incl.
+source-level pins on both attach routes). Found 2026-06-11 during the
+memory-overhaul Phase-1 closure step 1 (live k3d verify, flag on).
+Pre-existing plumbing, newly consequential once `memory.manager` pipelines
+became per-mode YAML choices. Original analysis below.
 
 ## Why this matters now
 

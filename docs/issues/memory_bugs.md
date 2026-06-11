@@ -25,7 +25,7 @@ Severity overview:
 | B8 | Neo4j-down kills pgvector-only KB injection too | LOW-MED | small | open |
 | B9 | Dead/misleading config keys (tuning no-ops) | LOW (hygiene) | ~1 h | **✅ keys deleted 2026-06-10** (PR #112) — enum nits still open |
 | B10 | Injection-strip prefix registry is silently fragile | LOW (latent) | test guard | open |
-| B11 | End-Session button (detach path) skips final extraction — only `/done` + idle extract | MED | small now / Phase-1 `capture()` properly | wired slice 5, live-verified via archive route 2026-06-11; k8s ✕-route deletes the pod without detach → needs orchestrator-side follow-up |
+| B11 | End-Session button (detach path) skips final extraction — only `/done` + idle extract | MED | small now / Phase-1 `capture()` properly | ✅ CLOSED 2026-06-11: capture wired (slice 5) + orchestrator detach-then-delete for the k8s ✕-route; both live-verified (archive route + DELETE route w/ extraction before teardown) |
 
 ---
 
@@ -197,8 +197,23 @@ closes every ending that actually reaches `_terminate_session` (idle
 timeout, loop crash, watchdog exits, drain/suspend, compose-mode detach —
 the `Terminate(...)` log lines confirm those paths fire). Fully closing the
 ✕-route on k8s needs an orchestrator-side detach-then-delete (or a
-SIGTERM-path capture with terminationGracePeriod headroom) — follow-up,
-outside Phase 1.
+SIGTERM-path capture with terminationGracePeriod headroom).
+**✅ ✕-route CLOSED same day (2026-06-11): detach-then-delete shipped +
+live-verified.** `_release_thread_resources` (shared by the user-facing
+DELETE, the agent-facing status flip, and the orphan reaper) now starts
+with `_detach_agent_session()`: looks up the thread's agent, and — only
+when its status is `session` (so the reaper never stalls on offline
+agents) — POSTs `/session/detach` and waits (connect 3 s, read 150 s ≈ the
+120 s persistent aux budget + git-push headroom) before the workspace and
+pod teardown. Live evidence (thread `d09ee110`, pool-attached dual pod):
+DELETE took 59.5 s during the slow-router window and the dying pod logged
+`Memory extraction: extracted 3, stored 3` → `Final memory extraction
+complete` → `Terminate(...): final memory capture complete` → detach 200 →
+orchestrator `agent detach completed before teardown`; 3 observer rows in
+pgvector. Ordering (detach → workspace cleanup → pod delete) +
+skip-conditions pinned in `tests/test_session_config_plumbing.py`. The
+dual pool pods' detach route now also passes reason `rest_detach` (was the
+`legacy` shim), so the documented signal greps identically everywhere.
 
 Related observation from the same investigation (cosmetic): `agents.status`
 can read `offline` for a pod that is Running but whose session app has
