@@ -140,10 +140,10 @@ jobs:
         #   the affected server binary isn't shipped by our images.
         # PYSEC-2025-183 (pyjwt): disputed; the "weak encryption" claim depends on
         #   caller-chosen key length, which is enforced by Keycloak in our deployment.
-        # PYSEC-2025-189..197, 210, PYSEC-2026-139 (torch): all require loading an
-        #   attacker-supplied checkpoint or running torch.jit on attacker code. Agents
-        #   only pull torch transitively via sentence-transformers against pinned,
-        #   vetted embedding models. Most have no fix released.
+        # PYSEC-2025-189..197, 210, PYSEC-2026-139, CVE-2025-3000 (torch): all require
+        #   loading an attacker-supplied checkpoint or running torch.jit on attacker
+        #   code. Agents only pull torch transitively via sentence-transformers against
+        #   pinned, vetted embedding models. Most have no fix released.
         # PYSEC-2025-211..218 (transformers): deserialization of untrusted model files
         #   (X-CLIP, GLM4, Perceiver, Transformer-XL, megatron_gpt2, SEW/SEW-D/HuBERT
         #   convert_config). Same threat model — we don't convert or load attacker-
@@ -174,6 +174,7 @@ jobs:
           --ignore-vuln PYSEC-2025-197
           --ignore-vuln PYSEC-2025-210
           --ignore-vuln PYSEC-2026-139
+          --ignore-vuln CVE-2025-3000
           --ignore-vuln PYSEC-2025-211
           --ignore-vuln PYSEC-2025-212
           --ignore-vuln PYSEC-2025-213
