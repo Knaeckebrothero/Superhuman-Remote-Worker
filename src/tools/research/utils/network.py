@@ -149,28 +149,6 @@ class ProxyConfig:
             proxy["password"] = self.password
         return proxy
 
-    def to_browser_use_proxy(self) -> Optional[Any]:
-        """Convert to browser-use ProxySettings format.
-
-        Returns:
-            browser_use ProxySettings instance, or None if no proxy.
-        """
-        if not self.is_configured:
-            return None
-
-        try:
-            from browser_use.browser.profile import ProxySettings
-
-            kwargs: Dict[str, str] = {"server": self.url}
-            if self.username:
-                kwargs["username"] = self.username
-            if self.password:
-                kwargs["password"] = self.password
-            return ProxySettings(**kwargs)
-        except ImportError:
-            logger.debug("browser-use not installed, cannot create ProxySettings")
-            return None
-
     def to_aiohttp_connector(self) -> Optional[Any]:
         """Create an aiohttp-socks ProxyConnector for this proxy config.
 

@@ -54,10 +54,15 @@ jobs:
         run: ruff format --check src/ orchestrator/ tests/
       - name: Verify Playwright pin consistency
         run: |
+          # The agent image has no Playwright; the pin only feeds the
+          # workspace/VM builds (.playwright-version is the source of truth,
+          # passed as a build-arg). Guard the two fallback copies against drift.
           PIN=$(tr -d '[:space:]' < .playwright-version)
           test -n "$PIN" || { echo "::error::.playwright-version is empty"; exit 1; }
-          grep -q "^playwright==${PIN}\b" requirements.txt \
-            || { echo "::error::playwright pin in requirements.txt does not match .playwright-version (${PIN})"; exit 1; }
+          grep -q "^ARG PLAYWRIGHT_VERSION=${PIN}$" docker/Dockerfile.workspace \
+            || { echo "::error::ARG PLAYWRIGHT_VERSION default in docker/Dockerfile.workspace does not match .playwright-version (${PIN})"; exit 1; }
+          grep -q "^PLAYWRIGHT_VERSION=${PIN}$" .env.example \
+            || { echo "::error::PLAYWRIGHT_VERSION in .env.example does not match .playwright-version (${PIN})"; exit 1; }
       - name: Install Helm
         uses: azure/setup-helm@v4
         with:

@@ -1,6 +1,6 @@
-"""Tests for browser automation tools and network utilities."""
+"""Tests for browser tools and network utilities."""
 
-import time
+import re
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -175,334 +175,30 @@ class TestProxyConfigToPlaywright:
         assert result["password"] == "pass"
 
 
-class TestProxyConfigToBrowserUse:
-    """Tests for ProxyConfig.to_browser_use_proxy method."""
-
-    def test_returns_none_when_unconfigured(self):
-        config = ProxyConfig()
-        assert config.to_browser_use_proxy() is None
-
-    def test_returns_none_when_browser_use_not_installed(self):
-        config = ProxyConfig(type=ProxyType.SOCKS5, host="localhost", port=1080)
-        with patch.dict(
-            "sys.modules", {"browser_use": None, "browser_use.browser.profile": None}
-        ):
-            # Force ImportError by patching the import
-            with patch(
-                "builtins.__import__",
-                side_effect=lambda name, *args: (_ for _ in ()).throw(ImportError)
-                if "browser_use" in name
-                else __builtins__.__import__(name, *args),
-            ):
-                result = config.to_browser_use_proxy()
-                assert result is None
+# ── No-local-browser regression guard ──────────────────────────────
 
 
-# ── Browser tools tests ────────────────────────────────────────────
+class TestNoLocalBrowserPath:
+    """The agent runtime must not contain an in-pod browser execution path.
 
+    The local browser_use fallback was removed — the workspace-side
+    browser-exec daemon is the only browser (see
+    docs/issues/remove_local_browser_fallback.md). A reintroduced import
+    would put a JS-executing engine back inside the credential-holding
+    agent pod.
+    """
 
-class TestBrowserToolsMetadata:
-    """Tests for browser tools metadata."""
-
-    def test_autonomous_tools_deprecated(self):
-        from src.tools.research.browser import BROWSER_TOOLS_METADATA
-
-        # browse_website / download_from_website were deprecated in favor of the
-        # direct browser_* tools. See docs/features/browser_workspace_executor.md.
-        assert BROWSER_TOOLS_METADATA == {}
-
-    def test_metadata_category(self):
-        from src.tools.research.browser import BROWSER_TOOLS_METADATA
-
-        for name, meta in BROWSER_TOOLS_METADATA.items():
-            assert meta["category"] == "research"
-
-    def test_metadata_phases(self):
-        from src.tools.research.browser import BROWSER_TOOLS_METADATA
-
-        for name, meta in BROWSER_TOOLS_METADATA.items():
-            assert "tactical" in meta["phases"]
-
-
-class TestGetBrowserConfig:
-    """Tests for _get_browser_config helper."""
-
-    def test_default_config(self, mock_tool_context, temp_docs_dir):
-        from src.tools.research.browser import _get_browser_config
-
-        mock_tool_context.config = {"browser": {}, "research": {"proxy": {}}}
-
-        with patch.dict("os.environ", {}, clear=True):
-            config = _get_browser_config(mock_tool_context)
-
-        assert config["headless"] is True
-        assert config["accept_downloads"] is True
-        assert config["auto_download_pdfs"] is True
-
-    def test_headless_from_env(self, mock_tool_context):
-        from src.tools.research.browser import _get_browser_config
-
-        mock_tool_context.config = {"browser": {}, "research": {"proxy": {}}}
-
-        with patch.dict("os.environ", {"BROWSER_HEADLESS": "false"}, clear=True):
-            config = _get_browser_config(mock_tool_context)
-
-        assert config["headless"] is False
-
-    def test_headless_from_config(self, mock_tool_context):
-        from src.tools.research.browser import _get_browser_config
-
-        mock_tool_context.config = {
-            "browser": {"headless": False},
-            "research": {"proxy": {}},
-        }
-
-        with patch.dict("os.environ", {}, clear=True):
-            config = _get_browser_config(mock_tool_context)
-
-        assert config["headless"] is False
-
-    def test_custom_downloads_path(self, mock_tool_context, temp_docs_dir):
-        from src.tools.research.browser import _get_browser_config
-
-        mock_tool_context.config = {"browser": {}, "research": {"proxy": {}}}
-        custom_path = temp_docs_dir / "custom_downloads"
-
-        with patch.dict("os.environ", {}, clear=True):
-            config = _get_browser_config(mock_tool_context, downloads_path=custom_path)
-
-        assert config["downloads_path"] == str(custom_path)
-        assert custom_path.exists()
-
-
-class TestFindNewFiles:
-    """Tests for _find_new_files helper."""
-
-    def test_finds_recent_files(self, temp_docs_dir):
-        from src.tools.research.browser import _find_new_files
-
-        # Create a file
-        (temp_docs_dir / "test.pdf").write_bytes(b"content")
-
-        files = _find_new_files(temp_docs_dir, max_age_seconds=60)
-        assert len(files) == 1
-        assert files[0].name == "test.pdf"
-
-    def test_ignores_old_files(self, temp_docs_dir):
-        import os
-
-        from src.tools.research.browser import _find_new_files
-
-        # Create a file and backdate it
-        path = temp_docs_dir / "old.pdf"
-        path.write_bytes(b"content")
-        old_time = time.time() - 120
-        os.utime(path, (old_time, old_time))
-
-        files = _find_new_files(temp_docs_dir, max_age_seconds=60)
-        assert len(files) == 0
-
-    def test_returns_newest_first(self, temp_docs_dir):
-        from src.tools.research.browser import _find_new_files
-
-        (temp_docs_dir / "first.pdf").write_bytes(b"a")
-        time.sleep(0.05)
-        (temp_docs_dir / "second.pdf").write_bytes(b"b")
-
-        files = _find_new_files(temp_docs_dir, max_age_seconds=60)
-        assert files[0].name == "second.pdf"
-
-    def test_empty_directory(self, temp_docs_dir):
-        from src.tools.research.browser import _find_new_files
-
-        files = _find_new_files(temp_docs_dir, max_age_seconds=60)
-        assert files == []
-
-    def test_nonexistent_directory(self):
-        from src.tools.research.browser import _find_new_files
-
-        files = _find_new_files(Path("/nonexistent/directory"), max_age_seconds=60)
-        assert files == []
-
-
-# ── Remote browser (CDP) tests ────────────────────────────────────
-
-
-class TestIsRemoteBrowser:
-    """Tests for _is_remote_browser detection."""
-
-    def test_returns_true_for_remote_backend(self, mock_remote_tool_context):
-        from src.tools.research.browser import _is_remote_browser
-
-        assert _is_remote_browser(mock_remote_tool_context) is True
-
-    def test_returns_false_for_local_backend(self, mock_tool_context):
-        from src.tools.research.browser import _is_remote_browser
-
-        mock_tool_context.config = {"browser": {}}
-        assert _is_remote_browser(mock_tool_context) is False
-
-    def test_returns_false_when_forced_local(self, mock_remote_tool_context):
-        from src.tools.research.browser import _is_remote_browser
-
-        mock_remote_tool_context.config = {"browser": {"remote": "local"}}
-        assert _is_remote_browser(mock_remote_tool_context) is False
-
-    def test_returns_false_without_workspace(self):
-        from src.tools.context import ToolContext
-        from src.tools.research.browser import _is_remote_browser
-
-        ctx = MagicMock(spec=ToolContext)
-        ctx.has_workspace.return_value = False
-        ctx.config = {"browser": {}}
-        assert _is_remote_browser(ctx) is False
-
-
-class TestStartRemoteChromium:
-    """Tests for _start_remote_chromium lifecycle."""
-
-    def test_starts_chromium_and_returns_ws_url(self, mock_remote_backend):
-        from src.tools.research.browser import _start_remote_chromium
-
-        url = _start_remote_chromium(
-            mock_remote_backend,
-            "/home/agent-host/workspace/documents",
+    def test_browser_use_not_imported_under_src(self):
+        src_root = Path(__file__).resolve().parents[3] / "src"
+        pattern = re.compile(r"^\s*(?:from|import)\s+browser_use", re.MULTILINE)
+        offenders = sorted(
+            str(path.relative_to(src_root))
+            for path in src_root.rglob("*.py")
+            if pattern.search(path.read_text(encoding="utf-8"))
         )
-
-        assert url.startswith("ws://10.42.0.50:9222/")
-        assert "abc-def" in url
-
-        # Verify pkill was called first (cleanup)
-        first_call = mock_remote_backend.exec_command.call_args_list[0]
-        assert "pkill" in first_call[0][0]
-
-        # Verify the Playwright Chromium symlink was launched
-        second_call = mock_remote_backend.exec_command.call_args_list[1]
-        assert "agent-chromium" in second_call[0][0]
-        assert "--remote-debugging-port=9222" in second_call[0][0]
-        assert "--headless=new" in second_call[0][0]
-
-    def test_replaces_localhost_with_host(self, mock_remote_backend):
-        from src.tools.research.browser import _start_remote_chromium
-
-        url = _start_remote_chromium(mock_remote_backend, "/tmp/docs")
-
-        assert "127.0.0.1" not in url
-        assert "localhost" not in url
-        assert "10.42.0.50" in url
-
-    def test_raises_on_timeout(self, mock_remote_backend):
-        from src.tools.research.browser import _start_remote_chromium
-
-        # Make exec_command return empty for the curl polls
-        call_count = [0]
-
-        def side_effect(cmd, timeout=30):
-            call_count[0] += 1
-            if "pkill" in cmd or "nohup" in cmd:
-                return ""
-            # curl polls return nothing useful
-            return ""
-
-        mock_remote_backend.exec_command = MagicMock(side_effect=side_effect)
-
-        with pytest.raises(RuntimeError, match="Chromium failed to start"):
-            _start_remote_chromium(mock_remote_backend, "/tmp/docs")
-
-
-class TestStopRemoteChromium:
-    """Tests for _stop_remote_chromium."""
-
-    def test_sends_pkill(self, mock_remote_backend):
-        from src.tools.research.browser import _stop_remote_chromium
-
-        _stop_remote_chromium(mock_remote_backend)
-
-        mock_remote_backend.exec_command.assert_called_once()
-        assert "pkill" in mock_remote_backend.exec_command.call_args[0][0]
-
-    def test_swallows_exceptions(self, mock_remote_backend):
-        from src.tools.research.browser import _stop_remote_chromium
-
-        mock_remote_backend.exec_command.side_effect = Exception("SSH down")
-        _stop_remote_chromium(mock_remote_backend)  # Should not raise
-
-
-class TestFindNewFilesRemote:
-    """Tests for _find_new_files_remote."""
-
-    def test_finds_recent_files(self, mock_remote_backend):
-        from src.tools.research.browser import _find_new_files_remote
-
-        mock_remote_backend.exec_command.return_value = (
-            "1712000000.0 /home/agent-host/workspace/documents/paper.pdf\n"
-            "1711999000.0 /home/agent-host/workspace/documents/data.csv\n"
+        assert offenders == [], (
+            f"browser_use must not be imported in the agent runtime: {offenders}"
         )
-
-        files = _find_new_files_remote(mock_remote_backend, "documents")
-
-        assert len(files) == 2
-        assert files[0] == "documents/paper.pdf"
-        assert files[1] == "documents/data.csv"
-
-    def test_returns_empty_on_no_files(self, mock_remote_backend):
-        from src.tools.research.browser import _find_new_files_remote
-
-        mock_remote_backend.exec_command.return_value = ""
-
-        files = _find_new_files_remote(mock_remote_backend, "documents")
-        assert files == []
-
-    def test_returns_empty_on_error(self, mock_remote_backend):
-        from src.tools.research.browser import _find_new_files_remote
-
-        mock_remote_backend.exec_command.side_effect = Exception("SSH error")
-
-        files = _find_new_files_remote(mock_remote_backend, "documents")
-        assert files == []
-
-
-class TestGetBrowserConfigRemote:
-    """Tests for _get_browser_config with remote backend."""
-
-    def test_returns_cdp_url_for_remote_backend(self, mock_remote_tool_context):
-        from src.tools.research.browser import _get_browser_config
-
-        config = _get_browser_config(mock_remote_tool_context)
-
-        assert "cdp_url" in config
-        assert config["cdp_url"].startswith("ws://10.42.0.50:9222/")
-        # Should NOT contain local browser keys
-        assert "headless" not in config
-        assert "downloads_path" not in config
-
-    def test_local_override_returns_local_config(
-        self, mock_remote_tool_context, temp_docs_dir
-    ):
-        from src.tools.research.browser import _get_browser_config
-
-        mock_remote_tool_context.config = {
-            "browser": {"remote": "local"},
-            "research": {"proxy": {}},
-        }
-        # Make get_path return a real path so mkdir works
-        mock_remote_tool_context.workspace_manager.get_path.return_value = (
-            temp_docs_dir / "documents"
-        )
-
-        with patch.dict("os.environ", {}, clear=True):
-            config = _get_browser_config(mock_remote_tool_context)
-
-        assert "headless" in config
-        assert "cdp_url" not in config
-
-    def test_ensures_documents_dir_on_remote(self, mock_remote_tool_context):
-        from src.tools.research.browser import _get_browser_config
-
-        _get_browser_config(mock_remote_tool_context)
-
-        backend = mock_remote_tool_context.workspace_manager.backend
-        backend.mkdir.assert_called_with("documents")
 
 
 # ── Workflow tools tests ───────────────────────────────────────────

@@ -226,11 +226,6 @@ class TestDownloadPaper:
                 new_callable=AsyncMock,
                 return_value=DownloadResult(success=False, error="Not found"),
             ),
-            patch(
-                "src.tools.research.papers._try_browser_download",
-                new_callable=AsyncMock,
-                return_value=None,
-            ),
         ):
             result = await download_paper.ainvoke(
                 {"identifier": "10.1038/test", "identifier_type": "doi"}
@@ -261,11 +256,6 @@ class TestDownloadPaper:
                     error="No OA PDF",
                     paper=paywalled_paper,
                 ),
-            ),
-            patch(
-                "src.tools.research.papers._try_browser_download",
-                new_callable=AsyncMock,
-                return_value=None,
             ),
         ):
             result = await download_paper.ainvoke(
@@ -299,60 +289,6 @@ class TestDownloadPaper:
             )
 
         assert "Downloaded" in result
-
-    @pytest.mark.asyncio
-    async def test_download_browser_fallback(self, mock_tool_context):
-        tools = create_paper_tools(mock_tool_context)
-        download_paper = next(t for t in tools if t.name == "download_paper")
-
-        with (
-            patch(
-                "src.tools.research.papers._try_unpaywall_download",
-                new_callable=AsyncMock,
-                return_value=DownloadResult(success=False, error="No OA"),
-            ),
-            patch(
-                "src.tools.research.papers._try_browser_download",
-                new_callable=AsyncMock,
-                return_value="Downloaded via browser: test.pdf\nPath: /tmp/test.pdf\nSize: 1,234 bytes",
-            ),
-        ):
-            result = await download_paper.ainvoke(
-                {
-                    "identifier": "10.1038/test",
-                    "identifier_type": "doi",
-                    "use_browser_fallback": True,
-                }
-            )
-
-        assert "browser" in result.lower()
-
-    @pytest.mark.asyncio
-    async def test_download_browser_fallback_disabled(self, mock_tool_context):
-        tools = create_paper_tools(mock_tool_context)
-        download_paper = next(t for t in tools if t.name == "download_paper")
-
-        with (
-            patch(
-                "src.tools.research.papers._try_unpaywall_download",
-                new_callable=AsyncMock,
-                return_value=DownloadResult(success=False, error="No OA"),
-            ),
-            patch(
-                "src.tools.research.papers._try_browser_download",
-                new_callable=AsyncMock,
-            ) as mock_browser,
-        ):
-            result = await download_paper.ainvoke(
-                {
-                    "identifier": "10.1038/test",
-                    "identifier_type": "doi",
-                    "use_browser_fallback": False,
-                }
-            )
-
-        mock_browser.assert_not_called()
-        assert "Could not download" in result
 
 
 class TestGetPaperInfo:

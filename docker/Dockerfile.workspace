@@ -157,7 +157,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 # 2b. Chromium via Playwright (replaces apt chromium-browser, which on Ubuntu
 #     Noble is a snap shim — see docker/agent-vm-base/scripts/provision-stage1.sh).
 #     PLAYWRIGHT_VERSION must match .playwright-version (also consumed by
-#     provision.sh and requirements.txt). Path matches Dockerfile.agent:80.
+#     provision.sh). The agent image has no Playwright/Chromium at all.
 # ---------------------------------------------------------------------------
 ARG PLAYWRIGHT_VERSION=1.59.0
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \

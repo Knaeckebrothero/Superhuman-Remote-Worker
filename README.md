@@ -531,7 +531,6 @@ pip install -r requirements.txt
 # System dependencies (Fedora)
 sudo dnf install poppler-utils         # PDF rendering
 # Debian/Ubuntu: sudo apt-get install poppler-utils
-playwright install chromium            # Browser-based research
 ```
 
 ### 2. Configure Environment

@@ -59,7 +59,7 @@ def mock_tool_context(mock_workspace_manager):
 
 @pytest.fixture
 def mock_remote_backend():
-    """Create a mock RemoteBackend for CDP browser tests."""
+    """Create a mock remote (SSH-shaped) workspace backend."""
     backend = MagicMock()
     backend.host = "10.42.0.50"
     backend.root = "/home/agent-host/workspace"
@@ -68,9 +68,7 @@ def mock_remote_backend():
     )
     backend.mkdir = MagicMock()
     backend.stat = MagicMock(return_value=1024)
-    backend.exec_command = MagicMock(
-        return_value='{"webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/browser/abc-def"}'
-    )
+    backend.exec_command = MagicMock(return_value="")
     return backend
 
 
