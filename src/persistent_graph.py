@@ -314,6 +314,7 @@ async def run_persistent_loop(
     initial_turn_count: int = 0,
     get_current_tools: Optional[Callable[[], tuple]] = None,
     memory_extraction_prompt: str = "",
+    memory_service: Optional[Any] = None,
 ) -> None:
     """Run the persistent interactive agent loop.
 
@@ -340,6 +341,10 @@ async def run_persistent_loop(
         memory_extraction_prompt: Matrix-resolved prompt for the background
             memory-extraction task, threaded from session setup (MemoryConfig
             carries no prompt attribute — docs/issues/memory_bugs.md B1).
+        memory_service: MemoryManager seam (src.services.memory) — when
+            bound (memory.manager.enabled), the in-loop extraction and the
+            per-turn retrieval/injection route through it instead of the
+            direct-store paths (memory overhaul Phase 1 cutover).
     """
     # Build tool lookup map
     tool_map: Dict[str, Any] = {tool.name: tool for tool in tools}
@@ -408,6 +413,7 @@ async def run_persistent_loop(
                 project_id=project_id,
                 project_ids=project_ids,
                 tool_context=tool_context,
+                memory_service=memory_service,
             )
             tool_calls_this_turn = result.tool_calls_made
         except asyncio.CancelledError:
@@ -417,8 +423,23 @@ async def run_persistent_loop(
             logger.exception(f"Error in turn {turn_id}")
             await callbacks.on_error(str(e))
 
-        # Memory extraction every N turns (fire-and-forget)
-        if (
+        # Memory extraction every N turns (fire-and-forget).
+        # Manager path (memory overhaul Phase 1): one turn_end capture —
+        # the persistent_interval_extractor writer reproduces the elapsed
+        # gate, the fixed window, and the extraction call below.
+        if memory_service is not None:
+            from .services.memory import CaptureEvent
+
+            asyncio.create_task(
+                memory_service.capture(
+                    CaptureEvent(
+                        kind="turn_end",
+                        messages=messages,
+                        turn_count=turn_count,
+                    )
+                )
+            )
+        elif (
             recall_store
             and auxiliary_llm
             and extraction_interval > 0
@@ -504,6 +525,7 @@ async def _execute_turn(
     project_id: Optional[str] = None,
     project_ids: Optional[List[str]] = None,
     tool_context: Optional[Any] = None,
+    memory_service: Optional[Any] = None,
 ) -> TurnResult:
     """Execute a single turn: LLM call -> tool calls -> repeat until done.
 
@@ -531,7 +553,34 @@ async def _execute_turn(
     # Memory/knowledge retrieval with timeout — must never block the LLM call
     _RETRIEVAL_TIMEOUT = 5  # seconds
 
-    if recall_store:
+    # MemoryManager seam read path (memory overhaul Phase 1 cutover): one
+    # assemble() replaces the two direct-store blocks below, which stay
+    # byte-identical for the flag-off path (pinned by
+    # tests/test_memory_persistent_equivalence.py). The per-store 5 s guard
+    # lives in the manager's runtime (retrieval_timeout).
+    manager_injection: List[BaseMessage] = []
+    if memory_service is not None:
+        from .services.memory import AssembleRequest
+        from .services.memory.plugins.legacy import build_persistent_query_text
+
+        _payload = await memory_service.assemble(
+            AssembleRequest(
+                query_text=build_persistent_query_text(messages),
+                model=getattr(config.llm, "model", None),
+            )
+        )
+        manager_injection = _payload.messages()
+        for _block in _payload.blocks:
+            if _block.kind == "memory" and _block.items:
+                logger.debug(
+                    f"Memory injection: {len(_block.items)} memories retrieved"
+                )
+            elif _block.kind == "knowledge" and _block.items:
+                logger.debug(
+                    f"Knowledge injection: {len(_block.items)} notes retrieved"
+                )
+
+    if memory_service is None and recall_store:
         try:
             await asyncio.wait_for(
                 recall_store.decrement_ttl(), timeout=_RETRIEVAL_TIMEOUT
@@ -574,7 +623,7 @@ async def _execute_turn(
             )
 
     effective_pids = project_ids or ([project_id] if project_id else [])
-    if knowledge_store and effective_pids:
+    if memory_service is None and knowledge_store and effective_pids:
         try:
             import uuid as _uuid
 
@@ -624,6 +673,17 @@ async def _execute_turn(
             )
 
         prepared = list(messages)
+
+        # MemoryManager seam: insert the assembled pairs at the legacy
+        # position (after the system message). The same message objects are
+        # inserted each inner-loop iteration — pair ids are only
+        # prefix-checked downstream (documented Phase-1 delta vs the legacy
+        # fresh-pair-per-iteration below).
+        if manager_injection:
+            _inject_idx = (
+                1 if prepared and isinstance(prepared[0], SystemMessage) else 0
+            )
+            prepared[_inject_idx:_inject_idx] = manager_injection
 
         # Inject memory and knowledge as transient tool-call pairs
         if memory_block:

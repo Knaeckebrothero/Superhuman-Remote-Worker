@@ -25,7 +25,7 @@ Severity overview:
 | B8 | Neo4j-down kills pgvector-only KB injection too | LOW-MED | small | open |
 | B9 | Dead/misleading config keys (tuning no-ops) | LOW (hygiene) | ~1 h | **✅ keys deleted 2026-06-10** (PR #112) — enum nits still open |
 | B10 | Injection-strip prefix registry is silently fragile | LOW (latent) | test guard | open |
-| B11 | End-Session button (detach path) skips final extraction — only `/done` + idle extract | MED | small now / Phase-1 `capture()` properly | open (found 2026-06-10) |
+| B11 | End-Session button (detach path) skips final extraction — only `/done` + idle extract | MED | small now / Phase-1 `capture()` properly | wired slice 5, live-verified via archive route 2026-06-11; k8s ✕-route deletes the pod without detach → needs orchestrator-side follow-up |
 
 ---
 
@@ -173,6 +173,32 @@ when the loop didn't already archive (~the B1 pattern, one more call site).
 exists and handles `session_end`/`idle_archive` with the legacy gates and
 log lines; the `_terminate_session` call site gains its `capture()` at
 cutover (slice 5), which is when this bug actually closes.
+**✅ Wired 2026-06-11 (Phase-1 slice 5), effective at flag-on:**
+`_terminate_session_inner` now awaits a `capture(kind="session_end")` for
+ALL terminate reasons before `cleanup()` tears down the stores, guarded by
+the new `PersistentSession.final_memory_extracted` flag that
+`_handle_archive`/`_handle_idle_archive` set after their own captures — so
+archive→terminate never double-extracts
+(`tests/test_memory_cutover.py::TestTeardownWiring` pins exactly-once).
+Manager-mode only: while `memory.manager.enabled` is off the detach path
+keeps today's (skipping) behaviour, i.e. the bug fully closes when the flag
+flips.
+**Live-verify addendum (2026-06-11, Phase-1 closure step 1 on k3d):** the
+teardown writer + `capture(kind="session_end")` are live-verified through
+the archive route (thread `ee9c2df8`: "Memory extraction: extracted 3,
+stored 3" + "Final memory extraction complete", 3 observer rows in
+pgvector). BUT the ✕-button row in the table needs a Kubernetes
+correction: the orchestrator's `DELETE /api/persistent/threads/{id}`
+handler does NOT call agent `/session/detach` on the k8s provisioner path —
+it deletes the agent pod directly (66 ms handler; the agent keeps
+heartbeating through the 30 s grace period, then dies). `_terminate_session`
+never runs there, so no agent-side wiring can capture. The slice-5 capture
+closes every ending that actually reaches `_terminate_session` (idle
+timeout, loop crash, watchdog exits, drain/suspend, compose-mode detach —
+the `Terminate(...)` log lines confirm those paths fire). Fully closing the
+✕-route on k8s needs an orchestrator-side detach-then-delete (or a
+SIGTERM-path capture with terminationGracePeriod headroom) — follow-up,
+outside Phase 1.
 
 Related observation from the same investigation (cosmetic): `agents.status`
 can read `offline` for a pod that is Running but whose session app has
@@ -479,6 +505,15 @@ poisoning.
 constructors) and asserts `is_workspace_injection_message` recognizes each;
 fails loudly when someone adds a fourth injection type.
 
+**✅ Guard landed 2026-06-11 (Phase-1 slice 5):**
+`tests/test_memory_cutover.py::TestStripRecognitionB10` asserts every message
+`MemoryManager.assemble()` emits satisfies `is_workspace_injection_message`
+(the manager renders through the same `create_*_injection_messages`
+constructors, so the prefixes are shared by construction), and that
+unrenderable candidate kinds contribute provenance-only blocks with no
+messages. A fourth injection type that bypasses the recognized constructors
+now fails this test instead of silently summarizing.
+
 ---
 
 ## Cleanup (not bugs) — tracked elsewhere
@@ -520,6 +555,11 @@ tracked in its issue doc) and the equally-dead `_load_query` twins in
    (graph.py in-loop extract/assemble, phase boundary, compaction store,
    queued drain; persistent loop extraction; persistent_app teardowns) —
    any change to those legacy blocks must update the equivalence suites in
-   lockstep. B11's missing-extraction fix is staged: the `teardown_extractor`
-   writer exists and handles `session_end`; the `_terminate_session` call
-   site gains its `capture()` at cutover (slice 5).
+   lockstep (the slice-5 `memory_service is None` guard terms are the one
+   sanctioned delta). **Slice 5 (2026-06-11) wired the cutover** behind
+   `memory.manager.enabled` (ships off): B10's strip guard landed (see B10
+   status) and B11's terminate capture is wired, effective at flag-on (see
+   B11 status). B5 itself stays open by design — the KB block remains
+   uncapped for byte-equivalence; the policy stage where its `token_budget`
+   plugin will live now exists. Flag flip + soak + legacy-block deletion
+   remain.

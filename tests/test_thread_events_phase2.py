@@ -475,6 +475,7 @@ class TestAgentRestInputEndpointsNoSession:
             turn_count=0,
             postgres_conn=None,
             memory_extraction_prompt="",
+            memory_service=None,  # legacy path (manager flag off)
         )
 
         try:

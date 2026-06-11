@@ -87,8 +87,7 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONPATH=/app \
     AGENT_CONFIG=defaults \
-    AGENT_PORT=8001 \
-    PLAYWRIGHT_BROWSERS_PATH=/opt/playwright
+    AGENT_PORT=8001
 
 WORKDIR /app
 
@@ -135,18 +134,8 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
 COPY --from=builder /usr/local/bin /usr/local/bin
 
-# Playwright install. We mount /opt/playwright as a cache so the ~300 MB
-# Chromium + ~30 MB ffmpeg + ~250 MB headless-shell downloads survive
-# layer invalidation. The browsers themselves are then copied out of the
-# cache mount into the image at the end of this RUN — without the copy
-# they'd vanish with the mount when the layer commits.
-RUN --mount=type=cache,target=/var/playwright-cache,sharing=locked \
-    --mount=type=cache,target=/var/cache/apt,sharing=locked \
-    --mount=type=cache,target=/var/lib/apt,sharing=locked \
-    PLAYWRIGHT_BROWSERS_PATH=/var/playwright-cache \
-    playwright install --with-deps chromium && \
-    mkdir -p /opt/playwright && \
-    cp -an /var/playwright-cache/. /opt/playwright/
+# No browser in the agent image — Chromium lives on the workspace image only
+# (browser-exec daemon). See docs/issues/remove_local_browser_fallback.md.
 
 # Source code LAST — these three COPYs are what Tilt's docker_build
 # `only=` list pins to.

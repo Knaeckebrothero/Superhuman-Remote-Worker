@@ -56,26 +56,43 @@ migration plan live in [[agent_memory_overhaul]].
 > - **Aux logging**: the four memory catches in `auxiliary.py` now log
 >   `type(e).__name__`, so openai-style exceptions no longer log as empty strings.
 >
-> **Phase-1 seam deltas (2026-06-11, slices 1–4 on develop).** Production behaviour
-> is unchanged (cutover flag `memory.manager.enabled` off, both graphs untouched),
-> but two things change how this snapshot should be read:
-> - A parallel implementation of the full memory path now exists in
+> **Phase-1 seam deltas (2026-06-11, slices 1–5 on develop; closure step 1
+> PASSED on k3d the same day).** The cutover flag `memory.manager.enabled` is
+> flipped **on** in both defaults files (closure step 2) after the live k3d
+> verify — see "Step-1 execution findings" in the overhaul doc's closure
+> runbook for the evidence and the three catches (dispatch round-trip flag
+> loss, fixed in `_parse_memory_config`; session config_name plumbing holes →
+> `docs/issues/session_config_name_plumbing.md`; k8s thread-DELETE bypasses
+> `_terminate_session` → memory_bugs.md B11 addendum). Three things change how
+> this snapshot should be read:
+> - A parallel implementation of the full memory path exists in
 >   `src/services/memory/`: MemoryManager kernel, the `recall_two_tier`/`kb_notes`
 >   read plugins + transplanted injection mechanics, and seven capture writers
 >   (`plugins/legacy_writers.py`) covering every write site this doc catalogs —
 >   including the compaction-summary store and the todo_complete queue drain.
->   Nothing in production constructs it yet.
-> - **The audited read AND write paths are now fixture-pinned**: the read blocks
->   (graph.py:888-1037, persistent_graph.py:527-659) and the write sites
->   (graph.py:1528-1606 in-loop extract/assemble, :2037-2054 phase boundary,
->   :842-860 compaction store, :3438-3444 queued drain;
->   persistent_graph.py:420-443 loop extraction; the persistent_app.py
+> - **Slice 5 wired the cutover**: both graphs construct the manager behind the
+>   flag (`build_phase_alternation_graph` / `PersistentSession._setup_memory`,
+>   instance named `memory_service` — `memory_manager` is the vestigial
+>   workspace.md manager) and every legacy block gained a
+>   `memory_service is None` guard term with the manager branch alongside.
+>   With the flag on, reads go through `assemble()` (payload spliced at the
+>   legacy positions) and the write sites emit `capture()` events; B11's
+>   missing detach extraction is fixed by a guarded `capture(session_end)` in
+>   `_terminate_session_inner`. The per-mode pipelines ship in
+>   `config/defaults.yaml` + `config/persistent_defaults.yaml`. Wiring is
+>   pinned by `tests/test_memory_cutover.py` (20 cases, incl. the B10
+>   strip-recognition guard and the dispatch round-trip regression).
+> - **The audited read AND write paths remain fixture-pinned**: the read blocks
+>   (graph.py execute node, persistent_graph.py `_execute_turn`) and the write
+>   sites (worker in-loop extract/assemble, phase boundary, compaction store,
+>   queued drain; persistent loop extraction; the persistent_app.py
 >   archive/idle teardowns) are reproduced verbatim and compared against the
 >   seam in `tests/test_memory_worker_equivalence.py`,
 >   `tests/test_memory_persistent_equivalence.py`, and
->   `tests/test_memory_capture_equivalence.py`. Until cutover those legacy
->   blocks are frozen-and-enforced — any change there must update the
->   equivalence suites in lockstep.
+>   `tests/test_memory_capture_equivalence.py`. Until the flag flips and the
+>   legacy blocks are deleted, they stay frozen-and-enforced — any change
+>   there must update the equivalence suites in lockstep (the slice-5 guard
+>   terms are the one sanctioned delta).
 
 Classification legend:
 
