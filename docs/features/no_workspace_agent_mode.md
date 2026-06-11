@@ -29,8 +29,12 @@ image drops Playwright/Chromium entirely; also completed
 shell-capable backend; agent image drops tmux/libtmux). §9.4 clone audit
 **done 2026-06-11** — finding: the worker path WAS reachable (unfiltered
 datasources, clone into agent CWD); local branches removed, unified
-backend-only helper (§7). Remaining prereq: §9.1 egress NetworkPolicy
-(S4). S1-S3 not started.
+backend-only helper (§7). §9.1 egress NetworkPolicy (S4) **implemented
+2026-06-11, ships default-off** — policy + values + enablement checklist
+(`agent_egress_networkpolicy_enablement.md`); per-deployment enablement
+(verify LLM/Keycloak egress, add carve-outs, stage on dev) is the open
+follow-up. All four §9 prerequisites now landed in code; S1-S3 (the lite
+backends themselves) not started.
 
 ## 1. Goal
 
@@ -301,6 +305,20 @@ Ship with (or before) v1:
    RFC1918/link-local/metadata. Valuable independent of lite mode; lite mode
    makes it a prerequisite. BYO datasources pointing at private ranges remain
    a per-tenant tiering question (multi-tenancy M1.D), unchanged.
+   **IMPLEMENTED 2026-06-11, ships default-off** (S4):
+   `helm/templates/agent/network-policy.yaml` + `agent.networkPolicy` values.
+   Single policy (agents are control plane, not a tenant boundary — no
+   tiers), selecting both `srw-agent`/`srw-persistent-agent` via
+   `matchExpressions In`. Allows the in-cluster deps by podSelector
+   (orchestrator 8085, NATS 4222, pg/pgvector 5432, neo4j 7688, mongo 27017,
+   nextcloud 80 / opencloud 9200, workspace SSH 30022 + CDP 9222), kube-dns,
+   and internet 80/443/22 minus the `except` CIDRs; `extraEgress` carries
+   per-deployment RFC1918 LLM/Keycloak/cloud carve-outs. External
+   LLM/Keycloak/Tavily work over the 443 wildcard with no config. Default-off
+   because flipping it on against a live cluster with an RFC1918 LLM endpoint
+   would break model access — **enablement is a per-deployment checklist**:
+   `docs/issues/agent_egress_networkpolicy_enablement.md` (discovery recipe +
+   stage-on-dev-first). Helm-lints clean in both CI scenarios.
 2. **Local-browser fallback removal** —
    `docs/issues/remove_local_browser_fallback.md` (filed 2026-06-10).
    **DONE 2026-06-11**: local path deleted, `browser_exec` errors loudly
@@ -371,7 +389,9 @@ observed demand.
 - **S3 — config/profile (~0.5 day):** lite expert/profile config (tool
   lists, `git_versioning: false`), lite instruction template, docs.
 - **S4 — egress NetworkPolicy (~0.5 day, parallel):** independent PR,
-  protects full mode too.
+  protects full mode too. **DONE 2026-06-11 (ships default-off)** — see §9.1;
+  per-deployment enablement tracked in
+  `agent_egress_networkpolicy_enablement.md`.
 
 ~2-3 days to a k3d-verified slice (S1-S3); S4 parallel.
 
