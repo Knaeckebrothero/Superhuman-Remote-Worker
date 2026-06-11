@@ -17,11 +17,12 @@ from services.workspace_lifecycle import (
     WorkspaceOwner,
     ensure_workspace,
 )
+from src.core.backends.factory import LITE_BACKENDS
 
 logger = logging.getLogger(__name__)
 
 
-def _ws_status(thread: dict) -> Optional[str]:
+def _thread_metadata(thread: dict) -> dict:
     md = thread.get("metadata") or {}
     if isinstance(md, str):
         # md is a non-empty string here ("" was already coerced to {} above).
@@ -29,7 +30,20 @@ def _ws_status(thread: dict) -> Optional[str]:
             md = json.loads(md)
         except (json.JSONDecodeError, TypeError):
             md = {}
-    return (md.get("workspace_container") or {}).get("status")
+    return md if isinstance(md, dict) else {}
+
+
+def _ws_status(thread: dict) -> Optional[str]:
+    return (_thread_metadata(thread).get("workspace_container") or {}).get("status")
+
+
+def _thread_backend(thread: dict) -> Optional[str]:
+    """The thread's configured ``workspace.backend`` (stored in
+    ``metadata.config_override``), or None when unset."""
+    co = _thread_metadata(thread).get("config_override") or {}
+    if not isinstance(co, dict):
+        return None
+    return (co.get("workspace") or {}).get("backend")
 
 
 async def ensure_session_workspace(
@@ -39,6 +53,15 @@ async def ensure_session_workspace(
     the thread is gone or ended (nothing to do)."""
     thread = await db.get_thread(thread_id)
     if not thread or thread.get("status") == "ended":
+        return None
+    if _thread_backend(thread) in LITE_BACKENDS:
+        # virtual/none sessions run with no workspace pod (no_workspace_agent_mode.md
+        # §4) — nothing to provision or reconcile. Centralized here so both the
+        # resume path and the periodic reconcile sweep skip lite threads.
+        logger.debug(
+            "session %s uses a lite workspace backend — no workspace to provision",
+            thread_id,
+        )
         return None
     return await ensure_workspace(
         WorkspaceOwner.session(thread_id),

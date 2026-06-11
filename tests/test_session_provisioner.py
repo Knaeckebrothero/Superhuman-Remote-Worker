@@ -142,6 +142,47 @@ async def test_reconcile_survives_one_thread_failing():
 
 
 @pytest.mark.asyncio
+async def test_ensure_skips_lite_backend_thread():
+    """A virtual/none session runs with no workspace pod (no_workspace_agent_mode.md
+    §4) — ensure must no-op rather than provision one."""
+    db = AsyncMock()
+    db.get_thread = AsyncMock(
+        return_value={
+            "id": "t1",
+            "status": "active",
+            "metadata": {
+                "config_override": {"workspace": {"backend": "virtual"}},
+            },
+        }
+    )
+    prov = AsyncMock()
+    res = await ensure_session_workspace(
+        "t1", db=db, provisioner=prov, suspension=AsyncMock()
+    )
+    assert res is None
+    prov.create_workspace.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_ensure_skips_lite_backend_thread_str_metadata():
+    """Same skip when metadata arrives as a JSON string (asyncpg JSONB)."""
+    db = AsyncMock()
+    db.get_thread = AsyncMock(
+        return_value={
+            "id": "t1",
+            "status": "active",
+            "metadata": '{"config_override": {"workspace": {"backend": "none"}}}',
+        }
+    )
+    prov = AsyncMock()
+    res = await ensure_session_workspace(
+        "t1", db=db, provisioner=prov, suspension=AsyncMock()
+    )
+    assert res is None
+    prov.create_workspace.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_suspended_workspace_status_fires_restore():
     """An active thread whose workspace is 'suspended' is restored (fire-and-forget),
     not recreated."""

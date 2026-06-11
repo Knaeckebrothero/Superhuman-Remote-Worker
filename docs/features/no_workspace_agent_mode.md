@@ -44,10 +44,25 @@ keyed on `workspace.backend` (`factory.py`), config support (`virtual`/`none`
 + `mounts` in loader `WorkspaceConfig`, resume-safe via `asdict`), the
 worker + session bootstrap seams (lite branch, git forced off per §8), and
 rclone in the agent image. The full WorkspaceBackend contract is exercised
-over the in-memory store. **Not yet exercised end-to-end** — that needs S2
-(an orchestrator that dispatches a `virtual`/`none` job) and a real object
-store. **S2** (orchestrator dispatch/skip-provisioning/validation/values) and
-**S3** (lite profile + instruction template) remain.
+over the in-memory store.
+
+**S2 (orchestrator side) implemented 2026-06-11** — the dispatch/session seams
+now skip workspace provisioning for `virtual`/`none` (`_job_needs_sandbox`
+short-circuits; the two eager session `create_workspace` sites and
+`ensure_session_workspace` skip lite threads), emit the §4 `mounts` payload (one
+shared `_inject_lite_workspace_config` helper drives both job dispatch and
+`_send_session_attach`; credentials sourced from deployment env, in-flight only,
+never persisted), reject `repository` datasources on a lite tier (HTTP 400 at
+`create_job`, fail-job at dispatch), and carry Helm values for the object store
+(`virtualWorkspace.rclone.*` → `VIRTUAL_WORKSPACE_RCLONE_TYPE/ROOT/CONFIG`;
+type/root via ConfigMap, the credential JSON via the bundled Secret). A
+contract-roundtrip test feeds the orchestrator-emitted payload straight into the
+agent's `create_lite_backend` and round-trips a file, so S1 and S2 are proven to
+agree without a cluster. **Local-dev story decided** (§13): dev/k3d uses the
+`memory` object store (set in `deployment/values-tilt.yaml`; non-durable,
+single-pod, no MinIO dependency); production points `virtualWorkspace.rclone`
+at MinIO S3. **Still not exercised on a real cluster** — that's the k3d smoke
+(§12). **S3** (lite profile + instruction template) remains.
 
 ## 1. Goal
 
@@ -402,11 +417,16 @@ observed demand.
   (`persistent_session.py`) bootstrap seams (lite branch; git forced off per
   §8), rclone in the agent image, libtmux hard-off (done in §9.3). 177 unit
   tests; not yet exercised end-to-end (needs S2 + a real object store).
-- **S2 — orchestrator side (~0.5-1 day):** `workspace.backend` enum
-  extension, skip-provisioning branches in job dispatch + session prepare,
-  payload emission (S3 prefix + creds from deployment config),
-  repository-datasource validation, Helm values for the object-store
-  endpoint (decide local-dev story here).
+- **S2 — orchestrator side (~0.5-1 day): DONE 2026-06-11.** `workspace.backend`
+  enum extension (shared `LITE_BACKENDS`, imported not re-declared),
+  skip-provisioning branches in job dispatch (`_job_needs_sandbox`) + session
+  prepare (eager `create_workspace` sites + `ensure_session_workspace`), payload
+  emission (per-owner prefix + creds from deployment config, in-flight only) via
+  the shared `_inject_lite_workspace_config`, repository-datasource validation
+  (400 at create, fail-job at dispatch), Helm values for the object-store
+  endpoint (`virtualWorkspace.rclone.*`). Local-dev story decided: `memory`
+  store in dev/k3d (`values-tilt.yaml`), MinIO S3 in prod. Unit + contract-
+  roundtrip tests green; not yet run on a real cluster (the §12 k3d smoke).
 - **S3 — config/profile (~0.5 day):** lite expert/profile config (tool
   lists, `git_versioning: false`), lite instruction template, docs.
 - **S4 — egress NetworkPolicy (~0.5 day, parallel):** independent PR,
@@ -453,8 +473,15 @@ start immediately. v1 requires no Cockpit changes — the tier is selected via
 - ~~**rclone subprocess vs boto3** for the backend's op layer~~ — **resolved
   (S1): rclone**, behind the swappable `ObjectStore` seam (§5). boto3 stays a
   drop-in alternative if the v1.1 latency revisit favors it.
-- **Local k3d object store:** dev-only MinIO vs WebDAV remote against the
-  bundled cloud (S2).
+- ~~**Local k3d object store:** dev-only MinIO vs WebDAV remote against the
+  bundled cloud (S2).~~ — **resolved (S2): the `memory` object store** in
+  dev/k3d (`deployment/values-tilt.yaml` sets `virtualWorkspace.rclone.type:
+  memory`). It's a non-durable, in-process store: a `virtual` job/session runs
+  as a single pod and round-trips files within the agent's lifetime, with no
+  MinIO dependency — enough for the §12 smoke. A dev MinIO or WebDAV-against-
+  bundled-cloud remains a drop-in (`type`+`config`) for when durability or
+  external inspection (`rclone lsjson`/`mc ls`) is wanted. Production uses
+  `type: s3` against MinIO.
 
 ## 14. Decision summary
 
