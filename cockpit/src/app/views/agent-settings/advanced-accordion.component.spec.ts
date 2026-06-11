@@ -96,3 +96,62 @@ describe('AdvancedAccordionComponent — VM permission', () => {
     });
   });
 });
+
+describe('AdvancedAccordionComponent — lite workspace gating', () => {
+  it('isLiteBackend / isNoneBackend track the selected backend', () => {
+    const {component} = createComponent({is_admin: true});
+    // Empty config resolves to the 'sandbox' default.
+    expect(component.isLiteBackend()).toBe(false);
+    expect(component.isNoneBackend()).toBe(false);
+
+    component.workspaceBackend.set('vm');
+    expect(component.isLiteBackend()).toBe(false);
+
+    component.workspaceBackend.set('virtual');
+    expect(component.isLiteBackend()).toBe(true);
+    expect(component.isNoneBackend()).toBe(false);
+
+    component.workspaceBackend.set('none');
+    expect(component.isLiteBackend()).toBe(true);
+    expect(component.isNoneBackend()).toBe(true);
+  });
+
+  it('omits shell/git/browser overrides for a virtual backend but keeps file limits', () => {
+    const {component} = createComponent({is_admin: true});
+    component.workspaceBackend.set('virtual');
+    component.gitVersioning.set(true);
+    component.shellMode.set('persistent');
+    component.browserVision.set(true);
+    component.maxReadWords.set(5000);
+
+    const o = component.getOverrides() as Record<string, any>;
+    expect(o['workspace'].backend).toBe('virtual');
+    expect(o['workspace'].git_versioning).toBeUndefined();
+    expect(o['workspace'].max_read_words).toBe(5000); // virtual keeps file tools
+    expect(o['shell']).toBeUndefined();
+    expect(o['browser']).toBeUndefined();
+  });
+
+  it('omits file-size limits for a none backend', () => {
+    const {component} = createComponent({is_admin: true});
+    component.workspaceBackend.set('none');
+    component.maxReadWords.set(5000);
+    component.maxWriteWords.set(2000);
+
+    const o = component.getOverrides() as Record<string, any>;
+    expect(o['workspace'].backend).toBe('none');
+    expect(o['workspace'].max_read_words).toBeUndefined();
+    expect(o['workspace'].max_write_words).toBeUndefined();
+  });
+
+  it('keeps shell and git overrides for a sandbox backend', () => {
+    const {component} = createComponent({is_admin: true});
+    component.workspaceBackend.set('sandbox');
+    component.shellMode.set('persistent');
+    component.gitVersioning.set(true);
+
+    const o = component.getOverrides() as Record<string, any>;
+    expect(o['shell'].mode).toBe('persistent');
+    expect(o['workspace'].git_versioning).toBe(true);
+  });
+});
