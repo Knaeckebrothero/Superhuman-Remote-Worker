@@ -285,7 +285,7 @@ opencloud:
   # (mkcert cert) — local-only, pairs with workspace.networkPolicy.extraEgress.
   mountInsecureTls: true
   hostAliases:
-    - ip: "10.43.68.20"
+    - ip: "10.43.239.6"
       hostnames:
         - "auth.localhost"
 

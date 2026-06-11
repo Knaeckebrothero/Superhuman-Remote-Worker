@@ -45,7 +45,7 @@ else
     --servers 1 \
     --port "80:80@loadbalancer" \
     --port "443:443@loadbalancer" \
-    --registry-create "${CLUSTER_NAME}-registry:0.0.0.0:5000"
+    --registry-create "${CLUSTER_NAME}-registry:0.0.0.0:5005"
   ok "cluster created"
 fi
 
