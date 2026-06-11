@@ -1668,6 +1668,19 @@ export class PersistentChatService {
                 this.endedAt.set(new Date().toISOString());
                 break;
 
+            case 'session.suspended':
+                // Drift-drain (platform update) suspend. Unlike 'ended', a
+                // suspended thread stays live-resumable: the next message
+                // restores the workspace on a fresh agent, so keep the
+                // composer enabled and don't render the resume card.
+                this._systemMessage(
+                    (params['message'] as string)
+                    || 'Session suspended. Send a message to resume where you left off.',
+                );
+                this.isWaitingForInput.set(false);
+                this.threadStatus.set('suspended');
+                break;
+
             case 'vm_upgrade.needed':
                 this._systemMessage(
                     `VM upgrade needed: ${(params['reason'] as string) || 'sudo detected'}. `

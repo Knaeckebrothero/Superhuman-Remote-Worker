@@ -37,6 +37,7 @@ POST   /api/admin/providers/models                                              
 DELETE /api/admin/providers/models/{catalog_id}                                         admin:_require_admin
 PATCH  /api/admin/providers/models/{catalog_id}                                         admin:_require_admin
 POST   /api/admin/providers/models/{catalog_id}/test                                    admin:_require_admin
+GET    /api/admin/security-events                                                       admin:_require_admin
 DELETE /api/admin/system-settings/main_cloud                                            admin:_require_admin
 GET    /api/admin/system-settings/main_cloud                                            admin:_require_admin
 PUT    /api/admin/system-settings/main_cloud                                            admin:_require_admin
@@ -55,6 +56,7 @@ GET    /api/agents/threads/{thread_id}/lifecycle                                
 POST   /api/agents/threads/{thread_id}/messages                                         internal:require_internal
 POST   /api/agents/threads/{thread_id}/release-agent                                    internal:require_internal
 PUT    /api/agents/threads/{thread_id}/status                                           internal:require_internal
+POST   /api/agents/threads/{thread_id}/suspend                                          internal:require_internal
 POST   /api/agents/threads/{thread_id}/upgrade-to-vm                                    internal:require_internal
 GET    /api/agents/threads/{thread_id}/workspace                                        internal:require_internal
 DELETE /api/agents/{agent_id}                                                           admin:_require_admin

@@ -60,9 +60,17 @@ _max_sessions_per_process: int = int(
 _pending_exit_task: Optional[asyncio.Task] = None
 
 # Drain intent — set the first time the orchestrator's heartbeat response
-# carries ``intents.should_drain=true``. Drives a one-shot detach + exit so
-# the agent doesn't keep reacting on every subsequent heartbeat.
+# carries ``intents.should_drain=true`` AND the session is in a drainable
+# state. Drives a one-shot suspend/detach + exit so the agent doesn't keep
+# reacting on every subsequent heartbeat. While a turn is in flight the
+# intent is deferred (flag stays False) and re-checked on each 5s tick.
 _drain_intent_handled: bool = False
+_drain_deferred_logged: bool = False
+
+# True exactly while the persistent loop is parked in _loop_get_user_input's
+# queue wait — the only state where an out-of-band teardown (drain-suspend)
+# cannot kill user-visible work mid-turn.
+_awaiting_input: bool = False
 
 # Self-cleanup watchdogs (PR 2 — protect against the abandoned-pod failure modes
 # that the orchestrator reconciler can only catch with a 60s+ delay):
@@ -70,6 +78,17 @@ _drain_intent_handled: bool = False
 #   _watchdog_tasks      → background tasks cancelled on detach/shutdown.
 _ws_connected_event: Optional[asyncio.Event] = None
 _watchdog_tasks: list[asyncio.Task] = []
+
+# Re-entrancy guard for _terminate_session. Out-of-band teardown (drain,
+# watchdog, REST detach) cancels the loop task and awaits it — but
+# run_persistent_loop swallows CancelledError during the input wait and
+# returns CLEANLY, so the loop's completion-handler wrapper observes a
+# normal exit and re-enters _terminate_session("loop_complete") while the
+# outer teardown is still in progress. Historically that just duplicated
+# work (double sync/cleanup, duplicate 'ended' writes); under drain-suspend
+# the inner call's 'ended' write would defeat the orchestrator's
+# 'suspended' transition, so the second caller now returns immediately.
+_terminating: bool = False
 
 # Reference to the currently running persistent-loop task. Set by ws_chat when
 # it spawns the loop, cleared when _terminate_session runs. _terminate_session()
@@ -335,13 +354,23 @@ def _ensure_persistent_loop_started(
 async def _handle_heartbeat_intents(response: dict[str, Any]) -> None:
     """Heartbeat-response callback: react to orchestrator-set intents.
 
-    Currently only ``should_drain`` triggers anything — when set, the
-    persistent agent detaches its session (which marks the thread
-    ``ended`` so any active WS gets a normal close) and exits the pod.
-    Idempotent: only fires once per process; later heartbeats observing
-    the same intent are no-ops.
+    Currently only ``should_drain`` triggers anything. What it does depends
+    on session state:
+
+    - No session attached → exit the pod (idle pool agent, nothing to save).
+    - Session attached, loop parked between turns → clean drain-suspend:
+      flush + teardown, then ask the orchestrator to snapshot the workspace
+      and mark the thread ``suspended`` so the next user input walks the
+      proven suspended-resume path on a fresh (new-build) agent. Falls back
+      to the legacy ``ended`` detach if the orchestrator can't suspend.
+    - Session attached, turn in flight → defer; re-checked on every 5s
+      heartbeat until the loop parks. A drain never kills a running turn.
+
+    Idempotent: fires once per process; later heartbeats observing the same
+    intent are no-ops. See
+    docs/issues/session_agent_drift_drain_kills_idle_sessions.md.
     """
-    global _drain_intent_handled
+    global _drain_intent_handled, _drain_deferred_logged
     if _drain_intent_handled:
         return
     intents = response.get("intents") or {}
@@ -349,15 +378,102 @@ async def _handle_heartbeat_intents(response: dict[str, Any]) -> None:
         return
     if not intents.get("should_drain"):
         return
+    reason = intents.get("drain_reason", "unspecified")
+
+    if _session is not None and not _session_parked():
+        if not _drain_deferred_logged:
+            logger.info(
+                "Drain intent received from orchestrator (reason=%s) but a "
+                "turn is in flight — deferring until the loop parks",
+                reason,
+            )
+            _drain_deferred_logged = True
+        return
+
     _drain_intent_handled = True
+    if _session is None:
+        logger.info(
+            "Drain intent received from orchestrator (reason=%s) — no session "
+            "attached, exiting",
+            reason,
+        )
+        _schedule_exit(delay=1.0)
+        return
+
     logger.info(
-        "Drain intent received from orchestrator (reason=%s) — detaching and exiting",
-        intents.get("drain_reason", "unspecified"),
+        "Drain intent received from orchestrator (reason=%s) — suspending "
+        "session and exiting",
+        reason,
     )
+    await _drain_suspend_session()
+
+
+def _session_parked() -> bool:
+    """True when the persistent loop is parked waiting for user input.
+
+    Parked = blocked in _loop_get_user_input's queue wait with nothing
+    queued and no tool call in flight. Anything else counts as an active
+    turn and must not be torn down out-of-band.
+    """
+    if not _awaiting_input or _tool_inflight:
+        return False
+    queue = _loop_user_queue
+    return queue is None or queue.empty()
+
+
+async def _drain_suspend_session() -> None:
+    """Drain an attached idle session via clean suspend instead of kill.
+
+    Converges on the attention-sleep terminal state — thread ``suspended``,
+    workspace snapshotted to S3, both pods gone — so the next user input
+    resumes through the existing suspended-restore path instead of racing a
+    half-deleted workspace pod (the 409→503 "session ended" failure this
+    replaces).
+    """
+    thread_id = _thread_id
+    _broadcast(
+        "session.suspended",
+        {
+            "thread_id": thread_id,
+            "message": (
+                "Session suspended for a platform update. "
+                "Send a message to resume where you left off."
+            ),
+        },
+    )
+
+    # Flush + teardown WITHOUT marking the thread ended — the orchestrator
+    # owns the 'suspended' transition below. Clearing _session here also
+    # makes the SIGTERM shutdown handler a no-op when the orchestrator
+    # deletes this pod as part of the suspend.
     try:
-        await _terminate_session("drain")
+        await _terminate_session("drain", mark_thread=False)
     except Exception as e:
-        logger.warning(f"Detach during drain-intent handling failed: {e}")
+        logger.warning(f"Session teardown during drain-suspend failed: {e}")
+
+    suspended = False
+    if _orchestrator_client and thread_id:
+        try:
+            suspended = await _orchestrator_client.suspend_thread(thread_id)
+        except Exception as e:
+            logger.warning(f"Drain-suspend request failed: {e}")
+    if not suspended and thread_id:
+        # Legacy fallback: mark ended (recoverable — the orchestrator's
+        # 'ended' handler snapshots best-effort via _suspend_thread_resources
+        # and refuses to clobber an already-'suspended' thread, so a lost
+        # suspend response can't end a suspended session). Uses the captured
+        # thread_id — _update_thread_status reads module globals that
+        # _terminate_session already cleared.
+        logger.warning(
+            "Drain-suspend unavailable for thread %s — falling back to "
+            "legacy ended detach",
+            thread_id,
+        )
+        if _orchestrator_client:
+            try:
+                await _orchestrator_client.update_thread_status(thread_id, "ended")
+            except Exception as e:
+                logger.warning(f"Fallback ended write failed: {e}")
     _schedule_exit(delay=1.0)
 
 
@@ -1451,7 +1567,7 @@ async def _attach_session(
     logger.info(f"Session attached: thread={_thread_id} events_epoch={_events_epoch}")
 
 
-async def _terminate_session(reason: str) -> None:
+async def _terminate_session(reason: str, *, mark_thread: bool = True) -> None:
     """Tear down the current session and return to idle.
 
     Called by:
@@ -1462,11 +1578,21 @@ async def _terminate_session(reason: str) -> None:
       - The persistent loop's own completion handler (idle timeout, crash,
         clean /done exit) routes here via _loop_completion_handler.
 
+    Re-entrancy: cancelling the loop task makes run_persistent_loop return
+    CLEANLY (it swallows CancelledError in the input wait), so the loop's
+    completion handler re-enters this function with reason="loop_complete"
+    while the out-of-band teardown is still running. The _terminating guard
+    makes that inner call a no-op — load-bearing for drain-suspend, where
+    the inner call's 'ended' write would defeat the orchestrator's
+    'suspended' transition.
+
     Steps:
       1. Cancel in-flight persistent-loop task (prevents permission_check race
          that the commit 3a1d265 race-fix protects against).
       2. Mark thread as ended (still resumable — `ended` is the only inactive
-         state).
+         state). Skipped when ``mark_thread=False`` — the drain-suspend path
+         uses that to keep status authority with the orchestrator, which
+         flips the thread to 'suspended' instead.
       3. Git commit + push.
       4. Clean up session resources.
       5. Clear session globals AND headless input primitives + subscribers.
@@ -1476,6 +1602,23 @@ async def _terminate_session(reason: str) -> None:
     "idle_timeout", "loop_crash", "loop_complete", "shutdown", "rest_detach",
     "thread_ended_oob", "boot_ws_timeout", "legacy".
     """
+    global _terminating
+    if not _session:
+        return
+    if _terminating:
+        logger.debug(
+            "Terminate(%s) skipped — session teardown already in progress", reason
+        )
+        return
+    _terminating = True
+    try:
+        await _terminate_session_inner(reason, mark_thread=mark_thread)
+    finally:
+        _terminating = False
+
+
+async def _terminate_session_inner(reason: str, *, mark_thread: bool = True) -> None:
+    """Body of _terminate_session — only reached holding the _terminating guard."""
     global _session, _thread_id, _sessions_served, _loop_task
     global _loop_user_queue, _loop_interrupt_flag, _loop_last_user_content
     global _hard_interrupt_event
@@ -1507,8 +1650,11 @@ async def _terminate_session(reason: str) -> None:
     # they would have triggered, no point letting them race the detach.
     _stop_watchdogs()
 
-    # Mark thread as ended (still resumable — `ended` is the only inactive state).
-    await _update_thread_status("ended")
+    # Mark thread as ended (still resumable — `ended` is the only inactive
+    # state). The drain-suspend path passes mark_thread=False: the
+    # orchestrator flips the thread to 'suspended' right after this teardown.
+    if mark_thread:
+        await _update_thread_status("ended")
 
     # Final cloud sync + drop secrets. No more background polling to stop:
     # Phase 1 moved sync to turn boundaries via the coordinator.
@@ -2347,32 +2493,41 @@ async def _loop_get_user_input() -> str:
             name="phase5-flip-awaiting-user",
         )
 
-    if _session is None:
-        return await queue.get()
+    # Parked window for the drain-suspend gate (_session_parked): exactly the
+    # span where this coroutine is blocked on the queue. The finally also
+    # covers loop-task cancellation and the idle-timeout raise.
+    global _awaiting_input
+    _awaiting_input = True
+    try:
+        if _session is None:
+            return await queue.get()
 
-    idle_timeout_minutes = _session.config.interactive.idle_timeout_minutes
-    if idle_timeout_minutes and idle_timeout_minutes > 0:
-        idle_timeout_seconds = idle_timeout_minutes * 60
-        try:
-            return await asyncio.wait_for(queue.get(), timeout=idle_timeout_seconds)
-        except asyncio.TimeoutError:
-            logger.info(
-                "Idle timeout (%dmin) for thread %s",
-                idle_timeout_minutes,
-                _thread_id,
-            )
-            _broadcast(
-                "session.idle_timeout",
-                {
-                    "thread_id": _thread_id,
-                    "message": (
-                        "Session paused due to inactivity. Your work has been saved."
-                    ),
-                    "timeout_minutes": idle_timeout_minutes,
-                },
-            )
-            raise IdleTimeoutError(f"Idle timeout after {idle_timeout_seconds}s")
-    return await queue.get()
+        idle_timeout_minutes = _session.config.interactive.idle_timeout_minutes
+        if idle_timeout_minutes and idle_timeout_minutes > 0:
+            idle_timeout_seconds = idle_timeout_minutes * 60
+            try:
+                return await asyncio.wait_for(queue.get(), timeout=idle_timeout_seconds)
+            except asyncio.TimeoutError:
+                logger.info(
+                    "Idle timeout (%dmin) for thread %s",
+                    idle_timeout_minutes,
+                    _thread_id,
+                )
+                _broadcast(
+                    "session.idle_timeout",
+                    {
+                        "thread_id": _thread_id,
+                        "message": (
+                            "Session paused due to inactivity. "
+                            "Your work has been saved."
+                        ),
+                        "timeout_minutes": idle_timeout_minutes,
+                    },
+                )
+                raise IdleTimeoutError(f"Idle timeout after {idle_timeout_seconds}s")
+        return await queue.get()
+    finally:
+        _awaiting_input = False
 
 
 def _loop_check_interrupt() -> Optional[str]:

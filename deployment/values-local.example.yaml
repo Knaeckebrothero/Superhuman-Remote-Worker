@@ -206,11 +206,33 @@ databases:
     storageSize: "2Gi"
 
 # -----------------------------------------------------------------------------
-# Workspace PVC — single-node k3d uses local-path, which is RWO-only
+# Workspace PVC — single-node k3d uses local-path, which is RWO-only.
+#
+# networkPolicy.extraEgress: in-cluster Traefik hairpin for OpenCloud
+# uploads. The tus PATCH targets https://cloud.localhost/data, which
+# coredns-custom resolves to the Traefik ClusterIP — inside the cluster
+# CIDRs the tier policies deny. This re-allows exactly the Traefik pods
+# (post-DNAT pod ports: websecure=8443, web=8000). Real deployments resolve
+# the public hostname externally and don't need this. Pairs with
+# opencloud.mountInsecureTls below for the mkcert cert on the same hop.
 # -----------------------------------------------------------------------------
 workspace:
   accessMode: "ReadWriteOnce"
   storageSize: "10Gi"
+  networkPolicy:
+    extraEgress:
+      - to:
+          - namespaceSelector:
+              matchLabels:
+                kubernetes.io/metadata.name: kube-system
+            podSelector:
+              matchLabels:
+                app.kubernetes.io/name: traefik
+        ports:
+          - protocol: TCP
+            port: 8443
+          - protocol: TCP
+            port: 8000
 
 # -----------------------------------------------------------------------------
 # Session router — direct-WS session endpoints. The orchestrator mints a JWT
@@ -259,6 +281,11 @@ sessionRouter:
 # -----------------------------------------------------------------------------
 opencloud:
   oidcInsecureTls: true
+  # rclone mounts pass --no-check-certificate so the tus upload hop —
+  # ocdav forwards upload bodies to the PUBLIC data-gateway URL, which
+  # presents the mkcert edge cert locally — passes TLS verification.
+  # Local-only; pairs with workspace.networkPolicy.extraEgress below.
+  mountInsecureTls: true
   hostAliases:
     - ip: "10.43.248.175"
       hostnames:

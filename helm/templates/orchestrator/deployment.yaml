@@ -519,6 +519,12 @@ spec:
                   name: {{ include "srw.secretName" . }}
                   key: OPENCLOUD_KEYCLOAK_CLIENT_SECRET
                   optional: true
+            - name: OPENCLOUD_MOUNT_INSECURE_TLS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: OPENCLOUD_MOUNT_INSECURE_TLS
+                  optional: true
             {{- end }}
             # External cloud service account (used with cloud.externalBackend)
             - name: CLOUD_SERVICE_USER

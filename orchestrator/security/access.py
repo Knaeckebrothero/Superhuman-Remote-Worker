@@ -16,7 +16,10 @@ loaded resource on success so callers don't refetch.
 
 Status code policy: 404 when the resource doesn't exist, 403 when it
 does but the caller lacks access. Same shape as H1-H5, decided in
-``docs/multi_tenancy.md`` open-question #1.
+``docs/multi_tenancy.md`` open-question #1. Every 403 raised here is
+additionally recorded as a security event (structured log line + a
+best-effort ``security_events`` row) via :func:`log_security_event` —
+see ``docs/features/security_event_log.md``.
 
 The H1-H5 hotfix helpers (``user_can_access_ide_entity``,
 ``require_project_owner``, ``require_sudo_request_authority``) moved
@@ -28,6 +31,7 @@ just the home for the next four bundles of work.
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any, Literal
 from uuid import UUID
@@ -35,6 +39,8 @@ from uuid import UUID
 from fastapi import HTTPException, Request
 
 from security.auth import require_approved_user
+
+logger = logging.getLogger(__name__)
 
 # Shared bootstrap secret for agent ↔ orchestrator and MCP-bridge ↔ orchestrator
 # traffic. Distributed via Helm as the ``MCP_INTERNAL_KEY`` env var (already
@@ -55,6 +61,140 @@ def _role_satisfies(actual: str | None, minimum: Role) -> bool:
     if actual_rank is None:
         return False
     return actual_rank >= _ROLE_RANK[minimum]
+
+
+# =============================================================================
+# Denied-access audit — every 403 below leaves a trace
+# =============================================================================
+#
+# Before this, every gate denied silently: 1000 UUID-probe attempts against
+# another user's resources produced 1000 identical 403s and zero detection
+# signal. Each deny now emits a structured WARNING line (survives in pod
+# logs even if the DB is down) plus a best-effort row in the
+# ``security_events`` table (queryable forensics, pruned on retention).
+# Closes M1.B #4; design in docs/features/security_event_log.md.
+
+
+def _request_meta(request: Any) -> tuple[str | None, str | None, str | None]:
+    """Best-effort ``(method, path, client_ip)`` from a Request/WebSocket.
+
+    Deliberately paranoid: tests pass bare MagicMocks, the WS handshake
+    has no ``method`` attribute, and proxies may omit forwarding headers.
+    Anything that isn't a real string degrades to None rather than
+    raising — the event row is still worth writing without it.
+    """
+    if request is None:
+        return None, None, None
+    method = getattr(request, "method", None)
+    if not isinstance(method, str):
+        method = None
+    path = getattr(getattr(request, "url", None), "path", None)
+    if not isinstance(path, str):
+        path = None
+    client_ip: str | None = None
+    try:
+        fwd = request.headers.get("x-forwarded-for", "")
+        if isinstance(fwd, str) and fwd:
+            client_ip = fwd.split(",")[0].strip()
+    except Exception:
+        client_ip = None
+    if not client_ip:
+        host = getattr(getattr(request, "client", None), "host", None)
+        client_ip = host if isinstance(host, str) else None
+    return method, path, client_ip
+
+
+async def log_security_event(
+    db,
+    *,
+    resource_type: str,
+    event_type: str = "access_denied",
+    user: dict[str, Any] | None = None,
+    resource_id: str | None = None,
+    detail: str = "",
+    request: Any = None,
+    method: str | None = None,
+    path: str | None = None,
+) -> None:
+    """Record a denied-access event. Never raises.
+
+    Emits the structured log line first, then the DB row, so a database
+    outage still leaves a trace in pod logs. A failed insert is loud
+    (``logger.error``) but never blocks the 403 it documents — a broken
+    audit trail must not turn a deny into a 500.
+
+    ``request`` may be a FastAPI ``Request``, a Starlette ``WebSocket``
+    (pass ``method='WS'`` explicitly), or None. ``user`` is the resolved
+    auth dict; ``real_is_admin``/``is_admin`` are compared to record
+    whether the admin "view as user" shadow was on (an admin exercising
+    the toggle is distinguishable from a genuine cross-user attempt).
+    """
+    user = user or {}
+    user_id = str(user["id"]) if user.get("id") else None
+    raw_auth = user.get("auth_method")
+    auth_method = raw_auth if isinstance(raw_auth, str) else None
+    real_is_admin = bool(user.get("real_is_admin", user.get("is_admin", False)))
+    view_as = real_is_admin and not bool(user.get("is_admin"))
+    req_method, req_path, client_ip = _request_meta(request)
+    method = method or req_method
+    path = path or req_path
+    logger.warning(
+        "security-event %s: user=%s auth=%s resource=%s/%s method=%s "
+        "path=%s view_as=%s ip=%s detail=%s",
+        event_type,
+        user_id,
+        auth_method,
+        resource_type,
+        resource_id,
+        method,
+        path,
+        view_as,
+        client_ip,
+        detail,
+    )
+    if db is None:
+        return
+    try:
+        await db.record_security_event(
+            event_type=event_type,
+            user_id=user_id,
+            auth_method=auth_method,
+            real_is_admin=real_is_admin,
+            view_as=view_as,
+            resource_type=resource_type,
+            resource_id=str(resource_id) if resource_id is not None else None,
+            method=method,
+            path=path,
+            detail=detail,
+            client_ip=client_ip,
+        )
+    except Exception as exc:
+        logger.error("security-event DB write failed (deny proceeds): %s", exc)
+
+
+async def _denied(
+    request: Any,
+    db,
+    user: dict[str, Any] | None,
+    *,
+    resource_type: str,
+    resource_id: str | None,
+    detail: str,
+) -> HTTPException:
+    """Log a denied-access event and return the 403 to raise.
+
+    Usage: ``raise await _denied(...)`` — the log and the raise live in
+    one expression so no future gate can do one without the other.
+    """
+    await log_security_event(
+        db,
+        user=user,
+        resource_type=resource_type,
+        resource_id=resource_id,
+        detail=detail,
+        request=request,
+    )
+    return HTTPException(status_code=403, detail=detail)
 
 
 # =============================================================================
@@ -226,13 +366,24 @@ async def require_project_member(
     if not project:
         raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
     if not _scope_permits_project(user, project_id):
-        raise HTTPException(status_code=403, detail="Access denied by MCP token scope")
+        raise await _denied(
+            request,
+            db,
+            user,
+            resource_type="project",
+            resource_id=project_id,
+            detail="Access denied by MCP token scope",
+        )
     if user.get("is_admin"):
         return user, project
     role = await db.get_user_role_in_project(project_id, str(user["id"]))
     if not _role_satisfies(role, min_role):
-        raise HTTPException(
-            status_code=403,
+        raise await _denied(
+            request,
+            db,
+            user,
+            resource_type="project",
+            resource_id=project_id,
             detail=f"Project role '{min_role}' or higher required",
         )
     return user, project
@@ -255,12 +406,26 @@ async def require_project_owner(
     if not project:
         raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
     if not _scope_permits_project(user, project_id):
-        raise HTTPException(status_code=403, detail="Access denied by MCP token scope")
+        raise await _denied(
+            request,
+            db,
+            user,
+            resource_type="project",
+            resource_id=project_id,
+            detail="Access denied by MCP token scope",
+        )
     if user.get("is_admin"):
         return user, project
     role = await db.get_user_role_in_project(project_id, str(user["id"]))
     if role != "owner":
-        raise HTTPException(status_code=403, detail="Project owner role required")
+        raise await _denied(
+            request,
+            db,
+            user,
+            resource_type="project",
+            resource_id=project_id,
+            detail="Project owner role required",
+        )
     return user, project
 
 
@@ -281,7 +446,14 @@ async def require_job_access(
     if not job:
         raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
     if not _scope_permits_project(user, job.get("project_id")):
-        raise HTTPException(status_code=403, detail="Access denied by MCP token scope")
+        raise await _denied(
+            request,
+            db,
+            user,
+            resource_type="job",
+            resource_id=job_id,
+            detail="Access denied by MCP token scope",
+        )
     if user.get("is_admin"):
         return user, job
     if str(job.get("user_id") or "") == str(user["id"]):
@@ -291,7 +463,14 @@ async def require_job_access(
         role = await db.get_user_role_in_project(str(project_id), str(user["id"]))
         if role:
             return user, job
-    raise HTTPException(status_code=403, detail="Not authorized to access this job")
+    raise await _denied(
+        request,
+        db,
+        user,
+        resource_type="job",
+        resource_id=job_id,
+        detail="Not authorized to access this job",
+    )
 
 
 async def user_can_access_any_job(
@@ -366,11 +545,25 @@ async def require_thread_owner(
     if not thread:
         raise HTTPException(status_code=404, detail="Thread not found")
     if not _scope_permits_personal(user):
-        raise HTTPException(status_code=403, detail="Access denied by MCP token scope")
+        raise await _denied(
+            request,
+            db,
+            user,
+            resource_type="thread",
+            resource_id=thread_id,
+            detail="Access denied by MCP token scope",
+        )
     if user.get("is_admin"):
         return user, thread
     if str(thread.get("user_id") or "") != str(user["id"]):
-        raise HTTPException(status_code=403, detail="Not your thread")
+        raise await _denied(
+            request,
+            db,
+            user,
+            resource_type="thread",
+            resource_id=thread_id,
+            detail="Not your thread",
+        )
     return user, thread
 
 
@@ -394,14 +587,26 @@ async def require_builder_session_owner(
             status_code=404, detail=f"Builder session '{session_id}' not found"
         )
     if not _scope_permits_personal(user):
-        raise HTTPException(status_code=403, detail="Access denied by MCP token scope")
+        raise await _denied(
+            request,
+            db,
+            user,
+            resource_type="builder_session",
+            resource_id=session_id,
+            detail="Access denied by MCP token scope",
+        )
     if user.get("is_admin"):
         return user, session
     owner_id = session.get("user_id")
     if owner_id and str(owner_id) == str(user["id"]):
         return user, session
-    raise HTTPException(
-        status_code=403, detail="Not authorized to access this builder session"
+    raise await _denied(
+        request,
+        db,
+        user,
+        resource_type="builder_session",
+        resource_id=session_id,
+        detail="Not authorized to access this builder session",
     )
 
 
@@ -489,15 +694,27 @@ async def require_sudo_request_authority(
         if job:
             job_project_id = job.get("project_id")
     if not _scope_permits_project(user, job_project_id):
-        raise HTTPException(status_code=403, detail="Access denied by MCP token scope")
+        raise await _denied(
+            request,
+            db,
+            user,
+            resource_type="sudo_request",
+            resource_id=request_id,
+            detail="Access denied by MCP token scope",
+        )
     if user.get("is_admin"):
         return sudo_req
     if job_project_id:
         role = await db.get_user_role_in_project(str(job_project_id), str(user["id"]))
         if role == "owner":
             return sudo_req
-    raise HTTPException(
-        status_code=403, detail="Not authorized to act on this sudo request"
+    raise await _denied(
+        request,
+        db,
+        user,
+        resource_type="sudo_request",
+        resource_id=request_id,
+        detail="Not authorized to act on this sudo request",
     )
 
 
@@ -584,8 +801,13 @@ async def require_datasource_access(
             status_code=404, detail=f"Datasource '{datasource_id}' not found"
         )
     if not await user_can_access_datasource(user, db, ds):
-        raise HTTPException(
-            status_code=403, detail="Not authorized to access this datasource"
+        raise await _denied(
+            request,
+            db,
+            user,
+            resource_type="datasource",
+            resource_id=datasource_id,
+            detail="Not authorized to access this datasource",
         )
     return user, ds
 
@@ -615,15 +837,25 @@ async def require_datasource_owner(
     if scope_pid is not None:
         project_ids = await db.list_datasource_projects(str(datasource_id))
         if scope_pid not in {UUID(str(pid)) for pid in project_ids}:
-            raise HTTPException(
-                status_code=403, detail="Access denied by MCP token scope"
+            raise await _denied(
+                request,
+                db,
+                user,
+                resource_type="datasource",
+                resource_id=datasource_id,
+                detail="Access denied by MCP token scope",
             )
     if user.get("is_admin"):
         return user, ds
     if str(ds.get("created_by") or "") == str(user["id"]):
         return user, ds
-    raise HTTPException(
-        status_code=403, detail="Only the datasource creator or an admin can do this"
+    raise await _denied(
+        request,
+        db,
+        user,
+        resource_type="datasource",
+        resource_id=datasource_id,
+        detail="Only the datasource creator or an admin can do this",
     )
 
 

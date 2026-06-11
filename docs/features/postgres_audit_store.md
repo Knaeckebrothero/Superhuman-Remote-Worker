@@ -2,6 +2,19 @@
 
 ## Status: Proposed (revised 2026-05-02; references re-verified 2026-06-10)
 
+> **2026-06-11 — implementation package exists and supersedes the technical
+> core of this doc.** An 8-agent discovery + research + synthesis pass
+> produced `postgres_audit_store_implementation.md` (final decision record,
+> DDL validated live on the cluster's PG 15.18, partition-module spec,
+> complete adapter interface, PR plan) and
+> `postgres_audit_store_contracts.md` (verbatim code contracts). **Where
+> this doc's § Schema / § Adapter layer and the package disagree, the
+> package wins** — discovery found three would-be migration aborts in the
+> DDL below (partitioned-table PK rule, parent-level reloptions,
+> `vacuum_freeze_min_age`), replaced the FK design with soft references
+> (retention conflict), and relocated the write pool into the agent
+> process. The Problem/Scope/rationale sections here remain current.
+
 > **Revision note (2026-06-10)** — file/line references below were
 > re-verified against the current tree. Material drift since 2026-05-02:
 >
@@ -134,7 +147,7 @@ endpoints (full list, not just the two named in the original draft):
 Plus three indirect consumers that enrich job rows with `audit_count`
 via per-job `count_documents` calls (N+1):
 `/api/jobs` (`main.py:3933-3936`), `/api/jobs/{id}` (`main.py:3953-3954`),
-`/api/projects/{id}/jobs` (`main.py:18740-18742`). The Postgres swap is
+`/api/projects/{id}/jobs` (`main.py:18814-18816`). The Postgres swap is
 an opportunity to collapse these into a single `SELECT ... GROUP BY job_id`.
 
 All reads are by `job_id` ± time range / step_type / tool name — no
@@ -154,8 +167,12 @@ unaffected by this migration end to end.
   *customer-attached MongoDB datasources*. A user pointing the agent at
   their own production MongoDB still needs Mongo client libraries and
   the existing tool surface. This is unaffected by removing the
-  internal audit Mongo. The `workspace-network-policy.yaml` egress to
-  port 27017 must therefore stay (workspace shells need `mongosh`).
+  internal audit Mongo. (Corrected 2026-06-11: the
+  `workspace-network-policy.yaml` 27017 egress is podSelector-scoped to
+  the *chart's* mongodb component — it never served external customer
+  Mongo and becomes dead code post-cutover; delete it with the rest.
+  Customer-Mongo reachability is governed by the workspace tier
+  allowlist, unchanged.)
 - **`mongoExpress` chart toggle** — the dev UI for the audit Mongo. Drop
   it (along with the audit Mongo, the `srw.mongoHost` helper, the
   `global.hostnames.mongo` value, the `ingress.yaml:443-481` mongo-express
@@ -214,6 +231,14 @@ and run the audit family against the audit pool in lifespan. There is
 no frozen `audit_schema.sql`, and `init.py` does not apply schema;
 later audit-schema changes are new numbered files (use the `.notx.sql`
 suffix for `CREATE INDEX CONCURRENTLY`-class operations).
+
+> **⚠ SUPERSEDED (2026-06-11)**: the DDL block below is kept for design
+> rationale only and contains statements that are **invalid on partitioned
+> tables** (bare `BIGSERIAL PRIMARY KEY`; parent-level `ALTER TABLE ... SET`
+> reloptions; `vacuum_freeze_min_age`) plus FK constraints that make
+> partition retention impossible. The validated, implementation-ready DDL is
+> in `postgres_audit_store_implementation.md` § 3 — copy from there, never
+> from here.
 
 ```sql
 -- llm_requests: one row per LLM call (main loop + auxiliary).
@@ -285,7 +310,7 @@ ALTER TABLE agent_audit ALTER COLUMN metadata SET COMPRESSION lz4;
 CREATE INDEX agent_audit_job_id_idx     ON agent_audit (job_id, timestamp);
 CREATE INDEX agent_audit_job_type_idx   ON agent_audit (job_id, step_type, timestamp);
 CREATE INDEX agent_audit_request_idx    ON agent_audit (request_id);
--- Expression index for the graph-delta tool-name filter (graph_routes.py:144).
+-- Expression index for the graph-delta tool-name filter (graph_routes.py:142).
 CREATE INDEX agent_audit_tool_name_idx
     ON agent_audit ((payload -> 'tool' ->> 'name'))
     WHERE step_type = 'tool';
@@ -449,7 +474,7 @@ sides expose the union of:
 - `get_audit_count(job_id)` — single-row helper used by enrichers
 - `iter_tool_calls(job_id)` — replaces the
   `mongodb._db["agent_audit"]` raw-cursor leak in
-  `graph_routes.py:144`. Either expose this method or refactor the
+  `graph_routes.py:142`. Either expose this method or refactor the
   helper to use `get_graph_deltas_bulk`.
 - `get_job_stats(job_id)` — aggregation SQL
 - `get_audit_stats(job_id)` — second aggregation
@@ -592,6 +617,50 @@ and stays as-is.
   avoids, and would make any future revert to a UPDATE pattern
   expensive.
 
+## Scale envelope and operational invariants
+
+Added 2026-06-10 after a scale review (100-user / 1,000-agent
+enterprise deployment; SaaS scenarios). Conclusion: the workload fits
+Postgres with no known cliff. Agents are LLM-latency-bound (~1
+insert/sec per fully active agent → ~600-1,000 inserts/sec at the
+absurd all-1,000-active bound), which a single instance absorbs
+comfortably; and the audit store is not load-bearing state (the
+archiver is non-fatal, data is retention-bounded), so the blast radius
+of a wrong sizing call is small. The conditions that keep it that way:
+
+**Invariants — violating these reopens the failure modes this design
+closed. Enforce in review:**
+
+1. `agent_audit` stays append-only, and `agent_audit.payload` never
+   gets a GIN index. Together these are what eliminate JSONB-UPDATE
+   write amplification.
+2. Writers must not scale as direct per-pod connections. Postgres
+   backends are processes (~MBs each; snapshot/ProcArray contention
+   beyond ~500-1,000 backends). Before any deployment beyond ~100
+   concurrent agents, put PgBouncer (transaction mode) in front of
+   `srw-auditdb` — single-statement INSERTs are the ideal
+   transaction-pooling workload — or route audit writes through the
+   orchestrator. Cheap and standard, but it must actually happen.
+3. "Search arbitrary payload fields across jobs" is a new feature with
+   its own storage answer (derived columns or an external index) —
+   never a payload GIN (see invariant 1).
+
+**Tuning defaults for the audit pool:**
+
+- `synchronous_commit = off`, set per-session on the audit pool (not
+  cluster-wide). It's an audit log — losing <1 s of trail in a crash
+  is acceptable, and the latency/throughput win is large.
+- Expect ~1.5-3× MongoDB's disk for identical payloads (WiredTiger
+  block-level zstd beats TOAST per-datum LZ4). Partition-drop
+  retention bounds it; the dominant lever at enterprise scale is
+  payload policy (full request bodies retained N days, previews
+  after; S3/Parquet tiering) — engine-agnostic, see the S3 note under
+  "Out of scope".
+- Watch **bytes/sec and WAL volume, not rows/sec**:
+  `llm_requests.request` carries the full per-call context (~200 KB at
+  50k tokens); payload bandwidth dominates row count by orders of
+  magnitude.
+
 ## File-by-file change list
 
 ### New
@@ -648,16 +717,16 @@ and stays as-is.
   `ensure_indexes` 3325-3332 (the `ensure_indexes` call has **no
   Postgres analogue** — the migration runner owns DDL; it just goes
   away), graph_routes share 3391, disconnect 3672, enrichers
-  3933-3936 / 3953-3954 / 18740-18742, endpoints: `/audit` 8418/8431,
+  3933-3936 / 3953-3954 / 18814-18816, endpoints: `/audit` 8418/8431,
   `/requests/{doc_id}` 8444-8459 (param → `int`), `/audit/timerange`
   8487/8491, `/chat` 8514/8525, `/audit/bulk` 9328/9339, `/chat/bulk`
   9365/9376, `/graph/bulk` 9402/9413, `/version` 9434/9438,
-  `/llm-requests` 14563/14572. The remaining "mongodb" hits in main.py
+  `/llm-requests` 14623/14646. The remaining "mongodb" hits in main.py
   (datasource type enums, test-connection, tool catalogs — e.g. 2544,
   9569, 9769, 9942-9949, 18998, 19077-19120) are **customer-datasource
   surface, not this migration** — leave them.
 - `orchestrator/graph_routes.py` — `set_mongodb()` (line 20) becomes
-  `set_audit_store()`. Line 144's raw `mongodb._db["agent_audit"]`
+  `set_audit_store()`. Line 142's raw `mongodb._db["agent_audit"]`
   access is replaced with `audit.iter_tool_calls(job_id)`.
 - `orchestrator/init.py` — replace `mongodump`/`mongorestore`
   shell-outs (URL parse at 1491, dump 1646-1690, restore 1693-1740)
@@ -677,8 +746,8 @@ and stays as-is.
   externalUrl,image,storageClass,storageSize,resources}` block (mirror
   the existing `databases.keycloak.*` block exactly). Default
   `enabled: true, internal: true`. Remove `databases.mongodb.*` (now
-  lines 404-409), `global.hostnames.mongo` (now line 61), and the
-  `mongoExpress` block (now lines 866-868) after cutover.
+  lines 404-418), `global.hostnames.mongo` (now line 61), and the
+  `mongoExpress` block (now lines 881-890) after cutover.
 - `helm/values.example.yaml` — parallel external-postgres example.
   Replace `databases.mongodb` external block with `databases.audit`.
   Same change in `helm/ci/customer-external-values.yaml`.

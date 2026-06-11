@@ -59,6 +59,12 @@ class OpenCloudSettings(BaseModel):
     # proxy.yaml with a different role_mapping.
     admin_role_claim_value: str = "opencloudAdmin"
     default_quota_bytes: Optional[int] = None
+    # Local-dev only: rclone mounts pass --no-check-certificate so the tus
+    # upload hop (ocdav redirects PATCHes to the PUBLIC data-gateway URL,
+    # which presents the mkcert edge cert on local k3d) doesn't fail TLS
+    # verification. All other mount traffic uses the internal plain-HTTP
+    # service URL and is unaffected. Never enable on a real deployment.
+    mount_insecure_tls: bool = False
 
 
 class MS365Settings(BaseModel):
@@ -279,6 +285,13 @@ def load_main_cloud_config(
                 "default_quota_bytes": overlay_value.get("default_quota_bytes")
                 if overlay_value.get("default_quota_bytes") is not None
                 else _parse_int(os.getenv("OPENCLOUD_DEFAULT_QUOTA_BYTES")),
+                "mount_insecure_tls": (
+                    _ov("mount_insecure_tls")
+                    or os.getenv("OPENCLOUD_MOUNT_INSECURE_TLS", "")
+                )
+                .strip()
+                .lower()
+                in ("1", "true", "yes"),
             }
         }
     elif backend_id == "ms365":
