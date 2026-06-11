@@ -15,7 +15,7 @@ Severity overview:
 
 | # | Bug | Severity | Effort | Status |
 |---|---|---|---|---|
-| B1 | Persistent memory extraction broken 3 ways (phantom config attrs) | **HIGH** | ~1 h | **✅ fixed 2026-06-10** (PR #111, on develop) — live test pending |
+| B1 | Persistent memory extraction broken 3 ways (phantom config attrs) | **HIGH** | ~1 h | **✅ fixed 2026-06-10** (PR #111) + **live-verified on k3d 2026-06-11** |
 | B2 | 4096-dim HNSW indexes silently skipped → seq-scan retrieval | **HIGH** | 0.5–1 d | **verified 2026-06-10: confirmed on dev AND prod** — fix open |
 | B3 | Assembler enabled-but-never-called in persistent sessions | MED-HIGH | 5 min (honesty) / ~1 d (wire) | **honesty fix ✅ 2026-06-10** (PR #112) — wire-vs-retire deferred to overhaul Phase 5 |
 | B4 | No embedding-dimension guard → silent total memory outage | MED | ~2 h | open |
@@ -105,26 +105,42 @@ all three heads degrade or kill extraction exactly there.
   the real `extract_and_store_memories` asserting the prompt reaches the
   aux-LLM task.
 
-**Remaining: live verification on a real session** — all three signals have
-never been observable before, so confirm on k3d/dev:
-1. in-loop: `Memory extraction triggered at turn N` at the configured
-   `observer_interval`, and new `source='observer'` rows in `memories`;
-2. `/done` teardown: `Final memory extraction complete` (INFO — has never
-   logged once in production history);
-3. idle archive: `Idle archive: memory extraction complete`.
+**✅ LIVE-VERIFIED 2026-06-11 on k3d** (thread `0c887768-98a5-4148-8495-0730d0c6fe35`,
+session driven over the agent WS exactly like the cockpit — 5 user turns with
+distinct memorable facts, then `{method:"archive"}` = `/done`):
 
-*Live-verify attempt 2026-06-10 evening:* fix confirmed deployed on dev
-(session pods on build `7ae23f7`, `RecallStore initialized` + aux override
-clean); extraction pipeline itself confirmed healthy same day (fresh
-`source='observer'` row at 16:08 via aux gemma-4-moe + embeddings). Driving
-the two dev test threads to the 5-turn threshold was aborted: both threads
-were ended/deleted from the cockpit mid-test, and k3d was mid-Tilt-churn.
-**Still pending: one quiet session ≥5 turns, then `/done`.** Verify with:
-`SELECT created_at, source, left(content,60) FROM memories WHERE job_id =
-'<thread_id>' ORDER BY created_at;` on the vector DB + the two INFO lines in
-the agent pod log. NB the discovery below (B11) — ending via the cockpit
-✕-button does NOT exercise the teardown extraction; only `/done` and idle
-timeout do.
+1. **in-loop trigger ✓** — `Memory extraction triggered at turn 5` (DEBUG) at
+   the configured `observer_interval: 5`. The *task* it spawned then failed
+   non-fatally after exactly 120 s (`Memory extraction failed (non-fatal): `
+   from `src.services.auxiliary` — aux `gemma-4-moe-strix` via ai.h4ll.app
+   timed out on that one call; same router served all 5 chat turns and the
+   teardown extraction fine). Wiring verified; the flake is the known-flapping
+   aux backend, not the fix.
+2. **`/done` teardown ✓** — `Memory extraction: extracted 5, stored 5 (phase 0)`
+   + `Final memory extraction complete` (INFO, first time it has ever logged)
+   + `Session archived`.
+3. **rows ✓** — 5 `source='observer'` rows in `memories` with
+   `job_id=<thread_id>`, one per fact fed in (uv standardization, Postgres
+   17.2/node4, <400-line PRs, v3.2 freeze, grafana URL). The k3d memories
+   table was empty before the test, so attribution is unambiguous.
+
+Idle-archive (signal `Idle archive: memory extraction complete`) was not
+exercised — it shares the same fixed call path as the archive teardown and
+needs a 30-min wait; acceptable to leave to soak.
+
+Two small follow-ups noticed during the run:
+- `src/services/auxiliary.py`'s extraction catch logs bare `str(e)` → empty
+  message for openai-style exceptions (the identical bug already fixed in
+  `persistent_graph.py` retrieval handlers, see
+  `docs/issues/persistent_graph_misleading_embedding_connection_error.md`).
+  One-liner: log `type(e).__name__` too.
+- A failed in-loop extraction still advances `_last_extraction_turn`, so the
+  next in-loop attempt is a full interval away; the teardown extraction is
+  the safety net that recovered it here (fire-and-forget semantics, by design
+  — worth keeping in mind for Phase-1 `capture()` retry policy).
+
+NB the discovery below (B11) — ending via the cockpit ✕-button does NOT
+exercise the teardown extraction; only `/done` and idle timeout do.
 
 ---
 
@@ -421,8 +437,8 @@ before Phase 1) and the equally-dead `_load_query` twins in
 
 ## Suggested order
 
-1. ~~**B1**~~ ✅ fixed 2026-06-10 — live verification on a real session still
-   pending (see B1 status above for the three signals to confirm).
+1. ~~**B1**~~ ✅ fixed 2026-06-10, live-verified on k3d 2026-06-11 (all
+   signals green; see B1 status above).
 2. ~~**B2 step 1**~~ ✅ verified 2026-06-10 — it IS a real perf cliff on both
    clusters; the halfvec migration (step 2) is now the open work item.
 3. ~~**B3 honesty fix + B9**~~ ✅ shipped 2026-06-10.
