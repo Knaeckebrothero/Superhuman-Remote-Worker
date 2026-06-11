@@ -703,6 +703,11 @@ class PersistentSession:
                 if self.tool_context:
                     self.tool_context.recall_store = self.recall_store
                 logger.info("RecallStore initialized for persistent session")
+
+                # B4 guard: background-probe the endpoint's dimensionality so
+                # a misconfigured provider surfaces as one ERROR at init
+                # instead of a swallowed WARNING per write.
+                asyncio.create_task(embedding_service.verify_dimensions())
             except Exception as e:
                 logger.warning(f"Failed to initialize RecallStore (non-fatal): {e}")
 

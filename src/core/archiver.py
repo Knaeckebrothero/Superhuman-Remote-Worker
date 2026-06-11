@@ -440,6 +440,74 @@ class LLMArchiver:
             logger.warning(f"Failed to archive LLM request: {e}")
             return None
 
+    def archive_error(
+        self,
+        job_id: str,
+        agent_type: str,
+        messages: Sequence[BaseMessage],
+        model: str,
+        error: str,
+        error_type: str,
+        *,
+        latency_ms: Optional[int] = None,
+        call_type: str = "main",
+        auxiliary_metadata: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
+        """Archive a FAILED LLM call (no response) to the llm_requests collection.
+
+        Mirrors :meth:`archive` for the exception path so a failed call leaves a
+        queryable row (``status="error"``) instead of vanishing. The main loop
+        surfaces its failures via the job's ``error_message``/status, but
+        auxiliary calls are deliberately non-fatal and otherwise leave no trace
+        — this is how a degraded auxiliary model becomes visible in the debug
+        view. Fire-and-forget: never raises.
+
+        See docs/issues/surface_silent_aux_failures.md.
+        """
+        if not self._ensure_connected():
+            return None
+
+        try:
+            doc = {
+                "job_id": job_id,
+                "agent_type": agent_type,
+                "timestamp": datetime.now(timezone.utc),
+                "model": model,
+                "call_type": call_type,
+                "status": "error",
+                "error": {"type": error_type, "message": error[:2000]},
+                "request": {
+                    "messages": [_message_to_dict(m) for m in messages],
+                    "message_count": len(messages),
+                },
+                "response": None,
+            }
+            if latency_ms is not None:
+                doc["latency_ms"] = latency_ms
+            if auxiliary_metadata:
+                doc["auxiliary_metadata"] = _serialize_for_mongo(auxiliary_metadata)
+            doc["metrics"] = {
+                "input_chars": sum(
+                    len(_normalize_content(m.content)) for m in messages
+                ),
+                "output_chars": 0,
+                "tool_calls": 0,
+                "token_usage": {},
+            }
+
+            result = self._collection.insert_one(doc)
+            doc_id = str(result.inserted_id)
+            type_str = f" | type={call_type}" if call_type != "main" else ""
+            logger.warning(
+                f"[LLM-ERR] {doc_id[-8:]} | job={job_id[:8]}... | "
+                f"{error_type}: {error[:120]}{type_str}"
+            )
+            return doc_id
+
+        except Exception as e:
+            logger.warning(f"Failed to archive LLM error: {e}")
+            return None
+
     def get_conversation(
         self,
         job_id: str,
