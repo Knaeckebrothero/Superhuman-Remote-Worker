@@ -275,6 +275,38 @@ class PersistentSession:
         effective_backend = (workspace_override or {}).get("backend") or ws_data.backend
         remote_cfg = (workspace_override or {}).get("remote") or ws_data.remote
 
+        # No-workspace tiers (virtual/none): no SSH workspace pod. Build the
+        # lite backend directly, with git off (§8 — lite tiers have no git).
+        from ..core.backends.factory import LITE_BACKENDS, create_lite_backend
+
+        if effective_backend in LITE_BACKENDS:
+            from types import SimpleNamespace
+
+            lite_cfg = SimpleNamespace(
+                backend=effective_backend,
+                mounts=(workspace_override or {}).get("mounts") or ws_data.mounts,
+            )
+            workspace_backend = create_lite_backend(lite_cfg, job_id=self.thread_id)
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, workspace_backend.connect)
+            self.workspace_manager = WorkspaceManager(
+                job_id=self.thread_id,
+                base_path=base_path,
+                config=WorkspaceManagerConfig(
+                    base_path=base_path,
+                    structure=ws_data.structure,
+                    git_versioning=False,
+                ),
+                backend=workspace_backend,
+            )
+            self.workspace_manager.initialize()
+            self._deploy_instruction_files()
+            logger.info(
+                "Lite workspace ready (backend=%s, no workspace pod)",
+                effective_backend,
+            )
+            return
+
         if not (effective_backend in ("sandbox", "vm", "remote") and remote_cfg):
             raise RuntimeError(
                 "No workspace configured. Persistent sessions require "

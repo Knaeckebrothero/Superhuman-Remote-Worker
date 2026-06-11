@@ -1136,7 +1136,7 @@ class LLMConfig:
 class WorkspaceConfig:
     """Workspace configuration."""
 
-    _VALID_BACKENDS = ("sandbox", "vm")
+    _VALID_BACKENDS = ("sandbox", "vm", "virtual", "none")
     _LEGACY_BACKEND_MAP = {"remote": "sandbox", "container": "sandbox"}
 
     structure: List[str] = field(default_factory=list)
@@ -1144,10 +1144,16 @@ class WorkspaceConfig:
     initial_files: Dict[str, str] = field(default_factory=dict)
     max_read_words: int = 25000  # Maximum word count for file reads
     git_versioning: bool = True  # Enable git versioning for workspace history
-    backend: str = "sandbox"  # "sandbox" (SSH workspace container) or "vm" (KubeVirt VM with sudo gate)
+    # "sandbox"/"vm" → SSH workspace container/VM (RemoteBackend); "virtual" →
+    # object-store file ops, no workspace pod (VirtualWorkspaceBackend); "none"
+    # → no file tools (ScratchBackend). See no_workspace_agent_mode.md §4.
+    backend: str = "sandbox"
     remote: Optional[Dict[str, Any]] = (
         None  # {host, port, username, key_path, workspace_path}
     )
+    # "virtual" tier only: object-store mount specs from dispatch — each a
+    # {name, rclone_spec: {type, config, root}, prefix, access} (§4).
+    mounts: Optional[List[Dict[str, Any]]] = None
 
     def __post_init__(self) -> None:
         # Backward compatibility: translate legacy backend names
@@ -1157,9 +1163,9 @@ class WorkspaceConfig:
         if self.backend not in self._VALID_BACKENDS:
             raise ValueError(
                 f"Invalid workspace.backend={self.backend!r}. "
-                f"Expected one of {self._VALID_BACKENDS}. The agent never "
-                f"operates on its own filesystem — every workspace must live "
-                f"in an isolated SSH-accessible container or VM."
+                f"Expected one of {self._VALID_BACKENDS} (sandbox/vm = isolated "
+                f"SSH workspace; virtual = object-store file ops, no workspace "
+                f"pod; none = no file tools)."
             )
 
 
@@ -1652,6 +1658,7 @@ def load_agent_config(
         git_versioning=workspace_data.get("git_versioning", True),
         backend=workspace_data.get("backend", "sandbox"),
         remote=workspace_data.get("remote"),
+        mounts=workspace_data.get("mounts"),
     )
 
     tools_data = data.get("tools", {})
@@ -1853,6 +1860,7 @@ def load_agent_config_from_dict(
         git_versioning=workspace_data.get("git_versioning", True),
         backend=workspace_data.get("backend", "sandbox"),
         remote=workspace_data.get("remote"),
+        mounts=workspace_data.get("mounts"),
     )
 
     tools_data = data.get("tools", {})
