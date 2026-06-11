@@ -29,7 +29,7 @@ related:
 > manager. Build the seam first; everything else becomes a plugin behind it.
 
 **Status:** Design v2 / **step 0 + pre-flight bug track complete, Phase 1 in
-progress (slices 1–2 of 5 done)** — restructured 2026-06-10 around the MemoryManager
+progress (slices 1–4 of 5 done)** — restructured 2026-06-10 around the MemoryManager
 abstraction after design alignment (v1 of 2026-06-07 was phase-first; superseded,
 phases preserved below in new order). Every bug worth fixing *before* the seam is
 fixed (B1/B2/B4 + logging); the remaining bugs are absorbed by phases by design.
@@ -118,6 +118,67 @@ fixed (B1/B2/B4 + logging); the remaining bugs are absorbed by phases by design.
   scope / empty results / retrieval failure / TTL-tick failure), model
   threading, stats counts. graph.py untouched — the legacy path stays
   live until cutover. Next: slice 3 (persistent parity).
+- **2026-06-11 — Phase 1 slice 3 (persistent parity) shipped**:
+  `build_persistent_query_text(messages)` (last HumanMessage, str-coerced,
+  "" when none — the legacy path retrieves with "" rather than skipping)
+  + `MemoryRuntime.retrieval_timeout` reproducing the persistent path's
+  per-store-call 5 s guard *per call* (None = worker/unbounded): each
+  retriever bounds its own awaits via `_bounded`, so a hung memory lookup
+  still never starves the KB lookup, and a timed-out decrement never
+  blocks retrieval — same outcomes as the legacy split `wait_for`s.
+  Shared fixtures extracted to `tests/_memory_fixtures.py` (the
+  `_fs_backend.py` pattern); **persistent equivalence suite**
+  (`tests/test_memory_persistent_equivalence.py`, 11 cases) pins the
+  payload against a verbatim reproduction of persistent_graph.py:527-659:
+  byte parity, identical store await-signatures legacy-vs-manager
+  (incl. multi-project UUID list), empty-query parity, and timeout parity
+  (memory-timeout→KB proceeds, KB-timeout→memory proceeds,
+  decrement-timeout→retrieve proceeds, None→`wait_for` never called).
+  Deliberately call-site (cutover's concern): pair *insertion position*
+  (persistent inserts after the SystemMessage; the payload is
+  position-agnostic) and the per-inner-iteration pair re-creation —
+  content is invariant within a turn, only the synthetic id suffix
+  differs, and nothing consumes those ids beyond prefix checks.
+  persistent_graph.py untouched. Next: slice 4 (capture() write path).
+- **2026-06-11 — Phase 1 slice 4 (capture() write path) shipped**: seven
+  writers in `plugins/legacy_writers.py`, one per legacy call site (full
+  site→writer map in its module docstring): `interval_extractor` (worker
+  in-loop, *modulo* gate via the real `_should_extract_memories`, gap
+  window, aux-task-flag gate), `persistent_interval_extractor` (*elapsed*
+  gate, fixed-width window, no phase kwarg, no task-flag gate — the
+  per-mode asymmetries are real legacy behaviour, preserved as two
+  registered writers the per-mode YAML pipelines pick between),
+  `phase_boundary_extractor`, `teardown_extractor` (session_end +
+  idle_archive, legacy log lines kept so the k3d B1 signals stay
+  greppable; B11's `_terminate_session` lands on it at cutover),
+  `memory_assembler` (TTL curation, reads
+  `extra["current_injection_text"]`), `compaction_memory` (the
+  graph.py:842 compaction-summary store — a sixth write site the doc's
+  list missed), `queued_memory` (the graph.py:3438 drain of
+  todo_complete-queued memories = the doc's "todo_complete queuing").
+  `CaptureEvent` gained `turn_count`; `MemoryRuntime` gained
+  `auxiliary_config` + `assembler_prompt` (prompts read at event time —
+  persistent re-resolves on config.update). Interval state is
+  writer-internal: matches persistent exactly (loop-local, resets to 0
+  even on resume — legacy does too); for the worker it replaces
+  checkpointed `last_observed_turn`, so a resume can only *widen* one
+  extraction window (completeness>precision, capped by
+  `_MAX_OBSERVATION_WINDOW`). State advances at trigger regardless of
+  task outcome (the documented B1 follow-up; teardown is the net).
+  `trigger_phrase_gen`/`cosine_dedup` from the §6 sketch are NOT separate
+  writers — they already ride inside ExtractMemoriesTask /
+  RecallStore.store. **Equivalence**
+  (`tests/test_memory_capture_equivalence.py`, 21 cases): per-site
+  verbatim legacy reproductions vs writers over identical event
+  sequences with spy await-list equality (REAL gates + REAL loader
+  configs), kwarg-shape pins (worker passes phase+window, persistent no
+  phase, boundary no window, teardown exactly 4 kwargs), gate/disable
+  cases, per-item drain containment, manager kind-routing. Known timing
+  delta, accepted: legacy fires extraction+assembly as parallel
+  create_tasks; capture() awaits writers sequentially inside one
+  background task — same calls, serialized (arguably kinder to the
+  flaky aux router). Graphs/persistent_app untouched.
+  Next: slice 5 (cutover behind `memory.manager.enabled`).
 **Companions:**
 - [`agent_memory_current_state.md`](agent_memory_current_state.md) — ground truth: every
   current capability classified wired/dead/conceptual with `file:line` evidence.
@@ -445,7 +506,7 @@ pre-flight (2026-06-11): B2 halfvec migrations shipped + k3d-verified (Phase 3's
 frozen until Phase-1 equivalence fixtures pin it (mapping in `memory_bugs.md`
 §Suggested order).
 
-### Phase 1 — The foundation: MemoryManager seam · ~1–1.5 wk ← **start here**
+### Phase 1 — The foundation: MemoryManager seam · ~1–1.5 wk ← **in progress: slices 1–4 of 5 done, cutover remains** (see implementation log)
 Extract all assembly + capture logic from `graph.py` / `persistent_graph.py` /
 `persistent_app.py` into `src/services/memory/` behind the §2.1 interface. Both graphs
 hold one `MemoryManager`; neither touches `RecallStore`/`KnowledgeStore` directly. v1

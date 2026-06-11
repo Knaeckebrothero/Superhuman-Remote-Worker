@@ -55,6 +55,27 @@ migration plan live in [[agent_memory_overhaul]].
 >   RecallStore init sites, and surfaces health on both agent status endpoints.
 > - **Aux logging**: the four memory catches in `auxiliary.py` now log
 >   `type(e).__name__`, so openai-style exceptions no longer log as empty strings.
+>
+> **Phase-1 seam deltas (2026-06-11, slices 1–4 on develop).** Production behaviour
+> is unchanged (cutover flag `memory.manager.enabled` off, both graphs untouched),
+> but two things change how this snapshot should be read:
+> - A parallel implementation of the full memory path now exists in
+>   `src/services/memory/`: MemoryManager kernel, the `recall_two_tier`/`kb_notes`
+>   read plugins + transplanted injection mechanics, and seven capture writers
+>   (`plugins/legacy_writers.py`) covering every write site this doc catalogs —
+>   including the compaction-summary store and the todo_complete queue drain.
+>   Nothing in production constructs it yet.
+> - **The audited read AND write paths are now fixture-pinned**: the read blocks
+>   (graph.py:888-1037, persistent_graph.py:527-659) and the write sites
+>   (graph.py:1528-1606 in-loop extract/assemble, :2037-2054 phase boundary,
+>   :842-860 compaction store, :3438-3444 queued drain;
+>   persistent_graph.py:420-443 loop extraction; the persistent_app.py
+>   archive/idle teardowns) are reproduced verbatim and compared against the
+>   seam in `tests/test_memory_worker_equivalence.py`,
+>   `tests/test_memory_persistent_equivalence.py`, and
+>   `tests/test_memory_capture_equivalence.py`. Until cutover those legacy
+>   blocks are frozen-and-enforced — any change there must update the
+>   equivalence suites in lockstep.
 
 Classification legend:
 
