@@ -1,0 +1,164 @@
+{{- if .Values.agent.networkPolicy.enabled }}
+# Agent-pod egress NetworkPolicy.
+#
+# Agent pods (job agents `app: srw-agent` and persistent-session agents
+# `app: srw-persistent-agent`) are provisioned dynamically by the
+# orchestrator, not by Helm, and historically had NO NetworkPolicy at all —
+# unlike workspace pods (workspace-network-policy.yaml). The agent process
+# holds internal credentials (LLM keys, EMBEDDING_*, DB creds injected via
+# config_override.env_keys), so an unrestricted egress surface there is the
+# highest-value exfiltration/SSRF target in the system. This policy is the
+# companion control to the local-execution-fallback removals (in-pod browser,
+# local libtmux, local git-clone) — see no_workspace_agent_mode.md §9.1 and
+# docs/issues/remove_local_browser_fallback.md.
+#
+# Shape mirrors the workspace `internet-only` tier: in-cluster dependencies
+# are allowed by podSelector; public internet is allowed on TCP 80/443/22 with
+# the RFC1918 / link-local / cluster CIDRs subtracted via `except`, so the pod
+# can reach external APIs (LLM providers, Tavily, external Keycloak) but cannot
+# pivot into the cluster network, home LAN, or the cloud-metadata endpoint.
+#
+# DEFAULT OFF (opt-in). The stock chart deploys no in-cluster LLM
+# (llm.seed.systemEndpoints defaults to []), so external LLM/Keycloak work
+# over the 443 wildcard out of the box — but a deployment whose LLM, Keycloak,
+# or cloud lives on an RFC1918 address (in-cluster other-namespace, or the
+# home LAN) MUST add an `extraEgress` carve-out before enabling, or agents
+# lose model access. See docs/issues/agent_egress_networkpolicy_enablement.md
+# for the discovery recipe + checklist.
+#
+# Single policy (no per-tier model): agent pods are control plane, not the
+# tenant-isolation boundary workspaces are. matchExpressions selects both
+# agent app labels (matchLabels cannot express the OR).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "srw.fullname" . }}-agent-egress
+  labels:
+    {{- include "srw.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app
+        operator: In
+        values:
+          - srw-agent
+          - srw-persistent-agent
+  policyTypes:
+    - Egress
+  egress:
+    # DNS resolution (kube-dns / CoreDNS in kube-system).
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Orchestrator HTTP — delegation (create_worker_job), lifecycle calls,
+    # config/prompt fetches, MCP-over-HTTP for orchestrator tools.
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "orchestrator") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 8085
+    # NATS — VM lifecycle events / job signalling.
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "nats") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 4222
+    # Workspace pods — RemoteBackend shell (SSH 30022) and the browser-exec
+    # daemon (CDP 9222). Covers both container and VM workspaces (KubeVirt
+    # propagates the component label to the virt-launcher pod).
+    - to:
+        - podSelector:
+            matchLabels:
+              srw.io/component: agent-workspace
+      ports:
+        - protocol: TCP
+          port: 30022
+        - protocol: TCP
+          port: 9222
+    # PostgreSQL (App DB) — in-process datasource SQL tools (psql-equivalent).
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "postgres") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 5432
+    # PostgreSQL (Vector DB) — memory / knowledge-base embeddings store.
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "pgvector") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 5432
+    # Neo4j — in-process graph datasource tools.
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "neo4j") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 7688
+    # MongoDB — in-process document datasource tools.
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "mongodb") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 27017
+    {{- if .Values.nextcloud.enabled }}
+    # Nextcloud — cloud file sync / control-plane WebDAV + OCS.
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "nextcloud") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 80
+    {{- end }}
+    {{- if .Values.opencloud.enabled }}
+    # OpenCloud — cloud file sync / control-plane WebDAV + LibreGraph.
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "opencloud") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 9200
+    {{- end }}
+    # Public internet (TCP 80/443 for external LLM providers, Tavily web
+    # research, external Keycloak token-exchange; 22 for completeness). The
+    # `except` list subtracts cluster CIDRs, the home LAN, and link-local /
+    # cloud-metadata so the pod cannot reach them through the wildcard —
+    # in-cluster services are reachable only via the explicit podSelector
+    # rules above. RFC1918 LLM/Keycloak/cloud need an `extraEgress` entry.
+    - ports:
+        - protocol: TCP
+          port: 80
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 22
+      to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              {{- range $cidr := .Values.agent.networkPolicy.except }}
+              - {{ $cidr }}
+              {{- end }}
+    {{- with .Values.agent.networkPolicy.extraEgress }}
+    # Deployment-specific egress carve-outs (raw NetworkPolicy egress entries).
+    # Typical use: an in-cluster LLM in another namespace (namespaceSelector),
+    # or a LAN LLM/Keycloak/cloud endpoint (ipBlock) that the `except` list
+    # above otherwise denies. K8s egress rules are additive (union) — a more
+    # specific allow here re-opens what the wildcard subtracts.
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+{{- end }}

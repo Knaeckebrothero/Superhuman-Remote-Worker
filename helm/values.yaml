@@ -150,6 +150,42 @@ agent:
   pdb:
     enabled: true
     minAvailable: 0
+  # -- Egress NetworkPolicy for agent pods (helm/templates/agent/network-policy.yaml).
+  # Agent pods hold internal credentials and historically had NO policy at all;
+  # this is the companion control to the local-execution-fallback removals
+  # (no_workspace_agent_mode.md §9.1). In-cluster dependencies are allowed by
+  # podSelector; public internet is allowed on TCP 80/443/22 minus the `except`
+  # CIDRs below.
+  networkPolicy:
+    # -- DEFAULT OFF (opt-in). External LLM/Keycloak/Tavily work over the 443
+    # wildcard out of the box, but a deployment whose LLM, Keycloak, or cloud
+    # lives on an RFC1918 address (in-cluster other-namespace, or the home LAN)
+    # MUST add an `extraEgress` carve-out before enabling, or agents lose model
+    # access. See docs/issues/agent_egress_networkpolicy_enablement.md.
+    enabled: false
+    # -- CIDRs subtracted from the 0.0.0.0/0 internet egress allow. Cluster
+    # CIDRs + home LAN + link-local/metadata denied by default (prod-safe,
+    # matches the workspace `internet-only` tier); in-cluster services stay
+    # reachable only via the explicit podSelector rules in the template.
+    except:
+      - 10.0.50.0/24       # K3s nodes
+      - 10.0.51.0/24       # MetalLB IPs (use podSelector for in-cluster services)
+      - 10.42.0.0/16       # pod CIDR
+      - 10.43.0.0/16       # service CIDR
+      - 192.168.178.0/24   # home LAN
+      - 169.254.0.0/16     # link-local / cloud-metadata
+    # -- Extra egress rules appended verbatim to the policy (raw NetworkPolicy
+    # egress entries). Use for an in-cluster LLM in another namespace
+    # (namespaceSelector) or a LAN LLM/Keycloak/cloud endpoint (ipBlock) that
+    # the `except` list above denies. Example:
+    #   - to:
+    #       - namespaceSelector:
+    #           matchLabels:
+    #             kubernetes.io/metadata.name: ai
+    #     ports:
+    #       - protocol: TCP
+    #         port: 8000
+    extraEgress: []
   # -- Agent pool sizing (AgentProvisioner)
   pool:
     maxAgents: "10"
