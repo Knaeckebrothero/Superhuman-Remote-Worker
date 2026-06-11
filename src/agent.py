@@ -15,7 +15,6 @@ Key Features:
 import asyncio
 import logging
 import os
-import shutil
 import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
@@ -1722,11 +1721,10 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         )
         self._tool_context = context
 
-        # Initialize ShellManager for persistent terminal sessions
+        # Initialize ShellManager for persistent terminal sessions. Shells run
+        # only on the workspace — there is no local (in-pod) tmux fallback.
         ws_backend = self._workspace_manager.backend
-        use_remote_shell = getattr(ws_backend, "supports_shell", False)
-
-        if use_remote_shell or shutil.which("tmux"):
+        if getattr(ws_backend, "supports_shell", False):
             try:
                 from src.tools.shell.shell_manager import ShellManager
 
@@ -1745,7 +1743,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                     sandbox_cwd=str(self._workspace_manager.path)
                     if shell_config.get("sandbox", True)
                     else None,
-                    backend=ws_backend if use_remote_shell else None,
+                    backend=ws_backend,
                     sudo_action=sudo_action,
                 )
                 context.shell_manager = shell_manager
@@ -1754,7 +1752,10 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             except Exception as e:
                 logger.warning(f"Failed to initialize ShellManager (non-fatal): {e}")
         else:
-            logger.debug("tmux not found — shell tools disabled")
+            logger.info(
+                "Workspace backend does not support shell — shell tools "
+                "disabled (no local fallback)"
+            )
 
         # Initialize RecallStore for Memory Light (if enabled)
         if self.config.memory.enabled:

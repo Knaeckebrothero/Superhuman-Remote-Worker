@@ -1,33 +1,32 @@
-"""Persistent shell session manager backed by tmux.
+"""Persistent shell session manager — delegates to the workspace backend.
 
-Provides a terminal multiplexer that gives the agent persistent, named shells.
-The default "default" shell persists across calls, preserving environment
-variables, working directory, and command history.
+The agent's shells run ON THE WORKSPACE (container pod or VM), never in the
+agent pod: ShellManager requires a workspace backend that declares
+``supports_shell`` and forwards every operation to it (RemoteBackend drives
+tmux on the workspace over SSH). The former local-libtmux execution path was
+removed — it served a bare-metal dev posture that is deprecated, and a
+dormant in-pod execution path is a liability (same rationale as
+docs/issues/remove_local_browser_fallback.md; see
+docs/features/no_workspace_agent_mode.md §9).
 
-Shells are auto-created on first use and closed via `exit`. Two tools expose
-this manager: shell_execute (run commands / send keys) and shell_read (read
-scrollback history).
+What remains agent-side:
+  * sudo interception and blocked-command gating (must fire before any
+    delegation so the backend path cannot bypass them),
+  * the shared sentinel/stall machinery (templates + pure helpers) consumed
+    by the backend implementation in src/core/backends/remote.py.
 
-Requires: tmux installed and accessible via PATH.
-Uses: libtmux for programmatic tmux control.
+Two tools expose this manager: shell_execute / run_command and shell_read.
 """
 
 import logging
 import re
-import threading
-import time
 import uuid
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-import libtmux
-
 logger = logging.getLogger(__name__)
-
-# Tab name validation pattern
-TAB_NAME_PATTERN = re.compile(r"^[a-z0-9-]{1,20}$")
 
 
 def build_sentinel_command(command: str, sentinel: str) -> Tuple[str, Optional[str]]:
@@ -267,16 +266,10 @@ def prompt_is_ready(all_lines: List[str]) -> bool:
 
 @dataclass
 class ShellTab:
-    """Tracks per-tab state for a persistent shell session."""
+    """Agent-side stub tracking a tab that lives on the workspace backend."""
 
     name: str
     tab_type: str  # "shell", "ssh", "repl", "process"
-    window: Any  # libtmux.Window
-    pane: Any  # libtmux.Pane
-    read_cursor: int = 0  # Line index for since_cursor reads
-    # Sentinel of a command that hit the soft/hard timeout and is still running
-    # on this tab. While set, new commands are refused (colliding-command guard).
-    pending_sentinel: Optional[str] = None
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     last_activity: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
@@ -291,19 +284,20 @@ class ShellTab:
 
 
 class ShellManager:
-    """Manages persistent tmux-backed shell sessions for the agent.
+    """Forwards persistent tmux-backed shell sessions to the workspace backend.
 
-    Creates a detached tmux session with a default shell and provides
-    methods for command execution, keystroke sending, and output reading.
-    New shells are auto-created on first use via ensure_tab().
+    Every operation delegates to a workspace backend that declares
+    ``supports_shell`` (e.g. RemoteBackend, which owns the tmux session on
+    the workspace over SSH). There is NO local execution path: constructing
+    a ShellManager without a shell-capable backend raises, and the callers
+    simply don't register shell tools for such workspaces (capability, not
+    inference).
 
-    When a workspace backend with shell support is provided (e.g. RemoteBackend),
-    all shell operations are delegated to the backend. Otherwise, local libtmux
-    is used directly (current behavior).
+    Agent-side gating (sudo interception, blocked commands) runs before any
+    delegation so the backend path cannot bypass it. Tab limits, scrollback
+    and timeout semantics are enforced by the backend implementation; the
+    corresponding constructor parameters are retained for config plumbing.
     """
-
-    # Compiled patterns for ANSI escape filtering
-    _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]|\x1b\].*?\x07")
 
     def __init__(
         self,
@@ -317,26 +311,38 @@ class ShellManager:
         backend: Optional[Any] = None,
         sudo_action: str = "freeze",
     ):
-        """Initialize ShellManager with a new tmux session.
+        """Initialize ShellManager over a shell-capable workspace backend.
 
         Args:
             job_id: Unique job identifier (used in session name)
-            max_tabs: Maximum number of concurrent shell tabs
-            scrollback_limit: Tmux history-limit per pane
+            max_tabs: Maximum number of concurrent shell tabs (backend-enforced)
+            scrollback_limit: Tmux history-limit per pane (backend-enforced)
             default_timeout: Default (hard) timeout for run_sync in seconds
+                             (backend-enforced)
             no_change_timeout: Seconds of no new output before a still-running
-                               command yields control back (soft timeout).
-                               Disabled when the caller passes an explicit timeout.
+                               command yields control back (backend-enforced)
             blocked_commands: Commands to block (None = use defaults)
-            sandbox_cwd: Working directory to restrict commands to (None = no restriction)
-            backend: Optional workspace backend with shell support. When provided
-                     and backend.supports_shell is True, all shell operations delegate
-                     to the backend (for remote execution). When None, local libtmux
-                     is used.
+            sandbox_cwd: Working directory to restrict commands to (backend
+                         workspaces start in the workspace root)
+            backend: Workspace backend with shell support — REQUIRED. All
+                     shell operations delegate to it.
             sudo_action: How to handle sudo commands. "freeze" returns a sentinel
                          for the tool layer to trigger a job freeze (VM upgrade prompt).
                          "block" hard-rejects. "allow" passes through (VM-backed agents).
+
+        Raises:
+            RuntimeError: If no backend is given or it does not declare shell
+                support. The local (in-pod) libtmux execution path was removed —
+                shells only run on the workspace, never in the agent pod.
         """
+        if backend is None or not getattr(backend, "supports_shell", False):
+            raise RuntimeError(
+                "ShellManager requires a workspace backend with shell support "
+                "(backend.supports_shell=True). Local in-pod tmux execution was "
+                "removed — shells run only on the workspace. See "
+                "docs/features/no_workspace_agent_mode.md §9."
+            )
+
         self.job_id = job_id
         self.max_tabs = max_tabs
         self.scrollback_limit = scrollback_limit
@@ -351,159 +357,30 @@ class ShellManager:
         else:
             self.blocked_commands = frozenset(blocked_commands)
 
-        # Check if we should delegate to the backend
-        self._use_backend = backend is not None and getattr(
-            backend, "supports_shell", False
-        )
-
-        if self._use_backend:
-            # Backend handles all shell state — no local tmux needed
-            self._sync_lock = threading.Lock()
-            self._tabs = OrderedDict()
-            self._session_name = f"agent_{job_id[:12]}"
-            logger.info(
-                f"ShellManager initialized with backend delegation: "
-                f"session={self._session_name}"
-            )
-            return
-
-        # --- Local libtmux initialization (existing behavior) ---
-
-        # Thread lock for synchronous command execution
-        self._sync_lock = threading.Lock()
-
-        # Tab storage (ordered for consistent iteration)
+        # Agent-side stubs mirroring backend tabs (bookkeeping only — the
+        # backend owns the authoritative tab state).
         self._tabs: OrderedDict[str, ShellTab] = OrderedDict()
-
-        # Create tmux session
-        session_name = f"agent_{job_id[:12]}"
-        self._server = libtmux.Server()
-
-        # Kill any stale session with the same name
-        existing = self._server.sessions.filter(session_name=session_name)
-        if existing:
-            for s in existing:
-                s.kill()
-
-        self._session = self._server.new_session(
-            session_name=session_name,
-            window_name="default",
-            x=200,
-            y=30,
-            detach=True,
-        )
-        self._session_name = session_name
-
-        # Set history limit
-        self._session.set_option("history-limit", str(scrollback_limit))
-
-        # Register default shell tab
-        default_window = self._session.active_window
-        default_pane = default_window.active_pane
-        self._tabs["default"] = ShellTab(
-            name="default",
-            tab_type="shell",
-            window=default_window,
-            pane=default_pane,
-        )
-
-        # Run setup (non-interactive env + optional cd) and wait for it to
-        # finish so the preamble fully settles and never folds into the first
-        # command's captured output.
-        setup = NONINTERACTIVE_ENV_EXPORT
-        if self.sandbox_cwd:
-            setup += f"; cd {self.sandbox_cwd}"
-        self._send_and_wait(default_pane, setup)
-
+        self._session_name = f"agent_{job_id[:12]}"
         logger.info(
-            f"ShellManager initialized: session={session_name}, "
-            f"tabs={list(self._tabs.keys())}"
+            f"ShellManager initialized with backend delegation: "
+            f"session={self._session_name}"
         )
-
-    def _send_and_wait(self, pane, command: str, timeout: float = 5.0) -> None:
-        """Send a setup command and block until it has run.
-
-        Appends a unique marker and polls until the marker prints on its own
-        line, confirming the command finished and the prompt returned. Used for
-        tab-creation preamble (env export, cd) so it fully settles before the
-        first user command — otherwise a race could fold the preamble into that
-        command's captured output.
-        """
-        marker = f"__READY_{uuid.uuid4().hex[:8]}__"
-        pane.send_keys(f"{command}; echo {marker}", enter=True)
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            try:
-                captured = pane.capture_pane(start="-{}".format(self.scrollback_limit))
-            except Exception:
-                return
-            lines = (
-                captured.splitlines() if isinstance(captured, str) else list(captured)
-            )
-            if any(ln.strip() == marker for ln in lines):
-                return
-            time.sleep(0.05)
-
-    def _ensure_session_alive(self) -> None:
-        """Recreate the tmux session if it has died externally."""
-        if self._use_backend:
-            return  # Backend manages its own session
-        if self.is_alive():
-            return
-
-        logger.warning(f"Tmux session '{self._session_name}' is dead, recreating")
-        self._tabs.clear()
-
-        self._session = self._server.new_session(
-            session_name=self._session_name,
-            window_name="default",
-            x=200,
-            y=30,
-            detach=True,
-        )
-        self._session.set_option("history-limit", str(self.scrollback_limit))
-
-        default_window = self._session.active_window
-        default_pane = default_window.active_pane
-        self._tabs["default"] = ShellTab(
-            name="default",
-            tab_type="shell",
-            window=default_window,
-            pane=default_pane,
-        )
-
-        setup = NONINTERACTIVE_ENV_EXPORT
-        if self.sandbox_cwd:
-            setup += f"; cd {self.sandbox_cwd}"
-        self._send_and_wait(default_pane, setup)
 
     def ensure_tab(self, name: str) -> ShellTab:
-        """Get an existing tab or auto-create a new shell tab.
+        """Get an existing tab or auto-create a new shell tab on the backend.
 
         Args:
             name: Tab name (lowercase alphanumeric + hyphens, max 20 chars)
 
         Returns:
-            ShellTab instance (existing or newly created)
+            ShellTab stub (existing or newly created)
 
         Raises:
-            ValueError: If name is invalid
+            ValueError: If name is invalid (backend-validated)
         """
-        if self._use_backend:
-            self._backend.shell_ensure_tab(name)
-            # Return a stub ShellTab for compatibility
-            if name not in self._tabs:
-                self._tabs[name] = ShellTab(
-                    name=name,
-                    tab_type="shell",
-                    window=None,
-                    pane=None,
-                )
-            return self._tabs[name]
-        self._ensure_session_alive()
-        if name in self._tabs:
-            return self._tabs[name]
-        self.open_tab(name)
+        self._backend.shell_ensure_tab(name)
+        if name not in self._tabs:
+            self._tabs[name] = ShellTab(name=name, tab_type="shell")
         return self._tabs[name]
 
     def open_tab(
@@ -512,7 +389,7 @@ class ShellManager:
         command: Optional[str] = None,
         tab_type: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Open a new named tab in the tmux session.
+        """Open a new named tab in the backend's tmux session.
 
         Args:
             name: Tab name (lowercase alphanumeric + hyphens, max 20 chars)
@@ -524,77 +401,16 @@ class ShellManager:
             Metadata dict for the new tab
 
         Raises:
-            ValueError: If name is invalid or duplicate
+            ValueError: If name is invalid or duplicate (backend-validated)
         """
-        if self._use_backend:
-            metadata = self._backend.shell_open_tab(
-                name, command=command, tab_type=tab_type
-            )
-            # Create stub ShellTab for local tracking
-            self._tabs[name] = ShellTab(
-                name=name,
-                tab_type=metadata.get("type", "shell"),
-                window=None,
-                pane=None,
-            )
-            return metadata
-        # Validate name
-        if not TAB_NAME_PATTERN.match(name):
-            raise ValueError(
-                f"Invalid tab name '{name}': must match {TAB_NAME_PATTERN.pattern}"
-            )
-
-        if name in self._tabs:
-            raise ValueError(f"Tab '{name}' already exists")
-
-        if len(self._tabs) >= self.max_tabs:
-            tab_names = ", ".join(self._tabs.keys())
-            raise ValueError(
-                f"Maximum tabs ({self.max_tabs}) reached. Close unused tabs first: "
-                f"shell_execute(command='exit', name='<tab>') — repeat until the tab closes. "
-                f"Open tabs: {tab_names}"
-            )
-
-        # Auto-detect type from command
-        if tab_type is None:
-            tab_type = "shell"
-            if command:
-                first_word = command.strip().split()[0]
-                # Strip path prefix (e.g. /usr/bin/python -> python)
-                base_cmd = first_word.rsplit("/", 1)[-1]
-                tab_type = COMMAND_TYPE_MAP.get(base_cmd, "process")
-
-        # Create tmux window
-        window = self._session.new_window(
-            window_name=name,
-            attach=False,
+        metadata = self._backend.shell_open_tab(
+            name, command=command, tab_type=tab_type
         )
-        pane = window.active_pane
-
-        # Non-interactive env + working directory (shell/process tabs only —
-        # REPLs/SSH manage their own environment). Wait for the preamble to
-        # settle so it doesn't fold into the first command's output.
-        if tab_type in ("shell", "process"):
-            setup = NONINTERACTIVE_ENV_EXPORT
-            if self.sandbox_cwd:
-                setup += f"; cd {self.sandbox_cwd}"
-            self._send_and_wait(pane, setup)
-
-        # Run initial command if provided
-        if command:
-            pane.send_keys(command, enter=True)
-
-        # Create tab entry
-        tab = ShellTab(
+        self._tabs[name] = ShellTab(
             name=name,
-            tab_type=tab_type,
-            window=window,
-            pane=pane,
+            tab_type=metadata.get("type", "shell"),
         )
-        self._tabs[name] = tab
-
-        logger.info(f"Opened tab '{name}' (type={tab_type}, command={command!r})")
-        return tab.to_metadata()
+        return metadata
 
     def send(self, name: str, text: str, enter: bool = True) -> str:
         """Send keystrokes to a tab.
@@ -610,18 +426,13 @@ class ShellManager:
         Raises:
             KeyError: If tab doesn't exist
         """
-        # Check blocked commands when actually executing (enter=True)
+        # Check blocked commands when actually executing (enter=True).
         # Must run before backend delegation so sudo intercept always fires.
         if enter:
             blocked = self._check_blocked(text)
             if blocked:
                 return blocked
-        if self._use_backend:
-            return self._backend.shell_send(name, text, enter=enter)
-        tab = self._get_tab(name)
-        tab.pane.send_keys(text, enter=enter)
-        tab.last_activity = datetime.now(timezone.utc)
-        return f"Sent to '{name}'"
+        return self._backend.shell_send(name, text, enter=enter)
 
     def read(
         self,
@@ -642,43 +453,10 @@ class ShellManager:
         Raises:
             KeyError: If tab doesn't exist
         """
-        if self._use_backend:
-            return self._backend.shell_read(
-                name, lines=lines, since_cursor=since_cursor
-            )
-        tab = self._get_tab(name)
-        all_lines = self._capture_lines(tab)
-        total_lines = len(all_lines)
-
-        if since_cursor:
-            # Return only lines after the read cursor
-            new_lines = all_lines[tab.read_cursor :]
-            tab.read_cursor = total_lines
-            text = "\n".join(new_lines) if new_lines else "(no new output)"
-            metadata = {
-                "tab": name,
-                "mode": "since_cursor",
-                "lines_returned": len(new_lines),
-                "total_lines": total_lines,
-            }
-        else:
-            # Return last N lines
-            start = max(0, total_lines - lines)
-            selected = all_lines[start:]
-            tab.read_cursor = total_lines
-            text = "\n".join(selected) if selected else "(empty)"
-            metadata = {
-                "tab": name,
-                "mode": "tail",
-                "lines_requested": lines,
-                "lines_returned": len(selected),
-                "total_lines": total_lines,
-            }
-
-        return text, metadata
+        return self._backend.shell_read(name, lines=lines, since_cursor=since_cursor)
 
     def close_tab(self, name: str) -> str:
-        """Close a tab by killing its tmux window.
+        """Close a tab by killing its tmux window on the backend.
 
         Args:
             name: Tab name
@@ -689,15 +467,9 @@ class ShellManager:
         Raises:
             KeyError: If tab doesn't exist
         """
-        if self._use_backend:
-            result = self._backend.shell_close_tab(name)
-            self._tabs.pop(name, None)
-            return result
-        tab = self._get_tab(name)
-        tab.window.kill()
-        del self._tabs[name]
-        logger.info(f"Closed tab '{name}'")
-        return f"Tab '{name}' closed"
+        result = self._backend.shell_close_tab(name)
+        self._tabs.pop(name, None)
+        return result
 
     def read_with_offset(
         self,
@@ -723,55 +495,15 @@ class ShellManager:
         Raises:
             KeyError: If tab doesn't exist
         """
-        if self._use_backend:
-            return self._backend.shell_read_with_offset(
-                name, lines=lines, offset=offset
-            )
-        tab = self._get_tab(name)
-        all_lines = self._capture_lines(tab)
-        total_lines = len(all_lines)
-
-        if offset is not None:
-            # Read `lines` lines starting from absolute offset
-            start = max(0, min(offset, total_lines))
-            end = min(start + lines, total_lines)
-            selected = all_lines[start:end]
-            text = "\n".join(selected) if selected else "(empty)"
-            metadata = {
-                "tab": name,
-                "mode": "offset",
-                "offset": start,
-                "lines_returned": len(selected),
-                "total_lines": total_lines,
-            }
-        else:
-            # Tail: return last N lines
-            start = max(0, total_lines - lines)
-            selected = all_lines[start:]
-            text = "\n".join(selected) if selected else "(empty)"
-            metadata = {
-                "tab": name,
-                "mode": "tail",
-                "lines_returned": len(selected),
-                "total_lines": total_lines,
-            }
-
-        return text, metadata
+        return self._backend.shell_read_with_offset(name, lines=lines, offset=offset)
 
     def format_tab_header(self) -> str:
         """Build tab header string showing all live shells.
 
-        Prunes dead tabs first, then returns format like:
-        [Shells: default | gpu-box | dev-server]
-
         Returns:
-            Header string
+            Header string like ``[Shells: default | gpu-box]``
         """
-        if self._use_backend:
-            return self._backend.shell_format_tab_header()
-        self._prune_dead_tabs()
-        names = list(self._tabs.keys())
-        return f"[Shells: {' | '.join(names)}]"
+        return self._backend.shell_format_tab_header()
 
     def list_tabs(self) -> List[Dict[str, Any]]:
         """Return metadata for all tabs.
@@ -779,10 +511,7 @@ class ShellManager:
         Returns:
             List of tab metadata dicts
         """
-        if self._use_backend:
-            return self._backend.shell_list_tabs()
-        self._prune_dead_tabs()
-        return [tab.to_metadata() for tab in self._tabs.values()]
+        return self._backend.shell_list_tabs()
 
     def run_sync(
         self,
@@ -791,15 +520,18 @@ class ShellManager:
         working_dir: Optional[str] = None,
         tab_name: str = "default",
     ) -> str:
-        """Execute a command synchronously in a shell-type tab.
+        """Execute a command synchronously in a shell-type tab on the backend.
 
-        Uses a sentinel marker pattern to detect command completion and
-        extract the exit code. Thread-safe via lock.
+        The backend uses a sentinel marker pattern to detect command
+        completion and extract the exit code; it derives the soft (no-change)
+        and hard timeouts from ``timeout`` exactly as documented on the
+        module constants (an explicit timeout disables the soft no-change
+        timeout).
 
         Args:
             command: Shell command to execute
-            timeout: Timeout in seconds (default: self.default_timeout)
-            working_dir: Working directory for the command (relative to sandbox)
+            timeout: Timeout in seconds (None => backend default + soft timeout)
+            working_dir: Working directory for the command (relative to workspace)
             tab_name: Name of the tab to run in (default "default"). Must be
                       a shell-type tab (sentinel detection requires a bash-like shell).
 
@@ -809,7 +541,6 @@ class ShellManager:
         Raises:
             ValueError: If command is blocked or tab is not shell-type
             KeyError: If tab does not exist
-            TimeoutError: If command exceeds timeout
         """
         # Safety check — must run before backend delegation so sudo
         # intercept and blocked-command checks always fire.
@@ -817,427 +548,21 @@ class ShellManager:
         if blocked:
             return blocked
 
-        # An explicit timeout disables the soft no-change timeout (the caller is
-        # telling us the command is expected to run long / quietly); only the
-        # hard timeout then bounds it.
-        soft_enabled = timeout is None
-
-        if self._use_backend:
-            # Pass timeout through as-is (None => soft timeout enabled). The
-            # backend derives soft/hard exactly as the local path does below.
-            return self._backend.shell_run(
-                command,
-                timeout=timeout,
-                tab_name=tab_name,
-                working_dir=working_dir,
-            )
-
-        if timeout is None:
-            timeout = self.default_timeout
-        timeout = min(timeout, HARD_TIMEOUT_CAP_SECONDS)
-
-        sentinel = f"__DONE_{uuid.uuid4().hex[:12]}__"
-        tab = self._get_tab(tab_name)
-
-        # Validate tab type — sentinel approach only works in bash-like shells
-        if tab.tab_type not in ("shell",):
-            raise ValueError(
-                f"Synchronous execution only works on shell-type tabs. "
-                f"Tab '{tab_name}' is type '{tab.tab_type}'. "
-                f"Use is_async=True for interactive tabs."
-            )
-
-        with self._sync_lock:
-            # --- Pre-flight check: is the tab already stuck? ---
-            # If an interactive prompt is already visible, refuse to send the
-            # command.  Sending it would type the command text into the waiting
-            # prompt (e.g. a [y/N] dialog), making things worse.
-            pre_lines = tab.pane.capture_pane(start="-{}".format(self.scrollback_limit))
-            if isinstance(pre_lines, str):
-                pre_check_lines = pre_lines.splitlines()
-            else:
-                pre_check_lines = list(pre_lines)
-
-            # Pre-flight 1: a genuine interactive prompt is already visible.
-            # Give the specific "answer the prompt" guidance.
-            existing_prompt = self._detect_blocked_tab(pre_check_lines, tab)
-            if existing_prompt:
-                state_lines = [ln for ln in pre_check_lines if ln.strip()][-30:]
-                terminal_state = "\n".join(state_lines) or "(empty)"
-                logger.debug(
-                    f"Tab '{tab_name}' is already blocked by "
-                    f"{existing_prompt} — command not sent: {command}"
-                )
-                return (
-                    f"Tab '{tab_name}' is blocked by a previous "
-                    f"{existing_prompt}. Your command was NOT executed.\n"
-                    f"Resolve the prompt first: send the expected input "
-                    f"with keys mode (e.g. keys='N' or keys='yes'), "
-                    f"send C-c to cancel, or use a different tab.\n"
-                    f"--- terminal state ---\n{terminal_state}"
-                )
-
-            # Pre-flight 2: colliding-command guard. A previous command on this
-            # tab hit the soft/hard timeout and may still be running. If neither
-            # its completion sentinel nor a fresh prompt has appeared, refuse the
-            # new command rather than queuing it behind the running one — which
-            # would head-of-line block the tab.
-            if tab.pending_sentinel is not None:
-                prev_done = any(
-                    ln.strip().startswith(tab.pending_sentinel)
-                    for ln in pre_check_lines
-                )
-                if prev_done or prompt_is_ready(pre_check_lines):
-                    tab.pending_sentinel = None
-                else:
-                    state_lines = [ln for ln in pre_check_lines if ln.strip()][-30:]
-                    terminal_state = "\n".join(state_lines) or "(empty)"
-                    return COLLIDING_COMMAND_TEMPLATE.format(
-                        tab=tab_name, terminal_state=terminal_state
-                    )
-
-            # Change directory if needed
-            if working_dir:
-                if self.sandbox_cwd:
-                    from pathlib import Path
-
-                    full_dir = str(Path(self.sandbox_cwd) / working_dir)
-                else:
-                    full_dir = working_dir
-                tab.pane.send_keys(f"cd {full_dir}", enter=True)
-                time.sleep(0.1)
-
-            # Record buffer position before command
-            pre_count = len(pre_check_lines)
-
-            # Build the sentinel-suffixed command. Multi-line commands get
-            # wrapped in a bash heredoc so inner heredocs / multi-statement
-            # scripts work correctly (BUG-5). See build_sentinel_command.
-            full_cmd, start_marker = build_sentinel_command(command, sentinel)
-            tab.pane.send_keys(full_cmd, enter=True)
-
-            # Poll for sentinel
-            start_time = time.monotonic()
-            output_text = ""
-            exit_code = None
-            last_content_hash = None
-            stall_start = None
-
-            while time.monotonic() - start_time < timeout:
-                time.sleep(0.2)
-                captured = tab.pane.capture_pane(
-                    start="-{}".format(self.scrollback_limit)
-                )
-                if isinstance(captured, str):
-                    all_lines = captured.splitlines()
-                else:
-                    all_lines = list(captured)
-
-                # Find the sentinel OUTPUT line (not the echoed command).
-                # The output line starts with the sentinel text: "__DONE_xxxx__ 0"
-                # The echoed command has it embedded: `echo "__DONE_xxxx__ $?"`
-                sentinel_line_idx = None
-                for i in range(len(all_lines) - 1, -1, -1):
-                    stripped = all_lines[i].strip()
-                    if stripped.startswith(sentinel):
-                        sentinel_line_idx = i
-                        break
-
-                if sentinel_line_idx is not None:
-                    line = all_lines[sentinel_line_idx]
-                    # Extract exit code from sentinel line: "__DONE_xxxx__ 0"
-                    parts = line.strip().split()
-                    try:
-                        exit_code = int(parts[-1]) if parts else 1
-                    except (ValueError, IndexError):
-                        exit_code = 1
-
-                    # Command finished — tab is no longer busy.
-                    tab.pending_sentinel = None
-
-                    if start_marker is not None:
-                        # Multi-line wrap path: locate the start marker output
-                        # line and extract everything between it and the sentinel.
-                        start_idx = None
-                        for i in range(sentinel_line_idx - 1, -1, -1):
-                            if all_lines[i].strip().startswith(start_marker):
-                                start_idx = i
-                                break
-                        if start_idx is not None:
-                            new_lines = all_lines[start_idx + 1 : sentinel_line_idx]
-                            output_lines = [
-                                ol
-                                for ol in new_lines
-                                if start_marker not in ol and sentinel not in ol
-                            ]
-                        else:
-                            # Marker not found — defensive fallback
-                            new_lines = all_lines[pre_count:sentinel_line_idx]
-                            output_lines = [
-                                ol for ol in new_lines if sentinel not in ol
-                            ]
-                    else:
-                        # Single-line path: existing extraction logic.
-                        # Extract output: lines between echoed command and sentinel.
-                        new_lines = all_lines[pre_count:sentinel_line_idx]
-                        # Filter out lines containing the sentinel (echoed command lines)
-                        output_lines = [ol for ol in new_lines if sentinel not in ol]
-                        # Skip prompt/command echo lines at the start
-                        while output_lines and (
-                            command.split()[0] in output_lines[0]
-                            or output_lines[0].strip().endswith("$")
-                        ):
-                            output_lines = output_lines[1:]
-
-                    output_text = "\n".join(output_lines).strip()
-                    break
-
-                # --- Early exit: genuine interactive prompt ---
-                # Only check after the command has had time to produce output.
-                elapsed = time.monotonic() - start_time
-                if elapsed > 1.0:
-                    prompt_type = self._detect_interactive_prompt(all_lines, tab)
-                    if prompt_type:
-                        terminal_state = self._capture_terminal_state(
-                            tab, sentinel, pre_count
-                        )
-                        logger.debug(
-                            f"Interactive prompt detected ({prompt_type}) "
-                            f"after {elapsed:.1f}s for: {command}"
-                        )
-                        # Command is waiting for input and owns the pane — don't
-                        # send a cwd-restore into it. Mark busy so a follow-up
-                        # command is guarded until the prompt is resolved.
-                        tab.pending_sentinel = sentinel
-                        tab.last_activity = datetime.now(timezone.utc)
-                        return INTERACTIVE_PROMPT_TEMPLATE.format(
-                            prompt_type=prompt_type,
-                            tab=tab_name,
-                            terminal_state=terminal_state,
-                        )
-
-                    # --- Soft no-change timeout (command still running) ---
-                    last_content_hash, stall_start, timed_out = compute_no_change_state(
-                        all_lines,
-                        last_content_hash,
-                        stall_start,
-                        time.monotonic(),
-                        soft_enabled,
-                        self.no_change_timeout,
-                    )
-                    if timed_out:
-                        terminal_state = self._capture_terminal_state(
-                            tab, sentinel, pre_count
-                        )
-                        logger.debug(
-                            f"No output change for {self.no_change_timeout:.0f}s "
-                            f"(still running) for: {command}"
-                        )
-                        # Leave the command running; don't cwd-restore into a
-                        # busy pane. Mark busy for the colliding-command guard.
-                        tab.pending_sentinel = sentinel
-                        tab.last_activity = datetime.now(timezone.utc)
-                        return STILL_RUNNING_TEMPLATE.format(
-                            tab=tab_name,
-                            elapsed=elapsed,
-                            quiet=time.monotonic() - stall_start,
-                            terminal_state=terminal_state,
-                        )
-
-            # Hard timeout: the loop exited without seeing the sentinel, so the
-            # command is still running. Report it as still-running (not killed,
-            # not an error) and leave the pane alone (no cwd-restore).
-            if exit_code is None:
-                terminal_state = self._capture_terminal_state(tab, sentinel, pre_count)
-                tab.pending_sentinel = sentinel
-                tab.last_activity = datetime.now(timezone.utc)
-                return STILL_RUNNING_HARDCAP_TEMPLATE.format(
-                    tab=tab_name, elapsed=timeout, terminal_state=terminal_state
-                )
-
-            # Completed — restore working directory if it was changed.
-            if working_dir and self.sandbox_cwd:
-                tab.pane.send_keys(f"cd {self.sandbox_cwd}", enter=True)
-                time.sleep(0.1)
-
-            tab.last_activity = datetime.now(timezone.utc)
-
-            # Format output
-            parts = [f"Exit code: {exit_code}"]
-            if output_text:
-                parts.append(f"--- stdout ---\n{output_text}")
-            else:
-                parts.append("(no output)")
-
-            return "\n".join(parts)
+        return self._backend.shell_run(
+            command,
+            timeout=timeout,
+            tab_name=tab_name,
+            working_dir=working_dir,
+        )
 
     def cleanup(self) -> None:
-        """Kill the entire tmux session and clean up."""
-        if self._use_backend:
-            self._backend.shell_cleanup()
-            self._tabs.clear()
-            return
-        try:
-            self._session.kill()
-            logger.info(f"Cleaned up tmux session '{self._session_name}'")
-        except Exception as e:
-            logger.warning(f"Error cleaning up tmux session: {e}")
+        """Kill the backend tmux session and clear local tab stubs."""
+        self._backend.shell_cleanup()
         self._tabs.clear()
 
     def is_alive(self) -> bool:
-        """Check if the tmux session still exists."""
-        if self._use_backend:
-            return self._backend.shell_is_alive()
-        try:
-            sessions = self._server.sessions.filter(session_name=self._session_name)
-            return len(sessions) > 0
-        except Exception:
-            return False
-
-    def _prune_dead_tabs(self) -> None:
-        """Remove tabs whose tmux windows are no longer alive."""
-        try:
-            live_window_ids = {w.id for w in self._session.windows}
-        except Exception:
-            return
-
-        dead = [
-            name
-            for name, tab in self._tabs.items()
-            if tab.window.id not in live_window_ids
-        ]
-        for name in dead:
-            del self._tabs[name]
-            logger.debug(f"Pruned dead tab '{name}'")
-
-    def _capture_lines(self, tab: ShellTab) -> List[str]:
-        """Capture and clean the pane buffer for a tab.
-
-        Returns:
-            List of output lines with trailing blanks stripped.
-        """
-        captured = tab.pane.capture_pane(start="-{}".format(self.scrollback_limit))
-        if isinstance(captured, str):
-            all_lines = captured.splitlines()
-        else:
-            all_lines = list(captured)
-
-        # Strip trailing empty lines
-        while all_lines and not all_lines[-1].strip():
-            all_lines.pop()
-
-        return all_lines
-
-    def _check_alternate_screen(self, tab: ShellTab) -> bool:
-        """Check if the pane is in alternate screen mode (vim, less, nano, etc.).
-
-        Returns:
-            True if alternate screen is active.
-        """
-        try:
-            result = tab.pane.cmd("display-message", "-p", "#{alternate_on}")
-            return result.stdout and result.stdout[0].strip() == "1"
-        except Exception:
-            return False
-
-    def _detect_interactive_prompt(
-        self, all_lines: List[str], tab: ShellTab
-    ) -> Optional[str]:
-        """Check if the terminal appears to be waiting for interactive input.
-
-        Examines the last few lines of pane output for known interactive
-        prompt patterns, and checks for alternate screen mode (editors/pagers).
-
-        Args:
-            all_lines: Current pane content lines.
-            tab: The ShellTab to check.
-
-        Returns:
-            Description of the detected prompt type, or None if no prompt detected.
-        """
-        # Check alternate screen mode (vim, less, nano, etc.)
-        if self._check_alternate_screen(tab):
-            return "alternate screen (editor/pager)"
-
-        # Check last 5 lines for interactive prompt patterns
-        check_lines = all_lines[-5:] if len(all_lines) >= 5 else all_lines
-        text_to_check = "\n".join(check_lines)
-
-        for pattern, description in INTERACTIVE_PROMPT_PATTERNS:
-            if pattern.search(text_to_check):
-                return description
-
-        return None
-
-    def _detect_blocked_tab(self, all_lines: List[str], tab: ShellTab) -> Optional[str]:
-        """Stricter check for pre-flight: is the tab stuck on a prompt RIGHT NOW?
-
-        Unlike _detect_interactive_prompt (which fires during polling when we
-        know a command is running), this checks BEFORE sending a command.  It
-        must avoid false positives when old prompt text is still in scrollback
-        but the shell has already recovered (e.g. after C-c).
-
-        Returns:
-            Description of the blocking prompt, or None if the tab is ready.
-        """
-        # Alternate screen is always a blocker
-        if self._check_alternate_screen(tab):
-            return "alternate screen (editor/pager)"
-
-        # If the shell is sitting at a ready prompt, the tab is not blocked.
-        if prompt_is_ready(all_lines):
-            return None
-
-        # Check last 3 lines (tighter window than the 5-line polling check)
-        check_lines = all_lines[-3:] if len(all_lines) >= 3 else all_lines
-        text_to_check = "\n".join(check_lines)
-
-        for pattern, description in INTERACTIVE_PROMPT_PATTERNS:
-            if pattern.search(text_to_check):
-                return description
-
-        return None
-
-    def _capture_terminal_state(
-        self, tab: ShellTab, sentinel: str, pre_count: int
-    ) -> str:
-        """Capture the current visible terminal state for timeout reporting.
-
-        Args:
-            tab: The ShellTab to capture from.
-            sentinel: The sentinel string to filter out.
-            pre_count: Line count before the command was sent.
-
-        Returns:
-            Cleaned terminal state string (last 30 lines, sentinel lines filtered).
-        """
-        try:
-            captured = tab.pane.capture_pane(start="-{}".format(self.scrollback_limit))
-            if isinstance(captured, str):
-                all_lines = captured.splitlines()
-            else:
-                all_lines = list(captured)
-
-            # Get lines after the command was sent, filtering sentinel artifacts
-            post_lines = all_lines[pre_count:]
-            clean_lines = [line for line in post_lines if sentinel not in line]
-
-            # If no post-command lines, fall back to last 30 visible lines
-            if not clean_lines:
-                clean_lines = all_lines[-30:]
-
-            # Cap at 30 lines to keep it concise
-            if len(clean_lines) > 30:
-                clean_lines = clean_lines[-30:]
-
-            # Strip trailing empty lines
-            while clean_lines and not clean_lines[-1].strip():
-                clean_lines.pop()
-
-            return "\n".join(clean_lines)
-        except Exception as e:
-            logger.debug(f"Failed to capture terminal state: {e}")
-            return "(failed to capture terminal state)"
+        """Check if the backend tmux session still exists."""
+        return self._backend.shell_is_alive()
 
     def _check_blocked(self, command: str) -> str | None:
         """Return error message if command's first word is blocked, else None.
@@ -1269,10 +594,3 @@ class ShellManager:
                 f"Blocked commands: {', '.join(sorted(self.blocked_commands))}"
             )
         return None
-
-    def _get_tab(self, name: str) -> ShellTab:
-        """Get a tab by name, raising KeyError if not found."""
-        if name not in self._tabs:
-            available = ", ".join(self._tabs.keys()) or "(none)"
-            raise KeyError(f"Tab '{name}' not found. Available: {available}")
-        return self._tabs[name]

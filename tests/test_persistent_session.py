@@ -903,20 +903,20 @@ class TestSetupShellManager:
                 call_kwargs = MockSM.call_args[1]
                 assert call_kwargs.get("backend") is mock_backend
 
-    def test_no_tmux_no_remote_returns_early(self):
-        """No shell when tmux not found and no remote backend."""
+    def test_no_backend_returns_early(self):
+        """No shell when there is no workspace backend (no local fallback)."""
         session = _make_session()
         mock_wm = MagicMock()
         mock_wm.backend = None
         session.workspace_manager = mock_wm
 
-        with patch("src.api.persistent_session.shutil.which", return_value=None):
-            session._setup_shell_manager()
+        session._setup_shell_manager()
 
         assert session.shell_manager is None
 
-    def test_local_tmux_creates_shell(self):
-        """Local ShellManager when tmux available and no remote backend."""
+    def test_backend_without_shell_support_returns_early(self):
+        """No shell when the backend doesn't declare supports_shell — the
+        local-tmux degradation was removed (capability, not inference)."""
         session = _make_session()
         mock_wm = MagicMock()
         mock_wm.backend = MagicMock(spec=[])  # no supports_shell attribute
@@ -925,55 +925,41 @@ class TestSetupShellManager:
         session.tool_context = MagicMock()
         session.config.extra = {"shell": {"sandbox": True}}
 
-        mock_sm = MagicMock()
+        session._setup_shell_manager()
 
-        with (
-            patch(
-                "src.api.persistent_session.shutil.which", return_value="/usr/bin/tmux"
-            ),
-            patch.dict(
-                "sys.modules",
-                {
-                    "src.tools.shell.shell_manager": MagicMock(
-                        ShellManager=MagicMock(return_value=mock_sm)
-                    )
-                },
-            ),
-        ):
-            session._setup_shell_manager()
-
-        assert session.shell_manager is mock_sm
+        assert session.shell_manager is None
 
     def test_shell_init_exception_non_fatal(self):
         """Exception during ShellManager init doesn't raise."""
         session = _make_session()
+        mock_backend = MagicMock()
+        mock_backend.supports_shell = True
         mock_wm = MagicMock()
-        mock_wm.backend = MagicMock(spec=[])
+        mock_wm.backend = mock_backend
         mock_wm.path = "/tmp/ws"
         session.workspace_manager = mock_wm
         session.config.extra = {"shell": {}}
 
-        with (
-            patch(
-                "src.api.persistent_session.shutil.which", return_value="/usr/bin/tmux"
-            ),
-            patch.dict(
-                "sys.modules",
-                {
-                    "src.tools.shell.shell_manager": MagicMock(
-                        ShellManager=MagicMock(side_effect=RuntimeError("tmux broken")),
-                    )
-                },
-            ),
+        with patch.dict(
+            "sys.modules",
+            {
+                "src.tools.shell.shell_manager": MagicMock(
+                    ShellManager=MagicMock(side_effect=RuntimeError("ssh broken")),
+                )
+            },
         ):
             # Should not raise
             session._setup_shell_manager()
 
+        assert session.shell_manager is None
+
     def test_sets_tool_context_shell_manager(self):
         """After init, tool_context.shell_manager is set."""
         session = _make_session()
+        mock_backend = MagicMock()
+        mock_backend.supports_shell = True
         mock_wm = MagicMock()
-        mock_wm.backend = MagicMock(spec=[])
+        mock_wm.backend = mock_backend
         mock_wm.path = "/tmp/ws"
         session.workspace_manager = mock_wm
         session.tool_context = MagicMock()
@@ -981,22 +967,18 @@ class TestSetupShellManager:
 
         mock_sm = MagicMock()
 
-        with (
-            patch(
-                "src.api.persistent_session.shutil.which", return_value="/usr/bin/tmux"
-            ),
-            patch.dict(
-                "sys.modules",
-                {
-                    "src.tools.shell.shell_manager": MagicMock(
-                        ShellManager=MagicMock(return_value=mock_sm)
-                    )
-                },
-            ),
+        with patch.dict(
+            "sys.modules",
+            {
+                "src.tools.shell.shell_manager": MagicMock(
+                    ShellManager=MagicMock(return_value=mock_sm)
+                )
+            },
         ):
             session._setup_shell_manager()
 
-        session.tool_context.shell_manager = mock_sm  # verify it would be set
+        assert session.shell_manager is mock_sm
+        assert session.tool_context.shell_manager is mock_sm
 
 
 # ---------------------------------------------------------------------------

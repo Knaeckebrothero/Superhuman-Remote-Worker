@@ -1,51 +1,37 @@
 """Tests for the run_command tool and shell mode toggle.
 
-Tests require tmux to be installed and accessible via PATH.
-Tests are automatically skipped if tmux is not available.
+ShellManager delegates to the workspace backend, so these tests script
+``backend.shell_run`` returns to exercise the tool layer — mode toggle,
+tail truncation, still-running passthrough, interactive-prompt translation,
+error-pattern warnings — without tmux. The live shell execution machinery
+is RemoteBackend's, covered by test_workspace_backends.py.
 """
 
-import shutil
 import uuid
 from unittest.mock import MagicMock
 
 import pytest
 
-# Skip entire module if tmux is not available
-pytestmark = pytest.mark.skipif(
-    shutil.which("tmux") is None, reason="tmux not installed"
-)
-
-from src.tools.shell.shell_manager import ShellManager  # noqa: E402
-from src.tools.shell.shell_tools import create_shell_tools  # noqa: E402
+from src.tools.shell.shell_manager import STILL_RUNNING_TEMPLATE, ShellManager
+from src.tools.shell.shell_tools import create_shell_tools
 
 
-@pytest.fixture
-def manager():
-    """Create a ShellManager for testing and clean up after."""
-    job_id = str(uuid.uuid4())
-    sm = ShellManager(
-        job_id=job_id,
-        max_tabs=4,
-        scrollback_limit=1000,
-        default_timeout=10,
-    )
-    yield sm
-    sm.cleanup()
+def make_backend():
+    """Mock workspace backend with shell support and a benign default."""
+    backend = MagicMock()
+    backend.supports_shell = True
+    backend.shell_run.return_value = "Exit code: 0\n--- stdout ---\nok"
+    return backend
 
 
 @pytest.fixture
-def fast_manager():
-    """ShellManager with a short no-change timeout for fast soft-timeout tests."""
-    job_id = str(uuid.uuid4())
-    sm = ShellManager(
-        job_id=job_id,
-        max_tabs=4,
-        scrollback_limit=1000,
-        default_timeout=30,
-        no_change_timeout=2.0,
-    )
-    yield sm
-    sm.cleanup()
+def backend():
+    return make_backend()
+
+
+@pytest.fixture
+def manager(backend):
+    return ShellManager(job_id=str(uuid.uuid4()), backend=backend)
 
 
 def _make_context(manager, mode="stateless"):
@@ -97,192 +83,106 @@ class TestModeToggle:
 
 
 class TestRunCommand:
-    """Tests for the run_command tool."""
+    """Tests for the run_command tool layer over a scripted backend."""
 
     def _get_run_command(self, manager):
         context = _make_context(manager, mode="stateless")
         tools = create_shell_tools(context)
         return next(t for t in tools if t.name == "run_command")
 
-    def test_basic_execution(self, manager):
+    def test_basic_execution(self, manager, backend):
+        backend.shell_run.return_value = "Exit code: 0\n--- stdout ---\nhello-world"
         tool = self._get_run_command(manager)
         result = tool.invoke({"command": "echo hello-world"})
         assert "Exit code: 0" in result
         assert "hello-world" in result
+        assert backend.shell_run.call_args[0][0] == "echo hello-world"
 
-    def test_exit_code_captured(self, manager):
+    def test_exit_code_captured(self, manager, backend):
+        backend.shell_run.return_value = "Exit code: 1\n(no output)"
         tool = self._get_run_command(manager)
         result = tool.invoke({"command": "false"})
         assert "Exit code: 1" in result
 
-    def test_no_tab_header_in_output(self, manager):
+    def test_no_tab_header_in_output(self, manager, backend):
+        backend.shell_run.return_value = "Exit code: 0\n--- stdout ---\ntest"
         tool = self._get_run_command(manager)
         result = tool.invoke({"command": "echo test"})
         assert "[Shells:" not in result
 
-    def test_tail_truncation(self, manager):
+    def test_tail_truncation(self, manager, backend):
+        lines = "\n".join(f"line_{i}" for i in range(1, 51))
+        backend.shell_run.return_value = f"Exit code: 0\n--- stdout ---\n{lines}"
         tool = self._get_run_command(manager)
-        # Generate 50 lines, request tail=10
-        result = tool.invoke(
-            {
-                "command": "for i in $(seq 1 50); do echo line_$i; done",
-                "tail": 10,
-            }
-        )
+        result = tool.invoke({"command": "seq", "tail": 10})
         assert "line_50" in result  # Last line present
         assert "line_1\n" not in result  # Early lines truncated
         assert "truncated" in result
 
-    def test_default_tail_is_30(self, manager):
+    def test_default_tail_is_30(self, manager, backend):
+        lines = "\n".join(f"line_{i}" for i in range(1, 61))
+        backend.shell_run.return_value = f"Exit code: 0\n--- stdout ---\n{lines}"
         tool = self._get_run_command(manager)
-        # Generate 60 lines with default tail
-        result = tool.invoke(
-            {
-                "command": "for i in $(seq 1 60); do echo line_$i; done",
-            }
-        )
+        result = tool.invoke({"command": "seq"})
         assert "line_60" in result
         assert "30 lines truncated" in result
 
-    def test_blocked_command_rejected(self, manager):
+    def test_blocked_command_rejected(self, manager, backend):
         tool = self._get_run_command(manager)
         result = tool.invoke({"command": "reboot"})
         assert "blocked" in result.lower() or "Error" in result
+        backend.shell_run.assert_not_called()
 
-    def test_timeout_parameter(self, manager):
+    def test_timeout_forwarded_to_backend(self, manager, backend):
         tool = self._get_run_command(manager)
-        result = tool.invoke(
-            {
-                "command": "sleep 30",
-                "timeout": 2,
-            }
+        tool.invoke({"command": "sleep 5", "timeout": 42})
+        assert backend.shell_run.call_args[1]["timeout"] == 42
+
+    def test_omitted_timeout_forwarded_as_none(self, manager, backend):
+        """None timeout passes through so the backend applies its soft
+        no-change timeout (an explicit timeout disables it backend-side)."""
+        tool = self._get_run_command(manager)
+        tool.invoke({"command": "echo hi"})
+        assert backend.shell_run.call_args[1]["timeout"] is None
+
+    def test_still_running_passthrough_not_error(self, manager, backend):
+        """A still-running result passes through honestly — not the old
+        'requires interactive input' error (the original stall bug)."""
+        backend.shell_run.return_value = STILL_RUNNING_TEMPLATE.format(
+            tab="default", elapsed=30, quiet=30, terminal_state="(working)"
         )
-        # Explicit timeout -> hard cap; reported still-running (not killed,
-        # not an error), no longer "timed out".
-        assert "still running" in result.lower()
-        assert "Exit code: -1" in result
-
-    def test_timeout_capped_at_600(self, manager):
-        """Timeout values above 600 should be capped."""
         tool = self._get_run_command(manager)
-        # Just verify it doesn't error — the cap is internal
-        result = tool.invoke(
-            {
-                "command": "echo ok",
-                "timeout": 9999,
-            }
-        )
-        assert "Exit code: 0" in result
-
-    def test_multiline_output(self, manager):
-        tool = self._get_run_command(manager)
-        result = tool.invoke({"command": "echo line1; echo line2; echo line3"})
-        assert "line1" in result
-        assert "line2" in result
-        assert "line3" in result
-
-    def test_error_pattern_warning(self, manager):
-        tool = self._get_run_command(manager)
-        result = tool.invoke({"command": "echo 'Traceback (most recent call last):'"})
-        assert "Possible error" in result or "Python traceback" in result
-
-    def test_no_output_command(self, manager):
-        tool = self._get_run_command(manager)
-        result = tool.invoke({"command": "true"})
-        assert "Exit code: 0" in result
-
-    def test_heredoc_python_executes(self, manager):
-        """BUG-5 regression: heredoc terminator must land on its own line
-        so the shell can close the heredoc and run the sentinel echo."""
-        tool = self._get_run_command(manager)
-        result = tool.invoke(
-            {
-                "command": "python3 <<'PY'\nprint('heredoc-works')\nPY",
-                "timeout": 10,
-            }
-        )
-        assert "Exit code: 0" in result
-        assert "heredoc-works" in result
-
-    def test_multiline_python_script(self, manager):
-        tool = self._get_run_command(manager)
-        result = tool.invoke(
-            {
-                "command": (
-                    "python3 <<'PY'\n"
-                    "import os\n"
-                    "x = 2 + 3\n"
-                    "print(f'result={x}')\n"
-                    "print('cwd_ok' if os.getcwd() else 'cwd_bad')\n"
-                    "PY"
-                ),
-                "timeout": 10,
-            }
-        )
-        assert "Exit code: 0" in result
-        assert "result=5" in result
-        assert "cwd_ok" in result
-
-    def test_bash_heredoc_multiple_commands(self, manager):
-        tool = self._get_run_command(manager)
-        result = tool.invoke(
-            {
-                "command": ("bash <<'EOF'\necho one\necho two\necho three\nEOF"),
-                "timeout": 10,
-            }
-        )
-        assert "Exit code: 0" in result
-        assert "one" in result
-        assert "two" in result
-        assert "three" in result
-
-    def test_heredoc_propagates_nonzero_exit(self, manager):
-        tool = self._get_run_command(manager)
-        result = tool.invoke(
-            {
-                "command": "python3 <<'PY'\nimport sys\nsys.exit(7)\nPY",
-                "timeout": 10,
-            }
-        )
-        assert "Exit code: 7" in result
-
-    def _get_run_command_for(self, mgr):
-        context = _make_context(mgr, mode="stateless")
-        tools = create_shell_tools(context)
-        return next(t for t in tools if t.name == "run_command")
-
-    def test_still_running_passthrough_not_error(self, fast_manager):
-        """A quiet long command yields an honest 'still running' result — not
-        the old 'requires interactive input' error (the original bug)."""
-        tool = self._get_run_command_for(fast_manager)
-        result = tool.invoke({"command": "sleep 20"})  # no timeout -> soft applies
+        result = tool.invoke({"command": "sleep 999"})
         assert "still running" in result.lower()
         assert "Exit code: -1" in result
         assert "requires interactive input" not in result.lower()
 
-    def test_explicit_timeout_disables_soft_timeout(self, fast_manager):
-        """An explicit timeout disables the 2s soft timeout, so a quiet command
-        runs to completion instead of returning still-running."""
-        tool = self._get_run_command_for(fast_manager)
-        result = tool.invoke(
-            {"command": "echo start; sleep 4; echo done", "timeout": 600}
+    def test_interactive_prompt_becomes_error(self, manager, backend):
+        """Stateless run_command can't answer prompts — the tool translates
+        the backend's interactive-prompt report into a clear error."""
+        backend.shell_run.return_value = (
+            "Interactive prompt detected (password prompt). The command is "
+            "waiting for input on tab 'default'.\n"
+            "--- terminal state ---\nPassword:"
         )
-        assert "Exit code: 0" in result
-        assert "done" in result
-
-    def test_noninteractive_env_injected(self, manager):
-        """Fresh tabs get pagers/prompts/progress-bars disabled."""
         tool = self._get_run_command(manager)
-        result = tool.invoke(
-            {
-                "command": (
-                    "echo PAGER=$PAGER GTP=$GIT_TERMINAL_PROMPT PB=$PIP_PROGRESS_BAR"
-                )
-            }
+        result = tool.invoke({"command": "ssh host"})
+        assert "requires interactive input" in result
+        assert "non-interactive" in result
+
+    def test_error_pattern_warning(self, manager, backend):
+        backend.shell_run.return_value = (
+            "Exit code: 0\n--- stdout ---\nTraceback (most recent call last):"
         )
-        assert "PAGER=cat" in result
-        assert "GTP=0" in result
-        assert "PB=off" in result
+        tool = self._get_run_command(manager)
+        result = tool.invoke({"command": "python broken.py"})
+        assert "Possible error" in result or "Python traceback" in result
+
+    def test_no_output_command(self, manager, backend):
+        backend.shell_run.return_value = "Exit code: 0\n(no output)"
+        tool = self._get_run_command(manager)
+        result = tool.invoke({"command": "true"})
+        assert "Exit code: 0" in result
 
 
 class TestToolNameAliasing:
@@ -369,4 +269,3 @@ class TestToolNameAliasing:
 
         names = get_all_tool_names(config)
         assert "run_command" in names
-        assert "shell_execute" not in names

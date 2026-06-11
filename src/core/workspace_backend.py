@@ -30,7 +30,8 @@ class WorkspaceBackend(ABC):
     File operations (abstract): Every backend must implement these.
     Shell operations (non-abstract): Default to NotImplementedError.
     Override in backends that support shell execution (RemoteBackend).
-    For local execution, ShellManager handles shell ops directly via libtmux.
+    Backends without shell support get no shell tools — there is no local
+    (in-pod) execution fallback (capability, not inference).
     """
 
     # --- File operations ---
@@ -308,9 +309,9 @@ class WorkspaceBackend(ABC):
     # --- Shell operations ---
     #
     # Non-abstract: default to NotImplementedError. Override in backends
-    # that support remote shell execution (RemoteBackend). For local
-    # execution, ShellManager uses libtmux directly — these methods are
-    # not called.
+    # that support remote shell execution (RemoteBackend). ShellManager
+    # refuses to construct without a shell-capable backend, so these
+    # defaults are never reached through the tools.
 
     def shell_run(
         self,
@@ -446,8 +447,8 @@ class WorkspaceBackend(ABC):
         """Whether this backend supports shell operations.
 
         Returns True if shell_run() is implemented (not the default
-        NotImplementedError). Used by ShellManager to decide whether to
-        delegate or use local libtmux.
+        NotImplementedError). Gates ShellManager construction and shell
+        tool registration — without it, shell tools are simply absent.
         """
         return False
 
