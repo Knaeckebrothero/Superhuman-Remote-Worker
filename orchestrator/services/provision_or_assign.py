@@ -105,7 +105,12 @@ async def provision_or_assign(
                     if resolved_ds:
                         attach_co = _build_datasource_tool_override(resolved_ds, co)
                     ok = await _send_session_attach(
-                        idle_agent, tid, attach_co, pids, datasources=ds_payload
+                        idle_agent,
+                        tid,
+                        attach_co,
+                        pids,
+                        datasources=ds_payload,
+                        config_name=cfg,
                     )
                     if ok:
                         logger.info(

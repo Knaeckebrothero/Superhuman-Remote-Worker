@@ -1000,6 +1000,10 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
                     config_override=request.get("config_override"),
                     project_ids=request.get("project_ids"),
                     datasources=request.get("datasources"),
+                    # Thread's config beats this pod's boot config — dual
+                    # pool pods boot as workers ('defaults'); see
+                    # docs/issues/session_config_name_plumbing.md (hole B).
+                    config_name=request.get("config_name"),
                 )
                 logger.info(f"Session setup complete for thread {thread_id}")
             except Exception:
@@ -1072,7 +1076,10 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
             import src.api.persistent_app as pa
 
             thread_id = pa._thread_id
-            await pa._detach_session()
+            # Same reason string as persistent_app's /session/detach so the
+            # documented "Terminate(rest_detach)" signal greps identically
+            # on dual pool pods (was the "legacy" back-compat shim).
+            await pa._terminate_session("rest_detach")
 
             if _should_loop():
                 await _reset_to_idle("session detach", skip_session_cleanup=True)

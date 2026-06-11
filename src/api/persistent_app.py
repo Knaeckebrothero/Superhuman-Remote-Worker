@@ -921,17 +921,60 @@ def _build_sync_coordinator(
     return coordinator if len(coordinator) > 0 else None
 
 
+def _load_expert_config(config_name: str):
+    """Resolve a named config exactly like the worker job path does.
+
+    Mirrors src/agent.py's ``metadata["config_name"]`` reload (expert YAML
+    via $extends + settings-matrix application), so a pool pod that booted
+    as a worker ('defaults') can serve a session under the thread's own
+    config — post-cutover the memory pipeline (and the whole session
+    profile) is a per-mode YAML choice
+    (docs/issues/session_config_name_plumbing.md, hole B).
+
+    Raises on unknown names: the attach endpoint turns that into a 500 and
+    the orchestrator falls back to provisioning a dedicated pod with the
+    right config baked in — failing loud beats silently running a session
+    on the worker YAML.
+    """
+    import yaml
+
+    from ..core.loader import (
+        _apply_settings_matrix,
+        load_agent_config_from_dict,
+        load_and_merge_config,
+        resolve_config_path,
+    )
+
+    config_path, deployment_dir = resolve_config_path(config_name)
+    merged_config_data = load_and_merge_config(config_path)
+    raw_llm_keys: set = set()
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            raw_cfg = yaml.safe_load(f) or {}
+        raw_llm_keys = set((raw_cfg.get("llm") or {}).keys())
+    except Exception:
+        pass
+    _apply_settings_matrix(merged_config_data, raw_llm_keys, deployment_dir)
+    return load_agent_config_from_dict(
+        merged_config_data, deployment_dir=deployment_dir
+    )
+
+
 async def _attach_session(
     thread_id: str,
     config_override: Optional[Dict[str, Any]] = None,
     project_ids: Optional[List[str]] = None,
     datasources: Optional[List[Dict[str, Any]]] = None,
+    config_name: Optional[str] = None,
 ) -> None:
     """Create and attach a PersistentSession for the given thread.
 
     This is the core session setup logic, extracted from the lifespan so it
     can be reused by both dedicated mode (lifespan startup) and pool mode
     (POST /session/attach).
+
+    ``config_name`` (pool mode): the thread's config, used as the session
+    base instead of the pod's boot config when provided.
     """
     global _session, _thread_id
 
@@ -1073,6 +1116,16 @@ async def _attach_session(
         )
 
     effective_config = _agent.config
+    if config_name:
+        # The thread's config beats the pod's boot config — idle-pool pods
+        # boot as workers, and a session served from the worker YAML loses
+        # its persistent memory pipeline (no teardown_extractor) among the
+        # rest of the session profile. Fail-loud on unknown names.
+        effective_config = _load_expert_config(config_name)
+        logger.info(
+            "Attach: session base config '%s' (overrides pod boot config)",
+            config_name,
+        )
     llm = _agent._tactical_llm or _agent._llm
     if config_override:
         import dataclasses
@@ -1674,6 +1727,9 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
             thread_id (str): Thread UUID to attach to
             config_override (dict, optional): Config overrides from thread metadata
             project_ids (list[str], optional): Project IDs for scoping
+            config_name (str, optional): Thread's config — used as the session
+                base instead of this pod's boot config (pool pods boot as
+                workers; see docs/issues/session_config_name_plumbing.md)
         """
         thread_id = request.get("thread_id")
         if not thread_id:
@@ -1694,6 +1750,7 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
                 config_override=request.get("config_override"),
                 project_ids=request.get("project_ids"),
                 datasources=request.get("datasources"),
+                config_name=request.get("config_name"),
             )
             return JSONResponse(
                 {

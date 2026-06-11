@@ -1668,8 +1668,14 @@ async def _send_session_attach(
     config_override: Optional[dict] = None,
     project_ids: Optional[list] = None,
     datasources: Optional[list] = None,
+    config_name: Optional[str] = None,
 ) -> bool:
     """Send a session attach request to an idle persistent agent.
+
+    ``config_name`` is the thread's config — pool pods boot as workers
+    ('defaults'), so the agent must re-resolve the session base config
+    from this name instead of its boot config
+    (docs/issues/session_config_name_plumbing.md, hole B).
 
     Returns True if the agent accepted the session.
     """
@@ -1679,6 +1685,7 @@ async def _send_session_attach(
         "config_override": config_override,
         "project_ids": project_ids,
         "datasources": datasources,
+        "config_name": config_name,
     }
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -1918,6 +1925,70 @@ async def _archive_and_cleanup_workspace(
     return actions
 
 
+async def _detach_agent_session(thread_id: str, timeout: float = 150.0) -> bool:
+    """Ask the thread's live agent to terminate its session, and wait.
+
+    Gives the agent the chance to run its full terminate path — final
+    memory capture (memory_bugs.md B11) and the workspace git push —
+    BEFORE ``_release_thread_resources`` tears down the workspace and
+    pod. Without this, the user-facing DELETE deleted the pod outright
+    and the session's final extraction died with it (the agent kept
+    heartbeating through the grace period, then got SIGKILLed).
+
+    Best-effort by design: returns False (and never raises) when the
+    thread has no bound agent, the agent isn't serving a session, or the
+    call fails — teardown then proceeds exactly as before. The read
+    timeout is sized to the persistent auxiliary extraction budget
+    (auxiliary.timeout=120s) plus git-push headroom; unreachable pods
+    fail in seconds via the connect timeout, and an already-terminated
+    agent answers "already_idle" instantly.
+    """
+    try:
+        thread = await postgres_db.get_thread(thread_id)
+        agent_id = (thread or {}).get("agent_id")
+        if not agent_id:
+            return False
+        row = await postgres_db.fetchrow(
+            "SELECT pod_ip, pod_port, status FROM agents WHERE id = $1",
+            str(agent_id),
+        )
+        agent = dict(row) if row else None
+        # 'session' is the heartbeat status of an agent serving a live
+        # session — anything else (ready/offline/busy) either has nothing
+        # to capture or is unreachable, so skip fast and let the normal
+        # teardown run.
+        if not agent or not agent.get("pod_ip") or agent.get("status") != "session":
+            return False
+        url = (
+            f"http://{agent['pod_ip']}:{int(agent.get('pod_port') or 8001)}"
+            "/session/detach"
+        )
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(timeout, connect=3.0)
+        ) as client:
+            resp = await client.post(url)
+        if resp.status_code == 200:
+            logger.info(
+                "Thread %s: agent detach completed before teardown",
+                thread_id,
+            )
+            return True
+        logger.warning(
+            "Thread %s: pre-teardown detach returned %s — proceeding",
+            thread_id,
+            resp.status_code,
+        )
+        return False
+    except Exception as e:
+        logger.warning(
+            "Thread %s: pre-teardown detach failed (%s: %s) — proceeding",
+            thread_id,
+            type(e).__name__,
+            e,
+        )
+        return False
+
+
 async def _release_thread_resources(thread_id: str) -> None:
     """Release a thread's workspace container/VM and agent pod.
 
@@ -1926,6 +1997,12 @@ async def _release_thread_resources(thread_id: str) -> None:
     its own exception — a failure in snapshotting must not block the
     agent-pod delete and vice versa, otherwise resources leak.
     """
+    # Let a live session agent terminate cleanly (final memory capture +
+    # git push) while its workspace still exists. No-op in seconds for
+    # agent-initiated endings (already terminated → "already_idle") and
+    # for the orphan reaper (agent not in 'session' status).
+    await _detach_agent_session(thread_id)
+
     try:
         await _archive_and_cleanup_workspace(thread_id, entity_type="threads")
     except Exception:
@@ -11832,7 +11909,11 @@ async def get_agent_system_info(request: Request, agent_id: str) -> dict[str, An
 class ThreadCreateRequest(BaseModel):
     """Request body for creating a persistent thread."""
 
-    config_name: str = Field("defaults", description="Agent config to use")
+    # Sessions run the persistent base config — every other session-config
+    # fallback in this file already says "persistent_defaults". The old
+    # "defaults" default silently put bare API threads on the WORKER yaml
+    # (docs/issues/session_config_name_plumbing.md, hole A).
+    config_name: str = Field("persistent_defaults", description="Agent config to use")
     project_id: str | None = Field(None, description="(Legacy) Single project to scope")
     project_ids: list[str] | None = Field(
         None, description="List of project UUIDs to scope"
@@ -12248,6 +12329,7 @@ async def create_thread(
                 co: dict,
                 pids: list,
                 ds_ids: list[str] | None,
+                cfg_name: str | None = None,
             ) -> None:
                 # Resolve datasources for the thread (explicit + project + global)
                 resolved_ds = await postgres_db.resolve_datasources_for_thread(
@@ -12260,7 +12342,12 @@ async def create_thread(
                 idle_agent = await _find_idle_persistent_agent()
                 if idle_agent:
                     await _send_session_attach(
-                        idle_agent, tid, co, pids, datasources=ds_payload
+                        idle_agent,
+                        tid,
+                        co,
+                        pids,
+                        datasources=ds_payload,
+                        config_name=cfg_name,
                     )
                 else:
                     logger.warning(
@@ -12275,6 +12362,7 @@ async def create_thread(
                     config_override,
                     effective_project_ids,
                     request_body.datasource_ids,
+                    request_body.config_name,
                 )
             )
         else:
@@ -12929,7 +13017,12 @@ async def resume_thread(
                     if resolved_ds:
                         co = _build_datasource_tool_override(resolved_ds, co)
                     ok = await _send_session_attach(
-                        idle_agent, tid, co, pids, datasources=ds_payload
+                        idle_agent,
+                        tid,
+                        co,
+                        pids,
+                        datasources=ds_payload,
+                        config_name=cfg,
                     )
                     if ok:
                         logger.info(

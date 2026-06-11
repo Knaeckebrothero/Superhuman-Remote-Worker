@@ -668,15 +668,21 @@ path.
       config_name plumbing holes (bare `ThreadCreateRequest` defaults to
       `"defaults"`; `/session/attach` pool reuse ignores the thread's
       config_name) — post-cutover that silently drops `teardown_extractor`.
-      Filed as `docs/issues/session_config_name_plumbing.md`.
+      Filed as `docs/issues/session_config_name_plumbing.md` — **FIXED +
+      live-verified the same day** (new API default; config_name carried on
+      all three orchestrator attach sites and forwarded by BOTH agent attach
+      routes, incl. the dual app the job pool actually runs; pool-attached
+      session on a worker-booted pod bound the persistent pipeline).
    3. **The ✕-button signal above is unreachable on k8s**: the orchestrator's
       thread DELETE deletes the agent pod directly (never calls
       `/session/detach`), so `_terminate_session` — and with it the B11
       capture — cannot fire on that route. The teardown writer was verified
-      through the archive route instead; the terminate guard rails were
-      observed via `Terminate(loop_complete) skipped — session teardown
-      already in progress`. Remaining gap + fix direction in memory_bugs.md
-      B11.
+      through the archive route instead. **CLOSED the same day** via
+      orchestrator detach-then-delete in `_release_thread_resources`
+      (live-verified: DELETE waited 59.5 s for `extracted 3, stored 3` +
+      `Terminate(...): final memory capture complete` before teardown; see
+      memory_bugs.md B11). The runbook's ✕-button signal is therefore valid
+      again — on dual pool pods it now also reads `Terminate(rest_detach)`.
    Also fixed en route (unrelated to memory): `docker/Dockerfile.agent.dev`
    still carried the playwright layer that fc42d052 removed from the prod
    Dockerfile — every Tilt agent rebuild had been failing since that commit.
