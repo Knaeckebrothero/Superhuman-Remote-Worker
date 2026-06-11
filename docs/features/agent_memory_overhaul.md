@@ -28,9 +28,11 @@ related:
 > assembles the right memories for every LLM call — the model is a *consumer*, never the
 > manager. Build the seam first; everything else becomes a plugin behind it.
 
-**Status:** Design v2 / **step 0 implemented, Phase 1 not started** — restructured
-2026-06-10 around the MemoryManager abstraction after design alignment (v1 of
-2026-06-07 was phase-first; superseded, phases preserved below in new order).
+**Status:** Design v2 / **step 0 + pre-flight bug track complete, Phase 1 not
+started** — restructured 2026-06-10 around the MemoryManager abstraction after
+design alignment (v1 of 2026-06-07 was phase-first; superseded, phases preserved
+below in new order). Every bug worth fixing *before* the seam is fixed
+(B1/B2/B4 + logging); the remaining bugs are absorbed by phases by design.
 
 **Implementation log:**
 - **2026-06-10 — Step 0 (ground-clearing) merged to develop** as #111 + #112:
@@ -51,14 +53,36 @@ related:
   to the thread, `Final memory extraction complete` logged for the first
   time ever. One aux-router timeout on the in-loop task (non-fatal, known
   flaky backend) — details + two small follow-ups in `memory_bugs.md` B1.
+- **2026-06-11 — B2 fixed + k3d-verified** (migrations `vector/0002–0005`):
+  dense channels of all five hybrid-search functions now order by
+  `subvector(embedding, 1, 4000)::halfvec(4000)` with matching HNSW
+  expression indexes (halfvec HNSW caps at 4000 dims — the doc's
+  `halfvec(4096)` idea was not viable; qwen3's MRL training makes the
+  4000-prefix rank-identical in testing). Premise correction: scoped
+  btrees meant dense retrieval was btree+sort per scope, not a table seq
+  scan — the indexes are the planner-gated hedge for scope growth.
+  `hnsw.iterative_scan = relaxed_order` pinned per function. Phase 3's
+  `ef_search` tuning is unblocked.
+- **2026-06-11 — B4 fixed + pre-flight complete**: dimension guard inside
+  `EmbeddingService` (per-response check vs `EMBEDDING_DIMENSIONS`, one
+  ERROR + latched fail-fast `EmbeddingDimensionError`, background
+  `verify_dimensions()` probe at both RecallStore init sites, health on
+  both status endpoints; `TestDimensionGuard`, 8 cases). Plus the B1
+  follow-up: the four memory catches in `auxiliary.py` log
+  `type(e).__name__` so openai errors stop logging as empty strings. B9's
+  enum nits deferred into the next migration touching the constraint
+  (Phase 4 gc). Remaining bugs (B3/B5–B8/B10/B11) are deliberately left
+  for their designed phases — the old code stays frozen so Phase-1
+  equivalence fixtures pin unmodified behaviour (mapping in
+  `memory_bugs.md` §Suggested order).
 - **Next: Phase 1** (MemoryManager seam), starting with acceptance-criteria
   alignment.
 **Companions:**
 - [`agent_memory_current_state.md`](agent_memory_current_state.md) — ground truth: every
   current capability classified wired/dead/conceptual with `file:line` evidence.
-- [`../issues/memory_bugs.md`](../issues/memory_bugs.md) — B1–B10, bugs fixable
-  independently of this redesign (B1 = persistent extraction broken; B2 = HNSW likely
-  silently absent; …).
+- [`../issues/memory_bugs.md`](../issues/memory_bugs.md) — B1–B11, bugs fixable
+  independently of this redesign. B1, B2, B4 fixed (2026-06-10/11); the
+  remainder are mapped to overhaul phases in its §Suggested order.
 - [`ai-memory-research/`](../../ai-memory-research) — five deep-research briefs + verified
   reports under `results/`.
 
@@ -371,12 +395,14 @@ extension list and loses nothing.
 
 Phases 1–2 are **the commitment** (foundation + instrument). Phases 3+ are
 evidence-driven: each lands behind a `memory.*` flag, defaults to current behaviour, and
-flips only on a green harness delta (P5). Bug track B1–B10
-([`memory_bugs.md`](../issues/memory_bugs.md)) proceeds independently — **step 0 done
-2026-06-10**: B1 fixed (live-verified on k3d 2026-06-11), B2 verified-confirmed
-(halfvec migration now the open item), B3-honesty + B9 + vestigial-code sweep
-shipped. Next bug-track item: B4; B2's halfvec migration must land before
-Phase 3 tunes `ef_search`.
+flips only on a green harness delta (P5). Bug track B1–B11
+([`memory_bugs.md`](../issues/memory_bugs.md)): **everything worth fixing before the
+seam is done** — step 0 (2026-06-10): B1 + B3-honesty + B9 + vestigial-code sweep;
+pre-flight (2026-06-11): B2 halfvec migrations shipped + k3d-verified (Phase 3's
+`ef_search` tuning unblocked) and B4 dimension guard. The remaining bugs
+(B3-wire/B5/B6/B7/B8/B10/B11) are absorbed by phases by design — the old code stays
+frozen until Phase-1 equivalence fixtures pin it (mapping in `memory_bugs.md`
+§Suggested order).
 
 ### Phase 1 — The foundation: MemoryManager seam · ~1–1.5 wk ← **start here**
 Extract all assembly + capture logic from `graph.py` / `persistent_graph.py` /
@@ -529,7 +555,7 @@ memory panel fed by `AssembleStats` provenance (optional stretch).
 ## 9. References
 
 - [`agent_memory_current_state.md`](agent_memory_current_state.md) — the audited baseline this doc designs against
-- [`../issues/memory_bugs.md`](../issues/memory_bugs.md) — independent bug track (B1–B10)
+- [`../issues/memory_bugs.md`](../issues/memory_bugs.md) — independent bug track (B1–B11; B1/B2/B4 fixed)
 - [`ai-memory-research/results/01_frontier_labs_report.md`](../../ai-memory-research/results/01_frontier_labs_report.md) — bounded+on-demand norm; model- vs system-managed camps
 - [`ai-memory-research/results/02_academic_sota_report.md`](../../ai-memory-research/results/02_academic_sota_report.md) — consolidation efficacy refuted; Self-RAG backs gating
 - [`ai-memory-research/results/03_retrieval_report.md`](../../ai-memory-research/results/03_retrieval_report.md) — reranker #1 ROI; keep RRF/qwen3; gate by score

@@ -1148,14 +1148,17 @@ class TestGenerateTitle:
 
     @pytest.mark.asyncio
     async def test_returns_none_when_no_string_content(self):
-        """Returns None when all messages have non-string content."""
+        """Returns None (before any LLM call) when no message has extractable text."""
         messages = [
-            AIMessage(content=[{"type": "text", "text": "list content"}]),
+            AIMessage(content=[{"type": "image_url", "image_url": {"url": "x"}}]),
         ]
-        mock_llm = AsyncMock()
+        mock_llm = MagicMock()
+        mock_llm.llm = AsyncMock()
 
         result = await _generate_title(messages, mock_llm)
         assert result is None
+        # No extractable text -> short-circuits before invoking the model.
+        mock_llm.llm.ainvoke.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_samples_first_10_messages(self):
