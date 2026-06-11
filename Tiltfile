@@ -39,6 +39,12 @@ docker_build(
         fall_back_on([
             'docker/Dockerfile.orchestrator.dev',
             'orchestrator/requirements.txt',
+            # Migrations must be BAKED, never just live-synced: a synced
+            # migration gets applied to the DB by the reloaded app, but the
+            # image still lacks the file — the next pod from that image (e.g.
+            # a Reloader bounce) fails startup with "applied but missing on
+            # disk" and crash-loops (2026-06-11, 0025_security_events).
+            'orchestrator/database/migrations/',
         ]),
         # orchestrator/ contents are flattened into /app/ to match the prod
         # Dockerfile's layout (so `from services.foo import bar` resolves).
