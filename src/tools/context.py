@@ -6,7 +6,6 @@ such as workspace managers, database connections, and configuration.
 
 import hashlib
 import logging
-import os
 import re
 from collections import deque
 from dataclasses import dataclass, field
@@ -122,10 +121,6 @@ class ToolContext:
     _job_metadata: Dict[str, Any] = field(
         default_factory=dict
     )  # job_id, project_id, priority, config_name, repo_name
-    _browser_session: Optional[Any] = (
-        None  # browser_use.BrowserSession (local/dev mode)
-    )
-    _browser_started: bool = False  # Whether Chromium has been started
 
     def __post_init__(self):
         """Validate context after initialization."""
@@ -654,62 +649,6 @@ class ToolContext:
         snapshot_cfg = browser_cfg.get("snapshot", {})
         return snapshot_cfg.get("max_dom_chars", 40000)
 
-    async def get_browser_session(self) -> Any:
-        """Lazy-start a local (in-process) Chromium and return a BrowserSession.
-
-        Local/dev mode only — remote workspaces drive the browser through
-        ``browser_exec()`` (the workspace-side browser-exec daemon) so CDP
-        never crosses the pod boundary. On subsequent calls, health-checks
-        the existing session and restarts if needed.
-
-        Returns:
-            browser_use.BrowserSession instance
-        """
-        from browser_use import BrowserSession
-
-        # Return existing healthy session
-        if self._browser_session is not None:
-            try:
-                # Quick health check — get current page URL
-                await self._browser_session.get_current_page_url()
-                return self._browser_session
-            except Exception:
-                logger.warning("Browser session unhealthy, restarting")
-                await self._close_browser_session()
-
-        browser_cfg = self.config.get("browser", {})
-        persistence_cfg = browser_cfg.get("persistence", {})
-
-        # Resolve user_data_dir
-        user_data_dir = persistence_cfg.get("user_data_dir", ".browser-profile")
-        if self.has_workspace():
-            from pathlib import Path
-
-            ws_root = self.workspace_manager.get_path("")
-            user_data_dir = str(Path(ws_root) / user_data_dir)
-
-        headless_env = os.getenv("BROWSER_HEADLESS", "").lower()
-        if headless_env in ("true", "1", "yes"):
-            headless = True
-        elif headless_env in ("false", "0", "no"):
-            headless = False
-        else:
-            headless = browser_cfg.get("headless", True)
-
-        kwargs = {
-            "headless": headless,
-            "user_data_dir": user_data_dir,
-        }
-
-        # Local in-process launch only. Remote workspaces never reach here —
-        # the direct browser tools route to browser_exec() instead.
-        session = BrowserSession(**kwargs)
-        await session.start()
-        self._browser_session = session
-        self._browser_started = True
-        logger.info("Browser session started")
-        return session
-
     async def browser_exec(self, action: str, **args: Any) -> Dict[str, Any]:
         """Run one browser action on the workspace via the browser-exec helper.
 
@@ -723,6 +662,14 @@ class ToolContext:
         import asyncio
         import json as _json
         import shlex
+
+        if not self.has_workspace():
+            return {
+                "error": (
+                    "browser tools require a workspace running the "
+                    "browser-exec daemon; no workspace backend is attached"
+                )
+            }
 
         backend = self.workspace_manager.backend
         payload = _json.dumps(args)
@@ -742,54 +689,12 @@ class ToolContext:
         except Exception:
             return {"error": f"browser-exec returned non-JSON: {out[:500]}"}
 
-    async def _close_browser_session(self) -> None:
-        """Close the local in-process browser session (dev mode)."""
-        if self._browser_session is not None:
-            try:
-                await self._browser_session.stop()
-            except Exception:
-                pass
-            self._browser_session = None
-
     async def close_browser(self) -> None:
-        """Kill Chromium and cleanup. Called on job/session end."""
-        # Local in-process session (dev mode).
-        await self._close_browser_session()
-
-        # Remote: tell the workspace browser-exec daemon to shut down.
-        from .research.browser import _is_remote_browser
-
-        if _is_remote_browser(self):
-            try:
-                await self.browser_exec("shutdown")
-            except Exception as e:
-                logger.debug(f"browser-exec shutdown failed: {e}")
-
-        self._browser_started = False
-        logger.info("Browser cleaned up")
-
-    async def export_browser_state(self) -> None:
-        """Export browser storage state for crash recovery.
-
-        Called at phase boundaries when persistence.export_state_on_phase
-        is true. Saves cookies/localStorage to the workspace.
-        """
-        browser_cfg = self.config.get("browser", {})
-        persistence_cfg = browser_cfg.get("persistence", {})
-        if not persistence_cfg.get("export_state_on_phase", True):
+        """Shut down the workspace browser-exec daemon. Called on job/session end."""
+        if not self.has_workspace():
             return
-        if self._browser_session is None:
-            return
-
         try:
-            if self.has_workspace():
-                from pathlib import Path
-
-                ws_root = self.workspace_manager.get_path("")
-                state_path = str(
-                    Path(ws_root) / ".browser-profile" / "storage_state.json"
-                )
-                await self._browser_session.export_storage_state(output_path=state_path)
-                logger.debug(f"Exported browser state to {state_path}")
+            await self.browser_exec("shutdown")
         except Exception as e:
-            logger.debug(f"Could not export browser state: {e}")
+            logger.debug(f"browser-exec shutdown failed: {e}")
+        logger.info("Browser cleaned up")

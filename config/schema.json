@@ -563,22 +563,46 @@
     },
     "browser": {
       "type": "object",
-      "description": "Browser automation configuration (browser-use + Playwright)",
+      "description": "Browser tool configuration (workspace-side browser-exec daemon; the agent pod never runs a browser)",
       "properties": {
-        "headless": {
-          "type": "boolean",
-          "default": true,
-          "description": "Run browser without visible UI"
+        "snapshot": {
+          "type": "object",
+          "description": "Page-state results returned by the direct browser tools",
+          "properties": {
+            "include_screenshot": {
+              "description": "Include screenshots in results: \"auto\" (if model is multimodal), true, or false",
+              "default": "auto"
+            },
+            "max_dom_chars": {
+              "type": "integer",
+              "default": 40000,
+              "description": "Truncate DOM text beyond this many characters"
+            }
+          }
         },
-        "timeout": {
-          "type": "integer",
-          "default": 60000,
-          "description": "Browser operation timeout in milliseconds"
-        },
-        "use_vision": {
-          "type": "boolean",
-          "default": false,
-          "description": "Use screenshot-based navigation instead of DOM/accessibility tree"
+        "security": {
+          "type": "object",
+          "description": "URL validation applied agent-side before dispatching actions",
+          "properties": {
+            "allowed_domains": {
+              "type": "array",
+              "items": { "type": "string" },
+              "default": [],
+              "description": "Allowlist of domains (empty = allow all)"
+            },
+            "blocked_domains": {
+              "type": "array",
+              "items": { "type": "string" },
+              "default": [],
+              "description": "Blocklist of domains"
+            },
+            "blocked_schemes": {
+              "type": "array",
+              "items": { "type": "string" },
+              "default": ["file", "javascript", "data"],
+              "description": "URL schemes that are always rejected"
+            }
+          }
         }
       }
     },

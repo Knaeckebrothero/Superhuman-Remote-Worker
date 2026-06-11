@@ -77,7 +77,6 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app \
     AGENT_CONFIG=defaults \
     AGENT_PORT=8001 \
-    PLAYWRIGHT_BROWSERS_PATH=/opt/playwright \
     BUILD_SHA=${BUILD_SHA}
 
 WORKDIR /app
@@ -120,10 +119,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
 COPY --from=builder /usr/local/bin /usr/local/bin
 
-# Install Playwright chromium BEFORE source code (only rebuilds when playwright version changes)
-RUN playwright install --with-deps chromium
+# No browser in the agent image — Chromium lives on the workspace image only
+# (browser-exec daemon). See docs/issues/remove_local_browser_fallback.md.
 
-# Copy source code LAST (changes most frequently, avoids busting playwright cache)
+# Copy source code LAST (changes most frequently)
 COPY --chown=srw:srw src/ ./src/
 COPY --chown=srw:srw config/ ./config/
 COPY --chown=srw:srw agent.py ./

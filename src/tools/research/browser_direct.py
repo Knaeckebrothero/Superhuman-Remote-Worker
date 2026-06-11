@@ -3,33 +3,27 @@
 Gives the agent fine-grained control over a persistent Chromium instance:
 navigate, inspect DOM, click, type, select, scroll, screenshot, back, close.
 
-Execution model:
-  * Remote workspace (the normal case): each action is dispatched to the
-    workspace-side ``browser-exec`` daemon over SSH via
-    ``ToolContext.browser_exec()``. Chrome's CDP stays on the workspace
-    loopback — it never crosses the pod boundary. See
-    docs/features/browser_workspace_executor.md.
-  * Local/dev (no remote workspace): browser-use runs in-process here.
+Execution model: every action is dispatched to the workspace-side
+``browser-exec`` daemon over SSH via ``ToolContext.browser_exec()``.
+Chrome's CDP stays on the workspace loopback — it never crosses the pod
+boundary — and page content is interpreted inside the NetworkPolicy-
+restricted workspace runtime. There is no in-pod (agent-side) browser
+execution path. See docs/features/browser_workspace_executor.md and
+docs/issues/remove_local_browser_fallback.md.
 
-Either way, this module keeps the agent-side logic — URL validation and
-content-nonce wrapping — and returns the same shape to the LLM:
+This module keeps the agent-side logic — URL validation and content-nonce
+wrapping — and returns the same shape to the LLM:
 ``{dom, url, title, screenshot?, tabs?}`` with numbered ``[N]`` element refs.
 
 Vision mode (screenshots in results) auto-selects from the model's
 multimodal capability (settings_matrix.yaml).
-
-Requires: pip install browser-use>=0.11.0 (local mode only; the workspace
-image ships browser-use for the remote daemon).
 """
 
-import asyncio
-import base64
 import logging
 from typing import Any, Dict, List, Optional
 
 from langchain_core.tools import tool
 
-from .browser import _is_remote_browser
 from .browser_security import validate_url_with_config, wrap_with_nonce
 from ..context import ToolContext
 
@@ -122,168 +116,14 @@ BROWSER_DIRECT_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
 }
 
 
-# ── Local (in-process) execution — dev mode only ─────────────────────
-#
-# These mirror the workspace-side browser-exec daemon. On a remote workspace
-# the agent never runs them; it calls ToolContext.browser_exec() instead.
-
-
-async def _local_page_state(session: Any, args: Dict[str, Any]) -> Dict[str, Any]:
-    """Build raw page state (DOM + optional screenshot). No nonce wrap here.
-
-    Uses get_browser_state_summary so the session selector map is populated
-    for subsequent ref-based actions (click/type/select) — mirrors browser-exec.
-    """
-    include_shot = bool(args.get("include_screenshot"))
-    summary = await session.get_browser_state_summary(include_screenshot=include_shot)
-
-    dom_text = summary.dom_state.llm_representation()
-    max_chars = int(args.get("max_dom_chars", 40000))
-    if len(dom_text) > max_chars:
-        dom_text = dom_text[:max_chars] + "\n... (DOM truncated)"
-
-    result: Dict[str, Any] = {
-        "url": summary.url,
-        "title": summary.title,
-        "dom": dom_text,
-    }
-
-    if include_shot and summary.screenshot:
-        result["screenshot"] = summary.screenshot
-
-    try:
-        tabs = summary.tabs
-        if tabs and len(tabs) > 1:
-            result["tabs"] = [
-                {
-                    "id": getattr(t, "target_id", getattr(t, "id", None)),
-                    "url": getattr(t, "url", None),
-                    "title": getattr(t, "title", None),
-                }
-                for t in tabs
-            ]
-    except Exception:
-        pass
-
-    return result
-
-
-async def _click_element(session: Any, ref: int) -> None:
-    from browser_use.browser.events import ClickElementEvent
-
-    node = await session.get_element_by_index(ref)
-    if node is None:
-        raise ValueError(
-            f"Element ref={ref} not found. Use browser_snapshot to get current refs."
-        )
-    event = session.event_bus.dispatch(ClickElementEvent(node=node))
-    await event
-    await event.event_result(raise_if_any=True)
-
-
-async def _type_text(session: Any, ref: int, text: str, clear: bool = True) -> None:
-    from browser_use.browser.events import TypeTextEvent
-
-    node = await session.get_element_by_index(ref)
-    if node is None:
-        raise ValueError(
-            f"Element ref={ref} not found. Use browser_snapshot to get current refs."
-        )
-    event = session.event_bus.dispatch(TypeTextEvent(node=node, text=text, clear=clear))
-    await event
-    await event.event_result(raise_if_any=True)
-
-
-async def _select_option(session: Any, ref: int, value: str) -> None:
-    from browser_use.browser.events import SelectDropdownOptionEvent
-
-    node = await session.get_element_by_index(ref)
-    if node is None:
-        raise ValueError(
-            f"Element ref={ref} not found. Use browser_snapshot to get current refs."
-        )
-    event = session.event_bus.dispatch(
-        SelectDropdownOptionEvent(node=node, option=value)
-    )
-    await event
-    await event.event_result(raise_if_any=True)
-
-
-async def _scroll(
-    session: Any, direction: str, amount: int = 500, ref: Optional[int] = None
-) -> None:
-    from browser_use.browser.events import ScrollEvent
-
-    node = None
-    if ref is not None:
-        node = await session.get_element_by_index(ref)
-    event = session.event_bus.dispatch(
-        ScrollEvent(direction=direction, amount=amount, node=node)
-    )
-    await event
-    await event.event_result(raise_if_any=True)
-
-
-async def _local_action(
-    context: ToolContext, action: str, args: Dict[str, Any]
-) -> Dict[str, Any]:
-    """Execute one action in-process against a local BrowserSession."""
-    session = await context.get_browser_session()
-
-    if action == "navigate":
-        await session.navigate_to(args["url"])
-        return await _local_page_state(session, args)
-    if action == "snapshot":
-        return await _local_page_state(session, args)
-    if action == "screenshot":
-        screenshot_bytes = await session.take_screenshot()
-        return {
-            "url": await session.get_current_page_url(),
-            "title": await session.get_current_page_title(),
-            "screenshot": base64.b64encode(screenshot_bytes).decode(),
-        }
-    if action == "click":
-        await _click_element(session, int(args["ref"]))
-        return await _local_page_state(session, args)
-    if action == "type":
-        await _type_text(
-            session,
-            int(args["ref"]),
-            args.get("text", ""),
-            clear=args.get("clear", True),
-        )
-        return await _local_page_state(session, args)
-    if action == "select":
-        await _select_option(session, int(args["ref"]), args["value"])
-        return await _local_page_state(session, args)
-    if action == "scroll":
-        ref = args.get("ref")
-        await _scroll(
-            session,
-            args.get("direction", "down"),
-            int(args.get("amount", 500)),
-            int(ref) if ref is not None else None,
-        )
-        return await _local_page_state(session, args)
-    if action == "back":
-        page = await session.get_current_page()
-        if page is not None:
-            await page.evaluate("() => { window.history.back(); }")
-            await asyncio.sleep(0.5)
-        return await _local_page_state(session, args)
-
-    return {"error": f"unknown action: {action}"}
-
-
 async def _run_action(context: ToolContext, action: str, **args: Any) -> Dict[str, Any]:
-    """Dispatch a browser action: remote → browser-exec, local → in-process."""
-    if _is_remote_browser(context):
-        return await context.browser_exec(action, **args)
-    try:
-        return await _local_action(context, action, args)
-    except Exception as e:
-        logger.error(f"local browser {action} failed: {e}", exc_info=True)
-        return {"error": f"{action} failed: {e}"}
+    """Dispatch a browser action to the workspace browser-exec daemon.
+
+    There is deliberately no local fallback: if the workspace cannot run
+    browser-exec, the daemon path returns a clear error — actions never
+    degrade to in-pod execution.
+    """
+    return await context.browser_exec(action, **args)
 
 
 # ── Tool factory ─────────────────────────────────────────────────────

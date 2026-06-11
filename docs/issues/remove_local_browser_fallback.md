@@ -1,6 +1,10 @@
 # Remove the local in-pod browser fallback (latent execution path on the agent pod)
 
-**Status**: Open — security hardening. Filed 2026-06-10.
+**Status**: Implemented on develop 2026-06-11 — full inventory removed (plus
+`export_browser_state`, `_resolve_doi_url`, and the dead `browser.*` config
+keys found during implementation); regression guard added. Verification 1-2
+pass (greps clean, research suite + ruff green); 3-4 (image build delta, k3d
+smoke) pending next deploy. Filed 2026-06-10.
 
 ## Context
 
