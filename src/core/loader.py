@@ -1252,6 +1252,24 @@ class PhaseSettings:
 
 
 @dataclass
+class MemoryPipelineConfig:
+    """Named plugins the MemoryManager binds per stage (memory.pipeline).
+
+    Names resolve against MEMORY_PLUGIN_REGISTRY
+    (src/services/memory/registry.py); an unknown name fails loudly at
+    bind time. Empty lists bind a no-op manager. Defaults stay empty
+    until the Phase-1 transplant registers the current-behaviour plugins
+    (docs/features/agent_memory_overhaul.md §5/§6).
+    """
+
+    retrievers: List[str] = field(default_factory=list)
+    scorers: List[str] = field(default_factory=list)
+    policies: List[str] = field(default_factory=list)
+    writers: List[str] = field(default_factory=list)
+    extensions: List[str] = field(default_factory=list)
+
+
+@dataclass
 class MemoryConfig:
     """Memory Light (RecallStore) configuration.
 
@@ -1270,6 +1288,11 @@ class MemoryConfig:
     dedup_threshold: float = 0.85
     retrieval_importance_floor: float = 0.4
     project_scoped: bool = True
+    # MemoryManager seam (memory overhaul Phase 1). manager_enabled is the
+    # cutover guard (memory.manager.enabled): while False the graphs keep
+    # their legacy direct-store paths and the manager is never constructed.
+    manager_enabled: bool = False
+    pipeline: MemoryPipelineConfig = field(default_factory=MemoryPipelineConfig)
 
 
 @dataclass
@@ -1459,6 +1482,18 @@ def _parse_memory_config(data: Dict[str, Any]) -> MemoryConfig:
     Returns:
         MemoryConfig dataclass
     """
+    manager_data = data.get("manager", {}) or {}
+    if not isinstance(manager_data, dict):
+        # Bool shorthand (`manager: true`), same tolerance as auxiliary tasks
+        manager_data = {"enabled": bool(manager_data)}
+    pipeline_data = data.get("pipeline", {}) or {}
+    pipeline = MemoryPipelineConfig(
+        retrievers=list(pipeline_data.get("retrievers", []) or []),
+        scorers=list(pipeline_data.get("scorers", []) or []),
+        policies=list(pipeline_data.get("policies", []) or []),
+        writers=list(pipeline_data.get("writers", []) or []),
+        extensions=list(pipeline_data.get("extensions", []) or []),
+    )
     return MemoryConfig(
         enabled=data.get("enabled", False),
         budget_tokens=data.get("budget_tokens", 10000),
@@ -1470,6 +1505,8 @@ def _parse_memory_config(data: Dict[str, Any]) -> MemoryConfig:
         dedup_threshold=data.get("dedup_threshold", 0.85),
         retrieval_importance_floor=data.get("retrieval_importance_floor", 0.4),
         project_scoped=data.get("project_scoped", True),
+        manager_enabled=manager_data.get("enabled", False),
+        pipeline=pipeline,
     )
 
 

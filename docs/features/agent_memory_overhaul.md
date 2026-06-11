@@ -28,11 +28,11 @@ related:
 > assembles the right memories for every LLM call — the model is a *consumer*, never the
 > manager. Build the seam first; everything else becomes a plugin behind it.
 
-**Status:** Design v2 / **step 0 + pre-flight bug track complete, Phase 1 not
-started** — restructured 2026-06-10 around the MemoryManager abstraction after
-design alignment (v1 of 2026-06-07 was phase-first; superseded, phases preserved
-below in new order). Every bug worth fixing *before* the seam is fixed
-(B1/B2/B4 + logging); the remaining bugs are absorbed by phases by design.
+**Status:** Design v2 / **step 0 + pre-flight bug track complete, Phase 1 in
+progress (slices 1–2 of 5 done)** — restructured 2026-06-10 around the MemoryManager
+abstraction after design alignment (v1 of 2026-06-07 was phase-first; superseded,
+phases preserved below in new order). Every bug worth fixing *before* the seam is
+fixed (B1/B2/B4 + logging); the remaining bugs are absorbed by phases by design.
 
 **Implementation log:**
 - **2026-06-10 — Step 0 (ground-clearing) merged to develop** as #111 + #112:
@@ -75,8 +75,49 @@ below in new order). Every bug worth fixing *before* the seam is fixed
   for their designed phases — the old code stays frozen so Phase-1
   equivalence fixtures pin unmodified behaviour (mapping in
   `memory_bugs.md` §Suggested order).
-- **Next: Phase 1** (MemoryManager seam), starting with acceptance-criteria
-  alignment.
+- **2026-06-11 — Phase 1 slice 1 (kernel) shipped**: `src/services/memory/`
+  package — types (§2.1 vocabulary: `AssembleRequest`/`MemoryPayload`/
+  `InjectionBlock`/`AssembleStats`/`CaptureEvent`/`MemoryRuntime`), plugin
+  protocols, `MEMORY_PLUGIN_REGISTRY` (TOOL_REGISTRY-style import-time
+  registration + loud `UnknownMemoryPluginError`), and the `MemoryManager`
+  binder (`from_config` resolves `memory.pipeline` names; `assemble()`
+  orchestrates retrievers→scorers→policies order-preserving with per-plugin
+  containment + stats; `capture()` dispatches by event kind, never raises).
+  `MemoryConfig` gained `manager_enabled` (`memory.manager.enabled`, the
+  cutover guard, default off) + `MemoryPipelineConfig`. Nothing constructs
+  the manager in production yet; no YAML entries until cutover (no config
+  theatre). 30 kernel tests (`tests/test_memory_manager.py`).
+  **§2.1-sketch refinements locked:** `Retriever.retrieve(req)` takes the
+  whole request, not `(query, bucket, k)` — v1 buckets layer over the
+  already scope-bound stores, per-bucket fan-out is Phase-6; `CaptureEvent`
+  carries no scope refs (manager is constructed per job/session, already
+  scoped); explicit `Policy` protocol added for the pipeline's `policies`
+  stage. The §6 pipeline-sketch names (`dense`, `sparse`, `rrf`, …) describe
+  the Phase-3+ decomposition; the slice-2 transplant registers honest
+  composite names instead (RRF lives inside the SQL functions — splitting it
+  into four pseudo-plugins would be ceremony, not a transplant).
+  Remaining slices: 2 worker read path + equivalence fixtures, 3 persistent
+  parity, 4 capture() write path, 5 cutover behind the flag.
+- **2026-06-11 — Phase 1 slice 2 (worker read path transplant) shipped**:
+  `plugins/legacy.py` registers `recall_two_tier` (wraps the two-tier
+  `RecallStore.retrieve()` *including* the decrement-then-retrieve TTL tick
+  with its own containment) and `kb_notes` (wraps `hybrid_search`,
+  `match_count=5`; passes `project_ids=[…]` which the store normalizes to
+  the same single/multi SQL paths as both legacy calling conventions —
+  one retriever serves both graphs). `build_worker_query_text(TaskFrame)`
+  transplants the top-todo+phase query formation. `_render_blocks` now
+  carries the legacy injection mechanics verbatim: `assemble_memory_block`
+  / `assemble_knowledge_block` called with `model=` only (never a budget —
+  byte-equivalence; the KB block stays uncapped until Phase 3/B5) + the
+  synthetic `recall_memories`/`kb_search` tool pairs. **Equivalence
+  fixtures** (`tests/test_memory_worker_equivalence.py`, 14 cases):
+  manager payload vs a verbatim reproduction of graph.py:888-1037 —
+  normalized-id byte comparison, golden block snapshots, store
+  call-signature pins (decrement-before-retrieve order, positional query,
+  no budget kwarg, `match_count=5`), conditional parity (no store / no
+  scope / empty results / retrieval failure / TTL-tick failure), model
+  threading, stats counts. graph.py untouched — the legacy path stays
+  live until cutover. Next: slice 3 (persistent parity).
 **Companions:**
 - [`agent_memory_current_state.md`](agent_memory_current_state.md) — ground truth: every
   current capability classified wired/dead/conceptual with `file:line` evidence.
