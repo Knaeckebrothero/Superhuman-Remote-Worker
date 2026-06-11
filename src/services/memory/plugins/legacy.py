@@ -13,14 +13,24 @@ rrf, …) describe the Phase-3+ decomposition, but today RRF fusion lives
 real units of current behaviour.
 """
 
+import asyncio
 import logging
 import uuid
-from typing import Any, List, Optional
+from typing import Any, Awaitable, List, Optional
+
+from langchain_core.messages import BaseMessage, HumanMessage
 
 from ..registry import register_memory_plugin
 from ..types import AssembleRequest, Candidate, MemoryRuntime, TaskFrame
 
 logger = logging.getLogger(__name__)
+
+
+async def _bounded(coro: Awaitable[Any], timeout: Optional[float]) -> Any:
+    """Apply the legacy persistent per-call guard; unbounded when None."""
+    if timeout is None:
+        return await coro
+    return await asyncio.wait_for(coro, timeout=timeout)
 
 
 def build_worker_query_text(frame: TaskFrame) -> str:
@@ -41,6 +51,20 @@ def build_worker_query_text(frame: TaskFrame) -> str:
     return " ".join(parts)
 
 
+def build_persistent_query_text(messages: List[BaseMessage]) -> str:
+    """Legacy persistent query formation (persistent_graph._execute_turn).
+
+    The most recent HumanMessage's content, string-coerced (multimodal
+    content lists become their str() form, exactly as the legacy scan
+    does); empty string when no HumanMessage exists — the legacy path
+    still retrieves with "" rather than skipping.
+    """
+    for msg in reversed(messages):
+        if isinstance(msg, HumanMessage):
+            return msg.content if isinstance(msg.content, str) else str(msg.content)
+    return ""
+
+
 class RecallTwoTierRetriever:
     """Wraps RecallStore.retrieve() unchanged: TTL-pinned tier first, then
     hybrid search, budget-fit to the store's configured budget.
@@ -50,10 +74,17 @@ class RecallTwoTierRetriever:
     replaces TTL-pinning, until then the tick must keep happening exactly
     once per assemble). The decrement has its own containment — a failed
     tick never blocks retrieval, matching the legacy split try/excepts.
+
+    ``timeout`` reproduces the persistent path's per-call 5 s guard
+    (None for the worker path, which runs unbounded): a timed-out
+    retrieve propagates to the manager's containment, skipping memory
+    while the KB retriever still runs — same outcome as the legacy
+    split wait_fors.
     """
 
-    def __init__(self, recall_store: Any) -> None:
+    def __init__(self, recall_store: Any, timeout: Optional[float] = None) -> None:
         self.recall_store = recall_store
+        self.timeout = timeout
 
     async def retrieve(self, req: AssembleRequest) -> List[Candidate]:
         store = self.recall_store
@@ -61,7 +92,7 @@ class RecallTwoTierRetriever:
             return []
 
         try:
-            await store.decrement_ttl()
+            await _bounded(store.decrement_ttl(), self.timeout)
         except Exception as e:
             logger.warning(
                 "TTL decrement failed (non-fatal): %s: %s", type(e).__name__, e
@@ -70,7 +101,7 @@ class RecallTwoTierRetriever:
         # No budget kwarg — the legacy call relies on the store's
         # constructed budget; passing req.budget_tokens here would change
         # behaviour before Phase 3's unified budget measures it.
-        memories = await store.retrieve(req.query_text)
+        memories = await _bounded(store.retrieve(req.query_text), self.timeout)
         return [
             Candidate(
                 kind="memory",
@@ -96,10 +127,12 @@ class KbNotesRetriever:
         knowledge_store: Any,
         project_id: Optional[str] = None,
         project_ids: Optional[List[str]] = None,
+        timeout: Optional[float] = None,
     ) -> None:
         self.knowledge_store = knowledge_store
         self.project_id = project_id
         self.project_ids = list(project_ids or [])
+        self.timeout = timeout
 
     def _effective_project_uuids(self) -> List[uuid.UUID]:
         effective = self.project_ids or ([self.project_id] if self.project_id else [])
@@ -115,10 +148,13 @@ class KbNotesRetriever:
         if not project_uuids:
             return []
 
-        notes = await self.knowledge_store.hybrid_search(
-            project_ids=project_uuids,
-            query=req.query_text,
-            match_count=5,
+        notes = await _bounded(
+            self.knowledge_store.hybrid_search(
+                project_ids=project_uuids,
+                query=req.query_text,
+                match_count=5,
+            ),
+            self.timeout,
         )
         return [
             Candidate(kind="knowledge", text=note.content, token_count=0, record=note)
@@ -138,7 +174,9 @@ def _build_recall_two_tier(runtime: MemoryRuntime) -> RecallTwoTierRetriever:
         logger.info(
             "recall_two_tier bound without a recall_store — contributes nothing"
         )
-    return RecallTwoTierRetriever(runtime.recall_store)
+    return RecallTwoTierRetriever(
+        runtime.recall_store, timeout=runtime.retrieval_timeout
+    )
 
 
 @register_memory_plugin(
@@ -155,4 +193,5 @@ def _build_kb_notes(runtime: MemoryRuntime) -> KbNotesRetriever:
         runtime.knowledge_store,
         project_id=runtime.project_id,
         project_ids=runtime.project_ids,
+        timeout=runtime.retrieval_timeout,
     )

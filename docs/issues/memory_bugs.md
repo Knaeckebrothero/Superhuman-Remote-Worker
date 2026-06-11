@@ -169,6 +169,10 @@ route ALL terminate reasons through one capture call (with a
 guard against double-extraction when archive already ran). If a quick win
 is wanted earlier: call the same extraction block from `_terminate_session`
 when the loop didn't already archive (~the B1 pattern, one more call site).
+**Staged 2026-06-11 (Phase-1 slice 4):** the `teardown_extractor` writer
+exists and handles `session_end`/`idle_archive` with the legacy gates and
+log lines; the `_terminate_session` call site gains its `capture()` at
+cutover (slice 5), which is when this bug actually closes.
 
 Related observation from the same investigation (cosmetic): `agents.status`
 can read `offline` for a pod that is Running but whose session app has
@@ -487,8 +491,10 @@ in `test_knowledge_phase3.py`/`test_recall_store.py` — each re-verified
 zero-callers by grep before deletion. Deliberately left: the
 `MemoryManager`/workspace-template family (tracked in
 `docs/issues/remove_workspace_md_vestiges.md` — NB its `MemoryManager` name
-collides with the overhaul's new abstraction, so that removal should land
-before Phase 1) and the equally-dead `_load_query` twins in
+collides with the overhaul's new abstraction; Phase 1 started 2026-06-11
+with the collision tolerated: the vestige has zero importers and a distinct
+module path (`src.managers.memory` vs `src.services.memory`), removal still
+tracked in its issue doc) and the equally-dead `_load_query` twins in
 `src/database/postgres_db.py:250` / `orchestrator/database/postgres.py:443`
 (outside the audited catalog; remove opportunistically).
 
@@ -506,4 +512,14 @@ before Phase 1) and the equally-dead `_load_query` twins in
    `_terminate_session`; B3 wire-vs-retire → Phase 5 ablation; B6 → Phase 4
    `gc` writer; B7 → graph-as-plugin restructure (Phase 1/7). Don't fix these
    standalone first — Phase 1 pins current behaviour with fixtures, so the
-   old code should stay frozen until the seam lands.
+   old code should stay frozen until the seam lands. **Freeze now enforced**
+   (2026-06-11, Phase-1 slices 2–4): `tests/test_memory_worker_equivalence.py`
+   + `tests/test_memory_persistent_equivalence.py` byte-pin the read blocks
+   (graph.py:888-1037 / persistent_graph.py:527-659) and
+   `tests/test_memory_capture_equivalence.py` pins every write site
+   (graph.py in-loop extract/assemble, phase boundary, compaction store,
+   queued drain; persistent loop extraction; persistent_app teardowns) —
+   any change to those legacy blocks must update the equivalence suites in
+   lockstep. B11's missing-extraction fix is staged: the `teardown_extractor`
+   writer exists and handles `session_end`; the `_terminate_session` call
+   site gains its `capture()` at cutover (slice 5).

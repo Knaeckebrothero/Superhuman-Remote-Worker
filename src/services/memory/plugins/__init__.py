@@ -12,3 +12,4 @@ gate, bounded core). See docs/features/agent_memory_overhaul.md §5.
 """
 
 from . import legacy  # noqa: F401  (import-time registration)
+from . import legacy_writers  # noqa: F401  (import-time registration)
