@@ -1,6 +1,8 @@
 # Browser Workspace Executor — Move CDP control onto the workspace
 
 > **Status**: Phases 1+2 implemented + **validated end-to-end on the dev cluster (2026-05-27)** — navigate / snapshot (persistent) / screenshot / click / shutdown all confirmed against a live workspace pod. Autonomous deprecated (Phase 3 dropped). Cluster validation surfaced **two bugs in the first deployed cut (`sha-310acc2`)**, both fixed + re-validated via a patched copy: (1) browser-use's default launch omits `--no-sandbox` → Chromium can't start in the pod; (2) `DomService.get_serialized_dom_tree()` doesn't populate the session selector map → `click`/`type`/`select` fail with "ref not found". Fix uses `chromium_sandbox=False` + container args, and `get_browser_state_summary()`. **Fix is uncommitted — needs a workspace image rebuild to ship.** Phase 4 (remove the 9222 exposure) still blocked on migrating `papers.py` (see §10/R6).
+>
+> **Update 2026-06-11**: the local/in-process browser path is **removed entirely** (`docs/issues/remove_local_browser_fallback.md`) — `browser-exec` is the only browser. `get_browser_session()`, `_local_action`, `_is_remote_browser()`, and the `papers.py` browser-download fallback are deleted; the agent image ships no Playwright/Chromium. This completes/retires **Phase 4**: `_start_remote_chromium` and the 9222 CDP path are gone with the fallback. Decision **D5** (keep local dev mode) is superseded — the Compose/bare-metal posture it served is deprecated.
 > **Created**: 2026-05-25
 > **Trigger**: Remote browser automation is broken cluster-wide (diagnosed from session `b4478b88`). See "Root cause" below.
 >

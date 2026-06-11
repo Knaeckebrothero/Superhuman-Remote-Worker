@@ -282,14 +282,19 @@ research:
     port: 1080            # Proxy port
 
 browser:
-  headless: true          # Run browser without GUI
-  timeout: 60000          # Navigation timeout (ms)
-  use_vision: false       # DOM-based (default) vs screenshot-based navigation
+  snapshot:
+    include_screenshot: auto  # "auto" (if model is multimodal) | true | false
+    max_dom_chars: 40000      # Truncate DOM text beyond this
+  security:
+    allowed_domains: []       # Empty = allow all domains
+    blocked_domains: []
+    blocked_schemes: ["file", "javascript", "data"]
 ```
 
-Proxy can also be set via environment variables: `RESEARCH_PROXY_TYPE`, `RESEARCH_PROXY_HOST`, `RESEARCH_PROXY_PORT`, `RESEARCH_PROXY_USER`, `RESEARCH_PROXY_PASS`.
+The browser itself runs on the workspace (`browser-exec` daemon) — the agent
+pod never executes Chromium. See `docs/features/browser_workspace_executor.md`.
 
-Browser LLM is configured separately: `BROWSER_LLM_MODEL` (default: `gpt-4o-mini`), `BROWSER_LLM_API_KEY`, `BROWSER_LLM_BASE_URL`.
+Proxy can also be set via environment variables: `RESEARCH_PROXY_TYPE`, `RESEARCH_PROXY_HOST`, `RESEARCH_PROXY_PORT`, `RESEARCH_PROXY_USER`, `RESEARCH_PROXY_PASS`.
 
 ### Database Connections
 

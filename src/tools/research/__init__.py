@@ -43,7 +43,6 @@ def create_browser_direct_tools(context: ToolContext) -> List[Any]:
 
 def get_research_metadata() -> Dict[str, Dict[str, Any]]:
     """Get metadata for all research tools."""
-    from .browser import BROWSER_TOOLS_METADATA
     from .papers import PAPER_TOOLS_METADATA
     from .web import RESEARCH_TOOLS_METADATA
     from .workflow import WORKFLOW_TOOLS_METADATA
@@ -51,7 +50,6 @@ def get_research_metadata() -> Dict[str, Dict[str, Any]]:
     metadata = {}
     metadata.update(RESEARCH_TOOLS_METADATA)
     metadata.update(PAPER_TOOLS_METADATA)
-    metadata.update(BROWSER_TOOLS_METADATA)
     metadata.update(WORKFLOW_TOOLS_METADATA)
     return metadata
 

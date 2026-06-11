@@ -279,18 +279,11 @@ communication:
   max_message_length: 5000         # Max chars per message body
   allowed_recipients: project      # "owner" (job owner only) or "project" (all project members)
 
-# Browser automation settings (browser-use + CDP)
+# Browser tool settings (workspace-side browser-exec daemon)
 # Direct browser tools (browser_navigate, browser_click, etc.) give the agent
-# step-by-step control. Vision mode auto-selects based on model's multimodal flag.
+# step-by-step control of a Chromium on the workspace; the agent pod never
+# runs a browser. Vision mode auto-selects based on model's multimodal flag.
 browser:
-  headless: true
-  timeout: 60000  # Milliseconds
-  use_vision: auto  # "auto" (true if model is multimodal) | true | false
-  remote: auto  # "auto" (use remote Chromium when workspace is remote), "local" (always local)
-  model: null  # Sub-agent model for browse_website (null = gpt-4o)
-  api_key: null  # Sub-agent API key (null = OPENAI_API_KEY)
-  base_url: null  # Sub-agent base URL
-  chromium_max_memory_mb: 512  # Restart Chromium if RSS exceeds this
   snapshot:
     include_screenshot: auto  # "auto" (if multimodal) | true | false
     max_dom_chars: 40000  # Truncate DOM text beyond this
@@ -298,9 +291,6 @@ browser:
     allowed_domains: []  # Empty = allow all domains
     blocked_domains: []  # Browser runs in isolated workspace — localhost is safe
     blocked_schemes: ["file", "javascript", "data"]
-  persistence:
-    user_data_dir: .browser-profile  # Relative to workspace root
-    export_state_on_phase: true  # storageState backup at phase boundaries
 
 # Shell command execution (tmux-backed terminal multiplexer)
 # Requires tmux installed.

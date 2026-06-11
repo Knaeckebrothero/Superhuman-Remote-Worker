@@ -143,17 +143,15 @@ def create_paper_tools(context: ToolContext) -> List[Any]:
     async def download_paper(
         identifier: str,
         identifier_type: str = "auto",
-        use_browser_fallback: bool = True,
     ) -> str:
         """Download paper PDF to workspace documents folder.
 
-        Uses fallback chain: arXiv -> Unpaywall -> Browser automation.
+        Uses fallback chain: arXiv -> Unpaywall (open-access copies).
         Downloaded papers are registered as citation sources when possible.
 
         Args:
             identifier: DOI (e.g., "10.1038/nature12373"), arXiv ID (e.g., "2408.08921"), or URL
             identifier_type: "doi", "arxiv", or "auto" (auto-detect)
-            use_browser_fallback: Try browser automation if API methods fail (default True). Useful for publisher pages with VPN access.
 
         Returns:
             Path to downloaded PDF or error message with suggestions
@@ -202,13 +200,6 @@ def create_paper_tools(context: ToolContext) -> List[Any]:
                     elif result.error:
                         logger.debug(f"Unpaywall download failed: {result.error}")
 
-            # Try browser automation as final fallback
-            if use_browser_fallback:
-                browser_result = await _try_browser_download(
-                    identifier, identifier_type, dest_dir, context, proxy=proxy
-                )
-                if browser_result:
-                    return browser_result
         finally:
             # Clean up temp dir if we created one for remote downloads
             if remote and dest_dir.exists():
@@ -220,7 +211,7 @@ def create_paper_tools(context: ToolContext) -> List[Any]:
         if paywalled_title:
             return (
                 f"Paper is paywalled: {paywalled_title}\n"
-                f"No open access version found and browser download failed.\n"
+                f"No open access version found.\n"
                 f"Suggestions:\n"
                 f"  - Check if a preprint exists on arXiv\n"
                 f"  - Connect to institutional VPN and configure proxy\n"
@@ -379,156 +370,6 @@ async def _try_unpaywall_download(
             error="UNPAYWALL_EMAIL not configured. Set it in .env to enable Unpaywall lookups.",
         )
     return await client.download(doi, dest_dir)
-
-
-async def _resolve_doi_url(doi: str, *, proxy=None) -> Optional[str]:
-    """Resolve a DOI to its publisher URL by following the redirect.
-
-    Args:
-        doi: DOI string (e.g., "10.1038/nature12373")
-        proxy: Optional ProxyConfig for routing through VPN.
-
-    Returns:
-        Publisher URL or None if resolution fails
-    """
-    from .utils.network import research_request
-
-    doi_url = f"https://doi.org/{doi}"
-    try:
-        async with research_request(
-            "HEAD", doi_url, proxy=proxy, timeout=15, allow_redirects=True
-        ) as resp:
-            return str(resp.url)
-    except Exception as e:
-        logger.debug(f"DOI resolution failed for {doi}: {e}")
-        return doi_url  # Fall back to doi.org URL
-
-
-async def _try_browser_download(
-    identifier: str,
-    identifier_type: str,
-    dest_dir: Path,
-    context: "ToolContext",
-    *,
-    proxy=None,
-) -> Optional[str]:
-    """Try downloading a paper using browser automation.
-
-    Resolves the identifier to a URL and uses browser-use to navigate
-    and download the PDF. Works best with institutional VPN/proxy.
-
-    Args:
-        identifier: Paper identifier (DOI, arXiv ID, or URL)
-        identifier_type: Type of identifier
-        dest_dir: Download destination directory
-        context: ToolContext for browser configuration
-
-    Returns:
-        Success message string, or None if browser download failed/unavailable
-    """
-    try:
-        from .browser import (
-            _get_browser_config,
-            _get_browser_llm,
-            _find_new_files,
-            _find_new_files_remote,
-            _is_remote_browser,
-            _register_downloaded_file,
-            _stop_remote_chromium,
-        )
-        from browser_use import Agent, Browser
-    except ImportError:
-        logger.debug("browser-use not available for fallback download")
-        return None
-
-    # Resolve identifier to a URL
-    if identifier_type == "doi":
-        doi_match = DOI_PATTERN.search(identifier)
-        if doi_match:
-            url = await _resolve_doi_url(doi_match.group(), proxy=proxy)
-        else:
-            return None
-    elif identifier_type == "arxiv":
-        arxiv_match = ARXIV_PATTERN.search(identifier)
-        arxiv_id = arxiv_match.group() if arxiv_match else identifier
-        url = f"https://arxiv.org/abs/{arxiv_id}"
-    elif identifier.startswith("http"):
-        url = identifier
-    else:
-        return None
-
-    logger.info(f"Trying browser download from: {url}")
-
-    remote = _is_remote_browser(context)
-    browser = None
-    try:
-        llm = _get_browser_llm()
-
-        if remote:
-            browser_kwargs = _get_browser_config(context)
-        else:
-            dest_dir.mkdir(parents=True, exist_ok=True)
-            browser_kwargs = _get_browser_config(context, downloads_path=dest_dir)
-
-        browser = Browser(**browser_kwargs)
-
-        agent = Agent(
-            task=(
-                f"Go to {url} and download the PDF of this paper. "
-                f"Look for a 'Download PDF' button or link. "
-                f"Accept any cookie banners if needed. "
-                f"Wait for the download to complete."
-            ),
-            llm=llm,
-            browser=browser,
-            use_vision=False,
-            max_actions_per_step=4,
-        )
-
-        await agent.run()
-
-        # Check for downloaded files — remote vs local detection
-        if remote:
-            backend = context.workspace_manager.backend
-            new_files = _find_new_files_remote(backend, "documents")
-            if new_files:
-                rel_path = new_files[0]
-                file_size = backend.stat(rel_path)
-                file_name = Path(rel_path).name
-                _register_downloaded_file(context, rel_path, name=file_name)
-                return (
-                    f"Downloaded via browser: {file_name}\n"
-                    f"Path: {rel_path}\n"
-                    f"Size: {file_size:,} bytes\n"
-                    f"Source: Browser automation ({url})"
-                )
-        else:
-            downloaded_files = _find_new_files(dest_dir)
-            if downloaded_files:
-                downloaded_path = downloaded_files[0]
-                _register_downloaded_file(
-                    context, str(downloaded_path), name=downloaded_path.name
-                )
-                return (
-                    f"Downloaded via browser: {downloaded_path.name}\n"
-                    f"Path: {downloaded_path}\n"
-                    f"Size: {downloaded_path.stat().st_size:,} bytes\n"
-                    f"Source: Browser automation ({url})"
-                )
-
-        return None
-
-    except Exception as e:
-        logger.debug(f"Browser download failed: {e}")
-        return None
-    finally:
-        if browser is not None:
-            try:
-                await browser.stop()
-            except Exception:
-                pass
-        if remote:
-            _stop_remote_chromium(context.workspace_manager.backend)
 
 
 async def _get_semantic_scholar_info(identifier: str, *, proxy=None) -> Optional[str]:
