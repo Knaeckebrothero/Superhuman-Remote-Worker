@@ -146,6 +146,20 @@ memory:
   dedup_threshold: 0.85
   retrieval_importance_floor: 0.4
   project_scoped: true
+  # MemoryManager seam (memory overhaul Phase 1). manager.enabled is the
+  # cutover flag: true routes memory through the manager + the pipeline
+  # below; false keeps the legacy direct-store paths. Persistent mode has
+  # its own writer set: the elapsed-gate interval extractor and the
+  # session_end/idle_archive teardown extractor (no assembler, no phases).
+  manager:
+    enabled: true
+  pipeline:
+    retrievers:
+      - recall_two_tier              # TTL-pinned tier + hybrid search (RecallStore)
+      - kb_notes                     # Top-5 project knowledge notes
+    writers:
+      - persistent_interval_extractor  # In-loop observer (elapsed gate)
+      - teardown_extractor             # Final extraction on session end / idle archive
 
 auxiliary:
   enabled: true

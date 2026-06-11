@@ -1670,6 +1670,7 @@ class TestHandleArchive:
         """recall_store read from _session.tool_context.recall_store."""
         ws = AsyncMock()
         mock_session = MagicMock()
+        mock_session.memory_service = None  # legacy path (manager flag off)
         mock_session.tool_context.recall_store = None
         mock_session.auxiliary_llm = None
         mock_session.messages = []
@@ -1695,6 +1696,7 @@ class TestHandleArchive:
         """Memory extraction only runs when recall_store, aux_llm, and messages all truthy."""
         ws = AsyncMock()
         mock_session = MagicMock()
+        mock_session.memory_service = None  # legacy path (manager flag off)
         mock_session.tool_context.recall_store = MagicMock()
         mock_session.auxiliary_llm = MagicMock()
         mock_session.messages = []  # Empty — should skip extraction
@@ -1714,6 +1716,7 @@ class TestHandleArchive:
         """Memory extraction failure doesn't prevent session.ended."""
         ws = AsyncMock()
         mock_session = MagicMock()
+        mock_session.memory_service = None  # legacy path (manager flag off)
         mock_session.tool_context.recall_store = MagicMock()
         mock_session.auxiliary_llm = MagicMock()
         mock_session.messages = [HumanMessage(content="hi")]
@@ -1744,6 +1747,7 @@ class TestHandleArchive:
         """Generates title when existing title is 'Untitled Session'."""
         ws = AsyncMock()
         mock_session = MagicMock()
+        mock_session.memory_service = None  # legacy path (manager flag off)
         mock_session.tool_context.recall_store = None
         mock_session.auxiliary_llm = MagicMock()
         mock_session.messages = [HumanMessage(content="hi")]
@@ -1771,6 +1775,7 @@ class TestHandleArchive:
         """Title generation failure doesn't crash archive."""
         ws = AsyncMock()
         mock_session = MagicMock()
+        mock_session.memory_service = None  # legacy path (manager flag off)
         mock_session.tool_context.recall_store = None
         mock_session.auxiliary_llm = None
         mock_session.messages = []
@@ -1798,6 +1803,7 @@ class TestHandleArchive:
         """Sends session.ended with thread_id."""
         ws = AsyncMock()
         mock_session = MagicMock()
+        mock_session.memory_service = None  # legacy path (manager flag off)
         mock_session.tool_context.recall_store = None
         mock_session.auxiliary_llm = None
         mock_session.messages = []
