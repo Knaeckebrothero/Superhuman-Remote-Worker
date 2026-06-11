@@ -1099,48 +1099,67 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             except Exception as e:
                 logger.warning(f"Failed to freeze resolved config: {e}")
 
-        # Create workspace backend. The agent never operates on its own
-        # filesystem — backend must be "sandbox" or "vm" with SSH credentials
-        # provided by the orchestrator at dispatch time.
-        if self.config.workspace.backend not in ("sandbox", "vm"):
-            raise RuntimeError(
-                f"Unsupported workspace.backend={self.config.workspace.backend!r}. "
-                f"The agent requires backend='sandbox' or 'vm' with SSH "
-                f"credentials injected by the orchestrator."
-            )
-        if not self.config.workspace.remote:
-            raise RuntimeError(
-                f"workspace.backend={self.config.workspace.backend!r} but no "
-                f"workspace.remote config was provided. The orchestrator must "
-                f"inject SSH credentials pointing at a provisioned workspace "
-                f"container or VM."
-            )
+        # Create workspace backend. The no-workspace tiers (virtual/none) run
+        # with no workspace pod — build the lite backend directly. Otherwise
+        # the agent never operates on its own filesystem: sandbox/vm require
+        # SSH credentials injected by the orchestrator at dispatch time.
+        from .core.backends.factory import LITE_BACKENDS, create_lite_backend
 
-        try:
-            from .core.backends.remote import RemoteBackend
+        if self.config.workspace.backend in LITE_BACKENDS:
+            try:
+                workspace_backend = create_lite_backend(
+                    self.config.workspace, job_id=job_id
+                )
+                workspace_backend.connect()
+                logger.info(
+                    "Lite workspace backend ready (backend=%s, no workspace pod)",
+                    self.config.workspace.backend,
+                )
+            except Exception as e:
+                logger.error(f"Failed to create lite backend: {e}")
+                raise
+        else:
+            if self.config.workspace.backend not in ("sandbox", "vm"):
+                raise RuntimeError(
+                    f"Unsupported workspace.backend={self.config.workspace.backend!r}. "
+                    f"The agent requires backend='sandbox' or 'vm' with SSH "
+                    f"credentials injected by the orchestrator."
+                )
+            if not self.config.workspace.remote:
+                raise RuntimeError(
+                    f"workspace.backend={self.config.workspace.backend!r} but no "
+                    f"workspace.remote config was provided. The orchestrator must "
+                    f"inject SSH credentials pointing at a provisioned workspace "
+                    f"container or VM."
+                )
 
-            remote_cfg = self.config.workspace.remote
-            shell_config = self.config.extra.get("shell", {})
-            workspace_backend = RemoteBackend(
-                host=remote_cfg["host"],
-                port=remote_cfg.get("port", 22),
-                username=remote_cfg.get("username", "agent-host"),
-                key_path=remote_cfg.get("key_path"),
-                workspace_path=remote_cfg.get(
-                    "workspace_path", "/home/agent-host/workspace"
-                ),
-                job_id=job_id,
-                scrollback_limit=shell_config.get("scrollback_limit", 5000),
-                default_timeout=shell_config.get("default_timeout", 120),
-                max_tabs=shell_config.get("max_tabs", 15),
-                blocked_commands=shell_config.get("blocked_commands"),
-                sudo_action=shell_config.get("sudo_action", "freeze"),
-            )
-            workspace_backend.connect()
-            logger.info(f"Remote workspace backend connected to {remote_cfg['host']}")
-        except Exception as e:
-            logger.error(f"Failed to create remote backend: {e}")
-            raise
+            try:
+                from .core.backends.remote import RemoteBackend
+
+                remote_cfg = self.config.workspace.remote
+                shell_config = self.config.extra.get("shell", {})
+                workspace_backend = RemoteBackend(
+                    host=remote_cfg["host"],
+                    port=remote_cfg.get("port", 22),
+                    username=remote_cfg.get("username", "agent-host"),
+                    key_path=remote_cfg.get("key_path"),
+                    workspace_path=remote_cfg.get(
+                        "workspace_path", "/home/agent-host/workspace"
+                    ),
+                    job_id=job_id,
+                    scrollback_limit=shell_config.get("scrollback_limit", 5000),
+                    default_timeout=shell_config.get("default_timeout", 120),
+                    max_tabs=shell_config.get("max_tabs", 15),
+                    blocked_commands=shell_config.get("blocked_commands"),
+                    sudo_action=shell_config.get("sudo_action", "freeze"),
+                )
+                workspace_backend.connect()
+                logger.info(
+                    f"Remote workspace backend connected to {remote_cfg['host']}"
+                )
+            except Exception as e:
+                logger.error(f"Failed to create remote backend: {e}")
+                raise
 
         # Worktree creation: subjobs on shared VM/container get a git worktree
         # instead of a full clone. The worktree is created on the remote machine.
@@ -1177,11 +1196,18 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                 metadata.pop("worktree_path", None)
 
         # Create workspace manager
+        # Lite tiers (virtual/none) have no git: their backend storage is not
+        # the local anchor path git would track, and git needs a shell they
+        # lack (no_workspace_agent_mode.md §8). Force versioning off regardless
+        # of the resolved config so a virtual/none job never attempts git init.
+        _git_versioning = self.config.workspace.git_versioning and (
+            self.config.workspace.backend not in LITE_BACKENDS
+        )
         self._workspace_manager = WorkspaceManager(
             job_id=job_id,
             config=WorkspaceManagerConfig(
                 structure=self.config.workspace.structure,
-                git_versioning=self.config.workspace.git_versioning,
+                git_versioning=_git_versioning,
                 git_remote_url=metadata.get("git_remote_url"),
                 branch_name=metadata.get("branch_name"),
                 repositories=metadata.get("repositories"),

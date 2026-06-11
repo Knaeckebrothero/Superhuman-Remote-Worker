@@ -88,6 +88,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certifi
 
 # Install runtime dependencies. Document/media processing runs in-process;
 # code execution (shell, browser) happens on the workspace, not in this pod.
+# rclone is the exception that proves the rule: a fixed-destination typed
+# client (no_workspace_agent_mode.md §3.1) used only by the `virtual` tier's
+# object-store backend. Needs >= 1.59 for `lsjson --stat` (bookworm ships 1.60).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq5 \
     curl \
@@ -96,6 +99,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     ripgrep \
     jq \
+    rclone \
     nodejs \
     build-essential \
     cmake \
