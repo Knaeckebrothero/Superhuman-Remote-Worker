@@ -142,6 +142,48 @@ type PermissionMode = 'supervised' | 'auto_accept' | 'autonomous';
 export type NarrationMode = 'silent' | 'verbose' | 'auto';
 
 /**
+ * Live token telemetry for the current turn, driven by per-LLM-call
+ * `usage.updated` frames. `inputTokens` is the latest call's prompt size —
+ * effectively the current context fill — while output/reasoning accumulate
+ * across the turn's calls. (docs/features/context_summarization_rework.md S5)
+ */
+export interface UsageState {
+    turn: number | null;
+    inputTokens: number | null;
+    outputTokensTurn: number;
+    reasoningTokensTurn: number;
+    ctxLimitTokens: number | null;
+}
+
+/**
+ * Live state of an in-flight context compaction, driven by the agent's
+ * `compaction.started` / `compaction.progress` frames and cleared by
+ * `context.compacted` (success) or `compaction.failed`. Frames are journaled
+ * server-side, so a reload mid-compaction reconstructs this from SSE replay
+ * (possibly from a progress frame alone — all fields nullable-tolerant).
+ * See docs/features/context_summarization_rework.md (S3).
+ */
+export interface CompactionProgressState {
+    trigger: string;
+    totalTokens: number | null;
+    ctxUsedTokens: number | null;
+    ctxLimitTokens: number | null;
+    ctxUsedPct: number | null;
+    auxLimitTokens: number | null;
+    nPasses: number;
+    /** 0 while planning (no progress frame yet). */
+    currentPass: number;
+    firstMsg: number | null;
+    lastMsg: number | null;
+    inTokens: number | null;
+    outTokens: number | null;
+    attempt: number;
+    stage: string;
+    /** Client epoch ms when the first compaction frame arrived (elapsed timer). */
+    startedAt: number;
+}
+
+/**
  * Response payload for ``GET /api/sessions/{thread_id}/connection`` — the
  * canonical WS URL + JWT for a bound session. The cockpit dials the WS at
  * `ws_url` directly (routed to the agent pod by the orchestrator's edge
@@ -247,6 +289,14 @@ export class PersistentChatService {
     // Updated on the SSE watchdog's 5s tick.
     readonly agentSilenceSeconds = signal<number>(0);
     private agentLastEventAt = 0;
+
+    // Live context-compaction progress (null = no compaction running).
+    // Drives the in-chat progress block + status-bar strip.
+    readonly compaction = signal<CompactionProgressState | null>(null);
+
+    // Live per-turn token telemetry (usage.updated frames); null until the
+    // first main-LLM call reports usage.
+    readonly usage = signal<UsageState | null>(null);
     readonly threadId = signal<string | null>(null);
 
     /**
@@ -1151,6 +1201,7 @@ export class PersistentChatService {
         this.startupPhase.set(null);
         this.pendingMessage.set(null);
         this.pendingPermission.set(null);
+        this.compaction.set(null);
         this.sessionTitle.set(null);
         this.modelName.set(null);
         this.temperature.set(0);
@@ -1377,8 +1428,11 @@ export class PersistentChatService {
 
         switch (cmd) {
             case '/compact':
+                // No local "Compacting context..." echo: the agent's
+                // compaction.started/progress frames drive the live progress
+                // block, and a no-op answers with a summary-less
+                // context.compacted (rendered as a system line below).
                 this._sendControl({method: 'compact', focus: arg});
-                this._systemMessage(`Compacting context${arg ? ` (focus: ${arg})` : ''}...`);
                 return true;
             case '/done':
                 this._sendControl({method: 'archive'});
@@ -1721,6 +1775,9 @@ export class PersistentChatService {
                 }
                 this.isInterrupting.set(false);
                 this.runningTool.set(null);
+                // A compaction never outlives its turn — clear a stale block
+                // (e.g. the pod died mid-fold and the turn was closed).
+                this.compaction.set(null);
                 break;
             }
 
@@ -1733,6 +1790,7 @@ export class PersistentChatService {
                 this._closeActiveTurnIfAny('turn_interrupted');
                 this.isInterrupting.set(false);
                 this.runningTool.set(null);
+                this.compaction.set(null);
                 this._systemMessage(`⚠ ${this.sanitizeError(params['message'] as string)}`);
                 break;
             }
@@ -1769,7 +1827,103 @@ export class PersistentChatService {
                 }
                 break;
 
+            case 'usage.updated': {
+                const prev = this.usage();
+                const turn = (params['turn'] as number) ?? null;
+                const sameTurn = prev !== null && prev.turn === turn;
+                this.usage.set({
+                    turn,
+                    // Latest call's prompt size ≈ current context fill
+                    inputTokens: (params['input_tokens'] as number) ?? prev?.inputTokens ?? null,
+                    outputTokensTurn:
+                        (sameTurn ? prev.outputTokensTurn : 0) +
+                        ((params['output_tokens'] as number) ?? 0),
+                    reasoningTokensTurn:
+                        (sameTurn ? prev.reasoningTokensTurn : 0) +
+                        ((params['reasoning_tokens'] as number) ?? 0),
+                    ctxLimitTokens:
+                        (params['ctx_limit_tokens'] as number) ?? prev?.ctxLimitTokens ?? null,
+                });
+                break;
+            }
+
+            case 'compaction.started': {
+                this.compaction.set({
+                    trigger: (params['trigger'] as string) ?? 'auto',
+                    totalTokens: (params['total_tokens'] as number) ?? null,
+                    ctxUsedTokens: (params['ctx_used_tokens'] as number) ?? null,
+                    ctxLimitTokens: (params['ctx_limit_tokens'] as number) ?? null,
+                    ctxUsedPct: (params['ctx_used_pct'] as number) ?? null,
+                    auxLimitTokens: (params['aux_limit_tokens'] as number) ?? null,
+                    nPasses: (params['n_passes'] as number) ?? 1,
+                    currentPass: 0,
+                    firstMsg: null,
+                    lastMsg: null,
+                    inTokens: null,
+                    outTokens: null,
+                    attempt: 1,
+                    stage: 'summarizing',
+                    startedAt: now,
+                });
+                break;
+            }
+
+            case 'compaction.progress': {
+                // Replay tolerance: a reload mid-compaction can deliver
+                // progress without its started frame — synthesize minimal
+                // state instead of dropping the update.
+                const prev = this.compaction();
+                this.compaction.set({
+                    trigger: (params['trigger'] as string) ?? prev?.trigger ?? 'auto',
+                    totalTokens: prev?.totalTokens ?? null,
+                    ctxUsedTokens: prev?.ctxUsedTokens ?? null,
+                    ctxLimitTokens: prev?.ctxLimitTokens ?? null,
+                    ctxUsedPct: prev?.ctxUsedPct ?? null,
+                    auxLimitTokens: prev?.auxLimitTokens ?? null,
+                    nPasses: (params['n_passes'] as number) ?? prev?.nPasses ?? 1,
+                    currentPass: (params['pass'] as number) ?? prev?.currentPass ?? 1,
+                    firstMsg: (params['first_msg'] as number) ?? null,
+                    lastMsg: (params['last_msg'] as number) ?? null,
+                    inTokens: (params['in_tokens'] as number) ?? null,
+                    outTokens: (params['out_tokens'] as number) ?? null,
+                    attempt: (params['attempt'] as number) ?? 1,
+                    stage: (params['stage'] as string) ?? 'summarizing',
+                    startedAt: prev?.startedAt ?? now,
+                });
+                break;
+            }
+
+            case 'compaction.skipped': {
+                // Engine ran but the result wasn't worth adopting (e.g. the
+                // summary came out larger than the folded messages). Journaled
+                // terminal frame — clears the progress block, including on
+                // SSE replay. Manual /compact additionally gets its own
+                // summary-less context.compacted for the system line.
+                this.compaction.set(null);
+                break;
+            }
+
+            case 'compaction.failed': {
+                this.compaction.set(null);
+                const reason = (params['reason'] as string) ?? 'unknown';
+                // History is intact by contract (the engine aborts rather than
+                // compacting behind a placeholder) — say so explicitly.
+                this._systemMessage(
+                    `⚠ Context compaction failed (${reason}) — conversation kept intact, will retry later.`,
+                );
+                break;
+            }
+
             case 'context.compacted': {
+                // Compaction finished — clear the live progress block.
+                this.compaction.set(null);
+                const summary = (params['summary'] as string | null) ?? '';
+                if (!summary) {
+                    // Manual /compact no-op: nothing was folded and no banner
+                    // row was persisted — a transient system line, not a banner.
+                    this._systemMessage('Nothing to compact — context is within limits.');
+                    break;
+                }
                 // Show a compaction banner. Stable id (compaction-<turn>) keeps
                 // SSE replay idempotent; the reducer replaces rather than dupes.
                 const turn = params['turn'];
@@ -1778,7 +1932,7 @@ export class PersistentChatService {
                 this.dispatch({
                     type: 'add_compaction',
                     id: compactionId,
-                    summary: (params['summary'] as string) ?? '',
+                    summary,
                     timestamp: Date.now(),
                 });
                 break;
@@ -2005,10 +2159,11 @@ function mergeMessagesById(a: HistoryMessage[], b: HistoryMessage[]): HistoryMes
     });
 }
 
-function historyToTurns(messages: HistoryMessage[]): Turn[] {
+export function historyToTurns(messages: HistoryMessage[]): Turn[] {
     const turns: Turn[] = [];
     const turnByNumber = new Map<number, AssistantTurn>();
     const toolCallById = new Map<string, ToolCallEvent>();
+    let lastCompactionSummary: string | null = null;
 
     for (const m of messages) {
         const isUser = ['human', 'user', 'HumanMessageChunk'].includes(m.role);
@@ -2017,14 +2172,34 @@ function historyToTurns(messages: HistoryMessage[]): Turn[] {
 
         const ts = m.created_at ? Date.parse(m.created_at) || Date.now() : Date.now();
 
-        // Compaction boundary marker (role='summary') → a divider banner.
+        // Compaction boundary marker (role='summary'). Consecutive identical
+        // summaries collapse to one marker (threads written before the
+        // run-counter gate carry duplicate rows — the duplicate-banner bug).
+        // A marker whose turn is already open renders as an inline event at
+        // its true position in the event stream; the turn block anchors at
+        // its first row, so a top-level divider would otherwise trail the
+        // whole turn's content. Markers between turns stay top-level dividers.
         if (m.role === 'summary') {
-            turns.push({
-                kind: 'compaction',
-                id: m.id,
-                summary: m.content ?? '',
-                timestamp: ts,
-            });
+            const summaryText = m.content ?? '';
+            if (summaryText && summaryText === lastCompactionSummary) continue;
+            if (summaryText) lastCompactionSummary = summaryText;
+            const owner =
+                m.turn_number != null ? turnByNumber.get(m.turn_number) : undefined;
+            if (owner) {
+                owner.events.push({
+                    kind: 'compaction',
+                    id: m.id,
+                    summary: summaryText,
+                    startedAt: ts,
+                });
+            } else {
+                turns.push({
+                    kind: 'compaction',
+                    id: m.id,
+                    summary: summaryText,
+                    timestamp: ts,
+                });
+            }
             continue;
         }
 

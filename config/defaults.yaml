@@ -244,7 +244,10 @@ auxiliary:
   base_url: null               # null = use LLM_BASE_URL (university vLLM endpoint)
   temperature: 0.0
   max_iterations: 15       # Cap for agent mode loops
-  timeout: 120             # Seconds per LLM call
+  timeout: 120             # Seconds per LLM call (quick interactive tasks)
+  # Per fold-call budget for conversation summarization (each pass is one
+  # bounded call — src/core/summarizer.py)
+  summarization_call_timeout: 240
   tasks:
     extract_memories:
       enabled: true

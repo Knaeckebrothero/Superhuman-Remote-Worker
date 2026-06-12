@@ -481,6 +481,9 @@ class PersistentSession:
             **self.config.extra,
             "agent_id": self.config.agent_id,
             "multimodal": self.config.llm.multimodal,
+            # Lets bulk readers cap a single tool result relative to the main
+            # model's window (session_silent_failure_audit.md #5).
+            "model_max_context_tokens": self.config.limits.model_max_context_tokens,
             "cloud_mount": {
                 "active": bool(
                     self.cloud_mount_manager and self.cloud_mount_manager.active
@@ -671,13 +674,15 @@ class PersistentSession:
                 message_count_min_tokens=lim.message_count_min_tokens,
                 keep_recent_tool_results=ctx.keep_recent_tool_results,
                 keep_recent_messages=ctx.keep_recent_messages,
-                # Safety-layer constants (model-aware; see loader fractions)
+                # Safety-layer constant (model-aware; see loader fractions).
+                # Summarization budgets are computed at call time from the
+                # aux model's window (src/core/summarizer.py).
                 model_max_context_tokens=lim.model_max_context_tokens,
-                summarization_safe_limit=lim.summarization_safe_limit,
-                summarization_chunk_size=lim.summarization_chunk_size,
             ),
             model=self.config.llm.model or "gpt-4",
-            summarization_timeout=self.config.llm.timeout or 600.0,
+            summarization_call_timeout=(
+                self.config.auxiliary.summarization_call_timeout
+            ),
         )
 
     def _setup_shell_manager(self) -> None:

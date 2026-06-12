@@ -170,10 +170,13 @@ auxiliary:
   # Bounded for the interactive path: short aux tasks (memory extraction,
   # knowledge curation, titles) run inline on the turn's critical path, so a
   # hung endpoint mustn't stall a turn for long. Failures fall back / skip
-  # gracefully. Summarization is the exception — it passes the larger,
-  # dedicated summarization_timeout (see ContextManager) because a big
-  # conversation can't be summarized under a schema within this window.
+  # gracefully. Summarization is the exception — each fold pass gets the
+  # larger summarization_call_timeout below.
   timeout: 120
+  # Per fold-call budget for conversation summarization. Each summarization
+  # pass is one bounded call (src/core/summarizer.py); a hung endpoint costs
+  # at most this much per attempt, never a single shared 600s blob.
+  summarization_call_timeout: 240
   tasks:
     extract_memories:
       enabled: true

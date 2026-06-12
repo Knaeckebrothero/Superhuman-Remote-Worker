@@ -330,8 +330,9 @@ limits:
   message_count_threshold: 300
   # Model-dependent (set in settings_matrix.yaml, NOT here):
   # context_threshold_tokens, model_max_context_tokens,
-  # summarization_safe_limit, summarization_chunk_size,
   # message_count_min_tokens
+  # (summarization budgets are not config leaves — they are computed at call
+  # time from the auxiliary model's window, see src/core/summarizer.py)
 
 context_management:
   compact_on_archive: true

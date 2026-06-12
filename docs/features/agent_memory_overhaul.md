@@ -483,6 +483,90 @@ below in new order). Every bug worth fixing *before* the seam is fixed
   budget, B5) is the open Phase-3 item.** Next measurement: re-run the
   contradiction probe over a completeness+rerank corpus as the Phase-4
   opening baseline.
+- **2026-06-12 (night) — Phase 3 slice 4 MEASURED: relative gate ships,
+  absolute gate falsified; Phase 3 COMPLETE. Phase-4 opening baseline
+  recorded.** Built: `plugins/gate.py` GatePolicy (`memory.gate.
+  {threshold,channel,mode}`, `pipeline.policies: [gate, bounded]`),
+  request digest (`memory.query.digest` default-off; unified
+  `build_digest_query_text` in `src/services/memory/query.py`, flag
+  consulted at all four AssembleRequest build sites — worker execute,
+  persistent turn, harness ingest + question time), B5 one-budget
+  (`memory.bounded.include_knowledge`: KB notes count against
+  `max_tokens`; `max_items` stays memory-only so a 200-candidate memory
+  channel can't starve the KB block), per-item `score` persisted in
+  harness results (post-hoc threshold analysis). `ef_search` deferred:
+  retrieval is saturated at eval scale (R@5 1.0), nothing to tune yet.
+  Requery measurements over the same restored `seam_complete_s20`
+  corpora (gemma reader, llama-70b judge):
+
+  | arm (runs/) | R@5 | NDCG@5 | mem/q | tok/q | end-task |
+  |---|---|---|---|---|---|
+  | `complete_rerank_b10_s20` (slice-3 ref) | 1.00 | 0.986 | 10.0 | 312 | 0.35 |
+  | `complete_rerank_gate_s20` absolute 0.05 | **0.80** | 0.692 | 2.15 | 72 | not judged (disqualified) |
+  | `complete_rerank_gaterel_s20` relative 0.01 | **1.00** | 0.950 | **3.7** | **111** | **0.40** |
+  | `complete_rerank_b10_gaterel_s20` gate+cap | 1.00 | 0.950 | 3.7 | 111 | 0.40 |
+  | `complete_rerank_b10_digest_s20` digest on | 1.00 | 0.986 | 10.0 | 310 | parity (see below) |
+
+  **Absolute thresholds are falsified on this corpus**: at 0.05 the gate
+  deleted ALL evidence on 4/19 answerable questions (R@5 0.80). A direct
+  score-distribution probe explains it — qwen3-reranker's absolute scale
+  varies by orders of magnitude per query (top evidence 0.9991 on one
+  question, 0.0325 / 0.0201 / **0.0019** on others) while the
+  evidence/distractor **separation** stays strong (5–800×). No absolute
+  cutoff can keep 0.0019-evidence and drop 0.005-distractors elsewhere.
+  **Relative mode** (floor = `threshold ×` the assemble's top score,
+  shipped as `memory.gate.mode: relative`, measured at 0.01) restores
+  R@5 1.0 / first-hit 1.0 at **3.7 items / 111 tokens per question** —
+  2.8× under bounded-10, **80× under the full dump** — with end-task
+  **0.40 ≥ b10's 0.35** (recovers the preference question ten noisy
+  items had cost; the slice-4 acceptance "gating cuts tokens with no
+  end-task regression" is met) and the **reader's abstention behaviour
+  goes perfect** (abstention question: 281→78 injected tokens, reader
+  correctly declines; abstention_score 1.0). Gate and gate+bounded
+  selections are byte-identical at s20 scale (the relative floor keeps
+  ≤10 everywhere) — bounded stays in the production stack as the cap
+  against floor-jitter and coverage leaks. **Limits, measured honestly:**
+  (a) P4's "inject *nothing* when nothing qualifies" is NOT reachable
+  from rerank scores alone — the abstention question's top score
+  (0.1057) outranks three answerable questions' evidence tops, so no
+  score-function separates "answerable but weakly phrased" from
+  "unanswerable with a topical near-miss"; a calibrated/ensemble channel
+  (Phase 5+/7) reopens it. (b) **top_k-coverage leak**: candidates past
+  the reranker's `top_k` stay unscored and pass the gate fail-open
+  (caught on affe2881 — 263 candidates vs top_k 256 → 7 junk items kept
+  at exactly the spot the gate should have cut; gate arms now run
+  top_k 512 + a results audit rule: any kept item with score 0.0 in a
+  gated arm is leak evidence). Fail-open on unscored items stays — it is
+  what makes a contained scorer outage degrade to the legacy dump
+  instead of an empty injection. (c) NDCG dips 0.986→0.950 (coverage
+  0.988→0.938): the floor sheds some secondary same-evidence duplicates
+  on multi-session/KU questions; end-task shows no harm. **Digest:**
+  question-time queries are byte-identical to legacy (one-message
+  answering session, stripped-equal), so parity is by construction; the
+  5/20 marginal context diffs are rerank endpoint jitter among
+  near-zero ties at the top-10 boundary (R@5/NDCG unchanged). The
+  digest's behavioural payoff — windowed mid-session queries — is not
+  measurable at LongMemEval question granularity; flag stays off
+  pending an ingest-time A/B or production soak. **Knowledge-update,
+  the through-line:** rerank ordering itself drops KU 0.25→0.0 *at
+  unchanged token count* (stale ranked immediately next to current
+  beats burying both mid-dump — the legacy RRF order at least carried a
+  recency prior), and no slice-4 policy can fix a selection problem
+  that is really a lifecycle problem. **Phase-4 opening baseline
+  (contra probe over a completeness corpus + rerank requery,
+  `runs/contra_complete{,_rerank}`):** update_injected 1.0 /
+  update_above_original **0.75** (seam baseline 0.125, flat 0.625) /
+  reader current **1.0**, stale 0, miss 0 on the 8-probe fixture —
+  completeness+rerank already rescue the small-corpus case, and the
+  remaining gap is exactly what supersede closes: the 2/8 stale-first
+  ties relevance can't break, the at-scale binding-loss miss from the
+  s20 decomposition, and KU end-task 0/4. Phase-3 acceptance closes:
+  reranker lifts R@k ✅, gating cuts tokens with no regression ✅,
+  bounded+gated ≥ full-injection ✅ (0.40 vs 0.45 where the entire gap
+  is one KU question = Phase 4 by construction, at 1.2 % of the
+  tokens). Production flip (defaults YAML pipelines) deliberately NOT
+  included — rollout is a separate decision on real-session evidence;
+  all new config sections are inert without explicit opt-in.
 **Companions:**
 - [`agent_memory_current_state.md`](agent_memory_current_state.md) — ground truth: every
   current capability classified wired/dead/conceptual with `file:line` evidence.
@@ -978,7 +1062,7 @@ retrieval table); A/Bs two configs and emits deltas (✅ — flat vs persistent_
 −0.74 R@5 / −0.46..0.51 end-task); **baseline numbers for the current system
 recorded** (✅ — `runs/seam_s20`, N=20 stratified prefix, seed 0).
 
-### Phase 3 — First plugin wave (measured): reranker + gate + bounded core · ~1–1.5 wk ← **slices 1–3 MEASURED 2026-06-12 (results table in the implementation log); slice 4 open**
+### Phase 3 — First plugin wave (measured): reranker + gate + bounded core · ~1–1.5 wk ← **✅ COMPLETE 2026-06-12, all 4 slices measured (results tables in the implementation log); production flip = separate rollout decision**
 Slice order (re-prioritized by the Phase-2 decomposition — extraction bias and
 injection order are the measured root causes, not search):
 1. **Completeness-biased extraction prompt** ✅ measured — end-task 0.30→0.45, facts
@@ -990,22 +1074,41 @@ injection order are the measured root causes, not search):
 3. **Bounded injection** ✅ measured — `bounded` policy (post-scorer cap): R@5 1.0 at
    312 tok/turn (29×); end-task parity-within-noise vs the full dump; without the
    reranker it craters (0.05) — ordering is the prerequisite, now proven.
-4. Ensemble gate threshold; request-digest query on; unified token budget incl. KB
-   (B5); `ef_search` measured-then-tuned. Always-inject core policy demoted: Phase-2
-   showed TTL-pinning is NOT the dominant ordering failure at question time.
+4. ✅ measured — gate ships with two modes: absolute thresholds FALSIFIED (R@5 0.80 —
+   reranker score scale varies orders of magnitude per query); `mode: relative`
+   (floor = 0.01 × top) holds R@5 1.0 at 3.7 items / 111 tok/q (80× under the dump),
+   end-task 0.40 ≥ b10's 0.35, reader abstention 1.0. Request digest built behind
+   `memory.query.digest` (question-time parity by construction; windowing payoff
+   needs ingest-time A/B). B5 one-budget via `memory.bounded.include_knowledge`.
+   `ef_search` deferred — retrieval saturated at eval scale. Always-inject core
+   policy demoted: Phase-2 showed TTL-pinning is NOT the dominant ordering failure
+   at question time.
 **Acceptance (harness):** reranker arm lifts Recall@k (✅ — +0.85 R@5) and end-task
 (✗ on the full dump — reading order doesn't matter when everything is injected; the
 lift shows up via slice 3 instead); gating cuts injected tokens with no end-task
-regression (open — slice 4); bounded core + gated slice ≥ full-injection quality at
-materially lower tokens/turn (✅ within noise — 0.35 vs 0.45 where the gap = 1 genuine
-knowledge-update fact-binding miss + 1 judge gray-zone flip, at 4 % of the tokens;
-the systematic remainder is supersede = Phase 4 by construction).
+regression (✅ — 111 vs 312 tok at 0.40 vs 0.35, abstention behaviour improves to
+perfect); bounded core + gated slice ≥ full-injection quality at materially lower
+tokens/turn (✅ — 0.40 vs 0.45 at 1.2 % of the tokens, where the entire remaining
+gap is one knowledge-update question = supersede = Phase 4 by construction).
+**Production-candidate stack** (rollout decision pending): `scorers: [reranker]`,
+`policies: [gate, bounded]` with `gate: {threshold: 0.01, mode: relative}`,
+`bounded: {max_items: 10}`, reranker `keep_pinned_first: false` + top_k sized to
+cover the store (gate arms leak unscored tail items fail-open otherwise).
 
 ### Phase 4 — Lifecycle writers: verdicts + bi-temporal supersede · ~1–1.5 wk
 Ingestion verdicts (ADD/UPDATE/MERGE/NOOP, aux-LLM, async); bi-temporal columns via
 `migrations/vector/NNNN_bitemporal_memory.sql` (+`knowledge_index`); supersede policy
 (retire-and-exclude, point-in-time queryable); boundary-driven extraction default-on;
 write-gate dropped (completeness>precision). Cost guard: bound verdict calls per write.
+**Opening baseline (recorded 2026-06-12, `runs/contra_complete_rerank`):** over a
+completeness+rerank corpus the probe reads update_above_original 0.75 (seam 0.125,
+flat 0.625) and reader current 1.0 / stale 0 / miss 0 on the 8-probe fixture — the
+small-corpus case is already rescued upstream; what supersede must close is the 2/8
+stale-first ties relevance can't break, the at-scale binding-loss miss (s20
+decomposition), and the knowledge-update end-task slice (0/4 on every reranked arm —
+relevance ordering puts stale immediately next to current, measurably worse than the
+legacy recency-blended order at equal tokens). Success = original_injected → 0 on
+superseded facts, KU end-task recovers toward its 0.5 baseline.
 **Acceptance (harness):** contradiction-survival probe flips to current-fact answers;
 knowledge-update slice improves; no regression elsewhere; verdict-call budget held.
 

@@ -29,12 +29,16 @@ VALID_AUTONOMY_LEVELS = {"full", "review", "partial", "guided", "dependent"}
 # the admin/catalog per-model window when set (injected at dispatch into
 # llm.model_max_context_tokens), else the family's conservative
 # limits.model_max_context_tokens. Fractions are uniform across families:
-# threshold leaves headroom below the window so the summarizer/response have
-# room to work. Keep these in sync with the hardcoded LimitsConfig /
-# ContextConfig fallback defaults (which are a base=100_000 instance of these).
+# threshold leaves headroom below the window so the response has room to work.
+# Keep these in sync with the hardcoded LimitsConfig / ContextConfig fallback
+# defaults (which are a base=100_000 instance of these).
+#
+# Deliberately ABSENT: summarization budgets. They were derived here from the
+# MAIN model's window until 2026-06-12, which sent 951k-token payloads to a
+# 131k auxiliary summarizer. They are now computed at call time from the aux
+# model's own window — src/core/summarizer.py,
+# docs/features/context_summarization_rework.md.
 CONTEXT_THRESHOLD_FRACTION = 0.80
-SUMMARIZATION_SAFE_FRACTION = 0.90
-SUMMARIZATION_CHUNK_FRACTION = 0.60
 MESSAGE_COUNT_MIN_FRACTION = 0.40
 
 
@@ -613,8 +617,6 @@ def _apply_settings_matrix(
         lim = data.setdefault("limits", {})
         lim["model_max_context_tokens"] = int(base)
         lim["context_threshold_tokens"] = int(base * CONTEXT_THRESHOLD_FRACTION)
-        lim["summarization_safe_limit"] = int(base * SUMMARIZATION_SAFE_FRACTION)
-        lim["summarization_chunk_size"] = int(base * SUMMARIZATION_CHUNK_FRACTION)
         lim["message_count_min_tokens"] = int(base * MESSAGE_COUNT_MIN_FRACTION)
         applied.append(f"limits<-derived(base={int(base)})")
 
@@ -1221,8 +1223,6 @@ class LimitsConfig:
     message_count_min_tokens: int = 40000  # 100_000 * 0.40
     tool_retry_count: int = 3
     model_max_context_tokens: int = 100000
-    summarization_safe_limit: int = 90000  # 100_000 * 0.90
-    summarization_chunk_size: int = 60000  # 100_000 * 0.60
     response_validation: ResponseValidationConfig = field(
         default_factory=ResponseValidationConfig
     )
@@ -1311,6 +1311,50 @@ class BoundedConfig:
 
     max_items: Optional[int] = None  # keep at most N memory items
     max_tokens: Optional[int] = None  # keep memory items within this budget
+    # B5: count knowledge-kind items against max_tokens too — one token
+    # budget across the memory + KB blocks (the legacy KB block is uncapped
+    # on every call). max_items stays a memory-count cap; requires
+    # max_tokens to be set.
+    include_knowledge: bool = False
+
+
+@dataclass
+class GateConfig:
+    """memory.gate — options for the 'gate' injection policy (P4).
+
+    Only consulted when ``gate`` appears in ``memory.pipeline.policies``.
+    Drops memory items whose score on ``channel`` falls below the floor:
+    ``threshold`` itself (mode "absolute") or ``threshold × the
+    assemble's top score`` (mode "relative" — the measured
+    recommendation: qwen3-reranker's absolute scale varies by orders of
+    magnitude per query while evidence/distractor separation stays
+    strong, so absolute cutoffs delete weakly-phrased evidence). Items
+    the channel never scored (scorer outage, candidates past the
+    reranker's top_k, a pinned head under keep_pinned_first) pass
+    through ungated, so a failed scorer degrades to the legacy full dump
+    rather than an empty injection. ``threshold`` must be set for the
+    policy to bind.
+    """
+
+    threshold: Optional[float] = None
+    channel: str = "rerank"  # channel_scores key the gate reads
+    mode: str = "absolute"  # absolute | relative (floor = threshold × top)
+
+
+@dataclass
+class QueryConfig:
+    """memory.query — retrieval query formation (overhaul §4).
+
+    ``digest`` swaps the legacy per-mode query texts (worker: top todo +
+    phase descriptor; persistent: last user message) for the unified
+    request digest — a recent message window plus the task frame. Default
+    off: it changes what gets embedded/reranked, so it stays a measured
+    opt-in (agent_memory_overhaul.md Phase 3 slice 4).
+    """
+
+    digest: bool = False
+    digest_window: int = 4  # trailing Human/AI messages in the digest
+    digest_max_chars_per_message: int = 500
 
 
 @dataclass
@@ -1339,6 +1383,8 @@ class MemoryConfig:
     pipeline: MemoryPipelineConfig = field(default_factory=MemoryPipelineConfig)
     reranker: RerankerConfig = field(default_factory=RerankerConfig)
     bounded: BoundedConfig = field(default_factory=BoundedConfig)
+    gate: GateConfig = field(default_factory=GateConfig)
+    query: QueryConfig = field(default_factory=QueryConfig)
 
 
 @dataclass
@@ -1363,7 +1409,11 @@ class AuxiliaryConfig:
     api_key: Optional[str] = None  # null = use provider env var
     temperature: float = 0.0
     max_iterations: int = 15  # Cap for agent mode loops
-    timeout: float = 120.0  # Seconds per LLM call
+    timeout: float = 120.0  # Seconds per LLM call (quick interactive tasks)
+    # Per fold-call timeout for conversation summarization. Each summarization
+    # pass is one bounded call (src/core/summarizer.py); a hung aux endpoint
+    # costs at most this much per attempt, not a single shared 600s blob.
+    summarization_call_timeout: float = 240.0
     tasks: Dict[str, AuxiliaryTaskConfig] = field(
         default_factory=lambda: {
             "extract_memories": AuxiliaryTaskConfig(enabled=True),
@@ -1561,6 +1611,25 @@ def _parse_memory_config(data: Dict[str, Any]) -> MemoryConfig:
             if bounded_data.get("max_tokens") is not None
             else None
         ),
+        include_knowledge=bool(bounded_data.get("include_knowledge", False)),
+    )
+    gate_data = data.get("gate", {}) or {}
+    gate = GateConfig(
+        threshold=(
+            float(gate_data["threshold"])
+            if gate_data.get("threshold") is not None
+            else None
+        ),
+        channel=str(gate_data.get("channel", "rerank")),
+        mode=str(gate_data.get("mode", "absolute")),
+    )
+    query_data = data.get("query", {}) or {}
+    query = QueryConfig(
+        digest=bool(query_data.get("digest", False)),
+        digest_window=int(query_data.get("digest_window", 4)),
+        digest_max_chars_per_message=int(
+            query_data.get("digest_max_chars_per_message", 500)
+        ),
     )
     return MemoryConfig(
         enabled=data.get("enabled", False),
@@ -1585,6 +1654,8 @@ def _parse_memory_config(data: Dict[str, Any]) -> MemoryConfig:
         pipeline=pipeline,
         reranker=reranker,
         bounded=bounded,
+        gate=gate,
+        query=query,
     )
 
 
@@ -1620,6 +1691,7 @@ def _parse_auxiliary_config(data: Dict[str, Any]) -> AuxiliaryConfig:
         temperature=data.get("temperature", 0.0),
         max_iterations=data.get("max_iterations", 15),
         timeout=data.get("timeout", 120.0),
+        summarization_call_timeout=data.get("summarization_call_timeout", 240.0),
         tasks=tasks,
     )
 
@@ -1756,8 +1828,6 @@ def load_agent_config(
         message_count_min_tokens=limits_data.get("message_count_min_tokens", 40000),
         tool_retry_count=limits_data.get("tool_retry_count", 3),
         model_max_context_tokens=limits_data.get("model_max_context_tokens", 100000),
-        summarization_safe_limit=limits_data.get("summarization_safe_limit", 90000),
-        summarization_chunk_size=limits_data.get("summarization_chunk_size", 60000),
         response_validation=_parse_response_validation(
             limits_data.get("response_validation", {})
         ),
@@ -1958,8 +2028,6 @@ def load_agent_config_from_dict(
         message_count_min_tokens=limits_data.get("message_count_min_tokens", 40000),
         tool_retry_count=limits_data.get("tool_retry_count", 3),
         model_max_context_tokens=limits_data.get("model_max_context_tokens", 100000),
-        summarization_safe_limit=limits_data.get("summarization_safe_limit", 90000),
-        summarization_chunk_size=limits_data.get("summarization_chunk_size", 60000),
         response_validation=_parse_response_validation(
             limits_data.get("response_validation", {})
         ),
@@ -2378,6 +2446,13 @@ def _create_openai_llm(
     if max_context_tokens:
         llm_kwargs["max_context_tokens"] = max_context_tokens
 
+    # Request usage on streamed responses (stream_options.include_usage).
+    # Without it, OpenAI-compatible streaming (vLLM et al.) returns no token
+    # usage at all — the persistent path streams every main call, so turn
+    # metrics / usage.updated frames were empty
+    # (docs/features/context_summarization_rework.md S5; verified on k3d).
+    llm_kwargs["stream_usage"] = True
+
     # Pass KeyRing for automatic key rotation
     llm_kwargs["key_ring"] = key_ring
 
@@ -2676,6 +2751,13 @@ def _create_openrouter_llm(
     )
     if max_context_tokens:
         llm_kwargs["max_context_tokens"] = max_context_tokens
+
+    # Request usage on streamed responses (stream_options.include_usage).
+    # Without it, OpenAI-compatible streaming (vLLM et al.) returns no token
+    # usage at all — the persistent path streams every main call, so turn
+    # metrics / usage.updated frames were empty
+    # (docs/features/context_summarization_rework.md S5; verified on k3d).
+    llm_kwargs["stream_usage"] = True
 
     # Pass KeyRing for automatic key rotation
     llm_kwargs["key_ring"] = key_ring

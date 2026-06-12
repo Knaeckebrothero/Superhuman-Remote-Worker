@@ -234,6 +234,13 @@ class PersistentLoopCallbacks:
     # background write (session_silent_failure_audit.md #14).
     archive_llm_call: Optional[Callable[..., None]] = None
 
+    # Live token telemetry, fired after each main-LLM call with that call's
+    # usage ({input_tokens, output_tokens, reasoning_tokens?, model?,
+    # ctx_limit_tokens}). input_tokens of the latest call ≈ current context
+    # size, which drives the cockpit's CTX gauge
+    # (docs/features/context_summarization_rework.md S5). Optional.
+    on_usage: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None
+
     # Set by the transport alongside a "hard" interrupt so the loop can cancel
     # a blocked LLM / auxiliary await immediately — the cooperative
     # check_interrupt poll can't fire while the turn is parked in a network
@@ -622,10 +629,23 @@ async def _execute_turn(
     if memory_service is not None:
         from .services.memory import AssembleRequest
         from .services.memory.plugins.legacy import build_persistent_query_text
+        from .services.memory.query import build_digest_query_text
 
+        # Unified request digest (§4) behind memory.query.digest; legacy
+        # last-user-message query while the flag is off.
+        _query_cfg = getattr(config.memory, "query", None)
+        if _query_cfg is not None and _query_cfg.digest:
+            _query_text = build_digest_query_text(
+                messages,
+                None,
+                window=_query_cfg.digest_window,
+                max_chars_per_message=_query_cfg.digest_max_chars_per_message,
+            )
+        else:
+            _query_text = build_persistent_query_text(messages)
         _payload = await memory_service.assemble(
             AssembleRequest(
-                query_text=build_persistent_query_text(messages),
+                query_text=_query_text,
                 model=getattr(config.llm, "model", None),
             )
         )
@@ -732,60 +752,24 @@ async def _execute_turn(
                 interrupted=True,
             )
 
-        prepared = list(messages)
-
-        # MemoryManager seam: insert the assembled pairs at the legacy
-        # position (after the system message). The same message objects are
-        # inserted each inner-loop iteration — pair ids are only
-        # prefix-checked downstream (documented Phase-1 delta vs the legacy
-        # fresh-pair-per-iteration below).
-        if manager_injection:
-            _inject_idx = (
-                1 if prepared and isinstance(prepared[0], SystemMessage) else 0
-            )
-            prepared[_inject_idx:_inject_idx] = manager_injection
-
-        # Inject memory and knowledge as transient tool-call pairs
-        if memory_block:
-            try:
-                from .core.memory_injection import create_memory_injection_messages
-
-                mem_ai, mem_tool = create_memory_injection_messages(memory_block)
-                # Insert after the system message, before conversation
-                inject_idx = (
-                    1 if prepared and isinstance(prepared[0], SystemMessage) else 0
-                )
-                prepared.insert(inject_idx, mem_ai)
-                prepared.insert(inject_idx + 1, mem_tool)
-            except Exception as e:
-                logger.warning(f"Memory injection failed (non-fatal): {e}")
-
-        if knowledge_block:
-            try:
-                from .core.knowledge_injection import (
-                    create_knowledge_injection_messages,
-                )
-
-                kb_ai, kb_tool = create_knowledge_injection_messages(knowledge_block)
-                # Insert after memory injection
-                inject_idx = (
-                    len(prepared)
-                    - len(messages)
-                    + (1 if prepared and isinstance(prepared[0], SystemMessage) else 0)
-                )
-                prepared.insert(inject_idx, kb_ai)
-                prepared.insert(inject_idx + 1, kb_tool)
-            except Exception as e:
-                logger.warning(f"Knowledge injection failed (non-fatal): {e}")
-
-        # Context compaction if needed. Raced against a hard interrupt: the
-        # summarization LLM call here is the worst offender for parking the
-        # turn (a hung endpoint can hold it for the full auxiliary timeout),
-        # so a hard "stop" must be able to tear it down at once.
-        pre_compact_len = len(prepared)
-        prepared, compact_interrupted = await _await_or_hard_interrupt(
+        # Context compaction if needed — on the DURABLE session list, not the
+        # per-call copy: a real compaction is adopted into `messages` once, so
+        # the next LLM call starts from [summary + recent] instead of
+        # re-summarizing from scratch on every call (the ephemeral-prepared
+        # design caused exactly that thrash once a session crossed the
+        # threshold). The transient memory/knowledge injections happen on the
+        # per-call copy below, AFTER compaction, so they are never folded into
+        # a durable summary. The full conversation always stays in
+        # thread_messages — only the in-memory working set shrinks.
+        # Raced against a hard interrupt: the summarization LLM call here is
+        # the worst offender for parking the turn (a hung endpoint can hold it
+        # for the full auxiliary timeout), so a hard "stop" must be able to
+        # tear it down at once.
+        pre_compact_len = len(messages)
+        compaction_runs_before = getattr(context_manager, "compaction_runs", 0)
+        bounded, compact_interrupted = await _await_or_hard_interrupt(
             context_manager.ensure_within_limits(
-                prepared,
+                messages,
                 auxiliary_llm,
                 max_summary_length=getattr(
                     config.context_management, "max_summary_length", 10000
@@ -806,18 +790,26 @@ async def _execute_turn(
         # markers + summary + fresh copies). This loop has no reducer to apply
         # them; left in, the markers reach _convert_message_to_dict and raise
         # "Got unknown type" → "malformed response". The worker graph strips
-        # them too (src/graph.py). Strip before the compaction-checkpoint check
-        # so len(prepared) reflects the real compacted message count.
-        prepared = strip_removal_markers(prepared)
+        # them too (src/graph.py).
+        bounded = strip_removal_markers(bounded)
 
-        # Auto-compaction happened this turn — surface it for display, then
-        # commit + push the workspace to Gitea as a checkpoint.
-        if len(prepared) < pre_compact_len:
-            summary_text = extract_summary_text(prepared)
+        # Did the manager actually summarize on this call? The run counter is
+        # the authoritative signal — the old length heuristic false-fired on
+        # stray RemoveMessage markers (duplicate-banner bug, 2026-06-12).
+        compaction_runs_after = getattr(context_manager, "compaction_runs", 0)
+        if (
+            isinstance(compaction_runs_before, int)
+            and isinstance(compaction_runs_after, int)
+            and compaction_runs_after > compaction_runs_before
+        ):
+            # Adopt the compacted history durably, surface it for display,
+            # then commit + push the workspace to Gitea as a checkpoint.
+            messages[:] = bounded
+            summary_text = extract_summary_text(messages)
             if summary_text and callbacks.on_context_compacted:
                 try:
                     await callbacks.on_context_compacted(
-                        summary_text, pre_compact_len, len(prepared)
+                        summary_text, pre_compact_len, len(messages)
                     )
                 except Exception as e:
                     logger.debug(f"on_context_compacted failed (non-fatal): {e}")
@@ -828,13 +820,58 @@ async def _execute_turn(
                     try:
                         if git_mgr.has_uncommitted_changes():
                             git_mgr.commit(
-                                f"Auto-compaction checkpoint ({pre_compact_len} → {len(prepared)} msgs)"
+                                f"Auto-compaction checkpoint ({pre_compact_len} → {len(messages)} msgs)"
                             )
                         git_mgr.push()
                     except Exception as e:
                         logger.debug(
                             f"Git push on auto-compaction failed (non-fatal): {e}"
                         )
+
+        # Per-call working copy: substitution/elision results from a
+        # non-summarizing bound stay ephemeral, and the transient injections
+        # below never touch the durable list.
+        prepared = list(bounded)
+
+        # MemoryManager seam: insert the assembled pairs at the legacy
+        # position (after the system message). The same message objects are
+        # inserted each inner-loop iteration — pair ids are only
+        # prefix-checked downstream (documented Phase-1 delta vs the legacy
+        # fresh-pair-per-iteration below).
+        injected_count = 0
+        base_inject_idx = (
+            1 if prepared and isinstance(prepared[0], SystemMessage) else 0
+        )
+        if manager_injection:
+            prepared[base_inject_idx:base_inject_idx] = manager_injection
+            injected_count += len(manager_injection)
+
+        # Inject memory and knowledge as transient tool-call pairs
+        if memory_block:
+            try:
+                from .core.memory_injection import create_memory_injection_messages
+
+                mem_ai, mem_tool = create_memory_injection_messages(memory_block)
+                # Insert after the system message, before conversation (and
+                # before the manager pairs — legacy order preserved)
+                prepared.insert(base_inject_idx, mem_ai)
+                prepared.insert(base_inject_idx + 1, mem_tool)
+                injected_count += 2
+            except Exception as e:
+                logger.warning(f"Memory injection failed (non-fatal): {e}")
+
+        if knowledge_block:
+            try:
+                from .core.knowledge_injection import (
+                    create_knowledge_injection_messages,
+                )
+
+                kb_ai, kb_tool = create_knowledge_injection_messages(knowledge_block)
+                # Insert after all prior injections
+                prepared.insert(base_inject_idx + injected_count, kb_ai)
+                prepared.insert(base_inject_idx + injected_count + 1, kb_tool)
+            except Exception as e:
+                logger.warning(f"Knowledge injection failed (non-fatal): {e}")
 
         # Repair tool-call pairing before the LLM call. Compaction thrash, an
         # interrupted turn, or streamed parallel-tool corruption (langchain
@@ -1134,22 +1171,27 @@ async def _execute_turn(
                 error=error_msg,
             )
 
-        # Extract per-turn metrics from response metadata
+        # Extract per-turn metrics from response metadata. Streaming providers
+        # often leave response_metadata.token_usage empty — the aggregated
+        # chunk carries LangChain's normalized ``usage_metadata`` instead, so
+        # read both (verified live on k3d: gemma via the vLLM router reports
+        # usage only through usage_metadata).
         llm_latency_ms = int((time.monotonic() - llm_start) * 1000)
         turn_metrics: Optional[dict] = None
-        if (
-            response
-            and hasattr(response, "response_metadata")
-            and response.response_metadata
-        ):
-            meta = response.response_metadata
-            token_usage = meta.get("token_usage", {})
+        meta = getattr(response, "response_metadata", None) or {}
+        token_usage = meta.get("token_usage", {}) or {}
+        usage_md = getattr(response, "usage_metadata", None) or {}
+        if response is not None and (token_usage or usage_md):
+            usage_details = usage_md.get("output_token_details") or {}
             turn_metrics = {
                 "input_tokens": token_usage.get("input_tokens")
-                or token_usage.get("prompt_tokens"),
+                or token_usage.get("prompt_tokens")
+                or usage_md.get("input_tokens"),
                 "output_tokens": token_usage.get("output_tokens")
-                or token_usage.get("completion_tokens"),
-                "reasoning_tokens": token_usage.get("reasoning_tokens"),
+                or token_usage.get("completion_tokens")
+                or usage_md.get("output_tokens"),
+                "reasoning_tokens": token_usage.get("reasoning_tokens")
+                or usage_details.get("reasoning"),
                 "latency_ms": llm_latency_ms,
                 "model": meta.get("model_name"),
             }
@@ -1168,6 +1210,19 @@ async def _execute_turn(
                 )
             except Exception as e:
                 logger.debug(f"LLM call archive failed (non-fatal): {e}")
+
+        # Live token telemetry for the cockpit's usage panel (same numbers as
+        # the audit row — one accumulator, two sinks).
+        if callbacks.on_usage is not None and turn_metrics:
+            try:
+                await callbacks.on_usage(
+                    {
+                        **turn_metrics,
+                        "ctx_limit_tokens": config.limits.model_max_context_tokens,
+                    }
+                )
+            except Exception as e:
+                logger.debug(f"usage callback failed (non-fatal): {e}")
 
         # Send reasoning from additional_kwargs if not already streamed
         # (covers DeepSeek, OpenRouter, and other non-Anthropic reasoning models)

@@ -142,12 +142,9 @@
   type: integer
   title: "Context threshold (tokens)"
   description: "Token count at which summarization / compaction is triggered."
-- kind: settings
-  name: limits.summarization_safe_limit
-  group: "Inference settings"
-  type: integer
-  title: "Summarization safe limit (tokens)"
-  description: "Upper safety bound kept free while summarizing."
+# limits.summarization_safe_limit was removed 2026-06-12: summarization
+# budgets are computed at call time from the auxiliary model's own window
+# (src/core/summarizer.py), not configured per main-model family.
 
 # --- Guardrails (tool examples + nudges) --------------------------------------
 - kind: guardrails

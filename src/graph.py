@@ -920,6 +920,7 @@ def create_execute_node(
         if memory_service is not None:
             from src.services.memory import AssembleRequest, TaskFrame
             from src.services.memory.plugins.legacy import build_worker_query_text
+            from src.services.memory.query import build_digest_query_text
 
             _mm_pending = todo_manager.list_pending()
             _mm_frame = TaskFrame(
@@ -927,9 +928,22 @@ def create_execute_node(
                 phase_number=phase_number,
                 is_strategic=is_strategic,
             )
+            # Unified request digest (§4) behind memory.query.digest;
+            # legacy top-todo+phase query while the flag is off.
+            if config.memory.query.digest:
+                _mm_query = build_digest_query_text(
+                    messages,
+                    _mm_frame,
+                    window=config.memory.query.digest_window,
+                    max_chars_per_message=(
+                        config.memory.query.digest_max_chars_per_message
+                    ),
+                )
+            else:
+                _mm_query = build_worker_query_text(_mm_frame)
             _manager_payload = await memory_service.assemble(
                 AssembleRequest(
-                    query_text=build_worker_query_text(_mm_frame),
+                    query_text=_mm_query,
                     task_frame=_mm_frame,
                     budget_tokens=config.memory.budget_tokens,
                     model=config.llm.model,
@@ -3689,23 +3703,33 @@ def build_phase_alternation_graph(
         message_count_min_tokens=config.limits.message_count_min_tokens,
         keep_recent_messages=config.context_management.keep_recent_messages,
         keep_recent_tool_results=config.context_management.keep_recent_tool_results,
-        # Safety layer constants
+        # Safety layer constant (summarization budgets are computed at call
+        # time from the aux model's window — src/core/summarizer.py)
         model_max_context_tokens=config.limits.model_max_context_tokens,
-        summarization_safe_limit=config.limits.summarization_safe_limit,
-        summarization_chunk_size=config.limits.summarization_chunk_size,
     )
     strategic_config = config.llm.get_phase_config("strategic")
     tactical_config = config.llm.get_phase_config("tactical")
-    summarization_config = config.llm.get_phase_config("summarization")
     context_mgr = ContextManager(
         config=context_config,
         model=config.llm.model,
         strategic_model=strategic_config.model,
         tactical_model=tactical_config.model,
-        summarization_timeout=summarization_config.timeout
-        or config.llm.timeout
-        or 600.0,
+        summarization_call_timeout=config.auxiliary.summarization_call_timeout,
     )
+
+    # Compaction progress for worker agents goes to the log (persistent
+    # sessions broadcast SSE frames instead — persistent_app wires its own).
+    async def _log_compaction_progress(event: str, params: Dict[str, Any]) -> None:
+        if event == "compaction.progress":
+            logger.info(
+                f"[compaction] pass {params.get('pass')}/{params.get('n_passes')} "
+                f"(messages {params.get('first_msg')}-{params.get('last_msg')}, "
+                f"{params.get('in_tokens')} tok in, attempt {params.get('attempt')})"
+            )
+        else:
+            logger.info(f"[compaction] {event}: {params}")
+
+    context_mgr.set_progress_callback(_log_compaction_progress)
 
     # Create retry manager for LLM call retries
     retry_manager = ToolRetryManager(max_retries=config.limits.tool_retry_count)
@@ -3734,7 +3758,12 @@ def build_phase_alternation_graph(
         from src.services.auxiliary import AuxiliaryLLM
 
         raw_llm = summarization_llm or strategic_llm_with_tools
-        auxiliary_llm = AuxiliaryLLM(llm=raw_llm)
+        # Fallback summarizer is the main/summarization LLM → its window is
+        # the main working window.
+        auxiliary_llm = AuxiliaryLLM(
+            llm=raw_llm,
+            max_context_tokens=config.limits.model_max_context_tokens,
+        )
 
     # Extract RecallStore for memory injection and free sources
     recall_store = tool_context.recall_store if tool_context else None

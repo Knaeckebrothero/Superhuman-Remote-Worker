@@ -186,9 +186,12 @@ class PDFReader:
                 # Count words in this page
                 page_words = len(page_text.split())
 
-                # Check if adding this page would exceed word limit
-                # (Only check when page_end is not explicitly set)
-                if page_end is None and total_words + page_words > self.max_words:
+                # Check if adding this page would exceed the word limit.
+                # Applies to explicit ranges too: an unbounded page_end let a
+                # single read return an entire 1355-page regulation (audit #5
+                # — the result alone exceeded the model's context window).
+                # was_truncated/next_page tell the model how to continue.
+                if total_words + page_words > self.max_words:
                     # If we haven't read anything yet, read at least one page
                     if not text_parts:
                         text_parts.append(f"[PAGE {page_num}]\n{page_text}")

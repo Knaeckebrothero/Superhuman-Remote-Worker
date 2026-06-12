@@ -916,6 +916,20 @@
       "banner": "Kontext zusammengefasst",
       "viewSummary": "Zusammenfassung anzeigen"
     },
+    "compactionLive": {
+      "title": "Kontext wird komprimiert",
+      "ctx": "Kontext {{pct}}%",
+      "planning": "Plane Durchläufe…",
+      "pass": "Durchlauf {{current}}/{{total}} · fasse Nachrichten {{first}}–{{last}} zusammen",
+      "retry": "(Versuch {{attempt}}/3)",
+      "footer": "Komprimiere — Durchlauf {{current}} von {{total}} · {{elapsed}}"
+    },
+    "usage": {
+      "input": "Eingabe",
+      "reasoning": "Reasoning",
+      "output": "Ausgabe",
+      "ctx": "Ctx"
+    },
     "empty": {
       "title": "Was wollen wir heute erobern?",
       "subtitle": "Der Agent ist verbunden und bereit. Stelle eine Aufgabe oder wähle unten einen Startpunkt."

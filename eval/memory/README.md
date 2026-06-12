@@ -90,6 +90,12 @@ python -m eval.memory.run --dataset ... --arm <readpath-arm> \
 #     the endpoint is cold/contended — failures are contained passthroughs,
 #     visible as "scorer 'reranker' failed (contained)" in run.log, which
 #     silently turns the arm into a legacy-order measurement).
+#     GATE ARMS: top_k must cover the candidate count with margin (512 for
+#     the ~270-row s20 corpora) — candidates past top_k stay UNSCORED and
+#     pass the gate fail-open, silently inflating kept-items (caught on
+#     affe2881: 263 candidates vs top_k 256 → 7-item leak). Audit: a kept
+#     item with items[].score == 0.0 in a gated arm is leak evidence
+#     (a true 0.0 rerank score sits below any positive floor).
 
 # 7. End-task accuracy (reader + LongMemEval judge over a finished run):
 export EVAL_READER_MODEL=... EVAL_READER_BASE_URL=... EVAL_READER_API_KEY=...
@@ -115,7 +121,22 @@ transport defaults to the arm's auxiliary endpoint);
 `config_overrides.memory.bounded: {max_items: N, max_tokens: T}` cap the
 injected memory items AFTER scorers run (`memory.budget_tokens` trims
 inside the retriever in legacy order — before a reranker can act — so
-post-scorer bounding must use the policy, not the budget). Results stream to `<out>/results.jsonl` per question — rerunning
+post-scorer bounding must use the policy, not the budget);
+`policies: [gate, bounded]` + `config_overrides.memory.gate:
+{threshold: X, mode: relative|absolute}` additionally drops
+below-floor memory items before the cap — floor = X (absolute) or
+X × the assemble's top score (relative; the measured choice — absolute
+cutoffs lose weakly-phrased evidence because qwen3-reranker's absolute
+scale varies by orders of magnitude per query). Items the scorer never
+saw pass through ungated, so a contained scorer failure degrades to
+the full dump, not an empty injection; `config_overrides.memory.bounded.
+include_knowledge: true` counts KB notes against `max_tokens` too (B5
+one-budget); `config_overrides.memory.query: {digest: true}` switches
+query formation to the unified request digest (window + task frame) at
+every assemble — both the per-turn ingest reads and question time, so
+it is requery-able (note: at question time the answering session is one
+message deep, so digest ≡ legacy there by construction — a digest
+requery measures plumbing + no-regression, not the windowing benefit). Results stream to `<out>/results.jsonl` per question — rerunning
 with the same `--out`/`--run-id` resumes, so a flaky aux endpoint only
 costs the in-flight questions. `run.log` in the run dir captures all
 contained seam warnings; a seam arm with `stored=0` across many questions

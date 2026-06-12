@@ -49,7 +49,22 @@ export interface ToolCallEvent extends ToolCallInfo {
     exitCode?: number;
 }
 
-export type TurnEvent = ThoughtEvent | TextEvent | ToolCallEvent;
+/**
+ * Mid-turn context-compaction marker. A `role='summary'` row whose
+ * `turn_number` falls inside a grouped assistant turn renders as an inline
+ * event at its true position in the event stream — the turn block anchors at
+ * its first row, so a top-level CompactionTurn divider would otherwise trail
+ * the whole turn's content (the "summary rendered below the reply" bug).
+ */
+export interface CompactionEvent {
+    kind: 'compaction';
+    id: string;
+    /** The summary the agent produced. May be empty when unavailable. */
+    summary: string;
+    startedAt: number;
+}
+
+export type TurnEvent = ThoughtEvent | TextEvent | ToolCallEvent | CompactionEvent;
 
 export type AssistantTurnStatus = 'streaming' | 'done' | 'interrupted' | 'error';
 
@@ -253,7 +268,8 @@ export function countEvents(turn: AssistantTurn): TurnEventCounts {
     for (const e of turn.events) {
         if (isThought(e)) thoughts++;
         else if (isText(e)) texts++;
-        else tools++;
+        else if (isToolCall(e)) tools++;
+        // compaction markers don't count toward the badge
     }
     return {thoughts, texts, tools};
 }
@@ -271,7 +287,7 @@ export function countEvents(turn: AssistantTurn): TurnEventCounts {
  * stand alone as `single` groups.
  */
 export type EventGroup =
-    | {kind: 'single'; id: string; event: ThoughtEvent | TextEvent}
+    | {kind: 'single'; id: string; event: ThoughtEvent | TextEvent | CompactionEvent}
     | {kind: 'tools'; id: string; tools: ToolCallEvent[]};
 
 /**

@@ -916,6 +916,20 @@
       "banner": "Context summarized",
       "viewSummary": "View summary"
     },
+    "compactionLive": {
+      "title": "Compacting context",
+      "ctx": "context {{pct}}%",
+      "planning": "Planning passes…",
+      "pass": "Pass {{current}}/{{total}} · summarizing messages {{first}}–{{last}}",
+      "retry": "(retry {{attempt}}/3)",
+      "footer": "Compacting — pass {{current}} of {{total}} · {{elapsed}}"
+    },
+    "usage": {
+      "input": "Input",
+      "reasoning": "Reasoning",
+      "output": "Output",
+      "ctx": "Ctx"
+    },
     "empty": {
       "title": "What shall we conquer today?",
       "subtitle": "The agent is connected and listening. Issue a brief, or pick a starting point below."
