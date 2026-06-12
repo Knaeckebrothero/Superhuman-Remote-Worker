@@ -11,6 +11,13 @@ smoke-tested on the live k3d cluster (PostgreSQL 15.18)**: single-transaction
 apply, partitions/reloptions/indexes inspected, two-phase write + JOIN-merge
 read + CHECK constraint exercised, scratch database dropped.
 
+> **Addendum (2026-06-11)** — the database-architecture review
+> (`database_architecture.md`) designates `srw-auditdb` as the product's
+> **observability tier**: the usage-metering ledger (`usage_events`,
+> `observability_and_quotas.md`) lands here too, as `migrations/audit/0002`
+> when metering Slice 1 starts. Additive; no change to this package's DDL,
+> adapter, or PR plan.
+
 Companion documents:
 - `postgres_audit_store.md` — the design doc (problem, rationale, scope). Its
   § Schema / § Adapter technical core is **superseded by this package** where

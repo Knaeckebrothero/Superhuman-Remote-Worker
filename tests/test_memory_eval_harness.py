@@ -16,13 +16,36 @@ import pytest
 
 from eval.memory import infra
 from eval.memory.arms import ArmSpec, IngestionOptions, _apply_auxiliary_overrides
+from eval.memory.contradiction import (
+    classify_answer,
+    load_probe_meta,
+    retrieval_outcome,
+    summarize_probe,
+)
 from eval.memory.datasets import (
     LMESession,
     LMETurn,
     load_longmemeval,
     subset_questions,
 )
-from eval.memory.ingest import HarnessHandles, ingest_question
+from eval.memory.ingest import (
+    EMBED_TOKEN_CAP,
+    VERBATIM_MAX_CHARS,
+    HarnessHandles,
+    PrimedEmbedding,
+    _verbatim_round_texts,
+    ingest_question,
+)
+from eval.memory.judge import (
+    JUDGE_MAX_TOKENS,
+    LLMRoute,
+    anscheck_prompt,
+    calibrate,
+    judge_row,
+    parse_verdict,
+    reader_messages,
+    summarize_judgements,
+)
 from eval.memory.metrics import (
     aggregate,
     collapse_to_sessions,
@@ -39,6 +62,7 @@ from src.services.memory.types import AssembleStats, InjectionBlock, MemoryPaylo
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = REPO_ROOT / "eval" / "memory" / "fixtures" / "tiny_longmemeval.json"
+PROBE_FIXTURE = REPO_ROOT / "eval" / "memory" / "fixtures" / "contradiction_probe.json"
 ARMS_DIR = REPO_ROOT / "eval" / "memory" / "arms"
 
 
@@ -428,6 +452,85 @@ class TestVerbatimIngest:
         assert "[Session date" not in stores[0].stored[1]["content"]
 
 
+class FakeEmbeddingService:
+    """Counts single vs batch calls; batch vectors are index-tagged."""
+
+    model = "fake-embed"
+
+    def __init__(self):
+        self.embed_calls = []
+        self.batch_calls = []
+
+    async def embed(self, text):
+        self.embed_calls.append(text)
+        return [-1.0]
+
+    async def embed_batch(self, texts):
+        self.batch_calls.append(list(texts))
+        base = sum(len(c) for c in self.batch_calls[:-1])
+        return [[float(base + i)] for i in range(len(texts))]
+
+
+class TestPrimedEmbedding:
+    @pytest.mark.asyncio
+    async def test_primed_hits_skip_single_calls(self):
+        inner = FakeEmbeddingService()
+        primed = PrimedEmbedding(inner, batch_size=2)
+        await primed.prime(["a", "b", "c"])
+
+        assert [len(c) for c in inner.batch_calls] == [2, 1]  # chunked
+        assert await primed.embed("a") == [0.0]
+        assert await primed.embed("c") == [2.0]  # vector follows the text
+        assert inner.embed_calls == []  # never fell back
+
+    @pytest.mark.asyncio
+    async def test_miss_falls_back_to_inner(self):
+        inner = FakeEmbeddingService()
+        primed = PrimedEmbedding(inner)
+        await primed.prime(["a"])
+        assert await primed.embed("unprimed") == [-1.0]
+        assert inner.embed_calls == ["unprimed"]
+
+    @pytest.mark.asyncio
+    async def test_prime_dedups_and_delegates_attrs(self):
+        inner = FakeEmbeddingService()
+        primed = PrimedEmbedding(inner, batch_size=10)
+        await primed.prime(["a", "a", "b"])
+        assert inner.batch_calls == [["a", "b"]]
+        await primed.prime(["b", "c"])  # already-cached text not re-sent
+        assert inner.batch_calls[1] == ["c"]
+        assert primed.model == "fake-embed"
+
+    @pytest.mark.asyncio
+    async def test_verbatim_ingest_primes_exactly_the_stored_texts(self):
+        question = load_longmemeval(str(FIXTURE))[0]
+        handles, stores, _ = make_handles()
+        embedding = FakeEmbeddingService()
+        handles.embedding = embedding
+        arm = ArmSpec(
+            name="t",
+            ingestion=IngestionOptions(mode="verbatim", date_prefix=True),
+        )
+        await ingest_question(question, arm, handles)
+
+        primed_texts = [t for chunk in embedding.batch_calls for t in chunk]
+        stored_texts = [s["content"] for store in stores for s in store.stored]
+        assert primed_texts == stored_texts  # incl. first-round date prefix
+        expected = [t for s in question.sessions for t in _verbatim_round_texts(s, arm)]
+        assert stored_texts == expected
+
+    @pytest.mark.asyncio
+    async def test_seam_mode_never_batch_primes(self):
+        question = load_longmemeval(str(FIXTURE))[0]
+        handles, _, managers = make_handles()
+        embedding = FakeEmbeddingService()
+        handles.embedding = embedding
+        arm = ArmSpec(name="t", ingestion=IngestionOptions(mode="seam"))
+        await ingest_question(question, arm, handles)
+        assert embedding.batch_calls == []
+        assert managers  # went through the manager path
+
+
 # ---------------------------------------------------------------------------
 # Query / provenance
 # ---------------------------------------------------------------------------
@@ -614,3 +717,290 @@ class TestReport:
         text = render_comparison(self._summary(0.5), self._summary(0.75))
         assert "+0.250" in text
         assert "armX" in text
+
+
+# ---------------------------------------------------------------------------
+# End-task judge
+# ---------------------------------------------------------------------------
+
+
+def fake_chat_client(responses):
+    """OpenAI-shaped async client returning canned responses in order."""
+    remaining = list(responses)
+    calls = []
+
+    async def create(**kwargs):
+        calls.append(kwargs)
+        content = remaining.pop(0)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
+        )
+
+    client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+    )
+    return client, calls
+
+
+class TestJudge:
+    def test_anscheck_prompt_selects_paper_templates(self):
+        p = anscheck_prompt("multi-session", "Q?", "A", "R", abstention=False)
+        assert "contains the correct answer" in p and "Q?" in p and "R" in p
+        p = anscheck_prompt("temporal-reasoning", "Q?", "A", "R", abstention=False)
+        assert "off-by-one errors" in p
+        p = anscheck_prompt("knowledge-update", "Q?", "A", "R", abstention=False)
+        assert "updated answer" in p
+        p = anscheck_prompt(
+            "single-session-preference", "Q?", "A", "R", abstention=False
+        )
+        assert "Rubric: A" in p
+        # abstention overrides the type-specific template
+        p = anscheck_prompt("multi-session", "Q?", "expl", "R", abstention=True)
+        assert "unanswerable" in p and "Explanation: expl" in p
+        with pytest.raises(ValueError):
+            anscheck_prompt("nope", "Q?", "A", "R", abstention=False)
+
+    def test_parse_verdict(self):
+        assert parse_verdict("Yes.")
+        assert parse_verdict("YES — the response is correct")
+        assert not parse_verdict("No")
+        assert not parse_verdict("incorrect")
+        # reasoning models: only the post-think tail counts
+        assert not parse_verdict("<think>could be yes, hmm</think>No")
+        assert parse_verdict("<think>checking... it is wrong? no — right</think>Yes")
+        assert not parse_verdict("<thinking>yes yes yes</thinking>no")
+
+    def test_reader_messages(self):
+        row = {
+            "question": "What did I adopt?",
+            "question_date": "2023/06/01",
+            "injected_context": "## Memories\n- adopted a dog",
+        }
+        msgs = reader_messages(row)
+        assert msgs[0]["role"] == "system"
+        assert "adopted a dog" in msgs[0]["content"]
+        assert msgs[1]["content"].startswith("(Current date: 2023/06/01)")
+
+        empty = reader_messages({"question": "Q?", "injected_context": ""})
+        assert "(no memories retrieved)" in empty[0]["content"]
+        assert empty[1]["content"] == "Q?"
+
+    @pytest.mark.asyncio
+    async def test_judge_row_wires_reader_into_judge(self):
+        row = {
+            "question_id": "q1",
+            "question_type": "single-session-user",
+            "is_abstention": False,
+            "question": "What pet?",
+            "answer": "a dog",
+            "question_date": "",
+            "injected_context": "- user adopted a dog named Rex",
+        }
+        reader_client, reader_calls = fake_chat_client(["You adopted a dog."])
+        judge_client, judge_calls = fake_chat_client(["yes"])
+        reader = LLMRoute(model="reader-m")
+        judge = LLMRoute(model="judge-m")
+
+        out = await judge_row(row, reader_client, judge_client, reader, judge)
+
+        assert out["correct"] is True
+        assert out["hypothesis"] == "You adopted a dog."
+        # reader saw the injected context; judge saw the reader's answer
+        assert "adopted a dog named Rex" in reader_calls[0]["messages"][0]["content"]
+        judge_prompt = judge_calls[0]["messages"][0]["content"]
+        assert "You adopted a dog." in judge_prompt and "What pet?" in judge_prompt
+        # paper protocol keeps temperature 0; max_tokens is raised so
+        # reasoning judges can think before the verdict token
+        assert judge_calls[0]["max_tokens"] == JUDGE_MAX_TOKENS
+        assert judge_calls[0]["temperature"] == 0.0
+
+    def test_summarize_judgements(self):
+        rows = [
+            {"question_type": "multi-session", "is_abstention": False, "correct": True},
+            {
+                "question_type": "multi-session",
+                "is_abstention": False,
+                "correct": False,
+            },
+            {
+                "question_type": "knowledge-update",
+                "is_abstention": True,
+                "correct": True,
+            },
+        ]
+        s = summarize_judgements(rows)
+        assert s["questions"] == 3
+        assert s["accuracy"] == round(2 / 3, 4)
+        assert s["accuracy_answerable"] == 0.5
+        assert s["abstention_score"] == 1.0
+        assert s["by_type"]["multi-session"]["n"] == 2
+
+    def test_calibrate(self):
+        judgements = [
+            {"question_id": "a", "correct": True},
+            {"question_id": "b", "correct": False},
+            {"question_id": "c", "correct": True},
+        ]
+        labels = {"a": True, "b": True, "x": False}
+        out = calibrate(judgements, labels)
+        assert out["overlap"] == 2
+        assert out["agreement"] == 0.5
+        assert out["disagreements"] == ["b"]
+
+    def test_route_from_env_fallback(self, monkeypatch):
+        monkeypatch.setenv("EVAL_AUX_MODEL", "aux-m")
+        monkeypatch.setenv("EVAL_AUX_BASE_URL", "https://aux")
+        monkeypatch.setenv("EVAL_AUX_API_KEY", "k")
+        monkeypatch.delenv("EVAL_READER_MODEL", raising=False)
+        route = LLMRoute.from_env("reader")
+        assert route.model == "aux-m" and route.base_url == "https://aux"
+
+        monkeypatch.setenv("EVAL_READER_MODEL", "reader-m")
+        assert LLMRoute.from_env("reader").model == "reader-m"
+
+        monkeypatch.delenv("EVAL_AUX_MODEL", raising=False)
+        monkeypatch.delenv("EVAL_JUDGE_MODEL", raising=False)
+        with pytest.raises(RuntimeError, match="EVAL_JUDGE_MODEL"):
+            LLMRoute.from_env("judge")
+
+
+# ---------------------------------------------------------------------------
+# Contradiction-survival probe
+# ---------------------------------------------------------------------------
+
+
+class TestContradiction:
+    def test_fixture_loads_through_both_loaders(self):
+        questions = load_longmemeval(str(PROBE_FIXTURE))
+        meta = load_probe_meta(str(PROBE_FIXTURE))
+        assert len(questions) == len(meta) == 8
+        for q in questions:
+            probe = meta[q.question_id]
+            haystack = {s.session_id for s in q.sessions}
+            assert probe["update_session_id"] in haystack
+            assert probe["original_session_id"] in haystack
+            assert q.evidence_session_ids == {probe["update_session_id"]}
+            # the values actually appear in their sessions' content
+            by_id = {s.session_id: s for s in q.sessions}
+            original_text = " ".join(
+                t.content for t in by_id[probe["original_session_id"]].turns
+            )
+            update_text = " ".join(
+                t.content for t in by_id[probe["update_session_id"]].turns
+            )
+            assert probe["stale_value"].lower() in original_text.lower()
+            assert probe["current_value"].lower() in update_text.lower()
+
+    def test_load_probe_meta_missing_key_raises(self, tmp_path):
+        broken = json.loads(PROBE_FIXTURE.read_text())
+        del broken[0]["probe"]["stale_value"]
+        path = tmp_path / "broken.json"
+        path.write_text(json.dumps(broken))
+        with pytest.raises(ValueError, match="stale_value"):
+            load_probe_meta(str(path))
+
+    def test_classify_answer(self):
+        probe = {
+            "current_value": "red Tesla Model 3",
+            "stale_value": "blue Honda Civic",
+        }
+        assert classify_answer("You drive a red tesla model 3.", probe) == "current"
+        # mentioning both counts as current (knowledge-update convention)
+        assert (
+            classify_answer(
+                "You used to drive a blue Honda Civic, now a red Tesla Model 3.",
+                probe,
+            )
+            == "current"
+        )
+        assert classify_answer("A blue Honda Civic, I believe.", probe) == "stale"
+        assert classify_answer("I do not have that information.", probe) == "miss"
+
+    def test_retrieval_outcome(self):
+        probe = {
+            "update_session_id": "u",
+            "original_session_id": "o",
+            "current_value": "x",
+            "stale_value": "y",
+        }
+        row = {"ranked_sessions": ["a", "u", "o"]}
+        out = retrieval_outcome(row, probe)
+        assert out["update_rank"] == 2 and out["original_rank"] == 3
+        assert out["update_above_original"] is True
+
+        out = retrieval_outcome({"ranked_sessions": ["o", "a"]}, probe)
+        assert out["update_rank"] is None and out["update_injected"] is False
+        assert out["update_above_original"] is False
+
+        # update present, original absent -> above by definition
+        out = retrieval_outcome({"ranked_sessions": ["u"]}, probe)
+        assert out["update_above_original"] is True
+
+    def test_summarize_probe(self):
+        rows = [
+            {
+                "update_injected": True,
+                "original_injected": True,
+                "update_above_original": True,
+                "reader_class": "current",
+            },
+            {
+                "update_injected": True,
+                "original_injected": False,
+                "update_above_original": True,
+                "reader_class": "stale",
+            },
+            {
+                "update_injected": False,
+                "original_injected": True,
+                "update_above_original": False,
+            },
+        ]
+        s = summarize_probe(rows)
+        assert s["questions"] == 3
+        assert s["update_injected"] == round(2 / 3, 4)
+        assert s["update_above_original"] == round(2 / 3, 4)
+        assert s["reader"]["n"] == 2
+        assert s["reader"]["current_rate"] == 0.5
+        assert s["reader"]["stale_rate"] == 0.5
+        assert s["reader"]["miss_rate"] == 0.0
+
+
+class TestVerbatimTruncation:
+    def test_oversized_round_capped_consistently(self):
+        big = "x" * (VERBATIM_MAX_CHARS + 5000)
+        session = LMESession(
+            session_id="s",
+            turns=[
+                LMETurn(role="user", content=big),
+                LMETurn(role="assistant", content="ok"),
+                LMETurn(role="user", content="small"),
+                LMETurn(role="assistant", content="fine"),
+            ],
+        )
+        arm = ArmSpec(name="t", ingestion=IngestionOptions(mode="verbatim"))
+        texts = _verbatim_round_texts(session, arm)
+        # "x"*N compresses to few cl100k tokens, so only the char cap fires
+        assert len(texts[0]) == VERBATIM_MAX_CHARS + len(" …[truncated]")
+        assert texts[0].endswith("…[truncated]")
+        assert texts[1] == "User: small\nAssistant: fine"  # small rounds untouched
+
+    def test_token_dense_round_capped_below_char_limit(self):
+        # token-dense content (digit soup ≈ 1 token/char-ish in cl100k)
+        # stays under the char cap but must still be token-truncated
+        big = " ".join(str(i % 97) for i in range(7500))  # ~22k chars
+        assert len(big) < VERBATIM_MAX_CHARS
+        session = LMESession(
+            session_id="s",
+            turns=[
+                LMETurn(role="user", content=big),
+                LMETurn(role="assistant", content="ok"),
+            ],
+        )
+        arm = ArmSpec(name="t", ingestion=IngestionOptions(mode="verbatim"))
+        text = _verbatim_round_texts(session, arm)[0]
+        assert text.endswith("…[truncated]")
+        from eval.memory.ingest import _encoding
+
+        n = len(_encoding().encode(text, disallowed_special=()))
+        assert n <= EMBED_TOKEN_CAP + 8  # cap + marker tokens

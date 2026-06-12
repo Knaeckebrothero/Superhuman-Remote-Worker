@@ -1,0 +1,754 @@
+[
+  {
+    "question_id": "contra_car",
+    "question_type": "knowledge-update",
+    "question": "What car do I drive?",
+    "answer": "You drive a red Tesla Model 3 (you previously drove a blue Honda Civic).",
+    "question_date": "2023/06/01 (Thu) 12:00",
+    "haystack_dates": [
+      "2023/04/02 (Sun) 10:05",
+      "2023/04/16 (Sun) 18:40",
+      "2023/05/07 (Sun) 09:30",
+      "2023/05/21 (Sun) 20:15"
+    ],
+    "haystack_session_ids": [
+      "probe_car_original",
+      "probe_car_filler_a",
+      "probe_car_update",
+      "probe_car_filler_b"
+    ],
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "I finally picked up my new car yesterday — a blue Honda Civic. The fuel economy is great."
+        },
+        {
+          "role": "assistant",
+          "content": "Noted — I will remember your car."
+        },
+        {
+          "role": "user",
+          "content": "Great, that will be useful context for later."
+        },
+        {
+          "role": "assistant",
+          "content": "Absolutely, just ask whenever you need it."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "What is a good way to learn basic Spanish before a holiday?"
+        },
+        {
+          "role": "assistant",
+          "content": "Short daily sessions work best — fifteen minutes of a course app plus listening to slow-Spanish podcasts."
+        },
+        {
+          "role": "user",
+          "content": "I tried the podcast idea on my commute today and it was fun."
+        },
+        {
+          "role": "assistant",
+          "content": "Consistency matters more than length, so a commute routine is ideal."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "Quick update on my life: I traded in my old car and now drive a red Tesla Model 3. Charging at home works well."
+        },
+        {
+          "role": "assistant",
+          "content": "Thanks for the update — I have replaced the old car information."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "Any tips for sleeping better during hot summer nights?"
+        },
+        {
+          "role": "assistant",
+          "content": "Keep blinds closed during the day, use breathable cotton bedding, and ventilate cross-wise late in the evening."
+        },
+        {
+          "role": "user",
+          "content": "Cross-ventilation helped a lot last night, thanks."
+        },
+        {
+          "role": "assistant",
+          "content": "Great — a thin buckwheat pillow also stays cooler than foam if you want to go further."
+        }
+      ]
+    ],
+    "answer_session_ids": [
+      "probe_car_update"
+    ],
+    "probe": {
+      "current_value": "red Tesla Model 3",
+      "stale_value": "blue Honda Civic",
+      "update_session_id": "probe_car_update",
+      "original_session_id": "probe_car_original"
+    }
+  },
+  {
+    "question_id": "contra_job",
+    "question_type": "knowledge-update",
+    "question": "Where do I work?",
+    "answer": "You work at Northwind Robotics (you previously worked at Greenfield Labs).",
+    "question_date": "2023/06/01 (Thu) 12:00",
+    "haystack_dates": [
+      "2023/04/02 (Sun) 10:05",
+      "2023/04/16 (Sun) 18:40",
+      "2023/05/07 (Sun) 09:30",
+      "2023/05/21 (Sun) 20:15"
+    ],
+    "haystack_session_ids": [
+      "probe_job_original",
+      "probe_job_filler_a",
+      "probe_job_update",
+      "probe_job_filler_b"
+    ],
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "I started my new position at Greenfield Labs this Monday. The onboarding was smooth."
+        },
+        {
+          "role": "assistant",
+          "content": "Noted — I will remember your employer."
+        },
+        {
+          "role": "user",
+          "content": "Great, that will be useful context for later."
+        },
+        {
+          "role": "assistant",
+          "content": "Absolutely, just ask whenever you need it."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "What is a good way to learn basic Spanish before a holiday?"
+        },
+        {
+          "role": "assistant",
+          "content": "Short daily sessions work best — fifteen minutes of a course app plus listening to slow-Spanish podcasts."
+        },
+        {
+          "role": "user",
+          "content": "I tried the podcast idea on my commute today and it was fun."
+        },
+        {
+          "role": "assistant",
+          "content": "Consistency matters more than length, so a commute routine is ideal."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "Big news — I left my old job and now work at Northwind Robotics. The commute is shorter too."
+        },
+        {
+          "role": "assistant",
+          "content": "Thanks for the update — I have replaced the old employer information."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "Any tips for sleeping better during hot summer nights?"
+        },
+        {
+          "role": "assistant",
+          "content": "Keep blinds closed during the day, use breathable cotton bedding, and ventilate cross-wise late in the evening."
+        },
+        {
+          "role": "user",
+          "content": "Cross-ventilation helped a lot last night, thanks."
+        },
+        {
+          "role": "assistant",
+          "content": "Great — a thin buckwheat pillow also stays cooler than foam if you want to go further."
+        }
+      ]
+    ],
+    "answer_session_ids": [
+      "probe_job_update"
+    ],
+    "probe": {
+      "current_value": "Northwind Robotics",
+      "stale_value": "Greenfield Labs",
+      "update_session_id": "probe_job_update",
+      "original_session_id": "probe_job_original"
+    }
+  },
+  {
+    "question_id": "contra_address",
+    "question_type": "knowledge-update",
+    "question": "What street do I live on?",
+    "answer": "You live on Birchwood Avenue (you previously lived on Maplewood Street).",
+    "question_date": "2023/06/01 (Thu) 12:00",
+    "haystack_dates": [
+      "2023/04/02 (Sun) 10:05",
+      "2023/04/16 (Sun) 18:40",
+      "2023/05/07 (Sun) 09:30",
+      "2023/05/21 (Sun) 20:15"
+    ],
+    "haystack_session_ids": [
+      "probe_address_original",
+      "probe_address_filler_a",
+      "probe_address_update",
+      "probe_address_filler_b"
+    ],
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "We just signed the lease — our apartment is on Maplewood Street, third floor."
+        },
+        {
+          "role": "assistant",
+          "content": "Noted — I will remember your street."
+        },
+        {
+          "role": "user",
+          "content": "Great, that will be useful context for later."
+        },
+        {
+          "role": "assistant",
+          "content": "Absolutely, just ask whenever you need it."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "What is a good way to learn basic Spanish before a holiday?"
+        },
+        {
+          "role": "assistant",
+          "content": "Short daily sessions work best — fifteen minutes of a course app plus listening to slow-Spanish podcasts."
+        },
+        {
+          "role": "user",
+          "content": "I tried the podcast idea on my commute today and it was fun."
+        },
+        {
+          "role": "assistant",
+          "content": "Consistency matters more than length, so a commute routine is ideal."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "Moving day is done! We now live on Birchwood Avenue. The new neighborhood is much quieter."
+        },
+        {
+          "role": "assistant",
+          "content": "Thanks for the update — I have replaced the old street information."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "Any tips for sleeping better during hot summer nights?"
+        },
+        {
+          "role": "assistant",
+          "content": "Keep blinds closed during the day, use breathable cotton bedding, and ventilate cross-wise late in the evening."
+        },
+        {
+          "role": "user",
+          "content": "Cross-ventilation helped a lot last night, thanks."
+        },
+        {
+          "role": "assistant",
+          "content": "Great — a thin buckwheat pillow also stays cooler than foam if you want to go further."
+        }
+      ]
+    ],
+    "answer_session_ids": [
+      "probe_address_update"
+    ],
+    "probe": {
+      "current_value": "Birchwood Avenue",
+      "stale_value": "Maplewood Street",
+      "update_session_id": "probe_address_update",
+      "original_session_id": "probe_address_original"
+    }
+  },
+  {
+    "question_id": "contra_phone",
+    "question_type": "knowledge-update",
+    "question": "What phone do I use?",
+    "answer": "You use an iPhone 15 (you previously used a Google Pixel 7).",
+    "question_date": "2023/06/01 (Thu) 12:00",
+    "haystack_dates": [
+      "2023/04/02 (Sun) 10:05",
+      "2023/04/16 (Sun) 18:40",
+      "2023/05/07 (Sun) 09:30",
+      "2023/05/21 (Sun) 20:15"
+    ],
+    "haystack_session_ids": [
+      "probe_phone_original",
+      "probe_phone_filler_a",
+      "probe_phone_update",
+      "probe_phone_filler_b"
+    ],
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "My new phone arrived — a Google Pixel 7. The camera is impressive."
+        },
+        {
+          "role": "assistant",
+          "content": "Noted — I will remember your phone."
+        },
+        {
+          "role": "user",
+          "content": "Great, that will be useful context for later."
+        },
+        {
+          "role": "assistant",
+          "content": "Absolutely, just ask whenever you need it."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "Can you recommend a book about urban gardening for small balconies?"
+        },
+        {
+          "role": "assistant",
+          "content": "Sure — 'The Balcony Gardener' is a popular pick for compact spaces, and it covers container soil basics well."
+        },
+        {
+          "role": "user",
+          "content": "Thanks, I will check the library for it this weekend."
+        },
+        {
+          "role": "assistant",
+          "content": "Good plan. Libraries often shelve it under hobby gardening rather than agriculture."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "I switched phones again; I'm on an iPhone 15 now. iMessage with the family group is easier."
+        },
+        {
+          "role": "assistant",
+          "content": "Thanks for the update — I have replaced the old phone information."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "How do I get tomato sauce stains out of a white shirt?"
+        },
+        {
+          "role": "assistant",
+          "content": "Rinse with cold water from the back of the fabric, then pre-treat with dish soap before a normal wash."
+        },
+        {
+          "role": "user",
+          "content": "The dish soap trick mostly worked, only a faint shadow left."
+        },
+        {
+          "role": "assistant",
+          "content": "A second pass with diluted white vinegar usually lifts the last shadow."
+        }
+      ]
+    ],
+    "answer_session_ids": [
+      "probe_phone_update"
+    ],
+    "probe": {
+      "current_value": "iPhone 15",
+      "stale_value": "Pixel 7",
+      "update_session_id": "probe_phone_update",
+      "original_session_id": "probe_phone_original"
+    }
+  },
+  {
+    "question_id": "contra_dentist",
+    "question_type": "knowledge-update",
+    "question": "When is my dentist appointment?",
+    "answer": "Your dentist appointment is on June 26 (it was rescheduled from June 12).",
+    "question_date": "2023/06/01 (Thu) 12:00",
+    "haystack_dates": [
+      "2023/04/02 (Sun) 10:05",
+      "2023/04/16 (Sun) 18:40",
+      "2023/05/07 (Sun) 09:30",
+      "2023/05/21 (Sun) 20:15"
+    ],
+    "haystack_session_ids": [
+      "probe_dentist_original",
+      "probe_dentist_filler_a",
+      "probe_dentist_update",
+      "probe_dentist_filler_b"
+    ],
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "I booked my dentist appointment for June 12 in the afternoon."
+        },
+        {
+          "role": "assistant",
+          "content": "Noted — I will remember your appointment."
+        },
+        {
+          "role": "user",
+          "content": "Great, that will be useful context for later."
+        },
+        {
+          "role": "assistant",
+          "content": "Absolutely, just ask whenever you need it."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "Can you recommend a book about urban gardening for small balconies?"
+        },
+        {
+          "role": "assistant",
+          "content": "Sure — 'The Balcony Gardener' is a popular pick for compact spaces, and it covers container soil basics well."
+        },
+        {
+          "role": "user",
+          "content": "Thanks, I will check the library for it this weekend."
+        },
+        {
+          "role": "assistant",
+          "content": "Good plan. Libraries often shelve it under hobby gardening rather than agriculture."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "The clinic called — my dentist appointment got rescheduled to June 26."
+        },
+        {
+          "role": "assistant",
+          "content": "Thanks for the update — I have replaced the old appointment information."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "How do I get tomato sauce stains out of a white shirt?"
+        },
+        {
+          "role": "assistant",
+          "content": "Rinse with cold water from the back of the fabric, then pre-treat with dish soap before a normal wash."
+        },
+        {
+          "role": "user",
+          "content": "The dish soap trick mostly worked, only a faint shadow left."
+        },
+        {
+          "role": "assistant",
+          "content": "A second pass with diluted white vinegar usually lifts the last shadow."
+        }
+      ]
+    ],
+    "answer_session_ids": [
+      "probe_dentist_update"
+    ],
+    "probe": {
+      "current_value": "June 26",
+      "stale_value": "June 12",
+      "update_session_id": "probe_dentist_update",
+      "original_session_id": "probe_dentist_original"
+    }
+  },
+  {
+    "question_id": "contra_gym",
+    "question_type": "knowledge-update",
+    "question": "Which gym am I a member of?",
+    "answer": "You are a member of FlexWorks (you previously went to Iron Temple).",
+    "question_date": "2023/06/01 (Thu) 12:00",
+    "haystack_dates": [
+      "2023/04/02 (Sun) 10:05",
+      "2023/04/16 (Sun) 18:40",
+      "2023/05/07 (Sun) 09:30",
+      "2023/05/21 (Sun) 20:15"
+    ],
+    "haystack_session_ids": [
+      "probe_gym_original",
+      "probe_gym_filler_a",
+      "probe_gym_update",
+      "probe_gym_filler_b"
+    ],
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "I signed up at Iron Temple gym today. The free-weights area is huge."
+        },
+        {
+          "role": "assistant",
+          "content": "Noted — I will remember your gym."
+        },
+        {
+          "role": "user",
+          "content": "Great, that will be useful context for later."
+        },
+        {
+          "role": "assistant",
+          "content": "Absolutely, just ask whenever you need it."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "What is a good way to learn basic Spanish before a holiday?"
+        },
+        {
+          "role": "assistant",
+          "content": "Short daily sessions work best — fifteen minutes of a course app plus listening to slow-Spanish podcasts."
+        },
+        {
+          "role": "user",
+          "content": "I tried the podcast idea on my commute today and it was fun."
+        },
+        {
+          "role": "assistant",
+          "content": "Consistency matters more than length, so a commute routine is ideal."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "I cancelled my old gym membership and joined FlexWorks instead — it is closer to the office."
+        },
+        {
+          "role": "assistant",
+          "content": "Thanks for the update — I have replaced the old gym information."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "Any tips for sleeping better during hot summer nights?"
+        },
+        {
+          "role": "assistant",
+          "content": "Keep blinds closed during the day, use breathable cotton bedding, and ventilate cross-wise late in the evening."
+        },
+        {
+          "role": "user",
+          "content": "Cross-ventilation helped a lot last night, thanks."
+        },
+        {
+          "role": "assistant",
+          "content": "Great — a thin buckwheat pillow also stays cooler than foam if you want to go further."
+        }
+      ]
+    ],
+    "answer_session_ids": [
+      "probe_gym_update"
+    ],
+    "probe": {
+      "current_value": "FlexWorks",
+      "stale_value": "Iron Temple",
+      "update_session_id": "probe_gym_update",
+      "original_session_id": "probe_gym_original"
+    }
+  },
+  {
+    "question_id": "contra_advisor",
+    "question_type": "knowledge-update",
+    "question": "Who is my thesis advisor?",
+    "answer": "Your thesis advisor is Dr. Yamamoto (previously it was Dr. Albrecht).",
+    "question_date": "2023/06/01 (Thu) 12:00",
+    "haystack_dates": [
+      "2023/04/02 (Sun) 10:05",
+      "2023/04/16 (Sun) 18:40",
+      "2023/05/07 (Sun) 09:30",
+      "2023/05/21 (Sun) 20:15"
+    ],
+    "haystack_session_ids": [
+      "probe_advisor_original",
+      "probe_advisor_filler_a",
+      "probe_advisor_update",
+      "probe_advisor_filler_b"
+    ],
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "My thesis advisor will be Dr. Albrecht; we set up biweekly meetings."
+        },
+        {
+          "role": "assistant",
+          "content": "Noted — I will remember your thesis advisor."
+        },
+        {
+          "role": "user",
+          "content": "Great, that will be useful context for later."
+        },
+        {
+          "role": "assistant",
+          "content": "Absolutely, just ask whenever you need it."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "Can you recommend a book about urban gardening for small balconies?"
+        },
+        {
+          "role": "assistant",
+          "content": "Sure — 'The Balcony Gardener' is a popular pick for compact spaces, and it covers container soil basics well."
+        },
+        {
+          "role": "user",
+          "content": "Thanks, I will check the library for it this weekend."
+        },
+        {
+          "role": "assistant",
+          "content": "Good plan. Libraries often shelve it under hobby gardening rather than agriculture."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "Department reshuffle: my thesis advisor is now Dr. Yamamoto. First meeting went well."
+        },
+        {
+          "role": "assistant",
+          "content": "Thanks for the update — I have replaced the old thesis advisor information."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "How do I get tomato sauce stains out of a white shirt?"
+        },
+        {
+          "role": "assistant",
+          "content": "Rinse with cold water from the back of the fabric, then pre-treat with dish soap before a normal wash."
+        },
+        {
+          "role": "user",
+          "content": "The dish soap trick mostly worked, only a faint shadow left."
+        },
+        {
+          "role": "assistant",
+          "content": "A second pass with diluted white vinegar usually lifts the last shadow."
+        }
+      ]
+    ],
+    "answer_session_ids": [
+      "probe_advisor_update"
+    ],
+    "probe": {
+      "current_value": "Dr. Yamamoto",
+      "stale_value": "Dr. Albrecht",
+      "update_session_id": "probe_advisor_update",
+      "original_session_id": "probe_advisor_original"
+    }
+  },
+  {
+    "question_id": "contra_diet",
+    "question_type": "knowledge-update",
+    "question": "What diet do I follow?",
+    "answer": "You follow a pescatarian diet (you previously were vegetarian).",
+    "question_date": "2023/06/01 (Thu) 12:00",
+    "haystack_dates": [
+      "2023/04/02 (Sun) 10:05",
+      "2023/04/16 (Sun) 18:40",
+      "2023/05/07 (Sun) 09:30",
+      "2023/05/21 (Sun) 20:15"
+    ],
+    "haystack_session_ids": [
+      "probe_diet_original",
+      "probe_diet_filler_a",
+      "probe_diet_update",
+      "probe_diet_filler_b"
+    ],
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "I have decided to go vegetarian — please keep that in mind for recipe ideas."
+        },
+        {
+          "role": "assistant",
+          "content": "Noted — I will remember your diet."
+        },
+        {
+          "role": "user",
+          "content": "Great, that will be useful context for later."
+        },
+        {
+          "role": "assistant",
+          "content": "Absolutely, just ask whenever you need it."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "Can you recommend a book about urban gardening for small balconies?"
+        },
+        {
+          "role": "assistant",
+          "content": "Sure — 'The Balcony Gardener' is a popular pick for compact spaces, and it covers container soil basics well."
+        },
+        {
+          "role": "user",
+          "content": "Thanks, I will check the library for it this weekend."
+        },
+        {
+          "role": "assistant",
+          "content": "Good plan. Libraries often shelve it under hobby gardening rather than agriculture."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "Small change: I now follow a pescatarian diet, so fish is fine again."
+        },
+        {
+          "role": "assistant",
+          "content": "Thanks for the update — I have replaced the old diet information."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "How do I get tomato sauce stains out of a white shirt?"
+        },
+        {
+          "role": "assistant",
+          "content": "Rinse with cold water from the back of the fabric, then pre-treat with dish soap before a normal wash."
+        },
+        {
+          "role": "user",
+          "content": "The dish soap trick mostly worked, only a faint shadow left."
+        },
+        {
+          "role": "assistant",
+          "content": "A second pass with diluted white vinegar usually lifts the last shadow."
+        }
+      ]
+    ],
+    "answer_session_ids": [
+      "probe_diet_update"
+    ],
+    "probe": {
+      "current_value": "pescatarian",
+      "stale_value": "vegetarian",
+      "update_session_id": "probe_diet_update",
+      "original_session_id": "probe_diet_original"
+    }
+  }
+]
