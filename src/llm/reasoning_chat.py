@@ -107,6 +107,36 @@ def _dump_codex_raw_response(
         logger.warning(f"Codex raw capture failed (non-fatal): {exc}")
 
 
+def _overflow_response_413(
+    request: Any, overflow: ContextOverflowError
+) -> httpx.Response:
+    """Convert a pre-flight context overflow into a non-retryable HTTP response.
+
+    Raising from inside ``send()`` gets wrapped into a retryable
+    ``openai.APIConnectionError`` by the SDK (``openai/_base_client.py``), so a
+    deterministic "request too big" failure was retried with backoff and
+    surfaced as a bare "Connection error." with the real cause buried in
+    ``__cause__`` — and ``persistent_graph`` misread it as "streaming not
+    supported". A synthetic 413 instead surfaces immediately as a typed,
+    non-retried ``APIStatusError`` carrying the real message; callers detect
+    it via ``code == "context_overflow"``.
+    See docs/issues/session_silent_failure_audit.md #3.
+    """
+    return httpx.Response(
+        status_code=413,
+        request=request,
+        json={
+            "error": {
+                "message": overflow.message,
+                "type": "invalid_request_error",
+                "code": "context_overflow",
+                "token_count": overflow.token_count,
+                "limit": overflow.limit,
+            }
+        },
+    )
+
+
 def count_request_tokens(body: dict, model: str = "gpt-4") -> int:
     """Count tokens in OpenAI API request body.
 
@@ -513,6 +543,7 @@ class ReasoningCapturingClient(httpx.Client):
 
         # Token validation for LLM requests (Layer 0 safety check)
         if is_llm_request:
+            overflow: Optional[ContextOverflowError] = None
             try:
                 body = json.loads(request.content)
                 token_count = count_request_tokens(body, self._model)
@@ -525,13 +556,12 @@ class ReasoningCapturingClient(httpx.Client):
                         f"({token_count / self._max_context_tokens * 100:.1f}%)"
                     )
 
-                # Raise error if over limit
                 if token_count > self._max_context_tokens:
                     logger.error(
                         f"Context overflow at HTTP layer: "
                         f"{token_count:,} tokens exceeds limit of {self._max_context_tokens:,}"
                     )
-                    raise ContextOverflowError(
+                    overflow = ContextOverflowError(
                         token_count=token_count,
                         limit=self._max_context_tokens,
                         request_size_bytes=len(request.content),
@@ -540,12 +570,13 @@ class ReasoningCapturingClient(httpx.Client):
             except json.JSONDecodeError:
                 # Non-JSON request body, skip validation
                 logger.debug("Skipping token count for non-JSON request")
-            except ContextOverflowError:
-                # Re-raise our custom exception
-                raise
             except Exception as e:
                 # Log but don't fail on counting errors - let the request through
                 logger.warning(f"Token counting failed, allowing request: {e}")
+
+            if overflow is not None:
+                # Don't raise — return a synthetic 413 the SDK won't retry.
+                return _overflow_response_413(request, overflow)
 
         # Send the request
         response = super().send(request, **kwargs)
@@ -729,6 +760,7 @@ class AsyncReasoningCapturingClient(httpx.AsyncClient):
 
         # Token validation for LLM requests (Layer 0 safety check)
         if is_llm_request:
+            overflow: Optional[ContextOverflowError] = None
             try:
                 body = json.loads(request.content)
                 token_count = count_request_tokens(body, self._model)
@@ -745,7 +777,7 @@ class AsyncReasoningCapturingClient(httpx.AsyncClient):
                         f"Context overflow at HTTP layer: "
                         f"{token_count:,} tokens exceeds limit of {self._max_context_tokens:,}"
                     )
-                    raise ContextOverflowError(
+                    overflow = ContextOverflowError(
                         token_count=token_count,
                         limit=self._max_context_tokens,
                         request_size_bytes=len(request.content),
@@ -753,10 +785,12 @@ class AsyncReasoningCapturingClient(httpx.AsyncClient):
 
             except json.JSONDecodeError:
                 logger.debug("Skipping token count for non-JSON request")
-            except ContextOverflowError:
-                raise
             except Exception as e:
                 logger.warning(f"Token counting failed, allowing request: {e}")
+
+            if overflow is not None:
+                # Don't raise — return a synthetic 413 the SDK won't retry.
+                return _overflow_response_413(request, overflow)
 
         # Send the request (async)
         response = await super().send(request, **kwargs)

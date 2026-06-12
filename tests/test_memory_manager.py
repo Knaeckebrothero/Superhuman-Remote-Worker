@@ -544,3 +544,295 @@ class TestMemoryConfigPlumbing:
         assert cfg.budget_tokens == 5000
         assert cfg.observer_interval == 3
         assert cfg.enabled is False
+
+
+# ---------------------------------------------------------------------------
+# Reranker scorer (Phase 3, slice 2)
+# ---------------------------------------------------------------------------
+
+
+class FakeRerankResponse:
+    def __init__(self, results):
+        self._results = results
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return {"results": self._results}
+
+
+class FakeRerankClient:
+    """httpx-shaped client returning canned Cohere-style rerank results."""
+
+    def __init__(self, scores=None, error=None):
+        #: text -> relevance score; results echo document order indices
+        self.scores = scores or {}
+        self.error = error
+        self.calls = []
+
+    async def post(self, url, json=None):
+        self.calls.append({"url": url, "json": json})
+        if self.error:
+            raise self.error
+        docs = json["documents"]
+        return FakeRerankResponse(
+            [
+                {"index": i, "relevance_score": self.scores.get(doc, 0.0)}
+                for i, doc in enumerate(docs)
+            ]
+        )
+
+
+def make_scored(text, *, pinned=False, kind="memory", record_id="r"):
+    candidate = make_candidate(kind=kind, text=text, record_id=record_id)
+    if kind == "memory" and pinned:
+        candidate.record.remaining_turns = 3
+    return Scored(candidate=candidate)
+
+
+class TestRerankerScorer:
+    def _scorer(self, client, **kwargs):
+        from src.services.memory.plugins.reranker import RerankerScorer
+
+        defaults = dict(
+            model="qwen3-reranker-8b",
+            base_url="https://router/v1",
+            api_key="k",
+            client=client,
+        )
+        defaults.update(kwargs)
+        return RerankerScorer(**defaults)
+
+    @pytest.mark.asyncio
+    async def test_reorders_by_relevance_and_records_channel_score(self):
+        client = FakeRerankClient(scores={"tesla": 0.9, "hiking": 0.1, "civic": 0.6})
+        scorer = self._scorer(client)
+        items = [make_scored("hiking"), make_scored("civic"), make_scored("tesla")]
+
+        out = await scorer.score(
+            AssembleRequest(query_text="what car does the user drive"), items
+        )
+
+        assert [i.candidate.text for i in out] == ["tesla", "civic", "hiking"]
+        assert out[0].score == 0.9
+        assert out[0].candidate.channel_scores["rerank"] == 0.9
+        assert client.calls[0]["url"] == "https://router/v1/rerank"
+        assert client.calls[0]["json"]["model"] == "qwen3-reranker-8b"
+
+    @pytest.mark.asyncio
+    async def test_pinned_stay_first_and_knowledge_passes_through(self):
+        client = FakeRerankClient(scores={"a": 0.2, "b": 0.8})
+        scorer = self._scorer(client)
+        pinned = make_scored("working-set note", pinned=True)
+        kb = make_scored("kb note", kind="knowledge")
+        items = [pinned, make_scored("a"), kb, make_scored("b")]
+
+        out = await scorer.score(AssembleRequest(query_text="q"), items)
+
+        assert [i.candidate.text for i in out] == [
+            "working-set note",
+            "b",
+            "a",
+            "kb note",
+        ]
+        # pinned item was not sent to the endpoint
+        assert client.calls[0]["json"]["documents"] == ["a", "b"]
+
+    @pytest.mark.asyncio
+    async def test_top_k_tail_keeps_original_order(self):
+        client = FakeRerankClient(scores={"x": 0.1, "y": 0.9})
+        scorer = self._scorer(client, top_k=2)
+        items = [
+            make_scored("x"),
+            make_scored("y"),
+            make_scored("t1"),
+            make_scored("t2"),
+        ]
+
+        out = await scorer.score(AssembleRequest(query_text="q"), items)
+
+        assert [i.candidate.text for i in out] == ["y", "x", "t1", "t2"]
+
+    @pytest.mark.asyncio
+    async def test_failure_raises_without_partial_reorder(self):
+        client = FakeRerankClient(error=RuntimeError("endpoint down"))
+        scorer = self._scorer(client)
+        items = [make_scored("a"), make_scored("b")]
+
+        with pytest.raises(RuntimeError):
+            await scorer.score(AssembleRequest(query_text="q"), items)
+        assert "rerank" not in items[0].candidate.channel_scores
+
+    @pytest.mark.asyncio
+    async def test_short_or_queryless_passthrough(self):
+        client = FakeRerankClient()
+        scorer = self._scorer(client)
+        single = [make_scored("only one")]
+        assert await scorer.score(AssembleRequest(query_text="q"), single) == single
+        items = [make_scored("a"), make_scored("b")]
+        assert await scorer.score(AssembleRequest(query_text=""), items) == items
+        assert client.calls == []
+
+    @pytest.mark.asyncio
+    async def test_manager_containment_on_scorer_failure(self):
+        from src.services.memory.plugins.reranker import RerankerScorer
+
+        scorer = RerankerScorer(
+            model="m",
+            base_url="https://router/v1",
+            api_key=None,
+            client=FakeRerankClient(error=RuntimeError("boom")),
+        )
+        manager = MemoryManager(
+            MemoryRuntime(),
+            retrievers=[
+                (
+                    "r",
+                    FakeRetriever([make_candidate(text="a"), make_candidate(text="b")]),
+                )
+            ],
+            scorers=[("reranker", scorer)],
+        )
+        payload = await manager.assemble(AssembleRequest(query_text="q"))
+        # items pass through unchanged; the failure is recorded, not raised
+        assert payload.stats.errors and "reranker" in payload.stats.errors[0]
+        assert payload.stats.injected_total == 2
+
+    def test_factory_defaults_to_auxiliary_transport(self):
+        from src.services.memory.plugins.reranker import _build_reranker
+        from src.core.loader import RerankerConfig
+
+        runtime = MemoryRuntime(
+            memory_config=SimpleNamespace(reranker=RerankerConfig()),
+            auxiliary_config=SimpleNamespace(
+                base_url="https://aux/v1", api_key="aux-key"
+            ),
+        )
+        scorer = _build_reranker(runtime)
+        assert scorer.endpoint == "https://aux/v1/rerank"
+        assert scorer.api_key == "aux-key"
+        assert scorer.top_k == 64
+
+    def test_parse_reranker_config(self):
+        cfg = _parse_memory_config(
+            {
+                "reranker": {
+                    "model": "rerank-1",
+                    "top_k": 32,
+                    "timeout": 5,
+                    "keep_pinned_first": False,
+                }
+            }
+        )
+        assert cfg.reranker.model == "rerank-1"
+        assert cfg.reranker.top_k == 32
+        assert cfg.reranker.timeout == 5.0
+        assert cfg.reranker.keep_pinned_first is False
+        assert cfg.reranker.base_url is None
+        # defaults when section absent
+        assert _parse_memory_config({}).reranker.model == "qwen3-reranker-8b"
+
+    def test_reranker_is_registered(self):
+        assert "reranker" in available_memory_plugins("scorer")["scorer"]
+
+
+# ---------------------------------------------------------------------------
+# BoundedPolicy (Phase 3 slice 3)
+# ---------------------------------------------------------------------------
+
+
+class TestBoundedPolicy:
+    def _policy(self, **kwargs):
+        from src.services.memory.plugins.bounded import BoundedPolicy
+
+        return BoundedPolicy(**kwargs)
+
+    def _req(self):
+        return AssembleRequest(query_text="what is my dog's name?")
+
+    @pytest.mark.asyncio
+    async def test_max_items_keeps_scored_order_and_passes_knowledge(self):
+        items = [
+            make_scored("m1", record_id="m1"),
+            make_scored("kb1", kind="knowledge", record_id="k1"),
+            make_scored("m2", record_id="m2"),
+            make_scored("m3", record_id="m3"),
+            make_scored("kb2", kind="knowledge", record_id="k2"),
+        ]
+        kept = await self._policy(max_items=2).apply(self._req(), items)
+        assert [i.candidate.text for i in kept] == ["m1", "kb1", "m2", "kb2"]
+
+    @pytest.mark.asyncio
+    async def test_max_tokens_walks_token_counts(self):
+        items = [
+            Scored(candidate=make_candidate(text="a", tokens=40, record_id="a")),
+            Scored(candidate=make_candidate(text="b", tokens=40, record_id="b")),
+            Scored(candidate=make_candidate(text="c", tokens=40, record_id="c")),
+        ]
+        kept = await self._policy(max_tokens=80).apply(self._req(), items)
+        assert [i.candidate.text for i in kept] == ["a", "b"]
+
+    @pytest.mark.asyncio
+    async def test_zero_token_count_falls_back_to_estimate(self):
+        long_text = "x" * 400  # ~100 estimated tokens
+        items = [
+            Scored(candidate=make_candidate(text=long_text, tokens=0, record_id="a")),
+            Scored(candidate=make_candidate(text=long_text, tokens=0, record_id="b")),
+        ]
+        kept = await self._policy(max_tokens=120).apply(self._req(), items)
+        assert len(kept) == 1
+
+    @pytest.mark.asyncio
+    async def test_both_caps_whichever_bites_first(self):
+        items = [
+            Scored(candidate=make_candidate(text=t, tokens=10, record_id=t))
+            for t in ("a", "b", "c", "d")
+        ]
+        kept = await self._policy(max_items=3, max_tokens=25).apply(self._req(), items)
+        assert [i.candidate.text for i in kept] == ["a", "b"]
+
+    @pytest.mark.asyncio
+    async def test_under_cap_keeps_everything(self):
+        items = [make_scored("m1"), make_scored("m2")]
+        kept = await self._policy(max_items=10).apply(self._req(), items)
+        assert kept == items
+
+    def test_capless_construction_raises(self):
+        with pytest.raises(ValueError, match="config theatre"):
+            self._policy()
+        with pytest.raises(ValueError, match=">= 1"):
+            self._policy(max_items=0)
+        with pytest.raises(ValueError, match=">= 1"):
+            self._policy(max_tokens=0)
+
+    def test_factory_reads_bounded_config(self):
+        from src.services.memory.plugins.bounded import _build_bounded
+
+        runtime = SimpleNamespace(
+            memory_config=SimpleNamespace(
+                bounded=SimpleNamespace(max_items=10, max_tokens=None)
+            )
+        )
+        policy = _build_bounded(runtime)
+        assert policy.max_items == 10
+        assert policy.max_tokens is None
+
+    def test_factory_missing_section_raises(self):
+        from src.services.memory.plugins.bounded import _build_bounded
+
+        runtime = SimpleNamespace(memory_config=SimpleNamespace(bounded=None))
+        with pytest.raises(ValueError, match="config section missing"):
+            _build_bounded(runtime)
+
+    def test_parse_bounded_config(self):
+        cfg = _parse_memory_config({"bounded": {"max_items": 10, "max_tokens": 2048}})
+        assert cfg.bounded.max_items == 10
+        assert cfg.bounded.max_tokens == 2048
+        # defaults when section absent: capless (the policy refuses to bind)
+        absent = _parse_memory_config({})
+        assert absent.bounded.max_items is None
+        assert absent.bounded.max_tokens is None
+
+    def test_bounded_is_registered(self):
+        assert "bounded" in available_memory_plugins("policy")["policy"]

@@ -69,6 +69,9 @@ class ArmSpec:
     auxiliary: Dict[str, Any] = field(default_factory=dict)
     ingestion: IngestionOptions = field(default_factory=IngestionOptions)
     ks: List[int] = field(default_factory=lambda: [1, 3, 5, 10])
+    #: Override the matrix-resolved extraction prompt with a file (path
+    #: relative to the repo root) — the prompt-variant A/B knob.
+    extraction_prompt_file: Optional[str] = None
 
     @classmethod
     def from_file(cls, path: str) -> "ArmSpec":
@@ -82,6 +85,7 @@ class ArmSpec:
             auxiliary=data.get("auxiliary") or {},
             ingestion=IngestionOptions(**(data.get("ingestion") or {})),
             ks=[int(k) for k in query.get("ks", [1, 3, 5, 10])],
+            extraction_prompt_file=data.get("extraction_prompt_file"),
         )
 
 

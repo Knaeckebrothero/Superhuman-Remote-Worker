@@ -139,6 +139,7 @@
     "emptyFilterEnded": "No ended sessions.",
     "untitledSession": "Untitled Session",
     "confirmDelete": "Delete this session permanently?",
+    "confirmForceDelete": "The agent is still working on a turn in this session. Delete anyway? The in-flight turn will be lost.",
     "turnsOne": "turn",
     "turnsMany": "turns",
     "filter": {
@@ -866,7 +867,8 @@
     },
     "status": {
       "temp": "temp {{value}}",
-      "turn": "Turn {{count}}"
+      "turn": "Turn {{count}}",
+      "agentQuiet": "Working — no output for {{seconds}}s"
     },
     "turn": {
       "collapsedEmpty": "Tool calls only",

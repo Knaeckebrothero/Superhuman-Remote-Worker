@@ -475,6 +475,18 @@ class WorkspaceSuspensionService:
             return False
 
         ws_status = ws_ctx.get("status") if ws_ctx else vm_ctx.get("status")
+        if ws_status in ("suspended", "suspending"):
+            # A concurrent/earlier suspend already handled (or is handling)
+            # this thread. Returning False here made the caller's fallback
+            # path log "suspend unavailable or failed" and delete the agent
+            # pod a second time right after a successful suspend
+            # (docs/issues/session_silent_failure_audit.md #13).
+            logger.info(
+                "Workspace for thread %s already %s — skipping duplicate suspend",
+                thread_id,
+                ws_status,
+            )
+            return True
         if ws_status != "ready":
             return False
 

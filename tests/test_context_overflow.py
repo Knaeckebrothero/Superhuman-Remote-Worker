@@ -207,8 +207,13 @@ class TestReasoningCapturingClient:
             client = ReasoningCapturingClient(max_context_tokens=50000)
             assert client._max_context_tokens == 50000
 
-    def test_raises_on_overflow(self, large_request_body):
-        """Should raise ContextOverflowError when over limit."""
+    def test_returns_synthetic_413_on_overflow(self, large_request_body):
+        """Overflow short-circuits into a 413 response the SDK won't retry.
+
+        Raising from inside send() got wrapped into a retryable
+        APIConnectionError by the OpenAI SDK (retry storm + misleading
+        "Connection error."); see docs/issues/session_silent_failure_audit.md #3.
+        """
         # Use a very small limit to trigger overflow
         client = ReasoningCapturingClient(max_context_tokens=100)
 
@@ -217,11 +222,14 @@ class TestReasoningCapturingClient:
         request.url = "https://api.openai.com/v1/chat/completions"
         request.content = json.dumps(large_request_body).encode()
 
-        with pytest.raises(ContextOverflowError) as exc_info:
-            client.send(request)
+        response = client.send(request)
 
-        assert exc_info.value.token_count > exc_info.value.limit
-        assert exc_info.value.limit == 100
+        assert response.status_code == 413
+        err = response.json()["error"]
+        assert err["code"] == "context_overflow"
+        assert err["limit"] == 100
+        assert err["token_count"] > 100
+        assert "exceeds model limit" in err["message"]
 
     def test_skips_non_chat_requests(self, large_request_body):
         """Should not validate non-chat-completion requests."""
@@ -399,19 +407,21 @@ class TestAsyncReasoningCapturingClient:
     """Tests for the async HTTP client with context limit validation."""
 
     @pytest.mark.asyncio
-    async def test_async_raises_on_overflow(self, large_request_body):
-        """Async client should raise ContextOverflowError when over limit."""
+    async def test_async_returns_synthetic_413_on_overflow(self, large_request_body):
+        """Async overflow short-circuits into a non-retryable 413 response."""
         client = AsyncReasoningCapturingClient(max_context_tokens=100)
 
         request = MagicMock()
         request.url = "https://api.openai.com/v1/chat/completions"
         request.content = json.dumps(large_request_body).encode()
 
-        with pytest.raises(ContextOverflowError) as exc_info:
-            await client.send(request)
+        response = await client.send(request)
 
-        assert exc_info.value.token_count > exc_info.value.limit
-        assert exc_info.value.limit == 100
+        assert response.status_code == 413
+        err = response.json()["error"]
+        assert err["code"] == "context_overflow"
+        assert err["limit"] == 100
+        assert err["token_count"] > 100
 
     @pytest.mark.asyncio
     async def test_async_skips_non_chat_requests(self, large_request_body):

@@ -29,6 +29,7 @@ from langchain_core.messages import (
 )
 
 from .core.context import ContextManager, extract_summary_text, repair_tool_pairing
+from .llm.exceptions import ContextOverflowError
 from .llm.reasoning_chat import extract_reasoning_text_from_block
 from .llm.response_guards import (
     coerce_to_ai_message,
@@ -104,6 +105,36 @@ APPROVE_SENTINEL = "__APPROVE__"
 DENY_SENTINEL = "__DENY__"
 
 
+def _user_facing_turn_error(e: BaseException) -> str:
+    """Map a turn-killing exception to a message worth showing the user.
+
+    The cockpit sanitizes raw backend strings into a generic "something went
+    wrong", so anything actionable has to be phrased here. Context overflows
+    are the common deterministic case: the capture client surfaces them as a
+    synthetic 413 with ``code: context_overflow``
+    (session_silent_failure_audit.md #3), or — defensively — as a typed
+    ContextOverflowError.
+    """
+    cause = getattr(e, "__cause__", None)
+    overflow = next(
+        (x for x in (e, cause) if isinstance(x, ContextOverflowError)), None
+    )
+    if overflow is not None:
+        return (
+            f"The conversation no longer fits the model's context window "
+            f"({overflow.token_count:,} tokens vs a {overflow.limit:,}-token "
+            f"limit) and compaction could not shrink it. Start a new session "
+            f"for this task, or switch to a larger-context model."
+        )
+    if "context_overflow" in str(e):
+        return (
+            "The conversation no longer fits the model's context window and "
+            f"compaction could not shrink it. ({e}) Start a new session for "
+            "this task, or switch to a larger-context model."
+        )
+    return str(e)
+
+
 class IdleTimeoutError(Exception):
     """Raised when the user has been idle beyond the configured timeout."""
 
@@ -130,8 +161,11 @@ class PersistentLoopCallbacks:
     communicates through these callbacks.
     """
 
-    # Wait for the next user message (blocks until available)
-    get_user_input: Callable[[], Awaitable[str]]
+    # Wait for the next user message (blocks until available). Returns either
+    # a plain string (sentinels, legacy callers) or a dict
+    # ``{"content": str, "id": str}`` whose id is the thread_messages row the
+    # accept-time persist already wrote (session_silent_failure_audit.md #1).
+    get_user_input: Callable[[], Awaitable[Any]]
 
     # Stream a token chunk to the client
     on_token: Callable[[str], Awaitable[None]]
@@ -158,8 +192,10 @@ class PersistentLoopCallbacks:
     # Stream a thinking/reasoning chunk to the client
     on_thinking: Callable[[str], Awaitable[None]]
 
-    # Notify client of errors
-    on_error: Callable[[str], Awaitable[None]]
+    # Notify client of errors. Accepts an optional ``turn_id`` kwarg so the
+    # transport can close the failed turn in the UI and persist the error
+    # (session_silent_failure_audit.md #2); older transports ignore it.
+    on_error: Callable[..., Awaitable[None]]
 
     # Check if an interrupt was requested (non-blocking). Returns the
     # interrupt mode ("hard" | "graceful") or None if no interrupt is
@@ -192,6 +228,11 @@ class PersistentLoopCallbacks:
     # turn-level metrics / approval decisions via an idempotent upsert).
     # Optional: None ⇒ persist only at turn-complete (back-compat).
     persist_message: Optional[Callable[[Any], Awaitable[None]]] = None
+
+    # Audit one main-LLM call (messages, response, metrics) to the
+    # llm_requests trail. Sync callback — the transport schedules its own
+    # background write (session_silent_failure_audit.md #14).
+    archive_llm_call: Optional[Callable[..., None]] = None
 
     # Set by the transport alongside a "hard" interrupt so the loop can cancel
     # a blocked LLM / auxiliary await immediately — the cooperative
@@ -378,7 +419,15 @@ async def run_persistent_loop(
             logger.info("Persistent loop exiting due to idle timeout")
             raise  # Propagate to loop_task
 
-        if user_input == INTERRUPT_SENTINEL:
+        # Dict-shaped items carry the id the accept-time persist wrote the
+        # row under (session_silent_failure_audit.md #1) — reusing it makes
+        # every later write an upsert onto that row instead of a duplicate.
+        input_msg_id: Optional[str] = None
+        if isinstance(user_input, dict):
+            input_msg_id = user_input.get("id")
+            user_input = user_input.get("content", "")
+
+        if not user_input or user_input == INTERRUPT_SENTINEL:
             continue
 
         # Refresh after receiving input so config changes made during the wait
@@ -392,9 +441,17 @@ async def run_persistent_loop(
 
         turn_count += 1
         turn_id = turn_count
-        messages.append(_ensure_msg_id(HumanMessage(content=user_input)))
+        user_msg = HumanMessage(content=user_input)
+        if input_msg_id:
+            user_msg.id = input_msg_id
+        messages.append(_ensure_msg_id(user_msg))
 
         await callbacks.on_turn_start(turn_id)
+        # Reconcile the accept-time row (turn_number was a guess there) — or
+        # create it for inputs that bypassed the REST/WS accept path. Upsert
+        # by message id either way.
+        if callbacks.persist_message is not None:
+            await callbacks.persist_message(user_msg)
         tool_calls_this_turn = 0
 
         result = None
@@ -421,7 +478,10 @@ async def run_persistent_loop(
             return
         except Exception as e:
             logger.exception(f"Error in turn {turn_id}")
-            await callbacks.on_error(str(e))
+            # turn_id lets the transport close the still-open turn in the UI
+            # and persist the failure so it survives reload
+            # (session_silent_failure_audit.md #2).
+            await callbacks.on_error(_user_facing_turn_error(e), turn_id=turn_id)
 
         # Memory extraction every N turns (fire-and-forget).
         # Manager path (memory overhaul Phase 1): one turn_end capture —
@@ -990,6 +1050,16 @@ async def _execute_turn(
                 # Fallback to ainvoke when streaming fails
                 # (e.g. ReasoningCapturingClient can't handle stream=True)
                 err_name = type(stream_err).__name__
+                # A context overflow is deterministic — retrying via ainvoke
+                # sends the identical oversized request again. Surface the
+                # typed cause instead of misreporting "streaming not
+                # supported" (session_silent_failure_audit.md #3). The
+                # capture client now returns a synthetic 413 (APIStatusError),
+                # but unwrap a legacy __cause__ wrap too, defensively.
+                if isinstance(
+                    getattr(stream_err, "__cause__", None), ContextOverflowError
+                ):
+                    raise stream_err.__cause__ from None
                 if "ResponseNotRead" in err_name or "APIConnectionError" in err_name:
                     logger.info(
                         f"Streaming not supported ({err_name}), falling back to ainvoke"
@@ -1084,6 +1154,20 @@ async def _execute_turn(
                 "model": meta.get("model_name"),
             }
             turn_metrics = {k: v for k, v in turn_metrics.items() if v is not None}
+
+        # Audit the call. Sessions previously wrote no llm_requests rows at
+        # all — job agents were auditable, session hangs were not
+        # (session_silent_failure_audit.md #14). The callback schedules its
+        # own background write; failures are non-fatal by contract.
+        if callbacks.archive_llm_call is not None and response is not None:
+            try:
+                callbacks.archive_llm_call(
+                    prepared,
+                    response,
+                    turn_metrics or {"latency_ms": llm_latency_ms},
+                )
+            except Exception as e:
+                logger.debug(f"LLM call archive failed (non-fatal): {e}")
 
         # Send reasoning from additional_kwargs if not already streamed
         # (covers DeepSeek, OpenRouter, and other non-Anthropic reasoning models)

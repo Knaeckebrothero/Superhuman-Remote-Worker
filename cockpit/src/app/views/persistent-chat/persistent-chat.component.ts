@@ -440,6 +440,9 @@ interface FileEditView {
             <app-badge tone="neutral" size="sm">{{ 'chat.status.temp' | transloco:{ value: chat.temperature() } }}</app-badge>
           }
           <app-badge tone="neutral" size="sm">{{ 'chat.status.turn' | transloco:{ count: chat.turnCount() } }}</app-badge>
+          @if (chat.agentSilenceSeconds() >= 30) {
+            <app-badge tone="warning" size="sm">{{ 'chat.status.agentQuiet' | transloco:{ seconds: chat.agentSilenceSeconds() } }}</app-badge>
+          }
           <app-badge tone="accent" size="sm">{{ chat.permissionMode() | titlecase }}</app-badge>
         </div>
       }

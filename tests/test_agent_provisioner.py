@@ -542,6 +542,7 @@ class TestScaleDownIdle:
         conn.fetch.return_value = [
             {"id": f"agent-{i}", "hostname": f"pod-{i}"} for i in range(4)
         ]
+        p._count_idle_agents = AsyncMock(return_value=4)
 
         with patch(
             "orchestrator.services.agent_provisioner.asyncio.to_thread",
@@ -564,6 +565,7 @@ class TestScaleDownIdle:
         conn.fetch.return_value = [
             {"id": f"agent-{i}", "hostname": f"pod-{i}"} for i in range(8)
         ]
+        p._count_idle_agents = AsyncMock(return_value=8)
 
         with patch(
             "orchestrator.services.agent_provisioner.asyncio.to_thread",
@@ -572,6 +574,35 @@ class TestScaleDownIdle:
             result = await p.scale_down_idle(max_terminate=1)
 
         assert result == 1
+
+    @pytest.mark.asyncio
+    async def test_leaves_buffer_idle_pods_alone(self):
+        """Idle pods within AGENT_BUFFER are warm-pool inventory, not excess.
+
+        Regression for the warm-pool/scale-down thrash: with 3 busy + 1 idle
+        and buffer=1, the old active-vs-min check (4 > 2) killed the idle pod
+        that ensure_warm_pool had just created — one pod/minute churn for
+        hours (docs/issues/session_silent_failure_audit.md #12).
+        """
+        p, conn = _make_provisioner(min_agents=2)
+        p._agent_buffer = 1
+
+        # active_count returns 4 (3 busy + 1 idle)
+        pods_result = MagicMock()
+        pods_result.items = [_make_pod(f"pod-{i}") for i in range(4)]
+        p._core_api.list_namespaced_pod.return_value = pods_result
+
+        conn.fetch.return_value = [{"id": "agent-0", "hostname": "pod-0"}]
+        p._count_idle_agents = AsyncMock(return_value=1)
+
+        with patch(
+            "orchestrator.services.agent_provisioner.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            result = await p.scale_down_idle(max_terminate=2)
+
+        assert result == 0
+        p._core_api.delete_namespaced_pod.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_noop_when_no_idle_agents(self):

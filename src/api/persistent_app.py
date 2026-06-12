@@ -128,6 +128,11 @@ _resume_message_limit: int = int(os.environ.get("RESUME_MESSAGE_LIMIT", "1000"))
 _SUBSCRIBER_QUEUE_MAXSIZE: int = 1000
 _subscribers: Dict[str, asyncio.Queue] = {}
 
+# Idle keepalive on the control WS (see _run_subscriber_pump). Must be
+# shorter than the cockpit's CONTROL_WS_WATCHDOG_TIMEOUT_MS and any
+# edge/tunnel idle timeout on the WS path.
+_WS_PING_INTERVAL_S: float = 20.0
+
 # Loop-facing input primitives. Used to be closure-scoped inside ws_chat;
 # hoisted to module level so they survive WS reconnect. All three are reset
 # on session attach / cleared on _terminate_session.
@@ -251,6 +256,17 @@ async def emit_session_event(method: str, params: dict) -> None:
         logger.warning("agent pod: NATS publish failed: %s", e)
 
 
+def _turn_in_flight() -> bool:
+    """True while the loop is executing a turn (not parked waiting for input).
+
+    Exposed via the agent's ``/status`` and ``/session/status`` so the
+    orchestrator's ``end_thread`` can refuse to tear down a session that is
+    mid-turn without an explicit ``force``
+    (docs/issues/session_silent_failure_audit.md #11).
+    """
+    return _loop_task is not None and not _loop_task.done() and not _awaiting_input
+
+
 def _session_ready() -> bool:
     """True when the persistent session is fully attached and the loop
     primitives are ready to accept a WS subscriber.
@@ -300,6 +316,7 @@ def _ensure_persistent_loop_started(
             on_vm_upgrade_needed=_loop_on_vm_upgrade_needed,
             on_context_compacted=_loop_on_context_compacted,
             persist_message=_loop_persist_message,
+            archive_llm_call=_loop_archive_llm_call,
             hard_interrupt_event=_hard_interrupt_event,
         )
         _loop_task = asyncio.create_task(
@@ -1701,6 +1718,7 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
             {
                 "mode": "persistent",
                 "thread_id": _thread_id,
+                "turn_in_flight": _turn_in_flight(),
                 "config": _config_path,
                 "permission_mode": _session.permission_mode if _session else None,
                 "turn_count": _session.turn_count if _session else 0,
@@ -1840,6 +1858,47 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
 # docs/issues/persistent_session_dual_mode_phase1_gap.md.
 
 
+async def _accept_user_input(content: str) -> str:
+    """Persist an accepted user message, then enqueue it for the loop.
+
+    Returns the message id. Persisting BEFORE the 200 goes out closes the
+    swallowed-input gap (session_silent_failure_audit.md #1): the queue is
+    process memory, so without the row a mid-turn input vanished from the UI
+    on reload and died with the pod. The loop reuses the id when it consumes
+    the item, so its own persist is an upsert onto this row (final
+    turn_number), never a duplicate.
+    """
+    import uuid as _uuid
+
+    from langchain_core.messages import HumanMessage
+
+    msg = HumanMessage(content=content)
+    msg.id = f"msg_{_uuid.uuid4().hex[:24]}"
+    _loop_last_user_content[0] = content
+    if (
+        _session is not None
+        and _session.postgres_conn is not None
+        and _thread_id is not None
+    ):
+        try:
+            await asyncio.wait_for(
+                _persist_one_message(
+                    _session.postgres_conn,
+                    _thread_id,
+                    msg,
+                    _session.turn_count + 1,
+                ),
+                timeout=5.0,
+            )
+        except Exception as e:
+            # Same non-fatal contract as _loop_persist_message: a failed
+            # write must not reject the input; the loop's upsert recovers
+            # it for any turn that starts.
+            logger.warning(f"Accept-time user message persist failed: {e}")
+    await _loop_user_queue.put({"content": content, "id": msg.id})
+    return msg.id
+
+
 async def handle_api_input(request: Request) -> JSONResponse:
     """Push user input onto the loop's queue. Body: {content, turn_id?}."""
     if _session is None or _loop_user_queue is None:
@@ -1856,13 +1915,13 @@ async def handle_api_input(request: Request) -> JSONResponse:
         )
     if not _ensure_persistent_loop_started("rest_input"):
         return JSONResponse({"error": "Session not ready"}, status_code=503)
-    _loop_last_user_content[0] = content
-    await _loop_user_queue.put(content)
+    message_id = await _accept_user_input(content)
     return JSONResponse(
         {
             "accepted": True,
             "turn_id": _session.turn_count,
             "queue_depth": _loop_user_queue.qsize(),
+            "message_id": message_id,
         }
     )
 
@@ -2040,8 +2099,7 @@ async def handle_persistent_websocket(ws: WebSocket) -> None:
             if method == "message":
                 content = data.get("content", "")
                 if content and _loop_user_queue is not None:
-                    _loop_last_user_content[0] = content
-                    await _loop_user_queue.put(content)
+                    await _accept_user_input(content)
 
             elif method == "approve":
                 # Phase 3: resolve the most-recent-pending permission
@@ -2355,10 +2413,20 @@ async def _run_subscriber_pump(
     One pump task per connected WebSocket. Cancelled by the ws_chat finally
     block when the WS closes; the queue is then garbage-collected after
     _unsubscribe removes the dict entry.
+
+    When the queue is idle, sends a ``ws.ping`` frame every
+    ``_WS_PING_INTERVAL_S`` — sent directly (never journaled to
+    thread_events) so the cockpit's control-WS watchdog can distinguish a
+    quiet-but-alive socket from a half-open one that an edge/tunnel idle
+    timeout silently killed (session_silent_failure_audit.md #9). The send
+    also makes the pump itself notice a dead socket within one interval.
     """
     try:
         while True:
-            frame = await queue.get()
+            try:
+                frame = await asyncio.wait_for(queue.get(), timeout=_WS_PING_INTERVAL_S)
+            except asyncio.TimeoutError:
+                frame = {"method": "ws.ping", "params": {}}
             try:
                 await ws.send_json(frame)
             except Exception:
@@ -2803,6 +2871,18 @@ async def _loop_permission_check(
     approved = final_status == "approved"
     if _session is not None:
         _session.tool_decisions[tool_call_id] = final_status
+    # Journal the outcome too: SSE replay-from-cursor re-delivers the
+    # permission.request frame, and without a matching resolution event a
+    # reloading client resurrects an already-decided approval card — whose
+    # re-click then 409s (session_silent_failure_audit.md #10).
+    _broadcast(
+        "permission.resolved",
+        {
+            "id": tool_call_id,
+            "approval_id": request_id,
+            "decision": final_status,
+        },
+    )
     return approved
 
 
@@ -2873,24 +2953,11 @@ async def _loop_on_turn_start(turn_id: int) -> None:
         ):
             _broadcast("workspace_sync.pulled", {"turn_id": turn_id})
 
-    # Save user message straight to the DB (bounded await — no messages lost on
-    # crash). Direct write via the agent's own pool; the orchestrator REST hop is
-    # bypassed (see docs/issues/persistent_session_midturn_message_loss.md).
-    if _session.postgres_conn and _loop_last_user_content[0]:
-        try:
-            await asyncio.wait_for(
-                _save_message(
-                    _session.postgres_conn,
-                    _thread_id,
-                    "user",
-                    _loop_last_user_content[0],
-                    None,
-                    turn_id,
-                ),
-                timeout=5.0,
-            )
-        except asyncio.TimeoutError:
-            logger.warning("User message save timed out (5s) — proceeding")
+    # User-message persistence moved to accept time (_accept_user_input) plus
+    # the loop's per-append upsert (persist_message). The content-based save
+    # that lived here read the *most recent* content global for every queued
+    # turn, so multiple queued inputs all persisted the last message's text
+    # (session_silent_failure_audit.md #1).
 
 
 async def _loop_on_turn_complete(turn_id: int, metrics: Optional[dict] = None) -> None:
@@ -2937,6 +3004,48 @@ async def _loop_on_turn_complete(turn_id: int, metrics: Optional[dict] = None) -
             _broadcast("workspace_sync.pushed", {"turn_id": turn_id})
 
 
+def _loop_archive_llm_call(prepared: Any, response: Any, metrics: dict) -> None:
+    """Audit one main-LLM call to the llm_requests trail, in the background.
+
+    Sessions previously wrote no llm_requests at all — job agents were
+    auditable, session hangs were not (session_silent_failure_audit.md #14).
+    The Mongo insert is synchronous, so it runs in a thread; failures are
+    non-fatal by audit-trail contract.
+    """
+    if _session is None or _thread_id is None:
+        return
+    thread_id = _thread_id
+    turn = _session.turn_count
+    model = metrics.get("model") or getattr(
+        getattr(_session.config, "llm", None), "model", "unknown"
+    )
+
+    def _do() -> None:
+        try:
+            from src.core.archiver import archive_llm_request
+
+            archive_llm_request(
+                job_id=thread_id,
+                agent_type="persistent",
+                messages=prepared,
+                response=response,
+                model=model,
+                latency_ms=metrics.get("latency_ms"),
+                iteration=turn,
+                call_type="main",
+                metadata={
+                    "thread_id": thread_id,
+                    "turn": turn,
+                    "input_tokens": metrics.get("input_tokens"),
+                    "output_tokens": metrics.get("output_tokens"),
+                },
+            )
+        except Exception as e:
+            logger.debug(f"llm_requests archive failed (non-fatal): {e}")
+
+    asyncio.create_task(asyncio.to_thread(_do), name="archive-llm-call")
+
+
 async def _loop_persist_message(msg: Any) -> None:
     """Persist a single message the instant the loop produces it (incremental
     durability — closes Symptom 1).
@@ -2969,8 +3078,44 @@ async def _loop_persist_message(msg: Any) -> None:
         logger.warning(f"Incremental message save failed (non-fatal): {e}")
 
 
-async def _loop_on_error(message: str) -> None:
-    _broadcast("error", {"message": message})
+async def _loop_on_error(message: str, turn_id: Optional[int] = None) -> None:
+    """Surface a turn-killing error: broadcast live AND persist it.
+
+    Previously this was a single transient ``error`` frame — the cockpit
+    flashed a banner that the immediately-following ``ready`` frame state
+    obscured, the still-open turn kept spinning, and a reload showed nothing
+    (session_silent_failure_audit.md #2). Now:
+      - ``error`` frame: legacy transient banner (kept for old clients)
+      - ``turn.error`` frame: cockpit closes the open turn + renders a
+        durable error bubble
+      - ``role='error'`` row: the bubble survives reload. Excluded from the
+        agent's own history restore (postgres_db.get_thread_messages) so it
+        never enters the LLM context.
+    """
+    payload: Dict[str, Any] = {"message": message}
+    if turn_id is not None:
+        payload["turn_id"] = turn_id
+    _broadcast("error", payload)
+    _broadcast("turn.error", payload)
+    if (
+        _session is not None
+        and _session.postgres_conn is not None
+        and _thread_id is not None
+    ):
+        try:
+            await asyncio.wait_for(
+                _session.postgres_conn.save_thread_message(
+                    thread_id=_thread_id,
+                    role="error",
+                    content=message,
+                    turn_number=(
+                        turn_id if turn_id is not None else _session.turn_count
+                    ),
+                ),
+                timeout=5.0,
+            )
+        except Exception as e:
+            logger.warning(f"Turn-error persist failed (non-fatal): {e}")
 
 
 async def _loop_on_vm_upgrade_needed(freeze_data: Dict[str, Any]) -> None:

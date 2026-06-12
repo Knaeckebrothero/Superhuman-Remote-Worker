@@ -83,6 +83,15 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="delete each question's memory rows after scoring (keeps the "
         "eval DB small; the row keeps the ranking either way)",
     )
+    parser.add_argument(
+        "--requery-from",
+        default=None,
+        help="existing run dir whose ingested corpora to re-query (the "
+        "ingest run must NOT have used --cleanup). Skips ingestion "
+        "entirely; scope run_id comes from that run's run_meta.json, so "
+        "question-time-only arms (scorers, budgets, injection policies) "
+        "are measured against the identical stored memories in minutes",
+    )
     return parser.parse_args(argv)
 
 
@@ -133,6 +142,13 @@ async def run_arm(args: argparse.Namespace) -> dict:
     )
     out_dir.mkdir(parents=True, exist_ok=True)
     run_id = args.run_id or out_dir.name
+    if args.requery_from:
+        source_meta = json.loads(
+            (Path(args.requery_from) / "run_meta.json").read_text(encoding="utf-8")
+        )
+        # Scope uuids derive from the INGEST run's id — that's what makes
+        # the stored corpora addressable from this run.
+        run_id = source_meta["run_id"]
     results_path = out_dir / "results.jsonl"
     _setup_logging(out_dir)
 
@@ -163,9 +179,25 @@ async def run_arm(args: argparse.Namespace) -> dict:
     embedding = await infra.require_embedding_service()
     aux_llm = None
     extraction_prompt = ""
-    if arm.ingestion.mode == "seam":
+    if args.requery_from:
+        # Read path only: writers never fire (no capture events), so the
+        # manager binds without them and no extraction transport is built.
+        config.memory.pipeline.writers = []
+    elif arm.ingestion.mode == "seam":
         aux_llm = infra.build_auxiliary_llm(config)
-        extraction_prompt = infra.resolve_extraction_prompt(config)
+        if arm.extraction_prompt_file:
+            extraction_prompt = Path(arm.extraction_prompt_file).read_text(
+                encoding="utf-8"
+            )
+            if not extraction_prompt.strip():
+                raise SystemExit(
+                    f"extraction_prompt_file {arm.extraction_prompt_file} is empty"
+                )
+            logger.info(
+                "Arm extraction prompt override: %s", arm.extraction_prompt_file
+            )
+        else:
+            extraction_prompt = infra.resolve_extraction_prompt(config)
 
     handles = HarnessHandles(
         config=config,
@@ -175,6 +207,24 @@ async def run_arm(args: argparse.Namespace) -> dict:
         aux_llm=aux_llm,
         extraction_prompt=extraction_prompt,
     )
+
+    if args.requery_from:
+        projects = [infra.project_uuid(run_id, q.question_id) for q in questions]
+        existing = await db.fetchval(
+            "SELECT count(*) FROM memories WHERE project_id = ANY($1::uuid[])",
+            projects,
+        )
+        if not existing:
+            raise SystemExit(
+                f"--requery-from {args.requery_from}: no memory rows under "
+                f"run_id {run_id!r} — was the ingest run made with --cleanup?"
+            )
+        logger.info(
+            "Re-query mode: %d stored memories across %d question scopes (source: %s)",
+            existing,
+            len(projects),
+            args.requery_from,
+        )
 
     (out_dir / "run_meta.json").write_text(
         json.dumps(
@@ -198,13 +248,25 @@ async def run_arm(args: argparse.Namespace) -> dict:
     async def _one(question) -> None:
         async with semaphore:
             try:
-                ingest = await ingest_question(question, arm, handles)
-                row = await answer_retrieval(question, arm, handles)
-                row["ingest"] = dataclasses.asdict(ingest)
-                if args.cleanup:
-                    await _cleanup_question(
-                        db, infra.project_uuid(run_id, question.question_id)
-                    )
+                if args.requery_from:
+                    row = await answer_retrieval(question, arm, handles)
+                    row["ingest"] = {"requeried_from": args.requery_from}
+                    if (
+                        not question.is_abstention
+                        and not row["cost"]["candidates_total"]
+                    ):
+                        logger.error(
+                            "%s: re-query found 0 candidates — empty scope?",
+                            question.question_id,
+                        )
+                else:
+                    ingest = await ingest_question(question, arm, handles)
+                    row = await answer_retrieval(question, arm, handles)
+                    row["ingest"] = dataclasses.asdict(ingest)
+                    if args.cleanup:
+                        await _cleanup_question(
+                            db, infra.project_uuid(run_id, question.question_id)
+                        )
             except Exception:
                 logger.exception("Question %s failed", question.question_id)
                 return
