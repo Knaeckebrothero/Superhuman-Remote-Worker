@@ -553,6 +553,52 @@ describe('PersistentChatService — connect()', () => {
         expect(tool.resultStatus).toBe('ok');
         const thought = assistant.events[0] as any;
         expect(thought.content).toBe('I should read the file first.');
+        // Keyed by the AI row id so a replayed reasoning frame for the same
+        // message dedupes against this rendered bubble.
+        expect(thought.messageId).toBe('a1');
+    });
+
+    it('dedupes a replayed thinking frame against the rendered history bubble', async () => {
+        // docs/issues/persistent_chat_reasoning_after_answer_and_replay_duplication.md
+        // After a cold connect paints the completed turn, the SSE replay cursor
+        // can re-emit the trailing reasoning frame (gemma journals it after the
+        // token run). It must not spawn a second `recovered:` thought bubble.
+        const {service, mockHttp, sseInstances} = createService();
+        mockHttp.get.mockImplementation((url: string) => {
+            if (url.endsWith('/messages')) {
+                return of({
+                    messages: [
+                        {
+                            id: 'a1',
+                            role: 'ai',
+                            content: 'The answer is 42.',
+                            tool_calls: null,
+                            turn_number: 1,
+                            thinking: 'Let me reason about this.',
+                            created_at: '2026-05-15T08:00:01Z',
+                        },
+                    ],
+                    total: 1,
+                });
+            }
+            return of({status: 'active', total_turns: 1});
+        });
+
+        await service.connect('thread-replay');
+        fireSseOpen(sseInstances[0]);
+
+        // Replay re-emits just the reasoning frame, keyed to the same row id.
+        fireSseMessage(
+            sseInstances[0],
+            {method: 'thinking', params: {content: 'Let me reason about this.', message_id: 'a1'}},
+            '1:1',
+        );
+
+        const assistantTurns = service.turns().filter(isAssistantTurn) as AssistantTurn[];
+        expect(assistantTurns).toHaveLength(1);
+        expect(assistantTurns[0].recovered).not.toBe(true);
+        const thoughts = assistantTurns[0].events.filter((e) => e.kind === 'thought');
+        expect(thoughts).toHaveLength(1);
     });
 
     it('passes the cached cursor as ?last_event_id=<epoch>:<seq> on initial open', async () => {

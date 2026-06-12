@@ -13,6 +13,26 @@ related:
 
 # Reasoning renders after the answer (gemma-style models) and duplicates on replay
 
+**Status:** ✅ Implemented 2026-06-13 (all three fixes). Awaiting the live
+gemma-session verification below.
+- (1) **Dedup** — reasoning frames now carry the AI message id. Agent
+  pre-allocates `ai_msg_id` before the stream and pins the row id to it for
+  Chat-Completions reasoning models (`persistent_graph.py`); the transport
+  coerces it to the row's uuid5 before broadcast (`persistent_app.py
+  _loop_on_thinking`); the cockpit stamps `messageId` in `historyToTurns` and
+  the reducer drops a `thinking` frame whose message already rendered in
+  another turn (`turn-reducer.ts appendThought`). Responses/Anthropic thinking
+  blocks keep their provider id and stay unkeyed (no round-trip risk).
+- (2) **Ordering** — the SSE tap (`reasoning_chat.py`) gains a request-scoped
+  `_STREAM_REASONING_SINK` contextvar; the graph routes live reasoning deltas
+  through it (before the answer tokens) and demotes the post-stream send to a
+  guarded fallback (`reasoning_streamed`). Degrades to legacy behavior if the
+  sink never fires.
+- (3) Stale `connect()` comment corrected.
+- Tests: `turn-reducer.spec.ts` (+7), `persistent-chat.service.spec.ts` (+2),
+  `test_persistent_graph.py::TestExecuteTurnReasoning` (+3). Full cockpit (519)
+  + Python persistent suites green.
+
 **Filed:** 2026-06-12, from user observation on k3d thread `e9699503`
 (gemma-4-moe-strix). Diagnosed same day with full DB receipts; sibling of
 the duplicate-compaction-banner bug fixed earlier that day (same
