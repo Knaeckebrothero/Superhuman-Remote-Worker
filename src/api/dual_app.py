@@ -1062,6 +1062,7 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
                 "ready": pa._session_ready(),
                 "thread_id": pa._thread_id,
                 "state": "session",
+                "turn_in_flight": pa._turn_in_flight(),
             }
         )
 

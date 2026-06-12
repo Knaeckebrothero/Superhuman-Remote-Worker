@@ -1276,6 +1276,44 @@ class MemoryPipelineConfig:
 
 
 @dataclass
+class RerankerConfig:
+    """memory.reranker — options for the 'reranker' scorer (overhaul Phase 3).
+
+    Only consulted when ``reranker`` appears in ``memory.pipeline.scorers``.
+    ``base_url``/``api_key`` default to the auxiliary endpoint at bind time
+    (the same router serves the ``/rerank`` route), so production needs no
+    extra credential plumbing — the reranker rides the auxiliary key the
+    orchestrator injects at dispatch.
+    """
+
+    model: str = "qwen3-reranker-8b"
+    base_url: Optional[str] = None  # null = auxiliary.base_url
+    api_key: Optional[str] = None  # null = auxiliary.api_key
+    top_k: int = 64  # rerank at most this many candidates per assemble
+    timeout: float = 10.0  # seconds per rerank call
+    # Keep TTL-pinned items (the recency working set) ahead of the
+    # reranked tail — Phase 3's bounded-core policy revisits pinning
+    # itself; the scorer doesn't change tier semantics.
+    keep_pinned_first: bool = True
+
+
+@dataclass
+class BoundedConfig:
+    """memory.bounded — options for the 'bounded' injection policy.
+
+    Only consulted when ``bounded`` appears in ``memory.pipeline.policies``.
+    Caps the memory-kind items of the assembled payload AFTER scorers run.
+    ``memory.budget_tokens`` trims inside the retriever — in legacy hybrid
+    order, before a reranker can surface the evidence — so post-scorer
+    bounding has to live in the policy stage. At least one cap must be set
+    for the policy to bind.
+    """
+
+    max_items: Optional[int] = None  # keep at most N memory items
+    max_tokens: Optional[int] = None  # keep memory items within this budget
+
+
+@dataclass
 class MemoryConfig:
     """Memory Light (RecallStore) configuration.
 
@@ -1299,6 +1337,8 @@ class MemoryConfig:
     # their legacy direct-store paths and the manager is never constructed.
     manager_enabled: bool = False
     pipeline: MemoryPipelineConfig = field(default_factory=MemoryPipelineConfig)
+    reranker: RerankerConfig = field(default_factory=RerankerConfig)
+    bounded: BoundedConfig = field(default_factory=BoundedConfig)
 
 
 @dataclass
@@ -1500,6 +1540,28 @@ def _parse_memory_config(data: Dict[str, Any]) -> MemoryConfig:
         writers=list(pipeline_data.get("writers", []) or []),
         extensions=list(pipeline_data.get("extensions", []) or []),
     )
+    reranker_data = data.get("reranker", {}) or {}
+    reranker = RerankerConfig(
+        model=reranker_data.get("model", "qwen3-reranker-8b"),
+        base_url=reranker_data.get("base_url"),
+        api_key=reranker_data.get("api_key"),
+        top_k=int(reranker_data.get("top_k", 64)),
+        timeout=float(reranker_data.get("timeout", 10.0)),
+        keep_pinned_first=bool(reranker_data.get("keep_pinned_first", True)),
+    )
+    bounded_data = data.get("bounded", {}) or {}
+    bounded = BoundedConfig(
+        max_items=(
+            int(bounded_data["max_items"])
+            if bounded_data.get("max_items") is not None
+            else None
+        ),
+        max_tokens=(
+            int(bounded_data["max_tokens"])
+            if bounded_data.get("max_tokens") is not None
+            else None
+        ),
+    )
     return MemoryConfig(
         enabled=data.get("enabled", False),
         budget_tokens=data.get("budget_tokens", 10000),
@@ -1521,6 +1583,8 @@ def _parse_memory_config(data: Dict[str, Any]) -> MemoryConfig:
             manager_data.get("enabled", data.get("manager_enabled", False))
         ),
         pipeline=pipeline,
+        reranker=reranker,
+        bounded=bounded,
     )
 
 

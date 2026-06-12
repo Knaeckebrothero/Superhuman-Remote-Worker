@@ -838,10 +838,18 @@ class AgentProvisioner:
             return set()
 
     async def scale_down_idle(self, max_terminate: int = 2) -> int:
-        """Terminate excess idle agent pods above MIN_AGENTS floor.
+        """Terminate excess idle agent pods above the MIN_AGENTS floor
+        while leaving AGENT_BUFFER idle pods alone.
 
         Runs each reconciler cycle but only removes up to *max_terminate* pods
         per invocation for gradual scale-down (avoids thundering herd).
+
+        Must mirror ensure_warm_pool()'s targets: that loop keeps
+        AGENT_BUFFER idle pods around; terminating idle pods on the
+        active-vs-min count alone made the two loops fight — warm pool
+        created one pod every cycle, scale-down deleted it the next
+        (one pod/minute churn for hours on dev,
+        docs/issues/session_silent_failure_audit.md #12).
 
         Returns:
             Number of pods terminated.
@@ -877,8 +885,14 @@ class AgentProvisioner:
         if not idle_rows:
             return 0
 
-        excess = active - self._min_agents
-        to_terminate = min(excess, len(idle_rows), max_terminate)
+        excess_active = active - self._min_agents
+        # Idle pods up to the buffer are warm-pool inventory, not excess —
+        # ensure_warm_pool would immediately recreate them.
+        idle_count = await self._count_idle_agents()
+        excess_idle = idle_count - self._agent_buffer
+        to_terminate = min(excess_active, excess_idle, len(idle_rows), max_terminate)
+        if to_terminate <= 0:
+            return 0
         terminated = 0
 
         for row in idle_rows[:to_terminate]:

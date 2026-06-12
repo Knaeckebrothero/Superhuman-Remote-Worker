@@ -614,6 +614,22 @@ export class SessionsPageComponent implements OnInit {
             );
             this.loadThreads();
         } catch (e: any) {
+            // Mid-turn guard (session_silent_failure_audit.md #11): a
+            // cleanup sweep used to tear down live sessions silently.
+            if (e?.status === 409) {
+                if (!confirm(this.transloco.translate('sessions.confirmForceDelete'))) return;
+                try {
+                    await firstValueFrom(
+                        this.http.delete(
+                            `${environment.apiUrl}/persistent/threads/${thread.id}?permanent=true&force=true`
+                        )
+                    );
+                    this.loadThreads();
+                } catch (e2: any) {
+                    this.toast.danger(this.errors.translate(e2, 'errors.sessions.deleteFailed'));
+                }
+                return;
+            }
             this.toast.danger(this.errors.translate(e, 'errors.sessions.deleteFailed'));
         }
     }

@@ -52,7 +52,7 @@ async def test_history_excludes_summary_marker_rows():
     db.fetch = AsyncMock(return_value=[])
     await db.get_thread_messages_history("t1")
     sql = " ".join(db.fetch.call_args[0][0].split())
-    assert "role <> 'summary'" in sql
+    assert "role NOT IN ('summary', 'error')" in sql
 
 
 @pytest.mark.asyncio
@@ -66,7 +66,9 @@ async def test_history_supports_since_turn_for_checkpoint_resume():
     await db.get_thread_messages_history("t1", since_turn=5)
     sql = " ".join(db.fetch.call_args[0][0].split())
     assert "turn_number >" in sql, "since_turn must add a turn_number filter"
-    assert "role <> 'summary'" in sql, "since_turn must preserve summary exclusion"
+    assert "role NOT IN ('summary', 'error')" in sql, (
+        "since_turn must preserve summary exclusion"
+    )
     assert "ORDER BY turn_number ASC" in sql, "ordering must be preserved"
     # The boundary value is bound as a parameter, not interpolated.
     args = db.fetch.call_args[0]
@@ -150,7 +152,7 @@ async def test_history_seq_gt_filters_and_orders_by_seq():
     sql = " ".join(db.fetch.call_args[0][0].split())
     assert "seq >" in sql, "seq_gt must add a seq filter"
     assert "ORDER BY seq ASC" in sql, "seq cursor must order by seq, not turn"
-    assert "role <> 'summary'" in sql, "summary exclusion preserved"
+    assert "role NOT IN ('summary', 'error')" in sql, "summary exclusion preserved"
     assert 42 in db.fetch.call_args[0][1:], "boundary seq must be a bound param"
 
 

@@ -11,5 +11,7 @@ curation writers); Phase 3+ adds the measured improvements (reranker,
 gate, bounded core). See docs/features/agent_memory_overhaul.md §5.
 """
 
+from . import bounded  # noqa: F401  (import-time registration)
 from . import legacy  # noqa: F401  (import-time registration)
 from . import legacy_writers  # noqa: F401  (import-time registration)
+from . import reranker  # noqa: F401  (import-time registration)

@@ -371,6 +371,118 @@ below in new order). Every bug worth fixing *before* the seam is fixed
   reader = gemma-4-moe, single seed, one transient 3s aux outage during
   ingestion (~3 sessions' extractions lost, stored counts unaffected
   in-family).
+- **2026-06-12 — Phase 3 started: slices 1–2 built (prompt variant +
+  reranker plugin + requery harness mode); first ingest run pending
+  infra.** Slice 1: `memory_extraction_prompt_complete.txt` committed —
+  user preferences/possessions/episodic events/quantities as first-class
+  extraction targets ("Events that happened" with counts/dates verbatim,
+  supersede-aware phrasing), "completeness over precision" replacing the
+  old prompt's "2 strong memories beat 6 weak ones"; the old prompt's
+  framing was purely engineering-task-oriented, which is root causes
+  (2)+(3) from the Phase-2 fact-level diagnostic verbatim. Harness gained
+  `extraction_prompt_file` (arm-level prompt override) and
+  **`--requery-from`** (ingest once without `--cleanup`, then measure any
+  question-time arm — scorer/budget/policy — against the identical stored
+  corpora in minutes; scope run_id inherited from the source run's
+  run_meta.json, writers stripped in requery mode). Slice 2 (code
+  complete): `RerankerConfig` (`memory.reranker`: model/base_url/api_key/
+  top_k/timeout/keep_pinned_first; transport defaults to the auxiliary
+  endpoint so dispatch needs no new credential plumbing) +
+  `plugins/reranker.py` `RerankerScorer` (Cohere-shaped `/rerank`;
+  memory-kind only, TTL-pinned head preserved, top-k cap, fully-valid-
+  response-or-raise → manager containment, channel_scores["rerank"]
+  recorded) + registry import + 8 unit tests; full suite 6049 green.
+  Arm YAMLs staged: `persistent_complete` (slice 1) and `complete_rerank`
+  (slice 2, requery mode). **Measurement status:** the first slice-1
+  ingest aborted twice on infra — (a) the router's qwen3-reranker-8b
+  initially returned near-noise scores (2/4 on a trivial battery,
+  order-independent — the Qwen3-Reranker instruction template wasn't
+  applied server-side; **fixed by the operator 2026-06-12**), (b) both
+  gemma routes went down mid-ingest (router API-key rotation; ~1285
+  outage-contaminated rows wiped, results cleared for a clean restart).
+  Early signal from the one pre-outage completed question: the
+  completeness prompt stored **229 memories vs 132** with the old prompt
+  (+73 % extraction volume). **Next (post-compact runbook):**
+  re-extract creds (catalog recipe; router key rotated) → verify reranker
+  battery now discriminates → relaunch slice-1 ingest (no `--cleanup`,
+  limit 20 seed 0) → slice-1 A/B + judge vs `seam_s20` → slice-2 rerank
+  requery (`--requery-from runs/seam_complete_s20`) → bounded-injection
+  requery sweep (slice 3) → doc the keep/cut deltas.
+- **2026-06-12 (evening) — Phase 3 slices 1–3 MEASURED; retrieval solved
+  on the seam, end-task bottleneck rotated to reader + supersede.** Infra
+  first: new router key verified, reranker battery post-template-fix
+  **4/4** (was 2/4) with the expected near-binary spread (relevant doc
+  0.24–1.0, distractors 0.000); a 240-doc probe call returns in 4.3 s and
+  pulls a planted answer from position 137 to rank 1 at 0.997. The full
+  measured wave (N=20 stratified, same seed-0 prefix as `seam_s20`;
+  reader gemma-4-moe, judge llama-3.3-70b-versatile):
+
+  | arm (runs/) | R@5 | NDCG@5 | first-hit | tok/turn | end-task |
+  |---|---|---|---|---|---|
+  | `seam_s20` baseline (old prompt, full dump) | 0.20 | 0.121 | 14.1 | 6 806 | 0.30 |
+  | `seam_complete_s20` slice 1 (full dump) | 0.20 | 0.094 | 16.5 | 8 923 | **0.45** |
+  | `complete_control_s20` requery control | 0.10 | 0.063 | 16.0 | 8 926 | — |
+  | `complete_rerank_s20` slice 2 (full dump) | **0.95** | 0.928 | 1.35 | 8 925 | 0.40 |
+  | `complete_rerank_b10_s20` slices 1+2+3 | **1.00** | 0.986 | 1.00 | **312** | 0.35\* |
+  | `complete_rerank_b25_s20` | 1.00 | 0.986 | 1.00 | 888 | 0.35 |
+  | `complete_bounded10_s20` bounded w/o reranker | 0.20 | 0.084 | 4.8 | 428 | **0.05** |
+
+  **Slice 1 (completeness prompt)**: extraction volume ~doubles (122→236
+  avg memories/question); fact-level A/B on the Phase-2 diagnostic
+  questions confirms the targeted transformation — episodic events now
+  extracted with dates/quantities ("assembled an IKEA bookshelf ~two
+  months ago", "bought a 15-lb bag … for $45"; 9→18 event-like memories
+  on the aggregation question), the rice preference now a clean
+  attributed user fact instead of denatured-in-procedure. Session-level
+  retrieval flat (expected — double the competition, same ranking), but
+  **end-task 0.30→0.45** and over-abstention 13/19→9/19: the reader
+  commits when the facts exist. By type: ss-user 0.33→1.0, multi-session
+  0→0.25, temporal 0.33→0.67; **knowledge-update 0.5→0.25** (more volume
+  = more stale/current coexistence — Phase 4's case sharpened).
+  **Slice 2 (reranker)**: **R@5 0.10→0.95 against the same corpora**
+  (requery control vs rerank arm at identical snapshot state) — ordering
+  was the remaining retrieval problem and a cross-encoder solves it
+  outright. End-task on the full dump however 0.45→0.40 with
+  knowledge-update → 0: pure-relevance ordering ranks the stale fact
+  next to the current one (the legacy RRF order at least had a recency
+  channel). Ordering alone doesn't help a reader that sees everything
+  anyway. **Slice 3 (bounded policy — `plugins/bounded.py`, NEW)**:
+  post-scorer cap (`memory.bounded.max_items`/`max_tokens`,
+  `pipeline.policies: [bounded]`; 10 unit tests). Placement is the
+  point: `memory.budget_tokens` trims **inside the retriever in legacy
+  hybrid order** — bounding before the scorer would cut the evidence the
+  reranker exists to surface, so the cap must live in the policy stage.
+  Result: **R@5 1.0 at 312 tokens/turn (29× cheaper than the dump)**;
+  end-task 0.35 vs 0.45, and the two lost questions decompose to **one
+  genuine knowledge-update fact-binding miss** (both facts in top-10;
+  stale "27 in my local park" phrasing-matches the question, updated
+  "32" lost its park-binding at extraction — reader picks stale) **and
+  one judge gray-zone flip** (near-identical preference answers judged
+  differently) — i.e. parity within noise at 4 % of the tokens, with
+  over-abstention down again (6/19). The no-reranker bounded control
+  craters to **0.05**: bounding is only safe once ordering is solved,
+  now measured. **Architectural finding (feeds Phases 4–5):** ~95 % of
+  every seam corpus is TTL-pinned — cross-session memories freeze
+  pinned once their job scope stops ticking (`decrement_ttl` only
+  touches the current scope), so the two-tier read path degenerates to
+  dump-the-store; Phase 2's "injection IS the store" was the pinned
+  tier, not search. `keep_pinned_first: false` (+ `top_k: 256`) is
+  therefore required for the reranker to act on these corpora.
+  **Protocol notes:** requery arms mutate corpus state (per-assemble
+  TTL decrement + retrieve-path re-pinning/access-bumps) → snapshot
+  `remaining_turns`/`access_count`/`last_accessed` once post-ingest and
+  restore between arms (side table `eval_ttl_snapshot_s20` in
+  `srw_eval`); the reranker's 10 s default timeout trips on cold/
+  contended full-store batches (17/20 contained passthroughs in one run
+  — detected via `AssembleStats.errors`, containment worked as designed;
+  arm override `timeout: 60`, concurrency 3 → 0 failures). **Slice-3
+  acceptance ("bounded ≥ full-injection at lower tokens"): met within
+  noise on end-task, exceeded on retrieval/cost; the systematic
+  remainder is knowledge-update, which is Phase 4's supersede by
+  construction. Slice 4 (gate threshold + request digest + unified
+  budget, B5) is the open Phase-3 item.** Next measurement: re-run the
+  contradiction probe over a completeness+rerank corpus as the Phase-4
+  opening baseline.
 **Companions:**
 - [`agent_memory_current_state.md`](agent_memory_current_state.md) — ground truth: every
   current capability classified wired/dead/conceptual with `file:line` evidence.
@@ -866,15 +978,28 @@ retrieval table); A/Bs two configs and emits deltas (✅ — flat vs persistent_
 −0.74 R@5 / −0.46..0.51 end-task); **baseline numbers for the current system
 recorded** (✅ — `runs/seam_s20`, N=20 stratified prefix, seed 0).
 
-### Phase 3 — First plugin wave (measured): reranker + gate + bounded core · ~1–1.5 wk
-`reranker_service` (bge-reranker-v2-m3, CPU in-cluster) as a Scorer; ensemble gate
-threshold; always-inject core policy replacing Tier-1 TTL-flooding; request-digest query
-on; unified token budget incl. KB (B5); `ef_search` measured-then-tuned (after B2 verdict
-on whether HNSW exists at all).
-**Acceptance (harness):** reranker arm lifts Recall@k and end-task; gating cuts injected
-tokens with no end-task regression; bounded core + gated slice ≥ full-injection quality at
-materially lower tokens/turn (baseline ceiling today: 10K-token memory budget + an
-uncapped KB block on **every** call).
+### Phase 3 — First plugin wave (measured): reranker + gate + bounded core · ~1–1.5 wk ← **slices 1–3 MEASURED 2026-06-12 (results table in the implementation log); slice 4 open**
+Slice order (re-prioritized by the Phase-2 decomposition — extraction bias and
+injection order are the measured root causes, not search):
+1. **Completeness-biased extraction prompt** ✅ measured — end-task 0.30→0.45, facts
+   verifiably present at fact granularity; knowledge-update degrades (more
+   stale/current coexistence → Phase 4).
+2. **Reranker as a Scorer** ✅ measured — R@5 0.10→0.95 same-corpus; needs
+   `keep_pinned_first: false` + `top_k` ≥ store size on multi-session corpora
+   (~95 % TTL-pinned) and a generous timeout for full-store batches.
+3. **Bounded injection** ✅ measured — `bounded` policy (post-scorer cap): R@5 1.0 at
+   312 tok/turn (29×); end-task parity-within-noise vs the full dump; without the
+   reranker it craters (0.05) — ordering is the prerequisite, now proven.
+4. Ensemble gate threshold; request-digest query on; unified token budget incl. KB
+   (B5); `ef_search` measured-then-tuned. Always-inject core policy demoted: Phase-2
+   showed TTL-pinning is NOT the dominant ordering failure at question time.
+**Acceptance (harness):** reranker arm lifts Recall@k (✅ — +0.85 R@5) and end-task
+(✗ on the full dump — reading order doesn't matter when everything is injected; the
+lift shows up via slice 3 instead); gating cuts injected tokens with no end-task
+regression (open — slice 4); bounded core + gated slice ≥ full-injection quality at
+materially lower tokens/turn (✅ within noise — 0.35 vs 0.45 where the gap = 1 genuine
+knowledge-update fact-binding miss + 1 judge gray-zone flip, at 4 % of the tokens;
+the systematic remainder is supersede = Phase 4 by construction).
 
 ### Phase 4 — Lifecycle writers: verdicts + bi-temporal supersede · ~1–1.5 wk
 Ingestion verdicts (ADD/UPDATE/MERGE/NOOP, aux-LLM, async); bi-temporal columns via

@@ -109,12 +109,26 @@ class SessionRouterService:
         # Service ends up with zero endpoints. Patching here is idempotent —
         # same value is a no-op, and a no-longer-bound thread can claim the
         # pod next by overwriting the label.
+        #
+        # Also stamp the short-form srw/thread-id (lifecycle reconciler
+        # selects on it) and flip srw/purpose to "session": a warm pool pod
+        # is provisioned as purpose=job, and serving a session under a job
+        # label breaks purpose-based selectors and dashboards
+        # (docs/issues/session_silent_failure_audit.md #16).
         try:
             await self._call(
                 self._core_api.patch_namespaced_pod,
                 name=pod_name,
                 namespace=self._namespace,
-                body={"metadata": {"labels": {"srw.io/thread-id": thread_id}}},
+                body={
+                    "metadata": {
+                        "labels": {
+                            "srw.io/thread-id": thread_id,
+                            "srw/thread-id": thread_id[:12],
+                            "srw/purpose": "session",
+                        }
+                    }
+                },
             )
         except Exception as e:
             if _is_k8s_status(e, 404):
