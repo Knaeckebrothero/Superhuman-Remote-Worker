@@ -181,10 +181,14 @@ data:
 
   # Virtual workspace tier (no_workspace_agent_mode.md §4/§5) — object store for
   # `workspace.backend: virtual` agents. Empty type disables the tier (a virtual
-  # job/session then fails fast). Credentials live in the bundled Secret key
-  # VIRTUAL_WORKSPACE_RCLONE_CONFIG, wired separately on the orchestrator pod.
+  # job/session then fails fast). For s3, endpoint/region/provider are non-secret
+  # (here); credentials are the Secret keys VIRTUAL_WORKSPACE_S3_ACCESS_KEY_ID /
+  # _SECRET_ACCESS_KEY, wired separately on the orchestrator pod.
   VIRTUAL_WORKSPACE_RCLONE_TYPE: {{ .Values.virtualWorkspace.rclone.type | default "" | quote }}
   VIRTUAL_WORKSPACE_RCLONE_ROOT: {{ .Values.virtualWorkspace.rclone.root | default "" | quote }}
+  VIRTUAL_WORKSPACE_S3_ENDPOINT: {{ .Values.virtualWorkspace.s3.endpoint | default "" | quote }}
+  VIRTUAL_WORKSPACE_S3_REGION: {{ .Values.virtualWorkspace.s3.region | default "us-east-1" | quote }}
+  VIRTUAL_WORKSPACE_S3_PROVIDER: {{ .Values.virtualWorkspace.s3.provider | default "Minio" | quote }}
   {{- if .Values.cloud.nextcloudRcloneUserHomeUsername }}
   NEXTCLOUD_RCLONE_USER_HOME_USERNAME: {{ .Values.cloud.nextcloudRcloneUserHomeUsername | quote }}
   {{- end }}

@@ -1151,24 +1151,28 @@ s3:
 #     lifetime, with NO MinIO dependency. Not durable — files vanish on pod
 #     restart; fine for smoke tests, never a real target.
 #   * production → type "s3" against the existing MinIO (e.g. minio.minio.svc),
-#     with credentials in the bundled Secret key VIRTUAL_WORKSPACE_RCLONE_CONFIG
-#     (secrets.values for chart-managed secrets, or ESO/Vault).
+#     with credentials in the bundled Secret keys VIRTUAL_WORKSPACE_S3_ACCESS_KEY_ID
+#     / VIRTUAL_WORKSPACE_S3_SECRET_ACCESS_KEY (secrets.values for chart-managed
+#     secrets, or ESO/Vault); endpoint/region/provider via virtualWorkspace.s3.*.
 #
 # Empty `rclone.type` disables the tier: a `virtual` job/session then fails fast
 # with an actionable error (use `none`, `sandbox`, or `vm` instead).
 virtualWorkspace:
   rclone:
-    # rclone backend type: "s3" | "webdav" | "memory" | "" (disabled).
+    # rclone backend type: "s3" | "memory" | "" (disabled). "memory" is a
+    # non-durable in-process dev store (no credentials, no MinIO).
     type: ""
     # Bucket or bucket/subpath, e.g. "srw-workspaces". Empty for type "memory".
     root: ""
-    # The rclone config (access_key_id, secret_access_key, endpoint, provider,
-    # region | url, user, pass, …) is a JSON object supplied via the bundled
-    # Secret key VIRTUAL_WORKSPACE_RCLONE_CONFIG — e.g. under secrets.values:
-    #   VIRTUAL_WORKSPACE_RCLONE_CONFIG: |
-    #     {"provider":"Minio","access_key_id":"…","secret_access_key":"…",
-    #      "endpoint":"http://minio.minio.svc:9000"}
-    # type "memory" needs no config.
+  # S3 connection (type: s3) — non-secret parts. The agent's scoped key is
+  # bucket-only; rclone is told not to create the (pre-provisioned) bucket.
+  # Credentials are the Secret keys VIRTUAL_WORKSPACE_S3_ACCESS_KEY_ID /
+  # VIRTUAL_WORKSPACE_S3_SECRET_ACCESS_KEY (secrets.values for chart-managed,
+  # or ESO/Vault). Mirrors the discrete snapshot S3 wiring (SNAPSHOT_S3_*).
+  s3:
+    endpoint: ""          # e.g. "http://minio.minio.svc:9000"
+    region: "us-east-1"
+    provider: "Minio"     # rclone S3 provider quirk-profile
 
 # =============================================================================
 # IDE Sessions

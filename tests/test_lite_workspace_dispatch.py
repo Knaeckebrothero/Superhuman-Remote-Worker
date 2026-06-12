@@ -64,39 +64,55 @@ class TestBackendFromOverride:
 # _virtual_workspace_rclone_spec
 # ---------------------------------------------------------------------------
 class TestVirtualWorkspaceRcloneSpec:
+    # s3 credentials/config now arrive as discrete env vars (mirroring the
+    # snapshot S3 wiring) rather than a single JSON blob.
+    S3_ENV = {
+        "VIRTUAL_WORKSPACE_S3_ACCESS_KEY_ID": "AKID",
+        "VIRTUAL_WORKSPACE_S3_SECRET_ACCESS_KEY": "SEKRET",
+        "VIRTUAL_WORKSPACE_S3_ENDPOINT": "http://minio.minio.svc:9000",
+        "VIRTUAL_WORKSPACE_S3_REGION": "eu-central-1",
+        "VIRTUAL_WORKSPACE_S3_PROVIDER": "Minio",
+    }
+
     def test_unset_type_returns_none(self, monkeypatch):
         monkeypatch.delenv("VIRTUAL_WORKSPACE_RCLONE_TYPE", raising=False)
         assert main._virtual_workspace_rclone_spec() is None
 
-    def test_set_builds_spec(self, monkeypatch):
+    def test_s3_builds_spec_from_discrete_env(self, monkeypatch):
         monkeypatch.setenv("VIRTUAL_WORKSPACE_RCLONE_TYPE", "s3")
-        monkeypatch.setenv("VIRTUAL_WORKSPACE_RCLONE_ROOT", "bucket-x")
-        monkeypatch.setenv("VIRTUAL_WORKSPACE_RCLONE_CONFIG", '{"access_key_id": "K"}')
-        assert main._virtual_workspace_rclone_spec() == {
-            "type": "s3",
-            "config": {"access_key_id": "K"},
-            "root": "bucket-x",
+        monkeypatch.setenv("VIRTUAL_WORKSPACE_RCLONE_ROOT", "srw-workspaces")
+        for key, value in self.S3_ENV.items():
+            monkeypatch.setenv(key, value)
+        spec = main._virtual_workspace_rclone_spec()
+        assert spec["type"] == "s3"
+        assert spec["root"] == "srw-workspaces"
+        # no_check_bucket is baked in (scoped key can't create the bucket).
+        assert spec["config"] == {
+            "provider": "Minio",
+            "access_key_id": "AKID",
+            "secret_access_key": "SEKRET",
+            "endpoint": "http://minio.minio.svc:9000",
+            "region": "eu-central-1",
+            "no_check_bucket": "true",
         }
 
-    def test_bad_json_config_falls_back_to_empty(self, monkeypatch):
+    def test_s3_defaults_provider_and_region(self, monkeypatch):
         monkeypatch.setenv("VIRTUAL_WORKSPACE_RCLONE_TYPE", "s3")
-        monkeypatch.setenv("VIRTUAL_WORKSPACE_RCLONE_CONFIG", "not json")
-        monkeypatch.delenv("VIRTUAL_WORKSPACE_RCLONE_ROOT", raising=False)
-        assert main._virtual_workspace_rclone_spec() == {
-            "type": "s3",
-            "config": {},
-            "root": "",
-        }
-
-    def test_non_object_json_config_ignored(self, monkeypatch):
-        monkeypatch.setenv("VIRTUAL_WORKSPACE_RCLONE_TYPE", "s3")
-        monkeypatch.setenv("VIRTUAL_WORKSPACE_RCLONE_CONFIG", '["a", "b"]')
-        assert main._virtual_workspace_rclone_spec()["config"] == {}
+        monkeypatch.setenv("VIRTUAL_WORKSPACE_S3_ACCESS_KEY_ID", "K")
+        monkeypatch.setenv("VIRTUAL_WORKSPACE_S3_SECRET_ACCESS_KEY", "S")
+        for key in ("VIRTUAL_WORKSPACE_S3_PROVIDER", "VIRTUAL_WORKSPACE_S3_REGION"):
+            monkeypatch.delenv(key, raising=False)
+        config = main._virtual_workspace_rclone_spec()["config"]
+        assert config["provider"] == "Minio"
+        assert config["region"] == "us-east-1"
+        assert config["no_check_bucket"] == "true"
 
     def test_memory_type_needs_no_config(self, monkeypatch):
         monkeypatch.setenv("VIRTUAL_WORKSPACE_RCLONE_TYPE", "memory")
-        monkeypatch.delenv("VIRTUAL_WORKSPACE_RCLONE_CONFIG", raising=False)
         monkeypatch.delenv("VIRTUAL_WORKSPACE_RCLONE_ROOT", raising=False)
+        # s3 creds are ignored for non-s3 types — config stays empty.
+        for key in self.S3_ENV:
+            monkeypatch.setenv(key, "leaked")
         assert main._virtual_workspace_rclone_spec() == {
             "type": "memory",
             "config": {},
@@ -134,7 +150,7 @@ class TestInjectLiteWorkspaceConfig:
 
     def test_virtual_builds_mount(self, monkeypatch):
         monkeypatch.setenv("VIRTUAL_WORKSPACE_RCLONE_TYPE", "memory")
-        monkeypatch.delenv("VIRTUAL_WORKSPACE_RCLONE_CONFIG", raising=False)
+        monkeypatch.delenv("VIRTUAL_WORKSPACE_S3_ACCESS_KEY_ID", raising=False)
         monkeypatch.delenv("VIRTUAL_WORKSPACE_RCLONE_ROOT", raising=False)
         co = main._inject_lite_workspace_config(
             {"workspace": {"backend": "virtual"}}, prefix="jobs/j7/"
@@ -239,7 +255,7 @@ class TestPayloadContractRoundtrip:
 
     def test_virtual_payload_builds_a_working_backend(self, monkeypatch):
         monkeypatch.setenv("VIRTUAL_WORKSPACE_RCLONE_TYPE", "memory")
-        monkeypatch.delenv("VIRTUAL_WORKSPACE_RCLONE_CONFIG", raising=False)
+        monkeypatch.delenv("VIRTUAL_WORKSPACE_S3_ACCESS_KEY_ID", raising=False)
         monkeypatch.delenv("VIRTUAL_WORKSPACE_RCLONE_ROOT", raising=False)
 
         co = main._inject_lite_workspace_config(
