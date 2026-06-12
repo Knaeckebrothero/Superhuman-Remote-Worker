@@ -114,6 +114,17 @@ async def answer_retrieval(
         "question_id": question.question_id,
         "question_type": question.question_type,
         "is_abstention": question.is_abstention,
+        "question": question.question,
+        "answer": question.answer,
+        "question_date": question.question_date,
+        # The rendered memory block(s) exactly as production would inject
+        # them — captured here because --cleanup deletes the rows, and the
+        # end-task reader/judge slice needs the context post-hoc.
+        "injected_context": "\n\n".join(
+            block.content
+            for block in payload.blocks
+            if block.kind == "memory" and block.content
+        ),
         "evidence": sorted(question.evidence_session_ids),
         "ranked_sessions": ranked[:MAX_RANKED_SESSIONS],
         "metrics": metrics,

@@ -38,9 +38,14 @@ findings), and `memory.manager.enabled` is **on** in both defaults files
 on dev** (passive — starts when the push rolls out; watch the seam failure
 surface, the flag stays the one-line rollback) → **step 4 delete the legacy
 blocks** (the "zero direct store calls" acceptance is the post-deletion
-state). **Phase 2 has started (2026-06-11): the eval harness skeleton is
-built and smoke-verified end-to-end** (`eval/memory/`, see its README) — it
-drives the seam offline and never touches what the soak exercises.
+state). **Phase 2 is essentially complete (2026-06-12): harness + judge +
+contradiction probe built, and all three acceptance gates closed with real
+LongMemEval_S runs** (`eval/memory/`, see its README). Headline: the
+current production pipeline (`persistent_current`) retrieves at
+**recall@5 0.20 / answers at 0.25–0.30**, vs **0.94 / 0.74–0.76** for
+trivial verbatim round storage of the same history (`flat_verbatim`) —
+the quantified case for Phases 3–5. The harness drives the seam offline
+and never touches what the soak exercises.
 Restructured 2026-06-10 around the MemoryManager abstraction after design
 alignment (v1 of 2026-06-07 was phase-first; superseded, phases preserved
 below in new order). Every bug worth fixing *before* the seam is fixed
@@ -283,6 +288,89 @@ below in new order). Every bug worth fixing *before* the seam is fixed
   Phase-2 slices: full **_S** runs (flat = published-baseline anchor,
   seam = current-system baseline numbers), end-task LLM-judge,
   contradiction-survival probe, recall-shape instrumentation.
+- **2026-06-12 — Phase 2 slices 2–4 shipped + ALL acceptance gates closed
+  (real LongMemEval_S runs, judge, calibration, contradiction probe).**
+  New modules: `eval/memory/judge.py` (reader over the captured
+  production-rendered injection block + the **verbatim LongMemEval
+  `evaluate_qa.py` judge prompts**; `--re-judge` swaps judges over fixed
+  hypotheses; `--calibrate` vs hand labels) and
+  `eval/memory/contradiction.py` + `fixtures/contradiction_probe.json`
+  (8 fact→supersede probes with known old/new values; retrieval-order +
+  current/stale/miss reader scoring, no judge LLM). 57 offline tests.
+  Run-relevant fixes found by the real data: result rows capture
+  `injected_context`/question/gold at answer time (post-`--cleanup`
+  judging); rare token-dense rounds exceed the embedding server's 8192
+  ctx (observed 8264 *qwen* tokens at 5816 cl100k — qwen ≈1.42×) →
+  `EMBED_TOKEN_CAP` 5000 cl100k; the paper's judge `max_tokens=10`
+  returns **empty content on reasoning models** → 2048 + post-`</think>`
+  verdict parse; `PrimedEmbedding` batch-primes verbatim ingestion.
+  Infra notes: catalog's only embedding endpoint (`-strix` = Strix Halo)
+  serializes ~0.8 unique texts/s — the plain router ids
+  (`qwen3-embedding-8b`, `gemma-4-moe`) are the L40S deployments, same
+  key, ~10×; flat N=100 ran in ~35 min after the switch.
+  **Gate 1 — published-baseline anchor ✅** (`flat_verbatim`, stratified
+  N=100 seed 0, R@1 0.63 / **R@5 0.940** / R@10 0.980 / **NDCG@5 0.773**
+  / coverage@5 0.891, first-hit 1.86): the paper publishes retrieval
+  tables only for **_M** (Tables 3/9/10; no _S rows exist), so the anchor
+  is placement + shape — ours sits above their _M round-K=V dense rows
+  (Stella R@5 0.66/N@5 0.50) in exactly the direction a 10× smaller
+  haystack + an 8B embedder + hybrid RRF predict, reproduces their
+  qualitative ordering (temporal-reasoning hardest: 0.812), sane k-curve,
+  nowhere degenerate-perfect.
+  **Gate 2 — A/B with deltas ✅ (the headline)**: `persistent_current`
+  (seam replay, gemma extraction, N=20 = exact prefix of the flat
+  subset): **R@5 0.200 (−0.740), NDCG@5 0.121, first-hit 14.1**; end-task
+  **0.25 (gemma judge) / 0.30 (llama-70B judge)** vs flat **0.76 / 0.74**.
+  Decomposition (from injected-set provenance): extraction is NOT the
+  session-level bottleneck (18/19 evidence sessions produced ≥1 memory)
+  and TTL-pinning is NOT dominant (top-5 injected items spread over the
+  haystack, only 14% from the last fifth); the evidence-derived memory
+  simply ranks ~13th median among **~122 injected items** (~56 tok each —
+  the whole store fits the 10k budget, injection IS the store), and the
+  reader then **over-abstains: 68% of answerable questions get "I don't
+  have that information"** with the answer in context; only 3/19 are
+  substantively wrong. **Fact-level diagnostic (3 flat-hit/seam-miss
+  questions re-run without cleanup, evidence-session memories read
+  against gold — `runs/seam_diag`): three distinct failure modes, one
+  each** — (1) *knowledge-update*: the answer fact survived extraction
+  verbatim ("two hours daily") but the stale value ("one hour") coexists
+  as an equal-standing memory (no supersede) and neither ranked top-5 of
+  110 → Phase 4's exact case; (2) *single-session-user*: the user's
+  favorite-rice **preference was never extracted as a user fact** — the
+  answer phrase survives only incidentally inside a procedural
+  onigiri-shaping memory (discriminating fact denatured); (3)
+  *multi-session count*: 11 evidence-session memories all capture decor
+  **preferences while systematically dropping the countable events**
+  (bought/assembled/sold/fixed) the question aggregates over. So
+  extraction bias (durable traits over episodic events / attributed
+  preferences) is a co-equal root cause with ranking and missing
+  supersede — and it's prompt-level, i.e. the cheapest possible harness
+  A/B.
+  **Gate 3 — current-system baseline recorded ✅** (the numbers above are
+  it). **Judge calibration**: 29-item stratified hand-labelled slice
+  (`eval/memory/data/judge_labels_flat_s100.json`) → **93.1% agreement
+  for BOTH judges, with the identical 2 disagreements** (both genuine
+  gray-zone: preference-rubric leniency, knowledge-update referent
+  ambiguity); judge-vs-judge agreement **98/100**. At n=29 each item is
+  3.4pp, so the residual is label-set size + item ambiguity, not judge
+  quality; `llama-3.3-70b-versatile` (same lineage as the paper's open
+  judge) is the recorded judge. >97% as a formal claim wants a ~100-item
+  label set (user pass).
+  **Contradiction probe (Phase-4 baseline)**: flat — update injected 8/8,
+  update-above-original 0.625, reader current 8/8; seam — **update
+  injected only 5/8, update-above-original 0.125, reader current 0.625 /
+  stale 0.125 / miss 0.25**. Phase 4's supersede has its target.
+  **Phase-3 implications, sharpened**: the big lever is not search
+  (hybrid finds verbatim rounds at rank 1.9) but what the writers store
+  and how injection orders it — (a) ranking/reranker over short
+  extracted facts, (b) bounded injection (122-item full-store dumps bury
+  the answer and trigger over-abstention), (c) extraction completeness
+  at fact granularity / dual-granularity storage (the paper's K=V+fact:
+  +9.4pp recall) as a first-class arm, (d) abstention-vs-recall trade
+  in the reader frame. Caveats recorded: seam n=20 (±~10pp end-task),
+  reader = gemma-4-moe, single seed, one transient 3s aux outage during
+  ingestion (~3 sessions' extractions lost, stored counts unaffected
+  in-family).
 **Companions:**
 - [`agent_memory_current_state.md`](agent_memory_current_state.md) — ground truth: every
   current capability classified wired/dead/conceptual with `file:line` evidence.
@@ -749,31 +837,34 @@ and deleting legacy before step 3 would destroy the flag's rollback path.
    suites' verbatim reproductions become the reference copy of the old behaviour
    and `tests/test_memory_cutover.py` keeps guarding the wiring.
 
-### Phase 2 — Eval harness against the seam + baseline · ~1–1.5 wk ← **IN PROGRESS (skeleton shipped + smoke-verified 2026-06-11; runs in parallel with the Phase-1 soak)**
-A standalone offline harness (`eval/memory/` — **built**, run recipes +
+### Phase 2 — Eval harness against the seam + baseline · ~1–1.5 wk ← **✅ COMPLETE 2026-06-12 (all acceptance gates closed with real _S runs; numbers in the implementation log)**
+A standalone offline harness (`eval/memory/` — run recipes +
 LongMemEval→seam mapping in [`eval/memory/README.md`](../../eval/memory/README.md))
 that drives **`MemoryManager.assemble()` directly** — the seam makes this
 dramatically simpler than v1's plan (no graph spin-up). Sessions are ingested
 **incrementally** (memories accrue through `capture()` as in production, not
 batch-loaded). Reports per config arm:
-- **Retrieval:** ✅ built — Recall@k / NDCG@k / coverage / first-hit vs answer-location
-  labels (LongMemEval_S first; a bespoke production-trace set second — no public
-  benchmark matches a project-scoped coding agent; avoid LoCoMo as primary, ~6.4%
-  wrong answer key).
-- **End-task:** ⬜ calibrated LLM-judge (>97% agreement target on a hand-labelled slice),
-  scored **separately** from retrieval — reading is its own bottleneck (Chain-of-Note /
-  answer-formatting swings QA up to +10 pt even at oracle recall, brief 05).
-- **Contradiction-survival probe:** ⬜ store fact → supersede → query: current or stale?
-- **Cost:** ✅ built — tokens injected + assemble latency per arm.
-- **Ablation switches:** ✅ built — arms deep-merge raw config overrides (the full
+- **Retrieval:** ✅ run — Recall@k / NDCG@k / coverage / first-hit vs answer-location
+  labels. Flat anchor R@5 0.940; current system R@5 0.200. (Bespoke
+  production-trace set still to come; avoid LoCoMo as primary, ~6.4% wrong key.)
+- **End-task:** ✅ run — LongMemEval's verbatim judge prompts, scored **separately**
+  from retrieval (flat 0.74–0.76 vs seam 0.25–0.30 — reading really is its own
+  bottleneck: 68% over-abstention with the answer in context). Calibration: 93.1%
+  on a 29-item hand-labelled slice, judge-vs-judge 98% — formal >97% claim wants a
+  ~100-item label pass.
+- **Contradiction-survival probe:** ✅ run — `contradiction.py` + committed 8-probe
+  fixture; seam baseline: update-above-original 0.125, reader stale 0.125/miss 0.25.
+- **Cost:** ✅ — tokens injected + assemble latency per arm (seam injects its whole
+  ~122-item store ≈ 6.8k tok; flat budget-trims to ~21 rounds ≈ 9.7k).
+- **Ablation switches:** ✅ — arms deep-merge raw config overrides (the full
   `memory.*` surface incl. pipeline lists) over any base YAML.
-Also: recall-shape instrumentation (single-hop vs multi-hop) starts accruing for the
-Phase-7 graph verdict (⬜).
-**Acceptance:** reproduces a published LongMemEval baseline within tolerance (⬜ —
-`flat_verbatim` on full _S vs the paper's round-granularity dense retrievers); A/Bs two
-configs and emits deltas (✅ mechanism — `report.py` comparison; smoke-verified on the
-fixture); **baseline numbers for the current system recorded** (⬜ —
-`persistent_current` on a stratified _S subset).
+Recall-shape: covered by the by-type slices (`multi-session` coverage@k is the
+multi-hop signal); finer per-hop breakdown only if the Phase-7 verdict needs it.
+**Acceptance:** reproduces a published LongMemEval baseline within tolerance (✅ —
+placement + shape vs the paper's **_M** dense rows; the paper publishes no _S
+retrieval table); A/Bs two configs and emits deltas (✅ — flat vs persistent_current,
+−0.74 R@5 / −0.46..0.51 end-task); **baseline numbers for the current system
+recorded** (✅ — `runs/seam_s20`, N=20 stratified prefix, seed 0).
 
 ### Phase 3 — First plugin wave (measured): reranker + gate + bounded core · ~1–1.5 wk
 `reranker_service` (bge-reranker-v2-m3, CPU in-cluster) as a Scorer; ensemble gate

@@ -14,6 +14,9 @@
 > `vacuum_freeze_min_age`), replaced the FK design with soft references
 > (retention conflict), and relocated the write pool into the agent
 > process. The Problem/Scope/rationale sections here remain current.
+> `database_architecture.md` (2026-06-11) additionally situates `srw-auditdb`
+> as the product-wide observability tier — the usage-metering ledger
+> (`usage_events`) lands there too.
 
 > **Revision note (2026-06-10)** — file/line references below were
 > re-verified against the current tree. Material drift since 2026-05-02:
