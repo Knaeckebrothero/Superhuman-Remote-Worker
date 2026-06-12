@@ -485,9 +485,10 @@ spec:
                   key: CLOUD_RCLONE_ALLOW_CONTAINER
                   optional: true
             # Virtual workspace tier (no_workspace_agent_mode.md §4/§5). type/root
-            # are non-secret (ConfigMap); the rclone config JSON carries
-            # credentials, so it comes from the bundled Secret. All optional —
-            # absent keys leave the tier disabled.
+            # are non-secret (ConfigMap); for s3 the credentials come from the
+            # bundled Secret (VIRTUAL_WORKSPACE_S3_ACCESS_KEY_ID /
+            # _SECRET_ACCESS_KEY). All optional — absent keys leave the tier
+            # disabled.
             - name: VIRTUAL_WORKSPACE_RCLONE_TYPE
               valueFrom:
                 configMapKeyRef:
@@ -500,11 +501,35 @@ spec:
                   name: {{ include "srw.configMapName" . }}
                   key: VIRTUAL_WORKSPACE_RCLONE_ROOT
                   optional: true
-            - name: VIRTUAL_WORKSPACE_RCLONE_CONFIG
+            - name: VIRTUAL_WORKSPACE_S3_ENDPOINT
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: VIRTUAL_WORKSPACE_S3_ENDPOINT
+                  optional: true
+            - name: VIRTUAL_WORKSPACE_S3_REGION
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: VIRTUAL_WORKSPACE_S3_REGION
+                  optional: true
+            - name: VIRTUAL_WORKSPACE_S3_PROVIDER
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: VIRTUAL_WORKSPACE_S3_PROVIDER
+                  optional: true
+            - name: VIRTUAL_WORKSPACE_S3_ACCESS_KEY_ID
               valueFrom:
                 secretKeyRef:
                   name: {{ include "srw.secretName" . }}
-                  key: VIRTUAL_WORKSPACE_RCLONE_CONFIG
+                  key: VIRTUAL_WORKSPACE_S3_ACCESS_KEY_ID
+                  optional: true
+            - name: VIRTUAL_WORKSPACE_S3_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: VIRTUAL_WORKSPACE_S3_SECRET_ACCESS_KEY
                   optional: true
             {{- if or .Values.opencloud.enabled (eq (default "" .Values.cloud.externalBackend) "opencloud") }}
             # OpenCloud — bundled (opencloud.enabled=true) or external
@@ -570,17 +595,17 @@ spec:
             # S3 credentials are optional — when absent the orchestrator
             # detects "no S3" via empty S3_ENDPOINT and disables snapshots
             # / external IDE session storage.
-            - name: S3_ACCESS_KEY
+            - name: SNAPSHOT_S3_ACCESS_KEY_ID
               valueFrom:
                 secretKeyRef:
                   name: {{ include "srw.secretName" . }}
-                  key: S3_ACCESS_KEY
+                  key: SNAPSHOT_S3_ACCESS_KEY_ID
                   optional: true
-            - name: S3_SECRET_KEY
+            - name: SNAPSHOT_S3_SECRET_ACCESS_KEY
               valueFrom:
                 secretKeyRef:
                   name: {{ include "srw.secretName" . }}
-                  key: S3_SECRET_KEY
+                  key: SNAPSHOT_S3_SECRET_ACCESS_KEY
                   optional: true
             - name: S3_BUCKET
               valueFrom:

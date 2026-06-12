@@ -56,8 +56,9 @@ shared `_inject_lite_workspace_config` helper drives both job dispatch and
 `_send_session_attach`; credentials sourced from deployment env, in-flight only,
 never persisted), reject `repository` datasources on a lite tier (HTTP 400 at
 `create_job`, fail-job at dispatch), and carry Helm values for the object store
-(`virtualWorkspace.rclone.*` → `VIRTUAL_WORKSPACE_RCLONE_TYPE/ROOT/CONFIG`;
-type/root via ConfigMap, the credential JSON via the bundled Secret). A
+(`virtualWorkspace.rclone.{type,root}` + `virtualWorkspace.s3.{endpoint,region,provider}`
+via ConfigMap, the `VIRTUAL_WORKSPACE_S3_ACCESS_KEY_ID`/`_SECRET_ACCESS_KEY`
+credentials via the bundled Secret — see the 2026-06-12 update below). A
 contract-roundtrip test feeds the orchestrator-emitted payload straight into the
 agent's `create_lite_backend` and round-trips a file, so S1 and S2 are proven to
 agree without a cluster. **Local-dev story decided** (§13): dev/k3d uses the
@@ -69,6 +70,24 @@ the lite backend from the live dispatch payload (`Lite workspace backend ready
 (backend=virtual, no workspace pod)`), a `virtual` job wrote `notes/plan.md`
 into its `jobs/<id>/` object-store prefix and completed, and a
 `virtual`+`repository`-datasource job was rejected at creation (HTTP 400).
+
+**Update 2026-06-12 — discrete S3 credentials + snapshot-secret rename.** The
+virtual-tier credential is no longer a JSON blob (`VIRTUAL_WORKSPACE_RCLONE_CONFIG`);
+it now mirrors the snapshot S3 wiring as discrete vars —
+`VIRTUAL_WORKSPACE_S3_ACCESS_KEY_ID`/`_SECRET_ACCESS_KEY` (Secret) +
+`VIRTUAL_WORKSPACE_S3_ENDPOINT`/`_REGION`/`_PROVIDER` (ConfigMap), with
+`no_check_bucket` baked in (the agent's bucket-scoped key can't create the
+pre-provisioned bucket). The store is a dedicated `srw-workspaces` bucket on the
+existing MinIO with its **own least-privilege key**, separate from snapshots
+(`s3:*` on `srw-workspaces` only — not bucket-admin, not the snapshot creds). In
+the same pass the snapshot secret keys were renamed for a consistent
+`<PURPOSE>_S3_*` convention: `S3_ACCESS_KEY`→`SNAPSHOT_S3_ACCESS_KEY_ID`,
+`S3_SECRET_KEY`→`SNAPSHOT_S3_SECRET_ACCESS_KEY` (the non-secret
+`S3_ENDPOINT`/`S3_BUCKET`/`S3_REGION` ConfigMap names are unchanged, as is
+`NEXTCLOUD_S3_*`). **Deploy caveat:** the snapshot rename is a live-secret change —
+the dev Vault bundle is renamed first, then the chart deploys. **prod-private's
+Vault needs the same `S3_*`→`SNAPSHOT_S3_*` rename before this chart reaches the
+prod cut**, or prod snapshots break on that deploy.
 
 **S3 (capability-gated tools) implemented + validated 2026-06-11** (§11/§12):
 tool binding is gated by backend capability — `registry.filter_tools_by_backend()`

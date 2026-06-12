@@ -78,8 +78,8 @@ class SnapshotService:
                 logger.info("Snapshot service: S3_ENDPOINT not set — disabled")
             return
 
-        access_key = os.environ.get("S3_ACCESS_KEY", "")
-        secret_key = os.environ.get("S3_SECRET_KEY", "")
+        access_key = os.environ.get("SNAPSHOT_S3_ACCESS_KEY_ID", "")
+        secret_key = os.environ.get("SNAPSHOT_S3_SECRET_ACCESS_KEY", "")
         self._bucket = os.environ.get("S3_BUCKET", "srw-snapshots")
         region = os.environ.get("S3_REGION", "us-east-1")
 

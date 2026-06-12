@@ -1844,36 +1844,43 @@ def _backend_from_override(config_override: Any) -> Optional[str]:
 def _virtual_workspace_rclone_spec() -> Optional[dict[str, Any]]:
     """The deployment's object-store spec for the ``virtual`` tier, or None.
 
-    Built from env wired by Helm (``virtualWorkspace.rclone.*``):
+    Built from env wired by Helm (``virtualWorkspace.*``):
 
-    - ``VIRTUAL_WORKSPACE_RCLONE_TYPE`` — rclone backend (``s3``/``webdav``/…,
-      or ``memory`` for a non-durable dev store). Empty ⇒ tier disabled (None).
+    - ``VIRTUAL_WORKSPACE_RCLONE_TYPE`` — rclone backend (``s3`` or, for a
+      non-durable dev store, ``memory``). Empty ⇒ tier disabled (None).
     - ``VIRTUAL_WORKSPACE_RCLONE_ROOT`` — bucket or ``bucket/subpath``.
-    - ``VIRTUAL_WORKSPACE_RCLONE_CONFIG`` — JSON object of rclone config
-      key/values (access_key_id, secret_access_key, endpoint, provider, …);
-      held in a Secret. Becomes ``RCLONE_CONFIG_*`` env in the agent, so it
-      never reaches argv.
+    - For ``s3``: discrete fields rather than a JSON blob, mirroring the
+      snapshot S3 wiring. ``VIRTUAL_WORKSPACE_S3_ACCESS_KEY_ID`` /
+      ``_SECRET_ACCESS_KEY`` are the (Secret-held) credentials; ``_ENDPOINT`` /
+      ``_REGION`` / ``_PROVIDER`` are non-secret config. Each ``config`` key
+      becomes ``RCLONE_CONFIG_*`` env in the agent, so secrets never reach argv.
 
     Returns the ``{type, config, root}`` shape the agent's
-    ``object_store_from_spec`` consumes as ``rclone_spec`` (§4/§5).
+    ``object_store_from_spec`` consumes as ``rclone_spec`` (§4/§5). ``config``
+    holds rclone backend key/values; for ``memory`` it is empty.
     """
     rtype = os.environ.get("VIRTUAL_WORKSPACE_RCLONE_TYPE", "").strip()
     if not rtype:
         return None
-    config: dict[str, Any] = {}
-    raw = os.environ.get("VIRTUAL_WORKSPACE_RCLONE_CONFIG", "").strip()
-    if raw:
-        try:
-            parsed = json.loads(raw)
-            if isinstance(parsed, dict):
-                config = parsed
-            else:
-                logger.error(
-                    "VIRTUAL_WORKSPACE_RCLONE_CONFIG is not a JSON object — ignoring"
-                )
-        except (json.JSONDecodeError, ValueError):
-            logger.error("VIRTUAL_WORKSPACE_RCLONE_CONFIG is not valid JSON — ignoring")
     root = os.environ.get("VIRTUAL_WORKSPACE_RCLONE_ROOT", "").strip()
+    config: dict[str, Any] = {}
+    if rtype == "s3":
+        config = {
+            "provider": os.environ.get("VIRTUAL_WORKSPACE_S3_PROVIDER", "").strip()
+            or "Minio",
+            "access_key_id": os.environ.get("VIRTUAL_WORKSPACE_S3_ACCESS_KEY_ID", ""),
+            "secret_access_key": os.environ.get(
+                "VIRTUAL_WORKSPACE_S3_SECRET_ACCESS_KEY", ""
+            ),
+            "endpoint": os.environ.get("VIRTUAL_WORKSPACE_S3_ENDPOINT", "").strip(),
+            "region": os.environ.get("VIRTUAL_WORKSPACE_S3_REGION", "").strip()
+            or "us-east-1",
+            # The agent's scoped key can't create buckets and the bucket is
+            # pre-provisioned, so tell rclone not to probe/create it. String
+            # (not bool) — config values reach rclone as RCLONE_CONFIG_* env.
+            "no_check_bucket": "true",
+        }
+    # "memory" (dev) carries no credentials — empty config.
     return {"type": rtype, "config": config, "root": root}
 
 
@@ -1909,9 +1916,10 @@ def _inject_lite_workspace_config(
         if spec is None:
             raise LiteWorkspaceConfigError(
                 "workspace.backend='virtual' needs an object store, but this "
-                "deployment has none configured. Set virtualWorkspace.rclone.* "
-                "(VIRTUAL_WORKSPACE_RCLONE_TYPE/ROOT/CONFIG) to an S3/MinIO "
-                "bucket — or use backend='none' for a no-file-tools agent, or "
+                "deployment has none configured. Set virtualWorkspace.rclone.type "
+                "(+ .root) and, for s3, virtualWorkspace.s3.* plus the "
+                "VIRTUAL_WORKSPACE_S3_ACCESS_KEY_ID / _SECRET_ACCESS_KEY secrets "
+                "— or use backend='none' for a no-file-tools agent, or "
                 "'sandbox'/'vm' for a full workspace."
             )
         ws["mounts"] = [

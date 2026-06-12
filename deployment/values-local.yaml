@@ -136,8 +136,8 @@ secrets:
     NEXTCLOUD_S3_SECRET_KEY: "stub"
 
     # --- S3 (snapshot service — no real S3 yet, stubs) ---
-    S3_ACCESS_KEY: "minioadmin"
-    S3_SECRET_KEY: "minioadmin_secret"
+    SNAPSHOT_S3_ACCESS_KEY_ID: "minioadmin"
+    SNAPSHOT_S3_SECRET_ACCESS_KEY: "minioadmin_secret"
 
     # --- Email (disabled but Keycloak references SMTP env vars unconditionally) ---
     SMTP_USER: "stub"
