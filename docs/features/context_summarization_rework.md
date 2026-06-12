@@ -18,11 +18,12 @@ related:
 
 # Context Summarization Rework — aux-budgeted rolling compaction, progress UI, live token counters
 
-**Status:** Design (2026-06-12). Not started. Absorbs the issues deferred from
-`docs/issues/session_silent_failure_audit.md` to the "summarization rework
-track": **#4-full** (failure semantics), **#5** (tool-result caps), **#6**
-(keep-window elision), **#7** (aux-context clamping/chunking) — plus the
-compaction progress UI and live token counters.
+**Status:** Implemented (2026-06-12, S1–S5 in one pass) + **§9 duplicate-banner
+follow-up fixed same day** (found during live verification). Absorbs the issues
+deferred from `docs/issues/session_silent_failure_audit.md` to the
+"summarization rework track": **#4-full** (failure semantics), **#5**
+(tool-result caps), **#6** (keep-window elision), **#7** (aux-context
+clamping/chunking) — plus the compaction progress UI and live token counters.
 
 **Evidence base:** threads `1f39a5a6` (gpt-5.5 @ 1.05M main ctx, 951k-token
 conversation sent whole to a 131k summarizer) and `b60166ee` (gpt-5.3-codex-spark
@@ -377,3 +378,78 @@ or add a sibling runbook at implementation time):
 4. **Coordination:** S1 touches `src/services/auxiliary.py`, shared ground
    with the in-flight memory-overhaul work (`agent_memory_overhaul.md`
    Phase 3) — sequence the merges, the diff surface is small.
+
+---
+
+## 9. Follow-up: the duplicate-banner bug (found + fixed 2026-06-12)
+
+Live verification on k3d (thread `51c71e83`, softDsim review) surfaced four
+chained defects around how compaction results are adopted and rendered. One
+manual `/compact` at 13% ctx produced **four** identical `role='summary'` rows
+(seq 359/362/365/368, identical text, stale `boundary_seq=320`), a doubled
+"compacting" animation, and banners rendering below the reply they preceded.
+
+**Root causes and fixes:**
+
+1. **Marker leak (agent)** — `_handle_compact` assigned the raw reducer delta
+   (`RemoveMessage` markers included) into `_session.messages`. Every later
+   LLM call then "shrank" after `strip_removal_markers`, and the loop's
+   length-delta heuristic re-detected a compaction and re-persisted the same
+   summary row — once per LLM call, forever. *Fix:* strip markers before
+   adopting, and replace the length heuristic everywhere with
+   `ContextManager.compaction_runs` — a monotonic counter bumped only when a
+   summarization actually produced a compacted result. Transports snapshot it
+   around the call (loop, manual `/compact`, resume Path B).
+2. **No-op `/compact` re-persisted the previous summary** —
+   `extract_summary_text` found the *old* summary message in the live list.
+   *Fix:* the counter gate; a no-op now answers the requesting client with a
+   summary-less `context.compacted` (cockpit renders "Nothing to compact",
+   no banner, no row).
+3. **Manual completion never journaled** — `context.compacted` for `/compact`
+   went `_ws_send`-only, so SSE replay could resurrect the progress block
+   (journaled started/progress) with nothing to clear it, badge defaulting to
+   "auto". *Fix:* real manual compactions broadcast (journaled) like auto;
+   every engine progress frame now carries `trigger` so replay-synthesized
+   state never guesses; the redundant local "Compacting context..." echo was
+   removed from the cockpit.
+4. **Banner trailing the turn (cockpit)** — `historyToTurns` anchors a turn's
+   block at its first `ai` row, so mid-turn summary rows (correct seq
+   position) rendered *after* the whole turn's content. *Fix:* a summary row
+   whose turn is already open becomes an inline `CompactionEvent` in the
+   turn's event stream at its true position; between-turn rows stay top-level
+   dividers; consecutive identical summaries collapse (renders pre-fix
+   threads sanely).
+
+**Plus the deferred adopt-into-live-list change (open question of the
+ephemeral-prepared design):** auto-compaction now runs on the durable session
+list *before* the per-call copy + transient memory/knowledge injections, and
+adopts its result (`messages[:] = stripped`) when the counter says a real
+summarization ran. Ends the re-summarize-every-call thrash ("5–21 summary
+rows/turn" incidents); injections can no longer be folded into a durable
+summary. Substitution-only/elision results stay per-call (failure paths never
+durably destroy content). Safe now that persistence is message-granular
+(thread_messages keeps the full log; resume Path A loads summary + tail).
+
+Tests: `TestCompactionRunCounter`, `test_progress_frames_carry_trigger`
+(context safety); `test_compact_strips_removal_markers`,
+`test_noop_compact_does_not_persist_marker` (persistent app);
+`test_compaction_adopts_result_into_session_list`,
+`test_passthrough_does_not_fire_compaction_side_effects` (persistent graph);
+in-turn placement + dedupe + no-op + trigger-synthesis specs (cockpit).
+
+**Live verification complete (2026-06-12, k3d thread `e9699503`):** no-op
+manual `/compact` → transient "Nothing to compact" line, zero summary rows,
+agent log `summarized=False`; real manual `/compact` → journaled
+`compaction.started`/`progress`/`context.compacted` (trigger=manual,
+47→13 messages), exactly **one** summary row (seq 491, fresh
+`boundary_seq: 464`), and two subsequent turns produced no duplicate rows.
+Pre-fix artifact note: this thread carries two journaled `compaction.started`
+frames (seq 383/387) with no terminal frame — size-guard skips from before
+`compaction.skipped` shipped; harmless (fresh connects start at the journal
+tail) but explains a ghost "COMPACTING" block if a stale cursor ever replays
+past them.
+
+A sibling render-layer bug found in the same thread (gemma reasoning bubble
+after the answer + duplicated on replay — same journal-vs-history seam, no
+data duplication) is filed separately:
+`docs/issues/persistent_chat_reasoning_after_answer_and_replay_duplication.md`.

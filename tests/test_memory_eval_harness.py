@@ -58,6 +58,7 @@ from eval.memory.metrics import (
 from eval.memory.query import answer_retrieval, session_ranking
 from eval.memory.report import render_comparison, render_markdown
 from eval.memory.run import _existing_question_ids
+from src.core.loader import QueryConfig
 from src.services.memory.types import AssembleStats, InjectionBlock, MemoryPayload
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -138,7 +139,12 @@ def make_handles(db=None, payload=None, run_id="testrun"):
         return manager
 
     handles = HarnessHandles(
-        config=SimpleNamespace(llm=SimpleNamespace(model="test-model")),
+        config=SimpleNamespace(
+            llm=SimpleNamespace(model="test-model"),
+            # Real MemoryConfig shape for query formation (digest off, as
+            # the production default) — _form_query_text reads it.
+            memory=SimpleNamespace(query=QueryConfig()),
+        ),
         run_id=run_id,
         db=db,
         store_factory=store_factory,
@@ -366,6 +372,26 @@ class TestSeamIngest:
         first = managers[0].assembles[0]
         assert first.query_text == question.sessions[0].turns[0].content
         assert first.model == "test-model"
+
+    @pytest.mark.asyncio
+    async def test_read_path_digest_flag_switches_query_formation(self, question):
+        # memory.query.digest=True (e.g. via a config_overrides arm) routes
+        # per-turn queries through the unified digest — later assembles see
+        # a windowed conversation, not just the last user message.
+        handles, _, managers = make_handles()
+        handles.config.memory.query = QueryConfig(digest=True, digest_window=4)
+        arm = ArmSpec(name="t", ingestion=IngestionOptions(mode="seam"))
+        await ingest_question(question, arm, handles)
+        manager = managers[0]
+        last = manager.assembles[-1]
+        rounds = list(question.sessions[0].rounds())
+        # The current user message is always the digest's focus line...
+        assert rounds[-1][0].content[:80] in last.query_text
+        if len(rounds) > 1:
+            # ...and with history the window adds prior turns (legacy
+            # formation would be the bare last user message).
+            assert "\n" in last.query_text
+            assert last.query_text != rounds[-1][0].content
 
     @pytest.mark.asyncio
     async def test_read_path_off(self, question):

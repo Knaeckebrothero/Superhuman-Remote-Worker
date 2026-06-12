@@ -960,6 +960,12 @@
         padding: 8px 0;
       }
 
+      /* Mid-turn compaction marker: same divider, tucked into the event flow. */
+      .session-divider.event-compaction {
+        padding: 4px 0;
+        margin: 6px 0 2px;
+      }
+
       .divider-line {
         flex: 1;
         height: 1px;
@@ -2340,3 +2346,134 @@
 }
 
 .tool-group-body { padding: v.$space-xs; }
+
+// --- Live context-compaction progress block ---------------------------------
+// (docs/features/context_summarization_rework.md S3 — mockup: header with
+// trigger + ctx %, segmented per-pass bar, pass detail line with in→out tokens)
+.compaction-progress {
+  margin: v.$space-sm 0;
+  padding: v.$space-sm v.$space-md;
+  border-left: 3px solid var(--warning, #e0707a);
+  border-radius: var(--radius-surface, 6px);
+  background: color-mix(in srgb, var(--warning, #e0707a) 7%, transparent);
+}
+
+.compaction-header {
+  display: flex;
+  align-items: center;
+  gap: v.$space-xs;
+  font-size: v.$font-size-sm;
+
+  .compaction-title {
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--warning, #e0707a);
+  }
+
+  .compaction-meta { color: var(--text-muted); }
+
+  .compaction-tokens {
+    margin-left: auto;
+    font-family: var(--font-mono, monospace);
+    color: var(--text-secondary);
+  }
+}
+
+.compaction-bar {
+  display: flex;
+  gap: 6px;
+  margin: v.$space-xs 0;
+
+  .compaction-segment {
+    flex: 1;
+    height: 4px;
+    border-radius: 2px;
+    background: color-mix(in srgb, var(--warning, #e0707a) 22%, transparent);
+    overflow: hidden;
+    position: relative;
+
+    &.done { background: var(--warning, #e0707a); }
+
+    &.active::after {
+      content: '';
+      position: absolute;
+      inset: 0;
+      background: var(--warning, #e0707a);
+      animation: compaction-pulse 1.4s ease-in-out infinite;
+    }
+
+    .compaction-fill {
+      display: block;
+      height: 100%;
+      background: var(--warning, #e0707a);
+      transition: width 300ms ease;
+    }
+  }
+}
+
+@keyframes compaction-pulse {
+  0%, 100% { opacity: 0.25; }
+  50% { opacity: 0.9; }
+}
+
+.compaction-detail {
+  display: flex;
+  align-items: baseline;
+  gap: v.$space-sm;
+  font-size: v.$font-size-sm;
+  color: var(--text-secondary);
+  font-family: var(--font-mono, monospace);
+
+  .compaction-retry { color: var(--warning, #e0707a); margin-left: v.$space-xs; }
+
+  .compaction-reduction {
+    margin-left: auto;
+    color: var(--text-muted);
+  }
+}
+
+// --- Live token usage panel (above composer, right-aligned) -----------------
+.usage-panel {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: v.$space-md;
+  padding: 2px v.$space-sm;
+  font-family: var(--font-mono, monospace);
+  font-size: 11px;
+  color: var(--text-secondary);
+
+  .usage-item {
+    display: inline-flex;
+    align-items: center;
+    gap: v.$space-xs;
+  }
+
+  .usage-label {
+    color: var(--text-muted);
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    font-size: 10px;
+  }
+
+  .usage-gauge {
+    display: inline-block;
+    width: 56px;
+    height: 4px;
+    border-radius: 2px;
+    background: color-mix(in srgb, var(--text-muted) 25%, transparent);
+    overflow: hidden;
+
+    .usage-gauge-fill {
+      display: block;
+      height: 100%;
+      background: var(--accent-color, #3399D6);
+      transition: width 300ms ease;
+
+      &.hot { background: var(--warning, #e0707a); }
+    }
+  }
+
+  .usage-hot { color: var(--warning, #e0707a); }
+}

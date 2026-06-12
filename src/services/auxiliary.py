@@ -186,8 +186,8 @@ class ExtractMemoriesTask(AuxTask):
 class SummarizeTask(AuxTask):
     """Summarize a conversation segment into structured fields.
 
-    Chain mode task that replaces the inline LLM call in
-    ContextManager._single_pass_summarize().
+    Chain mode task invoked per fold pass by
+    ``src.core.summarizer.SummarizationEngine``.
     Prompt loaded from config/prompts/ via the prompt matrix.
 
     The output schema is ConversationSummary from src/core/context.py.
@@ -484,6 +484,26 @@ class AuxHealth:
         }
 
 
+class AuxInputTooLarge(Exception):
+    """Task input exceeds the auxiliary model's context window.
+
+    Typed and deterministic — callers must NOT retry (the input doesn't
+    shrink). Summarization avoids this via the SummarizationEngine's
+    chunk planning; other aux tasks (memory extraction, titles) fail fast
+    here instead of overflowing at the HTTP transport.
+    See docs/features/context_summarization_rework.md (S1).
+    """
+
+    def __init__(self, tokens: int, limit: int, task_name: str = "unknown"):
+        self.tokens = tokens
+        self.limit = limit
+        self.task_name = task_name
+        super().__init__(
+            f"Auxiliary task {task_name} input is ~{tokens:,} tokens, exceeding "
+            f"the auxiliary model's {limit:,}-token context window"
+        )
+
+
 class AuxiliaryLLM:
     """Unified support task execution with chain and agent modes.
 
@@ -491,7 +511,10 @@ class AuxiliaryLLM:
 
     Args:
         llm: The support model (e.g. gpt-oss-120b, or main LLM as fallback)
-        config: AuxiliaryConfig dataclass (from loader.py)
+        max_context_tokens: The support model's own context window, resolved
+            from its settings at construction. Budgeting authority for the
+            SummarizationEngine and the chain() pre-flight guard. None
+            disables the guard (window unknown).
     """
 
     def __init__(
@@ -502,10 +525,12 @@ class AuxiliaryLLM:
         archiver: Optional["LLMArchiver"] = None,
         job_id: Optional[str] = None,
         agent_type: Optional[str] = None,
+        max_context_tokens: Optional[int] = None,
     ):
         self.llm = llm
         self.max_iterations = max_iterations
         self.timeout = timeout
+        self.max_context_tokens = max_context_tokens
         self._archiver = archiver
         self._job_id = job_id
         self._agent_type = agent_type or "unknown"
@@ -548,6 +573,24 @@ class AuxiliaryLLM:
             SystemMessage(content=task.system_prompt),
             HumanMessage(content=task.build_context()),
         ]
+
+        # Pre-flight: fail fast (typed, non-retryable) when the input cannot
+        # fit the auxiliary model's own window, instead of overflowing at the
+        # HTTP transport. Memory-extraction calls were shipping 951k-token
+        # payloads to a 131k model (session_silent_failure_audit.md #7).
+        if self.max_context_tokens:
+            from src.core.summarizer import count_text_tokens
+
+            input_tokens = count_text_tokens(messages[0].content) + count_text_tokens(
+                messages[1].content
+            )
+            if input_tokens > self.max_context_tokens:
+                task_name = task.__class__.__name__
+                error = AuxInputTooLarge(
+                    input_tokens, self.max_context_tokens, task_name
+                )
+                self.health.record_failure(task_name, error)
+                raise error
 
         start = time.monotonic()
         raw_result = await self._invoke_aux(

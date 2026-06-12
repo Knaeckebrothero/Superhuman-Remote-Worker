@@ -14,14 +14,19 @@
 #
 # Limits derivation: a family's `limits:` block carries ONLY
 # `model_max_context_tokens` — the conservative working-window BASE. The other
-# leaves (context_threshold_tokens, summarization_safe_limit,
-# summarization_chunk_size, message_count_min_tokens) are DERIVED at load as
-# fixed fractions of the base (see the *_FRACTION constants + _apply_settings_matrix
-# in src/core/loader.py); do not hand-author them here. When a model is added
-# with an explicit per-model context window (Admin → Models `context_window`),
-# that value overrides the base and the same fractions re-derive the leaves.
+# leaves (context_threshold_tokens, message_count_min_tokens) are DERIVED at
+# load as fixed fractions of the base (see the *_FRACTION constants +
+# _apply_settings_matrix in src/core/loader.py); do not hand-author them here.
+# When a model is added with an explicit per-model context window (Admin →
+# Models `context_window`), that value overrides the base and the same
+# fractions re-derive the leaves.
 # `settings.model_max_context_tokens` (the top-level one) stays the model's true
 # nominal/API ceiling for the Layer-1 safety check + output-token sizing.
+#
+# Summarization budgets are deliberately NOT derived here: they are computed
+# at call time from the AUXILIARY model's own window (src/core/summarizer.py).
+# Deriving them from the main model's window sent 951k-token payloads to a
+# 131k summarizer — docs/features/context_summarization_rework.md.
 
 default:
   prompts:

@@ -15,7 +15,7 @@ import {
     ViewChild,
     ViewChildren,
 } from '@angular/core';
-import {NgTemplateOutlet, TitleCasePipe} from '@angular/common';
+import {DecimalPipe, NgTemplateOutlet, TitleCasePipe} from '@angular/common';
 import {HttpClient} from '@angular/common/http';
 import {FormsModule} from '@angular/forms';
 import {Router, RouterLink} from '@angular/router';
@@ -352,6 +352,7 @@ interface FileEditView {
         FormsModule,
         NgTemplateOutlet,
         TitleCasePipe,
+        DecimalPipe,
         RouterLink,
         MarkdownComponent,
         SidebarToggleComponent,
@@ -440,8 +441,11 @@ interface FileEditView {
             <app-badge tone="neutral" size="sm">{{ 'chat.status.temp' | transloco:{ value: chat.temperature() } }}</app-badge>
           }
           <app-badge tone="neutral" size="sm">{{ 'chat.status.turn' | transloco:{ count: chat.turnCount() } }}</app-badge>
-          @if (chat.agentSilenceSeconds() >= 30) {
+          @if (chat.agentSilenceSeconds() >= 30 && !chat.compaction()) {
             <app-badge tone="warning" size="sm">{{ 'chat.status.agentQuiet' | transloco:{ seconds: chat.agentSilenceSeconds() } }}</app-badge>
+          }
+          @if (chat.compaction(); as comp) {
+            <app-badge tone="warning" size="sm">{{ 'chat.compactionLive.footer' | transloco:{ current: comp.currentPass > 0 ? comp.currentPass : 1, total: comp.nPasses, elapsed: compactionElapsed() } }}</app-badge>
           }
           <app-badge tone="accent" size="sm">{{ chat.permissionMode() | titlecase }}</app-badge>
         </div>
@@ -818,6 +822,24 @@ interface FileEditView {
                               <markdown [data]="group.event.content"></markdown>
                             </div>
                           }
+                          @case ('compaction') {
+                            <!-- Mid-turn compaction marker at its true position
+                                 in the event stream (same divider + expandable
+                                 summary as the between-turns banner). -->
+                            <div class="session-divider event-compaction">
+                              <span class="divider-line"></span>
+                              <span class="divider-text">{{ 'chat.compaction.banner' | transloco }}</span>
+                              <span class="divider-line"></span>
+                            </div>
+                            @if (group.event.summary) {
+                              <details class="compaction-summary">
+                                <summary>{{ 'chat.compaction.viewSummary' | transloco }}</summary>
+                                <div class="compaction-summary-body message-body">
+                                  <markdown [data]="group.event.summary"></markdown>
+                                </div>
+                              </details>
+                            }
+                          }
                         }
                       }
                     }
@@ -1010,6 +1032,64 @@ interface FileEditView {
           </div>
         }
 
+        <!-- Live context-compaction progress (compaction.started/progress
+             frames; cleared by context.compacted / compaction.failed).
+             Segmented bar for ≤20 passes, continuous bar + counter above —
+             the UI must render fine for ANY pass count. -->
+        @if (chat.compaction(); as comp) {
+          <div class="compaction-progress" role="status">
+            <div class="compaction-header">
+              <span class="action-spinner-sm" aria-hidden="true"></span>
+              <span class="compaction-title">{{ 'chat.compactionLive.title' | transloco }}</span>
+              <span class="compaction-meta">
+                {{ comp.trigger }}
+                @if (comp.ctxUsedPct != null) {
+                  · {{ 'chat.compactionLive.ctx' | transloco:{ pct: comp.ctxUsedPct } }}
+                }
+              </span>
+              @if (comp.ctxUsedTokens != null && comp.ctxLimitTokens != null) {
+                <span class="compaction-tokens">{{ formatTokens(comp.ctxUsedTokens) }} / {{ formatTokens(comp.ctxLimitTokens) }} tok</span>
+              }
+            </div>
+            <div class="compaction-bar">
+              @if (compactionSegments().length) {
+                @for (seg of compactionSegments(); track seg) {
+                  <span class="compaction-segment"
+                        [class.done]="seg < comp.currentPass"
+                        [class.active]="seg === comp.currentPass"></span>
+                }
+              } @else {
+                <span class="compaction-segment continuous">
+                  <span class="compaction-fill"
+                        [style.width.%]="comp.nPasses > 0 ? (100 * (comp.currentPass > 0 ? comp.currentPass - 1 : 0) / comp.nPasses) : 0"></span>
+                </span>
+              }
+            </div>
+            <div class="compaction-detail">
+              <span class="compaction-pass">
+                @if (comp.currentPass > 0) {
+                  {{ 'chat.compactionLive.pass' | transloco:{ current: comp.currentPass, total: comp.nPasses, first: comp.firstMsg ?? '?', last: comp.lastMsg ?? '?' } }}
+                  @if (comp.attempt > 1) {
+                    <span class="compaction-retry">{{ 'chat.compactionLive.retry' | transloco:{ attempt: comp.attempt } }}</span>
+                  }
+                } @else {
+                  {{ 'chat.compactionLive.planning' | transloco }}
+                }
+              </span>
+              @if (comp.inTokens != null) {
+                <span class="compaction-reduction">
+                  {{ formatTokens(comp.inTokens) }} →
+                  @if (comp.outTokens != null) {
+                    {{ formatTokens(comp.outTokens) }}
+                  } @else {
+                    …
+                  }
+                </span>
+              }
+            </div>
+          </div>
+        }
+
         <!-- Ended-session end-marker + resume card — replaces the composer
              when the thread is in 'ended' status. -->
         @if (chat.threadStatus() === 'ended') {
@@ -1089,6 +1169,25 @@ interface FileEditView {
       <!-- Input -->
       @if (chat.threadStatus() !== 'ended') {
       <div class="composer-wrap">
+        <!-- Live token telemetry (usage.updated frames): latest context fill
+             + cumulative output/reasoning for the running turn. -->
+        @if (chat.usage(); as u) {
+          <div class="usage-panel" aria-hidden="true">
+            @if (u.inputTokens != null) {
+              <span class="usage-item"><span class="usage-label">{{ 'chat.usage.input' | transloco }}</span>{{ u.inputTokens | number }}</span>
+            }
+            @if (u.reasoningTokensTurn > 0) {
+              <span class="usage-item"><span class="usage-label">{{ 'chat.usage.reasoning' | transloco }}</span>{{ u.reasoningTokensTurn | number }}</span>
+            }
+            <span class="usage-item"><span class="usage-label">{{ 'chat.usage.output' | transloco }}</span>{{ u.outputTokensTurn | number }}</span>
+            @if (usageCtxPct() != null) {
+              <span class="usage-item"><span class="usage-label">{{ 'chat.usage.ctx' | transloco }}</span>
+                <span class="usage-gauge"><span class="usage-gauge-fill" [class.hot]="usageCtxPct()! >= 80" [style.width.%]="usageCtxPct()"></span></span>
+                <span [class.usage-hot]="usageCtxPct()! >= 80">{{ usageCtxPct() }}%</span>
+              </span>
+            }
+          </div>
+        }
         <div
           class="composer"
           [class.focused]="inputFocused()"
@@ -1361,6 +1460,38 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         pickRunningCommandCard(this.chat.runningTool(), this.chat.turns()),
     );
 
+    // --- Live compaction progress (docs/features/context_summarization_rework.md S3)
+    /** 1s tick driving the elapsed timer; interval runs only mid-compaction. */
+    private readonly compactionNow = signal(Date.now());
+    private compactionTimer: ReturnType<typeof setInterval> | null = null;
+
+    readonly compactionElapsed = computed(() => {
+        const comp = this.chat.compaction();
+        if (!comp) return '0:00';
+        const secs = Math.max(0, Math.floor((this.compactionNow() - comp.startedAt) / 1000));
+        const m = Math.floor(secs / 60);
+        return `${m}:${(secs % 60).toString().padStart(2, '0')}`;
+    });
+
+    /** One segment per pass for small counts; [] switches the template to the
+     * continuous bar — a 9000-pass compaction must render fine too. */
+    readonly compactionSegments = computed(() => {
+        const comp = this.chat.compaction();
+        if (!comp || comp.nPasses < 1 || comp.nPasses > 20) return [] as number[];
+        return Array.from({length: comp.nPasses}, (_, i) => i + 1);
+    });
+
+    formatTokens(n: number): string {
+        return n >= 1000 ? `${(n / 1000).toFixed(1)}k` : `${n}`;
+    }
+
+    /** Context fill % for the usage panel gauge (null until usage known). */
+    readonly usageCtxPct = computed(() => {
+        const u = this.chat.usage();
+        if (!u || u.inputTokens == null || !u.ctxLimitTokens) return null;
+        return Math.min(100, Math.round((100 * u.inputTokens) / u.ctxLimitTokens));
+    });
+
     @ViewChild('messagesContainer') messagesContainer!: ElementRef<HTMLDivElement>;
     @ViewChild('inputEl') inputEl!: ElementRef<HTMLTextAreaElement>;
     @ViewChild('fileInput') fileInput?: ElementRef<HTMLInputElement>;
@@ -1543,6 +1674,21 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
                 this.startIdePolling(threadId);
             } else {
                 this.stopIdePolling();
+            }
+        });
+
+        // Elapsed-timer tick, only while a compaction is in flight.
+        effect(() => {
+            const active = this.chat.compaction() !== null;
+            if (active && this.compactionTimer === null) {
+                this.compactionNow.set(Date.now());
+                this.compactionTimer = setInterval(
+                    () => this.compactionNow.set(Date.now()),
+                    1000,
+                );
+            } else if (!active && this.compactionTimer !== null) {
+                clearInterval(this.compactionTimer);
+                this.compactionTimer = null;
             }
         });
 
@@ -1738,6 +1884,10 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         if (this.startupTickInterval) {
             clearInterval(this.startupTickInterval);
             this.startupTickInterval = null;
+        }
+        if (this.compactionTimer) {
+            clearInterval(this.compactionTimer);
+            this.compactionTimer = null;
         }
         this.capabilitiesSub?.unsubscribe();
         this.recordingStateSub?.unsubscribe();

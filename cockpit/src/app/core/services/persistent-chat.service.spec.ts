@@ -397,6 +397,62 @@ describe('PersistentChatService — message cache (loadHistory)', () => {
         expect(banner).toBeTruthy();
         expect((banner as {summary: string}).summary).toBe('We discussed X and Y.');
     });
+
+    it('renders a mid-turn summary row as an inline event at its position', async () => {
+        // The assistant turn anchors at its first row; a summary row that
+        // falls inside the turn must render IN the event stream, not as a
+        // top-level divider trailing the whole turn's content.
+        const {service, mockHttp} = createService();
+        mockHttp.get.mockImplementation((url: string) => {
+            if (url.includes('/messages')) {
+                return of({
+                    messages: [
+                        {id: 'u1', role: 'human', content: 'go', tool_calls: null, turn_number: 5, created_at: '2026-05-15T08:00:00Z'},
+                        {id: 'a1', role: 'ai', content: 'working on it', tool_calls: null, turn_number: 5, created_at: '2026-05-15T08:00:10Z'},
+                        {id: 's1', role: 'summary', content: 'recap text', tool_calls: null, turn_number: 5, created_at: '2026-05-15T08:00:20Z'},
+                        {id: 'a2', role: 'ai', content: 'final answer', tool_calls: null, turn_number: 5, created_at: '2026-05-15T08:00:30Z'},
+                    ],
+                    total: 4,
+                });
+            }
+            return of({status: 'active', total_turns: 5});
+        });
+
+        await service.connect('thread-midturn-summary');
+
+        const turns = service.turns();
+        expect(turns.some((t: {kind: string}) => t.kind === 'compaction')).toBe(false);
+        const assistant = turns.find((t: {kind: string}) => t.kind === 'assistant') as any;
+        expect(assistant).toBeTruthy();
+        const kinds = assistant.events.map((e: {kind: string}) => e.kind);
+        expect(kinds).toEqual(['text', 'compaction', 'text']);
+        expect(assistant.events[1].summary).toBe('recap text');
+    });
+
+    it('collapses consecutive duplicate summary rows into one banner', async () => {
+        // Threads written before the run-counter gate carry repeated
+        // role='summary' rows with identical content (duplicate-banner bug).
+        const {service, mockHttp} = createService();
+        mockHttp.get.mockImplementation((url: string) => {
+            if (url.includes('/messages')) {
+                return of({
+                    messages: [
+                        {id: 'u1', role: 'human', content: 'hi', tool_calls: null, turn_number: 1, created_at: '2026-05-15T08:00:00Z'},
+                        {id: 's1', role: 'summary', content: 'same recap', tool_calls: null, turn_number: 2, created_at: '2026-05-15T08:01:00Z'},
+                        {id: 's2', role: 'summary', content: 'same recap', tool_calls: null, turn_number: 2, created_at: '2026-05-15T08:01:30Z'},
+                        {id: 's3', role: 'summary', content: 'same recap', tool_calls: null, turn_number: 2, created_at: '2026-05-15T08:02:00Z'},
+                    ],
+                    total: 4,
+                });
+            }
+            return of({status: 'active', total_turns: 2});
+        });
+
+        await service.connect('thread-dup-summaries');
+
+        const banners = service.turns().filter((t: {kind: string}) => t.kind === 'compaction');
+        expect(banners.length).toBe(1);
+    });
 });
 
 describe('PersistentChatService — connect()', () => {
@@ -1366,13 +1422,16 @@ describe('PersistentChatService — control WS (slash commands + permissions)', 
         expect(denied.decision).toBe('denied');
     });
 
-    it('/compact slash command sends compact + adds a system turn', async () => {
+    it('/compact slash command sends compact without a local echo', async () => {
+        // No "Compacting context..." system turn: the agent's
+        // compaction.started/progress frames drive the live progress block,
+        // and a no-op answers with a summary-less context.compacted.
         const ctx = await readySession();
         await ctx.service.sendMessage('/compact recent edits');
         const sent = ctx.wsInstances[0].send.mock.calls.map((c: any) => JSON.parse(c[0]));
         expect(sent).toContainEqual({method: 'compact', focus: 'recent edits'});
         const systemTurns = ctx.service.turns().filter(isSystemTurn);
-        expect(systemTurns.slice(-1)[0].content).toMatch(/Compacting/);
+        expect(systemTurns.some((t) => /Compacting/.test(String(t.content)))).toBe(false);
     });
 
     it('/done sends archive', async () => {
@@ -1951,5 +2010,179 @@ describe('PersistentChatService — interrupt self-healing', () => {
 
         expect(service.isStreaming()).toBe(false);
         expect(service.isInterrupting()).toBe(false);
+    });
+});
+
+describe('PersistentChatService — compaction progress frames', () => {
+    afterEach(() => vi.clearAllMocks());
+
+    async function setup() {
+        const ctx = createService();
+        ctx.mockHttp.get.mockImplementation(() =>
+            of({status: 'active', total_turns: 0, messages: [], total: 0}),
+        );
+        await ctx.service.connect('thread-X');
+        const es = ctx.sseInstances[0];
+        fireSseOpen(es);
+        return {...ctx, es};
+    }
+
+    it('builds compaction state from started + progress frames', async () => {
+        const {service, es} = await setup();
+        fireSseMessage(es, {
+            method: 'compaction.started',
+            params: {
+                trigger: 'auto', total_tokens: 951_682, ctx_used_tokens: 951_682,
+                ctx_limit_tokens: 1_047_576, ctx_used_pct: 91,
+                aux_limit_tokens: 131_072, n_passes: 10,
+                plan: [{pass: 1, first_msg: 1, last_msg: 112, tokens: 98_000}],
+            },
+        }, '1:1');
+        expect(service.compaction()).not.toBeNull();
+        expect(service.compaction()!.nPasses).toBe(10);
+        expect(service.compaction()!.currentPass).toBe(0); // planning
+
+        fireSseMessage(es, {
+            method: 'compaction.progress',
+            params: {
+                pass: 4, n_passes: 10, first_msg: 113, last_msg: 141,
+                in_tokens: 38_000, out_tokens: 2_500, stage: 'summarizing', attempt: 1,
+            },
+        }, '1:2');
+        const comp = service.compaction()!;
+        expect(comp.currentPass).toBe(4);
+        expect(comp.firstMsg).toBe(113);
+        expect(comp.outTokens).toBe(2_500);
+        // started-frame fields survive progress updates
+        expect(comp.ctxUsedPct).toBe(91);
+    });
+
+    it('synthesizes state from a replayed progress frame without started (reload mid-fold)', async () => {
+        const {service, es} = await setup();
+        fireSseMessage(es, {
+            method: 'compaction.progress',
+            params: {pass: 7, n_passes: 10, first_msg: 500, last_msg: 540, in_tokens: 40_000, attempt: 2},
+        }, '1:1');
+        const comp = service.compaction()!;
+        expect(comp.currentPass).toBe(7);
+        expect(comp.nPasses).toBe(10);
+        expect(comp.attempt).toBe(2);
+    });
+
+    it('clears compaction state on context.compacted (success path)', async () => {
+        const {service, es} = await setup();
+        fireSseMessage(es, {method: 'compaction.started', params: {n_passes: 2}}, '1:1');
+        expect(service.compaction()).not.toBeNull();
+        fireSseMessage(es, {
+            method: 'context.compacted',
+            params: {before: 100, after: 12, trigger: 'auto', summary: 'did things', turn: 3},
+        }, '1:2');
+        expect(service.compaction()).toBeNull();
+    });
+
+    it('clears compaction state and surfaces a system line on compaction.failed', async () => {
+        const {service, es} = await setup();
+        fireSseMessage(es, {method: 'compaction.started', params: {n_passes: 3}}, '1:1');
+        fireSseMessage(es, {
+            method: 'compaction.failed',
+            params: {reason: 'aux_unavailable', pass: 2, n_passes: 3, kept_messages: true},
+        }, '1:2');
+        expect(service.compaction()).toBeNull();
+        const sys = service.turns().filter((t: any) => t.kind === 'system');
+        expect(sys.some((t: any) => String(t.content).includes('aux_unavailable'))).toBe(true);
+    });
+
+    it('clears stale compaction state when the turn ends', async () => {
+        const {service, es} = await setup();
+        fireSseMessage(es, {method: 'turn.started', params: {turn_id: 1}}, '1:1');
+        fireSseMessage(es, {method: 'compaction.started', params: {n_passes: 5}}, '1:2');
+        fireSseMessage(es, {method: 'turn.completed', params: {turn_id: 1}}, '1:3');
+        expect(service.compaction()).toBeNull();
+    });
+
+    it('clears the progress block on compaction.skipped', async () => {
+        // Engine ran but the size guard rejected the summary — the journaled
+        // terminal frame must clear the block (incl. on SSE replay).
+        const {service, es} = await setup();
+        fireSseMessage(es, {method: 'compaction.started', params: {n_passes: 1, trigger: 'manual'}}, '1:1');
+        expect(service.compaction()).not.toBeNull();
+        fireSseMessage(es, {
+            method: 'compaction.skipped',
+            params: {trigger: 'manual', reason: 'summary_not_smaller'},
+        }, '1:2');
+        expect(service.compaction()).toBeNull();
+    });
+
+    it('uses the trigger carried by a replayed progress frame (no started)', async () => {
+        const {service, es} = await setup();
+        fireSseMessage(es, {
+            method: 'compaction.progress',
+            params: {trigger: 'manual', pass: 1, n_passes: 1, first_msg: 1, last_msg: 34, in_tokens: 1176, out_tokens: null, attempt: 1, stage: 'summarizing'},
+        }, '1:1');
+        expect(service.compaction()!.trigger).toBe('manual');
+    });
+
+    it('renders a summary-less context.compacted as a system line, not a banner', async () => {
+        // Manual /compact no-op: the agent answers with summary=null and
+        // persists no row — the UI must not add an (empty) banner.
+        const {service, es} = await setup();
+        fireSseMessage(es, {method: 'compaction.started', params: {n_passes: 1, trigger: 'manual'}}, '1:1');
+        fireSseMessage(es, {
+            method: 'context.compacted',
+            params: {before: 10, after: 10, trigger: 'manual', summary: null, turn: 2},
+        }, '1:2');
+        expect(service.compaction()).toBeNull();
+        expect(service.turns().some((t: any) => t.kind === 'compaction')).toBe(false);
+        const sys = service.turns().filter((t: any) => t.kind === 'system');
+        expect(sys.some((t: any) => String(t.content).includes('Nothing to compact'))).toBe(true);
+    });
+});
+
+describe('PersistentChatService — usage.updated telemetry', () => {
+    afterEach(() => vi.clearAllMocks());
+
+    async function setup() {
+        const ctx = createService();
+        ctx.mockHttp.get.mockImplementation(() =>
+            of({status: 'active', total_turns: 0, messages: [], total: 0}),
+        );
+        await ctx.service.connect('thread-X');
+        const es = ctx.sseInstances[0];
+        fireSseOpen(es);
+        return {...ctx, es};
+    }
+
+    it('accumulates output/reasoning within a turn, latest input wins', async () => {
+        const {service, es} = await setup();
+        fireSseMessage(es, {
+            method: 'usage.updated',
+            params: {turn: 1, input_tokens: 10_000, output_tokens: 500, reasoning_tokens: 200, ctx_limit_tokens: 128_000},
+        }, '1:1');
+        fireSseMessage(es, {
+            method: 'usage.updated',
+            params: {turn: 1, input_tokens: 12_000, output_tokens: 700, reasoning_tokens: 100},
+        }, '1:2');
+        const u = service.usage()!;
+        expect(u.inputTokens).toBe(12_000);
+        expect(u.outputTokensTurn).toBe(1_200);
+        expect(u.reasoningTokensTurn).toBe(300);
+        expect(u.ctxLimitTokens).toBe(128_000);
+    });
+
+    it('resets per-turn accumulators when the turn changes', async () => {
+        const {service, es} = await setup();
+        fireSseMessage(es, {
+            method: 'usage.updated',
+            params: {turn: 1, input_tokens: 10_000, output_tokens: 500, ctx_limit_tokens: 128_000},
+        }, '1:1');
+        fireSseMessage(es, {
+            method: 'usage.updated',
+            params: {turn: 2, input_tokens: 11_000, output_tokens: 50},
+        }, '1:2');
+        const u = service.usage()!;
+        expect(u.turn).toBe(2);
+        expect(u.outputTokensTurn).toBe(50);
+        // limit carried over from the earlier frame
+        expect(u.ctxLimitTokens).toBe(128_000);
     });
 });
