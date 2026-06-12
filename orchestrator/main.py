@@ -2374,6 +2374,17 @@ async def _inject_model_credentials(
     if capability == "chat" and meta is not None and meta.context_window:
         section.setdefault("model_max_context_tokens", meta.context_window)
 
+    # Inject the agent-side factory name so the section always routes to the
+    # correct LLM factory — e.g. an OpenRouter row → _create_openrouter_llm
+    # (openrouter.ai), not the OpenAI default at api.openai.com. meta.provider
+    # already holds the factory name ("openai" for endpoint-backed rows).
+    # This must happen for endpoint rows too: a session hot-swap deep-merges
+    # the enriched override into the existing config, so leaving `provider`
+    # unset keeps the PREVIOUS model's factory (e.g. minimax via openrouter →
+    # gpt-5.5 endpoint row kept routing through _create_openrouter_llm).
+    if meta is not None and meta.provider:
+        section.setdefault("provider", meta.provider)
+
     if (
         meta is not None
         and meta.origin in ("custom", "system", "catalog")
@@ -2388,13 +2399,8 @@ async def _inject_model_credentials(
         return
 
     provider = meta.api_key_ref if meta is not None else _provider_of_model(model_id)
-    # Inject the agent-side factory name so system-anchored rows (which carry
-    # no endpoint base_url) route to the correct LLM factory — e.g. an
-    # OpenRouter row → _create_openrouter_llm (openrouter.ai), not the OpenAI
-    # default at api.openai.com. meta.provider already holds the factory name.
-    factory_provider = meta.provider if meta is not None else provider
-    if factory_provider:
-        section.setdefault("provider", factory_provider)
+    if meta is None and provider:
+        section.setdefault("provider", provider)
     if (
         provider
         and resolved_keys
@@ -11950,6 +11956,13 @@ async def agent_update_thread_config(
                     user_id=user_id,
                     resolved_keys=resolved_keys,
                 )
+                # A model swap must fully determine its transport. Any field
+                # resolution didn't set becomes an explicit None so the
+                # agent-side deep_merge CLEARS the previous model's value
+                # instead of inheriting it (e.g. swapping off an
+                # endpoint-backed model must not keep its base_url).
+                for transport_key in ("provider", "base_url", "api_key"):
+                    llm_section.setdefault(transport_key, None)
                 config_override["llm"] = llm_section
 
         ok = await postgres_db.merge_thread_config_override(thread_id, config_override)

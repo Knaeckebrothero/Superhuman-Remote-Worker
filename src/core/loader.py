@@ -2552,16 +2552,18 @@ def _create_openrouter_llm(
     # Build model kwargs
     model_kwargs = {}
 
-    # OpenRouter uses nested reasoning object format.
+    # OpenRouter uses a nested reasoning object in the request body.
     # OpenRouter supports all levels (none, minimal, low, medium, high, xhigh) — no clamping needed.
-    # Pass as first-class parameter (not model_kwargs) to avoid LangChain warning.
-    reasoning_kwargs = {}
-    if config.reasoning_level and config.reasoning_level != "none":
-        reasoning_kwargs["reasoning"] = {"effort": config.reasoning_level}
-
-    # top_k must go in extra_body, not model_kwargs — the Responses API
-    # (triggered by reasoning) rejects unknown keyword arguments.
+    # It must travel via extra_body: langchain-openai >= 1.x forwards a
+    # first-class ``reasoning`` field into the Chat Completions payload, and
+    # the OpenAI SDK's typed create() rejects it (TypeError: unexpected
+    # keyword argument 'reasoning'). extra_body merges into the JSON body
+    # without going through the typed signature.
     extra_body = {}
+    if config.reasoning_level and config.reasoning_level != "none":
+        extra_body["reasoning"] = {"effort": config.reasoning_level}
+
+    # top_k is likewise non-standard for the typed Chat Completions signature.
     if config.top_k is not None:
         extra_body["top_k"] = config.top_k
 
@@ -2597,8 +2599,6 @@ def _create_openrouter_llm(
     if model_kwargs:
         llm_kwargs["model_kwargs"] = model_kwargs
 
-    # Merge reasoning as first-class kwarg and extra_body for provider-specific params
-    llm_kwargs.update(reasoning_kwargs)
     if extra_body:
         llm_kwargs["extra_body"] = extra_body
 
