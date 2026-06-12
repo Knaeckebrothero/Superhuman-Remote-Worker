@@ -292,3 +292,28 @@ class TestPayloadContractRoundtrip:
             assert backend.read_file("scratch.txt") == "x"
         finally:
             backend.disconnect()
+
+
+# ---------------------------------------------------------------------------
+# _is_lite_config_override — gates scholar/critic/curator subjobs off for lite
+# ---------------------------------------------------------------------------
+class TestLiteSubjobGating:
+    """The git-graft lifecycle subjobs (scholar/critic/curator) are skipped for
+    lite jobs; all three guards key on ``_is_lite_config_override``."""
+
+    def test_lite_backends_detected(self):
+        assert main._is_lite_config_override({"workspace": {"backend": "virtual"}})
+        assert main._is_lite_config_override({"workspace": {"backend": "none"}})
+
+    def test_full_backends_not_lite(self):
+        assert not main._is_lite_config_override({"workspace": {"backend": "sandbox"}})
+        assert not main._is_lite_config_override({"workspace": {"backend": "vm"}})
+
+    def test_missing_or_none_not_lite(self):
+        assert not main._is_lite_config_override(None)
+        assert not main._is_lite_config_override({})
+        assert not main._is_lite_config_override({"llm": {"model": "x"}})
+
+    def test_json_string_override(self):
+        assert main._is_lite_config_override('{"workspace": {"backend": "none"}}')
+        assert not main._is_lite_config_override("not json at all")

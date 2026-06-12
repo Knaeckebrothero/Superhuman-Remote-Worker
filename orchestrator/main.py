@@ -1841,6 +1841,20 @@ def _backend_from_override(config_override: Any) -> Optional[str]:
     return ws.get("backend")
 
 
+def _is_lite_config_override(config_override: Any) -> bool:
+    """True if ``config_override`` selects a lite (``virtual``/``none``) backend.
+
+    Lite tiers have no git/workspace, so the orchestrator's git-graft lifecycle
+    subjobs (scholar/critic/curator) can neither hand their ``output/`` back to
+    the parent nor read the parent's deliverables — that handoff is entirely
+    Gitea-branch-based (see ``_graft_subjob_output``). They are therefore skipped
+    for lite jobs; the main agent researches/curates inline. A lite-compatible
+    handoff (object-store copy instead of git graft) is deferred to v2
+    (no_workspace_agent_mode.md §8).
+    """
+    return _backend_from_override(config_override) in LITE_BACKENDS
+
+
 def _virtual_workspace_rclone_spec() -> Optional[dict[str, Any]]:
     """The deployment's object-store spec for the ``virtual`` tier, or None.
 
@@ -7077,6 +7091,16 @@ async def _spawn_scholar_subjob(
     if job.get("parent_job_id"):
         return None
 
+    # Lite tiers (virtual/none) have no git workspace for the scholar -> parent
+    # output graft, so skip the research subjob (§8). The parent agent still
+    # researches inline (web/SQL/graph/Mongo/KB all work without a workspace).
+    if _is_lite_config_override(config_override):
+        logger.info(
+            f"Scholar skipped for job {job_id}: lite workspace backend has no "
+            f"git workspace for the research-phase graft handoff"
+        )
+        return None
+
     scholar_config = resolve_scholar_config_from_disk(config_name, config_override)
     if not scholar_config.get("enabled", False):
         logger.debug(f"Scholar not enabled for job {job_id} (config={config_name})")
@@ -7714,6 +7738,12 @@ async def _trigger_verification_on_complete(
     if job.get("parent_job_id") is not None:
         logger.debug(f"Skipping verification for {job_id} — it is a sub-job")
         return
+    if _is_lite_config_override(job.get("config_override")):
+        logger.info(
+            f"Critic skipped for job {job_id}: lite workspace backend has no "
+            f"git workspace for the verification subjob handoff"
+        )
+        return
     if not is_verification_enabled(job):
         logger.debug(f"Verification not enabled for job {job_id}")
         return
@@ -7922,6 +7952,12 @@ async def _trigger_curation_final_pass(
     if target_job is None:
         target_job = await postgres_db.get_job(target_job_id)
     if not target_job:
+        return
+    if _is_lite_config_override(target_job.get("config_override")):
+        logger.info(
+            f"Curation skipped for job {target_job_id}: lite workspace backend "
+            f"has no git workspace for the curator subjob handoff"
+        )
         return
     if not is_curation_enabled(target_job):
         return
