@@ -1,510 +1,381 @@
-# Global Expert Management
+---
+tags:
+  - feature
+  - experts
+  - config
+  - capabilities
+  - multi-tenancy
+related:
+  - "[[config_matrix_db_overrides]]"
+  - "[[observability_and_quotas]]"
+  - "[[multi_tenancy]]"
+  - "[[feature_development_pipeline]]"
+aliases:
+  - user-defined experts
+  - custom experts
+  - expert CRUD
+  - capability grants
+  - allowed models
+---
+
+# User-Defined Experts (DB-backed expert management + capability grants)
+
+> Design doc **v2 — 2026-06-11**, from the "users create/edit/improve their own
+> experts" planning conversation. Supersedes the undated v1 draft that
+> previously lived in this file (landed alongside `d861ce1f`); v1's schema
+> bones, API table, UI sketches, and anti-patterns are carried forward where
+> still valid. The two structural changes vs v1: **(a)** bundled YAML experts
+> are *overlaid*, not synced into the DB, mirroring the config-overrides
+> system exactly; **(b)** a **capability-grants** layer (generalizing
+> `users.can_use_vm`) gates what users may bake into an expert.
+
+**Status:** Design / not started.
+**Triggered by:** Live prompt + settings overrides shipped
+([[config_matrix_db_overrides]], migration `0022`). Experts are the natural
+next unit: a named, owned *bundle* (config fragment + persona + display
+metadata) instead of per-leaf overrides. Users should create, edit, share,
+and iterate on their own experts without operator filesystem access.
 
 ## Problem
 
-Experts are currently static YAML files in `config/experts/`, loaded at orchestrator startup and cached in memory. Users cannot create, customize, or share expert configurations without filesystem access to the deployment. This limits the system to a fixed set of built-in experts managed by operators.
-
-### Current limitations
+Experts are static YAML files in `config/experts/`, scanned into an in-memory
+cache at orchestrator startup. Users cannot create, customize, or share expert
+configurations without deployment access.
 
 | Issue | Detail |
 |-------|--------|
 | No user-created experts | Only operators with deployment access can add expert configs |
-| No ownership or sharing | All experts are globally visible, no per-user customization |
-| No project scoping | Project-specific experts require a Gitea jobs repo with `experts/` directory — brittle and undiscoverable |
-| No worker/session distinction in UI | Job creation and session creation show the same expert list, but they need fundamentally different configs (`$extends: defaults` vs `$extends: persistent_defaults`) |
-| No CRUD UI | The cockpit has no dedicated expert management — experts only appear as selection grids inside job/session create flows |
+| No ownership or sharing | All experts globally visible; no per-user customization |
+| Project experts are brittle | Scanned from a Gitea jobs-repo `experts/` directory (`main.py:15224-15352`) — undiscoverable, no UI |
+| No worker/session distinction in UI | Job and session create flows show the same list, but the configs extend different bases (`defaults` vs `persistent_defaults`) with incompatible schemas |
+| No CRUD UI | Experts only appear as selection grids inside job/session create flows |
+| No capability gating | Nothing governs which tools/models/autonomy a user could put in a config if they *could* author one — only `users.can_use_vm` exists, as a one-off boolean column |
 
-### How it works today
+### How it works today (verified anchors)
 
 | Layer | Mechanism | Location |
 |-------|-----------|----------|
-| Config files | YAML with `$extends` inheritance | `config/experts/{name}/config.yaml` |
-| Cache | `_experts_cache` dict, populated by `_scan_experts()` at startup | `main.py:9574-9619` |
-| API (read-only) | `GET /api/experts`, `GET /api/experts/{id}`, `POST /api/experts/reload` | `main.py:9626-9946` |
-| Project experts | Scanned from Gitea jobs repo `experts/` directory | `main.py:9847-9946` |
-| Cockpit | Expert selector grids in job-create and session-create components | `job-create.component.ts`, `session-create.component.ts` |
-| Config resolution | `_load_expert_detail()` merges expert YAML with defaults + settings_matrix | `main.py:9726-9795` |
+| Config files | YAML with `$extends` deep-merge inheritance | `config/experts/{name}/config.yaml`; merge in `src/core/loader.py:224-268` |
+| Name → path resolution (agent) | `resolve_config_path()` scans disk locations | `src/core/loader.py:3122` |
+| Cache + read API | `_experts_cache` + `_scan_experts()`; `GET /api/experts`, `GET /api/experts/{id}`, `POST /api/experts/reload` (admin) | `main.py:14951`, `:15000-15026`, `:15087` (`_load_expert_detail`), `:15166` |
+| Project experts | Gitea jobs-repo `experts/` scan | `main.py:15224-15352` |
+| Selection plumbing | `jobs.config_name`, `threads.metadata.config_name`; provisioners pass `--config {config_name}` + `AGENT_CONFIG` env | `persistent_provisioner.py:496,516`, `agent_provisioner.py:1008` |
+| DB config overrides (the pattern to mirror) | `config_overrides` table → agent loads rows at job first-run behind `CONFIG_DB_OVERRIDES_ENABLED`; lazy text lookup via `MatrixResolver._db_lookup`, eager settings merge | migration `0022`; `src/core/loader.py:60-159`; `src/agent.py:1049-1078`; `src/database/postgres_db.py:976-990` |
+| The existing capability grant | `users.can_use_vm` (default-deny column, admin bypass, kill-switch in `system_settings['vm_workspaces']`, enforced at point of use) | `0001_initial.sql:96-100`; `main.py:1844`; admin PATCH `main.py:18076` |
+| Per-user preference bag | `users.settings` JSONB, self-service `GET/PATCH /api/users/me/settings`; **`settings.persistent_agent` is merged as the base of session `config_override`** | `0001_initial.sql:113`; `main.py:16966/16983`; merge at `main.py:11939-11948` |
+| Subjob expert references | `verification.critic_config` / `scholar.scholar_config` / `curator.curator_config`, defaulting to hardcoded names; sections read from disk only | `main.py:6829, 7522, 7673`; `completion.py:144,196` |
 
-### Why it needs to change
+The `users.settings.persistent_agent → config_override` path matters for
+security: a *user-writable* preference bag already flows into agent config
+today. Capability enforcement must therefore validate the **merged
+dispatch-time result**, not just saved experts — otherwise any expert-level
+check is bypassable via a settings PATCH.
 
-1. **Users need custom experts.** Different teams want domain-specific personas (e.g., "Security Auditor", "Data Pipeline Engineer") without operator intervention.
-2. **Experts should be shareable.** A team lead creates an expert tuned for their project — team members should be able to use it without duplicating config.
-3. **Worker vs session is a first-class distinction.** A "developer" expert that runs phased jobs is fundamentally different from an "interactive developer" for chat sessions. The UI must surface this clearly.
-4. **Parity with datasources.** Datasources already have full CRUD, ownership, global/project scoping, and a dedicated management tab. Experts should follow the same pattern.
+## Locked decisions
 
----
+| # | Decision | Value |
+|---|---|---|
+| 1 | Storage model | **Overlay with fallback**, exactly like prompts/settings overrides: bundled YAML experts stay disk-resolved and canonical; the DB holds only user/admin-created rows. No YAML→DB seeding (v1 draft's sync model dropped — it duplicates truth and needs reload-overwrite hacks). Delete the row → shipped behavior returns. |
+| 2 | Table | Dedicated `experts` table (migration `0026`, **not** `schema.sql` — frozen at cutover). Not a new `kind` in `config_overrides`: owner/visibility columns don't belong there. |
+| 3 | Expert typing | `expert_type ∈ {worker, session}`, immutable after create. Determines the base config (`defaults.yaml` vs `persistent_defaults.yaml`). Structural, not cosmetic — the schemas are incompatible. |
+| 4 | No `$extends` in user configs | The base is implied by `expert_type`. "Start from scholar" = **fork (copy)** of its fragment, not a live link. Live extension chains (cycle/depth/visibility machinery) deferred. |
+| 5 | Selection | Pickers pass **`expert_id` (UUID)**; `jobs` gains a nullable `expert_id` column, threads carry `metadata.expert_id`. `config_name` remains for bundled experts and back-compat. Name-based resolution (automations, MCP convenience): **owner > project-linked > global > bundled** (most-specific wins; a personal fork named `scholar` shadows the bundled one *for that user only*). |
+| 6 | Agent-side resolution | The agent loads the expert row itself at job/session start via the app-DB connection it already holds, behind an `EXPERTS_DB_ENABLED` flag — the same seam and lifecycle as `config_overrides` (load at first-run → merge → freeze into `resolved_config`). Missing row at start = **fail loud**, not silently run on base config. |
+| 7 | Per-expert prompts | `experts.prompts` JSONB (v1 keys: `persona`, `instructions`) injected as the **highest-precedence layer** of the existing resolver chain: expert prompts → family DB override → global DB override → bundled file. Single text per key in v1; per-model-family variants deferred. |
+| 8 | Capability grants | New scoped table `capability_grants(scope_kind ∈ {user, project, global}, scope_id, key, value_json)` + code-side catalog — the principal-scoped twin of `config_overrides` and the generalization of `can_use_vm` (which migrates in). Resolution: user → project → global row → catalog default. Admins bypass. Kill-switch `system_settings['user_experts']`. |
+| 9 | Enforcement points | Twice, like `can_use_vm` today: **save-time** (422 with actionable message; editor greys out ungated controls) and **dispatch-time** on the *full merged config* (expert fragment + project override + `users.settings.persistent_agent` + job/thread `config_override`) against the **runner's** grants. Dispatch check **rejects** (no silent stripping — silent capability downgrades burn debugging time). This single checkpoint also closes the `persistent_agent` self-service hole. |
+| 10 | Hard-deny sections | `llm.api_key`/`env_keys`, `connections`, `workspace.remote` are rejected in user-authored content **regardless of grants** — credentials only ever come from orchestrator dispatch injection (existing invariant). |
+| 11 | Subjob references (v1) | `critic_config`/`scholar_config`/`curator_config` in user experts must name **bundled** experts (validated at save). `completion.py`'s disk readers stay untouched; DB-aware subjob resolution deferred. |
+| 12 | Versioning (v1) | Lite: `version` int incremented on update + `updated_by`. Full history/rollback deferred. Running jobs are already immune to edits via the `resolved_config` freeze. **Test-drive** ships in v1: run a draft as a plain `config_override` without saving. |
+| 13 | Quotas | Separate concern. `quota_limits` stays as designed in [[observability_and_quotas]] (scope-polymorphic, period-based, evaluated by the usage rollup). Grants and quota enforcement share only the dispatch seam. |
+| 14 | Global publishing | Setting `is_global=TRUE` is **admin-only** in v1 (a future `publish_global` grant key can open it up). |
 
-## Design
+## Architecture
 
-### Expert Types
-
-Every expert is either a **worker** expert or a **session** expert. This maps directly to the existing `$extends` mechanism:
-
-| Type | Base Config | Used For | Key Features |
-|------|------------|----------|--------------|
-| **Worker** | `defaults.yaml` | Jobs (phased execution) | Phases, todos, verification, scholar, curator, delegation, autonomy levels |
-| **Session** | `persistent_defaults.yaml` | Persistent threads (interactive chat) | WebSocket sessions, permission_mode, idle_timeout, greeting, no phases |
-
-This distinction is **structural**, not cosmetic — a worker expert cannot be used for a session and vice versa, because they inherit different base configs with incompatible schemas (worker has `delegation`, `verification`, `autonomy`; session has `interactive.permission_mode`, `interactive.greeting`).
-
-### Expert Sources
-
-Experts can come from three sources, with a clear priority order:
-
-| Source | Storage | Managed By | Priority |
-|--------|---------|------------|----------|
-| **Built-in** | YAML files in `config/experts/` | Operators (deployment) | Lowest — fallback defaults |
-| **User-created** | PostgreSQL `experts` table | Users via cockpit UI | Middle — personal customizations |
-| **Project-specific** | PostgreSQL `project_experts` or Gitea repo | Project owners | Highest — project-scoped overrides |
-
-When resolving an expert by name, project-specific > user-created > built-in. This mirrors datasource resolution.
-
-### Ownership Model (same as datasources)
-
-| Field | Purpose |
-|-------|---------|
-| `created_by` | Owner user UUID. NULL for built-in (YAML-sourced) experts |
-| `is_global` | `TRUE` = visible to all users. `FALSE` = visible only to owner |
-
-| Action | Who can do it |
-|--------|--------------|
-| View in expert panel | Owner, or anyone if `is_global = true`, or project member if linked to their project |
-| Use on a job/session | Owner, or anyone if global, or project member if linked to job's/session's project |
-| Link to a project | Owner only |
-| Edit / delete | Owner only (built-in experts are read-only) |
-| Duplicate (fork) | Any user who can view it — creates a new owned copy |
-
----
-
-## Database Schema
-
-### `experts` table
+### `experts` table — migration `0026_experts.sql`
 
 ```sql
 CREATE TABLE IF NOT EXISTS experts (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    name VARCHAR(100) NOT NULL,           -- unique identifier (slug), e.g. "security-auditor"
+    id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name         VARCHAR(100) NOT NULL,        -- slug ^[a-z][a-z0-9_-]*$
     display_name VARCHAR(200) NOT NULL,
-    description TEXT,
-    icon VARCHAR(100) DEFAULT 'smart_toy',
-    color VARCHAR(7) DEFAULT '#6B7280',
-    tags TEXT[] DEFAULT '{}',
-    expert_type VARCHAR(10) NOT NULL DEFAULT 'worker',  -- 'worker' or 'session'
-    config JSONB NOT NULL DEFAULT '{}',   -- expert-specific overrides (merged with defaults at resolution)
-    instructions TEXT,                     -- custom instructions injected into workspace
-    created_by UUID REFERENCES users(id) ON DELETE SET NULL,
-    is_global BOOLEAN NOT NULL DEFAULT FALSE,
-    source VARCHAR(20) NOT NULL DEFAULT 'user',  -- 'builtin', 'user', 'project'
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    updated_at TIMESTAMPTZ DEFAULT NOW()
+    description  TEXT,
+    icon         VARCHAR(100) NOT NULL DEFAULT 'smart_toy',
+    color        VARCHAR(7)   NOT NULL DEFAULT '#6B7280',
+    tags         TEXT[]       NOT NULL DEFAULT '{}',
+    expert_type  VARCHAR(10)  NOT NULL CHECK (expert_type IN ('worker', 'session')),
+    config       JSONB        NOT NULL DEFAULT '{}',  -- fragment vs the type's base; never the merged result
+    prompts      JSONB        NOT NULL DEFAULT '{}',  -- v1 keys: persona, instructions
+    owner_id     UUID         NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    is_global    BOOLEAN      NOT NULL DEFAULT FALSE,
+    version      INTEGER      NOT NULL DEFAULT 1,
+    updated_by   UUID         REFERENCES users(id) ON DELETE SET NULL,
+    created_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
+CREATE UNIQUE INDEX IF NOT EXISTS uq_experts_name_owner ON experts (name, owner_id);
+CREATE INDEX IF NOT EXISTS idx_experts_owner ON experts (owner_id);
+CREATE INDEX IF NOT EXISTS idx_experts_type  ON experts (expert_type);
 
--- Prevent duplicate names per owner
-CREATE UNIQUE INDEX IF NOT EXISTS uq_expert_name_owner
-    ON experts (name, COALESCE(created_by, '00000000-0000-0000-0000-000000000000'));
-
--- Filter by type efficiently
-CREATE INDEX IF NOT EXISTS idx_experts_type ON experts (expert_type);
-
--- Filter by owner
-CREATE INDEX IF NOT EXISTS idx_experts_created_by ON experts (created_by);
-
--- Trigger for updated_at
-CREATE TRIGGER set_experts_updated_at
-    BEFORE UPDATE ON experts
-    FOR EACH ROW EXECUTE FUNCTION update_updated_at();
+-- selection plumbing
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS expert_id UUID REFERENCES experts(id) ON DELETE SET NULL;
 ```
 
-### `project_experts` junction table
+Bundled names are *not* reserved — shadowing is by design (decision 5); the
+UI badges a shadowing expert. `ON DELETE SET NULL` on `jobs.expert_id` is safe
+for history because `resolved_config` is frozen per job.
+
+### `project_experts` junction (same migration)
 
 ```sql
 CREATE TABLE IF NOT EXISTS project_experts (
-    project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-    expert_id UUID NOT NULL REFERENCES experts(id) ON DELETE CASCADE,
-    is_default BOOLEAN DEFAULT FALSE,     -- if TRUE, this is the project's default expert for new jobs/sessions
-    config_override JSONB,                -- project-level config overrides on top of expert config
-    linked_at TIMESTAMPTZ DEFAULT NOW(),
+    project_id      UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    expert_id       UUID NOT NULL REFERENCES experts(id) ON DELETE CASCADE,
+    default_for     VARCHAR(10) CHECK (default_for IN ('worker', 'session')),  -- NULL = linked, not default
+    config_override JSONB,                        -- project-level tweaks on top of the expert fragment
+    linked_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (project_id, expert_id)
 );
-
--- Only one default expert per project per type
+-- one default worker + one default session expert per project
 CREATE UNIQUE INDEX IF NOT EXISTS uq_project_default_expert
-    ON project_experts (project_id, is_default) WHERE is_default = TRUE;
+    ON project_experts (project_id, default_for) WHERE default_for IS NOT NULL;
 ```
 
-### Migration of built-in experts
+(v1 draft amendment: `is_default BOOLEAN` allowed only one default *total*;
+`default_for` allows one per type.)
 
-On startup (or via `POST /api/experts/reload`), sync YAML experts into the `experts` table:
+Linking is owner-driven (link your own or a global expert to projects you're
+a member of). The junction supersedes the Gitea `experts/` directory scan,
+which is deprecated once this ships (read kept during a migration window).
+
+### `capability_grants` — migration `0027_capability_grants.sql`
 
 ```sql
-INSERT INTO experts (name, display_name, description, icon, color, tags, expert_type, config, instructions, source, is_global)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'builtin', TRUE)
-ON CONFLICT (name, COALESCE(created_by, '00000000-0000-0000-0000-000000000000'))
-DO UPDATE SET display_name = EXCLUDED.display_name, description = EXCLUDED.description,
-    icon = EXCLUDED.icon, color = EXCLUDED.color, tags = EXCLUDED.tags,
-    config = EXCLUDED.config, instructions = EXCLUDED.instructions,
-    updated_at = NOW()
-WHERE experts.source = 'builtin';  -- only overwrite built-in, never user-created
+CREATE TABLE IF NOT EXISTS capability_grants (
+    id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    scope_kind VARCHAR(10) NOT NULL CHECK (scope_kind IN ('user', 'project', 'global')),
+    scope_id   UUID,        -- user_id | project_id | NULL for global
+    key        VARCHAR(64)  NOT NULL,
+    value_json JSONB        NOT NULL,
+    granted_by UUID REFERENCES users(id) ON DELETE SET NULL,
+    created_at TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    CHECK ((scope_kind = 'global') = (scope_id IS NULL))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_grants_scope_key
+    ON capability_grants (scope_kind, COALESCE(scope_id, '00000000-0000-0000-0000-000000000000'), key);
+
+-- migrate the existing one-off grant
+INSERT INTO capability_grants (scope_kind, scope_id, key, value_json, granted_by)
+SELECT 'user', id, 'vm_workspace', 'true'::jsonb, NULL FROM users WHERE can_use_vm
+ON CONFLICT DO NOTHING;
 ```
 
-The `expert_type` is derived from the `$extends` field:
-- `$extends: defaults` -> `expert_type = 'worker'`
-- `$extends: persistent_defaults` -> `expert_type = 'session'`
+No FK on `scope_id` (polymorphic — same call as `quota_limits` in
+[[observability_and_quotas]]). `users.can_use_vm` reads switch to the grants
+service in S2; the column drops in a later cleanup migration.
 
----
+**Grant catalog** (code-side, like the config catalog: key, type, default,
+what it gates, description):
 
-## API Endpoints
+| Key | Type | Default | Gates in expert/override config |
+|---|---|---|---|
+| `vm_workspace` | bool | deny | `workspace.backend: vm` (replaces `can_use_vm`) |
+| `shell_tools` | bool | deny | `tools.shell` |
+| `delegation` | bool | deny | `delegation.*`, `tools.delegation` |
+| `datasource_tools` | bool | allow | `tools.sql` / `mongodb` / `graph` |
+| `browser` | bool | allow | `tools.browser_direct` |
+| `model_selection` | list | curated subset | which `models.yaml` entries are pickable (feeds expert editor *and* session model picker) |
+| `autonomy_ceiling` | enum | `review` | max `autonomy` (`full` > `review` > `partial` > `guided` > `dependent`) |
 
-### Global Expert CRUD
+Resolution mirrors expert layering: user row → project row → global row →
+catalog default. Admins bypass everything.
+
+### Resolution flow (agent, job/session start)
+
+```
+1. Dispatch carries expert_id (env AGENT_EXPERT_ID / JobStartRequest field);
+   config_name continues to carry bundled names.
+2. expert_id present + EXPERTS_DB_ENABLED:
+     load row from app DB (postgres_db.py, same pattern as
+     list_overrides_for_family) — missing row => fail job with clear error
+   else: resolve_config_path(config_name) on disk, as today.
+3. Base from expert_type: defaults.yaml | persistent_defaults.yaml.
+4. deep_merge: base <- expert.config (DB fragment or YAML file)
+5. deep_merge: <- project_experts.config_override (orchestrator passes it in dispatch metadata)
+6. Apply model_config_matrix for the resolved model family (existing).
+7. Apply DB config_overrides (existing 0022 layer, family/global).
+8. deep_merge: <- job/thread config_override (existing; per-job overrides win).
+9. experts.prompts entries registered as the top layer of MatrixResolver:
+   expert -> family DB -> global DB -> bundled file.
+10. Freeze into jobs.resolved_config (existing) — edits never touch running work.
+```
+
+The orchestrator needs the same DB read for `_load_expert_detail`
+(`main.py:15087`) so the UI detail view shows the resolved result, and
+`/api/experts` becomes a merge of the disk scan + DB rows visible to the
+caller (owned + project-linked + global), each tagged with `source`.
+
+### Enforcement flow (orchestrator)
+
+```
+Save-time   (POST/PUT /api/experts):  validate fragment against author's
+            grants + hard-deny list => 422 with the offending keys named.
+Dispatch    (job create / session create / automation fire):  validate the
+            FULL merged override stack against the RUNNER's grants
+            => reject with actionable message. Covers experts, per-job
+            overrides, and users.settings.persistent_agent uniformly.
+```
+
+A revoked grant therefore disables affected experts at next dispatch — no
+background sweep needed. Shared/global experts run under the runner's grants,
+not the author's.
+
+## API surface
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| `GET` | `/api/experts` | List experts. Query params: `type` (worker/session), `source` (builtin/user), `include_global` (bool) |
-| `POST` | `/api/experts` | Create user expert. Body: `ExpertCreate` |
-| `GET` | `/api/experts/{id}` | Get expert detail with resolved config (merged with defaults + settings_matrix) |
-| `PUT` | `/api/experts/{id}` | Update expert. Owner only. Built-in experts return 403 |
-| `DELETE` | `/api/experts/{id}` | Delete expert. Owner only. Built-in experts return 403. Cascades to project_experts |
-| `POST` | `/api/experts/{id}/duplicate` | Fork expert as owned copy. Any viewer can duplicate |
-| `POST` | `/api/experts/reload` | Re-sync built-in experts from YAML to DB |
+| `GET` | `/api/experts` | Merged list (bundled + visible DB rows). Query: `type`, `source`, `project_id` |
+| `POST` | `/api/experts` | Create (grant-validated). Body: `ExpertCreate` |
+| `GET` | `/api/experts/{id}` | Detail with resolved config (works for bundled names and UUIDs) |
+| `PUT` | `/api/experts/{id}` | Update, owner only; bumps `version`. Bundled experts → 403 |
+| `DELETE` | `/api/experts/{id}` | Owner only. Bundled → 403. See open question 1 |
+| `POST` | `/api/experts/{id}/duplicate` | Fork as owned copy (any viewer; bundled experts too — this is "start from scholar") |
+| `POST` | `/api/experts/reload` | Existing: re-scan bundled YAML cache (admin) |
+| `GET/POST/PATCH/DELETE` | `/api/projects/{pid}/experts[/{eid}]` | Link / overrides / default-for / unlink |
+| `GET` | `/api/admin/grants?scope_kind=&scope_id=` | List grants + catalog (admin) |
+| `PUT/DELETE` | `/api/admin/grants/{scope_kind}/{scope_id}/{key}` | Set/clear a grant (admin; extends the `main.py:18076` user-update pattern) |
+| `GET` | `/api/users/me/capabilities` | Resolved grant set for the caller (drives editor greying + pickers) |
 
-### Project Expert Linking
-
-| Method | Path | Purpose |
-|--------|------|---------|
-| `GET` | `/api/projects/{pid}/experts` | List experts linked to project (with project-level overrides) |
-| `POST` | `/api/projects/{pid}/experts/{eid}` | Link expert to project |
-| `PATCH` | `/api/projects/{pid}/experts/{eid}` | Update project-level overrides (config_override, is_default) |
-| `DELETE` | `/api/projects/{pid}/experts/{eid}` | Unlink expert from project |
-
-### Request/Response Models
-
-```python
-class ExpertCreate(BaseModel):
-    name: str                             # slug: ^[a-z][a-z0-9_-]*$
-    display_name: str
-    description: str | None = None
-    icon: str = "smart_toy"
-    color: str = "#6B7280"
-    tags: list[str] = []
-    expert_type: Literal["worker", "session"] = "worker"
-    config: dict[str, Any] = {}           # overrides on top of defaults
-    instructions: str | None = None
-    is_global: bool = False
-
-class ExpertUpdate(BaseModel):
-    display_name: str | None = None
-    description: str | None = None
-    icon: str | None = None
-    color: str | None = None
-    tags: list[str] | None = None
-    config: dict[str, Any] | None = None
-    instructions: str | None = None
-    is_global: bool | None = None
-
-class ProjectExpertSettings(BaseModel):
-    is_default: bool | None = None
-    config_override: dict[str, Any] | None = None
-```
-
-### Expert Resolution
-
-The existing `_load_expert_detail()` function needs to work with DB-stored experts in addition to YAML files. Resolution logic:
-
-```python
-async def resolve_expert(expert_id: str, project_id: str | None = None) -> ExpertDetail:
-    # 1. Check project-specific override
-    if project_id:
-        pe = await db.get_project_expert(project_id, expert_id)
-        if pe:
-            expert = await db.get_expert(pe["expert_id"])
-            # Apply project config_override on top
-            if pe.get("config_override"):
-                expert["config"] = _deep_merge(expert["config"], pe["config_override"])
-
-    # 2. Fall back to DB expert (user-created or built-in)
-    if not expert:
-        expert = await db.get_expert_by_name(expert_id)
-
-    # 3. Determine base config from expert_type
-    base = load_defaults(expert["expert_type"])  # defaults.yaml or persistent_defaults.yaml
-
-    # 4. Deep merge: base <- expert config
-    merged = _deep_merge(base, expert["config"])
-
-    # 5. Apply settings_matrix
-    merged = _apply_settings_matrix_to_config(merged, settings_matrix)
-
-    return ExpertDetail(
-        id=expert["name"],
-        display_name=expert["display_name"],
-        config=merged,
-        instructions=expert.get("instructions"),
-        defaults_tools=base.get("tools"),
-        settings_matrix=settings_matrix,
-    )
-```
-
-### Backward Compatibility
-
-The existing `config_name` field on jobs and threads (`VARCHAR(100)`) continues to work:
-- Built-in expert names (e.g., "scholar", "developer") resolve to DB rows with `source='builtin'`
-- User-created experts resolve by `name` field
-- Existing jobs/threads with `config_name` values keep working — resolution checks DB first, falls back to YAML scan if not found (during migration window)
-
----
+MCP server gains the matching tools (`create_expert`, `update_expert`,
+`delete_expert`, `link_expert_to_project`, …) alongside the existing
+`list_experts`/`get_expert`/`reload_experts` (`mcp/client.py:1096-1149`).
 
 ## Cockpit UI
 
-### Experts Tab (new page)
+**Experts page** (nav slot + layout pattern: the datasources tab). List with
+type/source filters; bundled experts badged + read-only with "Duplicate to
+customize"; shadowing experts badged ("overrides built-in *scholar* for you").
 
-Add an "Experts" tab to the cockpit navigation (same position pattern as the existing "Datasources" tab). The page follows the same layout as `datasource-list.component.ts`.
+**Type-aware editor** (v1 surface deliberately small):
+- Identity: name, display name, description, icon, color, tags
+- Persona prompt (textarea — the heart of it) + optional instructions
+- Model picker (entries from resolved `model_selection` grant)
+- Autonomy (capped at `autonomy_ceiling`; higher options greyed with tooltip)
+- Tool toggles (curated; ungated-off toggles greyed per grants)
+- Worker-only: verification/scholar/curator toggles (bundled refs only, decision 11)
+- Session-only: `interactive.permission_mode`, idle timeout, greeting
+- Advanced flap: raw YAML/JSON fragment editor (admin-only in v1)
+- **Test-drive**: launch a session/job with the unsaved draft as `config_override`
 
-#### List View
+Reuses the admin-config building blocks (typed controls from the catalog,
+bundled-default panel, reset semantics) and the tool-category checkboxes from
+`agent-settings`. Job-create filters `type=worker`; session-create
+(`session-create.component.ts`) filters `type=session`; project-linked
+experts listed first with badge. **Admin → Users** grows from the lone VM
+toggle into the grants panel (per-user; project + global grant editing on the
+admin config page).
 
-```
-[Worker ▼] [Session ▼] [All Sources ▼]     [+ New Expert]
+## Slices (each independently shippable)
 
-┌─────────────────────────────────────────────────────────┐
-│  🔬 Scholar                                    builtin  │
-│  Research and deep-dive analysis agent                  │
-│  Tags: research, analysis        Type: worker           │
-│  [Edit] [Duplicate] [Delete]                            │
-├─────────────────────────────────────────────────────────┤
-│  🛠️ Developer                                  builtin  │
-│  Implementation and PR factory                          │
-│  Tags: coding, development       Type: worker           │
-│  [Edit] [Duplicate] [Delete]                            │
-├─────────────────────────────────────────────────────────┤
-│  💬 Interactive                                builtin  │
-│  Conversational persistent sessions                     │
-│  Tags: chat, interactive         Type: session          │
-│  [Edit] [Duplicate] [Delete]                            │
-├─────────────────────────────────────────────────────────┤
-│  🔒 Security Auditor                       user/global  │
-│  Security review and vulnerability analysis             │
-│  Tags: security, audit           Type: worker           │
-│  [Edit] [Duplicate] [Delete]                            │
-└─────────────────────────────────────────────────────────┘
-```
+### Slice 1 — Table + resolution + selection end-to-end
+- Migration `0026` (experts, project_experts, `jobs.expert_id`).
+- CRUD + duplicate endpoints (no grants yet — hard-deny list only; creation
+  admin-gated until S2 if we want belt-and-braces).
+- `/api/experts` merge + DB-aware `_load_expert_detail`.
+- Agent: `EXPERTS_DB_ENABLED` flag, expert-by-id load, base-from-type merge,
+  prompts layer in MatrixResolver, fail-loud on missing row.
+- Dispatch plumbing: `expert_id` through job create, session create
+  (provisioner env), automations.
+- **Acceptance:** create an expert via API → run one job and one session with
+  it on k3d → frozen `resolved_config` contains the fragment and the persona
+  is in the system prompt; deleting the row fails the *next* run loudly;
+  bundled experts unaffected with the flag off.
 
-**Filters:**
-- **Type filter**: Worker / Session / All (default: All)
-- **Source filter**: Built-in / User / All (default: All)
-- Built-in experts show a badge and have Edit/Delete disabled (Duplicate always available)
+### Slice 2 — Grants + enforcement
+- Migration `0027` + catalog + grants service (user → project → global → default).
+- Save-time 422; dispatch-time reject on the merged stack (incl.
+  `persistent_agent`); admin bypass; `system_settings['user_experts']`
+  kill-switch; `can_use_vm` reads switched to grants.
+- Admin Users grants panel + `/api/users/me/capabilities`.
+- **Acceptance:** non-granted user saving a `tools.shell` expert → 422 naming
+  the key; grant revoked after save → next dispatch rejected with message; a
+  `persistent_agent` settings PATCH smuggling `tools.shell` → session create
+  rejected; VM gating behaves identically to the old column; admin bypasses.
 
-#### Create/Edit Form
+### Slice 3 — Cockpit
+- Experts page (list/create/edit/fork/delete), type-aware editor, greyed
+  ungated controls fed by `/api/users/me/capabilities`, grant-fed model picker,
+  picker integration (id-based, type-filtered, badges), project settings
+  expert section (link/override/default-for).
+- **Acceptance:** full lifecycle through the UI by a non-admin; bundled expert
+  opens read-only with working fork; session-create shows only session
+  experts; ungated controls visibly disabled, not hidden.
 
-The form is **type-aware** — selecting Worker vs Session changes which config sections are available:
+### Slice 4 — Iteration polish
+- Version counter surfaced + `updated_by`; test-drive button; per-expert
+  outcome stats on the detail page (success rate / avg phases from `jobs`
+  by `expert_id`; cost column once the [[observability_and_quotas]] ledger
+  lands); deprecate the Gitea `experts/` scan.
+- **Acceptance:** editing an expert bumps the visible version and never
+  changes an in-flight job; test-drive runs an unsaved draft; stats panel
+  matches a hand-run SQL count.
 
-```
-Expert Type:  (o) Worker   ( ) Session
+### Deferred (explicitly out of v1)
+- **AI-assisted "improve this expert"** — a builder/persistent session that
+  reads the expert + transcripts of jobs that used it and proposes edits.
+  Own design round once CRUD is proven.
+- Live `$extends` chains between DB experts; per-model-family prompt variants
+  in DB experts; per-expert `model_config_matrix` overlays; share-by-link;
+  full version history/rollback; DB-aware subjob expert resolution +
+  transitive grant checks for delegation chains; `publish_global` grant key.
 
-Name:         [security-auditor        ]
-Display Name: [Security Auditor        ]
-Description:  [Security review and ... ]
-Icon:         [verified_user  ] (picker)
-Color:        [#EF4444] (color picker)
-Tags:         [security] [audit] [+]
-Global:       [x] Visible to all users
+## Anti-patterns (carried from v1, amended)
 
-── LLM Settings ──────────────────────
-Model:        [anthropic/claude-sonnet-4-6    ▼]
-Reasoning:    [high ▼]
+1. Mixing worker and session config in one expert — `expert_type` is immutable.
+2. ~~Overwriting built-in DB rows on reload~~ → built-ins are **never in the
+   DB**; the overlay makes reload-sync machinery unnecessary.
+3. Storing resolved config in `experts.config` — fragments only; resolution at
+   load time so base changes propagate.
+4. Name as primary key — UUIDs; uniqueness is `(name, owner_id)`.
+5. User-supplied `$extends` — the base is implied by `expert_type` (decision 4).
+6. **New:** enforcing grants only at save time — revocation and shared experts
+   make dispatch-time the check that matters; save-time is UX.
 
-── Tools ─────────────────────────────
-[x] workspace    [x] core    [x] research
-[ ] shell        [x] git     [ ] citation
-...
+## Out of scope
 
-── Instructions ──────────────────────
-[                                       ]
-[  Custom instructions for this expert  ]
-[                                       ]
+- Quotas and spend limits → [[observability_and_quotas]] (`quota_limits`) and
+  its billing follow-on. Same dispatch seam eventually, different evaluator.
+- User preference storage → `users.settings` already exists; grants are
+  deliberately a separate, admin-writable table.
+- Org-level expert namespaces → [[multi_tenancy]] M2.
 
-── Advanced (worker only) ────────────
-Autonomy:     [review ▼]
-Verification: [x] Enable critic review
-Scholar:      [ ] Enable research phase
-...
+## Open questions
 
-── Advanced (session only) ───────────
-Permission:   [supervised ▼]
-Idle Timeout: [30] minutes
-Greeting:     [Hello! I'm ready to ...]
+1. **Deletion semantics** when automations/threads reference an expert:
+   block while referenced vs delete + fail-loud at next dispatch (S1 behavior).
+   Lean: allow delete, fail loud — consistent with decision 6 and the freeze;
+   add a "referenced by N automations" warning in the UI.
+2. **Project-linked experts ↔ project datasources**: should a project-default
+   expert auto-attach the project's datasources? (v1 keeps them independent.)
+3. **Grant granularity for datasource tools**: one `datasource_tools` key or
+   per-kind (`sql`/`mongodb`/`graph`)? Catalog makes splitting later cheap.
+4. **Editor advanced flap**: admin-only (v1) or its own grant key?
+5. Does the session model picker's existing free choice need to be narrowed by
+   `model_selection` in S2, or grandfathered until S3? (Lean: enforce in S2 —
+   dispatch validates anyway; UI catches up in S3.)
 
-                        [Cancel] [Save]
-```
+## References
 
-**Key behaviors:**
-- Switching type resets type-specific advanced sections
-- The config editor shows a structured form (not raw JSON) matching the existing `agent-settings.component.ts` pattern
-- Built-in experts open in read-only mode with a "Duplicate to customize" button
-- The tool selector reuses the existing tool category checkboxes from `agent-settings`
-
-### Job Create: Expert Selector
-
-The existing expert selector grid in `job-create.component.ts` filters to show **only worker-type experts**:
-
-```typescript
-// Current: shows all experts
-this.experts = this.apiService.getExperts();
-
-// New: filter by type
-this.experts = this.apiService.getExperts({ type: 'worker' });
-```
-
-Additionally, project-linked experts appear first (with a project badge), followed by global/owned experts.
-
-### Session Create: Expert Selector
-
-The existing selector in `session-create.component.ts` filters to show **only session-type experts**:
-
-```typescript
-this.experts = this.apiService.getExperts({ type: 'session' });
-```
-
-### Project Settings: Expert Tab
-
-Add an "Experts" section to project settings (alongside the existing datasources section):
-
-```
-Linked Experts                              [+ Link Expert]
-
-┌─────────────────────────────────────────────────────────┐
-│  🛠️ Developer               ⭐ Default for jobs         │
-│  Config override: reasoning_level=high                  │
-│  [Set Default] [Override Config] [Unlink]               │
-├─────────────────────────────────────────────────────────┤
-│  💬 Interactive              ⭐ Default for sessions     │
-│  No overrides                                           │
-│  [Set Default] [Override Config] [Unlink]               │
-└─────────────────────────────────────────────────────────┘
-```
-
-**Project-level overrides:**
-- `is_default`: One default worker expert for jobs, one default session expert for sessions
-- `config_override`: Project-specific tweaks (e.g., always use high reasoning, enable specific tools)
-
----
-
-## Config Resolution (updated flow)
-
-The current resolution chain adds a DB lookup step:
-
-```
-1. Determine expert_type from DB record
-2. Load base config:
-   - worker  -> config/defaults.yaml
-   - session -> config/persistent_defaults.yaml
-3. Deep merge: base <- expert.config (from DB)
-4. Deep merge: <- project config_override (if project-linked)
-5. Deep merge: <- job/thread config_override (per-job overrides from UI)
-6. Apply settings_matrix (model-family defaults)
-7. Result: resolved_config stored on job/thread
-```
-
-This preserves the existing `$extends` semantics but moves the expert config source from YAML files to DB rows, with YAML files serving as seed data for built-in experts.
-
----
-
-## MCP Server Integration
-
-Update the existing MCP tools to support the full expert lifecycle:
-
-| Tool | Current | New |
-|------|---------|-----|
-| `list_experts` | Lists YAML-based experts | Lists all experts (built-in + user) with type filter |
-| `get_expert` | Reads YAML config | Reads from DB with full resolution |
-| `reload_experts` | Rescans YAML directory | Re-syncs YAML -> DB for built-in experts |
-| `create_expert` | N/A | Creates user expert via DB |
-| `update_expert` | N/A | Updates user expert |
-| `delete_expert` | N/A | Deletes user expert |
-| `link_expert_to_project` | N/A | Links expert to project |
-| `unlink_expert_from_project` | N/A | Unlinks expert from project |
-
----
-
-## Migration Plan
-
-### Phase 1: Database + API (backend)
-
-| Change | File | What |
-|--------|------|------|
-| Add `experts` table | `schema.sql` | New table with indexes and trigger |
-| Add `project_experts` table | `schema.sql` | Junction table for project linking |
-| Seed built-in experts | `postgres.py` | `sync_builtin_experts()` reads YAML, upserts to DB |
-| CRUD methods | `postgres.py` | `create_expert`, `get_expert`, `update_expert`, `delete_expert`, `list_experts` |
-| Project linking methods | `postgres.py` | `link_expert_to_project`, `unlink_expert_from_project`, `list_project_experts` |
-| Resolution method | `postgres.py` | `resolve_expert()` with full merge chain |
-| REST endpoints | `main.py` | CRUD + project linking + duplicate + reload |
-| Update `_load_expert_detail` | `main.py` | Read from DB instead of YAML cache |
-| Update `list_experts` endpoint | `main.py` | Add `type` and `source` query params |
-
-**Result**: Full expert CRUD via API. Existing job/session creation works unchanged — `config_name` resolves via DB.
-
-### Phase 2: Cockpit UI
-
-| Change | File | What |
-|--------|------|------|
-| Expert list page | `cockpit/src/app/simple/pages/experts/` | New page component with CRUD |
-| Expert form component | `cockpit/src/app/shared/components/expert-form/` | Type-aware create/edit form |
-| Navigation update | Shell/layout components | Add "Experts" tab |
-| API service methods | `api.service.ts` | `createExpert`, `updateExpert`, `deleteExpert`, etc. |
-| API models | `api.model.ts` | `Expert`, `ExpertDetail`, `ExpertCreate`, `ExpertUpdate` interfaces |
-| Job create filter | `job-create.component.ts` | Filter experts to `type=worker` |
-| Session create filter | `session-create.component.ts` | Filter experts to `type=session` |
-| Project expert linking | Project settings component | Link/unlink experts, set defaults, config overrides |
-
-**Result**: Full expert management UI with type-aware filtering.
-
-### Phase 3: Advanced features (deferred)
-
-| Feature | What |
-|---------|------|
-| Expert versioning | Track config changes over time, rollback to previous versions |
-| Expert templates | Pre-built starting points for common use cases |
-| Expert sharing | Share expert via link/code without making globally visible |
-| Expert analytics | Track which experts are most used, success rates by expert |
-| Expert validation | Validate config against schema before save, surface errors in UI |
-
----
-
-## Files to Modify
-
-### Phase 1
-
-| File | Changes |
-|------|---------|
-| `orchestrator/database/schema.sql` | Add `experts` and `project_experts` tables |
-| `orchestrator/database/postgres.py` | Add expert CRUD + linking + resolution methods |
-| `orchestrator/main.py` | Add CRUD endpoints, update `_load_expert_detail`, update `_scan_experts` to seed DB |
-| `orchestrator/mcp/server.py` | Add create/update/delete/link expert MCP tools |
-| `orchestrator/services/formatters.py` | Update expert formatting for new fields |
-
-### Phase 2
-
-| File | Changes |
-|------|---------|
-| `cockpit/src/app/core/models/api.model.ts` | Add expert CRUD interfaces |
-| `cockpit/src/app/core/services/api.service.ts` | Add expert CRUD + linking methods |
-| `cockpit/src/app/simple/pages/experts/` | New expert list page (follows datasource-list pattern) |
-| `cockpit/src/app/shared/components/expert-form/` | New type-aware expert form component |
-| `cockpit/src/app/simple/simple-shell.component.ts` | Add "Experts" tab to navigation |
-| `cockpit/src/app/shared/components/job-create/job-create.component.ts` | Filter to worker experts |
-| `cockpit/src/app/shared/components/session-create/session-create.component.ts` | Filter to session experts |
-
----
-
-## Anti-Patterns to Avoid
-
-1. **Mixing worker and session configs in one expert.** The two types have incompatible schemas. An expert is always one or the other — enforced at creation time, immutable after.
-2. **Allowing edits to built-in experts.** Built-in experts are operator-managed via YAML. Users fork (duplicate) them instead of editing. The DB rows with `source='builtin'` are overwritten on reload.
-3. **Storing resolved config in the experts table.** The `config` column stores only the expert's overrides, not the merged result. Resolution happens at read time, ensuring base config changes propagate immediately.
-4. **Using expert name as primary key.** Names can collide across owners. Use UUID primary key, enforce uniqueness on `(name, owner)`.
-5. **Letting users create experts with `$extends` in config.** The `$extends` mechanism is implicit — `expert_type` determines the base config. The config column contains only overrides, never meta-directives.
-
-## Open Questions
-
-1. **Should project-linked experts inherit project datasource settings?** E.g., a project's "developer" expert auto-gets the project's linked datasources. Currently datasources and experts are selected independently per job — coupling them adds convenience but reduces flexibility.
-2. **Should experts have their own settings_matrix overrides?** Currently, per-expert `settings_matrix.yaml` is supported for YAML experts. Do user-created experts need this, or is the global matrix sufficient?
-3. **How to handle expert deletion when jobs reference it?** Options: soft-delete (mark inactive), prevent deletion if referenced, or fall back to built-in default. Recommend: prevent deletion if active jobs exist, allow if only historical.
+- [[config_matrix_db_overrides]] — the overlay pattern this mirrors
+  (migration `0022`, loader seam `src/core/loader.py:60-159`, admin editor).
+- [[observability_and_quotas]] — `quota_limits` / `usage_rates` siblings;
+  scope-polymorphic table convention `(scope_kind, scope_id, …)`.
+- [[multi_tenancy]] — Tier 0 admission + visibility model the expert
+  visibility rules compose with.
+- `docs/db_migration.md` — migration file conventions (`0026`/`0027`,
+  no `schema.sql` edits).
+- `users.can_use_vm` (`0001_initial.sql:96-100`, `main.py:1844`, `:18076`) —
+  the grant pattern being generalized.
+- `users.settings.persistent_agent` merge (`main.py:11939-11948`) — the
+  existing user-writable config path dispatch-time enforcement must cover.

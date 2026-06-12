@@ -72,6 +72,17 @@ python -m eval.memory.run --dataset eval/memory/data/longmemeval_s.json \
 # 6. Reports & A/B:
 python -m eval.memory.report eval/memory/runs/<run>
 python -m eval.memory.report eval/memory/runs/<runA> eval/memory/runs/<runB>
+
+# 7. End-task accuracy (reader + LongMemEval judge over a finished run):
+export EVAL_READER_MODEL=... EVAL_READER_BASE_URL=... EVAL_READER_API_KEY=...
+export EVAL_JUDGE_MODEL=...  # both fall back to EVAL_AUX_*
+python -m eval.memory.judge eval/memory/runs/<run>
+python -m eval.memory.judge eval/memory/runs/<run> --calibrate labels.json
+
+# 8. Contradiction-survival probe (fact → supersede → query):
+python -m eval.memory.run --dataset eval/memory/fixtures/contradiction_probe.json \
+  --arm <arm> --out eval/memory/runs/contra_<arm>
+python -m eval.memory.contradiction eval/memory/runs/contra_<arm> --reader
 ```
 
 Seam-mode arms additionally need the extraction model: fill the
@@ -98,8 +109,19 @@ export EVAL_VECTOR_DSN="postgresql://srw:<VECTOR_POSTGRES_PASSWORD>@localhost:15
 
 ## Cost & scale guidance
 
-- **verbatim**: one embedding call per round (+1 per assemble). Full
-  LongMemEval_S (500 questions × ~50 sessions) is embedding-only — fine.
+- **verbatim**: embeddings only. Each question's round texts are
+  batch-primed up front (`PrimedEmbedding`, 32 texts/request → ~8
+  requests per ~250-round question instead of ~250) and `store()` then
+  consumes the cache; vectors are identical either way. Batching cuts
+  request overhead and retry exposure, but it cannot beat the backend's
+  *throughput*: the k3d-default endpoint (`qwen3-embedding-8b-strix`)
+  serializes at **~0.8 unique texts/s** however you slice it (parallel
+  singles, batches — same rate; beware benchmarking with near-identical
+  texts, prefix caching makes it look 20–50× faster). At that rate the
+  full _S set (~124k rounds) is ~42 h; a stratified `--limit 100` is
+  ~9 h and statistically sufficient for the ballpark check (recall@5
+  SE ≈ 0.04). Same `--out`/`--run-id` resumes, so a subset run can be
+  extended to the full set later.
 - **seam**: extraction fires per `observer_interval` turns **and** per
   session end → roughly `sessions × (1 + turns/interval)` aux calls per
   question (~50–80 for _S questions). Start with `--limit 10..20`
@@ -135,19 +157,58 @@ questions is then the recorded **current-system baseline**.
 - The extraction-window cap (`_MAX_OBSERVATION_WINDOW`) applies as in
   production.
 
+## End-task accuracy (judge.py)
+
+Two stages over a finished run's `results.jsonl` (each row carries the
+question, gold answer, and the production-rendered `injected_context`
+captured at answer time — judging needs no DB and no dataset file):
+
+1. **Reader**: a chat model answers the question from the injected block
+   only. Fixed frame across arms, so the block is the only variable.
+2. **Judge**: the verbatim LongMemEval `evaluate_qa.py` prompts (per
+   question type; abstention variant for `*_abs`), temperature 0,
+   max_tokens 10, verdict = `"yes" in response.lower()`. Reusing the
+   paper's protocol inherits its published calibration; run
+   `--calibrate labels.json` (`{question_id: true|false}` hand labels)
+   to measure *our* judge model's agreement — target >97 %, re-judge
+   with a stronger `EVAL_JUDGE_MODEL` if below.
+
+Outputs `judge.jsonl` (resume-safe) + `judge_summary.json` (accuracy
+overall / by type / `abstention_score`). Retrieval metrics and end-task
+accuracy stay separate on purpose: reading is its own bottleneck
+(brief 05) — compare both columns before attributing a delta.
+
+## Contradiction-survival probe (contradiction.py)
+
+`fixtures/contradiction_probe.json`: 8 LongMemEval-schema instances
+(fact stated → fillers → fact superseded → fillers) with a `probe` block
+naming the old/new values and their sessions. Any arm ingests it through
+the normal runner; the scorer then reports, per layer:
+
+- retrieval order: `update_injected` / `update_above_original`
+- reading (`--reader`): answers classified **current / stale / miss** by
+  exact substring — no judge LLM; mentioning old + new counts as current
+  (the knowledge-update convention).
+
+`stale` survival on the seam arm is the Phase-4 acceptance metric; the
+knowledge-update slice of the real-data judge run is the same signal
+in vivo.
+
 ## Layout
 
 ```
 arms/        committed arm YAMLs (config variants under test)
-fixtures/    tiny committed LongMemEval-schema dataset (tests + smoke)
+fixtures/    committed LongMemEval-schema datasets (tests + smoke + probe)
 data/        real datasets (gitignored)
 runs/        results.jsonl / summary.json / report.md / run.log (gitignored)
 datasets.py  loader + typed records + stratified subsetting
 arms.py      ArmSpec + production-loader config resolution
 infra.py     DB/migrations/embeddings/aux-LLM/manager builders + scope uuids
-ingest.py    seam + verbatim session replay (capture events)
+ingest.py    seam + verbatim session replay (+ batch-primed embeddings)
 query.py     question-time assemble + provenance → session ranking
 metrics.py   Recall@k / NDCG@k / coverage / aggregation
+judge.py     reader + LongMemEval LLM-judge + calibration
+contradiction.py  probe scorer (retrieval order + current/stale/miss)
 run.py       CLI runner (resume-safe, concurrent per question)
 report.py    markdown rendering + arm-vs-arm deltas
 ```
@@ -157,11 +218,8 @@ Tests: `tests/test_memory_eval_harness.py` (fully offline — fakes via the
 
 ## Phase-2 slices still to build here
 
-- **End-task accuracy**: answer questions with a reader LLM over the
-  injected block; calibrated LLM-judge (>97 % agreement target on a
-  hand-labelled slice); abstention sub-score. Scored separately from
-  retrieval by design (reading is its own bottleneck — brief 05).
-- **Contradiction-survival probe**: store fact → supersede → query
-  (current or stale?) — the Phase-4 acceptance metric.
 - **Production-trace set**: bespoke second dataset from real jobs/threads
-  once the LongMemEval loop is trusted.
+  now that the LongMemEval loop is trusted.
+- Recall-shape (single- vs multi-hop) is covered by the by-type slices:
+  `multi-session` coverage@k *is* the multi-hop signal; a finer per-hop
+  breakdown only if the Phase-7 graph verdict needs it.

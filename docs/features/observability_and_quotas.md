@@ -51,7 +51,7 @@ change. This is the cost-isolation equivalent of the data-isolation work in
 |---|---|---|
 | 1 | Metering ownership | App-layer, self-owned. Cloud-agnostic. Never derive per-user cost from cloud billing APIs. |
 | 2 | This round's posture | Read-side only: meter + surface + **alert**. No dispatch blocking, no wallet. |
-| 3 | Storage of record | **One append-only `usage_events` ledger** in the existing `analytics` TimescaleDB, *not* an ops TSDB. |
+| 3 | Storage of record | **One append-only `usage_events` ledger** in the product's observability store **`srw-auditdb`** (in-chart plain Postgres, partition machinery from the audit-store work). *Amended 2026-06-11 — was: homelab `analytics` TimescaleDB. Reasons: shippability (the ledger is product billing substrate; `analytics` is homelab infra outside the chart) + TSL licensing for redistributed charts. See `database_architecture.md`. The homelab Timescale keeps ops analytics + $/vcpu-hour rate calibration.* |
 | 4 | Cost taxonomy | Single ledger, `category ∈ {llm, compute, query, storage}` ("utility costs" = compute + query). |
 | 5 | Compute cost basis | **Requests × wall-clock** (reserved capacity), not sampled utilization, not limits. |
 | 6 | Rate config | One DB-backed, effective-dated rate table keyed by `(category, resource, unit)`, in the **app DB**. |
@@ -71,8 +71,9 @@ and a completion-tokens row), which keeps `quantity/unit/rate/cost` scalar and m
 to the rate table.
 
 ```
--- analytics TimescaleDB (datawarehouse), schema owned by orchestrator
-usage_events  -- hypertable, time dimension = ts
+-- srw-auditdb (observability store; amended 2026-06-11, was analytics TimescaleDB),
+-- schema owned by migrations/audit/ (lands as 0002 with Slice 1)
+usage_events  -- monthly range-partitioned on ts (audit-store partition machinery)
   id           bigint
   ts           timestamptz        -- when the usage occurred / interval end
   user_id      uuid               -- attribution target (nullable for system events)
@@ -91,27 +92,28 @@ usage_events  -- hypertable, time dimension = ts
 - **`rate_usd` is snapshotted onto the row.** History is immutable; changing a rate
   never rewrites past cost. (Same principle as storing `cost_usd` rather than joining
   at read time.)
-- TimescaleDB **continuous aggregates** roll `usage_events` up to
+- An **orchestrator-timer rollup** (plain SQL over recent partitions; same
+  pattern as the audit store's maintenance loop) maintains
   `usage_daily(user_id, project_id, category, day, tokens|quantity, cost_usd)` —
-  cheap to read, compressed raw retained for audit.
+  cheap to read; raw events retained per auditdb retention, droppable once
+  rolled up. *(Amended 2026-06-11 — was TimescaleDB continuous aggregates.)*
 
 ### Where it lives, and the cross-DB join
 
 | Data | Store | Why |
 |---|---|---|
-| `usage_events` (high volume, time-series) | **`analytics` TimescaleDB** (`datawarehouse-lb…:5432`) | App DB is plain `postgres:15` — no hypertables/compression/continuous-aggregates. Reuse existing infra (pdu-scraper already writes here). |
+| `usage_events` (high volume, time-series) | **`srw-auditdb`** (in-chart observability store) | Keeps the firehose off the control plane, ships with the product, reuses the audit store's pool/partition/retention machinery. *(Amended 2026-06-11 — was `analytics` TimescaleDB; see `database_architecture.md`.)* |
 | `usage_daily` rollup mirror (small, joinable) | **App DB** | The Cockpit dashboard must join usage with user/job/project names. Mirror the daily continuous-aggregate into the app DB so the product reads **one** DB; raw high-res events stay in analytics. |
 | `usage_rates` (config) | **App DB** | Small relational config; admin-editable. Fits the [[config_matrix_db_overrides]] DB-override pattern. |
 | `quota_limits` (config) | **App DB** | Same. |
 
-New wiring required (none exists today): an orchestrator connection pool to `analytics`
-(`datawarehouse-lb.datawarehouse.svc.cluster.local:5432`, DB `analytics`) + a dedicated
-`srw_metering` role, following the `pdu_scraper` user pattern. **Gotcha (documented in
-pdu-scraper):** use the `datawarehouse-lb` service, not the chart's `timescaledb`
-ClusterIP — the latter selects `role=master` but this Patroni/Spilo version labels the
-leader `role=primary`, so it has no endpoints. Schema is applied by the orchestrator at
-startup (extend `database/migrate.py` with an `analytics` target, or a one-off
-init-SQL mirroring pdu-scraper's `10-schema.sql`).
+New wiring required: **none beyond the audit-store foundation** *(amended
+2026-06-11)* — the orchestrator's auditdb pool, the `migrations/audit/` family,
+and the partition machinery all come from `postgres_audit_store_implementation.md`
+PR 1; `usage_events` is an additive `0002` migration. The old plan's
+`datawarehouse-lb` gotcha (Patroni labels the leader `role=primary`, so the
+chart's `timescaledb` ClusterIP has no endpoints) now matters only for
+rate-calibration reads of pdu data, not for the ledger.
 
 ### The rate table
 
@@ -247,9 +249,19 @@ Resolves the "don't build more on MongoDB" concern *without* gating monitoring o
 - **This layer is Mongo-independent.** LLM cost rows are emitted at the token-capture point (`src/core/archiver.py:393`, from `response.response_metadata`) — the *same upstream source* that feeds `llm_requests`, **not** a read of it. The `usage_events` ledger is in effect a better-typed, HA-capable `llm_requests`, so this work is the **first step of replacing** Mongo, not weight on top of it.
 - **It also stands up the foundational store any Mongo retirement needs:** the orchestrator↔TimescaleDB connection, hypertable schema management, and the non-blocking event-write path. (Whether agents write the ledger directly — as they write Mongo today — or report through the orchestrator is a design call this layer settles; the migration of `agent_audit`/`llm_requests` then reuses whichever path we pick.) Monitoring-first de-risks and pays for that foundation; migrating-first builds the same foundation with no user-facing payoff in between.
 
-The broader Mongo→Postgres/TimescaleDB consolidation is its **own initiative, not a prerequisite here.** When it happens, the clean split is by nature, not "everything into one Postgres":
-- `agent_audit` + `llm_requests` → **TimescaleDB hypertables** (time-series, co-located with `usage_events`, reusing this layer's plumbing).
-- `chat_history` → **app-DB `thread_messages`**, converging the worker path with the already-Postgres interactive path (one message store, under the G5 visibility model).
+**Amended 2026-06-11 — the consolidation initiative now exists and the
+dependency inverted.** `postgres_audit_store_implementation.md` (validated
+DDL, adapter spec, 7-PR plan) stands up `srw-auditdb` and migrates all three
+collections there with wire parity; **this metering layer reuses *its*
+foundation** (pool, migration family, partition machinery) rather than
+building its own. Two deltas vs the sketch below as originally written:
+- `agent_audit` + `llm_requests` → **`srw-auditdb` plain-Postgres partitioned
+  tables** (not Timescale hypertables) — co-located with `usage_events` as
+  envisioned, engine per `database_architecture.md` (TSL/shippability).
+- `chat_history` → **stays a separate auditdb table with wire parity** for
+  the migration; the `thread_messages` convergence ("one message store",
+  G5 visibility model) is explicitly decoupled as a later *product*
+  initiative — the byte-parity migration keeps that door open.
 
 Cost driver: whether existing audit history must be preserved (dual-write + backfill) or a **forward-only cutover** is acceptable (far cheaper; fine on dev/thesis). Independent win that justifies eventual retirement: it removes today's single-replica, un-HA'd Mongo SPOF — the HA roadmap invests in CloudNativePG for Postgres but has no Mongo HA story. Tracked separately (issue doc TBD).
 
@@ -264,7 +276,7 @@ Cost driver: whether existing audit history must be preserved (dual-write + back
 ## Open questions
 
 1. Compute cost basis edge: bill on `requests` only, or `max(requests, observed)` for pods that burst past requests toward their limit? (Lean: requests only — simpler, defensible, matches node-packing.)
-2. Analytics schema management: extend `database/migrate.py` with an `analytics` target, or a standalone init-SQL like pdu-scraper? (Lean: extend `migrate.py` for one source of truth.)
+2. ~~Analytics schema management~~ **Resolved 2026-06-11**: the `migrations/audit/` family owns the schema (`usage_events` = `0002`); same runner, one source of truth.
 3. `usage_daily` mirror: push from a TimescaleDB continuous-aggregate refresh hook, or pull on an orchestrator timer? (Lean: orchestrator timer — no cross-DB triggers.)
 4. Soft-quota thresholds: fixed (80/100%) or admin-configurable per limit?
 5. Homelab compute rate: derive empirically from pdu power now, or ship a placeholder and calibrate later?
