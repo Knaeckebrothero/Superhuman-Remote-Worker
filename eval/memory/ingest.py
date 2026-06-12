@@ -193,6 +193,25 @@ def _verbatim_round_texts(session: LMESession, arm: ArmSpec) -> List[str]:
     return texts
 
 
+def _form_query_text(handles: HarnessHandles, messages: List[Any]) -> str:
+    """Production-faithful query formation: the persistent loop's exact
+    flag switch (memory.query.digest → unified digest, else legacy
+    last-user-message) so digest arms measure the real read path."""
+    from src.services.memory.plugins.legacy import build_persistent_query_text
+
+    query_cfg = getattr(handles.config.memory, "query", None)
+    if query_cfg is not None and query_cfg.digest:
+        from src.services.memory.query import build_digest_query_text
+
+        return build_digest_query_text(
+            messages,
+            None,
+            window=query_cfg.digest_window,
+            max_chars_per_message=query_cfg.digest_max_chars_per_message,
+        )
+    return build_persistent_query_text(messages)
+
+
 async def _replay_session_seam(
     session: LMESession,
     arm: ArmSpec,
@@ -203,7 +222,6 @@ async def _replay_session_seam(
     from langchain_core.messages import AIMessage, HumanMessage
 
     from src.services.memory import AssembleRequest, CaptureEvent
-    from src.services.memory.plugins.legacy import build_persistent_query_text
 
     model = getattr(handles.config.llm, "model", None)
     messages: List[Any] = []
@@ -217,7 +235,7 @@ async def _replay_session_seam(
         if arm.ingestion.read_path_per_turn:
             payload = await manager.assemble(
                 AssembleRequest(
-                    query_text=build_persistent_query_text(messages),
+                    query_text=_form_query_text(handles, messages),
                     model=model,
                 )
             )

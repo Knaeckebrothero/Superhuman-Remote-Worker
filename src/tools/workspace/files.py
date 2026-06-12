@@ -138,6 +138,17 @@ def create_file_tools(context: ToolContext) -> List[Any]:
         )  # ~25k words
         max_read_words = int(max_read_size_legacy / 5.5)
 
+    # Token-derived ceiling (session_silent_failure_audit.md #5): one tool
+    # result must not occupy more than ~15% of the main model's context
+    # window (~0.75 words/token). The configured max_read_words still rules
+    # when smaller; this bites only when the window is small relative to it —
+    # four unbounded PDF reads once filled a 128k window to 183%.
+    model_window = context.get_config("model_max_context_tokens")
+    if model_window:
+        derived_cap = int(model_window * 0.15 * 0.75)
+        if derived_cap < max_read_words:
+            max_read_words = max(derived_cap, 1_000)
+
     # Initialize PDF reader with word limit
     pdf_reader = PDFReader(max_words_per_read=max_read_words)
 

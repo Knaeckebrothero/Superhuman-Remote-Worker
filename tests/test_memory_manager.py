@@ -9,7 +9,12 @@ get their own equivalence-fixture suites in the follow-up slices.
 from types import SimpleNamespace
 
 import pytest
-from langchain_core.messages import AIMessage, ToolMessage
+from langchain_core.messages import (
+    AIMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
 
 import src.services.memory.registry as registry_module
 from src.core.loader import MemoryConfig, MemoryPipelineConfig, _parse_memory_config
@@ -836,3 +841,313 @@ class TestBoundedPolicy:
 
     def test_bounded_is_registered(self):
         assert "bounded" in available_memory_plugins("policy")["policy"]
+
+    # --- B5: include_knowledge — one token budget across memory + KB ---
+
+    @pytest.mark.asyncio
+    async def test_include_knowledge_counts_kb_tokens_against_budget(self):
+        items = [
+            Scored(candidate=make_candidate(text="m1", tokens=40, record_id="m1")),
+            Scored(
+                candidate=make_candidate(
+                    kind="knowledge", text="k1", tokens=40, record_id="k1"
+                )
+            ),
+            Scored(
+                candidate=make_candidate(
+                    kind="knowledge", text="k2", tokens=40, record_id="k2"
+                )
+            ),
+        ]
+        kept = await self._policy(max_tokens=80, include_knowledge=True).apply(
+            self._req(), items
+        )
+        assert [i.candidate.text for i in kept] == ["m1", "k1"]
+
+    @pytest.mark.asyncio
+    async def test_include_knowledge_max_items_stays_memory_only(self):
+        # Knowledge never counts toward max_items — only the token budget.
+        items = [
+            Scored(
+                candidate=make_candidate(
+                    kind="knowledge", text="k1", tokens=10, record_id="k1"
+                )
+            ),
+            Scored(candidate=make_candidate(text="m1", tokens=10, record_id="m1")),
+            Scored(candidate=make_candidate(text="m2", tokens=10, record_id="m2")),
+        ]
+        kept = await self._policy(
+            max_items=1, max_tokens=100, include_knowledge=True
+        ).apply(self._req(), items)
+        assert [i.candidate.text for i in kept] == ["k1", "m1"]
+
+    @pytest.mark.asyncio
+    async def test_include_knowledge_zero_token_kb_uses_estimate(self):
+        # Production kb_notes candidates deliberately carry token_count=0
+        # (legacy uncapped KB block) — the budget walk must estimate them.
+        long_text = "x" * 400  # ~100 estimated tokens
+        items = [
+            Scored(
+                candidate=make_candidate(
+                    kind="knowledge", text=long_text, tokens=0, record_id="k1"
+                )
+            ),
+            Scored(
+                candidate=make_candidate(
+                    kind="knowledge", text=long_text, tokens=0, record_id="k2"
+                )
+            ),
+        ]
+        kept = await self._policy(max_tokens=120, include_knowledge=True).apply(
+            self._req(), items
+        )
+        assert len(kept) == 1
+
+    def test_include_knowledge_without_max_tokens_raises(self):
+        with pytest.raises(ValueError, match="include_knowledge needs max_tokens"):
+            self._policy(max_items=10, include_knowledge=True)
+
+    def test_parse_include_knowledge(self):
+        cfg = _parse_memory_config(
+            {"bounded": {"max_tokens": 2048, "include_knowledge": True}}
+        )
+        assert cfg.bounded.include_knowledge is True
+        assert _parse_memory_config({}).bounded.include_knowledge is False
+
+
+class TestGatePolicy:
+    def _policy(self, **kwargs):
+        from src.services.memory.plugins.gate import GatePolicy
+
+        defaults = dict(threshold=0.05)
+        defaults.update(kwargs)
+        return GatePolicy(**defaults)
+
+    def _req(self):
+        return AssembleRequest(query_text="what is my dog's name?")
+
+    def _scored(self, text, rerank=None, kind="memory", record_id="r"):
+        item = make_scored(text, kind=kind, record_id=record_id)
+        if rerank is not None:
+            item.candidate.channel_scores["rerank"] = rerank
+            item.score = rerank
+        return item
+
+    @pytest.mark.asyncio
+    async def test_drops_below_threshold_keeps_above(self):
+        items = [
+            self._scored("relevant", rerank=0.97, record_id="m1"),
+            self._scored("borderline", rerank=0.24, record_id="m2"),
+            self._scored("distractor", rerank=0.0001, record_id="m3"),
+        ]
+        kept = await self._policy().apply(self._req(), items)
+        assert [i.candidate.text for i in kept] == ["relevant", "borderline"]
+
+    @pytest.mark.asyncio
+    async def test_unscored_items_pass_through(self):
+        # Scorer outage (containment passes items unscored), top_k tail,
+        # pinned head — absence of evidence never empties the injection.
+        items = [
+            self._scored("unscored-1", record_id="m1"),
+            self._scored("distractor", rerank=0.0001, record_id="m2"),
+            self._scored("unscored-2", record_id="m3"),
+        ]
+        kept = await self._policy().apply(self._req(), items)
+        assert [i.candidate.text for i in kept] == ["unscored-1", "unscored-2"]
+
+    @pytest.mark.asyncio
+    async def test_knowledge_passes_through_even_scored_below(self):
+        items = [
+            self._scored("kb", rerank=0.0001, kind="knowledge", record_id="k1"),
+            self._scored("mem", rerank=0.0001, record_id="m1"),
+        ]
+        kept = await self._policy().apply(self._req(), items)
+        assert [i.candidate.text for i in kept] == ["kb"]
+
+    @pytest.mark.asyncio
+    async def test_nothing_qualifies_injects_nothing(self):
+        # P4: below-threshold is not "inject the best of a bad lot".
+        items = [
+            self._scored("d1", rerank=0.001, record_id="m1"),
+            self._scored("d2", rerank=0.002, record_id="m2"),
+        ]
+        kept = await self._policy().apply(self._req(), items)
+        assert kept == []
+
+    @pytest.mark.asyncio
+    async def test_order_preserved_and_custom_channel(self):
+        items = [
+            self._scored("a", record_id="m1"),
+            self._scored("b", record_id="m2"),
+        ]
+        items[0].candidate.channel_scores["ensemble"] = 0.9
+        items[1].candidate.channel_scores["ensemble"] = 0.01
+        kept = await self._policy(threshold=0.5, channel="ensemble").apply(
+            self._req(), items
+        )
+        assert [i.candidate.text for i in kept] == ["a"]
+
+    # --- relative mode: floor = threshold × the assemble's top score ---
+
+    @pytest.mark.asyncio
+    async def test_relative_mode_scales_floor_to_top_score(self):
+        # The measured case: tiny absolute confidence, strong separation
+        # (probed c8f1aeed: evidence 0.0325 vs distractor max 0.0008 —
+        # absolute 0.05 deletes the evidence, relative 0.1 keeps it).
+        items = [
+            self._scored("evidence", rerank=0.0325, record_id="m1"),
+            self._scored("distractor", rerank=0.0008, record_id="m2"),
+        ]
+        kept = await self._policy(threshold=0.1, mode="relative").apply(
+            self._req(), items
+        )
+        assert [i.candidate.text for i in kept] == ["evidence"]
+
+    @pytest.mark.asyncio
+    async def test_relative_mode_top_item_always_passes(self):
+        # Corollary: relative gating can never inject nothing.
+        items = [self._scored("weak-top", rerank=0.0001, record_id="m1")]
+        kept = await self._policy(threshold=0.5, mode="relative").apply(
+            self._req(), items
+        )
+        assert len(kept) == 1
+
+    @pytest.mark.asyncio
+    async def test_relative_mode_all_unscored_passes_everything(self):
+        items = [
+            self._scored("u1", record_id="m1"),
+            self._scored("u2", record_id="m2"),
+        ]
+        kept = await self._policy(threshold=0.5, mode="relative").apply(
+            self._req(), items
+        )
+        assert len(kept) == 2
+
+    def test_construction_raises_without_threshold_or_channel(self):
+        with pytest.raises(ValueError, match="config theatre"):
+            self._policy(threshold=None)
+        with pytest.raises(ValueError, match="non-empty channel"):
+            self._policy(channel="")
+        with pytest.raises(ValueError, match="not in"):
+            self._policy(mode="sigmoid")
+
+    def test_factory_reads_gate_config(self):
+        from src.services.memory.plugins.gate import _build_gate
+
+        runtime = SimpleNamespace(
+            memory_config=SimpleNamespace(
+                gate=SimpleNamespace(threshold=0.05, channel="rerank")
+            )
+        )
+        policy = _build_gate(runtime)
+        assert policy.threshold == 0.05
+        assert policy.channel == "rerank"
+
+    def test_factory_missing_threshold_or_section_raises(self):
+        from src.services.memory.plugins.gate import _build_gate
+
+        with pytest.raises(ValueError, match="config section missing"):
+            _build_gate(SimpleNamespace(memory_config=SimpleNamespace(gate=None)))
+        runtime = SimpleNamespace(
+            memory_config=SimpleNamespace(
+                gate=SimpleNamespace(threshold=None, channel="rerank")
+            )
+        )
+        with pytest.raises(ValueError, match="config theatre"):
+            _build_gate(runtime)
+
+    def test_parse_gate_config(self):
+        cfg = _parse_memory_config(
+            {"gate": {"threshold": 0.05, "channel": "ensemble", "mode": "relative"}}
+        )
+        assert cfg.gate.threshold == 0.05
+        assert cfg.gate.channel == "ensemble"
+        assert cfg.gate.mode == "relative"
+        # defaults when section absent: no threshold (the policy refuses to
+        # bind), rerank channel, absolute mode
+        absent = _parse_memory_config({})
+        assert absent.gate.threshold is None
+        assert absent.gate.channel == "rerank"
+        assert absent.gate.mode == "absolute"
+
+    def test_gate_is_registered(self):
+        assert "gate" in available_memory_plugins("policy")["policy"]
+
+
+class TestDigestQueryText:
+    def _build(self, messages, frame=None, **kwargs):
+        from src.services.memory.query import build_digest_query_text
+
+        return build_digest_query_text(messages, frame, **kwargs)
+
+    def test_empty_messages_no_frame_yields_empty(self):
+        # Same contract as the legacy builders: retrieve with "", not skip.
+        assert self._build([]) == ""
+
+    def test_single_human_message_is_the_question(self):
+        # The harness question-time equivalence: one HumanMessage deep,
+        # digest == legacy == the question text.
+        assert self._build([HumanMessage(content="where do I live?")]) == (
+            "where do I live?"
+        )
+
+    def test_window_takes_trailing_conversational_messages_only(self):
+        messages = [
+            HumanMessage(content="h1"),
+            AIMessage(content="a1"),
+            SystemMessage(content="system noise"),
+            HumanMessage(content="h2"),
+            ToolMessage(content="tool payload", tool_call_id="t1"),
+            AIMessage(content="a2"),
+            HumanMessage(content="h3"),
+        ]
+        assert self._build(messages, window=3) == "h2\na2\nh3"
+
+    def test_per_message_clip(self):
+        text = self._build([HumanMessage(content="x" * 600)], max_chars_per_message=100)
+        assert text == "x" * 100
+
+    def test_frame_appended_as_focus(self):
+        from src.services.memory import TaskFrame
+
+        frame = TaskFrame(top_todo="implement the parser", phase_number=2)
+        text = self._build([HumanMessage(content="status?")], frame)
+        assert text == "status?\nimplement the parser\nphase 2 tactical"
+
+    def test_frame_only_matches_worker_legacy_shape(self):
+        from src.services.memory import TaskFrame
+        from src.services.memory.plugins.legacy import build_worker_query_text
+
+        frame = TaskFrame(top_todo="write tests", phase_number=3, is_strategic=True)
+        # With no conversation, the digest reduces to the legacy worker
+        # query modulo the join character.
+        assert self._build([], frame).replace("\n", " ") == (
+            build_worker_query_text(frame)
+        )
+
+    def test_multimodal_content_str_coerced_and_empties_skipped(self):
+        messages = [
+            HumanMessage(content=[{"type": "text", "text": "look"}]),
+            AIMessage(content="   "),
+        ]
+        text = self._build(messages)
+        assert "look" in text
+        assert text.count("\n") == 0  # blank AI message contributed nothing
+
+    def test_parse_query_config(self):
+        cfg = _parse_memory_config(
+            {
+                "query": {
+                    "digest": True,
+                    "digest_window": 6,
+                    "digest_max_chars_per_message": 200,
+                }
+            }
+        )
+        assert cfg.query.digest is True
+        assert cfg.query.digest_window == 6
+        assert cfg.query.digest_max_chars_per_message == 200
+        absent = _parse_memory_config({})
+        assert absent.query.digest is False
+        assert absent.query.digest_window == 4
+        assert absent.query.digest_max_chars_per_message == 500

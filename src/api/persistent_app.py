@@ -302,6 +302,13 @@ def _ensure_persistent_loop_started(
         return False
 
     if _loop_task is None or _loop_task.done():
+        # Compaction progress frames (started/progress/failed) ride the
+        # broadcast/SSE channel; idempotent, also set by _handle_compact for
+        # manual compaction before the first loop start. getattr: test
+        # doubles stub context_manager with plain objects.
+        _cb_setter = getattr(_session.context_manager, "set_progress_callback", None)
+        if callable(_cb_setter):
+            _cb_setter(_loop_compaction_progress)
         callbacks = PersistentLoopCallbacks(
             get_user_input=_loop_get_user_input,
             on_token=_loop_on_token,
@@ -317,6 +324,7 @@ def _ensure_persistent_loop_started(
             on_context_compacted=_loop_on_context_compacted,
             persist_message=_loop_persist_message,
             archive_llm_call=_loop_archive_llm_call,
+            on_usage=_loop_on_usage,
             hard_interrupt_event=_hard_interrupt_event,
         )
         _loop_task = asyncio.create_task(
@@ -1208,6 +1216,7 @@ async def _attach_session(
             llm=aux_inner,
             max_iterations=aux_cfg.max_iterations,
             timeout=aux_cfg.timeout,
+            max_context_tokens=model_settings.get("model_max_context_tokens"),
         )
         logger.info(
             "Auxiliary override applied: model=%s, base_url=%s",
@@ -2960,10 +2969,21 @@ async def _loop_on_turn_start(turn_id: int) -> None:
     # (session_silent_failure_audit.md #1).
 
 
+async def _loop_on_usage(payload: Dict[str, Any]) -> None:
+    """Per-LLM-call token telemetry → usage.updated frame (cockpit panel)."""
+    _broadcast(
+        "usage.updated",
+        {
+            "turn": (_session.turn_count + 1) if _session else None,
+            **payload,
+        },
+    )
+
+
 async def _loop_on_turn_complete(turn_id: int, metrics: Optional[dict] = None) -> None:
     if _session is None:
         return
-    _broadcast("turn.completed", {"turn_id": turn_id})
+    _broadcast("turn.completed", {"turn_id": turn_id, "metrics": metrics or {}})
     # Save AI messages from this turn straight to the DB (bounded await). Direct
     # write via the agent's own pool — the orchestrator REST hop is bypassed.
     if _session.postgres_conn:
@@ -3174,6 +3194,16 @@ async def _record_compaction(
         "summary": summary_text,
         "turn": turn,
     }
+    # Completion stats from the summarization engine (n_passes, duration_ms,
+    # before/after tokens) — extends context.compacted per
+    # docs/features/context_summarization_rework.md.
+    ctx_mgr_stats = getattr(
+        getattr(_session, "context_manager", None),
+        "_last_summarization_stats",
+        None,
+    )
+    if isinstance(ctx_mgr_stats, dict):
+        params.update(ctx_mgr_stats)
     try:
         if ws is not None:
             await _ws_send(ws, "context.compacted", params)
@@ -3222,6 +3252,19 @@ async def _loop_on_context_compacted(
 ) -> None:
     """Auto-summarization fired inside the loop — persist + broadcast a banner."""
     await _record_compaction(summary_text, before, after, trigger="auto", ws=None)
+
+
+async def _loop_compaction_progress(event: str, params: Dict[str, Any]) -> None:
+    """ContextManager compaction progress → journaled broadcast frames.
+
+    Carries ``compaction.started`` / ``compaction.progress`` /
+    ``compaction.failed`` (the completion event stays ``context.compacted``,
+    emitted by ``_record_compaction``). ``_broadcast`` stamps ``(epoch, seq)``
+    and journals into ``thread_events``, so a reload mid-compaction
+    reconstructs the progress UI from SSE replay.
+    See docs/features/context_summarization_rework.md (S3).
+    """
+    _broadcast(event, params)
 
 
 async def _loop_completion_handler(loop_task: asyncio.Task) -> None:
@@ -3434,6 +3477,7 @@ async def _restore_session_messages() -> None:
                         restored,
                         aux,
                         max_summary_length=max_summary_length,
+                        trigger="resume",
                     )
                     restored = strip_removal_markers(bounded)
                 except Exception as e:
@@ -3495,12 +3539,14 @@ async def _restore_session_messages() -> None:
         # ensure_within_limits returns a LangGraph reducer delta; this loop
         # has no reducer, so strip the RemoveMessage markers to materialize it.
         pre_compact_len = len(restored)
+        runs_before = getattr(ctx_mgr, "compaction_runs", 0)
         if ctx_mgr and aux and restored:
             try:
                 bounded = await ctx_mgr.ensure_within_limits(
                     restored,
                     aux,
                     max_summary_length=max_summary_length,
+                    trigger="resume",
                 )
                 restored = strip_removal_markers(bounded)
             except Exception as e:
@@ -3508,6 +3554,12 @@ async def _restore_session_messages() -> None:
                     "Compaction during restore failed "
                     f"(non-fatal, keeping full history): {e}"
                 )
+        runs_after = getattr(ctx_mgr, "compaction_runs", 0)
+        compacted_on_resume = (
+            isinstance(runs_before, int)
+            and isinstance(runs_after, int)
+            and runs_after > runs_before
+        )
 
         if restored:
             _session.messages.extend(restored)
@@ -3524,8 +3576,10 @@ async def _restore_session_messages() -> None:
             # so subsequent resumes hit Path A and the banner appears.
             # Path A itself does NOT re-write here — the existing row
             # already drives the banner via the cockpit's history render
-            # (avoids the live/history banner double-render).
-            if len(restored) < pre_compact_len:
+            # (avoids the live/history banner double-render). Gated on the
+            # manager's run counter, not a length delta (the heuristic
+            # false-fires on stray RemoveMessage markers).
+            if compacted_on_resume:
                 summary_text = extract_summary_text(restored)
                 if summary_text:
                     try:
@@ -3746,21 +3800,73 @@ async def _handle_compact(ws: WebSocket, focus: str = "") -> None:
             await _ws_send(ws, "error", {"message": "Session not ready"})
             return
 
+        from ..llm.response_guards import strip_removal_markers
+
+        ctx_mgr = _session.context_manager
+
+        # Manual compaction can run before the first loop start — make sure
+        # progress frames flow either way (idempotent setter; getattr for
+        # test doubles that stub the context manager).
+        _cb_setter = getattr(ctx_mgr, "set_progress_callback", None)
+        if callable(_cb_setter):
+            _cb_setter(_loop_compaction_progress)
+
         before_count = len(_session.messages)
-        _session.messages[:] = await _session.context_manager.summarize_and_compact(
+        runs_before = getattr(ctx_mgr, "compaction_runs", 0)
+        result = await ctx_mgr.summarize_and_compact(
             messages=_session.messages,
             auxiliary=_session.auxiliary_llm,
             max_summary_length=getattr(
                 _session.config.context_management, "max_summary_length", 10000
             ),
+            trigger="manual",
+            focus=focus or None,
         )
+        # summarize_and_compact returns a LangGraph reducer delta; this
+        # transport has no reducer, so strip the RemoveMessage markers before
+        # adopting. Leaking them into _session.messages made every later LLM
+        # call false-detect a compaction and re-persist the same summary row
+        # (the duplicate-banner bug, 2026-06-12).
+        _session.messages[:] = strip_removal_markers(result)
         after_count = len(_session.messages)
 
-        summary_text = extract_summary_text(_session.messages)
-        await _record_compaction(
-            summary_text, before_count, after_count, trigger="manual", ws=ws
+        runs_after = getattr(ctx_mgr, "compaction_runs", 0)
+        compacted_now = (
+            isinstance(runs_before, int)
+            and isinstance(runs_after, int)
+            and runs_after > runs_before
         )
-        logger.info(f"Manual compaction: {before_count} → {after_count} messages")
+        if compacted_now:
+            # A summary was actually produced: journal the completion
+            # (broadcast, not ws-only — SSE replay must be able to clear the
+            # progress UI after a reload) and persist the role='summary'
+            # checkpoint row.
+            summary_text = extract_summary_text(_session.messages)
+            await _record_compaction(
+                summary_text, before_count, after_count, trigger="manual", ws=None
+            )
+        else:
+            # No-op (below thresholds / nothing to fold): transient notice to
+            # the requesting client only — no banner row, no journal entry.
+            # summary=None tells the cockpit to render a system line instead
+            # of a banner. Extracting + re-persisting the *previous* summary
+            # here was another duplicate-banner source.
+            turn = _session.turn_count if _session else None
+            await _ws_send(
+                ws,
+                "context.compacted",
+                {
+                    "before": before_count,
+                    "after": after_count,
+                    "trigger": "manual",
+                    "summary": None,
+                    "turn": turn if isinstance(turn, int) else None,
+                },
+            )
+        logger.info(
+            f"Manual compaction: {before_count} → {after_count} messages "
+            f"(summarized={compacted_now})"
+        )
 
         # Commit + push workspace to Gitea on compaction (natural checkpoint boundary)
         if _session.workspace_manager:
@@ -3899,6 +4005,7 @@ async def _handle_config_update(ws: WebSocket, config_override: Dict[str, Any]) 
                 llm=aux_inner,
                 max_iterations=aux_cfg.max_iterations,
                 timeout=aux_cfg.timeout,
+                max_context_tokens=model_settings.get("model_max_context_tokens"),
             )
             logger.info(
                 "Auxiliary hot-swapped: model=%s, base_url=%s",

@@ -639,8 +639,16 @@ class TestRestoreFromCheckpoint:
             AIMessage(content="a3", id="y"),
         ]
         mock_session.context_manager = MagicMock()
+        # Simulate a *successful* summarization: the restore gate is the
+        # manager's compaction_runs counter, not a length delta.
+        mock_session.context_manager.compaction_runs = 0
+
+        async def _ensure(*args, **kwargs):
+            mock_session.context_manager.compaction_runs += 1
+            return compacted
+
         mock_session.context_manager.ensure_within_limits = AsyncMock(
-            return_value=compacted
+            side_effect=_ensure
         )
         mock_session.auxiliary_llm = MagicMock()
         mock_agent = MagicMock()
@@ -1434,6 +1442,21 @@ class TestPollVmReady:
 # ---------------------------------------------------------------------------
 
 
+def _wire_compacting_ctx_mgr(mock_session, result):
+    """Make the mock context manager simulate a *successful* summarization:
+    ``summarize_and_compact`` returns ``result`` and bumps ``compaction_runs``
+    — the transport's authoritative did-it-compact signal. Plain AsyncMock
+    return values simulate a no-op (counter untouched)."""
+    ctx = mock_session.context_manager
+    ctx.compaction_runs = 0
+
+    async def _compact(*args, **kwargs):
+        ctx.compaction_runs += 1
+        return result
+
+    ctx.summarize_and_compact = AsyncMock(side_effect=_compact)
+
+
 class TestHandleCompact:
     @pytest.mark.asyncio
     async def test_sends_error_when_session_none(self):
@@ -1520,11 +1543,12 @@ class TestHandleCompact:
             HumanMessage(content="q"),
         ]
         mock_session.turn_count = 7
-        mock_session.context_manager.summarize_and_compact = AsyncMock(
-            return_value=[
+        _wire_compacting_ctx_mgr(
+            mock_session,
+            [
                 SystemMessage(content="sys"),
                 SystemMessage(content="[Summary of prior work]\nWe did X and Y."),
-            ]
+            ],
         )
         mock_session.config.context_management.max_summary_length = 10000
         mock_session.workspace_manager = None
@@ -1559,11 +1583,12 @@ class TestHandleCompact:
             HumanMessage(content="q"),
         ]
         mock_session.turn_count = 7
-        mock_session.context_manager.summarize_and_compact = AsyncMock(
-            return_value=[
+        _wire_compacting_ctx_mgr(
+            mock_session,
+            [
                 SystemMessage(content="sys"),
                 SystemMessage(content="[Summary of prior work]\nrecap"),
-            ]
+            ],
         )
         mock_session.config.context_management.max_summary_length = 10000
         mock_session.workspace_manager = None
@@ -1593,8 +1618,8 @@ class TestHandleCompact:
         mock_session = MagicMock()
         mock_session.messages = [SystemMessage(content="sys")]
         mock_session.turn_count = 0
-        mock_session.context_manager.summarize_and_compact = AsyncMock(
-            return_value=[SystemMessage(content="[Summary of prior work]\ne")]
+        _wire_compacting_ctx_mgr(
+            mock_session, [SystemMessage(content="[Summary of prior work]\ne")]
         )
         mock_session.config.context_management.max_summary_length = 10000
         mock_session.workspace_manager = None
@@ -1610,6 +1635,86 @@ class TestHandleCompact:
 
         kwargs = mock_session.postgres_conn.save_thread_message.call_args.kwargs
         assert kwargs["metrics"]["boundary_turn"] == 0
+
+    @pytest.mark.asyncio
+    async def test_compact_strips_removal_markers(self):
+        """The reducer delta's RemoveMessage markers must never be adopted
+        into _session.messages — leaked markers made every later LLM call
+        false-detect a compaction and re-persist the same summary row
+        (the duplicate-banner bug, 2026-06-12)."""
+        from langchain_core.messages import RemoveMessage
+
+        ws = AsyncMock()
+        mock_session = MagicMock()
+        mock_session.messages = [
+            SystemMessage(content="sys"),
+            HumanMessage(content="q1", id="m1"),
+            AIMessage(content="a1", id="m2"),
+        ]
+        _wire_compacting_ctx_mgr(
+            mock_session,
+            [
+                RemoveMessage(id="m1"),
+                RemoveMessage(id="m2"),
+                SystemMessage(content="sys"),
+                SystemMessage(content="[Summary of prior work]\nrecap"),
+            ],
+        )
+        mock_session.config.context_management.max_summary_length = 10000
+        mock_session.workspace_manager = None
+        mock_session.postgres_conn.save_thread_message = AsyncMock(
+            return_value={"id": "s1", "seq": 9}
+        )
+
+        with (
+            patch("src.api.persistent_app._session", mock_session),
+            patch("src.api.persistent_app._thread_id", "tid-1"),
+        ):
+            await _handle_compact(ws, "")
+
+        assert not any(isinstance(m, RemoveMessage) for m in mock_session.messages), (
+            "RemoveMessage markers leaked into the live session list"
+        )
+        assert len(mock_session.messages) == 2
+
+    @pytest.mark.asyncio
+    async def test_noop_compact_does_not_persist_marker(self):
+        """A /compact that doesn't actually summarize (below thresholds) must
+        not re-persist the previous summary as a new role='summary' row, and
+        must answer the requesting client with a summary-less
+        context.compacted (rendered as a system line, not a banner)."""
+        ws = AsyncMock()
+        mock_session = MagicMock()
+        # A previous compaction's summary is still in the live list — the
+        # old code re-extracted and re-persisted it on every no-op.
+        original = [
+            SystemMessage(content="sys"),
+            SystemMessage(content="[Summary of prior work]\nold recap"),
+            HumanMessage(content="q", id="m1"),
+        ]
+        mock_session.messages = list(original)
+        mock_session.turn_count = 3
+        ctx = mock_session.context_manager
+        ctx.compaction_runs = 0  # never bumped → no-op
+        ctx.summarize_and_compact = AsyncMock(return_value=list(original))
+        mock_session.config.context_management.max_summary_length = 10000
+        mock_session.workspace_manager = None
+        mock_session.postgres_conn.save_thread_message = AsyncMock()
+
+        with (
+            patch("src.api.persistent_app._session", mock_session),
+            patch("src.api.persistent_app._thread_id", "tid-1"),
+        ):
+            await _handle_compact(ws, "")
+
+        mock_session.postgres_conn.save_thread_message.assert_not_awaited()
+        compacted_frames = [
+            call[0][0]
+            for call in ws.send_json.call_args_list
+            if call[0][0].get("method") == "context.compacted"
+        ]
+        assert len(compacted_frames) == 1
+        assert compacted_frames[0]["params"]["summary"] is None
 
     @pytest.mark.asyncio
     async def test_git_commit_and_push_on_compaction(self):

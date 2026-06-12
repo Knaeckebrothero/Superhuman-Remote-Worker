@@ -336,9 +336,17 @@ class UniversalAgent:
         from src.services.auxiliary import AuxiliaryLLM
 
         aux_config = self.config.auxiliary
+        # The summarizer's budgeting authority: the aux model's own window when
+        # a dedicated model is configured, else the main working window (the
+        # fallback summarizer IS the main/summarization LLM there). See
+        # docs/features/context_summarization_rework.md (S1).
+        main_window = getattr(limits, "model_max_context_tokens", None)
+
         if not aux_config.enabled:
             # Wrap summarization LLM as fallback even when auxiliary is disabled
-            self._auxiliary_llm = AuxiliaryLLM(llm=self._summarization_llm)
+            self._auxiliary_llm = AuxiliaryLLM(
+                llm=self._summarization_llm, max_context_tokens=main_window
+            )
             logger.info("AuxiliaryLLM disabled, using summarization LLM as fallback")
             return
 
@@ -360,6 +368,7 @@ class UniversalAgent:
                 max_retries=1,
             )
             aux_llm = create_llm(aux_llm_config, limits=limits)
+            aux_window = aux_llm_config.model_max_context_tokens or main_window
             logger.info(
                 f"Created auxiliary LLM: {aux_config.model}"
                 f" (settings matrix: top_p={aux_llm_config.top_p},"
@@ -369,12 +378,14 @@ class UniversalAgent:
         else:
             # Reuse summarization LLM (which is already the best fallback chain)
             aux_llm = self._summarization_llm
+            aux_window = main_window
             logger.info("AuxiliaryLLM: reusing summarization LLM")
 
         self._auxiliary_llm = AuxiliaryLLM(
             llm=aux_llm,
             max_iterations=aux_config.max_iterations,
             timeout=aux_config.timeout,
+            max_context_tokens=aux_window,
         )
 
     async def _setup_connections(self) -> None:
@@ -1732,6 +1743,9 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             **self.config.extra,
             "agent_id": self.config.agent_id,
             "multimodal": self.config.llm.multimodal,  # For vision-aware file reading
+            # Lets bulk readers cap a single tool result relative to the main
+            # model's window (session_silent_failure_audit.md #5).
+            "model_max_context_tokens": self.config.limits.model_max_context_tokens,
         }
         # Build job metadata for delegation tool access
         job_metadata = {

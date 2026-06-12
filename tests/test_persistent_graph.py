@@ -1745,14 +1745,28 @@ class TestTransientInjection:
 # ---------------------------------------------------------------------------
 
 
+def _make_compacting_ctx_mgr(result_fn):
+    """Context-manager mock whose ensure_within_limits simulates a
+    *successful* summarization: returns ``result_fn(msgs)`` and bumps
+    ``compaction_runs`` — the loop's authoritative did-it-compact gate
+    (length deltas alone no longer count as compaction)."""
+    ctx_mgr = AsyncMock()
+    ctx_mgr.compaction_runs = 0
+
+    async def _compactor(msgs, *a, **kw):
+        ctx_mgr.compaction_runs += 1
+        return result_fn(msgs)
+
+    ctx_mgr.ensure_within_limits = _compactor
+    return ctx_mgr
+
+
 class TestContextCompaction:
     @pytest.mark.asyncio
     async def test_compaction_triggers_git_commit_and_push(self):
-        """When compaction reduces message count, git commit + push fires."""
+        """When compaction actually ran (run counter), git commit + push fires."""
 
-        async def _compactor(msgs, *a, **kw):
-            # Simulate compaction by returning fewer messages
-            return msgs[:2]
+        ctx_mgr = _make_compacting_ctx_mgr(lambda msgs: msgs[:2])
 
         git_mgr = MagicMock()
         git_mgr.is_active = True
@@ -1775,7 +1789,7 @@ class TestContextCompaction:
         await _execute_turn(
             llm_with_tools=_make_streaming_llm(_make_llm_response("ok")),
             tool_map={},
-            context_manager=AsyncMock(ensure_within_limits=_compactor),
+            context_manager=ctx_mgr,
             messages=messages,
             callbacks=callbacks,
             llm_timeout=600,
@@ -1788,11 +1802,95 @@ class TestContextCompaction:
         git_mgr.push.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_compaction_adopts_result_into_session_list(self):
+        """A real compaction is adopted into the durable ``messages`` list
+        (summary + tail replace the old history in place), so the next LLM
+        call doesn't re-summarize from scratch. The full log stays in
+        thread_messages; only the in-memory working set shrinks."""
+
+        summary_msg = SystemMessage(content="[Summary of prior work]\nrecap")
+        ctx_mgr = _make_compacting_ctx_mgr(
+            lambda msgs: [msgs[0], summary_msg, msgs[-1]]
+        )
+
+        messages = [
+            SystemMessage(content="sys"),
+            HumanMessage(content="q1"),
+            AIMessage(content="a1"),
+            HumanMessage(content="q2"),
+        ]
+        callbacks = _make_callbacks(on_context_compacted=AsyncMock())
+
+        await _execute_turn(
+            llm_with_tools=_make_streaming_llm(_make_llm_response("ok")),
+            tool_map={},
+            context_manager=ctx_mgr,
+            messages=messages,
+            callbacks=callbacks,
+            llm_timeout=600,
+            auxiliary_llm=None,
+            config=_make_config(),
+        )
+
+        contents = [getattr(m, "content", "") for m in messages]
+        assert any("[Summary of prior work]" in c for c in contents), (
+            "compacted history must be adopted into the session list"
+        )
+        assert "q1" not in contents, "summarized-away messages must be gone"
+        # on_context_compacted surfaced the compaction exactly once
+        callbacks.on_context_compacted.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_passthrough_does_not_fire_compaction_side_effects(self):
+        """A pass-through bound (no summarization) must not adopt, must not
+        emit on_context_compacted, and must not git-push — even if stray
+        list-length changes occur (the old length heuristic false-fired on
+        leaked RemoveMessage markers; the run counter cannot)."""
+        from langchain_core.messages import RemoveMessage
+
+        git_mgr = MagicMock()
+        git_mgr.is_active = True
+        git_mgr.has_uncommitted_changes.return_value = True
+        ws_mgr = MagicMock()
+        ws_mgr.git_manager = git_mgr
+        tool_ctx = MagicMock()
+        tool_ctx.workspace_manager = ws_mgr
+
+        # Stray markers in the list (the historical leak shape): the strip
+        # shrinks the working copy, which used to read as "compaction".
+        messages = [
+            RemoveMessage(id="dead-1"),
+            RemoveMessage(id="dead-2"),
+            SystemMessage(content="sys"),
+            SystemMessage(content="[Summary of prior work]\nold recap"),
+            HumanMessage(content="q"),
+        ]
+        ctx_mgr = AsyncMock()
+        ctx_mgr.compaction_runs = 0  # never bumped → pass-through
+        ctx_mgr.ensure_within_limits = AsyncMock(side_effect=lambda m, *a, **kw: m)
+        callbacks = _make_callbacks(on_context_compacted=AsyncMock())
+
+        await _execute_turn(
+            llm_with_tools=_make_streaming_llm(_make_llm_response("ok")),
+            tool_map={},
+            context_manager=ctx_mgr,
+            messages=messages,
+            callbacks=callbacks,
+            llm_timeout=600,
+            auxiliary_llm=None,
+            config=_make_config(),
+            tool_context=tool_ctx,
+        )
+
+        callbacks.on_context_compacted.assert_not_awaited()
+        git_mgr.commit.assert_not_called()
+        git_mgr.push.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_compaction_git_failure_non_fatal(self):
         """Git failure during compaction doesn't crash."""
 
-        async def _compactor(msgs, *a, **kw):
-            return msgs[:1]
+        ctx_mgr = _make_compacting_ctx_mgr(lambda msgs: msgs[:1])
 
         git_mgr = MagicMock()
         git_mgr.is_active = True
@@ -1815,7 +1913,7 @@ class TestContextCompaction:
         result = await _execute_turn(
             llm_with_tools=_make_streaming_llm(_make_llm_response("ok")),
             tool_map={},
-            context_manager=AsyncMock(ensure_within_limits=_compactor),
+            context_manager=ctx_mgr,
             messages=messages,
             callbacks=callbacks,
             llm_timeout=600,

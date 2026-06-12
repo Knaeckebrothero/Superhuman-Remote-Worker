@@ -20,12 +20,12 @@ from src.core.loader import (
 from src.core.model_registry import family_of
 
 # Limit-leaf fractions mirror the *_FRACTION constants in src/core/loader.py.
-# The four derived leaves are int(base * fraction); model_max_context_tokens is
+# The derived leaves are int(base * fraction); model_max_context_tokens is
 # the base itself. Tests assert this relationship rather than hand-pinned magics.
+# Summarization budgets are deliberately NOT here — they derive from the
+# auxiliary model's window at call time (src/core/summarizer.py).
 FRACTIONS = {
     "context_threshold_tokens": 0.80,
-    "summarization_safe_limit": 0.90,
-    "summarization_chunk_size": 0.60,
     "message_count_min_tokens": 0.40,
 }
 
@@ -225,7 +225,6 @@ class TestApplySettingsMatrixLimits:
         _apply_settings_matrix(data, expert_llm_keys=set())
         assert data["limits"]["context_threshold_tokens"] == 80000
         assert data["limits"]["model_max_context_tokens"] == 100000
-        assert data["limits"]["summarization_safe_limit"] == 90000
 
     def test_family_overrides_default(self):
         """Family-specific values override default entry."""
@@ -456,8 +455,6 @@ class TestSettingsMatrixIntegration:
         # Derived from the minimax working base (170000) via the limit fractions.
         assert config.limits.model_max_context_tokens == 170000
         assert config.limits.context_threshold_tokens == 136000  # 170000 * 0.80
-        assert config.limits.summarization_safe_limit == 153000  # 170000 * 0.90
-        assert config.limits.summarization_chunk_size == 102000  # 170000 * 0.60
         assert config.limits.message_count_min_tokens == 68000  # 170000 * 0.40
 
     def test_unknown_model_gets_default_limits(self, tmp_path):
@@ -478,8 +475,6 @@ class TestSettingsMatrixIntegration:
 
         assert config.limits.model_max_context_tokens == 100000
         assert config.limits.context_threshold_tokens == 80000  # 100000 * 0.80
-        assert config.limits.summarization_safe_limit == 90000  # 100000 * 0.90
-        assert config.limits.summarization_chunk_size == 60000  # 100000 * 0.60
         assert config.limits.message_count_min_tokens == 40000  # 100000 * 0.40
 
     def test_load_agent_config_with_deployment_dir_matrix(self, tmp_path):
@@ -758,8 +753,6 @@ class TestPerExpertMatrixExtended:
                     "limits": {
                         "context_threshold_tokens": 30000,
                         "model_max_context_tokens": 40000,
-                        "summarization_safe_limit": 35000,
-                        "summarization_chunk_size": 25000,
                         "message_count_min_tokens": 20000,
                     },
                 },
@@ -987,6 +980,4 @@ class TestContextWindowBaseResolution:
         assert config.llm.model_max_context_tokens == 32000
         assert config.limits.model_max_context_tokens == 32000
         assert config.limits.context_threshold_tokens == 25600  # 32000 * 0.80
-        assert config.limits.summarization_safe_limit == 28800  # 32000 * 0.90
-        assert config.limits.summarization_chunk_size == 19200  # 32000 * 0.60
         assert config.limits.message_count_min_tokens == 12800  # 32000 * 0.40

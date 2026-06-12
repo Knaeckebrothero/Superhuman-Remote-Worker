@@ -13,7 +13,7 @@ from typing import Any, Dict, List
 from .arms import ArmSpec
 from .datasets import LMEQuestion
 from .infra import project_uuid, session_uuid
-from .ingest import HarnessHandles
+from .ingest import HarnessHandles, _form_query_text
 from .metrics import collapse_to_sessions, question_metrics
 
 logger = logging.getLogger(__name__)
@@ -67,6 +67,8 @@ async def answer_retrieval(
     handles: HarnessHandles,
 ) -> dict:
     """Run the question against the ingested store; return the result row."""
+    from langchain_core.messages import HumanMessage
+
     from src.services.memory import AssembleRequest
 
     project = project_uuid(handles.run_id, question.question_id)
@@ -74,9 +76,14 @@ async def answer_retrieval(
     store = handles.make_store(reader_job, project)
     manager = handles.make_manager(store, reader_job, project)
 
+    # Same flag switch as the live read path: the answering session is one
+    # HumanMessage deep, so legacy and digest both reduce to the question
+    # text — wiring it keeps digest arms honest end-to-end.
+    query_text = _form_query_text(handles, [HumanMessage(content=question.question)])
+
     payload = await manager.assemble(
         AssembleRequest(
-            query_text=question.question,
+            query_text=query_text,
             model=getattr(handles.config.llm, "model", None),
         )
     )
@@ -105,6 +112,10 @@ async def answer_retrieval(
                 record_to_job.get(str(item.get("record_id")))
             ),
             "tokens": item.get("token_count"),
+            # Final combined score (scorers write it; 0.0 when no scorer
+            # ran) — kept per item so threshold/calibration analysis works
+            # post-hoc from results.jsonl alone.
+            "score": item.get("score"),
         }
         for item in memory_items[:MAX_ITEM_DETAIL]
     ]

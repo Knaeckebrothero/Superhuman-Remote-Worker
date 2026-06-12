@@ -31,7 +31,7 @@ from langchain_core.messages import (
     ToolMessage,
 )
 
-from src.core.loader import load_agent_config
+from src.core.loader import QueryConfig, load_agent_config
 from src.core.workspace import WorkspaceManager
 from src.core.workspace_injection import (
     TODOS_INJECTION_CONTENT_PREFIX,
@@ -728,6 +728,9 @@ class TestPersistentTurnWiring:
         config.llm.timeout = 600
         config.llm.model = "test-model"
         config.context_management.max_summary_length = 10000
+        # Real QueryConfig — a bare MagicMock fabricates a truthy
+        # memory.query.digest and routes the turn into the digest branch.
+        config.memory.query = QueryConfig()
 
         service = RecordingManager(payload=make_payload())
         recall_spy = AsyncMock()
@@ -769,6 +772,52 @@ class TestPersistentTurnWiring:
         recall_spy.decrement_ttl.assert_not_called()
         recall_spy.retrieve.assert_not_called()
         kb_spy.hybrid_search.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_digest_flag_switches_query_formation(self):
+        from src.persistent_graph import _execute_turn
+
+        async def _astream(msgs, **kwargs):
+            yield AIMessage(content="ok")
+
+        llm = AsyncMock()
+        llm.astream = _astream
+
+        config = MagicMock()
+        config.llm.timeout = 600
+        config.llm.model = "test-model"
+        config.context_management.max_summary_length = 10000
+        config.memory.query = QueryConfig(digest=True, digest_window=4)
+
+        service = RecordingManager(payload=make_payload())
+        messages = [
+            SystemMessage(content="sys"),
+            HumanMessage(content="first ask"),
+            AIMessage(content="did things"),
+            HumanMessage(content="follow-up"),
+        ]
+
+        await _execute_turn(
+            llm_with_tools=llm,
+            tool_map={},
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
+            messages=messages,
+            callbacks=_persistent_callbacks(),
+            llm_timeout=600,
+            auxiliary_llm=None,
+            config=config,
+            recall_store=AsyncMock(),
+            knowledge_store=AsyncMock(),
+            project_id=str(PROJECT_ID),
+            memory_service=service,
+        )
+
+        # Digest = windowed conversation, not the bare last user message
+        # (which is what the legacy builder would have produced).
+        req = service.assemble_requests[0]
+        assert req.query_text == "first ask\ndid things\nfollow-up"
 
 
 # ---------------------------------------------------------------------------
