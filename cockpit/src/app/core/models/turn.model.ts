@@ -21,6 +21,14 @@ export interface ThoughtEvent {
     kind: 'thought';
     /** Stable id: `${turnId}.b${blockIndex}`. Survives SSE replay. */
     id: string;
+    /**
+     * Id of the AI message this reasoning belongs to (the thread_messages row
+     * id; matches the live `thinking` frame's `message_id`). Set for reasoning
+     * delivered via `reasoning_content` (gemma/DeepSeek/OpenRouter). Used to
+     * dedupe a frame replayed after history already rendered the bubble. May be
+     * undefined for older rows or interleaved Anthropic/Responses thinking.
+     */
+    messageId?: string;
     /** Accumulated content. Empty when status === 'hidden'. */
     content: string;
     status: ThoughtStatus;
