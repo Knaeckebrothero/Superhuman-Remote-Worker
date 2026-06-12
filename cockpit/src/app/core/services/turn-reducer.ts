@@ -51,7 +51,7 @@ export type ReducerAction =
     | { type: 'turn_completed'; turnId: string; finishedAt: number }
     | { type: 'turn_interrupted'; turnId: string; finishedAt: number }
     | { type: 'token'; content: string; timestamp: number }
-    | { type: 'thinking'; content: string; timestamp: number }
+    | { type: 'thinking'; content: string; timestamp: number; messageId?: string }
     | {
         type: 'tool_started';
         toolUseId: string;
@@ -252,7 +252,7 @@ export function reduce(state: ConversationState, action: ReducerAction): Convers
             return appendDelta(state, 'text', action.content, action.timestamp);
 
         case 'thinking':
-            return appendDelta(state, 'thought', action.content, action.timestamp);
+            return appendThought(state, action.content, action.timestamp, action.messageId);
 
         case 'tool_started':
             return updateActiveTurn(ensurePlaceholderTurn(state, action.timestamp), (turn) => {
@@ -436,6 +436,74 @@ function ensurePlaceholderTurn(
         turns: [...state.turns, placeholder],
         activeAssistantTurnId: placeholderId,
     };
+}
+
+/**
+ * Append a reasoning delta, with id-keyed dedupe.
+ *
+ * A `thinking` frame may carry the id of the AI message it belongs to. The
+ * same frame can arrive twice across the history/replay seam: history paints
+ * the completed turn (thought bubble keyed by the row id), then the SSE replay
+ * cursor — saved a few events behind — re-emits the trailing reasoning frame.
+ * Because the turn is no longer active, that replayed frame would otherwise
+ * land in a synthetic `recovered:` bubble via `ensurePlaceholderTurn`, showing
+ * the same reasoning twice. So: if this message's reasoning already lives in
+ * some *other* turn, drop the frame. The active turn is exempt, so live deltas
+ * for the in-flight message keep appending. Frames without a messageId (older
+ * rows, interleaved Anthropic/Responses thinking) fall back to adjacency-only
+ * behaviour, exactly as before. See
+ * docs/issues/persistent_chat_reasoning_after_answer_and_replay_duplication.md
+ */
+function appendThought(
+    state: ConversationState,
+    content: string,
+    timestamp: number,
+    messageId?: string,
+): ConversationState {
+    if (messageId) {
+        const activeId = state.activeAssistantTurnId;
+        const seenElsewhere = state.turns.some(
+            (t) =>
+                t.kind === 'assistant' &&
+                t.id !== activeId &&
+                t.events.some((e) => e.kind === 'thought' && e.messageId === messageId),
+        );
+        if (seenElsewhere) return state;
+    }
+    const seeded = ensurePlaceholderTurn(state, timestamp);
+    return updateActiveTurn(seeded, (turn) => {
+        const last = turn.events[turn.events.length - 1];
+        if (last && last.kind === 'thought' && last.status === 'streaming') {
+            const lastThought = last as ThoughtEvent;
+            // Merge into the open thought only when it's the same message (or
+            // neither side is keyed). A different messageId starts a fresh
+            // bubble even if adjacent.
+            const sameMessage =
+                !messageId ||
+                lastThought.messageId === undefined ||
+                lastThought.messageId === messageId;
+            if (sameMessage) {
+                const merged: ThoughtEvent = {
+                    ...lastThought,
+                    content: lastThought.content + content,
+                    messageId: lastThought.messageId ?? messageId,
+                };
+                return {...turn, events: replaceAt(turn.events, turn.events.length - 1, merged)};
+            }
+        }
+        const closed = closeOpenEvents(turn.events, timestamp);
+        const blockIndex = closed.filter((e) => e.kind === 'thought' || e.kind === 'text').length;
+        const id = `${turn.id}.b${blockIndex}`;
+        const newEvent: ThoughtEvent = {
+            kind: 'thought',
+            id,
+            messageId,
+            content,
+            status: 'streaming',
+            startedAt: timestamp,
+        };
+        return {...turn, events: [...closed, newEvent]};
+    });
 }
 
 function appendDelta(

@@ -274,6 +274,115 @@ describe('turn-reducer — text/thinking deltas', () => {
     });
 });
 
+describe('turn-reducer — reasoning frame dedupe (message-id keyed)', () => {
+    // docs/issues/persistent_chat_reasoning_after_answer_and_replay_duplication.md
+    // For gemma-style models, the reasoning frame is journaled after the whole
+    // token run; an SSE replay cursor landing in that gap re-emits just the
+    // thinking frame after the turn closed, and ensurePlaceholderTurn would
+    // otherwise materialise it as a duplicate `recovered:` bubble.
+
+    function historicalTurn(messageId: string): AssistantTurn {
+        return {
+            kind: 'assistant',
+            id: 'hist-turn',
+            events: [
+                {
+                    kind: 'thought',
+                    id: 'hist-turn.b0',
+                    messageId,
+                    content: 'because X',
+                    status: 'done',
+                    startedAt: 500,
+                },
+                {kind: 'text', id: 'hist-turn.b1', content: 'answer', status: 'done', startedAt: 600},
+            ],
+            status: 'done',
+            startedAt: 500,
+            finishedAt: 600,
+            historical: true,
+        };
+    }
+
+    it('drops a replayed thinking frame whose message already rendered in another turn', () => {
+        const loaded = reduce(EMPTY_CONVERSATION, {
+            type: 'load_history',
+            threadId: 'th',
+            turns: [historicalTurn('msg-x')],
+        });
+        // Replay re-emits the trailing reasoning frame; activeAssistantTurnId
+        // is null because the turn already closed.
+        const after = reduce(loaded, {
+            type: 'thinking',
+            content: 'because X',
+            messageId: 'msg-x',
+            timestamp: 1000,
+        });
+        expect(after.turns).toHaveLength(1);
+        expect(after.turns[0].id).toBe('hist-turn');
+        expect(after.activeAssistantTurnId).toBeNull();
+        const thoughts = (after.turns[0] as AssistantTurn).events.filter((e) => e.kind === 'thought');
+        expect(thoughts).toHaveLength(1);
+    });
+
+    it('a full live turn then a trailing replayed reasoning frame yields one bubble', () => {
+        let state = play([
+            {type: 'turn_started', turnId: 't1', startedAt: 1000},
+            {type: 'thinking', content: 'reason', messageId: 'msg-1', timestamp: 1100},
+            {type: 'token', content: 'answer', timestamp: 1200},
+            {type: 'turn_completed', turnId: 't1', finishedAt: 1300},
+        ]);
+        state = reduce(state, {
+            type: 'thinking',
+            content: 'reason',
+            messageId: 'msg-1',
+            timestamp: 1400,
+        });
+        expect(state.turns).toHaveLength(1);
+        const thoughts = (state.turns[0] as AssistantTurn).events.filter((e) => e.kind === 'thought');
+        expect(thoughts).toHaveLength(1);
+        expect(state.activeAssistantTurnId).toBeNull();
+    });
+
+    it('live deltas for the active message keep appending (active turn exempt)', () => {
+        const state = play([
+            {type: 'turn_started', turnId: 't1', startedAt: 1000},
+            {type: 'thinking', content: 'a', messageId: 'msg-1', timestamp: 1100},
+            {type: 'thinking', content: 'b', messageId: 'msg-1', timestamp: 1200},
+        ]);
+        const thoughts = activeTurn(state).events.filter((e) => e.kind === 'thought') as ThoughtEvent[];
+        expect(thoughts).toHaveLength(1);
+        expect(thoughts[0].content).toBe('ab');
+        expect(thoughts[0].messageId).toBe('msg-1');
+    });
+
+    it('adjacent thinking frames with different message ids form separate bubbles', () => {
+        const state = play([
+            {type: 'turn_started', turnId: 't1', startedAt: 1000},
+            {type: 'thinking', content: 'first', messageId: 'msg-1', timestamp: 1100},
+            {type: 'thinking', content: 'second', messageId: 'msg-2', timestamp: 1200},
+        ]);
+        const thoughts = activeTurn(state).events.filter((e) => e.kind === 'thought') as ThoughtEvent[];
+        expect(thoughts).toHaveLength(2);
+        expect(thoughts.map((t) => t.messageId)).toEqual(['msg-1', 'msg-2']);
+    });
+
+    it('an orphan thinking frame with no message id still recovers (back-compat)', () => {
+        const state = play([{type: 'thinking', content: 'orphan', timestamp: 1000}]);
+        expect(state.turns).toHaveLength(1);
+        expect(state.turns[0].id).toBe('recovered:1000');
+    });
+
+    it('an orphan thinking frame for an unrendered message still recovers', () => {
+        const state = play([
+            {type: 'thinking', content: 'new', messageId: 'msg-new', timestamp: 1000},
+        ]);
+        expect(state.turns).toHaveLength(1);
+        const turn = state.turns[0] as AssistantTurn;
+        expect(turn.recovered).toBe(true);
+        expect((turn.events[0] as ThoughtEvent).messageId).toBe('msg-new');
+    });
+});
+
 describe('turn-reducer — tool calls', () => {
     it('tool_started pushes a ToolCallEvent in running state', () => {
         const state = play([

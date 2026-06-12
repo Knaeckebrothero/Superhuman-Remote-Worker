@@ -2565,8 +2565,18 @@ async def _loop_on_token(token: str) -> None:
     _broadcast("token", {"content": token})
 
 
-async def _loop_on_thinking(content: str) -> None:
-    _broadcast("thinking", {"content": content})
+async def _loop_on_thinking(content: str, message_id: Optional[str] = None) -> None:
+    payload: Dict[str, Any] = {"content": content}
+    if message_id:
+        # The agent mints `msg_…` ids but the thread_messages PK is a derived
+        # uuid5 (``_coerce_row_id``), and history serves that UUID. Coerce the
+        # same way here so the live frame's id matches the row's, letting the
+        # client dedupe a reasoning frame replayed after history painted the
+        # bubble (the gemma "reasoning duplicates on replay" bug).
+        from src.database.postgres_db import _coerce_row_id
+
+        payload["message_id"] = _coerce_row_id(message_id)
+    _broadcast("thinking", payload)
 
 
 async def _loop_on_tool_start(

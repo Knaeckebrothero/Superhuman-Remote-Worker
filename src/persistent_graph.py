@@ -30,7 +30,10 @@ from langchain_core.messages import (
 
 from .core.context import ContextManager, extract_summary_text, repair_tool_pairing
 from .llm.exceptions import ContextOverflowError
-from .llm.reasoning_chat import extract_reasoning_text_from_block
+from .llm.reasoning_chat import (
+    _STREAM_REASONING_SINK,
+    extract_reasoning_text_from_block,
+)
 from .llm.response_guards import (
     coerce_to_ai_message,
     finalize_streamed_response,
@@ -189,8 +192,12 @@ class PersistentLoopCallbacks:
     on_turn_start: Callable[[int], Awaitable[None]]
     on_turn_complete: Callable[[int, Optional[dict]], Awaitable[None]]
 
-    # Stream a thinking/reasoning chunk to the client
-    on_thinking: Callable[[str], Awaitable[None]]
+    # Stream a thinking/reasoning chunk to the client. Accepts an optional
+    # ``message_id`` kwarg correlating the frame to the AI message it belongs
+    # to, so the client can dedupe a reasoning frame replayed after history
+    # already painted the bubble (the gemma "reasoning duplicates on replay"
+    # bug). Older callers taking only ``content`` still work.
+    on_thinking: Callable[..., Awaitable[None]]
 
     # Notify client of errors. Accepts an optional ``turn_id`` kwarg so the
     # transport can close the failed turn in the UI and persist the error
@@ -705,8 +712,6 @@ async def _execute_turn(
     effective_pids = project_ids or ([project_id] if project_id else [])
     if memory_service is None and knowledge_store and effective_pids:
         try:
-            import uuid as _uuid
-
             kb_context = ""
             for msg in reversed(messages):
                 if isinstance(msg, HumanMessage):
@@ -888,6 +893,35 @@ async def _execute_turn(
         response: Optional[AIMessage] = None
         llm_start = time.monotonic()
 
+        # Pre-allocate this LLM call's message id so every reasoning frame we
+        # broadcast (live deltas below, or the post-stream fallback) shares a
+        # stable key with the thread_messages row it lands in. The client
+        # dedupes a reasoning frame replayed after history already painted the
+        # bubble by this id (gemma "reasoning duplicates on replay" bug). See
+        # docs/issues/persistent_chat_reasoning_after_answer_and_replay_duplication.md
+        ai_msg_id = f"msg_{_uuid.uuid4().hex[:24]}"
+        # Set by the live reasoning sink below; gates the post-stream fallback
+        # so each reasoning blob is emitted exactly once.
+        reasoning_streamed = False
+        _loop = asyncio.get_running_loop()
+        # Keep strong refs to fire-and-forget broadcast tasks so they aren't
+        # GC'd mid-flight (CPython drops weakly-held tasks).
+        _reasoning_tasks: set = set()
+
+        def _on_reasoning_delta(text: str) -> None:
+            # Called synchronously from the SSE tap as reasoning bytes arrive
+            # (before the answer tokens, for gemma-style models). Schedule the
+            # async broadcast on the running loop; the body is a cheap enqueue
+            # so ordering vs. the awaited answer tokens holds.
+            nonlocal reasoning_streamed
+            if not text:
+                return
+            reasoning_streamed = True
+            task = _loop.create_task(callbacks.on_thinking(text, message_id=ai_msg_id))
+            _reasoning_tasks.add(task)
+            task.add_done_callback(_reasoning_tasks.discard)
+
+        _sink_token = _STREAM_REASONING_SINK.set(_on_reasoning_delta)
         try:
             try:
                 # Try astream for token-by-token streaming
@@ -1170,6 +1204,11 @@ async def _execute_turn(
                 tool_calls_made=tool_calls_made,
                 error=error_msg,
             )
+        finally:
+            # Stop routing reasoning deltas to this turn's sink — every exit
+            # path (return, raise, fall-through) must clear it so a stale
+            # closure can't fire on the next turn's stream.
+            _STREAM_REASONING_SINK.reset(_sink_token)
 
         # Extract per-turn metrics from response metadata. Streaming providers
         # often leave response_metadata.token_usage empty — the aggregated
@@ -1224,14 +1263,6 @@ async def _execute_turn(
             except Exception as e:
                 logger.debug(f"usage callback failed (non-fatal): {e}")
 
-        # Send reasoning from additional_kwargs if not already streamed
-        # (covers DeepSeek, OpenRouter, and other non-Anthropic reasoning models)
-        if response:
-            extra = getattr(response, "additional_kwargs", None) or {}
-            reasoning = extra.get("reasoning_content")
-            if reasoning and isinstance(reasoning, str):
-                await callbacks.on_thinking(reasoning)
-
         if response is None:
             return TurnResult(
                 turn_id=0,
@@ -1269,6 +1300,24 @@ async def _execute_turn(
         # types), then sanitize for Responses API compatibility (null IDs
         # from OpenRouter).
         response = _sanitize_ai_response(coerce_to_ai_message(response))
+
+        # Reasoning delivered via additional_kwargs.reasoning_content comes from
+        # Chat Completions models (gemma/DeepSeek/OpenRouter) — that API is
+        # stateless and never round-trips message ids, so pinning the row id to
+        # our pre-allocated ai_msg_id is safe. We pin whenever there is/was
+        # reasoning to broadcast so the live (or fallback) frame and this
+        # persisted row share the dedupe key. Responses/Anthropic thinking
+        # blocks keep their provider id (round-trip-critical) and aren't keyed.
+        _extra = getattr(response, "additional_kwargs", None) or {}
+        _reasoning = _extra.get("reasoning_content")
+        _has_reasoning = bool(_reasoning and isinstance(_reasoning, str))
+        if reasoning_streamed or _has_reasoning:
+            response.id = ai_msg_id
+        # Fallback: emit reasoning the live sink didn't already stream (the
+        # non-streaming capture path, or any model whose deltas the tap missed).
+        # Now that we're past sanitize, message_id matches the persisted row.
+        if _has_reasoning and not reasoning_streamed:
+            await callbacks.on_thinking(_reasoning, message_id=ai_msg_id)
         if (
             response_content
             and not getattr(response, "tool_calls", None)

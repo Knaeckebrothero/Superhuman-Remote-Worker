@@ -3169,3 +3169,124 @@ class TestHardInterruptHelpers:
 
         assert chunk is None
         assert status == "interrupt"
+
+
+# ---------------------------------------------------------------------------
+# 1.7 _execute_turn — reasoning broadcast (dedupe key + ordering)
+# ---------------------------------------------------------------------------
+
+
+class TestExecuteTurnReasoning:
+    """Reasoning frames carry the AI message id and are emitted exactly once.
+
+    docs/issues/persistent_chat_reasoning_after_answer_and_replay_duplication.md
+    """
+
+    @pytest.mark.asyncio
+    async def test_reasoning_content_emitted_once_with_pinned_message_id(self):
+        """A Chat-Completions reasoning blob (additional_kwargs.reasoning_content)
+        is broadcast once via the post-stream fallback, keyed to the AI message
+        id, and the persisted row id is pinned to that same id."""
+        response = AIMessage(content="The answer.")
+        response.additional_kwargs = {"reasoning_content": "Let me think."}
+
+        captured = []
+
+        async def _on_thinking(content, message_id=None):
+            captured.append((content, message_id))
+
+        callbacks = _make_callbacks(on_thinking=_on_thinking)
+        messages = [SystemMessage(content="sys"), HumanMessage(content="go")]
+
+        await _execute_turn(
+            llm_with_tools=_make_streaming_llm(response),
+            tool_map={},
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
+            messages=messages,
+            callbacks=callbacks,
+            llm_timeout=600,
+            auxiliary_llm=None,
+            config=_make_config(),
+        )
+
+        assert len(captured) == 1
+        content, message_id = captured[0]
+        assert content == "Let me think."
+        assert message_id and message_id.startswith("msg_")
+        # The appended AI row shares the broadcast id — the dedupe key.
+        assert messages[-1].id == message_id
+
+    @pytest.mark.asyncio
+    async def test_live_streamed_reasoning_skips_post_stream_fallback(self):
+        """When the SSE tap surfaces reasoning live (sink fired), the post-stream
+        fallback does not re-broadcast it — exactly one emission."""
+        from src.llm.reasoning_chat import _STREAM_REASONING_SINK
+
+        response = AIMessage(content="Answer.")
+        response.additional_kwargs = {"reasoning_content": "live reasoning"}
+
+        captured = []
+
+        async def _on_thinking(content, message_id=None):
+            captured.append((content, message_id))
+
+        async def _astream(messages, **kw):
+            # Simulate the tap surfacing a reasoning delta mid-stream, before
+            # the answer chunk — exactly what the live ordering fix relies on.
+            sink = _STREAM_REASONING_SINK.get()
+            assert sink is not None, "sink must be installed during the stream"
+            sink("live reasoning")
+            yield response
+
+        llm = AsyncMock()
+        llm.reasoning = None
+        llm.astream = _astream
+        llm.ainvoke = AsyncMock(return_value=response)
+
+        callbacks = _make_callbacks(on_thinking=_on_thinking)
+        messages = [SystemMessage(content="sys"), HumanMessage(content="go")]
+
+        await _execute_turn(
+            llm_with_tools=llm,
+            tool_map={},
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
+            messages=messages,
+            callbacks=callbacks,
+            llm_timeout=600,
+            auxiliary_llm=None,
+            config=_make_config(),
+        )
+        # Let the fire-and-forget broadcast task run.
+        await asyncio.sleep(0)
+
+        assert len(captured) == 1
+        assert captured[0][0] == "live reasoning"
+        # Pinned so the live frame's id matches the persisted row.
+        assert captured[0][1] == messages[-1].id
+
+    @pytest.mark.asyncio
+    async def test_sink_is_cleared_after_turn(self):
+        """The reasoning sink contextvar must not leak past the turn."""
+        from src.llm.reasoning_chat import _STREAM_REASONING_SINK
+
+        callbacks = _make_callbacks()
+        messages = [SystemMessage(content="sys"), HumanMessage(content="go")]
+
+        await _execute_turn(
+            llm_with_tools=_make_streaming_llm(_make_llm_response()),
+            tool_map={},
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
+            messages=messages,
+            callbacks=callbacks,
+            llm_timeout=600,
+            auxiliary_llm=None,
+            config=_make_config(),
+        )
+
+        assert _STREAM_REASONING_SINK.get() is None

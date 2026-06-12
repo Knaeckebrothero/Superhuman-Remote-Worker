@@ -496,11 +496,13 @@ export class PersistentChatService {
      * chat-page re-mounts and other reconnects against the same thread
      * (docs/issues/persistent_chat_lost_assistant_turn_on_mid_turn_reload.md
      * §Approach 1). loadHistory's GET /messages only returns *persisted*
-     * rows; during streaming the AI message isn't in thread_messages yet,
-     * so re-running it mid-turn would replace the visible streaming turn
-     * with just the user message and drop subsequent SSE events (the
-     * reducer no-ops `token`/`thinking`/`tool.*` events when
-     * `activeAssistantTurnId === null`).
+     * rows; during streaming the AI message isn't fully in thread_messages
+     * yet, so re-running it mid-turn would reset state and replace the
+     * visible streaming turn with just its persisted prefix. Subsequent SSE
+     * events arriving without an active turn are no longer dropped — since
+     * §Approach 2, `ensurePlaceholderTurn` absorbs them into a synthetic
+     * `recovered:` bubble — but that recovery is a fallback, not a reason to
+     * blow away the live turn here.
      */
     async connect(threadId: string): Promise<void> {
         const sameThread = this.threadId() === threadId && this.historyLoaded();
@@ -1697,6 +1699,7 @@ export class PersistentChatService {
                 this.dispatch({
                     type: 'thinking',
                     content: (params['content'] as string) || '',
+                    messageId: (params['message_id'] as string) || undefined,
                     timestamp: now,
                 });
                 break;
@@ -2265,6 +2268,9 @@ export function historyToTurns(messages: HistoryMessage[]): Turn[] {
             turn.events.push({
                 kind: 'thought',
                 id: `${turn.id}.b${turn.events.length}`,
+                // The individual AI row id (a turn may group several), keyed so
+                // a reasoning frame replayed over this rendered bubble dedupes.
+                messageId: m.id,
                 content: m.thinking,
                 status: 'done',
                 startedAt: ts,
