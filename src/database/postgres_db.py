@@ -390,7 +390,7 @@ class PostgresDB:
                    created_at
             FROM thread_messages
             WHERE thread_id = $1
-              AND role <> 'summary'
+              AND role NOT IN ('summary', 'error')
         """
         params: List[Any] = [thread_id]
         if seq_gt is not None:

@@ -1841,60 +1841,39 @@ def _backend_from_override(config_override: Any) -> Optional[str]:
     return ws.get("backend")
 
 
-def _is_lite_config_override(config_override: Any) -> bool:
-    """True if ``config_override`` selects a lite (``virtual``/``none``) backend.
-
-    Lite tiers have no git/workspace, so the orchestrator's git-graft lifecycle
-    subjobs (scholar/critic/curator) can neither hand their ``output/`` back to
-    the parent nor read the parent's deliverables — that handoff is entirely
-    Gitea-branch-based (see ``_graft_subjob_output``). They are therefore skipped
-    for lite jobs; the main agent researches/curates inline. A lite-compatible
-    handoff (object-store copy instead of git graft) is deferred to v2
-    (no_workspace_agent_mode.md §8).
-    """
-    return _backend_from_override(config_override) in LITE_BACKENDS
-
-
 def _virtual_workspace_rclone_spec() -> Optional[dict[str, Any]]:
     """The deployment's object-store spec for the ``virtual`` tier, or None.
 
-    Built from env wired by Helm (``virtualWorkspace.*``):
+    Built from env wired by Helm (``virtualWorkspace.rclone.*``):
 
-    - ``VIRTUAL_WORKSPACE_RCLONE_TYPE`` — rclone backend (``s3`` or, for a
-      non-durable dev store, ``memory``). Empty ⇒ tier disabled (None).
+    - ``VIRTUAL_WORKSPACE_RCLONE_TYPE`` — rclone backend (``s3``/``webdav``/…,
+      or ``memory`` for a non-durable dev store). Empty ⇒ tier disabled (None).
     - ``VIRTUAL_WORKSPACE_RCLONE_ROOT`` — bucket or ``bucket/subpath``.
-    - For ``s3``: discrete fields rather than a JSON blob, mirroring the
-      snapshot S3 wiring. ``VIRTUAL_WORKSPACE_S3_ACCESS_KEY_ID`` /
-      ``_SECRET_ACCESS_KEY`` are the (Secret-held) credentials; ``_ENDPOINT`` /
-      ``_REGION`` / ``_PROVIDER`` are non-secret config. Each ``config`` key
-      becomes ``RCLONE_CONFIG_*`` env in the agent, so secrets never reach argv.
+    - ``VIRTUAL_WORKSPACE_RCLONE_CONFIG`` — JSON object of rclone config
+      key/values (access_key_id, secret_access_key, endpoint, provider, …);
+      held in a Secret. Becomes ``RCLONE_CONFIG_*`` env in the agent, so it
+      never reaches argv.
 
     Returns the ``{type, config, root}`` shape the agent's
-    ``object_store_from_spec`` consumes as ``rclone_spec`` (§4/§5). ``config``
-    holds rclone backend key/values; for ``memory`` it is empty.
+    ``object_store_from_spec`` consumes as ``rclone_spec`` (§4/§5).
     """
     rtype = os.environ.get("VIRTUAL_WORKSPACE_RCLONE_TYPE", "").strip()
     if not rtype:
         return None
-    root = os.environ.get("VIRTUAL_WORKSPACE_RCLONE_ROOT", "").strip()
     config: dict[str, Any] = {}
-    if rtype == "s3":
-        config = {
-            "provider": os.environ.get("VIRTUAL_WORKSPACE_S3_PROVIDER", "").strip()
-            or "Minio",
-            "access_key_id": os.environ.get("VIRTUAL_WORKSPACE_S3_ACCESS_KEY_ID", ""),
-            "secret_access_key": os.environ.get(
-                "VIRTUAL_WORKSPACE_S3_SECRET_ACCESS_KEY", ""
-            ),
-            "endpoint": os.environ.get("VIRTUAL_WORKSPACE_S3_ENDPOINT", "").strip(),
-            "region": os.environ.get("VIRTUAL_WORKSPACE_S3_REGION", "").strip()
-            or "us-east-1",
-            # The agent's scoped key can't create buckets and the bucket is
-            # pre-provisioned, so tell rclone not to probe/create it. String
-            # (not bool) — config values reach rclone as RCLONE_CONFIG_* env.
-            "no_check_bucket": "true",
-        }
-    # "memory" (dev) carries no credentials — empty config.
+    raw = os.environ.get("VIRTUAL_WORKSPACE_RCLONE_CONFIG", "").strip()
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                config = parsed
+            else:
+                logger.error(
+                    "VIRTUAL_WORKSPACE_RCLONE_CONFIG is not a JSON object — ignoring"
+                )
+        except (json.JSONDecodeError, ValueError):
+            logger.error("VIRTUAL_WORKSPACE_RCLONE_CONFIG is not valid JSON — ignoring")
+    root = os.environ.get("VIRTUAL_WORKSPACE_RCLONE_ROOT", "").strip()
     return {"type": rtype, "config": config, "root": root}
 
 
@@ -1930,10 +1909,9 @@ def _inject_lite_workspace_config(
         if spec is None:
             raise LiteWorkspaceConfigError(
                 "workspace.backend='virtual' needs an object store, but this "
-                "deployment has none configured. Set virtualWorkspace.rclone.type "
-                "(+ .root) and, for s3, virtualWorkspace.s3.* plus the "
-                "VIRTUAL_WORKSPACE_S3_ACCESS_KEY_ID / _SECRET_ACCESS_KEY secrets "
-                "— or use backend='none' for a no-file-tools agent, or "
+                "deployment has none configured. Set virtualWorkspace.rclone.* "
+                "(VIRTUAL_WORKSPACE_RCLONE_TYPE/ROOT/CONFIG) to an S3/MinIO "
+                "bucket — or use backend='none' for a no-file-tools agent, or "
                 "'sandbox'/'vm' for a full workspace."
             )
         ws["mounts"] = [
@@ -2262,6 +2240,14 @@ async def _release_thread_resources(thread_id: str) -> None:
         logger.exception("Agent pod cleanup failed for thread %s", thread_id)
 
 
+# Threads with a suspend currently in flight. Two triggers can race on the
+# same thread within a second (e.g. the disconnect watchdog and the agent's
+# own status→ended PUT); without this guard the loser found the workspace
+# already suspended, misread it as a failure, and deleted the agent pod a
+# second time (docs/issues/session_silent_failure_audit.md #13).
+_threads_suspending: set[str] = set()
+
+
 async def _suspend_thread_resources(thread_id: str) -> None:
     """Suspend a thread's workspace to S3 and release the agent pod.
 
@@ -2275,6 +2261,19 @@ async def _suspend_thread_resources(thread_id: str) -> None:
     snapshot fails: the workspace stays alive (reconciler will reap it
     eventually) but we still delete the agent pod so the slot frees.
     """
+    if thread_id in _threads_suspending:
+        logger.info(
+            "Thread %s: suspend already in flight — skipping duplicate", thread_id
+        )
+        return
+    _threads_suspending.add(thread_id)
+    try:
+        await _suspend_thread_resources_inner(thread_id)
+    finally:
+        _threads_suspending.discard(thread_id)
+
+
+async def _suspend_thread_resources_inner(thread_id: str) -> None:
     suspended = False
     try:
         if workspace_suspension_service.is_enabled:
@@ -7097,16 +7096,6 @@ async def _spawn_scholar_subjob(
     if job.get("parent_job_id"):
         return None
 
-    # Lite tiers (virtual/none) have no git workspace for the scholar -> parent
-    # output graft, so skip the research subjob (§8). The parent agent still
-    # researches inline (web/SQL/graph/Mongo/KB all work without a workspace).
-    if _is_lite_config_override(config_override):
-        logger.info(
-            f"Scholar skipped for job {job_id}: lite workspace backend has no "
-            f"git workspace for the research-phase graft handoff"
-        )
-        return None
-
     scholar_config = resolve_scholar_config_from_disk(config_name, config_override)
     if not scholar_config.get("enabled", False):
         logger.debug(f"Scholar not enabled for job {job_id} (config={config_name})")
@@ -7744,12 +7733,6 @@ async def _trigger_verification_on_complete(
     if job.get("parent_job_id") is not None:
         logger.debug(f"Skipping verification for {job_id} — it is a sub-job")
         return
-    if _is_lite_config_override(job.get("config_override")):
-        logger.info(
-            f"Critic skipped for job {job_id}: lite workspace backend has no "
-            f"git workspace for the verification subjob handoff"
-        )
-        return
     if not is_verification_enabled(job):
         logger.debug(f"Verification not enabled for job {job_id}")
         return
@@ -7958,12 +7941,6 @@ async def _trigger_curation_final_pass(
     if target_job is None:
         target_job = await postgres_db.get_job(target_job_id)
     if not target_job:
-        return
-    if _is_lite_config_override(target_job.get("config_override")):
-        logger.info(
-            f"Curation skipped for job {target_job_id}: lite workspace backend "
-            f"has no git workspace for the curator subjob handoff"
-        )
         return
     if not is_curation_enabled(target_job):
         return
@@ -13135,19 +13112,58 @@ async def get_thread(thread_id: str, request: Request) -> dict[str, Any]:
     return result
 
 
+async def _thread_turn_in_flight(thread: dict) -> bool:
+    """Best-effort probe: is the thread's agent currently executing a turn?
+
+    Asks the bound agent's ``/session/status``. Any failure (no agent, pod
+    gone, timeout) returns False — ending a dead or unreachable session must
+    always be possible.
+    """
+    agent_id = thread.get("agent_id")
+    if not agent_id:
+        return False
+    try:
+        agent = await postgres_db.get_agent(str(agent_id))
+        if not agent or not agent.get("pod_ip"):
+            return False
+        url = f"http://{agent['pod_ip']}:{agent['pod_port']}/session/status"
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            response = await client.get(url)
+        if response.status_code != 200:
+            return False
+        return bool(response.json().get("turn_in_flight"))
+    except Exception:
+        return False
+
+
 @app.delete("/api/persistent/threads/{thread_id}")
 async def end_thread(
     thread_id: str,
     request: Request,
     permanent: bool = False,
+    force: bool = False,
 ) -> dict[str, str]:
     """End (or permanently delete) a persistent thread (auth: owner only).
 
     Query params:
         permanent: If true, delete the thread row and all associated messages
                    from the database. If false (default), just mark as ended.
+        force: Required to end a session whose agent is mid-turn. Without it
+               a live turn returns 409 — a sessions-list cleanup sweep tore
+               down an active session mid-turn, destroying its in-memory
+               input queue (docs/issues/session_silent_failure_audit.md #11).
     """
     user, thread = await require_thread_owner(request, postgres_db, thread_id)
+
+    if not force and await _thread_turn_in_flight(thread):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "turn_in_flight: the agent is mid-turn on this session. "
+                "Retry with ?force=true to end it anyway."
+            ),
+        )
+
     metadata = thread.get("metadata") or {}
     if isinstance(metadata, str):
         try:

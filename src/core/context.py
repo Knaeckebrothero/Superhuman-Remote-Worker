@@ -1227,7 +1227,7 @@ class ContextManager:
         auxiliary,
         summarization_prompt: Optional[str],
         max_summary_length: int,
-    ) -> str:
+    ) -> Optional[str]:
         """Single-pass summarization of conversation text.
 
         Delegates to AuxiliaryLLM.chain(SummarizeTask(...)) for the actual
@@ -1240,7 +1240,10 @@ class ContextManager:
             max_summary_length: Maximum summary length
 
         Returns:
-            Summary string
+            Summary string, or None when both the structured pass and the
+            unstructured fallback failed — callers must treat None as
+            "no summary available" and skip compaction rather than
+            substituting a placeholder for real history.
         """
         from src.services.auxiliary import SummarizeTask
 
@@ -1345,7 +1348,11 @@ class ContextManager:
             except Exception as fallback_err:
                 logger.error(f"Unstructured fallback also failed: {fallback_err}")
 
-            return f"[Summarization failed: {e}]"
+            # Stopgap for docs/issues/session_silent_failure_audit.md #4: a
+            # placeholder here used to *replace* the summarized history,
+            # permanently destroying it. Return None so callers keep the
+            # original messages instead.
+            return None
 
     async def _recursive_summarize(
         self,
@@ -1354,7 +1361,7 @@ class ContextManager:
         summarization_prompt: Optional[str],
         max_summary_length: int,
         depth: int = 0,
-    ) -> str:
+    ) -> Optional[str]:
         """Recursively summarize large inputs by chunking.
 
         This method handles arbitrarily large inputs by:
@@ -1410,6 +1417,15 @@ class ContextManager:
                 summarization_prompt,
                 chunk_max_length,
             )
+            if summary is None:
+                # A failed chunk means that slice of history would be lost.
+                # Fail the whole pass — the caller keeps the original
+                # messages uncompacted (see _single_pass_summarize).
+                logger.error(
+                    f"Chunk {i + 1}/{len(chunks)} summarization failed — "
+                    "aborting recursive summarization"
+                )
+                return None
             chunk_summaries.append(summary)
 
         # Combine summaries
@@ -1452,7 +1468,7 @@ class ContextManager:
         auxiliary,
         summarization_prompt: Optional[str] = None,
         max_summary_length: int = 10000,
-    ) -> str:
+    ) -> Optional[str]:
         """Generate a summary of the conversation.
 
         Handles arbitrarily large inputs via recursive chunked summarization.
@@ -1495,6 +1511,12 @@ class ContextManager:
                 summarization_prompt,
                 max_summary_length,
             )
+
+        if summary is None:
+            # Total summarizer failure (see _single_pass_summarize) — callers
+            # treat None as "no summary available" and skip compaction.
+            logger.error("Summarization produced no summary")
+            return None
 
         logger.info(f"Generated summary ({len(summary)} chars)")
         # Debug: log tail
@@ -1651,6 +1673,20 @@ class ContextManager:
             summarization_prompt,
             max_summary_length,
         )
+
+        # Stopgap (docs/issues/session_silent_failure_audit.md #4): when the
+        # summarizer is fully unavailable, keep the original history rather
+        # than compacting it away behind a placeholder. The turn may then
+        # fail on context overflow — visibly — instead of the agent being
+        # silently lobotomized.
+        if summary is None:
+            logger.error(
+                "Compaction aborted: summarization unavailable (aux LLM "
+                f"failure) — keeping {len(messages)} messages uncompacted"
+            )
+            if oversized_count > 0:
+                return _substitution_only_result()
+            return messages
 
         # Guard: if summary is larger than what we're replacing, skip compaction
         summary_tokens = self.get_token_count([SystemMessage(content=summary)])

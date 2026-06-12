@@ -1004,3 +1004,39 @@ class TestVerbatimTruncation:
 
         n = len(_encoding().encode(text, disallowed_special=()))
         assert n <= EMBED_TOKEN_CAP + 8  # cap + marker tokens
+
+
+class TestExtractionPromptOverride:
+    def test_arm_field_parses(self, tmp_path):
+        arm_file = tmp_path / "arm.yaml"
+        arm_file.write_text(
+            "name: t\nextraction_prompt_file: config/prompts/"
+            "memory_extraction_prompt_complete.txt\n"
+        )
+        arm = ArmSpec.from_file(str(arm_file))
+        assert arm.extraction_prompt_file == (
+            "config/prompts/memory_extraction_prompt_complete.txt"
+        )
+        assert ArmSpec(name="x").extraction_prompt_file is None
+
+    def test_variant_prompt_committed_and_nonempty(self):
+        text = (
+            REPO_ROOT / "config" / "prompts" / "memory_extraction_prompt_complete.txt"
+        ).read_text(encoding="utf-8")
+        # the structural contract the extractor parser relies on
+        for marker in (
+            "content",
+            "summary",
+            "keywords",
+            "importance",
+            "retrieval_messages",
+            "factual",
+            "procedural",
+            "error_solution",
+            "vocabulary",
+            "relational",
+        ):
+            assert marker in text, f"variant prompt missing field/type {marker}"
+        # the intervention itself
+        assert "Completeness over precision" in text
+        assert "Events that happened" in text

@@ -53,6 +53,16 @@ import {AppToastService} from '../../ui/toast';
 const CONTROL_WS_RECONNECT_DELAYS_MS = [500, 1000, 2000, 4000];
 const CONTROL_WS_RECONNECT_MAX_ATTEMPTS = 8;
 
+// Control-WS liveness watchdog. The agent's subscriber pump sends a
+// `ws.ping` frame every ~20s of idle (src/api/persistent_app.py,
+// _WS_PING_INTERVAL_S); if the socket claims OPEN but nothing arrived in
+// CONTROL_WS_WATCHDOG_TIMEOUT_MS it's half-open (edge/tunnel idle kill — no
+// close frame ever reaches us), so force-close it and let the reconnect
+// ladder re-fetch a fresh token. Closes the gap left when F4.5 shipped for
+// the SSE only (session_silent_failure_audit.md #9).
+const CONTROL_WS_WATCHDOG_INTERVAL_MS = 15_000;
+const CONTROL_WS_WATCHDOG_TIMEOUT_MS = 45_000;
+
 // SSE liveness watchdog. The orchestrator emits a typed `ping` event every
 // ~20s of idle (see `thread_event_stream` in `orchestrator/main.py`); the
 // watchdog checks every WATCHDOG_INTERVAL_MS and forces a reopen if no SSE
@@ -231,6 +241,12 @@ export class PersistentChatService {
     // --- Connection state ---
     readonly connectionState = signal<ConnectionState>('disconnected');
     readonly isConnected = computed(() => this.connectionState() === 'connected');
+
+    // Agent-liveness, distinct from connection-liveness (audit #8). Seconds
+    // since the last agent-origin frame while a turn is open; 0 when idle.
+    // Updated on the SSE watchdog's 5s tick.
+    readonly agentSilenceSeconds = signal<number>(0);
+    private agentLastEventAt = 0;
     readonly threadId = signal<string | null>(null);
 
     /**
@@ -407,6 +423,8 @@ export class PersistentChatService {
     private controlWs: WebSocket | null = null;
     private controlWsReconnectTimer: ReturnType<typeof setTimeout> | null = null;
     private controlWsReconnectAttempt = 0;
+    private controlWsLastMessageAt = 0;
+    private controlWsWatchdogTimer: ReturnType<typeof setInterval> | null = null;
     private intentionalClose = false;
     /**
      * Guard against double-opening the control WS while an async
@@ -687,7 +705,19 @@ export class PersistentChatService {
     private _startSseWatchdog(threadId: string): void {
         this._stopSseWatchdog();
         this.sseLastEventAt = Date.now();
+        this.agentLastEventAt = Date.now();
         this.sseWatchdogTimer = setInterval(() => {
+            // Piggyback the agent-quiet signal on this 5s tick (audit #8):
+            // only meaningful while a turn is open — an idle agent being
+            // quiet is expected.
+            this.zone.run(() => {
+                const turnOpen = this.conversation().activeAssistantTurnId != null;
+                this.agentSilenceSeconds.set(
+                    turnOpen && this.agentLastEventAt > 0
+                        ? Math.floor((Date.now() - this.agentLastEventAt) / 1000)
+                        : 0,
+                );
+            });
             if (!this.sse || this.sse.readyState !== EventSource.OPEN) {
                 // CONNECTING/CLOSED is already handled by onerror.
                 return;
@@ -916,8 +946,11 @@ export class PersistentChatService {
 
     private _installControlWs(threadId: string, wsUrl: string): void {
         this.controlWs = new WebSocket(wsUrl);
+        this.controlWsLastMessageAt = Date.now();
+        this._startControlWsWatchdog(threadId);
         this.controlWs.onclose = (event: CloseEvent) => {
             this.controlWs = null;
+            this._stopControlWsWatchdog();
             if (this.intentionalClose) return;
             if (this.threadId() !== threadId) return;
             // 4401 = expired/invalid token (Task 8). The agent is still
@@ -950,13 +983,16 @@ export class PersistentChatService {
         // reconnect to an already-idle loop where the cached SSE cursor
         // sits past the most recent `ready` event.
         this.controlWs.onmessage = (event: MessageEvent) => {
+            // Any frame proves liveness — including ws.ping, whose only job
+            // is feeding this watchdog.
+            this.controlWsLastMessageAt = Date.now();
             let frame: { method?: string; params?: Record<string, unknown> };
             try {
                 frame = JSON.parse(event.data);
             } catch {
                 return;
             }
-            if (!frame?.method) return;
+            if (!frame?.method || frame.method === 'ws.ping') return;
             if (frame.params && (frame.params as Record<string, unknown>)['_seq'] != null) {
                 return;
             }
@@ -984,6 +1020,33 @@ export class PersistentChatService {
             }
         } finally {
             this.controlWsOpening = false;
+        }
+    }
+
+    /** Force-close a half-open control WS that stopped delivering frames.
+     *  close() fires onclose locally even when the peer is unreachable, so
+     *  the regular reconnect ladder (with a fresh /connection token) takes
+     *  over from there. */
+    private _startControlWsWatchdog(threadId: string): void {
+        this._stopControlWsWatchdog();
+        this.controlWsWatchdogTimer = setInterval(() => {
+            if (this.threadId() !== threadId || this.intentionalClose) {
+                this._stopControlWsWatchdog();
+                return;
+            }
+            const ws = this.controlWs;
+            if (!ws || ws.readyState !== WebSocket.OPEN) return;
+            if (Date.now() - this.controlWsLastMessageAt > CONTROL_WS_WATCHDOG_TIMEOUT_MS) {
+                console.warn('[persistent-chat] control WS silent past watchdog — forcing reconnect');
+                ws.close(4002, 'heartbeat timeout');
+            }
+        }, CONTROL_WS_WATCHDOG_INTERVAL_MS);
+    }
+
+    private _stopControlWsWatchdog(): void {
+        if (this.controlWsWatchdogTimer) {
+            clearInterval(this.controlWsWatchdogTimer);
+            this.controlWsWatchdogTimer = null;
         }
     }
 
@@ -1063,6 +1126,7 @@ export class PersistentChatService {
         }
         this.controlWsReconnectAttempt = 0;
         this._stopSseWatchdog();
+        this._stopControlWsWatchdog();
         if (this.sse) {
             this.sse.close();
             this.sse = null;
@@ -1137,19 +1201,36 @@ export class PersistentChatService {
      * Local disconnect runs regardless of the DELETE result so the user
      * never gets stuck on a stale connection if the API call fails.
      */
-    async endSession(): Promise<void> {
+    async endSession(force = false): Promise<void> {
         const threadId = this.threadId();
         if (!threadId) {
             this.disconnect();
             return;
         }
         try {
+            const qs = force ? '?force=true' : '';
             await firstValueFrom(
-                this.http.delete(`${environment.apiUrl}/persistent/threads/${threadId}`),
+                this.http.delete(`${environment.apiUrl}/persistent/threads/${threadId}${qs}`),
             );
-        } finally {
+        } catch (err: unknown) {
+            const status = (err as {status?: number})?.status;
+            if (status === 409 && !force) {
+                // Mid-turn guard (session_silent_failure_audit.md #11): the
+                // orchestrator refuses to tear down a session whose agent is
+                // mid-turn unless forced. Declining keeps the session alive.
+                const proceed = confirm(
+                    'The agent is still working on a turn. End the session anyway? ' +
+                    'The in-flight turn and any queued input will be lost.',
+                );
+                if (proceed) {
+                    await this.endSession(true);
+                }
+                return;
+            }
             this.disconnect();
+            throw err;
         }
+        this.disconnect();
     }
 
     /** Add files queued in the composer to be uploaded on next send. */
@@ -1379,7 +1460,16 @@ export class PersistentChatService {
                 `${environment.apiUrl}/persistent/threads/${threadId}` +
                 `/approve/${pending.approvalId}`;
             this.http.post(url, {decision}).subscribe({
-                error: () => {
+                error: (err: unknown) => {
+                    const status = (err as {status?: number})?.status;
+                    if (status === 409) {
+                        // Already decided — a stale card from SSE replay or a
+                        // double-click (session_silent_failure_audit.md #10).
+                        // The permission.resolved event reconciles the card;
+                        // just tell the user instead of re-sending over WS.
+                        this._systemMessage('This permission request was already decided.');
+                        return;
+                    }
                     this._sendControl({method: decision, approval_id: pending.approvalId});
                 },
             });
@@ -1472,6 +1562,13 @@ export class PersistentChatService {
     private _handleEvent(data: { method: string; params?: Record<string, unknown> }): void {
         const params = data.params ?? {};
         const now = Date.now();
+
+        // Agent-liveness tracking (session_silent_failure_audit.md #8):
+        // "Connected" only proves the orchestrator SSE is up. Every frame
+        // reaching this dispatcher is agent-origin (orchestrator pings and
+        // ws.ping never get here), so its age is a fair proxy for "is the
+        // agent producing anything".
+        this.agentLastEventAt = now;
 
         switch (data.method) {
             case 'session.state':
@@ -1595,6 +1692,28 @@ export class PersistentChatService {
                 break;
             }
 
+            case 'permission.resolved': {
+                // SSE replay re-delivers permission.request frames; without
+                // this matching outcome event a reloading client resurrected
+                // an already-decided approval card, whose re-click then
+                // 409'd (session_silent_failure_audit.md #10).
+                const resolvedId = (params['id'] as string) || '';
+                const decision =
+                    params['decision'] === 'approved' ? 'approved' : 'denied';
+                if (this.pendingPermission()?.id === resolvedId) {
+                    this.pendingPermission.set(null);
+                }
+                if (resolvedId) {
+                    this.dispatch({
+                        type: 'permission_decision',
+                        toolUseId: resolvedId,
+                        decision,
+                        timestamp: now,
+                    });
+                }
+                break;
+            }
+
             case 'turn.completed': {
                 const turnId = String(params['turn_id'] ?? this.conversation().activeAssistantTurnId ?? '');
                 if (turnId) {
@@ -1602,6 +1721,19 @@ export class PersistentChatService {
                 }
                 this.isInterrupting.set(false);
                 this.runningTool.set(null);
+                break;
+            }
+
+            case 'turn.error': {
+                // A failed turn used to leave the assistant bubble spinning
+                // forever (no turn.completed on the error path) with only the
+                // transient banner as a signal. Close the turn and append a
+                // durable line — the matching role='error' history row keeps
+                // it across reloads (session_silent_failure_audit.md #2).
+                this._closeActiveTurnIfAny('turn_interrupted');
+                this.isInterrupting.set(false);
+                this.runningTool.set(null);
+                this._systemMessage(`⚠ ${this.sanitizeError(params['message'] as string)}`);
                 break;
             }
 
@@ -1891,6 +2023,19 @@ function historyToTurns(messages: HistoryMessage[]): Turn[] {
                 kind: 'compaction',
                 id: m.id,
                 summary: m.content ?? '',
+                timestamp: ts,
+            });
+            continue;
+        }
+
+        // Persisted turn failure (role='error') → muted system line, same
+        // treatment the live turn.error frame gets
+        // (session_silent_failure_audit.md #2).
+        if (m.role === 'error') {
+            turns.push({
+                kind: 'system',
+                id: m.id,
+                content: `⚠ ${m.content || 'The turn failed.'}`,
                 timestamp: ts,
             });
             continue;

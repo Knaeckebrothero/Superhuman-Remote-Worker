@@ -451,7 +451,12 @@ class TestSinglePassSummarize:
 
     @pytest.mark.asyncio
     async def test_handles_llm_error(self, context_manager):
-        """Should return error message when LLM fails."""
+        """Total failure returns None — callers keep history uncompacted.
+
+        The old contract returned an "[Summarization failed: …]" placeholder
+        that summarize_and_compact then substituted for the real history,
+        permanently destroying it (session_silent_failure_audit.md #4).
+        """
         from src.services.auxiliary import AuxiliaryLLM
 
         error_llm = MagicMock()
@@ -470,7 +475,35 @@ class TestSinglePassSummarize:
             max_summary_length=10000,
         )
 
-        assert "[Summarization failed:" in result
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_compaction_keeps_history_when_summarization_fails(
+        self, context_manager
+    ):
+        """summarize_and_compact must not replace history with a placeholder
+        when the summarizer is fully unavailable (audit #4 stopgap)."""
+        from langchain_core.messages import AIMessage, HumanMessage
+
+        from src.services.auxiliary import AuxiliaryLLM
+
+        error_llm = MagicMock()
+        structured_llm = AsyncMock()
+        structured_llm.ainvoke = AsyncMock(side_effect=Exception("aux 503"))
+        error_llm.with_structured_output = MagicMock(return_value=structured_llm)
+        error_llm.ainvoke = AsyncMock(side_effect=Exception("aux 503"))
+        aux = AuxiliaryLLM(llm=error_llm)
+
+        messages = []
+        for i in range(12):
+            messages.append(HumanMessage(content=f"question {i}", id=f"h{i}"))
+            messages.append(AIMessage(content=f"answer {i}", id=f"a{i}"))
+
+        result = await context_manager.summarize_and_compact(messages, aux)
+
+        # Unchanged: same objects, no RemoveMessage markers, no placeholder.
+        assert result == messages
+        assert not any("[Summarization failed" in str(m.content) for m in result)
 
 
 # =============================================================================

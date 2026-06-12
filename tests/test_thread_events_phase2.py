@@ -491,7 +491,11 @@ class TestAgentRestInputEndpointsNoSession:
                 assert response.status_code == 200
                 await asyncio.wait_for(mod._loop_task, timeout=1)
 
-            assert seen_inputs == ["hello from REST"]
+            # Accept-time persistence wraps queue items as {content, id} so
+            # the loop reuses the already-persisted row id
+            # (session_silent_failure_audit.md #1).
+            assert [i["content"] for i in seen_inputs] == ["hello from REST"]
+            assert all(i["id"].startswith("msg_") for i in seen_inputs)
         finally:
             mod._session = None
             mod._thread_id = None

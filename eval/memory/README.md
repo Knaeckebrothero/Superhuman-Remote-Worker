@@ -73,6 +73,24 @@ python -m eval.memory.run --dataset eval/memory/data/longmemeval_s.json \
 python -m eval.memory.report eval/memory/runs/<run>
 python -m eval.memory.report eval/memory/runs/<runA> eval/memory/runs/<runB>
 
+# 6b. Question-time-only A/Bs (scorers, budgets, injection policies):
+#     ingest ONCE without --cleanup, then re-query the same corpora with
+#     other arms in minutes (scope run_id is taken from the source run):
+python -m eval.memory.run --dataset ... --arm <ingest-arm> --out runs/<base>      # no --cleanup
+python -m eval.memory.run --dataset ... --arm <readpath-arm> \
+  --requery-from eval/memory/runs/<base> --out runs/<base>_rerank --limit 20
+#     COMPARABILITY: every assemble mutates corpus state (TTL decrement on
+#     the whole scope + retrieve-path re-pinning/access bumps), so snapshot
+#     remaining_turns/access_count/last_accessed into a side table once
+#     after ingest and restore it between requery arms — otherwise later
+#     arms see drifted tier membership. On multi-session corpora expect
+#     ~95% of rows TTL-pinned (cross-session scopes stop ticking): reranker
+#     arms need keep_pinned_first: false + top_k >= store size, and
+#     reranker.timeout: 60 (full-store batches trip the 10s default when
+#     the endpoint is cold/contended — failures are contained passthroughs,
+#     visible as "scorer 'reranker' failed (contained)" in run.log, which
+#     silently turns the arm into a legacy-order measurement).
+
 # 7. End-task accuracy (reader + LongMemEval judge over a finished run):
 export EVAL_READER_MODEL=... EVAL_READER_BASE_URL=... EVAL_READER_API_KEY=...
 export EVAL_JUDGE_MODEL=...  # both fall back to EVAL_AUX_*
@@ -87,7 +105,17 @@ python -m eval.memory.contradiction eval/memory/runs/contra_<arm> --reader
 
 Seam-mode arms additionally need the extraction model: fill the
 `auxiliary:` block in the arm (model + base_url + `api_key_env` naming an
-env var). Results stream to `<out>/results.jsonl` per question — rerunning
+env var). Arm-level extras: `extraction_prompt_file:` overrides the
+matrix-resolved extraction prompt (the prompt-variant A/B knob, e.g.
+`config/prompts/memory_extraction_prompt_complete.txt`);
+`config_overrides.memory.pipeline.scorers: [reranker]` +
+`config_overrides.memory.reranker:` switch on the reranker scorer (its
+transport defaults to the arm's auxiliary endpoint);
+`config_overrides.memory.pipeline.policies: [bounded]` +
+`config_overrides.memory.bounded: {max_items: N, max_tokens: T}` cap the
+injected memory items AFTER scorers run (`memory.budget_tokens` trims
+inside the retriever in legacy order — before a reranker can act — so
+post-scorer bounding must use the policy, not the budget). Results stream to `<out>/results.jsonl` per question — rerunning
 with the same `--out`/`--run-id` resumes, so a flaky aux endpoint only
 costs the in-flight questions. `run.log` in the run dir captures all
 contained seam warnings; a seam arm with `stored=0` across many questions
