@@ -1236,6 +1236,13 @@ async def _execute_turn(
             }
             turn_metrics = {k: v for k, v in turn_metrics.items() if v is not None}
 
+            # Anchor the compaction trigger on the real provider input_tokens
+            # (context_token_accounting.md S1). Guarded so test stubs and
+            # empty-usage turns are no-ops.
+            _record_usage = getattr(context_manager, "record_provider_usage", None)
+            if _record_usage is not None:
+                _record_usage(turn_metrics.get("input_tokens"))
+
         # Audit the call. Sessions previously wrote no llm_requests rows at
         # all — job agents were auditable, session hangs were not
         # (session_silent_failure_audit.md #14). The callback schedules its
