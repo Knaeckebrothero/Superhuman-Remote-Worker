@@ -6,22 +6,22 @@
 # block can carry up to three subsections:
 #   - prompts:       (prompt_type)      → filename in config/prompts/
 #   - instructions:  (instruction_type) → filename in config/templates/
-#   - settings:      inference parameters and `limits:` block
+#   - settings:      inference parameters (incl. model_max_context_tokens)
 #
 # Resolution: per-section, expert family → expert default → base family →
 # base default → hardcoded fallback. Sections and keys missing for a family
 # fall through to `default`.
 #
-# Limits derivation: a family's `limits:` block carries ONLY
-# `model_max_context_tokens` — the conservative working-window BASE. The other
-# leaves (context_threshold_tokens, message_count_min_tokens) are DERIVED at
-# load as fixed fractions of the base (see the *_FRACTION constants +
+# Context window: a family's `settings.model_max_context_tokens` is the model's
+# true max — a SINGLE value, with no separate conservative working-window cap.
+# The context-management `limits` leaves (model_max_context_tokens,
+# context_threshold_tokens, message_count_min_tokens) are DERIVED at load as
+# fixed fractions of that base (see the *_FRACTION constants +
 # _apply_settings_matrix in src/core/loader.py); do not hand-author them here.
 # When a model is added with an explicit per-model context window (Admin →
-# Models `context_window`), that value overrides the base and the same
-# fractions re-derive the leaves.
-# `settings.model_max_context_tokens` (the top-level one) stays the model's true
-# nominal/API ceiling for the Layer-1 safety check + output-token sizing.
+# Models `context_window`), that value overrides the family base and the same
+# fractions re-derive the leaves. To run a model below its true max, set a
+# smaller per-model `context_window` — the app imposes no default cap of its own.
 #
 # Summarization budgets are deliberately NOT derived here: they are computed
 # at call time from the AUXILIARY model's own window (src/core/summarizer.py).
@@ -53,8 +53,6 @@ default:
     multimodal: false
     parallel_tool_calls: false
     model_max_context_tokens: 128000
-    limits:
-      model_max_context_tokens: 100000
 
 minimax:
   prompts:
@@ -73,8 +71,6 @@ minimax:
     multimodal: false
     parallel_tool_calls: true
     model_max_context_tokens: 204800  # M2.7: 204,800 context, 131K max output
-    limits:
-      model_max_context_tokens: 170000
 
 # MiniMax M3 (released 2026-06-01) — distinct family from `minimax` (M2.7) so
 # the two coexist. M3 ships the MSA sparse-attention architecture, a 1M-token
@@ -104,11 +100,6 @@ minimax-m3:
     multimodal: true   # M3 is natively multimodal (image + video input)
     parallel_tool_calls: true  # M3 supports continuous + parallel tool calls
     model_max_context_tokens: 1000000  # M3: up to 1M context (>=512K guaranteed) via MSA
-    limits:
-      # MSA makes very long windows viable, but we cap the working window like
-      # the other 1M-class models (claude-opus, gpt-5, gemini) to bound cost and
-      # avoid long-context accuracy drift. Revisit upward after real M3 runs.
-      model_max_context_tokens: 200000
 
 o-series:
   settings:
@@ -116,8 +107,6 @@ o-series:
     multimodal: true  # o3/o4-mini support image inputs
     parallel_tool_calls: true
     model_max_context_tokens: 200000
-    limits:
-      model_max_context_tokens: 170000
 
 # DeepSeek V4 family (released 2026-04-24). Covers BOTH variants — family_of()
 # maps `deepseek-v4-pro` (1.6T/49B) and `deepseek-v4-flash` (284B/13B) to this
@@ -163,11 +152,6 @@ deepseek:
     multimodal: false  # V4 Pro + Flash are text-only
     parallel_tool_calls: false  # DeepSeek parallel tool calls remain unreliable
     model_max_context_tokens: 1000000  # V4 Pro + Flash: 1M context (was 64K on V3/R1)
-    limits:
-      # Cap the working window like the other 1M-class families (claude-opus,
-      # gpt-5, gemini, minimax-m3) to bound cost + avoid long-context drift.
-      # Revisit upward after real V4 runs.
-      model_max_context_tokens: 200000
 
 gemini:
   settings:
@@ -176,8 +160,6 @@ gemini:
     multimodal: true  # Gemini models are natively multimodal
     parallel_tool_calls: true
     model_max_context_tokens: 1000000
-    limits:
-      model_max_context_tokens: 200000
 
 claude-opus:
   settings:
@@ -185,8 +167,6 @@ claude-opus:
     multimodal: true  # Claude Opus 4.6 supports vision
     parallel_tool_calls: true
     model_max_context_tokens: 1000000  # Opus 4.6: 1M context, 128K max output
-    limits:
-      model_max_context_tokens: 200000
 
 gpt-5:
   prompts:
@@ -212,8 +192,6 @@ gpt-5:
     # and the Codex proxy only supports the Responses API.
     parallel_tool_calls: false
     model_max_context_tokens: 1050000  # gpt-5.4: 1.05M, 128K max output
-    limits:
-      model_max_context_tokens: 200000
 
 codex:
   prompts:
@@ -235,8 +213,6 @@ codex:
     # TODO: Re-enable once langchain-ai/langchain#34660 is fixed.
     parallel_tool_calls: false
     model_max_context_tokens: 400000  # gpt-5.3-codex: 400K context, 128K max output
-    limits:
-      model_max_context_tokens: 350000
 
 codex-spark:
   prompts:
@@ -254,8 +230,6 @@ codex-spark:
     # TODO: Re-enable once langchain-ai/langchain#34660 is fixed.
     parallel_tool_calls: false
     model_max_context_tokens: 128000  # gpt-5.3-codex-spark: 128K context (distilled)
-    limits:
-      model_max_context_tokens: 110000
 
 gpt-oss:
   prompts:
@@ -281,8 +255,6 @@ gpt-oss:
     multimodal: false  # gpt-oss-120b is text-only (MoE architecture)
     parallel_tool_calls: false  # Served via vLLM; parallel calls need provider support
     model_max_context_tokens: 131072  # True 128K context (MoE: 117B total, 5.1B active)
-    limits:
-      model_max_context_tokens: 110000
 
 # Gemma 4 has native system role, native multimodality, and strong Markdown
 # instruction following. Two integration challenges drove the variants below:
@@ -340,8 +312,6 @@ gemma:
     multimodal: true  # Gemma 4 31B accepts text + image + video (no audio on 31B)
     parallel_tool_calls: false  # vllm#39392: concurrent tool calls can emit <pad> tokens
     model_max_context_tokens: 131072  # Endpoint reports 131072 for current deployment
-    limits:
-      model_max_context_tokens: 110000
 
 # Model-specific overrides — add as needed:
 # claude-sonnet:
