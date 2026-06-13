@@ -140,6 +140,7 @@
     "untitledSession": "Untitled Session",
     "confirmDelete": "Delete this session permanently?",
     "confirmForceDelete": "The agent is still working on a turn in this session. Delete anyway? The in-flight turn will be lost.",
+    "confirmEndMidTurn": "The agent is still working on a turn. End the session anyway? The in-flight turn and any queued input will be lost.",
     "turnsOne": "turn",
     "turnsMany": "turns",
     "filter": {
