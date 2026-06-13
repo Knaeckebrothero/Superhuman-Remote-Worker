@@ -31,6 +31,8 @@ from langchain_core.messages import (
 )
 from pydantic import BaseModel, Field, model_validator
 
+from src.core.image_tokens import estimate_image_tokens, split_text_and_images
+
 logger = logging.getLogger(__name__)
 
 
@@ -345,6 +347,9 @@ class ContextManagementState:
     total_messages_trimmed: int = 0
     total_summarizations: int = 0
     current_token_count: int = 0
+    # Real input_tokens of the last provider call — the compaction-trigger
+    # anchor (context_token_accounting.md S1). None until the first response.
+    last_provider_input_tokens: Optional[int] = None
     summaries: List[str] = field(default_factory=list)
     last_compaction_iteration: int = 0
 
@@ -444,10 +449,15 @@ def count_tokens_tiktoken(messages: List[BaseMessage], model: str = "gpt-4") -> 
         debug_details = []
         for i, msg in enumerate(messages):
             msg_tokens = 0
-            # Count message content
-            content = msg.content if isinstance(msg.content, str) else str(msg.content)
-            content_tokens = len(enc.encode(content, disallowed_special=()))
-            msg_tokens += content_tokens
+            # Count message content. Multimodal content is a list of blocks;
+            # split out image blocks and count them as flat image tokens
+            # instead of tokenizing their base64 data URL as text (which
+            # inflated session 5dbb5770 to ~9.2M phantom tokens). See
+            # src/core/image_tokens.py + docs/features/context_token_accounting.md.
+            text, n_images = split_text_and_images(msg.content)
+            content_tokens = len(enc.encode(text, disallowed_special=()))
+            image_tokens = estimate_image_tokens(n_images)
+            msg_tokens += content_tokens + image_tokens
 
             # Count tool calls if present
             tool_call_tokens = 0
@@ -465,7 +475,9 @@ def count_tokens_tiktoken(messages: List[BaseMessage], model: str = "gpt-4") -> 
             if msg_tokens > 1000:
                 msg_type = type(msg).__name__
                 debug_details.append(
-                    f"[{i}] {msg_type}: {content_tokens}t content, {tool_call_tokens}t tools, {len(content)} chars"
+                    f"[{i}] {msg_type}: {content_tokens}t content, "
+                    f"{image_tokens}t images ({n_images}), {tool_call_tokens}t tools, "
+                    f"{len(text)} chars"
                 )
 
         if (
@@ -498,16 +510,18 @@ def count_tokens_approximate(messages: List[BaseMessage]) -> int:
         Approximate token count
     """
     total_chars = 0
+    total_image_tokens = 0
     for msg in messages:
-        content = msg.content if isinstance(msg.content, str) else str(msg.content)
-        total_chars += len(content)
+        text, n_images = split_text_and_images(msg.content)
+        total_chars += len(text)
+        total_image_tokens += estimate_image_tokens(n_images)
 
         # Add tool calls if present
         if hasattr(msg, "tool_calls") and msg.tool_calls:
             total_chars += len(str(msg.tool_calls))
 
-    # ~4 chars per token on average
-    return total_chars // 4
+    # ~4 chars per token on average, plus flat per-image tokens
+    return total_chars // 4 + total_image_tokens
 
 
 def get_token_counter(model: str = "gpt-4") -> Callable[[List[BaseMessage]], int]:
@@ -644,6 +658,33 @@ class ContextManager:
         self._state.current_token_count = count
         return count
 
+    def record_provider_usage(self, input_tokens: Optional[int]) -> None:
+        """Anchor the compaction trigger on the provider's real input_tokens.
+
+        Called after each main-model response that carries usage. The provider
+        count is ground truth for the current context size (it includes the
+        system prompt, tool schemas, and real image-token cost) and self-heals
+        the trigger every turn. None / non-positive values are ignored so an
+        empty-usage turn never clobbers the anchor.
+        """
+        if input_tokens and input_tokens > 0:
+            self._state.last_provider_input_tokens = int(input_tokens)
+
+    def _trigger_token_count(self, messages: List[BaseMessage]) -> int:
+        """Token count for compaction-*trigger* decisions.
+
+        The image-aware local count, floored by the last real provider
+        ``input_tokens``. Both numbers are honest now that image blocks are no
+        longer stringified; the floor is biased-high (it carries the
+        system-prompt / tool-schema / injection overhead the bare message list
+        lacks) and guards against local under-counting. The raw local count
+        still drives the post-compaction elision checks against the model max —
+        only the trigger uses the floor.
+        """
+        local = self.get_token_count(messages)
+        anchor = self._state.last_provider_input_tokens or 0
+        return max(local, anchor)
+
     def should_compact(self, messages: List[BaseMessage]) -> bool:
         """Check if context needs compaction.
 
@@ -653,7 +694,10 @@ class ContextManager:
         Returns:
             True if compaction threshold exceeded
         """
-        return self.get_token_count(messages) > self.config.compaction_threshold_tokens
+        return (
+            self._trigger_token_count(messages)
+            > self.config.compaction_threshold_tokens
+        )
 
     def should_summarize(self, messages: List[BaseMessage]) -> bool:
         """Check if summarization is needed.
@@ -669,7 +713,7 @@ class ContextManager:
         Returns:
             True if summarization threshold exceeded
         """
-        token_count = self.get_token_count(messages)
+        token_count = self._trigger_token_count(messages)
         message_count = len(messages)
 
         # Original threshold: high token count
