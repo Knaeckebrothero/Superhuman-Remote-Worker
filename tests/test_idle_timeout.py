@@ -410,6 +410,86 @@ class TestMarkOrphanedThreadsEnded:
 
 
 # =============================================================================
+# mark_orphaned_threads_suspended (replicated SQL logic)
+# =============================================================================
+
+
+async def mark_orphaned_threads_suspended(db):
+    """Replicated from postgres.py."""
+    async with db.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            UPDATE threads
+            SET status        = 'suspended',
+                agent_id      = NULL,
+                last_activity = CURRENT_TIMESTAMP
+            WHERE status IN ('awaiting_user', 'suspended')
+              AND agent_id IS NOT NULL
+              AND agent_id IN (SELECT id
+                               FROM agents
+                               WHERE status = 'offline')
+            RETURNING id
+            """
+        )
+    return [str(row["id"]) for row in rows]
+
+
+class TestMarkOrphanedThreadsSuspended:
+    @pytest.mark.asyncio
+    async def test_returns_ids_from_update(self):
+        conn = AsyncMock()
+        conn.fetch.return_value = [{"id": "t-1"}, {"id": "t-2"}]
+        db = MagicMock()
+        ctx = AsyncMock()
+        ctx.__aenter__ = AsyncMock(return_value=conn)
+        ctx.__aexit__ = AsyncMock(return_value=False)
+        db.acquire.return_value = ctx
+
+        ids = await mark_orphaned_threads_suspended(db)
+        assert ids == ["t-1", "t-2"]
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_when_none_affected(self):
+        conn = AsyncMock()
+        conn.fetch.return_value = []
+        db = MagicMock()
+        ctx = AsyncMock()
+        ctx.__aenter__ = AsyncMock(return_value=conn)
+        ctx.__aexit__ = AsyncMock(return_value=False)
+        db.acquire.return_value = ctx
+
+        ids = await mark_orphaned_threads_suspended(db)
+        assert ids == []
+
+    @pytest.mark.asyncio
+    async def test_sql_targets_paused_states_and_unbinds(self):
+        conn = AsyncMock()
+        conn.fetch.return_value = []
+        db = MagicMock()
+        ctx = AsyncMock()
+        ctx.__aenter__ = AsyncMock(return_value=conn)
+        ctx.__aexit__ = AsyncMock(return_value=False)
+        db.acquire.return_value = ctx
+
+        await mark_orphaned_threads_suspended(db)
+        sql = conn.fetch.call_args[0][0]
+        # Targets the PAUSED states that mark_orphaned_threads_ended skips,
+        # clears the stale binding, and only touches threads still bound to an
+        # offline agent.
+        assert "'awaiting_user'" in sql
+        assert "'suspended'" in sql
+        assert "= NULL" in sql
+        assert "agent_id IS NOT NULL" in sql
+        assert "'offline'" in sql
+        assert "RETURNING id" in sql
+        # Must NOT end the thread or touch the active-lifecycle states the
+        # ended-reaper owns.
+        assert "ended_at" not in sql
+        assert "'created'" not in sql
+        assert "'active'" not in sql
+
+
+# =============================================================================
 # PUT /api/agents/threads/{id}/status endpoint (replicated logic)
 # =============================================================================
 
@@ -476,6 +556,7 @@ async def stale_detector_sweep(db):
     stuck_working = await db.mark_stuck_working_agents_ready()
     stuck_session = await db.mark_stuck_session_agents_ready()
     ended_ids = await db.mark_orphaned_threads_ended()
+    suspended_ids = await db.mark_orphaned_threads_suspended()
     recovered = await db.recover_orphaned_jobs()
     gc_count = await db.gc_offline_agents(retention_hours=24)
     return {
@@ -483,6 +564,7 @@ async def stale_detector_sweep(db):
         "stuck_working": stuck_working,
         "stuck_session": stuck_session,
         "ended_threads": ended_ids,
+        "suspended_threads": suspended_ids,
         "recovered_jobs": recovered,
         "gc_offline": gc_count,
     }
@@ -496,6 +578,7 @@ class TestStaleDetectorSweep:
         db.mark_stuck_working_agents_ready.return_value = 0
         db.mark_stuck_session_agents_ready.return_value = 0
         db.mark_orphaned_threads_ended.return_value = ["thread-a"]
+        db.mark_orphaned_threads_suspended.return_value = []
         db.recover_orphaned_jobs.return_value = 0
         db.gc_offline_agents.return_value = 0
 
@@ -520,6 +603,7 @@ class TestStaleDetectorSweep:
         db.mark_stuck_working_agents_ready.return_value = 0
         db.mark_stuck_session_agents_ready.return_value = 0
         db.mark_orphaned_threads_ended.return_value = []
+        db.mark_orphaned_threads_suspended.return_value = []
         db.recover_orphaned_jobs.return_value = 0
         db.gc_offline_agents.return_value = 0
 
@@ -536,6 +620,7 @@ class TestStaleDetectorSweep:
         db.mark_stuck_working_agents_ready.return_value = 1
         db.mark_stuck_session_agents_ready.return_value = 1
         db.mark_orphaned_threads_ended.return_value = []
+        db.mark_orphaned_threads_suspended.return_value = []
         db.recover_orphaned_jobs.return_value = 0
         db.gc_offline_agents.return_value = 0
 
@@ -557,12 +642,37 @@ class TestStaleDetectorSweep:
         db.mark_stuck_working_agents_ready.return_value = 0
         db.mark_stuck_session_agents_ready.return_value = 0
         db.mark_orphaned_threads_ended.return_value = []
+        db.mark_orphaned_threads_suspended.return_value = []
         db.recover_orphaned_jobs.return_value = 0
         db.gc_offline_agents.return_value = 3
 
         await stale_detector_sweep(db)
         names = [c[0] for c in db.method_calls]
         assert names[-1] == "gc_offline_agents"
+
+    @pytest.mark.asyncio
+    async def test_suspends_paused_threads_after_agents_offline(self):
+        db = AsyncMock()
+        db.mark_stale_agents_offline.return_value = 1
+        db.mark_stuck_working_agents_ready.return_value = 0
+        db.mark_stuck_session_agents_ready.return_value = 0
+        db.mark_orphaned_threads_ended.return_value = []
+        db.mark_orphaned_threads_suspended.return_value = ["thread-p"]
+        db.recover_orphaned_jobs.return_value = 0
+        db.gc_offline_agents.return_value = 0
+
+        result = await stale_detector_sweep(db)
+        assert result["suspended_threads"] == ["thread-p"]
+
+        names = [c[0] for c in db.method_calls]
+        # Offline must be marked first (so the subquery sees it), and the
+        # offline rows must still exist when we suspend — i.e. before GC.
+        assert names.index("mark_stale_agents_offline") < names.index(
+            "mark_orphaned_threads_suspended"
+        )
+        assert names.index("mark_orphaned_threads_suspended") < names.index(
+            "gc_offline_agents"
+        )
 
 
 # =============================================================================

@@ -281,7 +281,18 @@ async def get_connection(
         raise HTTPException(status_code=425, detail="session not ready")
 
     agent = await db.get_agent(str(agent_id))
-    if not agent or not agent.get("pod_ip"):
+
+    # Self-heal a stale binding. A bound agent that is gone (row GC'd) or
+    # 'offline' (dead pod — the heartbeat reaper flips it) is terminal: clear
+    # agent_id and return 425 so the cockpit's _resolveConnection POSTs
+    # /prepare and re-provisions, instead of polling a 409 forever. A 'booting'
+    # agent is NOT dead — it falls through to the 409s below and the cockpit
+    # keeps polling (normal cold start).
+    if agent is None or agent.get("status") == "offline":
+        await db.update_thread_agent(thread_id, None)
+        raise HTTPException(status_code=425, detail="session not ready")
+
+    if not agent.get("pod_ip"):
         raise HTTPException(status_code=409, detail="agent unavailable")
     if agent.get("status") not in ("ready", "working", "session"):
         raise HTTPException(status_code=409, detail="agent not ready")

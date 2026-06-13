@@ -2846,6 +2846,47 @@ class PostgresDB:
             )
         return [str(row["id"]) for row in rows]
 
+    async def mark_orphaned_threads_suspended(self) -> list[str]:
+        """Suspend PAUSED threads whose bound agent went offline.
+
+        Companion to ``mark_orphaned_threads_ended`` for the ``awaiting_user``
+        / ``suspended`` states that method intentionally skips. A thread only
+        reaches these states after an agent ran a turn, so a non-NULL
+        ``agent_id`` here always pointed at a once-live agent; if that agent is
+        now ``offline`` the binding is stale and every reopen path wedges on it
+        (GET /connection 409-loops because the cockpit only re-provisions on a
+        425). Clearing ``agent_id`` + setting ``suspended`` routes the next open
+        through the normal re-provision path (``_do_prepare`` has no status
+        gate) and suspended-restore (which keys off
+        ``metadata.workspace_container.status``, not thread status).
+
+        Set-based CAS: idempotent across ticks (once ``agent_id`` is NULL the
+        row no longer matches) and race-free against a concurrent ``/prepare``
+        (which only ever re-binds to a live, non-offline agent). No advisory
+        lock needed — same contract as the drain-suspend CAS in ``main.py``.
+
+        Returns:
+            List of thread IDs suspended. The caller is responsible for freeing
+            the associated workspace + agent pod; this method only owns the DB
+            state transition.
+        """
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                UPDATE threads
+                SET status        = 'suspended',
+                    agent_id      = NULL,
+                    last_activity = CURRENT_TIMESTAMP
+                WHERE status IN ('awaiting_user', 'suspended')
+                  AND agent_id IS NOT NULL
+                  AND agent_id IN (SELECT id
+                                   FROM agents
+                                   WHERE status = 'offline')
+                RETURNING id
+                """
+            )
+        return [str(row["id"]) for row in rows]
+
     async def mark_stuck_working_agents_ready(self) -> int:
         """Reset agents whose self-reported status is internally inconsistent.
 

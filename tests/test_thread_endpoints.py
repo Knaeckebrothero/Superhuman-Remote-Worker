@@ -899,6 +899,40 @@ class TestUserCreateThread:
             config_override.setdefault("llm", {})["model"] = request_model
         assert config_override["llm"]["model"] == "claude-opus-4-6"
 
+    def test_request_permission_mode_overrides_user_default(self):
+        """Per-session permission mode override takes priority over user defaults.
+
+        Regression: the request's permission_mode used to be written only to
+        the threads.permission_mode column (which the agent never reads) and
+        never bridged into config_override.interactive — so a non-default pick
+        in the New Session form was dropped and every session booted
+        "supervised". The agent reads config.interactive.permission_mode, so the
+        per-session choice must land there, exactly like the model bridge above.
+        """
+        # User default already applied to config_override (main.py:12146).
+        config_override = {"interactive": {"permission_mode": "supervised"}}
+        request_permission_mode = "autonomous"
+        if request_permission_mode:
+            config_override.setdefault("interactive", {})["permission_mode"] = (
+                request_permission_mode
+            )
+        assert config_override["interactive"]["permission_mode"] == "autonomous"
+        # Column stays in sync with the resolved config_override value.
+        effective = (config_override.get("interactive") or {}).get(
+            "permission_mode"
+        ) or "supervised"
+        assert effective == "autonomous"
+
+    def test_omitted_permission_mode_keeps_user_default(self):
+        """Omitting permission_mode (None) preserves the user's saved default."""
+        config_override = {"interactive": {"permission_mode": "auto_accept"}}
+        request_permission_mode = None
+        if request_permission_mode:  # pragma: no cover - documents the None path
+            config_override.setdefault("interactive", {})["permission_mode"] = (
+                request_permission_mode
+            )
+        assert config_override["interactive"]["permission_mode"] == "auto_accept"
+
     def test_project_ids_normalization(self):
         """Legacy project_id → [project_id] normalization."""
         # New format
