@@ -226,10 +226,23 @@ jobs:
         # Transitive via mermaid → langium → chevrotain → lodash-es.
         # GHSA-r5fr-rjxr-66jc: Code Injection via _.template (high)
         # GHSA-f23m-r3pf-42rh: Prototype Pollution via _.unset/_.omit (moderate)
+        #
+        # esbuild 0.27.3 is exact-pinned by @angular/build@21; vite pins ^0.27,
+        # so the patched 0.28.1 is unreachable without breaking the Angular 21
+        # toolchain. Neither advisory applies to our usage (npm/Linux build, no
+        # dev server exposed). Ignoring esbuild's advisories propagates up the
+        # via-chain to vite → @vitejs/plugin-basic-ssl → @angular/build.
+        # GHSA-gv7w-rqvm-qjhr: RCE via the esbuild Deno module + NPM_CONFIG_REGISTRY
+        #   (Deno-only loader — unused here) (high)
+        # GHSA-g7r4-m6w7-qqqr: arbitrary file read in the dev server on Windows
+        #   (dev-server + Windows only; CI/prod run `ng build` on Linux) (high)
         run: |
           npm audit --json | python3 -c "
           import json, sys
-          IGNORE_ADVISORIES = {'GHSA-r5fr-rjxr-66jc', 'GHSA-f23m-r3pf-42rh'}
+          IGNORE_ADVISORIES = {
+              'GHSA-r5fr-rjxr-66jc', 'GHSA-f23m-r3pf-42rh',
+              'GHSA-gv7w-rqvm-qjhr', 'GHSA-g7r4-m6w7-qqqr',
+          }
           data = json.load(sys.stdin)
           vulns = data.get('vulnerabilities', {})
 
