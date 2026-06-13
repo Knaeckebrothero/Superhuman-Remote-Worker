@@ -26,9 +26,11 @@ VALID_AUTONOMY_LEVELS = {"full", "review", "partial", "guided", "dependent"}
 # =============================================================================
 # The context-management `limits` leaves are DERIVED as fixed fractions of a
 # single base context-window number (see _apply_settings_matrix). The base is
-# the admin/catalog per-model window when set (injected at dispatch into
-# llm.model_max_context_tokens), else the family's conservative
-# limits.model_max_context_tokens. Fractions are uniform across families:
+# the per-model window when set (Admin → Models `context_window`, injected at
+# dispatch into llm.model_max_context_tokens), else the family's
+# settings.model_max_context_tokens — the model's true max. There is no separate
+# conservative working-window cap; restrict a model by giving it a smaller
+# per-model `context_window`. Fractions are uniform across families: the
 # threshold leaves headroom below the window so the response has room to work.
 # Keep these in sync with the hardcoded LimitsConfig / ContextConfig fallback
 # defaults (which are a base=100_000 instance of these).
@@ -585,7 +587,7 @@ def _apply_settings_matrix(
 
     applied = []
 
-    # Apply flat keys -> data["llm"] (skip "limits" — it's not an LLM param)
+    # Apply flat keys -> data["llm"] (skip any "limits" — never an LLM param)
     for key, value in settings.items():
         if key == "limits":
             continue
@@ -593,26 +595,18 @@ def _apply_settings_matrix(
             data.setdefault("llm", {})[key] = value
             applied.append(f"llm.{key}={value}")
 
-    # Apply limits -> data["limits"] (matrix is sole source of truth)
-    limits_settings = settings.get("limits")
-    if isinstance(limits_settings, dict):
-        for key, value in limits_settings.items():
-            data.setdefault("limits", {})[key] = value
-            applied.append(f"limits.{key}={value}")
-
-    # Derive the working-window limit leaves from a single base context window.
-    # Base = the admin/catalog per-model window when explicitly overridden (it
-    # rides in llm.model_max_context_tokens and survived the flat-key loop above
-    # because it's in expert_llm_keys), else the family's conservative
-    # limits.model_max_context_tokens just applied. Invariant: no base config or
-    # expert YAML sets llm.model_max_context_tokens (see config/defaults.yaml),
-    # so its presence in expert_llm_keys means an explicit per-model override.
-    # Runs last so it is the sole authority for the derived leaves.
-    base = None
-    if "model_max_context_tokens" in expert_llm_keys:
-        base = (data.get("llm") or {}).get("model_max_context_tokens")
-    if not base:  # not overridden, or overridden with a falsy value (0/None)
-        base = (data.get("limits") or {}).get("model_max_context_tokens")
+    # Derive the context-management `limits` leaves from a single base window:
+    #   - the per-model window (Admin → Models `context_window`) when set — it is
+    #     injected at dispatch into llm.model_max_context_tokens and survives the
+    #     flat-key loop above because it's in expert_llm_keys;
+    #   - otherwise the family's settings.model_max_context_tokens (the model's
+    #     true max), which the flat-key loop just wrote into llm.
+    # There is no separate conservative working-window cap — a model runs at its
+    # full declared window unless an admin restricts it with a smaller per-model
+    # `context_window`. Runs last so it is the sole authority for the leaves.
+    base = (data.get("llm") or {}).get("model_max_context_tokens")
+    if not base:  # falsy per-model override (0/None) -> fall back to family max
+        base = settings.get("model_max_context_tokens")
     if base and base > 0:
         lim = data.setdefault("limits", {})
         lim["model_max_context_tokens"] = int(base)
