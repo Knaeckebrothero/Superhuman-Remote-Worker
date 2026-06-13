@@ -211,6 +211,25 @@ def _make_row(
     }
 
 
+@pytest.fixture(autouse=True)
+def _stub_post_commit_provisioning(monkeypatch):
+    """Keep every cron unit test hermetic against the new post-commit
+    provisioning hook. ``_process_one_due_automation`` late-imports
+    ``provision_job_repo`` and pulls ``gitea_client`` / ``main_cloud_router``
+    from ``main``; stub both so the tests never import the full orchestrator
+    app or hit Gitea. Tests that assert on provisioning re-patch with their
+    own handle (last setattr wins).
+    """
+    import sys
+    import types
+
+    monkeypatch.setattr("services.job_provisioning.provision_job_repo", AsyncMock())
+    fake_main = types.ModuleType("main")
+    fake_main.gitea_client = MagicMock()
+    fake_main.main_cloud_router = MagicMock()
+    monkeypatch.setitem(sys.modules, "main", fake_main)
+
+
 class TestProcessOneDueAutomation:
     @pytest.mark.asyncio
     async def test_no_due_returns_false_without_side_effects(self) -> None:
@@ -448,3 +467,85 @@ class TestAutoDisableNotification:
 
         await _process_one_due_automation(db)
         notify_mock.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Post-commit Gitea provisioning — fires once per cron fire, OUTSIDE the txn,
+# never on a skip/disable, and a provisioning failure never breaks the tick
+# or undoes the committed fire. This is the parity fix: cron-spawned jobs now
+# get a workspace repo like manual POST /api/jobs jobs.
+# ---------------------------------------------------------------------------
+
+
+def _patch_provisioning(monkeypatch, *, side_effect=None) -> AsyncMock:
+    """Re-patch the autouse provisioning stub with an assertable handle."""
+    provision_mock = AsyncMock(side_effect=side_effect)
+    monkeypatch.setattr("services.job_provisioning.provision_job_repo", provision_mock)
+    return provision_mock
+
+
+class TestPostCommitProvisioning:
+    @pytest.mark.asyncio
+    async def test_fire_provisions_created_job(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        provision = _patch_provisioning(monkeypatch)
+        row = _make_row(next_run_at=datetime.now(timezone.utc))
+        db = _make_mock_db(due_row=row)
+
+        out = await _process_one_due_automation(db)
+
+        assert out is True
+        provision.assert_awaited_once()
+        kwargs = provision.await_args.kwargs
+        assert kwargs["job_row"] == {"id": "11111111-1111-1111-1111-111111111111"}
+        assert kwargs["postgres_db"] is db
+
+    @pytest.mark.asyncio
+    async def test_catchup_skip_does_not_provision(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        provision = _patch_provisioning(monkeypatch)
+        long_ago = datetime(2025, 1, 1, 0, 0, tzinfo=timezone.utc)
+        row = _make_row(next_run_at=long_ago, catchup_window_seconds=3600)
+        db = _make_mock_db(due_row=row)
+
+        await _process_one_due_automation(db)
+
+        provision.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_max_fires_disable_does_not_provision(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        provision = _patch_provisioning(monkeypatch)
+        now = datetime.now(timezone.utc)
+        row = _make_row(
+            next_run_at=now,
+            max_fires_per_day=5,
+            fires_today_count=5,
+            fires_today_date=now.date(),
+        )
+        db = _make_mock_db(due_row=row)
+
+        await _process_one_due_automation(db)
+
+        provision.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_provisioning_failure_does_not_break_tick(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A Gitea outage during provisioning must not crash the tick or
+        undo the committed fire."""
+        provision = _patch_provisioning(
+            monkeypatch, side_effect=RuntimeError("gitea down")
+        )
+        row = _make_row(next_run_at=datetime.now(timezone.utc))
+        db = _make_mock_db(due_row=row)
+
+        out = await _process_one_due_automation(db)
+
+        assert out is True
+        provision.assert_awaited_once()
+        db.advance_automation_after_fire.assert_awaited_once()

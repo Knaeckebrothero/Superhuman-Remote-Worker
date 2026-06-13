@@ -848,21 +848,47 @@ export class PersistentChatService {
 
     /**
      * gone_beyond_horizon: cursor is too stale to replay (epoch mismatch or
-     * seq older than retention). Drop our cursor, REST-reload the transcript
-     * snapshot so the user at least sees completed turns, and reopen the
-     * stream from current tail.
+     * seq older than retention). REST-reload the transcript snapshot so the
+     * user sees completed turns, then re-anchor the cursor to the server tail
+     * (reported in the frame) and reopen the stream.
+     *
+     * Re-anchoring (rather than dropping the cursor) is what prevents the
+     * duplicate-turn render: with no cursor the server replays the whole epoch
+     * from seq 0, re-delivering every completed turn as a "live" copy that the
+     * reducer can't reconcile against the just-loaded history (history turns
+     * are keyed by DB id, replayed turns by numeric turn_id), so the turn shows
+     * twice split by a spurious "SESSION RESUMED" divider. Anchoring to the
+     * tail replays only genuinely newer events. See memory
+     * project_session_epoch_duplicate_render.
      */
     private async _handleGoneBeyondHorizon(event: MessageEvent): Promise<void> {
         const tid = this.threadId();
         if (!tid) return;
-        await this.cache.deleteThreadCursor(tid);
+        // The frame carries the live epoch + its tail seq:
+        // {"params":{"epoch":N,"server_seq":M,...}}.
+        let epoch: number | null = null;
+        let serverSeq: number | null = null;
+        try {
+            const p = JSON.parse(event.data)?.params;
+            epoch = typeof p?.epoch === 'number' ? p.epoch : null;
+            serverSeq = typeof p?.server_seq === 'number' ? p.server_seq : null;
+        } catch {
+            // Malformed frame — fall back to dropping the cursor (replay-from-0).
+        }
         if (this.sse) {
             this.sse.close();
             this.sse = null;
         }
         // Reload transcript so visible history doesn't have a silent gap.
         await this.loadHistory(tid);
-        // Reopen with no cursor — server starts us at the current tail.
+        // Re-anchor to the server tail so the reopened stream replays only
+        // events newer than the history we just loaded; drop the cursor only
+        // when the frame lacked a usable tail.
+        if (epoch != null && serverSeq != null) {
+            await this.cache.setThreadCursor(tid, epoch, serverSeq);
+        } else {
+            await this.cache.deleteThreadCursor(tid);
+        }
         await this._openSse(tid);
     }
 

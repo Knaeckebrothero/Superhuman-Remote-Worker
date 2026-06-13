@@ -393,17 +393,21 @@ export class SessionCreateComponent implements OnInit {
     // Build config_override from settings component
     const configOverride = this.agentSettings?.getOverrides() ?? {};
 
-    // Extract permission_mode and model from overrides (session-specific handling)
-    const permissionMode = (configOverride['interactive'] as any)?.['permission_mode'] ?? 'supervised';
+    // Extract permission_mode and model from overrides (session-specific handling).
+    // Only send permission_mode when the user actually picked a per-session
+    // override; omitting it lets the backend fall back to the user's saved
+    // default, then the config default. Sending a hardcoded 'supervised' here
+    // would clobber that saved default and forced every session to Supervised.
+    const permissionMode = (configOverride['interactive'] as any)?.['permission_mode'] ?? null;
     const model = (configOverride['llm'] as any)?.['model'] ?? null;
 
     const body: Record<string, unknown> = {
       title: this.title || 'Untitled Session',
       config_name: configName,
-      permission_mode: permissionMode,
       project_ids: projectIds.length > 0 ? projectIds : undefined,
     };
 
+    if (permissionMode) body['permission_mode'] = permissionMode;
     if (model) body['model'] = model;
 
     // Include full config_override if there are non-model overrides

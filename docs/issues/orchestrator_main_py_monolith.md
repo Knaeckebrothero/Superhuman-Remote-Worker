@@ -144,6 +144,8 @@ Routes that *kick* dispatch (e.g. `create_job`, `resume_job`) call into `orchest
 
 Each time a router file is created, lift the asyncpg cursor blocks inside its handlers into `orchestrator/services/<domain>.py`. Routes become 5–20 lines: validate input → call service → shape response. Don't gate the router split on this; it can happen per-domain as touched.
 
+**Worked example (2026-06-13):** the ~160-line Gitea repo/branch + access-grant + cloud-seed block was lifted out of the `POST /api/jobs` handler into `orchestrator/services/job_provisioning.py::provision_job_repo(...)`. A bug forced it: automation jobs (`create_job_from_automation` → `db.create_job()` directly) never hit the handler, so they silently skipped provisioning and got no workspace repo. This is exactly the failure mode of "handlers contain the business logic" (root cause #2) — a side effect inlined in one controller is invisible to every other caller. The fix puts it in a service all four job-creation paths can call. See `docs/features/automations.md` (Key-property correction).
+
 ## Suggested sequencing
 
 Each step is its own PR, mergeable independently, no behavior change expected:
