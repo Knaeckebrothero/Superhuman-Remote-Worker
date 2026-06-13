@@ -552,6 +552,17 @@ async def stale_agent_detector(shutdown_event: asyncio.Event) -> None:
                 for thread_id in ended_ids:
                     await _release_thread_resources(thread_id)
 
+            # 3b. Propagate: PAUSED threads (awaiting_user / suspended) bound to
+            # offline agents → 'suspended' with agent_id cleared, so the next
+            # open re-provisions instead of 409-looping. These are the paused
+            # states mark_orphaned_threads_ended intentionally skips; suspend
+            # (not release) keeps them resumable.
+            suspended_ids = await postgres_db.mark_orphaned_threads_suspended()
+            if suspended_ids:
+                logger.info(f"Suspended {len(suspended_ids)} orphaned paused thread(s)")
+                for thread_id in suspended_ids:
+                    await _suspend_thread_resources(thread_id)
+
             # 4. Propagate: jobs assigned to offline agents → paused
             recovered = await postgres_db.recover_orphaned_jobs()
             if recovered > 0:
@@ -4478,167 +4489,18 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
             delegation_context=job.delegation_context,
         )
 
-        # Create Gitea repo/branch for workspace delivery
-        job_id_str = str(result["id"])
-        short_id = job_id_str[:8]
-        if gitea_client.is_initialized:
-            if job.parent_job_id:
-                # Subjob: branch on parent's repo
-                parent = await postgres_db.get_job(job.parent_job_id)
-                if parent:
-                    # Resolve parent's repo name (parent may be root or itself a subjob)
-                    parent_repo_name = parent.get("repo_name")
-                    if not parent_repo_name and parent.get("parent_job_id"):
-                        root = await postgres_db.get_job(str(parent["parent_job_id"]))
-                        if root:
-                            parent_repo_name = root.get("repo_name")
-                    if not parent_repo_name:
-                        # Legacy fallback: try project jobs repo
-                        if parent.get("project_id"):
-                            repos = await postgres_db.get_project_repositories(
-                                str(parent["project_id"]), role="jobs"
-                            )
-                            if repos:
-                                parent_repo_name = repos[0]["name"]
-                        if not parent_repo_name:
-                            parent_repo_name = f"job-{str(parent['id'])}"
+        # Create Gitea repo/branch + grant creator access + seed the Mode A
+        # cloud baseline. Shared with the automation paths (cron + run-now)
+        # via services.job_provisioning so every job-creation path provisions
+        # identically. Mutates `result` in place (repo_name/branch_name).
+        from services.job_provisioning import provision_job_repo
 
-                    from_branch = parent.get("branch_name") or "main"
-                    config_name_slug = config_name or "subjob"
-                    branch_name = f"subjob/{short_id}/{config_name_slug}"
-                    branch_ok = await gitea_client.create_branch(
-                        parent_repo_name, branch_name, from_branch=from_branch
-                    )
-                    if not branch_ok:
-                        logger.error(
-                            f"Failed to create branch '{branch_name}' from '{from_branch}' "
-                            f"in '{parent_repo_name}' for subjob {job_id_str}"
-                        )
-                    await postgres_db.merge_job_context(
-                        job_id_str,
-                        {
-                            "git_remote_url": parent.get("context", {}).get(
-                                "git_remote_url", ""
-                            ),
-                        },
-                    )
-                    async with postgres_db.acquire() as conn:
-                        await conn.execute(
-                            "UPDATE jobs SET branch_name = $1, repo_name = $2 WHERE id = $3",
-                            branch_name,
-                            parent_repo_name,
-                            result["id"],
-                        )
-                    result["branch_name"] = branch_name
-                    result["repo_name"] = parent_repo_name
-            elif project_id:
-                # Project job: branch in project's shared jobs repo
-                repos = await postgres_db.get_project_repositories(
-                    project_id, role="jobs"
-                )
-                if repos:
-                    jobs_repo = repos[0]
-                    branch_name = f"job/{short_id}"
-                    branch_ok = await gitea_client.create_branch(
-                        jobs_repo["name"], branch_name, from_branch="main"
-                    )
-                    if not branch_ok:
-                        logger.error(
-                            f"Failed to create branch '{branch_name}' in "
-                            f"'{jobs_repo['name']}' — main branch may not exist"
-                        )
-                    await postgres_db.merge_job_context(
-                        job_id_str,
-                        {
-                            "git_remote_url": jobs_repo["repo_url"],
-                        },
-                    )
-                    async with postgres_db.acquire() as conn:
-                        await conn.execute(
-                            "UPDATE jobs SET branch_name = $1, repo_name = $2 WHERE id = $3",
-                            branch_name,
-                            jobs_repo["name"],
-                            result["id"],
-                        )
-                    result["branch_name"] = branch_name
-                    result["repo_name"] = jobs_repo["name"]
-                else:
-                    # Project has no jobs repo — fall back to per-job repo
-                    repo_name = f"job-{short_id}"
-                    git_remote_url = await gitea_client.create_repo(repo_name)
-                    if git_remote_url:
-                        await postgres_db.merge_job_context(
-                            job_id_str,
-                            {
-                                "git_remote_url": git_remote_url,
-                            },
-                        )
-                        async with postgres_db.acquire() as conn:
-                            await conn.execute(
-                                "UPDATE jobs SET repo_name = $1 WHERE id = $2",
-                                repo_name,
-                                result["id"],
-                            )
-                        result["repo_name"] = repo_name
-            else:
-                # Root job without project: create standalone per-job repo
-                repo_name = f"job-{short_id}"
-                git_remote_url = await gitea_client.create_repo(repo_name)
-                if git_remote_url:
-                    await postgres_db.merge_job_context(
-                        job_id_str,
-                        {
-                            "git_remote_url": git_remote_url,
-                        },
-                    )
-                    async with postgres_db.acquire() as conn:
-                        await conn.execute(
-                            "UPDATE jobs SET repo_name = $1 WHERE id = $2",
-                            repo_name,
-                            result["id"],
-                        )
-                    result["repo_name"] = repo_name
-
-            # Grant job creator read access to the Gitea repo
-            if result.get("repo_name") and job.user_id:
-                try:
-                    creator = await postgres_db.get_user(job.user_id)
-                    if creator and creator.get("email"):
-                        await gitea_client.grant_user_repo_access(
-                            creator["email"], result["repo_name"]
-                        )
-                except Exception as e:
-                    logger.warning(
-                        f"Failed to grant Gitea access for job {job_id_str}: {e}"
-                    )
-
-            # Mode A baseline seed (job_cloud_export.md §3.1). Fire-and-
-            # forget — runs in a background task that walks the project's
-            # cloud folder and pushes text files into the job's Gitea repo
-            # under projects/<slug>/. While it runs, the job carries
-            # context.cloud_baseline.state='seeding' and the dispatcher
-            # gate skips it. When done, it flips to 'ready' (or 'failed'
-            # on error — we still dispatch so the job doesn't deadlock).
-            # Only fires when the project actually has a cloud folder
-            # provisioned; loose jobs and projects without cloud_folder
-            # handle skip this path.
-            if project_id and result.get("repo_name") and gitea_client.is_initialized:
-                try:
-                    project_row = await postgres_db.get_project(project_id)
-                except Exception:
-                    project_row = None
-                if project_row and project_row.get("main_cloud_folder_handle"):
-                    from services.job_cloud_baseline import fire_baseline_seed
-
-                    fire_baseline_seed(
-                        job_id=job_id_str,
-                        project=project_row,
-                        repo_name=result["repo_name"],
-                        branch=result.get("branch_name"),
-                        postgres_db=postgres_db,
-                        gitea_client=gitea_client,
-                        main_cloud_router=main_cloud_router,
-                    )
+        await provision_job_repo(
+            job_row=result,
+            gitea_client=gitea_client,
+            postgres_db=postgres_db,
+            main_cloud_router=main_cloud_router,
+        )
 
         # Clone selected global datasources as job-scoped
         if job.datasource_ids:
@@ -12253,7 +12115,13 @@ class ThreadCreateRequest(BaseModel):
     datasource_ids: list[str] | None = Field(
         None, description="Explicit datasource IDs to attach to this thread"
     )
-    permission_mode: str = Field("supervised", description="Initial permission mode")
+    permission_mode: str | None = Field(
+        None,
+        description=(
+            "Per-session permission mode override. Omit to inherit the user's "
+            "saved default, then the config default ('supervised')."
+        ),
+    )
     title: str = Field("Untitled Session", description="Session title")
     model: str | None = Field(
         None,
@@ -12320,6 +12188,18 @@ async def create_thread(
         if request_body.temperature is not None:
             config_override.setdefault("llm", {})["temperature"] = (
                 request_body.temperature
+            )
+        # The agent reads its permission mode from config.interactive.permission_mode
+        # (src/api/persistent_session.py), NOT from the threads.permission_mode
+        # column — so a per-session choice only reaches the agent if it lands in
+        # config_override, exactly like the model/temperature bridges above and the
+        # runtime PATCH path (agent_update_thread_config). Without this, picking a
+        # non-default mode in the New Session form was silently dropped and every
+        # session booted "supervised". Field is str|None: omitted → keep the user
+        # default applied above; present → it wins.
+        if request_body.permission_mode:
+            config_override.setdefault("interactive", {})["permission_mode"] = (
+                request_body.permission_mode
             )
 
         # Normalize project_ids (backward compat: project_id → [project_id])
@@ -12422,12 +12302,19 @@ async def create_thread(
         if not env_keys_block:
             config_override.pop("env_keys", None)
 
+        # Keep the threads.permission_mode column in sync with the mode the
+        # agent will actually load from config_override (request > user default >
+        # "supervised"). Mirrors the column sync in agent_update_thread_config.
+        effective_permission_mode = (config_override.get("interactive") or {}).get(
+            "permission_mode"
+        ) or "supervised"
+
         thread_id = await postgres_db.create_thread(
             user_id=str(user["id"]),
             project_id=effective_project_ids[0] if effective_project_ids else None,
             config_name=request_body.config_name
             or user_settings.get("config_name", "persistent_defaults"),
-            permission_mode=request_body.permission_mode,
+            permission_mode=effective_permission_mode,
             title=request_body.title,
         )
 

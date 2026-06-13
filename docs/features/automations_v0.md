@@ -211,7 +211,7 @@ Deferred to v0.5: `/api/automations/{id}/preview`, `/api/automations/{id}/chain`
 
 **Backend services**
 - New: `orchestrator/services/cron_dispatcher.py` — 60s tick, `FOR UPDATE SKIP LOCKED` CTE pattern.
-- New: `orchestrator/services/automations.py` — `create_job_from_automation` helper that reuses the existing `create_job()` path.
+- New: `orchestrator/services/automations.py` — `create_job_from_automation` helper. Calls `db.create_job()` then the shared `orchestrator/services/job_provisioning.py::provision_job_repo(...)` so cron/run-now jobs get a Gitea repo + access grant like manual jobs. (Provisioning extraction landed 2026-06-13; originally this path called only `db.create_job()` and the spawned jobs had no repo — see `automations.md` correction + `docs/issues/`.)
 - Migration: `orchestrator/database/migrations/app/NNNN_create_automations.sql` (number assigned at merge; next-available after auth refactor lands) — **full schema including event-trigger columns** so v0.5 needs no migration.
 - API key storage is provided by the auth refactor's `0010_auth_tokens_consolidation.sql`; no separate migration in this PR.
 

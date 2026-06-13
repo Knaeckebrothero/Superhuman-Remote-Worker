@@ -28,24 +28,51 @@ related:
 > assembles the right memories for every LLM call — the model is a *consumer*, never the
 > manager. Build the seam first; everything else becomes a plugin behind it.
 
-**Status:** Design v2 / **Phase 1 implementation complete + closure steps 1–2
-done (2026-06-11)** — the live k3d verify PASSED in both modes (three real
-catches found and fixed the same day: dispatch round-trip flag loss, session
-config_name plumbing incl. the dual-app attach route, and the k8s ✕-route
-closed via orchestrator detach-then-delete; see the closure runbook's step-1
-findings), and `memory.manager.enabled` is **on** in both defaults files
-(committed). What remains for Phase-1 closure is operational: **step 3 soak
-on dev** (passive — starts when the push rolls out; watch the seam failure
-surface, the flag stays the one-line rollback) → **step 4 delete the legacy
-blocks** (the "zero direct store calls" acceptance is the post-deletion
-state). **Phase 2 is essentially complete (2026-06-12): harness + judge +
-contradiction probe built, and all three acceptance gates closed with real
-LongMemEval_S runs** (`eval/memory/`, see its README). Headline: the
-current production pipeline (`persistent_current`) retrieves at
-**recall@5 0.20 / answers at 0.25–0.30**, vs **0.94 / 0.74–0.76** for
-trivial verbatim round storage of the same history (`flat_verbatim`) —
-the quantified case for Phases 3–5. The harness drives the seam offline
-and never touches what the soak exercises.
+**Status:** Design v2 / **Phases 1–3 implemented + measured (2026-06-13)**. A
+7-phase overhaul; **three phases done, two rollout gates + Phases 4–7 remain.**
+The map:
+
+- **Phase 1 (MemoryManager seam) — code complete, flag ON, committed.** Both
+  graphs route through `assemble()`/`capture()` behind `memory.manager.enabled`
+  (on in both defaults files); the live k3d verify PASSED in both modes (three
+  catches found + fixed 2026-06-11 — dispatch round-trip flag loss, session
+  config_name plumbing incl. the dual-app attach route, k8s ✕-route via
+  orchestrator detach-then-delete). **Two operational steps remain — GATE A:**
+  **step 3 soak on dev** (passive; the flag is the one-line rollback, watch the
+  seam failure surface) → **step 4 delete the legacy `memory_service is None`
+  blocks** (the "zero direct store calls" acceptance is the post-deletion state;
+  the equivalence suites become reference copies).
+- **Phase 2 (eval harness) — ✅ COMPLETE (2026-06-12).** `eval/memory/` drives
+  the seam offline against LongMemEval_S; harness + LLM judge + contradiction
+  probe, all three acceptance gates closed. Baseline: the current production
+  pipeline (`persistent_current`) retrieves **R@5 0.20 / answers 0.25–0.30** vs
+  **0.94 / 0.74–0.76** for trivial verbatim storage of the same history
+  (`flat_verbatim`) — the quantified case for Phases 3–5. Offline; never
+  touches what the soak exercises.
+- **Phase 3 (first plugin wave) — ✅ COMPLETE (2026-06-12), NOT yet rolled
+  out.** Four measured slices took the seam from R@5 0.20 → **1.0 at 3.7 items
+  / 111 tokens per question (80× cheaper than the full dump)**, end-task 0.40 ≥
+  the full-dump 0.45 (the entire remaining gap is one knowledge-update question
+  = Phase 4), reader abstention perfect. The winning stack — `reranker` scorer
+  + relative `gate` + `bounded`-10 — is built, registered, and harness-validated
+  but **inert by default** (nothing in the defaults-YAML pipeline). **GATE B:**
+  the production flip is a separate decision pending real-session evidence —
+  the harness is N=20 synthetic with a gemma reader, not the product workload.
+- **Phase 4 (lifecycle supersede) — NEXT, not started.** Opening baseline
+  recorded (`runs/contra_complete_rerank`: update_above_original 0.75, reader
+  current 1.0 on the 8-probe fixture). The only thing that fixes
+  knowledge-update (0/4 end-task, and rerank ordering makes it *worse* at equal
+  tokens — a lifecycle problem no retrieval policy can solve). Bi-temporal
+  columns + ingestion verdicts (ADD/UPDATE/MERGE/NOOP) + retire-and-exclude.
+- **Phases 5–7** — ablate-and-cut (find + delete cargo-cult consolidation),
+  buckets productized (personal/shared + cockpit panel), frontier verdicts
+  (graph-keep, learned scorer). Decision-gated or dependent on Phase 4.
+
+Two smaller open items, both user-side: judge calibration is **93.1 % vs the
+97 % target** (needs a ~100-item label pass), and the request digest's
+windowing payoff is **unmeasured** (only question-time parity is proven —
+needs an ingest-time A/B or a production soak).
+
 Restructured 2026-06-10 around the MemoryManager abstraction after design
 alignment (v1 of 2026-06-07 was phase-first; superseded, phases preserved
 below in new order). Every bug worth fixing *before* the seam is fixed

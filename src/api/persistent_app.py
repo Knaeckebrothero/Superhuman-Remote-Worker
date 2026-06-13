@@ -1001,7 +1001,7 @@ async def _attach_session(
     ``config_name`` (pool mode): the thread's config, used as the session
     base instead of the pod's boot config when provided.
     """
-    global _session, _thread_id
+    global _session, _thread_id, _events_epoch, _next_seq, _tool_inflight
 
     if _session is not None:
         raise RuntimeError(
@@ -1280,6 +1280,64 @@ async def _attach_session(
         cloud_mount_cfg=cloud_mount_cfg,
     )
 
+    # Phase 2 event-log cursor init. The current epoch lives on the threads
+    # row; we bump it iff the previous epoch has events (i.e. this is a
+    # cold-checkpoint restart that lost the in-memory seq counter). A fresh
+    # epoch with no rows is reused as-is. _next_seq always starts at 0
+    # locally — _broadcast pre-increments before writing the first event.
+    #
+    # MUST run before the first _broadcast below. Otherwise an early frame
+    # (cloud_mount.ready, etc.) is written under the provisional epoch, the
+    # bump-check then sees that non-empty epoch and supersedes it, and any
+    # client that opened the SSE stream during provisioning is left holding a
+    # cursor for a now-dead epoch — which surfaces as a doubled turn plus a
+    # spurious "SESSION RESUMED" divider after the forced gone_beyond_horizon
+    # resync. See memory project_session_epoch_duplicate_render.
+    _tool_inflight = False
+    _events_epoch = 0
+    _next_seq = 0
+    if _session is not None and _session.postgres_conn is not None:
+        try:
+            async with _session.postgres_conn.acquire() as conn:
+                current_epoch = await conn.fetchval(
+                    "SELECT events_epoch FROM threads WHERE id = $1",
+                    _thread_id,
+                )
+                if current_epoch is None:
+                    current_epoch = 0
+                max_seq = await conn.fetchval(
+                    "SELECT COALESCE(MAX(seq), 0) FROM thread_events "
+                    "WHERE thread_id = $1 AND epoch = $2",
+                    _thread_id,
+                    current_epoch,
+                )
+                if max_seq and max_seq > 0:
+                    # Cold-checkpoint restart: previous epoch has events
+                    # but we lost the in-memory counter. Bump to a fresh
+                    # epoch so cursors from the previous run trigger
+                    # GONE_BEYOND_HORIZON on reconnect.
+                    new_epoch = await conn.fetchval(
+                        "UPDATE threads SET events_epoch = events_epoch + 1 "
+                        "WHERE id = $1 RETURNING events_epoch",
+                        _thread_id,
+                    )
+                    _events_epoch = int(new_epoch)
+                    logger.info(
+                        "Bumped events_epoch to %d for thread %s "
+                        "(previous epoch had %d events)",
+                        _events_epoch,
+                        _thread_id,
+                        max_seq,
+                    )
+                else:
+                    _events_epoch = int(current_epoch)
+        except Exception as e:
+            logger.warning(
+                "events_epoch init failed for thread %s (non-fatal): %s",
+                _thread_id,
+                e,
+            )
+
     cloud_mount_active = bool(
         _session.cloud_mount_manager and _session.cloud_mount_manager.active
     )
@@ -1427,57 +1485,6 @@ async def _attach_session(
     _loop_interrupt_flag = None
     _hard_interrupt_event = asyncio.Event()
     _loop_last_user_content = [""]
-
-    # Phase 2 event-log cursor init. The current epoch lives on the threads
-    # row; we bump it iff the previous epoch has events (i.e. this is a
-    # cold-checkpoint restart that lost the in-memory seq counter). A fresh
-    # epoch with no rows is reused as-is. _next_seq always starts at 0
-    # locally — _broadcast pre-increments before writing the first event.
-    global _events_epoch, _next_seq, _tool_inflight
-    _tool_inflight = False
-    _events_epoch = 0
-    _next_seq = 0
-    if _session is not None and _session.postgres_conn is not None:
-        try:
-            async with _session.postgres_conn.acquire() as conn:
-                current_epoch = await conn.fetchval(
-                    "SELECT events_epoch FROM threads WHERE id = $1",
-                    _thread_id,
-                )
-                if current_epoch is None:
-                    current_epoch = 0
-                max_seq = await conn.fetchval(
-                    "SELECT COALESCE(MAX(seq), 0) FROM thread_events "
-                    "WHERE thread_id = $1 AND epoch = $2",
-                    _thread_id,
-                    current_epoch,
-                )
-                if max_seq and max_seq > 0:
-                    # Cold-checkpoint restart: previous epoch has events
-                    # but we lost the in-memory counter. Bump to a fresh
-                    # epoch so cursors from the previous run trigger
-                    # GONE_BEYOND_HORIZON on reconnect.
-                    new_epoch = await conn.fetchval(
-                        "UPDATE threads SET events_epoch = events_epoch + 1 "
-                        "WHERE id = $1 RETURNING events_epoch",
-                        _thread_id,
-                    )
-                    _events_epoch = int(new_epoch)
-                    logger.info(
-                        "Bumped events_epoch to %d for thread %s "
-                        "(previous epoch had %d events)",
-                        _events_epoch,
-                        _thread_id,
-                        max_seq,
-                    )
-                else:
-                    _events_epoch = int(current_epoch)
-        except Exception as e:
-            logger.warning(
-                "events_epoch init failed for thread %s (non-fatal): %s",
-                _thread_id,
-                e,
-            )
 
     # Start self-cleanup watchdogs (PR 2): exit on boot-WS timeout or
     # out-of-band thread.status='ended'. Cancelled by _terminate_session.

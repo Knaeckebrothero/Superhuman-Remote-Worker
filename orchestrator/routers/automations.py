@@ -296,7 +296,13 @@ async def run_now(request: Request, automation_id: str) -> dict[str, Any]:
     on time. Useful for "test this thing I just edited" and for the
     cockpit's Run-now button.
     """
-    from main import _trigger_dispatch, postgres_db  # late import: avoid circular
+    from main import (  # late import: avoid circular
+        _trigger_dispatch,
+        gitea_client,
+        main_cloud_router,
+        postgres_db,
+    )
+    from services.job_provisioning import provision_job_repo
 
     caller = await require_approved_user(request, postgres_db)
     row = await _resolve_automation_or_404(
@@ -304,6 +310,22 @@ async def run_now(request: Request, automation_id: str) -> dict[str, Any]:
     )
 
     job = await create_job_from_automation(postgres_db, row, trigger_kind="manual")
+
+    # Provision the job's Gitea repo/branch + creator access grant (parity
+    # with the POST /api/jobs handler). Best-effort — a Gitea outage logs
+    # and leaves the job repo-less rather than failing the fire.
+    try:
+        await provision_job_repo(
+            job_row=job,
+            gitea_client=gitea_client,
+            postgres_db=postgres_db,
+            main_cloud_router=main_cloud_router,
+        )
+    except Exception:
+        logger.exception(
+            "run-now: repo provisioning failed for job %s (non-fatal)",
+            job.get("id"),
+        )
 
     # Best-effort nudge to the auto-assign dispatcher so the new job
     # doesn't sit idle for up to 30s waiting on the scheduled tick.

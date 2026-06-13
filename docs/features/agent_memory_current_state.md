@@ -96,6 +96,33 @@ migration plan live in [[agent_memory_overhaul]].
 >   legacy blocks are deleted, they stay frozen-and-enforced — any change
 >   there must update the equivalence suites in lockstep (the slice-5 guard
 >   terms are the one sanctioned delta).
+>
+> **Phase 2–3 deltas (2026-06-12 → 13, on the working tree).** The runtime
+> read/write behaviour this snapshot describes is **unchanged** — Phases 2–3
+> added an offline eval harness and a set of *optional, default-inert* plugins,
+> not a new live path. Read with that caveat:
+> - **Phase 2 = `eval/memory/` (offline only).** A LongMemEval_S harness that
+>   drives `assemble()`/`capture()` directly + an LLM judge + a contradiction
+>   probe. It never runs inside the agent; it touches no runtime code path. It
+>   produced the baseline that motivates Phases 3–5 (current pipeline R@5 0.20 /
+>   end-task 0.25–0.30 vs 0.94 / 0.74–0.76 for flat verbatim storage).
+> - **Phase 3 = four new plugins, all registered, all OFF by default.**
+>   `plugins/reranker.py` (a `scorer`), `plugins/bounded.py` + `plugins/gate.py`
+>   (two `policy` plugins), and `services/memory/query.py` (the unified request
+>   digest builder), plus their config sections (`memory.reranker`,
+>   `memory.bounded` incl. `include_knowledge` for B5, `memory.gate` with
+>   `mode: absolute|relative`, `memory.query.digest`). **None are in the default
+>   `memory.pipeline`** and `memory.query.digest` defaults off, so on the live
+>   runtime path today they do not fire — the seam still reproduces the
+>   transplanted legacy behaviour this doc catalogs. They are classification
+>   **🔶 CONDITIONAL** (bind + run only when an expert/arm config names them).
+>   The harness-measured production-candidate stack (`scorers: [reranker]`,
+>   `policies: [gate, bounded]`, relative gate 0.01 + bounded-10) lives in the
+>   overhaul doc's Phase-3 log; flipping it into the defaults YAML is an
+>   unstarted, separate rollout decision (overhaul Status, GATE B).
+> - **Equivalence pinning still holds.** Phase 3 changed neither the legacy
+>   blocks nor the seam's default rendering, so the equivalence suites above
+>   remain green and the freeze-until-deletion rule is unaffected.
 
 Classification legend:
 

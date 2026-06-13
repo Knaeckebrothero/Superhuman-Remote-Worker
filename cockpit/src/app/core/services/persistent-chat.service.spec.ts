@@ -961,8 +961,19 @@ describe('PersistentChatService — gone_beyond_horizon recovery', () => {
         vi.clearAllMocks();
     });
 
-    it('drops cursor, reloads history, reopens stream', async () => {
-        const ctx = createService({cursor: {epoch: 1, seq: 5, threadId: 'thread-g', updatedAt: ''} as any});
+    it('re-anchors cursor to the server tail, reloads history, reopens from tail', async () => {
+        // Stateful cursor so the reopened stream reflects the re-anchor.
+        let stored: any = {epoch: 1, seq: 5, threadId: 'thread-g', updatedAt: ''};
+        const ctx = createService({cursor: stored});
+        ctx.mockCache.getThreadCursor.mockImplementation(async () => stored);
+        ctx.mockCache.setThreadCursor.mockImplementation(
+            async (tid: string, epoch: number, seq: number) => {
+                stored = {epoch, seq, threadId: tid, updatedAt: ''};
+            },
+        );
+        ctx.mockCache.deleteThreadCursor.mockImplementation(async () => {
+            stored = null;
+        });
         ctx.mockHttp.get.mockImplementation(() =>
             of({status: 'active', total_turns: 0, messages: [], total: 0}),
         );
@@ -970,26 +981,58 @@ describe('PersistentChatService — gone_beyond_horizon recovery', () => {
         const firstSse = ctx.sseInstances[0];
         fireSseOpen(firstSse);
 
-        // Now simulate gone_beyond_horizon.
+        // Server reports the live epoch (2) and its tail seq (7).
         fireSseNamedEvent(firstSse, 'gone_beyond_horizon', {
             method: 'gone_beyond_horizon',
-            params: {epoch: 2, server_seq: 0, reason: 'epoch_mismatch'},
-        }, '2:0');
+            params: {epoch: 2, server_seq: 7, reason: 'epoch_mismatch'},
+        }, '2:7');
 
-        // The handler chain awaits: deleteCursor → loadHistory → openSse →
-        // getThreadCursor. setTimeout(0) lets all queued microtasks drain.
+        // The handler chain awaits: parse → close → loadHistory →
+        // setThreadCursor → openSse → getThreadCursor. setTimeout(0) lets all
+        // queued microtasks drain.
         await new Promise((r) => setTimeout(r, 0));
 
-        expect(ctx.mockCache.deleteThreadCursor).toHaveBeenCalledWith('thread-g');
+        // Re-anchored to the reported tail rather than dropped — this is what
+        // stops the replay-from-0 that re-renders loaded turns as a duplicate
+        // "live" copy (the SESSION RESUMED double-render).
+        expect(ctx.mockCache.setThreadCursor).toHaveBeenCalledWith('thread-g', 2, 7);
+        expect(ctx.mockCache.deleteThreadCursor).not.toHaveBeenCalled();
         expect(firstSse.close).toHaveBeenCalled();
-        // A second SSE was opened.
-        expect(ctx.sseInstances.length).toBeGreaterThanOrEqual(2);
-        // History was reloaded — find an additional GET /messages call after
-        // the initial one.
+
+        // History was reloaded — an additional GET /messages after the initial.
         const historyCalls = ctx.mockHttp.get.mock.calls.filter((c: any) =>
             String(c[0]).endsWith('/persistent/threads/thread-g/messages'),
         );
         expect(historyCalls.length).toBeGreaterThanOrEqual(2);
+
+        // A second SSE was opened, resuming from the re-anchored tail so it
+        // replays only events newer than the just-loaded history.
+        expect(ctx.sseInstances.length).toBeGreaterThanOrEqual(2);
+        expect(ctx.sseInstances[ctx.sseInstances.length - 1].url).toContain(
+            'last_event_id=2%3A7',
+        );
+    });
+
+    it('falls back to dropping the cursor when the frame lacks a server tail', async () => {
+        const ctx = createService({cursor: {epoch: 1, seq: 5, threadId: 'thread-h', updatedAt: ''} as any});
+        ctx.mockHttp.get.mockImplementation(() =>
+            of({status: 'active', total_turns: 0, messages: [], total: 0}),
+        );
+        await ctx.service.connect('thread-h');
+        const firstSse = ctx.sseInstances[0];
+        fireSseOpen(firstSse);
+
+        // Malformed frame: no numeric server_seq → can't re-anchor.
+        fireSseNamedEvent(firstSse, 'gone_beyond_horizon', {
+            method: 'gone_beyond_horizon',
+            params: {epoch: 2, reason: 'epoch_mismatch'},
+        }, '2:0');
+        await new Promise((r) => setTimeout(r, 0));
+
+        expect(ctx.mockCache.deleteThreadCursor).toHaveBeenCalledWith('thread-h');
+        expect(ctx.mockCache.setThreadCursor).not.toHaveBeenCalled();
+        expect(firstSse.close).toHaveBeenCalled();
+        expect(ctx.sseInstances.length).toBeGreaterThanOrEqual(2);
     });
 });
 

@@ -487,6 +487,97 @@ def test_connection_returns_409_when_agent_not_ready(monkeypatch):
     assert resp.status_code == 409
 
 
+def test_connection_self_heals_425_when_agent_offline(monkeypatch):
+    """A bound agent that went 'offline' (dead pod, flipped by the heartbeat
+    reaper) is terminal: clear the stale binding and return 425 so the cockpit
+    re-provisions via /prepare instead of 409-looping forever."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from orchestrator.routers.sessions import router as sessions_router
+
+    app = FastAPI()
+    _install_fake_auth(monkeypatch)
+    fake_db = AsyncMock()
+    fake_db.get_thread.return_value = {
+        "id": "t1",
+        "user_id": "u1",
+        "agent_id": "agent-dead",
+    }
+    fake_db.get_agent.return_value = {
+        "id": "agent-dead",
+        "pod_ip": "10.0.0.5",
+        "status": "offline",
+    }
+    from orchestrator.routers import sessions as sessions_mod
+
+    monkeypatch.setattr(sessions_mod, "_get_db", lambda: fake_db, raising=False)
+
+    app.include_router(sessions_router)
+    client = TestClient(app)
+    resp = client.get("/api/sessions/t1/connection")
+    assert resp.status_code == 425
+    fake_db.update_thread_agent.assert_awaited_once_with("t1", None)
+
+
+def test_connection_self_heals_425_when_agent_row_missing(monkeypatch):
+    """If the bound agent row is gone, treat it as terminal: unbind + 425.
+    (Defense-in-depth; the FK ON DELETE SET NULL normally makes this a NULL
+    agent_id → 425 already.)"""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from orchestrator.routers.sessions import router as sessions_router
+
+    app = FastAPI()
+    _install_fake_auth(monkeypatch)
+    fake_db = AsyncMock()
+    fake_db.get_thread.return_value = {
+        "id": "t1",
+        "user_id": "u1",
+        "agent_id": "agent-ghost",
+    }
+    fake_db.get_agent.return_value = None
+    from orchestrator.routers import sessions as sessions_mod
+
+    monkeypatch.setattr(sessions_mod, "_get_db", lambda: fake_db, raising=False)
+
+    app.include_router(sessions_router)
+    client = TestClient(app)
+    resp = client.get("/api/sessions/t1/connection")
+    assert resp.status_code == 425
+    fake_db.update_thread_agent.assert_awaited_once_with("t1", None)
+
+
+def test_connection_keeps_409_and_no_unbind_when_agent_booting(monkeypatch):
+    """REGRESSION GUARD: a 'booting' agent (normal cold start) must stay 409 so
+    the cockpit keeps polling — it must NOT be unbound as if it were dead."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from orchestrator.routers.sessions import router as sessions_router
+
+    app = FastAPI()
+    _install_fake_auth(monkeypatch)
+    fake_db = AsyncMock()
+    fake_db.get_thread.return_value = {
+        "id": "t1",
+        "user_id": "u1",
+        "agent_id": "agent-booting",
+    }
+    fake_db.get_agent.return_value = {
+        "id": "agent-booting",
+        "pod_ip": "10.0.0.7",
+        "status": "booting",
+    }
+    from orchestrator.routers import sessions as sessions_mod
+
+    monkeypatch.setattr(sessions_mod, "_get_db", lambda: fake_db, raising=False)
+
+    app.include_router(sessions_router)
+    client = TestClient(app)
+    resp = client.get("/api/sessions/t1/connection")
+    assert resp.status_code == 409
+    fake_db.update_thread_agent.assert_not_awaited()
+
+
 def test_connection_returns_425_when_pod_not_session_ready(monkeypatch):
     """If the agent is bound but its /ready endpoint reports not ready
     (Uvicorn still in lifespan / _attach_session not finished), return
