@@ -534,7 +534,15 @@ def create_filesystem_tools(context: ToolContext) -> List[Any]:
                     return "Error: PDF info requires pdfplumber. Install with: pip install pdfplumber"
 
                 try:
-                    info = pdf_reader.get_document_info(full_path)
+                    # Materialize the file on the local filesystem first —
+                    # required for remote workspace backends where get_path()
+                    # returns a remote-only path that local PDF I/O cannot open.
+                    with workspace.local_copy(path) as local_path:
+                        info = pdf_reader.get_document_info(local_path)
+
+                    # local_copy() yields a temp file — restore the
+                    # caller-facing name so the display shows the real path.
+                    info["file_name"] = path.rsplit("/", 1)[-1]
 
                     # Format with reading suggestions
                     lines = [format_document_info(info), ""]
@@ -580,7 +588,7 @@ def create_filesystem_tools(context: ToolContext) -> List[Any]:
                     return f"Error getting PDF info: {str(e)}"
 
             # For non-PDF files, return basic info
-            file_size = full_path.stat().st_size
+            file_size = workspace.get_size(path)
             estimated_words = int(file_size / BYTES_PER_WORD)
             estimated_tokens = estimated_words  # Roughly 1 word ≈ 1 token
 
