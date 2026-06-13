@@ -3,6 +3,7 @@ import {NgZone, signal} from '@angular/core';
 import {TestBed} from '@angular/core/testing';
 import {HttpClient} from '@angular/common/http';
 import {of, throwError} from 'rxjs';
+import {TranslocoService} from '@jsverse/transloco';
 import {PersistentChatService} from './persistent-chat.service';
 import {ApiService} from './api.service';
 import {IndexedDbService} from './indexed-db.service';
@@ -200,6 +201,7 @@ function createService(opts: {
             {provide: IndexedDbService, useValue: mockCache},
             {provide: AppToastService, useValue: mockToast},
             {provide: NotificationService, useValue: mockNotifications},
+            {provide: TranslocoService, useValue: {translate: (k: string) => k}},
             PersistentChatService,
         ],
     });

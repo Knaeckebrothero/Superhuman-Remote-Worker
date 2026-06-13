@@ -14,6 +14,7 @@ import {
     Turn,
     UserTurn,
 } from '../models/turn.model';
+import {TranslocoService} from '@jsverse/transloco';
 import {ApiService} from './api.service';
 import {IndexedDbService} from './indexed-db.service';
 import {NotificationService} from './notification.service';
@@ -209,6 +210,7 @@ export class PersistentChatService {
     private readonly zone = inject(NgZone);
     private readonly toast = inject(AppToastService);
     private readonly notifications = inject(NotificationService);
+    private readonly transloco = inject(TranslocoService);
     private readonly destroyRef = inject(DestroyRef);
 
     constructor() {
@@ -1271,10 +1273,7 @@ export class PersistentChatService {
                 // Mid-turn guard (session_silent_failure_audit.md #11): the
                 // orchestrator refuses to tear down a session whose agent is
                 // mid-turn unless forced. Declining keeps the session alive.
-                const proceed = confirm(
-                    'The agent is still working on a turn. End the session anyway? ' +
-                    'The in-flight turn and any queued input will be lost.',
-                );
+                const proceed = confirm(this.transloco.translate('sessions.confirmEndMidTurn'));
                 if (proceed) {
                     await this.endSession(true);
                 }
