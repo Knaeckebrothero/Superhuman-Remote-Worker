@@ -490,16 +490,36 @@ def create_file_tools(context: ToolContext) -> List[Any]:
                 start = page_start or 1
                 end = min(page_end or total_pages, total_pages)
 
-                # Add visual content for each page read
+                # Decide which pages actually need rasterizing. Text-rich,
+                # image-free pages are already represented by the extracted
+                # text above, so rendering them only burns image tokens
+                # (context_token_accounting.md S2). Fail-open: an empty map
+                # (inspection failed) renders every page, exactly as before.
+                from src.utils.pdf import compress_ranges, page_render_decisions
+
+                decisions = page_render_decisions(full_path, start, end)
+
                 visual_parts = []
+                skipped = []
                 for page_num in range(start, end + 1):
+                    decision = decisions.get(page_num)
+                    if decision is not None and not decision["render"]:
+                        skipped.append(page_num)
+                        continue
                     visual_content = _get_visual_content(full_path, page_num, describe)
                     if visual_content:
                         visual_parts.append(visual_content)
 
+                parts = [text_result]
                 if visual_parts:
-                    return text_result + "\n" + "\n".join(visual_parts)
-                return text_result
+                    parts.append("\n".join(visual_parts))
+                if skipped:
+                    parts.append(
+                        f"\n[Did not rasterize {len(skipped)} text-only "
+                        f"page(s) — already included as text above: "
+                        f"pages {compress_ranges(skipped)}]"
+                    )
+                return "\n".join(parts)
 
             except Exception as e:
                 logger.debug(f"Could not add visual content: {e}")

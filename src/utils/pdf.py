@@ -289,3 +289,94 @@ def format_read_info(info: Dict[str, Any], file_path: str) -> str:
     lines.append(f"Total pages: {info['total_pages']}")
 
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Visual-render gating (docs/features/context_token_accounting.md S2)
+# ---------------------------------------------------------------------------
+
+# A page with at least this many extracted characters and no embedded images is
+# treated as fully represented by its text, so it is NOT rasterized — rendering
+# it would only burn image tokens (the dev-session 5dbb5770 blow-up). Tuned
+# conservatively (~25 words). Only affects image-FREE pages, so it can never
+# drop a pictogram-bearing page.
+DEFAULT_MIN_TEXT_CHARS_FOR_SKIP = 100
+
+
+def should_render_page(
+    chars: int,
+    has_images: bool,
+    min_text_chars: int = DEFAULT_MIN_TEXT_CHARS_FOR_SKIP,
+) -> bool:
+    """Whether a PDF page needs visual rendering for a multimodal/vision read.
+
+    Render when the extracted text is sparse (likely a scanned or figure-heavy
+    page whose text alone misses content) OR the page embeds images
+    (pictograms/diagrams that text extraction drops). Skip only text-rich,
+    image-free pages: their extracted text already represents them and
+    rasterizing them only burns image tokens. This never skips an image-bearing
+    page. See docs/features/context_token_accounting.md (S2).
+    """
+    return chars < min_text_chars or has_images
+
+
+def page_render_decisions(
+    file_path,
+    page_start: int,
+    page_end: int,
+    min_text_chars: int = DEFAULT_MIN_TEXT_CHARS_FOR_SKIP,
+) -> Dict[int, Dict[str, Any]]:
+    """Per-page render decisions for ``[page_start, page_end]`` (1-indexed).
+
+    Returns ``{page_num: {"render": bool, "chars": int, "has_images": bool}}``.
+
+    Fail-open: a page that can't be inspected defaults to ``render=True``, and a
+    total failure (pdfplumber missing, unreadable file) returns ``{}`` so the
+    caller rasterizes every page exactly as before — visual content is never
+    silently dropped.
+
+    NOTE: image detection uses pdfplumber ``page.images`` (embedded raster
+    images), which catches the common GHS/SDS pictogram case. Vector-drawn
+    pictograms (rare) are not detected; calibrate ``min_text_chars`` and revisit
+    if a real document relies on them.
+    """
+    if not PDF_AVAILABLE:
+        return {}
+    path = Path(file_path)
+    decisions: Dict[int, Dict[str, Any]] = {}
+    try:
+        with pdfplumber.open(path) as pdf:
+            total = len(pdf.pages)
+            for page_num in range(page_start, min(page_end, total) + 1):
+                try:
+                    page = pdf.pages[page_num - 1]
+                    chars = len(page.extract_text() or "")
+                    has_images = bool(page.images)
+                except Exception:
+                    chars, has_images = 0, True  # fail-open: render this page
+                decisions[page_num] = {
+                    "render": should_render_page(chars, has_images, min_text_chars),
+                    "chars": chars,
+                    "has_images": has_images,
+                }
+    except Exception as e:
+        logger.debug(f"page_render_decisions failed for {path}: {e}")
+        return {}
+    return decisions
+
+
+def compress_ranges(nums) -> str:
+    """Format a list of ints as compact ranges: ``[2,3,4,6]`` -> ``"2-4, 6"``."""
+    ordered = sorted({int(n) for n in nums})
+    if not ordered:
+        return ""
+    ranges: List[Tuple[int, int]] = []
+    start = prev = ordered[0]
+    for n in ordered[1:]:
+        if n == prev + 1:
+            prev = n
+            continue
+        ranges.append((start, prev))
+        start = prev = n
+    ranges.append((start, prev))
+    return ", ".join(f"{a}-{b}" if a != b else f"{a}" for a, b in ranges)
