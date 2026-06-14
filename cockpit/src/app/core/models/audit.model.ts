@@ -113,4 +113,10 @@ export interface JobSummary {
   snapshot_status?: string | null;
   /** Mode B export marker — set when "Export to shared folder" succeeds. */
   exported_at?: string | null;
+  /**
+   * Backend-computed cloud-review routing (job_cloud_export.md). `'open_folder'`
+   * (loose / default-project / no-cloud-folder jobs) shows the "Open cloud
+   * folder" button; `'diff'` jobs route to the Mode A diff-review instead.
+   */
+  cloud_review_mode?: 'diff' | 'open_folder' | null;
 }
