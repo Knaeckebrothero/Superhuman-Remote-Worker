@@ -2624,6 +2624,34 @@ def _create_anthropic_llm(
     return llm
 
 
+# gemini-3.x ("thinking" models, incl. 3.5) reason before answering and, at
+# temperature 0.0 (our stack default), reliably fall into a degenerate
+# token-filling loop: they burn the whole ``max_output_tokens`` budget producing
+# reasoning/garbage and return ``finish_reason=MAX_TOKENS`` with EMPTY content.
+# Reproduced live on session 91ae13f5 (temp 0.0 → repeated 16k-token runaways
+# with empty output; temp 1.0 → clean answers; bare prompt thinks ~250 tokens, so
+# the 16k was NOT genuine reasoning) and matches Google staff guidance.
+#
+# The two changes that actually help: floor the temperature off 0.0, and turn on
+# thought capture so a future loop is *visible* instead of silent. We deliberately
+# do NOT force a thinking level (3.5-flash's own default is "medium"; forcing
+# "high" raises latency and loop risk) and do NOT inflate ``max_output_tokens`` (a
+# loop just fills whatever cap it's given — more tokens wasted before the guard
+# fires, not fewer).
+_GEMINI_THINKING_MIN_TEMPERATURE = 1.0
+
+
+def _is_gemini_3_or_later(model: str) -> bool:
+    """Gemini 3.x (incl. 3.5) — the generation with the temp-0 thinking loop."""
+    return "gemini-3" in (model or "").lower().replace("models/", "")
+
+
+def _is_gemini_thinking_model(model: str) -> bool:
+    """Gemini 2.5 and 3.x emit internal reasoning ("thinking" models)."""
+    m = (model or "").lower().replace("models/", "")
+    return "gemini-2.5" in m or "gemini-3" in m
+
+
 def _create_google_llm(
     config: LLMConfig,
     limits: Optional[LimitsConfig] = None,
@@ -2660,11 +2688,31 @@ def _create_google_llm(
     max_tokens = _resolve_max_output_tokens(config, limits)
     llm_kwargs["max_output_tokens"] = max_tokens
 
+    # Thinking-model handling (see note above the helpers).
+    thinking_mode = "none"
+    if _is_gemini_thinking_model(config.model):
+        # Surface thought summaries: observability (a runaway thinking loop is
+        # visible instead of silent) + UI capture. Thinking depth stays at the
+        # model's own per-model default — we don't force a level.
+        llm_kwargs["include_thoughts"] = True
+        thinking_mode = "include_thoughts"
+        if _is_gemini_3_or_later(config.model):
+            # Floor temperature off 0.0 — the dominant trigger for the degenerate
+            # token-filling loop (empty MAX_TOKENS responses).
+            if (
+                llm_kwargs.get("temperature") is None
+                or llm_kwargs["temperature"] < _GEMINI_THINKING_MIN_TEMPERATURE
+            ):
+                llm_kwargs["temperature"] = _GEMINI_THINKING_MIN_TEMPERATURE
+                thinking_mode += f" temp={_GEMINI_THINKING_MIN_TEMPERATURE}"
+
     llm = ChatGoogleGenerativeAI(**llm_kwargs)
 
     logger.info(
-        f"Created Google LLM: model={config.model}, temp={config.temperature}, "
-        f"timeout={config.timeout}s, max_output_tokens={max_tokens}"
+        f"Created Google LLM: model={config.model}, "
+        f"temp={llm_kwargs.get('temperature')}, "
+        f"timeout={config.timeout}s, max_output_tokens={max_tokens}, "
+        f"thinking={thinking_mode}"
     )
 
     return llm
