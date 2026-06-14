@@ -33,8 +33,9 @@ from pydantic import BaseModel, Field, model_validator
 
 from src.core.image_tokens import (
     content_to_summary_text,
-    estimate_image_tokens,
+    estimate_image_block_tokens,
     has_image_content,
+    split_text_and_image_blocks,
     split_text_and_images,
 )
 
@@ -401,6 +402,9 @@ class ContextConfig:
     # sent 951k-token payloads to a 131k summarizer
     # (docs/features/context_summarization_rework.md).
     model_max_context_tokens: int = 100_000
+    # Per-family image-token estimator config (matrix settings.image_tokens via
+    # LimitsConfig). None -> flat DEFAULT_IMAGE_TOKENS per image. S4.
+    image_tokens: Optional[Dict[str, Any]] = None
     # Evidence-preservation filter: side effects and failures survive compaction
     # so the strategic-phase audit protocol can cite verbatim tool output.
     preserve_tool_names: Tuple[str, ...] = (
@@ -422,18 +426,24 @@ class ContextConfig:
     )
 
 
-def count_tokens_tiktoken(messages: List[BaseMessage], model: str = "gpt-4") -> int:
+def count_tokens_tiktoken(
+    messages: List[BaseMessage],
+    model: str = "gpt-4",
+    image_config: Optional[Dict[str, Any]] = None,
+) -> int:
     """Count tokens using tiktoken for accurate counting.
 
     Args:
         messages: List of messages to count
         model: Model name for tokenizer selection
+        image_config: Resolved per-family image-token estimator config; image
+            blocks are billed by their pixel dimensions, never their base64.
 
     Returns:
         Token count
     """
     if not TIKTOKEN_AVAILABLE:
-        return count_tokens_approximate(messages)
+        return count_tokens_approximate(messages, image_config)
 
     try:
         # Try to get encoding for specific model
@@ -459,9 +469,12 @@ def count_tokens_tiktoken(messages: List[BaseMessage], model: str = "gpt-4") -> 
             # instead of tokenizing their base64 data URL as text (which
             # inflated session 5dbb5770 to ~9.2M phantom tokens). See
             # src/core/image_tokens.py + docs/features/context_token_accounting.md.
-            text, n_images = split_text_and_images(msg.content)
+            text, image_blocks = split_text_and_image_blocks(msg.content)
             content_tokens = len(enc.encode(text, disallowed_special=()))
-            image_tokens = estimate_image_tokens(n_images)
+            image_tokens = sum(
+                estimate_image_block_tokens(b, image_config) for b in image_blocks
+            )
+            n_images = len(image_blocks)
             msg_tokens += content_tokens + image_tokens
 
             # Count tool calls if present
@@ -499,10 +512,13 @@ def count_tokens_tiktoken(messages: List[BaseMessage], model: str = "gpt-4") -> 
 
     except Exception as e:
         logger.warning(f"tiktoken error, falling back to approximate: {e}")
-        return count_tokens_approximate(messages)
+        return count_tokens_approximate(messages, image_config)
 
 
-def count_tokens_approximate(messages: List[BaseMessage]) -> int:
+def count_tokens_approximate(
+    messages: List[BaseMessage],
+    image_config: Optional[Dict[str, Any]] = None,
+) -> int:
     """Approximate token count using character-based estimation.
 
     Uses ~4 characters per token as a rough estimate.
@@ -510,6 +526,7 @@ def count_tokens_approximate(messages: List[BaseMessage]) -> int:
 
     Args:
         messages: List of messages to count
+        image_config: Resolved per-family image-token estimator config.
 
     Returns:
         Approximate token count
@@ -517,9 +534,11 @@ def count_tokens_approximate(messages: List[BaseMessage]) -> int:
     total_chars = 0
     total_image_tokens = 0
     for msg in messages:
-        text, n_images = split_text_and_images(msg.content)
+        text, image_blocks = split_text_and_image_blocks(msg.content)
         total_chars += len(text)
-        total_image_tokens += estimate_image_tokens(n_images)
+        total_image_tokens += sum(
+            estimate_image_block_tokens(b, image_config) for b in image_blocks
+        )
 
         # Add tool calls if present
         if hasattr(msg, "tool_calls") and msg.tool_calls:
@@ -529,18 +548,24 @@ def count_tokens_approximate(messages: List[BaseMessage]) -> int:
     return total_chars // 4 + total_image_tokens
 
 
-def get_token_counter(model: str = "gpt-4") -> Callable[[List[BaseMessage]], int]:
+def get_token_counter(
+    model: str = "gpt-4",
+    image_config: Optional[Dict[str, Any]] = None,
+) -> Callable[[List[BaseMessage]], int]:
     """Get the appropriate token counter function.
 
     Args:
         model: Model name for tokenizer selection
+        image_config: Resolved per-family image-token estimator config, bound
+            into the returned counter so multimodal blocks are billed by their
+            pixel dimensions rather than their base64 length.
 
     Returns:
         Token counter function
     """
     if TIKTOKEN_AVAILABLE:
-        return lambda msgs: count_tokens_tiktoken(msgs, model)
-    return count_tokens_approximate
+        return lambda msgs: count_tokens_tiktoken(msgs, model, image_config)
+    return lambda msgs: count_tokens_approximate(msgs, image_config)
 
 
 class ContextManager:
@@ -589,12 +614,20 @@ class ContextManager:
                 one shared blob — see src/core/summarizer.py)
         """
         self.config = config or ContextConfig()
-        self._default_counter = get_token_counter(model)
+        # getattr-guarded: some callers pass a non-ContextConfig (e.g. tests
+        # hand the whole AgentConfig). image_tokens is an optional new field —
+        # absent -> flat estimation, never a constructor crash.
+        image_config = getattr(self.config, "image_tokens", None)
+        self._default_counter = get_token_counter(model, image_config)
         self._phase_counters: Dict[str, Callable[[List[BaseMessage]], int]] = {}
         if strategic_model:
-            self._phase_counters["strategic"] = get_token_counter(strategic_model)
+            self._phase_counters["strategic"] = get_token_counter(
+                strategic_model, image_config
+            )
         if tactical_model:
-            self._phase_counters["tactical"] = get_token_counter(tactical_model)
+            self._phase_counters["tactical"] = get_token_counter(
+                tactical_model, image_config
+            )
         self.token_counter = self._default_counter
         self._state = ContextManagementState()
         self._summarization_call_timeout = summarization_call_timeout

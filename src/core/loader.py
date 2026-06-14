@@ -591,6 +591,14 @@ def _apply_settings_matrix(
     for key, value in settings.items():
         if key == "limits":
             continue
+        if key == "image_tokens":
+            # Per-family image-token estimator config -> limits, not llm:
+            # _parse_llm_config's closed constructor silently drops unknown
+            # keys. See docs/features/context_token_accounting.md S4.
+            data.setdefault("limits", {})["image_tokens"] = value
+            mode = value.get("mode") if isinstance(value, dict) else value
+            applied.append(f"limits.image_tokens(mode={mode})")
+            continue
         if key not in expert_llm_keys:
             data.setdefault("llm", {})[key] = value
             applied.append(f"llm.{key}={value}")
@@ -1217,6 +1225,10 @@ class LimitsConfig:
     message_count_min_tokens: int = 40000  # 100_000 * 0.40
     tool_retry_count: int = 3
     model_max_context_tokens: int = 100000
+    # Per-family image-token estimator config (matrix settings.image_tokens),
+    # routed through limits (not llm — LLMConfig's closed constructor drops
+    # unknown keys). None -> flat fallback. context_token_accounting.md S4.
+    image_tokens: Optional[Dict[str, Any]] = None
     response_validation: ResponseValidationConfig = field(
         default_factory=ResponseValidationConfig
     )
@@ -1882,6 +1894,7 @@ def load_agent_config(
         message_count_min_tokens=limits_data.get("message_count_min_tokens", 40000),
         tool_retry_count=limits_data.get("tool_retry_count", 3),
         model_max_context_tokens=limits_data.get("model_max_context_tokens", 100000),
+        image_tokens=limits_data.get("image_tokens"),
         response_validation=_parse_response_validation(
             limits_data.get("response_validation", {})
         ),
@@ -2082,6 +2095,7 @@ def load_agent_config_from_dict(
         message_count_min_tokens=limits_data.get("message_count_min_tokens", 40000),
         tool_retry_count=limits_data.get("tool_retry_count", 3),
         model_max_context_tokens=limits_data.get("model_max_context_tokens", 100000),
+        image_tokens=limits_data.get("image_tokens"),
         response_validation=_parse_response_validation(
             limits_data.get("response_validation", {})
         ),

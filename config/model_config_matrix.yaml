@@ -53,6 +53,11 @@ default:
     multimodal: false
     parallel_tool_calls: false
     model_max_context_tokens: 128000
+    # Per-image token cost for the compaction trigger. `default` is the flat
+    # biased-high fallback used for unknown families and unreadable image dims;
+    # multimodal families below override with a dimension-aware mode. Verified
+    # formulas: docs/features/context_token_accounting.md §4 + appendix.
+    image_tokens: { mode: flat, flat: 1600 }
 
 minimax:
   prompts:
@@ -100,6 +105,7 @@ minimax-m3:
     multimodal: true   # M3 is natively multimodal (image + video input)
     parallel_tool_calls: true  # M3 supports continuous + parallel tool calls
     model_max_context_tokens: 1000000  # M3: up to 1M context (>=512K guaranteed) via MSA
+    image_tokens: { mode: flat, flat: 1600 }  # no public per-image formula — calibrate via usage
 
 o-series:
   settings:
@@ -107,6 +113,9 @@ o-series:
     multimodal: true  # o3/o4-mini support image inputs
     parallel_tool_calls: true
     model_max_context_tokens: 200000
+    # o1/o3 tile model: 75 base + 150/tile after 2048/768 fit. (o4-mini is
+    # actually patch-based; tiles biased-low for it — acceptable, it is unused.)
+    image_tokens: { mode: openai_tiles, base: 75, per_tile: 150, tile_px: 512, flat: 1000 }
 
 # DeepSeek V4 family (released 2026-04-24). Covers BOTH variants — family_of()
 # maps `deepseek-v4-pro` (1.6T/49B) and `deepseek-v4-flash` (284B/13B) to this
@@ -160,6 +169,10 @@ gemini:
     multimodal: true  # Gemini models are natively multimodal
     parallel_tool_calls: true
     model_max_context_tokens: 1000000
+    # Gemini API (ai.google.dev) bills a small flat per image (258 at MEDIUM /
+    # ~1120 at Gemini-3 HIGH). 2304 = biased-high (256 + Pan&Scan upside). NOT
+    # Vertex (which crop-tiles ~7x higher) — log the endpoint if that changes.
+    image_tokens: { mode: flat, flat: 2304 }
 
 claude-opus:
   settings:
@@ -167,6 +180,28 @@ claude-opus:
     multimodal: true  # Claude Opus 4.6 supports vision
     parallel_tool_calls: true
     model_max_context_tokens: 1000000  # Opus 4.6: 1M context, 128K max output
+    # 28px patches, Opus 4.7+/Fable5 high-res cap (2576px edge / 4784 tok max).
+    image_tokens: { mode: anthropic_patches, patch_px: 28, max_edge: 2576, max_tokens: 4784, flat: 4784 }
+
+# Claude Sonnet / Haiku — NEW rows. Without them family_of('claude-sonnet')
+# falls through to `default` (multimodal:false!), so the homelab interactive
+# main model never counted images and compacted at the 128k default window.
+# Vision = 28px patches at the legacy cap (1568px edge / 1568 tok).
+claude-sonnet:
+  settings:
+    temperature: 1.0
+    multimodal: true
+    parallel_tool_calls: true
+    model_max_context_tokens: 1000000  # Sonnet 4.x: up to 1M context
+    image_tokens: { mode: anthropic_patches, patch_px: 28, max_edge: 1568, max_tokens: 1568, flat: 1568 }
+
+claude-haiku:
+  settings:
+    temperature: 1.0
+    multimodal: true
+    parallel_tool_calls: true
+    model_max_context_tokens: 200000  # Haiku 4.5: 200K context
+    image_tokens: { mode: anthropic_patches, patch_px: 28, max_edge: 1568, max_tokens: 1568, flat: 1568 }
 
 gpt-5:
   prompts:
@@ -192,6 +227,10 @@ gpt-5:
     # and the Codex proxy only supports the Responses API.
     parallel_tool_calls: false
     model_max_context_tokens: 1050000  # gpt-5.4: 1.05M, 128K max output
+    # 32px patches. gpt-5.5 `auto`->original (budget 10000); gpt-5.4 `auto`->high
+    # (2500). budget 10000 is biased-high across both; full models bill patches
+    # ~1:1 (no published multiplier). A 1700x2200 page ~= 3726 tok.
+    image_tokens: { mode: openai_patches, patch_px: 32, budget: 10000, flat: 3000 }
 
 codex:
   prompts:
@@ -213,6 +252,8 @@ codex:
     # TODO: Re-enable once langchain-ai/langchain#34660 is fixed.
     parallel_tool_calls: false
     model_max_context_tokens: 400000  # gpt-5.3-codex: 400K context, 128K max output
+    # Same 32px-patch vision scheme as the gpt-5 family.
+    image_tokens: { mode: openai_patches, patch_px: 32, budget: 10000, flat: 3000 }
 
 codex-spark:
   prompts:
@@ -312,12 +353,16 @@ gemma:
     multimodal: true  # Gemma 4 31B accepts text + image + video (no audio on 31B)
     parallel_tool_calls: false  # vllm#39392: concurrent tool calls can emit <pad> tokens
     model_max_context_tokens: 131072  # Endpoint reports 131072 for current deployment
+    # Flat per image (Gemma 4 default 280; pan-and-scan off in vLLM). 320 =
+    # 280 x ~1.14 bias. Forward-looking — gemma is the text-only summarizer.
+    image_tokens: { mode: flat, flat: 320 }
 
-# Model-specific overrides — add as needed:
-# claude-sonnet:
+# Model-specific overrides — add as needed (use a real family_of() key; note
+# claude-sonnet/claude-haiku already have rows above):
+# my-custom-family:
 #   prompts:
-#     systemprompt: systemprompt_claude_sonnet.txt
+#     systemprompt: systemprompt_custom.txt
 #   instructions:
-#     instructions: instructions_claude_sonnet.md
+#     instructions: instructions_custom.md
 #   settings:
 #     temperature: 1.0

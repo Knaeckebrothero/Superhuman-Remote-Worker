@@ -680,6 +680,8 @@ class PersistentSession:
                 # Summarization budgets are computed at call time from the
                 # aux model's window (src/core/summarizer.py).
                 model_max_context_tokens=lim.model_max_context_tokens,
+                # Per-family image-token estimator (matrix settings.image_tokens).
+                image_tokens=lim.image_tokens,
             ),
             model=self.config.llm.model or "gpt-4",
             summarization_call_timeout=(

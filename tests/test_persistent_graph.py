@@ -29,6 +29,8 @@ from src.persistent_graph import (
     PersistentLoopCallbacks,
     TurnResult,
     _execute_turn,
+    _inject_context_pairs,
+    _injection_anchor_index,
     run_persistent_loop,
 )
 
@@ -3290,3 +3292,126 @@ class TestExecuteTurnReasoning:
         )
 
         assert _STREAM_REASONING_SINK.get() is None
+
+
+# ---------------------------------------------------------------------------
+# Transient context injection placement (Gemini function-call turn ordering)
+# ---------------------------------------------------------------------------
+
+
+def _first_index(messages, predicate):
+    return next((i for i, m in enumerate(messages) if predicate(m)), None)
+
+
+def _is_tool_call_ai(m) -> bool:
+    return isinstance(m, AIMessage) and bool(getattr(m, "tool_calls", None))
+
+
+def _memory_pair(content: str):
+    """A real (AIMessage(tool_call), ToolMessage) pair, as the seam produces."""
+    from src.core.memory_injection import create_memory_injection_messages
+
+    return list(create_memory_injection_messages(content))
+
+
+class TestInjectionAnchorIndex:
+    """`_injection_anchor_index` anchors injected pairs after the first user turn."""
+
+    def test_after_first_human_with_system(self):
+        msgs = [SystemMessage(content="sys"), HumanMessage(content="hi")]
+        assert _injection_anchor_index(msgs) == 2
+
+    def test_after_first_human_no_system(self):
+        msgs = [HumanMessage(content="hi"), AIMessage(content="yo")]
+        assert _injection_anchor_index(msgs) == 1
+
+    def test_anchors_on_first_human_not_later(self):
+        msgs = [
+            SystemMessage(content="sys"),
+            HumanMessage(content="h1"),
+            AIMessage(content="a1"),
+            HumanMessage(content="h2"),
+        ]
+        assert _injection_anchor_index(msgs) == 2
+
+    def test_no_human_falls_back_after_system(self):
+        assert _injection_anchor_index([SystemMessage(content="sys")]) == 1
+
+    def test_no_human_no_system_returns_zero(self):
+        assert _injection_anchor_index([]) == 0
+        assert _injection_anchor_index([AIMessage(content="a")]) == 0
+
+
+class TestInjectContextPairs:
+    """Injected memory/knowledge pairs must never precede the first user turn.
+
+    Regression for the Gemini 400 "Please ensure that function call turn comes
+    immediately after a user turn or after a function response turn": the
+    injected pairs are synthetic AIMessage(tool_call)+ToolMessage, and placing
+    them right after the SystemMessage (before the first HumanMessage) made the
+    function call the first entry of Gemini's `contents` array — failing the
+    very first turn of a session. The worker graph is shielded by its leading
+    todos HumanMessage; the persistent loop now anchors on the first user turn.
+    """
+
+    def _assert_gemini_ordering(self, messages):
+        """No tool-call AIMessage or ToolMessage may precede the first user turn."""
+        first_human = _first_index(messages, lambda m: isinstance(m, HumanMessage))
+        first_tool = _first_index(
+            messages, lambda m: _is_tool_call_ai(m) or isinstance(m, ToolMessage)
+        )
+        assert first_human is not None, "expected a user turn in the history"
+        assert first_tool is None or first_human < first_tool, (
+            f"tool turn at {first_tool} precedes first user turn at {first_human}"
+        )
+
+    def _assert_pairing(self, messages):
+        call_ids = [
+            tc["id"] for m in messages if _is_tool_call_ai(m) for tc in m.tool_calls
+        ]
+        result_ids = [m.tool_call_id for m in messages if isinstance(m, ToolMessage)]
+        assert sorted(call_ids) == sorted(result_ids)
+        # Each injected result immediately follows its call (AI then Tool).
+        for i, m in enumerate(messages):
+            if _is_tool_call_ai(m):
+                nxt = messages[i + 1]
+                assert isinstance(nxt, ToolMessage)
+                assert nxt.tool_call_id in {tc["id"] for tc in m.tool_calls}
+
+    def test_memory_injected_after_first_human(self):
+        prepared = [SystemMessage(content="sys"), HumanMessage(content="hi")]
+        count = _inject_context_pairs(prepared, [], "MEMORIES", "")
+        assert count == 2
+        self._assert_gemini_ordering(prepared)
+        # The fixed shape: System, Human, AI(tool_call), Tool — NOT the old
+        # System, AI(tool_call), Tool, Human that Gemini rejects.
+        assert isinstance(prepared[0], SystemMessage)
+        assert isinstance(prepared[1], HumanMessage)
+        assert _is_tool_call_ai(prepared[2])
+        assert isinstance(prepared[3], ToolMessage)
+
+    def test_knowledge_injected_after_first_human(self):
+        prepared = [SystemMessage(content="sys"), HumanMessage(content="hi")]
+        count = _inject_context_pairs(prepared, [], "", "KNOWLEDGE")
+        assert count == 2
+        self._assert_gemini_ordering(prepared)
+
+    def test_all_three_sources_ordering_and_pairing(self):
+        manager = _memory_pair("MANAGER")  # seam payload is itself tool-call pairs
+        prepared = [
+            SystemMessage(content="sys"),
+            HumanMessage(content="h1"),
+            AIMessage(content="a1"),
+            HumanMessage(content="h2"),
+        ]
+        count = _inject_context_pairs(prepared, manager, "MEM", "KB")
+        assert count == len(manager) + 4
+        self._assert_gemini_ordering(prepared)
+        self._assert_pairing(prepared)
+
+    def test_no_injection_when_all_empty(self):
+        prepared = [SystemMessage(content="sys"), HumanMessage(content="hi")]
+        before = list(prepared)
+        count = _inject_context_pairs(prepared, [], "", "")
+        assert count == 0
+        assert prepared == before

@@ -37,6 +37,18 @@ def derived(base: int) -> dict:
     return out
 
 
+def _derived_leaves(data: dict) -> dict:
+    """The derived numeric limit leaves only.
+
+    ``settings.image_tokens`` is a matrix passthrough (the per-family
+    image-token estimator config), NOT a value derived from the working-window
+    base, so it is dropped before comparing against :func:`derived`. Its routing
+    into ``limits`` is covered by
+    tests/test_image_token_estimator.py::TestLoaderRouting.
+    """
+    return {k: v for k, v in data.get("limits", {}).items() if k != "image_tokens"}
+
+
 @pytest.fixture(autouse=True)
 def clear_settings_matrix_cache():
     """Reset the unified model_config_matrix cache between tests."""
@@ -277,7 +289,7 @@ class TestPerExpertMatrix:
         assert data["llm"]["temperature"] == 0.7
         # Expert overrides the single base; the leaves derive from it.
         assert data["llm"]["model_max_context_tokens"] == 150000
-        assert data["limits"] == derived(150000)
+        assert _derived_leaves(data) == derived(150000)
 
     def test_no_expert_matrix_uses_base(self, tmp_path):
         """Missing expert model_config_matrix.yaml falls back to base."""
@@ -722,7 +734,7 @@ class TestPerExpertMatrixExtended:
 
         # The single value flows to llm and is the base the leaves derive from.
         assert data["llm"]["model_max_context_tokens"] == 256000
-        assert data["limits"] == derived(256000)
+        assert _derived_leaves(data) == derived(256000)
 
     def test_expert_adds_new_family_with_limits(self, tmp_path):
         """Expert can define a new family that the base doesn't have."""
@@ -781,7 +793,7 @@ class TestPerExpertMatrixExtended:
         )
 
         # The 42000 leaf is discarded; everything derives from base 160000.
-        assert data["limits"] == derived(160000)
+        assert _derived_leaves(data) == derived(160000)
         assert data["limits"]["context_threshold_tokens"] == 128000  # 160000 * 0.80
 
 
@@ -809,7 +821,7 @@ class TestRealMatrixFamilies:
         data = {"llm": {"model": model}, "limits": {}}
         _apply_settings_matrix(data, expert_llm_keys=set())
         # Every leaf derives from the family's working base.
-        assert data["limits"] == derived(base)
+        assert _derived_leaves(data) == derived(base)
 
     @pytest.mark.parametrize(
         "model,expected_temp",
@@ -907,7 +919,7 @@ class TestContextWindowBaseResolution:
         data = {"llm": {"model": "minimax-m3"}}
         _apply_settings_matrix(data, expert_llm_keys=set())
         # Base is the full 1M window; the leaves derive from it.
-        assert data["limits"] == derived(1000000)
+        assert _derived_leaves(data) == derived(1000000)
         assert data["llm"]["model_max_context_tokens"] == 1000000
 
     def test_explicit_override_becomes_base_and_survives_matrix(self):
@@ -921,7 +933,7 @@ class TestContextWindowBaseResolution:
         # Injected window is NOT overwritten by the family nominal.
         assert data["llm"]["model_max_context_tokens"] == 32000
         # Every leaf derives from the 32k working window.
-        assert data["limits"] == derived(32000)
+        assert _derived_leaves(data) == derived(32000)
 
     def test_override_below_family_base_is_honored_no_clamp(self):
         """The admin field is the window: a 512k override replaces the family's
@@ -930,7 +942,7 @@ class TestContextWindowBaseResolution:
         _apply_settings_matrix(
             data, expert_llm_keys={"model", "model_max_context_tokens"}
         )
-        assert data["limits"] == derived(512000)
+        assert _derived_leaves(data) == derived(512000)
 
     def test_falsy_override_falls_back_to_family_base(self):
         """A falsy override (0) falls back to the family's true-max base rather
@@ -940,7 +952,7 @@ class TestContextWindowBaseResolution:
         _apply_settings_matrix(
             data, expert_llm_keys={"model", "model_max_context_tokens"}
         )
-        assert data["limits"] == derived(1000000)
+        assert _derived_leaves(data) == derived(1000000)
 
     def test_per_model_window_in_config_drives_limits_end_to_end(self, tmp_path):
         """Full parse: a model_max_context_tokens in the config llm block (same
