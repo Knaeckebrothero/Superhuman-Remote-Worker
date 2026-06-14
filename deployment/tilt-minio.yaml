@@ -1,0 +1,130 @@
+# =============================================================================
+# Single-node MinIO — LOCAL k3d / Tilt ONLY.
+#
+# The helm chart deliberately never deploys MinIO (prod points the snapshot +
+# virtual-workspace S3 config at an external store). For local development this
+# fixture gives the `virtual` workspace tier a real S3 backend so the rclone
+# write path (and durable, inspectable objects) can be exercised on k3d instead
+# of the non-durable in-process `memory` store.
+#
+# Single-zone / single-drive (MinIO SNSD) — the supported mode for local dev.
+# Wired in via Tiltfile `k8s_yaml`; the virtual tier points here through
+# deployment/values-tilt.yaml (endpoint) + values-local.yaml (creds).
+# NOT for production.
+# =============================================================================
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: minio-data
+  namespace: srw
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minio
+  namespace: srw
+  labels:
+    app: minio
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate # single RWO PVC — never run two writers
+  selector:
+    matchLabels:
+      app: minio
+  template:
+    metadata:
+      labels:
+        app: minio
+    spec:
+      containers:
+        - name: minio
+          # k3d node has no external DNS; pull from the in-cluster registry
+          # (host: localhost:5005). Mirror with: podman pull docker.io/minio/minio:latest
+          # && podman tag ... localhost:5005/minio/minio:latest && podman push --tls-verify=false ...
+          image: srw-registry:5000/minio/minio:latest
+          imagePullPolicy: IfNotPresent
+          args: ["server", "/data", "--console-address", ":9001"]
+          env:
+            - name: MINIO_ROOT_USER
+              value: "minioadmin"
+            - name: MINIO_ROOT_PASSWORD
+              value: "minioadmin_secret"
+          ports:
+            - containerPort: 9000
+              name: s3
+            - containerPort: 9001
+              name: console
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          readinessProbe:
+            httpGet:
+              path: /minio/health/ready
+              port: 9000
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "1Gi"
+              cpu: "1000m"
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: minio-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio
+  namespace: srw
+spec:
+  selector:
+    app: minio
+  ports:
+    - name: s3
+      port: 9000
+      targetPort: 9000
+    - name: console
+      port: 9001
+      targetPort: 9001
+---
+# Pre-creates the srw-workspaces bucket. The orchestrator bakes
+# no_check_bucket=true into the rclone spec, so the bucket must already exist.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minio-createbucket
+  namespace: srw
+spec:
+  backoffLimit: 20
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: mc
+          image: srw-registry:5000/minio/mc:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: MINIO_ROOT_USER
+              value: "minioadmin"
+            - name: MINIO_ROOT_PASSWORD
+              value: "minioadmin_secret"
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              # Retry alias-set + mb together until MinIO is up (a unique alias
+              # avoids mc's built-in `local` -> localhost:9000 default).
+              until mc alias set m http://minio:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" \
+                    && mc mb -p m/srw-workspaces; do
+                echo "waiting for minio..."; sleep 2
+              done
+              echo "bucket srw-workspaces ready"

@@ -324,3 +324,13 @@ helm_resource(
         ('image.workspace.repository', 'image.workspace.tag'),
     ],
 )
+
+# -----------------------------------------------------------------------------
+# Local-only single-node MinIO (deployment/tilt-minio.yaml). Gives the
+# `virtual` workspace tier a real S3 backend on k3d so the rclone write path is
+# exercised durably instead of the in-process `memory` store. NOT part of the
+# helm chart (prod uses an external store); the virtual tier is pointed here via
+# deployment/values-tilt.yaml (endpoint) + values-local.yaml (VIRTUAL_WORKSPACE_S3_* creds).
+# -----------------------------------------------------------------------------
+k8s_yaml('deployment/tilt-minio.yaml')
+k8s_resource('minio', labels=['minio'], port_forwards=['9001:9001'])
