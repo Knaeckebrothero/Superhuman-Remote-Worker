@@ -88,6 +88,7 @@ type AgentSettingsTab = 'settings' | 'instructions' | 'advanced' | 'resolved';
             [datasources]="datasources()"
             [loading]="loadingDatasources()"
             [disabled]="disabled()"
+            [isLiteBackend]="advancedAccordion?.isLiteBackend() ?? false"
             (change)="onChange()"
           />
 

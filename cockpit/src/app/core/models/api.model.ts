@@ -124,6 +124,8 @@ export interface Datasource {
   cli_hint: string | null;
   default_branch: string | null;
   job_id: string | null;
+  /** Whether the datasource is visible to all users (vs owner/project only). */
+  is_global?: boolean;
   created_at: string;
   updated_at: string;
 }

@@ -172,6 +172,7 @@ def create_orchestrator_tools(context: ToolContext) -> List[Any]:
         instructions: Optional[str] = None,
         priority: int = 5,
         project_id: Optional[str] = None,
+        datasource_ids: Optional[List[str]] = None,
     ) -> str:
         """Create a new worker job on the orchestrator.
 
@@ -181,6 +182,8 @@ def create_orchestrator_tools(context: ToolContext) -> List[Any]:
             instructions: Additional instructions for the worker
             priority: Job priority 1-10, higher = more urgent (default: 5)
             project_id: Optional project to scope the job to
+            datasource_ids: Optional explicit datasource selection. Omit to
+                inherit this session's datasources; pass [] to attach none.
 
         Returns:
             Job creation result with job ID
@@ -194,6 +197,11 @@ def create_orchestrator_tools(context: ToolContext) -> List[Any]:
             payload["instructions"] = instructions
         if project_id:
             payload["project_id"] = project_id
+        # Explicit selection overrides inheritance; [] means "attach none".
+        # Omitting it lets the orchestrator inherit the parent session/job's
+        # selection (server-side, keyed off thread_id below).
+        if datasource_ids is not None:
+            payload["datasource_ids"] = datasource_ids
         # When invoked from a persistent session, carry the thread back so
         # the orchestrator can derive the owning user (and apply their model
         # preferences during dispatch). No-op for worker-mode callers.

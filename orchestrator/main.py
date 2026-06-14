@@ -1375,6 +1375,11 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
         # the object-store mounts (virtual) with deployment-sourced credentials,
         # in-flight only. A repository datasource needs a real workspace to
         # clone into, so reject the combination up front (§4/§7).
+        # Defense-in-depth: the submit-time guard already rejects an explicitly
+        # selected repo, and create_job filters repos out of an *inherited*
+        # lite selection — but this re-checks the fully resolved set, covering
+        # resume / VM-resume and any future path that could attach a repo the
+        # submit guard never saw.
         if _backend_from_override(config_override) in LITE_BACKENDS:
             repo_names = _repository_datasource_names(resolved_ds)
             if repo_names:
@@ -1975,6 +1980,61 @@ def _repository_datasource_names(datasources: Any) -> list[str]:
         if (ds.get("type") or "").lower() == "repository":
             names.append(str(ds.get("name") or ds.get("id") or "?"))
     return names
+
+
+async def _inherit_parent_datasource_ids(
+    *, thread_id: str | None, parent_job_id: str | None
+) -> list[str]:
+    """Datasource IDs a parented subjob inherits when it passes no explicit
+    selection (delegation keeps working without force-attaching anything).
+
+    Prefers the parent thread's persisted selection
+    (``threads.metadata.datasource_ids``), then the parent job's
+    ``job_datasources``. Returns [] when neither yields a selection.
+    """
+    if thread_id:
+        try:
+            thread = await postgres_db.get_thread(thread_id)
+        except Exception:
+            thread = None
+        if thread:
+            meta = thread.get("metadata") or {}
+            if isinstance(meta, str):
+                try:
+                    meta = json.loads(meta)
+                except (json.JSONDecodeError, TypeError):
+                    meta = {}
+            ids = meta.get("datasource_ids") or []
+            if ids:
+                return [str(x) for x in ids]
+    if parent_job_id:
+        try:
+            return await postgres_db.list_job_datasource_ids(parent_job_id)
+        except Exception:
+            return []
+    return []
+
+
+async def _propagate_datasources_to_subjob(
+    parent_job_id: str, child_job_id: str
+) -> None:
+    """Copy the parent job's datasource selection to a spawned subjob.
+
+    Explicit-only resolution means a subjob otherwise resolves no datasources;
+    scholar/critic/curator run on the parent's workspace and need the same
+    DB/repo sources. These subjobs are skipped for lite backends, so no
+    repository filtering is needed here.
+    """
+    try:
+        for ds_id in await postgres_db.list_job_datasource_ids(parent_job_id):
+            await postgres_db.link_datasource_to_job(child_job_id, ds_id)
+    except Exception as e:
+        logger.warning(
+            "Failed to propagate datasources %s -> %s: %s",
+            parent_job_id,
+            child_job_id,
+            e,
+        )
 
 
 def _job_needs_vm(job: dict) -> bool:
@@ -4502,39 +4562,79 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
             main_cloud_router=main_cloud_router,
         )
 
-        # Clone selected global datasources as job-scoped
-        if job.datasource_ids:
-            new_job_id = str(result["id"])
-            for ds_id in job.datasource_ids:
+        # Persist the explicit datasource selection as job_datasources links —
+        # the picker is the source of truth; resolution returns exactly these,
+        # nothing global/project force-attaches. When no selection is passed
+        # but the job has a parent (subjob / delegation), inherit the parent's
+        # selection so delegation keeps working; an explicit [] opts out.
+        new_job_id = str(result["id"])
+        if job.datasource_ids is not None:
+            selected_ds_ids = list(job.datasource_ids)
+        elif job.thread_id or job.parent_job_id:
+            selected_ds_ids = await _inherit_parent_datasource_ids(
+                thread_id=job.thread_id, parent_job_id=job.parent_job_id
+            )
+        else:
+            selected_ds_ids = []
+
+        # Lite tiers can't clone repos; drop any inherited repository
+        # datasources (explicitly-attached repos were already rejected above
+        # with a 400; the dispatch guard is the final backstop).
+        if selected_ds_ids and lite_backend in LITE_BACKENDS:
+            filtered: list[str] = []
+            for ds_id in selected_ds_ids:
                 try:
                     ds = await postgres_db.get_datasource(ds_id)
-                    if ds and ds.get("job_id") is None:
-                        # Parse credentials if stored as string
-                        creds = ds.get("credentials") or {}
-                        if isinstance(creds, str):
-                            try:
-                                creds = json.loads(creds)
-                            except (json.JSONDecodeError, ValueError):
-                                creds = {}
+                except Exception:
+                    ds = None
+                if ds and (ds.get("type") or "").lower() == "repository":
+                    logger.info(
+                        "Dropping repository datasource %s from lite job %s "
+                        "(backend=%s)",
+                        ds_id,
+                        new_job_id,
+                        lite_backend,
+                    )
+                    continue
+                filtered.append(ds_id)
+            selected_ds_ids = filtered
 
-                        await postgres_db.create_datasource(
-                            name=ds["name"],
-                            ds_type=ds["type"],
-                            connection_url=ds.get("connection_url"),
-                            description=ds.get("description"),
-                            credentials=creds if creds else None,
-                            job_id=new_job_id,
-                            cli_hint=ds.get("cli_hint"),
-                            default_branch=ds.get("default_branch"),
+        # Link each selection, verifying the creator can see it (owner OR
+        # is_global OR member of a linked project). Internal/trusted callers
+        # (agent, MCP) bypass the per-user check. Skip + log the rest.
+        if selected_ds_ids:
+            creator = None
+            if not is_internal_call(request) and effective_user_id:
+                try:
+                    creator = await postgres_db.get_user(effective_user_id)
+                except Exception:
+                    creator = None
+            for ds_id in selected_ds_ids:
+                try:
+                    if creator is not None:
+                        ds = await postgres_db.get_datasource(ds_id)
+                        if not ds:
+                            logger.warning("Skipping datasource %s: not found", ds_id)
+                            continue
+                        allowed = bool(ds.get("is_global")) or (
+                            await user_can_access_datasource(creator, postgres_db, ds)
                         )
-                    else:
-                        logger.warning(
-                            f"Skipping datasource {ds_id}: "
-                            f"{'not found' if not ds else 'not global (already job-scoped)'}"
-                        )
+                        if not allowed:
+                            logger.warning(
+                                "Skipping datasource %s for job %s: caller %s "
+                                "cannot access it",
+                                ds_id,
+                                new_job_id,
+                                effective_user_id,
+                            )
+                            continue
+                    await postgres_db.link_datasource_to_job(new_job_id, ds_id)
                 except Exception as e:
                     logger.warning(
-                        f"Failed to clone datasource {ds_id} for job {new_job_id}: {e}"
+                        "Failed to link datasource %s to job %s: %s",
+                        ds_id,
+                        new_job_id,
+                        e,
                     )
 
         # Link builder session to job (if provided)
@@ -7065,6 +7165,9 @@ async def _spawn_scholar_subjob(
     scholar_job_id = str(scholar_job["id"])
     short_id = scholar_job_id[:8]
 
+    # Inherit the parent's datasource selection (explicit-only resolution).
+    await _propagate_datasources_to_subjob(job_id, scholar_job_id)
+
     # Set up Gitea branch for the scholar subjob
     if gitea_client.is_initialized:
         parent_repo_name = job.get("repo_name")
@@ -7774,6 +7877,9 @@ async def _trigger_verification_on_complete(
 
         critic_job_id = str(critic_job["id"])
         short_id = critic_job_id[:8]
+
+        # Inherit the parent's datasource selection (explicit-only resolution).
+        await _propagate_datasources_to_subjob(job_id, critic_job_id)
 
         # Set up Gitea branch for the subjob (same logic as create_job endpoint)
         if gitea_client.is_initialized:
@@ -10019,6 +10125,38 @@ async def list_datasources(
         if await user_can_access_datasource(user, postgres_db, ds):
             visible.append(ds)
     return redact_datasources(visible)
+
+
+@app.get("/api/datasources/eligible")
+async def list_eligible_datasources(
+    request: Request,
+    project_id: list[str] | None = Query(
+        default=None,
+        description="Project(s) to include linked datasources for (repeatable)",
+    ),
+) -> list[dict[str, Any]]:
+    """Datasources the caller may pre-select for a job/session (the picker
+    source of truth).
+
+    Returns the union of: datasources the caller created, global datasources,
+    and datasources linked to any supplied project. Credentials are stripped.
+    Membership is required for each supplied project (403 otherwise). Used to
+    seed the create-job / create-session datasource picker; with explicit-only
+    resolution the picker is the only way a job gets datasources.
+    """
+    user = await require_approved_user(request, postgres_db)
+    project_ids = project_id or []
+    for pid in project_ids:
+        await require_project_member(request, postgres_db, pid)
+    try:
+        rows = await postgres_db.list_eligible_datasources(
+            str(user["id"]),
+            project_ids,
+            is_admin=bool(user.get("is_admin")),
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    return redact_datasources(rows)
 
 
 @app.get("/api/datasources/{datasource_id}")
@@ -13280,9 +13418,22 @@ async def resume_thread(
                             co = json.loads(co)
                         except (json.JSONDecodeError, TypeError):
                             co = {}
+                    # Pass the thread's explicit datasource selection (persisted
+                    # in metadata) — without it, explicit-only resolution returns
+                    # nothing on idle-pool resume (this path previously dropped
+                    # it). Read from the freshly-locked row (cur). NOTE: project_ids
+                    # here is the legacy thread field; deriving it from
+                    # thread_mounts is a separate latent fix.
+                    meta = cur.get("metadata") or {}
+                    if isinstance(meta, str):
+                        try:
+                            meta = json.loads(meta)
+                        except (json.JSONDecodeError, TypeError):
+                            meta = {}
                     pids = thread.get("project_ids") or []
                     resolved_ds = await postgres_db.resolve_datasources_for_thread(
-                        project_ids=pids
+                        datasource_ids=meta.get("datasource_ids"),
+                        project_ids=pids,
                     )
                     ds_payload = _build_datasources_payload(resolved_ds)
                     if resolved_ds:

@@ -4,6 +4,47 @@ import {AppIconComponent} from '../../ui/icon';
 import {AppSpinnerComponent} from '../../ui/spinner';
 import {Datasource, DatasourceType} from '../../core/models/api.model';
 
+/** A user's explicit picker selection, tagged with the datasource-set identity
+ *  it was made against (so a stale tag falls back to the default). */
+export type DatasourceSelection = {key: string; ids: Set<string>} | null;
+
+export function isRepositoryDatasource(type: DatasourceType | string): boolean {
+  return (type || '').toString().toLowerCase() === 'repository';
+}
+
+/** Stable identity of a datasource set (order-independent). */
+export function datasourceSetKey(datasources: {id: string}[]): string {
+  return datasources
+    .map(d => d.id)
+    .sort()
+    .join(',');
+}
+
+/** Active selection: the user's tagged choice, or all ids when the selection is
+ *  untouched (null) or stale (made against a different datasource set). */
+export function activeDatasourceIds(
+  datasources: {id: string}[],
+  selection: DatasourceSelection,
+): Set<string> {
+  if (selection && selection.key === datasourceSetKey(datasources)) {
+    return selection.ids;
+  }
+  return new Set(datasources.map(d => d.id));
+}
+
+/** Selected datasource IDs to submit: the active set, minus repository sources
+ *  disabled by a lite backend and any ids not in the current datasource set. */
+export function selectedDatasourceIds(
+  datasources: Datasource[],
+  selection: DatasourceSelection,
+  isLiteBackend: boolean,
+): string[] {
+  const active = activeDatasourceIds(datasources, selection);
+  return datasources
+    .filter(d => active.has(d.id) && !(isLiteBackend && isRepositoryDatasource(d.type)))
+    .map(d => d.id);
+}
+
 /**
  * Datasource checkbox list. Hidden entirely when no datasources are available.
  */
@@ -19,18 +60,21 @@ import {Datasource, DatasourceType} from '../../core/models/api.model';
           @for (ds of datasources(); track ds.id) {
             <label
               class="ds-option"
-              [class.selected]="selectedIds().has(ds.id)"
+              [class.selected]="isChecked(ds)"
+              [class.ds-disabled]="isLiteExcluded(ds)"
             >
               <input
                 type="checkbox"
-                [checked]="selectedIds().has(ds.id)"
+                [checked]="isChecked(ds)"
                 (change)="toggle(ds.id)"
-                [disabled]="disabled()"
+                [disabled]="disabled() || isLiteExcluded(ds)"
               >
               <app-icon size="md" class="ds-type-icon" [class]="'ds-type-' + ds.type">{{ getTypeIcon(ds.type) }}</app-icon>
               <span class="ds-info">
                 <span class="ds-name">{{ ds.name }}</span>
-                @if (ds.description) {
+                @if (isLiteExcluded(ds)) {
+                  <span class="ds-desc">Requires a sandbox or VM workspace</span>
+                } @else if (ds.description) {
                   <span class="ds-desc">{{ ds.description }}</span>
                 }
               </span>
@@ -83,6 +127,10 @@ import {Datasource, DatasourceType} from '../../core/models/api.model';
     }
     .ds-option.selected {
       background: color-mix(in srgb, var(--accent-color) 20%, transparent);
+    }
+    .ds-option.ds-disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
     }
     .ds-option input[type="checkbox"] {
       accent-color: var(--accent-color, var(--accent-color));
@@ -140,23 +188,43 @@ export class DatasourcesGroupComponent {
   datasources = input<Datasource[]>([]);
   loading = input(false);
   disabled = input(false);
+  /**
+   * When a lite workspace backend (virtual/none) is selected, repository
+   * datasources can't be cloned — they are shown disabled and excluded from
+   * the emitted selection.
+   */
+  isLiteBackend = input(false);
 
   change = output<void>();
 
-  readonly selectedIds = signal<Set<string>>(new Set());
+  // The user's explicit selection, tagged with the datasource-set identity it
+  // was made against. Null — or a stale tag (e.g. after switching project) —
+  // means "default: all eligible selected". The picker is the source of truth;
+  // explicit-only resolution attaches exactly what's checked.
+  private readonly selection = signal<{key: string; ids: Set<string>} | null>(null);
 
-  readonly modifiedCount = computed(() => this.selectedIds().size);
+  readonly modifiedCount = computed(() => this.getSelectedIds().length);
+
+  /** A repository datasource can't be used under a lite backend. */
+  isLiteExcluded(ds: Datasource): boolean {
+    return this.isLiteBackend() && isRepositoryDatasource(ds.type);
+  }
+
+  isChecked(ds: Datasource): boolean {
+    return (
+      !this.isLiteExcluded(ds) &&
+      activeDatasourceIds(this.datasources(), this.selection()).has(ds.id)
+    );
+  }
 
   toggle(id: string): void {
-    this.selectedIds.update(current => {
-      const next = new Set(current);
-      if (next.has(id)) {
-        next.delete(id);
-      } else {
-        next.add(id);
-      }
-      return next;
-    });
+    const next = new Set(activeDatasourceIds(this.datasources(), this.selection()));
+    if (next.has(id)) {
+      next.delete(id);
+    } else {
+      next.add(id);
+    }
+    this.selection.set({key: datasourceSetKey(this.datasources()), ids: next});
     this.change.emit();
   }
 
@@ -170,12 +238,19 @@ export class DatasourcesGroupComponent {
     return icons[type] || 'storage';
   }
 
-  /** Return selected datasource IDs. */
+  /**
+   * Selected datasource IDs, excluding repository sources disabled by a lite
+   * backend and any ids not in the current datasource set.
+   */
   getSelectedIds(): string[] {
-    return Array.from(this.selectedIds());
+    return selectedDatasourceIds(
+      this.datasources(),
+      this.selection(),
+      this.isLiteBackend(),
+    );
   }
 
   resetAll(): void {
-    this.selectedIds.set(new Set());
+    this.selection.set(null);
   }
 }
