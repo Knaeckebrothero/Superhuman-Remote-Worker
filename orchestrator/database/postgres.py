@@ -646,17 +646,17 @@ class PostgresDB:
 
         if status:
             param_count += 1
-            conditions.append(f"status = ${param_count}")
+            conditions.append(f"j.status = ${param_count}")
             values.append(status)
 
         if user_id:
             param_count += 1
-            conditions.append(f"user_id = ${param_count}")
+            conditions.append(f"j.user_id = ${param_count}")
             values.append(UUID(user_id))
 
         if scope_project_id:
             param_count += 1
-            conditions.append(f"project_id = ${param_count}")
+            conditions.append(f"j.project_id = ${param_count}")
             values.append(UUID(scope_project_id))
 
         where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
@@ -666,15 +666,17 @@ class PostgresDB:
         async with self.acquire() as conn:
             rows = await conn.fetch(
                 f"""
-                SELECT id, description, status,
-                       config_name, assigned_agent_id, user_id,
-                       project_id, parent_job_id, priority,
-                       repo_name, branch_name, merge_status,
-                       diff_status, exported_at, created_at,
-                       context->'snapshot'->>'status' AS snapshot_status
-                FROM jobs
+                SELECT j.id, j.description, j.status,
+                       j.config_name, j.assigned_agent_id, j.user_id,
+                       j.project_id, j.parent_job_id, j.priority,
+                       j.repo_name, j.branch_name, j.merge_status,
+                       j.diff_status, j.exported_at, j.created_at,
+                       j.context->'snapshot'->>'status' AS snapshot_status,
+                       (p.main_cloud_folder_handle IS NOT NULL) AS project_has_cloud_folder
+                FROM jobs j
+                LEFT JOIN projects p ON p.id = j.project_id
                 {where_clause}
-                ORDER BY created_at DESC
+                ORDER BY j.created_at DESC
                 LIMIT ${param_count}
                 """,
                 *values,
@@ -715,7 +717,7 @@ class PostgresDB:
 
         if status:
             param_count += 1
-            conditions.append(f"status = ${param_count}")
+            conditions.append(f"j.status = ${param_count}")
             values.append(status)
 
         param_count += 1
@@ -723,14 +725,14 @@ class PostgresDB:
         param_count += 1
         projects_idx = param_count
         conditions.append(
-            f"(user_id = ${user_idx} OR project_id = ANY(${projects_idx}::uuid[]))"
+            f"(j.user_id = ${user_idx} OR j.project_id = ANY(${projects_idx}::uuid[]))"
         )
         values.append(UUID(owner_user_id))
         values.append([UUID(p) for p in visible_project_ids])
 
         if scope_project_id:
             param_count += 1
-            conditions.append(f"project_id = ${param_count}")
+            conditions.append(f"j.project_id = ${param_count}")
             values.append(UUID(scope_project_id))
 
         where_clause = f"WHERE {' AND '.join(conditions)}"
@@ -740,15 +742,17 @@ class PostgresDB:
         async with self.acquire() as conn:
             rows = await conn.fetch(
                 f"""
-                SELECT id, description, status,
-                       config_name, assigned_agent_id, user_id,
-                       project_id, parent_job_id, priority,
-                       repo_name, branch_name, merge_status,
-                       diff_status, exported_at, created_at,
-                       context->'snapshot'->>'status' AS snapshot_status
-                FROM jobs
+                SELECT j.id, j.description, j.status,
+                       j.config_name, j.assigned_agent_id, j.user_id,
+                       j.project_id, j.parent_job_id, j.priority,
+                       j.repo_name, j.branch_name, j.merge_status,
+                       j.diff_status, j.exported_at, j.created_at,
+                       j.context->'snapshot'->>'status' AS snapshot_status,
+                       (p.main_cloud_folder_handle IS NOT NULL) AS project_has_cloud_folder
+                FROM jobs j
+                LEFT JOIN projects p ON p.id = j.project_id
                 {where_clause}
-                ORDER BY created_at DESC
+                ORDER BY j.created_at DESC
                 LIMIT ${param_count}
                 """,
                 *values,
@@ -773,18 +777,20 @@ class PostgresDB:
         async with self.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                SELECT id, status,
-                       config_name, config_override, resolved_config,
-                       assigned_agent_id, user_id,
-                       project_id, parent_job_id, priority,
-                       branch_name, repo_name, merge_status, repo_merge_statuses,
-                       freeze_data,
-                       cloud_diff_baseline_commit, diff_status,
-                       exported_folder_handle, exported_at,
-                       creation_order, worktree_path, delegation_context,
-                       created_at, updated_at, description, context
-                FROM jobs
-                WHERE id = $1
+                SELECT j.id, j.status,
+                       j.config_name, j.config_override, j.resolved_config,
+                       j.assigned_agent_id, j.user_id,
+                       j.project_id, j.parent_job_id, j.priority,
+                       j.branch_name, j.repo_name, j.merge_status, j.repo_merge_statuses,
+                       j.freeze_data,
+                       j.cloud_diff_baseline_commit, j.diff_status,
+                       j.exported_folder_handle, j.exported_at,
+                       j.creation_order, j.worktree_path, j.delegation_context,
+                       j.created_at, j.updated_at, j.description, j.context,
+                       (p.main_cloud_folder_handle IS NOT NULL) AS project_has_cloud_folder
+                FROM jobs j
+                LEFT JOIN projects p ON p.id = j.project_id
+                WHERE j.id = $1
                 """,
                 uuid_val,
             )

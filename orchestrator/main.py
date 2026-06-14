@@ -4505,7 +4505,9 @@ async def list_jobs(
             for job in jobs:
                 job["audit_count"] = None
 
-        return [_redact_job_config_override(job) for job in jobs]
+        return [
+            _with_cloud_review_mode(_redact_job_config_override(job)) for job in jobs
+        ]
     except HTTPException:
         raise
     except Exception as e:
@@ -4533,6 +4535,25 @@ def _redact_job_config_override(job: dict[str, Any]) -> dict[str, Any]:
     job = dict(job)
     cleaned = redact_config_override(co)
     job["config_override"] = json.dumps(cleaned) if was_str else cleaned
+    return job
+
+
+def _with_cloud_review_mode(job: dict[str, Any]) -> dict[str, Any]:
+    """Attach the computed ``cloud_review_mode`` and drop the raw join column.
+
+    Routing signal for the cockpit's job-review UI: a job whose project has a
+    main-cloud folder goes through the Mode A diff-review flow (``'diff'``);
+    everything else — loose jobs and projects without a cloud folder, including
+    the auto-assigned default project — gets the Mode B "Open cloud folder"
+    affordance (``'open_folder'``). Mirrors the seed-time gate in
+    ``services/job_cloud_baseline.py``. ``project_has_cloud_folder`` is computed
+    by the ``LEFT JOIN projects`` in the postgres read queries; we pop it so the
+    raw column never leaves over REST.
+    """
+    job = dict(job)
+    job["cloud_review_mode"] = (
+        "diff" if job.pop("project_has_cloud_folder", False) else "open_folder"
+    )
     return job
 
 
@@ -4565,7 +4586,7 @@ async def get_job(request: Request, job_id: str) -> dict[str, Any]:
             job["audit_count"] = await mongodb.get_audit_count(job_id)
         else:
             job["audit_count"] = None
-        return _redact_job_config_override(job)
+        return _with_cloud_review_mode(_redact_job_config_override(job))
     except HTTPException:
         raise
     except Exception as e:
@@ -9651,52 +9672,56 @@ async def reject_job_diff(request: Request, job_id: str) -> dict[str, Any]:
 
 @app.post("/api/jobs/{job_id}/export-to-shared-folder")
 async def export_job_to_shared_folder(request: Request, job_id: str) -> dict[str, Any]:
-    """Mode B of the job cloud workflow — export a completed loose job to
-    a freshly-allocated shared cloud folder.
+    """Mode B of the job cloud workflow — copy a job's deliverables into a
+    shared cloud folder ("Open cloud folder") and return its browser URL.
 
-    Only valid for completed jobs that are NOT attached to a project
-    (project-attached jobs go through the Mode A diff-review flow). Copies
-    the ``output/`` directory from the job's Gitea repo into a new
-    session-style cloud folder that is shared with the calling user.
-    Stamps ``exported_folder_handle`` + ``exported_at`` on the job;
-    re-export is refused while the handle is set (user must delete the
-    cloud folder to retry).
+    Valid for ``completed`` or ``pending_review`` jobs whose project has **no**
+    main-cloud folder (loose jobs and default-project / no-cloud-folder jobs);
+    jobs whose project *does* have a cloud folder go through the Mode A
+    diff-review flow instead. Copies the agent's declared deliverables (from
+    ``freeze_data.deliverables``, preserving their workspace-relative paths;
+    falls back to ``output/`` for jobs without a deliverables list) into a
+    per-job session-style cloud folder shared with the calling user.
+
+    Re-syncable: the folder id is derived deterministically from the job id, so
+    a repeat call overwrites the same folder and re-stamps ``exported_at`` as
+    "last synced at" (e.g. after resume-with-feedback). v1 overwrites in place
+    and does not prune files removed between syncs.
 
     See docs/done/job_cloud_export.md §3.2.
     """
     user, job = await require_job_access(request, postgres_db, job_id)
 
-    # Status gate — completed only. Failed/cancelled/in-flight jobs can't
-    # export because there's no stable output.
-    if job.get("status") != "completed":
+    # Status gate — completed or in-review. In-review (pending_review) export
+    # lets the user preview the deliverables in the cloud before approving;
+    # failed/cancelled/in-flight jobs have no stable output to copy.
+    if job.get("status") not in ("completed", "pending_review"):
         raise HTTPException(
             status_code=409,
             detail=(
                 f"Job is in status '{job.get('status')}'; "
-                "only completed jobs can be exported."
+                "only completed or in-review jobs can be exported."
             ),
         )
 
-    # Routing gate — project-attached jobs use the diff flow, not Mode B.
-    if job.get("project_id"):
+    # Routing gate — only jobs whose project has a main-cloud folder use the
+    # Mode A diff flow. Loose jobs AND default-project / no-cloud-folder jobs
+    # fall through to Mode B here (mirrors the seed gate in
+    # services/job_cloud_baseline.py). ``project_has_cloud_folder`` is computed
+    # by the projects LEFT JOIN in postgres.get_job.
+    if job.get("project_has_cloud_folder"):
         raise HTTPException(
             status_code=409,
             detail=(
-                "Job is attached to a project — use the diff-review "
+                "Job's project has a cloud folder — use the diff-review "
                 "(accept/reject) flow instead of shared-folder export."
             ),
         )
 
-    # Idempotency gate — refuse if we already wrote a handle. The user can
-    # delete the cloud folder if they want to redo this (v1 simplification).
-    if job.get("exported_folder_handle"):
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "Job has already been exported. Delete the existing shared "
-                "folder in your cloud to re-export."
-            ),
-        )
+    # No idempotency refusal: this endpoint is re-syncable. The folder id is
+    # derived deterministically from the job id below, so a repeat call
+    # overwrites the same folder (e.g. after resume-with-feedback) and
+    # re-stamps ``exported_at`` as "last synced at".
 
     # Fresh loose-job export folder — no project/thread row to pin to yet,
     # so resolve via the owner seam (returns the active backend today;
@@ -9732,12 +9757,53 @@ async def export_job_to_shared_folder(request: Request, job_id: str) -> dict[str
             detail=f"Cloud folder provisioning failed: {e}",
         ) from e
 
-    # 2) Copy ``output/`` recursively from Gitea → cloud. Bytes-faithful via
-    #    get_file_bytes so binary outputs (PDFs, images) survive the round
-    #    trip. Per-file failures abort the export and surface 502; we do
-    #    NOT stamp exported_folder_handle so the user can retry (the
-    #    partially-filled folder is harmless and idempotent under retry).
+    # 2) Copy the job's deliverables from Gitea → cloud, bytes-faithful via
+    #    get_file_bytes so binary outputs (PDFs, images) survive the round trip
+    #    and the declared workspace-relative paths are preserved. The agent's
+    #    declared deliverables (validated non-empty at freeze time) are the
+    #    curated result set — for code jobs they live under ``repo/`` and the
+    #    workspace root, not ``output/``. Jobs without a deliverables list
+    #    (older jobs) fall back to copying ``output/`` wholesale. Per-file read
+    #    failures in the deliverables path are logged and skipped (fail-soft) so
+    #    one missing artifact doesn't sink the whole export; ``files_copied``
+    #    reflects what actually landed.
     files_copied = 0
+
+    # Declared deliverables from freeze_data (JSONB may arrive as a str).
+    freeze_data = job.get("freeze_data")
+    if isinstance(freeze_data, str):
+        try:
+            freeze_data = json.loads(freeze_data)
+        except (json.JSONDecodeError, TypeError):
+            freeze_data = None
+    deliverables: list[str] = []
+    if isinstance(freeze_data, dict) and isinstance(
+        freeze_data.get("deliverables"), list
+    ):
+        deliverables = [
+            str(p).strip() for p in freeze_data["deliverables"] if str(p).strip()
+        ]
+
+    async def _copy_deliverable(path: str) -> None:
+        nonlocal files_copied
+        # Declared paths are workspace-root-relative, matching the job's Gitea
+        # repo layout. Reject path escapes defensively.
+        rel = path.lstrip("/")
+        if not rel or ".." in rel.split("/"):
+            logger.warning("Mode B export: skipping unsafe deliverable path %r", path)
+            return
+        file_bytes = await gitea_client.get_file_bytes(repo_name, rel, ref=branch)
+        if file_bytes is None:
+            # Declared but absent from the repo (e.g. a directory entry or a
+            # workspace-only artifact). Skip fail-soft rather than 502.
+            logger.warning(
+                "Mode B export: deliverable %r not found in repo %s; skipping",
+                rel,
+                repo_name,
+            )
+            return
+        await backend.put_session_file(folder_handle, path=rel, content=file_bytes)
+        files_copied += 1
 
     async def _copy_tree(src_dir: str) -> None:
         nonlocal files_copied
@@ -9768,7 +9834,12 @@ async def export_job_to_shared_folder(request: Request, job_id: str) -> dict[str
             files_copied += 1
 
     try:
-        await _copy_tree("output")
+        if deliverables:
+            for deliverable_path in deliverables:
+                await _copy_deliverable(deliverable_path)
+        else:
+            # No declared deliverables (older jobs) — copy output/ wholesale.
+            await _copy_tree("output")
     except HTTPException:
         raise
     except CloudBackendError as e:
@@ -19561,6 +19632,11 @@ async def list_project_jobs(
 
         jobs = [dict(r) for r in rows]
 
+        # cloud_review_mode: all rows share one project, so resolve its
+        # cloud-folder state once (the job_summary view has no projects JOIN).
+        project = await postgres_db.get_project(project_id)
+        has_cloud_folder = bool(project and project.get("main_cloud_folder_handle"))
+
         # Enrich with audit counts
         if mongodb.is_available:
             for job in jobs:
@@ -19569,7 +19645,12 @@ async def list_project_jobs(
             for job in jobs:
                 job["audit_count"] = None
 
-        return [_redact_job_config_override(job) for job in jobs]
+        result = []
+        for job in jobs:
+            job = _redact_job_config_override(job)
+            job["project_has_cloud_folder"] = has_cloud_folder
+            result.append(_with_cloud_review_mode(job))
+        return result
     except HTTPException:
         raise
     except Exception as e:

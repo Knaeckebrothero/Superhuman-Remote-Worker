@@ -179,6 +179,27 @@ interface FrozenJobData {
             </div>
           }
 
+          <!-- Cloud folder preview (Mode B "open folder") -->
+          @if (job()!.cloud_review_mode === 'open_folder') {
+            <div class="section cloud-folder">
+              <app-button
+                variant="info"
+                size="sm"
+                [loading]="isExportingToCloud()"
+                (clicked)="openCloudFolder()"
+              >
+                @if (isExportingToCloud()) {
+                  {{ 'jobReview.actions.openingCloudFolder' | transloco }}
+                } @else {
+                  {{ 'jobReview.links.openCloudFolder' | transloco }}
+                }
+              </app-button>
+              <div class="cloud-folder-hint">
+                {{ 'jobReview.cloudFolderDisclaimer' | transloco }}
+              </div>
+            </div>
+          }
+
           <!-- Actions -->
           <div class="actions-section">
             @if (frozenData()?.freeze_type === 'vm_upgrade_required') {
@@ -458,6 +479,18 @@ interface FrozenJobData {
         flex-wrap: wrap;
       }
 
+      .cloud-folder {
+        gap: 6px;
+        align-items: flex-start;
+      }
+
+      .cloud-folder-hint {
+        color: var(--text-secondary, var(--text-secondary));
+        font-size: 0.8em;
+        font-style: italic;
+        line-height: 1.4;
+      }
+
       /* Actions */
       .actions-section {
         display: flex;
@@ -574,6 +607,7 @@ export class JobReviewComponent {
   readonly resultIsError = signal(false);
   readonly confirmingApprove = signal(false);
   readonly ideLoading = signal(false);
+  readonly isExportingToCloud = signal(false);
   private confirmTimeout: ReturnType<typeof setTimeout> | null = null;
   private idePollingInterval: ReturnType<typeof setInterval> | null = null;
 
@@ -816,6 +850,36 @@ export class JobReviewComponent {
         this.loadJob();
       } else {
         this.resultMessage.set(this.transloco.translate('jobReview.messages.resumeFailed'));
+        this.resultIsError.set(true);
+      }
+    });
+  }
+
+  openCloudFolder(): void {
+    const jobId = this.currentJobId();
+    if (!jobId) return;
+
+    this.isExportingToCloud.set(true);
+    this.resultMessage.set(null);
+
+    // Reuses the Mode B export endpoint, which copies the job's declared
+    // deliverables into a shared cloud folder and returns its browser URL. The
+    // endpoint is re-syncable, so re-clicking after a resume-with-feedback
+    // refreshes the same folder. exportJobToSharedFolder toasts success/error.
+    this.api.exportJobToSharedFolder(jobId).subscribe((result) => {
+      this.isExportingToCloud.set(false);
+      if (result) {
+        const url = result.folder?.browser_url;
+        if (url) {
+          window.open(url, '_blank', 'noopener');
+        }
+        this.resultIsError.set(false);
+        // Refresh so exported_at ("last synced at") reflects the sync.
+        this.loadJob();
+      } else {
+        this.resultMessage.set(
+          this.transloco.translate('jobReview.messages.openCloudFolderFailed'),
+        );
         this.resultIsError.set(true);
       }
     });

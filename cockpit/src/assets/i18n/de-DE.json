@@ -230,7 +230,7 @@
       "confirmDelete": "Bestätigen?",
       "promote": "Heraufstufen",
       "createProject": "Projekt erstellen",
-      "exportToCloud": "In Cloud exportieren",
+      "exportToCloud": "Cloud-Ordner öffnen",
       "exported": "Exportiert"
     },
     "tooltip": {
@@ -250,7 +250,7 @@
       "confirmDelete": "Erneut klicken, um Löschung zu bestätigen",
       "deleteJob": "Auftrag löschen",
       "promoteJob": "Zu Projekt heraufstufen",
-      "exportToCloud": "Output-Ordner dieses Auftrags in einen geteilten Cloud-Ordner kopieren",
+      "exportToCloud": "Ergebnisse dieses Auftrags in einen geteilten Cloud-Ordner kopieren und öffnen",
       "alreadyExported": "Bereits exportiert. Cloud-Ordner löschen, um erneut zu exportieren.",
       "snapshotStats": "S3-Snapshot-Speicher",
       "snapshotAvailable": "Umgebungs-Snapshot verfügbar",
@@ -1521,8 +1521,10 @@
     "links": {
       "browseWorkspace": "Arbeitsbereich in Gitea öffnen",
       "startingIde": "IDE wird gestartet …",
-      "openIde": "Im Web-IDE öffnen"
+      "openIde": "Im Web-IDE öffnen",
+      "openCloudFolder": "Cloud-Ordner öffnen"
     },
+    "cloudFolderDisclaimer": "Vorschau – die Ergebnisse werden in einen geteilten Cloud-Ordner kopiert, den du durchsuchen kannst. Nutze das Feedback-Feld unten, um Änderungen anzufordern; direkte Änderungen an diesem Ordner erreichen den Agenten nicht und werden überschrieben, wenn der Job fortgesetzt wird.",
     "vmUpgrade": {
       "title": "Sudo erforderlich",
       "reason": "Der Agent hat einen privilegierten Befehl in einem gehärteten Container versucht:",
@@ -1541,7 +1543,8 @@
       "orContinueFeedback": "oder mit Feedback fortsetzen",
       "feedbackPlaceholder": "Feedback oder zusätzliche Anweisungen für den Agenten eingeben …",
       "resuming": "Wird fortgesetzt …",
-      "continueWithFeedback": "Mit Feedback fortsetzen"
+      "continueWithFeedback": "Mit Feedback fortsetzen",
+      "openingCloudFolder": "Wird geöffnet …"
     },
     "messages": {
       "approved": "Job erfolgreich genehmigt.",
@@ -1551,7 +1554,8 @@
       "continuing": "Job wird fortgesetzt. Der Agent nimmt die Ausführung wieder auf.",
       "continueFailed": "Job konnte nicht fortgesetzt werden. Details in der Konsole.",
       "resumedWithFeedback": "Job mit Feedback fortgesetzt. Der Agent arbeitet weiter.",
-      "resumeFailed": "Job konnte nicht fortgesetzt werden. Details in der Konsole."
+      "resumeFailed": "Job konnte nicht fortgesetzt werden. Details in der Konsole.",
+      "openCloudFolderFailed": "Cloud-Ordner konnte nicht geöffnet werden. Details in der Konsole."
     }
   },
   "jobDiffReview": {

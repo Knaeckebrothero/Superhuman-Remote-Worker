@@ -1003,6 +1003,13 @@ export interface Job {
   /** Mode B export marker (set when "Export to shared folder" succeeds). */
   exported_folder_handle?: string | null;
   exported_at?: string | null;
+  /**
+   * Backend-computed cloud-review routing (job_cloud_export.md). `'diff'` when
+   * the job's project has a main-cloud folder (Mode A diff-review);
+   * `'open_folder'` otherwise — loose jobs and default-project / no-cloud-folder
+   * jobs get the Mode B "Open cloud folder" button.
+   */
+  cloud_review_mode?: 'diff' | 'open_folder' | null;
 }
 
 /**
