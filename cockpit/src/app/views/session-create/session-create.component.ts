@@ -330,6 +330,8 @@ export class SessionCreateComponent implements OnInit {
         const defaultProject = projects.find(p => p.is_default);
         if (defaultProject) {
           this.selectedProjectIds.set(new Set([defaultProject.id]));
+          // Refresh eligible datasources now that a project is selected.
+          this.loadDatasourcesList();
         }
       },
     });
@@ -345,7 +347,13 @@ export class SessionCreateComponent implements OnInit {
 
   private loadDatasourcesList(): void {
     this.loadingDatasources.set(true);
-    this.http.get<any[]>(`${environment.apiUrl}/datasources?scope=global`).subscribe({
+    // Eligible = owner + global + linked to any selected project. The picker
+    // pre-selects these; explicit-only resolution attaches what stays checked.
+    const qs = Array.from(this.selectedProjectIds())
+      .map(id => `project_id=${encodeURIComponent(id)}`)
+      .join('&');
+    const url = `${environment.apiUrl}/datasources/eligible${qs ? '?' + qs : ''}`;
+    this.http.get<any[]>(url).subscribe({
       next: (ds) => { this.datasources.set(ds); this.loadingDatasources.set(false); },
       error: () => this.loadingDatasources.set(false),
     });
@@ -358,6 +366,8 @@ export class SessionCreateComponent implements OnInit {
       else next.add(id);
       return next;
     });
+    // Refresh eligible datasources for the new project selection.
+    this.loadDatasourcesList();
   }
 
   toggleExpert(expert: Expert): void {

@@ -97,6 +97,38 @@ No automatic knowledge base entries are created for datasources.
 
 ## Access Model
 
+> **Update 2026-06-14 — explicit-only attachment (supersedes "Resolution for job dispatch" below).**
+> The resolver previously auto-attached *every unlinked global datasource to every job*
+> (`resolve_datasources_for_job` returned project-linked **plus** all unlinked-global rows).
+> That force-attach made the lite workspace tiers (`virtual`/`none`) unusable whenever any
+> unlinked repository datasource existed, and pulled global datasources into unrelated users'
+> jobs. The picker layer this doc specced (the "Job datasource picker") was never gated into
+> resolution, so "eligible to pick" silently became "force-attached".
+>
+> Now **the picker is the source of truth and resolution is explicit-only**:
+> - `is_global` is purely a *visibility/eligibility* flag (who may pre-select a datasource),
+>   not an attachment rule. Nothing is force-attached.
+> - **Jobs** persist the explicit selection in the `job_datasources` junction (migration
+>   `0026`); `resolve_datasources_for_job` returns exactly those links (with a transitional
+>   fallback to the legacy `datasources.job_id` clones — that clone-to-job-scoped mechanism is
+>   retired). **Threads** persist it in `threads.metadata.datasource_ids`;
+>   `resolve_datasources_for_thread` returns exactly those.
+> - The create-job / create-session pickers pre-select the eligible set (owner + global +
+>   project-linked) via **`GET /api/datasources/eligible?project_id=…`** (repeatable
+>   `project_id`) and the user can opt out. Repository datasources are greyed out + excluded
+>   under a lite backend.
+> - Parented subjobs (worker subjobs, scholar/critic) **inherit** the parent's selection when
+>   none is passed (an explicit `[]` opts out); inherited repository sources are dropped for
+>   lite children.
+> - Non-UI callers (MCP `create_job`, automations) attach **only** what they pass in
+>   `datasource_ids` — project-linked datasources no longer auto-attach for them. (Per-automation
+>   datasource selection is a follow-up.)
+>
+> Implementation: `orchestrator/database/postgres.py` (`resolve_datasources_for_job`,
+> `resolve_datasources_for_thread`, `list_eligible_datasources`, `link_datasource_to_job`) and
+> `orchestrator/main.py` (`create_job`, `GET /api/datasources/eligible`). The table below still
+> describes *eligibility* (who may pre-select); only the auto-attach resolution is superseded.
+
 Datasources are **private by default**. Visibility and usage follow these rules:
 
 | Action | Who can do it |

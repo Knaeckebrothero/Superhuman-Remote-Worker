@@ -1153,6 +1153,8 @@ export class JobCreateComponent implements OnInit {
 
   onProjectIdChange(value: string | null): void {
     this.selectedProjectId.set(value && value !== '' ? value : null);
+    // Refresh eligible datasources for the newly selected project.
+    this.loadDatasources();
   }
 
   onCloudStorageChange(value: string | null): void {
@@ -1256,7 +1258,11 @@ export class JobCreateComponent implements OnInit {
 
   private loadDatasources(): void {
     this.isLoadingDatasources.set(true);
-    this.api.getDatasources('global').subscribe({
+    // Eligible = owner + global + linked to the selected project. The picker
+    // pre-selects these; explicit-only resolution attaches exactly what stays
+    // checked. Re-fetched whenever the project changes.
+    const pid = this.selectedProjectId();
+    this.api.getEligibleDatasources(pid ? [pid] : []).subscribe({
       next: (datasources) => { this.availableDatasources.set(datasources); this.isLoadingDatasources.set(false); },
       error: () => { this.isLoadingDatasources.set(false); },
     });
@@ -1272,6 +1278,9 @@ export class JobCreateComponent implements OnInit {
         const defaultProject = projects.find((p) => p.is_default);
         this.selectedProjectId.set(defaultProject?.id ?? projects[0]?.id ?? null);
       }
+      // Now that a project is selected, refresh eligible datasources so
+      // project-linked sources are included and pre-selected.
+      this.loadDatasources();
     });
   }
 

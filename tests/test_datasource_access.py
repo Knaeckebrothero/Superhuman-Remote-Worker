@@ -421,6 +421,63 @@ class TestListProjectDatasourcesEndpoint:
 
 
 # =============================================================================
+# list_eligible_datasources — picker eligibility (owned + global + project)
+# =============================================================================
+
+
+class TestEligibleDatasourcesEndpoint:
+    @pytest.mark.asyncio
+    async def test_member_gets_redacted_union(
+        self, user_a, project_a, datasource_a, datasource_global, fake_db, fake_request
+    ):
+        from main import list_eligible_datasources
+
+        fake_db.list_eligible_datasources = AsyncMock(
+            return_value=[datasource_a, datasource_global]
+        )
+        with _patch_caller_and_db(user_a, fake_db):
+            rows = await list_eligible_datasources(
+                fake_request, project_id=[str(project_a["id"])]
+            )
+        assert all("credentials" not in row for row in rows)
+        assert {r["id"] for r in rows} == {datasource_a["id"], datasource_global["id"]}
+        # Project ids + admin flag are forwarded to the DB layer.
+        call = fake_db.list_eligible_datasources.call_args
+        assert call.args[1] == [str(project_a["id"])]
+        assert call.kwargs.get("is_admin") is False
+
+    @pytest.mark.asyncio
+    async def test_non_member_project_403(
+        self, user_b, project_a, fake_db, fake_request
+    ):
+        from main import list_eligible_datasources
+
+        fake_db.list_eligible_datasources = AsyncMock()
+        with _patch_caller_and_db(user_b, fake_db):
+            with pytest.raises(HTTPException) as exc:
+                await list_eligible_datasources(
+                    fake_request, project_id=[str(project_a["id"])]
+                )
+        assert exc.value.status_code == 403
+        fake_db.list_eligible_datasources.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_no_project_owned_and_global(
+        self, user_a, datasource_a, datasource_global, fake_db, fake_request
+    ):
+        from main import list_eligible_datasources
+
+        fake_db.list_eligible_datasources = AsyncMock(
+            return_value=[datasource_a, datasource_global]
+        )
+        with _patch_caller_and_db(user_a, fake_db):
+            rows = await list_eligible_datasources(fake_request, project_id=None)
+        assert len(rows) == 2
+        fake_db.list_eligible_datasources.assert_awaited_once()
+        assert fake_db.list_eligible_datasources.call_args.args[1] == []
+
+
+# =============================================================================
 # link / patch / unlink — project-owner gate
 # =============================================================================
 
