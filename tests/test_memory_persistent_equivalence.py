@@ -7,7 +7,7 @@ containment, same gating. The legacy path stays live until the Phase-1
 cutover; if that block changes, this file must change with it.
 
 Out of scope here (call-site mechanics, position-agnostic payload):
-where the pairs get *inserted* (persistent: after the SystemMessage;
+where the pairs get *inserted* (persistent: after the first HumanMessage;
 worker: appended) and the per-inner-iteration re-creation of the pairs —
 within one turn the pair content is identical, only the synthetic id
 suffix differs, and nothing consumes those ids beyond prefix checks.
