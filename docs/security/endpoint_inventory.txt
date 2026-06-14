@@ -82,6 +82,7 @@ GET    /api/codex/models                                                        
 GET    /api/codex/status                                                                admin:_require_admin
 GET    /api/datasources                                                                 gated:user_can_access_datasource
 POST   /api/datasources                                                                 gated:require_approved_user
+GET    /api/datasources/eligible                                                        gated:require_project_member
 POST   /api/datasources/ssh-keys/generate                                               gated:require_approved_user
 DELETE /api/datasources/{datasource_id}                                                 gated:require_datasource_owner
 GET    /api/datasources/{datasource_id}                                                 gated:require_datasource_access
