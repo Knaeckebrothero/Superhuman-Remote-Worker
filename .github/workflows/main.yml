@@ -248,6 +248,25 @@ jobs:
           print('npm audit passed (ignored advisories: ' + ', '.join(IGNORE_ADVISORIES) + ')')
           "
 
+      # --- Third-party license policy gate (blocking) -----------------------
+      # Fails the release if a bundled dependency carries a denied license
+      # (GPL/AGPL/SSPL/BSL/...). Server images the chart pulls (Neo4j/Postgres/
+      # Mongo) are out of scope — we reference, not convey them — but their
+      # bundled *client drivers* (neo4j/psycopg/pymongo) ARE covered. Lives in
+      # this already-required job so it gates every build without per-job edits.
+      # The committed THIRD_PARTY_LICENSES.md is regenerated upstream on develop.
+      # Source of truth: scripts/check_licenses.py.
+      - name: Install license tooling + full bundled dep set
+        run: >-
+          uv pip install --system pip-licenses
+          -r orchestrator/requirements.txt
+          -r orchestrator/mcp/requirements.txt
+      - name: Install cockpit deps (for npm license scan)
+        working-directory: cockpit
+        run: npm ci
+      - name: Check third-party licenses
+        run: python scripts/check_licenses.py --check
+
   # ---------------------------------------------------------------------------
   # Python tests — always run on main (not change-based)
   # ---------------------------------------------------------------------------
