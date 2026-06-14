@@ -234,6 +234,19 @@ def is_overflow_error(exc: BaseException) -> bool:
     return False
 
 
+def _describe_exc(exc: Optional[BaseException]) -> str:
+    """Readable exception text — names the type when ``str()`` is empty.
+
+    ``asyncio.TimeoutError`` (and other arg-less exceptions) stringify to "",
+    which logged as the infamous ``failed ()`` during the 5dbb5770 incident,
+    hiding that the aux model was timing out on base64-laden folds.
+    """
+    if exc is None:
+        return "unknown error"
+    text = str(exc).strip()
+    return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
+
+
 class SummarizationEngine:
     """Plan-then-fold summarization sized for the auxiliary model's window."""
 
@@ -482,7 +495,8 @@ class SummarizationEngine:
                 backoff = BACKOFF_SECONDS[min(attempt - 1, len(BACKOFF_SECONDS) - 1)]
                 logger.warning(
                     f"Summarization pass {chunk.index}/{plan.n_passes} attempt "
-                    f"{attempt}/{MAX_ATTEMPTS} failed ({e}); retrying in {backoff}s"
+                    f"{attempt}/{MAX_ATTEMPTS} failed ({_describe_exc(e)}); "
+                    f"retrying in {backoff}s"
                 )
                 await self._emit_progress(
                     plan, chunk, attempt=attempt + 1, out_tokens=None
@@ -491,7 +505,7 @@ class SummarizationEngine:
 
         logger.error(
             f"Summarization pass {chunk.index}/{plan.n_passes} failed after "
-            f"{MAX_ATTEMPTS} attempts: {last_error}"
+            f"{MAX_ATTEMPTS} attempts: {_describe_exc(last_error)}"
         )
         raise SummarizationFailed(
             "aux_unavailable",

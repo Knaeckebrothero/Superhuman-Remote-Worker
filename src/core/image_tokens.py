@@ -75,3 +75,69 @@ def estimate_image_tokens(n_images: int) -> int:
     Superseded per family by the dimension-aware estimator in S4.
     """
     return max(0, n_images) * DEFAULT_IMAGE_TOKENS
+
+
+def has_image_content(content: Any) -> bool:
+    """True if message content is a multimodal list with >=1 image block.
+
+    Used by compaction-time elision (S3) to find image messages it can shed; a
+    plain-string or text-only-list message returns False, so a normal user
+    turn is never mistaken for a sheddable image re-delivery.
+    """
+    if not isinstance(content, list):
+        return False
+    return any(_is_image_block(item) for item in content)
+
+
+def _image_block_mime(item: dict) -> str:
+    """Best-effort MIME label for an image block ('image' if unknown).
+
+    Covers the three transported shapes: Anthropic ``source.media_type``,
+    OpenAI Chat Completions ``image_url.url`` data URL, and the Responses-API
+    ``input_image`` string data URL. Never returns the base64 payload.
+    """
+    source = item.get("source")
+    if isinstance(source, dict):
+        media_type = source.get("media_type")
+        if isinstance(media_type, str) and media_type:
+            return media_type
+    url = item.get("image_url")
+    if isinstance(url, dict):
+        url = url.get("url")
+    if isinstance(url, str) and url.startswith("data:"):
+        # data:image/png;base64,AAAA -> image/png
+        return url[5:].split(";", 1)[0].split(",", 1)[0] or "image"
+    return "image"
+
+
+def content_to_summary_text(content: Any) -> str:
+    """Flatten message content to a string safe for a text summarizer (S3).
+
+    String content is returned unchanged (callers apply their own character
+    truncation). Multimodal list content keeps its text parts and replaces each
+    image block with a compact ``[image: <mime>, ~<n> tok]`` marker, so a base64
+    data URL is never stringified into the summarizer prompt -- the leak that
+    drove 60 doomed 96k-token folds and wedged session 5dbb5770.
+    """
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return str(content)
+
+    parts: list[str] = []
+    for item in content:
+        if isinstance(item, str):
+            parts.append(item)
+        elif _is_image_block(item):
+            parts.append(
+                f"[image: {_image_block_mime(item)}, ~{DEFAULT_IMAGE_TOKENS} tok]"
+            )
+        elif isinstance(item, dict):
+            text = item.get("text")
+            if isinstance(text, str):
+                parts.append(text)
+            # Other non-text, non-image dicts contribute nothing -- avoids
+            # stringifying arbitrary base64-bearing payloads.
+        else:
+            parts.append(str(item))
+    return "\n".join(parts)
