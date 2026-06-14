@@ -281,6 +281,76 @@ jobs:
           print('npm audit passed (ignored advisories: ' + ', '.join(IGNORE_ADVISORIES) + ')')
           "
 
+      # --- Third-party license policy gate (blocking) -----------------------
+      # Fails the build if a bundled dependency carries a denied license
+      # (GPL/AGPL/SSPL/BSL/...). Server images the chart pulls (Neo4j/Postgres/
+      # Mongo) are out of scope — we reference, not convey them — but their
+      # bundled *client drivers* (neo4j/psycopg/pymongo) ARE covered. Lives in
+      # this already-required job so it gates every build without per-job edits.
+      # Source of truth: scripts/check_licenses.py.
+      - name: Install license tooling + full bundled dep set
+        run: >-
+          uv pip install --system pip-licenses
+          -r orchestrator/requirements.txt
+          -r orchestrator/mcp/requirements.txt
+      - name: Install cockpit deps (for npm license scan)
+        working-directory: cockpit
+        run: npm ci
+      - name: Check third-party licenses
+        run: python scripts/check_licenses.py --check
+
+  # ---------------------------------------------------------------------------
+  # Regenerate THIRD_PARTY_LICENSES.md and auto-commit on develop (mirrors the
+  # lint job's ruff auto-format-and-commit). Non-blocking — the dependency-audit
+  # job is the blocking gate. Push-only; PRs are covered by that gate.
+  # ---------------------------------------------------------------------------
+  license-inventory:
+    needs: [lint]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: develop
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: cockpit/package-lock.json
+      - name: Install dependencies + license tooling
+        run: >-
+          uv pip install --system pip-licenses
+          -r requirements.txt
+          -r orchestrator/requirements.txt
+          -r orchestrator/mcp/requirements.txt
+      - name: Install cockpit deps
+        working-directory: cockpit
+        run: npm ci
+      - name: Regenerate THIRD_PARTY_LICENSES.md
+        # --write also runs the gate; never block the docs commit here (the
+        # dependency-audit job blocks the build), so swallow a nonzero exit.
+        run: python scripts/check_licenses.py --write || true
+      - name: Commit if changed
+        run: |
+          if git diff --quiet THIRD_PARTY_LICENSES.md; then
+            echo "THIRD_PARTY_LICENSES.md unchanged"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add THIRD_PARTY_LICENSES.md
+          git commit -m "docs: regenerate THIRD_PARTY_LICENSES.md [skip ci]"
+          git push
+
   # ---------------------------------------------------------------------------
   # Detect which components changed — build jobs only run when needed
   # ---------------------------------------------------------------------------
