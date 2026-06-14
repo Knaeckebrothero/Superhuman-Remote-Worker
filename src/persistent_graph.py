@@ -44,6 +44,92 @@ from .services.image_content import extract_image_tags, make_multimodal_user_mes
 logger = logging.getLogger(__name__)
 
 
+def _injection_anchor_index(messages: List[BaseMessage]) -> int:
+    """Index at which to insert transient context-injection pairs.
+
+    Returns the position immediately AFTER the first ``HumanMessage`` so the
+    synthetic ``AIMessage(tool_call)`` + ``ToolMessage`` pairs we inject for
+    memory/knowledge are always preceded by a real user turn.
+
+    Why this matters: Gemini's native API (the ``google`` provider, via
+    ``ChatGoogleGenerativeAI``) rejects a function-call turn that does not
+    immediately follow a user or function-response turn — it 400s with
+    "Please ensure that function call turn comes immediately after a user turn
+    or after a function response turn." The system message is lifted into a
+    separate ``system_instruction`` field, so injecting the pairs right after
+    it makes the injected ``functionCall`` the first entry of Gemini's
+    ``contents`` array and the very first turn of a session fails. The worker
+    graph avoids this because it always prepends a todos ``HumanMessage`` ahead
+    of the pairs (``src/graph.py``); interactive sessions have no todo list, so
+    we anchor on the first user turn here instead. Anchoring after the first
+    ``HumanMessage`` rather than the system message is harmless to
+    OpenAI/Anthropic, which tolerate either order.
+
+    Falls back to just after a leading ``SystemMessage`` (the legacy position)
+    when the list contains no user turn yet.
+    """
+    for i, m in enumerate(messages):
+        if isinstance(m, HumanMessage):
+            return i + 1
+    if messages and isinstance(messages[0], SystemMessage):
+        return 1
+    return 0
+
+
+def _inject_context_pairs(
+    prepared: List[BaseMessage],
+    manager_injection: List[BaseMessage],
+    memory_block: str,
+    knowledge_block: str,
+) -> int:
+    """Insert transient memory/knowledge context pairs into ``prepared``.
+
+    Mutates ``prepared`` in place and returns the number of messages inserted.
+    The pairs are anchored immediately after the first user turn (see
+    ``_injection_anchor_index``) so the history stays valid for providers that
+    enforce function-call turn ordering (Gemini). Memory and knowledge
+    injection failures are non-fatal — the turn proceeds without that context.
+
+    The same message objects may be reused across inner-loop iterations; pair
+    ids are only prefix-checked downstream.
+    """
+    injected_count = 0
+    base_inject_idx = _injection_anchor_index(prepared)
+
+    if manager_injection:
+        prepared[base_inject_idx:base_inject_idx] = manager_injection
+        injected_count += len(manager_injection)
+
+    if memory_block:
+        try:
+            from .core.memory_injection import create_memory_injection_messages
+
+            mem_ai, mem_tool = create_memory_injection_messages(memory_block)
+            # Front of the injection zone, before the manager pairs (legacy
+            # order preserved).
+            prepared.insert(base_inject_idx, mem_ai)
+            prepared.insert(base_inject_idx + 1, mem_tool)
+            injected_count += 2
+        except Exception as e:
+            logger.warning(f"Memory injection failed (non-fatal): {e}")
+
+    if knowledge_block:
+        try:
+            from .core.knowledge_injection import (
+                create_knowledge_injection_messages,
+            )
+
+            kb_ai, kb_tool = create_knowledge_injection_messages(knowledge_block)
+            # After all prior injections.
+            prepared.insert(base_inject_idx + injected_count, kb_ai)
+            prepared.insert(base_inject_idx + injected_count + 1, kb_tool)
+            injected_count += 2
+        except Exception as e:
+            logger.warning(f"Knowledge injection failed (non-fatal): {e}")
+
+    return injected_count
+
+
 def _sanitize_ai_response(response: AIMessage) -> AIMessage:
     """Normalize AI message for Responses API compatibility.
 
@@ -838,45 +924,18 @@ async def _execute_turn(
         # below never touch the durable list.
         prepared = list(bounded)
 
-        # MemoryManager seam: insert the assembled pairs at the legacy
-        # position (after the system message). The same message objects are
-        # inserted each inner-loop iteration — pair ids are only
-        # prefix-checked downstream (documented Phase-1 delta vs the legacy
-        # fresh-pair-per-iteration below).
-        injected_count = 0
-        base_inject_idx = (
-            1 if prepared and isinstance(prepared[0], SystemMessage) else 0
+        # Transient context injection (memory / knowledge / MemoryManager
+        # seam). Anchored immediately after the first user turn — never before
+        # it — so the synthetic tool-call pairs stay valid for providers that
+        # enforce function-call turn ordering (Gemini rejects a function-call
+        # turn not preceded by a user/function-response turn). The worker graph
+        # is shielded by its leading todos HumanMessage; interactive sessions
+        # have no todo list, so we anchor on the first user turn here. See
+        # _injection_anchor_index. The same message objects may be reused each
+        # inner-loop iteration; pair ids are only prefix-checked downstream.
+        _inject_context_pairs(
+            prepared, manager_injection, memory_block, knowledge_block
         )
-        if manager_injection:
-            prepared[base_inject_idx:base_inject_idx] = manager_injection
-            injected_count += len(manager_injection)
-
-        # Inject memory and knowledge as transient tool-call pairs
-        if memory_block:
-            try:
-                from .core.memory_injection import create_memory_injection_messages
-
-                mem_ai, mem_tool = create_memory_injection_messages(memory_block)
-                # Insert after the system message, before conversation (and
-                # before the manager pairs — legacy order preserved)
-                prepared.insert(base_inject_idx, mem_ai)
-                prepared.insert(base_inject_idx + 1, mem_tool)
-                injected_count += 2
-            except Exception as e:
-                logger.warning(f"Memory injection failed (non-fatal): {e}")
-
-        if knowledge_block:
-            try:
-                from .core.knowledge_injection import (
-                    create_knowledge_injection_messages,
-                )
-
-                kb_ai, kb_tool = create_knowledge_injection_messages(knowledge_block)
-                # Insert after all prior injections
-                prepared.insert(base_inject_idx + injected_count, kb_ai)
-                prepared.insert(base_inject_idx + injected_count + 1, kb_tool)
-            except Exception as e:
-                logger.warning(f"Knowledge injection failed (non-fatal): {e}")
 
         # Repair tool-call pairing before the LLM call. Compaction thrash, an
         # interrupted turn, or streamed parallel-tool corruption (langchain
