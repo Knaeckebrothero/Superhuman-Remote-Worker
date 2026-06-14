@@ -36,6 +36,7 @@ from .core.loader import (
     get_all_tool_names,
     resolve_config_path,
     resolve_model_settings,
+    supports_parallel_tool_calls,
 )
 from .core.loader import get_project_root
 from .core.phase_snapshot import PhaseSnapshotManager
@@ -1935,11 +1936,24 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
 
         # Configure parallel tool calls from config (defaults to False to prevent
         # overwhelming the agent loop with 20+ simultaneous tool calls).
-        # OpenAI o-series reasoning models don't support this parameter.
-        bind_kwargs = {}
-        model_name = (self.config.llm.model or "").lower()
-        if not model_name.startswith(("o1", "o3", "o4")):
-            bind_kwargs["parallel_tool_calls"] = self.config.llm.parallel_tool_calls
+        # parallel_tool_calls is an OpenAI Chat Completions param — suppressed
+        # for providers/models that reject it (Google GenAI's GenerateContentConfig,
+        # OpenAI o-series). Strategic and tactical phases can use different
+        # providers, so gate each phase independently.
+        strategic_cfg = self.config.llm.get_phase_config("strategic")
+        tactical_cfg = self.config.llm.get_phase_config("tactical")
+
+        strategic_bind_kwargs = {}
+        if supports_parallel_tool_calls(strategic_cfg.provider, strategic_cfg.model):
+            strategic_bind_kwargs["parallel_tool_calls"] = (
+                strategic_cfg.parallel_tool_calls
+            )
+
+        tactical_bind_kwargs = {}
+        if supports_parallel_tool_calls(tactical_cfg.provider, tactical_cfg.model):
+            tactical_bind_kwargs["parallel_tool_calls"] = (
+                tactical_cfg.parallel_tool_calls
+            )
 
         # Phase-filter tools: each LLM only sees tools declared for its phase.
         # The ToolNode keeps the full list (LLM schema binding is primary enforcement).
@@ -1967,10 +1981,10 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         )
 
         self._strategic_llm_with_tools = self._strategic_llm.bind_tools(
-            strategic_tools, **bind_kwargs
+            strategic_tools, **strategic_bind_kwargs
         )
         self._tactical_llm_with_tools = self._tactical_llm.bind_tools(
-            tactical_tools, **bind_kwargs
+            tactical_tools, **tactical_bind_kwargs
         )
 
         # Keep _llm_with_tools for backwards compatibility

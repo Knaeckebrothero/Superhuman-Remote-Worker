@@ -12,6 +12,7 @@ from src.core.loader import (
     _create_openai_llm,
     _create_openrouter_llm,
     _create_codex_llm,
+    supports_parallel_tool_calls,
 )
 
 
@@ -530,3 +531,38 @@ class TestCodexLLMCreation:
 
         call_kwargs = mock_chat.call_args[1]
         assert call_kwargs["api_key"] == "sk-key1"
+
+
+class TestSupportsParallelToolCalls:
+    """`parallel_tool_calls` is an OpenAI Chat Completions kwarg — it must be
+    suppressed for providers/models that reject it."""
+
+    @pytest.mark.parametrize(
+        "provider,model",
+        [
+            ("openai", "gpt-4o"),
+            ("openrouter", "openrouter/anthropic/claude-sonnet-4"),
+            ("codex", "codex/gpt-5.5"),
+            ("groq", "moonshotai/kimi-k2-instruct-0905"),
+            ("anthropic", "claude-opus-4-5"),
+            (None, "gpt-4o"),  # provider defaults to openai-compatible
+        ],
+    )
+    def test_supported(self, provider, model):
+        assert supports_parallel_tool_calls(provider, model) is True
+
+    @pytest.mark.parametrize(
+        "provider,model",
+        [
+            ("google", "gemini-3.5-flash"),  # GenerateContentConfig: extra_forbidden
+            ("Google", "gemini-2.0-pro"),  # case-insensitive
+            ("openai", "o1-preview"),  # o-series reasoning models
+            ("openai", "o3-mini"),
+            ("openai", "o4-mini"),
+        ],
+    )
+    def test_suppressed(self, provider, model):
+        assert supports_parallel_tool_calls(provider, model) is False
+
+    def test_none_inputs_default_to_supported(self):
+        assert supports_parallel_tool_calls(None, None) is True
