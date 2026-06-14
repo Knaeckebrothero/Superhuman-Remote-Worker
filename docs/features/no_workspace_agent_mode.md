@@ -89,6 +89,18 @@ the dev Vault bundle is renamed first, then the chart deploys. **prod-private's
 Vault needs the same `S3_*`→`SNAPSHOT_S3_*` rename before this chart reaches the
 prod cut**, or prod snapshots break on that deploy.
 
+**Update 2026-06-14 — lite tier usable cluster-wide (explicit-only datasources).**
+The lite tiers were blocked from dispatching *any* job whenever an unlinked
+"global" repository datasource existed, because the resolver force-attached every
+unlinked-global datasource to every job and the lite guard then rejected the repo.
+Datasource attachment is now **explicit-only**: nothing is force-attached, the
+create-job/session picker is the source of truth, and repository datasources are
+greyed out + excluded under a lite backend (so the repo/lite conflict can't be
+submitted from the UI). The lite-tier repository rejection (§4/§7) remains as a
+defense-in-depth dispatch guard. See [[multi_datasource_support]] "Access Model"
+(update) for the full model. This is what makes `virtual`/`none` actually
+dispatchable on any cluster that has global repo datasources.
+
 **S3 (capability-gated tools) implemented + validated 2026-06-11** (§11/§12):
 tool binding is gated by backend capability — `registry.filter_tools_by_backend()`
 drops shell/browser/git when `not supports_shell` and the file tools when

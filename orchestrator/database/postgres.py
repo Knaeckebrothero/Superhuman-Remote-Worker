@@ -3474,86 +3474,95 @@ class PostgresDB:
     async def resolve_datasources_for_job(
         self, job_id: str, project_id: str | None = None
     ) -> List[Dict[str, Any]]:
-        """Resolve datasources for a job.
+        """Resolve datasources for a job — explicit selection only.
 
-        Returns all applicable datasources: those linked to the job's
-        project via the project_datasources junction table, plus any
-        unlinked global datasources. Multiple datasources of the same
-        type are allowed.
+        Returns exactly the datasources explicitly attached to the job via the
+        ``job_datasources`` junction (the picker is the source of truth).
+        Nothing is auto-attached: project-linked and global datasources reach a
+        job only if they were selected (and so written to ``job_datasources``).
 
-        For project-linked datasources, includes the project-level
-        read_only setting which controls the access mode (CLI vs tools).
+        ``project_id`` is used solely to surface the project-level ``read_only``
+        setting (CLI vs tools mode) for a selected datasource that is also
+        linked to that project; it never widens the result set.
+
+        Transitional: jobs created before the explicit-only migration (0026)
+        persisted their selection by cloning rows with ``datasources.job_id``
+        set. If a job has no ``job_datasources`` rows, fall back to those legacy
+        clones so in-flight jobs keep resolving. Remove once no live job
+        predates 0026.
 
         Args:
             job_id: Job UUID
-            project_id: Optional project UUID for project-level datasources
+            project_id: Optional project UUID (only for project_read_only)
 
         Returns:
             List of resolved datasource dicts (may contain multiple per type)
         """
         try:
-            UUID(job_id)
+            job_uuid = UUID(job_id)
         except ValueError:
             return []
 
         project_uuid = UUID(project_id) if project_id else None
 
         async with self.acquire() as conn:
-            if project_uuid:
-                rows = await conn.fetch(
-                    """
-                    SELECT DISTINCT d.id, d.name, d.description, d.type,
-                        d.connection_url, d.credentials,
-                        d.cli_hint, d.default_branch,
-                        d.created_at, d.updated_at,
-                        pd.read_only AS project_read_only
-                    FROM datasources d
-                    LEFT JOIN project_datasources pd
-                        ON pd.datasource_id = d.id AND pd.project_id = $1
-                    WHERE pd.project_id IS NOT NULL
-                       OR NOT EXISTS (
-                           SELECT 1 FROM project_datasources pd2
-                           WHERE pd2.datasource_id = d.id
-                       )
-                    ORDER BY d.type, d.name
-                    """,
-                    project_uuid,
-                )
+            rows = await conn.fetch(
+                """
+                SELECT DISTINCT d.id, d.name, d.description, d.type,
+                    d.connection_url, d.credentials,
+                    d.cli_hint, d.default_branch,
+                    d.created_at, d.updated_at,
+                    pd.read_only AS project_read_only
+                FROM job_datasources jd
+                JOIN datasources d ON d.id = jd.datasource_id
+                LEFT JOIN project_datasources pd
+                    ON pd.datasource_id = d.id AND pd.project_id = $2::uuid
+                WHERE jd.job_id = $1
+                ORDER BY d.type, d.name
+                """,
+                job_uuid,
+                project_uuid,
+            )
+            if rows:
                 return [_datasource_row_to_dict(row) for row in rows]
-            else:
-                rows = await conn.fetch(
-                    """
-                    SELECT DISTINCT d.id, d.name, d.description, d.type,
-                        d.connection_url, d.credentials,
-                        d.cli_hint, d.default_branch,
-                        d.created_at, d.updated_at,
-                        NULL::boolean AS project_read_only
-                    FROM datasources d
-                    WHERE NOT EXISTS (
-                        SELECT 1 FROM project_datasources pd2
-                        WHERE pd2.datasource_id = d.id
-                    )
-                    ORDER BY d.type, d.name
-                    """,
-                )
 
-        return [_datasource_row_to_dict(row) for row in rows]
+            # Transitional fallback: legacy clone-to-job-scoped rows (pre-0026).
+            legacy = await conn.fetch(
+                """
+                SELECT DISTINCT d.id, d.name, d.description, d.type,
+                    d.connection_url, d.credentials,
+                    d.cli_hint, d.default_branch,
+                    d.created_at, d.updated_at,
+                    NULL::boolean AS project_read_only
+                FROM datasources d
+                WHERE d.job_id = $1
+                ORDER BY d.type, d.name
+                """,
+                job_uuid,
+            )
+
+        return [_datasource_row_to_dict(row) for row in legacy]
 
     async def resolve_datasources_for_thread(
         self,
         datasource_ids: list[str] | None = None,
         project_ids: list[str] | None = None,
     ) -> List[Dict[str, Any]]:
-        """Resolve datasources for a persistent thread.
+        """Resolve datasources for a persistent thread — explicit selection only.
 
-        Returns all applicable datasources: explicitly attached by ID,
-        plus those linked to the thread's projects via project_datasources,
-        plus unlinked global datasources. Multiple datasources of the
-        same type are allowed.
+        Returns exactly the datasources explicitly attached to the thread by ID
+        (the picker is the source of truth, persisted in
+        ``threads.metadata.datasource_ids``). Nothing is auto-attached: global
+        and project-linked datasources reach a thread only if they were
+        selected.
+
+        ``project_ids`` is used solely to surface the project-level ``read_only``
+        setting for a selected datasource that is also linked to one of those
+        projects; it never widens the result set.
 
         Args:
             datasource_ids: Explicit datasource UUIDs attached to the thread
-            project_ids: Project UUIDs scoped to the thread
+            project_ids: Project UUIDs scoped to the thread (for project_read_only)
 
         Returns:
             List of resolved datasource dicts (may contain multiple per type)
@@ -3564,6 +3573,9 @@ class PostgresDB:
                 ds_uuids.append(UUID(ds_id))
             except ValueError:
                 pass
+
+        if not ds_uuids:
+            return []
 
         proj_uuids = []
         for pid in project_ids or []:
@@ -3585,19 +3597,131 @@ class PostgresDB:
                     ON pd.datasource_id = d.id
                    AND pd.project_id = ANY($2::uuid[])
                 WHERE d.id = ANY($1::uuid[])
-                   OR pd.project_id IS NOT NULL
-                   OR (
-                       d.is_global = true
-                       AND NOT EXISTS (
-                           SELECT 1 FROM project_datasources pd2
-                           WHERE pd2.datasource_id = d.id
-                       )
-                   )
                 ORDER BY d.type, d.name
                 """,
                 ds_uuids,
                 proj_uuids,
             )
+
+        return [_datasource_row_to_dict(row) for row in rows]
+
+    # -- Job ↔ Datasource junction (N:M) --------------------------------------
+
+    async def link_datasource_to_job(self, job_id: str, datasource_id: str) -> bool:
+        """Link a datasource to a job (the explicit picker selection).
+
+        The selection is persisted here; ``resolve_datasources_for_job``
+        returns exactly these links. Idempotent.
+
+        Returns True on success, False on a malformed UUID.
+        """
+        try:
+            j_uuid = UUID(job_id)
+            d_uuid = UUID(datasource_id)
+        except ValueError:
+            return False
+
+        async with self.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO job_datasources (job_id, datasource_id)
+                VALUES ($1, $2)
+                ON CONFLICT (job_id, datasource_id) DO NOTHING
+                """,
+                j_uuid,
+                d_uuid,
+            )
+        return True
+
+    async def list_job_datasource_ids(self, job_id: str) -> List[str]:
+        """Return the datasource IDs explicitly attached to a job.
+
+        Reads the ``job_datasources`` junction; falls back to legacy
+        clone-to-job-scoped rows (``datasources.job_id``) for jobs created
+        before migration 0026 so parent inheritance keeps working during the
+        transition.
+        """
+        try:
+            j_uuid = UUID(job_id)
+        except ValueError:
+            return []
+
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT datasource_id FROM job_datasources WHERE job_id = $1",
+                j_uuid,
+            )
+            if rows:
+                return [str(r["datasource_id"]) for r in rows]
+            legacy = await conn.fetch(
+                "SELECT id FROM datasources WHERE job_id = $1",
+                j_uuid,
+            )
+        return [str(r["id"]) for r in legacy]
+
+    async def list_eligible_datasources(
+        self,
+        user_id: str | None,
+        project_ids: list[str] | None = None,
+        *,
+        is_admin: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Datasources a user may pre-select for a job/session (picker source).
+
+        Union of: datasources the user created, global datasources, and
+        datasources linked to any of ``project_ids``. Excludes legacy
+        job-scoped clones (``datasources.job_id`` set). Admins see all
+        non-job-scoped datasources. Credentials are decrypted here; callers
+        must redact before returning over REST.
+        """
+        try:
+            u_uuid = UUID(user_id) if user_id else None
+        except ValueError:
+            u_uuid = None
+
+        proj_uuids = []
+        for pid in project_ids or []:
+            try:
+                proj_uuids.append(UUID(pid))
+            except ValueError:
+                pass
+
+        select_cols = """
+            SELECT DISTINCT d.id, d.name, d.description, d.type,
+                d.connection_url, d.credentials, d.cli_hint,
+                d.default_branch, d.created_by, d.is_global,
+                d.created_at, d.updated_at
+        """
+
+        async with self.acquire() as conn:
+            if is_admin:
+                rows = await conn.fetch(
+                    select_cols
+                    + """
+                    FROM datasources d
+                    WHERE d.job_id IS NULL
+                    ORDER BY d.type, d.name
+                    """,
+                )
+            else:
+                rows = await conn.fetch(
+                    select_cols
+                    + """
+                    FROM datasources d
+                    LEFT JOIN project_datasources pd
+                        ON pd.datasource_id = d.id
+                       AND pd.project_id = ANY($2::uuid[])
+                    WHERE d.job_id IS NULL
+                      AND (
+                          d.created_by = $1
+                          OR d.is_global = true
+                          OR pd.project_id IS NOT NULL
+                      )
+                    ORDER BY d.type, d.name
+                    """,
+                    u_uuid,
+                    proj_uuids,
+                )
 
         return [_datasource_row_to_dict(row) for row in rows]
 

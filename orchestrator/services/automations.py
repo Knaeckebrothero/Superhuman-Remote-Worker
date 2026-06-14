@@ -65,6 +65,10 @@ async def create_job_from_automation(
         "automation_trigger": trigger_kind,
     }
 
+    # NOTE: with explicit-only datasource resolution, automation-fired jobs
+    # attach no datasources (the automation row carries no selection and this
+    # is a non-UI path with no parent to inherit from). Per-automation
+    # datasource selection is a follow-up; see multi_datasource_support.md.
     project_id = automation.get("project_id")
     job = await db.create_job(
         description=automation["prompt"],

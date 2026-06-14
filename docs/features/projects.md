@@ -42,7 +42,7 @@ A **project** is:
 
 1. A database entity grouping related jobs
 2. A collection of **repositories** — one "jobs repo" for workspace continuity, plus any number of source/reference repos the agents work with
-3. A set of shared **datasources** available to all jobs in the project
+3. A set of shared **datasources** offered to jobs in the project — as of 2026-06-14 these are **pre-selected in the create-job/session picker, not force-attached**: a job attaches exactly what the user leaves checked (explicit-only resolution; see [[multi_datasource_support]] "Access Model" update). Non-UI job paths attach only what they pass in `datasource_ids`.
 4. A set of **project-specific expert configs** — custom agent roles tailored to the project
 5. A set of **members** — users who can access and contribute to the project
 6. Optionally, a description and goal that frames the entire effort

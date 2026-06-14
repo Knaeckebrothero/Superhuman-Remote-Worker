@@ -548,6 +548,29 @@ export class ApiService {
   }
 
   /**
+   * Get datasources eligible to pre-select for a new job/session: the union of
+   * the caller's own datasources, global datasources, and those linked to any
+   * given project. Backs the create-job / create-session picker (explicit-only
+   * resolution means the picker selection is the only way a job gets sources).
+   */
+  getEligibleDatasources(projectIds?: string[]): Observable<Datasource[]> {
+    let params = new HttpParams();
+    for (const pid of projectIds ?? []) {
+      if (pid) {
+        params = params.append('project_id', pid);
+      }
+    }
+    return this.http
+      .get<Datasource[]>(`${this.baseUrl}/datasources/eligible`, { params })
+      .pipe(
+        catchError((error) => {
+          console.error('Failed to fetch eligible datasources:', error);
+          return of([]);
+        }),
+      );
+  }
+
+  /**
    * Get a single datasource by ID.
    */
   getDatasource(id: string): Observable<Datasource | null> {
