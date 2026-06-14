@@ -27,6 +27,7 @@ from ..core.loader import (
     get_project_root,
     load_auxiliary_prompt,
     render_instruction_content,
+    supports_parallel_tool_calls,
 )
 from ..core.workspace import WorkspaceManager, WorkspaceManagerConfig
 from ..core.workspace_backend import WorkspaceUnavailableError
@@ -600,8 +601,9 @@ class PersistentSession:
             return
 
         bind_kwargs = {}
-        model_name = (self.config.llm.model or "").lower()
-        if not model_name.startswith(("o1", "o3", "o4")):
+        if supports_parallel_tool_calls(
+            self.config.llm.provider, self.config.llm.model
+        ):
             bind_kwargs["parallel_tool_calls"] = self.config.llm.parallel_tool_calls
 
         from src.services.guardrails import apply_guardrails_to_tools

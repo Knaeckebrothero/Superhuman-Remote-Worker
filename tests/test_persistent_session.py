@@ -34,6 +34,7 @@ def _make_config(**overrides):
     cfg.workspace.structure = {}
     cfg.workspace.git_versioning = False
     cfg.llm.model = overrides.get("model", "gpt-4o")
+    cfg.llm.provider = overrides.get("provider", None)
     cfg.llm.timeout = 600
     cfg.llm.multimodal = True
     cfg.llm.parallel_tool_calls = overrides.get("parallel_tool_calls", False)
@@ -811,6 +812,28 @@ class TestBindTools:
     def test_o4_model_no_parallel_tool_calls(self):
         """o4 models don't get parallel_tool_calls kwarg."""
         cfg = _make_config(model="o4-mini")
+        session = _make_session(config=cfg)
+        mock_llm = MagicMock()
+        mock_llm.bind_tools.return_value = "bound"
+        session._llm = mock_llm
+        session.tools = [MagicMock()]
+
+        session._bind_tools()
+
+        call_kwargs = mock_llm.bind_tools.call_args[1]
+        assert "parallel_tool_calls" not in call_kwargs
+
+    def test_google_provider_no_parallel_tool_calls(self):
+        """Google models must NOT get parallel_tool_calls — GenerateContentConfig
+        is a strict Pydantic model (extra_forbidden) and crashes on the kwarg.
+
+        Regression for session a6436fb8 (gemini-3.5-flash): "1 validation error
+        for GenerateContentConfig / parallel_tool_calls / Extra inputs are not
+        permitted".
+        """
+        cfg = _make_config(
+            model="gemini-3.5-flash", provider="google", parallel_tool_calls=True
+        )
         session = _make_session(config=cfg)
         mock_llm = MagicMock()
         mock_llm.bind_tools.return_value = "bound"

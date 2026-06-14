@@ -31,7 +31,12 @@ from langchain_core.messages import (
 )
 from pydantic import BaseModel, Field, model_validator
 
-from src.core.image_tokens import estimate_image_tokens, split_text_and_images
+from src.core.image_tokens import (
+    content_to_summary_text,
+    estimate_image_tokens,
+    has_image_content,
+    split_text_and_images,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1104,32 +1109,81 @@ class ContextManager:
             return result
         return messages
 
+    def _shed_image_messages(
+        self, messages: List[BaseMessage]
+    ) -> Tuple[List[BaseMessage], int]:
+        """Replace every multimodal image ``HumanMessage`` with a text marker.
+
+        Shared by both compaction-time elision tiers (S3). Image re-deliveries
+        (the synthetic "image content from tool call …" messages, or a user's
+        own uploaded image) are lossless to shed — the model already processed
+        the image — and carry no tool-call pairing contract, so this is
+        unconditionally safe. Returns a new list (same length, order, and ids
+        preserved) and the number of messages shed.
+        """
+        result = list(messages)
+        shed = 0
+        for i, msg in enumerate(result):
+            if isinstance(msg, HumanMessage) and has_image_content(msg.content):
+                tokens = self.token_counter([msg])
+                _text, n_images = split_text_and_images(msg.content)
+                replacement = HumanMessage(
+                    content=(
+                        f"[image content elided by compaction: {n_images} image(s), "
+                        f"~{tokens:,} tokens. The model already processed it; "
+                        f"re-read the source if the visual is needed again.]"
+                    )
+                )
+                if getattr(msg, "id", None):
+                    replacement.id = msg.id
+                result[i] = replacement
+                shed += 1
+        return result, shed
+
     def _elide_largest_tool_results(
         self,
         messages: List[BaseMessage],
         target_tokens: int,
     ) -> List[BaseMessage]:
-        """Replace the *content* of the largest tool results until under target.
+        """Shed the largest sheddable messages until under target.
 
-        Pairing-safe (tool_call_id is kept, so the parent AIMessage's tool
-        calls stay answered) and largest-first, so the minimum number of
-        results is sacrificed. Evidence preservation is deliberately ignored
-        here: this stage only runs when the request cannot otherwise fit the
-        model at all — an elided result beats a permanently dead session.
+        Two candidate classes, shed in order:
+        1. Multimodal image ``HumanMessage``s — lossless (the model already saw
+           the image) and free of any tool-pairing contract, so they go first
+           and free the most room with the least cost.
+        2. ``ToolMessage`` results — content elided, ``tool_call_id`` kept so
+           the parent AIMessage's tool calls stay answered. Largest-first, so
+           the minimum number is sacrificed.
+
+        Evidence preservation is deliberately ignored here: this stage only runs
+        when the request cannot otherwise fit the model at all — an elided
+        result beats a permanently dead session. Mutating the live list is why
+        elision is **compaction-time only**: adding/removing an image
+        invalidates the provider prompt cache (context_token_accounting.md §4.4).
 
         Args:
             messages: Message list (may contain RemoveMessage markers)
             target_tokens: Stop once the non-marker total fits this budget
         """
+        # Images first — lossless and the dominant bloat for multimodal sessions.
+        result, images_shed = self._shed_image_messages(messages)
+        non_remove = [m for m in result if not isinstance(m, RemoveMessage)]
+        if self.get_token_count(non_remove) <= target_tokens:
+            if images_shed:
+                logger.warning(
+                    f"Keep-window elision: shed {images_shed} image message(s) to "
+                    f"fit the {target_tokens:,}-token model limit"
+                )
+            return result
+
         sized = []
-        for i, msg in enumerate(messages):
+        for i, msg in enumerate(result):
             if isinstance(msg, ToolMessage) and isinstance(msg.content, str):
                 if msg.content.startswith("[tool result elided"):
                     continue  # already elided
                 sized.append((self.token_counter([msg]), i))
         sized.sort(reverse=True)
 
-        result = list(messages)
         elided = 0
         for msg_tokens, idx in sized:
             non_remove = [m for m in result if not isinstance(m, RemoveMessage)]
@@ -1150,10 +1204,11 @@ class ContextManager:
             result[idx] = replacement
             elided += 1
 
-        if elided:
+        if images_shed or elided:
             logger.warning(
-                f"Keep-window elision: replaced {elided} tool result(s) to fit "
-                f"the {target_tokens:,}-token model limit"
+                f"Keep-window elision: shed {images_shed} image message(s) and "
+                f"replaced {elided} tool result(s) to fit the "
+                f"{target_tokens:,}-token model limit"
             )
         return result
 
@@ -1176,6 +1231,14 @@ class ContextManager:
         Returns:
             Messages with truncated tool results
         """
+        # Last-resort path: shed image re-deliveries too. The largest-first
+        # elision tier handles them first, but a re-summarized keep-window can
+        # reintroduce them — and char-truncation can't touch list content.
+        # Lossless and pairing-free, so unconditional here.
+        messages, images_shed = self._shed_image_messages(messages)
+        if images_shed:
+            logger.warning(f"Emergency truncation: shed {images_shed} image message(s)")
+
         for limit in [initial_limit, final_limit]:
             # Build list of (index, content_length) for ToolMessages, sorted largest first
             tool_sizes = []
@@ -1300,11 +1363,12 @@ class ContextManager:
                     formatted_parts.append(f"Prior Summary: {msg.content}")
                 continue
             elif isinstance(msg, HumanMessage):
-                formatted_parts.append(f"User: {msg.content[:500]}")
+                # Image-safe: list content (a multimodal re-delivery) becomes
+                # text + "[image: ...]" markers, never stringified base64.
+                text = content_to_summary_text(msg.content)
+                formatted_parts.append(f"User: {text[:500]}")
             elif isinstance(msg, AIMessage):
-                content = (
-                    msg.content if isinstance(msg.content, str) else str(msg.content)
-                )
+                content = content_to_summary_text(msg.content)
                 if hasattr(msg, "tool_calls") and msg.tool_calls:
                     tool_names = [tc.get("name", "unknown") for tc in msg.tool_calls]
                     if content:
@@ -1321,9 +1385,7 @@ class ContextManager:
                     formatted_parts.append(f"Assistant: {content[:800]}...")
             elif isinstance(msg, ToolMessage):
                 tool_name = getattr(msg, "name", None) or "unknown"
-                content = (
-                    msg.content if isinstance(msg.content, str) else str(msg.content)
-                )
+                content = content_to_summary_text(msg.content)
                 if i in recent_tool_indices:
                     # Recent: include truncated content for summarization
                     truncated = content[:300]

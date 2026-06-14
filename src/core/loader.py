@@ -2268,6 +2268,32 @@ def _clamp_reasoning_level(level: str, supported: set[str]) -> str:
     return clamped
 
 
+def supports_parallel_tool_calls(provider: Optional[str], model: Optional[str]) -> bool:
+    """Whether the bind-time ``parallel_tool_calls`` kwarg may be passed.
+
+    ``parallel_tool_calls`` is an OpenAI Chat Completions parameter. It must NOT
+    be forwarded to providers/models that reject unknown fields:
+
+    - **Google**: ``langchain_google_genai`` threads the kwarg into the GenAI
+      SDK's ``GenerateContentConfig``, a strict Pydantic model
+      (``model_config = {"extra": "forbid"}``). Passing it raises
+      ``1 validation error for GenerateContentConfig / parallel_tool_calls /
+      Extra inputs are not permitted``.
+    - **OpenAI o-series reasoning models** (``o1``/``o3``/``o4``) don't accept
+      the parameter.
+
+    OpenAI-compatible providers (openai, openrouter, codex, groq) and Anthropic
+    accept it, so it is only suppressed for the cases above.
+    """
+    provider = (provider or "").lower()
+    model = (model or "").lower()
+    if provider == "google":
+        return False
+    if model.startswith(("o1", "o3", "o4")):
+        return False
+    return True
+
+
 def create_llm(
     config: LLMConfig,
     limits: Optional[LimitsConfig] = None,
