@@ -169,7 +169,7 @@ import {AppBadgeComponent} from '../../../ui/badge';
     }
     .admin-page {
       padding: 32px;
-      max-width: 900px;
+      max-width: var(--content-max-width);
       margin: 0 auto;
       color: var(--text-primary);
     }

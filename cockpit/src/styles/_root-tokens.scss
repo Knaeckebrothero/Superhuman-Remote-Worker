@@ -43,4 +43,12 @@
     'Cascadia Mono',
     consolas,
     monospace;
+
+  // --- Layout content widths ---
+  // Caps the centered content column on wide viewports. App content (forms,
+  // grids, settings) reads --width-content; table/grid-dense pages read the
+  // wide variant. Values track the 1140–1280px content-area band (standard =
+  // Tailwind screen-xl) with 1440px as the page-width ceiling.
+  --width-content: 1280px;
+  --width-content-wide: 1440px;
 }

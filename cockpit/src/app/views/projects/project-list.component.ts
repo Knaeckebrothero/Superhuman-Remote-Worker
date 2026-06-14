@@ -121,7 +121,7 @@ import {ViewModePillComponent} from '../../shell/view-mode-pill/view-mode-pill.c
 
     .page-container {
       padding: 24px;
-      max-width: 1200px;
+      max-width: var(--content-max-width);
       margin: 0 auto;
     }
 

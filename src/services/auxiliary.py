@@ -107,6 +107,45 @@ class AssemblyResult(BaseModel):
     summary: str = Field(description="Brief summary of assembly review")
 
 
+class IngestionVerdict(BaseModel):
+    """Structured output for the ingestion verdict (overhaul Phase 4).
+
+    The adjudicator compares a newly-extracted candidate memory against its
+    nearest currently-valid neighbours and decides what to do with it.
+    ``target_indices`` are 1-based positions in the numbered neighbour list
+    shown to the model (NOT database ids — echoing UUIDs is error-prone); the
+    store maps them back to rows.
+    """
+
+    action: str = Field(
+        description=(
+            "One of: ADD (genuinely new information — keep the candidate, "
+            "touch nothing), NOOP (already captured by a neighbour — discard "
+            "the candidate), UPDATE (the candidate is the SAME fact with a "
+            "changed/corrected value — keep it and retire the stale "
+            "neighbours in target_indices), MERGE (the candidate and "
+            "neighbours are complementary parts of one fact — store "
+            "merged_content and retire the neighbours in target_indices)."
+        )
+    )
+    target_indices: List[int] = Field(
+        default_factory=list,
+        description=(
+            "1-based indices of the neighbour memories this verdict acts on. "
+            "Required for UPDATE/MERGE (the rows to retire) and NOOP (the row "
+            "the candidate duplicates). Empty for ADD."
+        ),
+    )
+    merged_content: Optional[str] = Field(
+        default=None,
+        description=(
+            "For MERGE only: the single combined fact (1-3 self-contained "
+            "sentences) that replaces the candidate and the retired neighbours."
+        ),
+    )
+    reason: str = Field(description="One-line justification for the verdict")
+
+
 # NOTE: ConversationSummary (the summarization output schema) lives in
 # src/core/context.py because it's tightly coupled with the compaction
 # formatting logic there. SummarizeTask imports it from there.
@@ -181,6 +220,52 @@ class ExtractMemoriesTask(AuxTask):
     @property
     def output_schema(self) -> Type[BaseModel]:
         return ExtractedMemories
+
+
+class IngestionVerdictTask(AuxTask):
+    """Adjudicate a candidate memory against its nearest neighbours.
+
+    Chain-mode task (overhaul Phase 4). Prompt loaded from config/prompts/.
+    ``neighbours`` is the ordered list shown to the model — each item a dict
+    with ``content`` and an optional ``age`` / ``similarity`` annotation; the
+    1-based display index is the position in this list.
+    """
+
+    def __init__(
+        self,
+        candidate_content: str,
+        neighbours: List[Dict[str, Any]],
+        prompt: str,
+    ):
+        self.candidate_content = candidate_content
+        self.neighbours = neighbours
+        self._prompt = prompt
+
+    @property
+    def system_prompt(self) -> str:
+        return self._prompt
+
+    def build_context(self) -> str:
+        lines = ["NEW candidate memory:", self.candidate_content, ""]
+        lines.append("Existing similar memories (currently valid):")
+        for i, n in enumerate(self.neighbours, start=1):
+            meta_parts = []
+            if n.get("similarity") is not None:
+                meta_parts.append(f"similarity {float(n['similarity']):.2f}")
+            if n.get("age"):
+                meta_parts.append(str(n["age"]))
+            meta = f" ({', '.join(meta_parts)})" if meta_parts else ""
+            lines.append(f"[{i}]{meta} {n.get('content', '')}")
+        lines.append("")
+        lines.append(
+            "Decide ADD / UPDATE / MERGE / NOOP. For UPDATE/MERGE/NOOP put the "
+            "relevant [n] numbers in target_indices."
+        )
+        return "\n".join(lines)
+
+    @property
+    def output_schema(self) -> Type[BaseModel]:
+        return IngestionVerdict
 
 
 class SummarizeTask(AuxTask):
