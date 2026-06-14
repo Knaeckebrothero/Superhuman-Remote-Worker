@@ -139,6 +139,12 @@ secrets:
     SNAPSHOT_S3_ACCESS_KEY_ID: "minioadmin"
     SNAPSHOT_S3_SECRET_ACCESS_KEY: "minioadmin_secret"
 
+    # --- Virtual workspace tier S3 (local single-node MinIO, deployment/tilt-minio.yaml) ---
+    # Root creds of the local MinIO; the virtual backend's rclone uses these to
+    # read/write the srw-workspaces bucket. Endpoint is in values-tilt.yaml.
+    VIRTUAL_WORKSPACE_S3_ACCESS_KEY_ID: "minioadmin"
+    VIRTUAL_WORKSPACE_S3_SECRET_ACCESS_KEY: "minioadmin_secret"
+
     # --- Email (disabled but Keycloak references SMTP env vars unconditionally) ---
     SMTP_USER: "stub"
     SMTP_PASSWORD: "stub"

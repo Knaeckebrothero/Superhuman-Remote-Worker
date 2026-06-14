@@ -36,15 +36,18 @@ workspace:
   prewarm:
     enabled: false
 
-# Virtual workspace tier (no_workspace_agent_mode.md §4/§5). k3d has no MinIO,
-# so dev uses the non-durable in-process store: a `workspace.backend: virtual`
-# job/session runs as a single pod and round-trips files within the agent's
-# lifetime, with no external object store. Files vanish on pod restart — fine
-# for smoke tests. Point at a real S3/MinIO bucket (helm/values.yaml comments)
-# when durability/inspection is needed.
+# Virtual workspace tier (no_workspace_agent_mode.md §4/§5). A single-node MinIO
+# is deployed for local dev (deployment/tilt-minio.yaml, wired in the Tiltfile),
+# so the `virtual` backend exercises the real rclone -> S3 write path against a
+# durable, inspectable bucket (srw-workspaces). Credentials come from
+# values-local.yaml (VIRTUAL_WORKSPACE_S3_*). Swap rclone.type back to "memory"
+# to drop the MinIO dependency for pure smoke tests.
 virtualWorkspace:
   rclone:
-    type: "memory"
+    type: "s3"
+    root: "srw-workspaces"
+  s3:
+    endpoint: "http://minio.srw.svc.cluster.local:9000"
 
 # Cockpit dev image runs `ng serve`, which serves files from the Angular
 # source tree at /app/src/assets/. Land the chart-rendered env.js there so
