@@ -230,7 +230,7 @@
       "confirmDelete": "Confirm?",
       "promote": "Promote",
       "createProject": "Create Project",
-      "exportToCloud": "Export to cloud",
+      "exportToCloud": "Open cloud folder",
       "exported": "Exported"
     },
     "tooltip": {
@@ -250,7 +250,7 @@
       "confirmDelete": "Click again to confirm deletion",
       "deleteJob": "Delete job",
       "promoteJob": "Promote to project",
-      "exportToCloud": "Copy this job's output/ folder to a shared cloud folder",
+      "exportToCloud": "Copy this job's deliverables to a shared cloud folder and open it",
       "alreadyExported": "Already exported. Delete the cloud folder to re-export.",
       "snapshotStats": "S3 snapshot storage",
       "snapshotAvailable": "Environment snapshot available",
@@ -1521,8 +1521,10 @@
     "links": {
       "browseWorkspace": "Browse workspace in Gitea",
       "startingIde": "Starting IDE...",
-      "openIde": "Open in Web IDE"
+      "openIde": "Open in Web IDE",
+      "openCloudFolder": "Open cloud folder"
     },
+    "cloudFolderDisclaimer": "Preview — results are copied to a shared cloud folder you can browse. Use the feedback box below to request changes; edits made directly in this folder won't reach the agent and will be replaced when the job continues.",
     "vmUpgrade": {
       "title": "Sudo Required",
       "reason": "The agent attempted a privileged command in a hardened container:",
@@ -1541,7 +1543,8 @@
       "orContinueFeedback": "or continue with feedback",
       "feedbackPlaceholder": "Write feedback or additional instructions for the agent...",
       "resuming": "Resuming...",
-      "continueWithFeedback": "Continue with Feedback"
+      "continueWithFeedback": "Continue with Feedback",
+      "openingCloudFolder": "Opening..."
     },
     "messages": {
       "approved": "Job approved successfully.",
@@ -1551,7 +1554,8 @@
       "continuing": "Job continuing. Agent will resume execution.",
       "continueFailed": "Failed to continue job. Check console for details.",
       "resumedWithFeedback": "Job resumed with feedback. Agent will continue working.",
-      "resumeFailed": "Failed to resume job. Check console for details."
+      "resumeFailed": "Failed to resume job. Check console for details.",
+      "openCloudFolderFailed": "Failed to open cloud folder. Check console for details."
     }
   },
   "jobDiffReview": {

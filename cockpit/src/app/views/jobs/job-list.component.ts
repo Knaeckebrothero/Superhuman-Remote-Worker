@@ -275,6 +275,8 @@ interface JobRow {
                       >
                         {{ 'jobs.action.promote' | transloco }}
                       </app-button>
+                    }
+                    @if (row.job.status === 'completed' && row.job.cloud_review_mode === 'open_folder') {
                       @if (!row.job.exported_at) {
                         <app-button
                           variant="secondary"

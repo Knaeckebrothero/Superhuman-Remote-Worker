@@ -3,6 +3,7 @@
 **Status:** S1+S2+S3+S4 implemented (2026-06-13/14) · originally 2026-06-13
 **Verification:** §3–§8 + the formula appendix were refined 2026-06-13 against a 19-agent codebase+web research pass (Workflow `w7c2inj8v`): every provider image-token formula was re-derived from its official primary source, and the load-bearing codebase claims were checked against `src/`. Material corrections to the first draft are flagged inline with **⚠**.
 **Related:**
+- `docs/tests/context_token_accounting_verification.md` — **the verification runbook**: how to test all four slices (unit suites, the per-family estimator oracle, k3d probe-pod recipes, the live-session gold standard).
 - `docs/issues/multimodal_image_context_explosion.md` — the root-cause defect inventory (defects A–D, layers). This feature doc is the forward-looking *architecture*; that issue doc remains the detailed bug catalogue. Slices here subsume its Layer-A/C/0 work.
 - `docs/features/context_summarization_rework.md` — the aux-budgeted rolling-fold summarizer (`src/core/summarizer.py`, shipped S1+S2). This doc fixes the *input* that feeds it and the *trigger* that invokes it.
 - `docs/features/db_backed_model_catalog.md` / `config/model_config_matrix.yaml` — the per-family settings matrix this doc extends.
