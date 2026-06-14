@@ -19239,7 +19239,7 @@ async def create_project_job(
     """Create a job within a project — delegates to create_job. Requires editor or higher."""
     await require_project_member(request, postgres_db, project_id, min_role="editor")
     job.project_id = project_id
-    return await create_job(job)
+    return await create_job(request, job)
 
 
 @app.get("/api/projects/{project_id}/jobs")
