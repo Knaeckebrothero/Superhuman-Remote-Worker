@@ -761,12 +761,14 @@ class TestPersistentTurnWiring:
         assert req.query_text == "user query"
         assert req.model == "test-model"
 
-        # -- payload inserted directly after the SystemMessage
+        # -- payload inserted immediately after the first HumanMessage, so the
+        # synthetic function-call pairs always follow a real user turn (Gemini's
+        # native API 400s on a leading functionCall — see _injection_anchor_index).
         prepared = captured_prepared[0]
         payload_msgs = service.payload.messages()
         assert isinstance(prepared[0], SystemMessage)
-        assert prepared[1 : 1 + len(payload_msgs)] == payload_msgs
-        assert prepared[1 + len(payload_msgs)].content == "user query"
+        assert prepared[1].content == "user query"
+        assert prepared[2 : 2 + len(payload_msgs)] == payload_msgs
 
         # -- legacy direct-store blocks skipped
         recall_spy.decrement_ttl.assert_not_called()
