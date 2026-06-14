@@ -19,6 +19,22 @@
 load('ext://helm_resource', 'helm_resource')
 
 # -----------------------------------------------------------------------------
+# Global watch exclusions — paths Tilt must never treat as a code change.
+#
+# `eval/` holds memory-eval harness output (eval/memory/runs/*.log, etc.). An
+# active eval streams log lines several times a second; because the
+# orchestrator/cockpit/mcp docker_builds use context='.', each write looked
+# like an in-context source change with no matching sync() and forced a full
+# image rebuild per log line. Those Dockerfiles don't COPY eval/, so every
+# rebuild was a cache-identical no-op (no pod roll) — but it pinned the inner
+# loop in a perpetual rebuild and masked real edits behind the churn.
+# Excluding it at the watcher level stops the loop for every resource at once
+# without touching any build context. (agent/workspace use only=[…] allowlists
+# and were already immune.)
+# -----------------------------------------------------------------------------
+watch_settings(ignore=['eval/'])
+
+# -----------------------------------------------------------------------------
 # Registry — k3d created via `--registry-create srw-registry:0.0.0.0:5005`.
 #   docker push targets        : localhost:5005    (host-side mapped port)
 #   kubelet image references   : srw-registry:5000 (k3d internal DNS + port)

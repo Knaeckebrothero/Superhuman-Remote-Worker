@@ -114,6 +114,35 @@ class TestMemoryRecord:
         record = MemoryRecord.from_row({"keywords": None})
         assert record.keywords == []
 
+    def test_from_row_bitemporal_fields(self):
+        """from_row populates the Phase-4 bi-temporal supersede columns."""
+        from datetime import datetime, timezone
+
+        new_id = uuid.uuid4()
+        vf = datetime(2026, 6, 1, tzinfo=timezone.utc)
+        vt = datetime(2026, 6, 14, tzinfo=timezone.utc)
+        record = MemoryRecord.from_row(
+            {
+                "content": "stale fact",
+                "valid_from": vf,
+                "valid_to": vt,
+                "superseded_at": vt,
+                "superseded_by": new_id,
+            }
+        )
+        assert record.valid_from == vf
+        assert record.valid_to == vt
+        assert record.superseded_at == vt
+        assert record.superseded_by == new_id
+
+    def test_from_row_bitemporal_defaults_none(self):
+        """A currently-valid row has valid_to / superseded_* unset (None)."""
+        record = MemoryRecord.from_row({"content": "live fact"})
+        assert record.valid_from is None
+        assert record.valid_to is None
+        assert record.superseded_at is None
+        assert record.superseded_by is None
+
 
 # =============================================================================
 # Storage Tests
@@ -248,6 +277,319 @@ class TestRetrieval:
 
         # Should fit 2 memories (4000 tokens), not 3 (6000 would exceed 5000)
         assert len(results) == 2
+
+
+# =============================================================================
+# Bi-temporal supersede (overhaul Phase 4) — default retrieval excludes
+# retired (valid_to IS NOT NULL) rows. Behaviour-preserving until a writer
+# actually retires something; these pin the filter is present in every
+# agent-side read path.
+# =============================================================================
+
+
+class TestBitemporalRetrievalFilter:
+    """Every default read path filters `valid_to IS NULL` (currently-valid)."""
+
+    @pytest.mark.asyncio
+    async def test_find_similar_filters_valid(self, store, mock_db):
+        """find_similar only adjudicates against currently-valid memories."""
+        mock_db.fetchrow.return_value = None
+        await store.find_similar([0.1] * 1536)
+        sql = mock_db.fetchrow.call_args[0][0]
+        assert "valid_to IS NULL" in sql
+
+    @pytest.mark.asyncio
+    async def test_get_ttl_active_filters_valid(self, store, mock_db):
+        """A retired pinned memory is not 'active' — get_ttl_active excludes it."""
+        mock_db.fetch.return_value = []
+        await store.get_ttl_active()
+        sql = mock_db.fetch.call_args[0][0]
+        assert "valid_to IS NULL" in sql
+
+    @pytest.mark.asyncio
+    async def test_decrement_ttl_filters_valid(self, store, mock_db):
+        """decrement_ttl does not tick TTL on retired rows."""
+        mock_db.fetchval.return_value = 0
+        await store.decrement_ttl()
+        sql = mock_db.fetchval.call_args[0][0]
+        assert "valid_to IS NULL" in sql
+
+    @pytest.mark.asyncio
+    async def test_get_stats_reports_current_and_superseded(self, store, mock_db):
+        """get_stats surfaces the live vs retired split."""
+        mock_db.fetchrow.return_value = {
+            "total": 5,
+            "current": 4,
+            "superseded": 1,
+            "ttl_active": 2,
+        }
+        stats = await store.get_stats()
+        sql = mock_db.fetchrow.call_args[0][0]
+        assert "FILTER (WHERE valid_to IS NULL)" in sql
+        assert "FILTER (WHERE valid_to IS NOT NULL)" in sql
+        assert stats["current"] == 4
+        assert stats["superseded"] == 1
+
+
+# =============================================================================
+# Ingestion verdicts + supersede (overhaul Phase 4)
+# =============================================================================
+
+
+class _FakeVerdict:
+    """Stand-in for auxiliary.IngestionVerdict (duck-typed by the store)."""
+
+    def __init__(self, action, target_indices=None, merged_content=None, reason="r"):
+        self.action = action
+        self.target_indices = target_indices or []
+        self.merged_content = merged_content
+        self.reason = reason
+
+
+class _FakeVerdictService:
+    """Stand-in for IngestionVerdictService injected onto the store."""
+
+    def __init__(self, verdict, top_k=5, review_floor=0.6):
+        self.verdict = verdict
+        self.top_k = top_k
+        self.review_floor = review_floor
+        self.calls = 0
+        self.last_kwargs = None
+
+    async def adjudicate(self, **kwargs):
+        self.calls += 1
+        self.last_kwargs = kwargs
+        return self.verdict
+
+
+def _neighbour_row(content="old fact", sim=0.8):
+    return {
+        "id": uuid.uuid4(),
+        "content": content,
+        "memory_type": "factual",
+        "source": "observer",
+        "importance": 0.7,
+        "token_count": 10,
+        "access_count": 1,
+        "keywords": [],
+        "similarity": sim,
+    }
+
+
+class TestIngestionVerdict:
+    """store() write-path adjudication when an ingestion verdict is wired."""
+
+    @pytest.mark.asyncio
+    async def test_cost_guard_no_neighbour_adds_without_llm(
+        self, store, mock_db, mock_embedding_service
+    ):
+        """No near-duplicate → straight ADD, zero verdict calls."""
+        svc = _FakeVerdictService(_FakeVerdict("NOOP"))  # would NOOP if asked
+        store.ingestion_verdict = svc
+        mock_db.fetch.return_value = []  # find_similar_many: nothing close
+        new_id = uuid.uuid4()
+        mock_db.fetchval.return_value = new_id
+
+        result = await store.store(content="a brand new fact", importance=0.8)
+
+        assert result == new_id
+        assert svc.calls == 0  # cost guard: adjudicator never consulted
+        mock_db.fetchval.assert_awaited_once()  # inserted
+
+    @pytest.mark.asyncio
+    async def test_verdict_add_inserts_new(self, store, mock_db):
+        """ADD with neighbours present → adjudicate, then insert."""
+        store.ingestion_verdict = _FakeVerdictService(_FakeVerdict("ADD"))
+        mock_db.fetch.return_value = [_neighbour_row()]
+        new_id = uuid.uuid4()
+        mock_db.fetchval.return_value = new_id
+
+        result = await store.store(content="related but new", importance=0.8)
+
+        assert result == new_id
+        assert store.ingestion_verdict.calls == 1
+        mock_db.fetchval.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_verdict_noop_bumps_existing(self, store, mock_db):
+        """NOOP → bump the duplicate in place, never insert."""
+        row = _neighbour_row()
+        store.ingestion_verdict = _FakeVerdictService(
+            _FakeVerdict("NOOP", target_indices=[1])
+        )
+        mock_db.fetch.return_value = [row]
+
+        result = await store.store(content="dup", importance=0.9)
+
+        assert result == row["id"]
+        mock_db.fetchval.assert_not_awaited()  # no insert
+        mock_db.execute.assert_awaited()  # bump UPDATE
+
+    @pytest.mark.asyncio
+    async def test_verdict_update_inserts_and_supersedes(self, store, mock_db):
+        """UPDATE → insert the new fact AND retire the stale neighbour."""
+        row = _neighbour_row(content="works out one hour per day")
+        store.ingestion_verdict = _FakeVerdictService(
+            _FakeVerdict("UPDATE", target_indices=[1])
+        )
+        mock_db.fetch.return_value = [row]
+        new_id = uuid.uuid4()
+        mock_db.fetchval.return_value = new_id
+        mock_db.execute.return_value = "UPDATE 1"
+
+        result = await store.store(
+            content="works out two hours per day", importance=0.8
+        )
+
+        assert result == new_id
+        mock_db.fetchval.assert_awaited_once()  # inserted new
+        # supersede UPDATE ran against the stale neighbour id
+        execute_sqls = [c.args[0] for c in mock_db.execute.await_args_list]
+        assert any("valid_to = CURRENT_TIMESTAMP" in s for s in execute_sqls)
+        retire_call = next(
+            c for c in mock_db.execute.await_args_list if "valid_to" in c.args[0]
+        )
+        assert retire_call.args[1] == [row["id"]]  # old id
+        assert retire_call.args[2] == new_id  # superseded_by
+
+    @pytest.mark.asyncio
+    async def test_verdict_merge_inserts_merged_and_supersedes(
+        self, store, mock_db, mock_embedding_service
+    ):
+        """MERGE → insert merged_content (re-embedded) and retire neighbours."""
+        row = _neighbour_row(content="the bookshelf is oak")
+        store.ingestion_verdict = _FakeVerdictService(
+            _FakeVerdict(
+                "MERGE",
+                target_indices=[1],
+                merged_content="the oak bookshelf was assembled in May",
+            )
+        )
+        mock_db.fetch.return_value = [row]
+        new_id = uuid.uuid4()
+        mock_db.fetchval.return_value = new_id
+        mock_db.execute.return_value = "UPDATE 1"
+
+        result = await store.store(
+            content="assembled the bookshelf in May", importance=0.8
+        )
+
+        assert result == new_id
+        # candidate embed + merged-content re-embed
+        assert mock_embedding_service.embed.await_count == 2
+        inserted_content = mock_db.fetchval.await_args.args[4]  # $4 = content
+        assert inserted_content == "the oak bookshelf was assembled in May"
+
+    @pytest.mark.asyncio
+    async def test_verdict_update_without_targets_degrades_to_add(self, store, mock_db):
+        """Malformed UPDATE (no target_indices) → conservative ADD, no retire."""
+        store.ingestion_verdict = _FakeVerdictService(
+            _FakeVerdict("UPDATE", target_indices=[])
+        )
+        mock_db.fetch.return_value = [_neighbour_row()]
+        new_id = uuid.uuid4()
+        mock_db.fetchval.return_value = new_id
+
+        result = await store.store(content="ambiguous", importance=0.8)
+
+        assert result == new_id
+        mock_db.fetchval.assert_awaited_once()  # inserted
+        # no supersede UPDATE ran
+        execute_sqls = [c.args[0] for c in mock_db.execute.await_args_list]
+        assert not any("valid_to = CURRENT_TIMESTAMP" in s for s in execute_sqls)
+
+    @pytest.mark.asyncio
+    async def test_legacy_path_when_no_verdict_service(self, store, mock_db):
+        """ingestion_verdict None → legacy cosine dedup, find_similar_many unused."""
+        assert store.ingestion_verdict is None
+        mock_db.fetchrow.return_value = None  # find_similar: no dup
+        mock_db.fetchval.return_value = uuid.uuid4()
+        await store.store(content="x", importance=0.8)
+        # legacy path uses fetchrow (find_similar), not fetch (find_similar_many)
+        mock_db.fetchrow.assert_awaited()
+
+
+class TestFindSimilarManyAndSupersede:
+    """The two new write-path primitives."""
+
+    @pytest.mark.asyncio
+    async def test_find_similar_many_filters_and_limits(self, store, mock_db):
+        mock_db.fetch.return_value = []
+        await store.find_similar_many([0.1] * 1536, k=7, min_similarity=0.55)
+        sql = mock_db.fetch.call_args[0][0]
+        assert "valid_to IS NULL" in sql
+        assert "LIMIT $4" in sql
+        # params: (sql, embedding $1, scope_val $2, min_similarity $3, k $4)
+        assert mock_db.fetch.call_args[0][3] == 0.55  # min_similarity
+        assert mock_db.fetch.call_args[0][4] == 7  # k
+
+    @pytest.mark.asyncio
+    async def test_find_similar_many_attaches_similarity(self, store, mock_db):
+        mock_db.fetch.return_value = [_neighbour_row(sim=0.91)]
+        out = await store.find_similar_many([0.1] * 1536)
+        assert len(out) == 1
+        assert out[0].similarity == 0.91
+
+    @pytest.mark.asyncio
+    async def test_supersede_sets_markers_and_counts(self, store, mock_db):
+        mock_db.execute.return_value = "UPDATE 2"
+        old = [uuid.uuid4(), uuid.uuid4()]
+        new = uuid.uuid4()
+        count = await store.supersede(old, new)
+        assert count == 2
+        sql = mock_db.execute.call_args[0][0]
+        assert "valid_to = CURRENT_TIMESTAMP" in sql
+        assert "superseded_by = $2" in sql
+        assert "valid_to IS NULL" in sql  # idempotent: skip already-retired
+        assert mock_db.execute.call_args[0][1] == old
+        assert mock_db.execute.call_args[0][2] == new
+
+    @pytest.mark.asyncio
+    async def test_supersede_empty_is_noop(self, store, mock_db):
+        assert await store.supersede([], uuid.uuid4()) == 0
+        mock_db.execute.assert_not_awaited()
+
+
+class TestWriteGate:
+    """memory.extraction.write_gate (overhaul Phase 4) — completeness toggle."""
+
+    @pytest.mark.asyncio
+    async def test_gate_on_skips_low_importance(self, store, mock_embedding_service):
+        assert store.write_gate is True  # default
+        result = await store.store(content="x", importance=0.1)
+        assert result is None
+        mock_embedding_service.embed.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_gate_off_stores_low_importance(
+        self, mock_db, mock_embedding_service, job_id
+    ):
+        from types import SimpleNamespace
+
+        cfg = SimpleNamespace(
+            project_scoped=False,
+            dedup_threshold=0.92,
+            importance_threshold=0.3,
+            budget_tokens=5000,
+            max_memories_per_injection=10,
+            retrieval_importance_floor=0.4,
+            default_ttl=10,
+            extraction=SimpleNamespace(write_gate=False),
+        )
+        s = RecallStore(
+            db=mock_db,
+            embedding_service=mock_embedding_service,
+            job_id=job_id,
+            config=cfg,
+        )
+        assert s.write_gate is False
+        mock_db.fetchrow.return_value = None
+        mock_db.fetchval.return_value = uuid.uuid4()
+
+        result = await s.store(content="a low-value note", importance=0.05)
+
+        assert result is not None  # stored despite importance < threshold
+        mock_embedding_service.embed.assert_awaited()
 
 
 # =============================================================================

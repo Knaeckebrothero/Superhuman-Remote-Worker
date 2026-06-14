@@ -743,6 +743,49 @@ def redact_datasources(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [redact_datasource(row) for row in rows]
 
 
+# Key names (case-insensitive) whose VALUE is always a credential. The suffix
+# match covers the ``env_keys`` block (EMBEDDING_API_KEY, OPENROUTER_API_KEY,
+# VISION_API_KEY, WHISPER_API_KEY, TTS_API_KEY, CITATION_LLM_API_KEY, ...).
+_SECRET_KEY_NAMES = frozenset(
+    {"api_key", "password", "secret", "token", "private_key", "rclone_spec"}
+)
+_SECRET_KEY_SUFFIX = "_api_key"
+
+
+def _is_secret_key(key: str) -> bool:
+    k = key.lower()
+    return k in _SECRET_KEY_NAMES or k.endswith(_SECRET_KEY_SUFFIX)
+
+
+def redact_config_override(co: Any) -> Any:
+    """Return a deep copy of a ``config_override`` with credential fields removed.
+
+    Non-mutating and recursive (walks dicts and lists). Removes any key whose
+    name (case-insensitive) is one of api_key/password/secret/token/private_key/
+    rclone_spec, or ends with ``_api_key`` — i.e. ``llm.api_key``, phase overrides
+    ``llm.{strategic,tactical,summarization}.api_key``, ``auxiliary.api_key``,
+    every ``env_keys.*_API_KEY``, and ``workspace.mounts[].rclone_spec``.
+
+    Non-secret fields are preserved verbatim (``llm.model``/``provider``/
+    ``base_url``/``temperature``, ``env_keys.*_MODEL``/``*_BASE_URL``/``*_PROVIDER``,
+    ``workspace.backend``, ...).
+
+    Used at two boundaries:
+    - the user-facing GET endpoints (redact before returning), and
+    - persistence of ``threads.metadata.config_override`` (secrets are injected
+      in-flight only — see ``_inject_thread_dispatch_credentials`` in main.py).
+
+    Keep this pure: no DB access, no logging of values (it handles secrets).
+    """
+    if isinstance(co, dict):
+        return {
+            k: redact_config_override(v) for k, v in co.items() if not _is_secret_key(k)
+        }
+    if isinstance(co, list):
+        return [redact_config_override(v) for v in co]
+    return co
+
+
 async def user_can_access_datasource(
     user: dict[str, Any], db, ds: dict[str, Any]
 ) -> bool:

@@ -183,6 +183,16 @@ class MemoryRecord:
     remaining_turns: Optional[int] = None
     created_at: Optional[datetime] = None
     last_accessed: Optional[datetime] = None
+    # Bi-temporal supersede (overhaul Phase 4, migration vector/0006).
+    # valid_to IS NULL == currently valid == served by default retrieval.
+    valid_from: Optional[datetime] = None
+    valid_to: Optional[datetime] = None
+    superseded_at: Optional[datetime] = None
+    superseded_by: Optional[uuid.UUID] = None
+    # Transient: populated by similarity searches (find_similar_many), not a
+    # stored column. Lets the ingestion adjudicator see how close each
+    # neighbour is.
+    similarity: Optional[float] = None
 
     @classmethod
     def from_row(cls, row: Dict[str, Any]) -> "MemoryRecord":
@@ -206,6 +216,11 @@ class MemoryRecord:
             remaining_turns=row.get("remaining_turns"),
             created_at=row.get("created_at"),
             last_accessed=row.get("last_accessed"),
+            valid_from=row.get("valid_from"),
+            valid_to=row.get("valid_to"),
+            superseded_at=row.get("superseded_at"),
+            superseded_by=row.get("superseded_by"),
+            similarity=row.get("similarity"),
         )
 
 
@@ -254,6 +269,12 @@ class RecallStore:
         self.project_scoped = (
             getattr(config, "project_scoped", False) if config else False
         )
+        # Ingestion-verdict adjudicator (overhaul Phase 4). Late-bound by
+        # src.services.memory.ingestion.maybe_attach_ingestion_verdict at the
+        # manager-construction sites when memory.ingestion.enabled. While None
+        # (the default everywhere today), store() keeps the legacy cosine-0.85
+        # dedup-merge byte-for-byte — the equivalence suites pin that path.
+        self.ingestion_verdict = None
 
         # Config defaults (matches MemoryConfig dataclass)
         self.dedup_threshold = 0.85
@@ -262,6 +283,10 @@ class RecallStore:
         self.max_memories_per_injection = 150
         self.retrieval_importance_floor = 0.4
         self.default_ttl = 10
+        # Write-time importance gate (overhaul Phase 4). True = legacy floor;
+        # memory.extraction.write_gate: false drops it (completeness over
+        # precision — relevance is gated at retrieval instead).
+        self.write_gate = True
 
         if config is not None:
             self.dedup_threshold = getattr(config, "dedup_threshold", 0.85)
@@ -274,6 +299,9 @@ class RecallStore:
                 config, "retrieval_importance_floor", 0.4
             )
             self.default_ttl = getattr(config, "default_ttl", 10)
+            _ext = getattr(config, "extraction", None)
+            if _ext is not None:
+                self.write_gate = getattr(_ext, "write_gate", True)
 
     @property
     def _scope_filter(self):
@@ -336,7 +364,7 @@ class RecallStore:
         Returns:
             UUID of stored/updated memory, or None if below importance threshold
         """
-        if importance < self.importance_threshold:
+        if self.write_gate and importance < self.importance_threshold:
             logger.debug(
                 f"Memory below importance threshold ({importance} < "
                 f"{self.importance_threshold}), skipping"
@@ -346,52 +374,82 @@ class RecallStore:
         # Generate embedding
         embedding = await self.embedding_service.embed(content)
 
-        # Check for duplicates
+        # Ingestion-verdict write path (overhaul Phase 4): aux-LLM adjudication
+        # + bi-temporal supersede, replacing the cosine dedup-merge below. Only
+        # active when a verdict service is wired (memory.ingestion.enabled);
+        # otherwise the legacy path runs byte-for-byte (equivalence suites).
+        if self.ingestion_verdict is not None:
+            return await self._store_with_verdict(
+                embedding=embedding,
+                content=content,
+                summary=summary,
+                keywords=keywords,
+                importance=importance,
+                memory_type=memory_type,
+                source=source,
+                source_turn_start=source_turn_start,
+                source_turn_end=source_turn_end,
+                source_phase=source_phase,
+                token_count=token_count,
+                remaining_turns=remaining_turns,
+                retrieval_messages=retrieval_messages,
+            )
+
+        # Legacy dedup: a near-duplicate (cosine > dedup_threshold) bumps the
+        # existing row in place instead of inserting a new one.
         existing = await self.find_similar(embedding, self.dedup_threshold)
         if existing:
             logger.debug(
                 f"Dedup: updating existing memory {existing.id} instead of creating new"
             )
-            ttl = remaining_turns if remaining_turns is not None else self.default_ttl
-            await self.db.execute(
-                """
-                UPDATE memories
-                SET access_count = access_count + 1,
-                    last_accessed = CURRENT_TIMESTAMP,
-                    importance = GREATEST(importance, $1),
-                    remaining_turns = GREATEST(COALESCE(remaining_turns, 0), $3)
-                WHERE id = $2
-                """,
-                importance,
+            return await self._bump_existing(
                 existing.id,
-                ttl,
+                importance,
+                remaining_turns,
+                source,
+                similarity=existing.similarity,
             )
-            if self._archiver:
-                self._archiver.audit_step(
-                    job_id=str(self.job_id),
-                    agent_type=self.agent_id or "",
-                    step_type="memory_dedup",
-                    node_name="recall_store",
-                    iteration=0,
-                    data={
-                        "existing_id": str(existing.id),
-                        "source": source,
-                        "similarity": round(existing.similarity, 3)
-                        if hasattr(existing, "similarity")
-                        else None,
-                    },
-                )
-            return existing.id
 
-        # Estimate token count if not provided
+        return await self._insert(
+            embedding=embedding,
+            content=content,
+            summary=summary,
+            keywords=keywords,
+            importance=importance,
+            memory_type=memory_type,
+            source=source,
+            source_turn_start=source_turn_start,
+            source_turn_end=source_turn_end,
+            source_phase=source_phase,
+            token_count=token_count,
+            remaining_turns=remaining_turns,
+            retrieval_messages=retrieval_messages,
+        )
+
+    async def _insert(
+        self,
+        *,
+        embedding: List[float],
+        content: str,
+        summary: Optional[str] = None,
+        keywords: Optional[List[str]] = None,
+        importance: float = 0.5,
+        memory_type: str = "factual",
+        source: str = "observer",
+        source_turn_start: Optional[int] = None,
+        source_turn_end: Optional[int] = None,
+        source_phase: Optional[int] = None,
+        token_count: Optional[int] = None,
+        remaining_turns: Optional[int] = None,
+        retrieval_messages: Optional[List[str]] = None,
+    ) -> Optional[uuid.UUID]:
+        """INSERT a new memory row — the shared tail of every ADD path."""
+        # Estimate token count if not provided (~4 chars per token)
         if token_count is None:
-            # Rough estimate: ~4 chars per token
             token_count = len(content) // 4
 
-        # Default TTL
         ttl = remaining_turns if remaining_turns is not None else self.default_ttl
 
-        # Build tsvector for sparse search
         keywords_list = keywords or []
         keywords_text = " ".join(keywords_list) + " " + content
 
@@ -460,6 +518,184 @@ class RecallStore:
                 },
             )
         return mem_id
+
+    async def _bump_existing(
+        self,
+        existing_id: uuid.UUID,
+        importance: float,
+        remaining_turns: Optional[int],
+        source: str,
+        similarity: Optional[float] = None,
+    ) -> uuid.UUID:
+        """Bump an existing memory in place (legacy dedup hit / verdict NOOP)."""
+        ttl = remaining_turns if remaining_turns is not None else self.default_ttl
+        await self.db.execute(
+            """
+            UPDATE memories
+            SET access_count = access_count + 1,
+                last_accessed = CURRENT_TIMESTAMP,
+                importance = GREATEST(importance, $1),
+                remaining_turns = GREATEST(COALESCE(remaining_turns, 0), $3)
+            WHERE id = $2
+            """,
+            importance,
+            existing_id,
+            ttl,
+        )
+        if self._archiver:
+            self._archiver.audit_step(
+                job_id=str(self.job_id),
+                agent_type=self.agent_id or "",
+                step_type="memory_dedup",
+                node_name="recall_store",
+                iteration=0,
+                data={
+                    "existing_id": str(existing_id),
+                    "source": source,
+                    "similarity": (
+                        round(similarity, 3) if similarity is not None else None
+                    ),
+                },
+            )
+        return existing_id
+
+    async def _store_with_verdict(
+        self,
+        *,
+        embedding: List[float],
+        content: str,
+        summary: Optional[str],
+        keywords: Optional[List[str]],
+        importance: float,
+        memory_type: str,
+        source: str,
+        source_turn_start: Optional[int],
+        source_turn_end: Optional[int],
+        source_phase: Optional[int],
+        token_count: Optional[int],
+        remaining_turns: Optional[int],
+        retrieval_messages: Optional[List[str]],
+    ) -> Optional[uuid.UUID]:
+        """Adjudicate a candidate against neighbours, then ADD/NOOP/UPDATE/MERGE.
+
+        Cost guard: the verdict LLM is consulted only when a neighbour scores at
+        or above the service's review_floor. No near-duplicate → straight ADD,
+        zero LLM calls.
+        """
+        svc = self.ingestion_verdict
+
+        def _add():
+            return self._insert(
+                embedding=embedding,
+                content=content,
+                summary=summary,
+                keywords=keywords,
+                importance=importance,
+                memory_type=memory_type,
+                source=source,
+                source_turn_start=source_turn_start,
+                source_turn_end=source_turn_end,
+                source_phase=source_phase,
+                token_count=token_count,
+                remaining_turns=remaining_turns,
+                retrieval_messages=retrieval_messages,
+            )
+
+        try:
+            similar = await self.find_similar_many(
+                embedding, k=svc.top_k, min_similarity=svc.review_floor
+            )
+        except Exception as e:
+            logger.warning(
+                "Ingestion verdict: neighbour lookup failed (%s: %s); ADD",
+                type(e).__name__,
+                e,
+            )
+            return await _add()
+
+        # Cost guard: nothing close enough to adjudicate → new fact, just ADD.
+        if not similar:
+            return await _add()
+
+        verdict = await svc.adjudicate(
+            content=content,
+            summary=summary,
+            keywords=keywords,
+            similar=similar,
+        )
+        action = (getattr(verdict, "action", "ADD") or "ADD").strip().upper()
+        reason = getattr(verdict, "reason", "") or ""
+
+        targets = []
+        for idx in getattr(verdict, "target_indices", None) or []:
+            if isinstance(idx, int) and 1 <= idx <= len(similar):
+                targets.append(similar[idx - 1])
+
+        if action == "NOOP":
+            target = targets[0] if targets else similar[0]
+            self._audit_verdict("NOOP", [target.id], None, reason)
+            return await self._bump_existing(
+                target.id, importance, remaining_turns, source, target.similarity
+            )
+
+        if action in ("UPDATE", "MERGE"):
+            retire = [t.id for t in targets]
+            if not retire:
+                # UPDATE/MERGE must name the rows it supersedes; a verdict that
+                # names none is malformed. Degrade to a conservative ADD rather
+                # than guess a row to retire — wrongly retiring loses a fact,
+                # keeping both only costs a (downstream-gated) duplicate.
+                self._audit_verdict("ADD", [], None, f"{action}-without-targets→ADD")
+                return await _add()
+            if action == "MERGE":
+                merged = (getattr(verdict, "merged_content", None) or "").strip()
+                if merged and merged != content:
+                    new_emb = await self.embedding_service.embed(merged)
+                    new_id = await self._insert(
+                        embedding=new_emb,
+                        content=merged,
+                        summary=summary,
+                        keywords=keywords,
+                        importance=importance,
+                        memory_type=memory_type,
+                        source=source,
+                        source_turn_start=source_turn_start,
+                        source_turn_end=source_turn_end,
+                        source_phase=source_phase,
+                        token_count=None,  # re-estimate from merged content
+                        remaining_turns=remaining_turns,
+                        retrieval_messages=retrieval_messages,
+                    )
+                else:
+                    new_id = await _add()
+            else:
+                new_id = await _add()
+            if new_id:
+                await self.supersede(retire, new_id)
+                self._audit_verdict(action, retire, new_id, reason)
+            return new_id
+
+        # ADD and any unrecognized action → conservative ADD.
+        self._audit_verdict("ADD", [], None, reason)
+        return await _add()
+
+    def _audit_verdict(self, action, target_ids, new_id, reason):
+        """Audit an ingestion verdict (no-op without an archiver)."""
+        if not self._archiver:
+            return
+        self._archiver.audit_step(
+            job_id=str(self.job_id),
+            agent_type=self.agent_id or "",
+            step_type="memory_verdict",
+            node_name="recall_store",
+            iteration=0,
+            data={
+                "action": action,
+                "retired": [str(t) for t in target_ids],
+                "new_id": str(new_id) if new_id else None,
+                "reason": reason[:200],
+            },
+        )
 
     async def store_retrieval_messages(
         self,
@@ -532,6 +768,7 @@ class RecallStore:
             FROM memories
             WHERE {scope_clause}
               AND embedding IS NOT NULL
+              AND valid_to IS NULL
               AND 1 - (embedding <=> $1) > $3
             ORDER BY similarity DESC
             LIMIT 1
@@ -544,6 +781,71 @@ class RecallStore:
         if row:
             return MemoryRecord.from_row(dict(row))
         return None
+
+    async def find_similar_many(
+        self,
+        embedding: List[float],
+        k: int = 5,
+        min_similarity: float = 0.6,
+    ) -> List[MemoryRecord]:
+        """Return the top-``k`` currently-valid neighbours above ``min_similarity``.
+
+        Feeds the ingestion adjudicator (overhaul Phase 4). Only currently-valid
+        rows (``valid_to IS NULL``) are candidates — a verdict never compares a
+        new fact against an already-retired one. Each returned record carries a
+        transient ``.similarity``.
+        """
+        scope_clause, scope_val = self._scope_where(2)
+        rows = await self.db.fetch(
+            f"""
+            SELECT *, 1 - (embedding <=> $1) AS similarity
+            FROM memories
+            WHERE {scope_clause}
+              AND embedding IS NOT NULL
+              AND valid_to IS NULL
+              AND 1 - (embedding <=> $1) >= $3
+            ORDER BY similarity DESC
+            LIMIT $4
+            """,
+            embedding,
+            scope_val,
+            min_similarity,
+            k,
+        )
+        return [MemoryRecord.from_row(dict(row)) for row in rows]
+
+    async def supersede(
+        self,
+        old_ids: List[uuid.UUID],
+        new_id: uuid.UUID,
+    ) -> int:
+        """Retire memories ``old_ids``, pointing them at their replacement.
+
+        Sets the bi-temporal markers (``valid_to``/``superseded_at`` = now,
+        ``superseded_by`` = ``new_id``) and zeroes any TTL so a retired pinned
+        memory stops being injected. Idempotent: already-retired rows
+        (``valid_to IS NOT NULL``) are skipped. Returns the number retired.
+        """
+        if not old_ids:
+            return 0
+        result = await self.db.execute(
+            """
+            UPDATE memories
+            SET valid_to = CURRENT_TIMESTAMP,
+                superseded_at = CURRENT_TIMESTAMP,
+                superseded_by = $2,
+                remaining_turns = 0
+            WHERE id = ANY($1) AND valid_to IS NULL
+            """,
+            old_ids,
+            new_id,
+        )
+        try:
+            count = int(str(result).split()[-1])
+        except (ValueError, IndexError):
+            count = 0
+        logger.debug(f"Superseded {count} memory(ies) → {new_id}")
+        return count
 
     # =========================================================================
     # TTL Management
@@ -563,7 +865,7 @@ class RecallStore:
             f"""
             SELECT *
             FROM memories
-            WHERE {scope_clause} AND remaining_turns > 0
+            WHERE {scope_clause} AND remaining_turns > 0 AND valid_to IS NULL
             ORDER BY importance DESC
             """,
             scope_val,
@@ -584,7 +886,7 @@ class RecallStore:
             WITH updated AS (
                 UPDATE memories
                 SET remaining_turns = remaining_turns - 1
-                WHERE {scope_clause} AND remaining_turns > 0
+                WHERE {scope_clause} AND remaining_turns > 0 AND valid_to IS NULL
                 RETURNING id
             )
             SELECT COUNT(*) FROM updated
@@ -919,7 +1221,9 @@ class RecallStore:
                 COUNT(*) FILTER (WHERE source = 'phase_archive') AS from_phase_archive,
                 COUNT(*) FILTER (WHERE source = 'tool_error') AS from_tool_error,
                 AVG(importance) AS avg_importance,
-                COUNT(*) FILTER (WHERE remaining_turns > 0) AS ttl_active
+                COUNT(*) FILTER (WHERE remaining_turns > 0 AND valid_to IS NULL) AS ttl_active,
+                COUNT(*) FILTER (WHERE valid_to IS NULL) AS current,
+                COUNT(*) FILTER (WHERE valid_to IS NOT NULL) AS superseded
             FROM memories
             WHERE {scope_clause}
             """,

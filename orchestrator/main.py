@@ -110,6 +110,7 @@ from security.access import (  # noqa: E402
     is_internal_call,
     log_security_event,
     mcp_scope_project_id,
+    redact_config_override,
     redact_datasource,
     redact_datasources,
     require_builder_session_owner,
@@ -2547,6 +2548,124 @@ async def _inject_env_key_credentials(
         env_keys.setdefault(f"{prefix}_API_KEY", resolved_keys[provider])
 
 
+async def _inject_thread_dispatch_credentials(
+    config_override: dict[str, Any],
+    *,
+    user_id: str | None,
+    project_id: str | None = None,
+    user_settings: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Resolve + inject LLM / auxiliary / embedding credentials into a thread's
+    ``config_override`` IN PLACE (creating sections as needed). Returns the dict.
+
+    The persistent-session sibling of the worker-job ``_inject_dispatch_credentials``.
+    Secrets travel **in-flight only** — at thread create, and re-injected at session
+    attach/resume (the agent workspace endpoint + the resume dispatcher) — and are
+    stripped via ``redact_config_override`` before persistence, so
+    ``threads.metadata.config_override`` never stores plaintext keys.
+
+    Idempotent + re-injection-safe: ``_inject_model_credentials`` only early-returns
+    when both ``base_url`` and ``api_key`` are already present, and
+    ``_inject_env_key_credentials`` is fully ``setdefault``-based. So running this on
+    an already-enriched dict is a no-op, and running it on a *stripped* copy (model /
+    base_url / EMBEDDING_MODEL survive, the keys were removed) repopulates exactly the
+    removed secrets.
+    """
+    user_settings = user_settings or {}
+
+    # Drop None-valued keys in the model sections before injecting. A prior
+    # hot-swap persists explicit ``provider/base_url/api_key = None`` sentinels
+    # (they make the live agent's deep_merge CLEAR the previous model's
+    # transport); in a stored copy those Nones would block the setdefault-based
+    # injection below. Treat them as absent so the transport is repopulated.
+    for _sect_name in ("llm", "auxiliary"):
+        _sect = config_override.get(_sect_name)
+        if isinstance(_sect, dict):
+            for _k in [_k for _k, _v in _sect.items() if _v is None]:
+                del _sect[_k]
+
+    resolved_keys = await postgres_db.resolve_api_keys_for_job(
+        user_id=user_id,
+        project_id=project_id,
+    )
+
+    # Chat model. Fall back to the system default chat pin so the agent never
+    # boots on its YAML default (which has no transport → api.openai.com 401).
+    llm_section = config_override.get("llm") or {}
+    if not llm_section.get("model"):
+        system_chat_model = await postgres_db.resolve_default_for_capability("chat")
+        if system_chat_model:
+            llm_section["model"] = system_chat_model
+            logger.info(
+                "Thread dispatch: injected system default chat model: %s",
+                system_chat_model,
+            )
+    if llm_section.get("model"):
+        await _inject_model_credentials(
+            section=llm_section,
+            model_id=llm_section["model"],
+            user_id=user_id,
+            resolved_keys=resolved_keys,
+        )
+        config_override["llm"] = llm_section
+
+    # Auxiliary slot (title generation, memory extraction, knowledge curation).
+    aux_section = config_override.get("auxiliary") or {}
+    if not aux_section.get("model"):
+        aux_model = user_settings.get("default_auxiliary_model")
+        if not aux_model:
+            aux_model = await postgres_db.resolve_default_for_capability("auxiliary")
+        if aux_model:
+            aux_section["model"] = aux_model
+            logger.info("Thread dispatch: injected auxiliary model: %s", aux_model)
+    if aux_section.get("model"):
+        await _inject_model_credentials(
+            section=aux_section,
+            model_id=aux_section["model"],
+            user_id=user_id,
+            resolved_keys=resolved_keys,
+            capability="auxiliary",
+        )
+        config_override["auxiliary"] = aux_section
+
+    # Embedding capability travels as flat env vars. Source provider/model from
+    # the (possibly stripped) persisted block first so re-injection on resume is
+    # stable, then user settings, then the system default. Unconditionally call
+    # the env-key injector when a model is known: it is setdefault-based, so it
+    # re-adds the stripped EMBEDDING_API_KEY without clobbering surviving
+    # EMBEDDING_MODEL / EMBEDDING_BASE_URL.
+    env_keys_block = config_override.setdefault("env_keys", {})
+    embedding_provider = env_keys_block.get("EMBEDDING_PROVIDER") or user_settings.get(
+        "embedding_provider"
+    )
+    embedding_model = env_keys_block.get("EMBEDDING_MODEL") or user_settings.get(
+        "default_embedding_model"
+    )
+    if not embedding_model:
+        embedding_model = await postgres_db.resolve_default_for_capability("embedding")
+    if embedding_provider:
+        env_keys_block.setdefault("EMBEDDING_PROVIDER", embedding_provider)
+    if embedding_model:
+        await _inject_env_key_credentials(
+            env_keys=env_keys_block,
+            prefix="EMBEDDING",
+            model_id=embedding_model,
+            user_id=user_id,
+            resolved_keys=resolved_keys,
+            capability="embedding",
+        )
+    if (
+        embedding_provider == "openrouter"
+        and resolved_keys
+        and "openrouter" in resolved_keys
+    ):
+        env_keys_block.setdefault("OPENROUTER_API_KEY", resolved_keys["openrouter"])
+    if not env_keys_block:
+        config_override.pop("env_keys", None)
+
+    return config_override
+
+
 def _dispatch_llm_provider_fallback(
     job: dict, config_override: dict | None
 ) -> str | None:
@@ -3784,6 +3903,30 @@ async def lifespan(app: FastAPI):
     except Exception as _e:
         logger.error("Datasource credentials backfill failed: %s", _e)
 
+    # Strip any legacy plaintext secrets from threads.metadata.config_override.
+    # Persistent-session credentials are injected in-flight at attach/resume and
+    # must never be stored (see redact_config_override). Idempotent — once all
+    # rows are secret-free this is a fast no-op. Lives in lifespan (not init.py)
+    # for the same reason as the datasource backfill above.
+    try:
+        _sf = await postgres_db.backfill_strip_thread_config_secrets()
+        if _sf["stripped"] > 0:
+            logger.info(
+                "Stripped secrets from %d thread config_override(s) "
+                "(%d skipped, %d errors)",
+                _sf["stripped"],
+                _sf["skipped"],
+                _sf["errors"],
+            )
+        elif _sf["errors"] > 0:
+            logger.warning(
+                "Thread config_override strip backfill: %d errors (%d skipped)",
+                _sf["errors"],
+                _sf["skipped"],
+            )
+    except Exception as _e:
+        logger.error("Thread config_override strip backfill failed: %s", _e)
+
     # Dev-only: seed a fixed admin MCP token from MCP_DEV_TOKEN so a committed
     # .mcp.json works out of the box against a local cluster. Only fires when
     # MCP_DEV_TOKEN is set (unset in prod → no-op, no surprise auto-generated
@@ -4362,11 +4505,55 @@ async def list_jobs(
             for job in jobs:
                 job["audit_count"] = None
 
-        return jobs
+        return [_redact_job_config_override(job) for job in jobs]
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+def _redact_job_config_override(job: dict[str, Any]) -> dict[str, Any]:
+    """Strip credential fields from a job's ``config_override`` before it leaves
+    over REST. asyncpg returns the JSONB column as a JSON string; we redact and
+    re-serialize to the original representation so the response shape is
+    unchanged. See ``security.access.redact_config_override``.
+    """
+    co = job.get("config_override")
+    if co is None:
+        return job
+    was_str = isinstance(co, str)
+    if was_str:
+        try:
+            co = json.loads(co)
+        except (json.JSONDecodeError, TypeError):
+            # Opaque/garbage — drop it rather than risk returning a raw secret.
+            job = dict(job)
+            job["config_override"] = None
+            return job
+    job = dict(job)
+    cleaned = redact_config_override(co)
+    job["config_override"] = json.dumps(cleaned) if was_str else cleaned
+    return job
+
+
+def _redact_thread_metadata(thread: dict[str, Any]) -> dict[str, Any]:
+    """Strip credential fields from a thread's ``metadata.config_override``
+    before it leaves over REST. ``metadata`` is a JSONB column returned as a
+    JSON string; redact and re-serialize to the original representation.
+    """
+    md = thread.get("metadata")
+    was_str = isinstance(md, str)
+    if was_str:
+        try:
+            md = json.loads(md)
+        except (json.JSONDecodeError, TypeError):
+            return thread  # unparseable — cannot contain our config_override
+    if isinstance(md, dict) and "config_override" in md:
+        thread = dict(thread)
+        md = dict(md)
+        md["config_override"] = redact_config_override(md["config_override"])
+        thread["metadata"] = json.dumps(md) if was_str else md
+    return thread
 
 
 @app.get("/api/jobs/{job_id}")
@@ -4378,7 +4565,7 @@ async def get_job(request: Request, job_id: str) -> dict[str, Any]:
             job["audit_count"] = await mongodb.get_audit_count(job_id)
         else:
             job["audit_count"] = None
-        return job
+        return _redact_job_config_override(job)
     except HTTPException:
         raise
     except Exception as e:
@@ -11685,6 +11872,19 @@ async def agent_get_thread_workspace(
         and not cloud_sync_cfg
         and not thread.get("nc_session_folder")
     )
+    # Re-inject credentials in-flight: the persisted config_override is stripped
+    # of secrets (redact_config_override at create/hot-swap). This endpoint is
+    # the agent's key source on resume — its attach fallback in persistent_app.py
+    # reads ``config_override`` from here. require_internal + ingress-stripped, so
+    # plaintext stays on the agent trust boundary. Models/providers survive
+    # stripping, so user_settings isn't needed to repopulate the keys.
+    co = metadata.get("config_override") or {}
+    if co:
+        co = await _inject_thread_dispatch_credentials(
+            co,
+            user_id=str(thread["user_id"]) if thread.get("user_id") else None,
+            project_id=str(thread["project_id"]) if thread.get("project_id") else None,
+        )
     return {
         "status": ws.get("status", "none"),
         # K8s provisioner uses pod_ip; Docker provisioner uses host — normalize
@@ -11700,8 +11900,8 @@ async def agent_get_thread_workspace(
         "vm_ssh_host": vm.get("ssh_host"),
         "vm_ssh_port": vm.get("ssh_port"),
         "vm_name": vm.get("vm_name"),
-        # Config overrides (model, temperature, etc.)
-        "config_override": metadata.get("config_override"),
+        # Config overrides (model, temperature, etc.) — secrets re-injected above
+        "config_override": co,
         # Project scoping
         "project_ids": project_ids,
         # Resolved datasources for the thread
@@ -11986,7 +12186,14 @@ async def agent_update_thread_config(
                     llm_section.setdefault(transport_key, None)
                 config_override["llm"] = llm_section
 
-        ok = await postgres_db.merge_thread_config_override(thread_id, config_override)
+        # Persist WITHOUT secrets — the agent rebuilds its LLM from the enriched
+        # dict returned below, and resume re-injects from source. The explicit
+        # None transport sentinels stay in the stored copy so the deep-merge
+        # clears the previous model's transport; resume re-injection treats them
+        # as absent (see _inject_thread_dispatch_credentials).
+        ok = await postgres_db.merge_thread_config_override(
+            thread_id, redact_config_override(config_override)
+        )
         if not ok:
             raise HTTPException(status_code=404, detail="Thread not found")
 
@@ -12345,100 +12552,17 @@ async def create_thread(
             [request_body.project_id] if request_body.project_id else []
         )
 
-        # Resolve endpoint-backed model credentials so the agent gets the
-        # right base_url + api_key. Without this, custom/system endpoints
-        # (per-user vLLM, helm-seeded providers) silently route to the
-        # default OpenAI base and 404. Mirrors the dispatch path used for
-        # jobs at the dispatch_job site above.
-        llm_section = config_override.get("llm") or {}
-        resolved_keys = await postgres_db.resolve_api_keys_for_job(
+        # Resolve + inject LLM / auxiliary / embedding credentials so the agent
+        # gets the right base_url + api_key. Mirrors the worker-job dispatch
+        # injection. Secrets are injected in-flight here (and re-injected at
+        # session attach/resume) but stripped before the row is persisted (see
+        # redact_config_override below) — the threads table never stores keys.
+        config_override = await _inject_thread_dispatch_credentials(
+            config_override,
             user_id=str(user["id"]),
             project_id=effective_project_ids[0] if effective_project_ids else None,
+            user_settings=user_settings,
         )
-        # If neither the request nor the user's persistent_agent prefs pinned
-        # a model, fall back to the system default chat pin (the readiness
-        # gate's default_chat_model). This stops the agent from booting on
-        # its YAML default (RedHatAI/...) — which has no transport and
-        # silently routes to api.openai.com with "not-needed".
-        if not llm_section.get("model"):
-            system_chat_model = await postgres_db.resolve_default_for_capability("chat")
-            if system_chat_model:
-                llm_section["model"] = system_chat_model
-                logger.info(
-                    "Thread create: injected system default chat model: %s",
-                    system_chat_model,
-                )
-        if llm_section.get("model"):
-            await _inject_model_credentials(
-                section=llm_section,
-                model_id=llm_section["model"],
-                user_id=str(user["id"]),
-                resolved_keys=resolved_keys,
-            )
-            config_override["llm"] = llm_section
-
-        # Auxiliary slot. The agent's auxiliary_llm runs title generation,
-        # memory extraction, and knowledge curation; without an explicit
-        # override here the agent falls through to the YAML default and 401s
-        # on api.openai.com. Mirrors the worker dispatch block above.
-        aux_section = config_override.get("auxiliary") or {}
-        if not aux_section.get("model"):
-            aux_model = (user_settings or {}).get("default_auxiliary_model")
-            if not aux_model:
-                aux_model = await postgres_db.resolve_default_for_capability(
-                    "auxiliary"
-                )
-            if aux_model:
-                aux_section["model"] = aux_model
-                logger.info("Thread create: injected auxiliary model: %s", aux_model)
-        if aux_section.get("model"):
-            await _inject_model_credentials(
-                section=aux_section,
-                model_id=aux_section["model"],
-                user_id=str(user["id"]),
-                resolved_keys=resolved_keys,
-                capability="auxiliary",
-            )
-            config_override["auxiliary"] = aux_section
-
-        # Embedding capability travels as flat env vars (EMBEDDING_PROVIDER,
-        # EMBEDDING_MODEL, EMBEDDING_BASE_URL, EMBEDDING_API_KEY) consumed by
-        # the EmbeddingService singleton. Same risk as the auxiliary slot:
-        # the singleton is built at process boot from the agent's environment;
-        # without an attach-time override it sticks at whatever was set then.
-        env_keys_block = config_override.setdefault("env_keys", {})
-        embedding_provider = (user_settings or {}).get("embedding_provider")
-        embedding_model = (user_settings or {}).get("default_embedding_model")
-        if not embedding_model:
-            embedding_model = await postgres_db.resolve_default_for_capability(
-                "embedding"
-            )
-        if embedding_provider and "EMBEDDING_PROVIDER" not in env_keys_block:
-            env_keys_block["EMBEDDING_PROVIDER"] = embedding_provider
-        if embedding_model and "EMBEDDING_MODEL" not in env_keys_block:
-            env_keys_block["EMBEDDING_MODEL"] = embedding_model
-            await _inject_env_key_credentials(
-                env_keys=env_keys_block,
-                prefix="EMBEDDING",
-                model_id=embedding_model,
-                user_id=str(user["id"]),
-                resolved_keys=resolved_keys,
-                capability="embedding",
-            )
-            logger.info(
-                "Thread create: injected embedding: provider=%s, model=%s",
-                embedding_provider,
-                embedding_model,
-            )
-        if (
-            embedding_provider == "openrouter"
-            and resolved_keys
-            and "openrouter" in resolved_keys
-            and "OPENROUTER_API_KEY" not in env_keys_block
-        ):
-            env_keys_block["OPENROUTER_API_KEY"] = resolved_keys["openrouter"]
-        if not env_keys_block:
-            config_override.pop("env_keys", None)
 
         # Keep the threads.permission_mode column in sync with the mode the
         # agent will actually load from config_override (request > user default >
@@ -12462,7 +12586,11 @@ async def create_thread(
         # ``metadata.project_ids`` JSONB key is no longer written.
         metadata_patch = {}
         if config_override:
-            metadata_patch["config_override"] = config_override
+            # Persist WITHOUT secrets: keys are injected in-flight at attach
+            # (provision_or_assign / _assign_pool_agent below pass the enriched
+            # in-memory copy) and re-injected on resume (workspace endpoint +
+            # resume dispatcher). The threads row never stores plaintext keys.
+            metadata_patch["config_override"] = redact_config_override(config_override)
         if request_body.datasource_ids:
             metadata_patch["datasource_ids"] = request_body.datasource_ids
         if metadata_patch:
@@ -12772,7 +12900,7 @@ async def list_threads(
             # list endpoint is bounded by the user's own thread count.
             mount_rows = await postgres_db.list_thread_mounts(str(t["id"]))
             t["cloud_session_url"] = _resolve_cloud_session_url(t, mount_rows)
-        return {"threads": threads}
+        return {"threads": [_redact_thread_metadata(t) for t in threads]}
     except HTTPException:
         raise
     except Exception as e:
@@ -13159,7 +13287,7 @@ async def get_thread(thread_id: str, request: Request) -> dict[str, Any]:
     list-of-strings view kept stable for callers that only need scoping.
     """
     user, thread = await require_thread_owner(request, postgres_db, thread_id)
-    result = dict(thread)
+    result = _redact_thread_metadata(dict(thread))
     mounts = await postgres_db.list_thread_mounts(thread_id)
     result["cloud_session_url"] = _resolve_cloud_session_url(thread, mounts)
     result["mounts"] = [
@@ -13412,12 +13540,30 @@ async def resume_thread(
                 # Try idle pool agent first (instant attach, no pod boot).
                 idle_agent = await _find_idle_persistent_agent()
                 if idle_agent:
-                    co = thread.get("config_override") or {}
-                    if isinstance(co, str):
+                    # config_override lives in metadata (no top-level column) and
+                    # is stripped of secrets at rest — re-inject from source so the
+                    # attach payload carries the agent's keys. Needed in addition
+                    # to the workspace-endpoint re-inject because datasource
+                    # sessions make `co` truthy, suppressing the agent's
+                    # fetch-fallback (persistent_app.py).
+                    md = cur.get("metadata") or {}
+                    if isinstance(md, str):
                         try:
-                            co = json.loads(co)
+                            md = json.loads(md)
                         except (json.JSONDecodeError, TypeError):
-                            co = {}
+                            md = {}
+                    co = (
+                        (md.get("config_override") or {})
+                        if isinstance(md, dict)
+                        else {}
+                    )
+                    co = await _inject_thread_dispatch_credentials(
+                        co,
+                        user_id=str(cur["user_id"]) if cur.get("user_id") else None,
+                        project_id=str(cur["project_id"])
+                        if cur.get("project_id")
+                        else None,
+                    )
                     # Pass the thread's explicit datasource selection (persisted
                     # in metadata) — without it, explicit-only resolution returns
                     # nothing on idle-pool resume (this path previously dropped
@@ -19423,7 +19569,7 @@ async def list_project_jobs(
             for job in jobs:
                 job["audit_count"] = None
 
-        return jobs
+        return [_redact_job_config_override(job) for job in jobs]
     except HTTPException:
         raise
     except Exception as e:

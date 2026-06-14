@@ -97,10 +97,11 @@ migration plan live in [[agent_memory_overhaul]].
 >   there must update the equivalence suites in lockstep (the slice-5 guard
 >   terms are the one sanctioned delta).
 >
-> **Phase 2–3 deltas (2026-06-12 → 13, on the working tree).** The runtime
-> read/write behaviour this snapshot describes is **unchanged** — Phases 2–3
-> added an offline eval harness and a set of *optional, default-inert* plugins,
-> not a new live path. Read with that caveat:
+> **Phase 2–4 deltas (2026-06-12 → 14, on the working tree).** The runtime
+> read/write behaviour this snapshot describes is **unchanged** — Phases 2–4
+> added an offline eval harness and a set of *optional, default-inert* plugins
+> plus a behaviour-preserving schema migration, not a new live path. Read with
+> that caveat:
 > - **Phase 2 = `eval/memory/` (offline only).** A LongMemEval_S harness that
 >   drives `assemble()`/`capture()` directly + an LLM judge + a contradiction
 >   probe. It never runs inside the agent; it touches no runtime code path. It
@@ -120,9 +121,25 @@ migration plan live in [[agent_memory_overhaul]].
 >   `policies: [gate, bounded]`, relative gate 0.01 + bounded-10) lives in the
 >   overhaul doc's Phase-3 log; flipping it into the defaults YAML is an
 >   unstarted, separate rollout decision (overhaul Status, GATE B).
-> - **Equivalence pinning still holds.** Phase 3 changed neither the legacy
->   blocks nor the seam's default rendering, so the equivalence suites above
->   remain green and the freeze-until-deletion rule is unaffected.
+> - **Phase 4 = bi-temporal supersede, behaviour-preserving + flag-gated.**
+>   Migration `vector/0006_bitemporal_memory.sql` adds `valid_from`/`valid_to`/
+>   `superseded_at`/`superseded_by` to `memories` and teaches the three memory
+>   hybrid-search functions + `recall_store` reads to filter `valid_to IS NULL`.
+>   That filter is **live and not flag-gated** (a retired row must never be
+>   served) but **inert today**: every row has `valid_to = NULL` until something
+>   retires it, so retrieval returns exactly what it did before — classify the
+>   filter ✅ **WIRED-but-no-op**. The thing that *does* the retiring — the
+>   `RecallStore.store()` ingestion-verdict branch (ADD/UPDATE/MERGE/NOOP via the
+>   aux LLM → `supersede`), the `IngestionVerdictService`/prompt, and the
+>   `write_gate` completeness toggle — is gated behind `memory.ingestion.enabled`
+>   / `memory.extraction.write_gate` (both **default off**), so `store()` keeps
+>   the legacy cosine-0.85 dedup-merge byte-for-byte on the live path: 🔶
+>   **CONDITIONAL**. The harness measurement (does supersede fix
+>   knowledge-update?) is unstarted — overhaul doc Phase-4 log, slice 4.
+> - **Equivalence pinning still holds.** Phases 3–4 changed neither the legacy
+>   blocks nor the seam's default rendering (the verdict branch is unreachable
+>   with the flag off), so the equivalence suites above remain green and the
+>   freeze-until-deletion rule is unaffected.
 
 Classification legend:
 
