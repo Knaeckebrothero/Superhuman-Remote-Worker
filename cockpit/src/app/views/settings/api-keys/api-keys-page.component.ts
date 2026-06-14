@@ -236,7 +236,7 @@ const DEFAULT_SCOPES = ['jobs:read', 'chat:read'];
   `,
   styles: [`
     :host { display: block; height: 100%; }
-    .api-keys-page { padding: 24px; max-width: 1100px; margin: 0 auto; }
+    .api-keys-page { padding: 24px; max-width: var(--content-max-width); margin: 0 auto; }
     .api-keys-container { display: flex; flex-direction: column; gap: 24px; }
     .page-header { display: flex; align-items: center; gap: 12px; }
     .page-title { margin: 0; font-size: 1.5rem; }

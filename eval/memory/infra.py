@@ -238,6 +238,11 @@ def build_manager(
     Neo4j). retrieval_timeout=None per the module docstring.
     """
     from src.services.memory import MemoryManager, MemoryRuntime
+    from src.services.memory.ingestion import maybe_attach_ingestion_verdict
+
+    # Ingestion verdicts + bi-temporal supersede (overhaul Phase 4) — attach to
+    # the store the capture writers use, so a seam ingest exercises supersede.
+    maybe_attach_ingestion_verdict(recall_store, auxiliary_llm, config.memory)
 
     return MemoryManager.from_config(
         config.memory,

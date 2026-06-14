@@ -1336,6 +1336,49 @@ class GateConfig:
 
 
 @dataclass
+class IngestionConfig:
+    """memory.ingestion — write-path ingestion verdicts + bi-temporal supersede
+    (overhaul Phase 4, docs/features/agent_memory_overhaul.md §5).
+
+    When ``enabled``, ``RecallStore.store()`` replaces the lossy cosine-0.85
+    dedup-merge with an aux-LLM adjudication: a new candidate is compared
+    against its top-``verdict_top_k`` currently-valid neighbours and the LLM
+    returns ADD / UPDATE / MERGE / NOOP. UPDATE and MERGE retire the
+    superseded rows (set ``valid_to``/``superseded_at``/``superseded_by``) so
+    default retrieval stops serving them — the washing-machine fix (P3).
+
+    Cost guard ("bound verdict calls per write"): the LLM is consulted only
+    when a neighbour scores at/above ``review_floor`` similarity. A genuinely
+    new fact (no near-duplicate) is a straight ADD with zero LLM calls, so
+    verdict calls are bounded to roughly the near-duplicate rate — at most one
+    per stored memory. Default off: it changes what the store keeps, so it is
+    a measured opt-in and ships inert until the harness/soak greenlights it.
+    """
+
+    enabled: bool = False
+    verdict_top_k: int = 5  # neighbours shown to the adjudicator
+    review_floor: float = 0.6  # min cosine similarity that triggers a verdict call
+
+
+@dataclass
+class ExtractionConfig:
+    """memory.extraction — write-path extraction policy (overhaul Phase 4).
+
+    ``write_gate`` keeps the legacy write-time importance floor
+    (``importance < importance_threshold`` → skip). Phase 4 sets it False to
+    follow completeness-over-precision (§4 writers): a fact skipped at write
+    time is unrecoverable, and relevance is now gated at *retrieval* (the
+    reranker + gate), so the write-time floor is redundant. Default True —
+    dropping it is a measured opt-in. Boundary-driven extraction (phase-end,
+    session-end, idle) is already always-on via the registered
+    phase_boundary / teardown writers with the interval extractor as the
+    turn-count fallback, so it needs no separate trigger knob here.
+    """
+
+    write_gate: bool = True
+
+
+@dataclass
 class QueryConfig:
     """memory.query — retrieval query formation (overhaul §4).
 
@@ -1379,6 +1422,8 @@ class MemoryConfig:
     bounded: BoundedConfig = field(default_factory=BoundedConfig)
     gate: GateConfig = field(default_factory=GateConfig)
     query: QueryConfig = field(default_factory=QueryConfig)
+    ingestion: IngestionConfig = field(default_factory=IngestionConfig)
+    extraction: ExtractionConfig = field(default_factory=ExtractionConfig)
 
 
 @dataclass
@@ -1625,6 +1670,19 @@ def _parse_memory_config(data: Dict[str, Any]) -> MemoryConfig:
             query_data.get("digest_max_chars_per_message", 500)
         ),
     )
+    ingestion_data = data.get("ingestion", {}) or {}
+    if not isinstance(ingestion_data, dict):
+        # Bool shorthand (`ingestion: true`), same tolerance as manager/tasks.
+        ingestion_data = {"enabled": bool(ingestion_data)}
+    ingestion = IngestionConfig(
+        enabled=bool(ingestion_data.get("enabled", False)),
+        verdict_top_k=int(ingestion_data.get("verdict_top_k", 5)),
+        review_floor=float(ingestion_data.get("review_floor", 0.6)),
+    )
+    extraction_data = data.get("extraction", {}) or {}
+    extraction = ExtractionConfig(
+        write_gate=bool(extraction_data.get("write_gate", True)),
+    )
     return MemoryConfig(
         enabled=data.get("enabled", False),
         budget_tokens=data.get("budget_tokens", 10000),
@@ -1650,6 +1708,8 @@ def _parse_memory_config(data: Dict[str, Any]) -> MemoryConfig:
         bounded=bounded,
         gate=gate,
         query=query,
+        ingestion=ingestion,
+        extraction=extraction,
     )
 
 

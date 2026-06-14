@@ -858,7 +858,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
 
     .page-container {
       padding: 24px;
-      max-width: 1200px;
+      max-width: var(--content-max-width-wide);
       margin: 0 auto;
       overflow-x: hidden;
     }

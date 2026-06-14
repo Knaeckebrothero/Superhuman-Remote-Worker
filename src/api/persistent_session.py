@@ -813,6 +813,17 @@ class PersistentSession:
                 ),
             )
 
+        # Ingestion verdicts + bi-temporal supersede (overhaul Phase 4). Wired
+        # onto the store independently of the manager cutover — a write-path
+        # change behind memory.ingestion.enabled, used by legacy + seam writers.
+        from src.services.memory.ingestion import maybe_attach_ingestion_verdict
+
+        maybe_attach_ingestion_verdict(
+            self.recall_store,
+            getattr(self, "auxiliary_llm", None),
+            self.config.memory,
+        )
+
     def swap_backend(self, new_backend: Any) -> None:
         """Hot-swap workspace backend at runtime (e.g. container → VM).
 

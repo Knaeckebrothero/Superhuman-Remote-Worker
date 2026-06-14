@@ -64,7 +64,7 @@ type AdminLlmTab = 'providers' | 'models' | 'defaults';
     }
     .admin-page {
       padding: 32px;
-      max-width: 1100px;
+      max-width: var(--content-max-width);
       margin: 0 auto;
       color: var(--text-primary);
     }

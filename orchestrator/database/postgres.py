@@ -3954,6 +3954,87 @@ class PostgresDB:
 
         return {"encrypted": encrypted, "skipped": skipped, "errors": errors}
 
+    async def backfill_strip_thread_config_secrets(self) -> Dict[str, int]:
+        """One-shot migration: strip plaintext secrets from
+        ``threads.metadata.config_override``.
+
+        Persistent-session credentials are injected in-flight at session attach /
+        resume and must never be stored (see
+        ``security.access.redact_config_override`` and
+        ``main._inject_thread_dispatch_credentials``). This removes any legacy
+        plaintext keys (api_key, ``env_keys.*_API_KEY``, rclone_spec, ...) left
+        in the JSONB by earlier code.
+
+        Idempotent — a config_override that already has no secret fields is
+        rewritten to an identical value, detected by equality and counted as
+        skipped (no UPDATE issued).
+
+        Returns counts: ``{"stripped": N, "skipped": M, "errors": K}``.
+        """
+        # Lazy import keeps the module graph acyclic (security.access pulls in
+        # security.auth; this is a one-shot startup path, not a hot path).
+        from security.access import redact_config_override
+
+        stripped = 0
+        skipped = 0
+        errors = 0
+
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT id, metadata FROM threads "
+                "WHERE metadata -> 'config_override' IS NOT NULL"
+            )
+
+            for row in rows:
+                thread_id = row["id"]
+                raw = row["metadata"]
+
+                try:
+                    md = json.loads(raw) if isinstance(raw, str) else raw
+                except (json.JSONDecodeError, ValueError) as exc:
+                    logger.error(
+                        "Strip backfill: failed to parse metadata for thread %s: %s",
+                        thread_id,
+                        exc,
+                    )
+                    errors += 1
+                    continue
+
+                co = md.get("config_override") if isinstance(md, dict) else None
+                if not isinstance(co, dict):
+                    skipped += 1
+                    continue
+
+                cleaned = redact_config_override(co)
+                if cleaned == co:
+                    skipped += 1
+                    continue
+
+                try:
+                    await conn.execute(
+                        """
+                        UPDATE threads
+                        SET metadata = jsonb_set(
+                            COALESCE(metadata, '{}'::jsonb),
+                            '{config_override}',
+                            $1::jsonb
+                        )
+                        WHERE id = $2
+                        """,
+                        json.dumps(cleaned),
+                        thread_id,
+                    )
+                    stripped += 1
+                except Exception as exc:
+                    logger.error(
+                        "Strip backfill: update failed for thread %s: %s",
+                        thread_id,
+                        exc,
+                    )
+                    errors += 1
+
+        return {"stripped": stripped, "skipped": skipped, "errors": errors}
+
     async def upsert_default_datasource(
         self,
         name: str,

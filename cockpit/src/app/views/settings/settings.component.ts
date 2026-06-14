@@ -1030,7 +1030,7 @@ const EXPIRY_OPTIONS = [
 
     .settings-page {
       padding: 32px;
-      max-width: 800px;
+      max-width: var(--content-max-width);
       margin: 0 auto;
       color: var(--text-primary);
     }

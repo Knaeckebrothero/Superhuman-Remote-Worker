@@ -28,8 +28,9 @@ related:
 > assembles the right memories for every LLM call — the model is a *consumer*, never the
 > manager. Build the seam first; everything else becomes a plugin behind it.
 
-**Status:** Design v2 / **Phases 1–3 implemented + measured (2026-06-13)**. A
-7-phase overhaul; **three phases done, two rollout gates + Phases 4–7 remain.**
+**Status:** Design v2 / **Phases 1–3 implemented + measured; Phase 4 code
+complete, measurement pending (2026-06-14)**. A 7-phase overhaul; **four phases
+coded, two rollout gates + the Phase-4 measurement + Phases 5–7 remain.**
 The map:
 
 - **Phase 1 (MemoryManager seam) — code complete, flag ON, committed.** Both
@@ -58,12 +59,17 @@ The map:
   but **inert by default** (nothing in the defaults-YAML pipeline). **GATE B:**
   the production flip is a separate decision pending real-session evidence —
   the harness is N=20 synthetic with a gemma reader, not the product workload.
-- **Phase 4 (lifecycle supersede) — NEXT, not started.** Opening baseline
-  recorded (`runs/contra_complete_rerank`: update_above_original 0.75, reader
-  current 1.0 on the 8-probe fixture). The only thing that fixes
-  knowledge-update (0/4 end-task, and rerank ordering makes it *worse* at equal
-  tokens — a lifecycle problem no retrieval policy can solve). Bi-temporal
-  columns + ingestion verdicts (ADD/UPDATE/MERGE/NOOP) + retire-and-exclude.
+- **Phase 4 (lifecycle supersede) — CODE COMPLETE (slices 1–3, 2026-06-14),
+  measurement pending.** Bi-temporal columns + retrieval filter (migration
+  `vector/0006`, live-validated), ingestion verdicts ADD/UPDATE/MERGE/NOOP via
+  the aux LLM (`memory.ingestion.enabled`, default off) with retire-and-exclude
+  supersede, and a `write_gate` completeness toggle — all inert by default,
+  full suite green. The only thing that fixes knowledge-update (0/4 end-task,
+  and rerank ordering makes it *worse* at equal tokens — a lifecycle problem no
+  retrieval policy can solve). **Slice 4 (the measurement) is the open item:**
+  a fresh seam ingest with verdicts on (arms staged) vs the opening baseline
+  (`runs/contra_complete_rerank`: update_above_original 0.75, reader current
+  1.0). Needs the cluster + creds + a ~4.5h ingest.
 - **Phases 5–7** — ablate-and-cut (find + delete cargo-cult consolidation),
   buckets productized (personal/shared + cockpit panel), frontier verdicts
   (graph-keep, learned scorer). Decision-gated or dependent on Phase 4.
@@ -594,6 +600,66 @@ below in new order). Every bug worth fixing *before* the seam is fixed
   tokens). Production flip (defaults YAML pipelines) deliberately NOT
   included — rollout is a separate decision on real-session evidence;
   all new config sections are inert without explicit opt-in.
+- **2026-06-14 — Phase 4 slices 1–3 IMPLEMENTED (code complete, inert by
+  default; measurement = slice 4, not yet run).** The lifecycle write path:
+  ingestion verdicts + bi-temporal supersede, behind `memory.ingestion.enabled`
+  (default off) and `memory.extraction.write_gate`.
+  **Slice 1 (bi-temporal schema + retrieval filter, behaviour-preserving):**
+  migration `vector/0006_bitemporal_memory.sql` adds `valid_from` / `valid_to`
+  / `superseded_at` / `superseded_by` (self-FK, ON DELETE SET NULL) to
+  `memories`, backfills `valid_from = created_at`, two partial scope indexes
+  `WHERE valid_to IS NULL`, and CREATE-OR-REPLACEs the **three** memory
+  hybrid-search functions to filter `valid_to IS NULL` in every channel
+  (bodies otherwise byte-identical to 0002's halfvec versions — the casts +
+  `SET hnsw.iterative_scan` preserved). `knowledge_*` functions deliberately
+  untouched: `knowledge_index` already supersedes via `status='active'` and the
+  KB is the model's active notebook (P0). `recall_store` `find_similar` /
+  `get_ttl_active` / `decrement_ttl` filter `valid_to IS NULL`; `get_stats`
+  reports a current/superseded split; `MemoryRecord` gains the columns.
+  Behaviour-preserving by construction (every row valid_to NULL until a writer
+  retires it) — the filter is NOT flag-gated (a retired memory must never be
+  served). **Live-validated** in a throwaway pgvector-0.8.2 container: 0001→0006
+  apply clean, a retired row is excluded from `memory_hybrid_search` despite
+  matching every channel, columns/FK/partial indexes present. Equivalence
+  suites stay green.
+  **Slice 2 (ingestion verdict + supersede):** `IngestionVerdict` schema +
+  `IngestionVerdictTask` (`auxiliary.py`), `IngestionVerdictService` +
+  `maybe_attach_ingestion_verdict` (NEW `src/services/memory/ingestion.py`),
+  prompt `config/prompts/memory_ingestion_verdict.txt`. `RecallStore.store()`
+  gains a verdict branch keyed on `self.ingestion_verdict is not None` (None
+  everywhere today → legacy cosine-dedup byte-identical, equivalence pinned):
+  `find_similar_many` (currently-valid top-k) → **cost guard** (no neighbour ≥
+  `review_floor` → straight ADD, zero LLM calls; ≤1 verdict call per stored
+  memory) → `adjudicate` → ADD / NOOP (bump existing) / UPDATE (insert new +
+  `supersede` the stale rows, linking `superseded_by`) / MERGE (insert the
+  aux-merged content + supersede). New store primitives `find_similar_many` +
+  `supersede`; the INSERT and the dedup-bump refactored into shared `_insert` /
+  `_bump_existing`. Fail-safe: an aux outage or malformed verdict degrades to
+  ADD (never lose a write, never wrongly retire). Wired at the three
+  manager-construction sites (worker graph builder, persistent `_setup_memory`,
+  harness `build_manager`) — independent of the manager cutover, since it's a
+  write-path change used by both legacy and seam writers. The verdict rides the
+  existing aux LLM (no new transport/credential plumbing).
+  **Slice 3 (completeness):** `memory.extraction.write_gate` (default True =
+  legacy importance floor); false drops the write-time gate (a skipped fact is
+  unrecoverable; relevance is now gated at retrieval by the reranker+gate). No
+  `trigger` knob added — boundary-driven extraction is already always-on via
+  the `phase_boundary` + teardown writers with the interval extractor as the
+  turn fallback; an unwired knob would be config theatre.
+  **Tests:** +28 (`test_recall_store` verdict ADD/NOOP/UPDATE/MERGE +
+  find_similar_many/supersede/write_gate; `test_memory_ingestion` service
+  fail-safe + maybe_attach + config parse). Full suite **6453 passed** (only
+  the known `test_connect_disconnect` ordering flake), lint+format clean.
+  **Slice 4 (measure) staged, NOT run:** arms `persistent_complete_verdict`
+  (fresh seam ingest — verdicts change the write path, can't requery) +
+  `contra_complete_verdict` (the contradiction fixture with supersede ON +
+  the rerank read stack). Target shifts from "update out-ranks original"
+  (baseline 0.75) to **original_injected → 0** — the stale fact is *retired*,
+  never injected, so relevance ordering no longer has to win — with reader
+  current 1.0 and the KU end-task slice recovering toward 0.5. Needs the
+  cluster + `EVAL_AUX_API_KEY` + a ~4.5h ingest (eval writes to `srw_eval`
+  only). Production flip (defaults YAML) is the separate GATE-B rollout
+  decision; all Phase-4 config is inert without explicit opt-in.
 **Companions:**
 - [`agent_memory_current_state.md`](agent_memory_current_state.md) — ground truth: every
   current capability classified wired/dead/conceptual with `file:line` evidence.
@@ -1122,11 +1188,20 @@ gap is one knowledge-update question = supersede = Phase 4 by construction).
 `bounded: {max_items: 10}`, reranker `keep_pinned_first: false` + top_k sized to
 cover the store (gate arms leak unscored tail items fail-open otherwise).
 
-### Phase 4 — Lifecycle writers: verdicts + bi-temporal supersede · ~1–1.5 wk
-Ingestion verdicts (ADD/UPDATE/MERGE/NOOP, aux-LLM, async); bi-temporal columns via
-`migrations/vector/NNNN_bitemporal_memory.sql` (+`knowledge_index`); supersede policy
-(retire-and-exclude, point-in-time queryable); boundary-driven extraction default-on;
-write-gate dropped (completeness>precision). Cost guard: bound verdict calls per write.
+### Phase 4 — Lifecycle writers: verdicts + bi-temporal supersede · ~1–1.5 wk ← **slices 1–3 CODE COMPLETE 2026-06-14 (inert by default); slice 4 = measure**
+Ingestion verdicts (ADD/UPDATE/MERGE/NOOP, aux-LLM) ✅; bi-temporal columns via
+`migrations/vector/0006_bitemporal_memory.sql` ✅ (NOT `knowledge_index` — it already
+supersedes via `status='active'`, and the KB is the model's active notebook, P0);
+supersede policy (retire-and-exclude, point-in-time queryable via `valid_from`/`valid_to`)
+✅; write-gate dropped via `memory.extraction.write_gate` (completeness>precision) ✅.
+Boundary-driven extraction was already always-on (phase_boundary + teardown writers,
+interval as turn fallback) — no new trigger knob. Cost guard ✅: the `review_floor`
+similarity gate means a genuinely-new fact is a straight ADD with zero LLM calls, so
+verdict calls are bounded to ≤1 per stored memory. Behind `memory.ingestion.enabled`
+(default off); `store()` keeps the legacy cosine-dedup path byte-for-byte when the
+verdict service is unwired. **Slice 4 (measure) is the remaining work** — arms
+`persistent_complete_verdict` + `contra_complete_verdict` staged; needs a fresh seam
+ingest (verdicts change the write path, so no requery) on `srw_eval`.
 **Opening baseline (recorded 2026-06-12, `runs/contra_complete_rerank`):** over a
 completeness+rerank corpus the probe reads update_above_original 0.75 (seam 0.125,
 flat 0.625) and reader current 1.0 / stale 0 / miss 0 on the 8-probe fixture — the
@@ -1182,7 +1257,9 @@ memory panel fed by `AssembleStats` provenance (optional stretch).
   `config/defaults.yaml` + `config/persistent_defaults.yaml`): `memory.query.digest`,
   `memory.reranker.{model,endpoint,candidates}`, `memory.gate.threshold`,
   `memory.core.{budget_tokens,pin_sources}`, `memory.budget_tokens` (unified, KB
-  included), `memory.extraction.trigger` (`turns|boundary`), `memory.bitemporal.enabled`,
+  included), **`memory.ingestion.{enabled,verdict_top_k,review_floor}`** and
+  **`memory.extraction.write_gate`** (Phase 4, shipped 2026-06-14 — the verdict
+  supersede landed as `memory.ingestion`, not the placeholder `memory.bitemporal`),
   `memory.gc.{enabled,retention_days}`, `memory.buckets.*` (Phase 6),
   `memory.hnsw.ef_search`.
 - ~~Delete the dead knobs (B9)~~ — **done 2026-06-10** (`dense/sparse/recent_results`,

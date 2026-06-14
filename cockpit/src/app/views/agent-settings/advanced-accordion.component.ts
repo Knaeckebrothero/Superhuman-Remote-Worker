@@ -2,6 +2,7 @@ import {Component, computed, effect, inject, input, output, signal} from '@angul
 import {FormsModule} from '@angular/forms';
 import {TranslocoPipe} from '@jsverse/transloco';
 import {AppIconComponent} from '../../ui/icon';
+import {AppTooltipDirective} from '../../ui/tooltip';
 import {readConfigPath, resolveMatrixForModel, SettingsMode} from './agent-settings.types';
 import {getReasoningOptions} from './reasoning-options';
 import {UserService} from '../../core/services/user.service';
@@ -13,7 +14,7 @@ import {UserService} from '../../core/services/user.service';
 @Component({
   selector: 'app-advanced-accordion',
   standalone: true,
-    imports: [FormsModule, TranslocoPipe, AppIconComponent],
+    imports: [FormsModule, TranslocoPipe, AppIconComponent, AppTooltipDirective],
   template: `
     <div class="advanced-container">
       <!-- Inference Parameters -->
@@ -233,6 +234,9 @@ import {UserService} from '../../core/services/user.service';
                     [disabled]="disabled()">
                   <span>{{ 'advanced.labels.parallelToolCalls' | transloco }}</span>
                 </label>
+                <app-icon size="xs" class="info-icon" tabindex="0"
+                  [appTooltip]="'advanced.hints.parallelToolCalls' | transloco"
+                  [attr.aria-label]="'advanced.hints.parallelToolCalls' | transloco">info</app-icon>
                 @if (parallelToolCalls() !== null) {
                   <button type="button" class="reset-btn" (click)="parallelToolCalls.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
                 }
@@ -789,6 +793,14 @@ import {UserService} from '../../core/services/user.service';
       font-size: 11px;
       color: var(--text-muted, #6c7086);
       margin-top: 2px;
+    }
+    .info-icon {
+      color: var(--text-muted, #6c7086);
+      cursor: help;
+      margin-left: 2px;
+    }
+    .info-icon:hover, .info-icon:focus-visible {
+      color: var(--text-secondary, #9399b2);
     }
     .lite-hint {
       margin: 4px 0 8px;

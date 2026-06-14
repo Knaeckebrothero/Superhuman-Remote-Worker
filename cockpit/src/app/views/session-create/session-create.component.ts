@@ -173,7 +173,7 @@ interface ExpertDetail extends Expert {
       flex: 1;
       overflow: auto;
       padding: 20px;
-      max-width: 800px;
+      max-width: var(--content-max-width);
       width: 100%;
       margin: 0 auto;
     }

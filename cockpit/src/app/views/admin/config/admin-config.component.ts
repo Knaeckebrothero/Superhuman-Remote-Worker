@@ -273,7 +273,7 @@ const FAMILIES = ['gemma', 'gpt-5', 'gpt-oss', 'deepseek', 'minimax', 'minimax-m
     }
     .admin-page {
       padding: 32px;
-      max-width: 1000px;
+      max-width: var(--content-max-width);
       margin: 0 auto;
       color: var(--text-primary);
     }

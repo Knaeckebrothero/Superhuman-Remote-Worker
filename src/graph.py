@@ -3804,6 +3804,13 @@ def build_phase_alternation_graph(
             ),
         )
 
+    # Ingestion verdicts + bi-temporal supersede (overhaul Phase 4). Wired onto
+    # the store independently of the manager cutover — it's a write-path change
+    # behind memory.ingestion.enabled, used by both the legacy and seam writers.
+    from src.services.memory.ingestion import maybe_attach_ingestion_verdict
+
+    maybe_attach_ingestion_verdict(recall_store, auxiliary_llm, config.memory)
+
     # Create graph
     workflow = StateGraph(UniversalAgentState)
 
