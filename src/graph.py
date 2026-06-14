@@ -3706,6 +3706,8 @@ def build_phase_alternation_graph(
         # Safety layer constant (summarization budgets are computed at call
         # time from the aux model's window — src/core/summarizer.py)
         model_max_context_tokens=config.limits.model_max_context_tokens,
+        # Per-family image-token estimator config (matrix settings.image_tokens).
+        image_tokens=config.limits.image_tokens,
     )
     strategic_config = config.llm.get_phase_config("strategic")
     tactical_config = config.llm.get_phase_config("tactical")

@@ -1,6 +1,7 @@
 # config_override credential leak — at-rest plaintext + unredacted API responses
 
-**Status:** Fixed on `develop` (2026-06-14). Awaiting dev-cluster E2E sign-off.
+**Status:** ✅ Implemented, unit-tested, and **E2E-verified on k3d** (2026-06-14).
+Merged to `develop`; pending dev/prod CI-CD rollout.
 
 ## Summary
 
@@ -97,7 +98,15 @@ strongest at-rest posture and one mental model shared with jobs.
 
 - Unit: `pytest tests/test_config_override_redaction.py tests/test_thread_config_persistence.py`
   (+ `test_datasource_access.py`, `test_dispatch_phase_credentials.py` regression). All green.
-- E2E (pending on k3d/dev): create session on a key-requiring model → confirm DB
-  `metadata->'config_override'` has no `api_key`/`*_API_KEY` → first turn works →
-  **resume works (no 401)** → hot-swap works + still no key at rest → GET endpoints
-  return redacted config_override.
+- E2E on **k3d-srw** (2026-06-14; vector DB `srw-pgvector` left untouched — no restart):
+  - Lifespan backfill stripped all 20 existing threads → **0** plaintext keys at rest
+    (`model`/`base_url`/`provider`/`*_MODEL` preserved).
+  - Internal workspace endpoint **re-injected** `llm.api_key` (len 46), `auxiliary.api_key`,
+    and `EMBEDDING_API_KEY` on a stripped thread.
+  - **Resume keystone:** a resumed (stripped-at-rest) session applied the re-injected key
+    (`sk-mo-…`, `base_url=ai.h4ll.app`), made a successful `POST /v1/embeddings → 200 OK`,
+    and returned a live chat reply — **no 401** anywhere in the agent logs.
+  - **Create:** a freshly-created session persisted stripped (no `api_key`/`*_API_KEY` at rest).
+  - **GET redaction:** user-token `GET /api/persistent/threads[/{id}]` returned `config_override`
+    with no secrets, while the internal endpoint returned them — the intended split.
+  - One unrelated cockpit↔agent WebSocket glitch (known k3d service-worker issue) cleared on reload.
