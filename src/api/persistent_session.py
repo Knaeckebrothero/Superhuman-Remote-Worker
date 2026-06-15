@@ -485,6 +485,8 @@ class PersistentSession:
             # Lets bulk readers cap a single tool result relative to the main
             # model's window (session_silent_failure_audit.md #5).
             "model_max_context_tokens": self.config.limits.model_max_context_tokens,
+            # Per-family page-render DPI (None -> renderer default 150).
+            "pdf_render_dpi": getattr(self.config.limits, "pdf_render_dpi", None),
             "cloud_mount": {
                 "active": bool(
                     self.cloud_mount_manager and self.cloud_mount_manager.active

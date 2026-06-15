@@ -247,6 +247,23 @@ class TestLoaderRouting:
         assert data["llm"]["multimodal"] is True
         assert data["limits"]["image_tokens"]["mode"] == "anthropic_patches"
 
+    def test_claude_sonnet_routes_pdf_render_dpi(self):
+        from src.core.loader import _apply_settings_matrix
+
+        data = {"llm": {"model": "claude-sonnet-4-6"}}
+        _apply_settings_matrix(data, set())
+        # Per-family render DPI lands in limits (not llm); 130 for the 1568 cap.
+        assert data["limits"]["pdf_render_dpi"] == 130
+        assert "pdf_render_dpi" not in data["llm"]
+
+    def test_gpt5_has_no_pdf_render_dpi_override(self):
+        from src.core.loader import _apply_settings_matrix
+
+        data = {"llm": {"model": "gpt-5.5"}}
+        _apply_settings_matrix(data, set())
+        # No matrix value -> absent -> tool falls back to the renderer default (150).
+        assert "pdf_render_dpi" not in data.get("limits", {})
+
 
 # =============================================================================
 # ContextManager end-to-end with a resolved family config

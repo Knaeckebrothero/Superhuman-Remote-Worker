@@ -949,6 +949,11 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: LOG_LEVEL
+            - name: LOG_FORMAT
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: LOG_FORMAT
           volumeMounts:
             - name: workspace
               mountPath: /workspace

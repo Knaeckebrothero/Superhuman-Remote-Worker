@@ -126,6 +126,9 @@ def run_server(config_path: str, host: str, port: int):
         host=host,
         port=port,
         log_level="info",
+        # Defer to our root JSON handler so uvicorn's own access/error logs are
+        # JSON too, not plain text (see docs/features/centralized_logging.md).
+        log_config=None,
     )
 
 
@@ -150,6 +153,9 @@ def run_persistent_server(
         host=host,
         port=port,
         log_level="info",
+        # Defer to our root JSON handler so uvicorn's own access/error logs are
+        # JSON too, not plain text (see docs/features/centralized_logging.md).
+        log_config=None,
     )
 
 
@@ -173,6 +179,9 @@ def run_dual_server(config_path: str, host: str, port: int):
         host=host,
         port=port,
         log_level="info",
+        # Defer to our root JSON handler so uvicorn's own access/error logs are
+        # JSON too, not plain text (see docs/features/centralized_logging.md).
+        log_config=None,
     )
 
 
@@ -180,8 +189,17 @@ def main():
     """Main entry point."""
     args = parse_args()
     setup_logging()
-    # Tag every log line from this agent process with its id (correlation).
-    set_log_context(agent_id=os.getenv("AGENT_ID"))
+    # Tag every log line from this agent process with its identity (correlation).
+    # Pods don't set AGENT_ID; the pod name (POD_NAME / HOSTNAME) is the id the
+    # orchestrator uses in its own logs. SESSION_BOUND_THREAD_ID is present for
+    # dedicated session agents (pool/dual agents bind thread_id per-session at
+    # loop start instead).
+    set_log_context(
+        agent_id=os.getenv("AGENT_ID")
+        or os.getenv("POD_NAME")
+        or os.getenv("HOSTNAME"),
+        thread_id=os.getenv("SESSION_BOUND_THREAD_ID"),
+    )
 
     logger = logging.getLogger(__name__)
 

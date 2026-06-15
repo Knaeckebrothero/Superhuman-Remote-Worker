@@ -12,11 +12,15 @@ execution path. See docs/features/browser_workspace_executor.md and
 docs/issues/remove_local_browser_fallback.md.
 
 This module keeps the agent-side logic — URL validation and content-nonce
-wrapping — and returns the same shape to the LLM:
-``{dom, url, title, screenshot?, tabs?}`` with numbered ``[N]`` element refs.
+wrapping — and returns the page state to the LLM as a text block (URL,
+title, nonce-wrapped DOM with numbered ``[N]`` element refs). A screenshot,
+when present, is emitted as an ``<image_data>`` tag so the graph-side
+``extract_image_tags`` post-processor delivers it as a real image content
+block (and strips the base64 from the text). Returning a string rather
+than a dict is deliberate — see ``_page_state_to_text``.
 
 Vision mode (screenshots in results) auto-selects from the model's
-multimodal capability (settings_matrix.yaml).
+multimodal capability (config/model_config_matrix.yaml ``settings``).
 """
 
 import logging
@@ -26,6 +30,7 @@ from langchain_core.tools import tool
 
 from .browser_security import validate_url_with_config, wrap_with_nonce
 from ..context import ToolContext
+from ...services.image_content import IMAGE_DATA_TAG_TEMPLATE
 
 logger = logging.getLogger(__name__)
 
@@ -126,6 +131,39 @@ async def _run_action(context: ToolContext, action: str, **args: Any) -> Dict[st
     return await context.browser_exec(action, **args)
 
 
+def _page_state_to_text(result: Dict[str, Any]) -> str:
+    """Render a browser-exec result dict to the string the LLM receives.
+
+    A screenshot (base64 PNG) is emitted as an ``<image_data>`` tag so the
+    graph-side ``extract_image_tags`` post-processor lifts it into a real
+    image content block and strips the base64 from the text. The value is
+    returned as a *string* (not the raw dict) on purpose: the persistent
+    loop ``str()``s tool output and the worker ``ToolNode`` ``json.dumps``es
+    it — either of which would escape an in-dict tag and defeat extraction.
+    """
+    if not isinstance(result, dict):
+        return str(result)
+    if result.get("error"):
+        return f"Browser error: {result['error']}"
+
+    wrapped = wrap_with_nonce(result)
+    lines: List[str] = []
+    for key, label in (("url", "URL"), ("title", "Title"), ("tabs", "Open tabs")):
+        value = wrapped.get(key)
+        if value:
+            lines.append(f"{label}: {value}")
+    dom = wrapped.get("dom")
+    if dom:
+        lines.append(str(dom))
+    text = "\n".join(lines)
+
+    screenshot = result.get("screenshot")
+    if screenshot:
+        tag = IMAGE_DATA_TAG_TEMPLATE.format(mime="image/png", b64=screenshot)
+        text = f"{text}\n{tag}" if text else tag
+    return text
+
+
 # ── Tool factory ─────────────────────────────────────────────────────
 
 
@@ -148,7 +186,7 @@ def create_browser_direct_tools(context: ToolContext) -> List[Any]:
         }
 
     @tool
-    async def browser_navigate(url: str) -> dict:
+    async def browser_navigate(url: str) -> str:
         """Open a URL in the browser and see the page.
 
         Returns the page's DOM accessibility tree (with numbered element
@@ -164,13 +202,13 @@ def create_browser_direct_tools(context: ToolContext) -> List[Any]:
         try:
             url = validate_url_with_config(url, browser_cfg)
         except ValueError as e:
-            return {"error": str(e)}
+            return f"Browser error: {e}"
 
         result = await _run_action(context, "navigate", url=url, **_state_args())
-        return result if "error" in result else wrap_with_nonce(result)
+        return _page_state_to_text(result)
 
     @tool
-    async def browser_snapshot() -> dict:
+    async def browser_snapshot() -> str:
         """Get the current page state — DOM tree and optional screenshot.
 
         Use this after performing actions (click, type, scroll) to see
@@ -181,10 +219,10 @@ def create_browser_direct_tools(context: ToolContext) -> List[Any]:
             Page state with dom, url, title, and optionally screenshot
         """
         result = await _run_action(context, "snapshot", **_state_args())
-        return result if "error" in result else wrap_with_nonce(result)
+        return _page_state_to_text(result)
 
     @tool
-    async def browser_click(ref: int) -> dict:
+    async def browser_click(ref: int) -> str:
         """Click an element on the page by its reference number.
 
         Reference numbers come from the DOM snapshot (e.g., [42]<button>).
@@ -197,10 +235,10 @@ def create_browser_direct_tools(context: ToolContext) -> List[Any]:
             Updated page state after the click
         """
         result = await _run_action(context, "click", ref=ref, **_state_args())
-        return result if "error" in result else wrap_with_nonce(result)
+        return _page_state_to_text(result)
 
     @tool
-    async def browser_type(ref: int, text: str, clear: bool = True) -> dict:
+    async def browser_type(ref: int, text: str, clear: bool = True) -> str:
         """Type text into an input field.
 
         Args:
@@ -214,10 +252,10 @@ def create_browser_direct_tools(context: ToolContext) -> List[Any]:
         result = await _run_action(
             context, "type", ref=ref, text=text, clear=clear, **_state_args()
         )
-        return result if "error" in result else wrap_with_nonce(result)
+        return _page_state_to_text(result)
 
     @tool
-    async def browser_select(ref: int, value: str) -> dict:
+    async def browser_select(ref: int, value: str) -> str:
         """Select an option from a dropdown element.
 
         Args:
@@ -230,14 +268,14 @@ def create_browser_direct_tools(context: ToolContext) -> List[Any]:
         result = await _run_action(
             context, "select", ref=ref, value=value, **_state_args()
         )
-        return result if "error" in result else wrap_with_nonce(result)
+        return _page_state_to_text(result)
 
     @tool
     async def browser_scroll(
         direction: str = "down",
         amount: int = 500,
         ref: Optional[int] = None,
-    ) -> dict:
+    ) -> str:
         """Scroll the page or a specific element.
 
         Args:
@@ -249,7 +287,7 @@ def create_browser_direct_tools(context: ToolContext) -> List[Any]:
             Updated page state after scrolling
         """
         if direction not in ("up", "down", "left", "right"):
-            return {"error": f"Invalid direction: {direction}. Use up/down/left/right."}
+            return f"Browser error: Invalid direction: {direction}. Use up/down/left/right."
 
         result = await _run_action(
             context,
@@ -259,10 +297,10 @@ def create_browser_direct_tools(context: ToolContext) -> List[Any]:
             ref=ref,
             **_state_args(),
         )
-        return result if "error" in result else wrap_with_nonce(result)
+        return _page_state_to_text(result)
 
     @tool
-    async def browser_screenshot() -> dict:
+    async def browser_screenshot() -> str:
         """Take a screenshot of the current page.
 
         Always returns an image regardless of the multimodal setting.
@@ -272,17 +310,17 @@ def create_browser_direct_tools(context: ToolContext) -> List[Any]:
         Returns:
             Dict with screenshot (base64), url, and title
         """
-        return await _run_action(context, "screenshot")
+        return _page_state_to_text(await _run_action(context, "screenshot"))
 
     @tool
-    async def browser_back() -> dict:
+    async def browser_back() -> str:
         """Navigate back to the previous page in browser history.
 
         Returns:
             Updated page state after navigating back
         """
         result = await _run_action(context, "back", **_state_args())
-        return result if "error" in result else wrap_with_nonce(result)
+        return _page_state_to_text(result)
 
     @tool
     async def browser_close() -> str:

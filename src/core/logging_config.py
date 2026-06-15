@@ -43,11 +43,12 @@ _CORRELATION_KEYS = ("request_id", "job_id", "thread_id", "agent_id", "phase")
 def bind_log_context(**fields: Any) -> contextvars.Token:
     """Merge ``fields`` into the current logging context; return a reset token.
 
-    ``None`` values are skipped so callers can pass optional ids unconditionally.
+    ``None`` and empty-string values are skipped so callers can pass optional
+    ids unconditionally (k8s often sets unused env vars to "" rather than unset).
     """
     merged = dict(_log_context.get())
     for key, value in fields.items():
-        if value is not None:
+        if value not in (None, ""):
             merged[key] = value
     return _log_context.set(merged)
 
@@ -120,6 +121,7 @@ _RESERVED = set(logging.makeLogRecord({}).__dict__.keys()) | {
     "message",
     "asctime",
     "taskName",
+    "color_message",  # uvicorn passes an ANSI-laden duplicate of the message
 }
 
 
@@ -207,3 +209,7 @@ def configure_logging(
             logging.getLogger(namespace).setLevel(logging.DEBUG)
     else:
         root.setLevel(level)
+
+    # Route Python warnings (warnings.warn) through logging so they're JSON too
+    # (via the root handler) instead of raw stderr. See centralized_logging.md.
+    logging.captureWarnings(True)

@@ -4,11 +4,14 @@ tags:
   - cockpit
   - design
   - readability
+  - layout
   - persistent-sessions
 aliases:
   - chat reading width
   - session text line length
   - chat column max-width
+  - cockpit content width
+  - page width tokens
 related:
   - "[[settings_design]]"
   - "[[session_turn_rendering]]"
@@ -16,237 +19,291 @@ related:
   - "[[session_narration]]"
 ---
 
-# Session Chat Readability — reading-column width & line length
+# Cockpit Content Width & Readability
 
-**Status:** **Proposal — live-measured 2026-06-15, not yet implemented.**
-Scope is the persistent-session chat view (`persistent-chat`). This is the
-chat-specific companion to the page-container width unification shipped the
-same day (the `--content-max-width` / `--content-max-width-wide` tokens in
-`_root-tokens.scss` / `_semantic-tokens.scss`), which covered forms/lists/admin
-pages but deliberately **excluded** the chat reading column. This doc closes
-that gap.
+**Session:** 2026-06-15. Two related pieces of work; one shipped, one proposed.
 
----
-
-## 1. Problem
-
-The assistant/user message text in a session has **no readability cap**. The
-scroll container `.messages` has no `max-width` and is not centered, so on a
-wide monitor the prose runs nearly wall-to-wall at a small 13px font. Long
-answers become very hard to read (eye has to track enormous lines), which is
-the opposite failure mode from the New Session form that was just widened — and
-a worse one, because chat is the primary *reading* surface in the app.
-
-This was not obvious from eyeballing because short messages don't fill the
-width; it only bites on long answers (explanations, tables, lists), which are
-exactly the high-value content.
-
-### 1.1 Measured evidence (live, dev cluster via Tilt)
-
-Session `e9699503` ("Explaining Why the Sky Appears Blue", 11 turns), measured
-in-browser at a **1920×1080** viewport (the reporter's monitor is ~2000px, i.e.
-slightly worse):
-
-| Metric | Measured |
-|---|---|
-| Chat pane `.messages` clientWidth | **1710px** (`max-width: none`) |
-| Assistant text block rendered width | **1470px** |
-| `.message` wrapper cap | `max-width: 90%` → 1510px |
-| Body font size | **13px** (`line-height: 19.5px`) |
-| Avg glyph advance (Inter, measured) | 6.1px |
-| **Characters per line** | **≈ 241** |
-
-The readability target is **50–75 CPL** (66 ideal), **80 max** per WCAG 1.4.8.
-At ~241 CPL the chat is ~3× over the hard cap. See the design discussion and
-sources in the conversation that produced this doc; key references:
-[Baymard – line length](https://baymard.com/blog/line-length-readability),
-[NN/g – web forms](https://www.nngroup.com/articles/web-form-design/),
-[IxDF – white space](https://ixdf.org/literature/article/the-power-of-white-space).
-
-### 1.2 Live preview of the fix (same session, injected then reverted)
-
-Centered column at 820px + 15px font:
-
-| Metric | Before | Preview |
+| Part | Scope | Status |
 |---|---|---|
-| Text block width | 1470px | **688px** |
-| Font size | 13px | **15px** |
-| **Characters per line** | **241** | **≈ 98** |
+| **A — Page container widths** | Forms / lists / admin / settings pages | ✅ **SHIPPED** — committed, verified live (§2) |
+| **B — Session chat reading width** | The persistent-chat transcript | 📋 **PROPOSED** — measured + designed, **not implemented** (§3) |
 
-A centered ~760–820px column with a 15px body reads like a document instead of
-a billboard; code blocks and the markdown table stayed contained. 98 CPL is
-still above the textbook ideal but matches what production chat UIs actually
-ship (see §4.3) — and is a 2.5× improvement.
+**Resume in one line:** Part A is done; **Part B is the open work** — pick the
+width/font from §3.3, implement per §5, verify with the script in §6. Full
+resume checklist in §7.
 
 ---
 
-## 2. Root cause (code)
+## 1. Background — the principle behind both parts
 
-All in `cockpit/src/app/views/persistent-chat/persistent-chat.component.scss`:
+Content width should be **matched to the content type**, not maximised or
+copied blindly:
 
-- `.chat-container` (≈ L12) — full width, no cap.
-- `.messages` (≈ L289) — `flex: 1; overflow-y: auto; padding: 16px;` flex column
-  with `gap: 16px`. **No `max-width`, not centered.** This is the miss.
-- `.message` (≈ L511) — the only width control is `max-width: 90%` of the
-  full-width container. Assistant `align-self: flex-start`, user `flex-end`.
-- `.message-body` (≈ L556) — `font-size: 13px; line-height: 1.5;`. Assistant
-  variant (L574) only overrides padding/colour, so all prose is 13px.
-- For contrast, the **composer is already centered**: `.composer` (≈ L1428)
-  `max-width: 880px; margin: 0 auto;`. So the input box is constrained but the
-  transcript above it is not — visibly inconsistent.
-- Tool surfaces already self-limit: `.message.tool-only` (≈ L651)
-  `max-width: none` (intentional full-bleed); `.tool-card` (≈ L753)
-  `max-width: min(720px, 100%)`.
+- **App content** (forms, card grids, tables, settings): a centered column
+  ~1140–1280px (page ceiling ~1440px) is the modern norm. Full-bleed forms hurt
+  usability (huge label→field eye travel; inputs that imply "type a lot").
+- **Prose** (reading text, chat): **50–75 characters per line**, 66 ideal,
+  **80 max** (WCAG 1.4.8) ≈ `~70ch`. Narrower than app content *on purpose*.
+- **Data-dense** (big tables, IDE-like, inline editing): full-width is correct.
+- "Wasted" side margins are **intentional whitespace** (focus, grouping, reduced
+  cognitive load), which is why every major product (Claude, ChatGPT, Gemini,
+  Linear, Notion, GitHub, Stripe) caps content width. The fix for "feels empty"
+  is *density / multi-column*, not a wider single column.
 
----
-
-## 3. Goal & acceptance criteria
-
-1. Assistant/user **prose** renders at a comfortable line length on wide
-   screens — target band **75–95 CPL** (see §4.3 for the width/CPL math).
-2. **Code blocks, tables, and tool output keep their width** (or scroll
-   horizontally) — the prose cap must not strangle monospace/structured content.
-3. The transcript column is **centered** and visually aligns with the composer.
-4. One source of truth (a token), themeable, mirroring the page-width work.
-5. Mobile (<768px) stays effectively full-width (no regression).
+Sources: [Baymard – line length](https://baymard.com/blog/line-length-readability),
+[Baymard – form fields](https://baymard.com/blog/form-field-usability-matching-user-expectations),
+[NN/g – web forms](https://www.nngroup.com/articles/web-form-design/),
+[IxDF – white space](https://ixdf.org/literature/article/the-power-of-white-space),
+[UX Planet – whitespace](https://uxplanet.org/the-power-of-whitespace-a1a95e45f82b),
+[boxed vs full-width dashboards](https://www.bootstrapdash.com/blog/boxed-or-full-width-layout),
+[content max-width 2025](https://www.allianceinteractive.com/blog/website-dimensions/).
 
 ---
 
-## 4. Design
+## 2. Part A — Page container width unification ✅ SHIPPED
 
-### 4.1 Token (mirror the page-width work)
+### 2.1 Problem
+Each page hardcoded its own content `max-width` (800 / 900 / 1000 / 1100 /
+1200px) with `margin: 0 auto`. The narrowest (800px — New Session, Settings,
+Sessions) used <50% of a ~2000px monitor and read as "made for a phone." Values
+were inconsistent with no shared token. (The app shell `app.ts` gives every page
+full width; the caps were purely per-component.)
 
-Chat prose wants a *narrower* cap than app content (`--content-max-width: 1280px`),
-because line length, not screen real-estate, governs reading text. Add a
-dedicated token rather than reusing the page one:
+### 2.2 Fix — two CSS-custom-property tokens + swap consumers
+CSS variables (not Sass scalars) because `angular.json` sets
+`inlineStyleLanguage: "scss"` but the inline-`styles` components don't `@use`
+the Sass partials — only a CSS var reaches both inline-styled and `.scss`-file
+components.
 
 ```scss
-// _root-tokens.scss  (primitive)
---width-chat-content: 760px;   // reading column for session prose
+// cockpit/src/styles/_root-tokens.scss  (primitive)   — lines ~52–53
+--width-content: 1280px;
+--width-content-wide: 1440px;
 
-// _semantic-tokens.scss  (role)
+// cockpit/src/styles/_semantic-tokens.scss  (role)     — lines ~26–27
+--content-max-width:      var(--width-content);       // forms, settings, lists, grids
+--content-max-width-wide: var(--width-content-wide);  // table/grid-dense pages
+```
+
+### 2.3 Consumers swapped (10)
+**Standard `var(--content-max-width)` (1280px):**
+`session-create.component.ts:176`, `settings/settings.component.ts:1033`,
+`sessions/sessions-page.component.ts:228`, `projects/project-list.component.ts:124`,
+`admin/users/admin-users.component.ts:172`, `admin/config/admin-config.component.ts:276`,
+`admin/llm/admin-llm.component.ts:67`, `settings/api-keys/api-keys-page.component.ts:239`,
+`automations/automations-page.component.scss:11`.
+**Wide `var(--content-max-width-wide)` (1440px):** `project-detail/project-detail.component.ts:861`.
+
+Mobile `@media (max-width: 768px)` → `max-width: 100%` overrides left intact.
+**Left full-width on purpose** (already correct, data-dense / container-query):
+Jobs list, Data Sources, Create (job), Inbox. Chat = Part B.
+
+### 2.4 Verification (done this session)
+- `npx sass src/styles.scss` compiles clean (exit 0); tokens emit with the
+  primitive→role cascade.
+- Confirmed **live** on the running cockpit (Tilt `ng serve`): served
+  `http://127.0.0.1:4000/styles.css` contained `--width-content: 1280px` and
+  `--content-max-width: var(--width-content)`.
+- New Session form measured ~800→1280px; expert grid ~4→6 columns.
+
+### 2.5 Commit state
+All 12 files are **committed and clean** in the working tree. They landed in
+`76771eeb` (bundled under an unrelated commit message — "feat(memory): overhaul…"
+— because of parallel bulk-commit activity in this repo; commit message does NOT
+reflect the width work). The doc itself first landed in `bf50bb00`. Per local
+refs these are already on `origin/develop`. **No pending Part-A changes.**
+
+---
+
+## 3. Part B — Session chat reading width 📋 PROPOSED (open work)
+
+### 3.1 Problem
+The persistent-chat transcript has **no readability cap**. `.messages` (scroll
+container) has no `max-width` and isn't centered; the only control is
+`.message { max-width: 90% }` of the full-width pane, at a small **13px** font.
+On a wide monitor, long answers run nearly wall-to-wall. Worse failure mode than
+the form had, because chat is the app's primary *reading* surface. The composer
+below is already centered at 880px — so the transcript sprawls wider than its own
+input box (visibly inconsistent).
+
+### 3.2 Measured evidence (live, dev cluster, 2026-06-15)
+Session `e9699503` ("Explaining Why the Sky Appears Blue", 11 turns — good prose
++ a markdown table), measured in-browser at **1920×1080** (reporter's monitor is
+~2000px, i.e. slightly worse):
+
+| Metric | Before | Preview (820px col + 15px, injected then reverted) |
+|---|---|---|
+| `.messages` pane width | 1710px (`max-width: none`) | — |
+| Assistant text block width | **1470px** | 688px |
+| Body font | 13px (`line-height 19.5px`) | 15px |
+| Avg glyph advance (Inter, measured) | 6.1px @13px | ~7.0px @15px |
+| **Characters per line** | **≈ 241** | **≈ 98** |
+
+241 CPL ≈ 3× the WCAG hard cap (80) and ~3.6× the 66 ideal. The preview (a
+centered column + larger font) is a 2.5× improvement and code/table stayed
+contained.
+
+### 3.3 Root cause (code) — `persistent-chat.component.scss`
+- `.chat-container` (~L12) — full width, no cap.
+- `.messages` (~L289) — `flex:1; overflow-y:auto; padding:16px;` flex column,
+  `gap:16px`. **No max-width, not centered.** ← the miss.
+- `.message` (~L511) — only `max-width: 90%`; assistant `align-self:flex-start`,
+  user `flex-end`.
+- `.message-body` (~L556) — `font-size:13px; line-height:1.5`. Assistant variant
+  (~L574) overrides only padding/colour → all prose is 13px.
+- `.composer` (~L1428) — already centered `max-width:880px; margin:0 auto`.
+- Tool surfaces already self-limit: `.message.tool-only` (~L651) `max-width:none`
+  (full-bleed, intentional); `.tool-card` (~L753) `max-width: min(720px,100%)`.
+
+### 3.4 Design
+
+**New token** (prose wants a *narrower* cap than app content — keep separate):
+```scss
+// _root-tokens.scss (primitive)
+--width-chat-content: 760px;   // session reading column
+// _semantic-tokens.scss (role)
 --chat-content-width: var(--width-chat-content);
 ```
 
-This keeps the "match the cap to the content type" principle explicit: app
-pages = 1280/1440, chat prose = 760, and it's tunable in one place.
-
-### 4.2 Centering approach — inner wrapper (scrollbar stays at window edge)
-
-`.messages` is the scroll container; capping it directly would float the
-scrollbar in the middle. Instead keep `.messages` full-width (padding +
-`overflow-y`) and wrap the message list in a centered inner column:
-
+**Centering — inner wrapper** (keeps scrollbar at window edge). Keep `.messages`
+full-width (padding + overflow); wrap the message list in a centered column.
+**Requires a small template edit** — wrap the message `@for` in
+`<div class="messages-inner">` in `persistent-chat.component.ts`:
 ```scss
 .messages-inner {
   width: 100%;
   max-width: var(--chat-content-width);
   margin-inline: auto;
-  display: flex;
-  flex-direction: column;
-  gap: 16px;            /* move the gap here from .messages */
+  display: flex; flex-direction: column; gap: 16px;  /* moved off .messages */
 }
 ```
+`.message` `max-width: 90% → 100%` (wrapper now bounds it); keep `align-self`.
 
-Requires a **small template change**: wrap the message `@for` block in
-`<div class="messages-inner">` (in `persistent-chat.component.ts`/`.html`).
-`.message { max-width: 90% }` → `max-width: 100%` (the wrapper now bounds it);
-keep `align-self` so user bubbles right-align and assistant text left-aligns
-within the column (ChatGPT/Claude pattern).
+**Width / font targets** (avg glyph 6.1px@13px → ~7.0px@15px; assistant text ≈
+`column − ~100px` for padding + 30px avatar + 10px gap):
 
-### 4.3 Width / font targets (with measured CPL)
-
-Measured avg glyph advance: 6.1px @13px → ~7.0px @15px. Assistant text width ≈
-`column − ~100px` (16px padding ×2 + 30px avatar + 10px gap). So:
-
-| Option | Column (`--chat-content-width`) | Body font | ≈ text width | ≈ CPL | Feel |
+| Option | `--chat-content-width` | Body font | ≈ text px | ≈ CPL | Feel |
 |---|---|---|---|---|---|
-| Tight (readability-strict) | 660px | 15px | ~560px | **~80** | Closest to 66–75 ideal; can feel cramped with tables |
-| **Comfortable (recommended)** | **760px** | **15px** | ~660px | **~90** | Balanced; matches Claude/ChatGPT/Gemini |
-| Roomy | 820px | 15px | ~690px | ~98 | Preview shown; a touch wide |
+| Tight | 660px | 15px | ~560 | ~80 | Closest to ideal; cramped with tables |
+| **Comfortable (rec)** | **760px** | **15px** | ~660 | **~90** | Matches Claude/ChatGPT/Gemini |
+| Roomy | 820px | 15px | ~690 | ~98 | Preview shown; a touch wide |
 
-Production chat UIs (Claude, ChatGPT, Gemini) effectively run ~90–100 CPL —
-they trade the strict 66-char ideal for room to fit code/lists/tables. **760px
-+ 15px** lands in that band while being a 2.5× improvement over today.
+Production chat UIs run ~90–100 CPL (trade strict 66 for room for code/lists/
+tables). **Recommended: 760px + 15px.** The 13→15px bump is a coordinated but
+separable lever (13px is small for primary reading; bigger font also lowers CPL).
 
-**Font bump (13→15px) is a coordinated but separable lever.** 13px is small for
-primary reading content; bumping it both improves legibility and lowers CPL at a
-given width. If we keep 13px, the column would need to be ~560px to hit ~80 CPL,
-which is too narrow once a table appears. Recommendation: bump to 15px.
+**Keep wide / don't cap:** fenced code & `pre` → ensure `overflow-x:auto`
+(scroll inside the column, don't widen it); markdown tables → block + overflow-x;
+`.tool-card` (720px, leave); `.message.tool-only` → §5 decision.
 
-### 4.4 What stays wide (do NOT cap)
+**Composer:** point `.composer` at the same token so input aligns under the
+transcript (currently 880px; minor/reversible — §5).
 
-- **Fenced code / `pre`** inside prose → ensure `overflow-x: auto` so wide code
-  scrolls *within* the column instead of forcing it wider. (Verify current rule.)
-- **Markdown tables** → `display: block; overflow-x: auto` wrapper, same idea.
-- **`.tool-card` / tool output** → already capped at 720px; leave as-is.
-- **`.message.tool-only`** → decision in §6 (constrain to column vs full-bleed).
+### 3.5 Implementation sketch (files)
+1. `_root-tokens.scss` — add `--width-chat-content: 760px`.
+2. `_semantic-tokens.scss` — add `--chat-content-width: var(--width-chat-content)`.
+3. `persistent-chat.component.ts` (template) — wrap message loop in
+   `<div class="messages-inner">`.
+4. `persistent-chat.component.scss`:
+   - `.messages` — drop flex/gap (move to `.messages-inner`); keep padding + overflow.
+   - add `.messages-inner` (§3.4).
+   - `.message` — `max-width: 90% → 100%`.
+   - `.message-body` — `font-size 13px → 15px`, `line-height 1.5 → 1.6`.
+   - verify/add `pre`/`code`/table `overflow-x: auto`.
+   - `.composer` — `880px → var(--chat-content-width)` (if §5 agrees).
+   - mobile `@media (max-width:768px)` (~L2207) — confirm column collapses to full width.
 
-### 4.5 Composer alignment
+Effort ~1–2h, all cockpit/CSS + one template wrap. Tilt `ng serve` HMR (~5s).
 
-Point `.composer` at the same token (`max-width: var(--chat-content-width)`) so
-the input lines up under the transcript. (Currently 880px; aligning is the
-cleaner look but is a minor, reversible call — see §6.)
-
----
-
-## 5. Implementation sketch
-
-Files (all cockpit):
-
-1. `src/styles/_root-tokens.scss` — add `--width-chat-content: 760px`.
-2. `src/styles/_semantic-tokens.scss` — add `--chat-content-width: var(--width-chat-content)`.
-3. `src/app/views/persistent-chat/persistent-chat.component.ts` (template) —
-   wrap the message loop in `<div class="messages-inner">`.
-4. `src/app/views/persistent-chat/persistent-chat.component.scss`:
-   - `.messages` — drop `gap`/flex-column (move to `.messages-inner`); keep
-     padding + overflow.
-   - add `.messages-inner` (§4.2).
-   - `.message` — `max-width: 90%` → `100%`.
-   - `.message-body` — `font-size: 13px → 15px`, `line-height: 1.5 → 1.6`.
-   - verify/add `pre`, `code`, and markdown-table `overflow-x: auto`.
-   - `.composer` — `max-width: 880px → var(--chat-content-width)` (if §6 agrees).
-   - mobile `@media (max-width: 768px)` (≈ L2207) — confirm `.messages-inner`
-     collapses to full width (max-width 760 already > small viewports, so it's a
-     no-op there; add `max-width: 100%` only if needed).
-
-Effort: ~1–2 hours incl. the template wrap and overflow checks. Pure
-cockpit/CSS + one small HTML change → Tilt `ng serve` HMR (~5s) loop.
+### 3.6 Edge cases / risks
+Code blocks (scroll not squeeze), markdown tables (the sky session has one),
+user bubbles (right-align within narrower column — fine), tool-only full-bleed
+(§5), streaming/narration (same containers — unaffected), mobile (no regression),
+font bump → slightly fewer messages per screen (acceptable; only prose changes,
+tool/debug text keep their 11px).
 
 ---
 
-## 6. Open questions / decisions
+## 4. (reserved)
 
+---
+
+## 5. Open decisions (Part B) — settle on resume
 1. **Target width** — Tight 660 / **Comfortable 760 (rec)** / Roomy 820.
-2. **Font bump 13→15px** — recommended; confirm acceptable (slightly fewer
-   messages visible per screen).
+2. **Font bump 13→15px** — recommended; confirm acceptable.
 3. **Composer** — align to `--chat-content-width` (rec) or keep 880px.
 4. **`.message.tool-only` full-bleed** — keep tool output able to exceed the
-   prose column (good for wide command output/diffs), or constrain it to the
-   column for visual consistency? Leaning: keep tool output free to be wider,
-   cap only prose.
-5. **Empty-state** (`.empty-inner`, 850px) — leave as-is or align to the token?
-   (Cosmetic.)
+   prose column (good for wide command output/diffs) [leaning yes], or constrain
+   to the column for consistency.
+5. **Empty-state** (`.empty-inner`, 850px) — leave or align (cosmetic).
 
 ---
 
-## 7. Verification plan
+## 6. Measurement & verification tooling (reusable)
 
-- **Re-measure** with the same in-browser script (pane width, widest
-  `.message-assistant .message-body`, font, canvas-measured CPL) on session
-  `e9699503` at 1920px and ~2560px. Target: 75–95 CPL; no element forces
-  horizontal page scroll.
-- **Visual**: screenshot the same session before/after; confirm code block +
-  table still readable (scroll, not squeeze).
-- **Regression sweep** of the README smoke path session view: streaming a live
-  turn, tool cards, user bubbles, narration, resume card, mobile width (<768px).
-- Tilt loop for iteration; commit only after local pass (per CLAUDE.md
-  Plan→Develop→Verify).
+**Access:** `https://localhost/` (k3d + Tilt running), log in **test / test**
+(Keycloak). Good measurement target: session **`e9699503`** (sky-blue, prose +
+table). Set a wide viewport (the reporter is ~2000px) before measuring.
+
+**In-browser CPL measurement** (Playwright `browser_evaluate`, or paste in
+DevTools console) — returns pane width, widest assistant block, font, and
+canvas-measured characters-per-line:
+```js
+() => {
+  const out = { viewport: innerWidth + 'x' + innerHeight };
+  const m = document.querySelector('.messages');
+  if (m) { out.messages_clientWidth = Math.round(m.clientWidth);
+           out.messages_maxWidth = getComputedStyle(m).maxWidth; }
+  const bodies = [...document.querySelectorAll('.message-assistant .message-body')];
+  const widest = bodies.reduce((a,b)=> b.getBoundingClientRect().width > (a?.getBoundingClientRect().width||0) ? b : a, null);
+  if (widest) {
+    const cs = getComputedStyle(widest);
+    const para = [...widest.querySelectorAll('p,li,div')].find(e => (e.textContent||'').trim().length > 80) || widest;
+    const w = para.getBoundingClientRect().width;
+    const sample = (para.textContent||'').trim().slice(0,400);
+    const ctx = document.createElement('canvas').getContext('2d');
+    ctx.font = cs.fontSize + ' ' + cs.fontFamily;
+    Object.assign(out, {
+      assistant_body_width_px: Math.round(widest.getBoundingClientRect().width),
+      font: cs.fontSize, line_height: cs.lineHeight,
+      paragraph_width_px: Math.round(w),
+      chars_per_line: Math.round(w / (ctx.measureText(sample).width / sample.length)),
+    });
+  }
+  return out;
+}
+```
+**Preview without committing:** inject a `<style>` capping `.messages`
+(`max-width` + `margin-inline:auto`) and `.message-body{font-size:15px}`, screenshot,
+then remove the style element. (Used for the §3.2 preview row.)
+
+**Confirm a CSS change is live on the cluster** (Tilt syncs `cockpit/src/**`,
+`ng serve` HMR ~5s):
+```bash
+kubectl --context=k3d-srw -n srw exec deploy/srw-cockpit -- \
+  sh -c "wget -qO- http://127.0.0.1:4000/styles.css | grep -oE '\-\-chat-content-width[^;]*;|\-\-content-max-width[^;]*;'"
+```
+**Gotcha:** use `127.0.0.1`, not `localhost`, inside the pod — `localhost`
+resolves to IPv6 `::1` but `ng serve` binds IPv4 `0.0.0.0` → empty response.
+(Cost me two false "it's not live" readings this session.)
+
+---
+
+## 7. Resume checklist (Part B, cold start)
+1. Re-read §1 + §3. Confirm Part A still live (§2.4 grep, swap token name).
+2. **Settle §5 decisions** with the user (mainly width + font bump).
+3. Implement §3.5 (tokens → template wrap → scss; remember `overflow-x:auto` on
+   code/tables).
+4. Verify with §6 script on `e9699503` at ~1920px **and** ~2560px → target
+   **75–95 CPL**, no horizontal page scroll, code/table scroll (not squeeze).
+5. Smoke-sweep: live streaming turn, tool cards, user bubbles, narration, resume
+   card, mobile (<768px).
+6. Commit only after local pass (CLAUDE.md Plan→Develop→Verify). NB: this repo
+   has heavy parallel bulk-commit activity — check `git status` before committing
+   so unrelated working-tree changes don't get swept in.
 
 ---
 
 ## 8. Out of scope
-
-- Per-user width/font preference (possible later; token makes it trivial).
-- Builder/job views (different content classes; covered by page-width tokens).
-- Markdown/typography restyle beyond size/line-height (separate effort).
+Per-user width/font preference (token makes it trivial later); Builder/job views
+(covered by Part A tokens); markdown/typography restyle beyond size + line-height.

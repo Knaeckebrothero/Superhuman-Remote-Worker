@@ -40,13 +40,17 @@ def derived(base: int) -> dict:
 def _derived_leaves(data: dict) -> dict:
     """The derived numeric limit leaves only.
 
-    ``settings.image_tokens`` is a matrix passthrough (the per-family
-    image-token estimator config), NOT a value derived from the working-window
-    base, so it is dropped before comparing against :func:`derived`. Its routing
-    into ``limits`` is covered by
-    tests/test_image_token_estimator.py::TestLoaderRouting.
+    ``settings.image_tokens`` (per-family image-token estimator config) and
+    ``settings.pdf_render_dpi`` (per-family page-render resolution) are matrix
+    passthroughs, NOT values derived from the working-window base, so they are
+    dropped before comparing against :func:`derived`. image_tokens routing is
+    covered by tests/test_image_token_estimator.py::TestLoaderRouting.
     """
-    return {k: v for k, v in data.get("limits", {}).items() if k != "image_tokens"}
+    return {
+        k: v
+        for k, v in data.get("limits", {}).items()
+        if k not in ("image_tokens", "pdf_render_dpi")
+    }
 
 
 @pytest.fixture(autouse=True)

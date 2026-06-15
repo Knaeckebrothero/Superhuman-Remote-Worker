@@ -8621,6 +8621,10 @@ class PostgresDB:
 
         Returns the post-write row (after the DB-side updated_at is set).
         """
+        # ``updated_by`` is a TEXT column; coerce non-str actor ids (e.g. a
+        # UUID) so callers passing a raw uuid don't trip asyncpg's type check.
+        if updated_by is not None:
+            updated_by = str(updated_by)
         async with self.acquire() as conn:
             row = await conn.fetchrow(
                 """
