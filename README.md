@@ -705,4 +705,10 @@ rm workspace/checkpoints/job_*.db workspace/logs/job_*.log
 
 ## License
 
-Creative Commons Attribution 4.0 International License (CC BY 4.0). See [LICENSE.txt](LICENSE.txt).
+Licensed under the MIT License. See [LICENSE.txt](LICENSE.txt).
+
+Third-party components bundled into our images (and their upstream NOTICE
+obligations) are inventoried in [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).
+Server images the Helm chart pulls from public registries (Neo4j, PostgreSQL,
+MongoDB, …) arrive under their own upstream licenses and are not redistributed by
+this project.

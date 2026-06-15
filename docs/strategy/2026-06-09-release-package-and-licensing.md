@@ -14,9 +14,24 @@ related:
 # Release Package And Licensing Strategy
 
 **Date:** 2026-06-09
-**Last updated:** 2026-06-10
+**Last updated:** 2026-06-15
 **Status:** Decision draft and session recap, not legal advice. Review with a
 lawyer before a public release or before accepting outside contributions.
+
+> **Update (2026-06-15) — third-party license map now exists.** The
+> "component license map" / "third-party dependency-license notes" release
+> artifact (see [Release Package Scope](#release-package-scope) → Include and
+> [Proposed Release Artifacts](#proposed-release-artifacts)) is implemented:
+> `THIRD_PARTY_LICENSES.md` at the repo root, generated and policy-gated by
+> `scripts/check_licenses.py` (folded into the `dependency-audit` CI job; develop
+> auto-regenerates and commits the file). The gate **denies GPL/AGPL/SSPL/BSL in
+> the bundled dependency set** — correct while the project is MIT. **When the core
+> relicenses to `AGPL-3.0-or-later`** (the working direction below), GPL/LGPL/AGPL
+> dependencies become license-compatible, so the DENY list in
+> `scripts/check_licenses.py` should be revisited at that point. Note also that
+> the Helm chart pulls the Neo4j/PostgreSQL/MongoDB **server** images from public
+> registries (referenced, not conveyed), so their licenses — e.g. Neo4j CE's
+> GPLv3 — do not reach our code; only their bundled **client drivers** do.
 
 ## Short Recommendation
 
