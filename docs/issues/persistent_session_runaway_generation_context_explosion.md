@@ -193,10 +193,17 @@ ever found that ignores the cap.
 ## Recurrence 2026-06-07 — distinct exit-137 agent-pod kill (root cause untraced)
 
 > The 2026-05-11 fix above is **verified still intact and is NOT implicated**
-> (see "Ruled out"). This documents a *different*, still-open failure mode in
-> the same persistent-session area. Kept here because the investigation started
-> from this doc (the symptom — "the agent stops after the summary" — looked like
-> a recurrence) and it shares the summarization machinery.
+> (see "Ruled out"). This documents a *different* failure mode in the same
+> persistent-session area, found because the symptom — "the agent stops after
+> the summary" — looked like a recurrence.
+>
+> **Status (updated 2026-06-11):** the *wedge* and the surrounding hardening are
+> now fixed + deployed (see "Resolution status" below). The **exit-137 crash
+> itself remains untraced** — instrumentation is in place to catch the next one.
+> Two small follow-ups (codex `max_tokens`, summarization-quality polish) are
+> open. The "Knock-on: the session wedged" section below is the **now-fixed**
+> wedge (kept for the diagnostic record); "Still unexplained" still applies —
+> the crash root cause is open.
 
 ### Symptom (dev deployment, ns `superhuman-remote-worker`)
 
@@ -266,40 +273,61 @@ Why the user saw `agent /ready timeout` instead of a clean recovery:
   **persistent threads** get only `mark_orphaned_threads_ended()` — **no
   re-provision**. So an agent death wedges the session from the UI.
 
-### Changes shipped this round
-- **Reaper now logs `terminated.reason` + `signal`** alongside `exit_code`
-  (`agent_provisioner.py::_capture_agent_logs_before_reap`). The next exit-137
-  will say `OOMKilled` vs `Error` — the diagnostic we were missing. **This is
-  the bet: catch the next occurrence red-handed.**
-- **Summarization timeout decoupled from the interactive aux budget.** The
-  structured pass now passes the dedicated `summarization_timeout` (600s) via
-  `auxiliary.chain(task, timeout=…)` (`auxiliary.py`; `context.py`
-  `_single_pass_summarize`); `auxiliary.timeout` raised 45→120s
-  (`persistent_defaults.yaml`). The **same `Structured summarization failed:
-  TimeoutError`** appears in this doc's original 2026-05-11 log (120s then;
-  tightened to 45s on the persistent path), so this fixes a long-standing
-  symptom — but it is **not** the crash cause (the fallback succeeded; the agent
-  died ~2.5 min later while idle).
+### Resolution status (updated 2026-06-11)
+
+All committed + deployed to dev unless noted.
+
+| Item | Status |
+|---|---|
+| **Reaper `terminated.reason` + `signal` logging** (`agent_provisioner.py::_capture_agent_logs_before_reap`) — the diagnostic for the untraced crash | ✅ shipped + live (logged `reason=Completed` on a drain; armed for the next exit-137) |
+| **Summarization timeout decoupled** — structured pass gets the dedicated `summarization_timeout` (600s) via `auxiliary.chain(task, timeout=…)`; `auxiliary.timeout` 45→120 (`persistent_defaults.yaml`). Removes the *timeout*-driven fallbacks (the `Structured summarization TimeoutError` seen in the 2026-05-11 log) — but NOT the crash cause | ✅ shipped |
+| **C — model-aware context thresholds for persistent** — `_setup_context_manager` now reads `config.limits.*` like the worker path (`ea373fd5`, deployed `e189f683`). gpt-5.5 compacts at **160k** (0.80 × 200k working-window base from `model_config_matrix.yaml` gpt-5 family), not the 80k default | ✅ shipped + deployed |
+| **B — the wedge / self-heal** — `/connection` clears the stale `agent_id` + returns 425 when the bound agent is gone/`offline` → cockpit `/prepare` re-provisions; a `booting` agent still falls through to 409+poll (no premature recovery). `344d1de0` "self-healing for offline agents", deployed `50b6e4cf` | ✅ shipped + deployed |
+| **E — double-provision orphan blackhole** — provision-marker guard (`4830d122`) + agent-side `_exit_duplicate_provision` loser-exit (cause: `publishNotReadyAddresses:True` × double-provision) | ✅ shipped |
+| **D — probe hardening** — agent `/health` liveness `timeoutSeconds 1→5` + `failureThreshold 3→5`, readiness `/ready` `timeoutSeconds 1→5` (`agent_provisioner.py`); stops transient GC/event-loop stalls from SIGKILLing or de-endpointing healthy agents (the `a7d8f8e0` misfire) | ✅ implemented, **uncommitted** as of 2026-06-11 |
 
 ### Open / next
-1. **Catch the next exit-137** via the new `terminated.reason` log, then decide:
-   memory bump (if `OOMKilled`) vs frozen-loop hunt (if `Error`). Cheap mitigation
-   meanwhile: relax `/health` liveness `timeoutSeconds` 1→5.
-2. **Recovery-gap fix** (own concern): clear `threads.agent_id` on orphan-end
-   and/or make `_do_prepare` re-provision a thread bound to an *offline* agent,
-   so a dead-agent session self-heals instead of wedging on 409.
-3. **ContextConfig under-wired on the persistent path** (`persistent_session.py`
-   builds `ContextConfig` with only `keep_recent_*`), so `gpt-5.5` (1.05M ctx)
-   sessions still compact at the 80k default and use a 100k/2 oversized
-   threshold — code-confirmed, separate.
-4. Residual from this doc's own deferred item: **codex-proxy may not honor
-   `max_tokens`** cleanly (reasoning models use `max_completion_tokens`); no
-   runaway seen on this session, but it's the gap that could re-open the
-   explosion path for gpt-5.x.
+1. **The crash itself (A) — untraced, instrumented.** The reaper now records
+   `terminated.reason`; the next exit-137 will say `OOMKilled` (→ bump the 2 Gi
+   agent memory limit) vs `Error` (→ frozen-loop hunt: what blocks an idle
+   post-compaction agent's event loop?). Nothing to do until one recurs — watch
+   the orchestrator log for `Reap log capture: … exit_code=137 reason=…`. The D
+   probe relaxation makes a spurious liveness-kill less likely meanwhile.
+2. **F — verify codex-proxy honors `max_tokens`.** Reasoning models use
+   `max_completion_tokens`; if `srw-codex-proxy` drops the cap, the runaway
+   explosion path (this doc's main subject) could re-open for gpt-5.x. A probe,
+   not a code change.
+3. **G — summarization-quality polish.** When the structured `ConversationSummary`
+   pass *fails* (gemma is unreliable at structured output — xgrammar/tool-call
+   issues, not just slow), `_single_pass_summarize` falls back to a plain-prose
+   summary that **drops the resume-critical fields**: `critical_facts` (exact
+   paths/IDs/errors), `pinned_instructions`, `identity_anchor`, `tasks_in_progress`,
+   `state_changes` → a fuzzier resumed agent. The timeout fix removed the
+   *timeout*-driven fallbacks; the *schema-failure* fallbacks remain. Options
+   (cheap→bigger):
+   - (a) Lower `context_management.reasoning_level` `high→medium/low`
+     (`persistent_defaults.yaml`) — reasoning=high on an extraction task is slow
+     and can hurt schema adherence. One line; could fix speed *and* success.
+   - (b) Point summarization at a more structured-reliable aux model.
+   - (c) Make the fallback less lossy — a lighter parseable prompt that still
+     keeps `pinned_instructions` / `identity_anchor` / `critical_facts`.
+   - (d) Cap the fallback timeout shorter so worst case isn't 600+600s.
+
+   **Measure before building:** grep dev agent logs for `"Falling back to
+   unstructured"` vs successful structured summaries. If the fallback is a rare
+   footnote, only (a) is worth it; if frequent, (b)/(c). (Couldn't measure this
+   session — MCP/cluster access was down.)
+
+*Resolved since the 2026-06-07 write-up:* the wedge/recovery-gap (B) and the
+ContextConfig under-wiring (C) — both now in "Resolution status" above.
 
 ### References
-- `orchestrator/services/agent_provisioner.py` — reaper log capture (the fix) + agent pod probes/limits
-- `orchestrator/routers/sessions.py:150,184,275` — `/prepare` + `/connection` (the wedge)
-- `orchestrator/database/postgres.py` — `mark_orphaned_threads_ended`, `mark_stuck_session_agents_ready`
-- `src/services/auxiliary.py`, `src/core/context.py`, `config/persistent_defaults.yaml` — summarization-timeout decoupling
-- `cockpit/src/app/core/services/persistent-chat.service.ts:867,877` — the 180s connection-poll budget
+(Line numbers omitted where the files move often; use the function/symbol names.)
+- `orchestrator/services/agent_provisioner.py` — reaper `terminated.reason` capture + agent pod probes (D)
+- `orchestrator/routers/sessions.py` — `/connection` offline self-heal (B) + `_do_prepare` re-provision guard
+- `orchestrator/database/postgres.py` — `mark_orphaned_threads_ended`, `update_thread_agent`, `resume_thread`
+- `src/api/persistent_session.py::_setup_context_manager` — model-aware `config.limits.*` (C)
+- `src/core/loader.py` — fraction derivation of context limits (`CONTEXT_THRESHOLD_FRACTION` etc.)
+- `src/services/auxiliary.py`, `src/core/context.py`, `config/persistent_defaults.yaml` — summarization-timeout decoupling + the lossy fallback (G)
+- `docs/tests/persistent_session_duplicate_provision_409_exit_verification.md` — E verification runbook
+- Commits: `ea373fd5` (C), `344d1de0`+`50b6e4cf` (B/self-heal), `4830d122` (E provision-marker)

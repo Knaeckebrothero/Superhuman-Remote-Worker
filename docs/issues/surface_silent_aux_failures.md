@@ -33,22 +33,34 @@ them, or exposed them on a status surface.
 Make a sustained auxiliary outage **loud** and **queryable**, without changing
 the non-fatal contract (callers still swallow-and-continue).
 
-## Status (2026-06-11)
+## Status (2026-06-15)
 
 Built on `develop` (uncommitted), verified locally — `ruff check`/`format`
 clean, unit tests green (`tests/test_aux_health.py`, `tests/test_auxiliary.py`,
-`tests/test_llm_requests_filter.py`):
+`tests/test_llm_requests_filter.py`, `tests/test_agent_heartbeat.py`):
 
 - ✅ **Phase 1** — in-agent health tracker + escalation/recovery + `get_status()` exposure.
 - ✅ **Phase 1.5** — failed aux calls archived to `llm_requests` (`status="error"`).
 - 🟡 **Phase 1.6** — read side: ✅ backend (orchestrator `call_type`/`status`
   filter + projection on the **llm_requests** path) + ✅ session-path archiver
-  wired; ⏳ **Cockpit UI toggle is NEXT.**
-- ☐ **Phase 2** — central visibility (heartbeat → Cockpit agent badge). *Not started.*
+  wired; ⏳ **Cockpit UI toggle still open** — NB the debug "LLM-requests view"
+  is the single-doc `request-viewer`; `ApiService` has no job-scoped
+  llm-requests *list* method, so this is list-surface + ApiService wiring, not
+  just a toggle. Tracked separately.
+- ✅ **Phase 2** — central visibility (heartbeat → `agents.aux_degraded` →
+  Cockpit admin badge). **Shipped + k3d-verified 2026-06-15** (see below).
 - ☐ **Mitigation** — pin aux default off `gemma-4-moe`. *Not started (separate).*
 
-Not yet exercised end-to-end on a cluster (needs a deploy + a forced aux
-outage); the logic is unit-covered.
+Phase 2 verified end-to-end on k3d: migration `app/0027` applied on the dev DB;
+a heartbeat with `metrics.aux.degraded=true` through the **real** internal
+endpoint set `agents.aux_degraded=t` + stored the compact summary in
+`metadata.aux`, and `degraded=false` cleared both (recovery); the exact
+`list_agents`/`get_agent` SELECTs project the column; the admin Agents panel
+renders a red "⚠ Aux degraded" badge (with the `metadata.aux` tooltip) only for
+the degraded row. Organic agent-side emission (a real agent failing aux calls
+and flipping the badge itself) is unit-covered (`heartbeat_summary` shape) and
+shape-identical to the verified injection — left to confirm naturally during
+the memory-overhaul soak.
 
 ## Design
 
@@ -140,13 +152,34 @@ Phases 1 + 1.5 make the data *exist*; this makes it *visible*.
 Acceptance: a forced aux failure (worker *and* session) shows an error row in
 the debug view filtered by `status=error`, with the model + error type.
 
-### Phase 2 (follow-up, not in this change) — central visibility
+### Phase 2 — central visibility ✅
 
-- Include the `AuxHealth` snapshot in the agent → orchestrator **heartbeat**
-  (`POST /api/agents/{id}/heartbeat`), persist `aux_degraded` on the agent row,
-  and show a warning badge in the Cockpit admin agents view.
-- Optional: a Prometheus gauge (`srw_aux_consecutive_failures`) once the
-  observability stack (see `[[project_observability_and_quotas]]`) lands.
+*Implemented 2026-06-15:*
+
+- `AuxHealth.heartbeat_summary()` (`src/services/auxiliary.py`) — a compact
+  projection (degraded flag, aggregate failure count, model, per-failing-task
+  last-error-type) smaller than `snapshot()`. Always includes `degraded` so a
+  recovered agent clears the persisted flag.
+- Both heartbeat loops fold it into `metrics.aux` (`_aux_health_for_heartbeat`
+  + `_get_agent_metrics` in `src/api/app.py` for workers and
+  `src/api/persistent_app.py` for sessions). Best-effort; None before the aux
+  LLM is wired so the orchestrator leaves a stale flag untouched.
+- Migration `app/0027_agents_aux_degraded.sql` adds `agents.aux_degraded`
+  (BOOLEAN NOT NULL DEFAULT FALSE).
+- `agent_heartbeat` (`orchestrator/main.py`) extracts `metrics.aux.degraded`;
+  `PostgresDB.heartbeat()` persists it (the two-branch UPDATE became a dynamic
+  SET-clause builder so adding a column isn't a `$N` index-shuffling hazard);
+  `list_agents`/`get_agent` project the column. The compact summary rides in
+  `agents.metadata.aux` (existing metrics → metadata merge) for the tooltip.
+- Cockpit: `Agent.aux_degraded` model field + a red "⚠ Aux degraded" badge in
+  the admin Agents view (`agent-list.component.ts`), gated on `aux_degraded`,
+  tooltip built from `metadata.aux`. i18n in en + de-DE.
+- Tests: `TestAuxHeartbeatSummary` (`test_aux_health.py`),
+  `TestHeartbeatAuxDegraded` (`test_agent_heartbeat.py`, incl. a param-index
+  alignment guard), `auxTooltip` specs (`agent-list.component.spec.ts`).
+
+- Optional/deferred: a Prometheus gauge (`srw_aux_consecutive_failures`) once
+  the observability stack (see `[[project_observability_and_quotas]]`) lands.
 
 ### Related, separately actionable
 
