@@ -20,9 +20,10 @@ Two responsibilities, one parsed inventory:
              `<!-- BEGIN: id -->` / `<!-- END: id -->` markers. Curated prose
              outside those markers is preserved.
 
-Inputs are produced by `pip-licenses` (Python) and `license-checker-rseidelsohn`
-(npm). By default this script invokes those tools itself; pass --pip-json /
---npm-json to feed pre-captured JSON instead (used by the unit tests).
+Python licenses come from `pip-licenses` (reads installed package metadata); npm
+licenses come straight from `cockpit/package-lock.json` (no install, network, or
+node_modules needed). Pass --pip-json / --npm-lock-json to feed pre-captured JSON
+instead (used by the unit tests).
 
 Policy is data, not code — tune ALLOW_TOKENS / WEAK_TOKENS / DENY_TOKENS and the
 per-package OVERRIDES below. Mirrors the explicit, override-able style of the
@@ -70,7 +71,7 @@ WEAK_TOKENS = (
 
 ALLOW_TOKENS = (
     "mit", "bsd", "apache", "isc",
-    "python software foundation", "psf",
+    "python software foundation", "psf", "python-2.0",
     "zlib", "0bsd", "unlicense", "wtfpl", "boost",
     "hpnd", "historical permission",
     "public domain", "cc0", "cc-0",
@@ -102,9 +103,17 @@ def classify(license_str: str, pkg_name: str) -> str:
     if override:
         return override
 
-    s = (license_str or "").lower()
+    raw = license_str or ""
+    s = raw.lower()
     if not s or s in ("unknown", "unlicensed"):
         return CATEGORY_UNKNOWN
+
+    # SPDX disjunction ("X OR Y"): the user may use the most permissive operand,
+    # so a dual license with any permissive option is ALLOW — e.g. dompurify's
+    # "(MPL-2.0 OR Apache-2.0)" or "GPL-2.0 OR MIT". Uppercase " OR " is the SPDX
+    # operator; the lowercase "-or-later" suffix on a single license won't match.
+    if " OR " in raw and any(t in s for t in ALLOW_TOKENS):
+        return CATEGORY_ALLOW
 
     # AGPL / LGPL contain "gpl" — test them before plain GPL.
     if "agpl" in s or "affero" in s:
@@ -177,38 +186,60 @@ def collect_python(pip_json: str | None) -> list[Dep]:
     return [d for d in deps if d.name.lower() not in ("pip-licenses",)]
 
 
-def collect_npm(npm_json: str | None) -> list[Dep]:
-    if npm_json is not None:
-        raw = npm_json
-    elif (COCKPIT_DIR / "node_modules").is_dir():
-        raw = _run([
-            "npx", "--yes", "license-checker-rseidelsohn",
-            "--json", "--production", "--start", str(COCKPIT_DIR),
-        ])
-    else:
+def collect_npm(lock_json: str | None = None) -> list[Dep]:
+    """Production npm dependencies and licenses, straight from package-lock.json.
+
+    The lockfile is authoritative for both the license (npm records each
+    package's declared license — present for ~all entries) and the dev
+    classification, and it needs no install, no network, and no node_modules.
+    This is far more robust than `license-checker --production`, which leaks the
+    build toolchain against a full install.
+
+    We attribute the production closure only, so anything npm marks `dev` OR
+    `devOptional` is dropped. `devOptional` matters: @angular/cli, typescript,
+    and @algolia/* are devOptional (not pure `dev`), so a `dev`-only filter — or
+    `npm ls --omit=dev` — wrongly keeps them. They are build tooling, not part of
+    the shipped browser/SSR bundle.
+    """
+    if lock_json is None:
+        lock_path = COCKPIT_DIR / "package-lock.json"
+        if not lock_path.is_file():
+            sys.stderr.write(
+                "::warning::cockpit/package-lock.json absent; skipping npm scan\n")
+            return []
+        lock_json = lock_path.read_text(encoding="utf-8")
+    try:
+        packages = json.loads(lock_json).get("packages", {})
+    except (json.JSONDecodeError, TypeError, AttributeError):
         sys.stderr.write(
-            "::warning::cockpit/node_modules absent; skipping npm license scan "
-            "(run `npm ci` in cockpit/ to include it)\n"
-        )
+            "::warning::cockpit/package-lock.json unparseable; skipping npm scan\n")
         return []
-    if not raw.strip():
-        return []
-    deps = []
-    for key, meta in json.loads(raw).items():
-        # key is "name@version" (name may itself contain @scope/).
-        at = key.rfind("@")
-        name, version = (key[:at], key[at + 1:]) if at > 0 else (key, "")
-        lic = meta.get("licenses", "UNKNOWN")
-        if isinstance(lic, list):
-            lic = " / ".join(lic)
-        deps.append(Dep(
+
+    by_key: dict[tuple[str, str], Dep] = {}
+    for path, meta in packages.items():
+        if not path or not isinstance(meta, dict):
+            continue  # "" is the root project
+        if meta.get("dev") or meta.get("devOptional"):
+            continue  # dev-only / not in the production closure
+        name = path[path.rfind("node_modules/") + len("node_modules/"):]
+        lic = meta.get("license", "UNKNOWN")
+        if isinstance(lic, dict):  # legacy {type, url} form
+            lic = lic.get("type", "UNKNOWN")
+        elif isinstance(lic, list):
+            lic = " / ".join(
+                x.get("type", "") if isinstance(x, dict) else str(x) for x in lic)
+        version = meta.get("version", "")
+        by_key[(name, version)] = Dep(  # dedup: a pkg can sit at multiple paths
             name=name,
             version=version,
-            license_=lic,
-            url=meta.get("repository", ""),
+            license_=lic or "UNKNOWN",
+            url=f"https://www.npmjs.com/package/{name}",
             ecosystem="js",
-        ))
-    return [d for d in deps if d.name != "cockpit"]
+        )
+    sys.stderr.write(
+        f"::notice::npm license scan: {len(by_key)} production packages from "
+        "package-lock.json (dev/devOptional excluded)\n")
+    return list(by_key.values())
 
 
 # --- Reporting & gate -------------------------------------------------------
@@ -318,14 +349,15 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--no-python", action="store_true", help="skip Python deps")
     ap.add_argument("--no-js", action="store_true", help="skip npm deps")
     ap.add_argument("--pip-json", help="read pip-licenses JSON from file (testing)")
-    ap.add_argument("--npm-json", help="read license-checker JSON from file (testing)")
+    ap.add_argument("--npm-lock-json",
+                    help="read cockpit/package-lock.json from file (testing)")
     args = ap.parse_args(argv)
 
     def _read(p):
         return Path(p).read_text(encoding="utf-8") if p else None
 
     py = [] if args.no_python else collect_python(_read(args.pip_json))
-    js = [] if args.no_js else collect_npm(_read(args.npm_json))
+    js = [] if args.no_js else collect_npm(_read(args.npm_lock_json))
     deps = py + js
     if not deps:
         sys.stderr.write("::warning::no dependencies collected — nothing to check\n")

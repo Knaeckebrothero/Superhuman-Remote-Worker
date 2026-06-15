@@ -87,13 +87,13 @@ python scripts/check_licenses.py --check
 python scripts/check_licenses.py --write
 ```
 
-To run it locally, install the inventory tooling and the dependency tree first, so
-the tools see the **actual installed versions** (ideally inside the built orchestrator
-image to match what ships):
+To run it locally: backend licenses are read from installed package metadata, so
+install the Python deps first (ideally inside the built orchestrator image to match
+what ships). The frontend inventory is read directly from `cockpit/package-lock.json`
+— no `npm install` needed.
 
 ```bash
 pip install pip-licenses -r requirements.txt -r orchestrator/requirements.txt
-( cd cockpit && npm ci )
 python scripts/check_licenses.py --write   # gate + regenerate
 ```
 

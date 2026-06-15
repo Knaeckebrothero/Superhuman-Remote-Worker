@@ -261,10 +261,9 @@ jobs:
           uv pip install --system pip-licenses
           -r orchestrator/requirements.txt
           -r orchestrator/mcp/requirements.txt
-      - name: Install cockpit deps (for npm license scan)
-        working-directory: cockpit
-        run: npm ci
       - name: Check third-party licenses
+        # Python: installed metadata via pip-licenses. Frontend: read straight
+        # from cockpit/package-lock.json (no npm install / node_modules needed).
         run: python scripts/check_licenses.py --check
 
   # ---------------------------------------------------------------------------
