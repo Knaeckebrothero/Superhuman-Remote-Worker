@@ -362,6 +362,8 @@ ls "$dir"/*.sql | xargs -n1 basename | awk -F_ '{print $1}' | sort | uniq -d | g
 
 **Renaming policy.** Never rename a migration after it has been applied to any environment. The runner checksums file content and refuses checksum drift on applied rows. If a name is wrong, write a new migration that supersedes it.
 
+**Reserved numbers.** `0029_capability_grants.sql` is reserved for User-Defined Experts Slice 2 (capability grants) — see `docs/features/global_expert_management.md`. Do not claim `0029` for another feature. Reserved by this note rather than a placeholder file on purpose: the runner checksums applied migrations, so a committed-then-edited placeholder would later trip the drift guard. When Slice 2 lands it creates `0029` for real.
+
 ### Why sequential, not timestamps
 
 Surveyed projects split roughly:
