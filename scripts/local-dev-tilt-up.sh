@@ -25,6 +25,7 @@ cd "$REPO_ROOT"
 
 NAMESPACE="${NAMESPACE:-srw}"
 KUBE_CONTEXT="${KUBE_CONTEXT:-k3d-srw}"
+CLUSTER_NAME="${CLUSTER_NAME:-srw}"
 VALUES_LOCAL="$REPO_ROOT/deployment/values-local.yaml"
 
 log()  { printf '\033[1;34m[tilt-bootstrap]\033[0m %s\n' "$*"; }
@@ -74,7 +75,36 @@ elif [[ ! -f "$VALUES_LOCAL" ]]; then
   die "create values-local.yaml first"
 fi
 
-# --- 4. Run Tilt -------------------------------------------------------------
+# --- 4. Mirror MinIO images into the cluster registry ------------------------
+# The `virtual` workspace tier AND the snapshot/IDE object store both run on a
+# single-node MinIO (deployment/tilt-minio.yaml, deployed by the Tiltfile). The
+# k3d node has no external DNS, so MinIO's images must be pushed into the
+# in-cluster registry first — otherwise the minio pods sit in ImagePullBackOff
+# and snapshots + the virtual tier are dead. Idempotent: skips images already
+# present. The registry host port is read from the container (5005 on a fresh
+# cluster, 5000 on older ones), so this works regardless of which it is.
+REGISTRY_CTR=$(docker ps --filter "name=${CLUSTER_NAME}-registry" --format '{{.Names}}' 2>/dev/null | head -1 || true)
+REG_PORT=""
+[[ -n "$REGISTRY_CTR" ]] && REG_PORT=$(docker port "$REGISTRY_CTR" 5000 2>/dev/null | head -1 | sed -E 's/.*:([0-9]+)$/\1/' || true)
+if [[ -z "$REG_PORT" ]]; then
+  log "k3d registry not found / no published port — skipping MinIO mirror."
+  log "  (minio pods will ImagePullBackOff; mirror manually, then 'kubectl -n $NAMESPACE delete pod -l app=minio')"
+else
+  for img in minio/minio:latest minio/mc:latest; do
+    repo="${img%:*}"
+    if curl -fsS "http://localhost:${REG_PORT}/v2/${repo}/tags/list" >/dev/null 2>&1; then
+      skip "registry already has $img"
+    elif docker pull "$img" >/dev/null 2>&1 \
+         && docker tag "$img" "localhost:${REG_PORT}/${img}" \
+         && docker push "localhost:${REG_PORT}/${img}" >/dev/null 2>&1; then
+      ok "mirrored $img → localhost:${REG_PORT}"
+    else
+      log "WARN: could not mirror $img (offline / rate-limited?) — minio will ImagePullBackOff until you mirror it"
+    fi
+  done
+fi
+
+# --- 5. Run Tilt -------------------------------------------------------------
 cat <<EOF
 
 $(printf '\033[1;32m✓ Cluster ready. Starting Tilt.\033[0m')

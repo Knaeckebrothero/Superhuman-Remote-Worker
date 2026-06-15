@@ -28,9 +28,9 @@ related:
 > assembles the right memories for every LLM call — the model is a *consumer*, never the
 > manager. Build the seam first; everything else becomes a plugin behind it.
 
-**Status:** Design v2 / **Phases 1–3 implemented + measured; Phase 4 code
-complete, measurement pending (2026-06-14)**. A 7-phase overhaul; **four phases
-coded, two rollout gates + the Phase-4 measurement + Phases 5–7 remain.**
+**Status:** Design v2 / **Phases 1–4 implemented + measured (2026-06-14)**. A
+7-phase overhaul; **four phases done, two rollout gates (GATE A soak/delete,
+GATE B production flip) + Phases 5–7 remain.**
 The map:
 
 - **Phase 1 (MemoryManager seam) — code complete, flag ON, committed.** Both
@@ -59,25 +59,49 @@ The map:
   but **inert by default** (nothing in the defaults-YAML pipeline). **GATE B:**
   the production flip is a separate decision pending real-session evidence —
   the harness is N=20 synthetic with a gemma reader, not the product workload.
-- **Phase 4 (lifecycle supersede) — CODE COMPLETE (slices 1–3, 2026-06-14),
-  measurement pending.** Bi-temporal columns + retrieval filter (migration
-  `vector/0006`, live-validated), ingestion verdicts ADD/UPDATE/MERGE/NOOP via
-  the aux LLM (`memory.ingestion.enabled`, default off) with retire-and-exclude
-  supersede, and a `write_gate` completeness toggle — all inert by default,
-  full suite green. The only thing that fixes knowledge-update (0/4 end-task,
-  and rerank ordering makes it *worse* at equal tokens — a lifecycle problem no
-  retrieval policy can solve). **Slice 4 (the measurement) is the open item:**
-  a fresh seam ingest with verdicts on (arms staged) vs the opening baseline
-  (`runs/contra_complete_rerank`: update_above_original 0.75, reader current
-  1.0). Needs the cluster + creds + a ~4.5h ingest.
+- **Phase 4 (lifecycle supersede) — ✅ COMPLETE + MEASURED (2026-06-14), NOT
+  yet rolled out.** Bi-temporal columns + retrieval filter (migration
+  `vector/0006`), ingestion verdicts ADD/UPDATE/MERGE/NOOP via the aux LLM
+  (`memory.ingestion.enabled`, default off) with retire-and-exclude supersede,
+  and a `write_gate` completeness toggle — all inert by default, full suite
+  green. **The measured win (the thing no retrieval policy could fix):**
+  contradiction probe `original_injected` 1.0 → **0.25** (stale fact retired,
+  not just out-ranked) + reader current 1.0; and on the N=20 end-task slice
+  **knowledge-update 0/4 → 3/4** with **overall 0.40 → 0.50**, R@5 and tokens
+  unchanged, 14 % of the organic corpus retired. KU recovered past its 0.5
+  target. Still behind **GATE B** (production flip) — same as Phase 3, the
+  evidence is N=20 synthetic with a gemma reader.
 - **Phases 5–7** — ablate-and-cut (find + delete cargo-cult consolidation),
   buckets productized (personal/shared + cockpit panel), frontier verdicts
   (graph-keep, learned scorer). Decision-gated or dependent on Phase 4.
 
-Two smaller open items, both user-side: judge calibration is **93.1 % vs the
-97 % target** (needs a ~100-item label pass), and the request digest's
-windowing payoff is **unmeasured** (only question-time parity is proven —
-needs an ingest-time A/B or a production soak).
+**Open items after Phase 4** (none block the measured wins; all are rollout or
+follow-up, not core correctness):
+- **The two rollout gates** (the load-bearing ones, both decisions not code):
+  **GATE A** = Phase-1 soak on dev → delete the legacy `memory_service is None`
+  blocks; **GATE B** = flip the measured Phase-3+4 stack (`scorers: [reranker]`,
+  `policies: [gate, bounded]`, `memory.ingestion.enabled: true`,
+  `extraction.write_gate: false`) into the defaults YAML. The harness case is
+  made; the caveat is unchanged — N=20 synthetic, gemma reader, not the product
+  workload.
+- **GC / retention (B6) is NOT closed by Phase 4.** Supersede *retires, does not
+  delete* (sets `valid_to`) — by design for point-in-time history, but it means
+  the table still grows (supersede actually *adds* a row: the new fact plus the
+  retired old one). A GC job that deletes rows retired beyond a retention window
+  — keying off the new `valid_to`/`superseded_at` columns — remains future work
+  (loosely mapped to Phase 4 originally; now a Phase-4 follow-up / folds into
+  Phase 5's ablate-and-cut).
+- **`review_floor` tune** (the Phase-4 residual): the 2/8 contradiction misses +
+  the 1/4 KU miss were old/new pairs phrased below the 0.6 similarity floor, so
+  the verdict ADD'd them as distinct instead of superseding. A floor and/or
+  extraction-phrasing tune could close them — cheap follow-up, measured on the
+  same harness.
+- **Two user-side measurement items**: judge calibration is **93.1 % vs the
+  97 % target** (needs a ~100-item label pass), and the request digest's
+  windowing payoff is **unmeasured** (only question-time parity is proven —
+  needs an ingest-time A/B or a production soak).
+- **B9 enum nits**: the `memory_type`/`source` CHECK constraints still carry the
+  pre-overhaul enum values; fold into the next constraint-touching migration.
 
 Restructured 2026-06-10 around the MemoryManager abstraction after design
 alignment (v1 of 2026-06-07 was phase-first; superseded, phases preserved
@@ -660,6 +684,46 @@ below in new order). Every bug worth fixing *before* the seam is fixed
   cluster + `EVAL_AUX_API_KEY` + a ~4.5h ingest (eval writes to `srw_eval`
   only). Production flip (defaults YAML) is the separate GATE-B rollout
   decision; all Phase-4 config is inert without explicit opt-in.
+- **2026-06-14 — Phase 4 MEASURED on k3d (`srw_eval`); supersede fixes
+  knowledge-update.** Ran the full Phase-4 write path against real gemma
+  (extraction + verdicts) + llama-3.3-70b judge (groq). Migration 0006 applied
+  to `srw_eval`; creds resolved from the catalog's `-strix` endpoints
+  (decrypted via `resolve_catalog_model(...)['api_key']`), router accepts the
+  plain `gemma-4-moe`/`qwen3-embedding-8b` L40S ids.
+  **(a) Contradiction probe** (`runs/contra_complete_verdict`, verdicts ON +
+  rerank read stack, 8-probe fixture): **`original_injected` 1.0 → 0.25**
+  (the stale fact is *retired*, not just out-ranked), **`update_above_original`
+  0.75 → 1.0**, reader **current 1.0 / stale 0 / miss 0**. DB confirmed the
+  10 retired rows linked to their replacements — the washing-machine cases
+  exactly (`Pixel 7 → iPhone 15`, `Greenfield Labs → Northwind Robotics`,
+  `dentist Jun 12 → rescheduled Jun 26`). 2/8 kept the original — there the
+  old/new pair was phrased below the 0.6 `review_floor` so the verdict ADD'd
+  them as distinct (tunable). This probe isolates supersede (independent of
+  write_gate).
+  **(b) End-task / KU slice** (fresh seam ingest `runs/seam_complete_verdict_s20`,
+  N=20 seed 0, verdicts ON + write_gate off → then requeried through the
+  production-candidate read stack `complete_rerank_b10_gaterel` and judged):
+  20/20 ingested, 0 whole-question failures, **14 % of the organic corpus
+  retired** (1,518 / 10,494 — ~1 in 7 extracted facts superseded by a later
+  UPDATE/MERGE). vs the Phase-3 reference over the verdicts-OFF corpus
+  (`complete_rerank_b10_gaterel_s20`: overall 0.40, KU **0/4**):
+  **knowledge-update 0/4 → 3/4 (0.75)**, **overall end-task 0.40 → 0.50**,
+  retrieval R@5 1.0 (unchanged), 111 tok/q (unchanged), abstention 1.0
+  (correctly declines the 1 abstention question). The KU question from the
+  original Phase-2 fact-level diagnostic (`cc5ded98`, "two hours" vs stale
+  "one hour") now answers correctly because the stale value was retired at
+  ingest. The 1 remaining KU miss (`dad224aa`) + ss-preference 0.0
+  (n=3, judge gray-zone, within noise of the Phase-3 0.33) are the residual.
+  **Acceptance (all met):** contradiction probe flips to current-fact answers
+  ✅; KU slice improves ✅ (0 → 0.75, past the 0.5 target); no end-task
+  regression (overall up +0.10) ✅; verdict-call budget held (the `review_floor`
+  cost guard; the 84 contained aux failures over ~7 h were router noise,
+  absorbed per-op, zero whole-question loss) ✅. **Caveats:** N=20, per-type
+  n=3–4 (KU is 3-of-4), single seed, reader gemma / judge llama-70b (same as
+  prior phases for comparability); the s20 delta combines supersede +
+  write_gate-drop (the contradiction probe isolates supersede). Production
+  flip (defaults YAML) remains the separate GATE-B decision — but the harness
+  case for it is now made. Slice-4 complete → **Phase 4 done.**
 **Companions:**
 - [`agent_memory_current_state.md`](agent_memory_current_state.md) — ground truth: every
   current capability classified wired/dead/conceptual with `file:line` evidence.
@@ -1188,7 +1252,7 @@ gap is one knowledge-update question = supersede = Phase 4 by construction).
 `bounded: {max_items: 10}`, reranker `keep_pinned_first: false` + top_k sized to
 cover the store (gate arms leak unscored tail items fail-open otherwise).
 
-### Phase 4 — Lifecycle writers: verdicts + bi-temporal supersede · ~1–1.5 wk ← **slices 1–3 CODE COMPLETE 2026-06-14 (inert by default); slice 4 = measure**
+### Phase 4 — Lifecycle writers: verdicts + bi-temporal supersede · ~1–1.5 wk ← **✅ COMPLETE + MEASURED 2026-06-14 (inert by default; GATE-B flip pending)**
 Ingestion verdicts (ADD/UPDATE/MERGE/NOOP, aux-LLM) ✅; bi-temporal columns via
 `migrations/vector/0006_bitemporal_memory.sql` ✅ (NOT `knowledge_index` — it already
 supersedes via `status='active'`, and the KB is the model's active notebook, P0);
@@ -1199,9 +1263,10 @@ interval as turn fallback) — no new trigger knob. Cost guard ✅: the `review_
 similarity gate means a genuinely-new fact is a straight ADD with zero LLM calls, so
 verdict calls are bounded to ≤1 per stored memory. Behind `memory.ingestion.enabled`
 (default off); `store()` keeps the legacy cosine-dedup path byte-for-byte when the
-verdict service is unwired. **Slice 4 (measure) is the remaining work** — arms
-`persistent_complete_verdict` + `contra_complete_verdict` staged; needs a fresh seam
-ingest (verdicts change the write path, so no requery) on `srw_eval`.
+verdict service is unwired. **Slice 4 (measure) ✅ DONE 2026-06-14** (arms
+`persistent_complete_verdict` + `contra_complete_verdict`, fresh seam ingest on
+`srw_eval`, requeried through the rerank read stack + judged) — see the
+implementation-log entry for the full result.
 **Opening baseline (recorded 2026-06-12, `runs/contra_complete_rerank`):** over a
 completeness+rerank corpus the probe reads update_above_original 0.75 (seam 0.125,
 flat 0.625) and reader current 1.0 / stale 0 / miss 0 on the 8-probe fixture — the
@@ -1211,8 +1276,11 @@ decomposition), and the knowledge-update end-task slice (0/4 on every reranked a
 relevance ordering puts stale immediately next to current, measurably worse than the
 legacy recency-blended order at equal tokens). Success = original_injected → 0 on
 superseded facts, KU end-task recovers toward its 0.5 baseline.
-**Acceptance (harness):** contradiction-survival probe flips to current-fact answers;
-knowledge-update slice improves; no regression elsewhere; verdict-call budget held.
+**Acceptance (harness) — all met 2026-06-14:** contradiction-survival probe flips to
+current-fact answers ✅ (reader current 1.0, `original_injected` 1.0→0.25);
+knowledge-update slice improves ✅ (0/4 → 3/4, past the 0.5 target; overall end-task
+0.40 → 0.50); no regression elsewhere ✅ (R@5 1.0, 111 tok unchanged); verdict-call
+budget held ✅ (review_floor cost guard). N=20 caveat as Phase 3.
 
 ### Phase 5 — Ablate & cut · ~0.5 wk + data wait
 A/B the inherited consolidation layer — curation writer (née assembler), TTL semantics,

@@ -44,9 +44,15 @@ spec:
     spec:
       containers:
         - name: minio
-          # k3d node has no external DNS; pull from the in-cluster registry
-          # (host: localhost:5005). Mirror with: podman pull docker.io/minio/minio:latest
-          # && podman tag ... localhost:5005/minio/minio:latest && podman push --tls-verify=false ...
+          # k3d's node has no external DNS, so this image (and minio/mc below)
+          # must be mirrored into the in-cluster registry first. Push to the host
+          # port that maps to srw-registry:5000 — find it with
+          # `docker port srw-registry 5000` (5000 on the current cluster;
+          # local-dev-up.sh's --registry-create default is 5005 — verify, don't
+          # assume). One-shot mirror (set PORT to that value):
+          #   for i in minio/minio minio/mc; do docker pull "$i:latest"; \
+          #     docker tag "$i:latest" "localhost:$PORT/$i:latest"; \
+          #     docker push "localhost:$PORT/$i:latest"; done
           image: srw-registry:5000/minio/minio:latest
           imagePullPolicy: IfNotPresent
           args: ["server", "/data", "--console-address", ":9001"]
@@ -122,9 +128,13 @@ spec:
           args:
             - |
               # Retry alias-set + mb together until MinIO is up (a unique alias
-              # avoids mc's built-in `local` -> localhost:9000 default).
+              # avoids mc's built-in `local` -> localhost:9000 default). `mc mb -p`
+              # ignores already-exists, so the retry loop stays correct.
+              #   srw-workspaces = virtual workspace tier (rclone, no_check_bucket)
+              #   srw-snapshots  = workspace snapshot + IDE-session blobs (boto3)
               until mc alias set m http://minio:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" \
-                    && mc mb -p m/srw-workspaces; do
+                    && mc mb -p m/srw-workspaces \
+                    && mc mb -p m/srw-snapshots; do
                 echo "waiting for minio..."; sleep 2
               done
-              echo "bucket srw-workspaces ready"
+              echo "buckets srw-workspaces + srw-snapshots ready"

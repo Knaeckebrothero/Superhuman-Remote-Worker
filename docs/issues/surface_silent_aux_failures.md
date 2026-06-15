@@ -33,9 +33,28 @@ them, or exposed them on a status surface.
 Make a sustained auxiliary outage **loud** and **queryable**, without changing
 the non-fatal contract (callers still swallow-and-continue).
 
+## Status (2026-06-11)
+
+Built on `develop` (uncommitted), verified locally — `ruff check`/`format`
+clean, unit tests green (`tests/test_aux_health.py`, `tests/test_auxiliary.py`):
+
+- ✅ **Phase 1** — in-agent health tracker + escalation/recovery + `get_status()` exposure.
+- ✅ **Phase 1.5** — failed aux calls archived to `llm_requests` (`status="error"`).
+- ⏳ **Phase 1.6 (NEXT)** — surface aux + error rows in the debug view (read side)
+  + wire the session-path archiver. *Not started.*
+- ☐ **Phase 2** — central visibility (heartbeat → Cockpit agent badge). *Not started.*
+- ☐ **Mitigation** — pin aux default off `gemma-4-moe`. *Not started (separate).*
+
+Not yet exercised end-to-end on a cluster (needs a deploy + a forced aux
+outage); the logic is unit-covered.
+
 ## Design
 
-### Phase 1 (this change) — in-agent health + escalation
+### Phase 1 — in-agent health + escalation ✅
+
+*Implemented:* `AuxHealth` + `_TaskHealth` in `src/services/auxiliary.py`
+(recorded from the four task helpers); snapshot surfaced via
+`UniversalAgent.get_status()` in `src/agent.py`. Tests: `tests/test_aux_health.py`.
 
 `AuxHealth` tracker attached to the shared `AuxiliaryLLM` instance
 (`src/services/auxiliary.py`). The four task helpers record success/failure on
@@ -61,7 +80,12 @@ Behaviour:
 No control-flow change: failures still propagate to the existing `except` and
 are still swallowed. The tracker is in-process and cannot itself fail the task.
 
-### Phase 1.5 (this change) — log failed aux calls to the debug view
+### Phase 1.5 — log failed aux calls (write side) ✅
+
+*Implemented:* `LLMArchiver.archive_error()` in `src/core/archiver.py`;
+`AuxiliaryLLM._invoke_aux()` + `_archive_error()` in `src/services/auxiliary.py`
+(wraps the `chain()` + `agent()` LLM calls). Tests: `TestAuxErrorArchiving` +
+`TestArchiveError` in `tests/test_auxiliary.py`.
 
 Main-loop LLM failures are visible because they flow into the job's
 `error_message`/status. Auxiliary calls have **no** such surface: a successful
@@ -82,18 +106,38 @@ Change:
   when no archiver/job_id is wired, so it's safe on every path.
 
 Now a degraded aux model leaves a per-request error row in `llm_requests`
-alongside the main calls.
+alongside the main calls — on **worker jobs** (where the archiver is wired via
+`set_job_context`). Sessions still need the archiver wired (Phase 1.6).
 
-**Still open after this change** (call out so it isn't mistaken for done):
+### Phase 1.6 (NEXT) — surface aux + error rows in the debug view (read side)
 
-- **Session aux calls are still not archived at all** — the persistent-session
-  `AuxiliaryLLM`s (`persistent_app.py:877`, `:3400`) are built without an
-  archiver and never get `set_job_context`. Wiring that is a small follow-up.
-- **The debug UI still defaults to `call_type="main"`** — the agent's
-  `get_conversation` defaults to `"main"` and the orchestrator's
-  `get_job_chat_history` exposes no `call_type` param, so the new aux/error
-  rows are written but not yet *shown*. Surfacing them (a filter / an
-  "errors" toggle) is part of the read-side work below.
+Phases 1 + 1.5 make the data *exist*; this makes it *visible*. The rows are
+written but still filtered out on read:
+
+- The agent's `LLMArchiver.get_conversation` defaults to `call_type="main"`.
+- The orchestrator's `get_job_chat_history` (`orchestrator/main.py:8431`)
+  exposes no `call_type`/`status` param, and `mongodb.get_chat_history` builds
+  a main-only sequential view.
+- Session aux calls aren't archived at all yet (no archiver on the
+  persistent-session `AuxiliaryLLM`s at `persistent_app.py:877`, `:3400`), so
+  there's nothing to show for sessions.
+
+Plan:
+
+1. **Orchestrator read path** — add optional `call_type` + `status` query
+   params to `GET /api/jobs/{id}/chat-history` and thread them into
+   `mongodb.get_chat_history`. Default unchanged (main-only sequential view);
+   `call_type=all` includes aux rows; `status=error` returns only failures
+   across call types.
+2. **Session archiver** — wire `set_job_context` (or pass an archiver) for the
+   persistent-session `AuxiliaryLLM`s so session aux failures also get rows;
+   without it `_archive_error` no-ops on the session path.
+3. **Cockpit** — debug/LLM-requests view gets a source filter (All / Main /
+   Aux) + an "errors only" toggle; error rows render the `error.type/message`
+   with a degraded badge.
+
+Acceptance: a forced aux failure (worker *and* session) shows an error row in
+the debug view filtered by `status=error`, with the model + error type.
 
 ### Phase 2 (follow-up, not in this change) — central visibility
 
@@ -113,12 +157,13 @@ alongside the main calls.
 
 ## Acceptance criteria
 
-- [ ] 3 consecutive aux failures produce exactly one `AUXILIARY MODEL DEGRADED`
+- [x] 3 consecutive aux failures produce exactly one `AUXILIARY MODEL DEGRADED`
       ERROR; a 4th does not re-log (until `REPEAT_EVERY`).
-- [ ] A success after degradation logs `AUXILIARY MODEL RECOVERED` and resets.
-- [ ] `get_status()["auxiliary"]` reflects `degraded` + per-task counters.
-- [ ] No change to the swallow-and-continue behaviour of any task.
-- [ ] Unit tests for threshold, repeat-throttle, recovery, snapshot.
+- [x] A success after degradation logs `AUXILIARY MODEL RECOVERED` and resets.
+- [x] `get_status()["auxiliary"]` reflects `degraded` + per-task counters
+      (snapshot content unit-tested; `get_status()` wiring by inspection).
+- [x] No change to the swallow-and-continue behaviour of any task.
+- [x] Unit tests for threshold, repeat-throttle, recovery, snapshot.
 - [x] A failed aux call (worker job) writes one `llm_requests` row with
       `status="error"`, the task `call_type`, and the error type/message.
 - [x] `archive_error` no-ops without a Mongo connection; `_archive_error`

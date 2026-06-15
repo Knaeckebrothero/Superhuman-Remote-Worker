@@ -441,6 +441,16 @@ retrieval_importance_floor AND access_count = 0 AND last_accessed < now() -
 interval 'N days'`. Anything smarter (decay, archival tiers) belongs to the
 overhaul — but "unreachable rows live forever" needs no research to fix.
 
+**Status (2026-06-14): STILL OPEN — Phase 4 did NOT close this.** Phase 4
+shipped bi-temporal *supersede* (verdicts + `valid_to`/`superseded_at`/
+`superseded_by`, migration `vector/0006`), which *retires-not-deletes* — and in
+fact grows the table faster (a supersede writes the new fact *and* keeps the
+retired old one). So B6 is unchanged in kind, but the new columns are now the
+natural key for the GC job: delete rows where `valid_to IS NOT NULL AND
+superseded_at < now() - interval 'N days'` (retired-and-aged), plus the original
+unreachable-low-importance sketch above. GC remains a Phase-4 follow-up / Phase-5
+ablate-and-cut item (`agent_memory_overhaul.md` §Open items).
+
 ---
 
 ## B7 — KB dual-write drift, fail-open

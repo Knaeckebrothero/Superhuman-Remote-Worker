@@ -236,9 +236,37 @@ full chain count 3732, claude-sonnet `multimodal:true`, per-mode 3726/1496/4758/
 
 ---
 
-## 6. Live session (gold standard — recommended, not yet run)
+## 6. Live session (gold standard — ✅ VERIFIED 2026-06-14)
 
 Proves the graph loop, not just components.
+
+**Result (2026-06-14) — verified observationally against a real post-fix production
+session, which is stronger than a synthetic repro: it's the exact failing model +
+workload, run by a real user against the deployed fix.**
+
+Session `0ed8c0e0-5928-4db9-94f3-8782d840f278` (dev cluster, ns
+`superhuman-remote-worker`, created **18:12, after the S1–S4 deploy**):
+
+- **gpt-5.5** via codex-proxy, `persistent_defaults` — the same model that wedged
+  `eb989b82`/`5dbb5770`.
+- Read **10 multi-page PDFs** → 10 `Image content from tool call` HumanMessages +
+  22 tool results (45 messages total). S2 visibly active: a 9-page doc rendered
+  pages 1–5 (`seq 5480: [Pages 1-5 of 9]`).
+- **No compaction fired** — the role breakdown has **zero `role='summary'` rows**;
+  the `COMPACTING … 875%` phantom never appeared (correct counting ⇒ ~tens of k
+  real tokens, far under the window).
+- **Turn completed** — final message `seq 5483` is a substantive **10,399-char**
+  AI answer.
+
+Contrast pre-fix `eb989b82`: wedged at the trailing image HumanMessage, 2.79M
+phantom, stuck compacting (`total_turns=1`, last_role=human-image). (`total_tokens`
+is unreliable as a wedge signal — it reads `0` for *all* persistent threads incl.
+completed multi-turn ones; the real signal is whether an AI message with content
+follows the images.)
+
+A controlled browser-driven repro remains an option but is now **redundant** — the
+real session above exercised the exact failing path end-to-end and completed; every
+underlying component is also proven in §5.
 
 1. Place a multi-page PDF (ideally with a pictogram/figure page) in the session's
    cloud/workspace.
@@ -256,8 +284,10 @@ Proves the graph loop, not just components.
    - S2: the agent logs `[Did not rasterize N text-only page(s) …]` for a
      text-heavy PDF, and pictogram pages still render.
 
-Skipped so far only for k3d browser-driving flakiness; every underlying component
-is proven in §5.
+A scripted browser/API drive was never needed — the real session above is the
+gold-standard evidence; every underlying component is also proven in §5. (If a
+controlled repro is ever wanted: start a gpt-5.5 session, read several multi-page
+PDFs, assert no `COMPACTING` banner and a completed turn.)
 
 ---
 

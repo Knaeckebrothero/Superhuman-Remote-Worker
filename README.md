@@ -269,7 +269,7 @@ Sanity check: `docker run --rm hello-world`, `k3d version`, `kubectl version --c
 ./scripts/local-dev-up.sh
 ```
 
-Idempotent — re-runs are safe. Creates the k3d cluster (host ports 80/443 → Traefik, local image registry on `localhost:5000`), installs cert-manager, registers a `mkcert-issuer` ClusterIssuer wrapping your mkcert root CA, creates the `srw` namespace, and seeds a dummy `srw-vm-ssh-key` Secret (the orchestrator mounts it unconditionally for VM workspaces; locally a stub is fine).
+Idempotent — re-runs are safe. Creates the k3d cluster (host ports 80/443 → Traefik, local image registry on `localhost:5005`), installs cert-manager, registers a `mkcert-issuer` ClusterIssuer wrapping your mkcert root CA, creates the `srw` namespace, and seeds a dummy `srw-vm-ssh-key` Secret (the orchestrator mounts it unconditionally for VM workspaces; locally a stub is fine).
 
 The script's behaviour is documented inline; if anything fails it bails out with a clear message rather than silently continuing.
 
@@ -402,7 +402,7 @@ tilt version
 ./scripts/local-dev-tilt-up.sh
 ```
 
-This bootstrap is idempotent — it runs `scripts/local-dev-up.sh` underneath (cluster + cert-manager + namespace + vm-ssh-key Secret), then adds the `srw-session-jwt` Secret, syncs the current Traefik ClusterIP into `values-local.yaml`'s `opencloud.hostAliases` entry, and finally runs `tilt up` in the foreground.
+This bootstrap is idempotent — it runs `scripts/local-dev-up.sh` underneath (cluster + cert-manager + namespace + vm-ssh-key Secret), then adds the `srw-session-jwt` Secret, syncs the current Traefik ClusterIP into `values-local.yaml`'s `opencloud.hostAliases` entry, mirrors the MinIO images into the cluster registry (the `virtual` workspace tier and workspace snapshots / IDE-session blobs run on a single-node MinIO fixture, `deployment/tilt-minio.yaml`, deployed by the Tiltfile — k3d's node has no external DNS, so the images must be pre-loaded into the registry), and finally runs `tilt up` in the foreground.
 
 **Run Tilt — subsequent sessions**: the cluster, secrets, and Helm release persist across `k3d cluster stop/start`, and the Traefik ClusterIP is stable for the life of the cluster, so you don't need the bootstrap again. Just bring the cluster back and start Tilt directly (always cluster first, then Tilt — Tilt deploys *into* a running cluster):
 

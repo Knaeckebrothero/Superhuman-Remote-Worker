@@ -1,6 +1,6 @@
 # Context Token Accounting — truth-anchored estimation, per-family image tokens, image-safe recovery
 
-**Status:** S1+S2+S3+S4 implemented (2026-06-13/14) · originally 2026-06-13
+**Status:** S1+S2+S3+S4 implemented (2026-06-13/14) · **live-verified 2026-06-14** against real post-fix session `0ed8c0e0` (gpt-5.5, 10 multi-page PDFs → no compaction, turn completed; see verification runbook §6) · originally 2026-06-13
 **Verification:** §3–§8 + the formula appendix were refined 2026-06-13 against a 19-agent codebase+web research pass (Workflow `w7c2inj8v`): every provider image-token formula was re-derived from its official primary source, and the load-bearing codebase claims were checked against `src/`. Material corrections to the first draft are flagged inline with **⚠**.
 **Related:**
 - `docs/tests/context_token_accounting_verification.md` — **the verification runbook**: how to test all four slices (unit suites, the per-family estimator oracle, k3d probe-pod recipes, the live-session gold standard).
@@ -23,7 +23,7 @@ We have two token meters that disagree by ~290×, and a context-compaction path 
 | Display | Value | Source | Correct? |
 |---|---|---|---|
 | `COMPACTING … 9188.6k / 1050.0k · 875%` | 9,188,623 "tokens" | internal counter `str(content)` over base64 (`context.py:448/502/706`) | ❌ base64-as-text |
-| bottom bar `INPUT 31,744 · CTX 3%` | real `input_tokens` | provider `usage_metadata` (`persistent_graph.py:1222`) | ✅ |
+| bottom bar `INPUT 31,744 · CTX 3%` | real `input_tokens` | provider `usage_metadata` (`persistent_graph.py:1284`) | ✅ |
 
 Proof it's a measurement artifact, not real context: the persisted `thread_messages` for this thread total **93,105 chars with zero base64** (`has_b64 = 0`). The base64 exists only in live memory — 12 `HumanMessage`s (seq 4638…4667), each carrying a full-page render, flattened to a 61-char marker at persist. The real conversation is ~31k tokens against a 1.05M window = **3%**. The model request would have succeeded; nothing actually overflowed.
 
@@ -62,7 +62,7 @@ The aux endpoint is healthy — measured this session: `/v1/models` → 200 in 7
 
 ## 3. Decisions
 
-1. **Truth is the provider's `input_tokens`.** We already capture it (`persistent_graph.py:1222`). It becomes the authoritative current-context size. **⚠ Corrected:** the *full-history `str(content)` recount* is retired as the trigger source — but the *bounded per-delta estimate* stays. The delta is what makes self-healing work for messages appended this turn (including the ephemeral memory/knowledge **injection pairs** that live on the per-call `prepared` copy, never on `messages`). Don't conflate the two: kill the full recount, keep the delta.
+1. **Truth is the provider's `input_tokens`.** We already capture it (`persistent_graph.py:1284`). It becomes the authoritative current-context size. **⚠ Corrected:** the *full-history `str(content)` recount* is retired as the trigger source — but the *bounded per-delta estimate* stays. The delta is what makes self-healing work for messages appended this turn (including the ephemeral memory/knowledge **injection pairs** that live on the per-call `prepared` copy, never on `messages`). Don't conflate the two: kill the full recount, keep the delta.
 2. **The estimate covers only the delta** since the last call, and is **biased high**. Over-estimating compacts slightly early (safe); under-estimating risks a wasted overflow round-trip. Self-heals at the next call when truth re-anchors.
 3. **The API error is a backstop, not the primary trigger.** A proactive biased-high estimate avoids shipping megabytes of base64 just to be rejected. The real `ContextOverflowError` → compact → retry loop catches the rare under-estimate.
 4. **Image cost lives in `config/model_config_matrix.yaml`** `settings`, beside `multimodal` / `model_max_context_tokens`, with a `default` flat fallback. **⚠ Corrected:** family keys are the **hyphenated** `family_of()` strings (`gpt-5`, `codex`, `o-series`, `gemini`, `gemma`, `claude-opus`, `minimax-m3`) — not underscores, and there is no bare `claude` key. And it **must be routed through `LimitsConfig`, not `LLMConfig`**: `_parse_llm_config` (`loader.py:1534`) is a closed constructor that silently drops unknown keys (see §5).
@@ -83,7 +83,7 @@ trigger_tokens ≈ last_provider_input_tokens
 
 **Seam (verified):** there is no provider-truth slot today — `current_token_count` is written only internally, and `_loop_on_usage` (`persistent_app.py:2989`) only broadcasts SSE. Add:
 - `last_provider_input_tokens: Optional[int] = None` + `record_provider_usage(n)` setter on `ContextManagementState` (`context.py:337-349`).
-- Call `context_manager.record_provider_usage(turn_metrics["input_tokens"])` in `_execute_turn` (`persistent_graph.py:1237`, right after `turn_metrics` is assembled, before the `on_usage` callback). `context_manager` is already a named arg of `_execute_turn` — no callback threading. **Guard against `None`** so an empty-usage turn never overwrites the anchor with 0.
+- Call `context_manager.record_provider_usage(turn_metrics["input_tokens"])` in `_execute_turn` (`persistent_graph.py:1303`, right after `turn_metrics` is assembled, before the `on_usage` callback). `context_manager` is already a named arg of `_execute_turn` — no callback threading. **Guard against `None`** so an empty-usage turn never overwrites the anchor with 0.
 
 `estimate(msg)`:
 - **text** → existing `get_token_counter(model)` (tiktoken-by-family, `context.py:513`). Slight over-count is fine.
@@ -182,7 +182,7 @@ Gate in `src/tools/workspace/files.py` `_read_visual_document`, **per page** (no
 | Area | File:line | Change |
 |---|---|---|
 | Provider-truth slot | `context.py:337-349` | `last_provider_input_tokens` field + `record_provider_usage()` setter |
-| Truth call site | `persistent_graph.py:1237` | `record_provider_usage(turn_metrics["input_tokens"])`, None-guarded |
+| Truth call site | `persistent_graph.py:1303` | `record_provider_usage(turn_metrics["input_tokens"])`, None-guarded |
 | Trigger (primary) | `context.py:932` `ensure_within_limits` | compare anchor+delta, not `str(content)` recount |
 | Trigger (msg-count branch) | `context.py:680-684` | same anchor-based estimate |
 | Trigger (banner log) | `context.py:960-963` | log the anchor estimate, not the phantom recount |
