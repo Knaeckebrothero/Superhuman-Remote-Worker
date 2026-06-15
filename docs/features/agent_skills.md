@@ -56,27 +56,33 @@ Three pieces; each maps onto existing SRW machinery, so the net-new code is smal
 
 Retrieval, injection, repo scanning, config overlay, and the tool framework already exist. The genuinely new code is a scanner, a system-prompt menu block, and one tool.
 
-## One family: skills generalize Layer-3 instruction files
+## One artifact: instruction documents *are* skills
 
-SRW already has two instruction-bundle concepts:
+SRW already has the content. The Layer-3 instruction files ([[prompting]]) — `todo_guide.md`, `research_guide.md` — are, in content, exactly skills: focused "how to do X well" bundles. So skills don't sit *beside* instruction documents; they **subsume** them. There should be **one artifact type** (a skill / `SKILL.md`), not a separate "instruction document" concept. (Experts, by contrast, remain the heavier sibling — a persona/tools/workspace bundle that an agent *is*, not a capability it *loads*; [[global_expert_management]].)
 
-- **Experts** — heavy persona / tools / workspace bundles, pre-selected at job start ([[global_expert_management]]).
-- **Layer-3 instruction files** — focused guides activated by *deterministic* triggers (`before_tool:<tool>`, `phase:strategic|tactical`) ([[prompting]]).
+What differs between today's instruction files and a Claude Code skill is **not the artifact — it's how the artifact is *bound* to an activity.** Activation and enforcement are properties of the *binding*, not of the skill:
 
-A skill is a Layer-3 instruction file with a new activation: **model-invoked, from a catalog.** Rather than introduce a fourth parallel concept — which would *add* conceptual load, the opposite of the goal — skills should be modeled as an extension of the existing `instruction_files` / `InstructionFileEntry` trigger taxonomy:
+| Binding (trigger) | Activation | Use it when | Status |
+|---|---|---|---|
+| `before_tool:<tool>` + `enforce: true` | Tool-gated; the tool refuses until the skill is read | The guidance is **mandatory** before an action (a guardrail) | Exists (`todo_guide`) |
+| `phase:strategic\|tactical` | Auto-injected on phase transition | One skill always applies during a phase | Exists (`research_guide`) |
+| `model_invoked` | Agent picks from the catalog by reading descriptions | **Many** possible skills, only some apply — discovery has value | **New — this feature** |
+| `semantic` | Surfaced by relevance via the memory engine | Same, but the system pre-filters by context | Future (Phase 3) |
 
-| Trigger | Activation | Status |
-|---|---|---|
-| `before_tool:<tool>` | Tool-gated (passive / enforced) | Exists |
-| `phase:strategic\|tactical` | Injected on phase transition (active) | Exists |
-| `model_invoked` | Agent selects from the catalog by reading descriptions | **New — this feature** |
-| `semantic` | Surfaced by relevance via the memory/knowledge retrieval engine | Future (Phase 3) |
+So instruction documents become **skills bound with a deterministic (and possibly enforced) trigger**; the new thing this feature adds is the *model-invoked* binding plus the catalog. One family, one artifact, a small binding taxonomy.
 
-This keeps experts, instruction files, and skills as one coherent family with a single trigger model.
+**Load-bearing caveat — don't lose enforcement.** The `todo_guide` exists *because* agents reliably skip such guidance under pressure; the tool-gate was added precisely to force it ([[prompting]]). Re-expressing it as a "skill" must **not** quietly turn it into an optional, model-invoked suggestion — it stays a skill with an *enforced* binding. Litmus test per guide: *mandatory-before-an-action* → keep a deterministic/enforced binding; *optional-when-relevant* → candidate for `model_invoked`. When exactly one guide always applies to an action, a deterministic binding is also cheaper than a discover-then-read round-trip.
+
+### What is *not* a skill
+
+- **Expert identity / persona / methodology (Layer 1)** — always-on, rebuilt every call so the agent never forgets who it is. Skills are optional/triggered by nature; identity must never be optional. It stays in the system prompt. ([[prompting]])
+- **Task / deliverable / reference files (Layer 4)** — job-specific outputs and domain reference, read on demand from `plan.md`. Not reusable cross-task capabilities. Out of scope.
+
+The consolidation is therefore precise: **Layer 3 → skills.** Layers 1 and 4 stay as they are.
 
 ## Prior art — what already exists
 
-- **Four-layer prompt architecture** ([[prompting]]): Layer 3 ("instruction files, auto-injected by trigger conditions") is the deterministic ancestor of skills. The passive (tool-gated `read_file`) and active (transient injection) mechanisms are already implemented and proven by `todo_guide.md` and `research_guide.md`.
+- **Four-layer prompt architecture** ([[prompting]]): Layer 3 ("instruction files, auto-injected by trigger conditions") *is* the skill artifact, bound with deterministic triggers. The passive (tool-gated `read_file`) and active (transient injection) mechanisms are already implemented and proven by `todo_guide.md` and `research_guide.md`. This feature adds the `model_invoked` binding + catalog on top of them.
 - **Experts** ([[global_expert_management]]): the heavier sibling. Experts-v2 introduces DB-backed, user-authored, capability-gated bundles with user/project/global scope and an overlay model — exactly the substrate skills should reuse.
 - **Memory & knowledge** ([[memory_light]], [[project_knowledge_base]]): hybrid (dense + sparse + recency) retrieval that injects relevant content by similarity to the current todo + phase. The future `semantic` skill trigger routes the skill catalog through this same engine — context-aware skill suggestion with no new retrieval infrastructure.
 
@@ -84,10 +90,11 @@ This keeps experts, instruction files, and skills as one coherent family with a 
 
 1. Skills use the Claude Code/Codex format (`SKILL.md` directory + frontmatter `name`/`description` + optional supporting files) for portability and a familiar authoring model.
 2. Progressive disclosure is mandatory: only descriptions are always-on; bodies load on demand.
-3. Skills are modeled as a generalization of Layer-3 instruction files (a new `model_invoked` trigger), **not** a separate subsystem.
+3. Skills **subsume** Layer-3 instruction documents: one artifact (`SKILL.md`), with activation/enforcement expressed as a *binding* (trigger), not baked into the artifact. The new binding this feature adds is `model_invoked` + the catalog.
 4. Users can author skills (parity with Claude Code/Codex), but the authoring **substrate** (storage / scopes / grants) is inherited from experts-v2, not built here.
 5. The engine is: catalog scan → Layer-1 menu injection → `use_skill` load tool.
 6. Context-aware auto-injection/suggestion is explicitly a later phase, built as a `semantic` trigger over the memory engine.
+7. The consolidation is **Layer 3 only.** Expert identity (Layer 1) stays always-on in the system prompt; task/deliverable files (Layer 4) stay read-on-demand. Re-expressing today's enforced guides (e.g. `todo_guide`) as skills **must preserve their enforced binding** — not silently make a mandatory guardrail optional.
 
 ## Deferred / open (resolve after the experts rework)
 
@@ -103,7 +110,7 @@ This keeps experts, instruction files, and skills as one coherent family with a 
 
 - **Phase 0 — Engine.** Catalog scan + Layer-1 menu + `use_skill`, proven against bundled skills in the config repo.
 - **Phase 1 — User authoring.** Project-repo `skills/` and/or experts-v2 DB rows, reusing experts-v2 scopes + grants.
-- **Phase 2 — Starter library.** Bundled default skills covering the highest-value recurring activities.
+- **Phase 2 — Starter library + migration.** Bundled default skills covering the highest-value recurring activities, including today's `todo_guide` / `research_guide` re-expressed as skills (preserving their enforced/phase bindings).
 - **Phase 3 — Context-aware.** `semantic` trigger routing the catalog through the memory engine to auto-surface/suggest skills.
 
 ## Related

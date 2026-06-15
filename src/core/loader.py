@@ -73,6 +73,16 @@ def _is_config_db_overrides_enabled() -> bool:
     )
 
 
+def _is_experts_db_enabled() -> bool:
+    """True when DB-backed experts are turned on via env (mirrors the
+    config-overrides flag; same load-at-first-run-then-freeze lifecycle)."""
+    return os.getenv("EXPERTS_DB_ENABLED", "").lower().strip() in (
+        "true",
+        "1",
+        "yes",
+    )
+
+
 def set_config_overrides(rows: List[Dict[str, Any]]) -> None:
     """Load override rows into the process maps (replaces any previous set).
 
@@ -3145,6 +3155,12 @@ def get_phase_system_prompt(
                 expert_identity = resolver.load("persona")
             except FileNotFoundError:
                 expert_identity = ""
+        if expert_identity and config.extra.get("_persona_source") == "db":
+            # Untrusted user persona — fence + subordinate below operator policy
+            # (decision 7), never inject at system altitude.
+            from src.core.expert_resolution import fence_persona
+
+            expert_identity = fence_persona(expert_identity)
 
         # Render Jinja2 conditionals
         cli_ds_interactive = config.extra.get("_cli_datasources", [])
@@ -3180,6 +3196,12 @@ def get_phase_system_prompt(
             expert_identity = resolver.load("persona")
         except FileNotFoundError:
             expert_identity = ""
+    if expert_identity and config.extra.get("_persona_source") == "db":
+        # Untrusted user persona — fence + subordinate below operator policy
+        # (decision 7), never inject at system altitude.
+        from src.core.expert_resolution import fence_persona
+
+        expert_identity = fence_persona(expert_identity)
 
     # Load phase component
     prompt_type_key = prompt_type or ("strategic" if is_strategic else "tactical")
@@ -3977,6 +3999,13 @@ def serialize_resolved_config(config: AgentConfig, model: str = "") -> dict:
                     instructions[basename] = file_resolver.load(Path(entry.file).name)
                 except FileNotFoundError:
                     pass
+
+    # Overlay any agent-injected prompts (DB expert persona/instructions) so the
+    # frozen snapshot matches what get_phase_system_prompt actually renders —
+    # the resolver above only sees disk/config_overrides, not the expert row.
+    for _k, _v in (config.extra.get("_resolved_prompts") or {}).items():
+        if _v:
+            prompts[_k] = _v
 
     return {
         "agent": agent_dict,
