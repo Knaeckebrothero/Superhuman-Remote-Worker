@@ -51,6 +51,10 @@ data:
   # (src/core/loader.py) via envFrom on this shared ConfigMap. Default-off
   # chart-wide (prod-safe); the dev/experimental values file turns it on.
   CONFIG_DB_OVERRIDES_ENABLED: {{ .Values.agent.configDbOverridesEnabled | default "false" | quote }}
+  # DB-backed user experts (experts table). Read by both the orchestrator
+  # (list/CRUD) and the agent (expert-by-id load) via envFrom on this shared
+  # ConfigMap. Default-off chart-wide (prod-safe); the dev values file turns it on.
+  EXPERTS_DB_ENABLED: {{ .Values.agent.expertsDbEnabled | default "false" | quote }}
 
   # OIDC / SSO — works with internal Keycloak or external OIDC provider
   KEYCLOAK_URL: {{ include "srw.keycloakInternalUrl" . | quote }}

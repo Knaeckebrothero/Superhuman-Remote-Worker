@@ -15,6 +15,7 @@ new job. ``automations.last_job_id`` is the forward link, written by
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -70,6 +71,29 @@ async def create_job_from_automation(
     # is a non-UI path with no parent to inherit from). Per-automation
     # datasource selection is a follow-up; see multi_datasource_support.md.
     project_id = automation.get("project_id")
+
+    # Resolve the automation's expert NAME to a DB expert_id when DB-backed
+    # experts are on (decision 5/15: name-resolving automations are live refs).
+    # Falls through to config_name (bundled) when nothing matches.
+    expert_id = None
+    if os.getenv("EXPERTS_DB_ENABLED", "").lower().strip() in ("true", "1", "yes"):
+        from src.core.expert_resolution import pick_expert_by_name
+
+        owner_id = str(automation["owner_id"])
+        pids = [str(project_id)] if project_id else []
+        try:
+            candidates = await db.list_experts_visible(
+                user_id=owner_id, project_ids=pids
+            )
+            matches = [c for c in candidates if c["name"] == automation["expert"]]
+            winner = pick_expert_by_name(matches, owner_id, set(pids))
+            if winner:
+                expert_id = str(winner["id"])
+        except Exception as e:
+            logger.warning(
+                "Automation expert resolution failed (using config_name): %s", e
+            )
+
     job = await db.create_job(
         description=automation["prompt"],
         config_name=automation["expert"],
@@ -78,6 +102,7 @@ async def create_job_from_automation(
         user_id=str(automation["owner_id"]),
         project_id=str(project_id) if project_id else None,
         priority=int(automation.get("priority", 5)),
+        expert_id=expert_id,
     )
 
     logger.info(

@@ -151,6 +151,8 @@ agent:
   # (dev/experimental) so the admin Prompt-overrides UI takes effect; the
   # chart default (helm/values.yaml) keeps this OFF for prod.
   configDbOverridesEnabled: "true"
+  # DB-backed user experts (experts table) — ON in dev for the experts feature.
+  expertsDbEnabled: "true"
   tailscale:
     enabled: true
 # -----------------------------------------------------------------------------
