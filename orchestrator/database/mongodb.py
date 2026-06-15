@@ -851,6 +851,8 @@ class MongoDB:
         job_id: str,
         limit: int = 20,
         offset: int = 0,
+        call_type: Optional[str] = None,
+        status: Optional[str] = None,
     ) -> Dict[str, Any]:
         """List LLM requests for a job with summary fields only.
 
@@ -860,6 +862,13 @@ class MongoDB:
             job_id: The job UUID to query
             limit: Maximum entries to return (up to 100)
             offset: Number of entries to skip
+            call_type: Optional filter. ``None`` or ``"all"`` returns every
+                call type (main + auxiliary: memory_extraction, knowledge_curation,
+                memory_assembly, summarization, title_generation, …). Pass an
+                exact call_type to narrow.
+            status: Optional filter. ``"error"`` returns only failed calls
+                (auxiliary failures carry ``status="error"``); success rows omit
+                the field, so any value filters them out.
 
         Returns:
             Dict with entries, total count, offset, limit, hasMore
@@ -874,7 +883,13 @@ class MongoDB:
             }
 
         collection = self._db["llm_requests"]
-        query = {"job_id": job_id}
+        query: Dict[str, Any] = {"job_id": job_id}
+        # call_type=None/"all" -> every call type; otherwise narrow to one.
+        if call_type and call_type != "all":
+            query["call_type"] = call_type
+        # Error rows carry status="error"; success rows omit the field.
+        if status:
+            query["status"] = status
 
         # Clamp limit
         limit = min(limit, 100)
@@ -884,7 +899,9 @@ class MongoDB:
 
         has_more = (offset + limit) < total
 
-        # Project summary fields + response (for tool call names extraction)
+        # Project summary fields + response (for tool call names extraction).
+        # call_type/status/error let the UI distinguish main vs auxiliary calls
+        # and surface auxiliary failures (status="error").
         projection = {
             "_id": 1,
             "job_id": 1,
@@ -893,6 +910,9 @@ class MongoDB:
             "token_usage": 1,
             "iteration": 1,
             "response": 1,
+            "call_type": 1,
+            "status": 1,
+            "error": 1,
         }
 
         cursor = (
@@ -907,6 +927,8 @@ class MongoDB:
             doc["_id"] = str(doc["_id"])
             if "timestamp" in doc:
                 doc["timestamp"] = _to_iso_utc(doc["timestamp"])
+            # Pre-call_type rows (and any miss) default to "main" for the UI.
+            doc.setdefault("call_type", "main")
 
             # Extract just tool call names from response, then drop the full response
             response = doc.pop("response", {})

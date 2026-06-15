@@ -615,10 +615,11 @@ findings). Dev/prod unaffected either way, as this run proves.
 
 Operational note: with this live, every default-project dev session mounts
 the session owner's real Personal Space read-write at `/workspace/cloud`.
-The drift-drain hazard from §13 incident 1 was fixed the same evening
-(`docs/issues/session_agent_drift_drain_kills_idle_sessions.md` — drain is
-now a clean suspend for parked sessions, deferred for busy ones, k3d
-verified incl. a re-entrancy race found in run 1). The `suspended` terminal
-state needs one live check on dev (S3 snapshots) after the next deploy;
+The drift-drain hazard from §13 incident 1 was fixed and is now resolved
+(`docs/done/session_agent_drift_drain_kills_idle_sessions.md` — drain is now
+a clean suspend for parked sessions, deferred for busy ones; re-entrancy
+race + resume-restore 409 hardening also fixed; k3d-verified incl.
+real-apiserver validation of the 409 path). The `suspended` terminal state
+needs one organic live check on dev (S3 snapshots) on the next deploy;
 locally the snapshot store is absent so the designed legacy-ended fallback
 engaged.

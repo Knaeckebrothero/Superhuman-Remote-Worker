@@ -36,12 +36,14 @@ the non-fatal contract (callers still swallow-and-continue).
 ## Status (2026-06-11)
 
 Built on `develop` (uncommitted), verified locally — `ruff check`/`format`
-clean, unit tests green (`tests/test_aux_health.py`, `tests/test_auxiliary.py`):
+clean, unit tests green (`tests/test_aux_health.py`, `tests/test_auxiliary.py`,
+`tests/test_llm_requests_filter.py`):
 
 - ✅ **Phase 1** — in-agent health tracker + escalation/recovery + `get_status()` exposure.
 - ✅ **Phase 1.5** — failed aux calls archived to `llm_requests` (`status="error"`).
-- ⏳ **Phase 1.6 (NEXT)** — surface aux + error rows in the debug view (read side)
-  + wire the session-path archiver. *Not started.*
+- 🟡 **Phase 1.6** — read side: ✅ backend (orchestrator `call_type`/`status`
+  filter + projection on the **llm_requests** path) + ✅ session-path archiver
+  wired; ⏳ **Cockpit UI toggle is NEXT.**
 - ☐ **Phase 2** — central visibility (heartbeat → Cockpit agent badge). *Not started.*
 - ☐ **Mitigation** — pin aux default off `gemma-4-moe`. *Not started (separate).*
 
@@ -109,32 +111,31 @@ Now a degraded aux model leaves a per-request error row in `llm_requests`
 alongside the main calls — on **worker jobs** (where the archiver is wired via
 `set_job_context`). Sessions still need the archiver wired (Phase 1.6).
 
-### Phase 1.6 (NEXT) — surface aux + error rows in the debug view (read side)
+### Phase 1.6 — surface aux + error rows in the debug view (read side)
 
-Phases 1 + 1.5 make the data *exist*; this makes it *visible*. The rows are
-written but still filtered out on read:
+Phases 1 + 1.5 make the data *exist*; this makes it *visible*.
 
-- The agent's `LLMArchiver.get_conversation` defaults to `call_type="main"`.
-- The orchestrator's `get_job_chat_history` (`orchestrator/main.py:8431`)
-  exposes no `call_type`/`status` param, and `mongodb.get_chat_history` builds
-  a main-only sequential view.
-- Session aux calls aren't archived at all yet (no archiver on the
-  persistent-session `AuxiliaryLLM`s at `persistent_app.py:877`, `:3400`), so
-  there's nothing to show for sessions.
+> **Correction (found during impl):** the right read surface is the
+> **`llm_requests`** path (`get_job_llm_requests` → `mongodb.list_llm_requests`),
+> **not** `chat_history`/`get_job_chat_history` — that collection is main-loop
+> only by construction (the conversational turn view) and aux calls never land
+> there. `list_llm_requests` already returned *all* call types (`query =
+> {job_id}`); the gap was its projection dropped `call_type`/`status`/`error`.
 
-Plan:
-
-1. **Orchestrator read path** — add optional `call_type` + `status` query
-   params to `GET /api/jobs/{id}/chat-history` and thread them into
-   `mongodb.get_chat_history`. Default unchanged (main-only sequential view);
-   `call_type=all` includes aux rows; `status=error` returns only failures
-   across call types.
-2. **Session archiver** — wire `set_job_context` (or pass an archiver) for the
-   persistent-session `AuxiliaryLLM`s so session aux failures also get rows;
-   without it `_archive_error` no-ops on the session path.
-3. **Cockpit** — debug/LLM-requests view gets a source filter (All / Main /
-   Aux) + an "errors only" toggle; error rows render the `error.type/message`
-   with a degraded badge.
+1. ✅ **Orchestrator read path** — `mongodb.list_llm_requests` gained optional
+   `call_type` + `status` filters and now projects `call_type`/`status`/`error`
+   (pre-`call_type` rows default to `"main"`); `GET /api/jobs/{id}/llm-requests`
+   (`orchestrator/main.py`) exposes both as query params. `call_type=all`/omitted
+   = main + aux; `status=error` = failures only. Tests:
+   `tests/test_llm_requests_filter.py`.
+2. ✅ **Session archiver** — `_wire_session_aux_archiver()` in
+   `src/api/persistent_app.py` points the (shared) session `AuxiliaryLLM` at the
+   default archiver with `job_id=_thread_id`, `agent_type="persistent"`; called
+   from `_loop_on_turn_complete` (every turn) and after the aux hot-swap. Without
+   it `_archive_error` no-ops on the session path.
+3. ⏳ **Cockpit (NEXT)** — debug/LLM-requests view gets a source filter
+   (All / Main / Aux) + an "errors only" toggle; error rows render the
+   `error.type/message` with a degraded badge. Wire to the new query params.
 
 Acceptance: a forced aux failure (worker *and* session) shows an error row in
 the debug view filtered by `status=error`, with the model + error type.
@@ -169,6 +170,12 @@ the debug view filtered by `status=error`, with the model + error type.
 - [x] `archive_error` no-ops without a Mongo connection; `_archive_error`
       no-ops without an archiver/job_id; the original exception still
       propagates and is still swallowed by the caller.
-- [ ] Read-side: aux/error rows are surfaceable in the debug view
-      (orchestrator `call_type`/`status` filter + Cockpit toggle) — follow-up.
-- [ ] Session aux calls get an archiver wired — follow-up.
+- [x] Read-side backend: `list_llm_requests` filters by `call_type`/`status`
+      and projects `call_type`/`status`/`error`; `/api/jobs/{id}/llm-requests`
+      exposes the params. (`tests/test_llm_requests_filter.py`)
+- [x] Session aux calls get an archiver wired (`_wire_session_aux_archiver`,
+      called from `_loop_on_turn_complete` + after the aux hot-swap).
+- [ ] Cockpit: debug-view source filter (All/Main/Aux) + "errors only" toggle
+      that renders `error.type/message` — follow-up.
+- [ ] End-to-end on a cluster: a forced aux failure (worker *and* session)
+      shows an error row filtered by `status=error` — pending a deploy.
