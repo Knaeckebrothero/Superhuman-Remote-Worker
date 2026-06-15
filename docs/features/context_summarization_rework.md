@@ -451,5 +451,6 @@ past them.
 
 A sibling render-layer bug found in the same thread (gemma reasoning bubble
 after the answer + duplicated on replay — same journal-vs-history seam, no
-data duplication) is filed separately:
-`docs/issues/persistent_chat_reasoning_after_answer_and_replay_duplication.md`.
+data duplication) was filed and fixed separately (commit `20916662`,
+2026-06-13):
+`docs/done/persistent_chat_reasoning_after_answer_and_replay_duplication.md`.

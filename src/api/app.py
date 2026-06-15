@@ -397,12 +397,10 @@ def _setup_job_file_logging(job_id: str) -> Path:
     # Create flushing file handler for crash safety
     file_handler = _FlushingFileHandler(log_file, mode="a")
     file_handler.setLevel(level)
-    file_handler.setFormatter(
-        logging.Formatter(
-            "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S",
-        )
-    )
+    from ..core.logging_config import build_formatter
+
+    # Same formatter as stdout — JSON in-cluster (LOG_FORMAT=json).
+    file_handler.setFormatter(build_formatter(component="agent"))
 
     # Add to root logger
     root_logger = logging.getLogger()
@@ -462,6 +460,10 @@ async def _process_orchestrator_job(
         logger.error("Cannot process job - agent not initialized")
         return
 
+    from ..core.logging_config import bind_log_context, reset_log_context
+
+    # Tag every log line for this job with job_id (correlation).
+    _log_token = bind_log_context(job_id=job_id)
     try:
         # Set up per-job file logging for crash safety
         _setup_job_file_logging(job_id)
@@ -577,6 +579,7 @@ async def _process_orchestrator_job(
         if _current_job_id == job_id:
             _current_job_id = None
         _cleanup_job_file_handler(job_id)
+        reset_log_context(_log_token)
 
 
 def create_app(config_path: Optional[str] = None) -> FastAPI:

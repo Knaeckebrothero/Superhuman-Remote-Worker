@@ -153,6 +153,30 @@ async def _do_prepare(
             # wait happens after the lock is released so the new pod's
             # /register can acquire it.
             if not thread.get("agent_id"):
+                # Re-provisioning the agent (cold start / reopen): also reconcile
+                # the session workspace. ensure_workspace's drift probe recreates
+                # a 'ready'-but-dead pod (e.g. one destroyed by a cluster
+                # restart), restores a 'suspended' one, and creates a
+                # missing/failed one — so the fresh agent binds to a live
+                # workspace instead of SSH-looping a dead address. Fire-and-forget
+                # (mirrors the resume path in main.py); the agent tolerates a
+                # not-yet-ready workspace.
+                from main import (  # type: ignore
+                    container_provisioner,
+                    ensure_session_workspace,
+                    postgres_db,
+                    workspace_suspension_service,
+                )
+
+                asyncio.create_task(
+                    ensure_session_workspace(
+                        thread_id,
+                        db=postgres_db,
+                        provisioner=container_provisioner,
+                        suspension=workspace_suspension_service,
+                    )
+                )
+
                 if agent_pod_provisioning_in_progress(thread):
                     logger.info(
                         "Thread %s: agent pod already provisioning — "

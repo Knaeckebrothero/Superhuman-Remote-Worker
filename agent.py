@@ -41,36 +41,22 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from src import create_app  # noqa: E402
+from src.core.logging_config import (  # noqa: E402
+    configure_logging,
+    set_log_context,
+)
 
 
 def setup_logging():
-    """Configure logging from LOG_LEVEL environment variable.
+    """Configure logging from LOG_LEVEL / LOG_FORMAT environment variables.
 
-    Reads LOG_LEVEL env var (default: INFO). Valid values: DEBUG, INFO, WARNING, ERROR.
-
+    LOG_FORMAT=json emits structured JSON (cluster); default text (local/dev).
     When LOG_LEVEL=DEBUG, only app loggers (src.*, orchestrator.*) get DEBUG;
-    the root logger stays at INFO to suppress noisy third-party libraries.
-    Set DEBUG_ALL=1 to also include third-party debug output.
+    the root stays at INFO to suppress noisy third-party libraries. Set
+    DEBUG_ALL=1 to also include third-party debug output.
+    See docs/features/centralized_logging.md.
     """
-    level_name = os.getenv("LOG_LEVEL", "INFO").upper()
-    level = getattr(logging, level_name, logging.INFO)
-
-    if level <= logging.DEBUG and not os.getenv("DEBUG_ALL"):
-        # Root stays at INFO — silences all third-party DEBUG noise automatically
-        logging.basicConfig(
-            level=logging.INFO,
-            format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S",
-        )
-        # Only app namespaces get DEBUG
-        for namespace in ("src", "orchestrator"):
-            logging.getLogger(namespace).setLevel(logging.DEBUG)
-    else:
-        logging.basicConfig(
-            level=level,
-            format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S",
-        )
+    configure_logging(component="agent", app_namespaces=("src", "orchestrator"))
 
 
 def parse_args():
@@ -194,6 +180,8 @@ def main():
     """Main entry point."""
     args = parse_args()
     setup_logging()
+    # Tag every log line from this agent process with its id (correlation).
+    set_log_context(agent_id=os.getenv("AGENT_ID"))
 
     logger = logging.getLogger(__name__)
 

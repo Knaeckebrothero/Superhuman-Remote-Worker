@@ -196,6 +196,8 @@ agent:
     reservedJobSlots: "2"
 
 logLevel: "INFO"
+# "json" (structured, for log aggregation) or "text" (human-readable).
+logFormat: "json"
 
 # -----------------------------------------------------------------------------
 # VM Controller — uncomment to run KubeVirt VMs in this cluster instead of a

@@ -299,6 +299,7 @@ async def test_do_prepare_waits_when_agent_pod_marker_in_flight(monkeypatch):
     fake_main = MagicMock()
     fake_main.session_router = AsyncMock()
     fake_main.session_router.ensure_route = AsyncMock(return_value="/p/t1")
+    fake_main.ensure_session_workspace = AsyncMock(return_value=None)
     monkeypatch.setitem(sys.modules, "main", fake_main)
 
     emit_calls: list[dict] = []
@@ -325,6 +326,80 @@ async def test_do_prepare_waits_when_agent_pod_marker_in_flight(monkeypatch):
         pod_name="srw-agent-s-existing",
         pod_uid="k8s-uid-1",
     )
+
+
+@pytest.mark.asyncio
+async def test_do_prepare_reconciles_workspace_on_cold_start(monkeypatch):
+    """An unbound thread (cold start / reopen) kicks off ensure_session_workspace
+    so a 'ready'-but-dead workspace is recreated (drift) instead of the fresh
+    agent dialing a corpse. Warm reconnects (agent already bound) skip it."""
+    from orchestrator.routers import sessions as sessions_mod
+
+    db = AsyncMock()
+    db.get_thread = AsyncMock(
+        side_effect=[
+            {
+                "id": "t1",
+                "user_id": "u1",
+                "agent_id": None,
+                "config_name": "persistent_defaults",
+                "metadata": {},
+            },
+            {
+                "id": "t1",
+                "user_id": "u1",
+                "agent_id": "agent-xyz",
+                "config_name": "persistent_defaults",
+            },
+        ]
+    )
+    db.get_agent.return_value = {
+        "id": "agent-xyz",
+        "pod_ip": "10.0.0.5",
+        "pod_port": 8001,
+        "hostname": "srw-agent-s-new",
+        "pod_uid": "uid-1",
+    }
+    lock_cm = AsyncMock()
+    lock_cm.__aenter__.return_value = None
+    lock_cm.__aexit__.return_value = False
+    db.thread_advisory_lock = MagicMock(return_value=lock_cm)
+    monkeypatch.setattr(sessions_mod, "_get_db", lambda: db, raising=False)
+
+    monkeypatch.setattr(
+        sessions_mod, "_provision_agent_for_thread", AsyncMock(), raising=True
+    )
+
+    async def _bound(*a, **k):
+        return True
+
+    async def _ready_ok(pod_ip, pod_port, timeout_s):
+        return True
+
+    monkeypatch.setattr(sessions_mod, "wait_for_binding", _bound, raising=True)
+    monkeypatch.setattr(sessions_mod, "wait_for_ready", _ready_ok, raising=True)
+
+    import sys
+
+    fake_main = MagicMock()
+    fake_main.session_router = AsyncMock()
+    fake_main.session_router.ensure_route = AsyncMock(return_value="/p/t1")
+    fake_main.ensure_session_workspace = AsyncMock(return_value=None)
+    monkeypatch.setitem(sys.modules, "main", fake_main)
+
+    monkeypatch.setattr(
+        sessions_mod, "lifecycle_emit", lambda *a, **k: None, raising=True
+    )
+
+    await sessions_mod._do_prepare(
+        thread_id="t1",
+        user_id="u1",
+        config_name="persistent_defaults",
+        config_override=None,
+    )
+
+    fake_main.ensure_session_workspace.assert_called_once()
+    assert fake_main.ensure_session_workspace.call_args.args[0] == "t1"
 
 
 # --------------------------------------------------------------------------- #

@@ -31,17 +31,26 @@ if os.environ.get("LICENSE_TERMS_ACCEPTED", "").strip().lower() != "true":
         "See https://github.com/knaeckebrothero/Superhuman-Remote-Worker/blob/main/LICENSE"
     )
 
-# Configure application-level logging (Uvicorn only configures its own loggers)
-# When DEBUG, only app loggers get DEBUG; third-party stays at INFO.
-# Set DEBUG_ALL=1 to include third-party debug output.
-_log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
-if _log_level == "DEBUG" and not os.environ.get("DEBUG_ALL"):
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+# Configure application-level logging (Uvicorn only configures its own loggers).
+# JSON when LOG_FORMAT=json (cluster), text otherwise (local/dev). When DEBUG,
+# only app namespaces get DEBUG; third-party stays at INFO (DEBUG_ALL=1 to
+# include it). See docs/features/centralized_logging.md.
+try:
+    from logging_config import (  # noqa: E402
+        bind_log_context,
+        configure_logging,
+        reset_log_context,
     )
-    # App namespaces (covers both `uvicorn orchestrator.main:app` and `uvicorn main:app`)
-    for _ns in (
+except ModuleNotFoundError:  # `uvicorn orchestrator.main:app` vs flattened image
+    from orchestrator.logging_config import (  # noqa: E402
+        bind_log_context,
+        configure_logging,
+        reset_log_context,
+    )
+
+configure_logging(
+    component="orchestrator",
+    app_namespaces=(
         "orchestrator",
         "main",
         "database",
@@ -51,21 +60,14 @@ if _log_level == "DEBUG" and not os.environ.get("DEBUG_ALL"):
         "mcp",
         "graph_routes",
         "workspace",
-    ):
-        logging.getLogger(_ns).setLevel(logging.DEBUG)
-else:
-    logging.basicConfig(
-        level=_log_level,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
-
-# Suppress uvicorn's shallow access log — replaced by request logging middleware below.
-logging.getLogger("uvicorn.access").disabled = True
+    ),
+    disable_uvicorn_access=True,
+)
 
 from datetime import date, datetime, timedelta, timezone  # noqa: E402
 from decimal import Decimal  # noqa: E402
 from typing import Any, Literal, Optional  # noqa: E402
-from uuid import UUID  # noqa: E402
+from uuid import UUID, uuid4  # noqa: E402
 
 import asyncpg  # noqa: E402
 import yaml  # noqa: E402
@@ -1243,6 +1245,7 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
         logger.warning(f"Agent {agent_id} has no pod IP — skipping dispatch")
         return False
 
+    _log_token = bind_log_context(job_id=job_id, agent_id=agent_id)
     try:
         # Extract upload IDs from context if present
         job_context = job.get("context") or {}
@@ -1485,6 +1488,8 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
             exc_info=True,
         )
         return False
+    finally:
+        reset_log_context(_log_token)
 
 
 async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
@@ -4338,24 +4343,32 @@ async def request_logging_middleware(request: Request, call_next):
 
     method = request.method
     start = time.perf_counter()
+    # request_id tags this request's access-log line. NOTE: BaseHTTPMiddleware
+    # runs the downstream app in a separate task, so this does NOT propagate to
+    # route handlers — full request-scoped propagation is a later ASGI-middleware
+    # step (see docs/features/centralized_logging.md).
+    _log_token = bind_log_context(request_id=uuid4().hex[:12])
     try:
-        response = await call_next(request)
-    except Exception:
-        elapsed = (time.perf_counter() - start) * 1000
-        logger.exception(
-            "%s %s 500 (%dms) — unhandled exception", method, path, elapsed
-        )
-        return JSONResponse(
-            status_code=500, content={"detail": "Internal server error"}
-        )
+        try:
+            response = await call_next(request)
+        except Exception:
+            elapsed = (time.perf_counter() - start) * 1000
+            logger.exception(
+                "%s %s 500 (%dms) — unhandled exception", method, path, elapsed
+            )
+            return JSONResponse(
+                status_code=500, content={"detail": "Internal server error"}
+            )
 
-    elapsed = (time.perf_counter() - start) * 1000
-    status = response.status_code
-    if status >= 500:
-        logger.warning("%s %s %d (%dms)", method, path, status, elapsed)
-    else:
-        logger.info("%s %s %d (%dms)", method, path, status, elapsed)
-    return response
+        elapsed = (time.perf_counter() - start) * 1000
+        status = response.status_code
+        if status >= 500:
+            logger.warning("%s %s %d (%dms)", method, path, status, elapsed)
+        else:
+            logger.info("%s %s %d (%dms)", method, path, status, elapsed)
+        return response
+    finally:
+        reset_log_context(_log_token)
 
 
 # Include routers

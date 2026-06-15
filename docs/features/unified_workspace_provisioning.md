@@ -26,6 +26,14 @@ snapshot / restore) across agents, workspaces, and VMs, but explicitly left
 `persistent_provisioner.py` migration was deferred. Jobs have a dispatcher that
 re-provisions workspaces; sessions never got the equivalent.
 
+**Update 2026-06-15:** the deferred `ready`-but-pod-missing drift recovery (the
+`ensure_workspace` table row at `:142`, unit row `:211`) and the graceful agent
+exit for a *dead* workspace (the `WorkspaceUnavailableError` half of §D) have
+shipped and are k3d-verified, and `/prepare` now also calls
+`ensure_session_workspace` — see `[[session_resume_dead_workspace_drift]]` (now
+in `docs/done/`). The only rollout item still open is step 4 (remove the
+back-compat shims), so this design stays in `features/`.
+
 ## Problem
 
 Two parallel, near-identical implementations of the same workspace pod, with

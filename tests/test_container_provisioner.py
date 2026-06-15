@@ -78,6 +78,60 @@ class TestContainerProvisionerInit:
             assert provisioner._db is mock_db
 
 
+class TestWorkspacePodLive:
+    """Drift probe: workspace_pod_live(owner) — True=live, False=confirmed
+    dead/gone, None=can't tell (must be treated as 'assume live')."""
+
+    def _provisioner(self, k8s=True):
+        from orchestrator.services.container_provisioner import ContainerProvisioner
+
+        p = ContainerProvisioner()
+        p._k8s_available = k8s
+        p._core_api = MagicMock()
+        return p
+
+    @pytest.mark.asyncio
+    async def test_none_without_k8s(self):
+        p = self._provisioner(k8s=False)
+        assert await p.workspace_pod_live(WorkspaceOwner.session("t1")) is None
+
+    @pytest.mark.asyncio
+    async def test_false_on_404(self):
+        p = self._provisioner()
+
+        class _ApiExc(Exception):
+            status = 404
+
+        p._core_api.read_namespaced_pod = MagicMock(side_effect=_ApiExc())
+        assert await p.workspace_pod_live(WorkspaceOwner.session("t1")) is False
+
+    @pytest.mark.asyncio
+    async def test_true_when_running(self):
+        p = self._provisioner()
+        pod = MagicMock()
+        pod.status.phase = "Running"
+        p._core_api.read_namespaced_pod = MagicMock(return_value=pod)
+        assert await p.workspace_pod_live(WorkspaceOwner.session("t1")) is True
+
+    @pytest.mark.asyncio
+    async def test_false_on_failed_tombstone(self):
+        p = self._provisioner()
+        pod = MagicMock()
+        pod.status.phase = "Failed"
+        p._core_api.read_namespaced_pod = MagicMock(return_value=pod)
+        assert await p.workspace_pod_live(WorkspaceOwner.session("t1")) is False
+
+    @pytest.mark.asyncio
+    async def test_none_on_transient_error(self):
+        p = self._provisioner()
+
+        class _ApiExc(Exception):
+            status = 503
+
+        p._core_api.read_namespaced_pod = MagicMock(side_effect=_ApiExc())
+        assert await p.workspace_pod_live(WorkspaceOwner.session("t1")) is None
+
+
 class TestPodManifest:
     """Tests for pod manifest generation."""
 
