@@ -223,3 +223,4 @@ sessionRouter:
   annotations:
     traefik.ingress.kubernetes.io/router.priority: "1000"
 logLevel: "INFO"
+logFormat: "json"

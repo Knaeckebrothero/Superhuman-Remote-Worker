@@ -51,16 +51,27 @@ clean, unit tests green (`tests/test_aux_health.py`, `tests/test_auxiliary.py`,
   Cockpit admin badge). **Shipped + k3d-verified 2026-06-15** (see below).
 - ☐ **Mitigation** — pin aux default off `gemma-4-moe`. *Not started (separate).*
 
-Phase 2 verified end-to-end on k3d: migration `app/0027` applied on the dev DB;
-a heartbeat with `metrics.aux.degraded=true` through the **real** internal
-endpoint set `agents.aux_degraded=t` + stored the compact summary in
-`metadata.aux`, and `degraded=false` cleared both (recovery); the exact
-`list_agents`/`get_agent` SELECTs project the column; the admin Agents panel
-renders a red "⚠ Aux degraded" badge (with the `metadata.aux` tooltip) only for
-the degraded row. Organic agent-side emission (a real agent failing aux calls
-and flipping the badge itself) is unit-covered (`heartbeat_summary` shape) and
-shape-identical to the verified injection — left to confirm naturally during
-the memory-overhaul soak.
+Phase 2 verified end-to-end on k3d:
+
+- Migration `app/0027` applied on the dev DB (survives orchestrator re-init).
+- **Orchestrator/DB/UI:** a heartbeat with `metrics.aux.degraded=true` through
+  the **real** internal endpoint set `agents.aux_degraded=t` + stored the
+  compact summary in `metadata.aux`; `degraded=false` cleared both (recovery);
+  the exact `list_agents`/`get_agent` SELECTs project the column; the admin
+  Agents panel renders a red "⚠ Aux degraded" badge (with the `metadata.aux`
+  tooltip) only for the degraded row.
+- **Organic agent emission:** a freshly-provisioned session agent
+  (`0bf257ff`, on the rebuilt image) emitted `metrics.aux` on its own 60s
+  heartbeat — `{model: gemma-4-moe-strix, degraded: false, consecutive_failures:
+  0, failing_tasks: {}}` — which the orchestrator persisted to
+  `aux_degraded=false` + `metadata.aux`. So the full agent→orchestrator→DB pipe
+  is confirmed live, not just injected.
+
+The one path not exercised live is a real agent *failing* aux calls to flip
+`degraded=true` itself (would need a forced aux-model outage); that transition
+is unit-covered (`AuxHealth` escalation + `heartbeat_summary` shape) and the
+healthy organic emit + the injected degraded round-trip together cover the
+mechanism. It'll surface for real during the memory-overhaul soak.
 
 ## Design
 

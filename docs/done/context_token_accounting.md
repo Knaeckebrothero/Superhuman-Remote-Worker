@@ -5,6 +5,7 @@
 **Related:**
 - `docs/tests/context_token_accounting_verification.md` — **the verification runbook**: how to test all four slices (unit suites, the per-family estimator oracle, k3d probe-pod recipes, the live-session gold standard).
 - `docs/issues/multimodal_image_context_explosion.md` — the root-cause defect inventory (defects A–D, layers). This feature doc is the forward-looking *architecture*; that issue doc remains the detailed bug catalogue. Slices here subsume its Layer-A/C/0 work.
+- `docs/features/multimodal_image_cost_optimization.md` — the deferred cost/estimator knobs (per-family render DPI, ingestion downscale, OpenAI multiplier, o4-mini mapping, Gemini API-vs-Vertex, auto-calibration). All low-priority tuning, not correctness; §8's open knobs live there now.
 - `docs/features/context_summarization_rework.md` — the aux-budgeted rolling-fold summarizer (`src/core/summarizer.py`, shipped S1+S2). This doc fixes the *input* that feeds it and the *trigger* that invokes it.
 - `docs/features/db_backed_model_catalog.md` / `config/model_config_matrix.yaml` — the per-family settings matrix this doc extends.
 
@@ -235,6 +236,14 @@ Gate in `src/tools/workspace/files.py` `_read_visual_document`, **per page** (no
 ---
 
 ## 8. Open questions
+
+> **The deferred cost/estimator knobs (per-family render DPI, ingestion downscale /
+> `detail:low`, OpenAI patch multiplier, o4-mini mapping, Gemini API-vs-Vertex,
+> auto-calibration) are now tracked as a backlog in
+> `docs/features/multimodal_image_cost_optimization.md`.** All are cost/precision
+> tuning, not correctness — the trigger re-anchors on the real `input_tokens` each
+> turn, so a biased-high estimate only ever compacts slightly early. The notes below
+> remain as the design rationale.
 
 ### Resolved by the 2026-06-13 research
 

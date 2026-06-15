@@ -433,10 +433,18 @@ async def _process_orchestrator_job(
         logger.error("Cannot process job — agent not initialized")
         return
 
+    from ..core.logging_config import (
+        bind_log_context,
+        build_formatter,
+        reset_log_context,
+    )
+
+    # Tag every log line for this job (stdout + file) with job_id (correlation).
+    _log_token = bind_log_context(job_id=job_id)
     try:
         from ..core.workspace import get_logs_path
 
-        # Set up per-job file logging
+        # Set up per-job file logging — same formatter as stdout (JSON in-cluster).
         logs_dir = get_logs_path()
         log_file = logs_dir / f"job_{job_id}.log"
         level_name = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -444,12 +452,7 @@ async def _process_orchestrator_job(
 
         file_handler = logging.FileHandler(log_file, mode="a")
         file_handler.setLevel(level)
-        file_handler.setFormatter(
-            logging.Formatter(
-                "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-                datefmt="%Y-%m-%d %H:%M:%S",
-            )
-        )
+        file_handler.setFormatter(build_formatter(component="agent"))
         logging.getLogger().addHandler(file_handler)
 
         logger.info(f"Starting orchestrator job {job_id}")
@@ -557,6 +560,7 @@ async def _process_orchestrator_job(
     finally:
         if _current_job_id == job_id:
             _current_job_id = None
+        reset_log_context(_log_token)
 
 
 # ---------------------------------------------------------------------------

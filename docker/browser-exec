@@ -40,7 +40,11 @@ import sys
 from pathlib import Path
 
 SOCKET_PATH = os.environ.get("BROWSER_EXEC_SOCKET", "/tmp/browser-exec.sock")
-DAEMON_LOG = os.environ.get("BROWSER_EXEC_LOG", "/tmp/browser-exec.log")
+# Default under the agent-host home (not /tmp) so the workspace snapshot captures
+# it — snapshots exclude /tmp/*. See docs/features/centralized_logging.md.
+DAEMON_LOG = os.environ.get(
+    "BROWSER_EXEC_LOG", str(Path.home() / ".cache" / "srw" / "browser-exec.log")
+)
 # user_data_dir for the persistent profile (cookies/localStorage survive a
 # Chromium restart). Defaults under the agent-host home so it's workspace-local.
 PROFILE_DIR = os.environ.get(
@@ -364,6 +368,7 @@ def _ping(path: str) -> bool:
 
 def _spawn_daemon() -> None:
     """Start the daemon detached, logging to DAEMON_LOG."""
+    Path(DAEMON_LOG).parent.mkdir(parents=True, exist_ok=True)
     log_fh = open(DAEMON_LOG, "a")
     subprocess.Popen(
         [sys.executable, os.path.abspath(__file__), "serve"],

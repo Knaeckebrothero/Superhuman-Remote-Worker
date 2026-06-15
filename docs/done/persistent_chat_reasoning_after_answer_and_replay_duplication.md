@@ -13,8 +13,11 @@ related:
 
 # Reasoning renders after the answer (gemma-style models) and duplicates on replay
 
-**Status:** ✅ Implemented 2026-06-13 (all three fixes). Awaiting the live
-gemma-session verification below.
+**Status:** ✅ Resolved — implemented 2026-06-13 (all three fixes, commit
+`20916662`), unit/component tests green. Closed 2026-06-15. The live
+gemma-session E2E check (§Verification below) was **not run** — implementation
+plus unit coverage deemed sufficient to close; re-open if the duplication or
+post-answer ordering recurs on a real session.
 - (1) **Dedup** — reasoning frames now carry the AI message id. Agent
   pre-allocates `ai_msg_id` before the stream and pins the row id to it for
   Chat-Completions reasoning models (`persistent_graph.py`); the transport

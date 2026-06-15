@@ -28,6 +28,7 @@ from .persistent_session import PersistentSession, resolve_memory_extraction_pro
 from ..tools.registry import TOOL_REGISTRY
 from ..core.archiver import inflight_tool_call
 from ..core.context import extract_summary_text, repair_tool_pairing
+from ..core.workspace_backend import WorkspaceUnavailableError
 from ..agent import UniversalAgent
 from ..llm.reasoning_chat import extract_reasoning_text_from_block
 from ..persistent_graph import (
@@ -681,8 +682,10 @@ def _aux_health_for_heartbeat() -> Optional[Dict[str, Any]]:
         return None
 
 
-async def _exit_workspace_not_ready(thread_id: str, exc: WorkspaceNotReady) -> NoReturn:
-    """Handle WorkspaceNotReady during lifespan startup: best-effort deregister then exit.
+async def _exit_workspace_not_ready(thread_id: str, exc: Exception) -> NoReturn:
+    """Handle an unrecoverable workspace error during lifespan startup
+    (WorkspaceNotReady — never provisioned/wedged; or WorkspaceUnavailableError
+    — pod dead/unreachable): best-effort deregister then exit.
 
     Exits the process with status 0 (pod Completed, not Failed) so Kubernetes
     does not restart-loop the pod.  The orchestrator's session reconciler will
@@ -856,9 +859,13 @@ async def lifespan(app: FastAPI):
 
         try:
             await _attach_session(_thread_id)
-        except WorkspaceNotReady as e:
-            # Workspace raced us / is wedged: exit cleanly (status 0) instead of
-            # crashing, so K8s doesn't restart-loop. See _exit_workspace_not_ready.
+        except (WorkspaceNotReady, WorkspaceUnavailableError) as e:
+            # Workspace raced us / is wedged (WorkspaceNotReady) or its pod is
+            # dead/unreachable (WorkspaceUnavailableError — SSH connect exhausted
+            # against a destroyed workspace): exit cleanly (status 0) instead of
+            # crashing, so K8s doesn't restart-loop. The orchestrator's session
+            # reconcile (ensure_workspace drift probe) recreates the pod and
+            # rebinds a fresh agent. See _exit_workspace_not_ready.
             await _exit_workspace_not_ready(_thread_id, e)
     elif _thread_id and not dedicated_register_ok:
         logger.info(
