@@ -12551,6 +12551,9 @@ class ThreadCreateRequest(BaseModel):
     # "defaults" default silently put bare API threads on the WORKER yaml
     # (docs/issues/session_config_name_plumbing.md, hole A).
     config_name: str = Field("persistent_defaults", description="Agent config to use")
+    expert_id: str | None = Field(
+        None, description="DB-backed expert UUID for this session"
+    )
     project_id: str | None = Field(None, description="(Legacy) Single project to scope")
     project_ids: list[str] | None = Field(
         None, description="List of project UUIDs to scope"
@@ -12691,6 +12694,8 @@ async def create_thread(
             metadata_patch["config_override"] = redact_config_override(config_override)
         if request_body.datasource_ids:
             metadata_patch["datasource_ids"] = request_body.datasource_ids
+        if request_body.expert_id:
+            metadata_patch["expert_id"] = request_body.expert_id
         if metadata_patch:
             async with postgres_db.acquire() as conn:
                 await conn.execute(
@@ -13700,7 +13705,10 @@ async def resume_thread(
 
                 # No idle agent — create a dedicated session pod.
                 pod_name = await agent_provisioner.provision_agent(
-                    purpose="session", thread_id=tid, config_name=cfg
+                    purpose="session",
+                    thread_id=tid,
+                    config_name=cfg,
+                    expert_id=meta.get("expert_id"),
                 )
                 if pod_name:
                     return
@@ -13714,7 +13722,11 @@ async def resume_thread(
     elif persistent_provisioner.is_available:
         config_name = thread.get("config_name", "persistent_defaults")
         asyncio.create_task(
-            persistent_provisioner.create_agent_pod(thread_id, config_name=config_name)
+            persistent_provisioner.create_agent_pod(
+                thread_id,
+                config_name=config_name,
+                expert_id=_thread_expert_id(thread),
+            )
         )
 
     # Ensure the session workspace is provisioned/restored (idempotent): restores
@@ -14843,7 +14855,9 @@ async def _phase5_wake_if_suspended(thread_id: str) -> None:
             config_name = thread.get("config_name", "persistent_defaults")
             asyncio.create_task(
                 persistent_provisioner.create_agent_pod(
-                    thread_id, config_name=config_name
+                    thread_id,
+                    config_name=config_name,
+                    expert_id=_thread_expert_id(thread),
                 ),
                 name=f"phase5-create-agent-{thread_id[:8]}",
             )
@@ -15623,6 +15637,17 @@ def _is_uuid(value: str) -> bool:
         return True
     except (ValueError, AttributeError, TypeError):
         return False
+
+
+def _thread_expert_id(thread: dict[str, Any]) -> str | None:
+    """A session's bound expert_id from thread metadata (JSONB str-tolerant)."""
+    meta = thread.get("metadata") or {}
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except (ValueError, TypeError):
+            return None
+    return meta.get("expert_id") if isinstance(meta, dict) else None
 
 
 class ExpertCreate(BaseModel):

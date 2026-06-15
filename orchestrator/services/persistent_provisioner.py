@@ -135,6 +135,7 @@ class PersistentProvisioner:
         self,
         thread_id: str,
         config_name: str = "persistent_defaults",
+        expert_id: str | None = None,
         cpu_request: str = "250m",
         memory_request: str = "512Mi",
         cpu_limit: str = "1000m",
@@ -186,6 +187,7 @@ class PersistentProvisioner:
             pod_name=pod_name,
             thread_id=thread_id,
             config_name=config_name,
+            expert_id=expert_id,
             cpu_request=cpu_request,
             memory_request=memory_request,
             cpu_limit=cpu_limit,
@@ -439,6 +441,7 @@ class PersistentProvisioner:
         cpu_limit: str,
         memory_limit: str,
         pvc_name: Optional[str] = None,
+        expert_id: Optional[str] = None,
     ) -> dict:
         """Build the Kubernetes Pod manifest for a persistent agent.
 
@@ -515,7 +518,12 @@ class PersistentProvisioner:
                         "env": [
                             {"name": "AGENT_CONFIG", "value": config_name},
                             {"name": "AGENT_PORT", "value": "8001"},
-                        ],
+                        ]
+                        + (
+                            [{"name": "AGENT_EXPERT_ID", "value": expert_id}]
+                            if expert_id
+                            else []
+                        ),
                         "securityContext": {
                             "runAsNonRoot": True,
                             "runAsUser": 999,

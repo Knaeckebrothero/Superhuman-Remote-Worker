@@ -80,6 +80,20 @@ So instruction documents become **skills bound with a deterministic (and possibl
 
 The consolidation is therefore precise: **Layer 3 → skills.** Layers 1 and 4 stay as they are.
 
+## Skills × experts: composition
+
+Both skills *and* experts are first-class objects users can author (sharing the experts-v2 substrate). A skill is standalone and reusable; an expert **composes** skills. A skill reaches an agent two ways:
+
+1. **Catalog (model-invoked).** In-scope skills appear in the agent's menu and are loaded by the agent's judgment. This is the default "use skills like skills" mode — no expert involvement required.
+2. **Expert binding.** An expert config references skills and, per skill, may pin a binding:
+   - *no binding* → model-invoked (menu), same as the catalog;
+   - `before_tool:<tool>` (+ `enforce`) → deterministic, optionally gated;
+   - `phase:strategic|tactical` → auto-injected on entering that phase.
+
+The skill is written **once**; each expert decides **how it activates** for them. The same `code_review` skill might be model-invoked for a generalist but `phase:strategic`-injected for the `critic`. This is exactly what today's `instruction_files` list already expresses (`file → trigger → enforce`); it generalizes to `skill → binding`, and `todo_guide` is already an instance — a skill an expert binds with `before_tool + enforce`.
+
+**Deferred knob:** whether the catalog is *open* (every in-scope skill is discoverable by default; experts only *add* bindings) or *curated* (an expert exposes only the skills it declares, plus any globally-forced ones). Open matches Claude Code and maximizes reuse; curated gives tighter control. Settle alongside experts-v2 scoping.
+
 ## Prior art — what already exists
 
 - **Four-layer prompt architecture** ([[prompting]]): Layer 3 ("instruction files, auto-injected by trigger conditions") *is* the skill artifact, bound with deterministic triggers. The passive (tool-gated `read_file`) and active (transient injection) mechanisms are already implemented and proven by `todo_guide.md` and `research_guide.md`. This feature adds the `model_invoked` binding + catalog on top of them.
@@ -95,6 +109,7 @@ The consolidation is therefore precise: **Layer 3 → skills.** Layers 1 and 4 s
 5. The engine is: catalog scan → Layer-1 menu injection → `use_skill` load tool.
 6. Context-aware auto-injection/suggestion is explicitly a later phase, built as a `semantic` trigger over the memory engine.
 7. The consolidation is **Layer 3 only.** Expert identity (Layer 1) stays always-on in the system prompt; task/deliverable files (Layer 4) stay read-on-demand. Re-expressing today's enforced guides (e.g. `todo_guide`) as skills **must preserve their enforced binding** — not silently make a mandatory guardrail optional.
+8. Skills are **standalone, authored once**; experts **compose** them. A skill reaches an agent via the catalog (model-invoked) or via an expert binding that may pin a custom deterministic/enforced trigger. The same skill can be bound differently by different experts.
 
 ## Deferred / open (resolve after the experts rework)
 
@@ -104,6 +119,7 @@ The consolidation is therefore precise: **Layer 3 → skills.** Layers 1 and 4 s
 - **Bundled scripts/tools** — whether `use_skill` auto-registers a skill's scripts as callable tools, or the agent runs them via existing shell tools.
 - **Name precedence** — merge/override behaviour when the same skill name exists at multiple scopes (bundled vs project vs user).
 - **Menu token budget** — how many skills the always-on menu can hold before it becomes a cost in its own right; whether large catalogs need a coarse pre-filter.
+- **Catalog visibility** — *open* (every in-scope skill discoverable by default) vs *curated* (an expert exposes only the skills it declares). See [Skills × experts](#skills--experts-composition).
 - **Vocabulary** — how to disambiguate "skill" (this) from "expert" (role) in the UI and docs.
 
 ## Phasing (indicative; sequenced after the experts rework)

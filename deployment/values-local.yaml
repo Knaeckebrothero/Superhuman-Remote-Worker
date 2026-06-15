@@ -187,6 +187,8 @@ ingress:
 agent:
   # Phase D verification: apply DB config overrides (config_overrides table) to jobs.
   configDbOverridesEnabled: "true"
+  # DB-backed user experts (experts table) — ON in dev for the experts feature.
+  expertsDbEnabled: "true"
   pool:
     minAgents: "0"
     buffer: "0"

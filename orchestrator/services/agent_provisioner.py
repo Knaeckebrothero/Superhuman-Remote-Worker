@@ -191,6 +191,7 @@ class AgentProvisioner:
         purpose: str,
         thread_id: Optional[str] = None,
         config_name: str = "defaults",
+        expert_id: Optional[str] = None,
         cpu_request: str = "250m",
         memory_request: str = "512Mi",
         cpu_limit: str = "1000m",
@@ -264,6 +265,7 @@ class AgentProvisioner:
             purpose=purpose,
             thread_id=thread_id,
             config_name=config_name,
+            expert_id=expert_id,
             cpu_request=cpu_request,
             memory_request=memory_request,
             cpu_limit=cpu_limit,
@@ -1007,6 +1009,7 @@ class AgentProvisioner:
         memory_request: str,
         cpu_limit: str,
         memory_limit: str,
+        expert_id: Optional[str] = None,
     ) -> dict:
         """Build the Kubernetes Pod manifest for an agent.
 
@@ -1079,6 +1082,11 @@ class AgentProvisioner:
                 "env": [
                     {"name": "AGENT_CONFIG", "value": config_name},
                     {"name": "AGENT_PORT", "value": "8001"},
+                    *(
+                        [{"name": "AGENT_EXPERT_ID", "value": expert_id}]
+                        if expert_id
+                        else []
+                    ),
                     # Downward-API injection: the K8s-assigned pod UID. The
                     # agent reports this back at /api/agents/register so the
                     # session router can stamp ownerReferences on per-session

@@ -131,6 +131,9 @@ agent:
   # file turns it on. Gates only the agent's prompt resolver — not the
   # orchestrator or the admin UI (overrides remain editable regardless).
   configDbOverridesEnabled: "false"
+  # -- Enable DB-backed user experts (experts table) for both orchestrator and
+  # agent. Default OFF (prod-safe); the dev/experimental values file turns it on.
+  expertsDbEnabled: "false"
   resources:
     requests:
       memory: "512Mi"

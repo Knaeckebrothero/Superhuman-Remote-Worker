@@ -208,6 +208,18 @@ async def lifespan(app: FastAPI):
     _agent = UniversalAgent.from_config(config_path)
     await _agent.initialize()
 
+    # Session bound to a DB expert (decision 6): apply it as the base config and
+    # recreate LLMs before any session message. The config_name path is the
+    # fallback when no expert is bound.
+    _expert_id = os.getenv("AGENT_EXPERT_ID")
+    if _expert_id and _agent.postgres_conn:
+        from src.core.loader import _is_experts_db_enabled
+
+        if _is_experts_db_enabled():
+            if await _agent._apply_db_expert(_expert_id):
+                _agent._create_phase_llms()
+                logger.info("Session bound to DB expert %s", _expert_id)
+
     # Register with orchestrator
     _orchestrator_client = create_orchestrator_client_from_env(_agent.config.agent_id)
     logger.info("Registering with orchestrator...")
