@@ -32,16 +32,23 @@ gitea:
   internalUrl: "https://gitea.customer-internal.local"
   externalUrl: "https://gitea.customer-internal.local"
 
-# External databases
+# External databases — postgres/vector take host/port/db PARTS, not a bundled
+# URL: credentials (POSTGRES_USER/POSTGRES_PASSWORD, VECTOR_POSTGRES_*) come
+# from the existingSecret above, and the chart composes the DSN at runtime (see
+# databases.postgres in values.yaml for the rationale). mongodb uses a full URL.
 databases:
   postgres:
     enabled: true
     internal: false
-    externalUrl: "postgres://app:pw@managed-pg.customer.local:5432/srw"
+    externalHost: "managed-pg.customer.local"
+    externalPort: 5432
+    externalDb: "srw"
   vector:
     enabled: true
     internal: false
-    externalUrl: "postgresql://app:pw@managed-pg.customer.local:5432/srw_vector"
+    externalHost: "managed-pg.customer.local"
+    externalPort: 5432
+    externalDb: "srw_vector"
   mongodb:
     enabled: true
     internal: false

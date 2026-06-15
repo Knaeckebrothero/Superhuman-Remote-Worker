@@ -102,6 +102,14 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: POSTGRES_DB
+            # DB-backed experts: orchestrator uses explicit env (not envFrom), so
+            # the configmap flag must be referenced here too (agents get it via
+            # envFrom on the provisioner-built pods).
+            - name: EXPERTS_DB_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: EXPERTS_DB_ENABLED
             - name: VECTOR_POSTGRES_USER
               valueFrom:
                 secretKeyRef:

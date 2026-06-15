@@ -267,6 +267,10 @@ class JobStartRequest(BaseModel):
         default=None,
         description="Directory containing documents",
     )
+    expert_id: Optional[str] = Field(
+        default=None,
+        description="DB-backed expert UUID for this job",
+    )
     config_name: str = Field(
         default="default",
         description="Agent configuration name",
