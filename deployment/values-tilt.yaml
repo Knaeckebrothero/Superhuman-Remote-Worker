@@ -49,6 +49,17 @@ virtualWorkspace:
   s3:
     endpoint: "http://minio.srw.svc.cluster.local:9000"
 
+# Snapshot + IDE-session object store (helm `s3.*`). The cluster overlay
+# (values-experimental.yaml) points this at the external MinIO so the workspace
+# snapshot service + idle sweeper actually run; locally we aim it at the SAME
+# single-node MinIO fixture (deployment/tilt-minio.yaml) so dev exercises the real
+# boto3 -> S3 path instead of leaving snapshots disabled (empty S3_ENDPOINT also
+# short-circuits the idle sweeper -> ws-thread-* pods would pile up). Credentials
+# (SNAPSHOT_S3_*) come from values-local.yaml; bucket (srw-snapshots) + region
+# (us-east-1) take chart defaults. Mirrors the virtualWorkspace.s3 wiring above.
+s3:
+  endpoint: "http://minio.srw.svc.cluster.local:9000"
+
 # Cockpit dev image runs `ng serve`, which serves files from the Angular
 # source tree at /app/src/assets/. Land the chart-rendered env.js there so
 # Tilt-mode browsers get correct (Traefik-routed) URLs without having to

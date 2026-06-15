@@ -130,9 +130,20 @@ secrets:
     NEXTCLOUD_S3_ACCESS_KEY: "stub"
     NEXTCLOUD_S3_SECRET_KEY: "stub"
 
-    # Email/notifications/integrations + S3 — chart refs are gated/optional,
-    # so entries here are only required when you flip `email.enabled=true`,
-    # configure an `s3.endpoint`, or wire up a webhook/integration.
+    # Object store — root creds of the local single-node MinIO
+    # (deployment/tilt-minio.yaml; only deployed under `tilt up`). Used by both
+    # the workspace snapshot service + IDE-session blobs (SNAPSHOT_S3_*, bucket
+    # srw-snapshots) and the virtual workspace tier's rclone (VIRTUAL_WORKSPACE_S3_*,
+    # bucket srw-workspaces). The matching non-secret endpoints live in
+    # values-tilt.yaml (s3.endpoint / virtualWorkspace.s3.endpoint).
+    SNAPSHOT_S3_ACCESS_KEY_ID: "minioadmin"
+    SNAPSHOT_S3_SECRET_ACCESS_KEY: "minioadmin_secret"
+    VIRTUAL_WORKSPACE_S3_ACCESS_KEY_ID: "minioadmin"
+    VIRTUAL_WORKSPACE_S3_SECRET_ACCESS_KEY: "minioadmin_secret"
+
+    # Email/notifications/integrations — chart refs are gated/optional, so
+    # entries here are only required when you flip `email.enabled=true` or wire
+    # up a webhook/integration.
     DISCORD_WEBHOOK_URL: ""
     SLACK_WEBHOOK_URL: ""
     NTFY_TOKEN: ""

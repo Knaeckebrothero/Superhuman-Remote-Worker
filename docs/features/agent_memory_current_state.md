@@ -134,8 +134,11 @@ migration plan live in [[agent_memory_overhaul]].
 >   `write_gate` completeness toggle — is gated behind `memory.ingestion.enabled`
 >   / `memory.extraction.write_gate` (both **default off**), so `store()` keeps
 >   the legacy cosine-0.85 dedup-merge byte-for-byte on the live path: 🔶
->   **CONDITIONAL**. The harness measurement (does supersede fix
->   knowledge-update?) is unstarted — overhaul doc Phase-4 log, slice 4.
+>   **CONDITIONAL**. The harness measurement is **done (2026-06-14)** and
+>   positive — supersede fixes knowledge-update (end-task 0/4 → 3/4, overall
+>   0.40 → 0.50; contradiction probe `original_injected` 1.0 → 0.25, reader
+>   current 1.0) — but the runtime stays on the legacy path until the GATE-B
+>   production flip. Detail in the overhaul doc Phase-4 log.
 > - **Equivalence pinning still holds.** Phases 3–4 changed neither the legacy
 >   blocks nor the seam's default rendering (the verdict branch is unreachable
 >   with the flag off), so the equivalence suites above remain green and the
