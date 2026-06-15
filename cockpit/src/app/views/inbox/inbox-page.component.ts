@@ -30,6 +30,7 @@ import {AppInputComponent} from '../../ui/input';
 import {AppSelectComponent} from '../../ui/select';
 import {AppCheckboxComponent} from '../../ui/checkbox';
 import {AppIconComponent} from '../../ui/icon';
+import {AppCopyFieldComponent} from '../../ui/copy-field';
 
 interface FrozenJobData {
   freeze_type?: string;
@@ -87,6 +88,7 @@ function relativeTime(iso: string, nowLabel: string): string {
     AppSelectComponent,
     AppCheckboxComponent,
     AppIconComponent,
+    AppCopyFieldComponent,
   ],
   template: `
     <div class="inbox" (keydown)="onKeydown($event)">
@@ -315,6 +317,13 @@ function relativeTime(iso: string, nowLabel: string): string {
                 }
               </div>
 
+              <div class="detail-ids">
+                @if (selectedItem()!.sudo!.job_id) {
+                  <app-copy-field [label]="'inbox.detail.jobId' | transloco" [value]="selectedItem()!.sudo!.job_id" />
+                }
+                <app-copy-field [label]="'inbox.detail.requestId' | transloco" [value]="selectedItem()!.sudo!.id" />
+              </div>
+
               @if (selectedItem()!.sudo!.status === 'pending') {
                 @if (selectedItem()!.sudo!.request_type === 'vm_upgrade') {
                   <div class="upgrade-hint">
@@ -422,9 +431,13 @@ function relativeTime(iso: string, nowLabel: string): string {
                 @if (selectedItem()!.message!.jobDescription) {
                   · {{ selectedItem()!.message!.jobDescription }}
                 }
+              </div>
+
+              <div class="detail-ids">
                 @if (selectedItem()!.jobId) {
-                  · {{ 'inbox.messageDetail.jobPrefix' | transloco }} {{ selectedItem()!.jobId!.slice(0, 8) }}
+                  <app-copy-field [label]="'inbox.detail.jobId' | transloco" [value]="selectedItem()!.jobId!" />
                 }
+                <app-copy-field [label]="'inbox.detail.threadId' | transloco" [value]="selectedItem()!.message!.threadId" />
               </div>
 
               <!-- Thread messages -->
@@ -506,10 +519,12 @@ function relativeTime(iso: string, nowLabel: string): string {
                 <div class="review-job-desc">{{ selectedItem()!.review!.jobDescription }}</div>
                 <div class="review-job-meta">
                   <span>{{ selectedItem()!.review!.configName || ('inbox.reviewDetail.defaultAgent' | transloco) }}</span>
-                  <span>{{ 'inbox.reviewDetail.idPrefix' | transloco }} {{ selectedItem()!.review!.jobId.slice(0, 8) }}</span>
                   @if (frozenData()?.phase_number !== undefined) {
                     <span>{{ 'inbox.reviewDetail.phase' | transloco: {number: frozenData()?.phase_number} }}</span>
                   }
+                </div>
+                <div class="detail-ids">
+                  <app-copy-field [label]="'inbox.detail.jobId' | transloco" [value]="selectedItem()!.review!.jobId" />
                 </div>
               </div>
 
@@ -635,6 +650,11 @@ function relativeTime(iso: string, nowLabel: string): string {
 
               <h3 class="session-title">{{ selectedItem()!.title }}</h3>
               <div class="session-subtitle">{{ selectedItem()!.subtitle }}</div>
+
+              <div class="detail-ids">
+                <app-copy-field [label]="'inbox.detail.sessionId' | transloco" [value]="selectedItem()!.session!.threadId" />
+                <app-copy-field [label]="'inbox.detail.eventId' | transloco" [value]="selectedItem()!.session!.event.event_id" />
+              </div>
 
               @if (selectedItem()!.session!.event.tool) {
                 <div class="session-section">
@@ -1047,6 +1067,13 @@ function relativeTime(iso: string, nowLabel: string): string {
       font-weight: 600;
       font-variant-numeric: tabular-nums;
       margin-left: auto;
+    }
+
+    .detail-ids {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      margin-top: 8px;
     }
 
     /* ===== SUDO DETAIL ===== */

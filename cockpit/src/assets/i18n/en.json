@@ -1292,7 +1292,12 @@
       "emptyText": "Select an item to view details",
       "hintUse": "Use",
       "hintToNavigate": "to navigate,",
-      "hintToSelect": "to select"
+      "hintToSelect": "to select",
+      "jobId": "Job ID",
+      "requestId": "Request ID",
+      "threadId": "Thread ID",
+      "sessionId": "Session ID",
+      "eventId": "Event ID"
     },
     "sudoDetail": {
       "vmUpgradeRequest": "VM Upgrade Request",
@@ -1319,7 +1324,6 @@
       "modeBlocking": "blocking",
       "modeAsync": "async",
       "defaultAgent": "agent",
-      "jobPrefix": "job",
       "threadLoading": "Loading thread...",
       "noMessagesLoaded": "No messages loaded",
       "senderAgent": "Agent",
@@ -1334,7 +1338,6 @@
       "freezeUpgrade": "Sudo Required",
       "freezeComplete": "Job Complete",
       "defaultAgent": "agent",
-      "idPrefix": "ID:",
       "phase": "Phase {{number}}",
       "loadingFrozen": "Loading frozen data...",
       "summary": "Summary",
@@ -1513,7 +1516,7 @@
       "agentNotes": "Agent Notes"
     },
     "meta": {
-      "id": "ID: {{id}}...",
+      "jobId": "Job ID",
       "created": "Created: {{date}}"
     },
     "summaryEmpty": "No summary provided",

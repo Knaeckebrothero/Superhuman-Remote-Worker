@@ -9,6 +9,7 @@ import {AppIconButtonComponent} from '../../ui/icon-button';
 import {AppBadgeComponent, type BadgeTone} from '../../ui/badge';
 import {AppTextareaComponent} from '../../ui/textarea';
 import {AppSpinnerComponent} from '../../ui/spinner';
+import {AppCopyFieldComponent} from '../../ui/copy-field';
 import {JobDiffReviewComponent} from '../job-diff-review/job-diff-review.component';
 
 interface FrozenJobData {
@@ -42,6 +43,7 @@ interface FrozenJobData {
     AppBadgeComponent,
     AppTextareaComponent,
     AppSpinnerComponent,
+    AppCopyFieldComponent,
     JobDiffReviewComponent,
   ],
   template: `
@@ -99,7 +101,7 @@ interface FrozenJobData {
             <div class="section-header">{{ 'jobReview.sections.job' | transloco }}</div>
             <div class="job-description">{{ job()!.description }}</div>
             <div class="job-meta">
-              <span class="meta-item">{{ 'jobReview.meta.id' | transloco: {id: job()!.id.slice(0, 8)} }}</span>
+              <app-copy-field class="meta-item" [label]="'jobReview.meta.jobId' | transloco" [value]="job()!.id" />
               <span class="meta-item">{{ 'jobReview.meta.created' | transloco: {date: formatDate(job()!.created_at)} }}</span>
             </div>
           </div>
