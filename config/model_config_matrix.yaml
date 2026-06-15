@@ -113,8 +113,12 @@ o-series:
     multimodal: true  # o3/o4-mini support image inputs
     parallel_tool_calls: true
     model_max_context_tokens: 200000
-    # o1/o3 tile model: 75 base + 150/tile after 2048/768 fit. (o4-mini is
-    # actually patch-based; tiles biased-low for it — acceptable, it is unused.)
+    # o1/o3 tile model: 75 base + 150/tile after 2048/768 fit. NOTE: o4-mini is
+    # actually patch-based, but family_of() folds o1/o3/o4 -> "o-series"
+    # (model_registry.py), so a standalone o4-mini matrix row would be dead
+    # config — it shares this tile estimate (biased-low for o4-mini). Acceptable
+    # while o4-mini is unused; the real fix when it is adopted is splitting it
+    # into its own family + an openai_patches row (budget 1536, x1.72).
     image_tokens: { mode: openai_tiles, base: 75, per_tile: 150, tile_px: 512, flat: 1000 }
 
 # DeepSeek V4 family (released 2026-04-24). Covers BOTH variants — family_of()
@@ -194,6 +198,11 @@ claude-sonnet:
     parallel_tool_calls: true
     model_max_context_tokens: 1000000  # Sonnet 4.x: up to 1M context
     image_tokens: { mode: anthropic_patches, patch_px: 28, max_edge: 1568, max_tokens: 1568, flat: 1568 }
+    # 1568px edge cap ⇒ the provider downscales a 150-DPI A4 anyway; render at
+    # 130 (~at the cap) to stop paying for pixels the model discards. Omitting
+    # this key on a family ⇒ renderer default (150). Tune with calibration data
+    # (multimodal_image_cost_optimization.md §1) before lowering other families.
+    pdf_render_dpi: 130
 
 claude-haiku:
   settings:
@@ -202,6 +211,7 @@ claude-haiku:
     parallel_tool_calls: true
     model_max_context_tokens: 200000  # Haiku 4.5: 200K context
     image_tokens: { mode: anthropic_patches, patch_px: 28, max_edge: 1568, max_tokens: 1568, flat: 1568 }
+    pdf_render_dpi: 130  # legacy 1568px cap — see claude-sonnet note
 
 gpt-5:
   prompts:

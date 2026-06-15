@@ -18812,7 +18812,7 @@ async def put_main_cloud_settings(
             "main_cloud",
             clean_value,
             credentials_ref=credentials_ref,
-            updated_by=admin.get("id") or admin.get("email") or "admin",
+            updated_by=str(admin.get("id") or admin.get("email") or "admin"),
         )
     except Exception as e:
         raise HTTPException(

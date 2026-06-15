@@ -610,6 +610,13 @@ def _apply_settings_matrix(
             mode = value.get("mode") if isinstance(value, dict) else value
             applied.append(f"limits.image_tokens(mode={mode})")
             continue
+        if key == "pdf_render_dpi":
+            # Per-family page-render DPI -> limits (same closed-constructor
+            # reason as image_tokens). Consumed by the tool layer
+            # (_get_visual_content via ToolContext), not the LLM/ContextManager.
+            data.setdefault("limits", {})["pdf_render_dpi"] = value
+            applied.append(f"limits.pdf_render_dpi={value}")
+            continue
         if key not in expert_llm_keys:
             data.setdefault("llm", {})[key] = value
             applied.append(f"llm.{key}={value}")
@@ -1240,6 +1247,10 @@ class LimitsConfig:
     # routed through limits (not llm — LLMConfig's closed constructor drops
     # unknown keys). None -> flat fallback. context_token_accounting.md S4.
     image_tokens: Optional[Dict[str, Any]] = None
+    # Per-family page-render resolution (matrix settings.pdf_render_dpi), routed
+    # through limits like image_tokens. None -> renderer default (150). Read by
+    # the tool layer (_get_visual_content), not ContextManager.
+    pdf_render_dpi: Optional[int] = None
     response_validation: ResponseValidationConfig = field(
         default_factory=ResponseValidationConfig
     )
@@ -1906,6 +1917,7 @@ def load_agent_config(
         tool_retry_count=limits_data.get("tool_retry_count", 3),
         model_max_context_tokens=limits_data.get("model_max_context_tokens", 100000),
         image_tokens=limits_data.get("image_tokens"),
+        pdf_render_dpi=limits_data.get("pdf_render_dpi"),
         response_validation=_parse_response_validation(
             limits_data.get("response_validation", {})
         ),
@@ -2107,6 +2119,7 @@ def load_agent_config_from_dict(
         tool_retry_count=limits_data.get("tool_retry_count", 3),
         model_max_context_tokens=limits_data.get("model_max_context_tokens", 100000),
         image_tokens=limits_data.get("image_tokens"),
+        pdf_render_dpi=limits_data.get("pdf_render_dpi"),
         response_validation=_parse_response_validation(
             limits_data.get("response_validation", {})
         ),
@@ -2493,6 +2506,29 @@ def _create_openai_llm(
     # a catalog row pointing at an explicit `llm_endpoints` transport;
     # the dispatcher's `_inject_model_credentials` injects its `base_url`.
     base_url = config.base_url
+
+    # Gemini billing differs by endpoint: ai.google.dev bills a small flat per
+    # image (our flat image-token estimate assumes this), while Vertex crop-tiles
+    # ~7x higher — so a Vertex endpoint makes the flat estimate UNDERCOUNT (the
+    # unsafe direction). Surface the resolved endpoint so the assumption stays
+    # observable. See docs/features/multimodal_image_cost_optimization.md §5.
+    if "gemini" in (config.model or "").lower():
+        _gemini_ep = (base_url or "").lower()
+        if "aiplatform" in _gemini_ep or "vertex" in _gemini_ep:
+            logger.warning(
+                "Gemini model %s resolved to a Vertex-style endpoint (%s); the "
+                "flat image-token estimate assumes the ai.google.dev API and "
+                "will UNDERCOUNT Vertex crop-tile billing — revisit the gemini "
+                "family's settings.image_tokens.",
+                config.model,
+                base_url,
+            )
+        else:
+            logger.info(
+                "Gemini model %s image-token endpoint: %s",
+                config.model,
+                base_url or "(provider default)",
+            )
 
     # Build model kwargs
     model_kwargs = {}

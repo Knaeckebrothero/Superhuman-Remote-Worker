@@ -21,7 +21,7 @@ aliases:
 
 **Status**: Proposed — design only, not built. Filed 2026-06-15 as the
 independently-justified follow-up to the shipped fix in
-[`docs/issues/vm_live_status_query_shadowed_by_jetstream_stream.md`](../issues/vm_live_status_query_shadowed_by_jetstream_stream.md).
+[`docs/done/vm_live_status_query_shadowed_by_jetstream_stream.md`](../done/vm_live_status_query_shadowed_by_jetstream_stream.md).
 Effort ~3–5 eng-days. Cross-repo (touches the vm-controller).
 
 ## Why

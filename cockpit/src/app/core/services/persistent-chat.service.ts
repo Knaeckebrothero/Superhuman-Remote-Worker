@@ -2187,6 +2187,13 @@ function mergeMessagesById(a: HistoryMessage[], b: HistoryMessage[]): HistoryMes
     });
 }
 
+// Synthetic image-delivery messages ("Image content from tool call <id>:")
+// hand a tool's screenshot/page image to a multimodal model
+// (src/services/image_content.py + src/persistent_graph.py). The base64 is
+// dropped at persist, leaving a bare marker that would otherwise render as a
+// user bubble — hide it from the transcript entirely.
+const SYNTHETIC_IMAGE_DELIVERY_RE = /^Image content from tool call \S+:\s*$/;
+
 export function historyToTurns(messages: HistoryMessage[]): Turn[] {
     const turns: Turn[] = [];
     const turnByNumber = new Map<number, AssistantTurn>();
@@ -2247,6 +2254,7 @@ export function historyToTurns(messages: HistoryMessage[]): Turn[] {
         if (!isUser && !isAssistant && !isTool) continue;
 
         if (isUser) {
+            if (SYNTHETIC_IMAGE_DELIVERY_RE.test(m.content || '')) continue;
             const u: UserTurn = {
                 kind: 'user',
                 id: m.id,

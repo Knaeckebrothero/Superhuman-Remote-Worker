@@ -1,6 +1,6 @@
 # Multimodal image cost & estimator tuning — deferred from context token accounting
 
-**Status:** Backlog. Nothing started. **None of this is a correctness issue.**
+**Status:** Backlog — **partially addressed 2026-06-15** (per-family render-DPI mechanism, Gemini-endpoint log, o4-mini finding; see *Progress* below). **None of this is a correctness issue.**
 The multimodal context-explosion wedge is fixed and shipped (S1–S4,
 `docs/done/context_token_accounting.md`, live-verified 2026-06-14). These are the
 deliberately-deferred *cost* and *estimator-precision* knobs — they reduce real
@@ -8,6 +8,25 @@ provider tokens/$ on rendered pages and tighten the estimate, but the system is
 already safe without them because the compaction trigger **re-anchors on the
 provider's real `input_tokens` every turn** (so a biased-high estimate only ever
 compacts slightly early, never wedges).
+
+**Progress — 2026-06-15** (develop, uncommitted, unit-verified):
+- **#1 Per-family render DPI — mechanism shipped.** New matrix `settings.pdf_render_dpi`
+  → `LimitsConfig.pdf_render_dpi` → both `ToolContext` `tool_config` dicts →
+  `_get_visual_content` passes `dpi=context.get_config("pdf_render_dpi")` (None → renderer
+  default 150; the singleton is never mutated). `claude-sonnet`/`claude-haiku` set to **130**
+  (the 1568px cap downscales a 150-DPI A4 anyway → free savings); other families inherit 150
+  pending calibration. Routing tested (`test_image_token_estimator.py::TestLoaderRouting`).
+  Ingestion downscale / `detail:low` (§2) and full per-family values remain open.
+- **#5 Gemini API-vs-Vertex — mitigation shipped.** `_create_openai_llm` logs the resolved
+  Gemini endpoint and **warns** if it looks like Vertex (where the flat-2304 estimate
+  undercounts — the unsafe direction). The crop-tile mode swap is still deferred.
+- **#4 o4-mini — investigated, deliberately not changed.** `family_of()` folds o1/o3/o4 →
+  "o-series" (`model_registry.py`), so a standalone `o4-mini` row is dead config; the
+  o-series matrix comment now documents the real fix (family split + `openai_patches` row,
+  budget 1536 ×1.72) for when o4-mini is adopted.
+
+Still deferred (unchanged): #2, #3, #6, #7. This doc stays in `features/` — the backlog is
+not exhausted.
 
 **Parents / context:**
 - `docs/done/context_token_accounting.md` — the shipped fix (§8 "open knobs" is the source of this list).
@@ -182,11 +201,11 @@ pan-and-scan flag. **Priority:** None until gemma-vision is a main.
 
 | # | Item | Type | Trigger to do it |
 |---|------|------|------------------|
-| 1 | Per-family render DPI | render cost | a tile-mode vision main appears, or page-render $ measured as a problem |
+| 1 | Per-family render DPI | render cost | ✅ **mechanism shipped 2026-06-15** (claude=130); full calibration / other families still open |
 | 2 | Ingestion downscale / `detail:low` | render cost | same as #1 (implement together) |
 | 3 | OpenAI patch multiplier | estimator precision | a single-image `input_tokens` breakdown becomes available |
-| 4 | o4-mini patch mapping | estimator precision | o4-mini configured as a model |
-| 5 | Gemini API-vs-Vertex | estimator safety | **before** any Vertex vision routing |
+| 4 | o4-mini patch mapping | estimator precision | ✅ **investigated 2026-06-15** — a row alone is dead config (family fold); needs a family split when o4-mini is adopted |
+| 5 | Gemini API-vs-Vertex | estimator safety | ✅ **endpoint log+warn shipped 2026-06-15**; crop-tile mode still needed before any Vertex routing |
 | 6 | Auto-calibration loop | estimator safety | ≥2 vision families in active use |
 | 7 | Gemma vision flat | estimator precision | a gemma-vision main appears |
 

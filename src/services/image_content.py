@@ -17,11 +17,11 @@ The chat-completions image-content-block schema is the lowest common
 denominator that LangChain auto-translates to OpenAI/Anthropic/Google
 formats — no vendor branching needed here.
 
-Browser screenshot tools currently emit base64 inside a JSON-serialized
-dict rather than a `<image_data>` text tag; they are intentionally NOT
-covered by this module yet. A follow-up will either emit the same tag
-inside the JSON result or introduce a richer content-block-aware tool
-result protocol.
+Browser tools (`src/tools/research/browser_direct.py`) emit their
+screenshot through this same contract: `_page_state_to_text` renders the
+browser-exec result to a string and wraps the screenshot in an
+`<image_data>` tag, so `extract_image_tags` lifts it like any other image
+(and the base64 never reaches the token counter as text).
 """
 
 from __future__ import annotations
