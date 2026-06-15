@@ -1,13 +1,14 @@
 # DB schema hygiene — dead code and snapshot drift
 
-**Status:** open (first slice shipped on `chore/db-schema-hygiene`)
+**Status:** open — first slice landed on `develop` (`f4160780`, 2026-06-11);
+items 1–4 below remain.
 **Origin:** 2026-06-11 database-architecture review (`docs/features/database_architecture.md`),
 while deciding whether the audit-store refactor should bundle schema cleanup.
 Verdict there: targeted hygiene only — the audit migration stays byte-parity,
 and schema restructuring happens only when a feature or measured problem
 forces it. This doc tracks the targeted part.
 
-## Done (this branch)
+## Done (on `develop` — `f4160780`, 2026-06-11)
 
 - **Pre-BFF session block deleted** — `orchestrator/database/postgres.py`
   `SESSION OPERATIONS` section (6 methods, 91 lines: `create_session`,
