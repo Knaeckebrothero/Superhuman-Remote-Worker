@@ -157,11 +157,44 @@ cockpit tab open):
   CAS → suspended-restore wake). Exercise on dev (S3 present) after the
   next deploy — expected log line: "Drain-suspend complete for thread …".
 
-Still open from this issue: (c) resume-restore 409 hardening — a user input
-landing in the (now much smaller) window while the old workspace pod is
-still terminating can still race pod re-creation. `ensure_workspace`
-already waits on `suspending`; the remaining gap is AlreadyExists handling
-in the restore-path pod create.
+### (c) Resume-restore 409 hardening (done 2026-06-12)
+
+The last open leg. A user input landing while the just-suspended workspace
+pod is still draining its delete grace raced pod re-creation: the workspace
+pod name is deterministic (`ws-thread-<tid[:12]>`), so the restore-path
+`create_namespaced_pod` 409'd, hit the generic `except`, set
+`workspace_container.status='failed'`, and surfaced to the user as a 503
+"session ended" — the exact tail of the original incident.
+
+`container_provisioner.create_workspace` now routes its pod-create through
+`_create_pod_resolving_teardown(pod_manifest, pod_name)`:
+
+- create succeeds → return the pod (caller adopts the seed ConfigMap);
+- 409 + incumbent **Terminating** (`deletion_timestamp` set, or already 404
+  on the follow-up read) → `_wait_for_pod_gone(timeout=30)`, then recreate
+  the fresh pod once. This is the resume-race fix;
+- 409 + incumbent **live** (no deletion timestamp) → genuine idempotent
+  double-create; return `None` so the caller skips adoption (the live pod
+  already owns its same-named ConfigMap), mirroring the IDE-pod path;
+- teardown never completes within 30s → `RuntimeError` → existing
+  `failed`-status path (no infinite retry over a stuck terminator);
+- any non-409 error re-raises immediately (unchanged failure semantics).
+
+Scope: only the workspace pod was exposed — the **agent** pod uses a random
+name (`srw-agent-<p>-<uuid4>`) so resume always provisions a fresh one with
+no name collision (its 409 handler is just UUID-collision insurance). The
+VM restore path (KubeVirt async delete via NATS) is a different mechanism
+and out of scope here.
+
+Tests: `tests/test_container_provisioner.py::TestCreateWorkspaceTeardownRace`
+— terminating→wait→recreate, live→idempotent-adopt, teardown-timeout→clean
+fail, non-409→re-raise.
+
+**This issue is now fully resolved** (drain=clean-suspend + re-entrancy
+guard + resume 409 hardening). The only outstanding item is the one live
+dev check of the full `suspended` terminal state (S3 snapshot path), which
+the next `develop` deploy exercises organically — see the verification note
+above.
 
 ## Pointers
 

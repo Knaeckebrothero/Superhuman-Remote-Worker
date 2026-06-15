@@ -135,7 +135,10 @@ secrets:
     NEXTCLOUD_S3_ACCESS_KEY: "stub"
     NEXTCLOUD_S3_SECRET_KEY: "stub"
 
-    # --- S3 (snapshot service — no real S3 yet, stubs) ---
+    # --- S3 (snapshot service + IDE-session blobs) — root creds of the local
+    # single-node MinIO (deployment/tilt-minio.yaml). Active under Tilt, where
+    # values-tilt.yaml sets s3.endpoint to the MinIO service; the snapshot service
+    # auto-creates/uses the srw-snapshots bucket. Same MinIO as the virtual tier. ---
     SNAPSHOT_S3_ACCESS_KEY_ID: "minioadmin"
     SNAPSHOT_S3_SECRET_ACCESS_KEY: "minioadmin_secret"
 

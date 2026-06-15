@@ -1086,6 +1086,170 @@ class TestDispatchHelpers:
         assert ctx == {}
 
 
+class TestCreateWorkspaceTeardownRace:
+    """Restore-path 409 resolution — the suspend→resume teardown race.
+
+    Issue: session_agent_drift_drain_kills_idle_sessions (option c). A
+    just-suspended session leaves its old pod (same deterministic name)
+    Terminating inside its delete grace; a fast resume 409s on create.
+    """
+
+    @staticmethod
+    def _conflict() -> Exception:
+        err = Exception("Conflict")
+        err.status = 409
+        return err
+
+    @staticmethod
+    async def _sync_to_thread(fn, *args, **kwargs):
+        return fn(*args, **kwargs)
+
+    def _provisioner(self, monkeypatch):
+        from orchestrator.services.container_provisioner import ContainerProvisioner
+
+        provisioner = ContainerProvisioner()
+        provisioner._k8s_available = True
+        provisioner._namespace = "test-ns"
+        provisioner._db = AsyncMock()
+        provisioner._db.merge_thread_workspace_context = AsyncMock(return_value=True)
+        monkeypatch.setattr(
+            provisioner,
+            "_resolve_network_tier",
+            AsyncMock(return_value="internet-only"),
+        )
+        monkeypatch.setattr(provisioner, "_adopt_configmap", AsyncMock())
+        monkeypatch.setattr(
+            provisioner, "_wait_for_ready", AsyncMock(return_value="10.0.0.9")
+        )
+        return provisioner
+
+    @pytest.mark.asyncio
+    async def test_terminating_pod_waits_then_recreates(self, monkeypatch):
+        """409 + incumbent Terminating → wait for teardown, then recreate fresh."""
+        provisioner = self._provisioner(monkeypatch)
+
+        fresh_pod = MagicMock()
+        fresh_pod.metadata.uid = "uid-new"
+        fresh_pod.metadata.name = "ws-thread-thread-abc12"
+        create_seq = [self._conflict(), fresh_pod]
+
+        def fake_create(**kwargs):
+            item = create_seq.pop(0)
+            if isinstance(item, Exception):
+                raise item
+            return item
+
+        terminating = MagicMock()
+        terminating.metadata.deletion_timestamp = "2026-06-12T10:00:00Z"
+
+        mock_core_api = MagicMock()
+        mock_core_api.create_namespaced_pod = MagicMock(side_effect=fake_create)
+        mock_core_api.read_namespaced_pod = MagicMock(return_value=terminating)
+        provisioner._core_api = mock_core_api
+
+        monkeypatch.setattr(
+            provisioner, "_wait_for_pod_gone", AsyncMock(return_value=True)
+        )
+        with patch(
+            "orchestrator.services.container_provisioner.asyncio.to_thread",
+            side_effect=self._sync_to_thread,
+        ):
+            ok = await provisioner.create_workspace(
+                WorkspaceOwner.session("thread-abc12345")
+            )
+
+        assert ok is True
+        # First create 409'd, second (post-teardown) succeeded.
+        assert mock_core_api.create_namespaced_pod.call_count == 2
+        provisioner._wait_for_pod_gone.assert_awaited_once()
+        # Fresh pod → ConfigMap adopted.
+        provisioner._adopt_configmap.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_live_pod_is_idempotent_adopt(self, monkeypatch):
+        """409 + incumbent live (no deletion ts) → idempotent, no recreate/adopt."""
+        provisioner = self._provisioner(monkeypatch)
+
+        mock_core_api = MagicMock()
+        mock_core_api.create_namespaced_pod = MagicMock(side_effect=self._conflict())
+        live = MagicMock()
+        live.metadata.deletion_timestamp = None
+        mock_core_api.read_namespaced_pod = MagicMock(return_value=live)
+        provisioner._core_api = mock_core_api
+
+        gone = AsyncMock(return_value=True)
+        monkeypatch.setattr(provisioner, "_wait_for_pod_gone", gone)
+        with patch(
+            "orchestrator.services.container_provisioner.asyncio.to_thread",
+            side_effect=self._sync_to_thread,
+        ):
+            ok = await provisioner.create_workspace(
+                WorkspaceOwner.session("thread-abc12345")
+            )
+
+        assert ok is True
+        # No recreate (incumbent is live), no teardown wait.
+        assert mock_core_api.create_namespaced_pod.call_count == 1
+        gone.assert_not_awaited()
+        # created_pod is None → adoption skipped (live pod owns its own CM).
+        provisioner._adopt_configmap.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_teardown_timeout_fails_cleanly(self, monkeypatch):
+        """409 + incumbent never finishes terminating → failed, no infinite retry."""
+        provisioner = self._provisioner(monkeypatch)
+
+        mock_core_api = MagicMock()
+        mock_core_api.create_namespaced_pod = MagicMock(side_effect=self._conflict())
+        terminating = MagicMock()
+        terminating.metadata.deletion_timestamp = "2026-06-12T10:00:00Z"
+        mock_core_api.read_namespaced_pod = MagicMock(return_value=terminating)
+        provisioner._core_api = mock_core_api
+
+        monkeypatch.setattr(
+            provisioner, "_wait_for_pod_gone", AsyncMock(return_value=False)
+        )
+        with patch(
+            "orchestrator.services.container_provisioner.asyncio.to_thread",
+            side_effect=self._sync_to_thread,
+        ):
+            ok = await provisioner.create_workspace(
+                WorkspaceOwner.session("thread-abc12345")
+            )
+
+        assert ok is False
+        # Single create attempt — we never recreate over a stuck terminator.
+        assert mock_core_api.create_namespaced_pod.call_count == 1
+        last = provisioner._db.merge_thread_workspace_context.call_args_list[-1][0][1]
+        assert last["status"] == "failed"
+
+    @pytest.mark.asyncio
+    async def test_non_409_error_still_fails(self, monkeypatch):
+        """A non-conflict API error keeps the original failure semantics."""
+        provisioner = self._provisioner(monkeypatch)
+
+        boom = Exception("API down")
+        boom.status = 500
+        mock_core_api = MagicMock()
+        mock_core_api.create_namespaced_pod = MagicMock(side_effect=boom)
+        mock_core_api.read_namespaced_pod = MagicMock()
+        provisioner._core_api = mock_core_api
+
+        with patch(
+            "orchestrator.services.container_provisioner.asyncio.to_thread",
+            side_effect=self._sync_to_thread,
+        ):
+            ok = await provisioner.create_workspace(
+                WorkspaceOwner.session("thread-abc12345")
+            )
+
+        assert ok is False
+        # We never even looked at the incumbent — non-409 re-raises immediately.
+        mock_core_api.read_namespaced_pod.assert_not_called()
+        last = provisioner._db.merge_thread_workspace_context.call_args_list[-1][0][1]
+        assert last["status"] == "failed"
+
+
 class TestOwnerKeyedWorkspace:
     """Tests for WorkspaceOwner-keyed provisioning (Task 2 refactor)."""
 

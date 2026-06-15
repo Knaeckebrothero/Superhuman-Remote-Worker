@@ -223,13 +223,14 @@ class ContainerProvisioner:
         )
 
         try:
-            created_pod = await asyncio.to_thread(
-                self._core_api.create_namespaced_pod,
-                namespace=self._namespace,
-                body=pod_manifest,
+            created_pod = await self._create_pod_resolving_teardown(
+                pod_manifest, pod_name
             )
             # Make the pod own the seed ConfigMap so K8s GCs it on teardown.
-            await self._adopt_configmap(seed_cm, created_pod)
+            # created_pod is None only for the idempotent live-pod case, where
+            # the existing pod already owns its (same-named) ConfigMap.
+            if created_pod is not None:
+                await self._adopt_configmap(seed_cm, created_pod)
             logger.info(
                 "Workspace container created: %s (%s %s)",
                 pod_name,
@@ -1157,6 +1158,99 @@ class ContainerProvisioner:
         if self._fuse_enabled:
             capabilities.append("SYS_ADMIN")
         return capabilities
+
+    async def _create_pod_resolving_teardown(
+        self, pod_manifest: dict, pod_name: str
+    ) -> Optional[Any]:
+        """Create the workspace pod, resolving a suspend/resume teardown race.
+
+        Returns the created pod object, or ``None`` when a live pod with this
+        name already exists (idempotent double-create — the caller skips
+        ConfigMap adoption and just waits for readiness). Re-raises any
+        non-409 API error to the caller's failure path.
+
+        The race this fixes (issue
+        ``session_agent_drift_drain_kills_idle_sessions``, option c): a
+        just-suspended session leaves its old workspace pod — same
+        deterministic name (``ws-thread-<tid>``) — ``Terminating`` inside its
+        delete grace window. A fast resume (drift-drain → suspend → user
+        sends a message seconds later) then 409s on create, which previously
+        bubbled to the dispatcher as a failed restore and surfaced to the
+        user as a 503 "session ended". We distinguish:
+
+          * incumbent pod ``Terminating`` (``deletion_timestamp`` set, or
+            already 404 by the time we look) → wait for it to fully
+            disappear, then create the fresh pod;
+          * incumbent pod live (no deletion timestamp) → genuine idempotent
+            hit, adopt it (mirrors the IDE-pod path).
+        """
+        try:
+            return await asyncio.to_thread(
+                self._core_api.create_namespaced_pod,
+                namespace=self._namespace,
+                body=pod_manifest,
+            )
+        except Exception as e:
+            if getattr(e, "status", None) != 409:
+                raise
+
+        # 409 — inspect the incumbent pod sharing this deterministic name.
+        try:
+            existing = await asyncio.to_thread(
+                self._core_api.read_namespaced_pod,
+                name=pod_name,
+                namespace=self._namespace,
+            )
+        except Exception as e:
+            if getattr(e, "status", None) != 404:
+                raise
+            existing = None  # vanished between create and read — recreate below
+
+        terminating = (
+            existing is None or existing.metadata.deletion_timestamp is not None
+        )
+        if not terminating:
+            # Live pod already present (two creates raced for one owner) —
+            # treat as idempotent; the existing pod owns its ConfigMap.
+            logger.info(
+                "Workspace pod %s already exists and is live — adopting", pod_name
+            )
+            return None
+
+        # Old pod still draining its delete grace (suspend→resume race).
+        # Wait it out, then create the fresh pod on the freed name.
+        logger.info(
+            "Workspace pod %s is terminating (suspend/resume race) — waiting "
+            "for teardown before recreate",
+            pod_name,
+        )
+        if not await self._wait_for_pod_gone(pod_name, timeout=30):
+            raise RuntimeError(
+                f"workspace pod {pod_name} still terminating after 30s; "
+                "cannot recreate for resume"
+            )
+        return await asyncio.to_thread(
+            self._core_api.create_namespaced_pod,
+            namespace=self._namespace,
+            body=pod_manifest,
+        )
+
+    async def _wait_for_pod_gone(self, pod_name: str, timeout: int = 30) -> bool:
+        """Poll until the named pod no longer exists (404). True if gone."""
+        deadline = asyncio.get_event_loop().time() + timeout
+        while asyncio.get_event_loop().time() < deadline:
+            try:
+                await asyncio.to_thread(
+                    self._core_api.read_namespaced_pod,
+                    name=pod_name,
+                    namespace=self._namespace,
+                )
+            except Exception as e:
+                if getattr(e, "status", None) == 404:
+                    return True
+                # Transient read error — keep polling until the deadline.
+            await asyncio.sleep(1)
+        return False
 
     async def _wait_for_ready(self, pod_name: str, timeout: int = 120) -> Optional[str]:
         """Poll until the workspace pod is Running and has an IP.
