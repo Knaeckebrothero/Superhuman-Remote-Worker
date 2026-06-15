@@ -116,8 +116,14 @@ Create `helm/ci/invalid-values.yaml`:
 # renders successfully, the schema has stopped doing its job.
 #
 # Do NOT "fix" this file to make it render. Its only purpose is to fail.
+#
+# global.domain is set ONLY so the sole reason the render fails is the schema
+# type violation below — not the unrelated `global.domain is required` template
+# guard, which would otherwise mask the schema test.
 license:
   acceptTerms: "yes"   # WRONG TYPE: must be a boolean (true/false), not a string
+global:
+  domain: "negative-test.example.com"
 ```
 
 - [ ] **Step 2: Run it to confirm it currently (wrongly) renders — no schema yet**
@@ -226,17 +232,19 @@ Run: `helm template srw helm/ -f helm/ci/invalid-values.yaml`
 Expected: FAILS, non-zero exit, message like:
 `values don't meet the specifications of the schema(s) in the following chart: superhuman-remote-worker … - license.acceptTerms: Invalid type. Expected: boolean, given: string`
 
-- [ ] **Step 5: Confirm the schema does NOT over-reject valid inputs (defaults + all real scenarios)**
+- [ ] **Step 5: Confirm the schema does NOT over-reject valid inputs**
+
+The chart's `license-gate.yaml` (`fail` on `license.acceptTerms`, default `false`) and the `global.domain` `required` guard (default `""`) make a *pure*-defaults render fail at the **template** layer — unrelated to the schema. So prove schema-acceptance with the existing valid scenario files (authoritative), plus an otherwise-default render that supplies just those two required fields.
 
 Run:
 ```bash
-helm template srw helm/ >/dev/null && echo "defaults OK"
 for s in test customer-external; do
   helm template srw helm/ -f "helm/ci/$s-values.yaml" >/dev/null && echo "$s OK"
 done
+helm template srw helm/ --set license.acceptTerms=true --set global.domain=ci.example.com >/dev/null && echo "defaults+required OK"
 helm lint helm/ -f helm/ci/test-values.yaml
 ```
-Expected: `defaults OK`, `test OK`, `customer-external OK`, and `helm lint` reports `1 chart(s) linted, 0 chart(s) failed`. If any valid input is rejected, a declared type/enum disagrees with the real default — fix the schema (loosen that property), do not change the values file.
+Expected: `test OK` and `customer-external OK` — these are the authoritative proof the schema accepts valid configs. `defaults+required OK` should also print; if instead it errors on a *different* `required`/`fail` (some other field the bundled defaults need), that's a chart-completeness note, **not** a schema failure — the scenario-file passes already prove the schema is fine. `helm lint` reports `1 chart(s) linted, 0 chart(s) failed`. If a scenario file is rejected with a *schema* error, a declared type/enum disagrees with the real default — loosen that property in the schema; do not change the values file.
 
 - [ ] **Step 6: Commit**
 

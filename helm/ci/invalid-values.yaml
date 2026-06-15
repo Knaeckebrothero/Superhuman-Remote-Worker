@@ -1,0 +1,14 @@
+# NEGATIVE TEST — this file is INTENTIONALLY invalid and MUST be rejected by
+# helm/values.schema.json. CI (the chart-schema-negative job) asserts that
+# `helm template -f invalid-values.yaml` exits non-zero. If this file ever
+# renders successfully, the schema has stopped doing its job.
+#
+# Do NOT "fix" this file to make it render. Its only purpose is to fail.
+#
+# global.domain is set ONLY so the sole reason the render fails is the schema
+# type violation below — not the unrelated `global.domain is required` template
+# guard, which would otherwise mask the schema test.
+license:
+  acceptTerms: "yes"   # WRONG TYPE: must be a boolean (true/false), not a string
+global:
+  domain: "negative-test.example.com"

@@ -1,0 +1,27 @@
+# Same-cluster KubeVirt scenario — exercises the vmController templates
+# (Deployment, namespace, RBAC with kubevirt.io verbs, service) plus the
+# transport enum in values.schema.json. Uses chart-created secrets so the file
+# is self-contained. The chart does NOT install KubeVirt/CDI — irrelevant for a
+# static render test.
+license:
+  acceptTerms: true
+
+global:
+  domain: "vm.example.com"
+
+secrets:
+  create: true
+  values: {}
+
+vmController:
+  enabled: true
+  transport: http
+  namespace: agent-vms
+  # Dummy key — only needs to be a non-empty string to render the mount.
+  vmSshPublicKey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITESTKEYFORCIRENDERONLY00000000000000000 agent@srw"
+
+ingress:
+  enabled: true
+  className: traefik
+  tls:
+    enabled: false
