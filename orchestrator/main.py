@@ -12381,11 +12381,19 @@ async def agent_heartbeat(
     """
     await require_internal(request)
     try:
+        # Surface auxiliary-model health (aux Phase 2): the agent folds a
+        # compact AuxHealth summary into metrics.aux; persist its degraded flag
+        # on the agent row so the admin view can badge it. Absent on older
+        # agent builds / before the aux LLM is wired → None, which leaves the
+        # persisted flag untouched.
+        aux = (heartbeat.metrics or {}).get("aux")
+        aux_degraded = bool(aux.get("degraded")) if isinstance(aux, dict) else None
         result = await postgres_db.heartbeat(
             agent_id=agent_id,
             status=heartbeat.status,
             current_job_id=heartbeat.current_job_id,
             metrics=heartbeat.metrics,
+            aux_degraded=aux_degraded,
         )
         if result is None:
             raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found")

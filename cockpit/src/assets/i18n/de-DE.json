@@ -1812,6 +1812,8 @@
       "assignFailed": "Zuweisung fehlgeschlagen",
       "assignError": "Fehler bei der Zuweisung"
     },
+    "auxDegraded": "Hilfsmodell gestört",
+    "auxDegradedTip": "Hilfsmodell gestört",
     "time": {
       "secondsAgo": "vor {{n}}s",
       "minutesAgo": "vor {{n}} Min.",

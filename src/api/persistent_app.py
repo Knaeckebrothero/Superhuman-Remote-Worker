@@ -642,14 +642,41 @@ def _signal_ws_connected() -> None:
 
 def _get_agent_metrics() -> Optional[Dict[str, Any]]:
     """Collect metrics for heartbeat."""
+    metrics: Dict[str, Any] = {}
     try:
         import psutil
 
         proc = psutil.Process()
-        return {
-            "memory_mb": round(proc.memory_info().rss / 1_048_576, 1),
-            "cpu_percent": proc.cpu_percent(interval=0),
-        }
+        metrics.update(
+            {
+                "memory_mb": round(proc.memory_info().rss / 1_048_576, 1),
+                "cpu_percent": proc.cpu_percent(interval=0),
+            }
+        )
+    except Exception:
+        pass
+
+    # Auxiliary-task health → orchestrator persists the degraded flag and
+    # surfaces an admin badge (aux Phase 2). Best-effort; never fail heartbeat.
+    aux = _aux_health_for_heartbeat()
+    if aux is not None:
+        metrics["aux"] = aux
+
+    return metrics or None
+
+
+def _aux_health_for_heartbeat() -> Optional[Dict[str, Any]]:
+    """Compact auxiliary-model health for the heartbeat (aux Phase 2).
+
+    Reads the shared session auxiliary LLM. Returns None before a session is
+    bound so the orchestrator leaves any previously-persisted ``aux_degraded``
+    untouched rather than clearing it on incomplete information.
+    """
+    aux_llm = getattr(_session, "auxiliary_llm", None) if _session is not None else None
+    if aux_llm is None:
+        return None
+    try:
+        return aux_llm.health.heartbeat_summary()
     except Exception:
         return None
 

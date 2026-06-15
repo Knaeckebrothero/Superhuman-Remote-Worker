@@ -568,6 +568,34 @@ class AuxHealth:
             },
         }
 
+    def heartbeat_summary(self) -> Dict[str, Any]:
+        """Compact health projection carried on the agent → orchestrator heartbeat.
+
+        Smaller than :meth:`snapshot`: just the degraded flag, the aggregate
+        failure count, the model, and which tasks are currently failing (with
+        their last error type). The orchestrator persists ``degraded`` to
+        ``agents.aux_degraded`` (drives the admin badge) and stashes the rest in
+        ``agents.metadata.aux`` for the badge tooltip. Per-task success counters
+        and timestamps stay in :meth:`snapshot` / the ``/status`` endpoint.
+
+        Always includes ``degraded`` (even when False) so a recovered agent's
+        heartbeat clears the persisted flag.
+        """
+        failing = {
+            name: {
+                "consecutive_failures": t.consecutive_failures,
+                "last_error_type": t.last_error_type,
+            }
+            for name, t in self._tasks.items()
+            if t.consecutive_failures > 0
+        }
+        return {
+            "degraded": self._degraded,
+            "consecutive_failures": self._consecutive_failures,
+            "model": self.model,
+            "failing_tasks": failing,
+        }
+
 
 class AuxInputTooLarge(Exception):
     """Task input exceeds the auxiliary model's context window.

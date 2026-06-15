@@ -114,6 +114,13 @@ import {AppSpinnerComponent} from '../../ui/spinner';
                     <app-badge [tone]="agentStatusTone(agent.status)" size="sm">
                       {{ getStatusIcon(agent.status) }} {{ 'agentList.status.' + agent.status | transloco }}
                     </app-badge>
+                    @if (agent.aux_degraded) {
+                      <span class="aux-degraded" [title]="auxTooltip(agent)">
+                        <app-badge tone="danger" size="sm">
+                          &#x26A0; {{ 'agentList.auxDegraded' | transloco }}
+                        </app-badge>
+                      </span>
+                    }
                   </td>
                   <td class="config-name">{{ agent.config_name }}</td>
                   <td class="hostname">{{ agent.hostname || agent.pod_ip || '-' }}</td>
@@ -323,6 +330,11 @@ import {AppSpinnerComponent} from '../../ui/spinner';
 
       .agent-table tbody tr:hover {
         background: var(--surface-0, var(--surface-0));
+      }
+
+      .aux-degraded {
+        margin-left: 6px;
+        cursor: help;
       }
 
       .config-name {
@@ -567,6 +579,42 @@ export class AgentListComponent implements OnInit, OnDestroy {
       offline: '\u26AA',
     };
     return icons[status] || '\u2753';
+  }
+
+  /**
+   * Human tooltip for the aux-degraded badge, built from the compact
+   * `metadata.aux` summary the agent reports on its heartbeat (aux Phase 2).
+   * e.g. "Auxiliary model degraded: gemma-4-moe \u2014 7 consecutive failures
+   * (memory_extraction: ConnectionError)".
+   */
+  auxTooltip(agent: Agent): string {
+    const prefix = this.transloco.translate('agentList.auxDegradedTip');
+    const aux = (agent.metadata?.['aux'] ?? null) as {
+      model?: string;
+      consecutive_failures?: number;
+      failing_tasks?: Record<string, {last_error_type?: string}>;
+    } | null;
+    if (!aux) {
+      return prefix;
+    }
+
+    const parts: string[] = [];
+    if (aux.model) {
+      parts.push(aux.model);
+    }
+    if (aux.consecutive_failures) {
+      parts.push(`${aux.consecutive_failures} consecutive failures`);
+    }
+
+    const taskDetail = Object.entries(aux.failing_tasks ?? {})
+      .map(([name, t]) => `${name}: ${t?.last_error_type ?? 'error'}`)
+      .join(', ');
+
+    let detail = parts.join(' \u2014 ');
+    if (taskDetail) {
+      detail = detail ? `${detail} (${taskDetail})` : taskDetail;
+    }
+    return detail ? `${prefix}: ${detail}` : prefix;
   }
 
   formatTimestamp(timestamp: string): string {
