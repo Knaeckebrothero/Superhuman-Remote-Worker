@@ -37,6 +37,26 @@ see the chart README (`helm show readme oci://ghcr.io/knaeckebrothero/charts/sup
 | `mcp` | MCP server for Claude Code integration | **off** (can enable later) |
 | `pgadmin`, `mongo-express`, `dozzle` | Admin UIs | off |
 
+### 1.1 Component licensing
+
+The SRW components (`orchestrator`, `agent`, `cockpit`, `mcp`, workspace tooling)
+are under the project license — see [`LICENSE.txt`](../LICENSE.txt) — and the
+third-party libraries bundled *inside* those images are inventoried in
+[`THIRD_PARTY_LICENSES.md`](../THIRD_PARTY_LICENSES.md).
+
+The bundled **services** (`keycloak`, `gitea`, `opencloud`, `postgres`,
+`postgres-vector`, `mongodb`, `neo4j`) are **not redistributed by us**: the chart
+pins official upstream images that the customer's cluster pulls directly from
+their public registries, so each arrives under its own upstream OSS license (e.g.
+Neo4j Community Edition under **GPLv3** if you enable it). We reference those
+images; we don't convey them.
+
+> ⚠️ This holds only while the cluster pulls from the public registries. If you
+> mirror, re-tag, or ship those images yourself (e.g. an **air-gapped** install —
+> outside this prototype's scope, see the note at the top), you become a
+> distributor of that component and take on its distribution terms (source offer,
+> notices). Plan that with counsel before the first air-gapped delivery.
+
 ---
 
 ## 2. What the customer provides
