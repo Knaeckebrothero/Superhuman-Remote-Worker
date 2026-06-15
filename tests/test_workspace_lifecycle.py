@@ -144,3 +144,69 @@ async def test_ensure_create_failure_returns_FAILED():
         current_status=None,
     )
     assert res.outcome == EnsureOutcome.FAILED
+
+
+# =============================================================================
+# 'ready' drift check: a workspace marked ready whose pod is actually gone must
+# be recreated (design "ready, pod missing → treat as failed → recreate"),
+# while a probe that can't tell must NEVER false-recreate a healthy workspace.
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_ensure_ready_recreates_when_pod_confirmed_dead():
+    """ready + probe says the pod is gone/tombstone (False) → recreate."""
+    prov = AsyncMock()
+    prov.create_workspace = AsyncMock(return_value=True)
+    prov.workspace_pod_live = AsyncMock(return_value=False)
+    susp = AsyncMock()
+    owner = _WO.session("t1")
+    res = await ensure_workspace(
+        owner, provisioner=prov, suspension=susp, current_status="ready"
+    )
+    assert res.outcome == EnsureOutcome.PENDING  # _create → creating/PENDING
+    prov.workspace_pod_live.assert_awaited_once_with(owner)
+    prov.create_workspace.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_ensure_ready_no_recreate_when_pod_live():
+    """ready + probe says the pod is live (True) → READY, no recreate."""
+    prov = AsyncMock()
+    prov.create_workspace = AsyncMock(return_value=True)
+    prov.workspace_pod_live = AsyncMock(return_value=True)
+    susp = AsyncMock()
+    res = await ensure_workspace(
+        _WO.session("t1"), provisioner=prov, suspension=susp, current_status="ready"
+    )
+    assert res.outcome == EnsureOutcome.READY
+    prov.create_workspace.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_ensure_ready_trusts_db_when_probe_unknown():
+    """ready + probe can't tell (None: non-k8s / transient) → READY, no
+    recreate — never false-recreate a healthy workspace on a probe blip."""
+    prov = AsyncMock()
+    prov.create_workspace = AsyncMock(return_value=True)
+    prov.workspace_pod_live = AsyncMock(return_value=None)
+    susp = AsyncMock()
+    res = await ensure_workspace(
+        _WO.session("t1"), provisioner=prov, suspension=susp, current_status="ready"
+    )
+    assert res.outcome == EnsureOutcome.READY
+    prov.create_workspace.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_ensure_ready_trusts_db_when_provisioner_has_no_probe():
+    """A provisioner without workspace_pod_live (e.g. a non-container backend)
+    keeps the original behavior: ready → READY, no probe, no recreate."""
+    prov = AsyncMock(spec=["create_workspace"])
+    prov.create_workspace = AsyncMock(return_value=True)
+    susp = AsyncMock()
+    res = await ensure_workspace(
+        _WO.session("t1"), provisioner=prov, suspension=susp, current_status="ready"
+    )
+    assert res.outcome == EnsureOutcome.READY
+    prov.create_workspace.assert_not_called()

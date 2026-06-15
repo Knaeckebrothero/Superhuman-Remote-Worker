@@ -303,3 +303,6 @@ opencloud:
         - "auth.localhost"
 
 logLevel: "DEBUG"
+# Local k3d keeps human-readable logs ("json" once Loki lands — see
+# docs/features/centralized_logging.md).
+logFormat: "text"

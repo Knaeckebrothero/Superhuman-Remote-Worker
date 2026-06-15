@@ -106,6 +106,15 @@ async def ensure_workspace(
     if s in ("created", "creating", "restoring", "suspending", "pending"):
         return EnsureResult(EnsureOutcome.PENDING, status=s)
     if s == "ready":
+        # Drift check (design: "ready, pod missing → treat as failed →
+        # recreate"). The DB says ready, but the pod may be gone (out-of-band
+        # delete / node restart) or a dead tombstone. Probe liveness and
+        # recreate ONLY on a confirmed-dead pod; unknown / non-k8s / transient
+        # (probe returns None) keeps trusting 'ready' so a blip never
+        # false-recreates a healthy workspace.
+        probe = getattr(provisioner, "workspace_pod_live", None)
+        if probe is not None and await probe(owner) is False:
+            return await _create(owner, provisioner, ws_config)
         return EnsureResult(EnsureOutcome.READY, status="ready")
     # Unknown / unexpected status — wait (the dispatcher skips and retries).
     return EnsureResult(EnsureOutcome.PENDING, status=s)

@@ -8,165 +8,130 @@ tags:
   - deprecation
 aliases:
   - replace builder with sessions
-  - unified chat surface
-  - lightweight sessions
+  - remove builder
+  - builder deprecation
 related:
   - "[[builder]]"
-  - "[[orchestrator_main_py_monolith]]"
-  - "[[cloud_collaboration_model]]"
-  - "[[job_cloud_export]]"
-  - "[[two_graphs]]"
-  - "[[headless_persistent_sessions]]"
   - "[[dynamic_canvas]]"
-  - "[[ephemeral_workspaces]]"
+  - "[[orchestrator_main_py_monolith]]"
+  - "[[tool_implementation]]"
+  - "[[two_graphs]]"
   - "[[agent_open_source_split]]"
 ---
 
-# Builder → Sessions Consolidation
+# Builder Removal (→ Canvas later)
 
-> One chat surface, not two. The orchestrator orchestrates; the agent answers chats. Anything the builder can do, a session can do better — once we add the one verb it's missing.
+> Remove the builder now (it's unused and ships as the default chat surface right before the OSS release + pilots). **Park** its artifact-authoring machinery rather than delete it — the dynamic canvas will reuse it. Do **not** build an `instruction-author` session bridge; the capability comes back inside the [[dynamic_canvas]], not as a constrained session expert.
 
-**Status:** Concept. No work started.
-**Filed:** 2026-05-28
-**Supersedes (eventually):** [`builder.md`](builder.md)
+**Status:** Plan of record. Decided 2026-06-13.
+**Supersedes:** the earlier plan in this doc (build an `instruction-author` expert + `promote-to-job` verb *before* deleting the builder). Dropped — nobody uses the builder, so there is no live workflow to preserve through a bridge; the real replacement is canvas-hosted collaborative job/expert creation.
 
-## Motivation
+## Why now, why this shape
 
-Two concerns push in the same direction.
+- **Urgent / visible.** The builder is the shell's default view (`cockpit/.../shell.component.ts:93` renders `<app-instruction-builder/>`; root routes to the shell) — the "first chat tab." It's undocumented, the internal test students were already told it's deprecated, and it's barely used. It should not be the first thing OSS users and pilots see in the coming weeks.
+- **Its only real delta over sessions is the artifact tools** (mutate `instructions`/`config_override`/`description` and stream them into a form). Those tools are under-tested and some don't work — we don't want to wire them into sessions as-is.
+- **Canvas is the right home.** The builder's UX was always weak: it mutated cockpit form state in the background, with no clear signal of *which* field/window it changed. A Claude-Artifacts-style canvas tile makes job/expert creation a **visible, collaborative surface** — agent and user fill it together. [[dynamic_canvas]]'s v1 plan already lists "copy `JobArtifactService.applyToolCall()` + `BuilderStreamService` **verbatim** for `CanvasService`" — so parking that machinery feeds the canvas directly.
+- **Decoupled timelines.** Removal ships on its own; canvas + job-builder-in-canvas is the ~2-week later track. Removal is **not** blocked on canvas.
 
-**1. The builder is the orchestrator's second AI loop.** `orchestrator/services/builder_*.py` (prompt, tools, config, search, dispatch) + the `builder_sessions` / `builder_messages` tables + the SSE endpoints in `main.py` re-implement what `src/api/persistent_app.py` + `src/persistent_graph.py` already do: streaming chat, model resolution, tool dispatch, message persistence, summarization. The orchestrator is supposed to *orchestrate* — assigning work, gating approvals, tracking state — not host a chat agent. The chat agent lives in `src/`.
+## Current surface (verified 2026-06-13)
 
-**2. The builder's tool set is a strict subset of what a session can do.** Anything that grows on sessions — narration (`session_narration.md`), smart turn merging (`session_turn_rendering.md`), the BFF / cookie auth (`auth_bff_and_api_tokens.md`), the dynamic canvas (`dynamic_canvas.md`), headless / eager mode — does not automatically reach the builder, and the gap widens every release. Conversely, if sessions match the builder's UX, the user has no reason to choose the builder; it becomes a parallel code path with no remaining users.
+The consolidation doc's old inventory was stale (no `/builder` route anymore; BUILDER_* env already gone; no prompt config assets). Accurate map:
 
-Consolidation removes ~2k LOC from `main.py` (helps [[orchestrator_main_py_monolith]]), kills a 1262-line cockpit component, and unblocks the next direction the user wants: **lightweight session tiers** (no SSH workspace, just cloud-file IO + a Python sandbox).
-
-## What the builder is today
-
-Quick inventory so the deletion list at the end of the plan is concrete.
-
-| Surface | Files / endpoints |
-|---|---|
-| Backend services | `orchestrator/services/builder_prompt.py`, `builder_tools.py`, `builder_config.py`, `builder_search.py`, `builder_dispatch.py` |
-| Persistence | `builder_sessions` + `builder_messages` tables; ~6 `postgres_db.*builder_session*` methods |
-| API | `/api/builder/sessions` (CRUD), `/api/builder/sessions/{id}/message` (SSE), `BuilderSessionCreate`, `BuilderMessageRequest` |
-| System prompt | `orchestrator/config/builder_prompt_matrix.yaml` + per-model variants under `orchestrator/config/prompts/builder_*` |
-| Model resolution | `BUILDER_MODEL`, `BUILDER_LLM_PROVIDER`, `BUILDER_API_KEY`, `BUILDER_BASE_URL` env vars; `get_builder_model()`, `get_builder_base_url()`, `default_builder_model`; the `builder_models` slice of `/api/models` |
-| Cockpit | `cockpit/src/app/views/instruction-builder/instruction-builder.component.ts` (1262 LOC), `core/services/builder-stream.service.ts` (265 LOC), `core/services/job-artifact.service.ts` (artifact bidirectional sync) |
-| SSE events | `token`, `tool_call`, `tool_executing`, `tool_result`, `workspace_proposal`, `step`, `done`, `error` |
-| Artifact | `instructions.md` + `config_override` JSON + `description` — injected fresh into the system prompt each turn |
-| Default landing | `https://localhost/` lands on `/builder` after login (per the README smoke-test path) |
-
-What the builder *does* that sessions don't, today:
-
-- **Mutates a structured artifact** (`instructions` / `config_override` / `description`) via tool calls that the cockpit sync-replays into form signals.
-- **Promotes the artifact into a `JobStartRequest`** (the "launch" button at the end of the chat).
-- **Active-job / active-project context** is injected into the system prompt and inspection tools default to it.
-
-Everything else (chat, streaming, model selection, tools, thinking capture, summarization) overlaps with sessions.
-
-## Plan: four reversible steps, deprecation last
-
-Order matters. We don't delete `builder_*.py` until we've proven a session-based replacement covers the workflow.
-
-### Step 1 — `instruction-author` expert config
-
-A new entry under `config/experts/instruction-author.yaml` that:
-
-- Inherits from `persistent_defaults.yaml` (`$extends`).
-- Constrains the tool set to a curated subset: artifact-write tools (`write_instructions`, `update_config`, `set_description`), inspection tools (`get_job`, `list_jobs`, `query_table` read-only, `search_knowledge`), and a search tool (replacing `builder_search.tavily_search`).
-- Loads the builder's existing system prompt verbatim as the base persona (translated from the `builder_prompt_matrix.yaml` content into `config/prompts/persona_instruction_author.md`).
-- Defaults to the same model the builder uses today (`BUILDER_MODEL` becomes a session-default override for this expert config).
-
-**Exit criterion:** spin up a session with `expert: instruction-author`; the chat experience is comparable to today's builder for the canonical "help me write instructions for a research job" workflow.
-
-This step is reversible — it adds files, deletes nothing.
-
-### Step 2 — Promote workspace → `JobStartRequest`
-
-The one capability sessions lack. A session running `instruction-author` writes:
-
+**The shared artifact-streaming layer (the thing that shapes the whole removal):**
 ```
-workspace/
-  instructions.md
-  config.yaml          (or config_override.yaml)
-  description.md
+instruction-builder.component (chat UI)
+  → builder-stream.service.ts   (SSE → /api/builder/sessions/{id}/message)
+    → JobArtifactService         (instructions/config/description/streaming signals)
+      → job-create.component.ts            (form bound to artifacts.*)
+      → agent-settings/instructions-tab.component.ts (streaming input)
 ```
+`JobArtifactService` is **dual-purpose**: builder-AI sync target *and* the job-create form's own state container (`job-artifact.service.ts:42`). It cannot be deleted wholesale — job-create needs the form-state half.
 
-A new endpoint — `POST /api/sessions/{thread_id}/promote-to-job` — reads those files, validates them, and dispatches a `JobStartRequest` against the configured project. Returns the new `job_id`. The cockpit gets a "Launch Job" affordance in the session UI when these files exist.
+**Cockpit:**
+| Piece | Location | Disposition |
+|---|---|---|
+| Builder chat component (~1262 LOC) | `views/instruction-builder/` | **Delete** |
+| Shell default render + sessions sidebar | `views/shell/shell.component.ts:93,406,463` | **Swap** default → sessions |
+| ComponentRegistry registration | `app.ts:28,344`; `debug/layout.model.ts:32` | **Unregister** |
+| Sidebar nav item | `shell/sidebar/sidebar.component.ts:46` (`nav.builder`) | **Remove** |
+| `builder-stream.service.ts` | `core/services/` | **Park** (canvas seed) |
+| `JobArtifactService.applyToolCall()` + `WorkspaceProposal` + `streaming`/`builderModel` | `core/services/job-artifact.service.ts` | **Park** the AI-sync half; **keep** form-state half |
+| `job-create` + `agent-settings/instructions-tab` | `views/` | **Keep** as manual forms (drop AI-fill bindings) |
+| `builderModels` signal / `builder_models` field | `core/services/model.service.ts:30,50,75` | **Rename → `chatModels`/`chat_models`** (NOT delete) |
 
-This is structurally identical to the `job_cloud_export.md` accept path that shipped 2026-05-21: read files from a workspace, validate, materialize a downstream artifact. Same etag / external-mod gate model fits.
+**Orchestrator (`main.py` unless noted):**
+| Piece | Ref | Disposition |
+|---|---|---|
+| 5 endpoints `/api/builder/sessions*` | `20635,20659,20679,20750,20759` | **Delete** |
+| `BuilderSessionCreate`, `BuilderMessageRequest` | `3311,3785` | **Delete** |
+| Second AI loop | `_create_builder_llm:21057`, `_summarize_builder_session:21220`, `_generate_builder_title:21256` | **Delete** |
+| Service imports | `160,169,170,171,203` | **Delete** (after parking artifact tools) |
+| `services/builder_{tools,prompt,config,search,dispatch}.py` | — | **Delete**, except **park** `builder_tools.py`'s 5 artifact-tool schemas + their `builder_dispatch` handlers |
+| `get_builder_model` / `default_builder_model` | `167,3681,20795,20835,21235,21267` | **Delete** (builder-specific) |
+| `builder_models` slice of `/api/models` | `17783–17883` | **Rename → `chat_models`** (it's the chat-capable list) |
+| Postgres methods + table allowlist | `postgres.py:195–196, 7386+` | **Delete** |
+| `builder_sessions` / `builder_messages` tables | `migrations/app/0001_initial.sql` (+ frozen `schema.sql`) | **Drop** via new migration |
 
-**Exit criterion:** a session can be authored end-to-end (chat → instructions written → job dispatched) without touching `/builder/*`.
+**Config/env:** BUILDER_* already stripped from `helm/` (only `deployment/legacy/` reference YAMLs retain them — leave or scrub, non-functional). No `builder_prompt_matrix.yaml` / `config/prompts/builder_*` exist — the prompt is built in code by `builder_prompt.build_system_prompt`.
 
-### Step 3 — Deprecate the builder
+## Plan — ordered PRs
 
-Done in one PR, behind a feature flag if we want a soft rollout:
+Risk-ordered so the urgent visible win lands first and reversibly, and the careful rename is isolated.
 
-- Route `/builder` in the cockpit to a session with `expert: instruction-author` (auto-create on first visit, preserve last-used thread).
-- Freeze `builder_sessions` / `builder_messages` read-only; expose them via a "legacy builder sessions" archive view, or migrate them into `persistent_threads` with a `provenance: 'builder'` marker. (Decide based on volume — likely an archive view is enough.)
-- Delete `orchestrator/services/builder_*.py`, the `/api/builder/sessions*` endpoints, `BuilderSessionCreate`/`BuilderMessageRequest`, the `BUILDER_*` env vars, and the `builder_models` slice of `/api/models`.
-- Delete `cockpit/src/app/views/instruction-builder/`, `core/services/builder-stream.service.ts`. Keep `JobArtifactService` only if step 1's session UI reuses it for the form sync.
+### PR 1 — Hide the builder (visible cut; ship first; trivially reversible)
+- Make root land on **sessions** instead of the builder: stop rendering `<app-instruction-builder/>` in the shell (route `''` → sessions, or render the sessions view as shell default). The `chat → sessions` redirect already signals sessions as the primary surface.
+- Remove the `nav.builder` sidebar item and the `instruction-builder` ComponentRegistry/`layout.model.ts` registration.
+- **Leave all backend + the component file in place, just unwired** — pure "make it invisible." Delivers the pre-pilot outcome immediately; revert = one commit.
+- Update README smoke-test step 1 ("lands on `/builder`" → "lands on sessions").
 
-Expected diff: ~2k LOC out of `orchestrator/main.py`, ~1500 LOC out of the cockpit, ~500 LOC of services and migrations marked dead. The README smoke-test path's "lands on `/builder`" becomes "lands on `/sessions/new?expert=instruction-author`".
+### PR 2 — Remove the builder frontend + split `JobArtifactService`
+- Delete `views/instruction-builder/`.
+- **Split `JobArtifactService`**: keep the form-state container (instructions/description/config signals job-create writes directly); **park** the AI-sync half (`applyToolCall`, `WorkspaceProposal`, `streaming`, `builderModel`) into `core/services/_parked/` (canvas seed).
+- Park `builder-stream.service.ts` alongside it.
+- Update `job-create` + `agent-settings/instructions-tab` to drop the streaming/AI-fill bindings — they remain working **manual** forms.
 
-### Step 4 — Lightweight session tier + code-exec sandbox
+### PR 3 — Remove the builder backend
+- Delete the 5 endpoints + 2 request models + the AI-loop helpers.
+- Park `builder_tools.py`'s **5 artifact-tool schemas** (`update_/edit_/insert_instructions`, `update_config`, `update_description`) + their `builder_dispatch` handlers into `orchestrator/services/_parked/builder_artifact_tools.py`. Delete the rest of `builder_tools.py` (the ~85 operator/inspection schemas are redundant — they're the orchestrator's own REST API, still exposed via MCP) and `builder_{prompt,config,dispatch}.py`.
+- **Verify `builder_search.tavily_search` has no other consumer**; if shared, keep it, else delete.
+- Delete `get_builder_model` / `default_builder_model`.
 
-Only after step 3 lands. Two pieces:
+### PR 4 — Untangle `builder_models` → `chat_models` (careful rename, isolated)
+- `/api/models` field `builder_models` → `chat_models`; cockpit `model.service.ts` `builderModels` → `chatModels` + consumers.
+- Resolve the `'builder'` model-role/slot in the capability classification (`admin-defaults.component.ts` "chat-slot kinds: chat/builder/browser/citation") — drop the `builder` slot or alias it to `chat`. Confirm no session/admin model-picker regresses.
 
-- **Lightweight sessions.** A session mode that doesn't provision an SSH workspace pod — file IO goes directly to OpenCloud, no `paramiko`, no per-session container. Cheaper, faster to spin up, suitable for "just chat with my files" workflows (including instruction authoring after step 1).
-- **Python execution sandbox.** A bounded code-exec environment the session can call into for one-off computations. Options range from a per-session sidecar container to a shared, ephemeral exec service. Out of scope for v1 of this consolidation; sketched here because it's the user-articulated long-term direction.
+### PR 5 — DB cleanup
+- New migration `migrations/app/NNNN_drop_builder_tables.sql` dropping `builder_sessions` + `builder_messages` (low volume, unused → drop, not freeze). **Do not edit `schema.sql`** (frozen). Remove the postgres methods + allowlist entries.
 
-The open design question for this step is significant enough that it gets its own section.
+## Park strategy & canvas hand-off
 
-## Open design question — what does "no workspace" mean?
+Parked, unwired, with a `README.md` pointing here + to [[dynamic_canvas]]:
+- `cockpit/src/app/core/services/_parked/` — `builder-stream.service.ts` + the extracted `applyToolCall`/`WorkspaceProposal` sync logic. The canvas plan copies this shape into `CanvasService`.
+- `orchestrator/services/_parked/builder_artifact_tools.py` — the 5 artifact-tool schemas + dispatch handlers, the seed for the canvas's job/expert authoring operations.
 
-Two implementations look similar from outside but have very different maintenance profiles.
+These are reference/reuse, not live code. Alternative (rely on git history) was rejected — the owner asked for an explicit parked folder so the canvas work has a visible starting point.
 
-### Option A — Cloud-backed workspace backend
+## Deferred to canvas (out of scope here)
 
-Add a `backend: cloud` workspace mode alongside `remote` (SSH/SFTP). `WorkspaceManager` proxies all file IO to OpenCloud directly. The LangGraph state machine is unchanged: phases, todos, archive, todo-yaml — all still operate, just on cloud-backed files instead of SSH-mounted ones.
+How the builder's capability returns inside [[dynamic_canvas]] is a **separate design**, not part of this removal. The open fork (record only):
+- **(a) a structured `form` canvas kind** — schema-driven form the agent populates + user edits + a submit action dispatches the job/expert; generalizes beyond job creation.
+- **(b) a bespoke `job-builder` tile** in the canvas grid — reuses grid/lock/awareness plumbing, keeps a hand-built form component (closest to today's UI, minus the invisible-mutation problem since it's a visible tile).
 
-**Pros:** One graph to maintain. Reuses everything (phase alternation, archive, checkpoint resume, stuck detection). Per [[two_graphs]], the dual-graph cost is already real — no new graph to add.
+Decide when canvas v1 (steps 1–4 in `dynamic_canvas.md`) is stable.
 
-**Cons:** You still pay for the full state machine on tasks that don't need phases. A 3-turn "fix this typo in my instructions" session runs `init_workspace` → `execute` → `tools` → `check_todos` → `archive_phase` → `handle_transition` → `check_goal` just to write one file.
+## Acceptance criteria
 
-### Option B — A second (lighter) agent loop
+1. Fresh login lands on sessions; no builder tab, nav item, or route.
+2. `/api/builder/*`, `BuilderSessionCreate`/`BuilderMessageRequest`, the second AI loop, and `builder_{tools,prompt,config,dispatch}.py` are gone; artifact tools + dispatch handlers preserved under `_parked/`.
+3. `job-create` and `agent-settings/instructions-tab` still create/edit manually (no AI-fill, no console errors from a missing builder backend).
+4. `builder_models` renamed to `chat_models` end-to-end; session/admin model selection unaffected.
+5. `builder_sessions`/`builder_messages` dropped via migration; no orphaned postgres methods.
+6. README smoke-test + this doc reflect the new landing; the canvas seed is parked and pointed at from [[dynamic_canvas]].
 
-A chat-only agent loop with no phase alternation, no todos, no archive. Just LLM-with-tools in a streaming loop. Lives next to `graph.py` / `persistent_graph.py` as a third entry point.
+## Risks / open checks
 
-**Pros:** Cheap at runtime. Latency budget matches today's builder. Less to summarize / persist per turn.
-
-**Cons:** A third graph in a codebase where [[two_graphs]] already complains about two. Every new session capability has to be ported in three places now.
-
-**Recommendation:** **Option A.** The runtime overhead of phase machinery on short tasks is real but small (the LLM call dominates). The maintenance overhead of a third graph is large and recurring. If short-task latency becomes a measured problem, the right fix is a "skip phases if `max_phases <= 1`" config flag inside the existing graph, not a parallel graph. Decision deferrable until step 4 is actually queued.
-
-## Risks & migration concerns
-
-- **Latency UX regression.** Today's builder feels snappy because it's chat-in-the-orchestrator. A session has to provision a pod (or warm-pool wait). Step 4 / Option A largely fixes this, but step 3 lands before step 4. Possible mitigation: warm-pool the `instruction-author` expert specifically, or default it to `backend: cloud` once available.
-- **Existing `builder_sessions` data.** Decide between archive-view vs. migration into `persistent_threads`. Probably archive-view (low volume, low value of historical lookups).
-- **Curated vs. full tool set.** The session UI shows whatever tools the expert config exposes. If `instruction-author` is too constrained, users will switch to a regular session and lose the curated artifact UX. If it's too open, it's no longer "an instruction builder." Step 1's exit criterion is the gate — the curated set needs to *feel* like the builder, not be a stripped-down general agent.
-- **Deep links to `/builder/{id}`.** Cockpit deep links + saved tabs need a redirect (`/builder/{id}` → `/sessions/{id}` with the legacy session ID resolved via `provenance`).
-- **Workspace-edit approval flow.** The builder has its own `workspace_proposal` SSE event for path-validated writes. Sessions need an equivalent approval gate or the `instruction-author` expert needs to skip it (cheap-to-revert artifact edits, not real workspace mutations).
-- **`config_override.yaml` shape.** Today the cockpit `JobArtifactService` parses `config_override` as a typed JSON object with form-bound fields. The session-workspace version writes a YAML file the LLM authored freely. The promote endpoint needs to validate it against the same schema or sessions will produce job-start payloads the orchestrator rejects.
-
-## Why this lands well in the current codebase
-
-- **`main.py` is already being broken up.** This deletes ~2k LOC of the monolith without touching the dispatcher or jobs APIs — a clean cut.
-- **The cloud-mirror workspace pattern is shipped.** Step 2's "promote workspace files to downstream artifact" is a copy of `job_cloud_export.md`'s accept path. Same shape, smaller surface.
-- **The OSS split design needs this.** [[agent_open_source_split]] argues `src/` + `agent.py` + `config/` could be open-sourced if the orchestrator coupling is HTTP-only. The builder violates that — it's an AI loop *inside* the orchestrator. Consolidating onto sessions makes the OSS split cleaner.
-- **No new infra.** No new tables (or one tiny one for `provenance` if we migrate). No new services. No new containers. Just files moving between directories and ~3.5k LOC deleted.
-
-## Out of scope
-
-- Multi-tenant model selection / per-org instruction-author defaults (M1 → M2 territory in [[multi_tenancy]]).
-- A second "operator" or "admin" expert config — out of scope for this consolidation; same architectural shape if we want one later.
-- Code-exec sandbox design — flagged as step 4 direction but deserves its own doc when queued.
-
-## Acceptance criteria (when this work is "done")
-
-1. `config/experts/instruction-author.yaml` exists and produces a chat experience comparable to the current `/builder` for the canonical research-job authoring workflow.
-2. `POST /api/sessions/{thread_id}/promote-to-job` dispatches a valid job from a session workspace's `instructions.md` + `config.yaml` + `description.md`.
-3. `/builder` route in the cockpit redirects to or auto-creates a session with `expert: instruction-author`.
-4. `orchestrator/services/builder_*.py`, `/api/builder/sessions*`, `BUILDER_*` env vars, and the `instruction-builder` cockpit component are deleted.
-5. The README's smoke-test step 1 is updated to reflect the new landing page.
-6. No regression in the canonical workflow as measured against the pre-deprecation UX.
+- **`JobArtifactService` split** is the main scope risk — job-create binds tightly to its signals. Land PR 2 behind a quick manual job-create smoke test (create a job with instructions + config override, no AI assist).
+- **`tavily_search`** sharing — verify before deleting `builder_search.py`.
+- **`'builder'` model-slot** removal must not drop chat-capable models from session pickers (PR 4 smoke test).
+- **Default-landing swap** — confirm whether the shell renders sessions inline or root should `redirectTo: 'sessions'`; pick the one that keeps the sessions sidebar behavior intact.
+- Table **drop vs freeze** — drop assumes negligible historical value; if any pilot data exists, switch to a `provenance`-tagged archive instead.

@@ -270,6 +270,9 @@ data:
 
   # Logging
   LOG_LEVEL: {{ .Values.logLevel | quote }}
+  # JSON structured logs for the aggregation pipeline (Alloy -> Loki); "text"
+  # for human-readable output. See docs/features/centralized_logging.md.
+  LOG_FORMAT: {{ .Values.logFormat | default "text" | quote }}
 
   # License acceptance (enforced at runtime by orchestrator)
   LICENSE_TERMS_ACCEPTED: {{ .Values.license.acceptTerms | quote }}

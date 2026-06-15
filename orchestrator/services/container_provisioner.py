@@ -481,6 +481,41 @@ class ContainerProvisioner:
             )
             return None
 
+    async def workspace_pod_live(self, owner: "WorkspaceOwner") -> Optional[bool]:
+        """Drift probe: is the owner's workspace pod actually alive?
+
+        Returns:
+            ``True``  — pod exists and is ``Running``/``Pending`` (usable or
+                        still coming up).
+            ``False`` — pod is confirmed gone (404) or a dead tombstone
+                        (``Failed``/``Succeeded``/``Unknown`` phase).
+            ``None``  — can't tell: no k8s client, or a transient API error.
+
+        Callers MUST treat ``None`` as "assume live" so a probe blip (or a
+        non-k8s backend) never triggers a false recreate of a healthy
+        workspace.
+        """
+        if not self._k8s_available:
+            return None
+        try:
+            pod = await asyncio.to_thread(
+                self._core_api.read_namespaced_pod,
+                name=owner.pod_name,
+                namespace=self._namespace,
+            )
+        except Exception as e:
+            if getattr(e, "status", None) == 404:
+                return False
+            logger.debug(
+                "workspace_pod_live probe failed for %s %s: %s",
+                owner.kind,
+                owner.id,
+                e,
+            )
+            return None
+        phase = getattr(pod.status, "phase", None)
+        return phase in ("Running", "Pending")
+
     # =========================================================================
     # IDE session pods (on-demand code-server for workspace browsing)
     # =========================================================================

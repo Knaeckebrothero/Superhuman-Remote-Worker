@@ -303,8 +303,9 @@ PDFs, assert no `COMPACTING` banner and a completed turn.)
 a whole `AgentConfig` rather than a `ContextConfig`; absent field → flat
 estimation, never a constructor crash.
 
-**Open / biased approximations (documented, safe because the trigger re-anchors on
-the real `input_tokens` every turn):**
+**Open / biased approximations** — now tracked as a backlog in
+`docs/features/multimodal_image_cost_optimization.md` (all documented, safe because
+the trigger re-anchors on the real `input_tokens` every turn):
 - OpenAI full-model patch→token multiplier is unpublished → using `1.0`; the
   biased-high budget (10000) covers it.
 - `o4-mini` is actually patch-based but inherits the `o-series` tile config

@@ -27,12 +27,25 @@ flat token constant with a **dimension-aware estimator**, and adds a
 **prevention layer (downscale + selective rasterization)** that the research
 flags as the single highest-leverage change.
 
-**Status:** Diagnosed, root-caused (live DB + code, both verified), solution
-designed. Nothing implemented yet. This is the **multimodal sibling of
-[[session_silent_failure_audit]] #5/#6/#7** (the text-PDF case): #6's
-keep-window elision shipped for `ToolMessage` text but its filter **excludes**
-the image-bearing `HumanMessage`s, so images slip through. Out of scope of
-[[context_summarization_rework]] §4.7 as written.
+**Status:** ✅ **RESOLVED — shipped (S1–S4) + live-verified 2026-06-14.** The fix
+shipped as the four-slice design in **`docs/done/context_token_accounting.md`**
+(S1 honest counting + provider-`input_tokens` anchor · S2 don't-rasterize-text-pages
+gate · S3 image-safe summarizer/elision · S4 per-family estimator), verified
+against real post-fix session `0ed8c0e0` (gpt-5.5, 10 multi-page PDFs → no
+compaction, turn completed). Runbook: `docs/tests/context_token_accounting_verification.md`.
+
+**This doc is the historical root-cause inventory; the as-built differs from the
+A/B/C/0/Layer-0 framing below.** Notably the **Layer-B per-call
+`keep_recent_images` eviction was NOT shipped** — it was replaced by
+**compaction-time-only** image elision (S3) to avoid prompt-cache thrash. Deferred
+cost/estimator knobs (per-family render DPI, downscaling, multiplier/Gemini-Vertex
+calibration) now live in **`docs/features/multimodal_image_cost_optimization.md`**.
+Still-separate issues: the **browser-screenshot** path and **phantom user-message**
+role attribution.
+
+Still the **multimodal sibling of [[session_silent_failure_audit]] #5/#6/#7** (the
+text-PDF case): #6's keep-window elision shipped for `ToolMessage` text but its
+filter **excluded** the image-bearing `HumanMessage`s, so images slipped through.
 
 ---
 
