@@ -572,6 +572,37 @@ class TestQueryVmStatus:
         result = await bridge.query_vm_status("test-job-789")
         assert result is None
 
+    @pytest.mark.asyncio
+    async def test_query_rejects_jetstream_ack(self, bridge, mock_nc):
+        # If a JetStream stream's subjects ever cover vm.lifecycle.get.*, the
+        # request inbox receives the stream's publish-ack instead of the
+        # controller reply. That ack must never be surfaced as VM status.
+        # See docs/issues/vm_live_status_query_shadowed_by_jetstream_stream.md
+        ack = MagicMock()
+        ack.data = json.dumps({"stream": "VM_EVENTS", "seq": 42}).encode()
+        mock_nc.request = AsyncMock(return_value=ack)
+
+        result = await bridge.query_vm_status("test-job-789")
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_query_allows_reply_with_seq_field(self, bridge, mock_nc):
+        # A genuine controller reply carrying job_id is NOT an ack even if it
+        # happens to include stream/seq-like keys — the guard keys on the
+        # absence of job_id.
+        response_data = {
+            "job_id": "test-job-789",
+            "vm_name": "vm-test-job-789",
+            "stream": "ignored",
+            "seq": 7,
+        }
+        response_msg = MagicMock()
+        response_msg.data = json.dumps(response_data).encode()
+        mock_nc.request = AsyncMock(return_value=response_msg)
+
+        result = await bridge.query_vm_status("test-job-789")
+        assert result == response_data
+
 
 # =============================================================================
 # Test: send_control()

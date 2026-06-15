@@ -346,70 +346,22 @@ class ContainerProvisioner:
             pvc_name = f"pvc-ws-thread-{owner.id[:12]}"
         return await self._delete_pvc(pvc_name)
 
-    async def release_workspace(self, job_id: str) -> bool:
-        """Snapshot a job workspace to S3, then delete the pod.
+    async def release_workspace(self, owner: "WorkspaceOwner") -> bool:
+        """Snapshot a workspace to S3, then delete the pod (and its PVC).
 
-        K8s pods use emptyDir so data dies with the pod. Snapshotting before
-        deletion enables resume support (a new pod can restore from S3).
-
-        Returns:
-            True if deletion succeeded (snapshot failure is non-fatal).
-        """
-        owner = WorkspaceOwner.job(job_id)
-        # Get pod IP for SSH-based snapshot
-        status = await self.get_workspace_status(owner)
-        if (
-            self._snapshot_service
-            and self._snapshot_service.is_available
-            and status
-            and status.get("pod_ip")
-            and status.get("ready")
-        ):
-            try:
-                await self._snapshot_service.capture_vm_snapshot(
-                    job_id=job_id,
-                    ssh_host=status["pod_ip"],
-                    ssh_port=30022,
-                    source_type="pod",
-                )
-                logger.info(
-                    "Workspace snapshot captured for job %s before release", job_id
-                )
-            except Exception:
-                logger.exception(
-                    "Workspace snapshot failed for job %s — deleting anyway", job_id
-                )
-
-        deleted = await self.delete_workspace(owner)
-        await self.delete_workspace_pvc(owner)
-        return deleted
-
-    async def release_thread_workspace(self, thread_id: str) -> bool:
-        """Snapshot a thread workspace to S3, then delete the pod.
+        Owner-keyed: serves both jobs and sessions. K8s pods use emptyDir, so
+        data dies with the pod — snapshotting first enables resume (a fresh pod
+        restores from S3). Snapshot failure is non-fatal.
 
         Returns:
-            True if deletion succeeded (snapshot failure is non-fatal).
+            True if deletion succeeded.
         """
         if not self._k8s_available:
             return False
 
-        owner = WorkspaceOwner.session(thread_id)
-        pod_name = owner.pod_name
-
-        # Get pod IP for snapshot
-        try:
-            pod = await asyncio.to_thread(
-                self._core_api.read_namespaced_pod,
-                name=pod_name,
-                namespace=self._namespace,
-            )
-            pod_ip = pod.status.pod_ip
-            ready = pod.status.container_statuses and all(
-                cs.ready for cs in pod.status.container_statuses
-            )
-        except Exception:
-            pod_ip = None
-            ready = False
+        status = await self.get_workspace_status(owner)
+        pod_ip = status.get("pod_ip") if status else None
+        ready = status.get("ready") if status else False
 
         if (
             self._snapshot_service
@@ -419,20 +371,22 @@ class ContainerProvisioner:
         ):
             try:
                 await self._snapshot_service.capture_vm_snapshot(
-                    job_id=thread_id,
+                    job_id=owner.id,
                     ssh_host=pod_ip,
                     ssh_port=30022,
                     source_type="pod",
-                    entity_type="threads",
+                    entity_type="threads" if owner.kind == "session" else "jobs",
                 )
                 logger.info(
-                    "Workspace snapshot captured for thread %s before release",
-                    thread_id,
+                    "Workspace snapshot captured for %s %s before release",
+                    owner.kind,
+                    owner.id,
                 )
             except Exception:
                 logger.exception(
-                    "Workspace snapshot failed for thread %s — deleting anyway",
-                    thread_id,
+                    "Workspace snapshot failed for %s %s — deleting anyway",
+                    owner.kind,
+                    owner.id,
                 )
 
         deleted = await self.delete_workspace(owner)

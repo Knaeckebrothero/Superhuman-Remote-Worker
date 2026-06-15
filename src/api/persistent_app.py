@@ -328,6 +328,11 @@ def _ensure_persistent_loop_started(
             on_usage=_loop_on_usage,
             hard_interrupt_event=_hard_interrupt_event,
         )
+        # Tag the loop task — and the turn/aux tasks it spawns, which copy this
+        # context at creation — with thread_id for log correlation.
+        from ..core.logging_config import bind_log_context, reset_log_context
+
+        _ctx_token = bind_log_context(thread_id=_thread_id)
         _loop_task = asyncio.create_task(
             run_persistent_loop(
                 llm_with_tools=_session.llm_with_tools,
@@ -362,6 +367,7 @@ def _ensure_persistent_loop_started(
             _thread_id,
             source,
         )
+        reset_log_context(_ctx_token)
         return True
 
     if client_id:

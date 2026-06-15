@@ -1,5 +1,5 @@
 """Session-side workspace provisioning + reconcile — the dispatcher-equivalent
-for persistent sessions. See docs/features/unified_workspace_provisioning.md.
+for persistent sessions. See docs/done/unified_workspace_provisioning.md.
 
 Jobs get workspace reconcile from the main dispatcher loop; sessions never did,
 so a workspace wedged at 'failed'/missing for an active session never recovered.

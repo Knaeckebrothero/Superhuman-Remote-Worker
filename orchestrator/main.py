@@ -37,12 +37,14 @@ if os.environ.get("LICENSE_TERMS_ACCEPTED", "").strip().lower() != "true":
 # include it). See docs/features/centralized_logging.md.
 try:
     from logging_config import (  # noqa: E402
+        CorrelationIdMiddleware,
         bind_log_context,
         configure_logging,
         reset_log_context,
     )
 except ModuleNotFoundError:  # `uvicorn orchestrator.main:app` vs flattened image
     from orchestrator.logging_config import (  # noqa: E402
+        CorrelationIdMiddleware,
         bind_log_context,
         configure_logging,
         reset_log_context,
@@ -67,7 +69,7 @@ configure_logging(
 from datetime import date, datetime, timedelta, timezone  # noqa: E402
 from decimal import Decimal  # noqa: E402
 from typing import Any, Literal, Optional  # noqa: E402
-from uuid import UUID, uuid4  # noqa: E402
+from uuid import UUID  # noqa: E402
 
 import asyncpg  # noqa: E402
 import yaml  # noqa: E402
@@ -2208,7 +2210,9 @@ async def _archive_and_cleanup_workspace(
                 await docker_provisioner.release_thread_workspace(entity_id)
                 actions.append("docker thread workspace released")
             elif container_provisioner.is_available:
-                await container_provisioner.release_thread_workspace(entity_id)
+                await container_provisioner.release_workspace(
+                    WorkspaceOwner.session(entity_id)
+                )
                 actions.append("k8s thread workspace released")
 
         # VM cleanup (snapshot + delete)
@@ -2241,7 +2245,9 @@ async def _archive_and_cleanup_workspace(
                 await docker_provisioner.release_workspace(entity_id)
                 actions.append("docker workspace released")
             else:
-                await container_provisioner.release_workspace(entity_id)
+                await container_provisioner.release_workspace(
+                    WorkspaceOwner.job(entity_id)
+                )
                 actions.append("k8s workspace released")
 
     return actions
@@ -4348,32 +4354,31 @@ async def request_logging_middleware(request: Request, call_next):
 
     method = request.method
     start = time.perf_counter()
-    # request_id tags this request's access-log line. NOTE: BaseHTTPMiddleware
-    # runs the downstream app in a separate task, so this does NOT propagate to
-    # route handlers — full request-scoped propagation is a later ASGI-middleware
-    # step (see docs/features/centralized_logging.md).
-    _log_token = bind_log_context(request_id=uuid4().hex[:12])
+    # request_id is bound upstream by CorrelationIdMiddleware (outermost), so it
+    # tags both this access line and the route handler's logs.
     try:
-        try:
-            response = await call_next(request)
-        except Exception:
-            elapsed = (time.perf_counter() - start) * 1000
-            logger.exception(
-                "%s %s 500 (%dms) — unhandled exception", method, path, elapsed
-            )
-            return JSONResponse(
-                status_code=500, content={"detail": "Internal server error"}
-            )
-
+        response = await call_next(request)
+    except Exception:
         elapsed = (time.perf_counter() - start) * 1000
-        status = response.status_code
-        if status >= 500:
-            logger.warning("%s %s %d (%dms)", method, path, status, elapsed)
-        else:
-            logger.info("%s %s %d (%dms)", method, path, status, elapsed)
-        return response
-    finally:
-        reset_log_context(_log_token)
+        logger.exception(
+            "%s %s 500 (%dms) — unhandled exception", method, path, elapsed
+        )
+        return JSONResponse(
+            status_code=500, content={"detail": "Internal server error"}
+        )
+
+    elapsed = (time.perf_counter() - start) * 1000
+    status = response.status_code
+    if status >= 500:
+        logger.warning("%s %s %d (%dms)", method, path, status, elapsed)
+    else:
+        logger.info("%s %s %d (%dms)", method, path, status, elapsed)
+    return response
+
+
+# request_id correlation — added last so it is OUTERMOST (wraps the access-log
+# middleware above). See CorrelationIdMiddleware in logging_config.
+app.add_middleware(CorrelationIdMiddleware)
 
 
 # Include routers
