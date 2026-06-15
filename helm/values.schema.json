@@ -1,0 +1,88 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "title": "Superhuman Remote Worker Helm values",
+  "description": "Phase 1 structural validation: types and enums for high-signal fields. Intentionally permissive (additionalProperties allowed) so forward-compatible keys and existing values overlays are not rejected. Cross-field semantics (internal/external requirements, license acceptance, nats mutual-exclusion, neo4j enterprise license) stay in template `required`/`fail` guards.",
+  "type": "object",
+  "required": ["license", "global"],
+  "properties": {
+    "license": {
+      "type": "object",
+      "properties": {
+        "acceptTerms": { "type": "boolean" }
+      }
+    },
+    "global": {
+      "type": "object",
+      "properties": {
+        "domain": { "type": "string" }
+      }
+    },
+    "externalSecrets": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" }
+      }
+    },
+    "secrets": {
+      "type": "object",
+      "properties": {
+        "create": { "type": "boolean" },
+        "existingSecret": { "type": "string" }
+      }
+    },
+    "mcp": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" }
+      }
+    },
+    "opencloud": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" }
+      }
+    },
+    "nextcloud": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" }
+      }
+    },
+    "ingress": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "tls": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" }
+          }
+        }
+      }
+    },
+    "nats": {
+      "type": "object",
+      "properties": {
+        "internal": { "type": "boolean" }
+      }
+    },
+    "databases": {
+      "type": "object",
+      "properties": {
+        "neo4j": {
+          "type": "object",
+          "properties": {
+            "edition": { "type": "string", "enum": ["community", "enterprise"] }
+          }
+        }
+      }
+    },
+    "vmController": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "transport": { "type": "string", "enum": ["http", "nats", "both"] }
+      }
+    }
+  }
+}

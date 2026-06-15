@@ -593,7 +593,7 @@ Insert into the `PostgresDB` class (uses the existing `fetch`/`fetchrow`/`execut
         )
         blockers += [{"type": "thread", "id": str(t["id"]), "label": t["title"]} for t in threads]
         jobs = await self.fetch(
-            "SELECT id, description FROM jobs WHERE expert_id = $1 AND status IN ('created', 'queued')",
+            "SELECT id, description FROM jobs WHERE expert_id = $1 AND status IN ('created', 'waiting')",
             eid,
         )
         blockers += [{"type": "job", "id": str(j["id"]), "label": j["description"][:80]} for j in jobs]

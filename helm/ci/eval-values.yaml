@@ -1,0 +1,50 @@
+# Eval / single-node profile — chart-created secrets (secrets mode 2).
+# Exercises the `secrets.create=true` path that test-values (ESO) and
+# customer-external (existing Secret) do not cover, with the minimal footprint
+# a mini-PC k3s install would use. The chart auto-generates APP_ENCRYPTION_KEY
+# when it is absent from secrets.values (see templates/secret.yaml), so no
+# secret keys are required just to render. NOT a production config — chart-
+# created secrets are for eval only.
+license:
+  acceptTerms: true
+
+global:
+  domain: "eval.example.com"
+
+# Mode 2: chart creates the runtime Secret from these values (dev/eval only).
+# Empty is fine for a render test; a real eval install adds DB/provider creds.
+secrets:
+  create: true
+  values: {}
+
+# Keep the footprint small: optional heavy components off.
+databases:
+  neo4j:
+    enabled: false
+
+opencloud:
+  enabled: false
+nextcloud:
+  enabled: false
+
+mcp:
+  enabled: true
+
+vmController:
+  enabled: false
+
+# No home-cluster admin UIs / mesh on a minimal box.
+pgadmin:
+  enabled: false
+mongoExpress:
+  enabled: false
+dozzle:
+  enabled: false
+codexProxy:
+  enabled: false
+
+ingress:
+  enabled: true
+  className: traefik
+  tls:
+    enabled: false

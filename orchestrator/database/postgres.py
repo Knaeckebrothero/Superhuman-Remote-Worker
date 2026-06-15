@@ -5331,9 +5331,13 @@ class PostgresDB:
             {"type": "thread", "id": str(t["id"]), "label": t["title"]}
             for t in threads
         ]
+        # 'created'/'waiting' = truly unstarted (no resolved_config frozen yet) →
+        # block. Running/review/paused jobs have a frozen config + ON DELETE SET
+        # NULL covers history, so they never block (decision 15). NB: there is no
+        # 'queued' status in this schema — the pending-for-agent state is 'waiting'.
         jobs = await self.fetch(
             "SELECT id, description FROM jobs "
-            "WHERE expert_id = $1 AND status IN ('created', 'queued')",
+            "WHERE expert_id = $1 AND status IN ('created', 'waiting')",
             UUID(str(expert_id)),
         )
         blockers += [

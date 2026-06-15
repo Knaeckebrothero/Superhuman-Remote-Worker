@@ -431,6 +431,7 @@ async def _process_orchestrator_job(
     context: Optional[Dict[str, Any]] = None,
     instructions: Optional[str] = None,
     config_name: Optional[str] = None,
+    expert_id: Optional[str] = None,
     config_override: Optional[Dict[str, Any]] = None,
     git_remote_url: Optional[str] = None,
     datasources: Optional[list] = None,
@@ -487,6 +488,8 @@ async def _process_orchestrator_job(
             metadata["instructions"] = instructions
         if config_name and config_name != "default":
             metadata["config_name"] = config_name
+        if expert_id:
+            metadata["expert_id"] = expert_id
         if config_override:
             metadata["config_override"] = config_override
         if git_remote_url:
@@ -772,6 +775,7 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
                 context=request.context,
                 instructions=request.instructions,
                 config_name=request.config_name,
+                expert_id=request.expert_id,
                 config_override=request.config_override,
                 git_remote_url=request.git_remote_url,
                 datasources=request.datasources,
