@@ -116,3 +116,59 @@ class TestRedaction:
             _record("Authorization: Bearer eyJabc.def.ghijklmnop")
         )
         json.loads(line)  # must not raise
+
+
+class TestCorrelationIdMiddleware:
+    """Orchestrator-only ASGI middleware — request_id for the whole request."""
+
+    async def _request_id_seen_downstream(self, headers):
+        seen = {}
+
+        async def downstream(scope, receive, send):
+            # Must be visible to the downstream app (i.e. route handlers).
+            seen["request_id"] = orch_log._log_context.get().get("request_id")
+
+        mw = orch_log.CorrelationIdMiddleware(downstream)
+
+        async def receive():
+            return {"type": "http.request"}
+
+        async def send(_message):
+            return None
+
+        await mw({"type": "http", "headers": headers}, receive, send)
+        return seen["request_id"]
+
+    @pytest.mark.asyncio
+    async def test_honors_inbound_request_id(self):
+        rid = await self._request_id_seen_downstream(
+            [(b"x-request-id", b"trace-abc-123")]
+        )
+        assert rid == "trace-abc-123"
+        # bound only for the request — cleared afterwards
+        assert "request_id" not in orch_log._log_context.get()
+
+    @pytest.mark.asyncio
+    async def test_generates_when_absent(self):
+        rid = await self._request_id_seen_downstream([])
+        assert rid and len(rid) == 12
+
+    @pytest.mark.asyncio
+    async def test_sanitizes_hostile_request_id(self):
+        rid = await self._request_id_seen_downstream(
+            [(b"x-request-id", b'bad\nid"<script>')]
+        )
+        assert rid is not None
+        for bad in ("\n", '"', "<", ">"):
+            assert bad not in rid
+
+    @pytest.mark.asyncio
+    async def test_non_http_scope_passes_through(self):
+        called = {}
+
+        async def downstream(scope, receive, send):
+            called["ok"] = True
+
+        mw = orch_log.CorrelationIdMiddleware(downstream)
+        await mw({"type": "websocket"}, None, None)
+        assert called["ok"]

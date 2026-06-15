@@ -349,7 +349,28 @@ class NatsBridge:
                 json.dumps(payload).encode(),
                 timeout=timeout,
             )
-            return json.loads(response.data.decode())
+            data = json.loads(response.data.decode())
+            # Defensive guard: if a JetStream stream's subject filter ever
+            # covers this request/reply subject, the request inbox receives the
+            # stream's publish-ack ({"stream": ..., "seq": ...}) — which races
+            # ahead of (and beats) the VM controller's real reply. Never surface
+            # that ack as VM status; treat it as no response. See
+            # docs/issues/vm_live_status_query_shadowed_by_jetstream_stream.md
+            if (
+                isinstance(data, dict)
+                and "stream" in data
+                and "seq" in data
+                and "job_id" not in data
+            ):
+                logger.warning(
+                    "vm.lifecycle.get for job %s received a JetStream ack (%s) "
+                    "instead of a controller reply — a stream is shadowing the "
+                    "request subject; treating as no response",
+                    job_id,
+                    data,
+                )
+                return None
+            return data
         except Exception as e:
             logger.debug("VM status query failed for job %s: %s", job_id, e)
             return None

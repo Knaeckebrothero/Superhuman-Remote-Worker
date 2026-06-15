@@ -1,6 +1,6 @@
 ---
 title: Unified Workspace Provisioning (jobs + sessions)
-status: Design proposal — 2026-05-27
+status: Implemented + k3d-verified — 2026-06-15
 related:
   - "[[unified_instance_lifecycle]]"
   - "[[headless_persistent_sessions]]"
@@ -31,8 +31,9 @@ re-provisions workspaces; sessions never got the equivalent.
 exit for a *dead* workspace (the `WorkspaceUnavailableError` half of §D) have
 shipped and are k3d-verified, and `/prepare` now also calls
 `ensure_session_workspace` — see `[[session_resume_dead_workspace_drift]]` (now
-in `docs/done/`). The only rollout item still open is step 4 (remove the
-back-compat shims), so this design stays in `features/`.
+in `docs/done/`). Step 4 (remove the back-compat shims) is done too —
+`release_workspace` is now owner-keyed and the thread-CRUD shims are gone — so
+this design is fully realized and archived here in `docs/done/`.
 
 ## Problem
 
@@ -209,7 +210,10 @@ leave `main.py` for testable service modules; `main.py` keeps only wiring.
 3. **Wire sessions + safety-net (the fix).** `session_provisioner` event hooks
    + periodic reconcile; replace suspended-only gates; make the agent exit
    gracefully and rebind. This is the step that closes the gap.
-4. **Remove shims** once all call sites use the owner API.
+4. **Remove shims** once all call sites use the owner API. ✅ Done 2026-06-15:
+   `release_workspace` collapsed to one owner-keyed method (was
+   `release_workspace(job_id)` + `release_thread_workspace(thread_id)`); the
+   thread-CRUD shims (`create_thread_workspace` etc.) were already removed.
 
 ## Testing
 

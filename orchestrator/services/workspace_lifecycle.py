@@ -1,6 +1,6 @@
 """Owner-keyed workspace lifecycle: one provisioning path for jobs and sessions.
 
-See docs/features/unified_workspace_provisioning.md.
+See docs/done/unified_workspace_provisioning.md.
 """
 
 from __future__ import annotations

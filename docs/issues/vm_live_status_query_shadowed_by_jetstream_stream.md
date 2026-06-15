@@ -9,7 +9,64 @@ tags:
 
 # `GET /api/vms/{id}?live=true` returns a JetStream PubAck instead of VM status
 
-**Status**: Backlog — confirmed, **low severity / latent** (no UI consumer today). Filed 2026-06-15; reproduced live on dev 2026-06-13.
+**Status**: **Resolved (immediate fix shipped 2026-06-15)** — guard + stream-subject narrowing applied and verified live; **low severity / latent** (no UI consumer today). Filed 2026-06-15; reproduced live on dev 2026-06-13. The deeper architectural improvement (event-driven VM status) is tracked separately in [`docs/features/event_driven_vm_status.md`](../features/event_driven_vm_status.md).
+
+## Resolution (2026-06-15)
+
+Shipped the **C + A** combination (guard + narrow the stream), per the multi-agent
+investigation below — *not* the B subject-rename, because the vm-controller is a
+separate chart + Fleet GitRepo on a different cluster with prod-private lockstep,
+so an infra/orchestrator-only fix is far lower-risk for a latent bug.
+
+- **C (guard), orchestrator** — `nats_bridge.query_vm_status` now rejects
+  ack-shaped replies (`stream`+`seq`, no `job_id`) → returns `None` so the
+  endpoint reports the honest `live_error` instead of a PubAck. Unit tests added
+  (`tests/test_nats_bridge.py::TestQueryVmStatus::test_query_rejects_jetstream_ack`
+  + `test_query_allows_reply_with_seq_field`).
+- **A (narrow stream), live hub** — `nats stream edit VM_EVENTS --subjects
+  "vm.lifecycle.create.>,vm.lifecycle.delete.>,vm.lifecycle.status.>"` applied to
+  the shared `nats` hub (drops the `vm.lifecycle.get.*` coverage **and** the dead
+  `vm.status.>`). Fixes dev **and** prod-private at once (shared stream).
+- **A (sources of truth)** — `helm/templates/nats/streams-job.yaml` narrowed +
+  switched to an `add || nats stream edit -f` upsert (so subject changes actually
+  apply on upgrade — the gotcha #2 landmine); HomeLab
+  `deployments_managed/nats/README.md` updated with the narrowed subjects + a
+  warning never to use the `vm.lifecycle.>` wildcard.
+
+**Verified live (same probe that failed before):** `vm.lifecycle.get.srw-dev`
+now returns the controller's real reply
+(`{vm_name, ready, phase:"WaitingForVolumeBinding", created:true}`) on create and
+the honest `404 / NotFound` after delete — no more `{stream, seq}`. Create→delete
+cycle still round-trips clean.
+
+**Deferred to the follow-up doc:** B's `vm.rpc.*` namespace convention (lands for
+free when the event-driven watcher touches the controller) and making the
+now-unconsumed `VM_EVENTS` stream load-bearing.
+
+## Multi-agent research findings (2026-06-15)
+
+A four-agent investigation (codebase audit + NATS best-practices + comparative
+architecture + design) established:
+
+- **This is documented NATS behavior, not a NATS bug.** A stream replies to a
+  `request()` on a covered subject with a storage PubAck *by design* ("mandatory
+  when archiving messages which have a reply subject set"); the hub-local ack
+  beats a remote leaf responder. So mixing core request/reply with
+  stream-covered subjects is the canonical footgun.
+- **`vm.lifecycle.get` is the *only* collision in the system.** The codebase has
+  exactly two request/reply subjects: this one, and `sudo.request.*` — and no
+  stream covers `sudo.request.*`, so it's safe. Everything else is publish/push.
+- **All three JetStream streams are unconsumed** (no consumers, no
+  pull-subscribe; every consumer is a *core* push sub). `JOB_ASSIGNMENTS` has no
+  producer at all; `AGENT_HEARTBEATS` captures nothing (worker heartbeats are
+  HTTP, VM heartbeats are 5-token); `vm.status.>` had no producer. So `VM_EVENTS`
+  cost us nothing today *except* this bug → narrowing it is zero-risk.
+- **`no_ack: true` was rejected.** It would suppress the PubAck in one line, but
+  it's stream-wide and sacrifices publish-confirmation for every event — a
+  correct-but-lossy stopgap, not the right fix.
+- **Best practice = structural subject segregation** (keep RPC out of an event
+  stream's wildcard), and for *status specifically*, push events + a materialized
+  view rather than synchronous cross-leaf request/reply. That's the follow-up.
 
 ## Summary
 
@@ -149,10 +206,11 @@ controller" instead of surfacing a PubAck. Does not restore function on its own
 (the ack always wins the race), but guarantees we never hand a JetStream ack to
 a caller as VM status.
 
-**Recommendation**: given low severity and dev pragmatism — **C now** (trivial,
-stops garbage forever) + **A when convenient** (one `nats stream edit` restores
-real function and clears the queries-as-events waste). **B** if we want the
-separation enforced structurally rather than by config.
+**Recommendation** (✅ actioned 2026-06-15 — see Resolution above): **C + A**.
+C (trivial, stops garbage forever) + A (one `nats stream edit` restores real
+function and clears the queries-as-events waste). **B** was *not* taken
+standalone — the `vm.rpc.*` namespace convention is deferred into the
+event-driven follow-up, where the controller is touched anyway.
 
 ## Acceptance
 
@@ -167,7 +225,13 @@ separation enforced structurally rather than by config.
 
 ## Notes
 
-Sibling concern: `helm/templates/nats/streams-job.yaml` documents itself as
-idempotent but isn't for config changes — worth fixing independently of this bug
-since it affects all three streams (`VM_EVENTS`, `AGENT_HEARTBEATS`,
+Sibling concern (✅ fixed here): `helm/templates/nats/streams-job.yaml` documented
+itself as idempotent but wasn't for config changes — now uses an `add || nats
+stream edit -f` upsert for all three streams (`VM_EVENTS`, `AGENT_HEARTBEATS`,
 `JOB_ASSIGNMENTS`).
+
+Follow-up: the underlying reason `?live=true` exists is that the controller has
+no KubeVirt phase watcher, so the orchestrator's stored VM status is stale
+between create and delete. The event-driven redesign that fixes that (and makes
+the unconsumed `VM_EVENTS` stream load-bearing) is its own doc:
+[`docs/features/event_driven_vm_status.md`](../features/event_driven_vm_status.md).
