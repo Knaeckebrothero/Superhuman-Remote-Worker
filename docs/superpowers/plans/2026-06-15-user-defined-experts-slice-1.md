@@ -152,7 +152,9 @@ def test_project_experts_junction_and_one_default_per_type():
 def test_jobs_expert_id_set_null_on_delete():
     sql = MIGRATION.read_text()
     # History is safe: resolved_config is frozen per job (decision 15).
-    assert "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS expert_id UUID REFERENCES experts(id) ON DELETE SET NULL" in sql
+    assert "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS expert_id UUID" in sql
+    assert "REFERENCES experts(id) ON DELETE SET NULL NOT VALID" in sql
+    assert "VALIDATE CONSTRAINT jobs_expert_id_fkey" in sql
 
 
 def test_transactional_header_and_wrapping():
@@ -227,7 +229,14 @@ CREATE TABLE IF NOT EXISTS project_experts (
 CREATE UNIQUE INDEX IF NOT EXISTS uq_project_default_expert
     ON project_experts (project_id, default_for) WHERE default_for IS NOT NULL;
 
-ALTER TABLE jobs ADD COLUMN IF NOT EXISTS expert_id UUID REFERENCES experts(id) ON DELETE SET NULL;
+-- jobs.expert_id: two-phase FK (NOT VALID then VALIDATE) per docs/db_migration.md.
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS expert_id UUID;
+DO $$ BEGIN
+    ALTER TABLE jobs ADD CONSTRAINT jobs_expert_id_fkey
+        FOREIGN KEY (expert_id) REFERENCES experts(id) ON DELETE SET NULL NOT VALID;
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+ALTER TABLE jobs VALIDATE CONSTRAINT jobs_expert_id_fkey;
 
 COMMENT ON TABLE experts IS
     'DB-backed user/admin experts (overlay over bundled config/experts/). '
