@@ -1812,6 +1812,8 @@
       "assignFailed": "Failed to assign job",
       "assignError": "Error assigning job"
     },
+    "auxDegraded": "Aux degraded",
+    "auxDegradedTip": "Auxiliary model degraded",
     "time": {
       "secondsAgo": "{{n}}s ago",
       "minutesAgo": "{{n}}m ago",

@@ -958,6 +958,12 @@ export interface Agent {
   registered_at: string;
   last_heartbeat: string;
   metadata?: Record<string, unknown>;
+  /**
+   * Auxiliary-model health from the latest heartbeat (aux Phase 2). True while
+   * the agent's auxiliary LLM (memory extraction/curation, session titles) is
+   * sustained-failing. Compact failure detail lives in `metadata.aux`.
+   */
+  aux_degraded?: boolean;
 }
 
 // =============================================================================

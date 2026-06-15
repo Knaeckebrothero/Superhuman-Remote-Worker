@@ -1143,11 +1143,27 @@ class AgentProvisioner:
                     "httpGet": {"path": "/health", "port": 8001},
                     "initialDelaySeconds": 60,
                     "periodSeconds": 30,
+                    # /health is served on the agent's asyncio loop, so a GC
+                    # pause or brief sync work blows the kubelet's default 1s
+                    # timeout; with the default 3-failure budget that SIGKILLs a
+                    # healthy-but-busy pod (observed on srw-agent-j-a7d8f8e0:
+                    # "/health context deadline exceeded"). Give transient
+                    # stalls room — 5s timeout x 5 failures = ~150s before kill.
+                    # A genuinely dead pod is still caught by heartbeat/offline
+                    # detection (3 min) and the reaper.
+                    "timeoutSeconds": 5,
+                    "failureThreshold": 5,
                 },
                 "readinessProbe": {
                     "httpGet": {"path": "/ready", "port": 8001},
                     "initialDelaySeconds": 30,
                     "periodSeconds": 10,
+                    # Same event-loop tax as the liveness probe above: the 1s
+                    # default trips on a transient stall and drops the pod from
+                    # the Service endpoints (a WS blip for the user). Also seen
+                    # on srw-agent-j-a7d8f8e0. failureThreshold stays at the
+                    # default 3 so a genuinely not-ready pod still flips fast.
+                    "timeoutSeconds": 5,
                 },
                 "startupProbe": {
                     "httpGet": {"path": "/health", "port": 8001},

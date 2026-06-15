@@ -79,3 +79,46 @@ class TestAuxHealth:
         assert t["last_error_type"] == "ValueError"
         assert "bad json" in t["last_error"]
         assert t["last_failure_at"] is not None
+
+
+class TestAuxHeartbeatSummary:
+    """The compact projection carried on the agent → orchestrator heartbeat.
+
+    Drives the persisted ``agents.aux_degraded`` flag + the admin badge tooltip
+    (aux Phase 2). Always includes ``degraded`` so a recovered agent clears it.
+    """
+
+    def test_healthy_summary(self):
+        h = AuxHealth(model="gemma-4-moe")
+        assert h.heartbeat_summary() == {
+            "degraded": False,
+            "consecutive_failures": 0,
+            "model": "gemma-4-moe",
+            "failing_tasks": {},
+        }
+
+    def test_degraded_lists_only_failing_tasks(self):
+        h = AuxHealth(model="gemma-4-moe")
+        h.record_success("title_generation")  # healthy task — must not appear
+        for _ in range(3):
+            h.record_failure("memory_extraction", ConnectionError("503"))
+        s = h.heartbeat_summary()
+        assert s["degraded"] is True
+        assert s["consecutive_failures"] == 3
+        assert s["model"] == "gemma-4-moe"
+        assert set(s["failing_tasks"]) == {"memory_extraction"}
+        assert s["failing_tasks"]["memory_extraction"] == {
+            "consecutive_failures": 3,
+            "last_error_type": "ConnectionError",
+        }
+
+    def test_recovery_clears_failing_tasks(self):
+        h = AuxHealth()
+        for _ in range(3):
+            h.record_failure("memory_extraction", ConnectionError())
+        assert h.heartbeat_summary()["degraded"] is True
+        h.record_success("memory_extraction")
+        s = h.heartbeat_summary()
+        assert s["degraded"] is False
+        assert s["consecutive_failures"] == 0
+        assert s["failing_tasks"] == {}

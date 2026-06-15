@@ -2084,6 +2084,7 @@ class PostgresDB:
         status: str,
         current_job_id: str | None = None,
         metrics: Dict[str, Any] | None = None,
+        aux_degraded: bool | None = None,
     ) -> Dict[str, Any] | None:
         """Update agent heartbeat and status.
 
@@ -2096,6 +2097,10 @@ class PostgresDB:
             status: Agent status (booting, ready, working, completed, failed)
             current_job_id: Optional current job UUID
             metrics: Optional metrics dict to merge into metadata
+            aux_degraded: Auxiliary-model health from the heartbeat
+                (metrics.aux.degraded). True/False updates agents.aux_degraded;
+                None leaves the persisted flag untouched (e.g. older agent
+                builds or a not-yet-wired aux LLM). See aux Phase 2.
 
         Returns:
             Dict with previous status (for transition detection) or None if not found
@@ -2152,44 +2157,41 @@ class PostgresDB:
             # at the top of the pool query) and ``_send_session_attach``
             # binds the thread to a pod that's about to disappear — see
             # the 2026-05-24 thread 352144ea regression.
+            # Build the UPDATE dynamically: status / current_job_id /
+            # last_heartbeat always change; the metadata merge,
+            # last_completed_at and aux_degraded are conditional. The local
+            # positional-arg helper keeps the $N indices correct no matter
+            # which optional clauses are present (the previous hand-numbered
+            # two-branch form made adding a column an index-shuffling hazard).
+            params: List[Any] = []
+
+            def _p(value: Any) -> str:
+                params.append(value)
+                return f"${len(params)}"
+
+            status_expr = (
+                "CASE WHEN status = 'draining' THEN 'draining' "
+                "WHEN status = 'offline' THEN 'offline' "
+                f"ELSE {_p(status)} END"
+            )
+            set_clauses = [
+                f"status = {status_expr}",
+                f"current_job_id = {_p(job_uuid)}",
+                "last_heartbeat = CURRENT_TIMESTAMP",
+            ]
             if metrics:
-                result = await conn.execute(
-                    f"""
-                    UPDATE agents
-                    SET status = CASE
-                                   WHEN status = 'draining' THEN 'draining'
-                                   WHEN status = 'offline'  THEN 'offline'
-                                   ELSE $1
-                                 END,
-                        current_job_id = $2,
-                        last_heartbeat = CURRENT_TIMESTAMP,
-                        metadata = metadata || $3::jsonb
-                        {"  , last_completed_at = CURRENT_TIMESTAMP" if set_completed else ""}
-                    WHERE id = $4
-                    """,
-                    status,
-                    job_uuid,
-                    json.dumps(metrics),
-                    uuid_val,
+                set_clauses.append(
+                    f"metadata = metadata || {_p(json.dumps(metrics))}::jsonb"
                 )
-            else:
-                result = await conn.execute(
-                    f"""
-                    UPDATE agents
-                    SET status = CASE
-                                   WHEN status = 'draining' THEN 'draining'
-                                   WHEN status = 'offline'  THEN 'offline'
-                                   ELSE $1
-                                 END,
-                        current_job_id = $2,
-                        last_heartbeat = CURRENT_TIMESTAMP
-                        {"  , last_completed_at = CURRENT_TIMESTAMP" if set_completed else ""}
-                    WHERE id = $3
-                    """,
-                    status,
-                    job_uuid,
-                    uuid_val,
-                )
+            if set_completed:
+                set_clauses.append("last_completed_at = CURRENT_TIMESTAMP")
+            if aux_degraded is not None:
+                set_clauses.append(f"aux_degraded = {_p(aux_degraded)}")
+
+            query = (
+                f"UPDATE agents SET {', '.join(set_clauses)} WHERE id = {_p(uuid_val)}"
+            )
+            result = await conn.execute(query, *params)
 
             if result != "UPDATE 1":
                 return None
@@ -2226,7 +2228,7 @@ class PostgresDB:
                     """
                     SELECT id, config_name, hostname, pod_ip, pod_port, pid,
                            status, current_job_id, registered_at, last_heartbeat,
-                           last_completed_at, metadata, pod_uid
+                           last_completed_at, metadata, pod_uid, aux_degraded
                     FROM agents
                     WHERE status = $1
                     ORDER BY last_heartbeat DESC
@@ -2240,7 +2242,7 @@ class PostgresDB:
                     """
                     SELECT id, config_name, hostname, pod_ip, pod_port, pid,
                            status, current_job_id, registered_at, last_heartbeat,
-                           last_completed_at, metadata, pod_uid
+                           last_completed_at, metadata, pod_uid, aux_degraded
                     FROM agents
                     ORDER BY last_heartbeat DESC
                     LIMIT $1
@@ -2269,7 +2271,8 @@ class PostgresDB:
                 """
                 SELECT id, config_name, hostname, pod_ip, pod_port, pid,
                        status, current_job_id, thread_id,
-                       registered_at, last_heartbeat, metadata, pod_uid
+                       registered_at, last_heartbeat, metadata, pod_uid,
+                       aux_degraded
                 FROM agents
                 WHERE id = $1
                 """,

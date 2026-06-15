@@ -221,6 +221,7 @@ def _get_current_job_id() -> Optional[str]:
 
 def _get_agent_metrics() -> Optional[Dict[str, Any]]:
     """Get agent metrics for heartbeat reporting."""
+    metrics: Dict[str, Any] = {}
     try:
         import psutil
 
@@ -228,17 +229,41 @@ def _get_agent_metrics() -> Optional[Dict[str, Any]]:
         listening = [
             c for c in psutil.net_connections(kind="inet") if c.status == "LISTEN"
         ]
-        return {
-            "memory_mb": process.memory_info().rss / (1024 * 1024),
-            "cpu_percent": process.cpu_percent(),
-            "listening_ports": len(listening),
-            "process_count": len(psutil.pids()),
-        }
+        metrics.update(
+            {
+                "memory_mb": process.memory_info().rss / (1024 * 1024),
+                "cpu_percent": process.cpu_percent(),
+                "listening_ports": len(listening),
+                "process_count": len(psutil.pids()),
+            }
+        )
     except ImportError:
-        # psutil not installed
-        return None
+        pass  # psutil not installed
     except Exception as e:
         logger.debug(f"Failed to collect metrics: {e}")
+
+    # Auxiliary-task health → the orchestrator persists the degraded flag and
+    # surfaces an admin badge (aux Phase 2). Best-effort; never fail heartbeat.
+    aux = _aux_health_for_heartbeat()
+    if aux is not None:
+        metrics["aux"] = aux
+
+    return metrics or None
+
+
+def _aux_health_for_heartbeat() -> Optional[Dict[str, Any]]:
+    """Compact auxiliary-model health for the heartbeat (aux Phase 2).
+
+    Returns None when no auxiliary LLM is wired yet (e.g. booting) so the
+    orchestrator leaves any previously-persisted ``aux_degraded`` untouched
+    rather than clearing it on incomplete information.
+    """
+    aux_llm = getattr(_agent, "_auxiliary_llm", None) if _agent is not None else None
+    if aux_llm is None:
+        return None
+    try:
+        return aux_llm.health.heartbeat_summary()
+    except Exception:
         return None
 
 

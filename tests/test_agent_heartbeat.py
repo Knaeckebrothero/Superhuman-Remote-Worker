@@ -157,6 +157,75 @@ class TestHeartbeatPreservesOffline:
         assert "WHEN status = 'offline'" in sql
 
 
+class TestHeartbeatAuxDegraded:
+    """aux Phase 2: heartbeat persists the auxiliary-model degraded flag from
+    the AuxHealth summary the agent carries in metrics.aux. See
+    docs/issues/surface_silent_aux_failures.md.
+    """
+
+    @pytest.mark.asyncio
+    async def test_true_sets_column(self):
+        db, conn = _make_db_with_mocked_acquire(prev_status="ready")
+        await db.heartbeat(
+            agent_id="00000000-0000-0000-0000-000000000001",
+            status="ready",
+            aux_degraded=True,
+        )
+        sql, *params = conn.execute.call_args[0]
+        assert "aux_degraded = " in sql
+        assert any(p is True for p in params)
+
+    @pytest.mark.asyncio
+    async def test_false_clears_column(self):
+        # A recovered agent reports degraded=False — the column must be
+        # actively set false, not left stale at a previous true.
+        db, conn = _make_db_with_mocked_acquire(prev_status="ready")
+        await db.heartbeat(
+            agent_id="00000000-0000-0000-0000-000000000001",
+            status="ready",
+            aux_degraded=False,
+        )
+        sql, *params = conn.execute.call_args[0]
+        assert "aux_degraded = " in sql
+        assert any(p is False for p in params)
+
+    @pytest.mark.asyncio
+    async def test_none_omits_column(self):
+        # Older agent builds / not-yet-wired aux LLM omit the flag — the
+        # persisted value must be left untouched (no aux_degraded clause).
+        db, conn = _make_db_with_mocked_acquire(prev_status="ready")
+        await db.heartbeat(
+            agent_id="00000000-0000-0000-0000-000000000001",
+            status="ready",
+            aux_degraded=None,
+        )
+        sql = conn.execute.call_args[0][0]
+        assert "aux_degraded" not in sql
+
+    @pytest.mark.asyncio
+    async def test_param_indices_aligned_with_all_clauses_present(self):
+        # The dynamic param builder must keep $N indices contiguous and
+        # matched to positional args when the metadata merge, the
+        # working→ready last_completed_at clause, and aux_degraded all fire.
+        # This is the index-shuffling hazard the builder replaced.
+        import re
+
+        db, conn = _make_db_with_mocked_acquire(prev_status="working")
+        await db.heartbeat(
+            agent_id="00000000-0000-0000-0000-000000000001",
+            status="ready",
+            current_job_id="11111111-1111-1111-1111-111111111111",
+            metrics={"aux": {"degraded": True}},
+            aux_degraded=True,
+        )
+        sql, *params = conn.execute.call_args[0]
+        placeholders = {int(m) for m in re.findall(r"\$(\d+)", sql)}
+        assert placeholders == set(range(1, len(params) + 1))
+        assert "metadata = metadata ||" in sql
+        assert "last_completed_at = CURRENT_TIMESTAMP" in sql
+        assert "aux_degraded = " in sql
+
+
 class TestHeartbeatReturnsIntents:
     """Phase 1c: heartbeat result includes orchestrator-set intents so
     the FastAPI handler can surface them to the agent in the response."""
