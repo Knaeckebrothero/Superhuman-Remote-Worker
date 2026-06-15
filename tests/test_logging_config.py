@@ -67,10 +67,13 @@ class TestJsonFormatter:
         mod.reset_log_context(token)
         assert "thread_id" not in _emit_json(mod, "y")
 
-    def test_none_values_skipped(self, mod):
-        with mod.log_context(job_id=None):
-            rec = _emit_json(mod, "no job")
+    def test_none_and_empty_values_skipped(self, mod):
+        # k8s sets unused env vars to "" (e.g. SESSION_BOUND_THREAD_ID on
+        # worker pods); "" must not leak as a noise field.
+        with mod.log_context(job_id=None, thread_id=""):
+            rec = _emit_json(mod, "no ids")
         assert "job_id" not in rec
+        assert "thread_id" not in rec
 
     def test_exc_info_included(self, mod):
         try:

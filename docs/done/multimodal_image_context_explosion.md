@@ -40,8 +40,14 @@ A/B/C/0/Layer-0 framing below.** Notably the **Layer-B per-call
 **compaction-time-only** image elision (S3) to avoid prompt-cache thrash. Deferred
 cost/estimator knobs (per-family render DPI, downscaling, multiplier/Gemini-Vertex
 calibration) now live in **`docs/features/multimodal_image_cost_optimization.md`**.
-Still-separate issues: the **browser-screenshot** path and **phantom user-message**
-role attribution.
+Separate residuals — **all CLOSED 2026-06-15** (develop, uncommitted, unit-verified):
+**browser-screenshot** path now delivers via `<image_data>` (item 1), **phantom
+user-message** bubbles hidden in `historyToTurns` (item 2), CLAUDE.md stale refs
+fixed (item 5), **context_window drift** diagnosed as a per-deployment data fix
+(item 3), and a per-family render-DPI mechanism + Gemini-endpoint log landed
+(item 4; remaining tuning stays in `multimodal_image_cost_optimization.md`). With
+these closed this doc is fully resolved → archived to `docs/done/`. See the
+"Related issues" section below.
 
 Still the **multimodal sibling of [[session_silent_failure_audit]] #5/#6/#7** (the
 text-PDF case): #6's keep-window elision shipped for `ToolMessage` text but its
@@ -376,18 +382,40 @@ The deep dive overturned two claims in the original version of this doc:
    merely makes in-turn behavior match what resume already does) — and means
    no migration or persistence change is needed.
 
-## Related issues to file separately
+## Related issues — RESOLVED 2026-06-15 (develop, uncommitted, unit-verified)
 
-- **Browser screenshots not delivered as images + uncovered by compaction
-  normalization** (§D above). Both a capability bug (multimodal model never
-  sees the screenshot) and a context bug (base64-as-text in a `ToolMessage`).
-  Decide: route through `extract_image_tags` (then covered by A/B) vs. leave to
-  text-result nets. Honors [[feedback_browser_priority]].
-- **Phantom "user" messages.** Synthetic image `HumanMessage`s persist as
-  `role="human"` and the cockpit renders them as user bubbles
-  (`persistent-chat.service.ts:2171`). Tag them (distinct role or
-  `additional_kwargs` flag) + cockpit render rule. Cosmetic but user-facing.
-- **CLAUDE.md stale config references** (`settings_matrix.yaml`/`models.yaml`).
+All three separate-issues filed here were fixed this session:
+
+- **Browser screenshots now delivered as images** (§D). Chosen: route through
+  `extract_image_tags`. `browser_direct.py` tools now return a **string** via the
+  new `_page_state_to_text`, which emits the screenshot as an `<image_data>` tag.
+  Key reason it must be a string: dict returns get `json.dumps`-escaped by the
+  worker `ToolNode` and `str()`-escaped by the persistent loop, either of which
+  breaks the tag regex. The model now receives the screenshot as a real image
+  block and the base64 leaves the token counter. Covered by the existing image
+  nets. Tests: `tests/tools/research/test_browser_tools.py` (47) incl. a
+  screenshot→tag round-trip. `image_content.py` docstring updated.
+- **Phantom "user" messages — hidden.** Chose hide-entirely: `historyToTurns`
+  (`persistent-chat.service.ts`, the sole user-turn render path) now skips
+  `^Image content from tool call \S+:$`. +2 spec tests.
+- **CLAUDE.md stale config references — fixed** (the four dead refs —
+  `models.yaml`/`settings_matrix.yaml`/`prompt_matrix.yaml`/`instruction_matrix.yaml`
+  — now point at `config/model_config_matrix.yaml` + the DB-backed catalog).
+
+Also from the same backlog, addressed this session:
+
+- **context_window drift** (the §Symptom footnote) — diagnosed as a
+  per-deployment **data** fix, not code: the affected deployment's gpt-5.5
+  catalog row has `context_window=200000`, overriding the gpt-5 family's 1.05M
+  at dispatch (`main.py:1021`). Fix: clear it in Admin → Models (or
+  `UPDATE models SET context_window=NULL WHERE model_id='gpt-5.5'`) + reload.
+  Confirmed on k3d: all rows there are NULL → inherit family (k3d has no gpt-5.5
+  row, which is how the diagnosis was confirmed).
+- **Per-family render DPI + Gemini endpoint** — landed as a configurable
+  mechanism; tracked in `docs/features/multimodal_image_cost_optimization.md`
+  (which retains the still-deferred tuning knobs). o4-mini was investigated and
+  **not** changed: `family_of()` folds o1/o3/o4 → "o-series", so a standalone
+  row would be dead config — documented the real fix (family split) instead.
 
 ## Scope, phasing & verification
 

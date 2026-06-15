@@ -4,7 +4,7 @@ import {TestBed} from '@angular/core/testing';
 import {HttpClient} from '@angular/common/http';
 import {of, throwError} from 'rxjs';
 import {TranslocoService} from '@jsverse/transloco';
-import {PersistentChatService} from './persistent-chat.service';
+import {PersistentChatService, historyToTurns} from './persistent-chat.service';
 import {ApiService} from './api.service';
 import {IndexedDbService} from './indexed-db.service';
 import {NotificationService} from './notification.service';
@@ -2275,5 +2275,35 @@ describe('PersistentChatService — usage.updated telemetry', () => {
         expect(u.outputTokensTurn).toBe(50);
         // limit carried over from the earlier frame
         expect(u.ctxLimitTokens).toBe(128_000);
+    });
+
+    describe('historyToTurns — synthetic image-delivery messages', () => {
+        const msg = (over: Record<string, unknown>) => ({
+            id: 'x',
+            role: 'human',
+            content: '',
+            tool_calls: null,
+            turn_number: 1,
+            created_at: null,
+            ...over,
+        });
+
+        it('hides "Image content from tool call <id>:" markers from the transcript', () => {
+            const turns = historyToTurns([
+                msg({id: '1', content: 'Check this page'}),
+                msg({id: '2', content: 'Image content from tool call call_ABC123:'}),
+                msg({id: '3', role: 'ai', content: 'Looks good.'}),
+            ] as never);
+            const users = turns.filter((t) => t.kind === 'user');
+            expect(users).toHaveLength(1);
+            expect((users[0] as {content: string}).content).toBe('Check this page');
+        });
+
+        it('keeps a real user message that merely starts with the phrase', () => {
+            const turns = historyToTurns([
+                msg({content: 'Image content from tool call handling is broken — fix it'}),
+            ] as never);
+            expect(turns.filter((t) => t.kind === 'user')).toHaveLength(1);
+        });
     });
 });

@@ -1797,6 +1797,8 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             # Lets bulk readers cap a single tool result relative to the main
             # model's window (session_silent_failure_audit.md #5).
             "model_max_context_tokens": self.config.limits.model_max_context_tokens,
+            # Per-family page-render DPI (None -> renderer default 150).
+            "pdf_render_dpi": getattr(self.config.limits, "pdf_render_dpi", None),
         }
         # Build job metadata for delegation tool access
         job_metadata = {

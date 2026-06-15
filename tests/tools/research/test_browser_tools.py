@@ -601,8 +601,11 @@ class TestBrowserDirectDispatch:
         ctx.browser_exec.assert_awaited_once()
         assert ctx.browser_exec.await_args[0][0] == "navigate"
         assert ctx.browser_exec.await_args[1]["url"] == "https://example.com"
-        assert "nonce" in result
-        assert "page_content nonce=" in result["dom"]
+        # Result is now a formatted string (see _page_state_to_text) with the
+        # nonce-wrapped DOM inline, not a dict.
+        assert isinstance(result, str)
+        assert "page_content nonce=" in result
+        assert "https://e.com" in result
 
     @pytest.mark.asyncio
     async def test_invalid_url_short_circuits(self, mock_remote_tool_context):
@@ -612,7 +615,8 @@ class TestBrowserDirectDispatch:
         tools = {t.name: t for t in create_browser_direct_tools(ctx)}
         result = await tools["browser_navigate"].ainvoke({"url": "file:///etc/passwd"})
 
-        assert "error" in result
+        assert isinstance(result, str)
+        assert "error" in result.lower()
         ctx.browser_exec.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -636,5 +640,33 @@ class TestBrowserDirectDispatch:
         tools = {t.name: t for t in create_browser_direct_tools(ctx)}
         result = await tools["browser_navigate"].ainvoke({"url": "https://example.com"})
 
-        assert result == {"error": "navigate failed: boom"}
+        assert isinstance(result, str)
+        assert "navigate failed: boom" in result
         assert "nonce" not in result
+
+    @pytest.mark.asyncio
+    async def test_screenshot_emitted_as_image_tag(self, mock_remote_tool_context):
+        """A screenshot is surfaced as an <image_data> tag so the graph-side
+        extract_image_tags post-processor lifts it into a real image block
+        (and the base64 never reaches the token counter as text)."""
+        from src.tools.research.browser_direct import create_browser_direct_tools
+        from src.services.image_content import extract_image_tags
+
+        ctx = self._ctx(
+            mock_remote_tool_context,
+            {
+                "url": "https://e.com",
+                "title": "E",
+                "screenshot": "iVBORw0KGgoAAAANSUhEUg==",
+            },
+        )
+        tools = {t.name: t for t in create_browser_direct_tools(ctx)}
+        result = await tools["browser_screenshot"].ainvoke({})
+
+        assert isinstance(result, str)
+        assert '<image_data mime_type="image/png">' in result
+        cleaned, images = extract_image_tags(result)
+        assert len(images) == 1
+        assert images[0].mime_type == "image/png"
+        assert "iVBORw0KGgoAAAANSUhEUg==" not in cleaned
+        assert "[image attached: image/png]" in cleaned

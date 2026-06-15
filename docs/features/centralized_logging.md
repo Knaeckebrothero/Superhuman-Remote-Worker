@@ -28,7 +28,10 @@ aliases:
 > produced them is gone — without depending on a teardown hook or on the pod
 > being reachable at teardown time.
 
-**Status:** Design / not started.
+**Status:** **Slice 0 ✅ shipped + k3d-verified 2026-06-15** (structured JSON
+logging + correlation IDs + secret redaction). Slices 1–3 (Loki + Alloy +
+Grafana, retention, OTel) **not started** — the continuous-shipping pipeline
+itself is still the open work, so this doc stays in `features/`.
 **Triggered by:** Logs that matter for post-mortems live in ephemeral places
 tied to lifecycle events, so the highest-signal data is lost exactly when a
 failure occurs. The triggering question was "shouldn't we snapshot container
@@ -182,7 +185,7 @@ loggers should never log raw `config_override` / headers. Treat this as a Slice
 
 ## Slices (each independently shippable)
 
-### Slice 0 — Structured logging + log-to-stdout *(prereq; ships value alone)*
+### Slice 0 — Structured logging + log-to-stdout  ✅ **DONE (2026-06-15)**
 - Switch orchestrator + agent to **JSON structured logging** (a `JsonFormatter`;
   nothing structured today — it's greenfield) with correlation fields.
 - Route file-logging daemons to **stdout**: `browser-exec`
@@ -192,6 +195,43 @@ loggers should never log raw `config_override` / headers. Treat this as a Slice
 - **Value even without Loki:** `kubectl logs` becomes machine-parseable and
   greppable by `job_id`. **Acceptance:** a job emits JSON lines carrying its
   `job_id` across orchestrator and agent; no secret appears in any line.
+
+**Shipped + verified end-to-end on k3d (drove a session + worker job):**
+- New independent modules `orchestrator/logging_config.py` +
+  `src/core/logging_config.py` (separate images, no shared import path;
+  `redact()` kept in sync, both covered by `tests/test_logging_config.py`, 32
+  tests). `LOG_FORMAT=json|text` — code default `text`; `helm/values.yaml`=`json`,
+  `values-local.example.yaml`=`text` for readable local dev.
+- Correlation wired: **`agent_id`** (pod name; `HOSTNAME`/`POD_NAME` fallback) at
+  agent startup; **`job_id`** in the worker+dual job entry and the orchestrator
+  dispatcher; **`thread_id`** at the persistent loop-start seam — bound before
+  `asyncio.create_task` so it **copies into the loop task** (verified: the
+  `src.persistent_graph` line carried it); **`request_id`** via a pure-ASGI
+  `CorrelationIdMiddleware` (registered outermost → reaches route handlers, not
+  just the access line; honors inbound `X-Request-ID`, else generates).
+- uvicorn's own access/error logs routed through the JSON root handler
+  (`log_config=None`) + its ANSI `color_message` extra excluded.
+- `browser-exec` `DAEMON_LOG` moved out of the snapshot-excluded `/tmp`.
+- **5 env/wiring bugs the unit tests structurally could not catch — found only on
+  k3d** (all fixed + re-verified on the rebuilt image): (1) the orchestrator
+  deployment wires config keys individually, so it needed an explicit
+  `LOG_FORMAT` env block (agent pods get it via `envFrom`); (2) pods have **no**
+  `AGENT_ID` — identity is `HOSTNAME`/`POD_NAME`, session thread is
+  `SESSION_BOUND_THREAD_ID`; (3) k8s sets unused env to `""` not unset →
+  `bind_log_context` skips `""`; (4) uvicorn logs were plain text; (5) uvicorn's
+  `color_message` ANSI leak.
+- **Python warnings folded in:** `configure_logging` calls
+  `logging.captureWarnings(True)`, so `warnings.warn()` output routes through the
+  `py.warnings` logger → root JSON handler (local-verified with the
+  `reasoning_effort` UserWarning; deploys on next agent rebuild). All output —
+  the `logging` framework, uvicorn, and Python warnings — is now JSON.
+- **Ops note:** any change to the shared `srw-config` ConfigMap (incl. the agent
+  image tag, which lives there) makes Stakater Reloader bounce the whole stack
+  (~7 min, Keycloak cold-boot dominated). Budget for it on config-touching changes.
+- Files: the two `logging_config.py` modules, `agent.py`, `orchestrator/main.py`,
+  `src/api/{app,dual_app,persistent_app}.py`, `docker/browser-exec`,
+  `helm/templates/configmap.yaml`, `helm/templates/orchestrator/deployment.yaml`,
+  and the `values*.yaml` files.
 
 ### Slice 1 — Loki + Alloy + Grafana datasource *(the core)*
 - Loki (monolithic) in the chart, chunks → MinIO `srw-logs` bucket (reuse

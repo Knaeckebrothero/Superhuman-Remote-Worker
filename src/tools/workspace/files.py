@@ -408,9 +408,13 @@ def create_file_tools(context: ToolContext) -> List[Any]:
 
             renderer = get_document_renderer()
 
-            # Render the page as PNG
+            # Render the page as PNG. Per-family DPI (matrix settings.pdf_render_dpi
+            # via limits) lets patch-model mains render fewer pixels than the
+            # provider downscales away; None -> renderer default (150).
             try:
-                page_image = renderer.render_page(full_path, page_num)
+                page_image = renderer.render_page(
+                    full_path, page_num, dpi=context.get_config("pdf_render_dpi")
+                )
             except Exception as e:
                 logger.warning(
                     f"Could not render page {page_num} of {full_path.name}: {e}"
