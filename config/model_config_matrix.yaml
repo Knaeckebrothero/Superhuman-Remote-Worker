@@ -56,7 +56,7 @@ default:
     # Per-image token cost for the compaction trigger. `default` is the flat
     # biased-high fallback used for unknown families and unreadable image dims;
     # multimodal families below override with a dimension-aware mode. Verified
-    # formulas: docs/features/context_token_accounting.md §4 + appendix.
+    # formulas: docs/done/context_token_accounting.md §4 + appendix.
     image_tokens: { mode: flat, flat: 1600 }
 
 minimax:

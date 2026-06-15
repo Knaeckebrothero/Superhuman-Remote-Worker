@@ -594,7 +594,7 @@ def _apply_settings_matrix(
         if key == "image_tokens":
             # Per-family image-token estimator config -> limits, not llm:
             # _parse_llm_config's closed constructor silently drops unknown
-            # keys. See docs/features/context_token_accounting.md S4.
+            # keys. See docs/done/context_token_accounting.md S4.
             data.setdefault("limits", {})["image_tokens"] = value
             mode = value.get("mode") if isinstance(value, dict) else value
             applied.append(f"limits.image_tokens(mode={mode})")

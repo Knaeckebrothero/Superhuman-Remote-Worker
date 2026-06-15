@@ -6,7 +6,7 @@ inflated the internal context meter to **9.18M "tokens" / 875%** while the real
 provider count was **31,744 / 3%**, then summarization timed out 3/3 on the
 base64 it was fed and the session never completed.
 
-- **Design / what & why:** `docs/features/context_token_accounting.md`
+- **Design / what & why:** `docs/done/context_token_accounting.md`
 - **Root-cause defect inventory:** `docs/issues/multimodal_image_context_explosion.md`
 - **Memory:** `project_session_multimodal_pdf_context_explosion.md`
 

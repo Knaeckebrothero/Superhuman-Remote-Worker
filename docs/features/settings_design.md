@@ -967,7 +967,7 @@ These settings exist in the config system but are intentionally excluded from th
 | `memory.observer_model`, `memory.observer_base_url` | Infrastructure |
 | `context_management.summarization_template` | Expert-defined |
 | `limits.response_validation.max_tag_repetitions` etc. | Safety guardrails, not user-facing |
-| `limits.model_max_context_tokens`, `limits.context_threshold_tokens` etc. | Derived from settings_matrix.yaml per model family; not user-overridable (matrix is sole source of truth for limits) |
+| `limits.model_max_context_tokens`, `limits.context_threshold_tokens` etc. | Derived at load from a single base window in `model_config_matrix.yaml` per model family (the threshold/msg-min leaves are fixed fractions of the base). Not a per-job field; the base is the model's true max, overridable per-model via Admin → Models `context_window` |
 | `communication.max_message_length`, `communication.allowed_recipients` | System defaults, not per-job |
 | `browser.timeout` | Reasonable default, never needs changing |
 | Individual tool arrays (`tools.workspace: [read_file, ...]`) | Category toggles are sufficient; individual tools are expert-level |
