@@ -293,10 +293,9 @@ jobs:
           uv pip install --system pip-licenses
           -r orchestrator/requirements.txt
           -r orchestrator/mcp/requirements.txt
-      - name: Install cockpit deps (for npm license scan)
-        working-directory: cockpit
-        run: npm ci
       - name: Check third-party licenses
+        # Python: installed metadata via pip-licenses. Frontend: read straight
+        # from cockpit/package-lock.json (no npm install / node_modules needed).
         run: python scripts/check_licenses.py --check
 
   # ---------------------------------------------------------------------------
@@ -321,20 +320,14 @@ jobs:
       - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-          cache: npm
-          cache-dependency-path: cockpit/package-lock.json
       - name: Install dependencies + license tooling
+        # No Node step / npm ci: backend needs the installed Python deps for
+        # pip-licenses; the frontend inventory is read from package-lock.json.
         run: >-
           uv pip install --system pip-licenses
           -r requirements.txt
           -r orchestrator/requirements.txt
           -r orchestrator/mcp/requirements.txt
-      - name: Install cockpit deps
-        working-directory: cockpit
-        run: npm ci
       - name: Regenerate THIRD_PARTY_LICENSES.md
         # --write also runs the gate; never block the docs commit here (the
         # dependency-audit job blocks the build), so swallow a nonzero exit.
