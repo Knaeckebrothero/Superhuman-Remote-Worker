@@ -1,10 +1,13 @@
 {{- if .Values.nats.internal }}
 # JetStream stream provisioning — runs once per install/upgrade.
-# Idempotent: `nats stream add --defaults` is a no-op if the stream
-# already exists with the same config.
+# Upsert semantics: `nats stream add` CREATES a stream but CANNOT change an
+# existing one's config (subjects in particular), so each stream is added if
+# absent and otherwise converged with `nats stream edit -f`. Don't rely on
+# `nats stream add --defaults` alone to apply subject changes on upgrade.
 #
-# Equivalent to the `nats stream add` commands documented in the
-# HomeLab repo's deployments_managed/nats/README.md.
+# Equivalent to the `nats stream add`/`edit` commands documented in the
+# HomeLab repo's deployments_managed/nats/README.md (which provisions the
+# shared homelab hub; this Job only runs when nats.internal=true).
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -50,10 +53,20 @@ spec:
               NATS_URL="nats://{{ include "srw.natsName" . }}:4222"
               echo "Provisioning JetStream streams on $NATS_URL..."
 
-              # VM lifecycle + status — single replica (we run a single-node hub),
-              # 24h retention, 1 GiB max. Idempotent via --defaults.
+              # VM lifecycle EVENTS — single replica (we run a single-node hub),
+              # 24h retention, 1 GiB max.
+              # IMPORTANT: the request/reply subject `vm.lifecycle.get.*` is
+              # deliberately EXCLUDED. A stream whose subjects cover an RPC
+              # subject hijacks the request's reply inbox with a JetStream
+              # publish-ack, which beats the real responder and breaks live VM
+              # status queries. Keep this stream to genuine fire-and-forget
+              # events only. See
+              # docs/issues/vm_live_status_query_shadowed_by_jetstream_stream.md
+              # (the dead `vm.status.>` subject, which has no producer, is also
+              # dropped here). add||edit so subject changes apply on upgrade.
+              VM_EVENTS_SUBJECTS="vm.lifecycle.create.>,vm.lifecycle.delete.>,vm.lifecycle.status.>"
               nats stream add VM_EVENTS \
-                --subjects "vm.lifecycle.>,vm.status.>" \
+                --subjects "$VM_EVENTS_SUBJECTS" \
                 --retention limits \
                 --max-age 24h \
                 --max-bytes 1073741824 \
@@ -61,7 +74,8 @@ spec:
                 --storage file \
                 --discard old \
                 --defaults \
-                --server "$NATS_URL"
+                --server "$NATS_URL" \
+                || nats stream edit VM_EVENTS --subjects "$VM_EVENTS_SUBJECTS" -f --server "$NATS_URL"
               echo "stream VM_EVENTS ready"
 
               # Agent heartbeats — short retention, small size.
@@ -74,7 +88,8 @@ spec:
                 --storage file \
                 --discard old \
                 --defaults \
-                --server "$NATS_URL"
+                --server "$NATS_URL" \
+                || nats stream edit AGENT_HEARTBEATS --subjects "agent.*.heartbeat" -f --server "$NATS_URL"
               echo "stream AGENT_HEARTBEATS ready"
 
               # Job assignments — work queue (at-least-once delivery).
@@ -85,7 +100,8 @@ spec:
                 --replicas 1 \
                 --storage file \
                 --defaults \
-                --server "$NATS_URL"
+                --server "$NATS_URL" \
+                || nats stream edit JOB_ASSIGNMENTS --subjects "agent.*.job.>" -f --server "$NATS_URL"
               echo "stream JOB_ASSIGNMENTS ready"
 
               echo "All streams provisioned."

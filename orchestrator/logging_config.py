@@ -25,6 +25,7 @@ import re
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, Iterator
+from uuid import uuid4
 
 COMPONENT = "orchestrator"
 
@@ -211,3 +212,52 @@ def configure_logging(
 
     if disable_uvicorn_access:
         logging.getLogger("uvicorn.access").disabled = True
+
+
+# ---------------------------------------------------------------------------
+# Request correlation (ASGI middleware)
+# ---------------------------------------------------------------------------
+
+# Sanitise an inbound X-Request-ID so a hostile value can't inject newlines /
+# break a log line; keep it id-shaped and bounded.
+_RID_SANITISE = re.compile(r"[^A-Za-z0-9._-]")
+
+
+def _request_id_from_headers(scope: dict) -> str | None:
+    for key, value in scope.get("headers", []):
+        if key == b"x-request-id":
+            cleaned = _RID_SANITISE.sub("", value.decode("latin-1"))[:64]
+            return cleaned or None
+    return None
+
+
+class CorrelationIdMiddleware:
+    """Pure-ASGI middleware that binds ``request_id`` for the whole request.
+
+    A ``BaseHTTPMiddleware`` runs the route handler in a *separate* task, so a
+    contextvar set there never reaches the handler. This middleware sets the
+    contextvar in the same task the downstream app is awaited in — and the
+    handler sub-task copies that context at spawn — so ``request_id`` tags both
+    the access-log line and the route handler's own logs. Register it
+    **outermost** (add it last) so it wraps the access-logging middleware.
+
+    Honors an inbound ``X-Request-ID`` for cross-service trace continuity, else
+    generates one. Never lets request-id logic break a request.
+    """
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    async def __call__(self, scope: dict, receive: Any, send: Any) -> None:
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+        try:
+            request_id = _request_id_from_headers(scope) or uuid4().hex[:12]
+        except Exception:
+            request_id = uuid4().hex[:12]
+        token = bind_log_context(request_id=request_id)
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            reset_log_context(token)

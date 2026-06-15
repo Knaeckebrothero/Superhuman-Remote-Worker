@@ -132,6 +132,66 @@ class TestWorkspacePodLive:
         assert await p.workspace_pod_live(WorkspaceOwner.session("t1")) is None
 
 
+class TestReleaseWorkspace:
+    """Owner-keyed release_workspace: snapshot (if ready) then delete pod + PVC."""
+
+    def _prov(self):
+        from orchestrator.services.container_provisioner import ContainerProvisioner
+
+        p = ContainerProvisioner()
+        p._k8s_available = True
+        p.get_workspace_status = AsyncMock(
+            return_value={"pod_ip": "10.0.0.5", "ready": True}
+        )
+        p.delete_workspace = AsyncMock(return_value=True)
+        p.delete_workspace_pvc = AsyncMock(return_value=True)
+        snap = MagicMock()
+        snap.is_available = True
+        snap.capture_vm_snapshot = AsyncMock()
+        p._snapshot_service = snap
+        return p
+
+    @pytest.mark.asyncio
+    async def test_session_snapshots_then_deletes(self):
+        p = self._prov()
+        owner = WorkspaceOwner.session("t1")
+        assert await p.release_workspace(owner) is True
+        p._snapshot_service.capture_vm_snapshot.assert_awaited_once()
+        assert (
+            p._snapshot_service.capture_vm_snapshot.call_args.kwargs["entity_type"]
+            == "threads"
+        )
+        p.delete_workspace.assert_awaited_once_with(owner)
+        p.delete_workspace_pvc.assert_awaited_once_with(owner)
+
+    @pytest.mark.asyncio
+    async def test_job_uses_jobs_entity_type(self):
+        p = self._prov()
+        assert await p.release_workspace(WorkspaceOwner.job("j1")) is True
+        assert (
+            p._snapshot_service.capture_vm_snapshot.call_args.kwargs["entity_type"]
+            == "jobs"
+        )
+
+    @pytest.mark.asyncio
+    async def test_skips_snapshot_when_not_ready(self):
+        p = self._prov()
+        p.get_workspace_status = AsyncMock(
+            return_value={"pod_ip": None, "ready": False}
+        )
+        owner = WorkspaceOwner.session("t1")
+        assert await p.release_workspace(owner) is True
+        p._snapshot_service.capture_vm_snapshot.assert_not_awaited()
+        p.delete_workspace.assert_awaited_once_with(owner)
+
+    @pytest.mark.asyncio
+    async def test_returns_false_without_k8s(self):
+        p = self._prov()
+        p._k8s_available = False
+        assert await p.release_workspace(WorkspaceOwner.session("t1")) is False
+        p.delete_workspace.assert_not_awaited()
+
+
 class TestPodManifest:
     """Tests for pod manifest generation."""
 
