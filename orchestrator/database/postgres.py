@@ -5238,9 +5238,17 @@ class PostgresDB:
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb, $10, $11)
             RETURNING *
             """,
-            name, display_name, description, icon, color, tags or [], expert_type,
-            json.dumps(config or {}), json.dumps(prompts or {}),
-            UUID(str(owner_id)), is_global,
+            name,
+            display_name,
+            description,
+            icon,
+            color,
+            tags or [],
+            expert_type,
+            json.dumps(config or {}),
+            json.dumps(prompts or {}),
+            UUID(str(owner_id)),
+            is_global,
         )
         return dict(row)
 
@@ -5288,8 +5296,14 @@ class PostgresDB:
         """Patch mutable fields (NOT expert_type — immutable, decision 3) and bump
         version. Column names come from a fixed allow-list, never user input."""
         allowed = {
-            "display_name", "description", "icon", "color", "tags",
-            "config", "prompts", "is_global",
+            "display_name",
+            "description",
+            "icon",
+            "color",
+            "tags",
+            "config",
+            "prompts",
+            "is_global",
         }
         sets, vals = [], []
         for k, v in fields.items():
@@ -5305,7 +5319,7 @@ class PostgresDB:
         row = await self.fetchrow(
             f"""
             UPDATE experts
-            SET {', '.join(sets)}, version = version + 1,
+            SET {", ".join(sets)}, version = version + 1,
                 updated_by = ${len(vals) - 1}, updated_at = NOW()
             WHERE id = ${len(vals)}
             RETURNING *
@@ -5328,8 +5342,7 @@ class PostgresDB:
             str(expert_id),
         )
         blockers += [
-            {"type": "thread", "id": str(t["id"]), "label": t["title"]}
-            for t in threads
+            {"type": "thread", "id": str(t["id"]), "label": t["title"]} for t in threads
         ]
         # 'created'/'waiting' = truly unstarted (no resolved_config frozen yet) →
         # block. Running/review/paused jobs have a frozen config + ON DELETE SET

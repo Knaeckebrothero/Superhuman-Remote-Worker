@@ -15995,7 +15995,9 @@ async def get_expert(request: Request, expert_id: str) -> dict[str, Any]:
     if _is_experts_db_enabled() and _is_uuid(expert_id):
         detail = await _load_expert_detail(expert_id)
         if not detail:
-            raise HTTPException(status_code=404, detail=f"Expert not found: {expert_id}")
+            raise HTTPException(
+                status_code=404, detail=f"Expert not found: {expert_id}"
+            )
         return detail
 
     # Verify bundled expert exists
