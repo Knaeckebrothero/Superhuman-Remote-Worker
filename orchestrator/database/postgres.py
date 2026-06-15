@@ -778,7 +778,7 @@ class PostgresDB:
             row = await conn.fetchrow(
                 """
                 SELECT j.id, j.status,
-                       j.config_name, j.config_override, j.resolved_config,
+                       j.config_name, j.expert_id, j.config_override, j.resolved_config,
                        j.assigned_agent_id, j.user_id,
                        j.project_id, j.parent_job_id, j.priority,
                        j.branch_name, j.repo_name, j.merge_status, j.repo_merge_statuses,
@@ -814,6 +814,7 @@ class PostgresDB:
         creation_order: int | None = None,
         worktree_path: str | None = None,
         delegation_context: str | None = None,
+        expert_id: str | None = None,
     ) -> Dict[str, Any]:
         """Create a new job.
 
@@ -844,9 +845,9 @@ class PostgresDB:
         async with self.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                INSERT INTO jobs (description, document_path, config_name, config_override, context, status, user_id, project_id, branch_name, parent_job_id, priority, repo_name, creation_order, worktree_path, delegation_context)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
-                RETURNING id, status, config_name, assigned_agent_id, user_id, project_id, parent_job_id, priority, branch_name, repo_name, created_at, updated_at, description, creation_order, worktree_path
+                INSERT INTO jobs (description, document_path, config_name, config_override, context, status, user_id, project_id, branch_name, parent_job_id, priority, repo_name, creation_order, worktree_path, delegation_context, expert_id)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+                RETURNING id, status, config_name, assigned_agent_id, user_id, project_id, parent_job_id, priority, branch_name, repo_name, created_at, updated_at, description, creation_order, worktree_path, expert_id
                 """,
                 description,
                 document_path or document_dir,
@@ -863,6 +864,7 @@ class PostgresDB:
                 creation_order,
                 worktree_path,
                 delegation_context,
+                UUID(expert_id) if expert_id else None,
             )
 
         return dict(row)
@@ -5206,6 +5208,143 @@ class PostgresDB:
         """Delete a prompt override by id. Returns True iff a row was removed."""
         result = await self.execute(
             "DELETE FROM config_overrides WHERE id = $1", UUID(str(override_id))
+        )
+        return result == "DELETE 1"
+
+    # ── Experts (User-Defined Experts, Slice 1) ───────────────────────────
+
+    async def create_expert(
+        self,
+        *,
+        name: str,
+        display_name: str,
+        expert_type: str,
+        owner_id: str,
+        description: str | None = None,
+        icon: str = "smart_toy",
+        color: str = "#6B7280",
+        tags: List[str] | None = None,
+        config: Dict[str, Any] | None = None,
+        prompts: Dict[str, Any] | None = None,
+        is_global: bool = False,
+    ) -> Dict[str, Any]:
+        """Insert an owned expert. (name, owner_id) is unique — a personal fork
+        named 'scholar' shadows the bundled one for that user only (decision 5)."""
+        row = await self.fetchrow(
+            """
+            INSERT INTO experts
+                (name, display_name, description, icon, color, tags, expert_type,
+                 config, prompts, owner_id, is_global)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb, $10, $11)
+            RETURNING *
+            """,
+            name, display_name, description, icon, color, tags or [], expert_type,
+            json.dumps(config or {}), json.dumps(prompts or {}),
+            UUID(str(owner_id)), is_global,
+        )
+        return dict(row)
+
+    async def get_expert_by_id(self, expert_id: str) -> Dict[str, Any] | None:
+        row = await self.fetchrow(
+            "SELECT * FROM experts WHERE id = $1", UUID(str(expert_id))
+        )
+        return dict(row) if row else None
+
+    async def list_experts_visible(
+        self,
+        *,
+        user_id: str,
+        project_ids: List[str],
+        expert_type: str | None = None,
+    ) -> List[Dict[str, Any]]:
+        """Owned + project-linked + global rows visible to the caller. Each row is
+        annotated with the project_ids it is linked to (drives name precedence)."""
+        proj = [UUID(str(p)) for p in project_ids] if project_ids else []
+        rows = await self.fetch(
+            """
+            SELECT e.*,
+                   COALESCE(
+                     (SELECT array_agg(pe.project_id) FROM project_experts pe
+                      WHERE pe.expert_id = e.id), '{}') AS project_ids
+            FROM experts e
+            WHERE ($3::text IS NULL OR e.expert_type = $3)
+              AND (
+                e.owner_id = $1
+                OR e.is_global = TRUE
+                OR e.id IN (SELECT expert_id FROM project_experts
+                            WHERE project_id = ANY($2::uuid[]))
+              )
+            ORDER BY e.created_at DESC
+            """,
+            UUID(str(user_id)),
+            proj,
+            expert_type,
+        )
+        return [dict(r) for r in rows]
+
+    async def update_expert(
+        self, expert_id: str, *, updated_by: str, **fields: Any
+    ) -> Dict[str, Any] | None:
+        """Patch mutable fields (NOT expert_type — immutable, decision 3) and bump
+        version. Column names come from a fixed allow-list, never user input."""
+        allowed = {
+            "display_name", "description", "icon", "color", "tags",
+            "config", "prompts", "is_global",
+        }
+        sets, vals = [], []
+        for k, v in fields.items():
+            if k not in allowed:
+                continue
+            vals.append(json.dumps(v) if k in ("config", "prompts") else v)
+            cast = "::jsonb" if k in ("config", "prompts") else ""
+            sets.append(f"{k} = ${len(vals)}{cast}")
+        if not sets:
+            return await self.get_expert_by_id(expert_id)
+        vals.append(UUID(str(updated_by)))
+        vals.append(UUID(str(expert_id)))
+        row = await self.fetchrow(
+            f"""
+            UPDATE experts
+            SET {', '.join(sets)}, version = version + 1,
+                updated_by = ${len(vals) - 1}, updated_at = NOW()
+            WHERE id = ${len(vals)}
+            RETURNING *
+            """,
+            *vals,
+        )
+        return dict(row) if row else None
+
+    async def expert_delete_blockers(self, expert_id: str) -> List[Dict[str, Any]]:
+        """Live references that block deletion (decision 15): active (non-ended)
+        threads carrying metadata.expert_id, and pending/unstarted jobs with this
+        expert_id. Finished/running jobs never block (resolved_config frozen)."""
+        blockers: List[Dict[str, Any]] = []
+        threads = await self.fetch(
+            """
+            SELECT id, title FROM threads
+            WHERE status <> 'ended'
+              AND metadata->>'expert_id' = $1
+            """,
+            str(expert_id),
+        )
+        blockers += [
+            {"type": "thread", "id": str(t["id"]), "label": t["title"]}
+            for t in threads
+        ]
+        jobs = await self.fetch(
+            "SELECT id, description FROM jobs "
+            "WHERE expert_id = $1 AND status IN ('created', 'queued')",
+            UUID(str(expert_id)),
+        )
+        blockers += [
+            {"type": "job", "id": str(j["id"]), "label": (j["description"] or "")[:80]}
+            for j in jobs
+        ]
+        return blockers
+
+    async def delete_expert(self, expert_id: str) -> bool:
+        result = await self.execute(
+            "DELETE FROM experts WHERE id = $1", UUID(str(expert_id))
         )
         return result == "DELETE 1"
 

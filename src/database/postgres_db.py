@@ -133,6 +133,7 @@ class PostgresDB:
         self.jobs = JobsNamespace(self)
         self.citations = CitationsNamespace(self)
         self.config_overrides = ConfigOverridesNamespace(self)
+        self.experts = ExpertsNamespace(self)
 
         logger.info("PostgresDB initialized (not connected yet)")
 
@@ -988,6 +989,24 @@ class ConfigOverridesNamespace:
             family,
         )
         return [self.db._row_to_dict(row) for row in rows]
+
+
+class ExpertsNamespace:
+    """Expert reads for the agent's resolution path (decision 6)."""
+
+    def __init__(self, db: PostgresDB):
+        self.db = db
+
+    async def get_by_id(self, expert_id: str) -> Optional[Dict[str, Any]]:
+        """Return one expert row by UUID, or None (the agent fails loud on None).
+        config/prompts come back as JSONB (str without a codec) — the consumer
+        json.loads them via build_expert_config."""
+        row = await self.db.fetchrow(
+            "SELECT id, name, expert_type, config, prompts "
+            "FROM experts WHERE id = $1::uuid",
+            expert_id,
+        )
+        return self.db._row_to_dict(row)
 
 
 class CitationsNamespace:
