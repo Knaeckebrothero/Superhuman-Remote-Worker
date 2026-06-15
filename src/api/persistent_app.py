@@ -2997,9 +2997,42 @@ async def _loop_on_usage(payload: Dict[str, Any]) -> None:
     )
 
 
+def _wire_session_aux_archiver() -> None:
+    """Point the session's AuxiliaryLLM at the default archiver + thread context.
+
+    Worker jobs wire this in ``UniversalAgent.process_job``; persistent sessions
+    never did, so auxiliary failures/calls (memory extraction, title generation)
+    produced no ``llm_requests`` row — invisible in the debug view. The session
+    aux LLM is a shared instance (``_session.memory_service.runtime.auxiliary_llm``
+    is the same object), so wiring it once keeps every aux path archived.
+
+    Idempotent and cheap (just assigns three fields); fire-and-forget. Uses
+    ``job_id=_thread_id`` + ``agent_type="persistent"`` to match the session
+    main-call archiving in ``_loop_archive_llm_call``. See
+    docs/issues/surface_silent_aux_failures.md (Phase 1.6).
+    """
+    if _session is None or getattr(_session, "auxiliary_llm", None) is None:
+        return
+    if not _thread_id:
+        return
+    try:
+        from src.core.archiver import get_archiver
+
+        archiver = get_archiver()
+        if archiver is not None:
+            _session.auxiliary_llm.set_job_context(
+                archiver=archiver, job_id=_thread_id, agent_type="persistent"
+            )
+    except Exception as e:
+        logger.debug(f"Could not wire session aux archiver (non-fatal): {e}")
+
+
 async def _loop_on_turn_complete(turn_id: int, metrics: Optional[dict] = None) -> None:
     if _session is None:
         return
+    # Ensure the (shared) session aux LLM logs to llm_requests — covers the
+    # title call below plus the observer/extraction paths that reuse it.
+    _wire_session_aux_archiver()
     _broadcast("turn.completed", {"turn_id": turn_id, "metrics": metrics or {}})
     # Save AI messages from this turn straight to the DB (bounded await). Direct
     # write via the agent's own pool — the orchestrator REST hop is bypassed.
@@ -4045,6 +4078,10 @@ async def _handle_config_update(ws: WebSocket, config_override: Dict[str, Any]) 
             _session.memory_service.runtime.extraction_prompt = (
                 _session.memory_extraction_prompt
             )
+
+        # The swap replaced the aux LLM with a fresh (unwired) instance — re-point
+        # it at the archiver so its failures keep landing in llm_requests.
+        _wire_session_aux_archiver()
 
         # Reset embedding singleton if embedding env keys changed.
         new_env_block = effective_override.get("env_keys") or {}

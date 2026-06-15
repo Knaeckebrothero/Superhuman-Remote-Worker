@@ -15401,12 +15401,20 @@ async def get_job_llm_requests(
     job_id: str,
     limit: int = Query(default=20, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
+    call_type: str | None = Query(default=None),
+    status: str | None = Query(default=None),
 ) -> dict[str, Any]:
     """List LLM requests for a job with summary fields.
 
-    Returns model, timestamp, token usage, tool call names, and iteration
-    for each request. Use the _id with GET /api/requests/{doc_id} to get
-    the full request/response.
+    Returns model, timestamp, token usage, tool call names, call_type, and
+    iteration for each request. Use the _id with GET /api/requests/{doc_id} to
+    get the full request/response.
+
+    Query params:
+        call_type: filter by call type; ``all``/omitted returns main +
+            auxiliary calls, or pass an exact type (e.g. ``memory_extraction``).
+        status: pass ``error`` to return only failed calls (auxiliary failures
+            carry ``status="error"``).
     """
     await require_job_access(request, postgres_db, job_id)
     if not mongodb.is_available:
@@ -15418,7 +15426,13 @@ async def get_job_llm_requests(
         raise HTTPException(status_code=400, detail=f"Invalid job_id format: {job_id}")
 
     try:
-        data = await mongodb.list_llm_requests(job_id, limit=limit, offset=offset)
+        data = await mongodb.list_llm_requests(
+            job_id,
+            limit=limit,
+            offset=offset,
+            call_type=call_type,
+            status=status,
+        )
         return data
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e

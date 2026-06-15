@@ -9,6 +9,18 @@ related:
 
 # Every develop push drift-drains live idle session agents
 
+**Status:** ✅ **RESOLVED** 2026-06-12. Drain on a session-bound agent is now
+a clean suspend (option b): deferred while a turn is in flight, full
+flush→suspend→exit when parked, `session.suspended` surfaced to the UI. Two
+follow-on bugs found and fixed in the same arc — a `_terminate_session`
+re-entrancy race (loop-complete clobbering the suspend) and the resume-restore
+409 hardening (option c, `_create_pod_resolving_teardown`). Shipped to
+`develop` (in deployed `sha-f05256e`); k3d-verified incl. real-apiserver
+validation of the 409 teardown path. **One organic residual:** the full
+`suspended` terminal state (S3 snapshot → CAS → wake) is only reproducible
+where a snapshot store exists, so it self-verifies on the next dev/prod
+`develop` deploy — expected log line `Drain-suspend complete for thread …`.
+
 **Filed:** 2026-06-10, from the rclone dev-cluster runbook incident
 (`docs/tests/rclone_cloud_mount_dev_cluster.md` §13, incident 1).
 
