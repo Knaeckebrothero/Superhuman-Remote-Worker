@@ -3,6 +3,7 @@
 Kept separate from main.py / loader.py so the security-critical logic is small
 and unit-testable in isolation. No DB or framework imports here.
 """
+
 from __future__ import annotations
 
 import json
@@ -73,8 +74,15 @@ def pick_expert_by_name(
 
 
 _EXPORT_FIELDS = (
-    "name", "display_name", "description", "icon", "color",
-    "tags", "expert_type", "config", "prompts",
+    "name",
+    "display_name",
+    "description",
+    "icon",
+    "color",
+    "tags",
+    "expert_type",
+    "config",
+    "prompts",
 )
 
 

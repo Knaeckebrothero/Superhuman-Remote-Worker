@@ -1,5 +1,6 @@
 """Integration of persona fencing (decision 7) + DB-prompt freeze overlay
 through the real prompt assembler. Constructs a minimal config; no DB."""
+
 from src.core.loader import (
     get_phase_system_prompt,
     load_agent_config_from_dict,

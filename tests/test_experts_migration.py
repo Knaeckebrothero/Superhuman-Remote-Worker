@@ -1,5 +1,6 @@
 """Structural assertions on migration 0028 (the repo's migration-test idiom:
 read the file text, assert on DDL shape — see test_schema_capabilities_migration.py)."""
+
 from pathlib import Path
 
 MIGRATION = (
@@ -15,8 +16,14 @@ def test_migration_file_exists():
 def test_experts_table_shape():
     sql = MIGRATION.read_text()
     assert "CREATE TABLE IF NOT EXISTS experts" in sql
-    assert "expert_type  VARCHAR(10)  NOT NULL CHECK (expert_type IN ('worker', 'session'))" in sql
-    assert "owner_id     UUID         NOT NULL REFERENCES users(id) ON DELETE CASCADE" in sql
+    assert (
+        "expert_type  VARCHAR(10)  NOT NULL CHECK (expert_type IN ('worker', 'session'))"
+        in sql
+    )
+    assert (
+        "owner_id     UUID         NOT NULL REFERENCES users(id) ON DELETE CASCADE"
+        in sql
+    )
     assert "config       JSONB        NOT NULL DEFAULT '{}'" in sql
     assert "prompts      JSONB        NOT NULL DEFAULT '{}'" in sql
     assert "uq_experts_name_owner" in sql  # personal fork shadows bundled (decision 5)
@@ -25,7 +32,10 @@ def test_experts_table_shape():
 def test_project_experts_junction_and_one_default_per_type():
     sql = MIGRATION.read_text()
     assert "CREATE TABLE IF NOT EXISTS project_experts" in sql
-    assert "default_for     VARCHAR(10) CHECK (default_for IN ('worker', 'session'))" in sql
+    assert (
+        "default_for     VARCHAR(10) CHECK (default_for IN ('worker', 'session'))"
+        in sql
+    )
     assert "uq_project_default_expert" in sql
     assert "WHERE default_for IS NOT NULL" in sql
 
