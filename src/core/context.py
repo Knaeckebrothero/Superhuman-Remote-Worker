@@ -468,7 +468,7 @@ def count_tokens_tiktoken(
             # split out image blocks and count them as flat image tokens
             # instead of tokenizing their base64 data URL as text (which
             # inflated session 5dbb5770 to ~9.2M phantom tokens). See
-            # src/core/image_tokens.py + docs/features/context_token_accounting.md.
+            # src/core/image_tokens.py + docs/done/context_token_accounting.md.
             text, image_blocks = split_text_and_image_blocks(msg.content)
             content_tokens = len(enc.encode(text, disallowed_special=()))
             image_tokens = sum(

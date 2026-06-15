@@ -10,7 +10,7 @@ if it were text — which inflated a 12-image conversation to ~9.2M "tokens"
 This module is the seam for counting image blocks correctly. v1 (slice S1)
 uses a single biased-high flat constant per image; the per-family
 dimension-aware estimator (openai_patches / openai_tiles / anthropic_patches /
-flat) lands in S4. Design: docs/features/context_token_accounting.md.
+flat) lands in S4. Design: docs/done/context_token_accounting.md.
 """
 
 import base64
@@ -167,7 +167,7 @@ def content_to_summary_text(content: Any) -> str:
 # and apply the family `mode` from the matrix `settings.image_tokens`. Every
 # path is biased high and falls back to a flat constant when dims can't be read
 # or the family is unconfigured. Formulas verified against provider primary
-# sources — see docs/features/context_token_accounting.md §4.3 + appendix.
+# sources — see docs/done/context_token_accounting.md §4.3 + appendix.
 # ---------------------------------------------------------------------------
 
 

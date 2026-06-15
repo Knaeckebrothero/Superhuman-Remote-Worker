@@ -292,7 +292,7 @@ def format_read_info(info: Dict[str, Any], file_path: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Visual-render gating (docs/features/context_token_accounting.md S2)
+# Visual-render gating (docs/done/context_token_accounting.md S2)
 # ---------------------------------------------------------------------------
 
 # A page with at least this many extracted characters and no embedded images is
@@ -315,7 +315,7 @@ def should_render_page(
     (pictograms/diagrams that text extraction drops). Skip only text-rich,
     image-free pages: their extracted text already represents them and
     rasterizing them only burns image tokens. This never skips an image-bearing
-    page. See docs/features/context_token_accounting.md (S2).
+    page. See docs/done/context_token_accounting.md (S2).
     """
     return chars < min_text_chars or has_images
 
