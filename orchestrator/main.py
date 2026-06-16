@@ -12653,6 +12653,48 @@ async def create_thread(
                 request_body.permission_mode
             )
 
+        # --- DB expert binding (decisions 6/7/27): materialize the bound expert
+        # into config_override HERE so the session agent applies it through its
+        # normal deep_merge rail (persistent_app.py). The pod stays expert-blind:
+        # no AGENT_EXPERT_ID, no _apply_db_expert, no DB lookup — it just sees a
+        # config_override like any other. The expert is the BASE layer; the
+        # user/per-session overrides built above win on top. Bundled experts
+        # (slug config_name, trusted persona) skip this path and are unchanged.
+        bound_expert_id = request_body.expert_id
+        if (
+            not bound_expert_id
+            and request_body.config_name
+            and _is_uuid(request_body.config_name)
+        ):
+            # Cockpit currently sends the expert UUID in config_name; treat a UUID
+            # there as the binding and fall back to the session base below.
+            bound_expert_id = request_body.config_name
+        if bound_expert_id and _is_experts_db_enabled():
+            expert_detail = await _load_expert_detail(bound_expert_id)
+            if not expert_detail:
+                raise HTTPException(
+                    status_code=404, detail=f"Expert {bound_expert_id} not found"
+                )
+            # Expert fragment (merged onto its type base) underlays the user
+            # overrides. Merge BEFORE credential injection below so the injected
+            # base_url/api_key resolve for the expert's model.
+            config_override = _deep_merge_dicts(
+                expert_detail.get("config") or {}, config_override
+            )
+            _persona = expert_detail.get("persona")
+            _instructions = expert_detail.get("instructions")
+            if _persona or _instructions:
+                _extra = config_override.setdefault("extra", {})
+                _rp = _extra.setdefault("_resolved_prompts", {})
+                if _persona:
+                    _rp["persona"] = _persona
+                if _instructions:
+                    _rp["instructions"] = _instructions
+                # Decision 7: a DB (user-authored) persona is untrusted input — tag
+                # it so the agent fences it at render instead of granting it system
+                # altitude. Set server-side only; never sourced from client input.
+                _extra["_persona_source"] = "db"
+
         # Normalize project_ids (backward compat: project_id → [project_id])
         effective_project_ids = request_body.project_ids or (
             [request_body.project_id] if request_body.project_id else []
@@ -12680,8 +12722,12 @@ async def create_thread(
         thread_id = await postgres_db.create_thread(
             user_id=str(user["id"]),
             project_id=effective_project_ids[0] if effective_project_ids else None,
-            config_name=request_body.config_name
-            or user_settings.get("config_name", "persistent_defaults"),
+            config_name="persistent_defaults"
+            if bound_expert_id
+            else (
+                request_body.config_name
+                or user_settings.get("config_name", "persistent_defaults")
+            ),
             permission_mode=effective_permission_mode,
             title=request_body.title,
         )
@@ -12699,8 +12745,8 @@ async def create_thread(
             metadata_patch["config_override"] = redact_config_override(config_override)
         if request_body.datasource_ids:
             metadata_patch["datasource_ids"] = request_body.datasource_ids
-        if request_body.expert_id:
-            metadata_patch["expert_id"] = request_body.expert_id
+        if bound_expert_id:
+            metadata_patch["expert_id"] = bound_expert_id
         if metadata_patch:
             async with postgres_db.acquire() as conn:
                 await conn.execute(

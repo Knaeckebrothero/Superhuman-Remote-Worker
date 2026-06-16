@@ -4,6 +4,8 @@ import {ChatPreferencesService} from './chat-preferences.service';
 
 const KEY = 'cockpit:chat:reasoningExpanded';
 const TOOL_KEY = 'cockpit:chat:toolCallsExpanded';
+const WIDTH_KEY = 'cockpit:chat:readingWidth';
+const SIZE_KEY = 'cockpit:chat:textSize';
 
 describe('ChatPreferencesService', () => {
   beforeEach(() => {
@@ -69,5 +71,60 @@ describe('ChatPreferencesService', () => {
     // reasoning untouched (still its default)
     expect(svc.reasoningExpanded()).toBe(true);
     expect(window.localStorage.getItem(KEY)).toBeNull();
+  });
+
+  // --- readingWidth (Comfortable / Wide / Full) ---
+
+  it('defaults readingWidth to "comfortable" when nothing is stored', () => {
+    expect(TestBed.inject(ChatPreferencesService).readingWidth()).toBe('comfortable');
+  });
+
+  it('reads a stored readingWidth preference at construction', () => {
+    window.localStorage.setItem(WIDTH_KEY, 'full');
+    expect(TestBed.inject(ChatPreferencesService).readingWidth()).toBe('full');
+  });
+
+  it('falls back to "comfortable" for a malformed readingWidth value', () => {
+    window.localStorage.setItem(WIDTH_KEY, 'ginormous');
+    expect(TestBed.inject(ChatPreferencesService).readingWidth()).toBe('comfortable');
+  });
+
+  it('updates the signal and persists readingWidth on set', () => {
+    const svc = TestBed.inject(ChatPreferencesService);
+    svc.setReadingWidth('wide');
+    expect(svc.readingWidth()).toBe('wide');
+    expect(window.localStorage.getItem(WIDTH_KEY)).toBe('wide');
+  });
+
+  it('round-trips a persisted readingWidth into a fresh service instance', () => {
+    TestBed.inject(ChatPreferencesService).setReadingWidth('full');
+    TestBed.resetTestingModule(); // new injector → new service, same localStorage
+    expect(TestBed.inject(ChatPreferencesService).readingWidth()).toBe('full');
+  });
+
+  // --- textSize (Small / Medium / Large) ---
+
+  it('defaults textSize to "medium" when nothing is stored', () => {
+    expect(TestBed.inject(ChatPreferencesService).textSize()).toBe('medium');
+  });
+
+  it('reads a stored textSize preference at construction', () => {
+    window.localStorage.setItem(SIZE_KEY, 'large');
+    expect(TestBed.inject(ChatPreferencesService).textSize()).toBe('large');
+  });
+
+  it('falls back to "medium" for a malformed textSize value', () => {
+    window.localStorage.setItem(SIZE_KEY, 'huge');
+    expect(TestBed.inject(ChatPreferencesService).textSize()).toBe('medium');
+  });
+
+  it('persists textSize independently of readingWidth', () => {
+    const svc = TestBed.inject(ChatPreferencesService);
+    svc.setTextSize('small');
+    expect(svc.textSize()).toBe('small');
+    expect(window.localStorage.getItem(SIZE_KEY)).toBe('small');
+    // width untouched (still its default)
+    expect(svc.readingWidth()).toBe('comfortable');
+    expect(window.localStorage.getItem(WIDTH_KEY)).toBeNull();
   });
 });
