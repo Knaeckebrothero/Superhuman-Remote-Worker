@@ -32,9 +32,12 @@ aliases:
 **Status:** **Slice 1 implemented** on `develop` (2026-06-15). Orchestrator side
 verified on dev k3d (CRUD, list/detail, export/import, `expert_id` plumbing,
 migration `0028`); runtime agent-application acceptance (T1–T6) pending — see
-`docs/tests/user_defined_experts_slice1_verification.md`. Three integration bugs
+`docs/tests/user_defined_experts_slice1_verification.md` (procedures) +
+`docs/tests/user_defined_experts_slice1_test_gaps.md` (untested inventory). Three integration bugs
 found+fixed during testing (orchestrator deployment env, delete-blocker status
-literal, agent receive plumbing). Slices 2 (grants), 3 (Cockpit), 4 (polish): not started.
+literal, agent receive plumbing). Slices 2 (grants), 3 (Cockpit), 4 (polish): not started. NB: `project_experts`
+shipped in `0028` but its link/`default_for` API is deferred to Slice 3 —
+project-default experts aren't creatable yet.
 **v2.1 — 2026-06-15:** open questions 1–5 resolved (decisions 15–19). Migrations
 renumbered `0026`/`0027` → **`0028`/`0029`** — the original slots were taken by
 `job_datasources` and `agents_aux_degraded` after v2 was written.

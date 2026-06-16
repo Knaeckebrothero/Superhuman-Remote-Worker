@@ -51,4 +51,11 @@
   // Tailwind screen-xl) with 1440px as the page-width ceiling.
   --width-content: 1280px;
   --width-content-wide: 1440px;
+
+  // Reading column for prose (chat transcript). Deliberately NARROWER than app
+  // content: prose reads best at ~50–75 chars/line (80 max, WCAG 1.4.8), so the
+  // chat column is capped separately from forms/grids. Assistant text is flush
+  // (no side padding), so the rendered line ≈ column − 40px (avatar+gap); at
+  // 700px that is ~660px → ~94 CPL at 15px Inter, matching Claude/ChatGPT/Gemini.
+  --width-chat-content: 700px;
 }

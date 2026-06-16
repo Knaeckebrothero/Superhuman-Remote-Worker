@@ -649,6 +649,10 @@ interface FileEditView {
 
       <!-- Messages -->
       <div class="messages" #messagesContainer (scroll)="onMessagesScroll()">
+        <!-- Centered reading column: caps prose line length while the scrollbar
+             stays at the pane edge. .jump-latest is kept OUTSIDE this wrapper so
+             it floats over the scroll container (sticky + align-self:center). -->
+        <div class="messages-inner">
         @for (turn of chat.visibleTurns(); track turn.id; let isLast = $last) {
           @switch (turn.kind) {
             @case ('system') {
@@ -1143,6 +1147,8 @@ interface FileEditView {
             </app-button>
           </div>
         }
+
+        </div><!-- /.messages-inner -->
 
         <!-- Jump-to-latest pill: appears when the user has scrolled up while
              new messages arrive. Sticky-positioned so it floats over the stream
@@ -1718,6 +1724,18 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
             }
         });
 
+        // Attachment chips grow the composer the same way a multi-line draft
+        // does, shrinking the .messages viewport. Re-pin to the latest turn when
+        // the queue changes (Attach button, paste, or drag-drop) so adding a
+        // file never hides the most recent history. Gated on autoScroll so a
+        // user who scrolled up to read older turns isn't yanked back down.
+        effect(() => {
+            this.chat.pendingAttachments().length;
+            if (this.autoScroll) {
+                setTimeout(() => this.scrollToBottom(), 0);
+            }
+        });
+
         // Track new messages that arrive while the user has scrolled up.
         // Drives the "Jump to latest · N new" pill (F5).
         effect(() => {
@@ -1905,6 +1923,13 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         if (!el) return;
         el.style.height = 'auto';
         el.style.height = el.scrollHeight + 'px';
+        // The composer and the message list are flex siblings, so growing the
+        // textarea shrinks the .messages viewport from the bottom. Re-pin to the
+        // latest turn — only when the user was already following the bottom — so
+        // a multi-line draft never scrolls the most recent history out of view.
+        if (this.autoScroll) {
+            setTimeout(() => this.scrollToBottom(), 0);
+        }
     }
 
     send(): void {

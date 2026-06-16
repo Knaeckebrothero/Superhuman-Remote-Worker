@@ -292,8 +292,22 @@
         padding: 16px;
         display: flex;
         flex-direction: column;
+        // Scrollbar theming is global (see styles.scss `html` rule); both
+        // scrollbar-width and scrollbar-color inherit, so no local override here.
+      }
+
+      /* Centered reading column. .messages stays full-width (padding + scroll at
+         the pane edge); this wrapper caps prose line length and carries the
+         inter-message gap. flex:1 lets the empty-state center vertically. */
+      .messages-inner {
+        flex: 1;
+        width: 100%;
+        max-width: var(--chat-content-width);
+        margin-inline: auto;
+        min-width: 0;
+        display: flex;
+        flex-direction: column;
         gap: 16px;
-        scrollbar-width: thin;
       }
 
       .empty-state {
@@ -511,7 +525,7 @@
       .message {
         display: flex;
         gap: 10px;
-        max-width: 90%;
+        max-width: 100%;
         /* Pin the avatar to the top so it sits beside the first line of a
            tall bubble rather than centering against it (#9). */
         align-items: flex-start;
@@ -554,8 +568,8 @@
       }
 
       .message-body {
-        font-size: 13px;
-        line-height: 1.5;
+        font-size: 15px;
+        line-height: 1.6;
         min-width: 0;
       }
 
@@ -1427,7 +1441,7 @@
 
       .composer {
         position: relative;
-        max-width: 880px;
+        max-width: var(--chat-content-width);
         margin: 0 auto;
         background: var(--panel-bg);
         border: 1px solid var(--border-color, var(--surface-0));
@@ -2123,7 +2137,13 @@
 
       .message-body ::ng-deep table {
         border-collapse: collapse;
-        width: 100%;
+        /* Scroll wide tables inside the reading column instead of letting them
+           push the column (or the page) wider. Block + max-content + overflow
+           is the markdown-table pattern (the renderer doesn't wrap them). */
+        display: block;
+        width: max-content;
+        max-width: 100%;
+        overflow-x: auto;
         margin: 8px 0;
         font-size: 12px;
       }
