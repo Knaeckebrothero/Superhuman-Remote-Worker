@@ -46,7 +46,7 @@ import {ApiService, IdeSessionStatus} from '../../core/services/api.service';
 import {ModelService} from '../../core/services/model.service';
 import {I18nService} from '../../core/services/i18n.service';
 import {FileHandlingService} from '../../core/services/file-handling.service';
-import {ChatPreferencesService} from '../../core/services/chat-preferences.service';
+import {ChatPreferencesService, type ChatTextSize, type ReadingWidth} from '../../core/services/chat-preferences.service';
 import {DeviceCapabilitiesService} from '../../core/services/device-capabilities.service';
 import {VoiceRecordingService} from '../../core/services/voice-recording.service';
 import {FilePreview, FileType} from '../../core/models/file.model';
@@ -239,6 +239,30 @@ export function isStartupBannerVisible(isStartingSession: boolean, turnCount: nu
  * flushes the pending queue only once, so a message queued then would never
  * send.
  */
+/**
+ * Map the reading-width preference to the `--chat-content-width` CSS value.
+ * `full` → `none` removes the cap (full-bleed); the others are pixel caps.
+ */
+export function readingWidthToCss(width: ReadingWidth): string {
+    switch (width) {
+        case 'wide': return '900px';
+        case 'full': return 'none';
+        default: return '700px';
+    }
+}
+
+/**
+ * Map the text-size preference to the `--chat-body-font-size` CSS value. Only
+ * the message body scales; code/tables keep their own fixed sizes.
+ */
+export function textSizeToCss(size: ChatTextSize): string {
+    switch (size) {
+        case 'small': return '13px';
+        case 'large': return '17px';
+        default: return '15px';
+    }
+}
+
 export function canComposeDuringSession(isConnected: boolean, isStartingSession: boolean): boolean {
     return isConnected || isStartingSession;
 }
@@ -364,7 +388,9 @@ interface FileEditView {
         AppDialogComponent,
     ],
     template: `
-    <div class="chat-container">
+    <div class="chat-container"
+         [style.--chat-content-width]="chatWidthValue()"
+         [style.--chat-body-font-size]="chatTextSizeValue()">
       <!-- Drag-and-drop overlay (covers the chat area while files are being dragged) -->
       @if (isDragOver()) {
         <div class="drop-overlay" aria-hidden="true">
@@ -515,6 +541,26 @@ interface FileEditView {
                    [ngModel]="chat.temperature()"
                    (ngModelChange)="onTemperatureChange($event)">
           </div>
+          <div class="settings-row">
+            <label class="settings-label">{{ 'chat.settings.readingWidth' | transloco }}</label>
+            <app-select size="sm" [fullWidth]="false"
+                        [value]="chatPrefs.readingWidth()"
+                        (changed)="onReadingWidthChange($event)">
+              <option value="comfortable">{{ 'chat.settings.widthComfortable' | transloco }}</option>
+              <option value="wide">{{ 'chat.settings.widthWide' | transloco }}</option>
+              <option value="full">{{ 'chat.settings.widthFull' | transloco }}</option>
+            </app-select>
+          </div>
+          <div class="settings-row">
+            <label class="settings-label">{{ 'chat.settings.textSize' | transloco }}</label>
+            <app-select size="sm" [fullWidth]="false"
+                        [value]="chatPrefs.textSize()"
+                        (changed)="onTextSizeChange($event)">
+              <option value="small">{{ 'chat.settings.textSmall' | transloco }}</option>
+              <option value="medium">{{ 'chat.settings.textMedium' | transloco }}</option>
+              <option value="large">{{ 'chat.settings.textLarge' | transloco }}</option>
+            </app-select>
+          </div>
         </div>
       }
 
@@ -569,10 +615,12 @@ interface FileEditView {
             <details class="tool-card" [class.has-decision]="!!tc.decision" [class.tool-error]="tc.status === 'error'" [attr.open]="(tc.status === 'denied' || tc.status === 'error') ? '' : null">
               <summary class="tool-head">
                 <app-icon size="sm" class="tool-icon">{{ toolIcon(tc.tool) }}</app-icon>
-                @if (tc.decision; as d) {
-                  <span class="approval-badge" [class]="'approval-' + d">
-                    <app-icon size="sm" class="approval-badge-icon">{{ d === 'approved' ? 'check_circle' : 'block' }}</app-icon>
-                    {{ ('chat.approval.badge.' + d) | transloco }}
+                <!-- Approval is only surfaced for denials; an approved call
+                     renders identically to an auto-accepted / autonomous one. -->
+                @if (tc.decision === 'denied') {
+                  <span class="approval-badge approval-denied">
+                    <app-icon size="sm" class="approval-badge-icon">block</app-icon>
+                    {{ 'chat.approval.badge.denied' | transloco }}
                   </span>
                 }
                 <span class="tool-name">{{ tc.tool }}</span>
@@ -804,13 +852,6 @@ interface FileEditView {
                           @for (event of group.tools; track event.id) {
                             <div class="event-tool">
                               <ng-container [ngTemplateOutlet]="toolDetails" [ngTemplateOutletContext]="{ $implicit: [event] }"></ng-container>
-                              @if (event.decision; as d) {
-                                <div class="mile-resolved" [class.approved]="d === 'approved'" [class.rejected]="d === 'denied'">
-                                  <app-icon size="sm" class="mile-resolved-icon">{{ d === 'approved' ? 'check_circle' : 'block' }}</app-icon>
-                                  <span class="resolved-label">{{ ('chat.approval.badge.' + d) | transloco }}</span>
-                                  <span class="resolved-title">{{ event.tool }}</span>
-                                </div>
-                              }
                             </div>
                           }
                         }
@@ -1450,6 +1491,11 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     private readonly http = inject(HttpClient);
     private readonly fileHandling = inject(FileHandlingService);
     readonly chatPrefs = inject(ChatPreferencesService);
+
+    /** `--chat-content-width` / `--chat-body-font-size` bound on `.chat-container`,
+     *  derived from the per-device preferences (see readingWidthToCss/textSizeToCss). */
+    readonly chatWidthValue = computed(() => readingWidthToCss(this.chatPrefs.readingWidth()));
+    readonly chatTextSizeValue = computed(() => textSizeToCss(this.chatPrefs.textSize()));
     private readonly deviceCapabilities = inject(DeviceCapabilitiesService);
     private readonly voiceRecording = inject(VoiceRecordingService);
     private readonly router = inject(Router);
@@ -2540,6 +2586,20 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     onToolCallsDefaultChange(value: string | null): void {
         if (value === 'expanded' || value === 'collapsed') {
             this.chatPrefs.setToolCallsExpanded(value === 'expanded');
+        }
+    }
+
+    /** Display-only: the reading-column width preset (Comfortable / Wide / Full). */
+    onReadingWidthChange(value: string | null): void {
+        if (value === 'comfortable' || value === 'wide' || value === 'full') {
+            this.chatPrefs.setReadingWidth(value);
+        }
+    }
+
+    /** Display-only: the prose text-size preset (Small / Medium / Large). */
+    onTextSizeChange(value: string | null): void {
+        if (value === 'small' || value === 'medium' || value === 'large') {
+            this.chatPrefs.setTextSize(value);
         }
     }
 

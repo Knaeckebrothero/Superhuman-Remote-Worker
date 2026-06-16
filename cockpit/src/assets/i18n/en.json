@@ -901,7 +901,15 @@
       "reasoningExpanded": "Expanded",
       "reasoningCollapsed": "Collapsed",
       "toolCallsExpanded": "Expanded",
-      "toolCallsCollapsed": "Collapsed"
+      "toolCallsCollapsed": "Collapsed",
+      "readingWidth": "Reading width",
+      "widthComfortable": "Comfortable",
+      "widthWide": "Wide",
+      "widthFull": "Full width",
+      "textSize": "Text size",
+      "textSmall": "Small",
+      "textMedium": "Medium",
+      "textLarge": "Large"
     },
     "tasks": {
       "header": "Tasks {{done}}/{{total}}",

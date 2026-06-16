@@ -568,7 +568,9 @@
       }
 
       .message-body {
-        font-size: 15px;
+        /* 15px default; the per-device text-size preference overrides via the
+           --chat-body-font-size custom property set on .chat-container. */
+        font-size: var(--chat-body-font-size, 15px);
         line-height: 1.6;
         min-width: 0;
       }
@@ -1162,58 +1164,6 @@
         gap: 8px;
       }
 
-      .mile-resolved {
-        align-self: flex-start;
-        margin: 6px 0 6px 40px;
-        width: min(720px, calc(100% - 40px));
-        padding: 8px 14px;
-        display: flex;
-        align-items: center;
-        gap: 10px;
-        background: var(--surface-0);
-        border: 1px solid var(--border-color, var(--surface-0));
-        border-left: 3px solid var(--text-muted);
-        border-radius: 0;
-        font-family: 'JetBrains Mono', monospace;
-        font-size: 12px;
-        color: var(--text-secondary);
-      }
-
-      .mile-resolved.approved { border-left-color: var(--success); }
-      .mile-resolved.rejected { border-left-color: var(--text-muted); opacity: 0.85; }
-
-      .mile-resolved-icon { font-size: 16px; flex-shrink: 0; color: var(--text-muted); }
-      .mile-resolved.approved .mile-resolved-icon { color: var(--success); }
-      .mile-resolved.rejected .mile-resolved-icon { color: var(--text-muted); }
-
-      .mile-resolved .resolved-label {
-        font-family: var(--font-display, inherit);
-        text-transform: uppercase;
-        letter-spacing: 0.18em;
-        font-size: 10px;
-        font-weight: 600;
-        color: var(--text-primary);
-        flex-shrink: 0;
-      }
-
-      .mile-resolved.approved .resolved-label { color: var(--success); }
-
-      .mile-resolved .resolved-title {
-        color: var(--text-primary);
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-        min-width: 0;
-        flex: 1;
-      }
-
-      .mile-resolved .resolved-time {
-        margin-left: auto;
-        font-size: 11px;
-        color: var(--text-muted);
-        flex-shrink: 0;
-      }
-
       .approval-badge {
         display: inline-flex;
         align-items: center;
@@ -1225,11 +1175,6 @@
         text-transform: uppercase;
         letter-spacing: 0.04em;
         flex-shrink: 0;
-      }
-
-      .approval-badge.approval-approved {
-        background: var(--success-tint);
-        color: var(--success);
       }
 
       .approval-badge.approval-denied {

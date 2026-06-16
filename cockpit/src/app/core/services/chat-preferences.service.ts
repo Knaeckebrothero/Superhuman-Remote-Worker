@@ -3,6 +3,16 @@ import {isPlatformBrowser} from '@angular/common';
 
 const REASONING_EXPANDED_KEY = 'cockpit:chat:reasoningExpanded';
 const TOOL_CALLS_EXPANDED_KEY = 'cockpit:chat:toolCallsExpanded';
+const READING_WIDTH_KEY = 'cockpit:chat:readingWidth';
+const TEXT_SIZE_KEY = 'cockpit:chat:textSize';
+
+/** Reading-column width preset for the chat transcript. */
+export type ReadingWidth = 'comfortable' | 'wide' | 'full';
+export const READING_WIDTHS: readonly ReadingWidth[] = ['comfortable', 'wide', 'full'];
+
+/** Prose text-size preset for the chat transcript. */
+export type ChatTextSize = 'small' | 'medium' | 'large';
+export const CHAT_TEXT_SIZES: readonly ChatTextSize[] = ['small', 'medium', 'large'];
 
 /**
  * Device-local display preferences for the persistent-chat view.
@@ -46,6 +56,57 @@ export class ChatPreferencesService {
   setToolCallsExpanded(expanded: boolean): void {
     this.toolCallsExpanded.set(expanded);
     this.writeBool(TOOL_CALLS_EXPANDED_KEY, expanded);
+  }
+
+  /**
+   * Reading-column width for the transcript. Defaults to `comfortable` (the
+   * ~700px cap, ~94 CPL). `wide` loosens it; `full` removes the cap entirely
+   * (the pre-readability-cap full-bleed look). Drives `--chat-content-width`,
+   * which both the message column and the composer read.
+   */
+  readonly readingWidth = signal<ReadingWidth>(
+    this.readEnum(READING_WIDTH_KEY, READING_WIDTHS, 'comfortable'),
+  );
+
+  /** Set the reading-width preset and persist it for this device. */
+  setReadingWidth(width: ReadingWidth): void {
+    this.readingWidth.set(width);
+    this.writeString(READING_WIDTH_KEY, width);
+  }
+
+  /**
+   * Prose text size for the transcript. Defaults to `medium` (15px). Only the
+   * message body scales; code/tables keep their own fixed sizes. Drives
+   * `--chat-body-font-size`.
+   */
+  readonly textSize = signal<ChatTextSize>(
+    this.readEnum(TEXT_SIZE_KEY, CHAT_TEXT_SIZES, 'medium'),
+  );
+
+  /** Set the text-size preset and persist it for this device. */
+  setTextSize(size: ChatTextSize): void {
+    this.textSize.set(size);
+    this.writeString(TEXT_SIZE_KEY, size);
+  }
+
+  /** Read a stored value, returning the fallback unless it's a known member. */
+  private readEnum<T extends string>(key: string, allowed: readonly T[], fallback: T): T {
+    if (!this.isBrowser) return fallback;
+    try {
+      const raw = window.localStorage.getItem(key);
+      return (allowed as readonly string[]).includes(raw ?? '') ? (raw as T) : fallback;
+    } catch {
+      return fallback;
+    }
+  }
+
+  private writeString(key: string, value: string): void {
+    if (!this.isBrowser) return;
+    try {
+      window.localStorage.setItem(key, value);
+    } catch {
+      // localStorage blocked (private mode / quota) — applies for this session only.
+    }
   }
 
   private readBool(key: string, fallback: boolean): boolean {
