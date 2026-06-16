@@ -31,7 +31,13 @@ logger = logging.getLogger(__name__)
 
 _LABEL_SELECTOR = "srw.io/component=agent-workspace"
 
-_IDLE_JOB_STATUSES = frozenset({"paused", "pending_review", "waiting_for_reply"})
+# 'reviewing' is the verification-enabled twin of 'pending_review' (set by
+# determine_job_status when a critic is involved). The agent has frozen and the
+# critic reviews out-of-band in its own git workspace, so the parent pod is just
+# as idle/suspendable as 'pending_review'. Keep the two in lockstep.
+_IDLE_JOB_STATUSES = frozenset(
+    {"paused", "pending_review", "reviewing", "waiting_for_reply"}
+)
 _IDLE_THREAD_STATUSES = frozenset({"ended"})
 
 # Terminal = bound work is finished; nothing to preserve beyond an existing

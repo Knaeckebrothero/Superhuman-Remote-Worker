@@ -266,6 +266,14 @@ class TestIsIdle:
         assert await mgr.is_idle(inst) is True
 
     @pytest.mark.asyncio
+    async def test_reviewing_job_is_idle(self):
+        # Mirrors the workspace manager: 'reviewing' parks the VM just like
+        # 'pending_review' (critic reviews out-of-band), so it is suspendable.
+        mgr, *_ = _make_manager()
+        inst = Instance(kind="vm", id="x", metadata={"job_status": "reviewing"})
+        assert await mgr.is_idle(inst) is True
+
+    @pytest.mark.asyncio
     async def test_processing_job_is_not_idle(self):
         mgr, *_ = _make_manager()
         inst = Instance(kind="vm", id="x", metadata={"job_status": "processing"})
@@ -405,6 +413,12 @@ class TestIsReapable:
     async def test_paused_job_is_reapable(self):
         mgr, *_ = _make_manager()
         inst = Instance(kind="vm", id="x", metadata={"job_status": "paused"})
+        assert await mgr.is_reapable(inst) is True
+
+    @pytest.mark.asyncio
+    async def test_reviewing_job_is_reapable(self):
+        mgr, *_ = _make_manager()
+        inst = Instance(kind="vm", id="x", metadata={"job_status": "reviewing"})
         assert await mgr.is_reapable(inst) is True
 
     @pytest.mark.asyncio

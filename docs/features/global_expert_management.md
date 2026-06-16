@@ -29,7 +29,12 @@ aliases:
 > system exactly; **(b)** a **capability-grants** layer (generalizing
 > `users.can_use_vm`) gates what users may bake into an expert.
 
-**Status:** Design / not started.
+**Status:** **Slice 1 implemented** on `develop` (2026-06-15). Orchestrator side
+verified on dev k3d (CRUD, list/detail, export/import, `expert_id` plumbing,
+migration `0028`); runtime agent-application acceptance (T1–T6) pending — see
+`docs/tests/user_defined_experts_slice1_verification.md`. Three integration bugs
+found+fixed during testing (orchestrator deployment env, delete-blocker status
+literal, agent receive plumbing). Slices 2 (grants), 3 (Cockpit), 4 (polish): not started.
 **v2.1 — 2026-06-15:** open questions 1–5 resolved (decisions 15–19). Migrations
 renumbered `0026`/`0027` → **`0028`/`0029`** — the original slots were taken by
 `job_datasources` and `agents_aux_degraded` after v2 was written.

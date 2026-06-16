@@ -34,7 +34,12 @@ from .types import Instance
 logger = logging.getLogger(__name__)
 
 
-_IDLE_JOB_STATUSES = frozenset({"paused", "pending_review", "waiting_for_reply"})
+# 'reviewing' is the verification-enabled twin of 'pending_review'; both park
+# the bound work while a critic reviews out-of-band. Kept in lockstep with
+# WorkspaceInstanceManager._IDLE_JOB_STATUSES.
+_IDLE_JOB_STATUSES = frozenset(
+    {"paused", "pending_review", "reviewing", "waiting_for_reply"}
+)
 _IDLE_THREAD_STATUSES = frozenset({"ended"})
 
 # Terminal = bound work finished; reapable = pod/VM no longer needed at all
