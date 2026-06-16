@@ -901,7 +901,15 @@
       "reasoningExpanded": "Ausgeklappt",
       "reasoningCollapsed": "Eingeklappt",
       "toolCallsExpanded": "Ausgeklappt",
-      "toolCallsCollapsed": "Eingeklappt"
+      "toolCallsCollapsed": "Eingeklappt",
+      "readingWidth": "Lesebreite",
+      "widthComfortable": "Komfortabel",
+      "widthWide": "Breit",
+      "widthFull": "Volle Breite",
+      "textSize": "Textgröße",
+      "textSmall": "Klein",
+      "textMedium": "Mittel",
+      "textLarge": "Groß"
     },
     "tasks": {
       "header": "Aufgaben {{done}}/{{total}}",

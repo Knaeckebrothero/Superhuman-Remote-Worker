@@ -7,7 +7,9 @@ import {
     pickCodeServerUrlToOpen,
     pickCurrentStartupStep,
     pickRunningCommandCard,
+    readingWidthToCss,
     shouldFoldToolRun,
+    textSizeToCss,
 } from './persistent-chat.component';
 import {AssistantTurn} from '../../core/models/turn.model';
 
@@ -238,5 +240,33 @@ describe('shouldFoldToolRun', () => {
     it('treats the threshold as inclusive (>=); one below stays inline', () => {
         expect(shouldFoldToolRun(T, false, T)).toBe(true);
         expect(shouldFoldToolRun(T - 1, false, T)).toBe(false);
+    });
+});
+
+describe('readingWidthToCss', () => {
+    it('maps comfortable → the 700px reading column', () => {
+        expect(readingWidthToCss('comfortable')).toBe('700px');
+    });
+
+    it('maps wide → 900px', () => {
+        expect(readingWidthToCss('wide')).toBe('900px');
+    });
+
+    it('maps full → none (no cap = full-bleed)', () => {
+        expect(readingWidthToCss('full')).toBe('none');
+    });
+});
+
+describe('textSizeToCss', () => {
+    it('maps small → 13px', () => {
+        expect(textSizeToCss('small')).toBe('13px');
+    });
+
+    it('maps medium → the 15px default', () => {
+        expect(textSizeToCss('medium')).toBe('15px');
+    });
+
+    it('maps large → 17px', () => {
+        expect(textSizeToCss('large')).toBe('17px');
     });
 });
