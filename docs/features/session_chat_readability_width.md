@@ -26,11 +26,18 @@ related:
 | Part | Scope | Status |
 |---|---|---|
 | **A — Page container widths** | Forms / lists / admin / settings pages | ✅ **SHIPPED** — committed, verified live (§2) |
-| **B — Session chat reading width** | The persistent-chat transcript | 📋 **PROPOSED** — measured + designed, **not implemented** (§3) |
+| **B — Session chat reading width** | The persistent-chat transcript | ✅ **IMPLEMENTED (2026-06-16)** — working tree, **uncommitted**; compile (27/27 spec) + layout/CPL verified via mock; live-cluster §6 check still pending (cluster was down) |
 
-**Resume in one line:** Part A is done; **Part B is the open work** — pick the
-width/font from §3.3, implement per §5, verify with the script in §6. Full
-resume checklist in §7.
+**Resume in one line:** Both parts are implemented. **Part B open items:** confirm
+on the live stack with real Inter via the §6 script (target the ~90 CPL band),
+then commit. Settled decisions + the corrected CPL math are in §3.4/§5.
+
+> **2026-06-16 correction.** The original §3.4 recommendation (760px) assumed
+> assistant text loses ~100px to padding. It doesn't — assistant bubbles are
+> *flush* (`padding: 4px 0`), so the rendered line ≈ column − 40px (avatar 30 +
+> gap 10) only. Measured, **760px → ~102 CPL** (over the 90–100 / 75–95 targets).
+> Shipped value is **700px → ~94 CPL** (text ≈ 660px @ 15px Inter). It's one
+> token — nudge `--width-chat-content` to taste.
 
 ---
 
@@ -160,7 +167,7 @@ contained.
 **New token** (prose wants a *narrower* cap than app content — keep separate):
 ```scss
 // _root-tokens.scss (primitive)
---width-chat-content: 760px;   // session reading column
+--width-chat-content: 700px;   // session reading column
 // _semantic-tokens.scss (role)
 --chat-content-width: var(--width-chat-content);
 ```
@@ -179,18 +186,23 @@ full-width (padding + overflow); wrap the message list in a centered column.
 ```
 `.message` `max-width: 90% → 100%` (wrapper now bounds it); keep `align-self`.
 
-**Width / font targets** (avg glyph 6.1px@13px → ~7.0px@15px; assistant text ≈
-`column − ~100px` for padding + 30px avatar + 10px gap):
+**Width / font targets** (avg glyph 6.1px@13px → ~7.04px@15px; assistant text ≈
+`column − 40px` = 30px avatar + 10px gap — **assistant bubbles are flush, no side
+padding**, so the rendered line is wider than a padded estimate would suggest.
+Verified by mock + canvas measure, 2026-06-16):
 
-| Option | `--chat-content-width` | Body font | ≈ text px | ≈ CPL | Feel |
+| Option | `--chat-content-width` | Body font | ≈ text px | ≈ CPL (15px Inter) | Feel |
 |---|---|---|---|---|---|
-| Tight | 660px | 15px | ~560 | ~80 | Closest to ideal; cramped with tables |
-| **Comfortable (rec)** | **760px** | **15px** | ~660 | **~90** | Matches Claude/ChatGPT/Gemini |
-| Roomy | 820px | 15px | ~690 | ~98 | Preview shown; a touch wide |
+| Tight | 660px | 15px | ~620 | ~88 | Closest to ideal; tighter with tables |
+| Snug | 680px | 15px | ~640 | ~91 | A hair under the rec |
+| **Comfortable (shipped)** | **700px** | **15px** | ~660 | **~94** | Matches Claude/ChatGPT/Gemini |
+| Roomy | 720px | 15px | ~680 | ~97 | A touch wide |
+| (doc's old rec) | 760px | 15px | ~720 | ~102 | Over target — see correction above |
 
 Production chat UIs run ~90–100 CPL (trade strict 66 for room for code/lists/
-tables). **Recommended: 760px + 15px.** The 13→15px bump is a coordinated but
-separable lever (13px is small for primary reading; bigger font also lowers CPL).
+tables). **Shipped: 700px + 15px (~94 CPL).** The 13→15px bump is a coordinated
+but separable lever (13px is small for primary reading; bigger font also lowers
+CPL). Absolute CPL must be confirmed on the live stack (real Inter) via §6.
 
 **Keep wide / don't cap:** fenced code & `pre` → ensure `overflow-x:auto`
 (scroll inside the column, don't widen it); markdown tables → block + overflow-x;
@@ -228,14 +240,31 @@ tool/debug text keep their 11px).
 
 ---
 
-## 5. Open decisions (Part B) — settle on resume
-1. **Target width** — Tight 660 / **Comfortable 760 (rec)** / Roomy 820.
-2. **Font bump 13→15px** — recommended; confirm acceptable.
-3. **Composer** — align to `--chat-content-width` (rec) or keep 880px.
-4. **`.message.tool-only` full-bleed** — keep tool output able to exceed the
-   prose column (good for wide command output/diffs) [leaning yes], or constrain
-   to the column for consistency.
-5. **Empty-state** (`.empty-inner`, 850px) — leave or align (cosmetic).
+## 5. Decisions (Part B) — RESOLVED 2026-06-16
+1. **Target width** — **700px** (shipped). Was 760; corrected down after measuring
+   that flush assistant text → ~102 CPL at 760 (see §3.4 correction). 700 ≈ 94 CPL.
+2. **Font bump 13→15px** — **done** (`.message-body` 13→15px, line-height 1.5→1.6).
+3. **Composer** — **aligned** to `var(--chat-content-width)` (was 880px), so the
+   input sits under the transcript at the same width.
+4. **`.message.tool-only` full-bleed** — **moot**. The class isn't applied in the
+   current template (tools render inside the assistant `.turn-bubble`; `.tool-card`
+   self-caps at 720px ≈ the column). The `.message.tool-only` SCSS is vestigial and
+   left as-is. Nothing renders wall-to-wall, so no breakout was needed.
+5. **Empty-state** (`.empty-inner`, 850px) — **aligned by consequence**: it now sits
+   inside `.messages-inner`, so the suggestion grid is capped to the 700 column
+   instead of 850. Cosmetic, more consistent; revert by moving `.empty-state`
+   outside the wrapper if the grid feels cramped.
+
+**How it was built** (differs slightly from §3.5): the wrapper encloses the whole
+message *flow* (the `@for…@empty` plus the transient mile/compaction/end-marker/
+resume/reconnect cards), not just the `@for`, so those cards align in the column
+too. `.jump-latest` is kept OUTSIDE the wrapper (it's `position:sticky;
+align-self:center` and must stay a direct child of the `.messages` flex column).
+`.messages` keeps `display:flex;flex-direction:column` (so `.messages-inner{flex:1}`
+lets the empty-state center vertically); only its `gap:16px` moved to the wrapper.
+Markdown tables changed `width:100%` → `display:block; width:max-content;
+max-width:100%; overflow-x:auto` so wide tables scroll inside the column. `pre`
+already had `overflow-x:auto`.
 
 ---
 

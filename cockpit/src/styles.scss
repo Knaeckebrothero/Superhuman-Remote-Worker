@@ -68,6 +68,18 @@ body {
   background: var(--surface-2);
 }
 
+// Standard scrollbar properties (Firefox + Chromium 121+). Both are inherited,
+// so this one declaration themes every scrollbar in the app. When a browser
+// honours these it IGNORES the ::-webkit-scrollbar rules above — those remain
+// only as a fallback for Safari / older Chromium. Without this block Firefox
+// showed the unstyled OS scrollbar, and any element that sets `scrollbar-width`
+// (e.g. .messages) dropped the webkit theme on Chromium too, rendering the
+// default light-grey bar.
+html {
+  scrollbar-width: thin;
+  scrollbar-color: var(--surface-1) var(--panel-bg);
+}
+
 // --- Focus indicators (keyboard navigation) ---
 :focus-visible {
   outline: 2px solid var(--accent-color);

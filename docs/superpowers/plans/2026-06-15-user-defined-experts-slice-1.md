@@ -10,14 +10,45 @@
 
 **Spec:** `docs/features/global_expert_management.md` v2.2 (Slice 1 = lines 404–418). This plan implements that slice's bullets, with the two reconciliations noted in the header above.
 
-> **Implementation status (2026-06-15):** Tasks 1–14 implemented on `develop`;
-> pure-logic tests green (22); orchestrator side verified on dev k3d. Three
-> integration bugs surfaced in cluster testing and were fixed (orchestrator
-> deployment `EXPERTS_DB_ENABLED` env; delete-blocker `'queued'`→`'waiting'`;
-> agent receive plumbing in `src/api/models.py` + `dual_app.py` + `app.py`).
-> **Task 15 (runtime acceptance) is NOT done** — captured as T1–T6 in
-> `docs/tests/user_defined_experts_slice1_verification.md`. The `- [ ]` boxes
-> below are the plan as authored and are not used for live status tracking.
+> ## ── CURRENT STATE (2026-06-16) — read this first ──
+>
+> **Implemented & committed on `develop`** (Tasks 1–14): migration `0028`
+> (experts + project_experts + `jobs.expert_id`); experts CRUD + duplicate +
+> import/export; DB-aware `/api/experts` list & detail; agent expert-by-id load
+> + persona fencing + freeze; `expert_id` plumbed through job-create,
+> session-create + both provisioners, and automations; `EXPERTS_DB_ENABLED`
+> flag (ON in dev / OFF in prod).
+>
+> **+ three integration bugs found in dev-k3d testing and fixed (committed):**
+> 1. orchestrator deployment uses explicit `env:`, so it needed an
+>    `EXPERTS_DB_ENABLED` entry — `helm/templates/orchestrator/deployment.yaml`.
+> 2. delete-blocker status literal `'queued'` → `'waiting'` (no `'queued'` in the
+>    schema) — `orchestrator/database/postgres.py`.
+> 3. **critical:** the agent's *own* `JobStartRequest` model +
+>    `_process_orchestrator_job` didn't carry `expert_id`, so `process_job` never
+>    saw it and the first job froze the **default** persona —
+>    `src/api/models.py`, `src/api/dual_app.py`, `src/api/app.py`.
+>
+> **Verified:** pure-logic unit tests (22 green); orchestrator side live on dev
+> k3d — create / list (source-tagged) / detail (fragment merged onto base) /
+> export→import (fork-on-import); migration applied; `jobs.expert_id` set.
+>
+> **NOT verified — resume here:** the agent **runtime** application (load expert
+> → fence persona → freeze `resolved_config`). Procedures = **T1–T6** in
+> `docs/tests/user_defined_experts_slice1_verification.md`. `update` / `duplicate`
+> / `delete`-409 endpoints also not yet exercised on-cluster. **Full untested
+> inventory:** `docs/tests/user_defined_experts_slice1_test_gaps.md`.
+>
+> **Slice-1 scope gap:** the `project_experts` junction exists and name-resolution
+> reads it, but **no link / `default_for` API is implemented** (deferred to
+> Slice 3), so project-default experts can't be created yet (resolution tier 2
+> is currently unreachable).
+>
+> **Not in Slice 1 (future):** capability grants + dispatch enforcement (Slice 2);
+> Cockpit UI (Slice 3); version-history / test-drive / per-expert stats (Slice 4).
+>
+> The `- [ ]` boxes below are the plan **as authored**; this callout is the live
+> status (Task 15 / the boxes are not flipped).
 
 ---
 
