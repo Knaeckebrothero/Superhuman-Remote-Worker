@@ -234,6 +234,15 @@ class TestIsIdle:
         assert await mgr.is_idle(inst) is True
 
     @pytest.mark.asyncio
+    async def test_reviewing_job_is_idle(self):
+        # 'reviewing' is the verification-enabled twin of 'pending_review':
+        # the agent has frozen and a separate critic job reviews via git, so
+        # the parent workspace is quiescent and snapshot+free-able.
+        mgr, *_ = _make_manager()
+        inst = Instance(kind="workspace", id="x", metadata={"job_status": "reviewing"})
+        assert await mgr.is_idle(inst) is True
+
+    @pytest.mark.asyncio
     async def test_processing_is_not_idle(self):
         mgr, *_ = _make_manager()
         inst = Instance(kind="workspace", id="x", metadata={"job_status": "processing"})
@@ -295,6 +304,15 @@ class TestIsReapable:
     async def test_paused_job_is_reapable(self):
         mgr, *_ = _make_manager()
         inst = Instance(kind="workspace", id="x", metadata={"job_status": "paused"})
+        assert await mgr.is_reapable(inst) is True
+
+    @pytest.mark.asyncio
+    async def test_reviewing_job_is_reapable(self):
+        # A workspace parked in 'reviewing' (critic verifies out-of-band via
+        # git) must be snapshot+freed like 'pending_review' — otherwise the pod
+        # is pinned for the entire, possibly unbounded, review window.
+        mgr, *_ = _make_manager()
+        inst = Instance(kind="workspace", id="x", metadata={"job_status": "reviewing"})
         assert await mgr.is_reapable(inst) is True
 
     @pytest.mark.asyncio

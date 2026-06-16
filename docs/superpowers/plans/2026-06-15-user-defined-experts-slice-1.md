@@ -10,6 +10,15 @@
 
 **Spec:** `docs/features/global_expert_management.md` v2.2 (Slice 1 = lines 404–418). This plan implements that slice's bullets, with the two reconciliations noted in the header above.
 
+> **Implementation status (2026-06-15):** Tasks 1–14 implemented on `develop`;
+> pure-logic tests green (22); orchestrator side verified on dev k3d. Three
+> integration bugs surfaced in cluster testing and were fixed (orchestrator
+> deployment `EXPERTS_DB_ENABLED` env; delete-blocker `'queued'`→`'waiting'`;
+> agent receive plumbing in `src/api/models.py` + `dual_app.py` + `app.py`).
+> **Task 15 (runtime acceptance) is NOT done** — captured as T1–T6 in
+> `docs/tests/user_defined_experts_slice1_verification.md`. The `- [ ]` boxes
+> below are the plan as authored and are not used for live status tracking.
+
 ---
 
 ## Testing posture (read before starting)
