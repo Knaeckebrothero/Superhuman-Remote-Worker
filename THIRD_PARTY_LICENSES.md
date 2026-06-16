@@ -125,20 +125,19 @@ _No bundled dependency ships a NOTICE file._
 |---|---|---|---|
 | [@angular-devkit/core](https://www.npmjs.com/package/@angular-devkit/core) | 21.2.11 | MIT | ALLOW |
 | [@angular-devkit/schematics](https://www.npmjs.com/package/@angular-devkit/schematics) | 21.2.11 | MIT | ALLOW |
-| [@angular/animations](https://www.npmjs.com/package/@angular/animations) | 21.2.13 | MIT | ALLOW |
 | [@angular/cdk](https://www.npmjs.com/package/@angular/cdk) | 21.2.11 | MIT | ALLOW |
-| [@angular/common](https://www.npmjs.com/package/@angular/common) | 21.2.13 | MIT | ALLOW |
-| [@angular/compiler](https://www.npmjs.com/package/@angular/compiler) | 21.2.13 | MIT | ALLOW |
-| [@angular/core](https://www.npmjs.com/package/@angular/core) | 21.2.13 | MIT | ALLOW |
-| [@angular/forms](https://www.npmjs.com/package/@angular/forms) | 21.2.13 | MIT | ALLOW |
-| [@angular/platform-browser](https://www.npmjs.com/package/@angular/platform-browser) | 21.2.13 | MIT | ALLOW |
-| [@angular/platform-server](https://www.npmjs.com/package/@angular/platform-server) | 21.2.13 | MIT | ALLOW |
+| [@angular/common](https://www.npmjs.com/package/@angular/common) | 21.2.17 | MIT | ALLOW |
+| [@angular/compiler](https://www.npmjs.com/package/@angular/compiler) | 21.2.17 | MIT | ALLOW |
+| [@angular/core](https://www.npmjs.com/package/@angular/core) | 21.2.17 | MIT | ALLOW |
+| [@angular/forms](https://www.npmjs.com/package/@angular/forms) | 21.2.17 | MIT | ALLOW |
+| [@angular/platform-browser](https://www.npmjs.com/package/@angular/platform-browser) | 21.2.17 | MIT | ALLOW |
+| [@angular/platform-server](https://www.npmjs.com/package/@angular/platform-server) | 21.2.17 | MIT | ALLOW |
 | [@angular/pwa](https://www.npmjs.com/package/@angular/pwa) | 21.2.11 | MIT | ALLOW |
-| [@angular/router](https://www.npmjs.com/package/@angular/router) | 21.2.13 | MIT | ALLOW |
-| [@angular/service-worker](https://www.npmjs.com/package/@angular/service-worker) | 21.2.13 | MIT | ALLOW |
+| [@angular/router](https://www.npmjs.com/package/@angular/router) | 21.2.17 | MIT | ALLOW |
+| [@angular/service-worker](https://www.npmjs.com/package/@angular/service-worker) | 21.2.17 | MIT | ALLOW |
 | [@angular/ssr](https://www.npmjs.com/package/@angular/ssr) | 21.2.11 | MIT | ALLOW |
-| [@babel/code-frame](https://www.npmjs.com/package/@babel/code-frame) | 7.29.0 | MIT | ALLOW |
-| [@babel/helper-validator-identifier](https://www.npmjs.com/package/@babel/helper-validator-identifier) | 7.28.5 | MIT | ALLOW |
+| [@babel/code-frame](https://www.npmjs.com/package/@babel/code-frame) | 7.29.7 | MIT | ALLOW |
+| [@babel/helper-validator-identifier](https://www.npmjs.com/package/@babel/helper-validator-identifier) | 7.29.7 | MIT | ALLOW |
 | [@jridgewell/sourcemap-codec](https://www.npmjs.com/package/@jridgewell/sourcemap-codec) | 1.5.5 | MIT | ALLOW |
 | [@jsverse/transloco](https://www.npmjs.com/package/@jsverse/transloco) | 8.3.0 | MIT | ALLOW |
 | [@jsverse/transloco-locale](https://www.npmjs.com/package/@jsverse/transloco-locale) | 8.3.0 | MIT | ALLOW |
@@ -284,7 +283,7 @@ _No bundled dependency ships a NOTICE file._
 | [wrappy](https://www.npmjs.com/package/wrappy) | 1.0.2 | ISC | ALLOW |
 | [xhr2](https://www.npmjs.com/package/xhr2) | 0.2.1 | MIT | ALLOW |
 | [yoctocolors](https://www.npmjs.com/package/yoctocolors) | 2.1.2 | MIT | ALLOW |
-| [zone.js](https://www.npmjs.com/package/zone.js) | 0.16.1 | MIT | ALLOW |
+| [zone.js](https://www.npmjs.com/package/zone.js) | 0.16.2 | MIT | ALLOW |
 <!-- END: frontend-inventory -->
 
 ---
