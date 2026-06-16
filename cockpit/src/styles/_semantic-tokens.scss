@@ -25,4 +25,5 @@
   // --- Layout roles ---
   --content-max-width:      var(--width-content);      // centered page content: forms, settings, lists, grids
   --content-max-width-wide: var(--width-content-wide); // table/grid-dense pages: project detail, dense admin
+  --chat-content-width:     var(--width-chat-content); // chat transcript reading column (prose; narrower on purpose)
 }
