@@ -20,16 +20,16 @@
 #   2. **No HEALTHCHECK**: K8s probes own liveness/readiness in the dev
 #      cluster; the dockerd-side HEALTHCHECK is redundant and just slows
 #      pod startup.
-#   3. **No CitationEngine build-arg path**: Tilt always builds from the
-#      published pip dep; if you're iterating on CitationEngine itself,
-#      edit the agent Dockerfile directly.
+#   3. **CitationEngine is vendored** at ./citation_engine/ (folded in from
+#      its former separate repo): both images COPY it like src/, so it's no
+#      longer a dev/prod difference and edits rebuild in the normal loop.
 #   4. **No BUILD_SHA stamping**: the Tilt loop tags `tilt-<hash>`, and
 #      SHA-based drift detection (agent_manager.py) is intentionally a
 #      no-op in dev.
 #
 # Layer ordering is identical to prod so the iteration loop hits Docker's
-# layer cache for everything except `src/`, `config/`, `agent.py` — and
-# Tilt's docker_build `only=` list pins watching to exactly those paths.
+# layer cache for everything except `src/`, `citation_engine/`, `config/`,
+# `agent.py` — and Tilt's docker_build `only=` list pins watching to those.
 #
 # Live_update is intentionally not configured for the agent (agent pods
 # have restartPolicy: Never and are baked-in per-job — see Non-goals in
@@ -138,9 +138,10 @@ COPY --from=builder /usr/local/bin /usr/local/bin
 # No browser in the agent image — Chromium lives on the workspace image only
 # (browser-exec daemon). See docs/issues/remove_local_browser_fallback.md.
 
-# Source code LAST — these three COPYs are what Tilt's docker_build
+# Source code LAST — these COPYs are what Tilt's docker_build
 # `only=` list pins to.
 COPY --chown=srw:srw src/ ./src/
+COPY --chown=srw:srw citation_engine/ ./citation_engine/
 COPY --chown=srw:srw config/ ./config/
 COPY --chown=srw:srw agent.py ./
 

@@ -16,7 +16,7 @@ langgraph-checkpoint-postgres>=1.0.0
 langgraph-checkpoint-sqlite>=2.0.0  # SQLite checkpointer for LangGraph
 aiosqlite>=0.19.0  # Async SQLite driver for LangGraph checkpointing
 psycopg[binary]>=3.1.0
-psycopg2-binary>=2.9.0  # Required by citation engine
+psycopg2-binary>=2.9.0  # Required by the vendored citation_engine (Postgres mode)
 langchain-tavily>=0.1.0
 arxiv>=2.1.0
 aiohttp>=3.9.0
@@ -76,5 +76,8 @@ nats-py>=2.9.0
 # (services/cron_dispatcher.py). Pairs with zoneinfo (stdlib) for
 # DST-aware next-fire-time computation against IANA-named timezones.
 croniter>=2.0.0
-# Citation engine (separate repo):
-citation-engine[full] @ git+https://github.com/Knaeckebrothero/CitationEngine.git
+# Runtime deps of the vendored citation_engine package (./citation_engine/).
+# Its other deps (beautifulsoup4, langchain-openai/-core, langgraph, tiktoken,
+# httpx, psycopg2-binary, docx2txt, pydantic) are already pinned above.
+pymupdf>=1.23.0
+requests>=2.31.0

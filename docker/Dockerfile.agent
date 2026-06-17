@@ -38,26 +38,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Install CPU-only PyTorch first (separate layer — rarely changes, ~200MB vs ~2GB with CUDA)
 RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
 
-# Optional: path to local CitationEngine source (for local builds)
-ARG CITATION_ENGINE_PATH=""
-
+# CitationEngine is vendored at ./citation_engine/ (COPY'd with the source
+# below) — no separate install. Its runtime deps are in requirements.txt.
 COPY requirements.txt .
-
-# When CITATION_ENGINE_PATH is set, exclude citation-engine from requirements
-# (it will be installed separately from local source below)
-RUN if [ -n "$CITATION_ENGINE_PATH" ]; then \
-      sed '/citation-engine/d' requirements.txt > /tmp/reqs.txt && \
-      pip install --no-cache-dir -r /tmp/reqs.txt; \
-    else \
-      pip install --no-cache-dir -r requirements.txt; \
-    fi
-
-# Copy local CitationEngine when building locally; falls back to copying
-# requirements.txt (harmless no-op) so the COPY never fails in CI/CD builds
-COPY ${CITATION_ENGINE_PATH:-requirements.txt} /tmp/citation_engine_src/
-RUN if [ -n "$CITATION_ENGINE_PATH" ]; then \
-      pip install --no-cache-dir "/tmp/citation_engine_src[full]"; \
-    fi
+RUN pip install --no-cache-dir -r requirements.txt
 
 # Production image
 FROM python:3.11-slim
@@ -127,6 +111,7 @@ COPY --from=builder /usr/local/bin /usr/local/bin
 
 # Copy source code LAST (changes most frequently)
 COPY --chown=srw:srw src/ ./src/
+COPY --chown=srw:srw citation_engine/ ./citation_engine/
 COPY --chown=srw:srw config/ ./config/
 COPY --chown=srw:srw agent.py ./
 
