@@ -97,7 +97,7 @@ migration plan live in [[agent_memory_overhaul]].
 >   there must update the equivalence suites in lockstep (the slice-5 guard
 >   terms are the one sanctioned delta).
 >
-> **Phase 2–4 deltas (2026-06-12 → 14, on the working tree).** The runtime
+> **Phase 2–4 deltas (2026-06-12 → 17, on the working tree / dev).** The runtime
 > read/write behaviour this snapshot describes is **unchanged** — Phases 2–4
 > added an offline eval harness and a set of *optional, default-inert* plugins
 > plus a behaviour-preserving schema migration, not a new live path. Read with
@@ -119,8 +119,9 @@ migration plan live in [[agent_memory_overhaul]].
 >   **🔶 CONDITIONAL** (bind + run only when an expert/arm config names them).
 >   The harness-measured production-candidate stack (`scorers: [reranker]`,
 >   `policies: [gate, bounded]`, relative gate 0.01 + bounded-10) lives in the
->   overhaul doc's Phase-3 log; flipping it into the defaults YAML is an
->   unstarted, separate rollout decision (overhaul Status, GATE B).
+>   overhaul doc's Phase-3 log; it was **flipped into both defaults YAMLs and
+>   shipped to dev (GATE B, 2026-06-14)** — see the Phase-4 delta below, where on
+>   dev these now fire by default.
 > - **Phase 4 = bi-temporal supersede, behaviour-preserving + flag-gated.**
 >   Migration `vector/0006_bitemporal_memory.sql` adds `valid_from`/`valid_to`/
 >   `superseded_at`/`superseded_by` to `memories` and teaches the three memory
@@ -137,12 +138,16 @@ migration plan live in [[agent_memory_overhaul]].
 >   **CONDITIONAL**. The harness measurement is **done (2026-06-14)** and
 >   positive — supersede fixes knowledge-update (end-task 0/4 → 3/4, overall
 >   0.40 → 0.50; contradiction probe `original_injected` 1.0 → 0.25, reader
->   current 1.0). **GATE B is now flipped (2026-06-14)** — both defaults YAMLs
->   carry the reranker/gate/bounded + ingestion stack, so on the next dev deploy
->   these move from 🔶 CONDITIONAL to the default live path (the worker/persistent
->   agents will rerank + adjudicate by default). Shipping to dev first for
->   real-session validation; the legacy fallback stays behind the flags
->   (one-edit rollback). Detail in the overhaul doc Phase-4 + GATE-B log.
+>   current 1.0). **GATE B is flipped + committed + pushed → live on dev via
+>   Fleet (~2026-06-14)** — both defaults YAMLs carry the reranker/gate/bounded +
+>   ingestion stack, so **on dev these are now the default live path** (worker +
+>   persistent agents rerank + adjudicate by default); they remain 🔶 CONDITIONAL
+>   on prod until the dev soak earns the flip. **`review_floor` since tuned
+>   0.6→0.5 (2026-06-17, measured on the new lifecycle/supersede regression gate
+>   `eval/memory/lifecycle.py`: missed-retire halved, over-retire 0; committed
+>   `0ccab8a` → deploying to dev).**
+>   The legacy fallback stays behind the flags (one-edit rollback). Detail in the
+>   overhaul doc Phase-4 + GATE-B + 2026-06-17 log.
 > - **Equivalence pinning still holds.** Phases 3–4 changed neither the legacy
 >   blocks nor the seam's default rendering (the verdict branch is unreachable
 >   with the flag off), so the equivalence suites above remain green and the

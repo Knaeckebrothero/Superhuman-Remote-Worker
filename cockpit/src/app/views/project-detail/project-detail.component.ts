@@ -1,6 +1,7 @@
 import {ChangeDetectionStrategy, Component, computed, inject, OnDestroy, OnInit, signal} from '@angular/core';
 import {ActivatedRoute, Router} from '@angular/router';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
+import {MarkdownComponent} from 'ngx-markdown';
 import {ApiService} from '../../core/services/api.service';
 import {UserService} from '../../core/services/user.service';
 import {SidebarToggleComponent} from '../../shell/sidebar-toggle/sidebar-toggle.component';
@@ -49,6 +50,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
     AppCheckboxComponent,
     AppBadgeComponent,
     AppFormFieldComponent,
+    MarkdownComponent,
   ],
   template: `
     <div class="page-container">
@@ -352,7 +354,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                       }
                     </div>
                   }
-                  <div class="kb-detail-content">{{ note.content }}</div>
+                  <div class="kb-detail-content"><markdown [data]="note.content"></markdown></div>
                   @if (note.relationships && note.relationships.length > 0) {
                     <div class="kb-relationships">
                       <h4>{{ 'projectDetail.knowledge.relationships' | transloco }}</h4>
@@ -1390,8 +1392,94 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
     .kb-detail-content {
       font-size: 13px; line-height: 1.7;
       color: var(--text-primary);
-      white-space: pre-wrap; word-wrap: break-word;
+      word-wrap: break-word;
     }
+
+    /* Rendered markdown — mirrors the chat renderer's cascade so KB notes
+       read the same as agent messages. */
+    .kb-detail-content ::ng-deep > :first-child { margin-top: 0; }
+    .kb-detail-content ::ng-deep > :last-child { margin-bottom: 0; }
+
+    .kb-detail-content ::ng-deep p { margin: 8px 0; }
+
+    .kb-detail-content ::ng-deep h1,
+    .kb-detail-content ::ng-deep h2,
+    .kb-detail-content ::ng-deep h3,
+    .kb-detail-content ::ng-deep h4,
+    .kb-detail-content ::ng-deep h5,
+    .kb-detail-content ::ng-deep h6 {
+      color: var(--text-primary);
+      font-weight: 700; line-height: 1.3;
+      margin: 16px 0 8px 0;
+    }
+
+    .kb-detail-content ::ng-deep h1 { font-size: 18px; }
+    .kb-detail-content ::ng-deep h2 { font-size: 16px; }
+    .kb-detail-content ::ng-deep h3 { font-size: 14px; }
+    .kb-detail-content ::ng-deep h4,
+    .kb-detail-content ::ng-deep h5,
+    .kb-detail-content ::ng-deep h6 {
+      font-size: 13px;
+      color: var(--text-secondary);
+    }
+
+    .kb-detail-content ::ng-deep ul,
+    .kb-detail-content ::ng-deep ol {
+      margin: 6px 0; padding-left: 20px;
+    }
+    .kb-detail-content ::ng-deep ul { list-style-type: disc; }
+    .kb-detail-content ::ng-deep ol { list-style-type: decimal; }
+    .kb-detail-content ::ng-deep li { margin: 3px 0; }
+    .kb-detail-content ::ng-deep li > ul,
+    .kb-detail-content ::ng-deep li > ol { margin: 2px 0; }
+
+    .kb-detail-content ::ng-deep code {
+      background: color-mix(in srgb, var(--accent-color) 20%, transparent);
+      padding: 1px 5px; border-radius: var(--radius-tag);
+      font-family: 'JetBrains Mono', monospace; font-size: 0.9em;
+    }
+
+    .kb-detail-content ::ng-deep pre {
+      background: var(--surface-0);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-surface);
+      padding: 12px 16px; margin: 8px 0;
+      overflow-x: auto;
+      font-family: 'JetBrains Mono', monospace; font-size: 12px; line-height: 1.5;
+    }
+    .kb-detail-content ::ng-deep pre code { background: transparent; padding: 0; }
+
+    .kb-detail-content ::ng-deep blockquote {
+      border-left: 3px solid var(--accent-color);
+      margin: 8px 0; padding: 4px 12px;
+      color: var(--text-secondary);
+    }
+
+    .kb-detail-content ::ng-deep a { color: var(--info); text-decoration: none; }
+    .kb-detail-content ::ng-deep a:hover { text-decoration: underline; }
+
+    .kb-detail-content ::ng-deep table {
+      border-collapse: collapse;
+      display: block; width: max-content; max-width: 100%;
+      overflow-x: auto; margin: 8px 0; font-size: 12px;
+    }
+    .kb-detail-content ::ng-deep th,
+    .kb-detail-content ::ng-deep td {
+      padding: 6px 12px;
+      border-bottom: 1px solid var(--border-color);
+      text-align: left;
+    }
+    .kb-detail-content ::ng-deep th {
+      font-weight: 600; color: var(--accent-color);
+      font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px;
+    }
+
+    .kb-detail-content ::ng-deep hr {
+      border: none; border-top: 1px solid var(--border-color);
+      margin: 16px 0;
+    }
+
+    .kb-detail-content ::ng-deep img { max-width: 100%; height: auto; }
 
     .kb-relationships {
       margin-top: 16px; padding-top: 16px;

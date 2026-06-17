@@ -1,0 +1,336 @@
+:host {
+  display: block;
+}
+
+$mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+
+.tc {
+  /* Collapsed: a compact pill sized to its header, so the status sits right
+     after the hint with no far-right gap. Expanded: full width so the body
+     (params / result) reads well. */
+  width: fit-content;
+  max-width: 100%;
+  font-size: 12px;
+  border: 1px solid var(--border-color, var(--surface-0));
+  border-radius: var(--radius-surface);
+  background: var(--surface-0);
+  overflow: hidden;
+}
+
+.tc[open] {
+  width: 100%;
+}
+
+/* ── Collapsed header ─────────────────────────────────────────────── */
+
+.tc__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 10px;
+  cursor: pointer;
+  list-style: none;
+  background: var(--panel-bg);
+
+  &::-webkit-details-marker {
+    display: none;
+  }
+
+  &:hover {
+    background: var(--surface-1, rgba(255, 255, 255, 0.04));
+  }
+}
+
+.tc[open] > .tc__head {
+  border-bottom: 1px solid var(--border-color, var(--surface-0));
+}
+
+.tc__icon {
+  color: var(--accent-color);
+  flex-shrink: 0;
+}
+
+.tc__title {
+  font-weight: 600;
+  color: var(--text-primary);
+  flex-shrink: 0;
+}
+
+/* Short, single-line, ellipsized hint — full value lives in the body. */
+.tc__hint {
+  /* Size to content in the collapsed pill; shrink + ellipsize only when a long
+     hint would push the pill past max-width (e.g. a long chained command). */
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: $mono;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.tc__status {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+  font-family: var(--font-display, inherit);
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  font-size: 9.5px;
+  font-weight: 600;
+}
+
+.tc__status-icon {
+  font-size: 13px;
+}
+
+.tc__status--ok,
+.tc__status--ok .tc__status-icon {
+  color: var(--success);
+}
+
+.tc__status--running,
+.tc__status--running .tc__status-icon {
+  color: var(--warning);
+}
+
+.tc__status--running .tc__status-icon {
+  animation: tc-spin 0.7s linear infinite;
+}
+
+.tc__status--denied,
+.tc__status--denied .tc__status-icon,
+.tc__status--pending,
+.tc__status--pending .tc__status-icon {
+  color: var(--text-muted);
+}
+
+.tc__status--error,
+.tc__status--error .tc__status-icon {
+  color: var(--danger);
+}
+
+/* Error/denied accents, visible even while collapsed. */
+.tc--error {
+  border-left: 3px solid var(--danger);
+}
+
+.tc--denied {
+  border-left: 3px solid var(--text-muted);
+}
+
+/* ── Expanded body ────────────────────────────────────────────────── */
+
+.tc__body {
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.tc__toolname {
+  font-family: $mono;
+  font-size: 10.5px;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+  opacity: 0.85;
+}
+
+.tc__section {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.tc__label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-weight: 600;
+  color: var(--text-muted);
+}
+
+.tc__label--error {
+  color: var(--danger);
+}
+
+.tc__tag {
+  font-family: $mono;
+  text-transform: none;
+  letter-spacing: 0;
+  font-weight: 500;
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: var(--radius-tag);
+  background: var(--surface-1, rgba(255, 255, 255, 0.05));
+  color: var(--text-secondary);
+}
+
+.tc__copy {
+  margin-left: auto;
+}
+
+/* Parameter values + plain results: a flush code block, not a nested card.
+   No max-height: an expanded card grows to its full content height (the chat
+   scrolls, not the card). The component's 200-line "show more" cap is the only
+   bound, so huge output doesn't render all at once. */
+.tc__code,
+.tc__result {
+  margin: 0;
+  padding: 8px 10px;
+  background: var(--code-bg, rgba(0, 0, 0, 0.22));
+  border-radius: var(--radius-tag);
+  font-family: $mono;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+  overflow: auto;
+}
+
+.tc__code--path {
+  color: var(--accent-color);
+  word-break: break-all;
+}
+
+.tc__result--terminal {
+  background: var(--terminal-bg, rgba(0, 0, 0, 0.4));
+  color: var(--text-primary);
+}
+
+.tc__result--error {
+  background: color-mix(in srgb, var(--danger) 8%, transparent);
+  color: var(--danger);
+}
+
+.tc__md {
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: var(--text-primary);
+
+  :first-child {
+    margin-top: 0;
+  }
+
+  :last-child {
+    margin-bottom: 0;
+  }
+}
+
+/* ── Diff ─────────────────────────────────────────────────────────── */
+
+.tc__diff {
+  background: var(--code-bg, rgba(0, 0, 0, 0.22));
+  border-radius: var(--radius-tag);
+  padding: 4px 0;
+  overflow: auto;
+  font-family: $mono;
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+
+.tc__diff-line {
+  display: flex;
+  padding: 0 10px;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+
+  &.add {
+    background: color-mix(in srgb, var(--success) 18%, transparent);
+  }
+
+  &.del {
+    background: color-mix(in srgb, var(--danger) 18%, transparent);
+  }
+}
+
+.tc__diff-sign {
+  width: 1ch;
+  flex-shrink: 0;
+  opacity: 0.55;
+  user-select: none;
+}
+
+.tc__diff-text {
+  flex: 1;
+  min-width: 0;
+}
+
+/* ── Footers / buttons ────────────────────────────────────────────── */
+
+.tc__more {
+  align-self: flex-start;
+  padding: 3px 8px;
+  border: 1px solid var(--border-color, var(--surface-1));
+  border-radius: var(--radius-control);
+  background: transparent;
+  color: var(--text-secondary);
+  font-family: inherit;
+  font-size: 11px;
+  cursor: pointer;
+
+  &:hover {
+    background: var(--surface-1, rgba(255, 255, 255, 0.05));
+    color: var(--text-primary);
+  }
+}
+
+.tc__more-note {
+  font-size: 11px;
+  font-style: italic;
+  color: var(--text-muted);
+}
+
+/* ── Details ──────────────────────────────────────────────────────── */
+
+.tc__details {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 18px;
+  margin: 0;
+}
+
+.tc__detail {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+
+  dt {
+    font-size: 10.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-muted);
+  }
+
+  dd {
+    margin: 0;
+    font-family: $mono;
+    font-size: 11.5px;
+    color: var(--text-secondary);
+
+    &.tone-ok {
+      color: var(--success);
+    }
+
+    &.tone-error {
+      color: var(--danger);
+    }
+
+    &.tone-warn {
+      color: var(--warning);
+    }
+  }
+}
+
+@keyframes tc-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}

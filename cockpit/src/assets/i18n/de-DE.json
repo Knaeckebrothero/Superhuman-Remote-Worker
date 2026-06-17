@@ -1,4 +1,59 @@
 {
+  "toolCard": {
+    "sections": {
+      "result": "Ergebnis",
+      "error": "Fehler"
+    },
+    "status": {
+      "pending": "ausstehend",
+      "running": "läuft",
+      "ok": "abgeschlossen",
+      "error": "Fehler",
+      "denied": "abgelehnt"
+    },
+    "diff": {
+      "replace": "Diff",
+      "append": "angehängt",
+      "prepend": "vorangestellt",
+      "write": "geschrieben",
+      "truncated": "+{{count}} weitere Zeilen"
+    },
+    "showMore": "{{count}} weitere Zeilen anzeigen",
+    "showLess": "Weniger anzeigen",
+    "previewNote": "Vorschau · {{size}} gesamt",
+    "titles": {
+      "read_file": "Datei lesen",
+      "write_file": "Datei schreiben",
+      "edit_file": "Datei bearbeiten",
+      "list_files": "Dateien auflisten",
+      "search_files": "Dateien durchsuchen",
+      "file_exists": "Datei prüfen",
+      "delete_file": "Datei löschen",
+      "move_file": "Datei verschieben",
+      "get_document_info": "Dokument prüfen",
+      "run_command": "Befehl ausführen",
+      "shell_execute": "Befehl ausführen",
+      "shell_read": "Ausgabe lesen",
+      "git_log": "Git-Verlauf anzeigen",
+      "git_show": "Commit anzeigen",
+      "git_diff": "Änderungen vergleichen",
+      "git_status": "Git-Status prüfen",
+      "web_search": "Web durchsuchen",
+      "extract_webpage": "Seite extrahieren",
+      "browse_website": "Website öffnen",
+      "search_papers": "Paper suchen",
+      "kb_write": "In Wissensdatenbank schreiben",
+      "kb_read": "Wissen lesen",
+      "kb_search": "Wissen durchsuchen",
+      "next_phase_todos": "Nächste Phase planen",
+      "todo_complete": "Aufgabe abschließen",
+      "cite_document": "Dokument zitieren",
+      "send_message": "Nachricht senden",
+      "delegate_work": "Arbeit delegieren",
+      "job_complete": "Job abschließen",
+      "mark_complete": "Als erledigt markieren"
+    }
+  },
   "common": {
     "save": "Speichern",
     "saving": "Wird gespeichert...",
