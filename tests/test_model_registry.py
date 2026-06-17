@@ -94,6 +94,13 @@ class TestFamilyOf:
     def test_unknown_returns_default(self):
         assert family_of("totally-unknown-model") == "default"
 
+    def test_glm(self):
+        # GLM-5.2 (Zhipu, OpenRouter). Substring match covers every transport
+        # form: bare, vendor-prefixed, and openrouter-prefixed.
+        assert family_of("glm-5.2") == "glm"
+        assert family_of("z-ai/glm-5.2") == "glm"
+        assert family_of("openrouter/z-ai/glm-5.2") == "glm"
+
 
 class TestUnknownModels:
     @pytest.fixture(autouse=True)
