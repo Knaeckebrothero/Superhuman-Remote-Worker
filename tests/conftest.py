@@ -37,6 +37,11 @@ os.environ.setdefault(
     "APP_ENCRYPTION_KEY", "eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHg="
 )
 
+# orchestrator/main.py also guards on vector-DB credentials at import time.
+# Tests only exercise its utility functions / pure models, never the vector
+# store, so provide a dummy URL. setdefault never overrides a real CI/prod value.
+os.environ.setdefault("VECTOR_DB_URL", "postgresql://test:test@localhost:5432/test")
+
 
 # =============================================================================
 # F1 multi-tenancy fixture — three users, two projects, jobs/threads/sessions
