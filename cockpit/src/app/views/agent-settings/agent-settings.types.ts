@@ -106,6 +106,7 @@ export function detectModelFamily(model: string): string {
   if (name.startsWith('gpt-4o')) return 'gpt-4o';
   if (name.startsWith('o1') || name.startsWith('o3') || name.startsWith('o4')) return 'o-series';
   if (name.includes('deepseek')) return 'deepseek';
+  if (name.includes('glm')) return 'glm';
   if (name.includes('qwen') || name.includes('qwq')) return 'qwen';
   if (name.includes('llama')) return 'llama';
   if (name.startsWith('gemini')) return 'gemini';
