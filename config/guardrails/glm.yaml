@@ -1,0 +1,16 @@
+# GLM-5.2 guardrails
+#
+# Zhipu GLM-5.2 (744B-MoE / ~40B-active hybrid reasoning) is served via an
+# OpenAI-compatible API (LangChain ChatOpenAI over OpenRouter). Tool calls use
+# standard OpenAI parens-form serialization — everything in `default.yaml`
+# applies as-is. Reasoning is returned out-of-band (OpenRouter
+# `reasoning`/`reasoning_details`) and captured by src/llm/reasoning_chat.py,
+# so it never needs to appear in tool examples.
+#
+# Starts empty; this file exists so the matrix has a guardrails entry for `glm`
+# and any future drift (a tool-format quirk surfaced by real runs) can be added
+# here without touching the matrix.
+
+tool_examples: {}
+
+nudges: {}
