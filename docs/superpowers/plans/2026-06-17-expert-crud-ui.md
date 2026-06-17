@@ -14,6 +14,51 @@
 
 ---
 
+## Implementation status — ✅ COMPLETE (2026-06-17)
+
+All 10 tasks implemented, tested, and verified live on dev k3d (including a browser walkthrough).
+**Uncommitted on `develop`** — owner commits. Backend **46** pytest + Cockpit **579** vitest green;
+`ruff` + `tsc` + `ng build` (AOT template check) clean.
+
+**Verified live:**
+- **Backend** (k3d, MCP-header auth): create → 409 dup-name → 422 credential-deny →
+  update/version-bump → export(no creds) → duplicate → delete; `source=user`; self-cleaned.
+- **Cockpit** (Playwright, as dev `test` user): `/experts/new` renders, **auto-slug** works
+  (`Research Helper 2026` → `research-helper-2026`), 0 console errors; tilt redeployed the cockpit.
+
+**As-built deviations from the task bodies below (intentional — believe these over the steps where they conflict):**
+1. **Auth style** — handlers are `async def f(request: Request, …)` + `await require_approved_user(request, postgres_db)`
+   (returns the user dict), **not** `Depends(...)`. Delete returns `{"deleted": true}`. Ported verbatim from
+   `8334fb3c` with the single rename `_is_uuid` → `_looks_like_uuid`.
+2. **Editor config surface** — shipped an **editable raw `config` JSON textarea** (single source of truth,
+   server-validated by the hard-deny gate) instead of wiring the `app-tools-group` widget. Structured
+   tool toggles + a model picker are the documented fast-follow.
+3. **Edit-prefill** — uses `GET /api/experts/{id}/export` (the raw fragment) so re-saving never bakes the
+   merged result into the stored fragment.
+4. **Test infra** — added `tests/conftest.py` `os.environ.setdefault("VECTOR_DB_URL", …)` so
+   `orchestrator.main`-importing tests run locally (never overrides CI).
+5. **Debug grid** — also registered the experts view in `ComponentRegistryService`
+   (`app.ts:registerComponents()` + `'experts-list'` added to the `ComponentType` union in
+   `debug/layout.model.ts`). Not in the original task list — the debug grid is a separate hand-maintained
+   registry, not route-derived.
+6. **Theme tokens** — editor/list styles use real theme tokens (`--panel-bg`, `--text-primary`,
+   `--text-muted`, `--border-color`, `--danger-tint`/`--success-tint`). An earlier hardcoded
+   `var(--surface-color, #161616)` fallback caused a dark-on-dark contrast bug (found in the browser
+   walkthrough), fixed.
+7. **Routes are eager** (`component:`), consistent with the rest of `app.routes.ts` (not lazy `loadComponent`).
+
+**Files changed:** `orchestrator/main.py`, `src/api/app.py`, `src/database/postgres_db.py`,
+`tests/test_expert_crud.py` (new), `tests/conftest.py`; cockpit `core/models/api.model.ts`,
+`core/services/api.service.ts` (+ spec), `views/experts/*` (page/list/editor + 3 specs),
+`app.ts`, `app.routes.ts`, `shell/sidebar/sidebar.component.ts`, `debug/layout.model.ts`,
+`assets/i18n/en.json` + `de-DE.json`.
+
+**Still deferred (unchanged):** Slice 2 grants + `/api/users/me/capabilities` + control-greying,
+project-link/`default_for` UI, test-drive, version/stats panels, the structured tool-toggle widget,
+de-DE page translations.
+
+---
+
 ## Scope
 
 **In scope (this plan):**

@@ -15,7 +15,9 @@ import {
     DatasourceUpdateRequest,
     SSHKeyGenerateResponse,
     Expert,
+    ExpertCreateRequest,
     ExpertDetail,
+    ExpertUpdateRequest,
     Job,
     JobAcceptConflict,
     JobAcceptOutcome,
@@ -480,6 +482,50 @@ export class ApiService {
     return this.http.get<ExpertDetail>(`${this.baseUrl}/experts/${expertId}`).pipe(
       catchError(() => of(null)),
     );
+  }
+
+  /**
+   * Create a DB-backed expert. Errors propagate so callers can surface the
+   * 409 (name collision) / 422 (credential section) the server returns.
+   */
+  createExpert(body: ExpertCreateRequest): Observable<ExpertDetail> {
+    return this.http.post<ExpertDetail>(`${this.baseUrl}/experts`, body);
+  }
+
+  /**
+   * Update an owned DB-backed expert (owner or admin). Bumps ``version``.
+   */
+  updateExpert(id: string, body: ExpertUpdateRequest): Observable<ExpertDetail> {
+    return this.http.put<ExpertDetail>(`${this.baseUrl}/experts/${id}`, body);
+  }
+
+  /**
+   * Delete an owned DB-backed expert. Rejects (409) while live-referenced —
+   * the error body carries ``detail.blockers``.
+   */
+  deleteExpert(id: string): Observable<{ deleted: boolean }> {
+    return this.http.delete<{ deleted: boolean }>(`${this.baseUrl}/experts/${id}`);
+  }
+
+  /**
+   * Fork any visible expert (bundled or DB) into an owned copy.
+   */
+  duplicateExpert(id: string): Observable<ExpertDetail> {
+    return this.http.post<ExpertDetail>(`${this.baseUrl}/experts/${id}/duplicate`, {});
+  }
+
+  /**
+   * Serialize an expert to a portable bundle (raw fragment, no credentials).
+   */
+  exportExpert(id: string): Observable<Record<string, unknown>> {
+    return this.http.get<Record<string, unknown>>(`${this.baseUrl}/experts/${id}/export`);
+  }
+
+  /**
+   * Create an owned expert from a posted bundle (fork-on-import).
+   */
+  importExpert(body: ExpertCreateRequest): Observable<ExpertDetail> {
+    return this.http.post<ExpertDetail>(`${this.baseUrl}/experts/import`, body);
   }
 
   // ===== Agent Management Endpoints =====

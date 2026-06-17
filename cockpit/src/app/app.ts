@@ -23,6 +23,7 @@ import {JobListComponent} from './views/jobs/job-list.component';
 import {JobCreateComponent} from './views/create/job-create.component';
 import {StatisticsComponent} from './views/statistics/statistics.component';
 import {DatasourceListComponent} from './views/datasources/datasource-list.component';
+import {ExpertsListComponent} from './views/experts/experts-list.component';
 import {JobReviewComponent} from './views/job-review/job-review.component';
 import {WorkspaceBrowserComponent} from './views/workspace-browser/workspace-browser.component';
 import {InstructionBuilderComponent} from './views/instruction-builder/instruction-builder.component';
@@ -326,6 +327,12 @@ export class App implements OnInit {
       type: 'datasource-list',
       displayName: 'Datasources',
       component: DatasourceListComponent,
+    });
+
+    this.registry.register({
+      type: 'experts-list',
+      displayName: 'Experts',
+      component: ExpertsListComponent,
     });
 
     this.registry.register({

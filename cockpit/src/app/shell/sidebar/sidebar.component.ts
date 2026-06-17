@@ -87,6 +87,14 @@ import {ViewModeToggleComponent} from '../view-mode-toggle/view-mode-toggle.comp
           </a>
           <a
             class="nav-link"
+            routerLink="/experts"
+            routerLinkActive="active"
+          >
+            <app-icon size="md" class="nav-icon">psychology</app-icon>
+            {{ 'nav.experts' | transloco }}
+          </a>
+          <a
+            class="nav-link"
             routerLink="/automations"
             routerLinkActive="active"
           >
