@@ -14,6 +14,8 @@ import {ChatPageComponent} from './views/chat/chat-page.component';
 import {SessionsPageComponent} from './views/sessions/sessions-page.component';
 import {SessionCreateComponent} from './views/session-create/session-create.component';
 import {DatasourcesPageComponent} from './views/datasources/datasources-page.component';
+import {ExpertsPageComponent} from './views/experts/experts-page.component';
+import {ExpertEditorComponent} from './views/experts/expert-editor.component';
 import {AutomationsPageComponent} from './views/automations/automations-page.component';
 import {AdminLlmComponent} from './views/admin/llm/admin-llm.component';
 import {AdminUsersComponent} from './views/admin/users/admin-users.component';
@@ -35,6 +37,9 @@ export const routes: Routes = [
   { path: 'projects', component: ProjectListPageComponent, canActivate: [authGuard] },
   { path: 'projects/:id', component: ProjectDetailPageComponent, canActivate: [authGuard, projectAccessGuard] },
   { path: 'datasources', component: DatasourcesPageComponent, canActivate: [authGuard] },
+  { path: 'experts', component: ExpertsPageComponent, canActivate: [authGuard] },
+  { path: 'experts/new', component: ExpertEditorComponent, canActivate: [authGuard] },
+  { path: 'experts/:id/edit', component: ExpertEditorComponent, canActivate: [authGuard] },
   { path: 'automations', component: AutomationsPageComponent, canActivate: [authGuard] },
   { path: 'settings', component: SettingsComponent, canActivate: [authGuard] },
   { path: 'settings/api-keys', component: ApiKeysPageComponent, canActivate: [authGuard] },

@@ -27,6 +27,7 @@ export type ComponentType =
   | 'job-create'
   | 'statistics'
   | 'datasource-list'
+  | 'experts-list'
   | 'job-review'
   | 'workspace-browser'
   | 'instruction-builder'

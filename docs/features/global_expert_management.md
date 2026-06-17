@@ -42,13 +42,36 @@ aliases:
 > `docs/superpowers/specs/2026-06-17-orchestrator-resolved-config-design.md` and the
 > implementation plan `docs/superpowers/plans/2026-06-17-orchestrator-resolved-config.md`.
 
-**Status:** **Slice 1 implemented** on `develop` (2026-06-15). Orchestrator side
+**Status (2026-06-17):** **Slice 1 write-CRUD restored + Slice-3 create-UI shipped** on `develop`
+(uncommitted). The Slice-1 write endpoints had been clobbered by `6f8c635e` and were **restored**
+(`orchestrator/main.py`: create/update/delete/duplicate/export/import + `ExpertCreate`/`ExpertUpdate`
++ save-time hard-deny gate), then **live-verified on dev k3d** (create → 409 dup-name →
+422 credential-deny → update/version-bump → export → duplicate → delete, with `source=user`
+tagging; self-cleaned). **Slice 3 (Cockpit)** shipped: the Experts page (list, type/source filters,
+badges, row actions), the type-aware **create/edit editor** (identity + persona/instructions +
+editable raw `config`-fragment JSON — structured tool-toggle widget deferred to a fast-follow),
+delete-confirm with 409-blocker surfacing, and duplicate/export/import + nav + i18n (en full;
+de-DE nav only, page strings fall back to en). Agent-side expert resolution
+(`_apply_db_expert` / `ExpertsNamespace`) was **deleted** — resolution is orchestrator-only
+(`services/config_resolver.py`). Tests: backend 46 + cockpit 579 green; ruff/tsc/ng-build clean.
+**Still deferred:** Slice 2 (grants/enforcement + `/api/users/me/capabilities` + control greying),
+project-link/`default_for` UI, test-drive, version/stats panels, the structured tool-toggle widget,
+de-DE page translations. Plan: `docs/superpowers/plans/2026-06-17-expert-crud-ui.md`. **Browser-verified**
+(Playwright, dev `test` user): `/experts/new` renders, auto-slug works (`Research Helper 2026` →
+`research-helper-2026`), 0 console errors. A dark-on-dark contrast bug (a hardcoded `--surface-color`
+fallback) was caught in the walkthrough and fixed by switching the editor/list styles to the real theme
+tokens (`--panel-bg`/`--text-primary`/`--border-color`/`--danger-tint`…). The experts view is also
+registered in the debug-grid `ComponentRegistryService` (separate hand-maintained registry, not
+route-derived). The editor's config surface is an editable raw `config`-JSON textarea (the structured
+`app-tools-group` widget is the fast-follow).
+
+**Earlier status (Slice 1, 2026-06-15):** Orchestrator side
 verified on dev k3d (CRUD, list/detail, export/import, `expert_id` plumbing,
 migration `0028`); runtime agent-application acceptance (T1–T6) pending — see
 `docs/tests/user_defined_experts_slice1_verification.md` (procedures) +
 `docs/tests/user_defined_experts_slice1_test_gaps.md` (untested inventory). Three integration bugs
 found+fixed during testing (orchestrator deployment env, delete-blocker status
-literal, agent receive plumbing). Slices 2 (grants), 3 (Cockpit), 4 (polish): not started. NB: `project_experts`
+literal, agent receive plumbing). NB: `project_experts`
 shipped in `0028` but its link/`default_for` API is deferred to Slice 3 —
 project-default experts aren't creatable yet.
 **v2.1 — 2026-06-15:** open questions 1–5 resolved (decisions 15–19). Migrations
