@@ -432,8 +432,6 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile.agent
-      args:
-        CITATION_ENGINE_PATH: CitationEngine
     image: srw-agent:local
     environment:
       AGENT_CONFIG: ${AGENT_CONFIG:-defaults}
