@@ -70,7 +70,10 @@ _FAMILY_RULES: list[tuple[re.Pattern, str | Callable[[re.Match], FamilyDetection
     # prefix rule above recurses here for `mistralai/...`. Mirrors family_of()
     # in src/core/model_registry.py and the `mistral` model_config_matrix family.
     (
-        re.compile(r"mistral|codestral|magistral|ministral|devstral|pixtral|voxtral", re.IGNORECASE),
+        re.compile(
+            r"mistral|codestral|magistral|ministral|devstral|pixtral|voxtral",
+            re.IGNORECASE,
+        ),
         "mistral",
     ),
     (re.compile(r"glm", re.IGNORECASE), "glm"),
