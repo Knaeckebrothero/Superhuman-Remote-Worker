@@ -293,7 +293,7 @@ class EmbeddingService:
         except ImportError:
             raise EmbeddingServiceError(
                 "httpx is required for embedding service. "
-                "Install with: pip install citation-engine[vector]"
+                "Install it with: pip install httpx"
             ) from None
 
         url = f"{self.api_url}/embeddings"
