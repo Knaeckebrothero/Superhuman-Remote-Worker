@@ -16,10 +16,31 @@ For local development, persistent agents are started manually via:
 import asyncio
 import logging
 import os
+import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_config_name(config_name: str) -> str:
+    """A UUID in ``config_name`` means the cockpit put the expert id in the
+    wrong slot — it has no on-disk ``<uuid>.yaml`` and ``--config <uuid>``
+    crashes startup. Sessions apply the bound expert via ``config_override``,
+    so fall back to the session base. See
+    docs/features/global_expert_management.md."""
+    if not config_name:
+        return config_name
+    try:
+        uuid.UUID(str(config_name))
+    except (ValueError, TypeError, AttributeError):
+        return config_name
+    logger.warning(
+        "session config_name %s is a UUID (expert id in the config slot); "
+        "booting persistent_defaults — expert applies via config_override.",
+        config_name,
+    )
+    return "persistent_defaults"
 
 
 class PersistentProvisioner:
@@ -154,6 +175,7 @@ class PersistentProvisioner:
         Returns:
             True if pod was created (or already existed), False on error.
         """
+        config_name = _normalize_config_name(config_name)
         if not self._k8s_available:
             logger.info(
                 "K8s not available — start agent manually: "

@@ -19,9 +19,35 @@ import logging
 import os
 from datetime import datetime, timezone
 from typing import Any, Optional
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_config_name(config_name: str, purpose: str) -> str:
+    """Guard against an expert UUID leaking into ``config_name``.
+
+    ``config_name`` must name a bundled config that resolves to an on-disk
+    ``<name>.yaml``. The cockpit's expert picker puts the expert UUID here
+    instead, and ``--config <uuid>`` crashes agent startup (no such file). A
+    bound expert is applied via the thread's ``config_override`` (sessions) or
+    ``AGENT_EXPERT_ID`` (jobs), so a UUID in this slot is always wrong — boot
+    the purpose's base config instead. See
+    docs/features/global_expert_management.md."""
+    if not config_name:
+        return config_name
+    try:
+        UUID(str(config_name))
+    except (ValueError, TypeError, AttributeError):
+        return config_name
+    base = "defaults" if purpose == "job" else "persistent_defaults"
+    logger.warning(
+        "agent config_name %s is a UUID (expert id in the config slot); "
+        "booting base %s instead — expert applies via config_override.",
+        config_name,
+        base,
+    )
+    return base
 
 
 # Pending-phase container waiting reasons we treat as unrecoverable past grace.
@@ -257,6 +283,7 @@ class AgentProvisioner:
                 )
                 return None
 
+        config_name = _normalize_config_name(config_name, purpose)
         short_id = uuid4().hex[:8]
         pod_name = f"srw-agent-{purpose[0]}-{short_id}"
 
