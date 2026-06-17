@@ -31,6 +31,7 @@ from .core.loader import (
     AgentConfig,
     LLMConfig,
     load_agent_config,
+    load_config_from_resolved,
     create_llm,
     load_instructions,
     get_all_tool_names,
@@ -230,6 +231,34 @@ class UniversalAgent:
         """
         resolved_path, deployment_dir = resolve_config_path(config_path)
         config = load_agent_config(resolved_path, deployment_dir)
+        return cls(config, postgres_conn)
+
+    @classmethod
+    def from_resolved(
+        cls,
+        resolved_config: dict,
+        postgres_conn: Optional[Any] = None,
+    ) -> "UniversalAgent":
+        """Create an agent from an orchestrator-resolved config blob.
+
+        The blob (``serialize_resolved_config`` shape) is already fully merged
+        and frozen by the orchestrator — bundled base + expert + override layers
+        + settings matrix, with resolved prompts/instructions inline. No disk or
+        DB resolution happens here: ``load_config_from_resolved`` hydrates the
+        ``AgentConfig`` and seeds ``config.extra['_resolved_prompts'/
+        '_resolved_instructions']`` so the render path uses the frozen text (and
+        fences a DB persona via the ``_persona_source`` marker). This supersedes
+        agent-side resolution (Decision 6); ``from_config`` remains the fallback
+        when no blob is delivered.
+
+        Args:
+            resolved_config: Resolved config blob from the orchestrator.
+            postgres_conn: Optional PostgreSQL connection.
+
+        Returns:
+            UniversalAgent instance
+        """
+        config = load_config_from_resolved(resolved_config)
         return cls(config, postgres_conn)
 
     async def initialize(self) -> None:
@@ -876,7 +905,6 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         _config_from_db = False
         if resume and self.postgres_conn:
             try:
-                from .core.loader import load_config_from_resolved
                 import uuid as _uuid
 
                 resolved = await self.postgres_conn.jobs.get_resolved_config(
@@ -890,6 +918,19 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                 logger.warning(
                     f"Failed to load frozen config, falling back to disk: {e}"
                 )
+
+        # Orchestrator-resolved config (supersedes agent-side Decision 6): a
+        # delivered blob is already fully merged, credential-injected, and frozen
+        # by the orchestrator. Hydrate it and skip ALL local resolution
+        # (config_name / upload / config_override / DB-overrides) and the freeze —
+        # exactly like the resume frozen-config path above. The orchestrator
+        # delivers config_override=None alongside the blob, so the override block
+        # below is a no-op and the resolved layers are never degraded by a flat
+        # re-merge. Absent blob → today's path (fallback).
+        if not _config_from_db and metadata.get("resolved_config"):
+            self.config = load_config_from_resolved(metadata["resolved_config"])
+            _config_from_db = True
+            logger.info(f"Hydrated orchestrator-resolved config for job {job_id}")
 
         # Handle expert config name - load the named config (tools, prompts, workspace settings)
         # This must happen before config_upload_id and config_override so those can further override

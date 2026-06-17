@@ -29,6 +29,19 @@ aliases:
 > system exactly; **(b)** a **capability-grants** layer (generalizing
 > `users.can_use_vm`) gates what users may bake into an expert.
 
+> [!important] **Decision 6 superseded (2026-06-17) — orchestrator-resolved config.**
+> Agent-side expert resolution (Decision 6 below) is **retired**. The orchestrator
+> now resolves the *entire* config (bundled base + default-model floor + expert
+> fragment + override layers + settings matrix) into one frozen, credential-injected
+> blob; the agent is a pure executor that **hydrates** it (`UniversalAgent.from_resolved`
+> / `load_config_from_resolved`) and no longer reads `experts`/`config_overrides`
+> from the DB. Jobs resolve+freeze at dispatch; sessions re-resolve on every attach
+> (the warm-pool attach blob is the channel that fixes the 3-minute expert-session
+> stall). Decision 7 (persona fencing) and Decision 9 (capability-enforcement seam)
+> are preserved. See the new decision of record:
+> `docs/superpowers/specs/2026-06-17-orchestrator-resolved-config-design.md` and the
+> implementation plan `docs/superpowers/plans/2026-06-17-orchestrator-resolved-config.md`.
+
 **Status:** **Slice 1 implemented** on `develop` (2026-06-15). Orchestrator side
 verified on dev k3d (CRUD, list/detail, export/import, `expert_id` plumbing,
 migration `0028`); runtime agent-application acceptance (T1–T6) pending — see
@@ -107,7 +120,7 @@ check is bypassable via a settings PATCH.
 | 3 | Expert typing | `expert_type ∈ {worker, session}`, immutable after create. Determines the base config (`defaults.yaml` vs `persistent_defaults.yaml`). Structural, not cosmetic — the schemas are incompatible. |
 | 4 | No `$extends` in user configs | The base is implied by `expert_type`. "Start from scholar" = **fork (copy)** of its fragment, not a live link. Live extension chains (cycle/depth/visibility machinery) deferred. |
 | 5 | Selection | Pickers pass **`expert_id` (UUID)**; `jobs` gains a nullable `expert_id` column, threads carry `metadata.expert_id`. `config_name` remains for bundled experts and back-compat. Name-based resolution (automations, MCP convenience): **owner > project-linked > global > bundled** (most-specific wins; a personal fork named `scholar` shadows the bundled one *for that user only*). |
-| 6 | Agent-side resolution | The agent loads the expert row itself at job/session start via the app-DB connection it already holds, behind an `EXPERTS_DB_ENABLED` flag — the same seam and lifecycle as `config_overrides` (load at first-run → merge → freeze into `resolved_config`). Missing row at start = **fail loud**, not silently run on base config. |
+| 6 | ~~Agent-side resolution~~ **SUPERSEDED 2026-06-17** | ~~The agent loads the expert row itself at job/session start via the app-DB connection it already holds, behind an `EXPERTS_DB_ENABLED` flag~~. **Replaced by orchestrator-resolved config** (see banner at top): the orchestrator resolves the full config and emits a frozen blob; the agent hydrates it and never reads `experts`/`config_overrides` from the DB. `EXPERTS_DB_ENABLED` now gates *orchestrator* resolution. |
 | 7 | Per-expert prompts | `experts.prompts` JSONB (v1 keys: `persona`, `instructions`) is the **highest-precedence *content* layer** for resolving prompt text (expert → family DB → global DB → bundled file). **But it is NOT injected at system-prompt altitude:** the user persona is fenced as a delimited, explicitly-subordinated *style request* **below** a non-overridable operator/safety policy — it cannot override operator rules, tool/model/autonomy gates, or safety (capabilities are config-gated at dispatch, not prompt-gated). See **Security model → Persona trust boundary**. Single text per key in v1; per-model-family variants deferred. |
 | 8 | Capability grants | New scoped table `capability_grants(scope_kind ∈ {user, project, global}, scope_id, key, value_json)` + code-side catalog — the principal-scoped twin of `config_overrides` and the generalization of `can_use_vm` (which migrates in). Resolution: user → project → global row → catalog default. Admins bypass. Kill-switch `system_settings['user_experts']`. |
 | 9 | Enforcement points | Twice, like `can_use_vm` today: **save-time** (422 with actionable message; editor greys out ungated controls) and **dispatch-time** on the *full merged config* (expert fragment + project override + `users.settings.persistent_agent` + job/thread `config_override`) against the **runner's** grants. Dispatch check **rejects** (no silent stripping — silent capability downgrades burn debugging time). This single checkpoint also closes the `persistent_agent` self-service hole. |

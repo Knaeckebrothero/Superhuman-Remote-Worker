@@ -1028,6 +1028,7 @@ def _load_expert_config(config_name: str):
 async def _attach_session(
     thread_id: str,
     config_override: Optional[Dict[str, Any]] = None,
+    resolved_config: Optional[Dict[str, Any]] = None,
     project_ids: Optional[List[str]] = None,
     datasources: Optional[List[Dict[str, Any]]] = None,
     config_name: Optional[str] = None,
@@ -1069,6 +1070,8 @@ async def _attach_session(
     # Apply config overrides, project_ids, and datasources from thread metadata
     if not config_override:
         config_override = (workspace_override or {}).get("config_override")
+    if resolved_config is None:
+        resolved_config = (workspace_override or {}).get("resolved_config")
     if not project_ids:
         project_ids = (workspace_override or {}).get("project_ids") or []
     cloud_mount_cfg = (
@@ -1077,6 +1080,7 @@ async def _attach_session(
     if (
         (
             not config_override
+            or resolved_config is None
             or not project_ids
             or not datasources
             or not cloud_mount_cfg
@@ -1089,6 +1093,8 @@ async def _attach_session(
             if ws_info:
                 if not config_override:
                     config_override = ws_info.get("config_override")
+                if resolved_config is None:
+                    resolved_config = ws_info.get("resolved_config")
                 if not project_ids:
                     project_ids = ws_info.get("project_ids") or []
                 if not datasources:
@@ -1181,7 +1187,25 @@ async def _attach_session(
         )
 
     effective_config = _agent.config
-    if config_name:
+    _hydrated = False
+    if resolved_config:
+        # Orchestrator-resolved config: the blob is the full, frozen,
+        # credential-injected session config (base + expert + overrides). Hydrate
+        # it directly — no config_name load, no config_override flat-merge (which
+        # would degrade the resolved layers). This is the warm-pool / cold-attach
+        # expert delivery channel — the fix for the 3-minute stall.
+        from ..core.loader import create_llm, load_config_from_resolved
+
+        effective_config = load_config_from_resolved(resolved_config)
+        _hydrated = True
+        logger.info(
+            "Attach: hydrated orchestrator-resolved config for thread %s "
+            "(model=%s, persona_source=%s)",
+            thread_id,
+            effective_config.llm.model,
+            effective_config.extra.get("_persona_source"),
+        )
+    elif config_name:
         # The thread's config beats the pod's boot config — idle-pool pods
         # boot as workers, and a session served from the worker YAML loses
         # its persistent memory pipeline (no teardown_extractor) among the
@@ -1191,8 +1215,16 @@ async def _attach_session(
             "Attach: session base config '%s' (overrides pod boot config)",
             config_name,
         )
+
     llm = _agent._tactical_llm or _agent._llm
-    if config_override:
+    if _hydrated:
+        # The resolved llm carries the final model + injected transport.
+        llm = create_llm(effective_config.llm, effective_config.limits)
+        logger.info(
+            "Attach: built session LLM from resolved config: model=%s",
+            effective_config.llm.model,
+        )
+    elif config_override:
         import dataclasses
 
         from ..core.loader import (
@@ -1233,8 +1265,12 @@ async def _attach_session(
     # (or a runtime config.update) supplies an auxiliary section, build a
     # session-scoped AuxiliaryLLM and pass it in instead of the singleton.
     auxiliary_llm = _agent._auxiliary_llm
-    if config_override and config_override.get("auxiliary", {}).get("model"):
-        from ..core.loader import LLMConfig, resolve_model_settings
+    if (config_override and config_override.get("auxiliary", {}).get("model")) or (
+        _hydrated
+        and effective_config.auxiliary
+        and effective_config.auxiliary.model
+    ):
+        from ..core.loader import LLMConfig, create_llm, resolve_model_settings
         from ..services.auxiliary import AuxiliaryLLM
 
         aux_cfg = effective_config.auxiliary
@@ -1270,8 +1306,13 @@ async def _attach_session(
     # clear the singleton so the next get_embedding_service() rebuilds with
     # the right base_url + api_key. Without this the singleton stays bound
     # to whatever was set at boot.
-    if config_override and config_override.get("env_keys"):
-        env_keys = config_override["env_keys"]
+    _env_keys_src = (
+        (effective_config.extra or {}).get("env_keys")
+        if _hydrated
+        else (config_override.get("env_keys") if config_override else None)
+    )
+    if _env_keys_src:
+        env_keys = _env_keys_src
         embedding_keys = (
             "EMBEDDING_PROVIDER",
             "EMBEDDING_MODEL",
@@ -1822,6 +1863,7 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
             await _attach_session(
                 thread_id=thread_id,
                 config_override=request.get("config_override"),
+                resolved_config=request.get("resolved_config"),
                 project_ids=request.get("project_ids"),
                 datasources=request.get("datasources"),
                 config_name=request.get("config_name"),
