@@ -208,18 +208,6 @@ async def lifespan(app: FastAPI):
     _agent = UniversalAgent.from_config(config_path)
     await _agent.initialize()
 
-    # Session bound to a DB expert (decision 6): apply it as the base config and
-    # recreate LLMs before any session message. The config_name path is the
-    # fallback when no expert is bound.
-    _expert_id = os.getenv("AGENT_EXPERT_ID")
-    if _expert_id and _agent.postgres_conn:
-        from src.core.loader import _is_experts_db_enabled
-
-        if _is_experts_db_enabled():
-            if await _agent._apply_db_expert(_expert_id):
-                _agent._create_phase_llms()
-                logger.info("Session bound to DB expert %s", _expert_id)
-
     # Register with orchestrator
     _orchestrator_client = create_orchestrator_client_from_env(_agent.config.agent_id)
     logger.info("Registering with orchestrator...")
@@ -431,7 +419,6 @@ async def _process_orchestrator_job(
     context: Optional[Dict[str, Any]] = None,
     instructions: Optional[str] = None,
     config_name: Optional[str] = None,
-    expert_id: Optional[str] = None,
     config_override: Optional[Dict[str, Any]] = None,
     git_remote_url: Optional[str] = None,
     datasources: Optional[list] = None,
@@ -488,8 +475,6 @@ async def _process_orchestrator_job(
             metadata["instructions"] = instructions
         if config_name and config_name != "default":
             metadata["config_name"] = config_name
-        if expert_id:
-            metadata["expert_id"] = expert_id
         if config_override:
             metadata["config_override"] = config_override
         if git_remote_url:
@@ -775,7 +760,6 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
                 context=request.context,
                 instructions=request.instructions,
                 config_name=request.config_name,
-                expert_id=request.expert_id,
                 config_override=request.config_override,
                 git_remote_url=request.git_remote_url,
                 datasources=request.datasources,

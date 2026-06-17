@@ -137,8 +137,12 @@ migration plan live in [[agent_memory_overhaul]].
 >   **CONDITIONAL**. The harness measurement is **done (2026-06-14)** and
 >   positive — supersede fixes knowledge-update (end-task 0/4 → 3/4, overall
 >   0.40 → 0.50; contradiction probe `original_injected` 1.0 → 0.25, reader
->   current 1.0) — but the runtime stays on the legacy path until the GATE-B
->   production flip. Detail in the overhaul doc Phase-4 log.
+>   current 1.0). **GATE B is now flipped (2026-06-14)** — both defaults YAMLs
+>   carry the reranker/gate/bounded + ingestion stack, so on the next dev deploy
+>   these move from 🔶 CONDITIONAL to the default live path (the worker/persistent
+>   agents will rerank + adjudicate by default). Shipping to dev first for
+>   real-session validation; the legacy fallback stays behind the flags
+>   (one-edit rollback). Detail in the overhaul doc Phase-4 + GATE-B log.
 > - **Equivalence pinning still holds.** Phases 3–4 changed neither the legacy
 >   blocks nor the seam's default rendering (the verdict branch is unreachable
 >   with the flag off), so the equivalence suites above remain green and the
