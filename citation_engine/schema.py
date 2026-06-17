@@ -4,6 +4,15 @@ Database Schema for Citation Engine
 Defines the SQL schemas for both SQLite and PostgreSQL backends.
 Includes migration support for schema versioning.
 
+NOTE: In PostgreSQL (multi-agent) mode the CREATE TABLE / migration SQL in this
+module is NOT executed — the host application owns the schema (see
+``CitationEngine._initialize_schema``). When vendored into
+Superhuman-Remote-Worker, ``orchestrator/database/migrations/vector/`` is the
+authoritative source for the sources / citations / source_embeddings /
+job_sources / source_annotations / source_tags tables. ``POSTGRESQL_SCHEMA``
+below is retained only for the standalone path and as reference; keep it in
+sync with the host migrations or remove it in a future cleanup.
+
 Based on the Citation & Provenance Engine Design Document v0.3.
 """
 
