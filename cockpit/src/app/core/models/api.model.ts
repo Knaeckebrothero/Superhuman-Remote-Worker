@@ -71,7 +71,37 @@ export interface ExpertDetail extends Expert {
   defaults_tools?: Record<string, string[]>;
   /** Raw settings_matrix.yaml for client-side model-family resolution. */
   settings_matrix?: Record<string, Record<string, unknown>>;
+  /** DB-backed experts only — present on create/update responses + detail. */
+  name?: string;
+  owner_id?: string;
+  version?: number;
+  /** Persona + instructions fragment (DB-backed experts). */
+  prompts?: Record<string, unknown>;
 }
+
+/**
+ * Create a DB-backed expert (POST /api/experts). The save-time hard-deny scan
+ * runs server-side on ``config``; per-user grants are a later slice.
+ */
+export interface ExpertCreateRequest {
+  name: string;
+  display_name: string;
+  expert_type: 'worker' | 'session';
+  description?: string | null;
+  icon?: string;
+  color?: string;
+  tags?: string[];
+  config?: Record<string, unknown>;
+  prompts?: Record<string, unknown>;
+}
+
+/**
+ * Patch a DB-backed expert (PUT /api/experts/{id}). ``name`` and
+ * ``expert_type`` are immutable, so they are absent.
+ */
+export type ExpertUpdateRequest = Partial<
+  Omit<ExpertCreateRequest, 'name' | 'expert_type'>
+>;
 
 // =============================================================================
 // Datasource Models
