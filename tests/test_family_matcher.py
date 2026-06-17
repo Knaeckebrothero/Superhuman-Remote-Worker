@@ -47,6 +47,8 @@ from orchestrator.services.family_matcher import detect_family
         ("MiniMaxAI/MiniMax-M2.7", "minimax"),
         ("MiniMaxAI/MiniMax-M3", "minimax-m3"),
         ("deepseek-v3", "deepseek"),
+        ("z-ai/glm-5.2", "glm"),
+        ("glm-5.2", "glm"),
         # Kimi (Moonshot) → default per design (no custom prompts shipped)
         ("moonshotai/kimi-k2-instruct-0905", "default"),
         # Embeddings
@@ -70,6 +72,7 @@ def test_detect_family_matched_rules(model_id: str, expected_family: str) -> Non
         ("openrouter/openai/text-embedding-3-large", "openai-embedding"),
         ("openrouter/google/gemini-2.5-pro", "gemini"),
         ("openrouter/openai/gpt-oss-120b", "gpt-oss"),
+        ("openrouter/z-ai/glm-5.2", "glm"),
     ],
 )
 def test_openrouter_prefix_recurses(model_id: str, expected_family: str) -> None:
