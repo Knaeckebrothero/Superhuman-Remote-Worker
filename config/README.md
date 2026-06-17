@@ -32,7 +32,10 @@ config/
 │   ├── persona_minimax_m3.txt             # MiniMax M3 persona
 │   ├── strategic_minimax_m3.txt           # MiniMax M3 strategic prompt
 │   ├── tactical_minimax_m3.txt            # MiniMax M3 tactical prompt
-│   └── summarization_prompt_minimax_m3.txt # MiniMax M3 summarization
+│   ├── summarization_prompt_minimax_m3.txt # MiniMax M3 summarization
+│   ├── systemprompt_glm.txt                # GLM-5.2 worker system prompt
+│   ├── systemprompt_interactive_glm.txt    # GLM-5.2 persistent-chat system prompt
+│   └── persona_glm.txt                     # GLM-5.2 persona
 └── templates/                   # Instruction templates (non-prompt files)
     ├── instructions.md                  # Default agent instructions
     ├── instructions_minimax.md          # MiniMax M2.7-optimized instructions
