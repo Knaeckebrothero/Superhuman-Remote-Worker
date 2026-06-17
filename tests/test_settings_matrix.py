@@ -84,6 +84,48 @@ class TestFamilyOfMinimax:
         assert detect_reasoning_method("openrouter/minimax/minimax-m2.7") == "none"
 
 
+class TestGlmFamily:
+    def test_glm_registered_in_matrix(self):
+        matrix = _load_settings_matrix()
+        assert "glm" in matrix
+        assert matrix["glm"]["temperature"] == 1.0
+        assert matrix["glm"]["top_p"] == 0.95
+        assert matrix["glm"]["multimodal"] is False
+        assert matrix["glm"]["parallel_tool_calls"] is False
+        assert matrix["glm"]["model_max_context_tokens"] == 1000000
+        # Single context value per family — leaves derive at load, no `limits` here.
+        assert "limits" not in matrix["glm"]
+
+    def test_glm_settings_applied(self):
+        data = {"llm": {"model": "openrouter/z-ai/glm-5.2"}}
+        _apply_settings_matrix(data, expert_llm_keys=set())
+        assert data["llm"]["temperature"] == 1.0
+        assert data["llm"]["top_p"] == 0.95
+        assert data["llm"]["multimodal"] is False
+        assert data["llm"]["parallel_tool_calls"] is False
+        assert data["llm"]["model_max_context_tokens"] == 1000000
+        assert data["limits"]["model_max_context_tokens"] == 1000000
+        assert data["limits"]["context_threshold_tokens"] == 800000  # 1000000 * 0.80
+        assert data["limits"]["message_count_min_tokens"] == 400000  # 1000000 * 0.40
+
+    def test_glm_limits_end_to_end(self, tmp_path):
+        expert = {
+            "$extends": "defaults",
+            "agent_id": "test_agent",
+            "display_name": "Test Agent",
+            "llm": {"model": "openrouter/z-ai/glm-5.2"},
+        }
+        config_file = tmp_path / "config.yaml"
+        with open(config_file, "w") as f:
+            yaml.dump(expert, f)
+        config = loader.load_agent_config(str(config_file))
+        assert config.llm.temperature == 1.0
+        assert config.llm.top_p == 0.95
+        assert config.limits.model_max_context_tokens == 1000000
+        assert config.limits.context_threshold_tokens == 800000  # 1000000 * 0.80
+        assert config.limits.message_count_min_tokens == 400000  # 1000000 * 0.40
+
+
 # =============================================================================
 # _load_settings_matrix
 # =============================================================================
