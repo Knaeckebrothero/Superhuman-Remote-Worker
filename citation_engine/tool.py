@@ -171,14 +171,14 @@ def create_citation_tools(engine: CitationEngine) -> list:
             Citation ID formatted for embedding, e.g., "[1]"
             If verification fails, includes failure reason.
         """
-        log.debug(f"cite() called: source_type={source_type}, identifier={source_identifier}")
+        log.debug(
+            f"cite() called: source_type={source_type}, identifier={source_identifier}"
+        )
 
         # Validate source_type
         valid_types = ("document", "website", "database", "custom")
         if source_type not in valid_types:
-            error_msg = (
-                f"Invalid source_type: '{source_type}'. Must be one of: {', '.join(valid_types)}"
-            )
+            error_msg = f"Invalid source_type: '{source_type}'. Must be one of: {', '.join(valid_types)}"
             log.warning(error_msg)
             return f"Error: {error_msg}"
 
@@ -249,7 +249,9 @@ def create_citation_tools(engine: CitationEngine) -> list:
 
             # Format response based on verification status
             if result.verification_status == VerificationStatus.VERIFIED:
-                log.info(f"Citation [{result.citation_id}] created and verified successfully")
+                log.info(
+                    f"Citation [{result.citation_id}] created and verified successfully"
+                )
                 return f"[{result.citation_id}]"
             else:
                 log.warning(
@@ -291,14 +293,14 @@ def create_citation_tools(engine: CitationEngine) -> list:
         Returns:
             Confirmation message with source ID, or error message if registration fails.
         """
-        log.debug(f"register_source() called: type={source_type}, identifier={identifier}")
+        log.debug(
+            f"register_source() called: type={source_type}, identifier={identifier}"
+        )
 
         # Validate source_type
         valid_types = ("document", "website", "database", "custom")
         if source_type not in valid_types:
-            error_msg = (
-                f"Invalid source_type: '{source_type}'. Must be one of: {', '.join(valid_types)}"
-            )
+            error_msg = f"Invalid source_type: '{source_type}'. Must be one of: {', '.join(valid_types)}"
             log.warning(error_msg)
             return f"Error: {error_msg}"
 
@@ -442,7 +444,9 @@ def create_citation_tools(engine: CitationEngine) -> list:
 
         return "\n".join(lines)
 
-    log.info("Created 4 citation tools: cite, register_source, list_sources, get_citation_status")
+    log.info(
+        "Created 4 citation tools: cite, register_source, list_sources, get_citation_status"
+    )
     return [cite, register_source, list_sources, get_citation_status]
 
 

@@ -96,7 +96,9 @@ class Source:
             "identifier": self.identifier,
             "name": self.name,
             "version": self.version,
-            "content": self.content[:500] + "..." if len(self.content) > 500 else self.content,
+            "content": self.content[:500] + "..."
+            if len(self.content) > 500
+            else self.content,
             "content_hash": self.content_hash,
             "metadata": self.metadata,
             "created_at": self.created_at.isoformat(),
