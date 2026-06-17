@@ -2317,7 +2317,7 @@ def detect_reasoning_method(model: str, explicit_method: Optional[str] = None) -
         "gemma",
     ):
         return "none"
-    # gpt-5, gpt-4o, o-series, deepseek, qwen, llama, default
+    # gpt-5, gpt-4o, o-series, deepseek, glm, qwen, llama, default
     return "api"
 
 
