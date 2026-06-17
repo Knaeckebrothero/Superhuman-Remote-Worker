@@ -107,6 +107,11 @@ export function detectModelFamily(model: string): string {
   if (name.startsWith('o1') || name.startsWith('o3') || name.startsWith('o4')) return 'o-series';
   if (name.includes('deepseek')) return 'deepseek';
   if (name.includes('glm')) return 'glm';
+  if (
+    name.startsWith('mistral') || name.startsWith('codestral') || name.startsWith('magistral') ||
+    name.startsWith('ministral') || name.startsWith('devstral') || name.startsWith('pixtral') ||
+    name.startsWith('voxtral')
+  ) return 'mistral';
   if (name.includes('qwen') || name.includes('qwq')) return 'qwen';
   if (name.includes('llama')) return 'llama';
   if (name.startsWith('gemini')) return 'gemini';

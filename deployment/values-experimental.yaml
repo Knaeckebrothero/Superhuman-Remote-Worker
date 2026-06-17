@@ -204,6 +204,65 @@ llm:
   browserBaseUrl: ""
   embeddingBaseUrl: ""
   codexBaseUrl: ""
+  # ---------------------------------------------------------------------------
+  # System LLM catalog seeding (orchestrator/seed/llm_config.py, run by the
+  # post-install/post-upgrade `srw-llm-seed` Job). Insert-only + idempotent:
+  # re-running against an already-seeded stack logs "skipped" per row and
+  # exits 0, so admin-UI catalog edits survive every helm upgrade.
+  #
+  # Mistral AI is a FIRST-CLASS provider (provider_kind='system', provider slug
+  # 'mistral'): the factory routes it through ReasoningChatOpenAI against
+  # api.mistral.ai/v1 (OpenAI-compatible — see src/core/loader._create_mistral_llm),
+  # so the catalog rows carry no baseUrl. The API key is NOT stored here — ESO
+  # syncs the whole srw-secrets Vault bundle into the `srw` Secret, so add a
+  # `MISTRAL_API_KEY` property to
+  #   homelab/superhuman-remote-worker/srw-secrets
+  # The seed Job derives SEED_MISTRAL_API_KEY from systemApiKeys.mistral below
+  # and its pod fails to start if the key is absent, so add it to Vault BEFORE
+  # this change syncs. (Provider seeding needs migration 0029, which the
+  # orchestrator applies at startup before the seed Job's health gate passes.)
+  #
+  # Model ids use Mistral's `-latest` aliases (Magistral Medium omitted — it
+  # deprecates 2026-07-31; reasoning now lives in Medium 3.5 via
+  # reasoning_effort). Confirm the ids against
+  #   curl -s https://api.mistral.ai/v1/models -H "Authorization: Bearer $KEY"
+  # once the key is in Vault; pin to dated versions if you want reproducibility.
+  # contextWindow is nominal for the Mistral 3 family (256k).
+  # ---------------------------------------------------------------------------
+  seed:
+    enabled: true
+    systemApiKeys:
+      mistral:
+        secretName: srw
+        key: MISTRAL_API_KEY
+    systemModels:
+      - provider: mistral
+        id: "mistral-large-latest"
+        displayName: "Mistral Large 3"
+        family: "mistral"
+        contextWindow: 256000
+        capability: chat
+        multimodal: true
+      - provider: mistral
+        id: "mistral-medium-latest"
+        displayName: "Mistral Medium 3.5"
+        family: "mistral"
+        contextWindow: 256000
+        capability: chat
+        multimodal: true
+      - provider: mistral
+        id: "mistral-small-latest"
+        displayName: "Mistral Small 4"
+        family: "mistral"
+        contextWindow: 256000
+        capability: chat
+        multimodal: true
+      - provider: mistral
+        id: "codestral-latest"
+        displayName: "Codestral"
+        family: "mistral"
+        contextWindow: 256000
+        capability: chat
 # -----------------------------------------------------------------------------
 # Session router — Direct Session WebSockets
 # (docs/features/direct_session_websockets.md)

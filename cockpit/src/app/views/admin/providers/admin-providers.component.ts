@@ -30,6 +30,7 @@ const SYSTEM_PROVIDERS: {value: Exclude<ApiKeyProvider, 'codex'>; label: string}
   {value: 'google', label: 'Google'},
   {value: 'groq', label: 'Groq'},
   {value: 'openrouter', label: 'OpenRouter'},
+  {value: 'mistral', label: 'Mistral'},
   {value: 'vision', label: 'Vision'},
 ];
 
@@ -42,6 +43,7 @@ const DISCOVERABLE_PROVIDERS: ReadonlySet<string> = new Set([
   'google',
   'groq',
   'openrouter',
+  'mistral',
 ]);
 
 @Component({

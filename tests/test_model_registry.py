@@ -101,6 +101,16 @@ class TestFamilyOf:
         assert family_of("z-ai/glm-5.2") == "glm"
         assert family_of("openrouter/z-ai/glm-5.2") == "glm"
 
+    def test_mistral(self):
+        # Mistral 3 family + specialists. Native api.mistral.ai serves bare ids;
+        # the openrouter/ prefix recurses on the trailing segment.
+        assert family_of("mistral-large-latest") == "mistral"
+        assert family_of("mistral-medium-latest") == "mistral"
+        assert family_of("mistral-small-latest") == "mistral"
+        assert family_of("codestral-latest") == "mistral"
+        assert family_of("ministral-3-8b") == "mistral"
+        assert family_of("openrouter/mistralai/mistral-large") == "mistral"
+
 
 class TestUnknownModels:
     @pytest.fixture(autouse=True)

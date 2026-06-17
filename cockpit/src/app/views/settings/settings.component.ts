@@ -36,6 +36,7 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
   { value: 'google', label: 'Google' },
   { value: 'groq', label: 'Groq' },
   { value: 'openrouter', label: 'OpenRouter' },
+  { value: 'mistral', label: 'Mistral' },
   { value: 'codex', label: 'Codex' },
   { value: 'vision', label: 'Vision' },
 ];

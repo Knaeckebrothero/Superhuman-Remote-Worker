@@ -65,6 +65,14 @@ _FAMILY_RULES: list[tuple[re.Pattern, str | Callable[[re.Match], FamilyDetection
     (re.compile(r"minimax[-_]?m3", re.IGNORECASE), "minimax-m3"),
     (re.compile(r"minimax", re.IGNORECASE), "minimax"),
     (re.compile(r"deepseek", re.IGNORECASE), "deepseek"),
+    # Mistral 3 family + specialists (Codestral/Magistral/Ministral/Devstral/
+    # Pixtral/Voxtral). Native api.mistral.ai serves bare ids; the openrouter
+    # prefix rule above recurses here for `mistralai/...`. Mirrors family_of()
+    # in src/core/model_registry.py and the `mistral` model_config_matrix family.
+    (
+        re.compile(r"mistral|codestral|magistral|ministral|devstral|pixtral|voxtral", re.IGNORECASE),
+        "mistral",
+    ),
     (re.compile(r"glm", re.IGNORECASE), "glm"),
     (re.compile(r"kimi", re.IGNORECASE), "default"),
     # Embeddings

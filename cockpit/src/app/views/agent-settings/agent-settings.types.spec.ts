@@ -8,3 +8,13 @@ describe('detectModelFamily — GLM', () => {
     expect(detectModelFamily('glm-5.2')).toBe('glm');
   });
 });
+
+describe('detectModelFamily — Mistral', () => {
+  it('maps Mistral 3 family + specialists across transports', () => {
+    expect(detectModelFamily('mistral-large-latest')).toBe('mistral');
+    expect(detectModelFamily('mistral-medium-latest')).toBe('mistral');
+    expect(detectModelFamily('mistral-small-latest')).toBe('mistral');
+    expect(detectModelFamily('codestral-latest')).toBe('mistral');
+    expect(detectModelFamily('openrouter/mistralai/mistral-large')).toBe('mistral');
+  });
+});
