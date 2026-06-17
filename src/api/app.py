@@ -456,6 +456,7 @@ async def _process_orchestrator_job(
     config_name: Optional[str] = None,
     expert_id: Optional[str] = None,
     config_override: Optional[Dict[str, Any]] = None,
+    resolved_config: Optional[Dict[str, Any]] = None,
     git_remote_url: Optional[str] = None,
     datasources: Optional[list] = None,
     repositories: Optional[list] = None,
@@ -505,6 +506,8 @@ async def _process_orchestrator_job(
             metadata["expert_id"] = expert_id
         if config_override:
             metadata["config_override"] = config_override
+        if resolved_config:
+            metadata["resolved_config"] = resolved_config
         if git_remote_url:
             metadata["git_remote_url"] = git_remote_url
         if datasources:
@@ -855,6 +858,7 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
                 config_name=request.config_name,
                 expert_id=request.expert_id,
                 config_override=request.config_override,
+                resolved_config=request.resolved_config,
                 git_remote_url=request.git_remote_url,
                 datasources=request.datasources,
                 repositories=request.repositories,

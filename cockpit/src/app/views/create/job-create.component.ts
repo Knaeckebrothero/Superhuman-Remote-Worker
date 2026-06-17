@@ -1353,7 +1353,16 @@ export class JobCreateComponent implements OnInit {
     const request: JobCreateRequest = { description: this.formData.description };
 
     const expert = this.selectedExpert();
-    if (expert && expert.id !== 'defaults') request.config_name = expert.id;
+    if (expert && expert.id !== 'defaults') {
+      // DB-backed experts (source user/global) go via expert_id — the
+      // orchestrator resolves them into the job config. Bundled experts keep
+      // the config_name path. Fixes the config_name=<uuid> conflation.
+      if (expert.source === 'user' || expert.source === 'global') {
+        request.expert_id = expert.id;
+      } else {
+        request.config_name = expert.id;
+      }
+    }
     if (this.uploadId) request.upload_id = this.uploadId;
 
     // Collect overrides from the settings component

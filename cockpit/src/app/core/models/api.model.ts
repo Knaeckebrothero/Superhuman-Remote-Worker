@@ -53,6 +53,11 @@ export interface Expert {
   icon: string;
   color: string;
   tags: string[];
+  /** 'bundled' (disk config) | 'user' | 'global' (DB-backed). DB experts are
+   *  selected via expert_id; bundled experts via config_name. */
+  source?: string;
+  /** 'worker' | 'session' — present on DB-backed experts only. */
+  expert_type?: string;
 }
 
 /**
@@ -1029,6 +1034,9 @@ export interface JobCreateRequest {
   document_path?: string;
   document_dir?: string;
   config_name?: string;
+  /** DB-backed expert UUID. Preferred over config_name for expert selection;
+   *  the orchestrator resolves it into the job config. config_name stays base. */
+  expert_id?: string;
   config_override?: Record<string, unknown>;
   context?: Record<string, unknown>;
   instructions?: string;

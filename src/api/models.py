@@ -279,6 +279,15 @@ class JobStartRequest(BaseModel):
         default=None,
         description="Per-job configuration overrides",
     )
+    resolved_config: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Orchestrator-resolved config blob (serialize_resolved_config shape). "
+            "When present the agent hydrates it directly instead of resolving "
+            "config_name + config_override locally — the orchestrator owns "
+            "resolution and the freeze. Absent → today's path (fallback)."
+        ),
+    )
     context: Optional[Dict[str, Any]] = Field(
         default=None,
         description="Optional context dictionary",

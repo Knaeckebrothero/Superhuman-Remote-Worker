@@ -29,6 +29,9 @@ interface Expert {
   icon: string;
   color: string;
   tags: string[];
+  /** 'bundled' (disk) | 'user' | 'global' (DB). DB experts → expert_id. */
+  source?: string;
+  expert_type?: string;
 }
 
 interface ExpertDetail extends Expert {
@@ -397,7 +400,12 @@ export class SessionCreateComponent implements OnInit {
     this.creating.set(true);
 
     const expert = this.selectedExpert();
-    const configName = expert?.id ?? 'persistent_defaults';
+    // DB-backed experts (source user/global) go via expert_id; config_name
+    // stays the persistent base. Bundled experts keep the config_name path.
+    // Fixes the config_name=<uuid> conflation that crashed session boot.
+    const isDbExpert = expert?.source === 'user' || expert?.source === 'global';
+    const configName = expert && !isDbExpert ? expert.id : 'persistent_defaults';
+    const expertId = isDbExpert ? expert!.id : undefined;
     const projectIds = Array.from(this.selectedProjectIds());
 
     // Build config_override from settings component
@@ -414,6 +422,7 @@ export class SessionCreateComponent implements OnInit {
     const body: Record<string, unknown> = {
       title: this.title || 'Untitled Session',
       config_name: configName,
+      expert_id: expertId,
       project_ids: projectIds.length > 0 ? projectIds : undefined,
     };
 
