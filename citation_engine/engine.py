@@ -297,15 +297,30 @@ class CitationEngine:
             ) from e
 
     def _initialize_schema(self) -> None:
-        """Create database tables if they don't exist, then apply pending migrations."""
+        """Create database tables if they don't exist, then apply pending migrations.
+
+        SQLite (basic/standalone) mode only. In PostgreSQL (multi-agent) mode the
+        host application owns the schema through its own migration system — when
+        vendored into Superhuman-Remote-Worker that is
+        ``orchestrator/database/migrations/vector/``, which creates every table
+        this engine uses before an agent connects. CitationEngine must NOT create
+        tables or touch ``schema_migrations`` there: the host's migration runner
+        keeps a ``schema_migrations(filename, checksum, ...)`` table that collides
+        with this package's hand-rolled ``schema_migrations(version)``. So in
+        Postgres mode initialization here is both redundant and actively harmful.
+        """
+        if self._db_type != "sqlite":
+            log.debug(
+                "PostgreSQL mode: host application owns the schema; "
+                "skipping CitationEngine schema init + migrations"
+            )
+            return
+
         log.debug("Initializing database schema...")
         schema = get_schema(self._db_type)
 
         try:
-            if self._db_type == "sqlite":
-                self._cursor.executescript(schema)
-            else:
-                self._cursor.execute(schema)
+            self._cursor.executescript(schema)
             self._conn.commit()
             log.debug("Database schema initialized successfully")
         except Exception as e:
