@@ -89,14 +89,8 @@ GET    /api/datasources/{datasource_id}                                         
 PUT    /api/datasources/{datasource_id}                                                 gated:require_datasource_owner
 POST   /api/datasources/{datasource_id}/test                                            gated:require_datasource_owner
 GET    /api/experts                                                                     gated:require_approved_user
-POST   /api/experts                                                                     gated:require_approved_user
-POST   /api/experts/import                                                              gated:require_approved_user
 POST   /api/experts/reload                                                              admin:_require_admin
-DELETE /api/experts/{expert_id}                                                         gated:require_approved_user
 GET    /api/experts/{expert_id}                                                         gated:require_approved_user
-PUT    /api/experts/{expert_id}                                                         gated:require_approved_user
-POST   /api/experts/{expert_id}/duplicate                                               gated:require_approved_user
-GET    /api/experts/{expert_id}/export                                                  gated:require_approved_user
 GET    /api/health                                                                      public:k8s-liveness-probe
 POST   /api/internal/mcp-token-create                                                   internal:require_internal
 POST   /api/internal/mcp-token-verify                                                   internal:require_internal

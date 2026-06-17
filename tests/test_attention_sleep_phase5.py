@@ -564,46 +564,8 @@ class TestPhase5WakeIfSuspended:
         await asyncio.sleep(0)
 
         svc.restore_thread_workspace.assert_awaited_with("thread-abc")
-        # No expert bound on this thread → expert_id threads through as None.
         prov.create_agent_pod.assert_called_with(
-            "thread-abc", config_name="persistent_defaults", expert_id=None
-        )
-
-    @pytest.mark.asyncio
-    async def test_wake_preserves_thread_expert_id(self):
-        # Regression guard for the DB-experts threading: a suspended thread with
-        # a bound expert must re-provision its agent pod with that same expert,
-        # not silently drop it on magic-link wake.
-        import orchestrator.main as om
-
-        thread = {
-            "id": "thread-abc",
-            "agent_id": None,
-            "config_name": "persistent_defaults",
-            "metadata": {
-                "workspace_container": {"status": "suspended"},
-                "expert_id": "expert-xyz",
-            },
-        }
-        db = MagicMock()
-        db.get_thread = AsyncMock(return_value=thread)
-        db.acquire = _make_db().acquire
-        om.postgres_db = db
-
-        svc = MagicMock()
-        svc.is_enabled = True
-        svc.restore_thread_workspace = AsyncMock(return_value=True)
-        om.workspace_suspension_service = svc
-
-        prov = MagicMock()
-        prov.create_agent_pod = AsyncMock(return_value=True)
-        om.persistent_provisioner = prov
-
-        await om._phase5_wake_if_suspended("thread-abc")
-        await asyncio.sleep(0)
-
-        prov.create_agent_pod.assert_called_with(
-            "thread-abc", config_name="persistent_defaults", expert_id="expert-xyz"
+            "thread-abc", config_name="persistent_defaults"
         )
 
     @pytest.mark.asyncio

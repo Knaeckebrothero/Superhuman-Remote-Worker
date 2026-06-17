@@ -4,6 +4,7 @@ Handles loading agent configuration from YAML files and dynamically
 loading the appropriate tools based on configuration.
 """
 
+import copy
 import logging
 import os
 from dataclasses import dataclass, field
@@ -194,7 +195,7 @@ def deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]
         # {"llm": {"model": "gpt-oss", "temp": 0.0}, "tools": ["c"]}
         ```
     """
-    result = base.copy()
+    result = copy.deepcopy(base)
 
     for key, value in override.items():
         if value is None:
