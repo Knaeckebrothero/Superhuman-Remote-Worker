@@ -62,7 +62,7 @@ class ModelMeta:
     capability: str = "chat"
 
 
-_FACTORY_PROVIDERS = {"openai", "anthropic", "google", "groq", "openrouter", "codex"}
+_FACTORY_PROVIDERS = {"openai", "anthropic", "google", "groq", "openrouter", "mistral", "codex"}
 
 
 def _factory_provider(yaml_provider: Optional[str]) -> str:
@@ -172,6 +172,13 @@ def family_of(model_id: str, default: str = "default") -> str:
         return "deepseek"
     if "glm" in name:
         return "glm"
+    if name.startswith(
+        ("mistral", "codestral", "magistral", "ministral", "devstral", "pixtral", "voxtral")
+    ):
+        # Mistral 3 family + specialists. Native api.mistral.ai serves bare ids
+        # (mistral-large-latest, codestral-latest); the openrouter/ prefix is
+        # stripped above. All share the `mistral` matrix family.
+        return "mistral"
     if "qwen" in name or "qwq" in name:
         return "qwen"
     if "llama" in name:

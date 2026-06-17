@@ -2317,7 +2317,7 @@ def detect_reasoning_method(model: str, explicit_method: Optional[str] = None) -
         "gemma",
     ):
         return "none"
-    # gpt-5, gpt-4o, o-series, deepseek, glm, qwen, llama, default
+    # gpt-5, gpt-4o, o-series, deepseek, glm, mistral, qwen, llama, default
     return "api"
 
 
@@ -2421,6 +2421,8 @@ def create_llm(
         return _create_groq_llm(config, limits)
     elif provider == "openrouter":
         return _create_openrouter_llm(config, limits)
+    elif provider == "mistral":
+        return _create_mistral_llm(config, limits)
     elif provider == "codex":
         return _create_codex_llm(config, limits)
     else:
@@ -2954,6 +2956,85 @@ def _create_openrouter_llm(
         f"base_url={base_url}, timeout={config.timeout}s, "
         f"max_retries={config.max_retries}, max_context_tokens={max_context_tokens or 'default'}, "
         f"max_tokens={max_tokens}, reasoning={reasoning_mode}, keys={key_info}"
+    )
+
+    return llm
+
+
+def _create_mistral_llm(
+    config: LLMConfig,
+    limits: Optional[LimitsConfig] = None,
+) -> BaseChatModel:
+    """Create a Mistral AI LLM (native api.mistral.ai, OpenAI-compatible wire).
+
+    First-class provider routed through ReasoningChatOpenAI against Mistral's
+    OpenAI-compatible Chat Completions endpoint — the same strategy as the
+    openrouter/codex factories, so it inherits the reasoning-channel and
+    parallel-tool-call handling without pulling in a separate SDK. Requires
+    MISTRAL_API_KEY (env) or config.api_key.
+
+    Models are bare Mistral ids (mistral-large-latest, mistral-medium-latest,
+    mistral-small-latest, codestral-latest, …). A defensive ``mistral/`` prefix
+    is stripped if present; the API expects the bare id.
+    """
+    api_key = config.api_key or os.getenv("MISTRAL_API_KEY")
+    if not api_key:
+        raise ValueError(
+            "MISTRAL_API_KEY environment variable required for Mistral provider. "
+            "Set it in your environment or provide api_key in config."
+        )
+
+    # Strip a defensive mistral/ prefix — the native API expects bare ids.
+    model = config.model
+    if model.lower().startswith("mistral/"):
+        model = model[len("mistral/") :]
+
+    # Base URL: explicit config wins, otherwise Mistral's API.
+    base_url = config.base_url or "https://api.mistral.ai/v1"
+
+    # top_k is non-standard for the typed Chat Completions signature, so it
+    # rides in extra_body (same treatment as the openrouter factory).
+    extra_body = {}
+    if config.top_k is not None:
+        extra_body["top_k"] = config.top_k
+
+    llm_kwargs = {
+        "model": model,
+        "temperature": config.temperature,
+        "api_key": api_key,
+        "base_url": base_url,
+        "max_retries": config.max_retries,
+        # Mistral's endpoint is Chat Completions, not the Responses API.
+        "use_responses_api": False,
+    }
+    if config.top_p is not None:
+        llm_kwargs["top_p"] = config.top_p
+    if config.timeout is not None:
+        llm_kwargs["timeout"] = config.timeout
+    if extra_body:
+        llm_kwargs["extra_body"] = extra_body
+
+    max_tokens = _resolve_max_output_tokens(config, limits)
+    llm_kwargs["max_tokens"] = max_tokens
+
+    # Per-model context window for HTTP-layer validation (Layer 0 safety).
+    max_context_tokens = config.model_max_context_tokens or (
+        limits.model_max_context_tokens if limits else None
+    )
+    if max_context_tokens:
+        llm_kwargs["max_context_tokens"] = max_context_tokens
+
+    # Request usage on streamed responses (stream_options.include_usage) so the
+    # persistent path gets turn metrics — same as the openrouter factory.
+    llm_kwargs["stream_usage"] = True
+
+    llm = ReasoningChatOpenAI(**llm_kwargs)
+
+    logger.info(
+        f"Created Mistral LLM: model={model}, temp={config.temperature}, "
+        f"base_url={base_url}, timeout={config.timeout}s, "
+        f"max_retries={config.max_retries}, "
+        f"max_context_tokens={max_context_tokens or 'default'}, max_tokens={max_tokens}"
     )
 
     return llm

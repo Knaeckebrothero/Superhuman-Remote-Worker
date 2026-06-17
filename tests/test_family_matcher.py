@@ -49,6 +49,10 @@ from orchestrator.services.family_matcher import detect_family
         ("deepseek-v3", "deepseek"),
         ("z-ai/glm-5.2", "glm"),
         ("glm-5.2", "glm"),
+        # Mistral 3 family + specialists (settings-only family)
+        ("mistral-large-latest", "mistral"),
+        ("codestral-latest", "mistral"),
+        ("magistral-medium-latest", "mistral"),
         # Kimi (Moonshot) → default per design (no custom prompts shipped)
         ("moonshotai/kimi-k2-instruct-0905", "default"),
         # Embeddings
@@ -73,6 +77,7 @@ def test_detect_family_matched_rules(model_id: str, expected_family: str) -> Non
         ("openrouter/google/gemini-2.5-pro", "gemini"),
         ("openrouter/openai/gpt-oss-120b", "gpt-oss"),
         ("openrouter/z-ai/glm-5.2", "glm"),
+        ("openrouter/mistralai/mistral-large-latest", "mistral"),
     ],
 )
 def test_openrouter_prefix_recurses(model_id: str, expected_family: str) -> None:

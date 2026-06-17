@@ -16,6 +16,7 @@ Provider sources match the table in ``docs/features/models_yaml_removal.md``:
 | google     | GET https://generativelanguage.googleapis.com/v1beta/models   |
 | groq       | GET https://api.groq.com/openai/v1/models                     |
 | openrouter | GET https://openrouter.ai/api/v1/models                       |
+| mistral    | GET https://api.mistral.ai/v1/models                          |
 | anthropic  | Skipped — no authed listing with the metadata we need         |
 | vision     | Skipped — env-bridge provider, not a chat catalog source      |
 
@@ -48,7 +49,7 @@ DISCOVERY_CACHE_TTL = timedelta(hours=24)
 
 # Providers we know how to enumerate. Anthropic and the env-bridge "vision"
 # provider are deliberately absent — see module docstring for the rationale.
-DISCOVERABLE_PROVIDERS = {"openai", "google", "groq", "openrouter"}
+DISCOVERABLE_PROVIDERS = {"openai", "google", "groq", "openrouter", "mistral"}
 
 
 # Substrings that flag a chat-capable model as also serving vision.
@@ -73,6 +74,12 @@ _MULTIMODAL_PATTERNS = (
     "claude-4",  # claude-4 family is multimodal
     "qwen2-vl",
     "qwen2.5-vl",
+    # Mistral 3 multimodal generalists (Large 3 / Medium 3.5 / Small 4) + Pixtral.
+    # Codestral / Ministral stay text-only, so no entry for them.
+    "mistral-large",
+    "mistral-medium",
+    "mistral-small",
+    "pixtral",
 )
 
 
@@ -243,11 +250,30 @@ async def _fetch_google(api_key: str) -> list[dict[str, Any]]:
     return out
 
 
+async def _fetch_mistral(api_key: str) -> list[dict[str, Any]]:
+    """Mistral exposes the OpenAI-shaped ``/v1/models`` listing. IDs are bare
+    (`mistral-large-latest`, `codestral-latest`), which the family matcher's
+    mistral rule maps to the ``mistral`` family."""
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        resp = await client.get(
+            "https://api.mistral.ai/v1/models",
+            headers={"Authorization": f"Bearer {api_key}"},
+        )
+        resp.raise_for_status()
+        data = resp.json().get("data") or []
+    return [
+        _candidate_from_id(item["id"])
+        for item in data
+        if isinstance(item, dict) and item.get("id")
+    ]
+
+
 _FETCHERS = {
     "openai": _fetch_openai,
     "groq": _fetch_groq,
     "openrouter": _fetch_openrouter,
     "google": _fetch_google,
+    "mistral": _fetch_mistral,
 }
 
 

@@ -751,10 +751,13 @@
       .tool-summary-dot.denied { background: var(--danger); }
       .tool-summary-dot.mixed { background: var(--warning); }
 
-      /* Tool detail list (level 2) — F6 card visual */
+      /* Tool detail list — flush-left with the assistant prose. The card's
+         border + fill (Gestalt "common region") already marks it as a distinct
+         action, so no horizontal indent is needed; indenting only some rows
+         would create a ragged left edge that measurably slows scanning. */
 
       .tool-detail-list {
-        padding: 6px 0 4px 20px;
+        padding: 6px 0 4px 0;
         display: flex;
         flex-direction: column;
         gap: 6px;

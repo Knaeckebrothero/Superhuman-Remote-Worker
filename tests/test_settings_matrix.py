@@ -476,7 +476,7 @@ class TestSettingsMatrixIntegration:
             "agent_id": "test_agent",
             "display_name": "Test Agent",
             "llm": {
-                "model": "mistral-large",
+                "model": "some-unknown-model",
             },
         }
         config_file = tmp_path / "config.yaml"
