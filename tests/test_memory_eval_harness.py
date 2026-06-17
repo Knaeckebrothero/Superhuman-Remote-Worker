@@ -36,6 +36,11 @@ from eval.memory.ingest import (
     _verbatim_round_texts,
     ingest_question,
 )
+from eval.memory.lifecycle import (
+    classify_case,
+    load_lifecycle_meta,
+    summarize,
+)
 from eval.memory.judge import (
     JUDGE_MAX_TOKENS,
     LLMRoute,
@@ -64,6 +69,7 @@ from src.services.memory.types import AssembleStats, InjectionBlock, MemoryPaylo
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = REPO_ROOT / "eval" / "memory" / "fixtures" / "tiny_longmemeval.json"
 PROBE_FIXTURE = REPO_ROOT / "eval" / "memory" / "fixtures" / "contradiction_probe.json"
+LIFECYCLE_FIXTURE = REPO_ROOT / "eval" / "memory" / "fixtures" / "lifecycle_probe.json"
 ARMS_DIR = REPO_ROOT / "eval" / "memory" / "arms"
 
 
@@ -1066,3 +1072,144 @@ class TestExtractionPromptOverride:
         # the intervention itself
         assert "Completeness over precision" in text
         assert "Events that happened" in text
+
+
+class TestLifecycleScorer:
+    """Bi-temporal supersede scorer (eval/memory/lifecycle.py)."""
+
+    @staticmethod
+    def _rows(*pairs):
+        """(text, retired) tuples -> the {text, retired} rows classify_case wants.
+
+        Text is lowercased here exactly as _fetch_case_rows does from the DB.
+        """
+        return [{"text": t.lower(), "retired": r} for t, r in pairs]
+
+    def test_fixture_loads_through_both_loaders(self):
+        questions = load_longmemeval(str(LIFECYCLE_FIXTURE))
+        meta = load_lifecycle_meta(str(LIFECYCLE_FIXTURE))
+        assert len(questions) == len(meta) >= 15
+        raw = {
+            inst["question_id"]: inst
+            for inst in json.loads(LIFECYCLE_FIXTURE.read_text(encoding="utf-8"))
+        }
+        for q in questions:
+            block = meta[q.question_id]
+            cat = block["category"]
+            blob = " ".join(t.content for s in q.sessions for t in s.turns).lower()
+            # every asserted value actually occurs in some turn
+            for v in block["expect_valid"] + block["expect_retired"]:
+                assert v.lower() in blob, f"{q.question_id}: {v!r} not in any turn"
+            # only should-retire categories name retired values; and they ship a
+            # probe block so contradiction.py can still score them
+            if cat in ("update", "update_chain"):
+                assert block["expect_retired"], q.question_id
+                assert "probe" in raw[q.question_id], q.question_id
+            else:
+                assert not block["expect_retired"], q.question_id
+
+    def test_update_pass(self):
+        rows = self._rows(
+            ("user drives a red Tesla Model 3", False),
+            ("user drives a blue Honda Civic", True),
+        )
+        v = classify_case(
+            "update", rows, ["red Tesla Model 3"], ["blue Honda Civic"], []
+        )
+        assert v["status"] == "pass"
+        assert all(x["outcome"] == "ok" for x in v["values"])
+
+    def test_false_retire_is_a_fault(self):
+        # a coexisting fact that should have survived was wrongly retired
+        rows = self._rows(
+            ("owns a Tesla Model 3", False),
+            ("owns a Honda motorcycle", True),  # retired -> over-retire bug
+        )
+        v = classify_case(
+            "coexist", rows, ["Tesla Model 3", "Honda motorcycle"], [], []
+        )
+        assert v["status"] == "fail"
+        outcomes = {x["value"]: x["outcome"] for x in v["values"]}
+        assert outcomes["Honda motorcycle"] == "false_retired"
+        assert outcomes["Tesla Model 3"] == "ok"
+
+    def test_missed_retire_is_a_fault(self):
+        # stale value still served by a valid row -> supersede never fired
+        rows = self._rows(
+            ("default backend is OpenCloud", False),
+            ("default backend is Nextcloud", False),
+        )
+        v = classify_case("update", rows, ["OpenCloud"], ["Nextcloud"], [])
+        assert v["status"] == "fail"
+        assert v["values"][-1]["outcome"] == "missed_retire"
+
+    def test_chain_retires_every_hop(self):
+        rows = self._rows(
+            ("orchestrator on port 8085", False),
+            ("orchestrator on port 8080", True),
+            ("orchestrator on port 8083", True),
+        )
+        v = classify_case("update_chain", rows, ["8085"], ["8080", "8083"], [])
+        assert v["status"] == "pass"
+
+    def test_noop_duplicate_is_a_fault(self):
+        rows = self._rows(
+            ("works at Northwind Robotics", False),
+            ("employed by Northwind Robotics", False),  # twin -> NOOP failed
+        )
+        v = classify_case(
+            "noop", rows, ["Northwind Robotics"], [], ["Northwind Robotics"]
+        )
+        assert v["status"] == "fail"
+        assert v["values"][-1]["outcome"] == "duplicate"
+
+    def test_noop_single_row_passes(self):
+        rows = self._rows(("works at Northwind Robotics", False))
+        v = classify_case(
+            "noop", rows, ["Northwind Robotics"], [], ["Northwind Robotics"]
+        )
+        assert v["status"] == "pass"
+
+    def test_not_extracted_is_incomplete_not_fault(self):
+        rows = self._rows(("something unrelated", False))
+        v = classify_case("coexist", rows, ["Spanish", "Japanese"], [], [])
+        assert v["status"] == "incomplete"
+        assert all(x["outcome"] == "not_extracted" for x in v["values"])
+
+    def test_no_rows(self):
+        v = classify_case("update", [], ["X"], ["Y"], [])
+        assert v["status"] == "no_rows"
+
+    def test_summarize_rates_and_denominators(self):
+        coexist = classify_case(
+            "coexist",
+            self._rows(("has X here", False), ("has Y here", True)),
+            ["X", "Y"],
+            [],
+            [],
+        )  # X ok, Y false_retired
+        upd = classify_case(
+            "update",
+            self._rows(("now C", False), ("old S", True)),
+            ["C"],
+            ["S"],
+            [],
+        )  # both ok
+        gap = classify_case(
+            "coexist", self._rows(("noise", False)), ["Z"], [], []
+        )  # Z not_extracted
+        s = summarize([coexist, upd, gap])
+        assert s["cases"] == 3
+        assert s["failed"] == 1 and s["passed"] == 1 and s["incomplete"] == 1
+        # X, Y, C are assessable survivors; Z is excluded (not extracted)
+        assert s["survive_assessable_n"] == 3
+        assert s["false_retired_n"] == 1
+        assert s["false_retire_rate"] == round(1 / 3, 4)
+        assert s["missed_retire_rate"] == 0.0  # S correctly retired
+        assert s["not_extracted_n"] == 1
+        assert s["by_category"]["coexist"] == {
+            "pass": 0,
+            "fail": 1,
+            "incomplete": 1,
+            "no_rows": 0,
+        }
