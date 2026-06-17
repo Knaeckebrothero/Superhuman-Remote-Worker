@@ -430,43 +430,6 @@ class UniversalAgent:
             )
             self.vector_conn = None
 
-    async def _apply_db_expert(self, expert_id: str) -> bool:
-        """Load a DB expert by id and apply it as the base config (decision 6):
-        merge the fragment onto the expert_type base + inject persona/instructions
-        (fenced at render). FAIL LOUD on a missing row. Does NOT recreate LLMs —
-        callers do (process_job via config_dirty; session startup explicitly).
-        Shared by worker jobs and persistent sessions. Returns True when applied."""
-        from .core.expert_resolution import build_expert_config
-        from .core.loader import (
-            _apply_settings_matrix,
-            load_agent_config_from_dict,
-            load_and_merge_config,
-            resolve_config_path,
-        )
-
-        row = await self.postgres_conn.experts.get_by_id(expert_id)
-        if row is None:
-            raise RuntimeError(
-                f"Expert {expert_id} not found in DB (EXPERTS_DB_ENABLED). "
-                f"Failing loud rather than silently running base config (decision 6)."
-            )
-        base_name = (
-            "defaults" if row["expert_type"] == "worker" else "persistent_defaults"
-        )
-        base_path, _base_dir = resolve_config_path(base_name)
-        base_data = load_and_merge_config(base_path)
-        merged, prompts = build_expert_config(base_data, row)
-        _apply_settings_matrix(merged, set((merged.get("llm") or {}).keys()), None)
-        self.config = load_agent_config_from_dict(merged, deployment_dir=None)
-        rp = self.config.extra.setdefault("_resolved_prompts", {})
-        if prompts.get("persona"):
-            rp["persona"] = prompts["persona"]
-        if prompts.get("instructions"):
-            rp["instructions"] = prompts["instructions"]
-        self.config.extra["_persona_source"] = "db"
-        logger.info(f"Applied DB expert {row.get('name')} ({row['expert_type']})")
-        return True
-
     async def process_job(
         self,
         job_id: str,
@@ -928,21 +891,9 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                     f"Failed to load frozen config, falling back to disk: {e}"
                 )
 
-        # DB-backed expert (decision 6): load by id, FAIL LOUD on a missing row.
-        # Takes precedence over config_name. Id comes from per-job metadata
-        # (worker jobs) or AGENT_EXPERT_ID env (sessions). LLMs are recreated
-        # below via config_dirty.
-        expert_id = metadata.get("expert_id") or os.environ.get("AGENT_EXPERT_ID")
-        _expert_loaded = False
-        if expert_id and not _config_from_db and self.postgres_conn:
-            from .core.loader import _is_experts_db_enabled
-
-            if _is_experts_db_enabled():
-                _expert_loaded = await self._apply_db_expert(expert_id)
-
         # Handle expert config name - load the named config (tools, prompts, workspace settings)
         # This must happen before config_upload_id and config_override so those can further override
-        if not _expert_loaded and not _config_from_db and metadata.get("config_name"):
+        if not _config_from_db and metadata.get("config_name"):
             from .core.loader import (
                 _apply_settings_matrix,
                 load_and_merge_config,
@@ -1102,8 +1053,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         # LLMs would still hold whatever was built at agent boot (if any) or
         # would never be created at all.
         config_dirty = bool(
-            _expert_loaded
-            or metadata.get("config_name")
+            metadata.get("config_name")
             or metadata.get("config_upload_id")
             or metadata.get("config_override")
         )

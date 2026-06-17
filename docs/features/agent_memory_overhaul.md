@@ -28,9 +28,10 @@ related:
 > assembles the right memories for every LLM call — the model is a *consumer*, never the
 > manager. Build the seam first; everything else becomes a plugin behind it.
 
-**Status:** Design v2 / **Phases 1–4 implemented + measured (2026-06-14)**. A
-7-phase overhaul; **four phases done, two rollout gates (GATE A soak/delete,
-GATE B production flip) + Phases 5–7 remain.**
+**Status:** Design v2 / **Phases 1–4 implemented + measured; GATE-B stack
+flipped on, shipping to dev (2026-06-14)**. A 7-phase overhaul; **four phases
+done + the production stack now active in the defaults YAML (dev rollout for
+real-session validation); GATE A soak/delete + Phases 5–7 remain.**
 The map:
 
 - **Phase 1 (MemoryManager seam) — code complete, flag ON, committed.** Both
@@ -69,21 +70,28 @@ The map:
   not just out-ranked) + reader current 1.0; and on the N=20 end-task slice
   **knowledge-update 0/4 → 3/4** with **overall 0.40 → 0.50**, R@5 and tokens
   unchanged, 14 % of the organic corpus retired. KU recovered past its 0.5
-  target. Still behind **GATE B** (production flip) — same as Phase 3, the
-  evidence is N=20 synthetic with a gemma reader.
+  target. **GATE B flipped 2026-06-14** (the Phase-3+4 stack is now in both
+  defaults YAMLs), **shipping to dev** for real-session validation before prod —
+  the harness evidence is N=20 synthetic / gemma-reader, so dev is where
+  reranker latency + aux load under real traffic get proven.
 - **Phases 5–7** — ablate-and-cut (find + delete cargo-cult consolidation),
   buckets productized (personal/shared + cockpit panel), frontier verdicts
   (graph-keep, learned scorer). Decision-gated or dependent on Phase 4.
 
 **Open items after Phase 4** (none block the measured wins; all are rollout or
 follow-up, not core correctness):
-- **The two rollout gates** (the load-bearing ones, both decisions not code):
+- **The two rollout gates:**
   **GATE A** = Phase-1 soak on dev → delete the legacy `memory_service is None`
-  blocks; **GATE B** = flip the measured Phase-3+4 stack (`scorers: [reranker]`,
-  `policies: [gate, bounded]`, `memory.ingestion.enabled: true`,
-  `extraction.write_gate: false`) into the defaults YAML. The harness case is
-  made; the caveat is unchanged — N=20 synthetic, gemma reader, not the product
-  workload.
+  blocks (still pending — needs the soak).
+  **GATE B** = ✅ **flipped 2026-06-14** — both defaults YAMLs now carry the
+  measured Phase-3+4 stack (`scorers: [reranker]`, `policies: [gate, bounded]`,
+  `memory.ingestion.enabled: true`, `extraction.write_gate: false`).
+  **Shipping to the dev cluster first** for real-session validation — the one
+  thing the offline harness can't show is **reranker latency + the added aux
+  load under real traffic** (every assemble now reranks, every store may run a
+  verdict, and the router flaps). The legacy fallback stays in place behind the
+  flags, so rollback is a one-edit revert. Prod only after dev looks clean; the
+  N=20-synthetic / gemma-reader caveat is unchanged until then.
 - **GC / retention (B6) is NOT closed by Phase 4.** Supersede *retires, does not
   delete* (sets `valid_to`) — by design for point-in-time history, but it means
   the table still grows (supersede actually *adds* a row: the new fact plus the
@@ -724,6 +732,38 @@ below in new order). Every bug worth fixing *before* the seam is fixed
   write_gate-drop (the contradiction probe isolates supersede). Production
   flip (defaults YAML) remains the separate GATE-B decision — but the harness
   case for it is now made. Slice-4 complete → **Phase 4 done.**
+- **2026-06-14 — GATE B flipped (Phase-3+4 stack activated in the defaults),
+  shipping to dev.** Both `config/defaults.yaml` and
+  `config/persistent_defaults.yaml` now carry `pipeline.scorers: [reranker]`,
+  `pipeline.policies: [gate, bounded]`, the `reranker`/`gate`/`bounded` config
+  (relative gate 0.01, bounded-10, reranker `keep_pinned_first: false`,
+  `top_k: 512`), `ingestion.enabled: true` (verdict_top_k 5, review_floor 0.6),
+  and `extraction.write_gate: false`. One production-tuning divergence from the
+  eval config: **reranker `timeout: 10` not 60** — the eval's 60 was for cold
+  full-store batch throughput; in a live turn a slow rerank must fail-open fast
+  (it degrades to legacy order, contained) rather than stall the turn. The
+  reranker rides the auxiliary endpoint's transport (injected at dispatch — the
+  same one extraction uses, so it's always present where memory works at all).
+  Legacy paths stay in place behind the flags (one-edit rollback). Verified: the
+  activated defaults parse + bind the full pipeline, the verdict service attaches
+  during worker construction, all memory suites green (256); the
+  `test_memory_cutover` defaults-bind/construction fixtures were updated to feed
+  the new plugins their transport + a settable store. The remaining validation —
+  reranker latency + aux load under real traffic — is what the dev rollout is
+  for; prod flip (and GATE A's legacy deletion) follow dev evidence.
+  **k3d pre-push smoke (2026-06-14):** from the orchestrator pod (synced config
+  + real catalog transport + live router), the flipped pipeline **binds with
+  the real dispatched aux transport** (the bind the unit test had to stub —
+  `scorers:[reranker] policies:[gate,bounded]`, no raise), and a retriever
+  failure **degrades gracefully** (contained, empty payload, no crash). The
+  agent image (`tilt-f95a1d91…`) carries the flip. Live `/rerank` latency on
+  the router: **50 docs 0.96 s / 150 docs 2.13 s / 300 docs 4.22 s** — all well
+  under `timeout: 10`, so the live-turn assemble (≤150 candidates ≈ 2 s) won't
+  stall; the eval's 6.9 s assemble was concurrency-3 contention, not the live
+  single-turn cost. Could NOT run a full agent assemble in the orchestrator pod
+  (its image lacks the agent's pgvector codec / neo4j / citation deps — not a
+  prod issue) — the true live-turn path validates on the dev rollout with real
+  agent pods.
 **Companions:**
 - [`agent_memory_current_state.md`](agent_memory_current_state.md) — ground truth: every
   current capability classified wired/dead/conceptual with `file:line` evidence.
@@ -1252,7 +1292,7 @@ gap is one knowledge-update question = supersede = Phase 4 by construction).
 `bounded: {max_items: 10}`, reranker `keep_pinned_first: false` + top_k sized to
 cover the store (gate arms leak unscored tail items fail-open otherwise).
 
-### Phase 4 — Lifecycle writers: verdicts + bi-temporal supersede · ~1–1.5 wk ← **✅ COMPLETE + MEASURED 2026-06-14 (inert by default; GATE-B flip pending)**
+### Phase 4 — Lifecycle writers: verdicts + bi-temporal supersede · ~1–1.5 wk ← **✅ COMPLETE + MEASURED 2026-06-14 (GATE-B flipped in defaults → shipping to dev)**
 Ingestion verdicts (ADD/UPDATE/MERGE/NOOP, aux-LLM) ✅; bi-temporal columns via
 `migrations/vector/0006_bitemporal_memory.sql` ✅ (NOT `knowledge_index` — it already
 supersedes via `status='active'`, and the KB is the model's active notebook, P0);

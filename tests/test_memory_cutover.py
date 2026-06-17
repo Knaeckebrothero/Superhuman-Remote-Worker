@@ -201,11 +201,24 @@ class TestPipelineDefaults:
         ]
 
     def test_configured_names_bind(self, worker_config, persistent_config):
-        """Registry/YAML drift guard: every shipped name must resolve."""
+        """Registry/YAML drift guard: every shipped name must resolve.
+
+        Includes the GATE-B stack now in the defaults (scorers [reranker],
+        policies [gate, bounded]) — their factories read runtime.memory_config,
+        so bind with the config attached.
+        """
+        # The reranker rides the auxiliary endpoint's transport (base_url/key),
+        # injected at dispatch in production — stub it here so bind resolves.
+        aux_transport = SimpleNamespace(base_url="https://aux.test/v1", api_key="k")
         for cfg in (worker_config, persistent_config):
-            manager = MemoryManager.from_config(cfg.memory, MemoryRuntime())
+            manager = MemoryManager.from_config(
+                cfg.memory,
+                MemoryRuntime(memory_config=cfg.memory, auxiliary_config=aux_transport),
+            )
             summary = manager.pipeline_summary()
             assert summary["retrievers"] == cfg.memory.pipeline.retrievers
+            assert summary["scorers"] == cfg.memory.pipeline.scorers
+            assert summary["policies"] == cfg.memory.pipeline.policies
             assert summary["writers"] == cfg.memory.pipeline.writers
 
     def test_manager_flag_survives_dispatch_round_trip(self, worker_config):
@@ -259,7 +272,10 @@ class TestWorkerConstruction:
         self, worker_config, workspace_manager
     ):
         worker_config.memory.manager_enabled = True
-        marker_store = object()
+        # SimpleNamespace (not bare object()) so the now-default-on ingestion
+        # verdict can attach (maybe_attach_ingestion_verdict sets
+        # recall_store.ingestion_verdict); identity assertions still hold.
+        marker_store = SimpleNamespace()
         ctx = ToolContext(workspace_manager=workspace_manager)
         ctx.recall_store = marker_store
 
@@ -285,6 +301,9 @@ class TestWorkerConstruction:
         assert isinstance(runtime.assembler_prompt, str)
         assert runtime.assembler_prompt
         assert runtime.job_id == workspace_manager.job_id
+        # GATE B: ingestion is on in the defaults, so the verdict service
+        # attaches to the store during construction.
+        assert getattr(marker_store, "ingestion_verdict", None) is not None
 
     def test_flag_off_never_constructs(self, worker_config, workspace_manager):
         worker_config.memory.manager_enabled = False  # rollback-lever state

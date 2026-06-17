@@ -1442,7 +1442,6 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
             instructions=instructions,
             document_path=job.get("document_path"),
             config_name=job.get("config_name", "default"),
-            expert_id=str(job["expert_id"]) if job.get("expert_id") else None,
             config_override=config_override,
             git_remote_url=git_remote_url,
             context=remaining_context if remaining_context else None,
@@ -3273,9 +3272,6 @@ class JobCreate(BaseModel):
     delegation_context: str | None = Field(
         None, description="Shared context string from parent delegation"
     )
-    expert_id: str | None = Field(
-        None, description="DB-backed expert UUID for this job"
-    )
 
 
 class JobStartRequest(BaseModel):
@@ -3289,7 +3285,6 @@ class JobStartRequest(BaseModel):
     document_path: str | None = None
     document_dir: str | None = None
     config_name: str = "default"
-    expert_id: str | None = None
     config_override: dict[str, Any] | None = None
     context: dict[str, Any] | None = None
     instructions: str | None = None
@@ -4778,7 +4773,6 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
             creation_order=job.creation_order,
             worktree_path=job.worktree_path,
             delegation_context=job.delegation_context,
-            expert_id=job.expert_id,
         )
 
         # Create Gitea repo/branch + grant creator access + seed the Mode A
@@ -12556,9 +12550,6 @@ class ThreadCreateRequest(BaseModel):
     # "defaults" default silently put bare API threads on the WORKER yaml
     # (docs/issues/session_config_name_plumbing.md, hole A).
     config_name: str = Field("persistent_defaults", description="Agent config to use")
-    expert_id: str | None = Field(
-        None, description="DB-backed expert UUID for this session"
-    )
     project_id: str | None = Field(None, description="(Legacy) Single project to scope")
     project_ids: list[str] | None = Field(
         None, description="List of project UUIDs to scope"
@@ -12653,48 +12644,6 @@ async def create_thread(
                 request_body.permission_mode
             )
 
-        # --- DB expert binding (decisions 6/7/27): materialize the bound expert
-        # into config_override HERE so the session agent applies it through its
-        # normal deep_merge rail (persistent_app.py). The pod stays expert-blind:
-        # no AGENT_EXPERT_ID, no _apply_db_expert, no DB lookup — it just sees a
-        # config_override like any other. The expert is the BASE layer; the
-        # user/per-session overrides built above win on top. Bundled experts
-        # (slug config_name, trusted persona) skip this path and are unchanged.
-        bound_expert_id = request_body.expert_id
-        if (
-            not bound_expert_id
-            and request_body.config_name
-            and _is_uuid(request_body.config_name)
-        ):
-            # Cockpit currently sends the expert UUID in config_name; treat a UUID
-            # there as the binding and fall back to the session base below.
-            bound_expert_id = request_body.config_name
-        if bound_expert_id and _is_experts_db_enabled():
-            expert_detail = await _load_expert_detail(bound_expert_id)
-            if not expert_detail:
-                raise HTTPException(
-                    status_code=404, detail=f"Expert {bound_expert_id} not found"
-                )
-            # Expert fragment (merged onto its type base) underlays the user
-            # overrides. Merge BEFORE credential injection below so the injected
-            # base_url/api_key resolve for the expert's model.
-            config_override = _deep_merge_dicts(
-                expert_detail.get("config") or {}, config_override
-            )
-            _persona = expert_detail.get("persona")
-            _instructions = expert_detail.get("instructions")
-            if _persona or _instructions:
-                _extra = config_override.setdefault("extra", {})
-                _rp = _extra.setdefault("_resolved_prompts", {})
-                if _persona:
-                    _rp["persona"] = _persona
-                if _instructions:
-                    _rp["instructions"] = _instructions
-                # Decision 7: a DB (user-authored) persona is untrusted input — tag
-                # it so the agent fences it at render instead of granting it system
-                # altitude. Set server-side only; never sourced from client input.
-                _extra["_persona_source"] = "db"
-
         # Normalize project_ids (backward compat: project_id → [project_id])
         effective_project_ids = request_body.project_ids or (
             [request_body.project_id] if request_body.project_id else []
@@ -12722,12 +12671,8 @@ async def create_thread(
         thread_id = await postgres_db.create_thread(
             user_id=str(user["id"]),
             project_id=effective_project_ids[0] if effective_project_ids else None,
-            config_name="persistent_defaults"
-            if bound_expert_id
-            else (
-                request_body.config_name
-                or user_settings.get("config_name", "persistent_defaults")
-            ),
+            config_name=request_body.config_name
+            or user_settings.get("config_name", "persistent_defaults"),
             permission_mode=effective_permission_mode,
             title=request_body.title,
         )
@@ -12745,8 +12690,6 @@ async def create_thread(
             metadata_patch["config_override"] = redact_config_override(config_override)
         if request_body.datasource_ids:
             metadata_patch["datasource_ids"] = request_body.datasource_ids
-        if bound_expert_id:
-            metadata_patch["expert_id"] = bound_expert_id
         if metadata_patch:
             async with postgres_db.acquire() as conn:
                 await conn.execute(
@@ -13756,10 +13699,7 @@ async def resume_thread(
 
                 # No idle agent — create a dedicated session pod.
                 pod_name = await agent_provisioner.provision_agent(
-                    purpose="session",
-                    thread_id=tid,
-                    config_name=cfg,
-                    expert_id=meta.get("expert_id"),
+                    purpose="session", thread_id=tid, config_name=cfg
                 )
                 if pod_name:
                     return
@@ -13773,11 +13713,7 @@ async def resume_thread(
     elif persistent_provisioner.is_available:
         config_name = thread.get("config_name", "persistent_defaults")
         asyncio.create_task(
-            persistent_provisioner.create_agent_pod(
-                thread_id,
-                config_name=config_name,
-                expert_id=_thread_expert_id(thread),
-            )
+            persistent_provisioner.create_agent_pod(thread_id, config_name=config_name)
         )
 
     # Ensure the session workspace is provisioned/restored (idempotent): restores
@@ -14906,9 +14842,7 @@ async def _phase5_wake_if_suspended(thread_id: str) -> None:
             config_name = thread.get("config_name", "persistent_defaults")
             asyncio.create_task(
                 persistent_provisioner.create_agent_pod(
-                    thread_id,
-                    config_name=config_name,
-                    expert_id=_thread_expert_id(thread),
+                    thread_id, config_name=config_name
                 ),
                 name=f"phase5-create-agent-{thread_id[:8]}",
             )
@@ -15677,75 +15611,6 @@ class ExpertInfo(BaseModel):
     tags: list[str] = []
 
 
-def _is_experts_db_enabled() -> bool:
-    """True when DB-backed experts are on (mirrors the agent-side flag)."""
-    return os.getenv("EXPERTS_DB_ENABLED", "").lower().strip() in ("true", "1", "yes")
-
-
-def _is_uuid(value: str) -> bool:
-    try:
-        UUID(str(value))
-        return True
-    except (ValueError, AttributeError, TypeError):
-        return False
-
-
-def _thread_expert_id(thread: dict[str, Any]) -> str | None:
-    """A session's bound expert_id from thread metadata (JSONB str-tolerant)."""
-    meta = thread.get("metadata") or {}
-    if isinstance(meta, str):
-        try:
-            meta = json.loads(meta)
-        except (ValueError, TypeError):
-            return None
-    return meta.get("expert_id") if isinstance(meta, dict) else None
-
-
-class ExpertCreate(BaseModel):
-    """Create a DB-backed expert (Slice 1: hard-deny validated; grants in S2)."""
-
-    name: str = Field(..., pattern=r"^[a-z][a-z0-9_-]*$", max_length=100)
-    display_name: str = Field(..., min_length=1, max_length=200)
-    expert_type: Literal["worker", "session"]
-    description: str | None = None
-    icon: str = "smart_toy"
-    color: str = Field("#6B7280", pattern=r"^#[0-9A-Fa-f]{6}$")
-    tags: list[str] = []
-    config: dict[str, Any] = {}
-    prompts: dict[str, Any] = {}
-
-
-class ExpertUpdate(BaseModel):
-    """Patch a DB expert; expert_type is immutable (decision 3) so it is absent."""
-
-    display_name: str | None = Field(None, min_length=1, max_length=200)
-    description: str | None = None
-    icon: str | None = None
-    color: str | None = Field(None, pattern=r"^#[0-9A-Fa-f]{6}$")
-    tags: list[str] | None = None
-    config: dict[str, Any] | None = None
-    prompts: dict[str, Any] | None = None
-
-
-def _require_experts_db() -> None:
-    """The DB-experts feature is fully behind EXPERTS_DB_ENABLED."""
-    if not _is_experts_db_enabled():
-        raise HTTPException(status_code=404, detail="DB-backed experts are not enabled")
-
-
-def _validate_expert_fragment(config: dict[str, Any]) -> None:
-    """Reject credential sections in a user fragment (decision 10, hard-deny)."""
-    from src.core.expert_resolution import hard_deny_scan
-
-    offending = hard_deny_scan(config)
-    if offending:
-        raise HTTPException(
-            status_code=422,
-            detail="config may not set credential sections: "
-            + ", ".join(sorted(offending)),
-        )
-
-
 def _get_config_dir() -> Path:
     """Resolve the config directory path."""
     config_dir_env = os.environ.get("CONFIG_DIR")
@@ -15815,39 +15680,18 @@ _experts_cache: list[ExpertInfo] | None = None
 
 
 @app.get("/api/experts")
-async def list_experts(
-    request: Request, type: str | None = None
-) -> list[dict[str, Any]]:
-    """List experts: bundled (disk) + DB rows visible to the caller (owned +
-    project-linked + global), each tagged with ``source``. **P4e** — approved
-    users only. ``type`` narrows the DB rows (worker/session); bundled experts
-    are unfiltered (they carry no type), preserving today's behavior.
+async def list_experts(request: Request) -> list[dict[str, Any]]:
+    """List available expert configurations. **P4e** — gated to approved
+    users; the expert catalog is shared metadata, not per-user.
+
+    Scans config/experts/ for expert configs and returns metadata
+    for expert selection in the cockpit UI.
     """
-    user = await require_approved_user(request, postgres_db)
+    await require_approved_user(request, postgres_db)
     global _experts_cache
     if _experts_cache is None:
         _experts_cache = _scan_experts()
-    result = [{**e.model_dump(), "source": "bundled"} for e in _experts_cache]
-    if _is_experts_db_enabled():
-        visible = await user_visible_project_ids(user, postgres_db)
-        pids = [] if visible == "all" else [str(p) for p in visible]
-        rows = await postgres_db.list_experts_visible(
-            user_id=str(user["id"]), project_ids=pids, expert_type=type
-        )
-        result += [
-            {
-                "id": str(r["id"]),
-                "display_name": r["display_name"],
-                "description": r.get("description") or "",
-                "icon": r["icon"],
-                "color": r["color"],
-                "tags": r.get("tags") or [],
-                "expert_type": r["expert_type"],
-                "source": "global" if r["is_global"] else "user",
-            }
-            for r in rows
-        ]
-    return result
+    return [e.model_dump() for e in _experts_cache]
 
 
 @app.post("/api/experts/reload")
@@ -15919,40 +15763,8 @@ def _load_settings_matrix(config_dir: Path) -> dict[str, Any]:
     return _settings_matrix_cache
 
 
-async def _load_expert_detail(expert_id: str) -> dict[str, Any]:
-    """Load full expert detail: merged config + instructions content. DB-backed
-    experts (UUID) resolve their fragment onto the expert_type base; bundled
-    experts resolve from disk as before."""
-    if _is_experts_db_enabled() and _is_uuid(expert_id):
-        row = await postgres_db.get_expert_by_id(expert_id)
-        if not row:
-            return {}
-        base_name = (
-            "defaults" if row["expert_type"] == "worker" else "persistent_defaults"
-        )
-        base_path = _get_config_dir() / f"{base_name}.yaml"
-        base = yaml.safe_load(base_path.read_text()) if base_path.exists() else {}
-        cfg = row.get("config") or {}
-        if isinstance(cfg, str):
-            cfg = json.loads(cfg)
-        merged = _deep_merge(base, cfg)
-        merged.pop("connections", None)
-        prompts = row.get("prompts") or {}
-        if isinstance(prompts, str):
-            prompts = json.loads(prompts)
-        return {
-            "id": str(row["id"]),
-            "display_name": row["display_name"],
-            "description": row.get("description") or "",
-            "icon": row["icon"],
-            "color": row["color"],
-            "tags": row.get("tags") or [],
-            "expert_type": row["expert_type"],
-            "source": "user",
-            "config": merged,
-            "instructions": prompts.get("instructions"),
-            "persona": prompts.get("persona"),
-        }
+def _load_expert_detail(expert_id: str) -> dict[str, Any]:
+    """Load full expert detail: merged config + instructions content."""
     config_dir = _get_config_dir()
 
     # Load expert config
@@ -16041,24 +15853,14 @@ async def get_expert(request: Request, expert_id: str) -> dict[str, Any]:
     creation form.
     """
     await require_approved_user(request, postgres_db)
-
-    # DB-backed expert (UUID): the detail payload is self-contained.
-    if _is_experts_db_enabled() and _is_uuid(expert_id):
-        detail = await _load_expert_detail(expert_id)
-        if not detail:
-            raise HTTPException(
-                status_code=404, detail=f"Expert not found: {expert_id}"
-            )
-        return detail
-
-    # Verify bundled expert exists
+    # Verify expert exists
     global _experts_cache
     if _experts_cache is None:
         _experts_cache = _scan_experts()
 
     if expert_id == "defaults":
         # "defaults" is a virtual expert representing framework defaults
-        detail = await _load_expert_detail(expert_id)
+        detail = _load_expert_detail(expert_id)
         if not detail:
             raise HTTPException(status_code=404, detail="Defaults config not found")
         return detail
@@ -16067,7 +15869,7 @@ async def get_expert(request: Request, expert_id: str) -> dict[str, Any]:
     if not expert_info:
         raise HTTPException(status_code=404, detail=f"Expert not found: {expert_id}")
 
-    detail = await _load_expert_detail(expert_id)
+    detail = _load_expert_detail(expert_id)
     if not detail:
         raise HTTPException(
             status_code=404, detail=f"Expert config not found: {expert_id}"
@@ -16077,253 +15879,6 @@ async def get_expert(request: Request, expert_id: str) -> dict[str, Any]:
         **expert_info.model_dump(),
         **detail,
     }
-
-
-# ── User-Defined Experts: DB-backed CRUD + import/export (Slice 1) ────────
-
-
-def _bundled_expert_bundle(expert_id: str) -> dict[str, Any] | None:
-    """Portable bundle from a bundled (disk) expert: raw config.yaml fragment
-    (minus $extends/connections) + persona/instructions files + cache metadata.
-    None if not found. expert_type is inferred from $extends."""
-    global _experts_cache
-    if _experts_cache is None:
-        _experts_cache = _scan_experts()
-    info = next((e for e in _experts_cache if e.id == expert_id), None)
-    if not info:
-        return None
-    expert_dir = _get_config_dir() / "experts" / expert_id
-    config_path = expert_dir / "config.yaml"
-    if not config_path.exists():
-        return None
-    raw = yaml.safe_load(config_path.read_text()) or {}
-    extends = raw.pop("$extends", "defaults")
-    raw.pop("connections", None)
-    prompts: dict[str, Any] = {}
-    for key, fname in (("persona", "persona.txt"), ("instructions", "instructions.md")):
-        fp = expert_dir / fname
-        if fp.exists():
-            prompts[key] = fp.read_text(encoding="utf-8")
-    return {
-        "name": expert_id,
-        "display_name": info.display_name,
-        "description": info.description,
-        "icon": info.icon,
-        "color": info.color,
-        "tags": info.tags,
-        "expert_type": "session" if extends == "persistent_defaults" else "worker",
-        "config": raw,
-        "prompts": prompts,
-    }
-
-
-def _db_expert_to_bundle_src(row: dict[str, Any]) -> dict[str, Any]:
-    """Normalize a DB expert row into the bundle-source shape (JSONB str-tolerant)."""
-    cfg = row.get("config") or {}
-    if isinstance(cfg, str):
-        cfg = json.loads(cfg)
-    prm = row.get("prompts") or {}
-    if isinstance(prm, str):
-        prm = json.loads(prm)
-    return {
-        "name": row["name"],
-        "display_name": row["display_name"],
-        "expert_type": row["expert_type"],
-        "description": row.get("description"),
-        "icon": row["icon"],
-        "color": row["color"],
-        "tags": row.get("tags") or [],
-        "config": cfg,
-        "prompts": prm,
-    }
-
-
-async def _create_forked_expert(
-    src: dict[str, Any], owner_id: str, suffix: str = "copy"
-) -> dict[str, Any]:
-    """Create an owned expert from a bundle dict, suffixing the name on collision
-    (decision 4/27 fork-on-copy)."""
-    base_name = src["name"]
-    name = f"{base_name}-{suffix}"[:100]
-    for attempt in range(6):
-        try:
-            return await postgres_db.create_expert(
-                name=name,
-                display_name=f"{src['display_name']} ({suffix})"[:200],
-                expert_type=src["expert_type"],
-                owner_id=owner_id,
-                description=src.get("description"),
-                icon=src.get("icon", "smart_toy"),
-                color=src.get("color", "#6B7280"),
-                tags=src.get("tags") or [],
-                config=src.get("config") or {},
-                prompts=src.get("prompts") or {},
-            )
-        except HTTPException:
-            raise
-        except Exception as e:
-            if "uq_experts_name_owner" in str(e):
-                name = f"{base_name}-{suffix}-{attempt + 1}"[:100]
-                continue
-            raise
-    raise HTTPException(status_code=409, detail="No free name for the copy")
-
-
-@app.post("/api/experts")
-async def create_expert(request: Request, body: ExpertCreate) -> dict[str, Any]:
-    """Create an owned DB expert. Slice 1: hard-deny validated, no grants yet."""
-    _require_experts_db()
-    user = await require_approved_user(request, postgres_db)
-    if body.config:
-        _validate_expert_fragment(body.config)
-    try:
-        return await postgres_db.create_expert(
-            name=body.name,
-            display_name=body.display_name,
-            expert_type=body.expert_type,
-            owner_id=str(user["id"]),
-            description=body.description,
-            icon=body.icon,
-            color=body.color,
-            tags=body.tags,
-            config=body.config,
-            prompts=body.prompts,
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        if "uq_experts_name_owner" in str(e):
-            raise HTTPException(
-                status_code=409,
-                detail=f"You already have an expert named '{body.name}'",
-            ) from e
-        raise
-
-
-@app.put("/api/experts/{expert_id}")
-async def update_expert(
-    request: Request, expert_id: str, body: ExpertUpdate
-) -> dict[str, Any]:
-    """Update an owned DB expert (owner or admin). Bundled experts have no row."""
-    _require_experts_db()
-    user = await require_approved_user(request, postgres_db)
-    if not _is_uuid(expert_id):
-        raise HTTPException(status_code=403, detail="Bundled experts are read-only")
-    existing = await postgres_db.get_expert_by_id(expert_id)
-    if not existing:
-        raise HTTPException(status_code=404, detail="Expert not found")
-    if str(existing["owner_id"]) != str(user["id"]) and not user.get("is_admin"):
-        raise HTTPException(
-            status_code=403, detail="Only the owner may edit this expert"
-        )
-    if body.config is not None:
-        _validate_expert_fragment(body.config)
-    fields = body.model_dump(exclude_unset=True)
-    return await postgres_db.update_expert(
-        expert_id, updated_by=str(user["id"]), **fields
-    )
-
-
-@app.delete("/api/experts/{expert_id}")
-async def delete_expert(request: Request, expert_id: str) -> dict[str, Any]:
-    """Delete an owned DB expert (owner or admin). Blocks (409) while
-    live-referenced (decision 15)."""
-    _require_experts_db()
-    user = await require_approved_user(request, postgres_db)
-    if not _is_uuid(expert_id):
-        raise HTTPException(status_code=403, detail="Bundled experts cannot be deleted")
-    existing = await postgres_db.get_expert_by_id(expert_id)
-    if not existing:
-        raise HTTPException(status_code=404, detail="Expert not found")
-    if str(existing["owner_id"]) != str(user["id"]) and not user.get("is_admin"):
-        raise HTTPException(
-            status_code=403, detail="Only the owner may delete this expert"
-        )
-    blockers = await postgres_db.expert_delete_blockers(expert_id)
-    if blockers:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "message": "Expert is in use; repoint or remove these first",
-                "blockers": blockers,
-            },
-        )
-    await postgres_db.delete_expert(expert_id)
-    return {"deleted": True}
-
-
-@app.post("/api/experts/{expert_id}/duplicate")
-async def duplicate_expert(request: Request, expert_id: str) -> dict[str, Any]:
-    """Fork any visible expert (bundled or DB) into an owned copy — 'start from
-    scholar' (decision 4: copy, not live link)."""
-    _require_experts_db()
-    user = await require_approved_user(request, postgres_db)
-    if _is_uuid(expert_id):
-        row = await postgres_db.get_expert_by_id(expert_id)
-        if not row:
-            raise HTTPException(status_code=404, detail="Expert not found")
-        src = _db_expert_to_bundle_src(row)
-    else:
-        src = _bundled_expert_bundle(expert_id)
-        if not src:
-            raise HTTPException(status_code=404, detail="Expert not found")
-    return await _create_forked_expert(src, str(user["id"]), suffix="copy")
-
-
-@app.get("/api/experts/{expert_id}/export")
-async def export_expert(request: Request, expert_id: str) -> dict[str, Any]:
-    """Serialize an expert to a portable bundle (decision 27). DB experts export
-    their raw fragment; bundled experts export their on-disk config."""
-    from src.core.expert_resolution import to_export_bundle
-
-    _require_experts_db()
-    await require_approved_user(request, postgres_db)
-    if _is_uuid(expert_id):
-        row = await postgres_db.get_expert_by_id(expert_id)
-        if not row:
-            raise HTTPException(status_code=404, detail="Expert not found")
-        return to_export_bundle(_db_expert_to_bundle_src(row))
-    bundle = _bundled_expert_bundle(expert_id)
-    if not bundle:
-        raise HTTPException(status_code=404, detail="Expert not found")
-    return to_export_bundle(bundle)
-
-
-@app.post("/api/experts/import")
-async def import_expert(request: Request, body: ExpertCreate) -> dict[str, Any]:
-    """Create an owned expert from a posted bundle (decision 27). Same validation
-    as create; fork-on-import (name collision -> suffix)."""
-    _require_experts_db()
-    user = await require_approved_user(request, postgres_db)
-    if body.config:
-        _validate_expert_fragment(body.config)
-    name = body.name
-    for attempt in range(6):
-        try:
-            return await postgres_db.create_expert(
-                name=name,
-                display_name=body.display_name,
-                expert_type=body.expert_type,
-                owner_id=str(user["id"]),
-                description=body.description,
-                icon=body.icon,
-                color=body.color,
-                tags=body.tags,
-                config=body.config,
-                prompts=body.prompts,
-            )
-        except HTTPException:
-            raise
-        except Exception as e:
-            if "uq_experts_name_owner" in str(e):
-                name = (
-                    f"{body.name}-import"
-                    if attempt == 0
-                    else f"{body.name}-import-{attempt}"
-                )
-                continue
-            raise
-    raise HTTPException(status_code=409, detail="No free name for the import")
 
 
 # =============================================================================
