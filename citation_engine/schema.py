@@ -438,7 +438,9 @@ def get_schema(db_type: str) -> str:
     elif db_type == "postgresql":
         return POSTGRESQL_SCHEMA
     else:
-        raise ValueError(f"Unknown database type: {db_type}. Expected 'sqlite' or 'postgresql'.")
+        raise ValueError(
+            f"Unknown database type: {db_type}. Expected 'sqlite' or 'postgresql'."
+        )
 
 
 def get_verify_query(db_type: str) -> str:
@@ -459,7 +461,9 @@ def get_verify_query(db_type: str) -> str:
     elif db_type == "postgresql":
         return POSTGRESQL_VERIFY_TABLES
     else:
-        raise ValueError(f"Unknown database type: {db_type}. Expected 'sqlite' or 'postgresql'.")
+        raise ValueError(
+            f"Unknown database type: {db_type}. Expected 'sqlite' or 'postgresql'."
+        )
 
 
 def get_version_query(db_type: str) -> str:
@@ -477,10 +481,14 @@ def get_version_query(db_type: str) -> str:
     elif db_type == "postgresql":
         return POSTGRESQL_GET_VERSION
     else:
-        raise ValueError(f"Unknown database type: {db_type}. Expected 'sqlite' or 'postgresql'.")
+        raise ValueError(
+            f"Unknown database type: {db_type}. Expected 'sqlite' or 'postgresql'."
+        )
 
 
-def get_pending_migrations(current_version: int, db_type: str) -> list[tuple[int, str, str]]:
+def get_pending_migrations(
+    current_version: int, db_type: str
+) -> list[tuple[int, str, str]]:
     """
     Get migrations that need to be applied.
 

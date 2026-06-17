@@ -39,7 +39,11 @@ Version: 0.1.0
 """
 
 from .chunking import SemanticChunker
-from .embeddings import EmbeddingService, EmbeddingServiceError, EmbeddingServiceNotConfigured
+from .embeddings import (
+    EmbeddingService,
+    EmbeddingServiceError,
+    EmbeddingServiceNotConfigured,
+)
 from .engine import CitationEngine
 from .models import (
     Annotation,
