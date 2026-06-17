@@ -58,11 +58,20 @@ class TestFamilyOf:
         # `codex` substring + `gpt-5` prefix as codex, not bare gpt-5.
         assert family_of("codex/gpt-5.3-codex") == "codex"
 
+    def test_mistral(self):
+        # Mistral 3 family incl. Codestral and the `-latest` aliases. Native
+        # api.mistral.ai serves bare ids; OpenRouter's `mistralai/` prefix is
+        # stripped by the heuristic before matching.
+        assert family_of("mistral-large-latest") == "mistral"
+        assert family_of("mistral-medium-latest") == "mistral"
+        assert family_of("mistral-small-latest") == "mistral"
+        assert family_of("codestral-latest") == "mistral"
+        assert family_of("openrouter/mistralai/mistral-large") == "mistral"
+
     def test_unknown_model_returns_default(self):
         # After heuristic fallback kicks in, unrecognized IDs still fall through
         # to 'default'. Use an ID with no known substring match.
         assert family_of("some-unknown-model") == "default"
-        assert family_of("mistral-large") == "default"
 
     def test_unknown_returns_custom_default(self):
         """Callers can override the 'unknown' fallback."""

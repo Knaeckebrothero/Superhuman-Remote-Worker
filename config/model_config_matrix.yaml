@@ -396,6 +396,37 @@ gemma:
     # 280 x ~1.14 bias. Forward-looking — gemma is the text-only summarizer.
     image_tokens: { mode: flat, flat: 320 }
 
+# Mistral 3 family — Large 3 / Medium 3.5 / Small 4 / Codestral, wired as a
+# native first-class provider (provider slug 'mistral' → ReasoningChatOpenAI at
+# api.mistral.ai/v1, see src/core/loader._create_mistral_llm). Like claude/
+# gemini/o-series this is a SETTINGS-ONLY family: Mistral speaks the standard
+# OpenAI Chat Completions wire (parens-form tool calls + function calling), so
+# the `default` prompts/instructions and `default.yaml` guardrails apply
+# unchanged — only vision/context/sampling need a row. WITHOUT this block,
+# family_of() maps mistral-* → "mistral" but the lookup falls through to
+# `default` (multimodal: false!), so the vision models accept images yet
+# mis-count image tokens and compact at the wrong window — the failure the
+# claude-sonnet row documents. Codestral is text-only but shares the block; its
+# catalog row omits the `vision` capability, so it never receives images.
+mistral:
+  settings:
+    temperature: 0.0   # agentic/tool-use default (matches `default`/deepseek); raise toward ~0.3 for freeform chat
+    multimodal: true   # Large 3 / Medium 3.5 / Small 4 take image input
+    # Mistral's documented default ("the model decides if it uses parallel tool
+    # calls"); Large 3 / Medium 3.5 / Small / Codestral all support it. Safe here
+    # because we hit Chat Completions via ChatOpenAI — the gpt-5/codex
+    # Responses-API parallel-call corruption bug (langchain#34660) doesn't apply.
+    parallel_tool_calls: true
+    model_max_context_tokens: 256000  # Mistral 3 family: 256K (a per-model catalog context_window still overrides this)
+    # Mistral 3 vision encoder: 14px patches merged into 2x2 blocks ⇒ one image
+    # token per 28x28px region (Mistral docs bill at 784px = 28²). The longest
+    # edge is resized to ≤1540 (short side to the nearest multiple of 28), so the
+    # ceiling is (1540/28)² = 55×55 = 3025 tokens/image. `anthropic_patches` is
+    # the generic two-constraint (max_edge + max_tokens) resize-then-patchify
+    # estimator — reused here with Mistral's numbers, not Anthropic's. Sources:
+    # docs.mistral.ai/capabilities/vision + the Mistral-Small-2503 encoder spec.
+    image_tokens: { mode: anthropic_patches, patch_px: 28, max_edge: 1540, max_tokens: 3025, flat: 3025 }
+
 # Model-specific overrides — add as needed (use a real family_of() key; note
 # claude-sonnet/claude-haiku already have rows above):
 # my-custom-family:
