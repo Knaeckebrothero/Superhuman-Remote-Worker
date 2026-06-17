@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import uuid
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request, status
@@ -45,6 +46,22 @@ def _get_db() -> Any:
     from main import postgres_db  # type: ignore
 
     return postgres_db
+
+
+def _is_expert_uuid(value: str | None) -> bool:
+    """True if *value* is a UUID — i.e. an expert id that leaked into
+    ``config_name`` via the cockpit's picker. ``config_name`` is always a
+    bundled-config slug, never a UUID, so a UUID here means the expert was sent
+    in the wrong field. The thread row already carries the materialized expert
+    in ``config_override``, so the boot config must fall back to the base —
+    never ``--config <uuid>`` (which has no on-disk YAML and crashes startup)."""
+    if not value:
+        return False
+    try:
+        uuid.UUID(str(value))
+        return True
+    except (ValueError, TypeError, AttributeError):
+        return False
 
 
 # --------------------------------------------------------------------------- #
@@ -95,6 +112,20 @@ async def prepare_session(
     if str(thread.get("user_id") or "") != str(user["id"]):
         raise HTTPException(status_code=403, detail="thread access denied")
 
+    # The agent boots `--config <config_name>` and must load a real base YAML.
+    # The cockpit's expert picker sends the expert UUID in config_name (here and
+    # at create_thread); the bound expert is already materialized into the
+    # thread's config_override and applied at attach, so a UUID here must fall
+    # back to the persisted base instead of crashing startup on a missing file.
+    boot_config_name = body.config_name or thread.get("config_name")
+    if _is_expert_uuid(boot_config_name):
+        persisted = thread.get("config_name")
+        boot_config_name = (
+            persisted
+            if persisted and not _is_expert_uuid(persisted)
+            else "persistent_defaults"
+        )
+
     # Fire-and-forget the actual work in a background task. Progress reaches
     # the cockpit via SSE. Idempotency is enforced by the advisory lock
     # inside _do_prepare.
@@ -102,7 +133,7 @@ async def prepare_session(
         _do_prepare(
             thread_id=thread_id,
             user_id=str(user["id"]),
-            config_name=body.config_name or thread.get("config_name"),
+            config_name=boot_config_name,
             config_override=body.config_override,
         )
     )
