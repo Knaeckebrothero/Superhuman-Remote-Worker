@@ -1,0 +1,1004 @@
+[
+  {
+    "question_id": "lc_update_cloud",
+    "question_type": "knowledge-update",
+    "question": "What is the project's default cloud storage backend?",
+    "answer": "OpenCloud.",
+    "question_date": "2026/01/27 (later)",
+    "haystack_session_ids": [
+      "lc_update_cloud_orig",
+      "lc_update_cloud_filler0",
+      "lc_update_cloud_update"
+    ],
+    "haystack_dates": [
+      "2026/01/06 (Tue) 09:10",
+      "2026/01/13 (Tue) 12:00",
+      "2026/01/27 (Tue) 16:30"
+    ],
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "For the project we've settled on Nextcloud as the default cloud storage backend."
+        },
+        {
+          "role": "assistant",
+          "content": "Noted — Nextcloud is the default cloud storage backend."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "Any tips for sleeping better during hot summer nights?"
+        },
+        {
+          "role": "assistant",
+          "content": "Keep the blinds closed during the day and use breathable cotton bedding."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "Decision changed: the default cloud storage backend is now OpenCloud."
+        },
+        {
+          "role": "assistant",
+          "content": "Understood — OpenCloud is now the default cloud storage backend."
+        }
+      ]
+    ],
+    "answer_session_ids": [
+      "lc_update_cloud_orig",
+      "lc_update_cloud_update"
+    ],
+    "lifecycle": {
+      "category": "update",
+      "expect_valid": [
+        "OpenCloud"
+      ],
+      "expect_retired": [
+        "Nextcloud"
+      ],
+      "expect_unique": []
+    },
+    "probe": {
+      "current_value": "OpenCloud",
+      "stale_value": "Nextcloud",
+      "update_session_id": "lc_update_cloud_update",
+      "original_session_id": "lc_update_cloud_orig"
+    }
+  },
+  {
+    "question_id": "lc_update_aux",
+    "question_type": "knowledge-update",
+    "question": "Which model runs the auxiliary LLM?",
+    "answer": "gemma-4-moe.",
+    "question_date": "2026/01/25 (later)",
+    "haystack_session_ids": [
+      "lc_update_aux_orig",
+      "lc_update_aux_filler0",
+      "lc_update_aux_update"
+    ],
+    "haystack_dates": [
+      "2026/01/04 (Sun) 11:00",
+      "2026/01/11 (Sun) 10:00",
+      "2026/01/25 (Sun) 14:00"
+    ],
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "Our auxiliary LLM for background tasks runs on Mixtral."
+        },
+        {
+          "role": "assistant",
+          "content": "Got it — the auxiliary LLM runs on Mixtral."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "Any tips for sleeping better during hot summer nights?"
+        },
+        {
+          "role": "assistant",
+          "content": "Keep the blinds closed during the day and use breathable cotton bedding."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "The auxiliary LLM now runs on gemma-4-moe."
+        },
+        {
+          "role": "assistant",
+          "content": "Understood — auxiliary tasks now use gemma-4-moe."
+        }
+      ]
+    ],
+    "answer_session_ids": [
+      "lc_update_aux_orig",
+      "lc_update_aux_update"
+    ],
+    "lifecycle": {
+      "category": "update",
+      "expect_valid": [
+        "gemma-4-moe"
+      ],
+      "expect_retired": [
+        "Mixtral"
+      ],
+      "expect_unique": []
+    },
+    "probe": {
+      "current_value": "gemma-4-moe",
+      "stale_value": "Mixtral",
+      "update_session_id": "lc_update_aux_update",
+      "original_session_id": "lc_update_aux_orig"
+    }
+  },
+  {
+    "question_id": "lc_update_car",
+    "question_type": "knowledge-update",
+    "question": "What car do I drive?",
+    "answer": "A red Tesla Model 3.",
+    "question_date": "2026/01/23 (later)",
+    "haystack_session_ids": [
+      "lc_update_car_orig",
+      "lc_update_car_filler0",
+      "lc_update_car_update"
+    ],
+    "haystack_dates": [
+      "2026/01/02 (Fri) 10:05",
+      "2026/01/09 (Fri) 18:40",
+      "2026/01/23 (Fri) 09:30"
+    ],
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "I finally picked up my new car — a blue Honda Civic."
+        },
+        {
+          "role": "assistant",
+          "content": "Noted — I'll remember your car."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "Any tips for sleeping better during hot summer nights?"
+        },
+        {
+          "role": "assistant",
+          "content": "Keep the blinds closed during the day and use breathable cotton bedding."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "I traded in the old car; I now drive a red Tesla Model 3."
+        },
+        {
+          "role": "assistant",
+          "content": "Thanks for the update — I've replaced the old car information."
+        }
+      ]
+    ],
+    "answer_session_ids": [
+      "lc_update_car_orig",
+      "lc_update_car_update"
+    ],
+    "lifecycle": {
+      "category": "update",
+      "expect_valid": [
+        "red Tesla Model 3"
+      ],
+      "expect_retired": [
+        "blue Honda Civic"
+      ],
+      "expect_unique": []
+    },
+    "probe": {
+      "current_value": "red Tesla Model 3",
+      "stale_value": "blue Honda Civic",
+      "update_session_id": "lc_update_car_update",
+      "original_session_id": "lc_update_car_orig"
+    }
+  },
+  {
+    "question_id": "lc_update_diet",
+    "question_type": "knowledge-update",
+    "question": "What diet do I follow?",
+    "answer": "Vegetarian.",
+    "question_date": "2026/01/24 (later)",
+    "haystack_session_ids": [
+      "lc_update_diet_orig",
+      "lc_update_diet_filler0",
+      "lc_update_diet_update"
+    ],
+    "haystack_dates": [
+      "2026/01/03 (Sat) 08:00",
+      "2026/01/10 (Sat) 19:00",
+      "2026/01/24 (Sat) 12:30"
+    ],
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "I follow a strict vegan diet."
+        },
+        {
+          "role": "assistant",
+          "content": "Noted — strict vegan diet."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "Any tips for sleeping better during hot summer nights?"
+        },
+        {
+          "role": "assistant",
+          "content": "Keep the blinds closed during the day and use breathable cotton bedding."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "These days I eat a vegetarian diet."
+        },
+        {
+          "role": "assistant",
+          "content": "Understood — vegetarian diet now."
+        }
+      ]
+    ],
+    "answer_session_ids": [
+      "lc_update_diet_orig",
+      "lc_update_diet_update"
+    ],
+    "lifecycle": {
+      "category": "update",
+      "expect_valid": [
+        "vegetarian"
+      ],
+      "expect_retired": [
+        "vegan"
+      ],
+      "expect_unique": []
+    },
+    "probe": {
+      "current_value": "vegetarian",
+      "stale_value": "vegan",
+      "update_session_id": "lc_update_diet_update",
+      "original_session_id": "lc_update_diet_orig"
+    }
+  },
+  {
+    "question_id": "lc_chain_deadline",
+    "question_type": "knowledge-update",
+    "question": "When is my thesis deadline?",
+    "answer": "February 15, 2026.",
+    "question_date": "2026/01/20 (later)",
+    "haystack_session_ids": [
+      "lc_chain_deadline_orig",
+      "lc_chain_deadline_mid",
+      "lc_chain_deadline_filler0",
+      "lc_chain_deadline_update"
+    ],
+    "haystack_dates": [
+      "2025/12/10 (Wed) 09:00",
+      "2026/01/05 (Mon) 09:00",
+      "2026/01/12 (Mon) 09:00",
+      "2026/01/20 (Tue) 09:00"
+    ],
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "My thesis deadline is January 31, 2026."
+        },
+        {
+          "role": "assistant",
+          "content": "Noted — deadline January 31, 2026."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "The thesis deadline got pushed to February 7, 2026."
+        },
+        {
+          "role": "assistant",
+          "content": "Updated — deadline February 7, 2026."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "Any tips for sleeping better during hot summer nights?"
+        },
+        {
+          "role": "assistant",
+          "content": "Keep the blinds closed during the day and use breathable cotton bedding."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "The thesis deadline moved again; it's now February 15, 2026."
+        },
+        {
+          "role": "assistant",
+          "content": "Updated — deadline February 15, 2026."
+        }
+      ]
+    ],
+    "answer_session_ids": [
+      "lc_chain_deadline_orig",
+      "lc_chain_deadline_mid",
+      "lc_chain_deadline_update"
+    ],
+    "lifecycle": {
+      "category": "update_chain",
+      "expect_valid": [
+        "February 15"
+      ],
+      "expect_retired": [
+        "January 31",
+        "February 7"
+      ],
+      "expect_unique": []
+    },
+    "probe": {
+      "current_value": "February 15",
+      "stale_value": "February 7",
+      "update_session_id": "lc_chain_deadline_update",
+      "original_session_id": "lc_chain_deadline_orig"
+    }
+  },
+  {
+    "question_id": "lc_chain_port",
+    "question_type": "knowledge-update",
+    "question": "Which port does the orchestrator listen on?",
+    "answer": "Port 8085.",
+    "question_date": "2026/01/18 (later)",
+    "haystack_session_ids": [
+      "lc_chain_port_orig",
+      "lc_chain_port_mid",
+      "lc_chain_port_filler0",
+      "lc_chain_port_update"
+    ],
+    "haystack_dates": [
+      "2026/01/02 (Fri) 09:00",
+      "2026/01/08 (Thu) 09:00",
+      "2026/01/12 (Mon) 09:00",
+      "2026/01/18 (Sun) 09:00"
+    ],
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "The orchestrator listens on port 8080."
+        },
+        {
+          "role": "assistant",
+          "content": "Noted — orchestrator on port 8080."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "We moved the orchestrator to port 8083."
+        },
+        {
+          "role": "assistant",
+          "content": "Updated — orchestrator on port 8083."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "Any tips for sleeping better during hot summer nights?"
+        },
+        {
+          "role": "assistant",
+          "content": "Keep the blinds closed during the day and use breathable cotton bedding."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "The orchestrator now runs on port 8085."
+        },
+        {
+          "role": "assistant",
+          "content": "Updated — orchestrator on port 8085."
+        }
+      ]
+    ],
+    "answer_session_ids": [
+      "lc_chain_port_orig",
+      "lc_chain_port_mid",
+      "lc_chain_port_update"
+    ],
+    "lifecycle": {
+      "category": "update_chain",
+      "expect_valid": [
+        "8085"
+      ],
+      "expect_retired": [
+        "8080",
+        "8083"
+      ],
+      "expect_unique": []
+    },
+    "probe": {
+      "current_value": "8085",
+      "stale_value": "8083",
+      "update_session_id": "lc_chain_port_update",
+      "original_session_id": "lc_chain_port_orig"
+    }
+  },
+  {
+    "question_id": "lc_coexist_vehicles",
+    "question_type": "multi-session",
+    "question": "What vehicles do I own?",
+    "answer": "A red Tesla Model 3 and a Honda motorcycle.",
+    "question_date": "2026/01/22 (later)",
+    "haystack_session_ids": [
+      "lc_coexist_vehicles_x",
+      "lc_coexist_vehicles_filler0",
+      "lc_coexist_vehicles_y"
+    ],
+    "haystack_dates": [
+      "2026/01/08 (Thu) 10:00",
+      "2026/01/15 (Thu) 10:00",
+      "2026/01/22 (Thu) 10:00"
+    ],
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "I drive a red Tesla Model 3 to work every day."
+        },
+        {
+          "role": "assistant",
+          "content": "Noted — you drive a red Tesla Model 3."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "Any tips for sleeping better during hot summer nights?"
+        },
+        {
+          "role": "assistant",
+          "content": "Keep the blinds closed during the day and use breathable cotton bedding."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "On weekends I ride my Honda motorcycle out to the coast."
+        },
+        {
+          "role": "assistant",
+          "content": "Noted — you also ride a Honda motorcycle on weekends."
+        }
+      ]
+    ],
+    "answer_session_ids": [
+      "lc_coexist_vehicles_x",
+      "lc_coexist_vehicles_y"
+    ],
+    "lifecycle": {
+      "category": "coexist",
+      "expect_valid": [
+        "Tesla Model 3",
+        "Honda motorcycle"
+      ],
+      "expect_retired": [],
+      "expect_unique": []
+    }
+  },
+  {
+    "question_id": "lc_coexist_components",
+    "question_type": "multi-session",
+    "question": "What are the orchestrator and cockpit built with?",
+    "answer": "FastAPI and Angular.",
+    "question_date": "2026/01/21 (later)",
+    "haystack_session_ids": [
+      "lc_coexist_components_x",
+      "lc_coexist_components_filler0",
+      "lc_coexist_components_y"
+    ],
+    "haystack_dates": [
+      "2026/01/07 (Wed) 11:00",
+      "2026/01/14 (Wed) 11:00",
+      "2026/01/21 (Wed) 11:00"
+    ],
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "The orchestrator service is built with FastAPI."
+        },
+        {
+          "role": "assistant",
+          "content": "Noted — orchestrator uses FastAPI."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "Any tips for sleeping better during hot summer nights?"
+        },
+        {
+          "role": "assistant",
+          "content": "Keep the blinds closed during the day and use breathable cotton bedding."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "The cockpit front-end is built with Angular."
+        },
+        {
+          "role": "assistant",
+          "content": "Noted — cockpit uses Angular."
+        }
+      ]
+    ],
+    "answer_session_ids": [
+      "lc_coexist_components_x",
+      "lc_coexist_components_y"
+    ],
+    "lifecycle": {
+      "category": "coexist",
+      "expect_valid": [
+        "FastAPI",
+        "Angular"
+      ],
+      "expect_retired": [],
+      "expect_unique": []
+    }
+  },
+  {
+    "question_id": "lc_coexist_langs",
+    "question_type": "multi-session",
+    "question": "Which languages am I learning?",
+    "answer": "Spanish and Japanese.",
+    "question_date": "2026/01/19 (later)",
+    "haystack_session_ids": [
+      "lc_coexist_langs_x",
+      "lc_coexist_langs_filler0",
+      "lc_coexist_langs_y"
+    ],
+    "haystack_dates": [
+      "2026/01/05 (Mon) 20:00",
+      "2026/01/12 (Mon) 20:00",
+      "2026/01/19 (Mon) 20:00"
+    ],
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "I'm learning Spanish in the evenings."
+        },
+        {
+          "role": "assistant",
+          "content": "Noted — you're learning Spanish."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "Any tips for sleeping better during hot summer nights?"
+        },
+        {
+          "role": "assistant",
+          "content": "Keep the blinds closed during the day and use breathable cotton bedding."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "I also started learning Japanese on weekends."
+        },
+        {
+          "role": "assistant",
+          "content": "Noted — you're learning Japanese as well."
+        }
+      ]
+    ],
+    "answer_session_ids": [
+      "lc_coexist_langs_x",
+      "lc_coexist_langs_y"
+    ],
+    "lifecycle": {
+      "category": "coexist",
+      "expect_valid": [
+        "Spanish",
+        "Japanese"
+      ],
+      "expect_retired": [],
+      "expect_unique": []
+    }
+  },
+  {
+    "question_id": "lc_false_laptops",
+    "question_type": "multi-session",
+    "question": "What laptops do I use?",
+    "answer": "A MacBook Pro for work and a ThinkPad personally.",
+    "question_date": "2026/01/20 (later)",
+    "haystack_session_ids": [
+      "lc_false_laptops_x",
+      "lc_false_laptops_filler0",
+      "lc_false_laptops_y"
+    ],
+    "haystack_dates": [
+      "2026/01/06 (Tue) 09:00",
+      "2026/01/13 (Tue) 09:00",
+      "2026/01/20 (Tue) 09:00"
+    ],
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "My work laptop is a MacBook Pro."
+        },
+        {
+          "role": "assistant",
+          "content": "Noted — work laptop is a MacBook Pro."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "Any tips for sleeping better during hot summer nights?"
+        },
+        {
+          "role": "assistant",
+          "content": "Keep the blinds closed during the day and use breathable cotton bedding."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "My personal laptop is a ThinkPad."
+        },
+        {
+          "role": "assistant",
+          "content": "Noted — personal laptop is a ThinkPad."
+        }
+      ]
+    ],
+    "answer_session_ids": [
+      "lc_false_laptops_x",
+      "lc_false_laptops_y"
+    ],
+    "lifecycle": {
+      "category": "false_contradiction",
+      "expect_valid": [
+        "MacBook Pro",
+        "ThinkPad"
+      ],
+      "expect_retired": [],
+      "expect_unique": []
+    }
+  },
+  {
+    "question_id": "lc_false_dbs",
+    "question_type": "multi-session",
+    "question": "Which databases does the system use?",
+    "answer": "PostgreSQL for the app and MongoDB for the audit trail.",
+    "question_date": "2026/01/18 (later)",
+    "haystack_session_ids": [
+      "lc_false_dbs_x",
+      "lc_false_dbs_filler0",
+      "lc_false_dbs_y"
+    ],
+    "haystack_dates": [
+      "2026/01/04 (Sun) 13:00",
+      "2026/01/11 (Sun) 13:00",
+      "2026/01/18 (Sun) 13:00"
+    ],
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "The application database is PostgreSQL."
+        },
+        {
+          "role": "assistant",
+          "content": "Noted — app database is PostgreSQL."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "Any tips for sleeping better during hot summer nights?"
+        },
+        {
+          "role": "assistant",
+          "content": "Keep the blinds closed during the day and use breathable cotton bedding."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "The audit trail is stored in MongoDB."
+        },
+        {
+          "role": "assistant",
+          "content": "Noted — audit trail uses MongoDB."
+        }
+      ]
+    ],
+    "answer_session_ids": [
+      "lc_false_dbs_x",
+      "lc_false_dbs_y"
+    ],
+    "lifecycle": {
+      "category": "false_contradiction",
+      "expect_valid": [
+        "PostgreSQL",
+        "MongoDB"
+      ],
+      "expect_retired": [],
+      "expect_unique": []
+    }
+  },
+  {
+    "question_id": "lc_merge_flight",
+    "question_type": "multi-session",
+    "question": "When is my flight to Berlin?",
+    "answer": "On March 10 at 3pm.",
+    "question_date": "2026/01/23 (later)",
+    "haystack_session_ids": [
+      "lc_merge_flight_x",
+      "lc_merge_flight_filler0",
+      "lc_merge_flight_y"
+    ],
+    "haystack_dates": [
+      "2026/01/09 (Fri) 10:00",
+      "2026/01/16 (Fri) 10:00",
+      "2026/01/23 (Fri) 10:00"
+    ],
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "My flight to Berlin is on March 10."
+        },
+        {
+          "role": "assistant",
+          "content": "Noted — Berlin flight on March 10."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "Any tips for sleeping better during hot summer nights?"
+        },
+        {
+          "role": "assistant",
+          "content": "Keep the blinds closed during the day and use breathable cotton bedding."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "That Berlin flight leaves at 3pm."
+        },
+        {
+          "role": "assistant",
+          "content": "Noted — the Berlin flight is at 3pm."
+        }
+      ]
+    ],
+    "answer_session_ids": [
+      "lc_merge_flight_x",
+      "lc_merge_flight_y"
+    ],
+    "lifecycle": {
+      "category": "merge",
+      "expect_valid": [
+        "March 10",
+        "3pm"
+      ],
+      "expect_retired": [],
+      "expect_unique": []
+    }
+  },
+  {
+    "question_id": "lc_merge_dentist",
+    "question_type": "multi-session",
+    "question": "Who is my dentist and where is the office?",
+    "answer": "Dr. Reed, on Oak Street.",
+    "question_date": "2026/01/22 (later)",
+    "haystack_session_ids": [
+      "lc_merge_dentist_x",
+      "lc_merge_dentist_filler0",
+      "lc_merge_dentist_y"
+    ],
+    "haystack_dates": [
+      "2026/01/08 (Thu) 15:00",
+      "2026/01/15 (Thu) 15:00",
+      "2026/01/22 (Thu) 15:00"
+    ],
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "My dentist is Dr. Reed."
+        },
+        {
+          "role": "assistant",
+          "content": "Noted — your dentist is Dr. Reed."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "Any tips for sleeping better during hot summer nights?"
+        },
+        {
+          "role": "assistant",
+          "content": "Keep the blinds closed during the day and use breathable cotton bedding."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "Dr. Reed's office is on Oak Street."
+        },
+        {
+          "role": "assistant",
+          "content": "Noted — Dr. Reed's office is on Oak Street."
+        }
+      ]
+    ],
+    "answer_session_ids": [
+      "lc_merge_dentist_x",
+      "lc_merge_dentist_y"
+    ],
+    "lifecycle": {
+      "category": "merge",
+      "expect_valid": [
+        "Dr. Reed",
+        "Oak Street"
+      ],
+      "expect_retired": [],
+      "expect_unique": []
+    }
+  },
+  {
+    "question_id": "lc_noop_employer",
+    "question_type": "knowledge-update",
+    "question": "Where do I work?",
+    "answer": "Northwind Robotics.",
+    "question_date": "2026/01/23 (later)",
+    "haystack_session_ids": [
+      "lc_noop_employer_first",
+      "lc_noop_employer_filler0",
+      "lc_noop_employer_again"
+    ],
+    "haystack_dates": [
+      "2026/01/09 (Fri) 09:00",
+      "2026/01/16 (Fri) 09:00",
+      "2026/01/23 (Fri) 09:00"
+    ],
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "I work at Northwind Robotics."
+        },
+        {
+          "role": "assistant",
+          "content": "Noted — you work at Northwind Robotics."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "Any tips for sleeping better during hot summer nights?"
+        },
+        {
+          "role": "assistant",
+          "content": "Keep the blinds closed during the day and use breathable cotton bedding."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "Just to confirm, my employer is Northwind Robotics."
+        },
+        {
+          "role": "assistant",
+          "content": "Confirmed — Northwind Robotics."
+        }
+      ]
+    ],
+    "answer_session_ids": [
+      "lc_noop_employer_first",
+      "lc_noop_employer_again"
+    ],
+    "lifecycle": {
+      "category": "noop",
+      "expect_valid": [
+        "Northwind Robotics"
+      ],
+      "expect_retired": [],
+      "expect_unique": [
+        "Northwind Robotics"
+      ]
+    }
+  },
+  {
+    "question_id": "lc_noop_advisor",
+    "question_type": "knowledge-update",
+    "question": "Who is my thesis advisor?",
+    "answer": "Dr. Yamamoto.",
+    "question_date": "2026/01/21 (later)",
+    "haystack_session_ids": [
+      "lc_noop_advisor_first",
+      "lc_noop_advisor_filler0",
+      "lc_noop_advisor_again"
+    ],
+    "haystack_dates": [
+      "2026/01/07 (Wed) 14:00",
+      "2026/01/14 (Wed) 14:00",
+      "2026/01/21 (Wed) 14:00"
+    ],
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "My thesis advisor is Dr. Yamamoto."
+        },
+        {
+          "role": "assistant",
+          "content": "Noted — your advisor is Dr. Yamamoto."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "Any tips for sleeping better during hot summer nights?"
+        },
+        {
+          "role": "assistant",
+          "content": "Keep the blinds closed during the day and use breathable cotton bedding."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "Dr. Yamamoto is the one supervising my thesis."
+        },
+        {
+          "role": "assistant",
+          "content": "Confirmed — Dr. Yamamoto supervises your thesis."
+        }
+      ]
+    ],
+    "answer_session_ids": [
+      "lc_noop_advisor_first",
+      "lc_noop_advisor_again"
+    ],
+    "lifecycle": {
+      "category": "noop",
+      "expect_valid": [
+        "Yamamoto"
+      ],
+      "expect_retired": [],
+      "expect_unique": [
+        "Yamamoto"
+      ]
+    }
+  }
+]

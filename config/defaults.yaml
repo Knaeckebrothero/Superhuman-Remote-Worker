@@ -261,7 +261,7 @@ memory:
   ingestion:
     enabled: true
     verdict_top_k: 5
-    review_floor: 0.6
+    review_floor: 0.5   # measured 2026-06-17 (lifecycle probe): 0.6→0.5 halves missed-retire (catches cosine-0.547 supersede), false-retire stays 0
   extraction:
     write_gate: false                # completeness over precision — relevance is gated at retrieval now, not at write time
 
