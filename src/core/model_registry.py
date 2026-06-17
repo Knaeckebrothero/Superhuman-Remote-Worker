@@ -170,6 +170,8 @@ def family_of(model_id: str, default: str = "default") -> str:
         return "o-series"
     if "deepseek" in name:
         return "deepseek"
+    if "glm" in name:
+        return "glm"
     if "qwen" in name or "qwq" in name:
         return "qwen"
     if "llama" in name:
