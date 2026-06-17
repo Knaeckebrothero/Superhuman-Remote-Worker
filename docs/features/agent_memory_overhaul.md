@@ -28,10 +28,12 @@ related:
 > assembles the right memories for every LLM call — the model is a *consumer*, never the
 > manager. Build the seam first; everything else becomes a plugin behind it.
 
-**Status:** Design v2 / **Phases 1–4 implemented + measured; GATE-B stack
-flipped on, shipping to dev (2026-06-14)**. A 7-phase overhaul; **four phases
-done + the production stack now active in the defaults YAML (dev rollout for
-real-session validation); GATE A soak/delete + Phases 5–7 remain.**
+**Status:** Design v2 / **Phases 1–4 implemented + measured + tuned; GATE-B
+stack committed + pushed → live on dev via Fleet (~2026-06-14); `review_floor`
+tuned 0.6→0.5 + a lifecycle/supersede regression gate added (measured
+2026-06-17, committed `0ccab8a` → deploying to dev)**. A 7-phase overhaul; **four phases done + the
+production stack live on dev (soak underway for real-session validation); the
+dev soak, prod flip, GATE A delete, + Phases 5–7 remain.**
 The map:
 
 - **Phase 1 (MemoryManager seam) — code complete, flag ON, committed.** Both
@@ -60,8 +62,8 @@ The map:
   but **inert by default** (nothing in the defaults-YAML pipeline). **GATE B:**
   the production flip is a separate decision pending real-session evidence —
   the harness is N=20 synthetic with a gemma reader, not the product workload.
-- **Phase 4 (lifecycle supersede) — ✅ COMPLETE + MEASURED (2026-06-14), NOT
-  yet rolled out.** Bi-temporal columns + retrieval filter (migration
+- **Phase 4 (lifecycle supersede) — ✅ COMPLETE + MEASURED (2026-06-14), live
+  on dev + `review_floor`-tuned (2026-06-17).** Bi-temporal columns + retrieval filter (migration
   `vector/0006`), ingestion verdicts ADD/UPDATE/MERGE/NOOP via the aux LLM
   (`memory.ingestion.enabled`, default off) with retire-and-exclude supersede,
   and a `write_gate` completeness toggle — all inert by default, full suite
@@ -70,10 +72,11 @@ The map:
   not just out-ranked) + reader current 1.0; and on the N=20 end-task slice
   **knowledge-update 0/4 → 3/4** with **overall 0.40 → 0.50**, R@5 and tokens
   unchanged, 14 % of the organic corpus retired. KU recovered past its 0.5
-  target. **GATE B flipped 2026-06-14** (the Phase-3+4 stack is now in both
-  defaults YAMLs), **shipping to dev** for real-session validation before prod —
-  the harness evidence is N=20 synthetic / gemma-reader, so dev is where
-  reranker latency + aux load under real traffic get proven.
+  target. **GATE B flipped 2026-06-14, then committed + pushed → live on dev via
+  Fleet** (the Phase-3+4 stack is in both defaults YAMLs); **`review_floor` since
+  tuned 0.6→0.5 (2026-06-17, committed `0ccab8a` → deploying to dev)**. Dev is where the one thing the
+  harness can't show — reranker latency + aux load under real traffic — gets
+  proven; the N=20-synthetic / gemma-reader caveat holds until then.
 - **Phases 5–7** — ablate-and-cut (find + delete cargo-cult consolidation),
   buckets productized (personal/shared + cockpit panel), frontier verdicts
   (graph-keep, learned scorer). Decision-gated or dependent on Phase 4.
@@ -86,12 +89,13 @@ follow-up, not core correctness):
   **GATE B** = ✅ **flipped 2026-06-14** — both defaults YAMLs now carry the
   measured Phase-3+4 stack (`scorers: [reranker]`, `policies: [gate, bounded]`,
   `memory.ingestion.enabled: true`, `extraction.write_gate: false`).
-  **Shipping to the dev cluster first** for real-session validation — the one
-  thing the offline harness can't show is **reranker latency + the added aux
-  load under real traffic** (every assemble now reranks, every store may run a
-  verdict, and the router flaps). The legacy fallback stays in place behind the
-  flags, so rollback is a one-edit revert. Prod only after dev looks clean; the
-  N=20-synthetic / gemma-reader caveat is unchanged until then.
+  **Committed + pushed → live on dev via Fleet (~2026-06-14); the dev soak is
+  now the gate.** The one thing the offline harness can't show is **reranker
+  latency + the added aux load under real traffic** (every assemble now reranks,
+  every store may run a verdict, and the router flaps). The legacy fallback stays
+  in place behind the flags, so rollback is a one-edit revert. Prod only after
+  dev looks clean; the N=20-synthetic / gemma-reader caveat is unchanged until
+  then.
 - **GC / retention (B6) is NOT closed by Phase 4.** Supersede *retires, does not
   delete* (sets `valid_to`) — by design for point-in-time history, but it means
   the table still grows (supersede actually *adds* a row: the new fact plus the
@@ -99,11 +103,22 @@ follow-up, not core correctness):
   — keying off the new `valid_to`/`superseded_at` columns — remains future work
   (loosely mapped to Phase 4 originally; now a Phase-4 follow-up / folds into
   Phase 5's ablate-and-cut).
-- **`review_floor` tune** (the Phase-4 residual): the 2/8 contradiction misses +
-  the 1/4 KU miss were old/new pairs phrased below the 0.6 similarity floor, so
-  the verdict ADD'd them as distinct instead of superseding. A floor and/or
-  extraction-phrasing tune could close them — cheap follow-up, measured on the
-  same harness.
+- **`review_floor` tune — ✅ DONE (2026-06-17).** Tuned 0.6 → **0.5** in both
+  defaults YAMLs, measured on the new lifecycle probe: missed-retire halves
+  (0.25 → 0.125, the cosine-0.547 car pair now supersedes) with **over-retire
+  holding at 0** — the verdict correctly keeps the high-similarity look-alikes it
+  now adjudicates (false_laptops 0.729, false_dbs 0.586 both kept). The one
+  residual miss (`lc_update_diet`) is an *extraction* gap (the update fact was
+  never extracted), not a floor issue → folds into Phase 5's extraction-
+  completeness lever. (Committed `0ccab8a` → deploying to dev.)
+- **Lifecycle/supersede regression gate — NEW (2026-06-17).**
+  `eval/memory/fixtures/lifecycle_probe.json` (15 cases across UPDATE / chain /
+  coexist / false-contradiction / merge-additive / NOOP) + `eval/memory/lifecycle.py`
+  score the **bi-temporal DB state** directly — which rows are valid vs retired —
+  where the contradiction probe only tests "did the stale value stop being read."
+  Its headline `false_retire_rate` is the *over-retiring* signal the contradiction
+  probe is structurally blind to (there, every case wants something retired). 10
+  unit tests; re-runnable whenever the verdict prompt or `review_floor` changes.
 - **Two user-side measurement items**: judge calibration is **93.1 % vs the
   97 % target** (needs a ~100-item label pass), and the request digest's
   windowing payoff is **unmeasured** (only question-time parity is proven —
@@ -764,6 +779,33 @@ below in new order). Every bug worth fixing *before* the seam is fixed
   (its image lacks the agent's pgvector codec / neo4j / citation deps — not a
   prod issue) — the true live-turn path validates on the dev rollout with real
   agent pods.
+- **2026-06-17 — GATE-B stack confirmed shipped to dev; `review_floor` tuned 0.5;
+  lifecycle regression gate built + measured.** Git confirms the GATE-B flip was
+  committed + pushed (`develop` == `origin/develop`) → live on the dev cluster via
+  Fleet since ~06-14; the dev soak is the current rollout gate (the offline picture
+  is saturated — no more offline evidence needed). **New regression asset:**
+  `eval/memory/fixtures/lifecycle_probe.json` (15 hand-built cases — UPDATE ×4,
+  chain ×2, coexist ×3, false-contradiction ×2, merge-additive ×2, NOOP ×2, mixing
+  personal + project facts) via committed builder `build_lifecycle_probe.py`, plus
+  scorer `eval/memory/lifecycle.py` that reads the **bi-temporal DB state** per
+  `project_uuid(run_id, qid)` and classifies each labelled value ok / false_retired
+  / missed_retire / duplicate / not_extracted (the verdict *action* isn't persisted
+  — `_audit_verdict` no-ops without an archiver — so the DB state IS the ground
+  truth). 10 unit tests + an integration smoke against the real migrated `srw_eval`
+  schema. **Measured (k3d creds via the orchestrator-pod `resolve_catalog_model`
+  recipe, local `srw_eval`):** at the shipped `review_floor` 0.6 — 13/15 pass,
+  **false_retire_rate 0.0** (0/23 should-survive values wrongly retired; coexist /
+  false-contradiction / merge / NOOP all clean — supersede is *not* trigger-happy,
+  and it earns it: the high-sim look-alikes false_laptops 0.729 + false_dbs 0.586
+  were adjudicated and correctly kept), duplicate 0.0, **missed_retire 0.25 (2/8)**.
+  The 2 misses root-caused: car (Honda↔Tesla cosine 0.547 < 0.60 → cost-guard
+  skipped adjudication) + diet (the "vegetarian" update was never extracted — an
+  *extraction* gap, not supersede). At **`review_floor` 0.5**: 14/15 pass,
+  **missed_retire 0.25 → 0.125** (car now retires), **false_retire still 0.0** even
+  with more look-alikes adjudicated → 0.5 shipped to both defaults YAMLs
+  (committed `0ccab8a`, pushed → deploying to dev). The diet miss is now a Phase-5
+  extraction-completeness item. Creds
+  shredded after; arm `lifecycle_verdict_rf050_k3d.yaml` + run corpora are gitignored.
 **Companions:**
 - [`agent_memory_current_state.md`](agent_memory_current_state.md) — ground truth: every
   current capability classified wired/dead/conceptual with `file:line` evidence.
@@ -1292,7 +1334,7 @@ gap is one knowledge-update question = supersede = Phase 4 by construction).
 `bounded: {max_items: 10}`, reranker `keep_pinned_first: false` + top_k sized to
 cover the store (gate arms leak unscored tail items fail-open otherwise).
 
-### Phase 4 — Lifecycle writers: verdicts + bi-temporal supersede · ~1–1.5 wk ← **✅ COMPLETE + MEASURED 2026-06-14 (GATE-B flipped in defaults → shipping to dev)**
+### Phase 4 — Lifecycle writers: verdicts + bi-temporal supersede · ~1–1.5 wk ← **✅ COMPLETE + MEASURED 2026-06-14; live on dev + `review_floor`-tuned 0.5 (2026-06-17)**
 Ingestion verdicts (ADD/UPDATE/MERGE/NOOP, aux-LLM) ✅; bi-temporal columns via
 `migrations/vector/0006_bitemporal_memory.sql` ✅ (NOT `knowledge_index` — it already
 supersedes via `status='active'`, and the KB is the model's active notebook, P0);
@@ -1322,11 +1364,15 @@ knowledge-update slice improves ✅ (0/4 → 3/4, past the 0.5 target; overall e
 0.40 → 0.50); no regression elsewhere ✅ (R@5 1.0, 111 tok unchanged); verdict-call
 budget held ✅ (review_floor cost guard). N=20 caveat as Phase 3.
 
-### Phase 5 — Ablate & cut · ~0.5 wk + data wait
+### Phase 5 — Ablate & cut (+ GC + extraction completeness) · ~0.5 wk + data wait
 A/B the inherited consolidation layer — curation writer (née assembler), TTL semantics,
 dedup — via harness switches. **Remove what doesn't move the needle** (finding cargo-cult
 is a win: simpler system, fewer background LLM calls). Also the vestigial-code sweep
-(~1,600 lines cataloged in current-state §6).
+(~1,600 lines cataloged in current-state §6). **Folded in from Phase 4:** the **GC /
+retention** job (delete rows retired beyond a window, keying off `valid_to`/`superseded_at`
+— supersede now grows the table) and the **extraction-completeness** lever surfaced by the
+lifecycle probe (the `lc_update_diet` miss = an update fact never extracted, which
+`review_floor` can't fix). Benefits from real dev-soak `AssembleStats` data.
 **Acceptance:** documented keep/cut per op, each backed by a harness delta.
 
 ### Phase 6 — Buckets productized · ~1 wk
