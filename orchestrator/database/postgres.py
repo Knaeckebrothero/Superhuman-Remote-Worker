@@ -1357,6 +1357,38 @@ class PostgresDB:
 
         return result == "UPDATE 1"
 
+    async def store_resolved_config(
+        self, job_id: str, resolved_config: Dict[str, Any]
+    ) -> bool:
+        """Freeze the resolved config blob into ``jobs.resolved_config``.
+
+        First-run only: writes solely when the column is currently NULL, so a
+        re-dispatch / resume never overwrites the original frozen config (the
+        config-drift guard, mirroring the agent-side freeze). In the
+        orchestrator-resolved architecture the orchestrator owns this freeze.
+        The blob MUST already be stripped of secrets (``redact_config_override``)
+        by the caller.
+
+        Returns True if the freeze was written, False if not found or already set.
+        """
+        import json as json_module
+
+        try:
+            uuid_val = UUID(str(job_id))
+        except ValueError:
+            return False
+
+        query = (
+            "UPDATE jobs SET resolved_config = $1, updated_at = CURRENT_TIMESTAMP "
+            "WHERE id = $2 AND resolved_config IS NULL"
+        )
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                query, json_module.dumps(resolved_config), uuid_val
+            )
+
+        return result == "UPDATE 1"
+
     async def merge_job_context(self, job_id: str, updates: Dict[str, Any]) -> bool:
         """Atomically merge updates into the job's context JSONB column.
 

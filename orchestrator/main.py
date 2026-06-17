@@ -220,6 +220,10 @@ from services.session_provisioner import (  # noqa: E402
 from services.docker_provisioner import docker_provisioner  # noqa: E402
 from services.persistent_provisioner import persistent_provisioner  # noqa: E402
 from services.agent_provisioner import agent_provisioner  # noqa: E402
+from services.config_resolver import (  # noqa: E402
+    inject_blob_credentials,
+    resolve_config,
+)
 from services.session_router import SessionRouterService  # noqa: E402
 from services.session_tokens import SessionTokenService  # noqa: E402
 from services.lifecycle import (  # noqa: E402
@@ -937,6 +941,112 @@ async def imap_poll_loop(shutdown_event: asyncio.Event) -> None:
 # =============================================================================
 
 
+def _is_experts_db_enabled() -> bool:
+    """True when DB-backed experts / orchestrator-resolved config is on (env).
+
+    Gates whether the orchestrator resolves the full config at dispatch/attach
+    and emits a ``resolved_config`` blob. Off → the agent uses its ``from_config``
+    fallback (today's path). Dev on / prod off (helm ``expertsDbEnabled``).
+    """
+    return os.getenv("EXPERTS_DB_ENABLED", "").lower().strip() in ("true", "1", "yes")
+
+
+async def _resolve_default_models(user_id: str | None) -> dict[str, Any]:
+    """Effective default chat + auxiliary MODEL NAMES for a user (no transport).
+
+    Mirrors the model selection in ``_inject_dispatch_credentials`` /
+    ``_inject_thread_dispatch_credentials``: a user's pinned default wins, else
+    the system capability default. Returned as a config layer
+    (``{"llm": {"model": ...}, "auxiliary": {"model": ...}}``) that
+    ``resolve_config`` applies above the base config's placeholder model and below
+    the expert. base_url/api_key for the chosen models are injected into the
+    delivery blob, not here. Reused by job dispatch AND session attach.
+    """
+    out: dict[str, Any] = {}
+    user_settings: dict[str, Any] = {}
+    if user_id:
+        user_settings = await postgres_db.get_user_settings(str(user_id)) or {}
+    chat = user_settings.get("default_model") or await postgres_db.resolve_default_for_capability(
+        "chat"
+    )
+    aux = user_settings.get(
+        "default_auxiliary_model"
+    ) or await postgres_db.resolve_default_for_capability("auxiliary")
+    if chat:
+        out.setdefault("llm", {})["model"] = chat
+    if aux:
+        out.setdefault("auxiliary", {})["model"] = aux
+    return out
+
+
+async def _resolve_session_config(
+    thread: dict[str, Any],
+    metadata: dict[str, Any],
+    *,
+    config_override: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Resolve a persistent thread's full config to a delivery blob (credential-
+    injected), or ``None`` when experts are off / resolution fails (→ the agent's
+    ``config_name`` + ``config_override`` fallback).
+
+    The session sibling of the job-dispatch resolve. Sessions **re-resolve on
+    every (re)attach** — there is no freeze (mutable run; spec delivery table).
+    Layers: persistent_defaults base + default-model floor + DB expert
+    (``metadata.expert_id``) + thread ``config_override`` (request) → creds.
+    ``config_override`` overrides ``metadata.config_override`` for the warm-pool
+    path (it carries the attach-time lite-workspace backend).
+    """
+    if not _is_experts_db_enabled():
+        return None
+    try:
+        user_id = str(thread["user_id"]) if thread.get("user_id") else None
+        project_id = str(thread["project_id"]) if thread.get("project_id") else None
+        expert_id = metadata.get("expert_id")
+        expert_row = (
+            await postgres_db.get_expert_by_id(str(expert_id)) if expert_id else None
+        )
+        base = thread.get("config_name") or "persistent_defaults"
+        if base in ("default", "persistent_default") or _looks_like_uuid(base):
+            # Sentinel / cockpit-conflated expert UUID → resolve onto the real
+            # session base; the expert is delivered via expert_id, not the name.
+            base = "persistent_defaults"
+        request_override = (
+            config_override
+            if config_override is not None
+            else (metadata.get("config_override") or None)
+        )
+        base_defaults = await _resolve_default_models(user_id)
+        resolved = resolve_config(
+            base_config_name=base,
+            base_defaults=base_defaults,
+            expert_row=expert_row,
+            request_override=request_override,
+            expert_type="session",
+        )
+        return await inject_blob_credentials(
+            resolved,
+            lambda co: _inject_thread_dispatch_credentials(
+                co, user_id=user_id, project_id=project_id
+            ),
+        )
+    except Exception:
+        logger.exception(
+            "Session resolve failed for thread %s; falling back to config_name",
+            thread.get("id"),
+        )
+        return None
+
+
+def _looks_like_uuid(value: Any) -> bool:
+    """True if ``value`` parses as a UUID (a cockpit-conflated expert id in the
+    config_name slot, which must not be treated as a config file name)."""
+    try:
+        UUID(str(value))
+        return True
+    except (ValueError, TypeError, AttributeError):
+        return False
+
+
 async def _inject_dispatch_credentials(
     job: dict[str, Any],
     config_override: dict[str, Any] | None,
@@ -1427,12 +1537,69 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
                     f"Dispatch: using worktree path {worktree_path} for job {job_id}"
                 )
 
+        # Orchestrator-resolved config (supersedes agent-side Decision 6): when
+        # experts are enabled, resolve the full config here with the same loader
+        # the agent uses, freeze the secret-free copy into jobs.resolved_config,
+        # and deliver a credential-injected blob. The agent hydrates it and skips
+        # local resolution. On ANY failure we fall back to config_name +
+        # config_override below — the blob's absence is always safe.
+        resolved_config: dict[str, Any] | None = None
+        if _is_experts_db_enabled():
+            try:
+                expert_row = None
+                if job.get("expert_id"):
+                    expert_row = await postgres_db.get_expert_by_id(
+                        str(job["expert_id"])
+                    )
+                _base_name = job.get("config_name") or "defaults"
+                if _base_name == "default":
+                    # JobCreate / JobStartRequest sentinel for "the default
+                    # config"; the real base file is defaults.yaml (a literal
+                    # resolve of "default" 404s). The agent boots "defaults" too.
+                    _base_name = "defaults"
+                # Default-model floor (model names only): the base config carries
+                # a placeholder model; the effective default is the user's pinned
+                # model else the system capability default. Resolution applies it
+                # below the expert; inject_blob_credentials adds the transport.
+                _base_defaults = await _resolve_default_models(job.get("user_id"))
+                _resolved = resolve_config(
+                    base_config_name=_base_name,
+                    base_defaults=_base_defaults,
+                    expert_row=expert_row,
+                    request_override=config_override,
+                    expert_type="worker",
+                )
+                resolved_config = await inject_blob_credentials(
+                    _resolved,
+                    lambda co: _inject_dispatch_credentials(job, co),
+                )
+                await postgres_db.store_resolved_config(
+                    job_id, redact_config_override(resolved_config)
+                )
+                logger.info(
+                    "Dispatch: resolved config for job %s (expert_id=%s)",
+                    job_id,
+                    job.get("expert_id"),
+                )
+            except Exception:
+                logger.exception(
+                    "Dispatch: resolve_config failed for job %s; falling back "
+                    "to config_name + config_override",
+                    job_id,
+                )
+                resolved_config = None
+
         # Resolve API keys, model routing, and capability defaults.
         # Same helper drives both first-dispatch and resume so an orphaned
         # job re-dispatched to a fresh agent doesn't lose its credentials.
+        # (Still injected into config_override for the no-blob fallback path.)
         config_override = await _inject_dispatch_credentials(job, config_override)
 
-        # Build job start request
+        # Build job start request. resolved_config and config_override are
+        # mutually exclusive on the wire: a delivered blob is complete, so we
+        # send config_override=None to keep the agent from flat-merging an
+        # override on top of the resolved layers (the degradation we set out to
+        # fix).
         job_start = JobStartRequest(
             job_id=job_id,
             description=job["description"],
@@ -1442,7 +1609,8 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
             instructions=instructions,
             document_path=job.get("document_path"),
             config_name=job.get("config_name", "default"),
-            config_override=config_override,
+            config_override=None if resolved_config else config_override,
+            resolved_config=resolved_config,
             git_remote_url=git_remote_url,
             context=remaining_context if remaining_context else None,
             datasources=datasources_payload,
@@ -1789,10 +1957,33 @@ async def _send_session_attach(
         logger.error("Session attach: thread %s lite-config error: %s", thread_id, exc)
         return False
 
+    # Orchestrator-resolved config for the warm-pool agent: this is the expert
+    # delivery channel the warm path lacked (the 3-minute-stall bug). Re-resolve
+    # on every attach (no freeze). None when experts are off / resolve fails →
+    # the agent uses the config_name + config_override fallback below.
+    resolved_config: dict[str, Any] | None = None
+    try:
+        _thread = await postgres_db.get_thread(thread_id)
+        if _thread:
+            _meta = _thread.get("metadata") or {}
+            if isinstance(_meta, str):
+                try:
+                    _meta = json.loads(_meta)
+                except (json.JSONDecodeError, TypeError):
+                    _meta = {}
+            resolved_config = await _resolve_session_config(
+                _thread, _meta, config_override=config_override
+            )
+    except Exception:
+        logger.exception(
+            "Session attach: resolve failed for thread %s; using fallback", thread_id
+        )
+
     agent_url = f"http://{agent['pod_ip']}:{agent['pod_port']}/session/attach"
     payload = {
         "thread_id": thread_id,
-        "config_override": config_override,
+        "config_override": None if resolved_config else config_override,
+        "resolved_config": resolved_config,
         "project_ids": project_ids,
         "datasources": datasources,
         "config_name": config_name,
@@ -3227,6 +3418,14 @@ class JobCreate(BaseModel):
         None, description="Directory containing documents (deprecated)"
     )
     config_name: str = Field("default", description="Agent configuration name")
+    expert_id: str | None = Field(
+        None,
+        description=(
+            "DB-backed expert UUID. Preferred over config_name for expert "
+            "selection — the orchestrator resolves it into the job's config. "
+            "config_name stays the base profile."
+        ),
+    )
     config_override: dict[str, Any] | None = Field(
         None, description="Per-job configuration overrides"
     )
@@ -3286,6 +3485,14 @@ class JobStartRequest(BaseModel):
     document_dir: str | None = None
     config_name: str = "default"
     config_override: dict[str, Any] | None = None
+    resolved_config: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Orchestrator-resolved config blob (serialize_resolved_config shape). "
+            "Delivered instead of config_override when EXPERTS_DB_ENABLED; the "
+            "agent hydrates it. The orchestrator owns resolution and the freeze."
+        ),
+    )
     context: dict[str, Any] | None = None
     instructions: str | None = None
     git_remote_url: str | None = None
@@ -4764,6 +4971,7 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
             document_path=job.document_path,
             document_dir=job.document_dir,
             config_name=config_name,
+            expert_id=job.expert_id,
             config_override=config_override,
             context=context if context else None,
             user_id=effective_user_id,
@@ -11974,6 +12182,10 @@ async def agent_get_thread_workspace(
             user_id=str(thread["user_id"]) if thread.get("user_id") else None,
             project_id=str(thread["project_id"]) if thread.get("project_id") else None,
         )
+    # Orchestrator-resolved config for cold/dedicated attach: the agent prefers
+    # this fully-resolved, credential-injected blob over the config_override
+    # merge above (which stays for the fallback). None when experts are off.
+    session_resolved = await _resolve_session_config(thread, metadata)
     return {
         "status": ws.get("status", "none"),
         # K8s provisioner uses pod_ip; Docker provisioner uses host — normalize
@@ -11991,6 +12203,8 @@ async def agent_get_thread_workspace(
         "vm_name": vm.get("vm_name"),
         # Config overrides (model, temperature, etc.) — secrets re-injected above
         "config_override": co,
+        # Orchestrator-resolved config blob (preferred over config_override when present)
+        "resolved_config": session_resolved,
         # Project scoping
         "project_ids": project_ids,
         # Resolved datasources for the thread
@@ -12565,6 +12779,14 @@ class ThreadCreateRequest(BaseModel):
         ),
     )
     title: str = Field("Untitled Session", description="Session title")
+    expert_id: str | None = Field(
+        None,
+        description=(
+            "DB-backed expert UUID for this session. Preferred over config_name "
+            "for expert selection — stored in metadata.expert_id and resolved "
+            "into the session config at attach. config_name stays the base."
+        ),
+    )
     model: str | None = Field(
         None,
         description="LLM model override (e.g. RedHatAI/gemma-4-31B-it-FP8-Dynamic)",
@@ -12688,6 +12910,10 @@ async def create_thread(
             # in-memory copy) and re-injected on resume (workspace endpoint +
             # resume dispatcher). The threads row never stores plaintext keys.
             metadata_patch["config_override"] = redact_config_override(config_override)
+        if request_body.expert_id:
+            # DB expert selection: resolved into the session config at attach
+            # (_resolve_session_config reads metadata.expert_id).
+            metadata_patch["expert_id"] = request_body.expert_id
         if request_body.datasource_ids:
             metadata_patch["datasource_ids"] = request_body.datasource_ids
         if metadata_patch:
@@ -15680,18 +15906,43 @@ _experts_cache: list[ExpertInfo] | None = None
 
 
 @app.get("/api/experts")
-async def list_experts(request: Request) -> list[dict[str, Any]]:
-    """List available expert configurations. **P4e** — gated to approved
-    users; the expert catalog is shared metadata, not per-user.
+async def list_experts(
+    request: Request, type: str | None = None
+) -> list[dict[str, Any]]:
+    """List experts: bundled (disk) + DB rows visible to the caller (owned +
+    project-linked + global), each tagged with ``source``. **P4e** — approved
+    users only. ``type`` narrows the DB rows (worker/session); bundled experts
+    are unfiltered (they carry no type), preserving today's behavior.
 
-    Scans config/experts/ for expert configs and returns metadata
-    for expert selection in the cockpit UI.
+    Read-only surface. Expert CRUD (create/update/delete/import/export) is the
+    deferred fast-follow — the orchestrator-resolved config feature only needs
+    the catalog visible + selectable.
     """
-    await require_approved_user(request, postgres_db)
+    user = await require_approved_user(request, postgres_db)
     global _experts_cache
     if _experts_cache is None:
         _experts_cache = _scan_experts()
-    return [e.model_dump() for e in _experts_cache]
+    result = [{**e.model_dump(), "source": "bundled"} for e in _experts_cache]
+    if _is_experts_db_enabled():
+        visible = await user_visible_project_ids(user, postgres_db)
+        pids = [] if visible == "all" else [str(p) for p in visible]
+        rows = await postgres_db.list_experts_visible(
+            user_id=str(user["id"]), project_ids=pids, expert_type=type
+        )
+        result += [
+            {
+                "id": str(r["id"]),
+                "display_name": r["display_name"],
+                "description": r.get("description") or "",
+                "icon": r["icon"],
+                "color": r["color"],
+                "tags": r.get("tags") or [],
+                "expert_type": r["expert_type"],
+                "source": "global" if r["is_global"] else "user",
+            }
+            for r in rows
+        ]
+    return result
 
 
 @app.post("/api/experts/reload")
@@ -15763,8 +16014,40 @@ def _load_settings_matrix(config_dir: Path) -> dict[str, Any]:
     return _settings_matrix_cache
 
 
-def _load_expert_detail(expert_id: str) -> dict[str, Any]:
-    """Load full expert detail: merged config + instructions content."""
+async def _load_expert_detail(expert_id: str) -> dict[str, Any]:
+    """Load full expert detail: merged config + instructions content. DB-backed
+    experts (UUID) resolve their fragment onto the expert_type base; bundled
+    experts resolve from disk as before."""
+    if _is_experts_db_enabled() and _looks_like_uuid(expert_id):
+        row = await postgres_db.get_expert_by_id(expert_id)
+        if not row:
+            return {}
+        base_name = (
+            "defaults" if row["expert_type"] == "worker" else "persistent_defaults"
+        )
+        base_path = _get_config_dir() / f"{base_name}.yaml"
+        base = yaml.safe_load(base_path.read_text()) if base_path.exists() else {}
+        cfg = row.get("config") or {}
+        if isinstance(cfg, str):
+            cfg = json.loads(cfg)
+        merged = _deep_merge(base, cfg)
+        merged.pop("connections", None)
+        prompts = row.get("prompts") or {}
+        if isinstance(prompts, str):
+            prompts = json.loads(prompts)
+        return {
+            "id": str(row["id"]),
+            "display_name": row["display_name"],
+            "description": row.get("description") or "",
+            "icon": row["icon"],
+            "color": row["color"],
+            "tags": row.get("tags") or [],
+            "expert_type": row["expert_type"],
+            "source": "user",
+            "config": merged,
+            "instructions": prompts.get("instructions"),
+            "persona": prompts.get("persona"),
+        }
     config_dir = _get_config_dir()
 
     # Load expert config
@@ -15853,14 +16136,22 @@ async def get_expert(request: Request, expert_id: str) -> dict[str, Any]:
     creation form.
     """
     await require_approved_user(request, postgres_db)
-    # Verify expert exists
+
+    # DB-backed expert (UUID): the detail payload is self-contained.
+    if _is_experts_db_enabled() and _looks_like_uuid(expert_id):
+        detail = await _load_expert_detail(expert_id)
+        if not detail:
+            raise HTTPException(status_code=404, detail=f"Expert not found: {expert_id}")
+        return detail
+
+    # Verify bundled expert exists
     global _experts_cache
     if _experts_cache is None:
         _experts_cache = _scan_experts()
 
     if expert_id == "defaults":
         # "defaults" is a virtual expert representing framework defaults
-        detail = _load_expert_detail(expert_id)
+        detail = await _load_expert_detail(expert_id)
         if not detail:
             raise HTTPException(status_code=404, detail="Defaults config not found")
         return detail
@@ -15869,7 +16160,7 @@ async def get_expert(request: Request, expert_id: str) -> dict[str, Any]:
     if not expert_info:
         raise HTTPException(status_code=404, detail=f"Expert not found: {expert_id}")
 
-    detail = _load_expert_detail(expert_id)
+    detail = await _load_expert_detail(expert_id)
     if not detail:
         raise HTTPException(
             status_code=404, detail=f"Expert config not found: {expert_id}"

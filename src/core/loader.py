@@ -3262,6 +3262,12 @@ def get_phase_system_prompt(
                 expert_identity = resolver.load("persona")
             except FileNotFoundError:
                 expert_identity = ""
+        if expert_identity and config.extra.get("_persona_source") == "db":
+            # Untrusted user persona — fence + subordinate below operator policy
+            # (decision 7), never inject at system altitude.
+            from src.core.expert_resolution import fence_persona
+
+            expert_identity = fence_persona(expert_identity)
 
         # Render Jinja2 conditionals
         cli_ds_interactive = config.extra.get("_cli_datasources", [])
@@ -3297,6 +3303,12 @@ def get_phase_system_prompt(
             expert_identity = resolver.load("persona")
         except FileNotFoundError:
             expert_identity = ""
+    if expert_identity and config.extra.get("_persona_source") == "db":
+        # Untrusted user persona — fence + subordinate below operator policy
+        # (decision 7), never inject at system altitude.
+        from src.core.expert_resolution import fence_persona
+
+        expert_identity = fence_persona(expert_identity)
 
     # Load phase component
     prompt_type_key = prompt_type or ("strategic" if is_strategic else "tactical")
