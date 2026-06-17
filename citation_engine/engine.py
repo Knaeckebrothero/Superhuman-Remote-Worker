@@ -151,7 +151,9 @@ class CitationEngine:
         elif mode == self.POSTGRESQL_MODE:
             self.db_url = os.getenv("CITATION_DB_URL")
             if not self.db_url:
-                log.error("CITATION_DB_URL environment variable not set for multi-agent mode")
+                log.error(
+                    "CITATION_DB_URL environment variable not set for multi-agent mode"
+                )
                 raise ValueError(
                     "CITATION_DB_URL environment variable required for multi-agent mode"
                 )
@@ -179,7 +181,9 @@ class CitationEngine:
             self.llm_api_key = os.getenv("OPENAI_API_KEY", "")
 
         self.reasoning_level = os.getenv("CITATION_REASONING_LEVEL", "high")
-        self.skip_verification = os.getenv("CITATION_SKIP_VERIFICATION", "false").lower() == "true"
+        self.skip_verification = (
+            os.getenv("CITATION_SKIP_VERIFICATION", "false").lower() == "true"
+        )
 
         # Reasoning requirement configuration
         reasoning_config = os.getenv("CITATION_REASONING_REQUIRED", "low")
@@ -287,7 +291,9 @@ class CitationEngine:
 
             self._conn = psycopg2.connect(self.db_url)
             # Use RealDictCursor for dictionary-like row access
-            self._cursor = self._conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            self._cursor = self._conn.cursor(
+                cursor_factory=psycopg2.extras.RealDictCursor
+            )
             log.debug("Connected to PostgreSQL database")
         except ImportError as e:
             log.error("psycopg2 not installed, cannot use multi-agent mode")
@@ -353,7 +359,9 @@ class CitationEngine:
                     else:
                         self._cursor.execute(sql)
 
-                    insert_sql = get_migration_insert(self._db_type, version, description)
+                    insert_sql = get_migration_insert(
+                        self._db_type, version, description
+                    )
                     self._cursor.execute(insert_sql)
                     self._conn.commit()
                     log.info(f"Migration v{version} applied successfully")
@@ -887,11 +895,11 @@ class CitationEngine:
     def _link_source_to_job(self, source_id: int, job_id: str) -> None:
         """Create a job_sources link (idempotent)."""
         if self._db_type == "sqlite":
-            query = "INSERT OR IGNORE INTO job_sources (job_id, source_id) VALUES (?, ?)"
-        else:
             query = (
-                "INSERT INTO job_sources (job_id, source_id) VALUES (%s, %s) ON CONFLICT DO NOTHING"
+                "INSERT OR IGNORE INTO job_sources (job_id, source_id) VALUES (?, ?)"
             )
+        else:
+            query = "INSERT INTO job_sources (job_id, source_id) VALUES (%s, %s) ON CONFLICT DO NOTHING"
 
         self._ensure_connected()
         self._cursor.execute(query, (job_id, source_id))
@@ -934,7 +942,9 @@ class CitationEngine:
             try:
                 with open(file_path, encoding="utf-8") as f:
                     content = f.read()
-                log.debug(f"Read {len(content)} characters from file (unknown extension)")
+                log.debug(
+                    f"Read {len(content)} characters from file (unknown extension)"
+                )
                 return content
             except UnicodeDecodeError as e:
                 log.error(f"Cannot extract text from binary file: {file_path}")
@@ -969,7 +979,9 @@ class CitationEngine:
             doc.close()
 
             content = "\n\n".join(text_parts)
-            log.debug(f"Extracted {len(content)} characters from {len(text_parts)} PDF pages")
+            log.debug(
+                f"Extracted {len(content)} characters from {len(text_parts)} PDF pages"
+            )
             return content
 
         except ImportError as e:
@@ -1024,7 +1036,9 @@ class CitationEngine:
 
         with zipfile.ZipFile(file_path) as zf:
             # Find all word/document*.xml entries
-            doc_entries = sorted(n for n in zf.namelist() if re.match(r"word/document\d*\.xml$", n))
+            doc_entries = sorted(
+                n for n in zf.namelist() if re.match(r"word/document\d*\.xml$", n)
+            )
             if not doc_entries:
                 raise FileNotFoundError(f"No word/document*.xml found in {file_path}")
 
@@ -1109,7 +1123,9 @@ class CitationEngine:
                 "title": soup.title.string if soup.title else None,
             }
 
-            log.debug(f"Fetched {len(text)} characters, title: {metadata.get('title', 'N/A')}")
+            log.debug(
+                f"Fetched {len(text)} characters, title: {metadata.get('title', 'N/A')}"
+            )
             return text, metadata
 
         except ImportError as e:
@@ -1120,7 +1136,9 @@ class CitationEngine:
             ) from e
         except requests.exceptions.HTTPError as e:
             status_code = e.response.status_code if e.response is not None else None
-            log.warning(f"HTTP {status_code} for {url} - registering with metadata only")
+            log.warning(
+                f"HTTP {status_code} for {url} - registering with metadata only"
+            )
             placeholder = (
                 f"[CONTENT NOT ACCESSIBLE] This URL returned HTTP {status_code}. "
                 f"The content could not be fetched automatically. "
@@ -1136,7 +1154,9 @@ class CitationEngine:
             }
             return placeholder, metadata
         except Exception as e:
-            log.warning(f"Failed to fetch URL {url}: {e} - registering with metadata only")
+            log.warning(
+                f"Failed to fetch URL {url}: {e} - registering with metadata only"
+            )
             placeholder = (
                 f"[CONTENT NOT ACCESSIBLE] Failed to fetch this URL: {e}. "
                 f"Use the browser tool to manually download the content from: {url}"
@@ -1428,7 +1448,9 @@ class CitationEngine:
             )
 
         citation_id = self._insert(query, params)
-        log.info(f"Created citation [{citation_id}] for source [{source_id}], pending verification")
+        log.info(
+            f"Created citation [{citation_id}] for source [{source_id}], pending verification"
+        )
 
         # Perform synchronous verification
         verification = self._verify_citation(
@@ -1439,7 +1461,9 @@ class CitationEngine:
         self._update_verification_status(citation_id, verification)
 
         # Build summary note for context window management
-        source_snippet = source.name[:30] + "..." if len(source.name) > 30 else source.name
+        source_snippet = (
+            source.name[:30] + "..." if len(source.name) > 30 else source.name
+        )
         status_icon = "+" if verification.is_verified else "x"
         summary_note = f"Cited {source_snippet} ({locator}) - {status_icon}"
 
@@ -1452,7 +1476,9 @@ class CitationEngine:
             ),
             similarity_score=verification.similarity_score,
             matched_location=verification.matched_location,
-            verification_notes=verification.reasoning if not verification.is_verified else None,
+            verification_notes=verification.reasoning
+            if not verification.is_verified
+            else None,
             summary_note=summary_note,
         )
 
@@ -1935,7 +1961,9 @@ Respond in JSON format."""
 
         return self._row_to_source(results[0])
 
-    def get_citation(self, citation_id: int, job_id: str | None = None) -> Citation | None:
+    def get_citation(
+        self, citation_id: int, job_id: str | None = None
+    ) -> Citation | None:
         """
         Get a citation by ID, optionally verifying job_id ownership.
 
@@ -1971,7 +1999,9 @@ Respond in JSON format."""
 
         return self._row_to_citation(results[0])
 
-    def get_citations_for_source(self, source_id: int, job_id: str | None = None) -> list[Citation]:
+    def get_citations_for_source(
+        self, source_id: int, job_id: str | None = None
+    ) -> list[Citation]:
         """
         Get all citations referencing a source within a job.
 
@@ -2002,7 +2032,9 @@ Respond in JSON format."""
             results = self._query(query, (source_id,))
 
         citations = [self._row_to_citation(row) for row in results]
-        log.debug(f"Found {len(citations)} citations for source [{source_id}], job_id={job_id}")
+        log.debug(
+            f"Found {len(citations)} citations for source [{source_id}], job_id={job_id}"
+        )
         return citations
 
     def get_citations_by_session(self, session_id: str) -> list[Citation]:
@@ -2048,7 +2080,9 @@ Respond in JSON format."""
         if job_id is None and self.context:
             job_id = self.context.session_id
 
-        log.debug(f"Listing sources, job_id={job_id}, type filter: {source_type or 'all'}")
+        log.debug(
+            f"Listing sources, job_id={job_id}, type filter: {source_type or 'all'}"
+        )
 
         conditions = []
         params = []
@@ -2062,7 +2096,9 @@ Respond in JSON format."""
             params.append(source_type)
 
         if job_id is not None:
-            query = "SELECT s.* FROM sources s JOIN job_sources js ON s.id = js.source_id"
+            query = (
+                "SELECT s.* FROM sources s JOIN job_sources js ON s.id = js.source_id"
+            )
         else:
             query = "SELECT s.* FROM sources s"
 
@@ -2170,7 +2206,9 @@ Respond in JSON format."""
 
         matched_location = row.get("matched_location")
         if isinstance(matched_location, str):
-            matched_location = json.loads(matched_location) if matched_location else None
+            matched_location = (
+                json.loads(matched_location) if matched_location else None
+            )
 
         created_at = row.get("created_at")
         if isinstance(created_at, str):
@@ -2184,10 +2222,14 @@ Respond in JSON format."""
             quote_language=row.get("quote_language"),
             relevance_reasoning=row.get("relevance_reasoning"),
             confidence=Confidence(row.get("confidence", "high")),
-            extraction_method=ExtractionMethod(row.get("extraction_method", "direct_quote")),
+            extraction_method=ExtractionMethod(
+                row.get("extraction_method", "direct_quote")
+            ),
             source_id=row["source_id"],
             locator=locator,
-            verification_status=VerificationStatus(row.get("verification_status", "pending")),
+            verification_status=VerificationStatus(
+                row.get("verification_status", "pending")
+            ),
             verification_notes=row.get("verification_notes"),
             similarity_score=row.get("similarity_score"),
             matched_location=matched_location,
@@ -2245,7 +2287,9 @@ Respond in JSON format."""
             if not row:
                 return
 
-            col_type = row[0] if isinstance(row, (tuple, list)) else row.get("format_type", "")
+            col_type = (
+                row[0] if isinstance(row, (tuple, list)) else row.get("format_type", "")
+            )
             match = re.search(r"vector\((\d+)\)", col_type)
             if not match:
                 return  # Untyped vector column, no constraint to fix
@@ -2261,7 +2305,9 @@ Respond in JSON format."""
 
             # Drop HNSW index, clear stale embeddings, alter column
             self._cursor.execute("DROP INDEX IF EXISTS idx_source_embeddings_vector")
-            self._cursor.execute("DELETE FROM source_embeddings WHERE embedding IS NOT NULL")
+            self._cursor.execute(
+                "DELETE FROM source_embeddings WHERE embedding IS NOT NULL"
+            )
             self._cursor.execute(
                 f"ALTER TABLE source_embeddings ALTER COLUMN embedding TYPE vector({expected_dim})"
             )
@@ -2275,7 +2321,9 @@ Respond in JSON format."""
                     "WITH (m = 16, ef_construction = 64)"
                 )
                 self._conn.commit()
-                log.info(f"Vector column migrated to {expected_dim} dimensions (with HNSW index)")
+                log.info(
+                    f"Vector column migrated to {expected_dim} dimensions (with HNSW index)"
+                )
             else:
                 log.info(
                     f"Vector column migrated to {expected_dim} dimensions "
@@ -2354,7 +2402,9 @@ Respond in JSON format."""
         embeddings = service.embed_batch(chunks)
 
         # Insert into source_embeddings
-        for idx, (chunk_text, embedding) in enumerate(zip(chunks, embeddings, strict=False)):
+        for idx, (chunk_text, embedding) in enumerate(
+            zip(chunks, embeddings, strict=False)
+        ):
             embedding_str = "[" + ",".join(str(v) for v in embedding) + "]"
 
             if self._db_type == "sqlite":
@@ -2371,7 +2421,9 @@ Respond in JSON format."""
                     ON CONFLICT (source_id, job_id, chunk_index)
                     DO UPDATE SET chunk_text = EXCLUDED.chunk_text, embedding = EXCLUDED.embedding
                 """
-                self._cursor.execute(query, (source_id, job_id, idx, chunk_text, embedding_str))
+                self._cursor.execute(
+                    query, (source_id, job_id, idx, chunk_text, embedding_str)
+                )
 
         self._conn.commit()
         log.info(f"Embedded source [{source_id}]: {len(chunks)} chunks")
@@ -2463,7 +2515,9 @@ Respond in JSON format."""
             raise ValueError("Search query cannot be empty")
 
         if mode not in ("hybrid", "keyword", "semantic"):
-            raise ValueError(f"Invalid search mode '{mode}'. Use: hybrid, keyword, semantic")
+            raise ValueError(
+                f"Invalid search mode '{mode}'. Use: hybrid, keyword, semantic"
+            )
 
         if scope not in ("content", "annotations", "all"):
             raise ValueError(f"Invalid scope '{scope}'. Use: content, annotations, all")
@@ -2471,7 +2525,9 @@ Respond in JSON format."""
         job_id = self.context.session_id if self.context else None
 
         # Determine what search modes are available
-        can_semantic = self._db_type == "postgresql" and self._get_embedding_service() is not None
+        can_semantic = (
+            self._db_type == "postgresql" and self._get_embedding_service() is not None
+        )
 
         effective_mode = mode
         if mode == "semantic" and not can_semantic:
@@ -2578,7 +2634,9 @@ Respond in JSON format."""
         # Validate source exists and belongs to job
         source = self.get_source(source_id, job_id=job_id)
         if not source:
-            raise ValueError(f"Source [{source_id}] not found or not linked to current job")
+            raise ValueError(
+                f"Source [{source_id}] not found or not linked to current job"
+            )
 
         created_by = None
         if self.context:
@@ -2589,17 +2647,33 @@ Respond in JSON format."""
                 INSERT INTO source_annotations (source_id, job_id, annotation_type, content, page_reference, created_by)
                 VALUES (?, ?, ?, ?, ?, ?)
             """
-            params = (source_id, job_id, ann_type.value, content, page_reference, created_by)
+            params = (
+                source_id,
+                job_id,
+                ann_type.value,
+                content,
+                page_reference,
+                created_by,
+            )
         else:
             query = """
                 INSERT INTO source_annotations (source_id, job_id, annotation_type, content, page_reference, created_by)
                 VALUES (%s, %s, %s, %s, %s, %s)
                 RETURNING id
             """
-            params = (source_id, job_id, ann_type.value, content, page_reference, created_by)
+            params = (
+                source_id,
+                job_id,
+                ann_type.value,
+                content,
+                page_reference,
+                created_by,
+            )
 
         ann_id = self._insert(query, params)
-        log.info(f"Created {ann_type.value} annotation [{ann_id}] on source [{source_id}]")
+        log.info(
+            f"Created {ann_type.value} annotation [{ann_id}] on source [{source_id}]"
+        )
 
         return Annotation(
             id=ann_id,
@@ -2667,16 +2741,16 @@ Respond in JSON format."""
         # Validate source exists and belongs to job
         source = self.get_source(source_id, job_id=job_id)
         if not source:
-            raise ValueError(f"Source [{source_id}] not found or not linked to current job")
+            raise ValueError(
+                f"Source [{source_id}] not found or not linked to current job"
+            )
 
         for tag in tags:
             tag = tag.strip()
             if not tag:
                 continue
             if self._db_type == "sqlite":
-                query = (
-                    "INSERT OR IGNORE INTO source_tags (source_id, job_id, tag) VALUES (?, ?, ?)"
-                )
+                query = "INSERT OR IGNORE INTO source_tags (source_id, job_id, tag) VALUES (?, ?, ?)"
             else:
                 query = "INSERT INTO source_tags (source_id, job_id, tag) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING"
             self._cursor.execute(query, (source_id, job_id, tag))
@@ -2730,13 +2804,9 @@ Respond in JSON format."""
 
         if job_id is not None:
             if self._db_type == "sqlite":
-                query = (
-                    "SELECT tag FROM source_tags WHERE source_id = ? AND job_id = ? ORDER BY tag"
-                )
+                query = "SELECT tag FROM source_tags WHERE source_id = ? AND job_id = ? ORDER BY tag"
             else:
-                query = (
-                    "SELECT tag FROM source_tags WHERE source_id = %s AND job_id = %s ORDER BY tag"
-                )
+                query = "SELECT tag FROM source_tags WHERE source_id = %s AND job_id = %s ORDER BY tag"
             results = self._query(query, (source_id, job_id))
         else:
             if self._db_type == "sqlite":

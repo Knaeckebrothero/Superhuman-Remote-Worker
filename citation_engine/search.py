@@ -66,12 +66,16 @@ def keyword_search(
 
     if scope in ("content", "all"):
         results.extend(
-            _keyword_search_content(cursor, db_type, query, job_id, top_k, source_type, tags)
+            _keyword_search_content(
+                cursor, db_type, query, job_id, top_k, source_type, tags
+            )
         )
 
     if scope in ("annotations", "all"):
         results.extend(
-            _keyword_search_annotations(cursor, db_type, query, job_id, top_k, source_type, tags)
+            _keyword_search_annotations(
+                cursor, db_type, query, job_id, top_k, source_type, tags
+            )
         )
 
     # Deduplicate by (source_id, chunk_text) keeping highest score

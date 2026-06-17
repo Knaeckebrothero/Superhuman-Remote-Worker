@@ -104,7 +104,9 @@ class SemanticChunker:
             try:
                 return self._semantic_chunk(text)
             except Exception as e:
-                log.warning(f"Semantic chunking failed, falling back to fixed-size: {e}")
+                log.warning(
+                    f"Semantic chunking failed, falling back to fixed-size: {e}"
+                )
 
         # Fallback: fixed-size splitting
         return self._fixed_chunk(text)

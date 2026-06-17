@@ -78,7 +78,9 @@ class EmbeddingService:
         max_tokens_per_text: int = 8191,
         timeout: float = 60.0,
     ):
-        base_model = model or os.getenv("CITATION_EMBEDDING_MODEL", "qwen3-embedding-8b")
+        base_model = model or os.getenv(
+            "CITATION_EMBEDDING_MODEL", "qwen3-embedding-8b"
+        )
 
         # Explicit constructor args bypass provider logic (direct instantiation)
         if api_url:
@@ -86,7 +88,9 @@ class EmbeddingService:
             self.model = base_model
             self.api_url = api_url.rstrip("/")
             self.api_key = (
-                api_key or os.getenv("CITATION_EMBEDDING_KEY") or os.getenv("OPENAI_API_KEY")
+                api_key
+                or os.getenv("CITATION_EMBEDDING_KEY")
+                or os.getenv("OPENAI_API_KEY")
             )
         else:
             self.provider = os.getenv("EMBEDDING_PROVIDER", "local").lower()
@@ -94,12 +98,18 @@ class EmbeddingService:
             if self.provider == "openrouter":
                 self.api_key = api_key or os.getenv("OPENROUTER_API_KEY", "")
                 self.api_url = OPENROUTER_API_URL
-                self.model = f"qwen/{base_model}" if "/" not in base_model else base_model
+                self.model = (
+                    f"qwen/{base_model}" if "/" not in base_model else base_model
+                )
             else:
                 # "local" provider (default)
-                self.api_url = os.getenv("CITATION_EMBEDDING_URL") or "https://api.openai.com/v1"
+                self.api_url = (
+                    os.getenv("CITATION_EMBEDDING_URL") or "https://api.openai.com/v1"
+                )
                 self.api_key = (
-                    api_key or os.getenv("CITATION_EMBEDDING_KEY") or os.getenv("OPENAI_API_KEY")
+                    api_key
+                    or os.getenv("CITATION_EMBEDDING_KEY")
+                    or os.getenv("OPENAI_API_KEY")
                 )
                 self.model = base_model
 
@@ -305,19 +315,25 @@ class EmbeddingService:
                     )
                     if self._encoding is not None:
                         tokens = self._encoding.encode(text)
-                        texts[i] = self._encoding.decode(tokens[: self.max_tokens_per_text])
+                        texts[i] = self._encoding.decode(
+                            tokens[: self.max_tokens_per_text]
+                        )
                     else:
                         texts[i] = text[: self.max_tokens_per_text * 2]
 
         batches = self._compute_batches(texts)
-        log.debug(f"Embedding {len(texts)} text(s) in {len(batches)} batch(es) via {url}")
+        log.debug(
+            f"Embedding {len(texts)} text(s) in {len(batches)} batch(es) via {url}"
+        )
 
         results: list[list[float] | None] = [None] * len(texts)
 
         with httpx.Client(timeout=self.timeout) as client:
             for batch_indices in batches:
                 batch_texts = [texts[i] for i in batch_indices]
-                batch_results = self._embed_single_batch(batch_texts, client, url, headers)
+                batch_results = self._embed_single_batch(
+                    batch_texts, client, url, headers
+                )
                 for idx, embedding in zip(batch_indices, batch_results, strict=True):
                     results[idx] = embedding
 

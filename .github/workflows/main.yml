@@ -49,9 +49,9 @@ jobs:
       - name: Install ruff
         run: pip install ruff==0.14.10
       - name: Ruff lint
-        run: ruff check src/ orchestrator/ tests/
+        run: ruff check src/ orchestrator/ citation_engine/ tests/
       - name: Ruff format check
-        run: ruff format --check src/ orchestrator/ tests/
+        run: ruff format --check src/ orchestrator/ citation_engine/ tests/
       - name: Verify Playwright pin consistency
         run: |
           # The agent image has no Playwright; the pin only feeds the
