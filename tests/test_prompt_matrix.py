@@ -110,6 +110,11 @@ class TestDetectReasoningMethod:
         # Unknown → family 'default' → 'api'.
         assert detect_reasoning_method("some-unknown-model") == "api"
 
+    def test_glm_returns_api(self):
+        # GLM-5.2 (OpenRouter) uses the standard reasoning API param; family
+        # 'glm' must fall through to 'api', i.e. NOT be added to the "none" tuple.
+        assert detect_reasoning_method("openrouter/z-ai/glm-5.2") == "api"
+
     def test_explicit_override(self):
         assert (
             detect_reasoning_method("groq/gpt-oss-120b", explicit_method="none")

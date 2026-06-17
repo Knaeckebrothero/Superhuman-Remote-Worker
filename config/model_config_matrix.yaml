@@ -166,6 +166,35 @@ deepseek:
     parallel_tool_calls: false  # DeepSeek parallel tool calls remain unreliable
     model_max_context_tokens: 1000000  # V4 Pro + Flash: 1M context (was 64K on V3/R1)
 
+# Zhipu GLM-5.2 (released 2026-06-13) — text-only hybrid reasoning model,
+# 744B-MoE / ~40B-active, with a usable 1M-token context window, served
+# OpenAI-compatible via OpenRouter (LangChain ChatOpenAI). Closest analogue is
+# `deepseek`: standard parens-form tool wire, reasoning returned out-of-band and
+# captured by src/llm/reasoning_chat.py. Reasoning EFFORT rides on the per-model
+# catalog row (reasoning_level → OpenRouter `reasoning.effort`), NOT here. Vision
+# is a separate model (GLM-5V-Turbo), so this family is text-only.
+#
+# Prompts: forks the worker scaffold (`systemprompt`), the persistent-chat
+# scaffold (`systemprompt_interactive`), and the identity (`persona`). The phase
+# prompts (`strategic`/`tactical`/`summarization`) and `instructions` inherit
+# `default` — they are model-agnostic and GLM's tool wire is the standard
+# parens-form, so a fork would add maintenance with no benefit. Aux-path prompts
+# (memory_*, curation) are NOT forked: GLM is a chat/worker model, not the
+# auxiliary model.
+glm:
+  prompts:
+    systemprompt: systemprompt_glm.txt
+    systemprompt_interactive: systemprompt_interactive_glm.txt
+    persona: persona_glm.txt
+  guardrails:
+    file: glm.yaml
+  settings:
+    temperature: 1.0           # Z.ai published default for GLM-5.2 (thinking on by default)
+    top_p: 0.95                # Z.ai published default
+    multimodal: false          # text-only; vision is the separate GLM-5V-Turbo
+    parallel_tool_calls: false # brand-new model — start safe, flip to true once validated
+    model_max_context_tokens: 1000000  # usable 1M-token window
+
 gemini:
   settings:
     top_p: 0.95
