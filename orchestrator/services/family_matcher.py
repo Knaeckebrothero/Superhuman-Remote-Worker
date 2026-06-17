@@ -65,6 +65,7 @@ _FAMILY_RULES: list[tuple[re.Pattern, str | Callable[[re.Match], FamilyDetection
     (re.compile(r"minimax[-_]?m3", re.IGNORECASE), "minimax-m3"),
     (re.compile(r"minimax", re.IGNORECASE), "minimax"),
     (re.compile(r"deepseek", re.IGNORECASE), "deepseek"),
+    (re.compile(r"glm", re.IGNORECASE), "glm"),
     (re.compile(r"kimi", re.IGNORECASE), "default"),
     # Embeddings
     (re.compile(r"text-embedding", re.IGNORECASE), "openai-embedding"),
