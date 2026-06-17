@@ -1,4 +1,59 @@
 {
+  "toolCard": {
+    "sections": {
+      "result": "Result",
+      "error": "Error"
+    },
+    "status": {
+      "pending": "pending",
+      "running": "running",
+      "ok": "completed",
+      "error": "error",
+      "denied": "denied"
+    },
+    "diff": {
+      "replace": "diff",
+      "append": "appended",
+      "prepend": "prepended",
+      "write": "written",
+      "truncated": "+{{count}} more lines"
+    },
+    "showMore": "Show {{count}} more lines",
+    "showLess": "Show less",
+    "previewNote": "preview · {{size}} total",
+    "titles": {
+      "read_file": "Read file",
+      "write_file": "Write file",
+      "edit_file": "Edit file",
+      "list_files": "List files",
+      "search_files": "Search files",
+      "file_exists": "Check file",
+      "delete_file": "Delete file",
+      "move_file": "Move file",
+      "get_document_info": "Inspect document",
+      "run_command": "Execute command",
+      "shell_execute": "Execute command",
+      "shell_read": "Read output",
+      "git_log": "View git history",
+      "git_show": "View commit",
+      "git_diff": "Compare changes",
+      "git_status": "Check git status",
+      "web_search": "Search the web",
+      "extract_webpage": "Extract page",
+      "browse_website": "Browse website",
+      "search_papers": "Search papers",
+      "kb_write": "Write to knowledge base",
+      "kb_read": "Read knowledge",
+      "kb_search": "Search knowledge",
+      "next_phase_todos": "Plan next phase",
+      "todo_complete": "Complete todo",
+      "cite_document": "Cite document",
+      "send_message": "Send message",
+      "delegate_work": "Delegate work",
+      "job_complete": "Complete job",
+      "mark_complete": "Mark complete"
+    }
+  },
   "common": {
     "save": "Save",
     "saving": "Saving...",

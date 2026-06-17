@@ -41,7 +41,8 @@ import {
     Turn,
     TurnEvent,
 } from '../../core/models/turn.model';
-import {DiffLine, lineDiff} from '../../core/util/line-diff';
+import {ToolCardView} from '../../core/models/tool-card.model';
+import {toolCardViewFromEvent} from '../../core/tools/tool-card-adapters';
 import {ApiService, IdeSessionStatus} from '../../core/services/api.service';
 import {ModelService} from '../../core/services/model.service';
 import {I18nService} from '../../core/services/i18n.service';
@@ -58,6 +59,7 @@ import {AppBadgeComponent} from '../../ui/badge';
 import {AppSelectComponent} from '../../ui/select';
 import {AppIconComponent} from '../../ui/icon';
 import {AppDialogComponent} from '../../ui/dialog';
+import {AppToolCardComponent} from '../../ui/tool-card';
 import {AppToastService} from '../../ui/toast';
 import {ErrorMessageService} from '../../core/services/error-message.service';
 
@@ -358,16 +360,6 @@ export function shouldFoldToolRun(
     return !toolCallsExpanded && toolCount >= threshold;
 }
 
-/** Structured diff/content view for a file-mutating tool card (#7). */
-interface FileEditView {
-    path: string;
-    /** Drives the header label + icon: 'replace' renders a true diff;
-     *  the rest are all-additions (no "before" is available). */
-    mode: 'replace' | 'append' | 'prepend' | 'write';
-    lines: DiffLine[];
-    /** Lines dropped by the render cap, if any (shown as a "+N more" footer). */
-    truncated: number;
-}
 
 @Component({
     selector: 'app-persistent-chat',
@@ -386,6 +378,7 @@ interface FileEditView {
         AppSelectComponent,
         AppIconComponent,
         AppDialogComponent,
+        AppToolCardComponent,
     ],
     template: `
     <div class="chat-container"
@@ -612,53 +605,7 @@ interface FileEditView {
       <ng-template #toolDetails let-tools>
         <div class="tool-detail-list">
           @for (tc of tools; track tc.id) {
-            <details class="tool-card" [class.has-decision]="!!tc.decision" [class.tool-error]="tc.status === 'error'" [attr.open]="(tc.status === 'denied' || tc.status === 'error') ? '' : null">
-              <summary class="tool-head">
-                <app-icon size="sm" class="tool-icon">{{ toolIcon(tc.tool) }}</app-icon>
-                <!-- Approval is only surfaced for denials; an approved call
-                     renders identically to an auto-accepted / autonomous one. -->
-                @if (tc.decision === 'denied') {
-                  <span class="approval-badge approval-denied">
-                    <app-icon size="sm" class="approval-badge-icon">block</app-icon>
-                    {{ 'chat.approval.badge.denied' | transloco }}
-                  </span>
-                }
-                <span class="tool-name">{{ tc.tool }}</span>
-                @if (formatToolArgs(tc.args); as a) {
-                  <span class="tool-args">({{ a }})</span>
-                }
-                <span class="tool-status" [class]="'status-' + tc.status">
-                  <app-icon size="sm" class="tool-status-icon">{{ statusIcon(tc.status) }}</app-icon>
-                  {{ translateStatus(tc.status) }}
-                </span>
-              </summary>
-              @if (fileEditView(tc); as fev) {
-                <!-- #7: diff/content view for edit_file/write_file, built from
-                     the call args. 'replace' is a true old→new diff; the rest
-                     are all-additions (no "before" available). -->
-                <div class="tool-body tool-diff">
-                  <div class="diff-head">
-                    <app-icon size="sm" class="diff-mode-icon">{{ fev.mode === 'write' ? 'note_add' : 'difference' }}</app-icon>
-                    <span class="diff-mode">{{ ('chat.diff.' + fev.mode) | transloco }}</span>
-                    @if (fev.path) {
-                      <span class="diff-path">{{ fev.path }}</span>
-                    }
-                  </div>
-                  <div class="diff-body">
-                    @for (ln of fev.lines; track $index) {
-                      <div class="diff-line" [class.add]="ln.type === 'add'" [class.del]="ln.type === 'del'">
-                        <span class="diff-sign">{{ diffSign(ln.type) }}</span><span class="diff-text">{{ ln.text }}</span>
-                      </div>
-                    }
-                  </div>
-                  @if (fev.truncated > 0) {
-                    <div class="diff-truncated">{{ 'chat.diff.truncated' | transloco:{count: fev.truncated} }}</div>
-                  }
-                </div>
-              } @else if (tc.result) {
-                <div class="tool-body"><pre class="tool-result">{{ tc.result }}</pre></div>
-              }
-            </details>
+            <app-tool-card [view]="toolView(tc)" />
           }
         </div>
       </ng-template>
@@ -2709,8 +2656,11 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     private collapseCodeBlocks(): void {
         const container = this.messagesContainer?.nativeElement;
         if (!container) return;
+        // Exclude <app-tool-card> internals (.tc__result / .tc__code): those are
+        // structured UI with their own overflow + copy handling, not markdown
+        // code blocks. Without this they'd be double-wrapped in a code-collapse.
         const blocks = container.querySelectorAll<HTMLPreElement>(
-            '.message-body pre:not([data-collapsed])',
+            '.message-body pre:not([data-collapsed]):not(.tc__result):not(.tc__code)',
         );
         for (const pre of Array.from(blocks)) {
             pre.setAttribute('data-collapsed', '');
@@ -2734,8 +2684,10 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     private addCopyButtons(): void {
         const container = this.messagesContainer?.nativeElement;
         if (!container) return;
+        // Tool-card pres carry their own copy button — skip them here (see
+        // collapseCodeBlocks for the same exclusion rationale).
         const blocks = container.querySelectorAll<HTMLPreElement>(
-            '.message-body pre:not([data-copy-btn])',
+            '.message-body pre:not([data-copy-btn]):not(.tc__result):not(.tc__code)',
         );
         for (const pre of Array.from(blocks)) {
             pre.setAttribute('data-copy-btn', '');
@@ -2811,6 +2763,22 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
      * Folds only long runs, and only while the user hasn't opted into the
      * always-inline "Tool calls → Expanded" display preference.
      */
+    /**
+     * Render-ready view-model for a tool call, memoized per event object so the
+     * shared <app-tool-card> keeps a stable input identity (OnPush) across
+     * change-detection cycles. The reducer recreates the event object on every
+     * update, so the WeakMap key naturally invalidates when the call changes.
+     */
+    private readonly toolViewCache = new WeakMap<ToolCallEvent, ToolCardView>();
+
+    toolView(tc: ToolCallEvent): ToolCardView {
+        const cached = this.toolViewCache.get(tc);
+        if (cached) return cached;
+        const view = toolCardViewFromEvent(tc);
+        this.toolViewCache.set(tc, view);
+        return view;
+    }
+
     foldToolRun(tools: ToolCallEvent[]): boolean {
         return shouldFoldToolRun(
             tools.length,
@@ -2857,53 +2825,6 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         if (c.tools > 0) return this.transloco.translate('chat.turn.toolCount', {count: c.tools});
         if (c.thoughts > 0) return this.transloco.translate('chat.turn.thoughtCount', {count: c.thoughts});
         return this.transloco.translate('chat.turn.collapsedEmpty');
-    }
-
-    /** Render cap for a single diff card — bounds DOM for huge write_file bodies. */
-    private readonly DIFF_LINE_CAP = 400;
-
-    /**
-     * Diff/content view for an edit_file / write_file tool card (#7), built
-     * straight from the call args (no backend round-trip): edit_file replace
-     * carries old_string→new_string so we show a real diff; append/prepend/
-     * write have no "before" and render as all-additions. Returns null for any
-     * other tool, and for failed calls (so the error message shows instead of a
-     * diff that never applied).
-     */
-    fileEditView(tc: ToolCallEvent): FileEditView | null {
-        if (tc.status === 'error') return null;
-        const args = tc.args || {};
-        const str = (k: string): string => (typeof args[k] === 'string' ? (args[k] as string) : '');
-        const path = str('path');
-        let mode: FileEditView['mode'];
-        let lines: DiffLine[];
-        if (tc.tool === 'write_file') {
-            mode = 'write';
-            lines = lineDiff('', str('content'));
-        } else if (tc.tool === 'edit_file') {
-            const position = str('position');
-            if (position === 'end') {
-                mode = 'append';
-                lines = lineDiff('', str('new_string'));
-            } else if (position === 'start') {
-                mode = 'prepend';
-                lines = lineDiff('', str('new_string'));
-            } else {
-                mode = 'replace';
-                lines = lineDiff(str('old_string'), str('new_string'));
-            }
-        } else {
-            return null;
-        }
-        if (lines.length === 0) return null;
-        const truncated = Math.max(0, lines.length - this.DIFF_LINE_CAP);
-        if (truncated > 0) lines = lines.slice(0, this.DIFF_LINE_CAP);
-        return {path, mode, lines, truncated};
-    }
-
-    /** Gutter sign for a diff line. */
-    diffSign(type: DiffLine['type']): string {
-        return type === 'add' ? '+' : type === 'del' ? '-' : ' ';
     }
 
     /**
@@ -3058,24 +2979,6 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         return Array.from(groups.entries())
             .map(([label, count]) => count > 1 ? `${label} x${count}` : label)
             .join(', ');
-    }
-
-    translateStatus(status: string): string {
-        this.i18n.activeLang();
-        const key = `chat.tools.status${status.charAt(0).toUpperCase()}${status.slice(1)}`;
-        const translated = this.transloco.translate(key);
-        return translated !== key ? translated : status;
-    }
-
-    statusIcon(status: string): string {
-        switch (status) {
-            case 'completed': return 'check_circle';
-            case 'running': return 'progress_activity';
-            case 'denied': return 'block';
-            case 'pending': return 'radio_button_unchecked';
-            case 'error': return 'error';
-            default: return 'help';
-        }
     }
 
     toolSummaryLabel(calls: ToolCallInfo[]): string {
