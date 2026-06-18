@@ -49,7 +49,7 @@ points + `_attach_session`), `src/api/models.py` (`JobStartRequest.resolved_conf
 **Modify (cockpit):** `views/create/job-create.component.ts`,
 `views/session-create/session-create.component.ts`, `core/models/api.model.ts`.
 
-**Modify (docs):** `docs/features/global_expert_management.md` (supersede Decision 6).
+**Modify (docs):** `docs/done/global_expert_management.md` (supersede Decision 6).
 
 ---
 
@@ -379,7 +379,7 @@ def from_resolved(cls, blob: dict, postgres_conn: Optional[Any] = None) -> "Univ
 
 ### Task 11: Flag default + vault supersession
 
-**Files:** `helm/values.yaml` (already `expertsDbEnabled: "false"`), `docs/features/global_expert_management.md`
+**Files:** `helm/values.yaml` (already `expertsDbEnabled: "false"`), `docs/done/global_expert_management.md`
 
 - [ ] **Step 1:** Confirm `EXPERTS_DB_ENABLED` gates resolution (orchestrator: resolve only when on; agent: blob-presence drives hydrate). Dev on / prod off.
 - [ ] **Step 2:** Edit `global_expert_management.md`: mark **Decision 6 superseded** by orchestrator-resolution; link this plan + the spec.

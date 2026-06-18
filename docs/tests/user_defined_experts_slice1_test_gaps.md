@@ -5,7 +5,7 @@
 T1–T6 procedures). This doc is the **inventory** of everything still untested or
 unverified, so post-compaction work can resume without rediscovery.
 
-Feature: `docs/features/global_expert_management.md` ·
+Feature: `docs/done/global_expert_management.md` ·
 Plan/status: `docs/superpowers/plans/2026-06-15-user-defined-experts-slice-1.md`
 (see the "CURRENT STATE" callout at the top).
 

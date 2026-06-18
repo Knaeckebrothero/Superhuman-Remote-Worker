@@ -3,7 +3,7 @@
 framework imports — hermetically unit-testable (the security boundary). Async DB
 glue is in orchestrator/services/grants_service.py.
 
-Spec: docs/features/global_expert_management.md (decisions 8, 9, 19, 21-23).
+Spec: docs/done/global_expert_management.md (decisions 8, 9, 19, 21-23).
 Restrict-only (decision 22): a more-specific scope may only narrow an inherited
 value. Deny-by-default for security keys; existing users grandfathered by the
 0030 migration backfill (shell_tools, delegation)."""
