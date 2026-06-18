@@ -16674,23 +16674,33 @@ def _bundled_skill_bundle(skill_name: str) -> dict[str, Any] | None:
 
 
 async def _create_forked_skill(
-    src: dict[str, Any], owner_id: str, suffix: str = "copy"
+    src: dict[str, Any],
+    owner_id: str,
+    suffix: str = "copy",
+    *,
+    prefer_original: bool = False,
 ) -> dict[str, Any]:
-    """Create an owned skill from a source dict, suffixing the slug on collision
-    and rewriting the copy's SKILL.md 'name' to match (mirrors _create_forked_expert)."""
+    """Create an owned skill from a source dict. ``prefer_original`` (import) tries
+    the source name first and only suffixes on collision, storing the SKILL.md
+    verbatim so a clean import->export round-trips byte-for-byte; duplicate always
+    suffixes ``-copy``. The SKILL.md 'name' is rewritten only when the slug changes."""
     from src.core.skill_format import set_skill_name
 
     base_name = src["name"]
-    for attempt in range(6):
-        name = (
-            f"{base_name}-{suffix}" if attempt == 0 else f"{base_name}-{suffix}-{attempt}"
-        )[:100]
+    candidates = [base_name] if prefer_original else []
+    candidates.append(f"{base_name}-{suffix}")
+    candidates += [f"{base_name}-{suffix}-{i}" for i in range(2, 8)]
+    for cand in candidates:
+        name = cand[:100]
+        renamed = name != base_name
         files = dict(src["files"])
-        files["SKILL.md"] = set_skill_name(src["files"]["SKILL.md"], name)
+        if renamed:
+            files["SKILL.md"] = set_skill_name(src["files"]["SKILL.md"], name)
+        display = f"{src['display_name']} ({suffix})" if renamed else src["display_name"]
         try:
             return await postgres_db.create_skill(
                 name=name,
-                display_name=f"{src['display_name']} ({suffix})"[:200],
+                display_name=display[:200],
                 description=src.get("description"),
                 icon=src.get("icon", "extension"),
                 color=src.get("color", "#6B7280"),
@@ -17085,6 +17095,73 @@ async def delete_skill(request: Request, skill_id: str) -> dict[str, Any]:
         )
     await postgres_db.delete_skill(skill_id)
     return {"deleted": True}
+
+
+@app.post("/api/skills/{skill_id}/duplicate")
+async def duplicate_skill(request: Request, skill_id: str) -> dict[str, Any]:
+    """Fork any visible skill (bundled or DB) into an owned copy."""
+    _require_skills_db()
+    user = await require_approved_user(request, postgres_db)
+    if _looks_like_uuid(skill_id):
+        row = await postgres_db.get_skill_by_id(skill_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="Skill not found")
+        src = {
+            **_skill_row_to_meta(row),
+            "files": await postgres_db.get_skill_files(skill_id),
+        }
+    else:
+        src = _bundled_skill_bundle(skill_id)
+        if not src:
+            raise HTTPException(status_code=404, detail="Skill not found")
+    return await _create_forked_skill(src, str(user["id"]))
+
+
+@app.get("/api/skills/{skill_id}/export")
+async def export_skill(request: Request, skill_id: str) -> Response:
+    """Serialize a skill to a native zipped directory (drops into .claude/skills)."""
+    from src.core.skill_format import pack_skill_zip
+
+    _require_skills_db()
+    await require_approved_user(request, postgres_db)
+    if _looks_like_uuid(skill_id):
+        row = await postgres_db.get_skill_by_id(skill_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="Skill not found")
+        name, files = row["name"], await postgres_db.get_skill_files(skill_id)
+    else:
+        bundle = _bundled_skill_bundle(skill_id)
+        if not bundle:
+            raise HTTPException(status_code=404, detail="Skill not found")
+        name, files = bundle["name"], bundle["files"]
+    return Response(
+        content=pack_skill_zip(name, files),
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{name}.zip"'},
+    )
+
+
+@app.post("/api/skills/import")
+async def import_skill(request: Request, file: UploadFile = File(...)) -> dict[str, Any]:
+    """Create an owned skill from an uploaded skill zip (fork-on-name-collision)."""
+    from src.core.skill_format import SkillFormatError, unpack_skill_zip
+
+    _require_skills_db()
+    user = await require_approved_user(request, postgres_db)
+    try:
+        files = unpack_skill_zip(await file.read())
+    except SkillFormatError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+    name, description, files = _parse_skill_bundle(files)
+    src = {
+        "name": name,
+        "display_name": name.replace("-", " ").title(),
+        "description": description,
+        "files": files,
+    }
+    return await _create_forked_skill(
+        src, str(user["id"]), suffix="import", prefer_original=True
+    )
 
 
 # =============================================================================
