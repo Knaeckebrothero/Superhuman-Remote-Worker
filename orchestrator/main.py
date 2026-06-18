@@ -16696,7 +16696,9 @@ async def _create_forked_skill(
         files = dict(src["files"])
         if renamed:
             files["SKILL.md"] = set_skill_name(src["files"]["SKILL.md"], name)
-        display = f"{src['display_name']} ({suffix})" if renamed else src["display_name"]
+        display = (
+            f"{src['display_name']} ({suffix})" if renamed else src["display_name"]
+        )
         try:
             return await postgres_db.create_skill(
                 name=name,
@@ -17062,7 +17064,9 @@ async def update_skill(
     if not existing:
         raise HTTPException(status_code=404, detail="Skill not found")
     if str(existing["owner_id"]) != str(user["id"]) and not user.get("is_admin"):
-        raise HTTPException(status_code=403, detail="Only the owner may edit this skill")
+        raise HTTPException(
+            status_code=403, detail="Only the owner may edit this skill"
+        )
     fields = body.model_dump(exclude_unset=True, exclude={"files"})
     files = body.files
     if files is not None:
@@ -17142,7 +17146,9 @@ async def export_skill(request: Request, skill_id: str) -> Response:
 
 
 @app.post("/api/skills/import")
-async def import_skill(request: Request, file: UploadFile = File(...)) -> dict[str, Any]:
+async def import_skill(
+    request: Request, file: UploadFile = File(...)
+) -> dict[str, Any]:
     """Create an owned skill from an uploaded skill zip (fork-on-name-collision)."""
     from src.core.skill_format import SkillFormatError, unpack_skill_zip
 
