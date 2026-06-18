@@ -49,21 +49,32 @@ aliases:
 422 credential-deny → update/version-bump → export → duplicate → delete, with `source=user`
 tagging; self-cleaned). **Slice 3 (Cockpit)** shipped: the Experts page (list, type/source filters,
 badges, row actions), the type-aware **create/edit editor** (identity + persona/instructions +
-editable raw `config`-fragment JSON — structured tool-toggle widget deferred to a fast-follow),
+a **structured config editor** reusing the launch-flow groups — execution, model select, tool toggles, advanced-accordion — over a raw-JSON flap for unmanaged keys),
 delete-confirm with 409-blocker surfacing, and duplicate/export/import + nav + i18n (en full;
 de-DE nav only, page strings fall back to en). Agent-side expert resolution
 (`_apply_db_expert` / `ExpertsNamespace`) was **deleted** — resolution is orchestrator-only
 (`services/config_resolver.py`). Tests: backend 46 + cockpit 579 green; ruff/tsc/ng-build clean.
 **Still deferred:** Slice 2 (grants/enforcement + `/api/users/me/capabilities` + control greying),
-project-link/`default_for` UI, test-drive, version/stats panels, the structured tool-toggle widget,
-de-DE page translations. Plan: `docs/superpowers/plans/2026-06-17-expert-crud-ui.md`. **Browser-verified**
+project-link/`default_for` UI, test-drive, version/stats panels, per-tool curation
+(the tool toggles are category-level), de-DE page translations. Plan: `docs/superpowers/plans/2026-06-17-expert-crud-ui.md`. **Browser-verified**
 (Playwright, dev `test` user): `/experts/new` renders, auto-slug works (`Research Helper 2026` →
 `research-helper-2026`), 0 console errors. A dark-on-dark contrast bug (a hardcoded `--surface-color`
 fallback) was caught in the walkthrough and fixed by switching the editor/list styles to the real theme
 tokens (`--panel-bg`/`--text-primary`/`--border-color`/`--danger-tint`…). The experts view is also
 registered in the debug-grid `ComponentRegistryService` (separate hand-maintained registry, not
-route-derived). The editor's config surface is an editable raw `config`-JSON textarea (the structured
-`app-tools-group` widget is the fast-follow).
+route-derived).
+
+**Structured config editor (2026-06-17, browser-verified):** the editor's config surface is now
+**fully structured** — it reuses the launch-flow `execution-group` / `tools-group` /
+`advanced-accordion` (+ a plain model select; `model-group` was deliberately NOT reused because it
+mutates the user's *global* default-model prefs via `settingsService`) over a raw-JSON "Advanced
+(other keys)" flap for the unmanaged tail (`instruction_files`, etc.). The split/merge round-trips
+losslessly (create → save → edit), verified live: e.g. disabling the Shell tool + picking a model +
+autonomy=full + a raw-flap `instruction_files` key persists as exactly
+`{tools:{shell:[]}, llm:{strategic:{model}}, autonomy:'full', instruction_files:[…]}` and prefills
+back correctly. Helpers `deepMergeConfig`/`pickKeys`/`omitKeys` (`agent-settings/config-merge.ts`) +
+`MANAGED_CONFIG_KEYS`/`splitExpertConfig`/`assembleExpertConfig` (`views/experts/expert-config.ts`),
+18 new unit tests. Tool toggles are category-level (per-tool curation is the remaining fast-follow).
 
 **Earlier status (Slice 1, 2026-06-15):** Orchestrator side
 verified on dev k3d (CRUD, list/detail, export/import, `expert_id` plumbing,
@@ -372,6 +383,11 @@ MCP server gains the matching tools (`create_expert`, `update_expert`,
 
 ## Cockpit UI
 
+> ✅ **Implemented (2026-06-17)** — see the Status block at the top + the "Structured config editor"
+> note. The sketch below is the original design; the as-built editor went **fully structured** (it reuses
+> the agent-settings execution/model/tools/advanced groups over a raw-JSON flap) rather than the
+> "deliberately small" raw-fragment v1 surface described here, and grant-greying awaits Slice 2.
+
 **Experts page** (nav slot + layout pattern: the datasources tab). List with
 type/source filters; bundled experts badged + read-only with "Duplicate to
 customize"; shadowing experts badged ("overrides built-in *scholar* for you").
@@ -454,7 +470,11 @@ intersection with the invoker).
 
 ## Slices (each independently shippable)
 
-### Slice 1 — Table + resolution + selection end-to-end
+### Slice 1 — Table + resolution + selection end-to-end · ✅ SHIPPED
+> Write-CRUD was clobbered by `6f8c635e` and **restored 2026-06-17**, live-verified on k3d.
+> Creation is **open to all approved users** (not admin-gated); per-user grants are Slice 2.
+> Resolution moved entirely orchestrator-side (`config_resolver.py`) — supersedes the agent-side
+> "Agent:" bullet below (the `_apply_db_expert`/`ExpertsNamespace` path was deleted).
 - Migration `0028` (experts, project_experts, `jobs.expert_id`).
 - CRUD + duplicate + **import/export** endpoints (no grants yet — hard-deny list
   only; creation admin-gated until S2 if we want belt-and-braces). Import routes
@@ -477,7 +497,7 @@ intersection with the invoker).
   bundled experts unaffected with the flag off; an exported expert re-imports as
   a new owned row and runs.
 
-### Slice 2 — Grants + enforcement
+### Slice 2 — Grants + enforcement · ⬜ NOT STARTED (highest-value next step)
 - Migration `0029` + catalog + grants service (user → project → global → default).
 - Save-time 422; dispatch-time reject on the merged stack (incl.
   `persistent_agent`); admin bypass; `system_settings['user_experts']`
@@ -493,7 +513,14 @@ intersection with the invoker).
   innocuous layers caught at dispatch; `null`-deletion of a base guardrail caught;
   a user-scope grant exceeding a project ceiling refused (restrict-only).
 
-### Slice 3 — Cockpit
+### Slice 3 — Cockpit · 🟡 MOSTLY SHIPPED (2026-06-17, browser-verified)
+> **Done:** Experts page (list, type/source filters, badges, row actions), the type-aware
+> **create/edit/duplicate/delete** editor — fully **structured** (execution/model/tools/advanced groups
+> reused from agent-settings + a raw-JSON flap for unmanaged keys), import/export, id-based
+> type-filtered picker integration in job/session create, nav + i18n.
+> **Not yet:** grant-greyed ungated controls (needs the Slice-2 `/api/users/me/capabilities`),
+> grant-fed model narrowing, the project-settings link/`default_for` section, and per-tool tool
+> curation (the tool toggles are category-level).
 - Experts page (list/create/edit/fork/delete), type-aware editor, greyed
   ungated controls fed by `/api/users/me/capabilities`, grant-fed model picker,
   picker integration (id-based, type-filtered, badges), project settings
@@ -506,7 +533,7 @@ intersection with the invoker).
   opens read-only with working fork; session-create shows only session
   experts; ungated controls visibly disabled, not hidden.
 
-### Slice 4 — Iteration polish
+### Slice 4 — Iteration polish · ⬜ NOT STARTED
 - Version counter surfaced + `updated_by`; test-drive button; per-expert
   outcome stats on the detail page (success rate / avg phases from `jobs`
   by `expert_id`; cost column once the [[observability_and_quotas]] ledger

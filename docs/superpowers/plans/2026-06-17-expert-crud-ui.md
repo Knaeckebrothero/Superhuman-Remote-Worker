@@ -20,6 +20,14 @@ All 10 tasks implemented, tested, and verified live on dev k3d (including a brow
 **Uncommitted on `develop`** — owner commits. Backend **46** pytest + Cockpit **579** vitest green;
 `ruff` + `tsc` + `ng build` (AOT template check) clean.
 
+**Follow-up (same day) — structured config editor:** the raw-JSON-only config surface (as-built #2
+below) was replaced with a fully **structured editor** reusing the launch-flow
+`execution-group`/`tools-group`/`advanced-accordion` + a plain model select, over a raw-JSON flap for
+the unmanaged tail. `model-group` was NOT reused (it mutates the user's global default-model prefs).
+Browser-verified round-trip. Helpers: `agent-settings/config-merge.ts` + `views/experts/expert-config.ts`
+(`MANAGED_CONFIG_KEYS`/`splitExpertConfig`/`assembleExpertConfig`), 18 new unit tests. See
+`docs/features/global_expert_management.md` ("Structured config editor").
+
 **Verified live:**
 - **Backend** (k3d, MCP-header auth): create → 409 dup-name → 422 credential-deny →
   update/version-bump → export(no creds) → duplicate → delete; `source=user`; self-cleaned.
