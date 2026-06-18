@@ -18,6 +18,10 @@ import {
     ExpertCreateRequest,
     ExpertDetail,
     ExpertUpdateRequest,
+    Skill,
+    SkillCreateRequest,
+    SkillDetail,
+    SkillUpdateRequest,
     Job,
     JobAcceptConflict,
     JobAcceptOutcome,
@@ -527,6 +531,56 @@ export class ApiService {
    */
   importExpert(body: ExpertCreateRequest): Observable<ExpertDetail> {
     return this.http.post<ExpertDetail>(`${this.baseUrl}/experts/import`, body);
+  }
+
+  // ===== Skill Endpoints (Agent Skills) =====
+
+  /** List skills (bundled + DB-backed). Fails gracefully to []. */
+  getSkills(): Observable<Skill[]> {
+    return this.http
+      .get<Skill[]>(`${this.baseUrl}/skills`)
+      .pipe(catchError(() => of([])));
+  }
+
+  /** Full skill detail incl. the file tree. */
+  getSkillDetail(id: string): Observable<SkillDetail | null> {
+    return this.http
+      .get<SkillDetail>(`${this.baseUrl}/skills/${id}`)
+      .pipe(catchError(() => of(null)));
+  }
+
+  /** Create a DB skill. Errors propagate (409 name collision / 422 malformed). */
+  createSkill(body: SkillCreateRequest): Observable<SkillDetail> {
+    return this.http.post<SkillDetail>(`${this.baseUrl}/skills`, body);
+  }
+
+  /** Update an owned DB skill. Bumps version. */
+  updateSkill(id: string, body: SkillUpdateRequest): Observable<SkillDetail> {
+    return this.http.put<SkillDetail>(`${this.baseUrl}/skills/${id}`, body);
+  }
+
+  /** Delete an owned DB skill. */
+  deleteSkill(id: string): Observable<{deleted: boolean}> {
+    return this.http.delete<{deleted: boolean}>(`${this.baseUrl}/skills/${id}`);
+  }
+
+  /** Fork any visible skill into an owned copy. */
+  duplicateSkill(id: string): Observable<SkillDetail> {
+    return this.http.post<SkillDetail>(`${this.baseUrl}/skills/${id}/duplicate`, {});
+  }
+
+  /** Download a skill as a native zip (drops into .claude/skills). */
+  exportSkill(id: string): Observable<Blob> {
+    return this.http.get(`${this.baseUrl}/skills/${id}/export`, {
+      responseType: 'blob',
+    });
+  }
+
+  /** Import a skill from an uploaded zip (fork-on-collision). */
+  importSkill(file: File): Observable<SkillDetail> {
+    const fd = new FormData();
+    fd.append('file', file);
+    return this.http.post<SkillDetail>(`${this.baseUrl}/skills/import`, fd);
   }
 
   // ===== Agent Management Endpoints =====
