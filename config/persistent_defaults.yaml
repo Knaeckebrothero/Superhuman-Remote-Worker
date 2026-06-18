@@ -39,6 +39,7 @@ tools:
     - read_file
     - write_file
     - edit_file
+    - use_skill
     - list_files
     - delete_file
     - search_files
