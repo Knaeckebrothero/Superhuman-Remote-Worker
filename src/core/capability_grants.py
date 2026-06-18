@@ -7,6 +7,7 @@ Spec: docs/features/global_expert_management.md (decisions 8, 9, 19, 21-23).
 Restrict-only (decision 22): a more-specific scope may only narrow an inherited
 value. Deny-by-default for security keys; existing users grandfathered by the
 0030 migration backfill (shell_tools, delegation)."""
+
 from __future__ import annotations
 
 from typing import Any
@@ -15,16 +16,24 @@ _AUTONOMY_ORDER = ["dependent", "guided", "partial", "review", "full"]
 _PERMISSION_ORDER = ["supervised", "auto_accept", "autonomous"]
 
 CATALOG: dict[str, dict[str, Any]] = {
-    "vm_workspace":     {"type": "bool", "default": False, "restrict_only": True},
-    "shell_tools":      {"type": "bool", "default": False, "restrict_only": True},
-    "delegation":       {"type": "bool", "default": False, "restrict_only": True},
-    "datasource_tools": {"type": "bool", "default": True,  "restrict_only": True},
-    "browser":          {"type": "bool", "default": True,  "restrict_only": True},
-    "model_selection":  {"type": "list", "default": None,  "restrict_only": True},
-    "autonomy_ceiling": {"type": "enum", "default": "review",
-                         "restrict_only": True, "order": _AUTONOMY_ORDER},
-    "permission_mode":  {"type": "enum", "default": "supervised",
-                         "restrict_only": True, "order": _PERMISSION_ORDER},
+    "vm_workspace": {"type": "bool", "default": False, "restrict_only": True},
+    "shell_tools": {"type": "bool", "default": False, "restrict_only": True},
+    "delegation": {"type": "bool", "default": False, "restrict_only": True},
+    "datasource_tools": {"type": "bool", "default": True, "restrict_only": True},
+    "browser": {"type": "bool", "default": True, "restrict_only": True},
+    "model_selection": {"type": "list", "default": None, "restrict_only": True},
+    "autonomy_ceiling": {
+        "type": "enum",
+        "default": "review",
+        "restrict_only": True,
+        "order": _AUTONOMY_ORDER,
+    },
+    "permission_mode": {
+        "type": "enum",
+        "default": "supervised",
+        "restrict_only": True,
+        "order": _PERMISSION_ORDER,
+    },
 }
 
 
@@ -59,8 +68,9 @@ def _scope_value(rows: list[dict], key: str, spec: dict) -> Any:
     return acc
 
 
-def resolve_grants(*, user_rows: list[dict], project_rows: list[dict],
-                   global_rows: list[dict]) -> dict[str, Any]:
+def resolve_grants(
+    *, user_rows: list[dict], project_rows: list[dict], global_rows: list[dict]
+) -> dict[str, Any]:
     """Resolve every catalog key for one principal. granted = most-specific scope
     that sets it (user>project>global) else catalog default; restrict-only keys
     are clamped to the meet of every scope that set the key (decision 22 — a child
@@ -92,15 +102,22 @@ def _truthy(x: Any) -> bool:
 def _fragment_models(fragment: dict) -> list[str]:
     llm = fragment.get("llm") or {}
     out = []
-    for v in (llm.get("model"), (llm.get("strategic") or {}).get("model"),
-              (llm.get("tactical") or {}).get("model")):
+    for v in (
+        llm.get("model"),
+        (llm.get("strategic") or {}).get("model"),
+        (llm.get("tactical") or {}).get("model"),
+    ):
         if isinstance(v, str) and v:
             out.append(v)
     return out
 
 
 def _enum_exceeds(value: Any, ceiling: str, order: list[str]) -> bool:
-    return isinstance(value, str) and value in order and order.index(value) > order.index(ceiling)
+    return (
+        isinstance(value, str)
+        and value in order
+        and order.index(value) > order.index(ceiling)
+    )
 
 
 def evaluate(fragment: dict, grants: dict, *, is_admin: bool = False) -> list[str]:
@@ -138,10 +155,20 @@ def evaluate(fragment: dict, grants: dict, *, is_admin: bool = False) -> list[st
             if m not in allowed:
                 v.append(f"model_selection: model '{m}' is not in the permitted set")
 
-    if _enum_exceeds(fragment.get("autonomy"), grants.get("autonomy_ceiling", "review"),
-                     _AUTONOMY_ORDER):
-        v.append(f"autonomy_ceiling: autonomy '{fragment.get('autonomy')}' exceeds the ceiling")
-    if _enum_exceeds(inter.get("permission_mode"), grants.get("permission_mode", "supervised"),
-                     _PERMISSION_ORDER):
-        v.append(f"permission_mode: '{inter.get('permission_mode')}' exceeds the ceiling")
+    if _enum_exceeds(
+        fragment.get("autonomy"),
+        grants.get("autonomy_ceiling", "review"),
+        _AUTONOMY_ORDER,
+    ):
+        v.append(
+            f"autonomy_ceiling: autonomy '{fragment.get('autonomy')}' exceeds the ceiling"
+        )
+    if _enum_exceeds(
+        inter.get("permission_mode"),
+        grants.get("permission_mode", "supervised"),
+        _PERMISSION_ORDER,
+    ):
+        v.append(
+            f"permission_mode: '{inter.get('permission_mode')}' exceeds the ceiling"
+        )
     return v
