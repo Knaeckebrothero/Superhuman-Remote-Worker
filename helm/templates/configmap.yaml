@@ -55,6 +55,9 @@ data:
   # (list/CRUD) and the agent (expert-by-id load) via envFrom on this shared
   # ConfigMap. Default-off chart-wide (prod-safe); the dev values file turns it on.
   EXPERTS_DB_ENABLED: {{ .Values.agent.expertsDbEnabled | default "false" | quote }}
+  # DB-backed Agent Skills (skills + skill_files). Read by the orchestrator's
+  # skill CRUD/list endpoints. Default-off chart-wide (prod-safe); dev turns it on.
+  SKILLS_DB_ENABLED: {{ .Values.agent.skillsDbEnabled | default "false" | quote }}
 
   # OIDC / SSO — works with internal Keycloak or external OIDC provider
   KEYCLOAK_URL: {{ include "srw.keycloakInternalUrl" . | quote }}

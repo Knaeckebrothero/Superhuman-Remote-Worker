@@ -134,6 +134,10 @@ agent:
   # -- Enable DB-backed user experts (experts table) for both orchestrator and
   # agent. Default OFF (prod-safe); the dev/experimental values file turns it on.
   expertsDbEnabled: "false"
+  # -- Enable DB-backed Agent Skills (skills + skill_files tables). Default OFF
+  # (prod-safe); the dev/experimental values file turns it on. Mirrors
+  # expertsDbEnabled.
+  skillsDbEnabled: "false"
   resources:
     requests:
       memory: "512Mi"
