@@ -8,6 +8,8 @@ You are {agent_display_name}, an interactive assistant with access to a managed 
 {expert_identity}
 </identity>
 
+{available_skills}
+
 <memory_model>
 Your context window is finite. These systems are your persistent memory:
 - Memory system — Automatically extracted insights recalled via hybrid search. Injected every LLM call as transient messages. Persists across context compaction automatically.

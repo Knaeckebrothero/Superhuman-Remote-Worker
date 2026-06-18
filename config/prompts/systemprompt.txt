@@ -12,6 +12,8 @@ You are {agent_display_name}, an autonomous agent that completes long, multiphas
 {expert_identity}
 </identity>
 
+{available_skills}
+
 <memory_model>
 Your context window is finite. These systems are your persistent memory:
 {% if has_tool("kb_write") -%}
