@@ -458,17 +458,10 @@
       }
     },
     "viewMode": {
-      "role": "Admin",
-      "scopeAll": "Viewing all",
-      "scopeMe": "Viewing my data",
-      "tooltip": {
-        "switchToMe": "Click to view only your own data",
-        "switchToAll": "Click to view fleet-wide data"
-      },
-      "pill": {
-        "label": "Viewing your data",
-        "showAll": "Show all",
-        "tooltip": "Switch back to fleet-wide view"
+      "banner": {
+        "text": "You're viewing all users' data.",
+        "showMine": "Show only mine",
+        "tooltip": "Switch to viewing only your own data"
       }
     }
   },
@@ -489,6 +482,13 @@
       "title": "Language",
       "desc": "Your preferred interface language. Changes apply immediately.",
       "label": "Interface Language"
+    },
+    "dataVisibility": {
+      "title": "Data visibility",
+      "desc": "Admins see all users' data by default. Switch to \"Only my data\" to work as a regular user would. The choice is saved to your account and applies everywhere.",
+      "label": "Show",
+      "optionAll": "All data",
+      "optionMe": "Only my data"
     },
     "apiKeys": {
       "title": "API Keys",

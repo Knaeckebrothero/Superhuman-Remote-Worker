@@ -7,19 +7,16 @@ import {Project} from '../../core/models/api.model';
 import {SidebarToggleComponent} from '../../shell/sidebar-toggle/sidebar-toggle.component';
 import {TranslocoPipe} from '@jsverse/transloco';
 import {AppSpinnerComponent} from '../../ui/spinner';
-import {ViewModePillComponent} from '../../shell/view-mode-pill/view-mode-pill.component';
-
 @Component({
   selector: 'app-project-list-page',
   standalone: true,
-  imports: [SidebarToggleComponent, TranslocoPipe, AppSpinnerComponent, ViewModePillComponent],
+  imports: [SidebarToggleComponent, TranslocoPipe, AppSpinnerComponent],
   template: `
     <div class="page-container">
       <!-- Header -->
       <div class="page-header">
         <app-sidebar-toggle />
         <h1 class="page-title">{{ 'projects.title' | transloco }}</h1>
-        <app-view-mode-pill />
         <div class="header-actions">
           <button class="btn btn-primary" (click)="showCreateForm.set(!showCreateForm())">
             {{ (showCreateForm() ? 'projects.cancel' : 'projects.newProject') | transloco }}

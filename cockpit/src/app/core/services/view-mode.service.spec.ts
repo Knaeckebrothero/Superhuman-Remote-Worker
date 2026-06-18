@@ -1,14 +1,17 @@
-import {afterEach, beforeEach, describe, expect, it} from 'vitest';
+import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest';
 import {signal} from '@angular/core';
 import {TestBed} from '@angular/core/testing';
+import {of} from 'rxjs';
 import {UserService} from './user.service';
+import {SettingsService} from './settings.service';
 import {ViewModeService} from './view-mode.service';
-import {User} from '../models/api.model';
+import {User, UserSettings} from '../models/api.model';
 
 /**
- * Spec for `ViewModeService`. The service uses an `effect()` to rehydrate
- * from localStorage when the current user changes, so tests go through
- * `TestBed` and call `TestBed.tick()` to flush effects (mirrors
+ * Spec for `ViewModeService`. The service uses effects to (1) rehydrate from
+ * localStorage when the current user changes and (2) reconcile to the
+ * server-persisted `admin_view_mode` once preferences load, so tests go
+ * through `TestBed` and call `TestBed.tick()` to flush effects (mirrors
  * `i18n.service.spec.ts`).
  */
 
@@ -39,13 +42,26 @@ function buildUserServiceMock(initial: User | null = null) {
   return {currentUser, currentUserId, setUser};
 }
 
-function configure(userMock: ReturnType<typeof buildUserServiceMock>) {
+function buildSettingsServiceMock() {
+  // Only the surface ViewModeService touches: the `preferences` signal it
+  // reconciles against, and `updatePreferences` it calls on every setMode.
+  const preferences = signal<UserSettings>({});
+  const updatePreferences = vi.fn((_s: Partial<UserSettings>) => of({status: 'updated'}));
+  return {preferences, updatePreferences};
+}
+
+function configure(
+  userMock: ReturnType<typeof buildUserServiceMock>,
+  settingsMock: ReturnType<typeof buildSettingsServiceMock> = buildSettingsServiceMock(),
+) {
   TestBed.configureTestingModule({
     providers: [
       ViewModeService,
       {provide: UserService, useValue: userMock},
+      {provide: SettingsService, useValue: settingsMock},
     ],
   });
+  return settingsMock;
 }
 
 describe('ViewModeService', () => {
@@ -141,6 +157,67 @@ describe('ViewModeService', () => {
       expect(service.viewMode()).toBe('me');
       // Nothing keyed without a user.
       expect(localStorage.length).toBe(0);
+    });
+  });
+
+  describe('server-side persistence', () => {
+    it('persists the choice to the server on setMode', () => {
+      const userMock = buildUserServiceMock(ADMIN_USER);
+      const settingsMock = configure(userMock);
+      const service = TestBed.inject(ViewModeService);
+      TestBed.tick();
+
+      service.setMode('me');
+
+      expect(settingsMock.updatePreferences).toHaveBeenCalledWith({admin_view_mode: 'me'});
+    });
+
+    it('adopts the server value once preferences load and refreshes the mirror', () => {
+      const userMock = buildUserServiceMock(ADMIN_USER);
+      const settingsMock = configure(userMock);
+      const service = TestBed.inject(ViewModeService);
+      TestBed.tick();
+      expect(service.viewMode()).toBe('all'); // localStorage empty → default
+
+      // Server preferences arrive (initial load, or a login on another device).
+      settingsMock.preferences.set({admin_view_mode: 'me'});
+      TestBed.tick();
+
+      expect(service.viewMode()).toBe('me');
+      expect(localStorage.getItem('srw.viewMode.admin-1')).toBe('me');
+    });
+
+    it('server value overrides a stale localStorage mirror', () => {
+      localStorage.setItem('srw.viewMode.admin-1', 'all');
+      const userMock = buildUserServiceMock(ADMIN_USER);
+      const settingsMock = configure(userMock);
+      const service = TestBed.inject(ViewModeService);
+      TestBed.tick();
+      expect(service.viewMode()).toBe('all');
+
+      settingsMock.preferences.set({admin_view_mode: 'me'});
+      TestBed.tick();
+
+      expect(service.viewMode()).toBe('me');
+    });
+
+    it('ignores a missing or invalid server value (keeps the local choice)', () => {
+      localStorage.setItem('srw.viewMode.admin-1', 'me');
+      const userMock = buildUserServiceMock(ADMIN_USER);
+      const settingsMock = configure(userMock);
+      const service = TestBed.inject(ViewModeService);
+      TestBed.tick();
+      expect(service.viewMode()).toBe('me');
+
+      // Preferences load but carry no admin_view_mode → must not clobber.
+      settingsMock.preferences.set({admin_view_mode: undefined});
+      TestBed.tick();
+      expect(service.viewMode()).toBe('me');
+
+      // A bad value is likewise ignored.
+      settingsMock.preferences.set({admin_view_mode: 'banana' as unknown as 'me'});
+      TestBed.tick();
+      expect(service.viewMode()).toBe('me');
     });
   });
 

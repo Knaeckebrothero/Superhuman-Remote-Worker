@@ -3,6 +3,7 @@ import {Router} from '@angular/router';
 import {environment} from '../../core/environment';
 import {McpTokenService} from '../../core/services/mcp-token.service';
 import {UserService} from '../../core/services/user.service';
+import {ViewModeService} from '../../core/services/view-mode.service';
 import {ApiService} from '../../core/services/api.service';
 import {
   SettingsService,
@@ -99,6 +100,25 @@ const EXPIRY_OPTIONS = [
             </app-form-field>
           </div>
         </section>
+
+        <!-- Data Visibility Section (Admin Only) -->
+        @if (userService.currentUser()?.is_admin) {
+          <section class="settings-section">
+            <h2 class="section-title">{{ 'settings.dataVisibility.title' | transloco }}</h2>
+            <p class="section-desc">{{ 'settings.dataVisibility.desc' | transloco }}</p>
+            <div class="form-block">
+              <app-form-field [label]="'settings.dataVisibility.label' | transloco">
+                <app-select
+                  [value]="viewMode.viewMode()"
+                  (changed)="viewMode.setMode($any($event))"
+                >
+                  <option value="all">{{ 'settings.dataVisibility.optionAll' | transloco }}</option>
+                  <option value="me">{{ 'settings.dataVisibility.optionMe' | transloco }}</option>
+                </app-select>
+              </app-form-field>
+            </div>
+          </section>
+        }
 
         <!-- API Keys Section -->
         <section class="settings-section">
@@ -1502,6 +1522,7 @@ export class SettingsComponent implements OnInit {
   readonly settingsService = inject(SettingsService);
   readonly modelService = inject(ModelService);
   readonly i18n = inject(I18nService);
+  readonly viewMode = inject(ViewModeService);
   private readonly apiService = inject(ApiService);
   private readonly router = inject(Router);
   private readonly transloco = inject(TranslocoService);
