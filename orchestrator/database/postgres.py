@@ -5397,6 +5397,123 @@ class PostgresDB:
         )
         return result == "DELETE 1"
 
+    # ── Skills (Agent Skills, Slice 1: authoring foundation) ──────────────
+    async def create_skill(
+        self,
+        *,
+        name: str,
+        display_name: str,
+        owner_id: str,
+        files: Dict[str, str],
+        description: str | None = None,
+        icon: str = "extension",
+        color: str = "#6B7280",
+        tags: List[str] | None = None,
+        is_global: bool = False,
+    ) -> Dict[str, Any]:
+        """Insert an owned skill + its files atomically. (name, owner_id) unique."""
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO skills
+                        (name, display_name, description, icon, color, tags,
+                         owner_id, is_global)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                    RETURNING *
+                    """,
+                    name,
+                    display_name,
+                    description,
+                    icon,
+                    color,
+                    tags or [],
+                    UUID(str(owner_id)),
+                    is_global,
+                )
+                await conn.executemany(
+                    "INSERT INTO skill_files (skill_id, path, content) "
+                    "VALUES ($1, $2, $3)",
+                    [(row["id"], p, c) for p, c in sorted(files.items())],
+                )
+        return dict(row)
+
+    async def get_skill_by_id(self, skill_id: str) -> Dict[str, Any] | None:
+        row = await self.fetchrow(
+            "SELECT * FROM skills WHERE id = $1", UUID(str(skill_id))
+        )
+        return dict(row) if row else None
+
+    async def get_skill_files(self, skill_id: str) -> Dict[str, str]:
+        rows = await self.fetch(
+            "SELECT path, content FROM skill_files WHERE skill_id = $1 ORDER BY path",
+            UUID(str(skill_id)),
+        )
+        return {r["path"]: r["content"] for r in rows}
+
+    async def list_skills_visible(self, *, user_id: str) -> List[Dict[str, Any]]:
+        """Owned + global skills visible to the caller. No project junction in
+        Slice 1 (project skills come from the Gitea repo at runtime — Slice 2)."""
+        rows = await self.fetch(
+            """
+            SELECT * FROM skills
+            WHERE owner_id = $1 OR is_global = TRUE
+            ORDER BY created_at DESC
+            """,
+            UUID(str(user_id)),
+        )
+        return [dict(r) for r in rows]
+
+    async def update_skill(
+        self,
+        skill_id: str,
+        *,
+        updated_by: str,
+        files: Dict[str, str] | None = None,
+        **fields: Any,
+    ) -> Dict[str, Any] | None:
+        """Patch mutable metadata (NOT name — immutable) + optionally replace the
+        file set, bumping version. Column names come from a fixed allow-list."""
+        allowed = {"display_name", "description", "icon", "color", "tags", "is_global"}
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                sets, vals = [], []
+                for k, v in fields.items():
+                    if k not in allowed:
+                        continue
+                    vals.append(v)
+                    sets.append(f"{k} = ${len(vals)}")
+                set_sql = (", ".join(sets) + ", ") if sets else ""
+                vals.append(UUID(str(updated_by)))
+                vals.append(UUID(str(skill_id)))
+                row = await conn.fetchrow(
+                    f"""
+                    UPDATE skills
+                    SET {set_sql}version = version + 1,
+                        updated_by = ${len(vals) - 1}, updated_at = NOW()
+                    WHERE id = ${len(vals)}
+                    RETURNING *
+                    """,
+                    *vals,
+                )
+                if row and files is not None:
+                    await conn.execute(
+                        "DELETE FROM skill_files WHERE skill_id = $1",
+                        UUID(str(skill_id)),
+                    )
+                    await conn.executemany(
+                        "INSERT INTO skill_files (skill_id, path, content) "
+                        "VALUES ($1, $2, $3)",
+                        [(row["id"], p, c) for p, c in sorted(files.items())],
+                    )
+        return dict(row) if row else None
+
+    async def delete_skill(self, skill_id: str) -> bool:
+        result = await self.execute(
+            "DELETE FROM skills WHERE id = $1", UUID(str(skill_id))
+        )
+        return result == "DELETE 1"
+
     async def set_system_api_key_discovery_cache(
         self,
         provider: str,
