@@ -104,6 +104,53 @@ export type ExpertUpdateRequest = Partial<
 >;
 
 // =============================================================================
+// Skill Models (Agent Skills — the open SKILL.md standard)
+// =============================================================================
+
+/** Skill catalog entry (GET /api/skills). */
+export interface Skill {
+  id: string;
+  name: string;
+  display_name: string;
+  description: string;
+  icon: string;
+  color: string;
+  tags: string[];
+  /** 'bundled' (disk) | 'user' | 'global' (DB-backed). */
+  source?: string;
+}
+
+/** Full skill detail incl. the file tree (GET /api/skills/{id}). */
+export interface SkillDetail extends Skill {
+  /** path -> content; always includes 'SKILL.md' (the canonical artifact). */
+  files: Record<string, string>;
+  version?: number;
+  owner_id?: string;
+}
+
+/**
+ * Create a DB-backed skill (POST /api/skills). name + description are parsed
+ * from the SKILL.md frontmatter server-side, not sent separately.
+ */
+export interface SkillCreateRequest {
+  files: Record<string, string>;
+  display_name?: string | null;
+  icon?: string;
+  color?: string;
+  tags?: string[];
+}
+
+/** Patch a DB-backed skill (PUT /api/skills/{id}). name is immutable, so absent. */
+export interface SkillUpdateRequest {
+  files?: Record<string, string>;
+  display_name?: string;
+  icon?: string;
+  color?: string;
+  tags?: string[];
+  is_global?: boolean;
+}
+
+// =============================================================================
 // Datasource Models
 // =============================================================================
 
