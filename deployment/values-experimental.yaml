@@ -47,11 +47,11 @@ global:
 # -----------------------------------------------------------------------------
 image:
   orchestrator:
-    tag: sha-fb2861b
+    tag: sha-b275caa
   agent:
-    tag: sha-fb2861b
+    tag: sha-b275caa
   cockpit:
-    tag: sha-fb2861b
+    tag: sha-b275caa
   mcp:
     tag: sha-55ebd17
   workspace:
