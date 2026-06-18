@@ -517,6 +517,8 @@ export interface UserSettings {
   default_embedding_model?: string | null;
   embedding_provider?: string | null;
   language?: 'en' | 'de-DE' | null;
+  /** Admin "View as" scope: 'all' = fleet-wide (default), 'me' = own data only. */
+  admin_view_mode?: 'me' | 'all' | null;
   communication?: CommunicationSettings | null;
   persistent_agent?: PersistentAgentSettings | null;
   _resolved?: ResolvedDefaults;
