@@ -54,6 +54,7 @@ def resolve_config(
     user_settings: Optional[dict] = None,
     request_override: Optional[dict] = None,
     expert_type: str = "session",
+    capture: Optional[dict] = None,
 ) -> dict:
     """Resolve the full agent config to a ``serialize_resolved_config``-shaped blob.
 
@@ -112,6 +113,13 @@ def resolve_config(
             data = deep_merge(data, layer)
 
     _apply_settings_matrix(data, explicit_llm_keys, deployment_dir)
+
+    if capture is not None:
+        # Full merged config in fragment shape — the policy view for the dispatch
+        # PEP (single PDP). The base's shell/delegation are present here; deny-by-
+        # default is reconciled by grandfathering existing users (migration 0030).
+        capture["merged_fragment"] = copy.deepcopy(data)
+
     config = load_agent_config_from_dict(data, deployment_dir=deployment_dir)
     blob = serialize_resolved_config(config, model=config.llm.model)
 

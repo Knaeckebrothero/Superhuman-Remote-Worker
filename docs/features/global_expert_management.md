@@ -235,7 +235,7 @@ Linking is owner-driven (link your own or a global expert to projects you're
 a member of). The junction supersedes the Gitea `experts/` directory scan,
 which is deprecated once this ships (read kept during a migration window).
 
-### `capability_grants` — migration `0029_capability_grants.sql`
+### `capability_grants` — migration `0030_capability_grants.sql`
 
 ```sql
 CREATE TABLE IF NOT EXISTS capability_grants (
@@ -343,10 +343,12 @@ which is exactly what `src/core/loader.py:173-210` already implements:
 ```
 Save-time   (POST/PUT /api/experts):  validate fragment against author's
             grants + hard-deny list => 422 with the offending keys named.
-Dispatch    (job create / session create / automation fire):  validate the
-            FULL merged override stack against the RUNNER's grants
-            => reject with actionable message. Covers experts, per-job
-            overrides, and users.settings.persistent_agent uniformly.
+Dispatch    (job create / job RESUME / session create+attach / automation
+            fire):  validate the FULL merged override stack against the
+            RUNNER's grants => reject with actionable message. Covers experts,
+            per-job overrides, and users.settings.persistent_agent uniformly —
+            all land in the single orchestrator-resolved merged fragment
+            (config_resolver `capture`), so one evaluate() call sees them.
 ```
 
 A revoked grant therefore disables affected experts at next dispatch — no
@@ -486,7 +488,7 @@ intersection with the invoker).
   prompts layer in MatrixResolver, fail-loud on missing row.
 - Dispatch plumbing: `expert_id` through job create, session create
   (provisioner env), automations.
-- Reserve migration slot `0029` (by a note in `docs/db_migration.md`, **not** a
+- Reserve migration slot for grants (by a note in `docs/db_migration.md`, **not** a
   placeholder file — the runner checksums applied migrations, so an edited
   placeholder would fail the drift guard); prompts-layer mechanism decided —
   inject persona/instructions into the existing `config.extra["_resolved_prompts"]`
@@ -498,7 +500,7 @@ intersection with the invoker).
   a new owned row and runs.
 
 ### Slice 2 — Grants + enforcement · ⬜ NOT STARTED (highest-value next step)
-- Migration `0029` + catalog + grants service (user → project → global → default).
+- Migration `0030` + catalog + grants service (user → project → global → default).
 - Save-time 422; dispatch-time reject on the merged stack (incl.
   `persistent_agent`); admin bypass; `system_settings['user_experts']`
   kill-switch; `can_use_vm` reads switched to grants.
