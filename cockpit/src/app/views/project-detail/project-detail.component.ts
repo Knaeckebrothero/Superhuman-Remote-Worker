@@ -2,6 +2,7 @@ import {ChangeDetectionStrategy, Component, computed, inject, OnDestroy, OnInit,
 import {ActivatedRoute, Router} from '@angular/router';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {MarkdownComponent} from 'ngx-markdown';
+import {stripMarkdown} from '../../core/util/strip-markdown';
 import {ApiService} from '../../core/services/api.service';
 import {UserService} from '../../core/services/user.service';
 import {SidebarToggleComponent} from '../../shell/sidebar-toggle/sidebar-toggle.component';
@@ -388,7 +389,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                           <span class="kb-note-status" [attr.data-status]="note.status">{{ note.status }}</span>
                         </div>
                         @if (note.content_preview) {
-                          <div class="kb-note-preview">{{ truncate(note.content_preview, 180) }}</div>
+                          <div class="kb-note-preview">{{ notePreview(note.content_preview) }}</div>
                         }
                         <div class="kb-note-footer">
                           @if (note.tags && note.tags.length > 0) {
@@ -2057,6 +2058,11 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
   truncate(text: string | undefined, max: number): string {
     if (!text) return '';
     return text.length <= max ? text : text.slice(0, max) + '...';
+  }
+
+  /** Flatten a note's Markdown to plain prose, then truncate, for the card preview. */
+  notePreview(text: string | undefined): string {
+    return this.truncate(stripMarkdown(text), 180);
   }
 
   formatDate(dateString: string): string {
