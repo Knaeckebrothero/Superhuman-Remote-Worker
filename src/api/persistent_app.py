@@ -1266,9 +1266,7 @@ async def _attach_session(
     # session-scoped AuxiliaryLLM and pass it in instead of the singleton.
     auxiliary_llm = _agent._auxiliary_llm
     if (config_override and config_override.get("auxiliary", {}).get("model")) or (
-        _hydrated
-        and effective_config.auxiliary
-        and effective_config.auxiliary.model
+        _hydrated and effective_config.auxiliary and effective_config.auxiliary.model
     ):
         from ..core.loader import LLMConfig, create_llm, resolve_model_settings
         from ..services.auxiliary import AuxiliaryLLM
