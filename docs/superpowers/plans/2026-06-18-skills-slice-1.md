@@ -1,5 +1,7 @@
 # Agent Skills — Slice 1 (Authoring Foundation) Implementation Plan
 
+> **Status: ✅ Slice 1 COMPLETE & live-verified on k3d (2026-06-18).** All 12 tasks landed on `develop` (commits `b117fb3f`..`d138d234`). Backend 31 unit tests + Cockpit 4 vitest + `ng build` green; migration `0031` applies; `PostgresDB` CRUD round-trips byte-for-byte against real Postgres. End-to-end on the live k3d stack (`SKILLS_DB_ENABLED=true`, migration applied, deployed via Tilt): **14/14 checks** — create/get/update(version bump + file replace)/delete/duplicate, bundled `hello-skill` discoverable, **byte-comparable `import → export`**, and negative 422s (rename-via-frontmatter, missing SKILL.md). Verified at the API surface the Cockpit consumes (MCP-header auth); a browser click-through of `/skills` is the one remaining optional check.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Stand up the data model and authoring surface for Agent Skills — store, create, edit, duplicate, and import/export `SKILL.md` skills with a Cockpit editor — with **no agent runtime** (no menu injection, no `use_skill`, no workspace materialization; those are Slice 2).
