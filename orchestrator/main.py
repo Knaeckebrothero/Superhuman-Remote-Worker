@@ -16955,6 +16955,139 @@ async def import_expert(request: Request, body: ExpertCreate) -> dict[str, Any]:
 
 
 # =============================================================================
+# Skill Endpoints (Agent Skills, Slice 1)
+# =============================================================================
+
+
+@app.post("/api/skills")
+async def create_skill(request: Request, body: SkillCreate) -> dict[str, Any]:
+    """Create an owned DB skill from its file tree (Slice 1: deny-scan validated)."""
+    _require_skills_db()
+    user = await require_approved_user(request, postgres_db)
+    name, description, files = _parse_skill_bundle(body.files)
+    try:
+        return await postgres_db.create_skill(
+            name=name,
+            display_name=body.display_name or name,
+            description=description,
+            icon=body.icon,
+            color=body.color,
+            tags=body.tags,
+            owner_id=str(user["id"]),
+            files=files,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        if "uq_skills_name_owner" in str(e):
+            raise HTTPException(
+                status_code=409, detail=f"You already have a skill named '{name}'"
+            ) from e
+        raise
+
+
+@app.get("/api/skills")
+async def list_skills(request: Request) -> list[dict[str, Any]]:
+    """List skills: bundled (disk) + DB rows visible to the caller (owned + global),
+    each tagged with ``source``. Read-only; tags-and-concatenates (precedence is a
+    Slice-2 resolver concern)."""
+    user = await require_approved_user(request, postgres_db)
+    global _skills_cache
+    if _skills_cache is None:
+        _skills_cache = _scan_skills()
+    result = [{**s.model_dump(), "source": "bundled"} for s in _skills_cache]
+    if _is_skills_db_enabled():
+        rows = await postgres_db.list_skills_visible(user_id=str(user["id"]))
+        result += [
+            {
+                **_skill_row_to_meta(r),
+                "source": "global" if r["is_global"] else "user",
+            }
+            for r in rows
+        ]
+    return result
+
+
+@app.post("/api/skills/reload")
+async def reload_skills(request: Request) -> dict[str, Any]:
+    """Force reload of bundled skill cache. **Admin only**."""
+    await _require_admin(request)
+    global _skills_cache
+    _skills_cache = _scan_skills()
+    return {"status": "reloaded", "count": len(_skills_cache)}
+
+
+@app.get("/api/skills/{skill_id}")
+async def get_skill(request: Request, skill_id: str) -> dict[str, Any]:
+    """Full skill detail (metadata + file tree). DB skill by UUID, else bundled."""
+    await require_approved_user(request, postgres_db)
+    if _is_skills_db_enabled() and _looks_like_uuid(skill_id):
+        row = await postgres_db.get_skill_by_id(skill_id)
+        if not row:
+            raise HTTPException(status_code=404, detail=f"Skill not found: {skill_id}")
+        files = await postgres_db.get_skill_files(skill_id)
+        return {
+            **_skill_row_to_meta(row),
+            "source": "global" if row["is_global"] else "user",
+            "files": files,
+        }
+    bundle = _bundled_skill_bundle(skill_id)
+    if not bundle:
+        raise HTTPException(status_code=404, detail=f"Skill not found: {skill_id}")
+    return {**bundle, "source": "bundled"}
+
+
+@app.put("/api/skills/{skill_id}")
+async def update_skill(
+    request: Request, skill_id: str, body: SkillUpdate
+) -> dict[str, Any]:
+    """Update an owned DB skill (owner or admin). Bundled skills are read-only.
+    ``name`` is immutable — an edited SKILL.md whose frontmatter name differs is
+    rejected (rename = create a new skill)."""
+    _require_skills_db()
+    user = await require_approved_user(request, postgres_db)
+    if not _looks_like_uuid(skill_id):
+        raise HTTPException(status_code=403, detail="Bundled skills are read-only")
+    existing = await postgres_db.get_skill_by_id(skill_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Skill not found")
+    if str(existing["owner_id"]) != str(user["id"]) and not user.get("is_admin"):
+        raise HTTPException(status_code=403, detail="Only the owner may edit this skill")
+    fields = body.model_dump(exclude_unset=True, exclude={"files"})
+    files = body.files
+    if files is not None:
+        name, description, files = _parse_skill_bundle(files)
+        if name != existing["name"]:
+            raise HTTPException(
+                status_code=422,
+                detail=f"SKILL.md name '{name}' must match the skill's name "
+                f"'{existing['name']}'; create a new skill to rename",
+            )
+        fields["description"] = description
+    return await postgres_db.update_skill(
+        skill_id, updated_by=str(user["id"]), files=files, **fields
+    )
+
+
+@app.delete("/api/skills/{skill_id}")
+async def delete_skill(request: Request, skill_id: str) -> dict[str, Any]:
+    """Delete an owned DB skill (owner or admin). Files cascade away."""
+    _require_skills_db()
+    user = await require_approved_user(request, postgres_db)
+    if not _looks_like_uuid(skill_id):
+        raise HTTPException(status_code=403, detail="Bundled skills cannot be deleted")
+    existing = await postgres_db.get_skill_by_id(skill_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Skill not found")
+    if str(existing["owner_id"]) != str(user["id"]) and not user.get("is_admin"):
+        raise HTTPException(
+            status_code=403, detail="Only the owner may delete this skill"
+        )
+    await postgres_db.delete_skill(skill_id)
+    return {"deleted": True}
+
+
+# =============================================================================
 # Project Expert Endpoints
 # =============================================================================
 
