@@ -1,10 +1,20 @@
-# Superhuman Remote Worker
+# Project SRW
+
+> **Goal: a foundation for artificial intelligence to act in the digital world — functionally and safely.**
+
+"SRW" stands for *Superhuman Remote Worker* — the north star, not a description of today. The name is the goal: an AI you can hand real work and a machine to do it on. This repository builds the layer *underneath* that goal: the model-agnostic substrate any such system needs, whichever model does the thinking.
+
+Why a foundation and not just a smarter model? A decision isn't something a model "has"; it emerges when a predictive core is wired to a value signal and a selection loop. Today that core is an LLM predicting tokens — tomorrow it may be a world model predicting latent state, or a vision-language-action model predicting motor commands, with state shifting from text to vectors to frames. What *doesn't* change is everything around the core: a machine to run on, connectors to act through, durable memory and state, observability, scaling, cooperation between agents, and the guardrails that keep it safe. The cognitive core is a swappable organ; the harness is the durable part — and it's where the decision-making loop actually lives. In effect, SRW is an operating system for AI to interact with the digital world.
+
+Concrete capabilities are **milestones** toward that foundation, not the point in themselves. The flagship milestone today is the self-improving loop.
+
+## Milestone: The Self-Improving Loop
 
 A self-improving AI agent system. Specialized agents form a continuous innovation cycle: one explores ideas, one tears them apart, one builds the survivors, one curates what was learned. The system gets better on its own.
 
 Built on LangGraph with a config-driven architecture. Same codebase, different YAML configs, different roles. Runs as job-based workers or interactive persistent sessions.
 
-## The Innovation Cycle
+### The Innovation Cycle
 
 The typical human-AI workflow looks like this: you have an idea, you dump it on the AI, the AI builds it, then you spend forever refactoring because your inner perfectionist won't let you merge something that works but isn't elegant. Repeat.
 
