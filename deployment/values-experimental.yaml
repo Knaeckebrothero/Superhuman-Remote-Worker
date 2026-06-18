@@ -153,6 +153,8 @@ agent:
   configDbOverridesEnabled: "true"
   # DB-backed user experts (experts table) — ON in dev for the experts feature.
   expertsDbEnabled: "true"
+  # DB-backed Agent Skills (skills + skill_files) — ON in dev for the skills feature.
+  skillsDbEnabled: "true"
   tailscale:
     enabled: true
 # -----------------------------------------------------------------------------
