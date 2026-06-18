@@ -118,9 +118,9 @@ A skill is a *directory*, so storage splits by scope (precedence owner > project
 
 - **Bundled** → `config/skills/<name>/` (mirrors `config/experts/`), scanned + cached at startup.
 - **Project** → `skills/<name>/` in the project's Gitea jobs repo (mirrors the project `experts/` scan; identical to Claude Code's `.claude/skills`).
-- **User / global** → rows in a `skills` table mirroring `experts` (`id, name (slug, uniq per owner), display_name, description, icon, color, tags[], owner_id, is_global, version, updated_by, ts`) **plus a file tree** for the SKILL.md body and bundled files. Mechanism is an open item: a tarball/blob column vs a `skill_files(skill_id, path, content)` table.
+- **User / global** → rows in a `skills` table mirroring `experts` (`id, name (slug, uniq per owner), display_name, description, icon, color, tags[], owner_id, is_global, version, updated_by, ts`) **plus a `skill_files(skill_id, path, content)` table** holding the actual files. The **`SKILL.md` file is canonical**; the row's `name`/`description` are a denormalized cache re-parsed on save — so even frontmatter we don't yet interpret round-trips losslessly.
 
-Everything else mirrors experts: CRUD + duplicate + export/import (in `SKILL.md` bundle form) + reload, `list_skills`/`get_skill` MCP, and a Cockpit editor cloned from the experts editor.
+Everything else mirrors experts: CRUD + duplicate + reload, `list_skills`/`get_skill` MCP, and a Cockpit editor cloned from the experts editor. **Import/export is the native skill directory (zipped), not a JSON envelope** — a deliberate divergence from experts' export: an exported skill drops straight into `.claude/skills/`, and a real Claude Code/Codex skill imports unchanged. That interoperability is the point.
 
 ## Prior art — what already exists
 
@@ -138,24 +138,23 @@ Everything else mirrors experts: CRUD + duplicate + export/import (in `SKILL.md`
 6. **Deterministic/enforced bindings are preserved** for must-happen guidance (model-invocation is unreliable). Migrating `todo_guide`/`research_guide` to skills must keep their enforced/phase bindings.
 7. **Consolidation is Layer 3 only** — expert identity (Layer 1) and task/deliverable files (Layer 4) are not skills.
 8. Skills are **standalone, authored once**; experts **compose** them. Catalog is **open by default**, with per-expert curation available at scale.
-9. **Storage mirrors experts** (`SKILLS_DB_ENABLED`, owner>project>global>bundled): bundled `config/skills/`, project Gitea `skills/`, user/global DB rows + a file tree.
-10. **Security reuses experts' mechanisms** (`fence_persona` for description+body, `hard_deny_scan` at save). **Script execution sits behind capability-grants** → script-bearing skills are a later slice; first slices are prompt-only.
+9. **Storage mirrors experts** (`SKILLS_DB_ENABLED`, owner>project>global>bundled): bundled `config/skills/`, project Gitea `skills/`, user/global `skills` row + `skill_files` table (raw `SKILL.md` canonical, name/description denormalized). **Import/export is the native zipped skill directory**, not a JSON envelope — round-trips with Claude Code/Codex.
+10. **Security reuses experts' mechanisms** (`fence_persona` for description+body, `hard_deny_scan` at save). Script execution reuses the **shipped** capability-grants gate (`evaluate()`), extended with a script/shell grant key — so script-bearing skills are deferred for **scope/risk** (get prompt-only right first), no longer for missing infra.
 11. **Context-aware auto-suggest** is a later slice, built as a `semantic` trigger over the memory engine.
 
 ## Open items (tuning + sequencing, not blockers)
 
-- **DB file-tree mechanism** — tarball/blob column vs a `skill_files` table for user/global skills.
 - **Menu budget tuning** — the listing budget fraction, per-entry cap, and truncation/eviction policy (mirror Claude Code's knobs); when a coarse pre-filter is warranted.
-- **Capability-grant keys for scripts** — what grant unlocks script execution; rides experts' Slice 2 grants.
+- **Script-execution grant key** — which key to add to the shipped `evaluate()` catalog to gate skill-script execution (a `run_scripts`/`shell_tools`-style grant).
 - **Frontmatter extensions** — whether/when to honour `allowed-tools`, `disable-model-invocation`, `paths`.
 - **Vocabulary** — disambiguating "skill" (this) from "expert" (role) in the UI.
 
 ## Slices (mirroring how experts shipped)
 
-- **Slice 1 — Engine + prompt-only skills.** `SKILLS_DB_ENABLED`; storage (bundled `config/skills/` + project Gitea `skills/` + `skills` table & file tree); CRUD/import-export in `SKILL.md` form; workspace materialization; menu injection (L1) into the resolved blob; `use_skill` (L2); `fence_persona` + `hard_deny_scan`. Prompt-only, open catalog, no bindings yet. *Mirrors experts' Slice 1.*
-- **Slice 2 — Expert bindings + migration.** `expert.config` `skill → binding`; migrate `todo_guide`/`research_guide` to skills preserving their enforced/phase bindings.
-- **Slice 3 — Cockpit UI.** Skills page + editor cloned from the experts editor (`/skills`, `/skills/new`, `/skills/{id}/edit`).
-- **Slice 4 — Script-bearing skills.** L3 script execution behind capability grants (rides experts' grants slice).
+- **Slice 1 — Authoring foundation (get the basics right).** `SKILLS_DB_ENABLED`; storage (bundled `config/skills/` + project Gitea `skills/` + `skills` row + `skill_files`); the `SKILL.md` parser/serializer; CRUD + duplicate + native-zip import/export + edit; Cockpit editor cloned from the experts editor (`/skills`, `/skills/new`, `/skills/{id}/edit`); `fence_persona` (at rest) + `hard_deny_scan`. **No agent runtime yet.** *DoD: round-trip a real Claude Code skill (import → edit → export, byte-comparable); create/edit from scratch via the UI.*
+- **Slice 2 — Runtime engine.** Resolve the in-scope menu into the resolved blob; materialize skill dirs into the workspace; `use_skill` (L2); fenced Layer-1 menu injection (L1). Prompt-only, open catalog. *DoD: agent discovers and loads a skill end-to-end.*
+- **Slice 3 — Expert bindings + migration.** `expert.config` `skill → binding`; migrate `todo_guide`/`research_guide` to skills, preserving their enforced/phase bindings.
+- **Slice 4 — Script-bearing skills.** L3 script execution gated by the shipped grants `evaluate()` (extended with a script/shell grant key).
 - **Later — Context-aware.** `semantic` trigger routing the catalog through the memory engine.
 
 ## Related

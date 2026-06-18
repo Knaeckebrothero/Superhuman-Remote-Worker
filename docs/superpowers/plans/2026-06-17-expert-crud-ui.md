@@ -10,7 +10,7 @@
 
 **Tech Stack:** FastAPI + asyncpg (orchestrator), Angular 21 standalone/signals + Transloco (Cockpit), pytest (Py3.12 CI is the gate), vitest+jsdom (Cockpit).
 
-**Spec of record:** `docs/features/global_expert_management.md` — Slice 1 (write-CRUD, "no grants yet, hard-deny only") + Slice 3 (Cockpit page + type-aware editor). This plan is the restore-of-Slice-1-write-half + the create/edit subset of Slice 3.
+**Spec of record:** `docs/done/global_expert_management.md` — Slice 1 (write-CRUD, "no grants yet, hard-deny only") + Slice 3 (Cockpit page + type-aware editor). This plan is the restore-of-Slice-1-write-half + the create/edit subset of Slice 3.
 
 ---
 
@@ -26,7 +26,7 @@ below) was replaced with a fully **structured editor** reusing the launch-flow
 the unmanaged tail. `model-group` was NOT reused (it mutates the user's global default-model prefs).
 Browser-verified round-trip. Helpers: `agent-settings/config-merge.ts` + `views/experts/expert-config.ts`
 (`MANAGED_CONFIG_KEYS`/`splitExpertConfig`/`assembleExpertConfig`), 18 new unit tests. See
-`docs/features/global_expert_management.md` ("Structured config editor").
+`docs/done/global_expert_management.md` ("Structured config editor").
 
 **Verified live:**
 - **Backend** (k3d, MCP-header auth): create → 409 dup-name → 422 credential-deny →
@@ -1124,7 +1124,7 @@ Run: `cd cockpit && npx tsc --noEmit` → clean.
 - [ ] **Step 3: Cockpit smoke (Playwright/manual on dev)** — Experts nav → create an expert through the editor → it appears in the list with the `user` badge → edit → duplicate → export downloads JSON → delete (confirm dialog). Job-create and session-create grids show the new expert and send `expert_id` (not `config_name`).
 
 - [ ] **Step 4: Update docs + memory**
-  - `docs/features/global_expert_management.md`: flip the stale status line — Slice 1 write-CRUD **restored**; Slice 3 create/edit/list/duplicate/export/import **shipped** (grants/project-link/test-drive still deferred).
+  - `docs/done/global_expert_management.md`: flip the stale status line — Slice 1 write-CRUD **restored**; Slice 3 create/edit/list/duplicate/export/import **shipped** (grants/project-link/test-drive still deferred).
   - Update memory `orchestrator-resolved-config-progress` (or a new `expert-crud-ui` memory): write-CRUD gap CLOSED; UI shipped; what's still deferred.
 
 ---

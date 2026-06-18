@@ -55,7 +55,7 @@ byte-identical**; `vm_workspace` greying reuses the accordion's existing `canUse
 (4 new)** + AOT `ng build` + `tsc` clean; **live on k3d** the admin panel renders all 8 rows and
 set/revoke round-trips through the real API → DB → audit, and the editor renders with the
 admin-bypass (no gating) confirmed (the non-admin greying *visual* is unit + AOT covered, needs a
-non-admin session to see live). Plan: `docs/superpowers/plans/2026-06-18-capability-grants-ui.md`.
+non-admin session to see live). Plan: `docs/done/2026-06-18-capability-grants-ui.md`.
 **Remaining Slice-3 polish:** project-link/`default_for` UI, per-tool curation (toggles are
 category-level), de-DE page strings.
 
@@ -78,7 +78,7 @@ non-admin resolved); `delete_user` → grant-row cleanup. A runtime import-path 
 `sys.path`) was caught live and fixed. Tests: **29 new** (pure PDP + contract) + 268 area-regression
 green; ruff clean. **Fast-follow now shipped** — the Cockpit grants panel + editor control-greying
 landed the same day (see the Grants UI status above). Plan:
-`docs/superpowers/plans/2026-06-18-user-defined-experts-slice-2-enforcement.md`.
+`docs/done/2026-06-18-user-defined-experts-slice-2-enforcement.md`.
 
 **Status (2026-06-17):** **Slice 1 write-CRUD restored + Slice-3 create-UI shipped** on `develop`
 (uncommitted). The Slice-1 write endpoints had been clobbered by `6f8c635e` and were **restored**
@@ -552,9 +552,9 @@ intersection with the invoker).
 > `autonomy`); a raw-request-body duplicate/non-ASCII-key scan wired into the save endpoints; and
 > admin-set grant-value type validation. **Fast-follow now SHIPPED (2026-06-18):** the Cockpit
 > Admin → Grants panel and the `/api/users/me/capabilities`-driven editor control-greying — see the
-> Grants UI status block at the top + `docs/superpowers/plans/2026-06-18-capability-grants-ui.md`.
+> Grants UI status block at the top + `docs/done/2026-06-18-capability-grants-ui.md`.
 > Plan + full deviation changelog:
-> `docs/superpowers/plans/2026-06-18-user-defined-experts-slice-2-enforcement.md`.
+> `docs/done/2026-06-18-user-defined-experts-slice-2-enforcement.md`.
 - Migration `0030` + catalog + grants service (user → project → global → default).
 - Save-time 422; dispatch-time reject on the merged stack (incl.
   `persistent_agent`); admin bypass; `system_settings['user_experts']`

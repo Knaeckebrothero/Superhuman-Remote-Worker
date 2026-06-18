@@ -8,7 +8,7 @@
 
 **Tech Stack:** Python orchestrator (`orchestrator/main.py` ~21k-line monolith, asyncpg via `PostgresDB`), agent (`src/agent.py`, `src/core/loader.py`, `src/database/postgres_db.py`), Postgres migrations under `orchestrator/database/migrations/app/`, k3d local dev.
 
-**Spec:** `docs/features/global_expert_management.md` v2.2 (Slice 1 = lines 404–418). This plan implements that slice's bullets, with the two reconciliations noted in the header above.
+**Spec:** `docs/done/global_expert_management.md` v2.2 (Slice 1 = lines 404–418). This plan implements that slice's bullets, with the two reconciliations noted in the header above.
 
 > ## ── CURRENT STATE (2026-06-16) — read this first ──
 >
@@ -96,7 +96,7 @@ A placeholder `0029_*.sql` would be checksummed on first apply; editing it in Sl
 > **Reserved:** `0030_capability_grants.sql` (originally `0029`; `0029` was later
 > claimed by `0029_add_mistral_provider.sql`) is reserved for the User-Defined
 > Experts Slice 2 (capability grants) — see
-> `docs/features/global_expert_management.md`. Do not claim `0029` for another
+> `docs/done/global_expert_management.md`. Do not claim `0029` for another
 > feature. (Reserved by note, not a placeholder file: the runner checksums
 > applied migrations, so an edited placeholder would fail the drift check.)
 ```
@@ -224,7 +224,7 @@ Create `orchestrator/database/migrations/app/0028_experts.sql` (DDL verbatim fro
 --                returns. Adds project_experts (link + per-project default +
 --                override) and jobs.expert_id (nullable, SET NULL on delete —
 --                history is safe because jobs.resolved_config is frozen).
---                Design: docs/features/global_expert_management.md (Slice 1).
+--                Design: docs/done/global_expert_management.md (Slice 1).
 -- depends-on:    0001_initial.sql
 -- expected:      < 1s on dev DB. New empty tables + one nullable FK column
 --                (metadata-only ADD COLUMN in PostgreSQL 11+, no table rewrite).
@@ -282,7 +282,7 @@ ALTER TABLE jobs VALIDATE CONSTRAINT jobs_expert_id_fkey;
 COMMENT ON TABLE experts IS
     'DB-backed user/admin experts (overlay over bundled config/experts/). '
     'config = fragment vs the expert_type base; prompts = {persona, instructions}. '
-    'Design: docs/features/global_expert_management.md.';
+    'Design: docs/done/global_expert_management.md.';
 
 COMMIT;
 ```

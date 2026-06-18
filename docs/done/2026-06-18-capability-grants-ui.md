@@ -40,7 +40,7 @@
 ## Context & resolved design questions
 
 - **Backend is done + live-verified** (commit `a7ad2be0`). This slice is UI-only — no orchestrator changes. The catalog (`src/core/capability_grants.py` `CATALOG`) is delivered by both endpoints, so the UI reads it dynamically (never hardcodes the 8 keys).
-- **Spec:** `docs/features/global_expert_management.md` Slice 3 — "greyed ungated controls fed by `/api/users/me/capabilities`, grant-fed model picker, admin-users grant toggle." This plan realizes exactly that, scoped to the two deferred pieces.
+- **Spec:** `docs/done/global_expert_management.md` Slice 3 — "greyed ungated controls fed by `/api/users/me/capabilities`, grant-fed model picker, admin-users grant toggle." This plan realizes exactly that, scoped to the two deferred pieces.
 - **Catalog shape (delivered by the API):** `{ "<key>": { type: 'bool'|'enum'|'list', default: any, restrict_only: true, order?: string[] } }`. 8 keys: `vm_workspace, shell_tools, delegation, datasource_tools, browser, model_selection, autonomy_ceiling, permission_mode`.
 - **`/api/users/me/capabilities` →** `{ is_admin: boolean, grants: Record<key, value>|null, catalog }`. `grants===null` ⇒ admin (unrestricted). For a non-admin, `grants` is the fully-resolved effective set (every catalog key present).
 - **`GET /api/admin/grants?scope_kind=&scope_id=` →** `{ grants: [{ key, value_json, granted_by, updated_at }], catalog }` — only the **explicitly-set** rows for that one scope (NOT resolved/inherited). Absence of a key ⇒ inherits.

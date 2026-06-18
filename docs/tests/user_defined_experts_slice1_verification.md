@@ -6,7 +6,7 @@ worker-dispatch / session-provisioning pipeline was wedged during the original
 pass (jobs stalled in `waiting`; session agent pods are provisioned lazily on
 WebSocket attach). This doc captures exactly how to finish them.
 
-**Feature:** `docs/features/global_expert_management.md` ·
+**Feature:** `docs/done/global_expert_management.md` ·
 **Plan:** `docs/superpowers/plans/2026-06-15-user-defined-experts-slice-1.md` ·
 **Untested inventory:** `docs/tests/user_defined_experts_slice1_test_gaps.md`
 

@@ -2429,7 +2429,7 @@ def _get_container_context(job: dict) -> dict:
 # save-time (the 3 expert endpoints), job dispatch, job resume, and session
 # attach. Deny-by-default for security keys; existing approved users were
 # grandfathered by migration 0030 (shell_tools + delegation). See
-# docs/features/global_expert_management.md (decisions 8, 9, 19, 21-23).
+# docs/done/global_expert_management.md (decisions 8, 9, 19, 21-23).
 # =============================================================================
 
 
