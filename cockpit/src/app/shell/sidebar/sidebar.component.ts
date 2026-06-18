@@ -93,6 +93,14 @@ import {LegionMarkComponent} from '../../ui/legion-mark';
           </a>
           <a
             class="nav-link"
+            routerLink="/skills"
+            routerLinkActive="active"
+          >
+            <app-icon size="md" class="nav-icon">extension</app-icon>
+            {{ 'nav.skills' | transloco }}
+          </a>
+          <a
+            class="nav-link"
             routerLink="/automations"
             routerLinkActive="active"
           >

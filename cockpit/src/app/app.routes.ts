@@ -16,6 +16,8 @@ import {SessionCreateComponent} from './views/session-create/session-create.comp
 import {DatasourcesPageComponent} from './views/datasources/datasources-page.component';
 import {ExpertsPageComponent} from './views/experts/experts-page.component';
 import {ExpertEditorComponent} from './views/experts/expert-editor.component';
+import {SkillsPageComponent} from './views/skills/skills-page.component';
+import {SkillEditorComponent} from './views/skills/skill-editor.component';
 import {AutomationsPageComponent} from './views/automations/automations-page.component';
 import {AdminLlmComponent} from './views/admin/llm/admin-llm.component';
 import {AdminUsersComponent} from './views/admin/users/admin-users.component';
@@ -41,6 +43,9 @@ export const routes: Routes = [
   { path: 'experts', component: ExpertsPageComponent, canActivate: [authGuard] },
   { path: 'experts/new', component: ExpertEditorComponent, canActivate: [authGuard] },
   { path: 'experts/:id/edit', component: ExpertEditorComponent, canActivate: [authGuard] },
+  { path: 'skills', component: SkillsPageComponent, canActivate: [authGuard] },
+  { path: 'skills/new', component: SkillEditorComponent, canActivate: [authGuard] },
+  { path: 'skills/:id/edit', component: SkillEditorComponent, canActivate: [authGuard] },
   { path: 'automations', component: AutomationsPageComponent, canActivate: [authGuard] },
   { path: 'settings', component: SettingsComponent, canActivate: [authGuard] },
   { path: 'settings/api-keys', component: ApiKeysPageComponent, canActivate: [authGuard] },
