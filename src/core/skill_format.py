@@ -35,7 +35,9 @@ def parse_skill_md(text: str) -> tuple[dict[str, Any], str]:
     """Split a SKILL.md into (frontmatter dict, body str)."""
     m = _FRONTMATTER_RE.match(text)
     if not m:
-        raise SkillFormatError("SKILL.md must start with a '---' YAML frontmatter block")
+        raise SkillFormatError(
+            "SKILL.md must start with a '---' YAML frontmatter block"
+        )
     try:
         fm = yaml.safe_load(m.group(1)) or {}
     except yaml.YAMLError as e:
@@ -100,7 +102,7 @@ def unpack_skill_zip(data: bytes) -> dict[str, str]:
     prefix = f"{next(iter(tops))}/" if strip else ""
     files: dict[str, str] = {}
     for n in names:
-        rel = n[len(prefix):] if prefix and n.startswith(prefix) else n
+        rel = n[len(prefix) :] if prefix and n.startswith(prefix) else n
         validate_skill_path(rel)
         try:
             files[rel] = zf.read(n).decode("utf-8")
@@ -114,7 +116,9 @@ def set_skill_name(text: str, new_name: str) -> str:
     """Rewrite frontmatter 'name:' to new_name, preserving the body. For forks."""
     m = _FRONTMATTER_RE.match(text)
     if not m:
-        raise SkillFormatError("SKILL.md must start with a '---' YAML frontmatter block")
+        raise SkillFormatError(
+            "SKILL.md must start with a '---' YAML frontmatter block"
+        )
     block, body = m.group(1), m.group(2)
     new_block, n = re.subn(r"(?m)^name:.*$", f"name: {new_name}", block, count=1)
     if n == 0:
