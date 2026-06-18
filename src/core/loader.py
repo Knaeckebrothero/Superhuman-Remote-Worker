@@ -4142,4 +4142,5 @@ def load_config_from_resolved(resolved: dict) -> AgentConfig:
     # Store pre-resolved content for runtime use
     config.extra["_resolved_prompts"] = resolved.get("prompts", {})
     config.extra["_resolved_instructions"] = resolved.get("instructions", {})
+    config.extra["_resolved_skills"] = resolved.get("skills") or {}
     return config
