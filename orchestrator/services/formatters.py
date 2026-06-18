@@ -1217,6 +1217,42 @@ def format_experts(experts: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def format_skills(skills: list[dict[str, Any]]) -> str:
+    """Format skill catalog list."""
+    if not skills:
+        return "No skills found."
+
+    lines = [f"Skills ({len(skills)}):\n"]
+    for s in skills:
+        sid = s.get("id", "unknown")
+        name = s.get("name", sid)
+        source = s.get("source", "")
+        desc = s.get("description", "")
+        tags = s.get("tags", [])
+        suffix = f" [{source}]" if source else ""
+        lines.append(f"  {name}{suffix} (id: {sid})")
+        if desc:
+            lines.append(f"    {desc}")
+        if tags:
+            lines.append(f"    Tags: {', '.join(tags)}")
+
+    return "\n".join(lines)
+
+
+def format_skill_detail(skill_id: str, data: dict[str, Any]) -> str:
+    """Format skill detail (metadata + SKILL.md body + file list)."""
+    files = data.get("files", {})
+    body = files.get("SKILL.md", "")
+    extra = sorted(p for p in files if p != "SKILL.md")
+    lines = [f"Skill: {data.get('name', skill_id)}"]
+    if data.get("description"):
+        lines.append(f"  {data['description']}")
+    lines.append(f"  Bundled files: {', '.join(extra) if extra else '(none)'}")
+    lines.append("\n--- SKILL.md ---")
+    lines.append(body)
+    return "\n".join(lines)
+
+
 def format_models(data: dict[str, Any]) -> str:
     """Format model catalog for AI-friendly display."""
     lines: list[str] = []
