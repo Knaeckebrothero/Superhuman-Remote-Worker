@@ -33,6 +33,7 @@ import {InboxPageComponent} from './views/inbox/inbox-page.component';
 import {ConfigEditorComponent} from './views/config-editor/config-editor.component';
 import {EmptyCatalogBannerComponent} from './shell/empty-catalog-banner/empty-catalog-banner.component';
 import {ReadinessGateBannerComponent} from './shell/readiness-gate-banner/readiness-gate-banner.component';
+import {ViewModeBannerComponent} from './shell/view-mode-banner/view-mode-banner.component';
 import {AppPwaBannerComponent} from './shell/pwa-banner/pwa-banner.component';
 import {AppIconComponent} from './ui/icon';
 
@@ -44,6 +45,7 @@ import {AppIconComponent} from './ui/icon';
     AppToastContainerComponent,
     EmptyCatalogBannerComponent,
     ReadinessGateBannerComponent,
+    ViewModeBannerComponent,
     AppPwaBannerComponent,
     AppIconComponent,
   ],
@@ -70,6 +72,7 @@ import {AppIconComponent} from './ui/icon';
         } @else {
           <app-readiness-gate-banner />
           <app-empty-catalog-banner />
+          <app-view-mode-banner />
           <router-outlet />
         }
       </div>

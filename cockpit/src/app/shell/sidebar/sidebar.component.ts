@@ -13,12 +13,10 @@ import {environment} from '../../core/environment';
 import {TranslocoPipe} from '@jsverse/transloco';
 import {AppIconComponent} from '../../ui/icon';
 import {LegionMarkComponent} from '../../ui/legion-mark';
-import {ViewModeToggleComponent} from '../view-mode-toggle/view-mode-toggle.component';
-
 @Component({
   selector: 'app-sidebar',
   standalone: true,
-  imports: [RouterLink, RouterLinkActive, LayoutPickerComponent, NotificationBellComponent, TranslocoPipe, AppIconComponent, LegionMarkComponent, ViewModeToggleComponent],
+  imports: [RouterLink, RouterLinkActive, LayoutPickerComponent, NotificationBellComponent, TranslocoPipe, AppIconComponent, LegionMarkComponent],
   template: `
     <nav class="sidebar">
       <div class="sidebar-header">
@@ -216,8 +214,6 @@ import {ViewModeToggleComponent} from '../view-mode-toggle/view-mode-toggle.comp
               [style.background]="user.avatar_color"
             >{{ getInitials(user.display_name) }}</span>
             <span class="user-name">{{ user.display_name }}</span>
-            <app-view-mode-toggle />
-
           </div>
           <div class="footer-actions">
             <app-notification-bell />

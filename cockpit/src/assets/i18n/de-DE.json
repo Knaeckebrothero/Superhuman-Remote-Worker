@@ -458,17 +458,10 @@
       }
     },
     "viewMode": {
-      "role": "Admin",
-      "scopeAll": "Alle Daten",
-      "scopeMe": "Eigene Daten",
-      "tooltip": {
-        "switchToMe": "Wechseln, um nur eigene Daten zu sehen",
-        "switchToAll": "Wechseln zur flottenweiten Ansicht"
-      },
-      "pill": {
-        "label": "Nur eigene Daten",
-        "showAll": "Alle anzeigen",
-        "tooltip": "Zurück zur flottenweiten Ansicht"
+      "banner": {
+        "text": "Sie sehen die Daten aller Benutzer.",
+        "showMine": "Nur meine anzeigen",
+        "tooltip": "Zur Ansicht nur eigener Daten wechseln"
       }
     }
   },
@@ -489,6 +482,13 @@
       "title": "Sprache",
       "desc": "Ihre bevorzugte Oberflächensprache. Änderungen werden sofort angewendet.",
       "label": "Oberflächensprache"
+    },
+    "dataVisibility": {
+      "title": "Datensichtbarkeit",
+      "desc": "Admins sehen standardmäßig die Daten aller Benutzer. Wechseln Sie zu „Nur eigene Daten“, um wie ein normaler Benutzer zu arbeiten. Die Auswahl wird in Ihrem Konto gespeichert und gilt überall.",
+      "label": "Anzeigen",
+      "optionAll": "Alle Daten",
+      "optionMe": "Nur eigene Daten"
     },
     "apiKeys": {
       "title": "API-Schlüssel",

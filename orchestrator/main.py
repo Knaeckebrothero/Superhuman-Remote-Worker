@@ -4119,6 +4119,11 @@ class UserSettingsUpdate(BaseModel):
     default_tactical_model: str | None = None
     default_embedding_model: str | None = None
     embedding_provider: str | None = None
+    # Admin "View as" preference: 'all' = fleet-wide visibility (default),
+    # 'me' = shadow regular-user visibility. Read by the cockpit's
+    # ViewModeService; the live request narrowing rides the X-Admin-View-As
+    # header (orchestrator/security/auth.py), this just persists the choice.
+    admin_view_mode: Literal["me", "all"] | None = None
     # Phase 6: persistent_agent sub-object covers headless_mode,
     # headless_attention_sleep_minutes, notification_channels, plus the
     # existing model/permission_mode/greeting/idle_timeout_minutes/command_allowlist
@@ -18499,6 +18504,9 @@ def _resolve_preference_defaults() -> dict[str, Any]:
             "EMBEDDING_MODEL", "qwen3-embedding-8b"
         ),
         "embedding_provider": os.environ.get("EMBEDDING_PROVIDER", "local"),
+        # Admin "View as" default — fleet-wide visibility unless the admin
+        # has explicitly narrowed to their own data.
+        "admin_view_mode": "all",
         "persistent_agent": {
             "model": p_llm.get("model"),
             "permission_mode": "supervised",
