@@ -70,6 +70,7 @@ Composition within the system prompt (exact structure deferred until refactor la
 - Framework rules (phase alternation, workspace model, meta-cognition)
 - Phase directive (strategic or tactical mode)
 - Current todos
+- Available-skills menu — a fenced `name` + `description` listing of the in-scope skills; the agent loads a body on demand via the `use_skill` tool (Slice 2, shipped 2026-06-18; see [[agent_skills]])
 
 Expert-specific system prompts are supported via the matrix resolver. System prompt composition details will be worked out after the refactor is testable.
 
@@ -88,6 +89,8 @@ This replaces the current pattern where the full `instructions.md` (identity + m
 Instruction files live in the workspace (written at job init, expert-customizable via the matrix system). They provide guidance for specific activities — how to formulate todos, how to conduct reviews, how to write retrospectives, etc.
 
 **Key design principle: instruction files are auto-injected into the conversation based on trigger conditions, not left for the agent to discover.**
+
+> **Skills (2026-06-18):** the `model_invoked` skills catalog ([[agent_skills]], Slice 2 shipped) is the sibling of this triggered-injection mechanism — the agent loads a `SKILL.md` body via the `use_skill` tool on its **own judgment** (advertised by the Layer-1 menu above), rather than the system auto-injecting it on a trigger. A planned migration (skills Slice 3) folds these instruction files into the single `SKILL.md` artifact while **preserving** their deterministic bindings (`todo_guide`'s tool-gate enforcement, `research_guide`'s phase trigger); until then both coexist.
 
 #### Existing Implementation: `todo_guide.md`
 
