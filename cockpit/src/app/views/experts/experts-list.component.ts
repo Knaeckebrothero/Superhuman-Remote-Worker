@@ -77,8 +77,10 @@ export function isBundled(e: Expert): boolean {
             @for (e of filtered(); track e.id) {
               <tr>
                 <td class="name-cell">
-                  <app-icon size="sm" [style.color]="e.color">{{ e.icon || 'smart_toy' }}</app-icon>
-                  <span>{{ e.display_name }}</span>
+                  <span class="name-inner">
+                    <app-icon size="sm" [style.color]="e.color">{{ e.icon || 'smart_toy' }}</app-icon>
+                    <span>{{ e.display_name }}</span>
+                  </span>
                 </td>
                 <td>{{ e.expert_type || '—' }}</td>
                 <td>
@@ -89,19 +91,43 @@ export function isBundled(e: Expert): boolean {
                 </td>
                 <td class="actions-col">
                   @if (!bundled(e)) {
-                    <app-icon-button [ariaLabel]="'experts.edit' | transloco" variant="ghost" (clicked)="edit(e)">
-                      edit
+                    <app-icon-button
+                      size="sm"
+                      variant="ghost"
+                      [ariaLabel]="'experts.edit' | transloco"
+                      [tooltip]="'experts.edit' | transloco"
+                      (clicked)="edit(e)"
+                    >
+                      <app-icon size="sm">edit</app-icon>
                     </app-icon-button>
                   }
-                  <app-icon-button [ariaLabel]="'experts.duplicate' | transloco" variant="ghost" (clicked)="duplicate(e)">
-                    content_copy
+                  <app-icon-button
+                    size="sm"
+                    variant="ghost"
+                    [ariaLabel]="'experts.duplicate' | transloco"
+                    [tooltip]="'experts.duplicate' | transloco"
+                    (clicked)="duplicate(e)"
+                  >
+                    <app-icon size="sm">content_copy</app-icon>
                   </app-icon-button>
-                  <app-icon-button [ariaLabel]="'experts.export' | transloco" variant="ghost" (clicked)="exportExpert(e)">
-                    download
+                  <app-icon-button
+                    size="sm"
+                    variant="ghost"
+                    [ariaLabel]="'experts.export' | transloco"
+                    [tooltip]="'experts.export' | transloco"
+                    (clicked)="exportExpert(e)"
+                  >
+                    <app-icon size="sm">download</app-icon>
                   </app-icon-button>
                   @if (!bundled(e)) {
-                    <app-icon-button [ariaLabel]="'experts.delete' | transloco" variant="danger" (clicked)="askDelete(e)">
-                      delete
+                    <app-icon-button
+                      size="sm"
+                      variant="danger"
+                      [ariaLabel]="'experts.delete' | transloco"
+                      [tooltip]="'experts.delete' | transloco"
+                      (clicked)="askDelete(e)"
+                    >
+                      <app-icon size="sm">delete</app-icon>
                     </app-icon-button>
                   }
                 </td>
@@ -176,14 +202,20 @@ export function isBundled(e: Expert): boolean {
         border-bottom: 1px solid var(--border-color);
         color: var(--text-primary);
       }
-      .name-cell {
-        display: flex;
+      .name-cell .name-inner {
+        display: inline-flex;
         align-items: center;
         gap: 0.5rem;
       }
       .actions-col {
         text-align: right;
         white-space: nowrap;
+      }
+      .actions-col app-icon-button {
+        vertical-align: middle;
+      }
+      .actions-col app-icon-button + app-icon-button {
+        margin-left: 2px;
       }
       .empty {
         color: var(--text-muted);
