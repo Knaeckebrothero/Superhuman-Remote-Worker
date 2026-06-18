@@ -81,7 +81,7 @@ This is the net-new core. Pure functions, no DB, no FastAPI — fully unit-teste
 - Create: `src/core/skill_format.py`
 - Test: `tests/test_skill_format.py`
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```python
 # tests/test_skill_format.py
@@ -180,12 +180,12 @@ def test_set_skill_name_rewrites_frontmatter_only():
     assert "# PDF Filler" in out  # body untouched
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `python -m pytest tests/test_skill_format.py -v`
 Expected: FAIL with `ModuleNotFoundError: No module named 'src.core.skill_format'`
 
-- [ ] **Step 3: Write the module**
+- [x] **Step 3: Write the module**
 
 ```python
 # src/core/skill_format.py
@@ -313,12 +313,12 @@ def set_skill_name(text: str, new_name: str) -> str:
     return f"---\n{new_block}\n---\n{body}"
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `python -m pytest tests/test_skill_format.py -v`
 Expected: PASS (all cases)
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/core/skill_format.py tests/test_skill_format.py
@@ -334,7 +334,7 @@ Mirrors `0028_experts.sql` conventions (header block, `BEGIN` + `SET LOCAL` time
 **Files:**
 - Create: `orchestrator/database/migrations/app/0031_skills.sql`
 
-- [ ] **Step 1: Write the migration**
+- [x] **Step 1: Write the migration**
 
 ```sql
 -- migration:     0031_skills.sql
@@ -390,7 +390,7 @@ COMMENT ON TABLE skills IS
 COMMIT;
 ```
 
-- [ ] **Step 2: Apply the migration locally and verify the tables exist**
+- [x] **Step 2: Apply the migration locally and verify the tables exist**
 
 Run (against the local k3d / dev Postgres — adjust connection to your dev DB):
 ```bash
@@ -402,7 +402,7 @@ Expected: both tables print with the columns above; `uq_skills_name_owner` liste
 
 > Cross-check the migrate entrypoint against how `0030_capability_grants.sql` is applied in this repo (same runner). If unsure, grep `orchestrator/database/` for the migration runner and `docs/db_migration.md`.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add orchestrator/database/migrations/app/0031_skills.sql
@@ -419,7 +419,7 @@ Mirror the expert methods at `orchestrator/database/postgres.py:5248-5398`. `tag
 - Modify: `orchestrator/database/postgres.py` (add after `delete_expert`, ~line 5398)
 - Test: `tests/test_skill_crud.py` (DB methods are exercised live in Task 12; the unit test here covers the pure HTTP layer in Task 5)
 
-- [ ] **Step 1: Add the Skills persistence section**
+- [x] **Step 1: Add the Skills persistence section**
 
 ```python
     # ── Skills (Agent Skills, Slice 1: authoring foundation) ──────────────
@@ -542,12 +542,12 @@ Mirror the expert methods at `orchestrator/database/postgres.py:5248-5398`. `tag
 
 > No `skill_delete_blockers` in Slice 1: nothing references a skill yet (bindings are Slice 3). `skill_files` rows are removed by the `ON DELETE CASCADE` FK.
 
-- [ ] **Step 2: Sanity-check syntax**
+- [x] **Step 2: Sanity-check syntax**
 
 Run: `python -c "import orchestrator.database.postgres"`
 Expected: no import error (no test harness needed; live CRUD is verified in Task 12).
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add orchestrator/database/postgres.py
@@ -564,7 +564,7 @@ Mirror `ExpertInfo`/`ExpertCreate`/`ExpertUpdate` (`main.py:16108-16488`), `_is_
 - Modify: `orchestrator/main.py`
 - Test: `tests/test_skill_crud.py`
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```python
 # tests/test_skill_crud.py
@@ -630,12 +630,12 @@ def test_validate_frontmatter_allows_clean():
     _validate_skill_frontmatter({"name": "x", "description": "y"})
 ```
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 Run: `python -m pytest tests/test_skill_crud.py -v`
 Expected: FAIL with `ImportError: cannot import name 'SkillCreate'`
 
-- [ ] **Step 3: Add models near the experts models (`main.py`, after `ExpertUpdate` ~16488)**
+- [x] **Step 3: Add models near the experts models (`main.py`, after `ExpertUpdate` ~16488)**
 
 ```python
 class SkillInfo(BaseModel):
@@ -673,7 +673,7 @@ class SkillUpdate(BaseModel):
     is_global: bool | None = None
 ```
 
-- [ ] **Step 4: Add the flag helper near `_is_experts_db_enabled` (`main.py` ~951)**
+- [x] **Step 4: Add the flag helper near `_is_experts_db_enabled` (`main.py` ~951)**
 
 ```python
 def _is_skills_db_enabled() -> bool:
@@ -682,7 +682,7 @@ def _is_skills_db_enabled() -> bool:
     return os.getenv("SKILLS_DB_ENABLED", "").lower().strip() in ("true", "1", "yes")
 ```
 
-- [ ] **Step 5: Add the scan, parse, and validation helpers near the experts helpers (`main.py`, after `_validate_expert_fragment` ~16507)**
+- [x] **Step 5: Add the scan, parse, and validation helpers near the experts helpers (`main.py`, after `_validate_expert_fragment` ~16507)**
 
 ```python
 # Cache bundled skills at startup (mirrors _experts_cache).
@@ -837,12 +837,12 @@ async def _create_forked_skill(
     raise HTTPException(status_code=409, detail="No free name for the copy")
 ```
 
-- [ ] **Step 6: Run the tests to verify they pass**
+- [x] **Step 6: Run the tests to verify they pass**
 
 Run: `python -m pytest tests/test_skill_crud.py -v`
 Expected: PASS
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add orchestrator/main.py tests/test_skill_crud.py
@@ -858,7 +858,7 @@ Mirror the experts handlers at `main.py:16187-16679`. Auth via `require_approved
 **Files:**
 - Modify: `orchestrator/main.py` (place near the experts endpoints, ~16760)
 
-- [ ] **Step 1: Add the create, list, reload, get endpoints**
+- [x] **Step 1: Add the create, list, reload, get endpoints**
 
 ```python
 @app.post("/api/skills")
@@ -939,7 +939,7 @@ async def get_skill(request: Request, skill_id: str) -> dict[str, Any]:
     return {**bundle, "source": "bundled"}
 ```
 
-- [ ] **Step 2: Add the update and delete endpoints**
+- [x] **Step 2: Add the update and delete endpoints**
 
 ```python
 @app.put("/api/skills/{skill_id}")
@@ -992,12 +992,12 @@ async def delete_skill(request: Request, skill_id: str) -> dict[str, Any]:
     return {"deleted": True}
 ```
 
-- [ ] **Step 3: Smoke-check the app imports**
+- [x] **Step 3: Smoke-check the app imports**
 
 Run: `python -c "import orchestrator.main"`
 Expected: no import error (route registration succeeds).
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add orchestrator/main.py
@@ -1013,14 +1013,14 @@ Export/import diverge from experts: **native zip**, not JSON. Export returns a `
 **Files:**
 - Modify: `orchestrator/main.py` (after the CRUD endpoints from Task 5)
 
-- [ ] **Step 1: Ensure the FastAPI imports are present**
+- [x] **Step 1: Ensure the FastAPI imports are present**
 
 Confirm `File`, `UploadFile`, and `Response` are imported at the top of `main.py`. If any are missing, add to the existing `from fastapi import ...` line.
 
 Run: `python -c "from fastapi import File, UploadFile, Response; print('ok')"`
 Expected: `ok`
 
-- [ ] **Step 2: Add duplicate, export, import endpoints**
+- [x] **Step 2: Add duplicate, export, import endpoints**
 
 ```python
 @app.post("/api/skills/{skill_id}/duplicate")
@@ -1087,12 +1087,12 @@ async def import_skill(request: Request, file: UploadFile = File(...)) -> dict[s
 
 > Reusing `_create_forked_skill` for import keeps the collision/`set_skill_name` logic in one place; the imported copy's slug becomes `<name>-import` only if `<name>` is already taken by this owner.
 
-- [ ] **Step 3: Smoke-check imports**
+- [x] **Step 3: Smoke-check imports**
 
 Run: `python -c "import orchestrator.main"`
 Expected: no error.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add orchestrator/main.py
@@ -1109,7 +1109,7 @@ A bundled skill proves the scanner/bundled path end-to-end; the MCP tools mirror
 - Create: `config/skills/hello-skill/SKILL.md`
 - Modify: `orchestrator/mcp/server.py`, `orchestrator/mcp/client.py`
 
-- [ ] **Step 1: Create the bundled example skill**
+- [x] **Step 1: Create the bundled example skill**
 
 ```markdown
 ---
@@ -1126,7 +1126,7 @@ A minimal bundled skill that proves discovery and the bundled directory path.
 2. Report its name and description back to the user.
 ```
 
-- [ ] **Step 2: Add client methods (`orchestrator/mcp/client.py`, after `reload_experts` ~1143)**
+- [x] **Step 2: Add client methods (`orchestrator/mcp/client.py`, after `reload_experts` ~1143)**
 
 ```python
     @_create_retry_decorator()
@@ -1150,7 +1150,7 @@ A minimal bundled skill that proves discovery and the bundled directory path.
         return resp.json()
 ```
 
-- [ ] **Step 3: Add server tools (`orchestrator/mcp/server.py`, near `reload_experts` ~1400)**
+- [x] **Step 3: Add server tools (`orchestrator/mcp/server.py`, near `reload_experts` ~1400)**
 
 ```python
 @mcp.tool
@@ -1198,7 +1198,7 @@ async def reload_skills() -> str:
     return f"Skills reloaded ({result.get('count', 0)} bundled skills loaded)."
 ```
 
-- [ ] **Step 4: Add the `fmt` formatters used above**
+- [x] **Step 4: Add the `fmt` formatters used above**
 
 Find the module the experts formatters live in (`fmt.format_experts` / `fmt.format_expert_detail` — grep `def format_experts` under `orchestrator/mcp/`). Add sibling formatters mirroring them:
 
@@ -1225,12 +1225,12 @@ def format_skill_detail(skill_id: str, data: dict) -> str:
     )
 ```
 
-- [ ] **Step 5: Smoke-check imports**
+- [x] **Step 5: Smoke-check imports**
 
 Run: `python -c "import orchestrator.mcp.server, orchestrator.mcp.client"`
 Expected: no error.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add config/skills/hello-skill/SKILL.md orchestrator/mcp/server.py orchestrator/mcp/client.py
@@ -1247,7 +1247,7 @@ Mirror the experts DTOs (`api.model.ts`) and service methods (`api.service.ts:47
 - Modify: `cockpit/src/app/core/models/api.model.ts`
 - Modify: `cockpit/src/app/core/services/api.service.ts`
 
-- [ ] **Step 1: Add the DTOs (`api.model.ts`, near the `Expert` interfaces)**
+- [x] **Step 1: Add the DTOs (`api.model.ts`, near the `Expert` interfaces)**
 
 ```typescript
 export interface Skill {
@@ -1285,7 +1285,7 @@ export interface SkillUpdateRequest {
 }
 ```
 
-- [ ] **Step 2: Add the service methods (`api.service.ts`, after the experts methods ~530)**
+- [x] **Step 2: Add the service methods (`api.service.ts`, after the experts methods ~530)**
 
 ```typescript
   /** List skills (bundled + DB-backed). Fails gracefully to []. */
@@ -1335,12 +1335,12 @@ export interface SkillUpdateRequest {
 
 Ensure `Skill`, `SkillDetail`, `SkillCreateRequest`, `SkillUpdateRequest` are added to the existing api.model import in `api.service.ts`.
 
-- [ ] **Step 3: Build-check the types**
+- [x] **Step 3: Build-check the types**
 
 Run: `cd cockpit && npx tsc --noEmit -p tsconfig.json`
 Expected: no new type errors from these files.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add cockpit/src/app/core/models/api.model.ts cockpit/src/app/core/services/api.service.ts
@@ -1357,7 +1357,7 @@ The editor's pure helpers (slugify, files-array ↔ record, starter template) ar
 - Create: `cockpit/src/app/views/skills/skill-editor.util.ts`
 - Test: `cockpit/src/app/views/skills/skill-editor.util.spec.ts`
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```typescript
 // cockpit/src/app/views/skills/skill-editor.util.spec.ts
@@ -1385,12 +1385,12 @@ describe('skill-editor.util', () => {
 });
 ```
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 Run: `cd cockpit && npx vitest run src/app/views/skills/skill-editor.util.spec.ts`
 Expected: FAIL (module not found).
 
-- [ ] **Step 3: Write the util**
+- [x] **Step 3: Write the util**
 
 ```typescript
 // cockpit/src/app/views/skills/skill-editor.util.ts
@@ -1434,12 +1434,12 @@ export function hasSkillMd(files: SkillFile[]): boolean {
 
 > `recordToFiles` sorts SKILL.md first for display; the round-trip test compares against an array that is already in that order. If you add files out of order in the editor, persist via `filesToRecord` (order-independent).
 
-- [ ] **Step 4: Run to verify pass**
+- [x] **Step 4: Run to verify pass**
 
 Run: `cd cockpit && npx vitest run src/app/views/skills/skill-editor.util.spec.ts`
 Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add cockpit/src/app/views/skills/skill-editor.util.ts cockpit/src/app/views/skills/skill-editor.util.spec.ts
@@ -1460,7 +1460,7 @@ Mirror the experts components' patterns (standalone, signals, Transloco, the lis
 - Modify: `cockpit/src/app/shell/sidebar/sidebar.component.ts`
 - Modify: `cockpit/src/assets/i18n/en.json`
 
-- [ ] **Step 1: Add the page container**
+- [x] **Step 1: Add the page container**
 
 ```typescript
 // cockpit/src/app/views/skills/skills-page.component.ts
@@ -1476,7 +1476,7 @@ import {SkillsListComponent} from './skills-list.component';
 export class SkillsPageComponent {}
 ```
 
-- [ ] **Step 2: Add the list component**
+- [x] **Step 2: Add the list component**
 
 ```typescript
 // cockpit/src/app/views/skills/skills-list.component.ts
@@ -1649,7 +1649,7 @@ export class SkillsListComponent implements OnInit {
 }
 ```
 
-- [ ] **Step 3: Add the multi-file editor component**
+- [x] **Step 3: Add the multi-file editor component**
 
 ```typescript
 // cockpit/src/app/views/skills/skill-editor.component.ts
@@ -1815,7 +1815,7 @@ export class SkillEditorComponent implements OnInit {
 
 > If `app-textarea` has no `monospace` input, drop it or add a `class` binding — match the actual `AppTextareaComponent` API used in `expert-editor.component.ts`. `prompt()` for the new-file path is a pragmatic Slice-1 affordance; a proper inline field is a polish item.
 
-- [ ] **Step 4: Register routes (`app.routes.ts`)**
+- [x] **Step 4: Register routes (`app.routes.ts`)**
 
 ```typescript
 import {SkillsPageComponent} from './views/skills/skills-page.component';
@@ -1827,7 +1827,7 @@ import {SkillEditorComponent} from './views/skills/skill-editor.component';
 { path: 'skills/:id/edit', component: SkillEditorComponent, canActivate: [authGuard] },
 ```
 
-- [ ] **Step 5: Add the nav entry (`sidebar.component.ts`, next to the experts link ~86-93)**
+- [x] **Step 5: Add the nav entry (`sidebar.component.ts`, next to the experts link ~86-93)**
 
 ```html
 <a class="nav-link" routerLink="/skills" routerLinkActive="active">
@@ -1836,7 +1836,7 @@ import {SkillEditorComponent} from './views/skills/skill-editor.component';
 </a>
 ```
 
-- [ ] **Step 6: Add i18n strings (`en.json`)**
+- [x] **Step 6: Add i18n strings (`en.json`)**
 
 ```json
 "skills": {
@@ -1873,12 +1873,12 @@ import {SkillEditorComponent} from './views/skills/skill-editor.component';
 
 Also add `"skills": "Skills"` under the existing `nav` block.
 
-- [ ] **Step 7: Build-check Cockpit**
+- [x] **Step 7: Build-check Cockpit**
 
 Run: `cd cockpit && npm install --no-save @monaco-editor/loader && npx ng build`
 Expected: build succeeds. (Per repo notes, `ng build` needs the monaco loader installed first; vitest is reliable for unit tests.)
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add cockpit/src/app/views/skills/ cockpit/src/app/app.routes.ts cockpit/src/app/shell/sidebar/sidebar.component.ts cockpit/src/assets/i18n/en.json
@@ -1896,7 +1896,7 @@ Mirror `EXPERTS_DB_ENABLED` exactly (`values.yaml:136`, `configmap.yaml:57`, `or
 - Modify: `helm/templates/configmap.yaml`
 - Modify: `helm/templates/orchestrator/deployment.yaml`
 
-- [ ] **Step 1: Add the helm value (`values.yaml`, next to `expertsDbEnabled` ~136)**
+- [x] **Step 1: Add the helm value (`values.yaml`, next to `expertsDbEnabled` ~136)**
 
 ```yaml
   # DB-backed Agent Skills (Slice 1). Prod-safe default off; the dev values
@@ -1904,13 +1904,13 @@ Mirror `EXPERTS_DB_ENABLED` exactly (`values.yaml:136`, `configmap.yaml:57`, `or
   skillsDbEnabled: "false"
 ```
 
-- [ ] **Step 2: Map it in the ConfigMap (`configmap.yaml`, next to line 57)**
+- [x] **Step 2: Map it in the ConfigMap (`configmap.yaml`, next to line 57)**
 
 ```yaml
   SKILLS_DB_ENABLED: {{ .Values.agent.skillsDbEnabled | default "false" | quote }}
 ```
 
-- [ ] **Step 3: Reference it in the orchestrator Deployment env (`orchestrator/deployment.yaml`, next to lines 108-112)**
+- [x] **Step 3: Reference it in the orchestrator Deployment env (`orchestrator/deployment.yaml`, next to lines 108-112)**
 
 ```yaml
             - name: SKILLS_DB_ENABLED
@@ -1920,14 +1920,14 @@ Mirror `EXPERTS_DB_ENABLED` exactly (`values.yaml:136`, `configmap.yaml:57`, `or
                   key: SKILLS_DB_ENABLED
 ```
 
-- [ ] **Step 4: Lint the chart**
+- [x] **Step 4: Lint the chart**
 
 Run: `helm lint helm/ && helm template helm/ | grep -A4 SKILLS_DB_ENABLED`
 Expected: lint passes; the env block + configmap key render.
 
-> Also set `skillsDbEnabled: "true"` in the dev/experimental values override (wherever `expertsDbEnabled` is turned on for dev — grep for it; the comment at `values.yaml:135` says a separate dev file enables it).
+> Also set `skillsDbEnabled: "true"` in the in-repo dev values that turn `expertsDbEnabled` on: `deployment/values-local.yaml` (Tilt/local k3d) and `deployment/values-experimental.yaml` (develop→Fleet→dev cluster). **DONE** — both committed; `helm template` confirms `SKILLS_DB_ENABLED: "true"` renders in the configmap + orchestrator env.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add helm/values.yaml helm/templates/configmap.yaml helm/templates/orchestrator/deployment.yaml
@@ -1940,7 +1940,7 @@ git commit -m "feat(skills): wire SKILLS_DB_ENABLED through helm (dev-on/prod-of
 
 **Files:** none (verification only)
 
-- [ ] **Step 1: Backend tests + lint**
+- [x] **Step 1: Backend tests + lint**
 
 Run:
 ```bash
@@ -1949,7 +1949,7 @@ ruff check src/core/skill_format.py orchestrator/main.py orchestrator/database/p
 ```
 Expected: all tests pass; ruff clean (the push workflow runs ruff and will rewrite SHAs otherwise).
 
-- [ ] **Step 2: Cockpit tests + build**
+- [x] **Step 2: Cockpit tests + build**
 
 Run:
 ```bash
@@ -1957,7 +1957,7 @@ cd cockpit && npx vitest run src/app/views/skills/ && npx ng build
 ```
 Expected: skills unit tests pass; build succeeds.
 
-- [ ] **Step 3: Deploy to local k3d with the flag on**
+- [x] **Step 3: Deploy to local k3d with the flag on**
 
 Bring up / sync the local tilt stack with `SKILLS_DB_ENABLED=true` for the orchestrator, and apply migration `0031`. Confirm:
 ```bash
@@ -1968,7 +1968,7 @@ Expected: includes `hello-skill` (source `bundled`).
 
 > Per repo notes, the orchestrator MCP points at the remote cluster; to drive *local* k3d code use `X-Internal-Key: dev_mcp_internal_key` + in-pod `python3 urllib`, and log in via Cockpit once to seed the first user. A fresh cluster also needs an LLM provider for the readiness gate.
 
-- [ ] **Step 4: End-to-end authoring round-trip (the DoD)**
+- [x] **Step 4: End-to-end authoring round-trip (the DoD)**
 
 In Cockpit (logged in, flag on):
 1. **Create from scratch** — `/skills/new`, fill display name, edit the SKILL.md body, add a `references/guide.md` file, Save → appears in the list as `user`.
@@ -1986,14 +1986,14 @@ In Cockpit (logged in, flag on):
    ```
    Expected: `0`.
 
-- [ ] **Step 5: Negative checks**
+- [x] **Step 5: Negative checks**
 
 - Importing a zip with no `SKILL.md` → 422 with a clear message.
 - Importing a zip with a `../escape` path → 422.
 - Editing a skill and changing the frontmatter `name` → 422 ("must match the skill's name").
 - A SKILL.md frontmatter with a `connections:` block → 422 (deny-scan).
 
-- [ ] **Step 6: Final commit (if any verification fixes were needed)**
+- [x] **Step 6: Final commit (if any verification fixes were needed)**
 
 ```bash
 git add -A
@@ -2022,3 +2022,27 @@ git commit -m "fix(skills): address Slice-1 live-verification findings"
 **Type consistency** — `name`/`description` flow: parsed by `skill_identity` (Task 1) → `_parse_skill_bundle` (Task 4) → `create_skill`/`update_skill` (Task 3); the row's denormalized `description` is refreshed on every file-bearing save. `files` is `dict[str,str]` end-to-end (API ↔ DB ↔ `skill_format`), and `Record<string,string>` ↔ `SkillFile[]` on the Cockpit side (Task 9 helpers). `_create_forked_skill` (Task 4) is the single fork path used by both duplicate and import (Task 6).
 
 **Placeholder scan** — every code step carries real, adapted code. UI primitive import paths and the `app-textarea` API are the only "verify against the experts component" notes (Task 10), because those are existing shared components whose exact paths must match the repo.
+
+---
+
+## As-built notes (post-implementation, 2026-06-18)
+
+All 12 tasks executed inline on `develop` (commits `b117fb3f`..`d138d234`), plus two follow-ups. Every step above is checked. Where the build diverged from the written plan:
+
+**Backend refinements**
+- **`_create_forked_skill` gained `prefer_original`** (Task 4/6). Import tries the *source* name first and stores the `SKILL.md` **verbatim** (no frontmatter rewrite) so a clean `import → export` is byte-comparable; only on a name collision does it suffix + rewrite. Duplicate still always suffixes `-copy`. The written plan's simpler "always suffix" helper would have failed the byte-comparable DoD.
+- `_parse_skill_bundle` enforces **path-traversal validation** in addition to `hard_deny_scan` (net-new vs experts, since skills carry a file tree).
+
+**Cockpit as-built (corrections to the plan's draft component code, Task 10)** — verified against the live experts components + `ng build`:
+- Shared UI primitives import from **`../../ui/<name>`** barrels (not `../../shared/ui/<name>/<name>.component`).
+- Form controls use **`[value]` + `(valueChange)`**, *not* `[(ngModel)]` → **no `FormsModule`** import needed.
+- Buttons: `variant="primary|secondary|danger"` + `(clicked)`. Icon-buttons: `size`/`variant`/`[ariaLabel]`/`[tooltip]` + `(clicked)` with a child `<app-icon>`. Dialog: `[open]`/`[title]`/`(closed)` + `appDialogActions`. Badge: `[tone]`. Page wrapper uses `SidebarToggleComponent`.
+- Editor is a multi-file tab list + per-file `<app-textarea>`; add-file via `prompt()` (Slice-1 pragmatic affordance).
+
+**Dev enablement (Task 11 follow-up)** — the flag is set **in-repo** (not external): `deployment/values-local.yaml` (Tilt/local k3d) and `deployment/values-experimental.yaml` (develop→Fleet→dev cluster), mirroring `expertsDbEnabled`. Chart default stays OFF (prod-safe).
+
+**Bundle-budget follow-up** — `cockpit/angular.json` budgets right-sized: initial warn `1.5MB→2.25MB` / error `2.25MB→2.75MB`, component-style warn `32kB→36kB` / error `40kB→48kB`. The 2.07 MB raw initial bundle is **~420 kB gzipped transfer** (healthy); the stale 1.5 MB warning was pure noise and the 2.25 MB error sat ~180 kB above current (fragile). Route-level lazy loading remains the deeper raw-size lever if ever needed.
+
+**Live verification (Task 12, §3–5) — DONE on k3d.** Tilt rebuilt + deployed the committed code; orchestrator listens on **:8085**; auth via the **MCP-header trick** (`X-Internal-Key: dev_mcp_internal_key` + `X-MCP-User-Id: <approved user>`). An in-pod urllib script ran **14/14 checks**: bundled `hello-skill` discoverable; create/get/update (version bump + file replacement)/delete; **byte-comparable `import → export`** and export-byte-comparable; duplicate→`-copy`; name parsed from frontmatter; negatives 422 (rename-via-frontmatter, missing `SKILL.md`). `skills`/`skill_files` tables confirmed present (migration `0031` applied on orchestrator start). The e2e script was a throwaway (`/tmp`, not committed); test rows cleaned up. Only a browser click-through of `/skills` remains optional.
+
+**Deferred to later slices (unchanged):** persona fencing of menu/body (Slice 2 runtime), project-Gitea `skills/` scan + `use_skill` + workspace materialization (Slice 2), expert↔skill bindings + `todo_guide`/`research_guide` migration (Slice 3), script execution behind the grants `evaluate()` gate + binary assets (Slice 4).
