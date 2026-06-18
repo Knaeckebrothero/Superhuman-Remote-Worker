@@ -7,6 +7,7 @@
 - `docs/superpowers/plans/2026-06-15-phase1-chart-correctness-gates.md` — the CI render/`kubeconform`/schema gates this generator's drift-gate rides on.
 - `helm/values.example.yaml` — the curated customer value surface the form mirrors.
 - `helm/README.md` §Secret schema — the canonical secret modes; `secretKeyRef` keys across `helm/templates/` are the machine-readable key set the skeleton is checked against.
+- `HomeLab/deployments_managed/srw-sales-page/` (current ConfigMap hosting) + `docker/Dockerfile.cockpit` / `build-cockpit` in `.github/workflows/develop.yml` — the CI image pattern §13 normalizes the sales page onto.
 
 **Goal:** Replace "read a 765-line install guide and hand-edit a 217-line values
 file" with a static, client-side **config generator**: the operator picks a
@@ -38,8 +39,9 @@ exactly this friction. It is the natural destination for the sales page's
 
 **Strategic fit (deliberately small build):** this is a conversion tool for the
 self-host → commercial-license funnel, not new product surface. Total footprint:
-two static files, one CI job, one HomeLab deploy edit, and a doc move. It ships
-under the feature-freeze because it drives revenue and cannot become a
+two new static files + a trivial Dockerfile, one CI build job plus the drift-gate
+job, a one-line HomeLab manifest swap (ConfigMap → image), and a doc move. It
+ships under the feature-freeze because it drives revenue and cannot become a
 maintenance burden (see §9, the drift-gate).
 
 ## 2. Goals / Non-goals
@@ -54,7 +56,7 @@ maintenance burden (see §9, the drift-gate).
 - Automating cluster/DNS/TLS bootstrap (k3s, cert setup). Stays in the guide; the generator links to it.
 - Exposing the full 1345-key chart surface. Curated subset only.
 - Replacing the install guide. The generator *complements* it.
-- A build pipeline / framework. Vanilla, buildless.
+- A JS framework or client-side bundler. Vanilla source COPYed into an nginx image; the only "build" is the trivial Docker image (§13).
 
 ## 3. Placement & directory reorg
 
@@ -70,13 +72,17 @@ website/
   index.html      # MOVED from repo root (the existing sales page, unchanged content)
   configure.html  # NEW — the generator page (form + output UI)
   generator.js    # NEW — the "resolver": pure, DOM-free generation logic (ES module)
+  og-image.png    # NEW — 1200×630 social card (resolves the open landing-audit item)
+docker/
+  Dockerfile.website  # NEW — nginx:alpine + COPY website/ + nginx config
 ```
 
-- **Source of truth:** these three files in-repo (mirrors how root `index.html` is the source today).
-- **Served at:** `/` → `index.html`, `/configure.html` → the generator (optionally a clean `/configure` via an nginx `try_files` rule — polish, not required). `configure.html` loads `generator.js` via `<script type="module" src="generator.js">`.
-- **Tech:** vanilla JS, no framework, no build step. `generator.js` is an ES module so the *same* code is importable by the CI test (Node ESM) — one source of generation truth.
+- **Source of truth:** these files in-repo (mirrors how root `index.html` is the source today). They are baked into a container image at CI time (§13) — no more hand-inlining into a ConfigMap.
+- **Served at:** `/` → `index.html`, `/configure` → the generator. Because we now own the nginx config in the image (§13), a clean `/configure` URL via `try_files` and sensible cache headers are trivial. `configure.html` loads `generator.js` via `<script type="module" src="generator.js">`.
+- **Tech:** vanilla JS, no framework, no JS bundler — the only "build" is a Docker `COPY`. `generator.js` is an ES module so the *same* code is importable by the CI drift-gate (Node ESM) — one source of generation truth.
 - **`<noscript>` fallback:** a short message linking to the manual install guide, since the tool requires JS by design.
 - **Soft budget:** ~50kb gzipped for the generator (generous vs the sales page, still disciplined — zero dependencies).
+- **`og:image`:** owning the image lets us serve a real `1200×630` PNG file (resolving the open landing-audit item — LinkedIn/Twitter reject data-URI cards). Drop `website/og-image.png` and reference it absolutely.
 
 ## 4. The pure generator module (`generator.js`)
 
@@ -219,9 +225,10 @@ images.
 ## 11. Out of scope (YAGNI)
 
 No backend; no analytics/telemetry; no cluster/DNS/TLS automation; no full
-1345-key surface; no install-guide replacement; no framework or build step; no
-multi-language. The generator does one thing: turn a short form into a correct,
-copy-pasteable install bundle.
+1345-key surface; no install-guide replacement; no JS framework or client-side
+bundler; no deploy automation (manual redeploy, §13); no multi-language. The
+generator does one thing: turn a short form into a correct, copy-pasteable
+install bundle.
 
 ## 12. Dependencies & preconditions (revenue reality)
 
@@ -235,24 +242,60 @@ self-host CTA and confirming a pullable chart** — otherwise it is a polished d
 end. Implementation plan must list these as blocking prerequisites, not
 afterthoughts.
 
-## 13. Migration — moving `index.html` into `website/`
+## 13. Packaging & deployment (image-based)
 
-`index.html` is the source of truth for the deployed sales page; the deployed
-copy is inlined into the `srw-sales-page-content` ConfigMap and mounted via a
-single-file `subPath`. The move requires:
+Today the sales page is the lone SRW surface hand-inlined into a ConfigMap; every
+other component is a CI-built **public** GHCR image. This normalizes it. Decided
+deploy model (deliberately low-automation — the site changes a few times a year):
+**CI builds an image and publishes `:latest`; deploy is a manual redeploy.**
 
-- **Repo:** `git mv index.html website/index.html`; add `website/configure.html`, `website/generator.js`.
-- **HomeLab deploy** (`HomeLab/deployments_managed/srw-sales-page/10-deployment.yaml`):
-  - ConfigMap `srw-sales-page-content` gains `configure.html` and `generator.js` keys (inlined from `website/*`), alongside the existing (updated) `index.html`.
-  - Switch the nginx volume mount from the single-file `subPath: index.html` to a **directory mount** of the ConfigMap at `/usr/share/nginx/html/`, so all three files are served. nginx's default `index index.html` keeps `/` serving the sales page.
-  - Roll out via the existing flow (re-indent files into the ConfigMap block scalars, push to HomeLab, Fleet sync, `kubectl rollout restart deploy/srw-sales-page -n srw-sales-page`).
-- **Doc references to update:** `docs/website.md` (line ~147, the `gzip -c index.html` example path) and `docs/issues/sales_page_landing_audit.md` (the "repo root" source-of-truth notes). The `project_sales_page_deploy` memory must be updated to describe the new directory-mount, three-file flow.
+- **Image** — `docker/Dockerfile.website`: `FROM nginx:alpine`, `COPY website/`
+  into the html root, and a small server block (clean `/configure` via
+  `try_files`, static cache headers, `listen 80`). It is `Dockerfile.cockpit`
+  minus the Node build stage — there is nothing to compile.
+
+- **CI build job (`build-website`)** in `develop.yml`, modeled on `build-cockpit`:
+  - Change-gated on a new `changes.outputs.website` filter (diff over `website/`
+    and `docker/Dockerfile.website`).
+  - **Depends on the `generator-test` drift-gate (§9)** — a broken generator is
+    never published.
+  - On PR: `push: false` (builds the image to validate the Dockerfile only). On
+    push to `develop`: `push: true`, tagging
+    `ghcr.io/knaeckebrothero/superhuman-remote-worker-website:latest` (a
+    `sha-XXXX` tag is also pushed for traceability; HomeLab references `:latest`).
+  - **One-time:** flip the new GHCR package to **public** (first push defaults to
+    private) so the cluster pulls with no secret — same as the other SRW images.
+  - No `deploy-experimental` change, no tag auto-bump — CI's job ends at "image
+    published."
+
+- **HomeLab manifest swap** (`HomeLab/deployments_managed/srw-sales-page/10-deployment.yaml`):
+  - **Delete** the `srw-sales-page-content` ConfigMap and the single-file
+    `subPath` mount.
+  - Point the Deployment at
+    `image: ghcr.io/knaeckebrothero/superhuman-remote-worker-website:latest` with
+    `imagePullPolicy: Always`. **Keep** the Namespace, Service (port 80), and
+    Ingress (`superhuman-remote-worker.com`, Traefik, cert-manager DNS-01)
+    unchanged. Stays its own Fleet bundle → independent failure domain preserved.
+
+- **Rollout (manual, by design):** after CI publishes a new `:latest`, redeploy
+  on demand with `kubectl rollout restart deploy/srw-sales-page -n srw-sales-page`
+  (`Always` pull refetches the image). That is the entire deploy step — no
+  ConfigMap re-indenting, no cross-repo sync, no `kubectl` for routine copy work
+  beyond this one command when you choose to publish.
+
+- **`index.html` move + doc references:** `git mv index.html website/index.html`;
+  add the new files. Update `docs/website.md` (the `gzip -c index.html` path) and
+  `docs/issues/sales_page_landing_audit.md` (its "repo root" + "inline into
+  ConfigMap" notes — the ConfigMap flow is retired). Update the
+  `project_sales_page_deploy` memory to describe the image build + manual-restart
+  flow.
 
 ## 14. Testing strategy
 
 - **`generator-test` CI job** (§9) — the authoritative correctness gate across all three profiles.
 - **Local dev:** a `node` script invoking `generate()` per profile and piping through the §9 `ktest`-style helper, runnable before pushing (same tooling as the Phase-1 plan's prerequisites).
 - **Manual smoke:** open `website/configure.html` in a browser, generate each profile, confirm copy/download and the local-fill toggle; verify `<noscript>` shows the guide link.
+- **Image build:** `build-website` builds `docker/Dockerfile.website` on every PR (`push: false`), so a broken Dockerfile/image fails before merge; develop pushes publish `:latest`. A local `docker build -f docker/Dockerfile.website .` + `docker run` smoke-serves all routes (`/`, `/configure`, `/og-image.png`).
 - **Byte budget:** `gzip -c website/configure.html | wc -c` (+ `generator.js`) checked against the ~50kb soft budget.
 
 ## 15. Open risks
