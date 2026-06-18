@@ -33,7 +33,7 @@ def _normalize_config_name(config_name: str, purpose: str) -> str:
     bound expert is applied via the thread's ``config_override`` (sessions) or
     ``AGENT_EXPERT_ID`` (jobs), so a UUID in this slot is always wrong — boot
     the purpose's base config instead. See
-    docs/features/global_expert_management.md."""
+    docs/done/global_expert_management.md."""
     if not config_name:
         return config_name
     try:

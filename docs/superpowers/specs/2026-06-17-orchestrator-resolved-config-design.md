@@ -1,7 +1,7 @@
 # Orchestrator-Resolved Config — Design Spec
 
 **Status:** Approved design (2026-06-17), pending implementation plan.
-**Supersedes:** `docs/features/global_expert_management.md` **Decision 6**
+**Supersedes:** `docs/done/global_expert_management.md` **Decision 6**
 (agent-side resolution). That supersession must be written into the vault as part
 of implementation — this doc is the new decision of record.
 

@@ -45,7 +45,7 @@
 
 ## Context & resolved design questions
 
-- **Spec:** `docs/features/global_expert_management.md` — decisions 8, 9, 19, 21–23; catalog at lines **274–282**; enforcement flow **341–360**; `capability_grants` DDL sketch **238–268**.
+- **Spec:** `docs/done/global_expert_management.md` — decisions 8, 9, 19, 21–23; catalog at lines **274–282**; enforcement flow **341–360**; `capability_grants` DDL sketch **238–268**.
 - **Posture — deny-by-default via grandfathering (the central v2 change).** The dispatch PEP checks the **full merged config** (`config_resolver.py` `data` after `_apply_settings_matrix`). The operator base (`config/defaults.yaml`) ships `tools.shell` + `tools.delegation` + `delegation.enabled: true` for **every** worker job; the session base (`persistent_defaults.yaml`) ships `tools.shell` (delegation empty). With deny-default grants, an un-grandfathered non-admin would have **every** job rejected — a self-DoS. **Fix:** migration `0030` grandfathers all existing approved users with `shell_tools` + `delegation` grants (the always-on base capabilities). New principals start deny-by-default; an admin grants them. This honors spec decision 9 ("reject, no silent stripping") and decision 19's "no-op on upgrade" (existing users unaffected) without trimming the base or injecting capabilities.
 - **Verified base values (so we grandfather only what's needed):** `defaults.yaml` `autonomy: review` (= ceiling default → no autonomy self-DoS); `sql`/`mongodb`/`graph: []` (empty → datasource not triggered); `persistent_defaults.yaml` `permission_mode: supervised` (lowest → no permission self-DoS). So **only `shell_tools` + `delegation` need grandfathering**; autonomy/permission/model/datasource escalations are opt-in and correctly require explicit grants (not grandfathered — that is the point of deny-by-default).
 - **Migration number:** `0029` is taken by `0029_add_mistral_provider.sql`; this slice uses **`0030`** and corrects every stale `0029_capability_grants` reference (Task 14).
@@ -73,7 +73,7 @@
 - `orchestrator/services/config_resolver.py` — `capture` out-param on `resolve_config`.
 - `src/core/expert_resolution.py` — canonicalize-before-scan + **reject non-ASCII keys**.
 - `orchestrator/main.py` — `GrantDenied`; save-time PEP; dispatch PEPs (job + session + resume, fail-closed); `user_experts` kill-switch; `can_use_vm` swap; `/api/admin/grants` CRUD + audit; `/api/users/me/capabilities`.
-- `docs/features/global_expert_management.md`, `docs/db_migration.md`, `docs/superpowers/plans/2026-06-15-user-defined-experts-slice-1.md` — 0029→0030.
+- `docs/done/global_expert_management.md`, `docs/db_migration.md`, `docs/superpowers/plans/2026-06-15-user-defined-experts-slice-1.md` — 0029→0030.
 
 ## Test commands
 - Pure unit (authoritative for this slice): `python -m pytest tests/test_capability_grants.py -v`
@@ -98,7 +98,7 @@
 --                (decision 23). Grandfathers existing approved users for the base-shipped
 --                always-on capabilities (shell, delegation) so deny-by-default is a no-op
 --                on upgrade (decision 19). 0029 was claimed by add_mistral_provider.
---                Design: docs/features/global_expert_management.md (Slice 2).
+--                Design: docs/done/global_expert_management.md (Slice 2).
 -- depends-on:    0001_initial.sql
 -- expected:      < 1s. Two empty tables + INSERT..SELECT backfills over (small) users.
 -- locks:         AccessExclusiveLock on the new tables only.
@@ -212,7 +212,7 @@ def test_meet_bool_enum_list():
 framework imports — hermetically unit-testable (the security boundary). Async DB
 glue is in orchestrator/services/grants_service.py.
 
-Spec: docs/features/global_expert_management.md (decisions 8, 9, 19, 21-23).
+Spec: docs/done/global_expert_management.md (decisions 8, 9, 19, 21-23).
 Restrict-only (decision 22): a more-specific scope may only narrow an inherited
 value. Deny-by-default for security keys; existing users grandfathered by the
 0030 migration backfill (shell_tools, delegation)."""
@@ -982,7 +982,7 @@ async def _resolve_session_config(thread, metadata, *, config_override=None, sta
 
 ### Task 14: Admin grants API + `/api/users/me/capabilities` + doc renumber
 
-**Files:** `orchestrator/main.py`; `docs/features/global_expert_management.md`; `docs/db_migration.md`; `docs/superpowers/plans/2026-06-15-user-defined-experts-slice-1.md`.
+**Files:** `orchestrator/main.py`; `docs/done/global_expert_management.md`; `docs/db_migration.md`; `docs/superpowers/plans/2026-06-15-user-defined-experts-slice-1.md`.
 
 - [ ] **Step 1: Add endpoints** (model on `admin_patch_user`/`_require_admin`):
 
@@ -1033,7 +1033,7 @@ async def my_capabilities(request: Request) -> dict:
     return {"is_admin": False, "grants": grants, "catalog": CATALOG}
 ```
 
-- [ ] **Step 2: Renumber 0029→0030 EVERYWHERE.** Edit: `docs/db_migration.md:365` (note that 0029 went to mistral; grants = 0030); `docs/features/global_expert_management.md` (schema header ~238, Slice-1 reserve ~489, References bullet ~620); **and `docs/superpowers/plans/2026-06-15-user-defined-experts-slice-1.md`** (the `0029_capability_grants.sql` reserved-slot lines ~79/84/91/96/146). Add a one-line note in the spec's enforcement section that the resolved-config refactor routes `persistent_agent` through the single merged fragment.
+- [ ] **Step 2: Renumber 0029→0030 EVERYWHERE.** Edit: `docs/db_migration.md:365` (note that 0029 went to mistral; grants = 0030); `docs/done/global_expert_management.md` (schema header ~238, Slice-1 reserve ~489, References bullet ~620); **and `docs/superpowers/plans/2026-06-15-user-defined-experts-slice-1.md`** (the `0029_capability_grants.sql` reserved-slot lines ~79/84/91/96/146). Add a one-line note in the spec's enforcement section that the resolved-config refactor routes `persistent_agent` through the single merged fragment.
 - [ ] **Step 3: Verify the renumber is complete.** Run: `grep -rn "0029_capability_grants" docs/`  Expected: no matches.
 - [ ] **Step 4: Checkpoint.**
 
