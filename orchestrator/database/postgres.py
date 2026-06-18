@@ -8654,7 +8654,8 @@ class PostgresDB:
         rows = await self.fetch(
             "SELECT key, value_json, granted_by, updated_at FROM capability_grants "
             "WHERE scope_kind = $1 AND scope_id IS NOT DISTINCT FROM $2 ORDER BY key",
-            scope_kind, UUID(scope_id) if scope_id else None,
+            scope_kind,
+            UUID(scope_id) if scope_id else None,
         )
         result = []
         for r in rows:
@@ -8664,8 +8665,16 @@ class PostgresDB:
             result.append(d)
         return result
 
-    async def set_grant(self, *, scope_kind: str, scope_id: str | None, key: str,
-                        value_json: Any, actor: str | None, reason: str | None = None) -> dict:
+    async def set_grant(
+        self,
+        *,
+        scope_kind: str,
+        scope_id: str | None,
+        key: str,
+        value_json: Any,
+        actor: str | None,
+        reason: str | None = None,
+    ) -> dict:
         """Upsert one grant + audit row, one transaction. prev value_json is a JSON
         string from asyncpg — pass straight to the $::jsonb cast (don't re-dumps)."""
         async with self.acquire() as conn:
@@ -8673,7 +8682,9 @@ class PostgresDB:
                 prev = await conn.fetchrow(
                     "SELECT value_json FROM capability_grants WHERE scope_kind=$1 "
                     "AND scope_id IS NOT DISTINCT FROM $2 AND key=$3",
-                    scope_kind, UUID(scope_id) if scope_id else None, key,
+                    scope_kind,
+                    UUID(scope_id) if scope_id else None,
+                    key,
                 )
                 row = await conn.fetchrow(
                     """
@@ -8684,31 +8695,47 @@ class PostgresDB:
                             updated_at = NOW()
                     RETURNING *
                     """,
-                    scope_kind, UUID(scope_id) if scope_id else None, key,
-                    json.dumps(value_json), UUID(actor) if actor else None,
+                    scope_kind,
+                    UUID(scope_id) if scope_id else None,
+                    key,
+                    json.dumps(value_json),
+                    UUID(actor) if actor else None,
                 )
                 await conn.execute(
                     "INSERT INTO capability_grant_audit "
                     "(actor, scope_kind, scope_id, key, old_value, new_value, action, reason) "
                     "VALUES ($1,$2,$3,$4,$5::jsonb,$6::jsonb,$7,$8)",
-                    UUID(actor) if actor else None, scope_kind,
-                    UUID(scope_id) if scope_id else None, key,
-                    prev["value_json"] if prev else None,    # already a JSON string
-                    json.dumps(value_json), "update" if prev else "set", reason,
+                    UUID(actor) if actor else None,
+                    scope_kind,
+                    UUID(scope_id) if scope_id else None,
+                    key,
+                    prev["value_json"] if prev else None,  # already a JSON string
+                    json.dumps(value_json),
+                    "update" if prev else "set",
+                    reason,
                 )
                 d = dict(row)
                 if isinstance(d.get("value_json"), str):
                     d["value_json"] = json.loads(d["value_json"])
                 return d
 
-    async def delete_grant(self, *, scope_kind: str, scope_id: str | None, key: str,
-                           actor: str | None, reason: str | None = None) -> bool:
+    async def delete_grant(
+        self,
+        *,
+        scope_kind: str,
+        scope_id: str | None,
+        key: str,
+        actor: str | None,
+        reason: str | None = None,
+    ) -> bool:
         async with self.acquire() as conn:
             async with conn.transaction():
                 prev = await conn.fetchrow(
                     "DELETE FROM capability_grants WHERE scope_kind=$1 "
                     "AND scope_id IS NOT DISTINCT FROM $2 AND key=$3 RETURNING value_json",
-                    scope_kind, UUID(scope_id) if scope_id else None, key,
+                    scope_kind,
+                    UUID(scope_id) if scope_id else None,
+                    key,
                 )
                 if prev is None:
                     return False
@@ -8716,18 +8743,25 @@ class PostgresDB:
                     "INSERT INTO capability_grant_audit "
                     "(actor, scope_kind, scope_id, key, old_value, new_value, action, reason) "
                     "VALUES ($1,$2,$3,$4,$5::jsonb,NULL,'revoke',$6)",
-                    UUID(actor) if actor else None, scope_kind,
-                    UUID(scope_id) if scope_id else None, key, prev["value_json"], reason,
+                    UUID(actor) if actor else None,
+                    scope_kind,
+                    UUID(scope_id) if scope_id else None,
+                    key,
+                    prev["value_json"],
+                    reason,
                 )
                 return True
 
-    async def delete_grants_for_scope(self, conn, *, scope_kind: str, scope_id: str) -> int:
+    async def delete_grants_for_scope(
+        self, conn, *, scope_kind: str, scope_id: str
+    ) -> int:
         """Hard-delete a removed user/project's grant rows (no FK cascade fires —
         decision 23). Takes an existing connection so it runs in the caller's
         delete transaction (atomic with the principal removal)."""
         result = await conn.execute(
             "DELETE FROM capability_grants WHERE scope_kind=$1 AND scope_id=$2",
-            scope_kind, UUID(scope_id),
+            scope_kind,
+            UUID(scope_id),
         )
         return int(result.split()[-1]) if result else 0
 
@@ -8740,10 +8774,15 @@ class PostgresDB:
             )
             from src.core.capability_grants import resolve_grants
 
-            g = resolve_grants(user_rows=scoped["user"], project_rows=scoped["project"],
-                               global_rows=scoped["global"])
-            if any(r["key"] == "vm_workspace"
-                   for r in scoped["user"] + scoped["project"] + scoped["global"]):
+            g = resolve_grants(
+                user_rows=scoped["user"],
+                project_rows=scoped["project"],
+                global_rows=scoped["global"],
+            )
+            if any(
+                r["key"] == "vm_workspace"
+                for r in scoped["user"] + scoped["project"] + scoped["global"]
+            ):
                 return bool(g["vm_workspace"])
         except Exception:
             logger.exception("vm grant read failed; fall back to can_use_vm column")

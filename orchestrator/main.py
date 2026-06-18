@@ -1600,8 +1600,12 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
                 if await _user_experts_enabled():
                     await _enforce_dispatch_grants(
                         _cap["merged_fragment"],
-                        runner_user_id=str(job["user_id"]) if job.get("user_id") else None,
-                        project_ids=[str(job["project_id"])] if job.get("project_id") else [],
+                        runner_user_id=str(job["user_id"])
+                        if job.get("user_id")
+                        else None,
+                        project_ids=[str(job["project_id"])]
+                        if job.get("project_id")
+                        else [],
                     )
                 resolved_config = await inject_blob_credentials(
                     _resolved,
@@ -1754,7 +1758,9 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
                 await _enforce_dispatch_grants(
                     _rcap["merged_fragment"],
                     runner_user_id=str(job["user_id"]) if job.get("user_id") else None,
-                    project_ids=[str(job["project_id"])] if job.get("project_id") else [],
+                    project_ids=[str(job["project_id"])]
+                    if job.get("project_id")
+                    else [],
                 )
             except GrantDenied as gd:
                 logger.warning("Resume denied for job %s: %s", job.get("id"), gd)
@@ -2494,7 +2500,9 @@ async def _enforce_save_grants(config: dict[str, Any], *, user: dict[str, Any]) 
     )
     violations = evaluate(config, grants)
     if violations:
-        raise HTTPException(status_code=422, detail=_grant_violations_detail(violations))
+        raise HTTPException(
+            status_code=422, detail=_grant_violations_detail(violations)
+        )
 
 
 async def _enforce_expert_save(
@@ -19531,13 +19539,17 @@ def _validate_grant_value(key: str, value: Any) -> None:
     spec = CATALOG[key]
     t = spec["type"]
     if t == "bool" and not isinstance(value, bool):
-        raise HTTPException(status_code=400, detail=f"{key}: value_json must be a boolean")
+        raise HTTPException(
+            status_code=400, detail=f"{key}: value_json must be a boolean"
+        )
     if t == "enum" and value not in spec["order"]:
         raise HTTPException(
             status_code=400, detail=f"{key}: value_json must be one of {spec['order']}"
         )
     if t == "list" and not (value is None or isinstance(value, list)):
-        raise HTTPException(status_code=400, detail=f"{key}: value_json must be a list or null")
+        raise HTTPException(
+            status_code=400, detail=f"{key}: value_json must be a list or null"
+        )
 
 
 @app.get("/api/admin/grants")
@@ -19552,7 +19564,8 @@ async def list_grants_endpoint(
 
     return {
         "grants": await postgres_db.list_grants(
-            scope_kind=scope_kind, scope_id=(None if scope_kind == "global" else scope_id)
+            scope_kind=scope_kind,
+            scope_id=(None if scope_kind == "global" else scope_id),
         ),
         "catalog": CATALOG,
     }

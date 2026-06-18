@@ -102,8 +102,6 @@ async def test_user_experts_kill_switch_default_enabled(monkeypatch):
 @pytest.mark.asyncio
 async def test_user_experts_kill_switch_disabled(monkeypatch):
     fake = AsyncMock()
-    fake.get_system_setting = AsyncMock(
-        return_value={"value": {"enabled": False}}
-    )
+    fake.get_system_setting = AsyncMock(return_value={"value": {"enabled": False}})
     monkeypatch.setattr(m, "postgres_db", fake)
     assert await m._user_experts_enabled() is False
