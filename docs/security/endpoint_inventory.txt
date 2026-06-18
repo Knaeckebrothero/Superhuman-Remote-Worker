@@ -18,6 +18,9 @@ GET    /api/admin/config/overrides/{override_id}                                
 PUT    /api/admin/config/overrides/{override_id}                                        admin:_require_admin
 GET    /api/admin/families                                                              admin:_require_admin
 GET    /api/admin/families/detect                                                       admin:_require_admin
+GET    /api/admin/grants                                                                admin:_require_admin
+DELETE /api/admin/grants/{scope_kind}/{scope_id}/{key}                                  admin:_require_admin
+PUT    /api/admin/grants/{scope_kind}/{scope_id}/{key}                                  admin:_require_admin
 GET    /api/admin/providers/codex/availability                                          admin:_require_admin
 GET    /api/admin/providers/defaults                                                    admin:_require_admin
 PUT    /api/admin/providers/defaults/{kind}                                             admin:_require_admin
@@ -43,6 +46,8 @@ GET    /api/admin/system-settings/main_cloud                                    
 PUT    /api/admin/system-settings/main_cloud                                            admin:_require_admin
 POST   /api/admin/system-settings/main_cloud/reload                                     admin:_require_admin
 POST   /api/admin/system-settings/main_cloud/test                                       admin:_require_admin
+GET    /api/admin/system-settings/user_experts                                          admin:_require_admin
+PUT    /api/admin/system-settings/user_experts                                          admin:_require_admin
 GET    /api/admin/system-settings/vm_workspaces                                         admin:_require_admin
 PUT    /api/admin/system-settings/vm_workspaces                                         admin:_require_admin
 GET    /api/admin/users                                                                 admin:_require_admin
@@ -89,8 +94,14 @@ GET    /api/datasources/{datasource_id}                                         
 PUT    /api/datasources/{datasource_id}                                                 gated:require_datasource_owner
 POST   /api/datasources/{datasource_id}/test                                            gated:require_datasource_owner
 GET    /api/experts                                                                     gated:require_approved_user
+POST   /api/experts                                                                     gated:require_approved_user
+POST   /api/experts/import                                                              gated:require_approved_user
 POST   /api/experts/reload                                                              admin:_require_admin
+DELETE /api/experts/{expert_id}                                                         gated:require_approved_user
 GET    /api/experts/{expert_id}                                                         gated:require_approved_user
+PUT    /api/experts/{expert_id}                                                         gated:require_approved_user
+POST   /api/experts/{expert_id}/duplicate                                               gated:require_approved_user
+GET    /api/experts/{expert_id}/export                                                  gated:require_approved_user
 GET    /api/health                                                                      public:k8s-liveness-probe
 POST   /api/internal/mcp-token-create                                                   internal:require_internal
 POST   /api/internal/mcp-token-verify                                                   internal:require_internal
@@ -250,6 +261,7 @@ GET    /api/tables/{table_name}                                                 
 GET    /api/tables/{table_name}/schema                                                  admin:_require_admin
 GET    /api/users                                                                       gated:require_approved_user
 POST   /api/users                                                                       admin:_require_admin
+GET    /api/users/me/capabilities                                                       gated:require_approved_user
 DELETE /api/users/{user_id}                                                             admin:_require_admin
 GET    /api/users/{user_id}                                                             gated:require_approved_user
 PUT    /api/users/{user_id}                                                             gated:require_approved_user
