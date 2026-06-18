@@ -50,7 +50,7 @@ spec:
             - sh
             - -c
             - >-
-              until wget -q -O- http://{{ include "srw.fullname" . }}-orchestrator:8085/health >/dev/null;
+              until wget -q -O- http://{{ include "srw.fullname" . }}-orchestrator:8085/api/health >/dev/null;
               do echo "waiting for orchestrator..."; sleep 3; done
       containers:
         - name: seed
