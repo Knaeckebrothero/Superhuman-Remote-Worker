@@ -55,6 +55,7 @@ def resolve_config(
     request_override: Optional[dict] = None,
     expert_type: str = "session",
     capture: Optional[dict] = None,
+    skills: Optional[dict] = None,
 ) -> dict:
     """Resolve the full agent config to a ``serialize_resolved_config``-shaped blob.
 
@@ -130,6 +131,12 @@ def resolve_config(
     for _k in ("persona", "instructions"):
         if prompts_override.get(_k):
             blob["prompts"][_k] = prompts_override[_k]
+
+    # Slice-2 skills runtime: attach the pre-gathered in-scope skill menu + file
+    # trees. DB I/O happens in the caller (orchestrator/main.py); this keeps the
+    # blob shape identical for jobs and sessions and unit-testable without a DB.
+    if skills:
+        blob["skills"] = skills
 
     return blob
 
