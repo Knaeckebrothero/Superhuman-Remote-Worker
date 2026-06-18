@@ -1238,3 +1238,36 @@ export interface WorkspaceOverview {
   };
   archive_count: number;
 }
+
+// --- Capability grants (User-Defined Experts, Slice 2) ---
+
+/** One entry of the capability catalog (delivered by both grant endpoints). */
+export interface GrantCatalogEntry {
+  type: 'bool' | 'enum' | 'list';
+  default: unknown;
+  restrict_only: boolean;
+  order?: string[];
+}
+
+export type GrantCatalog = Record<string, GrantCatalogEntry>;
+
+/** GET /api/users/me/capabilities */
+export interface UserCapabilities {
+  is_admin: boolean;
+  grants: Record<string, unknown> | null; // null ⇒ admin (unrestricted)
+  catalog: GrantCatalog;
+}
+
+/** One explicitly-set grant row (GET /api/admin/grants). */
+export interface Grant {
+  key: string;
+  value_json: unknown;
+  granted_by: string | null;
+  updated_at: string;
+}
+
+/** GET /api/admin/grants?scope_kind=&scope_id= */
+export interface GrantListResponse {
+  grants: Grant[];
+  catalog: GrantCatalog;
+}

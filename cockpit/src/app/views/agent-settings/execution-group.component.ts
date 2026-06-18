@@ -10,6 +10,8 @@ import {
   readConfigPath,
   SettingsMode,
 } from './agent-settings.types';
+import {allowedEnumOptions} from './capability-gates';
+import type {GrantCatalog} from '../../core/models/api.model';
 
 /**
  * Execution settings group: autonomy, scholar, critic, project memory.
@@ -34,7 +36,7 @@ import {
               (ngModelChange)="onAutonomyChange($event)"
               [disabled]="disabled()"
             >
-              @for (level of autonomyLevels; track level.value) {
+              @for (level of autonomyOptions(); track level.value) {
                 <option [value]="level.value">{{ 'agentSettings.autonomy.' + level.value + '.label' | transloco }}</option>
               }
             </select>
@@ -56,7 +58,7 @@ import {
               (ngModelChange)="onPermissionModeChange($event)"
               [disabled]="disabled()"
             >
-              @for (pm of permissionModes; track pm.value) {
+              @for (pm of permissionOptions(); track pm.value) {
                 <option [value]="pm.value">{{ 'agentSettings.permissionModes.' + pm.value + '.label' | transloco }}</option>
               }
             </select>
@@ -257,6 +259,10 @@ export class ExecutionGroupComponent {
   disabled = input(false);
   /** Whether the selected project has shared memory enabled. */
   showProjectMemory = input(false);
+  /** Author's resolved capability grants for editor greying; null ⇒ no gating. */
+  gatedCapabilities = input<Record<string, unknown> | null>(null);
+  /** Capability catalog (supplies the enum `order` for ceiling filtering). */
+  catalog = input<GrantCatalog>({});
 
   change = output<void>();
 
@@ -264,6 +270,27 @@ export class ExecutionGroupComponent {
   readonly autonomyLevels = AUTONOMY_LEVELS;
   readonly criticRoundOptions = CRITIC_ROUND_OPTIONS;
   readonly permissionModes = PERMISSION_MODES;
+
+  /** Autonomy levels at/below the granted ceiling. The currently-selected value
+   *  is always kept visible (an admin-authored expert may pin a higher level). */
+  readonly autonomyOptions = computed(() => {
+    const allowed = new Set(
+      allowedEnumOptions(this.gatedCapabilities(), 'autonomy_ceiling',
+        this.autonomyLevels.map((l) => l.value), this.catalog()),
+    );
+    const current = this.autonomy() ?? this.resolvedAutonomy();
+    return this.autonomyLevels.filter((l) => allowed.has(l.value) || l.value === current);
+  });
+
+  /** Permission modes at/below the granted ceiling (current always kept). */
+  readonly permissionOptions = computed(() => {
+    const allowed = new Set(
+      allowedEnumOptions(this.gatedCapabilities(), 'permission_mode',
+        this.permissionModes.map((p) => p.value), this.catalog()),
+    );
+    const current = this.permissionMode() ?? this.resolvedPermissionMode();
+    return this.permissionModes.filter((p) => allowed.has(p.value) || p.value === current);
+  });
 
   // User overrides (null = use default)
   readonly autonomy = signal<string | null>(null);
