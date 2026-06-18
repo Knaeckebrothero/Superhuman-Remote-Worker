@@ -27,17 +27,18 @@ import {
           <label
             class="tool-toggle"
             [class.modified]="isModified(cat.key)"
-            [class.disabled]="disabled()"
+            [class.disabled]="disabled() || isCategoryBlocked(cat.key)"
+            [title]="isCategoryBlocked(cat.key) ? ('grants.lockedShort' | transloco) : ''"
           >
             <input
               type="checkbox"
               [checked]="isCategoryEnabled(cat.key)"
               (change)="toggleCategory(cat.key)"
-              [disabled]="disabled()"
+              [disabled]="disabled() || isCategoryBlocked(cat.key)"
             >
             <app-icon size="md" class="tool-toggle-icon">{{ cat.icon }}</app-icon>
             <span class="tool-toggle-info">
-              <span class="tool-toggle-name">{{ 'agentSettings.toolCategories.' + cat.key + '.label' | transloco }}</span>
+              <span class="tool-toggle-name">{{ 'agentSettings.toolCategories.' + cat.key + '.label' | transloco }}@if (isCategoryBlocked(cat.key)) { <span class="tool-lock">🔒</span> }</span>
               <span class="tool-toggle-desc">{{ 'agentSettings.toolCategories.' + cat.key + '.description' | transloco }}</span>
             </span>
             @if (isModified(cat.key)) {
@@ -204,6 +205,24 @@ export class ToolsGroupComponent {
   disabled = input(false);
   /** Default tool lists from defaults.yaml, used to re-enable expert-disabled categories. */
   defaultsTools = input<Record<string, string[]>>({});
+  /** Author's resolved capability grants for editor greying; null ⇒ no gating
+   *  (launch flow / admin). Maps tool categories → catalog keys. */
+  gatedCapabilities = input<Record<string, unknown> | null>(null);
+
+  private readonly CAT_TO_GRANT: Record<string, string> = {
+    shell: 'shell_tools',
+    delegation: 'delegation',
+    browser_direct: 'browser',
+  };
+
+  /** True if a category is blocked by a missing grant (disable-only — never
+   *  mutates the fragment, so opening an admin-authored expert can't strip it). */
+  isCategoryBlocked(catKey: string): boolean {
+    const g = this.gatedCapabilities();
+    if (g === null) return false;
+    const grantKey = this.CAT_TO_GRANT[catKey];
+    return !!grantKey && g[grantKey] !== true;
+  }
 
   change = output<void>();
 

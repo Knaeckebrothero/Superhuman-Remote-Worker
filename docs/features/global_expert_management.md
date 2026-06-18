@@ -42,6 +42,27 @@ aliases:
 > `docs/superpowers/specs/2026-06-17-orchestrator-resolved-config-design.md` and the
 > implementation plan `docs/superpowers/plans/2026-06-17-orchestrator-resolved-config.md`.
 
+**Status (2026-06-18):** **Slice 2 — capability-grants enforcement + admin API — SHIPPED** on
+`develop` (uncommitted) and **live-verified on k3d-srw**. Migration `0030_capability_grants`
+(tables + append-only audit + `can_use_vm` migrate-in) realizes **deny-by-default via
+grandfathering**: the operator base ships `tools.shell` + `tools.delegation` for every job, so the
+migration backfills `shell_tools` + `delegation` grants for existing approved users — deny-by-default
+is a no-op on upgrade, new principals start denied. One pure PDP
+(`src/core/capability_grants.evaluate`; 8-key catalog incl. a **new `permission_mode` ceiling** for
+sessions) is enforced at **four** PEPs: save-time (the 3 expert endpoints → 422), **job dispatch**,
+**job resume** (closes the frozen-blob bypass), and **session attach** (warm + cold) — all
+fail-closed. Admin grants CRUD (`/api/admin/grants` GET/PUT/DELETE), `/api/users/me/capabilities`,
+and the `system_settings['user_experts']` kill-switch round it out; `can_use_vm` reads now dual-read
+the grant with a legacy-column fallback. **Live-verified:** grandfather backfill; save-time 422
+(multi-key); dispatch reject with per-key resolution (granted `shell_tools` passes, ungranted
+`delegation` blocks); admin CRUD + audit (`set`/`revoke`/`set`); `/me/capabilities` (admin null +
+non-admin resolved); `delete_user` → grant-row cleanup. A runtime import-path bug
+(`from orchestrator.services…` vs the pod's flattened sibling `from services…`, masked by the test
+`sys.path`) was caught live and fixed. Tests: **29 new** (pure PDP + contract) + 268 area-regression
+green; ruff clean. **Still deferred to a fast-follow:** the Cockpit Admin→Users grants panel and the
+`/api/users/me/capabilities`-driven editor control-greying (the endpoint ships here for the UI to
+consume). Plan: `docs/superpowers/plans/2026-06-18-user-defined-experts-slice-2-enforcement.md`.
+
 **Status (2026-06-17):** **Slice 1 write-CRUD restored + Slice-3 create-UI shipped** on `develop`
 (uncommitted). The Slice-1 write endpoints had been clobbered by `6f8c635e` and were **restored**
 (`orchestrator/main.py`: create/update/delete/duplicate/export/import + `ExpertCreate`/`ExpertUpdate`
@@ -54,7 +75,7 @@ delete-confirm with 409-blocker surfacing, and duplicate/export/import + nav + i
 de-DE nav only, page strings fall back to en). Agent-side expert resolution
 (`_apply_db_expert` / `ExpertsNamespace`) was **deleted** — resolution is orchestrator-only
 (`services/config_resolver.py`). Tests: backend 46 + cockpit 579 green; ruff/tsc/ng-build clean.
-**Still deferred:** Slice 2 (grants/enforcement + `/api/users/me/capabilities` + control greying),
+**Still deferred:** Slice 2 **Cockpit grants panel + editor control-greying** (enforcement + admin API + `/api/users/me/capabilities` SHIPPED 2026-06-18, above),
 project-link/`default_for` UI, test-drive, version/stats panels, per-tool curation
 (the tool toggles are category-level), de-DE page translations. Plan: `docs/superpowers/plans/2026-06-17-expert-crud-ui.md`. **Browser-verified**
 (Playwright, dev `test` user): `/experts/new` renders, auto-slug works (`Research Helper 2026` →
@@ -169,7 +190,7 @@ check is bypassable via a settings PATCH.
 | 18 | Advanced (raw YAML/JSON) editor | **Admin-only in v1.** Not a security boundary either way — decision 9's dispatch-time validation checks the merged fragment *however authored*, so raw input cannot smuggle ungated keys past dispatch. Admin-gating is blast-radius/footgun only. A `raw_config` grant key is deferred until the validators are proven. |
 | 19 | `model_selection` default | **All enabled catalog models** (∅ = unconstrained); narrowing is opt-in per user/project/global. S2 enforcement is therefore a **no-op on upgrade** — it only bites once an admin narrows. NB: there is **no** server-side model gate today (`_inject_model_credentials()`, `main.py:2431-2504`, silently provider-infers unknown models at `:2461` rather than rejecting), so `model_selection` is the *first* such gate — hence the permissive default to avoid breaking existing free choice. |
 | 20 | Naming / model | "Capability" here = **feature entitlement (ABAC/PBAC, NIST SP 800-162)**, *not* object-capability security: authority resolves from the subject's identity/scope (ambient authority), not an unforgeable token. The `capability_grants` name is kept for continuity; read "capability" as "entitlement," and don't assume ocap guarantees (unforgeability, token delegation). |
-| 21 | Single PDP, two PEPs | Save-time and dispatch-time MUST call **one shared decision function** `evaluate(merged_config, grants) -> {allowed, violations[]}`. Save-time runs it on the saved fragment (UX); dispatch-time runs the *identical* function on the full merged stack (authority). One implementation ⇒ the two enforcement points can't drift. (XACML framing: two PEPs, one PDP; the code catalog is the PAP; grant/config reads are the PIP.) The generalized check is **new code** mirroring `_check_vm_permission`'s two-step shape. |
+| 21 | Single PDP, two PEPs | Save-time and dispatch-time MUST call **one shared decision function** `evaluate(merged_config, grants) -> {allowed, violations[]}`. Save-time runs it on the saved fragment (UX); dispatch-time runs the *identical* function on the full merged stack (authority). One implementation ⇒ the two enforcement points can't drift. (XACML framing: two PEPs, one PDP; the code catalog is the PAP; grant/config reads are the PIP.) **Shipped 2026-06-18** as `src/core/capability_grants.evaluate`, mirroring `_check_vm_permission`'s two-step shape; enforced at four PEPs (save/dispatch/resume/session). |
 | 22 | Per-key scope semantics | Catalog keys are **`restrict-only`** by default — a more-specific scope may only *narrow*, never *widen*, the inherited value (a user row cannot exceed a project/global cap). `autonomy_ceiling`, `shell_tools`, `vm_workspace`, `delegation`, `browser` are restrict-only; only genuinely-independent toggles may be `override`. Pure most-specific-wins would let a user grant exceed an admin ceiling — a privilege-escalation footgun (cf. Cerbos `REQUIRE_PARENTAL_CONSENT` vs `OVERRIDE_PARENT`). Security-relevant keys **default-deny**; `model_selection`/`datasource_tools` may default-allow with the inline justification already given. |
 | 23 | Grant-change audit | Mutable `granted_by`+`updated_at` is current-state, not an audit trail (a DELETE erases the actor). Add an **append-only** `capability_grant_audit(actor, scope_kind, scope_id, key, old_value, new_value, action, reason, at)`, written on every grant/update/revoke incl. admin-bypass (OWASP `authz_change` record). |
 | 24 | Two different merges | **Name-resolution = replacement** (pick *one whole* expert by owner>project>global>bundled; a personal `scholar` shadows the bundled one *entirely* — never a half-and-half merge). **Config-layering = additive deep-merge** *within* the chosen expert (decision 1's chain). Distinct; must not be conflated. Global experts are **shadowable** (personal/project forks win by name); an admin who needs *non-overridable* behavior uses a **grant** (the enforcement layer), not a global expert (the convenience layer). |
@@ -355,11 +376,14 @@ A revoked grant therefore disables affected experts at next dispatch — no
 background sweep needed (a **bounded TOCTOU window**, CWE-367, ≈ max run
 duration; mid-run re-evaluation/kill is deferred and accepted). Shared/global
 experts run under the runner's grants, not the author's — the **CWE-441
-confused-deputy** mitigation. Today only `_check_vm_permission()` (`main.py:2129`)
-does dispatch-time gating; the generalized `evaluate(merged_config, grants)`
-(decision 21) is **new code** mirroring its two-step shape (kill-switch →
-admin-bypass → per-key restrict-only resolution). If the grants read fails,
-**fail closed** for deny-by-default keys.
+confused-deputy** mitigation. As of 2026-06-18 this **ships**: alongside
+`_check_vm_permission()`, the generalized `evaluate(merged_config, grants)`
+(`src/core/capability_grants.py`, decision 21) gates dispatch — mirroring the
+former's two-step shape (kill-switch → admin-bypass → per-key restrict-only
+resolution) — wired at save-time, dispatch, resume, and session attach via
+`_enforce_save_grants` / `_enforce_dispatch_grants` (`orchestrator/main.py`). On a
+grants-read failure it **fails closed** for deny-by-default keys, falling back to
+the legacy `can_use_vm` column only for the `vm_workspace` capability.
 
 ## API surface
 
@@ -499,17 +523,31 @@ intersection with the invoker).
   bundled experts unaffected with the flag off; an exported expert re-imports as
   a new owned row and runs.
 
-### Slice 2 — Grants + enforcement · ⬜ NOT STARTED (highest-value next step)
+### Slice 2 — Grants + enforcement · ✅ SHIPPED — enforcement + admin API (2026-06-18, live-verified on k3d)
+> **As-built (2026-06-18, uncommitted on `develop`).** Posture is **deny-by-default least-privilege
+> via grandfathering** — migration `0030` backfills `shell_tools`+`delegation` for existing approved
+> users so deny-by-default is a no-op on upgrade; new principals start denied (no base
+> re-architecture, no capability injection). One pure PDP `evaluate()` (8-key catalog, restrict-only)
+> runs at **four** PEPs: save-time, dispatch, **resume** (added — the original cut missed the
+> frozen-blob replay bypass), and session attach (warm+cold), all fail-closed. **Beyond the original
+> spec:** a `permission_mode` ceiling key (sessions gate on `interactive.permission_mode`, not
+> `autonomy`); a raw-request-body duplicate/non-ASCII-key scan wired into the save endpoints; and
+> admin-set grant-value type validation. **Deferred to a fast-follow:** the Cockpit Admin→Users
+> grants panel and the `/api/users/me/capabilities`-driven editor control-greying (the endpoint
+> ships here for the UI to consume). Plan + full deviation changelog:
+> `docs/superpowers/plans/2026-06-18-user-defined-experts-slice-2-enforcement.md`.
 - Migration `0030` + catalog + grants service (user → project → global → default).
 - Save-time 422; dispatch-time reject on the merged stack (incl.
   `persistent_agent`); admin bypass; `system_settings['user_experts']`
   kill-switch; `can_use_vm` reads switched to grants.
 - Admin Users grants panel + `/api/users/me/capabilities`.
-- **Acceptance:** non-granted user saving a `tools.shell` expert → 422 naming
-  the key; grant revoked after save → next dispatch rejected with message; a
-  `persistent_agent` settings PATCH smuggling `tools.shell` → session create
-  rejected; VM gating behaves identically to the old column; admin bypasses.
-- **Adversarial acceptance:** duplicate-key fragment
+- **Acceptance (✅ verified live on k3d 2026-06-18, except where noted):**
+  non-granted user saving a `tools.shell`/`workspace.backend:vm` expert → 422 naming
+  the key (✅); ungranted dispatch rejected with per-key message (✅ — granted `shell_tools`
+  passes, ungranted `delegation` blocks); a `persistent_agent` PATCH smuggling
+  `permission_mode:autonomous` → session rejected (covered by unit/contract; not driven live);
+  VM gating via the migrated grant behaves identically to the old column; admin bypasses (✅).
+- **Adversarial acceptance (✅ unit-verified):** duplicate-key fragment
   `{"llm":{"api_key":null,"api_key":"x"}}` rejected; case/Unicode-aliased
   credential (`llm.apiKey`, fullwidth) rejected; a credential assembled across two
   innocuous layers caught at dispatch; `null`-deletion of a base guardrail caught;

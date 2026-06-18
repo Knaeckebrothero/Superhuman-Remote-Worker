@@ -85,6 +85,19 @@
     "collapseSidebar": "Collapse sidebar",
     "openSidebar": "Open sidebar"
   },
+  "grants": {
+    "lockedShort": "Requires a capability grant",
+    "locked": {
+      "vm_workspace": "VM workspaces require the vm_workspace grant.",
+      "shell_tools": "Shell tools require the shell_tools grant.",
+      "delegation": "Delegation requires the delegation grant.",
+      "datasource_tools": "Datasource tools require the datasource_tools grant.",
+      "browser": "Browser tools require the browser grant.",
+      "model_selection": "Your administrator limits which models you may select.",
+      "autonomy_ceiling": "Autonomy above your ceiling requires a grant.",
+      "permission_mode": "This permission mode requires a grant."
+    }
+  },
   "shell": {
     "newSession": "New session",
     "untitledSession": "Untitled",

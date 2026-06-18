@@ -50,6 +50,7 @@ import {
     TableDataResponse,
     TableInfo,
     User,
+    UserCapabilities,
     WorkspaceOverview,
 } from '../models/api.model';
 import {ThreadUploadResponse, UploadInfo, UploadResponse} from '../models/file.model';
@@ -1501,6 +1502,13 @@ export class ApiService {
     return this.http.get<Project>(`${this.baseUrl}/projects/${id}`).pipe(
       catchError(() => of(null)),
     );
+  }
+
+  /** Current user's resolved capabilities + the catalog (drives editor greying). */
+  getMyCapabilities(): Observable<UserCapabilities | null> {
+    return this.http
+      .get<UserCapabilities>(`${this.baseUrl}/users/me/capabilities`)
+      .pipe(catchError(() => of(null)));
   }
 
   createProject(body: ProjectCreateRequest): Observable<Project | null> {
