@@ -7,6 +7,7 @@ and unit-testable in isolation. No DB or framework imports here.
 from __future__ import annotations
 
 import json
+import re
 import unicodedata
 from typing import Any
 
@@ -42,6 +43,36 @@ def hard_deny_scan(config: Any, _path: tuple[str, ...] = ()) -> list[str]:
         for i, item in enumerate(config):
             offending.extend(hard_deny_scan(item, _path + (str(i),)))
     return offending
+
+
+_ASCII_KEY = re.compile(r"^[\x20-\x7E]*$")  # printable ASCII only
+
+
+def _strict_object_pairs(pairs: list[tuple[str, Any]]) -> dict:
+    """json object_pairs_hook: reject duplicate keys (after canonicalization, RFC
+    7493) AND any non-ASCII key (reject, don't normalize — confusables defense)."""
+    seen: set[str] = set()
+    out: dict = {}
+    for k, val in pairs:
+        if not _ASCII_KEY.match(str(k)):
+            raise ValueError(f"non-ASCII key not allowed: {k!r}")
+        ck = canonical_key(str(k))
+        if ck in seen:
+            raise ValueError(f"duplicate key after canonicalization: {k}")
+        seen.add(ck)
+        out[k] = val
+    return out
+
+
+def scan_fragment_text(text: str) -> list[str]:
+    """Parse raw fragment TEXT rejecting duplicate/non-ASCII keys, then hard-deny-
+    scan. Returns offending paths ([] = clean); a parse rejection is a synthetic
+    offence so the caller refuses the fragment."""
+    try:
+        parsed = json.loads(text, object_pairs_hook=_strict_object_pairs)
+    except ValueError as e:
+        return [f"<malformed>: {e}"]
+    return hard_deny_scan(parsed)
 
 
 def expert_precedence_key(row: dict, user_id: str, project_ids: set[str]) -> tuple:

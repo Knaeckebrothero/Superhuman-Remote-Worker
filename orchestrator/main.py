@@ -984,6 +984,7 @@ async def _resolve_session_config(
     metadata: dict[str, Any],
     *,
     config_override: dict[str, Any] | None = None,
+    status: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Resolve a persistent thread's full config to a delivery blob (credential-
     injected), or ``None`` when experts are off / resolution fails (→ the agent's
@@ -996,7 +997,9 @@ async def _resolve_session_config(
     ``config_override`` overrides ``metadata.config_override`` for the warm-pool
     path (it carries the attach-time lite-workspace backend).
     """
-    if not _is_experts_db_enabled():
+    if not _is_experts_db_enabled() or not await _user_experts_enabled():
+        if status is not None:
+            status["state"] = "disabled"
         return None
     try:
         user_id = str(thread["user_id"]) if thread.get("user_id") else None
@@ -1016,24 +1019,44 @@ async def _resolve_session_config(
             else (metadata.get("config_override") or None)
         )
         base_defaults = await _resolve_default_models(user_id)
+        _cap: dict = {}
         resolved = resolve_config(
             base_config_name=base,
             base_defaults=base_defaults,
             expert_row=expert_row,
             request_override=request_override,
             expert_type="session",
+            capture=_cap,
         )
-        return await inject_blob_credentials(
+        # Session dispatch PEP (decision 9): the merged config — including
+        # interactive.permission_mode and any persistent_agent keys baked into
+        # config_override — must fit the runner's grants. GrantDenied escapes the
+        # generic except below (fail closed: never deliver the unvetted override).
+        await _enforce_dispatch_grants(
+            _cap["merged_fragment"],
+            runner_user_id=user_id,
+            project_ids=[project_id] if project_id else [],
+        )
+        delivered = await inject_blob_credentials(
             resolved,
             lambda co: _inject_thread_dispatch_credentials(
                 co, user_id=user_id, project_id=project_id
             ),
         )
+        if status is not None:
+            status["state"] = "ok"
+        return delivered
+    except GrantDenied:
+        if status is not None:
+            status["state"] = "denied"
+        raise
     except Exception:
         logger.exception(
             "Session resolve failed for thread %s; falling back to config_name",
             thread.get("id"),
         )
+        if status is not None:
+            status["state"] = "error"
         return None
 
 
@@ -1562,13 +1585,24 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
                 # model else the system capability default. Resolution applies it
                 # below the expert; inject_blob_credentials adds the transport.
                 _base_defaults = await _resolve_default_models(job.get("user_id"))
+                _cap: dict = {}
                 _resolved = resolve_config(
                     base_config_name=_base_name,
                     base_defaults=_base_defaults,
                     expert_row=expert_row,
                     request_override=config_override,
                     expert_type="worker",
+                    capture=_cap,
                 )
+                # Dispatch PEP (decision 9): the merged config must fit the runner's
+                # grants. GrantDenied is caught BELOW the generic fallback so a denial
+                # is never downgraded to the unchecked config_override (fail closed).
+                if await _user_experts_enabled():
+                    await _enforce_dispatch_grants(
+                        _cap["merged_fragment"],
+                        runner_user_id=str(job["user_id"]) if job.get("user_id") else None,
+                        project_ids=[str(job["project_id"])] if job.get("project_id") else [],
+                    )
                 resolved_config = await inject_blob_credentials(
                     _resolved,
                     lambda co: _inject_dispatch_credentials(job, co),
@@ -1581,6 +1615,14 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
                     job_id,
                     job.get("expert_id"),
                 )
+            except GrantDenied as gd:
+                logger.warning("Dispatch denied for job %s: %s", job_id, gd)
+                await postgres_db.update_job_status(
+                    job_id,
+                    status="failed",
+                    error_message=_grant_violations_detail(gd.violations),
+                )
+                return False
             except Exception:
                 logger.exception(
                     "Dispatch: resolve_config failed for job %s; falling back "
@@ -1686,6 +1728,43 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
         config_override = job.get("config_override")
         if isinstance(config_override, str):
             config_override = json.loads(config_override)
+
+        # Resume PEP (decision 9, B3): resume replays the write-once frozen blob and
+        # would otherwise skip grant enforcement — a grant revoked since dispatch must
+        # still block the resume. Re-resolve the merged config and re-check the
+        # runner's CURRENT grants. Fail closed: deny -> mark failed + refuse.
+        if await _user_experts_enabled():
+            try:
+                _rbase = job.get("config_name") or "defaults"
+                if _rbase == "default":
+                    _rbase = "defaults"
+                _rcap: dict = {}
+                resolve_config(
+                    base_config_name=_rbase,
+                    base_defaults=await _resolve_default_models(job.get("user_id")),
+                    expert_row=(
+                        await postgres_db.get_expert_by_id(str(job["expert_id"]))
+                        if job.get("expert_id")
+                        else None
+                    ),
+                    request_override=config_override,
+                    expert_type="worker",
+                    capture=_rcap,
+                )
+                await _enforce_dispatch_grants(
+                    _rcap["merged_fragment"],
+                    runner_user_id=str(job["user_id"]) if job.get("user_id") else None,
+                    project_ids=[str(job["project_id"])] if job.get("project_id") else [],
+                )
+            except GrantDenied as gd:
+                logger.warning("Resume denied for job %s: %s", job.get("id"), gd)
+                await postgres_db.update_job_status(
+                    str(job["id"]),
+                    status="failed",
+                    error_message=_grant_violations_detail(gd.violations),
+                )
+                return False
+
         if resolved_ds:
             config_override = _build_datasource_tool_override(
                 resolved_ds, config_override
@@ -1962,6 +2041,7 @@ async def _send_session_attach(
     # on every attach (no freeze). None when experts are off / resolve fails →
     # the agent uses the config_name + config_override fallback below.
     resolved_config: dict[str, Any] | None = None
+    _sess_status: dict[str, Any] = {}
     try:
         _thread = await postgres_db.get_thread(thread_id)
         if _thread:
@@ -1972,12 +2052,24 @@ async def _send_session_attach(
                 except (json.JSONDecodeError, TypeError):
                     _meta = {}
             resolved_config = await _resolve_session_config(
-                _thread, _meta, config_override=config_override
+                _thread, _meta, config_override=config_override, status=_sess_status
             )
+    except GrantDenied as gd:
+        logger.warning("Session attach denied for thread %s: %s", thread_id, gd)
+        return False
     except Exception:
         logger.exception(
             "Session attach: resolve failed for thread %s; using fallback", thread_id
         )
+    # Fail closed: a resolution ERROR (experts on, resolve threw) must not deliver
+    # the unvetted config_override — the grant check never ran. The 'disabled' state
+    # (experts off) intentionally falls through to the legacy fallback below.
+    if _sess_status.get("state") == "error":
+        logger.warning(
+            "Session attach: resolve errored for thread %s; refusing (fail closed)",
+            thread_id,
+        )
+        return False
 
     agent_url = f"http://{agent['pod_ip']}:{agent['pod_port']}/session/attach"
     payload = {
@@ -2324,6 +2416,123 @@ def _get_container_context(job: dict) -> dict:
     return ctx.get("workspace_container", {})
 
 
+# =============================================================================
+# Capability grants (User-Defined Experts, Slice 2) — PEPs + helpers
+#
+# One pure PDP (src/core/capability_grants.evaluate) is enforced at four points:
+# save-time (the 3 expert endpoints), job dispatch, job resume, and session
+# attach. Deny-by-default for security keys; existing approved users were
+# grandfathered by migration 0030 (shell_tools + delegation). See
+# docs/features/global_expert_management.md (decisions 8, 9, 19, 21-23).
+# =============================================================================
+
+
+class GrantDenied(Exception):
+    """A merged config exceeds the runner's grants (dispatch PEP). Must NOT be
+    swallowed by a resolve fallback (fail closed)."""
+
+    def __init__(self, violations: list[str]):
+        self.violations = violations
+        super().__init__("; ".join(violations))
+
+
+async def _user_experts_enabled() -> bool:
+    """Runtime kill-switch (decision 8). Absent row = enabled (fail-open for fresh
+    installs). When disabled, DB-expert creation + grant enforcement are off."""
+    try:
+        row = await postgres_db.get_system_setting("user_experts")
+    except Exception:
+        logger.exception("user_experts read failed; fail-open")
+        return True
+    value = (row or {}).get("value") or {}
+    return not (isinstance(value, dict) and value.get("enabled") is False)
+
+
+def _grant_violations_detail(violations: list[str]) -> str:
+    return "config exceeds your capability grants: " + "; ".join(violations)
+
+
+async def _grant_project_ids(user: dict) -> list[str]:
+    """Project scope ids for grant resolution. user_visible_project_ids returns
+    'all' for admins (who bypass anyway) — treat as no project constraint."""
+    vis = await user_visible_project_ids(user, postgres_db)  # security/access.py
+    return [] if vis == "all" else [str(p) for p in vis]
+
+
+async def _scan_raw_request_fragment(request: Request) -> None:
+    """Slice-2 hardening (decision 10): scan the RAW request bytes for duplicate
+    or non-ASCII keys (parser-differential + unicode-confusable defenses) that the
+    parsed body has already silently collapsed. 422 on offence. Best-effort — if
+    the body can't be re-read the parsed-dict hard-deny scan still ran."""
+    from src.core.expert_resolution import scan_fragment_text
+
+    try:
+        raw = (await request.body()).decode("utf-8")
+    except Exception:
+        return
+    if not raw.strip():
+        return
+    offending = scan_fragment_text(raw)
+    if offending:
+        raise HTTPException(
+            status_code=422,
+            detail="config rejected (malformed, duplicate/non-ASCII, or credential "
+            "keys): " + "; ".join(offending),
+        )
+
+
+async def _enforce_save_grants(config: dict[str, Any], *, user: dict[str, Any]) -> None:
+    """Save-time PEP (decision 9): the author's grants must cover the raw fragment.
+    422 naming offending keys. Admins bypass."""
+    if user.get("is_admin"):
+        return
+    from src.core.capability_grants import evaluate
+    from services.grants_service import resolve_grants_for
+
+    grants = await resolve_grants_for(
+        postgres_db, user_id=str(user["id"]), project_ids=await _grant_project_ids(user)
+    )
+    violations = evaluate(config, grants)
+    if violations:
+        raise HTTPException(status_code=422, detail=_grant_violations_detail(violations))
+
+
+async def _enforce_expert_save(
+    request: Request, config: dict[str, Any], *, user: dict[str, Any]
+) -> None:
+    """Combined save-time gate: kill-switch (403) + raw dup/non-ASCII key scan
+    (422) + capability-grant enforcement (422). Admins bypass grants, not the
+    kill-switch."""
+    if not await _user_experts_enabled():
+        raise HTTPException(
+            status_code=403,
+            detail="User-defined experts are disabled by the administrator",
+        )
+    await _scan_raw_request_fragment(request)
+    await _enforce_save_grants(config, user=user)
+
+
+async def _enforce_dispatch_grants(
+    merged: dict, *, runner_user_id: str | None, project_ids: list[str]
+) -> None:
+    """Authoritative dispatch PEP (decision 9): the merged config must fit the
+    RUNNER's grants. Raises GrantDenied on violation. Admin runner bypasses.
+    NOTE (v1 stance): runner = job owner (job['user_id']); for delegation children
+    inheriting a privileged owner this bypasses (spec defers transitive checks)."""
+    user = await postgres_db.get_user(runner_user_id) if runner_user_id else None
+    if user and user.get("is_admin"):
+        return
+    from src.core.capability_grants import evaluate
+    from services.grants_service import resolve_grants_for
+
+    grants = await resolve_grants_for(
+        postgres_db, user_id=runner_user_id, project_ids=project_ids
+    )
+    violations = evaluate(merged, grants)
+    if violations:
+        raise GrantDenied(violations)
+
+
 async def _check_vm_permission(
     user: dict | None,
     *,
@@ -2355,7 +2564,7 @@ async def _check_vm_permission(
         )
     if user and user.get("is_admin"):
         return
-    if not user or not user.get("can_use_vm"):
+    if not user or not await postgres_db.user_can_use_vm(user):
         raise HTTPException(
             status_code=403,
             detail="User is not permitted to use VM workspaces",
@@ -6887,6 +7096,48 @@ async def resume_job(
     _, job = await require_internal_or_job_access(req, postgres_db, job_id)
     if request is None:
         request = JobResumeRequest()
+
+    # Resume PEP (decision 9, B3): re-check the runner's CURRENT grants against the
+    # job's stored config before replaying it. Placed before the resume try so a 403
+    # is not downgraded by the broad handler below (fail closed on denial). A resolve
+    # infra error proceeds — the dispatch-time grant check already passed.
+    if await _user_experts_enabled():
+        try:
+            _rco = job.get("config_override")
+            if isinstance(_rco, str):
+                _rco = json.loads(_rco)
+            _rbase = job.get("config_name") or "defaults"
+            if _rbase == "default":
+                _rbase = "defaults"
+            _rcap: dict = {}
+            resolve_config(
+                base_config_name=_rbase,
+                base_defaults=await _resolve_default_models(job.get("user_id")),
+                expert_row=(
+                    await postgres_db.get_expert_by_id(str(job["expert_id"]))
+                    if job.get("expert_id")
+                    else None
+                ),
+                request_override=_rco,
+                expert_type="worker",
+                capture=_rcap,
+            )
+            await _enforce_dispatch_grants(
+                _rcap["merged_fragment"],
+                runner_user_id=str(job["user_id"]) if job.get("user_id") else None,
+                project_ids=[str(job["project_id"])] if job.get("project_id") else [],
+            )
+        except GrantDenied as gd:
+            logger.warning("Resume denied for job %s: %s", job_id, gd)
+            raise HTTPException(
+                status_code=403, detail=_grant_violations_detail(gd.violations)
+            )
+        except Exception:
+            logger.exception(
+                "Resume PEP: grant re-check failed for job %s; proceeding "
+                "(dispatch-time check stands)",
+                job_id,
+            )
 
     try:
         # Allow resuming jobs in any status except completed
@@ -12185,7 +12436,22 @@ async def agent_get_thread_workspace(
     # Orchestrator-resolved config for cold/dedicated attach: the agent prefers
     # this fully-resolved, credential-injected blob over the config_override
     # merge above (which stays for the fallback). None when experts are off.
-    session_resolved = await _resolve_session_config(thread, metadata)
+    # Session dispatch PEP (fail closed): a grant denial or resolve error must not
+    # fall through to the unvetted config_override — refuse the attach (403).
+    _sess_status: dict[str, Any] = {}
+    try:
+        session_resolved = await _resolve_session_config(
+            thread, metadata, status=_sess_status
+        )
+    except GrantDenied as gd:
+        raise HTTPException(
+            status_code=403, detail=_grant_violations_detail(gd.violations)
+        )
+    if _sess_status.get("state") == "error":
+        raise HTTPException(
+            status_code=403,
+            detail="capability grants could not be verified for this session config",
+        )
     return {
         "status": ws.get("status", "none"),
         # K8s provisioner uses pod_ip; Docker provisioner uses host — normalize
@@ -16322,6 +16588,7 @@ async def create_expert(request: Request, body: ExpertCreate) -> dict[str, Any]:
     user = await require_approved_user(request, postgres_db)
     if body.config:
         _validate_expert_fragment(body.config)
+    await _enforce_expert_save(request, body.config or {}, user=user)
     try:
         return await postgres_db.create_expert(
             name=body.name,
@@ -16364,6 +16631,7 @@ async def update_expert(
         )
     if body.config is not None:
         _validate_expert_fragment(body.config)
+    await _enforce_expert_save(request, body.config or {}, user=user)
     fields = body.model_dump(exclude_unset=True)
     return await postgres_db.update_expert(
         expert_id, updated_by=str(user["id"]), **fields
@@ -16443,6 +16711,7 @@ async def import_expert(request: Request, body: ExpertCreate) -> dict[str, Any]:
     user = await require_approved_user(request, postgres_db)
     if body.config:
         _validate_expert_fragment(body.config)
+    await _enforce_expert_save(request, body.config or {}, user=user)
     name = body.name
     for attempt in range(6):
         try:
@@ -19207,6 +19476,144 @@ async def put_vm_workspaces_settings(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
     return _vm_workspaces_response(row)
+
+
+# =============================================================================
+# Capability grants — admin CRUD + audit + kill-switch + self-introspection
+# (User-Defined Experts, Slice 2; decisions 8, 9, 23). The PEPs live near
+# _check_vm_permission; these are the management/read surfaces.
+# =============================================================================
+
+
+@app.get("/api/admin/system-settings/user_experts")
+async def get_user_experts_settings(request: Request) -> dict[str, Any]:
+    """Return the global user-defined-experts kill-switch (decision 8).
+    Admin-only. Absent row is reported as enabled (fail-open default)."""
+    await _require_admin(request)
+    row = await postgres_db.get_system_setting("user_experts")
+    value = (row or {}).get("value") or {}
+    return {
+        "enabled": not (isinstance(value, dict) and value.get("enabled") is False),
+        "updated_by": (row or {}).get("updated_by"),
+    }
+
+
+@app.put("/api/admin/system-settings/user_experts")
+async def put_user_experts_settings(
+    body: dict[str, Any], request: Request
+) -> dict[str, Any]:
+    """Toggle the user-defined-experts kill-switch. Admin-only. When disabled,
+    DB-expert creation and grant enforcement are off (decision 8)."""
+    admin = await _require_admin(request)
+    enabled = body.get("enabled")
+    if not isinstance(enabled, bool):
+        raise HTTPException(status_code=400, detail="`enabled` must be a boolean")
+    await postgres_db.upsert_system_setting(
+        "user_experts",
+        {"enabled": enabled},
+        updated_by=admin.get("email") or str(admin.get("id", "")),
+    )
+    return {"enabled": enabled}
+
+
+class GrantSet(BaseModel):
+    """Request body for setting a capability grant."""
+
+    value_json: Any
+    reason: str | None = None
+
+
+def _validate_grant_value(key: str, value: Any) -> None:
+    """Reject a grant value that doesn't match the catalog type, so a malformed
+    enum can't later crash meet()/resolve_grants at dispatch time."""
+    from src.core.capability_grants import CATALOG
+
+    spec = CATALOG[key]
+    t = spec["type"]
+    if t == "bool" and not isinstance(value, bool):
+        raise HTTPException(status_code=400, detail=f"{key}: value_json must be a boolean")
+    if t == "enum" and value not in spec["order"]:
+        raise HTTPException(
+            status_code=400, detail=f"{key}: value_json must be one of {spec['order']}"
+        )
+    if t == "list" and not (value is None or isinstance(value, list)):
+        raise HTTPException(status_code=400, detail=f"{key}: value_json must be a list or null")
+
+
+@app.get("/api/admin/grants")
+async def list_grants_endpoint(
+    request: Request, scope_kind: str, scope_id: str | None = None
+) -> dict:
+    """List the grants set on one scope, plus the catalog. Admin-only."""
+    await _require_admin(request)
+    if scope_kind not in ("user", "project", "global"):
+        raise HTTPException(status_code=400, detail="bad scope_kind")
+    from src.core.capability_grants import CATALOG
+
+    return {
+        "grants": await postgres_db.list_grants(
+            scope_kind=scope_kind, scope_id=(None if scope_kind == "global" else scope_id)
+        ),
+        "catalog": CATALOG,
+    }
+
+
+@app.put("/api/admin/grants/{scope_kind}/{scope_id}/{key}")
+async def set_grant_endpoint(
+    scope_kind: str, scope_id: str, key: str, body: GrantSet, request: Request
+) -> dict:
+    """Set/update one capability grant (audited). Admin-only."""
+    admin = await _require_admin(request)
+    from src.core.capability_grants import CATALOG
+
+    if key not in CATALOG or scope_kind not in ("user", "project", "global"):
+        raise HTTPException(status_code=400, detail="unknown key or scope_kind")
+    _validate_grant_value(key, body.value_json)
+    return {
+        "grant": await postgres_db.set_grant(
+            scope_kind=scope_kind,
+            scope_id=(None if scope_kind == "global" else scope_id),
+            key=key,
+            value_json=body.value_json,
+            actor=str(admin["id"]),
+            reason=body.reason,
+        )
+    }
+
+
+@app.delete("/api/admin/grants/{scope_kind}/{scope_id}/{key}")
+async def delete_grant_endpoint(
+    scope_kind: str, scope_id: str, key: str, request: Request
+) -> dict:
+    """Revoke one capability grant (audited). Admin-only."""
+    admin = await _require_admin(request)
+    if scope_kind not in ("user", "project", "global"):
+        raise HTTPException(status_code=400, detail="bad scope_kind")
+    return {
+        "deleted": await postgres_db.delete_grant(
+            scope_kind=scope_kind,
+            scope_id=(None if scope_kind == "global" else scope_id),
+            key=key,
+            actor=str(admin["id"]),
+        )
+    }
+
+
+@app.get("/api/users/me/capabilities")
+async def my_capabilities(request: Request) -> dict:
+    """The caller's effective resolved grants + the catalog (drives editor greying
+    in the fast-follow). Admins get null grants (unrestricted)."""
+    user = await require_approved_user(request, postgres_db)
+    from src.core.capability_grants import CATALOG
+
+    if user.get("is_admin"):
+        return {"is_admin": True, "grants": None, "catalog": CATALOG}
+    from services.grants_service import resolve_grants_for
+
+    grants = await resolve_grants_for(
+        postgres_db, user_id=str(user["id"]), project_ids=await _grant_project_ids(user)
+    )
+    return {"is_admin": False, "grants": grants, "catalog": CATALOG}
 
 
 # =============================================================================

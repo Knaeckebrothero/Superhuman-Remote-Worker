@@ -6779,10 +6779,16 @@ class PostgresDB:
             return False
 
         async with self.acquire() as conn:
-            result = await conn.execute(
-                "DELETE FROM users WHERE id = $1",
-                uuid_val,
-            )
+            async with conn.transaction():
+                # No FK cascade fires on capability_grants.scope_id (polymorphic);
+                # delete the user's grant rows in-band so removal stays atomic.
+                await self.delete_grants_for_scope(
+                    conn, scope_kind="user", scope_id=user_id
+                )
+                result = await conn.execute(
+                    "DELETE FROM users WHERE id = $1",
+                    uuid_val,
+                )
 
         return result == "DELETE 1"
 
@@ -7120,10 +7126,16 @@ class PostgresDB:
             return False
 
         async with self.acquire() as conn:
-            result = await conn.execute(
-                "DELETE FROM projects WHERE id = $1",
-                uuid_val,
-            )
+            async with conn.transaction():
+                # No FK cascade fires on capability_grants.scope_id (polymorphic);
+                # delete the project's grant rows in-band so removal stays atomic.
+                await self.delete_grants_for_scope(
+                    conn, scope_kind="project", scope_id=project_id
+                )
+                result = await conn.execute(
+                    "DELETE FROM projects WHERE id = $1",
+                    uuid_val,
+                )
 
         return result == "DELETE 1"
 
@@ -8614,6 +8626,129 @@ class PostgresDB:
 
     # =========================================================================
     # SYSTEM SETTINGS (Phase 4)
+    # --- Capability grants (Slice 2) ---
+
+    async def list_grants_for_scopes(
+        self, *, user_id: str | None, project_ids: list[str]
+    ) -> dict[str, list[dict]]:
+        """{'user': [...], 'project': [...], 'global': [...]} of {key, value_json}.
+        JSONB is returned by asyncpg as a STRING here — deserialize on read."""
+        rows = await self.fetch(
+            """
+            SELECT scope_kind, key, value_json FROM capability_grants
+            WHERE (scope_kind = 'global')
+               OR (scope_kind = 'user'    AND scope_id = $1)
+               OR (scope_kind = 'project' AND scope_id = ANY($2::uuid[]))
+            """,
+            UUID(user_id) if user_id else None,
+            [UUID(p) for p in project_ids],
+        )
+        out: dict[str, list[dict]] = {"user": [], "project": [], "global": []}
+        for r in rows:
+            raw = r["value_json"]
+            val = json.loads(raw) if isinstance(raw, str) else raw
+            out[r["scope_kind"]].append({"key": r["key"], "value_json": val})
+        return out
+
+    async def list_grants(self, *, scope_kind: str, scope_id: str | None) -> list[dict]:
+        rows = await self.fetch(
+            "SELECT key, value_json, granted_by, updated_at FROM capability_grants "
+            "WHERE scope_kind = $1 AND scope_id IS NOT DISTINCT FROM $2 ORDER BY key",
+            scope_kind, UUID(scope_id) if scope_id else None,
+        )
+        result = []
+        for r in rows:
+            d = dict(r)
+            if isinstance(d.get("value_json"), str):
+                d["value_json"] = json.loads(d["value_json"])
+            result.append(d)
+        return result
+
+    async def set_grant(self, *, scope_kind: str, scope_id: str | None, key: str,
+                        value_json: Any, actor: str | None, reason: str | None = None) -> dict:
+        """Upsert one grant + audit row, one transaction. prev value_json is a JSON
+        string from asyncpg — pass straight to the $::jsonb cast (don't re-dumps)."""
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                prev = await conn.fetchrow(
+                    "SELECT value_json FROM capability_grants WHERE scope_kind=$1 "
+                    "AND scope_id IS NOT DISTINCT FROM $2 AND key=$3",
+                    scope_kind, UUID(scope_id) if scope_id else None, key,
+                )
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO capability_grants (scope_kind, scope_id, key, value_json, granted_by)
+                    VALUES ($1, $2, $3, $4::jsonb, $5)
+                    ON CONFLICT (scope_kind, scope_id, key) DO UPDATE
+                        SET value_json = EXCLUDED.value_json, granted_by = EXCLUDED.granted_by,
+                            updated_at = NOW()
+                    RETURNING *
+                    """,
+                    scope_kind, UUID(scope_id) if scope_id else None, key,
+                    json.dumps(value_json), UUID(actor) if actor else None,
+                )
+                await conn.execute(
+                    "INSERT INTO capability_grant_audit "
+                    "(actor, scope_kind, scope_id, key, old_value, new_value, action, reason) "
+                    "VALUES ($1,$2,$3,$4,$5::jsonb,$6::jsonb,$7,$8)",
+                    UUID(actor) if actor else None, scope_kind,
+                    UUID(scope_id) if scope_id else None, key,
+                    prev["value_json"] if prev else None,    # already a JSON string
+                    json.dumps(value_json), "update" if prev else "set", reason,
+                )
+                d = dict(row)
+                if isinstance(d.get("value_json"), str):
+                    d["value_json"] = json.loads(d["value_json"])
+                return d
+
+    async def delete_grant(self, *, scope_kind: str, scope_id: str | None, key: str,
+                           actor: str | None, reason: str | None = None) -> bool:
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                prev = await conn.fetchrow(
+                    "DELETE FROM capability_grants WHERE scope_kind=$1 "
+                    "AND scope_id IS NOT DISTINCT FROM $2 AND key=$3 RETURNING value_json",
+                    scope_kind, UUID(scope_id) if scope_id else None, key,
+                )
+                if prev is None:
+                    return False
+                await conn.execute(
+                    "INSERT INTO capability_grant_audit "
+                    "(actor, scope_kind, scope_id, key, old_value, new_value, action, reason) "
+                    "VALUES ($1,$2,$3,$4,$5::jsonb,NULL,'revoke',$6)",
+                    UUID(actor) if actor else None, scope_kind,
+                    UUID(scope_id) if scope_id else None, key, prev["value_json"], reason,
+                )
+                return True
+
+    async def delete_grants_for_scope(self, conn, *, scope_kind: str, scope_id: str) -> int:
+        """Hard-delete a removed user/project's grant rows (no FK cascade fires —
+        decision 23). Takes an existing connection so it runs in the caller's
+        delete transaction (atomic with the principal removal)."""
+        result = await conn.execute(
+            "DELETE FROM capability_grants WHERE scope_kind=$1 AND scope_id=$2",
+            scope_kind, UUID(scope_id),
+        )
+        return int(result.split()[-1]) if result else 0
+
+    async def user_can_use_vm(self, user: dict) -> bool:
+        """Effective vm_workspace grant; fall back to the legacy can_use_vm column
+        during rollout / on grant-read failure (per-capability fail-mode)."""
+        try:
+            scoped = await self.list_grants_for_scopes(
+                user_id=str(user["id"]), project_ids=[]
+            )
+            from src.core.capability_grants import resolve_grants
+
+            g = resolve_grants(user_rows=scoped["user"], project_rows=scoped["project"],
+                               global_rows=scoped["global"])
+            if any(r["key"] == "vm_workspace"
+                   for r in scoped["user"] + scoped["project"] + scoped["global"]):
+                return bool(g["vm_workspace"])
+        except Exception:
+            logger.exception("vm grant read failed; fall back to can_use_vm column")
+        return bool(user.get("can_use_vm"))
+
     # =========================================================================
     # Key/value store for deploy-time configuration that operators can edit
     # via the cockpit admin UI. Secrets never land here — the credentials_ref

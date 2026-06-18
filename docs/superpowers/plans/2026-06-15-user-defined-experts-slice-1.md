@@ -93,7 +93,8 @@ Local `pytest` is env-noisy (Py3.14, missing `paramiko`/`aiosmtplib`); CI (Py3.1
 A placeholder `0029_*.sql` would be checksummed on first apply; editing it in Slice 2 to add the real grants DDL would trip the runner's checksum-drift guard (`orchestrator/database/migrate.py`). Reserve by convention instead. Add to `docs/db_migration.md` under the migration list/conventions section:
 
 ```markdown
-> **Reserved:** `0029_capability_grants.sql` is reserved for the User-Defined
+> **Reserved:** `0030_capability_grants.sql` (originally `0029`; `0029` was later
+> claimed by `0029_add_mistral_provider.sql`) is reserved for the User-Defined
 > Experts Slice 2 (capability grants) — see
 > `docs/features/global_expert_management.md`. Do not claim `0029` for another
 > feature. (Reserved by note, not a placeholder file: the runner checksums
@@ -1620,4 +1621,4 @@ kubectl rollout restart -n srw deploy/orchestrator
 
 **Placeholder scan:** No "TBD"/"TODO"; every implementation step shows real code. The two notes that read like deferrals (`_get_expert_row_sync`, exact status literals) are explicitly called out as "implement as async / verify the literal," not left vague.
 
-**Out-of-Slice-1 (correctly absent):** grants/`capability_grants`/`0029` DDL, save-time 422 on grants, dispatch-time merged-stack enforcement, allow-list pydantic binding, duplicate-key/raw-byte canonicalization, Cockpit UI, version-history. All are Slice 2+.
+**Out-of-Slice-1 (correctly absent):** grants/`capability_grants`/`0030` DDL, save-time 422 on grants, dispatch-time merged-stack enforcement, allow-list pydantic binding, duplicate-key/raw-byte canonicalization, Cockpit UI, version-history. All are Slice 2+.
