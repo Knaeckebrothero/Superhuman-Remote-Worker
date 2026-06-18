@@ -35,3 +35,55 @@ def test_resolve_config_without_skills_has_empty_dict():
     assert blob.get("skills") in (None, {})
     config = load_config_from_resolved(blob)
     assert config.extra["_resolved_skills"] == {}
+
+
+# ── Task 3: Layer-1 system-prompt menu injection ──────────────────────────────
+def _worker_cfg(template, menu=None):
+    data = {
+        "agent_id": "t",
+        "display_name": "T",
+        "_resolved_prompts": {"systemprompt": template, "tactical": "TAC{phase_number}"},
+    }
+    if menu is not None:
+        data["_resolved_skills"] = {"menu": menu}
+    return load_agent_config_from_dict(data)
+
+
+def test_worker_prompt_includes_fenced_skills_menu():
+    cfg = _worker_cfg(
+        "BASE {agent_display_name} ID:{expert_identity} "
+        "SK:{available_skills} C:{prompt_content}",
+        menu=[{"name": "hello-skill", "description": "Use when testing."}],
+    )
+    out = get_phase_system_prompt(cfg, is_strategic=False)
+    assert "<available_skills" in out
+    assert "- hello-skill: Use when testing." in out
+
+
+def test_worker_prompt_no_menu_when_no_skills():
+    cfg = _worker_cfg(
+        "BASE {agent_display_name} ID:{expert_identity} "
+        "SK:{available_skills} C:{prompt_content}",
+    )
+    out = get_phase_system_prompt(cfg, is_strategic=False)
+    assert "<available_skills" not in out
+    assert "SK: C:" in out  # placeholder resolved to empty string
+
+
+def test_interactive_prompt_includes_fenced_skills_menu():
+    cfg = load_agent_config_from_dict(
+        {
+            "agent_id": "t",
+            "display_name": "T",
+            "_resolved_prompts": {
+                "systemprompt_interactive": "SYS {agent_display_name} :: "
+                "{expert_identity} :: {available_skills}",
+            },
+            "_resolved_skills": {
+                "menu": [{"name": "hello-skill", "description": "Use when testing."}]
+            },
+        }
+    )
+    out = get_phase_system_prompt(cfg, is_strategic=False, prompt_type="interactive")
+    assert "<available_skills" in out
+    assert "- hello-skill: Use when testing." in out

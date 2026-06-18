@@ -3276,9 +3276,17 @@ def get_phase_system_prompt(
                 template, tool_names, cli_datasources=cli_ds_interactive
             )
 
+        # Slice-2 skills menu (L1): fenced, untrusted user content. Empty when no
+        # in-scope skills (then {available_skills} renders blank).
+        from src.core.expert_resolution import fence_skills_menu
+
+        available_skills = fence_skills_menu(
+            config.extra.get("_resolved_skills", {}).get("menu", [])
+        )
         rendered = template.format(
             agent_display_name=config.display_name,
             expert_identity=expert_identity,
+            available_skills=available_skills,
         )
 
         # Prepend reasoning directive for OSS models
@@ -3331,9 +3339,17 @@ def get_phase_system_prompt(
     rendered_component = phase_component.format(phase_number=phase_number)
 
     # Inject all components and render remaining placeholders
+    # Slice-2 skills menu (L1): fenced, untrusted user content. Empty when no
+    # in-scope skills (then {available_skills} renders blank).
+    from src.core.expert_resolution import fence_skills_menu
+
+    available_skills = fence_skills_menu(
+        config.extra.get("_resolved_skills", {}).get("menu", [])
+    )
     rendered = base_template.format(
         agent_display_name=config.display_name,
         expert_identity=expert_identity,
+        available_skills=available_skills,
         prompt_content=rendered_component,
     )
 
