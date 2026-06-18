@@ -1026,6 +1026,9 @@ async def _resolve_session_config(
         )
         base_defaults = await _resolve_default_models(user_id)
         _cap: dict = {}
+        _skills_payload = await _gather_in_scope_skills(
+            user_id, [project_id] if project_id else None
+        )
         resolved = resolve_config(
             base_config_name=base,
             base_defaults=base_defaults,
@@ -1033,6 +1036,7 @@ async def _resolve_session_config(
             request_override=request_override,
             expert_type="session",
             capture=_cap,
+            skills=_skills_payload,
         )
         # Session dispatch PEP (decision 9): the merged config — including
         # interactive.permission_mode and any persistent_agent keys baked into
@@ -1592,6 +1596,10 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
                 # below the expert; inject_blob_credentials adds the transport.
                 _base_defaults = await _resolve_default_models(job.get("user_id"))
                 _cap: dict = {}
+                _skills_payload = await _gather_in_scope_skills(
+                    str(job["user_id"]) if job.get("user_id") else None,
+                    [str(job["project_id"])] if job.get("project_id") else None,
+                )
                 _resolved = resolve_config(
                     base_config_name=_base_name,
                     base_defaults=_base_defaults,
@@ -1599,6 +1607,7 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
                     request_override=config_override,
                     expert_type="worker",
                     capture=_cap,
+                    skills=_skills_payload,
                 )
                 # Dispatch PEP (decision 9): the merged config must fit the runner's
                 # grants. GrantDenied is caught BELOW the generic fallback so a denial
@@ -16671,6 +16680,73 @@ def _bundled_skill_bundle(skill_name: str) -> dict[str, Any] | None:
         "tags": fm.get("tags", []),
         "files": files,
     }
+
+
+async def _gather_in_scope_skills(
+    user_id: str | None, project_ids: list[str] | None = None
+) -> dict[str, Any]:
+    """Build the resolved-blob skills payload: the precedence-deduped menu plus
+    the file tree for each winning skill. Bundled (disk) + DB (owned + global).
+    Returns {} when skills are disabled or there is no user. Slice 2."""
+    from src.core.skill_resolution import resolve_skill_menu
+
+    if not _is_skills_db_enabled() or not user_id:
+        return {}
+
+    global _skills_cache
+    if _skills_cache is None:
+        _skills_cache = _scan_skills()
+
+    rows: list[dict[str, Any]] = []
+    for s in _skills_cache:
+        rows.append(
+            {
+                **s.model_dump(),
+                "owner_id": None,
+                "is_global": False,
+                "created_at": "",
+                "_source": "bundled",
+                "_ref": s.id,  # bundled dir name
+            }
+        )
+    for r in await postgres_db.list_skills_visible(user_id=str(user_id)):
+        rows.append(
+            {
+                **_skill_row_to_meta(r),
+                "owner_id": str(r["owner_id"]) if r.get("owner_id") else None,
+                "is_global": r["is_global"],
+                "created_at": str(r.get("created_at", "")),
+                "_source": "global" if r["is_global"] else "user",
+                "_ref": str(r["id"]),
+            }
+        )
+
+    menu_rows = resolve_skill_menu(
+        rows, user_id=str(user_id), project_ids=set(project_ids or [])
+    )
+
+    menu: list[dict[str, Any]] = []
+    files: dict[str, dict[str, str]] = {}
+    for row in menu_rows:
+        menu.append(
+            {
+                "id": row.get("id"),
+                "name": row["name"],
+                "display_name": row.get("display_name"),
+                "description": row.get("description") or "",
+                "icon": row.get("icon"),
+                "color": row.get("color"),
+                "tags": row.get("tags") or [],
+            }
+        )
+        if row["_source"] == "bundled":
+            bundle = _bundled_skill_bundle(row["_ref"])
+            if bundle:
+                files[row["name"]] = bundle["files"]
+        else:
+            files[row["name"]] = await postgres_db.get_skill_files(row["_ref"])
+
+    return {"menu": menu, "files": files}
 
 
 async def _create_forked_skill(
