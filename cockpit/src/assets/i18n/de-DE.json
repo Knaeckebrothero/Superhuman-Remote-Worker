@@ -85,6 +85,19 @@
     "collapseSidebar": "Seitenleiste einklappen",
     "openSidebar": "Seitenleiste öffnen"
   },
+  "grants": {
+    "lockedShort": "Erfordert eine Freigabe",
+    "locked": {
+      "vm_workspace": "VM-Workspaces erfordern die Freigabe „vm_workspace“.",
+      "shell_tools": "Shell-Tools erfordern die Freigabe „shell_tools“.",
+      "delegation": "Delegation erfordert die Freigabe „delegation“.",
+      "datasource_tools": "Datenquellen-Tools erfordern die Freigabe „datasource_tools“.",
+      "browser": "Browser-Tools erfordern die Freigabe „browser“.",
+      "model_selection": "Ihr Administrator schränkt ein, welche Modelle Sie auswählen können.",
+      "autonomy_ceiling": "Autonomie über Ihrer Obergrenze erfordert eine Freigabe.",
+      "permission_mode": "Dieser Berechtigungsmodus erfordert eine Freigabe."
+    }
+  },
   "shell": {
     "newSession": "Neue Sitzung",
     "untitledSession": "Unbenannt",
@@ -1185,6 +1198,35 @@
       "searchFor": "nach \"{{term}}\"",
       "commandDash": "— {{cmd}}"
     }
+  },
+  "experts": {
+    "title": "Experten",
+    "new": "Neuer Experte",
+    "import": "Importieren",
+    "empty": "Noch keine Experten. Erstellen Sie einen oder duplizieren Sie einen integrierten.",
+    "loading": "Experten werden geladen…",
+    "filterAll": "Alle",
+    "filterWorker": "Worker",
+    "filterSession": "Sitzung",
+    "colName": "Name",
+    "colType": "Typ",
+    "colSource": "Quelle",
+    "colActions": "Aktionen",
+    "edit": "Bearbeiten",
+    "duplicate": "Duplizieren",
+    "export": "Exportieren",
+    "delete": "Löschen",
+    "cancel": "Abbrechen",
+    "save": "Speichern",
+    "bundledReadonly": "integriert",
+    "confirmDeleteTitle": "Experten löschen?",
+    "confirmDeleteBody": "Dies löscht dauerhaft",
+    "deleted": "Experte gelöscht",
+    "duplicated": "Experte dupliziert",
+    "imported": "Experte importiert",
+    "inUse": "Experte wird von {{count}} Aufträgen verwendet",
+    "saveFailed": "Speichern fehlgeschlagen",
+    "invalidJson": "Ungültige JSON-Datei"
   },
   "datasources": {
     "title": "Datenquellen",

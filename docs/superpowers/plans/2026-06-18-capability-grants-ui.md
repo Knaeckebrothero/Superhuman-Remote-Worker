@@ -1,5 +1,30 @@
 # Capability-Grants UI (Slice-2 fast-follow) Implementation Plan
 
+> ## ✅ STATUS: COMPLETE — executed inline on `develop` (uncommitted) + live-verified on k3d, 2026-06-18
+>
+> All 8 tasks executed. **70 cockpit specs** (4 new pure-gate + 66 existing, no regression) green;
+> AOT `ng build` completes (only pre-existing budget warnings); `tsc --noEmit` 0 errors. **Live on
+> k3d cockpit** (`test`/`test` = admin): the Admin → Grants panel renders all 8 catalog rows with the
+> correct control type each, and **set (PUT) + revoke (DELETE)** round-trip through the real API → DB →
+> append-only audit (verified, left clean); the expert editor renders with the admin-bypass (no
+> gating) confirmed (autonomy shows `full`, models enabled, 0 lock hints). The per-task `- [ ]`
+> checkboxes below are the historical plan of record — this banner is the as-built record.
+>
+> **As-built notes / deviations:**
+> 1. **Admin panel uses literal English strings** (not Transloco) to match the existing admin-section
+>    convention (`AdminUsersComponent` etc.); only the editor lock hints use the new `grants.*` i18n keys.
+> 2. **`AdminGrantsService` is Observable-based** (`.subscribe`), matching `AdminUsersService`, rather
+>    than the `firstValueFrom`/async draft in this plan.
+> 3. **`browser_direct` is included** in the tools-group gate map (correct + free: the resolved-grants
+>    record carries `browser`'s effective value, so it only blocks when explicitly denied) — slightly
+>    exceeds the "defer browser greying" scope without risk.
+> 4. **`vm_workspace` greying** is left to the accordion's pre-existing `canUseVm` (already grant-aware
+>    via the backend dual-read) — not re-wired.
+> 5. **Not driven live:** the non-admin greying *visual* (needs a non-admin Keycloak session; `test` is
+>    admin). The gate logic (4 vitest) + the `[disabled]`/filtered-`@for` bindings (AOT) cover it.
+> 6. **Dev-test mechanics:** cockpit at `https://localhost` (traefik), Keycloak `test`/`test`; the
+>    `markLoaded … classList` console error is a pre-existing index.html splash-shim race, benign.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 >
 > **Commits are the user's responsibility.** This user handles all commits/pushes. Every "Checkpoint" means *stop, confirm tests green, leave changes staged* — do NOT run `git commit`/`git push`.
