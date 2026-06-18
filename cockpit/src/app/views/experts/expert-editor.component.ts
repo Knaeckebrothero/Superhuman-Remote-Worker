@@ -4,7 +4,7 @@ import {ActivatedRoute, Router} from '@angular/router';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {ApiService} from '../../core/services/api.service';
 import {ModelService} from '../../core/services/model.service';
-import type {ExpertCreateRequest, ExpertUpdateRequest} from '../../core/models/api.model';
+import type {ExpertCreateRequest, ExpertUpdateRequest, GrantCatalog} from '../../core/models/api.model';
 import {AppButtonComponent} from '../../ui/button';
 import {AppInputComponent} from '../../ui/input';
 import {AppTextareaComponent} from '../../ui/textarea';
@@ -16,6 +16,7 @@ import {ToolsGroupComponent} from '../agent-settings/tools-group.component';
 import {AdvancedAccordionComponent} from '../agent-settings/advanced-accordion.component';
 import {deepMergeConfig} from '../agent-settings/config-merge';
 import {assembleExpertConfig, splitExpertConfig} from './expert-config';
+import {isModelAllowed} from '../agent-settings/capability-gates';
 
 /** Derive a valid expert slug (^[a-z][a-z0-9_-]*$) from a display name. */
 export function slugify(s: string): string {
@@ -141,6 +142,8 @@ interface EditorForm {
           [mode]="mode()"
           [disabled]="false"
           [showProjectMemory]="false"
+          [gatedCapabilities]="gatedCapabilities()"
+          [catalog]="catalog()"
         />
       </section>
 
@@ -148,36 +151,39 @@ interface EditorForm {
         <h2>Model</h2>
         @if (mode() === 'job') {
           <label class="ml">Strategic model
-            <select class="model-select" [ngModel]="form.strategicModel" (ngModelChange)="form.strategicModel = $event">
+            <select class="model-select" [disabled]="isModelGated()" [ngModel]="form.strategicModel" (ngModelChange)="form.strategicModel = $event">
               <option [ngValue]="''">(base default)</option>
               @for (g of models(); track g.group) {
                 <optgroup [label]="g.group">
-                  @for (m of g.models; track m) { <option [ngValue]="m">{{ m }}</option> }
+                  @for (m of g.models; track m) { <option [ngValue]="m" [disabled]="!modelAllowed(m)">{{ m }}</option> }
                 </optgroup>
               }
             </select>
           </label>
           <label class="ml">Tactical model
-            <select class="model-select" [ngModel]="form.tacticalModel" (ngModelChange)="form.tacticalModel = $event">
+            <select class="model-select" [disabled]="isModelGated()" [ngModel]="form.tacticalModel" (ngModelChange)="form.tacticalModel = $event">
               <option [ngValue]="''">(base default)</option>
               @for (g of models(); track g.group) {
                 <optgroup [label]="g.group">
-                  @for (m of g.models; track m) { <option [ngValue]="m">{{ m }}</option> }
+                  @for (m of g.models; track m) { <option [ngValue]="m" [disabled]="!modelAllowed(m)">{{ m }}</option> }
                 </optgroup>
               }
             </select>
           </label>
         } @else {
           <label class="ml">Model
-            <select class="model-select" [ngModel]="form.sessionModel" (ngModelChange)="form.sessionModel = $event">
+            <select class="model-select" [disabled]="isModelGated()" [ngModel]="form.sessionModel" (ngModelChange)="form.sessionModel = $event">
               <option [ngValue]="''">(base default)</option>
               @for (g of models(); track g.group) {
                 <optgroup [label]="g.group">
-                  @for (m of g.models; track m) { <option [ngValue]="m">{{ m }}</option> }
+                  @for (m of g.models; track m) { <option [ngValue]="m" [disabled]="!modelAllowed(m)">{{ m }}</option> }
                 </optgroup>
               }
             </select>
           </label>
+        }
+        @if (isModelGated()) {
+          <small class="lock-hint">🔒 {{ 'grants.locked.model_selection' | transloco }}</small>
         }
       </section>
 
@@ -188,6 +194,7 @@ interface EditorForm {
           [mode]="mode()"
           [disabled]="false"
           [defaultsTools]="defaultsTools()"
+          [gatedCapabilities]="gatedCapabilities()"
         />
       </section>
 
@@ -282,6 +289,16 @@ interface EditorForm {
         color: var(--text-primary);
         font: inherit;
       }
+      .model-select:disabled {
+        opacity: 0.55;
+        cursor: not-allowed;
+      }
+      .lock-hint {
+        display: block;
+        margin-top: 0.35rem;
+        color: var(--text-muted);
+        font-size: 0.8rem;
+      }
       .hint {
         margin: 0;
         color: var(--text-muted);
@@ -328,6 +345,19 @@ export class ExpertEditorComponent implements OnInit {
 
   readonly models = this.modelService.models;
 
+  // Capability grants → editor control-greying. undefined = loading; null = admin
+  // (unrestricted, no gating). A resolved record gates per the deny-default PDP.
+  capabilities = signal<Record<string, unknown> | null | undefined>(undefined);
+  catalog = signal<GrantCatalog>({});
+  /** What the group components consume; null ⇒ no gating (admin / loading). */
+  gatedCapabilities = computed(() => this.capabilities() ?? null);
+  /** True only when a model_selection restriction is in force. */
+  isModelGated = computed(() => {
+    const g = this.capabilities();
+    return g != null && Array.isArray((g as Record<string, unknown>)['model_selection']);
+  });
+  modelAllowed = (id: string): boolean => isModelAllowed(this.capabilities() ?? null, id);
+
   form: EditorForm = {
     name: '',
     display_name: '',
@@ -365,6 +395,12 @@ export class ExpertEditorComponent implements OnInit {
 
   ngOnInit(): void {
     this.modelService.load();
+    // Author's capabilities → grey controls they lack grants for. Fail-open on
+    // error (null = no gating); the save-time 422 remains the backstop.
+    this.api.getMyCapabilities().subscribe((c) => {
+      this.capabilities.set(c ? c.grants : null);
+      this.catalog.set(c?.catalog ?? {});
+    });
     // Type base (worker + session both use `defaults`): drives default displays
     // + the tools-group baseline.
     this.api.getExpertDetail('defaults').subscribe((d) => {

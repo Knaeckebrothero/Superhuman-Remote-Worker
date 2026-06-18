@@ -144,6 +144,14 @@ import {ViewModeToggleComponent} from '../view-mode-toggle/view-mode-toggle.comp
               <app-icon size="md" class="nav-icon">edit_note</app-icon>
               Admin · Config
             </a>
+            <a
+              class="nav-link"
+              routerLink="/admin/grants"
+              routerLinkActive="active"
+            >
+              <app-icon size="md" class="nav-icon">verified_user</app-icon>
+              Admin · Grants
+            </a>
           }
         </div>
 

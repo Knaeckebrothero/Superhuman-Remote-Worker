@@ -10,7 +10,7 @@ tags:
 # Agent Skills
 
 > **Status**: Design — 2026-06-18. Ready for Slice-1 planning.
-> The experts rework ([[global_expert_management]]) has **landed** (Slices 1 + 3 on `develop`; capability-grants deferred), so skills now build on its *shipped* substrate — the orchestrator-resolved frozen-config model, the `experts`-style table + scope precedence, persona fencing, and save-time credential deny-scan.
+> The experts rework ([[global_expert_management]]) has **landed** (Slices 1 + 3 + **Slice 2 capability-grants enforcement**, all on `develop`; only the Cockpit grants panel/control-greying remains), so skills now build on its *shipped* substrate — the orchestrator-resolved frozen-config model, the `experts`-style table + scope precedence, persona fencing, save-time credential deny-scan, **and the capability-grants gate (`evaluate()`) enforced at save/dispatch/resume/session**.
 > **Decision: adopt Anthropic's open `SKILL.md` standard** ([agentskills.io](https://agentskills.io/specification)) verbatim, so SRW skills are portable to/from Claude Code and Codex rather than a bespoke format. The previously-deferred knobs are resolved below; what remains open is narrowed to tuning + the script/grants slice.
 
 ## Motivation
@@ -110,7 +110,7 @@ The skill is written **once**; each expert decides **how it activates**. The sam
 
 - **Descriptions are always-on and user-authored** → a persistent prompt-injection vector (worse than a persona, which only loads when selected). Fence both the description (in the menu) and the body using the shipped **`fence_persona`** mechanism, marking skill content untrusted (`_source=db`), so it reads as a request, not operator policy.
 - **Config fragments / frontmatter** run through the shipped **`hard_deny_scan`** at save time (422 on credential keys/paths), exactly as expert fragments do.
-- **Script execution is an untrusted-code surface** — Anthropic explicitly warns a malicious skill can direct the agent to misuse tools. Allowing a skill's scripts to *run* therefore sits **behind the capability-grants gate** (experts' deferred Slice 2). Consequently, **script-bearing skills are a later slice**; the first slices are prompt-only.
+- **Script execution is an untrusted-code surface** — Anthropic explicitly warns a malicious skill can direct the agent to misuse tools. Allowing a skill's scripts to *run* therefore sits **behind the capability-grants gate** (experts' Slice 2, **shipped 2026-06-18** — the `evaluate()` PDP a `shell_tools`/`run_scripts`-style grant would extend). Consequently, **script-bearing skills are a later slice**; the first slices are prompt-only.
 
 ## Storage — mirror experts, plus a file tree
 
@@ -124,7 +124,7 @@ Everything else mirrors experts: CRUD + duplicate + export/import (in `SKILL.md`
 
 ## Prior art — what already exists
 
-- **Experts-v2** ([[global_expert_management]]) — **landed** (Slices 1 + 3): orchestrator resolves a frozen `resolved_config` blob the agent hydrates; `experts` table (migration 0028) + `project_experts` + `jobs.expert_id`; owner > project > global > bundled precedence; `fence_persona` for untrusted user prompt content; `hard_deny_scan` at save. Skills reuse all of it. (Capability-grants = experts' deferred Slice 2; script gating waits on it.)
+- **Experts-v2** ([[global_expert_management]]) — **landed** (Slices 1 + 3 + Slice 2): orchestrator resolves a frozen `resolved_config` blob the agent hydrates; `experts` table (migration 0028) + `project_experts` + `jobs.expert_id`; owner > project > global > bundled precedence; `fence_persona` for untrusted user prompt content; `hard_deny_scan` at save. Skills reuse all of it. (Capability-grants enforcement = experts' Slice 2, **shipped 2026-06-18** — migration `0030`, the `evaluate()` PDP at four PEPs; script gating extends it with a script/shell-style grant.)
 - **Four-layer prompt architecture** ([[prompting]]): Layer 3 *is* the skill artifact, bound deterministically; the passive (tool-gated `read_file`) and active (phase injection) mechanisms are shipped and proven by `todo_guide.md` / `research_guide.md`. This feature adds the `model_invoked` binding + catalog.
 - **Memory & knowledge** ([[memory_light]], [[project_knowledge_base]]): hybrid retrieval that injects content by similarity to the current todo + phase — the engine the future `semantic` skill trigger rides.
 

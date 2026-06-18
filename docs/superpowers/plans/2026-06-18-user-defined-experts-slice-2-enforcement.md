@@ -1,5 +1,34 @@
 # User-Defined Experts — Slice 2 (Capability Grants: Enforcement + Admin API) Implementation Plan — v2
 
+> ## ✅ STATUS: COMPLETE — executed inline on `develop` (uncommitted) + live-verified on k3d-srw, 2026-06-18
+>
+> All 15 tasks executed. **29 new tests** (21 pure PDP + 8 contract) + 268 area-regression green;
+> ruff clean; `orchestrator.main` imports and all routes register. **Live-verified on k3d-srw:**
+> migration `0030` + grandfather backfill; save-time 422 (multi-key); dispatch PEP reject with
+> per-key resolution (granted `shell_tools` passes, ungranted `delegation` blocks, job → `failed`);
+> admin grants CRUD + append-only audit (`set`/`revoke`/`set`); `/api/users/me/capabilities` (admin
+> null + non-admin resolved); `delete_user` → grant-row cleanup. The per-task `- [ ]` checkboxes below
+> are left **unchecked as the historical plan of record** — this banner is the as-built record.
+>
+> **Deviations from this plan, as executed (all intentional):**
+> 1. **Wired `scan_fragment_text`** (raw-body duplicate/non-ASCII/credential-key scan) into all 3 save
+>    endpoints via a combined `_enforce_expert_save` helper — Task 5 built it "to be wired in Task 8"
+>    but Task 8's literal steps omitted the wiring.
+> 2. **Added `_validate_grant_value`** on the admin set-grant endpoint — rejects a value whose type
+>    mismatches the catalog (e.g. an out-of-range enum) so it can't crash `meet()` at dispatch.
+> 3. **Fixed a bug in Task 11's pseudo-code:** `(config_name).replace("default","defaults")` corrupts
+>    `"defaults"`→`"defaultss"`; used the dispatch path's `if name == "default"` guard instead.
+> 4. **`resume_job` endpoint PEP placed before its broad `try`** so a 403 isn't swallowed; a resolve
+>    *infra* error proceeds (the dispatch-time check already passed) rather than 500-ing every resume.
+> 5. **Session attach fails CLOSED on a resolve _error_** (experts enabled): refuses rather than
+>    delivering the unvetted `config_override`. Behavior change; the experts-*disabled* path keeps the
+>    legacy fallback.
+> 6. **Runtime import-path bug caught live + fixed:** the three lazy `from orchestrator.services.grants_service import …`
+>    were wrong in the pod (its flattened layout uses sibling `from services…`); the test `sys.path`
+>    (both roots on it) masked this. Fixed to `from services.grants_service import …`. **Lesson:** for
+>    runtime imports in `orchestrator/`, use sibling `from services…`/`from security…`, never
+>    `from orchestrator.…`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 >
 > **Commits are the user's responsibility.** This user handles all commits/pushes ("orchestration"). Every "Checkpoint" means *stop, confirm tests green, leave changes staged for the user* — do NOT run `git commit`/`git push`.
