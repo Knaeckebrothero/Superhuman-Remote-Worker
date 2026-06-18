@@ -415,6 +415,22 @@ class PersistentSession:
         Copies files like design_guide.md from the expert config directory into
         the workspace so the agent can read them via workspace tools.
         """
+        # Skill directories (Slice 2) — mirror of the agent.py worker path. Runs
+        # before the instruction-files guard since skills come from the frozen
+        # blob (_resolved_skills), not the expert config dir.
+        from src.core.skill_resolution import skill_files_to_workspace
+
+        skills_files = self.config.extra.get("_resolved_skills", {}).get("files", {})
+        for ws_path, content in skill_files_to_workspace(skills_files).items():
+            target = self.workspace_manager.get_path(ws_path)
+            if target.exists():
+                continue  # don't overwrite on session resume
+            parent_dir = str(Path(ws_path).parent)
+            if parent_dir and parent_dir != ".":
+                self.workspace_manager.backend.mkdir(parent_dir)
+            self.workspace_manager.write_file(ws_path, content)
+            logger.debug(f"Deployed skill file to workspace: {ws_path}")
+
         if not self.config.instruction_files or not self.config._deployment_dir:
             return
 
