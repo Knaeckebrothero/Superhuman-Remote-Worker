@@ -966,9 +966,9 @@ async def _resolve_default_models(user_id: str | None) -> dict[str, Any]:
     user_settings: dict[str, Any] = {}
     if user_id:
         user_settings = await postgres_db.get_user_settings(str(user_id)) or {}
-    chat = user_settings.get("default_model") or await postgres_db.resolve_default_for_capability(
-        "chat"
-    )
+    chat = user_settings.get(
+        "default_model"
+    ) or await postgres_db.resolve_default_for_capability("chat")
     aux = user_settings.get(
         "default_auxiliary_model"
     ) or await postgres_db.resolve_default_for_capability("auxiliary")
@@ -16141,7 +16141,9 @@ async def get_expert(request: Request, expert_id: str) -> dict[str, Any]:
     if _is_experts_db_enabled() and _looks_like_uuid(expert_id):
         detail = await _load_expert_detail(expert_id)
         if not detail:
-            raise HTTPException(status_code=404, detail=f"Expert not found: {expert_id}")
+            raise HTTPException(
+                status_code=404, detail=f"Expert not found: {expert_id}"
+            )
         return detail
 
     # Verify bundled expert exists

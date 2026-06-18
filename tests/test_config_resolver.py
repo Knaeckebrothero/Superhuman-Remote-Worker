@@ -78,7 +78,10 @@ def test_base_defaults_replace_placeholder_below_expert():
     placeholder, but an expert still overrides the chat model."""
     blob = resolve_config(
         base_config_name="persistent_defaults",
-        base_defaults={"llm": {"model": "sys-default"}, "auxiliary": {"model": "aux-d"}},
+        base_defaults={
+            "llm": {"model": "sys-default"},
+            "auxiliary": {"model": "aux-d"},
+        },
     )
     assert blob["agent"]["llm"]["model"] == "sys-default"  # floor > base placeholder
     assert blob["agent"]["auxiliary"]["model"] == "aux-d"
