@@ -42,6 +42,23 @@ aliases:
 > `docs/superpowers/specs/2026-06-17-orchestrator-resolved-config-design.md` and the
 > implementation plan `docs/superpowers/plans/2026-06-17-orchestrator-resolved-config.md`.
 
+**Status (2026-06-18) — Grants UI fast-follow SHIPPED + live-verified on k3d.** The two UI pieces
+deferred from Slice 2/3 now ship on `develop` (uncommitted): **(1)** an **Admin → Grants** panel
+(`/admin/grants`, sidebar, admin-guarded) to set/revoke grants per user/project/global — a tri-state
+control per catalog key (Inherit = `DELETE` / Allow·Deny = `PUT` / enum select / model-id list),
+reading the catalog dynamically; **(2)** **editor control-greying** — a pure `capability-gates.ts`
+(4 vitest) fed by `/api/users/me/capabilities` greys the shell/delegation tool toggles, filters
+autonomy/permission options above the granted ceiling, and disables the model selects when
+restricted. Group gating is opt-in (`input(null)` ⇒ no gating) so the **launch flow is
+byte-identical**; `vm_workspace` greying reuses the accordion's existing `canUseVm`;
+`browser`/`datasource_tools` greying deferred (allow-by-default). Verified: **70 cockpit specs
+(4 new)** + AOT `ng build` + `tsc` clean; **live on k3d** the admin panel renders all 8 rows and
+set/revoke round-trips through the real API → DB → audit, and the editor renders with the
+admin-bypass (no gating) confirmed (the non-admin greying *visual* is unit + AOT covered, needs a
+non-admin session to see live). Plan: `docs/superpowers/plans/2026-06-18-capability-grants-ui.md`.
+**Remaining Slice-3 polish:** project-link/`default_for` UI, per-tool curation (toggles are
+category-level), de-DE page strings.
+
 **Status (2026-06-18):** **Slice 2 — capability-grants enforcement + admin API — SHIPPED** on
 `develop` (uncommitted) and **live-verified on k3d-srw**. Migration `0030_capability_grants`
 (tables + append-only audit + `can_use_vm` migrate-in) realizes **deny-by-default via
@@ -59,9 +76,9 @@ the grant with a legacy-column fallback. **Live-verified:** grandfather backfill
 non-admin resolved); `delete_user` → grant-row cleanup. A runtime import-path bug
 (`from orchestrator.services…` vs the pod's flattened sibling `from services…`, masked by the test
 `sys.path`) was caught live and fixed. Tests: **29 new** (pure PDP + contract) + 268 area-regression
-green; ruff clean. **Still deferred to a fast-follow:** the Cockpit Admin→Users grants panel and the
-`/api/users/me/capabilities`-driven editor control-greying (the endpoint ships here for the UI to
-consume). Plan: `docs/superpowers/plans/2026-06-18-user-defined-experts-slice-2-enforcement.md`.
+green; ruff clean. **Fast-follow now shipped** — the Cockpit grants panel + editor control-greying
+landed the same day (see the Grants UI status above). Plan:
+`docs/superpowers/plans/2026-06-18-user-defined-experts-slice-2-enforcement.md`.
 
 **Status (2026-06-17):** **Slice 1 write-CRUD restored + Slice-3 create-UI shipped** on `develop`
 (uncommitted). The Slice-1 write endpoints had been clobbered by `6f8c635e` and were **restored**
@@ -75,9 +92,9 @@ delete-confirm with 409-blocker surfacing, and duplicate/export/import + nav + i
 de-DE nav only, page strings fall back to en). Agent-side expert resolution
 (`_apply_db_expert` / `ExpertsNamespace`) was **deleted** — resolution is orchestrator-only
 (`services/config_resolver.py`). Tests: backend 46 + cockpit 579 green; ruff/tsc/ng-build clean.
-**Still deferred:** Slice 2 **Cockpit grants panel + editor control-greying** (enforcement + admin API + `/api/users/me/capabilities` SHIPPED 2026-06-18, above),
-project-link/`default_for` UI, test-drive, version/stats panels, per-tool curation
-(the tool toggles are category-level), de-DE page translations. Plan: `docs/superpowers/plans/2026-06-17-expert-crud-ui.md`. **Browser-verified**
+**Still deferred:** project-link/`default_for` UI, test-drive, version/stats panels, per-tool curation
+(the tool toggles are category-level), de-DE page translations.
+(Slice 2 enforcement + admin API **and** the grants panel + editor control-greying all **SHIPPED 2026-06-18**, above.) Plan: `docs/superpowers/plans/2026-06-17-expert-crud-ui.md`. **Browser-verified**
 (Playwright, dev `test` user): `/experts/new` renders, auto-slug works (`Research Helper 2026` →
 `research-helper-2026`), 0 console errors. A dark-on-dark contrast bug (a hardcoded `--surface-color`
 fallback) was caught in the walkthrough and fixed by switching the editor/list styles to the real theme
@@ -412,7 +429,8 @@ MCP server gains the matching tools (`create_expert`, `update_expert`,
 > ✅ **Implemented (2026-06-17)** — see the Status block at the top + the "Structured config editor"
 > note. The sketch below is the original design; the as-built editor went **fully structured** (it reuses
 > the agent-settings execution/model/tools/advanced groups over a raw-JSON flap) rather than the
-> "deliberately small" raw-fragment v1 surface described here, and grant-greying awaits Slice 2.
+> "deliberately small" raw-fragment v1 surface described here. Grant-greying **shipped 2026-06-18**
+> (the Slice-2 fast-follow — `capability-gates.ts` fed by `/api/users/me/capabilities`).
 
 **Experts page** (nav slot + layout pattern: the datasources tab). List with
 type/source filters; bundled experts badged + read-only with "Duplicate to
@@ -433,9 +451,9 @@ Reuses the admin-config building blocks (typed controls from the catalog,
 bundled-default panel, reset semantics) and the tool-category checkboxes from
 `agent-settings`. Job-create filters `type=worker`; session-create
 (`session-create.component.ts`) filters `type=session`; project-linked
-experts listed first with badge. **Admin → Users** grows from the lone VM
-toggle into the grants panel (per-user; project + global grant editing on the
-admin config page).
+experts listed first with badge. As-built (2026-06-18), a dedicated **Admin →
+Grants** page (`/admin/grants`) handles user, project, and global grant editing
+in one scope-selectable table; the Admin → Users VM toggle stays where it is.
 
 ## Security model
 
@@ -532,15 +550,16 @@ intersection with the invoker).
 > frozen-blob replay bypass), and session attach (warm+cold), all fail-closed. **Beyond the original
 > spec:** a `permission_mode` ceiling key (sessions gate on `interactive.permission_mode`, not
 > `autonomy`); a raw-request-body duplicate/non-ASCII-key scan wired into the save endpoints; and
-> admin-set grant-value type validation. **Deferred to a fast-follow:** the Cockpit Admin→Users
-> grants panel and the `/api/users/me/capabilities`-driven editor control-greying (the endpoint
-> ships here for the UI to consume). Plan + full deviation changelog:
+> admin-set grant-value type validation. **Fast-follow now SHIPPED (2026-06-18):** the Cockpit
+> Admin → Grants panel and the `/api/users/me/capabilities`-driven editor control-greying — see the
+> Grants UI status block at the top + `docs/superpowers/plans/2026-06-18-capability-grants-ui.md`.
+> Plan + full deviation changelog:
 > `docs/superpowers/plans/2026-06-18-user-defined-experts-slice-2-enforcement.md`.
 - Migration `0030` + catalog + grants service (user → project → global → default).
 - Save-time 422; dispatch-time reject on the merged stack (incl.
   `persistent_agent`); admin bypass; `system_settings['user_experts']`
   kill-switch; `can_use_vm` reads switched to grants.
-- Admin Users grants panel + `/api/users/me/capabilities`.
+- Admin Users grants panel + `/api/users/me/capabilities`. ✅ (panel at `/admin/grants`, shipped 2026-06-18)
 - **Acceptance (✅ verified live on k3d 2026-06-18, except where noted):**
   non-granted user saving a `tools.shell`/`workspace.backend:vm` expert → 422 naming
   the key (✅); ungranted dispatch rejected with per-key message (✅ — granted `shell_tools`
@@ -557,9 +576,10 @@ intersection with the invoker).
 > **Done:** Experts page (list, type/source filters, badges, row actions), the type-aware
 > **create/edit/duplicate/delete** editor — fully **structured** (execution/model/tools/advanced groups
 > reused from agent-settings + a raw-JSON flap for unmanaged keys), import/export, id-based
-> type-filtered picker integration in job/session create, nav + i18n.
-> **Not yet:** grant-greyed ungated controls (needs the Slice-2 `/api/users/me/capabilities`),
-> grant-fed model narrowing, the project-settings link/`default_for` section, and per-tool tool
+> type-filtered picker integration in job/session create, nav + i18n, **and (2026-06-18) the
+> Admin → Grants panel + grant-greyed ungated controls / grant-fed model narrowing via
+> `/api/users/me/capabilities`** (live-verified on k3d).
+> **Not yet:** the project-settings link/`default_for` section, and per-tool tool
 > curation (the tool toggles are category-level).
 - Experts page (list/create/edit/fork/delete), type-aware editor, greyed
   ungated controls fed by `/api/users/me/capabilities`, grant-fed model picker,
