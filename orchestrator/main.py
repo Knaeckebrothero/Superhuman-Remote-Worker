@@ -951,6 +951,12 @@ def _is_experts_db_enabled() -> bool:
     return os.getenv("EXPERTS_DB_ENABLED", "").lower().strip() in ("true", "1", "yes")
 
 
+def _is_skills_db_enabled() -> bool:
+    """True when DB-backed Agent Skills are on (env). Dev on / prod off (helm
+    ``skillsDbEnabled``). Mirrors ``EXPERTS_DB_ENABLED``."""
+    return os.getenv("SKILLS_DB_ENABLED", "").lower().strip() in ("true", "1", "yes")
+
+
 async def _resolve_default_models(user_id: str | None) -> dict[str, Any]:
     """Effective default chat + auxiliary MODEL NAMES for a user (no transport).
 
@@ -16488,6 +16494,41 @@ class ExpertUpdate(BaseModel):
     prompts: dict[str, Any] | None = None
 
 
+class SkillInfo(BaseModel):
+    """Skill catalog metadata for discovery (the L1 'menu' entry)."""
+
+    id: str
+    name: str
+    display_name: str
+    description: str
+    icon: str = "extension"
+    color: str = "#6B7280"
+    tags: list[str] = []
+
+
+class SkillCreate(BaseModel):
+    """Create a DB-backed skill from its file tree (must include SKILL.md).
+
+    name + description are parsed from SKILL.md frontmatter, not sent separately."""
+
+    files: dict[str, str]
+    display_name: str | None = Field(None, max_length=200)
+    icon: str = "extension"
+    color: str = Field("#6B7280", pattern=r"^#[0-9A-Fa-f]{6}$")
+    tags: list[str] = []
+
+
+class SkillUpdate(BaseModel):
+    """Patch a DB skill; name is immutable (derived from SKILL.md) so it is absent."""
+
+    files: dict[str, str] | None = None
+    display_name: str | None = Field(None, min_length=1, max_length=200)
+    icon: str | None = None
+    color: str | None = Field(None, pattern=r"^#[0-9A-Fa-f]{6}$")
+    tags: list[str] | None = None
+    is_global: bool | None = None
+
+
 def _require_experts_db() -> None:
     """The DB-experts feature is fully behind EXPERTS_DB_ENABLED."""
     if not _is_experts_db_enabled():
@@ -16505,6 +16546,165 @@ def _validate_expert_fragment(config: dict[str, Any]) -> None:
             detail="config may not set credential sections: "
             + ", ".join(sorted(offending)),
         )
+
+
+# ── Skills (Agent Skills, Slice 1) ────────────────────────────────────────
+# Cache bundled skills at startup (mirrors _experts_cache).
+_skills_cache: list[SkillInfo] | None = None
+
+
+def _require_skills_db() -> None:
+    """The DB-skills feature is fully behind SKILLS_DB_ENABLED."""
+    if not _is_skills_db_enabled():
+        raise HTTPException(status_code=404, detail="DB-backed skills are not enabled")
+
+
+def _validate_skill_frontmatter(frontmatter: dict[str, Any]) -> None:
+    """Reject credential sections in SKILL.md frontmatter (reuses expert deny-scan)."""
+    from src.core.expert_resolution import hard_deny_scan
+
+    offending = hard_deny_scan(frontmatter)
+    if offending:
+        raise HTTPException(
+            status_code=422,
+            detail="SKILL.md frontmatter may not set credential sections: "
+            + ", ".join(sorted(offending)),
+        )
+
+
+def _parse_skill_bundle(files: dict[str, str]) -> tuple[str, str, dict[str, str]]:
+    """Validate paths, parse SKILL.md, deny-scan. Returns (name, description, files)."""
+    from src.core.skill_format import (
+        SkillFormatError,
+        parse_skill_md,
+        skill_identity,
+        validate_skill_files,
+    )
+
+    try:
+        validate_skill_files(files)
+        fm, _body = parse_skill_md(files["SKILL.md"])
+        name, description = skill_identity(fm)
+    except SkillFormatError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+    _validate_skill_frontmatter(fm)
+    return name, description, files
+
+
+def _skill_row_to_meta(row: dict[str, Any]) -> dict[str, Any]:
+    """Project a skills row into the catalog metadata shape."""
+    return {
+        "id": str(row["id"]),
+        "name": row["name"],
+        "display_name": row["display_name"],
+        "description": row.get("description") or "",
+        "icon": row["icon"],
+        "color": row["color"],
+        "tags": row.get("tags") or [],
+        "version": row.get("version"),
+        "owner_id": str(row["owner_id"]) if row.get("owner_id") else None,
+    }
+
+
+def _scan_skills() -> list[SkillInfo]:
+    """Scan config/skills/<name>/SKILL.md for bundled skills."""
+    from src.core.skill_format import SkillFormatError, parse_skill_md, skill_identity
+
+    skills_dir = _get_config_dir() / "skills"
+    skills: list[SkillInfo] = []
+    if not skills_dir.is_dir():
+        return skills
+    for entry in sorted(skills_dir.iterdir()):
+        skill_md = entry / "SKILL.md"
+        if not entry.is_dir() or not skill_md.exists():
+            continue
+        try:
+            fm, _ = parse_skill_md(skill_md.read_text(encoding="utf-8"))
+            name, description = skill_identity(fm)
+            skills.append(
+                SkillInfo(
+                    id=entry.name,
+                    name=name,
+                    display_name=fm.get("display_name", name.replace("-", " ").title()),
+                    description=description,
+                    icon=fm.get("icon", "extension"),
+                    color=fm.get("color", "#6B7280"),
+                    tags=fm.get("tags", []),
+                )
+            )
+        except (SkillFormatError, OSError, ValueError) as e:
+            logger.warning(f"Failed to parse bundled skill {skill_md}: {e}")
+    return skills
+
+
+def _bundled_skill_bundle(skill_name: str) -> dict[str, Any] | None:
+    """Read a bundled skill's full directory into a metadata + files dict."""
+    from src.core.skill_format import (
+        parse_skill_md,
+        skill_identity,
+        validate_skill_path,
+    )
+
+    skill_dir = _get_config_dir() / "skills" / skill_name
+    skill_md = skill_dir / "SKILL.md"
+    if not skill_dir.is_dir() or not skill_md.exists():
+        return None
+    files: dict[str, str] = {}
+    for fp in sorted(skill_dir.rglob("*")):
+        if not fp.is_file():
+            continue
+        rel = str(fp.relative_to(skill_dir))
+        try:
+            validate_skill_path(rel)
+            files[rel] = fp.read_text(encoding="utf-8")
+        except (ValueError, UnicodeDecodeError):
+            continue
+    fm, _ = parse_skill_md(files["SKILL.md"])
+    name, description = skill_identity(fm)
+    return {
+        "id": skill_name,
+        "name": name,
+        "display_name": fm.get("display_name", name.replace("-", " ").title()),
+        "description": description,
+        "icon": fm.get("icon", "extension"),
+        "color": fm.get("color", "#6B7280"),
+        "tags": fm.get("tags", []),
+        "files": files,
+    }
+
+
+async def _create_forked_skill(
+    src: dict[str, Any], owner_id: str, suffix: str = "copy"
+) -> dict[str, Any]:
+    """Create an owned skill from a source dict, suffixing the slug on collision
+    and rewriting the copy's SKILL.md 'name' to match (mirrors _create_forked_expert)."""
+    from src.core.skill_format import set_skill_name
+
+    base_name = src["name"]
+    for attempt in range(6):
+        name = (
+            f"{base_name}-{suffix}" if attempt == 0 else f"{base_name}-{suffix}-{attempt}"
+        )[:100]
+        files = dict(src["files"])
+        files["SKILL.md"] = set_skill_name(src["files"]["SKILL.md"], name)
+        try:
+            return await postgres_db.create_skill(
+                name=name,
+                display_name=f"{src['display_name']} ({suffix})"[:200],
+                description=src.get("description"),
+                icon=src.get("icon", "extension"),
+                color=src.get("color", "#6B7280"),
+                tags=src.get("tags") or [],
+                owner_id=owner_id,
+                files=files,
+            )
+        except HTTPException:
+            raise
+        except Exception as e:
+            if "uq_skills_name_owner" in str(e):
+                continue
+            raise
+    raise HTTPException(status_code=409, detail="No free name for the copy")
 
 
 def _bundled_expert_bundle(expert_id: str) -> dict[str, Any] | None:
