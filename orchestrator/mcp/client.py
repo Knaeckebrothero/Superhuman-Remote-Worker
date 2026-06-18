@@ -1107,6 +1107,26 @@ class AsyncCockpitClient:
         return resp.json()
 
     @_create_retry_decorator()
+    async def list_skills(self) -> list[dict[str, Any]]:
+        """List available skills (bundled + DB)."""
+        resp = await self._client.get("/api/skills")
+        resp.raise_for_status()
+        return resp.json()
+
+    @_create_retry_decorator()
+    async def get_skill(self, skill_id: str) -> dict[str, Any]:
+        """Get full skill detail (metadata + files)."""
+        resp = await self._client.get(f"/api/skills/{skill_id}")
+        resp.raise_for_status()
+        return resp.json()
+
+    async def reload_skills(self) -> dict[str, Any]:
+        """Force reload of bundled skills from disk."""
+        resp = await self._client.post("/api/skills/reload")
+        resp.raise_for_status()
+        return resp.json()
+
+    @_create_retry_decorator()
     async def list_models(self) -> dict[str, Any]:
         """List available models from the model catalog."""
         resp = await self._client.get("/api/models")

@@ -991,6 +991,51 @@ async def get_expert(expert_id: str) -> str:
 
 
 @mcp.tool
+async def list_skills() -> str:
+    """List available agent skills (the catalog the agent selects from).
+
+    Returns:
+        Skills with id, name, description, and tags.
+    """
+    client = _get_client()
+    try:
+        skills = await client.list_skills()
+        return fmt.format_skills(skills)
+    except Exception as e:
+        return fmt.format_monitoring_error("list skills", e)
+
+
+@mcp.tool
+async def get_skill(skill_id: str) -> str:
+    """Get full detail for a skill including its SKILL.md body and file list.
+
+    Args:
+        skill_id: Skill id (bundled name or DB UUID).
+
+    Returns:
+        The skill's metadata, body, and bundled file paths.
+    """
+    client = _get_client()
+    try:
+        data = await client.get_skill(skill_id)
+        return fmt.format_skill_detail(skill_id, data)
+    except Exception as e:
+        return fmt.format_monitoring_error(f"get skill '{skill_id}'", e)
+
+
+@mcp.tool
+async def reload_skills() -> str:
+    """Force reload of bundled skills from disk.
+
+    Returns:
+        Reload confirmation with skill count.
+    """
+    client = _get_client()
+    result = await client.reload_skills()
+    return f"Skills reloaded ({result.get('count', 0)} bundled skills loaded)."
+
+
+@mcp.tool
 async def list_models() -> str:
     """List available AI models grouped by provider.
 
