@@ -2114,6 +2114,19 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                 except FileNotFoundError:
                     logger.warning(f"Instruction file not found: {entry.file}")
 
+        # Skill directories (Slice 2): materialize in-scope skills into
+        # skills/<name>/<path> so use_skill (L2) and read_file/run_command (L3)
+        # can reach them. Same write_file/mkdir path as instruction files.
+        from .core.skill_resolution import skill_files_to_workspace
+
+        skills_files = self.config.extra.get("_resolved_skills", {}).get("files", {})
+        for ws_path, content in skill_files_to_workspace(skills_files).items():
+            parent_dir = str(Path(ws_path).parent)
+            if parent_dir and parent_dir != ".":
+                self._workspace_manager.backend.mkdir(parent_dir)
+            self._workspace_manager.write_file(ws_path, content)
+            logger.debug(f"Deployed skill file to workspace: {ws_path}")
+
     async def _register_initial_documents_background(
         self, context: "ToolContext"
     ) -> None:
