@@ -612,7 +612,10 @@ class TestGatedReadEndpointsHappyPath:
         fake_mongo = MagicMock()
         fake_mongo.is_available = True
         fake_mongo.get_job_audit = AsyncMock(return_value={"entries": [], "total": 0})
-        with _patch_caller_and_db(user_a, fake_db), patch("main.audit_reader", fake_mongo):
+        with (
+            _patch_caller_and_db(user_a, fake_db),
+            patch("main.audit_reader", fake_mongo),
+        ):
             await get_job_audit(fake_request, str(job_a["id"]))
         fake_mongo.get_job_audit.assert_awaited_once()
 
