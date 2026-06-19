@@ -1920,7 +1920,7 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
   }
 
   createJobInProject(): void {
-    this.router.navigate(['/'], { queryParams: { project: this.projectId } });
+    this.router.navigate(['/jobs/new'], { queryParams: { project: this.projectId } });
   }
 
   /** Cross-link to the Automations page with this project preselected.

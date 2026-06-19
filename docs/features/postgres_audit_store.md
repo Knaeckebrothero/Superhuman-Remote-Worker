@@ -1,6 +1,11 @@
 # Replace MongoDB Audit Store with PostgreSQL
 
-## Status: Proposed (revised 2026-05-02; references re-verified 2026-06-10)
+## Status: ✅ SHIPPED — cutover live on dev 2026-06-19 (PR 1–7 deployed; soak → Mongo wipe → PR 8 cleanup remain)
+
+> This is the original **design** doc (problem, rationale, scope). Current
+> as-built state, deploy verification, the ESO/Vault gotcha, and the pre-wipe
+> backup are tracked in `postgres_audit_store_implementation.md`
+> § Current status (2026-06-19).
 
 > **2026-06-11 — implementation package exists and supersedes the technical
 > core of this doc.** An 8-agent discovery + research + synthesis pass
