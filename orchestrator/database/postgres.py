@@ -193,8 +193,6 @@ REQUIRED_TABLES = [
     "jobs",
     "agents",
     "datasources",
-    "builder_sessions",
-    "builder_messages",
     "user_api_keys",
     "project_api_keys",
     "models",
@@ -5738,7 +5736,7 @@ class PostgresDB:
     # MODELS CATALOG
     # Admin-curated table of (model, capability) offerings anchored to a
     # transport (system_api_keys provider OR system-scoped llm_endpoints row).
-    # Reads feed every model picker (builder/session/job) and the resolver's
+    # Reads feed every model picker (session/job) and the resolver's
     # catalog branch in src/core/model_registry.py.
     # =========================================================================
 
@@ -6161,7 +6159,7 @@ class PostgresDB:
     async def get_default_llm_model(self, kind: str) -> str | None:
         """Return the configured default model ID for ``kind`` or None.
 
-        ``kind`` is one of 'builder', 'browser', 'citation'.
+        ``kind`` is one of 'browser', 'citation'.
         """
         row = await self.get_system_setting(self._default_llm_model_key(kind))
         if row is None:
@@ -7706,237 +7704,6 @@ class PostgresDB:
             )
 
         return dict(row) if row else None
-
-    # =========================================================================
-    # BUILDER SESSION OPERATIONS
-    # =========================================================================
-
-    async def create_builder_session(
-        self,
-        expert_id: str | None = None,
-        user_id: str | None = None,
-    ) -> Dict[str, Any]:
-        """Create a new builder chat session.
-
-        Args:
-            expert_id: Optional expert ID used as starting point
-            user_id: Optional user UUID who created this session
-
-        Returns:
-            Created session dict with id, expert_id, user_id, created_at, updated_at
-        """
-        user_uuid = UUID(user_id) if user_id else None
-
-        async with self.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                INSERT INTO builder_sessions (expert_id, user_id)
-                VALUES ($1, $2)
-                RETURNING id, job_id, expert_id, user_id, created_at, updated_at, summary, title
-                """,
-                expert_id,
-                user_uuid,
-            )
-
-        return dict(row)
-
-    async def get_builder_session(self, session_id: str) -> Dict[str, Any] | None:
-        """Get a builder session by ID.
-
-        Args:
-            session_id: Session UUID as string
-
-        Returns:
-            Session dict or None if not found
-        """
-        try:
-            uuid_val = UUID(session_id)
-        except ValueError:
-            return None
-
-        async with self.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                SELECT id, job_id, expert_id, user_id, created_at, updated_at,
-                       summary, title
-                FROM builder_sessions
-                WHERE id = $1
-                """,
-                uuid_val,
-            )
-
-        return dict(row) if row else None
-
-    async def update_builder_session_job(self, session_id: str, job_id: str) -> bool:
-        """Link a builder session to a job after job creation.
-
-        Args:
-            session_id: Session UUID
-            job_id: Job UUID to link
-
-        Returns:
-            True if updated, False if session not found
-        """
-        try:
-            session_uuid = UUID(session_id)
-            job_uuid = UUID(job_id)
-        except ValueError:
-            return False
-
-        async with self.acquire() as conn:
-            result = await conn.execute(
-                "UPDATE builder_sessions SET job_id = $1 WHERE id = $2",
-                job_uuid,
-                session_uuid,
-            )
-
-        return result == "UPDATE 1"
-
-    async def update_builder_session_summary(
-        self, session_id: str, summary: str
-    ) -> bool:
-        """Update the auto-summary for a builder session.
-
-        Args:
-            session_id: Session UUID
-            summary: Compressed summary of older messages
-
-        Returns:
-            True if updated, False if session not found
-        """
-        try:
-            uuid_val = UUID(session_id)
-        except ValueError:
-            return False
-
-        async with self.acquire() as conn:
-            result = await conn.execute(
-                "UPDATE builder_sessions SET summary = $1 WHERE id = $2",
-                summary,
-                uuid_val,
-            )
-
-        return result == "UPDATE 1"
-
-    async def list_builder_sessions(
-        self,
-        user_id: str,
-        limit: int = 50,
-    ) -> List[Dict[str, Any]]:
-        """List builder sessions for a user, most recent first."""
-        try:
-            user_uuid = UUID(user_id)
-        except ValueError:
-            return []
-
-        async with self.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT id, title, expert_id, created_at, updated_at
-                FROM builder_sessions
-                WHERE user_id = $1
-                ORDER BY updated_at DESC
-                LIMIT $2
-                """,
-                user_uuid,
-                limit,
-            )
-
-        return [dict(r) for r in rows]
-
-    async def update_builder_session_title(self, session_id: str, title: str) -> bool:
-        """Set the auto-generated title for a builder session."""
-        try:
-            uuid_val = UUID(session_id)
-        except ValueError:
-            return False
-
-        async with self.acquire() as conn:
-            result = await conn.execute(
-                "UPDATE builder_sessions SET title = $1 WHERE id = $2",
-                title,
-                uuid_val,
-            )
-
-        return result == "UPDATE 1"
-
-    async def create_builder_message(
-        self,
-        session_id: str,
-        role: str,
-        content: str | None = None,
-        tool_calls: List[Dict[str, Any]] | None = None,
-        steps: List[Dict[str, Any]] | None = None,
-    ) -> Dict[str, Any]:
-        """Create a new message in a builder session.
-
-        Args:
-            session_id: Session UUID
-            role: Message role ('user' or 'assistant')
-            content: Conversational text content
-            tool_calls: List of artifact mutations (assistant only)
-            steps: Agent reasoning steps (assistant only)
-
-        Returns:
-            Created message dict
-        """
-        session_uuid = UUID(session_id)
-
-        async with self.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                INSERT INTO builder_messages (session_id, role, content, tool_calls, steps)
-                VALUES ($1, $2, $3, $4, $5)
-                RETURNING id, session_id, role, content, tool_calls, steps, created_at
-                """,
-                session_uuid,
-                role,
-                content,
-                json.dumps(tool_calls) if tool_calls else None,
-                json.dumps(steps) if steps else None,
-            )
-
-        return dict(row)
-
-    async def get_builder_messages(
-        self,
-        session_id: str,
-        limit: int = 100,
-    ) -> List[Dict[str, Any]]:
-        """Get messages for a builder session in chronological order.
-
-        Args:
-            session_id: Session UUID
-            limit: Maximum messages to return
-
-        Returns:
-            List of message dicts ordered by created_at ASC
-        """
-        try:
-            uuid_val = UUID(session_id)
-        except ValueError:
-            return []
-
-        async with self.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT id, session_id, role, content, tool_calls, steps, created_at
-                FROM builder_messages
-                WHERE session_id = $1
-                ORDER BY created_at ASC
-                LIMIT $2
-                """,
-                uuid_val,
-                limit,
-            )
-
-        results = [dict(row) for row in rows]
-        for msg in results:
-            for key in ("tool_calls", "steps"):
-                val = msg.get(key)
-                if isinstance(val, str):
-                    msg[key] = json.loads(val)
-        return results
 
     # =========================================================================
     # SCHEMA MANAGEMENT

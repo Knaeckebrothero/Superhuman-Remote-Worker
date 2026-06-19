@@ -33,7 +33,7 @@ from security import access
 
 
 def _patch_caller_and_db(user: dict, db):
-    """Same stack as test_builder_session_access — see that file for rationale."""
+    """Patch the caller (require_approved_user) and DB on the main module."""
     stack = ExitStack()
     stack.enter_context(
         patch("main.require_approved_user", AsyncMock(return_value=user))

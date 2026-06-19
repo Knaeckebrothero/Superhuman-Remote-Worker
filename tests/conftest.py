@@ -72,10 +72,10 @@ except Exception:
 # Layout:
 #   user_a  ──owner──▶ project_a ──contains──▶ job_a
 #                                    │
-#                                    └─thread_a   builder_session_a
+#                                    └─thread_a
 #   user_b  ──owner──▶ project_b ──contains──▶ job_b
 #                                    │
-#                                    └─thread_b   builder_session_b
+#                                    └─thread_b
 #   user_admin (is_admin=True, no project membership; admin role bypasses)
 #
 # user_a has no membership in project_b (and vice versa). user_admin has no
@@ -163,16 +163,6 @@ def thread_b() -> dict:
 
 
 @pytest.fixture
-def builder_session_a() -> dict:
-    return {"id": _SID_A, "user_id": _UID_A, "expert_id": None}
-
-
-@pytest.fixture
-def builder_session_b() -> dict:
-    return {"id": _SID_B, "user_id": _UID_B, "expert_id": None}
-
-
-@pytest.fixture
 def datasource_a() -> dict:
     """Created by user_a, linked to project_a."""
     return {
@@ -225,8 +215,6 @@ def fake_db(
     job_b,
     thread_a,
     thread_b,
-    builder_session_a,
-    builder_session_b,
     datasource_a,
     datasource_b,
     datasource_global,
@@ -240,7 +228,6 @@ def fake_db(
     projects = {_PID_A: project_a, _PID_B: project_b}
     jobs = {_JID_A: job_a, _JID_B: job_b}
     threads = {_TID_A: thread_a, _TID_B: thread_b}
-    sessions = {_SID_A: builder_session_a, _SID_B: builder_session_b}
     datasources = {
         _DSID_A: datasource_a,
         _DSID_B: datasource_b,
@@ -275,9 +262,6 @@ def fake_db(
     async def get_thread(tid):
         return threads.get(_to_uuid(tid))
 
-    async def get_builder_session(sid):
-        return sessions.get(_to_uuid(sid))
-
     async def get_user_role_in_project(pid, uid):
         return memberships.get((_to_uuid(pid), _to_uuid(uid)))
 
@@ -302,7 +286,6 @@ def fake_db(
     db.get_project = AsyncMock(side_effect=get_project)
     db.get_job = AsyncMock(side_effect=get_job)
     db.get_thread = AsyncMock(side_effect=get_thread)
-    db.get_builder_session = AsyncMock(side_effect=get_builder_session)
     db.get_user_role_in_project = AsyncMock(side_effect=get_user_role_in_project)
     db.get_projects_for_user = AsyncMock(side_effect=get_projects_for_user)
     db.get_datasource = AsyncMock(side_effect=get_datasource)
