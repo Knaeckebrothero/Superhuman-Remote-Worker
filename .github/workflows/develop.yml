@@ -361,6 +361,7 @@ jobs:
       sudo-gate: ${{ steps.check.outputs.sudo-gate }}
       workspace: ${{ steps.check.outputs.workspace }}
       chart: ${{ steps.check.outputs.chart }}
+      website: ${{ steps.check.outputs.website }}
       python-changed: ${{ steps.test-paths.outputs.python }}
       cockpit-changed: ${{ steps.test-paths.outputs.cockpit }}
     steps:
@@ -511,12 +512,19 @@ jobs:
             CHART="false"
           fi
 
+          # Website (sales page + config generator) — also rebuilds on its Dockerfile.
+          if [ -z "$CHART_BASE" ] || [ -n "$(git diff --name-only "$CHART_BASE" HEAD -- 'website/' 'docker/Dockerfile.website')" ]; then
+            WEBSITE="true"
+          else
+            WEBSITE="false"
+          fi
+
           echo ""
           echo "Change detection results:"
           echo "  agent=$AGENT  orchestrator=$ORCHESTRATOR  cockpit=$COCKPIT"
           echo "  mcp=$MCP  workspace=$WORKSPACE"
           echo "  vm-controller=$VM_CONTROLLER  vm-base=$VM_BASE  vm-base-stage1=$VM_BASE_STAGE1  sudo-gate=$SUDO_GATE"
-          echo "  chart=$CHART"
+          echo "  chart=$CHART  website=$WEBSITE"
 
           {
             echo "agent=$AGENT"
@@ -529,7 +537,80 @@ jobs:
             echo "vm-base-stage1=$VM_BASE_STAGE1"
             echo "sudo-gate=$SUDO_GATE"
             echo "chart=$CHART"
+            echo "website=$WEBSITE"
           } >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  # Config-generator drift-gate (website/). Runs when website/ OR helm/ changed.
+  # Hard gate: generated values must render against the real chart and carry a
+  # complete secret-key set. A chart that won't render is deploy-breaking.
+  # ---------------------------------------------------------------------------
+  generator-test:
+    needs: changes
+    if: needs.changes.outputs.website == 'true' || needs.changes.outputs.chart == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.17.0
+      - name: Install kubeconform
+        run: |
+          curl -fsSL https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz \
+            | sudo tar -xz -C /usr/local/bin kubeconform
+          kubeconform -v
+      - name: Generator unit + drift tests
+        run: node --test website/test/generator.unit.test.mjs website/test/generator.drift.test.mjs
+
+  # ---------------------------------------------------------------------------
+  # Build the website image (sales page + generator). No buildcache — a one-COPY
+  # nginx image builds in seconds. Depends on generator-test so a broken
+  # generator never publishes. Publishes :latest (+ :sha) on push to develop.
+  # ---------------------------------------------------------------------------
+  build-website:
+    needs: [changes, generator-test]
+    if: >-
+      always() && !cancelled() &&
+      (needs.changes.outputs.website == 'true' || github.event_name == 'workflow_dispatch') &&
+      needs.generator-test.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        if: github.event_name != 'pull_request'
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-website
+          tags: |
+            type=sha,format=short,prefix=sha-
+            type=raw,value=latest,enable=${{ github.event_name != 'pull_request' }}
+      - name: Build${{ github.event_name == 'pull_request' && ' (PR validation, no push)' || ' and push' }}
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/Dockerfile.website
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: false
 
   # ---------------------------------------------------------------------------
   # Python tests (change-based)
