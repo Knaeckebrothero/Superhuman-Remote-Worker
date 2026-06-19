@@ -91,7 +91,7 @@ todos:
     content: >-
       CREATE CORRECTIVE TODOS: Call next_phase_todos with the first corrective phase.
 
-      IMPORTANT: You MUST invoke the read_file tool on `todo_guide.md` BEFORE invoking next_phase_todos.
+      IMPORTANT: You MUST invoke the read_file tool on `skills/todo-guide/SKILL.md` BEFORE invoking next_phase_todos.
 
       Create todos that:
       {% if has_tool("kb_search") -%}
@@ -116,7 +116,7 @@ todos:
       that trace to specific feedback items.
 
       INSTEAD OF: Calling job_complete now — corrections have not been made yet.
-      Instead of skipping reading todo_guide.md — the tool enforces this.
+      Instead of skipping reading skills/todo-guide/SKILL.md — the tool enforces this.
       Instead of vague todos — each must reference specific feedback and files.
       Instead of meta-todos for archiving, cleanup, or status updates — every
       todo must advance the actual corrections.

@@ -101,11 +101,12 @@ def create_todo_tools(context: ToolContext) -> List[Any]:
             Success message confirming todos were staged, or error if validation fails.
         """
         try:
-            # Enforcement of todo_guide.md read is now config-driven via
-            # instruction_files triggers (apply_instruction_enforcement wrapper).
-            # Fallback check for backward compat when no instruction_files configured:
+            # Enforcement of the todo guide read is now config-driven via
+            # instruction_files triggers (apply_instruction_enforcement wrapper);
+            # the guide is the bundled "todo-guide" skill (Slice 3). Fallback check
+            # for backward compat when no instruction_files are configured:
             if not context._instruction_files and not context.was_recently_read(
-                "todo_guide.md"
+                "skills/todo-guide/SKILL.md"
             ):
                 from src.services.guardrails import format_nudge
 
@@ -117,7 +118,7 @@ def create_todo_tools(context: ToolContext) -> List[Any]:
                 return format_nudge(
                     "read_file_required_error",
                     model=model,
-                    file_path="todo_guide.md",
+                    file_path="skills/todo-guide/SKILL.md",
                     tool_name="next_phase_todos",
                 )
 

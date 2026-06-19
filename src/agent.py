@@ -1717,8 +1717,8 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             model_name=self.config.llm.model,
         )
 
-        # Instruction files (todo_guide.md, instruction_files, template-based instructions.md)
-        # are deployed in _deploy_instruction_files() after tools are loaded, so that
+        # Instruction files (bound skills like todo-guide, instruction_files, template-based
+        # instructions.md) are deployed in _deploy_instruction_files() after tools are loaded, so that
         # Jinja2 conditionals can reference which tools are actually available.
 
         logger.debug(f"Workspace created at {self._workspace_manager.path}")
@@ -2051,16 +2051,14 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
 
         Deploys:
         - instructions.md (from template, only if not already written from upload/inline)
-        - todo_guide.md (via instruction matrix)
-        - Additional instruction_files from config
+        - Additional instruction_files from config (literal files + bound skills)
+        - In-scope skill directories (Slice 2)
         """
         from .core.loader import (
-            InstructionMatrixResolver,
             FileResolver,
             render_instruction_content,
             load_instructions,
         )
-        from .core.model_registry import family_of
 
         # instructions.md — only deploy template if not already present (upload/inline)
         instructions_path = self._workspace_manager.get_path("instructions.md")
@@ -2070,19 +2068,9 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             self._workspace_manager.write_file("instructions.md", instructions)
             logger.debug("Deployed template-based instructions.md to workspace")
 
-        # todo_guide.md — via instruction matrix
-        model_family = family_of(self.config.llm.model)
-        instr_resolver = InstructionMatrixResolver(
-            self.config._deployment_dir, model_family
-        )
-        try:
-            resolved = self.config.extra.get("_resolved_instructions", {})
-            todo_guide = resolved.get("todo_guide") or instr_resolver.load("todo_guide")
-            todo_guide = render_instruction_content(todo_guide, loaded_tool_names)
-            self._workspace_manager.write_file("todo_guide.md", todo_guide)
-            logger.debug("Deployed todo_guide.md to workspace")
-        except FileNotFoundError:
-            logger.warning("todo_guide.md not found via instruction matrix")
+        # todo_guide is now the bundled "todo-guide" skill, bound via instruction_files
+        # (before_tool:next_phase_todos) and materialized in the loop below — no matrix
+        # special-case. See docs/features/agent_skills.md (Slice 3).
 
         # Additional instruction files (config-driven)
         if self.config.instruction_files:
@@ -2111,9 +2099,6 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                             self._workspace_manager.backend.mkdir(parent_dir)
                         self._workspace_manager.write_file(entry.path, content)
                         logger.debug(f"Deployed bound skill to workspace: {entry.path}")
-                        continue
-                    # Skip todo_guide.md — already handled above via matrix
-                    if entry.file == "todo_guide.md":
                         continue
                     # Check resolved config first (resumed jobs)
                     basename = Path(entry.file).stem

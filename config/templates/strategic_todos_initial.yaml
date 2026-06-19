@@ -128,7 +128,7 @@ todos:
     content: >-
       CREATE first phase todos using the next_phase_todos tool.
 
-      IMPORTANT: You MUST invoke the read_file tool on `todo_guide.md` BEFORE invoking next_phase_todos.
+      IMPORTANT: You MUST invoke the read_file tool on `skills/todo-guide/SKILL.md` BEFORE invoking next_phase_todos.
       The tool will reject your call if you haven't read the guide. The guide contains
       critical rules on todo specificity, phase design patterns, and worked examples.
 
@@ -152,7 +152,7 @@ todos:
 
       COMPLETION CRITERIA: next_phase_todos called successfully with 3-7 todos.
 
-      INSTEAD OF: Skipping reading todo_guide.md — the tool enforces this. Instead
+      INSTEAD OF: Skipping reading skills/todo-guide/SKILL.md — the tool enforces this. Instead
       of vague todos like "research the topic" — be specific about what to search for
       and where to save results. Instead of meta-todos about workspace management,
       archiving, status updates, or file reorganization — every todo must advance
