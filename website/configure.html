@@ -1,0 +1,280 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIzMiIgaGVpZ2h0PSIzMiIgdmlld0JveD0iMCAwIDMyIDMyIj4KPHJlY3Qgd2lkdGg9IjMyIiBoZWlnaHQ9IjMyIiByeD0iNyIgcnk9IjciIGZpbGw9IiNmM2VjZTAiPjwvcmVjdD4KPGcgdHJhbnNmb3JtPSJ0cmFuc2xhdGUoNCA0KSBzY2FsZSgwLjc4MTI1KSI+CjxsaW5lIHgxPSIxNiIgeTE9IjIuNSIgeDI9IjE2IiB5Mj0iMjkuNSIgc3Ryb2tlPSIjN2EzYjFhIiBzdHJva2Utd2lkdGg9IjEuMSIgc3Ryb2tlLWxpbmVjYXA9InJvdW5kIj48L2xpbmU+CjxwYXRoIGQ9Ik0gMTYgMi4yIEwgMTUuNCA0IEwgMTYuNiA0IFoiIGZpbGw9IiM3YTNiMWEiPjwvcGF0aD4KPGNpcmNsZSBjeD0iMTYiIGN5PSI0LjUiIHI9IjAuNiIgZmlsbD0iIzdhM2IxYSI+PC9jaXJjbGU+CjxsaW5lIHgxPSI1LjQiIHkxPSI2IiB4Mj0iMjYuNiIgeTI9IjYiIHN0cm9rZT0iIzdhM2IxYSIgc3Ryb2tlLXdpZHRoPSIxLjEiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCI+PC9saW5lPgo8Y2lyY2xlIGN4PSIxNiIgY3k9IjI4LjUiIHI9IjAuNyIgZmlsbD0iIzdhM2IxYSI+PC9jaXJjbGU+CjxyZWN0IHg9IjciIHk9IjciIHdpZHRoPSIxOCIgaGVpZ2h0PSIxNyIgZmlsbD0iIzljMWYyZSI+PC9yZWN0Pgo8cmVjdCB4PSI3LjUiIHk9IjgiIHdpZHRoPSIxNyIgaGVpZ2h0PSIwLjYiIGZpbGw9IiNmYmY2ZWMiIG9wYWNpdHk9IjAuNTUiPjwvcmVjdD4KPHJlY3QgeD0iNy41IiB5PSIyMi40IiB3aWR0aD0iMTciIGhlaWdodD0iMC42IiBmaWxsPSIjZmJmNmVjIiBvcGFjaXR5PSIwLjU1Ij48L3JlY3Q+Cjx0ZXh0IHg9IjE2IiB5PSIxNi45IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBmb250LWZhbWlseT0iQ2luemVsLCBHZW9yZ2lhLCBzZXJpZiIgZm9udC13ZWlnaHQ9IjcwMCIgZm9udC1zaXplPSI1LjYiIGxldHRlci1zcGFjaW5nPSIwLjQiIGZpbGw9IiNmYmY2ZWMiPlNSVzwvdGV4dD4KPC9nPgo8L3N2Zz4=">
+<title>SRW — Self-host config generator</title>
+<meta name="description" content="Generate a ready-to-use Helm values.yaml, Secret skeleton, and install script for self-hosting Superhuman Remote Worker.">
+<style>
+:root{
+ --bg:#0c0c0d;--panel:#111114;--s0:#181820;--s1:#26262e;--s2:#37373f;
+ --bd:#26262e;--tx:#eceaea;--t2:#b8b3b0;--t3:#74706e;
+ --ac:#a8232a;--ah:#c42f37;--ok:#85a060;--wn:#caa658;--in:#7a8eb5;
+ --hv:rgba(255,255,255,.04);
+}
+@media (prefers-color-scheme:light){
+ :root{
+  --bg:#f3ece0;--panel:#fbf6ec;--s0:#ede4d2;--s1:#dccfb6;--s2:#c2b294;
+  --bd:#dccfb6;--tx:#2a1d12;--t2:#5a4632;--t3:#8a7b66;
+  --ac:#9c1f2e;--ah:#7a1822;--ok:#4a6b2a;--wn:#a07a1c;--in:#3f5e8c;
+  --hv:rgba(42,29,18,.04);
+ }
+}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0}
+body{background:var(--bg);color:var(--tx);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Inter,sans-serif;font-size:16px;line-height:1.55;-webkit-font-smoothing:antialiased}
+.wrap{max-width:880px;margin:0 auto;padding:32px 24px 80px}
+.disp{font-family:Cinzel,Georgia,"Times New Roman",serif;text-transform:uppercase;letter-spacing:.04em;font-weight:600;margin:0}
+h1.disp{font-size:clamp(28px,4vw,42px);line-height:1.12}
+.label{font-family:Cinzel,Georgia,serif;text-transform:uppercase;letter-spacing:.22em;font-size:11px;color:var(--t3);font-weight:600;margin:26px 0 10px}
+a{color:var(--in)}
+.muted{color:var(--t2)}.dim{color:var(--t3);font-size:13px}
+code,pre,.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+fieldset{border:1px solid var(--bd);border-radius:8px;padding:14px 16px;margin:0 0 8px}
+legend{padding:0 8px;color:var(--t2);font-size:13px}
+.row{display:flex;flex-wrap:wrap;gap:12px;align-items:center;margin:8px 0}
+.row label.f{display:flex;flex-direction:column;gap:4px;font-size:13px;color:var(--t2);flex:1;min-width:180px}
+input[type=text],input[type=number],select,textarea{background:var(--s0);color:var(--tx);border:1px solid var(--bd);border-radius:6px;padding:8px 10px;font-size:14px;font-family:inherit}
+textarea{width:100%;min-height:90px;font-family:ui-monospace,monospace;font-size:13px}
+.chk{display:flex;gap:9px;align-items:flex-start;margin:10px 0}
+.chk input{margin-top:3px}
+button{font-family:inherit;font-size:14px;border-radius:6px;border:1px solid var(--bd);background:var(--s1);color:var(--tx);padding:9px 16px;cursor:pointer}
+button:hover{background:var(--s2)}
+button:disabled{opacity:.45;cursor:not-allowed}
+#generate{background:var(--ac);border-color:var(--ac);color:#fff;font-weight:600;padding:11px 22px;margin-top:18px}
+#generate:hover:not(:disabled){background:var(--ah)}
+.errs{color:var(--ac);font-size:13px;margin:10px 0;min-height:1px}
+.errs ul{margin:4px 0;padding-left:18px}
+[hidden]{display:none!important}
+.tabs{display:flex;gap:4px;margin:22px 0 0;border-bottom:1px solid var(--bd)}
+.tabs button{border:1px solid var(--bd);border-bottom:none;border-radius:6px 6px 0 0;background:var(--s0);color:var(--t2);padding:8px 14px}
+.tabs button.active{background:var(--panel);color:var(--tx);font-weight:600}
+pre#out{background:var(--panel);border:1px solid var(--bd);border-top:none;border-radius:0 0 8px 8px;padding:16px;overflow:auto;max-height:480px;font-size:13px;line-height:1.5;margin:0}
+.outbar{display:flex;gap:8px;margin:10px 0}
+.note{background:var(--s0);border:1px solid var(--bd);border-radius:6px;padding:10px 12px;font-size:13px;color:var(--t2);margin:8px 0}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <noscript><p>This config generator needs JavaScript. To self-host without it, follow the
+    <a href="https://github.com/knaeckebrothero/superhuman-remote-worker/blob/main/helm/README.md">Helm install guide</a>.</p></noscript>
+
+  <main id="app" hidden>
+    <h1 class="disp">Self-host config generator</h1>
+    <p class="muted">Pick a profile, fill the form, and get a ready <code>values.yaml</code>, a Secret skeleton,
+      and an <code>install.sh</code>. Everything runs in your browser — nothing is sent anywhere.</p>
+
+    <p class="label">License</p>
+    <div class="chk"><input type="checkbox" id="license">
+      <label for="license">I hold a valid SRW commercial license (required — SRW is source-available, not free to run).</label></div>
+
+    <p class="label">Profile</p>
+    <div class="row">
+      <label class="f" style="flex-direction:row;gap:8px;align-items:center"><input type="radio" name="profile" value="evaluation" checked> Evaluation (single node)</label>
+      <label class="f" style="flex-direction:row;gap:8px;align-items:center"><input type="radio" name="profile" value="production"> Production (external services)</label>
+      <label class="f" style="flex-direction:row;gap:8px;align-items:center"><input type="radio" name="profile" value="production-vms"> Production + same-cluster VMs</label>
+    </div>
+
+    <p class="label">Cluster</p>
+    <div class="row">
+      <label class="f">Base domain<input type="text" id="domain" placeholder="srw.example.com"></label>
+      <label class="f">Ingress class<select id="ingressClass"><option>traefik</option><option>nginx</option></select></label>
+    </div>
+    <div class="chk"><input type="checkbox" id="tls"><label for="tls">Enable TLS (cert-manager)</label></div>
+    <div class="row" id="tls-ext" hidden>
+      <label class="f">TLS issuer name<input type="text" id="tlsIssuer" value="letsencrypt-prod"></label>
+    </div>
+
+    <div data-show="production production-vms">
+      <p class="label">Backing services — bundled vs bring-your-own</p>
+
+      <fieldset><legend>PostgreSQL (app DB)</legend>
+        <div class="row"><label class="f">Mode<select id="postgres" class="svc"><option value="bundled">bundled</option><option value="external">external</option></select></label></div>
+        <div class="row svc-ext" id="postgres-ext" hidden>
+          <label class="f">Host<input type="text" id="postgresHost" placeholder="pg.example.com"></label>
+          <label class="f">Port<input type="number" id="postgresPort" value="5432"></label>
+          <label class="f">Database<input type="text" id="postgresDb" value="srw"></label>
+        </div>
+      </fieldset>
+
+      <fieldset><legend>Vector DB (pgvector)</legend>
+        <div class="row"><label class="f">Mode<select id="vector" class="svc"><option value="bundled">bundled</option><option value="external">external</option></select></label></div>
+        <div class="row svc-ext" id="vector-ext" hidden>
+          <label class="f">Host<input type="text" id="vectorHost" placeholder="pg.example.com"></label>
+          <label class="f">Port<input type="number" id="vectorPort" value="5432"></label>
+          <label class="f">Database<input type="text" id="vectorDb" value="srw_vector"></label>
+        </div>
+      </fieldset>
+
+      <fieldset><legend>MongoDB (audit log)</legend>
+        <div class="row"><label class="f">Mode<select id="mongodb" class="svc"><option value="bundled">bundled</option><option value="external">external</option></select></label></div>
+        <div class="row svc-ext" id="mongodb-ext" hidden>
+          <label class="f">URL<input type="text" id="mongodbUrl" placeholder="mongodb://mongo.example.com:27017/srw_logs"></label>
+        </div>
+      </fieldset>
+
+      <fieldset><legend>OIDC provider</legend>
+        <div class="row"><label class="f">Mode<select id="oidc" class="svc"><option value="bundled">bundled (Keycloak)</option><option value="external">external</option></select></label></div>
+        <div class="row svc-ext" id="oidc-ext" hidden>
+          <label class="f">Issuer URL<input type="text" id="oidcIssuerUrl" placeholder="https://login.example.com/realms/srw"></label>
+          <label class="f">Cockpit client ID<input type="text" id="cockpitClientId" value="srw-cockpit"></label>
+        </div>
+      </fieldset>
+
+      <fieldset><legend>Git server</legend>
+        <div class="row"><label class="f">Mode<select id="git" class="svc"><option value="bundled">bundled (Gitea)</option><option value="external">external</option></select></label></div>
+        <div class="row svc-ext" id="git-ext" hidden>
+          <label class="f">URL<input type="text" id="gitUrl" placeholder="https://git.example.com"></label>
+        </div>
+      </fieldset>
+
+      <fieldset><legend>Cloud storage</legend>
+        <div class="row"><label class="f">Mode<select id="cloud" class="svc"><option value="bundled">bundled (OpenCloud)</option><option value="external">external</option></select></label></div>
+        <div class="row svc-ext" id="cloud-ext" hidden>
+          <label class="f">Backend<select id="cloudBackend"><option>nextcloud</option><option>opencloud</option><option>webdav</option></select></label>
+          <label class="f">URL<input type="text" id="cloudUrl" placeholder="https://cloud.example.com"></label>
+        </div>
+      </fieldset>
+    </div>
+
+    <p class="label">Knowledge graph</p>
+    <div class="chk"><input type="checkbox" id="neo4j"><label for="neo4j">Enable Neo4j (project knowledge graph)</label></div>
+    <div class="row" id="neo4j-ext" hidden>
+      <label class="f">Edition<select id="neo4jEdition"><option>community</option><option>enterprise</option></select></label>
+    </div>
+
+    <div data-show="production-vms">
+      <p class="label">Same-cluster VMs (KubeVirt)</p>
+      <div class="row">
+        <label class="f">Transport<select id="vmTransport"><option>http</option><option>nats</option><option>both</option></select></label>
+        <label class="f">Namespace<input type="text" id="vmNamespace" value="agent-vms"></label>
+        <label class="f">Storage class<input type="text" id="vmStorageClass" value="longhorn"></label>
+        <label class="f">Disk size<input type="text" id="vmDiskSize" value="30Gi"></label>
+      </div>
+      <div class="row"><label class="f">VM SSH public key<input type="text" id="vmSshPublicKey" placeholder="ssh-ed25519 AAAA... agent@srw"></label></div>
+    </div>
+
+    <p class="label">Secrets</p>
+    <div class="chk"><input type="checkbox" id="fillSecrets">
+      <label for="fillSecrets">Fill secret values in my browser (advanced). <span class="dim">100% client-side — never sent anywhere. View source to confirm.</span></label></div>
+    <div id="fill-ext" hidden>
+      <div class="note">Paste <code>KEY=value</code> pairs, one per line. Anything you omit stays a <code>CHANGE_ME</code> placeholder.</div>
+      <textarea id="secretValues" placeholder="POSTGRES_PASSWORD=...&#10;KC_CLIENT_SECRET=..."></textarea>
+    </div>
+
+    <div class="errs" id="errs" aria-live="polite"></div>
+    <button id="generate" disabled>Generate ▸</button>
+
+    <section id="output" hidden>
+      <div class="tabs">
+        <button data-tab="values" class="active">values.yaml</button>
+        <button data-tab="secret">srw-secrets</button>
+        <button data-tab="install">install.sh</button>
+      </div>
+      <pre id="out" class="mono"></pre>
+      <div class="outbar">
+        <button id="copy">Copy</button>
+        <button id="download">Download</button>
+      </div>
+      <p class="dim">Next: cluster bootstrap (k3s/DNS/TLS) and applying these live in the
+        <a href="https://github.com/knaeckebrothero/superhuman-remote-worker/blob/main/helm/README.md">install guide</a>.
+        This is a starter overlay — review every value before installing.</p>
+    </section>
+  </main>
+</div>
+
+<script type="module">
+import { generate, validate } from './generator.mjs';
+
+const $ = (id) => document.getElementById(id);
+const app = $('app');
+app.hidden = false;                       // reveal once JS runs (noscript covers the rest)
+
+const profile = () => document.querySelector('input[name=profile]:checked').value;
+const v = (id) => ($(id) ? $(id).value.trim() : '');
+const checked = (id) => $(id).checked;
+
+function parseSecretValues(text) {
+  const out = {};
+  for (const line of text.split('\n')) {
+    const m = line.match(/^\s*([A-Z0-9_]+)\s*[=:]\s*(.+?)\s*$/);
+    if (m) out[m[1]] = m[2];
+  }
+  return out;
+}
+
+function readInputs() {
+  return {
+    licenseAccepted: checked('license'),
+    domain: v('domain'),
+    ingressClass: v('ingressClass'),
+    tlsEnabled: checked('tls'), tlsIssuer: v('tlsIssuer'),
+    postgres: v('postgres'), postgresHost: v('postgresHost'), postgresPort: v('postgresPort'), postgresDb: v('postgresDb'),
+    vector: v('vector'), vectorHost: v('vectorHost'), vectorPort: v('vectorPort'), vectorDb: v('vectorDb'),
+    mongodb: v('mongodb'), mongodbUrl: v('mongodbUrl'),
+    oidc: v('oidc'), oidcIssuerUrl: v('oidcIssuerUrl'), cockpitClientId: v('cockpitClientId'),
+    git: v('git'), gitUrl: v('gitUrl'),
+    cloud: v('cloud'), cloudBackend: v('cloudBackend'), cloudUrl: v('cloudUrl'),
+    neo4jEnabled: checked('neo4j'), neo4jEdition: v('neo4jEdition'),
+    neo4jLicenseAccepted: false,
+    vm: { transport: v('vmTransport'), namespace: v('vmNamespace'), storageClass: v('vmStorageClass'),
+          diskSize: v('vmDiskSize'), sshPublicKey: v('vmSshPublicKey') },
+    fillSecrets: checked('fillSecrets'),
+    secretValues: parseSecretValues(v('secretValues')),
+  };
+}
+
+function applyVisibility() {
+  const p = profile();
+  document.querySelectorAll('[data-show]').forEach((el) => {
+    el.hidden = !el.dataset.show.split(' ').includes(p);
+  });
+  $('tls-ext').hidden = !checked('tls');
+  $('neo4j-ext').hidden = !checked('neo4j');
+  $('fill-ext').hidden = !checked('fillSecrets');
+  for (const svc of ['postgres', 'vector', 'mongodb', 'oidc', 'git', 'cloud']) {
+    $(svc + '-ext').hidden = !($(svc).value === 'external');
+  }
+}
+
+function refresh() {
+  applyVisibility();
+  const errs = validate(profile(), readInputs());
+  const box = $('errs');
+  box.innerHTML = errs.length ? '<ul>' + errs.map((e) => `<li>${e}</li>`).join('') + '</ul>' : '';
+  $('generate').disabled = errs.length > 0;
+}
+
+let result = {};
+const FILES = { values: 'values.yaml', secret: 'srw-secrets.yaml', install: 'install.sh' };
+const PARTS = () => ({ values: result.valuesYaml, secret: result.secretSkeleton, install: result.installScript });
+let activeTab = 'values';
+
+function showTab(t) {
+  activeTab = t;
+  $('out').textContent = PARTS()[t] || '';
+  document.querySelectorAll('.tabs button').forEach((b) => b.classList.toggle('active', b.dataset.tab === t));
+}
+
+$('generate').onclick = () => {
+  result = generate(profile(), readInputs());
+  $('output').hidden = false;
+  showTab('values');
+  $('output').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+};
+document.querySelectorAll('.tabs button').forEach((b) => { b.onclick = () => showTab(b.dataset.tab); });
+$('copy').onclick = () => navigator.clipboard.writeText(PARTS()[activeTab] || '');
+$('download').onclick = () => {
+  const blob = new Blob([PARTS()[activeTab] || ''], { type: 'text/plain' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob); a.download = FILES[activeTab]; a.click();
+  URL.revokeObjectURL(a.href);
+};
+
+app.addEventListener('input', refresh);
+app.addEventListener('change', refresh);
+refresh();
+</script>
+</body>
+</html>
