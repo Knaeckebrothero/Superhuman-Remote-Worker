@@ -52,14 +52,6 @@ import {LegionMarkComponent} from '../../ui/legion-mark';
           </a>
           <a
             class="nav-link"
-            routerLink="/review"
-            routerLinkActive="active"
-          >
-            <app-icon size="md" class="nav-icon">rate_review</app-icon>
-            {{ 'nav.review' | transloco }}
-          </a>
-          <a
-            class="nav-link"
             routerLink="/projects"
             routerLinkActive="active"
           >
@@ -97,14 +89,6 @@ import {LegionMarkComponent} from '../../ui/legion-mark';
           >
             <app-icon size="md" class="nav-icon">schedule</app-icon>
             {{ 'nav.automations' | transloco }}
-          </a>
-          <a
-            class="nav-link"
-            routerLink="/create"
-            routerLinkActive="active"
-          >
-            <app-icon size="md" class="nav-icon">add_circle</app-icon>
-            {{ 'nav.create' | transloco }}
           </a>
           @if (!viewport.isMobile()) {
             <a

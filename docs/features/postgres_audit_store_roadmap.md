@@ -25,6 +25,34 @@ if the Compose deprecation lands first** (gate G6).
 > way. Line refs throughout updated to the 2026-06-10 tree; expect
 > further drift and re-grep at implementation time.
 
+## Current status (2026-06-19) — SHIPPED, cutover live on dev
+
+All phases implemented and deployed. Postgres (`srw-auditdb`) is the live audit
+backend on the **dev cluster**; the irreversible P7 flip is done. Remaining work
+is the soak + Mongo wipe + P8 cleanup. Full detail (verification, deploy gotcha,
+backup) in `postgres_audit_store_implementation.md` § Current status.
+
+| Phase | Work | PR(s) | State |
+|-------|------|-------|-------|
+| P0 Pre-flight | gates closed (G0 hand-rolled, G6 skip-Compose) | — | ✅ |
+| P1 Foundation | `migrations/audit/0001` + partition module + lifespan | PR 1 | ✅ |
+| P2 Writer | `SyncAuditWriter` + archiver branches | PR 2 | ✅ |
+| P3 Reader | `AuditStore` (stitch + filters) | PR 3 | ✅ |
+| P4 Wiring | orchestrator reader selector + cockpit id-normalization | PR 4a/4b | ✅ |
+| P5 Infrastructure | Helm `srw-auditdb` + secret/NetPol/`wait-for-auditdb` | PR 5 | ✅ k3d-verified |
+| P6 Validation | lean cut — component tests + k3d in-cluster e2e in place of a formal A/B; G3 perf gate not run as a phase | PR 6 | ✅ |
+| P7 Cutover | chart default `mongodb`→`postgres` + `generator.mjs` drift fix; **deployed to dev** | PR 7 | ✅ live |
+| P8 Cleanup | remove Mongo chart/modules/`motor`/`MONGODB_URL` + `_id` dual-reads | — | ⏳ pending soak |
+
+**Post-flip tail:** ~24 h soak → fresh Mongo dump + wipe `srw_logs` (delete PVC) →
+P8. Pre-wipe backup taken 2026-06-19 14:44 (`~/srw-audit-mongo-backup/…`,
+276,543 docs, verified). **Deploy trap (hit + fixed on dev):** ESO-backed envs
+need the Vault `AUDIT_POSTGRES_USER/PASSWORD` keys *before* the chart bump, else
+`srw-auditdb` crash-loops on `CreateContainerConfigError` and blocks the
+orchestrator's `wait-for-auditdb`.
+
+---
+
 ## Critical path
 
 ```

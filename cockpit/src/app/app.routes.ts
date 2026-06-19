@@ -35,8 +35,8 @@ export const routes: Routes = [
     {path: 'sessions/:threadId', component: ChatPageComponent, canActivate: [authGuard]},
     {path: 'chat', redirectTo: 'sessions'},
   { path: 'jobs', component: JobsPageComponent, canActivate: [authGuard] },
-  { path: 'review', component: JobReviewPageComponent, canActivate: [authGuard] },
-  { path: 'create', component: CreatePageComponent, canActivate: [authGuard] },
+  { path: 'jobs/new', component: CreatePageComponent, canActivate: [authGuard] },
+  { path: 'jobs/review', component: JobReviewPageComponent, canActivate: [authGuard] },
   { path: 'inbox', component: InboxPageComponent, canActivate: [authGuard] },
   { path: 'projects', component: ProjectListPageComponent, canActivate: [authGuard] },
   { path: 'projects/:id', component: ProjectDetailPageComponent, canActivate: [authGuard, projectAccessGuard] },
@@ -58,9 +58,11 @@ export const routes: Routes = [
   { path: 'admin/grants', component: AdminGrantsComponent, canActivate: [authGuard, adminGuard] },
   { path: 'debug', component: DebugPageComponent, canActivate: [authGuard] },
 
-  // Redirects for old bookmarks
+  // Redirects for old bookmarks. Jobs absorbed the standalone Create + Review
+  // surfaces, so their old top-level paths now redirect into /jobs/*.
   { path: 'sudo', redirectTo: 'inbox' },
-  { path: 'review', redirectTo: 'inbox' },
+  { path: 'create', redirectTo: 'jobs/new' },
+  { path: 'review', redirectTo: 'jobs/review' },
 
   // Catch old email links: /jobs/{jobId}/messages/{threadId}
   // redirectTo can't transform path params to query params, so use a redirect component
