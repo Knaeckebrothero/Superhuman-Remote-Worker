@@ -75,3 +75,33 @@ def test_fence_skills_menu_wraps_and_strips_braces():
     assert "<available_skills" in out and "</available_skills>" in out
     assert "- a: use when ok" in out  # braces stripped
     assert "{" not in out and "}" not in out
+
+
+# --- Slice 3: bound skills are removed from the model-invoked catalog ---
+
+from src.core.skill_resolution import filter_bound_skills  # noqa: E402
+
+
+def test_filter_removes_bound_skill_from_menu_and_files():
+    blob = {
+        "agent": {
+            "instruction_files": [
+                {"skill": "todo-guide", "trigger": "before_tool:next_phase_todos"},
+                {"file": "x.md", "trigger": "phase:tactical"},
+            ]
+        },
+        "skills": {
+            "menu": [{"name": "todo-guide"}, {"name": "free-skill"}],
+            "files": {"todo-guide": {"SKILL.md": "x"}, "free-skill": {"SKILL.md": "y"}},
+        },
+    }
+    filter_bound_skills(blob)
+    assert [m["name"] for m in blob["skills"]["menu"]] == ["free-skill"]
+    assert set(blob["skills"]["files"]) == {"free-skill"}
+
+
+def test_filter_noop_without_skills_or_bindings():
+    assert filter_bound_skills({"agent": {}}) == {"agent": {}}
+    blob = {"agent": {"instruction_files": []}, "skills": {"menu": [{"name": "a"}], "files": {}}}
+    filter_bound_skills(blob)
+    assert [m["name"] for m in blob["skills"]["menu"]] == ["a"]  # nothing bound → unchanged
