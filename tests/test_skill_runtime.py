@@ -42,7 +42,10 @@ def _worker_cfg(template, menu=None):
     data = {
         "agent_id": "t",
         "display_name": "T",
-        "_resolved_prompts": {"systemprompt": template, "tactical": "TAC{phase_number}"},
+        "_resolved_prompts": {
+            "systemprompt": template,
+            "tactical": "TAC{phase_number}",
+        },
     }
     if menu is not None:
         data["_resolved_skills"] = {"menu": menu}

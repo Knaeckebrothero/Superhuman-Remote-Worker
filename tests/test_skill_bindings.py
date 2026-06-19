@@ -20,14 +20,18 @@ from src.core.loader import InstructionFileEntry, load_agent_config_from_dict
 
 
 def test_file_entry_path_is_the_file():
-    e = InstructionFileEntry(trigger="before_tool:next_phase_todos", file="todo_guide.md")
+    e = InstructionFileEntry(
+        trigger="before_tool:next_phase_todos", file="todo_guide.md"
+    )
     assert e.path == "todo_guide.md"
     assert e.trigger_type == "before_tool"
     assert e.trigger_target == "next_phase_todos"
 
 
 def test_skill_entry_path_is_skill_md():
-    e = InstructionFileEntry(trigger="phase:tactical", skill="research-guide", enforce=False)
+    e = InstructionFileEntry(
+        trigger="phase:tactical", skill="research-guide", enforce=False
+    )
     assert e.path == "skills/research-guide/SKILL.md"
     assert e.trigger_type == "phase"
     assert e.trigger_target == "tactical"
@@ -46,7 +50,11 @@ def test_parse_skill_binding_from_config():
             "agent_id": "t",
             "display_name": "T",
             "instruction_files": [
-                {"skill": "research-guide", "trigger": "phase:tactical", "enforce": False},
+                {
+                    "skill": "research-guide",
+                    "trigger": "phase:tactical",
+                    "enforce": False,
+                },
                 {"file": "todo_guide.md", "trigger": "before_tool:next_phase_todos"},
             ],
         }
@@ -82,19 +90,31 @@ def _ctx(tmp_path, entries):
 def test_before_tool_gate_targets_skill_path(tmp_path):
     ctx = _ctx(
         tmp_path,
-        [InstructionFileEntry(trigger="before_tool:next_phase_todos", skill="todo-guide")],
+        [
+            InstructionFileEntry(
+                trigger="before_tool:next_phase_todos", skill="todo-guide"
+            )
+        ],
     )
-    assert ctx.get_enforcement_files("next_phase_todos") == ["skills/todo-guide/SKILL.md"]
+    assert ctx.get_enforcement_files("next_phase_todos") == [
+        "skills/todo-guide/SKILL.md"
+    ]
     # gate closed until the skill path is read
     assert ctx.check_tool_enforcement("next_phase_todos") is not None
-    ctx.record_file_read("skills/todo-guide/SKILL.md")  # what use_skill / read_file record
+    ctx.record_file_read(
+        "skills/todo-guide/SKILL.md"
+    )  # what use_skill / read_file record
     assert ctx.check_tool_enforcement("next_phase_todos") is None
 
 
 def test_phase_binding_targets_skill_path(tmp_path):
     ctx = _ctx(
         tmp_path,
-        [InstructionFileEntry(trigger="phase:tactical", skill="research-guide", enforce=False)],
+        [
+            InstructionFileEntry(
+                trigger="phase:tactical", skill="research-guide", enforce=False
+            )
+        ],
     )
     entries = ctx.get_phase_instruction_files("tactical")
     assert len(entries) == 1 and entries[0].path == "skills/research-guide/SKILL.md"
@@ -104,7 +124,11 @@ def test_phase_binding_targets_skill_path(tmp_path):
 def test_apply_enforcement_wrapper_uses_skill_path(tmp_path):
     ctx = _ctx(
         tmp_path,
-        [InstructionFileEntry(trigger="before_tool:next_phase_todos", skill="todo-guide")],
+        [
+            InstructionFileEntry(
+                trigger="before_tool:next_phase_todos", skill="todo-guide"
+            )
+        ],
     )
     calls = []
     tool = SimpleNamespace(
@@ -134,7 +158,9 @@ def test_serialize_freezes_bound_skill_md(tmp_path):
             ],
         }
     )
-    cfg._deployment_dir = str(tmp_path)  # matrix/prompt resolvers need a dir; files absent → None
+    cfg._deployment_dir = str(
+        tmp_path
+    )  # matrix/prompt resolvers need a dir; files absent → None
     blob = serialize_resolved_config(cfg)
     # Frozen under the skill name (not "SKILL"), independent of the catalog flag.
     assert "hello-skill" in blob["instructions"]
@@ -168,7 +194,9 @@ def test_scholar_binds_research_guide_as_skill():
     assert len(research) == 1
     assert research[0]["trigger"] == "phase:tactical"
     assert research[0]["enforce"] is False
-    assert not any(e.get("file") == "research_guide.md" for e in entries)  # old ref gone
+    assert not any(
+        e.get("file") == "research_guide.md" for e in entries
+    )  # old ref gone
 
 
 # ---------------------------------------------------------------------------
