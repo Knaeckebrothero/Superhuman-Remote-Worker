@@ -3,7 +3,7 @@ import {Injector, runInInjectionContext} from '@angular/core';
 import {HttpClient} from '@angular/common/http';
 import {BuilderStreamService} from './builder-stream.service';
 import {JobArtifactService} from './job-artifact.service';
-import {UserService} from './user.service';
+import {UserService} from '../user.service';
 
 // ---------------------------------------------------------------------------
 // Test scaffolding
