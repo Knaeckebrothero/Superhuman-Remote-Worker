@@ -30,7 +30,6 @@ export type ComponentType =
   | 'experts-list'
   | 'job-review'
   | 'workspace-browser'
-  | 'instruction-builder'
   | 'project-list'
   | 'memory-panel'
   | 'action-center'

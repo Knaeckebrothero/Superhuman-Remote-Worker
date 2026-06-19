@@ -345,7 +345,7 @@ The `test` user is pre-seeded in the Keycloak realm with `admin` + `user` roles,
 
 Quick checklist after a fresh `helm install` (or after recreating the cluster). Each step exercises an independent slice of the stack.
 
-**1. Cockpit + Keycloak login** — open `https://localhost/`, log in as `test`/`test`. Lands on `/builder`. If you land in a refresh loop, jump to the matching troubleshooting entry below.
+**1. Cockpit + Keycloak login** — open `https://localhost/`, log in as `test`/`test`. Lands on the Sessions list (`/sessions`). If you land in a refresh loop, jump to the matching troubleshooting entry below.
 
 **2. Sessions (persistent agent + WS)** — Sessions → **New Session** → pick any expert (e.g. Scholar) → **Create Session**. Expected sequence in the UI:
 
