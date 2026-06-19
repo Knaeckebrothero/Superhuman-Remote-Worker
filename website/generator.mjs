@@ -43,8 +43,10 @@ export function validate(profile, inputs) {
     e.push('Ingress class must be nginx or traefik.');
 
   if (profile !== 'evaluation') {
-    for (const [svc, url] of [['postgres', 'postgresUrl'], ['vector', 'vectorUrl'],
-      ['mongodb', 'mongodbUrl'], ['git', 'gitUrl'], ['cloud', 'cloudUrl']]) {
+    for (const svc of ['postgres', 'vector']) {
+      if (inputs[svc] === 'external' && !inputs[svc + 'Host']) e.push(`An external ${svc} requires its host.`);
+    }
+    for (const [svc, url] of [['mongodb', 'mongodbUrl'], ['git', 'gitUrl'], ['cloud', 'cloudUrl']]) {
       if (inputs[svc] === 'external' && !inputs[url]) e.push(`An external ${svc} requires its URL.`);
     }
     if (inputs.oidc === 'external' && !inputs.oidcIssuerUrl)
@@ -103,12 +105,20 @@ function buildValuesYaml(profile, inputs) {
 function databasesBlock(profile, inputs) {
   const L = ['databases:'];
   if (profile !== 'evaluation') {
-    const dbExt = (key, svc, url) => inputs[svc] === 'external' ? [
-      `  ${key}:`, '    enabled: true', '    internal: false', `    externalUrl: "${url}"`,
+    // Postgres + vector take discrete host/port/db (the chart composes the DSN at
+    // runtime with creds from the Secret). Only mongodb takes a full externalUrl.
+    const pgExt = (key, svc, defaultDb) => inputs[svc] === 'external' ? [
+      `  ${key}:`, '    enabled: true', '    internal: false',
+      `    externalHost: "${inputs[svc + 'Host'] || ''}"`,
+      `    externalPort: ${inputs[svc + 'Port'] || 5432}`,
+      `    externalDb: "${inputs[svc + 'Db'] || defaultDb}"`,
     ] : [];
-    L.push(...dbExt('postgres', 'postgres', inputs.postgresUrl));
-    L.push(...dbExt('vector', 'vector', inputs.vectorUrl));
-    L.push(...dbExt('mongodb', 'mongodb', inputs.mongodbUrl));
+    L.push(...pgExt('postgres', 'postgres', 'srw'));
+    L.push(...pgExt('vector', 'vector', 'srw_vector'));
+    if (inputs.mongodb === 'external') {
+      L.push('  mongodb:', '    enabled: true', '    internal: false',
+        `    externalUrl: "${inputs.mongodbUrl || ''}"`);
+    }
   }
   L.push('  neo4j:');
   L.push(`    enabled: ${inputs.neo4jEnabled === true}`);
@@ -156,37 +166,37 @@ function vmControllerBlock(inputs) {
   ];
 }
 
-// User-supplied secret keys per profile (placeholders unless fillSecrets). The
-// authoritative required set is whatever the chart renders — the drift-gate
-// (generator.drift.test.mjs) fails CI if a referenced key is missing here, so
-// this list is reconciled against the real chart in Task 8.
+// Secret keys for the operator-owned-Secret profiles. GENERATED keys get a
+// random value (internal secrets); USER_KEYS get CHANGE_ME placeholders (or
+// filled values when fillSecrets). These mirror the chart's non-optional
+// secretKeyRefs for the recommended (external-services) config — the drift-gate
+// (generator.drift.test.mjs) fails CI if the chart references a key not listed
+// here. NOTE: GITEA_ADMIN_* are referenced unconditionally by the chart even
+// with external git (a documented stub-key requirement), so they must be present.
+const GENERATED = ['APP_ENCRYPTION_KEY', 'MCP_INTERNAL_KEY'];
 const USER_KEYS = {
-  evaluation: ['LLM_API_KEY'],
-  production: ['POSTGRES_PASSWORD', 'VECTOR_DB_PASSWORD', 'MONGODB_PASSWORD',
-               'KC_CLIENT_SECRET', 'GITEA_OIDC_CLIENT_SECRET',
-               'CLOUD_SERVICE_PASSWORD', 'LLM_API_KEY'],
+  evaluation: [],
+  production: ['POSTGRES_USER', 'POSTGRES_PASSWORD',
+               'VECTOR_POSTGRES_USER', 'VECTOR_POSTGRES_PASSWORD',
+               'KC_CLIENT_SECRET', 'GITEA_ADMIN_USER', 'GITEA_ADMIN_PASSWORD'],
 };
 USER_KEYS['production-vms'] = USER_KEYS.production;
 
 function buildSecret(profile, inputs) {
+  if (profile === 'evaluation') {
+    return ['# Eval mode: the chart creates the Secret and auto-generates the',
+      '# required keys (APP_ENCRYPTION_KEY etc.). No Secret to pre-create — add',
+      '# provider API keys after install via Admin → Providers.'].join('\n') + '\n';
+  }
   const val = (k) => (inputs.fillSecrets && inputs.secretValues?.[k]) || 'CHANGE_ME';
   const data = {};
-  // Generated randoms only in operator-owned-Secret modes (not eval/chart-created,
-  // where the chart auto-generates APP_ENCRYPTION_KEY itself).
-  if (profile !== 'evaluation') {
-    data.APP_ENCRYPTION_KEY = randomHex(32);
-    data.SESSION_JWT_SECRET = randomHex(32);
-  }
+  for (const k of GENERATED) data[k] = randomHex(32);     // random internal secrets
   for (const k of USER_KEYS[profile]) data[k] = val(k);
 
-  if (profile === 'evaluation') {
-    const lines = ['# Eval mode: the chart creates the Secret. Add real values to',
-      '# `secrets.values` in values.yaml, or pre-create this Secret. The chart',
-      '# auto-generates APP_ENCRYPTION_KEY when absent.'];
-    for (const [k, v] of Object.entries(data)) lines.push(`#   ${k}: ${v}`);
-    return lines.join('\n') + '\n';
-  }
-  const lines = ['apiVersion: v1', 'kind: Secret', 'metadata:',
+  const lines = ['# Pre-create this Secret before `helm install`. Every key below is',
+    '# referenced by the chart; set real values (or safe dummies for components you',
+    '# run externally, e.g. GITEA_ADMIN_* when using external git).',
+    'apiVersion: v1', 'kind: Secret', 'metadata:',
     '  name: srw-secrets', '  namespace: srw', 'type: Opaque', 'stringData:'];
   for (const [k, v] of Object.entries(data)) lines.push(`  ${k}: ${v}`);
   return lines.join('\n') + '\n';
