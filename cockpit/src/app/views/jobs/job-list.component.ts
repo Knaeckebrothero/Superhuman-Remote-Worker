@@ -12,6 +12,7 @@ import {AppBadgeComponent, type BadgeTone} from '../../ui/badge';
 import {AppChipComponent} from '../../ui/chip';
 import {AppInputComponent} from '../../ui/input';
 import {AppSpinnerComponent} from '../../ui/spinner';
+import {AppIconComponent} from '../../ui/icon';
 type StatusFilter = 'all' | JobStatus;
 
 /** A row in the hierarchical job list. */
@@ -34,7 +35,9 @@ interface JobRow {
     AppBadgeComponent,
     AppChipComponent,
     AppInputComponent,
-    AppSpinnerComponent,  ],
+    AppSpinnerComponent,
+    AppIconComponent,
+  ],
   template: `
     <div class="job-list-container">
       <!-- Header with filters -->
@@ -54,20 +57,38 @@ interface JobRow {
             </app-chip>
           }
         </div>
-        <app-button
-          variant="secondary"
-          size="sm"
-          class="refresh-btn"
-          [disabled]="isLoading()"
-          (clicked)="refresh()"
-        >
-          {{ 'jobs.refresh' | transloco }}
-        </app-button>
-        @if (snapshotStats()?.available) {
-          <span class="snapshot-stats" [title]="'jobs.tooltip.snapshotStats' | transloco">
-            {{ 'jobs.snapshotsSummary' | transloco:{ count: snapshotStats()!.total_snapshots, size: formatBytes(snapshotStats()!.total_size_bytes) } }}
-          </span>
-        }
+        <div class="header-actions">
+          @if (snapshotStats()?.available) {
+            <span class="snapshot-stats" [title]="'jobs.tooltip.snapshotStats' | transloco">
+              {{ 'jobs.snapshotsSummary' | transloco:{ count: snapshotStats()!.total_snapshots, size: formatBytes(snapshotStats()!.total_size_bytes) } }}
+            </span>
+          }
+          @if (pendingReviewCount() > 0) {
+            <app-button
+              variant="warning"
+              size="sm"
+              [ariaLabel]="'jobs.tooltip.reviewQueue' | transloco"
+              (clicked)="goToReview()"
+            >
+              {{ 'jobs.reviewQueue' | transloco:{ count: pendingReviewCount() } }}
+            </app-button>
+          }
+          <app-button
+            variant="secondary"
+            size="sm"
+            [disabled]="isLoading()"
+            (clicked)="refresh()"
+          >
+            {{ 'jobs.refresh' | transloco }}
+          </app-button>
+          <app-button
+            variant="primary"
+            size="sm"
+            (clicked)="goToCreate()"
+          >
+            <app-icon size="sm">add</app-icon> {{ 'jobs.newJob' | transloco }}
+          </app-button>
+        </div>
       </div>
 
       <!-- Loading State -->
@@ -403,14 +424,17 @@ interface JobRow {
         margin-left: 2px;
       }
 
-      .refresh-btn {
+      .header-actions {
+        display: flex;
+        align-items: center;
+        gap: 8px;
         margin-left: auto;
+        flex-wrap: wrap;
       }
 
       .snapshot-stats {
         font-size: 10px;
         color: var(--text-muted);
-        margin-left: 8px;
         flex-shrink: 0;
       }
 
@@ -811,6 +835,11 @@ export class JobListComponent implements OnInit, OnDestroy {
     return allJobs.filter((job) => job.status === filter);
   });
 
+  /** Count of jobs awaiting human review — drives the header Review button. */
+  readonly pendingReviewCount = computed(
+    () => this.jobs().filter((job) => job.status === 'pending_review').length,
+  );
+
   /**
    * Build a flat list of JobRows with hierarchy info.
    * Root jobs (no parent_job_id) appear first, followed by their children
@@ -1071,10 +1100,25 @@ export class JobListComponent implements OnInit, OnDestroy {
     this.selectedJobId.set(jobId);
   }
 
+  /** Open the create form (full page, mirrors Sessions' "New Session"). */
+  goToCreate(): void {
+    this.router.navigate(['/jobs/new']);
+  }
+
+  /**
+   * Open the review queue with no job preselected — the review page then
+   * auto-selects the first pending_review job. Clearing the current job
+   * avoids landing on a previously-viewed (non-pending) job.
+   */
+  goToReview(): void {
+    this.data.setCurrentJob(null);
+    this.router.navigate(['/jobs/review']);
+  }
+
   reviewJob(jobId: string): void {
     this.data.setCurrentJob(jobId);
     this.selectedJobId.set(jobId);
-    this.router.navigate(['/review']);
+    this.router.navigate(['/jobs/review']);
   }
 
   pauseJob(jobId: string): void {

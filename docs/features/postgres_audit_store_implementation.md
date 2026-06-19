@@ -1,6 +1,6 @@
 # Postgres Audit Store — Implementation Package
 
-**Status: ready for review** (generated overnight 2026-06-10/11; awaiting sign-off, then implementation starts at PR 1).
+**Status: ✅ SHIPPED — PR 1–7 merged on `develop` and deployed via Fleet; the Postgres cutover is LIVE on the dev cluster as of 2026-06-19.** Remaining: ~24 h soak → Mongo data wipe → PR 8 (Mongo code/chart removal). Full detail in [§ Current status (2026-06-19)](#current-status-2026-06-19--shipped-cutover-live-on-dev) below; the package text after it is the as-built reference.
 
 Provenance: produced by an 8-agent discovery run — four code agents extracted
 the definitive write/read/cockpit/infra contracts from the current tree, three
@@ -32,6 +32,69 @@ How to review this in one pass: read § 1 (what was decided and why), § 2
 (what discovery corrected — this is where the surprises are), skim § 3–5
 (the artifacts: DDL, partition module spec, adapter interface), then § 8–10
 (PR plan, day-1 checklist, the short list that needs your sign-off).
+
+---
+
+## Current status (2026-06-19) — SHIPPED, cutover live on dev
+
+The migration is implemented end-to-end and **live on the dev cluster**. Postgres
+(`srw-auditdb`) is the active audit backend; Mongo is no longer in the audit path.
+
+**PRs (merged on `develop`, deployed via Fleet):**
+
+| PR | Scope | State |
+|----|-------|-------|
+| 1 | `migrations/audit/0001` (3 partitioned tables) + partition module (`audit_partitions.py`) + audit-DB lifespan wiring | ✅ merged |
+| 2 | Agent `SyncAuditWriter` (daemon thread + private loop) + archiver PG branches | ✅ merged |
+| 3 | `AuditStore` reader (two-phase stitch, filters, `step_number`) | ✅ merged |
+| 4a / 4b | Orchestrator reader selector + 13 read sites; Cockpit id-normalization (`_id`↔`id`) | ✅ merged |
+| 5 | Helm `srw-auditdb` (StatefulSet, secret keys, NetworkPolicies, `wait-for-auditdb` init) | ✅ merged + k3d-verified |
+| 6 | `AUDIT_BACKEND` chart flag + flip to `postgres` on k3d (in-cluster write+read e2e PASS) | ✅ merged |
+| 7 | Cutover: chart default `mongodb`→`postgres` + `website/generator.mjs` secret-skeleton drift fix | ✅ merged + **deployed to dev** |
+
+**Verified live on dev (2026-06-19):** `srw-auditdb-0` Ready; orchestrator logs
+`Audit store (read) connected` → `Audit reads served by Postgres AuditStore
+(AUDIT_BACKEND=postgres)` → `Database migrations applied` → `audit_partitions:
+maintenance loop started`; `schema_migrations` shows `0001_initial.sql` succeeded;
+the partition/index tree is present.
+
+**Deploy gotcha hit + resolved (the ESO/Vault trap):** the chart's new
+non-optional `AUDIT_POSTGRES_USER`/`AUDIT_POSTGRES_PASSWORD` secret keys were not
+in Vault, so `srw-auditdb` sat in `CreateContainerConfigError` ("couldn't find key
+AUDIT_POSTGRES_USER in Secret …/srw") for ~44 min and blocked the orchestrator's
+`wait-for-auditdb` (no outage — the pre-cutover orchestrator pod kept serving).
+Fixed by adding both keys to Vault path
+`secret/homelab/superhuman-remote-worker/srw-secrets` (user `srw`, fresh password
+— the DB was empty/uninitialized) → ESO sync → recovery. **Operational rule:** in
+any ESO-backed env, add the Vault `AUDIT_POSTGRES_*` keys *before* bumping the
+chart (ESO refresh is 1 h; force with the `force-sync` annotation).
+
+**Pre-wipe Mongo backup (safety net):** dev `srw_logs` dumped 2026-06-19 14:44 →
+`~/srw-audit-mongo-backup/srw_logs-20260619-144410.archive.gz` (1.4 GB,
+276,543 docs: agent_audit 189,375 + llm_requests 43,584 + chat_history 43,584;
+sha256 `987f86ab842daf2dacb07af15c4d6423298573c78574ea8d796a003dd03598e7`),
+verified (mongodump exit 0 + `gzip -t` + `mongorestore --dryRun`). Restore:
+`mongorestore --archive=<file> --gzip`. `srw-prod-private` deliberately not backed
+up (never used).
+
+**Remaining (the cutover tail):**
+1. **~24 h soak** on dev — real jobs/sessions write to `srw-auditdb`; cockpit
+   Audit/Chat/Graph render from Postgres (old jobs read empty — expected, their
+   data is stranded in Mongo); partition maintenance stays healthy.
+2. **Mongo wipe** — fresh incremental dump (14:44→flip tail) then drop `srw_logs`
+   / delete its PVC (~2.7 GB reclaimed).
+3. **PR 8 cleanup** — remove chart `mongodb`/`mongo-express`, the Mongo modules +
+   `motor` (orchestrator image) + `MONGODB_URL`, and the transitional `_id`
+   dual-reads. (G5: `pymongo` stays — customer datasource tools.)
+
+**Scope deltas from the original plan (lean cut, agreed with the user):** P6's
+formal A/B + perf gate (G3) was not run as a separate phase — validation was
+component tests (writer 14/14, reader 40/40 against real `postgres:16`) + the k3d
+in-cluster write+read e2e + the dev cutover checks above. Auto-retention
+(`retire_partitions`) ships as a deferred no-op stub; partitions accumulate until
+a later retention pass. The deferred Dockerfile `postgresql-client` + `init.py`
+`pg_dump` backup were dropped (backup was already dead code; the orchestrator
+talks to auditdb via asyncpg).
 
 ---
 

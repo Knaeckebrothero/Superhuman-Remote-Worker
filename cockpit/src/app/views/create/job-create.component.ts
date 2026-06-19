@@ -1,5 +1,5 @@
 import {Component, computed, effect, ElementRef, inject, OnInit, signal, ViewChild} from '@angular/core';
-import {ActivatedRoute} from '@angular/router';
+import {ActivatedRoute, Router} from '@angular/router';
 import {ApiService} from '../../core/services/api.service';
 import {FileHandlingService} from '../../core/services/file-handling.service';
 import {JobArtifactService} from '../../core/services/job-artifact.service';
@@ -41,6 +41,9 @@ import {AppTooltipDirective} from '../../ui/tooltip';
     <div class="job-create-container">
       <div class="header-bar">
         <span class="title">{{ 'jobs.create.title' | transloco }}</span>
+        <app-button variant="secondary" size="sm" class="back-btn" (clicked)="cancel()">
+          {{ 'jobs.create.backToJobs' | transloco }}
+        </app-button>
       </div>
 
       <div class="form-container">
@@ -331,6 +334,10 @@ import {AppTooltipDirective} from '../../ui/tooltip';
         background: var(--panel-header-bg, #1e1e2e);
         border-bottom: 1px solid var(--border-color, var(--surface-0));
         flex-shrink: 0;
+      }
+
+      .back-btn {
+        margin-left: auto;
       }
 
       .title {
@@ -1084,6 +1091,7 @@ import {AppTooltipDirective} from '../../ui/tooltip';
 export class JobCreateComponent implements OnInit {
   private readonly api = inject(ApiService);
   private readonly route = inject(ActivatedRoute);
+  private readonly router = inject(Router);
   private readonly userService = inject(UserService);
   private readonly modelService = inject(ModelService);
   readonly fileService = inject(FileHandlingService);
@@ -1463,4 +1471,9 @@ export class JobCreateComponent implements OnInit {
   clearSuccess(): void { this.successMessage.set(null); }
   clearError(): void { this.errorMessage.set(null); }
   private clearMessages(): void { this.successMessage.set(null); this.errorMessage.set(null); }
+
+  /** Leave the create form and return to the job list. */
+  cancel(): void {
+    this.router.navigate(['/jobs']);
+  }
 }
