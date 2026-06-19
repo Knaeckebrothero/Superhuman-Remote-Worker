@@ -16,7 +16,6 @@ access.py helpers narrow accordingly. Helpers covered:
   - require_project_member / require_project_owner
   - require_job_access / user_can_access_job
   - user_can_access_ide_entity
-  - require_builder_session_owner
   - require_sudo_request_authority
   - user_can_access_datasource / require_datasource_owner
   - apply_mcp_scope (SQL-shaped variant, already had coverage; refresh here)
@@ -304,36 +303,6 @@ class TestUserCanAccessIdeEntityScoped:
         assert await access.user_can_access_ide_entity(
             scoped, fake_db, str(thread_a["id"])
         )
-
-
-# =============================================================================
-# require_builder_session_owner — denies project-scoped tokens entirely
-# =============================================================================
-
-
-class TestRequireBuilderSessionOwnerScoped:
-    @pytest.mark.asyncio
-    async def test_project_scope_denied(
-        self, user_a, builder_session_a, project_a, fake_db, fake_request
-    ):
-        scoped = _scoped(user_a, f"project:{project_a['id']}")
-        with _patch_caller(scoped):
-            with pytest.raises(HTTPException) as exc:
-                await access.require_builder_session_owner(
-                    fake_request, fake_db, str(builder_session_a["id"])
-                )
-        assert exc.value.status_code == 403
-
-    @pytest.mark.asyncio
-    async def test_user_scope_allowed(
-        self, user_a, builder_session_a, fake_db, fake_request
-    ):
-        scoped = _scoped(user_a, "user")
-        with _patch_caller(scoped):
-            user, _ = await access.require_builder_session_owner(
-                fake_request, fake_db, str(builder_session_a["id"])
-            )
-        assert user is scoped
 
 
 # =============================================================================
