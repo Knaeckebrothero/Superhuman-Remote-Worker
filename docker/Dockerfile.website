@@ -1,0 +1,22 @@
+# Static marketing site + Helm config generator, served by nginx.
+# Build (from repo root):  podman build -t srw-website -f docker/Dockerfile.website .
+FROM nginx:alpine
+LABEL description="SRW sales page + self-host config generator"
+
+# Only the runtime assets — NOT website/test/ or anything else.
+COPY website/index.html website/configure.html website/generator.mjs /usr/share/nginx/html/
+# og-image.png is added by the og:image task; COPY it here once it exists.
+
+# Clean /configure URL + correct .mjs MIME (a regex location, so the default
+# mime.types include still covers everything else) + listen 80.
+RUN printf 'server {\n\
+    listen 80;\n\
+    root /usr/share/nginx/html;\n\
+    index index.html;\n\
+    location = /configure { try_files /configure.html =404; }\n\
+    location ~ \\.mjs$ { default_type application/javascript; }\n\
+    location / { try_files $uri $uri/ =404; }\n\
+}\n' > /etc/nginx/conf.d/default.conf
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD wget -q --spider http://localhost:80/ || exit 1
