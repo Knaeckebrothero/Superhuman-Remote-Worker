@@ -488,7 +488,7 @@ def format_llm_requests(job_id: str, data: dict[str, Any]) -> str:
             if tool_calls
             else "(none)"
         )
-        doc_id = entry.get("_id", "?")
+        doc_id = entry.get("id", entry.get("_id", "?"))
         iteration = entry.get("iteration", "?")
 
         lines.append(
@@ -571,7 +571,7 @@ def format_graph_changes(changes: dict[str, Any]) -> str:
 
 def format_llm_request(request: dict[str, Any]) -> str:
     """Format LLM request/response from MongoDB llm_requests document."""
-    lines = [f"LLM Request: {request.get('_id', 'unknown')}\n"]
+    lines = [f"LLM Request: {request.get('id', request.get('_id', 'unknown'))}\n"]
 
     lines.append(f"Job: {request.get('job_id', 'N/A')}")
     lines.append(f"Model: {request.get('model', 'N/A')}")

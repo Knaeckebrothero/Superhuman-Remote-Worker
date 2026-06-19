@@ -98,6 +98,7 @@ from pydantic import BaseModel, Field, model_validator  # noqa: E402
 from database import (  # noqa: E402
     PostgresDB,
     MongoDB,
+    AuditStore,
     ALLOWED_TABLES,
     FilterCategory,
     MIGRATIONS_VECTOR_DIR,
@@ -245,7 +246,7 @@ from services import headless_notifications  # noqa: E402
 from services.imap_poller import imap_poller  # noqa: E402
 from services.notification_service import notification_service  # noqa: E402
 import httpx  # noqa: E402
-from graph_routes import router as graph_router, set_mongodb  # noqa: E402
+from graph_routes import router as graph_router, set_audit_reader, set_postgres_db  # noqa: E402
 from uploads import router as uploads_router  # noqa: E402
 
 logger = logging.getLogger(__name__)
@@ -288,6 +289,13 @@ audit_db = (
     if _audit_url
     else None
 )
+
+# Audit READS (PR4): the cockpit-facing read backend, selected by AUDIT_BACKEND.
+# Defaults to the Mongo reader; the lifespan swaps in the Postgres AuditStore
+# when AUDIT_BACKEND=postgres. Both expose the same read method surface, so the
+# ~13 read call sites are backend-agnostic.
+audit_store = AuditStore(_audit_url) if _audit_url else None
+audit_reader = mongodb
 
 # Session router singletons — see docs/features/direct_session_websockets.md
 import json as _session_json  # noqa: E402
@@ -4320,7 +4328,7 @@ class CustomJSONResponse(JSONResponse):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan handler."""
-    global _shutdown_event
+    global _shutdown_event, audit_reader
 
     # Hard-fail if the legacy LLM_BASE_URL env var is set. The env-var-driven
     # routing for self-hosted "Local" group models was removed in chunk 6 of
@@ -4364,6 +4372,21 @@ async def lifespan(app: FastAPI):
                 "Audit DB connect failed — continuing without the audit store. "
                 "Check AUDIT_POSTGRES_* and the srw-auditdb server."
             )
+
+    # PR4: when AUDIT_BACKEND=postgres, serve the cockpit-facing reads from the
+    # Postgres AuditStore (its own read pool) instead of Mongo. Both expose the
+    # same method surface, so the read call sites are backend-agnostic. A connect
+    # failure leaves is_available=False -> the endpoints' degraded shapes; never
+    # fatal (non-load-bearing tier).
+    if (
+        os.getenv("AUDIT_BACKEND", "mongodb").strip().lower() == "postgres"
+        and audit_store is not None
+    ):
+        audit_reader = audit_store
+        await audit_store.connect()
+        logger.info(
+            "Audit reads served by Postgres AuditStore (AUDIT_BACKEND=postgres)"
+        )
 
     # Reassert MongoDB index declarations on every startup. Idempotent —
     # existing identical indexes are a silent no-op. Closes the gap that
@@ -4461,8 +4484,9 @@ async def lifespan(app: FastAPI):
 
     register_catalog_lookup(postgres_db.resolve_catalog_model)
 
-    # Share MongoDB instance with graph_routes
-    set_mongodb(mongodb)
+    # Share the selected audit reader + the app DB with graph_routes.
+    set_audit_reader(audit_reader)
+    set_postgres_db(postgres_db)
 
     # Initialize Gitea workspace delivery (graceful if unavailable)
     await gitea_client.ensure_initialized()
@@ -4761,6 +4785,8 @@ async def lifespan(app: FastAPI):
     # Disconnect from databases
     await mongodb.disconnect()
     await vector_db.disconnect()
+    if audit_store is not None:
+        await audit_store.disconnect()
     if audit_db is not None:
         await audit_db.disconnect()
     await postgres_db.disconnect()
@@ -5029,10 +5055,10 @@ async def list_jobs(
                 limit=limit,
             )
 
-        if mongodb.is_available:
+        if audit_reader.is_available:
             for job in jobs:
                 jid = str(job["id"])
-                job["audit_count"] = await mongodb.get_audit_count(jid)
+                job["audit_count"] = await audit_reader.get_audit_count(jid)
         else:
             for job in jobs:
                 job["audit_count"] = None
@@ -5114,8 +5140,8 @@ async def get_job(request: Request, job_id: str) -> dict[str, Any]:
     """Get a single job by ID."""
     _, job = await require_job_access(request, postgres_db, job_id)
     try:
-        if mongodb.is_available:
-            job["audit_count"] = await mongodb.get_audit_count(job_id)
+        if audit_reader.is_available:
+            job["audit_count"] = await audit_reader.get_audit_count(job_id)
         else:
             job["audit_count"] = None
         return _with_cloud_review_mode(_redact_job_config_override(job))
@@ -9574,7 +9600,7 @@ async def get_job_audit(
     """
     await require_job_access(request, postgres_db, job_id)
     effective_size = limit if limit is not None else page_size
-    if not mongodb.is_available:
+    if not audit_reader.is_available:
         return {
             "entries": [],
             "total": 0,
@@ -9587,7 +9613,7 @@ async def get_job_audit(
         }
 
     try:
-        return await mongodb.get_job_audit(
+        return await audit_reader.get_job_audit(
             job_id=job_id,
             page=page,
             page_size=page_size,
@@ -9608,14 +9634,14 @@ async def get_request(request: Request, doc_id: str) -> dict[str, Any]:
     pass; otherwise the embedded `job_id` is run through `require_job_access`.
     Requests without a `job_id` (legacy) are admin-only.
     """
-    if not mongodb.is_available:
+    if not audit_reader.is_available:
         raise HTTPException(
             status_code=503,
             detail="MongoDB not available",
         )
 
     try:
-        llm_doc = await mongodb.get_request(doc_id)
+        llm_doc = await audit_reader.get_request(doc_id)
         if llm_doc is None:
             # Auth before disclosing existence: any approved user may probe.
             await require_approved_user(request, postgres_db)
@@ -9643,11 +9669,11 @@ async def get_audit_time_range(request: Request, job_id: str) -> dict[str, str] 
         Dict with 'start' and 'end' ISO timestamps, or null if no entries/MongoDB unavailable
     """
     await require_job_access(request, postgres_db, job_id)
-    if not mongodb.is_available:
+    if not audit_reader.is_available:
         return None
 
     try:
-        return await mongodb.get_audit_time_range(job_id)
+        return await audit_reader.get_audit_time_range(job_id)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
@@ -9670,7 +9696,7 @@ async def get_job_chat_history(
         pageSize: Number of entries per page (max 200)
     """
     await require_job_access(request, postgres_db, job_id)
-    if not mongodb.is_available:
+    if not audit_reader.is_available:
         return {
             "entries": [],
             "total": 0,
@@ -9681,7 +9707,7 @@ async def get_job_chat_history(
         }
 
     try:
-        return await mongodb.get_chat_history(
+        return await audit_reader.get_chat_history(
             job_id=job_id,
             page=page,
             page_size=page_size,
@@ -10534,7 +10560,7 @@ async def get_job_audit_bulk(
         limit: Maximum entries to return (max 5000)
     """
     await require_job_access(request, postgres_db, job_id)
-    if not mongodb.is_available:
+    if not audit_reader.is_available:
         return {
             "entries": [],
             "total": 0,
@@ -10545,7 +10571,7 @@ async def get_job_audit_bulk(
         }
 
     try:
-        return await mongodb.get_job_audit_bulk(
+        return await audit_reader.get_job_audit_bulk(
             job_id=job_id,
             offset=offset,
             limit=limit,
@@ -10571,7 +10597,7 @@ async def get_job_chat_bulk(
         limit: Maximum entries to return (max 5000)
     """
     await require_job_access(request, postgres_db, job_id)
-    if not mongodb.is_available:
+    if not audit_reader.is_available:
         return {
             "entries": [],
             "total": 0,
@@ -10582,7 +10608,7 @@ async def get_job_chat_bulk(
         }
 
     try:
-        return await mongodb.get_chat_history_bulk(
+        return await audit_reader.get_chat_history_bulk(
             job_id=job_id,
             offset=offset,
             limit=limit,
@@ -10608,7 +10634,7 @@ async def get_job_graph_bulk(
         limit: Maximum deltas to return (max 5000)
     """
     await require_job_access(request, postgres_db, job_id)
-    if not mongodb.is_available:
+    if not audit_reader.is_available:
         return {
             "deltas": [],
             "total": 0,
@@ -10619,7 +10645,7 @@ async def get_job_graph_bulk(
         }
 
     try:
-        return await mongodb.get_graph_deltas_bulk(
+        return await audit_reader.get_graph_deltas_bulk(
             job_id=job_id,
             offset=offset,
             limit=limit,
@@ -10640,11 +10666,11 @@ async def get_job_version(request: Request, job_id: str) -> dict[str, Any] | Non
         Returns null if job has no audit data or MongoDB unavailable
     """
     await require_job_access(request, postgres_db, job_id)
-    if not mongodb.is_available:
+    if not audit_reader.is_available:
         return None
 
     try:
-        return await mongodb.get_job_version(job_id)
+        return await audit_reader.get_job_version(job_id)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
@@ -16033,7 +16059,7 @@ async def get_job_llm_requests(
             carry ``status="error"``).
     """
     await require_job_access(request, postgres_db, job_id)
-    if not mongodb.is_available:
+    if not audit_reader.is_available:
         raise HTTPException(status_code=503, detail="MongoDB not available")
 
     try:
@@ -16042,7 +16068,7 @@ async def get_job_llm_requests(
         raise HTTPException(status_code=400, detail=f"Invalid job_id format: {job_id}")
 
     try:
-        data = await mongodb.list_llm_requests(
+        data = await audit_reader.list_llm_requests(
             job_id,
             limit=limit,
             offset=offset,
@@ -21260,9 +21286,9 @@ async def list_project_jobs(
         has_cloud_folder = bool(project and project.get("main_cloud_folder_handle"))
 
         # Enrich with audit counts
-        if mongodb.is_available:
+        if audit_reader.is_available:
             for job in jobs:
-                job["audit_count"] = await mongodb.get_audit_count(str(job["id"]))
+                job["audit_count"] = await audit_reader.get_audit_count(str(job["id"]))
         else:
             for job in jobs:
                 job["audit_count"] = None

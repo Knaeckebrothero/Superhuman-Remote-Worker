@@ -46,10 +46,10 @@ def _patch_caller_and_db(user: dict, db):
 
 
 def _patch_mongo_unavailable():
-    """Make ``main.mongodb.is_available`` False so list_jobs skips enrichment."""
+    """Make ``main.audit_reader.is_available`` False so list_jobs skips enrichment."""
     fake_mongo = MagicMock()
     fake_mongo.is_available = False
-    return patch("main.mongodb", fake_mongo)
+    return patch("main.audit_reader", fake_mongo)
 
 
 def _scoped(user: dict, scope: str) -> dict:
@@ -340,7 +340,7 @@ class TestGatedReadEndpoints:
 
         with (
             _patch_caller_and_db(user_b, fake_db),
-            patch("main.mongodb", _make_dud("mongodb")),
+            patch("main.audit_reader", _make_dud("mongodb")),
         ):
             with pytest.raises(HTTPException) as exc:
                 await get_job_audit(fake_request, str(job_a["id"]))
@@ -354,7 +354,7 @@ class TestGatedReadEndpoints:
 
         with (
             _patch_caller_and_db(user_b, fake_db),
-            patch("main.mongodb", _make_dud("mongodb")),
+            patch("main.audit_reader", _make_dud("mongodb")),
         ):
             with pytest.raises(HTTPException) as exc:
                 await get_job_llm_requests(fake_request, str(job_a["id"]))
@@ -576,7 +576,7 @@ class TestGatedReadEndpoints:
 
         with (
             _patch_caller_and_db(user_b, fake_db),
-            patch("main.mongodb", _make_dud("mongodb")),
+            patch("main.audit_reader", _make_dud("mongodb")),
         ):
             with pytest.raises(HTTPException) as exc:
                 await get_job_version(fake_request, str(job_a["id"]))
@@ -612,7 +612,7 @@ class TestGatedReadEndpointsHappyPath:
         fake_mongo = MagicMock()
         fake_mongo.is_available = True
         fake_mongo.get_job_audit = AsyncMock(return_value={"entries": [], "total": 0})
-        with _patch_caller_and_db(user_a, fake_db), patch("main.mongodb", fake_mongo):
+        with _patch_caller_and_db(user_a, fake_db), patch("main.audit_reader", fake_mongo):
             await get_job_audit(fake_request, str(job_a["id"]))
         fake_mongo.get_job_audit.assert_awaited_once()
 
