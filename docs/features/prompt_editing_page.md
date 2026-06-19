@@ -278,8 +278,9 @@ preserved here as the eventual target.
 ### Per-expert overrides → expert-creation feature
 
 v1 keys overrides by `(family, kind, name)` only. Per-expert content (personas,
-`research_guide.md`, expert-specific strategic/tactical) is the bulk of the
-prompt surface and belongs to the larger **expert-creation** feature, which
+expert-specific strategic/tactical; note the guides like `research-guide` have since
+migrated to **skills** — [[agent_skills]] — edited via the skills editor, not here) is
+the bulk of the prompt surface and belongs to the larger **expert-creation** feature, which
 extends this one by letting operators *create* experts, not just edit prompts.
 Adding it back means restoring the `expert` column and a second resolution
 layer:
