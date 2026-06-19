@@ -119,8 +119,42 @@ function vmControllerBlock(inputs) {
   ];
 }
 
-// Filled in by later tasks (Secret skeleton, install script):
-function buildSecret() { return ''; }
+// User-supplied secret keys per profile (placeholders unless fillSecrets). The
+// authoritative required set is whatever the chart renders — the drift-gate
+// (generator.drift.test.mjs) fails CI if a referenced key is missing here, so
+// this list is reconciled against the real chart in Task 8.
+const USER_KEYS = {
+  evaluation: ['LLM_API_KEY'],
+  production: ['POSTGRES_PASSWORD', 'VECTOR_DB_PASSWORD', 'MONGODB_PASSWORD',
+               'KC_CLIENT_SECRET', 'GITEA_OIDC_CLIENT_SECRET',
+               'CLOUD_SERVICE_PASSWORD', 'LLM_API_KEY'],
+};
+USER_KEYS['production-vms'] = USER_KEYS.production;
+
+function buildSecret(profile, inputs) {
+  const val = (k) => (inputs.fillSecrets && inputs.secretValues?.[k]) || 'CHANGE_ME';
+  const data = {};
+  // Generated randoms only in operator-owned-Secret modes (not eval/chart-created,
+  // where the chart auto-generates APP_ENCRYPTION_KEY itself).
+  if (profile !== 'evaluation') {
+    data.APP_ENCRYPTION_KEY = randomHex(32);
+    data.SESSION_JWT_SECRET = randomHex(32);
+  }
+  for (const k of USER_KEYS[profile]) data[k] = val(k);
+
+  if (profile === 'evaluation') {
+    const lines = ['# Eval mode: the chart creates the Secret. Add real values to',
+      '# `secrets.values` in values.yaml, or pre-create this Secret. The chart',
+      '# auto-generates APP_ENCRYPTION_KEY when absent.'];
+    for (const [k, v] of Object.entries(data)) lines.push(`#   ${k}: ${v}`);
+    return lines.join('\n') + '\n';
+  }
+  const lines = ['apiVersion: v1', 'kind: Secret', 'metadata:',
+    '  name: srw-secrets', '  namespace: srw', 'type: Opaque', 'stringData:'];
+  for (const [k, v] of Object.entries(data)) lines.push(`  ${k}: ${v}`);
+  return lines.join('\n') + '\n';
+}
+
 function buildInstall() { return ''; }
 
 export { CHART };
