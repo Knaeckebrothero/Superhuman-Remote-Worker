@@ -429,10 +429,12 @@ databases:
   audit:
     enabled: true
     internal: true
-    # -- Active backend for audit reads/writes: "mongodb" (default) or
-    # "postgres". The orchestrator's reader and the agent's writer both honor
-    # it. Flip to "postgres" at cutover (PR7), or per-env via values-local.
-    backend: "mongodb"
+    # -- Active backend for audit reads/writes: "postgres" (default since the
+    # PR7 cutover) or "mongodb" (legacy, pre-cutover fallback). Both the
+    # orchestrator reader and the agent writer honor it; flip back to "mongodb"
+    # per-env via the Fleet overlay / values-local for an emergency rollback
+    # (the Mongo data must still exist — see the pre-wipe backup).
+    backend: "postgres"
     # -- External mode connection parts (credentials live in the Secret).
     externalHost: ""
     externalPort: 5432

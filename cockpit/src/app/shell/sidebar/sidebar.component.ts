@@ -36,15 +36,6 @@ import {LegionMarkComponent} from '../../ui/legion-mark';
         <div class="sidebar-nav">
           <a
             class="nav-link"
-            routerLink="/"
-            routerLinkActive="active"
-            [routerLinkActiveOptions]="{ exact: true }"
-          >
-            <app-icon size="md" class="nav-icon">construction</app-icon>
-            {{ 'nav.builder' | transloco }}
-          </a>
-          <a
-            class="nav-link"
             [routerLink]="sessionsLink()"
             routerLinkActive="active"
           >
