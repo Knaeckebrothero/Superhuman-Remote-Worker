@@ -518,6 +518,13 @@ export class DataService {
    * Fetch all job data from API and cache in IndexedDB.
    */
   private async fetchAndCacheJob(jobId: string): Promise<void> {
+    // Rebuild from scratch: drop any stale rows first. bulkPut only upserts by
+    // primary key, so without this a re-fetch leaves orphaned/duplicate entries
+    // whenever ids change shape — notably the audit-backend cutover, where chat
+    // ids flip from Mongo ObjectId strings to Postgres integers (chat is keyed
+    // by id). clearJob deletes audit/chat/graph rows + metadata by jobId.
+    await this.db.clearJob(jobId);
+
     let totalFetched = 0;
     let hasMore = true;
     let offset = 0;
