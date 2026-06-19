@@ -90,19 +90,19 @@ Instruction files live in the workspace (written at job init, expert-customizabl
 
 **Key design principle: instruction files are auto-injected into the conversation based on trigger conditions, not left for the agent to discover.**
 
-> **Skills (2026-06-18):** the `model_invoked` skills catalog ([[agent_skills]], Slice 2 shipped) is the sibling of this triggered-injection mechanism — the agent loads a `SKILL.md` body via the `use_skill` tool on its **own judgment** (advertised by the Layer-1 menu above), rather than the system auto-injecting it on a trigger. A planned migration (skills Slice 3) folds these instruction files into the single `SKILL.md` artifact while **preserving** their deterministic bindings (`todo_guide`'s tool-gate enforcement, `research_guide`'s phase trigger); until then both coexist.
+> **Skills — Layer 3 documents ARE skills now (Slice 3 shipped, 2026-06-19; [[agent_skills]]).** The two instruction files below have migrated to **bundled skills** (`todo-guide`, `research-guide`). An `instruction_files` entry now takes **either** `file:` (an arbitrary workspace file, as before) **or** `skill:` (a bundled skill, resolved to `skills/<name>/SKILL.md`) — same `trigger`/`enforce` semantics either way. Their deterministic bindings are **preserved**: `todo-guide` keeps the `before_tool:next_phase_todos` tool-gate, `research-guide` the `phase:tactical` injection — and the gate is now satisfied by **either** `read_file` **or** `use_skill` (both record the same path). The `model_invoked` catalog (Slice 2 — the agent loads a `SKILL.md` body on its **own judgment** from the Layer-1 menu) is the *optional-discovery* sibling of these deterministic bindings; a deterministically-bound skill is filtered out of that menu so it is never also offered as optional. Net: Layer 3 is now **one artifact** (`SKILL.md`), with the binding deciding activation.
 
-#### Existing Implementation: `todo_guide.md`
+#### Existing Implementation: the `todo-guide` skill (formerly `todo_guide.md`)
 
-This pattern is already proven in production with the todo guide. It uses **passive injection** — the system doesn't inject content into the conversation directly, but creates conditions that force the agent to inject it into its own context via `read_file`. The content enters the conversation as a normal tool result.
+This pattern is proven in production with the todo guide — since Slice 3 (2026-06-19) the guide is the bundled **`todo-guide` skill**, bound by a `skill:` entry rather than a `file:` one. It uses **passive injection** — the system doesn't inject content directly, but creates conditions that force the agent to inject it into its own context. The content enters the conversation as a normal tool result.
 
 It works at three levels:
 
-1. **File copied to workspace** at job init (`src/agent.py:1099-1104`) — the guide is available as a workspace file
-2. **Strategic todo templates** tell the agent to read it (`strategic_todos_initial.yaml:91`, etc.) — soft guidance
-3. **Tool enforces it** — `next_phase_todos` checks `context.was_recently_read("todo_guide.md")` and rejects the call if the agent hasn't read it (`src/tools/core/todo.py:115-118`) — hard enforcement
+1. **Materialized to the workspace** at job init as `skills/todo-guide/SKILL.md` — for a bound skill the body rides the frozen `instructions` blob (flag-independent of `SKILLS_DB_ENABLED`), written by `_deploy_instruction_files`
+2. **Strategic todo templates** tell the agent to read `skills/todo-guide/SKILL.md` (`config/templates/strategic_todos_initial.yaml`, etc.) — soft guidance
+3. **Tool enforces it** — the `apply_instruction_enforcement` wrapper (`src/tools/registry.py`) checks `context.was_recently_read("skills/todo-guide/SKILL.md")` and rejects `next_phase_todos` until the agent has read it (via `read_file` **or** `use_skill`) — hard enforcement
 
-The enforcement mechanism uses `ToolContext._recent_reads` (a deque of the last 10 `read_file` paths). When the agent calls `read_file`, the path is recorded. When a tool checks `was_recently_read()`, it looks in that deque. The tool gate refuses to execute until the agent has read the guide — so the agent is forced to self-inject the content.
+The enforcement mechanism uses `ToolContext._recent_reads` (a deque of the last 10 read paths). Both `read_file` and `use_skill` call `record_file_read()`, so either satisfies the gate. When a tool checks `was_recently_read()`, it looks in that deque and refuses to execute until the agent has read the guide — so the agent is forced to self-inject the content.
 
 This is the "before tool call" trigger already working: the agent cannot stage todos without first reading the guide.
 
@@ -139,20 +139,20 @@ Instruction file triggers are defined as an array in the expert's config. Each e
 
 ```yaml
 instruction_files:
-  - file: instructions/todo_guide.md
+  - skill: todo-guide                     # bundled skill → skills/todo-guide/SKILL.md
     trigger: before_tool:next_phase_todos
-    enforce: true   # passive: tool rejects if not read
+    enforce: true   # passive: tool rejects until the skill is read (read_file or use_skill)
 
-  - file: instructions/review_guide.md
-    trigger: phase:strategic
-    enforce: false  # active: system injects on phase transition
+  - skill: research-guide                 # scholar: injected on tactical-phase entry
+    trigger: phase:tactical
+    enforce: false  # active: system injects the SKILL.md body on phase transition
 
-  - file: instructions/plan_template.md
+  - file: instructions/plan_template.md   # a literal file still works — file: XOR skill:
     trigger: before_tool:next_phase_todos
     enforce: false  # active: system injects before tool call
 ```
 
-Experts override by providing their own instruction files and/or trigger mappings in their config directory.
+Each entry names **either** a `skill:` (a bundled skill, resolved to `skills/<name>/SKILL.md`) **or** a `file:` (an arbitrary workspace-relative file) — exactly one. Experts override by providing their own `instruction_files` entries (and bundled/authored skills) in their config.
 
 ### Layer 4: Task Files — Deliverables & Reference
 
@@ -208,7 +208,7 @@ The current `instructions.md` (138 lines) mixes six content types. Here's where 
 | Phase alternation model | 14-31 | **Layer 1**: `strategic.txt` / `tactical.txt` | Already existed |
 | Key files and folders | 33-41 | **Layer 1**: `systemprompt.txt` (Memory Model) + workspace template | Already existed |
 | Working principles | 43-71 | **Layer 1**: `systemprompt.txt` (Working Principles + Meta-Cognitive Guardrails) | Already existed |
-| Working with source materials | 73-101 | **Layer 3**: `research_guide.md` (scholar-specific instruction file) | Done — scholar reference |
+| Working with source materials | 73-101 | **Layer 3**: the `research-guide` skill (scholar; was `research_guide.md`) | Done — scholar reference |
 | Delivering results | 103-132 | **Layer 4**: Strategic todos (deliverable tracking in workspace.md + plan.md) | Done — conventions |
 | Task placeholder | 134-137 | **Layer 2**: `task_brief.md` (kickoff message) | Done |
 
@@ -227,7 +227,7 @@ The current `instructions.md` (138 lines) mixes six content types. Here's where 
 | Transient injection mechanism | Done | workspace.md pattern in `workspace_injection.py` |
 | Expert-specific system prompts | **Done** | `persona.txt` per expert, injected via `{expert_identity}` in systemprompt.txt every call |
 | Kickoff message rework | **Done** | `kickoff_message` field in API/UI, `task_brief.md` in workspace, HumanMessage includes task brief |
-| Instruction file trigger system | **Done** | Config-driven triggers via `instruction_files` in config, passive enforcement wrappers, phase injection |
+| Instruction file trigger system | **Done** | Config-driven triggers via `instruction_files`, passive enforcement wrappers, phase injection. **Slice 3 (2026-06-19)** extended entries with a `skill:` form (XOR `file:`, → `skills/<name>/SKILL.md`) and migrated `todo-guide`/`research-guide` to bundled skills ([[agent_skills]]) |
 | Task file conventions | **Done** | Convention-based: `output/` for deliverables, `reference/` for domain material, Deliverables table in workspace.md and plan.md |
 | Content authoring | **Done** | Scholar as reference expert. Default persona written. `research_guide.md` for scholar. `instructions.md` fully mapped to layers. |
 
