@@ -2094,6 +2094,24 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             resolved_instructions = self.config.extra.get("_resolved_instructions", {})
             for entry in self.config.instruction_files:
                 try:
+                    if entry.skill:
+                        # Bound skill: content from the (flag-independent) instructions
+                        # channel, written to skills/<skill>/SKILL.md. The catalog
+                        # materialization path (Slice 2) is filtered out for bound
+                        # skills, so this is the single delivery path.
+                        content = resolved_instructions.get(entry.skill)
+                        if not content:
+                            logger.warning(
+                                f"Bound skill content missing from blob: {entry.skill}"
+                            )
+                            continue
+                        content = render_instruction_content(content, loaded_tool_names)
+                        parent_dir = str(Path(entry.path).parent)
+                        if parent_dir and parent_dir != ".":
+                            self._workspace_manager.backend.mkdir(parent_dir)
+                        self._workspace_manager.write_file(entry.path, content)
+                        logger.debug(f"Deployed bound skill to workspace: {entry.path}")
+                        continue
                     # Skip todo_guide.md — already handled above via matrix
                     if entry.file == "todo_guide.md":
                         continue
