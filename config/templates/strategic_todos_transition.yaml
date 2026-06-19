@@ -123,7 +123,7 @@ todos:
 
       If required deliverables are still missing:
 
-      (1) FIRST invoke the read_file tool on `todo_guide.md` — the next_phase_todos tool
+      (1) FIRST invoke the read_file tool on `skills/todo-guide/SKILL.md` — the next_phase_todos tool
           will reject your call if you haven't read the guide recently.
       (2) Then invoke next_phase_todos to create the next tactical phase.
 

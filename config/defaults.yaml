@@ -164,7 +164,7 @@ tools:
 # enforce: true = passive (tool rejects until agent reads file)
 # enforce: false = active (system injects content as transient message)
 instruction_files:
-  - file: todo_guide.md
+  - skill: todo-guide
     trigger: before_tool:next_phase_todos
     enforce: true
 
