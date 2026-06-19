@@ -26,7 +26,6 @@ import {DatasourceListComponent} from './views/datasources/datasource-list.compo
 import {ExpertsListComponent} from './views/experts/experts-list.component';
 import {JobReviewComponent} from './views/job-review/job-review.component';
 import {WorkspaceBrowserComponent} from './views/workspace-browser/workspace-browser.component';
-import {InstructionBuilderComponent} from './views/instruction-builder/instruction-builder.component';
 import {ProjectListPageComponent} from './views/projects/project-list.component';
 import {MemoryPanelComponent} from './debug/components/memory-panel/memory-panel.component';
 import {InboxPageComponent} from './views/inbox/inbox-page.component';
@@ -348,12 +347,6 @@ export class App implements OnInit {
       type: 'workspace-browser',
       displayName: 'Workspace Browser',
       component: WorkspaceBrowserComponent,
-    });
-
-    this.registry.register({
-      type: 'instruction-builder',
-      displayName: 'Instruction Builder',
-      component: InstructionBuilderComponent,
     });
 
     this.registry.register({

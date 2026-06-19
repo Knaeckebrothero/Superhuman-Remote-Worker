@@ -1,7 +1,6 @@
 import {Routes} from '@angular/router';
 import {SettingsComponent} from './views/settings/settings.component';
 import {ApiKeysPageComponent} from './views/settings/api-keys/api-keys-page.component';
-import {ShellPageComponent} from './views/shell/shell.component';
 import {JobsPageComponent} from './views/jobs/jobs-page.component';
 import {JobReviewPageComponent} from './views/job-review/job-review-page.component';
 import {CreatePageComponent} from './views/create/create-page.component';
@@ -28,7 +27,9 @@ import {adminGuard} from './core/guards/admin.guard';
 import {projectAccessGuard} from './core/guards/project-access.guard';
 
 export const routes: Routes = [
-  { path: '', component: ShellPageComponent, canActivate: [authGuard] },
+  // Builder removed (see docs/features/builder_to_sessions_consolidation.md).
+  // Sessions is the primary surface; root redirects there.
+  { path: '', redirectTo: 'sessions', pathMatch: 'full' },
     {path: 'sessions', component: SessionsPageComponent, canActivate: [authGuard]},
     {path: 'sessions/new', component: SessionCreateComponent, canActivate: [authGuard]},
     {path: 'sessions/:threadId', component: ChatPageComponent, canActivate: [authGuard]},
