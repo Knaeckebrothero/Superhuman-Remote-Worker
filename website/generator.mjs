@@ -178,6 +178,7 @@ const USER_KEYS = {
   evaluation: [],
   production: ['POSTGRES_USER', 'POSTGRES_PASSWORD',
                'VECTOR_POSTGRES_USER', 'VECTOR_POSTGRES_PASSWORD',
+               'AUDIT_POSTGRES_USER', 'AUDIT_POSTGRES_PASSWORD',
                'KC_CLIENT_SECRET', 'GITEA_ADMIN_USER', 'GITEA_ADMIN_PASSWORD'],
 };
 USER_KEYS['production-vms'] = USER_KEYS.production;
