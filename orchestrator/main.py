@@ -101,6 +101,7 @@ from database import (  # noqa: E402
     ALLOWED_TABLES,
     FilterCategory,
     MIGRATIONS_VECTOR_DIR,
+    MIGRATIONS_AUDIT_DIR,
 )
 from security.auth import (  # noqa: E402
     get_current_user,
@@ -143,6 +144,9 @@ from auth import bff_router  # noqa: E402
 from routers import automations_router  # noqa: E402
 from routers.sessions import router as sessions_router  # noqa: E402
 from services.cron_dispatcher import cron_dispatcher_loop  # noqa: E402
+from services.audit_partitions import (  # noqa: E402
+    maintenance_loop as audit_maintenance_loop,
+)
 from services.workspace import workspace_service  # noqa: E402
 from services.gitea import GiteaClient  # noqa: E402
 from services.keycloak_admin import KeycloakGroupSync  # noqa: E402
@@ -269,6 +273,20 @@ if not _vector_url:
 vector_db = PostgresDB(
     connection_string=_vector_url,
     migrations_dir=MIGRATIONS_VECTOR_DIR,
+)
+
+# Audit DB — observability-tier instance that replaces the MongoDB collections
+# (llm_requests / agent_audit / chat_history). Unlike the vector DB this is
+# NON-load-bearing: when its credentials are absent (AUDIT_POSTGRES_* unset /
+# databases.audit.enabled=false) the orchestrator runs without it — no
+# migrations, no partition maintenance — exactly as it tolerates MongoDB being
+# unavailable. Stood up behind the AUDIT_BACKEND flag; nothing reads or writes
+# it until the writer/reader land (PR 2/3). Hence: skip silently, never raise.
+_audit_url = _build_pg_url("AUDIT_POSTGRES", fallback_env="AUDIT_DB_URL")
+audit_db = (
+    PostgresDB(connection_string=_audit_url, migrations_dir=MIGRATIONS_AUDIT_DIR)
+    if _audit_url
+    else None
 )
 
 # Session router singletons — see docs/features/direct_session_websockets.md
@@ -4328,6 +4346,25 @@ async def lifespan(app: FastAPI):
     await vector_db.connect()
     await mongodb.connect()
 
+    # Audit DB is the non-load-bearing observability tier: a connect failure
+    # must NOT abort startup (unlike the control-plane + vector DBs above).
+    # Log loudly, then degrade — product flow survives the audit store's outage.
+    audit_ready = False
+    if audit_db is None:
+        logger.info(
+            "Audit DB disabled (AUDIT_POSTGRES_* unset) — Postgres audit store "
+            "inactive; archiving continues via MongoDB / no-op."
+        )
+    else:
+        try:
+            await audit_db.connect()
+            audit_ready = True
+        except Exception:
+            logger.exception(
+                "Audit DB connect failed — continuing without the audit store. "
+                "Check AUDIT_POSTGRES_* and the srw-auditdb server."
+            )
+
     # Reassert MongoDB index declarations on every startup. Idempotent —
     # existing identical indexes are a silent no-op. Closes the gap that
     # produced the 2026-05-12 outage where the standalone init.py CLI was
@@ -4342,6 +4379,15 @@ async def lifespan(app: FastAPI):
     # docs/db_migration.md §Operational runbook for repair steps).
     await postgres_db.apply_migrations()
     await vector_db.apply_migrations()
+    if audit_db is not None and audit_ready:
+        try:
+            await audit_db.apply_migrations()
+        except Exception:
+            logger.exception(
+                "Audit DB migrations failed — disabling audit store for this "
+                "process (non-load-bearing)."
+            )
+            audit_ready = False
     logger.info("Database migrations applied")
 
     # Encrypt any legacy plaintext datasource credentials. Idempotent — once
@@ -4615,6 +4661,16 @@ async def lifespan(app: FastAPI):
         )
     )
 
+    # Audit-store partition maintenance (creation + ANALYZE + lookahead alarms;
+    # retention deferred — see services/audit_partitions.py). Only when the
+    # audit DB is configured; otherwise the store is inactive and there is
+    # nothing to maintain.
+    audit_maintenance_task = (
+        asyncio.create_task(audit_maintenance_loop(audit_db.pool, _shutdown_event))
+        if (audit_db is not None and audit_ready)
+        else None
+    )
+
     # Unified instance lifecycle reconciler (drift-based draining and,
     # in future phases, crash recovery + cross-kind primitives). Runs
     # peer to agent_pool_reconciler — pool owns capacity, lifecycle
@@ -4688,6 +4744,8 @@ async def lifespan(app: FastAPI):
     await lifecycle_reconciler_task
     await main_cloud_listen_task
     await automation_cron_task
+    if audit_maintenance_task is not None:
+        await audit_maintenance_task
 
     # Cleanup clients
     await nats_bridge.disconnect()
@@ -4703,6 +4761,8 @@ async def lifespan(app: FastAPI):
     # Disconnect from databases
     await mongodb.disconnect()
     await vector_db.disconnect()
+    if audit_db is not None:
+        await audit_db.disconnect()
     await postgres_db.disconnect()
 
 
