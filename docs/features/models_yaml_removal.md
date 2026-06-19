@@ -121,7 +121,6 @@ default:
     strategic_todos_transition: strategic_todos_transition.yaml
     strategic_todos_resume: strategic_todos_resume.yaml
     workspace_template: workspace_template.md
-    todo_guide: todo_guide.md
   settings:
     temperature: 0.0
     multimodal: false
@@ -154,7 +153,6 @@ gpt-oss:
     # … rest of gpt-oss prompts
   instructions:
     instructions: instructions_gpt_oss.md
-    todo_guide: todo_guide_gpt_oss.md
     strategic_todos_transition: strategic_todos_transition_gpt_oss.yaml
   settings:
     temperature: 1.0
