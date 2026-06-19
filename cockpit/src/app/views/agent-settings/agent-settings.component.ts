@@ -105,7 +105,6 @@ type AgentSettingsTab = 'settings' | 'instructions' | 'advanced' | 'resolved';
             <app-instructions-tab
               [disabled]="disabled()"
               [loadingExpert]="loadingExpert()"
-              [streaming]="streaming()"
               (contentChange)="onInstructionsChange($event)"
             />
           </div>
@@ -208,8 +207,6 @@ export class AgentSettingsComponent {
   loadingDatasources = input(false);
   /** Expert detail loading state. */
   loadingExpert = input(false);
-  /** Builder AI streaming state. */
-  streaming = input(false);
 
   /** Emitted whenever any setting changes. */
   change = output<void>();

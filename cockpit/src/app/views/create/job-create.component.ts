@@ -91,7 +91,7 @@ import {AppTooltipDirective} from '../../ui/tooltip';
               [required]="true"
               [rows]="6"
               [placeholder]="'jobs.create.descriptionPlaceholder' | transloco"
-              [disabled]="isSubmitting() || artifacts.streaming()"
+              [disabled]="isSubmitting()"
             />
           </app-form-field>
 
@@ -102,7 +102,7 @@ import {AppTooltipDirective} from '../../ui/tooltip';
               (valueChange)="kickoffMessage = $event"
               [rows]="3"
               [placeholder]="'jobs.create.kickoffPlaceholder' | transloco"
-              [disabled]="isSubmitting() || artifacts.streaming()"
+              [disabled]="isSubmitting()"
             />
           </app-form-field>
 
@@ -269,14 +269,13 @@ import {AppTooltipDirective} from '../../ui/tooltip';
           <app-agent-settings
             mode="job"
             [config]="expertDetail()?.config ?? frameworkDefaults() ?? {}"
-            [disabled]="isSubmitting() || artifacts.streaming()"
+            [disabled]="isSubmitting()"
             [showProjectMemory]="projectHasSharedMemory()"
             [defaultsTools]="expertDetail()?.defaults_tools ?? {}"
             [settingsMatrix]="expertDetail()?.settings_matrix ?? frameworkSettingsMatrix()"
             [datasources]="availableDatasources()"
             [loadingDatasources]="isLoadingDatasources()"
             [loadingExpert]="isLoadingExpertDetail()"
-            [streaming]="artifacts.streaming()"
             (instructionsChange)="onInstructionsChange($event)"
           />
 
@@ -294,7 +293,7 @@ import {AppTooltipDirective} from '../../ui/tooltip';
               type="submit"
               variant="primary"
               [loading]="isSubmitting() || isUploading()"
-              [disabled]="!formData.description || artifacts.streaming()"
+              [disabled]="!formData.description"
             >
               @if (isSubmitting()) {
                 {{ 'jobs.create.creating' | transloco }}
@@ -1094,7 +1093,9 @@ export class JobCreateComponent implements OnInit {
   @ViewChild(AgentSettingsComponent) agentSettings!: AgentSettingsComponent;
 
   constructor() {
-    // Sync builder AI → settings component
+    // Mirror artifact form-state (expert prefill / user edits) into the
+    // settings component. The description effect below also writes back
+    // formData.description, so it is load-bearing for the manual form.
     effect(() => {
       const instructions = this.artifacts.instructions();
       if (instructions !== null) {
@@ -1245,15 +1246,11 @@ export class JobCreateComponent implements OnInit {
   }
 
   onDescriptionEdit(value: string): void {
-    if (!this.artifacts.streaming()) {
-      this.artifacts.description.set(value || null);
-    }
+    this.artifacts.description.set(value || null);
   }
 
   onInstructionsChange(value: string | null): void {
-    if (!this.artifacts.streaming()) {
-      this.artifacts.instructions.set(value);
-    }
+    this.artifacts.instructions.set(value);
   }
 
   private loadDatasources(): void {
@@ -1377,9 +1374,6 @@ export class JobCreateComponent implements OnInit {
 
     const dsIds = this.agentSettings?.getSelectedDatasourceIds() ?? [];
     if (dsIds.length > 0) request.datasource_ids = dsIds;
-
-    const builderSessionId = this.artifacts.sessionId();
-    if (builderSessionId) request.builder_session_id = builderSessionId;
 
     const projectId = this.selectedProjectId();
     if (projectId) request.project_id = projectId;

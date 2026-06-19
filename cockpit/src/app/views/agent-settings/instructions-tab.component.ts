@@ -1,17 +1,16 @@
 import {Component, computed, input, output, signal} from '@angular/core';
 import {FormsModule} from '@angular/forms';
-import {AppIconComponent} from '../../ui/icon';
 import {AppSpinnerComponent} from '../../ui/spinner';
 
 /**
  * Instructions tab: full-height markdown textarea with clear and reset actions.
- * Used only in job creation mode. Exposes instructionsContent for parent wiring
- * to the JobArtifactService (builder AI streaming).
+ * Used only in job creation mode. Emits content changes via contentChange for
+ * the parent (job-create) to mirror into the JobArtifactService form state.
  */
 @Component({
   selector: 'app-instructions-tab',
   standalone: true,
-  imports: [FormsModule, AppIconComponent, AppSpinnerComponent],
+  imports: [FormsModule, AppSpinnerComponent],
   template: `
     <div class="instructions-container">
       <div class="instructions-header">
@@ -27,15 +26,8 @@ import {AppSpinnerComponent} from '../../ui/spinner';
         (ngModelChange)="onEdit($event)"
         rows="16"
         placeholder="Select an expert to pre-fill instructions, or type custom instructions..."
-        [disabled]="disabled() || loadingExpert() || streaming()"
+        [disabled]="disabled() || loadingExpert()"
       ></textarea>
-
-      @if (streaming()) {
-        <span class="streaming-hint">
-          <app-spinner size="sm" />
-          AI is editing instructions...
-        </span>
-      }
 
       <div class="instructions-actions">
         @if (content()) {
@@ -54,11 +46,6 @@ import {AppSpinnerComponent} from '../../ui/spinner';
             [disabled]="disabled() || loadingExpert()"
           >Reset to expert default</button>
         }
-      </div>
-
-      <div class="instructions-hint">
-        <app-icon size="xs" class="hint-icon">info</app-icon>
-        Builder AI can edit instructions via the job builder chat.
       </div>
     </div>
   `,
@@ -104,13 +91,6 @@ import {AppSpinnerComponent} from '../../ui/spinner';
     .instructions-editor::placeholder {
       color: var(--text-muted, #6c7086);
     }
-    .streaming-hint {
-      display: flex;
-      align-items: center;
-      gap: 6px;
-      font-size: 12px;
-      color: var(--accent-color, var(--accent-color));
-    }
     .instructions-actions {
       display: flex;
       gap: 12px;
@@ -132,20 +112,11 @@ import {AppSpinnerComponent} from '../../ui/spinner';
       opacity: 0.5;
       cursor: not-allowed;
     }
-    .instructions-hint {
-      display: flex;
-      align-items: center;
-      gap: 6px;
-      font-size: 11px;
-      color: var(--text-muted, #6c7086);
-      padding: 6px 0;
-    }
   `],
 })
 export class InstructionsTabComponent {
   disabled = input(false);
   loadingExpert = input(false);
-  streaming = input(false);
 
   contentChange = output<string | null>();
 
@@ -183,7 +154,7 @@ export class InstructionsTabComponent {
     this.contentChange.emit(instructions);
   }
 
-  /** Called by parent to update content from external source (builder AI). */
+  /** Called by parent to set content from an external source (e.g. expert prefill). */
   setContent(value: string | null): void {
     this.content.set(value);
   }
