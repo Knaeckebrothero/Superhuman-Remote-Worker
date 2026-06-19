@@ -20,7 +20,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-# Same path-setup pattern as test_create_builder_llm.py.
+# Add orchestrator/ to sys.path so its top-level modules import bare.
 _ORCH = Path(__file__).parent.parent / "orchestrator"
 if str(_ORCH) not in sys.path:
     sys.path.insert(0, str(_ORCH))
