@@ -38,6 +38,7 @@ from .postgres import (
     SCHEMA_FILE,
     MIGRATIONS_APP_DIR,
     MIGRATIONS_VECTOR_DIR,
+    MIGRATIONS_AUDIT_DIR,
     REQUIRED_TABLES,
 )
 from .mongodb import MongoDB, FILTER_MAPPINGS, FilterCategory
@@ -50,6 +51,7 @@ __all__ = [
     "SCHEMA_FILE",
     "MIGRATIONS_APP_DIR",
     "MIGRATIONS_VECTOR_DIR",
+    "MIGRATIONS_AUDIT_DIR",
     "REQUIRED_TABLES",
     # MongoDB
     "MongoDB",

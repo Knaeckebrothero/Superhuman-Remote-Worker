@@ -168,6 +168,7 @@ SCHEMA_FILE = Path(__file__).parent / "schema.sql"
 # wire each instance to its own subdir.
 MIGRATIONS_APP_DIR = Path(__file__).parent / "migrations" / "app"
 MIGRATIONS_VECTOR_DIR = Path(__file__).parent / "migrations" / "vector"
+MIGRATIONS_AUDIT_DIR = Path(__file__).parent / "migrations" / "audit"
 
 # Tables exposed to the cockpit
 ALLOWED_TABLES = frozenset(
@@ -503,6 +504,17 @@ class PostgresDB:
     def is_connected(self) -> bool:
         """Check if connected to database."""
         return self._pool is not None
+
+    @property
+    def pool(self) -> Optional[asyncpg.Pool]:
+        """The underlying asyncpg pool (``None`` until ``connect()``).
+
+        Exposed for background tasks that need the raw pool rather than the
+        higher-level helpers — e.g. the audit partition-maintenance loop,
+        which acquires its own connections for DDL (ATTACH/DETACH/ANALYZE)
+        and catalog introspection.
+        """
+        return self._pool
 
     # =========================================================================
     # TABLE OPERATIONS
