@@ -4,6 +4,8 @@
 **Status:** Open. Six independent issues; #1 and #2 affect every visitor on the live page now. #3–#7 are polish.
 **Component:** Source of truth `index.html` (SRW repo root). Deployed copy in `HomeLab/deployments_managed/srw-sales-page/10-deployment.yaml` (the `srw-sales-page-content` ConfigMap, inlined HTML at `data.index.html`). Live at https://superhuman-remote-worker.com/.
 
+> **Update (2026-06-19):** source moved to `website/index.html`; the page now ships as a CI-built nginx image (`ghcr.io/knaeckebrothero/superhuman-remote-worker-website`) rather than an inlined ConfigMap. The "re-indent into the ConfigMap" instructions below are retired — see `docs/superpowers/specs/2026-06-18-helm-config-generator-design.md` §13.
+
 ## Summary
 
 End-to-end review of the live landing page after the 2026-05-26 redesign (`c40f468`), favicon add (`62a0034`), and scale-diagram label fix (`ea41619`). The page reads well, copy is consistent with the actual product (config names, citation language, license model), and the visual structure works at desktop widths. But every conversion path on the page is a dead link, the social card is empty, and the mobile nav hides the very link a sales page most wants visible.
