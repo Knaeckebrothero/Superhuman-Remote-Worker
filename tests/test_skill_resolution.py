@@ -57,9 +57,7 @@ def test_menu_is_sorted_by_name_deterministic():
 
 
 def test_files_to_workspace_prefixes_skill_dir():
-    out = skill_files_to_workspace(
-        {"hello": {"SKILL.md": "x", "references/g.md": "y"}}
-    )
+    out = skill_files_to_workspace({"hello": {"SKILL.md": "x", "references/g.md": "y"}})
     assert out == {
         "skills/hello/SKILL.md": "x",
         "skills/hello/references/g.md": "y",
@@ -102,6 +100,11 @@ def test_filter_removes_bound_skill_from_menu_and_files():
 
 def test_filter_noop_without_skills_or_bindings():
     assert filter_bound_skills({"agent": {}}) == {"agent": {}}
-    blob = {"agent": {"instruction_files": []}, "skills": {"menu": [{"name": "a"}], "files": {}}}
+    blob = {
+        "agent": {"instruction_files": []},
+        "skills": {"menu": [{"name": "a"}], "files": {}},
+    }
     filter_bound_skills(blob)
-    assert [m["name"] for m in blob["skills"]["menu"]] == ["a"]  # nothing bound → unchanged
+    assert [m["name"] for m in blob["skills"]["menu"]] == [
+        "a"
+    ]  # nothing bound → unchanged
