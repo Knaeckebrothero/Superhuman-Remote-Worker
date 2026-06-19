@@ -43,3 +43,30 @@ def skill_files_to_workspace(
         for rel_path, content in files.items():
             out[f"skills/{name}/{rel_path}"] = content
     return out
+
+
+def filter_bound_skills(blob: dict[str, Any]) -> dict[str, Any]:
+    """Remove skills delivered via deterministic bindings (instruction_files
+    ``skill:`` entries) from the model-invoked catalog (menu + files).
+
+    Bound skills are materialized through the flag-independent instructions
+    channel (serialize / _deploy_instruction_files), so they must not also be
+    offered as optional ``use_skill`` entries. Mutates ``blob`` in place and
+    returns it; no-op when there is no skills payload or no bound skills.
+    Slice 3.
+    """
+    skills = blob.get("skills")
+    if not skills:
+        return blob
+    bound = {
+        e.get("skill")
+        for e in (blob.get("agent", {}).get("instruction_files") or [])
+        if e.get("skill")
+    }
+    if not bound:
+        return blob
+    if skills.get("menu"):
+        skills["menu"] = [m for m in skills["menu"] if m.get("name") not in bound]
+    if skills.get("files"):
+        skills["files"] = {n: f for n, f in skills["files"].items() if n not in bound}
+    return blob
