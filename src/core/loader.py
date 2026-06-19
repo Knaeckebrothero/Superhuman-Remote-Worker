@@ -973,22 +973,43 @@ class InstructionMatrixResolver(MatrixResolver):
 
 @dataclass
 class InstructionFileEntry:
-    """An instruction file with trigger conditions for auto-injection.
+    """An instruction file (or bound skill) with a trigger condition.
 
-    Defines when and how an instruction file is delivered to the agent.
+    Defines when and how a Layer-3 artifact is delivered to the agent. The
+    artifact is either a literal instruction ``file`` (workspace-relative path)
+    OR a bundled ``skill`` (resolved to ``skills/<skill>/SKILL.md``) — exactly
+    one. See docs/features/agent_skills.md (Slice 3).
 
     Attributes:
-        file: Workspace-relative path (e.g., "todo_guide.md")
         trigger: Trigger condition string:
             - "before_tool:<tool_name>" — fires when the named tool is called
             - "phase:strategic" / "phase:tactical" — fires on phase transition
-        enforce: If True, tool rejects until agent reads the file (passive).
+        file: Workspace-relative path (e.g. "todo_guide.md"). XOR ``skill``.
+        skill: Bundled skill name (e.g. "research-guide"). XOR ``file``;
+               resolves to ``skills/<skill>/SKILL.md`` via ``path``.
+        enforce: If True, tool rejects until agent reads the artifact (passive).
                  If False, system injects content automatically (active).
     """
 
-    file: str
     trigger: str
+    file: Optional[str] = None
+    skill: Optional[str] = None
     enforce: bool = True
+
+    def __post_init__(self) -> None:
+        if bool(self.file) == bool(self.skill):
+            raise ValueError(
+                "InstructionFileEntry requires exactly one of 'file' or 'skill' "
+                f"(got file={self.file!r}, skill={self.skill!r})"
+            )
+
+    @property
+    def path(self) -> str:
+        """The workspace path this binding resolves to: a skill's SKILL.md when
+        bound to a skill, else the literal instruction-file path."""
+        if self.skill:
+            return f"skills/{self.skill}/SKILL.md"
+        return self.file or ""
 
     @property
     def trigger_type(self) -> str:
@@ -1943,8 +1964,9 @@ def load_agent_config(
     instruction_files_data = data.get("instruction_files", [])
     instruction_files = [
         InstructionFileEntry(
-            file=entry["file"],
             trigger=entry["trigger"],
+            file=entry.get("file"),
+            skill=entry.get("skill"),
             enforce=entry.get("enforce", True),
         )
         for entry in instruction_files_data
@@ -2145,8 +2167,9 @@ def load_agent_config_from_dict(
     instruction_files_data = data.get("instruction_files", [])
     instruction_files = [
         InstructionFileEntry(
-            file=entry["file"],
             trigger=entry["trigger"],
+            file=entry.get("file"),
+            skill=entry.get("skill"),
             enforce=entry.get("enforce", True),
         )
         for entry in instruction_files_data
