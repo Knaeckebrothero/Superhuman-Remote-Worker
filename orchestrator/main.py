@@ -1038,6 +1038,11 @@ async def _resolve_session_config(
             capture=_cap,
             skills=_skills_payload,
         )
+        # Bound skills are delivered deterministically (instructions channel);
+        # strip them from the model-invoked catalog so they aren't double-offered.
+        from src.core.skill_resolution import filter_bound_skills
+
+        filter_bound_skills(resolved)
         # Session dispatch PEP (decision 9): the merged config — including
         # interactive.permission_mode and any persistent_agent keys baked into
         # config_override — must fit the runner's grants. GrantDenied escapes the
@@ -1609,6 +1614,11 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
                     capture=_cap,
                     skills=_skills_payload,
                 )
+                # Bound skills are delivered deterministically (instructions channel);
+                # strip them from the model-invoked catalog so they aren't double-offered.
+                from src.core.skill_resolution import filter_bound_skills
+
+                filter_bound_skills(_resolved)
                 # Dispatch PEP (decision 9): the merged config must fit the runner's
                 # grants. GrantDenied is caught BELOW the generic fallback so a denial
                 # is never downgraded to the unchecked config_override (fail closed).
