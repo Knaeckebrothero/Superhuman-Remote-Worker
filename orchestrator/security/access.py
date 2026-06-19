@@ -567,49 +567,6 @@ async def require_thread_owner(
     return user, thread
 
 
-async def require_builder_session_owner(
-    request: Request,
-    db,
-    session_id: str,
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Require caller to own the builder session. Returns ``(user, session)``.
-
-    Builder sessions are personal scratch space — there's no project
-    sharing. Admins bypass. A ``project:<uuid>``-scoped MCP token is
-    refused since the session has no project to bind to. Raises 404 if
-    the session doesn't exist, 403 if owned by someone else. Orphan
-    sessions (``user_id IS NULL``) are admin-only — fail closed.
-    """
-    user = await require_approved_user(request, db)
-    session = await db.get_builder_session(session_id)
-    if not session:
-        raise HTTPException(
-            status_code=404, detail=f"Builder session '{session_id}' not found"
-        )
-    if not _scope_permits_personal(user):
-        raise await _denied(
-            request,
-            db,
-            user,
-            resource_type="builder_session",
-            resource_id=session_id,
-            detail="Access denied by MCP token scope",
-        )
-    if user.get("is_admin"):
-        return user, session
-    owner_id = session.get("user_id")
-    if owner_id and str(owner_id) == str(user["id"]):
-        return user, session
-    raise await _denied(
-        request,
-        db,
-        user,
-        resource_type="builder_session",
-        resource_id=session_id,
-        detail="Not authorized to access this builder session",
-    )
-
-
 # =============================================================================
 # Specialized helpers — multi-table or service-backed
 # =============================================================================
