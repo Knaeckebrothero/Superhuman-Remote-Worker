@@ -140,3 +140,32 @@ def test_serialize_freezes_bound_skill_md(tmp_path):
     assert "hello-skill" in blob["instructions"]
     assert "Hello Skill" in blob["instructions"]["hello-skill"]
     assert "SKILL" not in blob["instructions"]  # no stem collision
+
+
+# ---------------------------------------------------------------------------
+# Task 5: research_guide migrated to a bundled skill (phase:tactical binding)
+# ---------------------------------------------------------------------------
+
+from pathlib import Path as _P  # noqa: E402
+
+from src.core.skill_format import parse_skill_md, skill_identity  # noqa: E402
+
+
+def test_research_guide_skill_exists_and_parses():
+    md = (_P("config/skills/research-guide/SKILL.md")).read_text(encoding="utf-8")
+    fm, body = parse_skill_md(md)
+    name, _desc = skill_identity(fm)
+    assert name == "research-guide"
+    assert "Research Workflow" in body  # the migrated body survived
+
+
+def test_scholar_binds_research_guide_as_skill():
+    import yaml
+
+    cfg = yaml.safe_load(_P("config/experts/scholar/config.yaml").read_text())
+    entries = cfg["instruction_files"]
+    research = [e for e in entries if e.get("skill") == "research-guide"]
+    assert len(research) == 1
+    assert research[0]["trigger"] == "phase:tactical"
+    assert research[0]["enforce"] is False
+    assert not any(e.get("file") == "research_guide.md" for e in entries)  # old ref gone

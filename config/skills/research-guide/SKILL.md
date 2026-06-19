@@ -1,3 +1,14 @@
+---
+name: research-guide
+description: Use during a tactical research or exploration phase — methodology for framing a question, searching broadly, citing every claim, and persisting findings.
+display_name: Research Guide
+icon: science
+color: "#f9e2af"
+tags:
+  - research
+  - methodology
+---
+
 # Research Guide
 
 You are entering a tactical phase. This guide covers research methodology for your exploration work.
