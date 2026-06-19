@@ -166,3 +166,17 @@ Tone: confident, technical, zero marketing fluff. No "unlock the power of," no "
 
 Output: show me an ASCII wireframe + an estimated gzipped byte budget per section first. I'll approve before you write any HTML.
 ```
+
+## How it's actually deployed (2026-06)
+
+The marketing surface — this sales page plus the self-host **config generator** —
+lives in the SRW repo under `website/` and ships as a single nginx container
+image. Not the Cloudflare Pages option sketched above, and no longer an inlined
+ConfigMap.
+
+- **Source:** `website/index.html` (sales page), `website/configure.html` + `website/generator.mjs` (the Helm config generator).
+- **Image:** `docker/Dockerfile.website` → CI job `build-website` → `ghcr.io/knaeckebrothero/superhuman-remote-worker-website:latest` (+ `:sha-…`), published on push to `develop`, gated on the `generator-test` drift-gate.
+- **Deploy:** `HomeLab/deployments_managed/srw-sales-page/` runs the image (`imagePullPolicy: Always`); Traefik ingress on `superhuman-remote-worker.com`.
+- **Publish a change:** edit `website/*` → push `develop` (CI rebuilds `:latest`) → `kubectl rollout restart deploy/srw-sales-page -n srw-sales-page`. One-time: set the GHCR package **public** after the first push.
+
+Full design + rationale: `docs/superpowers/specs/2026-06-18-helm-config-generator-design.md`.
