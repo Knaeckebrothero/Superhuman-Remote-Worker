@@ -36,7 +36,7 @@ instruction_files:
   - file: todo_guide.md
     trigger: before_tool:next_phase_todos
     enforce: true
-  - file: research_guide.md
+  - skill: research-guide
     trigger: phase:tactical
     enforce: false  # Active: injected automatically at tactical phase start
 
@@ -84,8 +84,8 @@ tools:
   # SQL injected when system datasource attached (for reading job data, test results)
   sql: []
   # Citations: a research agent must back every factual claim with a source.
-  # research_guide.md (tactical phase) instructs cite_web / cite_document, so the
-  # tools must exist. Mirrors defaults.yaml's citation suite.
+  # the research-guide skill (tactical phase) instructs cite_web / cite_document,
+  # so the tools must exist. Mirrors defaults.yaml's citation suite.
   citation:
     - cite_document
     - cite_web
