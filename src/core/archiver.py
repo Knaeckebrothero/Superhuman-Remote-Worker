@@ -41,7 +41,7 @@ import logging
 import os
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence
 
 from langchain_core.messages import (
     AIMessage,
@@ -52,6 +52,9 @@ from langchain_core.messages import (
 )
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from src.database.audit_writer import SyncAuditWriter
 
 
 def _serialize_for_mongo(obj: Any) -> Any:
@@ -67,6 +70,35 @@ def _serialize_for_mongo(obj: Any) -> Any:
     elif isinstance(obj, (list, tuple)):
         return [_serialize_for_mongo(item) for item in obj]
     return obj
+
+
+def _serialize_payload(obj: Any) -> Any:
+    """Serialize objects for JSONB storage in the Postgres audit store.
+
+    Like :func:`_serialize_for_mongo` (UUID -> str) but also converts
+    ``datetime`` -> UTC ISO-8601 string with a ``Z`` suffix (microsecond
+    precision, matching the wire output the Mongo path produced), since JSONB
+    has no native datetime type.
+    """
+    if isinstance(obj, uuid.UUID):
+        return str(obj)
+    if isinstance(obj, datetime):
+        dt = (
+            obj.astimezone(timezone.utc)
+            if obj.tzinfo
+            else obj.replace(tzinfo=timezone.utc)
+        )
+        return dt.isoformat().replace("+00:00", "Z")
+    if isinstance(obj, dict):
+        return {k: _serialize_payload(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_serialize_payload(item) for item in obj]
+    return obj
+
+
+def _iso_utc_now() -> str:
+    """Current UTC time as an ISO-8601 'Z' string (for JSONB ``completed_at``)."""
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def _normalize_content(content) -> str:
@@ -171,27 +203,31 @@ class LLMArchiver:
 
     def __init__(
         self,
-        mongodb_url: str,
+        mongodb_url: Optional[str] = None,
         database_name: str = "srw_logs",
         collection_name: str = "llm_requests",
         audit_collection_name: str = "agent_audit",
+        writer: Optional["SyncAuditWriter"] = None,
     ):
         """Initialize the archiver.
 
         Args:
-            mongodb_url: MongoDB connection string
-            database_name: Database name
-            collection_name: Collection for LLM requests
-            audit_collection_name: Collection for agent audit trail
+            mongodb_url: MongoDB connection string (Mongo backend only)
+            database_name: Database name (Mongo backend only)
+            collection_name: Collection for LLM requests (Mongo backend only)
+            audit_collection_name: Collection for agent audit trail (Mongo only)
+            writer: A :class:`SyncAuditWriter` selects the Postgres backend; when
+                set, the Mongo fields are unused and pymongo is never imported.
         """
-        # Import here to avoid circular imports
-        from src.database.mongo_db import MongoDB
+        self._is_postgres = writer is not None
+        self._writer = writer
 
+        # Mongo state (unused in Postgres mode).
         self._mongodb_url = mongodb_url
         self._database_name = database_name
         self._collection_name = collection_name
         self._audit_collection_name = audit_collection_name
-        self._mongo_db = MongoDB(url=mongodb_url) if mongodb_url else None
+        self._mongo_db = None
         self._collection = None
         self._audit_collection = None
         self._chat_history_collection = None
@@ -199,13 +235,40 @@ class LLMArchiver:
         self._connection_attempted = False
         self._step_counters: Dict[str, int] = {}  # Per-job step counters
 
+        if not self._is_postgres:
+            # Import here to avoid circular imports (and to skip pymongo entirely
+            # on the Postgres path).
+            from src.database.mongo_db import MongoDB
+
+            self._mongo_db = MongoDB(url=mongodb_url) if mongodb_url else None
+
     @classmethod
     def from_env(cls) -> Optional["LLMArchiver"]:
         """Create archiver from environment variables.
 
-        Returns:
-            LLMArchiver instance if MONGODB_URL is set, None otherwise.
+        ``AUDIT_BACKEND`` (default ``mongodb``) selects the backend:
+        - ``postgres`` -> :class:`SyncAuditWriter` gated on ``AUDIT_POSTGRES_*``
+          / ``AUDIT_DB_URL``
+        - ``mongodb``  -> the legacy Mongo archiver gated on ``MONGODB_URL``
+
+        Returns an archiver if the selected backend is configured, else None
+        (so ``get_archiver()`` is None and all guarded call sites no-op).
         """
+        backend = os.getenv("AUDIT_BACKEND", "mongodb").strip().lower()
+
+        if backend == "postgres":
+            from src.database.audit_writer import SyncAuditWriter
+
+            writer = SyncAuditWriter.from_env()
+            if writer is None:
+                logger.debug(
+                    "AUDIT_BACKEND=postgres but audit DB unconfigured; "
+                    "LLM archiving disabled"
+                )
+                return None
+            return cls(writer=writer)
+
+        # Default: MongoDB backend.
         mongodb_url = os.getenv("MONGODB_URL")
         if not mongodb_url:
             logger.debug("MONGODB_URL not set, LLM archiving disabled")
@@ -224,11 +287,14 @@ class LLMArchiver:
         return cls(mongodb_url=mongodb_url, database_name=db_name)
 
     def _ensure_connected(self) -> bool:
-        """Ensure MongoDB connection is established.
+        """Ensure the active backend is ready to write.
 
         Returns:
             True if connected, False otherwise.
         """
+        if self._is_postgres:
+            return self._writer is not None and self._writer.ensure_ready()
+
         if self._connected:
             return True
 
@@ -350,7 +416,7 @@ class LLMArchiver:
             return None
 
         try:
-            # Build document
+            # ---- shared field assembly (identical for both backends) ----
             request_data: Dict[str, Any] = {
                 "messages": [_message_to_dict(m) for m in messages],
                 "message_count": len(messages),
@@ -361,6 +427,70 @@ class LLMArchiver:
             if model_kwargs:
                 request_data["model_kwargs"] = model_kwargs
 
+            response_dict = _message_to_dict(response)
+
+            total_input_chars = sum(
+                len(_normalize_content(m.content)) for m in messages
+            )
+            response_chars = len(_normalize_content(response.content))
+            metrics = {
+                "input_chars": total_input_chars,
+                "output_chars": response_chars,
+                "tool_calls": len(response.tool_calls)
+                if hasattr(response, "tool_calls") and response.tool_calls
+                else 0,
+                # Token usage from response metadata (incl. reasoning_tokens)
+                "token_usage": getattr(response, "response_metadata", {}).get(
+                    "token_usage", {}
+                ),
+            }
+
+            tool_count = metrics["tool_calls"]
+            iter_str = f"iter={iteration}" if iteration else ""
+            latency_str = f"{latency_ms}ms" if latency_ms else "?"
+            tool_str = f"{tool_count} tools" if tool_count > 0 else "no tools"
+            type_str = f" | type={call_type}" if call_type != "main" else ""
+
+            if self._is_postgres:
+                row = {
+                    "job_id": job_id,
+                    "agent_type": agent_type,
+                    "call_type": call_type,
+                    "model": model,
+                    "iteration": iteration,
+                    "timestamp": datetime.now(timezone.utc),
+                    "latency_ms": latency_ms,
+                    "request": request_data,
+                    "response": response_dict,
+                    "metadata": _serialize_payload(metadata) if metadata else None,
+                    "auxiliary_metadata": _serialize_payload(auxiliary_metadata)
+                    if auxiliary_metadata
+                    else None,
+                    "metrics": metrics,
+                }
+                request_id = self._writer.insert_llm_request(row)
+                if request_id is None:
+                    return None
+                logger.info(
+                    f"[LLM] {request_id} | job={job_id[:8]}... | {iter_str} | "
+                    f"{latency_str} | {tool_str}{type_str}"
+                )
+                if call_type == "main":
+                    self._archive_chat_entry(
+                        job_id=job_id,
+                        agent_type=agent_type,
+                        messages=messages,
+                        response=response,
+                        model=model,
+                        latency_ms=latency_ms,
+                        iteration=iteration,
+                        request_id=request_id,
+                        phase=phase,
+                        phase_number=phase_number,
+                    )
+                return request_id
+
+            # ---- MongoDB backend ----
             doc = {
                 "job_id": job_id,
                 "agent_type": agent_type,
@@ -368,50 +498,20 @@ class LLMArchiver:
                 "model": model,
                 "call_type": call_type,
                 "request": request_data,
-                "response": _message_to_dict(response),
+                "response": response_dict,
             }
-
-            # Add optional fields
             if latency_ms is not None:
                 doc["latency_ms"] = latency_ms
-
             if iteration is not None:
                 doc["iteration"] = iteration
-
             if metadata:
                 doc["metadata"] = _serialize_for_mongo(metadata)
-
             if auxiliary_metadata:
                 doc["auxiliary_metadata"] = _serialize_for_mongo(auxiliary_metadata)
+            doc["metrics"] = metrics
 
-            # Count tokens approximately
-            total_input_chars = sum(
-                len(_normalize_content(m.content)) for m in messages
-            )
-            response_chars = len(_normalize_content(response.content))
-
-            doc["metrics"] = {
-                "input_chars": total_input_chars,
-                "output_chars": response_chars,
-                "tool_calls": len(response.tool_calls)
-                if hasattr(response, "tool_calls") and response.tool_calls
-                else 0,
-                # Token usage from response metadata (includes reasoning_tokens for supported models)
-                "token_usage": getattr(response, "response_metadata", {}).get(
-                    "token_usage", {}
-                ),
-            }
-
-            # Insert
             result = self._collection.insert_one(doc)
             doc_id = str(result.inserted_id)
-
-            # Log a concise summary - use INFO so it's visible but not overwhelming
-            tool_count = doc["metrics"]["tool_calls"]
-            iter_str = f"iter={iteration}" if iteration else ""
-            latency_str = f"{latency_ms}ms" if latency_ms else "?"
-            tool_str = f"{tool_count} tools" if tool_count > 0 else "no tools"
-            type_str = f" | type={call_type}" if call_type != "main" else ""
 
             logger.info(
                 f"[LLM] {doc_id[-8:]} | job={job_id[:8]}... | {iter_str} | "
@@ -468,6 +568,52 @@ class LLMArchiver:
             return None
 
         try:
+            request_data = {
+                "messages": [_message_to_dict(m) for m in messages],
+                "message_count": len(messages),
+            }
+            metrics = {
+                "input_chars": sum(
+                    len(_normalize_content(m.content)) for m in messages
+                ),
+                "output_chars": 0,
+                "tool_calls": 0,
+                "token_usage": {},
+            }
+            type_str = f" | type={call_type}" if call_type != "main" else ""
+
+            if self._is_postgres:
+                # llm_requests has no status/error columns and response is
+                # NOT NULL: fold the error into metadata and store an empty
+                # response so a failed (usually auxiliary) call stays queryable.
+                row = {
+                    "job_id": job_id,
+                    "agent_type": agent_type,
+                    "call_type": call_type,
+                    "model": model,
+                    "iteration": None,
+                    "timestamp": datetime.now(timezone.utc),
+                    "latency_ms": latency_ms,
+                    "request": request_data,
+                    "response": {},
+                    "metadata": {
+                        "status": "error",
+                        "error": {"type": error_type, "message": error[:2000]},
+                    },
+                    "auxiliary_metadata": _serialize_payload(auxiliary_metadata)
+                    if auxiliary_metadata
+                    else None,
+                    "metrics": metrics,
+                }
+                request_id = self._writer.insert_llm_request(row)
+                if request_id is not None:
+                    logger.warning(
+                        f"[LLM-ERR] {request_id} | job={job_id[:8]}... | "
+                        f"{error_type}: {error[:120]}{type_str}"
+                    )
+                return request_id
+
+            # ---- MongoDB backend ----
             doc = {
                 "job_id": job_id,
                 "agent_type": agent_type,
@@ -476,28 +622,17 @@ class LLMArchiver:
                 "call_type": call_type,
                 "status": "error",
                 "error": {"type": error_type, "message": error[:2000]},
-                "request": {
-                    "messages": [_message_to_dict(m) for m in messages],
-                    "message_count": len(messages),
-                },
+                "request": request_data,
                 "response": None,
             }
             if latency_ms is not None:
                 doc["latency_ms"] = latency_ms
             if auxiliary_metadata:
                 doc["auxiliary_metadata"] = _serialize_for_mongo(auxiliary_metadata)
-            doc["metrics"] = {
-                "input_chars": sum(
-                    len(_normalize_content(m.content)) for m in messages
-                ),
-                "output_chars": 0,
-                "tool_calls": 0,
-                "token_usage": {},
-            }
+            doc["metrics"] = metrics
 
             result = self._collection.insert_one(doc)
             doc_id = str(result.inserted_id)
-            type_str = f" | type={call_type}" if call_type != "main" else ""
             logger.warning(
                 f"[LLM-ERR] {doc_id[-8:]} | job={job_id[:8]}... | "
                 f"{error_type}: {error[:120]}{type_str}"
@@ -641,9 +776,6 @@ class LLMArchiver:
             phase: Current phase ("strategic" or "tactical")
             phase_number: Current phase number
         """
-        if self._chat_history_collection is None:
-            return
-
         try:
             # Find new inputs: messages after the last AIMessage
             # These are the messages that triggered this response
@@ -709,7 +841,30 @@ class LLMArchiver:
                         ),
                     }
 
-            # Build document
+            if self._is_postgres:
+                self._writer.insert_chat_entry(
+                    {
+                        "job_id": job_id,
+                        "agent_type": agent_type,
+                        "iteration": iteration,
+                        "model": model,
+                        "timestamp": datetime.now(timezone.utc),
+                        "latency_ms": latency_ms,
+                        "phase": phase,
+                        "phase_number": phase_number,
+                        "request_id": request_id,
+                        "inputs": new_inputs,
+                        "response": response_data,
+                        "reasoning": reasoning,
+                    }
+                )
+                logger.debug(f"[CHAT] Archived chat entry for job {job_id[:8]}...")
+                return
+
+            # ---- MongoDB backend ----
+            if self._chat_history_collection is None:
+                return
+
             doc: Dict[str, Any] = {
                 "job_id": job_id,
                 "agent_type": agent_type,
@@ -801,6 +956,29 @@ class LLMArchiver:
             return None
 
         try:
+            if self._is_postgres:
+                row = {
+                    "job_id": job_id,
+                    "agent_type": agent_type,
+                    "iteration": iteration,
+                    "step_type": step_type,
+                    "node_name": node_name,
+                    "phase": phase,
+                    "phase_number": phase_number,
+                    "timestamp": datetime.now(timezone.utc),
+                    "latency_ms": latency_ms,
+                    "payload": _serialize_payload(data) if data else {},
+                    "metadata": _serialize_payload(metadata) if metadata else None,
+                }
+                audit_id = self._writer.insert_audit_pre(row)
+                if audit_id is not None:
+                    logger.debug(
+                        f"[AUDIT] {audit_id} | job={job_id[:8]}... | "
+                        f"iter={iteration} | {step_type}"
+                    )
+                return audit_id
+
+            # ---- MongoDB backend ----
             step_number = self._get_next_step_number(job_id)
 
             doc = {
@@ -931,6 +1109,20 @@ class LLMArchiver:
             return False
 
         try:
+            if self._is_postgres:
+                payload = {
+                    "tool": {
+                        "result_preview": self._truncate_string(result, 500),
+                        "result_size_bytes": len(result) if result else 0,
+                        "success": success,
+                    },
+                    "completed_at": _iso_utc_now(),
+                }
+                if error:
+                    payload["tool"]["error"] = self._truncate_string(error, 500)
+                return self._writer.insert_audit_post(audit_doc_id, payload, latency_ms)
+
+            # ---- MongoDB backend ----
             from bson import ObjectId
 
             update_data = {
@@ -1042,6 +1234,24 @@ class LLMArchiver:
             return False
 
         try:
+            if self._is_postgres:
+                payload = {
+                    "llm": {
+                        "request_id": request_id,
+                        "response_content_preview": response_preview,
+                        "tool_calls": tool_calls,
+                        "metrics": {
+                            "output_chars": output_chars,
+                            "tool_call_count": len(tool_calls) if tool_calls else 0,
+                        },
+                    },
+                    "completed_at": _iso_utc_now(),
+                }
+                return self._writer.insert_audit_post(
+                    audit_doc_id, payload, latency_ms, request_id=request_id
+                )
+
+            # ---- MongoDB backend ----
             from bson import ObjectId
 
             update_data = {
@@ -1171,7 +1381,11 @@ class LLMArchiver:
             return {}
 
     def close(self):
-        """Close MongoDB connection."""
+        """Close the active backend's connection."""
+        if self._is_postgres:
+            if self._writer is not None:
+                self._writer.close()
+            return
         if self._mongo_db:
             self._mongo_db.close()
             self._connected = False
