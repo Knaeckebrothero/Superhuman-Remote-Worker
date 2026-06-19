@@ -63,6 +63,11 @@ export interface AuditErrorInfo {
  */
 export interface AuditEntry {
   _id: string;
+  /**
+   * Transitional: the Postgres audit store sends an integer `id`; the Mongo
+   * store sends a string `_id`. ApiService normalizes both into `_id` (string).
+   */
+  id?: number | string;
   job_id: string;
   step_number: number;
   step_type: AuditStepType;

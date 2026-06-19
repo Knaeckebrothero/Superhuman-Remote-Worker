@@ -51,22 +51,25 @@ export class RequestService {
    * Load a request by document ID.
    */
   loadRequest(docId: string): void {
-    if (!docId || docId.trim() === '') {
+    const id = String(docId ?? '').trim();
+    if (id === '') {
       this.error.set('Please enter a document ID');
       return;
     }
 
-    // Validate ObjectId format (24 hex characters)
-    if (!/^[a-fA-F0-9]{24}$/.test(docId)) {
-      this.error.set('Invalid document ID format (expected 24 hex characters)');
+    // Accept a Mongo ObjectId (24 hex) or a Postgres integer id.
+    if (!/^([a-fA-F0-9]{24}|\d+)$/.test(id)) {
+      this.error.set(
+        'Invalid document ID format (expected 24 hex chars or a numeric id)',
+      );
       return;
     }
 
-    this.currentDocId.set(docId);
+    this.currentDocId.set(id);
     this.isLoading.set(true);
     this.error.set(null);
 
-    this.api.getRequest(docId).subscribe({
+    this.api.getRequest(id).subscribe({
       next: (request) => {
         this.isLoading.set(false);
         if (request) {

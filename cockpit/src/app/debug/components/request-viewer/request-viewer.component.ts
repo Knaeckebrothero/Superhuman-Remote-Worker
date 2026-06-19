@@ -19,7 +19,7 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
         <input
           type="text"
           class="doc-id-input"
-          placeholder="Enter document ID (24 hex chars)..."
+          placeholder="Enter document ID (24 hex chars or numeric id)..."
           [(ngModel)]="docIdInput"
           (keyup.enter)="onLoad()"
         />

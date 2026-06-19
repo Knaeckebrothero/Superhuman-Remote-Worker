@@ -88,6 +88,35 @@ export interface BulkChatResponse {
 }
 
 /**
+ * Audit-store id normalization (transitional). The store is migrating
+ * MongoDB(`_id`: string ObjectId) -> Postgres(`id`: integer), and the backend
+ * is flag-selected, so an entry may arrive with either `_id` (string) or `id`
+ * (number), and `request_id` as either. Coercing `_id`/`request_id` to strings
+ * at ingestion keeps every downstream consumer (track keys, IndexedDB primary
+ * key, `.slice()` display, the 24-hex regex) working unchanged on both backends.
+ */
+function normalizeAuditEntry(e: AuditEntry): AuditEntry {
+  e._id = String(e.id ?? e._id ?? '');
+  if (e.llm && e.llm.request_id != null) {
+    e.llm.request_id = String(e.llm.request_id);
+  }
+  return e;
+}
+
+function normalizeChatEntry(e: ChatEntry): ChatEntry {
+  e._id = String(e.id ?? e._id ?? '');
+  if (e.request_id != null) {
+    e.request_id = String(e.request_id);
+  }
+  return e;
+}
+
+function normalizeLLMRequest(r: LLMRequest): LLMRequest {
+  r._id = String(r.id ?? r._id ?? '');
+  return r;
+}
+
+/**
  * Response for bulk graph changes endpoint.
  */
 export interface BulkGraphResponse {
@@ -243,6 +272,10 @@ export class ApiService {
     return this.http
       .get<AuditResponse>(`${this.baseUrl}/jobs/${jobId}/audit`, { params })
       .pipe(
+        map((response) => {
+          response.entries?.forEach(normalizeAuditEntry);
+          return response;
+        }),
         catchError((error) => {
           console.error(`Failed to fetch audit for job ${jobId}:`, error);
           return of({
@@ -262,6 +295,7 @@ export class ApiService {
    */
   getRequest(docId: string): Observable<LLMRequest | null> {
     return this.http.get<LLMRequest>(`${this.baseUrl}/requests/${docId}`).pipe(
+      map((request) => (request ? normalizeLLMRequest(request) : request)),
       catchError((error) => {
         console.error(`Failed to fetch request ${docId}:`, error);
         return of(null);
@@ -318,6 +352,10 @@ export class ApiService {
     return this.http
       .get<ChatHistoryResponse>(`${this.baseUrl}/jobs/${jobId}/chat`, { params })
       .pipe(
+        map((response) => {
+          response.entries?.forEach(normalizeChatEntry);
+          return response;
+        }),
         catchError((error) => {
           console.error(`Failed to fetch chat history for job ${jobId}:`, error);
           return of({
@@ -350,6 +388,10 @@ export class ApiService {
     return this.http
       .get<BulkAuditResponse>(`${this.baseUrl}/jobs/${jobId}/audit/bulk`, { params })
       .pipe(
+        map((response) => {
+          response.entries?.forEach(normalizeAuditEntry);
+          return response;
+        }),
         catchError((error) => {
           console.error(`Failed to fetch bulk audit for job ${jobId}:`, error);
           return of({
@@ -378,6 +420,10 @@ export class ApiService {
     return this.http
       .get<BulkChatResponse>(`${this.baseUrl}/jobs/${jobId}/chat/bulk`, { params })
       .pipe(
+        map((response) => {
+          response.entries?.forEach(normalizeChatEntry);
+          return response;
+        }),
         catchError((error) => {
           console.error(`Failed to fetch bulk chat for job ${jobId}:`, error);
           return of({
