@@ -169,3 +169,34 @@ def test_scholar_binds_research_guide_as_skill():
     assert research[0]["trigger"] == "phase:tactical"
     assert research[0]["enforce"] is False
     assert not any(e.get("file") == "research_guide.md" for e in entries)  # old ref gone
+
+
+# ---------------------------------------------------------------------------
+# Task 6: todo_guide migrated to a bundled skill + matrix special-case removed
+# ---------------------------------------------------------------------------
+
+
+def test_todo_guide_skill_exists_and_parses():
+    md = (_P("config/skills/todo-guide/SKILL.md")).read_text(encoding="utf-8")
+    fm, body = parse_skill_md(md)
+    name, _desc = skill_identity(fm)
+    assert name == "todo-guide"
+    assert "Short Phases" in body  # the migrated body survived
+
+
+def test_defaults_bind_todo_guide_as_skill():
+    import yaml
+
+    cfg = yaml.safe_load(_P("config/defaults.yaml").read_text())
+    entries = cfg["instruction_files"]
+    todo = [e for e in entries if e.get("skill") == "todo-guide"]
+    assert len(todo) == 1
+    assert todo[0]["trigger"] == "before_tool:next_phase_todos"
+    assert todo[0]["enforce"] is True
+    assert not any(e.get("file") == "todo_guide.md" for e in entries)
+
+
+def test_todo_guide_dropped_from_instruction_matrix():
+    from src.core.loader import InstructionMatrixResolver
+
+    assert "todo_guide" not in InstructionMatrixResolver.HARDCODED_DEFAULTS

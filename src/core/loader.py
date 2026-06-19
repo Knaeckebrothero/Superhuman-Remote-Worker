@@ -967,7 +967,6 @@ class InstructionMatrixResolver(MatrixResolver):
         "strategic_todos_transition": "strategic_todos_transition.yaml",
         "strategic_todos_resume": "strategic_todos_resume.yaml",
         "workspace_template": "workspace_template.md",
-        "todo_guide": "todo_guide.md",
     }
 
 

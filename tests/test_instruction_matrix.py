@@ -147,7 +147,6 @@ class TestInstructionMatrixResolver:
         assert (
             resolver.resolve_filename("workspace_template") == "workspace_template.md"
         )
-        assert resolver.resolve_filename("todo_guide") == "todo_guide.md"
 
     def test_base_matrix_default_resolution(self, tmp_path):
         """Base instruction matrix default entries are used."""
@@ -174,8 +173,11 @@ class TestInstructionMatrixResolver:
 
         assert resolver.resolve_filename("instructions") == "custom_instructions.md"
         assert resolver.resolve_filename("workspace_template") == "custom_workspace.md"
-        # Not in matrix, falls to hardcoded
-        assert resolver.resolve_filename("todo_guide") == "todo_guide.md"
+        # Not in this matrix, falls to hardcoded default
+        assert (
+            resolver.resolve_filename("strategic_todos_initial")
+            == "strategic_todos_initial.yaml"
+        )
 
     def test_expert_override(self, tmp_path):
         """Expert instruction matrix entries override base matrix entries."""
@@ -356,7 +358,6 @@ class TestResolvedConfigSerialization:
             (config_templates / "workspace_template.md").write_text(
                 "workspace template"
             )
-            (config_templates / "todo_guide.md").write_text("todo guide")
             (config_templates / "strategic_todos_initial.yaml").write_text(
                 "todos:\n  - id: 1\n    content: test todo content here"
             )
@@ -385,7 +386,6 @@ class TestResolvedConfigSerialization:
         # Check instructions captured
         assert result["instructions"]["instructions"] == "instructions content"
         assert result["instructions"]["workspace_template"] == "workspace template"
-        assert result["instructions"]["todo_guide"] == "todo guide"
 
         # Check API keys stripped
         assert "api_key" not in result["agent"].get("llm", {})

@@ -125,7 +125,7 @@ todos:
 
       If deliverables are still missing or incomplete:
 
-      (1) Read todo_guide.md (next_phase_todos will reject if you haven't).
+      (1) Read skills/todo-guide/SKILL.md (next_phase_todos will reject if you haven't).
       (2) Call next_phase_todos with 3-5 todos for the next tactical phase.
 
       Each todo MUST:

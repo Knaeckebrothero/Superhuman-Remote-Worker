@@ -31,9 +31,9 @@ workspace:
     - repo/
   git_versioning: true
 
-# Scholar-specific instruction files (extends defaults' todo_guide.md)
+# Scholar-specific instruction files (extends defaults' todo-guide skill)
 instruction_files:
-  - file: todo_guide.md
+  - skill: todo-guide
     trigger: before_tool:next_phase_todos
     enforce: true
   - skill: research-guide

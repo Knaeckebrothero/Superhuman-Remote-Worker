@@ -62,7 +62,7 @@
 # Workspace scaffolding + the strategic todo/phase system. Persistent sessions
 # use none of these (no phases, no todos); src/persistent_graph.py never loads
 # them. Resolved via InstructionMatrixResolver, so model-family variants apply
-# (e.g. instructions_minimax.md, todo_guide_gpt_oss.md). The vestigial
+# (e.g. instructions_minimax.md, strategic_todos_transition_gpt_oss.yaml). The vestigial
 # workspace_template.md is intentionally not exposed — workspace.md was removed.
 - kind: instructions
   name: instructions
@@ -94,13 +94,6 @@
   description: >-
     The todo list (YAML) used when a frozen job is resumed with human feedback:
     process the feedback, adapt the plan, and create corrective tactical todos.
-- kind: instructions
-  name: todo_guide
-  group: "Instructions · worker (jobs)"
-  title: "Todo crafting guide (todo_guide.md)"
-  description: >-
-    The guide an agent must read before calling next_phase_todos (3–7 focused
-    todos per phase). Written into the workspace as todo_guide.md.
 
 # --- Settings (LLM inference params + execution limits) -----------------------
 # `name` is the matrix leaf; dotted names (limits.*) target LimitsConfig fields.
