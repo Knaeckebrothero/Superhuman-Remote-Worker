@@ -115,3 +115,28 @@ def test_apply_enforcement_wrapper_uses_skill_path(tmp_path):
     assert "skills/todo-guide/SKILL.md" in blocked and calls == []  # nudged, not run
     ctx.record_file_read("skills/todo-guide/SKILL.md")
     assert tool.func() == "OK" and calls == [1]  # gate opened
+
+
+# ---------------------------------------------------------------------------
+# Task 3: bound-skill content rides the flag-independent instructions channel
+# ---------------------------------------------------------------------------
+
+from src.core.loader import serialize_resolved_config  # noqa: E402
+
+
+def test_serialize_freezes_bound_skill_md(tmp_path):
+    cfg = load_agent_config_from_dict(
+        {
+            "agent_id": "t",
+            "display_name": "T",
+            "instruction_files": [
+                {"skill": "hello-skill", "trigger": "phase:tactical", "enforce": False}
+            ],
+        }
+    )
+    cfg._deployment_dir = str(tmp_path)  # matrix/prompt resolvers need a dir; files absent → None
+    blob = serialize_resolved_config(cfg)
+    # Frozen under the skill name (not "SKILL"), independent of the catalog flag.
+    assert "hello-skill" in blob["instructions"]
+    assert "Hello Skill" in blob["instructions"]["hello-skill"]
+    assert "SKILL" not in blob["instructions"]  # no stem collision

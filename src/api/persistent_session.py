@@ -441,6 +441,26 @@ class PersistentSession:
         )
         for entry in self.config.instruction_files:
             try:
+                if entry.skill:
+                    # Bound skill: flag-independent instructions channel → skills/<skill>/SKILL.md.
+                    target_path = self.workspace_manager.get_path(entry.path)
+                    if target_path.exists():
+                        continue  # don't overwrite on session resume
+                    content = self.config.extra.get("_resolved_instructions", {}).get(
+                        entry.skill
+                    )
+                    if not content:
+                        logger.warning(
+                            f"Bound skill content missing from blob: {entry.skill}"
+                        )
+                        continue
+                    content = render_instruction_content(content, [])
+                    parent_dir = str(Path(entry.path).parent)
+                    if parent_dir and parent_dir != ".":
+                        self.workspace_manager.backend.mkdir(parent_dir)
+                    self.workspace_manager.write_file(entry.path, content)
+                    logger.debug(f"Deployed bound skill to workspace: {entry.path}")
+                    continue
                 # Skip if already present (don't overwrite on session resume)
                 target_path = self.workspace_manager.get_path(entry.file)
                 if target_path.exists():

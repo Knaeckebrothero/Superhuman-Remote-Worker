@@ -4130,15 +4130,27 @@ def serialize_resolved_config(config: AgentConfig, model: str = "") -> dict:
             instructions[it] = None
 
     # Also resolve custom instruction files from config.instruction_files
-    # (e.g. research_guide.md) — these aren't in the matrix but need to survive
-    # serialization so resumed/VM jobs can copy them to the workspace.
+    # (e.g. research_guide.md) AND bound skills (skill:) — these aren't in the
+    # matrix but need to survive serialization so resumed/VM jobs (and the
+    # deterministic binding when the skills CATALOG is off) can materialize them.
     if config.instruction_files:
         templates_dir = get_project_root() / "config" / "templates"
         file_resolver = FileResolver(
             deployment_dir=config._deployment_dir,
             framework_dir=templates_dir,
         )
+        skills_root = get_project_root() / "config" / "skills"
         for entry in config.instruction_files:
+            if entry.skill:
+                # Bound skill: freeze SKILL.md keyed by skill name (NOT its "SKILL"
+                # stem). Flag-independent — does not depend on the catalog gather.
+                if entry.skill not in instructions:
+                    skill_md = skills_root / entry.skill / "SKILL.md"
+                    try:
+                        instructions[entry.skill] = skill_md.read_text(encoding="utf-8")
+                    except OSError:
+                        pass  # non-bundled bound skill (out of scope this slice)
+                continue
             basename = Path(entry.file).stem
             if basename not in instructions:
                 try:
