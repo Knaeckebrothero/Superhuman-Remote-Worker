@@ -20,6 +20,16 @@ data:
   VECTOR_POSTGRES_PORT: {{ include "srw.vectorPostgresPort" . | quote }}
   VECTOR_POSTGRES_DB: {{ include "srw.vectorPostgresDb" . | quote }}
 
+  # Audit DB (srw-auditdb) — non-secret connection parts. Composed with
+  # AUDIT_POSTGRES_USER/AUDIT_POSTGRES_PASSWORD from the Secret. Agent pods
+  # inherit this ConfigMap via envFrom, so the audit writer reaches them too.
+  AUDIT_POSTGRES_HOST: {{ include "srw.auditPostgresHost" . | quote }}
+  AUDIT_POSTGRES_PORT: {{ include "srw.auditPostgresPort" . | quote }}
+  AUDIT_POSTGRES_DB: {{ include "srw.auditPostgresDb" . | quote }}
+  # Active audit backend (mongodb|postgres): the orchestrator reads it for the
+  # reader selector; agents inherit it via envFrom for the writer.
+  AUDIT_BACKEND: {{ .Values.databases.audit.backend | quote }}
+
   # Citation Engine DB — runs on the pgvector instance under its own role
   # (srw_citations) and dedicated database (citation_engine). Composed with
   # CITATION_POSTGRES_USER/PASSWORD from the Secret.

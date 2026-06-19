@@ -34,6 +34,11 @@ spec:
           image: busybox:1.36
           command: ["sh", "-c", "until nc -z {{ include "srw.fullname" . }}-pgvector 5432; do sleep 2; done"]
         {{- end }}
+        {{- if and .Values.databases.audit.enabled .Values.databases.audit.internal }}
+        - name: wait-for-auditdb
+          image: busybox:1.36
+          command: ["sh", "-c", "until nc -z {{ include "srw.fullname" . }}-auditdb 5432; do sleep 2; done"]
+        {{- end }}
         {{- if and .Values.databases.mongodb.enabled .Values.databases.mongodb.internal }}
         - name: wait-for-mongodb
           image: busybox:1.36
@@ -140,6 +145,36 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: VECTOR_POSTGRES_DB
+            - name: AUDIT_POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: AUDIT_POSTGRES_USER
+            - name: AUDIT_POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: AUDIT_POSTGRES_PASSWORD
+            - name: AUDIT_POSTGRES_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: AUDIT_POSTGRES_HOST
+            - name: AUDIT_POSTGRES_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: AUDIT_POSTGRES_PORT
+            - name: AUDIT_POSTGRES_DB
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: AUDIT_POSTGRES_DB
+            - name: AUDIT_BACKEND
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: AUDIT_BACKEND
             - name: MONGODB_URL
               valueFrom:
                 configMapKeyRef:

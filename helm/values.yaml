@@ -422,6 +422,33 @@ databases:
       limits:
         memory: "1Gi"
         cpu: "500m"
+  # Audit DB (srw-auditdb) — observability tier replacing MongoDB. Its own
+  # server so observability writes can't take down the control plane
+  # (failure-domain isolation). Append-only, monthly-partitioned,
+  # retention-bounded. Stood up behind the AUDIT_BACKEND flag.
+  audit:
+    enabled: true
+    internal: true
+    # -- Active backend for audit reads/writes: "mongodb" (default) or
+    # "postgres". The orchestrator's reader and the agent's writer both honor
+    # it. Flip to "postgres" at cutover (PR7), or per-env via values-local.
+    backend: "mongodb"
+    # -- External mode connection parts (credentials live in the Secret).
+    externalHost: ""
+    externalPort: 5432
+    externalDb: "srw_audit"
+    # PostgreSQL 16 (>= 16.5 ships the DETACH CONCURRENTLY + partitioned-FK
+    # fixes); 15.9+ is compatible if a 15.x is preferred for fleet uniformity.
+    image: postgres:16
+    storageClass: ""
+    storageSize: "10Gi"
+    resources:
+      requests:
+        memory: "256Mi"
+        cpu: "100m"
+      limits:
+        memory: "1Gi"
+        cpu: "500m"
   # Dedicated Postgres for the bundled Keycloak. Keeps the IdP's data plane
   # isolated from the orchestrator's. Only renders when both the bundled
   # Keycloak and this DB are internal.
