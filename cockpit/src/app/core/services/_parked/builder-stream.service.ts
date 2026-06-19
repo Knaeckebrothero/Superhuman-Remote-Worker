@@ -1,9 +1,9 @@
 import {inject, Injectable} from '@angular/core';
 import {HttpClient} from '@angular/common/http';
 import {catchError, Observable, of} from 'rxjs';
-import {environment} from '../environment';
+import {environment} from '../../environment';
 import {JobArtifactService} from './job-artifact.service';
-import {UserService} from './user.service';
+import {UserService} from '../user.service';
 
 /** A builder chat message (stored in builder_messages table). */
 export interface BuilderMessage {
