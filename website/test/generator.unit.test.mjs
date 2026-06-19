@@ -64,3 +64,26 @@ test('production-vms emits a vmController block', () => {
   assert.match(valuesYaml, /vmDiskSize: 30Gi/);
   assert.match(valuesYaml, /vmSshPublicKey: "ssh-ed25519 AAAA\.\.\. agent@srw"/);
 });
+
+test('evaluation secret skeleton omits APP_ENCRYPTION_KEY (chart generates it)', () => {
+  const { secretSkeleton } = generate('evaluation', evalInputs);
+  // No APP_ENCRYPTION_KEY *entry* for the user to fill (the explanatory comment
+  // may still name it — hence the trailing colon to match a key line only).
+  assert.doesNotMatch(secretSkeleton, /APP_ENCRYPTION_KEY:/);
+});
+
+test('production secret skeleton includes generated + placeholder keys', () => {
+  const { secretSkeleton } = generate('production', prodBase);
+  assert.match(secretSkeleton, /APP_ENCRYPTION_KEY: [0-9a-f]{64}/);
+  assert.match(secretSkeleton, /SESSION_JWT_SECRET: [0-9a-f]{64}/);
+  assert.match(secretSkeleton, /POSTGRES_PASSWORD: CHANGE_ME/);
+  assert.match(secretSkeleton, /kind: Secret/);
+  assert.match(secretSkeleton, /name: srw-secrets/);
+});
+
+test('fillSecrets substitutes provided values for placeholders', () => {
+  const { secretSkeleton } = generate('production',
+    { ...prodBase, fillSecrets: true, secretValues: { POSTGRES_PASSWORD: 's3cret' } });
+  assert.match(secretSkeleton, /POSTGRES_PASSWORD: s3cret/);
+  assert.doesNotMatch(secretSkeleton, /POSTGRES_PASSWORD: CHANGE_ME/);
+});
