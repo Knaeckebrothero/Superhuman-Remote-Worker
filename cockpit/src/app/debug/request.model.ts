@@ -70,6 +70,9 @@ export interface LLMToolSchema {
  */
 export interface LLMRequest {
   _id: string;
+  /** Transitional: Postgres sends integer `id`, Mongo string `_id`; ApiService
+   * normalizes both into `_id` (string). */
+  id?: number | string;
   job_id: string;
   agent_type: string;
   timestamp: string;

@@ -177,3 +177,79 @@ describe('ApiService.planTTS', () => {
     expect(await pending).toBeNull();
   });
 });
+
+describe('ApiService audit id normalization (Mongo _id / Postgres id)', () => {
+  let api: ApiService;
+  let httpMock: HttpTestingController;
+
+  beforeEach(() => {
+    TestBed.resetTestingModule();
+    TestBed.configureTestingModule({
+      providers: [
+        ApiService,
+        provideHttpClient(),
+        provideHttpClientTesting(),
+        {provide: AppToastService, useValue: {}},
+        {provide: TranslocoService, useValue: {translate: (k: string) => k}},
+        {provide: ErrorMessageService, useValue: {}},
+      ],
+    });
+    api = TestBed.inject(ApiService);
+    httpMock = TestBed.inject(HttpTestingController);
+  });
+
+  afterEach(() => httpMock.verify());
+
+  it('coerces a Postgres integer id + nested request_id to strings (audit)', async () => {
+    const pending = firstValueFrom(api.getJobAudit('job-1'));
+    const req = httpMock.expectOne((r) => r.url.endsWith('/jobs/job-1/audit'));
+    req.flush({
+      entries: [{id: 4271, step_type: 'llm', llm: {request_id: 99}}],
+      total: 1,
+      page: 1,
+      pageSize: 50,
+      hasMore: false,
+    });
+    const res = await pending;
+    expect(res.entries[0]._id).toBe('4271');
+    expect(typeof res.entries[0]._id).toBe('string');
+    expect(res.entries[0].llm!.request_id).toBe('99');
+  });
+
+  it('leaves a Mongo ObjectId _id untouched (audit)', async () => {
+    const pending = firstValueFrom(api.getJobAudit('job-1'));
+    const req = httpMock.expectOne((r) => r.url.endsWith('/jobs/job-1/audit'));
+    req.flush({
+      entries: [{_id: '507f1f77bcf86cd799439011', step_type: 'tool'}],
+      total: 1,
+      page: 1,
+      pageSize: 50,
+      hasMore: false,
+    });
+    const res = await pending;
+    expect(res.entries[0]._id).toBe('507f1f77bcf86cd799439011');
+  });
+
+  it('coerces chat id + request_id to strings', async () => {
+    const pending = firstValueFrom(api.getChatHistory('job-1'));
+    const req = httpMock.expectOne((r) => r.url.endsWith('/jobs/job-1/chat'));
+    req.flush({
+      entries: [{id: 5, request_id: 88}],
+      total: 1,
+      page: 1,
+      pageSize: 50,
+      hasMore: false,
+    });
+    const res = await pending;
+    expect(res.entries[0]._id).toBe('5');
+    expect(res.entries[0].request_id).toBe('88');
+  });
+
+  it('coerces a single LLM request id to string', async () => {
+    const pending = firstValueFrom(api.getRequest('7'));
+    const req = httpMock.expectOne((r) => r.url.endsWith('/requests/7'));
+    req.flush({id: 7, job_id: 'job-1'});
+    const res = await pending;
+    expect(res!._id).toBe('7');
+  });
+});
