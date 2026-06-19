@@ -557,7 +557,6 @@ export interface UserSettings {
   default_auxiliary_model?: string | null;
   default_vision_model?: string | null;
   default_whisper_model?: string | null;
-  default_builder_model?: string | null;
   default_session_model?: string | null;
   default_strategic_model?: string | null;
   default_tactical_model?: string | null;

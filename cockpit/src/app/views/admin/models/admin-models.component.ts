@@ -73,7 +73,7 @@ function hintsToCapabilities(
   template: `
     <div class="admin-models">
       <p class="section-intro">
-        Curate the LLM offerings available in builder, sessions, and jobs.
+        Curate the LLM offerings available in sessions and jobs.
         Each model anchors to a configured provider (system API key) or a
         system endpoint.
       </p>
@@ -87,7 +87,7 @@ function hintsToCapabilities(
           } @else if (models.models().length === 0) {
             <p class="empty-state">
               Add a model from a configured provider to make it available
-              in builder, sessions, and jobs.
+              in sessions and jobs.
             </p>
           } @else {
             @for (group of groupedModels(); track group.key) {

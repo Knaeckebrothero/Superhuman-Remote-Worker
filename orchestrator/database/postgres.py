@@ -6148,10 +6148,9 @@ class PostgresDB:
     # =========================================================================
     # DEFAULT LLM MODEL HELPERS
     # Thin wrappers over the existing system_settings table (section 9d).
-    # Keys: llm.default_builder_model / llm.default_browser_model /
-    #       llm.default_citation_model
+    # Keys: llm.default_browser_model / llm.default_citation_model
     # Value shape: {"model": "<model_id>"}
-    # Replaces the BUILDER_MODEL / BROWSER_LLM_MODEL / CITATION_LLM_MODEL
+    # Replaces the BROWSER_LLM_MODEL / CITATION_LLM_MODEL
     # env vars as the source of truth for the default model per workload.
     # =========================================================================
 

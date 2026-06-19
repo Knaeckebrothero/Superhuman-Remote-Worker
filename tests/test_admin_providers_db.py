@@ -382,12 +382,12 @@ class TestDefaultLlmModelHelpers:
         db = PostgresDB.__new__(PostgresDB)
         db.get_system_setting = AsyncMock(
             return_value={
-                "key": "llm.default_builder_model",
+                "key": "llm.default_browser_model",
                 "value": {"model": "gpt-4o"},
             }
         )
-        assert await db.get_default_llm_model("builder") == "gpt-4o"
-        db.get_system_setting.assert_awaited_once_with("llm.default_builder_model")
+        assert await db.get_default_llm_model("browser") == "gpt-4o"
+        db.get_system_setting.assert_awaited_once_with("llm.default_browser_model")
 
     @pytest.mark.asyncio
     async def test_get_returns_none_when_unset(self):
@@ -407,9 +407,9 @@ class TestDefaultLlmModelHelpers:
         db.upsert_system_setting = AsyncMock()
         db.delete_system_setting = AsyncMock()
 
-        await db.set_default_llm_model("builder", "gpt-4o", updated_by="admin-1")
+        await db.set_default_llm_model("browser", "gpt-4o", updated_by="admin-1")
         db.upsert_system_setting.assert_awaited_once_with(
-            "llm.default_builder_model", {"model": "gpt-4o"}, updated_by="admin-1"
+            "llm.default_browser_model", {"model": "gpt-4o"}, updated_by="admin-1"
         )
         db.delete_system_setting.assert_not_awaited()
 

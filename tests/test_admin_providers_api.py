@@ -99,7 +99,7 @@ class TestProviderWhitelist:
 class TestDefaultModelKinds:
     def test_covers_core_workload_kinds(self):
         # Chat-slot defaults (always present).
-        assert {"builder", "browser", "citation"}.issubset(VALID_DEFAULT_MODEL_KINDS)
+        assert {"browser", "citation"}.issubset(VALID_DEFAULT_MODEL_KINDS)
         # Non-chat slots added with the capability extension.
         assert {"embedding", "vision", "auxiliary"}.issubset(VALID_DEFAULT_MODEL_KINDS)
 
