@@ -477,6 +477,30 @@ srw_vector
 {{- end -}}
 {{- end }}
 
+{{- define "srw.auditPostgresHost" -}}
+{{- if .Values.databases.audit.internal -}}
+{{- printf "%s-auditdb" (include "srw.fullname" .) -}}
+{{- else -}}
+{{- required "databases.audit.externalHost is required when internal=false" .Values.databases.audit.externalHost -}}
+{{- end -}}
+{{- end }}
+
+{{- define "srw.auditPostgresPort" -}}
+{{- if .Values.databases.audit.internal -}}
+5432
+{{- else -}}
+{{- .Values.databases.audit.externalPort | default 5432 -}}
+{{- end -}}
+{{- end }}
+
+{{- define "srw.auditPostgresDb" -}}
+{{- if .Values.databases.audit.internal -}}
+srw_audit
+{{- else -}}
+{{- .Values.databases.audit.externalDb | default "srw_audit" -}}
+{{- end -}}
+{{- end }}
+
 {{/*
 MongoDB URL — supports external mode (no auth in current setup, so URL is non-secret).
 */}}

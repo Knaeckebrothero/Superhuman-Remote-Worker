@@ -97,6 +97,14 @@ spec:
       ports:
         - protocol: TCP
           port: 5432
+    # PostgreSQL (Audit DB) — the agent's audit writer (SyncAuditWriter).
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "auditdb") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 5432
     # Neo4j — in-process graph datasource tools.
     - to:
         - podSelector:
