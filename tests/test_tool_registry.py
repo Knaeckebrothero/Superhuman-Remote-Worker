@@ -469,6 +469,11 @@ class FakeInstructionEntry:
     trigger_target: str
     enforce: bool
 
+    @property
+    def path(self) -> str:
+        """Mirror InstructionFileEntry.path; this fake only models file: entries."""
+        return self.file
+
 
 class TestApplyInstructionEnforcement:
     """Tests for apply_instruction_enforcement()."""
