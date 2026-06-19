@@ -1,0 +1,107 @@
+{{- if and .Values.databases.audit.enabled .Values.databases.audit.internal }}
+# Audit Database (srw-auditdb) — observability tier (replaces MongoDB).
+#
+# Dedicated PostgreSQL instance for the append-only audit/llm/chat trace (and,
+# later, the usage-metering ledger). Non-load-bearing: product flow survives its
+# outage. Schema + monthly partitions are applied by the orchestrator's
+# migration runner on startup (migrations/audit/0001_initial.sql), not by initdb;
+# partition maintenance runs as a lifespan task. No pgvector extension needed.
+#
+# Component label "auditdb" (7 chars) stays well under the 52-char StatefulSet
+# name budget (controller-revision-hash adds 11 chars; total label <= 63).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "srw.fullname" . }}-auditdb-data
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "auditdb") | nindent 4 }}
+  annotations:
+    "helm.sh/resource-policy": keep
+spec:
+  accessModes:
+    - ReadWriteOnce
+  {{- if .Values.databases.audit.storageClass }}
+  storageClassName: {{ .Values.databases.audit.storageClass }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.databases.audit.storageSize }}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "srw.fullname" . }}-auditdb
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "auditdb") | nindent 4 }}
+spec:
+  serviceName: {{ include "srw.fullname" . }}-auditdb
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "srw.componentSelectorLabels" (dict "context" . "component" "auditdb") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "srw.componentSelectorLabels" (dict "context" . "component" "auditdb") | nindent 8 }}
+    spec:
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: auditdb
+          image: {{ .Values.databases.audit.image }}
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: AUDIT_POSTGRES_USER
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: AUDIT_POSTGRES_PASSWORD
+            - name: POSTGRES_DB
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: AUDIT_POSTGRES_DB
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          livenessProbe:
+            exec:
+              # -d postgres: probe the always-present maintenance DB (the audit
+              # DB name is srw_audit). -U is not authenticated by pg_isready.
+              command: ["pg_isready", "-U", "srw", "-d", "postgres"]
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "srw", "-d", "postgres"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.databases.audit.resources | nindent 12 }}
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ include "srw.fullname" . }}-auditdb-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "srw.fullname" . }}-auditdb
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "auditdb") | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - port: 5432
+      targetPort: 5432
+  selector:
+    {{- include "srw.componentSelectorLabels" (dict "context" . "component" "auditdb") | nindent 4 }}
+{{- end }}

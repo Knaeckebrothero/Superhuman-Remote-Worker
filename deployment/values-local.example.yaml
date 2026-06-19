@@ -93,6 +93,8 @@ secrets:
     POSTGRES_PASSWORD: "dev_pg_password"
     VECTOR_POSTGRES_USER: "srw"
     VECTOR_POSTGRES_PASSWORD: "dev_pgvector_password"
+    AUDIT_POSTGRES_USER: "srw"
+    AUDIT_POSTGRES_PASSWORD: "dev_auditdb_password"
     NEO4J_USERNAME: "neo4j"
     NEO4J_PASSWORD: "dev_neo4j_password_noslash"
 
@@ -209,6 +211,8 @@ databases:
     storageSize: "5Gi"
   vector:
     storageSize: "5Gi"
+  audit:
+    storageSize: "2Gi"
   mongodb:
     storageSize: "2Gi"
   neo4j:
