@@ -4100,7 +4100,6 @@ class CatalogModelUpdate(BaseModel):
 # panel didn't render the dropdown).
 VALID_DEFAULT_MODEL_KINDS = {
     "chat",
-    "builder",
     "browser",
     "citation",
     "embedding",
@@ -4133,7 +4132,6 @@ class UserSettingsUpdate(BaseModel):
     default_vision_model: str | None = None
     default_whisper_model: str | None = None
     default_tts_model: str | None = None
-    default_builder_model: str | None = None
     default_session_model: str | None = None
     default_strategic_model: str | None = None
     default_tactical_model: str | None = None
@@ -19204,7 +19202,7 @@ async def list_available_models(
 
     Returns catalog rows grouped by provider/capability:
 
-    - ``groups`` + ``builder_models`` (chat-capability rows)
+    - ``groups`` (chat-capability rows, grouped by provider)
     - ``auxiliary_models`` / ``vision_models`` / ``embedding_models`` /
       ``whisper_models`` / ``tts_models`` (one helper list per capability)
 
@@ -19230,7 +19228,6 @@ async def list_available_models(
 
     # Build (provider_kind, provider_ref) → group payload.
     groups_by_key: dict[tuple[str, str], dict[str, Any]] = {}
-    builder_models: list[dict[str, Any]] = []
     auxiliary: list[dict[str, Any]] = []
     vision: list[dict[str, Any]] = []
     embedding: list[dict[str, Any]] = []
@@ -19244,7 +19241,7 @@ async def list_available_models(
         ref = row["provider_ref"]
         # Fan-out: under the array model one row contributes to every
         # capability bucket it claims. A multimodal chat row registered as
-        # ['chat','auxiliary','vision'] surfaces in builder_models AND
+        # ['chat','auxiliary','vision'] surfaces in the chat groups AND
         # auxiliary_models AND vision_models simultaneously — which is
         # exactly the operator intent (one physical model serves all three).
         capabilities_set = set(row.get("capabilities") or [])
@@ -19263,9 +19260,9 @@ async def list_available_models(
             whisper.append(helper_entry)
         if "tts" in capabilities_set:
             tts.append(helper_entry)
-        # Chat-only path: register the row in its provider group + the flat
-        # builder list. Embedding-/whisper-/tts-only rows skip this path so
-        # the chat dropdowns don't show non-chat models.
+        # Chat-only path: register the row in its provider group. Embedding-/
+        # whisper-/tts-only rows skip this path so the chat dropdowns don't
+        # show non-chat models.
         if "chat" not in capabilities_set:
             continue
         key = (kind, ref)
@@ -19292,19 +19289,11 @@ async def list_available_models(
                 }
             groups_by_key[key] = group
         group["models"].append(row["model_id"])
-        builder_models.append(
-            {
-                "label": row["display_label"],
-                "id": row["model_id"],
-                "configured": True,
-            }
-        )
 
     groups = list(groups_by_key.values())
 
     return {
         "groups": groups,
-        "builder_models": builder_models,
         "auxiliary_models": auxiliary,
         "vision_models": vision,
         "whisper_models": whisper,

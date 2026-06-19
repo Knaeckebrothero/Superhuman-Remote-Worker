@@ -11,7 +11,6 @@ function createService(mockHttp?: any) {
         {group: 'Local', provider: 'local', configured: true, models: ['openai/gpt-oss-120b']},
         {group: 'OpenAI', provider: 'openai', configured: true, models: ['gpt-5.4', 'gpt-4o']},
       ],
-      builder_models: [{label: 'GPT OSS 120B', id: 'openai/gpt-oss-120b', configured: true}],
       auxiliary_models: [{id: 'gpt-4o-mini', label: 'GPT-4o Mini', configured: true}],
       vision_models: [{id: 'gpt-4o', label: 'GPT-4o', configured: true}],
       whisper_models: [{id: 'whisper-1', label: 'Whisper v1', configured: true}],
@@ -34,7 +33,6 @@ describe('ModelService', () => {
     it('should start with empty signals', () => {
       const {service} = createService();
       expect(service.models()).toEqual([]);
-      expect(service.builderModels()).toEqual([]);
       expect(service.auxiliaryModels()).toEqual([]);
       expect(service.visionModels()).toEqual([]);
       expect(service.whisperModels()).toEqual([]);
@@ -52,7 +50,6 @@ describe('ModelService', () => {
 
       expect(service.models()).toHaveLength(2);
       expect(service.models()[0].group).toBe('Local');
-      expect(service.builderModels()).toHaveLength(1);
       expect(service.auxiliaryModels()).toHaveLength(1);
       expect(service.visionModels()).toHaveLength(1);
       expect(service.whisperModels()).toHaveLength(1);
@@ -115,7 +112,6 @@ describe('ModelService', () => {
       // No hard-coded fallback — DB is the only source of truth. Empty
       // signals drive the empty-state banner + disabled pickers.
       expect(service.models()).toEqual([]);
-      expect(service.builderModels()).toEqual([]);
       expect(service.auxiliaryModels()).toEqual([]);
       expect(service.providers()).toEqual([]);
     });
@@ -126,7 +122,6 @@ describe('ModelService', () => {
           .mockReturnValueOnce(throwError(() => new Error('fail')))
           .mockReturnValueOnce(of({
             groups: [{group: 'Test', provider: 'local', configured: true, models: ['test-model']}],
-            builder_models: [],
             auxiliary_models: [],
             vision_models: [],
             whisper_models: [],
@@ -150,7 +145,6 @@ describe('ModelService', () => {
       const http = {
         get: vi.fn().mockReturnValue(of({
           groups: [],
-          builder_models: [],
           // helper fields omitted (old backend)
           configured_providers: [],
         })),
