@@ -59,7 +59,6 @@ function createComponent() {
     const mockModelService: any = {
         models: signal([]),
         presets: signal([]),
-        builderModels: signal([]),
         auxiliaryModels: signal([]),
         visionModels: signal([]),
         whisperModels: signal([]),

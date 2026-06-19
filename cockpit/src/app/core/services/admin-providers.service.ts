@@ -39,7 +39,6 @@ export interface SystemApiKeyEntry {
  */
 export type DefaultModelKind =
   | 'chat'
-  | 'builder'
   | 'browser'
   | 'citation'
   | 'embedding'
@@ -50,7 +49,6 @@ export type DefaultModelKind =
 
 export const DEFAULT_MODEL_KINDS: DefaultModelKind[] = [
   'chat',
-  'builder',
   'browser',
   'citation',
   'embedding',
@@ -62,7 +60,6 @@ export const DEFAULT_MODEL_KINDS: DefaultModelKind[] = [
 
 const EMPTY_DEFAULTS: Record<DefaultModelKind, string | null> = {
   chat: null,
-  builder: null,
   browser: null,
   citation: null,
   embedding: null,

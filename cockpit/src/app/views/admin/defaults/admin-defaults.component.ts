@@ -62,7 +62,7 @@ import {AppFormFieldComponent} from '../../../ui/form-field';
                       <option [value]="m.id">{{ m.label }}</option>
                     }
                   } @else {
-                    <!-- Chat-slot kinds (chat/builder/browser/citation):
+                    <!-- Chat-slot kinds (chat/browser/citation):
                          strict filter by 'chat' capability via the
                          pre-bucketed groups list. -->
                     @for (group of modelService.models(); track group.group) {

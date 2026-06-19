@@ -21,7 +21,6 @@ function createComponent(overrides?: {
 
   const mockModelService = {
     models: mockModels,
-    builderModels: signal([]),
     auxiliaryModels: signal([]),
     visionModels: signal([]),
     whisperModels: signal([]),
