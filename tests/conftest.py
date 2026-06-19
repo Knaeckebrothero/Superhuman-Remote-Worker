@@ -42,6 +42,22 @@ os.environ.setdefault(
 # store, so provide a dummy URL. setdefault never overrides a real CI/prod value.
 os.environ.setdefault("VECTOR_DB_URL", "postgresql://test:test@localhost:5432/test")
 
+# Pin the orchestrator's top-level packages (``database``, ``services``, ...) in
+# sys.modules before any test runs. Both ``src`` and ``orchestrator`` ship
+# same-named top-level packages (each is its own import root in its own
+# container), and several agent-side tests prepend ``src`` to sys.path. Without
+# this, ``orchestrator.main``'s sibling imports (``from database import ...``,
+# ``from services... import ...``) can resolve to ``src/*`` once an agent test
+# has run, raising ImportError. Importing ``main`` here, while orchestrator/
+# leads sys.path, caches its whole import graph for the session. Agent code and
+# the src-inserting tests never bare-import these colliding packages, so the pin
+# is invisible to them. Best-effort: a failure here just leaves the prior
+# (order-dependent) behavior.
+try:
+    import main as _srw_orchestrator_main  # noqa: F401
+except Exception:
+    pass
+
 
 # =============================================================================
 # F1 multi-tenancy fixture — three users, two projects, jobs/threads/sessions

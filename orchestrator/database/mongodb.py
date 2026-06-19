@@ -391,6 +391,29 @@ class MongoDB:
         collection = self._db["agent_audit"]
         return await collection.count_documents({"job_id": job_id})
 
+    async def iter_tool_calls(self, job_id: str):
+        """Yield all tool-step audit docs for a job (step_number order).
+
+        Backend-agnostic seam for graph_routes (mirrors the former raw-cursor
+        access in graph_routes._get_all_tool_calls). ``_id`` stringified,
+        ``timestamp`` -> isoformat — the shape the cypher parser consumes.
+        """
+        if not self._available or self._db is None:
+            return
+        collection = self._db["agent_audit"]
+        cursor = collection.find({"job_id": job_id, "step_type": "tool"}).sort(
+            "step_number", 1
+        )
+        async for doc in cursor:
+            doc["_id"] = str(doc["_id"])
+            if "timestamp" in doc:
+                doc["timestamp"] = (
+                    doc["timestamp"].isoformat()
+                    if hasattr(doc["timestamp"], "isoformat")
+                    else doc["timestamp"]
+                )
+            yield doc
+
     async def get_job_ids_with_audit(self) -> List[str]:
         """Get list of job IDs that have audit entries.
 
