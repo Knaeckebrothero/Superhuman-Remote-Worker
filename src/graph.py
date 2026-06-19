@@ -1115,18 +1115,18 @@ def create_execute_node(
                 if phase_entries:
                     for entry in phase_entries:
                         try:
-                            instr_content = workspace_manager.read_file(entry.file)
+                            instr_content = workspace_manager.read_file(entry.path)
                             instr_ai, instr_tool = create_instruction_tool_messages(
-                                entry.file, instr_content
+                                entry.path, instr_content
                             )
                             target_messages.append(instr_ai)
                             target_messages.append(instr_tool)
                             logger.debug(
-                                f"[{job_id}] Injected instruction file: {entry.file}"
+                                f"[{job_id}] Injected instruction file: {entry.path}"
                             )
                         except FileNotFoundError:
                             logger.warning(
-                                f"[{job_id}] Phase instruction file not found: {entry.file}"
+                                f"[{job_id}] Phase instruction file not found: {entry.path}"
                             )
 
         # Inject transient messages (todos, memory, knowledge, instruction files)

@@ -57,3 +57,61 @@ def test_parse_skill_binding_from_config():
     assert by_path["skills/research-guide/SKILL.md"].enforce is False
     assert by_path["todo_guide.md"].file == "todo_guide.md"
     assert by_path["todo_guide.md"].enforce is True  # default
+
+
+# ---------------------------------------------------------------------------
+# Task 2: before_tool + phase consumers resolve via entry.path
+# ---------------------------------------------------------------------------
+
+from types import SimpleNamespace  # noqa: E402
+
+from tests._fs_backend import FilesystemTestBackend  # noqa: E402
+from src.core.workspace import WorkspaceManager  # noqa: E402
+from src.tools.context import ToolContext  # noqa: E402
+from src.tools.registry import apply_instruction_enforcement  # noqa: E402
+
+
+def _ctx(tmp_path, entries):
+    ws = WorkspaceManager(job_id="t", backend=FilesystemTestBackend(tmp_path))
+    ctx = ToolContext(workspace_manager=ws)
+    ctx._instruction_files = entries
+    ctx._llm_config = None
+    return ctx
+
+
+def test_before_tool_gate_targets_skill_path(tmp_path):
+    ctx = _ctx(
+        tmp_path,
+        [InstructionFileEntry(trigger="before_tool:next_phase_todos", skill="todo-guide")],
+    )
+    assert ctx.get_enforcement_files("next_phase_todos") == ["skills/todo-guide/SKILL.md"]
+    # gate closed until the skill path is read
+    assert ctx.check_tool_enforcement("next_phase_todos") is not None
+    ctx.record_file_read("skills/todo-guide/SKILL.md")  # what use_skill / read_file record
+    assert ctx.check_tool_enforcement("next_phase_todos") is None
+
+
+def test_phase_binding_targets_skill_path(tmp_path):
+    ctx = _ctx(
+        tmp_path,
+        [InstructionFileEntry(trigger="phase:tactical", skill="research-guide", enforce=False)],
+    )
+    entries = ctx.get_phase_instruction_files("tactical")
+    assert len(entries) == 1 and entries[0].path == "skills/research-guide/SKILL.md"
+    assert ctx.get_phase_instruction_files("strategic") == []
+
+
+def test_apply_enforcement_wrapper_uses_skill_path(tmp_path):
+    ctx = _ctx(
+        tmp_path,
+        [InstructionFileEntry(trigger="before_tool:next_phase_todos", skill="todo-guide")],
+    )
+    calls = []
+    tool = SimpleNamespace(
+        name="next_phase_todos", func=lambda *a, **k: (calls.append(1), "OK")[1]
+    )
+    apply_instruction_enforcement([tool], ctx)
+    blocked = tool.func()
+    assert "skills/todo-guide/SKILL.md" in blocked and calls == []  # nudged, not run
+    ctx.record_file_read("skills/todo-guide/SKILL.md")
+    assert tool.func() == "OK" and calls == [1]  # gate opened

@@ -659,7 +659,7 @@ def apply_instruction_enforcement(
     enforcement_map: Dict[str, List[str]] = {}
     for entry in context._instruction_files:
         if entry.trigger_type == "before_tool" and entry.enforce:
-            enforcement_map.setdefault(entry.trigger_target, []).append(entry.file)
+            enforcement_map.setdefault(entry.trigger_target, []).append(entry.path)
 
     if not enforcement_map:
         return tools
