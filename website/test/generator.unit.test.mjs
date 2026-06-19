@@ -50,3 +50,17 @@ test('production with a bundled service omits its externalUrl', () => {
   const { valuesYaml } = generate('production', { ...prodBase, postgres: 'bundled' });
   assert.doesNotMatch(valuesYaml, /postgres:\n\s+enabled: true\n\s+internal: false/);
 });
+
+test('production-vms emits a vmController block', () => {
+  const { valuesYaml } = generate('production-vms', {
+    ...prodBase,
+    vm: { transport: 'http', namespace: 'agent-vms', storageClass: 'longhorn',
+          diskSize: '30Gi', sshPublicKey: 'ssh-ed25519 AAAA... agent@srw' },
+  });
+  assert.match(valuesYaml, /vmController:\n\s+enabled: true/);
+  assert.match(valuesYaml, /transport: http/);
+  assert.match(valuesYaml, /namespace: agent-vms/);
+  assert.match(valuesYaml, /vmStorageClass: longhorn/);
+  assert.match(valuesYaml, /vmDiskSize: 30Gi/);
+  assert.match(valuesYaml, /vmSshPublicKey: "ssh-ed25519 AAAA\.\.\. agent@srw"/);
+});
