@@ -2226,6 +2226,11 @@
   justify-content: flex-end;
   align-items: center;
   gap: v.$space-md;
+  // Align to the composer's centered reading column (same max-width + auto
+  // margins) so the bar sits flush above the input instead of floating out
+  // in the right margin.
+  max-width: var(--chat-content-width);
+  margin: 0 auto 4px;
   padding: 2px v.$space-sm;
   font-family: var(--font-mono, monospace);
   font-size: 11px;
