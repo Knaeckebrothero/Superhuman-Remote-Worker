@@ -87,3 +87,18 @@ test('fillSecrets substitutes provided values for placeholders', () => {
   assert.match(secretSkeleton, /POSTGRES_PASSWORD: s3cret/);
   assert.doesNotMatch(secretSkeleton, /POSTGRES_PASSWORD: CHANGE_ME/);
 });
+
+test('install script applies secret then helm-installs from the OCI chart', () => {
+  const { installScript } = generate('production', prodBase);
+  assert.match(installScript, /^#!\/usr\/bin\/env bash/);
+  assert.match(installScript, /set -euo pipefail/);
+  assert.match(installScript, /kubectl create namespace srw/);
+  assert.match(installScript, /kubectl apply -n srw -f srw-secrets\.yaml/);
+  assert.match(installScript, /helm install srw oci:\/\/ghcr\.io\/knaeckebrothero\/charts\/superhuman-remote-worker/);
+  assert.match(installScript, /-f values\.yaml/);
+});
+
+test('evaluation install script does not apply an external secret', () => {
+  const { installScript } = generate('evaluation', evalInputs);
+  assert.doesNotMatch(installScript, /kubectl apply -n srw -f srw-secrets\.yaml/);
+});
