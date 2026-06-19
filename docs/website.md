@@ -144,7 +144,7 @@ CTAs:
 Licensing framing: SRW is source-available, not open source. Be honest about this — don't imply MIT/Apache. The page must make the two valid paths clear: (a) pay for the hosted product, or (b) buy a commercial license and self-host. Reading the source is free; running it commercially is not.
 
 Hard constraints:
-- Single static index.html, inlined CSS, ≤14kb gzipped on the wire (raw source can be ~40–50kb, gzip will handle it). Verify with: gzip -c index.html | wc -c
+- Single static index.html, inlined CSS, ≤14kb gzipped on the wire (raw source can be ~40–50kb, gzip will handle it). Verify with: gzip -c website/index.html | wc -c
 - No JS frameworks. Vanilla JS only if it earns its bytes.
 - No web fonts, no raster images — system fonts + inline SVG for any diagrams.
 - Must render and be usable with JS disabled.
