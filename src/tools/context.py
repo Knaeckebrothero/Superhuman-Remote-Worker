@@ -560,7 +560,7 @@ class ToolContext:
                 and entry.trigger_type == "before_tool"
                 and entry.trigger_target == tool_name
             ):
-                required.append(entry.file)
+                required.append(entry.path)
         return required
 
     def check_tool_enforcement(self, tool_name: str) -> Optional[str]:
