@@ -1,6 +1,20 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { generate, PROFILES } from '../generator.mjs';
+import { readFileSync } from 'node:fs';
+import { generate, validate, PROFILES } from '../generator.mjs';
+
+// Walk a JSON Schema collecting dotted paths of every property with an `enum`.
+function collectEnumPaths(node, prefix = '') {
+  let out = [];
+  if (node && node.properties) for (const [k, v] of Object.entries(node.properties)) {
+    const p = prefix ? `${prefix}.${k}` : k;
+    if (v.enum) out.push(p);
+    out = out.concat(collectEnumPaths(v, p));
+  }
+  return out;
+}
+// Keep in sync with the structural rules in generator.mjs's validate().
+const KNOWN_ENUM_PATHS = ['databases.neo4j.edition', 'vmController.transport'];
 
 const evalInputs = {
   licenseAccepted: true, domain: 'eval.example.com',
@@ -101,4 +115,33 @@ test('install script applies secret then helm-installs from the OCI chart', () =
 test('evaluation install script does not apply an external secret', () => {
   const { installScript } = generate('evaluation', evalInputs);
   assert.doesNotMatch(installScript, /kubectl apply -n srw -f srw-secrets\.yaml/);
+});
+
+test('validate flags missing license + domain', () => {
+  const errs = validate('evaluation', { licenseAccepted: false, domain: '' });
+  assert.ok(errs.some((e) => /license/i.test(e)));
+  assert.ok(errs.some((e) => /domain/i.test(e)));
+});
+
+test('validate requires a URL for an external service', () => {
+  const errs = validate('production', { ...prodBase, postgres: 'external', postgresUrl: '' });
+  assert.ok(errs.some((e) => /postgres.*url/i.test(e)));
+});
+
+test('validate requires license acceptance for neo4j enterprise', () => {
+  const errs = validate('production', { ...prodBase, neo4jEnabled: true, neo4jEdition: 'enterprise' });
+  assert.equal(errs.filter((e) => /neo4j/i.test(e)).length, 0);
+  const errs2 = validate('production', { ...prodBase, neo4jEnabled: true, neo4jEdition: 'enterprise', neo4jLicenseAccepted: false });
+  assert.ok(errs2.some((e) => /neo4j.*license/i.test(e)));
+});
+
+test('valid production input yields no errors', () => {
+  assert.deepEqual(validate('production', prodBase), []);
+});
+
+test('structural rules cover every enum in helm/values.schema.json', () => {
+  const schema = JSON.parse(readFileSync(new URL('../../helm/values.schema.json', import.meta.url)));
+  for (const path of collectEnumPaths(schema)) {
+    assert.ok(KNOWN_ENUM_PATHS.includes(path), `validator missing enum rule for ${path}`);
+  }
 });
