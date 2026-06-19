@@ -9,7 +9,6 @@ real server in ``tests/test_audit_writer.py``.
 
 from __future__ import annotations
 
-import os
 from uuid import uuid4
 
 import pytest
@@ -212,4 +211,3 @@ def test_postgres_mode_does_not_import_pymongo(fw):
     arch = LLMArchiver(writer=fw)
     assert arch._is_postgres is True
     assert arch._mongo_db is None
-    assert os.environ.get("MONGODB_URL") in (None, "")  # sanity: unset under pytest

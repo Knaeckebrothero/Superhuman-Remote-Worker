@@ -1,31 +1,37 @@
 """Graph change routes for timeline visualization.
 
-Provides endpoints to fetch and parse Neo4j graph changes from the MongoDB audit trail.
+Provides endpoints to fetch and parse Neo4j graph changes from the audit trail.
 """
 
 import math
 import re
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 
-from database import MongoDB
+from security.access import require_job_access
 
-# Shared MongoDB instance - will be connected via lifespan in main.py
-# We need to import the instance from main to share the connection
-# For now, create a module-level reference that will be set from main
-_mongodb: MongoDB | None = None
-
-
-def set_mongodb(mongodb: MongoDB) -> None:
-    """Set the MongoDB instance from main.py."""
-    global _mongodb
-    _mongodb = mongodb
+# Active audit reader (Mongo or the Postgres AuditStore) + the app DB, set from
+# main.py's lifespan. The reader exposes iter_tool_calls(job_id); both qualify.
+_audit_reader: Any = None
+_postgres_db: Any = None
 
 
-def get_mongodb() -> MongoDB | None:
-    """Get the MongoDB instance."""
-    return _mongodb
+def set_audit_reader(reader: Any) -> None:
+    """Set the active audit reader instance from main.py."""
+    global _audit_reader
+    _audit_reader = reader
+
+
+def set_postgres_db(db: Any) -> None:
+    """Set the app Postgres DB (for require_job_access) from main.py."""
+    global _postgres_db
+    _postgres_db = db
+
+
+def get_audit_reader() -> Any:
+    """Get the active audit reader instance."""
+    return _audit_reader
 
 
 router = APIRouter(prefix="/api/graph", tags=["graph"])
@@ -37,10 +43,10 @@ MAX_DELTA_CHAIN = 50
 
 
 @router.get("/changes/{job_id}")
-async def get_graph_changes(job_id: str) -> dict[str, Any]:
+async def get_graph_changes(job_id: str, request: Request) -> dict[str, Any]:
     """Get parsed graph changes for a job.
 
-    Fetches tool calls from MongoDB, parses Cypher queries,
+    Fetches tool calls from the audit store, parses Cypher queries,
     and returns snapshots + deltas for timeline visualization.
 
     Args:
@@ -49,12 +55,15 @@ async def get_graph_changes(job_id: str) -> dict[str, Any]:
     Returns:
         Dict with jobId, timeRange, summary, snapshots, and deltas
     """
-    mongodb = get_mongodb()
-    if mongodb is None or not mongodb.is_available:
+    reader = get_audit_reader()
+    if reader is None or not reader.is_available:
         raise HTTPException(
             status_code=503,
-            detail="MongoDB not available",
+            detail="Audit store not available",
         )
+
+    # Authorize: this was previously the only unauthenticated audit read.
+    await require_job_access(request, _postgres_db, job_id)
 
     try:
         # Get all audit entries for this job
@@ -97,7 +106,7 @@ async def get_graph_changes(job_id: str) -> dict[str, Any]:
                     "timestamp": entry["timestamp"],
                     "toolCallIndex": i,
                     "cypherQuery": query,
-                    "toolCallId": entry["_id"],
+                    "toolCallId": str(entry.get("id", entry.get("_id", ""))),
                     "stepNumber": entry.get("step_number"),
                     "changes": parsed,
                 }
@@ -131,35 +140,17 @@ async def get_graph_changes(job_id: str) -> dict[str, Any]:
 
 
 async def _get_all_tool_calls(job_id: str) -> list[dict[str, Any]]:
-    """Get all tool_call and tool_result entries for a job.
+    """Get all tool-step entries for a job (step_number order).
 
-    Fetches all pages from MongoDB to get complete audit trail.
+    Backend-agnostic: the active reader's ``iter_tool_calls`` yields the stitched
+    tool docs (Mongo or Postgres), which the cypher parser consumes unchanged.
     """
-    mongodb = get_mongodb()
-    if mongodb is None or not mongodb.is_available or mongodb._db is None:
+    reader = get_audit_reader()
+    if reader is None or not reader.is_available:
         return []
 
-    collection = mongodb._db["agent_audit"]
-
-    # Query for tool-related entries
-    # Note: archiver stores tool calls with step_type="tool"
-    query = {
-        "job_id": job_id,
-        "step_type": "tool",
-    }
-
-    # Fetch all matching entries sorted by step_number
-    cursor = collection.find(query).sort("step_number", 1)
-
     entries = []
-    async for doc in cursor:
-        doc["_id"] = str(doc["_id"])
-        if "timestamp" in doc:
-            doc["timestamp"] = (
-                doc["timestamp"].isoformat()
-                if hasattr(doc["timestamp"], "isoformat")
-                else doc["timestamp"]
-            )
+    async for doc in reader.iter_tool_calls(job_id):
         entries.append(doc)
 
     return entries

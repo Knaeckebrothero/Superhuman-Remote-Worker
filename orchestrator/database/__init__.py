@@ -42,6 +42,7 @@ from .postgres import (
     REQUIRED_TABLES,
 )
 from .mongodb import MongoDB, FILTER_MAPPINGS, FilterCategory
+from .audit_store import AuditStore
 
 __all__ = [
     # PostgreSQL
@@ -57,4 +58,6 @@ __all__ = [
     "MongoDB",
     "FILTER_MAPPINGS",
     "FilterCategory",
+    # Postgres audit store (reader)
+    "AuditStore",
 ]
