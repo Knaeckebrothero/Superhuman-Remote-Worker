@@ -4,8 +4,7 @@ FROM nginx:alpine
 LABEL description="SRW sales page + self-host config generator"
 
 # Only the runtime assets — NOT website/test/ or anything else.
-COPY website/index.html website/configure.html website/generator.mjs /usr/share/nginx/html/
-# og-image.png is added by the og:image task; COPY it here once it exists.
+COPY website/index.html website/configure.html website/generator.mjs website/og-image.png /usr/share/nginx/html/
 
 # Clean /configure URL + correct .mjs MIME (a regex location, so the default
 # mime.types include still covers everything else) + listen 80.
