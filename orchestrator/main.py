@@ -2609,6 +2609,71 @@ async def _check_vm_permission(
         )
 
 
+async def _enforce_workspace_upgrade_grants(
+    thread: dict,
+    *,
+    target_tier: str,
+) -> None:
+    """Sec-1 — shared upgrade-authorization gate (server-side, fail-closed).
+
+    The single PEP that both the session upgrade endpoint
+    (``agent_upgrade_thread_to_workspace``, workspace_tier_upgrade.md §4.2 S4)
+    and the future worker ``provision-workspace`` endpoint (§4.3 W2) call before
+    provisioning. Re-runs the dispatch PDP (``capability_grants.evaluate``) on the
+    POST-UPGRADE config — the thread's stored ``config_override`` with
+    ``workspace.backend`` flipped to ``target_tier`` — exactly as
+    ``_enforce_dispatch_grants`` does at dispatch, just re-run at upgrade time:
+
+    - ``target_tier='vm'`` trips the ``vm_workspace`` grant requirement, and
+      additionally keeps the operator gate (the global ``vm_workspaces``
+      kill-switch + per-user ``can_use_vm`` via ``_check_vm_permission``).
+    - ``target_tier='sandbox'`` is NOT gated by the backend (the PDP gates only
+      ``vm`` and explicitly-declared tool flags), so it passes by default —
+      matching "sandbox is the ungated default tier" — unless the thread's
+      config already declares a gated tool (e.g. ``tools.shell``) the owner
+      lacks, in which case dispatch would have rejected it too.
+
+    Raises ``HTTPException(403)`` on violation. No new grant key, no
+    sandbox-specific rule — identical to dispatch-time enforcement.
+    """
+    owner_id = thread.get("user_id")
+    owner = await postgres_db.get_user(owner_id) if owner_id else None
+
+    # vm keeps its operator gate (global kill-switch + can_use_vm), on top of the
+    # vm_workspace grant the PDP enforces below.
+    if target_tier == "vm":
+        await _check_vm_permission(owner, job_needs_vm=True)
+
+    metadata = thread.get("metadata") or {}
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except (json.JSONDecodeError, TypeError):
+            metadata = {}
+    config_override = metadata.get("config_override") or {}
+    if not isinstance(config_override, dict):
+        config_override = {}
+    # Post-upgrade config = the frozen override with the backend flipped. A
+    # shallow merge of the workspace sub-dict suffices — the PDP only reads
+    # workspace.backend plus declared tool/autonomy flags.
+    post_upgrade = {
+        **config_override,
+        "workspace": {
+            **(config_override.get("workspace") or {}),
+            "backend": target_tier,
+        },
+    }
+    project_ids = await _grant_project_ids(owner) if owner else []
+    try:
+        await _enforce_dispatch_grants(
+            post_upgrade, runner_user_id=owner_id, project_ids=project_ids
+        )
+    except GrantDenied as exc:
+        raise HTTPException(
+            status_code=403, detail=_grant_violations_detail(exc.violations)
+        ) from exc
+
+
 async def _archive_and_cleanup_workspace(
     entity_id: str,
     entity_type: str = "jobs",
@@ -13177,6 +13242,11 @@ async def agent_upgrade_thread_to_workspace(
     thread = await postgres_db.get_thread(thread_id)
     if not thread:
         raise HTTPException(status_code=404, detail="Thread not found")
+
+    # Sec-1 — authorize the upgrade against the owner's capability grants BEFORE
+    # provisioning (fail-closed). sandbox passes by default; a shell-restricted
+    # owner (or a vm target without vm_workspace) is refused with 403.
+    await _enforce_workspace_upgrade_grants(thread, target_tier=target_tier)
 
     if not (container_provisioner.is_available and container_provisioner.in_cluster):
         raise HTTPException(

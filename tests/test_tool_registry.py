@@ -345,6 +345,24 @@ class TestLoadToolsValidation:
         with pytest.raises(ValueError, match="todo_manager"):
             load_tools(["todo_complete"], ctx)
 
+    def test_request_workspace_upgrade_loads_without_todo_manager(self):
+        """The lite control tool (workspace_tier_upgrade.md §4.2 S5) loads on a
+        session-shaped context — workspace_manager present, todo_manager=None —
+        where todo/job core tools would require a TodoManager. It is the lone
+        manager-independent core tool, so the relaxed core gate must let it through.
+        """
+        ws = MagicMock()
+        ws.is_initialized = True
+        ctx = ToolContext(workspace_manager=ws)  # no todo_manager (a session)
+        tools = load_tools(["request_workspace_upgrade"], ctx)
+        assert [t.name for t in tools] == ["request_workspace_upgrade"]
+
+    def test_request_workspace_upgrade_loads_without_any_manager(self):
+        """It needs neither workspace nor todo — a bare context still loads it."""
+        ctx = ToolContext()
+        tools = load_tools(["request_workspace_upgrade"], ctx)
+        assert [t.name for t in tools] == ["request_workspace_upgrade"]
+
 
 class TestLoadToolsForPhase:
     """Tests for load_tools_for_phase()."""

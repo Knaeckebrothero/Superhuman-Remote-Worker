@@ -2025,6 +2025,19 @@ export class PersistentChatService {
                 );
                 break;
 
+            case 'workspace_upgrade.needed':
+                // The agent called request_workspace_upgrade — offer the upgrade
+                // (HITL: a human accepts before anything provisions). The minimal
+                // accept path is the /upgrade-workspace slash command, which sends
+                // the same upgrade-to-workspace control message.
+                this._systemMessage(
+                    `The agent requested a real workspace: `
+                    + `${(params['reason'] as string) || 'shell/git tools needed'}. `
+                    + `Send /upgrade-workspace to provision a sandbox `
+                    + `(your files carry over).`,
+                );
+                break;
+
             case 'workspace_upgrade.started':
                 this._systemMessage('Provisioning workspace, please wait...');
                 break;

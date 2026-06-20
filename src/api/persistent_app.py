@@ -186,6 +186,7 @@ _NOTIFICATION_METHODS = frozenset(
     {
         "permission.request",
         "vm_upgrade.needed",
+        "workspace_upgrade.needed",
         "approve",
         "deny",
         "ready",
@@ -321,7 +322,7 @@ def _ensure_persistent_loop_started(
             on_turn_complete=_loop_on_turn_complete,
             on_error=_loop_on_error,
             check_interrupt=_loop_check_interrupt,
-            on_vm_upgrade_needed=_loop_on_vm_upgrade_needed,
+            on_workspace_upgrade_needed=_loop_on_workspace_upgrade_needed,
             on_context_compacted=_loop_on_context_compacted,
             persist_message=_loop_persist_message,
             archive_llm_call=_loop_archive_llm_call,
@@ -3318,8 +3319,29 @@ async def _loop_on_error(message: str, turn_id: Optional[int] = None) -> None:
             logger.warning(f"Turn-error persist failed (non-fatal): {e}")
 
 
-async def _loop_on_vm_upgrade_needed(freeze_data: Dict[str, Any]) -> None:
-    """Notify subscribers that sudo was detected and VM upgrade is available."""
+async def _loop_on_workspace_upgrade_needed(freeze_data: Dict[str, Any]) -> None:
+    """Notify subscribers that a workspace upgrade is available.
+
+    Fires for two distinct freeze types and emits the matching per-tier offer
+    event so the existing cockpit handlers + nats_bridge map keep working
+    unchanged (workspace_tier_upgrade.md §4.2 S5):
+
+    - ``workspace_upgrade_required`` — a lite agent called
+      ``request_workspace_upgrade`` → emit ``workspace_upgrade.needed`` (the
+      sandbox offer; accept sends ``upgrade-to-workspace``).
+    - ``vm_upgrade_required`` — a sandbox sudo intercept → emit
+      ``vm_upgrade.needed`` (the existing VM offer; accept sends
+      ``upgrade-to-vm``). Unchanged behavior.
+    """
+    if freeze_data.get("freeze_type") == "workspace_upgrade_required":
+        _broadcast(
+            "workspace_upgrade.needed",
+            {
+                "target_tier": freeze_data.get("target_tier", "sandbox"),
+                "reason": freeze_data.get("reason", "A real workspace is needed"),
+            },
+        )
+        return
     _broadcast(
         "vm_upgrade.needed",
         {
