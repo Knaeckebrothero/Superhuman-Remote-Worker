@@ -60,6 +60,17 @@ class ToolContext:
         None  # TodoManager, imported later to avoid circular deps
     )
     postgres_db: Optional["PostgresDB"] = None
+    vector_db: Optional["PostgresDB"] = (
+        None  # Vector-store pool (srw_vector) — citations live here, NOT in
+        # postgres_db (the main app DB). Injected from agent.vector_conn.
+    )
+    verify_aux: Optional[Any] = (
+        None  # AuxiliaryLLM for citation verification (Phase 2). When set,
+        # cite_* schedules async verdict write-back; None = verification off.
+    )
+    verify_citation_prompt: Optional[str] = (
+        None  # Matrix-resolved citation-verification system prompt.
+    )
     datasources: Dict[str, Any] = field(default_factory=dict)
     config: Dict[str, Any] = field(default_factory=dict)
     _job_id: Optional[str] = None  # Direct job_id override
@@ -260,42 +271,40 @@ class ToolContext:
         return self.config.get(key, default)
 
     def get_citation_engine(self) -> Any:
-        """Lazily initialize and return CitationEngine.
+        """Lazily construct the CitationEngine bound to SRW's vector pool.
 
-        Creates a CitationEngine instance on first call, reuses it afterwards.
-        Uses multi-agent mode (PostgreSQL); the DSN is composed at runtime
-        from CITATION_POSTGRES_* env vars (with fallback to legacy URL envs).
-
-        Returns:
-            CitationEngine instance
+        The engine is async and performs all I/O on the shared vector-store
+        pool (``srw_vector``, ``self.vector_db``); construction itself does no
+        I/O, so this stays synchronous. Returns a cached instance.
 
         Raises:
-            ImportError: If citation_engine package is not installed
+            ImportError: If the citation_engine package is not importable.
+            RuntimeError: If no vector-store pool is attached.
         """
         if self.citation_engine is None:
-            from citation_engine import CitationEngine, CitationContext
+            from citation_engine import CitationContext, CitationEngine
 
-            from src.utils.db_url import build_postgres_url
+            if self.vector_db is None:
+                raise RuntimeError(
+                    "Citations require the vector store (srw_vector); no vector "
+                    "pool is attached (VECTOR_POSTGRES_* unset)."
+                )
 
             # Create context for audit trails using job_id as session
             ctx = CitationContext(
                 session_id=self.job_id or "unknown",
                 agent_id=self.config.get("agent_id", "unknown"),
             )
-
-            db_url = (
-                build_postgres_url("CITATION_POSTGRES", fallback_env="CITATION_DB_URL")
-                or build_postgres_url("VECTOR_POSTGRES", fallback_env="VECTOR_DB_URL")
-                or build_postgres_url("POSTGRES", fallback_env="DATABASE_URL")
-            )
             self.citation_engine = CitationEngine(
-                mode="multi-agent", context=ctx, db_url=db_url
+                db=self.vector_db,
+                context=ctx,
+                verify_aux=self.verify_aux,
+                verify_prompt=self.verify_citation_prompt,
             )
-            self.citation_engine._connect()
 
         return self.citation_engine
 
-    def get_or_register_doc_source(
+    async def get_or_register_doc_source(
         self, file_path: str, name: Optional[str] = None
     ) -> int:
         """Get cached source_id or register new document source.
@@ -316,11 +325,11 @@ class ToolContext:
             return self._source_registry[file_path]
 
         engine = self.get_citation_engine()
-        source = engine.add_doc_source(file_path, name=name)
+        source = await engine.add_doc_source(file_path, name=name)
         self._source_registry[file_path] = source.id
         return source.id
 
-    def get_or_register_web_source(
+    async def get_or_register_web_source(
         self, url: str, name: Optional[str] = None
     ) -> tuple[int, Optional[str]]:
         """Get cached source_id or register new web source.
@@ -343,7 +352,7 @@ class ToolContext:
             return source_id, fetch_error
 
         engine = self.get_citation_engine()
-        source = engine.add_web_source(url, name=name)
+        source = await engine.add_web_source(url, name=name)
         self._source_registry[url] = source.id
 
         # Check if content was actually fetched
@@ -494,13 +503,14 @@ class ToolContext:
         return req
 
     def close_citation_engine(self) -> None:
-        """Close CitationEngine connection if open.
+        """Drop the cached CitationEngine reference.
 
-        Should be called when the tool context is being disposed of
-        to properly clean up database connections.
+        The engine no longer owns a DB connection — it borrows the agent's
+        shared vector pool (``vector_db``), which the agent closes on shutdown.
+        So there is nothing to close here; just release the reference and clear
+        the per-job source cache.
         """
         if self.citation_engine is not None:
-            self.citation_engine.close()
             self.citation_engine = None
             self._source_registry.clear()
 

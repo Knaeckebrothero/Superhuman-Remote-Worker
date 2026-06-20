@@ -4,16 +4,32 @@ Citation Engine - Core Implementation
 The main CitationEngine class that provides citation functionality
 for AI agents.
 
+Native Superhuman-Remote-Worker subsystem (see
+``docs/features/citation_engine_integration.md``). The engine is **async-native**
+and runs exclusively against SRW's managed vector store (``srw_vector``) through
+the shared asyncpg pool (``src.database.postgres_db.PostgresDB``). It owns no
+database connection of its own and has no SQLite / standalone mode — the host
+application's ``orchestrator/database/migrations/vector/`` owns the schema.
+
+The engine collapsed the DB + embedding + verification stacks onto SRW:
+- Data access is ``async`` on the injected vector pool (no ``psycopg2``).
+- Chunk embeddings use SRW's async embedding service (``get_embedding_service``),
+  matching the host ``source_embeddings.embedding vector(4096)`` column.
+- Verification runs on SRW's **auxiliary-LLM service** (Phase 2): ``cite_*``
+  writes the citation ``pending`` and returns immediately; a background
+  ``VerifyCitationTask`` writes the verdict back (eventually-consistent). The
+  engine owns no LLM client or credentials.
+
 Based on the Citation & Provenance Engine Design Document v0.3.
 """
 
+import asyncio
 import hashlib
 import json
 import logging
 import os
 import re
-import sqlite3
-from contextlib import contextmanager
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -34,542 +50,137 @@ from .models import (
     VerificationResult,
     VerificationStatus,
 )
-from .schema import (
-    get_migration_insert,
-    get_pending_migrations,
-    get_schema,
-    get_version_query,
-)
 
 # Set up logging
 log = logging.getLogger(__name__)
 
-# Groq auto-detection: model prefixes served by Groq's OpenAI-compatible API
-GROQ_MODEL_PREFIXES = (
-    "llama-",
-    "meta-llama/",
-    "mixtral-",
-    "gemma-",
-    "gemma2-",
-    "deepseek-",
-    "qwen/",
-    "moonshotai/",
-    "openai/gpt-oss",
-    "groq/",
-    "canopylabs/",
-    "whisper-",
-)
-GROQ_BASE_URL = "https://api.groq.com/openai/v1"
-
-
-def _resolve_llm_provider(model: str, llm_url: str | None) -> str:
-    """
-    Resolve which LLM provider to use.
-
-    Priority:
-        1. CITATION_LLM_PROVIDER env var (explicit override)
-        2. CITATION_LLM_URL is set → "custom"
-        3. Model name matches a Groq prefix → "groq"
-        4. Default → "openai"
-    """
-    explicit = os.getenv("CITATION_LLM_PROVIDER", "").strip().lower()
-    if explicit:
-        return explicit
-    if llm_url:
-        return "custom"
-    if any(model.lower().startswith(p) for p in GROQ_MODEL_PREFIXES):
-        return "groq"
-    return "openai"
-
 
 class CitationEngine:
     """
-    Citation & Provenance Engine for AI agents.
+    Citation & Provenance Engine for AI agents (SRW-native, async).
 
-    Supports two modes:
-    - Basic (SQLite): Single-agent, zero setup, local development
-    - Multi-Agent (PostgreSQL): Shared citation pool, production deployments
+    The engine always runs inside Superhuman-Remote-Worker against the shared
+    vector store. It is constructed with an SRW ``PostgresDB`` pool bound to that
+    store; it never opens its own connection.
 
-    Usage:
-        # Basic mode (default)
-        engine = CitationEngine(mode="basic", db_path="./citations.db")
+    Usage::
 
-        # Multi-agent mode
-        engine = CitationEngine(mode="multi-agent")
+        engine = CitationEngine(db=agent.vector_conn, context=ctx)
+        source = await engine.add_doc_source("./document.pdf", name="My Doc")
+        result = await engine.cite_doc(
+            claim="The regulation requires X",
+            source_id=source.id,
+            quote_context="Full paragraph...",
+            locator={"page": 24},
+        )
 
-        with engine:
-            source = engine.add_doc_source("./document.pdf", name="My Doc")
-            result = engine.cite_doc(
-                claim="The regulation requires X",
-                source_id=source.id,
-                quote_context="Full paragraph...",
-                locator={"page": 24}
-            )
-
-    Environment Variables:
-        CITATION_DB_URL: PostgreSQL connection string (multi-agent mode)
-        CITATION_LLM_PROVIDER: Force provider: openai | groq | custom (auto-detected if unset)
-        CITATION_LLM_URL: Custom LLM endpoint (e.g., llama.cpp server)
-        CITATION_LLM_MODEL: Model to use for verification (default: gpt-4o-mini)
-        CITATION_REASONING_REQUIRED: none | low | medium | high (default: low)
+    Verification runs on SRW's auxiliary-LLM service: ``cite_*`` returns
+    ``pending`` and a background ``VerifyCitationTask`` (on ``verify_aux``)
+    writes the verdict back. The engine owns no LLM client or credentials.
     """
-
-    # Database connection types
-    SQLITE_MODE = "basic"
-    POSTGRESQL_MODE = "multi-agent"
 
     def __init__(
         self,
-        mode: str = "basic",
-        db_path: str | None = None,
+        db: Any,
         context: CitationContext | None = None,
+        verify_aux: Any | None = None,
+        verify_prompt: str | None = None,
     ):
         """
         Initialize the Citation Engine.
 
         Args:
-            mode: "basic" (SQLite) or "multi-agent" (PostgreSQL)
-            db_path: Path to SQLite file (basic mode) or None to use default
-            context: Optional citation context for audit trails
-
-        Environment Variables:
-            CITATION_DB_URL: PostgreSQL connection string (multi-agent mode)
-            CITATION_LLM_URL: Custom LLM endpoint (e.g., llama.cpp server)
-            CITATION_LLM_MODEL: Model to use for verification
-            CITATION_REASONING_REQUIRED: none | low | medium | high
+            db: An SRW ``PostgresDB`` instance bound to the vector store
+                (``srw_vector``). The engine performs all I/O through this
+                shared async pool and never opens its own connection.
+            context: Optional citation context for audit trails. ``session_id``
+                is mapped to the citation ``job_id``.
+            verify_aux: Optional SRW ``AuxiliaryLLM`` (the citation-verification
+                model — a dedicated ``CITATION_LLM`` model or the auxiliary-model
+                fallback). When set, ``cite_*`` schedules background verification;
+                when ``None``, citations are created ``pending`` and left
+                unverified (verification disabled / unavailable).
+            verify_prompt: The matrix-resolved citation-verification system
+                prompt handed to ``VerifyCitationTask``.
         """
-        log.debug("Initializing CitationEngine...")
+        log.debug("Initializing CitationEngine (SRW-native async)...")
 
-        self.mode = mode
+        if db is None:
+            raise ValueError(
+                "CitationEngine requires an SRW vector PostgresDB pool. "
+                "No vector store is configured (VECTOR_POSTGRES_* unset)."
+            )
+
+        self.db = db
         self.context = context
 
-        # Database configuration
-        if mode == self.SQLITE_MODE:
-            self.db_path = db_path or os.getenv("CITATION_DB_PATH", "./citations.db")
-            self._db_type = "sqlite"
-            log.debug(f"Configured for SQLite mode with path: {self.db_path}")
-        elif mode == self.POSTGRESQL_MODE:
-            self.db_url = os.getenv("CITATION_DB_URL")
-            if not self.db_url:
-                log.error(
-                    "CITATION_DB_URL environment variable not set for multi-agent mode"
-                )
-                raise ValueError(
-                    "CITATION_DB_URL environment variable required for multi-agent mode"
-                )
-            self._db_type = "postgresql"
-            log.debug("Configured for PostgreSQL mode")
-        else:
-            log.error(f"Invalid mode specified: {mode}")
-            raise ValueError(f"Unknown mode: {mode}. Use 'basic' or 'multi-agent'.")
-
-        # LLM configuration
-        self.llm_url = os.getenv("CITATION_LLM_URL")
-        self.llm_model = os.getenv("CITATION_LLM_MODEL", "gpt-4o-mini")
-        self.llm_provider = _resolve_llm_provider(self.llm_model, self.llm_url)
-
-        if self.llm_provider == "groq":
-            self.llm_api_key = os.getenv("GROQ_API_KEY", "")
-            if not self.llm_url:
-                self.llm_url = GROQ_BASE_URL
-            if not self.llm_api_key:
-                log.warning(
-                    "Groq provider detected but GROQ_API_KEY is not set. "
-                    "Set GROQ_API_KEY or use CITATION_LLM_PROVIDER to override."
-                )
-        else:
-            self.llm_api_key = os.getenv("OPENAI_API_KEY", "")
-
-        self.reasoning_level = os.getenv("CITATION_REASONING_LEVEL", "high")
-        self.skip_verification = (
-            os.getenv("CITATION_SKIP_VERIFICATION", "false").lower() == "true"
-        )
-
-        # Reasoning requirement configuration
+        # Whether the agent must supply relevance_reasoning for low/medium-
+        # confidence citations — a citation-quality gate, independent of the
+        # verifier. Default 'low' = required only for low-confidence claims.
         reasoning_config = os.getenv("CITATION_REASONING_REQUIRED", "low")
         if reasoning_config not in ("none", "low", "medium", "high"):
             log.warning(
-                f"Invalid CITATION_REASONING_REQUIRED value: {reasoning_config}. Using 'low'."
+                "Invalid CITATION_REASONING_REQUIRED value: %s. Using 'low'.",
+                reasoning_config,
             )
             reasoning_config = "low"
         self.reasoning_required = reasoning_config
 
-        # Connection will be established on first use or with context manager
-        self._conn = None
-        self._cursor = None
-        self._llm_client = None
+        # Verification runs on SRW's auxiliary-LLM service (Phase 2). The engine
+        # holds no LLM client; cite_* schedules a background VerifyCitationTask.
+        self._verify_aux = verify_aux
+        self._verify_prompt = verify_prompt or ""
+        #: In-flight verification tasks — kept referenced so the event loop
+        #: doesn't GC them mid-flight; discarded on completion.
+        self._verify_tasks: set[asyncio.Task] = set()
 
-        # Embedding service (lazy init, optional)
+        # Embedding service (SRW singleton, lazy) + chunker
         self._embedding_service = None
         self._chunker = None
-        self._vector_dimension_checked = False
 
         log.info(
-            f"CitationEngine initialized: mode={mode}, "
-            f"llm_provider={self.llm_provider}, "
-            f"reasoning_required={self.reasoning_required}, "
-            f"reasoning_level={self.reasoning_level}, "
-            f"skip_verification={self.skip_verification}"
+            "CitationEngine initialized (async, vector pool); verification=%s",
+            "aux" if verify_aux is not None else "disabled",
         )
 
-    def __enter__(self):
-        """Context manager entry - establish database connection."""
-        self._connect()
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        """Context manager exit - close database connection."""
-        self.close()
-        return False  # Don't suppress exceptions
-
-    def __del__(self):
-        """Cleanup on deletion."""
-        self.close()
-        log.debug("CitationEngine object destroyed.")
-
     # =========================================================================
-    # DATABASE CONNECTION METHODS
+    # CONTEXT / HELPERS
     # =========================================================================
 
-    def _connect(self) -> None:
+    def _job_uuid(self) -> uuid.UUID | None:
+        """Resolve the current job_id (context.session_id) as a UUID.
+
+        The host citation tables key on ``job_id UUID``; asyncpg is strict about
+        parameter types (unlike psycopg2's text protocol), so the string session
+        id must be coerced to ``uuid.UUID`` before it reaches a query.
         """
-        Establish database connection based on mode.
+        jid = self.context.session_id if self.context else None
+        return self._as_uuid(jid)
 
-        For SQLite: Creates the database file if it doesn't exist
-        For PostgreSQL: Connects using the CITATION_DB_URL environment variable
-
-        Raises:
-            ConnectionError: If connection fails
-        """
-        if self._conn is not None:
-            log.debug("Connection already established, skipping reconnect")
-            return
-
-        log.debug(f"Establishing {self._db_type} database connection...")
-
+    @staticmethod
+    def _as_uuid(value: Any) -> uuid.UUID | None:
+        if value is None:
+            return None
+        if isinstance(value, uuid.UUID):
+            return value
         try:
-            if self._db_type == "sqlite":
-                self._connect_sqlite()
-            else:
-                self._connect_postgresql()
+            return uuid.UUID(str(value))
+        except (ValueError, TypeError, AttributeError):
+            log.warning(f"job_id '{value}' is not a valid UUID; skipping job scope")
+            return None
 
-            # Initialize schema
-            self._initialize_schema()
-            log.info(f"Connected to {self._db_type} database successfully")
-
-        except Exception as e:
-            log.error(f"Failed to connect to database: {e}")
-            raise ConnectionError(f"Database connection failed: {e}") from e
-
-    def _connect_sqlite(self) -> None:
-        """Establish SQLite connection with proper configuration."""
-        # Ensure directory exists
-        db_dir = os.path.dirname(self.db_path)
-        if db_dir and not os.path.exists(db_dir):
-            os.makedirs(db_dir)
-            log.debug(f"Created directory for database: {db_dir}")
-
-        self._conn = sqlite3.connect(
-            self.db_path,
-            timeout=30.0,
-            check_same_thread=False,
-        )
-        # Enable dictionary-like row access
-        self._conn.row_factory = sqlite3.Row
-        self._cursor = self._conn.cursor()
-
-        # Enable foreign keys for SQLite
-        self._cursor.execute("PRAGMA foreign_keys = ON")
-
-        log.debug(f"Connected to SQLite database: {self.db_path}")
-
-    def _connect_postgresql(self) -> None:
-        """Establish PostgreSQL connection with proper configuration."""
-        try:
-            import psycopg2
-            import psycopg2.extras
-
-            self._conn = psycopg2.connect(self.db_url)
-            # Use RealDictCursor for dictionary-like row access
-            self._cursor = self._conn.cursor(
-                cursor_factory=psycopg2.extras.RealDictCursor
-            )
-            log.debug("Connected to PostgreSQL database")
-        except ImportError as e:
-            log.error("psycopg2 not installed, cannot use multi-agent mode")
-            raise ImportError(
-                "psycopg2 is required for multi-agent mode. "
-                "Install it with: pip install psycopg2-binary"
-            ) from e
-
-    def _initialize_schema(self) -> None:
-        """Create database tables if they don't exist, then apply pending migrations.
-
-        SQLite (basic/standalone) mode only. In PostgreSQL (multi-agent) mode the
-        host application owns the schema through its own migration system — when
-        vendored into Superhuman-Remote-Worker that is
-        ``orchestrator/database/migrations/vector/``, which creates every table
-        this engine uses before an agent connects. CitationEngine must NOT create
-        tables or touch ``schema_migrations`` there: the host's migration runner
-        keeps a ``schema_migrations(filename, checksum, ...)`` table that collides
-        with this package's hand-rolled ``schema_migrations(version)``. So in
-        Postgres mode initialization here is both redundant and actively harmful.
-        """
-        if self._db_type != "sqlite":
-            log.debug(
-                "PostgreSQL mode: host application owns the schema; "
-                "skipping CitationEngine schema init + migrations"
-            )
-            return
-
-        log.debug("Initializing database schema...")
-        schema = get_schema(self._db_type)
-
-        try:
-            self._cursor.executescript(schema)
-            self._conn.commit()
-            log.debug("Database schema initialized successfully")
-        except Exception as e:
-            self._conn.rollback()
-            log.error(f"Failed to initialize schema: {e}")
-            raise
-
-        # Apply pending migrations
-        self._apply_migrations()
-
-    def _apply_migrations(self) -> None:
-        """Apply any pending schema migrations."""
-        try:
-            version_query = get_version_query(self._db_type)
-            self._cursor.execute(version_query)
-            row = self._cursor.fetchone()
-            current_version = row["version"] if isinstance(row, dict) else row[0]
-            log.debug(f"Current schema version: {current_version}")
-
-            pending = get_pending_migrations(current_version, self._db_type)
-            if not pending:
-                log.debug("No pending migrations")
-                return
-
-            for version, description, sql in pending:
-                log.info(f"Applying migration v{version}: {description}")
-                try:
-                    if self._db_type == "sqlite":
-                        self._cursor.executescript(sql)
-                    else:
-                        self._cursor.execute(sql)
-
-                    insert_sql = get_migration_insert(
-                        self._db_type, version, description
-                    )
-                    self._cursor.execute(insert_sql)
-                    self._conn.commit()
-                    log.info(f"Migration v{version} applied successfully")
-                except Exception as e:
-                    self._conn.rollback()
-                    log.error(f"Migration v{version} failed: {e}")
-                    raise
-        except Exception as e:
-            log.error(f"Migration check failed: {e}")
-            raise
-
-    def close(self) -> None:
-        """Close database connection and cleanup resources."""
-        if self._conn:
-            try:
-                self._conn.close()
-                self._conn = None
-                self._cursor = None
-                log.debug("Database connection closed")
-            except Exception as e:
-                log.error(f"Error closing database connection: {e}")
-        else:
-            log.debug("No database connection to close")
-
-    def _ensure_connected(self) -> None:
-        """Ensure database connection is established."""
-        if self._conn is None:
-            log.debug("No active connection, establishing new connection...")
-            self._connect()
-
-    @contextmanager
-    def _transaction(self):
-        """
-        Context manager for database transactions.
-
-        Automatically commits on success, rolls back on failure.
-
-        Usage:
-            with self._transaction():
-                self._execute_insert(...)
-                self._execute_insert(...)
-        """
-        self._ensure_connected()
-        try:
-            yield
-            self._conn.commit()
-            log.debug("Transaction committed successfully")
-        except Exception as e:
-            self._conn.rollback()
-            log.error(f"Transaction rolled back due to error: {e}")
-            raise
-
-    def _execute(
-        self,
-        query: str,
-        params: tuple | None = None,
-        fetch: bool = True,
-    ) -> list[dict[str, Any]] | int:
-        """
-        Execute a SQL query with comprehensive error handling and logging.
-
-        Args:
-            query: SQL query string
-            params: Query parameters (tuple)
-            fetch: If True, fetch and return results; if False, return lastrowid
-
-        Returns:
-            List of dictionaries (if fetch=True) or last inserted row ID
-        """
-        self._ensure_connected()
-
-        try:
-            if params:
-                log.debug(f"Executing query with {len(params)} parameters")
-                self._cursor.execute(query, params)
-            else:
-                log.debug("Executing query without parameters")
-                self._cursor.execute(query)
-
-            if fetch:
-                rows = self._cursor.fetchall()
-                log.debug(f"Query returned {len(rows)} rows")
-                # Convert to list of dicts
-                if self._db_type == "sqlite":
-                    return [dict(row) for row in rows]
-                else:
-                    return [dict(row) for row in rows]
-            else:
-                self._conn.commit()
-                lastrowid = self._cursor.lastrowid
-                log.debug(f"Insert completed, lastrowid={lastrowid}")
-                return lastrowid
-
-        except Exception as e:
-            self._conn.rollback()
-            log.error(f"Query execution failed: {e}")
-            log.debug(f"Failed query: {query[:200]}...")
-            if params:
-                log.debug(
-                    f"Query params: {params[:5]}..."
-                    if len(params) > 5
-                    else f"Query params: {params}"
-                )
-            raise
-
-    def _query(
-        self,
-        query: str,
-        params: tuple | None = None,
-    ) -> list[dict[str, Any]]:
-        """
-        Execute a SELECT query and return results as list of dicts.
-
-        Args:
-            query: SQL SELECT query
-            params: Query parameters
-
-        Returns:
-            List of dictionaries containing query results
-        """
-        return self._execute(query, params, fetch=True)
-
-    def _insert(
-        self,
-        query: str,
-        params: tuple | None = None,
-    ) -> int:
-        """
-        Execute an INSERT query and return the new row ID.
-
-        Args:
-            query: SQL INSERT query
-            params: Query parameters
-
-        Returns:
-            ID of the inserted row
-        """
-        self._ensure_connected()
-
-        try:
-            if params:
-                log.debug(f"Executing insert with {len(params)} parameters")
-                self._cursor.execute(query, params)
-            else:
-                log.debug("Executing insert without parameters")
-                self._cursor.execute(query)
-
-            self._conn.commit()
-
-            if self._db_type == "sqlite":
-                row_id = self._cursor.lastrowid
-            else:
-                # PostgreSQL: query should include "RETURNING id"
-                result = self._cursor.fetchone()
-                if result:
-                    row_id = result["id"] if isinstance(result, dict) else result[0]
-                else:
-                    row_id = self._cursor.lastrowid
-
-            log.debug(f"Insert completed successfully, id={row_id}")
-            return row_id
-
-        except Exception as e:
-            self._conn.rollback()
-            log.error(f"Insert failed: {e}")
-            log.debug(f"Failed query: {query[:200]}...")
-            raise
-
-    def _update(
-        self,
-        query: str,
-        params: tuple | None = None,
-    ) -> int:
-        """
-        Execute an UPDATE query and return the number of affected rows.
-
-        Args:
-            query: SQL UPDATE query
-            params: Query parameters
-
-        Returns:
-            Number of rows affected
-        """
-        self._ensure_connected()
-
-        try:
-            if params:
-                log.debug(f"Executing update with {len(params)} parameters")
-                self._cursor.execute(query, params)
-            else:
-                log.debug("Executing update without parameters")
-                self._cursor.execute(query)
-
-            self._conn.commit()
-            rowcount = self._cursor.rowcount
-            log.debug(f"Update completed, {rowcount} rows affected")
-            return rowcount
-
-        except Exception as e:
-            self._conn.rollback()
-            log.error(f"Update failed: {e}")
-            raise
+    @staticmethod
+    def _loads(value: Any) -> Any:
+        """Decode a JSONB column value (asyncpg returns jsonb as text)."""
+        if isinstance(value, (str, bytes)):
+            return json.loads(value)
+        return value
 
     # =========================================================================
     # SOURCE REGISTRATION METHODS
     # =========================================================================
 
-    def add_doc_source(
+    async def add_doc_source(
         self,
         file_path: str,
         name: str | None = None,
@@ -577,19 +188,9 @@ class CitationEngine:
         metadata: Metadata | None = None,
     ) -> Source:
         """
-        Register a document source (PDF, markdown, txt, json, csv, images, etc.)
+        Register a document source (PDF, markdown, txt, json, csv, images, etc.).
 
-        Extracts text content using PyMuPDF (for PDFs) or appropriate parser.
-        Stores extracted content for verification.
-
-        Args:
-            file_path: Path to the document file
-            name: Human-readable name (defaults to filename)
-            version: Version identifier (e.g., "2024-01")
-            metadata: Additional metadata (stored as JSON)
-
-        Returns:
-            Source object with assigned ID
+        Extracts text content (PyMuPDF for PDFs) and stores it for verification.
 
         Raises:
             FileNotFoundError: If file doesn't exist
@@ -602,18 +203,16 @@ class CitationEngine:
             log.error(f"File not found: {file_path}")
             raise FileNotFoundError(f"File not found: {file_path}")
 
-        # Extract content based on file type
-        content = self._extract_document_content(file_path)
+        # Extraction can be CPU/IO heavy (PDF parsing) — keep the loop responsive.
+        content = await asyncio.to_thread(self._extract_document_content, file_path)
         log.debug(f"Extracted {len(content)} characters from document")
 
-        # Compute content hash for integrity verification
         content_hash = hashlib.sha256(content.encode()).hexdigest()
 
-        # Use filename as default name
         if name is None:
             name = os.path.basename(file_path)
 
-        source = self._register_source(
+        source = await self._register_source(
             source_type=SourceType.DOCUMENT,
             identifier=file_path,
             name=name,
@@ -626,7 +225,7 @@ class CitationEngine:
         log.info(f"Registered document source [{source.id}]: {name}")
         return source
 
-    def add_web_source(
+    async def add_web_source(
         self,
         url: str,
         name: str | None = None,
@@ -636,35 +235,20 @@ class CitationEngine:
         """
         Register a website source.
 
-        Downloads and archives page content at registration time.
-        Stores HTML and extracted text for verification.
-
-        Args:
-            url: URL of the web page
-            name: Human-readable name (defaults to URL)
-            version: Version identifier
-            metadata: Additional metadata
-
-        Returns:
-            Source object with assigned ID
-
-        Raises:
-            ConnectionError: If page cannot be fetched
+        Downloads and archives page content at registration time (stored for
+        verification). Network fetch runs in a worker thread.
         """
         log.debug(f"Registering web source: {url}")
 
-        # Fetch and archive web content
-        content, fetch_metadata = self._fetch_web_content(url)
+        content, fetch_metadata = await asyncio.to_thread(self._fetch_web_content, url)
         log.debug(f"Fetched {len(content)} characters from web page")
 
-        # Compute content hash
         content_hash = hashlib.sha256(content.encode()).hexdigest()
 
-        # Merge metadata
         if metadata:
             fetch_metadata.update(metadata)
 
-        source = self._register_source(
+        source = await self._register_source(
             source_type=SourceType.WEBSITE,
             identifier=url,
             name=name or url,
@@ -677,7 +261,7 @@ class CitationEngine:
         log.info(f"Registered web source [{source.id}]: {name or url}")
         return source
 
-    def add_db_source(
+    async def add_db_source(
         self,
         identifier: str,
         name: str,
@@ -686,26 +270,9 @@ class CitationEngine:
         result_description: str | None = None,
         metadata: Metadata | None = None,
     ) -> Source:
-        """
-        Register a database source (SQL, NoSQL, graph DB).
-
-        Stores query and result description in metadata.
-        Content field contains string representation of result.
-
-        Args:
-            identifier: Database/table identifier (e.g., "mydb.users")
-            name: Human-readable name
-            content: String representation of query result
-            query: The query that produced the result
-            result_description: Description of what the result contains
-            metadata: Additional metadata
-
-        Returns:
-            Source object with assigned ID
-        """
+        """Register a database source (SQL, NoSQL, graph DB)."""
         log.debug(f"Registering database source: {identifier}")
 
-        # Build metadata with query info
         db_metadata = {
             "query": query,
             "result_description": result_description,
@@ -713,10 +280,9 @@ class CitationEngine:
         if metadata:
             db_metadata.update(metadata)
 
-        # Compute content hash
         content_hash = hashlib.sha256(content.encode()).hexdigest()
 
-        source = self._register_source(
+        source = await self._register_source(
             source_type=SourceType.DATABASE,
             identifier=identifier,
             name=name,
@@ -728,47 +294,26 @@ class CitationEngine:
         log.info(f"Registered database source [{source.id}]: {name}")
         return source
 
-    def add_custom_source(
+    async def add_custom_source(
         self,
         name: str,
         content: str,
         description: str | None = None,
         metadata: Metadata | None = None,
     ) -> Source:
-        """
-        Register a custom/AI-generated source.
-
-        For artifacts created by the agent itself:
-        - Computed matrices or tables
-        - Generated plots or visualizations
-        - Analysis outputs
-
-        Content is provided directly by the agent.
-
-        Args:
-            name: Human-readable name for the artifact
-            content: The content/data of the artifact
-            description: Description of what this artifact represents
-            metadata: Additional metadata
-
-        Returns:
-            Source object with assigned ID
-        """
+        """Register a custom/AI-generated source (matrices, plots, analyses)."""
         log.debug(f"Registering custom source: {name}")
 
-        # Build metadata with description
         custom_metadata = {"description": description}
         if metadata:
             custom_metadata.update(metadata)
 
-        # Compute content hash
         content_hash = hashlib.sha256(content.encode()).hexdigest()
 
-        # Use name + timestamp as identifier for custom sources
         timestamp = datetime.now(timezone.utc).isoformat()
         identifier = f"custom:{name}:{timestamp}"
 
-        source = self._register_source(
+        source = await self._register_source(
             source_type=SourceType.CUSTOM,
             identifier=identifier,
             name=name,
@@ -780,7 +325,7 @@ class CitationEngine:
         log.info(f"Registered custom source [{source.id}]: {name}")
         return source
 
-    def _register_source(
+    async def _register_source(
         self,
         source_type: SourceType,
         identifier: str,
@@ -791,76 +336,39 @@ class CitationEngine:
         metadata: Metadata | None = None,
     ) -> Source:
         """
-        Internal method to register a source in the database.
+        Register a source in the database.
 
         Uses content_hash for deduplication: if a source with the same hash
         already exists, reuses it and creates a job_sources link only.
-
-        Args:
-            source_type: Type of source
-            identifier: Unique identifier (path, URL, etc.)
-            name: Human-readable name
-            content: Full text content
-            content_hash: SHA-256 hash of content
-            version: Version string
-            metadata: Additional metadata (JSON)
-
-        Returns:
-            Source object with assigned ID
         """
-        self._ensure_connected()
-
-        # Serialize metadata to JSON
         metadata_json = json.dumps(metadata) if metadata else None
+        job_uuid = self._job_uuid()
 
-        # Get job_id from context (session_id is the job_id)
-        job_id = self.context.session_id if self.context else None
-
-        # Check for existing source by content_hash (dedup)
         existing_source = None
         if content_hash:
-            existing_source = self._find_source_by_hash(content_hash)
+            existing_source = await self._find_source_by_hash(content_hash)
 
         if existing_source:
             source_id = existing_source.id
             log.info(f"Source with content_hash already exists [{source_id}], reusing")
         else:
-            # Insert new source (without job_id — sources are shared)
-            if self._db_type == "sqlite":
-                query = """
-                    INSERT INTO sources (type, identifier, name, version, content, content_hash, metadata)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+            source_id = await self.db.fetchval(
                 """
-                params = (
-                    source_type.value,
-                    identifier,
-                    name,
-                    version,
-                    content,
-                    content_hash,
-                    metadata_json,
-                )
-            else:
-                query = """
-                    INSERT INTO sources (type, identifier, name, version, content, content_hash, metadata)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
-                    RETURNING id
-                """
-                params = (
-                    source_type.value,
-                    identifier,
-                    name,
-                    version,
-                    content,
-                    content_hash,
-                    metadata_json,
-                )
+                INSERT INTO sources (type, identifier, name, version, content, content_hash, metadata)
+                VALUES ($1::source_type, $2, $3, $4, $5, $6, $7::jsonb)
+                RETURNING id
+                """,
+                source_type.value,
+                identifier,
+                name,
+                version,
+                content,
+                content_hash,
+                metadata_json,
+            )
 
-            source_id = self._insert(query, params)
-
-        # Create job_sources link
-        if job_id:
-            self._link_source_to_job(source_id, job_id)
+        if job_uuid:
+            await self._link_source_to_job(source_id, job_uuid)
 
         source = Source(
             id=source_id,
@@ -874,56 +382,36 @@ class CitationEngine:
             created_at=datetime.now(timezone.utc),
         )
 
-        # Auto-embed if embedding service is available (non-blocking)
-        if job_id:
-            self._auto_embed_source(source_id, content, job_id)
+        # Auto-embed if an embedding service is available (best-effort).
+        if job_uuid:
+            await self._auto_embed_source(source_id, content, job_uuid)
 
         return source
 
-    def _find_source_by_hash(self, content_hash: str) -> Source | None:
+    async def _find_source_by_hash(self, content_hash: str) -> Source | None:
         """Find an existing source by content_hash."""
-        if self._db_type == "sqlite":
-            query = "SELECT * FROM sources WHERE content_hash = ?"
-        else:
-            query = "SELECT * FROM sources WHERE content_hash = %s"
-
-        results = self._query(query, (content_hash,))
-        if results:
-            return self._row_to_source(results[0])
+        row = await self.db.fetchrow(
+            "SELECT * FROM sources WHERE content_hash = $1", content_hash
+        )
+        if row:
+            return self._row_to_source(dict(row))
         return None
 
-    def _link_source_to_job(self, source_id: int, job_id: str) -> None:
+    async def _link_source_to_job(self, source_id: int, job_uuid: uuid.UUID) -> None:
         """Create a job_sources link (idempotent)."""
-        if self._db_type == "sqlite":
-            query = (
-                "INSERT OR IGNORE INTO job_sources (job_id, source_id) VALUES (?, ?)"
-            )
-        else:
-            query = "INSERT INTO job_sources (job_id, source_id) VALUES (%s, %s) ON CONFLICT DO NOTHING"
-
-        self._ensure_connected()
-        self._cursor.execute(query, (job_id, source_id))
-        self._conn.commit()
-        log.debug(f"Linked source [{source_id}] to job {job_id}")
+        await self.db.execute(
+            "INSERT INTO job_sources (job_id, source_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+            job_uuid,
+            source_id,
+        )
+        log.debug(f"Linked source [{source_id}] to job {job_uuid}")
 
     def _extract_document_content(self, file_path: str) -> str:
         """
         Extract text content from a document file.
 
-        Supports:
-        - PDF: Uses PyMuPDF
-        - Markdown, TXT, JSON, CSV: Direct read
-        - Other: Attempt to read as text
-
-        Args:
-            file_path: Path to the document
-
-        Returns:
-            Extracted text content
-
-        Raises:
-            ValueError: If file type is not supported
-            ImportError: If required library is not installed
+        Supports PDF (PyMuPDF), DOCX (docx2txt), and text formats. Runs in a
+        worker thread (sync I/O).
         """
         ext = Path(file_path).suffix.lower()
         log.debug(f"Extracting content from {ext} file")
@@ -938,7 +426,6 @@ class CitationEngine:
             log.debug(f"Read {len(content)} characters from text file")
             return content
         else:
-            # Try to read as text
             try:
                 with open(file_path, encoding="utf-8") as f:
                     content = f.read()
@@ -954,17 +441,7 @@ class CitationEngine:
                 ) from e
 
     def _extract_pdf_content(self, file_path: str) -> str:
-        """
-        Extract text content from a PDF file using PyMuPDF.
-
-        Includes page markers for better citation locators.
-
-        Args:
-            file_path: Path to the PDF file
-
-        Returns:
-            Extracted text content with page markers
-        """
+        """Extract text content from a PDF file using PyMuPDF, with page markers."""
         try:
             import fitz  # PyMuPDF
 
@@ -991,19 +468,7 @@ class CitationEngine:
             ) from e
 
     def _extract_docx_content(self, file_path: str) -> str:
-        """
-        Extract text content from a DOCX file using docx2txt.
-
-        Falls back to direct XML parsing when the archive uses a non-standard
-        main document name (e.g. ``word/document2.xml`` instead of
-        ``word/document.xml``), which some newer Word versions produce.
-
-        Args:
-            file_path: Path to the DOCX file
-
-        Returns:
-            Extracted text content
-        """
+        """Extract text content from a DOCX file using docx2txt (with fallback)."""
         try:
             import docx2txt
 
@@ -1035,7 +500,6 @@ class CitationEngine:
         text_parts: list[str] = []
 
         with zipfile.ZipFile(file_path) as zf:
-            # Find all word/document*.xml entries
             doc_entries = sorted(
                 n for n in zf.namelist() if re.match(r"word/document\d*\.xml$", n)
             )
@@ -1053,19 +517,10 @@ class CitationEngine:
 
     def _fetch_web_content(self, url: str) -> tuple[str, dict[str, Any]]:
         """
-        Fetch and archive web page content.
+        Fetch and archive web page content (runs in a worker thread).
 
-        Downloads the page, extracts text, and stores metadata.
-
-        Args:
-            url: URL to fetch
-
-        Returns:
-            Tuple of (extracted_text, metadata)
-
-        Raises:
-            ConnectionError: If fetch fails
-            ImportError: If required libraries are not installed
+        Returns (extracted_text, metadata). On fetch failure, returns a
+        placeholder + metadata so the source still registers.
         """
         try:
             import requests
@@ -1080,7 +535,6 @@ class CitationEngine:
 
             content_type = response.headers.get("content-type", "")
 
-            # Handle PDF content (binary) - extract text via PyMuPDF
             if "application/pdf" in content_type or url.lower().endswith(".pdf"):
                 import tempfile
 
@@ -1097,24 +551,17 @@ class CitationEngine:
                     "content_type": content_type,
                     "title": None,
                 }
-
                 log.debug(f"Extracted {len(text)} characters from PDF")
                 return text, metadata
 
-            # Parse HTML
             soup = BeautifulSoup(response.text, "html.parser")
 
-            # Remove script and style elements
             for script in soup(["script", "style"]):
                 script.decompose()
 
-            # Extract text
             text = soup.get_text(separator="\n", strip=True)
-
-            # Strip any NUL bytes that may have slipped through
             text = text.replace("\x00", "")
 
-            # Build metadata
             metadata = {
                 "url": url,
                 "accessed_at": datetime.now(timezone.utc).isoformat(),
@@ -1122,7 +569,6 @@ class CitationEngine:
                 "content_type": content_type,
                 "title": soup.title.string if soup.title else None,
             }
-
             log.debug(
                 f"Fetched {len(text)} characters, title: {metadata.get('title', 'N/A')}"
             )
@@ -1175,7 +621,7 @@ class CitationEngine:
     # CITATION METHODS
     # =========================================================================
 
-    def cite_doc(
+    async def cite_doc(
         self,
         claim: str,
         source_id: int,
@@ -1186,30 +632,9 @@ class CitationEngine:
         confidence: str = "high",
         extraction_method: str = "direct_quote",
     ) -> CitationResult:
-        """
-        Create a citation from a document source.
-
-        Triggers synchronous verification.
-        Returns citation ID or error with verification feedback.
-
-        Args:
-            claim: The assertion being supported
-            source_id: ID of the document source
-            quote_context: Paragraph containing the evidence
-            locator: Location data (page, section, etc.)
-            verbatim_quote: Exact quoted text (optional)
-            relevance_reasoning: Why this evidence supports the claim
-            confidence: Agent's confidence level (high, medium, low)
-            extraction_method: How information was extracted
-
-        Returns:
-            CitationResult with citation ID and verification status
-
-        Raises:
-            ValueError: If source doesn't exist or required fields missing
-        """
+        """Create a citation from a document source (verified)."""
         log.debug(f"Creating document citation for source [{source_id}]")
-        return self._create_citation(
+        return await self._create_citation(
             claim=claim,
             source_id=source_id,
             quote_context=quote_context,
@@ -1220,7 +645,7 @@ class CitationEngine:
             extraction_method=extraction_method,
         )
 
-    def cite_web(
+    async def cite_web(
         self,
         claim: str,
         source_id: int,
@@ -1231,26 +656,9 @@ class CitationEngine:
         confidence: str = "high",
         extraction_method: str = "direct_quote",
     ) -> CitationResult:
-        """
-        Create a citation from a website source.
-
-        Uses archived content (from add_web_source) for verification.
-
-        Args:
-            claim: The assertion being supported
-            source_id: ID of the website source
-            quote_context: Paragraph containing the evidence
-            locator: Location data (heading_context, accessed_at, etc.)
-            verbatim_quote: Exact quoted text (optional)
-            relevance_reasoning: Why this evidence supports the claim
-            confidence: Agent's confidence level
-            extraction_method: How information was extracted
-
-        Returns:
-            CitationResult with citation ID and verification status
-        """
+        """Create a citation from a website source (uses archived content)."""
         log.debug(f"Creating web citation for source [{source_id}]")
-        return self._create_citation(
+        return await self._create_citation(
             claim=claim,
             source_id=source_id,
             quote_context=quote_context,
@@ -1261,7 +669,7 @@ class CitationEngine:
             extraction_method=extraction_method,
         )
 
-    def cite_db(
+    async def cite_db(
         self,
         claim: str,
         source_id: int,
@@ -1271,36 +679,20 @@ class CitationEngine:
         confidence: str = "high",
         extraction_method: str = "aggregation",
     ) -> CitationResult:
-        """
-        Create a citation from a database source.
-
-        Verification uses the query result stored in source.
-
-        Args:
-            claim: The assertion being supported
-            source_id: ID of the database source
-            quote_context: Description of the data/result
-            locator: Location data (query, table, result_description, etc.)
-            relevance_reasoning: Why this data supports the claim
-            confidence: Agent's confidence level
-            extraction_method: How information was extracted (default: aggregation)
-
-        Returns:
-            CitationResult with citation ID and verification status
-        """
+        """Create a citation from a database source."""
         log.debug(f"Creating database citation for source [{source_id}]")
-        return self._create_citation(
+        return await self._create_citation(
             claim=claim,
             source_id=source_id,
             quote_context=quote_context,
             locator=locator,
-            verbatim_quote=None,  # No verbatim quote for database sources
+            verbatim_quote=None,
             relevance_reasoning=relevance_reasoning,
             confidence=confidence,
             extraction_method=extraction_method,
         )
 
-    def cite_custom(
+    async def cite_custom(
         self,
         claim: str,
         source_id: int,
@@ -1309,24 +701,9 @@ class CitationEngine:
         relevance_reasoning: str | None = None,
         confidence: str = "high",
     ) -> CitationResult:
-        """
-        Create a citation from a custom/AI-generated source.
-
-        For citing matrices, plots, computed results, etc.
-
-        Args:
-            claim: The assertion being supported
-            source_id: ID of the custom source
-            quote_context: Description of the relevant part of the artifact
-            locator: Optional location data
-            relevance_reasoning: Why this artifact supports the claim
-            confidence: Agent's confidence level
-
-        Returns:
-            CitationResult with citation ID and verification status
-        """
+        """Create a citation from a custom/AI-generated source."""
         log.debug(f"Creating custom citation for source [{source_id}]")
-        return self._create_citation(
+        return await self._create_citation(
             claim=claim,
             source_id=source_id,
             quote_context=quote_context,
@@ -1334,10 +711,10 @@ class CitationEngine:
             verbatim_quote=None,
             relevance_reasoning=relevance_reasoning,
             confidence=confidence,
-            extraction_method="inference",  # Custom sources are typically inferences
+            extraction_method="inference",
         )
 
-    def _create_citation(
+    async def _create_citation(
         self,
         claim: str,
         source_id: int,
@@ -1349,25 +726,14 @@ class CitationEngine:
         extraction_method: str = "direct_quote",
         quote_language: str | None = None,
     ) -> CitationResult:
-        """
-        Internal method to create and verify a citation.
-
-        Args:
-            All citation fields
-
-        Returns:
-            CitationResult with verification status
-        """
-        self._ensure_connected()
+        """Create and verify a citation."""
         log.debug(f"Creating citation: claim='{claim[:50]}...', source_id={source_id}")
 
-        # Validate source exists
-        source = self.get_source(source_id)
+        source = await self.get_source(source_id)
         if source is None:
             log.error(f"Source not found: {source_id}")
             raise ValueError(f"Source not found: {source_id}")
 
-        # Validate confidence and extraction_method enums
         try:
             conf = Confidence(confidence)
         except ValueError as e:
@@ -1385,131 +751,115 @@ class CitationEngine:
                 "Use 'direct_quote', 'paraphrase', 'inference', 'aggregation', or 'negative'."
             ) from e
 
-        # Check if relevance_reasoning is required based on configuration
         self._validate_reasoning_requirement(conf, relevance_reasoning)
 
-        # Get job_id and created_by from context for audit trail
-        job_id = None
+        job_uuid = self._job_uuid()
         created_by = None
         if self.context:
-            job_id = self.context.session_id
             created_by = (
                 f"{self.context.session_id}:{self.context.agent_id}"
                 if self.context.agent_id
                 else self.context.session_id
             )
 
-        # Serialize locator to JSON
         locator_json = json.dumps(locator)
 
-        # Insert citation with pending status
-        if self._db_type == "sqlite":
-            query = """
-                INSERT INTO citations (
-                    job_id, claim, verbatim_quote, quote_context, quote_language,
-                    relevance_reasoning, confidence, extraction_method,
-                    source_id, locator, verification_status, created_by
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+        citation_id = await self.db.fetchval(
             """
-            params = (
-                job_id,
-                claim,
-                verbatim_quote,
-                quote_context,
-                quote_language,
-                relevance_reasoning,
-                confidence,
-                extraction_method,
-                source_id,
-                locator_json,
-                created_by,
+            INSERT INTO citations (
+                job_id, claim, verbatim_quote, quote_context, quote_language,
+                relevance_reasoning, confidence, extraction_method,
+                source_id, locator, verification_status, created_by
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7::confidence_level, $8::extraction_method,
+                $9, $10::jsonb, 'pending'::verification_status, $11
             )
-        else:
-            query = """
-                INSERT INTO citations (
-                    job_id, claim, verbatim_quote, quote_context, quote_language,
-                    relevance_reasoning, confidence, extraction_method,
-                    source_id, locator, verification_status, created_by
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'pending', %s)
-                RETURNING id
-            """
-            params = (
-                job_id,
-                claim,
-                verbatim_quote,
-                quote_context,
-                quote_language,
-                relevance_reasoning,
-                confidence,
-                extraction_method,
-                source_id,
-                locator_json,
-                created_by,
-            )
-
-        citation_id = self._insert(query, params)
+            RETURNING id
+            """,
+            job_uuid,
+            claim,
+            verbatim_quote,
+            quote_context,
+            quote_language,
+            relevance_reasoning,
+            confidence,
+            extraction_method,
+            source_id,
+            locator_json,
+            created_by,
+        )
         log.info(
             f"Created citation [{citation_id}] for source [{source_id}], pending verification"
         )
 
-        # Perform synchronous verification
-        verification = self._verify_citation(
-            citation_id, source, quote_context, verbatim_quote, claim, locator
-        )
+        # D2: return immediately with status=pending and schedule background
+        # verification on the auxiliary model. The verdict is written back to the
+        # row asynchronously (eventually-consistent). When no verifier is wired,
+        # the citation simply stays 'pending'.
+        self._schedule_verification(citation_id)
 
-        # Update citation with verification result
-        self._update_verification_status(citation_id, verification)
-
-        # Build summary note for context window management
         source_snippet = (
             source.name[:30] + "..." if len(source.name) > 30 else source.name
         )
-        status_icon = "+" if verification.is_verified else "x"
-        summary_note = f"Cited {source_snippet} ({locator}) - {status_icon}"
-
         result = CitationResult(
             citation_id=citation_id,
-            verification_status=(
-                VerificationStatus.VERIFIED
-                if verification.is_verified
-                else VerificationStatus.FAILED
-            ),
-            similarity_score=verification.similarity_score,
-            matched_location=verification.matched_location,
-            verification_notes=verification.reasoning
-            if not verification.is_verified
-            else None,
-            summary_note=summary_note,
+            verification_status=VerificationStatus.PENDING,
+            summary_note=f"Cited {source_snippet} ({locator}) - pending verification",
         )
-
         log.info(
-            f"Citation [{citation_id}] verification complete: "
-            f"status={result.verification_status.value}, score={verification.similarity_score:.2f}"
+            "Citation [%s] created (pending); verification %s",
+            citation_id,
+            "scheduled" if self._verify_aux is not None else "disabled",
         )
         return result
+
+    def _schedule_verification(self, citation_id: int) -> None:
+        """Schedule background verification for a freshly-created citation.
+
+        Fire-and-forget on the running event loop (the agent's loop persists for
+        its lifetime, so the verdict lands after ``cite_*`` returns). The task is
+        held in ``_verify_tasks`` so it isn't GC'd mid-flight. No-op when no
+        verifier is wired or there is no running loop (e.g. a sync context).
+        """
+        if self._verify_aux is None:
+            return
+        try:
+            task = asyncio.create_task(self._run_verification(citation_id))
+        except RuntimeError:
+            log.debug("No running event loop; skipping citation verification schedule")
+            return
+        self._verify_tasks.add(task)
+        task.add_done_callback(self._verify_tasks.discard)
+
+    async def _run_verification(self, citation_id: int) -> None:
+        """Run one citation's verification via the auxiliary-LLM service."""
+        from src.services.auxiliary import verify_and_store_citation
+
+        await verify_and_store_citation(
+            self._verify_aux, self, citation_id, self._verify_prompt
+        )
+
+    async def await_pending_verifications(self, timeout: float = 30.0) -> None:
+        """Await any in-flight verification tasks (used by the boundary reconcile).
+
+        Best-effort: returns when all scheduled verifications have written their
+        verdict back, or after ``timeout`` seconds, whichever comes first.
+        """
+        pending = {t for t in self._verify_tasks if not t.done()}
+        if not pending:
+            return
+        await asyncio.wait(pending, timeout=timeout)
 
     def _validate_reasoning_requirement(
         self,
         confidence: Confidence,
         relevance_reasoning: str | None,
     ) -> None:
-        """
-        Validate that relevance_reasoning is provided when required.
-
-        Based on CITATION_REASONING_REQUIRED environment variable:
-        - none: Never required
-        - low: Required when confidence is low (default)
-        - medium: Required when confidence is low or medium
-        - high: Always required
-
-        Raises:
-            ValueError: If reasoning is required but not provided
-        """
+        """Validate that relevance_reasoning is provided when required."""
         if self.reasoning_required == "none":
             return
 
         needs_reasoning = False
-
         if self.reasoning_required == "low" and confidence == Confidence.LOW:
             needs_reasoning = True
         elif self.reasoning_required == "medium" and confidence in (
@@ -1530,7 +880,7 @@ class CitationEngine:
                 f"when CITATION_REASONING_REQUIRED='{self.reasoning_required}'"
             )
 
-    def _update_verification_status(
+    async def _update_verification_status(
         self,
         citation_id: int,
         verification: VerificationResult,
@@ -1538,265 +888,117 @@ class CitationEngine:
         """Update citation with verification results."""
         status = "verified" if verification.is_verified else "failed"
 
-        # Handle matched_location - ensure it's JSON serializable
-        matched_location = verification.matched_location
         matched_location_json = None
-        if matched_location is not None:
-            # Ensure it's a proper dict, not a Mock or other non-serializable type
-            if isinstance(matched_location, dict):
-                try:
-                    matched_location_json = json.dumps(matched_location)
-                except (TypeError, ValueError) as e:
-                    log.warning(f"Could not serialize matched_location: {e}")
-                    matched_location_json = None
+        if isinstance(verification.matched_location, dict):
+            try:
+                matched_location_json = json.dumps(verification.matched_location)
+            except (TypeError, ValueError) as e:
+                log.warning(f"Could not serialize matched_location: {e}")
 
-        if self._db_type == "sqlite":
-            query = """
-                UPDATE citations
-                SET verification_status = ?,
-                    verification_notes = ?,
-                    similarity_score = ?,
-                    matched_location = ?
-                WHERE id = ?
+        await self.db.execute(
             """
-            params = (
-                status,
-                verification.reasoning,
-                verification.similarity_score,
-                matched_location_json,
-                citation_id,
-            )
-        else:
-            query = """
-                UPDATE citations
-                SET verification_status = %s,
-                    verification_notes = %s,
-                    similarity_score = %s,
-                    matched_location = %s
-                WHERE id = %s
-            """
-            params = (
-                status,
-                verification.reasoning,
-                verification.similarity_score,
-                matched_location_json,
-                citation_id,
-            )
-
-        self._update(query, params)
+            UPDATE citations
+            SET verification_status = $1::verification_status,
+                verification_notes = $2,
+                similarity_score = $3,
+                matched_location = $4::jsonb
+            WHERE id = $5
+            """,
+            status,
+            verification.reasoning,
+            verification.similarity_score,
+            matched_location_json,
+            citation_id,
+        )
         log.debug(f"Updated verification status for citation [{citation_id}]: {status}")
 
-    # =========================================================================
-    # VERIFICATION METHODS
-    # =========================================================================
-
-    def _setup_llm_client(self) -> None:
-        """
-        Initialize the verification LLM client.
-
-        Uses LangGraph's ChatOpenAI with custom base_url to support:
-        - OpenAI API
-        - OpenAI-compatible endpoints (llama.cpp, vLLM, Ollama)
-
-        Reads CITATION_LLM_URL from environment for custom endpoints.
-        """
-        if self._llm_client is not None:
-            return
-
-        try:
-            from langchain_openai import ChatOpenAI
-
-            # Build model_kwargs for reasoning (only for o-series models)
-            model_kwargs = {}
-            if (
-                self.llm_provider == "openai"
-                and self.reasoning_level
-                and self.reasoning_level != "none"
-                and self.llm_model.startswith("o")
-            ):
-                model_kwargs["reasoning_effort"] = self.reasoning_level
-
-            # Build kwargs for ChatOpenAI
-            kwargs = {
-                "model": self.llm_model,
-                "temperature": 0.0,  # Deterministic verification
-                "timeout": 120,  # 2 min - verification of 3 pages should be fast
-                "max_retries": 1,  # 1 retry only - avoid long waits on failures
-                "max_completion_tokens": 4096,  # Verification response is small JSON
-            }
-
-            # Add model_kwargs if non-empty
-            if model_kwargs:
-                kwargs["model_kwargs"] = model_kwargs
-
-            if self.llm_url:
-                kwargs["base_url"] = self.llm_url
-
-            if self.llm_api_key:
-                kwargs["api_key"] = self.llm_api_key
-
-            base_client = ChatOpenAI(**kwargs)
-
-            # Use structured output so the model knows when to stop
-            from pydantic import BaseModel, Field
-
-            class VerificationResponse(BaseModel):
-                """Structured response for citation verification."""
-
-                verified: bool = Field(description="Whether the citation is valid")
-                similarity_score: float = Field(
-                    description="How closely the quote matches the source (0-1)"
-                )
-                matched_text: str | None = Field(
-                    default=None, description="The actual text found in the source"
-                )
-                reasoning: str = Field(description="Brief explanation of the decision")
-
-            self._llm_client = base_client.with_structured_output(VerificationResponse)
-            log.debug(f"Verification LLM client initialized: {self.llm_model}")
-
-        except ImportError as e:
-            log.warning("langchain-openai not installed, verification will be limited")
-            raise ImportError(
-                "langchain-openai is required for verification. "
-                "Install with: pip install langchain-openai"
-            ) from e
-
-    def _verify_citation(
+    async def edit_citation(
         self,
         citation_id: int,
-        source: Source,
-        quote_context: str,
-        verbatim_quote: str | None,
-        claim: str,
-        locator: dict | None = None,
-    ) -> VerificationResult:
+        claim: str | None = None,
+        verbatim_quote: str | None = None,
+        quote_context: str | None = None,
+        relevance_reasoning: str | None = None,
+        confidence: str | None = None,
+        extraction_method: str | None = None,
+        locator: dict[str, Any] | None = None,
+    ) -> None:
         """
-        Verify a citation using the verification LLM.
+        Edit fields of a citation belonging to the current job.
 
-        Checks if the quoted text exists in the source and supports the claim.
+        When content fields (claim, verbatim_quote, quote_context) change,
+        verification_status resets to 'pending' and prior verification results
+        are cleared. Scoped to ``context.session_id`` (job_id).
 
-        Args:
-            citation_id: ID of the citation being verified
-            source: The source being cited
-            quote_context: The context provided by the agent
-            verbatim_quote: The exact quote (if any)
-            claim: The claim being supported
-            locator: Optional locator dict with page/section info
-
-        Returns:
-            VerificationResult with verification status
+        Raises:
+            ValueError: If the citation is not found / not owned, or no fields given.
         """
-        log.debug(f"Verifying citation [{citation_id}] against source [{source.id}]")
+        job_uuid = self._job_uuid()
 
-        # Skip verification if configured (for development/testing)
-        if self.skip_verification:
-            log.info(
-                f"Skipping verification for citation [{citation_id}] (CITATION_SKIP_VERIFICATION=true)"
+        # Ownership guard (job-scoped).
+        if job_uuid is not None:
+            row = await self.db.fetchrow(
+                "SELECT id FROM citations WHERE id = $1 AND job_id = $2",
+                citation_id,
+                job_uuid,
             )
-            return VerificationResult(
-                is_verified=True,
-                similarity_score=1.0,
-                reasoning="Verification skipped (CITATION_SKIP_VERIFICATION=true)",
+        else:
+            row = await self.db.fetchrow(
+                "SELECT id FROM citations WHERE id = $1", citation_id
             )
+        if not row:
+            raise ValueError(f"Citation {citation_id} not found")
 
-        try:
-            self._setup_llm_client()
-        except ImportError as e:
-            log.warning(f"LLM not available for verification: {e}")
-            return VerificationResult(
-                is_verified=False,
-                similarity_score=0.0,
-                reasoning="Verification skipped: LLM not available",
-                error=str(e),
-            )
-
-        # Extract relevant portion of source content based on locator
-        source_content = self._extract_relevant_content(source.content, locator)
-
-        # Build verification prompt
-        prompt = self._build_verification_prompt(
-            source_content=source_content,
-            quote_context=quote_context,
-            verbatim_quote=verbatim_quote,
-            claim=claim,
+        content_fields_changed = any(
+            v is not None for v in [claim, verbatim_quote, quote_context]
         )
 
-        try:
-            import time
+        field_map = [
+            ("claim", claim, None),
+            ("verbatim_quote", verbatim_quote, None),
+            ("quote_context", quote_context, None),
+            ("relevance_reasoning", relevance_reasoning, None),
+            ("confidence", confidence, "confidence_level"),
+            ("extraction_method", extraction_method, "extraction_method"),
+            ("locator", locator, "jsonb"),
+        ]
 
-            from langchain_core.messages import HumanMessage, SystemMessage
+        updates: list[str] = []
+        values: list[Any] = []
+        idx = 1
+        for col, val, cast in field_map:
+            if val is None:
+                continue
+            placeholder = f"${idx}" + (f"::{cast}" if cast else "")
+            updates.append(f"{col} = {placeholder}")
+            values.append(json.dumps(val) if cast == "jsonb" else val)
+            idx += 1
 
-            system_prompt = self._get_verification_system_prompt()
-            messages = [
-                SystemMessage(content=system_prompt),
-                HumanMessage(content=prompt),
-            ]
+        if not updates:
+            raise ValueError("No fields provided to edit")
 
-            # Invoke with structured output
-            start_time = time.time()
-            log.debug("Sending verification request to LLM...")
+        if content_fields_changed:
+            updates.append("verification_status = 'pending'::verification_status")
+            updates.append("verification_notes = NULL")
+            updates.append("similarity_score = NULL")
+            updates.append("matched_location = NULL")
 
-            response = self._llm_client.invoke(messages)
+        values.append(citation_id)
+        query = f"UPDATE citations SET {', '.join(updates)} WHERE id = ${idx}"
+        await self.db.execute(query, *values)
+        log.debug(f"Edited citation {citation_id}")
 
-            elapsed_ms = int((time.time() - start_time) * 1000)
-            log.debug(
-                f"Verification complete in {elapsed_ms}ms: "
-                f"verified={response.verified}, score={response.similarity_score:.2f}"
-            )
-
-            return VerificationResult(
-                is_verified=response.verified,
-                similarity_score=response.similarity_score,
-                reasoning=response.reasoning,
-            )
-
-        except Exception as e:
-            log.error(f"Verification failed for citation [{citation_id}]: {e}")
-            return VerificationResult(
-                is_verified=False,
-                similarity_score=0.0,
-                reasoning=f"Verification error: {e}",
-                error=str(e),
-            )
-
-    def _get_verification_system_prompt(self) -> str:
-        """Return the system prompt for the verification LLM."""
-        return f"""Reasoning: {self.reasoning_level}
-
-You are a citation verification assistant. Your job is to verify that:
-1. The quoted text (or similar text) exists in the provided source content
-2. The quoted text actually supports the claim being made
-
-Respond in JSON format with these fields:
-- verified: boolean - whether the citation is valid
-- similarity_score: float (0-1) - how closely the quote matches the source
-- matched_text: string - the actual text found in the source (if any)
-- matched_location: object - where in the source the text was found (optional)
-- reasoning: string - brief explanation of your decision
-
-Be strict but fair. Minor paraphrasing is acceptable if the meaning is preserved.
-If the quote cannot be found or doesn't support the claim, explain why."""
+    # =========================================================================
+    # VERIFICATION HELPERS (verification itself runs on the auxiliary-LLM
+    # service — see src/services/auxiliary.py::verify_and_store_citation)
+    # =========================================================================
 
     def _extract_relevant_content(
         self,
         full_content: str,
         locator: dict | None,
     ) -> str:
-        """
-        Extract the relevant portion of source content based on locator.
-
-        For PDFs with page markers, extracts just the cited page plus
-        adjacent pages for context. This dramatically reduces LLM context
-        and speeds up verification.
-
-        Args:
-            full_content: Full source content (may include page markers)
-            locator: Locator dict with page/section info, or None
-
-        Returns:
-            Relevant content portion, or full content if no locator
-        """
+        """Extract the relevant portion of source content based on locator (page)."""
         if not locator or "page" not in locator:
             log.debug("No page locator, using full content")
             return full_content
@@ -1804,14 +1006,9 @@ If the quote cannot be found or doesn't support the claim, explain why."""
         page_num = locator["page"]
         log.debug(f"Extracting content for page {page_num}")
 
-        # Split content by page markers
-        import re
-
         page_pattern = r"--- Page (\d+) ---"
         pages = re.split(page_pattern, full_content)
 
-        # pages list: ['', '1', 'content1', '2', 'content2', ...]
-        # Build page_num -> content mapping
         page_contents = {}
         for i in range(1, len(pages), 2):
             if i + 1 < len(pages):
@@ -1825,10 +1022,8 @@ If the quote cannot be found or doesn't support the claim, explain why."""
             log.debug("No page markers found in content, using full content")
             return full_content
 
-        # Extract target page plus adjacent pages for context
-        context_pages = 1  # Include 1 page before and after
+        context_pages = 1
         extracted_parts = []
-
         for p in range(page_num - context_pages, page_num + context_pages + 1):
             if p in page_contents:
                 extracted_parts.append(f"--- Page {p} ---\n{page_contents[p]}")
@@ -1841,346 +1036,173 @@ If the quote cannot be found or doesn't support the claim, explain why."""
         log.debug(f"Extracted {len(extracted)} chars for page {page_num}")
         return extracted
 
-    def _build_verification_prompt(
-        self,
-        source_content: str,
-        quote_context: str,
-        verbatim_quote: str | None,
-        claim: str,
-    ) -> str:
-        """Build the verification prompt."""
-        # Truncate source content if too long to fit in context
-        max_content_length = 50000
-        if len(source_content) > max_content_length:
-            source_content = (
-                source_content[:max_content_length]
-                + f"\n\n[... truncated, {len(source_content) - max_content_length} more characters ...]"
-            )
-            log.debug(f"Truncated source content to {max_content_length} characters")
-
-        prompt = f"""Please verify this citation:
-
-## Claim
-{claim}
-
-## Quoted Context
-{quote_context}
-"""
-
-        if verbatim_quote:
-            prompt += f"""
-## Verbatim Quote
-{verbatim_quote}
-"""
-
-        prompt += f"""
-## Source Content
-{source_content}
-
-Please verify that the quoted text exists in the source and supports the claim.
-Respond in JSON format."""
-
-        return prompt
-
-    def _parse_verification_response(self, response: str) -> VerificationResult:
-        """Parse the verification LLM response."""
-        try:
-            import re
-
-            # Look for JSON in the response
-            json_match = re.search(r"\{.*\}", response, re.DOTALL)
-            if json_match:
-                data = json.loads(json_match.group())
-            else:
-                # Try parsing the entire response as JSON
-                data = json.loads(response)
-
-            return VerificationResult(
-                is_verified=data.get("verified", False),
-                similarity_score=float(data.get("similarity_score", 0.0)),
-                matched_text=data.get("matched_text"),
-                matched_location=data.get("matched_location"),
-                reasoning=data.get("reasoning"),
-            )
-
-        except (json.JSONDecodeError, KeyError, TypeError) as e:
-            log.warning(f"Failed to parse verification response as JSON: {e}")
-            # Try to determine verification from response text
-            is_verified = (
-                "verified" in response.lower()
-                and "not verified" not in response.lower()
-                and "unverified" not in response.lower()
-            )
-            return VerificationResult(
-                is_verified=is_verified,
-                similarity_score=0.5 if is_verified else 0.0,
-                reasoning=response[:500],
-            )
-
     # =========================================================================
     # RETRIEVAL METHODS
     # =========================================================================
 
-    def get_source(self, source_id: int, job_id: str | None = None) -> Source | None:
-        """
-        Get a source by ID, optionally verifying job ownership via job_sources.
+    async def get_source(
+        self, source_id: int, job_id: str | None = None
+    ) -> Source | None:
+        """Get a source by ID, optionally verifying job ownership via job_sources."""
+        job_uuid = self._as_uuid(job_id) if job_id is not None else self._job_uuid()
+        log.debug(f"Retrieving source [{source_id}], job_id={job_uuid}")
 
-        Args:
-            source_id: The ID of the source to retrieve
-            job_id: Optional job_id to verify ownership (defaults to context.session_id)
-
-        Returns:
-            Source object or None if not found or not linked to job
-        """
-        # Default to context's job_id if not provided
-        if job_id is None and self.context:
-            job_id = self.context.session_id
-
-        log.debug(f"Retrieving source [{source_id}], job_id={job_id}")
-
-        if job_id is not None:
-            if self._db_type == "sqlite":
-                query = """SELECT s.* FROM sources s
+        if job_uuid is not None:
+            row = await self.db.fetchrow(
+                """SELECT s.* FROM sources s
                     JOIN job_sources js ON s.id = js.source_id
-                    WHERE s.id = ? AND js.job_id = ?"""
-            else:
-                query = """SELECT s.* FROM sources s
-                    JOIN job_sources js ON s.id = js.source_id
-                    WHERE s.id = %s AND js.job_id = %s"""
-            results = self._query(query, (source_id, job_id))
+                    WHERE s.id = $1 AND js.job_id = $2""",
+                source_id,
+                job_uuid,
+            )
         else:
-            if self._db_type == "sqlite":
-                query = "SELECT * FROM sources WHERE id = ?"
-            else:
-                query = "SELECT * FROM sources WHERE id = %s"
-            results = self._query(query, (source_id,))
+            row = await self.db.fetchrow(
+                "SELECT * FROM sources WHERE id = $1", source_id
+            )
 
-        if not results:
-            log.debug(f"Source [{source_id}] not found (job_id={job_id})")
+        if not row:
+            log.debug(f"Source [{source_id}] not found (job_id={job_uuid})")
             return None
+        return self._row_to_source(dict(row))
 
-        return self._row_to_source(results[0])
-
-    def get_citation(
+    async def get_citation(
         self, citation_id: int, job_id: str | None = None
     ) -> Citation | None:
-        """
-        Get a citation by ID, optionally verifying job_id ownership.
+        """Get a citation by ID, optionally verifying job_id ownership."""
+        job_uuid = self._as_uuid(job_id) if job_id is not None else self._job_uuid()
+        log.debug(f"Retrieving citation [{citation_id}], job_id={job_uuid}")
 
-        Args:
-            citation_id: The ID of the citation to retrieve
-            job_id: Optional job_id to verify ownership (defaults to context.session_id)
-
-        Returns:
-            Citation object or None if not found or job_id doesn't match
-        """
-        # Default to context's job_id if not provided
-        if job_id is None and self.context:
-            job_id = self.context.session_id
-
-        log.debug(f"Retrieving citation [{citation_id}], job_id={job_id}")
-
-        if job_id is not None:
-            if self._db_type == "sqlite":
-                query = "SELECT * FROM citations WHERE id = ? AND job_id = ?"
-            else:
-                query = "SELECT * FROM citations WHERE id = %s AND job_id = %s"
-            results = self._query(query, (citation_id, job_id))
+        if job_uuid is not None:
+            row = await self.db.fetchrow(
+                "SELECT * FROM citations WHERE id = $1 AND job_id = $2",
+                citation_id,
+                job_uuid,
+            )
         else:
-            if self._db_type == "sqlite":
-                query = "SELECT * FROM citations WHERE id = ?"
-            else:
-                query = "SELECT * FROM citations WHERE id = %s"
-            results = self._query(query, (citation_id,))
+            row = await self.db.fetchrow(
+                "SELECT * FROM citations WHERE id = $1", citation_id
+            )
 
-        if not results:
-            log.debug(f"Citation [{citation_id}] not found (job_id={job_id})")
+        if not row:
+            log.debug(f"Citation [{citation_id}] not found (job_id={job_uuid})")
             return None
+        return self._row_to_citation(dict(row))
 
-        return self._row_to_citation(results[0])
-
-    def get_citations_for_source(
+    async def get_citations_for_source(
         self, source_id: int, job_id: str | None = None
     ) -> list[Citation]:
-        """
-        Get all citations referencing a source within a job.
+        """Get all citations referencing a source within a job."""
+        job_uuid = self._as_uuid(job_id) if job_id is not None else self._job_uuid()
+        log.debug(f"Retrieving citations for source [{source_id}], job_id={job_uuid}")
 
-        Args:
-            source_id: The ID of the source
-            job_id: Optional job_id filter (defaults to context.session_id)
-
-        Returns:
-            List of Citation objects for the specified job
-        """
-        # Default to context's job_id if not provided
-        if job_id is None and self.context:
-            job_id = self.context.session_id
-
-        log.debug(f"Retrieving citations for source [{source_id}], job_id={job_id}")
-
-        if job_id is not None:
-            if self._db_type == "sqlite":
-                query = "SELECT * FROM citations WHERE source_id = ? AND job_id = ? ORDER BY created_at DESC"
-            else:
-                query = "SELECT * FROM citations WHERE source_id = %s AND job_id = %s ORDER BY created_at DESC"
-            results = self._query(query, (source_id, job_id))
+        if job_uuid is not None:
+            rows = await self.db.fetch(
+                "SELECT * FROM citations WHERE source_id = $1 AND job_id = $2 ORDER BY created_at DESC",
+                source_id,
+                job_uuid,
+            )
         else:
-            if self._db_type == "sqlite":
-                query = "SELECT * FROM citations WHERE source_id = ? ORDER BY created_at DESC"
-            else:
-                query = "SELECT * FROM citations WHERE source_id = %s ORDER BY created_at DESC"
-            results = self._query(query, (source_id,))
+            rows = await self.db.fetch(
+                "SELECT * FROM citations WHERE source_id = $1 ORDER BY created_at DESC",
+                source_id,
+            )
 
-        citations = [self._row_to_citation(row) for row in results]
-        log.debug(
-            f"Found {len(citations)} citations for source [{source_id}], job_id={job_id}"
-        )
+        citations = [self._row_to_citation(dict(r)) for r in rows]
+        log.debug(f"Found {len(citations)} citations for source [{source_id}]")
         return citations
 
-    def get_citations_by_session(self, session_id: str) -> list[Citation]:
-        """
-        Get all citations created in a session.
-
-        Args:
-            session_id: The session ID to filter by
-
-        Returns:
-            List of Citation objects
-        """
+    async def get_citations_by_session(self, session_id: str) -> list[Citation]:
+        """Get all citations created in a session (created_by prefix match)."""
         log.debug(f"Retrieving citations for session: {session_id}")
-
-        if self._db_type == "sqlite":
-            query = "SELECT * FROM citations WHERE created_by LIKE ? ORDER BY created_at DESC"
-            params = (f"{session_id}%",)
-        else:
-            query = "SELECT * FROM citations WHERE created_by LIKE %s ORDER BY created_at DESC"
-            params = (f"{session_id}%",)
-
-        results = self._query(query, params)
-        citations = [self._row_to_citation(row) for row in results]
+        rows = await self.db.fetch(
+            "SELECT * FROM citations WHERE created_by LIKE $1 ORDER BY created_at DESC",
+            f"{session_id}%",
+        )
+        citations = [self._row_to_citation(dict(r)) for r in rows]
         log.debug(f"Found {len(citations)} citations for session: {session_id}")
         return citations
 
-    def list_sources(
+    async def list_sources(
         self,
         source_type: str | None = None,
         job_id: str | None = None,
     ) -> list[Source]:
-        """
-        List registered sources, filtered by job_id (via job_sources join) and optionally by type.
-
-        Args:
-            source_type: Optional type filter (document, website, database, custom)
-            job_id: Optional job_id filter (defaults to context.session_id if available)
-
-        Returns:
-            List of Source objects for the specified job
-        """
-        # Default to context's job_id if not provided
-        if job_id is None and self.context:
-            job_id = self.context.session_id
-
+        """List registered sources, filtered by job_id (job_sources join) and type."""
+        job_uuid = self._as_uuid(job_id) if job_id is not None else self._job_uuid()
         log.debug(
-            f"Listing sources, job_id={job_id}, type filter: {source_type or 'all'}"
+            f"Listing sources, job_id={job_uuid}, type filter: {source_type or 'all'}"
         )
 
-        conditions = []
-        params = []
+        params: list[Any] = []
+        conditions: list[str] = []
 
-        if job_id is not None:
-            conditions.append("js.job_id = ?")
-            params.append(job_id)
-
-        if source_type is not None:
-            conditions.append("s.type = ?")
-            params.append(source_type)
-
-        if job_id is not None:
+        if job_uuid is not None:
             query = (
                 "SELECT s.* FROM sources s JOIN job_sources js ON s.id = js.source_id"
             )
+            params.append(job_uuid)
+            conditions.append(f"js.job_id = ${len(params)}")
         else:
             query = "SELECT s.* FROM sources s"
+
+        if source_type is not None:
+            params.append(source_type)
+            conditions.append(f"s.type = ${len(params)}::source_type")
 
         if conditions:
             query += " WHERE " + " AND ".join(conditions)
         query += " ORDER BY s.created_at DESC"
 
-        # Adjust placeholders for PostgreSQL
-        if self._db_type == "postgresql":
-            query = query.replace("?", "%s")
-
-        results = self._query(query, tuple(params) if params else None)
-        sources = [self._row_to_source(row) for row in results]
-        log.debug(f"Found {len(sources)} sources for job_id={job_id}")
+        rows = await self.db.fetch(query, *params)
+        sources = [self._row_to_source(dict(r)) for r in rows]
+        log.debug(f"Found {len(sources)} sources for job_id={job_uuid}")
         return sources
 
-    def list_citations(
+    async def list_citations(
         self,
         source_id: int | None = None,
         session_id: str | None = None,
         verification_status: str | None = None,
         job_id: str | None = None,
     ) -> list[Citation]:
-        """
-        List citations with optional filters.
-
-        Args:
-            source_id: Filter by source ID
-            session_id: Filter by session ID (legacy, uses created_by LIKE)
-            verification_status: Filter by verification status
-            job_id: Filter by job_id (defaults to context.session_id if available)
-
-        Returns:
-            List of Citation objects for the specified job
-        """
-        # Default to context's job_id if not provided
-        if job_id is None and self.context:
-            job_id = self.context.session_id
-
+        """List citations with optional filters (job-scoped by default)."""
+        job_uuid = self._as_uuid(job_id) if job_id is not None else self._job_uuid()
         log.debug(
-            f"Listing citations: job_id={job_id}, source_id={source_id}, "
+            f"Listing citations: job_id={job_uuid}, source_id={source_id}, "
             f"session_id={session_id}, status={verification_status}"
         )
 
-        conditions = []
-        params = []
+        params: list[Any] = []
+        conditions: list[str] = []
 
-        if job_id is not None:
-            conditions.append("job_id = ?")
-            params.append(job_id)
-
+        if job_uuid is not None:
+            params.append(job_uuid)
+            conditions.append(f"job_id = ${len(params)}")
         if source_id is not None:
-            conditions.append("source_id = ?")
             params.append(source_id)
-
+            conditions.append(f"source_id = ${len(params)}")
         if session_id is not None:
-            conditions.append("created_by LIKE ?")
             params.append(f"{session_id}%")
-
+            conditions.append(f"created_by LIKE ${len(params)}")
         if verification_status is not None:
-            conditions.append("verification_status = ?")
             params.append(verification_status)
+            conditions.append(
+                f"verification_status = ${len(params)}::verification_status"
+            )
 
         query = "SELECT * FROM citations"
         if conditions:
             query += " WHERE " + " AND ".join(conditions)
         query += " ORDER BY created_at DESC"
 
-        # Adjust placeholders for PostgreSQL
-        if self._db_type == "postgresql":
-            query = query.replace("?", "%s")
-
-        results = self._query(query, tuple(params) if params else None)
-        citations = [self._row_to_citation(row) for row in results]
-        log.debug(f"Found {len(citations)} citations for job_id={job_id}")
+        rows = await self.db.fetch(query, *params)
+        citations = [self._row_to_citation(dict(r)) for r in rows]
+        log.debug(f"Found {len(citations)} citations for job_id={job_uuid}")
         return citations
 
     def _row_to_source(self, row: dict[str, Any]) -> Source:
         """Convert a database row to a Source object."""
-        metadata = row.get("metadata")
-        if isinstance(metadata, str):
-            metadata = json.loads(metadata) if metadata else None
+        metadata = self._loads(row.get("metadata"))
 
         created_at = row.get("created_at")
         if isinstance(created_at, str):
@@ -2200,15 +1222,8 @@ Respond in JSON format."""
 
     def _row_to_citation(self, row: dict[str, Any]) -> Citation:
         """Convert a database row to a Citation object."""
-        locator = row.get("locator")
-        if isinstance(locator, str):
-            locator = json.loads(locator) if locator else {}
-
-        matched_location = row.get("matched_location")
-        if isinstance(matched_location, str):
-            matched_location = (
-                json.loads(matched_location) if matched_location else None
-            )
+        locator = self._loads(row.get("locator")) or {}
+        matched_location = self._loads(row.get("matched_location"))
 
         created_at = row.get("created_at")
         if isinstance(created_at, str):
@@ -2242,240 +1257,129 @@ Respond in JSON format."""
     # =========================================================================
 
     def _get_embedding_service(self):
-        """Lazy-init the embedding service. Returns None if not configured."""
+        """Lazy-resolve SRW's process-wide embedding service. None if unavailable.
+
+        Phase 1: the citation engine shares SRW's embedding service
+        (``src.services.embedding_service.get_embedding_service`` — 4096-dim,
+        matching the host ``source_embeddings.embedding vector(4096)`` column)
+        instead of carrying its own ``CITATION_EMBEDDING_*`` stack.
+        """
         if self._embedding_service is None:
             try:
-                from .embeddings import EmbeddingService, EmbeddingServiceNotConfigured
+                from src.services.embedding_service import get_embedding_service
 
-                self._embedding_service = EmbeddingService()
-            except EmbeddingServiceNotConfigured:
-                log.debug("Embedding service not configured, vector features disabled")
-                self._embedding_service = False  # Sentinel: tried but not available
+                self._embedding_service = get_embedding_service()
             except Exception as e:
-                log.debug(f"Could not initialize embedding service: {e}")
-                self._embedding_service = False
+                log.debug(f"SRW embedding service unavailable: {e}")
+                self._embedding_service = False  # Sentinel: tried, not available
 
         return self._embedding_service if self._embedding_service is not False else None
 
     def _get_chunker(self):
-        """Lazy-init the semantic chunker."""
+        """Lazy-init the chunker.
+
+        Phase 1 uses fixed-size chunking (``embedding_service=None``); semantic
+        chunking needs an async chunker and is deferred (search still works on
+        fixed chunks).
+        """
         if self._chunker is None:
             from .chunking import SemanticChunker
 
-            service = self._get_embedding_service()
-            self._chunker = SemanticChunker(embedding_service=service)
-
+            self._chunker = SemanticChunker(embedding_service=None)
         return self._chunker
 
-    def _ensure_vector_dimension(self, service) -> None:
-        """Ensure pgvector column dimension matches the embedding model. Auto-migrates if needed."""
-        if self._vector_dimension_checked or self._db_type != "postgresql":
-            self._vector_dimension_checked = True
-            return
-
-        self._vector_dimension_checked = True
-        expected_dim = service.dimension
-
-        try:
-            self._cursor.execute(
-                "SELECT format_type(atttypid, atttypmod) "
-                "FROM pg_attribute "
-                "WHERE attrelid = 'source_embeddings'::regclass "
-                "AND attname = 'embedding'"
-            )
-            row = self._cursor.fetchone()
-            if not row:
-                return
-
-            col_type = (
-                row[0] if isinstance(row, (tuple, list)) else row.get("format_type", "")
-            )
-            match = re.search(r"vector\((\d+)\)", col_type)
-            if not match:
-                return  # Untyped vector column, no constraint to fix
-
-            current_dim = int(match.group(1))
-            if current_dim == expected_dim:
-                return
-
-            log.warning(
-                f"Vector column dimension mismatch: DB has vector({current_dim}), "
-                f"model '{service.model}' needs vector({expected_dim}). Auto-migrating..."
-            )
-
-            # Drop HNSW index, clear stale embeddings, alter column
-            self._cursor.execute("DROP INDEX IF EXISTS idx_source_embeddings_vector")
-            self._cursor.execute(
-                "DELETE FROM source_embeddings WHERE embedding IS NOT NULL"
-            )
-            self._cursor.execute(
-                f"ALTER TABLE source_embeddings ALTER COLUMN embedding TYPE vector({expected_dim})"
-            )
-            self._conn.commit()
-
-            # Recreate HNSW index only if within pgvector's 2000-dim limit
-            if expected_dim <= 2000:
-                self._cursor.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_source_embeddings_vector "
-                    "ON source_embeddings USING hnsw (embedding vector_cosine_ops) "
-                    "WITH (m = 16, ef_construction = 64)"
-                )
-                self._conn.commit()
-                log.info(
-                    f"Vector column migrated to {expected_dim} dimensions (with HNSW index)"
-                )
-            else:
-                log.info(
-                    f"Vector column migrated to {expected_dim} dimensions "
-                    f"(no HNSW index — exceeds 2000-dim limit, sequential scan will be used)"
-                )
-
-        except Exception as e:
-            self._conn.rollback()
-            log.warning(f"Failed to check/migrate vector dimension: {e}")
-
-    def _auto_embed_source(self, source_id: int, content: str, job_id: str) -> None:
+    async def _auto_embed_source(
+        self, source_id: int, content: str, job_uuid: uuid.UUID
+    ) -> None:
         """Auto-embed source content after registration. Silently skips on failure."""
-        if self._db_type == "sqlite":
-            return  # Vector search is PostgreSQL-only
-
         service = self._get_embedding_service()
         if not service:
             return
 
         try:
-            # Check if already embedded for this job
-            if self._db_type == "sqlite":
-                query = "SELECT COUNT(*) as cnt FROM source_embeddings WHERE source_id = ? AND job_id = ?"
-            else:
-                query = "SELECT COUNT(*) as cnt FROM source_embeddings WHERE source_id = %s AND job_id = %s"
-
-            results = self._query(query, (source_id, job_id))
-            if results and results[0].get("cnt", 0) > 0:
-                log.debug(f"Source [{source_id}] already embedded for job {job_id}")
+            cnt = await self.db.fetchval(
+                "SELECT COUNT(*) FROM source_embeddings WHERE source_id = $1 AND job_id = $2",
+                source_id,
+                job_uuid,
+            )
+            if cnt and cnt > 0:
+                log.debug(f"Source [{source_id}] already embedded for job {job_uuid}")
                 return
-
-            self._embed_source_content(source_id, content, job_id, service)
+            await self._embed_source_content(source_id, content, job_uuid, service)
         except Exception as e:
-            # Rollback to clear PostgreSQL's aborted transaction state,
-            # otherwise all subsequent queries on this connection will fail.
-            try:
-                self._conn.rollback()
-            except Exception:
-                pass
             log.warning(f"Auto-embed failed for source [{source_id}], skipping: {e}")
 
-    def _embed_source_content(
+    async def _embed_source_content(
         self,
         source_id: int,
         content: str,
-        job_id: str,
+        job_uuid: uuid.UUID,
         service=None,
     ) -> int:
-        """
-        Chunk and embed source content, storing in source_embeddings.
-
-        Args:
-            source_id: Source ID
-            content: Text content to embed
-            job_id: Job ID
-            service: Optional EmbeddingService (uses default if None)
-
-        Returns:
-            Number of chunks embedded
-        """
+        """Chunk and embed source content, storing in source_embeddings."""
         if service is None:
             service = self._get_embedding_service()
             if not service:
                 raise RuntimeError("Embedding service not available")
 
-        # Ensure DB vector column matches the embedding model dimension
-        self._ensure_vector_dimension(service)
-
-        chunker = self._get_chunker()
-        chunks = chunker.chunk(content)
-
+        chunks = self._get_chunker().chunk(content)
         if not chunks:
             return 0
 
-        # Embed all chunks in one batch
-        embeddings = service.embed_batch(chunks)
+        # SRW's embedding service is async; pgvector codec on the pool connection
+        # encodes List[float] → vector(4096) directly.
+        embeddings = await service.embed_batch(chunks)
 
-        # Insert into source_embeddings
-        for idx, (chunk_text, embedding) in enumerate(
-            zip(chunks, embeddings, strict=False)
-        ):
-            embedding_str = "[" + ",".join(str(v) for v in embedding) + "]"
-
-            if self._db_type == "sqlite":
-                # SQLite stub: no embedding column
-                query = """
-                    INSERT OR REPLACE INTO source_embeddings (source_id, job_id, chunk_index, chunk_text)
-                    VALUES (?, ?, ?, ?)
-                """
-                self._cursor.execute(query, (source_id, job_id, idx, chunk_text))
-            else:
-                query = """
+        async with self.db.acquire() as conn:
+            for idx, (chunk_text, embedding) in enumerate(
+                zip(chunks, embeddings, strict=False)
+            ):
+                await conn.execute(
+                    """
                     INSERT INTO source_embeddings (source_id, job_id, chunk_index, chunk_text, embedding)
-                    VALUES (%s, %s, %s, %s, %s)
+                    VALUES ($1, $2, $3, $4, $5)
                     ON CONFLICT (source_id, job_id, chunk_index)
                     DO UPDATE SET chunk_text = EXCLUDED.chunk_text, embedding = EXCLUDED.embedding
-                """
-                self._cursor.execute(
-                    query, (source_id, job_id, idx, chunk_text, embedding_str)
+                    """,
+                    source_id,
+                    job_uuid,
+                    idx,
+                    chunk_text,
+                    embedding,
                 )
 
-        self._conn.commit()
         log.info(f"Embedded source [{source_id}]: {len(chunks)} chunks")
         return len(chunks)
 
-    def reindex_source(self, source_id: int) -> int:
-        """
-        Force re-chunk and re-embed a source for the current job.
-
-        Deletes existing embeddings and re-creates them from source content.
-
-        Args:
-            source_id: The source to reindex
-
-        Returns:
-            Number of chunks embedded
-
-        Raises:
-            ValueError: If source not found
-            RuntimeError: If embedding service not available
-            NotImplementedError: If using SQLite mode
-        """
-        if self._db_type == "sqlite":
-            raise NotImplementedError("Vector search requires PostgreSQL mode")
-
+    async def reindex_source(self, source_id: int) -> int:
+        """Force re-chunk and re-embed a source for the current job."""
         service = self._get_embedding_service()
         if not service:
             raise RuntimeError(
-                "Embedding service not configured. "
-                "Set CITATION_EMBEDDING_KEY or CITATION_EMBEDDING_URL."
+                "Embedding service not configured (EMBEDDING_* env / SRW service)."
             )
 
-        job_id = self.context.session_id if self.context else None
-        source = self.get_source(source_id, job_id=job_id)
+        job_uuid = self._job_uuid()
+        source = await self.get_source(
+            source_id, job_id=str(job_uuid) if job_uuid else None
+        )
         if not source:
             raise ValueError(f"Source [{source_id}] not found")
 
-        # Delete existing embeddings for this source+job
-        if self._db_type == "postgresql":
-            query = "DELETE FROM source_embeddings WHERE source_id = %s AND job_id = %s"
-        else:
-            query = "DELETE FROM source_embeddings WHERE source_id = ? AND job_id = ?"
-        self._cursor.execute(query, (source_id, job_id))
-        self._conn.commit()
-
-        return self._embed_source_content(source_id, source.content, job_id, service)
+        await self.db.execute(
+            "DELETE FROM source_embeddings WHERE source_id = $1 AND job_id = $2",
+            source_id,
+            job_uuid,
+        )
+        return await self._embed_source_content(
+            source_id, source.content, job_uuid, service
+        )
 
     # =========================================================================
     # SEARCH METHODS
     # =========================================================================
 
-    def search_library(
+    async def search_library(
         self,
         query: str,
         mode: str = "hybrid",
@@ -2484,23 +1388,7 @@ Respond in JSON format."""
         scope: str = "content",
         top_k: int = 10,
     ) -> SearchResults:
-        """
-        Search the source library with keyword, semantic, or hybrid retrieval.
-
-        Args:
-            query: Natural language query or keywords
-            mode: Search mode — "hybrid", "keyword", or "semantic"
-            tags: Optional tag filter (AND logic)
-            source_type: Optional source type filter ("document", "website", etc.)
-            scope: What to search — "content", "annotations", or "all"
-            top_k: Maximum number of results
-
-        Returns:
-            SearchResults with labeled evidence
-
-        Raises:
-            ValueError: If query is empty or mode is invalid
-        """
+        """Search the source library with keyword, semantic, or hybrid retrieval."""
         from .search import (
             keyword_search,
             label_evidence,
@@ -2509,25 +1397,18 @@ Respond in JSON format."""
             semantic_search,
         )
 
-        self._ensure_connected()
-
         if not query or not query.strip():
             raise ValueError("Search query cannot be empty")
-
         if mode not in ("hybrid", "keyword", "semantic"):
             raise ValueError(
                 f"Invalid search mode '{mode}'. Use: hybrid, keyword, semantic"
             )
-
         if scope not in ("content", "annotations", "all"):
             raise ValueError(f"Invalid scope '{scope}'. Use: content, annotations, all")
 
-        job_id = self.context.session_id if self.context else None
-
-        # Determine what search modes are available
-        can_semantic = (
-            self._db_type == "postgresql" and self._get_embedding_service() is not None
-        )
+        job_uuid = self._job_uuid()
+        service = self._get_embedding_service()
+        can_semantic = service is not None
 
         effective_mode = mode
         if mode == "semantic" and not can_semantic:
@@ -2537,34 +1418,38 @@ Respond in JSON format."""
             log.info("Semantic search unavailable, hybrid falling back to keyword-only")
             effective_mode = "keyword"
 
-        # Fetch more than top_k for each method so RRF has enough to merge
         fetch_k = top_k * 2
-
         keyword_hits = []
         semantic_hits = []
 
-        if effective_mode in ("keyword", "hybrid"):
-            keyword_hits = keyword_search(
-                cursor=self._cursor,
-                db_type=self._db_type,
-                query=query,
-                job_id=job_id,
-                top_k=fetch_k,
-                source_type=source_type,
-                tags=tags,
-                scope=scope,
-            )
+        # Compute the query embedding (async) before acquiring the connection.
+        query_embedding = None
+        if effective_mode in ("semantic", "hybrid") and service:
+            try:
+                query_embedding = await service.embed(query)
+            except Exception as e:
+                log.warning(f"Query embedding failed, keyword-only: {e}")
+                if effective_mode == "semantic":
+                    effective_mode = "keyword"
 
-        if effective_mode in ("semantic", "hybrid"):
-            service = self._get_embedding_service()
-            if service:
+        async with self.db.acquire() as conn:
+            if effective_mode in ("keyword", "hybrid"):
+                keyword_hits = await keyword_search(
+                    conn=conn,
+                    query=query,
+                    job_id=job_uuid,
+                    top_k=fetch_k,
+                    source_type=source_type,
+                    tags=tags,
+                    scope=scope,
+                )
+
+            if effective_mode in ("semantic", "hybrid") and query_embedding is not None:
                 try:
-                    query_embedding = service.embed(query)
-                    semantic_hits = semantic_search(
-                        cursor=self._cursor,
-                        db_type=self._db_type,
+                    semantic_hits = await semantic_search(
+                        conn=conn,
                         query_embedding=query_embedding,
-                        job_id=job_id,
+                        job_id=job_uuid,
                         top_k=fetch_k,
                         source_type=source_type,
                         tags=tags,
@@ -2572,7 +1457,6 @@ Respond in JSON format."""
                 except Exception as e:
                     log.warning(f"Semantic search failed: {e}")
 
-        # Merge results
         if effective_mode == "hybrid" and keyword_hits and semantic_hits:
             merged = rrf_merge(keyword_hits, semantic_hits, top_k=top_k)
         elif keyword_hits:
@@ -2582,7 +1466,6 @@ Respond in JSON format."""
         else:
             merged = []
 
-        # Apply evidence labels
         labeled = label_evidence(merged)
         summary = overall_label(labeled)
 
@@ -2597,32 +1480,16 @@ Respond in JSON format."""
     # ANNOTATION & TAG METHODS
     # =========================================================================
 
-    def annotate_source(
+    async def annotate_source(
         self,
         source_id: int,
         content: str,
         annotation_type: str = "note",
         page_reference: str | None = None,
     ) -> Annotation:
-        """
-        Add an annotation to a source.
+        """Add an annotation to a source (per-job)."""
+        job_uuid = self._job_uuid()
 
-        Args:
-            source_id: The source to annotate
-            content: Annotation text
-            annotation_type: Type of annotation (note, highlight, summary, question, critique)
-            page_reference: Optional page/section reference
-
-        Returns:
-            The created Annotation object
-
-        Raises:
-            ValueError: If source not found or annotation_type invalid
-        """
-        self._ensure_connected()
-        job_id = self.context.session_id if self.context else None
-
-        # Validate annotation type
         try:
             ann_type = AnnotationType(annotation_type)
         except ValueError as err:
@@ -2631,8 +1498,9 @@ Respond in JSON format."""
                 f"Invalid annotation_type '{annotation_type}'. Valid: {valid}"
             ) from err
 
-        # Validate source exists and belongs to job
-        source = self.get_source(source_id, job_id=job_id)
+        source = await self.get_source(
+            source_id, job_id=str(job_uuid) if job_uuid else None
+        )
         if not source:
             raise ValueError(
                 f"Source [{source_id}] not found or not linked to current job"
@@ -2642,35 +1510,19 @@ Respond in JSON format."""
         if self.context:
             created_by = self.context.agent_id or self.context.session_id
 
-        if self._db_type == "sqlite":
-            query = """
-                INSERT INTO source_annotations (source_id, job_id, annotation_type, content, page_reference, created_by)
-                VALUES (?, ?, ?, ?, ?, ?)
+        ann_id = await self.db.fetchval(
             """
-            params = (
-                source_id,
-                job_id,
-                ann_type.value,
-                content,
-                page_reference,
-                created_by,
-            )
-        else:
-            query = """
-                INSERT INTO source_annotations (source_id, job_id, annotation_type, content, page_reference, created_by)
-                VALUES (%s, %s, %s, %s, %s, %s)
-                RETURNING id
-            """
-            params = (
-                source_id,
-                job_id,
-                ann_type.value,
-                content,
-                page_reference,
-                created_by,
-            )
-
-        ann_id = self._insert(query, params)
+            INSERT INTO source_annotations (source_id, job_id, annotation_type, content, page_reference, created_by)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            RETURNING id
+            """,
+            source_id,
+            job_uuid,
+            ann_type.value,
+            content,
+            page_reference,
+            created_by,
+        )
         log.info(
             f"Created {ann_type.value} annotation [{ann_id}] on source [{source_id}]"
         )
@@ -2678,7 +1530,7 @@ Respond in JSON format."""
         return Annotation(
             id=ann_id,
             source_id=source_id,
-            job_id=job_id,
+            job_id=str(job_uuid),
             annotation_type=ann_type,
             content=content,
             page_reference=page_reference,
@@ -2686,136 +1538,94 @@ Respond in JSON format."""
             created_by=created_by,
         )
 
-    def get_annotations(
+    async def get_annotations(
         self,
         source_id: int,
         annotation_type: str | None = None,
     ) -> list[Annotation]:
-        """
-        Get annotations for a source in the current job.
+        """Get annotations for a source in the current job."""
+        job_uuid = self._job_uuid()
 
-        Args:
-            source_id: The source to get annotations for
-            annotation_type: Optional type filter
+        params: list[Any] = [source_id]
+        conditions = ["source_id = $1"]
 
-        Returns:
-            List of Annotation objects, newest first
-        """
-        self._ensure_connected()
-        job_id = self.context.session_id if self.context else None
-
-        conditions = ["source_id = ?"]
-        params: list = [source_id]
-
-        if job_id is not None:
-            conditions.append("job_id = ?")
-            params.append(job_id)
-
+        if job_uuid is not None:
+            params.append(job_uuid)
+            conditions.append(f"job_id = ${len(params)}")
         if annotation_type is not None:
-            conditions.append("annotation_type = ?")
             params.append(annotation_type)
+            conditions.append(f"annotation_type = ${len(params)}")
 
-        query = "SELECT * FROM source_annotations WHERE " + " AND ".join(conditions)
-        query += " ORDER BY created_at DESC"
+        query = (
+            "SELECT * FROM source_annotations WHERE "
+            + " AND ".join(conditions)
+            + " ORDER BY created_at DESC"
+        )
+        rows = await self.db.fetch(query, *params)
+        return [self._row_to_annotation(dict(r)) for r in rows]
 
-        if self._db_type == "postgresql":
-            query = query.replace("?", "%s")
+    async def tag_source(self, source_id: int, tags: list[str]) -> list[str]:
+        """Add tags to a source in the current job."""
+        job_uuid = self._job_uuid()
 
-        results = self._query(query, tuple(params))
-        return [self._row_to_annotation(row) for row in results]
-
-    def tag_source(self, source_id: int, tags: list[str]) -> list[str]:
-        """
-        Add tags to a source in the current job.
-
-        Args:
-            source_id: The source to tag
-            tags: List of tag strings to add
-
-        Returns:
-            Current list of all tags for this source+job
-        """
-        self._ensure_connected()
-        job_id = self.context.session_id if self.context else None
-
-        # Validate source exists and belongs to job
-        source = self.get_source(source_id, job_id=job_id)
+        source = await self.get_source(
+            source_id, job_id=str(job_uuid) if job_uuid else None
+        )
         if not source:
             raise ValueError(
                 f"Source [{source_id}] not found or not linked to current job"
             )
 
-        for tag in tags:
-            tag = tag.strip()
-            if not tag:
-                continue
-            if self._db_type == "sqlite":
-                query = "INSERT OR IGNORE INTO source_tags (source_id, job_id, tag) VALUES (?, ?, ?)"
-            else:
-                query = "INSERT INTO source_tags (source_id, job_id, tag) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING"
-            self._cursor.execute(query, (source_id, job_id, tag))
+        async with self.db.acquire() as conn:
+            for tag in tags:
+                tag = tag.strip()
+                if not tag:
+                    continue
+                await conn.execute(
+                    "INSERT INTO source_tags (source_id, job_id, tag) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+                    source_id,
+                    job_uuid,
+                    tag,
+                )
 
-        self._conn.commit()
         log.info(f"Tagged source [{source_id}] with {tags}")
+        return await self.get_tags(source_id)
 
-        return self.get_tags(source_id)
+    async def remove_tags(self, source_id: int, tags: list[str]) -> list[str]:
+        """Remove tags from a source in the current job."""
+        job_uuid = self._job_uuid()
 
-    def remove_tags(self, source_id: int, tags: list[str]) -> list[str]:
-        """
-        Remove tags from a source in the current job.
+        async with self.db.acquire() as conn:
+            for tag in tags:
+                tag = tag.strip()
+                if not tag:
+                    continue
+                await conn.execute(
+                    "DELETE FROM source_tags WHERE source_id = $1 AND job_id = $2 AND tag = $3",
+                    source_id,
+                    job_uuid,
+                    tag,
+                )
 
-        Args:
-            source_id: The source to remove tags from
-            tags: List of tag strings to remove
-
-        Returns:
-            Remaining list of tags for this source+job
-        """
-        self._ensure_connected()
-        job_id = self.context.session_id if self.context else None
-
-        for tag in tags:
-            tag = tag.strip()
-            if not tag:
-                continue
-            if self._db_type == "sqlite":
-                query = "DELETE FROM source_tags WHERE source_id = ? AND job_id = ? AND tag = ?"
-            else:
-                query = "DELETE FROM source_tags WHERE source_id = %s AND job_id = %s AND tag = %s"
-            self._cursor.execute(query, (source_id, job_id, tag))
-
-        self._conn.commit()
         log.info(f"Removed tags {tags} from source [{source_id}]")
+        return await self.get_tags(source_id)
 
-        return self.get_tags(source_id)
+    async def get_tags(self, source_id: int) -> list[str]:
+        """Get all tags for a source in the current job."""
+        job_uuid = self._job_uuid()
 
-    def get_tags(self, source_id: int) -> list[str]:
-        """
-        Get all tags for a source in the current job.
-
-        Args:
-            source_id: The source to get tags for
-
-        Returns:
-            List of tag strings, sorted alphabetically
-        """
-        self._ensure_connected()
-        job_id = self.context.session_id if self.context else None
-
-        if job_id is not None:
-            if self._db_type == "sqlite":
-                query = "SELECT tag FROM source_tags WHERE source_id = ? AND job_id = ? ORDER BY tag"
-            else:
-                query = "SELECT tag FROM source_tags WHERE source_id = %s AND job_id = %s ORDER BY tag"
-            results = self._query(query, (source_id, job_id))
+        if job_uuid is not None:
+            rows = await self.db.fetch(
+                "SELECT tag FROM source_tags WHERE source_id = $1 AND job_id = $2 ORDER BY tag",
+                source_id,
+                job_uuid,
+            )
         else:
-            if self._db_type == "sqlite":
-                query = "SELECT tag FROM source_tags WHERE source_id = ? ORDER BY tag"
-            else:
-                query = "SELECT tag FROM source_tags WHERE source_id = %s ORDER BY tag"
-            results = self._query(query, (source_id,))
-
-        return [row["tag"] for row in results]
+            rows = await self.db.fetch(
+                "SELECT tag FROM source_tags WHERE source_id = $1 ORDER BY tag",
+                source_id,
+            )
+        return [r["tag"] for r in rows]
 
     def _row_to_annotation(self, row: dict[str, Any]) -> Annotation:
         """Convert a database row to an Annotation object."""
@@ -2838,93 +1648,61 @@ Respond in JSON format."""
     # EXPORT METHODS
     # =========================================================================
 
-    def format_citation(
+    async def format_citation(
         self,
         citation_id: int,
         style: str = "inline",
     ) -> str:
-        """
-        Format a single citation for display/export.
-
-        Args:
-            citation_id: ID of the citation to format
-            style: Citation style (inline, harvard, ieee, bibtex, apa)
-
-        Returns:
-            Formatted citation string
-
-        Raises:
-            ValueError: If citation or source not found, or unknown style
-        """
+        """Format a single citation for display/export."""
         log.debug(f"Formatting citation [{citation_id}] in {style} style")
 
-        citation = self.get_citation(citation_id)
+        citation = await self.get_citation(citation_id)
         if citation is None:
             raise ValueError(f"Citation not found: {citation_id}")
 
-        source = self.get_source(citation.source_id)
+        source = await self.get_source(citation.source_id)
         if source is None:
             raise ValueError(f"Source not found for citation {citation_id}")
 
         if style == "inline":
             return f"[{citation.id}]"
-
         elif style == "harvard":
-            # Author (Year) Title. Source.
             return f"{source.name} ({source.version or 'n.d.'})"
-
         elif style == "ieee":
-            # [N] Author, "Title," Source, Year.
             return f"[{citation.id}] {source.name}, {source.version or 'n.d.'}"
-
         elif style == "bibtex":
-            # Generate BibTeX entry
             entry_type = "misc"
             if source.type == SourceType.DOCUMENT:
                 entry_type = "book"
             elif source.type == SourceType.WEBSITE:
                 entry_type = "online"
-
             return f"""@{entry_type}{{cite{citation.id},
     title = {{{source.name}}},
     year = {{{source.version or "n.d."}}},
     note = {{{source.identifier}}}
 }}"""
-
         elif style == "apa":
-            # Author. (Year). Title. Source.
             return f"{source.name}. ({source.version or 'n.d.'})."
-
         else:
             raise ValueError(
                 f"Unknown citation style: {style}. Supported: inline, harvard, ieee, bibtex, apa"
             )
 
-    def export_bibliography(
+    async def export_bibliography(
         self,
         session_id: str | None = None,
         style: str = "harvard",
     ) -> str:
-        """
-        Export all citations (or session citations) as bibliography.
-
-        Args:
-            session_id: Optional session ID to filter citations
-            style: Citation style
-
-        Returns:
-            Formatted bibliography string
-        """
+        """Export all citations (or session citations) as bibliography."""
         log.debug(f"Exporting bibliography in {style} style, session_id={session_id}")
 
-        citations = self.list_citations(session_id=session_id)
-
+        citations = await self.list_citations(session_id=session_id)
         if not citations:
             return "No citations found."
 
         lines = []
         for citation in citations:
-            formatted = self.format_citation(citation.id, style)
+            formatted = await self.format_citation(citation.id, style)
             lines.append(formatted)
 
         bibliography = "\n\n".join(lines)
@@ -2935,40 +1713,24 @@ Respond in JSON format."""
     # STATISTICS & REPORTING
     # =========================================================================
 
-    def get_statistics(self) -> dict[str, Any]:
-        """
-        Get statistics about sources and citations.
-
-        Returns:
-            Dictionary with counts and breakdowns
-        """
+    async def get_statistics(self) -> dict[str, Any]:
+        """Get statistics about sources and citations."""
         log.debug("Calculating statistics")
-        self._ensure_connected()
 
-        stats = {
-            "sources": {},
-            "citations": {},
-        }
+        stats = {"sources": {}, "citations": {}}
 
-        # Count sources by type
-        if self._db_type == "sqlite":
-            query = "SELECT type, COUNT(*) as count FROM sources GROUP BY type"
-        else:
-            query = "SELECT type, COUNT(*) as count FROM sources GROUP BY type"
-
-        results = self._query(query)
-        stats["sources"]["by_type"] = {row["type"]: row["count"] for row in results}
+        rows = await self.db.fetch(
+            "SELECT type::text AS type, COUNT(*) AS count FROM sources GROUP BY type"
+        )
+        stats["sources"]["by_type"] = {r["type"]: r["count"] for r in rows}
         stats["sources"]["total"] = sum(stats["sources"]["by_type"].values())
 
-        # Count citations by verification status
-        if self._db_type == "sqlite":
-            query = "SELECT verification_status, COUNT(*) as count FROM citations GROUP BY verification_status"
-        else:
-            query = "SELECT verification_status, COUNT(*) as count FROM citations GROUP BY verification_status"
-
-        results = self._query(query)
+        rows = await self.db.fetch(
+            "SELECT verification_status::text AS verification_status, COUNT(*) AS count "
+            "FROM citations GROUP BY verification_status"
+        )
         stats["citations"]["by_status"] = {
-            row["verification_status"]: row["count"] for row in results
+            r["verification_status"]: r["count"] for r in rows
         }
         stats["citations"]["total"] = sum(stats["citations"]["by_status"].values())
 

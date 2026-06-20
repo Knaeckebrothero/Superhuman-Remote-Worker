@@ -58,6 +58,32 @@ The migration is implemented end-to-end and **live on the dev cluster**. Postgre
 maintenance loop started`; `schema_migrations` shows `0001_initial.sql` succeeded;
 the partition/index tree is present.
 
+**Full-job e2e validation (2026-06-20) — closes PR 6's "no full live LLM job" caveat.**
+PR 6 proved the write path by composition (agent gets the right env + writer unit
+tests + a pod-with-env write/read), but had not driven a real agent job. That gap
+is now closed on k3d:
+- **Local suite 41/41:** `test_archiver_pg` (10, DB-free PG branch) +
+  `test_audit_pagination`/`test_llm_requests_filter` (9, Mongo-fallback reader
+  contract — still wired pre-PR 8) + testcontainers `test_audit_writer` /
+  `test_audit_store_reader` / `test_audit_store` (22, real `postgres:16`
+  writer→reader roundtrip: stitch, global `step_number`-under-filter, version,
+  `token_usage`+status, `get_request`, partitioning/LZ4/CHECK/fail-loud, partition
+  maintenance).
+- **Live worker job** (`gemma-4-moe-strix`) wrote all three tables to `srw-auditdb`:
+  `agent_audit` 140 (73 pre / 67 post — every post carries `pre_id`, llm-posts
+  carry `request_id`), `llm_requests` 34, `chat_history` 34 (with `reasoning`
+  captured).
+- **All nine read endpoints HTTP 200** through the live orchestrator + the real
+  BFF cookie auth: `/audit` (+ `filter=tools|messages|errors|all`, global
+  `step_number` preserved), `/audit/timerange`, `/chat`, `/audit/bulk`,
+  `/chat/bulk`, `/version` (counts match), `/llm-requests` (`token_usage` +
+  `call_type` filter), `/requests/{id}`. Stitched logical rows carried merged
+  post data (latency, `tool`/`llm` sub-objects); `step_number` strictly increasing.
+- **MCP** reads audit via the same orchestrator REST API (`mcp/client.py` →
+  `/jobs/{id}/audit|chat|…`) → transitively covered; MCP healthy. Error-row path
+  (status folded into `metadata` + status filter) is covered by unit tests (the
+  live job had zero errors). No regressions.
+
 **Deploy gotcha hit + resolved (the ESO/Vault trap):** the chart's new
 non-optional `AUDIT_POSTGRES_USER`/`AUDIT_POSTGRES_PASSWORD` secret keys were not
 in Vault, so `srw-auditdb` sat in `CreateContainerConfigError` ("couldn't find key

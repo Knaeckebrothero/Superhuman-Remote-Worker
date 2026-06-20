@@ -418,12 +418,12 @@ they're consumed only as ingress hosts and as window.env.* deep-links.
 {{- end }}
 
 {{/*
-Database connection parts — host/port/db for postgres + vector + citation.
+Database connection parts — host/port/db for postgres + vector.
 
 Credentials (user/password) live in the Secret only; the DSN is composed at
 runtime by the application (orchestrator/utils/db_url.py and src/utils/
 db_url.py). That avoids the redundancy + URL-encoding footgun of also
-shipping a DATABASE_URL/VECTOR_DB_URL/CITATION_DB_URL Vault key.
+shipping a DATABASE_URL/VECTOR_DB_URL Vault key.
 
 For external mode, set databases.<which>.externalHost/externalPort/
 externalDb in values; the chart still injects the host/port/db via

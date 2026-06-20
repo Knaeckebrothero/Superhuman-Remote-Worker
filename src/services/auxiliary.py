@@ -146,6 +146,32 @@ class IngestionVerdict(BaseModel):
     reason: str = Field(description="One-line justification for the verdict")
 
 
+class CitationVerdict(BaseModel):
+    """Structured verdict for citation verification (citation engine Phase 2).
+
+    The verifier checks a citation's quote against its source content and
+    decides whether the quote exists in the source AND supports the claim.
+    Relocated from the citation engine's own LLM stack onto the auxiliary model.
+    """
+
+    verified: bool = Field(
+        description=(
+            "True only if the quoted text (or closely matching text) exists in "
+            "the source AND supports the claim. False otherwise."
+        )
+    )
+    similarity_score: float = Field(
+        description="How closely the quote matches the source content (0.0–1.0).",
+        ge=0.0,
+        le=1.0,
+    )
+    matched_text: Optional[str] = Field(
+        default=None,
+        description="The actual text found in the source that matches the quote.",
+    )
+    reasoning: str = Field(description="One or two sentences explaining the verdict.")
+
+
 # NOTE: ConversationSummary (the summarization output schema) lives in
 # src/core/context.py because it's tightly coupled with the compaction
 # formatting logic there. SummarizeTask imports it from there.
@@ -266,6 +292,68 @@ class IngestionVerdictTask(AuxTask):
     @property
     def output_schema(self) -> Type[BaseModel]:
         return IngestionVerdict
+
+
+class VerifyCitationTask(AuxTask):
+    """Verify a citation's quote against its source content.
+
+    Chain-mode task (citation engine Phase 2). Replaces the engine's own
+    synchronous verification LLM call. ``source_content`` is the relevant
+    portion of the source (page-scoped by the engine when a page locator
+    exists). Prompt loaded from config/prompts/ via the prompt matrix.
+    """
+
+    #: Cap the source excerpt so a large document can't overflow the aux window.
+    MAX_SOURCE_CHARS = 50000
+
+    def __init__(
+        self,
+        claim: str,
+        quote_context: str,
+        verbatim_quote: Optional[str],
+        source_content: str,
+        prompt: str,
+    ):
+        self.claim = claim
+        self.quote_context = quote_context
+        self.verbatim_quote = verbatim_quote
+        self.source_content = source_content
+        self._prompt = prompt
+
+    @property
+    def system_prompt(self) -> str:
+        return self._prompt
+
+    def build_context(self) -> str:
+        src = self.source_content or ""
+        if len(src) > self.MAX_SOURCE_CHARS:
+            dropped = len(src) - self.MAX_SOURCE_CHARS
+            src = (
+                src[: self.MAX_SOURCE_CHARS]
+                + f"\n\n[... truncated {dropped} chars ...]"
+            )
+
+        parts = [
+            "## Claim",
+            self.claim,
+            "",
+            "## Quoted Context",
+            self.quote_context,
+        ]
+        if self.verbatim_quote:
+            parts += ["", "## Verbatim Quote", self.verbatim_quote]
+        parts += [
+            "",
+            "## Source Content",
+            src,
+            "",
+            "Verify that the quoted text exists in the source and supports the claim.",
+        ]
+        return "\n".join(parts)
+
+    @property
+    def output_schema(self) -> Type[BaseModel]:
+        return CitationVerdict
 
 
 class SummarizeTask(AuxTask):
@@ -438,6 +526,7 @@ _TASK_CALL_TYPES = {
     "ExtractMemoriesTask": "memory_extraction",
     "AssembleMemoriesTask": "memory_assembly",
     "CurateKnowledgeTask": "knowledge_curation",
+    "VerifyCitationTask": "citation_verification",
 }
 
 
@@ -1022,6 +1111,99 @@ async def extract_and_store_memories(
             "Memory extraction failed (non-fatal): %s: %s", type(e).__name__, e
         )
         return 0
+
+
+async def verify_and_store_citation(
+    verify_aux: "AuxiliaryLLM",
+    engine: Any,
+    citation_id: int,
+    prompt: str,
+) -> Optional["CitationVerdict"]:
+    """Verify one pending citation via the auxiliary model and write the verdict back.
+
+    Counterpart to ``extract_and_store_memories`` for the citation engine: runs
+    ``VerifyCitationTask`` in chain mode on ``verify_aux``, records ``AuxHealth``,
+    and persists the verdict via ``engine._update_verification_status``.
+
+    Eventually-consistent (D2): the citation was already written ``pending`` by
+    ``cite_*``; this runs in the background and flips it to ``verified`` /
+    ``failed``. **An aux *outage* leaves the row ``pending``** (so the Phase-2b
+    boundary reconcile / a retry can pick it up) — only a real negative verdict
+    sets ``failed``. Non-fatal: never raises into the (fire-and-forget) caller.
+
+    Args:
+        verify_aux: AuxiliaryLLM wrapping the citation-verification model
+            (the dedicated CITATION_LLM model, or the auxiliary model fallback).
+        engine: The async CitationEngine (data access + status write-back).
+        citation_id: The citation to verify.
+        prompt: The matrix-resolved citation-verification system prompt.
+
+    Returns:
+        The CitationVerdict on a successful verdict, else None.
+    """
+    try:
+        citation = await engine.get_citation(citation_id)
+        if citation is None:
+            return None
+        source = await engine.get_source(citation.source_id)
+        if source is None:
+            logger.warning(
+                "Citation verification: source [%s] for citation [%s] not found",
+                citation.source_id,
+                citation_id,
+            )
+            return None
+
+        source_content = engine._extract_relevant_content(
+            source.content, citation.locator
+        )
+        task = VerifyCitationTask(
+            claim=citation.claim,
+            quote_context=citation.quote_context,
+            verbatim_quote=citation.verbatim_quote,
+            source_content=source_content,
+            prompt=prompt,
+        )
+
+        verdict = await verify_aux.chain(task)
+
+        # Lazy import — the vendored engine package owns this model.
+        from citation_engine.models import VerificationResult
+
+        await engine._update_verification_status(
+            citation_id,
+            VerificationResult(
+                is_verified=verdict.verified,
+                similarity_score=verdict.similarity_score,
+                matched_text=verdict.matched_text,
+                matched_location=(
+                    {"matched_text": verdict.matched_text}
+                    if verdict.matched_text
+                    else None
+                ),
+                reasoning=verdict.reasoning,
+            ),
+        )
+        verify_aux.health.record_success("citation_verification")
+        logger.info(
+            "Citation [%s] verified=%s (score %.2f)",
+            citation_id,
+            verdict.verified,
+            verdict.similarity_score,
+        )
+        return verdict
+
+    except Exception as e:
+        verify_aux.health.record_failure("citation_verification", e)
+        # Leave verification_status='pending' — an aux outage is transient; the
+        # Phase-2b boundary reconcile (or a re-read) can retry. Non-fatal.
+        logger.warning(
+            "Citation verification failed for [%s] (non-fatal): %s: %s",
+            citation_id,
+            type(e).__name__,
+            e,
+        )
+        return None
 
 
 async def curate_and_store_knowledge(
