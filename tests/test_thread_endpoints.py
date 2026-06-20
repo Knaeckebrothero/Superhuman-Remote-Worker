@@ -139,11 +139,22 @@ def parse_workspace_metadata(thread):
     }
 
 
-async def agent_upgrade_to_vm(db, vm_provisioner, thread_id):
-    """5.3: POST /api/agents/threads/{thread_id}/upgrade-to-vm"""
+async def agent_upgrade_to_vm(db, vm_provisioner, thread_id, grant_gate=None):
+    """5.3: POST /api/agents/threads/{thread_id}/upgrade-to-vm
+
+    ``grant_gate`` mirrors the shared Sec-1 authorization gate
+    (``_enforce_workspace_upgrade_grants``), now run on this endpoint too
+    (Phase 2: it was previously ungated). Async ``(thread, target_tier) -> None``
+    raising ``_GateDenied`` on refusal, run BEFORE provisioning (fail-closed).
+    """
     thread = await db.get_thread(thread_id)
     if not thread:
         return {"error": 404, "detail": "Thread not found"}
+    if grant_gate is not None:
+        try:
+            await grant_gate(thread, "vm")
+        except _GateDenied as exc:
+            return {"error": 403, "detail": str(exc)}
     if not vm_provisioner.is_available:
         return {"error": 503, "detail": "VM provisioning not available"}
 
@@ -181,21 +192,35 @@ class _GateDenied(Exception):
 
 
 async def agent_upgrade_to_workspace(
-    db, provisioner, thread_id, target_tier="sandbox", grant_gate=None
+    db,
+    provisioner,
+    thread_id,
+    target_tier="sandbox",
+    grant_gate=None,
+    vm_provisioner=None,
 ):
     """5.3b: POST /api/agents/threads/{thread_id}/upgrade-to-workspace
-    (workspace_tier_upgrade.md §4.2 S2 + S4) — mirrors orchestrator/main.py handler.
+    (workspace_tier_upgrade.md §4.2 S2 + S4 / Phase 2) — mirrors orchestrator/main.py.
 
     Provisions a real container for a lite thread (virtual/none -> sandbox).
-    Idempotent on an in-flight/ready container; the `vm` tier keeps its own
-    operator-gated upgrade-to-vm path. ``grant_gate`` mirrors the shared Sec-1
-    authorization gate (``_enforce_workspace_upgrade_grants``): an async
-    ``(thread, target_tier) -> None`` that raises ``_GateDenied`` on refusal,
-    run BEFORE provisioning (fail-closed).
+    Idempotent on an in-flight/ready container. ``vm`` is delegated to the
+    operator-gated upgrade-to-vm path (Phase 2), which runs the same grant gate.
+    ``grant_gate`` mirrors the shared Sec-1 authorization gate
+    (``_enforce_workspace_upgrade_grants``): an async ``(thread, target_tier) ->
+    None`` that raises ``_GateDenied`` on refusal, run BEFORE provisioning
+    (fail-closed).
     """
     target_tier = target_tier or "sandbox"
-    if target_tier != "sandbox":
+    if target_tier not in ("sandbox", "vm"):
         return {"error": 400, "detail": f"unsupported target_tier {target_tier!r}"}
+
+    # vm delegates to the operator-gated VM path (which runs the same gate,
+    # provisions the VM, and records metadata.vm). Mirrors the real endpoint's
+    # `return await agent_upgrade_thread_to_vm(request, thread_id)`.
+    if target_tier == "vm":
+        return await agent_upgrade_to_vm(
+            db, vm_provisioner, thread_id, grant_gate=grant_gate
+        )
 
     thread = await db.get_thread(thread_id)
     if not thread:
@@ -877,6 +902,22 @@ class TestAgentUpgradeToVm:
         result = await agent_upgrade_to_vm(db, vm, "tid-1")
         assert result["error"] == 500
 
+    @pytest.mark.asyncio
+    async def test_grant_gate_refusal_returns_403_before_provisioning(self):
+        # Phase 2 (⚠️ gap closed): this endpoint now runs the shared Sec-1 gate.
+        # A refusal is a 403 BEFORE the availability check or provisioning.
+        thread = _make_thread(metadata={})
+        db = _mock_db()
+        db.get_thread = AsyncMock(return_value=thread)
+        vm = _mock_vm_provisioner(available=True)
+
+        async def _deny(_thread, _tier):
+            raise _GateDenied("User is not permitted to use VM workspaces")
+
+        result = await agent_upgrade_to_vm(db, vm, "tid-1", grant_gate=_deny)
+        assert result["error"] == 403
+        vm.create_thread_vm.assert_not_awaited()
+
 
 # =============================================================================
 # 5.3b: POST /api/agents/threads/{thread_id}/upgrade-to-workspace (S2)
@@ -889,13 +930,52 @@ class TestAgentUpgradeToWorkspace:
     """
 
     @pytest.mark.asyncio
-    async def test_returns_400_for_non_sandbox_tier(self):
-        # vm keeps its own gated upgrade-to-vm path; this endpoint is sandbox-only.
+    async def test_returns_400_for_unknown_tier(self):
+        # Only sandbox|vm are valid targets; anything else is a 400.
         db = _mock_db()
         prov = _mock_provisioner(available=True, in_cluster=True)
-        result = await agent_upgrade_to_workspace(db, prov, "tid-1", target_tier="vm")
+        result = await agent_upgrade_to_workspace(
+            db, prov, "tid-1", target_tier="bogus"
+        )
         assert result["error"] == 400
         prov.create_workspace.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_vm_tier_delegates_to_vm_path(self):
+        # Phase 2: vm delegates to the VM provisioner (not the container path),
+        # records nothing on the container, and reports provisioning.
+        thread = _make_thread(metadata={})
+        db = _mock_db()
+        db.get_thread = AsyncMock(return_value=thread)
+        prov = _mock_provisioner(available=True, in_cluster=True)
+        vm = _mock_vm_provisioner(available=True, mode="nats")
+        result = await agent_upgrade_to_workspace(
+            db, prov, "tid-1", target_tier="vm", vm_provisioner=vm
+        )
+        assert result["status"] == "provisioning"
+        assert result["vm_provisioner_mode"] == "nats"
+        vm.create_thread_vm.assert_awaited_once()
+        # The container provisioner is untouched on a vm upgrade.
+        prov.create_workspace.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_vm_tier_refused_by_grant_gate_returns_403(self):
+        # Phase 2: an owner without can_use_vm / vm_workspace is refused 403 and
+        # no VM is provisioned (the gate runs inside the delegated vm path).
+        thread = _make_thread(metadata={})
+        db = _mock_db()
+        db.get_thread = AsyncMock(return_value=thread)
+        prov = _mock_provisioner(available=True, in_cluster=True)
+        vm = _mock_vm_provisioner(available=True)
+
+        async def _deny(_thread, _tier):
+            raise _GateDenied("User is not permitted to use VM workspaces")
+
+        result = await agent_upgrade_to_workspace(
+            db, prov, "tid-1", target_tier="vm", vm_provisioner=vm, grant_gate=_deny
+        )
+        assert result["error"] == 403
+        vm.create_thread_vm.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_returns_404_when_thread_not_found(self):

@@ -42,10 +42,23 @@ container→VM upgrade precedent from [[vm_backend]]. **All of Phase 1 (S1–S5)
 now built + unit-green** (S4 = the shared Sec-1 grant gate; S5 = the
 agent-initiated offer: `workspace_upgrade_required` freeze vocab +
 `request_workspace_upgrade` tool + cockpit offer). The MVP (S1+S2+S3) is k3d
-end-to-end verified. **Scope built = session `virtual → sandbox` ONLY** — see the
-scope matrix below. What remains: **Phase 2** (session `virtual → vm` — the
-endpoint currently `400`s on `vm`), **Phase 3** (worker jobs, §4.3), **Phase 4**
-(warm pool + auto-grant), and a live smoke test of the S5 agent-offer round-trip.
+end-to-end verified. **Phase 2 (session `virtual → vm`) is now also built +
+unit-green** (2026-06-20): the endpoint delegates a `vm` target to the
+operator-gated VM path, the swap handler polls vm readiness via `_poll_vm_ready`
+and re-opens the shell-layer sudo gate after the swap, `/upgrade-workspace vm` is
+the explicit human-intent trigger, and the previously-ungated `upgrade-to-vm`
+endpoint is now grant-gated. The **orchestrator side is k3d-verified** (2026-06-20,
+API-level): vm routes past the tier-check (no `400`), the grant gate fires
+fail-closed (kill-switch → `403` *before* the availability `503`, on both the
+delegated and direct endpoints), sandbox is unaffected by the vm-only switch —
+and the smoke **caught + fixed a real bug** in the shared Sec-1 gate (a
+`pgproto.UUID` thread `user_id` crashed `get_user`; it also affected Phase-1
+sandbox S4; now coerced to `str`). **Scope built = session `virtual → sandbox`
+(k3d-verified) + session `virtual → vm` (orchestrator k3d-verified; full VM
+boot/seed/sudo needs the dev cluster — k3d has no KubeVirt/NATS).** What remains:
+**Phase 3** (worker jobs, §4.3), **Phase 4** (warm pool + auto-grant), a live k3d
+smoke of the S5 agent-offer round-trip, and a full `virtual → vm` boot smoke on
+the dev cluster.
 
 **In one paragraph.** Make workspace acquisition lazy: a session (or job) starts
 on `virtual` and upgrades to a `sandbox` pod (or `vm`) only when the work needs
@@ -63,32 +76,30 @@ but is an accelerator, not a prerequisite.
 ### Implementation status (2026-06-20)
 
 Slice-by-slice; details in each slice below. **Built** = code landed +
-unit-green + ruff-clean on `develop` (uncommitted). The session path (S1+S2+S3)
-is **k3d end-to-end verified** (2026-06-20) — see the Status block. A
-prerequisite gap (persistent `virtual` sessions couldn't boot) was found and
-fixed as part of the smoke test.
+unit-green + ruff-clean on `develop` (uncommitted). The session sandbox path
+(S1+S2+S3) is **k3d end-to-end verified** (2026-06-20) — see the Status block;
+the Phase-2 `virtual → vm` path is **k3d-verified orchestrator-side** (routing +
+fail-closed grant gate; the full VM boot needs the dev cluster). Two gaps were
+found and fixed via the smoke tests: persistent `virtual` sessions couldn't boot
+(Phase 1), and the shared grant gate crashed on a real (asyncpg-UUID) thread
+`user_id` (Phase 2 — which also affected Phase-1 sandbox S4). The full
+tested/untested map lives in
+[`tests/workspace_tier_upgrade_test_coverage.md`](../../tests/workspace_tier_upgrade_test_coverage.md).
 
 #### Scope — what actually works today (read this first on resume)
 
-Despite the doc title's `virtual`/`none` → `sandbox`/`vm`, **Phase 1 built
-exactly ONE cell of that matrix: persistent _sessions_, `virtual → sandbox`.**
-Everything else is design-stage.
+Despite the doc title's `virtual`/`none` → `sandbox`/`vm`, **Phases 1+2 built the
+two _session_ cells: `virtual → sandbox` (k3d-verified) and `virtual → vm`
+(unit-green).** The worker-job row and the `none` cells are still design-stage.
 
 | Source → Target | → `sandbox` (container) | → `vm` |
 |---|---|---|
-| **Session** `virtual` | ✅ **Built + k3d-verified** (S1–S5) | ❌ Phase 2 — endpoint `400`s on `vm` |
-| **Session** `none` | 🟡 plausibly works (tool exposed + lite-boot fixed), **unverified** | ❌ Phase 2 |
+| **Session** `virtual` | ✅ **Built + k3d-verified** (S1–S5) | ✅ **Built** — orchestrator k3d-verified (Phase 2); full VM boot needs dev cluster |
+| **Session** `none` | 🟡 plausibly works (tool exposed + lite-boot fixed), **unverified** | 🟡 plausibly works (same delegation), **unverified** |
 | **Worker job** `virtual` | ❌ Phase 3 (§4.3 W1+W2) | ❌ Phase 3 (§4.3 W3) |
 | **Worker job** `none` | ❌ out of scope (scratch tmpdir has no durable anchor) | ❌ |
 
-Three things explicitly **NOT** done yet (common misreadings):
-- **No VM target.** `agent_upgrade_thread_to_workspace` hard-`400`s on
-  `target_tier != "sandbox"` (`orchestrator/main.py`). `_handle_workspace_upgrade`
-  *carries* `vm` forward-compat (sets `sudo_action="allow"` for `vm`, reads
-  `backend_tier` from the poll result) but the endpoint gates it off, so that
-  branch is **unreachable until Phase 2**. The pre-existing `upgrade-to-vm` path is
-  `sandbox → vm` (sudo-triggered) and a shell-less `virtual` session can never
-  reach it.
+Two things explicitly **NOT** done yet (common misreadings):
 - **No worker-job upgrades.** Sessions only. The entire §4.3 worker flow (W1–W3)
   is unbuilt — its blocker is the non-portable pod-local LangGraph checkpoint.
 - **`none` is only theoretically covered.** The S5 request tool is exposed on any
@@ -108,7 +119,7 @@ Three things explicitly **NOT** done yet (common misreadings):
 | §4.2 **S5** | Agent-initiated offer (`request_workspace_upgrade` tool + freeze) | **✅ Built** |
 | §4.3 **W1–W3** | Worker-job flow (in-process `virtual → sandbox`, vm re-dispatch) | Design |
 | §4.4 **Sec-1…5** | Capability & security slices | Design |
-| Phase 2 | Sessions `virtual → vm` | Design |
+| Phase 2 | Sessions `virtual → vm` | **✅ Built** (orchestrator k3d-verified; VM boot needs dev cluster) |
 
 **Landing spots for the built slices:**
 - S1 — `src/api/persistent_session.py`: `resetup_tools_for_backend()` +
@@ -128,9 +139,20 @@ Three things explicitly **NOT** done yet (common misreadings):
   `tests/test_workspace_seed.py`.
 - Cockpit — `cockpit/src/app/core/services/persistent-chat.service.ts`
   (`workspace_upgrade.started/complete/failed` cases + `/upgrade-workspace`
-  slash command). *Note: the session-side `vm` upgrade was never wired in the
-  cockpit (only jobs upgrade via REST), so the slash command is the minimal
-  session trigger.*
+  slash command). *Note: the slash command is the minimal session trigger; a
+  dedicated button is deferred. (Phase 2 adds `/upgrade-workspace vm` as the
+  session-side vm trigger — see the Phase 2 entry below.)*
+- **Phase 2 (`virtual → vm`)** — `orchestrator/main.py`:
+  `agent_upgrade_thread_to_workspace` accepts `vm` and delegates to
+  `agent_upgrade_thread_to_vm`, which is **now grant-gated** via
+  `_enforce_workspace_upgrade_grants` (that gate also got the `str(user_id)`
+  coercion fix the smoke test surfaced). `src/api/persistent_app.py`:
+  `_handle_workspace_upgrade` vm branch (`_poll_vm_ready` → `remote` block +
+  post-swap `shell_manager.sudo_action="allow"`). Cockpit: `/upgrade-workspace
+  vm`. Tests: `tests/test_thread_endpoints.py` (vm delegation + `403` on both the
+  delegated and direct endpoints), `tests/test_capability_grants.py`,
+  `persistent-chat.service.spec.ts`. Tested/untested map:
+  [`tests/workspace_tier_upgrade_test_coverage.md`](../../tests/workspace_tier_upgrade_test_coverage.md).
 
 ---
 
@@ -428,10 +450,12 @@ dispatch at `persistent_app.py:2292`).
     runs while **both** backends are live; `swap_backend` then sees it connected,
     skips reconnecting, and disconnects the old one. The blocking SSH connect and
     SFTP seed both run via `asyncio.to_thread`.
-  - **Forward-compat:** the handler reads `backend_tier` from the poll result and
-    sets `sudo_action = "allow"` for `vm`, `"freeze"` for `sandbox` — so the same
-    handler serves Phase 2 (`virtual → vm`) once S2 provisions a vm; today S2
-    provisions sandbox only. An early guard no-ops if the backend already
+  - **Forward-compat → now wired (Phase 2):** the handler reads `backend_tier`
+    from the poll result and sets `sudo_action = "allow"` for `vm`, `"freeze"` for
+    `sandbox`. This is what let Phase 2 reuse the handler for `virtual → vm` (the
+    endpoint now delegates a `vm` target to the VM provisioner; the vm branch
+    polls `_poll_vm_ready` and re-opens the shell sudo gate post-swap — see §6
+    Phase 2). An early guard no-ops if the backend already
     `supports_shell`.
   - **S3a — `seed_workspace()`** landed in a new module `src/core/backends/seed.py`;
     `WorkspaceBackend.walk(path="")` is the base (list_dir descent) with a flat
@@ -667,7 +691,14 @@ consolidating their grant checks. Runs `capability_grants.evaluate` on the
 dispatch (`capability_grants.py:123`); a `vm` target additionally runs
 `_check_vm_permission` (the global `vm_workspaces` kill-switch + `can_use_vm`).
 The dedicated `workspace_upgrade` kill-switch + live downgrade (Sec-3) stay
-deferred.
+deferred. **k3d-verified live (2026-06-20):** with `system_settings.vm_workspaces
+= {enabled:false}` the gate returns `403` *before* the availability `503`, on
+both the delegated (`/upgrade-to-workspace {vm}`) and direct (`/upgrade-to-vm`)
+endpoints; removing the row restores `503` (gate passes for the admin owner). The
+smoke also surfaced + fixed a latent crash: the gate passed the asyncpg
+`pgproto.UUID` thread `user_id` straight to `get_user` (→ `UUID()` →
+`AttributeError`), now coerced to `str` — this had silently affected the sandbox
+S4 path too (S4 was never live-tested before).
 - `target=vm`: the fragment's `workspace.backend='vm'` trips the `vm_workspace`
   requirement (`evaluate` line 135); `vm` also keeps `_check_vm_permission` +
   operator approval (`main.py:2574`).
@@ -773,11 +804,11 @@ classifier misses ~17% of overeager actions). Maps to open question #1.
 **New code** (✅ = built, 🟡 = partial, ◻️ = design):
 1. ✅ `resetup_tools_for_backend()` on `PersistentSession` (+ extracted `_load_tools_for_backend()`).
 2. 🟡 Generalized `workspace_upgrade_required` freeze type (✅ S5 — session path: the `request_workspace_upgrade` tool sets it; the loop's consume check + `on_workspace_upgrade_needed` callback fire the `workspace_upgrade.needed` offer). The worker-side `context.workspace_upgrade` namespace + `completion.py` routing + `_format_freeze_notification` case remain ◻️ (§4.3 W1; sessions don't pause, they hot-swap).
-3. ✅ Agent-side `_handle_workspace_upgrade(target_tier)` generalizing `_handle_vm_upgrade` (sandbox target; vm forward-compat).
-4. 🟡 Orchestrator `request_thread_workspace_upgrade` + `POST …/threads/{id}/upgrade-to-workspace` ✅ (S2); `POST /api/jobs/{id}/…` is the worker endpoint (W2, ◻️).
+3. ✅ Agent-side `_handle_workspace_upgrade(target_tier)` generalizing `_handle_vm_upgrade` (sandbox + vm; the vm branch polls `_poll_vm_ready`, maps to a `remote` block, and re-opens the shell sudo gate — Phase 2).
+4. 🟡 Orchestrator `request_thread_workspace_upgrade` + `POST …/threads/{id}/upgrade-to-workspace` ✅ (S2; `vm` delegates to `/upgrade-to-vm`, now grant-gated — Phase 2); `POST /api/jobs/{id}/…` is the worker endpoint (W2, ◻️).
 5. ✅ Agent-side **seed copy** (`seed_workspace` + `WorkspaceBackend.walk()`), verify-before-flip.
 6. ◻️ Teach `_job_needs_sandbox` to honor `context.workspace_upgrade.requested`; add the **sandbox injection to `_resume_job_on_agent`**. *(Worker path; only the deferred direct lite→vm re-dispatch needs it — see §4.3 W3.)*
-7. ✅ Grant re-check on upgrade (S4 — `_enforce_workspace_upgrade_grants`, the shared Sec-1 gate) + persist new tier to `threads.metadata` (S3b, via `update_thread_config`).
+7. ✅ Grant re-check on upgrade (S4 — `_enforce_workspace_upgrade_grants`, the shared Sec-1 gate; **k3d-verified live + hardened** with the `str(user_id)` coercion fix) + persist new tier to `threads.metadata` (S3b, via `update_thread_config`).
 8. 🟡 Cockpit: minimal `workspace_upgrade.*` toasts + `/upgrade-workspace` slash ✅; `workspace_upgrade.needed` offer message + action-center surface ✅ (S5); a dedicated one-click "Upgrade workspace" / accept button ◻️ (later).
 9. ◻️ *(v2)* Worker in-process `virtual → sandbox` upgrade (agent-side freeze interception + re-`ainvoke`, §4.3 W1) + orchestrator `provision-workspace` endpoint (W2). Re-dispatch / fencing only for the operator-gated VM path (W3).
 10. ◻️ *(v3)* Warm-pool claim (depends on [[workspace_warm_pool_and_async_sessions]]).
@@ -795,32 +826,66 @@ classifier misses ~17% of overeager actions). Maps to open question #1.
   initiated offer: freeze vocab + `request_workspace_upgrade` tool + cockpit
   offer), all unit-green + ruff-clean. **Remaining:** a live k3d smoke test of the
   S5 agent-offer round-trip (tool → offer → accept → shell).
-- **Phase 2 — Sessions, `virtual → vm`. ◻️ Not started. Resume checklist** (mostly
-  wiring; the agent handler already has the `vm` branch):
-  1. **Endpoint:** drop the `target_tier != "sandbox"` → `400` in
-     `agent_upgrade_thread_to_workspace` (`orchestrator/main.py`) for `vm`, and for
-     a `vm` target provision via the VM path
-     (`vm_provisioner.create_thread_vm`, as `agent_upgrade_thread_to_vm` does) and
-     record `metadata.vm` instead of `metadata.workspace_container`. Simplest:
-     route `target_tier == "vm"` straight to the existing
-     `agent_upgrade_thread_to_vm` body.
-  2. **Agent handler:** `_handle_workspace_upgrade` already builds the backend with
-     `sudo_action="allow"` when `backend_tier == "vm"` and reads `backend_tier`
-     from the poll — so the seed + swap + retool + persist all work unchanged. The
-     only agent change is the **poll**: use `_poll_vm_ready` (`persistent_app.py`,
-     already exists) for the `vm` branch instead of `_poll_workspace_ready`, and
-     read the VM connection block from `metadata.vm`.
-  3. **Client:** `request_thread_vm_upgrade` already exists in
-     `orchestrator_client.py` — call it for the `vm` branch.
-  4. **⚠️ Grant gap to close:** `_enforce_workspace_upgrade_grants` already handles
-     `vm` (runs `_check_vm_permission` + the `vm_workspace` PDP), BUT the existing
-     `agent_upgrade_thread_to_vm` endpoint **does not call any grant gate today** —
-     it only checks `vm_provisioner.is_available`. Wire
-     `_enforce_workspace_upgrade_grants(thread, target_tier="vm")` into it (and/or
-     the unified endpoint) so the `vm` path is authorized like dispatch.
-  5. **Cockpit:** the `workspace_upgrade.needed` offer already carries
-     `target_tier`; make the accept send that tier (today `/upgrade-workspace`
-     hard-codes `sandbox`). Keep operator approval for `vm`.
+- **Phase 2 — Sessions, `virtual → vm`. ✅ Built (2026-06-20), unit-green +
+  orchestrator k3d-verified (full VM boot needs the dev cluster).** As built
+  (5 seams, the last two corrected vs the original checklist):
+  1. **Endpoint ✅:** `agent_upgrade_thread_to_workspace` now accepts
+     `target_tier ∈ {sandbox, vm}` (`400` only on an unknown tier) and, for `vm`,
+     `return await agent_upgrade_thread_to_vm(request, thread_id)` — the existing
+     VM endpoint provisions via `vm_provisioner.create_thread_vm` and records
+     `metadata.vm`. One client method + one endpoint keeps the agent uniform.
+  2. **Agent handler ✅ (one correction):** `_handle_workspace_upgrade` already
+     builds the backend with `sudo_action="allow"` for `vm` and the seed + swap +
+     retool + persist all work unchanged. The poll DID need to branch — but
+     `_poll_vm_ready` returns `{ssh_host, ssh_port}`, **not** the `{backend,
+     remote:{host,port,…}}` shape `_poll_workspace_ready` returns and the handler
+     consumes, so the `vm` branch calls `_poll_vm_ready` and **maps its output
+     into a `remote` block** (host/port + the env `SSH_KEY_PATH`). `_poll_vm_ready`
+     (not `_poll_workspace_ready`) is also the *correct* poller because it
+     tolerates the async provisioning window and bails on `vm_status=='failed'`,
+     whereas `_poll_workspace_ready` mis-bails on the still-`none` container status.
+  3. **⚠️ Sudo gate (NEW — the checklist missed this):** after `swap_backend`,
+     `_setup_shell_manager` rebuilds the `ShellManager` with the config-default
+     `sudo_action="freeze"`, and `ShellManager._check_blocked` gates sudo **before**
+     the backend — so a vm-upgraded session would freeze on sudo. The handler now
+     sets `shell_manager.sudo_action = "allow"` for a `vm` backend after the swap
+     (mirroring `_handle_vm_upgrade`). Sandbox deliberately keeps `"freeze"` so its
+     sudo→VM escalation still fires.
+  4. **⚠️ Grant gap closed ✅:** `_enforce_workspace_upgrade_grants(thread,
+     target_tier="vm")` is now wired into `agent_upgrade_thread_to_vm` itself
+     (after the 404, before the 503) — so **both** the delegated lite→vm path and
+     the pre-existing sandbox→vm sudo path now enforce the global `vm_workspaces`
+     kill-switch + per-user `can_use_vm` + the `vm_workspace` PDP grant.
+  5. **Cockpit ✅:** `/upgrade-workspace vm` sends `target_tier:'vm'`
+     (`/upgrade-workspace` alone stays `sandbox`); the explicit `vm` keyword is the
+     human-intent trigger §4.4 requires for the privileged tier. The
+     `workspace_upgrade.needed` offer honors the carried `target_tier`. Operator
+     gating is server-side (the grant gate), so a refused vm upgrade surfaces as a
+     `workspace_upgrade.failed` toast.
+  - *Client unchanged:* the original checklist suggested calling
+    `request_thread_vm_upgrade` for the `vm` branch; instead the single
+    `request_thread_workspace_upgrade(target_tier)` method + the delegating
+    endpoint cover both tiers, so the agent path stays uniform.
+    `request_thread_vm_upgrade` remains the sudo→VM path's client method.
+  - *Tests:* `tests/test_thread_endpoints.py` (vm delegation + vm grant-gate 403
+    on both endpoints), `tests/test_capability_grants.py` (vm vs sandbox PDP),
+    cockpit `persistent-chat.service.spec.ts` (`/upgrade-workspace [vm]` tier).
+  - *k3d smoke (2026-06-20, orchestrator-side, ✅):* vm routes past the tier-check
+    (no `400`); the grant gate fires fail-closed (kill-switch → `403` *before* the
+    `503`, on both `/upgrade-to-workspace {vm}` and direct `/upgrade-to-vm`);
+    sandbox stays unaffected by the vm-only switch (→ `200`). **Caught + fixed a
+    real bug:** the shared gate passed the asyncpg `pgproto.UUID` thread `user_id`
+    straight to `get_user`, which does `UUID(user_id)` → crashed
+    (`AttributeError: …'replace'`) — a 500 on BOTH the vm path and the
+    never-live-tested sandbox S4 path; fixed by coercing `owner_id` to `str` in
+    `_enforce_workspace_upgrade_grants`. (Mocked unit helpers structurally can't
+    catch this — only a live DB returns the UUID type, so the k3d smoke is the
+    regression guard.)
+  - *Remaining:* a full `virtual → vm` boot smoke on the **dev cluster** (k3d has
+    no KubeVirt/NATS → `vm_provisioner.is_available` is False, so the swap
+    handler's poll/seed/sudo-reopen branch is unexercised). The vm-tier session
+    **resume/suspend** lifecycle (S3b persists `workspace.backend=vm`) is untested
+    — orthogonal to the in-place upgrade, which never drops the live conversation.
 - **Phase 3 — Worker jobs. ◻️ Not started.** Full design in **§4.3 (W1–W3)** —
   start there. MVP = W1 + W2: in-process `virtual → sandbox` swap mirroring the
   session (no re-dispatch, no checkpoint move), reusing `seed_workspace` (S3a) +
