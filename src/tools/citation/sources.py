@@ -236,10 +236,17 @@ def create_source_tools(context: ToolContext) -> List[Any]:
                 )
 
             # Register source and create citation
+            cloud_anchor = None
             try:
                 resolved_path = resolve_path(document_path)
+                # Phase 3 (D7): if this file was read from a user's cloud, a
+                # snapshot-anchor (drift fingerprint + live pointer) was stashed
+                # at read time — persist it onto the source's metadata.cloud.
+                cloud_anchor = context.get_cloud_anchor(resolved_path)
                 source_id = await context.get_or_register_doc_source(
-                    resolved_path, name=Path(document_path).name
+                    resolved_path,
+                    name=Path(document_path).name,
+                    cloud_metadata=cloud_anchor,
                 )
             except FileNotFoundError:
                 return f"Error: Document not found at {document_path}"
@@ -288,6 +295,10 @@ Section: {section or "N/A"}
 Status: {status.upper()}
 Similarity Score: {similarity}
 """
+            if cloud_anchor:
+                output += (
+                    "Cloud-anchored: yes (original snapshotted for drift detection)\n"
+                )
             if result.verification_notes:
                 output += f"\nNote: {result.verification_notes}"
 

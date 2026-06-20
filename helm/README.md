@@ -202,18 +202,20 @@ deployment — what you need depends on which optional components you enable.
 **Database credentials** — discrete user + password keys only. The chart
 composes the DSN at runtime from these + ConfigMap-provided host/port/db,
 so `/`, `@`, `=`, and `+` in passwords are URL-quoted automatically. Don't
-ship a bundled `DATABASE_URL` / `VECTOR_DB_URL` / `CITATION_DB_URL` Vault
+ship a bundled `DATABASE_URL` / `VECTOR_DB_URL` Vault
 key — both layouts coexist (the app falls back to the URL if user+password
 aren't set), but the URL form is legacy and a footgun under `urlsplit`.
 - `POSTGRES_USER`, `POSTGRES_PASSWORD`
 - `VECTOR_POSTGRES_USER`, `VECTOR_POSTGRES_PASSWORD` — pgvector has its
   own superuser password (separate from the main Postgres) so a credential
-  leak on one instance doesn't compromise the other.
-- `CITATION_POSTGRES_USER`, `CITATION_POSTGRES_PASSWORD` — citation
-  engine runs as its own role (`srw_citations`) on the pgvector instance
-  with a dedicated `citation_engine` database.
+  leak on one instance doesn't compromise the other. Citations, embeddings,
+  and memories all live in this instance (`srw_vector`); the citation engine
+  is a native SRW subsystem on the vector pool, **not** a separate role or
+  database (the former `srw_citations` / `citation_engine` DB was retired in
+  the citation-engine native integration — see
+  `docs/features/citation_engine_integration.md`).
 - `NEO4J_USERNAME`, `NEO4J_PASSWORD` — both live in Vault (mirroring
-  the `POSTGRES_USER` / `VECTOR_POSTGRES_USER` / `CITATION_POSTGRES_USER`
+  the `POSTGRES_USER` / `VECTOR_POSTGRES_USER`
   pattern, so all DB credentials sit in one place). Community edition
   expects `NEO4J_USERNAME=neo4j`; enterprise can use a different value.
   The Neo4j server image's `NEO4J_AUTH` is composed at pod-start from
@@ -260,8 +262,6 @@ POSTGRES_USER=srw
 POSTGRES_PASSWORD=changeme
 VECTOR_POSTGRES_USER=srw
 VECTOR_POSTGRES_PASSWORD=changeme
-CITATION_POSTGRES_USER=srw_citations
-CITATION_POSTGRES_PASSWORD=changeme
 KC_REALM_ADMIN_PASSWORD=changeme
 OPENAI_API_KEY=sk-...
 CLOUD_SERVICE_USER=agent

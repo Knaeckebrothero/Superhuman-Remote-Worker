@@ -17,6 +17,12 @@ related:
 
 # CitationEngine Rework: Literature Management & Semantic Search
 
+> **Status (2026-06-20):** The feature set described here is built, but the
+> engine is now a **native async SRW subsystem** (DB on the shared `srw_vector`
+> pool, verifier on the auxiliary-LLM service) — not the standalone package this
+> doc assumes. See [[citation_engine_integration]] for the current plumbing +
+> status (Phases 1–2 shipped).
+
 **Status:** Planning
 **Created:** 2026-02-08
 **Related:** [Citation Workflow Issues](citation_issues.md), [Workspace Vector Search](vectorization.md)
