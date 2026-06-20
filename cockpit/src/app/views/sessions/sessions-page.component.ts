@@ -15,6 +15,7 @@ import {Thread} from '../../core/models/api.model';
 import {SidebarToggleComponent} from '../../shell/sidebar-toggle/sidebar-toggle.component';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {AppButtonComponent} from '../../ui/button';
+import {AppDialogComponent} from '../../ui/dialog';
 import {AppIconButtonComponent} from '../../ui/icon-button';
 import {AppTabBarComponent, AppTabComponent} from '../../ui/tab-bar';
 import {AppInputComponent} from '../../ui/input';
@@ -48,6 +49,7 @@ interface Project {
         AppChipComponent,
         AppIconComponent,
         AppFormFieldComponent,
+        AppDialogComponent,
     ],
     template: `
     <div class="page-toggle">
@@ -163,17 +165,15 @@ interface Project {
 
           @for (thread of filteredThreads(); track thread.id) {
             <div class="session-card" [class.ended]="thread.status === 'ended'">
-              <div class="session-main" (click)="openSession(thread)">
-                <div class="session-info">
-                  <span class="session-status-dot" [class]="thread.status"></span>
-                  <span class="session-title">{{ thread.title || ('sessions.untitledSession' | transloco) }}</span>
-                  <span class="session-id" title="Session ID">{{ thread.id.slice(0, 8) }}</span>
-                  <span class="session-config">{{ thread.config_name | titlecase }}</span>
-                </div>
-                <div class="session-meta">
-                  <span class="meta-item">{{ thread.total_turns || 0 }} {{ ((thread.total_turns || 0) === 1 ? 'sessions.turnsOne' : 'sessions.turnsMany') | transloco }}</span>
-                  <span class="meta-item">{{ thread.last_activity | translocoDate:{dateStyle:'short', timeStyle:'short'} }}</span>
-                </div>
+              <div class="session-heading" (click)="openSession(thread)">
+                <span class="session-status-dot" [class]="thread.status"></span>
+                <span class="session-title">{{ thread.title || ('sessions.untitledSession' | transloco) }}</span>
+              </div>
+              <div class="session-meta" (click)="openSession(thread)">
+                <span class="session-id" title="Session ID">{{ thread.id.slice(0, 8) }}</span>
+                <span class="session-config">{{ thread.config_name | titlecase }}</span>
+                <span class="meta-item">{{ thread.total_turns || 0 }} {{ ((thread.total_turns || 0) === 1 ? 'sessions.turnsOne' : 'sessions.turnsMany') | transloco }}</span>
+                <span class="meta-item">{{ thread.last_activity | translocoDate:{dateStyle:'short', timeStyle:'short'} }}</span>
               </div>
               <div class="session-actions">
                 @if (thread.cloud_session_url || thread.nc_session_folder) {
@@ -205,6 +205,38 @@ interface Project {
           }
         }
       </div>
+
+      <app-dialog
+        [open]="confirmDeleteOpen()"
+        [title]="'sessions.confirmDelete' | transloco"
+        (closed)="confirmDeleteOpen.set(false)"
+      >
+        <p>{{ pendingDelete()?.title || ('sessions.untitledSession' | transloco) }}</p>
+        <div appDialogActions>
+          <app-button variant="secondary" (clicked)="confirmDeleteOpen.set(false)">
+            {{ 'common.cancel' | transloco }}
+          </app-button>
+          <app-button variant="danger" (clicked)="confirmDelete()">
+            {{ 'common.delete' | transloco }}
+          </app-button>
+        </div>
+      </app-dialog>
+
+      <app-dialog
+        [open]="confirmForceOpen()"
+        [title]="'common.delete' | transloco"
+        (closed)="confirmForceOpen.set(false)"
+      >
+        <p>{{ 'sessions.confirmForceDelete' | transloco }}</p>
+        <div appDialogActions>
+          <app-button variant="secondary" (clicked)="confirmForceOpen.set(false)">
+            {{ 'common.cancel' | transloco }}
+          </app-button>
+          <app-button variant="danger" (clicked)="confirmForceDelete()">
+            {{ 'common.delete' | transloco }}
+          </app-button>
+        </div>
+      </app-dialog>
     </div>
   `,
     styles: [`
@@ -333,8 +365,14 @@ interface Project {
 
     /* Session cards */
     .session-card {
-      display: flex;
+      display: grid;
+      grid-template-columns: 1fr auto;
+      grid-template-areas:
+        "heading heading"
+        "meta    actions";
       align-items: center;
+      column-gap: 8px;
+      row-gap: 6px;
       padding: 12px;
       border: 1px solid var(--border-color, var(--surface-0));
       border-radius: var(--radius-surface);
@@ -346,17 +384,15 @@ interface Project {
     .session-card:hover { border-color: var(--accent-color, var(--accent-color)); }
     .session-card.ended { opacity: 0.6; }
 
-    .session-main {
-      flex: 1;
-      cursor: pointer;
-      min-width: 0;
-    }
-
-    .session-info {
+    /* The title gets its own full-width row so it shows as much as possible;
+       the id/config/meta and the action buttons sit on the row beneath it. */
+    .session-heading {
+      grid-area: heading;
       display: flex;
       align-items: center;
       gap: 8px;
-      margin-bottom: 4px;
+      min-width: 0;
+      cursor: pointer;
     }
 
     .session-status-dot {
@@ -376,6 +412,8 @@ interface Project {
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
+      flex: 1;
+      min-width: 0;
     }
 
     .session-config {
@@ -384,7 +422,13 @@ interface Project {
       border-radius: var(--radius-tag);
       background: var(--surface-0, var(--surface-0));
       color: var(--text-muted, #6c7086);
-      flex-shrink: 0;
+      /* Shrink + ellipsis so a long config (e.g. a project UUID) truncates
+         instead of pushing the title to 0 width or overlapping the actions. */
+      flex-shrink: 1;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
     }
 
     .session-id {
@@ -395,8 +439,13 @@ interface Project {
     }
 
     .session-meta {
+      grid-area: meta;
       display: flex;
-      gap: 12px;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 4px 12px;
+      min-width: 0;
+      cursor: pointer;
     }
 
     .meta-item {
@@ -405,10 +454,10 @@ interface Project {
     }
 
     .session-actions {
+      grid-area: actions;
       display: flex;
       gap: 4px;
-      flex-shrink: 0;
-      margin-left: 8px;
+      justify-self: end;
     }
 
     /* Empty / loading */
@@ -481,6 +530,11 @@ export class SessionsPageComponent implements OnInit {
     creating = signal(false);
     statusFilter = signal<string | null>(null);
     selectedProjectIds = signal<string[]>([]);
+
+    // Themed delete-confirmation dialogs (replace the native confirm()).
+    confirmDeleteOpen = signal(false);
+    confirmForceOpen = signal(false);
+    pendingDelete = signal<Thread | null>(null);
 
     showCreate = false;
     newTitle = '';
@@ -606,8 +660,16 @@ export class SessionsPageComponent implements OnInit {
         window.open(`${environment.cloudUrl}/apps/files/?dir=/${folderName}`, '_blank');
     }
 
-    async deleteSession(thread: Thread): Promise<void> {
-        if (!confirm(this.transloco.translate('sessions.confirmDelete'))) return;
+    deleteSession(thread: Thread): void {
+        // Open the themed confirmation dialog instead of a native confirm().
+        this.pendingDelete.set(thread);
+        this.confirmDeleteOpen.set(true);
+    }
+
+    async confirmDelete(): Promise<void> {
+        const thread = this.pendingDelete();
+        if (!thread) return;
+        this.confirmDeleteOpen.set(false);
         try {
             await firstValueFrom(
                 this.http.delete(`${environment.apiUrl}/persistent/threads/${thread.id}?permanent=true`)
@@ -617,20 +679,27 @@ export class SessionsPageComponent implements OnInit {
             // Mid-turn guard (session_silent_failure_audit.md #11): a
             // cleanup sweep used to tear down live sessions silently.
             if (e?.status === 409) {
-                if (!confirm(this.transloco.translate('sessions.confirmForceDelete'))) return;
-                try {
-                    await firstValueFrom(
-                        this.http.delete(
-                            `${environment.apiUrl}/persistent/threads/${thread.id}?permanent=true&force=true`
-                        )
-                    );
-                    this.loadThreads();
-                } catch (e2: any) {
-                    this.toast.danger(this.errors.translate(e2, 'errors.sessions.deleteFailed'));
-                }
+                // Live/mid-turn session — escalate to a force-delete confirm.
+                this.confirmForceOpen.set(true);
                 return;
             }
             this.toast.danger(this.errors.translate(e, 'errors.sessions.deleteFailed'));
+        }
+    }
+
+    async confirmForceDelete(): Promise<void> {
+        const thread = this.pendingDelete();
+        if (!thread) return;
+        this.confirmForceOpen.set(false);
+        try {
+            await firstValueFrom(
+                this.http.delete(
+                    `${environment.apiUrl}/persistent/threads/${thread.id}?permanent=true&force=true`
+                )
+            );
+            this.loadThreads();
+        } catch (e2: any) {
+            this.toast.danger(this.errors.translate(e2, 'errors.sessions.deleteFailed'));
         }
     }
 
