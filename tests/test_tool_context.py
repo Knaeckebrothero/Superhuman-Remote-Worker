@@ -37,6 +37,11 @@ class FakeInstructionEntry:
     trigger_target: str
     enforce: bool
 
+    @property
+    def path(self) -> str:
+        """Mirror InstructionFileEntry.path; file-bound entries resolve to file."""
+        return self.file
+
 
 # =============================================================================
 # Construction and Validation
@@ -540,7 +545,11 @@ class TestCitationEngine:
         ctx.close_citation_engine()  # Should not raise
 
     def test_close_clears_state(self):
-        """close_citation_engine should clear engine and registries."""
+        """close_citation_engine should clear engine and registries.
+
+        It must NOT call engine.close() — the engine borrows the agent's
+        shared vector pool, which the agent closes on shutdown (see c420f066).
+        """
         engine = MagicMock()
         ctx = ToolContext(citation_engine=engine)
         ctx._source_registry = {"a": 1, "b": 2}
@@ -548,4 +557,4 @@ class TestCitationEngine:
 
         assert ctx.citation_engine is None
         assert ctx._source_registry == {}
-        engine.close.assert_called_once()
+        engine.close.assert_not_called()

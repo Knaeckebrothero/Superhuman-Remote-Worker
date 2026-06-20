@@ -295,7 +295,7 @@ async def _download_available_papers(
 
                     # Register as citation source
                     try:
-                        context.get_or_register_doc_source(
+                        await context.get_or_register_doc_source(
                             display_path, name=paper.title
                         )
                     except Exception:
