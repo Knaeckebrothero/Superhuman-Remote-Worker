@@ -16,6 +16,14 @@ related:
 
 # CitationEngine Rework — Implementation Roadmap
 
+> **Status (2026-06-20):** The citation engine is now a **native async SRW
+> subsystem** — the standalone / SQLite / separate-DB plumbing this roadmap
+> assumes was replaced. DB on the shared `srw_vector` pool, verification on the
+> auxiliary-LLM service, feedback injected into the agent loop. Phases 1–2
+> shipped; see [[citation_engine_integration]] for the current architecture +
+> status. The *feature* goals here (shared source library, annotations/tags,
+> hybrid search) still stand and are built.
+
 **Parent doc:** [citation_engine_rework.md](citation_engine_rework.md)
 **Created:** 2026-02-08
 
