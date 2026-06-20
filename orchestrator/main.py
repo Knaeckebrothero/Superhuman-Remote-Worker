@@ -13112,6 +13112,87 @@ async def agent_upgrade_thread_to_vm(
     }
 
 
+class ThreadWorkspaceUpgradeRequest(BaseModel):
+    """Body for ``POST /api/agents/threads/{id}/upgrade-to-workspace``."""
+
+    target_tier: str = "sandbox"
+
+
+@app.post("/api/agents/threads/{thread_id}/upgrade-to-workspace")
+async def agent_upgrade_thread_to_workspace(
+    request: Request,
+    thread_id: str,
+    body: ThreadWorkspaceUpgradeRequest | None = None,
+) -> dict[str, Any]:
+    """Provision a real workspace container for a lite (``virtual``/``none``)
+    thread, upgrading it to the ``sandbox`` tier. **Internal** (P4b) — requires
+    ``X-Internal-Key``. Ingress strips this path.
+
+    The session-side counterpart to the live ``swap_backend()`` hot-swap
+    (workspace_tier_upgrade.md §4.2 S2): the agent calls this when a ``virtual``
+    session needs a real environment (the user starts coding / the agent
+    requests an upgrade), then polls ``/workspace`` for readiness via
+    ``_poll_workspace_ready`` and swaps its backend in place — the conversation
+    never drops. Idempotent: a second call while a container is already
+    provisioning/ready is a no-op.
+
+    ``vm`` targets keep their own operator-gated path (``/upgrade-to-vm``); this
+    endpoint handles the container tier only.
+    """
+    await require_internal(request)
+    target_tier = (body.target_tier if body else "sandbox") or "sandbox"
+    if target_tier != "sandbox":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"upgrade-to-workspace handles target_tier='sandbox'; got "
+                f"{target_tier!r} (use /upgrade-to-vm for the vm tier)"
+            ),
+        )
+
+    thread = await postgres_db.get_thread(thread_id)
+    if not thread:
+        raise HTTPException(status_code=404, detail="Thread not found")
+
+    if not (container_provisioner.is_available and container_provisioner.in_cluster):
+        raise HTTPException(
+            status_code=503,
+            detail="Workspace container provisioning not available (no in-cluster K8s)",
+        )
+
+    # Idempotency: short-circuit if a container is already in flight or ready.
+    metadata = thread.get("metadata") or {}
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except (json.JSONDecodeError, TypeError):
+            metadata = {}
+    wc = metadata.get("workspace_container") or {}
+    if wc.get("status") in ("pending", "creating", "created", "ready"):
+        return {
+            "status": wc["status"],
+            "thread_id": thread_id,
+            "target_tier": "sandbox",
+            "message": "Workspace container already provisioned or in progress",
+        }
+
+    # Mark pending, then provision in the background: create_workspace blocks
+    # up to ~120s waiting for the pod IP and updates
+    # metadata.workspace_container to ready/failed itself. The agent polls
+    # /workspace (-> _poll_workspace_ready) for the ready connection block.
+    # Mirrors the eager-session provisioning path in agent_create_thread.
+    await postgres_db.merge_thread_workspace_context(thread_id, {"status": "pending"})
+    asyncio.create_task(
+        container_provisioner.create_workspace(WorkspaceOwner.session(thread_id))
+    )
+
+    return {
+        "status": "provisioning",
+        "thread_id": thread_id,
+        "target_tier": "sandbox",
+    }
+
+
 @app.post("/api/agents/threads/{thread_id}/messages")
 async def agent_save_message(
     request: Request,

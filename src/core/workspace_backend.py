@@ -283,6 +283,39 @@ class WorkspaceBackend(ABC):
         """
         ...
 
+    def walk(self, path: str = "") -> list[str]:
+        """Recursively list every file path under ``path``, relative to the
+        workspace root.
+
+        Default implementation descends via ``list_dir`` (which returns
+        root-relative paths, directories suffixed ``/``). Backends over a flat
+        object store (``VirtualWorkspaceBackend``) override this with a single
+        recursive listing — both for efficiency and because their ``list_dir``
+        collapses to one level. Used by the cross-backend seed copy on a
+        workspace-tier upgrade (``workspace_tier_upgrade.md`` §4.2 S3a).
+
+        Args:
+            path: Subtree to walk, relative to root (default: whole workspace).
+
+        Returns:
+            Sorted list of file paths (relative to root, no trailing slash).
+            Directories are descended into but not themselves returned.
+        """
+        files: list[str] = []
+        stack: list[str] = [path]
+        seen: set[str] = set()
+        while stack:
+            current = stack.pop()
+            for entry in self.list_dir(current):
+                if entry in seen:
+                    continue
+                seen.add(entry)
+                if entry.endswith("/"):
+                    stack.append(entry.rstrip("/"))
+                else:
+                    files.append(entry)
+        return sorted(files)
+
     # --- Properties ---
 
     @property
