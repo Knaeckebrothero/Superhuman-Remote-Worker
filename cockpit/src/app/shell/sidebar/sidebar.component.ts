@@ -333,6 +333,13 @@ import {LegionMarkComponent} from '../../ui/legion-mark';
         color: var(--accent-color, #cba6f7);
       }
 
+      /* Larger tap target in the mobile nav drawer (links were ~36px). */
+      @media (max-width: 768px) {
+        .nav-link {
+          min-height: 44px;
+        }
+      }
+
       /* Debug sections */
 
       .section {
