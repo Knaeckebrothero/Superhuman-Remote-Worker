@@ -4655,9 +4655,11 @@ async def _handle_workspace_upgrade(
     are live (S3a) → ``swap_backend`` → ``resetup_tools_for_backend`` (S1) →
     persist the new tier (S3b).
 
-    The ``vm`` tier keeps its own operator-gated path (``_handle_vm_upgrade``);
-    this handler builds a ready ``vm`` block with ``sudo_action="allow"`` only
-    for forward-compat, but S2 provisions ``sandbox`` exclusively.
+    Phase 2: the same handler serves ``virtual → vm``. The orchestrator delegates
+    vm provisioning (operator-gated); this handler polls vm readiness via
+    ``_poll_vm_ready``, builds the backend with ``sudo_action="allow"``, seeds +
+    swaps as usual, and re-opens the shell-layer sudo gate after the swap. (The
+    pre-existing ``_handle_vm_upgrade`` stays the sandbox→vm sudo-escalation path.)
     """
     if not _session or not _orchestrator_client or not _thread_id:
         await _ws_send(ws, "workspace_upgrade.failed", {"reason": "Session not ready"})
@@ -4700,16 +4702,38 @@ async def _handle_workspace_upgrade(
             )
             return
 
-        # 2. Poll for container readiness. _poll_workspace_ready already returns
-        #    the {"backend": "sandbox", "remote": {host, port, ...}} block.
-        ws_config = await _poll_workspace_ready(
-            _orchestrator_client, _thread_id, timeout=300
-        )
+        # 2. Poll for readiness, then normalize to a {"backend", "remote"} block.
+        #    A vm provisions through metadata.vm (vm_status), which _poll_vm_ready
+        #    tolerates through the async provisioning window and bails promptly on
+        #    'failed'; _poll_workspace_ready would mis-bail on the still-empty
+        #    container status. Sandbox keeps the container poller (returns the
+        #    block directly).
+        if target_tier == "vm":
+            vm_cfg = await _poll_vm_ready(_orchestrator_client, _thread_id, timeout=300)
+            ssh_key = os.environ.get("SSH_KEY_PATH", "/run/secrets/vm-ssh-key")
+            ws_config = (
+                {
+                    "backend": "vm",
+                    "remote": {
+                        "host": vm_cfg["ssh_host"],
+                        "port": vm_cfg.get("ssh_port", 22),
+                        "username": "agent-host",
+                        "key_path": ssh_key,
+                        "workspace_path": "/home/agent-host/workspace",
+                    },
+                }
+                if vm_cfg
+                else None
+            )
+        else:
+            ws_config = await _poll_workspace_ready(
+                _orchestrator_client, _thread_id, timeout=300
+            )
         if not ws_config or not ws_config.get("remote"):
             await _ws_send(
                 ws,
                 "workspace_upgrade.failed",
-                {"reason": "Workspace did not become ready in time"},
+                {"reason": f"{target_tier} workspace did not become ready in time"},
             )
             return
 
@@ -4755,6 +4779,19 @@ async def _handle_workspace_upgrade(
         #    appear on the next turn (get_current_tools re-reads per turn).
         _session.swap_backend(new_backend)
         _session.resetup_tools_for_backend()
+
+        # A vm keeps its own in-guest sudo gate — re-open the shell-layer sudo
+        # intercept. swap_backend rebuilds ShellManager with the config-default
+        # ("freeze"), and ShellManager._check_blocked gates sudo BEFORE the
+        # backend, so a vm-upgraded session would otherwise freeze on sudo. The
+        # sandbox tier deliberately keeps "freeze" so its sudo→VM escalation
+        # still fires. Mirrors _handle_vm_upgrade.
+        if (
+            backend_tier == "vm"
+            and _session.shell_manager
+            and hasattr(_session.shell_manager, "sudo_action")
+        ):
+            _session.shell_manager.sudo_action = "allow"
 
         # 7. Persist the new tier (S3b) so the suspend/resume/reconcile
         #    lifecycle engages and a resumed session re-provisions a sandbox,
