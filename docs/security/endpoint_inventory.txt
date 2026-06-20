@@ -63,6 +63,7 @@ POST   /api/agents/threads/{thread_id}/release-agent                            
 PUT    /api/agents/threads/{thread_id}/status                                           internal:require_internal
 POST   /api/agents/threads/{thread_id}/suspend                                          internal:require_internal
 POST   /api/agents/threads/{thread_id}/upgrade-to-vm                                    internal:require_internal
+POST   /api/agents/threads/{thread_id}/upgrade-to-workspace                             internal:require_internal
 GET    /api/agents/threads/{thread_id}/workspace                                        internal:require_internal
 DELETE /api/agents/{agent_id}                                                           admin:_require_admin
 GET    /api/agents/{agent_id}                                                           admin:_require_admin

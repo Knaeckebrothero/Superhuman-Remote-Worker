@@ -608,6 +608,19 @@ class PersistentSession:
             path, self.turn_count
         )
 
+        self._load_tools_for_backend()
+
+    def _load_tools_for_backend(self) -> None:
+        """Resolve, filter, load, document, and post-process the toolset for
+        the CURRENT workspace backend, setting ``self.tools``.
+
+        Factored out of ``_setup_tools`` so ``resetup_tools_for_backend`` can
+        re-derive the toolset after a live backend swap (e.g. ``virtual`` →
+        ``sandbox``) WITHOUT rebuilding ``tool_context`` or resetting
+        ``session_task_manager``. Reads only instance state already set by
+        ``_setup_tools`` (``tool_context``, ``config``, ``workspace_manager``,
+        ``cloud_mount_manager``), so it is safe to call again post-swap.
+        """
         # Get all tool names and filter out phase-specific ones
         all_names = get_all_tool_names(self.config)
         tool_names = [n for n in all_names if n not in _EXCLUDED_TOOLS]
@@ -638,6 +651,9 @@ class PersistentSession:
 
         # Capability gate: drop tools the workspace backend can't support (lite
         # tiers — no_workspace_agent_mode.md §3.2/§7). Mirrors the worker path.
+        # On a backend swap this RE-FILTERS against the new backend, so an
+        # upgrade (virtual → sandbox) re-admits shell/git/file tools the lite
+        # tier had stripped.
         from ..tools.registry import filter_tools_by_backend
 
         tool_names = filter_tools_by_backend(
@@ -678,6 +694,42 @@ class PersistentSession:
         self.tools = apply_instruction_enforcement(self.tools, self.tool_context)
 
         logger.info(f"Loaded {len(self.tools)} tools for persistent session")
+
+    def resetup_tools_for_backend(self) -> None:
+        """Re-derive + rebind the toolset after a live backend swap.
+
+        ``swap_backend`` rebuilds the ShellManager (and, when the new backend
+        supports a shell, repoints ``tool_context.shell_manager``) but leaves
+        ``self.tools`` / ``self.llm_with_tools`` bound to the OLD backend's
+        (lite-filtered) toolset. After a ``virtual`` → ``sandbox`` upgrade the
+        new backend supports a shell + file tools, so shell, git, and file
+        tools must be re-derived; this recomputes the tool list against the new
+        backend and rebinds the LLM — without touching ``session_task_manager``
+        or rebuilding ``tool_context`` the way a full ``_setup_tools`` would
+        (that would drop in-flight session state).
+
+        The per-turn ``get_current_tools()`` re-read in ``persistent_graph``
+        then exposes the new tools on the next turn with no further plumbing.
+        Safe to call only after ``_setup_tools`` has run once.
+        """
+        if not self.tool_context:
+            logger.warning(
+                "resetup_tools_for_backend called before tool setup — skipping"
+            )
+            return
+        # swap_backend rebuilds self.shell_manager but only repoints
+        # tool_context.shell_manager when the NEW backend supports a shell.
+        # Repoint unconditionally so a swap to a no-shell backend (downgrade /
+        # kill-switch) clears the stale manager too.
+        self.tool_context.shell_manager = self.shell_manager
+        # The WorkspaceManager object is unchanged by swap_backend (only its
+        # ._backend flips), so tool_context.workspace_manager stays valid.
+        self._load_tools_for_backend()
+        self._bind_tools()
+        backend_name = type(getattr(self.workspace_manager, "backend", None)).__name__
+        logger.info(
+            f"Re-derived {len(self.tools)} tools after backend swap ({backend_name})"
+        )
 
     def _bind_tools(self) -> None:
         """Bind tools to LLM."""

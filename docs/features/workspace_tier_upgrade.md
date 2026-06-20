@@ -22,14 +22,17 @@ related:
 
 # Workspace Tier Upgrade — `virtual`/`none` → `sandbox`/`vm` on demand
 
-**Status:** **Design — not yet scoped or built (2026-06-20).** Proposes a live
-upgrade path from the lite workspace tiers to a real container or VM, so a
-session (or job) can start cheap and instant and only acquire a workspace pod /
-VM when the work actually needs one. Grounded in a codebase trace (what's
-reusable vs missing) plus a survey of how cloud-IDE / agent-sandbox platforms
-solve the same problem. Sibling to [[no_workspace_agent_mode]] (which shipped
-the lite tiers) and reuses the container→VM upgrade precedent from
-[[vm_backend]].
+**Status:** **Phase-1 MVP implemented (S1 + S2 + S3), k3d end-to-end verify
+pending — 2026-06-20.** Proposes a live upgrade path from the lite workspace
+tiers to a real container or VM, so a session (or job) can start cheap and
+instant and only acquire a workspace pod / VM when the work actually needs one.
+Grounded in a codebase trace (what's reusable vs missing) plus a survey of how
+cloud-IDE / agent-sandbox platforms solve the same problem. Sibling to
+[[no_workspace_agent_mode]] (which shipped the lite tiers) and reuses the
+container→VM upgrade precedent from [[vm_backend]]. The session `virtual →
+sandbox` path (live in-process swap, no freeze/resume) is built and unit-green;
+what remains is the grant gate (S4), the agent-initiated offer (S5), the worker
+path (§4.3), and a live cluster smoke test.
 
 **In one paragraph.** Make workspace acquisition lazy: a session (or job) starts
 on `virtual` and upgrades to a `sandbox` pod (or `vm`) only when the work needs
@@ -43,6 +46,48 @@ workspace; (3) **auto-upgrade `virtual → sandbox` is acceptable** (non-root,
 default-deny egress) *only if the trigger is human intent, not ingested
 content* — `vm` stays operator-gated; (4) a **warm pool** makes it feel instant
 but is an accelerator, not a prerequisite.
+
+### Implementation status (2026-06-20)
+
+Slice-by-slice; details in each slice below. **Built** = code landed +
+unit-green + ruff-clean on `develop` (uncommitted). k3d end-to-end smoke test of
+the session path is still pending (needs a live `virtual` session).
+
+| Slice | What | Status |
+|---|---|---|
+| §4.2 **S1** | `resetup_tools_for_backend()` — re-derive toolset after a swap | **✅ Built** |
+| §4.2 **S2** | Orchestrator `POST …/upgrade-to-workspace` + client method | **✅ Built** |
+| §4.2 **S3** | Agent handler: seed + swap + retool + persist (the MVP) | **✅ Built** |
+| §4.2 **S3a** | `WorkspaceBackend.walk()` + `seed_workspace()` copy-down | **✅ Built** |
+| §4.2 **S3b** | Persist new tier to `metadata.config_override.workspace.backend` | **✅ Built** |
+| §4.2 — | Minimal Cockpit (`workspace_upgrade.*` toasts + `/upgrade-workspace`) | **✅ Built** |
+| §4.2 **S4** | Grant enforcement (shared §4.4 Sec-1 gate) | Design |
+| §4.2 **S5** | Agent-initiated offer (`request_workspace_upgrade` tool + freeze) | Design |
+| §4.3 **W1–W3** | Worker-job flow (in-process `virtual → sandbox`, vm re-dispatch) | Design |
+| §4.4 **Sec-1…5** | Capability & security slices | Design |
+| Phase 2 | Sessions `virtual → vm` | Design |
+
+**Landing spots for the built slices:**
+- S1 — `src/api/persistent_session.py`: `resetup_tools_for_backend()` +
+  extracted `_load_tools_for_backend()`. Tests: `tests/test_persistent_session.py`
+  (`TestResetupToolsForBackend`).
+- S2 — `orchestrator/main.py`: `agent_upgrade_thread_to_workspace` +
+  `ThreadWorkspaceUpgradeRequest`; `src/api/orchestrator_client.py`:
+  `request_thread_workspace_upgrade()`. Manifest regenerated
+  (`docs/security/endpoint_inventory.txt`, auto-classified
+  `internal:require_internal`). Tests: `tests/test_thread_endpoints.py`
+  (`TestAgentUpgradeToWorkspace`).
+- S3 — `src/api/persistent_app.py`: `_handle_workspace_upgrade()` + WS dispatch
+  `method == "upgrade-to-workspace"`.
+- S3a — `src/core/workspace_backend.py` (base `walk()`),
+  `src/core/backends/virtual.py` (flat `walk()` override),
+  `src/core/backends/seed.py` (`seed_workspace()`). Tests:
+  `tests/test_workspace_seed.py`.
+- Cockpit — `cockpit/src/app/core/services/persistent-chat.service.ts`
+  (`workspace_upgrade.started/complete/failed` cases + `/upgrade-workspace`
+  slash command). *Note: the session-side `vm` upgrade was never wired in the
+  cockpit (only jobs upgrade via REST), so the slash command is the minimal
+  session trigger.*
 
 ---
 
@@ -251,9 +296,9 @@ The work breaks into five slices. **S1 + S2 + S3 are the MVP** — a user-trigge
 upgrade working end-to-end; S4 adds the grant gate, S5 the agent-initiated offer.
 S1 and S2 are independent and can land in parallel.
 
-**S1 — `resetup_tools_for_backend()` (the unblocker).** Re-derive the toolset
-after a swap so the new tier's tools appear, without clobbering live session
-state. `swap_backend` (`persistent_session.py:867`) rebuilds `ShellManager` but
+**S1 — `resetup_tools_for_backend()` (the unblocker). ✅ Built.** Re-derive the
+toolset after a swap so the new tier's tools appear, without clobbering live
+session state. `swap_backend` (`persistent_session.py:867`) rebuilds `ShellManager` but
 leaves `self.tools` / `llm_with_tools` and the now-stale
 `tool_context.shell_manager` (set at `:552`) pointing at the old, lite-filtered
 set. New method that (a) refreshes `tool_context.shell_manager =
@@ -270,9 +315,16 @@ exposes the new tools on the next turn with zero further plumbing.
   `resetup_tools_for_backend()`, shell/git appear in `self.tools` /
   `llm_with_tools` and `tool_context.shell_manager` is the new one.
 - *Deps:* none. Independently shippable + unit-testable.
+- *As built:* shared block extracted as `_load_tools_for_backend()`; the new
+  method recomputes via it + `_bind_tools()`. One refinement vs the sketch:
+  `swap_backend → _setup_shell_manager` already repoints `tool_context.shell_manager`
+  *only when the new backend has a shell*, so `resetup_tools_for_backend` repoints
+  it **unconditionally** (also covers a downgrade to a no-shell backend). Verify
+  landed as `TestResetupToolsForBackend` (real `swap_backend` + retool readmits
+  shell/git; pre-setup no-op guard).
 
-**S2 — Orchestrator sandbox-upgrade endpoint.** Provision a sandbox pod for an
-existing lite thread, idempotently. New internal `POST
+**S2 — Orchestrator sandbox-upgrade endpoint. ✅ Built.** Provision a sandbox pod
+for an existing lite thread, idempotently. New internal `POST
 /api/agents/threads/{thread_id}/upgrade-to-workspace {target_tier}` mirroring
 `agent_upgrade_thread_to_vm` (`main.py:12849`): for `sandbox`, assert
 `container_provisioner.is_available`, short-circuit if
@@ -287,8 +339,16 @@ eager-session pattern at `main.py:13300`) and record
   `{"backend":"sandbox","remote":{…}}` config (already implemented,
   `persistent_app.py:4467`).
 - *Deps:* none (parallel with S1).
+- *As built:* `agent_upgrade_thread_to_workspace` + `ThreadWorkspaceUpgradeRequest`
+  (default `target_tier="sandbox"`); `400` on a non-sandbox tier (vm keeps its own
+  `/upgrade-to-vm`), `503` unless `is_available AND in_cluster`, idempotent when
+  `metadata.workspace_container.status ∈ {pending,creating,created,ready}`, else
+  `merge_thread_workspace_context({"status":"pending"})` + background
+  `create_workspace`. Unit coverage is the replicated-logic `TestAgentUpgradeToWorkspace`
+  (8 cases) in `test_thread_endpoints.py` (main.py isn't importable under the test
+  deps); the `curl` k3d check is still the live verify.
 
-**S3 — Agent handler: seed + swap + retool + persist (the MVP).**
+**S3 — Agent handler: seed + swap + retool + persist (the MVP). ✅ Built.**
 `_handle_workspace_upgrade(ws, target_tier)` generalizing `_handle_vm_upgrade`
 (`persistent_app.py:4500`): `request_thread_workspace_upgrade` (S2) →
 `_poll_workspace_ready` → build `RemoteBackend` from the returned `remote` block
@@ -315,8 +375,35 @@ dispatch at `persistent_app.py:2292`).
   (1) a pod spawns, (2) a file written in `virtual` (`notes/plan.md`) exists in
   the new pod workspace, (3) the next turn the agent can run a shell command,
   (4) the WebSocket/conversation never dropped. Watch agent logs for "Backend
-  swapped" + "Loaded N tools".
+  swapped" + "Loaded N tools". **(Still pending — needs a live session.)**
 - *Deps:* S1 + S2.
+- *As built:*
+  - **Ordering** (the one subtlety): the new `RemoteBackend` is connected
+    *before* the seed (`await asyncio.to_thread(new_backend.connect)`) so the copy
+    runs while **both** backends are live; `swap_backend` then sees it connected,
+    skips reconnecting, and disconnects the old one. The blocking SSH connect and
+    SFTP seed both run via `asyncio.to_thread`.
+  - **Forward-compat:** the handler reads `backend_tier` from the poll result and
+    sets `sudo_action = "allow"` for `vm`, `"freeze"` for `sandbox` — so the same
+    handler serves Phase 2 (`virtual → vm`) once S2 provisions a vm; today S2
+    provisions sandbox only. An early guard no-ops if the backend already
+    `supports_shell`.
+  - **S3a — `seed_workspace()`** landed in a new module `src/core/backends/seed.py`;
+    `WorkspaceBackend.walk(path="")` is the base (list_dir descent) with a flat
+    `_store.list()` override on `VirtualWorkspaceBackend` (skips `.keep` markers).
+    Verify is **per-file `dst.exists()`** (using the same relative path written),
+    raising `RuntimeError` on any miss so the agent never swaps onto a half-seeded
+    workspace. Empty source dirs are not recreated (walk returns files only). Tests:
+    `tests/test_workspace_seed.py`.
+  - **S3b — persist tier** via the existing `update_thread_config(thread_id,
+    {"workspace": {"backend": tier}})` client method (deep-merges into
+    `metadata.config_override`); non-fatal on failure so a persist error never
+    breaks the live upgrade.
+  - **Cockpit:** `/upgrade-workspace` slash command +
+    `workspace_upgrade.started/complete/failed` system-message toasts in
+    `persistent-chat.service.ts`. A dedicated "Upgrade workspace" button is
+    deferred; the slash command is the minimal trigger (and the session-side `vm`
+    upgrade had no cockpit send wired either — only jobs upgrade via REST).
 
 **S4 — Grant enforcement.** Run the shared upgrade-authorization gate (§4.4
 Sec-1) before provisioning: `capability_grants.evaluate` on the post-upgrade
@@ -589,26 +676,29 @@ classifier misses ~17% of overeager actions). Maps to open question #1.
 - `VirtualWorkspaceBackend` / `ObjectStore` read+list (for the seed copy) — `virtual.py:88`, `object_store.py:49`
 - Agent egress NetworkPolicy — [[no_workspace_agent_mode]] §9.1
 
-**New code:**
-1. `resetup_tools_for_backend()` on `PersistentSession` (the ~10-line blocker).
-2. Generalized `workspace_upgrade_required` freeze type + `context.workspace_upgrade` namespace; `completion.py` routing + `_format_freeze_notification` case.
-3. Agent-side `_handle_workspace_upgrade(target_tier)` generalizing `_handle_vm_upgrade` for the sandbox target.
-4. Orchestrator `request_thread_workspace_upgrade` + `POST /api/jobs/{id}/upgrade-workspace`.
-5. Agent-side **seed copy** (virtual prefix → new backend) with verify-before-flip.
-6. Teach `_job_needs_sandbox` to honor `context.workspace_upgrade.requested`; add the **sandbox injection to `_resume_job_on_agent`**.
-7. Grant re-check on upgrade; persist new tier to `threads.metadata`.
-8. Cockpit: upgrade offer banner + explicit "Upgrade workspace" control + provisioning state.
-9. *(v2)* Worker in-process `virtual → sandbox` upgrade (agent-side freeze interception + re-`ainvoke`, §4.3 W1) + orchestrator `provision-workspace` endpoint (W2). Re-dispatch / fencing only for the operator-gated VM path (W3).
-10. *(v3)* Warm-pool claim (depends on [[workspace_warm_pool_and_async_sessions]]).
+**New code** (✅ = built, 🟡 = partial, ◻️ = design):
+1. ✅ `resetup_tools_for_backend()` on `PersistentSession` (+ extracted `_load_tools_for_backend()`).
+2. ◻️ Generalized `workspace_upgrade_required` freeze type + `context.workspace_upgrade` namespace; `completion.py` routing + `_format_freeze_notification` case. *(S5 — not built; S3 persists the tier via `update_thread_config` instead, no freeze needed for the user-triggered path.)*
+3. ✅ Agent-side `_handle_workspace_upgrade(target_tier)` generalizing `_handle_vm_upgrade` (sandbox target; vm forward-compat).
+4. 🟡 Orchestrator `request_thread_workspace_upgrade` + `POST …/threads/{id}/upgrade-to-workspace` ✅ (S2); `POST /api/jobs/{id}/…` is the worker endpoint (W2, ◻️).
+5. ✅ Agent-side **seed copy** (`seed_workspace` + `WorkspaceBackend.walk()`), verify-before-flip.
+6. ◻️ Teach `_job_needs_sandbox` to honor `context.workspace_upgrade.requested`; add the **sandbox injection to `_resume_job_on_agent`**. *(Worker path; only the deferred direct lite→vm re-dispatch needs it — see §4.3 W3.)*
+7. 🟡 Grant re-check on upgrade (◻️ S4) + persist new tier to `threads.metadata` (✅ S3b, via `update_thread_config`).
+8. 🟡 Cockpit: minimal `workspace_upgrade.*` toasts + `/upgrade-workspace` slash ✅; offer banner + explicit "Upgrade workspace" button ◻️ (S5 / later).
+9. ◻️ *(v2)* Worker in-process `virtual → sandbox` upgrade (agent-side freeze interception + re-`ainvoke`, §4.3 W1) + orchestrator `provision-workspace` endpoint (W2). Re-dispatch / fencing only for the operator-gated VM path (W3).
+10. ◻️ *(v3)* Warm-pool claim (depends on [[workspace_warm_pool_and_async_sessions]]).
 
 ---
 
 ## 6. Phasing
 
-- **Phase 1 — Sessions, `virtual → sandbox`, HITL.** §4.2 slices S1–S5 (MVP =
-  S1 + S2 + S3; S4 grant gate; S5 agent-initiated offer). Explicit-user-action /
-  agent-offer trigger, no auto-grant yet. Delivers the headline use case. Lowest
-  risk: in-process, portable state, single writer.
+- **Phase 1 — Sessions, `virtual → sandbox`, HITL. 🟡 MVP built (S1+S2+S3),
+  S4+S5 + k3d verify remaining.** §4.2 slices S1–S5 (MVP = S1 + S2 + S3; S4 grant
+  gate; S5 agent-initiated offer). Explicit-user-action / agent-offer trigger, no
+  auto-grant yet. Delivers the headline use case. Lowest risk: in-process,
+  portable state, single writer. **Done:** S1+S2+S3 + minimal cockpit, unit-green.
+  **Remaining:** S4 (grant gate — §4.4 Sec-1), S5 (agent-initiated offer), and the
+  live k3d smoke test.
 - **Phase 2 — Sessions, `virtual → vm`.** Add the VM target to
   `_handle_workspace_upgrade` (reuses `request_thread_vm_upgrade`), keep the
   operator-approval gate. Mostly wiring once Phase 1 exists.

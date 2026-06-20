@@ -7,6 +7,7 @@ swap_backend(), get_workspace_content(), cleanup().
 """
 
 import uuid
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -1278,6 +1279,128 @@ class TestSwapBackend:
             session.swap_backend(new_backend)
 
         new_backend.connect.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# 2.10b resetup_tools_for_backend() — S1: live tool re-derivation after a swap
+# (docs/features/workspace_tier_upgrade.md §4.2)
+# ---------------------------------------------------------------------------
+
+
+class _SwappableWM:
+    """Minimal WorkspaceManager stand-in whose ``.backend`` reflects the
+    ``._backend`` that ``swap_backend`` assigns — so the capability gate in
+    ``_load_tools_for_backend`` observes the post-swap backend. A plain
+    MagicMock's ``.backend`` would not track an assignment to ``._backend``.
+    """
+
+    def __init__(self, backend):
+        self._backend = backend
+
+    @property
+    def backend(self):
+        return self._backend
+
+    def get_path(self, rel):
+        return f"/tmp/ws/{rel}"
+
+    def write_file(self, rel, content):
+        pass
+
+
+def _named_tool(name):
+    """A mock tool object carrying a ``.name`` (MagicMock(name=...) is special)."""
+    t = MagicMock()
+    t.name = name
+    return t
+
+
+class TestResetupToolsForBackend:
+    """S1: after a live backend swap from a lite (no-shell) tier to a
+    shell-capable one, ``resetup_tools_for_backend`` re-derives + rebinds the
+    toolset so shell/git tools — dropped by the lite capability gate — reappear,
+    without rebuilding ``tool_context`` or resetting ``session_task_manager``.
+    """
+
+    def test_swap_then_resetup_readmits_shell_and_git(self):
+        from src.tools.registry import get_tools_by_category
+
+        shell = get_tools_by_category("shell")[0]
+        git = get_tools_by_category("git")[0]
+        web = get_tools_by_category("research")[0]
+
+        # virtual: no shell -> shell/git filtered; sandbox: shell -> re-admitted.
+        virtual = SimpleNamespace(supports_shell=False, supports_file_tools=True)
+        sandbox = SimpleNamespace(supports_shell=True, supports_file_tools=True)
+
+        session = _make_session()
+        session.workspace_manager = _SwappableWM(virtual)
+        session._llm = MagicMock()
+        session._llm.bind_tools.return_value = MagicMock()
+
+        new_sm = MagicMock()
+
+        with (
+            patch(
+                "src.api.persistent_session.get_all_tool_names",
+                return_value=[shell, git, web],
+            ),
+            patch(
+                "src.api.persistent_session.load_tools",
+                side_effect=lambda names, ctx: [_named_tool(n) for n in names],
+            ),
+            patch(
+                "src.api.persistent_session.apply_description_overrides",
+                side_effect=lambda x: x,
+            ),
+            patch(
+                "src.api.persistent_session.apply_instruction_enforcement",
+                side_effect=lambda x, y: x,
+            ),
+            patch("src.api.persistent_session.ToolContext"),
+            patch("src.tools.generate_workspace_tool_docs"),
+            patch(
+                "src.api.persistent_session.supports_parallel_tool_calls",
+                return_value=False,
+            ),
+            patch(
+                "src.services.guardrails.apply_guardrails_to_tools",
+                side_effect=lambda tools, model=None: tools,
+            ),
+        ):
+            # Lite (virtual) tier — shell/git dropped by the capability gate.
+            session._setup_tools(None)
+            before = {t.name for t in session.tools}
+            assert shell not in before and git not in before
+            assert web in before
+
+            # Live upgrade: real swap_backend (shell rebuild stubbed to install
+            # a fresh ShellManager), then the S1 retool.
+            with patch.object(
+                session,
+                "_setup_shell_manager",
+                side_effect=lambda: setattr(session, "shell_manager", new_sm),
+            ):
+                session.swap_backend(sandbox)
+            session.resetup_tools_for_backend()
+
+            after = {t.name for t in session.tools}
+
+        # Shell + git re-admitted against the sandbox backend; web retained.
+        assert shell in after and git in after and web in after
+        # tool_context repointed at the freshly built ShellManager.
+        assert session.tool_context.shell_manager is new_sm
+        # LLM rebound with the upgraded toolset (shell/git included).
+        rebind_names = {t.name for t in session._llm.bind_tools.call_args[0][0]}
+        assert shell in rebind_names and git in rebind_names
+        assert session.llm_with_tools is session._llm.bind_tools.return_value
+
+    def test_resetup_before_setup_is_noop(self):
+        """Guard: called before _setup_tools (no tool_context) → safe no-op."""
+        session = _make_session()
+        session.tool_context = None
+        session.resetup_tools_for_backend()  # must not raise
+        assert session.tools is None
 
 
 # ---------------------------------------------------------------------------

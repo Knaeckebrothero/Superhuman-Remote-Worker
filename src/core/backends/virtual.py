@@ -266,6 +266,22 @@ class VirtualWorkspaceBackend(WorkspaceBackend):
                 results.append(rel_root + name + "/")
         return sorted(results)
 
+    def walk(self, path: str = "") -> list[str]:
+        """Flat recursive listing of every file under ``path`` (relative to the
+        workspace root), via the object store's recursive ``list``.
+
+        Overrides the base backend's list_dir-descent walk because ``list_dir``
+        here collapses to a single level — the flat store already knows every
+        key under the prefix in one call (``workspace_tier_upgrade.md`` §4.2
+        S3a, the seed source).
+        """
+        out: list[str] = []
+        for info in self._store.list(self._dir_prefix(path)):
+            if posixpath.basename(info.key) == _DIR_MARKER:
+                continue  # hide the empty-dir markers
+            out.append(self._strip_prefix(info.key))
+        return sorted(out)
+
     def search_files(
         self, query: str, path: str = "", case_sensitive: bool = False
     ) -> list[dict]:
