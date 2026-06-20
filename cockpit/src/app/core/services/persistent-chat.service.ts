@@ -1057,7 +1057,8 @@ export class PersistentChatService {
         // sends, never persisted): orchestrator status frames during WS
         // startup (provisioning/booting/connecting), the agent's
         // session.state welcome frame, and control-plane acks
-        // (mode.changed, narration.changed, interrupt.ack, vm_upgrade.*).
+        // (mode.changed, narration.changed, interrupt.ack, vm_upgrade.*,
+        // workspace_upgrade.*).
         // These never reach SSE, so the WS is the only path that delivers
         // them — and session.state is what flips sessionReady on a
         // reconnect to an already-idle loop where the cached SSE cursor
@@ -1483,6 +1484,14 @@ export class PersistentChatService {
             case '/undo':
                 this._sendControl({method: 'undo'});
                 this._systemMessage('Undoing last file changes...');
+                return true;
+            case '/upgrade-workspace':
+                // Lite (virtual) -> sandbox upgrade: provisions a real
+                // workspace container, seeds it, and hot-swaps in place so
+                // shell/git/file tools become available without dropping the
+                // conversation (workspace_tier_upgrade.md §4.2 S3).
+                this._sendControl({method: 'upgrade-to-workspace', target_tier: 'sandbox'});
+                this._systemMessage('Provisioning workspace, please wait...');
                 return true;
             default:
                 return false;
@@ -2013,6 +2022,27 @@ export class PersistentChatService {
             case 'vm_upgrade.failed':
                 this._systemMessage(
                     `VM upgrade failed: ${(params['reason'] as string) || 'unknown error'}`,
+                );
+                break;
+
+            case 'workspace_upgrade.started':
+                this._systemMessage('Provisioning workspace, please wait...');
+                break;
+
+            case 'workspace_upgrade.complete': {
+                const seeded = params['seeded_files'] as number | undefined;
+                const seededNote = typeof seeded === 'number'
+                    ? ` ${seeded} file(s) carried over.`
+                    : '';
+                this._systemMessage(
+                    `Workspace ready — shell, git, and file tools are now available.${seededNote}`,
+                );
+                break;
+            }
+
+            case 'workspace_upgrade.failed':
+                this._systemMessage(
+                    `Workspace upgrade failed: ${(params['reason'] as string) || 'unknown error'}`,
                 );
                 break;
 

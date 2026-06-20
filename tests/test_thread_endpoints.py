@@ -175,6 +175,53 @@ async def agent_upgrade_to_vm(db, vm_provisioner, thread_id):
     }
 
 
+async def agent_upgrade_to_workspace(db, provisioner, thread_id, target_tier="sandbox"):
+    """5.3b: POST /api/agents/threads/{thread_id}/upgrade-to-workspace
+    (workspace_tier_upgrade.md §4.2 S2) — mirrors orchestrator/main.py handler.
+
+    Provisions a real container for a lite thread (virtual/none -> sandbox).
+    Idempotent on an in-flight/ready container; the `vm` tier keeps its own
+    operator-gated upgrade-to-vm path.
+    """
+    target_tier = target_tier or "sandbox"
+    if target_tier != "sandbox":
+        return {"error": 400, "detail": f"unsupported target_tier {target_tier!r}"}
+
+    thread = await db.get_thread(thread_id)
+    if not thread:
+        return {"error": 404, "detail": "Thread not found"}
+
+    if not (provisioner.is_available and provisioner.in_cluster):
+        return {
+            "error": 503,
+            "detail": "Workspace container provisioning not available",
+        }
+
+    metadata = thread.get("metadata") or {}
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except (json.JSONDecodeError, TypeError):
+            metadata = {}
+    wc = metadata.get("workspace_container") or {}
+    if wc.get("status") in ("pending", "creating", "created", "ready"):
+        return {
+            "status": wc["status"],
+            "thread_id": thread_id,
+            "target_tier": "sandbox",
+            "message": "Workspace container already provisioned or in progress",
+        }
+
+    await db.merge_thread_workspace_context(thread_id, {"status": "pending"})
+    await provisioner.create_workspace(WorkspaceOwner.session(thread_id))
+
+    return {
+        "status": "provisioning",
+        "thread_id": thread_id,
+        "target_tier": "sandbox",
+    }
+
+
 async def agent_save_message(
     db, thread_id, role, content=None, tool_calls=None, turn_number=None
 ):
@@ -425,10 +472,15 @@ def _mock_gitea(initialized=False):
     return g
 
 
-def _mock_provisioner(available=False):
+def _mock_provisioner(available=False, in_cluster=None):
     p = AsyncMock()
     type(p).is_available = PropertyMock(return_value=available)
-    p.create_workspace = AsyncMock()
+    # Defaults to tracking is_available unless overridden (the upgrade-to-
+    # workspace gate requires both is_available AND in_cluster).
+    type(p).in_cluster = PropertyMock(
+        return_value=available if in_cluster is None else in_cluster
+    )
+    p.create_workspace = AsyncMock(return_value=True)
     p.delete_workspace = AsyncMock()
     return p
 
@@ -808,6 +860,101 @@ class TestAgentUpgradeToVm:
 
         result = await agent_upgrade_to_vm(db, vm, "tid-1")
         assert result["error"] == 500
+
+
+# =============================================================================
+# 5.3b: POST /api/agents/threads/{thread_id}/upgrade-to-workspace (S2)
+# =============================================================================
+
+
+class TestAgentUpgradeToWorkspace:
+    """Tests for POST /api/agents/threads/{thread_id}/upgrade-to-workspace —
+    lite -> sandbox container provisioning (workspace_tier_upgrade.md §4.2 S2).
+    """
+
+    @pytest.mark.asyncio
+    async def test_returns_400_for_non_sandbox_tier(self):
+        # vm keeps its own gated upgrade-to-vm path; this endpoint is sandbox-only.
+        db = _mock_db()
+        prov = _mock_provisioner(available=True, in_cluster=True)
+        result = await agent_upgrade_to_workspace(db, prov, "tid-1", target_tier="vm")
+        assert result["error"] == 400
+        prov.create_workspace.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_returns_404_when_thread_not_found(self):
+        db = _mock_db()
+        db.get_thread = AsyncMock(return_value=None)
+        prov = _mock_provisioner(available=True, in_cluster=True)
+        result = await agent_upgrade_to_workspace(db, prov, "tid-1")
+        assert result["error"] == 404
+
+    @pytest.mark.asyncio
+    async def test_returns_503_when_not_in_cluster(self):
+        # Provisioner available but out-of-cluster (e.g. dev compose) → no pod.
+        db = _mock_db()
+        db.get_thread = AsyncMock(return_value=_make_thread())
+        prov = _mock_provisioner(available=True, in_cluster=False)
+        result = await agent_upgrade_to_workspace(db, prov, "tid-1")
+        assert result["error"] == 503
+        prov.create_workspace.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_returns_503_when_provisioner_unavailable(self):
+        db = _mock_db()
+        db.get_thread = AsyncMock(return_value=_make_thread())
+        prov = _mock_provisioner(available=False)
+        result = await agent_upgrade_to_workspace(db, prov, "tid-1")
+        assert result["error"] == 503
+
+    @pytest.mark.asyncio
+    async def test_idempotent_when_already_provisioning(self):
+        thread = _make_thread(metadata={"workspace_container": {"status": "pending"}})
+        db = _mock_db()
+        db.get_thread = AsyncMock(return_value=thread)
+        prov = _mock_provisioner(available=True, in_cluster=True)
+        result = await agent_upgrade_to_workspace(db, prov, "tid-1")
+        assert result["status"] == "pending"
+        assert (
+            result["message"]
+            == "Workspace container already provisioned or in progress"
+        )
+        # No duplicate provisioning, no status churn.
+        prov.create_workspace.assert_not_awaited()
+        db.merge_thread_workspace_context.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_idempotent_when_already_ready(self):
+        thread = _make_thread(metadata={"workspace_container": {"status": "ready"}})
+        db = _mock_db()
+        db.get_thread = AsyncMock(return_value=thread)
+        prov = _mock_provisioner(available=True, in_cluster=True)
+        result = await agent_upgrade_to_workspace(db, prov, "tid-1")
+        assert result["status"] == "ready"
+        prov.create_workspace.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_provisions_for_new_request(self):
+        thread = _make_thread(metadata={})
+        db = _mock_db()
+        db.get_thread = AsyncMock(return_value=thread)
+        prov = _mock_provisioner(available=True, in_cluster=True)
+        result = await agent_upgrade_to_workspace(db, prov, "tid-1")
+        assert result["status"] == "provisioning"
+        assert result["target_tier"] == "sandbox"
+        db.merge_thread_workspace_context.assert_awaited_once_with(
+            "tid-1", {"status": "pending"}
+        )
+        prov.create_workspace.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_defaults_to_sandbox_when_tier_omitted(self):
+        thread = _make_thread(metadata={})
+        db = _mock_db()
+        db.get_thread = AsyncMock(return_value=thread)
+        prov = _mock_provisioner(available=True, in_cluster=True)
+        result = await agent_upgrade_to_workspace(db, prov, "tid-1")
+        assert result["status"] == "provisioning"
 
 
 # =============================================================================

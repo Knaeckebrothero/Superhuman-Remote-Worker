@@ -2293,6 +2293,11 @@ async def handle_persistent_websocket(ws: WebSocket) -> None:
                 # Upgrade workspace from container to VM
                 asyncio.create_task(_handle_vm_upgrade(ws))
 
+            elif method == "upgrade-to-workspace":
+                # Upgrade a lite (virtual) session to a real sandbox container
+                target_tier = data.get("target_tier", "sandbox")
+                asyncio.create_task(_handle_workspace_upgrade(ws, target_tier))
+
             elif method == "undo":
                 if _session is None:
                     await _ws_send(
@@ -4567,6 +4572,149 @@ async def _handle_vm_upgrade(ws: WebSocket) -> None:
     except Exception as e:
         logger.exception(f"VM upgrade failed for thread {_thread_id}")
         await _ws_send(ws, "vm_upgrade.failed", {"reason": str(e)})
+
+
+async def _handle_workspace_upgrade(
+    ws: WebSocket, target_tier: str = "sandbox"
+) -> None:
+    """Handle a lite (``virtual``) → ``sandbox`` workspace upgrade from cockpit.
+
+    The live, in-process counterpart to the worker freeze→re-dispatch path
+    (``workspace_tier_upgrade.md`` §4.2 S3): provision a real workspace
+    container for a lite session, seed it from the live object-store prefix, and
+    hot-swap the backend in place — the conversation never drops (session state
+    is in Postgres, one process holds both backends). Flow: request provisioning
+    (S2) → poll ready → build ``RemoteBackend`` → **seed** while both backends
+    are live (S3a) → ``swap_backend`` → ``resetup_tools_for_backend`` (S1) →
+    persist the new tier (S3b).
+
+    The ``vm`` tier keeps its own operator-gated path (``_handle_vm_upgrade``);
+    this handler builds a ready ``vm`` block with ``sudo_action="allow"`` only
+    for forward-compat, but S2 provisions ``sandbox`` exclusively.
+    """
+    if not _session or not _orchestrator_client or not _thread_id:
+        await _ws_send(ws, "workspace_upgrade.failed", {"reason": "Session not ready"})
+        return
+
+    target_tier = target_tier or "sandbox"
+    await _ws_send(
+        ws,
+        "workspace_upgrade.started",
+        {"thread_id": _thread_id, "target_tier": target_tier},
+    )
+
+    try:
+        src_backend = (
+            _session.workspace_manager.backend if _session.workspace_manager else None
+        )
+
+        # Already on a shell-capable tier — nothing to upgrade (idempotent).
+        if getattr(src_backend, "supports_shell", False):
+            await _ws_send(
+                ws,
+                "workspace_upgrade.complete",
+                {
+                    "thread_id": _thread_id,
+                    "target_tier": target_tier,
+                    "message": "Workspace already supports a shell",
+                },
+            )
+            return
+
+        # 1. Request provisioning via orchestrator (S2).
+        ok = await _orchestrator_client.request_thread_workspace_upgrade(
+            _thread_id, target_tier=target_tier
+        )
+        if not ok:
+            await _ws_send(
+                ws,
+                "workspace_upgrade.failed",
+                {"reason": "Orchestrator rejected workspace upgrade request"},
+            )
+            return
+
+        # 2. Poll for container readiness. _poll_workspace_ready already returns
+        #    the {"backend": "sandbox", "remote": {host, port, ...}} block.
+        ws_config = await _poll_workspace_ready(
+            _orchestrator_client, _thread_id, timeout=300
+        )
+        if not ws_config or not ws_config.get("remote"):
+            await _ws_send(
+                ws,
+                "workspace_upgrade.failed",
+                {"reason": "Workspace did not become ready in time"},
+            )
+            return
+
+        # 3. Build a RemoteBackend from the ready connection block. The sandbox
+        #    keeps sudo_action="freeze" — preserving the existing sandbox→VM
+        #    sudo escalation; only a vm target allows sudo through.
+        from ..core.backends.remote import RemoteBackend
+
+        backend_tier = ws_config.get("backend", "sandbox")
+        remote = ws_config["remote"]
+        shell_config = _session.config.extra.get("shell", {})
+        sudo_action = "allow" if backend_tier == "vm" else "freeze"
+        new_backend = RemoteBackend(
+            host=remote["host"],
+            port=remote.get("port", 30022),
+            username=remote.get("username", "agent-host"),
+            key_path=remote.get("key_path"),
+            workspace_path=remote.get("workspace_path", "/home/agent-host/workspace"),
+            job_id=_thread_id,
+            default_timeout=shell_config.get("default_timeout", 120),
+            max_tabs=shell_config.get("max_tabs", 15),
+            sudo_action=sudo_action,
+        )
+
+        # 4. Connect the new backend now so the SEED copy (next) runs while BOTH
+        #    backends are live — swap_backend would otherwise disconnect the old
+        #    one. swap_backend then sees it connected and skips re-connecting.
+        await asyncio.to_thread(new_backend.connect)
+
+        # 5. Seed the new workspace from the live virtual prefix (S3a). Pure
+        #    in-process copy (the agent holds the object-store creds). Run off
+        #    the event loop — SFTP writes are blocking.
+        seeded = 0
+        if src_backend is not None:
+            from ..core.backends.seed import seed_workspace
+
+            seeded = await asyncio.to_thread(seed_workspace, src_backend, new_backend)
+            logger.info(
+                f"Seeded {seeded} file(s) into upgraded workspace for {_thread_id}"
+            )
+
+        # 6. Hot-swap + re-derive the toolset (S1) so shell/git/file tools
+        #    appear on the next turn (get_current_tools re-reads per turn).
+        _session.swap_backend(new_backend)
+        _session.resetup_tools_for_backend()
+
+        # 7. Persist the new tier (S3b) so the suspend/resume/reconcile
+        #    lifecycle engages and a resumed session re-provisions a sandbox,
+        #    not a virtual. Deep-merged into metadata.config_override; non-fatal.
+        try:
+            await _orchestrator_client.update_thread_config(
+                _thread_id, {"workspace": {"backend": backend_tier}}
+            )
+        except Exception as e:
+            logger.warning(f"Persisting upgraded tier failed (non-fatal): {e}")
+
+        await _ws_send(
+            ws,
+            "workspace_upgrade.complete",
+            {
+                "thread_id": _thread_id,
+                "target_tier": backend_tier,
+                "seeded_files": seeded,
+            },
+        )
+        logger.info(
+            f"Workspace upgrade ({backend_tier}) complete for thread {_thread_id}"
+        )
+
+    except Exception as e:
+        logger.exception(f"Workspace upgrade failed for thread {_thread_id}")
+        await _ws_send(ws, "workspace_upgrade.failed", {"reason": str(e)})
 
 
 async def _poll_vm_ready(

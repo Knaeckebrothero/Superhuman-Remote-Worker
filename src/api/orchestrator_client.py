@@ -351,6 +351,48 @@ class OrchestratorClient:
             logger.error(f"VM upgrade request error: {e}")
             return False
 
+    async def request_thread_workspace_upgrade(
+        self, thread_id: str, target_tier: str = "sandbox"
+    ) -> bool:
+        """Provision a real workspace container for a lite thread (upgrade from
+        ``virtual``/``none`` to the ``sandbox`` tier).
+
+        The session-side analogue of ``request_thread_vm_upgrade``: kicks off
+        container provisioning, after which the caller polls
+        ``get_thread_workspace`` until ready and hot-swaps the backend in place
+        (workspace_tier_upgrade.md §4.2). The ``vm`` tier keeps its own
+        operator-gated ``request_thread_vm_upgrade`` path.
+
+        Returns:
+            True if accepted (or already in progress), False on failure.
+        """
+        if not self._client:
+            await self.connect()
+
+        url = (
+            f"{self.orchestrator_url}"
+            f"/api/agents/threads/{thread_id}/upgrade-to-workspace"
+        )
+        payload = {"target_tier": target_tier}
+
+        try:
+            response = await self._client.post(url, json=payload)
+            if response.status_code == 200:
+                logger.info(
+                    f"Workspace upgrade ({target_tier}) requested for thread "
+                    f"{thread_id}"
+                )
+                return True
+            else:
+                logger.error(
+                    f"Workspace upgrade request failed: "
+                    f"{response.status_code} - {response.text}"
+                )
+                return False
+        except Exception as e:
+            logger.error(f"Workspace upgrade request error: {e}")
+            return False
+
     async def get_thread_workspace(self, thread_id: str) -> dict | None:
         """Poll workspace container status for a thread.
 
