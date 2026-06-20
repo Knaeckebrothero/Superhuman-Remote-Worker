@@ -243,6 +243,14 @@ def create_source_tools(context: ToolContext) -> List[Any]:
                 # snapshot-anchor (drift fingerprint + live pointer) was stashed
                 # at read time — persist it onto the source's metadata.cloud.
                 cloud_anchor = context.get_cloud_anchor(resolved_path)
+                # Phase 3b: snapshot the original bytes to the blob store (via the
+                # orchestrator — the agent has no S3 creds) so the citation has a
+                # "view original" backup. Mutates cloud_anchor with the blob key
+                # before registration; best-effort, never blocks the citation.
+                if cloud_anchor:
+                    await context.snapshot_cloud_source_bytes(
+                        resolved_path, cloud_anchor
+                    )
                 source_id = await context.get_or_register_doc_source(
                     resolved_path,
                     name=Path(document_path).name,
@@ -296,9 +304,13 @@ Status: {status.upper()}
 Similarity Score: {similarity}
 """
             if cloud_anchor:
-                output += (
-                    "Cloud-anchored: yes (original snapshotted for drift detection)\n"
-                )
+                if cloud_anchor.get("snapshot_blob_key"):
+                    output += (
+                        "Cloud-anchored: yes "
+                        "(original snapshotted for drift detection)\n"
+                    )
+                else:
+                    output += "Cloud-anchored: yes (live pointer recorded)\n"
             if result.verification_notes:
                 output += f"\nNote: {result.verification_notes}"
 

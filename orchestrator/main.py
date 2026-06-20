@@ -11505,6 +11505,34 @@ async def list_job_citations(
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
+@app.post("/api/citations/snapshot")
+async def store_citation_snapshot(request: Request) -> dict[str, Any]:
+    """Persist the original bytes of a cited cloud document (Phase 3, D7).
+
+    **Internal** (P4b) — requires ``X-Internal-Key``; the agent calls this at
+    cite-time because it has no S3 credentials of its own. The request body is
+    the raw file bytes; ``content_type`` is an optional query param used when
+    the blob is later served back. Returns a content-addressed
+    ``snapshot_blob_key`` the agent records onto the citation source's
+    ``metadata.cloud`` so the original can be retrieved on view.
+    """
+    await require_internal(request)
+    if not snapshot_service.is_available:
+        raise HTTPException(status_code=503, detail="Snapshot store unavailable")
+    data = await request.body()
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty body")
+    content_type = (
+        request.query_params.get("content_type") or "application/octet-stream"
+    )
+    key = await snapshot_service.save_blob(
+        data, prefix="citations", content_type=content_type
+    )
+    if not key:
+        raise HTTPException(status_code=500, detail="Snapshot store write failed")
+    return {"snapshot_blob_key": key, "size_bytes": len(data)}
+
+
 @app.get("/api/citations/{citation_id}")
 async def get_citation_detail(request: Request, citation_id: int) -> dict[str, Any]:
     """Get full citation record with source info and verification details.
@@ -11548,6 +11576,194 @@ async def get_citation_detail(request: Request, citation_id: int) -> dict[str, A
                     status_code=404, detail=f"Citation {citation_id} not found"
                 )
 
+            return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+def _source_cloud_meta(metadata: Any) -> dict[str, Any]:
+    """Extract the ``metadata.cloud`` block from a ``sources.metadata`` value.
+
+    The vector pool may hand back JSONB as a dict (codec) or a JSON string;
+    coerce both, and return ``{}`` when there's no cloud snapshot-anchor.
+    """
+    if isinstance(metadata, (str, bytes)):
+        try:
+            metadata = json.loads(metadata)
+        except (ValueError, TypeError):
+            return {}
+    if not isinstance(metadata, dict):
+        return {}
+    cloud = metadata.get("cloud")
+    return cloud if isinstance(cloud, dict) else {}
+
+
+def _home_relative_path(anchor_webdav_url: str, home_webdav_url: str) -> Optional[str]:
+    """Path of a cited file relative to the viewing user's home, if it's under it.
+
+    Phase 3c (D7) only re-fetches a cited cloud file for the drift check when it
+    is provably inside the *viewing user's own* cloud home — i.e. the anchor's
+    WebDAV URL starts with the user's home WebDAV URL. Returns the home-relative
+    path (no leading slash) in that case, else ``None`` (→ ``live_state =
+    unreachable``: an external datasource or a different cloud the orchestrator
+    can't fetch on the user's behalf). This both guards against comparing a
+    same-named-but-different file and yields the path for
+    ``get_project_folder_file_bytes``.
+    """
+    if not anchor_webdav_url or not home_webdav_url:
+        return None
+    base = home_webdav_url.rstrip("/")
+    if not anchor_webdav_url.startswith(base):
+        return None
+    return anchor_webdav_url[len(base) :].lstrip("/") or None
+
+
+@app.get("/api/citations/{citation_id}/snapshot")
+async def get_citation_snapshot(request: Request, citation_id: int) -> Response:
+    """Serve the backed-up original bytes of a cited cloud document (Phase 3c, D7).
+
+    Viewing-user auth (same gate as ``get_citation_detail``). Returns the copy
+    SRW stored at cite-time (``metadata.cloud.snapshot_blob_key``) so a citation
+    can show the exact version cited even when the live source changed or is
+    unreachable. 404 if the citation is unknown/unauthorized or has no snapshot
+    (404 over 403 so citation existence isn't leaked by probing).
+    """
+    caller = await require_approved_user(request, postgres_db)
+    try:
+        async with vector_db.acquire() as conn:
+            row = await conn.fetchrow(
+                """SELECT c.job_id, s.name AS source_name, s.metadata
+                   FROM citations c JOIN sources s ON c.source_id = s.id
+                   WHERE c.id = $1""",
+                citation_id,
+            )
+        if not row:
+            raise HTTPException(
+                status_code=404, detail=f"Citation {citation_id} not found"
+            )
+        job_id = row["job_id"]
+        if not await user_can_access_any_job(
+            caller, postgres_db, [str(job_id)] if job_id else []
+        ):
+            raise HTTPException(
+                status_code=404, detail=f"Citation {citation_id} not found"
+            )
+
+        cloud = _source_cloud_meta(row["metadata"])
+        key = cloud.get("snapshot_blob_key")
+        if not key:
+            raise HTTPException(
+                status_code=404, detail="No snapshot stored for this citation"
+            )
+        data = await snapshot_service.get_blob(key)
+        if data is None:
+            raise HTTPException(status_code=404, detail="Snapshot blob not found")
+
+        media_type = cloud.get("content_type") or "application/octet-stream"
+        filename = (row["source_name"] or f"citation-{citation_id}").replace('"', "")
+        return Response(
+            content=data,
+            media_type=media_type,
+            headers={"Content-Disposition": f'inline; filename="{filename}"'},
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/api/citations/{citation_id}/drift")
+async def get_citation_drift(request: Request, citation_id: int) -> dict[str, Any]:
+    """On-view drift check for a cited cloud document (Phase 3c, D7).
+
+    Viewing-user auth. Compares the live source against what was cited. A
+    best-effort re-fetch runs **only** when the cited file is provably inside the
+    viewing user's own cloud home (so the credentials are the user's, never the
+    agent's expired ones, and we never compare a same-named different file).
+    Returns:
+
+    - ``live_state``: ``unchanged`` | ``changed`` | ``unreachable`` | ``unknown``
+    - ``snapshot_available``: whether ``/snapshot`` can serve the backed-up copy
+    - ``cited``: the drift fingerprint captured at cite-time
+
+    ``unreachable`` (external datasource / different cloud / no access) is the
+    spec's "fall back to the snapshot" branch.
+    """
+    caller = await require_approved_user(request, postgres_db)
+    try:
+        async with vector_db.acquire() as conn:
+            row = await conn.fetchrow(
+                """SELECT c.job_id, s.metadata
+                   FROM citations c JOIN sources s ON c.source_id = s.id
+                   WHERE c.id = $1""",
+                citation_id,
+            )
+        if not row:
+            raise HTTPException(
+                status_code=404, detail=f"Citation {citation_id} not found"
+            )
+        job_id = row["job_id"]
+        if not await user_can_access_any_job(
+            caller, postgres_db, [str(job_id)] if job_id else []
+        ):
+            raise HTTPException(
+                status_code=404, detail=f"Citation {citation_id} not found"
+            )
+
+        cloud = _source_cloud_meta(row["metadata"])
+        if not cloud:
+            raise HTTPException(
+                status_code=400, detail="Citation has no cloud source to drift-check"
+            )
+
+        cited_sha = cloud.get("file_sha256")
+        result: dict[str, Any] = {
+            "citation_id": citation_id,
+            "live_state": "unknown",
+            "snapshot_available": bool(cloud.get("snapshot_blob_key")),
+            "cited": {
+                "etag": cloud.get("etag"),
+                "file_sha256": cited_sha,
+                "captured_at": cloud.get("captured_at"),
+                "webdav_url": cloud.get("webdav_url"),
+                "backend": cloud.get("backend"),
+            },
+        }
+
+        # Best-effort live re-fetch via the viewing user's own cloud home.
+        try:
+            backend = main_cloud_router.for_owner(caller)
+            user_id = await backend.resolve_user_identity(
+                email=caller.get("email"),
+                display_name=caller.get("display_name"),
+            )
+            home = await backend.get_user_home(user_id) if user_id else None
+            rel = (
+                _home_relative_path(
+                    cloud.get("webdav_url") or "", home.webdav_url or ""
+                )
+                if home and home.webdav_url
+                else None
+            )
+            if rel is None:
+                result["live_state"] = "unreachable"
+                result["reason"] = "live source not reachable from your account"
+                return result
+            live_bytes = await backend.get_project_folder_file_bytes(
+                home.handle, path=rel
+            )
+            live_sha = hashlib.sha256(live_bytes).hexdigest()
+            result["live"] = {"file_sha256": live_sha, "size_bytes": len(live_bytes)}
+            result["live_state"] = (
+                "unchanged" if cited_sha and live_sha == cited_sha else "changed"
+            )
+            return result
+        except Exception as e:
+            logger.info("Citation %s drift live-fetch unreachable: %s", citation_id, e)
+            result["live_state"] = "unreachable"
+            result["reason"] = "live source could not be fetched"
             return result
     except HTTPException:
         raise

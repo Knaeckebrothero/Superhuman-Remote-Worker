@@ -235,6 +235,68 @@ class SnapshotService:
             )
             return False
 
+    # =========================================================================
+    # Content-addressed blobs (Phase 3, D7 — cited cloud-document snapshots)
+    # =========================================================================
+
+    def _object_exists(self, key: str) -> bool:
+        """True if an object exists at ``key`` (synchronous, run in a thread)."""
+        try:
+            self._s3.head_object(Bucket=self._bucket, Key=key)
+            return True
+        except ClientError as e:
+            code = e.response.get("Error", {}).get("Code", "")
+            if code in ("404", "NoSuchKey", "NotFound"):
+                return False
+            raise
+
+    async def save_blob(
+        self,
+        data: bytes,
+        *,
+        prefix: str = "citations",
+        content_type: str = "application/octet-stream",
+    ) -> Optional[str]:
+        """Store raw bytes content-addressed under ``<prefix>/<sha[:2]>/<sha>``.
+
+        Used to snapshot the original bytes of a cited cloud document so the
+        citation has a durable "view the original" backup (the agent has no S3
+        credentials, so it reaches this via an orchestrator endpoint). Returns
+        the object key, or ``None`` when the store is unavailable or the write
+        fails. Idempotent: identical bytes hash to the same key, and an existing
+        object is not re-uploaded (a cheap HEAD precedes the PUT).
+        """
+        if not self._available or not data:
+            return None
+        sha = hashlib.sha256(data).hexdigest()
+        key = f"{prefix}/{sha[:2]}/{sha}"
+        try:
+            if not await asyncio.to_thread(self._object_exists, key):
+                await asyncio.to_thread(
+                    self._s3.put_object,
+                    Bucket=self._bucket,
+                    Key=key,
+                    Body=data,
+                    ContentType=content_type or "application/octet-stream",
+                )
+            return key
+        except Exception as e:
+            logger.error("save_blob failed (key=%s): %s", key, e)
+            return None
+
+    async def get_blob(self, key: str) -> Optional[bytes]:
+        """Fetch the raw bytes for a blob ``key``; ``None`` if missing/unavailable."""
+        if not self._available or not key:
+            return None
+        try:
+            resp = await asyncio.to_thread(
+                self._s3.get_object, Bucket=self._bucket, Key=key
+            )
+            return await asyncio.to_thread(resp["Body"].read)
+        except Exception as e:
+            logger.debug("get_blob miss (key=%s): %s", key, e)
+            return None
+
     async def capture_vm_snapshot(
         self,
         job_id: str,
