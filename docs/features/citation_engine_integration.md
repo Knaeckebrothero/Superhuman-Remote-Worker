@@ -56,10 +56,16 @@ The feature set and the verification approach are unchanged.
 | **3c** | On-view drift check + view-original: `GET /api/citations/{id}/drift` (viewing-user auth) re-fetches the live source via MainCloud **only when it's provably under the viewer's own cloud home**, hash-compares → `unchanged`/`changed`/`unreachable`; `GET /api/citations/{id}/snapshot` streams the backup via `get_blob`; cockpit UI deferred | ✅ shipped + k3d-verified |
 
 Verified by the gated async Postgres round-trip
-(`tests/citation_engine/test_integration_postgres.py`, 5/5 vs the dev
-`srw_vector`) + unit suites (`tests/test_citation_feedback_injection.py`,
-`TestEditCitationTool`, the graph tests). A full live agent-job run is the
-remaining end-to-end check for the 2b injection.
+(`tests/citation_engine/test_integration_postgres.py`, 6/6 vs the dev
+`srw_vector`, incl. cloud-metadata persistence) + CI unit suites
+(`tests/test_citation_feedback_injection.py`, `tests/test_cloud_citation_anchor.py`,
+`tests/test_citation_snapshot_blob.py`, `tests/test_citation_drift_helpers.py`,
+`TestEditCitationTool`, the graph tests) + live k3d endpoint checks against the
+real orchestrator + MinIO (3b: `POST /api/citations/snapshot` bytes→key→dedup→
+boto3 read-back; 3c: `/snapshot` 200+bytes and `/drift` states + the 401 auth
+gate). The remaining end-to-end check is a full real-cloud agent run — the 2b
+feedback injection in a live job and the 3c `unchanged`/`changed` drift path
+(needs a cited file under the viewing user's own cloud home).
 
 **Deferred follow-ons:** persistent-session feedback injection (sessions already
 *verify* citations; only the feedback inject routes differently — via the
