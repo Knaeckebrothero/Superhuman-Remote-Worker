@@ -50,9 +50,15 @@ import {ViewModeService} from '../../core/services/view-mode.service';
         align-items: center;
         gap: 10px;
         padding: 8px 16px;
-        background: rgba(249, 226, 175, 0.12);
-        border-bottom: 1px solid rgba(249, 226, 175, 0.3);
-        color: var(--warn-color, #f9e2af);
+        /* Use the theme warning tokens. The previous hardcoded #f9e2af is a
+           dark-theme amber and rendered near-invisible (~1.1:1) on light
+           themes, where --warn-color is undefined. */
+        background: var(--warning-tint);
+        border-bottom: 1px solid color-mix(in srgb, var(--warning) 30%, transparent);
+        /* Mix toward the theme text color so the amber clears WCAG AA (4.5:1)
+           on the light tint; mixing toward --text-primary raises contrast in
+           both light and dark themes. */
+        color: color-mix(in srgb, var(--warning) 55%, var(--text-primary));
         font-size: 13px;
         line-height: 1.4;
         flex-shrink: 0;

@@ -94,6 +94,10 @@
         font-size: 14px;
         font-weight: 600;
         color: var(--text-primary);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        min-width: 0;
       }
 
       .header-session-id {
@@ -1996,6 +2000,22 @@
           flex-wrap: wrap;
           gap: 4px;
           padding: 6px 8px;
+        }
+
+        /* Let the title take the available width on one line (it was wrapping
+           to ~3 lines). The 8-char session id is redundant on a phone. */
+        .header-left {
+          flex: 1;
+          min-width: 0;
+        }
+
+        .header-title {
+          flex: 1;
+          min-width: 0;
+        }
+
+        .header-session-id {
+          display: none;
         }
 
         .messages {
