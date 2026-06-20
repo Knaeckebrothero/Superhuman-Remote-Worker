@@ -2636,7 +2636,11 @@ async def _enforce_workspace_upgrade_grants(
     Raises ``HTTPException(403)`` on violation. No new grant key, no
     sandbox-specific rule — identical to dispatch-time enforcement.
     """
+    # thread["user_id"] comes back from asyncpg as a UUID object; get_user (and
+    # _enforce_dispatch_grants below) expect a string — coerce once, matching the
+    # str(user["id"]) convention used elsewhere.
     owner_id = thread.get("user_id")
+    owner_id = str(owner_id) if owner_id is not None else None
     owner = await postgres_db.get_user(owner_id) if owner_id else None
 
     # vm keeps its operator gate (global kill-switch + can_use_vm), on top of the
@@ -13166,6 +13170,13 @@ async def agent_upgrade_thread_to_vm(
     if not thread:
         raise HTTPException(status_code=404, detail="Thread not found")
 
+    # Sec-1 — authorize BEFORE provisioning (fail-closed). This endpoint is the
+    # target of both the sandbox→VM sudo path and the lite→vm delegation from
+    # /upgrade-to-workspace; it previously ran ungated. The shared gate enforces
+    # the global vm_workspaces kill-switch + per-user can_use_vm + the
+    # vm_workspace PDP grant (workspace_tier_upgrade.md §4.4 Sec-1 / Phase 2).
+    await _enforce_workspace_upgrade_grants(thread, target_tier="vm")
+
     if not vm_provisioner.is_available:
         raise HTTPException(
             status_code=503,
@@ -13225,19 +13236,31 @@ async def agent_upgrade_thread_to_workspace(
     never drops. Idempotent: a second call while a container is already
     provisioning/ready is a no-op.
 
-    ``vm`` targets keep their own operator-gated path (``/upgrade-to-vm``); this
-    endpoint handles the container tier only.
+    ``vm`` targets (workspace_tier_upgrade.md Phase 2) are delegated to the
+    operator-gated VM path (``/upgrade-to-vm``): same grant gate, but provisions
+    a KubeVirt VM and records ``metadata.vm``. The agent polls vm readiness and
+    hot-swaps in place just like the container tier.
     """
     await require_internal(request)
     target_tier = (body.target_tier if body else "sandbox") or "sandbox"
-    if target_tier != "sandbox":
+    if target_tier not in ("sandbox", "vm"):
         raise HTTPException(
             status_code=400,
             detail=(
-                f"upgrade-to-workspace handles target_tier='sandbox'; got "
-                f"{target_tier!r} (use /upgrade-to-vm for the vm tier)"
+                f"upgrade-to-workspace supports target_tier 'sandbox' or 'vm'; "
+                f"got {target_tier!r}"
             ),
         )
+
+    # vm targets reuse the operator-gated VM provisioning path: it runs the same
+    # _enforce_workspace_upgrade_grants gate, provisions the VM, and records
+    # metadata.vm. The agent then polls vm readiness and hot-swaps in place
+    # exactly like the sandbox path — the swap handler (_handle_workspace_upgrade)
+    # is tier-agnostic and sets sudo_action="allow" for a vm backend
+    # (workspace_tier_upgrade.md Phase 2). Keeping a single client method +
+    # endpoint means the agent stays uniform across tiers.
+    if target_tier == "vm":
+        return await agent_upgrade_thread_to_vm(request, thread_id)
 
     thread = await postgres_db.get_thread(thread_id)
     if not thread:

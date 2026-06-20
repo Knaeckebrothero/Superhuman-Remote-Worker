@@ -1485,14 +1485,24 @@ export class PersistentChatService {
                 this._sendControl({method: 'undo'});
                 this._systemMessage('Undoing last file changes...');
                 return true;
-            case '/upgrade-workspace':
-                // Lite (virtual) -> sandbox upgrade: provisions a real
-                // workspace container, seeds it, and hot-swaps in place so
-                // shell/git/file tools become available without dropping the
-                // conversation (workspace_tier_upgrade.md §4.2 S3).
-                this._sendControl({method: 'upgrade-to-workspace', target_tier: 'sandbox'});
-                this._systemMessage('Provisioning workspace, please wait...');
+            case '/upgrade-workspace': {
+                // Lite (virtual) -> sandbox|vm upgrade: provisions a real
+                // workspace, seeds it from the live object-store prefix, and
+                // hot-swaps in place so shell/git/file tools become available
+                // without dropping the conversation (workspace_tier_upgrade.md
+                // §4.2 S3 / Phase 2). `/upgrade-workspace vm` is the explicit
+                // human-intent trigger for the privileged tier — the server
+                // still gates it (can_use_vm + global kill-switch); sandbox is
+                // the default.
+                const tier = arg.trim().toLowerCase() === 'vm' ? 'vm' : 'sandbox';
+                this._sendControl({method: 'upgrade-to-workspace', target_tier: tier});
+                this._systemMessage(
+                    tier === 'vm'
+                        ? 'Provisioning a VM workspace (requires approval), please wait...'
+                        : 'Provisioning workspace, please wait...',
+                );
                 return true;
+            }
             default:
                 return false;
         }
@@ -2025,18 +2035,23 @@ export class PersistentChatService {
                 );
                 break;
 
-            case 'workspace_upgrade.needed':
+            case 'workspace_upgrade.needed': {
                 // The agent called request_workspace_upgrade — offer the upgrade
                 // (HITL: a human accepts before anything provisions). The minimal
                 // accept path is the /upgrade-workspace slash command, which sends
-                // the same upgrade-to-workspace control message.
+                // the same upgrade-to-workspace control message. Honor the offered
+                // tier (`vm` would need `/upgrade-workspace vm`); the tool only
+                // requests `sandbox` today.
+                const tier = (params['target_tier'] as string) || 'sandbox';
+                const accept = tier === 'vm' ? '/upgrade-workspace vm' : '/upgrade-workspace';
                 this._systemMessage(
                     `The agent requested a real workspace: `
                     + `${(params['reason'] as string) || 'shell/git tools needed'}. `
-                    + `Send /upgrade-workspace to provision a sandbox `
+                    + `Send ${accept} to provision a ${tier} `
                     + `(your files carry over).`,
                 );
                 break;
+            }
 
             case 'workspace_upgrade.started':
                 this._systemMessage('Provisioning workspace, please wait...');

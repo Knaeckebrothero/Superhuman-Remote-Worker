@@ -1539,6 +1539,20 @@ describe('PersistentChatService — control WS (slash commands + permissions)', 
         expect(sent).toContainEqual({method: 'undo'});
     });
 
+    it('/upgrade-workspace defaults to the sandbox tier', async () => {
+        const ctx = await readySession();
+        await ctx.service.sendMessage('/upgrade-workspace');
+        const sent = ctx.wsInstances[0].send.mock.calls.map((c: any) => JSON.parse(c[0]));
+        expect(sent).toContainEqual({method: 'upgrade-to-workspace', target_tier: 'sandbox'});
+    });
+
+    it('/upgrade-workspace vm requests the vm tier (Phase 2, server-gated)', async () => {
+        const ctx = await readySession();
+        await ctx.service.sendMessage('/upgrade-workspace vm');
+        const sent = ctx.wsInstances[0].send.mock.calls.map((c: any) => JSON.parse(c[0]));
+        expect(sent).toContainEqual({method: 'upgrade-to-workspace', target_tier: 'vm'});
+    });
+
     it('setMode mutates the signal and sends mode.set', async () => {
         const ctx = await readySession();
         ctx.service.setMode('auto_accept');
