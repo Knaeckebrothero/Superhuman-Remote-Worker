@@ -13,6 +13,7 @@ import {AppChipComponent} from '../../ui/chip';
 import {AppInputComponent} from '../../ui/input';
 import {AppSpinnerComponent} from '../../ui/spinner';
 import {AppIconComponent} from '../../ui/icon';
+import {AppDialogComponent} from '../../ui/dialog';
 type StatusFilter = 'all' | JobStatus;
 
 /** A row in the hierarchical job list. */
@@ -37,6 +38,7 @@ interface JobRow {
     AppInputComponent,
     AppSpinnerComponent,
     AppIconComponent,
+    AppDialogComponent,
   ],
   template: `
     <div class="job-list-container">
@@ -252,35 +254,19 @@ interface JobRow {
                       </app-button>
                     }
                     @if (row.job.status !== 'completed' && row.job.status !== 'cancelled') {
-                      @if (confirmingCancelId() === row.job.id) {
-                        <app-button
-                          variant="danger"
-                          size="sm"
-                          [loading]="cancelingJobIds().has(row.job.id)"
-                          [ariaLabel]="'jobs.tooltip.confirmCancel' | transloco"
-                          (clicked)="cancelJob(row.job.id); $event.stopPropagation()"
-                        >
-                          @if (cancelingJobIds().has(row.job.id)) {
-                            {{ 'jobs.action.canceling' | transloco }}
-                          } @else {
-                            {{ 'jobs.action.sure' | transloco }}
-                          }
-                        </app-button>
-                      } @else {
-                        <app-button
-                          variant="warning"
-                          size="sm"
-                          [loading]="cancelingJobIds().has(row.job.id)"
-                          [ariaLabel]="'jobs.tooltip.cancelJob' | transloco"
-                          (clicked)="confirmCancel(row.job.id); $event.stopPropagation()"
-                        >
-                          @if (cancelingJobIds().has(row.job.id)) {
-                            {{ 'jobs.action.canceling' | transloco }}
-                          } @else {
-                            {{ 'jobs.action.cancel' | transloco }}
-                          }
-                        </app-button>
-                      }
+                      <app-button
+                        variant="warning"
+                        size="sm"
+                        [loading]="cancelingJobIds().has(row.job.id)"
+                        [ariaLabel]="'jobs.tooltip.cancelJob' | transloco"
+                        (clicked)="askCancel(row.job); $event.stopPropagation()"
+                      >
+                        @if (cancelingJobIds().has(row.job.id)) {
+                          {{ 'jobs.action.canceling' | transloco }}
+                        } @else {
+                          {{ 'jobs.action.cancel' | transloco }}
+                        }
+                      </app-button>
                     }
                     @if (row.job.status === 'completed' && !row.job.project_id) {
                       <app-button
@@ -313,14 +299,10 @@ interface JobRow {
                       <app-button
                         variant="danger"
                         size="sm"
-                        [ariaLabel]="(confirmingDeleteId() === row.job.id ? 'jobs.tooltip.confirmDelete' : 'jobs.tooltip.deleteJob') | transloco"
-                        (clicked)="confirmingDeleteId() === row.job.id ? deleteJob(row.job.id) : confirmDelete(row.job.id); $event.stopPropagation()"
+                        [ariaLabel]="'jobs.tooltip.deleteJob' | transloco"
+                        (clicked)="askDelete(row.job); $event.stopPropagation()"
                       >
-                        @if (confirmingDeleteId() === row.job.id) {
-                          {{ 'jobs.action.confirmDelete' | transloco }}
-                        } @else {
-                          {{ 'jobs.action.delete' | transloco }}
-                        }
+                        {{ 'jobs.action.delete' | transloco }}
                       </app-button>
                     }
                   </td>
@@ -378,6 +360,42 @@ interface JobRow {
           {{ 'jobs.count' | transloco:{ filtered: filteredJobs().length, total: jobs().length } }}
         </span>
       </div>
+
+      <!-- Confirm delete — themed dialog (replaces the old inline two-tap; mirrors Sessions). -->
+      <app-dialog
+        [open]="confirmDeleteOpen()"
+        [title]="'jobs.confirmDelete' | transloco"
+        size="sm"
+        (closed)="confirmDeleteOpen.set(false)"
+      >
+        {{ pendingJob()?.description }}
+        <div appDialogActions>
+          <app-button variant="secondary" (clicked)="confirmDeleteOpen.set(false)">
+            {{ 'common.cancel' | transloco }}
+          </app-button>
+          <app-button variant="danger" (clicked)="onConfirmDelete()">
+            {{ 'common.delete' | transloco }}
+          </app-button>
+        </div>
+      </app-dialog>
+
+      <!-- Confirm cancel — themed dialog. -->
+      <app-dialog
+        [open]="confirmCancelOpen()"
+        [title]="'jobs.confirmCancel' | transloco"
+        size="sm"
+        (closed)="confirmCancelOpen.set(false)"
+      >
+        {{ 'jobs.confirmCancelHint' | transloco }}
+        <div appDialogActions>
+          <app-button variant="secondary" (clicked)="confirmCancelOpen.set(false)">
+            {{ 'jobs.confirmCancelDismiss' | transloco }}
+          </app-button>
+          <app-button variant="warning" (clicked)="onConfirmCancel()">
+            {{ 'jobs.confirmCancelConfirm' | transloco }}
+          </app-button>
+        </div>
+      </app-dialog>
     </div>
   `,
   styles: [
@@ -741,8 +759,11 @@ interface JobRow {
           table-layout: fixed;
         }
 
+        /* Give actions more width so the buttons pack into ~2 rows instead of 3
+           (shorter rows, more jobs per screen). The prompt can spare it now that
+           it wraps to two lines. */
         .col-prompt {
-          width: 40%;
+          width: 33%;
         }
 
         .col-status {
@@ -750,15 +771,38 @@ interface JobRow {
         }
 
         .col-actions {
-          width: 35%;
+          width: 42%;
         }
 
-        .actions-cell {
-          white-space: normal;
-        }
-
+        /* Job description: the only identifier on mobile (id + created columns
+           are hidden), so let it wrap to two lines instead of a ~15-char
+           single-line ellipsis. */
         .prompt-text {
           font-size: 11px;
+          flex: 1;
+          min-width: 0;
+          white-space: normal;
+          overflow: hidden;
+          display: -webkit-box;
+          -webkit-line-clamp: 2;
+          -webkit-box-orient: vertical;
+        }
+
+        /* Actions: left-aligned wrapping group. Right-alignment (the base rule)
+           is what made wrapped rows ragged — each row right-aligned to a
+           different left edge, producing the "staircase". Left-aligned rows
+           share one left edge and read as a tidy block. */
+        .actions-cell {
+          white-space: normal;
+          text-align: left;
+        }
+
+        .actions-cell app-button {
+          margin: 0 4px 4px 0;
+        }
+
+        .actions-cell app-button + app-button {
+          margin-left: 0;
         }
 
         .header-bar {
@@ -766,8 +810,24 @@ interface JobRow {
           gap: 6px;
         }
 
+        /* Filter chips: a single horizontally-scrollable row instead of wrapping
+           to three rows (~102px). Takes a full header line and scrolls sideways. */
         .filter-chips {
-          gap: 3px;
+          gap: 6px;
+          flex-wrap: nowrap;
+          flex-basis: 100%;
+          overflow-x: auto;
+          -webkit-overflow-scrolling: touch;
+          scrollbar-width: none;
+          padding-bottom: 2px;
+        }
+
+        .filter-chips::-webkit-scrollbar {
+          display: none;
+        }
+
+        .filter-chips app-chip {
+          flex-shrink: 0;
         }
 
         .table-container {
@@ -799,10 +859,11 @@ export class JobListComponent implements OnInit, OnDestroy {
   readonly ideLoadingJobIds = signal<Set<string>>(new Set());
   private idePollingIntervals = new Map<string, ReturnType<typeof setInterval>>();
 
-  // Inline confirmation state
-  readonly confirmingDeleteId = signal<string | null>(null);
-  readonly confirmingCancelId = signal<string | null>(null);
-  private confirmTimeout: ReturnType<typeof setTimeout> | null = null;
+  // Themed confirm-dialog state (delete + cancel), replacing the old inline
+  // two-tap confirms — consistent with the Sessions page.
+  readonly confirmDeleteOpen = signal(false);
+  readonly confirmCancelOpen = signal(false);
+  readonly pendingJob = signal<JobSummary | null>(null);
 
   // Promote form state
   readonly promoteJobId = signal<string | null>(null);
@@ -1130,7 +1191,6 @@ export class JobListComponent implements OnInit, OnDestroy {
   }
 
   cancelJob(jobId: string): void {
-    this.clearConfirmations();
     const next = new Set(this.cancelingJobIds());
     next.add(jobId);
     this.cancelingJobIds.set(next);
@@ -1158,29 +1218,29 @@ export class JobListComponent implements OnInit, OnDestroy {
     });
   }
 
-  confirmDelete(jobId: string): void {
-    this.clearConfirmations();
-    this.confirmingDeleteId.set(jobId);
-    this.confirmTimeout = setTimeout(() => this.clearConfirmations(), 3000);
+  askDelete(job: JobSummary): void {
+    this.pendingJob.set(job);
+    this.confirmDeleteOpen.set(true);
   }
 
-  confirmCancel(jobId: string): void {
-    this.clearConfirmations();
-    this.confirmingCancelId.set(jobId);
-    this.confirmTimeout = setTimeout(() => this.clearConfirmations(), 3000);
+  askCancel(job: JobSummary): void {
+    this.pendingJob.set(job);
+    this.confirmCancelOpen.set(true);
   }
 
-  private clearConfirmations(): void {
-    this.confirmingDeleteId.set(null);
-    this.confirmingCancelId.set(null);
-    if (this.confirmTimeout) {
-      clearTimeout(this.confirmTimeout);
-      this.confirmTimeout = null;
-    }
+  onConfirmDelete(): void {
+    const job = this.pendingJob();
+    this.confirmDeleteOpen.set(false);
+    if (job) this.deleteJob(job.id);
+  }
+
+  onConfirmCancel(): void {
+    const job = this.pendingJob();
+    this.confirmCancelOpen.set(false);
+    if (job) this.cancelJob(job.id);
   }
 
   deleteJob(jobId: string): void {
-    this.clearConfirmations();
     this.api.deleteJob(jobId).subscribe((result) => {
       if (result) {
         this.refresh();
