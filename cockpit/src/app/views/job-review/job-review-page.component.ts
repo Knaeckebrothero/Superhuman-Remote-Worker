@@ -228,7 +228,9 @@ function relativeTime(iso: string | null | undefined, nowLabel: string): string 
         letter-spacing: 0.5px;
         font-weight: 600;
         font-size: 10px;
-        color: var(--warning-color, #f9e2af);
+        /* Theme token (was the non-existent --warning-color → invisible #f9e2af
+           fallback on the light theme). Mixed toward text for WCAG AA at 10px. */
+        color: color-mix(in srgb, var(--warning) 55%, var(--text-primary));
       }
 
       .item-time {

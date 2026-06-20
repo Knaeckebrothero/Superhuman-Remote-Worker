@@ -32,7 +32,13 @@
     // Without this, the literal text (e.g. "settings") flashes before glyphs
     // arrive — visible as broken `.notdef` boxes in the UI.
     (function () {
-      function markLoaded() { document.body.classList.add('fonts-loaded'); }
+      function markLoaded() {
+        // When the font is already cached, document.fonts.load() resolves in a
+        // microtask that runs before <body> is parsed — document.body is null.
+        // Guard and defer to DOMContentLoaded in that case.
+        if (document.body) { document.body.classList.add('fonts-loaded'); }
+        else { document.addEventListener('DOMContentLoaded', markLoaded, { once: true }); }
+      }
       if (document.fonts && document.fonts.load) {
         document.fonts.load('1em "Material Symbols Outlined"')
           .then(markLoaded)

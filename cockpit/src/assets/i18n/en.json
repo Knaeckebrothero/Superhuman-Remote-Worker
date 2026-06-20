@@ -251,6 +251,11 @@
   },
   "jobs": {
     "title": "Jobs",
+    "confirmDelete": "Delete this job permanently?",
+    "confirmCancel": "Cancel this job?",
+    "confirmCancelHint": "You can resume it later from a checkpoint.",
+    "confirmCancelDismiss": "Keep running",
+    "confirmCancelConfirm": "Cancel job",
     "loading": "Loading jobs...",
     "refresh": "Refresh",
     "newJob": "New Job",
