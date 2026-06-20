@@ -4,46 +4,31 @@ Citation & Provenance Engine
 A structured citation system for AI agents that forces articulation of
 claim-to-source relationships and enables verification.
 
+Native Superhuman-Remote-Worker subsystem: the engine is async and runs against
+SRW's shared vector store (``srw_vector``) through the agent's asyncpg pool. It
+has no standalone/SQLite mode and owns no database connection of its own — the
+host's ``orchestrator/database/migrations/vector/`` owns the schema, and the
+agent injects the vector ``PostgresDB`` pool at construction.
+
+See ``docs/features/citation_engine_integration.md``.
+
 Usage:
-    from citation_engine import CitationEngine
+    from citation_engine import CitationEngine, CitationContext
 
-    # Basic mode (SQLite)
-    engine = CitationEngine(mode="basic", db_path="./citations.db")
-
-    # Multi-agent mode (PostgreSQL)
-    engine = CitationEngine(mode="multi-agent")  # Uses CITATION_DB_URL env var
-
-    with engine:
-        # Register sources
-        pdf_source = engine.add_doc_source("./document.pdf", name="My Document")
-
-        # Create citations
-        result = engine.cite_doc(
-            claim="The regulation requires X",
-            source_id=pdf_source.id,
-            quote_context="Full paragraph containing the quote...",
-            verbatim_quote="The exact text being cited",
-            locator={"page": 24, "section": "§ 8.1"}
-        )
-
-        if result.verification_status == "verified":
-            print(f"Citation [{result.citation_id}] verified!")
-
-Environment Variables:
-    CITATION_DB_URL: PostgreSQL connection string (multi-agent mode)
-    CITATION_LLM_URL: Custom LLM endpoint (e.g., llama.cpp server)
-    CITATION_REASONING_REQUIRED: none | low | medium | high (default: low)
-
-Author: Claude Code Assistant
-Version: 0.1.0
+    engine = CitationEngine(db=agent.vector_conn, context=ctx)
+    source = await engine.add_doc_source("./document.pdf", name="My Document")
+    result = await engine.cite_doc(
+        claim="The regulation requires X",
+        source_id=source.id,
+        quote_context="Full paragraph containing the quote...",
+        verbatim_quote="The exact text being cited",
+        locator={"page": 24, "section": "§ 8.1"},
+    )
+    if result.verification_status == VerificationStatus.VERIFIED:
+        print(f"Citation [{result.citation_id}] verified!")
 """
 
 from .chunking import SemanticChunker
-from .embeddings import (
-    EmbeddingService,
-    EmbeddingServiceError,
-    EmbeddingServiceNotConfigured,
-)
 from .engine import CitationEngine
 from .models import (
     Annotation,
@@ -63,13 +48,8 @@ from .models import (
     VerificationResult,
     VerificationStatus,
 )
-from .schema import (
-    SCHEMA_VERSION,
-    get_current_schema_version,
-    get_schema,
-)
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 __all__ = [
     # Core engine
     "CitationEngine",
@@ -93,22 +73,6 @@ __all__ = [
     # Search
     "SearchResult",
     "SearchResults",
-    # Embedding & chunking
-    "EmbeddingService",
-    "EmbeddingServiceError",
-    "EmbeddingServiceNotConfigured",
+    # Chunking
     "SemanticChunker",
-    # Schema utilities
-    "get_schema",
-    "get_current_schema_version",
-    "SCHEMA_VERSION",
 ]
-
-# Optional imports - only available if langchain/pydantic are installed
-try:
-    from .tool import CitationTool, create_citation_tools  # noqa: F401
-
-    __all__.extend(["create_citation_tools", "CitationTool"])
-except ImportError:
-    # Tools not available without pydantic/langchain
-    pass

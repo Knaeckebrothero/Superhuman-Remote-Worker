@@ -447,14 +447,12 @@ services:
       # Browser automation
       BROWSER_LLM_MODEL: ${BROWSER_LLM_MODEL:-gpt-4o-mini}
       BROWSER_LLM_BASE_URL: ${BROWSER_LLM_BASE_URL:-}
-      # Citation Engine
-      CITATION_DB_URL: postgresql://${VECTOR_POSTGRES_USER:-srw}:${VECTOR_POSTGRES_PASSWORD:-srw_password}@postgres-vector:5432/${VECTOR_POSTGRES_DB:-srw_vector}
+      # Citation Engine — uses the shared vector store (VECTOR_POSTGRES_*) +
+      # SRW's EMBEDDING_* service; no separate citation DB or embedding config.
+      # Only the verifier LLM config remains (moves to the aux model in Phase 2).
       CITATION_LLM_URL: ${CITATION_LLM_URL:-}
       CITATION_LLM_MODEL: ${CITATION_LLM_MODEL:-gpt-4o}
       CITATION_REASONING_LEVEL: ${CITATION_REASONING_LEVEL:-high}
-      CITATION_EMBEDDING_MODEL: ${CITATION_EMBEDDING_MODEL:-qwen3-embedding-8b}
-      CITATION_EMBEDDING_URL: ${CITATION_EMBEDDING_URL:-}
-      CITATION_EMBEDDING_KEY: ${CITATION_EMBEDDING_KEY:-}
       # Embedding routing
       EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
       EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-}

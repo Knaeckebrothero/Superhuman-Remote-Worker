@@ -495,7 +495,7 @@ databases:
     externalUrl: ""
     # -- Auth credentials for the bundled Neo4j: both NEO4J_USERNAME and
     # NEO4J_PASSWORD live in the Secret (Vault), mirroring how the
-    # POSTGRES_USER / VECTOR_POSTGRES_USER / CITATION_POSTGRES_USER pairs
+    # POSTGRES_USER / VECTOR_POSTGRES_USER pairs
     # work — there is no chart-level value for the username. Community
     # edition allows only "neo4j"; enterprise can admit a different name,
     # but in either case the value is set via Vault, not values.yaml.
@@ -1128,13 +1128,12 @@ llm:
 # =============================================================================
 # Citation Engine
 # =============================================================================
-# NOTE: `llmUrl` / `llmModel` / `reasoningLevel` moved to the DB-backed LLM
-# config. The orchestrator passes resolved values through job
-# `config_override` at dispatch; the agent no longer reads CITATION_LLM_MODEL
-# / CITATION_LLM_URL from env. Embedding model/URL stay here for now.
-citation:
-  embeddingModel: "qwen3-embedding-8b"
-  embeddingUrl: ""
+# The citation engine is a native SRW subsystem: it uses the agent's shared
+# vector store (VECTOR_POSTGRES_*) for storage and SRW's EMBEDDING_* service
+# for embeddings — no separate citation DB, role, or embedding config.
+# `llmUrl` / `llmModel` / `reasoningLevel` for the verifier are passed via job
+# `config_override` at dispatch (default set in Admin → Models). See
+# docs/features/citation_engine_integration.md.
 
 # =============================================================================
 # Email / Notifications

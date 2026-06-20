@@ -1418,30 +1418,32 @@ class TestEditFileTool:
 
 
 class TestEditCitationTool:
-    """Tests for the edit_citation tool."""
+    """Tests for the edit_citation tool.
+
+    edit_citation now routes through the engine's job-scoped
+    ``edit_citation`` on the vector store (not ``context.db.citations.edit``,
+    which targeted the main app DB where citations don't live).
+    """
 
     @pytest.fixture
-    def mock_db(self):
-        """Create a mock database with citations namespace."""
-        db = MagicMock()
-        db.citations = MagicMock()
-        return db
+    def mock_engine(self):
+        """CitationEngine mock with an async edit_citation."""
+        engine = MagicMock()
+        engine.edit_citation = AsyncMock(return_value=None)
+        return engine
 
     @pytest.fixture
-    def edit_tool(self, workspace_manager, mock_db):
+    def edit_tool(self, workspace_manager, mock_engine):
         """Create citation tools and return the edit_citation tool."""
         from src.tools.citation import create_citation_tools
         from src.tools.context import ToolContext
 
         ctx = ToolContext(
             workspace_manager=workspace_manager,
-            postgres_db=mock_db,
             _job_id="test-job-123",
         )
-        # Pre-set a mock citation engine so get_citation_engine() doesn't
-        # try to connect to a real database via CITATION_DB_URL.
-        mock_engine = MagicMock()
-        mock_engine.get_citation.return_value = {"id": 1}
+        # Pre-set the engine so get_citation_engine() returns it without
+        # needing a real vector pool.
         ctx.citation_engine = mock_engine
         tools = create_citation_tools(ctx)
         for t in tools:
@@ -1450,10 +1452,8 @@ class TestEditCitationTool:
         pytest.fail("edit_citation tool not found in citation tools")
 
     @pytest.mark.asyncio
-    async def test_edit_claim(self, edit_tool, mock_db):
+    async def test_edit_claim(self, edit_tool, mock_engine):
         """Test successful edit of claim field."""
-        mock_db.citations.edit = AsyncMock(return_value=None)
-
         result = await edit_tool.ainvoke(
             {
                 "citation_id": 1,
@@ -1463,13 +1463,15 @@ class TestEditCitationTool:
 
         assert "ok: edited citation [1]" in result
         assert "verification_status reset" in result
-        mock_db.citations.edit.assert_called_once()
-        assert mock_db.citations.edit.call_args.kwargs["claim"] == "Updated claim text"
+        mock_engine.edit_citation.assert_called_once()
+        assert (
+            mock_engine.edit_citation.call_args.kwargs["claim"] == "Updated claim text"
+        )
 
     @pytest.mark.asyncio
-    async def test_edit_not_found(self, edit_tool, mock_db):
-        """Test error when citation is not found."""
-        mock_db.citations.edit = AsyncMock(
+    async def test_edit_not_found(self, edit_tool, mock_engine):
+        """Test error when citation is not found (engine raises ValueError)."""
+        mock_engine.edit_citation = AsyncMock(
             side_effect=ValueError("Citation 999 not found")
         )
 
@@ -1484,10 +1486,8 @@ class TestEditCitationTool:
         assert "not found" in result
 
     @pytest.mark.asyncio
-    async def test_content_edit_resets_verification(self, edit_tool, mock_db):
+    async def test_content_edit_resets_verification(self, edit_tool, mock_engine):
         """Test that editing content fields triggers verification reset message."""
-        mock_db.citations.edit = AsyncMock(return_value=None)
-
         result = await edit_tool.ainvoke(
             {
                 "citation_id": 1,
@@ -1498,10 +1498,10 @@ class TestEditCitationTool:
         assert "verification_status reset to 'pending'" in result
 
     @pytest.mark.asyncio
-    async def test_non_content_edit_preserves_verification(self, edit_tool, mock_db):
+    async def test_non_content_edit_preserves_verification(
+        self, edit_tool, mock_engine
+    ):
         """Test that editing non-content fields does not mention verification reset."""
-        mock_db.citations.edit = AsyncMock(return_value=None)
-
         result = await edit_tool.ainvoke(
             {
                 "citation_id": 1,
@@ -1513,7 +1513,7 @@ class TestEditCitationTool:
         assert "verification_status reset" not in result
 
     @pytest.mark.asyncio
-    async def test_edit_no_fields(self, edit_tool, mock_db):
+    async def test_edit_no_fields(self, edit_tool):
         """Test error when no fields are provided."""
         result = await edit_tool.ainvoke(
             {
@@ -1525,7 +1525,7 @@ class TestEditCitationTool:
         assert "no fields" in result
 
     @pytest.mark.asyncio
-    async def test_edit_invalid_locator_json(self, edit_tool, mock_db):
+    async def test_edit_invalid_locator_json(self, edit_tool):
         """Test error when locator is not valid JSON."""
         result = await edit_tool.ainvoke(
             {

@@ -197,7 +197,7 @@ def create_source_tools(context: ToolContext) -> List[Any]:
         return path
 
     @tool
-    def cite_document(
+    async def cite_document(
         text: str,
         document_path: str,
         page: Optional[int] = None,
@@ -238,7 +238,7 @@ def create_source_tools(context: ToolContext) -> List[Any]:
             # Register source and create citation
             try:
                 resolved_path = resolve_path(document_path)
-                source_id = context.get_or_register_doc_source(
+                source_id = await context.get_or_register_doc_source(
                     resolved_path, name=Path(document_path).name
                 )
             except FileNotFoundError:
@@ -260,7 +260,7 @@ def create_source_tools(context: ToolContext) -> List[Any]:
             # Create the citation
             engine = context.get_citation_engine()
             effective_claim = claim or f"Evidence from document: {text[:100]}..."
-            result = engine.cite_doc(
+            result = await engine.cite_doc(
                 claim=effective_claim,
                 source_id=source_id,
                 quote_context=text,
@@ -300,7 +300,7 @@ Similarity Score: {similarity}
             return f"Error creating citation: {str(e)}"
 
     @tool
-    def cite_web(
+    async def cite_web(
         text: str,
         url: str,
         title: Optional[str] = None,
@@ -343,7 +343,7 @@ Similarity Score: {similarity}
 
             # Register source and create citation
             try:
-                source_id, fetch_error = context.get_or_register_web_source(
+                source_id, fetch_error = await context.get_or_register_web_source(
                     url, name=title
                 )
             except Exception as e:
@@ -367,7 +367,7 @@ Similarity Score: {similarity}
             # Create the citation
             engine = context.get_citation_engine()
             effective_claim = claim or f"Information from web source: {text[:100]}..."
-            result = engine.cite_web(
+            result = await engine.cite_web(
                 claim=effective_claim,
                 source_id=source_id,
                 quote_context=text,
@@ -407,7 +407,7 @@ Similarity Score: {similarity}
             return f"Error creating web citation: {str(e)}"
 
     @tool
-    def list_sources() -> str:
+    async def list_sources() -> str:
         """List citation sources registered by this job.
 
         Shows document, web, database, and custom sources that have been
@@ -425,7 +425,7 @@ Similarity Score: {similarity}
 
             engine = context.get_citation_engine()
             # list_sources() now filters by job_id from context automatically
-            sources = engine.list_sources()
+            sources = await engine.list_sources()
 
             if not sources:
                 return "No sources registered yet. Use cite_document or cite_web to register sources."
@@ -441,7 +441,7 @@ Similarity Score: {similarity}
             return f"Error listing sources: {str(e)}"
 
     @tool
-    def get_citation(citation_id: int) -> str:
+    async def get_citation(citation_id: int) -> str:
         """Get details about a specific citation from this job.
 
         Retrieves the full citation record including claim, source, verification
@@ -463,12 +463,12 @@ Similarity Score: {similarity}
 
             engine = context.get_citation_engine()
             # get_citation() now filters by job_id from context automatically
-            citation = engine.get_citation(citation_id)
+            citation = await engine.get_citation(citation_id)
 
             if not citation:
                 return f"Citation [{citation_id}] not found."
 
-            source = engine.get_source(citation.source_id)
+            source = await engine.get_source(citation.source_id)
 
             similarity = (
                 f"{citation.similarity_score:.2f}"
@@ -527,7 +527,7 @@ Similarity Score: {similarity}
             return f"Error getting citation: {str(e)}"
 
     @tool
-    def list_citations(
+    async def list_citations(
         source_id: Optional[int] = None, status: Optional[str] = None
     ) -> str:
         """List citations created by this job.
@@ -552,7 +552,7 @@ Similarity Score: {similarity}
             engine = context.get_citation_engine()
             # list_citations() now filters by job_id from context automatically
             # Pass filters directly to engine for efficiency
-            citations = engine.list_citations(
+            citations = await engine.list_citations(
                 source_id=source_id,
                 verification_status=status,
             )
@@ -611,20 +611,12 @@ Similarity Score: {similarity}
             "ok: edited citation [N]" on success, "error: {reason}" on failure
         """
         try:
-            if not context.db:
-                return "error: no database connection"
-
-            # Verify citation belongs to current job before editing
             try:
                 from citation_engine import CitationEngine  # noqa: F401
-
-                engine = context.get_citation_engine()
-                # get_citation filters by job_id from context
-                citation = engine.get_citation(citation_id)
-                if not citation:
-                    return f"error: citation [{citation_id}] not found"
             except ImportError:
-                pass  # If CitationEngine not available, skip ownership check
+                return "error: CitationEngine not installed"
+
+            engine = context.get_citation_engine()
 
             # Build kwargs for edit, only including non-None values
             kwargs = {}
@@ -653,7 +645,11 @@ Similarity Score: {similarity}
                 v is not None for v in [claim, verbatim_quote, quote_context]
             )
 
-            await context.db.citations.edit(citation_id=citation_id, **kwargs)
+            # Route through the engine (vector store). Job-scoped ownership and
+            # the verification-status reset on content change are handled there.
+            # (Previously this hit context.db = the main app DB, where citations
+            # do not live — a cross-database mis-target.)
+            await engine.edit_citation(citation_id=citation_id, **kwargs)
 
             result = f"ok: edited citation [{citation_id}]"
             if content_changed:
@@ -667,7 +663,7 @@ Similarity Score: {similarity}
             return f"error: {str(e)}"
 
     @tool
-    def annotate_source(
+    async def annotate_source(
         source_id: int,
         content: str,
         type: Optional[str] = "note",
@@ -694,7 +690,7 @@ Similarity Score: {similarity}
                 return "CitationEngine not installed."
 
             engine = context.get_citation_engine()
-            annotation = engine.annotate_source(
+            annotation = await engine.annotate_source(
                 source_id=source_id,
                 content=content,
                 annotation_type=type or "note",
@@ -714,7 +710,7 @@ Similarity Score: {similarity}
             return f"Error creating annotation: {str(e)}"
 
     @tool
-    def get_annotations(
+    async def get_annotations(
         source_id: int,
         type: Optional[str] = None,
     ) -> str:
@@ -737,7 +733,7 @@ Similarity Score: {similarity}
                 return "CitationEngine not installed."
 
             engine = context.get_citation_engine()
-            annotations = engine.get_annotations(
+            annotations = await engine.get_annotations(
                 source_id=source_id,
                 annotation_type=type,
             )
@@ -766,7 +762,7 @@ Similarity Score: {similarity}
             return f"Error getting annotations: {str(e)}"
 
     @tool
-    def tag_source(
+    async def tag_source(
         source_id: int,
         tags: str,
         action: Optional[str] = "add",
@@ -797,10 +793,14 @@ Similarity Score: {similarity}
                 return "Error: no tags provided"
 
             if action == "remove":
-                current_tags = engine.remove_tags(source_id=source_id, tags=tag_list)
+                current_tags = await engine.remove_tags(
+                    source_id=source_id, tags=tag_list
+                )
                 verb = "Removed"
             else:
-                current_tags = engine.tag_source(source_id=source_id, tags=tag_list)
+                current_tags = await engine.tag_source(
+                    source_id=source_id, tags=tag_list
+                )
                 verb = "Added"
 
             return (
@@ -815,7 +815,7 @@ Similarity Score: {similarity}
             return f"Error tagging source: {str(e)}"
 
     @tool
-    def search_library(
+    async def search_library(
         query: str,
         mode: Optional[str] = "hybrid",
         tags: Optional[str] = None,
@@ -853,7 +853,7 @@ Similarity Score: {similarity}
             if tags:
                 tag_list = [t.strip() for t in tags.split(",") if t.strip()]
 
-            results = engine.search_library(
+            results = await engine.search_library(
                 query=query,
                 mode=mode or "hybrid",
                 tags=tag_list,
@@ -896,7 +896,7 @@ Similarity Score: {similarity}
             return f"Error searching library: {str(e)}"
 
     @tool
-    def generate_bibliography(
+    async def generate_bibliography(
         style: Optional[str] = "bibtex",
         citation_ids: Optional[str] = None,
         output_path: Optional[str] = None,
@@ -940,19 +940,19 @@ Similarity Score: {similarity}
                 entries = []
                 for cid in ids:
                     try:
-                        entry = engine.format_citation(cid, effective_style)
+                        entry = await engine.format_citation(cid, effective_style)
                         entries.append(entry)
                     except ValueError as e:
                         entries.append(f"% Error for citation {cid}: {e}")
             else:
                 # All citations for this job
-                all_citations = engine.list_citations()
+                all_citations = await engine.list_citations()
                 if not all_citations:
                     return "No citations found. Use cite_document or cite_web first."
                 entries = []
                 for c in all_citations:
                     try:
-                        entry = engine.format_citation(c.id, effective_style)
+                        entry = await engine.format_citation(c.id, effective_style)
                         entries.append(entry)
                     except ValueError as e:
                         entries.append(f"% Error for citation {c.id}: {e}")

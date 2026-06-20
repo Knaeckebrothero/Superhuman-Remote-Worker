@@ -30,12 +30,9 @@ data:
   # reader selector; agents inherit it via envFrom for the writer.
   AUDIT_BACKEND: {{ .Values.databases.audit.backend | quote }}
 
-  # Citation Engine DB — runs on the pgvector instance under its own role
-  # (srw_citations) and dedicated database (citation_engine). Composed with
-  # CITATION_POSTGRES_USER/PASSWORD from the Secret.
-  CITATION_POSTGRES_HOST: {{ include "srw.vectorPostgresHost" . | quote }}
-  CITATION_POSTGRES_PORT: {{ include "srw.vectorPostgresPort" . | quote }}
-  CITATION_POSTGRES_DB: {{ "citation_engine" | quote }}
+  # (Citations live in the vector store — srw_vector — reached through the
+  # agent's shared VECTOR_POSTGRES_* pool. No separate citation DB/role/DSN.
+  # See docs/features/citation_engine_integration.md.)
 
   # MongoDB
   MONGODB_URL: {{ include "srw.mongodbUrl" . | quote }}
@@ -117,12 +114,9 @@ data:
   # docs/features/models_yaml_removal.md.
   KEY_COOLDOWN_SECONDS: {{ .Values.llm.keyCooldownSeconds | quote }}
 
-  # Citation Engine — embedding lives outside the catalog table for now
-  # (separate code path; not gated by readiness). Stays env-driven. The
-  # citation DSN is composed from CITATION_POSTGRES_* above + the user/
-  # password from the Secret (no CITATION_DB_URL key needed in Vault).
-  CITATION_EMBEDDING_MODEL: {{ .Values.citation.embeddingModel | quote }}
-  CITATION_EMBEDDING_URL: {{ .Values.citation.embeddingUrl | quote }}
+  # (Citation embeddings now share SRW's EMBEDDING_* service — same 4096-dim
+  # qwen3-embedding-8b model that backs memory/KB — so there is no separate
+  # CITATION_EMBEDDING_* stack. See docs/features/citation_engine_integration.md.)
 
   # Codex raw-response diagnostic capture
   DEBUG_CODEX_RAW_RESPONSE: {{ "0" | quote }}

@@ -39,6 +39,7 @@ default:
     memory_extraction: memory_extraction_prompt.txt
     memory_assembler: memory_assembler_prompt.txt
     curation: curation_prompt.txt
+    citation_verification: citation_verification_prompt.txt
   instructions:
     instructions: instructions.md
     strategic_todos_initial: strategic_todos_initial.yaml

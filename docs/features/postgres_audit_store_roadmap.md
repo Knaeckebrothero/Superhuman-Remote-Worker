@@ -40,7 +40,7 @@ backup) in `postgres_audit_store_implementation.md` § Current status.
 | P3 Reader | `AuditStore` (stitch + filters) | PR 3 | ✅ |
 | P4 Wiring | orchestrator reader selector + cockpit id-normalization | PR 4a/4b | ✅ |
 | P5 Infrastructure | Helm `srw-auditdb` + secret/NetPol/`wait-for-auditdb` | PR 5 | ✅ k3d-verified |
-| P6 Validation | lean cut — component tests + k3d in-cluster e2e in place of a formal A/B; G3 perf gate not run as a phase | PR 6 | ✅ |
+| P6 Validation | lean cut — component tests + k3d full-job e2e (41 unit + live worker job, 2026-06-20) in place of a formal A/B; G3 perf gate not run as a phase | PR 6 | ✅ |
 | P7 Cutover | chart default `mongodb`→`postgres` + `generator.mjs` drift fix; **deployed to dev** | PR 7 | ✅ live |
 | P8 Cleanup | remove Mongo chart/modules/`motor`/`MONGODB_URL` + `_id` dual-reads | — | ⏳ pending soak |
 
