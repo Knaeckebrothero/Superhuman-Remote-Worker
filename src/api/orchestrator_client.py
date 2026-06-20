@@ -413,6 +413,69 @@ class OrchestratorClient:
             logger.debug(f"Failed to get thread workspace: {e}")
             return None
 
+    async def request_job_workspace_upgrade(
+        self, job_id: str, target_tier: str = "sandbox"
+    ) -> bool:
+        """Provision a real workspace container for a lite (``virtual``/``none``)
+        worker job, in place — the worker analogue of
+        ``request_thread_workspace_upgrade`` (workspace_tier_upgrade.md §4.3 W2).
+
+        The job stays ``processing`` (no pause, no re-dispatch): the same running
+        agent provisions, then polls ``get_job_workspace_status`` until ready and
+        swaps its ``WorkspaceManager`` backend in place, re-``ainvoke``-ing from
+        the local checkpoint. Idempotent server-side.
+
+        Returns:
+            True if accepted (or already in progress), False on failure.
+        """
+        if not self._client:
+            await self.connect()
+
+        url = f"{self.orchestrator_url}/api/jobs/{job_id}/provision-workspace"
+        payload = {"target_tier": target_tier}
+
+        try:
+            response = await self._client.post(url, json=payload)
+            if response.status_code == 200:
+                logger.info(
+                    f"Workspace upgrade ({target_tier}) requested for job {job_id}"
+                )
+                return True
+            else:
+                logger.error(
+                    f"Job workspace upgrade request failed: "
+                    f"{response.status_code} - {response.text}"
+                )
+                return False
+        except Exception as e:
+            logger.error(f"Job workspace upgrade request error: {e}")
+            return False
+
+    async def get_job_workspace_status(self, job_id: str) -> dict | None:
+        """Poll workspace container connection details for a running job.
+
+        The job-side analogue of ``get_thread_workspace`` — returns the
+        ``context.workspace_container`` block (status + pod connection fields)
+        the agent's ``_poll_job_workspace_ready`` consumes to build the upgraded
+        ``RemoteBackend`` (workspace_tier_upgrade.md §4.3 W1).
+
+        Returns:
+            Workspace status dict {status, pod_ip, pod_port, pod_name,
+            namespace, ssh_key_path}, or None on failure.
+        """
+        if not self._client:
+            await self.connect()
+
+        url = f"{self.orchestrator_url}/api/jobs/{job_id}/workspace-status"
+        try:
+            response = await self._client.get(url)
+            if response.status_code == 200:
+                return response.json()
+            return None
+        except Exception as e:
+            logger.debug(f"Failed to get job workspace status: {e}")
+            return None
+
     async def get_thread_lifecycle(self, thread_id: str) -> dict | None:
         """Fetch minimal lifecycle fields for the agent's status watchdog.
 

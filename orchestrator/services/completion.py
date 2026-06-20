@@ -322,6 +322,14 @@ def determine_job_status(
         return ("waiting", None)
     if freeze_type == "vm_upgrade_required":
         return ("paused", None)
+    if freeze_type == "workspace_upgrade_required":
+        # A worker job requested an in-process sandbox upgrade, but the agent's
+        # upgrade attempt failed (provision/seed/grant) and surfaced the freeze
+        # instead of swapping in place (workspace_tier_upgrade.md §4.3 W1). Pause
+        # so the dispatcher can re-attempt, mirroring the vm_upgrade fallback. On
+        # the happy path this freeze never reaches here — the agent handles it
+        # in-process and the job continues without ever reporting the freeze.
+        return ("paused", None)
     if freeze_type == "version_upgrade":
         # Continue-as-New: agent observed orchestrator-set drain intent,
         # froze cleanly at a phase boundary, and the same job context
