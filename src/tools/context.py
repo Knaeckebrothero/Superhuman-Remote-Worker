@@ -10,6 +10,7 @@ import re
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional
 from urllib.parse import urlparse
 
@@ -78,6 +79,12 @@ class ToolContext:
     _source_registry: Dict[str, int] = field(
         default_factory=dict
     )  # path/url -> source_id
+    _cloud_anchors: Dict[str, Dict[str, Any]] = field(
+        default_factory=dict
+    )  # resolved local path -> cloud snapshot-anchor (Phase 3, D7): the
+    # drift fingerprint (etag, file_sha256) + best-effort live pointer
+    # (backend, path, webdav_url) captured when a cloud file is read, so
+    # cite_* can persist it onto the source's metadata.cloud block.
     _inaccessible_sources: Dict[str, str] = field(
         default_factory=dict
     )  # url -> error message
@@ -304,16 +311,52 @@ class ToolContext:
 
         return self.citation_engine
 
+    @staticmethod
+    def _normalize_anchor_key(local_path: str) -> str:
+        """Normalize a local path to the absolute form ``add_doc_source`` uses."""
+        try:
+            return str(Path(local_path).resolve())
+        except (OSError, ValueError, RuntimeError):
+            return str(local_path)
+
+    def record_cloud_anchor(self, local_path: str, anchor: Dict[str, Any]) -> None:
+        """Stash a cloud snapshot-anchor for a downloaded file (Phase 3, D7).
+
+        Called by cloud read tools (e.g. ``webdav_read``) once a file lands in
+        the workspace, so a later ``cite_*`` on that path can persist the anchor
+        onto the source's ``metadata.cloud`` block. Keyed by the resolved
+        absolute path (matching how the engine resolves sources).
+        """
+        if not local_path or not anchor:
+            return
+        self._cloud_anchors[self._normalize_anchor_key(local_path)] = anchor
+
+    def get_cloud_anchor(self, local_path: str) -> Optional[Dict[str, Any]]:
+        """Return the stashed cloud snapshot-anchor for a local path, if any."""
+        if not local_path:
+            return None
+        return self._cloud_anchors.get(self._normalize_anchor_key(local_path))
+
     async def get_or_register_doc_source(
-        self, file_path: str, name: Optional[str] = None
+        self,
+        file_path: str,
+        name: Optional[str] = None,
+        cloud_metadata: Optional[Dict[str, Any]] = None,
     ) -> int:
         """Get cached source_id or register new document source.
 
         Checks the source registry first to avoid re-registering the same document.
 
+        When the document was read from a user's cloud, ``cloud_metadata`` (the
+        snapshot-anchor: drift fingerprint + best-effort live pointer) is stored
+        on the new source's ``metadata.cloud`` block (Phase 3, D7). If not passed
+        explicitly, any anchor previously stashed for this path via
+        ``record_cloud_anchor`` is used.
+
         Args:
             file_path: Path to the document file
             name: Optional human-readable name for the source
+            cloud_metadata: Optional cloud snapshot-anchor to persist on the source
 
         Returns:
             source_id for use in citations
@@ -324,8 +367,13 @@ class ToolContext:
         if file_path in self._source_registry:
             return self._source_registry[file_path]
 
+        if cloud_metadata is None:
+            cloud_metadata = self.get_cloud_anchor(file_path)
+
+        metadata = {"cloud": cloud_metadata} if cloud_metadata else None
+
         engine = self.get_citation_engine()
-        source = await engine.add_doc_source(file_path, name=name)
+        source = await engine.add_doc_source(file_path, name=name, metadata=metadata)
         self._source_registry[file_path] = source.id
         return source.id
 

@@ -19,7 +19,7 @@ related:
   - database_architecture.md
   - no_workspace_agent_mode.md
   - main_cloud_abstraction.md
-status: phase-2a-implemented
+status: phase-2-implemented
 date: 2026-06-19
 updated: 2026-06-20
 ---
@@ -30,11 +30,12 @@ updated: 2026-06-20
 
 The citation engine has been **folded into the repo** (vendored at `./citation_engine/`,
 floating git pin removed, host owns the schema, tests relocated, k3d round-trip
-verified). But it is still *built like a standalone library*: it carries its own
-synchronous DB connection with SQLite/Postgres dual modes, its own LLM client for
-verification, and its own schema duality. This document covers the next step —
-turning it from a bundled-but-standalone package into a **first-class SRW
-subsystem** that uses SRW's native infrastructure for every one of those concerns.
+verified). It *was* still built like a standalone library — its own synchronous
+DB connection with SQLite/Postgres dual modes, its own LLM client for
+verification, its own embedding stack, and a schema duality. This document
+covers turning it into a **first-class SRW subsystem** that uses SRW's native
+infrastructure for every one of those concerns. **Phases 1 and 2 are now
+implemented** — see *Implementation status* below.
 
 This is **orthogonal to** the existing citation docs:
 [[citation_engine_roadmap]] and [[citation_engine_rework]] describe the engine's
@@ -42,6 +43,30 @@ This is **orthogonal to** the existing citation docs:
 [[citation_issues]] is the verification *research*. This doc is about the
 *plumbing*: how the engine plugs into SRW's DB, auxiliary-LLM, and cloud layers.
 The feature set and the verification approach are unchanged.
+
+## Implementation status (2026-06-20)
+
+| Phase | Scope | Status |
+|---|---|---|
+| **1** | DB collapse + async-native on the `srw_vector` pool; SQLite / `mode` / `psycopg2` / separate DSN + embedding stacks deleted; chunk embeddings on SRW's async `get_embedding_service()` | ✅ shipped + k3d-verified |
+| **2a** | Verifier → auxiliary-LLM (`VerifyCitationTask`); `cite_*` returns `pending` and self-schedules async write-back; D6 model slot (`CITATION_LLM_*` moved engine→agent); `AuxHealth` + `verify_citations` config gate | ✅ shipped + k3d-verified |
+| **2b** | D4 feedback loop (worker): execute node re-injects still-`failed` citations each turn; `archive_phase` boundary reconcile; DB-driven + self-resolving | ✅ shipped + k3d-verified |
+| **3a** | Cloud anchor capture (D7, agent-side): `webdav_read` captures the snapshot-anchor (etag, raw-bytes `file_sha256`, `webdav_url`, backend); `cite_document` threads it onto the source's `metadata.cloud` (JSONB — no migration) | ✅ shipped + k3d-verified |
+| **3b** | Original-bytes snapshot: orchestrator endpoint persists the raw file to `srw-snapshots` (content-addressed) → `snapshot_blob_key` on `metadata.cloud` (agent has no S3 creds) | ⏳ not started |
+| **3c** | On-view drift check + view-original: orchestrator endpoints (viewing-user auth) re-fetch live etag/hash, return unchanged/changed/no-access + stream the backup; cockpit UI deferred | ⏳ not started |
+
+Verified by the gated async Postgres round-trip
+(`tests/citation_engine/test_integration_postgres.py`, 5/5 vs the dev
+`srw_vector`) + unit suites (`tests/test_citation_feedback_injection.py`,
+`TestEditCitationTool`, the graph tests). A full live agent-job run is the
+remaining end-to-end check for the 2b injection.
+
+**Deferred follow-ons:** persistent-session feedback injection (sessions already
+*verify* citations; only the feedback inject routes differently — via the
+MemoryManager seam); a cockpit citations view; semantic chunking restored behind
+an async chunker; the `oc:fileid` durable cloud link. Per-phase detail +
+acceptance criteria are in *Phasing & acceptance criteria* below; the original
+design rationale (Motivation / Design) is kept as the record.
 
 ## Motivation
 
@@ -332,22 +357,74 @@ Phase 2a (done):
   row `pending` (only a real negative verdict sets `failed`) — the Phase-2b
   reconcile is the backstop. ✅
 
-Phase 2b (remaining):
-- Failed verdicts injected into the agent's workflow (worker execute-node
-  pending-feedback check + persistent turn-stream injection) **and** a boundary
-  reconcile step that sweeps still-`pending`/`failed` citations (D4). Needs
-  graph plumbing; `engine.await_pending_verifications()` already exists as the
-  reconcile hook.
+Phase 2b — feedback loop (D4) — **✅ worker shipped + k3d-verified 2026-06-20;
+persistent deferred**:
+- The worker execute node re-reads `verification_status` each turn and injects
+  any still-`failed` citations as a synthetic `check_citation_verification`
+  tool-result (`src/core/citation_feedback_injection.py`), telling the agent to
+  edit/remove them. **DB-driven, so it self-resolves**: editing a citation resets
+  it to `pending` → re-verifies → it drops out of the injected block next turn.
+  Excluded from summarization via the unified `is_workspace_injection_message`. ✅
+- Boundary reconcile: `archive_phase` awaits in-flight verdicts
+  (`engine.await_pending_verifications`) so failures surface in the next phase. ✅
+- This realises the **inject + reconcile** combination of D4: the per-turn
+  re-injection *is* the sweep (failed citations resurface until fixed), and the
+  boundary await flushes verdicts still computing at the phase edge. No queue /
+  engine sink needed — the DB row's `verification_status` is the source of truth.
+- Verified at the component level on k3d (negative verdict → `failed` →
+  `list_citations(failed)` → `format_failed_citations`) + unit tests for the
+  injection helpers + the 66-test graph suite; a full live agent-job run is the
+  remaining end-to-end check.
+- **Deferred — persistent-session feedback injection.** Persistent sessions
+  already *verify* citations (2a wired `verify_aux` on their ToolContext), but
+  their turn messages are assembled via the MemoryManager seam, not the worker's
+  `_inject_transient_messages`, so the feedback injection there is a separate,
+  clean follow-on. (A cockpit citations view remains the other deferred reader.)
 
-**Phase 3 — Cloud citations**
-- A cited cloud document is saved at cite-time as text (`content`) + original blob
-  (`srw-snapshots`/`snapshot_blob_key`), with `{backend, path, webdav_url}`,
-  `etag`, and `content_hash`.
-- The Phase 2 verifier verifies against the saved copy (no cloud creds).
-- Opening the citation runs an on-view drift check (etag-then-hash); a changed
-  source shows a warning + the backed-up original; no-access falls back to the
-  snapshot.
-- `content_hash` dedup still collapses identical sources.
+**Phase 3 — Cloud citations** — split into **3a (✅ shipped + k3d-verified
+2026-06-20)**, **3b**, **3c** (not started), mirroring the 2a/2b split.
+
+Grounding found during implementation: agents reach cloud files two ways —
+(1) a **WebDAV datasource** (`src/tools/webdav/tools.py`; the worker cite path,
+where `client.info()` exposes the `etag` that `webdav_read` was discarding), and
+(2) **rclone `cloud_mount`** at `/workspace/cloud` (persistent sessions only;
+main-cloud files appear as plain FS paths with no etag). The `srw-snapshots`
+blob store is **orchestrator-only** (the agent has no S3 creds), so the
+original-bytes snapshot must go through an orchestrator endpoint. Phase 3 targets
+the WebDAV-datasource worker path first (consistent with 2b's worker-first
+scoping).
+
+Phase 3a — cloud anchor capture (agent-side, done):
+- `webdav_read` best-effort captures a snapshot-anchor — `{backend, path,
+  webdav_url, etag, modified, content_type, size, file_sha256, captured_at}` —
+  via `client.info()` + the client hostname + a raw-bytes SHA-256, and stashes it
+  on `ToolContext._cloud_anchors` keyed by the resolved local path. Capture never
+  raises (a metadata failure can't break a download). ✅
+- `cite_document` looks the anchor up by resolved path and threads it through
+  `get_or_register_doc_source(cloud_metadata=…)` →
+  `add_doc_source(metadata={"cloud": …})`. The source now records the live
+  pointer + drift fingerprint of what it actually cited. ✅
+- **No engine change, no migration** — `metadata` is JSONB and round-trips via
+  `_register_source` / `_row_to_source` / `_loads`. The text copy (`content`) +
+  `content_hash` dedup are unchanged, so the Phase 2 verifier already verifies
+  against the saved copy with no cloud creds. ✅
+- Tests: `tests/test_cloud_citation_anchor.py` (11, CI — anchor build, stash
+  normalization, metadata threading) + integration
+  `test_cloud_anchor_metadata_persists` (6/6 vs k3d `srw_vector`) + the 66-test
+  graph suite. ✅
+
+Phase 3b — original-bytes snapshot (not started):
+- A new orchestrator endpoint persists the raw file bytes to `srw-snapshots`
+  (content-addressed by `content_hash`) and returns a `snapshot_blob_key` that
+  the agent records onto `metadata.cloud` — enabling "view the original" (the
+  text copy alone can't render the original PDF).
+
+Phase 3c — on-view drift check + view-original (not started):
+- Orchestrator endpoints (viewing-user auth, never the agent): re-fetch the live
+  source (etag-then-hash, reusing the `detect_external_mods` etag pattern +
+  MainCloud `get_project_folder_file_bytes`) → unchanged / changed / no-access;
+  a changed source shows a warning + the backed-up original; no-access falls back
+  to the snapshot. Cockpit UI deferred per the doc.
 
 ## Open questions & deferrals
 

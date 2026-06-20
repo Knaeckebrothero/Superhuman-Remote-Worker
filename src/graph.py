@@ -1076,6 +1076,35 @@ def create_execute_node(
                     f"[{job_id}] Knowledge retrieval failed (non-fatal): {e}"
                 )
 
+        # Citation verification feedback (Phase 2b / D4): surface still-failed
+        # citations so the agent can correct them. DB-driven — re-computed from
+        # verification_status each turn — so it self-resolves once the agent
+        # edits/removes the citation. Only runs after citation activity (the
+        # engine is lazily created on first cite/source registration).
+        _citation_feedback_block = [""]
+        _cit_engine = (
+            getattr(tool_context, "citation_engine", None) if tool_context else None
+        )
+        if _cit_engine is not None:
+            try:
+                _failed_cites = await _cit_engine.list_citations(
+                    verification_status="failed"
+                )
+                if _failed_cites:
+                    from src.core.citation_feedback_injection import (
+                        format_failed_citations,
+                    )
+
+                    _citation_feedback_block[0] = format_failed_citations(_failed_cites)
+                    logger.debug(
+                        f"[{job_id}] Citation feedback: {len(_failed_cites)} failed "
+                        f"citation(s) to surface"
+                    )
+            except Exception as e:
+                logger.warning(
+                    f"[{job_id}] Citation feedback retrieval failed (non-fatal): {e}"
+                )
+
         def _inject_transient_messages(target_messages: list) -> None:
             """Append transient injection messages (todos, memories, knowledge, instruction files)."""
             # Todo list as transient HumanMessage
@@ -1107,6 +1136,18 @@ def create_execute_node(
                 )
                 target_messages.append(kb_ai)
                 target_messages.append(kb_tool)
+
+            # Citation verification feedback: surface failed citations (Phase 2b)
+            if _citation_feedback_block[0]:
+                from src.core.citation_feedback_injection import (
+                    create_citation_feedback_injection_messages,
+                )
+
+                cit_ai, cit_tool = create_citation_feedback_injection_messages(
+                    _citation_feedback_block[0]
+                )
+                target_messages.append(cit_ai)
+                target_messages.append(cit_tool)
 
             # Phase-triggered instruction files (active injection)
             if tool_context and hasattr(tool_context, "get_phase_instruction_files"):
@@ -2160,6 +2201,20 @@ def create_archive_phase_node(
 
         current_phase = plan_manager.get_current_phase()
         logger.info(f"[{job_id}] Archiving phase: {current_phase}")
+
+        # Citation verification (Phase 2b / D4): flush in-flight verdicts at the
+        # phase boundary so any failures surface in the next phase's injection
+        # (the execute node re-reads verification_status each turn).
+        _cit_engine = (
+            getattr(tool_context, "citation_engine", None) if tool_context else None
+        )
+        if _cit_engine is not None:
+            try:
+                await _cit_engine.await_pending_verifications(timeout=15)
+            except Exception as e:
+                logger.debug(
+                    f"[{job_id}] Citation verification flush failed (non-fatal): {e}"
+                )
 
         import asyncio
 

@@ -275,16 +275,19 @@ def _build_job_manifest(self, job_id, config_name, image, resources, timeout):
         "WORKSPACE_PATH", "LLM_BASE_URL", "KEY_COOLDOWN_SECONDS",
         "VISION_MODEL", "BROWSER_LLM_MODEL", "BROWSER_LLM_BASE_URL",
         "RESEARCH_PROXY_TYPE", "RESEARCH_PROXY_HOST", "RESEARCH_PROXY_PORT",
-        "CITATION_DB_URL", "CITATION_LLM_URL", "CITATION_LLM_MODEL",
-        "CITATION_REASONING_LEVEL", "CITATION_EMBEDDING_MODEL",
-        "CITATION_EMBEDDING_URL", "EMBEDDING_MODEL", "EMBEDDING_BASE_URL",
+        "CITATION_LLM_URL", "CITATION_LLM_MODEL", "CITATION_REASONING_LEVEL",
+        "EMBEDDING_MODEL", "EMBEDDING_BASE_URL",
         "UNPAYWALL_EMAIL", "NEO4J_URL", "NEO4J_USERNAME", "LOG_LEVEL",
     ]
+    # NB: the citation engine is now a native SRW subsystem — it uses the shared
+    # vector pool (VECTOR_POSTGRES_*) + SRW's EMBEDDING_* service, so the former
+    # CITATION_DB_URL / CITATION_EMBEDDING_* keys were retired (only the verifier
+    # CITATION_LLM_* model slot remains). See citation_engine_integration.md.
     secret_keys = [
         "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GROQ_API_KEY",
         "OPENROUTER_API_KEY", "GOOGLE_API_KEY", "TAVILY_API_KEY",
         "SEMANTIC_SCHOLAR_API_KEY", "VISION_API_KEY", "WHISPER_API_KEY",
-        "CITATION_EMBEDDING_KEY", "EMBEDDING_API_KEY", "NEO4J_PASSWORD",
+        "EMBEDDING_API_KEY", "NEO4J_PASSWORD",
     ]
 
     env = [

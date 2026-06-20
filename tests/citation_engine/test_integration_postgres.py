@@ -181,6 +181,41 @@ async def test_annotations_tags_and_keyword_search(engine_ctx):
 
 
 @pytest.mark.asyncio
+async def test_cloud_anchor_metadata_persists(engine_ctx, tmp_path):
+    """A cloud-document source persists its snapshot-anchor on metadata.cloud.
+
+    Phase 3 (D7): when a cited document was read from a user's cloud, the engine
+    stores the drift fingerprint (etag + raw-bytes hash) and best-effort live
+    pointer (backend / path / webdav_url) inside the source's JSONB metadata.
+    This exercises the real add_doc_source(metadata=...) → JSONB → get_source
+    round-trip on the live schema (no new column needed).
+    """
+    doc = tmp_path / "cloud_doc.txt"
+    engine, _db, job_id = engine_ctx
+    doc.write_text(f"Cloud retention policy: 10 years. marker={job_id}")
+
+    anchor = {
+        "backend": "webdav",
+        "path": "/Documents/cloud_doc.txt",
+        "webdav_url": "https://cloud.example/remote.php/dav/Documents/cloud_doc.txt",
+        "etag": '"abc123"',
+        "file_sha256": "deadbeefcafe",
+        "captured_at": "2026-06-20T00:00:00+00:00",
+    }
+    source = await engine.add_doc_source(str(doc), metadata={"cloud": anchor})
+    assert source.id
+
+    fetched = await engine.get_source(source.id)
+    assert fetched is not None and fetched.metadata is not None
+    cloud = fetched.metadata.get("cloud")
+    assert cloud is not None
+    assert cloud["backend"] == "webdav"
+    assert cloud["etag"] == '"abc123"'
+    assert cloud["file_sha256"] == "deadbeefcafe"
+    assert cloud["webdav_url"].endswith("cloud_doc.txt")
+
+
+@pytest.mark.asyncio
 async def test_async_verification_writeback(engine_ctx):
     """cite_* schedules verification; the verdict is written back async (Phase 2).
 
@@ -236,3 +271,48 @@ async def test_async_verification_writeback(engine_ctx):
     assert cit is not None
     assert cit.verification_status.value == "verified"
     assert cit.similarity_score == pytest.approx(0.95)
+
+
+@pytest.mark.asyncio
+async def test_failed_verdict_surfaces_for_feedback(engine_ctx):
+    """A negative verdict → 'failed' → queryable for the Phase 2b feedback inject.
+
+    This is the exact path the worker execute node uses to surface failed
+    citations back to the agent (``list_citations(verification_status='failed')``
+    → ``format_failed_citations``).
+    """
+    from citation_engine import CitationEngine
+    from src.core.citation_feedback_injection import format_failed_citations
+    from src.services.auxiliary import CitationVerdict
+
+    engine, db, job_id = engine_ctx
+    content = f"Unrelated text about the weather. marker={job_id}"
+
+    mock_aux = MagicMock()
+    mock_aux.chain = AsyncMock(
+        return_value=CitationVerdict(
+            verified=False,
+            similarity_score=0.1,
+            matched_text=None,
+            reasoning="the quote does not appear in the source",
+        )
+    )
+    mock_aux.health = MagicMock()
+
+    verify_engine = CitationEngine(
+        db=db, context=engine.context, verify_aux=mock_aux, verify_prompt="verify"
+    )
+    source = await verify_engine.add_custom_source(name="weather note", content=content)
+    result = await verify_engine.cite_custom(
+        claim="Companies must retain records for 10 years",
+        source_id=source.id,
+        quote_context="records must be retained for 10 years",
+    )
+    await verify_engine.await_pending_verifications(timeout=10)
+
+    failed = await verify_engine.list_citations(verification_status="failed")
+    assert any(c.id == result.citation_id for c in failed)
+
+    block = format_failed_citations(failed)
+    assert f"[{result.citation_id}]" in block
+    assert "edit_citation" in block

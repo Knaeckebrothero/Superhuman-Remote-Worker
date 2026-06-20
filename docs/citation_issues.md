@@ -17,6 +17,13 @@ related:
 
 # Citation Workflow Issues & Research Findings
 
+> **Status (2026-06-20):** The verification *methodology* here is unchanged, but
+> it now runs on SRW's **auxiliary-LLM service** (async: `cite_*` returns
+> `pending`, a background task writes the verdict back) rather than the engine's
+> own synchronous LLM call. The "audit tool" / inject + reconcile feedback is
+> wired as Phase 2b. See [[citation_engine_integration]] (Phase 2) for how it's
+> implemented.
+
 ## The Problem
 
 The current citation workflow requires the agent to create citations **before** writing the text that references them. This is backwards from natural writing where you:

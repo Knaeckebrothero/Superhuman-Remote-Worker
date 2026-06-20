@@ -9,9 +9,11 @@ Connection is established by datasource_setup.create_datasource_connection()
 and injected via ToolContext.get_datasource("webdav").
 """
 
+import hashlib
 import logging
 import os
-from typing import Any, Dict, List
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
 
 from langchain_core.tools import tool
 
@@ -152,6 +154,16 @@ def create_webdav_tools(context: ToolContext) -> List[Any]:
             client.download_sync(remote_path=path, local_path=local_path)
 
             size = os.path.getsize(local_path)
+
+            # Phase 3 (D7): stash a cloud snapshot-anchor for this file so a
+            # later cite_* persists its drift fingerprint + live pointer onto
+            # the source. Best-effort — never let metadata capture break a read.
+            try:
+                anchor = _build_cloud_anchor(client, path, local_path)
+                context.record_cloud_anchor(local_path, anchor)
+            except Exception as e:
+                logger.debug("Could not record cloud anchor for %s: %s", path, e)
+
             return f"Downloaded {path} → documents/{filename} ({_human_size(size)})"
         except Exception as e:
             return f"Error downloading {path}: {e}"
@@ -240,3 +252,63 @@ def _human_size(size_bytes: int) -> str:
             return f"{size_bytes:.1f} {unit}" if unit != "B" else f"{size_bytes} B"
         size_bytes /= 1024
     return f"{size_bytes:.1f} TB"
+
+
+def _webdav_base_url(client: Any) -> str:
+    """Best-effort base URL (hostname) of a webdav3 client.
+
+    webdav3 stows the connection options on ``client.webdav`` (a settings
+    object with a ``hostname`` attribute). Guarded so an internal API change
+    degrades to "no live pointer" rather than raising.
+    """
+    settings = getattr(client, "webdav", None)
+    host = getattr(settings, "hostname", None) if settings is not None else None
+    return str(host) if host else ""
+
+
+def _file_sha256(local_path: str) -> Optional[str]:
+    """SHA-256 of a file's raw bytes, streamed; None on any I/O error."""
+    try:
+        h = hashlib.sha256()
+        with open(local_path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError as e:
+        logger.debug("cloud-anchor hash failed for %s: %s", local_path, e)
+        return None
+
+
+def _build_cloud_anchor(
+    client: Any, remote_path: str, local_path: str
+) -> Dict[str, Any]:
+    """Capture a Phase-3 (D7) cloud snapshot-anchor for a downloaded file.
+
+    Best-effort and never raises: returns the drift fingerprint (``etag`` +
+    raw-bytes ``file_sha256``) plus a best-effort live pointer (``backend``,
+    ``path``, ``webdav_url``). A later ``cite_*`` persists this onto the
+    source's ``metadata.cloud`` so the citation records what it actually cited
+    and can be drift-checked / re-fetched on view.
+    """
+    anchor: Dict[str, Any] = {"backend": "webdav", "path": remote_path}
+
+    base = _webdav_base_url(client)
+    if base:
+        anchor["webdav_url"] = base.rstrip("/") + "/" + remote_path.lstrip("/")
+
+    # File metadata via PROPFIND (etag / modified / content_type / size).
+    try:
+        info = client.info(remote_path) or {}
+        for key in ("etag", "modified", "created", "content_type", "size"):
+            val = info.get(key)
+            if val not in (None, ""):
+                anchor[key] = val
+    except Exception as e:  # webdav3 raises assorted client errors
+        logger.debug("cloud-anchor info() failed for %s: %s", remote_path, e)
+
+    file_hash = _file_sha256(local_path)
+    if file_hash:
+        anchor["file_sha256"] = file_hash
+
+    anchor["captured_at"] = datetime.now(timezone.utc).isoformat()
+    return anchor
