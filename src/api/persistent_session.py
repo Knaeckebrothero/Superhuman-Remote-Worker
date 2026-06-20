@@ -62,6 +62,29 @@ def resolve_memory_extraction_prompt(config: AgentConfig) -> str:
         return ""
 
 
+def resolve_citation_verification_prompt(config: AgentConfig) -> str:
+    """Load the citation-verification prompt through the prompt matrix.
+
+    Mirrors ``resolve_memory_extraction_prompt``. Persistent sessions verify
+    citations on the auxiliary model (the dedicated CITATION_LLM model slot is
+    a worker-dispatch concept), so resolve against the aux model family.
+    """
+    aux_model = (
+        config.auxiliary.model
+        or config.llm.get_phase_config("summarization").model
+        or config.llm.model
+    )
+    try:
+        return load_auxiliary_prompt(config, "citation_verification", model=aux_model)
+    except Exception as e:
+        logger.warning(
+            "Citation verification prompt could not be loaded — verification "
+            "will run without instructions: %s",
+            e,
+        )
+        return ""
+
+
 # Phase-specific tools that don't apply to interactive mode
 _EXCLUDED_TOOLS = frozenset(
     {
@@ -106,6 +129,11 @@ class PersistentSession:
     # Matrix-resolved prompt for memory extraction; threaded into the loop
     # and the teardown extraction sites (MemoryConfig carries no prompt).
     memory_extraction_prompt: str = ""
+    # Citation verification (Phase 2): the AuxiliaryLLM used to verify citations
+    # (the aux model in sessions) + its matrix-resolved prompt. Threaded onto
+    # ToolContext so the citation engine schedules async verdict write-back.
+    citation_verify_aux: Optional[Any] = None
+    citation_verification_prompt: str = ""
     shell_manager: Optional[Any] = None
 
     # DB connections (for message persistence + memory)
@@ -192,6 +220,21 @@ class PersistentSession:
         self.permission_mode = self.config.interactive.permission_mode
         self.narration_mode = self.config.interactive.narration_mode
         self.memory_extraction_prompt = resolve_memory_extraction_prompt(self.config)
+        # Citation verification (Phase 2): reuse the auxiliary model in sessions,
+        # gated by auxiliary.tasks.verify_citations.
+        _verify_task = self.config.auxiliary.tasks.get("verify_citations")
+        if (
+            self.config.auxiliary.enabled
+            and _verify_task is not None
+            and _verify_task.enabled
+        ):
+            self.citation_verify_aux = self.auxiliary_llm
+            self.citation_verification_prompt = resolve_citation_verification_prompt(
+                self.config
+            )
+        else:
+            self.citation_verify_aux = None
+            self.citation_verification_prompt = ""
 
         # 1. Create workspace (with optional remote backend + git)
         await self._setup_workspace(
@@ -542,6 +585,9 @@ class PersistentSession:
             workspace_manager=self.workspace_manager,
             todo_manager=None,  # No TodoManager in persistent mode
             postgres_db=postgres_conn,
+            vector_db=self.vector_conn,  # Citations live in srw_vector
+            verify_aux=self.citation_verify_aux,
+            verify_citation_prompt=self.citation_verification_prompt,
             datasources=self.datasources,
             config=tool_config,
             _job_id=self.thread_id,

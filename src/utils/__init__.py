@@ -17,19 +17,11 @@ from .document_models import (
 )
 from .config import load_config, load_prompt, get_project_root
 
-# Citation utilities (optional - requires citation_engine)
-try:
-    from .citation_utils import (  # noqa: F401
-        CitationHelper,
-        create_citation_engine,
-        is_citation_engine_available,
-        get_citation_engine_config,
-        create_citation_tools,
-    )
-
-    _citation_available = True
-except ImportError:
-    _citation_available = False
+# NOTE: citation integration lives in the vendored ``citation_engine`` package
+# (constructed via ``ToolContext.get_citation_engine`` on the vector pool) and
+# the agent tools in ``src.tools.citation``. The former ``citation_utils``
+# helper module was dead/fictional (it referenced an engine API that never
+# existed) and was removed in the citation-engine native integration (Phase 1).
 
 __all__ = [
     # Document Processing
@@ -48,15 +40,3 @@ __all__ = [
     "load_prompt",
     "get_project_root",
 ]
-
-# Add citation exports if available
-if _citation_available:
-    __all__.extend(
-        [
-            "CitationHelper",
-            "create_citation_engine",
-            "is_citation_engine_available",
-            "get_citation_engine_config",
-            "create_citation_tools",
-        ]
-    )

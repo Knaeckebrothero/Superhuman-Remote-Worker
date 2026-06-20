@@ -939,6 +939,7 @@ class PromptMatrixResolver(MatrixResolver):
         "summarization": "summarization_prompt.txt",
         "memory_extraction": "memory_extraction_prompt.txt",
         "curation": "curation_prompt.txt",
+        "citation_verification": "citation_verification_prompt.txt",
     }
 
     # Backward compatibility: expose _prompt_resolver as alias for _file_resolver
@@ -1502,6 +1503,7 @@ class AuxiliaryConfig:
             "extract_memories": AuxiliaryTaskConfig(enabled=True),
             "curate_knowledge": AuxiliaryTaskConfig(enabled=True),
             "assemble_memories": AuxiliaryTaskConfig(enabled=True),
+            "verify_citations": AuxiliaryTaskConfig(enabled=True),
         }
     )
 
@@ -1777,7 +1779,12 @@ def _parse_auxiliary_config(data: Dict[str, Any]) -> AuxiliaryConfig:
             tasks[task_name] = AuxiliaryTaskConfig(enabled=bool(task_conf))
 
     # Ensure defaults for known tasks
-    for default_task in ("extract_memories", "curate_knowledge", "assemble_memories"):
+    for default_task in (
+        "extract_memories",
+        "curate_knowledge",
+        "assemble_memories",
+        "verify_citations",
+    ):
         if default_task not in tasks:
             tasks[default_task] = AuxiliaryTaskConfig(enabled=True)
 

@@ -171,7 +171,7 @@ def create_paper_tools(context: ToolContext) -> List[Any]:
                 result = await _try_arxiv_download(identifier, dest_dir)
                 if result.success:
                     ws_path = _maybe_transfer(context, remote, result.path)
-                    _register_downloaded_paper(context, result, ws_path)
+                    await _register_downloaded_paper(context, result, ws_path)
                     return (
                         f"Downloaded: {result.paper.title}\n"
                         f"Path: {ws_path}\n"
@@ -187,7 +187,7 @@ def create_paper_tools(context: ToolContext) -> List[Any]:
                     )
                     if result.success:
                         ws_path = _maybe_transfer(context, remote, result.path)
-                        _register_downloaded_paper(context, result, ws_path)
+                        await _register_downloaded_paper(context, result, ws_path)
                         return (
                             f"Downloaded: {result.paper.title}\n"
                             f"Path: {ws_path}\n"
@@ -497,7 +497,7 @@ def _maybe_transfer(
     return dest_rel
 
 
-def _register_downloaded_paper(
+async def _register_downloaded_paper(
     context: ToolContext, result, display_path: Optional[str] = None
 ) -> None:
     """Register a downloaded paper as a citation source."""
@@ -506,7 +506,7 @@ def _register_downloaded_paper(
 
     path_str = display_path or str(result.path)
     try:
-        source_id = context.get_or_register_doc_source(
+        source_id = await context.get_or_register_doc_source(
             path_str, name=result.paper.title
         )
         logger.info(

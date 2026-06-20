@@ -17,7 +17,6 @@ import logging
 import os
 import time
 import zipfile
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
@@ -163,6 +162,13 @@ class UniversalAgent:
 
         # Auxiliary LLM for support tasks (summarization, memory extraction, curation)
         self._auxiliary_llm = None
+
+        # Citation verification (Phase 2): an AuxiliaryLLM on the citation model
+        # (dedicated CITATION_LLM model, or the auxiliary model fallback) + the
+        # matrix-resolved prompt. Threaded onto ToolContext so the citation
+        # engine schedules async verdict write-back.
+        self._citation_verify_aux = None
+        self._citation_verification_prompt = ""
 
         # Tool context (for phase-aware behavior)
         self._tool_context: Optional[ToolContext] = None
@@ -356,6 +362,8 @@ class UniversalAgent:
 
         # Create AuxiliaryLLM for support tasks (summarization, memory, curation)
         self._initialize_auxiliary_llm(llm_config, limits)
+        # Citation verifier (Phase 2) — built on the aux LLM, so after it.
+        self._initialize_citation_verifier(limits)
 
     def _initialize_auxiliary_llm(self, llm_config, limits) -> None:
         """Create the AuxiliaryLLM instance for support tasks.
@@ -417,6 +425,80 @@ class UniversalAgent:
             timeout=aux_config.timeout,
             max_context_tokens=aux_window,
         )
+
+    def _initialize_citation_verifier(self, limits) -> None:
+        """Build the citation-verification AuxiliaryLLM (D6) + load its prompt.
+
+        Uses a dedicated citation model when one is dispatched
+        (``CITATION_LLM_MODEL`` — set by the orchestrator from the per-job
+        override / Admin default), else reuses the auxiliary model. Gated by
+        ``auxiliary.tasks.verify_citations``. The citation engine schedules
+        verification as a background ``AuxiliaryLLM`` chain task (async,
+        eventually-consistent).
+        """
+        import os
+
+        from src.services.auxiliary import AuxiliaryLLM
+
+        aux_cfg = self.config.auxiliary
+        task_cfg = aux_cfg.tasks.get("verify_citations")
+        if not aux_cfg.enabled or task_cfg is None or not task_cfg.enabled:
+            self._citation_verify_aux = None
+            logger.info(
+                "Citation verification disabled (auxiliary.tasks.verify_citations)"
+            )
+            return
+
+        citation_model = os.getenv("CITATION_LLM_MODEL")
+        if citation_model and self._auxiliary_llm is not None:
+            # Dedicated citation model (D6) — resolve its family settings matrix.
+            model_settings = resolve_model_settings(
+                citation_model, self.config._deployment_dir
+            )
+            verify_cfg = LLMConfig(
+                model=citation_model,
+                base_url=os.getenv("CITATION_LLM_BASE_URL")
+                or os.getenv("CITATION_LLM_URL"),
+                api_key=os.getenv("CITATION_LLM_API_KEY")
+                or os.getenv("OPENAI_API_KEY"),
+                temperature=0.0,
+                top_p=model_settings.get("top_p"),
+                top_k=model_settings.get("top_k"),
+                model_max_context_tokens=model_settings.get("model_max_context_tokens"),
+                max_retries=1,
+            )
+            try:
+                verify_llm = create_llm(verify_cfg, limits=limits)
+                self._citation_verify_aux = AuxiliaryLLM(
+                    llm=verify_llm,
+                    timeout=aux_cfg.timeout,
+                    max_context_tokens=verify_cfg.model_max_context_tokens,
+                )
+                prompt_model = citation_model
+                logger.info(f"Citation verifier: dedicated model {citation_model}")
+            except Exception as e:
+                logger.warning(
+                    f"Could not build dedicated citation model '{citation_model}' "
+                    f"({e}); falling back to the auxiliary model"
+                )
+                self._citation_verify_aux = self._auxiliary_llm
+                prompt_model = aux_cfg.model or self.config.llm.model
+        else:
+            # Fall back to the auxiliary model.
+            self._citation_verify_aux = self._auxiliary_llm
+            prompt_model = aux_cfg.model or self.config.llm.model
+            logger.info("Citation verifier: reusing auxiliary model")
+
+        # Resolve the verification prompt via the matrix (model-family aware).
+        try:
+            from src.core.loader import load_auxiliary_prompt
+
+            self._citation_verification_prompt = load_auxiliary_prompt(
+                self.config, "citation_verification", model=prompt_model or ""
+            )
+        except Exception as e:
+            logger.warning(f"Could not load citation_verification prompt: {e}")
+            self._citation_verification_prompt = ""
 
     async def _setup_connections(self) -> None:
         """Set up required database connections.
@@ -519,6 +601,17 @@ class UniversalAgent:
                 job_id=job_id,
                 agent_type=self.config.agent_id,
             )
+            # The dedicated citation verifier (if distinct) needs the same
+            # archiver/job context so its calls land in the debug view.
+            if (
+                self._citation_verify_aux is not None
+                and self._citation_verify_aux is not self._auxiliary_llm
+            ):
+                self._citation_verify_aux.set_job_context(
+                    archiver=_get_archiver_for_aux(),
+                    job_id=job_id,
+                    agent_type=self.config.agent_id,
+                )
 
         try:
             # Create workspace for this job
@@ -1806,6 +1899,9 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             workspace_manager=self._workspace_manager,
             todo_manager=self._todo_manager,
             postgres_db=self.postgres_conn,
+            vector_db=getattr(self, "vector_conn", None),
+            verify_aux=self._citation_verify_aux,
+            verify_citation_prompt=self._citation_verification_prompt,
             datasources=datasources_dict,
             config=tool_config,
             _job_id=self._current_job_id,
@@ -2133,34 +2229,25 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
     async def _register_initial_documents_background(
         self, context: "ToolContext"
     ) -> None:
-        """Background async wrapper for parallel document registration.
-
-        Runs the synchronous _register_initial_documents in a thread executor
-        so the agent's ReAct loop can start immediately.
-
-        Args:
-            context: ToolContext with workspace and citation engine
-        """
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self._register_initial_documents, context)
-
-    def _register_initial_documents(self, context: "ToolContext") -> None:
         """Register input documents in documents/ as CitationEngine sources.
 
         Scans the documents/ directory for supported file types and registers
-        each as a source in parallel using ThreadPoolExecutor, enabling hybrid
-        vector search via search_library.
-        Skips documents/external/ (web content registered separately).
+        each as a source concurrently on the agent's shared async vector pool,
+        enabling hybrid vector search via search_library. Skips
+        documents/external/ (web content is registered separately by the
+        research tools).
 
-        Each worker thread creates its own CitationEngine instance for thread
-        safety (the shared context.citation_engine uses a single DB connection).
-
-        Non-fatal: failures are logged but do not block job execution.
+        Runs as a background task so the agent's ReAct loop starts immediately.
+        Concurrency is bounded by a semaphore (the pool + embedding endpoint do
+        the rest). Non-fatal: failures are logged but never block the job.
 
         Args:
-            context: ToolContext with workspace and citation engine
+            context: ToolContext with the workspace + vector pool.
         """
         if not context.has_workspace():
+            return
+        if context.vector_db is None:
+            logger.debug("No vector pool attached; skipping document auto-registration")
             return
 
         SUPPORTED_EXTENSIONS = {
@@ -2183,7 +2270,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             if not docs_path.exists():
                 return
 
-            # Collect eligible files
+            # Collect eligible files (sync filesystem walk is quick).
             files: List[Tuple[Path, str]] = []
             for file_path in sorted(docs_path.rglob("*")):
                 if not file_path.is_file():
@@ -2196,7 +2283,6 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                 except ValueError:
                     pass  # Not under external/, proceed
 
-                # Filter to supported extensions
                 if file_path.suffix.lower() not in SUPPORTED_EXTENSIONS:
                     continue
 
@@ -2210,84 +2296,36 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                 f"Starting background registration of {len(files)} document(s)..."
             )
 
-            # Process in parallel — each thread gets its own CitationEngine
-            max_workers = min(len(files), 4)
-            results: List[Optional[Tuple[str, int]]] = []
+            # Register concurrently on the shared vector pool. The engine borrows
+            # the pool (no per-instance connection), so a single context-owned
+            # engine is reused across all files; get_or_register_doc_source
+            # populates context._source_registry as it goes.
+            sem = asyncio.Semaphore(4)
 
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = [
-                    executor.submit(
-                        self._process_single_document,
-                        file_path,
-                        name,
-                        context,
-                    )
-                    for file_path, name in files
-                ]
-                for future in futures:
-                    results.append(future.result())
+            async def _register(file_path: Path, name: str) -> bool:
+                async with sem:
+                    try:
+                        await context.get_or_register_doc_source(
+                            str(file_path), name=name
+                        )
+                        return True
+                    except Exception as e:
+                        logger.debug(f"Could not register document {name}: {e}")
+                        return False
 
-            # Update source registry from results (single-threaded, no race)
-            registered_count = 0
-            for result in results:
-                if result is not None:
-                    file_path_str, source_id = result
-                    context._source_registry[file_path_str] = source_id
-                    registered_count += 1
+            results = await asyncio.gather(*(_register(fp, name) for fp, name in files))
+            registered_count = sum(1 for ok in results if ok)
 
             elapsed = time.monotonic() - start_time
             if registered_count > 0:
                 logger.info(
-                    f"Registered {registered_count} document(s) in {elapsed:.1f}s (parallel)"
+                    f"Registered {registered_count} document(s) in {elapsed:.1f}s (async pool)"
                 )
 
         except Exception as e:
             logger.warning(
                 f"Auto-registration of input documents failed (non-fatal): {e}"
             )
-
-    def _process_single_document(
-        self,
-        file_path: Path,
-        name: str,
-        context: "ToolContext",
-    ) -> Optional[Tuple[str, int]]:
-        """Process a single document in a worker thread.
-
-        Creates an independent CitationEngine instance with its own DB
-        connection for thread safety.
-
-        Args:
-            file_path: Absolute path to the document file
-            name: Human-readable name for the source
-            context: ToolContext (used only for job_id and agent_id)
-
-        Returns:
-            Tuple of (file_path_str, source_id) on success, None on failure
-        """
-        engine = None
-        try:
-            from citation_engine import CitationEngine, CitationContext
-
-            ctx = CitationContext(
-                session_id=context.job_id or "unknown",
-                agent_id=context.config.get("agent_id", "unknown"),
-            )
-            engine = CitationEngine(mode="multi-agent", context=ctx)
-            engine._connect()
-
-            source = engine.add_doc_source(str(file_path), name=name)
-            return (str(file_path), source.id)
-
-        except Exception as e:
-            logger.debug(f"Could not register document {name}: {e}")
-            return None
-        finally:
-            if engine is not None:
-                try:
-                    engine.close()
-                except Exception:
-                    pass
 
     def _inject_datasource_index(self, ds_configs: list) -> None:
         """Inject a compact datasource index into datasources.md.

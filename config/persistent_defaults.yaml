@@ -217,6 +217,10 @@ auxiliary:
       # enabling it here is a no-op (docs/issues/memory_bugs.md B3). Whether
       # to wire or retire the assembler is a memory-overhaul decision.
       enabled: false
+    # Citation verification (citation engine Phase 2): cite_* returns 'pending'
+    # and the verdict is written back async on the auxiliary model.
+    verify_citations:
+      enabled: true
 
 interactive:
   permission_mode: supervised
