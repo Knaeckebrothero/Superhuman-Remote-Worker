@@ -19,7 +19,7 @@ related:
   - database_architecture.md
   - no_workspace_agent_mode.md
   - main_cloud_abstraction.md
-status: phase-2-implemented
+status: phase-3-implemented
 date: 2026-06-19
 updated: 2026-06-20
 ---
@@ -34,7 +34,7 @@ verified). It *was* still built like a standalone library — its own synchronou
 DB connection with SQLite/Postgres dual modes, its own LLM client for
 verification, its own embedding stack, and a schema duality. This document
 covers turning it into a **first-class SRW subsystem** that uses SRW's native
-infrastructure for every one of those concerns. **Phases 1 and 2 are now
+infrastructure for every one of those concerns. **Phases 1–3 are now
 implemented** — see *Implementation status* below.
 
 This is **orthogonal to** the existing citation docs:
@@ -52,8 +52,8 @@ The feature set and the verification approach are unchanged.
 | **2a** | Verifier → auxiliary-LLM (`VerifyCitationTask`); `cite_*` returns `pending` and self-schedules async write-back; D6 model slot (`CITATION_LLM_*` moved engine→agent); `AuxHealth` + `verify_citations` config gate | ✅ shipped + k3d-verified |
 | **2b** | D4 feedback loop (worker): execute node re-injects still-`failed` citations each turn; `archive_phase` boundary reconcile; DB-driven + self-resolving | ✅ shipped + k3d-verified |
 | **3a** | Cloud anchor capture (D7, agent-side): `webdav_read` captures the snapshot-anchor (etag, raw-bytes `file_sha256`, `webdav_url`, backend); `cite_document` threads it onto the source's `metadata.cloud` (JSONB — no migration) | ✅ shipped + k3d-verified |
-| **3b** | Original-bytes snapshot: orchestrator endpoint persists the raw file to `srw-snapshots` (content-addressed) → `snapshot_blob_key` on `metadata.cloud` (agent has no S3 creds) | ⏳ not started |
-| **3c** | On-view drift check + view-original: orchestrator endpoints (viewing-user auth) re-fetch live etag/hash, return unchanged/changed/no-access + stream the backup; cockpit UI deferred | ⏳ not started |
+| **3b** | Original-bytes snapshot: `POST /api/citations/snapshot` (internal-key) persists the raw file to `srw-snapshots` content-addressed (`citations/<sha[:2]>/<sha>`, HEAD-dedup) → `snapshot_blob_key` on `metadata.cloud`; agent uploads via `OrchestratorClient` at cite-time (it has no S3 creds) | ✅ shipped + k3d-verified |
+| **3c** | On-view drift check + view-original: `GET /api/citations/{id}/drift` (viewing-user auth) re-fetches the live source via MainCloud **only when it's provably under the viewer's own cloud home**, hash-compares → `unchanged`/`changed`/`unreachable`; `GET /api/citations/{id}/snapshot` streams the backup via `get_blob`; cockpit UI deferred | ✅ shipped + k3d-verified |
 
 Verified by the gated async Postgres round-trip
 (`tests/citation_engine/test_integration_postgres.py`, 5/5 vs the dev
@@ -382,7 +382,8 @@ persistent deferred**:
   clean follow-on. (A cockpit citations view remains the other deferred reader.)
 
 **Phase 3 — Cloud citations** — split into **3a (✅ shipped + k3d-verified
-2026-06-20)**, **3b**, **3c** (not started), mirroring the 2a/2b split.
+2026-06-20)**, **3b (✅ shipped + k3d-verified 2026-06-20)**, and **3c (✅
+shipped + k3d-verified 2026-06-20)**, mirroring the 2a/2b split.
 
 Grounding found during implementation: agents reach cloud files two ways —
 (1) a **WebDAV datasource** (`src/tools/webdav/tools.py`; the worker cite path,
@@ -413,18 +414,52 @@ Phase 3a — cloud anchor capture (agent-side, done):
   `test_cloud_anchor_metadata_persists` (6/6 vs k3d `srw_vector`) + the 66-test
   graph suite. ✅
 
-Phase 3b — original-bytes snapshot (not started):
-- A new orchestrator endpoint persists the raw file bytes to `srw-snapshots`
-  (content-addressed by `content_hash`) and returns a `snapshot_blob_key` that
-  the agent records onto `metadata.cloud` — enabling "view the original" (the
-  text copy alone can't render the original PDF).
+Phase 3b — original-bytes snapshot (done):
+- `SnapshotService.save_blob` / `get_blob` store raw bytes content-addressed
+  under `citations/<sha[:2]>/<sha>` in `srw-snapshots` (HEAD-dedup, so identical
+  bytes never re-upload). ✅
+- `POST /api/citations/snapshot` (internal-key auth via `require_internal`) reads
+  the raw request body + `?content_type`, calls `save_blob`, and returns
+  `{snapshot_blob_key, size_bytes}`. The agent has no S3 credentials, so this is
+  how the bytes get persisted. ✅
+- `OrchestratorClient.save_citation_snapshot` (agent) POSTs the bytes;
+  `ToolContext.snapshot_cloud_source_bytes` reads the cited file, uploads, and
+  writes `snapshot_blob_key` back onto the anchor **before** registration, so the
+  source is registered with the key already on `metadata.cloud`. Best-effort —
+  a failed/unavailable store leaves the citation intact (text copy is the
+  verification anchor); the tool reports "live pointer recorded" vs "original
+  snapshotted" accordingly. ✅
+- Tests: `tests/test_citation_snapshot_blob.py` (13, CI — `save_blob` put/dedup,
+  `get_blob`, `save_citation_snapshot` 200/error/network/empty,
+  `snapshot_cloud_source_bytes` upload/short-circuit/no-client/missing-file).
+  Live k3d: `require_internal` 401 gate → authed 200 + content-addressed key →
+  identical re-POST returns the same key → boto3 read-back confirms exact bytes +
+  `application/pdf` ContentType in real MinIO. ✅
 
-Phase 3c — on-view drift check + view-original (not started):
-- Orchestrator endpoints (viewing-user auth, never the agent): re-fetch the live
-  source (etag-then-hash, reusing the `detect_external_mods` etag pattern +
-  MainCloud `get_project_folder_file_bytes`) → unchanged / changed / no-access;
-  a changed source shows a warning + the backed-up original; no-access falls back
-  to the snapshot. Cockpit UI deferred per the doc.
+Phase 3c — on-view drift check + view-original (done):
+- `GET /api/citations/{id}/snapshot` (viewing-user auth: `require_approved_user`
+  + `user_can_access_any_job`, 404-on-no-access so existence isn't leaked) streams
+  the backed-up original via `SnapshotService.get_blob(snapshot_blob_key)` with
+  the stored `content_type` + `inline` Content-Disposition. ✅
+- `GET /api/citations/{id}/drift` returns the cite-time fingerprint +
+  `snapshot_available`, and runs a **best-effort** live re-fetch **only when the
+  cited file is provably inside the viewing user's own cloud home** —
+  `_home_relative_path` guards on the anchor `webdav_url` being a prefix of the
+  user's `UserHome.webdav_url` (so the creds are the user's, never the agent's,
+  and we never compare a same-named different file), then
+  `get_project_folder_file_bytes` + SHA-256 compare → `unchanged` / `changed`.
+  External datasource / different cloud / no access → `unreachable` (the spec's
+  "fall back to the snapshot" branch). ✅
+- Tests: `tests/test_citation_drift_helpers.py` (8, CI — `_home_relative_path`
+  under/not-under/host-mismatch/trailing-slash, `_source_cloud_meta` dict/string/
+  no-block). Live k3d (real orchestrator + MinIO, authed as the test user via
+  `X-Internal-Key`+`X-MCP-User-Id`): `/snapshot` → 200 + exact bytes +
+  `application/pdf` + `inline` filename; `/drift` → `unreachable` +
+  `snapshot_available:true` + echoed fingerprint; no user header → 401. ✅
+- **Deferred (same bar as prior slices):** the `unchanged`/`changed` live path
+  needs a citation whose source is a real file under the viewing user's
+  OpenCloud home — exercise on a full real-cloud agent run. **Cockpit citations
+  view stays deferred** (the data layer + endpoints are now ready for it).
 
 ## Open questions & deferrals
 

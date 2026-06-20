@@ -4,6 +4,7 @@ Provides a container for dependencies that tools need access to,
 such as workspace managers, database connections, and configuration.
 """
 
+import asyncio
 import hashlib
 import logging
 import re
@@ -336,6 +337,42 @@ class ToolContext:
         if not local_path:
             return None
         return self._cloud_anchors.get(self._normalize_anchor_key(local_path))
+
+    async def snapshot_cloud_source_bytes(
+        self, local_path: str, anchor: Dict[str, Any]
+    ) -> Optional[str]:
+        """Persist a cited cloud file's original bytes to the snapshot store (D7).
+
+        The agent holds no blob-store credentials, so the bytes are round-tripped
+        through the orchestrator (``OrchestratorClient.save_citation_snapshot`` →
+        ``POST /api/citations/snapshot``), which returns a content-addressed
+        ``snapshot_blob_key``. The key is written back onto ``anchor`` in place so
+        a re-cite of the same file doesn't re-upload, and so the source is
+        registered with the key already present (Phase 3b).
+
+        Best-effort: returns the key, or ``None`` when there's no orchestrator
+        client, the file can't be read, or the upload fails — the extracted-text
+        copy remains the citation's verification anchor either way.
+        """
+        if anchor.get("snapshot_blob_key"):
+            return anchor["snapshot_blob_key"]
+        client = self.orchestrator_client
+        if client is None:
+            return None
+        try:
+            data = await asyncio.to_thread(Path(local_path).read_bytes)
+        except OSError as e:
+            logger.debug("Cloud snapshot read failed for %s: %s", local_path, e)
+            return None
+        content_type = anchor.get("content_type") or "application/octet-stream"
+        try:
+            key = await client.save_citation_snapshot(data, content_type=content_type)
+        except Exception as e:  # never let a snapshot upload break citation creation
+            logger.debug("Cloud snapshot upload failed for %s: %s", local_path, e)
+            return None
+        if key:
+            anchor["snapshot_blob_key"] = key
+        return key
 
     async def get_or_register_doc_source(
         self,
