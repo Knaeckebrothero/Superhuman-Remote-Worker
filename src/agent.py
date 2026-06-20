@@ -871,12 +871,69 @@ class UniversalAgent:
         Args:
             graph_input: Initial state for new jobs, or None to resume from checkpoint
             config: LangGraph config with thread_id
+
+        If a run ends with a ``workspace_upgrade_required`` freeze (target
+        ``sandbox``), the job is upgraded IN PROCESS — provision → seed → swap →
+        retool → rebuild graph — and the same graph is re-streamed from the local
+        checkpoint with shell/git now available, mirroring the session live swap
+        (workspace_tier_upgrade.md §4.3 W1). No re-dispatch, no checkpoint move.
+        On upgrade failure the freeze is surfaced unchanged so the orchestrator
+        pauses the job.
         """
         try:
-            async for state in run_graph_with_streaming(
-                self._graph, graph_input, config
-            ):
-                yield state
+            # At most one in-process upgrade per run: virtual → sandbox flips the
+            # backend to supports_shell=True, after which the request tool drops
+            # out and the supports_shell guard below short-circuits anyway.
+            upgraded = False
+            while True:
+                final_state: Optional[Dict[str, Any]] = None
+                async for state in run_graph_with_streaming(
+                    self._graph, graph_input, config
+                ):
+                    final_state = state
+                    yield state
+
+                freeze = (final_state or {}).get("freeze_data") or {}
+                wants_upgrade = (
+                    not upgraded
+                    and isinstance(freeze, dict)
+                    and freeze.get("freeze_type") == "workspace_upgrade_required"
+                    and (freeze.get("target_tier") or "sandbox") == "sandbox"
+                    and self._workspace_manager is not None
+                    and not getattr(
+                        self._workspace_manager.backend, "supports_shell", False
+                    )
+                )
+                if not wants_upgrade:
+                    break
+
+                upgraded = True
+                ok = await self._perform_inprocess_workspace_upgrade(
+                    freeze.get("target_tier") or "sandbox"
+                )
+                if not ok:
+                    # Provision/seed failed — surface the freeze unchanged; the
+                    # orchestrator routes it (pauses the job for re-dispatch).
+                    break
+
+                # Prime the rebuilt graph to resume from the local checkpoint
+                # (the proven feedback-resume pattern): clear the stale freeze +
+                # stop flags as a __start__ update, then re-stream with no input
+                # so route_entry → restore_todo_state continues the loop with
+                # shell/git now available. restore_todo_state also clears
+                # should_stop/goal_achieved; clearing freeze_data here keeps the
+                # stale upgrade-freeze from reaching the orchestrator on real
+                # completion.
+                await self._graph.aupdate_state(
+                    config,
+                    {
+                        "freeze_data": None,
+                        "should_stop": False,
+                        "goal_achieved": False,
+                    },
+                    as_node="__start__",
+                )
+                graph_input = None
 
             self._jobs_processed += 1
         finally:
@@ -885,6 +942,198 @@ class UniversalAgent:
             self._cleanup_shell_manager()
             self._close_datasource_connections()
             await self._cleanup_checkpointer()
+
+    async def _poll_job_workspace_ready(
+        self, job_id: str, timeout: int = 300, poll_interval: float = 2.0
+    ) -> Optional[Dict[str, Any]]:
+        """Poll the orchestrator for a running job's upgraded-workspace readiness.
+
+        The worker analogue of ``persistent_app._poll_workspace_ready`` (sandbox
+        only — the worker MVP upgrades ``virtual → sandbox``; ``vm`` is the
+        operator-gated re-dispatch path). Returns the
+        ``{"backend":"sandbox","remote":{...}}`` block, or None on
+        timeout/failure (workspace_tier_upgrade.md §4.3 W1).
+        """
+        import time
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            ws = await self._orchestrator_client.get_job_workspace_status(job_id)
+            if not ws:
+                return None
+            # SSH key: orchestrator sends the path it resolved; fall back to the
+            # K8s default secret mount.
+            ssh_key = ws.get("ssh_key_path") or "/run/secrets/vm-ssh-key"
+            status = ws.get("status", "none")
+            if status == "ready" and ws.get("pod_ip"):
+                return {
+                    "backend": "sandbox",
+                    "remote": {
+                        "host": ws["pod_ip"],
+                        "port": ws.get("pod_port") or 30022,
+                        "username": "agent-host",
+                        "key_path": ssh_key,
+                        "workspace_path": "/home/agent-host/workspace",
+                    },
+                }
+            if status == "failed":
+                logger.warning(f"[{job_id}] Workspace provisioning failed: {ws}")
+                return None
+            if status == "none":
+                # No workspace_container recorded — nothing is provisioning.
+                return None
+            # Still pending/creating/created — wait and poll again.
+            await asyncio.sleep(poll_interval)
+
+        logger.warning(
+            f"[{job_id}] Workspace upgrade polling timed out after {timeout}s"
+        )
+        return None
+
+    async def _perform_inprocess_workspace_upgrade(self, target_tier: str) -> bool:
+        """Upgrade a running lite (``virtual``/``none``) job to a real ``sandbox``
+        workspace IN PROCESS, mirroring the session live swap
+        (workspace_tier_upgrade.md §4.3 W1).
+
+        Provision via the orchestrator → poll → connect a sandbox
+        ``RemoteBackend`` → seed the still-live virtual files into it (both
+        backends live) → swap the ``WorkspaceManager`` backend → re-derive
+        tools/shell → rebuild the graph on the SAME checkpointer. The caller then
+        re-streams the graph from the checkpoint.
+
+        Returns True on success (graph rebuilt, ready to resume on the new
+        backend); False on any failure (the caller surfaces the freeze so the
+        orchestrator pauses the job). ``config_override`` / ``resolved_config``
+        are deliberately NOT rewritten (frozen at first dispatch, §4.1) — the
+        swap is in-process and ephemeral.
+        """
+        job_id = self._current_job_id
+        old_backend = (
+            self._workspace_manager.backend if self._workspace_manager else None
+        )
+        if old_backend is None:
+            return False
+        # Guard: already a real (shell-capable) workspace — nothing to upgrade.
+        if getattr(old_backend, "supports_shell", False):
+            return True
+        if not self._orchestrator_client:
+            logger.warning(
+                f"[{job_id}] Workspace upgrade requested but no orchestrator "
+                f"client — cannot provision; surfacing freeze"
+            )
+            return False
+
+        logger.info(
+            f"[{job_id}] In-process workspace upgrade requested → {target_tier}"
+        )
+
+        # 1. Provision (server-side grant-gated, fail-closed). The job stays
+        #    'processing' — no pause, no re-dispatch.
+        try:
+            ok = await self._orchestrator_client.request_job_workspace_upgrade(
+                job_id, target_tier
+            )
+        except Exception as e:
+            logger.error(f"[{job_id}] Workspace upgrade provision request errored: {e}")
+            return False
+        if not ok:
+            logger.warning(
+                f"[{job_id}] Workspace upgrade refused or failed at the orchestrator"
+            )
+            return False
+
+        # 2. Poll for the ready connection block.
+        ws_config = await self._poll_job_workspace_ready(job_id, timeout=300)
+        if not ws_config or not ws_config.get("remote"):
+            logger.warning(
+                f"[{job_id}] Upgraded workspace did not become ready in time"
+            )
+            return False
+
+        # 3. Build + connect the new sandbox backend. Connect BEFORE the seed so
+        #    BOTH backends are live for the copy (mirrors the session handler).
+        try:
+            from .core.backends.remote import RemoteBackend
+
+            remote = ws_config["remote"]
+            shell_config = self.config.extra.get("shell", {})
+            new_backend = RemoteBackend(
+                host=remote["host"],
+                port=remote.get("port", 22),
+                username=remote.get("username", "agent-host"),
+                key_path=remote.get("key_path"),
+                workspace_path=remote.get(
+                    "workspace_path", "/home/agent-host/workspace"
+                ),
+                job_id=job_id,
+                scrollback_limit=shell_config.get("scrollback_limit", 5000),
+                default_timeout=shell_config.get("default_timeout", 120),
+                max_tabs=shell_config.get("max_tabs", 15),
+                blocked_commands=shell_config.get("blocked_commands"),
+                # sandbox keeps the sudo gate ("freeze") so its sudo→VM
+                # escalation path still fires; only a vm target would set "allow".
+                sudo_action=shell_config.get("sudo_action", "freeze"),
+            )
+            await asyncio.to_thread(new_backend.connect)
+        except Exception as e:
+            logger.error(f"[{job_id}] Failed to connect upgraded backend: {e}")
+            return False
+
+        # 4. Seed virtual → sandbox (both live), verify-before-flip.
+        try:
+            from .core.backends.seed import seed_workspace
+
+            n = await asyncio.to_thread(seed_workspace, old_backend, new_backend)
+            logger.info(f"[{job_id}] Seeded {n} file(s) into upgraded workspace")
+        except Exception as e:
+            logger.error(f"[{job_id}] Workspace seed failed: {e}")
+            try:
+                await asyncio.to_thread(new_backend.disconnect)
+            except Exception:
+                pass
+            return False
+
+        # 5. Swap the backend on the WorkspaceManager, drop the old virtual one.
+        self._workspace_manager._backend = new_backend
+        try:
+            await asyncio.to_thread(old_backend.disconnect)
+        except Exception:
+            pass
+        # Remove the stale freeze marker the graph wrote on freeze (seeded
+        # across): the job continues in-process, it is NOT frozen for the
+        # orchestrator.
+        try:
+            if new_backend.exists("output/job_frozen.json"):
+                new_backend.delete_file("output/job_frozen.json")
+        except Exception:
+            pass
+
+        # 6. Re-derive tools + shell manager for the new (shell-capable) backend.
+        self._cleanup_shell_manager()
+        await self._setup_job_tools()
+
+        # 7. Rebuild the graph with the new tools/LLMs/tool_context but the SAME
+        #    checkpointer, so the re-invoke resumes from the local checkpoint.
+        snapshot_manager = PhaseSnapshotManager(job_id, workspace_backend=new_backend)
+        self._graph = build_phase_alternation_graph(
+            strategic_llm_with_tools=self._strategic_llm_with_tools,
+            tactical_llm_with_tools=self._tactical_llm_with_tools,
+            tools=self._tools,
+            config=self.config,
+            workspace=self._workspace_manager,
+            todo_manager=self._todo_manager,
+            workspace_template="",
+            checkpointer=self._checkpointer,
+            auxiliary_llm=self._auxiliary_llm,
+            snapshot_manager=snapshot_manager,
+            tool_context=self._tool_context,
+            postgres_db=self.postgres_conn,
+        )
+        logger.info(
+            f"[{job_id}] Workspace upgraded to {target_tier}; graph rebuilt with "
+            f"shell/git tools — resuming in process"
+        )
+        return True
 
     def _load_workspace_template(self) -> str:
         """Load the workspace.md template for the nested loop graph.
@@ -2036,6 +2285,19 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         tool_names = filter_tools_by_backend(
             tool_names, self._workspace_manager.backend
         )
+
+        # Expose the in-process upgrade control tool ONLY on a lite (no-shell)
+        # backend — the W1 trigger (workspace_tier_upgrade.md §4.3): a lite worker
+        # that needs a real environment calls request_workspace_upgrade, which
+        # sets a workspace_upgrade_required freeze the agent intercepts and
+        # upgrades in place. Mirrors the session path
+        # (persistent_session._load_tools_for_backend); it isn't in any config's
+        # tool list, so without this a lite job could never request an upgrade.
+        # After a virtual→sandbox swap supports_shell=True, so the re-derive on
+        # the new backend drops it (nothing left to upgrade to).
+        if not getattr(self._workspace_manager.backend, "supports_shell", False):
+            if "request_workspace_upgrade" not in tool_names:
+                tool_names.append("request_workspace_upgrade")
 
         try:
             self._tools = load_tools(tool_names, context)

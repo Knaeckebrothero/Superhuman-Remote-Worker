@@ -142,6 +142,7 @@ POST   /api/jobs/{job_id}/messages/{thread_id}/reply                            
 PUT    /api/jobs/{job_id}/pause                                                         gated:require_internal_or_job_access
 GET    /api/jobs/{job_id}/progress                                                      gated:require_job_access
 POST   /api/jobs/{job_id}/promote                                                       gated:require_job_access
+POST   /api/jobs/{job_id}/provision-workspace                                           internal:require_internal
 POST   /api/jobs/{job_id}/reject                                                        gated:require_job_access
 GET    /api/jobs/{job_id}/repo/commits                                                  gated:require_job_access
 GET    /api/jobs/{job_id}/repo/contents                                                 gated:require_job_access
@@ -164,6 +165,7 @@ GET    /api/jobs/{job_id}/todos/current                                         
 POST   /api/jobs/{job_id}/upgrade-to-vm                                                 gated:require_job_access
 GET    /api/jobs/{job_id}/version                                                       gated:require_job_access
 GET    /api/jobs/{job_id}/workspace                                                     gated:require_job_access
+GET    /api/jobs/{job_id}/workspace-status                                              internal:require_internal
 GET    /api/jobs/{job_id}/workspace/{path:path}                                         gated:require_job_access
 PUT    /api/jobs/{job_id}/workspace/{path:path}                                         gated:require_job_access
 GET    /api/mcp-tokens                                                                  gated:require_approved_user
