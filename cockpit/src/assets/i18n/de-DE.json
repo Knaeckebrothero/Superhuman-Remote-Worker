@@ -251,6 +251,11 @@
   },
   "jobs": {
     "title": "Aufträge",
+    "confirmDelete": "Diesen Job endgültig löschen?",
+    "confirmCancel": "Diesen Job abbrechen?",
+    "confirmCancelHint": "Sie können ihn später von einem Checkpoint fortsetzen.",
+    "confirmCancelDismiss": "Weiterlaufen lassen",
+    "confirmCancelConfirm": "Job abbrechen",
     "loading": "Aufträge werden geladen...",
     "refresh": "Aktualisieren",
     "newJob": "Neuer Auftrag",

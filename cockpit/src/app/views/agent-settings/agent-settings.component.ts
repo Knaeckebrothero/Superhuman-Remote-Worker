@@ -1,5 +1,6 @@
-import {Component, computed, effect, ElementRef, input, output, signal, ViewChild} from '@angular/core';
+import {Component, computed, effect, ElementRef, inject, input, output, signal, ViewChild} from '@angular/core';
 import {Datasource} from '../../core/models/api.model';
+import {ViewportService} from '../../core/services/viewport.service';
 import {SettingsMode} from './agent-settings.types';
 import {ExecutionGroupComponent} from './execution-group.component';
 import {ModelGroupComponent} from './model-group.component';
@@ -36,10 +37,10 @@ type AgentSettingsTab = 'settings' | 'instructions' | 'advanced' | 'resolved';
     AppBadgeComponent,
   ],
   template: `
-    <div class="settings-root" [class.vertical]="mode() === 'job'" [class.horizontal]="mode() === 'session'">
+    <div class="settings-root" [class.vertical]="useVerticalTabs()" [class.horizontal]="!useVerticalTabs()">
       <!-- Tab navigation -->
       <app-tab-nav
-        [orientation]="mode() === 'job' ? 'vertical' : 'horizontal'"
+        [orientation]="useVerticalTabs() ? 'vertical' : 'horizontal'"
         [value]="activeTab()"
         (valueChange)="onTabChange($event)"
       >
@@ -196,6 +197,14 @@ export class AgentSettingsComponent {
   config = input<Record<string, unknown>>({});
   mode = input<SettingsMode>('job');
   disabled = input(false);
+
+  private readonly viewport = inject(ViewportService);
+  /**
+   * Vertical tab rail only in job mode on wide screens. On mobile the rail would
+   * eat ~130px and squeeze the content into ~219px (horizontal scroll, clipped
+   * Delegation controls), so collapse to horizontal tabs with full-width content.
+   */
+  readonly useVerticalTabs = computed(() => this.mode() === 'job' && !this.viewport.isMobile());
   /** Whether the selected project has shared memory. */
   showProjectMemory = input(false);
   /** Default tool lists from defaults.yaml. */
