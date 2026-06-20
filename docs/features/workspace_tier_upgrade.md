@@ -42,8 +42,10 @@ container→VM upgrade precedent from [[vm_backend]]. **All of Phase 1 (S1–S5)
 now built + unit-green** (S4 = the shared Sec-1 grant gate; S5 = the
 agent-initiated offer: `workspace_upgrade_required` freeze vocab +
 `request_workspace_upgrade` tool + cockpit offer). The MVP (S1+S2+S3) is k3d
-end-to-end verified; what remains is the worker path (§4.3) and a live smoke test
-of the S5 agent-offer round-trip.
+end-to-end verified. **Scope built = session `virtual → sandbox` ONLY** — see the
+scope matrix below. What remains: **Phase 2** (session `virtual → vm` — the
+endpoint currently `400`s on `vm`), **Phase 3** (worker jobs, §4.3), **Phase 4**
+(warm pool + auto-grant), and a live smoke test of the S5 agent-offer round-trip.
 
 **In one paragraph.** Make workspace acquisition lazy: a session (or job) starts
 on `virtual` and upgrades to a `sandbox` pod (or `vm`) only when the work needs
@@ -65,6 +67,34 @@ unit-green + ruff-clean on `develop` (uncommitted). The session path (S1+S2+S3)
 is **k3d end-to-end verified** (2026-06-20) — see the Status block. A
 prerequisite gap (persistent `virtual` sessions couldn't boot) was found and
 fixed as part of the smoke test.
+
+#### Scope — what actually works today (read this first on resume)
+
+Despite the doc title's `virtual`/`none` → `sandbox`/`vm`, **Phase 1 built
+exactly ONE cell of that matrix: persistent _sessions_, `virtual → sandbox`.**
+Everything else is design-stage.
+
+| Source → Target | → `sandbox` (container) | → `vm` |
+|---|---|---|
+| **Session** `virtual` | ✅ **Built + k3d-verified** (S1–S5) | ❌ Phase 2 — endpoint `400`s on `vm` |
+| **Session** `none` | 🟡 plausibly works (tool exposed + lite-boot fixed), **unverified** | ❌ Phase 2 |
+| **Worker job** `virtual` | ❌ Phase 3 (§4.3 W1+W2) | ❌ Phase 3 (§4.3 W3) |
+| **Worker job** `none` | ❌ out of scope (scratch tmpdir has no durable anchor) | ❌ |
+
+Three things explicitly **NOT** done yet (common misreadings):
+- **No VM target.** `agent_upgrade_thread_to_workspace` hard-`400`s on
+  `target_tier != "sandbox"` (`orchestrator/main.py`). `_handle_workspace_upgrade`
+  *carries* `vm` forward-compat (sets `sudo_action="allow"` for `vm`, reads
+  `backend_tier` from the poll result) but the endpoint gates it off, so that
+  branch is **unreachable until Phase 2**. The pre-existing `upgrade-to-vm` path is
+  `sandbox → vm` (sudo-triggered) and a shell-less `virtual` session can never
+  reach it.
+- **No worker-job upgrades.** Sessions only. The entire §4.3 worker flow (W1–W3)
+  is unbuilt — its blocker is the non-portable pod-local LangGraph checkpoint.
+- **`none` is only theoretically covered.** The S5 request tool is exposed on any
+  no-shell backend (so a `none` session would see it) and the lite-boot fix
+  covers `none`, but **only `virtual → sandbox` was built + tested**; `none →
+  sandbox` is unverified and `none` for workers is out of scope.
 
 | Slice | What | Status |
 |---|---|---|
@@ -765,14 +795,45 @@ classifier misses ~17% of overeager actions). Maps to open question #1.
   initiated offer: freeze vocab + `request_workspace_upgrade` tool + cockpit
   offer), all unit-green + ruff-clean. **Remaining:** a live k3d smoke test of the
   S5 agent-offer round-trip (tool → offer → accept → shell).
-- **Phase 2 — Sessions, `virtual → vm`.** Add the VM target to
-  `_handle_workspace_upgrade` (reuses `request_thread_vm_upgrade`), keep the
-  operator-approval gate. Mostly wiring once Phase 1 exists.
-- **Phase 3 — Worker jobs.** §4.3 slices W1–W3 (MVP = W1 + W2: in-process
-  `virtual → sandbox` swap mirroring the session — no re-dispatch, no checkpoint
-  move). The operator-gated VM path (W3) reuses the existing container→VM
-  machinery; `virtual → vm` composes W1 + the existing sudo→VM path, so no
-  lite-checkpoint re-dispatch is ever required.
+- **Phase 2 — Sessions, `virtual → vm`. ◻️ Not started. Resume checklist** (mostly
+  wiring; the agent handler already has the `vm` branch):
+  1. **Endpoint:** drop the `target_tier != "sandbox"` → `400` in
+     `agent_upgrade_thread_to_workspace` (`orchestrator/main.py`) for `vm`, and for
+     a `vm` target provision via the VM path
+     (`vm_provisioner.create_thread_vm`, as `agent_upgrade_thread_to_vm` does) and
+     record `metadata.vm` instead of `metadata.workspace_container`. Simplest:
+     route `target_tier == "vm"` straight to the existing
+     `agent_upgrade_thread_to_vm` body.
+  2. **Agent handler:** `_handle_workspace_upgrade` already builds the backend with
+     `sudo_action="allow"` when `backend_tier == "vm"` and reads `backend_tier`
+     from the poll — so the seed + swap + retool + persist all work unchanged. The
+     only agent change is the **poll**: use `_poll_vm_ready` (`persistent_app.py`,
+     already exists) for the `vm` branch instead of `_poll_workspace_ready`, and
+     read the VM connection block from `metadata.vm`.
+  3. **Client:** `request_thread_vm_upgrade` already exists in
+     `orchestrator_client.py` — call it for the `vm` branch.
+  4. **⚠️ Grant gap to close:** `_enforce_workspace_upgrade_grants` already handles
+     `vm` (runs `_check_vm_permission` + the `vm_workspace` PDP), BUT the existing
+     `agent_upgrade_thread_to_vm` endpoint **does not call any grant gate today** —
+     it only checks `vm_provisioner.is_available`. Wire
+     `_enforce_workspace_upgrade_grants(thread, target_tier="vm")` into it (and/or
+     the unified endpoint) so the `vm` path is authorized like dispatch.
+  5. **Cockpit:** the `workspace_upgrade.needed` offer already carries
+     `target_tier`; make the accept send that tier (today `/upgrade-workspace`
+     hard-codes `sandbox`). Keep operator approval for `vm`.
+- **Phase 3 — Worker jobs. ◻️ Not started.** Full design in **§4.3 (W1–W3)** —
+  start there. MVP = W1 + W2: in-process `virtual → sandbox` swap mirroring the
+  session (no re-dispatch, no checkpoint move), reusing `seed_workspace` (S3a) +
+  the `request_workspace_upgrade` tool / `workspace_upgrade_required` freeze (S5).
+  New code needed: agent-side freeze interception + re-`ainvoke` (`src/agent.py`,
+  §4.3 W1) and the orchestrator `POST /api/jobs/{id}/provision-workspace` endpoint
+  (W2, gated by the same `_enforce_workspace_upgrade_grants`). The blocker is the
+  pod-local non-portable LangGraph checkpoint (§2.3) — the in-process swap sidesteps
+  it. The operator-gated VM path (W3) reuses the existing container→VM machinery;
+  `virtual → vm` composes W1 + the existing sudo→VM path, so no lite-checkpoint
+  re-dispatch is ever required. Worker-side items still ◻️ in §5: the
+  `context.workspace_upgrade` namespace + `completion.py` routing (item 2),
+  `_job_needs_sandbox` + `_resume_job_on_agent` sandbox injection (item 6).
 - **Phase 4 — Accelerate + automate.** Warm pool for ~instant sandbox upgrades;
   **auto-upgrade `virtual → sandbox` on coding intent** — only after the trigger
   is provably human-authored (not ingested content), egress stays default-deny,
