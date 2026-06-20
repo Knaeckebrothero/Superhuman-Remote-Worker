@@ -19,9 +19,10 @@ related:
 
 > **Status (2026-06-20):** The feature set described here is built, but the
 > engine is now a **native async SRW subsystem** (DB on the shared `srw_vector`
-> pool, verifier on the auxiliary-LLM service) — not the standalone package this
-> doc assumes. See [[citation_engine_integration]] for the current plumbing +
-> status (Phases 1–2 shipped).
+> pool, verifier on the auxiliary-LLM service, cited cloud docs anchored by a
+> saved snapshot) — not the standalone package this doc assumes. See
+> [[citation_engine_integration]] for the current plumbing + status (Phases 1–3
+> shipped).
 
 **Status:** Planning
 **Created:** 2026-02-08
