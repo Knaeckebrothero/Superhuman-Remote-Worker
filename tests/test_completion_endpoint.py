@@ -332,6 +332,22 @@ class TestDetermineJobStatus:
         status, err = determine_job_status(job, result)
         assert status == "pending_review"
 
+    def test_workspace_upgrade_required_paused(self):
+        """A worker in-process sandbox upgrade that FAILED surfaces the freeze;
+        the orchestrator pauses for re-attempt (workspace_tier_upgrade.md §4.3
+        W1). On the happy path this freeze never reaches completion — the agent
+        swaps in place and the job continues."""
+        job = make_job(
+            freeze_data={
+                "freeze_type": "workspace_upgrade_required",
+                "target_tier": "sandbox",
+            }
+        )
+        result = {"should_stop": True, "goal_achieved": False}
+        status, err = determine_job_status(job, result)
+        assert status == "paused"
+        assert err is None
+
     def test_no_freeze_data_not_goal_achieved(self):
         """Stopped without goal or freeze data — pending_review."""
         job = make_job(verification_enabled=True)

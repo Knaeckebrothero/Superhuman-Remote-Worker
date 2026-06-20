@@ -2609,37 +2609,40 @@ async def _check_vm_permission(
         )
 
 
-async def _enforce_workspace_upgrade_grants(
-    thread: dict,
+async def _enforce_workspace_upgrade_grants_for_config(
     *,
+    owner_id: Any,
+    config_override: dict | None,
     target_tier: str,
 ) -> None:
-    """Sec-1 — shared upgrade-authorization gate (server-side, fail-closed).
+    """Sec-1 — shared upgrade-authorization gate core (server-side, fail-closed).
 
-    The single PEP that both the session upgrade endpoint
-    (``agent_upgrade_thread_to_workspace``, workspace_tier_upgrade.md §4.2 S4)
-    and the future worker ``provision-workspace`` endpoint (§4.3 W2) call before
-    provisioning. Re-runs the dispatch PDP (``capability_grants.evaluate``) on the
-    POST-UPGRADE config — the thread's stored ``config_override`` with
-    ``workspace.backend`` flipped to ``target_tier`` — exactly as
-    ``_enforce_dispatch_grants`` does at dispatch, just re-run at upgrade time:
+    Parameterized by the raw ``(owner_id, config_override)`` so BOTH the session
+    path (``thread.metadata.config_override``) and the worker path (the
+    ``jobs.config_override`` column) reuse one PEP — see the thin
+    ``_enforce_workspace_upgrade_grants`` (session) /
+    ``_enforce_job_workspace_upgrade_grants`` (worker, §4.3 W2) wrappers.
+
+    Re-runs the dispatch PDP (``capability_grants.evaluate``) on the POST-UPGRADE
+    config — the stored ``config_override`` with ``workspace.backend`` flipped to
+    ``target_tier`` — exactly as ``_enforce_dispatch_grants`` does at dispatch,
+    just re-run at upgrade time:
 
     - ``target_tier='vm'`` trips the ``vm_workspace`` grant requirement, and
       additionally keeps the operator gate (the global ``vm_workspaces``
       kill-switch + per-user ``can_use_vm`` via ``_check_vm_permission``).
     - ``target_tier='sandbox'`` is NOT gated by the backend (the PDP gates only
       ``vm`` and explicitly-declared tool flags), so it passes by default —
-      matching "sandbox is the ungated default tier" — unless the thread's
-      config already declares a gated tool (e.g. ``tools.shell``) the owner
-      lacks, in which case dispatch would have rejected it too.
+      matching "sandbox is the ungated default tier" — unless the config already
+      declares a gated tool (e.g. ``tools.shell``) the owner lacks, in which case
+      dispatch would have rejected it too.
 
     Raises ``HTTPException(403)`` on violation. No new grant key, no
     sandbox-specific rule — identical to dispatch-time enforcement.
     """
-    # thread["user_id"] comes back from asyncpg as a UUID object; get_user (and
+    # owner_id comes back from asyncpg as a UUID object; get_user (and
     # _enforce_dispatch_grants below) expect a string — coerce once, matching the
     # str(user["id"]) convention used elsewhere.
-    owner_id = thread.get("user_id")
     owner_id = str(owner_id) if owner_id is not None else None
     owner = await postgres_db.get_user(owner_id) if owner_id else None
 
@@ -2648,13 +2651,6 @@ async def _enforce_workspace_upgrade_grants(
     if target_tier == "vm":
         await _check_vm_permission(owner, job_needs_vm=True)
 
-    metadata = thread.get("metadata") or {}
-    if isinstance(metadata, str):
-        try:
-            metadata = json.loads(metadata)
-        except (json.JSONDecodeError, TypeError):
-            metadata = {}
-    config_override = metadata.get("config_override") or {}
     if not isinstance(config_override, dict):
         config_override = {}
     # Post-upgrade config = the frozen override with the backend flipped. A
@@ -2676,6 +2672,48 @@ async def _enforce_workspace_upgrade_grants(
         raise HTTPException(
             status_code=403, detail=_grant_violations_detail(exc.violations)
         ) from exc
+
+
+async def _enforce_workspace_upgrade_grants(
+    thread: dict,
+    *,
+    target_tier: str,
+) -> None:
+    """Session wrapper over the shared Sec-1 gate — extracts the owner +
+    ``config_override`` from a thread row (``metadata.config_override``) and
+    delegates to ``_enforce_workspace_upgrade_grants_for_config``."""
+    metadata = thread.get("metadata") or {}
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except (json.JSONDecodeError, TypeError):
+            metadata = {}
+    await _enforce_workspace_upgrade_grants_for_config(
+        owner_id=thread.get("user_id"),
+        config_override=metadata.get("config_override") or {},
+        target_tier=target_tier,
+    )
+
+
+async def _enforce_job_workspace_upgrade_grants(
+    job: dict,
+    *,
+    target_tier: str,
+) -> None:
+    """Worker wrapper over the shared Sec-1 gate (§4.3 W2). Jobs carry
+    ``config_override`` as a top-level JSONB column (not under ``metadata``) and
+    ``user_id`` as the owner — extract those and delegate to the shared core."""
+    config_override = job.get("config_override") or {}
+    if isinstance(config_override, str):
+        try:
+            config_override = json.loads(config_override)
+        except (json.JSONDecodeError, TypeError):
+            config_override = {}
+    await _enforce_workspace_upgrade_grants_for_config(
+        owner_id=job.get("user_id"),
+        config_override=config_override,
+        target_tier=target_tier,
+    )
 
 
 async def _archive_and_cleanup_workspace(
@@ -13307,6 +13345,130 @@ async def agent_upgrade_thread_to_workspace(
         "status": "provisioning",
         "thread_id": thread_id,
         "target_tier": "sandbox",
+    }
+
+
+class JobWorkspaceUpgradeRequest(BaseModel):
+    target_tier: str = "sandbox"
+
+
+@app.post("/api/jobs/{job_id}/provision-workspace")
+async def provision_job_workspace(
+    request: Request,
+    job_id: str,
+    body: JobWorkspaceUpgradeRequest | None = None,
+) -> dict[str, Any]:
+    """Provision a real workspace container for a RUNNING lite (``virtual``/
+    ``none``) worker job, upgrading it to the ``sandbox`` tier IN PLACE.
+    **Internal** (P4b) — requires ``X-Internal-Key``.
+
+    The worker-side counterpart to the session ``upgrade-to-workspace`` endpoint
+    (workspace_tier_upgrade.md §4.3 W2). Unlike the operator-gated
+    ``/api/jobs/{id}/upgrade-to-vm`` (which freezes → re-dispatches), this never
+    pauses or re-dispatches: the job stays ``processing`` and the SAME running
+    agent provisions, polls ``/workspace-status`` for readiness, seeds the
+    virtual files into the new pod, and hot-swaps its ``WorkspaceManager``
+    backend — re-``ainvoke``-ing from the local checkpoint. That sidesteps the
+    non-portable pod-local LangGraph checkpoint entirely (§2.3). Idempotent: a
+    second call while a container is already provisioning/ready is a no-op.
+
+    ``vm`` is intentionally NOT accepted here: VM is operator-gated and must
+    pause for approval (it can't stay in-process), so it keeps the existing
+    ``/upgrade-to-vm`` freeze→approve→re-dispatch path (§4.3 W3).
+    """
+    await require_internal(request)
+    target_tier = (body.target_tier if body else "sandbox") or "sandbox"
+    if target_tier != "sandbox":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"provision-workspace supports target_tier 'sandbox' only for a "
+                f"running job; vm upgrades go through /upgrade-to-vm "
+                f"(operator-gated). Got {target_tier!r}"
+            ),
+        )
+
+    job = await postgres_db.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    # Sec-1 — authorize against the owner's grants BEFORE provisioning
+    # (fail-closed), via the shared gate. sandbox passes by default; a
+    # shell-restricted owner is refused 403.
+    await _enforce_job_workspace_upgrade_grants(job, target_tier=target_tier)
+
+    if not (container_provisioner.is_available and container_provisioner.in_cluster):
+        raise HTTPException(
+            status_code=503,
+            detail="Workspace container provisioning not available (no in-cluster K8s)",
+        )
+
+    # Idempotency: short-circuit if a container is already in flight or ready.
+    context = job.get("context") or {}
+    if isinstance(context, str):
+        try:
+            context = json.loads(context)
+        except (json.JSONDecodeError, TypeError):
+            context = {}
+    wc = context.get("workspace_container") or {}
+    if wc.get("status") in ("pending", "creating", "created", "ready"):
+        return {
+            "status": wc["status"],
+            "job_id": job_id,
+            "target_tier": "sandbox",
+            "message": "Workspace container already provisioned or in progress",
+        }
+
+    # Mark pending, then provision in the background: create_workspace blocks up
+    # to ~120s waiting for the pod IP and updates context.workspace_container to
+    # ready/failed itself. The agent polls /workspace-status
+    # (-> _poll_job_workspace_ready) for the ready connection block, then swaps
+    # in place. No status change, no _trigger_dispatch — the running agent owns
+    # the swap (the whole point of the in-process design, §4.3 W1).
+    await postgres_db.merge_workspace_container_context(job_id, {"status": "pending"})
+    asyncio.create_task(
+        container_provisioner.create_workspace(WorkspaceOwner.job(job_id))
+    )
+
+    return {
+        "status": "provisioning",
+        "job_id": job_id,
+        "target_tier": "sandbox",
+    }
+
+
+@app.get("/api/jobs/{job_id}/workspace-status")
+async def get_job_workspace_status(request: Request, job_id: str) -> dict[str, Any]:
+    """Return a running job's workspace-container connection details for the
+    agent's in-process upgrade poller. **Internal** — requires ``X-Internal-Key``.
+
+    The job-side analogue of ``GET /api/agents/threads/{id}/workspace``: surfaces
+    ``context.workspace_container`` (status + pod IP/port) so the agent's
+    ``_poll_job_workspace_ready`` can build the upgraded ``RemoteBackend``
+    (workspace_tier_upgrade.md §4.3 W1). The provisioner writes ``pod_ip``/
+    ``port``; map ``port`` → ``pod_port`` to match the session poller's shape.
+    """
+    await require_internal(request)
+    job = await postgres_db.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    context = job.get("context") or {}
+    if isinstance(context, str):
+        try:
+            context = json.loads(context)
+        except (json.JSONDecodeError, TypeError):
+            context = {}
+    wc = context.get("workspace_container") or {}
+
+    return {
+        "status": wc.get("status", "none"),
+        "pod_ip": wc.get("pod_ip") or wc.get("host"),
+        "pod_port": wc.get("pod_port") or wc.get("port"),
+        "pod_name": wc.get("pod_name"),
+        "namespace": wc.get("namespace"),
+        "ssh_key_path": os.environ.get("SSH_KEY_PATH"),
+        "git_remote_url": wc.get("git_remote_url"),
     }
 
 

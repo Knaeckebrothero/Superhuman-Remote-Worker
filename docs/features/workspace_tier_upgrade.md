@@ -53,12 +53,31 @@ fail-closed (kill-switch → `403` *before* the availability `503`, on both the
 delegated and direct endpoints), sandbox is unaffected by the vm-only switch —
 and the smoke **caught + fixed a real bug** in the shared Sec-1 gate (a
 `pgproto.UUID` thread `user_id` crashed `get_user`; it also affected Phase-1
-sandbox S4; now coerced to `str`). **Scope built = session `virtual → sandbox`
-(k3d-verified) + session `virtual → vm` (orchestrator k3d-verified; full VM
-boot/seed/sudo needs the dev cluster — k3d has no KubeVirt/NATS).** What remains:
-**Phase 3** (worker jobs, §4.3), **Phase 4** (warm pool + auto-grant), a live k3d
-smoke of the S5 agent-offer round-trip, and a full `virtual → vm` boot smoke on
-the dev cluster.
+sandbox S4; now coerced to `str`). **Phase 3 (worker jobs `virtual → sandbox`) is
+now also built + unit-green + k3d END-TO-END VERIFIED** (2026-06-20): the worker
+upgrades **in process**, exactly mirroring the session live swap — the agent
+intercepts a `workspace_upgrade_required` freeze returned by `ainvoke`, calls a
+new grant-gated orchestrator endpoint (`POST /api/jobs/{id}/provision-workspace`,
+status stays `processing` — no re-dispatch), polls `…/workspace-status`, seeds
+the still-live virtual files into the new sandbox pod, swaps the
+`WorkspaceManager` backend, re-derives tools/shell, rebuilds the graph on the
+**same checkpointer**, and re-`ainvoke`s from the local checkpoint. That
+sidesteps the non-portable pod-local LangGraph checkpoint entirely (§2.3). The
+shared Sec-1 grant gate was refactored into a config-parameterized core so the
+worker endpoint reuses it (a job carries `config_override` as a top-level column,
+not under `metadata`). **The k3d smoke (2026-06-20) ran a real virtual worker job
+through the whole path:** it booted lite (no shell, `request_workspace_upgrade`
+exposed), called the tool, the agent intercepted the freeze and upgraded **on the
+same pod** (no re-dispatch) — seeded 49 files virtual→sandbox, swapped, re-derived
+`run_command`, rebuilt the graph, resumed in process, and ran `echo
+SMOKE_OK_PHASE3 && uname -n` on the sandbox (the marker file on the pod proves it:
+`SMOKE_OK_PHASE3` + the sandbox hostname). **Scope built = session `virtual →
+sandbox` (k3d-verified) + session `virtual → vm` (orchestrator k3d-verified; full
+VM boot/seed/sudo needs the dev cluster — k3d has no KubeVirt/NATS) + worker
+`virtual → sandbox` (unit-green + k3d end-to-end verified).** What remains: the
+operator-gated worker `* → vm` re-dispatch (Phase 3 W3, deferred), **Phase 4**
+(warm pool + auto-grant), a live k3d smoke of the S5 agent-offer round-trip, and a
+full `virtual → vm` boot smoke on the dev cluster.
 
 **In one paragraph.** Make workspace acquisition lazy: a session (or job) starts
 on `virtual` and upgrades to a `sandbox` pod (or `vm`) only when the work needs
@@ -76,32 +95,55 @@ but is an accelerator, not a prerequisite.
 ### Implementation status (2026-06-20)
 
 Slice-by-slice; details in each slice below. **Built** = code landed +
-unit-green + ruff-clean on `develop` (uncommitted). The session sandbox path
-(S1+S2+S3) is **k3d end-to-end verified** (2026-06-20) — see the Status block;
-the Phase-2 `virtual → vm` path is **k3d-verified orchestrator-side** (routing +
-fail-closed grant gate; the full VM boot needs the dev cluster). Two gaps were
-found and fixed via the smoke tests: persistent `virtual` sessions couldn't boot
-(Phase 1), and the shared grant gate crashed on a real (asyncpg-UUID) thread
-`user_id` (Phase 2 — which also affected Phase-1 sandbox S4). The full
-tested/untested map lives in
+unit-green + ruff-clean. **Commit state (2026-06-20):** Phases 1+2 are
+**committed** on `develop` (HEAD `44b5b436` "Support VM-tier workspace upgrades
+(Phase 2)" + `52f46c01`/`9ede6b14`/`6b1374d6`); **Phase 3 is built but
+uncommitted** (9-file changeset: `src/agent.py`, `src/api/orchestrator_client.py`,
+`orchestrator/main.py`, `orchestrator/services/completion.py`,
+`docs/security/endpoint_inventory.txt`, `tests/test_completion_endpoint.py`,
+this doc, the coverage doc, + new `tests/test_job_workspace_upgrade.py`).
+
+Verification by phase: the session sandbox path (S1+S2+S3) is **k3d end-to-end
+verified**; Phase-2 `virtual → vm` is **k3d-verified orchestrator-side** (routing
++ fail-closed grant gate; full VM boot needs the dev cluster); Phase-3 worker
+`virtual → sandbox` is **k3d end-to-end verified** (real virtual job: 49 files
+seeded, upgraded on the same pod with no re-dispatch, shell command run on the
+sandbox — see the Status block + §6 Phase 3).
+
+Three gaps were found + fixed during the builds/smokes: persistent `virtual`
+sessions couldn't boot (Phase 1); the shared grant gate crashed on a real
+(asyncpg-UUID) thread `user_id` (Phase 2 — which also affected Phase-1 sandbox
+S4); and the worker upgrade had **no trigger** — `request_workspace_upgrade` is
+in no config and a worker's tool list is config-driven, so `_setup_job_tools` now
+injects it lite-only (Phase 3, mirroring the session). The full tested/untested
+map lives in
 [`tests/workspace_tier_upgrade_test_coverage.md`](../../tests/workspace_tier_upgrade_test_coverage.md).
 
 #### Scope — what actually works today (read this first on resume)
 
 Despite the doc title's `virtual`/`none` → `sandbox`/`vm`, **Phases 1+2 built the
 two _session_ cells: `virtual → sandbox` (k3d-verified) and `virtual → vm`
-(unit-green).** The worker-job row and the `none` cells are still design-stage.
+(unit-green); Phase 3 (2026-06-20) adds the _worker-job_ `virtual → sandbox`
+cell (in-process, unit-green + **k3d end-to-end verified**).** The `none` cells
+and the worker→vm cell are still design-stage.
 
 | Source → Target | → `sandbox` (container) | → `vm` |
 |---|---|---|
 | **Session** `virtual` | ✅ **Built + k3d-verified** (S1–S5) | ✅ **Built** — orchestrator k3d-verified (Phase 2); full VM boot needs dev cluster |
 | **Session** `none` | 🟡 plausibly works (tool exposed + lite-boot fixed), **unverified** | 🟡 plausibly works (same delegation), **unverified** |
-| **Worker job** `virtual` | ❌ Phase 3 (§4.3 W1+W2) | ❌ Phase 3 (§4.3 W3) |
+| **Worker job** `virtual` | ✅ **Built + k3d-verified** — in-process swap (Phase 3 W1+W2) | ❌ Phase 3 W3 (deferred — operator-gated re-dispatch; composes W1 + sudo→VM) |
 | **Worker job** `none` | ❌ out of scope (scratch tmpdir has no durable anchor) | ❌ |
 
 Two things explicitly **NOT** done yet (common misreadings):
-- **No worker-job upgrades.** Sessions only. The entire §4.3 worker flow (W1–W3)
-  is unbuilt — its blocker is the non-portable pod-local LangGraph checkpoint.
+- **Worker-job upgrades = `virtual → sandbox` only.** Phase 3 built the
+  in-process worker swap (W1 + W2): the agent intercepts a
+  `workspace_upgrade_required` freeze from `ainvoke`, provisions a sandbox, seeds
+  from the live virtual backend, swaps the `WorkspaceManager` backend, retools,
+  and re-`ainvoke`s from the local checkpoint — no re-dispatch, no checkpoint
+  move (sidestepping the non-portable pod-local checkpoint). **Unit-green + k3d
+  end-to-end verified** (2026-06-20: a real virtual job seeded 49 files, upgraded
+  on the same pod, and ran a shell command on the sandbox). The operator-gated
+  worker→vm path (W3) is deferred.
 - **`none` is only theoretically covered.** The S5 request tool is exposed on any
   no-shell backend (so a `none` session would see it) and the lite-boot fix
   covers `none`, but **only `virtual → sandbox` was built + tested**; `none →
@@ -117,9 +159,12 @@ Two things explicitly **NOT** done yet (common misreadings):
 | §4.2 — | Minimal Cockpit (`workspace_upgrade.*` toasts + `/upgrade-workspace`) | **✅ Built** |
 | §4.2 **S4** | Grant enforcement (shared §4.4 Sec-1 gate) | **✅ Built** |
 | §4.2 **S5** | Agent-initiated offer (`request_workspace_upgrade` tool + freeze) | **✅ Built** |
-| §4.3 **W1–W3** | Worker-job flow (in-process `virtual → sandbox`, vm re-dispatch) | Design |
-| §4.4 **Sec-1…5** | Capability & security slices | Design |
+| §4.3 **W1** | Worker in-process `virtual → sandbox` (freeze interception + re-`ainvoke`) | **✅ Built + k3d-verified** (Phase 3) |
+| §4.3 **W2** | Orchestrator `POST …/jobs/{id}/provision-workspace` + `…/workspace-status` + client | **✅ Built + k3d-verified** (Phase 3) |
+| §4.3 **W3** | Operator-gated worker `* → vm` re-dispatch | Design (deferred; composes W1 + sudo→VM) |
+| §4.4 **Sec-1…5** | Capability & security slices | Design (Sec-1 ✅ — now shared by session + worker) |
 | Phase 2 | Sessions `virtual → vm` | **✅ Built** (orchestrator k3d-verified; VM boot needs dev cluster) |
+| Phase 3 | Worker jobs `virtual → sandbox` (W1+W2) | **✅ Built + k3d end-to-end verified** |
 
 **Landing spots for the built slices:**
 - S1 — `src/api/persistent_session.py`: `resetup_tools_for_backend()` +
@@ -152,6 +197,27 @@ Two things explicitly **NOT** done yet (common misreadings):
   vm`. Tests: `tests/test_thread_endpoints.py` (vm delegation + `403` on both the
   delegated and direct endpoints), `tests/test_capability_grants.py`,
   `persistent-chat.service.spec.ts`. Tested/untested map:
+  [`tests/workspace_tier_upgrade_test_coverage.md`](../../tests/workspace_tier_upgrade_test_coverage.md).
+- **Phase 3 (worker `virtual → sandbox`, in-process)** — `src/agent.py`:
+  `_process_job_streaming` now wraps the stream in an upgrade loop (intercepts a
+  `workspace_upgrade_required`/sandbox freeze → `_perform_inprocess_workspace_upgrade`
+  → re-stream from checkpoint); new `_perform_inprocess_workspace_upgrade`
+  (provision → poll → connect → seed → swap `_workspace_manager._backend` →
+  `_setup_job_tools` → rebuild graph on the same checkpointer) and
+  `_poll_job_workspace_ready` (sandbox-only job analogue of
+  `_poll_workspace_ready`); `_setup_job_tools` injects `request_workspace_upgrade`
+  lite-only (the W1 trigger — it's in no config). `src/api/orchestrator_client.py`:
+  `request_job_workspace_upgrade` + `get_job_workspace_status`. `orchestrator/main.py`:
+  `POST /api/jobs/{id}/provision-workspace` (status stays `processing`, no
+  re-dispatch) + `GET /api/jobs/{id}/workspace-status`; the Sec-1 gate refactored
+  into `_enforce_workspace_upgrade_grants_for_config` (shared core) + the existing
+  session wrapper + new `_enforce_job_workspace_upgrade_grants` (job carries
+  `config_override` as a top-level column). Manifest regenerated (both endpoints
+  auto-classified `internal:require_internal`). Tests:
+  `tests/test_job_workspace_upgrade.py` (28 cases: endpoint routing/idempotency/
+  gate, the job-wrapper extraction vs the real `evaluate`, the W1 trigger-exposure
+  contract, the agent poller + upgrade guards + the streaming-interception
+  decision logic). Tested/untested map:
   [`tests/workspace_tier_upgrade_test_coverage.md`](../../tests/workspace_tier_upgrade_test_coverage.md).
 
 ---
@@ -559,7 +625,12 @@ claim + `none`-tier (Phase 4); `virtual → vm`, which reuses the S3 handler wit
 `target_tier="vm"`, the existing VM provisioner, and the operator-approval gate
 (Phase 2).
 
-### 4.3 Worker-job flow (v2)
+### 4.3 Worker-job flow (v2 — ✅ MVP built + k3d-verified, Phase 3; W3 deferred)
+
+> **Status:** W1 + W2 (in-process `virtual → sandbox`) are built + k3d
+> end-to-end verified (2026-06-20); the as-built detail is in the W1/W2 notes
+> below + §6 Phase 3. The design narrative here is preserved for the rationale.
+> Only the operator-gated worker `* → vm` path (W3) remains deferred.
 
 Worker jobs are harder than sessions for one reason: the LangGraph checkpoint is
 **pod-local and non-portable** (AsyncSqliteSaver at `WORKSPACE_PATH/checkpoints/
@@ -607,6 +678,18 @@ helper (§4.2 S3a).
   continues **in the same agent pod** with a shell, and completes. Logs show
   "Backend swapped" with no `/job/resume`.
 - *Deps:* §4.2 S3a + §4.2 S5 + W2.
+- ***As built (Phase 3, 2026-06-20) ✅ — full detail in §6 Phase 3.*** Landed in
+  `_process_job_streaming` (the one-shot upgrade loop) + `_perform_inprocess_workspace_upgrade`
+  + `_poll_job_workspace_ready` (`src/agent.py`). Two refinements vs the sketch:
+  (a) the interception lives in the **streaming** generator (the orchestrator runs
+  jobs with `stream=True`), not after a bare `ainvoke`; (b) the resume uses the
+  proven `aupdate_state(as_node="__start__")` + re-stream pattern — and since
+  `restore_todo_state` already clears `should_stop`/`goal_achieved` on resume, the
+  re-invoke only additionally clears the stale `freeze_data`. On failure the freeze
+  is surfaced unchanged and `completion.py` routes it → `paused`. Unit-green
+  (`tests/test_job_workspace_upgrade.py`) **+ k3d end-to-end verified 2026-06-20**
+  (real virtual job: seeded 49 files, upgraded on the same pod with no
+  re-dispatch, ran a shell command on the sandbox — see §6 Phase 3).
 
 **W2 — Orchestrator: provision-workspace-for-a-running-job (gated).** New `POST
 /api/jobs/{id}/provision-workspace {target_tier}`: grant check (fail-closed,
@@ -618,6 +701,17 @@ polls `get_job_workspace` for readiness (the job-side analogue of
 - *Verify:* call for a virtual job → pod spawns, `context.workspace_container`
   recorded, status unchanged.
 - *Deps:* none (parallel with W1).
+- ***As built (Phase 3, 2026-06-20) ✅.*** `POST /api/jobs/{id}/provision-workspace`
+  (`internal:require_internal`; refuses `vm` with `400` — operator-gated → keeps
+  `/upgrade-to-vm`) + `GET /api/jobs/{id}/workspace-status` (the agent's poll
+  source, mapping the provisioner's `port` → `pod_port`). Grant check via the
+  shared `_enforce_job_workspace_upgrade_grants` (the Sec-1 gate was refactored
+  into a config-parameterized core; a job's `config_override` is a top-level
+  column). Idempotent on `context.workspace_container.status`; marks `pending`
+  then `create_workspace(WorkspaceOwner.job(...))` in the background. **No
+  `_trigger_dispatch`** — the running agent owns the swap. Client methods
+  `request_job_workspace_upgrade` / `get_job_workspace_status` in
+  `orchestrator_client.py`. Endpoint manifest regenerated.
 
 **W3 — Re-dispatch path for operator-gated `* → vm` (existing machinery,
 generalized; deferred).** VM targets must pause for operator approval, so they
@@ -803,14 +897,14 @@ classifier misses ~17% of overeager actions). Maps to open question #1.
 
 **New code** (✅ = built, 🟡 = partial, ◻️ = design):
 1. ✅ `resetup_tools_for_backend()` on `PersistentSession` (+ extracted `_load_tools_for_backend()`).
-2. 🟡 Generalized `workspace_upgrade_required` freeze type (✅ S5 — session path: the `request_workspace_upgrade` tool sets it; the loop's consume check + `on_workspace_upgrade_needed` callback fire the `workspace_upgrade.needed` offer). The worker-side `context.workspace_upgrade` namespace + `completion.py` routing + `_format_freeze_notification` case remain ◻️ (§4.3 W1; sessions don't pause, they hot-swap).
+2. ✅ Generalized `workspace_upgrade_required` freeze type. Session path (S5): the `request_workspace_upgrade` tool sets it; the loop's consume check + `on_workspace_upgrade_needed` callback fire the `workspace_upgrade.needed` offer. Worker path (Phase 3 W1): the agent **intercepts** the freeze in `_process_job_streaming` and upgrades in place — so the `context.workspace_upgrade` namespace + a re-dispatch are **not needed** (the happy path never reports the freeze). `completion.py` now routes `workspace_upgrade_required → paused` as the FAILURE fallback (an upgrade that couldn't provision/seed surfaces the freeze → re-attempt). Only the `_format_freeze_notification` cosmetic case remains ◻️.
 3. ✅ Agent-side `_handle_workspace_upgrade(target_tier)` generalizing `_handle_vm_upgrade` (sandbox + vm; the vm branch polls `_poll_vm_ready`, maps to a `remote` block, and re-opens the shell sudo gate — Phase 2).
-4. 🟡 Orchestrator `request_thread_workspace_upgrade` + `POST …/threads/{id}/upgrade-to-workspace` ✅ (S2; `vm` delegates to `/upgrade-to-vm`, now grant-gated — Phase 2); `POST /api/jobs/{id}/…` is the worker endpoint (W2, ◻️).
+4. ✅ Orchestrator `request_thread_workspace_upgrade` + `POST …/threads/{id}/upgrade-to-workspace` (S2; `vm` delegates to `/upgrade-to-vm`, now grant-gated — Phase 2); worker `POST /api/jobs/{id}/provision-workspace` + `GET …/workspace-status` + the `request_job_workspace_upgrade`/`get_job_workspace_status` client methods (W2, Phase 3 — status stays `processing`, no re-dispatch).
 5. ✅ Agent-side **seed copy** (`seed_workspace` + `WorkspaceBackend.walk()`), verify-before-flip.
 6. ◻️ Teach `_job_needs_sandbox` to honor `context.workspace_upgrade.requested`; add the **sandbox injection to `_resume_job_on_agent`**. *(Worker path; only the deferred direct lite→vm re-dispatch needs it — see §4.3 W3.)*
 7. ✅ Grant re-check on upgrade (S4 — `_enforce_workspace_upgrade_grants`, the shared Sec-1 gate; **k3d-verified live + hardened** with the `str(user_id)` coercion fix) + persist new tier to `threads.metadata` (S3b, via `update_thread_config`).
 8. 🟡 Cockpit: minimal `workspace_upgrade.*` toasts + `/upgrade-workspace` slash ✅; `workspace_upgrade.needed` offer message + action-center surface ✅ (S5); a dedicated one-click "Upgrade workspace" / accept button ◻️ (later).
-9. ◻️ *(v2)* Worker in-process `virtual → sandbox` upgrade (agent-side freeze interception + re-`ainvoke`, §4.3 W1) + orchestrator `provision-workspace` endpoint (W2). Re-dispatch / fencing only for the operator-gated VM path (W3).
+9. ✅ *(Phase 3)* Worker in-process `virtual → sandbox` upgrade (agent-side freeze interception + `_perform_inprocess_workspace_upgrade` + re-`ainvoke`, §4.3 W1) + orchestrator `provision-workspace`/`workspace-status` endpoints (W2) + shared-gate refactor (config-parameterized core + job wrapper). Unit-green + **k3d end-to-end verified** (2026-06-20). Re-dispatch / fencing only for the deferred operator-gated VM path (W3).
 10. ◻️ *(v3)* Warm-pool claim (depends on [[workspace_warm_pool_and_async_sessions]]).
 
 ---
@@ -886,19 +980,66 @@ classifier misses ~17% of overeager actions). Maps to open question #1.
     handler's poll/seed/sudo-reopen branch is unexercised). The vm-tier session
     **resume/suspend** lifecycle (S3b persists `workspace.backend=vm`) is untested
     — orthogonal to the in-place upgrade, which never drops the live conversation.
-- **Phase 3 — Worker jobs. ◻️ Not started.** Full design in **§4.3 (W1–W3)** —
-  start there. MVP = W1 + W2: in-process `virtual → sandbox` swap mirroring the
-  session (no re-dispatch, no checkpoint move), reusing `seed_workspace` (S3a) +
-  the `request_workspace_upgrade` tool / `workspace_upgrade_required` freeze (S5).
-  New code needed: agent-side freeze interception + re-`ainvoke` (`src/agent.py`,
-  §4.3 W1) and the orchestrator `POST /api/jobs/{id}/provision-workspace` endpoint
-  (W2, gated by the same `_enforce_workspace_upgrade_grants`). The blocker is the
-  pod-local non-portable LangGraph checkpoint (§2.3) — the in-process swap sidesteps
-  it. The operator-gated VM path (W3) reuses the existing container→VM machinery;
-  `virtual → vm` composes W1 + the existing sudo→VM path, so no lite-checkpoint
-  re-dispatch is ever required. Worker-side items still ◻️ in §5: the
-  `context.workspace_upgrade` namespace + `completion.py` routing (item 2),
-  `_job_needs_sandbox` + `_resume_job_on_agent` sandbox injection (item 6).
+- **Phase 3 — Worker jobs `virtual → sandbox`. ✅ Built (W1 + W2, 2026-06-20),
+  unit-green + k3d END-TO-END VERIFIED.** MVP = W1 + W2: in-process `virtual →
+  sandbox` swap
+  mirroring the session (no re-dispatch, no checkpoint move), reusing
+  `seed_workspace` (S3a) + the `request_workspace_upgrade` tool /
+  `workspace_upgrade_required` freeze (S5). **As built (the in-process pattern, 5
+  seams):**
+  0. **W1 trigger ✅ (the gap the build surfaced):** `request_workspace_upgrade`
+     is in no config's tool list, and the worker's `get_all_tool_names` is purely
+     config-driven — so a lite worker had **no way to request an upgrade**.
+     `_setup_job_tools` now injects the control tool **lite-only** (when the
+     backend isn't shell-capable), mirroring the session's
+     `_load_tools_for_backend`; after a `virtual → sandbox` swap the re-derive
+     drops it (nothing left to upgrade to). Without this seam the entire worker
+     flow is unreachable.
+  1. **Agent interception (W1) ✅:** `_process_job_streaming` (`src/agent.py`) now
+     wraps the graph stream in a one-shot upgrade loop — if a run ends with a
+     `workspace_upgrade_required`/`sandbox` freeze (and the backend isn't already
+     shell-capable), it runs `_perform_inprocess_workspace_upgrade` and, on
+     success, re-streams from the local checkpoint with `freeze_data`/`should_stop`
+     cleared (the proven feedback-resume pattern: `aupdate_state(as_node="__start__")`
+     → `route_entry` → `restore_todo_state`, which itself clears the stop flags).
+     On failure it surfaces the freeze unchanged.
+  2. **In-process upgrade (W1) ✅:** `_perform_inprocess_workspace_upgrade`
+     provisions via the orchestrator → `_poll_job_workspace_ready` → connects a
+     sandbox `RemoteBackend` (`sudo_action="freeze"`) **while the virtual backend
+     is still live** → `seed_workspace(old, new)` (both live, verify-before-flip)
+     → swaps `self._workspace_manager._backend` → `_setup_job_tools()` (re-derives
+     backend-filtered tools + the shell manager) → rebuilds the graph on the
+     **same checkpointer**. Sidesteps the pod-local non-portable checkpoint (§2.3).
+  3. **Orchestrator (W2) ✅:** `POST /api/jobs/{id}/provision-workspace` (internal,
+     grant-gated, status stays `processing` — **no `_trigger_dispatch`**, the
+     running agent owns the swap) + `GET …/workspace-status` (the agent's poll
+     source) + the `request_job_workspace_upgrade`/`get_job_workspace_status`
+     client methods. `vm` is refused here (operator-gated → `/upgrade-to-vm`).
+  4. **Shared gate ✅:** Sec-1 refactored into a config-parameterized core
+     (`_enforce_workspace_upgrade_grants_for_config`) + the existing session
+     wrapper + a new `_enforce_job_workspace_upgrade_grants` (a job carries
+     `config_override` as a top-level column, not under `metadata`).
+     `completion.py` routes the failure-path freeze → `paused`.
+  - *Tests:* `tests/test_job_workspace_upgrade.py` (28, incl. the W1
+    trigger-exposure contract) + `test_completion_endpoint.py` (failure →
+    paused).
+  - *k3d smoke (2026-06-20, ✅ end-to-end):* a real `virtual` worker job
+    (`fa144821`, gemini-3.5-flash) booted lite (shell/git dropped,
+    `request_workspace_upgrade` exposed) → the agent called the tool → the freeze
+    was intercepted **in process** (same agent, job never left `processing` — no
+    re-dispatch, no `/job/resume`) → `POST /provision-workspace` spawned
+    `workspace-fa144821-aff` → **"Seeded 49 file(s) from VirtualWorkspaceBackend
+    to RemoteBackend"** → `run_command` re-derived → "graph rebuilt … resuming in
+    process" → the resumed graph ran `echo SMOKE_OK_PHASE3 && uname -n` on the
+    sandbox (the marker file on the pod = `SMOKE_OK_PHASE3` + the sandbox
+    hostname, and `notes/task_rules.md` written pre-upgrade survived the seed) →
+    `job_complete` → `reviewing`. Orchestrator-side curls also checked directly:
+    `vm`→400, missing→404, `workspace-status` none→ready with `port`→`pod_port`,
+    and the live-DB job-wrapper gate passed with no asyncpg-type crash.
+  - *Deferred:* the operator-gated worker `* → vm` path (W3) — composes W1 +
+    the existing sudo→VM re-dispatch, so no lite-checkpoint re-dispatch is ever
+    required. Still ◻️ in §5 (W3-only): `_job_needs_sandbox` +
+    `_resume_job_on_agent` sandbox injection (item 6).
 - **Phase 4 — Accelerate + automate.** Warm pool for ~instant sandbox upgrades;
   **auto-upgrade `virtual → sandbox` on coding intent** — only after the trigger
   is provably human-authored (not ingested content), egress stays default-deny,
