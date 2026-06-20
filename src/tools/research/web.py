@@ -4,6 +4,7 @@ Provides web search and content extraction capabilities using Tavily API.
 Supports search, extract, crawl, and map operations.
 """
 
+import asyncio
 import logging
 from typing import Any, Dict, List, Literal, Optional
 
@@ -82,6 +83,20 @@ def _truncate_content(content: str, max_words: int = MAX_RAW_CONTENT_WORDS) -> s
     return content
 
 
+def _run_async(coro: Any, loop: Optional[asyncio.AbstractEventLoop] = None) -> Any:
+    """Drive an async coroutine from synchronous web-tool code.
+
+    ``ToolContext.get_or_register_web_source`` is async (it does I/O on the
+    shared ``srw_vector`` pool), but the web tools are sync and run in executor
+    threads with no running loop. Scheduling the coroutine on the loop that
+    created the tools (captured in ``create_web_tools``) preserves asyncpg
+    connection-pool affinity. Mirrors the bridge in ``knowledge_tools.py``.
+    """
+    if loop is not None and loop.is_running():
+        return asyncio.run_coroutine_threadsafe(coro, loop).result()
+    return asyncio.run(coro)
+
+
 def create_web_tools(context: ToolContext) -> List[Any]:
     """Create web search tools with injected context.
 
@@ -91,6 +106,14 @@ def create_web_tools(context: ToolContext) -> List[Any]:
     Returns:
         List of LangChain tool functions
     """
+
+    # Capture the loop at tool-creation time (async graph setup) so the sync
+    # tools below can drive ToolContext's async source registration on the
+    # original loop, preserving asyncpg pool affinity (see _run_async).
+    try:
+        _creator_loop: Optional[asyncio.AbstractEventLoop] = asyncio.get_running_loop()
+    except RuntimeError:
+        _creator_loop = None
 
     @tool
     def web_search(
@@ -131,6 +154,7 @@ def create_web_tools(context: ToolContext) -> List[Any]:
             include_domains=include_domains,
             exclude_domains=exclude_domains,
             include_raw_content=include_raw_content,
+            creator_loop=_creator_loop,
         )
 
     @tool
@@ -153,7 +177,13 @@ def create_web_tools(context: ToolContext) -> List[Any]:
         Returns:
             Extracted content from each URL with source IDs for citation
         """
-        return _extract_webpage(urls, context, query=query, extract_depth=extract_depth)
+        return _extract_webpage(
+            urls,
+            context,
+            query=query,
+            extract_depth=extract_depth,
+            creator_loop=_creator_loop,
+        )
 
     @tool
     def crawl_website(
@@ -193,6 +223,7 @@ def create_web_tools(context: ToolContext) -> List[Any]:
             limit=limit,
             select_paths=select_paths,
             exclude_paths=exclude_paths,
+            creator_loop=_creator_loop,
         )
 
     @tool
@@ -243,6 +274,7 @@ def _direct_web_search(
     include_domains: Optional[str] = None,
     exclude_domains: Optional[str] = None,
     include_raw_content: bool = False,
+    creator_loop: Optional[asyncio.AbstractEventLoop] = None,
 ) -> str:
     """Direct Tavily web search.
 
@@ -304,8 +336,9 @@ def _direct_web_search(
                 title = r.get("title", "Untitled")
                 if url:
                     try:
-                        source_id, fetch_error = context.get_or_register_web_source(
-                            url, name=title
+                        source_id, fetch_error = _run_async(
+                            context.get_or_register_web_source(url, name=title),
+                            creator_loop,
                         )
                         registered_sources.append((url, source_id))
                         if fetch_error:
@@ -383,6 +416,7 @@ def _extract_webpage(
     context: Optional[ToolContext] = None,
     query: Optional[str] = None,
     extract_depth: str = "basic",
+    creator_loop: Optional[asyncio.AbstractEventLoop] = None,
 ) -> str:
     """Extract full content from web pages using Tavily Extract.
 
@@ -428,7 +462,9 @@ def _extract_webpage(
                 url = r.get("url", "")
                 if url:
                     try:
-                        source_id, fetch_error = context.get_or_register_web_source(url)
+                        source_id, fetch_error = _run_async(
+                            context.get_or_register_web_source(url), creator_loop
+                        )
                         registered.append((url, source_id))
                     except Exception as e:
                         logger.warning(f"Could not register source {url}: {e}")
@@ -491,6 +527,7 @@ def _crawl_website(
     limit: int = 20,
     select_paths: Optional[str] = None,
     exclude_paths: Optional[str] = None,
+    creator_loop: Optional[asyncio.AbstractEventLoop] = None,
 ) -> str:
     """Crawl a website using Tavily Crawl.
 
@@ -549,8 +586,9 @@ def _crawl_website(
                 page_url = r.get("url", "")
                 if page_url:
                     try:
-                        source_id, fetch_error = context.get_or_register_web_source(
-                            page_url
+                        source_id, fetch_error = _run_async(
+                            context.get_or_register_web_source(page_url),
+                            creator_loop,
                         )
                         registered.append((page_url, source_id))
                     except Exception as e:
