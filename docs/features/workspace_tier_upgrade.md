@@ -22,8 +22,17 @@ related:
 
 # Workspace Tier Upgrade — `virtual`/`none` → `sandbox`/`vm` on demand
 
-**Status:** **Phase-1 MVP implemented (S1 + S2 + S3), k3d end-to-end verify
-pending — 2026-06-20.** Proposes a live upgrade path from the lite workspace
+**Status:** **Phase-1 MVP implemented + k3d END-TO-END VERIFIED (S1 + S2 + S3)
+— 2026-06-20.** Smoke test on a real cluster (cockpit UI): a `virtual` session
+ran `/upgrade-workspace` → a sandbox pod spawned, 49 files were seeded
+virtual→pod over SFTP, the backend hot-swapped, the toolset re-derived (44→55,
+shell re-admitted), the tier persisted, the conversation never dropped, and the
+agent then ran a shell command on the upgraded pod reading a seeded marker.
+**Prerequisite fixed:** the smoke test surfaced that persistent `virtual`
+sessions couldn't boot at all (a gap in the [[no_workspace_agent_mode]] session
+wiring — `_attach_session` polled for a workspace pod before reading the lite
+config); fixed by making the attach lite-aware and injecting the object-store
+mounts into the resolved-config blob the agent hydrates. Proposes a live upgrade path from the lite workspace
 tiers to a real container or VM, so a session (or job) can start cheap and
 instant and only acquire a workspace pod / VM when the work actually needs one.
 Grounded in a codebase trace (what's reusable vs missing) plus a survey of how
@@ -50,8 +59,10 @@ but is an accelerator, not a prerequisite.
 ### Implementation status (2026-06-20)
 
 Slice-by-slice; details in each slice below. **Built** = code landed +
-unit-green + ruff-clean on `develop` (uncommitted). k3d end-to-end smoke test of
-the session path is still pending (needs a live `virtual` session).
+unit-green + ruff-clean on `develop` (uncommitted). The session path (S1+S2+S3)
+is **k3d end-to-end verified** (2026-06-20) — see the Status block. A
+prerequisite gap (persistent `virtual` sessions couldn't boot) was found and
+fixed as part of the smoke test.
 
 | Slice | What | Status |
 |---|---|---|
@@ -375,7 +386,9 @@ dispatch at `persistent_app.py:2292`).
   (1) a pod spawns, (2) a file written in `virtual` (`notes/plan.md`) exists in
   the new pod workspace, (3) the next turn the agent can run a shell command,
   (4) the WebSocket/conversation never dropped. Watch agent logs for "Backend
-  swapped" + "Loaded N tools". **(Still pending — needs a live session.)**
+  swapped" + "Loaded N tools". **✅ Verified on k3d 2026-06-20** — all four held
+  (49 files seeded, 44→55 tools, agent ran a shell command reading a seeded
+  marker, conversation intact).
 - *Deps:* S1 + S2.
 - *As built:*
   - **Ordering** (the one subtlety): the new `RemoteBackend` is connected

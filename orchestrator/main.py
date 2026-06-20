@@ -12731,6 +12731,30 @@ async def agent_get_thread_workspace(
             status_code=403,
             detail="capability grants could not be verified for this session config",
         )
+    # Lite (virtual/none) sessions run with no workspace pod. Attach the
+    # object-store mounts in-flight here — the same enrichment
+    # _send_session_attach does for the idle-pool path — so a DEDICATED session
+    # agent (provisioned when no pool agent is free) can build its lite backend
+    # from this response. Without it _attach_session would poll for a workspace
+    # pod that never exists and the agent would exit cleanly (the lite session
+    # boot gap, no_workspace_agent_mode). No-op for sandbox/vm.
+    try:
+        co = _inject_lite_workspace_config(co, prefix=f"threads/{thread_id}/") or co
+        # The resolved blob is the agent's PREFERRED hydration source, loaded via
+        # load_agent_config_from_dict(resolved["agent"]) WITHOUT a config_override
+        # merge (persistent_app._attach_session). Its agent.workspace already
+        # carries the lite backend but NOT the in-flight object-store mounts —
+        # attach them there, else create_lite_backend raises "requires
+        # workspace.mounts" and the lite session can't boot.
+        if isinstance(session_resolved, dict) and _backend_from_override(co) in (
+            LITE_BACKENDS
+        ):
+            agent_ws = session_resolved.setdefault("agent", {}).setdefault(
+                "workspace", {}
+            )
+            agent_ws.update(co.get("workspace") or {})
+    except LiteWorkspaceConfigError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     return {
         "status": ws.get("status", "none"),
         # K8s provisioner uses pod_ip; Docker provisioner uses host — normalize
