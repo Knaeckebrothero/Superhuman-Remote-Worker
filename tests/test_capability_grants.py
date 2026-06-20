@@ -116,6 +116,36 @@ def test_flags_ungranted_shell_and_vm_and_autonomy():
     assert "shell_tools" in j and "vm_workspace" in j and "autonomy_ceiling" in j
 
 
+def test_workspace_upgrade_gate_vm_vs_sandbox():
+    """Sec-1 (workspace_tier_upgrade.md §4.4): the upgrade gate re-runs this PDP
+    on the post-upgrade fragment {workspace:{backend:target_tier}}.
+
+      * sandbox is the ungated default tier — clean for a default principal.
+      * vm trips vm_workspace unless granted.
+    """
+    # sandbox upgrade — passes by default (no backend gate, no declared tools).
+    assert evaluate({"workspace": {"backend": "sandbox"}}, DEFAULTS) == []
+    # vm upgrade without the grant — refused.
+    v = evaluate({"workspace": {"backend": "vm"}}, DEFAULTS)
+    assert len(v) == 1 and "vm_workspace" in v[0]
+    # vm upgrade with the grant — clean.
+    assert (
+        evaluate({"workspace": {"backend": "vm"}}, {**DEFAULTS, "vm_workspace": True})
+        == []
+    )
+
+
+def test_workspace_upgrade_gate_refuses_shell_restricted_principal():
+    """A principal whose config declares tools.shell but lacks the shell_tools
+    grant is refused even for a sandbox upgrade — the upgrade re-runs dispatch
+    enforcement on the post-upgrade config, so a shell restriction still bites."""
+    post_upgrade = {"workspace": {"backend": "sandbox"}, "tools": {"shell": ["ls"]}}
+    v = evaluate(post_upgrade, {**DEFAULTS, "shell_tools": False})
+    assert len(v) == 1 and "shell_tools" in v[0]
+    # Same config, owner holds the grant → clean.
+    assert evaluate(post_upgrade, {**DEFAULTS, "shell_tools": True}) == []
+
+
 def test_delegation_reads_enabled_not_dict_presence():
     # A disabled delegation settings-dict must NOT trip the gate.
     assert evaluate({"delegation": {"enabled": False, "max_depth": 3}}, DEFAULTS) == []

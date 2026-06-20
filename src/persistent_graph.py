@@ -306,7 +306,18 @@ class PersistentLoopCallbacks:
     # value behaves like "graceful" (preserves partial response).
     check_interrupt: Callable[[], Optional[str]]
 
-    # Notify client that a VM upgrade is needed (sudo detected, optional)
+    # Notify the client that a workspace upgrade is available. Fires for BOTH a
+    # sandbox sudo intercept asking for a VM (freeze_type=vm_upgrade_required)
+    # and a lite agent's request_workspace_upgrade asking for a sandbox
+    # (freeze_type=workspace_upgrade_required, workspace_tier_upgrade.md §4.2 S5).
+    # The freeze_data carries freeze_type + (target_tier|command) + reason.
+    on_workspace_upgrade_needed: Optional[
+        Callable[[Dict[str, Any]], Awaitable[None]]
+    ] = None
+
+    # Deprecated alias for on_workspace_upgrade_needed (the original sudo→VM
+    # name). Kept so older constructors / tests keep working; reconciled into
+    # on_workspace_upgrade_needed by __post_init__.
     on_vm_upgrade_needed: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None
 
     # Notify the transport that automatic summarization compacted the context,
@@ -342,6 +353,16 @@ class PersistentLoopCallbacks:
     # side effects — that path stays cooperative). Optional: None ⇒
     # cooperative-only interrupts (back-compat for callers that don't set it).
     hard_interrupt_event: Optional[asyncio.Event] = None
+
+    def __post_init__(self) -> None:
+        # Back-compat: callers that still pass the deprecated on_vm_upgrade_needed
+        # get it promoted to the generalized on_workspace_upgrade_needed the loop
+        # actually reads (workspace_tier_upgrade.md §4.2 S5).
+        if (
+            self.on_workspace_upgrade_needed is None
+            and self.on_vm_upgrade_needed is not None
+        ):
+            self.on_workspace_upgrade_needed = self.on_vm_upgrade_needed
 
 
 # Sentinel returned by _safe_anext on stream exhaustion. Avoids letting
@@ -1505,14 +1526,18 @@ async def _execute_turn(
                 tool_name, cleaned_str, tool_call_id, is_error=is_error
             )
 
-            # Check for freeze request (e.g. sudo intercept → VM upgrade)
-            if tool_context and callbacks.on_vm_upgrade_needed:
+            # Check for a freeze request — a sudo intercept asking for a VM
+            # (vm_upgrade_required) or a lite agent's request_workspace_upgrade
+            # asking for a sandbox (workspace_upgrade_required, §4.2 S5). Both
+            # surface as an upgrade OFFER; the agent only requests, never flips
+            # the tier (§4.4 Sec-4).
+            if tool_context and callbacks.on_workspace_upgrade_needed:
                 freeze_req = tool_context.consume_freeze_request()
-                if (
-                    freeze_req
-                    and freeze_req.get("freeze_type") == "vm_upgrade_required"
+                if freeze_req and freeze_req.get("freeze_type") in (
+                    "vm_upgrade_required",
+                    "workspace_upgrade_required",
                 ):
-                    await callbacks.on_vm_upgrade_needed(freeze_req)
+                    await callbacks.on_workspace_upgrade_needed(freeze_req)
 
         # Continue the inner loop — LLM sees tool results on next iteration
 

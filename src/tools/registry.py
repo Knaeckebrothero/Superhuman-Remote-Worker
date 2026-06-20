@@ -338,14 +338,23 @@ def load_tools(tool_names: List[str], context: ToolContext) -> List[Any]:
                 all_tools.append(tool)
                 logger.debug(f"Loaded workspace tool: {tool.name}")
 
-    # Core tools (todo + job)
+    # Core tools (todo + job + control). Todo/job tools need a workspace (todos
+    # persist to workspace files); todo tools additionally need a TodoManager.
+    # The lone exception is the control tool request_workspace_upgrade, which
+    # needs neither manager — so a lite session running with todo_manager=None
+    # can still expose it (workspace_tier_upgrade.md §4.2 S5). Require each
+    # manager only when a tool that actually depends on it was requested.
     if "core" in tools_by_category:
-        if not context.has_workspace():
+        from .core.todo import TODO_TOOLS_METADATA
+        from .core.upgrade import WORKSPACE_UPGRADE_TOOLS_METADATA
+
+        requested = set(tools_by_category["core"])
+        needs_workspace = requested - set(WORKSPACE_UPGRADE_TOOLS_METADATA)
+        if needs_workspace and not context.has_workspace():
             raise ValueError("Core tools require workspace_manager in ToolContext")
-        if not context.has_todo():
+        if requested & set(TODO_TOOLS_METADATA) and not context.has_todo():
             raise ValueError("Core tools require todo_manager in ToolContext")
         core_tools = create_core_tools(context)
-        requested = set(tools_by_category["core"])
         for tool in core_tools:
             if tool.name in requested:
                 all_tools.append(tool)

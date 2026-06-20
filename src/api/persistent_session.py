@@ -649,6 +649,16 @@ class PersistentSession:
             if "srw_cloud_status" not in tool_names:
                 tool_names.append("srw_cloud_status")
 
+        # Lite-tier only: expose the agent-initiated upgrade request
+        # (workspace_tier_upgrade.md §4.2 S5) so a no-shell session can ASK for a
+        # real sandbox. Gated on the backend lacking a shell — after a virtual →
+        # sandbox swap this re-derives against the now-shell-capable backend and
+        # the tool drops out (nothing left to upgrade to).
+        _backend = getattr(self.workspace_manager, "backend", None)
+        if _backend is not None and not getattr(_backend, "supports_shell", False):
+            if "request_workspace_upgrade" not in tool_names:
+                tool_names.append("request_workspace_upgrade")
+
         # Capability gate: drop tools the workspace backend can't support (lite
         # tiers — no_workspace_agent_mode.md §3.2/§7). Mirrors the worker path.
         # On a backend swap this RE-FILTERS against the new backend, so an

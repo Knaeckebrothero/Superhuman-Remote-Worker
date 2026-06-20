@@ -2803,6 +2803,76 @@ class TestVMUpgradeDetection:
         on_upgrade.assert_called_once_with(freeze_req)
 
     @pytest.mark.asyncio
+    async def test_workspace_upgrade_fires_on_matching_freeze_type(self):
+        """The generalized callback (workspace_tier_upgrade.md §4.2 S5) fires on a
+        request_workspace_upgrade freeze (freeze_type=workspace_upgrade_required),
+        and the new on_workspace_upgrade_needed kwarg is honored directly."""
+        response_with_tool = AIMessage(
+            content="",
+            tool_calls=[{"name": "run_cmd", "args": {}, "id": "tc1"}],
+        )
+        final_response = _make_llm_response("done")
+
+        call_count = 0
+
+        async def _astream(msgs, **kw):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                yield response_with_tool
+            else:
+                yield final_response
+
+        llm = AsyncMock()
+        llm.reasoning = None
+        llm.astream = _astream
+
+        tool = _make_tool("run_cmd", "ok")
+
+        freeze_req = {
+            "freeze_type": "workspace_upgrade_required",
+            "target_tier": "sandbox",
+            "reason": "need a shell",
+        }
+        tool_ctx = MagicMock()
+        tool_ctx.consume_freeze_request.return_value = freeze_req
+
+        on_upgrade = AsyncMock()
+        # Construct via the NEW kwarg directly (no alias).
+        callbacks = _make_callbacks(on_workspace_upgrade_needed=on_upgrade)
+        messages = [SystemMessage(content="sys"), HumanMessage(content="go")]
+
+        await _execute_turn(
+            llm_with_tools=llm,
+            tool_map={"run_cmd": tool},
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
+            messages=messages,
+            callbacks=callbacks,
+            llm_timeout=600,
+            auxiliary_llm=None,
+            config=_make_config(),
+            tool_context=tool_ctx,
+        )
+
+        on_upgrade.assert_called_once_with(freeze_req)
+
+    def test_vm_upgrade_kwarg_aliases_to_workspace_upgrade(self):
+        """The deprecated on_vm_upgrade_needed kwarg is promoted to the
+        generalized on_workspace_upgrade_needed the loop actually reads."""
+        cb = AsyncMock()
+        callbacks = _make_callbacks(on_vm_upgrade_needed=cb)
+        assert callbacks.on_workspace_upgrade_needed is cb
+        # An explicit new-kwarg value is NOT overwritten by the alias.
+        new_cb = AsyncMock()
+        old_cb = AsyncMock()
+        both = _make_callbacks(
+            on_workspace_upgrade_needed=new_cb, on_vm_upgrade_needed=old_cb
+        )
+        assert both.on_workspace_upgrade_needed is new_cb
+
+    @pytest.mark.asyncio
     async def test_vm_upgrade_not_fired_on_other_freeze_type(self):
         """on_vm_upgrade_needed NOT fired for non-vm_upgrade freeze types."""
         response_with_tool = AIMessage(
