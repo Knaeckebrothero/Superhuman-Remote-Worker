@@ -739,6 +739,50 @@ class OrchestratorClient:
             logger.warning(f"Unexpected error downloading file: {e}")
             return None
 
+    async def save_citation_snapshot(
+        self, data: bytes, content_type: str = "application/octet-stream"
+    ) -> Optional[str]:
+        """Persist a cited cloud document's original bytes to the snapshot store.
+
+        Phase 3 (D7): the agent has no S3 credentials, so the original bytes are
+        round-tripped through the orchestrator (``POST /api/citations/snapshot``,
+        internal-key auth), which content-addresses them and returns a
+        ``snapshot_blob_key``. Best-effort — returns the key, or ``None`` on any
+        failure (citation integrity rests on the extracted-text copy, not this
+        blob).
+
+        Args:
+            data: Raw original file bytes.
+            content_type: MIME type to store the blob under (for "view original").
+
+        Returns:
+            The content-addressed snapshot key, or None on failure.
+        """
+        if not data:
+            return None
+        if not self._client:
+            await self.connect()
+
+        url = f"{self.orchestrator_url}/api/citations/snapshot"
+        try:
+            response = await self._client.post(
+                url,
+                content=data,
+                params={"content_type": content_type},
+                headers={"Content-Type": "application/octet-stream"},
+            )
+        except httpx.RequestError as e:
+            logger.warning(f"Citation snapshot upload failed (network): {e}")
+            return None
+
+        if response.status_code == 200:
+            return response.json().get("snapshot_blob_key")
+        logger.warning(
+            f"Citation snapshot upload rejected: {response.status_code} - "
+            f"{response.text[:200]}"
+        )
+        return None
+
     async def resume_job(
         self,
         job_id: str,
