@@ -175,13 +175,23 @@ async def agent_upgrade_to_vm(db, vm_provisioner, thread_id):
     }
 
 
-async def agent_upgrade_to_workspace(db, provisioner, thread_id, target_tier="sandbox"):
+class _GateDenied(Exception):
+    """Stand-in for the orchestrator's HTTPException(403) raised by the shared
+    Sec-1 grant gate (_enforce_workspace_upgrade_grants)."""
+
+
+async def agent_upgrade_to_workspace(
+    db, provisioner, thread_id, target_tier="sandbox", grant_gate=None
+):
     """5.3b: POST /api/agents/threads/{thread_id}/upgrade-to-workspace
-    (workspace_tier_upgrade.md §4.2 S2) — mirrors orchestrator/main.py handler.
+    (workspace_tier_upgrade.md §4.2 S2 + S4) — mirrors orchestrator/main.py handler.
 
     Provisions a real container for a lite thread (virtual/none -> sandbox).
     Idempotent on an in-flight/ready container; the `vm` tier keeps its own
-    operator-gated upgrade-to-vm path.
+    operator-gated upgrade-to-vm path. ``grant_gate`` mirrors the shared Sec-1
+    authorization gate (``_enforce_workspace_upgrade_grants``): an async
+    ``(thread, target_tier) -> None`` that raises ``_GateDenied`` on refusal,
+    run BEFORE provisioning (fail-closed).
     """
     target_tier = target_tier or "sandbox"
     if target_tier != "sandbox":
@@ -190,6 +200,12 @@ async def agent_upgrade_to_workspace(db, provisioner, thread_id, target_tier="sa
     thread = await db.get_thread(thread_id)
     if not thread:
         return {"error": 404, "detail": "Thread not found"}
+
+    if grant_gate is not None:
+        try:
+            await grant_gate(thread, target_tier)
+        except _GateDenied as exc:
+            return {"error": 403, "detail": str(exc)}
 
     if not (provisioner.is_available and provisioner.in_cluster):
         return {
@@ -955,6 +971,39 @@ class TestAgentUpgradeToWorkspace:
         prov = _mock_provisioner(available=True, in_cluster=True)
         result = await agent_upgrade_to_workspace(db, prov, "tid-1")
         assert result["status"] == "provisioning"
+
+    @pytest.mark.asyncio
+    async def test_grant_gate_refusal_returns_403_before_provisioning(self):
+        # Sec-1 (S4): a shell-restricted owner (or vm without vm_workspace) is
+        # refused 403 and nothing provisions.
+        thread = _make_thread(metadata={})
+        db = _mock_db()
+        db.get_thread = AsyncMock(return_value=thread)
+        prov = _mock_provisioner(available=True, in_cluster=True)
+
+        async def _deny(_thread, _tier):
+            raise _GateDenied("config exceeds your capability grants: shell_tools")
+
+        result = await agent_upgrade_to_workspace(db, prov, "tid-1", grant_gate=_deny)
+        assert result["error"] == 403
+        assert "shell_tools" in result["detail"]
+        prov.create_workspace.assert_not_awaited()
+        db.merge_thread_workspace_context.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_grant_gate_pass_provisions(self):
+        # A default (ungated) sandbox upgrade passes the gate and provisions.
+        thread = _make_thread(metadata={})
+        db = _mock_db()
+        db.get_thread = AsyncMock(return_value=thread)
+        prov = _mock_provisioner(available=True, in_cluster=True)
+
+        async def _allow(_thread, _tier):
+            return None
+
+        result = await agent_upgrade_to_workspace(db, prov, "tid-1", grant_gate=_allow)
+        assert result["status"] == "provisioning"
+        prov.create_workspace.assert_awaited_once()
 
 
 # =============================================================================

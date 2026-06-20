@@ -184,6 +184,7 @@ export class NotificationService {
     } else if (
         data.type === 'session.permission_request' ||
         data.type === 'session.vm_upgrade' ||
+        data.type === 'session.workspace_upgrade' ||
         data.type === 'session.waiting'
     ) {
         this.sessionEvents.update((events) => [

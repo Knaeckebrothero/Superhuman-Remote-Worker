@@ -1373,6 +1373,8 @@ class TestResetupToolsForBackend:
             before = {t.name for t in session.tools}
             assert shell not in before and git not in before
             assert web in before
+            # S5: the lite tier exposes the agent-initiated upgrade request.
+            assert "request_workspace_upgrade" in before
 
             # Live upgrade: real swap_backend (shell rebuild stubbed to install
             # a fresh ShellManager), then the S1 retool.
@@ -1388,6 +1390,9 @@ class TestResetupToolsForBackend:
 
         # Shell + git re-admitted against the sandbox backend; web retained.
         assert shell in after and git in after and web in after
+        # S5: once shell-capable, the upgrade request drops out (nothing to
+        # upgrade to) — the re-derive re-evaluates exposure against the new tier.
+        assert "request_workspace_upgrade" not in after
         # tool_context repointed at the freshly built ShellManager.
         assert session.tool_context.shell_manager is new_sm
         # LLM rebound with the upgraded toolset (shell/git included).

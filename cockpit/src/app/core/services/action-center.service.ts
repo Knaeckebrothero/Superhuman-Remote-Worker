@@ -222,18 +222,22 @@ export class ActionCenterService {
     private mapSession(e: SessionEvent): ActionItem {
         const isPermission = e.type === 'session.permission_request';
         const isVmUpgrade = e.type === 'session.vm_upgrade';
+        const isWorkspaceUpgrade = e.type === 'session.workspace_upgrade';
+        const isUpgrade = isVmUpgrade || isWorkspaceUpgrade;
 
         return {
             id: `sess:${e.event_id}`,
             type: 'session',
             status: 'pending',
-            urgency: isPermission ? 90 : isVmUpgrade ? 70 : 30,
+            urgency: isPermission ? 90 : isUpgrade ? 70 : 30,
             timestamp: e.created_at,
             title: isPermission
                 ? `Approve: ${e.tool}`
                 : isVmUpgrade
                     ? 'VM Upgrade Needed'
-                    : 'Waiting for Input',
+                    : isWorkspaceUpgrade
+                        ? 'Workspace Upgrade Needed'
+                        : 'Waiting for Input',
             subtitle: [e.title, e.config_name].filter(Boolean).join(' \u00B7 '),
             jobId: null,
             session: {threadId: e.thread_id, event: e},

@@ -38,10 +38,12 @@ instant and only acquire a workspace pod / VM when the work actually needs one.
 Grounded in a codebase trace (what's reusable vs missing) plus a survey of how
 cloud-IDE / agent-sandbox platforms solve the same problem. Sibling to
 [[no_workspace_agent_mode]] (which shipped the lite tiers) and reuses the
-container→VM upgrade precedent from [[vm_backend]]. The session `virtual →
-sandbox` path (live in-process swap, no freeze/resume) is built and unit-green;
-what remains is the grant gate (S4), the agent-initiated offer (S5), the worker
-path (§4.3), and a live cluster smoke test.
+container→VM upgrade precedent from [[vm_backend]]. **All of Phase 1 (S1–S5) is
+now built + unit-green** (S4 = the shared Sec-1 grant gate; S5 = the
+agent-initiated offer: `workspace_upgrade_required` freeze vocab +
+`request_workspace_upgrade` tool + cockpit offer). The MVP (S1+S2+S3) is k3d
+end-to-end verified; what remains is the worker path (§4.3) and a live smoke test
+of the S5 agent-offer round-trip.
 
 **In one paragraph.** Make workspace acquisition lazy: a session (or job) starts
 on `virtual` and upgrades to a `sandbox` pod (or `vm`) only when the work needs
@@ -72,8 +74,8 @@ fixed as part of the smoke test.
 | §4.2 **S3a** | `WorkspaceBackend.walk()` + `seed_workspace()` copy-down | **✅ Built** |
 | §4.2 **S3b** | Persist new tier to `metadata.config_override.workspace.backend` | **✅ Built** |
 | §4.2 — | Minimal Cockpit (`workspace_upgrade.*` toasts + `/upgrade-workspace`) | **✅ Built** |
-| §4.2 **S4** | Grant enforcement (shared §4.4 Sec-1 gate) | Design |
-| §4.2 **S5** | Agent-initiated offer (`request_workspace_upgrade` tool + freeze) | Design |
+| §4.2 **S4** | Grant enforcement (shared §4.4 Sec-1 gate) | **✅ Built** |
+| §4.2 **S5** | Agent-initiated offer (`request_workspace_upgrade` tool + freeze) | **✅ Built** |
 | §4.3 **W1–W3** | Worker-job flow (in-process `virtual → sandbox`, vm re-dispatch) | Design |
 | §4.4 **Sec-1…5** | Capability & security slices | Design |
 | Phase 2 | Sessions `virtual → vm` | Design |
@@ -418,20 +420,34 @@ dispatch at `persistent_app.py:2292`).
     deferred; the slash command is the minimal trigger (and the session-side `vm`
     upgrade had no cockpit send wired either — only jobs upgrade via REST).
 
-**S4 — Grant enforcement.** Run the shared upgrade-authorization gate (§4.4
-Sec-1) before provisioning: `capability_grants.evaluate` on the post-upgrade
-config + the kill-switch, fail-closed, mirroring `_enforce_dispatch_grants`. For
-`sandbox` this passes by default (the PDP gates only `vm` and explicitly declared
-tool flags); refuse with `workspace_upgrade.failed {reason}` only when the PDP
-actually violates (e.g. a `tools.shell` cap on this user/expert) or the
-kill-switch is off.
+**S4 — Grant enforcement. ✅ Built.** Run the shared upgrade-authorization gate
+(§4.4 Sec-1) before provisioning: `capability_grants.evaluate` on the post-upgrade
+config, fail-closed, mirroring `_enforce_dispatch_grants`. For `sandbox` this
+passes by default (the PDP gates only `vm` and explicitly declared tool flags);
+refuse with `403` only when the PDP actually violates (e.g. a `tools.shell` cap on
+this user/expert) or, for a `vm` target, the operator gate.
 - *Verify:* a `sandbox` upgrade for a default user succeeds (ungated); a user
   with an admin `tools.shell` restriction is refused with a clear reason; a
   `vm`-target upgrade without `vm_workspace` is refused.
 - *Deps:* S3; the shared gate is §4.4 Sec-1.
+- *As built:* `_enforce_workspace_upgrade_grants(thread, target_tier)` in
+  `orchestrator/main.py` — the single PEP both the session endpoint (this slice)
+  and the future worker `provision-workspace` endpoint (§4.3 W2) call. It builds
+  the post-upgrade config as the thread's stored `config_override` with
+  `workspace.backend` flipped to the target tier, then delegates to
+  `_enforce_dispatch_grants` (same `evaluate`, re-run at upgrade time → `403` via
+  `GrantDenied`). A `vm` target additionally runs `_check_vm_permission` (global
+  `vm_workspaces` kill-switch + `can_use_vm`). Wired into
+  `agent_upgrade_thread_to_workspace` right after the 404 check, before
+  provisioning (fail-closed). No new grant key, no sandbox-specific rule — sandbox
+  passes by default. Sec-3's `workspace_upgrade` kill-switch + live downgrade stay
+  deferred (fast-follow). Unit coverage: `tests/test_capability_grants.py`
+  (`evaluate` on `workspace.backend` vm/sandbox + the shell-restricted principal)
+  and `tests/test_thread_endpoints.py` (`TestAgentUpgradeToWorkspace` 403-before-
+  provision + pass-provisions, via an injected gate mirroring the helper).
 
-**S5 — Agent-initiated offer (HITL trigger).** A lite agent has no shell tool to
-"attempt", so give it an explicit request path. (a) **Freeze vocab:** add
+**S5 — Agent-initiated offer (HITL trigger). ✅ Built.** A lite agent has no shell
+tool to "attempt", so give it an explicit request path. (a) **Freeze vocab:** add
 `workspace_upgrade_required` (carries `target_tier`, `reason`); generalize the
 consume check (`persistent_graph.py:1513`) to fire on both it and
 `vm_upgrade_required`; rename the callback to `on_workspace_upgrade_needed` (keep
@@ -452,6 +468,37 @@ message.
 - *Verify:* steer a virtual session toward needing a shell → agent calls
   `request_workspace_upgrade` → offer appears → accept → shell appears.
 - *Deps:* S3 (+ S4 for the gate).
+- *As built:*
+  - **(a) Freeze vocab / callback.** `PersistentLoopCallbacks` gained
+    `on_workspace_upgrade_needed`; `on_vm_upgrade_needed` is kept as a deprecated
+    alias reconciled in `__post_init__` (so existing constructors/tests keep
+    working). The `_execute_turn` consume check now fires the generalized callback
+    on `freeze_type ∈ {vm_upgrade_required, workspace_upgrade_required}`. The loop
+    handler `_loop_on_workspace_upgrade_needed` branches on `freeze_type` and emits
+    the matching per-tier offer — `vm_upgrade.needed` (unchanged sudo→VM path) or
+    `workspace_upgrade.needed {target_tier, reason}` (the new sandbox offer) — so
+    the existing cockpit handlers + nats_bridge map both keep working.
+    `_NOTIFICATION_METHODS` + the nats_bridge `event_type_map`
+    (`→ session.workspace_upgrade`) gained the new event.
+  - **(b) Tool.** `src/tools/core/upgrade.py` —
+    `request_workspace_upgrade(reason)`, category `core`, sets a
+    `workspace_upgrade_required` freeze (target `sandbox`); it only *requests*
+    (§4.4 Sec-4). Wired into `create_core_tools`/`get_core_metadata`. The `core`
+    loader gate was relaxed: only todo/job tools need their managers, so the lone
+    manager-independent control tool loads on a lite session
+    (`todo_manager=None`). `persistent_session._load_tools_for_backend` exposes it
+    only while the backend has **no shell** — after a `virtual → sandbox` swap the
+    re-derive drops it (nothing left to upgrade to).
+  - **(c) Cockpit.** A `workspace_upgrade.needed` system-message offer pointing at
+    `/upgrade-workspace` (the existing accept path), plus
+    `session.workspace_upgrade` parity in `notification.service` + the
+    action-center ("Workspace Upgrade Needed"). A dedicated accept button is
+    deferred, matching the S3 minimal-cockpit stance.
+  - **Tests:** `tests/test_persistent_graph.py` (generalized callback fires on
+    `workspace_upgrade_required`; alias promotion), `tests/test_tool_registry.py`
+    (control tool loads without a todo/workspace manager),
+    `tests/test_persistent_session.py` (`TestResetupToolsForBackend` asserts the
+    tool is exposed on virtual, gone on sandbox), plus the freeze-shape smoke.
 
 **Out of these slices** (later phases): auto-grant without a click + warm-pool
 claim + `none`-tier (Phase 4); `virtual → vm`, which reuses the S3 handler with
@@ -581,12 +628,16 @@ Decisions:
 control surface) — the minimum for Phase 1–3 to ship safely with HITL approval.
 Sec-3 (kill-switch downgrade) is a fast-follow; Sec-5 (auto-grant) is Phase 4.
 
-**Sec-1 — Shared upgrade-authorization gate (server-side, fail-closed).** One
-helper that **both** the session endpoint (§4.2 S4) and the worker
-`provision-workspace` endpoint (§4.3 W2) call before provisioning, consolidating
-their grant checks. Run `capability_grants.evaluate` on the **post-upgrade merged
-config**, exactly as `_enforce_dispatch_grants` does at dispatch
-(`capability_grants.py:123`), plus the kill-switch (Sec-3):
+**Sec-1 — Shared upgrade-authorization gate (server-side, fail-closed). ✅ Built
+(as §4.2 S4).** One helper (`_enforce_workspace_upgrade_grants` in
+`orchestrator/main.py`) that **both** the session endpoint (§4.2 S4) and the
+future worker `provision-workspace` endpoint (§4.3 W2) call before provisioning,
+consolidating their grant checks. Runs `capability_grants.evaluate` on the
+**post-upgrade merged config**, exactly as `_enforce_dispatch_grants` does at
+dispatch (`capability_grants.py:123`); a `vm` target additionally runs
+`_check_vm_permission` (the global `vm_workspaces` kill-switch + `can_use_vm`).
+The dedicated `workspace_upgrade` kill-switch + live downgrade (Sec-3) stay
+deferred.
 - `target=vm`: the fragment's `workspace.backend='vm'` trips the `vm_workspace`
   requirement (`evaluate` line 135); `vm` also keeps `_check_vm_permission` +
   operator approval (`main.py:2574`).
@@ -691,13 +742,13 @@ classifier misses ~17% of overeager actions). Maps to open question #1.
 
 **New code** (✅ = built, 🟡 = partial, ◻️ = design):
 1. ✅ `resetup_tools_for_backend()` on `PersistentSession` (+ extracted `_load_tools_for_backend()`).
-2. ◻️ Generalized `workspace_upgrade_required` freeze type + `context.workspace_upgrade` namespace; `completion.py` routing + `_format_freeze_notification` case. *(S5 — not built; S3 persists the tier via `update_thread_config` instead, no freeze needed for the user-triggered path.)*
+2. 🟡 Generalized `workspace_upgrade_required` freeze type (✅ S5 — session path: the `request_workspace_upgrade` tool sets it; the loop's consume check + `on_workspace_upgrade_needed` callback fire the `workspace_upgrade.needed` offer). The worker-side `context.workspace_upgrade` namespace + `completion.py` routing + `_format_freeze_notification` case remain ◻️ (§4.3 W1; sessions don't pause, they hot-swap).
 3. ✅ Agent-side `_handle_workspace_upgrade(target_tier)` generalizing `_handle_vm_upgrade` (sandbox target; vm forward-compat).
 4. 🟡 Orchestrator `request_thread_workspace_upgrade` + `POST …/threads/{id}/upgrade-to-workspace` ✅ (S2); `POST /api/jobs/{id}/…` is the worker endpoint (W2, ◻️).
 5. ✅ Agent-side **seed copy** (`seed_workspace` + `WorkspaceBackend.walk()`), verify-before-flip.
 6. ◻️ Teach `_job_needs_sandbox` to honor `context.workspace_upgrade.requested`; add the **sandbox injection to `_resume_job_on_agent`**. *(Worker path; only the deferred direct lite→vm re-dispatch needs it — see §4.3 W3.)*
-7. 🟡 Grant re-check on upgrade (◻️ S4) + persist new tier to `threads.metadata` (✅ S3b, via `update_thread_config`).
-8. 🟡 Cockpit: minimal `workspace_upgrade.*` toasts + `/upgrade-workspace` slash ✅; offer banner + explicit "Upgrade workspace" button ◻️ (S5 / later).
+7. ✅ Grant re-check on upgrade (S4 — `_enforce_workspace_upgrade_grants`, the shared Sec-1 gate) + persist new tier to `threads.metadata` (S3b, via `update_thread_config`).
+8. 🟡 Cockpit: minimal `workspace_upgrade.*` toasts + `/upgrade-workspace` slash ✅; `workspace_upgrade.needed` offer message + action-center surface ✅ (S5); a dedicated one-click "Upgrade workspace" / accept button ◻️ (later).
 9. ◻️ *(v2)* Worker in-process `virtual → sandbox` upgrade (agent-side freeze interception + re-`ainvoke`, §4.3 W1) + orchestrator `provision-workspace` endpoint (W2). Re-dispatch / fencing only for the operator-gated VM path (W3).
 10. ◻️ *(v3)* Warm-pool claim (depends on [[workspace_warm_pool_and_async_sessions]]).
 
@@ -705,13 +756,15 @@ classifier misses ~17% of overeager actions). Maps to open question #1.
 
 ## 6. Phasing
 
-- **Phase 1 — Sessions, `virtual → sandbox`, HITL. 🟡 MVP built (S1+S2+S3),
-  S4+S5 + k3d verify remaining.** §4.2 slices S1–S5 (MVP = S1 + S2 + S3; S4 grant
-  gate; S5 agent-initiated offer). Explicit-user-action / agent-offer trigger, no
-  auto-grant yet. Delivers the headline use case. Lowest risk: in-process,
-  portable state, single writer. **Done:** S1+S2+S3 + minimal cockpit, unit-green.
-  **Remaining:** S4 (grant gate — §4.4 Sec-1), S5 (agent-initiated offer), and the
-  live k3d smoke test.
+- **Phase 1 — Sessions, `virtual → sandbox`, HITL. ✅ Built (S1–S5),
+  unit-green; MVP (S1+S2+S3) k3d end-to-end verified.** §4.2 slices S1–S5 (MVP =
+  S1 + S2 + S3; S4 grant gate; S5 agent-initiated offer). Explicit-user-action /
+  agent-offer trigger, no auto-grant yet. Delivers the headline use case. Lowest
+  risk: in-process, portable state, single writer. **Done:** S1+S2+S3 + minimal
+  cockpit (k3d-verified 2026-06-20), S4 (shared Sec-1 grant gate) + S5 (agent-
+  initiated offer: freeze vocab + `request_workspace_upgrade` tool + cockpit
+  offer), all unit-green + ruff-clean. **Remaining:** a live k3d smoke test of the
+  S5 agent-offer round-trip (tool → offer → accept → shell).
 - **Phase 2 — Sessions, `virtual → vm`.** Add the VM target to
   `_handle_workspace_upgrade` (reuses `request_thread_vm_upgrade`), keep the
   operator-approval gate. Mostly wiring once Phase 1 exists.

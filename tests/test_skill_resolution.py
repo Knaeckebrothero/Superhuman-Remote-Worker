@@ -4,8 +4,6 @@ Mirrors the experts precedence model (src/core/expert_resolution.py) but the
 menu keeps ALL names (bundled is the floor) instead of picking one winner.
 """
 
-import pytest
-
 from src.core.skill_resolution import resolve_skill_menu, skill_files_to_workspace
 from src.core.expert_resolution import fence_skills_menu
 

@@ -643,6 +643,7 @@ class NatsBridge:
         event_type_map = {
             "permission.request": "session.permission_request",
             "vm_upgrade.needed": "session.vm_upgrade",
+            "workspace_upgrade.needed": "session.workspace_upgrade",
             "approve": "session.resolved",
             "deny": "session.resolved",
             "ready": "session.waiting",
