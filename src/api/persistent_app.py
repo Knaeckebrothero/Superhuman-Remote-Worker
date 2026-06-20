@@ -1025,6 +1025,26 @@ def _load_expert_config(config_name: str):
     )
 
 
+def _session_backend_is_lite(config: Optional[Dict[str, Any]]) -> bool:
+    """True if a resolved session config / override selects a lite tier
+    (``virtual``/``none``).
+
+    Lite tiers run with no workspace pod, so the session attach must skip the
+    workspace-readiness poll (which would otherwise raise ``WorkspaceNotReady``
+    for a pod that never exists) and let ``PersistentSession._setup_workspace``
+    build the object-store backend from the injected mounts (the lite tiers
+    have no SSH workspace pod — no_workspace_agent_mode.md §4).
+    """
+    if not isinstance(config, dict):
+        return False
+    from ..core.backends.factory import LITE_BACKENDS
+
+    # config_override is flat ({workspace: ...}); a resolved_config blob nests
+    # the agent config under "agent".
+    ws = config.get("workspace") or (config.get("agent") or {}).get("workspace") or {}
+    return ws.get("backend") in LITE_BACKENDS
+
+
 async def _attach_session(
     thread_id: str,
     config_override: Optional[Dict[str, Any]] = None,
@@ -1051,9 +1071,29 @@ async def _attach_session(
 
     _thread_id = thread_id
 
-    # Wait for workspace container (if orchestrator is provisioning one)
+    # Determine the backend before polling: a lite (virtual/none) session has
+    # NO workspace pod, so polling for one would always fail (WorkspaceNotReady).
+    # The pool path passes config_override; a dedicated agent fetches it here.
+    # The orchestrator attaches the lite object-store mounts to this response
+    # for lite threads, so the session can build its backend without a pod.
+    _rc, _co = resolved_config, config_override
+    if _rc is None and _co is None and _orchestrator_client and _thread_id:
+        try:
+            _peek = await _orchestrator_client.get_thread_workspace(_thread_id)
+            if _peek:
+                _rc = _peek.get("resolved_config")
+                _co = _peek.get("config_override")
+        except Exception:
+            pass
+    # Check BOTH blobs: the resolved config is the agent's preferred hydration
+    # source, the override is the authoritative tier — either may carry it.
+    is_lite_session = _session_backend_is_lite(_rc) or _session_backend_is_lite(_co)
+
+    # Wait for workspace container (if orchestrator is provisioning one).
+    # Skipped for lite tiers, which run with no pod — the session builds its
+    # object-store backend from the injected mounts (persistent_session.py).
     workspace_override = None
-    if _orchestrator_client and _thread_id:
+    if not is_lite_session and _orchestrator_client and _thread_id:
         workspace_override = await _poll_workspace_ready(
             _orchestrator_client, _thread_id, timeout=120
         )
@@ -1066,6 +1106,11 @@ async def _attach_session(
                 "No workspace container provisioned for thread. "
                 "Cannot attach session without an isolated workspace."
             )
+    elif is_lite_session:
+        logger.info(
+            "Lite (no-pod) session for thread %s — skipping workspace poll",
+            _thread_id,
+        )
 
     # Apply config overrides, project_ids, and datasources from thread metadata
     if not config_override:

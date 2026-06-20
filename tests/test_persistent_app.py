@@ -31,6 +31,7 @@ from src.api.persistent_app import (
     _safe_serialize,
     _save_message,
     _save_turn_ai_messages,
+    _session_backend_is_lite,
     _ws_send,
     create_persistent_app,
 )
@@ -3529,3 +3530,45 @@ class TestExitWorkspaceNotReadyHelper:
                         await pa._exit_workspace_not_ready("thread-1", exc)
 
         mock_exit.assert_called_once_with(0)
+
+
+# ---------------------------------------------------------------------------
+# _session_backend_is_lite() — lite-session boot detection
+# (no_workspace_agent_mode session boot gap; workspace_tier_upgrade.md smoke test)
+# ---------------------------------------------------------------------------
+
+
+class TestSessionBackendIsLite:
+    """_attach_session uses this to skip the workspace-pod poll for lite
+    (virtual/none) sessions. Must read both the FLAT config_override shape
+    ({workspace: ...}) and the NESTED resolved_config shape (agent.workspace)."""
+
+    def test_flat_virtual_is_lite(self):
+        assert _session_backend_is_lite({"workspace": {"backend": "virtual"}}) is True
+
+    def test_flat_none_is_lite(self):
+        assert _session_backend_is_lite({"workspace": {"backend": "none"}}) is True
+
+    def test_nested_virtual_is_lite(self):
+        # A resolved_config blob nests the agent config under "agent".
+        assert (
+            _session_backend_is_lite({"agent": {"workspace": {"backend": "virtual"}}})
+            is True
+        )
+
+    def test_flat_sandbox_is_not_lite(self):
+        assert _session_backend_is_lite({"workspace": {"backend": "sandbox"}}) is False
+
+    def test_nested_vm_is_not_lite(self):
+        assert (
+            _session_backend_is_lite({"agent": {"workspace": {"backend": "vm"}}})
+            is False
+        )
+
+    def test_missing_backend_is_not_lite(self):
+        assert _session_backend_is_lite({"workspace": {}}) is False
+        assert _session_backend_is_lite({}) is False
+
+    def test_non_dict_is_not_lite(self):
+        assert _session_backend_is_lite(None) is False
+        assert _session_backend_is_lite("virtual") is False
