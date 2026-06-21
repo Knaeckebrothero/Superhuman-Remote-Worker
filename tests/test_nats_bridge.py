@@ -435,8 +435,8 @@ class TestRequestVmCreate:
 
         payload = json.loads(mock_nc.publish.call_args.args[1].decode())
         assert payload["agent_config"] == "defaults"
-        assert payload["cpu_cores"] == 2
-        assert payload["memory"] == "4Gi"
+        assert payload["cpu_cores"] == 8
+        assert payload["memory"] == "16Gi"
         assert payload["description"] == ""
 
     @pytest.mark.asyncio
