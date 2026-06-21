@@ -3,6 +3,15 @@ VM template — loaded by the vm-controller's render_template() and
 string-substituted at provision time. Variables of the form ${...}
 are populated by the controller per-job, EXCEPT for the SSH public key
 and Helm-configurable defaults which are templated in by Helm now.
+
+Two hard constraints on the cloud-init userData below:
+  1. The SSH key path MUST be /etc/ssh/authorized_keys/agent-host — the base
+     image's sshd is AuthorizedKeysFile /etc/ssh/authorized_keys/%u
+     (provision-stage2.sh); ~/.ssh/authorized_keys is never read.
+  2. The whole userData block has a hard 2048-byte KubeVirt limit (inline
+     cloudInitNoCloud). Keep it terse — do NOT add inline comments inside the
+     userData (this Helm comment is stripped and costs nothing). If it ever
+     grows past the limit, switch to a UserDataSecretRef.
 */ -}}
 {{- $sshPubKey := "" -}}
 {{- if .Values.ssh.publicKey -}}
@@ -111,13 +120,6 @@ data:
                         JOB_ID=${JOB_ID}
                         ORCHESTRATOR_ID=${ORCHESTRATOR_ID}
                         VM_ID=agent-vm-${JOB_ID}
-                    # MUST match the base image's sshd AuthorizedKeysFile
-                    # (/etc/ssh/authorized_keys/%u — see agent-vm-base
-                    # provision-stage2.sh). Writing to ~/.ssh/authorized_keys
-                    # instead left sshd unable to find the key → every
-                    # orchestrator SSH got "Permission denied (publickey)" even
-                    # though the keypair matched. The parent dir is pre-created
-                    # 0755 root by the image.
                     - path: /etc/ssh/authorized_keys/agent-host
                       permissions: '0600'
                       owner: agent-host:agent-host
