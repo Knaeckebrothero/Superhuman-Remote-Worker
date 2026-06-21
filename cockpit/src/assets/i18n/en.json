@@ -1278,6 +1278,7 @@
   "datasources": {
     "title": "Datasources",
     "new": "New",
+    "refresh": "Refresh",
     "dismiss": "Dismiss",
     "filter": {
       "all": "All",
@@ -1393,7 +1394,8 @@
       "scopeGlobal": "Global",
       "testTooltip": "Test connection",
       "editTooltip": "Edit",
-      "deleteTooltip": "Delete"
+      "deleteTooltip": "Delete",
+      "moreActions": "More actions"
     },
     "messages": {
       "repoNoAuthConfirm": "No authentication credentials provided.\n\nThis repository will be cloned as read-only — the agent can browse and read the code but will not be able to push changes.\n\nContinue?",
