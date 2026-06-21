@@ -498,7 +498,11 @@ jobs:
           SUDO_GATE=$(has_changes "$SHA_VM_BASE" \
             vm/sudo-daemon/ vm/sudo-plugin/)
 
-          # Chart changes (helm/ directory)
+          # Chart changes (helm/ = main chart, helm-vm-cluster/ = vm-cluster
+          # chart). BOTH must be watched: a helm-vm-cluster/-only change (e.g. a
+          # NetworkPolicy/configmap fix) otherwise sets chart=false and — with no
+          # vm-controller image rebuilt — silently skips the vm-cluster chart
+          # publish + fleet bump, so the fix never deploys.
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             CHART_BASE="${{ github.event.pull_request.base.sha }}"
           elif git rev-parse HEAD~1 &>/dev/null; then
@@ -506,7 +510,7 @@ jobs:
           else
             CHART_BASE=""
           fi
-          if [ -z "$CHART_BASE" ] || [ -n "$(git diff --name-only "$CHART_BASE" HEAD -- 'helm/')" ]; then
+          if [ -z "$CHART_BASE" ] || [ -n "$(git diff --name-only "$CHART_BASE" HEAD -- 'helm/' 'helm-vm-cluster/')" ]; then
             CHART="true"
           else
             CHART="false"
