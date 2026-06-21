@@ -10,6 +10,15 @@ end-to-end (register → SSH → seed → swap → retool → `sudo`=root), but 
 the agent was processing — at the exact moment it needed the upgrade — defeats the feature
 and undercuts the "deep cloud integration" product thesis ([[project_cloud_storage_thesis]]).
 
+> **✅ RESOLVED + DEV-VERIFIED 2026-06-21** (`sha-2b0e496`, thread `b1419d02`). All three parts
+> shipped — handler re-mount (`persistent_app.py`), topology-aware public URL + read-only default
+> (`opencloud.py`/`nextcloud.py`/`main.py`), seed comment corrected — plus 4 unit tests (all green).
+> **Live proof on the upgraded VM:** `mount` → `srw-b1419d02-home on /cloud/home type fuse.rclone
+> (ro,…)`; `ls cloud/` listed the user's real OpenCloud files; `touch cloud/…` → `WRITE_REFUSED`
+> (read-only enforced); `hostname` = the VM. The mount working at all proves the **public** URL is
+> in use (the VM can't reach the internal service). Teardown clean (VM + Headscale node + pod + DB
+> row reaped, no leak). Can be moved to `docs/done/`.
+
 > **Investigation note (2026-06-21):** a codebase trace + web/security research corrected **two**
 > assumptions in the first draft of this issue: (a) the VM image does **not** lack rclone/fuse3 —
 > they're already baked in via the Packer provision script; and (b) the fix is **not** "use the

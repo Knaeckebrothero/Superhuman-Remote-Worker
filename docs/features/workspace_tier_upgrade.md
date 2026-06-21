@@ -22,7 +22,7 @@ related:
 
 # Workspace Tier Upgrade — `virtual`/`none` → `sandbox`/`vm` on demand
 
-**Status (LATEST — session `sandbox → vm` FULLY VERIFIED end-to-end incl. sudo + clean teardown — 2026-06-21):**
+**Status (LATEST — session `sandbox → vm` FULLY VERIFIED end-to-end incl. sudo, cloud mount + clean teardown — 2026-06-21):**
 The lite→sandbox tiers + Q7/Q8 are done (see prior status below). The **VM tier had
 NEVER worked on dev** (DB-proven: 0 threads/jobs ever reached `vm_status=ready` /
 `vm_ssh_host`) due to **two pre-existing VM-backend infra bugs**, both now found +
@@ -63,9 +63,11 @@ pod + DB row, no leak. Bonus finding: `sudo` re-prompts even in auto-accept mode
 (privileged-command gating). The `virtual → vm` cell differs only in the seed *source*
 (object-store vs SSH `RemoteBackend`), already proven for `virtual → sandbox`; the entire
 VM-side path (provision→register→SSH→swap→retool→sudo→teardown) is now proven. **Known gap
-found during this test (HIGH — must fix, NOT just warn):** the upgrade does **not** carry the
-OpenCloud cloud mount onto the VM — the agent loses access to the live cloud data it upgraded to
-keep working on. Root causes (per the issue's investigation): the handler never re-runs
+found during this test → **✅ FIXED + DEV-VERIFIED 2026-06-21** (`sha-2b0e496`):** the upgrade did **not** carry the
+OpenCloud cloud mount onto the VM — the agent lost access to the live cloud data it upgraded to
+keep working on. **Now fixed** (handler re-mount + topology-aware public URL + read-only default);
+re-verified on a fresh `sandbox → vm` run — the VM's `cloud/` mounts (`fuse.rclone, ro`), lists the
+user's real OpenCloud files, and refuses writes. Root causes (per the issue's investigation): the handler never re-runs
 `_setup_cloud_mount` post-swap, **and** the mount WebDAV URL is hardcoded to the *internal*
 `srw-opencloud:9200` the cross-cluster VM can't reach (fix = topology-aware public URL for VM).
 rclone/fuse3 are already in the VM image; FUSE is native in the guest — those are NOT blockers.
@@ -281,7 +283,7 @@ and the worker→vm cell are still design-stage.
 
 | Source → Target | → `sandbox` (container) | → `vm` |
 |---|---|---|
-| **Session** `virtual` | ✅ **Built + DEV-verified** (S1–S5, 2026-06-21) | ✅ **DEV end-to-end VERIFIED via `sandbox → vm`** (2026-06-21): cold KubeVirt VM (8c/16Gi) → register (`ready`, mesh ssh) → SSH → seed (79 files, skipped unreadable `cloud`) → swap → retool → **`sudo`→root on the VM** → clean teardown (no leak). `virtual → vm` shares this VM-side path; differs only in object-store seed source (already proven for `→ sandbox`). Cold-import latency still mitigated agent-side (900 s + heartbeat + orphan teardown, Q7); golden-image clone deferred |
+| **Session** `virtual` | ✅ **Built + DEV-verified** (S1–S5, 2026-06-21) | ✅ **DEV end-to-end VERIFIED via `sandbox → vm`** (2026-06-21): cold KubeVirt VM (8c/16Gi) → register (`ready`, mesh ssh) → SSH → seed (79 files, skipped unreadable `cloud`) → swap → retool → **`sudo`→root** + **`cloud/` re-mounted read-only** on the VM → clean teardown (no leak). `virtual → vm` shares this VM-side path; differs only in object-store seed source (already proven for `→ sandbox`). Cold-import latency still mitigated agent-side (900 s + heartbeat + orphan teardown, Q7); golden-image clone deferred |
 | **Session** `none` | 🟡 plausibly works (tool exposed + lite-boot fixed; worker-`none` verified), **unverified for sessions** | 🟡 plausibly works (same delegation), **unverified** |
 | **Worker job** `virtual` | ✅ **Built + DEV-verified** — in-process swap (Phase 3 W1+W2) | ❌ Phase 3 W3 (deferred — operator-gated re-dispatch; composes W1 + sudo→VM) |
 | **Worker job** `none` | ✅ **DEV-verified** (2026-06-21) — the `ScratchBackend → RemoteBackend` seed copies the scratch files in; the "no durable anchor" worry didn't bite | ❌ |
@@ -308,6 +310,7 @@ Two things explicitly **NOT** done yet (common misreadings):
 | §4.2 **S3** | Agent handler: seed + swap + retool + persist (the MVP) | **✅ Built** |
 | §4.2 **S3a** | `WorkspaceBackend.walk()` + `seed_workspace()` copy-down | **✅ Built** |
 | §4.2 **S3b** | Persist new tier to `metadata.config_override.workspace.backend` | **✅ Built** |
+| §4.2 **S3c** | Re-establish cloud mount on the new backend (topology-aware public URL + read-only for vm) | **✅ Built + DEV-verified** (2026-06-21) |
 | §4.2 — | Minimal Cockpit (`workspace_upgrade.*` toasts + `/upgrade-workspace`) | **✅ Built** |
 | §4.2 **S4** | Grant enforcement (shared §4.4 Sec-1 gate) | **✅ Built** |
 | §4.2 **S5** | Agent-initiated offer (`request_workspace_upgrade` tool + freeze) | **✅ Built** |
@@ -572,8 +575,10 @@ itself between turns), and there is no resume.
 clicks "Upgrade workspace", or the agent calls `request_workspace_upgrade`) →
 grant check → orchestrator provisions a sandbox pod → agent builds + connects a
 `RemoteBackend` and seeds it from the virtual prefix (both backends live) →
-`swap_backend()` → `resetup_tools_for_backend()` → persist the new tier → emit
-`workspace_upgrade.complete`. The next turn has shell/git.
+`swap_backend()` → **re-establish the cloud mount on the new backend** (S3c) →
+`resetup_tools_for_backend()` → persist the new tier → emit
+`workspace_upgrade.complete`. The next turn has shell/git — and the OpenCloud
+`cloud/` mount carried across.
 
 The work breaks into five slices. **S1 + S2 + S3 are the MVP** — a user-triggered
 upgrade working end-to-end; S4 adds the grant gate, S5 the agent-initiated offer.
@@ -637,7 +642,8 @@ eager-session pattern at `main.py:13300`) and record
 `_poll_workspace_ready` → build `RemoteBackend` from the returned `remote` block
 with **`sudo_action="freeze"`** (not VM's `"allow"` — the sandbox keeps its sudo
 gate, which preserves the existing sandbox→VM escalation for free) → **seed**
-(S3a) → `swap_backend` → `resetup_tools_for_backend` (S1) → **persist tier**
+(S3a) → `swap_backend` → **re-establish the cloud mount** (S3c) →
+`resetup_tools_for_backend` (S1) → **persist tier**
 (S3b) → emit `.started`/`.complete`/`.failed` like the VM path. Wire WS dispatch
 `method == "upgrade-to-workspace"` → this handler (mirror the `upgrade-to-vm`
 dispatch at `persistent_app.py:2292`).
@@ -652,6 +658,20 @@ dispatch at `persistent_app.py:2292`).
 - **S3b — persist tier.** Write `metadata.config_override.workspace.backend =
   "sandbox"` so `ensure_session_workspace` (`session_provisioner.py:49`) stops
   no-op'ing on this thread and the suspend/resume/reconcile lifecycle engages.
+- **S3c — re-establish the cloud mount (added 2026-06-21).** The OpenCloud `cloud/`
+  mount is a per-host rclone process (the agent runs `rclone mount` on the
+  workspace over SSH), so it does **not** follow the backend swap — without a
+  remount the agent would lose the live cloud data it upgraded to keep working on
+  ([[workspace_upgrade_drops_cloud_mount]]). After `swap_backend` and **before**
+  retool (tool exposure of `srw_cloud_status` is gated on an active mount), the
+  handler re-fetches the freshly-built `cloud_mount` via `get_thread_workspace`
+  (the orchestrator rebuilds it for the now-*ready* runtime), tears down the stale
+  manager (`aclose`), and re-runs `_setup_cloud_mount` against the new backend. For
+  a cross-cluster **vm** runtime the orchestrator emits the **public** WebDAV URL
+  (the VM can't reach the internal `srw-opencloud:9200`) and a **read-only** mount
+  (root tier — writes are a deliberate escalation); a same-cluster sandbox pod
+  keeps the internal URL + read-write. Best-effort: a remount failure emits
+  `workspace_upgrade.cloud_mount_degraded` and never aborts the upgrade.
 - Minimal Cockpit: an "Upgrade workspace" action that sends the WS message + a
   provisioning/complete/failed indicator (reuse the vm_upgrade toast pattern).
 - *Verify (k3d):* from a running virtual session, trigger the upgrade and assert
@@ -686,6 +706,18 @@ dispatch at `persistent_app.py:2292`).
     {"workspace": {"backend": tier}})` client method (deep-merges into
     `metadata.config_override`); non-fatal on failure so a persist error never
     breaks the live upgrade.
+  - **S3c — cloud remount (2026-06-21)** in `_handle_workspace_upgrade` (re-fetch
+    `cloud_mount` + `aclose` stale manager + `_setup_cloud_mount`, ordered before
+    retool), plus topology-aware URL in `opencloud.py`/`nextcloud.py`
+    `build_rclone_mount_spec` (new `prefer_public_url`, threaded from
+    `_build_agent_cloud_mount` in `main.py` which reads `metadata["vm"]`) and a
+    read-only default for the vm tier. **DEV-verified 2026-06-21** (`sha-2b0e496`):
+    on the upgraded VM `cloud/` mounts `fuse.rclone,ro`, lists the user's real
+    OpenCloud files, and refuses writes. Tests:
+    `test_thread_mount_rows.py` (vm→RO+public / pod→RW+internal),
+    `test_opencloud.py` (URL swap), `test_persistent_app.py` (handler remount).
+    Covers `→ sandbox` sessions too (internal URL + read-write). Full write-up +
+    the corrected root-cause analysis in `docs/issues/workspace_upgrade_drops_cloud_mount.md`.
   - **Cockpit:** `/upgrade-workspace` slash command +
     `workspace_upgrade.started/complete/failed` system-message toasts in
     `persistent-chat.service.ts`. A dedicated "Upgrade workspace" button is

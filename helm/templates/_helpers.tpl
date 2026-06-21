@@ -501,6 +501,30 @@ srw_audit
 {{- end -}}
 {{- end }}
 
+{{- define "srw.litellmPostgresHost" -}}
+{{- if .Values.databases.litellm.internal -}}
+{{- printf "%s-litellmdb" (include "srw.fullname" .) -}}
+{{- else -}}
+{{- required "databases.litellm.externalHost is required when internal=false" .Values.databases.litellm.externalHost -}}
+{{- end -}}
+{{- end }}
+
+{{- define "srw.litellmPostgresPort" -}}
+{{- if .Values.databases.litellm.internal -}}
+5432
+{{- else -}}
+{{- .Values.databases.litellm.externalPort | default 5432 -}}
+{{- end -}}
+{{- end }}
+
+{{- define "srw.litellmPostgresDb" -}}
+{{- if .Values.databases.litellm.internal -}}
+srw_litellm
+{{- else -}}
+{{- .Values.databases.litellm.externalDb | default "srw_litellm" -}}
+{{- end -}}
+{{- end }}
+
 {{/*
 MongoDB URL — supports external mode (no auth in current setup, so URL is non-secret).
 */}}
