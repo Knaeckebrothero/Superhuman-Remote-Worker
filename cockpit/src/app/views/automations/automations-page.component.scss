@@ -288,6 +288,14 @@
 }
 
 @media (max-width: 720px) {
+  // The header is a single non-wrapping flex row (toggle + title + spacer +
+  // New-automation button); at phone widths the long title + verbose button
+  // overflow and the button clips off the right edge. Allow it to wrap so the
+  // button drops to its own line instead. Desktop is untouched (>720px fits on
+  // one line, so wrap never triggers).
+  .page-header {
+    flex-wrap: wrap;
+  }
   .editor-grid {
     grid-template-columns: 1fr;
   }
