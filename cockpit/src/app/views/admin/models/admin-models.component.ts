@@ -520,6 +520,46 @@ function hintsToCapabilities(
       background: var(--danger-tint);
       color: var(--danger);
     }
+    @media (max-width: 720px) {
+      /* The catalog table is a 6-column grid
+         (1.4fr 2fr 160px 100px 70px 260px = 590px of fixed columns alone), so
+         at phone widths Family / Enabled / Test / Delete fall off the right
+         edge and the host's overflow:auto quietly hides them. Collapse each
+         row into a stacked card so every field and control stays on-screen.
+         Desktop (>720px) keeps the table grid untouched. */
+      .model-header {
+        display: none;
+      }
+      .model-row {
+        grid-template-columns: 1fr;
+        gap: 6px;
+        padding: 12px;
+      }
+      .col-display {
+        font-size: 14px;
+        font-weight: 600;
+      }
+      .col-family::before {
+        content: 'Family: ';
+        color: var(--text-muted);
+      }
+      .col-enabled {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+      .col-enabled::before {
+        content: 'Enabled: ';
+        color: var(--text-muted);
+      }
+      .col-actions {
+        margin-top: 4px;
+      }
+      /* Stack the cramped two-up form rows (two ~137px fields side-by-side). */
+      .form-row.two-col {
+        flex-direction: column;
+      }
+    }
   `],
 })
 export class AdminModelsComponent implements OnInit {
@@ -594,7 +634,6 @@ export class AdminModelsComponent implements OnInit {
         available: true,
       });
     }
-    const codex = this.providers.codexAvailability();
     for (const ep of this.providers.systemEndpoints()) {
       const isCodex = ep.label === CODEX_PROXY_LABEL;
       opts.push({
@@ -603,14 +642,13 @@ export class AdminModelsComponent implements OnInit {
         label: isCodex
           ? `${ep.label} (codex subscription)`
           : `${ep.label} (endpoint)`,
-        // Codex proxy is "available" for catalog authoring even without an
-        // active subscription — admins may seed catalog rows ahead of OAuth
-        // login. The runtime status banner below tells them when login is
-        // needed.
-        available: isCodex ? true : true,
+        // Every system endpoint can anchor a catalog row — including the
+        // seeded codex-proxy even without an active subscription (admins may
+        // seed rows ahead of OAuth login; the runtime status banner below
+        // tells them when login is needed).
+        available: true,
       });
     }
-    void codex;
     return opts;
   });
 

@@ -146,6 +146,9 @@ const DISCOVERABLE_PROVIDERS: ReadonlySet<string> = new Set([
                 />
               </app-form-field>
             </div>
+            @if (keyFormError()) {
+              <p class="form-error">{{ keyFormError() }}</p>
+            }
             <app-button
               variant="primary"
               size="md"
@@ -768,6 +771,45 @@ const DISCOVERABLE_PROVIDERS: ReadonlySet<string> = new Set([
       letter-spacing: 0;
     }
     .link-button:hover { text-decoration: underline; }
+    @media (max-width: 720px) {
+      /* Provider API Keys table is a 6-column grid
+         (1.3fr 1fr 1fr 0.9fr 0.9fr 90px); at phone widths six columns squish
+         into ~318px (~40px each), truncating every field. Collapse each row
+         into a stacked card. Desktop (>720px) keeps the table grid. */
+      .key-header {
+        display: none;
+      }
+      .key-row {
+        grid-template-columns: 1fr;
+        gap: 4px;
+        padding: 12px 14px;
+      }
+      .key-row .col-provider {
+        font-size: 14px;
+        font-weight: 600;
+      }
+      .key-row .col-updated::before {
+        content: 'Updated: ';
+        color: var(--text-muted);
+      }
+      .key-row .col-action {
+        margin-top: 4px;
+      }
+      /* System Endpoint cards: the 4-button action row (Test / Discover /
+         Edit / Delete) runs Delete off the right edge. Stack the head so the
+         actions get their own full-width line and wrap. */
+      .endpoint-head {
+        flex-direction: column;
+        align-items: stretch;
+      }
+      .endpoint-actions {
+        flex-wrap: wrap;
+      }
+      /* Stack the cramped two-up form rows. */
+      .form-row.two-col {
+        flex-direction: column;
+      }
+    }
   `],
 })
 export class AdminProvidersComponent implements OnInit {
@@ -786,6 +828,9 @@ export class AdminProvidersComponent implements OnInit {
   readonly keyValue = signal('');
   readonly keyLabel = signal('');
   readonly savingKey = signal(false);
+  // Surfaced when a key save fails — otherwise the form silently resets the
+  // spinner and looks like nothing happened (mirrors endpointFormError).
+  readonly keyFormError = signal<string>('');
 
   // Post-save discovery dialog. `discoveryProvider` is the provider whose
   // post-save async probe we're polling for; `discoveryPolling` flips off
@@ -865,6 +910,7 @@ export class AdminProvidersComponent implements OnInit {
     const provider = this.keyProvider();
     this.savingKey.set(true);
     this.discoveryError.set('');
+    this.keyFormError.set('');
     this.admin
       .setSystemApiKey(provider, {
         api_key: value,
@@ -882,7 +928,10 @@ export class AdminProvidersComponent implements OnInit {
             this.startDiscoveryPolling(provider);
           }
         },
-        error: () => this.savingKey.set(false),
+        error: (err) => {
+          this.keyFormError.set(err?.error?.detail ?? 'Failed to save key.');
+          this.savingKey.set(false);
+        },
       });
   }
 
