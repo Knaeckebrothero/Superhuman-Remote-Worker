@@ -82,3 +82,89 @@
     min-height: v.$touch-target-min;
   }
 }
+
+// --- Progressive enhancement: customizable <select> (appearance: base-select) ---
+// Supported in Chromium 135+. Renders the option list in the top layer, anchored
+// to the trigger via implicit CSS anchor positioning — which (a) fixes the
+// Chromium-Linux popup mis-position under our nested-scroll shell, and (b) makes
+// the picker themeable. Browsers without support (Firefox/Safari) ignore all of
+// this and keep the native <select> popup above — which doesn't exhibit the bug.
+@supports (appearance: base-select) {
+  .app-select__field {
+    appearance: base-select;
+
+    // Suppress the native picker arrow; we keep the themed .app-select__chevron overlay.
+    &::picker-icon {
+      display: none;
+    }
+  }
+
+  // The in-<select> trigger: transparent, so the field provides border/bg/padding.
+  .app-select__trigger {
+    all: unset;
+    box-sizing: border-box;
+    display: flex;
+    align-items: center;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+    font: inherit;
+    color: inherit;
+    cursor: pointer;
+  }
+
+  // The dropdown panel (top layer) — themed to match app-menu.
+  .app-select__field::picker(select) {
+    appearance: base-select;
+    box-sizing: border-box;
+    min-width: anchor-size(width);
+    max-height: 320px;
+    overflow-y: auto;
+    padding: v.$space-xs;
+    background: var(--surface-2, var(--surface-1));
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-surface, 8px);
+    box-shadow: var(--shadow-md, 0 8px 24px rgb(0 0 0 / 30%));
+    color: var(--text-primary);
+    z-index: v.$z-overlay;
+  }
+
+  // Option rows + optgroup labels are *projected* content, so they carry the parent
+  // component's view-encapsulation attribute, not app-select's — a scoped selector
+  // never matches them. Pierce with ::ng-deep so these styles reach the picker rows.
+  // (The ::picker(select) panel above is a pseudo-element of the in-template <select>,
+  // so it's already in scope and doesn't need this.) Option text colour is inherited
+  // from the picker's `color: var(--text-primary)`.
+  :host ::ng-deep {
+    option {
+      padding: v.$space-xs v.$space-sm;
+      border-radius: var(--radius-control, 6px);
+      cursor: pointer;
+
+      &:hover {
+        background: var(--hover, var(--surface-1));
+      }
+
+      &:checked {
+        background: var(--active);
+      }
+
+      &:disabled {
+        cursor: not-allowed;
+        opacity: 0.5;
+      }
+
+      &::checkmark {
+        color: var(--accent-color);
+      }
+    }
+
+    optgroup {
+      padding: v.$space-xs v.$space-sm;
+      color: var(--text-muted);
+      font-size: v.$font-size-xs;
+    }
+  }
+}
