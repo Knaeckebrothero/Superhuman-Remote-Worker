@@ -698,7 +698,7 @@ class TestRequestThreadVmUpgrade:
 
     @pytest.mark.asyncio
     async def test_default_cpu_and_memory(self, client):
-        """Default: cpu_cores=2, memory='4Gi'."""
+        """Default: cpu_cores=8, memory='16Gi'."""
         mock_response = MagicMock()
         mock_response.status_code = 200
 
@@ -707,8 +707,8 @@ class TestRequestThreadVmUpgrade:
             await client.request_thread_vm_upgrade("tid-1")
 
             call_payload = mock_http.post.call_args[1]["json"]
-            assert call_payload["cpu_cores"] == 2
-            assert call_payload["memory"] == "4Gi"
+            assert call_payload["cpu_cores"] == 8
+            assert call_payload["memory"] == "16Gi"
 
 
 class TestGetThreadWorkspace:
