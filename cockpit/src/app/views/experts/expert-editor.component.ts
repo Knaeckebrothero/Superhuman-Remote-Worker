@@ -11,6 +11,7 @@ import {AppTextareaComponent} from '../../ui/textarea';
 import {AppSelectComponent} from '../../ui/select';
 import {AppFormFieldComponent} from '../../ui/form-field';
 import {AppIconComponent} from '../../ui/icon';
+import {SidebarToggleComponent} from '../../shell/sidebar-toggle/sidebar-toggle.component';
 import {ExecutionGroupComponent} from '../agent-settings/execution-group.component';
 import {ToolsGroupComponent} from '../agent-settings/tools-group.component';
 import {AdvancedAccordionComponent} from '../agent-settings/advanced-accordion.component';
@@ -80,6 +81,7 @@ interface EditorForm {
     AppSelectComponent,
     AppFormFieldComponent,
     AppIconComponent,
+    SidebarToggleComponent,
     ExecutionGroupComponent,
     ToolsGroupComponent,
     AdvancedAccordionComponent,
@@ -87,6 +89,10 @@ interface EditorForm {
   template: `
     <div class="editor">
       <header class="head">
+        <!-- Full-page route (no page shell), so carry the mobile sidebar toggle
+             here too — otherwise the off-canvas nav is unreachable on mobile.
+             Renders nothing on desktop (sidebar always expanded). -->
+        <app-sidebar-toggle />
         <h1>{{ (isEdit() ? 'experts.edit' : 'experts.new') | transloco }}</h1>
       </header>
 
@@ -248,6 +254,10 @@ interface EditorForm {
         padding: 1rem 1.5rem;
       }
       .head {
+        display: flex;
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 0.5rem;
         margin-bottom: 1rem;
       }
       .head h1 {
