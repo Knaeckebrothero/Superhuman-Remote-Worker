@@ -545,14 +545,14 @@ class TestTemplateRendering:
         result = provisioner_with_k8s._render_template(job_config)
 
         assert result["metadata"]["name"] == "agent-vm-test-456"
-        # Defaults: agent_config=defaults, cpu=2, memory=4Gi
+        # Defaults: agent_config=defaults, cpu=8, memory=16Gi
         assert result["spec"]["config"]["agentConfig"] == "defaults"
-        assert result["spec"]["template"]["spec"]["domain"]["cpu"]["cores"] == 2
+        assert result["spec"]["template"]["spec"]["domain"]["cpu"]["cores"] == 8
         assert (
             result["spec"]["template"]["spec"]["domain"]["resources"]["requests"][
                 "memory"
             ]
-            == "4Gi"
+            == "16Gi"
         )
 
     def test_render_template_uses_default_vm_image(self, provisioner_with_k8s):
