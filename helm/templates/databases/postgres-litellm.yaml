@@ -1,0 +1,109 @@
+{{- if and .Values.databases.litellm.enabled .Values.databases.litellm.internal }}
+# LiteLLM Gateway Database (srw-litellmdb) — the LLM-usage control plane.
+#
+# Dedicated PostgreSQL instance backing the in-chart LiteLLM proxy (usage
+# monitoring + rate limiting — docs/features/usage_monitoring_and_rate_limiting.md).
+# LiteLLM OWNS this database: it creates and self-migrates its LiteLLM_* tables
+# (virtual keys, teams, internal users, spend logs) via Prisma on startup. The
+# orchestrator's migration runner does NOT touch it. DB mode is required — it is
+# what unlocks virtual keys, per-user/team limits, and the spend/usage dashboard.
+#
+# Component label "litellmdb" (9 chars) stays well under the 52-char StatefulSet
+# name budget (controller-revision-hash adds 11 chars; total label <= 63).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "srw.fullname" . }}-litellmdb-data
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "litellmdb") | nindent 4 }}
+  annotations:
+    "helm.sh/resource-policy": keep
+spec:
+  accessModes:
+    - ReadWriteOnce
+  {{- if .Values.databases.litellm.storageClass }}
+  storageClassName: {{ .Values.databases.litellm.storageClass }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.databases.litellm.storageSize }}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "srw.fullname" . }}-litellmdb
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "litellmdb") | nindent 4 }}
+spec:
+  serviceName: {{ include "srw.fullname" . }}-litellmdb
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "srw.componentSelectorLabels" (dict "context" . "component" "litellmdb") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "srw.componentSelectorLabels" (dict "context" . "component" "litellmdb") | nindent 8 }}
+    spec:
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: litellmdb
+          image: {{ .Values.databases.litellm.image }}
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: LITELLM_POSTGRES_USER
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: LITELLM_POSTGRES_PASSWORD
+            - name: POSTGRES_DB
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: LITELLM_POSTGRES_DB
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          livenessProbe:
+            exec:
+              # -d postgres: probe the always-present maintenance DB (the
+              # gateway DB name is srw_litellm). -U is not authenticated by
+              # pg_isready.
+              command: ["pg_isready", "-U", "srw", "-d", "postgres"]
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "srw", "-d", "postgres"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.databases.litellm.resources | nindent 12 }}
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ include "srw.fullname" . }}-litellmdb-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "srw.fullname" . }}-litellmdb
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "litellmdb") | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - port: 5432
+      targetPort: 5432
+  selector:
+    {{- include "srw.componentSelectorLabels" (dict "context" . "component" "litellmdb") | nindent 4 }}
+{{- end }}

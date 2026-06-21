@@ -144,6 +144,7 @@ from auth import bff_router  # noqa: E402
 from routers import automations_router  # noqa: E402
 from routers.sessions import router as sessions_router  # noqa: E402
 from services.cron_dispatcher import cron_dispatcher_loop  # noqa: E402
+from services.litellm_gateway import litellm_sync_loop  # noqa: E402
 from services.audit_partitions import (  # noqa: E402
     maintenance_loop as audit_maintenance_loop,
 )
@@ -1090,6 +1091,31 @@ def _looks_like_uuid(value: Any) -> bool:
         return False
 
 
+def _gateway_routing_target() -> tuple[str, str] | None:
+    """OpenAI-compatible ``(base_url, api_key)`` for the LiteLLM gateway, or None.
+
+    Returns None unless the gateway is enabled (``LITELLM_BASE_URL`` set — the
+    chart only populates it when ``litellm.enabled``). When set, **endpoint-kind**
+    models are pointed here instead of straight at their upstream, so all of their
+    traffic is measured at the one chokepoint (Slice 1). See
+    docs/features/usage_monitoring_and_rate_limiting.md.
+
+    The ``/v1`` suffix matches what the agent's OpenAI factory expects (direct
+    endpoint base_urls carry it too); the orchestrator's admin/health client uses
+    the bare ``LITELLM_BASE_URL`` instead.
+
+    Slice 1 presents the **master key** as the shared agent credential: agents
+    already receive real upstream keys today, so this is no worse, and Slice 2
+    replaces it with per-job least-privilege virtual keys minted at dispatch
+    (the per-job-client-rebuild prereq is docs/issues/agent_loop_mode_pod_reuse.md).
+    """
+    base = os.getenv("LITELLM_BASE_URL", "").strip()
+    key = os.getenv("LITELLM_MASTER_KEY", "").strip()
+    if not base or not key:
+        return None
+    return f"{base.rstrip('/')}/v1", key
+
+
 async def _inject_dispatch_credentials(
     job: dict[str, Any],
     config_override: dict[str, Any] | None,
@@ -1136,16 +1162,28 @@ async def _inject_dispatch_credentials(
         and meta.origin in ("custom", "system", "catalog")
         and meta.endpoint_id
     ):
-        endpoint_row = await postgres_db.get_user_llm_endpoint(meta.endpoint_id)
-        if endpoint_row:
-            if endpoint_row.get("base_url"):
-                llm_over.setdefault("base_url", endpoint_row["base_url"])
-            if endpoint_row.get("api_key"):
-                llm_over.setdefault("api_key", endpoint_row["api_key"])
+        _gw = _gateway_routing_target()
+        if _gw is not None:
+            # Endpoint-kind model + gateway enabled → route through LiteLLM so the
+            # traffic is measured at the chokepoint. The gateway resolves the
+            # model_id to its real upstream (registered by the catalog-sync loop).
+            llm_over.setdefault("base_url", _gw[0])
+            llm_over.setdefault("api_key", _gw[1])
             logger.info(
-                f"Dispatch: routed {model_id} to {meta.origin} endpoint "
-                f"{endpoint_row.get('label') or meta.endpoint_id}"
+                f"Dispatch: routed {model_id} via LiteLLM gateway "
+                f"(endpoint {meta.endpoint_id})"
             )
+        else:
+            endpoint_row = await postgres_db.get_user_llm_endpoint(meta.endpoint_id)
+            if endpoint_row:
+                if endpoint_row.get("base_url"):
+                    llm_over.setdefault("base_url", endpoint_row["base_url"])
+                if endpoint_row.get("api_key"):
+                    llm_over.setdefault("api_key", endpoint_row["api_key"])
+                logger.info(
+                    f"Dispatch: routed {model_id} to {meta.origin} endpoint "
+                    f"{endpoint_row.get('label') or meta.endpoint_id}"
+                )
     elif resolved_keys:
         if meta is not None and meta.api_key_ref:
             provider_for_key: str | None = meta.api_key_ref
@@ -3075,6 +3113,13 @@ async def _inject_model_credentials(
         and meta.origin in ("custom", "system", "catalog")
         and meta.endpoint_id
     ):
+        _gw = _gateway_routing_target()
+        if _gw is not None:
+            # Route endpoint-kind phase/aux models through the gateway too, so
+            # measurement covers the full chat/auxiliary surface (Slice 1).
+            section.setdefault("base_url", _gw[0])
+            section.setdefault("api_key", _gw[1])
+            return
         endpoint_row = await postgres_db.get_user_llm_endpoint(meta.endpoint_id)
         if endpoint_row:
             if endpoint_row.get("base_url"):
@@ -4779,6 +4824,15 @@ async def lifespan(app: FastAPI):
         )
     )
 
+    # LiteLLM gateway catalog sync — registers endpoint-kind catalog models into
+    # the in-chart LiteLLM proxy so agent LLM traffic can be measured (and, in
+    # later slices, rate-limited). Self-disables when LITELLM_BASE_URL is unset
+    # (i.e. litellm.enabled=false), so it's a no-op on deployments without the
+    # gateway. See docs/features/usage_monitoring_and_rate_limiting.md.
+    litellm_sync_task = asyncio.create_task(
+        litellm_sync_loop(_shutdown_event, postgres_db)
+    )
+
     # Audit-store partition maintenance (creation + ANALYZE + lookahead alarms;
     # retention deferred — see services/audit_partitions.py). Only when the
     # audit DB is configured; otherwise the store is inactive and there is
@@ -4862,6 +4916,7 @@ async def lifespan(app: FastAPI):
     await lifecycle_reconciler_task
     await main_cloud_listen_task
     await automation_cron_task
+    await litellm_sync_task
     if audit_maintenance_task is not None:
         await audit_maintenance_task
 

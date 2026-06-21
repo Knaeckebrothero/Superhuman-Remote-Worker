@@ -1,0 +1,16 @@
+{{- if .Values.litellm.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "srw.serviceName" (dict "context" . "component" "litellm") }}
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "litellm") | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - port: {{ .Values.litellm.port }}
+      targetPort: 4000
+      name: http
+  selector:
+    {{- include "srw.componentSelectorLabels" (dict "context" . "component" "litellm") | nindent 4 }}
+{{- end }}

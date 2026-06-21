@@ -1,0 +1,125 @@
+{{- if .Values.litellm.enabled }}
+{{/*
+LiteLLM gateway — central proxy all agent LLM traffic traverses for usage
+monitoring + rate limiting. Runs in DB mode (Prisma self-migrates LiteLLM_*
+tables into srw_litellm on boot), which unlocks virtual keys, per-user/team
+limits, spend tracking, and the native dashboard. Models are registered at
+runtime by the orchestrator's catalog-sync loop (services/litellm_gateway.py),
+not baked into config.yaml.
+*/}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "srw.fullname" . }}-litellm
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "litellm") | nindent 4 }}
+  annotations:
+    reloader.stakater.com/auto: "true"
+spec:
+  replicas: {{ .Values.litellm.replicas | default 1 }}
+  selector:
+    matchLabels:
+      {{- include "srw.componentSelectorLabels" (dict "context" . "component" "litellm") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "srw.componentSelectorLabels" (dict "context" . "component" "litellm") | nindent 8 }}
+    spec:
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      initContainers:
+        {{- if and .Values.databases.litellm.enabled .Values.databases.litellm.internal }}
+        - name: wait-for-litellmdb
+          image: busybox:1.36
+          command: ["sh", "-c", "until nc -z {{ include "srw.fullname" . }}-litellmdb 5432; do echo waiting for litellmdb; sleep 2; done"]
+        {{- end }}
+      containers:
+        - name: litellm
+          image: {{ .Values.litellm.image }}
+          args:
+            - "--config"
+            - "/etc/litellm/config.yaml"
+            - "--port"
+            - "4000"
+            - "--host"
+            - "0.0.0.0"
+            # Single worker: v1 is single-replica, and each extra uvicorn worker
+            # reloads the whole app (memory multiplier + a prior OOMKill).
+            - "--num_workers"
+            - "1"
+          ports:
+            - containerPort: 4000
+              name: http
+          env:
+            # --- Gateway Postgres (DB mode). Composed into DATABASE_URL below.
+            - name: LITELLM_POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: LITELLM_POSTGRES_USER
+            - name: LITELLM_POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: LITELLM_POSTGRES_PASSWORD
+            - name: LITELLM_POSTGRES_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: LITELLM_POSTGRES_HOST
+            - name: LITELLM_POSTGRES_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: LITELLM_POSTGRES_PORT
+            - name: LITELLM_POSTGRES_DB
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: LITELLM_POSTGRES_DB
+            # Prisma DSN. NOTE: the password must be URL-safe (dev creds are);
+            # for prod, store a pre-encoded password or front it with a Secret
+            # that is already percent-encoded.
+            - name: DATABASE_URL
+              value: "postgresql://$(LITELLM_POSTGRES_USER):$(LITELLM_POSTGRES_PASSWORD)@$(LITELLM_POSTGRES_HOST):$(LITELLM_POSTGRES_PORT)/$(LITELLM_POSTGRES_DB)"
+            # --- Admin auth + at-rest encryption of DB-stored model keys.
+            - name: LITELLM_MASTER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: LITELLM_MASTER_KEY
+            - name: LITELLM_SALT_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: LITELLM_SALT_KEY
+            - name: STORE_MODEL_IN_DB
+              value: "True"
+          volumeMounts:
+            - name: config
+              mountPath: /etc/litellm
+              readOnly: true
+          # Prisma migrate runs on first boot — give it generous startup grace.
+          readinessProbe:
+            httpGet:
+              path: /health/readiness
+              port: 4000
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            failureThreshold: 18
+          livenessProbe:
+            httpGet:
+              path: /health/liveliness
+              port: 4000
+            initialDelaySeconds: 90
+            periodSeconds: 15
+            failureThreshold: 6
+          resources:
+            {{- toYaml .Values.litellm.resources | nindent 12 }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "srw.fullname" . }}-litellm-config
+{{- end }}

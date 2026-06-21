@@ -105,6 +105,31 @@ spec:
 ---
 {{- end }}
 
+{{- if and .Values.databases.litellm.enabled .Values.databases.litellm.internal }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "srw.fullname" . }}-litellmdb
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "litellmdb") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "srw.componentSelectorLabels" (dict "context" . "component" "litellmdb") | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    # Only the LiteLLM gateway reaches its own DB (Prisma migrate + runtime).
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "litellm") | nindent 14 }}
+      ports:
+        - port: 5432
+          protocol: TCP
+---
+{{- end }}
+
 {{- if and .Values.databases.mongodb.enabled .Values.databases.mongodb.internal }}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy

@@ -30,6 +30,20 @@ data:
   # reader selector; agents inherit it via envFrom for the writer.
   AUDIT_BACKEND: {{ .Values.databases.audit.backend | quote }}
 
+  # LiteLLM gateway DB (srw_litellm) — non-secret connection parts. Composed
+  # with LITELLM_POSTGRES_USER/PASSWORD (Secret) into the DATABASE_URL on the
+  # LiteLLM pod. LiteLLM self-migrates this schema via Prisma (not the
+  # orchestrator migration runner). Rendered unconditionally (mirrors the
+  # audit keys); only consumed when litellm.enabled.
+  LITELLM_POSTGRES_HOST: {{ include "srw.litellmPostgresHost" . | quote }}
+  LITELLM_POSTGRES_PORT: {{ include "srw.litellmPostgresPort" . | quote }}
+  LITELLM_POSTGRES_DB: {{ include "srw.litellmPostgresDb" . | quote }}
+  {{- if .Values.litellm.enabled }}
+  # In-cluster URL agents + orchestrator use to reach the LiteLLM gateway.
+  # Presence of this key is what enables the orchestrator's catalog-sync loop.
+  LITELLM_BASE_URL: {{ printf "http://%s:%d" (include "srw.serviceName" (dict "context" . "component" "litellm")) (int .Values.litellm.port) | quote }}
+  {{- end }}
+
   # (Citations live in the vector store — srw_vector — reached through the
   # agent's shared VECTOR_POSTGRES_* pool. No separate citation DB/role/DSN.
   # See docs/features/citation_engine_integration.md.)
