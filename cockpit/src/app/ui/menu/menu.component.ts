@@ -137,6 +137,12 @@ export class AppMenuComponent {
   private reposition(): void {
     if (!this.anchor || !this.isOpen()) return;
     const panel = this.panelRef().nativeElement;
+    // open() calls this synchronously, before change detection applies the
+    // [data-open] binding — so the panel can still be `display: none` (zero
+    // size), which breaks width-based placement (e.g. bottom-end ends up off
+    // screen). Force the open style on for measurement; the binding re-affirms
+    // it on the next tick, and close() clears it via the same binding.
+    if (!panel.hasAttribute('data-open')) panel.setAttribute('data-open', '');
     const a = this.anchor.getBoundingClientRect();
     const margin = 4;
 
