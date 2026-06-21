@@ -479,6 +479,45 @@ class TestRcloneMountSpec:
         assert spec.auth["type"] == "keycloak_client_credentials"
 
     @pytest.mark.asyncio
+    async def test_prefer_public_url_swaps_internal_to_public(self):
+        # A cross-cluster VM mount must target the public edge; the internal
+        # service URL isn't reachable from the vm cluster
+        # (docs/issues/workspace_upgrade_drops_cloud_mount.md). Same-cluster
+        # pods (default, prefer_public_url=False) keep the internal URL.
+        settings = _settings().model_copy(
+            update={
+                "base_url": "http://srw-opencloud:9200",
+                "public_url": "https://cloud.example.com",
+            }
+        )
+        be = OpenCloudBackend(settings)
+        _install_fake(be, FakeOpenCloud())
+        handle = ProjectFolderHandle(
+            backend="opencloud", native_id="drive-42", vendor_meta={}
+        )
+        internal = await be.build_rclone_mount_spec(
+            handle=handle,
+            mount_kind="project",
+            target_path="/cloud/proj",
+            access="read_write",
+        )
+        assert (
+            internal.source_config["url"]
+            == "http://srw-opencloud:9200/dav/spaces/drive-42/"
+        )
+        public = await be.build_rclone_mount_spec(
+            handle=handle,
+            mount_kind="project",
+            target_path="/cloud/proj",
+            access="read_only",
+            prefer_public_url=True,
+        )
+        assert (
+            public.source_config["url"]
+            == "https://cloud.example.com/dav/spaces/drive-42/"
+        )
+
+    @pytest.mark.asyncio
     async def test_user_home_with_sub_uses_impersonation_auth(self):
         be = OpenCloudBackend(_settings())
         _install_fake(be, FakeOpenCloud())

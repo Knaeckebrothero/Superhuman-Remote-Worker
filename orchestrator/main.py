@@ -14462,6 +14462,7 @@ async def _build_rclone_mount_from_row(
     row: dict[str, Any],
     *,
     workspace_name: str,
+    runtime_is_vm: bool = False,
 ) -> Optional[dict[str, Any]]:
     backend_id = row.get("backend_id")
     handle_str = row.get("cloud_handle")
@@ -14477,12 +14478,17 @@ async def _build_rclone_mount_from_row(
             username=handle.vendor_meta.get("username"),
         )
         target_path = f"/cloud/{workspace_name}"
+        # vm tier = root → read-only by default (root + FUSE over the whole
+        # Space is a real blast radius); see
+        # docs/issues/workspace_upgrade_drops_cloud_mount.md § Security.
+        access = "read_only" if runtime_is_vm else "read_write"
         spec = await backend.build_rclone_mount_spec(
             handle=handle,
             mount_kind=str(row.get("mount_kind") or "project"),
             target_path=target_path,
-            access="read_write",
+            access=access,
             subject=subject,
+            prefer_public_url=runtime_is_vm,
         )
     except CloudBackendError as e:
         logger.info(
@@ -14505,7 +14511,7 @@ async def _build_rclone_mount_from_row(
         "backend": backend.backend_id,
         "target_path": target_path,
         "workspace_name": workspace_name,
-        "access": "read_write",
+        "access": access,
         "source_ref": str(row.get("source_ref")) if row.get("source_ref") else None,
         **spec.to_payload(),
     }
@@ -14513,6 +14519,8 @@ async def _build_rclone_mount_from_row(
 
 async def _build_rclone_session_mount(
     thread: dict[str, Any],
+    *,
+    runtime_is_vm: bool = False,
 ) -> Optional[dict[str, Any]]:
     handle_str = thread.get("main_cloud_session_handle") or thread.get(
         "nc_session_folder"
@@ -14525,12 +14533,14 @@ async def _build_rclone_session_mount(
         return None
     try:
         handle = SessionFolderHandle.from_db(handle_str, backend=backend.backend_id)
+        access = "read_only" if runtime_is_vm else "read_write"
         spec = await backend.build_rclone_mount_spec(
             handle=handle,
             mount_kind="session_folder",
             target_path="/cloud/home",
-            access="read_write",
+            access=access,
             subject=None,
+            prefer_public_url=runtime_is_vm,
         )
     except Exception as e:
         logger.warning(
@@ -14545,7 +14555,7 @@ async def _build_rclone_session_mount(
         "backend": backend.backend_id,
         "target_path": "/cloud/home",
         "workspace_name": "home",
-        "access": "read_write",
+        "access": access,
         **spec.to_payload(),
     }
 
@@ -14566,6 +14576,12 @@ async def _build_agent_cloud_mount(
     if not _runtime_supports_rclone_mount(metadata):
         return None
 
+    # A cross-cluster VM runtime needs the public WebDAV URL (it can't reach the
+    # internal service DNS) and defaults to a read-only mount (root tier). A
+    # same-cluster workspace pod keeps the internal URL + read-write.
+    vm_ctx = metadata.get("vm") or {}
+    runtime_is_vm = vm_ctx.get("status") == "ready" and bool(vm_ctx.get("ssh_host"))
+
     rows = [
         row
         for row in (mount_rows or [])
@@ -14575,7 +14591,9 @@ async def _build_agent_cloud_mount(
     mounted_rows: list[dict[str, Any]] = []
     for row in rows:
         workspace_name = _cloud_mount_name(row, used_names)
-        mounted = await _build_rclone_mount_from_row(row, workspace_name=workspace_name)
+        mounted = await _build_rclone_mount_from_row(
+            row, workspace_name=workspace_name, runtime_is_vm=runtime_is_vm
+        )
         if mounted is None:
             mounted_rows = []
             break
@@ -14584,7 +14602,9 @@ async def _build_agent_cloud_mount(
     fallback = False
     mounts_out = mounted_rows
     if not mounts_out or len(mounts_out) != len(rows):
-        session_mount = await _build_rclone_session_mount(thread)
+        session_mount = await _build_rclone_session_mount(
+            thread, runtime_is_vm=runtime_is_vm
+        )
         if session_mount:
             mounts_out = [session_mount]
             fallback = bool(rows)

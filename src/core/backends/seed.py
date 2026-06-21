@@ -56,8 +56,10 @@ def seed_workspace(src: "WorkspaceBackend", dst: "WorkspaceBackend") -> int:
             # mount points (notably the OpenCloud `cloud/` rclone mount, which
             # stats as a non-dir over SFTP), symlinks, sockets, FIFOs. Skip them
             # instead of failing the whole upgrade — one un-copyable mount must
-            # not abort a VM/sandbox swap. The cloud mount in particular is
-            # RE-mounted on the new backend, so it must not be copied anyway.
+            # not abort a VM/sandbox swap. The cloud mount in particular is a
+            # live rclone mount (not copyable); it is re-established separately
+            # by the upgrade handler, which re-runs _setup_cloud_mount against
+            # the new backend (docs/issues/workspace_upgrade_drops_cloud_mount.md).
             logger.warning("Seed: skipping unreadable entry %r: %s", rel, e)
             skipped.append(rel)
             continue

@@ -505,6 +505,110 @@ async def test_build_agent_cloud_mount_uses_supported_thread_mount(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_build_agent_cloud_mount_vm_runtime_is_readonly_and_public(monkeypatch):
+    """A cross-cluster VM runtime mounts read-only (root tier) and requests the
+    public WebDAV URL — the internal service URL isn't reachable from the vm
+    cluster (docs/issues/workspace_upgrade_drops_cloud_mount.md)."""
+    from main import _build_agent_cloud_mount
+    from services.cloud import RcloneMountSpec
+
+    captured: dict = {}
+
+    class Backend:
+        backend_id = "opencloud"
+        is_initialized = True
+
+        async def build_rclone_mount_spec(
+            self, *, mount_kind, target_path, access, prefer_public_url=False, **kwargs
+        ):
+            captured["access"] = access
+            captured["prefer_public_url"] = prefer_public_url
+            return RcloneMountSpec(
+                source_type="webdav",
+                source_config={
+                    "url": "https://cloud.public.test/dav/spaces/d/",
+                    "vendor": "infinitescale",
+                },
+                auth={"type": "keycloak_client_credentials"},
+            )
+
+    monkeypatch.setenv("CLOUD_WORKSPACE_DRIVER", "rclone_mount")
+    router = MagicMock()
+    router.for_backend.return_value = Backend()
+    thread = {
+        "id": "t1",
+        "main_cloud_backend": "opencloud",
+        "main_cloud_session_handle": "sessions/t1",
+    }
+
+    with patch("main.main_cloud_router", router):
+        payload = await _build_agent_cloud_mount(
+            thread,
+            mount_rows=[],
+            metadata={"vm": {"status": "ready", "ssh_host": "100.64.0.5"}},
+        )
+
+    assert payload is not None
+    assert captured["prefer_public_url"] is True
+    assert captured["access"] == "read_only"
+    assert payload["mounts"][0]["access"] == "read_only"
+
+
+@pytest.mark.asyncio
+async def test_build_agent_cloud_mount_pod_runtime_is_readwrite_and_internal(
+    monkeypatch,
+):
+    """A same-cluster workspace pod keeps read-write + the internal URL (no
+    public-edge hairpin, works on local k3d)."""
+    from main import _build_agent_cloud_mount
+    from services.cloud import RcloneMountSpec
+
+    captured: dict = {}
+
+    class Backend:
+        backend_id = "opencloud"
+        is_initialized = True
+
+        async def build_rclone_mount_spec(
+            self, *, mount_kind, target_path, access, prefer_public_url=False, **kwargs
+        ):
+            captured["access"] = access
+            captured["prefer_public_url"] = prefer_public_url
+            return RcloneMountSpec(
+                source_type="webdav",
+                source_config={
+                    "url": "http://srw-opencloud:9200/dav/spaces/d/",
+                    "vendor": "infinitescale",
+                },
+                auth={"type": "keycloak_client_credentials"},
+            )
+
+    monkeypatch.setenv("CLOUD_WORKSPACE_DRIVER", "rclone_mount")
+    monkeypatch.delenv("CLOUD_RCLONE_ALLOW_CONTAINER", raising=False)
+    router = MagicMock()
+    router.for_backend.return_value = Backend()
+    thread = {
+        "id": "t1",
+        "main_cloud_backend": "opencloud",
+        "main_cloud_session_handle": "sessions/t1",
+    }
+
+    with patch("main.main_cloud_router", router):
+        payload = await _build_agent_cloud_mount(
+            thread,
+            mount_rows=[],
+            metadata={
+                "workspace_container": {"status": "ready", "pod_ip": "10.42.0.10"}
+            },
+        )
+
+    assert payload is not None
+    assert captured["prefer_public_url"] is False
+    assert captured["access"] == "read_write"
+    assert payload["mounts"][0]["access"] == "read_write"
+
+
+@pytest.mark.asyncio
 async def test_build_agent_cloud_mount_uses_container_runtime_by_default(monkeypatch):
     from main import _build_agent_cloud_mount
     from services.cloud import RcloneMountSpec

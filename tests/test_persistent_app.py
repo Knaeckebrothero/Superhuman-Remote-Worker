@@ -2237,6 +2237,71 @@ class TestHandleWorkspaceUpgradeVm:
         ]
         assert len(failed) == 1
 
+    @pytest.mark.asyncio
+    async def test_cloud_mount_reestablished_after_vm_swap(self):
+        """A successful sandbox→vm upgrade re-fetches the fresh (vm-ready)
+        cloud_mount and re-mounts it on the new backend — the rclone mount is
+        per-host and doesn't follow the swap.
+        docs/issues/workspace_upgrade_drops_cloud_mount.md."""
+        import sys
+
+        ws = AsyncMock()
+        client = AsyncMock()
+        client.request_thread_workspace_upgrade.return_value = True
+        fresh_mount = {
+            "version": 1,
+            "driver": "rclone",
+            "mounts": [{"access": "read_only"}],
+        }
+        client.get_thread_workspace.return_value = {"cloud_mount": fresh_mount}
+
+        sandbox = SimpleNamespace(supports_shell=True, sudo_action="freeze")
+        sess = self._session_with_backend(sandbox)
+        sess.cloud_mount_manager = None  # nothing stale to tear down
+        sess.cloud_mount_error = None
+        sess.swap_backend = MagicMock()
+        sess.resetup_tools_for_backend = MagicMock()
+
+        async def _fake_setup(cfg):
+            # A successful mount leaves an active manager.
+            sess.cloud_mount_manager = SimpleNamespace(active=True)
+
+        sess._setup_cloud_mount = AsyncMock(side_effect=_fake_setup)
+
+        mock_remote_mod = MagicMock()  # RemoteBackend(...) → connectable stub
+        with (
+            patch("src.api.persistent_app._session", sess),
+            patch("src.api.persistent_app._orchestrator_client", client),
+            patch("src.api.persistent_app._thread_id", "tid"),
+            patch(
+                "src.api.persistent_app._poll_vm_ready",
+                new_callable=AsyncMock,
+                return_value={"ssh_host": "100.64.0.9", "ssh_port": 22},
+            ),
+            patch.dict(sys.modules, {"src.core.backends.remote": mock_remote_mod}),
+            patch("src.core.backends.seed.seed_workspace", return_value=7),
+        ):
+            await _handle_workspace_upgrade(ws, target_tier="vm")
+
+        # Re-fetched the fresh payload and re-mounted on the new backend ...
+        client.get_thread_workspace.assert_awaited_once_with("tid")
+        sess._setup_cloud_mount.assert_awaited_once_with(fresh_mount)
+        sess.resetup_tools_for_backend.assert_called_once()
+        # ... mount succeeded (no degraded notice) and the upgrade completed.
+        degraded = [
+            c[0][0]
+            for c in ws.send_json.call_args_list
+            if c[0][0].get("method") == "workspace_upgrade.cloud_mount_degraded"
+        ]
+        assert degraded == []
+        complete = [
+            c[0][0]
+            for c in ws.send_json.call_args_list
+            if c[0][0].get("method") == "workspace_upgrade.complete"
+        ]
+        assert len(complete) == 1
+        client.abort_thread_vm_upgrade.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # 3.17 _ws_send()
