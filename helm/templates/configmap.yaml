@@ -42,6 +42,9 @@ data:
   # In-cluster URL agents + orchestrator use to reach the LiteLLM gateway.
   # Presence of this key is what enables the orchestrator's catalog-sync loop.
   LITELLM_BASE_URL: {{ printf "http://%s:%d" (include "srw.serviceName" (dict "context" . "component" "litellm")) (int .Values.litellm.port) | quote }}
+  # Aggregate upstream backstop (per-model rpm/tpm capacity) → stamped on the
+  # shared fleet key by the orchestrator. JSON map keyed by model_id (+ "*").
+  LITELLM_BACKSTOP: {{ .Values.litellm.backstop | toJson | quote }}
   {{- end }}
 
   # (Citations live in the vector store — srw_vector — reached through the

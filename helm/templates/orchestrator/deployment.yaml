@@ -189,6 +189,11 @@ spec:
                 secretKeyRef:
                   name: {{ include "srw.secretName" . }}
                   key: LITELLM_MASTER_KEY
+            - name: LITELLM_BACKSTOP
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: LITELLM_BACKSTOP
             {{- end }}
             - name: MONGODB_URL
               valueFrom:
