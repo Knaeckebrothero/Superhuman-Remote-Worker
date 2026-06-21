@@ -160,6 +160,7 @@ class NextcloudBackend:
         target_path: str,
         access: str,
         subject: CloudMountSubject | None = None,
+        prefer_public_url: bool = False,
     ) -> RcloneMountSpec:
         """Build an rclone WebDAV spec for a Nextcloud-backed cloud surface."""
         if isinstance(handle, SessionFolderHandle):
@@ -177,6 +178,18 @@ class NextcloudBackend:
             else:
                 webdav_url = self.get_project_folder_webdav_url(handle)
                 creds = self.webdav_credentials
+
+        # Cross-cluster VM runtimes can't reach the internal service URL; swap
+        # to the public edge (no-op unless the URL is internal-prefixed). Mirror
+        # of the OpenCloud path — see
+        # docs/issues/workspace_upgrade_drops_cloud_mount.md.
+        if (
+            prefer_public_url
+            and webdav_url
+            and self._public_url
+            and webdav_url.startswith(self._base_url)
+        ):
+            webdav_url = self._public_url + webdav_url[len(self._base_url) :]
 
         if not webdav_url:
             raise CloudBackendError(

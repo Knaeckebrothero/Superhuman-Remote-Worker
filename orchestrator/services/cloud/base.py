@@ -344,4 +344,11 @@ class SupportsRcloneMount(Protocol):
         target_path: str,
         access: Literal["read_only", "read_write"],
         subject: CloudMountSubject | None = None,
-    ) -> RcloneMountSpec: ...
+        prefer_public_url: bool = False,
+    ) -> RcloneMountSpec:
+        """``prefer_public_url`` selects the public WebDAV endpoint instead of
+        the internal one — required for cross-cluster VM runtimes that can't
+        reach the internal service DNS (workspace_upgrade_drops_cloud_mount.md).
+        Same-cluster workspace pods leave it ``False`` (no public-edge hairpin).
+        """
+        ...
