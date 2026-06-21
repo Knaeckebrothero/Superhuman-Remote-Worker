@@ -10,11 +10,18 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+import orchestrator.services.litellm_gateway as gw_mod
 from orchestrator.services.litellm_gateway import (
+    FLEET_KEY_ALIAS,
     OWNED_ID_PREFIX,
+    _build_fleet_limits,
     _needs_replace,
+    _parse_backstop,
     _rev_for_endpoint,
     build_desired_models,
+    compute_fleet_key,
+    ensure_fleet_key,
+    get_fleet_key,
     sync_catalog_to_gateway,
 )
 
@@ -222,3 +229,118 @@ class TestSyncCatalogToGateway:
 
         client.delete_model.assert_not_awaited()
         assert counts["deleted"] == 0
+
+
+class TestComputeFleetKey:
+    def test_deterministic(self):
+        assert compute_fleet_key("sk-master") == compute_fleet_key("sk-master")
+
+    def test_depends_on_master_key(self):
+        assert compute_fleet_key("sk-a") != compute_fleet_key("sk-b")
+
+    def test_prefix(self):
+        assert compute_fleet_key("sk-x").startswith("sk-srw-fleet-")
+
+
+class TestParseBackstop:
+    def test_unset_is_empty(self, monkeypatch):
+        monkeypatch.delenv("LITELLM_BACKSTOP", raising=False)
+        assert _parse_backstop() == {}
+
+    def test_valid_json(self, monkeypatch):
+        monkeypatch.setenv("LITELLM_BACKSTOP", '{"gemma": {"rpm": 5}}')
+        assert _parse_backstop() == {"gemma": {"rpm": 5}}
+
+    def test_malformed_is_empty(self, monkeypatch):
+        monkeypatch.setenv("LITELLM_BACKSTOP", "not-json{")
+        assert _parse_backstop() == {}
+
+    def test_non_object_is_empty(self, monkeypatch):
+        monkeypatch.setenv("LITELLM_BACKSTOP", "[1, 2]")
+        assert _parse_backstop() == {}
+
+
+class TestBuildFleetLimits:
+    def test_per_model_rpm(self):
+        assert _build_fleet_limits(["a", "b"], {"a": {"rpm": 5}}) == {
+            "model_rpm_limit": {"a": 5}
+        }
+
+    def test_wildcard_default_fans_out(self):
+        # '*' is the category→model_names expansion in miniature.
+        out = _build_fleet_limits(["a", "b"], {"*": {"rpm": 10}, "a": {"rpm": 5}})
+        assert out["model_rpm_limit"] == {"a": 5, "b": 10}
+
+    def test_tpm(self):
+        assert _build_fleet_limits(["a"], {"a": {"tpm": 100}}) == {
+            "model_tpm_limit": {"a": 100}
+        }
+
+    def test_no_config_is_empty(self):
+        assert _build_fleet_limits(["a"], {}) == {}
+
+
+class TestEnsureFleetKey:
+    @pytest.fixture(autouse=True)
+    def _reset_globals(self, monkeypatch):
+        monkeypatch.delenv("LITELLM_BACKSTOP", raising=False)
+        monkeypatch.setenv("LITELLM_MASTER_KEY", "sk-master")
+        gw_mod._fleet_key_ready = False
+        gw_mod._fleet_spec_hash = None
+        yield
+        gw_mod._fleet_key_ready = False
+        gw_mod._fleet_spec_hash = None
+
+    @pytest.mark.asyncio
+    async def test_mints_scoped_key_and_marks_ready(self, monkeypatch):
+        monkeypatch.setenv("LITELLM_BACKSTOP", '{"gemma-4-moe-strix": {"rpm": 5}}')
+        db = _mock_db([_model_row("c1", "gemma-4-moe-strix")])
+        client = AsyncMock()
+        assert get_fleet_key() is None  # gated until ensure runs
+
+        await ensure_fleet_key(client, db, "sk-master")
+
+        client.upsert_key.assert_awaited_once()
+        _, kwargs = client.upsert_key.call_args
+        assert kwargs["alias"] == FLEET_KEY_ALIAS
+        assert kwargs["spec"]["models"] == ["gemma-4-moe-strix"]
+        assert kwargs["spec"]["model_rpm_limit"] == {"gemma-4-moe-strix": 5}
+        # routing can now switch agents onto it
+        assert get_fleet_key() == compute_fleet_key("sk-master")
+
+    @pytest.mark.asyncio
+    async def test_idempotent_when_unchanged(self):
+        db = _mock_db([_model_row("c1", "gemma-4-moe-strix")])
+        client = AsyncMock()
+        await ensure_fleet_key(client, db, "sk-master")
+        await ensure_fleet_key(client, db, "sk-master")
+        client.upsert_key.assert_awaited_once()  # second call is a no-op
+
+    @pytest.mark.asyncio
+    async def test_rewrites_when_limits_change(self, monkeypatch):
+        db = _mock_db([_model_row("c1", "gemma-4-moe-strix")])
+        client = AsyncMock()
+        await ensure_fleet_key(client, db, "sk-master")
+        monkeypatch.setenv("LITELLM_BACKSTOP", '{"gemma-4-moe-strix": {"rpm": 9}}')
+        await ensure_fleet_key(client, db, "sk-master")
+        assert client.upsert_key.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_no_models_skips(self):
+        db = _mock_db([])
+        client = AsyncMock()
+        await ensure_fleet_key(client, db, "sk-master")
+        client.upsert_key.assert_not_awaited()
+        assert get_fleet_key() is None
+
+    @pytest.mark.asyncio
+    async def test_no_backstop_still_sends_empty_limit_dicts(self):
+        # No LITELLM_BACKSTOP → the fleet key still mints (agents off the master
+        # key), and the empty limit dicts must be present so a *later* removal of
+        # a backstop propagates on /key/update (omitted fields keep old values).
+        db = _mock_db([_model_row("c1", "gemma-4-moe-strix")])
+        client = AsyncMock()
+        await ensure_fleet_key(client, db, "sk-master")
+        _, kwargs = client.upsert_key.call_args
+        assert kwargs["spec"]["model_rpm_limit"] == {}
+        assert kwargs["spec"]["model_tpm_limit"] == {}

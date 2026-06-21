@@ -29,6 +29,9 @@ upstream key back out of LiteLLM).
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
+import json
 import logging
 import os
 from typing import Any, Dict
@@ -45,6 +48,18 @@ OWNED_ID_PREFIX = "srw-"
 # How often the reconcile loop re-syncs the catalog into the gateway. Cheap
 # (a handful of models); a LISTEN/NOTIFY trigger can replace polling later.
 DEFAULT_SYNC_INTERVAL_S = 60.0
+
+# Shared "fleet" virtual key (Slice 2a backstop). All agent traffic routes
+# through this one non-admin key instead of the admin master key, so its
+# per-model rpm buckets cap the *fleet aggregate* against the upstream — a
+# breach returns 429 + Retry-After, which the agent's existing backoff honors.
+# (The admin master key bypasses limits, so it can't be the agent credential.)
+FLEET_KEY_ALIAS = "srw-fleet-backstop"
+
+# Set True once the fleet key is provisioned in LiteLLM. Until then,
+# get_fleet_key() returns None and routing falls back to the master key.
+_fleet_key_ready = False
+_fleet_spec_hash: str | None = None
 
 
 def _rev_for_endpoint(endpoint: Dict[str, Any]) -> int:
@@ -127,6 +142,30 @@ class LiteLLMClient:
             json={"id": model_info_id},
         )
         resp.raise_for_status()
+
+    async def upsert_key(self, key: str, *, alias: str, spec: Dict[str, Any]) -> None:
+        """Create the key with a fixed value, or update it if it already exists.
+
+        The value is derived deterministically from the master key, so on restart
+        the same value is re-asserted (LiteLLM persists keys in its DB) — a
+        duplicate ``/key/generate`` falls through to ``/key/update`` so limit
+        changes apply without re-minting (and routing never needs the value
+        persisted anywhere).
+        """
+        resp = await self._client.post(
+            f"{self._base_url}/key/generate",
+            headers=self._headers,
+            json={"key": key, "key_alias": alias, **spec},
+        )
+        if resp.status_code == 200:
+            return
+        # Already exists (or generate rejected the duplicate) → update in place.
+        upd = await self._client.post(
+            f"{self._base_url}/key/update",
+            headers=self._headers,
+            json={"key": key, **spec},
+        )
+        upd.raise_for_status()
 
 
 async def build_desired_models(postgres_db: Any) -> Dict[str, Dict[str, Any]]:
@@ -259,6 +298,115 @@ async def sync_catalog_to_gateway(
     }
 
 
+def compute_fleet_key(master_key: str) -> str:
+    """Deterministic, secret value for the shared fleet key.
+
+    HMAC of a fixed label under the master key → stable across orchestrator
+    restarts (routing recomputes it, no persistence needed) yet unguessable
+    without the master key.
+    """
+    digest = hmac.new(
+        master_key.encode(), FLEET_KEY_ALIAS.encode(), hashlib.sha256
+    ).hexdigest()
+    return f"sk-srw-fleet-{digest[:40]}"
+
+
+def get_fleet_key() -> str | None:
+    """The shared fleet key for agent routing, or None until it's provisioned.
+
+    Returns None (→ routing falls back to the master key) until the sync loop
+    has created the key in LiteLLM with its limits, so agents never present a
+    key the gateway doesn't know yet.
+    """
+    if not _fleet_key_ready:
+        return None
+    master_key = os.getenv("LITELLM_MASTER_KEY", "").strip()
+    return compute_fleet_key(master_key) if master_key else None
+
+
+def _parse_backstop() -> Dict[str, Dict[str, int]]:
+    """Parse ``LITELLM_BACKSTOP`` (JSON) → ``{model_id|'*': {'rpm'|'tpm': int}}``.
+
+    The upstream's real capacity, keyed by catalog model_id with a ``'*'``
+    default. Empty / malformed → ``{}`` (the fleet key still mints, unlimited, so
+    agents stay off the admin master key — the security half of 2a always lands).
+    """
+    raw = os.getenv("LITELLM_BACKSTOP", "").strip()
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else {}
+    except (ValueError, TypeError):
+        logger.warning("LITELLM_BACKSTOP is not valid JSON; ignoring backstop")
+        return {}
+
+
+def _build_fleet_limits(
+    model_ids: list[str], backstop: Dict[str, Dict[str, int]]
+) -> Dict[str, Any]:
+    """Expand the per-model / ``'*'``-default capacity config into key limits.
+
+    This is the category→model_names expansion (capability-check gap 1) in
+    miniature: ``'*'`` fans out to every registered model so a single number can
+    cap the whole fleet, with per-model override.
+    """
+    default = backstop.get("*", {})
+    model_rpm: Dict[str, int] = {}
+    model_tpm: Dict[str, int] = {}
+    for m in model_ids:
+        spec = backstop.get(m, default)
+        if spec.get("rpm"):
+            model_rpm[m] = int(spec["rpm"])
+        if spec.get("tpm"):
+            model_tpm[m] = int(spec["tpm"])
+    out: Dict[str, Any] = {}
+    if model_rpm:
+        out["model_rpm_limit"] = model_rpm
+    if model_tpm:
+        out["model_tpm_limit"] = model_tpm
+    return out
+
+
+async def ensure_fleet_key(
+    client: LiteLLMClient, postgres_db: Any, master_key: str
+) -> None:
+    """Provision the shared, non-admin fleet key carrying the aggregate backstop.
+
+    Idempotent: re-asserts the deterministic key value, scopes it to the
+    currently-registered models, and only calls the gateway when the resolved
+    limit set changed. Flips ``_fleet_key_ready`` so routing can switch agents
+    onto it.
+    """
+    global _fleet_key_ready, _fleet_spec_hash
+    desired = await build_desired_models(postgres_db)
+    model_ids = sorted(spec["model_name"] for spec in desired.values())
+    if not model_ids:
+        return  # nothing registered yet — nothing to scope the key to
+    limits = _build_fleet_limits(model_ids, _parse_backstop())
+    # Always send both limit dicts (empty = cleared). LiteLLM's /key/update leaves
+    # omitted fields untouched, so lowering or removing a backstop only propagates
+    # if the field is present — verified that an empty dict clears, not blocks.
+    spec = {
+        "models": model_ids,
+        "model_rpm_limit": limits.get("model_rpm_limit", {}),
+        "model_tpm_limit": limits.get("model_tpm_limit", {}),
+    }
+    spec_hash = json.dumps(spec, sort_keys=True)
+    if _fleet_key_ready and spec_hash == _fleet_spec_hash:
+        return
+    await client.upsert_key(
+        compute_fleet_key(master_key), alias=FLEET_KEY_ALIAS, spec=spec
+    )
+    _fleet_key_ready = True
+    _fleet_spec_hash = spec_hash
+    logger.info(
+        "Fleet backstop key ensured: %d model(s), limits=%s",
+        len(model_ids),
+        limits or "none (off master key only)",
+    )
+
+
 async def litellm_sync_loop(
     shutdown_event: asyncio.Event,
     postgres_db: Any,
@@ -291,6 +439,7 @@ async def litellm_sync_loop(
             try:
                 if await client.is_ready():
                     await sync_catalog_to_gateway(postgres_db, client)
+                    await ensure_fleet_key(client, postgres_db, master_key)
                 else:
                     logger.debug("LiteLLM gateway not ready yet; will retry")
             except Exception:
