@@ -327,6 +327,7 @@
       "resumeJob": "Vom Checkpoint fortsetzen",
       "confirmDelete": "Erneut klicken, um Löschung zu bestätigen",
       "deleteJob": "Auftrag löschen",
+      "moreActions": "Weitere Aktionen",
       "promoteJob": "Zu Projekt heraufstufen",
       "exportToCloud": "Ergebnisse dieses Auftrags in einen geteilten Cloud-Ordner kopieren und öffnen",
       "alreadyExported": "Bereits exportiert. Cloud-Ordner löschen, um erneut zu exportieren.",
