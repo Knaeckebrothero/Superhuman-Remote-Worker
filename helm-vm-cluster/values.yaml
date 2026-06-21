@@ -92,6 +92,10 @@ vmController:
   # -- Default VM image — override per-job via the orchestrator API.
   # Defaults to ghcr.io/knaeckebrothero/superhuman-remote-worker-agent-vm-base:v<chart.AppVersion>
   defaultVmImage: ""
+  # -- Per-VM size: 8 cores / 16Gi (bumped from 2c/4Gi 2026-06-21). The
+  # orchestrator passes explicit cpu/memory per upgrade, so this is the
+  # controller-side fallback. Workspace *containers* (sandbox tier) are sized
+  # separately (container_provisioner) and are intentionally NOT changed.
   defaultCpu: 8
   defaultMemory: "16Gi"
   vmStorageClass: "local-path"
