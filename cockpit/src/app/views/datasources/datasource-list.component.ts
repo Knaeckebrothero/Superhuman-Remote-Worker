@@ -20,6 +20,8 @@ import {AppIconComponent} from '../../ui/icon';
 import {AppSpinnerComponent} from '../../ui/spinner';
 import {AppFormFieldComponent} from '../../ui/form-field';
 import {AppDialogComponent} from '../../ui/dialog';
+import {AppMenuComponent, AppMenuItemComponent, AppMenuTriggerDirective} from '../../ui/menu';
+import {ViewportService} from '../../core/services/viewport.service';
 /**
  * Datasource management panel with full CRUD, type filtering, and connection testing.
  */
@@ -38,7 +40,11 @@ import {AppDialogComponent} from '../../ui/dialog';
     AppIconComponent,
     AppSpinnerComponent,
     AppFormFieldComponent,
-    AppDialogComponent,  ],
+    AppDialogComponent,
+    AppMenuComponent,
+    AppMenuItemComponent,
+    AppMenuTriggerDirective,
+  ],
   template: `
     <div class="ds-container">
       <!-- Header -->
@@ -635,8 +641,8 @@ import {AppDialogComponent} from '../../ui/dialog';
               <tr>
                 <th>{{ 'datasources.table.colType' | transloco }}</th>
                 <th>{{ 'datasources.table.colName' | transloco }}</th>
-                <th>{{ 'datasources.table.colUrl' | transloco }}</th>
-                <th>{{ 'datasources.table.colScope' | transloco }}</th>
+                <th class="col-url">{{ 'datasources.table.colUrl' | transloco }}</th>
+                <th class="col-scope">{{ 'datasources.table.colScope' | transloco }}</th>
                 <th>{{ 'datasources.table.colActions' | transloco }}</th>
               </tr>
             </thead>
@@ -654,42 +660,74 @@ import {AppDialogComponent} from '../../ui/dialog';
                     @if (ds.description) {
                       <span class="ds-desc">{{ ds.description }}</span>
                     }
+                    @if (viewport.isMobile()) {
+                      <app-badge class="ds-scope-inline" [tone]="ds.job_id ? 'neutral' : 'accent'" size="xs">
+                        {{ (ds.job_id ? 'datasources.table.scopeJob' : 'datasources.table.scopeGlobal') | transloco }}
+                      </app-badge>
+                    }
                   </td>
-                  <td class="url-cell mono">{{ ds.connection_url ? maskUrl(ds.connection_url) : '—' }}</td>
-                  <td>
+                  <td class="url-cell mono col-url">{{ ds.connection_url ? maskUrl(ds.connection_url) : '—' }}</td>
+                  <td class="col-scope">
                     <app-badge [tone]="ds.job_id ? 'neutral' : 'accent'" size="xs">
                       {{ (ds.job_id ? 'datasources.table.scopeJob' : 'datasources.table.scopeGlobal') | transloco }}
                     </app-badge>
                   </td>
                   <td class="actions-cell">
-                    <app-icon-button
-                      variant="ghost"
-                      size="sm"
-                      [ariaLabel]="'datasources.table.testTooltip' | transloco"
-                      [tooltip]="'datasources.table.testTooltip' | transloco"
-                      [loading]="testingIds().has(ds.id)"
-                      (clicked)="testDatasource(ds.id)"
-                    >
-                      <app-icon size="sm">cable</app-icon>
-                    </app-icon-button>
-                    <app-icon-button
-                      variant="ghost"
-                      size="sm"
-                      [ariaLabel]="'datasources.table.editTooltip' | transloco"
-                      [tooltip]="'datasources.table.editTooltip' | transloco"
-                      (clicked)="openEditForm(ds)"
-                    >
-                      <app-icon size="sm">edit</app-icon>
-                    </app-icon-button>
-                    <app-icon-button
-                      variant="danger"
-                      size="sm"
-                      [ariaLabel]="'datasources.table.deleteTooltip' | transloco"
-                      [tooltip]="'datasources.table.deleteTooltip' | transloco"
-                      (clicked)="deleteDatasource(ds)"
-                    >
-                      <app-icon size="sm">delete</app-icon>
-                    </app-icon-button>
+                    @if (viewport.isMobile()) {
+                      <!-- Mobile: collapse the row actions into a ⋯ overflow menu so the
+                           cell is just the kebab and the table fits without h-scroll
+                           (mirrors the Jobs list). -->
+                      <app-icon-button
+                        variant="ghost"
+                        size="sm"
+                        [ariaLabel]="'datasources.table.moreActions' | transloco"
+                        [loading]="testingIds().has(ds.id)"
+                        [appMenuTrigger]="rowMenu"
+                        menuPlacement="bottom-end"
+                      >
+                        <app-icon size="sm">more_vert</app-icon>
+                      </app-icon-button>
+                      <app-menu #rowMenu>
+                        <app-menu-item (activated)="testDatasource(ds.id)">
+                          {{ 'datasources.table.testTooltip' | transloco }}
+                        </app-menu-item>
+                        <app-menu-item (activated)="openEditForm(ds)">
+                          {{ 'datasources.table.editTooltip' | transloco }}
+                        </app-menu-item>
+                        <app-menu-item tone="danger" (activated)="deleteDatasource(ds)">
+                          {{ 'datasources.table.deleteTooltip' | transloco }}
+                        </app-menu-item>
+                      </app-menu>
+                    } @else {
+                      <app-icon-button
+                        variant="ghost"
+                        size="sm"
+                        [ariaLabel]="'datasources.table.testTooltip' | transloco"
+                        [tooltip]="'datasources.table.testTooltip' | transloco"
+                        [loading]="testingIds().has(ds.id)"
+                        (clicked)="testDatasource(ds.id)"
+                      >
+                        <app-icon size="sm">cable</app-icon>
+                      </app-icon-button>
+                      <app-icon-button
+                        variant="ghost"
+                        size="sm"
+                        [ariaLabel]="'datasources.table.editTooltip' | transloco"
+                        [tooltip]="'datasources.table.editTooltip' | transloco"
+                        (clicked)="openEditForm(ds)"
+                      >
+                        <app-icon size="sm">edit</app-icon>
+                      </app-icon-button>
+                      <app-icon-button
+                        variant="danger"
+                        size="sm"
+                        [ariaLabel]="'datasources.table.deleteTooltip' | transloco"
+                        [tooltip]="'datasources.table.deleteTooltip' | transloco"
+                        (clicked)="deleteDatasource(ds)"
+                      >
+                        <app-icon size="sm">delete</app-icon>
+                      </app-icon-button>
+                    }
 
                     @if (testResults()[ds.id]; as result) {
                       <span
@@ -1202,12 +1240,84 @@ import {AppDialogComponent} from '../../ui/dialog';
 
       .inline-test.test-ok { color: var(--success); }
       .inline-test.test-error { color: var(--danger); }
+
+      /* ===== Mobile (≤768px) =====
+         This page never had a responsive pass. Mirror the Jobs header (a single
+         horizontally-scrollable chip strip with a right edge-fade) and shrink the
+         table so it fits without horizontal scroll (the row actions collapse into a
+         ⋯ overflow menu in the template). 768px matches ViewportService.isMobile(). */
+      @media (max-width: 768px) {
+        /* Filter chips: scroll sideways instead of overflowing 599px and getting
+           clipped by :host{overflow:hidden}. order:1 + flex-basis:100% drops the
+           strip onto its own row below the title + actions. */
+        .filter-chips {
+          order: 1;
+          flex-basis: 100%;
+          min-width: 0;
+          flex-wrap: nowrap;
+          overflow-x: auto;
+          -webkit-overflow-scrolling: touch;
+          scrollbar-width: none;
+          padding-bottom: 2px;
+          -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 24px), transparent);
+          mask-image: linear-gradient(to right, #000 calc(100% - 24px), transparent);
+        }
+
+        .filter-chips::-webkit-scrollbar {
+          display: none;
+        }
+
+        .filter-chips app-chip {
+          flex-shrink: 0;
+        }
+
+        /* Trailing space so the last chip clears the fade when scrolled fully right. */
+        .filter-chips app-chip:last-child {
+          margin-right: 28px;
+        }
+
+        /* Compact the chips for the scroll strip (the global mobile rule gives
+           selectable chips a chunky 44px target). Scoped local to this strip. */
+        .filter-chips ::ng-deep .app-chip__btn[data-selectable] {
+          min-height: 0;
+          height: 30px;
+          padding: 0 7px;
+          font-size: 10px;
+        }
+
+        /* Drop the low-value (masked + truncated) URL column, and the Scope column
+           (scope is folded into the name cell as a badge below) so Type / Name +
+           the kebab fit without horizontal scroll. URL stays editable in the form. */
+        .col-url,
+        .col-scope {
+          display: none;
+        }
+
+        /* Scope shown inline under the name on mobile (its own column is hidden). */
+        .ds-scope-inline {
+          margin-top: 4px;
+        }
+
+        /* Env-var editor: let the key shrink so the value field isn't squeezed
+           to ~68px next to the fixed 200px key. */
+        app-input.env-key {
+          flex: 1 1 0;
+          min-width: 0;
+        }
+
+        /* Generic-file card rows wrap so the Upload / remove actions drop to their
+           own line instead of crushing the Env-var field. */
+        .generic-file-card .form-row {
+          flex-wrap: wrap;
+        }
+      }
     `,
   ],
 })
 export class DatasourceListComponent implements OnInit {
   private readonly api = inject(ApiService);
   private readonly transloco = inject(TranslocoService);
+  protected readonly viewport = inject(ViewportService);
 
   // State signals
   readonly datasources = signal<Datasource[]>([]);
