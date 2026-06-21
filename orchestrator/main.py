@@ -2198,6 +2198,42 @@ def _is_lite_config_override(config_override: Any) -> bool:
     return _backend_from_override(config_override) in LITE_BACKENDS
 
 
+def _validated_session_workspace_override(
+    config_override: Any,
+) -> Optional[dict[str, Any]]:
+    """Extract + validate the ``workspace`` sub-dict from a New Session request's
+    ``config_override`` (the cockpit 'Backend' selector + Advanced→Workspace
+    fragment). Returns the workspace dict for ``create_thread`` to merge, or
+    ``None`` when no workspace fragment was sent.
+
+    ``create_thread`` provisions only a lite tier (no pod) or a sandbox container
+    — it has no VM-provisioner (NATS/KubeVirt) wiring — so ``vm`` is rejected
+    here: VM is reached by starting on a lite tier and upgrading
+    (``_enforce_workspace_upgrade_grants`` + the workspace-upgrade path). Unknown
+    backends are rejected too. A workspace fragment with no ``backend`` (e.g.
+    word-limit tweaks only) passes through untouched.
+
+    Raises ``HTTPException(400)`` on a disallowed/invalid backend.
+    """
+    ws = config_override.get("workspace") if isinstance(config_override, dict) else None
+    if not isinstance(ws, dict) or not ws:
+        return None
+    backend = ws.get("backend")
+    if backend == "vm":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "VM workspaces can't be selected at session creation; start the "
+                "session on the Virtual tier and upgrade it to VM."
+            ),
+        )
+    if backend is not None and backend not in ("sandbox", "virtual", "none"):
+        raise HTTPException(
+            status_code=400, detail=f"Invalid workspace backend '{backend}'"
+        )
+    return ws
+
+
 def _virtual_workspace_rclone_spec() -> Optional[dict[str, Any]]:
     """The deployment's object-store spec for the ``virtual`` tier, or None.
 
@@ -13697,6 +13733,16 @@ class ThreadCreateRequest(BaseModel):
         description="LLM model override (e.g. RedHatAI/gemma-4-31B-it-FP8-Dynamic)",
     )
     temperature: float | None = Field(None, description="Temperature override")
+    config_override: dict[str, Any] | None = Field(
+        None,
+        description=(
+            "Per-session config overrides from the New Session 'Advanced' form. "
+            "Only the workspace sub-dict is honored at create time: "
+            "workspace.backend selects the tier (sandbox | virtual | none) and "
+            "MUST be set here because the workspace is provisioned at creation. "
+            "vm is not creatable directly — start on a lite tier and upgrade."
+        ),
+    )
 
 
 @app.post("/api/persistent/threads")
@@ -13770,6 +13816,24 @@ async def create_thread(
             config_override.setdefault("interactive", {})["permission_mode"] = (
                 request_body.permission_mode
             )
+
+        # Per-session WORKSPACE TIER from the New Session "Backend" selector.
+        # The cockpit sends it nested under request_body.config_override
+        # ({"workspace": {"backend": ..., "max_read_words": ..., ...}}).
+        # ThreadCreateRequest historically declared no config_override field, so
+        # Pydantic dropped it and create_thread rebuilt the override only from
+        # model/temperature/permission_mode — every session booted the default
+        # (sandbox) regardless of the dropdown, because the provisioning fork
+        # below keys off _backend_from_override(config_override). Honor ONLY the
+        # validated workspace sub-dict (no creds, no tool grants); the backend
+        # must land in config_override now because the workspace is provisioned
+        # synchronously at create — unlike the other Advanced settings it can't
+        # be a runtime PATCH.
+        req_workspace = _validated_session_workspace_override(
+            request_body.config_override
+        )
+        if req_workspace:
+            config_override.setdefault("workspace", {}).update(req_workspace)
 
         # Normalize project_ids (backward compat: project_id → [project_id])
         effective_project_ids = request_body.project_ids or (
