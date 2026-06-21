@@ -8,6 +8,7 @@ import {AppInputComponent} from '../../ui/input';
 import {AppTextareaComponent} from '../../ui/textarea';
 import {AppFormFieldComponent} from '../../ui/form-field';
 import {AppIconComponent} from '../../ui/icon';
+import {SidebarToggleComponent} from '../../shell/sidebar-toggle/sidebar-toggle.component';
 import {
   filesToRecord,
   hasSkillMd,
@@ -26,18 +27,25 @@ import {
     AppTextareaComponent,
     AppFormFieldComponent,
     AppIconComponent,
+    SidebarToggleComponent,
   ],
   template: `
     <div class="editor">
       <header class="head">
-        <h1>{{ (isEdit() ? 'skills.editTitle' : 'skills.newTitle') | transloco }}</h1>
-        <div class="head-actions">
-          <app-button variant="secondary" (clicked)="cancel()">
-            {{ 'skills.cancel' | transloco }}
-          </app-button>
-          <app-button variant="primary" [disabled]="saving()" (clicked)="save()">
-            {{ 'skills.save' | transloco }}
-          </app-button>
+        <!-- Full-page route (no page shell), so carry the mobile sidebar toggle
+             here too — otherwise the off-canvas nav is unreachable on mobile.
+             Renders nothing on desktop (sidebar always expanded). -->
+        <app-sidebar-toggle />
+        <div class="head-row">
+          <h1>{{ (isEdit() ? 'skills.editTitle' : 'skills.newTitle') | transloco }}</h1>
+          <div class="head-actions">
+            <app-button variant="secondary" (clicked)="cancel()">
+              {{ 'skills.cancel' | transloco }}
+            </app-button>
+            <app-button variant="primary" [disabled]="saving()" (clicked)="save()">
+              {{ 'skills.save' | transloco }}
+            </app-button>
+          </div>
         </div>
       </header>
 
@@ -107,9 +115,16 @@ import {
       }
       .head {
         display: flex;
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 0.5rem;
+        margin-bottom: 1rem;
+      }
+      .head-row {
+        display: flex;
         justify-content: space-between;
         align-items: center;
-        margin-bottom: 1rem;
+        width: 100%;
       }
       .head h1 {
         margin: 0;

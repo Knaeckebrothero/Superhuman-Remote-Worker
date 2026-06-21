@@ -1253,6 +1253,7 @@
     "colName": "Name",
     "colSource": "Quelle",
     "colActions": "Aktionen",
+    "moreActions": "Weitere Aktionen",
     "displayName": "Anzeigename",
     "icon": "Icon (Material Symbol)",
     "color": "Farbe (Hex)",
