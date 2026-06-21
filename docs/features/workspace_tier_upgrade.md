@@ -22,7 +22,27 @@ related:
 
 # Workspace Tier Upgrade — `virtual`/`none` → `sandbox`/`vm` on demand
 
-**Status:** **Phase-1 MVP implemented + k3d END-TO-END VERIFIED (S1 + S2 + S3)
+**Status:** **DEV-CLUSTER VERIFIED — 2026-06-21.** On the real homelab cluster
+(cockpit + KubeVirt, not k3d): worker `virtual → sandbox` **and** `none →
+sandbox` end-to-end (full lifecycle to `reviewing`; Sec-2 egress labels
+confirmed on the upgraded pod), and session `virtual → sandbox` end-to-end (the
+S5 permission + `/upgrade-workspace` offer/accept flow, 59-file seed, live
+shell). Session `virtual → vm` provisions a **real KubeVirt VM**; the swap
+previously aborted on the cold ~2.8 GB base-image import because `_poll_vm_ready`
+was a hardcoded 300 s — **agent-side fix shipped 2026-06-21** (Q7): the poll
+timeout is env-tunable (`VM_UPGRADE_POLL_TIMEOUT`, default 900 s) with a ~60 s
+progress heartbeat, and on timeout the agent tears the half-provisioned VM down
+via a new `abort-vm-upgrade` endpoint instead of leaking it. The remaining
+root-cause (every VM pays a fresh CDI **registry import**) is a golden-image
+clone — infra on the `vm` cluster, deferred (Q7). Live testing also surfaced +
+fixed the **New Session "Backend" selector being a no-op** (`ThreadCreateRequest`
+dropped `config_override` → every session booted `sandbox`; fix committed
+`37d1e523`, deployed) and **fixed the sandbox→vm sudo-escalation UI accept path**
+(Q8): the offer banner pointed at a nonexistent button/`/upgrade` and
+`/upgrade-workspace vm` no-op'd from a sandbox — now a tier-aware gate lets
+sandbox→vm proceed through the unified seed+persist handler and the banner points
+at the real command. Full detail in "Dev-cluster verification (2026-06-21)" below. _Prior status:_
+**Phase-1 MVP implemented + k3d END-TO-END VERIFIED (S1 + S2 + S3)
 — 2026-06-20.** Smoke test on a real cluster (cockpit UI): a `virtual` session
 ran `/upgrade-workspace` → a sandbox pod spawned, 49 files were seeded
 virtual→pod over SFTP, the backend hot-swapped, the toolset re-derived (44→55,
@@ -95,18 +115,19 @@ but is an accelerator, not a prerequisite.
 ### Implementation status (2026-06-20)
 
 Slice-by-slice; details in each slice below. **Built** = code landed +
-unit-green + ruff-clean. **Commit state (2026-06-20):** Phases 1+2 are
-**committed** on `develop` (HEAD `44b5b436` "Support VM-tier workspace upgrades
-(Phase 2)" + `52f46c01`/`9ede6b14`/`6b1374d6`); **Phase 3 is built but
-uncommitted** (9-file changeset: `src/agent.py`, `src/api/orchestrator_client.py`,
-`orchestrator/main.py`, `orchestrator/services/completion.py`,
-`docs/security/endpoint_inventory.txt`, `tests/test_completion_endpoint.py`,
-this doc, the coverage doc, + new `tests/test_job_workspace_upgrade.py`).
+unit-green + ruff-clean. **Commit state (2026-06-21):** Phases 1+2+3 are all
+**committed + deployed to dev** — Phases 1+2 (`44b5b436` + `52f46c01`/`9ede6b14`/
+`6b1374d6`), Phase 3 (`6e4a9bbd`), and the session create-bug fix (`37d1e523`,
+which the dev smoke surfaced — see "Dev-cluster verification (2026-06-21)"). The
+running dev image is `sha-c55a926`; the fix rolled to `sha-37d1e52`.
 
-Verification by phase: the session sandbox path (S1+S2+S3) is **k3d end-to-end
-verified**; Phase-2 `virtual → vm` is **k3d-verified orchestrator-side** (routing
-+ fail-closed grant gate; full VM boot needs the dev cluster); Phase-3 worker
-`virtual → sandbox` is **k3d end-to-end verified** (real virtual job: 49 files
+Verification by phase: the session sandbox path (S1+S2+S3) is **k3d + DEV
+end-to-end verified** (2026-06-21, full S5 offer/accept flow); Phase-2 `virtual →
+vm` is **k3d-verified orchestrator-side** and **dev-confirmed to provision a real
+KubeVirt VM** (2026-06-21) — the cold-import poll timeout is now mitigated
+agent-side (tunable timeout + heartbeat + orphan teardown; Q7), with the
+golden-image clone as the deferred root-cause fix; Phase-3 worker
+`virtual → sandbox` is **k3d + DEV end-to-end verified** (real virtual job: 49 files
 seeded, upgraded on the same pod with no re-dispatch, shell command run on the
 sandbox — see the Status block + §6 Phase 3).
 
@@ -119,6 +140,74 @@ injects it lite-only (Phase 3, mirroring the session). The full tested/untested
 map lives in
 [`tests/workspace_tier_upgrade_test_coverage.md`](../../tests/workspace_tier_upgrade_test_coverage.md).
 
+#### Dev-cluster verification (2026-06-21)
+
+Phase 3 was committed (`6e4a9bbd`) and shipped to the dev cluster (image
+`sha-c55a926`), then exercised **live on the real homelab cluster** (cockpit UI
++ KubeVirt) — not k3d. Results:
+
+- **Worker `virtual → sandbox` — DEV end-to-end verified.** A real virtual job
+  (created via the API with `config_override.workspace.backend=virtual`, since
+  neither the session UI — pre-fix — nor the job UI exposes a working backend
+  selector) booted lite, called `request_workspace_upgrade`, intercepted the
+  freeze, provisioned a sandbox **on the same pod (no re-dispatch)**, seeded 50
+  files virtual→sandbox, swapped, re-derived `run_command`, resumed, and ran the
+  task for real (`hostinfo.py` proven on the pod). The job then completed cleanly
+  (`job_complete` → `reviewing`) and its workspace pod was reclaimed.
+- **Worker `none → sandbox` — DEV verified (previously unverified).** Same chain
+  from a `none`-tier job: the capability gate dropped 30 tools (no shell **and**
+  no file tools), the seed was `ScratchBackend → RemoteBackend` (35 files), and a
+  live `uname -a` on the upgraded pod confirmed the shell — closing the "`none`
+  only theoretical" caveat for the worker path.
+- **Sec-2 (egress posture) — confirmed.** An in-process-upgraded pod carries
+  `srw.io/component=agent-workspace` + `srw.io/network-tier=internet-only`,
+  exactly the labels the workspace `NetworkPolicy`s select on
+  (`srw-workspace-fallback-deny` / `…-home-allowed` / `…-internet-only`) — so an
+  upgraded pod is egress-governed identically to a normally-provisioned one, by
+  construction.
+- **Session `virtual → sandbox` — DEV end-to-end verified (the S5 offer flow).**
+  A `virtual` session created through the cockpit New Session form (see the
+  create-bug fix below) was driven to a no-shell wall → the agent requested the
+  upgrade → Supervised permission (gate 1) → `/upgrade-workspace` offer (gate 2)
+  → `upgrade-to-workspace → 200` → seeded 59 files → `Backend swapped to
+  RemoteBackend` → re-derived 65 tools → live `uname -a` on the session pod
+  confirmed the shell.
+- **Session `virtual → vm` on KubeVirt — provisions, but the cold-import poll is
+  too short.** `/upgrade-workspace vm` from a lite session fired the full path:
+  the `srw-dev` controller created a real KubeVirt `VirtualMachine` + VMI
+  (`agent-vm-<thread>` in the `vm` cluster's `agent-vms` ns) and a CDI
+  DataVolume. But the base-image import (`agent-vm-base`, a ~2.8 GB registry
+  pull) is slow **and flaky** (the CDI importer restarted; import progress even
+  regressed) and ran well past the agent's `_poll_vm_ready` **300 s** timeout
+  (`persistent_app.py:4595`/`:4857`) → the agent aborted the swap **gracefully**
+  (session config stayed `virtual`, still usable) while KubeVirt kept
+  provisioning in the background (orphaned VM). On a *warm* cluster (image
+  cached) it would fit; cold needs the timeout relaxed and/or a
+  golden-image/clone source so the import isn't paid per-VM (Open Q below).
+
+**Create-bug fix (committed `37d1e523`, deployed).** Live testing surfaced that
+the New Session "Backend" selector was a no-op end-to-end: the cockpit sends
+`config_override.workspace.backend`, but `ThreadCreateRequest` declared no
+`config_override` field, so Pydantic dropped it and **every** session booted the
+default `sandbox` (0 of 127 threads had ever carried a backend override) — i.e.
+lite/VM sessions were uncreatable from the UI, which is why the Phase-1 k3d
+"verification" had only ever seeded the backend out-of-band. Fixed by adding
+`config_override` to the model and merging a *validated* workspace sub-dict in
+`create_thread` (`_validated_session_workspace_override`: allows
+`sandbox`/`virtual`/`none`; rejects `vm` at create — `create_thread` has no
+VM-provisioner wiring, VM is reached by starting lite + upgrading — and unknown
+backends). Confirmed live: a UI-created `virtual` session now boots lite (no
+pod). 7 regression tests in `tests/test_session_config_plumbing.py`.
+
+**Also found (open, UI):** the **sandbox → vm sudo-escalation** offer can't be
+accepted from the cockpit. When a sandbox agent trips the `sudo_action=freeze`
+gate, the `vm_upgrade.needed` banner says "send `/upgrade`", but the cockpit
+handler only recognizes `/upgrade-workspace [vm]`, and `/upgrade-workspace vm`
+no-op'd from sandbox (`_handle_workspace_upgrade` short-circuited when the backend
+already `supports_shell`). **Fixed 2026-06-21** (Q8): a tier-aware gate lets
+sandbox→vm proceed through the unified handler and the banner now points at
+`/upgrade-workspace vm`.
+
 #### Scope — what actually works today (read this first on resume)
 
 Despite the doc title's `virtual`/`none` → `sandbox`/`vm`, **Phases 1+2 built the
@@ -129,10 +218,10 @@ and the worker→vm cell are still design-stage.
 
 | Source → Target | → `sandbox` (container) | → `vm` |
 |---|---|---|
-| **Session** `virtual` | ✅ **Built + k3d-verified** (S1–S5) | ✅ **Built** — orchestrator k3d-verified (Phase 2); full VM boot needs dev cluster |
-| **Session** `none` | 🟡 plausibly works (tool exposed + lite-boot fixed), **unverified** | 🟡 plausibly works (same delegation), **unverified** |
-| **Worker job** `virtual` | ✅ **Built + k3d-verified** — in-process swap (Phase 3 W1+W2) | ❌ Phase 3 W3 (deferred — operator-gated re-dispatch; composes W1 + sudo→VM) |
-| **Worker job** `none` | ❌ out of scope (scratch tmpdir has no durable anchor) | ❌ |
+| **Session** `virtual` | ✅ **Built + DEV-verified** (S1–S5, 2026-06-21) | 🟡 **Built** — provisions a **real KubeVirt VM** on dev; cold-import timeout mitigated agent-side (tunable 900 s + heartbeat + orphan teardown, Q7); full seed/swap re-verify pending the golden-image clone or a warm cluster |
+| **Session** `none` | 🟡 plausibly works (tool exposed + lite-boot fixed; worker-`none` verified), **unverified for sessions** | 🟡 plausibly works (same delegation), **unverified** |
+| **Worker job** `virtual` | ✅ **Built + DEV-verified** — in-process swap (Phase 3 W1+W2) | ❌ Phase 3 W3 (deferred — operator-gated re-dispatch; composes W1 + sudo→VM) |
+| **Worker job** `none` | ✅ **DEV-verified** (2026-06-21) — the `ScratchBackend → RemoteBackend` seed copies the scratch files in; the "no durable anchor" worry didn't bite | ❌ |
 
 Two things explicitly **NOT** done yet (common misreadings):
 - **Worker-job upgrades = `virtual → sandbox` only.** Phase 3 built the
@@ -163,7 +252,7 @@ Two things explicitly **NOT** done yet (common misreadings):
 | §4.3 **W2** | Orchestrator `POST …/jobs/{id}/provision-workspace` + `…/workspace-status` + client | **✅ Built + k3d-verified** (Phase 3) |
 | §4.3 **W3** | Operator-gated worker `* → vm` re-dispatch | Design (deferred; composes W1 + sudo→VM) |
 | §4.4 **Sec-1…5** | Capability & security slices | Design (Sec-1 ✅ — now shared by session + worker) |
-| Phase 2 | Sessions `virtual → vm` | **✅ Built** (orchestrator k3d-verified; VM boot needs dev cluster) |
+| Phase 2 | Sessions `virtual → vm` | **✅ Built** (orchestrator k3d-verified; dev-confirmed to provision a real KubeVirt VM 2026-06-21; cold-import poll mitigated agent-side — tunable timeout + heartbeat + orphan teardown, Q7; golden-image clone deferred) |
 | Phase 3 | Worker jobs `virtual → sandbox` (W1+W2) | **✅ Built + k3d end-to-end verified** |
 
 **Landing spots for the built slices:**
@@ -625,7 +714,7 @@ claim + `none`-tier (Phase 4); `virtual → vm`, which reuses the S3 handler wit
 `target_tier="vm"`, the existing VM provisioner, and the operator-approval gate
 (Phase 2).
 
-### 4.3 Worker-job flow (v2 — ✅ MVP built + k3d-verified, Phase 3; W3 deferred)
+### 4.3 Worker-job flow (v2 — ✅ MVP built + dev-verified, Phase 3; W3 deferred)
 
 > **Status:** W1 + W2 (in-process `virtual → sandbox`) are built + k3d
 > end-to-end verified (2026-06-20); the as-built detail is in the W1/W2 notes
@@ -918,8 +1007,13 @@ classifier misses ~17% of overeager actions). Maps to open question #1.
   risk: in-process, portable state, single writer. **Done:** S1+S2+S3 + minimal
   cockpit (k3d-verified 2026-06-20), S4 (shared Sec-1 grant gate) + S5 (agent-
   initiated offer: freeze vocab + `request_workspace_upgrade` tool + cockpit
-  offer), all unit-green + ruff-clean. **Remaining:** a live k3d smoke test of the
-  S5 agent-offer round-trip (tool → offer → accept → shell).
+  offer), all unit-green + ruff-clean. **Remaining: none — the S5 agent-offer
+  round-trip was DEV-verified end-to-end 2026-06-21** (lite session → no-shell
+  wall → `request_workspace_upgrade` → Supervised permission → `/upgrade-workspace`
+  offer/accept → `upgrade-to-workspace 200` → 59-file seed → `swap_backend` →
+  65 tools re-derived → live shell). The New-Session create-bug that had blocked
+  UI-creating a lite session at all (so this round-trip had never actually been
+  walked through the cockpit) was fixed first (`37d1e523`).
 - **Phase 2 — Sessions, `virtual → vm`. ✅ Built (2026-06-20), unit-green +
   orchestrator k3d-verified (full VM boot needs the dev cluster).** As built
   (5 seams, the last two corrected vs the original checklist):
@@ -975,14 +1069,25 @@ classifier misses ~17% of overeager actions). Maps to open question #1.
     `_enforce_workspace_upgrade_grants`. (Mocked unit helpers structurally can't
     catch this — only a live DB returns the UUID type, so the k3d smoke is the
     regression guard.)
-  - *Remaining:* a full `virtual → vm` boot smoke on the **dev cluster** (k3d has
-    no KubeVirt/NATS → `vm_provisioner.is_available` is False, so the swap
-    handler's poll/seed/sudo-reopen branch is unexercised). The vm-tier session
-    **resume/suspend** lifecycle (S3b persists `workspace.backend=vm`) is untested
-    — orthogonal to the in-place upgrade, which never drops the live conversation.
+  - *Dev boot smoke (2026-06-21, ⚠️ partial):* `/upgrade-workspace vm` from a lite
+    session **did** fire the full path — the `srw-dev` controller created a real
+    KubeVirt `VirtualMachine` + VMI + CDI DataVolume — proving the provision plumbing
+    end-to-end. But the agent's then-hardcoded **300 s** `_poll_vm_ready` couldn't
+    cover a *cold* ~2.8 GB base-image import (reached ~93% at ~23 min; importer
+    restarted/regressed), so the swap **aborted gracefully** (session stayed
+    `virtual`) and the poll/seed/sudo-reopen branch went unexercised. **Mitigated
+    2026-06-21** (Q7): the poll timeout is now env-tunable (default 900 s) with a
+    progress heartbeat, and a failed/timed-out upgrade tears the orphan VM down via
+    the new `abort-vm-upgrade` endpoint — so the branch should complete on a
+    warm/cached cluster, and the golden-image clone (deferred) removes the cold cost
+    entirely. The vm-tier session
+    **resume/suspend** lifecycle (S3b persists `workspace.backend=vm`) is still
+    untested — orthogonal to the in-place upgrade, which never drops the conversation.
 - **Phase 3 — Worker jobs `virtual → sandbox`. ✅ Built (W1 + W2, 2026-06-20),
-  unit-green + k3d END-TO-END VERIFIED.** MVP = W1 + W2: in-process `virtual →
-  sandbox` swap
+  unit-green + k3d END-TO-END VERIFIED + DEV-VERIFIED 2026-06-21** (real worker
+  jobs on the homelab cluster: `virtual → sandbox` full lifecycle to `reviewing`
+  and `none → sandbox`; Sec-2 egress labels confirmed). MVP = W1 + W2:
+  in-process `virtual → sandbox` swap
   mirroring the session (no re-dispatch, no checkpoint move), reusing
   `seed_workspace` (S3a) + the `request_workspace_upgrade` tool /
   `workspace_upgrade_required` freeze (S5). **As built (the in-process pattern, 5
@@ -1070,6 +1175,48 @@ classifier misses ~17% of overeager actions). Maps to open question #1.
 6. **Cockpit UX for the in-flight wait** — reuse the `vm_upgrade` banner pattern
    and the async-session "type while infra spins up" buffering from
    [[workspace_warm_pool_and_async_sessions]]?
+7. **Cold VM-import latency vs `_poll_vm_ready`** (found 2026-06-21; **agent-side
+   fix shipped 2026-06-21, root-cause infra fix deferred**). Session
+   `virtual → vm` provisions a real KubeVirt VM, but the agent's flat **300 s**
+   `_poll_vm_ready` couldn't cover a *cold* `agent-vm-base` import (~2.8 GB
+   registry pull, only ~93 % at ~23 min on dev) — the swap aborted and leaked the
+   VM.
+   - **Done (agent-side):** `_poll_vm_ready`'s timeout is now env-tunable
+     (`VM_UPGRADE_POLL_TIMEOUT`, default **900 s**) and emits a ~60 s progress
+     heartbeat (`workspace_upgrade.progress` → cockpit "still provisioning… Ns")
+     so the wait isn't a black box. On timeout/failure the agent calls the new
+     internal `POST /api/agents/threads/{id}/abort-vm-upgrade`, which
+     `delete_thread_vm` + marks `metadata.vm.status='aborted'` so the orphan is
+     torn down and the in-progress guard doesn't wedge a retry. (Closes the
+     orphan-cleanup half of this, relates to Q3.)
+   - **Deferred (root cause, infra):** every VM still pays a fresh CDI **registry
+     import** because the vm-controller DataVolume uses
+     `source.registry.url: docker://${VM_IMAGE}`
+     (`helm/templates/vm-controller/configmap.yaml:31`). The durable fix is to
+     **pre-warm a golden disk and clone it per-VM**: a one-time / `DataImportCron`
+     import into a golden PVC + a CDI `DataSource`, then switch the per-VM
+     DataVolume `source.registry` to `sourceRef: {kind: DataSource}`
+     (host-assisted clone works even on `local-path`; it skips the docker pull +
+     qcow2 conversion). That turns a cold upgrade from ~5–25 min into a local
+     block copy. Deferred because it's KubeVirt/CDI storage on the `vm` cluster
+     (CRDs absent from the `main` context) and needs on-cluster verification —
+     not changed blind.
+8. **Sandbox → vm sudo-escalation has no working UI accept** (found 2026-06-21;
+   **FIXED 2026-06-21**). A sandbox agent that tripped the `sudo_action=freeze`
+   gate emitted a `vm_upgrade.needed` offer whose banner said "use the upgrade
+   button or send `/upgrade`" — but neither existed (the cockpit only handles
+   `/upgrade-workspace [vm]`), and `/upgrade-workspace vm` no-op'd from a sandbox
+   because `_handle_workspace_upgrade` short-circuited on `supports_shell`. Fixed
+   by: (a) a tier-aware `_upgrade_already_satisfied` gate — a sandbox no longer
+   "satisfies" a vm target (`sudo_action` discriminates sandbox `freeze` from vm
+   `allow`), so sandbox→vm now PROCEEDS through the unified seed+persist handler;
+   (b) collapsing `_handle_vm_upgrade` into a thin alias for
+   `_handle_workspace_upgrade(target_tier="vm")` — the old standalone handler
+   swapped to an *empty* VM (losing the sandbox's files) and never persisted the
+   tier; (c) the cockpit `vm_upgrade.needed` banner now says "Send
+   `/upgrade-workspace vm`" and surfaces the triggering sudo command. Unit-pinned
+   in `tests/test_persistent_app.py` (`TestUpgradeAlreadySatisfied`,
+   `TestHandleWorkspaceUpgradeVm`) + `persistent-chat.service.spec.ts`.
 
 ---
 

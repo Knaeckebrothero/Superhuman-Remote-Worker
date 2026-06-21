@@ -168,6 +168,20 @@ class RemoteBackend(WorkspaceBackend):
     def supports_shell(self) -> bool:
         return True
 
+    @property
+    def sudo_action(self) -> str:
+        """How this backend handles ``sudo`` (``"freeze"`` | ``"allow"`` |
+        ``"block"``).
+
+        Doubles as the tier discriminator for the live upgrade path: a ``vm``
+        backend is built with ``sudo_action="allow"`` (its guest owns the sudo
+        gate), a ``sandbox`` keeps ``"freeze"`` (sudo → VM-escalation). The
+        workspace-upgrade handler reads this to tell sandbox from vm, since both
+        report ``supports_shell == True`` (workspace_tier_upgrade.md Phase 2 /
+        Q8).
+        """
+        return self._sudo_action
+
     def exec_command(self, command: str, timeout: int = 30) -> str:
         """Execute a command via SSH and return stdout.
 

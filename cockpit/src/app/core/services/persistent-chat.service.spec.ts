@@ -2243,6 +2243,69 @@ describe('PersistentChatService — compaction progress frames', () => {
     });
 });
 
+describe('PersistentChatService — workspace/VM upgrade notices (Q7/Q8)', () => {
+    afterEach(() => vi.clearAllMocks());
+
+    async function setup() {
+        const ctx = createService();
+        ctx.mockHttp.get.mockImplementation(() =>
+            of({status: 'active', total_turns: 0, messages: [], total: 0}),
+        );
+        await ctx.service.connect('thread-X');
+        fireSseOpen(ctx.sseInstances[0]);
+        return {...ctx, es: ctx.sseInstances[0]};
+    }
+
+    function sysLines(service: any): string[] {
+        return service.turns()
+            .filter((t: any) => t.kind === 'system')
+            .map((t: any) => String(t.content));
+    }
+
+    it('vm_upgrade.needed points at the real /upgrade-workspace vm command, not a phantom button', async () => {
+        const {service, es} = await setup();
+        fireSseMessage(es, {
+            method: 'vm_upgrade.needed',
+            params: {reason: 'sudo detected', command: 'sudo apt-get install foo'},
+        }, '1:1');
+        const lines = sysLines(service);
+        expect(lines.some(l => l.includes('/upgrade-workspace vm'))).toBe(true);
+        // The misleading "upgrade button or send /upgrade" wording is gone.
+        expect(lines.some(l => l.includes('upgrade button'))).toBe(false);
+        // The triggering command is surfaced for context.
+        expect(lines.some(l => l.includes('sudo apt-get install foo'))).toBe(true);
+    });
+
+    it('workspace_upgrade.progress surfaces a live heartbeat during a slow provision', async () => {
+        const {service, es} = await setup();
+        fireSseMessage(es, {
+            method: 'workspace_upgrade.progress',
+            params: {target_tier: 'vm', elapsed_s: 120, timeout_s: 900},
+        }, '1:1');
+        expect(sysLines(service).some(l => l.includes('120s'))).toBe(true);
+    });
+
+    it('workspace_upgrade.complete mentions sudo for a vm target only', async () => {
+        const {service, es} = await setup();
+        fireSseMessage(es, {
+            method: 'workspace_upgrade.complete',
+            params: {target_tier: 'vm', seeded_files: 3},
+        }, '1:1');
+        const lines = sysLines(service);
+        expect(lines.some(l => l.toLowerCase().includes('sudo'))).toBe(true);
+        expect(lines.some(l => l.includes('3 file(s) carried over'))).toBe(true);
+    });
+
+    it('workspace_upgrade.complete for a sandbox target does not mention sudo', async () => {
+        const {service, es} = await setup();
+        fireSseMessage(es, {
+            method: 'workspace_upgrade.complete',
+            params: {target_tier: 'sandbox'},
+        }, '1:1');
+        expect(sysLines(service).some(l => l.toLowerCase().includes('sudo'))).toBe(false);
+    });
+});
+
 describe('PersistentChatService — usage.updated telemetry', () => {
     afterEach(() => vi.clearAllMocks());
 

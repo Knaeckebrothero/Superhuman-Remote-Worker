@@ -13,7 +13,7 @@ import logging
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime
-from typing import Any, Dict, List, NoReturn, Optional
+from typing import Any, Awaitable, Callable, Dict, List, NoReturn, Optional
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
@@ -113,6 +113,15 @@ _thread_status_poll_s: int = int(os.environ.get("THREAD_STATUS_POLL_S", "60"))
 # normally bounds the tail to ~keep_recent, well under this. Generous so it never
 # trims a healthy session; logged when it does. Tunable via env.
 _resume_message_limit: int = int(os.environ.get("RESUME_MESSAGE_LIMIT", "1000"))
+
+# How long the live VM-upgrade handler waits for a KubeVirt VM to become ready
+# before giving up and tearing it down. The default sandbox-container poll is
+# ~300s, but a *cold* VM pays a fresh ~2.8GB CDI registry import per DataVolume
+# (helm vm-controller template `source.registry`), which routinely exceeds 5min.
+# Tunable so warm clusters (or a future golden-image `sourceRef` clone — see
+# workspace_tier_upgrade.md Q7) can dial it back down. (workspace_tier_upgrade.md
+# Phase 2 / Q7.)
+_vm_upgrade_poll_timeout: int = int(os.environ.get("VM_UPGRADE_POLL_TIMEOUT", "900"))
 
 # Subscriber registry for headless persistent sessions.
 #
@@ -4569,76 +4578,43 @@ async def _poll_workspace_ready(
     return None
 
 
-async def _handle_vm_upgrade(ws: WebSocket) -> None:
-    """Handle VM upgrade request from cockpit.
+def _upgrade_already_satisfied(src_backend: Any, target_tier: str) -> bool:
+    """True when the live backend already provides ``target_tier`` — the
+    workspace upgrade is then a no-op.
 
-    Flow: request VM provisioning → poll until ready → hot-swap backend.
+    Both ``sandbox`` and ``vm`` are ``RemoteBackend`` (``supports_shell`` is True
+    for each), so a plain shell check can't tell them apart. ``vm`` is the only
+    tier built with ``sudo_action="allow"`` (its guest owns the sudo gate); a
+    ``sandbox`` keeps ``"freeze"`` so its sudo→VM escalation still fires. Hence a
+    ``vm`` target is satisfied only by an already-``vm`` backend, while a
+    ``sandbox`` target is satisfied by any shell-capable backend (sandbox OR vm).
+
+    This is what lets a sandbox→vm upgrade PROCEED (seed + swap + sudo-reopen)
+    instead of short-circuiting on "already supports a shell" — the Q8 bug where
+    the sandbox sudo-escalation accept silently no-op'd
+    (workspace_tier_upgrade.md Q8).
     """
-    if not _session or not _orchestrator_client or not _thread_id:
-        await _ws_send(ws, "vm_upgrade.failed", {"reason": "Session not ready"})
-        return
+    if not getattr(src_backend, "supports_shell", False):
+        return False
+    if target_tier == "vm":
+        return getattr(src_backend, "sudo_action", None) == "allow"
+    return True
 
-    await _ws_send(ws, "vm_upgrade.started", {"thread_id": _thread_id})
 
-    try:
-        # 1. Request VM provisioning via orchestrator
-        ok = await _orchestrator_client.request_thread_vm_upgrade(_thread_id)
-        if not ok:
-            await _ws_send(
-                ws,
-                "vm_upgrade.failed",
-                {"reason": "Orchestrator rejected VM upgrade request"},
-            )
-            return
+async def _handle_vm_upgrade(ws: WebSocket) -> None:
+    """Back-compat alias for the sandbox→vm sudo-escalation accept
+    (the ``upgrade-to-vm`` control message).
 
-        # 2. Poll for VM readiness (up to 5 minutes)
-        vm_config = await _poll_vm_ready(_orchestrator_client, _thread_id, timeout=300)
-        if not vm_config:
-            await _ws_send(
-                ws,
-                "vm_upgrade.failed",
-                {"reason": "VM did not become ready in time"},
-            )
-            return
-
-        # 3. Create new RemoteBackend pointing at VM
-        from ..core.backends.remote import RemoteBackend
-
-        shell_config = _session.config.extra.get("shell", {})
-        ssh_key = os.environ.get("SSH_KEY_PATH", "/run/secrets/vm-ssh-key")
-        new_backend = RemoteBackend(
-            host=vm_config["ssh_host"],
-            port=vm_config.get("ssh_port", 22),
-            username="agent-host",
-            key_path=ssh_key,
-            workspace_path="/home/agent-host/workspace",
-            job_id=_thread_id,
-            default_timeout=shell_config.get("default_timeout", 120),
-            max_tabs=shell_config.get("max_tabs", 15),
-            sudo_action="allow",  # VM has its own sudo gate
-        )
-
-        # 4. Hot-swap backend on session
-        _session.swap_backend(new_backend)
-
-        # 5. VM has its own sudo gate — allow sudo through
-        if _session.shell_manager and hasattr(_session.shell_manager, "sudo_action"):
-            _session.shell_manager.sudo_action = "allow"
-
-        await _ws_send(
-            ws,
-            "vm_upgrade.complete",
-            {
-                "thread_id": _thread_id,
-                "ssh_host": vm_config["ssh_host"],
-                "ssh_port": vm_config.get("ssh_port", 22),
-            },
-        )
-        logger.info(f"VM upgrade complete for thread {_thread_id}")
-
-    except Exception as e:
-        logger.exception(f"VM upgrade failed for thread {_thread_id}")
-        await _ws_send(ws, "vm_upgrade.failed", {"reason": str(e)})
+    Delegates to the unified ``_handle_workspace_upgrade`` vm path so a single
+    implementation seeds the new VM from the live workspace, re-opens the sudo
+    gate, and persists the tier. The old standalone handler did none of those —
+    it swapped to an empty VM, losing the sandbox's working files, and never
+    recorded ``backend=vm`` (so suspend/resume re-provisioned a sandbox). The
+    cockpit's ``vm_upgrade.needed`` accept now sends ``/upgrade-workspace vm``
+    directly; this remains only for older clients still emitting
+    ``upgrade-to-vm`` (workspace_tier_upgrade.md Q8).
+    """
+    await _handle_workspace_upgrade(ws, target_tier="vm")
 
 
 async def _handle_workspace_upgrade(
@@ -4677,15 +4653,18 @@ async def _handle_workspace_upgrade(
             _session.workspace_manager.backend if _session.workspace_manager else None
         )
 
-        # Already on a shell-capable tier — nothing to upgrade (idempotent).
-        if getattr(src_backend, "supports_shell", False):
+        # Already serves the requested tier — nothing to upgrade (idempotent).
+        # Tier-aware: a sandbox source does NOT satisfy a vm target (sandbox is
+        # shell-capable but unprivileged), so sandbox→vm falls through to provision
+        # below instead of short-circuiting here (workspace_tier_upgrade.md Q8).
+        if _upgrade_already_satisfied(src_backend, target_tier):
             await _ws_send(
                 ws,
                 "workspace_upgrade.complete",
                 {
                     "thread_id": _thread_id,
                     "target_tier": target_tier,
-                    "message": "Workspace already supports a shell",
+                    "message": f"Workspace already provides the {target_tier} tier",
                 },
             )
             return
@@ -4709,7 +4688,27 @@ async def _handle_workspace_upgrade(
         #    container status. Sandbox keeps the container poller (returns the
         #    block directly).
         if target_tier == "vm":
-            vm_cfg = await _poll_vm_ready(_orchestrator_client, _thread_id, timeout=300)
+
+            async def _emit_vm_progress(elapsed_s: int) -> None:
+                # Heartbeat the cockpit so a multi-minute cold VM import isn't a
+                # silent black box (workspace_tier_upgrade.md Q7).
+                await _ws_send(
+                    ws,
+                    "workspace_upgrade.progress",
+                    {
+                        "thread_id": _thread_id,
+                        "target_tier": "vm",
+                        "elapsed_s": elapsed_s,
+                        "timeout_s": _vm_upgrade_poll_timeout,
+                    },
+                )
+
+            vm_cfg = await _poll_vm_ready(
+                _orchestrator_client,
+                _thread_id,
+                timeout=_vm_upgrade_poll_timeout,
+                progress_cb=_emit_vm_progress,
+            )
             ssh_key = os.environ.get("SSH_KEY_PATH", "/run/secrets/vm-ssh-key")
             ws_config = (
                 {
@@ -4730,6 +4729,18 @@ async def _handle_workspace_upgrade(
                 _orchestrator_client, _thread_id, timeout=300
             )
         if not ws_config or not ws_config.get("remote"):
+            # A vm that never came ready (usually the cold ~2.8GB CDI import
+            # outrunning the poll budget) leaves a half-provisioned VM +
+            # DataVolume + importer pod running with nobody attached. Tear it down
+            # so it doesn't leak — the orphan that previously needed a manual
+            # `kubectl delete` (workspace_tier_upgrade.md Q7). Best-effort.
+            if target_tier == "vm":
+                try:
+                    await _orchestrator_client.abort_thread_vm_upgrade(_thread_id)
+                except Exception as e:
+                    logger.warning(
+                        f"VM abort/teardown after failed upgrade ({_thread_id}): {e}"
+                    )
             await _ws_send(
                 ws,
                 "workspace_upgrade.failed",
@@ -4824,33 +4835,52 @@ async def _handle_workspace_upgrade(
 async def _poll_vm_ready(
     client: Any,
     thread_id: str,
-    timeout: int = 300,
+    timeout: Optional[int] = None,
     poll_interval: float = 3.0,
+    progress_cb: Optional[Callable[[int], Awaitable[None]]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Poll orchestrator for VM readiness.
+
+    Args:
+        timeout: seconds to wait before giving up; defaults to
+            ``_vm_upgrade_poll_timeout`` (env ``VM_UPGRADE_POLL_TIMEOUT``) so the
+            cold-import budget is tunable per cluster (Q7).
+        progress_cb: optional async heartbeat invoked ~every 60s with elapsed
+            seconds, so the cockpit can show a live "still provisioning" notice
+            instead of a multi-minute black box (kept sparse to avoid spamming
+            the transcript, since each fires a system message).
 
     Returns:
         VM config dict {"ssh_host": ..., "ssh_port": ...} or None on timeout/failure.
     """
     import time
 
-    deadline = time.monotonic() + timeout
+    if timeout is None:
+        timeout = _vm_upgrade_poll_timeout
+    start = time.monotonic()
+    deadline = start + timeout
+    last_progress = start
 
     while time.monotonic() < deadline:
         ws = await client.get_thread_workspace(thread_id)
-        if not ws:
-            await asyncio.sleep(poll_interval)
-            continue
+        if ws:
+            vm_status = ws.get("vm_status")
+            if vm_status == "ready" and ws.get("vm_ssh_host"):
+                return {
+                    "ssh_host": ws["vm_ssh_host"],
+                    "ssh_port": ws.get("vm_ssh_port", 22),
+                }
+            if vm_status == "failed":
+                logger.warning(f"VM provisioning failed for thread {thread_id}")
+                return None
 
-        vm_status = ws.get("vm_status")
-        if vm_status == "ready" and ws.get("vm_ssh_host"):
-            return {
-                "ssh_host": ws["vm_ssh_host"],
-                "ssh_port": ws.get("vm_ssh_port", 22),
-            }
-        if vm_status == "failed":
-            logger.warning(f"VM provisioning failed for thread {thread_id}")
-            return None
+        now = time.monotonic()
+        if progress_cb is not None and (now - last_progress) >= 60.0:
+            last_progress = now
+            try:
+                await progress_cb(int(now - start))
+            except Exception:
+                pass
 
         await asyncio.sleep(poll_interval)
 

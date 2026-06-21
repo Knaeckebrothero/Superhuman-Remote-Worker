@@ -2014,12 +2014,22 @@ export class PersistentChatService {
                 this.threadStatus.set('suspended');
                 break;
 
-            case 'vm_upgrade.needed':
+            case 'vm_upgrade.needed': {
+                // A sandbox session hit a sudo command (vm_upgrade_required
+                // freeze). The accept is the SAME /upgrade-workspace command with
+                // the `vm` arg: it routes through the unified upgrade handler,
+                // which seeds the VM from the sandbox, opens the sudo gate, and
+                // persists the tier (workspace_tier_upgrade.md Q8). The old banner
+                // pointed at a nonexistent "upgrade button" / `/upgrade` command.
+                const cmd = (params['command'] as string) || '';
+                const cmdNote = cmd ? ` (\`${cmd}\` needs root)` : '';
                 this._systemMessage(
-                    `VM upgrade needed: ${(params['reason'] as string) || 'sudo detected'}. `
-                    + `Use the upgrade button or send /upgrade to switch to a VM workspace.`,
+                    `VM upgrade needed: ${(params['reason'] as string) || 'sudo detected'}${cmdNote}. `
+                    + `Send /upgrade-workspace vm to move this session onto a VM with sudo `
+                    + `(your files carry over).`,
                 );
                 break;
+            }
 
             case 'vm_upgrade.started':
                 this._systemMessage('Upgrading workspace to VM, please wait...');
@@ -2057,13 +2067,32 @@ export class PersistentChatService {
                 this._systemMessage('Provisioning workspace, please wait...');
                 break;
 
+            case 'workspace_upgrade.progress': {
+                // Heartbeat during a slow (cold) VM provision so a multi-minute
+                // wait isn't a silent black box (workspace_tier_upgrade.md Q7).
+                // The agent emits this ~once a minute while polling readiness.
+                const elapsed = params['elapsed_s'] as number | undefined;
+                const tier = (params['target_tier'] as string) || 'workspace';
+                this._systemMessage(
+                    typeof elapsed === 'number'
+                        ? `Still provisioning the ${tier} workspace (${elapsed}s elapsed)…`
+                        : `Still provisioning the ${tier} workspace…`,
+                );
+                break;
+            }
+
             case 'workspace_upgrade.complete': {
                 const seeded = params['seeded_files'] as number | undefined;
                 const seededNote = typeof seeded === 'number'
                     ? ` ${seeded} file(s) carried over.`
                     : '';
+                const tier = (params['target_tier'] as string) || '';
+                const sudoNote = tier === 'vm'
+                    ? ' Running on a VM — sudo is now available.'
+                    : '';
                 this._systemMessage(
-                    `Workspace ready — shell, git, and file tools are now available.${seededNote}`,
+                    `Workspace ready — shell, git, and file tools are now available.`
+                    + `${sudoNote}${seededNote}`,
                 );
                 break;
             }

@@ -13286,6 +13286,39 @@ async def agent_upgrade_thread_to_vm(
     }
 
 
+@app.post("/api/agents/threads/{thread_id}/abort-vm-upgrade")
+async def agent_abort_thread_vm_upgrade(
+    request: Request, thread_id: str
+) -> dict[str, Any]:
+    """Tear down a thread's VM after a failed/timed-out live upgrade.
+    **Internal** (P4b) — requires ``X-Internal-Key``. Ingress strips this path.
+
+    Called by the persistent agent when ``_poll_vm_ready`` gives up: a cold CDI
+    registry import can outrun the poll budget, leaving a half-provisioned VM +
+    DataVolume + importer pod with nobody attached. This deletes the VM and
+    marks ``metadata.vm.status='aborted'`` so the provisioning-in-progress guard
+    (``status in provisioning/created/ready``) doesn't wedge a later retry
+    (workspace_tier_upgrade.md Q7). Idempotent — safe to call when no VM exists.
+    """
+    await require_internal(request)
+    thread = await postgres_db.get_thread(thread_id)
+    if not thread:
+        raise HTTPException(status_code=404, detail="Thread not found")
+
+    deleted = False
+    if vm_provisioner.is_available:
+        try:
+            deleted = await vm_provisioner.delete_thread_vm(thread_id)
+        except Exception as e:
+            logger.warning(
+                "abort-vm-upgrade: delete_thread_vm failed for %s: %s", thread_id, e
+            )
+    # Clear the in-progress marker regardless of delete outcome so a retry isn't
+    # blocked by the idempotency guard.
+    await postgres_db.merge_thread_vm_context(thread_id, {"status": "aborted"})
+    return {"status": "aborted", "thread_id": thread_id, "vm_deleted": deleted}
+
+
 class ThreadWorkspaceUpgradeRequest(BaseModel):
     """Body for ``POST /api/agents/threads/{id}/upgrade-to-workspace``."""
 
