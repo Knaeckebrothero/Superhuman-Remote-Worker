@@ -122,8 +122,11 @@
     "goalPlaceholder": "Ziel (optional)",
     "badgePersonal": "Persönlich",
     "jobsCount": "{{count}} Aufträge",
+    "jobsCountOne": "{{count}} Auftrag",
     "reposCount": "{{count}} Repos",
+    "reposCountOne": "{{count}} Repo",
     "membersCount": "{{count}} Mitglieder",
+    "membersCountOne": "{{count}} Mitglied",
     "status": {
       "active": "aktiv",
       "archived": "archiviert",

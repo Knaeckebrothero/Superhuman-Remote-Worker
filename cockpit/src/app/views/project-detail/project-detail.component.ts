@@ -5,6 +5,7 @@ import {MarkdownComponent} from 'ngx-markdown';
 import {stripMarkdown} from '../../core/util/strip-markdown';
 import {ApiService} from '../../core/services/api.service';
 import {UserService} from '../../core/services/user.service';
+import {ViewportService} from '../../core/services/viewport.service';
 import {SidebarToggleComponent} from '../../shell/sidebar-toggle/sidebar-toggle.component';
 import {AppIconComponent} from '../../ui/icon';
 import {AppSpinnerComponent} from '../../ui/spinner';
@@ -213,7 +214,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                       <tr>
                         <td>
                           <span class="status-badge" [class]="'status-' + job.status">
-                            {{ job.status }}
+                            {{ formatStatus(job.status) }}
                           </span>
                         </td>
                         <td class="desc-cell">{{ truncate(job.description, 60) }}</td>
@@ -240,6 +241,10 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
           <!-- KNOWLEDGE TAB -->
           @if (activeTab() === 'knowledge') {
             <div class="kb-section">
+              <!-- Stats + search/filters act on the list; on mobile, hide them while a
+                   single note is open so the note isn't buried under chrome. Desktop
+                   keeps them visible (master/detail, plenty of vertical room). -->
+              @if (!viewport.isMobile() || !kbSelectedNote()) {
               <!-- Summary Stats -->
               @if (kbSummary(); as summary) {
                 <div class="kb-stats-row">
@@ -312,6 +317,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                   {{ 'projectDetail.knowledge.export' | transloco }}
                 </app-button>
               </div>
+              }
 
               <!-- Note Detail View -->
               @if (kbSelectedNote(); as note) {
@@ -996,7 +1002,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
       margin-top: 4px;
     }
 
-    .overview-actions { display: flex; gap: 8px; align-items: center; }
+    .overview-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 
     .mono { font-family: 'JetBrains Mono', monospace; font-size: 12px; }
 
@@ -1545,8 +1551,8 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
       .data-table { min-width: 500px; }
 
       .inline-form { flex-direction: column; align-items: stretch; }
-      .kb-stats-row { flex-direction: column; }
-      .kb-toolbar { flex-direction: column; gap: 8px; }
+      .kb-stats-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+      .kb-toolbar { flex-direction: column; align-items: stretch; gap: 8px; }
     }
   `],
 })
@@ -1556,6 +1562,7 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
   private readonly api = inject(ApiService);
   private readonly userService = inject(UserService);
   private readonly transloco = inject(TranslocoService);
+  protected readonly viewport = inject(ViewportService);
 
   readonly project = signal<Project | null>(null);
   readonly jobs = signal<Job[]>([]);
@@ -2058,6 +2065,12 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
   truncate(text: string | undefined, max: number): string {
     if (!text) return '';
     return text.length <= max ? text : text.slice(0, max) + '...';
+  }
+
+  /** Humanise a status enum for display (e.g. "pending_review" -> "pending review").
+      The CSS class still uses the raw value; text-transform capitalises the result. */
+  formatStatus(status: string | undefined): string {
+    return (status ?? '').replace(/_/g, ' ');
   }
 
   /** Flatten a note's Markdown to plain prose, then truncate, for the card preview. */

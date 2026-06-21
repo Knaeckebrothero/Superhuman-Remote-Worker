@@ -122,8 +122,11 @@
     "goalPlaceholder": "Goal (optional)",
     "badgePersonal": "Personal",
     "jobsCount": "{{count}} jobs",
+    "jobsCountOne": "{{count}} job",
     "reposCount": "{{count}} repos",
+    "reposCountOne": "{{count}} repo",
     "membersCount": "{{count}} members",
+    "membersCountOne": "{{count}} member",
     "status": {
       "active": "active",
       "archived": "archived",
