@@ -73,6 +73,8 @@ spec:
                   optional: true
             - name: HEADSCALE_USER
               value: {{ .Values.vmController.headscale.user | quote }}
+            - name: HEADSCALE_KEY_EXPIRY_MINUTES
+              value: {{ .Values.vmController.headscale.keyExpiryMinutes | default 30 | quote }}
             {{- end }}
             - name: LOG_LEVEL
               valueFrom:

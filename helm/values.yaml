@@ -1360,6 +1360,12 @@ vmController:
     apiKeySecretName: ""
     apiKeySecretKey: api-key
     user: srw
+    # -- Pre-auth key registration deadline (minutes). The VM must join the mesh
+    # within this window of key mint (at VM-create); it must exceed worst-case
+    # create→join, which includes the cold per-VM image import — not just boot.
+    # 10 (old default) expired mid-import for tier upgrades. See
+    # docs/features/workspace_tier_upgrade.md Q7.
+    keyExpiryMinutes: 30
   resources:
     requests:
       memory: "64Mi"
