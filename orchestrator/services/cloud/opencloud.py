@@ -159,6 +159,7 @@ class OpenCloudBackend:
         target_path: str,
         access: str,
         subject: CloudMountSubject | None = None,
+        prefer_public_url: bool = False,
     ) -> RcloneMountSpec:
         """Build an rclone WebDAV spec for an OpenCloud Space surface.
 
@@ -214,6 +215,19 @@ class OpenCloudBackend:
                     )
                 auth["type"] = "keycloak_user_impersonation"
                 auth["target_user_sub"] = target_user_sub
+
+        # Cross-cluster VM runtimes can't reach the internal service URL
+        # (srw-opencloud:9200) — swap to the public edge, which the VM egress
+        # NetworkPolicy permits (443). Same-cluster pods keep the internal URL
+        # (no hairpin, works on local k3d). See
+        # docs/issues/workspace_upgrade_drops_cloud_mount.md.
+        if (
+            prefer_public_url
+            and webdav_url
+            and self._public_url
+            and webdav_url.startswith(self._base_url)
+        ):
+            webdav_url = self._public_url + webdav_url[len(self._base_url) :]
 
         if not webdav_url:
             raise CloudBackendError(

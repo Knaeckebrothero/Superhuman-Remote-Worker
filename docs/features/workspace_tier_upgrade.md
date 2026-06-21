@@ -22,7 +22,61 @@ related:
 
 # Workspace Tier Upgrade — `virtual`/`none` → `sandbox`/`vm` on demand
 
-**Status:** **DEV-CLUSTER VERIFIED — 2026-06-21.** On the real homelab cluster
+**Status (LATEST — session `sandbox → vm` FULLY VERIFIED end-to-end incl. sudo + clean teardown — 2026-06-21):**
+The lite→sandbox tiers + Q7/Q8 are done (see prior status below). The **VM tier had
+NEVER worked on dev** (DB-proven: 0 threads/jobs ever reached `vm_status=ready` /
+`vm_ssh_host`) due to **two pre-existing VM-backend infra bugs**, both now found +
+fixed + **confirmed on-cluster** (commits `8f101915`→`e32ca45`):
+
+1. **Workspace egress NetworkPolicy `srw-vm-workspace` blocked NATS port 4222.** It
+   allowed 53 + 80/443 + Tailscale (41641/3478) but not 4222, so the in-guest
+   `management-daemon` could never `connect_nats` → never published
+   `agent.vm.{oid}.{job}.register` → `vm_status` never flipped to `ready`. (Proof:
+   NATS-leaf `/connz` showed only the controller connected, never the VM. This is
+   why mesh-join worked but NATS didn't.) **Fix:** 4222/TCP egress carve-out `to:`
+   the nats-leaf pod.
+2. **SSH `authorized_keys` written to the wrong path.** cloud-init wrote
+   `~/.ssh/authorized_keys`, but the base image's sshd is `AuthorizedKeysFile
+   /etc/ssh/authorized_keys/%u` → key never read → "Permission denied" even with a
+   matching keypair. **Fix:** path → `/etc/ssh/authorized_keys/agent-host`.
+
+Also: **VM size bumped 2c/4Gi → 8c/16Gi** (`5048a4ba`, all provisioning layers;
+containers unchanged). The completion test then **reached `vm_status=ready` with a
+mesh `ssh_host` — the daemon registered, first time ever — the VM came up 8c/16Gi,
+and the agent SSH'd in.** It fell over only at the **file seed**, which surfaced
+**two final agent-code bugs** (`a8da5dde`, agent image **deploying**): the seed read
+the OpenCloud `cloud` rclone mount as a file (`Cannot read cloud: Failure`) →
+**fix: `seed_workspace` skips unreadable entries**; and that post-`ready` failure
+**leaked the running VM** → **fix: the `_handle_workspace_upgrade` except block now
+tears the VM down**. **✅ FULL COMPLETION VERIFIED on dev (2026-06-21, agent `sha-a8da5dd`):**
+a fresh `sandbox` session (carrying the OpenCloud `cloud → /cloud/home` symlink that broke
+the prior seed) ran `/upgrade-workspace vm` → cold KubeVirt VM provisioned (8c/16Gi,
+warm-cache import) → daemon **registered** (`vm_status=ready`, mesh `ssh_host 100.64.18.42`,
+~18 s after VMI Running) → agent **SSH'd in** → **seed skipped the unreadable `cloud` mount**
+(`Seeded 79 file(s) (skipped 1 unreadable)` — the exact `a8da5dde` fix, live) → backend
+**swapped** to `RemoteBackend(VM)` → **45 tools re-derived** (shell admitted) → upgrade
+complete. Acceptance payoff confirmed in-session: `whoami`→`agent-host`, `sudo whoami`→`root`,
+`sudo id`→`uid=0(root) gid=0(root)`, `hostname`→`agent-vm-16a8613d…` (genuinely on the VM).
+The Q7 progress heartbeat rendered in-cockpit (`Still provisioning… 62…371 s elapsed`).
+**Teardown also verified:** deleting the session reaped the VM + Headscale node + sandbox
+pod + DB row, no leak. Bonus finding: `sudo` re-prompts even in auto-accept mode
+(privileged-command gating). The `virtual → vm` cell differs only in the seed *source*
+(object-store vs SSH `RemoteBackend`), already proven for `virtual → sandbox`; the entire
+VM-side path (provision→register→SSH→swap→retool→sudo→teardown) is now proven. **Known gap
+found during this test (HIGH — must fix, NOT just warn):** the upgrade does **not** carry the
+OpenCloud cloud mount onto the VM — the agent loses access to the live cloud data it upgraded to
+keep working on. Root causes (per the issue's investigation): the handler never re-runs
+`_setup_cloud_mount` post-swap, **and** the mount WebDAV URL is hardcoded to the *internal*
+`srw-opencloud:9200` the cross-cluster VM can't reach (fix = topology-aware public URL for VM).
+rclone/fuse3 are already in the VM image; FUSE is native in the guest — those are NOT blockers.
+Filed `docs/issues/workspace_upgrade_drops_cloud_mount.md`. Deploy/diagnosis gotchas
+(CI chart-detection only watched `helm/`; cloud-init userData 2048-byte limit;
+controller caches its template → bounce the pod; two earlier misdiagnoses —
+Headscale-key-TTL + DNS-hijack — both WRONG) captured in `[[project_workspace_tier_upgrade]]`.
+The golden-image clone (per-VM CDI `source.registry` import, 6–25 min cold) remains
+a deferred Q7 **perf** fix, orthogonal to all the above.
+
+**Status (lite tiers + Q7/Q8) — DEV-CLUSTER VERIFIED — 2026-06-21.** On the real homelab cluster
 (cockpit + KubeVirt, not k3d): worker `virtual → sandbox` **and** `none →
 sandbox` end-to-end (full lifecycle to `reviewing`; Sec-2 egress labels
 confirmed on the upgraded pod), and session `virtual → sandbox` end-to-end (the
@@ -227,7 +281,7 @@ and the worker→vm cell are still design-stage.
 
 | Source → Target | → `sandbox` (container) | → `vm` |
 |---|---|---|
-| **Session** `virtual` | ✅ **Built + DEV-verified** (S1–S5, 2026-06-21) | 🟡 **Built** — provisions a **real KubeVirt VM** on dev; cold-import timeout mitigated agent-side (tunable 900 s + heartbeat + orphan teardown, Q7); full seed/swap re-verify pending the golden-image clone or a warm cluster |
+| **Session** `virtual` | ✅ **Built + DEV-verified** (S1–S5, 2026-06-21) | ✅ **DEV end-to-end VERIFIED via `sandbox → vm`** (2026-06-21): cold KubeVirt VM (8c/16Gi) → register (`ready`, mesh ssh) → SSH → seed (79 files, skipped unreadable `cloud`) → swap → retool → **`sudo`→root on the VM** → clean teardown (no leak). `virtual → vm` shares this VM-side path; differs only in object-store seed source (already proven for `→ sandbox`). Cold-import latency still mitigated agent-side (900 s + heartbeat + orphan teardown, Q7); golden-image clone deferred |
 | **Session** `none` | 🟡 plausibly works (tool exposed + lite-boot fixed; worker-`none` verified), **unverified for sessions** | 🟡 plausibly works (same delegation), **unverified** |
 | **Worker job** `virtual` | ✅ **Built + DEV-verified** — in-process swap (Phase 3 W1+W2) | ❌ Phase 3 W3 (deferred — operator-gated re-dispatch; composes W1 + sudo→VM) |
 | **Worker job** `none` | ✅ **DEV-verified** (2026-06-21) — the `ScratchBackend → RemoteBackend` seed copies the scratch files in; the "no durable anchor" worry didn't bite | ❌ |
@@ -1230,38 +1284,26 @@ classifier misses ~17% of overeager actions). Maps to open question #1.
    `/upgrade-workspace vm`" and surfaces the triggering sudo command. Unit-pinned
    in `tests/test_persistent_app.py` (`TestUpgradeAlreadySatisfied`,
    `TestHandleWorkspaceUpgradeVm`) + `persistent-chat.service.spec.ts`.
-9. **VM never reports `ready` — Headscale auth-key expires mid-boot** (found
-   2026-06-21 verifying Q7/Q8 on dev; **interim fix shipped 2026-06-21**). With
-   Q7's 900 s timeout in place, a sandbox→vm upgrade ran the full path: the cold
-   CDI import actually **succeeded in ~6 min** (DataVolume `Succeeded`, VMI
-   `Running`) — yet `vm_status` never flipped `created→ready` / `vm_ssh_host`
-   stayed null, so the swap couldn't complete and the agent auto-tore-down the VM
-   at 900 s (Q7 cleanup worked perfectly). **Root cause:** the VM's reachable
-   address is its Headscale mesh IP, which the in-guest daemon only reports after
-   `tailscale up`. The mesh-join uses a single-use, ephemeral pre-auth key whose
-   `expiration` is the **registration deadline** = mint-time + `HEADSCALE_KEY_
-   EXPIRY_MINUTES` (default **10 min**), and the controller mints it at
-   **VM-create**, *before* the import (`vm/controller/controller.py` `_do_create`
-   → `headscale_client.create_auth_key`). The ~6 min import eats most of the 10 min
-   window → the key expires mid-boot → join fails → no mesh IP → never `ready`.
-   (Evidence: controller log `Created Headscale auth key … (expires …10:17:24Z)`
-   at VM-create, then Create→Delete with no registration; orchestrator no
-   `on_vm_ready`.)
-   - **Shipped (interim, correct config):** `HEADSCALE_KEY_EXPIRY_MINUTES` raised
-     **10 → 30** via a new `headscale.keyExpiryMinutes` value in BOTH charts
-     (`helm-vm-cluster` = the dedicated vm cluster, + `helm` co-located). 10 min
-     was sized for fast boots; the registration window must exceed worst-case
-     create→join, which includes the import. Single-use + ephemeral + `tag:vm`
-     key, so the longer window is a minor trade-off. Reaches the vm cluster via
-     the normal develop→CI→Fleet cycle (CI republishes the vm-cluster OCI chart +
-     bumps `deployment-vms/srw-vm-controller/fleet.yaml`).
-   - **Proper fix:** the golden-image clone (Q7) removes the import → boot is near-
-     immediate → join lands well inside even a 10-min key (lets the TTL shrink
-     again). Optional hardening: the management-daemon re-mints a fresh key over
-     NATS (pod-network reachable, no mesh needed) if `tailscale up` with the
-     baked-in key fails — self-healing regardless of timing.
-   - **Still unverified:** an actual session→vm **completion** (seed/swap/sudo-
-     reopen) — blocked on this until the TTL fix deploys; that's the next live test.
+9. **VM never reported `ready` — RESOLVED 2026-06-21 (it was a NetworkPolicy egress
+   block, NOT the two things first guessed).** The VM tier had never reached `ready`
+   on dev (0 ever). **Two misdiagnoses to NOT repeat:** (a) Headscale pre-auth key
+   TTL (`HEADSCALE_KEY_EXPIRY_MINUTES`, mint-at-create vs the ~6 min import) — WRONG;
+   the mesh join actually works (the controller deletes the node on teardown, and a
+   30 min key changed nothing). (b) tailscale MagicDNS hijacking cluster DNS — WRONG
+   (Headscale `override_local_dns:false` = split-DNS; egress 53 is allowed anyway).
+   *Lesson: get guest-side evidence (here: NATS-leaf `/connz` + an SSH into a
+   diagnostic VM over the mesh), don't infer from timing.* **Actual root cause:** the
+   workspace egress NetworkPolicy `srw-vm-workspace` allowed 53 + 80/443 + Tailscale
+   (41641/3478) but **not 4222** → the in-guest daemon's `connect_nats` to
+   `nats://srw-vm-nats-leaf:4222` was dropped → never registered → never `ready`
+   (which is *why* mesh-join worked but NATS didn't). **Fixed** (4222/TCP egress
+   `to:` the nats-leaf) + the SSH-path bug (see top Status). **Confirmed:** the next
+   completion test reached `vm_status=ready` with a mesh `ssh_host` and the agent
+   SSH'd into an 8c/16Gi VM. The `HEADSCALE_KEY_EXPIRY_MINUTES` 10→30 change was the
+   misdiagnosis — harmless, kept. Deploy gotchas hit (CI chart-detection only watched
+   `helm/`; cloud-init userData 2048-byte limit; controller caches its template →
+   bounce the pod) and the two final seed/leak fixes are in `[[project_workspace_tier_upgrade]]`.
+   The golden-image clone (Q7 perf, cold import) is still deferred + orthogonal.
 
 ---
 

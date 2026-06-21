@@ -4789,6 +4789,38 @@ async def _handle_workspace_upgrade(
         # 6. Hot-swap + re-derive the toolset (S1) so shell/git/file tools
         #    appear on the next turn (get_current_tools re-reads per turn).
         _session.swap_backend(new_backend)
+
+        # 6a. Re-establish the OpenCloud cloud mount on the NEW backend. The
+        #     mount is a per-host rclone process, so it does NOT follow the
+        #     backend swap — without this the agent loses the cloud data it
+        #     upgraded to keep working on. Re-fetch the freshly-built payload
+        #     (the orchestrator now targets the public WebDAV URL + read-only
+        #     for a vm runtime) and remount BEFORE retooling, since
+        #     srw_cloud_status exposure is gated on an active mount. Best-effort:
+        #     a remount failure must not abort the otherwise-successful upgrade.
+        #     See docs/issues/workspace_upgrade_drops_cloud_mount.md.
+        try:
+            _ws_info = await _orchestrator_client.get_thread_workspace(_thread_id)
+            _fresh_cloud_mount = _ws_info.get("cloud_mount") if _ws_info else None
+            if _fresh_cloud_mount:
+                if _session.cloud_mount_manager is not None:
+                    await _session.cloud_mount_manager.aclose()
+                    _session.cloud_mount_manager = None
+                _session.cloud_mount_error = None
+                await _session._setup_cloud_mount(_fresh_cloud_mount)
+                _mgr = _session.cloud_mount_manager
+                if _mgr is None or not getattr(_mgr, "active", False):
+                    await _ws_send(
+                        ws,
+                        "workspace_upgrade.cloud_mount_degraded",
+                        {
+                            "thread_id": _thread_id,
+                            "reason": _session.cloud_mount_error or "mount inactive",
+                        },
+                    )
+        except Exception as e:
+            logger.warning(f"Cloud remount after upgrade failed ({_thread_id}): {e}")
+
         _session.resetup_tools_for_backend()
 
         # A vm keeps its own in-guest sudo gate — re-open the shell-layer sudo
