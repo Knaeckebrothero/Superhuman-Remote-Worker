@@ -195,6 +195,59 @@ LLM self-attributes per call via the virtual key (robust to agent-pod reuse);
 workspaces are single-owner (worker one-shot `container_provisioner.py:291`;
 session one-thread, billed per active interval).
 
+## Infrastructure
+
+> The deployment delta is small because LiteLLM brings its own persistence:
+> **+1 app container, +1 small Postgres LiteLLM fully owns, ~0 new tables on our
+> side for Slices 1–3.** The chart already deploys one small single-replica
+> Postgres StatefulSet per workload class (`helm/templates/databases/postgres.yaml`,
+> `-vector`, `-audit`, `-keycloak`), gated by `databases.<name>.enabled` — LiteLLM
+> drops straight into that mold.
+
+### New chart components (Slices 1–3)
+
+| Component | K8s objects | Chart location | Notes |
+|---|---|---|---|
+| **LiteLLM gateway** | Deployment + ClusterIP Service | new `helm/templates/litellm/` (mirror `orchestrator/`) | image `ghcr.io/berriai/litellm`; port **4000**; agents reach `http://<release>-litellm:4000` |
+| **LiteLLM Postgres** | StatefulSet + PVC + Service | new `databases/postgres-litellm.yaml` (copy `postgres-audit.yaml` near-verbatim) | gated by `databases.litellm.enabled`; **required** — DB mode is what unlocks virtual keys + per-user/team limits + spend tracking |
+| **Secrets** | `LITELLM_MASTER_KEY`, `LITELLM_POSTGRES_USER/PASSWORD` | existing `secret.yaml` (+ ESO/Vault for prod) | mirror the `AUDIT_POSTGRES_*` keys |
+| **Config** | `LITELLM_POSTGRES_DB` + a mounted `config.yaml` (model list, upstreams, per-deployment rpm/tpm backstop) | existing `configmap.yaml` + a new ConfigMap | upstreams incl. homelab router + LiteLLM→CLIProxyAPI for codex |
+
+### Databases
+
+- **+1 new DB: LiteLLM's own.** Ownership note that matters operationally:
+  **LiteLLM self-migrates its schema via Prisma on startup** — it creates/owns its
+  `LiteLLM_*` tables (keys, teams, users, spend logs). This is **not** driven by the
+  orchestrator's `migrations/{app,audit,vector}/` runner. New DB, but we don't author
+  its tables.
+- **No new DB for the ledger.** Slice 4's `usage_events` lands in the **existing
+  `srw-auditdb`** as `migrations/audit/0002` — the audit template already earmarks it
+  ("and, later, the usage-metering ledger", `postgres-audit.yaml:3-7`). Slice 4 =
+  **0 new DBs, 1 new table.**
+
+### New tables in *our* schema
+
+- **Slices 1–3:** effectively **none required** — keys/limits/spend live in LiteLLM's
+  DB. Only candidate: **one small config table** in the app DB for the category→model
+  map + per-user/project limit policy (Open Q4) — and that can start as **YAML**, so
+  possibly zero.
+- **Slice 4:** **+1** `usage_events` (audit DB) + workspace-metering emit code + a
+  Cockpit view.
+
+### Not needed (for v1)
+
+- **No Redis** — only required to share rate-limit counters across *multiple* LiteLLM
+  replicas; v1 is single-replica → in-memory. (Un-defers at scale — see below.)
+- **No new DB server** for metering — reuses `srw-auditdb`.
+- **No agent-side infra change** — agents are pointed at the gateway via the existing
+  dispatch config-swap (`_inject_dispatch_credentials`).
+
+### Side effect: centralized provider egress
+
+Today every agent pod egresses directly to providers. With the gateway, **only the
+LiteLLM pod needs outbound provider egress** — agents reach it in-cluster. Shrinks the
+egress surface (composes with the agent-egress NetworkPolicy work).
+
 ## Slices (each independently shippable)
 
 ### Slice 1 — Gateway + RPM/TPM visibility *(the measurement need; starting point)*
@@ -231,8 +284,9 @@ session one-thread, billed per active interval).
 - Per-user / per-project **rolling N-hour or daily request/token quota**.
   **Necessarily orchestrator-side** — LiteLLM's only long-window cap is
   dollar-denominated (capability gap 2), and we want request/token counts.
-- Orchestrator polls LiteLLM usage (confirm read path — gap 4); over-quota →
-  freeze the user's jobs + tear down pods (reusing the freeze/teardown path).
+- Orchestrator polls LiteLLM usage (confirm read path — gap 4) via **one aggregate
+  `GROUP BY user` query, never a per-user loop** (see Scaling); over-quota → freeze
+  the user's jobs + tear down pods (reusing the freeze/teardown path).
 - **Acceptance:** a user crossing the quota has in-flight jobs frozen and
   workspaces released; throttle (Slice 2) and quota-stop are distinguishable (one
   slows, one stops); midnight-flood mitigation (rolling window) applied or filed.
@@ -293,6 +347,36 @@ hits the fragile resume path).
 
 **Other cost centers** — query (Neo4j/pgvector), storage, agent-pod compute:
 ignored now; the ledger's `category` taxonomy reserves them.
+
+## Scaling to N users
+
+> Verdict: the **shape holds** — a central gateway is how rate-limiting/metering is
+> done at *any* scale, not something you outgrow. What upgrades at ~1000 users is the
+> single-instance v1 *deployment*, in a predictable order. **Every lever below is
+> already a deferred design item; scaling = un-deferring, not rethinking.** The real
+> ceilings (provider tier capacity, cluster nodes) are things the gateway *rations
+> fairly* but can't *create*.
+
+### Un-defer order (each bites roughly in turn)
+
+| # | Pressure at scale | Fix (already in the design) |
+|---|---|---|
+| 1 | One LiteLLM pod won't carry aggregate RPS, and it's now **everyone's critical path** | **Multi-replica LiteLLM + Redis** for shared rate-limit counters, + Redis HA. The Redis skipped at v1 becomes **mandatory** the moment replicas > 1. |
+| 2 | LiteLLM writes a **spend-log row per request** + hot-row spend-counter updates → DB firehose (not proxy CPU) | Lean on the **partitioned `usage_events`** ledger (Slice 4 — audit-store machinery is built for firehose volume + retention) as the durable store; keep LiteLLM's own DB **enforcement-only, short-retention**, with batched spend writes. |
+| 3 | Orchestrator added load: key mint/revoke per job (2 calls) + the quota poll | Quota poll = **one aggregate query**, never a per-user loop; consider **per-session keys** instead of per-job to cut key churn (trades attribution granularity). |
+| 4 | Hundreds of concurrent agent + workspace pods | **Derived-concurrency admission** (Deferred §): `sustainable_agents = rate_budget / demand_per_agent` — stops provisioning thousands of starved pods. |
+| 5 | Gateway holds **every** provider key → compromise = total; real external users | **Credential-broker hardening** ([[credential_broker]]): per-session least-privilege + pod-binding (tailnet). |
+
+### The honest ceiling
+
+- **Homelab:** finite cluster nodes cap concurrent agents *well before* 1000 users —
+  the cluster is the first wall, not the gateway.
+- **Cloud:** the walls are provider **tier limits** (1000 users share a finite set of
+  keys → per-user limits get small unless you buy capacity) and the autoscaled pod
+  fleet.
+- The gateway makes scarcity **fair and visible**; "it holds at 1000 users" means "it
+  throttles everyone correctly," not "everyone runs at full speed." Creating capacity
+  is a provisioning/procurement question, not an architecture one.
 
 ## Resolved by the capability check (2026-06-20)
 

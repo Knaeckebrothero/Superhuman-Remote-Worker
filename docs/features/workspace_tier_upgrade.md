@@ -1198,9 +1198,13 @@ classifier misses ~17% of overeager actions). Maps to open question #1.
      DataVolume `source.registry` to `sourceRef: {kind: DataSource}`
      (host-assisted clone works even on `local-path`; it skips the docker pull +
      qcow2 conversion). That turns a cold upgrade from ~5–25 min into a local
-     block copy. Deferred because it's KubeVirt/CDI storage on the `vm` cluster
-     (CRDs absent from the `main` context) and needs on-cluster verification —
-     not changed blind.
+     block copy. **2-for-1:** removing the import also fixes the VM-readiness race
+     in Q9 (the import no longer eats the Headscale key window). Deferred because
+     it's KubeVirt/CDI storage on the `vm` cluster (CRDs absent from the `main`
+     context) and needs on-cluster verification — not changed blind. NB on this
+     cluster `VM_STORAGE_CLASS=local-path` (no CSI snapshot/clone) → CDI falls
+     back to host-assisted clone (~1–3 min, fits the key window); near-instant
+     clones would need VM storage on a snapshot-capable CSI.
 8. **Sandbox → vm sudo-escalation has no working UI accept** (found 2026-06-21;
    **FIXED 2026-06-21**). A sandbox agent that tripped the `sudo_action=freeze`
    gate emitted a `vm_upgrade.needed` offer whose banner said "use the upgrade
@@ -1217,6 +1221,38 @@ classifier misses ~17% of overeager actions). Maps to open question #1.
    `/upgrade-workspace vm`" and surfaces the triggering sudo command. Unit-pinned
    in `tests/test_persistent_app.py` (`TestUpgradeAlreadySatisfied`,
    `TestHandleWorkspaceUpgradeVm`) + `persistent-chat.service.spec.ts`.
+9. **VM never reports `ready` — Headscale auth-key expires mid-boot** (found
+   2026-06-21 verifying Q7/Q8 on dev; **interim fix shipped 2026-06-21**). With
+   Q7's 900 s timeout in place, a sandbox→vm upgrade ran the full path: the cold
+   CDI import actually **succeeded in ~6 min** (DataVolume `Succeeded`, VMI
+   `Running`) — yet `vm_status` never flipped `created→ready` / `vm_ssh_host`
+   stayed null, so the swap couldn't complete and the agent auto-tore-down the VM
+   at 900 s (Q7 cleanup worked perfectly). **Root cause:** the VM's reachable
+   address is its Headscale mesh IP, which the in-guest daemon only reports after
+   `tailscale up`. The mesh-join uses a single-use, ephemeral pre-auth key whose
+   `expiration` is the **registration deadline** = mint-time + `HEADSCALE_KEY_
+   EXPIRY_MINUTES` (default **10 min**), and the controller mints it at
+   **VM-create**, *before* the import (`vm/controller/controller.py` `_do_create`
+   → `headscale_client.create_auth_key`). The ~6 min import eats most of the 10 min
+   window → the key expires mid-boot → join fails → no mesh IP → never `ready`.
+   (Evidence: controller log `Created Headscale auth key … (expires …10:17:24Z)`
+   at VM-create, then Create→Delete with no registration; orchestrator no
+   `on_vm_ready`.)
+   - **Shipped (interim, correct config):** `HEADSCALE_KEY_EXPIRY_MINUTES` raised
+     **10 → 30** via a new `headscale.keyExpiryMinutes` value in BOTH charts
+     (`helm-vm-cluster` = the dedicated vm cluster, + `helm` co-located). 10 min
+     was sized for fast boots; the registration window must exceed worst-case
+     create→join, which includes the import. Single-use + ephemeral + `tag:vm`
+     key, so the longer window is a minor trade-off. Reaches the vm cluster via
+     the normal develop→CI→Fleet cycle (CI republishes the vm-cluster OCI chart +
+     bumps `deployment-vms/srw-vm-controller/fleet.yaml`).
+   - **Proper fix:** the golden-image clone (Q7) removes the import → boot is near-
+     immediate → join lands well inside even a 10-min key (lets the TTL shrink
+     again). Optional hardening: the management-daemon re-mints a fresh key over
+     NATS (pod-network reachable, no mesh needed) if `tailscale up` with the
+     baked-in key fails — self-healing regardless of timing.
+   - **Still unverified:** an actual session→vm **completion** (seed/swap/sudo-
+     reopen) — blocked on this until the TTL fix deploys; that's the next live test.
 
 ---
 
