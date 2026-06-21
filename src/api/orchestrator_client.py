@@ -351,6 +351,35 @@ class OrchestratorClient:
             logger.error(f"VM upgrade request error: {e}")
             return False
 
+    async def abort_thread_vm_upgrade(self, thread_id: str) -> bool:
+        """Tear down a thread's VM after a failed/timed-out upgrade.
+
+        Called by the live upgrade handler when ``_poll_vm_ready`` gives up, so a
+        half-provisioned VM (+ its DataVolume + CDI importer pod) doesn't leak
+        with nobody attached. Idempotent server-side; clears ``metadata.vm`` so a
+        later retry isn't blocked by the provisioning-in-progress guard
+        (workspace_tier_upgrade.md Q7).
+
+        Returns:
+            True if the teardown request was accepted, False otherwise.
+        """
+        if not self._client:
+            await self.connect()
+
+        url = f"{self.orchestrator_url}/api/agents/threads/{thread_id}/abort-vm-upgrade"
+        try:
+            response = await self._client.post(url)
+            if response.status_code == 200:
+                logger.info(f"VM upgrade aborted/torn down for thread {thread_id}")
+                return True
+            logger.error(
+                f"VM upgrade abort failed: {response.status_code} - {response.text}"
+            )
+            return False
+        except Exception as e:
+            logger.error(f"VM upgrade abort error: {e}")
+            return False
+
     async def request_thread_workspace_upgrade(
         self, thread_id: str, target_tier: str = "sandbox"
     ) -> bool:
