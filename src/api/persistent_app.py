@@ -4829,6 +4829,18 @@ async def _handle_workspace_upgrade(
 
     except Exception as e:
         logger.exception(f"Workspace upgrade failed for thread {_thread_id}")
+        # A failure AFTER the vm was provisioned (e.g. the seed or swap step,
+        # once vm_status was already ready) would otherwise leak the running VM —
+        # only the poll-timeout path tore it down before. Tear it down here too
+        # (idempotent; a no-op if no vm was created) so no failure path leaks a
+        # ready VM (workspace_tier_upgrade.md Q7).
+        if target_tier == "vm" and _orchestrator_client is not None:
+            try:
+                await _orchestrator_client.abort_thread_vm_upgrade(_thread_id)
+            except Exception as ee:
+                logger.warning(
+                    f"VM teardown after upgrade failure ({_thread_id}): {ee}"
+                )
         await _ws_send(ws, "workspace_upgrade.failed", {"reason": str(e)})
 
 

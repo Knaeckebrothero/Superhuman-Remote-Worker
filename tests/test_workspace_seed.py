@@ -124,6 +124,35 @@ class TestSeedWorkspace:
         assert dst.is_dir("a/b/c")
         assert dst.read_file("a/b/c/deep.txt") == "x"
 
+    def test_skips_unreadable_entries_like_cloud_mount(self, tmp_path, monkeypatch):
+        # walk() can surface a mount point (the OpenCloud `cloud` rclone mount
+        # stats as a non-dir over SFTP) that read_file can't read as a file. The
+        # seed must SKIP it (not abort the whole upgrade), copy the real files,
+        # and not list it as missing. Found live: a sandbox→vm upgrade aborted on
+        # `Cannot read cloud: Failure` after the VM was already ready.
+        src = _virtual()
+        src.write_file("plan.md", "p")
+        src.write_file("notes/a.md", "a")
+        orig_walk, orig_read = src.walk, src.read_file
+        monkeypatch.setattr(
+            src, "walk", lambda path="": sorted([*orig_walk(path), "cloud"])
+        )
+
+        def read_or_fail(rel, binary=False):
+            if rel == "cloud":
+                raise OSError("Failure")
+            return orig_read(rel, binary=binary)
+
+        monkeypatch.setattr(src, "read_file", read_or_fail)
+        dst = FilesystemTestBackend(tmp_path)
+
+        n = seed_workspace(src, dst)  # must NOT raise
+
+        assert n == 2  # the two real files copied; `cloud` skipped
+        assert dst.read_file("plan.md") == "p"
+        assert dst.read_file("notes/a.md") == "a"
+        assert not dst.exists("cloud")
+
     def test_raises_when_destination_drops_writes(self, tmp_path, monkeypatch):
         # A dst whose writes vanish → verify-before-return must raise so the
         # caller never swaps onto a half-seeded workspace.
