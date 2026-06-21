@@ -56,6 +56,7 @@ PATCH  /api/admin/users/{user_id}                                               
 GET    /api/agents                                                                      admin:_require_admin
 POST   /api/agents/register                                                             internal:require_internal
 POST   /api/agents/threads                                                              internal:require_internal
+POST   /api/agents/threads/{thread_id}/abort-vm-upgrade                                 internal:require_internal
 PATCH  /api/agents/threads/{thread_id}/config                                           internal:require_internal
 GET    /api/agents/threads/{thread_id}/lifecycle                                        internal:require_internal
 POST   /api/agents/threads/{thread_id}/messages                                         internal:require_internal
