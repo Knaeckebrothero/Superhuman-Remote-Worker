@@ -1253,6 +1253,7 @@
     "colName": "Name",
     "colSource": "Source",
     "colActions": "Actions",
+    "moreActions": "More actions",
     "displayName": "Display name",
     "icon": "Icon (Material Symbol)",
     "color": "Color (hex)",
