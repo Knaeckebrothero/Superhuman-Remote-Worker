@@ -175,6 +175,21 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: AUDIT_BACKEND
+            {{- if .Values.litellm.enabled }}
+            # LiteLLM gateway control plane. BASE_URL gates the catalog-sync loop
+            # (services/litellm_gateway.py) on; MASTER_KEY authenticates its admin
+            # API calls + (Slice 2) the per-job virtual keys it mints.
+            - name: LITELLM_BASE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: LITELLM_BASE_URL
+            - name: LITELLM_MASTER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: LITELLM_MASTER_KEY
+            {{- end }}
             - name: MONGODB_URL
               valueFrom:
                 configMapKeyRef:

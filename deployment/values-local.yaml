@@ -96,6 +96,10 @@ secrets:
     VECTOR_POSTGRES_PASSWORD: "dev_pgvector_password"
     AUDIT_POSTGRES_USER: "srw"
     AUDIT_POSTGRES_PASSWORD: "dev_auditdb_password"
+    LITELLM_POSTGRES_USER: "srw"
+    LITELLM_POSTGRES_PASSWORD: "dev_litellmdb_password"
+    LITELLM_MASTER_KEY: "sk-dev-litellm-master-do-not-use-in-prod"
+    LITELLM_SALT_KEY: "sk-dev-litellm-salt-do-not-use-in-prod"
     NEO4J_USERNAME: "neo4j"
     NEO4J_PASSWORD: "dev_neo4j_password_noslash"
 
@@ -228,12 +232,21 @@ databases:
   audit:
     storageSize: "2Gi"
     backend: "postgres"
+  litellm:
+    enabled: true
+    storageSize: "2Gi"
   mongodb:
     storageSize: "2Gi"
   neo4j:
     storageSize: "5Gi"
   keycloak:
     storageSize: "2Gi"
+
+# -----------------------------------------------------------------------------
+# LiteLLM gateway — usage monitoring + rate limiting (Slice 1: RPM visibility)
+# -----------------------------------------------------------------------------
+litellm:
+  enabled: true
 
 # -----------------------------------------------------------------------------
 # Workspace PVC — single-node local-path is RWO-only, override the prod default

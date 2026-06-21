@@ -1,0 +1,27 @@
+{{- if .Values.litellm.enabled }}
+{{/*
+Base LiteLLM proxy config. The model_list is intentionally EMPTY — the
+orchestrator registers catalog models at runtime via the admin API
+(/model/new), which requires store_model_in_db. master_key + database_url are
+supplied via env (LITELLM_MASTER_KEY / DATABASE_URL) on the Deployment.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "srw.fullname" . }}-litellm-config
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "litellm") | nindent 4 }}
+data:
+  config.yaml: |
+    model_list: []
+    litellm_settings:
+      # Tolerate provider-specific params the agent sends (reasoning kwargs,
+      # etc.) instead of erroring — the gateway is a measurement pass-through.
+      drop_params: true
+      telemetry: false
+    general_settings:
+      # Persist admin-API-registered models to the gateway's Postgres so they
+      # survive restarts. This is what makes the orchestrator's /model/new sync
+      # durable rather than ephemeral.
+      store_model_in_db: true
+{{- end }}
