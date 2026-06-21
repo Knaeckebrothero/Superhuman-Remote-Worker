@@ -62,6 +62,8 @@ spec:
                   key: api-key
             - name: HEADSCALE_USER
               value: {{ .Values.headscale.user | quote }}
+            - name: HEADSCALE_KEY_EXPIRY_MINUTES
+              value: {{ .Values.headscale.keyExpiryMinutes | default 30 | quote }}
             {{- if .Values.ssh.publicKeyVaultPath }}
             # When the public key is synced from Vault, the controller reads
             # it at runtime and substitutes ${SSH_AUTHORIZED_KEY} in the

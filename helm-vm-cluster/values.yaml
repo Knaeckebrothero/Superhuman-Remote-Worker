@@ -114,6 +114,16 @@ vmController:
 headscale:
   url: ""
   user: "srw"
+  # -- Pre-auth key registration deadline (minutes). The VM must join the mesh
+  # within this window of the key being minted (at VM-create). It must comfortably
+  # exceed the worst-case create→join latency — which today includes the cold
+  # per-VM CDI image import (minutes), NOT just guest boot. The old 10-min default
+  # was sized for fast boots and the import would expire the key mid-boot, so the
+  # VM never registered a mesh IP and workspace-tier `*→vm` upgrades timed out.
+  # (Single-use + ephemeral + tag:vm-scoped, so a longer registration window is a
+  # minor trade-off. A golden-image clone — removing the import — lets this shrink
+  # again; see docs/features/workspace_tier_upgrade.md Q7.)
+  keyExpiryMinutes: 30
   # -- Provide EXACTLY ONE source (or leave both empty to fall back to
   # externalSecrets.vaultPath — see "Layout B" in external-secret.yaml):
   #   apiKeySecret      — name of a pre-existing K8s Secret in this namespace
