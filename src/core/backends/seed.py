@@ -47,24 +47,40 @@ def seed_workspace(src: "WorkspaceBackend", dst: "WorkspaceBackend") -> int:
     """
     files = src.walk()
     written = 0
+    skipped: list[str] = []
     for rel in files:
-        data = src.read_file(rel, binary=True)
+        try:
+            data = src.read_file(rel, binary=True)
+        except (OSError, FileNotFoundError) as e:
+            # walk() can surface entries that aren't readable as regular files:
+            # mount points (notably the OpenCloud `cloud/` rclone mount, which
+            # stats as a non-dir over SFTP), symlinks, sockets, FIFOs. Skip them
+            # instead of failing the whole upgrade — one un-copyable mount must
+            # not abort a VM/sandbox swap. The cloud mount in particular is
+            # RE-mounted on the new backend, so it must not be copied anyway.
+            logger.warning("Seed: skipping unreadable entry %r: %s", rel, e)
+            skipped.append(rel)
+            continue
         parent = posixpath.dirname(rel)
         if parent:
             dst.mkdir(parent)
         dst.write_file(rel, data)
         written += 1
 
-    missing = [rel for rel in files if not dst.exists(rel)]
+    # Verify only the files we actually attempted to copy (skipped entries are
+    # expected to be absent in the destination).
+    expected = [rel for rel in files if rel not in skipped]
+    missing = [rel for rel in expected if not dst.exists(rel)]
     if missing:
         raise RuntimeError(
-            f"Workspace seed incomplete: {len(missing)} of {len(files)} file(s) "
+            f"Workspace seed incomplete: {len(missing)} of {len(expected)} file(s) "
             f"missing in destination (e.g. {missing[:3]})"
         )
 
     logger.info(
-        "Seeded %d file(s) from %s to %s",
+        "Seeded %d file(s) (skipped %d unreadable) from %s to %s",
         written,
+        len(skipped),
         type(src).__name__,
         type(dst).__name__,
     )
