@@ -9,6 +9,8 @@ import {AppBadgeComponent} from '../../ui/badge';
 import {AppIconComponent} from '../../ui/icon';
 import {AppSpinnerComponent} from '../../ui/spinner';
 import {AppDialogComponent} from '../../ui/dialog';
+import {AppMenuComponent, AppMenuItemComponent, AppMenuTriggerDirective} from '../../ui/menu';
+import {ViewportService} from '../../core/services/viewport.service';
 
 /** Bundled (disk) skills are read-only; absence of a source means bundled. */
 export function isBundledSkill(s: Skill): boolean {
@@ -26,6 +28,9 @@ export function isBundledSkill(s: Skill): boolean {
     AppIconComponent,
     AppSpinnerComponent,
     AppDialogComponent,
+    AppMenuComponent,
+    AppMenuItemComponent,
+    AppMenuTriggerDirective,
   ],
   template: `
     <div class="skills">
@@ -69,45 +74,78 @@ export function isBundledSkill(s: Skill): boolean {
                   <app-badge [tone]="bundled(s) ? 'neutral' : 'info'">{{ s.source || 'bundled' }}</app-badge>
                 </td>
                 <td class="actions-col">
-                  @if (!bundled(s)) {
+                  @if (viewport.isMobile()) {
+                    <!-- Mobile: collapse the row actions into a ⋯ overflow menu so the
+                         cell is just the kebab and the table fits without h-scroll
+                         (mirrors the Jobs / Data Sources / Experts lists). -->
+                    <app-icon-button
+                      variant="ghost"
+                      size="sm"
+                      [ariaLabel]="'skills.moreActions' | transloco"
+                      [appMenuTrigger]="rowMenu"
+                      menuPlacement="bottom-end"
+                    >
+                      <app-icon size="sm">more_vert</app-icon>
+                    </app-icon-button>
+                    <app-menu #rowMenu>
+                      @if (!bundled(s)) {
+                        <app-menu-item (activated)="edit(s)">
+                          {{ 'skills.edit' | transloco }}
+                        </app-menu-item>
+                      }
+                      <app-menu-item (activated)="duplicate(s)">
+                        {{ 'skills.duplicate' | transloco }}
+                      </app-menu-item>
+                      <app-menu-item (activated)="exportSkill(s)">
+                        {{ 'skills.export' | transloco }}
+                      </app-menu-item>
+                      @if (!bundled(s)) {
+                        <app-menu-item tone="danger" (activated)="askDelete(s)">
+                          {{ 'skills.delete' | transloco }}
+                        </app-menu-item>
+                      }
+                    </app-menu>
+                  } @else {
+                    @if (!bundled(s)) {
+                      <app-icon-button
+                        size="sm"
+                        variant="ghost"
+                        [ariaLabel]="'skills.edit' | transloco"
+                        [tooltip]="'skills.edit' | transloco"
+                        (clicked)="edit(s)"
+                      >
+                        <app-icon size="sm">edit</app-icon>
+                      </app-icon-button>
+                    }
                     <app-icon-button
                       size="sm"
                       variant="ghost"
-                      [ariaLabel]="'skills.edit' | transloco"
-                      [tooltip]="'skills.edit' | transloco"
-                      (clicked)="edit(s)"
+                      [ariaLabel]="'skills.duplicate' | transloco"
+                      [tooltip]="'skills.duplicate' | transloco"
+                      (clicked)="duplicate(s)"
                     >
-                      <app-icon size="sm">edit</app-icon>
+                      <app-icon size="sm">content_copy</app-icon>
                     </app-icon-button>
-                  }
-                  <app-icon-button
-                    size="sm"
-                    variant="ghost"
-                    [ariaLabel]="'skills.duplicate' | transloco"
-                    [tooltip]="'skills.duplicate' | transloco"
-                    (clicked)="duplicate(s)"
-                  >
-                    <app-icon size="sm">content_copy</app-icon>
-                  </app-icon-button>
-                  <app-icon-button
-                    size="sm"
-                    variant="ghost"
-                    [ariaLabel]="'skills.export' | transloco"
-                    [tooltip]="'skills.export' | transloco"
-                    (clicked)="exportSkill(s)"
-                  >
-                    <app-icon size="sm">download</app-icon>
-                  </app-icon-button>
-                  @if (!bundled(s)) {
                     <app-icon-button
                       size="sm"
-                      variant="danger"
-                      [ariaLabel]="'skills.delete' | transloco"
-                      [tooltip]="'skills.delete' | transloco"
-                      (clicked)="askDelete(s)"
+                      variant="ghost"
+                      [ariaLabel]="'skills.export' | transloco"
+                      [tooltip]="'skills.export' | transloco"
+                      (clicked)="exportSkill(s)"
                     >
-                      <app-icon size="sm">delete</app-icon>
+                      <app-icon size="sm">download</app-icon>
                     </app-icon-button>
+                    @if (!bundled(s)) {
+                      <app-icon-button
+                        size="sm"
+                        variant="danger"
+                        [ariaLabel]="'skills.delete' | transloco"
+                        [tooltip]="'skills.delete' | transloco"
+                        (clicked)="askDelete(s)"
+                      >
+                        <app-icon size="sm">delete</app-icon>
+                      </app-icon-button>
+                    }
                   }
                 </td>
               </tr>
@@ -219,6 +257,7 @@ export class SkillsListComponent implements OnInit {
   private api = inject(ApiService);
   private router = inject(Router);
   private transloco = inject(TranslocoService);
+  protected readonly viewport = inject(ViewportService);
 
   rows = signal<Skill[]>([]);
   loading = signal(true);
