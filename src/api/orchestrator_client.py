@@ -324,7 +324,7 @@ class OrchestratorClient:
             return False
 
     async def request_thread_vm_upgrade(
-        self, thread_id: str, cpu_cores: int = 2, memory: str = "4Gi"
+        self, thread_id: str, cpu_cores: int = 8, memory: str = "16Gi"
     ) -> bool:
         """Request VM provisioning for a persistent thread (upgrade from container).
 

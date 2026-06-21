@@ -111,7 +111,14 @@ data:
                         JOB_ID=${JOB_ID}
                         ORCHESTRATOR_ID=${ORCHESTRATOR_ID}
                         VM_ID=agent-vm-${JOB_ID}
-                    - path: /home/agent-host/.ssh/authorized_keys
+                    # MUST match the base image's sshd AuthorizedKeysFile
+                    # (/etc/ssh/authorized_keys/%u — see agent-vm-base
+                    # provision-stage2.sh). Writing to ~/.ssh/authorized_keys
+                    # instead left sshd unable to find the key → every
+                    # orchestrator SSH got "Permission denied (publickey)" even
+                    # though the keypair matched. The parent dir is pre-created
+                    # 0755 root by the image.
+                    - path: /etc/ssh/authorized_keys/agent-host
                       permissions: '0600'
                       owner: agent-host:agent-host
                       content: |

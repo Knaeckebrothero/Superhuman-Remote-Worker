@@ -234,8 +234,8 @@ class VMProvisioner:
             "${JOB_ID}": job_config["job_id"],
             "${AGENT_CONFIG}": job_config.get("agent_config", "defaults"),
             "${VM_IMAGE}": job_config.get("vm_image") or self._default_vm_image,
-            "${CPU_CORES}": str(job_config.get("cpu_cores", 2)),
-            "${MEMORY}": job_config.get("memory", "4Gi"),
+            "${CPU_CORES}": str(job_config.get("cpu_cores", 8)),
+            "${MEMORY}": job_config.get("memory", "16Gi"),
             "${NATS_URL}": job_config.get("nats_url", ""),
             "${DESCRIPTION}": job_config.get("description", ""),
             # CDI DataVolume storage
@@ -258,8 +258,8 @@ class VMProvisioner:
         job_id: str,
         agent_config: str = "defaults",
         vm_image: Optional[str] = None,
-        cpu_cores: int = 2,
-        memory: str = "4Gi",
+        cpu_cores: int = 8,
+        memory: str = "16Gi",
         description: str = "",
     ) -> bool:
         """Create a VM for a job.
@@ -742,8 +742,8 @@ class VMProvisioner:
         thread_id: str,
         agent_config: str = "defaults",
         vm_image: Optional[str] = None,
-        cpu_cores: int = 2,
-        memory: str = "4Gi",
+        cpu_cores: int = 8,
+        memory: str = "16Gi",
         description: str = "",
     ) -> bool:
         """Create a VM for a persistent thread.

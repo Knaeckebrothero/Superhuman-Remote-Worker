@@ -3365,8 +3365,8 @@ async def _try_dispatch_pending_jobs() -> None:
                             job_id=job_id,
                             agent_config=job.get("config_name", "defaults"),
                             vm_image=vm_cfg.get("image"),
-                            cpu_cores=vm_cfg.get("cpu_cores", 2),
-                            memory=vm_cfg.get("memory", "4Gi"),
+                            cpu_cores=vm_cfg.get("cpu_cores", 8),
+                            memory=vm_cfg.get("memory", "16Gi"),
                             description=job.get("description", ""),
                         )
                         if ok:
@@ -3919,8 +3919,8 @@ class VMCreateRequest(BaseModel):
     job_id: str
     agent_config: str = "defaults"
     vm_image: str | None = None
-    cpu_cores: int = Field(2, ge=1, le=16)
-    memory: str = "4Gi"
+    cpu_cores: int = Field(8, ge=1, le=16)
+    memory: str = "16Gi"
     description: str = ""
 
 
@@ -9294,8 +9294,8 @@ async def get_snapshot_stats(request: Request) -> dict[str, Any]:
 class IdeSessionRequest(BaseModel):
     """Request body for starting an IDE session."""
 
-    cpu_cores: int = Field(2, description="VM CPU cores")
-    memory: str = Field("4Gi", description="VM memory")
+    cpu_cores: int = Field(8, description="VM CPU cores")
+    memory: str = Field("16Gi", description="VM memory")
     idle_timeout_minutes: int | None = Field(
         None, description="Override default idle timeout"
     )

@@ -436,7 +436,7 @@ import {UserService} from '../../core/services/user.service';
               <div class="field-row" [class.modified]="vmMemory() !== null">
                 <label class="field-label">{{ 'advanced.labels.vmMemory' | transloco }}</label>
                 <div class="field-control">
-                  <input type="text" class="form-input compact-input" placeholder="4Gi"
+                  <input type="text" class="form-input compact-input" placeholder="16Gi"
                     [ngModel]="vmMemory() ?? resolvedVmMemory()"
                     (ngModelChange)="vmMemory.set($event); emitChange()"
                     [disabled]="disabled()">
@@ -1024,8 +1024,8 @@ export class AdvancedAccordionComponent {
   readonly resolvedKeepRecentMessages = computed(() => (this.r('context_management.keep_recent_messages') ?? 10) as number);
 
   readonly resolvedWorkspaceBackend = computed(() => (this.r('workspace.backend') ?? 'sandbox') as string);
-  readonly resolvedVmCpuCores = computed(() => (this.r('workspace.vm.cpu_cores') ?? 2) as number);
-  readonly resolvedVmMemory = computed(() => (this.r('workspace.vm.memory') ?? '4Gi') as string);
+  readonly resolvedVmCpuCores = computed(() => (this.r('workspace.vm.cpu_cores') ?? 8) as number);
+  readonly resolvedVmMemory = computed(() => (this.r('workspace.vm.memory') ?? '16Gi') as string);
   readonly resolvedMaxReadWords = computed(() => (this.r('workspace.max_read_words') ?? 25000) as number);
   readonly resolvedMaxWriteWords = computed(() => (this.r('workspace.max_write_words') ?? 10000) as number);
   readonly resolvedGitVersioning = computed(() => {
