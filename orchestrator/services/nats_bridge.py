@@ -218,8 +218,8 @@ class NatsBridge:
         job_id: str,
         agent_config: str = "defaults",
         vm_image: Optional[str] = None,
-        cpu_cores: int = 2,
-        memory: str = "4Gi",
+        cpu_cores: int = 8,
+        memory: str = "16Gi",
         description: str = "",
         entity_type: str = "job",
     ) -> bool:

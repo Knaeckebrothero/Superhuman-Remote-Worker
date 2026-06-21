@@ -186,8 +186,8 @@ class IdeSessionService:
     async def start_session(
         self,
         job_id: str,
-        cpu_cores: int = 2,
-        memory: str = "4Gi",
+        cpu_cores: int = 8,
+        memory: str = "16Gi",
         idle_timeout_minutes: Optional[int] = None,
     ) -> dict[str, Any]:
         """Start an IDE session for a job.

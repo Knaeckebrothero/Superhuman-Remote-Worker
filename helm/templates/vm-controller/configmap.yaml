@@ -94,7 +94,12 @@ data:
                         NATS_URL=${NATS_URL}
                         JOB_ID=${JOB_ID}
                         VM_ID=agent-vm-${JOB_ID}
-                    - path: /home/agent-host/.ssh/authorized_keys
+                    # MUST match the base image's sshd AuthorizedKeysFile
+                    # (/etc/ssh/authorized_keys/%u — agent-vm-base
+                    # provision-stage2.sh); ~/.ssh/authorized_keys is never read
+                    # by sshd → "Permission denied (publickey)". Dir pre-created
+                    # 0755 root by the image.
+                    - path: /etc/ssh/authorized_keys/agent-host
                       permissions: '0600'
                       owner: agent-host:agent-host
                       content: |

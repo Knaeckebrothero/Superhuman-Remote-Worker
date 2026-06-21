@@ -54,3 +54,17 @@ spec:
           port: 41641
         - protocol: UDP
           port: 3478
+    # NATS leaf (TCP/4222) — the in-guest management-daemon's registration /
+    # heartbeat / control channel. WITHOUT THIS the daemon can never connect, so
+    # it never publishes `agent.vm.*.register` → the orchestrator never sets
+    # vm_status=ready / ssh_host → VM workspaces silently never reach ready (the
+    # since-day-one gap: the egress carve-out covered DNS + internet + Tailscale
+    # but missed the daemon's own control channel). Scoped to the leaf pod so the
+    # workspace stays otherwise cluster-isolated (Sec-2).
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: nats-leaf
+      ports:
+        - protocol: TCP
+          port: 4222

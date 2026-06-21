@@ -92,8 +92,8 @@ vmController:
   # -- Default VM image — override per-job via the orchestrator API.
   # Defaults to ghcr.io/knaeckebrothero/superhuman-remote-worker-agent-vm-base:v<chart.AppVersion>
   defaultVmImage: ""
-  defaultCpu: 2
-  defaultMemory: "4Gi"
+  defaultCpu: 8
+  defaultMemory: "16Gi"
   vmStorageClass: "local-path"
   vmDiskSize: "20Gi"
   service:

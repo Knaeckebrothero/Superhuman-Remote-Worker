@@ -1344,8 +1344,8 @@ vmController:
   # When empty, defaults to ghcr.io/knaeckebrothero/superhuman-remote-worker-agent-vm-base:v<Chart.AppVersion>
   # so the VM base tracks the chart release. Set explicitly to pin a specific tag.
   defaultVmImage: ""
-  defaultCpu: 2
-  defaultMemory: 4Gi
+  defaultCpu: 8
+  defaultMemory: 16Gi
   # -- CDI DataVolume storage class + size for the VM root disk.
   vmStorageClass: local-path
   vmDiskSize: 20Gi
