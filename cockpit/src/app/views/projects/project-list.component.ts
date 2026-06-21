@@ -7,6 +7,7 @@ import {Project} from '../../core/models/api.model';
 import {SidebarToggleComponent} from '../../shell/sidebar-toggle/sidebar-toggle.component';
 import {TranslocoPipe} from '@jsverse/transloco';
 import {AppSpinnerComponent} from '../../ui/spinner';
+import {ViewportService} from '../../core/services/viewport.service';
 @Component({
   selector: 'app-project-list-page',
   standalone: true,
@@ -15,15 +16,22 @@ import {AppSpinnerComponent} from '../../ui/spinner';
     <div class="page-container">
       <!-- Header -->
       <div class="page-header">
-        <app-sidebar-toggle />
-        <h1 class="page-title">{{ 'projects.title' | transloco }}</h1>
+        <div class="header-left">
+          <app-sidebar-toggle />
+          <h1 class="page-title">{{ 'projects.title' | transloco }}</h1>
+        </div>
         <div class="header-actions">
           <button class="btn btn-primary" (click)="showCreateForm.set(!showCreateForm())">
             {{ (showCreateForm() ? 'projects.cancel' : 'projects.newProject') | transloco }}
           </button>
-          <button class="btn btn-ghost" (click)="refresh()" [disabled]="isLoading()">
-            {{ 'projects.refresh' | transloco }}
-          </button>
+          <!-- Refresh is desktop-only: on mobile the list reloads on navigation
+               and pull-to-refresh works, so the button is dropped (matches the
+               Jobs header) — and removing it keeps the header to one tidy row. -->
+          @if (!viewport.isMobile()) {
+            <button class="btn btn-ghost" (click)="refresh()" [disabled]="isLoading()">
+              {{ 'projects.refresh' | transloco }}
+            </button>
+          }
         </div>
       </div>
 
@@ -103,9 +111,9 @@ import {AppSpinnerComponent} from '../../ui/spinner';
                 <p class="card-desc">{{ truncate(project.description, 120) }}</p>
               }
               <div class="card-footer">
-                <span class="chip">{{ 'projects.jobsCount' | transloco:{ count: project.job_count ?? 0 } }}</span>
-                <span class="chip">{{ 'projects.reposCount' | transloco:{ count: project.repo_count ?? 0 } }}</span>
-                <span class="chip">{{ 'projects.membersCount' | transloco:{ count: project.member_count ?? 0 } }}</span>
+                <span class="chip">{{ ((project.job_count ?? 0) === 1 ? 'projects.jobsCountOne' : 'projects.jobsCount') | transloco:{ count: project.job_count ?? 0 } }}</span>
+                <span class="chip">{{ ((project.repo_count ?? 0) === 1 ? 'projects.reposCountOne' : 'projects.reposCount') | transloco:{ count: project.repo_count ?? 0 } }}</span>
+                <span class="chip">{{ ((project.member_count ?? 0) === 1 ? 'projects.membersCountOne' : 'projects.membersCount') | transloco:{ count: project.member_count ?? 0 } }}</span>
               </div>
             </div>
           }
@@ -129,6 +137,13 @@ import {AppSpinnerComponent} from '../../ui/spinner';
       margin-bottom: 20px;
       flex-wrap: wrap;
       gap: 12px;
+    }
+
+    .header-left {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      min-width: 0;
     }
 
     .page-title {
@@ -287,6 +302,7 @@ export class ProjectListPageComponent implements OnInit {
   private readonly userService = inject(UserService);
   private readonly session = inject(SessionService);
   private readonly router = inject(Router);
+  protected readonly viewport = inject(ViewportService);
 
   readonly projects = signal<Project[]>([]);
   readonly isLoading = signal(false);
