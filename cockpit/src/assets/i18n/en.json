@@ -327,6 +327,7 @@
       "resumeJob": "Resume from checkpoint",
       "confirmDelete": "Click again to confirm deletion",
       "deleteJob": "Delete job",
+      "moreActions": "More actions",
       "promoteJob": "Promote to project",
       "exportToCloud": "Copy this job's deliverables to a shared cloud folder and open it",
       "alreadyExported": "Already exported. Delete the cloud folder to re-export.",

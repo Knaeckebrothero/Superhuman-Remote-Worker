@@ -13,7 +13,10 @@ import {AppChipComponent} from '../../ui/chip';
 import {AppInputComponent} from '../../ui/input';
 import {AppSpinnerComponent} from '../../ui/spinner';
 import {AppIconComponent} from '../../ui/icon';
+import {AppIconButtonComponent} from '../../ui/icon-button';
 import {AppDialogComponent} from '../../ui/dialog';
+import {AppMenuComponent, AppMenuItemComponent, AppMenuTriggerDirective} from '../../ui/menu';
+import {ViewportService} from '../../core/services/viewport.service';
 type StatusFilter = 'all' | JobStatus;
 
 /** A row in the hierarchical job list. */
@@ -38,7 +41,11 @@ interface JobRow {
     AppInputComponent,
     AppSpinnerComponent,
     AppIconComponent,
+    AppIconButtonComponent,
     AppDialogComponent,
+    AppMenuComponent,
+    AppMenuItemComponent,
+    AppMenuTriggerDirective,
   ],
   template: `
     <div class="job-list-container">
@@ -75,14 +82,19 @@ interface JobRow {
               {{ 'jobs.reviewQueue' | transloco:{ count: pendingReviewCount() } }}
             </app-button>
           }
-          <app-button
-            variant="secondary"
-            size="sm"
-            [disabled]="isLoading()"
-            (clicked)="refresh()"
-          >
-            {{ 'jobs.refresh' | transloco }}
-          </app-button>
+          <!-- Refresh is desktop-only: on mobile the list auto-refreshes every
+               30s (and the browser's pull-to-refresh works), so the button is
+               dropped to keep the header to the two actions that matter. -->
+          @if (!viewport.isMobile()) {
+            <app-button
+              variant="secondary"
+              size="sm"
+              [disabled]="isLoading()"
+              (clicked)="refresh()"
+            >
+              {{ 'jobs.refresh' | transloco }}
+            </app-button>
+          }
           <app-button
             variant="primary"
             size="sm"
@@ -190,6 +202,53 @@ interface JobRow {
                     {{ formatDate(row.job.created_at) }}
                   </td>
                   <td class="actions-cell">
+                    @if (viewport.isMobile()) {
+                      <!-- Mobile: the whole action set lives in an overflow menu, so
+                           the cell is just the kebab and the prompt gets the width. -->
+                      <app-icon-button
+                        size="sm"
+                        [ariaLabel]="'jobs.tooltip.moreActions' | transloco"
+                        [appMenuTrigger]="rowMenu"
+                        menuPlacement="bottom-end"
+                        (click)="$event.stopPropagation()"
+                      >
+                        <app-icon size="sm">more_vert</app-icon>
+                      </app-icon-button>
+                      <app-menu #rowMenu>
+                        <app-menu-item (activated)="viewJob(row.job.id)">{{ 'jobs.action.view' | transloco }}</app-menu-item>
+                        @if (row.job.status === 'pending_review') {
+                          <app-menu-item (activated)="reviewJob(row.job.id)">{{ 'jobs.action.review' | transloco }}</app-menu-item>
+                        } @else if (row.job.status === 'processing') {
+                          <app-menu-item (activated)="pauseJob(row.job.id)">{{ 'jobs.action.pause' | transloco }}</app-menu-item>
+                        } @else if (row.job.status === 'failed' || row.job.status === 'cancelled' || row.job.status === 'paused' || row.job.status === 'created') {
+                          <app-menu-item (activated)="resumeJob(row.job.id)">{{ 'jobs.action.resume' | transloco }}</app-menu-item>
+                        }
+                        @if (getWorkspaceUrl(row.job)) {
+                          <app-menu-item (activated)="openWorkspace(row.job)">{{ 'jobs.action.workspace' | transloco }}</app-menu-item>
+                        }
+                        @if (canOpenIde(row.job)) {
+                          <app-menu-item (activated)="openIde(row.job.id)">
+                            @if (ideLoadingJobIds().has(row.job.id)) {
+                              {{ 'jobs.action.starting' | transloco }}
+                            } @else {
+                              {{ 'jobs.action.ide' | transloco }}
+                            }
+                          </app-menu-item>
+                        }
+                        @if (row.job.status !== 'completed' && row.job.status !== 'cancelled') {
+                          <app-menu-item (activated)="askCancel(row.job)">{{ 'jobs.action.cancel' | transloco }}</app-menu-item>
+                        }
+                        @if (row.job.status === 'completed' && !row.job.project_id) {
+                          <app-menu-item (activated)="togglePromote(row.job.id)">{{ 'jobs.action.promote' | transloco }}</app-menu-item>
+                        }
+                        @if (row.job.status === 'completed' && row.job.cloud_review_mode === 'open_folder' && !row.job.exported_at) {
+                          <app-menu-item (activated)="exportJobToSharedFolder(row.job.id)">{{ 'jobs.action.exportToCloud' | transloco }}</app-menu-item>
+                        }
+                        @if (row.job.status !== 'processing' && row.job.status !== 'paused' && row.job.status !== 'reviewing' && row.job.status !== 'waiting') {
+                          <app-menu-item tone="danger" (activated)="askDelete(row.job)">{{ 'jobs.action.delete' | transloco }}</app-menu-item>
+                        }
+                      </app-menu>
+                    } @else {
                     <app-button
                       variant="info"
                       size="sm"
@@ -304,6 +363,7 @@ interface JobRow {
                       >
                         {{ 'jobs.action.delete' | transloco }}
                       </app-button>
+                    }
                     }
                   </td>
                 </tr>
@@ -759,19 +819,27 @@ interface JobRow {
           table-layout: fixed;
         }
 
-        /* Give actions more width so the buttons pack into ~2 rows instead of 3
-           (shorter rows, more jobs per screen). The prompt can spare it now that
-           it wraps to two lines. */
+        /* Mobile actions are a single "⋯" kebab (View + everything else live
+           inside its menu), so the column only needs room for one icon button.
+           That, plus a slightly tighter status column, hands the bulk of the
+           width to the job description. */
         .col-prompt {
-          width: 33%;
+          width: 62%;
         }
 
         .col-status {
-          width: 25%;
+          width: 24%;
         }
 
         .col-actions {
-          width: 42%;
+          width: 14%;
+        }
+
+        /* In the narrower status column, let a secondary badge (delegation
+           "N children", snapshot "S", child "#N") wrap under the status pill
+           rather than drift right toward the kebab. */
+        .status-cell-inner {
+          flex-wrap: wrap;
         }
 
         /* Job description: the only identifier on mobile (id + created columns
@@ -788,31 +856,35 @@ interface JobRow {
           -webkit-box-orient: vertical;
         }
 
-        /* Actions: left-aligned wrapping group. Right-alignment (the base rule)
-           is what made wrapped rows ragged — each row right-aligned to a
-           different left edge, producing the "staircase". Left-aligned rows
-           share one left edge and read as a tidy block. */
+        /* Actions: a single kebab pinned to the right edge — the standard
+           overflow-menu position, and it pairs with the menu's bottom-end
+           placement (panel right edge aligns under the trigger). */
         .actions-cell {
-          white-space: normal;
-          text-align: left;
+          text-align: right;
         }
 
-        .actions-cell app-button {
-          margin: 0 4px 4px 0;
-        }
-
-        .actions-cell app-button + app-button {
-          margin-left: 0;
+        .actions-cell app-icon-button {
+          vertical-align: middle;
         }
 
         .header-bar {
           padding: 8px;
-          gap: 6px;
+          gap: 6px 8px;
+        }
+
+        /* One-line title bar: the title and the action cluster share row 1 (the
+           actions are pushed right by their margin-left:auto), and the filter
+           chips drop to row 2 via order:1 below. */
+        .snapshot-stats {
+          /* Low signal on a phone — often just "0 snapshots". Reclaim the space. */
+          display: none;
         }
 
         /* Filter chips: a single horizontally-scrollable row instead of wrapping
-           to three rows (~102px). Takes a full header line and scrolls sideways. */
+           to three rows (~102px). order:1 puts it on its own line below the
+           title + actions; it then scrolls sideways. */
         .filter-chips {
+          order: 1;
           gap: 6px;
           flex-wrap: nowrap;
           flex-basis: 100%;
@@ -820,6 +892,12 @@ interface JobRow {
           -webkit-overflow-scrolling: touch;
           scrollbar-width: none;
           padding-bottom: 2px;
+          /* Soft-fade the right edge so a partially-visible chip reads as
+             "swipe for more" rather than looking cut off at the screen edge.
+             The mask is fixed to the strip box (not the content), so it always
+             feathers the rightmost ~24px of the visible row. */
+          -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 24px), transparent);
+          mask-image: linear-gradient(to right, #000 calc(100% - 24px), transparent);
         }
 
         .filter-chips::-webkit-scrollbar {
@@ -828,6 +906,29 @@ interface JobRow {
 
         .filter-chips app-chip {
           flex-shrink: 0;
+        }
+
+        /* Trailing scroll space so that, when scrolled fully right, the last
+           chip sits past the fade zone and stays fully legible (otherwise the
+           end of the list would look faded too). */
+        .filter-chips app-chip:last-child {
+          margin-right: 28px;
+        }
+
+        /* The global mobile rule gives every selectable chip a 44px touch target,
+           which is chunky for a scrollable filter strip. Scope a more compact
+           size to this strip so more chips fit on screen: shorter, tighter
+           padding, slightly smaller text. (::ng-deep reaches the chip's inner
+           button; the .filter-chips prefix keeps it local to the Jobs header.) */
+        .filter-chips ::ng-deep .app-chip__btn[data-selectable] {
+          min-height: 0;
+          height: 30px;
+          padding: 0 7px;
+          font-size: 10px;
+        }
+
+        .filter-chips .count {
+          font-size: 9px;
         }
 
         .table-container {
@@ -843,6 +944,7 @@ export class JobListComponent implements OnInit, OnDestroy {
   private readonly userService = inject(UserService);
   private readonly transloco = inject(TranslocoService);
   private readonly router = inject(Router);
+  protected readonly viewport = inject(ViewportService);
 
   readonly jobs = signal<JobSummary[]>([]);
   readonly isLoading = signal(false);
