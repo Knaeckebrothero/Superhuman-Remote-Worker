@@ -1278,6 +1278,7 @@
   "datasources": {
     "title": "Datenquellen",
     "new": "Neu",
+    "refresh": "Aktualisieren",
     "dismiss": "Schließen",
     "filter": {
       "all": "Alle",
@@ -1393,7 +1394,8 @@
       "scopeGlobal": "Global",
       "testTooltip": "Verbindung testen",
       "editTooltip": "Bearbeiten",
-      "deleteTooltip": "Löschen"
+      "deleteTooltip": "Löschen",
+      "moreActions": "Weitere Aktionen"
     },
     "messages": {
       "repoNoAuthConfirm": "Keine Anmeldeinformationen angegeben.\n\nDieses Repository wird nur lesend geklont — der Agent kann den Code durchsuchen und lesen, aber keine Änderungen pushen.\n\nFortfahren?",
