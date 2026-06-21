@@ -1,5 +1,7 @@
 # Agent Skills — Slice 4 (Script-Bearing Skills) Implementation Plan
 
+> **✅ COMPLETE — shipped on `develop` 2026-06-21.** All 3 tasks executed inline; 38 skill unit tests green; ruff clean. Commits: `3649b4ad` (`use_skill` note), `bf56d0ee` (bundled `word-count`), `60860bc2` (docs → SHIPPED). **k3d DoD passed** via the worker auto-upgrade path: a `virtual` `gemma-4-moe` job read the note, called `request_workspace_upgrade`, auto-upgraded virtual→sandbox, the seed carried `sample.txt` + `skills/word-count/`, and `python skills/word-count/scripts/wordcount.py sample.txt` → `lines=2 words=9 chars=44`. **As-built deltas vs this plan:** (a) the L1 "runs scripts" marker stayed deferred; (b) the `word-count` frontmatter quotes its `color:` (matches the sibling bundled skills, avoids a YAML-comment null) and adds `display_name`/`tags`; (c) the DoD ran via the **worker job** auto-upgrade rather than a cockpit **session** human-click — the session human-approval upgrade was already k3d-verified when [[workspace_tier_upgrade]] shipped, so only the new seam (the note + bundled skill triggering the upgrade) needed proving.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make a skill's bundled `scripts/` runnable end-to-end — directly on shell-capable tiers, and via the already-built workspace-tier-upgrade HITL flow on lite (`virtual`) tiers — with a graceful-degradation note so a shell-less agent still gets the skill's prose.
@@ -43,7 +45,7 @@
 - Modify: `src/tools/workspace/skills.py`
 - Test: `tests/test_skill_tool.py`
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Append to `tests/test_skill_tool.py`:
 
@@ -104,12 +106,12 @@ def test_prompt_only_skill_on_lite_tier_has_no_note(tmp_path):
     assert "request_workspace_upgrade" not in out  # no scripts/ → no note
 ```
 
-- [ ] **Step 2: Run the new tests to verify they fail**
+- [x] **Step 2: Run the new tests to verify they fail**
 
 Run: `pytest tests/test_skill_tool.py -v -k "note or shell or prompt_only"`
 Expected: the 3 new tests FAIL (`test_script_skill_with_shell_has_no_note` and `test_prompt_only...` may pass trivially since no note exists yet; `test_script_skill_on_lite_tier_appends_upgrade_note` FAILS on the missing `request_workspace_upgrade` / `cannot be executed` substrings).
 
-- [ ] **Step 3: Implement the note**
+- [x] **Step 3: Implement the note**
 
 In `src/tools/workspace/skills.py`:
 
@@ -165,12 +167,12 @@ In `src/tools/workspace/skills.py`:
             return f"[skill: {skill_name}]\n\n{body}{_script_availability_note(skill_name)}"
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `pytest tests/test_skill_tool.py -v`
 Expected: all tests PASS (the 4 original + 3 new). The original `test_use_skill_returns_body` still passes — its skill has no `scripts/`, so no note.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/tools/workspace/skills.py tests/test_skill_tool.py
@@ -186,7 +188,7 @@ git commit -m "feat(skills): use_skill notes script-bearing skills need a worksp
 - Create: `config/skills/word-count/scripts/wordcount.py`
 - Test: `tests/test_bundled_skills.py`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Create `tests/test_bundled_skills.py`:
 
@@ -216,12 +218,12 @@ def test_bundled_word_count_skill_is_valid_and_script_bearing():
     assert "scripts/wordcount.py" in md
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `pytest tests/test_bundled_skills.py -v`
 Expected: FAIL with `FileNotFoundError` (the `word-count` skill does not exist yet).
 
-- [ ] **Step 3: Create the bundled skill**
+- [x] **Step 3: Create the bundled skill**
 
 Create `config/skills/word-count/SKILL.md`:
 
@@ -277,17 +279,17 @@ if __name__ == "__main__":
     raise SystemExit(main(sys.argv))
 ```
 
-- [ ] **Step 4: Run the test to verify it passes**
+- [x] **Step 4: Run the test to verify it passes**
 
 Run: `pytest tests/test_bundled_skills.py -v`
 Expected: PASS.
 
-- [ ] **Step 5: Sanity-check the script runs (stdlib-only, output-only)**
+- [x] **Step 5: Sanity-check the script runs (stdlib-only, output-only)**
 
 Run: `printf 'one two\nthree\n' > /tmp/wc.txt && python config/skills/word-count/scripts/wordcount.py /tmp/wc.txt`
 Expected: `lines=2 words=3 chars=14`
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add config/skills/word-count/SKILL.md config/skills/word-count/scripts/wordcount.py tests/test_bundled_skills.py
@@ -303,11 +305,11 @@ git commit -m "feat(skills): bundle word-count, the first script-bearing example
 
 This task has no unit code — it is the live-cluster proof (mirrors how Slices 2 & 3 were signed off) followed by the as-built doc flip. Requires the local tilt/k3d stack (cluster `srw`); see `docs/features/local_tilt_dev_stack_stinkpad.md` and the dispatch playbook in `k3d_verify_runtime_in_deployed_images`.
 
-- [ ] **Step 1: Bring up local k3d with the new image**
+- [x] **Step 1: Bring up local k3d with the new image**
 
 Ensure the agent/orchestrator images include this branch (tilt rebuild), and that an LLM provider is seeded (readiness gate). Confirm `config/skills/word-count/` is in the agent image.
 
-- [ ] **Step 2: Drive the full loop on a `virtual` session**
+- [x] **Step 2: Drive the full loop on a `virtual` session**
 
 1. Start a persistent session pinned to the `virtual` tier (thread `workspace.backend = virtual`).
 2. In the session: write a short text file with the file tools, then ask for its **exact** word count.
@@ -315,7 +317,7 @@ Ensure the agent/orchestrator images include this branch (tilt rebuild), and tha
 4. Approve the upgrade the way the tier-upgrade smoke test does — cockpit "Upgrade workspace", or send the session WS `upgrade-to-workspace` message / hit the orchestrator `upgrade-to-workspace` endpoint — simulating the human click.
 5. After the hot-swap: the agent runs `python skills/word-count/scripts/wordcount.py <file>` via `run_command` and reports the counts.
 
-- [ ] **Step 3: Assert the evidence**
+- [x] **Step 3: Assert the evidence**
 
 Confirm (cockpit transcript or Mongo `srw_logs` per the playbook):
 - the `use_skill` result carried the degradation note (the `request_workspace_upgrade` affordance);
@@ -325,13 +327,13 @@ Confirm (cockpit transcript or Mongo `srw_logs` per the playbook):
 
 If any step fails, STOP and fix before flipping the docs (per executing-plans: don't force through a red DoD).
 
-- [ ] **Step 4: Flip the feature doc to shipped**
+- [x] **Step 4: Flip the feature doc to shipped**
 
 In `docs/features/agent_skills.md`:
 - Status banner: change the "Next: Slice 4 …" sentence to mark Slice 4 **shipped** with the date and a one-line as-built.
 - Slice 4 entry: change "design settled 2026-06-21" to "**✅ SHIPPED (`develop`, <date>)**" and append the DoD-met note (the k3d evidence from Step 3, plus: net-new code was the `use_skill` note + the bundled `word-count` example; no grants/upgrade/orchestrator changes).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add docs/features/agent_skills.md

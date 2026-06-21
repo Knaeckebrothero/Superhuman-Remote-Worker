@@ -48,6 +48,15 @@ ran `/upgrade-workspace` → a sandbox pod spawned, 49 files were seeded
 virtual→pod over SFTP, the backend hot-swapped, the toolset re-derived (44→55,
 shell re-admitted), the tier persisted, the conversation never dropped, and the
 agent then ran a shell command on the upgraded pod reading a seeded marker.
+
+**Independent re-exercise (2026-06-21):** the [[agent_skills]] Slice 4 DoD drove
+the **worker** `virtual → sandbox` auto-upgrade end-to-end from a new trigger — a
+script-bearing skill's `use_skill` note led a real `gemma-4-moe` job to call
+`request_workspace_upgrade`; the freeze auto-upgraded the job in-process, the
+seed carried the skill (`skills/word-count/`) plus the agent's `sample.txt` into
+the sandbox, and the bundled script ran there (`lines=2 words=9 chars=44`). A
+second consumer confirming Phase 3 W1 keeps working.
+
 **Prerequisite fixed:** the smoke test surfaced that persistent `virtual`
 sessions couldn't boot at all (a gap in the [[no_workspace_agent_mode]] session
 wiring — `_attach_session` polled for a workspace pod before reading the lite
