@@ -23,6 +23,7 @@ from src.api.persistent_app import (
     _handle_archive,
     _handle_compact,
     _handle_vm_upgrade,
+    _handle_workspace_upgrade,
     _loop_persist_message,
     _persist_one_message,
     _poll_vm_ready,
@@ -32,6 +33,7 @@ from src.api.persistent_app import (
     _save_message,
     _save_turn_ai_messages,
     _session_backend_is_lite,
+    _upgrade_already_satisfied,
     _ws_send,
     create_persistent_app,
 )
@@ -2077,222 +2079,123 @@ class TestWSMessageRouting:
 # ---------------------------------------------------------------------------
 
 
+class TestUpgradeAlreadySatisfied:
+    """Pure tier-check that gates the live workspace upgrade (Q8).
+
+    Both sandbox and vm are RemoteBackend (supports_shell True), so the check
+    must use sudo_action to tell them apart — otherwise sandbox→vm wrongly
+    short-circuits as 'already supports a shell' (the Q8 bug this fixes).
+    """
+
+    def test_no_shell_never_satisfied(self):
+        lite = SimpleNamespace(supports_shell=False)
+        assert _upgrade_already_satisfied(lite, "sandbox") is False
+        assert _upgrade_already_satisfied(lite, "vm") is False
+
+    def test_sandbox_satisfies_sandbox_not_vm(self):
+        sandbox = SimpleNamespace(supports_shell=True, sudo_action="freeze")
+        assert _upgrade_already_satisfied(sandbox, "sandbox") is True
+        # The fix: a sandbox does NOT satisfy a vm target — it must proceed.
+        assert _upgrade_already_satisfied(sandbox, "vm") is False
+
+    def test_vm_satisfies_both(self):
+        vm = SimpleNamespace(supports_shell=True, sudo_action="allow")
+        assert _upgrade_already_satisfied(vm, "sandbox") is True
+        assert _upgrade_already_satisfied(vm, "vm") is True
+
+    def test_missing_sudo_action_is_not_vm(self):
+        # A shell backend without a sudo_action attr can't be a vm.
+        plain = SimpleNamespace(supports_shell=True)
+        assert _upgrade_already_satisfied(plain, "vm") is False
+        assert _upgrade_already_satisfied(plain, "sandbox") is True
+
+
 class TestHandleVmUpgrade:
+    """The legacy ``upgrade-to-vm`` accept is now a thin alias (Q8)."""
+
     @pytest.mark.asyncio
-    async def test_sends_failed_when_session_none(self):
+    async def test_delegates_to_workspace_upgrade_vm(self):
         ws = AsyncMock()
-        with (
-            patch("src.api.persistent_app._session", None),
-            patch("src.api.persistent_app._orchestrator_client", MagicMock()),
-            patch("src.api.persistent_app._thread_id", "tid"),
-        ):
+        with patch(
+            "src.api.persistent_app._handle_workspace_upgrade",
+            new_callable=AsyncMock,
+        ) as mock_handler:
             await _handle_vm_upgrade(ws)
 
-        failed_calls = [
+        mock_handler.assert_awaited_once_with(ws, target_tier="vm")
+
+
+# ---------------------------------------------------------------------------
+# 3.16 _handle_workspace_upgrade() — vm path (Q7 teardown + Q8 sandbox→vm)
+# ---------------------------------------------------------------------------
+
+
+class TestHandleWorkspaceUpgradeVm:
+    def _session_with_backend(self, backend):
+        sess = MagicMock()
+        sess.config.extra = {"shell": {}}
+        sess.workspace_manager.backend = backend
+        return sess
+
+    @pytest.mark.asyncio
+    async def test_short_circuits_when_already_vm(self):
+        """A session already on a vm doesn't re-provision."""
+        ws = AsyncMock()
+        client = AsyncMock()
+        backend = SimpleNamespace(supports_shell=True, sudo_action="allow")
+        with (
+            patch(
+                "src.api.persistent_app._session",
+                self._session_with_backend(backend),
+            ),
+            patch("src.api.persistent_app._orchestrator_client", client),
+            patch("src.api.persistent_app._thread_id", "tid"),
+        ):
+            await _handle_workspace_upgrade(ws, target_tier="vm")
+
+        client.request_thread_workspace_upgrade.assert_not_called()
+        complete = [
             c[0][0]
             for c in ws.send_json.call_args_list
-            if c[0][0].get("method") == "vm_upgrade.failed"
+            if c[0][0].get("method") == "workspace_upgrade.complete"
         ]
-        assert len(failed_calls) == 1
+        assert len(complete) == 1
+        assert "vm" in complete[0]["params"]["message"]
 
     @pytest.mark.asyncio
-    async def test_sends_failed_when_client_none(self):
+    async def test_sandbox_to_vm_proceeds_and_aborts_on_timeout(self):
+        """sandbox→vm must NOT short-circuit (Q8); a poll timeout tears the
+        half-provisioned VM down instead of leaking it (Q7)."""
         ws = AsyncMock()
+        client = AsyncMock()
+        client.request_thread_workspace_upgrade.return_value = True
+        sandbox = SimpleNamespace(supports_shell=True, sudo_action="freeze")
         with (
-            patch("src.api.persistent_app._session", MagicMock()),
-            patch("src.api.persistent_app._orchestrator_client", None),
-            patch("src.api.persistent_app._thread_id", "tid"),
-        ):
-            await _handle_vm_upgrade(ws)
-
-        failed_calls = [
-            c[0][0]
-            for c in ws.send_json.call_args_list
-            if c[0][0].get("method") == "vm_upgrade.failed"
-        ]
-        assert len(failed_calls) == 1
-
-    @pytest.mark.asyncio
-    async def test_sends_started_before_provisioning(self):
-        """vm_upgrade.started sent before any provisioning attempt."""
-        ws = AsyncMock()
-        mock_client = AsyncMock()
-        mock_client.request_thread_vm_upgrade.return_value = False
-
-        with (
-            patch("src.api.persistent_app._session", MagicMock()),
-            patch("src.api.persistent_app._orchestrator_client", mock_client),
-            patch("src.api.persistent_app._thread_id", "tid"),
-        ):
-            await _handle_vm_upgrade(ws)
-
-        # First WS send should be vm_upgrade.started
-        first_call = ws.send_json.call_args_list[0][0][0]
-        assert first_call["method"] == "vm_upgrade.started"
-
-    @pytest.mark.asyncio
-    async def test_sends_failed_on_rejected(self):
-        """vm_upgrade.failed when orchestrator rejects request."""
-        ws = AsyncMock()
-        mock_client = AsyncMock()
-        mock_client.request_thread_vm_upgrade.return_value = False
-
-        with (
-            patch("src.api.persistent_app._session", MagicMock()),
-            patch("src.api.persistent_app._orchestrator_client", mock_client),
-            patch("src.api.persistent_app._thread_id", "tid"),
-        ):
-            await _handle_vm_upgrade(ws)
-
-        failed_calls = [
-            c[0][0]
-            for c in ws.send_json.call_args_list
-            if c[0][0].get("method") == "vm_upgrade.failed"
-        ]
-        assert len(failed_calls) == 1
-        assert "rejected" in failed_calls[0]["params"]["reason"].lower()
-
-    @pytest.mark.asyncio
-    async def test_sends_failed_on_poll_timeout(self):
-        """vm_upgrade.failed when VM doesn't become ready."""
-        ws = AsyncMock()
-        mock_client = AsyncMock()
-        mock_client.request_thread_vm_upgrade.return_value = True
-
-        with (
-            patch("src.api.persistent_app._session", MagicMock()),
-            patch("src.api.persistent_app._orchestrator_client", mock_client),
-            patch("src.api.persistent_app._thread_id", "tid"),
-            patch("src.api.persistent_app._poll_vm_ready", return_value=None),
-        ):
-            await _handle_vm_upgrade(ws)
-
-        failed_calls = [
-            c[0][0]
-            for c in ws.send_json.call_args_list
-            if c[0][0].get("method") == "vm_upgrade.failed"
-        ]
-        assert len(failed_calls) == 1
-
-    @pytest.mark.asyncio
-    async def test_successful_upgrade_sends_complete(self):
-        """vm_upgrade.complete sent after successful backend swap."""
-        ws = AsyncMock()
-        mock_client = AsyncMock()
-        mock_client.request_thread_vm_upgrade.return_value = True
-
-        mock_session = MagicMock()
-        mock_session.config.extra = {"shell": {}}
-        mock_session.shell_manager = MagicMock()
-        mock_session.shell_manager.sudo_action = "freeze"
-
-        mock_backend = MagicMock()
-
-        with (
-            patch("src.api.persistent_app._session", mock_session),
-            patch("src.api.persistent_app._orchestrator_client", mock_client),
+            patch(
+                "src.api.persistent_app._session",
+                self._session_with_backend(sandbox),
+            ),
+            patch("src.api.persistent_app._orchestrator_client", client),
             patch("src.api.persistent_app._thread_id", "tid"),
             patch(
                 "src.api.persistent_app._poll_vm_ready",
-                return_value={
-                    "ssh_host": "10.0.0.5",
-                    "ssh_port": 22,
-                },
-            ),
-            patch(
-                "src.api.persistent_app.RemoteBackend",
-                return_value=mock_backend,
-                create=True,
+                new_callable=AsyncMock,
+                return_value=None,
             ),
         ):
-            # Patch the import inside the function
-            import sys
+            await _handle_workspace_upgrade(ws, target_tier="vm")
 
-            mock_remote_mod = MagicMock()
-            mock_remote_mod.RemoteBackend.return_value = mock_backend
-            with patch.dict(sys.modules, {"src.core.backends.remote": mock_remote_mod}):
-                await _handle_vm_upgrade(ws)
-
-        complete_calls = [
+        # Proceeded past the short-circuit (Q8) ...
+        client.request_thread_workspace_upgrade.assert_awaited_once()
+        # ... and on poll failure tore the VM down (Q7) ...
+        client.abort_thread_vm_upgrade.assert_awaited_once_with("tid")
+        # ... and reported failure.
+        failed = [
             c[0][0]
             for c in ws.send_json.call_args_list
-            if c[0][0].get("method") == "vm_upgrade.complete"
+            if c[0][0].get("method") == "workspace_upgrade.failed"
         ]
-        assert len(complete_calls) == 1
-        assert complete_calls[0]["params"]["ssh_host"] == "10.0.0.5"
-
-    @pytest.mark.asyncio
-    async def test_sets_sudo_action_to_allow(self):
-        """After upgrade, shell_manager.sudo_action set to 'allow'."""
-        ws = AsyncMock()
-        mock_client = AsyncMock()
-        mock_client.request_thread_vm_upgrade.return_value = True
-
-        mock_session = MagicMock()
-        mock_session.config.extra = {"shell": {}}
-        mock_session.shell_manager = MagicMock()
-        mock_session.shell_manager.sudo_action = "freeze"
-
-        mock_backend = MagicMock()
-
-        import sys
-
-        mock_remote_mod = MagicMock()
-        mock_remote_mod.RemoteBackend.return_value = mock_backend
-
-        with (
-            patch("src.api.persistent_app._session", mock_session),
-            patch("src.api.persistent_app._orchestrator_client", mock_client),
-            patch("src.api.persistent_app._thread_id", "tid"),
-            patch(
-                "src.api.persistent_app._poll_vm_ready",
-                return_value={
-                    "ssh_host": "host",
-                    "ssh_port": 22,
-                },
-            ),
-            patch.dict(sys.modules, {"src.core.backends.remote": mock_remote_mod}),
-        ):
-            await _handle_vm_upgrade(ws)
-
-        assert mock_session.shell_manager.sudo_action == "allow"
-
-    @pytest.mark.asyncio
-    async def test_exception_sends_failed(self):
-        """Exception during upgrade sends vm_upgrade.failed."""
-        ws = AsyncMock()
-        mock_client = AsyncMock()
-        mock_client.request_thread_vm_upgrade.return_value = True
-
-        mock_session = MagicMock()
-        mock_session.config.extra = {"shell": {}}
-
-        import sys
-
-        mock_remote_mod = MagicMock()
-        mock_remote_mod.RemoteBackend.side_effect = RuntimeError("connect failed")
-
-        with (
-            patch("src.api.persistent_app._session", mock_session),
-            patch("src.api.persistent_app._orchestrator_client", mock_client),
-            patch("src.api.persistent_app._thread_id", "tid"),
-            patch(
-                "src.api.persistent_app._poll_vm_ready",
-                return_value={
-                    "ssh_host": "host",
-                    "ssh_port": 22,
-                },
-            ),
-            patch.dict(sys.modules, {"src.core.backends.remote": mock_remote_mod}),
-        ):
-            await _handle_vm_upgrade(ws)
-
-        failed_calls = [
-            c[0][0]
-            for c in ws.send_json.call_args_list
-            if c[0][0].get("method") == "vm_upgrade.failed"
-        ]
-        assert len(failed_calls) == 1
+        assert len(failed) == 1
 
 
 # ---------------------------------------------------------------------------
