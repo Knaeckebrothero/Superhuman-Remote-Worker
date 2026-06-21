@@ -1226,6 +1226,7 @@
     "colType": "Type",
     "colSource": "Source",
     "colActions": "Actions",
+    "moreActions": "More actions",
     "edit": "Edit",
     "duplicate": "Duplicate",
     "export": "Export",

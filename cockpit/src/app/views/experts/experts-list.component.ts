@@ -10,6 +10,8 @@ import {AppChipComponent} from '../../ui/chip';
 import {AppIconComponent} from '../../ui/icon';
 import {AppSpinnerComponent} from '../../ui/spinner';
 import {AppDialogComponent} from '../../ui/dialog';
+import {AppMenuComponent, AppMenuItemComponent, AppMenuTriggerDirective} from '../../ui/menu';
+import {ViewportService} from '../../core/services/viewport.service';
 
 export type ExpertTypeFilter = 'all' | 'worker' | 'session';
 
@@ -35,6 +37,9 @@ export function isBundled(e: Expert): boolean {
     AppIconComponent,
     AppSpinnerComponent,
     AppDialogComponent,
+    AppMenuComponent,
+    AppMenuItemComponent,
+    AppMenuTriggerDirective,
   ],
   template: `
     <div class="experts">
@@ -90,45 +95,78 @@ export function isBundled(e: Expert): boolean {
                   }
                 </td>
                 <td class="actions-col">
-                  @if (!bundled(e)) {
+                  @if (viewport.isMobile()) {
+                    <!-- Mobile: collapse the row actions into a ⋯ overflow menu so the
+                         cell is just the kebab and the table fits without h-scroll
+                         (mirrors the Jobs / Data Sources lists). -->
+                    <app-icon-button
+                      variant="ghost"
+                      size="sm"
+                      [ariaLabel]="'experts.moreActions' | transloco"
+                      [appMenuTrigger]="rowMenu"
+                      menuPlacement="bottom-end"
+                    >
+                      <app-icon size="sm">more_vert</app-icon>
+                    </app-icon-button>
+                    <app-menu #rowMenu>
+                      @if (!bundled(e)) {
+                        <app-menu-item (activated)="edit(e)">
+                          {{ 'experts.edit' | transloco }}
+                        </app-menu-item>
+                      }
+                      <app-menu-item (activated)="duplicate(e)">
+                        {{ 'experts.duplicate' | transloco }}
+                      </app-menu-item>
+                      <app-menu-item (activated)="exportExpert(e)">
+                        {{ 'experts.export' | transloco }}
+                      </app-menu-item>
+                      @if (!bundled(e)) {
+                        <app-menu-item tone="danger" (activated)="askDelete(e)">
+                          {{ 'experts.delete' | transloco }}
+                        </app-menu-item>
+                      }
+                    </app-menu>
+                  } @else {
+                    @if (!bundled(e)) {
+                      <app-icon-button
+                        size="sm"
+                        variant="ghost"
+                        [ariaLabel]="'experts.edit' | transloco"
+                        [tooltip]="'experts.edit' | transloco"
+                        (clicked)="edit(e)"
+                      >
+                        <app-icon size="sm">edit</app-icon>
+                      </app-icon-button>
+                    }
                     <app-icon-button
                       size="sm"
                       variant="ghost"
-                      [ariaLabel]="'experts.edit' | transloco"
-                      [tooltip]="'experts.edit' | transloco"
-                      (clicked)="edit(e)"
+                      [ariaLabel]="'experts.duplicate' | transloco"
+                      [tooltip]="'experts.duplicate' | transloco"
+                      (clicked)="duplicate(e)"
                     >
-                      <app-icon size="sm">edit</app-icon>
+                      <app-icon size="sm">content_copy</app-icon>
                     </app-icon-button>
-                  }
-                  <app-icon-button
-                    size="sm"
-                    variant="ghost"
-                    [ariaLabel]="'experts.duplicate' | transloco"
-                    [tooltip]="'experts.duplicate' | transloco"
-                    (clicked)="duplicate(e)"
-                  >
-                    <app-icon size="sm">content_copy</app-icon>
-                  </app-icon-button>
-                  <app-icon-button
-                    size="sm"
-                    variant="ghost"
-                    [ariaLabel]="'experts.export' | transloco"
-                    [tooltip]="'experts.export' | transloco"
-                    (clicked)="exportExpert(e)"
-                  >
-                    <app-icon size="sm">download</app-icon>
-                  </app-icon-button>
-                  @if (!bundled(e)) {
                     <app-icon-button
                       size="sm"
-                      variant="danger"
-                      [ariaLabel]="'experts.delete' | transloco"
-                      [tooltip]="'experts.delete' | transloco"
-                      (clicked)="askDelete(e)"
+                      variant="ghost"
+                      [ariaLabel]="'experts.export' | transloco"
+                      [tooltip]="'experts.export' | transloco"
+                      (clicked)="exportExpert(e)"
                     >
-                      <app-icon size="sm">delete</app-icon>
+                      <app-icon size="sm">download</app-icon>
                     </app-icon-button>
+                    @if (!bundled(e)) {
+                      <app-icon-button
+                        size="sm"
+                        variant="danger"
+                        [ariaLabel]="'experts.delete' | transloco"
+                        [tooltip]="'experts.delete' | transloco"
+                        (clicked)="askDelete(e)"
+                      >
+                        <app-icon size="sm">delete</app-icon>
+                      </app-icon-button>
+                    }
                   }
                 </td>
               </tr>
@@ -242,6 +280,7 @@ export class ExpertsListComponent implements OnInit {
   private api = inject(ApiService);
   private router = inject(Router);
   private transloco = inject(TranslocoService);
+  protected readonly viewport = inject(ViewportService);
 
   filters: {value: ExpertTypeFilter; key: string}[] = [
     {value: 'all', key: 'experts.filterAll'},
