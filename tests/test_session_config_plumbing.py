@@ -67,6 +67,66 @@ class TestThreadCreateDefault:
         assert orch_main.ThreadCreateRequest().config_name == "persistent_defaults"
 
 
+class TestSessionWorkspaceBackendOverride:
+    """The New Session 'Backend' selector must reach create_thread.
+
+    Regression pin for the dropped-backend bug (found 2026-06-20 live-testing
+    the workspace-tier-upgrade feature): ThreadCreateRequest declared no
+    config_override field, so the cockpit's
+    ``{"config_override": {"workspace": {"backend": "virtual"}}}`` was silently
+    discarded by Pydantic and every session booted the default (sandbox) —
+    making lite/VM sessions uncreatable from the UI.
+    """
+
+    def test_request_model_accepts_config_override(self):
+        req = orch_main.ThreadCreateRequest(
+            config_override={"workspace": {"backend": "virtual"}}
+        )
+        assert req.config_override == {"workspace": {"backend": "virtual"}}
+
+    def test_bare_request_has_no_config_override(self):
+        assert orch_main.ThreadCreateRequest().config_override is None
+
+    @pytest.mark.parametrize("backend", ["sandbox", "virtual", "none"])
+    def test_creatable_backends_pass_through(self, backend):
+        ws = orch_main._validated_session_workspace_override(
+            {"workspace": {"backend": backend, "max_read_words": 5}}
+        )
+        assert ws == {"backend": backend, "max_read_words": 5}
+
+    def test_vm_backend_rejected_at_create(self):
+        # create_thread has no VM-provisioner wiring — vm must be reached by
+        # starting lite and upgrading, not selected at creation.
+        with pytest.raises(orch_main.HTTPException) as exc:
+            orch_main._validated_session_workspace_override(
+                {"workspace": {"backend": "vm"}}
+            )
+        assert exc.value.status_code == 400
+        assert "upgrade" in exc.value.detail.lower()
+
+    def test_unknown_backend_rejected(self):
+        with pytest.raises(orch_main.HTTPException) as exc:
+            orch_main._validated_session_workspace_override(
+                {"workspace": {"backend": "bogus"}}
+            )
+        assert exc.value.status_code == 400
+
+    def test_absent_fragment_returns_none(self):
+        assert orch_main._validated_session_workspace_override(None) is None
+        assert orch_main._validated_session_workspace_override({}) is None
+        assert (
+            orch_main._validated_session_workspace_override({"llm": {"model": "m"}})
+            is None
+        )
+
+    def test_workspace_without_backend_passes_through(self):
+        # Word-limit-only tweaks (no tier change) are honored, not rejected.
+        ws = orch_main._validated_session_workspace_override(
+            {"workspace": {"max_read_words": 10}}
+        )
+        assert ws == {"max_read_words": 10}
+
+
 class TestSendSessionAttachPayload:
     """Hole B, orchestrator side: the attach payload carries config_name."""
 
