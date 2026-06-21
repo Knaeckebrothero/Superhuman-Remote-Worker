@@ -144,7 +144,10 @@ from auth import bff_router  # noqa: E402
 from routers import automations_router  # noqa: E402
 from routers.sessions import router as sessions_router  # noqa: E402
 from services.cron_dispatcher import cron_dispatcher_loop  # noqa: E402
-from services.litellm_gateway import litellm_sync_loop  # noqa: E402
+from services.litellm_gateway import (  # noqa: E402
+    get_fleet_key,
+    litellm_sync_loop,
+)
 from services.audit_partitions import (  # noqa: E402
     maintenance_loop as audit_maintenance_loop,
 )
@@ -1104,14 +1107,18 @@ def _gateway_routing_target() -> tuple[str, str] | None:
     endpoint base_urls carry it too); the orchestrator's admin/health client uses
     the bare ``LITELLM_BASE_URL`` instead.
 
-    Slice 1 presents the **master key** as the shared agent credential: agents
-    already receive real upstream keys today, so this is no worse, and Slice 2
-    replaces it with per-job least-privilege virtual keys minted at dispatch
-    (the per-job-client-rebuild prereq is docs/issues/agent_loop_mode_pod_reuse.md).
+    Credential: the shared **fleet key** (Slice 2a) — a non-admin key carrying
+    the aggregate backstop, so the admin master key (which bypasses all limits)
+    never reaches agents. Falls back to the master key only in the brief startup
+    window before the fleet key is provisioned. Slice 2b replaces the shared key
+    with per-job least-privilege keys minted at dispatch (per-job-client-rebuild
+    prereq: docs/issues/agent_loop_mode_pod_reuse.md).
     """
     base = os.getenv("LITELLM_BASE_URL", "").strip()
-    key = os.getenv("LITELLM_MASTER_KEY", "").strip()
-    if not base or not key:
+    if not base:
+        return None
+    key = get_fleet_key() or os.getenv("LITELLM_MASTER_KEY", "").strip()
+    if not key:
         return None
     return f"{base.rstrip('/')}/v1", key
 

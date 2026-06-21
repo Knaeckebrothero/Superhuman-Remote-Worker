@@ -247,6 +247,11 @@ databases:
 # -----------------------------------------------------------------------------
 litellm:
   enabled: true
+  # No rate cap yet — set per-model upstream capacity here once known/measured:
+  #   backstop: { gemma-4-moe-strix: { rpm: 60 }, "*": { rpm: 120 } }
+  # With {} the fleet key still mints (unlimited), so agents are off the admin
+  # master key (the security half of 2a) without throttling real usage.
+  backstop: {}
 
 # -----------------------------------------------------------------------------
 # Workspace PVC — single-node local-path is RWO-only, override the prod default
