@@ -2197,6 +2197,46 @@ class TestHandleWorkspaceUpgradeVm:
         ]
         assert len(failed) == 1
 
+    @pytest.mark.asyncio
+    async def test_vm_torn_down_on_post_ready_seed_swap_failure(self):
+        """A failure AFTER the VM is ready (seed/swap raising) must tear the VM
+        down — not leak a running VM (Q7). Found live: the seed choked on the
+        cloud mount once the VM had already registered."""
+        import sys
+
+        ws = AsyncMock()
+        client = AsyncMock()
+        client.request_thread_workspace_upgrade.return_value = True
+        sandbox = SimpleNamespace(supports_shell=True, sudo_action="freeze")
+        # RemoteBackend construction blows up → the except block runs.
+        mock_remote_mod = MagicMock()
+        mock_remote_mod.RemoteBackend.side_effect = RuntimeError("seed/swap boom")
+        with (
+            patch(
+                "src.api.persistent_app._session",
+                self._session_with_backend(sandbox),
+            ),
+            patch("src.api.persistent_app._orchestrator_client", client),
+            patch("src.api.persistent_app._thread_id", "tid"),
+            patch(
+                "src.api.persistent_app._poll_vm_ready",
+                new_callable=AsyncMock,
+                return_value={"ssh_host": "10.0.0.9", "ssh_port": 22},
+            ),
+            patch.dict(sys.modules, {"src.core.backends.remote": mock_remote_mod}),
+        ):
+            await _handle_workspace_upgrade(ws, target_tier="vm")
+
+        # The post-ready failure tore the VM down (the leak fix) ...
+        client.abort_thread_vm_upgrade.assert_awaited_once_with("tid")
+        # ... and reported failure.
+        failed = [
+            c[0][0]
+            for c in ws.send_json.call_args_list
+            if c[0][0].get("method") == "workspace_upgrade.failed"
+        ]
+        assert len(failed) == 1
+
 
 # ---------------------------------------------------------------------------
 # 3.17 _ws_send()
