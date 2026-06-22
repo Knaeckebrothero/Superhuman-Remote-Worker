@@ -39,6 +39,9 @@ instruction_files:
   - skill: research-guide
     trigger: phase:tactical
     enforce: false  # Active: injected automatically at tactical phase start
+  - skill: verify-before-done
+    trigger: phase:tactical
+    enforce: false  # Active: injected at tactical phase start (where completion happens)
 
 tools:
   workspace:

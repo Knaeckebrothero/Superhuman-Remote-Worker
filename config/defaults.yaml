@@ -167,6 +167,9 @@ instruction_files:
   - skill: todo-guide
     trigger: before_tool:next_phase_todos
     enforce: true
+  - skill: verify-before-done
+    trigger: phase:tactical
+    enforce: false  # Active: injected at tactical phase start (where completion happens)
 
 connections:
   postgres: true
