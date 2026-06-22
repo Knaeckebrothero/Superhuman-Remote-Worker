@@ -31,7 +31,7 @@ aliases:
 > under provider API limits and subscription-coding-plan rate limits, so the fleet
 > stops generating constant 429 errors.
 
-**Status:** **Slices 1 + 2a committed; Slice 2b implemented + k3d-verified (2026-06-22), uncommitted on `develop`.** Slices 3–4 pending. See **Implementation status** below for what shipped, the spike findings that revised the design, and the gotchas.
+**Status:** **Slices 1 + 2a committed; Slices 2b + 3 implemented + k3d-verified (2026-06-22), uncommitted on `develop`.** Slice 4 (ledger + Cockpit) pending. See **Implementation status** below for what shipped, the spike findings that revised the design, and the gotchas.
 **Triggered by:** Putting the system into real operation. Multiple agents call
 the same providers with **zero coordination** today — each discovers limits by
 hitting a 429 and backing off independently (`src/graph.py:177-290` classify +
@@ -49,7 +49,7 @@ markup / billing → [[saas_billing_and_metering]]; capacity-aware admission
 (derived concurrency) → Deferred §; the custom usage ledger + workspace metering
 → Slice 4 (later).
 
-## Implementation status (updated 2026-06-21)
+## Implementation status (updated 2026-06-22)
 
 Built on local k3d (`k3d-srw`), uncommitted on `develop`. Driven **spike-first** —
 several LiteLLM assumptions in this doc were **overturned by live testing** and the
@@ -104,11 +104,52 @@ internal user `rpm_limit=50`, **8 reqs through the scoped key → `[200,200,429�
 deferred (would need one-key-per-user, which conflicts with per-project teams — a LiteLLM
 modeling limit); per-user is flat for now.
 
+> **⚠️ TODO — measure real capacity before turning the throttle on (deferred 2026-06-22).**
+> Both knobs ship **inert** (`litellm.backstop: {}`, `litellm.ratePolicy: {}`): scoped keys
+> mint, agents are off the admin master key, and traffic is attributed per user/project —
+> but **nothing is actually rate-capped until real numbers are set.** Before enabling
+> enforcement, measure the homelab router's (strix box's) safe sustained RPM **and** each
+> provider / subscription-plan tier's real limits, then fill in `litellm.backstop`
+> (aggregate capacity) + `litellm.ratePolicy` (per-project / per-user caps). Until then this
+> feature is **measurement + attribution only**, not throttling. (Same inert-until-measured
+> state as 2a's backstop — folded into one task.)
+
 **Decision on the aggregate backstop (2a) vs scoped keys (2b):** an agent presents one
 key, so the fleet-key bucket and a scoped key are mutually exclusive per request. The
 fleet key stays the **fallback** (no user/project, or gateway blip); for scoped traffic
 the aggregate ceiling is **`Σ(project team caps) ≤ capacity`, an admin invariant** (a true
 global ceiling needs Redis at multi-replica — Scaling §). Honest for single-replica v1.
+
+**✅ Slice 3 — longer-window quota stop (orchestrator-enforced).** Unlike 1/2 (LiteLLM
+enforces in-band), the daily quota is **orchestrator-enforced** because LiteLLM's only
+long-window cap is dollar-denominated (gap 2). A `quota_poll_loop` (120 s, beside the
+catalog sync) reads each active project's **daily** usage from `/team/daily/activity`
+(gap 4 resolved — the non-enterprise per-team endpoint; `/spend/report` is Enterprise-
+gated, `/spend/logs` dollar-only, and per-**user** activity didn't populate off
+key-ownership, so v1 is **per-project only**). Over-quota → two enforcement points sharing
+one in-memory set: the loop **freezes** the project's running jobs (`pause_job` +
+`update_job_status(freeze_data=quota_exceeded)` + `release_workspace`, all existing
+primitives) and the **dispatcher skips** that project (else a paused job re-dispatches in
+~5 s and keeps consuming). The daily UTC reset auto-clears the set → frozen jobs
+re-dispatch at 00:00 UTC (the midnight-flood follow-up is **filed**, per the acceptance
+criteria's "applied *or* filed"). Window = UTC day (rolling-N-hour deferred). Policy =
+`litellm.quota` → `LITELLM_QUOTA` env, default `{}` = inert. *Verified live:* the
+over/under decision logic (over@quota=3, under@quota=100, inert at no policy) **and** —
+after the `team_ids` read-path fix below — correct **per-team scoping** (a 6-request team
+reads back exactly 6, a zero-traffic team 0); poll loop confirmed running in-cluster; 16
+new unit tests (76 total). *Deferred:* full job-freeze E2E (needs a real dispatched job —
+freeze reuses proven primitives, same bar as Slices 1/2b); per-user quota.
+
+> **Read-path bug caught + fixed in verification (Slice 3).** `/team/daily/activity`'s
+> filter param is **`team_ids` (plural)** — the singular `team_id` is **silently ignored**
+> and returns the *global* all-team total. The first cut used `team_id`, so every project
+> read the same global number (a global quota mislabeled as per-project — one busy project
+> would have frozen all of them). **Fixed to `team_ids`** and re-verified live: a team that
+> fired 6 requests reads back **exactly 6** (1:1, not inflated — the earlier "~3×" was this
+> global leak), a zero-traffic team reads **0** (isolated). Minor caveat that remains: a
+> short aggregation **lag** (~tens of seconds) before served requests appear — fine for a
+> daily cap. `successful_requests` (not `api_requests`) is summed so our own 429s don't
+> count.
 
 **Spike findings that revised the design:**
 - **Per-deployment `rpm`/`tpm` does NOT 429** without **Redis + `enable_pre_call_check`/
@@ -138,12 +179,13 @@ global ceiling needs Redis at multi-replica — Scaling §). Honest for single-r
   Postgres can't sub for LiteLLM's hot-path counters (Redis-hardcoded + hot-row write
   antipattern).
 
-**Next:** commit 2b; set a real `backstop` + `ratePolicy` capacity (or measure the strix
-box's safe RPM); Slice 3 (long-window quota stop); Slice 4 (ledger + Cockpit view).
-*Deferred within 2b:* per-user **per-model** limits; a DB-table + Cockpit-UI policy source
-(file/values-driven for now); full job-dispatch E2E through `_gateway_routing_target_scoped`
-(the helper is verified live; the dispatch glue is unit + inspection-proven, same caveat as
-Slice 1's "real JOB through `_inject_dispatch_credentials`").
+**Next:** commit 2b + 3; set a real `backstop` + `ratePolicy` + `quota` capacity (or measure
+the strix box's safe RPM / daily volume — counts are 1:1 now the `team_ids` bug is fixed);
+Slice 4 (ledger + Cockpit view). *Deferred:* per-user **per-model** rate limits + per-user **quota** (the
+per-user activity read is unreliable); rolling-N-hour quota window (daily-UTC for now);
+a DB-table + Cockpit-UI policy source (file/values-driven for now); full job-level E2E for
+2b's dispatch glue + 3's freeze (both reuse verified primitives — same bar as Slice 1's
+"real JOB through `_inject_dispatch_credentials`").
 
 ## Why a gateway (the one mechanism that does all of it)
 
@@ -190,9 +232,9 @@ doesn't carry a prior job's client/key — [[agent_loop_mode_pod_reuse]] item 1.
 | 3 | Enforcement | **Rate limits (RPM/TPM), not dollar caps.** No spend gate. |
 | 4 | Enforcement **subject** | **Per-user and per-project** — *not* application-wide aggregate. |
 | 4a | Model **categories** | A **config convenience** for the admin: group models (`large`/`medium`/`small`) to set one limit across many, with per-model override (gpt-5.5 ≠ opus-4.8 if wanted). Categories are **our** abstraction — LiteLLM has no model-group rate limits (see capability check), so the orchestrator **expands category → individual model_names** when writing limits. |
-| 5 | Limit responses | **RPM/TPM breach → 429 → agent backoff (slow down), in-band.** **Longer-window quota breach → hard stop + pod teardown, orchestrator-driven (out-of-band).** |
+| 5 | Limit responses | **RPM/TPM breach → 429 → agent backoff (slow down), in-band** — *shipped Slice 2b.* **Longer-window quota breach → hard stop + pod teardown, orchestrator-driven (out-of-band)** — *shipped Slice 3 (per-project daily; freeze = `pause_job` + `release_workspace` + dispatcher gate; per-user deferred).* |
 | 5a | Upstream backstop | **REVISED — k3d-verified 2026-06-21.** Per-deployment `rpm`/`tpm` in `config.yaml` does **NOT** 429 in our setup (it's router/load-balancing metadata; hard pre-call enforcement needs **Redis + `enable_pre_call_check`/`enforce_model_rate_limits`**, and the **admin master key bypasses all limits**). What **does** enforce in-memory (no Redis) is **key/team `model_rpm_limit`** (proven 429 + Retry-After). So the backstop is a **shared "fleet" virtual key** — deterministic value (HMAC of the master key, no persistence), `model_rpm_limit = upstream capacity`, scoped to registered models — that all agents use **instead of the admin master key** (security win). Fleet aggregate → one bucket → 429 → backoff. Capacity = the `litellm.backstop` knob (`{model_id\|'*':{rpm/tpm}}`). **Implemented (Slice 2a).** |
-| 6 | Identity | Per-**job** virtual key minted at dispatch, **revoked on completion**; carries job_id + user_id (+ team_id = project). |
+| 6 | Identity | **REVISED — k3d-verified 2026-06-22 (Slice 2b).** *Not* per-job — a **per-(user, project) scoped key** (deterministic, like the fleet key), bound to a LiteLLM **team** (= project) + **internal user** (= user) that carry the limits. Enforcement aggregates on the shared team/user objects, so one key per (user, project) gives identical limits **without** per-job mint/revoke churn; per-job *attribution* deferred to the Slice-4 ledger. Falls back to the fleet key (5a) when user/project is absent. |
 | 7 | Monitoring (v1) | LiteLLM's **native dashboard** (RPM/TPM/usage per key/user/model). Build no custom UI for Slices 1–3. |
 | 8 | Store of record (later) | Slice 4 only: canonical rows in **`usage_events`** (option A); LiteLLM's internal DB = enforcement-only. |
 | 9 | Metered scope | LLM via gateway. **Workspace** compute → Slice 4 (cost-picture completion, decoupled from rate-limiting). Agent pods / query / storage → ignored. |
@@ -273,9 +315,14 @@ allow-list (`models=[]`); multi-instance limit sharing via Redis.
    load-test that a set limit actually returns 429 in our deployment mode is an
    acceptance gate, not an afterthought. (Per-model 429 also skips fallback,
    #24152 — for us that's *desired*: we want the 429, not a silent model swap.)
-4. **Usage polling:** spend/usage is tracked (end_user, team, model_group,
-   tokens); confirm the exact read path at build (spend API vs reading LiteLLM's
-   Postgres spend table directly) for the Slice-3 poll.
+4. **Usage polling:** ~~confirm the exact read path at build~~ → **RESOLVED (Slice 3):
+   `GET /team/daily/activity?team_ids=<id>`** (per-team daily `successful_requests` +
+   `total_tokens`, non-enterprise). Rejected at build: `/spend/report` (Enterprise-gated),
+   `/spend/logs` (dollar-only, `0.0` for unpriced homelab models), per-**user**
+   `/user/daily/activity` (didn't populate off key-ownership). **Param gotcha:** the filter
+   is `team_ids` (plural); singular `team_id` is silently ignored → returns the *global*
+   total (a bug caught in verification — see Implementation status). Counts are 1:1; minor
+   aggregation lag.
 
 ### Metering ownership (Slice 4) — event-driven vs time-driven
 
@@ -386,15 +433,25 @@ egress surface (composes with the agent-egress NetworkPolicy work).
   guard, not silently unthrottled.
 
 ### Slice 3 — Longer-window quota stop *(orchestrator-enforced)*
-- Per-user / per-project **rolling N-hour or daily request/token quota**.
-  **Necessarily orchestrator-side** — LiteLLM's only long-window cap is
-  dollar-denominated (capability gap 2), and we want request/token counts.
-- Orchestrator polls LiteLLM usage (confirm read path — gap 4) via **one aggregate
-  `GROUP BY user` query, never a per-user loop** (see Scaling); over-quota → freeze
-  the user's jobs + tear down pods (reusing the freeze/teardown path).
-- **Acceptance:** a user crossing the quota has in-flight jobs frozen and
-  workspaces released; throttle (Slice 2) and quota-stop are distinguishable (one
-  slows, one stops); midnight-flood mitigation (rolling window) applied or filed.
+> **✅ IMPLEMENTED + k3d-verified (read path live) 2026-06-22.** Per-**project** daily
+> quota (per-user deferred — read path unreliable); window = UTC day (rolling filed).
+> See Implementation status for what shipped + the `team_ids` read-path fix.
+- Per-project **daily request/token quota** (per-user deferred). **Necessarily
+  orchestrator-side** — LiteLLM's only long-window cap is dollar-denominated (capability
+  gap 2), and we want request/token counts.
+- Orchestrator polls LiteLLM usage via **`/team/daily/activity`** (gap 4 resolved: the
+  non-enterprise per-team activity endpoint — `/spend/report` is Enterprise-gated,
+  `/spend/logs` is dollar-only, per-user activity didn't populate). One read per active
+  project (bounded by active jobs; `SELECT DISTINCT` at scale). Over-quota → freeze the
+  project's jobs (`pause_job` + `release_workspace`) **and** the dispatcher skips
+  re-dispatching them (an in-memory over-quota set the poll loop owns) — without the gate,
+  a paused job re-dispatches in ~5 s and keeps consuming.
+- **Acceptance:** a project crossing the quota has in-flight jobs frozen + workspaces
+  released *(freeze reuses proven primitives; the read/decision/poll path is live-verified,
+  full job-freeze E2E deferred to a real dispatched job — same bar as Slices 1/2b)*;
+  throttle (Slice 2) and quota-stop are distinguishable (429-slows vs pause-stops, tagged
+  `freeze_data.type=quota_exceeded`); midnight-flood mitigation **filed** (rolling window —
+  the daily UTC reset means frozen projects auto-unfreeze + re-dispatch at 00:00 UTC).
 
 ### Slice 4 — Unified ledger + workspace metering + Cockpit view *(later)*
 - Adopt **option A**: gateway per-request callback writes canonical
@@ -486,8 +543,9 @@ ignored now; the ledger's `category` taxonomy reserves them.
 ## Resolved by the capability check (2026-06-20)
 
 - ~~Aggregate vs per-user~~ → **per-user + per-project** (decision 4); categories
-  are config sugar (4a); upstream ceiling handled by per-deployment `config.yaml`
-  rpm (5a), not a user-facing app cap.
+  are config sugar (4a); upstream ceiling handled by the **shared fleet key**
+  (5a, revised — *not* per-deployment `config.yaml` rpm, which doesn't enforce),
+  not a user-facing app cap.
 - ~~LiteLLM expresses the matrix?~~ → **yes**, via team/user/key (capability
   check), with three gaps now owned as orchestrator-side work (category
   expansion + validation, request-count quota, enforcement load-test).
@@ -497,17 +555,22 @@ ignored now; the ledger's `category` taxonomy reserves them.
 1. **Limit unit:** **requests** (RPM) only, or also **tokens** (TPM)? Both are
    native. *Lean: RPM first (matches the "requests per minute" framing); add TPM
    for a token-heavy category when needed.*
-2. **Quota window:** daily (simple, midnight-flood) vs rolling N-hour (4–8 h,
-   smoother) vs weekly (matches some subscription allowances)? *Lean: configurable
-   per category; default rolling to dodge the flood.* Orchestrator-enforced either
-   way (gap 2).
-3. **User vs project precedence:** a job has both a `user_id` and a `project_id`
-   (= team) — when both carry a limit, which wins? *Lean: the more restrictive
-   (min) applies; LiteLLM resolves key > team, and the user limit is a separate
-   independent ceiling, so effectively all three bind and the tightest wins.*
-4. **Category definition home:** where does the model→category map live — a new
-   admin-editable table (mirrors the DB-override pattern), or config YAML? Ties to
-   how the orchestrator expands categories before writing LiteLLM limits.
+2. **Quota window:** ~~daily vs rolling N-hour vs weekly~~ → **v1 shipped daily (UTC)**
+   (Slice 3); the `/team/daily/activity` read path is day-bucketed, and the daily reset
+   gives free auto-unfreeze. **Rolling N-hour deferred** (the midnight-flood mitigation —
+   needs finer-grained reads, e.g. raw spend logs or the Slice-4 ledger). Still
+   orchestrator-enforced (gap 2).
+3. ~~**User vs project precedence**~~ → **RESOLVED (Slice 2b).** All three scopes
+   bind independently and the **tightest wins**: the scoped key inherits both its
+   **team** (project, per-model) and **internal-user** (user, flat) limits, plus the
+   aggregate fleet/team ceiling — verified composing on one key (429 at whichever
+   trips first). Per-user is flat for now (per-user per-model deferred — needs
+   one-key-per-user, which conflicts with per-project teams).
+4. ~~**Category definition home**~~ → **RESOLVED for v1: file/values-driven.** The
+   category→model map + per-project/per-user limits live in the `litellm.ratePolicy`
+   helm value (`LITELLM_RATE_POLICY` env JSON); the orchestrator expands
+   category→model_names with a validation guard. A DB table + Cockpit admin UI can
+   replace the *source* later without touching the enforcement plumbing.
 
 ## References
 

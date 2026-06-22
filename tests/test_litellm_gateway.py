@@ -6,7 +6,7 @@ records the admin calls. See docs/features/usage_monitoring_and_rate_limiting.md
 """
 
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -19,13 +19,16 @@ from orchestrator.services.litellm_gateway import (
     _internal_user_id_for,
     _needs_replace,
     _parse_backstop,
+    _parse_quota_policy,
     _parse_rate_policy,
+    _project_quota,
     _rev_for_endpoint,
     _team_id_for_project,
     _team_limits_for_project,
     _user_limits,
     build_desired_models,
     compute_fleet_key,
+    compute_project_quota_status,
     compute_scoped_key,
     ensure_fleet_key,
     ensure_scoped_key,
@@ -574,3 +577,171 @@ class TestEnsureScopedKey:
         assert key == compute_scoped_key("sk-master", "u1", "p1")
         _, t_kwargs = client.upsert_team.call_args
         assert t_kwargs["spec"]["model_rpm_limit"] == {}
+
+
+# --------------------------------------------------------------------------
+# Slice 3 — longer-window quota (read path + policy)
+# --------------------------------------------------------------------------
+
+
+class TestParseQuotaPolicy:
+    def test_unset_is_empty(self, monkeypatch):
+        monkeypatch.delenv("LITELLM_QUOTA", raising=False)
+        assert _parse_quota_policy() == {}
+
+    def test_valid_json(self, monkeypatch):
+        monkeypatch.setenv(
+            "LITELLM_QUOTA", '{"projects": {"default": {"requests_per_day": 5}}}'
+        )
+        assert _parse_quota_policy() == {
+            "projects": {"default": {"requests_per_day": 5}}
+        }
+
+    def test_malformed_is_empty(self, monkeypatch):
+        monkeypatch.setenv("LITELLM_QUOTA", "nope{")
+        assert _parse_quota_policy() == {}
+
+    def test_non_object_is_empty(self, monkeypatch):
+        monkeypatch.setenv("LITELLM_QUOTA", "[1, 2]")
+        assert _parse_quota_policy() == {}
+
+
+class TestProjectQuota:
+    _P = {
+        "projects": {
+            "default": {"requests_per_day": 100},
+            "p-vip": {"requests_per_day": 10, "tokens_per_day": 5000},
+        }
+    }
+
+    def test_default_applies(self):
+        assert _project_quota(self._P, "p-x") == {"requests_per_day": 100}
+
+    def test_override(self):
+        assert _project_quota(self._P, "p-vip") == {
+            "requests_per_day": 10,
+            "tokens_per_day": 5000,
+        }
+
+    def test_zero_means_no_cap(self):
+        assert (
+            _project_quota({"projects": {"default": {"requests_per_day": 0}}}, "p")
+            == {}
+        )
+
+    def test_empty_policy(self):
+        assert _project_quota({}, "p") == {}
+
+
+class TestGetTeamDailyUsage:
+    @pytest.mark.asyncio
+    async def test_sums_successful_requests_and_tokens(self):
+        # api_requests includes our own gateway 429s — the quota must count only
+        # successful (upstream-hitting) requests, so we sum successful_requests.
+        client = gw_mod.LiteLLMClient("http://gw", "sk-master")
+        resp = MagicMock()
+        resp.raise_for_status = MagicMock()
+        resp.json = MagicMock(
+            return_value={
+                "results": [
+                    {
+                        "metrics": {
+                            "successful_requests": 3,
+                            "total_tokens": 50,
+                            "api_requests": 18,  # includes 429s — must be ignored
+                        }
+                    },
+                    {"metrics": {"successful_requests": 2, "total_tokens": 20}},
+                ]
+            }
+        )
+        client._client = AsyncMock()
+        client._client.get = AsyncMock(return_value=resp)
+        out = await client.get_team_daily_usage("srw-proj-p1", day="2026-06-22")
+        assert out == {"requests": 5, "tokens": 70}
+        # queried the non-enterprise activity endpoint, scoped to the team + day.
+        # NOTE: the filter param is team_ids (plural) — the singular team_id is
+        # silently ignored and returns the global all-team total (verified live).
+        _, kwargs = client._client.get.call_args
+        assert kwargs["params"] == {
+            "team_ids": "srw-proj-p1",
+            "start_date": "2026-06-22",
+            "end_date": "2026-06-22",
+        }
+        await client.aclose()
+
+    @pytest.mark.asyncio
+    async def test_empty_results_is_zero(self):
+        client = gw_mod.LiteLLMClient("http://gw", "sk-master")
+        resp = MagicMock()
+        resp.raise_for_status = MagicMock()
+        resp.json = MagicMock(return_value={"results": []})
+        client._client = AsyncMock()
+        client._client.get = AsyncMock(return_value=resp)
+        assert await client.get_team_daily_usage("t", day="d") == {
+            "requests": 0,
+            "tokens": 0,
+        }
+        await client.aclose()
+
+
+class TestComputeProjectQuotaStatus:
+    @pytest.mark.asyncio
+    async def test_no_policy_returns_empty(self, monkeypatch):
+        monkeypatch.delenv("LITELLM_QUOTA", raising=False)
+        client = AsyncMock()
+        assert await compute_project_quota_status(client, ["p1"], day="d") == {}
+        client.get_team_daily_usage.assert_not_awaited()  # no reads when inert
+
+    @pytest.mark.asyncio
+    async def test_over_when_requests_exceed(self, monkeypatch):
+        monkeypatch.setenv(
+            "LITELLM_QUOTA", '{"projects": {"default": {"requests_per_day": 10}}}'
+        )
+        client = AsyncMock()
+        client.get_team_daily_usage.return_value = {"requests": 12, "tokens": 0}
+        out = await compute_project_quota_status(client, ["p1"], day="2026-06-22")
+        assert out["p1"]["over"] is True
+        client.get_team_daily_usage.assert_awaited_once_with(
+            "srw-proj-p1", day="2026-06-22"
+        )
+
+    @pytest.mark.asyncio
+    async def test_under_when_below(self, monkeypatch):
+        monkeypatch.setenv(
+            "LITELLM_QUOTA", '{"projects": {"default": {"requests_per_day": 10}}}'
+        )
+        client = AsyncMock()
+        client.get_team_daily_usage.return_value = {"requests": 3, "tokens": 0}
+        out = await compute_project_quota_status(client, ["p1"], day="d")
+        assert out["p1"]["over"] is False
+
+    @pytest.mark.asyncio
+    async def test_token_axis_also_trips(self, monkeypatch):
+        monkeypatch.setenv(
+            "LITELLM_QUOTA", '{"projects": {"default": {"tokens_per_day": 100}}}'
+        )
+        client = AsyncMock()
+        client.get_team_daily_usage.return_value = {"requests": 1, "tokens": 200}
+        out = await compute_project_quota_status(client, ["p1"], day="d")
+        assert out["p1"]["over"] is True
+
+    @pytest.mark.asyncio
+    async def test_project_without_quota_omitted(self, monkeypatch):
+        monkeypatch.setenv(
+            "LITELLM_QUOTA", '{"projects": {"p1": {"requests_per_day": 5}}}'
+        )
+        client = AsyncMock()
+        client.get_team_daily_usage.return_value = {"requests": 9, "tokens": 0}
+        out = await compute_project_quota_status(client, ["p1", "p2"], day="d")
+        assert "p1" in out and "p2" not in out  # p2 has no entry + no default
+
+    @pytest.mark.asyncio
+    async def test_read_failure_skips_project(self, monkeypatch):
+        monkeypatch.setenv(
+            "LITELLM_QUOTA", '{"projects": {"default": {"requests_per_day": 5}}}'
+        )
+        client = AsyncMock()
+        client.get_team_daily_usage.side_effect = RuntimeError("gateway down")
+        # a read blip must skip, never mass-freeze
+        assert await compute_project_quota_status(client, ["p1"], day="d") == {}

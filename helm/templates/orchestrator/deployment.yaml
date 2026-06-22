@@ -199,6 +199,11 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: LITELLM_RATE_POLICY
+            - name: LITELLM_QUOTA
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: LITELLM_QUOTA
             {{- end }}
             - name: MONGODB_URL
               valueFrom:

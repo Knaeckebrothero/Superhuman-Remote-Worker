@@ -146,6 +146,8 @@ from routers.sessions import router as sessions_router  # noqa: E402
 from services.cron_dispatcher import cron_dispatcher_loop  # noqa: E402
 from services.litellm_gateway import (  # noqa: E402
     LiteLLMClient,
+    _parse_quota_policy,
+    compute_project_quota_status,
     ensure_scoped_key,
     get_fleet_key,
     litellm_sync_loop,
@@ -1168,6 +1170,185 @@ async def _gateway_routing_target_scoped(
         finally:
             await client.aclose()
     return _gateway_routing_target()
+
+
+# ---------------------------------------------------------------------------
+# Slice 3 — longer-window quota stop (orchestrator-enforced).
+#
+# LiteLLM has no native request/token daily quota (only a dollar cron budget —
+# capability gap 2), so the orchestrator polls per-project daily usage from the
+# gateway and, when a project crosses its quota, freezes that project's running
+# jobs (pause + workspace release) AND blocks the dispatcher from re-dispatching
+# them. The two enforcement points share one in-memory set, owned by the poll
+# loop. Per-project only for v1 (the per-user activity read is unreliable); daily
+# UTC window (rolling deferred). See docs/features/usage_monitoring_and_rate_limiting.md.
+# ---------------------------------------------------------------------------
+
+# Projects currently frozen for crossing their daily quota. Rebound (not mutated)
+# by the quota poll loop so the dispatcher always reads a consistent snapshot.
+_over_quota_projects: frozenset[str] = frozenset()
+
+
+def is_project_over_quota(project_id: str | None) -> bool:
+    """True if this project is currently quota-frozen (cheap in-memory lookup).
+
+    Called by the dispatcher per candidate job, so it must never touch the
+    gateway/DB — it only consults the set the poll loop maintains.
+    """
+    return bool(project_id) and str(project_id) in _over_quota_projects
+
+
+async def _active_project_ids() -> set[str]:
+    """Distinct project ids with running/pending jobs — the quota poll's scope.
+
+    Bounded to projects that actually have work, so the poll only reads usage for
+    relevant teams. (At scale this becomes one ``SELECT DISTINCT project_id``; the
+    few-hundred-row scan is fine for now — noted in the Scaling section.)
+    """
+    ids: set[str] = set()
+    for status in ("processing", "created", "paused"):
+        try:
+            for job in await postgres_db.get_jobs(status=status, limit=500):
+                pid = job.get("project_id")
+                if pid:
+                    ids.add(str(pid))
+        except Exception:
+            logger.exception("Quota poll: failed to list %s jobs", status)
+    return ids
+
+
+async def _freeze_project_over_quota(
+    project_id: str, *, usage: dict[str, int], quota: dict[str, int]
+) -> int:
+    """Freeze a project's in-flight jobs after it crossed its daily quota.
+
+    Pauses each ``processing`` job (frees its agent, stops re-dispatch via the
+    gate) and releases its workspace snapshot-first, so it resumes cleanly once
+    the quota resets. Tags ``freeze_data`` with ``type=quota_exceeded`` so the UI
+    can tell a quota stop from a normal pause. Returns the count actually frozen.
+    """
+    try:
+        jobs = await postgres_db.get_jobs(
+            status="processing", scope_project_id=project_id, limit=200
+        )
+    except Exception:
+        logger.exception("Quota freeze: failed to list jobs for project %s", project_id)
+        return 0
+
+    frozen = 0
+    for job in jobs:
+        job_id = str(job["id"])
+        try:
+            # pause_job guards on status='processing' + clears the agent; if it
+            # lost the race (already paused/done), skip — nothing to freeze.
+            if not await postgres_db.pause_job(job_id):
+                continue
+            await postgres_db.update_job_status(
+                job_id,
+                freeze_data={
+                    "type": "quota_exceeded",
+                    "scope": "project",
+                    "project_id": project_id,
+                    "usage": usage,
+                    "quota": quota,
+                },
+            )
+            await _cascade_pause_to_children(job_id)
+            if container_provisioner.is_available:
+                await container_provisioner.release_workspace(
+                    WorkspaceOwner.job(job_id)
+                )
+            frozen += 1
+            logger.warning(
+                "Quota stop: froze job %s — project %s over daily quota (%s / %s)",
+                job_id,
+                project_id,
+                usage,
+                quota,
+            )
+        except Exception:
+            logger.exception("Quota freeze: failed to freeze job %s", job_id)
+    return frozen
+
+
+async def _quota_poll_tick(client: LiteLLMClient) -> None:
+    """One quota evaluation: refresh the over-quota set + freeze newly-over jobs."""
+    global _over_quota_projects
+    # Cheap short-circuit when no quota is configured (the common case until an
+    # admin sets one): don't even scan jobs. Also clears a stale gate if the
+    # policy was just removed.
+    if not _parse_quota_policy():
+        if _over_quota_projects:
+            _over_quota_projects = frozenset()
+        return
+
+    project_ids = await _active_project_ids()
+    if not project_ids:
+        _over_quota_projects = frozenset()
+        return
+
+    day = datetime.now(timezone.utc).date().isoformat()
+    status = await compute_project_quota_status(client, list(project_ids), day=day)
+    now_over = frozenset(pid for pid, st in status.items() if st["over"])
+    newly_over = now_over - _over_quota_projects
+    newly_under = _over_quota_projects - now_over
+    # Atomic rebind (not clear+update) so the dispatcher never sees a half-empty
+    # set. Projects that dropped back under quota (e.g. the midnight reset) leave
+    # the set here → their paused jobs become dispatchable again automatically.
+    _over_quota_projects = now_over
+
+    if newly_under:
+        logger.info(
+            "Quota: project(s) %s back under daily quota — dispatch re-enabled",
+            sorted(newly_under),
+        )
+    for pid in newly_over:
+        st = status[pid]
+        logger.warning(
+            "Quota: project %s crossed daily quota (usage=%s quota=%s) — freezing jobs",
+            pid,
+            st["usage"],
+            st["quota"],
+        )
+        await _freeze_project_over_quota(pid, usage=st["usage"], quota=st["quota"])
+
+
+async def quota_poll_loop(
+    shutdown_event: asyncio.Event,
+    postgres_db: Any,
+    *,
+    interval: float = 120.0,
+) -> None:
+    """Background loop: enforce per-project daily usage quotas (Slice 3).
+
+    No-op when the gateway is unconfigured (``LITELLM_BASE_URL`` unset), mirroring
+    the catalog sync. Slower cadence than the dispatcher (quotas move over hours,
+    not seconds). Never raises into the lifespan: a tick failure is logged and
+    retried. ``postgres_db`` is accepted for symmetry with the other loops (the
+    helpers use the module global).
+    """
+    base_url = os.getenv("LITELLM_BASE_URL", "").strip()
+    master_key = os.getenv("LITELLM_MASTER_KEY", "").strip()
+    if not base_url or not master_key:
+        logger.info("Quota poll loop disabled (gateway not configured)")
+        return
+
+    client = LiteLLMClient(base_url, master_key)
+    logger.info("Quota poll loop starting (interval=%ss)", interval)
+    try:
+        while not shutdown_event.is_set():
+            try:
+                if await client.is_ready():
+                    await _quota_poll_tick(client)
+            except Exception:
+                logger.exception("Quota poll tick failed (non-fatal)")
+            try:
+                await asyncio.wait_for(shutdown_event.wait(), timeout=interval)
+            except asyncio.TimeoutError:
+                pass
+    finally:
+        await client.aclose()
+        logger.info("Quota poll loop stopped")
 
 
 async def _inject_dispatch_credentials(
@@ -3434,6 +3615,17 @@ async def _try_dispatch_pending_jobs() -> None:
             dispatchable_jobs = []
             for job in pending_jobs:
                 job_id = str(job["id"])
+                # Slice 3 quota gate: a project that crossed its daily quota is
+                # frozen — don't dispatch/resume or provision for its jobs until
+                # the quota poll clears it (at the daily reset, or when usage
+                # drops). The poll loop separately freezes already-running jobs.
+                if is_project_over_quota(job.get("project_id")):
+                    logger.debug(
+                        "Dispatcher: skipping job %s — project %s over quota",
+                        job_id,
+                        job.get("project_id"),
+                    )
+                    continue
                 if _job_needs_vm(job):
                     # Admin-gated permission check (kill-switch + per-user grant).
                     # Re-verified here in case a grant was revoked or the
@@ -4914,6 +5106,11 @@ async def lifespan(app: FastAPI):
         litellm_sync_loop(_shutdown_event, postgres_db)
     )
 
+    # Longer-window quota stop (Slice 3): polls per-project daily usage from the
+    # gateway and freezes jobs whose project crossed its quota. Self-disables with
+    # the gateway (LITELLM_BASE_URL unset). See usage_monitoring_and_rate_limiting.md.
+    quota_poll_task = asyncio.create_task(quota_poll_loop(_shutdown_event, postgres_db))
+
     # Audit-store partition maintenance (creation + ANALYZE + lookahead alarms;
     # retention deferred — see services/audit_partitions.py). Only when the
     # audit DB is configured; otherwise the store is inactive and there is
@@ -4998,6 +5195,7 @@ async def lifespan(app: FastAPI):
     await main_cloud_listen_task
     await automation_cron_task
     await litellm_sync_task
+    await quota_poll_task
     if audit_maintenance_task is not None:
         await audit_maintenance_task
 
