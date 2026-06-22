@@ -432,6 +432,7 @@ const FAMILIES = ['gemma', 'gpt-5', 'gpt-oss', 'deepseek', 'glm', 'minimax', 'mi
     }
     .actions {
       display: flex;
+      flex-wrap: wrap;
       gap: 12px;
       margin-top: 16px;
     }

@@ -141,6 +141,43 @@ def resolve_config(
     return blob
 
 
+def unrouted_model_slots(blob: dict) -> list[str]:
+    """Return descriptions of model-bearing slots in a *credentialed* delivery
+    blob that have NO transport — no ``base_url``, ``api_key``, or ``provider``.
+
+    Such a slot has no way to reach its endpoint: the agent's ``create_llm``
+    falls back to the OpenAI factory default (``api.openai.com``) and the model
+    almost certainly 401/404s with an opaque error (incident: job eec20eeb —
+    codex phase pins shipped without transport). Dispatch uses this to **fail
+    fast** with an actionable message instead of letting the agent misroute.
+
+    Conservative by design: a slot is only flagged when it carries a ``model``
+    yet none of the three routing fields. A model with a ``provider`` (factory
+    default base URL) or an inline ``api_key`` is considered routable.
+    """
+    agent = blob.get("agent") or {}
+    llm = agent.get("llm") or {}
+    problems: list[str] = []
+
+    def _check(section: object, label: str) -> None:
+        if not isinstance(section, dict):
+            return
+        model = section.get("model")
+        if not model:
+            return
+        if not (
+            section.get("base_url") or section.get("api_key") or section.get("provider")
+        ):
+            problems.append(f"{label} model {model!r}")
+
+    _check(llm, "llm")
+    if isinstance(llm, dict):
+        for _phase in ("strategic", "tactical"):
+            _check(llm.get(_phase), f"llm.{_phase}")
+    _check(agent.get("auxiliary"), "auxiliary")
+    return problems
+
+
 async def inject_blob_credentials(
     blob: dict,
     injector: Callable[[dict], Awaitable[dict] | Awaitable[None]],
@@ -169,11 +206,25 @@ async def inject_blob_credentials(
     # treats them as absent (a serialized config carries explicit model=None /
     # base_url=None defaults that would otherwise block injection). Mirrors
     # _inject_thread_dispatch_credentials' own None-stripping.
+    #
+    # This MUST reach the nested phase blocks (llm.strategic / llm.tactical /
+    # llm.summarization), not just the top-level section. serialize_resolved_config
+    # emits those with explicit base_url=None / provider=None leaves; a
+    # present-but-None key defeats the injector's setdefault, so endpoint-backed
+    # phase pins (e.g. codex models) shipped without transport and 401'd against
+    # api.openai.com while the base model — whose top-level None WAS stripped —
+    # worked, masking the gap (incident: job eec20eeb / "Research 01").
+    def _strip_none_keys(d: dict) -> None:
+        for _k in [_k for _k, _v in d.items() if _v is None]:
+            del d[_k]
+
     for _sect in ("llm", "auxiliary"):
         _s = co.get(_sect)
         if isinstance(_s, dict):
-            for _k in [_k for _k, _v in _s.items() if _v is None]:
-                del _s[_k]
+            _strip_none_keys(_s)
+            for _sub in _s.values():
+                if isinstance(_sub, dict):
+                    _strip_none_keys(_sub)
 
     result = await injector(co)
     if isinstance(result, dict):
