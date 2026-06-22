@@ -25,10 +25,12 @@ summarizer call every ~20 s; cancelled 2026-06-22).
 
 **Status:** ✅ **Fixed** 2026-06-22 (option B — see [Fixes](#fixes)). Root cause confirmed
 (see [Verification](#verification) + [[context_budget_base_model_verification]]); fix
-implemented, unit-verified, and **in-cluster-verified on k3d** (resolver run inside the live
-orchestrator pod → `1,050,000` not `131072`). Uncommitted on `develop`. A clean **live-job**
-e2e is deferred to **dev**: k3d's catalog is `gemma`-only, so it cannot exercise a >131K phase
-model, and the real gpt-5.x repro needs the fix shipped to dev first.
+implemented, unit-verified, and **verified end-to-end on the live k3d dispatch path** — a job
+with the exact incident config (`gpt-5.5`/`gpt-5.4-mini` over the gemma base) logged
+`Created strategic LLM: gpt-5.5 (window=1050000, budget=1050000)`, i.e. the budget flipped from
+gemma's `131072` to the gpt-5 family's `1,050,000`. Uncommitted on `develop`. (The k3d job then
+403'd on the provider key — k3d serves only gemma — which is *after* the budget computation and
+irrelevant to the fix; a fully-completing run still wants a real gpt-5.x endpoint, i.e. dev.)
 
 **Severity:** High. Any job/expert that overrides only the per-phase models — while leaving
 the default `llm.model` base — gets **both** the wrong context window **and** the wrong
@@ -250,7 +252,11 @@ pure resolver `resolve_phase_model_budget` (`src/core/loader.py`):
   `self.config.llm.get_phase_config(phase).multimodal`) and the client flag agree — a
   non-multimodal phase can't be handed an image the other phase left on the shared history.
 - **Warnings:** mixed family/window/multimodal logged + stored in the frozen-config blob as
-  `model_config_warnings` (backend surface; cockpit picker hint deferred).
+  `model_config_warnings` (backend surface). **Cockpit picker hint also shipped** — a
+  pure-client advisory banner in `model-group.component.ts` driven by `computeModelMismatch`
+  (`agent-settings.types.ts`), mirroring this resolver off the same `settings_matrix`; fires
+  only on a real window gap (`>2×` = prominent) or multimodal mismatch, silent on
+  family-difference alone. Job-create only; 6 vitest cases + build green.
 - **Tests:** `tests/test_phase_model_budget.py` (12 cases — incident, mixed
   window/family/multimodal, catalog-window pin, explicit-param pin, same-family dedupe,
   session-shape unchanged). `tests/test_settings_matrix.py` + context/graph suites stay green.
@@ -267,13 +273,21 @@ Sessions (single `llm.model`, `has_phase_overrides()` false) are untouched.
   `resolve_phase_model_budget` *inside the live orchestrator pod*: incident inputs
   (`gpt-5.5`/`gpt-5.4-mini`, base gemma) → `min_window=1,050,000` (not 131072) + gpt-5 params
   (`temp 1.0 / top_p None / top_k None`); `gemini-3.5-flash` both → `1,000,000`.
-- ⏳ **Live-job e2e — deferred to dev.** k3d can't exercise it: its catalog has only `gemma`
-  as a chat model (no >131K model to flip *to*), and the available MCP targets dev. The clean
-  repro (a job that accumulates past 131K and would have 413'd pre-fix) needs the real gpt-5.x
-  models on dev — which requires shipping the fix there first. Plan: deploy to dev → re-create
-  the `gpt-5.5`/`gpt-5.4-mini` incident job → assert the agent log shows `budget=1,050,000`
-  and the job runs a >131K turn with **no** synthetic 413. (No k3d state was mutated during
-  verification — no jobs, catalog rows, or Keycloak changes.)
+- ✅ **Live-job e2e on k3d, 2026-06-22.** Submitted the exact incident config
+  (`config_override.llm.strategic=gpt-5.5`, `tactical=gpt-5.4-mini`, base gemma) through the real
+  dispatch path (REST `POST /api/jobs` via the internal-key header → auto-dispatch → scholar
+  subjob → agent pod → `config_override` merge → `_create_phase_llms`). The agent logged, in
+  order: `Settings matrix (gemma): … model_max_context_tokens=131072 … limits<-derived(base=131072)`
+  (the old base-derived value) immediately superseded by
+  `Created strategic LLM: gpt-5.5 (window=1050000, budget=1050000)` — the budget flip, live. The
+  job then 403'd on the local router's key (k3d serves only gemma), which is *after* the budget
+  computation and irrelevant to the fix. The phase models are uncatalogued on k3d, so the family
+  window comes from the matrix via `family_of` (no per-model catalog row needed). Both test jobs
+  were deleted afterward; no leaked pods.
+- ⏳ **Fully-completing run — still wants dev.** A job that actually *runs past 131K* (vs. just
+  proving the budget at boot) needs a real gpt-5.x endpoint, which lives on dev — gated on
+  shipping the fix there. Plan: deploy to dev → re-run the incident job → confirm a >131K turn
+  with **no** synthetic 413.
 
 **Immediate (operational):** ✅ done — wedged job `9639710d` cancelled (it could not
 self-recover).
