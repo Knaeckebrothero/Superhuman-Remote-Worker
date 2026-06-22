@@ -75,18 +75,25 @@ but the provisioner applies it to K8s too.
 `_reset_to_idle()` resets **per-task** state, but the agent is the same
 **process** across jobs, so anything at module/global scope or cached on
 `app.state` survives the reset. Whether that's safe depends entirely on what is
-rebuilt per job vs cached. Unverified, and the thing to actually investigate:
+rebuilt per job vs cached. Item 1 below (the load-bearing one) is now **verified
+safe** (2026-06-21); 2–5 remain to confirm:
 
-1. **Credential / LLM-client bleed — the load-bearing one.** Per-job creds
-   (`api_key`, `base_url`, `key_ring`) arrive in the `JobStartRequest`
-   `config_override` and are built into the client via
-   `loader.py:_create_openai_llm`. **If that client (or the resolved config) is
-   cached across loop iterations rather than rebuilt per job, job B can run on
-   job A's key/endpoint.** This directly undercuts the
-   [[credential_broker]] direction: per-job *ephemeral keys* are pointless if a
-   reused process holds the previous job's client. **Either way, per-job client
-   rebuild is a prerequisite for the broker** — so this audit has to happen
-   before brokering regardless of the one-shot/reuse decision.
+1. **Credential / LLM-client bleed — the load-bearing one. ✅ RESOLVED 2026-06-21.**
+   Per-job creds (`api_key`/`base_url`) arrive in `JobStartRequest.config_override`
+   and build the client via `loader._create_openai_llm`. **Verified the client is
+   rebuilt per dispatch, not cached:** the orchestrator injects `config_override` on
+   *every* dispatch → `config_dirty` is always true in `UniversalAgent.process_job`
+   → `_create_phase_llms()` reruns (rebuilding strategic/tactical **and** aux via
+   `_initialize_auxiliary_llm`) inside `_setup_job_workspace`, *before* the graph is
+   built with the tool-bound clients. So a looped pod running job B builds fresh
+   clients from job B's key — no job-A-on-job-B bleed. **The prerequisite for
+   per-job/fleet keys is cleared:** the usage-monitoring gateway's Slice 2a shipped a
+   shared fleet key on this basis ([[usage_monitoring_and_rate_limiting]]); Slice 2b
+   then landed **per-(user, project) scoped keys** (per-job keys proved unnecessary —
+   enforcement lives on shared team/user objects, so one key per (user, project) gives
+   the same limits without per-job churn), minted per dispatch on the same basis.
+   (Was: "if that client were cached across loop iterations,
+   job B could run on job A's key/endpoint, making per-job ephemeral keys pointless.")
 2. **Memory / RecallStore caches.** Project-scoped sharing is intended, but
    verify there's no cross-*project* or cross-*user* bleed when a pod serves
    job A (project X) then job B (project Y).
