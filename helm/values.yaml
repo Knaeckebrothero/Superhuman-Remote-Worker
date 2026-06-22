@@ -1035,6 +1035,20 @@ litellm:
   # still mints, so agents leave the admin master key — the security half lands).
   # Example: { "gemma-4-moe-strix": { "rpm": 60 }, "*": { "rpm": 120 } }
   backstop: {}
+  # -- Per-user / per-project rate-limit policy (Slice 2b). Drives the scoped
+  # keys the orchestrator mints per (user, project): `projects` → LiteLLM teams
+  # (per-model `model_rpm_limit`, aggregated across the project's keys), `users`
+  # → internal users (flat rpm/tpm). `categories` group models so one limit
+  # covers many; a project spec keys limits by category name (or "*" = every
+  # registered model). "default" applies when there's no per-id override. Empty
+  # = no per-entity limits (scoped keys still mint → attribution + off the admin
+  # master key; the aggregate `backstop` still applies via the fleet fallback).
+  # Example:
+  #   ratePolicy:
+  #     categories: { large: ["gemma-4-moe-strix"] }
+  #     projects:   { default: { large: { rpm: 30 } } }
+  #     users:      { default: { rpm: 120 } }
+  ratePolicy: {}
   resources:
     requests:
       memory: "512Mi"

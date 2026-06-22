@@ -31,7 +31,7 @@ aliases:
 > under provider API limits and subscription-coding-plan rate limits, so the fleet
 > stops generating constant 429 errors.
 
-**Status:** Design — ready to build.
+**Status:** **Slices 1 + 2a committed; Slice 2b implemented + k3d-verified (2026-06-22), uncommitted on `develop`.** Slices 3–4 pending. See **Implementation status** below for what shipped, the spike findings that revised the design, and the gotchas.
 **Triggered by:** Putting the system into real operation. Multiple agents call
 the same providers with **zero coordination** today — each discovers limits by
 hitting a 429 and backing off independently (`src/graph.py:177-290` classify +
@@ -48,6 +48,102 @@ stop, and **live RPM/TPM/usage monitoring**.
 markup / billing → [[saas_billing_and_metering]]; capacity-aware admission
 (derived concurrency) → Deferred §; the custom usage ledger + workspace metering
 → Slice 4 (later).
+
+## Implementation status (updated 2026-06-21)
+
+Built on local k3d (`k3d-srw`), uncommitted on `develop`. Driven **spike-first** —
+several LiteLLM assumptions in this doc were **overturned by live testing** and the
+design revised accordingly (below).
+
+**✅ Slice 1 — gateway + per-model RPM measurement.** LiteLLM in-chart (own Postgres,
+DB mode, Prisma self-migrate). The model catalog is **DB-only** (admin-curated, keys
+encrypted in the app DB, no Secret copy), so the orchestrator **syncs the catalog into
+LiteLLM via its admin API** (`/model/new`) rather than a static `config.yaml`:
+`orchestrator/services/litellm_gateway.py` decrypts each upstream key (as dispatch
+already does) and registers endpoint-kind models, reconciling on a 60 s loop. Agent
+traffic is pointed at the gateway via the existing dispatch config-swap
+(`_inject_dispatch_credentials` / `_inject_model_credentials`). *Verified:* 4 homelab
+models registered; real gemma traffic measured per-model in `/spend/logs`. *Scope held:*
+endpoint-kind models only (gemini/`system` + embedding/whisper/tts stay direct for now;
+codex isn't deployed on this cluster).
+
+**✅ Slice 2a — aggregate upstream backstop (shared fleet key).** The prereq
+([[agent_loop_mode_pod_reuse]] item 1) is **resolved**: the agent rebuilds its LLM
+clients (strategic/tactical/aux) on every dispatch (`config_dirty` always true →
+`_create_phase_llms()` reruns before the graph builds), so minted keys can't bleed
+across jobs. The backstop is a **shared, non-admin "fleet" key** (deterministic value =
+HMAC of the master key, so routing recomputes it with no persistence) carrying
+`model_rpm_limit = capacity`, that all agents use **instead of the admin master key**.
+Config knob: `litellm.backstop` (`{model_id|'*':{rpm/tpm}}`, default `{}`). *Verified:*
+fleet aggregate 429 at a test cap, cap-removal propagates, agents off the master key,
+34 unit tests.
+
+**✅ Slice 2b — per-user / per-project rate limits (scoped keys).** Each job/session
+routes through a **per-(user, project) scoped key** instead of the shared fleet key:
+deterministic value (HMAC, like the fleet key), bound to a LiteLLM **team** (= project,
+carrying per-model `model_rpm_limit`) and an **internal user** (= user, flat `rpm`/`tpm`).
+The key itself carries no limits — the **team and user objects do the aggregating**
+(team across the project's keys, user across the user's keys), both **in-memory, no
+Redis** (verified). *Not per-job keys:* enforcement lives on the shared team/user
+objects, so one key per (user, project) gives identical enforcement without per-job
+mint/revoke churn — the doc's "per-session to cut churn" steer (per-job *attribution* is
+deferred to the Slice-4 ledger). Jobs missing a user or project fall back to the fleet
+key (still aggregate-capped). Policy source = `litellm.ratePolicy` value →
+`LITELLM_RATE_POLICY` env JSON (`{categories, projects, users}`); the orchestrator
+**expands category → model_names with a validation guard** (an entry naming an
+unregistered model is dropped + warned, never silently unthrottled — capability gap 1).
+Impl: `ensure_scoped_key` + `upsert_team`/`upsert_internal_user`/`upsert_scoped_key` in
+`litellm_gateway.py`; routing via `_gateway_routing_target_scoped` wired into both
+`_inject_dispatch_credentials` (worker jobs) and `_inject_thread_dispatch_credentials`
+(sessions), threaded to every model section via a `gateway_override`. **Hash-gated** so a
+repeat dispatch with unchanged policy issues no gateway calls. *Verified live (k3d, real
+`ensure_scoped_key` against the gateway):* team created with `model_rpm_limit
+{gemma:5}` (ghost model filtered by the guard), key bound to `team_id` + `user_id`,
+internal user `rpm_limit=50`, **8 reqs through the scoped key → `[200,200,429×6]`**
+(team limit binds); 26 new unit tests (60 total). *Scope:* per-user **per-model** limits
+deferred (would need one-key-per-user, which conflicts with per-project teams — a LiteLLM
+modeling limit); per-user is flat for now.
+
+**Decision on the aggregate backstop (2a) vs scoped keys (2b):** an agent presents one
+key, so the fleet-key bucket and a scoped key are mutually exclusive per request. The
+fleet key stays the **fallback** (no user/project, or gateway blip); for scoped traffic
+the aggregate ceiling is **`Σ(project team caps) ≤ capacity`, an admin invariant** (a true
+global ceiling needs Redis at multi-replica — Scaling §). Honest for single-replica v1.
+
+**Spike findings that revised the design:**
+- **Per-deployment `rpm`/`tpm` does NOT 429** without **Redis + `enable_pre_call_check`/
+  `enforce_model_rate_limits`** (v1 has no Redis) — it's router/load-balancing metadata.
+  → **Decision 5a revised:** backstop is the fleet key, not a `config.yaml` number.
+- **The admin master key bypasses all rate limits** → it can't be the agent credential
+  (hence the fleet key).
+- **Key/team `model_rpm_limit` DOES enforce in-memory** (no Redis) → `429 + Retry-After:
+  60`. The gap-3 worry (per-model key limits unreliable, #10052) did **not** reproduce —
+  no `enforce_model_rate_limits` needed for key-level limits. **2b extends this (verified
+  2026-06-22):** team `model_rpm_limit` **and** internal-user flat `rpm` both enforce
+  in-memory too, and **compose on one scoped key** (key bound to both). One caveat: the
+  **team** limiter trips *stricter* than nominal (rpm=5 cut at ~2) — fine for a protective
+  throttle (agents back off), but don't read team caps as exact.
+- `/key/generate` accepts a **custom key value** (→ deterministic fleet key); an **empty
+  `model_rpm_limit` clears** a cap (so `/key/update` must always send the limit dicts,
+  since omitted fields keep old values).
+
+**Gotchas worth keeping:**
+- LiteLLM first boot **OOMKilled at 1Gi** (Prisma-migrate + proxy spike) → chart default
+  raised to **2Gi + `--num_workers 1`** (each uvicorn worker reloads the whole app).
+- LiteLLM serves OpenAI under `/v1`, admin/health at root — routing appends `/v1`, the
+  admin client uses the bare base URL.
+- Dashboard is ClusterIP-only: `kubectl -n srw port-forward svc/srw-litellm 4000:4000` →
+  `/ui` (master-key login).
+- If multi-replica is ever needed (shared counters), use **Valkey** (BSD, drop-in);
+  Postgres can't sub for LiteLLM's hot-path counters (Redis-hardcoded + hot-row write
+  antipattern).
+
+**Next:** commit 2b; set a real `backstop` + `ratePolicy` capacity (or measure the strix
+box's safe RPM); Slice 3 (long-window quota stop); Slice 4 (ledger + Cockpit view).
+*Deferred within 2b:* per-user **per-model** limits; a DB-table + Cockpit-UI policy source
+(file/values-driven for now); full job-dispatch E2E through `_gateway_routing_target_scoped`
+(the helper is verified live; the dispatch glue is unit + inspection-proven, same caveat as
+Slice 1's "real JOB through `_inject_dispatch_credentials`").
 
 ## Why a gateway (the one mechanism that does all of it)
 
@@ -250,7 +346,7 @@ egress surface (composes with the agent-egress NetworkPolicy work).
 
 ## Slices (each independently shippable)
 
-### Slice 1 — Gateway + RPM/TPM visibility *(the measurement need; starting point)*
+### Slice 1 — Gateway + RPM/TPM visibility — ✅ IMPLEMENTED (k3d-verified 2026-06-21)
 - Stand up LiteLLM in-chart; route all agent LLM traffic through it via the
   dispatch config-swap. **No enforcement yet** — pass-through.
 - Include codex/subscription models via LiteLLM → CLIProxyAPI so their usage is
@@ -263,15 +359,24 @@ egress surface (composes with the agent-egress NetworkPolicy work).
   providers + codex all visible as upstreams.
 
 ### Slice 2 — Per-user / per-project rate limits *(the headline enforcement)*
+> **2a (aggregate backstop, shared fleet key) ✅ + 2b (per-user/project, scoped keys) ✅
+> IMPLEMENTED + k3d-verified** (2a 2026-06-21, 2b 2026-06-22 — see Implementation status +
+> decision 5a). 2a is committed; 2b is uncommitted on `develop`. The mapping below is what
+> shipped (project → team, user → internal user) — minus per-job keys, which 2b replaced
+> with one scoped key per (user, project) since enforcement lives on the team/user objects.
 - Admin config (ours): model → **category** map + a **RPM/TPM per category**,
   settable per **user** and per **project**, with per-model override.
 - Map to LiteLLM: **project → team** (`model_rpm_limit` dict), **user → internal
   user**, **job → virtual key** (tagged user_id+team_id) minted at dispatch,
   revoked on completion. Orchestrator **expands category → exact model_names**
   when writing the dicts + validates none silently skip. *(Prereq: per-job client
-  rebuild, [[agent_loop_mode_pod_reuse]].)*
-- Set per-deployment `rpm`/`tpm` in `config.yaml` to each provider key's real
-  capacity (decision 5a backstop).
+  rebuild, [[agent_loop_mode_pod_reuse]] — **RESOLVED 2026-06-21**: agent already
+  rebuilds its LLM clients per dispatch.)*
+- ~~Set per-deployment `rpm`/`tpm` in `config.yaml`~~ — **revised (done in 2a):**
+  per-deployment rpm doesn't 429 without Redis; the aggregate backstop is the shared
+  fleet key's `model_rpm_limit` instead (decision 5a). 2b adds the per-user/project
+  layer on top: **project → team** `model_rpm_limit` (aggregates per-model), **user →
+  internal user** (flat), **job → key** tagged user+team.
 - Breach → `429 + short Retry-After` → agent's existing backoff slows it down.
 - **Acceptance (enforcement is a gate, not faith — gap 3):** a configured per-user
   limit on a model **actually returns 429** under load in our deployment mode

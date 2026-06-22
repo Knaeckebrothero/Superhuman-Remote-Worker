@@ -194,6 +194,11 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: LITELLM_BACKSTOP
+            - name: LITELLM_RATE_POLICY
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: LITELLM_RATE_POLICY
             {{- end }}
             - name: MONGODB_URL
               valueFrom:

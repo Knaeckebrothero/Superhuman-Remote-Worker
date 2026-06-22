@@ -45,6 +45,10 @@ data:
   # Aggregate upstream backstop (per-model rpm/tpm capacity) → stamped on the
   # shared fleet key by the orchestrator. JSON map keyed by model_id (+ "*").
   LITELLM_BACKSTOP: {{ .Values.litellm.backstop | toJson | quote }}
+  # Per-user / per-project rate-limit policy (Slice 2b) → the orchestrator
+  # expands it into LiteLLM teams (projects) + internal users + scoped keys.
+  # JSON: { categories, projects, users }.
+  LITELLM_RATE_POLICY: {{ .Values.litellm.ratePolicy | toJson | quote }}
   {{- end }}
 
   # (Citations live in the vector store — srw_vector — reached through the

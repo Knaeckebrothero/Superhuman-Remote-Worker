@@ -61,6 +61,13 @@ FLEET_KEY_ALIAS = "srw-fleet-backstop"
 _fleet_key_ready = False
 _fleet_spec_hash: str | None = None
 
+# Slice 2b: per-(user, project) scoped keys. Maps (user_id, project_id) → the
+# spec hash we last ensured in the gateway, so the hot dispatch path skips the
+# team/user/key upserts unless the resolved limits/models actually changed. The
+# key *value* is deterministic (compute_scoped_key), so nothing is persisted —
+# this cache is a pure latency optimization, safe to lose on restart.
+_scoped_ensured: Dict[tuple[str, str], str] = {}
+
 
 def _rev_for_endpoint(endpoint: Dict[str, Any]) -> int:
     """Revision stamp for an endpoint, from its ``updated_at``.
@@ -164,6 +171,90 @@ class LiteLLMClient:
             f"{self._base_url}/key/update",
             headers=self._headers,
             json={"key": key, **spec},
+        )
+        upd.raise_for_status()
+
+    async def upsert_team(
+        self, team_id: str, *, alias: str, spec: Dict[str, Any]
+    ) -> None:
+        """Create a team with a fixed ``team_id``, or update it (Slice 2b project).
+
+        The team carries the project's per-model ``model_rpm_limit`` dict, which
+        LiteLLM enforces **aggregated across every key in the team** (in-memory,
+        no Redis) — verified 2026-06-22. ``team_id`` is deterministic
+        (``srw-proj-<uuid>``) so a re-create on restart re-asserts the same team.
+        """
+        resp = await self._client.post(
+            f"{self._base_url}/team/new",
+            headers=self._headers,
+            json={"team_id": team_id, "team_alias": alias, **spec},
+        )
+        if resp.status_code == 200:
+            return
+        upd = await self._client.post(
+            f"{self._base_url}/team/update",
+            headers=self._headers,
+            json={"team_id": team_id, **spec},
+        )
+        upd.raise_for_status()
+
+    async def upsert_internal_user(self, user_id: str, *, spec: Dict[str, Any]) -> None:
+        """Create an internal user with a fixed ``user_id``, or update it (2b user).
+
+        Internal-user limits are **flat** (``rpm_limit``/``tpm_limit``), enforced
+        aggregated across all of the user's keys (in-memory) — verified
+        2026-06-22. ``auto_create_key`` is disabled: we mint the scoped key
+        ourselves with a deterministic value so routing never has to read it back.
+        """
+        resp = await self._client.post(
+            f"{self._base_url}/user/new",
+            headers=self._headers,
+            json={"user_id": user_id, "auto_create_key": False, **spec},
+        )
+        if resp.status_code == 200:
+            return
+        upd = await self._client.post(
+            f"{self._base_url}/user/update",
+            headers=self._headers,
+            json={"user_id": user_id, **spec},
+        )
+        upd.raise_for_status()
+
+    async def upsert_scoped_key(
+        self,
+        key: str,
+        *,
+        alias: str,
+        user_id: str,
+        team_id: str,
+        models: list[str],
+    ) -> None:
+        """Create/refresh a per-(user,project) key bound to its team + owner.
+
+        The key itself carries **no** limits — it inherits the team's per-model
+        caps and the internal user's flat caps, which is the whole point: one key
+        per (user, project), enforcement on the shared team/user objects. ``key``
+        is deterministic (HMAC) so it survives restarts; ``user_id``/``team_id``
+        bind it on create and never change for a given (user, project) pair, so
+        the update path only needs to refresh the allowed ``models`` list.
+        """
+        resp = await self._client.post(
+            f"{self._base_url}/key/generate",
+            headers=self._headers,
+            json={
+                "key": key,
+                "key_alias": alias,
+                "user_id": user_id,
+                "team_id": team_id,
+                "models": models,
+            },
+        )
+        if resp.status_code == 200:
+            return
+        upd = await self._client.post(
+            f"{self._base_url}/key/update",
+            headers=self._headers,
+            json={"key": key, "models": models},
         )
         upd.raise_for_status()
 
@@ -405,6 +496,236 @@ async def ensure_fleet_key(
         len(model_ids),
         limits or "none (off master key only)",
     )
+
+
+# ---------------------------------------------------------------------------
+# Slice 2b — per-user / per-project rate limits (scoped virtual keys).
+#
+# Enforcement subjects map onto LiteLLM as: project → **team** (per-model
+# ``model_rpm_limit`` dict), user → **internal user** (flat ``rpm_limit``). Both
+# enforce in-memory without Redis (verified 2026-06-22). An agent presents one
+# **scoped key** per (user, project) that is bound to that project's team and
+# that user's internal-user record; the key carries no limits of its own, so the
+# team + user objects do the aggregating. The aggregate fleet backstop (2a) stays
+# the fallback for jobs missing a user or project. The policy (category→models +
+# per-project / per-user limits) rides in the ``LITELLM_RATE_POLICY`` env as JSON,
+# the chart's ``litellm.ratePolicy`` value — file-driven for v1; a DB table + admin
+# UI can replace the source later without touching this enforcement plumbing.
+# ---------------------------------------------------------------------------
+
+
+def _team_id_for_project(project_id: str) -> str:
+    """Deterministic LiteLLM team id for an SRW project."""
+    return f"srw-proj-{project_id}"
+
+
+def _internal_user_id_for(user_id: str) -> str:
+    """Deterministic LiteLLM internal-user id for an SRW user."""
+    return f"srw-user-{user_id}"
+
+
+def compute_scoped_key(master_key: str, user_id: str, project_id: str) -> str:
+    """Deterministic, secret value for a (user, project) scoped key.
+
+    Same construction as :func:`compute_fleet_key` — HMAC of the (user, project)
+    pair under the master key — so routing recomputes it without persistence, yet
+    it's unguessable without the master key. Distinct ``sk-srw-`` shape from the
+    fleet key's ``sk-srw-fleet-``.
+    """
+    label = f"srw-scoped:{user_id}:{project_id}"
+    digest = hmac.new(master_key.encode(), label.encode(), hashlib.sha256).hexdigest()
+    return f"sk-srw-{digest[:48]}"
+
+
+def _parse_rate_policy() -> Dict[str, Any]:
+    """Parse ``LITELLM_RATE_POLICY`` (JSON) → the per-user/project limit policy.
+
+    Schema (all optional)::
+
+        {
+          "categories": {"large": ["modelA", "modelB"], "small": ["modelC"]},
+          "projects": {"default": {"large": {"rpm": 30}}, "<pid>": {"*": {"rpm": 10}}},
+          "users":    {"default": {"rpm": 120}, "<uid>": {"rpm": 300}}
+        }
+
+    Project specs are keyed by **category** (or ``'*'`` = every registered model);
+    user specs are **flat** rpm/tpm. Empty / malformed → ``{}`` (no per-entity
+    limits; agents still ride scoped keys off the master key — the attribution +
+    off-admin-key half always lands, mirroring the fleet key's behavior).
+    """
+    raw = os.getenv("LITELLM_RATE_POLICY", "").strip()
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else {}
+    except (ValueError, TypeError):
+        logger.warning("LITELLM_RATE_POLICY is not valid JSON; ignoring rate policy")
+        return {}
+
+
+def _category_models(
+    policy: Dict[str, Any], category: str, model_ids: list[str]
+) -> list[str]:
+    """Resolve a project-spec category to registered model_names (validation guard).
+
+    ``'*'`` fans out to every registered model. Otherwise looks the category up in
+    the policy's ``categories`` map and keeps only models that are actually
+    registered in the gateway — an entry naming an unknown model is **skipped with
+    a warning**, never silently applied (capability gap 1: LiteLLM keys limits by
+    exact model_name and drops a mismatch without erroring).
+    """
+    if category == "*":
+        return list(model_ids)
+    registered = set(model_ids)
+    named = (policy.get("categories") or {}).get(category) or []
+    valid = [m for m in named if m in registered]
+    unknown = [m for m in named if m not in registered]
+    if unknown:
+        logger.warning(
+            "Rate policy: category %r names unregistered model(s) %s — skipped "
+            "(would be silently unthrottled by LiteLLM)",
+            category,
+            sorted(set(unknown)),
+        )
+    return valid
+
+
+def _team_limits_for_project(
+    policy: Dict[str, Any], project_id: str, model_ids: list[str]
+) -> Dict[str, Any]:
+    """Build a team's ``model_rpm_limit`` / ``model_tpm_limit`` from the policy.
+
+    Looks up the project's spec (its own id, else ``'default'``), expands each
+    category → model_names, and emits per-model dicts. A category that matches no
+    registered model is warned about, not dropped silently.
+    """
+    projects = policy.get("projects") or {}
+    spec = projects.get(project_id) or projects.get("default") or {}
+    model_rpm: Dict[str, int] = {}
+    model_tpm: Dict[str, int] = {}
+    for category, limits in spec.items():
+        if not isinstance(limits, dict):
+            continue
+        models = _category_models(policy, category, model_ids)
+        if not models:
+            logger.warning(
+                "Rate policy: project %s category %r matched no registered models",
+                project_id,
+                category,
+            )
+            continue
+        for m in models:
+            if limits.get("rpm"):
+                model_rpm[m] = int(limits["rpm"])
+            if limits.get("tpm"):
+                model_tpm[m] = int(limits["tpm"])
+    out: Dict[str, Any] = {}
+    if model_rpm:
+        out["model_rpm_limit"] = model_rpm
+    if model_tpm:
+        out["model_tpm_limit"] = model_tpm
+    return out
+
+
+def _user_limits(policy: Dict[str, Any], user_id: str) -> Dict[str, Any]:
+    """Build an internal user's flat ``rpm_limit`` / ``tpm_limit`` from the policy."""
+    users = policy.get("users") or {}
+    spec = users.get(user_id) or users.get("default") or {}
+    out: Dict[str, Any] = {}
+    if spec.get("rpm"):
+        out["rpm_limit"] = int(spec["rpm"])
+    if spec.get("tpm"):
+        out["tpm_limit"] = int(spec["tpm"])
+    return out
+
+
+async def ensure_scoped_key(
+    client: LiteLLMClient,
+    postgres_db: Any,
+    master_key: str,
+    *,
+    user_id: str | None,
+    project_id: str | None,
+) -> str | None:
+    """Provision the (user, project) scoped key + its team/internal-user, return it.
+
+    Returns ``None`` when the job has no user or no project — the caller then
+    falls back to the shared fleet key (2a), which still caps the aggregate. Else
+    idempotently upserts the project's team (per-model limits), the user's
+    internal-user record (flat limits), and the deterministic scoped key bound to
+    both, then returns the key value.
+
+    Hash-gated by ``_scoped_ensured`` so a repeat dispatch for the same
+    (user, project) with unchanged policy/models issues **no** gateway calls —
+    only the resolve + hash. The team/user limit dicts are **always sent in full**
+    (empty = cleared) so lowering or removing a limit propagates, same lesson as
+    the fleet key's ``/key/update``.
+    """
+    if not user_id or not project_id:
+        return None
+    desired = await build_desired_models(postgres_db)
+    model_ids = sorted(spec["model_name"] for spec in desired.values())
+    if not model_ids:
+        return None
+
+    policy = _parse_rate_policy()
+    team_limits = _team_limits_for_project(policy, project_id, model_ids)
+    user_limits = _user_limits(policy, user_id)
+    team_id = _team_id_for_project(project_id)
+    internal_uid = _internal_user_id_for(user_id)
+    key = compute_scoped_key(master_key, user_id, project_id)
+
+    spec_hash = json.dumps(
+        {
+            "models": model_ids,
+            "team": team_limits,
+            "user": user_limits,
+            "team_id": team_id,
+            "uid": internal_uid,
+        },
+        sort_keys=True,
+    )
+    if _scoped_ensured.get((user_id, project_id)) == spec_hash:
+        return key
+
+    # Team (project): always send both limit dicts so removals propagate.
+    await client.upsert_team(
+        team_id,
+        alias=f"srw-proj-{project_id}",
+        spec={
+            "models": model_ids,
+            "model_rpm_limit": team_limits.get("model_rpm_limit", {}),
+            "model_tpm_limit": team_limits.get("model_tpm_limit", {}),
+        },
+    )
+    # Internal user: flat limits. Send explicit null to clear when absent so a
+    # removed per-user override propagates (same omitted-field caveat as keys).
+    await client.upsert_internal_user(
+        internal_uid,
+        spec={
+            "rpm_limit": user_limits.get("rpm_limit"),
+            "tpm_limit": user_limits.get("tpm_limit"),
+        },
+    )
+    await client.upsert_scoped_key(
+        key,
+        alias=f"srw-scoped-{user_id}-{project_id}",
+        user_id=internal_uid,
+        team_id=team_id,
+        models=model_ids,
+    )
+    _scoped_ensured[(user_id, project_id)] = spec_hash
+    logger.info(
+        "Scoped key ensured: user=%s project=%s (%d models, team_limits=%s, "
+        "user_limits=%s)",
+        user_id,
+        project_id,
+        len(model_ids),
+        team_limits or "none",
+        user_limits or "none",
+    )
+    return key
 
 
 async def litellm_sync_loop(
