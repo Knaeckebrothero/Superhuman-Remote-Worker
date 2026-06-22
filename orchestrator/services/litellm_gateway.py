@@ -258,6 +258,36 @@ class LiteLLMClient:
         )
         upd.raise_for_status()
 
+    async def get_team_daily_usage(self, team_id: str, *, day: str) -> Dict[str, int]:
+        """A team's served-request + token totals for one UTC day (Slice 3 read path).
+
+        Reads ``GET /team/daily/activity`` (the **non-enterprise** activity endpoint —
+        ``/spend/report`` is Enterprise-gated and ``/spend/logs`` is dollar-only) and
+        sums the day's rows. Counts **successful** requests, not ``api_requests`` (which
+        also includes our own gateway 429s from the Slice-2 throttle — those never hit
+        the upstream, so they must not count against the daily quota). ``day`` is an
+        ISO ``YYYY-MM-DD`` (UTC); the caller computes it so this stays clock-free.
+
+        **Param gotcha (verified 2026-06-22):** the filter is ``team_ids`` (plural). The
+        singular ``team_id`` is **silently ignored** → the endpoint returns the *global*
+        all-team total, which would make every project share one usage number (a global
+        quota mislabeled as per-project). A single value is accepted for the plural param.
+        Note also an aggregation **lag**: just-served requests take ~tens of seconds to
+        appear — fine for a daily cap (a slightly late freeze still bounds daily volume).
+        """
+        resp = await self._client.get(
+            f"{self._base_url}/team/daily/activity",
+            headers=self._headers,
+            params={"team_ids": team_id, "start_date": day, "end_date": day},
+        )
+        resp.raise_for_status()
+        requests = tokens = 0
+        for row in resp.json().get("results") or []:
+            metrics = row.get("metrics") or {}
+            requests += int(metrics.get("successful_requests") or 0)
+            tokens += int(metrics.get("total_tokens") or 0)
+        return {"requests": requests, "tokens": tokens}
+
 
 async def build_desired_models(postgres_db: Any) -> Dict[str, Dict[str, Any]]:
     """Compute the LiteLLM deployments the catalog wants, keyed by ``model_info.id``.
@@ -726,6 +756,102 @@ async def ensure_scoped_key(
         user_limits or "none",
     )
     return key
+
+
+# ---------------------------------------------------------------------------
+# Slice 3 — longer-window quota (orchestrator-enforced).
+#
+# LiteLLM's only long-window cap is dollar-denominated (`max_budget`, fixed cron
+# reset) — there is no native request/token daily quota (capability gap 2). So the
+# quota stop is **orchestrator-enforced**: read per-project daily usage from the
+# gateway, and when a project crosses its quota, freeze its jobs + release their
+# workspaces (the enforcement lives in main.py — pause_job/release_workspace; this
+# module owns only the read path + policy). Per-**project** only for v1: the
+# `/team/daily/activity` read is reliable, but the per-user rollup doesn't populate
+# off key-ownership (verified). Window is the UTC day (rolling-N-hour deferred — the
+# midnight-flood mitigation is filed, not blocking). Policy = `LITELLM_QUOTA` env.
+# ---------------------------------------------------------------------------
+
+
+def _parse_quota_policy() -> Dict[str, Any]:
+    """Parse ``LITELLM_QUOTA`` (JSON) → the per-project daily quota policy.
+
+    Schema::
+
+        {"projects": {"default": {"requests_per_day": 5000, "tokens_per_day": 0},
+                      "<project_id>": {"requests_per_day": 1000}}}
+
+    A ``0`` / missing limit means "no cap on that axis". Empty / malformed → ``{}``
+    (no quota enforced — inert, mirroring backstop/ratePolicy: the loop still runs
+    but freezes nothing).
+    """
+    raw = os.getenv("LITELLM_QUOTA", "").strip()
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else {}
+    except (ValueError, TypeError):
+        logger.warning("LITELLM_QUOTA is not valid JSON; ignoring quota policy")
+        return {}
+
+
+def _project_quota(policy: Dict[str, Any], project_id: str) -> Dict[str, int]:
+    """Resolve a project's daily quota (its own entry, else ``default``)."""
+    projects = policy.get("projects") or {}
+    spec = projects.get(project_id) or projects.get("default") or {}
+    out: Dict[str, int] = {}
+    if spec.get("requests_per_day"):
+        out["requests_per_day"] = int(spec["requests_per_day"])
+    if spec.get("tokens_per_day"):
+        out["tokens_per_day"] = int(spec["tokens_per_day"])
+    return out
+
+
+async def compute_project_quota_status(
+    client: LiteLLMClient,
+    project_ids: list[str],
+    *,
+    day: str,
+) -> Dict[str, Dict[str, Any]]:
+    """For each project with a quota, read today's usage and decide over/under.
+
+    Returns ``{project_id: {"over": bool, "usage": {...}, "quota": {...}}}`` for only
+    the projects that *have* a quota (no-quota projects are omitted, never frozen).
+    ``day`` is the UTC ``YYYY-MM-DD`` the caller stamped. A project is **over** when it
+    meets-or-exceeds either configured axis (requests or tokens). A read failure for one
+    project is logged and that project skipped — a gateway blip must not mass-freeze.
+    """
+    policy = _parse_quota_policy()
+    if not policy:
+        return {}
+    out: Dict[str, Dict[str, Any]] = {}
+    for project_id in project_ids:
+        quota = _project_quota(policy, project_id)
+        if not quota:
+            continue
+        try:
+            usage = await client.get_team_daily_usage(
+                _team_id_for_project(project_id), day=day
+            )
+        except Exception:
+            logger.warning(
+                "Quota poll: failed to read usage for project %s; skipping this tick",
+                project_id,
+            )
+            continue
+        over = bool(
+            (
+                quota.get("requests_per_day")
+                and usage["requests"] >= quota["requests_per_day"]
+            )
+            or (
+                quota.get("tokens_per_day")
+                and usage["tokens"] >= quota["tokens_per_day"]
+            )
+        )
+        out[project_id] = {"over": over, "usage": usage, "quota": quota}
+    return out
 
 
 async def litellm_sync_loop(

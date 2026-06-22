@@ -49,6 +49,10 @@ data:
   # expands it into LiteLLM teams (projects) + internal users + scoped keys.
   # JSON: { categories, projects, users }.
   LITELLM_RATE_POLICY: {{ .Values.litellm.ratePolicy | toJson | quote }}
+  # Per-project daily quota policy (Slice 3) → the orchestrator's quota poll loop
+  # freezes a project's jobs when its UTC-day usage crosses the cap.
+  # JSON: { projects: { default|<id>: { requests_per_day, tokens_per_day } } }.
+  LITELLM_QUOTA: {{ .Values.litellm.quota | toJson | quote }}
   {{- end }}
 
   # (Citations live in the vector store — srw_vector — reached through the

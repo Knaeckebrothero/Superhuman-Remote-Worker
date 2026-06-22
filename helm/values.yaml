@@ -1034,6 +1034,8 @@ litellm:
   # gateway model without an explicit entry. Empty = no rate cap (the fleet key
   # still mints, so agents leave the admin master key — the security half lands).
   # Example: { "gemma-4-moe-strix": { "rpm": 60 }, "*": { "rpm": 120 } }
+  # TODO (deferred 2026-06-22): {} = inert (no cap). Measure the strix box's safe
+  # sustained RPM + provider/subscription tiers, then set real numbers to throttle.
   backstop: {}
   # -- Per-user / per-project rate-limit policy (Slice 2b). Drives the scoped
   # keys the orchestrator mints per (user, project): `projects` → LiteLLM teams
@@ -1048,7 +1050,23 @@ litellm:
   #     categories: { large: ["gemma-4-moe-strix"] }
   #     projects:   { default: { large: { rpm: 30 } } }
   #     users:      { default: { rpm: 120 } }
+  # TODO (deferred 2026-06-22): {} = inert (scoped keys mint, but no per-tenant
+  # cap). Measure per-project/per-user demand, then set real numbers.
   ratePolicy: {}
+  # -- Longer-window quota stop (Slice 3, orchestrator-enforced). Per-**project**
+  # daily request/token quota: when a project's UTC-day usage crosses the cap, the
+  # orchestrator freezes its running jobs (pause + workspace release) and stops
+  # re-dispatching them until the daily reset. Distinct from the rate limit above
+  # (that slows via 429; this stops). Per-project only for v1 (the per-user usage
+  # read is unreliable). `0`/missing = no cap on that axis. "default" applies when
+  # there's no per-id override. Empty = inert (the poll loop runs but freezes
+  # nothing). TODO (deferred 2026-06-22): measure real per-project daily volume.
+  # Example:
+  #   quota:
+  #     projects:
+  #       default:  { requests_per_day: 5000 }
+  #       "<project_id>": { requests_per_day: 1000, tokens_per_day: 2000000 }
+  quota: {}
   resources:
     requests:
       memory: "512Mi"
