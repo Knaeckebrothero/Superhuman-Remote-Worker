@@ -14,41 +14,53 @@ related:
   - "[[project_usage_monitoring_rate_limiting]]"
 ---
 
-# Per-phase models (`strategic`/`tactical`) inherit the **base** model's context window — big-window models get silently capped at the base/aux model's limit
+# Per-phase models (`strategic`/`tactical`) inherit the **base** model's family settings — both context window AND inference params — instead of their own
 
 **Filed:** 2026-06-22, from investigating dev job `9639710d-d63f-4496-ae90-0f2ade1d41dd`
 (scholar, "Research 03: verify-before-done", project `a9eae0b7`). The user picked
 `gpt-5.5` (strategic) + `gpt-5.4-mini` (tactical) — both nominally ~1M context — yet the
 job wedged in an infinite loop with a `413 context_overflow … exceeds model limit of
-131,072`. **Live incident** (job stuck `processing`, looping since ~12:36 UTC, burning a
-summarizer call every ~20 s).
+131,072`. **Live incident** (job stuck `processing`, looping ~12:36→14:32 UTC, burning a
+summarizer call every ~20 s; cancelled 2026-06-22).
 
-**Severity:** High. Any job/expert that overrides only the per-phase models to a
-larger-window model — while leaving the default `llm.model` base — is **silently capped at
-the base model's window** (128K with today's gemma default). The cap is enforced by SRW's
-*own* client-side preflight, so the request never reaches the provider, and the job cannot
-recover on its own.
+**Status:** ✅ **Fixed** 2026-06-22 (option B — see [Fixes](#fixes)). Root cause confirmed
+(see [Verification](#verification) + [[context_budget_base_model_verification]]); fix
+implemented, unit-verified, and **in-cluster-verified on k3d** (resolver run inside the live
+orchestrator pod → `1,050,000` not `131072`). Uncommitted on `develop`. A clean **live-job**
+e2e is deferred to **dev**: k3d's catalog is `gemma`-only, so it cannot exercise a >131K phase
+model, and the real gpt-5.x repro needs the fix shipped to dev first.
+
+**Severity:** High. Any job/expert that overrides only the per-phase models — while leaving
+the default `llm.model` base — gets **both** the wrong context window **and** the wrong
+inference parameters, taken from the base/aux model's family instead of the phase model's.
+The window mismatch is the loud failure (a self-inflicted 413 loop the job can't escape);
+the parameter mismatch is the quiet one (mostly masked today, but a latent correctness bug).
 
 > Line numbers were accurate on 2026-06-22 and will drift — re-grep
 > `_apply_settings_matrix`, `family_of`, `model = llm_data.get("model"`,
-> `CONTEXT_THRESHOLD_FRACTION` (`src/core/loader.py`); `phase_llm_config.model_max_context_tokens`
-> (`src/graph.py`); `_overflow_response_413`, `_max_context_tokens` (`src/llm/reasoning_chat.py`);
-> `_inject_endpoint_into_section`, `meta.context_window` (`orchestrator/main.py`) when acting on this.
+> `CONTEXT_THRESHOLD_FRACTION`, `def get_phase_config`, `def resolve_model_settings`
+> (`src/core/loader.py`); `_create_phase_llms` (`src/agent.py`);
+> `phase_llm_config.model_max_context_tokens` (`src/graph.py`);
+> `_overflow_response_413`, `_max_context_tokens` (`src/llm/reasoning_chat.py`);
+> `_inject_endpoint_into_section`, `meta.context_window` (`orchestrator/main.py`).
 
 ## Recommendation (TL;DR)
 
-The context budget for a job must be derived from the models that **actually run inference**
-(the `strategic`/`tactical` phase models), not from the base `llm.model` — which, when the
-phases are overridden, is only the **auxiliary/summarizer** model and never does main
-inference. Fix in `_apply_settings_matrix` (`src/core/loader.py:577`): resolve the window
-from the phase models (e.g. the **min** of their family windows, since the ContextManager
-uses one shared compaction budget across the alternating phases), and/or populate each
-phase config's own `model_max_context_tokens`.
+The root problem is general: **phase behavior is derived from the base `llm.model` slot**,
+which — when only `strategic`/`tactical` are overridden — is just the auxiliary/summarizer
+model and never runs main inference. This leaks along **two axes**:
 
-Two faster mitigations exist (set a per-model catalog `context_window`; or set the base
-`llm.model` to a gpt-5.x model) — see [Fixes](#fixes). The catalog-`context_window` route
-only corrects the per-phase call limits, not the global compaction budget, so it's a
-stopgap, not the real fix.
+1. **Context window** (a *shared* resource — one history is sent to whichever phase runs
+   next): fix by deriving the global budget from the **min** of the phase models' windows,
+   not the base model.
+2. **Inference params** (`temperature`, `top_p`, `top_k`, `multimodal`,
+   `parallel_tool_calls`, …) (*per-model*, independent per call): fix by having **each phase
+   resolve its own family's settings** — exactly what the auxiliary path already does
+   (`resolve_model_settings(aux.model)`, `agent.py:393`) and the phase path does not.
+
+Stopgaps (per-model catalog `context_window`; or set the base `llm.model`) fix the window
+only — see [Fixes](#fixes). The durable fix is "stop deriving phase behavior from the base
+slot," and it leaves **sessions** (single model in `llm.model`) untouched.
 
 ## Symptom
 
@@ -63,7 +75,7 @@ stopgap, not the real fix.
 - The job never advances: it retries 3×, fails the call, re-enters `execute`, runs an
   ineffective compaction, and repeats forever (observed at iteration 62+).
 
-## Root cause
+## Root cause — axis 1: context window
 
 **The "413" is synthetic — generated by SRW, not the provider** — and the `131,072`
 ceiling is **gemma's** window, not gpt-5.x's. Chain:
@@ -110,6 +122,66 @@ ceiling is **gemma's** window, not gpt-5.x's. Chain:
    floor stays above 131,072 → synthetic 413 → retry ×3 → re-loop. The job is structurally
    unable to recover.
 
+## Root cause — axis 2: inference parameters (same leak, quieter)
+
+The phase LLMs are built by `_create_phase_llms` (`src/agent.py:298`) →
+`llm_config.get_phase_config("strategic")`. `get_phase_config` (`src/core/loader.py:1103-1161`)
+fills each field **from the phase override if set, else from `self`** — the base llm config:
+
+```python
+top_p=override.top_p if override.top_p is not None else self.top_p,
+top_k=override.top_k if override.top_k is not None else self.top_k,
+multimodal=override.multimodal if override.multimodal is not None else self.multimodal,
+parallel_tool_calls=override.parallel_tool_calls if … else self.parallel_tool_calls,
+temperature=override.temperature if override.temperature is not None else self.temperature,
+```
+
+The phase override (`config_override.llm.strategic`) only set `model`, `temperature`,
+`reasoning_level`. Everything else falls through to `self`, whose params
+`_apply_settings_matrix` populated from the **gemma** family. So `gpt-5.5` actually ran with
+gemma's sampling/capability params:
+
+| Param | Inherited (gemma) | gpt-5 family value | Effect on this job |
+|---|---|---|---|
+| `top_k` | **64** | (none — reasoning model) | wrong, but **dropped by LiteLLM** `drop_params:true` |
+| `top_p` | **0.95** | (default) | wrong; passed through, minor for a reasoning model |
+| `multimodal` | true | true | coincidentally matches |
+| `parallel_tool_calls` | false | false | coincidentally matches |
+| `temperature` | 0.3 | 1.0 | overridden to 0 in `config_override`, so hidden |
+
+**Why it hasn't blown up** (all three masks happened to apply here):
+1. `litellm` is configured `drop_params: true` → silently drops `top_k` / penalties before
+   forwarding to codex-proxy.
+2. gemma and gpt-5 coincidentally agree on `parallel_tool_calls=false`, `multimodal=true`.
+3. `temperature` was explicitly overridden per phase.
+
+**Where it bites** (remove any mask): a phase model behind a provider **without**
+drop_params (rejects `top_k`); a **text-only** phase model under a multimodal base
+(`multimodal=true` leaks → image-token miscount / images sent to a text model); a model that
+needs `parallel_tool_calls=true` getting `false`; or any phase relying on its family's
+`temperature` default.
+
+**The auxiliary path already does this right** — `agent.py:393` calls
+`resolve_model_settings(aux_config.model)` so the aux model gets its *own* family's params.
+The phase path simply doesn't; it inherits the base's. Same pattern to copy.
+
+## Why sessions are fine and jobs aren't (the design gap)
+
+The whole settings-matrix path was built and validated against **sessions**, where it is
+correct — and it silently fails to transfer to **jobs**:
+
+- **Sessions:** one main model. The picker writes it to `llm.model` — the base slot. So
+  `family_of(llm.model)` = the model actually running → window **and** params correct.
+  Auxiliaries are a separate key and don't affect the main config.
+- **Jobs:** two co-equal phase models. The picker writes `llm.strategic` / `llm.tactical`
+  and leaves `llm.model` at the default. So `family_of(llm.model)` reads the **default**
+  (gemma), not either inference model → window and params wrong.
+
+Same code, right answer for sessions, wrong for jobs — the implicit assumption "`llm.model`
+is the model doing inference" holds for sessions and breaks for the job/phase-alternation
+model. This is *not* an expert-config defect: `defaults.yaml`'s cheap gemma base and
+scholar's `llm: {}` are both legitimate; the bug is the resolver keying off the base slot.
+
 ## Evidence
 
 Job config (`jobs.config_override.llm`, dev DB):
@@ -117,9 +189,11 @@ Job config (`jobs.config_override.llm`, dev DB):
 { "strategic": {"model": "gpt-5.5",      "temperature": 0, "reasoning_level": "high"},
   "tactical":  {"model": "gpt-5.4-mini",  "temperature": 0, "reasoning_level": "high"} }
 ```
-No base `llm.model` override → inherits gemma from `defaults.yaml`. `document_content` is
-empty (0 chars) — context is **accumulated** (KB/memory/tool results), not one big input
-doc, which is why compaction *should* have been the relief valve.
+No base `llm.model` override → inherits gemma from `defaults.yaml`. scholar's
+`config.yaml` is `$extends: defaults` with `llm: {}` (empty), so it does not set a base
+model either. `document_content` is empty (0 chars) — context is **accumulated**
+(KB/memory/tool results), not one big input doc, which is why compaction *should* have been
+the relief valve.
 
 Agent log (`srw-agent-j-8958a588`, ns `superhuman-remote-worker`):
 ```
@@ -130,75 +204,143 @@ graph.py:3857   [compaction] compaction.started: {'trigger':'auto','total_tokens
 reasoning_chat.py:798  Context overflow at HTTP layer: 139,594 tokens exceeds limit of 131,072
 graph.py:2123   LLM error after 4 attempts: Error code: 413 - {… 'code': 'context_overflow', 'token_count': 139594, 'limit': 131072}
 ```
-`top_k=64` is gemma's signature setting (`model_config_matrix.yaml:384`), confirming the
-window-driving family resolved to `gemma`. The `gpt-5.5`/`gpt-5.4-mini` catalog rows
-(`models` table) have `context_window = null`, so nothing overrides the gemma-derived base.
+The aux line shows gemma's `top_p=0.95, top_k=64` — the same flat params the phase configs
+inherit. `gpt-5.5`/`gpt-5.4-mini` catalog rows (`models` table) have `context_window = null`,
+so nothing overrides the gemma-derived base. **0 non-200 responses from `srw-litellm`** —
+the provider never errored; the 413 is entirely SRW's preflight.
 
-## Why this is broader than one job
+## Verification
 
-This is not specific to scholar or to gpt-5.x. The window is taken from `llm.model`
-regardless of whether that model ever runs inference. **Any** expert or job that:
-- keeps the default `llm.model` (gemma, 128K) as base/aux, **and**
-- overrides `strategic`/`tactical` to a larger-window model,
+Confirmed two independent ways (full detail + decision matrix in
+[[context_budget_base_model_verification]]):
 
-silently runs the large model at 128K. The bigger the gap between the base/aux window and
-the phase models' real windows, the more capability is left on the table — and for
-long-horizon jobs it manifests as an unrecoverable preflight-413 loop.
+- **Direct `_apply_settings_matrix` test** against the real matrix, single-variable
+  (strategic/tactical = `minimax/minimax-m3` in both; only the base model differs):
+  base=gemma → `model_max_context_tokens = 131072`; base=`minimax-m3` →
+  `1,000,000`. The budget flips on the base model alone, with identical 1M-window phase
+  models — and `minimax-m3` (OpenRouter) shares nothing with gpt-5/codex/LiteLLM, ruling
+  those out.
+- **Live evidence** already on record: the original job logged `Created OpenAI LLM:
+  model=gpt-5.5 … max_context_tokens=131072` for a `gpt-5` (1.05M-family) model — the full
+  live dispatch path, a second family.
 
-> The LiteLLM gateway going live on dev today (`ac211a52`, ~12:11 UTC) is **incidental** —
-> it now fronts these models (`base_url=http://srw-litellm:4000/v1`) but is not causal. The
-> gemma-derived cap and the synthetic preflight are independent of the gateway; the 413
-> never reaches it.
+(Side finding from the cluster attempt: MCP-submitted **worker** jobs are dispatch-denied
+for `shell_tools`/`delegation` unless the submitting identity holds those grants — clear
+those tools in `config_override` for scripted repros. Not part of this bug.)
 
 ## Fixes
 
-**Immediate (operational):** cancel the wedged job `9639710d` — it cannot self-recover and
-is burning summarizer calls each cycle.
+**✅ Implemented (2026-06-22, option B — on `develop`, unit-verified).** Stops deriving phase
+behavior from the base slot, centralized in `_create_phase_llms` (`src/agent.py`) via a new
+pure resolver `resolve_phase_model_budget` (`src/core/loader.py`):
 
-**Mitigation A — per-model catalog `context_window` (no code).** Set `context_window` on
-the `gpt-5.5` and `gpt-5.4-mini` catalog rows (Admin → Models; both `null` today). Dispatch
-injects it **per chat section** via `_inject_endpoint_into_section`
-(`orchestrator/main.py:3444-3445`), populating each phase config's
-`model_max_context_tokens` → the per-phase Layer-0 (preflight) and Layer-1 (`graph.py:1258`)
-limits become correct. **Caveat:** the *global* compaction budget (`config.limits`) is still
-gemma-derived (131K), so compaction stays over-eager (harmless, but wasteful). Stopgap, not
-a fix. Verify on re-run that the codex-proxy/ChatGPT backend actually accepts >131K — the
-current synthetic 413 means the provider's real per-request cap has never been exercised.
+- **Window:** budget = `min` over the strategic/tactical models' own windows (per-model
+  catalog `context_window` when set, else family window), written to `config.limits`
+  (compaction) **and** to each overridden phase's `config.model_max_context_tokens`.
+  *Implementation finding that corrects the design note below — raising `limits` alone is
+  NOT enough: `get_phase_config` copies the base `self.model_max_context_tokens` (gemma
+  131072) into each resolved phase config, and the per-client 413 preflight reads
+  `config.model_max_context_tokens or limits` (`loader.py` `_create_openai_llm`), so the
+  per-phase config window must be set too, not just the global `limits`.*
+- **Params:** each phase resolves its OWN family's `temperature/top_p/top_k/parallel_tool_calls`
+  via `resolve_model_settings(phase_model)` (explicit per-phase pins still win), mirroring the
+  aux path. gpt-5 phases now get `temp 1.0 / top_p None / top_k None`, not gemma's `0.3/0.95/64`.
+- **Multimodal:** reconciled to the **AND** across the two phases (min-capability) and written
+  back to `self.config.llm` so the per-tool image gate (`get_phase_multimodal` →
+  `self.config.llm.get_phase_config(phase).multimodal`) and the client flag agree — a
+  non-multimodal phase can't be handed an image the other phase left on the shared history.
+- **Warnings:** mixed family/window/multimodal logged + stored in the frozen-config blob as
+  `model_config_warnings` (backend surface; cockpit picker hint deferred).
+- **Tests:** `tests/test_phase_model_budget.py` (12 cases — incident, mixed
+  window/family/multimodal, catalog-window pin, explicit-param pin, same-family dedupe,
+  session-shape unchanged). `tests/test_settings_matrix.py` + context/graph suites stay green.
+
+Sessions (single `llm.model`, `has_phase_overrides()` false) are untouched.
+
+**Verification status:**
+- ✅ **Unit** — `tests/test_phase_model_budget.py` (12 cases: pure resolver + an integration
+  test driving the real `_create_phase_llms`); `tests/test_settings_matrix.py` (77) and the
+  context-overflow / context-safety / tool-context / graph-image / graph suites (220) stay
+  green; `ruff check` + `ruff format` clean.
+- ✅ **In-cluster (k3d), 2026-06-22** — code confirmed deployed (Tilt rebuilt the agent image
+  `16:29:24Z`, just after the edits; orchestrator `loader.py` live-synced). Ran
+  `resolve_phase_model_budget` *inside the live orchestrator pod*: incident inputs
+  (`gpt-5.5`/`gpt-5.4-mini`, base gemma) → `min_window=1,050,000` (not 131072) + gpt-5 params
+  (`temp 1.0 / top_p None / top_k None`); `gemini-3.5-flash` both → `1,000,000`.
+- ⏳ **Live-job e2e — deferred to dev.** k3d can't exercise it: its catalog has only `gemma`
+  as a chat model (no >131K model to flip *to*), and the available MCP targets dev. The clean
+  repro (a job that accumulates past 131K and would have 413'd pre-fix) needs the real gpt-5.x
+  models on dev — which requires shipping the fix there first. Plan: deploy to dev → re-create
+  the `gpt-5.5`/`gpt-5.4-mini` incident job → assert the agent log shows `budget=1,050,000`
+  and the job runs a >131K turn with **no** synthetic 413. (No k3d state was mutated during
+  verification — no jobs, catalog rows, or Keycloak changes.)
+
+**Immediate (operational):** ✅ done — wedged job `9639710d` cancelled (it could not
+self-recover).
+
+**Mitigation A — per-model catalog `context_window` (no code).** Set `context_window` on the
+phase models' catalog rows (Admin → Models; `null` today). Dispatch injects it **per chat
+section** via `_inject_endpoint_into_section` (`orchestrator/main.py:3444-3445`), correcting
+the per-phase Layer-0/Layer-1 limits. **Caveat:** the *global* compaction budget
+(`config.limits`) stays gemma-derived, so compaction stays over-eager; and it does nothing
+for the **parameter** leak. Stopgap.
 
 **Mitigation B — set the base model too.** Set `llm.model` (not just the phase models) to a
-gpt-5.x model in the expert/`config_override`. Then `family_of` → `gpt-5` → 1,050,000 and
-both the global budget and the phase limits are correct. Requires the base model to be
-settable from wherever the job was configured (the cockpit picker may only set
+matching model in the expert/`config_override`. Fixes both window and params for that job,
+but requires setting the base slot (the cockpit picker likely only writes
 `strategic`/`tactical`).
 
-**Proper fix (code).** Make `_apply_settings_matrix` (`src/core/loader.py:577`) derive the
-context window from the models that actually run inference:
-- When `strategic`/`tactical` (or any phase model) are present, resolve each phase model's
-  family window and set the **global** `config.limits.model_max_context_tokens` to the
-  **min** across them (the ContextManager uses one shared compaction budget for the
-  conversation history that is sent to whichever phase model runs next).
-- And/or populate each phase config's own `model_max_context_tokens` so
-  `graph.py:1258` uses the precise per-phase window for the Layer-0/Layer-1 gates.
-- Do **not** key the budget off `llm.model` when that model is only the auxiliary/summarizer.
+**Proper fix (code) — stop deriving phase behavior from the base slot.** Two parts, matching
+the two axes:
 
-Worth a paired check: the auxiliary/summarizer window already derives correctly from the
-aux model (`aux_limit_tokens: 131072` = gemma), so only the **main** budget needs the new
-derivation.
+1. **Context window = `min` over the models that actually run inference.** Because the
+   ContextManager keeps **one** history that is sent to whichever phase runs next, the budget
+   must fit the *smaller* window — otherwise a tactical call on the smaller model overflows.
+   - Sessions: min over `{llm.model}` = unchanged.
+   - Jobs: min over `{strategic, tactical}` (use the per-model catalog `context_window` when
+     set, else the family window).
+   - **Why `min`, and why it's near-optimal (not just safe):** worker compaction is *lossy*
+     (RemoveMessage permanently deletes/summarizes). Even if you let the history grow to the
+     big model's window during a strategic phase, the next tactical phase forces a compaction
+     down to the small window and that detail is gone for good — so in steady-state
+     alternation the effective ceiling collapses to ~min regardless of scheme. Truly using
+     both windows would require **separate per-phase histories or ephemeral per-call views**
+     (≈ what the session path's per-turn `ensure_within_limits` does) — a real
+     re-architecture of the worker compaction path, which re-summarizes every tactical call
+     and still feeds the small model a degraded view. **Decision (2026-06-22): ship `min`;**
+     revisit per-phase views only if a concrete wildly-mismatched pairing needs it.
+   - Add a **config-time warning** when the two windows differ a lot (e.g. >2×): *"tactical
+     <small> caps your strategic <big> — they share one history,"* so the tradeoff is visible
+     instead of silent.
+
+2. **Inference params = each phase resolves its OWN family.** Params are per-model and
+   independent per call — no sharing, no `min`. In `_create_phase_llms` / `get_phase_config`,
+   resolve each phase model's family settings via `resolve_model_settings(phase_model)`
+   (`loader.py:503`) and apply them, instead of inheriting the base's flat params — exactly
+   what the auxiliary path already does (`agent.py:393`).
+
+Net: derive **window from the min of the inference models** and **params from each phase
+model's own family**; never key either off `llm.model` when that slot is only the
+aux/summarizer. Add a regression test covering both shapes — single `llm.model` (session)
+and `strategic`+`tactical` with **mixed families and mixed windows** (job) — so this gap
+can't reopen.
 
 ## Repro
 
 1. Submit a worker job whose expert keeps the default `llm.model` (gemma) and overrides
-   `strategic`/`tactical` to a ~1M model (e.g. `gpt-5.5` / `gpt-5.4-mini`).
-2. Drive it until accumulated context (KB + memories + tool results) exceeds ~131K.
-3. Observe the synthetic `413 context_overflow … limit 131072` in the agent log
-   (`src/llm/reasoning_chat.py:798`) and the job looping without progress.
+   `strategic`/`tactical` to a ~1M model (e.g. `gpt-5.5` / `gpt-5.4-mini`, or
+   `minimax/minimax-m3`). (For MCP-scripted submission, also clear the grant gate:
+   `"tools": {"shell": [], "delegation": []}`.)
+2. Read the agent startup log: `Created OpenAI LLM: model=<big-model> … max_context_tokens=131072`
+   — the wrong (gemma) window, no need to grow context.
+3. Drive it until accumulated context exceeds ~131K → synthetic `413 context_overflow …
+   limit 131072` (`reasoning_chat.py:798`) and the job loops without progress.
 
 ## Open questions
 
-- **Real provider cap.** Because the 413 is synthetic, we don't yet know the codex-proxy →
-  ChatGPT/Codex OAuth backend's true per-request limit for `gpt-5.5`/`gpt-5.4-mini`. Confirm
-  before assuming ~1M end-to-end (the `/v1/models` listings don't advertise context length).
-- **Min-vs-per-phase semantics.** If a future job mixes a large-window strategic model with
-  a small-window tactical model, `min` is the safe global budget — but per-phase windows
-  would let each phase use its full capacity. Decide whether the added complexity is worth
-  it, or whether `min` is sufficient.
+- **Real provider cap.** The 413 is synthetic, so the codex-proxy → ChatGPT/Codex backend's
+  *true* per-request limit for `gpt-5.5`/`gpt-5.4-mini` is still unconfirmed above ~131K
+  (the largest *successful* call observed was ~131K; LiteLLM returned 200 on everything
+  below that). Confirm by raising the window and re-running.
+- ~~Min-vs-per-phase semantics~~ — **decided**: ship `min` (rationale above); per-phase
+  ephemeral views deferred.

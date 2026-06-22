@@ -529,6 +529,159 @@ def resolve_model_settings(
     return settings
 
 
+# Inference params that are family-bound and must be resolved per phase model
+# (NOT inherited from the base/primary slot). multimodal is handled separately
+# because it is reconciled to the AND across phases, not taken per-family.
+_PHASE_PARAM_KEYS = ("temperature", "top_p", "top_k", "parallel_tool_calls")
+
+
+def resolve_phase_model_budget(
+    *,
+    base_model: str,
+    strategic_override: Optional["PhaseLLMOverride"],
+    tactical_override: Optional["PhaseLLMOverride"],
+    summarization_override: Optional["PhaseLLMOverride"] = None,
+    deployment_dir: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Resolve the shared context budget + per-phase inference params for a
+    two-model (strategic/tactical) worker job.
+
+    Worker jobs run a strategic and a tactical model over ONE shared message
+    history, but historically derived both the global context budget AND the
+    sampling params from the base ``llm.model`` slot (gemma by default) — see
+    docs/issues/context_budget_uses_base_model_not_phase_models.md. This is the
+    pure resolver that replaces that: each phase's params/window/multimodal come
+    from its OWN family (never the base), and the shared budget is the ``min`` of
+    the two phase windows (forced by the single shared history — the smaller
+    model must be able to ingest whatever is there).
+
+    The "effective model" of a phase is ``override.model`` when the phase pins
+    one, else ``base_model`` (a phase with no override genuinely runs the base
+    model, so its window/capability legitimately constrains the shared history).
+
+    Args:
+        base_model: the base ``llm.model`` (used for any phase without a model pin).
+        strategic_override/tactical_override/summarization_override: the phase
+            override objects from ``self.config.llm.{strategic,tactical,summarization}``
+            (``None`` when that phase has no override). Used to detect
+            explicitly-pinned params (which win over the family default) and any
+            dispatch-injected per-model window (``model_max_context_tokens``).
+        deployment_dir: expert dir for per-expert matrix override.
+
+    Returns:
+        ``{
+            "min_window": Optional[int],          # min over strategic+tactical windows
+            "params": {phase: {temperature, top_p, top_k, parallel_tool_calls}},
+                                                   # only for phases WITH an override
+            "windows": {phase: Optional[int]},     # each overridden phase's OWN window
+            "effective_multimodal": bool,          # AND across strategic+tactical
+            "warnings": [(level, message)],        # level in {"warning","info"}
+        }``
+    """
+    _cache: Dict[str, Dict[str, Any]] = {}
+
+    def _family(model: str) -> Dict[str, Any]:
+        if model not in _cache:
+            _cache[model] = resolve_model_settings(model, deployment_dir)
+        return _cache[model]
+
+    def _eff_model(ov: "Optional[PhaseLLMOverride]") -> str:
+        return ov.model if (ov is not None and ov.model) else base_model
+
+    def _window(ov: "Optional[PhaseLLMOverride]") -> Optional[int]:
+        # Dispatch-injected per-model catalog window wins; else the family's
+        # true max. NEVER fall back to the base/limits window here (that is the
+        # bug this resolver fixes).
+        catalog = ov.model_max_context_tokens if ov is not None else None
+        return catalog or _family(_eff_model(ov)).get("model_max_context_tokens")
+
+    def _multimodal(ov: "Optional[PhaseLLMOverride]") -> bool:
+        pinned = ov.multimodal if ov is not None else None
+        if pinned is not None:
+            return bool(pinned)
+        return bool(_family(_eff_model(ov)).get("multimodal", False))
+
+    # --- shared-history budget: min over strategic + tactical ONLY -----------
+    # (summarization sends to the aux/summarizer path, not the shared phase
+    # history, so its window must not cap the main budget.)
+    strat_win = _window(strategic_override)
+    tact_win = _window(tactical_override)
+    windows = [w for w in (strat_win, tact_win) if w]
+    min_window = min(windows) if windows else None
+
+    # --- effective multimodal: AND across strategic + tactical ---------------
+    strat_mm = _multimodal(strategic_override)
+    tact_mm = _multimodal(tactical_override)
+    effective_multimodal = strat_mm and tact_mm
+
+    # --- per-phase inference params + own window (explicit pin wins) ---------
+    # Only phases WITH an override get a (distinct) resolved config we can safely
+    # mutate; a phase with no override genuinely runs the base model and keeps
+    # the base params/window. Each overridden phase's own window must be set on
+    # its client config so the HTTP-layer 413 preflight (``config.model_max_…
+    # or limits``) uses the model's TRUE window, not the inherited base one.
+    params: Dict[str, Dict[str, Any]] = {}
+    windows: Dict[str, Optional[int]] = {}
+    for name, ov in (
+        ("strategic", strategic_override),
+        ("tactical", tactical_override),
+        ("summarization", summarization_override),
+    ):
+        if ov is None:
+            continue  # phase uses the base model + base params; leave untouched
+        fam = _family(_eff_model(ov))
+        params[name] = {
+            k: (getattr(ov, k) if getattr(ov, k) is not None else fam.get(k))
+            for k in _PHASE_PARAM_KEYS
+        }
+        windows[name] = ov.model_max_context_tokens or fam.get(
+            "model_max_context_tokens"
+        )
+
+    # --- warnings ------------------------------------------------------------
+    warnings: List[tuple] = []
+    strat_model, tact_model = (
+        _eff_model(strategic_override),
+        _eff_model(tactical_override),
+    )
+    if strat_win and tact_win and strat_win != tact_win:
+        lo, hi = min(strat_win, tact_win), max(strat_win, tact_win)
+        warnings.append(
+            (
+                "warning" if hi > 2 * lo else "info",
+                f"Phase models have different context windows: "
+                f"strategic={strat_model}({strat_win}), tactical={tact_model}({tact_win}); "
+                f"shared history capped to min={lo}.",
+            )
+        )
+    if family_of(strat_model) != family_of(tact_model):
+        warnings.append(
+            (
+                "info",
+                f"Phase models are different families "
+                f"({family_of(strat_model)} vs {family_of(tact_model)}); "
+                f"each phase uses its own inference params.",
+            )
+        )
+    if strat_mm != tact_mm:
+        warnings.append(
+            (
+                "warning",
+                f"Phase models differ in multimodal capability "
+                f"(strategic={strat_mm}, tactical={tact_mm}); image input disabled "
+                f"for all phases (effective={effective_multimodal}).",
+            )
+        )
+
+    return {
+        "min_window": min_window,
+        "params": params,
+        "windows": windows,
+        "effective_multimodal": effective_multimodal,
+        "warnings": warnings,
+    }
+
+
 def bundled_settings_for_family(family: str, name: str) -> Any:
     """File-resolved settings leaf for <family> (default ⊕ family), ignoring DB
     overrides. ``name`` may be a dotted path into limits (e.g.
