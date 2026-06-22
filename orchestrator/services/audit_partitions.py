@@ -53,6 +53,19 @@ PARENTS: dict[str, int] = {
     "llm_requests": 90,
     "agent_audit": 90,
     "chat_history": 365,
+    # Usage-metering ledger (migrations/audit/0002). Billing substrate, so a
+    # longer window than the agent trace; raw rows are droppable once rolled up
+    # to the app-DB usage_daily mirror. (Retention is still deferred below.)
+    "usage_events": 365,
+}
+
+# Partition-key column per parent. The 0001 audit tables partition on
+# ``timestamp``; the 0002 usage ledger partitions on ``ts``. Only the leaf
+# CHECK-constraint column in _create_and_attach varies — naming, bounds, status,
+# and ANALYZE are all column-agnostic. Anything not listed defaults to
+# ``timestamp``, so the existing three parents generate byte-identical DDL.
+PARTITION_COLUMN: dict[str, str] = {
+    "usage_events": "ts",
 }
 
 LOOKAHEAD_MONTHS = 2  # current month + 2 pre-created (N+2)
@@ -84,6 +97,12 @@ def _quote_ident(ident: str) -> str:
     """Double-quote a SQL identifier (defensive — all callers pass controlled
     names derived from the PARENTS dict + computed YYYY_MM suffixes)."""
     return '"' + ident.replace('"', '""') + '"'
+
+
+def _part_col(parent: str) -> str:
+    """Partition-key column for a parent (``timestamp`` default; ``ts`` for the
+    usage ledger). Drives only the leaf bound CHECK in _create_and_attach."""
+    return PARTITION_COLUMN.get(parent, "timestamp")
 
 
 def _add_months(year: int, month: int, n: int) -> tuple[int, int]:
@@ -211,12 +230,15 @@ async def _create_and_attach(
 
     # A matching CHECK lets ATTACH skip the validation scan (free on an empty
     # leaf, load-bearing if a non-empty standalone is ever resumed). Idempotent.
+    # The bound column is the parent's partition key (`timestamp`, or `ts` for
+    # usage_events).
+    qcol = _quote_ident(_part_col(parent))
     bound = f"{part}_bound"
     qbound = _quote_ident(bound)
     await conn.execute(f"ALTER TABLE {qpart} DROP CONSTRAINT IF EXISTS {qbound}")
     await conn.execute(
         f"ALTER TABLE {qpart} ADD CONSTRAINT {qbound} "
-        f"CHECK (\"timestamp\" >= '{lo}' AND \"timestamp\" < '{hi}')"
+        f"CHECK ({qcol} >= '{lo}' AND {qcol} < '{hi}')"
     )
     await conn.execute(
         f"ALTER TABLE {qparent} ATTACH PARTITION {qpart} "
