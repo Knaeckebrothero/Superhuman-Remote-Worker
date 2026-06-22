@@ -774,9 +774,13 @@ const EXPIRY_OPTIONS = [
               } @else {
                 <span class="codex-status-dot" [class.connected]="codexStatus().connected"></span>
                 <span class="codex-status-text">
-                  {{ (codexStatus().connected ? 'settings.codex.connected' : 'settings.codex.notConnected') | transloco }}
-                  @if (codexStatus().model_count > 0) {
-                    &mdash; {{ codexStatus().model_count }} model(s) available
+                  @if (!codexStatus().reachable) {
+                    {{ 'settings.codex.notEnabled' | transloco }}
+                  } @else {
+                    {{ (codexStatus().connected ? 'settings.codex.connected' : 'settings.codex.notConnected') | transloco }}
+                    @if (codexStatus().model_count > 0) {
+                      &mdash; {{ codexStatus().model_count }} model(s) available
+                    }
                   }
                 </span>
                 <app-button
@@ -817,7 +821,8 @@ const EXPIRY_OPTIONS = [
               </div>
             }
 
-            <!-- Connect -->
+            <!-- Connect (only when the proxy is actually reachable) -->
+            @if (codexStatus().reachable) {
             <div class="create-form">
               <app-button
                 variant="primary"
@@ -862,6 +867,15 @@ const EXPIRY_OPTIONS = [
                 </div>
               }
             </div>
+            } @else if (!codexLoading()) {
+              <!-- Proxy disabled/down: explain how to turn it on instead of
+                   offering a Connect button that 502s on /api/codex/login. -->
+              <div class="codex-disabled-notice">
+                <p class="codex-disabled-title">{{ 'settings.codex.disabledTitle' | transloco }}</p>
+                <p class="codex-disabled-desc">{{ 'settings.codex.disabledDesc' | transloco }}</p>
+                <code class="codex-disabled-code">codexProxy.enabled: true</code>
+              </div>
+            }
           </section>
 
           <!-- Cloud Storage Section (Admin Only, Phase 4) -->
@@ -1403,6 +1417,38 @@ const EXPIRY_OPTIONS = [
       flex: 1;
     }
 
+    .codex-disabled-notice {
+      padding: 14px 16px;
+      background: var(--surface-0);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-surface);
+    }
+
+    .codex-disabled-title {
+      font-size: 14px;
+      font-weight: 600;
+      color: var(--text-primary);
+      margin: 0 0 6px 0;
+    }
+
+    .codex-disabled-desc {
+      font-size: 13px;
+      color: var(--text-secondary);
+      line-height: 1.6;
+      margin: 0 0 10px 0;
+    }
+
+    .codex-disabled-code {
+      display: inline-block;
+      padding: 4px 10px;
+      background: var(--surface-1);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-control);
+      font-family: 'JetBrains Mono', 'Fira Code', monospace;
+      font-size: 12px;
+      color: var(--text-secondary);
+    }
+
     .codex-accounts {
       margin-bottom: 16px;
     }
@@ -1614,7 +1660,7 @@ export class SettingsComponent implements OnInit {
   readonly commSaved = signal(false);
 
   // Codex proxy state (admin-only)
-  readonly codexStatus = signal<CodexStatus>({ connected: false, accounts: [], model_count: 0 });
+  readonly codexStatus = signal<CodexStatus>({ connected: false, reachable: false, accounts: [], model_count: 0 });
   readonly codexModels = signal<string[]>([]);
   readonly codexLoading = signal(false);
   readonly codexConnecting = signal(false);

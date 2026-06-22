@@ -593,6 +593,12 @@ export interface PersistentAgentSettings {
  */
 export interface CodexStatus {
   connected: boolean;
+  /**
+   * Whether the codex-proxy deployment is reachable at all. False when the
+   * proxy is disabled (e.g. `codexProxy.enabled: false`) or down — the UI
+   * shows an "enable it" disclaimer instead of a Connect button that 502s.
+   */
+  reachable: boolean;
   accounts: { name: string; status: string; status_message?: string }[];
   model_count: number;
 }
