@@ -28,7 +28,8 @@ summarizer call every ~20 s; cancelled 2026-06-22).
 implemented, unit-verified, and **verified end-to-end on the live k3d dispatch path** — a job
 with the exact incident config (`gpt-5.5`/`gpt-5.4-mini` over the gemma base) logged
 `Created strategic LLM: gpt-5.5 (window=1050000, budget=1050000)`, i.e. the budget flipped from
-gemma's `131072` to the gpt-5 family's `1,050,000`. Uncommitted on `develop`. (The k3d job then
+gemma's `131072` to the gpt-5 family's `1,050,000`. Committed + pushed to `develop`
+(`58540ac5` backend, `f1061559` UI; CD built `sha-f106155`) — rolling to dev. (The k3d job then
 403'd on the provider key — k3d serves only gemma — which is *after* the budget computation and
 irrelevant to the fix; a fully-completing run still wants a real gpt-5.x endpoint, i.e. dev.)
 

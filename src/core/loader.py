@@ -549,7 +549,7 @@ def resolve_phase_model_budget(
     Worker jobs run a strategic and a tactical model over ONE shared message
     history, but historically derived both the global context budget AND the
     sampling params from the base ``llm.model`` slot (gemma by default) — see
-    docs/issues/context_budget_uses_base_model_not_phase_models.md. This is the
+    docs/done/context_budget_uses_base_model_not_phase_models.md. This is the
     pure resolver that replaces that: each phase's params/window/multimodal come
     from its OWN family (never the base), and the shared budget is the ``min`` of
     the two phase windows (forced by the single shared history — the smaller

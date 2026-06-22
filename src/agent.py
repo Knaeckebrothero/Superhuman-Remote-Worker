@@ -324,7 +324,7 @@ class UniversalAgent:
             # Phase models resolve their OWN family params + window instead of
             # inheriting the base/primary slot (gemma by default). The shared
             # context budget is the min of the two phase windows (single shared
-            # history). See docs/issues/context_budget_uses_base_model_not_phase_models.md.
+            # history). See docs/done/context_budget_uses_base_model_not_phase_models.md.
             # NOTE: this overwrites the matrix/DB-derived `limits` window leaves —
             # the phase-min is authoritative for a job whose inference models are
             # the phase models, so it supersedes any base-family admin override.
