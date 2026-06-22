@@ -138,6 +138,50 @@ class TestPhaseOverrideCredentialInjection:
         assert result["llm"]["strategic"]["api_key"] == CODEX_API_KEY
 
     @pytest.mark.asyncio
+    async def test_blob_delivery_injects_phase_pin_transport(self, patched_main):
+        """eec20eeb regression (blob-delivery path).
+
+        ``serialize_resolved_config`` emits the phase blocks with explicit
+        ``base_url: None`` / ``provider: None`` leaves. ``inject_blob_credentials``
+        only stripped None at the TOP level of ``llm``, so the nested phase
+        leaves survived and defeated ``_inject_model_credentials``'s
+        ``setdefault`` (a present-but-None key is not overwritten). Codex phase
+        pins therefore shipped without transport and the agent fell back to
+        api.openai.com → 401. The base model worked (its top-level None WAS
+        stripped), masking the gap. This exercises the REAL resolve_config blob
+        through the REAL injector — the path jobs actually use.
+        """
+        from orchestrator.services.config_resolver import (
+            inject_blob_credentials,
+            resolve_config,
+        )
+
+        blob = resolve_config(
+            base_config_name="defaults",
+            request_override={
+                "llm": {
+                    "strategic": {"model": "gpt-5.3-codex-spark"},
+                    "tactical": {"model": "gpt-5.3-codex-spark"},
+                }
+            },
+            expert_type="worker",
+        )
+        # Precondition: serialize emits the None transport leaves that trigger
+        # the bug (guards against the fixture silently changing shape).
+        assert "base_url" in blob["agent"]["llm"]["strategic"]
+        assert blob["agent"]["llm"]["strategic"]["base_url"] is None
+
+        delivered = await inject_blob_credentials(
+            blob, lambda co: main._inject_dispatch_credentials(_job(), co)
+        )
+
+        llm = delivered["agent"]["llm"]
+        assert llm["strategic"]["base_url"] == CODEX_BASE_URL
+        assert llm["strategic"]["api_key"] == CODEX_API_KEY
+        assert llm["tactical"]["base_url"] == CODEX_BASE_URL
+        assert llm["tactical"]["api_key"] == CODEX_API_KEY
+
+    @pytest.mark.asyncio
     async def test_auxiliary_override_also_injected(self, patched_main):
         """Same hole existed for top-level `auxiliary` overrides."""
         override = {"auxiliary": {"model": "gpt-5.3-codex-spark"}}
