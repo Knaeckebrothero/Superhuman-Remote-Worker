@@ -218,6 +218,7 @@ from services.agent_provisioner import agent_provisioner  # noqa: E402
 from services.config_resolver import (  # noqa: E402
     inject_blob_credentials,
     resolve_config,
+    unrouted_model_slots,
 )
 from services.session_router import SessionRouterService  # noqa: E402
 from services.session_tokens import SessionTokenService  # noqa: E402
@@ -2030,6 +2031,29 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
         # job re-dispatched to a fresh agent doesn't lose its credentials.
         # (Still injected into config_override for the no-blob fallback path.)
         config_override = await _inject_dispatch_credentials(job, config_override)
+
+        # Fail fast on a pinned model with no resolvable transport rather than
+        # letting the agent silently fall back to api.openai.com and 401/404 with
+        # an opaque error (eec20eeb). Only the blob path is validated; the
+        # no-blob fallback keeps its legacy behaviour.
+        if resolved_config:
+            _unrouted = unrouted_model_slots(resolved_config)
+            if _unrouted:
+                msg = (
+                    "Pinned model(s) have no resolvable endpoint or provider after "
+                    f"dispatch resolution: {', '.join(_unrouted)}. Set the model's "
+                    "endpoint/provider key (Admin → Providers / Models) or pin a "
+                    "different model."
+                )
+                logger.error(
+                    "Dispatch: job %s has unroutable model slot(s) — %s",
+                    job_id,
+                    _unrouted,
+                )
+                await postgres_db.update_job_status(
+                    job_id, status="failed", error_message=msg
+                )
+                return False
 
         # Build job start request. resolved_config and config_override are
         # mutually exclusive on the wire: a delivered blob is complete, so we

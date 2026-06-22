@@ -144,3 +144,50 @@ def test_redact_strips_secrets_from_blob_for_persist():
     assert "api_key" not in persisted["agent"]["llm"]
     assert "FOO_API_KEY" not in persisted["agent"]["env_keys"]
     assert persisted["agent"]["env_keys"]["FOO_MODEL"] == "m"  # non-secret preserved
+
+
+# --- fail-fast: transport-less pinned models (Option D) ---------------------
+
+
+def test_unrouted_model_slots_flags_transportless_phase_pin():
+    """A pinned model with NO base_url / api_key / provider after injection would
+    silently fall back to api.openai.com and 401/404 (eec20eeb). Flag it so
+    dispatch can fail fast with an actionable error instead."""
+    from orchestrator.services.config_resolver import unrouted_model_slots
+
+    blob = {
+        "agent": {
+            "llm": {
+                "model": "gemma",
+                "base_url": "http://router/v1",  # base: routed
+                "strategic": {"model": "gpt-5.5"},  # UNROUTED — no transport
+                "tactical": {  # routed via provider + key
+                    "model": "gpt-5.4-mini",
+                    "provider": "openai",
+                    "api_key": "sk-x",
+                },
+            },
+            "auxiliary": {"model": "aux", "base_url": "http://aux/v1"},  # routed
+        }
+    }
+    problems = unrouted_model_slots(blob)
+    assert any("strategic" in p and "gpt-5.5" in p for p in problems)
+    assert not any("tactical" in p for p in problems)
+    assert not any(p.startswith("llm model") for p in problems)
+    assert not any("auxiliary" in p for p in problems)
+
+
+def test_unrouted_model_slots_empty_when_all_routed():
+    from orchestrator.services.config_resolver import unrouted_model_slots
+
+    blob = {"agent": {"llm": {"model": "m", "base_url": "u"}}}
+    assert unrouted_model_slots(blob) == []
+
+
+def test_unrouted_model_slots_ignores_slots_without_a_model():
+    """Empty/absent model sections are not failures (the base may legitimately
+    omit a phase pin)."""
+    from orchestrator.services.config_resolver import unrouted_model_slots
+
+    blob = {"agent": {"llm": {"model": "m", "base_url": "u", "strategic": {}}}}
+    assert unrouted_model_slots(blob) == []
