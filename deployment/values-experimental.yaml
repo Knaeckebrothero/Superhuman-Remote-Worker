@@ -129,7 +129,15 @@ virtualWorkspace:
 # -----------------------------------------------------------------------------
 # Databases — all internal (chart defaults), override here if you externalize
 # -----------------------------------------------------------------------------
-# databases:
+databases:
+  # LiteLLM gateway's dedicated Postgres (DB mode). LiteLLM OWNS + self-migrates
+  # this schema via Prisma on boot — the orchestrator migration runner never
+  # touches it. Creds come from Vault (srw-secrets: LITELLM_POSTGRES_USER /
+  # LITELLM_POSTGRES_PASSWORD); host/port/db are chart-provided. Required for
+  # virtual keys, per-user/team limits, and the spend/usage dashboard.
+  litellm:
+    enabled: true
+# Other DBs stay internal (chart defaults). Externalize here if needed:
 #   postgres:
 #     externalUrl: ""
 #   vector:
@@ -270,6 +278,29 @@ llm:
         family: "mistral"
         contextWindow: 256000
         capability: chat
+# -----------------------------------------------------------------------------
+# LiteLLM gateway — usage monitoring + rate limiting
+# (docs/features/usage_monitoring_and_rate_limiting.md)
+#
+# All agent LLM traffic routes through this in-cluster proxy (port 4000). DB
+# mode (databases.litellm above) unlocks virtual keys + the spend/usage
+# dashboard. Master/salt keys + gateway-DB creds come from Vault (srw-secrets:
+# LITELLM_MASTER_KEY / LITELLM_SALT_KEY / LITELLM_POSTGRES_*). The orchestrator
+# registers the catalog's endpoint models into the gateway on boot, mints a
+# shared fleet key + scoped per-user/project keys, and routes agents through
+# those — the admin master key stays orchestrator-only.
+#
+# Throttle knobs (backstop / ratePolicy / quota) are intentionally OMITTED here
+# = chart default {} = MEASURE-ONLY, no enforcement. The gateway records RPM/TPM
+# and the usage ledger fills, but nothing is rate-capped yet. Once real load is
+# observed (gateway UI + Cockpit Admin → Usage), set the strix box's safe
+# sustained RPM + provider/subscription tiers here to switch enforcement on.
+#
+# UI is ClusterIP-only (no ingress): kubectl -n superhuman-remote-worker
+# port-forward svc/srw-litellm 4000:4000 → http://localhost:4000/ui (master key).
+# -----------------------------------------------------------------------------
+litellm:
+  enabled: true
 # -----------------------------------------------------------------------------
 # Session router — Direct Session WebSockets
 # (docs/features/direct_session_websockets.md)
