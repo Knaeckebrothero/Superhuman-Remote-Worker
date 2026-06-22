@@ -29,11 +29,45 @@ aliases:
 > documented follow-on in [[saas_billing_and_metering]] — this doc builds the ledger
 > they will read and debit from.
 
-**Status:** Design / not started.
+**Status:** **Ledger spine + LLM + workspace-compute metering + a Cockpit usage view are
+IMPLEMENTED + k3d-verified (2026-06-22)** as **Slice 4 of
+[[usage_monitoring_and_rate_limiting]]** (see its Implementation status for the verification
+detail). This doc stays the **schema + decisions source of truth** (`usage_events`,
+`usage_rates`, the rate table, the open-interval reconciler) — the implementation note just
+below records what's built, what's deferred, and the one design change.
 **Triggered by:** Approaching enterprise/SaaS readiness. Before plans/billing exist we
 need (a) per-user cost attribution that works on *any* cluster (homelab today, AWS
 later), and (b) basic infra-ops monitoring. Locked in conversation that this round is
 **all read-side** — metering + dashboards + soft-quota *alerts*, no enforcement gates.
+
+## Implementation note (2026-06-22) — what the rate-limiting Slice 4 built
+
+The ledger this doc designed now exists, built as Slice 4 of
+[[usage_monitoring_and_rate_limiting]] (the gateway from its Slices 1–3 changed where LLM
+cost is sourced — see below):
+
+- **`usage_events`** — shipped verbatim from this doc's schema as
+  `migrations/audit/0002_usage_events.sql` (monthly-partitioned on `ts` in `srw-auditdb`,
+  via the audit-store partition machinery). **`usage_rates`** shipped as
+  `migrations/app/0033` (effective-dated, **ships empty** → costs are `NULL`/$0 until an
+  admin seeds rates; quantities are metered immediately).
+- **LLM rows — DESIGN CHANGE.** This doc sketched emitting them at the agent's
+  token-capture point (`archiver.py:393`). The implementation instead **materializes them
+  from the LiteLLM gateway** (poll `/spend/logs` → `category='llm'` rows). Why: the gateway
+  (Slices 1–3) now exists, and the scoped key gives **clean per-user/project identity** at
+  the gateway (the agent has `job_id` but not `user_id`; the gateway has user/project but
+  not `job_id`). Trade-off: LLM rows attribute to user/project but **not** job (per-job LLM
+  is a deferred follow-up — tag requests with `job_id` via gateway metadata).
+- **Workspace compute** — open/close intervals exactly as designed here, via a
+  `workspace_intervals` (`app/0034`) bookkeeping table + a materialize-and-reconcile loop
+  (requests × wall-clock → `vcpu-hour` + `gib-hour`). **Container/sandbox tier only**;
+  agent-pod compute (Slice 2 here) + VM tier are deferred.
+- **Cockpit "Usage" view** (this doc's Slice 4) — shipped, reads `GET /api/usage`.
+- **Deferred:** query metering (Slice 3 here), soft-quota *alerts* (Slice 5 here), the
+  `usage_daily` rollup mirror, agent-pod + VM compute, per-job LLM attribution. The
+  `quota_limits` table is unbuilt; note the **rate-limiting doc already ships a different,
+  enforcing daily quota** (its Slice 3, orchestrator-driven freeze) — distinct from this
+  doc's planned soft-alert quota.
 
 ## Why self-owned metering (not cloud billing)
 
@@ -163,6 +197,13 @@ intervals and closes stragglers. **Acceptance test:** delete a workspace pod out
 double-count on the next sweep.
 
 ## Slices (each independently shippable)
+
+> **Implementation status (2026-06-22):** the ledger foundation + workspace compute
+> (Slice 1), the LLM half of Slice 2 (gateway-sourced), and the Cockpit view (Slice 4)
+> are **built** as Slice 4 of [[usage_monitoring_and_rate_limiting]] — see the
+> implementation note near the top. **Deferred:** agent-pod compute (Slice 2), query
+> metering (Slice 3), soft-quota alerts (Slice 5), the `usage_daily` rollup. The slice
+> text below is the original design record.
 
 Each metering slice ships with at least a raw read endpoint so numbers can be verified;
 the polished dashboard is its own slice.

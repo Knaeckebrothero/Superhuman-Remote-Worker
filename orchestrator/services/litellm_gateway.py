@@ -34,9 +34,13 @@ import hmac
 import json
 import logging
 import os
-from typing import Any, Dict
+import uuid
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
 
 import httpx
+
+from services.usage_ledger import UsageEvent, UsageLedger
 
 logger = logging.getLogger(__name__)
 
@@ -287,6 +291,24 @@ class LiteLLMClient:
             requests += int(metrics.get("successful_requests") or 0)
             tokens += int(metrics.get("total_tokens") or 0)
         return {"requests": requests, "tokens": tokens}
+
+    async def get_spend_logs(self) -> List[Dict[str, Any]]:
+        """Recent per-request spend-log rows (Slice 4c materialization source).
+
+        Each row carries ``request_id``, ``model_group``, prompt/completion/total
+        tokens, ``startTime``, and — for scoped-key traffic — ``user``
+        (``srw-user-<uuid>``) + ``team_id`` (``srw-proj-<uuid>``), which is how an
+        LLM usage row attributes to an SRW user/project (the ``api_key`` field is a
+        hash, unusable for that). ``spend`` is dollar-only (0 for unpriced homelab
+        models), so we materialize the *token* quantities and price them from
+        usage_rates like every other ledger row.
+        """
+        resp = await self._client.get(
+            f"{self._base_url}/spend/logs", headers=self._headers
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data if isinstance(data, list) else []
 
 
 async def build_desired_models(postgres_db: Any) -> Dict[str, Dict[str, Any]]:
@@ -852,6 +874,111 @@ async def compute_project_quota_status(
         )
         out[project_id] = {"over": over, "usage": usage, "quota": quota}
     return out
+
+
+# ---------------------------------------------------------------------------
+# Slice 4c — materialize the LiteLLM spend log into the usage_events ledger.
+#
+# LiteLLM's own DB is enforcement-only (Scaling §2); the durable, queryable record
+# of LLM usage is the auditdb usage_events ledger. We run stock LiteLLM (no custom
+# callback), so the orchestrator polls /spend/logs and writes canonical
+# category='llm' rows — the same orchestrator-polls-the-gateway shape as the Slice
+# 3 quota read. Attribution comes from the scoped key's deterministic user/team
+# ids on each row (the api_key is hashed); token quantities are priced from
+# usage_rates like any other row (homelab models are unpriced → cost stays NULL).
+# ---------------------------------------------------------------------------
+
+
+def _srw_id_from(value: Any, prefix: str) -> Optional[str]:
+    """Extract an SRW UUID from a deterministic gateway id (else None).
+
+    Scoped keys bind to user ``srw-user-<uuid>`` + team ``srw-proj-<uuid>`` (Slice
+    2b), so the spend log's ``user`` / ``team_id`` carry those. Strip the prefix
+    and keep the remainder only if it's a real UUID — test ids
+    (``srw-user-ktest-user``), the fleet key's blank attribution, and non-scoped
+    traffic (``default_user_id``, a raw uuid without our prefix) stay unattributed
+    and never poison the ledger's uuid columns.
+    """
+    if not isinstance(value, str) or not value.startswith(prefix):
+        return None
+    rest = value[len(prefix) :]
+    try:
+        uuid.UUID(rest)
+        return rest
+    except (ValueError, AttributeError, TypeError):
+        return None
+
+
+def _parse_spend_ts(value: Any) -> Optional[datetime]:
+    """Parse a spend-log ISO timestamp ('...Z') to a tz-aware UTC datetime."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        d = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+
+
+async def materialize_llm_usage(
+    client: LiteLLMClient,
+    ledger: Optional[UsageLedger],
+    *,
+    since: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """Pull recent spend-log rows into usage_events as ``category='llm'`` rows.
+
+    One row per token *dimension* (prompt-token + completion-token), ``resource``
+    = the model group, attributed to the SRW user/project parsed from the scoped
+    key's ids. Idempotent at the ledger (dedupe on source_id+unit+ts), so
+    re-polling the same rows is safe; ``since`` is an in-memory efficiency cursor
+    (max ``startTime`` processed) the caller threads across ticks. Rows with no
+    tokens (health checks) or no model are skipped. Returns
+    ``{"materialized", "cursor", "scanned"}``.
+    """
+    if ledger is None or not ledger.is_available:
+        return {"materialized": 0, "cursor": since, "scanned": 0}
+    rows = await client.get_spend_logs()
+    events: List[UsageEvent] = []
+    max_ts = since
+    for r in rows:
+        ts = _parse_spend_ts(r.get("startTime"))
+        if ts is None or (since is not None and ts <= since):
+            continue
+        model = r.get("model_group") or r.get("model")
+        rid = r.get("request_id")
+        if not model or not rid:
+            continue
+        prompt = int(r.get("prompt_tokens") or 0)
+        completion = int(r.get("completion_tokens") or 0)
+        if prompt == 0 and completion == 0:
+            continue
+        common = dict(
+            category="llm",
+            resource=str(model),
+            source="litellm",
+            source_id=str(rid),
+            ts=ts,
+            user_id=_srw_id_from(r.get("user"), "srw-user-"),
+            project_id=_srw_id_from(r.get("team_id"), "srw-proj-"),
+            details={"model": str(model), "request_id": str(rid)},
+        )
+        if prompt:
+            events.append(UsageEvent(quantity=prompt, unit="prompt-token", **common))
+        if completion:
+            events.append(
+                UsageEvent(quantity=completion, unit="completion-token", **common)
+            )
+        if max_ts is None or ts > max_ts:
+            max_ts = ts
+    inserted = await ledger.record_events(events)
+    if inserted:
+        logger.info(
+            "LLM usage: materialized %d ledger row(s) from %d spend-log row(s)",
+            inserted,
+            len(rows),
+        )
+    return {"materialized": inserted, "cursor": max_ts, "scanned": len(rows)}
 
 
 async def litellm_sync_loop(

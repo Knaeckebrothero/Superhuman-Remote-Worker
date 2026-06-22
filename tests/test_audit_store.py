@@ -27,13 +27,20 @@ import pytest
 # case). Must precede the orchestrator imports so a plain `pytest` stays green.
 pytest.importorskip("testcontainers.postgres")
 
+from types import SimpleNamespace  # noqa: E402
+
 from orchestrator.database.migrate import run_migrations  # noqa: E402
 from orchestrator.database.postgres import MIGRATIONS_AUDIT_DIR  # noqa: E402
-from orchestrator.services import audit_partitions  # noqa: E402
+from orchestrator.services import audit_partitions, workspace_metering  # noqa: E402
+from orchestrator.services.usage_ledger import (  # noqa: E402
+    UsageEvent,
+    UsageLedger,
+    UsageRates,
+)
 
 pytestmark = pytest.mark.asyncio
 
-PARENTS = ("llm_requests", "agent_audit", "chat_history")
+PARENTS = ("llm_requests", "agent_audit", "chat_history", "usage_events")
 AUDIT_INDEXES = {
     "llm_requests": {"llm_requests_job_ts_idx"},
     "agent_audit": {
@@ -42,6 +49,11 @@ AUDIT_INDEXES = {
         "agent_audit_pre_id_idx",
     },
     "chat_history": {"chat_history_job_ts_idx"},
+    "usage_events": {
+        "usage_events_dedupe_idx",
+        "usage_events_user_ts_idx",
+        "usage_events_ref_idx",
+    },
 }
 # Official postgres images are built --with-lz4 (required by the SET COMPRESSION
 # statements in the migration). Pin 16 per the package's image recommendation.
@@ -182,6 +194,7 @@ class TestAuditSchema:
                 ("llm_requests", "request"),
                 ("agent_audit", "payload"),
                 ("chat_history", "inputs"),
+                ("usage_events", "details"),
             ):
                 attc = await pool.fetchval(
                     # attcompression is the internal "char" type (bytes via
@@ -242,6 +255,47 @@ class TestAuditSchema:
                 )
             assert exc.value.sqlstate == "23514"
 
+    async def test_usage_events_partitions_on_ts(self, pg_dsn):
+        # 0002 partitions usage_events on `ts` (not `timestamp`). A row whose ts
+        # falls outside every monthly partition must fail loudly with 23514 (same
+        # no-DEFAULT design), proving the partition key + the audit_partitions
+        # `ts`-column path are wired correctly.
+        async with _audit_pool(pg_dsn) as pool:
+            far_future = datetime.now(timezone.utc) + timedelta(days=3650)
+            with pytest.raises(asyncpg.exceptions.CheckViolationError) as exc:
+                await pool.execute(
+                    "INSERT INTO usage_events "
+                    "(ts, category, resource, quantity, unit, source, source_id) "
+                    "VALUES ($1, 'llm', 'm', 1, 'prompt-token', 'litellm', 'r1')",
+                    far_future,
+                )
+            assert exc.value.sqlstate == "23514"
+
+    async def test_usage_events_dedupe_unique(self, pg_dsn):
+        # The at-least-once idempotency key (source, source_id, unit, ts): a second
+        # identical emit is rejected, so a re-polled spend log / re-emitted close
+        # cannot double-count. A different unit on the same source_id is allowed
+        # (one row per metered dimension).
+        async with _audit_pool(pg_dsn) as pool:
+            now = datetime.now(timezone.utc)
+            sql = (
+                "INSERT INTO usage_events "
+                "(ts, category, resource, quantity, unit, source, source_id) "
+                "VALUES ($1,$2,$3,$4,$5,$6,$7)"
+            )
+            await pool.execute(
+                sql, now, "llm", "gemma", 100, "prompt-token", "litellm", "req-abc"
+            )
+            with pytest.raises(asyncpg.exceptions.UniqueViolationError):
+                await pool.execute(
+                    sql, now, "llm", "gemma", 100, "prompt-token", "litellm", "req-abc"
+                )
+            await pool.execute(
+                sql, now, "llm", "gemma", 50, "completion-token", "litellm", "req-abc"
+            )
+            n = await pool.fetchval("SELECT count(*) FROM usage_events")
+            assert n == 2
+
 
 class TestAuditPartitions:
     """orchestrator/services/audit_partitions.py against a live audit DB."""
@@ -257,9 +311,10 @@ class TestAuditPartitions:
     async def test_ensure_partitions_extends_lookahead(self, pg_dsn):
         async with _audit_pool(pg_dsn) as pool:
             before = {p: await _children(pool, p) for p in PARENTS}
-            # lookahead 4 vs the bootstrap's 2 → 2 new months per parent = 6.
+            # lookahead 4 vs the bootstrap's 2 → 2 new months per parent ×
+            # 4 parents = 8.
             created = await audit_partitions.ensure_partitions(pool, lookahead_months=4)
-            assert len(created) == 6, created
+            assert len(created) == 8, created
             for parent in PARENTS:
                 after = await _children(pool, parent)
                 assert len(after) == 5
@@ -305,3 +360,395 @@ class TestAuditPartitions:
             assert set(result) == {"created", "analyzed", "retired", "status"}
             assert result["retired"].get("deferred") is True
             assert set(result["status"]) == set(PARENTS)
+
+
+class TestUsageLedger:
+    """orchestrator/services/usage_ledger.py against a live audit DB (Slice 4a)."""
+
+    async def test_record_and_query_unpriced(self, pg_dsn):
+        async with _audit_pool(pg_dsn) as pool:
+            ledger = UsageLedger(pool, UsageRates(None))  # rates absent → unpriced
+            now = datetime.now(timezone.utc)
+            uid, pid, job = uuid4(), uuid4(), uuid4()
+            events = [
+                UsageEvent(
+                    category="llm",
+                    resource="gemma",
+                    quantity=100,
+                    unit="prompt-token",
+                    source="litellm",
+                    source_id="req1",
+                    ts=now,
+                    user_id=str(uid),
+                    project_id=str(pid),
+                    ref_kind="job",
+                    ref_id=str(job),
+                ),
+                UsageEvent(
+                    category="llm",
+                    resource="gemma",
+                    quantity=40,
+                    unit="completion-token",
+                    source="litellm",
+                    source_id="req1",
+                    ts=now,
+                    user_id=str(uid),
+                    project_id=str(pid),
+                    ref_kind="job",
+                    ref_id=str(job),
+                ),
+                UsageEvent(
+                    category="compute",
+                    resource="workspace_pod",
+                    quantity=2,
+                    unit="vcpu-hour",
+                    source="orchestrator",
+                    source_id="ws1",
+                    ts=now,
+                    user_id=str(uid),
+                    project_id=str(pid),
+                    ref_kind="job",
+                    ref_id=str(job),
+                ),
+            ]
+            assert await ledger.record_events(events) == 3
+            res = await ledger.query_usage(
+                from_ts=now - timedelta(days=1), to_ts=now + timedelta(days=1)
+            )
+            by = {(b["category"], b["unit"]): b for b in res["by_category"]}
+            assert by[("llm", "prompt-token")]["quantity"] == 100.0
+            assert by[("llm", "completion-token")]["quantity"] == 40.0
+            assert by[("compute", "vcpu-hour")]["quantity"] == 2.0
+            assert res["total_cost_usd"] == 0.0  # unpriced
+
+    async def test_idempotent_dedupe(self, pg_dsn):
+        async with _audit_pool(pg_dsn) as pool:
+            ledger = UsageLedger(pool, UsageRates(None))
+            now = datetime.now(timezone.utc)
+            ev = UsageEvent(
+                category="llm",
+                resource="gemma",
+                quantity=10,
+                unit="prompt-token",
+                source="litellm",
+                source_id="dup",
+                ts=now,
+            )
+            assert await ledger.record_events([ev]) == 1
+            assert await ledger.record_events([ev]) == 0  # re-emit deduped
+            # Same source_id, different dimension (unit) → distinct row.
+            ev2 = UsageEvent(
+                category="llm",
+                resource="gemma",
+                quantity=5,
+                unit="completion-token",
+                source="litellm",
+                source_id="dup",
+                ts=now,
+            )
+            assert await ledger.record_events([ev2]) == 1
+            assert await pool.fetchval("SELECT count(*) FROM usage_events") == 2
+
+    async def test_rate_snapshot(self, pg_dsn):
+        async with _audit_pool(pg_dsn) as pool:
+            # usage_rates is an app-DB table; create it on this pool so the
+            # resolver has something to read (one DB is fine for the test).
+            await pool.execute(
+                "CREATE TABLE usage_rates (category text, resource text, "
+                "unit text, rate_usd numeric, effective_from timestamptz, "
+                "PRIMARY KEY (category, resource, unit, effective_from))"
+            )
+            now = datetime.now(timezone.utc)
+            await pool.execute(
+                "INSERT INTO usage_rates "
+                "VALUES ('llm','gemma','prompt-token',0.002,$1)",
+                now - timedelta(days=10),
+            )
+            ledger = UsageLedger(pool, UsageRates(pool))
+            await ledger.record_events(
+                [
+                    UsageEvent(
+                        category="llm",
+                        resource="gemma",
+                        quantity=1000,
+                        unit="prompt-token",
+                        source="litellm",
+                        source_id="r",
+                        ts=now,
+                    )
+                ]
+            )
+            row = await pool.fetchrow(
+                "SELECT rate_usd, cost_usd FROM usage_events WHERE source_id='r'"
+            )
+            assert float(row["rate_usd"]) == 0.002
+            assert float(row["cost_usd"]) == 2.0  # 1000 * 0.002, snapshotted
+
+    async def test_partition_gap_falls_back_per_row(self, pg_dsn):
+        # A row whose ts falls outside every partition (no DEFAULT partition) would
+        # fail the whole batch INSERT; the per-row fallback must still land the good
+        # rows and drop only the offender (else the poller blocks forever).
+        async with _audit_pool(pg_dsn) as pool:
+            ledger = UsageLedger(pool, UsageRates(None))
+            now = datetime.now(timezone.utc)
+            good = UsageEvent(
+                category="llm",
+                resource="g",
+                quantity=1,
+                unit="prompt-token",
+                source="litellm",
+                source_id="good",
+                ts=now,
+            )
+            bad = UsageEvent(  # +10y → no partition exists
+                category="llm",
+                resource="g",
+                quantity=1,
+                unit="prompt-token",
+                source="litellm",
+                source_id="bad",
+                ts=now + timedelta(days=3650),
+            )
+            assert await ledger.record_events([good, bad]) == 1
+            assert (
+                await pool.fetchval(
+                    "SELECT count(*) FROM usage_events WHERE source_id='good'"
+                )
+                == 1
+            )
+            assert (
+                await pool.fetchval(
+                    "SELECT count(*) FROM usage_events WHERE source_id='bad'"
+                )
+                == 0
+            )
+
+    async def test_visibility_owner_filter(self, pg_dsn):
+        async with _audit_pool(pg_dsn) as pool:
+            ledger = UsageLedger(pool, UsageRates(None))
+            now = datetime.now(timezone.utc)
+            ua, ub, pshared = uuid4(), uuid4(), uuid4()
+            await ledger.record_events(
+                [
+                    UsageEvent(
+                        category="llm",
+                        resource="m",
+                        quantity=1,
+                        unit="prompt-token",
+                        source="litellm",
+                        source_id="a",
+                        ts=now,
+                        user_id=str(ua),
+                    ),
+                    UsageEvent(
+                        category="llm",
+                        resource="m",
+                        quantity=1,
+                        unit="prompt-token",
+                        source="litellm",
+                        source_id="b",
+                        ts=now,
+                        user_id=str(ub),
+                        project_id=str(pshared),
+                    ),
+                ]
+            )
+            window = dict(
+                from_ts=now - timedelta(days=1), to_ts=now + timedelta(days=1)
+            )
+            # ua sees only their own row.
+            res = await ledger.query_usage(owner_user_id=str(ua), **window)
+            assert sum(b["events"] for b in res["by_category"]) == 1
+            # ua as a member of pshared also sees ub's project-scoped row.
+            res2 = await ledger.query_usage(
+                owner_user_id=str(ua), visible_project_ids=[str(pshared)], **window
+            )
+            assert sum(b["events"] for b in res2["by_category"]) == 2
+
+    async def test_unavailable_pool_noop(self):
+        # No DB needed: a ledger with no audit pool no-ops (non-load-bearing tier).
+        ledger = UsageLedger(None, UsageRates(None))
+        assert ledger.is_available is False
+        now = datetime.now(timezone.utc)
+        ev = UsageEvent(
+            category="llm",
+            resource="m",
+            quantity=1,
+            unit="prompt-token",
+            source="litellm",
+            source_id="x",
+            ts=now,
+        )
+        assert await ledger.record_events([ev]) == 0
+        res = await ledger.query_usage(from_ts=now - timedelta(days=1), to_ts=now)
+        assert res == {"by_category": [], "total_cost_usd": 0.0}
+
+
+async def _create_intervals_table(pool) -> None:
+    """Create workspace_intervals (app-DB table) on the test pool (0034 DDL)."""
+    await pool.execute(
+        """
+        CREATE TABLE workspace_intervals (
+            id BIGSERIAL PRIMARY KEY,
+            owner_kind TEXT NOT NULL,
+            owner_id UUID NOT NULL,
+            tier TEXT,
+            cpu_millicores INTEGER NOT NULL,
+            mem_bytes BIGINT NOT NULL,
+            started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            ended_at TIMESTAMPTZ,
+            materialized_at TIMESTAMPTZ,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+        """
+    )
+    await pool.execute(
+        "CREATE UNIQUE INDEX workspace_intervals_open_uq "
+        "ON workspace_intervals (owner_kind, owner_id) WHERE ended_at IS NULL"
+    )
+
+
+def _owner(kind: str, oid) -> SimpleNamespace:
+    return SimpleNamespace(kind=kind, id=str(oid))
+
+
+async def _noattrib(kind, oid):
+    return None
+
+
+class TestWorkspaceMetering:
+    """orchestrator/services/workspace_metering.py against a live DB (Slice 4b)."""
+
+    async def test_parse_cpu(self):
+        assert workspace_metering.parse_cpu_millicores("500m") == 500
+        assert workspace_metering.parse_cpu_millicores("2") == 2000
+        assert workspace_metering.parse_cpu_millicores("2000m") == 2000
+
+    async def test_parse_mem(self):
+        assert workspace_metering.parse_mem_bytes("1Gi") == 1024**3
+        assert workspace_metering.parse_mem_bytes("512Mi") == 512 * 1024**2
+        assert workspace_metering.parse_mem_bytes("1G") == 1000**3
+
+    async def test_open_close_idempotent(self, pg_dsn):
+        async with _audit_pool(pg_dsn) as pool:
+            await _create_intervals_table(pool)
+            owner = _owner("job", uuid4())
+            kw = dict(tier="sandbox", cpu="500m", memory="1Gi")
+            await workspace_metering.open_interval(pool, owner, **kw)
+            await workspace_metering.open_interval(pool, owner, **kw)  # deduped
+            assert (
+                await pool.fetchval(
+                    "SELECT count(*) FROM workspace_intervals WHERE ended_at IS NULL"
+                )
+                == 1
+            )
+            await workspace_metering.close_interval(pool, owner)
+            assert (
+                await pool.fetchval(
+                    "SELECT count(*) FROM workspace_intervals WHERE ended_at IS NULL"
+                )
+                == 0
+            )
+            # Re-open after close → a fresh interval (suspend/restore semantics).
+            await workspace_metering.open_interval(pool, owner, **kw)
+            assert await pool.fetchval("SELECT count(*) FROM workspace_intervals") == 2
+
+    async def test_materialize_computes_quantities(self, pg_dsn):
+        async with _audit_pool(pg_dsn) as pool:
+            await _create_intervals_table(pool)
+            owner = _owner("job", uuid4())
+            uid = uuid4()
+            await workspace_metering.open_interval(
+                pool, owner, tier="sandbox", cpu="500m", memory="1Gi"
+            )
+            # Force a 2-hour closed interval.
+            await pool.execute(
+                "UPDATE workspace_intervals SET "
+                "started_at = now() - interval '2 hours', ended_at = now() "
+                "WHERE owner_id = $1::uuid",
+                str(owner.id),
+            )
+
+            async def attrib(kind, oid):
+                return {"user_id": str(uid), "project_id": None}
+
+            ledger = UsageLedger(pool, UsageRates(None))
+            res = await workspace_metering.materialize_and_reconcile(
+                pool, ledger, attrib
+            )
+            assert res["materialized"] == 1
+            rows = await pool.fetch(
+                "SELECT unit, quantity, user_id, ref_kind FROM usage_events "
+                "WHERE category='compute' ORDER BY unit"
+            )
+            by = {r["unit"]: r for r in rows}
+            # 500m = 0.5 vcpu over 2h → 1.0; 1Gi over 2h → 2.0.
+            assert abs(float(by["vcpu-hour"]["quantity"]) - 1.0) < 1e-6
+            assert abs(float(by["gib-hour"]["quantity"]) - 2.0) < 1e-6
+            assert str(by["vcpu-hour"]["user_id"]) == str(uid)
+            assert by["vcpu-hour"]["ref_kind"] == "job"
+            assert (
+                await pool.fetchval(
+                    "SELECT materialized_at FROM workspace_intervals "
+                    "WHERE owner_id=$1::uuid",
+                    str(owner.id),
+                )
+                is not None
+            )
+
+    async def test_materialize_idempotent(self, pg_dsn):
+        async with _audit_pool(pg_dsn) as pool:
+            await _create_intervals_table(pool)
+            owner = _owner("session", uuid4())
+            await workspace_metering.open_interval(
+                pool, owner, tier="sandbox", cpu="1", memory="2Gi"
+            )
+            await pool.execute(
+                "UPDATE workspace_intervals SET "
+                "started_at = now() - interval '1 hour', ended_at = now() "
+                "WHERE owner_id=$1::uuid",
+                str(owner.id),
+            )
+            ledger = UsageLedger(pool, UsageRates(None))
+            r1 = await workspace_metering.materialize_and_reconcile(
+                pool, ledger, _noattrib
+            )
+            r2 = await workspace_metering.materialize_and_reconcile(
+                pool, ledger, _noattrib
+            )
+            assert r1["materialized"] == 1
+            assert r2["materialized"] == 0  # already stamped + ledger dedupes
+            assert await pool.fetchval("SELECT count(*) FROM usage_events") == 2
+
+    async def test_reconcile_closes_leaked_open(self, pg_dsn):
+        async with _audit_pool(pg_dsn) as pool:
+            await _create_intervals_table(pool)
+            owner = _owner("job", uuid4())
+            await workspace_metering.open_interval(
+                pool, owner, tier="sandbox", cpu="500m", memory="1Gi"
+            )
+            # Backdate to 48h ago → a leaked open the reconciler must bound.
+            await pool.execute(
+                "UPDATE workspace_intervals SET "
+                "started_at = now() - interval '48 hours' WHERE owner_id=$1::uuid",
+                str(owner.id),
+            )
+            ledger = UsageLedger(pool, UsageRates(None))
+            res = await workspace_metering.materialize_and_reconcile(
+                pool, ledger, _noattrib, orphan_after_h=24
+            )
+            assert res["reconciled"] == 1
+            row = await pool.fetchrow(
+                "SELECT started_at, ended_at, materialized_at FROM workspace_intervals "
+                "WHERE owner_id=$1::uuid",
+                str(owner.id),
+            )
+            assert row["ended_at"] is not None
+            # Capped at started_at + 24h, then materialized in the same pass.
+            capped_s = (row["ended_at"] - row["started_at"]).total_seconds()
+            assert abs(capped_s - 24 * 3600) < 5
+            assert row["materialized_at"] is not None
+            q = await pool.fetchval(
+                "SELECT quantity FROM usage_events WHERE unit='vcpu-hour'"
+            )
+            assert abs(float(q) - 12.0) < 1e-3  # 0.5 vcpu × 24h

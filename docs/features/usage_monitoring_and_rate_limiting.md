@@ -31,7 +31,7 @@ aliases:
 > under provider API limits and subscription-coding-plan rate limits, so the fleet
 > stops generating constant 429 errors.
 
-**Status:** **Slices 1 + 2a committed; Slices 2b + 3 implemented + k3d-verified (2026-06-22), uncommitted on `develop`.** Slice 4 (ledger + Cockpit) pending. See **Implementation status** below for what shipped, the spike findings that revised the design, and the gotchas.
+**Status:** **Slices 1 + 2a committed; Slices 2b + 3 + 4 implemented + k3d-verified (2026-06-22), uncommitted on `develop`.** The feature is functionally **complete end-to-end** — measure + attribute + throttle (429) + daily quota stop + durable `usage_events` ledger (LLM tokens + workspace compute) + a Cockpit usage view. The throttle/quota/rate knobs still ship **inert** until real capacity is measured. See **Implementation status** below for what shipped, the spike findings that revised the design, and the gotchas.
 **Triggered by:** Putting the system into real operation. Multiple agents call
 the same providers with **zero coordination** today — each discovers limits by
 hitting a 429 and backing off independently (`src/graph.py:177-290` classify +
@@ -47,7 +47,7 @@ stop, and **live RPM/TPM/usage monitoring**.
 **Explicitly NOT this round:** dollar budget caps (set provider-side); wallet /
 markup / billing → [[saas_billing_and_metering]]; capacity-aware admission
 (derived concurrency) → Deferred §; the custom usage ledger + workspace metering
-→ Slice 4 (later).
+→ Slice 4 (✅ shipped 2026-06-22).
 
 ## Implementation status (updated 2026-06-22)
 
@@ -151,6 +151,49 @@ freeze reuses proven primitives, same bar as Slices 1/2b); per-user quota.
 > daily cap. `successful_requests` (not `api_requests`) is summed so our own 429s don't
 > count.
 
+**✅ Slice 4 — unified usage ledger + workspace metering + Cockpit view.** The durable,
+queryable record of usage (LLM tokens + workspace compute) is the append-only
+`usage_events` ledger in **`srw-auditdb`** (the *locked* schema from
+[[observability_and_quotas]]); LiteLLM's own DB stays **enforcement-only** (Scaling §2).
+Implemented as four independently-shippable sub-slices, **all k3d-verified**:
+- **4a — ledger foundation.** `migrations/audit/0002_usage_events.sql` (partitioned on
+  `ts`, registered in `audit_partitions.py` via a conservative per-parent partition-column
+  map; at-least-once dedupe on `(source, source_id, unit, ts)`), `usage_rates`
+  (`app/0033`, effective-dated, ships **empty/inert** — same posture as the throttle
+  knobs), a `UsageLedger` writer (snapshots the rate onto each row; **per-row fallback** so
+  one uninsertable row can't sink a batch or wedge the poller) + a `UsageRates` resolver,
+  and `GET /api/usage` (G5-visibility-scoped aggregate by category/unit). *Verified:*
+  migrations applied live on the dev auditdb/app DB; 11 unit tests + the partition
+  machinery (testcontainers, real migration runner).
+- **4b — workspace compute metering.** `workspace_intervals` (`app/0034`) records a pod's
+  open→close (**requests × wall-clock**, decision 5); the container provisioner emits open
+  at create + close at delete (the funnel for release *and* suspend, so suspend/restore
+  bills only live periods); a loop materializes CLOSED intervals into `vcpu-hour` +
+  `gib-hour` ledger rows + reconciles leaked opens (bounded at a cap). *Verified live:* a
+  synthetic 2h / 500m·1Gi interval materialized **cross-DB** (app pool → audit pool) into
+  exactly `vcpu-hour=1.0` + `gib-hour=2.0`; 6 unit tests. *(Container/sandbox tier only;
+  VM-tier emits are an additive follow-up — the table + loop are tier-agnostic.)*
+- **4c — LLM materialization.** A poll loop pulls LiteLLM `/spend/logs` → `category='llm'`
+  rows (prompt-token + completion-token), **attributed per user/project** by parsing the
+  scoped key's `user=srw-user-<uuid>` / `team_id=srw-proj-<uuid>` off each row (the
+  `api_key` field is hashed, unusable; a UUID guard rejects non-scoped / test ids so they
+  never poison the ledger). Idempotent (ledger dedupe + an in-memory `startTime` cursor).
+  *Verified live:* a real-UUID scoped-key gemma request round-tripped spend-log → poll →
+  **2 correctly-attributed ledger rows** (prompt 18 + completion 5, carrying user_id **and**
+  project_id); 76 historical spend-log rows materialized; 8 unit tests.
+- **4d — Cockpit view.** Admin → Usage (read-only, reads `GET /api/usage`): tokens +
+  compute by category/unit over a 7/30/90-day window, G5-scoped. *Verified:* prod build
+  compiles the component + route + nav; 3 vitest tests. *(The `usage_daily` rollup + the
+  per-day / per-user / per-job breakdowns the doc sketches are deferred — the raw indexed,
+  partition-pruned query is instant at v1 scale.)*
+
+> **⚠️ v1 limitation — per-job LLM attribution.** Compute rows carry `ref_id` = job/thread,
+> but LLM rows do **not** (the gateway never sees `job_id` — it's stripped at the wire
+> boundary; only the scoped key's user/project reach the spend log). So a per-**job** cost
+> line covers compute fully and LLM only at the user/project level. Closing it needs the
+> orchestrator to tag each agent request with `job_id` via LiteLLM request metadata — a
+> deferred follow-up. Per-user/project LLM attribution (the headline) works today.
+
 **Spike findings that revised the design:**
 - **Per-deployment `rpm`/`tpm` does NOT 429** without **Redis + `enable_pre_call_check`/
   `enforce_model_rate_limits`** (v1 has no Redis) — it's router/load-balancing metadata.
@@ -179,13 +222,17 @@ freeze reuses proven primitives, same bar as Slices 1/2b); per-user quota.
   Postgres can't sub for LiteLLM's hot-path counters (Redis-hardcoded + hot-row write
   antipattern).
 
-**Next:** commit 2b + 3; set a real `backstop` + `ratePolicy` + `quota` capacity (or measure
-the strix box's safe RPM / daily volume — counts are 1:1 now the `team_ids` bug is fixed);
-Slice 4 (ledger + Cockpit view). *Deferred:* per-user **per-model** rate limits + per-user **quota** (the
-per-user activity read is unreliable); rolling-N-hour quota window (daily-UTC for now);
-a DB-table + Cockpit-UI policy source (file/values-driven for now); full job-level E2E for
-2b's dispatch glue + 3's freeze (both reuse verified primitives — same bar as Slice 1's
-"real JOB through `_inject_dispatch_credentials`").
+**Next:** commit 2b + 3 + 4; set a real `backstop` + `ratePolicy` + `quota` capacity
+(measure the strix box's safe RPM / daily volume — counts are 1:1 now the `team_ids` bug is
+fixed) **and** seed `usage_rates` to turn the ledger's $0 costs into real dollars.
+*Deferred:* **per-job LLM attribution** (tag agent requests with `job_id` via LiteLLM
+request metadata — the gateway never sees job_id today); **VM-tier compute metering**
+(additive — the same `workspace_intervals` path); the `usage_daily` rollup + per-day /
+per-user / per-job Cockpit breakdowns; a live authed-UI screenshot of the Usage view;
+per-user **per-model** rate limits + per-user **quota**; rolling-N-hour quota window; a
+DB-table + Cockpit-UI policy source (file/values-driven for now); full job-level dispatch/
+freeze E2E (all reuse verified primitives — same bar as Slice 1's "real JOB through
+`_inject_dispatch_credentials`").
 
 ## Why a gateway (the one mechanism that does all of it)
 
@@ -236,8 +283,8 @@ doesn't carry a prior job's client/key — [[agent_loop_mode_pod_reuse]] item 1.
 | 5a | Upstream backstop | **REVISED — k3d-verified 2026-06-21.** Per-deployment `rpm`/`tpm` in `config.yaml` does **NOT** 429 in our setup (it's router/load-balancing metadata; hard pre-call enforcement needs **Redis + `enable_pre_call_check`/`enforce_model_rate_limits`**, and the **admin master key bypasses all limits**). What **does** enforce in-memory (no Redis) is **key/team `model_rpm_limit`** (proven 429 + Retry-After). So the backstop is a **shared "fleet" virtual key** — deterministic value (HMAC of the master key, no persistence), `model_rpm_limit = upstream capacity`, scoped to registered models — that all agents use **instead of the admin master key** (security win). Fleet aggregate → one bucket → 429 → backoff. Capacity = the `litellm.backstop` knob (`{model_id\|'*':{rpm/tpm}}`). **Implemented (Slice 2a).** |
 | 6 | Identity | **REVISED — k3d-verified 2026-06-22 (Slice 2b).** *Not* per-job — a **per-(user, project) scoped key** (deterministic, like the fleet key), bound to a LiteLLM **team** (= project) + **internal user** (= user) that carry the limits. Enforcement aggregates on the shared team/user objects, so one key per (user, project) gives identical limits **without** per-job mint/revoke churn; per-job *attribution* deferred to the Slice-4 ledger. Falls back to the fleet key (5a) when user/project is absent. |
 | 7 | Monitoring (v1) | LiteLLM's **native dashboard** (RPM/TPM/usage per key/user/model). Build no custom UI for Slices 1–3. |
-| 8 | Store of record (later) | Slice 4 only: canonical rows in **`usage_events`** (option A); LiteLLM's internal DB = enforcement-only. |
-| 9 | Metered scope | LLM via gateway. **Workspace** compute → Slice 4 (cost-picture completion, decoupled from rate-limiting). Agent pods / query / storage → ignored. |
+| 8 | Store of record | **shipped Slice 4** — canonical rows in **`usage_events`** (`srw-auditdb`): LLM via spend-log materialization, compute via interval emit; LiteLLM's internal DB = enforcement-only. |
+| 9 | Metered scope | **shipped Slice 4** — LLM (gateway) + **workspace** compute (container tier; requests × wall-clock). Agent pods / query / storage still ignored (the `category` taxonomy reserves them). |
 | 10 | BYOK | Route the user's own key **through the gateway too** (rate-limited + measured); later, let the user set custom limits on their own key. |
 | 11 | Subscription plans | Codex / subscription models route **LiteLLM → CLIProxyAPI → provider** so they're rate-limited too (the plans this is most needed for). |
 
@@ -338,6 +385,16 @@ LLM self-attributes per call via the virtual key (robust to agent-pod reuse);
 workspaces are single-owner (worker one-shot `container_provisioner.py:291`;
 session one-thread, billed per active interval).
 
+> **Implemented (Slice 4, 2026-06-22) — the design held, one realization detail.** We run
+> **stock LiteLLM** (no custom callback), so the gateway doesn't buffer/emit; instead the
+> **orchestrator polls `/spend/logs`** and writes the LLM rows. The **idempotent dedupe**
+> on `(source, source_id, unit, ts)` provides the at-least-once guarantee in place of
+> gateway buffering. Compute is exactly as designed (orchestrator open/close into
+> `workspace_intervals` + a materialize/reconcile loop). Attribution caveat: LLM rows
+> self-attribute to **user/project** via the scoped key's ids — **not job** (the gateway
+> never sees `job_id`); compute rows do carry the job/thread ref. Per-job LLM attribution
+> is the one deferred gap.
+
 ## Infrastructure
 
 > The deployment delta is small because LiteLLM brings its own persistence:
@@ -365,17 +422,22 @@ session one-thread, billed per active interval).
   its tables.
 - **No new DB for the ledger.** Slice 4's `usage_events` lands in the **existing
   `srw-auditdb`** as `migrations/audit/0002` — the audit template already earmarks it
-  ("and, later, the usage-metering ledger", `postgres-audit.yaml:3-7`). Slice 4 =
-  **0 new DBs, 1 new table.**
+  ("and, later, the usage-metering ledger", `postgres-audit.yaml:3-7`). Slice 4 (shipped)
+  = **0 new DBs, 3 new tables** (`usage_events` in `srw-auditdb`; `usage_rates` +
+  `workspace_intervals` in the app DB — the two app-side tables were small enough to not
+  warrant their own server).
 
 ### New tables in *our* schema
 
-- **Slices 1–3:** effectively **none required** — keys/limits/spend live in LiteLLM's
-  DB. Only candidate: **one small config table** in the app DB for the category→model
-  map + per-user/project limit policy (Open Q4) — and that can start as **YAML**, so
-  possibly zero.
-- **Slice 4:** **+1** `usage_events` (audit DB) + workspace-metering emit code + a
-  Cockpit view.
+- **Slices 1–3 (shipped):** **none** — keys/limits/spend live in LiteLLM's DB, and the
+  category→model + per-user/project limit policy stayed **YAML** (`litellm.ratePolicy` /
+  `litellm.quota` env, Open Q4 resolved file-driven), exactly as the "possibly zero" call
+  predicted.
+- **Slice 4 (✅ shipped 2026-06-22):** **+3 tables** — `usage_events` (`audit/0002`, the
+  append-only ledger) + `usage_rates` (`app/0033`, effective-dated rate config, ships
+  empty/inert) + `workspace_intervals` (`app/0034`, mutable compute open/close
+  bookkeeping). Plus the `/spend/logs` materializer, the compute emit + reconcile loop,
+  and the Cockpit Usage view.
 
 ### Not needed (for v1)
 
@@ -453,14 +515,21 @@ egress surface (composes with the agent-egress NetworkPolicy work).
   `freeze_data.type=quota_exceeded`); midnight-flood mitigation **filed** (rolling window —
   the daily UTC reset means frozen projects auto-unfreeze + re-dispatch at 00:00 UTC).
 
-### Slice 4 — Unified ledger + workspace metering + Cockpit view *(later)*
-- Adopt **option A**: gateway per-request callback writes canonical
-  `category='llm'` rows into `usage_events`; LiteLLM DB → enforcement-only.
+### Slice 4 — Unified ledger + workspace metering + Cockpit view
+> **✅ IMPLEMENTED + k3d-verified 2026-06-22** (4a–4d — see Implementation status). One
+> design change vs the sketch below: LLM rows are **materialized by polling `/spend/logs`**,
+> not a LiteLLM per-request callback (we run the stock image) — the same orchestrator-polls-
+> the-gateway shape as Slice 3, and exactly the Scaling-§2 "LiteLLM DB enforcement-only,
+> `usage_events` durable" design.
+- ~~gateway per-request callback~~ → **orchestrator polls `/spend/logs`** → canonical
+  `category='llm'` rows into `usage_events` (attributed per user/project via the scoped
+  key's deterministic ids); LiteLLM DB → enforcement-only.
 - Orchestrator emits `category='compute'` workspace open/close intervals
-  (`requests × wall-clock`) + open-interval reconciler.
-- Minimal admin "Usage" view joining both per job/user/day (G5 visibility model).
-- **Acceptance:** one query gives job cost = LLM + workspace, reconciled against
-  the gateway's own number.
+  (`requests × wall-clock`) + open-interval reconciler. **Done** (container/sandbox tier).
+- Admin "Usage" view (by category/unit over a window, G5 visibility model). **Done.**
+- **Acceptance:** a window query returns LLM + workspace usage by category, G5-scoped
+  (`GET /api/usage`). *Caveat:* a per-**job** total covers compute fully but LLM only at the
+  user/project level (job_id never reaches the gateway — see the v1-limitation callout).
 
 > Slices 1–3 are the operational win (measure + throttle + quota), all on
 > LiteLLM-native surfaces. Slice 4 stands up the durable ledger billing will later

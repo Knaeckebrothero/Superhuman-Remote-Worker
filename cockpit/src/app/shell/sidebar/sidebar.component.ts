@@ -133,6 +133,14 @@ import {LegionMarkComponent} from '../../ui/legion-mark';
               <app-icon size="md" class="nav-icon">verified_user</app-icon>
               Admin · Grants
             </a>
+            <a
+              class="nav-link"
+              routerLink="/admin/usage"
+              routerLinkActive="active"
+            >
+              <app-icon size="md" class="nav-icon">monitoring</app-icon>
+              Admin · Usage
+            </a>
           }
         </div>
 
