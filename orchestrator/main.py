@@ -5611,9 +5611,11 @@ async def list_jobs(
             )
 
         if audit_reader.is_available:
+            counts = await audit_reader.get_audit_counts(
+                [str(job["id"]) for job in jobs]
+            )
             for job in jobs:
-                jid = str(job["id"])
-                job["audit_count"] = await audit_reader.get_audit_count(jid)
+                job["audit_count"] = counts.get(str(job["id"]), 0)
         else:
             for job in jobs:
                 job["audit_count"] = None
@@ -22478,10 +22480,13 @@ async def list_project_jobs(
         project = await postgres_db.get_project(project_id)
         has_cloud_folder = bool(project and project.get("main_cloud_folder_handle"))
 
-        # Enrich with audit counts
+        # Enrich with audit counts (single batched query, not N+1)
         if audit_reader.is_available:
+            counts = await audit_reader.get_audit_counts(
+                [str(job["id"]) for job in jobs]
+            )
             for job in jobs:
-                job["audit_count"] = await audit_reader.get_audit_count(str(job["id"]))
+                job["audit_count"] = counts.get(str(job["id"]), 0)
         else:
             for job in jobs:
                 job["audit_count"] = None

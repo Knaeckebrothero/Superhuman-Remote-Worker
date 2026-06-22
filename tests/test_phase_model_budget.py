@@ -7,7 +7,7 @@ default), and the shared compaction budget is the `min` of the two phase
 windows. Sessions (single-model) are untouched.
 
 Root cause + design:
-docs/issues/context_budget_uses_base_model_not_phase_models.md
+docs/done/context_budget_uses_base_model_not_phase_models.md
 """
 
 from types import SimpleNamespace
