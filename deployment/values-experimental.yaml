@@ -86,10 +86,15 @@ dozzle:
   enabled: true
 codexProxy:
   enabled: true
-  # Pinned (was chart-default :latest) to pick up the Codex identity-obfuscation
-  # fixes (v7.1.30–39) that stop OpenAI invalidating the OAuth token after a
-  # handful of requests. Bump deliberately; upstream ships multiple/day.
-  image: docker.io/eceasy/cli-proxy-api:v7.1.39
+  # Pinned to a concrete version (chart default is :latest); upstream ships
+  # multiple builds/day. v7.1.30–39 carried the Codex identity-obfuscation fixes
+  # that stop OpenAI invalidating the OAuth token after a handful of requests.
+  # Bumped 2026-06-22 (v7.1.39 → v7.2.27): from 2026-06-19 the v7.1.39 harmony
+  # parser stopped stripping gpt-5.x's tool-call tokens, leaking raw
+  # `<|tool_call>…<tool_call|>` into chat/completions `content` (structured
+  # tool_calls stayed correct). Verify after rollout: (1) codex auth still
+  # survives >13 calls (no 401 storm), (2) leak gone. Revert this line if 401s return.
+  image: docker.io/eceasy/cli-proxy-api:v7.2.27
 # -----------------------------------------------------------------------------
 # Cloud storage — OpenCloud bundled (chart default)
 # -----------------------------------------------------------------------------
