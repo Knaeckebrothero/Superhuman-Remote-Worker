@@ -35,6 +35,9 @@ instruction_files:
   - file: design_guide.md
     trigger: phase:tactical
     enforce: true
+  - skill: verify-before-done
+    trigger: phase:tactical
+    enforce: false  # Active: injected at tactical phase start (where completion happens)
 
 tools:
   workspace:

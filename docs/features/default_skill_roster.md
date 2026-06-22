@@ -8,7 +8,7 @@ tags:
 
 # Default Skill Roster
 
-> **Status**: Research + recommendation, 2026-06-21. **No code changes yet.** Defines which bundled **skills** SRW should ship *by default in every deployment*, structured as a tight always-on **universal core** plus **opt-in** and **expert-dedicated** tiers. Builds on the shipped skills substrate ([[agent_skills]]) and is the skills-side companion to [[default_expert_roster]]. The roster recommendation is **pending decision**; the proposed first concrete build is the Tier-1 four (`systematic-debugging`, `verify-before-done`, `planning-and-decomposition`, `brainstorming`).
+> **Status**: Research + recommendation, 2026-06-21. **First build shipped 2026-06-22: `verify-before-done`** — authored as a bundled skill (`config/skills/verify-before-done/`) and bound `phase:tactical` on the worker experts (`defaults` → developer/critic/curator/bughunter, plus the overriders `scholar` + `designer`). Its stronger enforcement tiers (**B** read-gate, **C** trace-gate) are deferred follow-ups — see [Enforcement model & follow-ups](#enforcement-model--follow-ups). Defines which bundled **skills** SRW should ship *by default in every deployment*, structured as a tight always-on **universal core** plus **opt-in** and **expert-dedicated** tiers. Builds on the shipped skills substrate ([[agent_skills]]) and is the skills-side companion to [[default_expert_roster]]. Remaining Tier-1 builds: `systematic-debugging` and `brainstorming` (`planning-and-decomposition` already ships as `todo-guide`).
 >
 > **Method**: a `deep-research` harness run (107 agents, ~4.2M tokens, 6 search angles, 24 sources fetched, 119 claims extracted → 25 verified → **24 confirmed / 1 refuted** via 3-vote adversarial verification) surveyed Anthropic's official skills, Claude Code's `superpowers` ecosystem, OpenAI Codex, Cursor, Cline, community "awesome" collections, and the multi-agent failure literature — then synthesized against SRW's architecture. Descriptive claims (what each system *ships*) are strongly sourced (primary repos verified via live GitHub API, official docs, peer-reviewed MAST); roster *tier placements* are reasoned synthesis on top (confidence noted per call).
 
@@ -131,6 +131,22 @@ The research deliberately surfaced four questions the sources cannot settle — 
 2. **Do coding-validated skills transfer to pure knowledge-work?** This is the central **unmeasured** premise — *every* strong validation source (superpowers, Cursor, Cline) is a **coding** ecosystem. No source measures `systematic-debugging`'s value for non-code research/writing. Plausible (the procedures are general) but it is extrapolation. **Recommended de-risk:** run one SRW eval job with a draft `systematic-debugging` skill on a *non-coding* task before committing it to the core.
 3. **Model-invoked vs. enforced/gated, per skill?** Evidence supports both. Likely mix: *enforce* `verify-before-done` (and keep the existing enforced `planning`), leave `brainstorming` / `systematic-debugging` model-invoked. Tune on SRW's own eval set, per Anthropic's "match your evaluation tasks" guidance.
 4. **Build `writer` first?** It is the planned new writer expert ([[default_expert_roster]]) but the **weakest-validated** roster entry — no vendor ships a generic prose *procedure*. A spike is warranted before baseline commitment.
+
+## Enforcement model & follow-ups
+
+Skills can be delivered at three escalating levels of enforcement. Authoring the `SKILL.md` (the guidance) is independent of which level it is bound at — and `verify-before-done`, the first build, deliberately ships at the lowest level, with the higher two captured here as follow-ups. The same ladder applies to any skill where compliance matters.
+
+| Tier | Mechanism | Status for `verify-before-done` |
+|---|---|---|
+| **A — Guidance** | Author the `SKILL.md`; bind `phase:tactical` so the body auto-injects whenever the agent is doing tactical work (where completion happens). Portable; no orchestrator changes. | **✅ Shipped 2026-06-22** (worker experts). |
+| **B — Read-gate** | The *existing* `before_tool` enforce binding (as `todo-guide` uses on `next_phase_todos`): the action is refused until the agent has read the skill. | **Available, not used here** — forces *reading*, not *doing*. |
+| **C — Trace-gate** | Orchestrator-side check at `check_goal` / the completion gate: reject `goal_achieved` / `todo_complete` unless a workspace tool actually ran in the current tactical phase **and** its output is referenced in the completion payload; on failure, re-inject the body and force another loop. | **Deferred** — new infra, its own design doc. |
+
+**The key distinction (B vs C):** "the agent read the skill" ≠ "the agent performed verification." B only proves the body was in context; the agent can read it and still claim success without running anything. C is the only tier that checks the *behavior*. The verify-before-done research argues C is necessary (it cites a "compliance gap" where models promise to follow a process in text but skip the execution) — and C is *general* completion-integrity infra that would harden every skill, which is why it belongs in its own design doc rather than riding on this one.
+
+**Before building C, measure.** The headline statistic motivating C (near-0% process compliance when self-controlled → 75%+ behind a deterministic gate) traces to effectively a single source plus two arXiv IDs not independently confirmed. Instrument our own runs first: across completed jobs, how often did the agent emit `goal_achieved` without a fresh verification tool call in that tactical phase? High rate → C is justified; if Tier-A guidance already moves it, C may be unnecessary. Same measure-before-building discipline applied to the rate-limit knobs.
+
+**Already covered:** the research's "recursion trap" (an over-rigid gate causing infinite repair-verify loops) is already mitigated by SRW's fingerprint-based loop detection (hard caps: tactical = rewind, strategic = freeze), so C inherits that backstop rather than needing its own.
 
 ## Considered but not elevated (no silent drops)
 
