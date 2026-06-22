@@ -502,3 +502,66 @@ class TestAgentRestInputEndpointsNoSession:
             mod._loop_task = None
             mod._loop_user_queue = None
             mod._hard_interrupt_event = None
+
+
+# ---------------------------------------------------------------------------
+# Section 6 — No-cursor SSE replay anchors past the last completed turn
+# ---------------------------------------------------------------------------
+
+
+class TestNoCursorReplayStart:
+    """A fresh SSE attach (no cached cursor — e.g. opening the session on a
+    second device) must NOT replay the whole epoch from seq 0. The client has
+    already loaded the thread's completed turns from REST history; replaying
+    them as live frames re-renders the last assistant turn twice, split by a
+    spurious "SESSION RESUMED" divider (the cold-attach twin of the
+    gone_beyond_horizon duplicate render). The replay must start just past the
+    last turn-terminal event so only the in-flight turn is replayed."""
+
+    @pytest.mark.asyncio
+    async def test_anchors_past_last_terminal_event(self):
+        import orchestrator.main as om
+
+        captured = {}
+
+        class _Conn:
+            async def fetchval(self, sql, *args):
+                captured["sql"] = sql
+                captured["args"] = args
+                # Simulate MAX(seq) of the epoch's terminal events.
+                return 7
+
+        start = await om._no_cursor_replay_start(_Conn(), "thread-x", 3)
+
+        # Replay only seq > 7 (the in-flight turn), NOT the whole epoch.
+        assert start == 7
+        # The anchor must filter on turn-terminal kinds, not every event —
+        # otherwise it would stop at the last token and still re-replay the
+        # completed turn's text.
+        assert "turn.completed" in captured["sql"]
+        assert "turn.error" in captured["sql"]
+        assert captured["args"] == ("thread-x", 3)
+
+    @pytest.mark.asyncio
+    async def test_returns_zero_when_no_turn_has_finished(self):
+        """First turn still in flight (no terminal event yet) → replay from 0
+        so the in-flight first turn, absent from REST history, is delivered."""
+        import orchestrator.main as om
+
+        class _Conn:
+            async def fetchval(self, sql, *args):
+                return 0  # COALESCE(MAX(seq), 0) with no terminal rows
+
+        start = await om._no_cursor_replay_start(_Conn(), "thread-x", 0)
+        assert start == 0
+
+    @pytest.mark.asyncio
+    async def test_coerces_null_max_to_zero(self):
+        import orchestrator.main as om
+
+        class _Conn:
+            async def fetchval(self, sql, *args):
+                return None
+
+        start = await om._no_cursor_replay_start(_Conn(), "thread-x", 0)
+        assert start == 0

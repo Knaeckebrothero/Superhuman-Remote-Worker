@@ -5,6 +5,7 @@ _build_tool_use_failed_feedback, _is_tool_error, _extract_markdown_content,
 _check_empty_response_streak, _check_no_tool_call_streak.
 """
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from src.graph import (
@@ -493,18 +494,22 @@ class TestCheckNoToolCallStreak:
 # =============================================================================
 
 
-def _make_sdk_error(class_name: str, status_code, *, body=None, message=""):
+def _make_sdk_error(class_name: str, status_code, *, body=None, message="", url=None):
     """Build a duck-typed SDK error.
 
     The classifier inspects ``type(exc).__name__`` and ``exc.status_code`` /
     ``exc.body`` rather than isinstance-checking the openai/anthropic SDK
-    types, so we don't need to import them here.
+    types, so we don't need to import them here. ``url`` populates a duck-typed
+    ``.request.url`` the way ``openai.APIStatusError`` does, so URL-based
+    routing checks (codex-proxy detection) can be exercised.
     """
     cls = type(class_name, (Exception,), {})
     err = cls(message)
     err.status_code = status_code
     if body is not None:
         err.body = body
+    if url is not None:
+        err.request = SimpleNamespace(url=url)
     return err
 
 
@@ -676,6 +681,70 @@ class TestClassifyLlmError:
             "AuthenticationError",
             401,
             body={"error": {"code": "auth_unavailable"}},
+        )
+        outer = Exception("LangChain wrapper")
+        outer.__cause__ = inner
+        assert _classify_llm_error(outer) == "auth_unavailable"
+
+    # --- Codex proxy GENERIC 401 (no marker) — transient blip, retryable ----
+    # The 2026-06-22 "Research 01" incident: CLIProxyAPI returned a *generic*
+    # 401 ("Invalid, disabled, or expired API key" / authentication_error) with
+    # NO auth_unavailable marker during a token-refresh window. The same model
+    # answered in a session ~50s later. The autonomous job must retry+resume,
+    # not hard-fail. Detection is host-scoped to the codex proxy so a real
+    # api.openai.com bad-key 401 still fails fast.
+
+    def test_401_codex_proxy_generic_error_is_retryable(self):
+        """Generic 401 (no marker) routed through the in-cluster codex proxy
+        → auth_unavailable, identified by the 'codex' host."""
+        err = _make_sdk_error(
+            "AuthenticationError",
+            401,
+            body={
+                "error": {
+                    "message": "Invalid, disabled, or expired API key",
+                    "type": "authentication_error",
+                }
+            },
+            url="http://srw-codex-proxy:8317/v1/responses",
+        )
+        assert _classify_llm_error(err) == "auth_unavailable"
+
+    def test_401_codex_proxy_localhost_default_port_is_retryable(self):
+        """Local-dev codex proxy (CLIProxyAPI default localhost:8317): the host
+        has no 'codex' substring, so the :8317 port marker carries it."""
+        err = _make_sdk_error(
+            "AuthenticationError",
+            401,
+            body={"error": {"message": "Invalid, disabled, or expired API key"}},
+            url="http://localhost:8317/v1/chat/completions",
+        )
+        assert _classify_llm_error(err) == "auth_unavailable"
+
+    def test_401_real_openai_host_stays_permanent(self):
+        """A generic 401 from the REAL api.openai.com (a genuinely bad key)
+        must still fail fast — the codex-proxy widening is host-scoped."""
+        err = _make_sdk_error(
+            "AuthenticationError",
+            401,
+            body={
+                "error": {
+                    "message": "Invalid, disabled, or expired API key",
+                    "type": "authentication_error",
+                }
+            },
+            url="https://api.openai.com/v1/chat/completions",
+        )
+        assert _classify_llm_error(err) == "permanent"
+
+    def test_401_codex_proxy_error_walks_cause_chain(self):
+        """LangChain wraps the provider error — URL-based codex detection must
+        unwrap it like the marker-based path does."""
+        inner = _make_sdk_error(
+            "AuthenticationError",
+            401,
+            body={"error": {"message": "Invalid, disabled, or expired API key"}},
+            url="http://srw-codex-proxy:8317/v1/responses",
         )
         outer = Exception("LangChain wrapper")
         outer.__cause__ = inner

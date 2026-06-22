@@ -15662,6 +15662,34 @@ async def _forward_to_agent(
         return {"raw": response.text[:500]}
 
 
+async def _no_cursor_replay_start(conn, thread_id: str, epoch: int) -> int:
+    """Replay floor (exclusive) for an SSE attach that carries no cursor.
+
+    A fresh client — opening the session on a second device, or any client
+    with no cached cursor for this thread — has already painted the thread's
+    completed turns from REST history. Replaying the whole epoch from seq 0
+    would re-deliver each completed turn as a *live* copy the cockpit reducer
+    can't reconcile (history turns are keyed by message id, replayed turns by
+    turn_id), so the last assistant turn renders twice, split by a spurious
+    "SESSION RESUMED" divider — the cold-attach twin of the gone_beyond_horizon
+    duplicate render.
+
+    Anchor instead just past the last turn-terminal event (``turn.completed`` /
+    ``turn.error``, both of which persist their turn to ``thread_messages``), so
+    the replay carries only the in-flight, not-yet-persisted turn. Returns 0
+    when no turn has finished yet (first turn still streaming) so that turn —
+    absent from REST history — still replays from the start.
+    """
+    anchor = await conn.fetchval(
+        "SELECT COALESCE(MAX(seq), 0) FROM thread_events "
+        "WHERE thread_id = $1 AND epoch = $2 "
+        "AND kind IN ('turn.completed', 'turn.error')",
+        thread_id,
+        epoch,
+    )
+    return int(anchor or 0)
+
+
 @app.get("/api/persistent/threads/{thread_id}/stream")
 async def thread_event_stream(thread_id: str, request: Request) -> StreamingResponse:
     """SSE: stream this thread's event log with replay-from-cursor.
@@ -15679,7 +15707,8 @@ async def thread_event_stream(thread_id: str, request: Request) -> StreamingResp
     server_epoch = int(thread.get("events_epoch") or 0)
 
     # Parse Last-Event-ID. Format: "<epoch>:<seq>". Missing/malformed → no
-    # replay, start from current tail.
+    # cursor, so the replay floor is computed by _no_cursor_replay_start below
+    # (anchored past the last completed turn, not seq 0).
     #
     # EventSource doesn't let the browser set custom request headers, so the
     # cockpit hands us the cached cursor via `?last_event_id=` for the
@@ -15768,7 +15797,18 @@ async def thread_event_stream(thread_id: str, request: Request) -> StreamingResp
             yield f"id: {server_epoch}:0\nevent: gone_beyond_horizon\ndata: {payload}\n\n"
             return
 
-        last_sent_seq = cursor_seq if cursor_seq is not None else 0
+        # Replay floor. With a cursor, resume right after it. Without one, a
+        # fresh attach has already loaded completed turns from REST history, so
+        # anchor past the last completed turn instead of replaying the whole
+        # epoch from 0 (which doubles the last assistant turn + shows a spurious
+        # "SESSION RESUMED" divider — see _no_cursor_replay_start).
+        if cursor_seq is not None:
+            last_sent_seq = cursor_seq
+        else:
+            async with postgres_db.acquire() as conn:
+                last_sent_seq = await _no_cursor_replay_start(
+                    conn, thread_id, server_epoch
+                )
         empty_polls = 0
         idle_keepalive_at = 0.0
         cancelled = False

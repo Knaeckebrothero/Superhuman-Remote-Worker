@@ -1052,16 +1052,26 @@ spec:
         - name: vm-ssh-key
           secret:
             secretName: {{ include "srw.vmSshKeySecretName" . }}
-            # 0444 (read for owner/group/other) so the orchestrator container,
-            # which runs as the non-root `srw` user (uid 999) baked into
-            # docker/Dockerfile.orchestrator, can read the key. The secret is
-            # owned root:root and the orchestrator pod is single-purpose, so
-            # world-readable inside this container is acceptable. Required by
-            # services/thread_uploads.py (paramiko SFTP for live thread
-            # workspace uploads). NOTE: OpenSSH's CLI rejects group/world-
-            # readable keys — services/{ide_session,snapshot_service}.py shell
-            # out to `ssh -i` and would need `-o StrictModes=no` (or an
-            # initContainer-staged copy) before they can use this key. They
-            # don't today, so this change unblocks paramiko but does not by
-            # itself fix the system-`ssh` paths.
+            # 0444 (world-readable) so the non-root `srw` user the orchestrator
+            # runs as in prod (USER srw, docker/Dockerfile.orchestrator) can read
+            # this root:root-owned key. The pod is single-purpose, so world-
+            # readable in-container is acceptable. Required by
+            # services/thread_uploads.py (paramiko SFTP for live thread uploads).
+            #
+            # Do NOT lower this to 0400: a non-root process cannot read a
+            # root-owned 0400 file — that breaks prod, including the paramiko
+            # path above.
+            #
+            # The `ssh -i` paths (services/{snapshot_service,ide_session}.py and
+            # services/ssh_helpers.py) also work in prod despite 0444: OpenSSH
+            # enforces its private-key permission check ONLY when the key file is
+            # owned by the same uid running ssh. Here the key is root-owned while
+            # the process is `srw`, so the check is skipped. It DOES trip in
+            # local dev, where docker/Dockerfile.orchestrator.dev runs the
+            # container as root (uid == key owner) -> "Permissions 0444 ... too
+            # open ... ignored" -> snapshot/IDE SSH fails. That is dev-only.
+            # There is no client-side `StrictModes` ssh option (it is an sshd
+            # directive); to make the dev SSH paths work, stage-copy the key to a
+            # 0600 file owned by the runtime user at startup (works as root or
+            # srw).
             defaultMode: 0444

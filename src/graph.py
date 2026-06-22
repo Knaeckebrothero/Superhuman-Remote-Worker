@@ -45,9 +45,11 @@ Phase Alternation:
 
 import json
 import logging
+import os
 import re
 import time
 from typing import Any, Callable, Dict, List, Literal, Optional
+from urllib.parse import urlsplit
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import (
@@ -174,6 +176,66 @@ def _is_codex_auth_unavailable(exc: BaseException) -> bool:
     return "auth_unavailable" in text or "invalidated oauth token" in text
 
 
+def _request_url_str(exc: BaseException) -> Optional[str]:
+    """Best-effort extraction of the HTTP request URL from an SDK error.
+
+    openai/anthropic ``APIStatusError`` carry ``.request`` (an httpx.Request)
+    and ``.response`` (whose ``.request`` also exposes the URL). Duck-typed to
+    match the rest of the classifier — no SDK import required.
+    """
+    for attr_path in (("request", "url"), ("response", "request", "url")):
+        obj: Any = exc
+        for attr in attr_path:
+            obj = getattr(obj, attr, None)
+            if obj is None:
+                break
+        if obj is not None:
+            return str(obj)
+    return None
+
+
+def _is_codex_proxy_url(url: str) -> bool:
+    """True if ``url`` targets the Codex/CLIProxyAPI proxy.
+
+    Codex/ChatGPT-subscription models are reached over an OpenAI-compatible
+    transport (``provider="openai"`` + the proxy's ``base_url``), so the
+    request URL is the only thing that tells a codex-proxy call apart from a
+    real ``api.openai.com`` call. Markers, in order of authority:
+
+    * an explicit ``CODEX_BASE_URL`` / ``CODEX_PROXY_URL`` host (operator-set)
+    * a host containing ``codex`` (the in-cluster ``srw-codex-proxy`` service)
+    * CLIProxyAPI's default port ``8317`` (the local-dev default base URL,
+      see ``loader._create_codex_llm``)
+    """
+    u = url.lower()
+    for env in ("CODEX_BASE_URL", "CODEX_PROXY_URL"):
+        base = os.environ.get(env)
+        if base:
+            host = urlsplit(base).netloc.lower()
+            if host and host in u:
+                return True
+    return "codex" in u or ":8317" in u
+
+
+def _is_codex_proxy_error(exc: BaseException) -> bool:
+    """True if ``exc`` came from a request routed through the Codex proxy.
+
+    A 401 from that proxy is a *transient* token-refresh / account-auth blip:
+    CLIProxyAPI surfaces it as a generic ``authentication_error`` WITHOUT the
+    ``auth_unavailable`` marker (so :func:`_is_codex_auth_unavailable` misses
+    it), yet it clears on the next refresh just the same. Treating it as
+    recoverable (bounded retry + resume) instead of permanent stops a one-off
+    proxy hiccup from hard-failing an autonomous job, while a real
+    ``api.openai.com`` bad-key 401 (different host) still fails fast.
+
+    Incident: 2026-06-22 job "Research 01" died on the first strategic call
+    with this exact generic 401 while a session ran the same gpt-5.5 through
+    the same proxy ~50s later.
+    """
+    url = _request_url_str(exc)
+    return url is not None and _is_codex_proxy_url(url)
+
+
 def _classify_llm_error(error: Exception) -> str:
     """Classify an LLM exception as ``permanent``, ``rate_limit``, or ``transient``.
 
@@ -230,11 +292,19 @@ def _classify_llm_error(error: Exception) -> str:
                                 return "permanent"
                     # 400 without a parseable body — be conservative, retry.
                     return "transient"
-                if status_code == 401 and _is_codex_auth_unavailable(current):
-                    # Codex/OAuth-proxy token invalidated or mid-refresh —
-                    # recoverable by a proxy re-auth + resume, so retry rather
-                    # than fail the job. A genuinely-bad API key carries no
-                    # ``auth_unavailable`` marker and stays "permanent" below.
+                if status_code == 401 and (
+                    _is_codex_auth_unavailable(current)
+                    or _is_codex_proxy_error(current)
+                ):
+                    # Codex/OAuth-proxy token invalidated, mid-refresh, or a
+                    # transient proxy auth blip — recoverable by a proxy
+                    # re-auth/refresh + resume, so retry rather than fail the
+                    # job. Detected either by the proxy's ``auth_unavailable``
+                    # marker OR by the request routing through the codex proxy
+                    # (the proxy sometimes returns a *generic* 401 with no
+                    # marker — the 2026-06-22 "Research 01" incident). A
+                    # genuinely-bad key hits a different host and stays
+                    # "permanent" below.
                     return "auth_unavailable"
                 return "permanent"
             if 500 <= status_code < 600:
