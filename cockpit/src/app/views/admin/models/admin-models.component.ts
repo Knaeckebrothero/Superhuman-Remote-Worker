@@ -530,30 +530,66 @@ function hintsToCapabilities(
       .model-header {
         display: none;
       }
+      /* Two-column card: title + enabled-toggle share row 1 (toggle pinned
+         top-right, the conventional spot); the model-id becomes a muted
+         subtitle so an id identical to the display label reads as a faint echo
+         rather than a duplicate; capabilities + family share row 3 (tags left,
+         family right); Test/Delete span the bottom. */
       .model-row {
-        grid-template-columns: 1fr;
-        gap: 6px;
-        padding: 12px;
+        grid-template-columns: 1fr auto;
+        align-items: start;
+        column-gap: 8px;
+        row-gap: 6px;
+        padding: 12px 14px;
       }
       .col-display {
-        font-size: 14px;
+        grid-column: 1;
+        grid-row: 1;
+        font-size: 15px;
         font-weight: 600;
+        min-width: 0;
+        overflow-wrap: anywhere;
+      }
+      .col-enabled {
+        grid-column: 2;
+        grid-row: 1;
+        justify-self: end;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        white-space: nowrap;
+      }
+      .col-enabled::before {
+        content: 'Enabled';
+        font-size: 12px;
+        color: var(--text-muted);
+      }
+      .col-id {
+        grid-column: 1 / -1;
+        grid-row: 2;
+        font-size: 11px;
+        opacity: 0.6;
+      }
+      .col-capability {
+        grid-column: 1;
+        grid-row: 3;
+      }
+      .col-family {
+        grid-column: 2;
+        grid-row: 3;
+        justify-self: end;
+        align-self: start;
+        font-size: 12px;
+        white-space: nowrap;
       }
       .col-family::before {
         content: 'Family: ';
         color: var(--text-muted);
       }
-      .col-enabled {
-        display: flex;
-        align-items: center;
-        gap: 8px;
-      }
-      .col-enabled::before {
-        content: 'Enabled: ';
-        color: var(--text-muted);
-      }
       .col-actions {
-        margin-top: 4px;
+        grid-column: 1 / -1;
+        grid-row: 4;
+        margin-top: 2px;
       }
       /* Stack the cramped two-up form rows (two ~137px fields side-by-side). */
       .form-row.two-col {
