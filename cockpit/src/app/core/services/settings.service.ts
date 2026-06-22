@@ -133,7 +133,7 @@ export class SettingsService {
   getCodexStatus(): Observable<CodexStatus> {
     return this.http
       .get<CodexStatus>(`${this.baseUrl}/codex/status`)
-      .pipe(catchError(() => of({ connected: false, accounts: [], model_count: 0 })));
+      .pipe(catchError(() => of({ connected: false, reachable: false, accounts: [], model_count: 0 })));
   }
 
   getCodexModels(): Observable<{ models: string[] }> {

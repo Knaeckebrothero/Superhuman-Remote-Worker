@@ -20653,7 +20653,15 @@ async def codex_status(request: Request) -> dict[str, Any]:
         auth_resp = await _codex_proxy_request("GET", "/v0/management/auth-files")
         auth_files = auth_resp.json()
     except HTTPException:
-        return {"connected": False, "accounts": [], "model_count": 0}
+        # Proxy unreachable — the codex-proxy deployment is disabled or down.
+        # `reachable: False` lets the cockpit show an "enable it" disclaimer
+        # instead of a Connect button that would 502 on /api/codex/login.
+        return {
+            "connected": False,
+            "reachable": False,
+            "accounts": [],
+            "model_count": 0,
+        }
 
     # Normalize: auth-files may return a list or a dict with a key
     accounts = (
@@ -20683,6 +20691,7 @@ async def codex_status(request: Request) -> dict[str, Any]:
 
     return {
         "connected": len(active) > 0,
+        "reachable": True,
         "accounts": [
             {
                 "name": a.get("name", "unknown"),
