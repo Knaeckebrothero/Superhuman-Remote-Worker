@@ -151,10 +151,13 @@ from services.litellm_gateway import (  # noqa: E402
     ensure_scoped_key,
     get_fleet_key,
     litellm_sync_loop,
+    materialize_llm_usage,
 )
 from services.audit_partitions import (  # noqa: E402
     maintenance_loop as audit_maintenance_loop,
 )
+from services import workspace_metering  # noqa: E402
+from services.usage_ledger import UsageLedger, UsageRates  # noqa: E402
 from services.workspace import workspace_service  # noqa: E402
 from services.gitea import GiteaClient  # noqa: E402
 from services.keycloak_admin import KeycloakGroupSync  # noqa: E402
@@ -283,6 +286,33 @@ audit_db = (
 # ~13 read call sites are backend-agnostic.
 audit_store = AuditStore(_audit_url) if _audit_url else None
 audit_reader = mongodb
+
+# Usage-metering ledger (Slice 4). Instantiated in the lifespan once the audit +
+# app pools and the usage_rates migration are ready; None until then (and on
+# deployments without the audit tier — metering disabled, non-load-bearing).
+usage_ledger: UsageLedger | None = None
+
+
+async def _workspace_metering_attribution(
+    owner_kind: str, owner_id: str
+) -> dict[str, Any] | None:
+    """Resolve a workspace owner → {user_id, project_id} for ledger attribution.
+
+    Best-effort (used by the Slice 4b metering loop): a missing/deleted owner
+    yields None — the compute row is still recorded, just unattributed.
+    """
+    try:
+        row = (
+            await postgres_db.get_job(owner_id)
+            if owner_kind == "job"
+            else await postgres_db.get_thread(owner_id)
+        )
+        if not row:
+            return None
+        return {"user_id": row.get("user_id"), "project_id": row.get("project_id")}
+    except Exception:
+        return None
+
 
 # Session router singletons — see docs/features/direct_session_websockets.md
 import json as _session_json  # noqa: E402
@@ -1349,6 +1379,49 @@ async def quota_poll_loop(
     finally:
         await client.aclose()
         logger.info("Quota poll loop stopped")
+
+
+async def llm_usage_poll_loop(
+    shutdown_event: asyncio.Event,
+    *,
+    interval: float = 120.0,
+) -> None:
+    """Background loop: materialize the LiteLLM spend log into usage_events (4c).
+
+    No-op when the gateway is unconfigured or the ledger is unavailable. The
+    spend-log scan is idempotent at the ledger (dedupe on request_id+unit+ts), so
+    re-polling is safe; an in-memory cursor (max startTime processed) keeps each
+    tick to only the new rows. Never raises into the lifespan.
+    """
+    base_url = os.getenv("LITELLM_BASE_URL", "").strip()
+    master_key = os.getenv("LITELLM_MASTER_KEY", "").strip()
+    if not base_url or not master_key:
+        logger.info("LLM usage poll loop disabled (gateway not configured)")
+        return
+    if usage_ledger is None or not usage_ledger.is_available:
+        logger.info("LLM usage poll loop disabled (usage ledger unavailable)")
+        return
+
+    client = LiteLLMClient(base_url, master_key)
+    cursor = None
+    logger.info("LLM usage poll loop starting (interval=%ss)", interval)
+    try:
+        while not shutdown_event.is_set():
+            try:
+                if await client.is_ready():
+                    res = await materialize_llm_usage(
+                        client, usage_ledger, since=cursor
+                    )
+                    cursor = res.get("cursor") or cursor
+            except Exception:
+                logger.exception("LLM usage poll tick failed (non-fatal)")
+            try:
+                await asyncio.wait_for(shutdown_event.wait(), timeout=interval)
+            except asyncio.TimeoutError:
+                pass
+    finally:
+        await client.aclose()
+        logger.info("LLM usage poll loop stopped")
 
 
 async def _inject_dispatch_credentials(
@@ -4825,6 +4898,17 @@ async def lifespan(app: FastAPI):
             audit_ready = False
     logger.info("Database migrations applied")
 
+    # Usage-metering ledger (Slice 4). Writes go to the auditdb usage_events
+    # table (None → no-op when the audit tier is absent); rates resolve against
+    # the app-DB usage_rates table created by the migration above. Built here so
+    # both pools + the schema are ready. Emitters (compute / LLM materialization)
+    # and /api/usage read this singleton.
+    global usage_ledger
+    usage_ledger = UsageLedger(
+        audit_db.pool if (audit_db is not None and audit_ready) else None,
+        UsageRates(postgres_db.pool),
+    )
+
     # Encrypt any legacy plaintext datasource credentials. Idempotent — once
     # all rows are v1 ciphertexts this is a fast no-op. Lives in lifespan
     # (not init.py) for the same reason mongodb.ensure_indexes does: init.py
@@ -5111,6 +5195,23 @@ async def lifespan(app: FastAPI):
     # the gateway (LITELLM_BASE_URL unset). See usage_monitoring_and_rate_limiting.md.
     quota_poll_task = asyncio.create_task(quota_poll_loop(_shutdown_event, postgres_db))
 
+    # Workspace compute metering (Slice 4b): materialize CLOSED workspace
+    # intervals into the usage ledger + reconcile leaked opens. Self-disables
+    # when the app pool or ledger is absent (non-load-bearing tier).
+    workspace_metering_task = asyncio.create_task(
+        workspace_metering.workspace_metering_loop(
+            _shutdown_event,
+            postgres_db,
+            usage_ledger,
+            _workspace_metering_attribution,
+        )
+    )
+
+    # LLM usage materialization (Slice 4c): poll the LiteLLM spend log into the
+    # usage ledger as category='llm' rows. Self-disables when the gateway or the
+    # ledger is absent.
+    llm_usage_task = asyncio.create_task(llm_usage_poll_loop(_shutdown_event))
+
     # Audit-store partition maintenance (creation + ANALYZE + lookahead alarms;
     # retention deferred — see services/audit_partitions.py). Only when the
     # audit DB is configured; otherwise the store is inactive and there is
@@ -5196,6 +5297,8 @@ async def lifespan(app: FastAPI):
     await automation_cron_task
     await litellm_sync_task
     await quota_poll_task
+    await workspace_metering_task
+    await llm_usage_task
     if audit_maintenance_task is not None:
         await audit_maintenance_task
 
@@ -11768,6 +11871,66 @@ async def get_stuck_jobs(
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+def _parse_utc_date(s: str) -> datetime:
+    """Parse an ISO date/datetime as tz-aware UTC (naive → assumed UTC)."""
+    d = datetime.fromisoformat(s)
+    return (
+        d.replace(tzinfo=timezone.utc)
+        if d.tzinfo is None
+        else d.astimezone(timezone.utc)
+    )
+
+
+@app.get("/api/usage")
+async def get_usage(
+    request: Request,
+    days: int = Query(default=30, ge=1, le=365),
+    from_date: str | None = Query(
+        default=None, description="ISO date/datetime (UTC); overrides `days`"
+    ),
+    to_date: str | None = Query(
+        default=None, description="ISO date/datetime (UTC), exclusive"
+    ),
+    ref_id: str | None = Query(default=None, description="Filter to one job/thread id"),
+) -> dict[str, Any]:
+    """Aggregate usage (LLM tokens + workspace compute) for the caller (G5).
+
+    Reads the ``usage_events`` ledger (Slice 4). Window defaults to the last
+    ``days``; ``from_date``/``to_date`` override it. Admins see the full fleet
+    (optionally narrowed by an MCP ``project:`` scope); non-admins see only rows
+    they own or can see via project membership. Returns sums by (category, unit)
+    plus the headline ``total_cost_usd`` (0 while resources are unpriced).
+    ``available=false`` means the audit tier is off — metering disabled.
+    """
+    user = await require_approved_user(request, postgres_db)
+    if usage_ledger is None or not usage_ledger.is_available:
+        return {"by_category": [], "total_cost_usd": 0.0, "available": False}
+    try:
+        now = datetime.now(timezone.utc)
+        to_ts = _parse_utc_date(to_date) if to_date else now
+        from_ts = (
+            _parse_utc_date(from_date) if from_date else (to_ts - timedelta(days=days))
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"invalid date: {e}") from e
+    vis = await _visibility_kwargs_for_stats(user)
+    try:
+        result = await usage_ledger.query_usage(
+            from_ts=from_ts,
+            to_ts=to_ts,
+            owner_user_id=vis.get("owner_user_id"),
+            visible_project_ids=vis.get("visible_project_ids"),
+            scope_project_id=vis.get("scope_project_id"),
+            ref_id=ref_id,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    result["available"] = True
+    result["from"] = from_ts.isoformat()
+    result["to"] = to_ts.isoformat()
+    return result
 
 
 # =============================================================================

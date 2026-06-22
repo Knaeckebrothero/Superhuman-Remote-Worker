@@ -20,6 +20,7 @@ import logging
 import os
 from typing import Any, Optional
 
+from services import workspace_metering
 from services.workspace_lifecycle import WorkspaceOwner
 
 logger = logging.getLogger(__name__)
@@ -246,6 +247,13 @@ class ContainerProvisioner:
                 },
             )
 
+            # Open a compute-metering interval (Slice 4b) — best-effort, billed on
+            # the requested cpu/memory from pod creation to deletion. Idempotent
+            # on the live-pod re-create path (one open interval per owner).
+            await workspace_metering.open_interval(
+                self._db, owner, tier="sandbox", cpu=cpu, memory=memory
+            )
+
             # Wait for pod IP (poll until ready or timeout)
             pod_ip = await self._wait_for_ready(pod_name, timeout=120)
             if pod_ip:
@@ -314,6 +322,9 @@ class ContainerProvisioner:
             )
             await self._delete_seed_configmap(pod_name)
             await self._set_context(owner, {"status": "deleted"})
+            # Close the compute-metering interval (Slice 4b) — pod gone, billing
+            # stops. Best-effort; the loop's reconciler bounds any missed close.
+            await workspace_metering.close_interval(self._db, owner)
             return True
         except Exception as e:
             # 404 is fine — pod already gone
@@ -324,6 +335,7 @@ class ContainerProvisioner:
                     owner.kind,
                     owner.id,
                 )
+                await workspace_metering.close_interval(self._db, owner)
                 return True
             logger.error(
                 "Failed to delete workspace container for %s %s: %s",

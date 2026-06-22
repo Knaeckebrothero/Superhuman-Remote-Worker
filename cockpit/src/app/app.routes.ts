@@ -22,6 +22,7 @@ import {AdminLlmComponent} from './views/admin/llm/admin-llm.component';
 import {AdminUsersComponent} from './views/admin/users/admin-users.component';
 import {AdminConfigComponent} from './views/admin/config/admin-config.component';
 import {AdminGrantsComponent} from './views/admin/grants/admin-grants.component';
+import {AdminUsageComponent} from './views/admin/usage/admin-usage.component';
 import {authGuard} from './core/guards/auth.guard';
 import {adminGuard} from './core/guards/admin.guard';
 import {projectAccessGuard} from './core/guards/project-access.guard';
@@ -56,6 +57,7 @@ export const routes: Routes = [
   { path: 'admin/users', component: AdminUsersComponent, canActivate: [authGuard, adminGuard] },
   { path: 'admin/config', component: AdminConfigComponent, canActivate: [authGuard, adminGuard] },
   { path: 'admin/grants', component: AdminGrantsComponent, canActivate: [authGuard, adminGuard] },
+  { path: 'admin/usage', component: AdminUsageComponent, canActivate: [authGuard, adminGuard] },
   { path: 'debug', component: DebugPageComponent, canActivate: [authGuard] },
 
   // Redirects for old bookmarks. Jobs absorbed the standalone Create + Review

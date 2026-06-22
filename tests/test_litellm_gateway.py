@@ -7,6 +7,7 @@ records the admin calls. See docs/features/usage_monitoring_and_rate_limiting.md
 
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock
+from uuid import uuid4
 
 import pytest
 
@@ -21,8 +22,10 @@ from orchestrator.services.litellm_gateway import (
     _parse_backstop,
     _parse_quota_policy,
     _parse_rate_policy,
+    _parse_spend_ts,
     _project_quota,
     _rev_for_endpoint,
+    _srw_id_from,
     _team_id_for_project,
     _team_limits_for_project,
     _user_limits,
@@ -33,6 +36,7 @@ from orchestrator.services.litellm_gateway import (
     ensure_fleet_key,
     ensure_scoped_key,
     get_fleet_key,
+    materialize_llm_usage,
     sync_catalog_to_gateway,
 )
 
@@ -745,3 +749,179 @@ class TestComputeProjectQuotaStatus:
         client.get_team_daily_usage.side_effect = RuntimeError("gateway down")
         # a read blip must skip, never mass-freeze
         assert await compute_project_quota_status(client, ["p1"], day="d") == {}
+
+
+class _CaptureLedger:
+    """Minimal UsageLedger stand-in: captures events + simulates dedupe."""
+
+    def __init__(self):
+        self.events = []
+        self.is_available = True
+        self._seen = set()
+
+    async def record_events(self, events):
+        new = 0
+        for e in events:
+            key = (e.source, e.source_id, e.unit, e.ts)
+            if key in self._seen:
+                continue
+            self._seen.add(key)
+            self.events.append(e)
+            new += 1
+        return new
+
+
+class TestSrwIdFrom:
+    def test_valid_uuid_extracted(self):
+        u = str(uuid4())
+        assert _srw_id_from(f"srw-user-{u}", "srw-user-") == u
+        assert _srw_id_from(f"srw-proj-{u}", "srw-proj-") == u
+
+    def test_non_uuid_and_unprefixed_rejected(self):
+        # Test ids, the fleet key's blank attribution, and raw uuids without our
+        # prefix must NOT attribute (they'd poison the ledger's uuid columns).
+        assert _srw_id_from("srw-user-ktest-user", "srw-user-") is None
+        assert _srw_id_from("default_user_id", "srw-user-") is None
+        assert _srw_id_from("e95f0254-5ad3-48ae-8824-6acce14ee3a7", "srw-proj-") is None
+        assert _srw_id_from("", "srw-user-") is None
+        assert _srw_id_from(None, "srw-user-") is None
+
+
+class TestParseSpendTs:
+    def test_iso_z_parsed_utc(self):
+        d = _parse_spend_ts("2026-06-22T06:36:47.993000Z")
+        assert d is not None and d.tzinfo is not None
+
+    def test_bad_inputs_none(self):
+        assert _parse_spend_ts("not-a-date") is None
+        assert _parse_spend_ts(None) is None
+        assert _parse_spend_ts("") is None
+
+
+class TestMaterializeLlmUsage:
+    @pytest.mark.asyncio
+    async def test_attribution_and_quantities(self):
+        uid, pid = str(uuid4()), str(uuid4())
+        rows = [
+            {  # scoped-key traffic → attributed to the SRW user + project
+                "request_id": "r1",
+                "model_group": "gemma",
+                "prompt_tokens": 17,
+                "completion_tokens": 2,
+                "startTime": "2026-06-22T06:36:47.993000Z",
+                "user": f"srw-user-{uid}",
+                "team_id": f"srw-proj-{pid}",
+            },
+            {  # fleet / unscoped traffic → recorded but unattributed
+                "request_id": "r2",
+                "model_group": "gemma",
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "startTime": "2026-06-22T06:37:00.000000Z",
+                "user": "default_user_id",
+                "team_id": "",
+            },
+        ]
+        client = AsyncMock()
+        client.get_spend_logs.return_value = rows
+        ledger = _CaptureLedger()
+        res = await materialize_llm_usage(client, ledger)
+        assert res["materialized"] == 4  # 2 rows × (prompt + completion)
+        by = {(e.source_id, e.unit): e for e in ledger.events}
+        assert by[("r1", "prompt-token")].quantity == 17
+        assert by[("r1", "prompt-token")].user_id == uid
+        assert by[("r1", "prompt-token")].project_id == pid
+        assert by[("r1", "completion-token")].quantity == 2
+        assert by[("r2", "prompt-token")].user_id is None
+        assert by[("r2", "prompt-token")].project_id is None
+        assert all(
+            e.category == "llm" and e.resource == "gemma" and e.source == "litellm"
+            for e in ledger.events
+        )
+
+    @pytest.mark.asyncio
+    async def test_skips_zero_token_no_model_and_bad_rows(self):
+        rows = [
+            {
+                "request_id": "z",
+                "model_group": "g",
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "startTime": "2026-06-22T06:36:47Z",
+            },
+            {
+                "request_id": "n",
+                "model_group": "",
+                "model": "",
+                "prompt_tokens": 5,
+                "completion_tokens": 5,
+                "startTime": "2026-06-22T06:36:47Z",
+            },
+            {
+                "request_id": "",
+                "model_group": "g",
+                "prompt_tokens": 5,
+                "completion_tokens": 0,
+                "startTime": "2026-06-22T06:36:47Z",
+            },
+            {
+                "model_group": "g",
+                "prompt_tokens": 5,
+                "completion_tokens": 0,
+                "startTime": "bad-ts",
+            },
+        ]
+        client = AsyncMock()
+        client.get_spend_logs.return_value = rows
+        ledger = _CaptureLedger()
+        res = await materialize_llm_usage(client, ledger)
+        assert res["materialized"] == 0
+        # A row with only prompt tokens emits one event (not two).
+        client.get_spend_logs.return_value = [
+            {
+                "request_id": "p",
+                "model_group": "g",
+                "prompt_tokens": 3,
+                "completion_tokens": 0,
+                "startTime": "2026-06-22T06:36:47Z",
+            }
+        ]
+        assert (await materialize_llm_usage(client, _CaptureLedger()))[
+            "materialized"
+        ] == 1
+
+    @pytest.mark.asyncio
+    async def test_cursor_filters_already_seen(self):
+        rows = [
+            {
+                "request_id": "a",
+                "model_group": "g",
+                "prompt_tokens": 1,
+                "completion_tokens": 0,
+                "startTime": "2026-06-22T06:00:00Z",
+            },
+            {
+                "request_id": "b",
+                "model_group": "g",
+                "prompt_tokens": 1,
+                "completion_tokens": 0,
+                "startTime": "2026-06-22T07:00:00Z",
+            },
+        ]
+        client = AsyncMock()
+        client.get_spend_logs.return_value = rows
+        res1 = await materialize_llm_usage(client, _CaptureLedger())
+        assert res1["materialized"] == 2
+        # A fresh ledger + the cursor → both rows are <= cursor, ledger never sees
+        # them (proves the cursor filters, independent of ledger dedupe).
+        fresh = _CaptureLedger()
+        res2 = await materialize_llm_usage(client, fresh, since=res1["cursor"])
+        assert res2["materialized"] == 0
+        assert fresh.events == []
+
+    @pytest.mark.asyncio
+    async def test_no_ledger_noop(self):
+        client = AsyncMock()
+        res = await materialize_llm_usage(client, None)
+        assert res == {"materialized": 0, "cursor": None, "scanned": 0}
+        client.get_spend_logs.assert_not_called()
