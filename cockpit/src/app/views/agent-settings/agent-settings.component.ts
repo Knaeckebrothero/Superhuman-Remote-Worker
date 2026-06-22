@@ -76,6 +76,7 @@ type AgentSettingsTab = 'settings' | 'instructions' | 'advanced' | 'resolved';
             [config]="config()"
             [mode]="mode()"
             [disabled]="disabled()"
+            [settingsMatrix]="settingsMatrix()"
             (change)="onChange()"
           />
           <app-tools-group

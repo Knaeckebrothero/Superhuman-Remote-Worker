@@ -4,7 +4,7 @@ import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {AppIconComponent} from '../../ui/icon';
 import {ModelService} from '../../core/services/model.service';
 import {SettingsService} from '../../core/services/settings.service';
-import {readConfigPath, SettingsMode} from './agent-settings.types';
+import {computeModelMismatch, ModelMismatch, readConfigPath, SettingsMode} from './agent-settings.types';
 import {getReasoningOptions} from './reasoning-options';
 
 const STORAGE_KEYS = {
@@ -80,6 +80,24 @@ const STORAGE_KEYS = {
             }
           </div>
         </div>
+
+        <!-- Phase-model mismatch advisory: the two models share one context
+             history, so the budget collapses to the smaller window and image
+             support to the AND (mirrors backend resolve_phase_model_budget).
+             Only shown when settings actually differ. -->
+        @if (modelMismatch(); as mm) {
+          <div class="model-mismatch" [class.prominent]="mm.prominent">
+            <app-icon size="xs">warning</app-icon>
+            <div class="mismatch-text">
+              @if (mm.window) {
+                <div>{{ 'agentSettings.model.mismatchWindow' | transloco: { min: fmtTokens(mm.window.min) } }}</div>
+              }
+              @if (mm.multimodal) {
+                <div>{{ 'agentSettings.model.mismatchMultimodal' | transloco }}</div>
+              }
+            </div>
+          </div>
+        }
       } @else {
         <!-- Session: single model -->
         <div class="field-row" [class.modified]="sessionModel() !== null">
@@ -178,6 +196,31 @@ const STORAGE_KEYS = {
       background: var(--danger-tint);
       color: var(--danger);
     }
+    .model-mismatch {
+      display: flex;
+      gap: 8px;
+      align-items: flex-start;
+      margin: 4px 0 12px 8px;
+      padding: 8px 10px;
+      border-radius: var(--radius-control);
+      background: var(--surface-1, rgba(255, 255, 255, 0.04));
+      border-left: 2px solid var(--warning, #f5a623);
+      color: var(--text-secondary, #a6adc8);
+      font-size: 12px;
+      line-height: 1.4;
+    }
+    .model-mismatch.prominent {
+      background: var(--warning-tint, rgba(245, 166, 35, 0.12));
+      color: var(--text-primary, var(--text-primary));
+    }
+    .model-mismatch app-icon {
+      color: var(--warning, #f5a623);
+      flex-shrink: 0;
+      margin-top: 1px;
+    }
+    .mismatch-text > div + div {
+      margin-top: 4px;
+    }
   `],
 })
 export class ModelGroupComponent {
@@ -194,6 +237,8 @@ export class ModelGroupComponent {
   config = input<Record<string, unknown>>({});
   mode = input<SettingsMode>('job');
   disabled = input(false);
+  /** Raw settings_matrix (family → window/multimodal/params) for the mismatch hint. */
+  settingsMatrix = input<Record<string, Record<string, unknown>>>({});
 
   change = output<void>();
 
@@ -233,6 +278,28 @@ export class ModelGroupComponent {
   readonly sessionReasoningOptions = computed(() =>
     getReasoningOptions(this.sessionModel() ?? this.resolvedSessionModel())
   );
+
+  /**
+   * Advisory: do the two phase models' family settings differ enough to matter?
+   * Mirrors the backend's min-window / multimodal-AND reconciliation
+   * (`resolve_phase_model_budget`). Job mode only; `null` when they agree.
+   */
+  readonly modelMismatch = computed<ModelMismatch | null>(() => {
+    if (this.mode() !== 'job') return null;
+    const strat = this.strategicModel() ?? this.resolvedStrategicModel();
+    const tact = this.tacticalModel() ?? this.resolvedTacticalModel();
+    return computeModelMismatch(this.settingsMatrix(), strat, tact);
+  });
+
+  /** Compact token-count label, e.g. 131072 → "131k", 1050000 → "1.05M". */
+  fmtTokens(n: number): string {
+    if (n >= 1_000_000) {
+      const m = n / 1_000_000;
+      return (Number.isInteger(m) ? String(m) : m.toFixed(2).replace(/\.?0+$/, '')) + 'M';
+    }
+    if (n >= 1000) return Math.round(n / 1000) + 'k';
+    return String(n);
+  }
 
   readonly modifiedCount = computed(() => {
     let count = 0;

@@ -1919,7 +1919,9 @@
       "single": "Modell",
       "default": "Standard",
       "presetUnconfigured": "Mindestens einem Modell fehlt ein API-Schlüssel",
-      "providerNoKey": "{{provider}} (kein API-Schlüssel)"
+      "providerNoKey": "{{provider}} (kein API-Schlüssel)",
+      "mismatchWindow": "Diese Modelle haben unterschiedliche Kontextfenster — sie teilen sich einen Verlauf und werden auf das kleinere begrenzt (~{{min}}).",
+      "mismatchMultimodal": "Eines dieser Modelle kann keine Bilder lesen — die Bildeingabe wird für beide Phasen deaktiviert."
     }
   },
   "agentList": {

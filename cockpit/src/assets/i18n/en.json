@@ -1919,7 +1919,9 @@
       "single": "Model",
       "default": "Default",
       "presetUnconfigured": "One or both models lack an API key",
-      "providerNoKey": "{{provider}} (no API key)"
+      "providerNoKey": "{{provider}} (no API key)",
+      "mismatchWindow": "These models have different context windows — they share one history, so it's capped to the smaller (~{{min}}).",
+      "mismatchMultimodal": "One of these models can't read images — image input will be disabled for both phases."
     }
   },
   "agentList": {

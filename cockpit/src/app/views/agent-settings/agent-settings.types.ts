@@ -155,3 +155,57 @@ export function resolveMatrixForModel(
   }
   return base;
 }
+
+/** Result of comparing the two phase models' family settings (window + multimodal). */
+export interface ModelMismatch {
+  /** Window gap exceeds 2× (mirrors the backend's prominent-warning threshold). */
+  prominent: boolean;
+  /** Set when the two windows differ; `min` is the budget the shared history is capped to. */
+  window: {min: number; strategicWindow: number; tacticalWindow: number} | null;
+  /** True when the two models differ in multimodal capability (⇒ image input disabled for both). */
+  multimodal: boolean;
+}
+
+/**
+ * Compare the strategic + tactical phase models' family settings and report a
+ * mismatch worth warning about. Pure client-side mirror of the backend's
+ * `resolve_phase_model_budget` (src/core/loader.py): a worker job runs both
+ * phase models over ONE shared history, so the context budget collapses to the
+ * `min` of their windows and multimodal collapses to the AND.
+ *
+ * Only flags cases with a real consequence — different context windows (history
+ * capped to the smaller) or different multimodal capability (image input
+ * disabled for both). Stays silent when the two models merely differ in family
+ * but agree on window AND multimodal, because there the backend's min/AND is a
+ * no-op. Window/multimodal come from the family matrix, so an admin per-model
+ * `context_window` override is not reflected (this is an advisory hint).
+ */
+export function computeModelMismatch(
+  matrix: Record<string, Record<string, unknown>>,
+  strategicModel: string | null,
+  tacticalModel: string | null,
+): ModelMismatch | null {
+  if (!matrix || Object.keys(matrix).length === 0) return null;
+  if (!strategicModel || !tacticalModel || strategicModel === tacticalModel) return null;
+
+  const sm = resolveMatrixForModel(matrix, strategicModel);
+  const tm = resolveMatrixForModel(matrix, tacticalModel);
+
+  const sWin = typeof sm['model_max_context_tokens'] === 'number'
+    ? (sm['model_max_context_tokens'] as number) : null;
+  const tWin = typeof tm['model_max_context_tokens'] === 'number'
+    ? (tm['model_max_context_tokens'] as number) : null;
+  const sMulti = sm['multimodal'] === true;
+  const tMulti = tm['multimodal'] === true;
+
+  const windowDiffers = sWin !== null && tWin !== null && sWin !== tWin;
+  const multimodalDiffers = sMulti !== tMulti;
+  if (!windowDiffers && !multimodalDiffers) return null;
+
+  const window = windowDiffers
+    ? {min: Math.min(sWin as number, tWin as number), strategicWindow: sWin as number, tacticalWindow: tWin as number}
+    : null;
+  const prominent = window !== null && Math.max(sWin as number, tWin as number) > 2 * window.min;
+
+  return {prominent, window, multimodal: multimodalDiffers};
+}
