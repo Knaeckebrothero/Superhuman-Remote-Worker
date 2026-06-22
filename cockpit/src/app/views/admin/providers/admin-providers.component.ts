@@ -809,6 +809,34 @@ const DISCOVERABLE_PROVIDERS: ReadonlySet<string> = new Set([
       .form-row.two-col {
         flex-direction: column;
       }
+      /* Discovery dialog rows: the 4-col grid (24px 1.6fr 0.8fr 1.6fr) crams
+         model-id + family + capability checkboxes into ~40-80px columns at
+         phone widths (id wraps to 3 lines, caps stack one-per-line). Re-flow to
+         a checkbox + stacked-content layout: id / family / capabilities each
+         span the full content width. The direct-child combinator keeps the
+         per-capability checkboxes (nested in .discovery-caps) untouched. */
+      .discovery-row {
+        grid-template-columns: 24px 1fr;
+        align-items: start;
+        gap: 4px 8px;
+        padding: 8px 0;
+      }
+      .discovery-row > app-checkbox {
+        grid-column: 1;
+        grid-row: 1;
+      }
+      .discovery-id {
+        grid-column: 2;
+        grid-row: 1;
+      }
+      .discovery-family {
+        grid-column: 2;
+        grid-row: 2;
+      }
+      .discovery-caps {
+        grid-column: 2;
+        grid-row: 3;
+      }
     }
   `],
 })
