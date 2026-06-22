@@ -145,6 +145,8 @@ from routers import automations_router  # noqa: E402
 from routers.sessions import router as sessions_router  # noqa: E402
 from services.cron_dispatcher import cron_dispatcher_loop  # noqa: E402
 from services.litellm_gateway import (  # noqa: E402
+    LiteLLMClient,
+    ensure_scoped_key,
     get_fleet_key,
     litellm_sync_loop,
 )
@@ -1123,6 +1125,51 @@ def _gateway_routing_target() -> tuple[str, str] | None:
     return f"{base.rstrip('/')}/v1", key
 
 
+async def _gateway_routing_target_scoped(
+    user_id: str | None, project_id: str | None
+) -> tuple[str, str] | None:
+    """Gateway ``(base_url, api_key)`` using the per-(user,project) scoped key (2b).
+
+    Ensures the job's scoped key (+ its team/internal-user, carrying the
+    per-project / per-user limits) exists, then routes the agent onto it so
+    LiteLLM enforces those limits. Falls back to the shared fleet key (2a) when
+    the job has no user/project, when the gateway is briefly unreachable, or when
+    the scoped-key ensure fails — the fleet key still caps the aggregate and keeps
+    agents off the admin master key, so a transient gateway blip degrades to
+    "measured + aggregate-capped" rather than failing the dispatch.
+
+    Returns None only when the gateway is disabled entirely (so callers keep their
+    direct-endpoint path), matching :func:`_gateway_routing_target`.
+    """
+    base = os.getenv("LITELLM_BASE_URL", "").strip()
+    if not base:
+        return None
+    master = os.getenv("LITELLM_MASTER_KEY", "").strip()
+    if user_id and project_id and master:
+        client = LiteLLMClient(base, master)
+        try:
+            if await client.is_ready():
+                scoped = await ensure_scoped_key(
+                    client,
+                    postgres_db,
+                    master,
+                    user_id=user_id,
+                    project_id=project_id,
+                )
+                if scoped:
+                    return f"{base.rstrip('/')}/v1", scoped
+        except Exception:
+            logger.exception(
+                "Scoped-key ensure failed (user=%s project=%s); "
+                "falling back to fleet key",
+                user_id,
+                project_id,
+            )
+        finally:
+            await client.aclose()
+    return _gateway_routing_target()
+
+
 async def _inject_dispatch_credentials(
     job: dict[str, Any],
     config_override: dict[str, Any] | None,
@@ -1148,11 +1195,19 @@ async def _inject_dispatch_credentials(
     """
     job_id = str(job["id"])
     user_id_str = str(job["user_id"]) if job.get("user_id") else None
+    project_id_str = str(job["project_id"]) if job.get("project_id") else None
 
     resolved_keys = await postgres_db.resolve_api_keys_for_job(
         user_id=user_id_str,
-        project_id=str(job["project_id"]) if job.get("project_id") else None,
+        project_id=project_id_str,
     )
+
+    # Resolve the gateway routing target once for the whole dispatch: the
+    # per-(user,project) scoped key (Slice 2b) when both are known, else the
+    # shared fleet key (2a). Computed here so every model section the job pins
+    # (top-level + strategic/tactical/aux) routes through the *same* key, so the
+    # job's per-project/per-user limits apply uniformly across its LLM surface.
+    _gw_scoped = await _gateway_routing_target_scoped(user_id_str, project_id_str)
 
     config_override = config_override or {}
     llm_over = config_override.setdefault("llm", {})
@@ -1169,11 +1224,12 @@ async def _inject_dispatch_credentials(
         and meta.origin in ("custom", "system", "catalog")
         and meta.endpoint_id
     ):
-        _gw = _gateway_routing_target()
+        _gw = _gw_scoped
         if _gw is not None:
             # Endpoint-kind model + gateway enabled → route through LiteLLM so the
-            # traffic is measured at the chokepoint. The gateway resolves the
-            # model_id to its real upstream (registered by the catalog-sync loop).
+            # traffic is measured at the chokepoint AND the job's scoped key
+            # (2b) applies its per-project/per-user limits. The gateway resolves
+            # the model_id to its real upstream (registered by the catalog sync).
             llm_over.setdefault("base_url", _gw[0])
             llm_over.setdefault("api_key", _gw[1])
             logger.info(
@@ -1257,6 +1313,7 @@ async def _inject_dispatch_credentials(
             user_id=user_id_str,
             resolved_keys=resolved_keys,
             capability=_capability,
+            gateway_override=_gw_scoped,
         )
         if "api_key" not in _section and "base_url" not in _section:
             logger.warning(
@@ -1286,6 +1343,7 @@ async def _inject_dispatch_credentials(
                     user_id=user_id_str,
                     resolved_keys=resolved_keys,
                     capability="auxiliary",
+                    gateway_override=_gw_scoped,
                 )
                 logger.info(f"Dispatch: injected auxiliary model override: {aux_model}")
 
@@ -1299,6 +1357,7 @@ async def _inject_dispatch_credentials(
                     model_id=default_model,
                     user_id=user_id_str,
                     resolved_keys=resolved_keys,
+                    gateway_override=_gw_scoped,
                 )
                 logger.info(f"Dispatch: injected user default_model: {default_model}")
 
@@ -1318,6 +1377,7 @@ async def _inject_dispatch_credentials(
                 model_id=_phase_model,
                 user_id=user_id_str,
                 resolved_keys=resolved_keys,
+                gateway_override=_gw_scoped,
             )
             if "api_key" not in phase_section and "base_url" not in phase_section:
                 logger.warning(
@@ -1422,6 +1482,7 @@ async def _inject_dispatch_credentials(
                 model_id=system_chat_model,
                 user_id=user_id_str,
                 resolved_keys=resolved_keys,
+                gateway_override=_gw_scoped,
             )
             logger.info(
                 f"Dispatch: injected system default chat model: {system_chat_model} "
@@ -3072,6 +3133,7 @@ async def _inject_model_credentials(
     user_id: str | None,
     resolved_keys: dict[str, str] | None,
     capability: str = "chat",
+    gateway_override: tuple[str, str] | None = None,
 ) -> None:
     """Populate a config-override section with the right base_url + api_key
     for a given model ID.
@@ -3120,10 +3182,14 @@ async def _inject_model_credentials(
         and meta.origin in ("custom", "system", "catalog")
         and meta.endpoint_id
     ):
-        _gw = _gateway_routing_target()
+        # Prefer the caller's pre-resolved target (the dispatch's scoped key, 2b);
+        # otherwise resolve the shared fleet key here (callers without user/project
+        # context, e.g. some hot-swap paths).
+        _gw = gateway_override or _gateway_routing_target()
         if _gw is not None:
             # Route endpoint-kind phase/aux models through the gateway too, so
-            # measurement covers the full chat/auxiliary surface (Slice 1).
+            # measurement covers the full chat/auxiliary surface (Slice 1) and the
+            # scoped key's limits apply to every section (Slice 2b).
             section.setdefault("base_url", _gw[0])
             section.setdefault("api_key", _gw[1])
             return
@@ -3233,6 +3299,12 @@ async def _inject_thread_dispatch_credentials(
         project_id=project_id,
     )
 
+    # Route this session's LLM traffic through its per-(user,project) scoped key
+    # (2b) so per-project/per-user limits apply to sessions too; falls back to the
+    # fleet key when user/project is absent. Sessions are long-lived, so the
+    # scoped key's hash-gated ensure runs once and is cheap on re-injection.
+    _gw_scoped = await _gateway_routing_target_scoped(user_id, project_id)
+
     # Chat model. Fall back to the system default chat pin so the agent never
     # boots on its YAML default (which has no transport → api.openai.com 401).
     llm_section = config_override.get("llm") or {}
@@ -3250,6 +3322,7 @@ async def _inject_thread_dispatch_credentials(
             model_id=llm_section["model"],
             user_id=user_id,
             resolved_keys=resolved_keys,
+            gateway_override=_gw_scoped,
         )
         config_override["llm"] = llm_section
 
@@ -3269,6 +3342,7 @@ async def _inject_thread_dispatch_credentials(
             user_id=user_id,
             resolved_keys=resolved_keys,
             capability="auxiliary",
+            gateway_override=_gw_scoped,
         )
         config_override["auxiliary"] = aux_section
 

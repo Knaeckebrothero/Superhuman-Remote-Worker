@@ -15,12 +15,20 @@ from orchestrator.services.litellm_gateway import (
     FLEET_KEY_ALIAS,
     OWNED_ID_PREFIX,
     _build_fleet_limits,
+    _category_models,
+    _internal_user_id_for,
     _needs_replace,
     _parse_backstop,
+    _parse_rate_policy,
     _rev_for_endpoint,
+    _team_id_for_project,
+    _team_limits_for_project,
+    _user_limits,
     build_desired_models,
     compute_fleet_key,
+    compute_scoped_key,
     ensure_fleet_key,
+    ensure_scoped_key,
     get_fleet_key,
     sync_catalog_to_gateway,
 )
@@ -46,7 +54,9 @@ def _model_row(catalog_id, model_id, endpoint_id=_EP_ID):
 def _mock_db(model_rows, endpoint=None):
     db = AsyncMock()
     db.list_models.return_value = model_rows
-    db.get_user_llm_endpoint.return_value = endpoint if endpoint is not None else _endpoint()
+    db.get_user_llm_endpoint.return_value = (
+        endpoint if endpoint is not None else _endpoint()
+    )
     return db
 
 
@@ -128,7 +138,9 @@ class TestNeedsReplace:
         assert _needs_replace(self._spec(), self._spec()) is False
 
     def test_api_base_change_triggers_replace(self):
-        assert _needs_replace(self._spec(api_base="https://old/v1"), self._spec()) is True
+        assert (
+            _needs_replace(self._spec(api_base="https://old/v1"), self._spec()) is True
+        )
 
     def test_model_change_triggers_replace(self):
         assert _needs_replace(self._spec(model="openai/old"), self._spec()) is True
@@ -344,3 +356,221 @@ class TestEnsureFleetKey:
         _, kwargs = client.upsert_key.call_args
         assert kwargs["spec"]["model_rpm_limit"] == {}
         assert kwargs["spec"]["model_tpm_limit"] == {}
+
+
+# --------------------------------------------------------------------------
+# Slice 2b — per-user / per-project scoped keys
+# --------------------------------------------------------------------------
+
+
+class TestComputeScopedKey:
+    def test_deterministic(self):
+        assert compute_scoped_key("sk-master", "u1", "p1") == compute_scoped_key(
+            "sk-master", "u1", "p1"
+        )
+
+    def test_depends_on_master_key(self):
+        assert compute_scoped_key("sk-a", "u1", "p1") != compute_scoped_key(
+            "sk-b", "u1", "p1"
+        )
+
+    def test_depends_on_user_and_project(self):
+        base = compute_scoped_key("sk-master", "u1", "p1")
+        assert compute_scoped_key("sk-master", "u2", "p1") != base
+        assert compute_scoped_key("sk-master", "u1", "p2") != base
+
+    def test_prefix_distinct_from_fleet(self):
+        k = compute_scoped_key("sk-x", "u1", "p1")
+        assert k.startswith("sk-srw-")
+        # must NOT collide with the fleet key's namespace
+        assert not k.startswith("sk-srw-fleet-")
+
+
+class TestScopedIdHelpers:
+    def test_team_id(self):
+        assert _team_id_for_project("p1") == "srw-proj-p1"
+
+    def test_internal_user_id(self):
+        assert _internal_user_id_for("u1") == "srw-user-u1"
+
+
+class TestParseRatePolicy:
+    def test_unset_is_empty(self, monkeypatch):
+        monkeypatch.delenv("LITELLM_RATE_POLICY", raising=False)
+        assert _parse_rate_policy() == {}
+
+    def test_valid_json(self, monkeypatch):
+        monkeypatch.setenv("LITELLM_RATE_POLICY", '{"users": {"default": {"rpm": 5}}}')
+        assert _parse_rate_policy() == {"users": {"default": {"rpm": 5}}}
+
+    def test_malformed_is_empty(self, monkeypatch):
+        monkeypatch.setenv("LITELLM_RATE_POLICY", "nope{")
+        assert _parse_rate_policy() == {}
+
+    def test_non_object_is_empty(self, monkeypatch):
+        monkeypatch.setenv("LITELLM_RATE_POLICY", "[1, 2]")
+        assert _parse_rate_policy() == {}
+
+
+class TestCategoryModels:
+    _POLICY = {"categories": {"large": ["a", "b"], "small": ["c"]}}
+
+    def test_named_category_filters_to_registered(self):
+        assert _category_models(self._POLICY, "large", ["a", "b", "c"]) == ["a", "b"]
+
+    def test_wildcard_returns_all_registered(self):
+        assert _category_models(self._POLICY, "*", ["a", "b"]) == ["a", "b"]
+
+    def test_unknown_model_skipped_with_warning(self, caplog):
+        import logging
+
+        with caplog.at_level(logging.WARNING):
+            out = _category_models(
+                {"categories": {"large": ["a", "ghost"]}}, "large", ["a"]
+            )
+        # the validation guard drops the unregistered model + surfaces it (gap 1:
+        # LiteLLM would silently skip a mismatched model_name → unthrottled)
+        assert out == ["a"]
+        assert "ghost" in caplog.text
+
+    def test_unknown_category_is_empty(self):
+        assert _category_models(self._POLICY, "missing", ["a"]) == []
+
+
+class TestTeamLimitsForProject:
+    _POLICY = {
+        "categories": {"large": ["gemma-4-moe-strix"]},
+        "projects": {
+            "default": {"large": {"rpm": 30}},
+            "p-special": {"*": {"rpm": 10, "tpm": 1000}},
+        },
+    }
+
+    def test_default_applies_when_no_override(self):
+        out = _team_limits_for_project(self._POLICY, "p-unknown", ["gemma-4-moe-strix"])
+        assert out == {"model_rpm_limit": {"gemma-4-moe-strix": 30}}
+
+    def test_per_project_override_and_wildcard(self):
+        out = _team_limits_for_project(
+            self._POLICY, "p-special", ["gemma-4-moe-strix", "other"]
+        )
+        assert out["model_rpm_limit"] == {"gemma-4-moe-strix": 10, "other": 10}
+        assert out["model_tpm_limit"] == {"gemma-4-moe-strix": 1000, "other": 1000}
+
+    def test_empty_policy_is_empty(self):
+        assert _team_limits_for_project({}, "p1", ["a"]) == {}
+
+
+class TestUserLimits:
+    _POLICY = {"users": {"default": {"rpm": 120}, "u-vip": {"rpm": 500, "tpm": 9999}}}
+
+    def test_default(self):
+        assert _user_limits(self._POLICY, "u-x") == {"rpm_limit": 120}
+
+    def test_override(self):
+        assert _user_limits(self._POLICY, "u-vip") == {
+            "rpm_limit": 500,
+            "tpm_limit": 9999,
+        }
+
+    def test_empty(self):
+        assert _user_limits({}, "u1") == {}
+
+
+class TestEnsureScopedKey:
+    @pytest.fixture(autouse=True)
+    def _reset(self, monkeypatch):
+        monkeypatch.delenv("LITELLM_RATE_POLICY", raising=False)
+        monkeypatch.setenv("LITELLM_MASTER_KEY", "sk-master")
+        gw_mod._scoped_ensured.clear()
+        yield
+        gw_mod._scoped_ensured.clear()
+
+    @pytest.mark.asyncio
+    async def test_none_without_user_or_project(self):
+        db = _mock_db([_model_row("c1", "gemma-4-moe-strix")])
+        client = AsyncMock()
+        assert (
+            await ensure_scoped_key(
+                client, db, "sk-master", user_id=None, project_id="p1"
+            )
+            is None
+        )
+        assert (
+            await ensure_scoped_key(
+                client, db, "sk-master", user_id="u1", project_id=None
+            )
+            is None
+        )
+        client.upsert_team.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_no_models_returns_none(self):
+        db = _mock_db([])
+        client = AsyncMock()
+        assert (
+            await ensure_scoped_key(
+                client, db, "sk-master", user_id="u1", project_id="p1"
+            )
+            is None
+        )
+
+    @pytest.mark.asyncio
+    async def test_upserts_team_user_key_and_returns_key(self, monkeypatch):
+        monkeypatch.setenv(
+            "LITELLM_RATE_POLICY",
+            '{"categories": {"large": ["gemma-4-moe-strix"]}, '
+            '"projects": {"default": {"large": {"rpm": 7}}}, '
+            '"users": {"default": {"rpm": 50}}}',
+        )
+        db = _mock_db([_model_row("c1", "gemma-4-moe-strix")])
+        client = AsyncMock()
+
+        key = await ensure_scoped_key(
+            client, db, "sk-master", user_id="u1", project_id="p1"
+        )
+        assert key == compute_scoped_key("sk-master", "u1", "p1")
+
+        # team carries the per-model project limit (aggregates across the project)
+        _, t_kwargs = client.upsert_team.call_args
+        assert t_kwargs["spec"]["model_rpm_limit"] == {"gemma-4-moe-strix": 7}
+        # internal user carries the flat per-user limit
+        _, u_kwargs = client.upsert_internal_user.call_args
+        assert u_kwargs["spec"]["rpm_limit"] == 50
+        # the key binds to both (no limits of its own — the objects enforce)
+        _, k_kwargs = client.upsert_scoped_key.call_args
+        assert k_kwargs["team_id"] == "srw-proj-p1"
+        assert k_kwargs["user_id"] == "srw-user-u1"
+
+    @pytest.mark.asyncio
+    async def test_idempotent_when_unchanged(self):
+        db = _mock_db([_model_row("c1", "gemma-4-moe-strix")])
+        client = AsyncMock()
+        await ensure_scoped_key(client, db, "sk-master", user_id="u1", project_id="p1")
+        await ensure_scoped_key(client, db, "sk-master", user_id="u1", project_id="p1")
+        client.upsert_team.assert_awaited_once()  # hash-gate skips the second
+
+    @pytest.mark.asyncio
+    async def test_rewrites_when_policy_changes(self, monkeypatch):
+        db = _mock_db([_model_row("c1", "gemma-4-moe-strix")])
+        client = AsyncMock()
+        await ensure_scoped_key(client, db, "sk-master", user_id="u1", project_id="p1")
+        monkeypatch.setenv(
+            "LITELLM_RATE_POLICY", '{"users": {"default": {"rpm": 999}}}'
+        )
+        await ensure_scoped_key(client, db, "sk-master", user_id="u1", project_id="p1")
+        assert client.upsert_team.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_no_policy_still_mints_off_master(self):
+        # No policy → no per-entity limits, but the scoped key still mints
+        # (attribution + off the admin master key); team/user upserted with empty
+        # limits so a later policy addition propagates (omitted-field caveat).
+        db = _mock_db([_model_row("c1", "gemma-4-moe-strix")])
+        client = AsyncMock()
+        key = await ensure_scoped_key(
+            client, db, "sk-master", user_id="u1", project_id="p1"
+        )
+        assert key == compute_scoped_key("sk-master", "u1", "p1")
+        _, t_kwargs = client.upsert_team.call_args
+        assert t_kwargs["spec"]["model_rpm_limit"] == {}
