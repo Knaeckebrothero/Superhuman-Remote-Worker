@@ -132,6 +132,28 @@ const INHERIT = '__inherit__';
     .grid .muted, .muted { color: var(--text-muted); }
     .banner { margin-top: 1rem; padding: 0.5rem 0.75rem; border-radius: 6px; }
     .banner.err { background: var(--danger-tint); color: var(--danger); }
+
+    @media (max-width: 560px) {
+      /* Scope bar: stack each control full-width (bigger tap targets; also caps
+         the User/Project <select> intrinsic width so a long name can't overflow). */
+      .scope-bar { flex-direction: column; gap: 0.75rem; }
+      .scope-bar select, .scope-bar input { width: 100%; box-sizing: border-box; }
+      .reason { flex: none; min-width: 0; }
+
+      /* Grants grid -> one card per capability (a fixed 3-col table can't fit a
+         phone; this restores full-width controls and removes the h-scroll). */
+      .grid, .grid tbody, .grid tr, .grid td { display: block; }
+      .grid thead { display: none; }
+      .grid tr {
+        border: 1px solid var(--border-color); border-radius: var(--radius-surface);
+        padding: 0.75rem; margin-bottom: 0.75rem;
+      }
+      .grid td { border-bottom: none; padding: 0.2rem 0; }
+      .grid td:first-child { padding-bottom: 0.35rem; }
+      .grid td:nth-child(2)::before { content: 'Default: '; color: var(--text-muted); }
+      .grid td:nth-child(3) select,
+      .grid td:nth-child(3) input { width: 100%; box-sizing: border-box; }
+    }
   `],
 })
 export class AdminGrantsComponent implements OnInit {
