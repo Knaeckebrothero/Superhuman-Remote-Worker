@@ -311,6 +311,71 @@ import {AppBadgeComponent} from '../../../ui/badge';
       padding: 20px;
       font-size: 13px;
     }
+    @media (max-width: 720px) {
+      /* The Users table is a 6-col grid (32px 1.4fr 1.6fr 110px 70px 70px) —
+         the ~282px of fixed columns alone overflow a phone, and
+         .user-table{overflow:hidden} clips the Admin/VM toggles off-screen
+         with no scrollbar. Re-grid each row into a self-contained card.
+         Desktop (>720px) keeps the table unchanged. */
+      .user-header {
+        display: none;
+      }
+      .user-row {
+        grid-template-columns: auto 1fr auto;
+        column-gap: 8px;
+        row-gap: 8px;
+        padding: 12px 14px;
+      }
+      .col-select {
+        grid-row: 1;
+        grid-column: 1;
+      }
+      .col-name {
+        grid-row: 1;
+        grid-column: 2;
+        font-weight: 600;
+        min-width: 0;
+        overflow-wrap: anywhere;
+      }
+      .col-status {
+        grid-row: 1;
+        grid-column: 3;
+        justify-self: end;
+      }
+      .col-email {
+        grid-row: 2;
+        grid-column: 1 / -1;
+      }
+      /* The two flag toggles become full-width settings-list rows. The header
+         row that labelled them is hidden on mobile, so re-introduce visible
+         labels via ::before (5th child = Admin, 6th = VM). */
+      .user-row > .col-flag {
+        grid-column: 1 / -1;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding-top: 8px;
+        border-top: 1px solid var(--border-color);
+        font-size: 13px;
+        color: var(--text-primary);
+      }
+      .user-row > .col-flag:nth-child(5) {
+        grid-row: 3;
+      }
+      .user-row > .col-flag:nth-child(5)::before {
+        content: 'Admin access';
+      }
+      .user-row > .col-flag:nth-child(6) {
+        grid-row: 4;
+      }
+      .user-row > .col-flag:nth-child(6)::before {
+        content: 'VM access';
+      }
+      /* Let the Approve button wrap below the filters instead of squeezing. */
+      .user-toolbar {
+        flex-wrap: wrap;
+      }
+    }
   `],
 })
 export class AdminUsersComponent implements OnInit {
