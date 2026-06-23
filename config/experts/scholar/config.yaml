@@ -42,6 +42,13 @@ instruction_files:
   - skill: verify-before-done
     trigger: phase:tactical
     enforce: false  # Active: injected at tactical phase start (where completion happens)
+  # Reference every claim inline as [N] (cite-and-place, not cite-and-forget).
+  - skill: cite-as-you-write
+    trigger: before_tool:cite_web
+    enforce: true
+  - skill: cite-as-you-write
+    trigger: before_tool:cite_document
+    enforce: true
 
 tools:
   workspace:
