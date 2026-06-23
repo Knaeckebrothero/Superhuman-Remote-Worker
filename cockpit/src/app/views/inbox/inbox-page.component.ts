@@ -1160,7 +1160,11 @@ function relativeTime(iso: string, nowLabel: string): string {
       border-bottom: 1px solid var(--border-color, var(--surface-0));
       align-items: center;
     }
-    .rule-form app-input { flex: 1; }
+    .rule-form app-input { flex: 1; min-width: 0; }
+    /* Bound the approve/deny <select>: its base-select field is width:100%, so without
+       a definite host width it takes the whole flex row and starves the pattern input
+       down to ~16px (reproduces at every viewport, not just mobile). */
+    .rule-form app-select { flex: 0 0 7.5rem; }
 
     .rule-row {
       display: flex;
@@ -1472,7 +1476,14 @@ function relativeTime(iso: string, nowLabel: string): string {
       .detail-panel { display: none; }
       .inbox-body.mobile-detail .list-panel { display: none; }
       .inbox-body.mobile-detail .detail-panel { display: block; }
-      .filter-chips { gap: 3px; }
+
+      /* Give the filter chips their own full-width row instead of a ~138px sliver
+         squeezed between the title and the SSE/refresh cluster (which hid 3 of the 5
+         filters behind a scrollbar-less swipe). Title + status stay on row 1; the
+         chips wrap to row 2 and scroll there with ~4 visible at rest. */
+      .inbox-header { flex-wrap: wrap; row-gap: 6px; }
+      .header-right { margin-left: auto; }
+      .filter-chips { gap: 3px; order: 3; flex-basis: 100%; }
     }
   `],
 })
