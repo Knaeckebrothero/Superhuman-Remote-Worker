@@ -17,7 +17,7 @@ from .document_models import (
 )
 from .config import load_config, load_prompt, get_project_root
 
-# NOTE: citation integration lives in the vendored ``citation_engine`` package
+# NOTE: citation integration lives in the ``src.citation_engine`` package
 # (constructed via ``ToolContext.get_citation_engine`` on the vector pool) and
 # the agent tools in ``src.tools.citation``. The former ``citation_utils``
 # helper module was dead/fictional (it referenced an engine API that never

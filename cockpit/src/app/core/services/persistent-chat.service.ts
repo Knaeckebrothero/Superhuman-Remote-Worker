@@ -153,6 +153,10 @@ export interface UsageState {
     inputTokens: number | null;
     outputTokensTurn: number;
     reasoningTokensTurn: number;
+    /** True when ``reasoningTokensTurn`` was derived from the captured reasoning
+     *  text because the provider reported no reasoning-token count (e.g. gemma
+     *  via vLLM). The figure is then a subset of ``outputTokensTurn``. */
+    reasoningEstimated: boolean;
     ctxLimitTokens: number | null;
 }
 
@@ -1888,6 +1892,11 @@ export class PersistentChatService {
                     reasoningTokensTurn:
                         (sameTurn ? prev.reasoningTokensTurn : 0) +
                         ((params['reasoning_tokens'] as number) ?? 0),
+                    // Sticky across the turn: once any call's reasoning is
+                    // estimated (provider reported no count), the turn reads est.
+                    reasoningEstimated:
+                        (sameTurn ? prev.reasoningEstimated : false) ||
+                        !!params['reasoning_estimated'],
                     ctxLimitTokens:
                         (params['ctx_limit_tokens'] as number) ?? prev?.ctxLimitTokens ?? null,
                 });

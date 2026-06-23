@@ -53,10 +53,19 @@ class SemanticChunker:
 
     Falls back to fixed-size splitting if the embedding service is unavailable.
 
+    The embedder is dependency-injected (not imported here): pass any object
+    exposing ``embed_batch(list[str]) -> list[list[float]]`` — e.g. SRW's
+    ``get_embedding_service()``. Semantic mode is currently inactive pending an
+    async chunker (see the citation engine integration doc follow-ups); with no
+    embedder the chunker uses the fixed-size fallback.
+
     Usage:
-        from citation_engine.embeddings import EmbeddingService
-        service = EmbeddingService()
-        chunker = SemanticChunker(embedding_service=service)
+        # Fixed-size fallback (no embedder):
+        chunker = SemanticChunker()
+        chunks = chunker.chunk("Long document text...")
+
+        # Semantic mode (inject an embedder exposing embed_batch):
+        chunker = SemanticChunker(embedding_service=embedder)
         chunks = chunker.chunk("Long document text...")
     """
 

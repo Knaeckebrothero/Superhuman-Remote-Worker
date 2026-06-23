@@ -226,7 +226,7 @@ def create_source_tools(context: ToolContext) -> List[Any]:
         try:
             # Try to use CitationEngine
             try:
-                from citation_engine import CitationEngine  # noqa: F401
+                from src.citation_engine import CitationEngine  # noqa: F401
             except ImportError:
                 # Fallback to stub behavior
                 citation_id = f"CIT-{uuid.uuid4().hex[:8].upper()}"
@@ -356,7 +356,7 @@ Similarity Score: {similarity}
 
             # Try to use CitationEngine
             try:
-                from citation_engine import CitationEngine  # noqa: F401
+                from src.citation_engine import CitationEngine  # noqa: F401
             except ImportError:
                 citation_id = f"CIT-{uuid.uuid4().hex[:8].upper()}"
                 logger.warning("CitationEngine not installed, using stub mode")
@@ -442,7 +442,7 @@ Similarity Score: {similarity}
         """
         try:
             try:
-                from citation_engine import CitationEngine  # noqa: F401
+                from src.citation_engine import CitationEngine  # noqa: F401
             except ImportError:
                 return "CitationEngine not installed. No sources available."
 
@@ -480,7 +480,7 @@ Similarity Score: {similarity}
         """
         try:
             try:
-                from citation_engine import CitationEngine  # noqa: F401
+                from src.citation_engine import CitationEngine  # noqa: F401
             except ImportError:
                 return "CitationEngine not installed."
 
@@ -568,7 +568,7 @@ Similarity Score: {similarity}
         """
         try:
             try:
-                from citation_engine import CitationEngine  # noqa: F401
+                from src.citation_engine import CitationEngine  # noqa: F401
             except ImportError:
                 return "CitationEngine not installed. No citations available."
 
@@ -635,7 +635,7 @@ Similarity Score: {similarity}
         """
         try:
             try:
-                from citation_engine import CitationEngine  # noqa: F401
+                from src.citation_engine import CitationEngine  # noqa: F401
             except ImportError:
                 return "error: CitationEngine not installed"
 
@@ -708,7 +708,7 @@ Similarity Score: {similarity}
         """
         try:
             try:
-                from citation_engine import CitationEngine  # noqa: F401
+                from src.citation_engine import CitationEngine  # noqa: F401
             except ImportError:
                 return "CitationEngine not installed."
 
@@ -751,7 +751,7 @@ Similarity Score: {similarity}
         """
         try:
             try:
-                from citation_engine import CitationEngine  # noqa: F401
+                from src.citation_engine import CitationEngine  # noqa: F401
             except ImportError:
                 return "CitationEngine not installed."
 
@@ -805,7 +805,7 @@ Similarity Score: {similarity}
         """
         try:
             try:
-                from citation_engine import CitationEngine  # noqa: F401
+                from src.citation_engine import CitationEngine  # noqa: F401
             except ImportError:
                 return "CitationEngine not installed."
 
@@ -865,7 +865,7 @@ Similarity Score: {similarity}
         """
         try:
             try:
-                from citation_engine import CitationEngine  # noqa: F401
+                from src.citation_engine import CitationEngine  # noqa: F401
             except ImportError:
                 return "CitationEngine not installed."
 
@@ -943,7 +943,7 @@ Similarity Score: {similarity}
         """
         try:
             try:
-                from citation_engine import CitationEngine  # noqa: F401
+                from src.citation_engine import CitationEngine  # noqa: F401
             except ImportError:
                 return "CitationEngine not installed."
 

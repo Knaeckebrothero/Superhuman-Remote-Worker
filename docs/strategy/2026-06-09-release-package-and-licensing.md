@@ -13,6 +13,8 @@ related:
 
 # Release Package And Licensing Strategy
 
+> **Superseded — FSL-1.1-ALv2 adopted 2026-06-23.** The license switch analyzed below was decided: the project was relicensed MIT → FSL-1.1-ALv2 (Functional Source License v1.1, Apache-2.0 future license; root file now `LICENSE`, not `LICENSE.txt`). Any "currently MIT" statements below reflect the pre-decision state and are kept for historical context.
+
 **Date:** 2026-06-09
 **Last updated:** 2026-06-15
 **Status:** Decision draft and session recap, not legal advice. Review with a

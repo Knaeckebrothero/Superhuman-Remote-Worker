@@ -40,7 +40,7 @@ see the chart README (`helm show readme oci://ghcr.io/knaeckebrothero/charts/sup
 ### 1.1 Component licensing
 
 The SRW components (`orchestrator`, `agent`, `cockpit`, `mcp`, workspace tooling)
-are under the project license — see [`LICENSE.txt`](../LICENSE.txt) — and the
+are under the project license — see [`LICENSE`](../LICENSE) — and the
 third-party libraries bundled *inside* those images are inventoried in
 [`THIRD_PARTY_LICENSES.md`](../THIRD_PARTY_LICENSES.md).
 

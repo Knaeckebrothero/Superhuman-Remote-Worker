@@ -59,8 +59,10 @@ data:
   # agent's shared VECTOR_POSTGRES_* pool. No separate citation DB/role/DSN.
   # See docs/features/citation_engine_integration.md.)
 
-  # MongoDB
+  {{- if .Values.databases.mongodb.enabled }}
+  # MongoDB (retired audit backend — rendered only if explicitly re-enabled; D-5 removes this)
   MONGODB_URL: {{ include "srw.mongodbUrl" . | quote }}
+  {{- end }}
 
   # Gitea
   GITEA_URL: {{ include "srw.gitUrl" . | quote }}

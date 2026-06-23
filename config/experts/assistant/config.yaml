@@ -1,0 +1,26 @@
+# yaml-language-server: $schema=../../schema.json
+# Assistant - General-purpose interactive assistant; the default for new sessions
+$extends: persistent_defaults
+
+agent_id: assistant
+display_name: Assistant
+description: |
+  General-purpose interactive assistant and the default for new sessions.
+  Collaborates with the user turn by turn on research, writing, analysis,
+  planning, and light coding — rather than running an autonomous batch job.
+  Inherits the full persistent toolset (files, research, browser, citations,
+  shell, git, knowledge) from persistent_defaults; its only specialization is
+  a conversational, generalist persona (persona.txt).
+icon: smart_toy
+color: "#89b4fa"
+tags:
+  - general
+  - assistant
+  - interactive
+  - persistent
+
+# Intentionally thin. Everything operational — tools, memory, auxiliary,
+# interactive settings, limits, context management, workspace, model floor — is
+# inherited from persistent_defaults via $extends (deep-merge), so nothing is
+# duplicated. The persona lives here (not in persistent_defaults) so the base
+# stays role-neutral for the other session experts that extend it.

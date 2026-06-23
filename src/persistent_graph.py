@@ -29,6 +29,7 @@ from langchain_core.messages import (
 )
 
 from .core.context import ContextManager, extract_summary_text, repair_tool_pairing
+from .core.summarizer import count_text_tokens
 from .llm.exceptions import ContextOverflowError
 from .llm.reasoning_chat import (
     _STREAM_REASONING_SINK,
@@ -222,6 +223,32 @@ def _user_facing_turn_error(e: BaseException) -> str:
             "this task, or switch to a larger-context model."
         )
     return str(e)
+
+
+def _maybe_estimate_reasoning_tokens(turn_metrics: dict, reasoning_text: str) -> None:
+    """Backfill a reasoning-token figure from captured reasoning *text*.
+
+    Some models stream/emit reasoning content but no provider reasoning-token
+    count (gemma via the vLLM router folds reasoning into ``output_tokens``).
+    When ``turn_metrics`` carries no ``reasoning_tokens`` but we hold the
+    reasoning text, tokenize it ourselves and mark it estimated. The estimate is
+    a SUBSET of ``output_tokens`` (never additive). Mutates ``turn_metrics`` in
+    place; a provider-reported count or empty text is a no-op.
+    """
+    if turn_metrics.get("reasoning_tokens"):
+        return
+    if not reasoning_text:
+        return
+    est = count_text_tokens(reasoning_text, turn_metrics.get("model"))
+    if est > 0:
+        # Reasoning is a subset of output_tokens; our tiktoken estimate uses a
+        # different tokenizer than the model, so clamp it so the UI never shows
+        # reasoning larger than the output it lives inside.
+        out = turn_metrics.get("output_tokens")
+        if isinstance(out, int) and out > 0:
+            est = min(est, out)
+        turn_metrics["reasoning_tokens"] = est
+        turn_metrics["reasoning_estimated"] = True
 
 
 class IdleTimeoutError(Exception):
@@ -983,6 +1010,10 @@ async def _execute_turn(
         # Set by the live reasoning sink below; gates the post-stream fallback
         # so each reasoning blob is emitted exactly once.
         reasoning_streamed = False
+        # Accumulate streamed reasoning text so we can derive a token estimate
+        # for models that stream reasoning but report no provider reasoning-token
+        # count (gemma via the vLLM router folds it into output_tokens).
+        _reasoning_buf: list = []
         _loop = asyncio.get_running_loop()
         # Keep strong refs to fire-and-forget broadcast tasks so they aren't
         # GC'd mid-flight (CPython drops weakly-held tasks).
@@ -997,6 +1028,7 @@ async def _execute_turn(
             if not text:
                 return
             reasoning_streamed = True
+            _reasoning_buf.append(text)
             task = _loop.create_task(callbacks.on_thinking(text, message_id=ai_msg_id))
             _reasoning_tasks.add(task)
             task.add_done_callback(_reasoning_tasks.discard)
@@ -1315,6 +1347,19 @@ async def _execute_turn(
                 "model": meta.get("model_name"),
             }
             turn_metrics = {k: v for k, v in turn_metrics.items() if v is not None}
+
+            # Backfill a reasoning-token estimate for models that surface
+            # reasoning *text* but no provider reasoning-token count (gemma via
+            # the vLLM router folds it into output_tokens). We hold the streamed
+            # reasoning text (or the post-hoc reasoning_content), so tokenize it
+            # ourselves — a SUBSET of output_tokens, flagged estimated.
+            _reasoning_text = "".join(_reasoning_buf) or (
+                (getattr(response, "additional_kwargs", None) or {}).get(
+                    "reasoning_content"
+                )
+                or ""
+            )
+            _maybe_estimate_reasoning_tokens(turn_metrics, _reasoning_text)
 
             # Anchor the compaction trigger on the real provider input_tokens
             # (context_token_accounting.md S1). Guarded so test stubs and

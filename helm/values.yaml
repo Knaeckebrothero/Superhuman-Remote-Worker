@@ -429,11 +429,11 @@ databases:
   audit:
     enabled: true
     internal: true
-    # -- Active backend for audit reads/writes: "postgres" (default since the
-    # PR7 cutover) or "mongodb" (legacy, pre-cutover fallback). Both the
-    # orchestrator reader and the agent writer honor it; flip back to "mongodb"
-    # per-env via the Fleet overlay / values-local for an emergency rollback
-    # (the Mongo data must still exist — see the pre-wipe backup).
+    # -- Active audit backend. "postgres" only — the legacy "mongodb" value is
+    # retired (MongoDB removed 2026-06-23; see
+    # docs/features/database_optimization_plan.md). Kept as a single-value knob so
+    # the audit_reader seam survives for a future BYO backend; setting "mongodb"
+    # now logs a warning and still serves reads/writes from Postgres.
     backend: "postgres"
     # -- External mode connection parts (credentials live in the Secret).
     externalHost: ""
@@ -499,7 +499,12 @@ databases:
         memory: "512Mi"
         cpu: "250m"
   mongodb:
-    enabled: true
+    # Retired audit backend (removed 2026-06-23 — see
+    # docs/features/database_optimization_plan.md QW-4/D-5). Off by default; the
+    # StatefulSet, NetworkPolicy, MONGODB_URL configmap/env, and the orchestrator
+    # boot calls are all gated on this flag. The code + this block are deleted in
+    # D-5; re-enable only as a temporary measure, never as a supported backend.
+    enabled: false
     internal: true
     # -- Full MongoDB URL for external mode. Example: "mongodb://my-mongo.db.svc:27017/srw_logs"
     externalUrl: ""
