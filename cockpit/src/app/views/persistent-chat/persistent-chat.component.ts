@@ -361,6 +361,53 @@ export function shouldFoldToolRun(
 }
 
 
+/**
+ * Composer draft persistence — survive a full-page reload (e.g. the auth
+ * redirect that fires when a BFF session genuinely expires) without losing an
+ * unsent message. Keyed by thread id in sessionStorage: per-tab, survives the
+ * same-tab OIDC round-trip + reload, and auto-clears when the tab closes.
+ * Writes are synchronous (no debounce) so the latest text is always persisted
+ * before any abrupt navigation. Every call is best-effort — storage can throw
+ * (private mode / quota) and a lost draft must never break the composer.
+ */
+const DRAFT_KEY_PREFIX = 'cockpit:draft:';
+
+export function draftKey(threadId: string): string {
+    return `${DRAFT_KEY_PREFIX}${threadId}`;
+}
+
+export function saveDraft(threadId: string | null, text: string): void {
+    if (!threadId) return;
+    try {
+        if (text && text.trim()) {
+            sessionStorage.setItem(draftKey(threadId), text);
+        } else {
+            sessionStorage.removeItem(draftKey(threadId));
+        }
+    } catch {
+        /* storage unavailable / quota — drafts are best-effort */
+    }
+}
+
+export function loadDraft(threadId: string | null): string {
+    if (!threadId) return '';
+    try {
+        return sessionStorage.getItem(draftKey(threadId)) ?? '';
+    } catch {
+        return '';
+    }
+}
+
+export function clearDraft(threadId: string | null): void {
+    if (!threadId) return;
+    try {
+        sessionStorage.removeItem(draftKey(threadId));
+    } catch {
+        /* noop */
+    }
+}
+
+
 @Component({
     selector: 'app-persistent-chat',
     standalone: true,
@@ -1695,6 +1742,17 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
             }
         });
 
+        // Restore a persisted composer draft when a thread loads (e.g. after an
+        // auth-redirect reload). Empty-guarded so it never clobbers text the
+        // user is already typing; onInputChange writes the draft on every
+        // keystroke and send() clears it once the message is in flight.
+        effect(() => {
+            const threadId = this.chat.threadId();
+            if (!threadId || this.inputText.trim()) return;
+            const draft = loadDraft(threadId);
+            if (draft) this.inputText = draft;
+        });
+
         // Elapsed-timer tick, only while a compaction is in flight.
         effect(() => {
             const active = this.chat.compaction() !== null;
@@ -1948,17 +2006,23 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         const text = this.inputText.trim();
         if (!text && this.chat.pendingAttachments().length === 0) return;
 
+        const threadId = this.chat.threadId();
         this.showSlashMenu.set(false);
         // Clear textarea immediately — sendMessage is async because of uploads.
         this.inputText = '';
+        // Drop the persisted draft now the message is in flight, so a reload
+        // can't re-surface a message that was actually sent.
+        clearDraft(threadId);
         this.autoScroll = true;
         // Fire-and-forget. On a hard send failure the service rolls back the
         // optimistic bubble; restore the draft so the user can retry (unless
         // they've already started typing a new one). The error banner set by
-        // the service explains why.
+        // the service explains why. Re-persist explicitly — a programmatic
+        // inputText assignment does not fire ngModelChange.
         void this.chat.sendMessage(text).then((ok) => {
             if (ok === false && !this.inputText.trim()) {
                 this.inputText = text;
+                saveDraft(threadId, text);
             }
         });
 
@@ -2420,6 +2484,9 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         } else {
             this.showSlashMenu.set(false);
         }
+        // Persist the draft synchronously so an abrupt reload (auth redirect)
+        // can't lose it. Cleared on a successful send.
+        saveDraft(this.chat.threadId(), value);
     }
 
     onMessagesScroll(): void {
