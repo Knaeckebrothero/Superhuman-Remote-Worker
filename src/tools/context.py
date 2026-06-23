@@ -290,7 +290,7 @@ class ToolContext:
             RuntimeError: If no vector-store pool is attached.
         """
         if self.citation_engine is None:
-            from citation_engine import CitationContext, CitationEngine
+            from src.citation_engine import CitationContext, CitationEngine
 
             if self.vector_db is None:
                 raise RuntimeError(

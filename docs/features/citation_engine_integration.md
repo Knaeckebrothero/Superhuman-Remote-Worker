@@ -21,15 +21,15 @@ related:
   - main_cloud_abstraction.md
 status: phase-3-implemented
 date: 2026-06-19
-updated: 2026-06-20
+updated: 2026-06-23
 ---
 
 # Citation Engine — Native SRW Integration
 
 ## Summary
 
-The citation engine has been **folded into the repo** (vendored at `./citation_engine/`,
-floating git pin removed, host owns the schema, tests relocated, k3d round-trip
+The citation engine has been **folded into the repo** (now an agent subpackage at
+`src/citation_engine/`, floating git pin removed, host owns the schema, tests relocated, k3d round-trip
 verified). It *was* still built like a standalone library — its own synchronous
 DB connection with SQLite/Postgres dual modes, its own LLM client for
 verification, its own embedding stack, and a schema duality. This document
@@ -63,16 +63,34 @@ Verified by the gated async Postgres round-trip
 `TestEditCitationTool`, the graph tests) + live k3d endpoint checks against the
 real orchestrator + MinIO (3b: `POST /api/citations/snapshot` bytes→key→dedup→
 boto3 read-back; 3c: `/snapshot` 200+bytes and `/drift` states + the 401 auth
-gate). The remaining end-to-end check is a full real-cloud agent run — the 2b
-feedback injection in a live job and the 3c `unchanged`/`changed` drift path
-(needs a cited file under the viewing user's own cloud home).
+gate). A dedicated Phase-3 end-to-end pass (2026-06-22) re-ran this in-cluster:
+32 live service checks (the full `/snapshot` + `/drift` + detail auth matrix
+across admin / job-owner / other-user / no-auth, content-address dedup,
+byte-fidelity, and the no-cloud-block / missing-blob / missing-key negatives),
+3 checks driving the **real** `OrchestratorClient.save_citation_snapshot` against
+the live endpoint + MinIO, and the 32 Phase-3 unit tests — all green, with every
+test row + blob cleaned up afterwards. The remaining end-to-end check is a full
+real-cloud agent run — the 2b feedback injection in a live job and the 3c
+`unchanged`/`changed` drift path (needs a cited file under the viewing user's own
+cloud home).
 
-**Deferred follow-ons:** persistent-session feedback injection (sessions already
-*verify* citations; only the feedback inject routes differently — via the
-MemoryManager seam); a cockpit citations view; semantic chunking restored behind
-an async chunker; the `oc:fileid` durable cloud link. Per-phase detail +
-acceptance criteria are in *Phasing & acceptance criteria* below; the original
-design rationale (Motivation / Design) is kept as the record.
+**Housekeeping (2026-06-23):** the package moved from the repo root to
+`src/citation_engine/` — it's agent-only (the orchestrator never imported it), so
+it's now an agent subpackage rather than a top-level sibling. Imports are
+`from src.citation_engine …`; the `COPY citation_engine/` Dockerfile lines, the CI
+ruff path arg, and the four Tiltfile `only=`/`ignore=` entries were dropped (all
+covered by `src/`). Pure relocation, no behaviour change — re-verified ruff-clean
++ 165 unit tests + the 6/6 `srw_vector` round-trip above. Kept as a
+flat-`PYTHONPATH` subpackage, **not** a pip/`pyproject` package, to match the repo.
+
+**Deferred follow-ons** (none are defects — all were explicitly scoped out of
+Phases 1–3): a cockpit citations view, a full real-cloud agent-job e2e,
+persistent-session feedback injection, semantic chunking behind an async chunker,
+and the `oc:fileid` durable cloud link. They're enumerated with rationale,
+integration points, and rough effort in *Follow-ups (deferred — not greenlit)*
+below. Per-phase detail + acceptance criteria are in *Phasing & acceptance
+criteria*; the original design rationale (Motivation / Design) is kept as the
+record.
 
 ## Motivation
 
@@ -467,6 +485,58 @@ Phase 3c — on-view drift check + view-original (done):
   OpenCloud home — exercise on a full real-cloud agent run. **Cockpit citations
   view stays deferred** (the data layer + endpoints are now ready for it).
 
+## Follow-ups (deferred — not greenlit)
+
+Phases 1–3 are complete and verified; the items below were deliberately scoped
+out, not skipped. None blocks the shipped feature. Listed roughly by leverage —
+if one is picked up, spin it into its own issue/feature doc.
+
+### 1. Cockpit citations view — *highest leverage; makes the backend user-visible*
+The entire data layer + read API is ready and proven (`GET /api/citations/{id}`,
+`/api/citations/{id}/snapshot`, `/api/citations/{id}/drift`), but nothing
+surfaces it. A view would list a job's citations with verification status, render
+"view original" from `/snapshot`, and show a drift badge from `/drift`. The one
+genuinely new piece is a **notification channel** for the async
+`pending → verified/failed` transition (SSE/WS) so the UI updates without a
+reload. *Effort:* moderate (Angular view + a status stream). *Plugs into:* the
+existing cockpit data-access patterns (`ApiService` + SSE).
+
+### 2. Full real-cloud agent-job e2e — *the remaining verification gap*
+Everything below the agent has been exercised live; what hasn't is a **real LLM
+job citing a real OpenCloud file**. That single run closes the two paths the
+component tests can't reach: (a) 2b failed-citation feedback injection inside a
+live worker turn, and (b) the 3c `unchanged`/`changed` drift branch (today's
+synthetic anchor URL correctly resolves to `unreachable`; the live hash-compare
+needs a cited file under the viewing user's own cloud home). *Effort:* low-code,
+high-setup (a real-cloud session + a deliberately-wrong citation to trip the
+verifier). *Same e2e bar deferred since 2b/3a.*
+
+### 3. Persistent-session feedback injection
+Persistent sessions already **verify** citations (2a wired `verify_aux` onto their
+ToolContext), but the D4 *feedback* injection is worker-only — it lives in
+`graph.py::_inject_transient_messages`, whereas persistent sessions assemble turn
+messages through the MemoryManager seam (`src/services/memory/manager.py`).
+Routing the still-`failed`-citation block through that seam is a clean, contained
+follow-on. *Effort:* small. *Plugs into:*
+`src/core/citation_feedback_injection.py` (reuse `format_failed_citations`) + the
+MemoryManager turn-assembly seam.
+
+### 4. Semantic chunking behind an async chunker
+A deliberate Phase 1 deviation: `SemanticChunker` needs a *sync* embedder, so
+chunking fell back to fixed-size to avoid blocking the async data layer (search
+still works on fixed chunks). Restoring it means giving the chunker an
+async-embedder path. *Effort:* moderate. *Plugs into:* `src/citation_engine/chunking.py`
++ SRW's async `get_embedding_service()`.
+
+### 5. `oc:fileid` durable cloud link
+Drift re-fetch currently locates the live file by **WebDAV-URL prefix match**
+(`_home_relative_path`), which breaks if the user renames/moves the file. A native
+OpenCloud `oc:fileid` captured at cite-time would let the live link + drift check
+survive moves. D7 always treated this as a *link-durability enhancement*, never a
+prerequisite — the saved snapshot is the real anchor. *Effort:* moderate (capture
+in `webdav_read` / MainCloud + a fileid→path resolve on the drift path).
+*Plugs into:* the 3a anchor + the 3c re-fetch.
+
 ## Open questions & deferrals
 
 Resolved this round (now **D4–D6**): verdict feedback = inject + batch reconcile;
@@ -475,11 +545,10 @@ configurable slot. Consumers of the async verdict (former open Q4) follow from
 those: the **agent** via injection + reconcile, the **DB** `verification_status`
 + the **audit trail** always, and the **cockpit** as the deferred reader below.
 
-**Deferred (out of scope for this integration):**
-- **Cockpit surfacing of citations + verification status.** With async status
-  (`pending → verified/failed`) a live UI would need a notification channel
-  (SSE/WS). The integration only needs the DB + audit to hold the status; a
-  cockpit citations view is a worthwhile follow-on once the data layer is clean.
+**Deferred (out of scope for this integration):** consolidated in *Follow-ups
+(deferred — not greenlit)* above — the cockpit citations view, the real-cloud
+agent-job e2e, persistent-session feedback injection, async semantic chunking,
+and the `oc:fileid` durable link.
 
 **Resolved (now D7):** the cloud-document reference model — snapshot-as-anchor
 (save text + blob, best-effort pointer, on-view drift check). The earlier

@@ -2354,6 +2354,43 @@ describe('PersistentChatService — usage.updated telemetry', () => {
         expect(u.ctxLimitTokens).toBe(128_000);
     });
 
+    it('marks reasoning estimated when the agent derives it; sticky within the turn', async () => {
+        const {service, es} = await setup();
+        // gemma-style: provider gave no reasoning count, agent derived + flagged it.
+        fireSseMessage(es, {
+            method: 'usage.updated',
+            params: {turn: 1, input_tokens: 10_000, output_tokens: 81, reasoning_tokens: 70, reasoning_estimated: true, ctx_limit_tokens: 128_000},
+        }, '1:1');
+        let u = service.usage()!;
+        expect(u.reasoningTokensTurn).toBe(70);
+        expect(u.reasoningEstimated).toBe(true);
+        // A later same-turn frame keeps the turn flagged estimated.
+        fireSseMessage(es, {
+            method: 'usage.updated',
+            params: {turn: 1, output_tokens: 20, reasoning_tokens: 30, reasoning_estimated: true},
+        }, '1:2');
+        u = service.usage()!;
+        expect(u.reasoningTokensTurn).toBe(100);
+        expect(u.reasoningEstimated).toBe(true);
+    });
+
+    it('leaves reasoningEstimated false for provider-reported reasoning, and resets on a new turn', async () => {
+        const {service, es} = await setup();
+        fireSseMessage(es, {
+            method: 'usage.updated',
+            params: {turn: 1, input_tokens: 10_000, output_tokens: 500, reasoning_tokens: 200},
+        }, '1:1');
+        expect(service.usage()!.reasoningEstimated).toBe(false);
+        // New turn that happens to be estimated → flips; proves the per-turn reset.
+        fireSseMessage(es, {
+            method: 'usage.updated',
+            params: {turn: 2, input_tokens: 11_000, output_tokens: 40, reasoning_tokens: 33, reasoning_estimated: true},
+        }, '1:2');
+        const u = service.usage()!;
+        expect(u.turn).toBe(2);
+        expect(u.reasoningEstimated).toBe(true);
+    });
+
     describe('historyToTurns — synthetic image-delivery messages', () => {
         const msg = (over: Record<string, unknown>) => ({
             id: 'x',

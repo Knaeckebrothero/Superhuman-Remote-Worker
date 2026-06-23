@@ -31,6 +31,7 @@ from src.persistent_graph import (
     _execute_turn,
     _inject_context_pairs,
     _injection_anchor_index,
+    _maybe_estimate_reasoning_tokens,
     run_persistent_loop,
 )
 
@@ -3485,3 +3486,37 @@ class TestInjectContextPairs:
         count = _inject_context_pairs(prepared, [], "", "")
         assert count == 0
         assert prepared == before
+
+
+class TestMaybeEstimateReasoningTokens:
+    """_maybe_estimate_reasoning_tokens — backfill reasoning tokens from text
+    when the provider reports none (e.g. gemma via vLLM)."""
+
+    def test_estimates_and_flags_when_no_provider_count(self):
+        tm = {"input_tokens": 10_000, "output_tokens": 400, "model": "gemma-4-moe"}
+        _maybe_estimate_reasoning_tokens(tm, "Let me think: 17*23 = 391. " * 5)
+        assert tm["reasoning_tokens"] > 0
+        assert tm["reasoning_estimated"] is True
+        # output is the provider's number, untouched; the estimate sits within it.
+        assert tm["output_tokens"] == 400
+        assert tm["reasoning_tokens"] <= tm["output_tokens"]
+
+    def test_clamps_estimate_to_output_tokens(self):
+        # A long reasoning blob whose tiktoken estimate would exceed the tiny
+        # provider output count must clamp — reasoning can't exceed its output.
+        tm = {"output_tokens": 5, "model": "gemma-4-moe"}
+        _maybe_estimate_reasoning_tokens(tm, "reasoning " * 200)
+        assert tm["reasoning_tokens"] == 5
+        assert tm["reasoning_estimated"] is True
+
+    def test_noop_when_provider_reported_reasoning(self):
+        tm = {"output_tokens": 500, "reasoning_tokens": 200, "model": "o1"}
+        _maybe_estimate_reasoning_tokens(tm, "some reasoning text")
+        assert tm["reasoning_tokens"] == 200
+        assert "reasoning_estimated" not in tm
+
+    def test_noop_when_no_reasoning_text(self):
+        tm = {"output_tokens": 50, "model": "gemma-4-moe"}
+        _maybe_estimate_reasoning_tokens(tm, "")
+        assert "reasoning_tokens" not in tm
+        assert "reasoning_estimated" not in tm

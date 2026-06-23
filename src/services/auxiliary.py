@@ -1167,8 +1167,8 @@ async def verify_and_store_citation(
 
         verdict = await verify_aux.chain(task)
 
-        # Lazy import — the vendored engine package owns this model.
-        from citation_engine.models import VerificationResult
+        # Lazy import — the citation_engine package owns this model.
+        from src.citation_engine.models import VerificationResult
 
         await engine._update_verification_status(
             citation_id,

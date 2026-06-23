@@ -1166,18 +1166,27 @@ export function shouldFoldToolRun(
         <!-- Live token telemetry (usage.updated frames): latest context fill
              + cumulative output/reasoning for the running turn. -->
         @if (chat.usage(); as u) {
-          <div class="usage-panel" aria-hidden="true">
-            @if (u.inputTokens != null) {
-              <span class="usage-item"><span class="usage-label">{{ 'chat.usage.input' | transloco }}</span>{{ u.inputTokens | number }}</span>
-            }
-            @if (u.reasoningTokensTurn > 0) {
-              <span class="usage-item"><span class="usage-label">{{ 'chat.usage.reasoning' | transloco }}</span>{{ u.reasoningTokensTurn | number }}</span>
-            }
-            <span class="usage-item"><span class="usage-label">{{ 'chat.usage.output' | transloco }}</span>{{ u.outputTokensTurn | number }}</span>
+          <div class="usage-panel" aria-hidden="true"
+               [class.lvl-warn]="usageCtxLevel() === 'warn'"
+               [class.lvl-danger]="usageCtxLevel() === 'danger'">
+            <!-- secondary: per-turn token breakdown (compact chips) -->
+            <span class="usage-tokens">
+              @if (u.inputTokens != null) {
+                <span class="usage-chip"><span class="usage-k">{{ 'chat.usage.input' | transloco }}</span>{{ formatTokens(u.inputTokens) }}</span>
+              }
+              <span class="usage-chip"><span class="usage-k">{{ 'chat.usage.output' | transloco }}</span>{{ formatTokens(u.outputTokensTurn) }}</span>
+              @if (u.reasoningTokensTurn > 0) {
+                <span class="usage-chip" [title]="u.reasoningEstimated ? ('chat.usage.reasoningEstimatedHint' | transloco) : ''">
+                  <span class="usage-k">{{ 'chat.usage.reasoning' | transloco }}</span>{{ u.reasoningEstimated ? '~' : '' }}{{ formatTokens(u.reasoningTokensTurn) }}
+                </span>
+              }
+            </span>
+            <!-- primary: context-window fill — the actionable metric, colour-ramped -->
             @if (usageCtxPct() != null) {
-              <span class="usage-item"><span class="usage-label">{{ 'chat.usage.ctx' | transloco }}</span>
-                <span class="usage-gauge"><span class="usage-gauge-fill" [class.hot]="usageCtxPct()! >= 80" [style.width.%]="usageCtxPct()"></span></span>
-                <span [class.usage-hot]="usageCtxPct()! >= 80">{{ usageCtxPct() }}%</span>
+              <span class="usage-ctx">
+                <span class="usage-ctx-label">{{ 'chat.usage.ctx' | transloco }}</span>
+                <span class="usage-gauge"><span class="usage-gauge-fill" [style.width.%]="usageCtxPct()"></span></span>
+                <span class="usage-ctx-pct">{{ usageCtxPct() }}%</span>
               </span>
             }
           </div>
@@ -1489,6 +1498,16 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         const u = this.chat.usage();
         if (!u || u.inputTokens == null || !u.ctxLimitTokens) return null;
         return Math.min(100, Math.round((100 * u.inputTokens) / u.ctxLimitTokens));
+    });
+
+    /** Context-fill threshold level driving the gauge colour ramp
+     *  (ok → warn → danger). A null pct reads as 'ok'. */
+    readonly usageCtxLevel = computed<'ok' | 'warn' | 'danger'>(() => {
+        const pct = this.usageCtxPct();
+        if (pct == null) return 'ok';
+        if (pct >= 90) return 'danger';
+        if (pct >= 75) return 'warn';
+        return 'ok';
     });
 
     @ViewChild('messagesContainer') messagesContainer!: ElementRef<HTMLDivElement>;

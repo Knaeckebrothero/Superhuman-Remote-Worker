@@ -205,11 +205,13 @@ spec:
                   name: {{ include "srw.configMapName" . }}
                   key: LITELLM_QUOTA
             {{- end }}
+            {{- if .Values.databases.mongodb.enabled }}
             - name: MONGODB_URL
               valueFrom:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: MONGODB_URL
+            {{- end }}
             - name: WORKSPACE_PATH
               valueFrom:
                 configMapKeyRef:

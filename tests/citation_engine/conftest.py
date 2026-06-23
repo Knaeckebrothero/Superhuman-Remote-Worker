@@ -7,7 +7,7 @@ async, so this package's coverage is the single async round-trip in
 The former SQLite unit fixtures + sample-data fixtures were retired with the
 SQLite mode; the round-trip is self-contained.
 
-citation_engine is importable from the repo root (the top-level tests/conftest.py
+src.citation_engine is importable from the repo root (the top-level tests/conftest.py
 puts it on sys.path). Environment comes from the process / cluster — e.g.
 CITATION_DB_URL (or VECTOR_POSTGRES_*) for the Postgres integration — not a
 local .env file.

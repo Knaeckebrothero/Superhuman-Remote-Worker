@@ -50,7 +50,7 @@ def _vector_url() -> str | None:
 @pytest_asyncio.fixture
 async def engine_ctx():
     """Yield (engine, db, job_id) bound to the vector store; clean up after."""
-    from citation_engine import CitationContext, CitationEngine
+    from src.citation_engine import CitationContext, CitationEngine
     from src.database.postgres_db import PostgresDB
 
     url = _vector_url()
@@ -223,7 +223,7 @@ async def test_async_verification_writeback(engine_ctx):
     the real path: engine self-schedules ``verify_and_store_citation`` →
     ``AuxiliaryLLM.chain`` → ``_update_verification_status`` on the live schema.
     """
-    from citation_engine import CitationEngine
+    from src.citation_engine import CitationEngine
     from src.services.auxiliary import CitationVerdict
 
     engine, db, job_id = engine_ctx
@@ -281,7 +281,7 @@ async def test_failed_verdict_surfaces_for_feedback(engine_ctx):
     citations back to the agent (``list_citations(verification_status='failed')``
     → ``format_failed_citations``).
     """
-    from citation_engine import CitationEngine
+    from src.citation_engine import CitationEngine
     from src.core.citation_feedback_injection import format_failed_citations
     from src.services.auxiliary import CitationVerdict
 

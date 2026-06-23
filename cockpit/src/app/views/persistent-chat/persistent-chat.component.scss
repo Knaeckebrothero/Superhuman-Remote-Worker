@@ -2241,51 +2241,92 @@
 }
 
 // --- Live token usage panel (above composer, right-aligned) -----------------
+// Hierarchy: secondary token chips (input/output/reasoning) on the left; the
+// context-window fill — the actionable metric — promoted to a colour-ramped
+// hero gauge on the right. Aligned to the composer's centered reading column.
 .usage-panel {
   display: flex;
   justify-content: flex-end;
   align-items: center;
   gap: v.$space-md;
-  // Align to the composer's centered reading column (same max-width + auto
-  // margins) so the bar sits flush above the input instead of floating out
-  // in the right margin.
   max-width: var(--chat-content-width);
   margin: 0 auto 4px;
   padding: 2px v.$space-sm;
   font-family: var(--font-mono, monospace);
-  font-size: 11px;
-  color: var(--text-secondary);
 
-  .usage-item {
+  // secondary: per-turn token breakdown
+  .usage-tokens {
     display: inline-flex;
     align-items: center;
+    gap: v.$space-sm;
+    font-size: 11px;
+    color: var(--text-secondary);
+  }
+
+  .usage-chip {
+    display: inline-flex;
+    align-items: baseline;
     gap: v.$space-xs;
   }
 
-  .usage-label {
+  .usage-k {
     color: var(--text-muted);
-    letter-spacing: 0.08em;
     text-transform: uppercase;
-    font-size: 10px;
+    letter-spacing: 0.07em;
+    font-size: 9.5px;
+  }
+
+  // primary: context-window fill (hero)
+  .usage-ctx {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    padding-left: v.$space-md;
+    border-left: 1px solid var(--border-color, var(--surface-0));
+  }
+
+  .usage-ctx-label {
+    font-size: 9.5px;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--text-muted);
   }
 
   .usage-gauge {
     display: inline-block;
-    width: 56px;
-    height: 4px;
-    border-radius: 2px;
-    background: color-mix(in srgb, var(--text-muted) 25%, transparent);
+    width: 64px;
+    height: 5px;
+    border-radius: 3px;
+    background: color-mix(in srgb, var(--text-muted) 22%, transparent);
     overflow: hidden;
-
-    .usage-gauge-fill {
-      display: block;
-      height: 100%;
-      background: var(--accent-color, #3399D6);
-      transition: width 300ms ease;
-
-      &.hot { background: var(--warning, #e0707a); }
-    }
   }
 
-  .usage-hot { color: var(--warning, #e0707a); }
+  .usage-gauge-fill {
+    display: block;
+    height: 100%;
+    border-radius: 3px;
+    background: var(--info, #7a9bc6);
+    transition: width 300ms ease, background-color 300ms ease;
+  }
+
+  .usage-ctx-pct {
+    font-size: 13px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    color: var(--info, #7a9bc6);
+    min-width: 32px;
+    text-align: right;
+  }
+
+  // 3-tier threshold ramp (info → gold → blood) via real theme tokens
+  &.lvl-warn {
+    .usage-gauge-fill { background: var(--warning, #cdab68); }
+    .usage-ctx-pct { color: var(--warning, #cdab68); }
+  }
+
+  &.lvl-danger {
+    .usage-gauge-fill { background: var(--danger, #cc4647); }
+    .usage-ctx-pct { color: var(--danger, #cc4647); }
+  }
 }

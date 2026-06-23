@@ -84,7 +84,6 @@ docker_build(
         '.tilt-state/',
         # Cross-component dirs the orchestrator build doesn't care about — any
         # file change here would otherwise force a fall_back full rebuild.
-        'citation_engine/',
         'cockpit/',
         'helm/',
         'docs/',
@@ -138,7 +137,6 @@ docker_build(
         # Cross-component dirs the cockpit build doesn't care about.
         'orchestrator/',
         'src/',
-        'citation_engine/',
         'config/',
         'agent.py',
         'init.py',
@@ -183,7 +181,6 @@ docker_build(
     dockerfile='docker/Dockerfile.agent.dev',
     only=[
         'src/',
-        'citation_engine/',
         'config/',
         'agent.py',
         'requirements.txt',
@@ -232,7 +229,6 @@ docker_build(
         '**/*.pyo',
         # Cross-component dirs the mcp build doesn't care about.
         'src/',
-        'citation_engine/',
         'config/',
         'cockpit/',
         'helm/',

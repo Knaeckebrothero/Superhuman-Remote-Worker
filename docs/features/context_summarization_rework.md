@@ -19,8 +19,11 @@ related:
 # Context Summarization Rework — aux-budgeted rolling compaction, progress UI, live token counters
 
 **Status:** Implemented (2026-06-12, S1–S5 in one pass) + **§9 duplicate-banner
-follow-up fixed same day** (found during live verification). Absorbs the issues
-deferred from `docs/issues/session_silent_failure_audit.md` to the
+follow-up fixed same day** (found during live verification) + **§10 token-UI
+refinement** (2026-06-23: composer-bar alignment shipped; reasoning-token
+estimate + context-bar restyle implemented + test-verified; live render blocked
+on the LiteLLM usage gap — `docs/issues/litellm_streaming_usage_not_surfaced.md`).
+Absorbs the issues deferred from `docs/issues/session_silent_failure_audit.md` to the
 "summarization rework track": **#4-full** (failure semantics), **#5**
 (tool-result caps), **#6** (keep-window elision), **#7** (aux-context
 clamping/chunking) — plus the compaction progress UI and live token counters.
@@ -454,3 +457,78 @@ after the answer + duplicated on replay — same journal-vs-history seam, no
 data duplication) was filed and fixed separately (commit `20916662`,
 2026-06-13):
 `docs/done/persistent_chat_reasoning_after_answer_and_replay_duplication.md`.
+
+## 10. Follow-up: token-counter UI refinement + reasoning estimate (2026-06-18 → 06-23)
+
+A second pass on the §4.6 live counters, prompted by the panel reading as
+"unfinished and out of place" in real sessions. Three UI changes plus one
+infrastructure blocker.
+
+**10.1 Composer-bar alignment (shipped, commit `9da9ad17`).** The panel lived in
+`.composer-wrap` (full-width, 36px padding) with no width cap, so
+`justify-content: flex-end` right-aligned it to the *viewport* edge — floating in
+the right margin, detached from the composer, which is capped at
+`--chat-content-width` (700px) and centered. (That unconstrained full-width flex
+also produced a stray `%` artifact floating on the left.) *Fix:* constrain
+`.usage-panel` to the same `max-width: var(--chat-content-width); margin: 0 auto`
+as the composer so it sits flush above the input. Verified on k3d — panel and
+composer right edges align to the pixel.
+
+**10.2 Reasoning-token estimate for providers that omit it (implemented,
+unit-verified).** §4.6 promised reasoning tokens "best-effort where the provider
+reports them" — but self-hosted gemma via vLLM streams reasoning *text* while
+folding it into `output_tokens` and reporting
+`completion_tokens_details.reasoning_tokens: 0`, so the reasoning chip stayed
+permanently hidden for the most-used local model even though the thinking is
+visibly captured. Capturing reasoning *text* (the `reasoning_chat.py` SSE tap →
+`additional_kwargs.reasoning_content`) is a **separate path** from the provider's
+token *count*; holding the words means we can count them ourselves.
+
+- **Agent** (`src/persistent_graph.py`): `_on_reasoning_delta` now also
+  accumulates streamed reasoning into `_reasoning_buf`. After `turn_metrics` is
+  built, the new module helper `_maybe_estimate_reasoning_tokens(turn_metrics,
+  reasoning_text)` fires when the provider gave no `reasoning_tokens`: it
+  tokenizes the buffer (falling back to `additional_kwargs.reasoning_content`)
+  via `summarizer.count_text_tokens` (tiktoken/cl100k), **clamps to
+  `output_tokens`** (reasoning is a subset, never additive — a different
+  tokenizer could otherwise overshoot the provider's output count), sets
+  `reasoning_tokens`, and flags `reasoning_estimated=True`. Rides the existing
+  `usage.updated` frame (new `reasoning_estimated` field).
+- **Cockpit**: `UsageState.reasoningEstimated` (sticky across a turn, resets per
+  turn); the chip renders `~70` with a tooltip
+  (`chat.usage.reasoningEstimatedHint`, en + de) — "estimated from the captured
+  reasoning text, counted within Output."
+- **Tests**: `TestMaybeEstimateReasoningTokens` (estimate+flag, clamp, two
+  no-ops) in `tests/test_persistent_graph.py`; reducer set/sticky/reset specs in
+  `persistent-chat.service.spec.ts`. 105 backend + 130 cockpit green.
+
+**10.3 Context-bar restyle (implemented, harness-rendered).** The flat,
+equal-weight mono strip with an *inverted* ramp (accent-red at rest → gold "hot"
+≥80%) became a hierarchy: per-turn token counts demoted to compact
+`k`-formatted chips (`formatTokens`), the **context-window fill promoted to a
+colour-ramped hero** (divider + larger %), driven by a new `usageCtxLevel()`
+computed — a correct 3-tier ramp on real theme tokens: `--info` (ok) →
+`--warning` (warn ≥75%) → `--danger` (danger ≥90%). Mirrors the "Variant B"
+mockup's content model (ctx-% hero, demoted counts) but as a *horizontal* bar,
+not the vertical side-rail — the side-rail fights the 700px centered reading
+column. Thresholds are static for now; tying warn/danger to the actual
+compaction trigger (so "danger" literally means "compaction imminent") is the
+obvious refinement.
+
+**10.4 Blocker: LiteLLM-routed models surface no usage at all.** Live
+verification of 10.2/10.3 is blocked because both reachable local models are
+unusable for it: `gemma-4-moe-strix` 401s (expired endpoint key — the known
+persistent main-model key issue), and `gemma-4-moe` (via the LiteLLM gateway)
+emits **no `usage.updated` frame at all**, so the whole bar (input/output/ctx
+*and* the reasoning estimate) stays hidden for it. Curling the gateway proves it
+returns usage only when `stream_options.include_usage` is set — which SRW's
+`stream_usage=True` is supposed to send (verified in langchain source) — yet the
+usage chunk never reaches `response.usage_metadata`. Characterized with evidence
++ close-out steps in `docs/issues/litellm_streaming_usage_not_surfaced.md`
+(prime suspect: the `AsyncReasoningCapturingClient` httpx tap dropping the final
+usage-only chunk). **This is the keystone**: closing it renders the live bar for
+every LiteLLM-routed model and unblocks the 10.2/10.3 screenshot.
+
+**Status:** 10.1 shipped (`9da9ad17`); 10.2 + 10.3 implemented + test-verified,
+live render pending 10.4; 10.4 characterized + filed, unfixed. The 10.2/10.3
+changes are on the working tree, uncommitted as of 2026-06-23.
