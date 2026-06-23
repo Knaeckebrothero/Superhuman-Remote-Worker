@@ -555,6 +555,10 @@ async def stale_detector_sweep(db):
     count = await db.mark_stale_agents_offline(timeout_minutes=3)
     stuck_working = await db.mark_stuck_working_agents_ready()
     stuck_session = await db.mark_stuck_session_agents_ready()
+    # The pod-delete actuation (agent_provisioner.delete_agent_pod over the
+    # returned hostnames) lives in the real loop and is intentionally not
+    # modeled in this db-only replication.
+    orphaned_sessions = await db.reap_orphaned_session_agents(grace_minutes=5)
     ended_ids = await db.mark_orphaned_threads_ended()
     suspended_ids = await db.mark_orphaned_threads_suspended()
     recovered = await db.recover_orphaned_jobs()
@@ -563,6 +567,7 @@ async def stale_detector_sweep(db):
         "stale_agents": count,
         "stuck_working": stuck_working,
         "stuck_session": stuck_session,
+        "orphaned_sessions": orphaned_sessions,
         "ended_threads": ended_ids,
         "suspended_threads": suspended_ids,
         "recovered_jobs": recovered,
@@ -785,6 +790,148 @@ class TestMarkStuckSessionAgentsReady:
         # signal here because zombies heartbeat normally.
         assert "ended_at < NOW() - INTERVAL '2 minutes'" in sql
         assert "last_heartbeat" not in sql
+
+
+# =============================================================================
+# reap_orphaned_session_agents (replicated SQL logic)
+# =============================================================================
+
+
+async def reap_orphaned_session_agents(db, grace_minutes=5):
+    """Replicated from postgres.py."""
+    orphan_pred = "status = 'session' AND thread_id IS NULL AND current_job_id IS NULL"
+    async with db.acquire() as conn:
+        await conn.execute(
+            f"""
+            UPDATE agents
+            SET intents = intents - 'session_orphaned_at'
+            WHERE COALESCE(intents, '{{}}'::jsonb) ? 'session_orphaned_at'
+              AND NOT ({orphan_pred})
+            """
+        )
+        await conn.execute(
+            f"""
+            UPDATE agents
+            SET intents = COALESCE(intents, '{{}}'::jsonb)
+                          || jsonb_build_object('session_orphaned_at', to_jsonb(NOW()))
+            WHERE {orphan_pred}
+              AND NOT (COALESCE(intents, '{{}}'::jsonb) ? 'session_orphaned_at')
+            """
+        )
+        rows = await conn.fetch(
+            f"""
+            SELECT id, hostname
+            FROM agents
+            WHERE {orphan_pred}
+              AND hostname IS NOT NULL
+              AND (COALESCE(intents, '{{}}'::jsonb) ->> 'session_orphaned_at')::timestamptz
+                  < NOW() - make_interval(mins => $1)
+            """,
+            grace_minutes,
+        )
+    return [{"id": str(row["id"]), "hostname": row["hostname"]} for row in rows]
+
+
+class TestReapOrphanedSessionAgents:
+    @staticmethod
+    def _db_with(fetch_rows):
+        conn = AsyncMock()
+        conn.execute.return_value = "UPDATE 0"
+        conn.fetch.return_value = fetch_rows
+        db = MagicMock()
+        ctx = AsyncMock()
+        ctx.__aenter__ = AsyncMock(return_value=conn)
+        ctx.__aexit__ = AsyncMock(return_value=False)
+        db.acquire.return_value = ctx
+        return db, conn
+
+    @pytest.mark.asyncio
+    async def test_returns_mapped_rows(self):
+        db, _ = self._db_with(
+            [
+                {
+                    "id": "11111111-1111-1111-1111-111111111111",
+                    "hostname": "srw-agent-j-aaa",
+                },
+                {
+                    "id": "22222222-2222-2222-2222-222222222222",
+                    "hostname": "srw-agent-j-bbb",
+                },
+            ]
+        )
+        out = await reap_orphaned_session_agents(db, grace_minutes=5)
+        assert out == [
+            {
+                "id": "11111111-1111-1111-1111-111111111111",
+                "hostname": "srw-agent-j-aaa",
+            },
+            {
+                "id": "22222222-2222-2222-2222-222222222222",
+                "hostname": "srw-agent-j-bbb",
+            },
+        ]
+
+    @pytest.mark.asyncio
+    async def test_empty_when_no_orphans(self):
+        db, _ = self._db_with([])
+        assert await reap_orphaned_session_agents(db) == []
+
+    @pytest.mark.asyncio
+    async def test_select_scopes_to_unbound_session_with_bound_grace(self):
+        db, conn = self._db_with([])
+        await reap_orphaned_session_agents(db, grace_minutes=7)
+        select_sql = conn.fetch.call_args[0][0]
+        assert "status = 'session'" in select_sql
+        assert "thread_id IS NULL" in select_sql
+        assert "current_job_id IS NULL" in select_sql
+        # Grace anchored on the stamp, not heartbeat freshness (zombies
+        # heartbeat normally) and not a bound thread (there isn't one).
+        assert "session_orphaned_at" in select_sql
+        assert "make_interval(mins => $1)" in select_sql
+        # Grace value is a bound param, not interpolated into the SQL.
+        assert conn.fetch.call_args[0][1] == 7
+
+    @pytest.mark.asyncio
+    async def test_stamps_new_and_clears_recovered(self):
+        db, conn = self._db_with([])
+        await reap_orphaned_session_agents(db)
+        update_sqls = [c[0][0] for c in conn.execute.call_args_list]
+        assert any("intents - 'session_orphaned_at'" in s for s in update_sqls)
+        assert any("jsonb_build_object('session_orphaned_at'" in s for s in update_sqls)
+
+    @pytest.mark.asyncio
+    async def test_never_reaps_thread_bound_agents(self):
+        # Every statement is gated on thread_id IS NULL, so a thread-bound
+        # live session is never touched (guards the 2026-06-10 incident).
+        db, conn = self._db_with([])
+        await reap_orphaned_session_agents(db)
+        all_sql = [c[0][0] for c in conn.execute.call_args_list]
+        all_sql.append(conn.fetch.call_args[0][0])
+        for stmt in all_sql:
+            assert "thread_id IS NULL" in stmt
+
+
+@pytest.mark.asyncio
+async def test_stale_sweep_reaps_orphans_between_consistency_and_gc():
+    # The orphan reap runs after the gentle session-ready fix and before GC.
+    db = AsyncMock()
+    db.mark_stale_agents_offline.return_value = 0
+    db.mark_stuck_working_agents_ready.return_value = 0
+    db.mark_stuck_session_agents_ready.return_value = 0
+    db.reap_orphaned_session_agents.return_value = []
+    db.mark_orphaned_threads_ended.return_value = []
+    db.mark_orphaned_threads_suspended.return_value = []
+    db.recover_orphaned_jobs.return_value = 0
+    db.gc_offline_agents.return_value = 0
+
+    await stale_detector_sweep(db)
+    names = [c[0] for c in db.method_calls]
+    assert names.index("mark_stuck_session_agents_ready") < names.index(
+        "reap_orphaned_session_agents"
+    )
+    assert names.index("reap_orphaned_session_agents") < names.index(
+        "gc_offline_agents"
+    )
 
 
 # =============================================================================

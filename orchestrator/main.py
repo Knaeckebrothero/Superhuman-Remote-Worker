@@ -599,6 +599,29 @@ async def stale_agent_detector(shutdown_event: asyncio.Event) -> None:
                     f"on ended thread"
                 )
 
+            # 2b. STOPGAP — reap session agents wedged with NO bound thread/job.
+            # mark_stuck_session_agents_ready (above) can't reach these: its
+            # predicate needs thread_id IS NOT NULL, and a *live* agent
+            # re-asserts 'session' on every 5s heartbeat so a flip-to-ready
+            # never sticks — deleting the pod is the only actuation that does.
+            # Scoped to thread_id + current_job_id both NULL (holds nothing
+            # user-visible), so it never touches a thread-bound live session
+            # (the 2026-06-10 incident). Proper fix = the intent/observed split
+            # in docs/features/unified_instance_lifecycle.md. Tracking:
+            # docs/issues/lifecycle_session_agents_without_thread_never_drain.md
+            orphaned_sessions = await postgres_db.reap_orphaned_session_agents(
+                grace_minutes=5
+            )
+            for orphan in orphaned_sessions:
+                deleted = await agent_provisioner.delete_agent_pod(orphan["hostname"])
+                logger.warning(
+                    "Reaped orphaned session agent %s (pod=%s, deleted=%s): "
+                    "'session' with no thread/job past grace",
+                    orphan["id"],
+                    orphan["hostname"],
+                    deleted,
+                )
+
             # 3. Propagate: threads bound to offline agents → 'ended'
             ended_ids = await postgres_db.mark_orphaned_threads_ended()
             if ended_ids:
