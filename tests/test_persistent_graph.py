@@ -1744,6 +1744,193 @@ class TestTransientInjection:
 
 
 # ---------------------------------------------------------------------------
+# 1.5b _execute_turn — citation-verification feedback (Phase 2b / D4, persistent
+# parity with the worker's _inject_transient_messages)
+# ---------------------------------------------------------------------------
+
+
+def _failed_cit(cid=1, claim="The sky is green", notes="quote not found", score=0.1):
+    """Fake failed-verification Citation (the attrs format_failed_citations reads)."""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        id=cid, claim=claim, verification_notes=notes, similarity_score=score
+    )
+
+
+def _capturing_llm(captured, response):
+    """LLM mock that records the messages list passed to each astream call."""
+    llm = AsyncMock()
+    llm.reasoning = None
+
+    async def _astream(messages, **kw):
+        captured.append(list(messages))
+        yield response
+
+    llm.astream = _astream
+    llm.ainvoke = AsyncMock(return_value=response)
+    return llm
+
+
+class TestCitationFeedbackInjectionUnit:
+    """Pure _inject_context_pairs coverage for the citation-feedback block."""
+
+    def test_injects_citation_feedback_pair_after_other_context(self):
+        from src.core.citation_feedback_injection import (
+            is_citation_feedback_injection_message,
+        )
+
+        prepared = [SystemMessage(content="sys"), HumanMessage(content="hi")]
+        added = _inject_context_pairs(
+            prepared, [], "", "", "Automatic verification FAILED for [1]"
+        )
+
+        assert added == 2
+        pair = [m for m in prepared if is_citation_feedback_injection_message(m)]
+        assert len(pair) == 2  # synthetic AI tool-call + ToolMessage report
+        tool_msgs = [m for m in prepared if isinstance(m, ToolMessage)]
+        assert any("verification FAILED" in m.content for m in tool_msgs)
+        # Anchored after the first user turn (provider turn-ordering safety).
+        assert isinstance(prepared[0], SystemMessage)
+        assert isinstance(prepared[1], HumanMessage)
+
+    def test_empty_citation_block_is_noop(self):
+        prepared = [SystemMessage(content="sys"), HumanMessage(content="hi")]
+        added = _inject_context_pairs(prepared, [], "", "", "")
+        assert added == 0
+        assert len(prepared) == 2
+
+
+class TestExecuteTurnCitationFeedback:
+    @pytest.mark.asyncio
+    async def test_failed_citations_surfaced_to_llm(self):
+        """A still-failed citation is queried once per turn and injected into the
+        LLM input as a synthetic check_citation_verification pair."""
+        from src.core.citation_feedback_injection import (
+            is_citation_feedback_injection_message,
+        )
+
+        engine = MagicMock()
+        engine.list_citations = AsyncMock(return_value=[_failed_cit()])
+        tool_ctx = MagicMock()
+        tool_ctx.citation_engine = engine
+
+        captured: List[List[BaseMessage]] = []
+        messages = [SystemMessage(content="sys"), HumanMessage(content="cite this")]
+
+        await _execute_turn(
+            llm_with_tools=_capturing_llm(captured, _make_llm_response("done")),
+            tool_map={},
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
+            messages=messages,
+            callbacks=_make_callbacks(),
+            llm_timeout=600,
+            auxiliary_llm=None,
+            config=_make_config(),
+            tool_context=tool_ctx,
+        )
+
+        engine.list_citations.assert_called_once_with(verification_status="failed")
+        assert captured, "LLM was never called"
+        pair = [m for m in captured[0] if is_citation_feedback_injection_message(m)]
+        assert len(pair) == 2
+        # Durable history must NOT carry the ephemeral injection.
+        assert not any(is_citation_feedback_injection_message(m) for m in messages)
+
+    @pytest.mark.asyncio
+    async def test_no_engine_skips_query_and_injection(self):
+        """No citation engine on the context → no query, no injection, no error."""
+        from src.core.citation_feedback_injection import (
+            is_citation_feedback_injection_message,
+        )
+
+        tool_ctx = MagicMock()
+        tool_ctx.citation_engine = None  # not yet created (no citation activity)
+
+        captured: List[List[BaseMessage]] = []
+        messages = [SystemMessage(content="sys"), HumanMessage(content="hi")]
+
+        result = await _execute_turn(
+            llm_with_tools=_capturing_llm(captured, _make_llm_response("done")),
+            tool_map={},
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
+            messages=messages,
+            callbacks=_make_callbacks(),
+            llm_timeout=600,
+            auxiliary_llm=None,
+            config=_make_config(),
+            tool_context=tool_ctx,
+        )
+
+        assert result.error is None
+        assert captured
+        assert not any(is_citation_feedback_injection_message(m) for m in captured[0])
+
+    @pytest.mark.asyncio
+    async def test_no_failed_citations_no_injection(self):
+        """Engine present but nothing failed → no feedback pair."""
+        from src.core.citation_feedback_injection import (
+            is_citation_feedback_injection_message,
+        )
+
+        engine = MagicMock()
+        engine.list_citations = AsyncMock(return_value=[])
+        tool_ctx = MagicMock()
+        tool_ctx.citation_engine = engine
+
+        captured: List[List[BaseMessage]] = []
+        messages = [SystemMessage(content="sys"), HumanMessage(content="hi")]
+
+        await _execute_turn(
+            llm_with_tools=_capturing_llm(captured, _make_llm_response("done")),
+            tool_map={},
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
+            messages=messages,
+            callbacks=_make_callbacks(),
+            llm_timeout=600,
+            auxiliary_llm=None,
+            config=_make_config(),
+            tool_context=tool_ctx,
+        )
+
+        engine.list_citations.assert_called_once_with(verification_status="failed")
+        assert not any(is_citation_feedback_injection_message(m) for m in captured[0])
+
+    @pytest.mark.asyncio
+    async def test_retrieval_timeout_is_non_fatal(self):
+        """A timeout/error fetching failed citations must not kill the turn."""
+        engine = MagicMock()
+        engine.list_citations = AsyncMock(side_effect=asyncio.TimeoutError)
+        tool_ctx = MagicMock()
+        tool_ctx.citation_engine = engine
+
+        captured: List[List[BaseMessage]] = []
+        messages = [SystemMessage(content="sys"), HumanMessage(content="hi")]
+
+        result = await _execute_turn(
+            llm_with_tools=_capturing_llm(captured, _make_llm_response("done")),
+            tool_map={},
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
+            messages=messages,
+            callbacks=_make_callbacks(),
+            llm_timeout=600,
+            auxiliary_llm=None,
+            config=_make_config(),
+            tool_context=tool_ctx,
+        )
+
+        assert result.error is None
+
+
+# ---------------------------------------------------------------------------
 # 1.6 _execute_turn — context compaction
 # ---------------------------------------------------------------------------
 
