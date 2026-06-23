@@ -63,14 +63,76 @@ jobs:
             || { echo "::error::ARG PLAYWRIGHT_VERSION default in docker/Dockerfile.workspace does not match .playwright-version (${PIN})"; exit 1; }
           grep -q "^PLAYWRIGHT_VERSION=${PIN}$" .env.example \
             || { echo "::error::PLAYWRIGHT_VERSION in .env.example does not match .playwright-version (${PIN})"; exit 1; }
+
+  # ---------------------------------------------------------------------------
+  # Chart correctness gates (Phase 1) — render matrix + schema validation.
+  # Full-power branch: always runs, every step is a hard gate. Distinct from
+  # generator-test, which gates the website config-generator's output.
+  # ---------------------------------------------------------------------------
+  chart-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario:
+          - test
+          - customer-external
+          - eval
+          - vm
+    steps:
+      - uses: actions/checkout@v4
+
       - name: Install Helm
         uses: azure/setup-helm@v4
         with:
           version: v3.17.0
-      - name: Helm lint (home cluster scenario)
-        run: helm lint helm/ -f helm/ci/test-values.yaml
-      - name: Helm lint (customer external-services scenario)
-        run: helm lint helm/ -f helm/ci/customer-external-values.yaml
+
+      - name: Install kubeconform
+        run: |
+          curl -fsSL https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz \
+            | sudo tar -xz -C /usr/local/bin kubeconform
+          kubeconform -v
+
+      - name: Helm lint (${{ matrix.scenario }})
+        run: helm lint helm/ -f helm/ci/${{ matrix.scenario }}-values.yaml
+
+      - name: Render + kubeconform (${{ matrix.scenario }})
+        run: |
+          helm template srw helm/ -f helm/ci/${{ matrix.scenario }}-values.yaml \
+            | kubeconform \
+                -kubernetes-version 1.28.0 \
+                -ignore-missing-schemas \
+                -schema-location default \
+                -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
+                -summary
+
+  # ---------------------------------------------------------------------------
+  # Schema negative test — proves values.schema.json rejects bad input. A
+  # deliberately-invalid values file MUST make `helm template` fail. Hard gate.
+  # ---------------------------------------------------------------------------
+  chart-schema-negative:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.17.0
+
+      - name: Assert invalid values are rejected by the schema
+        run: |
+          if helm template srw helm/ -f helm/ci/invalid-values.yaml >/dev/null 2>&1; then
+            echo "::error::helm/ci/invalid-values.yaml rendered successfully — values.schema.json is not rejecting it. The schema has stopped validating."
+            exit 1
+          fi
+          echo "OK: invalid-values.yaml was correctly rejected by values.schema.json"
 
   # ---------------------------------------------------------------------------
   # Config-generator drift-gate (website/). Always-run, hard gate on the release
@@ -946,7 +1008,7 @@ jobs:
   # ---------------------------------------------------------------------------
   release-chart:
     name: Package and publish Helm chart
-    needs: [resolve-version, build-agent, build-orchestrator, build-cockpit, build-mcp, build-workspace, build-vm-controller, build-agent-vm-base]
+    needs: [resolve-version, build-agent, build-orchestrator, build-cockpit, build-mcp, build-workspace, build-vm-controller, build-agent-vm-base, chart-test]
     if: >-
       always() && !cancelled() &&
       github.event_name == 'push' &&
@@ -956,7 +1018,8 @@ jobs:
       needs.build-cockpit.result == 'success' &&
       needs.build-mcp.result == 'success' &&
       needs.build-agent-vm-base.result == 'success' &&
-      !contains(needs.build-workspace.result, 'failure')
+      !contains(needs.build-workspace.result, 'failure') &&
+      needs.chart-test.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
