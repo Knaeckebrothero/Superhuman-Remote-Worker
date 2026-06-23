@@ -94,18 +94,82 @@ jobs:
             || { echo "::error::PLAYWRIGHT_VERSION in .env.example does not match .playwright-version (${PIN})"; exit 1; }
         continue-on-error: true
 
+  # ---------------------------------------------------------------------------
+  # Chart correctness gates (Phase 1) — render matrix + schema validation.
+  # Runs only when helm/ changed. Lint is advisory (soft); render + kubeconform
+  # are HARD — a chart that won't render or validate is deploy-breaking, and
+  # this branch publishes + deploys the srw-dev chart. Distinct from
+  # generator-test, which gates the website config-generator's output.
+  # ---------------------------------------------------------------------------
+  chart-test:
+    needs: changes
+    if: needs.changes.outputs.chart == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario:
+          - test
+          - customer-external
+          - eval
+          - vm
+    steps:
+      - uses: actions/checkout@v4
+
       - name: Install Helm
         uses: azure/setup-helm@v4
         with:
           version: v3.17.0
 
-      - name: Helm lint (home cluster scenario)
-        run: helm lint helm/ -f helm/ci/test-values.yaml
+      - name: Install kubeconform
+        run: |
+          curl -fsSL https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz \
+            | sudo tar -xz -C /usr/local/bin kubeconform
+          kubeconform -v
+
+      - name: Helm lint (${{ matrix.scenario }})
+        run: helm lint helm/ -f helm/ci/${{ matrix.scenario }}-values.yaml
         continue-on-error: true
 
-      - name: Helm lint (customer external-services scenario)
-        run: helm lint helm/ -f helm/ci/customer-external-values.yaml
-        continue-on-error: true
+      - name: Render + kubeconform (${{ matrix.scenario }})
+        run: |
+          helm template srw helm/ -f helm/ci/${{ matrix.scenario }}-values.yaml \
+            | kubeconform \
+                -kubernetes-version 1.28.0 \
+                -ignore-missing-schemas \
+                -schema-location default \
+                -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
+                -summary
+
+  # ---------------------------------------------------------------------------
+  # Schema negative test — proves values.schema.json rejects bad input. A
+  # deliberately-invalid values file MUST make `helm template` fail. Hard gate.
+  # ---------------------------------------------------------------------------
+  chart-schema-negative:
+    needs: changes
+    if: needs.changes.outputs.chart == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.17.0
+
+      - name: Assert invalid values are rejected by the schema
+        run: |
+          if helm template srw helm/ -f helm/ci/invalid-values.yaml >/dev/null 2>&1; then
+            echo "::error::helm/ci/invalid-values.yaml rendered successfully — values.schema.json is not rejecting it. The schema has stopped validating."
+            exit 1
+          fi
+          echo "OK: invalid-values.yaml was correctly rejected by values.schema.json"
 
   # ---------------------------------------------------------------------------
   # CodeQL — static analysis for security vulnerabilities
@@ -1237,12 +1301,14 @@ jobs:
       - build-workspace
       - build-vm-controller
       - build-agent-vm-base
+      - chart-test
     if: >-
       always() && !cancelled() &&
       github.event_name == 'push' &&
       needs.dependency-audit.result == 'success' &&
       !contains(needs.test-python.result, 'failure') &&
-      !contains(needs.test-cockpit.result, 'failure')
+      !contains(needs.test-cockpit.result, 'failure') &&
+      !contains(needs.chart-test.result, 'failure')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
