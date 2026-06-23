@@ -138,9 +138,14 @@ async def _resolve_from_cookie(session_id: str, db) -> dict | None:
     cookie gets cleared via the standard /auth/me round-trip.
 
     Refreshes the stored access token mid-session when it's within
-    ``SRW_ACCESS_TOKEN_REFRESH_SKEW_S`` of expiry. A refresh failure
-    (KC down, refresh token revoked) deletes the session row and
-    returns None.
+    ``SRW_ACCESS_TOKEN_REFRESH_SKEW_S`` of expiry, and re-validates with
+    Keycloak (the same refresh) once the session has been idle past
+    ``SRW_SESSION_IDLE_TIMEOUT_S`` rather than deleting it: the BFF session
+    is a renewable lease over the KC SSO session, so an idle-but-still-valid
+    session is renewed instead of force-logging the user out (which would
+    lose unsent work). A refresh failure (KC down, SSO ended, refresh token
+    revoked) deletes the session row and returns None. The absolute lifetime
+    cap remains a hard stop with no refresh attempt.
     """
     sess = await db.get_srw_session(session_id)
     if not sess:
@@ -150,12 +155,24 @@ async def _resolve_from_cookie(session_id: str, db) -> dict | None:
         # Past absolute lifetime — refresh attempts would just bounce.
         await db.delete_srw_session(session_id)
         return None
-    if sess["last_seen_at"] + _idle_timeout() <= now:
-        await db.delete_srw_session(session_id)
-        return None
-
+    # Idle OR access token near expiry → re-validate with Keycloak by
+    # refreshing in place. On idle this proves the SSO session is still alive
+    # instead of blind-deleting a session KC still considers valid: the idle
+    # window becomes a re-validation checkpoint, not a logout, so an idle user
+    # stops being force-logged-out (and losing unsent work) mid-session. A
+    # genuine KC rejection (SSO ended / refresh token revoked) deletes the row
+    # inside _refresh_session_in_place and returns None → clean re-login.
+    #
+    # CONCURRENCY INVARIANT: a tab refocus can fan out several requests that all
+    # hit this branch and refresh with the SAME refresh_token. That is safe ONLY
+    # while Keycloak refresh-token rotation is OFF (revokeRefreshToken=false — the
+    # realm default and our config in helm/ + HomeLab). Do NOT enable rotation
+    # without first serializing refresh per session (asyncio.Lock keyed by
+    # session_id, re-reading the row inside the lock).
     access_token = sess["access_token"]
-    if sess["access_expires_at"] - now <= _refresh_skew():
+    idle_expired = sess["last_seen_at"] + _idle_timeout() <= now
+    near_expiry = sess["access_expires_at"] - now <= _refresh_skew()
+    if idle_expired or near_expiry:
         access_token = await _refresh_session_in_place(sess, db)
         if access_token is None:
             return None
@@ -212,6 +229,15 @@ async def _refresh_session_in_place(sess: dict, db) -> str | None:
         access_expires_at=new_access_expires_at,
         id_token=tokens.get("id_token"),
     )
+    # Keep the in-memory session authoritative for the rest of this request —
+    # the caller still reads sess["id_token"] (and may read other token fields)
+    # after we return. Without this, an idle-triggered refresh would leave the
+    # stale id_token in sess for the downstream identity-claim merge.
+    sess["access_token"] = access_token
+    sess["refresh_token"] = refresh_token
+    sess["access_expires_at"] = new_access_expires_at
+    if tokens.get("id_token"):
+        sess["id_token"] = tokens["id_token"]
     return access_token
 
 
