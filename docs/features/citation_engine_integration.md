@@ -54,7 +54,7 @@ The feature set and the verification approach are unchanged.
 | **3a** | Cloud anchor capture (D7, agent-side): `webdav_read` captures the snapshot-anchor (etag, raw-bytes `file_sha256`, `webdav_url`, backend); `cite_document` threads it onto the source's `metadata.cloud` (JSONB — no migration) | ✅ shipped + k3d-verified |
 | **3b** | Original-bytes snapshot: `POST /api/citations/snapshot` (internal-key) persists the raw file to `srw-snapshots` content-addressed (`citations/<sha[:2]>/<sha>`, HEAD-dedup) → `snapshot_blob_key` on `metadata.cloud`; agent uploads via `OrchestratorClient` at cite-time (it has no S3 creds) | ✅ shipped + k3d-verified |
 | **3c** | On-view drift check + view-original: `GET /api/citations/{id}/drift` (viewing-user auth) re-fetches the live source via MainCloud **only when it's provably under the viewer's own cloud home**, hash-compares → `unchanged`/`changed`/`unreachable`; `GET /api/citations/{id}/snapshot` streams the backup via `get_blob`; cockpit UI deferred | ✅ shipped + k3d-verified |
-| **4** | **Inline citation usage** — agent skill (`cite-as-you-write`, `before_tool:cite_*` enforced) so claims are referenced inline as `[N]`, + cockpit `[N]`→hover-source rendering | 🚧 greenlit 2026-06-23; Half A building, Half B specified |
+| **4** | **Inline citation usage** — interactive-prompt citation mandate (conditional on `has_tool`) + `cite-as-you-write` skill (`before_tool:cite_*` enforced) so claims are cited inline as `[N]`==citation_id; + cockpit `[N]`→hover-source rendering | Half A ✅ built + k3d-verified 2026-06-23 (Gemini: gate→`cite_web`→verified citation→`[21]`); Half B specified |
 
 Verified by the gated async Postgres round-trip
 (`tests/citation_engine/test_integration_postgres.py`, 6/6 vs the dev
@@ -488,9 +488,10 @@ Phase 3c — on-view drift check + view-original (done):
 
 ## Phase 4 — Inline citation usage (skill + cockpit rendering)
 
-*Greenlit 2026-06-23. Half A (agent skill) building; Half B (cockpit rendering)
-specified, not started. This is **usage + UX**, not plumbing — Phases 1–3 made
-citations real; Phase 4 makes them reach the reader.*
+*Greenlit 2026-06-23. Half A (agent cites inline) ✅ built + k3d-verified
+2026-06-23; Half B (cockpit rendering) specified, not started. This is
+**usage + UX**, not plumbing — Phases 1–3 made citations real; Phase 4 makes them
+reach the reader.*
 
 **Problem (observed).** In a live persistent session (2026-06-23) the assistant
 searched the web 7×, extracted a page, and called `cite_web` 4× — then wrote its
@@ -513,43 +514,65 @@ renumbered 1..k in order of appearance**, with the popup keyed off the real
 record. This dissolves the numbering problem and links prose → real citation rows
 (→ later, Phase 3 snapshot/drift).
 
-### Half A — agent cites inline, reliably (building)
+### Half A — agent cites inline, reliably ✅ built + k3d-verified 2026-06-23
 
-- **New bundled skill `cite-as-you-write`**
-  (`config/skills/cite-as-you-write/SKILL.md`): when a claim rests on a source,
-  cite it → take the `[N]` the tool returns → append it to the exact sentence the
-  source supports → carry every marker into the final answer. Names the exact
-  failure mode ("an uncited citation is invisible to the reader"). House style of
-  `verify-before-done`.
-- **Binding — `before_tool:cite_web` + `before_tool:cite_document`,
-  `enforce: true`.** This is the *only* trigger that fires in persistent sessions:
-  `phase:*` never fires there (no phase loop — `src/persistent_graph.py` never
-  calls `get_phase_instruction_files()`), and `before_tool` + `enforce:false`
-  (active inject) has no injector in the persistent turn loop. `enforce:true`
-  (read-before-tool gate, the `todo-guide` pattern) works in **both** worker and
-  persistent; reading happens just before the first cite, so the guidance is in
-  context exactly when it's needed. Bound skills are intentionally filtered out of
-  the model-invoked menu (no redundancy) — the enforced binding *is* the delivery.
-- **Placement** (instruction-file lists are replace-on-override —
-  `deep_merge`, `loader.py:179`): `config/defaults.yaml` (covers non-overriding
-  workers), re-declared in `config/experts/scholar/config.yaml` (the worker
-  citation user, which overrides `instruction_files`), and a new block in
-  `config/experts/assistant/config.yaml` (the default persistent agent — the
-  session in the screenshot; persistent experts opt in individually since
-  `persistent_defaults.yaml` omits `instruction_files` by convention).
-- **Flag-safe.** Bound-skill content is frozen into `_resolved_instructions`
-  directly from `config/skills/<name>/SKILL.md` at dispatch — *flag-independent*
-  (`loader.py:4302-4312`), unlike the `SKILLS_DB_ENABLED`-gated discovery menu. So
-  this works in every environment, exactly like `todo-guide`. (The only soft-lock
-  risk is a missing/unparseable `SKILL.md` — then the enforce gate would reject the
-  cite tool forever; mitigated by shipping a valid skill + the k3d verify.)
-- **Reinforce the base instruction** (`config/prompts/instructions.md`
-  §Citations) — strengthen the one-liner the agent is currently skipping (worker
-  prompt; the skill carries the persistent side).
-- **Honest limit.** The enforced binding guarantees the *guidance is present*
-  whenever the agent cites; it can't guarantee the model weaves every marker into
-  the final prose. This is LLM compliance — Phase 4 moves the odds a lot, not to
-  certainty.
+**Two delivery layers, both required.** The live test proved the skill binding
+alone is *not* enough: a bound skill is invisible until `cite_web` is called, so it
+can teach the *how* of citing but can't drive the *decision* to cite. The agent
+needs an always-on instruction too.
+
+- **Driver — a conditional `<citations>` block in the interactive system prompt**
+  (`config/prompts/systemprompt_interactive.txt` + the `_deepseek` / `_glm` /
+  `_gpt_5` variants), guarded by
+  `{% if has_tool("cite_web") or has_tool("cite_document") %}` so it appears **only
+  when the session actually has the citation tools**. This mandates `cite_web` /
+  `cite_document` and forbids hand-written `[N]` / "Sources" lists — it's what
+  makes the agent *decide* to cite. The interactive prompt receives `tool_names`
+  (`persistent_session.py` builds the prompt after `_setup_tools`), so the
+  `has_tool` conditional renders (`render_instruction_content`, `loader.py:945`).
+  Worker side already had the equivalent via `instructions.md` §Citations
+  (strengthened here) + `research-guide`.
+- **The "how" — bundled skill `cite-as-you-write`**
+  (`config/skills/cite-as-you-write/SKILL.md`) bound `before_tool:cite_web` +
+  `before_tool:cite_document`, `enforce:true` in `config/defaults.yaml`,
+  `scholar`, and `assistant`. `before_tool` is the only trigger that fires in
+  persistent sessions (`phase:*` never fires; `before_tool` `enforce:false` has no
+  persistent injector). When the agent calls `cite_web`, the gate forces it to read
+  the skill first — so the placement/discipline guidance lands exactly when citing.
+  Flag-independent (frozen into `_resolved_instructions`, `loader.py:4302`), works
+  in every environment. Lists are replace-on-override (`deep_merge`,
+  `loader.py:179`), so it's re-declared per overriding expert.
+
+**Two mechanism bugs found + fixed during k3d verification** (the gate was armed in
+*theory* but inert in *fact*; both have regression tests):
+1. **Async enforcement** — `apply_instruction_enforcement` wrapped only a tool's
+   sync `.func`, but `cite_web`/`cite_document` are `async` (invoked via
+   `.coroutine`/`.ainvoke`), so the gate was a silent no-op. Now wraps `.coroutine`
+   too (`registry.py`). The shipped `todo-guide` worked only because
+   `next_phase_todos` is sync.
+2. **Bound-skill deploy in sessions** — `persistent_session._deploy_instruction_files`
+   early-returned when `_deployment_dir` is `None` (always true for sessions), so
+   the skill file never deployed → the gate required reading a missing file →
+   `cite_web` *bricked*. The `_deployment_dir` guard now gates only literal `file:`
+   entries.
+
+**Verified end-to-end on k3d (2026-06-23):** a real autonomous session on a
+tool-capable model (Gemini) ran `web_search → cite_web → read_file → cite_web`
+(the gate firing: blocked → read skill → cite), wrote a **verified** citation to
+`srw_vector` (`id=21`, real source URL, status `verified` via the Phase-2a aux
+verifier), and answered with `... in 2009 [21].` where the marker **equals the
+citation_id** — the exact contract Half B resolves.
+
+**Model-capability limit (important).** A weak model
+(`RedHatAI/gemma-4-31B`, the dev session default) **will not call `cite_web` even
+when the prompt mandates it** — it complies with the *format* (self-authored,
+sometimes hallucinated `[N]`) but skips the *tool*, writing zero engine citations.
+No prompt strengthening fixed this (you can't force a specific tool call via prompt
+alone). The wiring is correct end-to-end; **engine-backed citations in sessions
+require a session model with solid tool-use.** Dev currently enables only gemma (a
+`google` key exists but no Gemini is registered), so the verification used a
+per-session `model` override to Gemini. Implication: the session default model must
+be tool-capable for this to pay off in normal use.
 
 ### Half B — cockpit renders `[N]` as hover popups (specified, not started)
 
@@ -590,18 +613,21 @@ citation tools in practice, de-risking the real auto-binding design later.
 
 ### Acceptance criteria
 
-- **A1:** `cite-as-you-write` parses (`parse_skill_md`) and is bound
-  `before_tool:cite_*` enforced in `defaults` + `scholar` + `assistant`. On k3d:
-  in a persistent session the gate fires (the agent must read the skill before its
-  first cite) and the assistant's answer carries `[N]` markers tied to the
-  citations it created.
+- **A1 ✅ (met 2026-06-23):** `cite-as-you-write` parses + validates and is bound
+  `before_tool:cite_*` enforced in `defaults` + `scholar` + `assistant`; the
+  interactive prompt mandates citing (conditional on `has_tool`). On k3d, a
+  tool-capable session (Gemini): the gate fires (`cite_web` → read skill →
+  `cite_web`), a **verified** citation lands in `srw_vector`, and the answer
+  carries `[N]` markers == the citation ids. Caveat: requires a tool-capable
+  session model — the weak dev default (gemma) self-authors `[N]` and never calls
+  `cite_web`.
 - **B1:** `GET /api/persistent/threads/{tid}/citations` returns the owner's
   session citations (200), and 403/404s for non-owners.
 - **B2:** the cockpit renders `[<id>]` in assistant messages as superscript
   markers with a working source popup; the dead `【…】` path is removed or
   repointed.
 
-*(Half A is the current build target.)*
+*(Half A ✅ done; Half B is the next build target.)*
 
 ## Follow-ups (deferred — not greenlit)
 

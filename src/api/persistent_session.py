@@ -474,14 +474,22 @@ class PersistentSession:
             self.workspace_manager.write_file(ws_path, content)
             logger.debug(f"Deployed skill file to workspace: {ws_path}")
 
-        if not self.config.instruction_files or not self.config._deployment_dir:
+        if not self.config.instruction_files:
             return
 
-        templates_dir = get_project_root() / "config" / "templates"
-        file_resolver = FileResolver(
-            deployment_dir=self.config._deployment_dir,
-            framework_dir=templates_dir,
-        )
+        # file_resolver is only needed for literal ``file:`` instruction entries
+        # (loaded from the deployment/templates dir). Bound ``skill:`` entries come
+        # from the frozen ``_resolved_instructions`` blob and need no deployment
+        # dir — so DON'T gate the whole loop on ``_deployment_dir`` (which is None
+        # for sessions), or bound skills silently fail to deploy and their
+        # ``before_tool`` enforce gate bricks the tool (the cite-as-you-write case).
+        file_resolver = None
+        if self.config._deployment_dir:
+            templates_dir = get_project_root() / "config" / "templates"
+            file_resolver = FileResolver(
+                deployment_dir=self.config._deployment_dir,
+                framework_dir=templates_dir,
+            )
         for entry in self.config.instruction_files:
             try:
                 if entry.skill:
@@ -507,6 +515,12 @@ class PersistentSession:
                 # Skip if already present (don't overwrite on session resume)
                 target_path = self.workspace_manager.get_path(entry.file)
                 if target_path.exists():
+                    continue
+                if file_resolver is None:
+                    logger.warning(
+                        f"Cannot deploy instruction file {entry.file}: "
+                        "no deployment dir"
+                    )
                     continue
                 content = file_resolver.load(Path(entry.file).name)
                 content = render_instruction_content(content, [])
