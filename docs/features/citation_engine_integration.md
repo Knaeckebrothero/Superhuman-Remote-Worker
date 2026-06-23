@@ -88,8 +88,9 @@ flat-`PYTHONPATH` subpackage, **not** a pip/`pyproject` package, to match the re
 
 **Deferred follow-ons** (none are defects — all were explicitly scoped out of
 Phases 1–3): a cockpit citations view, a full real-cloud agent-job e2e,
-persistent-session feedback injection, semantic chunking behind an async chunker,
-and the `oc:fileid` durable cloud link. They're enumerated with rationale,
+semantic chunking behind an async chunker, and the `oc:fileid` durable cloud
+link (persistent-session feedback injection shipped 2026-06-23). They're
+enumerated with rationale,
 integration points, and rough effort in *Follow-ups (deferred — not greenlit)*
 below. Per-phase detail + acceptance criteria are in *Phasing & acceptance
 criteria*; the original design rationale (Motivation / Design) is kept as the
@@ -402,12 +403,21 @@ persistent deferred**:
   `list_citations(failed)` → `format_failed_citations`) + unit tests for the
   injection helpers + the 66-test graph suite; a full live agent-job run is the
   remaining end-to-end check.
-- **Deferred — persistent-session feedback injection.** Persistent sessions
-  already *verify* citations (2a wired `verify_aux` on their ToolContext), but
-  their turn messages are assembled via the MemoryManager seam, not the worker's
-  `_inject_transient_messages`, so the feedback injection there is a separate,
-  clean follow-on. (The cockpit reader shipped as inline `[N]` rendering in
-  Phase 4 Half B.)
+- **Persistent-session feedback injection — ✅ shipped + k3d-verified
+  2026-06-23.** Persistent sessions already *verified* citations (2a wired
+  `verify_aux` on their ToolContext); the D4 *feedback* now fires there too,
+  mirroring the worker. `_execute_turn` (`src/persistent_graph.py`) re-reads
+  `verification_status` once per turn (job-scoped `list_citations(failed)`, 5 s
+  timeout guard) and `_inject_context_pairs` appends the synthetic
+  `check_citation_verification` pair after memory/knowledge — a **direct**
+  injection, *not* via the MemoryManager (which only renders memory/knowledge
+  kinds, and the worker injects citation feedback directly too). No
+  summarization-exclusion wiring needed: the pair rides the ephemeral per-call
+  `prepared` copy (compaction runs on the durable list first), so it never enters
+  history or a summary. k3d: a Gemini session cited → the citation was forced to
+  `failed` → next turn the agent saw the injected feedback, called `edit_citation`
+  (reset → `pending`), self-resolving the loop. (The cockpit reader shipped as
+  inline `[N]` rendering in Phase 4 Half B.)
 
 **Phase 3 — Cloud citations** — split into **3a (✅ shipped + k3d-verified
 2026-06-20)**, **3b (✅ shipped + k3d-verified 2026-06-20)**, and **3c (✅
@@ -616,9 +626,10 @@ display, with a source popover:
 ### Relationship to the deferred follow-ups
 
 Phase 4 **absorbs the user-visible core of Follow-up ①** (citations surface
-inline, in the chat, rather than only in a separate panel) and is the natural
-carrier for **Follow-up ③** (persistent feedback) — both now need the persistent
-citation read path. ② becomes the way to exercise the Half-B v2 drift badge. ④/⑤
+inline, in the chat, rather than only in a separate panel). **Follow-up ③**
+(persistent feedback) then shipped 2026-06-23 — a direct injection in
+`src/persistent_graph.py` mirroring the worker (it did *not* need Phase 4's read
+path after all). ② becomes the way to exercise the Half-B v2 drift badge. ④/⑤
 are unaffected. Binding the skill to the cite tools is also a **manual preview of
 the deferred "toolset → auto-skill" idea**: the skill now travels with the
 citation tools in practice, de-risking the real auto-binding design later.
@@ -678,19 +689,30 @@ needs a cited file under the viewing user's own cloud home). *Effort:* low-code,
 high-setup (a real-cloud session + a deliberately-wrong citation to trip the
 verifier). *Same e2e bar deferred since 2b/3a.*
 
-### 3. Persistent-session feedback injection
+### 3. Persistent-session feedback injection — ✅ SHIPPED + k3d-verified 2026-06-23
 
-> **Carried by Phase 4** — the persistent citation read path Phase 4 Half B adds
-> is the same seam this needs; do it alongside Half B.
+> **Done.** Implemented as a **direct** injection in `_execute_turn` /
+> `_inject_context_pairs` (`src/persistent_graph.py`), mirroring the worker —
+> **not** routed through the MemoryManager seam as first assumed. The manager
+> only renders memory/knowledge kinds, and the worker also injects citation
+> feedback directly, so the faithful integration point is the persistent
+> turn-assembly site where memory/knowledge get injected. Reuses
+> `format_failed_citations` + `create_citation_feedback_injection_messages` from
+> `src/core/citation_feedback_injection.py` (no new injection logic).
 
-Persistent sessions already **verify** citations (2a wired `verify_aux` onto their
-ToolContext), but the D4 *feedback* injection is worker-only — it lives in
-`graph.py::_inject_transient_messages`, whereas persistent sessions assemble turn
-messages through the MemoryManager seam (`src/services/memory/manager.py`).
-Routing the still-`failed`-citation block through that seam is a clean, contained
-follow-on. *Effort:* small. *Plugs into:*
-`src/core/citation_feedback_injection.py` (reuse `format_failed_citations`) + the
-MemoryManager turn-assembly seam.
+Persistent sessions already **verified** citations (2a wired `verify_aux` onto
+their ToolContext); the D4 *feedback* injection had been worker-only (it lives in
+`graph.py::_inject_transient_messages`). Now `src/persistent_graph.py` runs the
+same DB-driven, job-scoped retrieval once per turn (`list_citations(failed)`, 5 s
+timeout) and injects the still-`failed` block alongside memory/knowledge, on the
+ephemeral per-call copy (so it never enters durable history or a summary —
+no exclusion wiring, unlike the worker). *Effort (actual):* small, as estimated.
+**Verified:** 6 unit tests (`TestCitationFeedbackInjectionUnit` +
+`TestExecuteTurnCitationFeedback` in `tests/test_persistent_graph.py`) + a live
+k3d run — a Gemini session cited, the citation was forced to `failed`, and the
+next turn the agent edited it (`failed` → `pending`), closing the
+inject → fix → re-verify loop (agent log `Citation feedback: 1 failed
+citation(s) to surface`, `persistent_graph.py:981`).
 
 ### 4. Semantic chunking behind an async chunker
 A deliberate Phase 1 deviation: `SemanticChunker` needs a *sync* embedder, so
@@ -732,9 +754,10 @@ shipped in Phase 4 Half B.
 
 **Deferred (out of scope for this integration):** consolidated in *Follow-ups
 (deferred — not greenlit)* above — the real-cloud
-agent-job e2e, persistent-session feedback injection, async semantic chunking,
-the `oc:fileid` durable link, and the Half-B v2 cockpit view-original/drift
-badge. (Phase 4 shipped the agent-cites-inline + cockpit `[N]` rendering halves.)
+agent-job e2e, async semantic chunking, the `oc:fileid` durable link, and the
+Half-B v2 cockpit view-original/drift badge. (Phase 4 shipped the
+agent-cites-inline + cockpit `[N]` rendering halves; persistent-session feedback
+injection shipped 2026-06-23.)
 
 **Resolved (now D7):** the cloud-document reference model — snapshot-as-anchor
 (save text + blob, best-effort pointer, on-view drift check). The earlier

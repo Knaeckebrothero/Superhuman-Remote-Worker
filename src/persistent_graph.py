@@ -82,14 +82,16 @@ def _inject_context_pairs(
     manager_injection: List[BaseMessage],
     memory_block: str,
     knowledge_block: str,
+    citation_feedback_block: str = "",
 ) -> int:
-    """Insert transient memory/knowledge context pairs into ``prepared``.
+    """Insert transient memory/knowledge/citation context pairs into ``prepared``.
 
     Mutates ``prepared`` in place and returns the number of messages inserted.
     The pairs are anchored immediately after the first user turn (see
     ``_injection_anchor_index``) so the history stays valid for providers that
-    enforce function-call turn ordering (Gemini). Memory and knowledge
-    injection failures are non-fatal — the turn proceeds without that context.
+    enforce function-call turn ordering (Gemini). Memory, knowledge, and
+    citation-feedback injection failures are non-fatal — the turn proceeds
+    without that context.
 
     The same message objects may be reused across inner-loop iterations; pair
     ids are only prefix-checked downstream.
@@ -127,6 +129,22 @@ def _inject_context_pairs(
             injected_count += 2
         except Exception as e:
             logger.warning(f"Knowledge injection failed (non-fatal): {e}")
+
+    if citation_feedback_block:
+        try:
+            from .core.citation_feedback_injection import (
+                create_citation_feedback_injection_messages,
+            )
+
+            cit_ai, cit_tool = create_citation_feedback_injection_messages(
+                citation_feedback_block
+            )
+            # After memory/knowledge — matches the worker injection order.
+            prepared.insert(base_inject_idx + injected_count, cit_ai)
+            prepared.insert(base_inject_idx + injected_count + 1, cit_tool)
+            injected_count += 2
+        except Exception as e:
+            logger.warning(f"Citation feedback injection failed (non-fatal): {e}")
 
     return injected_count
 
@@ -816,6 +834,7 @@ async def _execute_turn(
     # --- Memory retrieval (once per turn, before the inner loop) ---
     memory_block = ""
     knowledge_block = ""
+    citation_feedback_block = ""
 
     # Memory/knowledge retrieval with timeout — must never block the LLM call
     _RETRIEVAL_TIMEOUT = 5  # seconds
@@ -940,6 +959,40 @@ async def _execute_turn(
                 e,
             )
 
+    # Citation verification feedback (Phase 2b / D4 — persistent parity with the
+    # worker's _inject_transient_messages): surface still-failed citations so the
+    # agent can correct them. DB-driven and job-scoped (list_citations defaults to
+    # this session's job_id == thread_id), recomputed once per turn so it
+    # self-resolves — editing a citation resets it to pending → re-verifies →
+    # drops out next turn. Only runs after citation activity (the engine is lazily
+    # created on first cite/source registration). Injected on the ephemeral
+    # per-call copy below, so it never enters the durable history or a summary.
+    _cit_engine = (
+        getattr(tool_context, "citation_engine", None) if tool_context else None
+    )
+    if _cit_engine is not None:
+        try:
+            _failed_cites = await asyncio.wait_for(
+                _cit_engine.list_citations(verification_status="failed"),
+                timeout=_RETRIEVAL_TIMEOUT,
+            )
+            if _failed_cites:
+                from .core.citation_feedback_injection import format_failed_citations
+
+                citation_feedback_block = format_failed_citations(_failed_cites)
+                logger.debug(
+                    f"Citation feedback: {len(_failed_cites)} failed citation(s) "
+                    "to surface"
+                )
+        except asyncio.TimeoutError:
+            logger.warning("Citation feedback retrieval timed out — skipping injection")
+        except Exception as e:
+            logger.warning(
+                "Citation feedback retrieval failed (non-fatal): %s: %s",
+                type(e).__name__,
+                e,
+            )
+
     while True:
         # Check for interrupt before LLM call
         if callbacks.check_interrupt():
@@ -1041,7 +1094,11 @@ async def _execute_turn(
         # _injection_anchor_index. The same message objects may be reused each
         # inner-loop iteration; pair ids are only prefix-checked downstream.
         _inject_context_pairs(
-            prepared, manager_injection, memory_block, knowledge_block
+            prepared,
+            manager_injection,
+            memory_block,
+            knowledge_block,
+            citation_feedback_block,
         )
 
         # Repair tool-call pairing before the LLM call. Compaction thrash, an
