@@ -7,6 +7,12 @@ discussion in
 [`docs/issues/agent_lifecycle_management.md`](../issues/agent_lifecycle_management.md).
 Not yet implemented.
 
+> **Deferred twice (2026-05-09, 2026-06-12) and still owed.** This refactor is
+> the proper fix for the recurring session-zombie symptom tracked in
+> [`docs/issues/lifecycle_session_agents_without_thread_never_drain.md`](../issues/lifecycle_session_agents_without_thread_never_drain.md)
+> (see its *Deferral log*). A status-repair **stopgap** is being added 2026-06-23
+> to stop the bleeding; it does **not** discharge this work.
+
 ## Problem (summary)
 
 Agents, workspace pods, and VMs are three families of stateful instances

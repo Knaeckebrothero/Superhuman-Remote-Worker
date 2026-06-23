@@ -171,3 +171,170 @@ async def test_stateful_non_reapable_manager_is_skipped(caplog):
     # The VM manager was left entirely alone by the reap path.
     assert mgr.delete_calls == []
     assert report["vm"]["reaped"] == 0
+
+
+# =============================================================================
+# Drift + idle stateful instances must snapshot before any teardown.
+#
+# A drifted instance that has gone idle used to take the bare drift-drain path
+# (drain() == no-snapshot delete() for workspaces/VMs), losing un-snapshotted
+# state. It must instead flow through the snapshot-aware reap path.
+# =============================================================================
+
+
+def _drifted_inst():
+    # version != any expected SHA ⇒ is_drift True (expected set is non-empty).
+    return Instance(kind="workspace", id="ws-1", version="old", bound_to="j1")
+
+
+def _drifted_idle_mgr(inst, **kw):
+    """Reapable manager whose single instance is drifted AND idle — the
+    combination that previously took the no-snapshot bare-drain path."""
+    mgr = _stateful_mgr(inst, **kw)
+    mgr.is_idle = AsyncMock(return_value=True)
+    mgr.expected_versions = AsyncMock(return_value={"new"})
+    return mgr
+
+
+@pytest.mark.asyncio
+async def test_drifted_idle_dirty_reachable_snapshots_before_delete():
+    """Core data-loss regression: drifted + idle + dirty + reachable reapable
+    instance is snapshotted BEFORE delete, via the reap path — never bare-drained."""
+    inst = _drifted_inst()
+    mgr = _drifted_idle_mgr(inst, dirty=True, reachable=True, snapshot_ref="j1")
+    order: list[str] = []
+    mgr.snapshot = AsyncMock(side_effect=lambda i: order.append("snapshot") or "j1")
+    mgr.delete = AsyncMock(side_effect=lambda i, grace_s: order.append("delete"))
+    rec = InstanceLifecycleReconciler([mgr])
+    report = await rec.tick()
+    assert order == ["snapshot", "delete"]
+    mgr.drain.assert_not_called()
+    assert report["workspace"]["reaped"] == 1
+    assert report["workspace"]["drained"] == 0
+
+
+@pytest.mark.asyncio
+async def test_drifted_idle_clean_reapable_deletes_without_snapshot():
+    """Drifted + idle + clean: delete without a wasted snapshot/probe."""
+    mgr = _drifted_idle_mgr(_drifted_inst(), dirty=False)
+    rec = InstanceLifecycleReconciler([mgr])
+    report = await rec.tick()
+    mgr.snapshot.assert_not_called()
+    mgr.is_reachable.assert_not_called()
+    mgr.delete.assert_awaited_once()
+    mgr.drain.assert_not_called()
+    assert report["workspace"]["reaped"] == 1
+    assert report["workspace"]["drained"] == 0
+
+
+@pytest.mark.asyncio
+async def test_drifted_idle_dirty_snapshot_fails_records_attempt_pod_survives():
+    """If the snapshot fails, the pod must survive (record_attempt) — never a
+    bare-drain delete. Strongest anti-data-loss guarantee."""
+    mgr = _drifted_idle_mgr(
+        _drifted_inst(), dirty=True, reachable=True, snapshot_ref=None
+    )
+    rec = InstanceLifecycleReconciler([mgr])
+    report = await rec.tick()
+    mgr.snapshot.assert_awaited_once()
+    mgr.record_attempt.assert_awaited_once()
+    mgr.delete.assert_not_called()
+    mgr.drain.assert_not_called()
+    assert report["workspace"]["reap_attempts"] == 1
+    assert report["workspace"]["drained"] == 0
+
+
+@pytest.mark.asyncio
+async def test_drifted_idle_dirty_unreachable_not_exhausted_records_attempt():
+    """Drifted + idle + dirty + unreachable + retries left: pod survives."""
+    mgr = _drifted_idle_mgr(
+        _drifted_inst(), dirty=True, reachable=False, exhausted=False
+    )
+    rec = InstanceLifecycleReconciler([mgr])
+    await rec.tick()
+    mgr.record_attempt.assert_awaited_once()
+    mgr.give_up.assert_not_called()
+    mgr.delete.assert_not_called()
+    mgr.drain.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_drifted_idle_dirty_unreachable_exhausted_gives_up():
+    """Bounded escape hatch still fires under drift (cannot snapshot forever)."""
+    mgr = _drifted_idle_mgr(
+        _drifted_inst(), dirty=True, reachable=False, exhausted=True
+    )
+    rec = InstanceLifecycleReconciler([mgr])
+    report = await rec.tick()
+    mgr.give_up.assert_awaited_once()
+    mgr.delete.assert_not_called()  # give_up owns the deletion
+    mgr.drain.assert_not_called()
+    assert report["workspace"]["reap_forced"] == 1
+
+
+@pytest.mark.asyncio
+async def test_drifted_idle_reapable_does_not_count_against_drain_cap():
+    """Reapable teardown uses the uncapped reap path: the disruption cap
+    (max(1, n//4)) must never leave a drifted dirty pod bare-drained."""
+    insts = [
+        Instance(kind="workspace", id=f"ws-{i}", version="old", bound_to=f"j{i}")
+        for i in range(8)
+    ]
+    mgr = MagicMock(spec=ReapableInstanceManager)
+    mgr.kind = "workspace"
+    mgr.expected_versions = AsyncMock(return_value={"new"})  # all 8 drift
+    mgr.list_instances = AsyncMock(return_value=insts)
+    mgr.is_healthy = AsyncMock(return_value=True)
+    mgr.is_idle = AsyncMock(return_value=True)
+    mgr.signal_drain_pending = AsyncMock()
+    mgr.is_reapable = AsyncMock(return_value=True)
+    mgr.is_dirty = AsyncMock(return_value=False)  # clean → straight delete
+    mgr.is_reachable = AsyncMock(return_value=False)
+    mgr.attempts_exhausted = AsyncMock(return_value=False)
+    mgr.snapshot = AsyncMock(return_value=None)
+    mgr.delete = AsyncMock()
+    mgr.give_up = AsyncMock()
+    mgr.record_attempt = AsyncMock()
+    rec = InstanceLifecycleReconciler([mgr])
+    report = await rec.tick()
+    assert mgr.delete.await_count == 8  # cap=2, but reap is uncapped → all 8
+    assert report["workspace"]["reaped"] == 8
+    assert report["workspace"]["drained"] == 0
+    mgr.drain.assert_not_called()
+
+
+class _IdleStatefulNonReapable(_StatefulNonReapable):
+    """Stateful-but-not-reapable AND drifted + idle — exercises the
+    snapshot-then-drain contract arm of the drift branch (no real manager
+    ships this shape today, but StatefulInstanceManager promises it)."""
+
+    def __init__(self, instances):
+        super().__init__(instances)
+        self.order: list[str] = []
+
+    async def expected_versions(self):
+        return {"new"}
+
+    async def is_idle(self, inst):
+        return True
+
+    async def snapshot(self, inst):
+        self.order.append("snapshot")
+        return "snap-ref"
+
+    async def drain(self, inst, grace_s):
+        self.order.append("drain")
+
+
+@pytest.mark.asyncio
+async def test_stateful_non_reapable_drifted_idle_snapshots_then_drains():
+    """A StatefulInstanceManager that is NOT reapable still must snapshot
+    before the destructive drain on a drift teardown."""
+    mgr = _IdleStatefulNonReapable(
+        [Instance(kind="vm", id="vm-1", version="old", bound_to="j1")]
+    )
+    rec = InstanceLifecycleReconciler([mgr])
+    report = await rec.tick()
+    assert mgr.order == ["snapshot", "drain"]
+    assert report["vm"]["drained"] == 1
+    assert report["vm"]["reaped"] == 0

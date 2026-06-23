@@ -3006,6 +3006,80 @@ class PostgresDB:
             return int(result.split()[1])
         return 0
 
+    async def reap_orphaned_session_agents(
+        self, grace_minutes: int = 5
+    ) -> List[Dict[str, Any]]:
+        """Find live session agents wedged with no bound thread or job.
+
+        STOPGAP (2026-06-23). Companion to ``mark_stuck_session_agents_ready``
+        for the one case that sweep cannot fix: an agent stuck at
+        ``status='session'`` with ``thread_id IS NULL``. That sweep's predicate
+        requires ``thread_id IS NOT NULL``, so once the binding is gone it can
+        never match. And because the agent re-asserts ``'session'`` on every 5s
+        heartbeat (``persistent_app._heartbeat_status``), flipping the row to
+        ``'ready'`` does not stick — the only actuation that does is deleting
+        the pod. This method returns the pods to delete; the caller
+        (``stale_agent_detector``) issues the K8s delete, after which the row
+        ages to ``offline`` (heartbeat timeout) and is GC'd normally.
+
+        Safe by construction: ``thread_id IS NULL AND current_job_id IS NULL``
+        means the agent holds nothing user-visible. A thread-bound live session
+        keeps ``thread_id`` set and is never selected — this does NOT re-open
+        the 2026-06-10 drift-drain-kills-idle-sessions incident.
+
+        Grace: the orphan state must persist >= ``grace_minutes``. First
+        sighting stamps ``intents.session_orphaned_at = NOW()`` (DB clock); the
+        row is only returned once that stamp is older than the grace. The stamp
+        is cleared as soon as the agent leaves the orphan state (rebound to a
+        thread/job, or flipped ready/offline), so the brief attach window where
+        ``status`` is 'session' before ``thread_id`` is written is never reaped.
+
+        Superseded by the orchestrator intent/observed split in
+        ``docs/features/unified_instance_lifecycle.md``; tracked in
+        ``docs/issues/lifecycle_session_agents_without_thread_never_drain.md``.
+
+        Returns:
+            List of ``{"id": <agent uuid str>, "hostname": <pod name>}`` for
+            pods the caller must delete.
+        """
+        orphan_pred = (
+            "status = 'session' AND thread_id IS NULL AND current_job_id IS NULL"
+        )
+        async with self.acquire() as conn:
+            # Clear the stamp on any row that recovered (rebound to a
+            # thread/job, or left 'session') so a future wedge re-arms the grace.
+            await conn.execute(
+                f"""
+                UPDATE agents
+                SET intents = intents - 'session_orphaned_at'
+                WHERE COALESCE(intents, '{{}}'::jsonb) ? 'session_orphaned_at'
+                  AND NOT ({orphan_pred})
+                """
+            )
+            # Stamp first sighting of the orphan state (DB clock — no app clock).
+            await conn.execute(
+                f"""
+                UPDATE agents
+                SET intents = COALESCE(intents, '{{}}'::jsonb)
+                              || jsonb_build_object('session_orphaned_at', to_jsonb(NOW()))
+                WHERE {orphan_pred}
+                  AND NOT (COALESCE(intents, '{{}}'::jsonb) ? 'session_orphaned_at')
+                """
+            )
+            # Select orphans whose stamp is older than the grace — reap these.
+            rows = await conn.fetch(
+                f"""
+                SELECT id, hostname
+                FROM agents
+                WHERE {orphan_pred}
+                  AND hostname IS NOT NULL
+                  AND (COALESCE(intents, '{{}}'::jsonb) ->> 'session_orphaned_at')::timestamptz
+                      < NOW() - make_interval(mins => $1)
+                """,
+                grace_minutes,
+            )
+        return [{"id": str(row["id"]), "hostname": row["hostname"]} for row in rows]
+
     async def gc_offline_agents(self, retention_hours: int = 24) -> int:
         """Delete agent rows that have been offline longer than the retention.
 
