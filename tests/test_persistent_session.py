@@ -60,6 +60,46 @@ def _make_session(**overrides):
     )
 
 
+class TestDeployBoundSkillWithoutDeploymentDir:
+    """Regression: a bound skill must deploy into a session workspace even when
+    ``config._deployment_dir`` is None.
+
+    Sessions load their config from the frozen blob, which carries no deployment
+    dir. The old ``_deploy_instruction_files`` guard (``or not _deployment_dir``)
+    returned early, so the bound skill file was never written — and its
+    ``before_tool`` enforce gate then bricked the tool (cite_web / cite_document
+    required reading a SKILL.md that did not exist).
+    """
+
+    def test_bound_skill_deploys_when_deployment_dir_none(self, tmp_path):
+        from src.core.loader import InstructionFileEntry
+        from src.core.workspace import WorkspaceManager
+        from tests._fs_backend import FilesystemTestBackend
+
+        cfg = _make_config(
+            extra={
+                "_resolved_skills": {},  # nothing from the catalog path
+                "_resolved_instructions": {"cite-as-you-write": "CITE BODY"},
+            }
+        )
+        cfg._deployment_dir = None  # the session case (frozen-blob config)
+        cfg.instruction_files = [
+            InstructionFileEntry(
+                trigger="before_tool:cite_web", skill="cite-as-you-write"
+            )
+        ]
+        session = _make_session(config=cfg)
+        session.workspace_manager = WorkspaceManager(
+            job_id="t", backend=FilesystemTestBackend(tmp_path)
+        )
+
+        session._deploy_instruction_files()
+
+        path = "skills/cite-as-you-write/SKILL.md"
+        assert session.workspace_manager.get_path(path).exists()
+        assert "CITE BODY" in session.workspace_manager.read_file(path)
+
+
 # ---------------------------------------------------------------------------
 # 2.1 _EXCLUDED_TOOLS constant
 # ---------------------------------------------------------------------------
