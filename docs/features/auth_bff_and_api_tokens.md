@@ -344,7 +344,21 @@ Lifetime knobs (env-tunable; defaults below):
 | Absolute lifetime (anchored to KC refresh TTL) | 30 days | `SRW_SESSION_ABSOLUTE_TIMEOUT_S` |
 | Access-token refresh skew | 60 s | `SRW_ACCESS_TOKEN_REFRESH_SKEW_S` |
 
-The idle timeout is *enforced by the session validator* (`last_seen_at + idle > now()`), not by the cookie's `Max-Age` — the cookie's Max-Age matches absolute lifetime so the browser doesn't drop it early.
+The idle timeout is *enforced by the session validator*, not by the cookie's `Max-Age` — the cookie's Max-Age matches absolute lifetime so the browser doesn't drop it early.
+
+> **Update (2026-06-23) — idle re-validates instead of deleting.** The validator
+> originally *deleted* an idle session (`last_seen_at + idle ≤ now()` → drop row →
+> 401), which force-logged-out idle-but-still-valid users and, on the ensuing
+> full-page redirect, destroyed any unsent cockpit chat draft. It now treats idle
+> as a *re-validation checkpoint*: an idle session is refreshed in place against
+> Keycloak (the same `_refresh_session_in_place` the near-expiry path already
+> uses), so it survives as long as KC's SSO session is alive — the BFF session is a
+> *renewable lease* over the KC SSO session. Only a genuine KC rejection (SSO ended
+> / refresh revoked) or the absolute cap ends it. **Concurrency invariant:** the
+> refresh fan-out a tab refocus can trigger is safe only while Keycloak
+> refresh-token rotation is OFF (`revokeRefreshToken=false` — the realm default and
+> our config); enabling rotation requires per-session refresh serialization first.
+> Full write-up: `docs/issues/persistent_session_idle_expiry_message_swallow.md`.
 
 A pre-auth state table for PKCE verifier + return-to URL between `/auth/login` and `/auth/callback`:
 
@@ -467,10 +481,16 @@ async def get_current_user(request: Request, db) -> dict:
     if session_id:
         sess = await db.get_session(session_id)
         if sess and sess.revoked_at is None \
-                and sess.absolute_expires_at > now() \
-                and sess.last_seen_at + IDLE_TIMEOUT > now():
-            if sess.access_expires_at - now() < REFRESH_SKEW:
-                sess = await refresh_session(sess, db)   # writes-through new tokens
+                and sess.absolute_expires_at > now():        # absolute cap = only hard stop
+            # Idle OR access-token near expiry → re-validate with Keycloak by
+            # refreshing in place. Idle no longer deletes the row: while KC's SSO
+            # session is alive the refresh renews it (renewable lease); a genuine
+            # KC rejection inside refresh_session deletes the row and 401s.
+            idle = sess.last_seen_at + IDLE_TIMEOUT <= now()
+            if idle or sess.access_expires_at - now() < REFRESH_SKEW:
+                sess = await refresh_session(sess, db)   # None on KC reject → falls through → 401
+                if sess is None:
+                    return await _bearer_or_mcp(request, db)
             await db.touch_session_last_seen(session_id)
             return await db.get_user(sess.user_id)
 
@@ -888,7 +908,7 @@ Discussion summary preserved for posterity:
 | KC 24+ removed `sub` claim from access tokens — callback 500'd `KeyError: 'sub'` | **Realised 2026-05-13.** Resolved with a defensive `_merge_identity_claims` helper in `security/auth.py` that decodes the id_token (which always carries `sub` per OIDC) and merges identity fields into the access-token claim bag before user resolution. Used by both the BFF callback and the cookie validator. Avoids per-client KC realm config and is robust to future default changes. |
 | 86 inline `require_approved_user` calls have subtle variations that break with cookie path | The function signature stays identical; cookie path is purely additive. Pre-PR-1 grep audit confirms all call sites use the canonical shape. |
 | Cookie scoped to `.superhuman-remote-worker.com` exposes other subdomains | Audit current subdomain inventory: `cockpit`, `api`, `auth`, `dozzle`, `git`, `mcp`, `mongo`, `cloud`, `pgadmin`. Confirm none serve untrusted user-uploaded HTML. The `cloud` subdomain (OpenCloud) is the highest-risk — review its content-security headers. |
-| Refresh token rotation enabled in Keycloak breaks long-lived sessions | If KC issues a new refresh token on each exchange, we store it. If we drop one due to a race, the session dies and user re-logs in. Test with KC's rotation policy enabled. |
+| Refresh token rotation enabled in Keycloak breaks long-lived sessions | If KC issues a new refresh token on each exchange, we store it. If we drop one due to a race, the session dies and user re-logs in. Test with KC's rotation policy enabled. **Amplified by idle-refresh (2026-06-23):** a tab refocus can fan out concurrent refreshes of the same token, so rotation must stay OFF (`revokeRefreshToken=false`) until per-session refresh serialization exists. |
 | Back-channel logout URL not reachable from KC (network policy) | Verify the orchestrator's pod is reachable from the KC pod's namespace before relying on back-channel. Front-channel logout works regardless. |
 | MCP tokens kept working but accidentally locked out by stricter validator | The `kind='mcp'` path is explicitly preserved. Add a test that an existing pre-migration MCP token round-trips. |
 | CSRF middleware overreached and blocked in-cluster agent traffic | **Realised 2026-05-13–14, fixed 2026-05-14.** The middleware as designed enforced `X-CSRF: 1` on all non-safe methods with only a path allowlist + Bearer/X-Internal-Key bypasses. Agent-pod → orchestrator-pod calls have none of those, so every `POST /api/agents/register` and `POST /api/jobs/{id}/complete` 403'd silently for two days. Only stale, already-registered agents kept the cluster running. Fixed by short-circuiting CSRF before any header check when the request has no `srw_session` cookie — the cookie *is* the CSRF vector, so without it there's no browser-mediated session to forge. Header-based exemptions for Bearer and X-Internal-Key kept as defense-in-depth for hybrid requests. **Retro lesson**: the CSRF design's threat model named "cookie-authenticated browsers" as the target, but the implementation acted on "all non-safe requests by default" — those are not the same thing, and the implementation should follow the threat model. The CSRF tests covered the cockpit happy path but not the agent path; a smoke test that exercises a no-cookie POST should have caught this. |

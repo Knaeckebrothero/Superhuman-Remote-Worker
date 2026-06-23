@@ -1,13 +1,17 @@
-import {describe, expect, it} from 'vitest';
+import {beforeEach, describe, expect, it} from 'vitest';
 
 import {
     canComposeDuringSession,
+    clearDraft,
+    draftKey,
     extractClipboardFiles,
     isStartupBannerVisible,
+    loadDraft,
     pickCodeServerUrlToOpen,
     pickCurrentStartupStep,
     pickRunningCommandCard,
     readingWidthToCss,
+    saveDraft,
     shouldFoldToolRun,
     textSizeToCss,
 } from './persistent-chat.component';
@@ -268,5 +272,57 @@ describe('textSizeToCss', () => {
 
     it('maps large → 17px', () => {
         expect(textSizeToCss('large')).toBe('17px');
+    });
+});
+
+/**
+ * Composer draft persistence — the un-loseable net for the case where the BFF
+ * session genuinely expires and the auth interceptor does a full-page reload.
+ * sessionStorage is real under jsdom; clear it between cases.
+ */
+describe('draft persistence', () => {
+    const tid = 'thread-abc';
+
+    beforeEach(() => {
+        sessionStorage.clear();
+    });
+
+    it('keys a draft under the cockpit:draft: prefix', () => {
+        expect(draftKey(tid)).toBe('cockpit:draft:thread-abc');
+    });
+
+    it('round-trips a saved draft', () => {
+        saveDraft(tid, 'half-written message');
+        expect(loadDraft(tid)).toBe('half-written message');
+    });
+
+    it('returns empty string for an unknown thread', () => {
+        expect(loadDraft('never-saved')).toBe('');
+    });
+
+    it('clears a saved draft', () => {
+        saveDraft(tid, 'to be cleared');
+        clearDraft(tid);
+        expect(loadDraft(tid)).toBe('');
+    });
+
+    it('isolates drafts by thread id', () => {
+        saveDraft('thread-a', 'message A');
+        saveDraft('thread-b', 'message B');
+        expect(loadDraft('thread-a')).toBe('message A');
+        expect(loadDraft('thread-b')).toBe('message B');
+    });
+
+    it('removes the key when the text is empty or whitespace', () => {
+        saveDraft(tid, 'something');
+        saveDraft(tid, '   ');
+        expect(loadDraft(tid)).toBe('');
+        expect(sessionStorage.getItem(draftKey(tid))).toBeNull();
+    });
+
+    it('is a no-op for a null thread id', () => {
+        expect(() => saveDraft(null, 'x')).not.toThrow();
+        expect(loadDraft(null)).toBe('');
+        expect(() => clearDraft(null)).not.toThrow();
     });
 });
