@@ -10,6 +10,39 @@
 
 ---
 
+## Execution status — ✅ COMPLETE (landed on `develop`, 2026-06-23)
+
+All five tasks implemented, verified locally, and committed to `develop`. The work landed in **two** commits (not the per-task sequence below — see deviations):
+
+- **`983002a2`** — `values.schema.json`, the negative-test file, the `eval`/`vm` scenarios, and the `customer-external` fix (Tasks 1–3). The schema is **live**: helm validates against it on every install / template / publish.
+- **`f387cc2d`** — `chart-test` + `chart-schema-negative` jobs wired into `develop.yml` and `main.yml`, old `helm lint` steps removed from the `lint` job, dev/release publishes gated on `chart-test` (Tasks 4–5).
+
+| Task | Status |
+|---|---|
+| 1 — `values.schema.json` + negative test | ✅ `983002a2` |
+| 2 — `eval-values.yaml` scenario | ✅ `983002a2` |
+| 3 — `vm-values.yaml` scenario | ✅ `983002a2` |
+| 4 — wire `develop.yml` (chart-gated; lint soft, render hard) | ✅ `f387cc2d` |
+| 5 — wire `main.yml` (always-run, all hard) | ✅ `f387cc2d` |
+
+> The per-step `- [ ]` checkboxes further down are left as the original plan record; actual execution is summarized here.
+
+**Headline finding — the matrix paid off on the first run.** `customer-external-values.yaml` was already broken: it set `databases.postgres.externalUrl` / `vector.externalUrl`, but the chart requires `externalHost`/`externalPort`/`externalDb` (credentials come from the Secret, by design). It **passed `helm lint`** — which is why it sat broken — but **failed a real `helm template`**. Fixed as part of Task 1. This is exactly the `lint`-passes-but-`render`-fails gap Phase 1 targets.
+
+**Final verification (against the current `develop` chart, after a week of drift):** all four scenarios render + kubeconform clean — `test` 88 / `customer-external` 30 / `eval` 55 / `vm` 76 resources, **0 invalid, 0 skipped** (the CRD catalog even resolved `ExternalSecret`/`Certificate`/`Middleware`); negative test correctly rejected (`at '/license/acceptTerms': got string, want boolean`); both workflows parse.
+
+**Deviations from the written plan (recorded for honesty):**
+- **Commit shape:** 2 commits, not the per-task sequence. Tasks 1–3 were auto-committed by a concurrent agent in the shared working tree — *entangled* with unrelated experts changes in `983002a2` — then moved onto `develop` by fast-forward. Lesson applied to Tasks 4–5: committed promptly to claim the work cleanly (`f387cc2d`, workflow files only).
+- **Plan corrections made mid-execution** (already folded into this doc): `invalid-values.yaml` needed `global.domain` set, and Task 1 Step 5 was reworked — a *pure*-defaults render fails at the `license-gate` / `global.domain` template guards (not the schema), so schema-acceptance is proven via the real scenario files instead.
+- **`generator-test` already existed:** another session had added a chart-gated job that installs kubeconform identically (it gates the *website config-generator* output). `chart-test` was placed alongside it — distinct and complementary, noted in both job comments.
+
+**Remaining (operator-owned, not code):**
+- **Branch protection:** to make a red `chart-test` / `chart-schema-negative` *block PR merges* into develop, add them as **required status checks** (GitHub setting). The publish-gating wired here works regardless.
+- **First end-to-end CI exercise:** the GitHub-side matrix/gating is only fully validated by the next push that touches `helm/`; locally everything is green.
+- **Push:** kept in sync with `origin/develop` as part of the maintainer's branch orchestration, not by this plan's execution.
+
+---
+
 ## Background the executor needs
 
 This chart is the single supported install path for an OSS release. Today CI only runs `helm lint` against two values files (`helm/ci/test-values.yaml`, `helm/ci/customer-external-values.yaml`). `helm lint` catches template *syntax* errors but does **not** prove the rendered manifests are valid Kubernetes, and there is no install-time validation of operator-supplied values. Phase 1 closes the static-analysis gap (Phase 2, a real install test on a throwaway cluster, is a separate plan).
