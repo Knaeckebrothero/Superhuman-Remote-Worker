@@ -1,6 +1,6 @@
 # Persistent session: gpt-5.x via Codex proxy returns empty `stop` completion
 
-**Status:** Open · **isolated, not synthetically reproducible** (≈1026 calls, every layer incl. full prod LiteLLM path clean — 2026-06-23) · rare non-deterministic upstream/condition-dependent event · fix = agent-side auto-retry (not yet implemented)
+**Status:** **Mitigation implemented 2026-06-23** (develop, branch `fix/session-empty-response-retry`) · root cause **isolated, not synthetically reproducible** (≈1026 calls, every layer incl. full prod LiteLLM path clean) — a rare non-deterministic upstream/condition-dependent event with no single layer to patch · fix = agent-side **bounded auto-retry + live reasoning-replace** (see "Recommended mitigation" below)
 **Found:** 2026-06-23, investigating session `6810288e` on the main cluster
 **Component:** `persistent_graph.py` streaming turn loop · Codex proxy (`srw-codex-proxy`, CLIProxyAPI v7.2.27) · LiteLLM gateway
 **Related:** [[langchain_responses_api_streaming]] (same failure family, non-streaming worker-graph variant) · [[litellm_streaming_usage_not_surfaced]] (explains the `token_usage: {}` / stale usage bar seen here)
@@ -235,11 +235,42 @@ fires on the **non-streaming** path; extend it to the **streaming** path (tee th
 SSE, dump when the aggregated content is empty) and leave it armed on a real
 gpt-5.x session to catch the next one.
 
-## Recommended mitigation
+## Recommended mitigation — implemented 2026-06-23
 
-Independent of root cause: add a **single bounded auto-retry** when a `main`
-call returns `finish_reason=stop` with empty content **and** no tool calls,
-gated to reasoning/codex model families. At ~0.7 %, one retry would almost
-always succeed and the user would never see the placeholder. Optionally retry
-the streaming call once in **non-streaming** mode (different translation path in
-the proxy/SDK). Keep the placeholder as the terminal fallback after the retry.
+Independent of root cause: a **single bounded auto-retry** when a `main` call
+streams empty content **and** no tool calls **and** no refusal, gated to
+reasoning/codex model families (`getattr(llm_with_tools, "reasoning", None)`).
+At ~0.7 %, one retry almost always succeeds and the user never sees the
+placeholder. The retry is **non-streaming** (`ainvoke`) on purpose — it reuses
+the proven empty-tool-args retry path and hits a different proxy/SDK translation
+path. The placeholder remains the terminal fallback when the retry is also
+empty/refuses. Single attempt — a straight-line call, not a loop, so it is
+hard-bounded.
+
+What shipped:
+
+- **Server** (`src/persistent_graph.py`): the empty-content terminal guard
+  (`~1418`) now retries via `ainvoke` before the placeholder. On success it
+  re-streams the retry's reasoning + answer via the new
+  `_stream_response_blocks` helper. In the **slow-empty** sub-mode (the model
+  streamed *reasoning* then emitted no answer) it first emits a new
+  `thinking.reset` frame so the dead-end reasoning bubble is **replaced** rather
+  than left stale with the retry's answer appended under it — draining the
+  in-flight reasoning broadcasts (`_reasoning_tasks`) first so a late delta can't
+  repaint after the reset. New optional callback
+  `PersistentLoopCallbacks.on_thinking_reset` → `_loop_on_thinking_reset`
+  (`src/api/persistent_app.py`) broadcasts `thinking.reset` (free-form frame, the
+  `message_id` coerced via `_coerce_row_id` to match the reasoning frames).
+- **Client** (`cockpit/.../persistent-chat.service.ts` + `turn-reducer.ts`): a
+  `thinking.reset` SSE frame maps to a `thinking_reset` reducer action whose
+  `resetThought` helper drops the active turn's streaming `ThoughtEvent`(s) for
+  the message id — idempotent and replay-safe (no active turn ⇒ no-op; never
+  seeds a placeholder turn). The persisted row is already the retry's response,
+  so a reload is coherent regardless; the reset frame fixes the *live* render.
+- Tests: `tests/test_persistent_graph.py::TestEmptyResponseRetry` (6 cases) +
+  `turn-reducer.spec.ts` (4) + `persistent-chat.service.spec.ts` (1).
+
+Still open (separate, optional): the only way to capture a true positive is **in
+situ** — `DEBUG_CODEX_RAW_RESPONSE` (`src/llm/reasoning_chat.py:852`) fires only
+on the non-streaming path; extend it to tee the streaming SSE and dump when the
+aggregated content is empty, then leave it armed on a real gpt-5.x session.

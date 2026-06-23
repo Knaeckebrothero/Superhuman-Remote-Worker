@@ -383,6 +383,57 @@ describe('turn-reducer — reasoning frame dedupe (message-id keyed)', () => {
     });
 });
 
+describe('turn-reducer — thinking_reset (live replace)', () => {
+    it('drops the active streaming reasoning bubble for a message id', () => {
+        const state = play([
+            {type: 'turn_started', turnId: 't1', startedAt: 1000},
+            {type: 'thinking', content: 'dead ', timestamp: 1100, messageId: 'a1'},
+            {type: 'thinking', content: 'end', timestamp: 1150, messageId: 'a1'},
+            {type: 'thinking_reset', messageId: 'a1', timestamp: 1200},
+        ]);
+        const turn = activeTurn(state);
+        expect(turn.events.filter((e) => e.kind === 'thought')).toHaveLength(0);
+    });
+
+    it('lets the retry re-stream a fresh bubble after a reset', () => {
+        // The empty-response replace: dead-end reasoning is cleared, then the
+        // retry streams its own reasoning + answer under the same message id.
+        const state = play([
+            {type: 'turn_started', turnId: 't1', startedAt: 1000},
+            {type: 'thinking', content: 'dead end', timestamp: 1100, messageId: 'a1'},
+            {type: 'thinking_reset', messageId: 'a1', timestamp: 1200},
+            {type: 'thinking', content: 'fresh reasoning', timestamp: 1300, messageId: 'a1'},
+            {type: 'token', content: 'recovered', timestamp: 1400},
+        ]);
+        const turn = activeTurn(state);
+        const thoughts = turn.events.filter((e) => e.kind === 'thought') as ThoughtEvent[];
+        expect(thoughts).toHaveLength(1);
+        expect(thoughts[0].content).toBe('fresh reasoning'); // dead-end gone
+        const texts = turn.events.filter((e) => e.kind === 'text') as TextEvent[];
+        expect(texts[0].content).toBe('recovered');
+    });
+
+    it('is a no-op when there is no active turn (replay-safe)', () => {
+        const state = play([{type: 'thinking_reset', messageId: 'a1', timestamp: 1000}]);
+        expect(state).toEqual(EMPTY_CONVERSATION);
+    });
+
+    it('leaves a done thought and a non-matching streaming thought intact', () => {
+        // a1 closes to done when a2 opens; resetting a1 matches neither the
+        // (done) a1 nor the (streaming, different-id) a2 — nothing is removed.
+        const state = play([
+            {type: 'turn_started', turnId: 't1', startedAt: 1000},
+            {type: 'thinking', content: 'first', timestamp: 1100, messageId: 'a1'},
+            {type: 'thinking', content: 'second', timestamp: 1200, messageId: 'a2'},
+            {type: 'thinking_reset', messageId: 'a1', timestamp: 1300},
+        ]);
+        const turn = activeTurn(state);
+        const thoughts = turn.events.filter((e) => e.kind === 'thought') as ThoughtEvent[];
+        expect(thoughts).toHaveLength(2);
+        expect(thoughts.map((t) => t.content)).toEqual(['first', 'second']);
+    });
+});
+
 describe('turn-reducer — tool calls', () => {
     it('tool_started pushes a ToolCallEvent in running state', () => {
         const state = play([

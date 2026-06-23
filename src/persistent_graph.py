@@ -381,6 +381,18 @@ class PersistentLoopCallbacks:
     # cooperative-only interrupts (back-compat for callers that don't set it).
     hard_interrupt_event: Optional[asyncio.Event] = None
 
+    # Tell the client to DROP the in-progress reasoning bubble for a message id.
+    # Used by the empty-response retry to REPLACE a dead-end reasoning stream
+    # (the model streamed reasoning then emitted no answer) with the retry's
+    # reasoning + answer, rather than leaving the stale bubble and appending the
+    # answer underneath. Optional: None ⇒ no live replace (back-compat for
+    # tests/older transports); the retry still runs, the stale bubble just
+    # lingers until the next rerender (the persisted row is already the retry's,
+    # so a reload is coherent regardless). Takes a ``message_id`` kwarg matching
+    # the id on_thinking stamped on the reasoning frames. See
+    # docs/issues/session_empty_response_gpt5_codex_stop.md.
+    on_thinking_reset: Optional[Callable[..., Awaitable[None]]] = None
+
     def __post_init__(self) -> None:
         # Back-compat: callers that still pass the deprecated on_vm_upgrade_needed
         # get it promoted to the generalized on_workspace_upgrade_needed the loop
@@ -717,6 +729,53 @@ async def run_persistent_loop(
             f"Turn {turn_id} complete: {tool_calls_this_turn} tool calls, "
             f"{len(messages)} total messages"
         )
+
+
+async def _stream_response_blocks(
+    response: Any,
+    callbacks: "PersistentLoopCallbacks",
+    *,
+    message_id: Optional[str] = None,
+) -> tuple[str, bool]:
+    """Stream a non-streamed AIMessage's content to the client.
+
+    Mirrors the inline block-walk the live loop runs for the empty-tool-args
+    ainvoke retry (text → on_token, reasoning/thinking blocks → on_thinking).
+    Used by the empty-response retry to re-emit the retry's reasoning + answer
+    after a thinking.reset, keyed to ``message_id`` so the new reasoning lands in
+    (replaces) the same bubble. Returns ``(accumulated_text, emitted_reasoning)``
+    — the caller flips ``reasoning_streamed`` on the latter so the post-stream
+    fallback doesn't double-emit.
+    """
+    text_out = ""
+    emitted_reasoning = False
+    content = getattr(response, "content", None)
+    if not content:
+        return text_out, emitted_reasoning
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                text = block.get("text", "")
+                if text:
+                    text_out += text
+                    await callbacks.on_token(text)
+            elif isinstance(block, dict) and block.get("type") == "thinking":
+                thinking = block.get("thinking", "")
+                if thinking:
+                    await callbacks.on_thinking(thinking, message_id=message_id)
+                    emitted_reasoning = True
+            elif isinstance(block, dict) and block.get("type") == "reasoning":
+                reasoning = extract_reasoning_text_from_block(block)
+                if reasoning:
+                    await callbacks.on_thinking(reasoning, message_id=message_id)
+                    emitted_reasoning = True
+            elif isinstance(block, str) and block:
+                text_out += block
+                await callbacks.on_token(block)
+    elif isinstance(content, str):
+        text_out = content
+        await callbacks.on_token(content)
+    return text_out, emitted_reasoning
 
 
 async def _execute_turn(
@@ -1416,15 +1475,91 @@ async def _execute_turn(
                 bool(getattr(response, "tool_calls", None)),
                 list(extra.keys()),
             )
+            # Shared terminal placeholder, used when nothing better can be shown.
+            _empty_msg = (
+                "⚠ The model returned an empty response. "
+                "Please try again or switch models."
+            )
             if refusal:
                 logger.warning("Model refusal: %s", refusal)
                 response_content = f"⚠ The model declined to respond: {refusal}"
                 await callbacks.on_token(response_content)
-            else:
-                response_content = (
-                    "⚠ The model returned an empty response. "
-                    "Please try again or switch models."
+            elif getattr(llm_with_tools, "reasoning", None):
+                # Bounded auto-retry for reasoning/codex models. A gpt-5.x turn
+                # via the Codex proxy occasionally streams finish_reason=stop with
+                # zero content deltas and no tool call — a rare (~0.7 %),
+                # non-deterministic upstream event we could not reproduce across
+                # ~1026 synthetic calls (docs/issues/
+                # session_empty_response_gpt5_codex_stop.md). One ainvoke retry
+                # almost always succeeds and, being non-streaming, hits a
+                # different proxy/SDK translation path. Single attempt — a
+                # straight-line call, not a loop, so it is hard-bounded.
+                logger.info(
+                    "Empty streamed response on a reasoning model — "
+                    "retrying once via ainvoke"
                 )
+                retry: Optional[AIMessage] = None
+                try:
+                    retry = await asyncio.wait_for(
+                        llm_with_tools.ainvoke(prepared), timeout=llm_timeout
+                    )
+                except Exception as retry_err:
+                    logger.warning(
+                        "Empty-response ainvoke retry failed: %s",
+                        type(retry_err).__name__,
+                    )
+                retry_extra = (
+                    (getattr(retry, "additional_kwargs", None) or {})
+                    if retry is not None
+                    else {}
+                )
+                retry_tools = (
+                    getattr(retry, "tool_calls", None) if retry is not None else None
+                )
+                if retry is not None and (
+                    getattr(retry, "content", None) or retry_tools
+                ):
+                    # Retry produced something. Replace the dead-end reasoning
+                    # bubble (if one streamed live) with the retry's reasoning +
+                    # answer rather than appending under the stale one.
+                    if reasoning_streamed and callbacks.on_thinking_reset is not None:
+                        # Drain the in-flight reasoning broadcasts first so a late
+                        # delta can't repaint AFTER the reset. The streaming sink
+                        # was already cleared in the finally above, so this set is
+                        # closed — it can't grow while we await it.
+                        if _reasoning_tasks:
+                            await asyncio.gather(
+                                *_reasoning_tasks, return_exceptions=True
+                            )
+                        await callbacks.on_thinking_reset(message_id=ai_msg_id)
+                        reasoning_streamed = False
+                    response_content, _retry_reasoned = await _stream_response_blocks(
+                        retry, callbacks, message_id=ai_msg_id
+                    )
+                    if _retry_reasoned:
+                        reasoning_streamed = True
+                    response = retry
+                    # The retry may itself be empty / a refusal → placeholder.
+                    if not response_content and not retry_tools:
+                        retry_refusal = retry_extra.get("refusal")
+                        response_content = (
+                            f"⚠ The model declined to respond: {retry_refusal}"
+                            if retry_refusal
+                            else _empty_msg
+                        )
+                        await callbacks.on_token(response_content)
+                else:
+                    # Retry also empty (or raised). Keep attempt-1's reasoning
+                    # visible (no reset) and show the placeholder.
+                    retry_refusal = retry_extra.get("refusal")
+                    response_content = (
+                        f"⚠ The model declined to respond: {retry_refusal}"
+                        if retry_refusal
+                        else _empty_msg
+                    )
+                    await callbacks.on_token(response_content)
+            else:
+                response_content = _empty_msg
                 await callbacks.on_token(response_content)
 
         # Coerce a streamed chunk to a concrete AIMessage before it enters

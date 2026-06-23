@@ -786,6 +786,24 @@ describe('PersistentChatService — SSE event dispatch', () => {
         expect(text.status).toBe('done');
     });
 
+    it('drops the streaming reasoning bubble on thinking.reset (empty-response replace)', async () => {
+        const {service, es} = await setup();
+        fireSseMessage(es, {method: 'turn.started', params: {turn_id: 1}}, '1:1');
+        fireSseMessage(
+            es,
+            {method: 'thinking', params: {content: 'dead-end reasoning', message_id: 'a1'}},
+            '1:2',
+        );
+        expect(
+            service.currentStreamingTurn()!.events.filter((e) => e.kind === 'thought'),
+        ).toHaveLength(1);
+        // The agent's empty-response retry asks the client to clear the bubble.
+        fireSseMessage(es, {method: 'thinking.reset', params: {message_id: 'a1'}}, '1:3');
+        expect(
+            service.currentStreamingTurn()!.events.filter((e) => e.kind === 'thought'),
+        ).toHaveLength(0);
+    });
+
     it('sets pendingPermission on permission.request', async () => {
         const {service, es} = await setup();
         fireSseMessage(es, {

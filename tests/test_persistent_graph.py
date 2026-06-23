@@ -2197,6 +2197,170 @@ class TestLLMStreaming:
 
 
 # ---------------------------------------------------------------------------
+# 1.5b _execute_turn — empty-response bounded retry (gpt-5.x / codex)
+# ---------------------------------------------------------------------------
+
+_PLACEHOLDER = (
+    "⚠ The model returned an empty response. Please try again or switch models."
+)
+
+
+def _drive_reasoning_then_empty(reasoning_text="dead-end reasoning"):
+    """An astream that surfaces a reasoning delta (sets reasoning_streamed=True
+    via the live sink) and then yields an empty answer — the slow-empty mode."""
+    from src.llm.reasoning_chat import _STREAM_REASONING_SINK
+
+    async def _astream(messages, **kw):
+        sink = _STREAM_REASONING_SINK.get()
+        assert sink is not None, "sink must be installed during the stream"
+        sink(reasoning_text)
+        yield AIMessage(content="")
+
+    return _astream
+
+
+async def _run_turn(llm, callbacks):
+    messages = [SystemMessage(content="sys"), HumanMessage(content="go")]
+    result = await _execute_turn(
+        llm_with_tools=llm,
+        tool_map={},
+        context_manager=AsyncMock(
+            ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+        ),
+        messages=messages,
+        callbacks=callbacks,
+        llm_timeout=600,
+        auxiliary_llm=None,
+        config=_make_config(),
+    )
+    await asyncio.sleep(0)  # let fire-and-forget reasoning broadcasts settle
+    return result, messages
+
+
+class TestEmptyResponseRetry:
+    @pytest.mark.asyncio
+    async def test_slow_empty_replaces_reasoning_and_recovers(self):
+        """Reasoning streamed then empty → ainvoke retry, reset frame fired, the
+        retry's reasoning + answer re-streamed under the same message id."""
+        thinking_calls = []
+
+        async def _on_thinking(content, message_id=None):
+            thinking_calls.append((content, message_id))
+
+        retry = AIMessage(
+            content=[
+                {"type": "reasoning", "summary": [{"text": "retry reasoning"}]},
+                {"type": "text", "text": "recovered answer"},
+            ]
+        )
+        llm = AsyncMock()
+        llm.reasoning = True  # gate ON
+        llm.astream = _drive_reasoning_then_empty()
+        llm.ainvoke = AsyncMock(return_value=retry)
+
+        reset = AsyncMock()
+        callbacks = _make_callbacks(on_thinking=_on_thinking, on_thinking_reset=reset)
+        _, messages = await _run_turn(llm, callbacks)
+
+        # Retried exactly once.
+        llm.ainvoke.assert_awaited_once()
+        # Reset fired once, keyed to the message id the appended row carries.
+        reset.assert_awaited_once()
+        assert reset.await_args.kwargs["message_id"] == messages[-1].id
+        # The retry's reasoning was re-emitted under that same id...
+        assert ("retry reasoning", messages[-1].id) in thinking_calls
+        # ...and its answer streamed, with no placeholder shown.
+        callbacks.on_token.assert_any_call("recovered answer")
+        for call in callbacks.on_token.call_args_list:
+            assert "empty response" not in call.args[0].lower()
+
+    @pytest.mark.asyncio
+    async def test_fast_empty_recovers_without_reset(self):
+        """Empty with NO prior streamed reasoning → retry recovers, but no reset
+        frame (there is no live bubble to clear)."""
+        llm = _make_streaming_llm(AIMessage(content=""))
+        llm.reasoning = True
+        llm.ainvoke = AsyncMock(return_value=AIMessage(content="recovered"))
+
+        reset = AsyncMock()
+        callbacks = _make_callbacks(on_thinking_reset=reset)
+        _, messages = await _run_turn(llm, callbacks)
+
+        llm.ainvoke.assert_awaited_once()
+        reset.assert_not_awaited()
+        callbacks.on_token.assert_any_call("recovered")
+        assert messages[-1].content == "recovered"
+
+    @pytest.mark.asyncio
+    async def test_retry_also_empty_shows_placeholder_and_no_reset(self):
+        """Reasoning streamed then empty, and the retry is ALSO empty → keep the
+        dead-end reasoning (no reset) and fall back to the placeholder."""
+        llm = AsyncMock()
+        llm.reasoning = True
+        llm.astream = _drive_reasoning_then_empty()
+        llm.ainvoke = AsyncMock(return_value=AIMessage(content=""))
+
+        reset = AsyncMock()
+        callbacks = _make_callbacks(on_thinking_reset=reset)
+        _, messages = await _run_turn(llm, callbacks)
+
+        llm.ainvoke.assert_awaited_once()
+        reset.assert_not_awaited()  # reset only on a successful retry
+        callbacks.on_token.assert_any_call(_PLACEHOLDER)
+        assert messages[-1].content == _PLACEHOLDER
+
+    @pytest.mark.asyncio
+    async def test_non_reasoning_model_does_not_retry(self):
+        """Gate is reasoning-only: a non-reasoning model keeps today's
+        placeholder behavior and never retries."""
+        llm = _make_streaming_llm(AIMessage(content=""))
+        llm.reasoning = None  # gate OFF
+        llm.ainvoke = AsyncMock()
+
+        callbacks = _make_callbacks(on_thinking_reset=AsyncMock())
+        _, messages = await _run_turn(llm, callbacks)
+
+        llm.ainvoke.assert_not_awaited()
+        callbacks.on_token.assert_called_once_with(_PLACEHOLDER)
+        assert messages[-1].content == _PLACEHOLDER
+
+    @pytest.mark.asyncio
+    async def test_refusal_short_circuits_before_retry(self):
+        """An explicit refusal is a real answer, not the empty bug — show it and
+        never retry, even on a reasoning model."""
+        llm = _make_streaming_llm(
+            AIMessage(content="", additional_kwargs={"refusal": "I cannot"})
+        )
+        llm.reasoning = True
+        llm.ainvoke = AsyncMock()
+
+        callbacks = _make_callbacks(on_thinking_reset=AsyncMock())
+        _, _ = await _run_turn(llm, callbacks)
+
+        llm.ainvoke.assert_not_awaited()
+        callbacks.on_token.assert_called_once_with(
+            "⚠ The model declined to respond: I cannot"
+        )
+
+    @pytest.mark.asyncio
+    async def test_retry_works_when_reset_callback_absent(self):
+        """Back-compat: on_thinking_reset=None (older transport) → the retry still
+        recovers, the stale bubble just isn't cleared live."""
+        llm = AsyncMock()
+        llm.reasoning = True
+        llm.astream = _drive_reasoning_then_empty()
+        llm.ainvoke = AsyncMock(return_value=AIMessage(content="recovered"))
+
+        callbacks = _make_callbacks()  # no on_thinking_reset ⇒ None
+        assert callbacks.on_thinking_reset is None
+        _, messages = await _run_turn(llm, callbacks)
+
+        llm.ainvoke.assert_awaited_once()
+        callbacks.on_token.assert_any_call("recovered")
+        assert messages[-1].content == "recovered"
+
+
+# ---------------------------------------------------------------------------
 # 1.6 _execute_turn — LLM streaming fallback
 # ---------------------------------------------------------------------------
 
