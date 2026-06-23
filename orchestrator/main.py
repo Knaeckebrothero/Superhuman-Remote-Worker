@@ -247,6 +247,9 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 postgres_db = PostgresDB()
+# Retired audit backend — unused at runtime after QW-4 (the Mongo reader + boot
+# calls were removed). The object, class, and import are deleted in D-5.
+# See docs/features/database_optimization_plan.md.
 mongodb = MongoDB()
 gitea_client = GiteaClient()
 keycloak_groups = KeycloakGroupSync()
@@ -281,12 +284,13 @@ audit_db = (
     else None
 )
 
-# Audit READS (PR4): the cockpit-facing read backend, selected by AUDIT_BACKEND.
-# Defaults to the Mongo reader; the lifespan swaps in the Postgres AuditStore
-# when AUDIT_BACKEND=postgres. Both expose the same read method surface, so the
-# ~13 read call sites are backend-agnostic.
-audit_store = AuditStore(_audit_url) if _audit_url else None
-audit_reader = mongodb
+# Audit READS: the cockpit-facing read backend. Served exclusively by the
+# Postgres AuditStore — the legacy Mongo reader was retired
+# (docs/features/database_optimization_plan.md QW-4/D-5). AuditStore is
+# null-safe: is_available stays False (the read endpoints' degraded shapes,
+# never a crash) until connect() runs on a real DSN in the lifespan.
+audit_store = AuditStore(_audit_url)
+audit_reader = audit_store
 
 # Usage-metering ledger (Slice 4). Instantiated in the lifespan once the audit +
 # app pools and the usage_rates migration are ready; None until then (and on
@@ -4837,7 +4841,7 @@ class CustomJSONResponse(JSONResponse):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan handler."""
-    global _shutdown_event, audit_reader
+    global _shutdown_event
 
     # Hard-fail if the legacy LLM_BASE_URL env var is set. The env-var-driven
     # routing for self-hosted "Local" group models was removed in chunk 6 of
@@ -4861,7 +4865,6 @@ async def lifespan(app: FastAPI):
     # Connect to databases
     await postgres_db.connect()
     await vector_db.connect()
-    await mongodb.connect()
 
     # Audit DB is the non-load-bearing observability tier: a connect failure
     # must NOT abort startup (unlike the control-plane + vector DBs above).
@@ -4882,27 +4885,20 @@ async def lifespan(app: FastAPI):
                 "Check AUDIT_POSTGRES_* and the srw-auditdb server."
             )
 
-    # PR4: when AUDIT_BACKEND=postgres, serve the cockpit-facing reads from the
-    # Postgres AuditStore (its own read pool) instead of Mongo. Both expose the
-    # same method surface, so the read call sites are backend-agnostic. A connect
-    # failure leaves is_available=False -> the endpoints' degraded shapes; never
-    # fatal (non-load-bearing tier).
-    if (
-        os.getenv("AUDIT_BACKEND", "mongodb").strip().lower() == "postgres"
-        and audit_store is not None
-    ):
-        audit_reader = audit_store
+    # Audit reads are served by the Postgres AuditStore (audit_reader is bound to
+    # it at construction). Connect its read pool when the tier is present; a
+    # connect failure leaves is_available=False -> the endpoints' degraded shapes,
+    # never fatal (non-load-bearing tier). The legacy Mongo reader was retired
+    # (docs/features/database_optimization_plan.md QW-4/D-5).
+    if audit_db is not None:
         await audit_store.connect()
-        logger.info(
-            "Audit reads served by Postgres AuditStore (AUDIT_BACKEND=postgres)"
+        logger.info("Audit reads served by Postgres AuditStore")
+    if os.getenv("AUDIT_BACKEND", "postgres").strip().lower() == "mongodb":
+        logger.warning(
+            "AUDIT_BACKEND=mongodb is no longer supported — MongoDB was removed; "
+            "serving audit reads from Postgres. Drop databases.audit.backend / the "
+            "AUDIT_BACKEND override."
         )
-
-    # Reassert MongoDB index declarations on every startup. Idempotent —
-    # existing identical indexes are a silent no-op. Closes the gap that
-    # produced the 2026-05-12 outage where the standalone init.py CLI was
-    # never actually invoked by the deploy pipeline. See
-    # docs/issues/agent_audit_collection_missing_indexes.md.
-    await mongodb.ensure_indexes()
 
     # Apply pending migrations on each DB. Each PostgresDB instance is
     # bound to its migrations directory at construction time; the runner
@@ -4935,9 +4931,8 @@ async def lifespan(app: FastAPI):
 
     # Encrypt any legacy plaintext datasource credentials. Idempotent — once
     # all rows are v1 ciphertexts this is a fast no-op. Lives in lifespan
-    # (not init.py) for the same reason mongodb.ensure_indexes does: init.py
-    # is not reliably invoked at deploy time, and this is data-integrity
-    # critical for the encryption-at-rest guarantee.
+    # (not init.py) because init.py is not reliably invoked at deploy time, and
+    # this is data-integrity critical for the encryption-at-rest guarantee.
     try:
         _bf = await postgres_db.backfill_encrypt_datasource_credentials()
         if _bf["encrypted"] > 0:
@@ -5338,7 +5333,6 @@ async def lifespan(app: FastAPI):
     register_catalog_lookup(None)
 
     # Disconnect from databases
-    await mongodb.disconnect()
     await vector_db.disconnect()
     if audit_store is not None:
         await audit_store.disconnect()

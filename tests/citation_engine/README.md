@@ -1,6 +1,6 @@
 # citation_engine tests
 
-Test suite for the vendored `citation_engine` package (`../../citation_engine/`).
+Test suite for the `citation_engine` package (`../../src/citation_engine/`).
 
 After the **native SRW integration** (`docs/features/citation_engine_integration.md`),
 the engine is async and Postgres-only — it runs against SRW's vector store

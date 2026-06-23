@@ -38,8 +38,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Install CPU-only PyTorch first (separate layer — rarely changes, ~200MB vs ~2GB with CUDA)
 RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
 
-# CitationEngine is vendored at ./citation_engine/ (COPY'd with the source
-# below) — no separate install. Its runtime deps are in requirements.txt.
+# The citation_engine package lives under src/ (src/citation_engine/) and is
+# COPY'd with the rest of src/ below — no separate install. Its runtime deps
+# are in requirements.txt.
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
@@ -111,7 +112,6 @@ COPY --from=builder /usr/local/bin /usr/local/bin
 
 # Copy source code LAST (changes most frequently)
 COPY --chown=srw:srw src/ ./src/
-COPY --chown=srw:srw citation_engine/ ./citation_engine/
 COPY --chown=srw:srw config/ ./config/
 COPY --chown=srw:srw agent.py ./
 

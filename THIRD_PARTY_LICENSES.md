@@ -1,6 +1,6 @@
 # Third-Party Licenses
 
-This product (the "Software", MIT-licensed — see `LICENSE.txt`) bundles third-party
+This product (the "Software", licensed under FSL-1.1-ALv2 — see `LICENSE`) bundles third-party
 open-source components. Their licenses are permissive or weak-copyleft and require
 that we **reproduce their copyright and license notices** when we distribute the
 Software. This file discharges that obligation for every bundled dependency.
@@ -290,5 +290,5 @@ _No bundled dependency ships a NOTICE file._
 
 ## This project's own license
 
-The Software itself is licensed under the **MIT License** — see `LICENSE.txt`.
+The Software itself is licensed under the **Functional Source License v1.1 (FSL-1.1-ALv2)** — see `LICENSE`.
 This file concerns only the third-party components distributed alongside it.

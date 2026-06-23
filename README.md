@@ -715,7 +715,7 @@ rm workspace/checkpoints/job_*.db workspace/logs/job_*.log
 
 ## License
 
-Licensed under the MIT License. See [LICENSE.txt](LICENSE.txt).
+Licensed under the [Functional Source License, Version 1.1 (FSL-1.1-ALv2)](LICENSE) — a source-available license permitting use, modification, and redistribution for any purpose **except competing with the Software**, with each release converting to the Apache License 2.0 two years after its publication.
 
 Third-party components bundled into our images (and their upstream NOTICE
 obligations) are inventoried in [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).
