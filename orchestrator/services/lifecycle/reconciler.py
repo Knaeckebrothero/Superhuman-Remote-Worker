@@ -185,8 +185,24 @@ class InstanceLifecycleReconciler:
                         stats["skipped_busy"] += 1
                         # Not drained on drift, but may still be reapable
                         # below if its bound work has finished/paused.
+                    elif isinstance(manager, ReapableInstanceManager):
+                        # Drifted + idle + reapable: never bare-drain. For
+                        # workspaces/VMs drain() is a no-snapshot delete(), so
+                        # draining a dirty instance here would lose state. Fall
+                        # through (no continue) to the snapshot-aware reap path
+                        # below. is_idle ⊆ is_reapable for both managers, so
+                        # _reap won't early-return; it is uncapped by design
+                        # (mirrors the every-tick reap of finished work), so the
+                        # disruption cap correctly does not gate it.
+                        pass
                     elif drained < cap and self._budget.allow(kind):
                         try:
+                            if isinstance(manager, StatefulInstanceManager):
+                                # Stateful-but-not-reapable (no such manager ships
+                                # today): honor the StatefulInstanceManager contract
+                                # that a snapshot precedes any state-losing drain.
+                                # Reapable kinds took the branch above.
+                                await manager.snapshot(inst)
                             await manager.drain(inst, grace_s=0)
                             stats["drained"] += 1
                             drained += 1
@@ -198,12 +214,15 @@ class InstanceLifecycleReconciler:
                                 inst.id,
                             )
 
-                # Reap path: teardown-eligible workspaces whose bound work has
-                # finished or gone idle. Replaces the old keep-alive-on-
-                # snapshot-failure loop. Gated on ReapableInstanceManager, NOT
-                # StatefulInstanceManager — VMs are stateful but don't implement
-                # the reap predicates (routing them here AttributeError'd every
-                # tick; see test_stateful_non_reapable_manager_is_skipped).
+                # Reap path: teardown-eligible stateful instances whose bound
+                # work has finished or gone idle (clean → delete; dirty+reachable
+                # → snapshot then delete; dirty+unreachable → bounded retry /
+                # give_up). Replaces the old keep-alive-on-snapshot-failure loop.
+                # Gated on ReapableInstanceManager: BOTH WorkspaceInstanceManager
+                # and VMInstanceManager implement the reap predicates and qualify.
+                # A StatefulInstanceManager that is NOT reapable (none ship today)
+                # is intentionally excluded so _reap never AttributeErrors on a
+                # missing predicate (see test_stateful_non_reapable_manager_is_skipped).
                 if isinstance(manager, ReapableInstanceManager):
                     try:
                         await self._reap(manager, inst, stats)
