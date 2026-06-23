@@ -337,6 +337,7 @@ def _ensure_persistent_loop_started(
             archive_llm_call=_loop_archive_llm_call,
             on_usage=_loop_on_usage,
             hard_interrupt_event=_hard_interrupt_event,
+            on_thinking_reset=_loop_on_thinking_reset,
         )
         # Tag the loop task — and the turn/aux tasks it spawns, which copy this
         # context at creation — with thread_id for log correlation.
@@ -2724,6 +2725,21 @@ async def _loop_on_thinking(content: str, message_id: Optional[str] = None) -> N
 
         payload["message_id"] = _coerce_row_id(message_id)
     _broadcast("thinking", payload)
+
+
+async def _loop_on_thinking_reset(message_id: Optional[str] = None) -> None:
+    # Drop the in-progress reasoning bubble for this message id on the client.
+    # The empty-response retry emits this right before re-streaming the retry's
+    # reasoning so the dead-end reasoning is REPLACED, not appended-under. The
+    # _coerce_row_id coercion is load-bearing: it must match the id
+    # _loop_on_thinking stamped on the original reasoning frames, or the client
+    # won't find the bubble to clear.
+    payload: Dict[str, Any] = {}
+    if message_id:
+        from src.database.postgres_db import _coerce_row_id
+
+        payload["message_id"] = _coerce_row_id(message_id)
+    _broadcast("thinking.reset", payload)
 
 
 async def _loop_on_tool_start(

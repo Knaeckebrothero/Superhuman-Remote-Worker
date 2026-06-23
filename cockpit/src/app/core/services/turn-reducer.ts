@@ -52,6 +52,7 @@ export type ReducerAction =
     | { type: 'turn_interrupted'; turnId: string; finishedAt: number }
     | { type: 'token'; content: string; timestamp: number }
     | { type: 'thinking'; content: string; timestamp: number; messageId?: string }
+    | { type: 'thinking_reset'; messageId?: string; timestamp: number }
     | {
         type: 'tool_started';
         toolUseId: string;
@@ -253,6 +254,9 @@ export function reduce(state: ConversationState, action: ReducerAction): Convers
 
         case 'thinking':
             return appendThought(state, action.content, action.timestamp, action.messageId);
+
+        case 'thinking_reset':
+            return resetThought(state, action.messageId);
 
         case 'tool_started':
             return updateActiveTurn(ensurePlaceholderTurn(state, action.timestamp), (turn) => {
@@ -504,6 +508,32 @@ function appendThought(
         };
         return {...turn, events: [...closed, newEvent]};
     });
+}
+
+/**
+ * Drop the active turn's in-progress reasoning bubble for a message id.
+ *
+ * The agent's empty-response retry (a gpt-5.x turn that streamed reasoning then
+ * emitted no answer) sends `thinking.reset` before re-streaming the retry's
+ * reasoning, so the dead-end reasoning is REPLACED rather than appended under.
+ * We remove only *streaming* thoughts matching `messageId` from the active turn:
+ * a `done` thought from an earlier interleaved block survives, and with no
+ * active turn (e.g. SSE replay after history already painted the clean persisted
+ * row) `updateActiveTurn` no-ops — so this is idempotent and replay-safe. Unlike
+ * `appendThought` it never seeds a placeholder turn; reset is purely subtractive.
+ */
+function resetThought(state: ConversationState, messageId?: string): ConversationState {
+    return updateActiveTurn(state, (turn) => ({
+        ...turn,
+        events: turn.events.filter(
+            (e) =>
+                !(
+                    e.kind === 'thought' &&
+                    e.status === 'streaming' &&
+                    (!messageId || e.messageId === messageId)
+                ),
+        ),
+    }));
 }
 
 function appendDelta(
