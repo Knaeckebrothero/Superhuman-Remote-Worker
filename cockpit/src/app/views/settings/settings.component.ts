@@ -1560,6 +1560,60 @@ const EXPIRY_OPTIONS = [
     }
     .cloud-message { margin-top: 12px; }
     .cloud-overlay-info { margin-top: 8px; }
+
+    /* ---- Mobile (<=560px): this page's first responsive block ---- */
+    @media (max-width: 560px) {
+      /* Reclaim width — the 32px/24px desktop padding is wasteful on a phone. */
+      .settings-page { padding: 16px; }
+      .settings-section { padding: 16px; }
+
+      /* Paired fields stack to one full-width column (bigger tap targets; the
+         preference/persistent/cloud selects were cramped, not broken). */
+      .two-col { grid-template-columns: 1fr; }
+
+      /* API-key & MCP-token grids -> one card per row. A fixed 5-/7-column grid
+         can't fit a phone, and the table wrapper is overflow:hidden, so the
+         right-most column (the Delete / Revoke button) was clipped and
+         UNREACHABLE. Cards restore every field + a full-width action button. */
+      .key-table, .token-table { border: none; border-radius: 0; overflow: visible; }
+      .key-header, .token-header { display: none; }
+      .key-row, .token-row {
+        display: block;
+        border: 1px solid var(--border-color);
+        border-radius: var(--radius-surface);
+        padding: 12px 14px;
+        margin-bottom: 10px;
+      }
+      .key-row > span, .token-row > span { display: block; padding: 1px 0; }
+      /* First cell = card title. */
+      .key-row .col-provider, .token-row .col-name {
+        font-weight: 600; font-size: 14px; color: var(--text-primary); margin-bottom: 4px;
+      }
+      /* Re-label the now-headerless value cells. CSS content: is not scanned by
+         the i18n hardcoded-string check and matches the admin-users card
+         precedent; it also sidesteps the missing settings.apiKeys.* keys. */
+      .key-row .col-prefix::before { content: 'Key: '; }
+      .key-row .col-label::before { content: 'Label: '; }
+      .key-row .col-updated::before { content: 'Updated: '; }
+      .token-row .col-prefix::before { content: 'Token: '; }
+      .token-row .col-scope::before { content: 'Scope: '; }
+      .token-row .col-origin::before { content: 'Origin: '; }
+      .token-row .col-used::before { content: 'Last used: '; }
+      .token-row .col-expires::before { content: 'Expires: '; }
+      .key-row span::before, .token-row span::before { color: var(--text-muted); font-weight: 600; }
+      /* Action cell -> full-width button at the foot of the card. */
+      .key-row .col-action, .token-row .col-action { margin-top: 12px; }
+      .key-row .col-action app-button, .token-row .col-action app-button { display: block; width: 100%; }
+      .key-row .col-action ::ng-deep .app-button__btn,
+      .token-row .col-action ::ng-deep .app-button__btn { width: 100%; }
+
+      /* Codex accounts & Cloud secret-provenance rows: let the long, unbreakable
+         mono strings (e.g. OPENCLOUD_KEYCLOAK_CLIENT_SECRET) wrap instead of
+         forcing the row -- and the whole page -- to scroll sideways. */
+      .codex-account-row { flex-wrap: wrap; }
+      .codex-account-row > * { min-width: 0; }
+      .codex-account-row .mono { overflow-wrap: anywhere; }
+    }
   `],
 })
 export class SettingsComponent implements OnInit {
