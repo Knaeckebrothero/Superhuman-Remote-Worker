@@ -673,42 +673,72 @@ def apply_instruction_enforcement(
     if not enforcement_map:
         return tools
 
+    def _enforcement_block(tool_name, files):
+        """Return a nudge string if a required instruction file is still unread
+        (gate closed), else None."""
+        for file_path in files:
+            if not context.was_recently_read(file_path):
+                from src.services.guardrails import format_nudge
+
+                model = (
+                    context._llm_config.model
+                    if context._llm_config is not None
+                    else None
+                )
+                return format_nudge(
+                    "read_file_required_error",
+                    model=model,
+                    file_path=file_path,
+                    tool_name=tool_name,
+                )
+        return None
+
+    def _make_sync_wrapper(orig, tool_name, files):
+        @functools.wraps(orig)
+        def wrapper(*args, **kwargs):
+            blocked = _enforcement_block(tool_name, files)
+            if blocked is not None:
+                return blocked
+            return orig(*args, **kwargs)
+
+        return wrapper
+
+    def _make_async_wrapper(orig, tool_name, files):
+        @functools.wraps(orig)
+        async def wrapper(*args, **kwargs):
+            blocked = _enforcement_block(tool_name, files)
+            if blocked is not None:
+                return blocked
+            return await orig(*args, **kwargs)
+
+        return wrapper
+
     for tool in tools:
         if tool.name not in enforcement_map:
             continue
 
         required_files = enforcement_map[tool.name]
-        original_func = tool.func
         tool_name = tool.name
 
-        @functools.wraps(original_func)
-        def make_wrapper(orig, name, files):
-            """Create enforcement wrapper closure."""
+        # Sync tools (e.g. next_phase_todos) expose .func; async @tool functions
+        # (e.g. cite_web / cite_document) expose .coroutine and are invoked via
+        # .ainvoke(), which bypasses .func. Wrap whichever the tool actually has —
+        # wrapping only .func makes enforcement a silent no-op for async tools.
+        wrapped = False
+        if getattr(tool, "func", None) is not None:
+            tool.func = _make_sync_wrapper(tool.func, tool_name, required_files)
+            wrapped = True
+        if getattr(tool, "coroutine", None) is not None:
+            tool.coroutine = _make_async_wrapper(
+                tool.coroutine, tool_name, required_files
+            )
+            wrapped = True
 
-            def wrapper(*args, **kwargs):
-                for file_path in files:
-                    if not context.was_recently_read(file_path):
-                        from src.services.guardrails import format_nudge
-
-                        model = (
-                            context._llm_config.model
-                            if context._llm_config is not None
-                            else None
-                        )
-                        return format_nudge(
-                            "read_file_required_error",
-                            model=model,
-                            file_path=file_path,
-                            tool_name=name,
-                        )
-                return orig(*args, **kwargs)
-
-            return wrapper
-
-        tool.func = make_wrapper(original_func, tool_name, required_files)
-        logger.debug(
-            f"Applied instruction enforcement to {tool_name}: requires {required_files}"
-        )
+        if wrapped:
+            logger.debug(
+                f"Applied instruction enforcement to {tool_name}: "
+                f"requires {required_files}"
+            )
 
     wrapped_count = sum(1 for t in tools if t.name in enforcement_map)
     if wrapped_count:
