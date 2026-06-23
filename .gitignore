@@ -33,6 +33,9 @@ env/
 # Local environment
 .env
 
+# Helm local-dev credentials overlay — values-local.example.yaml is tracked; the real one is NOT
+deployment/values-local.yaml
+
 # SQLite database files
 *.db
 

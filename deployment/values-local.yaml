@@ -169,7 +169,8 @@ secrets:
     DEFAULT_DS_WEBDAV_USERNAME: ""
     DEFAULT_DS_WEBDAV_PASSWORD: ""
 
-    # --- Codex proxy (disabled, stub) ---
+    # --- Codex proxy (enabled below: codexProxy.enabled) — management key for
+    # the proxy's remote-management API + the orchestrator's /api/codex/* calls.
     CODEX_MANAGEMENT_KEY: "dev_codex_key"
 
     # --- Internal API keys ---
@@ -252,6 +253,26 @@ litellm:
   # With {} the fleet key still mints (unlimited), so agents are off the admin
   # master key (the security half of 2a) without throttling real usage.
   backstop: {}
+
+# -----------------------------------------------------------------------------
+# Codex OAuth proxy (CLIProxyAPI) — transport for gpt-5.x / Codex subscription
+# models. Enabled here to reproduce/debug Codex-routed issues locally (e.g.
+# docs/issues/session_empty_response_gpt5_codex_stop.md). The orchestrator
+# already points CODEX_PROXY_URL at the in-cluster service and reads
+# CODEX_MANAGEMENT_KEY from the dev secret above; flipping enabled spawns the
+# Deployment/Service/PVC. Image pinned to match dev (values-experimental.yaml)
+# and the version in the issue docs — chart default is :latest, which drifts
+# daily and would change the harmony parser under test.
+#
+# Post-deploy this proxy still needs an OpenAI OAuth login before it can serve
+# traffic: Admin → Models → Codex login (or POST /api/codex/login), open the
+# returned URL, then paste the localhost:1455 callback URL back into the cockpit
+# (the orchestrator relays it internally — no port-forward needed). Tokens
+# persist in the codex-proxy-auth PVC across restarts/upgrades.
+# -----------------------------------------------------------------------------
+codexProxy:
+  enabled: true
+  image: docker.io/eceasy/cli-proxy-api:v7.2.27
 
 # -----------------------------------------------------------------------------
 # Workspace PVC — single-node local-path is RWO-only, override the prod default
