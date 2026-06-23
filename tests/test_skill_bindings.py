@@ -141,6 +141,34 @@ def test_apply_enforcement_wrapper_uses_skill_path(tmp_path):
     assert tool.func() == "OK" and calls == [1]  # gate opened
 
 
+@pytest.mark.asyncio
+async def test_apply_enforcement_wraps_async_tool_coroutine(tmp_path):
+    """Async @tool functions (cite_web / cite_document) are invoked via
+    .coroutine (.ainvoke), never .func — so enforcement must wrap the coroutine,
+    or the before_tool gate is a silent no-op for them."""
+    ctx = _ctx(
+        tmp_path,
+        [
+            InstructionFileEntry(
+                trigger="before_tool:cite_web", skill="cite-as-you-write"
+            )
+        ],
+    )
+    calls = []
+
+    async def _cite(*a, **k):
+        calls.append(1)
+        return "CITED"
+
+    tool = SimpleNamespace(name="cite_web", func=None, coroutine=_cite)
+    apply_instruction_enforcement([tool], ctx)
+
+    blocked = await tool.coroutine()
+    assert "skills/cite-as-you-write/SKILL.md" in blocked and calls == []  # nudged
+    ctx.record_file_read("skills/cite-as-you-write/SKILL.md")
+    assert await tool.coroutine() == "CITED" and calls == [1]  # gate opened
+
+
 # ---------------------------------------------------------------------------
 # Task 3: bound-skill content rides the flag-independent instructions channel
 # ---------------------------------------------------------------------------
