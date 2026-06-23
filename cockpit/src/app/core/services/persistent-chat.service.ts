@@ -1752,6 +1752,16 @@ export class PersistentChatService {
                 });
                 break;
 
+            // Drop the in-progress reasoning bubble — the agent's empty-response
+            // retry replaces a dead-end reasoning stream with the retry's.
+            case 'thinking.reset':
+                this.dispatch({
+                    type: 'thinking_reset',
+                    messageId: (params['message_id'] as string) || undefined,
+                    timestamp: now,
+                });
+                break;
+
             case 'tool.started':
                 this.dispatch({
                     type: 'tool_started',
