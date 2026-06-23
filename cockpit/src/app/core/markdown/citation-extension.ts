@@ -1,42 +1,59 @@
 import {MarkedExtension} from 'marked';
 
 /**
- * Marked extension that renders agent citation markup as clickable links.
+ * Marked extension that turns the agent's inline citation markers into
+ * superscript reference elements the chat component resolves into a source
+ * popover.
  *
- * Patterns:
- *   【cite_web(Title, URL)】  ->  <a href="URL" target="_blank">Title</a>
- *   【cite_document(Title, Path)】  ->  <span title="Path">Title</span>
+ * The citation tools (`cite_web` / `cite_document`) return `[<id>]` and the
+ * agent is instructed to place that marker on the claim it supports, so the
+ * marker IS the citation id:
+ *
+ *   [21]  ->  <sup class="citation-ref" data-cid="21">21</sup>
+ *
+ * This stage is stateless — it only marks candidates. The chat component then
+ * post-processes each `.citation-ref` against the citations it fetched for the
+ * thread (keyed by `data-cid`): real ids get renumbered 1..k in order of
+ * appearance, made clickable, and given a source popover; ids with no matching
+ * citation are restored to their literal `[N]` text, so a stray `[5]` in normal
+ * prose is never hijacked.
+ *
+ * A `[N]` immediately followed by `(`, `[`, or `:` is left untouched so real
+ * markdown links and reference definitions (`[1](url)`, `[1][ref]`, `[1]: url`)
+ * still parse normally.
  */
 export function citationExtension(): MarkedExtension {
     return {
         extensions: [
             {
-                name: 'citation',
+                name: 'citationRef',
                 level: 'inline',
                 start(src: string) {
-                    return src.indexOf('\u3010');
+                    const i = src.indexOf('[');
+                    return i < 0 ? undefined : i;
                 },
                 tokenizer(src: string) {
-                    const match = src.match(
-                        /^\u3010cite_(web|document)\(([^,]+),\s*(.+?)\)\u3011/
-                    );
-                    if (match) {
-                        return {
-                            type: 'citation',
-                            raw: match[0],
-                            citationType: match[1],
-                            title: match[2].trim(),
-                            ref: match[3].trim(),
-                        };
+                    const match = src.match(/^\[(\d+)\]/);
+                    if (!match) {
+                        return undefined;
                     }
-                    return undefined;
+                    const after = src.charAt(match[0].length);
+                    if (after === '(' || after === '[' || after === ':') {
+                        // Real markdown link / reference definition — not a citation.
+                        return undefined;
+                    }
+                    return {
+                        type: 'citationRef',
+                        raw: match[0],
+                        cid: match[1],
+                    };
                 },
                 renderer(token: any) {
-                    if (token.citationType === 'web') {
-                        const safeUrl = encodeURI(token.ref);
-                        return `<a class="citation citation-web" href="${safeUrl}" target="_blank" rel="noopener" title="${token.ref}">${token.title}</a>`;
-                    }
-                    return `<span class="citation citation-doc" title="${token.ref}">${token.title}</span>`;
+                    // The id rides a class (`cid-N`) as well as data-cid: class
+                    // survives the markdown HTML sanitizer for sure, so the
+                    // component can always recover the id even after it renumbers
+                    // the visible text.
+                    return `<sup class="citation-ref cid-${token.cid}" data-cid="${token.cid}">${token.cid}</sup>`;
                 },
             },
         ],
