@@ -54,6 +54,7 @@ The feature set and the verification approach are unchanged.
 | **3a** | Cloud anchor capture (D7, agent-side): `webdav_read` captures the snapshot-anchor (etag, raw-bytes `file_sha256`, `webdav_url`, backend); `cite_document` threads it onto the source's `metadata.cloud` (JSONB — no migration) | ✅ shipped + k3d-verified |
 | **3b** | Original-bytes snapshot: `POST /api/citations/snapshot` (internal-key) persists the raw file to `srw-snapshots` content-addressed (`citations/<sha[:2]>/<sha>`, HEAD-dedup) → `snapshot_blob_key` on `metadata.cloud`; agent uploads via `OrchestratorClient` at cite-time (it has no S3 creds) | ✅ shipped + k3d-verified |
 | **3c** | On-view drift check + view-original: `GET /api/citations/{id}/drift` (viewing-user auth) re-fetches the live source via MainCloud **only when it's provably under the viewer's own cloud home**, hash-compares → `unchanged`/`changed`/`unreachable`; `GET /api/citations/{id}/snapshot` streams the backup via `get_blob`; cockpit UI deferred | ✅ shipped + k3d-verified |
+| **4** | **Inline citation usage** — agent skill (`cite-as-you-write`, `before_tool:cite_*` enforced) so claims are referenced inline as `[N]`, + cockpit `[N]`→hover-source rendering | 🚧 greenlit 2026-06-23; Half A building, Half B specified |
 
 Verified by the gated async Postgres round-trip
 (`tests/citation_engine/test_integration_postgres.py`, 6/6 vs the dev
@@ -485,6 +486,123 @@ Phase 3c — on-view drift check + view-original (done):
   OpenCloud home — exercise on a full real-cloud agent run. **Cockpit citations
   view stays deferred** (the data layer + endpoints are now ready for it).
 
+## Phase 4 — Inline citation usage (skill + cockpit rendering)
+
+*Greenlit 2026-06-23. Half A (agent skill) building; Half B (cockpit rendering)
+specified, not started. This is **usage + UX**, not plumbing — Phases 1–3 made
+citations real; Phase 4 makes them reach the reader.*
+
+**Problem (observed).** In a live persistent session (2026-06-23) the assistant
+searched the web 7×, extracted a page, and called `cite_web` 4× — then wrote its
+answer with **zero inline references**. The citations existed in `srw_vector` but
+were invisible to the user. The instruction to reference them already exists
+(`config/prompts/instructions.md` §Citations: "return a citation ID you can
+reference inline as `[N]`") and was simply not followed. So Phase 4 is a
+**compliance + rendering** gap, not a missing capability: make the agent reliably
+attach the marker it already receives, and make the cockpit turn that marker into
+a hoverable source.
+
+**Keystone decision — markers are `citation_id`; the cockpit prettifies.**
+`cite_web` / `cite_document` already return `[<citation_id>]`
+(`src/tools/citation/sources.py:291,406`) and tell the agent "Use [N] when
+referencing." That id is a global `SERIAL` (e.g. `[1847]`) — durable and
+unambiguous but ugly as a footnote, and the model can't reliably renumber across a
+turn. So the contract is: **the agent keeps emitting `[<id>]`; the cockpit parses
+it, looks the id up in the session's citations, and renders a friendly superscript
+renumbered 1..k in order of appearance**, with the popup keyed off the real
+record. This dissolves the numbering problem and links prose → real citation rows
+(→ later, Phase 3 snapshot/drift).
+
+### Half A — agent cites inline, reliably (building)
+
+- **New bundled skill `cite-as-you-write`**
+  (`config/skills/cite-as-you-write/SKILL.md`): when a claim rests on a source,
+  cite it → take the `[N]` the tool returns → append it to the exact sentence the
+  source supports → carry every marker into the final answer. Names the exact
+  failure mode ("an uncited citation is invisible to the reader"). House style of
+  `verify-before-done`.
+- **Binding — `before_tool:cite_web` + `before_tool:cite_document`,
+  `enforce: true`.** This is the *only* trigger that fires in persistent sessions:
+  `phase:*` never fires there (no phase loop — `src/persistent_graph.py` never
+  calls `get_phase_instruction_files()`), and `before_tool` + `enforce:false`
+  (active inject) has no injector in the persistent turn loop. `enforce:true`
+  (read-before-tool gate, the `todo-guide` pattern) works in **both** worker and
+  persistent; reading happens just before the first cite, so the guidance is in
+  context exactly when it's needed. Bound skills are intentionally filtered out of
+  the model-invoked menu (no redundancy) — the enforced binding *is* the delivery.
+- **Placement** (instruction-file lists are replace-on-override —
+  `deep_merge`, `loader.py:179`): `config/defaults.yaml` (covers non-overriding
+  workers), re-declared in `config/experts/scholar/config.yaml` (the worker
+  citation user, which overrides `instruction_files`), and a new block in
+  `config/experts/assistant/config.yaml` (the default persistent agent — the
+  session in the screenshot; persistent experts opt in individually since
+  `persistent_defaults.yaml` omits `instruction_files` by convention).
+- **Flag-safe.** Bound-skill content is frozen into `_resolved_instructions`
+  directly from `config/skills/<name>/SKILL.md` at dispatch — *flag-independent*
+  (`loader.py:4302-4312`), unlike the `SKILLS_DB_ENABLED`-gated discovery menu. So
+  this works in every environment, exactly like `todo-guide`. (The only soft-lock
+  risk is a missing/unparseable `SKILL.md` — then the enforce gate would reject the
+  cite tool forever; mitigated by shipping a valid skill + the k3d verify.)
+- **Reinforce the base instruction** (`config/prompts/instructions.md`
+  §Citations) — strengthen the one-liner the agent is currently skipping (worker
+  prompt; the skill carries the persistent side).
+- **Honest limit.** The enforced binding guarantees the *guidance is present*
+  whenever the agent cites; it can't guarantee the model weaves every marker into
+  the final prose. This is LLM compliance — Phase 4 moves the odds a lot, not to
+  certainty.
+
+### Half B — cockpit renders `[N]` as hover popups (specified, not started)
+
+- **New thread-scoped read endpoint**
+  `GET /api/persistent/threads/{thread_id}/citations` (`require_thread_owner`).
+  The existing `GET /api/jobs/{id}/citations` **404s for a thread** —
+  `require_job_access` does `get_job()` first and a thread has no `jobs` row
+  (`orchestrator/security/access.py:445-447`), even though citations are stored
+  with `job_id = thread_id`. Reuse the existing list SQL (`main.py:12155`), which
+  already returns popup-ready fields (claim, source name/type, verification
+  status, confidence, created_at).
+- **Repoint the orphaned renderer.**
+  `cockpit/src/app/core/markdown/citation-extension.ts` currently tokenizes
+  `【cite_web(Title,URL)】` CJK-bracket markup that **nothing emits** (confirmed: no
+  prompt / persona / skill produces it; the agent emits `[N]`). Repoint it at the
+  real `[<id>]` form, renumber for display, render a superscript. Styles
+  (`.citation-web` / `.citation-doc`) and the reusable `[appTooltip]` directive
+  already exist.
+- **Fetch + attach.** `persistent-chat.service.ts` fetches the session's
+  citations and hands the id→record map to the renderer.
+- **Popup** via `[appTooltip]` / card: source name, link, claim,
+  verification-status badge.
+- **Deferred to a Half-B v2:** "view original" + drift badge — they reuse Phase
+  3's `/snapshot` + `/drift`, which also gate on `user_can_access_any_job` and so
+  404 for thread ids; they'd need thread-aware auth. This is where Phase 4 grows
+  into Follow-up ① (full citations view) and exercises Follow-up ② (real-cloud
+  drift).
+
+### Relationship to the deferred follow-ups
+
+Phase 4 **absorbs the user-visible core of Follow-up ①** (citations surface
+inline, in the chat, rather than only in a separate panel) and is the natural
+carrier for **Follow-up ③** (persistent feedback) — both now need the persistent
+citation read path. ② becomes the way to exercise the Half-B v2 drift badge. ④/⑤
+are unaffected. Binding the skill to the cite tools is also a **manual preview of
+the deferred "toolset → auto-skill" idea**: the skill now travels with the
+citation tools in practice, de-risking the real auto-binding design later.
+
+### Acceptance criteria
+
+- **A1:** `cite-as-you-write` parses (`parse_skill_md`) and is bound
+  `before_tool:cite_*` enforced in `defaults` + `scholar` + `assistant`. On k3d:
+  in a persistent session the gate fires (the agent must read the skill before its
+  first cite) and the assistant's answer carries `[N]` markers tied to the
+  citations it created.
+- **B1:** `GET /api/persistent/threads/{tid}/citations` returns the owner's
+  session citations (200), and 403/404s for non-owners.
+- **B2:** the cockpit renders `[<id>]` in assistant messages as superscript
+  markers with a working source popup; the dead `【…】` path is removed or
+  repointed.
+
+*(Half A is the current build target.)*
+
 ## Follow-ups (deferred — not greenlit)
 
 Phases 1–3 are complete and verified; the items below were deliberately scoped
@@ -492,6 +610,11 @@ out, not skipped. None blocks the shipped feature. Listed roughly by leverage �
 if one is picked up, spin it into its own issue/feature doc.
 
 ### 1. Cockpit citations view — *highest leverage; makes the backend user-visible*
+
+> **Largely absorbed by Phase 4** — inline `[N]` rendering surfaces citations in
+> the chat itself. A separate job-wide list panel may still be useful; the v2
+> popup (view-original + drift) is the remaining part that completes this item.
+
 The entire data layer + read API is ready and proven (`GET /api/citations/{id}`,
 `/api/citations/{id}/snapshot`, `/api/citations/{id}/drift`), but nothing
 surfaces it. A view would list a job's citations with verification status, render
@@ -512,6 +635,10 @@ high-setup (a real-cloud session + a deliberately-wrong citation to trip the
 verifier). *Same e2e bar deferred since 2b/3a.*
 
 ### 3. Persistent-session feedback injection
+
+> **Carried by Phase 4** — the persistent citation read path Phase 4 Half B adds
+> is the same seam this needs; do it alongside Half B.
+
 Persistent sessions already **verify** citations (2a wired `verify_aux` onto their
 ToolContext), but the D4 *feedback* injection is worker-only — it lives in
 `graph.py::_inject_transient_messages`, whereas persistent sessions assemble turn

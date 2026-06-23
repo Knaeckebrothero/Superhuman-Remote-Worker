@@ -232,6 +232,19 @@ databases:
     storageSize: "2Gi"
 
 # -----------------------------------------------------------------------------
+# Codex OAuth proxy (CLIProxyAPI) — transport for gpt-5.x / Codex subscription
+# models. Off by default (chart default). Flip enabled to reproduce/debug
+# Codex-routed issues locally; the orchestrator already points CODEX_PROXY_URL
+# at the in-cluster service and reads CODEX_MANAGEMENT_KEY from the dev secret
+# above. Image pinned to match dev (chart default is :latest, which drifts
+# daily). Post-deploy needs a one-time OpenAI OAuth login via Admin → Models →
+# Codex login (tokens persist in the codex-proxy-auth PVC).
+# -----------------------------------------------------------------------------
+codexProxy:
+  enabled: true
+  image: docker.io/eceasy/cli-proxy-api:v7.2.27
+
+# -----------------------------------------------------------------------------
 # Workspace PVC — single-node k3d uses local-path, which is RWO-only.
 #
 # networkPolicy.extraEgress: in-cluster Traefik hairpin for OpenCloud
