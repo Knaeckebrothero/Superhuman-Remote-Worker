@@ -19,7 +19,7 @@ related:
   - database_architecture.md
   - no_workspace_agent_mode.md
   - main_cloud_abstraction.md
-status: phase-3-implemented
+status: phase-4-implemented
 date: 2026-06-19
 updated: 2026-06-23
 ---
@@ -34,8 +34,10 @@ verified). It *was* still built like a standalone library — its own synchronou
 DB connection with SQLite/Postgres dual modes, its own LLM client for
 verification, its own embedding stack, and a schema duality. This document
 covers turning it into a **first-class SRW subsystem** that uses SRW's native
-infrastructure for every one of those concerns. **Phases 1–3 are now
-implemented** — see *Implementation status* below.
+infrastructure for every one of those concerns. **Phases 1–3 (plumbing) are
+implemented + k3d-verified, and Phase 4 (inline citation usage — agent cites
+inline, cockpit renders it) is now implemented + k3d-verified too** — see
+*Implementation status* below.
 
 This is **orthogonal to** the existing citation docs:
 [[citation_engine_roadmap]] and [[citation_engine_rework]] describe the engine's
@@ -53,8 +55,8 @@ The feature set and the verification approach are unchanged.
 | **2b** | D4 feedback loop (worker): execute node re-injects still-`failed` citations each turn; `archive_phase` boundary reconcile; DB-driven + self-resolving | ✅ shipped + k3d-verified |
 | **3a** | Cloud anchor capture (D7, agent-side): `webdav_read` captures the snapshot-anchor (etag, raw-bytes `file_sha256`, `webdav_url`, backend); `cite_document` threads it onto the source's `metadata.cloud` (JSONB — no migration) | ✅ shipped + k3d-verified |
 | **3b** | Original-bytes snapshot: `POST /api/citations/snapshot` (internal-key) persists the raw file to `srw-snapshots` content-addressed (`citations/<sha[:2]>/<sha>`, HEAD-dedup) → `snapshot_blob_key` on `metadata.cloud`; agent uploads via `OrchestratorClient` at cite-time (it has no S3 creds) | ✅ shipped + k3d-verified |
-| **3c** | On-view drift check + view-original: `GET /api/citations/{id}/drift` (viewing-user auth) re-fetches the live source via MainCloud **only when it's provably under the viewer's own cloud home**, hash-compares → `unchanged`/`changed`/`unreachable`; `GET /api/citations/{id}/snapshot` streams the backup via `get_blob`; cockpit UI deferred | ✅ shipped + k3d-verified |
-| **4** | **Inline citation usage** — interactive-prompt citation mandate (conditional on `has_tool`) + `cite-as-you-write` skill (`before_tool:cite_*` enforced) so claims are cited inline as `[N]`==citation_id; + cockpit `[N]`→hover-source rendering | Half A ✅ built + k3d-verified 2026-06-23 (Gemini: gate→`cite_web`→verified citation→`[21]`); Half B specified |
+| **3c** | On-view drift check + view-original: `GET /api/citations/{id}/drift` (viewing-user auth) re-fetches the live source via MainCloud **only when it's provably under the viewer's own cloud home**, hash-compares → `unchanged`/`changed`/`unreachable`; `GET /api/citations/{id}/snapshot` streams the backup via `get_blob`; cockpit UI → Phase 4 | ✅ shipped + k3d-verified |
+| **4** | **Inline citation usage** — interactive-prompt citation mandate (conditional on `has_tool`) + `cite-as-you-write` skill (`before_tool:cite_*` enforced) so claims are cited inline as `[N]`==citation_id; + cockpit `[N]`→hover-source rendering | Half A ✅ built + k3d-verified 2026-06-23 (Gemini: gate→`cite_web`→verified citation→`[21]`); Half B ✅ built + k3d-verified 2026-06-23 (Gemini cite → cockpit renumbered/hoverable/clickable `[N]`) |
 
 Verified by the gated async Postgres round-trip
 (`tests/citation_engine/test_integration_postgres.py`, 6/6 vs the dev
@@ -404,7 +406,8 @@ persistent deferred**:
   already *verify* citations (2a wired `verify_aux` on their ToolContext), but
   their turn messages are assembled via the MemoryManager seam, not the worker's
   `_inject_transient_messages`, so the feedback injection there is a separate,
-  clean follow-on. (A cockpit citations view remains the other deferred reader.)
+  clean follow-on. (The cockpit reader shipped as inline `[N]` rendering in
+  Phase 4 Half B.)
 
 **Phase 3 — Cloud citations** — split into **3a (✅ shipped + k3d-verified
 2026-06-20)**, **3b (✅ shipped + k3d-verified 2026-06-20)**, and **3c (✅
@@ -489,7 +492,7 @@ Phase 3c — on-view drift check + view-original (done):
 ## Phase 4 — Inline citation usage (skill + cockpit rendering)
 
 *Greenlit 2026-06-23. Half A (agent cites inline) ✅ built + k3d-verified
-2026-06-23; Half B (cockpit rendering) specified, not started. This is
+2026-06-23; Half B (cockpit rendering) ✅ built + k3d-verified 2026-06-23. This is
 **usage + UX**, not plumbing — Phases 1–3 made citations real; Phase 4 makes them
 reach the reader.*
 
@@ -574,32 +577,41 @@ require a session model with solid tool-use.** Dev currently enables only gemma 
 per-session `model` override to Gemini. Implication: the session default model must
 be tool-capable for this to pay off in normal use.
 
-### Half B — cockpit renders `[N]` as hover popups (specified, not started)
+### Half B — cockpit renders `[N]` as hover popups ✅ built + k3d-verified 2026-06-23
 
-- **New thread-scoped read endpoint**
-  `GET /api/persistent/threads/{thread_id}/citations` (`require_thread_owner`).
-  The existing `GET /api/jobs/{id}/citations` **404s for a thread** —
-  `require_job_access` does `get_job()` first and a thread has no `jobs` row
-  (`orchestrator/security/access.py:445-447`), even though citations are stored
-  with `job_id = thread_id`. Reuse the existing list SQL (`main.py:12155`), which
-  already returns popup-ready fields (claim, source name/type, verification
-  status, confidence, created_at).
-- **Repoint the orphaned renderer.**
-  `cockpit/src/app/core/markdown/citation-extension.ts` currently tokenizes
-  `【cite_web(Title,URL)】` CJK-bracket markup that **nothing emits** (confirmed: no
-  prompt / persona / skill produces it; the agent emits `[N]`). Repoint it at the
-  real `[<id>]` form, renumber for display, render a superscript. Styles
-  (`.citation-web` / `.citation-doc`) and the reusable `[appTooltip]` directive
-  already exist.
-- **Fetch + attach.** `persistent-chat.service.ts` fetches the session's
-  citations and hands the id→record map to the renderer.
-- **Popup** via `[appTooltip]` / card: source name, link, claim,
-  verification-status badge.
+As built — the `[<id>]` marker resolves to the real citation, renumbered for
+display, with a source popover:
+
+- **Thread-scoped read endpoint** `GET /api/persistent/threads/{thread_id}/citations`
+  (`require_thread_owner`; `main.py`). The by-job endpoint **404s for a thread**
+  (`require_job_access` → `get_job()` is None, no `jobs` row), so this one queries
+  `citations WHERE job_id = thread_id` directly and returns the popup fields
+  (claim, source name / type / identifier, verification status, confidence).
+  Verified: bogus thread → 404; owner → the session's rows.
+- **Marked extension repointed** (`citation-extension.ts`): the dead
+  `【cite_web(...)】` tokenizer is replaced by one that turns `[<id>]` into
+  `<sup class="citation-ref cid-<id>">`. It skips `[1](url)` / `[1][ref]` / `[1]:`
+  so real links survive, and carries the id in a **class** (survives the HTML
+  sanitizer, unlike `data-*`).
+- **Fetch** (`persistent-chat.service.ts`): `loadCitations` GETs the endpoint into
+  a `citationsByCid` signal on connect **and** after every turn (an effect on
+  `isWaitingForInput`), so new citations resolve live without a reload.
+- **Resolver** (`CitationRefDirective`, applied to the agent-text `<markdown>`):
+  after render + whenever citations load, each `.citation-ref` is renumbered 1..k
+  in order of appearance, given a source popover (native `title`: name / URL /
+  claim / verification status), and made click-to-open when the source is a URL.
+  A `[N]` with no matching citation (a stray number in prose) is restored to
+  literal text once citations have loaded — non-destructively, so it still
+  upgrades if a citation arrives later.
+- **Verified end-to-end on k3d (2026-06-23):** a Gemini session cited a real web
+  source (`cite_web` ×2 → citations `id=22,23`); the answer carried `[22] [23]`,
+  and the cockpit (logged in as the owner) rendered them as superscript `¹ ²`,
+  `resolved clickable`, each with a hover popover of source + claim + verification
+  status, linking to the source URL.
 - **Deferred to a Half-B v2:** "view original" + drift badge — they reuse Phase
-  3's `/snapshot` + `/drift`, which also gate on `user_can_access_any_job` and so
-  404 for thread ids; they'd need thread-aware auth. This is where Phase 4 grows
-  into Follow-up ① (full citations view) and exercises Follow-up ② (real-cloud
-  drift).
+  3's `/snapshot` + `/drift`, which gate on `user_can_access_any_job` and so 404
+  for thread ids; they'd need thread-aware auth. This is where Phase 4 grows into
+  Follow-up ① (full citations view) and exercises Follow-up ② (real-cloud drift).
 
 ### Relationship to the deferred follow-ups
 
@@ -621,13 +633,17 @@ citation tools in practice, de-risking the real auto-binding design later.
   carries `[N]` markers == the citation ids. Caveat: requires a tool-capable
   session model — the weak dev default (gemma) self-authors `[N]` and never calls
   `cite_web`.
-- **B1:** `GET /api/persistent/threads/{tid}/citations` returns the owner's
-  session citations (200), and 403/404s for non-owners.
-- **B2:** the cockpit renders `[<id>]` in assistant messages as superscript
-  markers with a working source popup; the dead `【…】` path is removed or
-  repointed.
+- **B1 ✅ (met 2026-06-23):** `GET /api/persistent/threads/{tid}/citations`
+  returns the owner's session citations (200) and 404s for a non-existent thread;
+  guarded by `require_thread_owner` (admin bypass; 403 for non-owners).
+- **B2 ✅ (met 2026-06-23):** the cockpit renders `[<id>]` in assistant messages
+  as superscript markers — renumbered 1..k, with a source popover and
+  click-to-open — resolved against the fetched citations; the dead `【…】` path is
+  gone. Verified live (Gemini session: markers `¹ ²` → citations 22/23, popover +
+  source URLs).
 
-*(Half A ✅ done; Half B is the next build target.)*
+*(Half A + Half B ✅ done + k3d-verified; only the Half-B v2 view-original/drift
+badge remains deferred.)*
 
 ## Follow-ups (deferred — not greenlit)
 
@@ -637,9 +653,11 @@ if one is picked up, spin it into its own issue/feature doc.
 
 ### 1. Cockpit citations view — *highest leverage; makes the backend user-visible*
 
-> **Largely absorbed by Phase 4** — inline `[N]` rendering surfaces citations in
-> the chat itself. A separate job-wide list panel may still be useful; the v2
-> popup (view-original + drift) is the remaining part that completes this item.
+> **Shipped via Phase 4 Half B (2026-06-23)** — inline `[N]` rendering now
+> surfaces citations in the chat itself (renumbered, hoverable, click-to-open).
+> What remains of this item: an optional separate job-wide list panel, and the
+> "view original" + drift badge (Half-B v2 — needs thread-aware auth on
+> `/snapshot` + `/drift`).
 
 The entire data layer + read API is ready and proven (`GET /api/citations/{id}`,
 `/api/citations/{id}/snapshot`, `/api/citations/{id}/drift`), but nothing
@@ -690,18 +708,33 @@ prerequisite — the saved snapshot is the real anchor. *Effort:* moderate (capt
 in `webdav_read` / MainCloud + a fileid→path resolve on the drift path).
 *Plugs into:* the 3a anchor + the 3c re-fetch.
 
+### 6. Tool-capable session model (for engine-backed citations) — *operational*
+Phase-4 verification showed the **session default model** is the gating factor for
+engine-backed citations. `RedHatAI/gemma-4-31B` (the dev session default) won't
+call `cite_web` even when the prompt mandates it (it self-authors `[N]` and writes
+no citation rows); Gemini runs the full tool-backed flow. For sessions to produce
+engine-backed citations in normal use — not via a per-session `model` override —
+the session default must be a model with solid tool-use, or one must be registered
+and selectable. On dev today only gemma is enabled in the `models` table (a
+`google` key exists in `system_api_keys` but no Gemini is registered). *Effort:*
+config/ops (Admin → Models: register a tool-capable chat model; set
+`persistent_defaults.yaml` `llm.model` or the per-user default accordingly).
+*Plugs into:* `model_registry`, `persistent_defaults.yaml`.
+
 ## Open questions & deferrals
 
 Resolved this round (now **D4–D6**): verdict feedback = inject + batch reconcile;
 sources stay distinct but cross-referenceable; the verification model is a
 configurable slot. Consumers of the async verdict (former open Q4) follow from
 those: the **agent** via injection + reconcile, the **DB** `verification_status`
-+ the **audit trail** always, and the **cockpit** as the deferred reader below.
++ the **audit trail** always, and the **cockpit** — inline `[N]` rendering
+shipped in Phase 4 Half B.
 
 **Deferred (out of scope for this integration):** consolidated in *Follow-ups
-(deferred — not greenlit)* above — the cockpit citations view, the real-cloud
+(deferred — not greenlit)* above — the real-cloud
 agent-job e2e, persistent-session feedback injection, async semantic chunking,
-and the `oc:fileid` durable link.
+the `oc:fileid` durable link, and the Half-B v2 cockpit view-original/drift
+badge. (Phase 4 shipped the agent-cites-inline + cockpit `[N]` rendering halves.)
 
 **Resolved (now D7):** the cloud-document reference model — snapshot-as-anchor
 (save text + blob, best-effort pointer, on-view drift check). The earlier
