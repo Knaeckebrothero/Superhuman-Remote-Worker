@@ -21,6 +21,7 @@ import {FormsModule} from '@angular/forms';
 import {Router, RouterLink} from '@angular/router';
 import {firstValueFrom, Subscription} from 'rxjs';
 import {MarkdownComponent} from 'ngx-markdown';
+import {CitationRefDirective} from '../../core/markdown/citation-ref.directive';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {ChatAttachment, PermissionRequest, PersistentChatService, RunningToolInfo, ToolCallInfo,} from '../../core/services/persistent-chat.service';
 import {
@@ -418,6 +419,7 @@ export function clearDraft(threadId: string | null): void {
         DecimalPipe,
         RouterLink,
         MarkdownComponent,
+        CitationRefDirective,
         SidebarToggleComponent,
         TranslocoPipe,
         AppButtonComponent,
@@ -667,7 +669,7 @@ export function clearDraft(threadId: string | null): void {
             </span>
           </summary>
           <div class="thinking-content">
-            <markdown [data]="event.content"></markdown>
+            <markdown appCitationRef [data]="event.content"></markdown>
           </div>
         </details>
       </ng-template>
@@ -816,7 +818,7 @@ export function clearDraft(threadId: string | null): void {
                     @let answer = finalAnswer(turn);
                     @if (answer) {
                       <div class="event-text turn-final-answer">
-                        <markdown [data]="answer"></markdown>
+                        <markdown appCitationRef [data]="answer"></markdown>
                       </div>
                     } @else {
                       <span class="turn-headline">{{ collapsedHeadline(turn) }}</span>
@@ -858,7 +860,7 @@ export function clearDraft(threadId: string | null): void {
                           }
                           @case ('text') {
                             <div class="event-text">
-                              <markdown [data]="group.event.content"></markdown>
+                              <markdown appCitationRef [data]="group.event.content"></markdown>
                             </div>
                           }
                           @case ('compaction') {

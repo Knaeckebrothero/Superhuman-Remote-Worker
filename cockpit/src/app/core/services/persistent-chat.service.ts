@@ -206,6 +206,20 @@ interface ConnectionPayload {
  *
  * All state is exposed as Angular signals for reactive UI updates.
  */
+/** A citation created during a persistent session (engine-backed). The marker
+ *  the agent emits inline — `[<id>]` — is `id`; the chat resolves it to this. */
+export interface ThreadCitation {
+    id: number;
+    claim: string;
+    source_id: number;
+    source_name: string;
+    source_type: string;
+    source_identifier: string | null;
+    verification_status: string;
+    confidence: string;
+    created_at: string;
+}
+
 @Injectable({providedIn: 'root'})
 export class PersistentChatService {
     private readonly http = inject(HttpClient);
@@ -218,6 +232,16 @@ export class PersistentChatService {
     private readonly destroyRef = inject(DestroyRef);
 
     constructor() {
+        // Refresh the thread's engine citations whenever a turn finishes (the
+        // agent may have created new ones via cite_web/cite_document), so inline
+        // [N] markers resolve live without a reload. See CitationRefDirective.
+        effect(() => {
+            const waiting = this.isWaitingForInput();
+            const tid = untracked(() => this.threadId());
+            if (waiting && tid) {
+                void this.loadCitations(tid);
+            }
+        });
         // Single source of truth for the "Starting session" card phase
         // transitions. The orchestrator emits session.lifecycle events on
         // the user's always-on /notifications/events SSE from every
@@ -304,6 +328,11 @@ export class PersistentChatService {
     // first main-LLM call reports usage.
     readonly usage = signal<UsageState | null>(null);
     readonly threadId = signal<string | null>(null);
+    /** Engine citations for this session, keyed by citation id (the agent emits
+     *  the id as the inline `[N]` marker). Drives inline resolution +
+     *  source popover (see CitationRefDirective). Loaded on connect + per turn. */
+    readonly citationsByCid = signal<Map<number, ThreadCitation>>(new Map());
+    readonly citationsLoaded = signal(false);
 
     /**
      * True iff a session start is *actively in flight* — POST creating a thread,
@@ -533,11 +562,14 @@ export class PersistentChatService {
             this.undoAvailable.set(false);
             this.isSessionPaused.set(false);
             this.runningTool.set(null);
+            this.citationsByCid.set(new Map());
+            this.citationsLoaded.set(false);
 
             this.threadId.set(threadId);
             await this.loadHistory(threadId);
         }
         await this.loadThreadMeta(threadId);
+        void this.loadCitations(threadId);
 
         // Don't auto-connect to ended sessions — render the read-only resume
         // card instead. The user explicitly clicks "Resume" to come back online.
@@ -594,6 +626,35 @@ export class PersistentChatService {
      * turns won't have thought events — known gap, see
      * `docs/features/session_turn_rendering.md`.
      */
+    /**
+     * Fetch the engine citations for this session (job_id == thread_id) and
+     * index them by citation id for inline [N] resolution. Best-effort — a
+     * failure just leaves markers unresolved (restored to literal text).
+     */
+    private async loadCitations(threadId: string): Promise<void> {
+        try {
+            const resp = await firstValueFrom(
+                this.http.get<{citations: ThreadCitation[]}>(
+                    `${environment.apiUrl}/persistent/threads/${threadId}/citations`,
+                ),
+            );
+            const map = new Map<number, ThreadCitation>();
+            for (const c of resp?.citations ?? []) {
+                map.set(c.id, c);
+            }
+            if (this.threadId() === threadId) {
+                this.citationsByCid.set(map);
+                this.citationsLoaded.set(true);
+            }
+        } catch {
+            // Non-fatal: citations are an enhancement. Mark "loaded" so the
+            // renderer stops waiting and leaves any [N] as literal text.
+            if (this.threadId() === threadId) {
+                this.citationsLoaded.set(true);
+            }
+        }
+    }
+
     private async loadHistory(threadId: string): Promise<void> {
         try {
             // 1. Cache-first: paint the cached conversation immediately (zero

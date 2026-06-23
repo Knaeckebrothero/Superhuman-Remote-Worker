@@ -15497,6 +15497,55 @@ async def resume_thread(
     return {"status": "created", "thread_id": thread_id}
 
 
+@app.get("/api/persistent/threads/{thread_id}/citations")
+async def get_thread_citations(
+    thread_id: str,
+    request: Request,
+    limit: int = Query(default=200, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+) -> dict[str, Any]:
+    """List citations created in a persistent session, for inline ``[N]`` rendering.
+
+    The citation engine stores a session's citations with ``job_id = thread_id``
+    (it maps ``CitationContext.session_id`` → ``job_id``), so the thread UUID *is*
+    the ``job_id`` — there is no separate thread column. Owner-only (the by-job
+    endpoint 404s for a thread since no ``jobs`` row exists). The marker the agent
+    emits is the citation ``id``; the cockpit renumbers for display and resolves
+    each ``[id]`` to a row returned here.
+    """
+    await require_thread_owner(request, postgres_db, thread_id)
+    try:
+        async with vector_db.acquire() as conn:
+            count_row = await conn.fetchrow(
+                "SELECT COUNT(*) AS total FROM citations WHERE job_id = $1::uuid",
+                thread_id,
+            )
+            total = count_row["total"] if count_row else 0
+            rows = await conn.fetch(
+                """SELECT c.id, LEFT(c.claim, 300) AS claim, c.source_id,
+                       s.name AS source_name, s.type::text AS source_type,
+                       s.identifier AS source_identifier,
+                       c.verification_status::text AS verification_status,
+                       c.confidence::text AS confidence,
+                       c.created_at
+                FROM citations c
+                JOIN sources s ON c.source_id = s.id
+                WHERE c.job_id = $1::uuid
+                ORDER BY c.id ASC
+                LIMIT $2 OFFSET $3""",
+                thread_id,
+                limit,
+                offset,
+            )
+            return {
+                "citations": [dict(r) for r in rows],
+                "total": total,
+                "thread_id": thread_id,
+            }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
 @app.get("/api/persistent/threads/{thread_id}/messages")
 async def get_thread_messages_history(
     thread_id: str,
