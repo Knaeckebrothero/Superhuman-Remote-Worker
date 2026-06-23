@@ -183,6 +183,7 @@ POST   /api/persistent/threads                                                  
 DELETE /api/persistent/threads/{thread_id}                                              gated:require_thread_owner
 GET    /api/persistent/threads/{thread_id}                                              gated:require_thread_owner
 POST   /api/persistent/threads/{thread_id}/approve/{approval_id}                        gated:require_thread_owner
+GET    /api/persistent/threads/{thread_id}/citations                                    gated:require_thread_owner
 GET    /api/persistent/threads/{thread_id}/ide                                          gated:require_thread_owner
 POST   /api/persistent/threads/{thread_id}/input                                        gated:require_approved_user
 POST   /api/persistent/threads/{thread_id}/interrupt                                    gated:require_approved_user
