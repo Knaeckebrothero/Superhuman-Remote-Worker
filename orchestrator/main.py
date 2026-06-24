@@ -142,6 +142,7 @@ from security.credential_files import (  # noqa: E402
 from security.csrf import CSRFMiddleware  # noqa: E402
 from auth import bff_router  # noqa: E402
 from routers import automations_router  # noqa: E402
+from routers import project_loops_router  # noqa: E402
 from routers.sessions import router as sessions_router  # noqa: E402
 from services.cron_dispatcher import cron_dispatcher_loop  # noqa: E402
 from services.litellm_gateway import (  # noqa: E402
@@ -5493,6 +5494,7 @@ app.include_router(bff_router)
 app.include_router(graph_router)
 app.include_router(uploads_router)
 app.include_router(automations_router)
+app.include_router(project_loops_router)
 app.include_router(sessions_router)
 
 
@@ -9305,6 +9307,184 @@ async def _trigger_verification_on_complete(
         logger.info(f"Verification job {critic_job_id} created for job {job_id}")
 
 
+def _loop_deadline_passed(run_until: Any) -> bool:
+    """True if the project loop's run_until deadline has passed (tz-aware)."""
+    if run_until is None:
+        return False
+    if isinstance(run_until, str):
+        try:
+            run_until = datetime.fromisoformat(run_until)
+        except ValueError:
+            return False
+    if run_until.tzinfo is None:
+        run_until = run_until.replace(tzinfo=timezone.utc)
+    return datetime.now(timezone.utc) >= run_until
+
+
+async def _spawn_loop_job(
+    loop: dict[str, Any],
+    *,
+    role: str,
+    iteration: int,
+) -> dict[str, Any]:
+    """Create + provision + dispatch one bare project-loop job.
+
+    Shared by the loop start endpoint and the ``_advance_project_loop`` hook.
+    Mirrors the automation run-now path: ``create_loop_job`` does the DB write,
+    then we provision the Gitea repo and nudge the dispatcher. Raises on a
+    failed job create (caller decides how to handle); provisioning / dispatch
+    failures are non-fatal (logged), matching POST /api/jobs + run-now.
+    """
+    from services.job_provisioning import provision_job_repo
+    from services.project_loops import create_loop_job
+
+    job = await create_loop_job(postgres_db, loop, role=role, iteration=iteration)
+
+    try:
+        await provision_job_repo(
+            job_row=job,
+            gitea_client=gitea_client,
+            postgres_db=postgres_db,
+            main_cloud_router=main_cloud_router,
+        )
+    except Exception:
+        logger.exception(
+            "project loop %s: repo provisioning failed for job %s (non-fatal)",
+            loop.get("id"),
+            job.get("id"),
+        )
+
+    try:
+        _trigger_dispatch()
+    except Exception:
+        logger.exception("project loop: _trigger_dispatch raised (non-fatal)")
+
+    return job
+
+
+async def _advance_project_loop(
+    job: dict[str, Any],
+    result: dict[str, Any],
+    actions: list[str],
+) -> None:
+    """Advance a project self-improvement loop when its current job completes.
+
+    If the completed job belongs to a *running* loop and is that loop's
+    in-flight job, decrement the budget, check stop conditions (budget /
+    deadline / consecutive-failure cap), and either stop the loop or rotate to
+    the next role and spawn the next job. Idempotent on ``current_job_id`` so a
+    re-delivered completion can't double-advance. Loop jobs run bare, so this is
+    the only completion hook that fires for them.
+
+    Design: docs/features/project_self_improvement_loop.md.
+    """
+    ctx = job.get("context")
+    if isinstance(ctx, str):
+        try:
+            ctx = json.loads(ctx)
+        except (json.JSONDecodeError, ValueError):
+            ctx = {}
+    loop_id = (ctx or {}).get("loop_id")
+    if not loop_id:
+        return
+
+    loop = await postgres_db.get_project_loop(str(loop_id))
+    if not loop or loop.get("status") != "running":
+        return  # paused / stopped / terminal — leave the current job, don't advance
+    if str(job["id"]) != str(loop.get("current_job_id") or ""):
+        return  # idempotency: only the in-flight job advances the loop
+
+    failed = bool(result.get("error")) or job.get("status") == "failed"
+    consecutive = (int(loop.get("consecutive_failures") or 0) + 1) if failed else 0
+    last_error = (result.get("error") or "job failed") if failed else None
+
+    remaining = loop.get("remaining_iterations")
+    next_remaining = (remaining - 1) if remaining is not None else None
+
+    # Stop conditions, re-checked every advance.
+    stop_reason: str | None = None
+    if next_remaining is not None and next_remaining <= 0:
+        stop_reason = "budget"
+    elif _loop_deadline_passed(loop.get("run_until")):
+        stop_reason = "deadline"
+    elif consecutive >= int(loop.get("max_consecutive_failures") or 3):
+        stop_reason = "failures"
+
+    if stop_reason:
+        await postgres_db.update_project_loop(
+            str(loop_id),
+            status=("failed" if stop_reason == "failures" else "completed"),
+            remaining_iterations=next_remaining,
+            consecutive_failures=consecutive,
+            last_error=last_error,
+            stop_reason=stop_reason,
+            current_job_id=None,
+        )
+        actions.append(f"project loop {str(loop_id)[:8]} stopped ({stop_reason})")
+        return
+
+    # Rotate to the next role and spawn the next job.
+    roles = loop.get("role_sequence") or ["scholar", "critic", "developer"]
+    next_index = (int(loop.get("seq_index") or 0) + 1) % len(roles)
+    next_role = roles[next_index]
+    total_run = int(loop.get("total_jobs_run") or 0) + 1
+
+    # Reflect the decremented budget in the kickoff the next job sees.
+    loop_for_spawn = dict(loop)
+    loop_for_spawn["remaining_iterations"] = next_remaining
+
+    try:
+        child = await _spawn_loop_job(
+            loop_for_spawn, role=next_role, iteration=total_run
+        )
+    except Exception as e:
+        logger.exception("project loop %s: failed to spawn next job", loop_id)
+        await postgres_db.update_project_loop(
+            str(loop_id),
+            status="failed",
+            remaining_iterations=next_remaining,
+            consecutive_failures=consecutive,
+            last_error=f"spawn failed: {e}",
+            stop_reason="failures",
+            current_job_id=None,
+        )
+        actions.append(f"project loop {str(loop_id)[:8]} stopped (spawn failed)")
+        return
+
+    await postgres_db.update_project_loop(
+        str(loop_id),
+        seq_index=next_index,
+        current_job_id=str(child["id"]),
+        remaining_iterations=next_remaining,
+        consecutive_failures=consecutive,
+        total_jobs_run=total_run,
+        last_error=last_error,
+    )
+    actions.append(
+        f"project loop {str(loop_id)[:8]} → {next_role} job {str(child['id'])[:8]}"
+    )
+
+
+async def _resume_project_loop(loop_id: str) -> dict[str, Any] | None:
+    """Resume a paused project loop.
+
+    Sets status back to ``running``. If the in-flight job already reached a
+    terminal state while the loop was paused (so the advance that would have
+    fired was suppressed), re-run that advance now so the rotation continues;
+    otherwise the still-running job advances the loop naturally on completion.
+    """
+    loop = await postgres_db.update_project_loop(loop_id, status="running")
+    if not loop:
+        return None
+    cur = loop.get("current_job_id")
+    if cur:
+        cur_job = await postgres_db.get_job(str(cur))
+        if cur_job and cur_job.get("status") in ("completed", "failed", "cancelled"):
+            await _advance_project_loop(cur_job, {}, [])
+            loop = await postgres_db.get_project_loop(loop_id)
+    return loop
+
+
 async def _trigger_curation_final_pass(
     target_job_id: str,
     target_job: dict[str, Any] | None = None,
@@ -9636,6 +9816,16 @@ async def complete_job(
                 logger.error(
                     f"Error triggering curation for {job_id}: {e}", exc_info=True
                 )
+
+        # 5d. Advance project self-improvement loop (if this job belongs to one).
+        # Loop jobs run bare, so this is the only completion hook that fires for
+        # them; it spawns the next role's job or stops the loop on budget.
+        try:
+            await _advance_project_loop(job, result, actions)
+        except Exception as e:
+            logger.error(
+                f"Error advancing project loop for {job_id}: {e}", exc_info=True
+            )
 
         # 6. Trigger dispatch (freed agent can pick up queued work)
         _trigger_dispatch()
