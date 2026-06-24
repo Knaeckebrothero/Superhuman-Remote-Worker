@@ -138,14 +138,22 @@ async def start_project_loop(
 
 @router.get("/{project_id}/loop")
 async def get_project_loop(request: Request, project_id: str) -> dict[str, Any]:
-    """Return the project's active loop. 404 if none is active."""
+    """Return the project's current loop.
+
+    Prefers the active (running|paused) loop; falls back to the most recent
+    terminal one so the cockpit can show the outcome (status + stop_reason)
+    after an unattended run finished. 404 only if the project never had a loop.
+    """
     from main import postgres_db  # late import: avoid circular
 
     await require_approved_user(request, postgres_db)
     await require_project_member(request, postgres_db, project_id, min_role="viewer")
     loop = await postgres_db.get_active_project_loop(project_id)
     if not loop:
-        raise HTTPException(status_code=404, detail="No active loop for this project")
+        recent = await postgres_db.list_project_loops(project_id=project_id)
+        loop = recent[0] if recent else None
+    if not loop:
+        raise HTTPException(status_code=404, detail="No loop for this project")
     return loop
 
 

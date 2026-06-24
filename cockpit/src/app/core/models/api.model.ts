@@ -729,6 +729,56 @@ export interface Project {
   member_count?: number;
 }
 
+/** Status of a project self-improvement loop. */
+export type ProjectLoopStatus =
+  | 'running'
+  | 'paused'
+  | 'stopped'
+  | 'completed'
+  | 'failed';
+
+/**
+ * A project self-improvement loop — the control row that runs jobs one at a
+ * time, rotating role_sequence (e.g. scholar→critic→developer) until a
+ * budget (max_iterations / run_until / consecutive-failure cap) stops it.
+ * Mirrors the project_loops table. See docs/features/project_self_improvement_loop.md.
+ */
+export interface ProjectLoop {
+  id: string;
+  project_id: string;
+  owner_id: string | null;
+  status: ProjectLoopStatus;
+  goal: string | null;
+  acceptance_criteria: string | null;
+  user_prompt: string | null;
+  model: string | null;
+  role_sequence: string[];
+  seq_index: number;
+  max_iterations: number | null;
+  remaining_iterations: number | null;
+  run_until: string | null;
+  max_consecutive_failures: number;
+  current_job_id: string | null;
+  total_jobs_run: number;
+  consecutive_failures: number;
+  last_error: string | null;
+  stop_reason: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/** Request body for starting a project loop (POST /projects/{id}/loop). */
+export interface ProjectLoopStartRequest {
+  model?: string | null;
+  role_sequence?: string[] | null;
+  max_iterations?: number | null;
+  run_until?: string | null;
+  acceptance_criteria?: string | null;
+  user_prompt?: string | null;
+  goal_override?: string | null;
+  max_consecutive_failures?: number;
+}
+
 /**
  * Workspace egress tier for a project. The set must stay in sync with
  * the CHECK constraint in 0016_project_network_tier.sql and the

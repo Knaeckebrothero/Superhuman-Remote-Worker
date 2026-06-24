@@ -40,6 +40,8 @@ import {
     MemoryListResponse,
     MemoryStats,
     Project,
+    ProjectLoop,
+    ProjectLoopStartRequest,
     ProjectCreateRequest,
     ProjectDatasource,
     ProjectMember,
@@ -1627,6 +1629,49 @@ export class ApiService {
     return this.http.delete<{ status: string }>(`${this.baseUrl}/projects/${id}`).pipe(
       catchError(() => of(null)),
     );
+  }
+
+  // ===== Project self-improvement loop =====
+  // See docs/features/project_self_improvement_loop.md. The GET returns null on
+  // 404 (no active loop) — the caller treats null as "show the start form".
+
+  getProjectLoop(projectId: string): Observable<ProjectLoop | null> {
+    return this.http
+      .get<ProjectLoop>(`${this.baseUrl}/projects/${projectId}/loop`)
+      .pipe(catchError(() => of(null)));
+  }
+
+  startProjectLoop(
+    projectId: string,
+    body: ProjectLoopStartRequest,
+  ): Observable<ProjectLoop | null> {
+    return this.http
+      .post<ProjectLoop>(`${this.baseUrl}/projects/${projectId}/loop`, body)
+      .pipe(catchError(() => of(null)));
+  }
+
+  pauseProjectLoop(projectId: string): Observable<ProjectLoop | null> {
+    return this.http
+      .post<ProjectLoop>(`${this.baseUrl}/projects/${projectId}/loop/pause`, {})
+      .pipe(catchError(() => of(null)));
+  }
+
+  resumeProjectLoop(projectId: string): Observable<ProjectLoop | null> {
+    return this.http
+      .post<ProjectLoop>(`${this.baseUrl}/projects/${projectId}/loop/resume`, {})
+      .pipe(catchError(() => of(null)));
+  }
+
+  stopProjectLoop(projectId: string): Observable<ProjectLoop | null> {
+    return this.http
+      .post<ProjectLoop>(`${this.baseUrl}/projects/${projectId}/loop/stop`, {})
+      .pipe(catchError(() => of(null)));
+  }
+
+  listProjectLoopJobs(projectId: string): Observable<Job[]> {
+    return this.http
+      .get<Job[]>(`${this.baseUrl}/projects/${projectId}/loop/jobs`)
+      .pipe(catchError(() => of([])));
   }
 
   getProjectMembers(id: string): Observable<ProjectMember[]> {

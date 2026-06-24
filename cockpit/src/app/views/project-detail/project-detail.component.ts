@@ -17,6 +17,7 @@ import {AppSelectComponent} from '../../ui/select';
 import {AppCheckboxComponent} from '../../ui/checkbox';
 import {AppBadgeComponent} from '../../ui/badge';
 import {AppFormFieldComponent} from '../../ui/form-field';
+import {ProjectLoopComponent} from './project-loop.component';
 import {
     Datasource,
     Expert,
@@ -33,7 +34,7 @@ import {
     User,
 } from '../../core/models/api.model';
 
-type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'experts' | 'members' | 'settings';
+type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'experts' | 'members' | 'loop' | 'settings';
 
 @Component({
   selector: 'app-project-detail-page',
@@ -53,6 +54,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
     AppBadgeComponent,
     AppFormFieldComponent,
     MarkdownComponent,
+    ProjectLoopComponent,
   ],
   template: `
     <div class="page-container">
@@ -728,6 +730,10 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
           }
 
           <!-- SETTINGS TAB -->
+          @if (activeTab() === 'loop') {
+            <app-project-loop [projectId]="project()?.id ?? ''" />
+          }
+
           @if (activeTab() === 'settings') {
             <div class="settings-section">
               <!-- General -->
@@ -1649,6 +1655,7 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
     { id: 'repos', labelKey: 'projectDetail.tabs.repos' },
     { id: 'experts', labelKey: 'projectDetail.tabs.experts' },
     { id: 'members', labelKey: 'projectDetail.tabs.members' },
+    { id: 'loop', labelKey: 'projectDetail.tabs.loop' },
     { id: 'settings', labelKey: 'projectDetail.tabs.settings' },
   ];
 
