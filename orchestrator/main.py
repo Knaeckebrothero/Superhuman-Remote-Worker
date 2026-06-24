@@ -1741,7 +1741,12 @@ async def _inject_dispatch_credentials(
             env_keys_block = config_override.setdefault("env_keys", {})
             if embedding_provider and "EMBEDDING_PROVIDER" not in env_keys_block:
                 env_keys_block["EMBEDDING_PROVIDER"] = embedding_provider
-            if embedding_model and "EMBEDDING_MODEL" not in env_keys_block:
+            if embedding_model:
+                # Resolve endpoint base_url + api_key even when EMBEDDING_MODEL
+                # was already set — _inject_env_key_credentials uses setdefault,
+                # so a pre-present MODEL must not suppress the _API_KEY (the bug
+                # that left jobs with MODEL+BASE_URL but no key:
+                # docs/issues/embedding_key_missing_silently_disables_memory_and_kb.md).
                 await _inject_env_key_credentials(
                     env_keys=env_keys_block,
                     prefix="EMBEDDING",
@@ -1784,6 +1789,39 @@ async def _inject_dispatch_credentials(
                 f"Dispatch: injected system default chat model: {system_chat_model} "
                 f"(job {job_id})"
             )
+
+    # System-default fallback for the embedding credential — same rationale as
+    # the chat model above. Embedding (memory + KB) was otherwise resolved ONLY
+    # inside the user-preference block, so a job whose user has no embedding
+    # preference (or no user at all) silently fell back to provider 'local' with
+    # no key, disabling memory + KB with no signal. Inject the admin-curated
+    # system embedding here so every job gets it the same way it gets its chat
+    # model. docs/issues/embedding_key_missing_silently_disables_memory_and_kb.md
+    _emb_env = config_override.setdefault("env_keys", {})
+    if "EMBEDDING_API_KEY" not in _emb_env:
+        _emb_model = _emb_env.get(
+            "EMBEDDING_MODEL"
+        ) or await postgres_db.resolve_default_for_capability("embedding")
+        if _emb_model:
+            await _inject_env_key_credentials(
+                env_keys=_emb_env,
+                prefix="EMBEDDING",
+                model_id=_emb_model,
+                user_id=user_id_str,
+                resolved_keys=resolved_keys,
+                capability="embedding",
+            )
+            if _emb_env.get("EMBEDDING_API_KEY"):
+                logger.info(
+                    f"Dispatch: injected system default embedding: {_emb_model} "
+                    f"(job {job_id})"
+                )
+            else:
+                logger.error(
+                    f"Dispatch: system embedding model {_emb_model!r} resolved no "
+                    f"usable API key for job {job_id} — memory/KB will be "
+                    f"unavailable. Check the embedding endpoint (Admin → Models)."
+                )
 
     return config_override
 
@@ -2072,6 +2110,14 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
         # job re-dispatched to a fresh agent doesn't lose its credentials.
         # (Still injected into config_override for the no-blob fallback path.)
         config_override = await _inject_dispatch_credentials(job, config_override)
+        # Log injected env-key NAMES (never values) so a missing credential —
+        # e.g. EMBEDDING_API_KEY, which silently disables memory + KB — is
+        # greppable at dispatch (embedding_key_missing_silently_disables_memory_and_kb.md).
+        logger.info(
+            "Dispatch: job %s injected env_key names=%s",
+            job_id,
+            sorted((config_override.get("env_keys") or {}).keys()),
+        )
 
         # Fail fast on a pinned model with no resolvable transport rather than
         # letting the agent silently fall back to api.openai.com and 401/404 with
@@ -2239,6 +2285,11 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
         # no llm.api_key and the loader would silently fall back to
         # OPENAI_API_KEY=not-needed and 401 against the user's router.
         config_override = await _inject_dispatch_credentials(job, config_override)
+        logger.info(
+            "Dispatch (resume): job %s injected env_key names=%s",
+            job_id,
+            sorted((config_override.get("env_keys") or {}).keys()),
+        )
 
         # Inject VM workspace config if job has a ready VM
         vm_ctx = _get_vm_context(job)
@@ -3572,10 +3623,28 @@ async def _inject_env_key_credentials(
     ):
         endpoint_row = await postgres_db.get_user_llm_endpoint(meta.endpoint_id)
         if endpoint_row:
-            if endpoint_row.get("base_url"):
-                env_keys.setdefault(f"{prefix}_BASE_URL", endpoint_row["base_url"])
-            if endpoint_row.get("api_key"):
-                env_keys.setdefault(f"{prefix}_API_KEY", endpoint_row["api_key"])
+            base_url = endpoint_row.get("base_url")
+            api_key = endpoint_row.get("api_key")
+            if base_url and not api_key:
+                # The endpoint is configured but its stored key didn't decrypt
+                # (get_user_llm_endpoint -> _decrypt_stored already logged the
+                # cause) or is empty. Surface it loudly and do NOT emit a
+                # half-credential (base_url without api_key) that silently
+                # degrades the agent to a keyless 'local' provider — the failure
+                # mode in docs/issues/embedding_key_missing_silently_disables_memory_and_kb.md.
+                logger.error(
+                    "Dispatch: %s endpoint %s resolved a base_url but no usable "
+                    "api_key (decrypt failed or empty) — not injecting "
+                    "%s_BASE_URL/_API_KEY; re-add the key in Admin → Models.",
+                    prefix,
+                    meta.endpoint_id,
+                    prefix,
+                )
+                return
+            if base_url:
+                env_keys.setdefault(f"{prefix}_BASE_URL", base_url)
+            if api_key:
+                env_keys.setdefault(f"{prefix}_API_KEY", api_key)
         return
 
     provider = meta.api_key_ref if meta is not None else _provider_of_model(model_id)
@@ -9699,6 +9768,38 @@ async def complete_job(
         # 1. Determine and set the new job status
         new_status, error_message = determine_job_status(job, result)
 
+        # 1·mem. Memory/KB-unavailable bounded retry. determine_job_status has
+        # already enforced the cap (paused under MEMORY_RETRY_CAP, failed at it).
+        # For the pause we must FREE the agent so the dispatcher re-dispatches the
+        # SAME job on a fresh pod — pause_job() does that, but only while the row
+        # is still 'processing', so it has to run before the generic status write
+        # below. The loop-advance hook is correctly skipped because the job never
+        # reaches a terminal status here.
+        # docs/issues/embedding_key_missing_silently_disables_memory_and_kb.md
+        if new_status == "paused":
+            _mfd = result.get("freeze_data")
+            if isinstance(_mfd, str):
+                try:
+                    _mfd = json.loads(_mfd)
+                except (ValueError, TypeError):
+                    _mfd = {}
+            if isinstance(_mfd, dict) and _mfd.get("freeze_type") in (
+                "memory_unavailable",
+                "kb_unavailable",
+            ):
+                # Atomic increment (race-proof) — a duplicate re-dispatch of the
+                # same paused job must not let two handlers both read the old
+                # value and stall the counter, which would defeat the cap.
+                _mn = await postgres_db.increment_job_memory_retry(job_id)
+                if await postgres_db.pause_job(job_id):
+                    _trigger_dispatch()
+                    actions.append(
+                        f"memory_unavailable: re-queued for retry "
+                        f"(memory_retry_count -> {_mn})"
+                    )
+                    job["status"] = "paused"
+                    new_status = None  # generic write + loop-advance must not re-handle
+
         # 1a. Mode A diff capture (job_cloud_export.md §3.3). If this is a
         # project-attached job that received a baseline at dispatch, see
         # whether the agent made changes under projects/<slug>/. If so,
@@ -9855,8 +9956,13 @@ async def complete_job(
         # 5d. Advance project self-improvement loop (if this job belongs to one).
         # Loop jobs run bare, so this is the only completion hook that fires for
         # them; it spawns the next role's job or stops the loop on budget.
+        # Only a TERMINAL outcome advances the loop: a paused job (e.g. the
+        # memory_unavailable bounded-retry) is re-dispatched as the SAME job, so
+        # the loop must keep waiting on it rather than rotate to the next role.
+        # docs/issues/embedding_key_missing_silently_disables_memory_and_kb.md
         try:
-            await _advance_project_loop(job, result, actions)
+            if job.get("status") in ("completed", "failed", "cancelled"):
+                await _advance_project_loop(job, result, actions)
         except Exception as e:
             logger.error(
                 f"Error advancing project loop for {job_id}: {e}", exc_info=True

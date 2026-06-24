@@ -714,6 +714,45 @@ class UniversalAgent:
             # Load tools for this job
             await self._setup_job_tools()
 
+            # Fail-closed guard: a memory-required job must not run "blind" if its
+            # embedding-backed stores failed to initialize (e.g. the dispatch
+            # dropped EMBEDDING_API_KEY). Pause for bounded re-dispatch — the
+            # orchestrator caps retries then fails — instead of silently running
+            # with memory + KB disabled. See
+            # docs/issues/embedding_key_missing_silently_disables_memory_and_kb.md.
+            _project_id = (self._job_metadata or {}).get("project_id")
+            _memory_missing = getattr(self, "_memory_degraded", False) or (
+                bool(_project_id) and getattr(self, "_kb_degraded", False)
+            )
+            if self.config.memory.required and _memory_missing:
+                logger.error(
+                    f"[{job_id}] memory.required=true but the embedding-backed "
+                    f"stores failed to initialize "
+                    f"(memory_degraded={getattr(self, '_memory_degraded', False)}, "
+                    f"kb_degraded={getattr(self, '_kb_degraded', False)}) — pausing "
+                    f"for re-dispatch instead of running without memory/KB"
+                )
+                self._cleanup_shell_manager()
+                self._close_datasource_connections()
+                await self._cleanup_checkpointer()
+                self._current_job_id = None
+                freeze_state = {
+                    "job_id": job_id,
+                    "should_stop": True,
+                    "freeze_data": {
+                        "freeze_type": "memory_unavailable",
+                        "reason": (
+                            "Embedding service unavailable at startup — memory "
+                            "(RecallStore)/KB failed to initialize and this job "
+                            "requires memory (memory.required=true). Check the "
+                            "embedding model/endpoint (Admin → Models)."
+                        ),
+                    },
+                }
+                if stream:
+                    return self._yield_error_state(freeze_state)
+                return freeze_state
+
             # Create checkpointer for this job (enables resume after crash)
             checkpoint_path = self._get_checkpoint_path(job_id)
             self._checkpoint_conn = await aiosqlite.connect(checkpoint_path)
@@ -1499,14 +1538,30 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             )
             logger.info("Applied inline config overrides")
 
-        # Apply env_keys overrides (user/project API keys for non-LLM providers)
+        # Apply env_keys overrides (user/project API keys for non-LLM providers).
+        # In the blob-delivery path the orchestrator sends config_override=None and
+        # carries the credentials inside resolved_config.agent.env_keys (via
+        # inject_blob_credentials). Fall back to the blob so embedding / vision /
+        # whisper / tts / citation keys still reach os.environ — otherwise the
+        # embedding-backed memory + KB silently fail for every blob-delivered job.
+        # docs/issues/embedding_key_missing_silently_disables_memory_and_kb.md
         env_keys = (metadata.get("config_override") or {}).get("env_keys")
+        if not env_keys:
+            env_keys = ((metadata.get("resolved_config") or {}).get("agent") or {}).get(
+                "env_keys"
+            )
         if env_keys:
             import os as _os
 
             for k, v in env_keys.items():
                 _os.environ[k] = v
-            logger.info(f"Applied {len(env_keys)} env key override(s)")
+            # Log the key NAMES (never values) so a missing credential — e.g.
+            # EMBEDDING_API_KEY, which silently disables memory + KB — is
+            # greppable in the agent log.
+            logger.info(
+                f"Applied {len(env_keys)} env key override(s): "
+                f"{sorted(env_keys.keys())}"
+            )
 
         # Recreate LLMs if config was modified for this job. On resume we
         # always recreate when frozen config was loaded — frozen config has
@@ -2283,7 +2338,12 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                 "disabled (no local fallback)"
             )
 
-        # Initialize RecallStore for Memory Light (if enabled)
+        # Initialize RecallStore for Memory Light (if enabled). These flags let
+        # the process_job guard fail-closed (pause for re-dispatch) when a
+        # memory-required job loses its embedding-backed stores. See
+        # docs/issues/embedding_key_missing_silently_disables_memory_and_kb.md.
+        self._memory_degraded = False
+        self._kb_degraded = False
         if self.config.memory.enabled:
             try:
                 from src.services.embedding_service import get_embedding_service
@@ -2329,7 +2389,27 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                 asyncio.create_task(embedding_service.verify_dimensions())
 
             except Exception as e:
-                logger.warning(f"Failed to initialize RecallStore (non-fatal): {e}")
+                self._memory_degraded = True
+                _provider = os.environ.get("EMBEDDING_PROVIDER", "local")
+                _model = os.environ.get("EMBEDDING_MODEL", "unknown")
+                from src.core.archiver import audit_unavailable as _audit_unavailable
+
+                _audit_unavailable(
+                    job_id=self._current_job_id,
+                    agent_type=self.config.agent_id,
+                    step_type="memory_unavailable",
+                    component="RecallStore",
+                    error=e,
+                    node_name="setup_job_tools",
+                    extra={
+                        "embedding_provider": _provider,
+                        "embedding_model": _model,
+                    },
+                )
+                logger.warning(
+                    f"Failed to initialize RecallStore (non-fatal): {e} "
+                    f"[embedding_provider={_provider}, model={_model}]"
+                )
 
         # Initialize KnowledgeGraphDB + KnowledgeStore for project knowledge base
         project_id = (
@@ -2358,7 +2438,28 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                         "Failed to connect to Neo4j — inline curation disabled"
                     )
             except Exception as e:
-                logger.warning(f"Failed to initialize knowledge base (non-fatal): {e}")
+                self._kb_degraded = True
+                from src.core.archiver import audit_unavailable as _audit_unavailable
+
+                _audit_unavailable(
+                    job_id=self._current_job_id,
+                    agent_type=self.config.agent_id,
+                    step_type="kb_unavailable",
+                    component="KnowledgeStore",
+                    error=e,
+                    node_name="setup_job_tools",
+                    extra={
+                        "project_id": str(project_id) if project_id else None,
+                        "embedding_provider": os.environ.get(
+                            "EMBEDDING_PROVIDER", "local"
+                        ),
+                    },
+                )
+                logger.warning(
+                    f"Failed to initialize knowledge base (non-fatal): {e} "
+                    f"[embedding_provider="
+                    f"{os.environ.get('EMBEDDING_PROVIDER', 'local')}]"
+                )
 
         # Load tools from registry, gated by what the workspace backend can
         # actually support (no_workspace_agent_mode.md §3.2/§7): the lite tiers

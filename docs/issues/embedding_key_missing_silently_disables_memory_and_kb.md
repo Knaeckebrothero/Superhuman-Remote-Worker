@@ -216,6 +216,69 @@ transport/hydration. Cross-check with the agent log line
   `qwen3-embedding-8b` enabled; endpoint `16d395f2` has a key. All three jobs
   share `user_id 52b14734-…`. `srw-orchestrator` uptime 4h17m / 0 restarts.
 
+## Implementation & e2e verification (2026-06-24, k3d)
+
+Built the three layers, and an end-to-end run on k3d (reactivating a real
+project loop) surfaced the **true root cause** plus three integration bugs —
+all fixed and verified.
+
+**Keystone root cause (deeper than first diagnosed): the blob-delivery path
+never applied `env_keys` to the agent's `os.environ`.** When a job carries a
+`resolved_config` blob (any expert/loop job), dispatch sends the JobStartRequest
+with `config_override=None` (`orchestrator/main.py` `_dispatch_job_to_agent`) and
+the credentials ride inside `resolved_config.agent.env_keys` (via
+`inject_blob_credentials`). But the agent applied env_keys **only** from
+`metadata.config_override.env_keys` (`src/agent.py`), which is `None` on that
+path — so `EMBEDDING_API_KEY` (and `VISION_/WHISPER_/TTS_/CITATION_*`) never
+reached `os.environ`, and the embedding service fell back to keyless `local`.
+This is why the original injection looked correct yet memory still died.
+**Fix:** the agent now falls back to `resolved_config.agent.env_keys` when
+`config_override` is absent. On k3d this flipped a blob job from
+`Applied 0 env keys` (memory/KB dead) to `Applied 16 env keys` →
+`RecallStore initialized` + `Knowledge base initialized` → job runs with memory.
+
+**Layers as shipped:**
+- **L1 (loud):** `audit_unavailable()` helper (`src/core/archiver.py`) emits a
+  `memory_unavailable`/`kb_unavailable` audit step; wired into the swallow sites
+  in `src/agent.py` + `src/api/persistent_session.py`; dispatch + agent log
+  injected env-key *names*.
+- **L2 (fail-closed):** `memory.required` flag (`MemoryConfig`, both YAML
+  defaults; set by `project_loops.create_loop_job`). Agent guard in
+  `process_job` freezes `memory_unavailable` when required+degraded;
+  `completion.determine_job_status` → paused under `MEMORY_RETRY_CAP=2`, then
+  failed; `/complete` frees the agent (`pause_job`) and atomically bumps the
+  retry counter.
+- **L3 (reliable injection):** system-default embedding fallback outside the
+  `user_id` gate; the `EMBEDDING_MODEL`-present skip-gate fixed; decrypt-failure
+  surfaced (no half-credential); **+ the keystone blob env_keys fix above.**
+
+**Integration bugs caught by the e2e (all fixed):**
+1. **Loop advanced on pause** — `_advance_project_loop` ran on every loop-job
+   `/complete`; a paused (retrying) job rotated the loop to the next role. Now
+   gated to terminal status only. *Verified:* on pause the loop keeps the same
+   `current_job_id`, no sibling spawn.
+2. **Agent not freed on memory-pause** — `update_job_status(status="paused")`
+   doesn't clear `assigned_agent_id`, so the job couldn't re-dispatch. Now uses
+   `pause_job()` before the generic write. *Verified:* `assigned_agent_id` NULL
+   → dispatcher re-provisions the job.
+3. **Retry counter race** — read-modify-write from the job dict let concurrent
+   re-dispatches both read the old value (counter stuck at 1 → cap never fires).
+   Now `increment_job_memory_retry()` does an atomic DB increment (monotonic →
+   cap termination guaranteed).
+
+**Verified on k3d:** dispatch injects `EMBEDDING_API_KEY`; with the keystone fix
+the agent applies it and memory/KB initialize (happy path); without a usable key
+the guard pauses (not blind-run) with a `memory_unavailable` audit + freeze;
+loop does not advance on pause; agent freed + re-dispatched. Unit: 57 tests
+(`test_complete_job_endpoint.py`, `test_dispatch_phase_credentials.py`); full
+`ruff check src/ orchestrator/` clean. (k3d's recurring `SSH tar failed …
+Permissions 0444 … vm-ssh-key` is an unrelated known issue —
+`dev_snapshot_ssh_key_perms_0444.md`.)
+
+**Follow-up:** add a regression test for the blob env_keys application (needs a
+small seam in `process_job`), and review whether `vision/whisper/tts/citation`
+were also silently keyless on the blob path before this fix (same mechanism).
+
 ## Related
 
 - [`preemption_before_first_checkpoint_replays_job_opening.md`](preemption_before_first_checkpoint_replays_job_opening.md)

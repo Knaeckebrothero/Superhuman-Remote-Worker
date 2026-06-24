@@ -2342,7 +2342,7 @@ describe('PersistentChatService — usage.updated telemetry', () => {
         const {service, es} = await setup();
         fireSseMessage(es, {
             method: 'usage.updated',
-            params: {turn: 1, input_tokens: 10_000, output_tokens: 500, reasoning_tokens: 200, ctx_limit_tokens: 128_000},
+            params: {turn: 1, input_tokens: 10_000, output_tokens: 500, reasoning_tokens: 200, ctx_limit_tokens: 128_000, compaction_threshold_tokens: 80_000},
         }, '1:1');
         fireSseMessage(es, {
             method: 'usage.updated',
@@ -2353,13 +2353,15 @@ describe('PersistentChatService — usage.updated telemetry', () => {
         expect(u.outputTokensTurn).toBe(1_200);
         expect(u.reasoningTokensTurn).toBe(300);
         expect(u.ctxLimitTokens).toBe(128_000);
+        // Compaction threshold sticks across same-turn frames that omit it.
+        expect(u.compactionThresholdTokens).toBe(80_000);
     });
 
     it('resets per-turn accumulators when the turn changes', async () => {
         const {service, es} = await setup();
         fireSseMessage(es, {
             method: 'usage.updated',
-            params: {turn: 1, input_tokens: 10_000, output_tokens: 500, ctx_limit_tokens: 128_000},
+            params: {turn: 1, input_tokens: 10_000, output_tokens: 500, ctx_limit_tokens: 128_000, compaction_threshold_tokens: 80_000},
         }, '1:1');
         fireSseMessage(es, {
             method: 'usage.updated',
@@ -2368,8 +2370,9 @@ describe('PersistentChatService — usage.updated telemetry', () => {
         const u = service.usage()!;
         expect(u.turn).toBe(2);
         expect(u.outputTokensTurn).toBe(50);
-        // limit carried over from the earlier frame
+        // limit + compaction threshold carried over from the earlier frame
         expect(u.ctxLimitTokens).toBe(128_000);
+        expect(u.compactionThresholdTokens).toBe(80_000);
     });
 
     it('marks reasoning estimated when the agent derives it; sticky within the turn', async () => {

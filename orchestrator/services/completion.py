@@ -247,6 +247,12 @@ def is_job_completion_freeze(job: dict[str, Any]) -> bool:
 # ---------------------------------------------------------------------------
 
 
+# Bounded re-dispatch cap for memory/KB-unavailable pauses. After this many
+# pause+retry cycles a memory-required job is failed instead of looping forever
+# (docs/issues/embedding_key_missing_silently_disables_memory_and_kb.md).
+MEMORY_RETRY_CAP = 2
+
+
 def determine_job_status(
     job: dict[str, Any],
     result: dict[str, Any],
@@ -336,6 +342,27 @@ def determine_job_status(
         # gets re-dispatched to a fresh-version agent by the auto-assign
         # dispatcher. State preserved through ``freeze_data`` + workspace.
         return ("paused", None)
+    if freeze_type in ("memory_unavailable", "kb_unavailable"):
+        # A memory-required job (e.g. the self-improvement loop) lost its
+        # embedding-backed stores at startup. Pause for bounded re-dispatch so a
+        # transient dispatch-time credential miss self-heals on the next pod;
+        # after MEMORY_RETRY_CAP attempts fail loudly instead of looping. The
+        # /complete handler bumps context.memory_retry_count on each pause.
+        ctx = job.get("context") or {}
+        if isinstance(ctx, str):
+            try:
+                ctx = json.loads(ctx)
+            except (json.JSONDecodeError, ValueError):
+                ctx = {}
+        retries = int((ctx or {}).get("memory_retry_count", 0) or 0)
+        if retries < MEMORY_RETRY_CAP:
+            return ("paused", None)
+        reason = fd.get("reason") or "memory/KB unavailable at startup."
+        return (
+            "failed",
+            f"{reason} Still unavailable after {retries} re-dispatch attempt(s) "
+            f"— check the embedding model/endpoint (Admin → Models).",
+        )
     return ("pending_review", None)
 
 

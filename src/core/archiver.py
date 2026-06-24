@@ -1408,6 +1408,47 @@ def get_archiver() -> Optional[LLMArchiver]:
     return _default_archiver
 
 
+def audit_unavailable(
+    *,
+    job_id: str,
+    agent_type: str,
+    step_type: str,
+    component: str,
+    error: BaseException,
+    node_name: str = "setup",
+    extra: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Record that a subsystem (memory/KB) failed to initialize.
+
+    Best-effort and never raises — safe to call from an ``except`` block. Emits
+    an audit step with a custom ``step_type`` (e.g. ``memory_unavailable`` /
+    ``kb_unavailable``) so the degradation is visible in the cockpit audit trail
+    instead of living only in a pod-log WARNING (see
+    docs/issues/embedding_key_missing_silently_disables_memory_and_kb.md).
+    """
+    arch = get_archiver()
+    if arch is None:
+        return
+    data: Dict[str, Any] = {
+        "component": component,
+        "error": str(error),
+        "error_type": type(error).__name__,
+    }
+    if extra:
+        data.update(extra)
+    try:
+        arch.audit_step(
+            job_id=str(job_id),
+            agent_type=agent_type or "",
+            step_type=step_type,
+            node_name=node_name,
+            iteration=0,
+            data=data,
+        )
+    except Exception:  # pragma: no cover - audit must never break the caller
+        pass
+
+
 def archive_llm_request(
     job_id: str,
     agent_type: str,

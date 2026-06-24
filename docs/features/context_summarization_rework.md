@@ -23,8 +23,9 @@ follow-up fixed same day** (found during live verification) + **§10 token-UI
 refinement** (2026-06-23: composer-bar alignment shipped; reasoning-token
 estimate + context-bar restyle implemented + test-verified; the presumed
 "LiteLLM usage gap" was investigated 2026-06-24 and found to be a misdiagnosis —
-the usage pipeline is healthy, live render now unblocked, see §10.4 and
-`docs/issues/litellm_streaming_usage_not_surfaced.md`).
+the usage pipeline is healthy and the bar is now LIVE-VERIFIED rendering with
+real telemetry, see §10.4 and
+`docs/done/litellm_streaming_usage_not_surfaced.md`).
 Absorbs the issues deferred from `docs/issues/session_silent_failure_audit.md` to the
 "summarization rework track": **#4-full** (failure semantics), **#5**
 (tool-result caps), **#6** (keep-window elision), **#7** (aux-context
@@ -517,33 +518,58 @@ column. Thresholds are static for now; tying warn/danger to the actual
 compaction trigger (so "danger" literally means "compaction imminent") is the
 obvious refinement.
 
-**10.4 Investigated: the "LiteLLM blocker" was a misdiagnosis — usage
-plumbing is healthy (2026-06-24).** The original hypothesis (LiteLLM /
+**10.4 The "LiteLLM blocker" was a misdiagnosis — usage plumbing is healthy,
+now LIVE-VERIFIED (2026-06-24).** The original hypothesis (LiteLLM /
 `include_usage` / the httpx tap eating the usage chunk) is **wrong**. Verified
-from inside the orchestrator pod:
+in-pod and then end-to-end in the cockpit:
 - `stream_options:{include_usage:True}` **is** on the wire (openai-SDK DEBUG
-  logs, 4/4 requests) — langchain converts `stream_usage=True` as expected.
+  logs) — langchain converts `stream_usage=True` as expected.
 - The SSE tap is a **pure pass-through**; plain `ChatOpenAI` and
   `ReasoningChatOpenAI` return **identical** `usage_metadata`.
-- The real session route for `gemma-4-moe` is **direct to `ai.h4ll.app`**
-  (registry endpoint `f475b8e1`), **not** the LiteLLM gateway — so the gateway
-  was never in the path. With the correctly-decrypted endpoint key a streamed
-  gemma turn returns `{input_tokens:21, output_tokens:20}`.
+- The session **does route through LiteLLM** on k3d — the live agent dispatch
+  log shows `base_url=http://srw-litellm:4000/v1` (gateway enabled here, as on
+  dev since `ac211a52`). The registry endpoint `ai.h4ll.app` (`f475b8e1`) is the
+  *upstream* LiteLLM forwards to, not the agent's dispatch URL. A streamed gemma
+  turn returns `{input_tokens, output_tokens, reasoning_tokens}`.
 - Real turns persist correct metrics (`thread_messages.metrics` for a live
   gemini thread: `input/output/reasoning = 15624/65/35`).
+
+**Live render (session `f1eab88e`, gemma-4-moe):** the redesigned bar showed
+`INPUT 11.5k · OUTPUT 1.9k · REASONING 1.8k · CTX 9%` above the composer, in the
+reading column — confirming 10.1 (alignment), 10.3 (chips + ctx-% hero), and a
+**native** reasoning count (no `~`, so 10.2's estimate wasn't even needed on the
+LiteLLM route).
 
 The empty bar that started this was an **errored turn** — `gemma-4-moe-strix`
 (now `enabled=false`) 401ing on a stale upstream key. A 401 captures no usage →
 no frame → no bar. Full evidence in
-`docs/issues/litellm_streaming_usage_not_surfaced.md` (now closed/corrected).
-Side-finding that *validates 10.2*: the direct `ai.h4ll.app` route reports no
-reasoning detail (`output_token_details: {}`), so the 10.2 estimate is the only
-source of a reasoning count on the real gemma route.
+`docs/done/litellm_streaming_usage_not_surfaced.md` (closed/corrected). The
+10.2 estimate remains the fallback for any route/model that omits the count
+(e.g. the direct `ai.h4ll.app` upstream returns `output_token_details:{}`).
+
+**10.5 Ctx gauge anchored on the compaction trigger (implemented + live-verified
+2026-06-24).** The gauge ramp was keyed to % of the raw model *window* (static
+75/90), but auto-compaction fires at an *absolute* `context_threshold_tokens`
+(≈80% of the window). So the danger zone was effectively unreachable: context
+gets compacted back down before window-fill could approach 90%. Fix: the agent
+now sends `compaction_threshold_tokens` on the `usage.updated` frame
+(persistent_graph.py, from `config.limits.context_threshold_tokens`); the cockpit
+anchors `usageCtxPct` on it (falling back to the window if absent), so the same
+75/90 ramp now means *"% toward the next compaction"* and `danger` ≈ compaction
+imminent. A `chat.usage.ctxHint` tooltip explains it. **Live-verified** (session
+`f052283c`): frame carried `compaction_threshold_tokens=104857`; gauge read 11%
+(= 11504/104857), not the window's 9% (= 11504/131072). Service spec extended
+(propagation + carry-over); 105 cockpit tests green; tsc + ruff clean.
+
+The other mooted refinement — a "turn failed" affordance — was found to be
+**already covered**: a turn error renders as a muted system line (live
+`turn.error` frame + persisted `role='error'` row) plus an `error` signal. The
+"empty bar reads as broken" worry was a debugging-in-isolation artifact; a real
+user sees the error line. No change made.
 
 **Status:** 10.1 shipped (`9da9ad17`); 10.2 + 10.3 implemented, test-verified,
-and committed on develop; 10.4 **investigated → not a blocker** (2026-06-24) —
-the usage pipeline is healthy. Live screenshot of 10.2/10.3 with real telemetry
-is now unblocked (the enabled `gemma-4-moe` route + decrypted key both work);
-only the visual capture remains. Optional refinements: tie warn/danger
-thresholds to the compaction trigger; add a "turn failed" affordance so an
-errored turn doesn't read as a broken bar.
+committed on develop; 10.4 **resolved — not a blocker, live-verified**
+(2026-06-24); 10.5 **implemented + live-verified** (2026-06-24, uncommitted on
+develop). The usage pipeline is healthy, the bar renders end-to-end with real
+telemetry, and the ctx gauge is correctly anchored on the compaction trigger.
+No open items.
