@@ -777,7 +777,8 @@
       "repos": "Repos",
       "experts": "Experten",
       "members": "Mitglieder",
-      "settings": "Einstellungen"
+      "settings": "Einstellungen",
+      "loop": "Loop"
     },
     "overview": {
       "description": "Beschreibung",
