@@ -19,6 +19,7 @@ spec:
         {{- include "srw.componentSelectorLabels" (dict "context" . "component" "orchestrator") | nindent 8 }}
     spec:
       serviceAccountName: {{ include "srw.fullname" . }}-orchestrator
+      terminationGracePeriodSeconds: {{ .Values.orchestrator.terminationGracePeriodSeconds }}
       {{- with .Values.global.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
@@ -1033,18 +1034,31 @@ spec:
               mountPath: /run/secrets/vm-ssh-key
               subPath: ssh-privatekey
               readOnly: true
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sh", "-c", "sleep {{ .Values.orchestrator.preStopDrainSeconds }}"]
+          startupProbe:
+            httpGet:
+              path: /api/health
+              port: 8085
+            periodSeconds: 5
+            failureThreshold: 30
+            timeoutSeconds: 3
           livenessProbe:
             httpGet:
               path: /api/health
               port: 8085
-            initialDelaySeconds: 30
             periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
           readinessProbe:
             httpGet:
               path: /api/health
               port: 8085
-            initialDelaySeconds: 10
             periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
           resources:
             {{- toYaml .Values.orchestrator.resources | nindent 12 }}
       volumes:

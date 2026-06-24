@@ -113,6 +113,14 @@ orchestrator:
   # and bind to a thread. Must accommodate a cold agent image pull on every
   # node — observed up to 5+ minutes for a fresh tag with no cache.
   agentBindTimeoutSeconds: 300
+  # -- Graceful shutdown. On SIGTERM the pod is removed from Service endpoints;
+  # the preStop sleep holds the container alive while that removal propagates
+  # (kube-proxy/LB) so in-flight requests drain instead of being cut. Long-lived
+  # SSE streams drop regardless and are recovered by thread_events replay.
+  preStopDrainSeconds: 15
+  # -- Must exceed preStopDrainSeconds + lifespan shutdown (background loops,
+  # NATS drain, DB pool close).
+  terminationGracePeriodSeconds: 60
 
 # =============================================================================
 # Agent
