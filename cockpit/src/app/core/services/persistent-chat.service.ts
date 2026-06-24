@@ -218,6 +218,18 @@ export interface ThreadCitation {
     verification_status: string;
     confidence: string;
     created_at: string;
+    /** Cloud-document citation (cite_document w/ snapshot-anchor): can drift-check. */
+    has_cloud_anchor?: boolean;
+    /** A backed-up original copy exists → "view original" can stream it. */
+    has_snapshot?: boolean;
+}
+
+/** On-view drift result for a cloud-document citation (Phase 3c /drift). */
+export interface CitationDrift {
+    citation_id: number;
+    live_state: 'unchanged' | 'changed' | 'unreachable' | 'unknown';
+    snapshot_available: boolean;
+    reason?: string;
 }
 
 @Injectable({providedIn: 'root'})
@@ -652,6 +664,40 @@ export class PersistentChatService {
             if (this.threadId() === threadId) {
                 this.citationsLoaded.set(true);
             }
+        }
+    }
+
+    /**
+     * On-view drift check for a cloud-document citation (Phase 3c /drift).
+     * Goes through the by-citation endpoint, which now authorizes session
+     * citations by thread ownership. Best-effort — null on any failure.
+     */
+    async fetchCitationDrift(citationId: number): Promise<CitationDrift | null> {
+        try {
+            return await firstValueFrom(
+                this.http.get<CitationDrift>(
+                    `${environment.apiUrl}/citations/${citationId}/drift`,
+                ),
+            );
+        } catch {
+            return null;
+        }
+    }
+
+    /**
+     * Fetch the backed-up original bytes of a cited cloud document (Phase 3c
+     * /snapshot) as a Blob, so "view original" carries the auth token (a raw
+     * window.open to the URL would not). Null if unavailable/unauthorized.
+     */
+    async fetchCitationSnapshotBlob(citationId: number): Promise<Blob | null> {
+        try {
+            return await firstValueFrom(
+                this.http.get(`${environment.apiUrl}/citations/${citationId}/snapshot`, {
+                    responseType: 'blob',
+                }),
+            );
+        } catch {
+            return null;
         }
     }
 

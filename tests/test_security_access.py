@@ -362,6 +362,76 @@ class TestUserCanAccessIdeEntity:
 
 
 # =============================================================================
+# user_can_access_job_or_thread — citations carry job_id == thread_id for
+# sessions; this is the gate behind /api/citations/{id}{,/snapshot,/drift}
+# =============================================================================
+
+
+class TestUserCanAccessJobOrThread:
+    @pytest.mark.asyncio
+    async def test_admin_always_true(self, user_admin, fake_db):
+        assert (
+            await access.user_can_access_job_or_thread(
+                user_admin, fake_db, "any-id-at-all"
+            )
+            is True
+        )
+
+    @pytest.mark.asyncio
+    async def test_job_owner_true(self, user_a, job_a, fake_db):
+        assert (
+            await access.user_can_access_job_or_thread(
+                user_a, fake_db, str(job_a["id"])
+            )
+            is True
+        )
+
+    @pytest.mark.asyncio
+    async def test_other_user_job_false(self, user_b, job_a, fake_db):
+        assert (
+            await access.user_can_access_job_or_thread(
+                user_b, fake_db, str(job_a["id"])
+            )
+            is False
+        )
+
+    @pytest.mark.asyncio
+    async def test_thread_owner_true(self, user_a, thread_a, fake_db):
+        # The session-citation case: job_id is actually a thread id the user owns.
+        assert (
+            await access.user_can_access_job_or_thread(
+                user_a, fake_db, str(thread_a["id"])
+            )
+            is True
+        )
+
+    @pytest.mark.asyncio
+    async def test_other_user_thread_false(self, user_b, thread_a, fake_db):
+        assert (
+            await access.user_can_access_job_or_thread(
+                user_b, fake_db, str(thread_a["id"])
+            )
+            is False
+        )
+
+    @pytest.mark.asyncio
+    async def test_unknown_id_false(self, user_a, fake_db):
+        assert (
+            await access.user_can_access_job_or_thread(
+                user_a, fake_db, "neither-job-nor-thread"
+            )
+            is False
+        )
+
+    @pytest.mark.asyncio
+    async def test_none_entity_false(self, user_a, fake_db):
+        # Orphan citation (job_id NULL) → caller passes None → fail closed.
+        assert (
+            await access.user_can_access_job_or_thread(user_a, fake_db, None) is False
+        )
+
+
+# =============================================================================
 # require_sudo_request_authority — owner of related job's project, or admin
 # =============================================================================
 

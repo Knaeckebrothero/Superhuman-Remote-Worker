@@ -21,7 +21,7 @@ related:
   - main_cloud_abstraction.md
 status: phase-4-implemented
 date: 2026-06-19
-updated: 2026-06-23
+updated: 2026-06-24
 ---
 
 # Citation Engine — Native SRW Integration
@@ -52,11 +52,11 @@ The feature set and the verification approach are unchanged.
 |---|---|---|
 | **1** | DB collapse + async-native on the `srw_vector` pool; SQLite / `mode` / `psycopg2` / separate DSN + embedding stacks deleted; chunk embeddings on SRW's async `get_embedding_service()` | ✅ shipped + k3d-verified |
 | **2a** | Verifier → auxiliary-LLM (`VerifyCitationTask`); `cite_*` returns `pending` and self-schedules async write-back; D6 model slot (`CITATION_LLM_*` moved engine→agent); `AuxHealth` + `verify_citations` config gate | ✅ shipped + k3d-verified |
-| **2b** | D4 feedback loop (worker): execute node re-injects still-`failed` citations each turn; `archive_phase` boundary reconcile; DB-driven + self-resolving | ✅ shipped + k3d-verified |
+| **2b** | D4 feedback loop: execute node re-injects still-`failed` citations each turn; `archive_phase` boundary reconcile; DB-driven + self-resolving. **Worker + persistent sessions** (persistent = same retrieval in `_execute_turn`/`_inject_context_pairs`, ephemeral injection) | ✅ worker k3d-verified 06-20; persistent k3d-verified 06-23 |
 | **3a** | Cloud anchor capture (D7, agent-side): `webdav_read` captures the snapshot-anchor (etag, raw-bytes `file_sha256`, `webdav_url`, backend); `cite_document` threads it onto the source's `metadata.cloud` (JSONB — no migration) | ✅ shipped + k3d-verified |
 | **3b** | Original-bytes snapshot: `POST /api/citations/snapshot` (internal-key) persists the raw file to `srw-snapshots` content-addressed (`citations/<sha[:2]>/<sha>`, HEAD-dedup) → `snapshot_blob_key` on `metadata.cloud`; agent uploads via `OrchestratorClient` at cite-time (it has no S3 creds) | ✅ shipped + k3d-verified |
 | **3c** | On-view drift check + view-original: `GET /api/citations/{id}/drift` (viewing-user auth) re-fetches the live source via MainCloud **only when it's provably under the viewer's own cloud home**, hash-compares → `unchanged`/`changed`/`unreachable`; `GET /api/citations/{id}/snapshot` streams the backup via `get_blob`; cockpit UI → Phase 4 | ✅ shipped + k3d-verified |
-| **4** | **Inline citation usage** — interactive-prompt citation mandate (conditional on `has_tool`) + `cite-as-you-write` skill (`before_tool:cite_*` enforced) so claims are cited inline as `[N]`==citation_id; + cockpit `[N]`→hover-source rendering | Half A ✅ built + k3d-verified 2026-06-23 (Gemini: gate→`cite_web`→verified citation→`[21]`); Half B ✅ built + k3d-verified 2026-06-23 (Gemini cite → cockpit renumbered/hoverable/clickable `[N]`) |
+| **4** | **Inline citation usage** — interactive-prompt citation mandate (conditional on `has_tool`) + `cite-as-you-write` skill (`before_tool:cite_*` enforced) so claims are cited inline as `[N]`==citation_id; + cockpit `[N]`→hover-source rendering | Half A ✅ built + k3d-verified 2026-06-23 (Gemini: gate→`cite_web`→verified citation→`[21]`); Half B ✅ built + k3d-verified 2026-06-23 (Gemini cite → cockpit renumbered/hoverable/clickable `[N]`); Half-B v2 ✅ built + k3d-verified 2026-06-24 (citations panel + view-original/drift via `user_can_access_job_or_thread`) |
 
 Verified by the gated async Postgres round-trip
 (`tests/citation_engine/test_integration_postgres.py`, 6/6 vs the dev
@@ -87,9 +87,9 @@ covered by `src/`). Pure relocation, no behaviour change — re-verified ruff-cl
 flat-`PYTHONPATH` subpackage, **not** a pip/`pyproject` package, to match the repo.
 
 **Deferred follow-ons** (none are defects — all were explicitly scoped out of
-Phases 1–3): a cockpit citations view, a full real-cloud agent-job e2e,
-semantic chunking behind an async chunker, and the `oc:fileid` durable cloud
-link (persistent-session feedback injection shipped 2026-06-23). They're
+Phases 1–3): a full real-cloud agent-job e2e, semantic chunking behind an async
+chunker, and the `oc:fileid` durable cloud link (the cockpit citations view +
+persistent-session feedback injection shipped 2026-06-23/24). They're
 enumerated with rationale,
 integration points, and rough effort in *Follow-ups (deferred — not greenlit)*
 below. Per-phase detail + acceptance criteria are in *Phasing & acceptance
@@ -618,10 +618,19 @@ display, with a source popover:
   and the cockpit (logged in as the owner) rendered them as superscript `¹ ²`,
   `resolved clickable`, each with a hover popover of source + claim + verification
   status, linking to the source URL.
-- **Deferred to a Half-B v2:** "view original" + drift badge — they reuse Phase
-  3's `/snapshot` + `/drift`, which gate on `user_can_access_any_job` and so 404
-  for thread ids; they'd need thread-aware auth. This is where Phase 4 grows into
-  Follow-up ① (full citations view) and exercises Follow-up ② (real-cloud drift).
+- **Half-B v2 — ✅ shipped + k3d-verified 2026-06-24:** a session **citations
+  panel** (`citations-panel.component.ts`, toggled from the chat header) lists the
+  session's citations with verification badges, and for cloud-document citations a
+  **"view original"** link (streams the cite-time snapshot) + an on-demand **drift
+  badge**. The blocker was auth: Phase 3's `/snapshot` + `/drift` (+ the by-id
+  detail) gated on `user_can_access_any_job`, which 404s for thread ids. New
+  `user_can_access_job_or_thread` resolver (job-first, then thread-owner —
+  mirroring `user_can_access_ide_entity`; the IDE helper now delegates to it) fixes
+  all three. The thread-citations endpoint now also returns `has_snapshot` /
+  `has_cloud_anchor` so the panel only shows cloud controls where they apply. This
+  is where Phase 4 grew into Follow-up ① (the inline + panel views together) and
+  it sets up Follow-up ② (real-cloud drift exercises the `unchanged`/`changed`
+  branch — today's synthetic anchor still resolves to `unreachable`).
 
 ### Relationship to the deferred follow-ups
 
@@ -652,9 +661,16 @@ citation tools in practice, de-risking the real auto-binding design later.
   click-to-open — resolved against the fetched citations; the dead `【…】` path is
   gone. Verified live (Gemini session: markers `¹ ²` → citations 22/23, popover +
   source URLs).
+- **B3 ✅ (met 2026-06-24, Half-B v2):** the cockpit citations panel lists the
+  session's citations with verification badges, and offers "view original"
+  (`/snapshot`) + an on-demand drift badge (`/drift`) for cloud-document
+  citations. The by-id `/citations/{id}{,/snapshot,/drift}` endpoints authorize
+  session citations via `user_can_access_job_or_thread`; the thread-citations
+  endpoint returns `has_snapshot`/`has_cloud_anchor`. Verified live (k3d): as the
+  thread owner all three endpoints return 200 for a session citation (was 404),
+  the panel flags resolve, and a no-auth call still 401s.
 
-*(Half A + Half B ✅ done + k3d-verified; only the Half-B v2 view-original/drift
-badge remains deferred.)*
+*(Half A + Half B + Half-B v2 ✅ done + k3d-verified.)*
 
 ## Follow-ups (deferred — not greenlit)
 
@@ -662,13 +678,18 @@ Phases 1–3 are complete and verified; the items below were deliberately scoped
 out, not skipped. None blocks the shipped feature. Listed roughly by leverage —
 if one is picked up, spin it into its own issue/feature doc.
 
-### 1. Cockpit citations view — *highest leverage; makes the backend user-visible*
+### 1. Cockpit citations view — ✅ SHIPPED (Phase 4 Half B + Half-B v2)
 
-> **Shipped via Phase 4 Half B (2026-06-23)** — inline `[N]` rendering now
-> surfaces citations in the chat itself (renumbered, hoverable, click-to-open).
-> What remains of this item: an optional separate job-wide list panel, and the
-> "view original" + drift badge (Half-B v2 — needs thread-aware auth on
-> `/snapshot` + `/drift`).
+> **Done.** Phase 4 Half B (2026-06-23) added inline `[N]` rendering in the chat
+> (renumbered, hoverable, click-to-open). Half-B v2 (2026-06-24) added the
+> **citations panel** — a job-wide list toggled from the chat header with
+> verification badges, plus "view original" (streams the `/snapshot`) and an
+> on-demand drift badge (`/drift`) for cloud-document citations. The auth blocker
+> is fixed via `user_can_access_job_or_thread` (the by-id `/citations/{id}`,
+> `/snapshot`, `/drift` now authorize session citations by thread ownership).
+> The only thing left of the original "notification channel" idea is live
+> `pending → verified/failed` push — today the panel refreshes per turn (the
+> existing `isWaitingForInput` effect), which covers the common case.
 
 The entire data layer + read API is ready and proven (`GET /api/citations/{id}`,
 `/api/citations/{id}/snapshot`, `/api/citations/{id}/drift`), but nothing
@@ -753,11 +774,10 @@ those: the **agent** via injection + reconcile, the **DB** `verification_status`
 shipped in Phase 4 Half B.
 
 **Deferred (out of scope for this integration):** consolidated in *Follow-ups
-(deferred — not greenlit)* above — the real-cloud
-agent-job e2e, async semantic chunking, the `oc:fileid` durable link, and the
-Half-B v2 cockpit view-original/drift badge. (Phase 4 shipped the
-agent-cites-inline + cockpit `[N]` rendering halves; persistent-session feedback
-injection shipped 2026-06-23.)
+(deferred — not greenlit)* above — the real-cloud agent-job e2e, async semantic
+chunking, and the `oc:fileid` durable link. (Phase 4 shipped agent-cites-inline +
+the cockpit `[N]` rendering + the citations panel with view-original/drift;
+persistent-session feedback injection shipped 2026-06-23.)
 
 **Resolved (now D7):** the cloud-document reference model — snapshot-as-anchor
 (save text + blob, best-effort pointer, on-view drift check). The earlier

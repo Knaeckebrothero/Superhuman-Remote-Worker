@@ -18,6 +18,9 @@ import yaml
 from src.core.model_registry import (
     ModelMeta,
     UnknownModelError,
+    _catalog_row_to_meta,
+    _endpoint_factory_provider,
+    _endpoint_row_to_meta,
     _factory_provider,
     family_of,
     register_catalog_lookup,
@@ -53,6 +56,87 @@ class TestFactoryProviderMapping:
         # Keeps the system forgiving of catalog typos — dispatch won't crash,
         # it'll just route through the OpenAI factory.
         assert _factory_provider("made-up-provider") == "openai"
+
+
+class TestEndpointFactoryProvider:
+    """_endpoint_factory_provider routes the Codex proxy to the codex factory.
+
+    Endpoint-backed rows are OpenAI-compatible by default, but the system
+    Codex proxy speaks only the Responses API and needs the codex factory's
+    reasoning-summary path. Detected by the seeded ``codex-proxy`` label or a
+    ``codex-proxy`` host in the base_url.
+    See docs/issues/litellm_gateway_drops_gpt_codex_reasoning_capture.md
+    """
+
+    def test_codex_proxy_by_label(self):
+        assert (
+            _endpoint_factory_provider("http://anything/v1", "codex-proxy") == "codex"
+        )
+
+    def test_codex_proxy_label_is_case_insensitive(self):
+        assert _endpoint_factory_provider(None, "Codex-Proxy") == "codex"
+
+    def test_codex_proxy_by_base_url_host(self):
+        # The seed always points the endpoint at the ``*-codex-proxy`` service,
+        # so the host carries the signal even if a label isn't supplied.
+        assert _endpoint_factory_provider("http://srw-codex-proxy:8317/v1") == "codex"
+
+    def test_generic_openai_endpoint(self):
+        assert (
+            _endpoint_factory_provider("http://srw-vllm:8000/v1", "gemma") == "openai"
+        )
+
+    def test_none_inputs_default_to_openai(self):
+        assert _endpoint_factory_provider(None, None) == "openai"
+
+
+class TestEndpointMetaProviderResolution:
+    """The endpoint/catalog meta builders carry ``codex`` for the Codex proxy
+    and ``openai`` for everything else — the regression that silently dropped
+    gpt-5.x reasoning was these hardcoding ``provider="openai"``.
+    """
+
+    def test_endpoint_row_codex_proxy(self):
+        row = {
+            "model_id": "gpt-5.5",
+            "base_url": "http://srw-codex-proxy:8317/v1",
+            "label": "codex-proxy",
+            "endpoint_id": "e1",
+            "family": "gpt-5",
+        }
+        assert _endpoint_row_to_meta(row, origin="system").provider == "codex"
+
+    def test_endpoint_row_generic_endpoint(self):
+        row = {
+            "model_id": "gemma-4-moe",
+            "base_url": "http://srw-vllm:8000/v1",
+            "label": "homelab",
+            "endpoint_id": "e2",
+        }
+        assert _endpoint_row_to_meta(row, origin="system").provider == "openai"
+
+    def test_catalog_endpoint_row_codex_proxy(self):
+        row = {
+            "provider_kind": "endpoint",
+            "provider_ref": "e1",
+            "model_id": "gpt-5.5",
+            "endpoint_id": "e1",
+            "endpoint_label": "codex-proxy",
+            "endpoint_base_url": "http://srw-codex-proxy:8317/v1",
+            "family": "gpt-5",
+        }
+        assert _catalog_row_to_meta(row).provider == "codex"
+
+    def test_catalog_endpoint_row_generic(self):
+        row = {
+            "provider_kind": "endpoint",
+            "provider_ref": "e2",
+            "model_id": "gemma-4-moe",
+            "endpoint_id": "e2",
+            "endpoint_label": "homelab",
+            "endpoint_base_url": "http://srw-vllm:8000/v1",
+        }
+        assert _catalog_row_to_meta(row).provider == "openai"
 
 
 class TestFamilyOf:

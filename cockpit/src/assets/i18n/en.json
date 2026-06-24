@@ -951,7 +951,25 @@
       "ideButton": "IDE",
       "ideActiveTooltip": "Open workspace in IDE",
       "ideLoadingTooltip": "Workspace starting...",
+      "citationsButton": "Citations",
+      "citationsTooltip": "Show this session's citations",
       "disconnect": "Disconnect"
+    },
+    "citations": {
+      "title": "Citations",
+      "empty": "No citations yet. Ask the agent to research and cite a source.",
+      "close": "Close",
+      "viewOriginal": "View original",
+      "checkSource": "Check source",
+      "checking": "Checking…",
+      "driftUnchanged": "Source unchanged since cited",
+      "driftChanged": "Source changed since cited",
+      "driftUnreachable": "Live source not reachable",
+      "driftUnknown": "Drift unknown",
+      "statusVerified": "Verified",
+      "statusPending": "Verifying…",
+      "statusFailed": "Unverified",
+      "statusUnknown": "Unknown"
     },
     "status": {
       "temp": "temp {{value}}",

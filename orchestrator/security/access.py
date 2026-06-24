@@ -572,27 +572,30 @@ async def require_thread_owner(
 # =============================================================================
 
 
-async def user_can_access_ide_entity(user: dict[str, Any], db, entity_id: str) -> bool:
-    """Whether ``user`` can open the embedded IDE for ``entity_id``.
+async def user_can_access_job_or_thread(
+    user: dict[str, Any], db, entity_id: str | None
+) -> bool:
+    """True if the caller can access ``entity_id`` as a job OR owns it as a thread.
 
-    The IDE proxy accepts either a job UUID or a thread UUID in the URL
-    (see ``ide_proxy_service._load_context``). We mirror that resolution
-    here: try job first, then thread.
+    Some artifacts carry a ``job_id`` that, for persistent sessions, is actually
+    a *thread* id (``job_id == thread_id``) with no row in ``jobs`` — citations
+    are the motivating case. A pure job check (:func:`user_can_access_any_job`)
+    therefore 404s for every session citation. This resolver tries the job table
+    first, then the thread table (the same job-or-thread shape the embedded IDE
+    uses), so worker-job and session artifacts are both authorized.
 
-    Returns a bool — the caller decides whether to 404 (the WS path can't
-    easily distinguish "not found" from "no access" without leaking
-    existence) or to raise. Used by both ``ide_proxy_http`` and
-    ``ide_proxy_ws`` in main.py.
-
-    Admins pass (subject to scope). For jobs: owner or any project
-    member, narrowed by a ``project:<uuid>`` MCP scope. For threads:
-    owner only — a project-scoped token can't open a personal thread.
-    Orphan owners fail closed.
+    Returns a bool — callers decide whether a miss is 404 (don't leak existence)
+    or 403. Admins pass subject to scope; for jobs: owner or any project member,
+    narrowed by a ``project:<uuid>`` MCP scope; for threads: owner only (a
+    project-scoped token can't reach a personal thread). Orphan/unknown
+    ``entity_id`` → False (fail closed for non-admins).
     """
-    # Fast path: unscoped admin sees every entity (matches the legacy
-    # behavior the IDE proxy tests assert).
+    # Fast path: unscoped admin sees every entity, even one whose row was
+    # already deleted (matches the IDE-proxy race behavior the tests assert).
     if user.get("is_admin") and _scope_project_id(user) is None:
         return True
+    if not entity_id:
+        return False
     job = await db.get_job(entity_id)
     if job:
         if not _scope_permits_project(user, job.get("project_id")):
@@ -615,6 +618,18 @@ async def user_can_access_ide_entity(user: dict[str, Any], db, entity_id: str) -
             return True
         return str(thread.get("user_id") or "") == str(user["id"])
     return False
+
+
+async def user_can_access_ide_entity(user: dict[str, Any], db, entity_id: str) -> bool:
+    """Whether ``user`` can open the embedded IDE for ``entity_id``.
+
+    The IDE proxy accepts either a job UUID or a thread UUID in the URL
+    (see ``ide_proxy_service._load_context``). Thin alias over
+    :func:`user_can_access_job_or_thread` (job-first, then thread), kept as a
+    named seam for the ``ide_proxy_http`` / ``ide_proxy_ws`` call sites and the
+    tests that assert the IDE-proxy access behavior.
+    """
+    return await user_can_access_job_or_thread(user, db, entity_id)
 
 
 async def require_sudo_request_authority(
