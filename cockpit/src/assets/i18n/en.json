@@ -1043,7 +1043,8 @@
       "reasoning": "Reasoning",
       "reasoningEstimatedHint": "Estimated from the captured reasoning text — counted within Output (this model reports no separate reasoning-token count).",
       "output": "Output",
-      "ctx": "Ctx"
+      "ctx": "Ctx",
+      "ctxHint": "Context fill toward the auto-compaction point — at 100% the agent summarizes older context to free room."
     },
     "empty": {
       "title": "What shall we conquer today?",

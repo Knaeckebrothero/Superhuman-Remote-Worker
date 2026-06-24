@@ -1043,7 +1043,8 @@
       "reasoning": "Reasoning",
       "reasoningEstimatedHint": "Geschätzt aus dem erfassten Reasoning-Text – in der Ausgabe enthalten (dieses Modell meldet keine separate Reasoning-Token-Zahl).",
       "output": "Ausgabe",
-      "ctx": "Ctx"
+      "ctx": "Ctx",
+      "ctxHint": "Kontextfüllung bis zum automatischen Verdichtungspunkt – bei 100 % fasst der Agent älteren Kontext zusammen, um Platz zu schaffen."
     },
     "empty": {
       "title": "Was wollen wir heute erobern?",

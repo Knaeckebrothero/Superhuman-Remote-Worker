@@ -21,6 +21,28 @@ import {AppSpinnerComponent} from '../../ui/spinner';
 
 type LoopPreset = 'build' | 'write' | 'research';
 
+/** Job statuses that won't change further. */
+const TERMINAL_JOB_STATUSES = new Set(['completed', 'failed', 'cancelled']);
+
+/** True while at least one job is still non-terminal (in flight). */
+export function hasInFlightJob(jobs: Pick<Job, 'status'>[]): boolean {
+  return jobs.some((j) => !TERMINAL_JOB_STATUSES.has(j.status));
+}
+
+/**
+ * The loop has ended (stopped/completed/failed) but a job it spawned is still
+ * finishing. Stopping is graceful — the in-flight job runs to completion and no
+ * new jobs are queued — so the UI shows a wind-down notice during this window.
+ */
+export function isLoopWindingDown(
+  loop: Pick<ProjectLoop, 'status'> | null,
+  jobs: Pick<Job, 'status'>[],
+): boolean {
+  if (!loop) return false;
+  const active = loop.status === 'running' || loop.status === 'paused';
+  return !active && hasInFlightJob(jobs);
+}
+
 /**
  * Project Loop tab — start / monitor / control the project self-improvement
  * loop. Mounted by the project-detail page only when the Loop tab is open, so
@@ -92,19 +114,13 @@ type LoopPreset = 'build' | 'write' | 'research';
                 <app-button variant="danger" size="sm" [disabled]="busy()" (clicked)="stop()">Stop</app-button>
               </div>
             </div>
-
-            @if (jobs().length) {
-              <div class="loop-jobs">
-                <div class="loop-jobs-title">Jobs this run ({{ jobs().length }})</div>
-                @for (j of jobs(); track j.id) {
-                  <div class="loop-job">
-                    <span class="role">{{ jobRole(j) }}</span>
-                    <span class="loop-badge sm" [attr.data-status]="j.status">{{ j.status }}</span>
-                    <span class="mono dim">{{ j.id.slice(0, 8) }}</span>
-                  </div>
-                }
-              </div>
-            }
+          } @else if (windingDown()) {
+            <!-- WINDING DOWN: loop stopped but the in-flight job is still finishing -->
+            <div class="loop-outcome winding" [attr.data-status]="l.status">
+              <strong>Loop {{ l.status }}.</strong>
+              The job still running will finish on its own — no new jobs will be
+              queued after it.
+            </div>
           } @else {
             <!-- TERMINAL OUTCOME -->
             <div class="loop-outcome" [attr.data-status]="l.status">
@@ -114,9 +130,22 @@ type LoopPreset = 'build' | 'write' | 'research';
               @if (l.last_error) { <span class="err">{{ l.last_error }}</span> }
             </div>
           }
+
+          @if ((isActive() || windingDown()) && jobs().length) {
+            <div class="loop-jobs">
+              <div class="loop-jobs-title">Jobs this run ({{ jobs().length }})</div>
+              @for (j of jobs(); track j.id) {
+                <div class="loop-job">
+                  <span class="role">{{ jobRole(j) }}</span>
+                  <span class="loop-badge sm" [attr.data-status]="j.status">{{ j.status }}</span>
+                  <span class="mono dim">{{ j.id.slice(0, 8) }}</span>
+                </div>
+              }
+            </div>
+          }
         }
 
-        @if (!isActive()) {
+        @if (showStartForm()) {
           <!-- START FORM (shown when no loop is active) -->
           <div class="loop-card">
             @if (modelOptions().length === 0) {
@@ -218,6 +247,7 @@ type LoopPreset = 'build' | 'write' | 'research';
       }
       .loop-outcome[data-status='completed'] { border-left-color: var(--success); }
       .loop-outcome[data-status='failed'] { border-left-color: var(--danger); }
+      .loop-outcome.winding { border-left-color: var(--warning); }
       .loop-outcome .err { display: block; margin-top: 4px; color: var(--danger); font-size: 12px; }
       .loop-seq { display: flex; gap: 6px; flex-wrap: wrap; margin-top: -6px; }
       .loop-role-chip {
@@ -274,6 +304,19 @@ export class ProjectLoopComponent implements OnInit, OnDestroy {
     return l.role_sequence[l.seq_index % l.role_sequence.length];
   });
 
+  /**
+   * Loop is over (stopped/completed/failed) but its last job is still
+   * finishing — stopping is graceful, so the in-flight job runs to completion
+   * and no new jobs are queued. Drives the wind-down disclaimer.
+   */
+  readonly windingDown = computed(() =>
+    isLoopWindingDown(this.loop(), this.jobs()),
+  );
+  /** Offer the start form only when nothing is active or winding down. */
+  readonly showStartForm = computed(
+    () => !this.isActive() && !this.windingDown(),
+  );
+
   ngOnInit(): void {
     const pid = this.projectId();
     if (pid) this.modelService.load(pid);
@@ -296,7 +339,14 @@ export class ProjectLoopComponent implements OnInit, OnDestroy {
     this.api.getProjectLoop(pid).subscribe((l) => {
       this.loop.set(l);
       this.loading.set(false);
-      if (l && (l.status === 'running' || l.status === 'paused')) {
+      // Fetch jobs while active — and while stopped, since a graceful stop
+      // leaves the in-flight job finishing (needed for the wind-down notice).
+      if (
+        l &&
+        (l.status === 'running' ||
+          l.status === 'paused' ||
+          l.status === 'stopped')
+      ) {
         this.api.listProjectLoopJobs(pid).subscribe((j) => this.jobs.set(j));
       } else {
         this.jobs.set([]);

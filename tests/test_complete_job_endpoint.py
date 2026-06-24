@@ -175,6 +175,63 @@ class TestCompleteJobStatusDetermination:
         assert status2 == "completed"  # This one gets completed_at
 
 
+class TestMemoryUnavailableStatus:
+    """memory/KB-unavailable freeze → bounded pause-then-fail.
+
+    docs/issues/embedding_key_missing_silently_disables_memory_and_kb.md
+    """
+
+    def _result(self, freeze_type="memory_unavailable"):
+        return {
+            "should_stop": True,
+            "freeze_data": {
+                "freeze_type": freeze_type,
+                "reason": "Embedding service unavailable at startup.",
+            },
+        }
+
+    def test_first_attempt_pauses(self):
+        job = make_job(verification_enabled=False, context={})
+        status, err = determine_job_status(job, self._result())
+        assert status == "paused"
+        assert err is None
+
+    def test_under_cap_pauses(self):
+        job = make_job(verification_enabled=False, context={"memory_retry_count": 1})
+        status, _ = determine_job_status(job, self._result())
+        assert status == "paused"
+
+    def test_at_cap_fails_with_reason(self):
+        job = make_job(verification_enabled=False, context={"memory_retry_count": 2})
+        status, err = determine_job_status(job, self._result())
+        assert status == "failed"
+        assert err is not None
+        assert "embedding" in err.lower()
+
+    def test_kb_unavailable_pauses_then_fails(self):
+        result = self._result(freeze_type="kb_unavailable")
+        assert (
+            determine_job_status(
+                make_job(verification_enabled=False, context={}), result
+            )[0]
+            == "paused"
+        )
+        assert (
+            determine_job_status(
+                make_job(verification_enabled=False, context={"memory_retry_count": 2}),
+                result,
+            )[0]
+            == "failed"
+        )
+
+    def test_context_as_json_string(self):
+        # The job row's context can arrive as a JSON string, not a dict.
+        job = make_job(verification_enabled=False)
+        job["context"] = '{"memory_retry_count": 2}'
+        status, _ = determine_job_status(job, self._result())
+        assert status == "failed"
+
+
 class TestCompleteJobCriticStatus:
     """Test status determination for critic (sub) jobs."""
 

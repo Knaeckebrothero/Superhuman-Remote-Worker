@@ -1506,6 +1506,14 @@ async def _execute_turn(
                     {
                         **turn_metrics,
                         "ctx_limit_tokens": config.limits.model_max_context_tokens,
+                        # The absolute token count at which auto-compaction
+                        # fires (limits.context_threshold_tokens → ContextConfig).
+                        # The cockpit anchors its ctx gauge + colour ramp on this,
+                        # not the raw model window, so "danger" means compaction
+                        # is imminent rather than an arbitrary % of the window.
+                        "compaction_threshold_tokens": getattr(
+                            config.limits, "context_threshold_tokens", None
+                        ),
                     }
                 )
             except Exception as e:

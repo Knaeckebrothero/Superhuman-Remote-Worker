@@ -567,7 +567,23 @@ class PersistentSession:
             else:
                 logger.warning("Failed to connect to Neo4j — knowledge tools disabled")
         except Exception as e:
-            logger.warning(f"Failed to initialize knowledge base (non-fatal): {e}")
+            from src.core.archiver import audit_unavailable as _audit_unavailable
+
+            _audit_unavailable(
+                job_id=self.thread_id,
+                agent_type=self.config.agent_id,
+                step_type="kb_unavailable",
+                component="KnowledgeStore",
+                error=e,
+                node_name="session_setup",
+                extra={
+                    "embedding_provider": os.environ.get("EMBEDDING_PROVIDER", "local"),
+                },
+            )
+            logger.warning(
+                f"Failed to initialize knowledge base (non-fatal): {e} "
+                f"[embedding_provider={os.environ.get('EMBEDDING_PROVIDER', 'local')}]"
+            )
 
     def _setup_tools(self, postgres_conn: Optional[Any]) -> None:
         """Load tools from config, excluding phase-specific ones."""
@@ -925,7 +941,25 @@ class PersistentSession:
                 # instead of a swallowed WARNING per write.
                 asyncio.create_task(embedding_service.verify_dimensions())
             except Exception as e:
-                logger.warning(f"Failed to initialize RecallStore (non-fatal): {e}")
+                from src.core.archiver import audit_unavailable as _audit_unavailable
+
+                _provider = os.environ.get("EMBEDDING_PROVIDER", "local")
+                _audit_unavailable(
+                    job_id=self.thread_id,
+                    agent_type=self.config.agent_id,
+                    step_type="memory_unavailable",
+                    component="RecallStore",
+                    error=e,
+                    node_name="session_setup",
+                    extra={
+                        "embedding_provider": _provider,
+                        "embedding_model": os.environ.get("EMBEDDING_MODEL", "unknown"),
+                    },
+                )
+                logger.warning(
+                    f"Failed to initialize RecallStore (non-fatal): {e} "
+                    f"[embedding_provider={_provider}]"
+                )
 
         # KnowledgeStore (knowledge injection, project-scoped)
         # Skip if already initialized by _setup_knowledge() (for tool loading)
@@ -941,7 +975,25 @@ class PersistentSession:
                 )
                 logger.info("KnowledgeStore initialized for persistent session")
             except Exception as e:
-                logger.warning(f"Failed to initialize KnowledgeStore (non-fatal): {e}")
+                from src.core.archiver import audit_unavailable as _audit_unavailable
+
+                _audit_unavailable(
+                    job_id=self.thread_id,
+                    agent_type=self.config.agent_id,
+                    step_type="kb_unavailable",
+                    component="KnowledgeStore",
+                    error=e,
+                    node_name="session_setup",
+                    extra={
+                        "embedding_provider": os.environ.get(
+                            "EMBEDDING_PROVIDER", "local"
+                        ),
+                    },
+                )
+                logger.warning(
+                    f"Failed to initialize KnowledgeStore (non-fatal): {e} "
+                    f"[embedding_provider={os.environ.get('EMBEDDING_PROVIDER', 'local')}]"
+                )
 
         # MemoryManager seam (memory overhaul Phase 1, behind
         # memory.manager.enabled). Constructed after both stores so the

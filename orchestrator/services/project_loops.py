@@ -152,6 +152,11 @@ async def create_loop_job(
         "scholar": {"enabled": False},
         "curator": {"enabled": False},
         "autonomy": "full",
+        # The loop coordinates ONLY through the project knowledge base + shared
+        # memory, so a step that loses its embedding-backed stores must pause for
+        # re-dispatch rather than run blind (see
+        # docs/issues/embedding_key_missing_silently_disables_memory_and_kb.md).
+        "memory": {"required": True},
     }
     model = loop.get("model")
     if model:

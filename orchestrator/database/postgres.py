@@ -1430,6 +1430,34 @@ class PostgresDB:
 
         return result == "UPDATE 1"
 
+    async def increment_job_memory_retry(self, job_id: str) -> int:
+        """Atomically increment context.memory_retry_count and return the new value.
+
+        Done as a single DB statement (read-and-increment in one) so concurrent
+        /complete handlers — e.g. a duplicate/racing re-dispatch of the same
+        paused job — can't both read the same value and stall the counter at 1.
+        Returns the new count, or 0 if the job was not found / id was invalid.
+        See docs/issues/embedding_key_missing_silently_disables_memory_and_kb.md.
+        """
+        try:
+            uuid_val = UUID(job_id)
+        except ValueError:
+            return 0
+
+        query = (
+            "UPDATE jobs "
+            "SET context = jsonb_set("
+            "        COALESCE(context, '{}'::jsonb), '{memory_retry_count}', "
+            "        to_jsonb(COALESCE((context->>'memory_retry_count')::int, 0) + 1)"
+            "    ), "
+            "    updated_at = CURRENT_TIMESTAMP "
+            "WHERE id = $1 "
+            "RETURNING (context->>'memory_retry_count')::int"
+        )
+        async with self.acquire() as conn:
+            new_count = await conn.fetchval(query, uuid_val)
+        return int(new_count) if new_count is not None else 0
+
     async def merge_vm_context(self, job_id: str, vm_updates: Dict[str, Any]) -> bool:
         """Atomically merge updates into context.vm without touching other keys.
 

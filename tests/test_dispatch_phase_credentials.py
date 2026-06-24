@@ -547,3 +547,141 @@ class TestCodexBypassesGateway:
         # Endpoint + gateway enabled → gateway (measurement/rate-limit chokepoint).
         assert section["base_url"] == GATEWAY[0]
         assert section["api_key"] == GATEWAY[1]
+
+
+# ---------------------------------------------------------------------------
+# Embedding credential reliability (memory + KB).
+#
+# The embedding key drives memory (RecallStore) + KB (KnowledgeStore). It was
+# resolved ONLY inside the `if job.get("user_id")` block, so a job whose user
+# had no embedding preference (or no user) silently shipped without a key and
+# ran with memory/KB dead and no signal. The fix gives embedding the same
+# system-default fallback the chat model has (outside the user gate), stops a
+# pre-present EMBEDDING_MODEL from suppressing the key, and refuses to emit a
+# half-credential when the endpoint key can't decrypt.
+# See docs/issues/embedding_key_missing_silently_disables_memory_and_kb.md
+# ---------------------------------------------------------------------------
+
+EMB_ENDPOINT_ID = "33333333-3333-3333-3333-333333333333"
+EMB_BASE_URL = "https://ai.h4ll.app/v1"
+EMB_API_KEY = "sk-emb-test"
+EMB_MODEL = "qwen3-embedding-8b"
+
+
+def _job_no_user(*, job_id: str = "00000000-0000-0000-0000-000000000002") -> dict:
+    """A job with NO user_id — the user-preference dispatch block is skipped."""
+    return {"id": job_id, "project_id": "00000000-0000-0000-0000-0000000000bb"}
+
+
+@pytest.fixture
+def patched_main_embedding(monkeypatch):
+    """System embedding model `qwen3-embedding-8b` on an endpoint with a key.
+
+    No user settings; `resolve_default_for_capability` returns the embedding
+    model only for the "embedding" capability (None elsewhere, so the chat /
+    vision / aux fallbacks stay no-ops). Returns a mutable holder so a test can
+    simulate a decrypt failure (`holder["api_key"] = None`).
+    """
+    holder = {"api_key": EMB_API_KEY}
+
+    async def fake_resolve(model_id, user_id=None, capability="chat"):
+        if model_id == EMB_MODEL:
+            return ModelMeta(
+                model_id=EMB_MODEL,
+                provider="openai",
+                family="default",
+                display_name="Qwen3 Embedding 8B",
+                origin="system",
+                endpoint_id=EMB_ENDPOINT_ID,
+                api_key_ref="openai",
+            )
+        return None
+
+    monkeypatch.setattr(
+        main, "_resolve_model", AsyncMock(side_effect=fake_resolve), raising=True
+    )
+
+    async def fake_get_endpoint(endpoint_id):
+        if endpoint_id == EMB_ENDPOINT_ID:
+            return {
+                "id": EMB_ENDPOINT_ID,
+                "label": "Local Router",
+                "base_url": EMB_BASE_URL,
+                "api_key": holder["api_key"],
+            }
+        return None
+
+    monkeypatch.setattr(
+        main.postgres_db,
+        "get_user_llm_endpoint",
+        AsyncMock(side_effect=fake_get_endpoint),
+    )
+    monkeypatch.setattr(
+        main.postgres_db, "resolve_api_keys_for_job", AsyncMock(return_value={})
+    )
+    monkeypatch.setattr(
+        main.postgres_db, "get_user_settings", AsyncMock(return_value={})
+    )
+
+    async def fake_default(capability):
+        return EMB_MODEL if capability == "embedding" else None
+
+    monkeypatch.setattr(
+        main.postgres_db,
+        "resolve_default_for_capability",
+        AsyncMock(side_effect=fake_default),
+    )
+    return holder
+
+
+class TestEmbeddingCredentialReliability:
+    @pytest.mark.asyncio
+    async def test_system_default_injected_without_user(self, patched_main_embedding):
+        """No user_id → user block skipped; the system-default fallback still
+        injects the embedding endpoint + key (the core asymmetry fix)."""
+        result = await main._inject_dispatch_credentials(_job_no_user(), {})
+        env = result["env_keys"]
+        assert env["EMBEDDING_MODEL"] == EMB_MODEL
+        assert env["EMBEDDING_BASE_URL"] == EMB_BASE_URL
+        assert env["EMBEDDING_API_KEY"] == EMB_API_KEY
+
+    @pytest.mark.asyncio
+    async def test_user_without_embedding_pref_still_gets_key(
+        self, patched_main_embedding
+    ):
+        """A job WITH a user but no embedding preference still resolves the
+        system default embedding key."""
+        result = await main._inject_dispatch_credentials(_job(), {})
+        assert result["env_keys"]["EMBEDDING_API_KEY"] == EMB_API_KEY
+
+    @pytest.mark.asyncio
+    async def test_pre_present_model_does_not_suppress_key(
+        self, patched_main_embedding
+    ):
+        """A pre-present EMBEDDING_MODEL must NOT skip _API_KEY injection."""
+        result = await main._inject_dispatch_credentials(
+            _job_no_user(), {"env_keys": {"EMBEDDING_MODEL": EMB_MODEL}}
+        )
+        assert result["env_keys"]["EMBEDDING_API_KEY"] == EMB_API_KEY
+
+    @pytest.mark.asyncio
+    async def test_preset_api_key_is_not_overwritten(self, patched_main_embedding):
+        """A per-job/BYO embedding key already in env_keys wins (additive)."""
+        result = await main._inject_dispatch_credentials(
+            _job_no_user(), {"env_keys": {"EMBEDDING_API_KEY": "user-byo"}}
+        )
+        assert result["env_keys"]["EMBEDDING_API_KEY"] == "user-byo"
+
+    @pytest.mark.asyncio
+    async def test_decrypt_failure_emits_no_half_credential(
+        self, patched_main_embedding, caplog
+    ):
+        """Endpoint has a base_url but the key didn't decrypt (api_key=None):
+        do NOT inject a base_url-without-key half-credential, and log loudly."""
+        patched_main_embedding["api_key"] = None
+        with caplog.at_level("ERROR", logger=main.logger.name):
+            result = await main._inject_dispatch_credentials(_job_no_user(), {})
+        env = result.get("env_keys", {})
+        assert "EMBEDDING_API_KEY" not in env
+        assert "EMBEDDING_BASE_URL" not in env
+        assert any(EMB_ENDPOINT_ID in rec.getMessage() for rec in caplog.records)

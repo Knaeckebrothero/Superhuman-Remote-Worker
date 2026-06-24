@@ -158,6 +158,11 @@ export interface UsageState {
      *  via vLLM). The figure is then a subset of ``outputTokensTurn``. */
     reasoningEstimated: boolean;
     ctxLimitTokens: number | null;
+    /** Absolute token count at which auto-compaction fires. The ctx gauge is
+     *  anchored on this (not the raw model window), so "danger" means a
+     *  compaction is imminent. Null until the agent reports it; the gauge then
+     *  falls back to ``ctxLimitTokens``. */
+    compactionThresholdTokens: number | null;
 }
 
 /**
@@ -2039,6 +2044,10 @@ export class PersistentChatService {
                         !!params['reasoning_estimated'],
                     ctxLimitTokens:
                         (params['ctx_limit_tokens'] as number) ?? prev?.ctxLimitTokens ?? null,
+                    compactionThresholdTokens:
+                        (params['compaction_threshold_tokens'] as number) ??
+                        prev?.compactionThresholdTokens ??
+                        null,
                 });
                 break;
             }
