@@ -12,7 +12,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Deque, Dict, List, Optional
 from urllib.parse import urlparse
 
 from ..core.workspace import WorkspaceManager
@@ -72,6 +72,12 @@ class ToolContext:
     )
     verify_citation_prompt: Optional[str] = (
         None  # Matrix-resolved citation-verification system prompt.
+    )
+    citation_verdict_callback: Optional[Callable[[int, str], None]] = (
+        None  # (citation_id, status) listener fired when a background
+        # verification lands a verdict. Persistent sessions wire this to a
+        # WS/SSE broadcast (live citations-panel update); worker jobs leave it
+        # None. Threaded to CitationEngine(on_verdict=...).
     )
     datasources: Dict[str, Any] = field(default_factory=dict)
     config: Dict[str, Any] = field(default_factory=dict)
@@ -308,6 +314,7 @@ class ToolContext:
                 context=ctx,
                 verify_aux=self.verify_aux,
                 verify_prompt=self.verify_citation_prompt,
+                on_verdict=self.citation_verdict_callback,
             )
 
         return self.citation_engine
