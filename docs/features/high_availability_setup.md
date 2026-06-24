@@ -22,6 +22,7 @@ related:
 
 **Status:** Living reference. Runbook is usable now; roadmap is design-stage.
 **Filed:** 2026-05-20
+**Refreshed:** 2026-06-24 — inventory re-verified against the Helm chart (the live path via Fleet); added two newer single-replica Postgres SPOFs (`postgres-audit`, `postgres-litellm`); confirmed no roadmap item has started.
 **Triggered by:** 2026-05-16 incident — pulling `node3` for maintenance took the whole SRW stack offline despite a healthy 3-node etcd quorum and 2-replica Longhorn data redundancy.
 
 ## What "HA" means in this project
@@ -53,6 +54,8 @@ What survives a single-node loss *today*, assuming the failure isn't on the node
 | App (stateful) | PostgreSQL | StatefulSet `replicas: 1` | ✗ | Primary data store. **Highest-impact SPOF.** |
 | App (stateful) | pgvector | StatefulSet `replicas: 1` | ✗ | Embeddings + memories store. |
 | App (stateful) | postgres-keycloak | StatefulSet `replicas: 1` | ✗ | Auth DB. Down ⇒ no login. |
+| App (stateful) | postgres-audit | StatefulSet `replicas: 1` | ✗ | **New since this doc** (`helm/templates/databases/postgres-audit.yaml`). Audit store (`AUDIT_BACKEND`). Non-fatal but a SPOF. |
+| App (stateful) | postgres-litellm | StatefulSet `replicas: 1` | ✗ | **New since this doc** (`helm/templates/databases/postgres-litellm.yaml`). LiteLLM gateway DB. Down ⇒ no LLM dispatch. |
 | App (stateful) | MongoDB | StatefulSet `replicas: 1` | ✗ (non-fatal) | Audit trail only; agent + orchestrator degrade gracefully. |
 | App (stateful) | Neo4j | StatefulSet `replicas: 1` | ✗ (non-fatal) | Knowledge graph; optional per CLAUDE.md. |
 | App (stateful) | Gitea | StatefulSet `replicas: 1` | ✗ | Workspace git server. Fast to recover; not catastrophic. |
@@ -191,7 +194,9 @@ The data tier is where the real SPOFs live. Each item below is its own discrete 
 
 ### Priority 1: PostgreSQL → CloudNativePG
 
-Both `postgres` and `postgres-vector` (pgvector) and `postgres-keycloak` would migrate to [CloudNativePG](https://cloudnative-pg.io/). Standard answer in the K8s ecosystem; gives synchronous replication, automatic failover, point-in-time recovery, and operator-managed backups.
+> **Status (2026-06-24): not started.** No `cnpg` / CloudNativePG resources exist in the SRW deployment trees — all Postgres instances are plain single-replica StatefulSets. (The only `cnpg` manifests in the repo are in the unrelated `HomeLab/` tree.) Note the migration scope grew: there are now **five** Postgres instances, not three — add `postgres-audit` and `postgres-litellm` to the list below.
+
+All five Postgres instances (`postgres`, `postgres-vector`/pgvector, `postgres-keycloak`, `postgres-audit`, `postgres-litellm`) would migrate to [CloudNativePG](https://cloudnative-pg.io/). Standard answer in the K8s ecosystem; gives synchronous replication, automatic failover, point-in-time recovery, and operator-managed backups.
 
 - Three separate `Cluster` resources, one per logical DB.
 - Multi-replica with at least one synchronous standby.
@@ -200,7 +205,9 @@ Both `postgres` and `postgres-vector` (pgvector) and `postgres-keycloak` would m
 
 ### Priority 2: NATS → multi-replica
 
-Cheap, low-risk, high-value. NATS clusters horizontally out of the box; the chart already runs a StatefulSet, just bump replicas and add the cluster routes config. Coordination plane stops being a SPOF, which matters more once the orchestrator goes multi-replica (per `orchestrator_ha_scaling.md` Phase 4).
+> **Status (2026-06-24): not started, and clustering is currently *explicitly disabled*.** `helm/templates/nats/configmap.yaml:32-33` carries a "No clustering — single replica is fine for pilot" note plus a TODO to add the `cluster {}` block and bump replicas. `helm/templates/nats/statefulset.yaml:25` is still `replicas: 1`.
+
+Cheap, low-risk, high-value. NATS clusters horizontally out of the box; the chart already runs a StatefulSet, just bump replicas and add the cluster routes config (currently commented as a TODO). Coordination plane stops being a SPOF, which matters more once the orchestrator goes multi-replica (per `orchestrator_ha_scaling.md` Phase 4).
 
 ### Priority 3 (optional): MongoDB → ReplicaSet
 
