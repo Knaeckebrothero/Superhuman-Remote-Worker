@@ -237,7 +237,11 @@ def test_todo_guide_skill_exists_and_parses():
     fm, body = parse_skill_md(md)
     name, _desc = skill_identity(fm)
     assert name == "todo-guide"
-    assert "Short Phases" in body  # the migrated body survived
+    # Body is real and on-topic — anchored on the tool it gates rather than on
+    # exact wording, so prose edits (e.g. the L3 phase-patterns offload) don't
+    # break this. Detailed examples live in references/phase-patterns.md.
+    assert "next_phase_todos" in body
+    assert len(body) > 500
 
 
 def test_defaults_bind_todo_guide_as_skill():

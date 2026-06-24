@@ -466,3 +466,84 @@ class TestContextWindowInjection:
         )
         assert result["auxiliary"]["base_url"] == CTX_BASE_URL
         assert "model_max_context_tokens" not in result["auxiliary"]
+
+
+# ---------------------------------------------------------------------------
+# Codex proxy bypasses the LiteLLM gateway (reasoning-capture regression)
+#
+# The Codex proxy speaks ONLY the Responses API; routing it through the LiteLLM
+# gateway normalizes to Chat Completions and drops gpt-5.x reasoning. So an
+# endpoint model whose meta.provider == "codex" must hit the endpoint directly
+# even when the gateway is enabled, while non-codex endpoint models still route
+# through the gateway.
+# See docs/issues/litellm_gateway_drops_gpt_codex_reasoning_capture.md
+# ---------------------------------------------------------------------------
+
+GATEWAY = ("http://srw-litellm:4000/v1", "sk-fleet")
+
+
+def _patch_resolve_provider(monkeypatch, *, provider: str):
+    async def fake_resolve(model_id, user_id=None, capability="chat"):
+        return ModelMeta(
+            model_id=model_id,
+            provider=provider,
+            family="gpt-5",
+            display_name=model_id,
+            origin="catalog",
+            endpoint_id=CODEX_ENDPOINT_ID,
+        )
+
+    monkeypatch.setattr(
+        main, "_resolve_model", AsyncMock(side_effect=fake_resolve), raising=True
+    )
+
+    async def fake_get_endpoint(endpoint_id):
+        if endpoint_id == CODEX_ENDPOINT_ID:
+            return {
+                "id": CODEX_ENDPOINT_ID,
+                "label": "codex-proxy",
+                "base_url": CODEX_BASE_URL,
+                "api_key": CODEX_API_KEY,
+            }
+        return None
+
+    monkeypatch.setattr(
+        main.postgres_db,
+        "get_user_llm_endpoint",
+        AsyncMock(side_effect=fake_get_endpoint),
+    )
+
+
+class TestCodexBypassesGateway:
+    """meta.provider == 'codex' skips the gateway and injects the codex factory."""
+
+    @pytest.mark.asyncio
+    async def test_codex_model_hits_endpoint_not_gateway(self, monkeypatch):
+        _patch_resolve_provider(monkeypatch, provider="codex")
+        section = {"model": "gpt-5.5"}
+        await main._inject_model_credentials(
+            section=section,
+            model_id="gpt-5.5",
+            user_id="u",
+            resolved_keys={},
+            gateway_override=GATEWAY,
+        )
+        # Direct to the codex proxy — NOT the gateway — and built via the codex factory.
+        assert section["base_url"] == CODEX_BASE_URL
+        assert section["api_key"] == CODEX_API_KEY
+        assert section.get("provider") == "codex"
+
+    @pytest.mark.asyncio
+    async def test_noncodex_endpoint_still_routes_via_gateway(self, monkeypatch):
+        _patch_resolve_provider(monkeypatch, provider="openai")
+        section = {"model": "gemma-4-moe"}
+        await main._inject_model_credentials(
+            section=section,
+            model_id="gemma-4-moe",
+            user_id="u",
+            resolved_keys={},
+            gateway_override=GATEWAY,
+        )
+        # Endpoint + gateway enabled → gateway (measurement/rate-limit chokepoint).
+        assert section["base_url"] == GATEWAY[0]
+        assert section["api_key"] == GATEWAY[1]

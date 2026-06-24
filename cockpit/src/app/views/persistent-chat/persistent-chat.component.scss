@@ -230,6 +230,13 @@
         align-items: center;
         flex-shrink: 0;
       }
+
+      // Citations panel hosts its own column layout — drop the settings banner's
+      // centered-flex + inner padding so it controls its own spacing.
+      .citations-panel-wrap {
+        display: block;
+        padding: 0;
+      }
       .settings-row {
         display: flex;
         align-items: center;

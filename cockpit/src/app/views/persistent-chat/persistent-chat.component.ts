@@ -57,6 +57,7 @@ import {environment} from '../../core/environment';
 import {SidebarToggleComponent} from '../../shell/sidebar-toggle/sidebar-toggle.component';
 import {AppButtonComponent} from '../../ui/button';
 import {AppBadgeComponent} from '../../ui/badge';
+import {CitationsPanelComponent} from './citations-panel/citations-panel.component';
 import {AppSelectComponent} from '../../ui/select';
 import {AppIconComponent} from '../../ui/icon';
 import {AppDialogComponent} from '../../ui/dialog';
@@ -428,6 +429,7 @@ export function clearDraft(threadId: string | null): void {
         AppIconComponent,
         AppDialogComponent,
         AppToolCardComponent,
+        CitationsPanelComponent,
     ],
     template: `
     <div class="chat-container"
@@ -463,6 +465,13 @@ export function clearDraft(threadId: string | null): void {
             <button class="settings-btn" (click)="showSettings.update(v => !v)"
                     [class.active]="showSettings()" [title]="'chat.header.settingsTooltip' | transloco">
               <app-icon size="sm" class="settings-icon">tune</app-icon>
+            </button>
+          }
+
+          @if (chat.isConnected() && chat.citationsByCid().size > 0) {
+            <button class="settings-btn" (click)="showCitations.update(v => !v)"
+                    [class.active]="showCitations()" [title]="'chat.header.citationsTooltip' | transloco">
+              <app-icon size="sm" class="settings-icon">format_quote</app-icon>
             </button>
           }
 
@@ -603,6 +612,13 @@ export function clearDraft(threadId: string | null): void {
               <option value="large">{{ 'chat.settings.textLarge' | transloco }}</option>
             </app-select>
           </div>
+        </div>
+      }
+
+      <!-- Citations panel (Half-B v2): session citations + view-original/drift -->
+      @if (showCitations()) {
+        <div class="settings-panel citations-panel-wrap">
+          <app-citations-panel (close)="showCitations.set(false)" />
         </div>
       }
 
@@ -1569,6 +1585,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
 
     // Settings panel
     readonly showSettings = signal(false);
+    readonly showCitations = signal(false);
 
     // Resume state
     readonly isResuming = signal(false);

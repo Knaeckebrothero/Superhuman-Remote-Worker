@@ -21,8 +21,10 @@ related:
 **Status:** Implemented (2026-06-12, S1–S5 in one pass) + **§9 duplicate-banner
 follow-up fixed same day** (found during live verification) + **§10 token-UI
 refinement** (2026-06-23: composer-bar alignment shipped; reasoning-token
-estimate + context-bar restyle implemented + test-verified; live render blocked
-on the LiteLLM usage gap — `docs/issues/litellm_streaming_usage_not_surfaced.md`).
+estimate + context-bar restyle implemented + test-verified; the presumed
+"LiteLLM usage gap" was investigated 2026-06-24 and found to be a misdiagnosis —
+the usage pipeline is healthy, live render now unblocked, see §10.4 and
+`docs/issues/litellm_streaming_usage_not_surfaced.md`).
 Absorbs the issues deferred from `docs/issues/session_silent_failure_audit.md` to the
 "summarization rework track": **#4-full** (failure semantics), **#5**
 (tool-result caps), **#6** (keep-window elision), **#7** (aux-context
@@ -515,20 +517,33 @@ column. Thresholds are static for now; tying warn/danger to the actual
 compaction trigger (so "danger" literally means "compaction imminent") is the
 obvious refinement.
 
-**10.4 Blocker: LiteLLM-routed models surface no usage at all.** Live
-verification of 10.2/10.3 is blocked because both reachable local models are
-unusable for it: `gemma-4-moe-strix` 401s (expired endpoint key — the known
-persistent main-model key issue), and `gemma-4-moe` (via the LiteLLM gateway)
-emits **no `usage.updated` frame at all**, so the whole bar (input/output/ctx
-*and* the reasoning estimate) stays hidden for it. Curling the gateway proves it
-returns usage only when `stream_options.include_usage` is set — which SRW's
-`stream_usage=True` is supposed to send (verified in langchain source) — yet the
-usage chunk never reaches `response.usage_metadata`. Characterized with evidence
-+ close-out steps in `docs/issues/litellm_streaming_usage_not_surfaced.md`
-(prime suspect: the `AsyncReasoningCapturingClient` httpx tap dropping the final
-usage-only chunk). **This is the keystone**: closing it renders the live bar for
-every LiteLLM-routed model and unblocks the 10.2/10.3 screenshot.
+**10.4 Investigated: the "LiteLLM blocker" was a misdiagnosis — usage
+plumbing is healthy (2026-06-24).** The original hypothesis (LiteLLM /
+`include_usage` / the httpx tap eating the usage chunk) is **wrong**. Verified
+from inside the orchestrator pod:
+- `stream_options:{include_usage:True}` **is** on the wire (openai-SDK DEBUG
+  logs, 4/4 requests) — langchain converts `stream_usage=True` as expected.
+- The SSE tap is a **pure pass-through**; plain `ChatOpenAI` and
+  `ReasoningChatOpenAI` return **identical** `usage_metadata`.
+- The real session route for `gemma-4-moe` is **direct to `ai.h4ll.app`**
+  (registry endpoint `f475b8e1`), **not** the LiteLLM gateway — so the gateway
+  was never in the path. With the correctly-decrypted endpoint key a streamed
+  gemma turn returns `{input_tokens:21, output_tokens:20}`.
+- Real turns persist correct metrics (`thread_messages.metrics` for a live
+  gemini thread: `input/output/reasoning = 15624/65/35`).
 
-**Status:** 10.1 shipped (`9da9ad17`); 10.2 + 10.3 implemented + test-verified,
-live render pending 10.4; 10.4 characterized + filed, unfixed. The 10.2/10.3
-changes are on the working tree, uncommitted as of 2026-06-23.
+The empty bar that started this was an **errored turn** — `gemma-4-moe-strix`
+(now `enabled=false`) 401ing on a stale upstream key. A 401 captures no usage →
+no frame → no bar. Full evidence in
+`docs/issues/litellm_streaming_usage_not_surfaced.md` (now closed/corrected).
+Side-finding that *validates 10.2*: the direct `ai.h4ll.app` route reports no
+reasoning detail (`output_token_details: {}`), so the 10.2 estimate is the only
+source of a reasoning count on the real gemma route.
+
+**Status:** 10.1 shipped (`9da9ad17`); 10.2 + 10.3 implemented, test-verified,
+and committed on develop; 10.4 **investigated → not a blocker** (2026-06-24) —
+the usage pipeline is healthy. Live screenshot of 10.2/10.3 with real telemetry
+is now unblocked (the enabled `gemma-4-moe` route + decrypted key both work);
+only the visual capture remains. Optional refinements: tie warn/danger
+thresholds to the compaction trigger; add a "turn failed" affordance so an
+errored turn doesn't read as a broken bar.

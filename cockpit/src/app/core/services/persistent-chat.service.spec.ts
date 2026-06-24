@@ -2438,4 +2438,41 @@ describe('PersistentChatService — usage.updated telemetry', () => {
             expect(turns.filter((t) => t.kind === 'user')).toHaveLength(1);
         });
     });
+
+    describe('citation drift + snapshot fetch (Half-B v2)', () => {
+        it('fetchCitationDrift GETs the by-citation drift endpoint and returns the result', async () => {
+            const {service, mockHttp} = createService();
+            const payload = {citation_id: 7, live_state: 'changed', snapshot_available: true};
+            mockHttp.get.mockReturnValue(of(payload));
+            const res = await service.fetchCitationDrift(7);
+            expect(res).toEqual(payload);
+            expect(mockHttp.get).toHaveBeenCalledWith(
+                expect.stringContaining('/citations/7/drift'),
+            );
+        });
+
+        it('fetchCitationDrift returns null when the request errors', async () => {
+            const {service, mockHttp} = createService();
+            mockHttp.get.mockReturnValue(throwError(() => new Error('boom')));
+            expect(await service.fetchCitationDrift(7)).toBeNull();
+        });
+
+        it('fetchCitationSnapshotBlob requests a blob and returns it', async () => {
+            const {service, mockHttp} = createService();
+            const blob = new Blob(['pdf'], {type: 'application/pdf'});
+            mockHttp.get.mockReturnValue(of(blob));
+            const res = await service.fetchCitationSnapshotBlob(9);
+            expect(res).toBe(blob);
+            expect(mockHttp.get).toHaveBeenCalledWith(
+                expect.stringContaining('/citations/9/snapshot'),
+                expect.objectContaining({responseType: 'blob'}),
+            );
+        });
+
+        it('fetchCitationSnapshotBlob returns null on error', async () => {
+            const {service, mockHttp} = createService();
+            mockHttp.get.mockReturnValue(throwError(() => new Error('boom')));
+            expect(await service.fetchCitationSnapshotBlob(9)).toBeNull();
+        });
+    });
 });
