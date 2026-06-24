@@ -9065,6 +9065,220 @@ class PostgresDB:
             )
         return [dict(r) for r in rows]
 
+    # =========================================================================
+    # PROJECT LOOPS (self-improvement loop control rows)
+    # =========================================================================
+
+    @staticmethod
+    def _project_loop_row_to_dict(row) -> Dict[str, Any] | None:
+        """Normalize a project_loops asyncpg Record into a serializable dict.
+
+        Decodes the ``role_sequence`` JSONB column to a list; everything else
+        passes through. Returns None on a None row so callers can chain.
+        """
+        if row is None:
+            return None
+        out = dict(row)
+        seq = out.get("role_sequence")
+        if isinstance(seq, str):
+            try:
+                out["role_sequence"] = json.loads(seq)
+            except (TypeError, ValueError):
+                pass
+        return out
+
+    async def create_project_loop(
+        self,
+        *,
+        project_id: str,
+        owner_id: str | None,
+        goal: str | None = None,
+        acceptance_criteria: str | None = None,
+        user_prompt: str | None = None,
+        model: str | None = None,
+        role_sequence: List[str] | None = None,
+        max_iterations: int | None = None,
+        run_until: datetime | None = None,
+        max_consecutive_failures: int = 3,
+    ) -> Dict[str, Any]:
+        """Insert a project_loop control row in 'running' status.
+
+        ``remaining_iterations`` is seeded from ``max_iterations``. At least one
+        of ``max_iterations`` / ``run_until`` must be set (DB CHECK enforces it
+        too). The caller (router) validates the budget before calling.
+        """
+        roles = role_sequence or ["scholar", "critic", "developer"]
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO project_loops (
+                    project_id, owner_id, status,
+                    goal, acceptance_criteria, user_prompt, model,
+                    role_sequence, seq_index,
+                    max_iterations, remaining_iterations, run_until,
+                    max_consecutive_failures
+                )
+                VALUES (
+                    $1, $2, 'running',
+                    $3, $4, $5, $6,
+                    $7::jsonb, 0,
+                    $8, $8, $9,
+                    $10
+                )
+                RETURNING *
+                """,
+                UUID(project_id),
+                UUID(owner_id) if owner_id else None,
+                goal,
+                acceptance_criteria,
+                user_prompt,
+                model,
+                json.dumps(roles),
+                max_iterations,
+                run_until,
+                max_consecutive_failures,
+            )
+        return self._project_loop_row_to_dict(row)
+
+    async def get_project_loop(self, loop_id: str) -> Dict[str, Any] | None:
+        """Fetch one project loop by id. Returns None if not found."""
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM project_loops WHERE id = $1",
+                UUID(loop_id),
+            )
+        return self._project_loop_row_to_dict(row)
+
+    async def get_active_project_loop(self, project_id: str) -> Dict[str, Any] | None:
+        """Return the project's active (running|paused) loop, or None.
+
+        Backs the one-active-loop-per-project rule (also enforced by the
+        partial unique index) and the GET endpoint.
+        """
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT * FROM project_loops
+                WHERE project_id = $1 AND status IN ('running', 'paused')
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                UUID(project_id),
+            )
+        return self._project_loop_row_to_dict(row)
+
+    async def list_project_loops(
+        self,
+        *,
+        project_id: str | None = None,
+        owner_id: str | None = None,
+    ) -> List[Dict[str, Any]]:
+        """List project loops, newest first. Filters are additive."""
+        clauses: list[str] = []
+        params: list[Any] = []
+        if project_id is not None:
+            params.append(UUID(project_id))
+            clauses.append(f"project_id = ${len(params)}")
+        if owner_id is not None:
+            params.append(UUID(owner_id))
+            clauses.append(f"owner_id = ${len(params)}")
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                f"SELECT * FROM project_loops {where} ORDER BY created_at DESC",
+                *params,
+            )
+        return [self._project_loop_row_to_dict(r) for r in rows]
+
+    # Fields the loop controller / API may mutate. id / project_id / owner_id /
+    # created_at are immutable; everything else is loop runtime state.
+    _PROJECT_LOOP_UPDATABLE_FIELDS = frozenset(
+        {
+            "status",
+            "goal",
+            "acceptance_criteria",
+            "user_prompt",
+            "model",
+            "role_sequence",
+            "seq_index",
+            "max_iterations",
+            "remaining_iterations",
+            "run_until",
+            "max_consecutive_failures",
+            "current_job_id",
+            "total_jobs_run",
+            "consecutive_failures",
+            "last_error",
+            "stop_reason",
+        }
+    )
+
+    async def update_project_loop(
+        self,
+        loop_id: str,
+        **fields: Any,
+    ) -> Dict[str, Any] | None:
+        """Partial update of a project_loop row.
+
+        Unknown fields raise ValueError to catch typos at the boundary rather
+        than silently no-op. ``role_sequence`` is JSONB-encoded;
+        ``current_job_id`` is coerced to UUID (None clears it).
+        """
+        unknown = set(fields) - self._PROJECT_LOOP_UPDATABLE_FIELDS
+        if unknown:
+            raise ValueError(f"Cannot update project_loop fields: {sorted(unknown)}")
+        if not fields:
+            return await self.get_project_loop(loop_id)
+
+        sets: list[str] = []
+        params: list[Any] = []
+        for key, value in fields.items():
+            if key == "role_sequence":
+                params.append(json.dumps(value or []))
+                sets.append(f"{key} = ${len(params)}::jsonb")
+            elif key == "current_job_id":
+                params.append(UUID(value) if value else None)
+                sets.append(f"{key} = ${len(params)}")
+            else:
+                params.append(value)
+                sets.append(f"{key} = ${len(params)}")
+
+        sets.append("updated_at = now()")
+        params.append(UUID(loop_id))
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                f"UPDATE project_loops SET {', '.join(sets)} "
+                f"WHERE id = ${len(params)} RETURNING *",
+                *params,
+            )
+        return self._project_loop_row_to_dict(row) if row else None
+
+    async def list_project_loop_jobs(
+        self,
+        loop_id: str,
+        *,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """Jobs spawned by this loop, newest first.
+
+        Joins on the ``context->>'loop_id'`` tag the controller stamps at spawn
+        time (mirrors ``list_automation_runs``).
+        """
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, status, description, config_name, priority,
+                       created_at, updated_at, project_id
+                FROM jobs
+                WHERE context->>'loop_id' = $1
+                ORDER BY created_at DESC
+                LIMIT $2
+                """,
+                loop_id,
+                limit,
+            )
+        return [dict(r) for r in rows]
+
     async def fetch_next_due_cron_automation(self, conn) -> Dict[str, Any] | None:
         """Pessimistically claim the next due cron automation under SKIP LOCKED.
 
