@@ -719,7 +719,7 @@ class UniversalAgent:
             # dropped EMBEDDING_API_KEY). Pause for bounded re-dispatch — the
             # orchestrator caps retries then fails — instead of silently running
             # with memory + KB disabled. See
-            # docs/issues/embedding_key_missing_silently_disables_memory_and_kb.md.
+            # docs/done/embedding_key_missing_silently_disables_memory_and_kb.md.
             _project_id = (self._job_metadata or {}).get("project_id")
             _memory_missing = getattr(self, "_memory_degraded", False) or (
                 bool(_project_id) and getattr(self, "_kb_degraded", False)
@@ -1544,7 +1544,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         # inject_blob_credentials). Fall back to the blob so embedding / vision /
         # whisper / tts / citation keys still reach os.environ — otherwise the
         # embedding-backed memory + KB silently fail for every blob-delivered job.
-        # docs/issues/embedding_key_missing_silently_disables_memory_and_kb.md
+        # docs/done/embedding_key_missing_silently_disables_memory_and_kb.md
         env_keys = (metadata.get("config_override") or {}).get("env_keys")
         if not env_keys:
             env_keys = ((metadata.get("resolved_config") or {}).get("agent") or {}).get(
@@ -2341,7 +2341,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         # Initialize RecallStore for Memory Light (if enabled). These flags let
         # the process_job guard fail-closed (pause for re-dispatch) when a
         # memory-required job loses its embedding-backed stores. See
-        # docs/issues/embedding_key_missing_silently_disables_memory_and_kb.md.
+        # docs/done/embedding_key_missing_silently_disables_memory_and_kb.md.
         self._memory_degraded = False
         self._kb_degraded = False
         if self.config.memory.enabled:

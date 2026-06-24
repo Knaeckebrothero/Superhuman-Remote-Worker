@@ -178,7 +178,7 @@ class TestCompleteJobStatusDetermination:
 class TestMemoryUnavailableStatus:
     """memory/KB-unavailable freeze → bounded pause-then-fail.
 
-    docs/issues/embedding_key_missing_silently_disables_memory_and_kb.md
+    docs/done/embedding_key_missing_silently_disables_memory_and_kb.md
     """
 
     def _result(self, freeze_type="memory_unavailable"):

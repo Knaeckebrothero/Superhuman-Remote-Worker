@@ -77,6 +77,7 @@ from .core.loader import (
     load_auxiliary_prompt,
     get_phase_system_prompt,
 )
+from .core.model_registry import family_of
 from .core.phase import (
     handle_phase_transition,
     get_initial_strategic_todos,
@@ -86,6 +87,11 @@ from .core.phase import (
 from .core.phase_snapshot import PhaseSnapshotManager
 from .core.response_validator import validate_response
 from .core.state import UniversalAgentState
+from .core.toolcall_recovery import (
+    has_leaked_tool_call_markup,
+    parse_leaked_tool_calls,
+    strip_tool_call_markup,
+)
 from .core.workspace import WorkspaceManager
 from .llm.exceptions import ContextOverflowError
 from .llm.response_guards import is_degenerate_response
@@ -95,6 +101,12 @@ from .services.image_content import extract_image_tags, make_multimodal_user_mes
 from .tools.context import ToolContext
 
 logger = logging.getLogger(__name__)
+
+# Model families whose tool-call grammar the fallback recovery parser
+# understands. When such a model's serving layer leaks a tool call into message
+# content as text, the execute node rebuilds it into a structured call. Detection
+# (the no-tool-call circuit breaker) is NOT gated by family — only recovery is.
+RECOVERABLE_TOOLCALL_FAMILIES = {"gemma"}
 
 
 # =============================================================================
@@ -529,21 +541,29 @@ def _check_no_tool_call_streak(
     current_streak: int,
     last_hash: str,
     threshold: int = 3,
+    *,
+    is_leaked_markup: bool = False,
 ) -> tuple[int, bool, str]:
-    """Track consecutive identical no-tool-call responses (parser-failure signal).
+    """Track consecutive no-tool-call responses (parser-failure signal).
 
-    Catches the case where a response has non-empty content but zero tool calls
-    AND the content repeats verbatim across iterations — the upstream tool-call
-    parser is failing to lift the model's output into structured tool_calls and
-    the agent would otherwise loop forever calling the LLM with unchanged
-    context (e.g. job 3c30d72e: Gemma 4 emitted Python-style ``call:fn(args)``
-    instead of canonical ``call:fn{args}``; vLLM's gemma4 parser refused the
-    format and ``tool_calls`` stayed None for 1385 iterations).
+    Catches the case where a response has non-empty content but zero tool calls —
+    the upstream tool-call parser is failing to lift the model's output into
+    structured tool_calls and the agent would otherwise loop forever calling the
+    LLM with unchanged context (e.g. job 3c30d72e: Gemma 4 emitted Python-style
+    ``call:fn(args)`` instead of canonical ``call:fn{args}``; vLLM's gemma4 parser
+    refused the format and ``tool_calls`` stayed None for 1385 iterations).
+
+    The streak advances when either:
+
+    * the content repeats verbatim across iterations (hash match), or
+    * ``is_leaked_markup`` is set — the content is a bare leaked tool-call block
+      the fallback parser could not recover. This catches the variant where the
+      leaked payload *differs* every turn (job 2dacba6f: git_log, git_tags,
+      todo_complete…), which a pure hash-match would never accumulate.
 
     Distinct from _check_empty_response_streak (which requires content==0).
-    The hash-match condition prevents false positives on legitimate
-    natural-language reflections that happen to produce no tool calls — those
-    vary across iterations and won't accumulate.
+    Legitimate natural-language reflections (no markup, varying text) neither
+    match a prior hash nor look like leaked markup, so they won't accumulate.
 
     Args:
         content_str: The response's text content (post-normalization).
@@ -551,13 +571,16 @@ def _check_no_tool_call_streak(
         current_streak: Current streak count.
         last_hash: Truncated SHA-256 of the previous iteration's content. Empty
             string on first call or after a reset.
-        threshold: Number of consecutive identical no-tool responses tolerated.
+        threshold: Number of consecutive no-tool responses tolerated.
+        is_leaked_markup: True when the content is dominated by unrecovered
+            leaked tool-call markup (see has_leaked_tool_call_markup).
 
     Returns:
         Tuple of (new_streak, should_fail, new_hash). Streak resets to 0 (and
         new_hash to "") when a tool call is present or content is empty. On a
-        no-tool-call response with new content, streak resets to 1 with the
-        new hash. On a hash match, streak increments.
+        no-tool-call response that neither matches the prior hash nor looks like
+        leaked markup, the streak resets to 1 with the new hash. Otherwise it
+        increments.
     """
     import hashlib
 
@@ -567,7 +590,7 @@ def _check_no_tool_call_streak(
     new_hash = hashlib.sha256(
         content_str.encode("utf-8", errors="replace")
     ).hexdigest()[:16]
-    if new_hash == last_hash:
+    if is_leaked_markup or new_hash == last_hash:
         new_streak = current_streak + 1
         return new_streak, new_streak > threshold, new_hash
     return 1, False, new_hash
@@ -1379,6 +1402,59 @@ def create_execute_node(
                     f"[{job_id}] LLM response: {content_len} chars, {tool_calls_count} tool calls"
                 )
 
+                # --- Fallback: recover tool calls leaked into content ---
+                # Some serving layers (vLLM's gemma4 parser) drop a tool call to
+                # plain text when the model emits a slightly off-spec wire format,
+                # leaving content=markup and tool_calls=empty. Rebuild the call so
+                # the tools node can execute it instead of the agent looping. Gated
+                # to families whose grammar this is; the parser bails unless the
+                # whole message is well-formed blocks for known tools.
+                if (
+                    tool_calls_count == 0
+                    and isinstance(content_str, str)
+                    and content_str
+                    and family_of(phase_model) in RECOVERABLE_TOOLCALL_FAMILIES
+                ):
+                    recovered = parse_leaked_tool_calls(
+                        content_str, allowed_names=set(tool_names or [])
+                    )
+                    if recovered:
+                        response.tool_calls = recovered
+                        response.content = strip_tool_call_markup(content_str)
+                        tool_calls_count = len(recovered)
+                        content_str = response.content
+                        content_len = len(content_str)
+                        _no_tool_call_streak[0] = 0
+                        _no_tool_call_last_hash[0] = ""
+                        logger.info(
+                            f"[{job_id}] Recovered {tool_calls_count} leaked tool "
+                            f"call(s) from content (model={phase_model}): "
+                            f"{[tc['name'] for tc in recovered]}"
+                        )
+                        if auditor:
+                            auditor.audit_step(
+                                job_id=job_id,
+                                agent_type=config.agent_id,
+                                step_type="toolcall_recovered",
+                                node_name="execute",
+                                iteration=iteration,
+                                data={
+                                    "toolcall_recovered": {
+                                        "model": phase_model,
+                                        "recovered": [
+                                            {
+                                                "name": tc["name"],
+                                                "args_preview": str(tc["args"])[:200],
+                                            }
+                                            for tc in recovered
+                                        ],
+                                    }
+                                },
+                                metadata=state.get("metadata"),
+                                phase=phase_str,
+                                phase_number=phase_number,
+                            )
+
                 # --- Empty response circuit breaker ---
                 # The codex proxy + langchain Responses API non-streaming path
                 # can silently return AIMessages with empty content and dropped
@@ -1443,16 +1519,19 @@ def create_execute_node(
                 # non-empty but tool_calls is None — happens when the upstream
                 # tool-call parser refuses the model's wire format and returns
                 # the raw output as content (e.g. Gemma 4 emitting parens
-                # instead of canonical braces). Hash-match across iterations
-                # makes this deterministic: legitimate natural-language
-                # reflections vary and won't trip it.
+                # instead of canonical braces). Trips on either verbatim repeats
+                # (hash match) or bare leaked markup the fallback parser could not
+                # recover (even when the payload varies each turn); legitimate
+                # natural-language reflections do neither and won't trip it.
                 content_for_streak = content_str if isinstance(content_str, str) else ""
+                leaked_markup = has_leaked_tool_call_markup(content_for_streak)
                 no_tc_streak, no_tc_should_fail, no_tc_hash = (
                     _check_no_tool_call_streak(
                         content_str=content_for_streak,
                         tool_calls_count=tool_calls_count,
                         current_streak=_no_tool_call_streak[0],
                         last_hash=_no_tool_call_last_hash[0],
+                        is_leaked_markup=leaked_markup,
                     )
                 )
                 _no_tool_call_streak[0] = no_tc_streak
@@ -1475,8 +1554,8 @@ def create_execute_node(
                                     "type": "parser_failure",
                                     "message": (
                                         "LLM response has content but no "
-                                        "tool_calls; same content repeating "
-                                        "across iterations"
+                                        "tool_calls; leaked/malformed tool-call "
+                                        "markup or repeated content"
                                     ),
                                     "streak": no_tc_streak,
                                     "model": phase_model,
@@ -1497,15 +1576,13 @@ def create_execute_node(
                     return {
                         "error": {
                             "message": (
-                                f"LLM emitted identical non-empty content "
-                                f"with no tool_calls for {no_tc_streak} "
-                                f"consecutive iterations. Likely a tool-call "
-                                f"parser failure — the upstream inference "
-                                f"backend may be returning malformed "
-                                f"tool-call syntax that the parser cannot "
-                                f"lift into structured tool_calls. Verify "
-                                f"the model is emitting the parser's "
-                                f"canonical format. Model: {phase_model}. "
+                                f"LLM emitted non-empty content with no "
+                                f"usable tool_calls for {no_tc_streak} "
+                                f"consecutive iterations (leaked/malformed "
+                                f"tool-call markup the parser could not lift, "
+                                f"or identical repeated content). Verify the "
+                                f"model is emitting the parser's canonical "
+                                f"format. Model: {phase_model}. "
                                 f"Sample: {sample!r}"
                             ),
                             "type": "parser_failure",
