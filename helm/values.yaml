@@ -1232,7 +1232,7 @@ llm:
 # for embeddings — no separate citation DB, role, or embedding config.
 # `llmUrl` / `llmModel` / `reasoningLevel` for the verifier are passed via job
 # `config_override` at dispatch (default set in Admin → Models). See
-# docs/features/citation_engine_integration.md.
+# docs/done/citation_engine_integration.md.
 
 # =============================================================================
 # Email / Notifications

@@ -29,7 +29,7 @@ tags:
 # so the assistant references sources inline as [N] instead of citing-and-forgetting.
 # persistent_defaults omits instruction_files by convention, so persistent experts
 # opt in here; before_tool + enforce is the only binding that fires in a session
-# (no phase loop). See docs/features/citation_engine_integration.md Phase 4.
+# (no phase loop). See docs/done/citation_engine_integration.md Phase 4.
 instruction_files:
   - skill: cite-as-you-write
     trigger: before_tool:cite_web
