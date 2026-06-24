@@ -608,7 +608,7 @@ class TestCodexBypassesGateway:
 # system-default fallback the chat model has (outside the user gate), stops a
 # pre-present EMBEDDING_MODEL from suppressing the key, and refuses to emit a
 # half-credential when the endpoint key can't decrypt.
-# See docs/issues/embedding_key_missing_silently_disables_memory_and_kb.md
+# See docs/done/embedding_key_missing_silently_disables_memory_and_kb.md
 # ---------------------------------------------------------------------------
 
 EMB_ENDPOINT_ID = "33333333-3333-3333-3333-333333333333"

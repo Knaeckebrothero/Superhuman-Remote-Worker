@@ -488,6 +488,60 @@ class TestCheckNoToolCallStreak:
         assert s2 == 2
         assert h1 == h2
 
+    # --- markup-aware hardening (job 2dacba6f: varying leaked payloads) ---
+
+    def test_leaked_markup_varying_payloads_accumulate_and_fail(self):
+        """Different leaked tool-call blocks each turn (git_log, git_tags,
+        todo_complete…) must accumulate when flagged as leaked markup, even
+        though their hashes differ — the 24,127-iteration regression that a
+        pure hash-match could never catch."""
+        payloads = [
+            "<|tool_call>call:git_log(max_count=15)<tool_call|>",
+            "<|tool_call>call:git_tags()<tool_call|>",
+            '<|tool_call>call:todo_complete(todo_id="todo_1")<tool_call|>',
+            '<|tool_call>call:read_file{path:<|"|>plan.md<|"|>}<tool_call|>',
+        ]
+        s, h = 0, ""
+        for i, payload in enumerate(payloads):
+            s, fail, h = _check_no_tool_call_streak(
+                payload, 0, s, h, is_leaked_markup=True
+            )
+            if i < 3:
+                assert fail is False
+                assert s == i + 1
+            else:
+                assert fail is True
+                assert s == 4
+
+    def test_leaked_markup_first_response_does_not_fail(self):
+        """First leaked-markup response starts the streak at 1, no fail."""
+        s, fail, h = _check_no_tool_call_streak(
+            self.LEAKED, 0, 0, "", is_leaked_markup=True
+        )
+        assert s == 1
+        assert fail is False
+        assert h != ""
+
+    def test_varying_content_without_markup_flag_still_resets(self):
+        """Backward-compat: with is_leaked_markup unset (default False),
+        differing content still resets to 1 — unchanged legacy behavior."""
+        a, fail_a, ha = _check_no_tool_call_streak("response A", 0, 5, "oldhash")
+        assert a == 1
+        assert fail_a is False
+        b, fail_b, hb = _check_no_tool_call_streak("response B", 0, a, ha)
+        assert b == 1
+        assert fail_b is False
+        assert hb != ha
+
+    def test_tool_call_resets_even_with_markup_flag(self):
+        """A real tool call resets the streak regardless of the markup flag."""
+        s, fail, h = _check_no_tool_call_streak(
+            self.LEAKED, 1, 3, "prev", is_leaked_markup=True
+        )
+        assert s == 0
+        assert fail is False
+        assert h == ""
+
 
 # =============================================================================
 # _classify_llm_error

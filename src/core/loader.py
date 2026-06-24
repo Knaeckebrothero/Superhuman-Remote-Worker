@@ -1605,7 +1605,7 @@ class MemoryConfig:
     # When True, a job/session that needs memory but whose embedding-backed
     # stores fail to initialize must NOT run blind: the worker agent pauses for
     # bounded re-dispatch instead of silently degrading (see
-    # docs/issues/embedding_key_missing_silently_disables_memory_and_kb.md).
+    # docs/done/embedding_key_missing_silently_disables_memory_and_kb.md).
     # Default False = degrade-loud (Layer 1 audit only).
     required: bool = False
     budget_tokens: int = 10000

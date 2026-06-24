@@ -1424,7 +1424,7 @@ def audit_unavailable(
     an audit step with a custom ``step_type`` (e.g. ``memory_unavailable`` /
     ``kb_unavailable``) so the degradation is visible in the cockpit audit trail
     instead of living only in a pod-log WARNING (see
-    docs/issues/embedding_key_missing_silently_disables_memory_and_kb.md).
+    docs/done/embedding_key_missing_silently_disables_memory_and_kb.md).
     """
     arch = get_archiver()
     if arch is None:

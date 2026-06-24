@@ -1746,7 +1746,7 @@ async def _inject_dispatch_credentials(
                 # was already set — _inject_env_key_credentials uses setdefault,
                 # so a pre-present MODEL must not suppress the _API_KEY (the bug
                 # that left jobs with MODEL+BASE_URL but no key:
-                # docs/issues/embedding_key_missing_silently_disables_memory_and_kb.md).
+                # docs/done/embedding_key_missing_silently_disables_memory_and_kb.md).
                 await _inject_env_key_credentials(
                     env_keys=env_keys_block,
                     prefix="EMBEDDING",
@@ -1796,7 +1796,7 @@ async def _inject_dispatch_credentials(
     # preference (or no user at all) silently fell back to provider 'local' with
     # no key, disabling memory + KB with no signal. Inject the admin-curated
     # system embedding here so every job gets it the same way it gets its chat
-    # model. docs/issues/embedding_key_missing_silently_disables_memory_and_kb.md
+    # model. docs/done/embedding_key_missing_silently_disables_memory_and_kb.md
     _emb_env = config_override.setdefault("env_keys", {})
     if "EMBEDDING_API_KEY" not in _emb_env:
         _emb_model = _emb_env.get(
@@ -3642,7 +3642,7 @@ async def _inject_env_key_credentials(
                 # cause) or is empty. Surface it loudly and do NOT emit a
                 # half-credential (base_url without api_key) that silently
                 # degrades the agent to a keyless 'local' provider — the failure
-                # mode in docs/issues/embedding_key_missing_silently_disables_memory_and_kb.md.
+                # mode in docs/done/embedding_key_missing_silently_disables_memory_and_kb.md.
                 logger.error(
                     "Dispatch: %s endpoint %s resolved a base_url but no usable "
                     "api_key (decrypt failed or empty) — not injecting "
@@ -9786,7 +9786,7 @@ async def complete_job(
         # is still 'processing', so it has to run before the generic status write
         # below. The loop-advance hook is correctly skipped because the job never
         # reaches a terminal status here.
-        # docs/issues/embedding_key_missing_silently_disables_memory_and_kb.md
+        # docs/done/embedding_key_missing_silently_disables_memory_and_kb.md
         if new_status == "paused":
             _mfd = result.get("freeze_data")
             if isinstance(_mfd, str):
@@ -9970,7 +9970,7 @@ async def complete_job(
         # Only a TERMINAL outcome advances the loop: a paused job (e.g. the
         # memory_unavailable bounded-retry) is re-dispatched as the SAME job, so
         # the loop must keep waiting on it rather than rotate to the next role.
-        # docs/issues/embedding_key_missing_silently_disables_memory_and_kb.md
+        # docs/done/embedding_key_missing_silently_disables_memory_and_kb.md
         try:
             if job.get("status") in ("completed", "failed", "cancelled"):
                 await _advance_project_loop(job, result, actions)

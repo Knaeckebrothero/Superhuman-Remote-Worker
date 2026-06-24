@@ -249,7 +249,7 @@ def is_job_completion_freeze(job: dict[str, Any]) -> bool:
 
 # Bounded re-dispatch cap for memory/KB-unavailable pauses. After this many
 # pause+retry cycles a memory-required job is failed instead of looping forever
-# (docs/issues/embedding_key_missing_silently_disables_memory_and_kb.md).
+# (docs/done/embedding_key_missing_silently_disables_memory_and_kb.md).
 MEMORY_RETRY_CAP = 2
 
 

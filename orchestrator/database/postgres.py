@@ -1437,7 +1437,7 @@ class PostgresDB:
         /complete handlers — e.g. a duplicate/racing re-dispatch of the same
         paused job — can't both read the same value and stall the counter at 1.
         Returns the new count, or 0 if the job was not found / id was invalid.
-        See docs/issues/embedding_key_missing_silently_disables_memory_and_kb.md.
+        See docs/done/embedding_key_missing_silently_disables_memory_and_kb.md.
         """
         try:
             uuid_val = UUID(job_id)
