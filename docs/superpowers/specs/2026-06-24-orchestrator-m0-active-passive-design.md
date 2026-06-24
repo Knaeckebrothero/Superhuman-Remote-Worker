@@ -1,6 +1,6 @@
 # Orchestrator M0 — Active-Passive Failover Hardening — Design Spec
 
-**Status:** Approved design (2026-06-24), pending implementation plan.
+**Status:** Implemented & locally verified on k3d (2026-06-24). All chart/doc changes committed on `develop` (unpushed). Live multi-node + real-traffic chaos test deferred — see `docs/tests/orchestrator_m0_failover_verification.md`.
 **Parent:** `docs/features/orchestrator_ha_scaling.md` — Milestone **M0** / **Phase 0** (Track 1). This spec is the implementation-of-record for that milestone.
 **Goal:** Make a single orchestrator pod's death (eviction, OOM, node drain, image roll) a fast, bounded, predictable failover instead of today's multi-minute, connection-severing blackout — **without** making the orchestrator multi-replica. Stays `replicas: 1`.
 **Scope:** Config-only. Helm chart changes plus an operations runbook. **No application code.**
@@ -111,32 +111,34 @@ Default `enabled: true`, `minAvailable: 0`. At `replicas: 1`, `minAvailable: 0` 
     enabled: true
     minAvailable: 0   # replicas:1 → must be 0; flip to 1 at replicas>=2 (M1)
   ```
-- `helm/values.example.yaml` — mirror the new keys (it is documentation-facing).
-- `helm/values.schema.json` — add matching entries under the `orchestrator` properties (`preStopDrainSeconds`: integer, `terminationGracePeriodSeconds`: integer, `pdb`: object of `enabled`: boolean + `minAvailable`: integer). The chart validates against this schema; missing entries fail `helm template` if `additionalProperties:false` is set on that object — verify during implementation.
+- `helm/values.example.yaml` — **no change made (as built).** It is a deliberately minimal customer overlay (external services + sizing only, no `orchestrator:` block); the HA defaults in `values.yaml` are production-appropriate, so adding HA keys there would contradict its design (YAGNI).
+- `helm/values.schema.json` — **no change needed (as built).** Confirmed during implementation: the schema is intentionally permissive (`additionalProperties` allowed; it does not define `orchestrator`), so the new keys validate without schema edits.
 - `docs/operations/orchestrator_failover.md` — new: documents expected failover behavior and the chaos-test procedure (Phase 0 explicitly calls for this doc).
 
 ---
 
 ## Validation
 
-**Done here (by the implementer):**
-- `helm lint helm/` passes.
-- `helm template helm/` renders cleanly with (a) defaults and (b) `--set orchestrator.replicas=2 --set orchestrator.pdb.minAvailable=1` (proves Track-2-readiness and schema validity).
-- Rendered orchestrator Deployment contains `terminationGracePeriodSeconds`, container `lifecycle.preStop`, `startupProbe`, and the tuned liveness/readiness; rendered output includes the orchestrator PDB when enabled. A rendered-manifest diff goes in the implementation-plan verification step.
+**Chart validation (done):**
+- `helm lint helm/ -f helm/ci/test-values.yaml` passes; renders cleanly across all `helm/ci/*` values files, with defaults and with `--set orchestrator.replicas=2 --set orchestrator.pdb.minAvailable=1` (Track-2-readiness).
+- Rendered orchestrator Deployment contains `terminationGracePeriodSeconds`, container `lifecycle.preStop`, `startupProbe`, and the tuned liveness/readiness; the orchestrator PDB renders when enabled and is absent when disabled.
 
-**Behavioral chaos test (operator-run, on dev):** destructive `kubectl delete pod <orchestrator>` under load — (a) a job mid-dispatch, (b) a sudo prompt open, (c) a persistent session mid-turn — measuring observable downtime and confirming clean recovery (job re-dispatched, session reattaches, no duplicate side effects). Delivered as a script + the `orchestrator_failover.md` runbook; **not** run from this workspace (it can't safely drive the remote cluster, and local k3d/tilt runs dev Dockerfiles rather than this chart). Acceptance target: observed REST downtime within the rolling-restart window (single-digit seconds at `replicas:1` with a warm replacement; documented, not asserted in CI).
+**Local k3d mechanics (done, 2026-06-24):** the chart was Helm-deployed on the single-node k3d stack and the mechanics were exercised live — `startupProbe` + init-containers carried the orchestrator through a ~5-min cold start with **0 restarts**; `preStop` graceful termination measured **18s** (15s sleep + shutdown); `srw-orchestrator-pdb` reports **`ALLOWED DISRUPTIONS: 1`**. Full results: `docs/tests/orchestrator_m0_failover_verification.md`.
+
+**Behavioral chaos test on the shared cluster (deferred):** the multi-node node-drain reschedule, in-flight-request drain under real traffic, and full-stack failover (job re-dispatch, session reattach, sudo survival) require the live multi-node cluster and are **deferred to a quiet overnight window**, gated on M0 reaching dev (push `develop` / Fleet sync). Procedure: `docs/operations/orchestrator_failover.md`; tracking: `docs/tests/orchestrator_m0_failover_verification.md`.
 
 ---
 
 ## Definition of done
 
-- [ ] Chart renders + lints (defaults and `replicas=2`), schema updated.
-- [ ] preStop + grace + startupProbe + tuned probes present in the rendered Deployment.
-- [ ] Orchestrator PDB renders when enabled; absent when disabled.
-- [ ] New values documented in `values.yaml` + `values.example.yaml`.
-- [ ] `docs/operations/orchestrator_failover.md` written (behavior + chaos-test runbook + script).
-- [ ] `orchestrator_ha_scaling.md` Phase 0 checkboxes + M0 status updated to reflect what landed (and what's left: the operator-run chaos test).
-- [ ] `helm/ci/` render-test values still render and the chart CI gate is green (new keys are optional with defaults, so no breakage expected — confirm).
+- [x] Chart renders + lints (defaults and `replicas=2`); schema needed **no change** (permissive).
+- [x] preStop + grace + startupProbe + tuned probes present in the rendered Deployment.
+- [x] Orchestrator PDB renders when enabled; absent when disabled.
+- [x] New values documented in `values.yaml` (`values.example.yaml` left unchanged — minimal overlay, see §5).
+- [x] `docs/operations/orchestrator_failover.md` written (behavior + chaos-test runbook).
+- [x] `orchestrator_ha_scaling.md` Phase 0 checkboxes + M0 status updated.
+- [x] `helm/ci/` render-test values still render (verified against all four; new keys are optional with defaults).
+- [ ] **Live chaos test on the shared cluster — deferred** (overnight, after M0 reaches dev). Tracked in `docs/tests/orchestrator_m0_failover_verification.md`.
 
 ---
 
@@ -146,6 +148,7 @@ Default `enabled: true`, `minAvailable: 0`. At `replicas: 1`, `minAvailable: 0` 
 - **Drain 15 / grace 60**, not the parent doc's offhand 30/60 — see §1 rationale. Tunable.
 - **`startupProbe` over bumping liveness `initialDelaySeconds`** — the modern K8s answer to slow start; decouples migration time from the liveness budget permanently.
 - **PDB `minAvailable: 0` default** — mandatory at `replicas:1`; the PDB exists mainly for Track-2-readiness and intent documentation.
+- **No `values.schema.json` / `values.example.yaml` changes** (resolved during implementation) — the schema is permissive (doesn't define `orchestrator`) and the example file is a minimal customer overlay, so the `values.yaml` defaults cover M0. This refines the original §5, which had assumed a schema edit might be needed.
 
 ## Out of scope
 
