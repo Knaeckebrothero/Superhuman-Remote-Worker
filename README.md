@@ -21,15 +21,15 @@ The typical human-AI workflow looks like this: you have an idea, you dump it on 
 This system replaces that loop with four agents that run it continuously:
 
 ```
-         ┌──────────────────────────────────────────────────┐
-         │                                                  │
-         ▼                                                  │
+         ┌─────────────────────────────────────────────────┐
+         │                                                 │
+         ▼                                                 │
    ┌──────────┐     writes ideas     ┌──────────┐          │
-   │  SCHOLAR │ ──────────────────► │  CRITIC  │          │
+   │  SCHOLAR │ ───────────────────► │  CRITIC  │          │
    │          │                      │          │          │
    │ Explores │     reviews &        │ Reviews  │          │
    │ the web, │     rates them       │ rejects  │          │
-   │ codebase,│ ◄────────────────── │ or       │          │
+   │ codebase,│ ◄─────────────────── │ or       │          │
    │ papers,  │  feedback/issues     │ approves │          │
    │ logs     │                      └────┬─────┘          │
    └──────────┘                           │                │
