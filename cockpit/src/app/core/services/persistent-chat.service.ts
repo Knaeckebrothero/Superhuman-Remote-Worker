@@ -1936,6 +1936,29 @@ export class PersistentChatService {
                 break;
             }
 
+            case 'citation.verdict': {
+                // The aux verifier flipped a citation pending→verified/failed.
+                // Patch it in place so the citations panel + inline [N] popover
+                // update live, instead of waiting for the next per-turn
+                // loadCitations(). No-op if the citation isn't loaded yet — the
+                // turn-boundary refresh will pick up its already-final status.
+                const cid = Number(params['citation_id']);
+                const status =
+                    typeof params['verification_status'] === 'string'
+                        ? (params['verification_status'] as string)
+                        : '';
+                if (Number.isFinite(cid) && status) {
+                    this.citationsByCid.update((m) => {
+                        const existing = m.get(cid);
+                        if (!existing) return m;
+                        const next = new Map(m);
+                        next.set(cid, {...existing, verification_status: status});
+                        return next;
+                    });
+                }
+                break;
+            }
+
             case 'turn.completed': {
                 const turnId = String(params['turn_id'] ?? this.conversation().activeAssistantTurnId ?? '');
                 if (turnId) {

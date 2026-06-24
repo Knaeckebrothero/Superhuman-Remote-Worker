@@ -1514,7 +1514,7 @@ async def _inject_dispatch_credentials(
         # API Codex proxy). Inject it so the agent builds the right factory — the
         # endpoint branch otherwise leaves provider unset and the agent defaults
         # to the openai factory, which forces Chat Completions and strips gpt-5.x
-        # reasoning. See docs/issues/litellm_gateway_drops_gpt_codex_reasoning_capture.md
+        # reasoning. See docs/done/litellm_gateway_drops_gpt_codex_reasoning_capture.md
         if meta.provider:
             llm_over.setdefault("provider", meta.provider)
         # The Codex proxy speaks ONLY the Responses API; the LiteLLM gateway

@@ -96,7 +96,7 @@ def _factory_provider(yaml_provider: Optional[str]) -> str:
 # generic ``openai`` (Chat Completions) factory, which forces
 # ``use_responses_api=False`` and never requests a reasoning summary, so gpt-5.x
 # / o-series / codex models wired to this endpoint silently lose their reasoning.
-# See docs/issues/litellm_gateway_drops_gpt_codex_reasoning_capture.md
+# See docs/done/litellm_gateway_drops_gpt_codex_reasoning_capture.md
 CODEX_PROXY_ENDPOINT_LABEL = "codex-proxy"
 
 

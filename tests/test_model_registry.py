@@ -65,7 +65,7 @@ class TestEndpointFactoryProvider:
     Codex proxy speaks only the Responses API and needs the codex factory's
     reasoning-summary path. Detected by the seeded ``codex-proxy`` label or a
     ``codex-proxy`` host in the base_url.
-    See docs/issues/litellm_gateway_drops_gpt_codex_reasoning_capture.md
+    See docs/done/litellm_gateway_drops_gpt_codex_reasoning_capture.md
     """
 
     def test_codex_proxy_by_label(self):
