@@ -13,6 +13,11 @@ tags:
 
 # Missing embedding API key silently disables BOTH memory and KB for a job
 
+**Status:** ✅ RESOLVED 2026-06-24 — fix implemented + k3d-verified end-to-end
+(uncommitted on `develop`; pending commit + prod deploy). Root cause was deeper
+than first diagnosed (the blob-delivery path never applied `env_keys` to the
+agent's `os.environ`); see "Implementation & e2e verification" below.
+
 **Filed:** 2026-06-24, found while investigating "this loop job has no memory
 injection" on the main cluster — loop `27cabc53` (project "Better Resavio",
 `54426051-…`), Developer/Execution job
@@ -281,7 +286,7 @@ were also silently keyless on the blob path before this fix (same mechanism).
 
 ## Related
 
-- [`preemption_before_first_checkpoint_replays_job_opening.md`](preemption_before_first_checkpoint_replays_job_opening.md)
+- [`preemption_before_first_checkpoint_replays_job_opening.md`](../issues/preemption_before_first_checkpoint_replays_job_opening.md)
   — same loop run (`27cabc53`). Its evidence table notes Run 1 had "KB tools
   absent" + `… > memory > …` instruction hierarchy vs Run 3's "KB tools present"
   + `… > knowledge base > …`. That "KB tools absent / `memory >`" signature is

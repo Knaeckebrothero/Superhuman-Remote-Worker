@@ -29,6 +29,8 @@ related:
 | #2a — Gemma prompt variants (systemprompt/persona/strategic/tactical/summarization) | **Shipped** | End-to-end Jinja+format pipeline validated; canonical wire-format anchor at top + bottom of systemprompt, 6 worked examples in tactical |
 | #2b — Gemma instructions variant (`instructions_gemma.md`) | **Shipped** | All 5 Python-style examples in default `instructions.md` rewritten in canonical format; wired via matrix `gemma.instructions` |
 | #2c — Strip Python-parens examples from runtime nudges + `todo_complete` docstring (model-agnostic, true root cause) | **Shipped** | `src/graph.py:1373` recovery nudge, `src/managers/todo.py:409`, `src/tools/core/todo.py:174,196,207` rewritten format-neutral. See "Root cause 1b" below |
+| #6 — Agent-side leaked-tool-call recovery (rebuild a structured call from leaked markup) | **Shipped** (2026-06-24) | `src/core/toolcall_recovery.py` + execute-node hook; unit-tested in `tests/test_toolcall_recovery.py`. See Fix 6 below |
+| #7 — Markup-aware no-tool-call breaker (trip on *varying* leaked payloads) | **Shipped** (2026-06-24) | `is_leaked_markup` branch in `_check_no_tool_call_streak`; added tests in `TestCheckNoToolCallStreak`. See Fix 7 below |
 | #3 — Don't dispatch worker jobs to `gemma-4-moe` (interim) | **N/A** | Superseded by #2; can dispatch once a real-job validation passes |
 | #4 — Backend failover (`gemma-4-moe` → `gemma-4-moe-strix`) | **Open** | Configmap + router multi-backend support change; not blocking |
 | #5 — Cockpit visibility for `parser_failure` freezes | **Open** | API + UI work; nice-to-have |
@@ -37,6 +39,8 @@ related:
 | Pin `--chat-template tool_chat_template_gemma4.jinja` | **Open** | Workstation deployment change |
 
 **Validation pending:** a real Gemma worker job to confirm the parser failure rate drops from ~100% to near zero. Until that succeeds, treat fixes #1, #2a, #2b as "code-complete, behaviour-unverified."
+
+**Update (2026-06-24) — recurrence + agent-side recovery.** The prompt/instruction fixes (#2a–#2c) reduced but did **not** eliminate the leak. Job `2dacba6f` (`gemma-4-moe`) still ran **24,127 iterations**, **23,743 (98%) leaked-as-text with no structured `tool_calls`**, and surfaced the raw `<|tool_call>…<tool_call|>` markup in the Cockpit chat-history debug view (the markup is faithfully stored in `chat_history.response.content` — it is *not* a Mongo→Postgres import artifact). Two new model-agnostic harness fixes shipped: the agent now **recovers** the leaked call into a real structured tool call before acting — so the model makes progress *and* the markup is no longer archived (#6) — and the no-tool-call breaker now **fails fast even when the leaked payload varies each turn** (#7), closing the blind spot that let #1 miss this run: #1 keys on identical-content hashes, but 2dacba6f varied its calls (`git_log`, `git_tags`, `todo_complete`…) so the hash never matched.
 
 ## TL;DR
 
@@ -260,6 +264,16 @@ Even with that, the in-memory rate limiter pinning the router to 1 replica is th
 ### Fix 5 — Operator visibility — open
 
 Add a Cockpit alert / job-page banner when `freeze_data.type == "parser_failure"` so the operator sees *why* a job stopped before opening the audit. Today the audit has to be paginated by hand to find the leaked-text pattern. Now that fix #1 emits `parser_failure` as a structured error type, the API and UI changes are localised.
+
+### Fix 6 — Agent-side leaked-tool-call recovery — **SHIPPED (2026-06-24)**
+
+New pure module `src/core/toolcall_recovery.py` — `parse_leaked_tool_calls` (strict recovery), `has_leaked_tool_call_markup` (loose detector, used by #7), and `strip_tool_call_markup` (content cleanup). The execute node (`src/graph.py`, right after the LLM-response normalization, before the empty/no-tool-call breakers) calls the parser when `tool_calls_count == 0` and the model's family is in `RECOVERABLE_TOOLCALL_FAMILIES` (default `{"gemma"}`): on a clean parse it sets `response.tool_calls`, strips the markup from `response.content`, and resets the no-tool-call streak. The recovered call then routes through the normal `route_after_execute` → tools-node path (phase-gating still applies), and the archiver records the cleaned content + structured call — so **new** chat-history rows no longer show the markup (historical rows are untouched).
+
+The parser is deliberately conservative: it recovers only when the trimmed content is *wholly* one or more well-formed `<|tool_call>call:NAME<args><tool_call|>` blocks, every tool name is in the phase-bound set, and every arg parses cleanly (both canonical Gemma braces `{k:<|"|>v<|"|>}` and the Python-parens leak `(k=v)` / `()`). Any ambiguity → bail entirely, so a misparsed `write_file`/`run_command` is never executed; the registry/phase gate and `ToolNode(handle_tool_errors=True)` are the backstops. Recovered calls get a unique `id` (`rcv_<hex>`) so context-compaction tool-call/result pairing doesn't strip them as orphans. **v1 limitation:** array/object args (`tasks:[...]`, nested `{...}`) are not recovered — those fall through to the breaker (#7). Unit-tested in `tests/test_toolcall_recovery.py`.
+
+### Fix 7 — Markup-aware no-tool-call breaker — **SHIPPED (2026-06-24)**
+
+Hardened `_check_no_tool_call_streak()` (`src/graph.py`) with a keyword-only `is_leaked_markup` argument: the streak now advances on a bare leaked-markup response *even when the payload differs each turn*, not only on identical-content hash matches. The execute-node call site passes `has_leaked_tool_call_markup(content)`. This closes Fix 1's blind spot — job 2dacba6f varied its leaked calls, so the hash never matched and the original detector never tripped across 24,127 iterations. Detection is **not** family-gated (recovery in #6 is; fail-fast is safe for any backend). The outcome is unchanged — still `error.type="parser_failure"`, `recoverable=False` → job `failed` — just reached in ~4 iterations instead of 24k. New tests in `tests/test_graph_helpers.py::TestCheckNoToolCallStreak`; the pre-existing tests still pass (the kwarg defaults `False`, so existing positional callers are unaffected).
 
 ### Other follow-ups (deliberately deferred)
 
