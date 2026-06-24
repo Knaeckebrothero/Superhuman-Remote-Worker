@@ -145,6 +145,7 @@ from routers import automations_router  # noqa: E402
 from routers import project_loops_router  # noqa: E402
 from routers.sessions import router as sessions_router  # noqa: E402
 from services.cron_dispatcher import cron_dispatcher_loop  # noqa: E402
+from services.project_loop_sweeper import project_loop_sweeper_loop  # noqa: E402
 from services.litellm_gateway import (  # noqa: E402
     LiteLLMClient,
     _parse_quota_policy,
@@ -5223,6 +5224,13 @@ async def lifespan(app: FastAPI):
             postgres_db, _shutdown_event, on_job_created=_trigger_dispatch
         )
     )
+    # Safety-net for project self-improvement loops: recover any loop whose
+    # current job went terminal without the completion hook advancing it.
+    project_loop_sweeper_task = asyncio.create_task(
+        project_loop_sweeper_loop(
+            postgres_db, _shutdown_event, advance_fn=_advance_project_loop
+        )
+    )
 
     # LiteLLM gateway catalog sync — registers endpoint-kind catalog models into
     # the in-chart LiteLLM proxy so agent LLM traffic can be measured (and, in
@@ -5338,6 +5346,7 @@ async def lifespan(app: FastAPI):
     await lifecycle_reconciler_task
     await main_cloud_listen_task
     await automation_cron_task
+    await project_loop_sweeper_task
     await litellm_sync_task
     await quota_poll_task
     await workspace_metering_task
@@ -9392,7 +9401,15 @@ async def _advance_project_loop(
     if not loop or loop.get("status") != "running":
         return  # paused / stopped / terminal — leave the current job, don't advance
     if str(job["id"]) != str(loop.get("current_job_id") or ""):
-        return  # idempotency: only the in-flight job advances the loop
+        return  # cheap pre-check: only the in-flight job advances the loop
+
+    # Atomic claim: nulls current_job_id iff it still equals this job on a
+    # running loop. Guarantees exactly one advance even if the completion hook
+    # and the safety-net sweeper fire concurrently for the same terminal job
+    # (the loser gets False here and backs off). Uses the pre-claim `loop`
+    # snapshot below for seq_index / remaining — the claim only nulls the job.
+    if not await postgres_db.claim_project_loop_advance(str(loop_id), str(job["id"])):
+        return  # another caller already claimed this advance
 
     failed = bool(result.get("error")) or job.get("status") == "failed"
     consecutive = (int(loop.get("consecutive_failures") or 0) + 1) if failed else 0
