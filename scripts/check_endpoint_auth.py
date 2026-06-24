@@ -50,6 +50,9 @@ GATE_NAMES = {
     "require_sudo_request_authority",
     "user_can_access_any_job",
     "user_can_access_job",
+    # job-first then thread-owner resolver — gates session citations whose
+    # ``job_id`` is actually a thread id with no ``jobs`` row (citation panel).
+    "user_can_access_job_or_thread",
     "user_can_access_datasource",
     "user_can_access_ide_entity",
 }
@@ -151,6 +154,7 @@ def _classify(
         "require_sudo_request_authority": 0,
         "user_can_access_any_job": 1,
         "user_can_access_job": 1,
+        "user_can_access_job_or_thread": 1,
         "user_can_access_datasource": 1,
         "user_can_access_ide_entity": 1,
         "_require_admin": 2,
