@@ -12,6 +12,8 @@ from src.core.loader import (
     _create_openai_llm,
     _create_openrouter_llm,
     _create_codex_llm,
+    detect_reasoning_method,
+    reasoning_capability,
     supports_parallel_tool_calls,
 )
 
@@ -197,8 +199,10 @@ class TestReasoningSummaryRouting:
         assert call_kwargs["model_kwargs"]["reasoning_effort"] == "medium"
 
     @patch("src.core.loader.ReasoningChatOpenAI")
-    def test_proxy_model_gets_model_kwargs(self, mock_chat):
-        """openai/ proxy model should use model_kwargs.reasoning_effort (Chat Completions)."""
+    def test_gpt_oss_is_prompt_delivered_not_api(self, mock_chat):
+        """gpt-oss reasoning rides the system-prompt `Reasoning:` line
+        (detect_reasoning_method=='prompt'), so the OpenAI factory must NOT also
+        inject an API reasoning_effort — that was the double-injection bug."""
         mock_chat.return_value = MagicMock()
         config = _make_config(model="openai/gpt-oss-120b", reasoning_level="high")
 
@@ -206,7 +210,7 @@ class TestReasoningSummaryRouting:
 
         call_kwargs = mock_chat.call_args[1]
         assert "reasoning" not in call_kwargs
-        assert call_kwargs["model_kwargs"]["reasoning_effort"] == "high"
+        assert "reasoning_effort" not in call_kwargs.get("model_kwargs", {})
 
     @patch("src.core.loader.ReasoningChatOpenAI")
     def test_no_reasoning_when_none(self, mock_chat):
@@ -360,9 +364,10 @@ class TestOpenAIReasoningClamping:
 
     @patch("src.core.loader.ReasoningChatOpenAI")
     def test_xhigh_clamped_to_high(self, mock_chat):
-        """xhigh should be clamped to high for OpenAI Chat Completions."""
+        """xhigh should be clamped to high for a native-effort OpenAI model.
+        (gpt-oss is prompt-delivered, so an effort_enum/native family is used.)"""
         mock_chat.return_value = MagicMock()
-        config = _make_config(model="openai/gpt-oss-120b", reasoning_level="xhigh")
+        config = _make_config(model="gpt-5.2-pro", reasoning_level="xhigh")
 
         _create_openai_llm(config, limits=None)
 
@@ -407,7 +412,7 @@ class TestOpenRouterReasoningFormat:
         """OpenRouter should pass minimal through without clamping."""
         mock_chat.return_value = MagicMock()
         config = _make_config(
-            model="openrouter/minimax/minimax-m2.7", reasoning_level="minimal"
+            model="openrouter/z-ai/glm-5.2", reasoning_level="minimal"
         )
 
         _create_openrouter_llm(config, limits=None)
@@ -566,3 +571,111 @@ class TestSupportsParallelToolCalls:
 
     def test_none_inputs_default_to_supported(self):
         assert supports_parallel_tool_calls(None, None) is True
+
+
+class TestFamilyCenteredReasoning:
+    """Family-driven reasoning capability + delivery
+    (docs/features/family_centered_reasoning.md)."""
+
+    def test_capability_method_per_family(self):
+        assert reasoning_capability("gemma-4-moe")["method"] == "binary_toggle"
+        assert reasoning_capability("gpt-5.2-pro")["method"] == "effort_enum"
+        assert reasoning_capability("openai/gpt-oss-120b")["delivery"] == "prompt"
+        assert reasoning_capability("minimax-m2.7")["method"] == "none"
+        assert reasoning_capability("claude-opus-4-8")["method"] == "none"
+        # Unknown family falls through to the `default` block (effort_enum).
+        assert reasoning_capability("some-unknown-model")["method"] == "effort_enum"
+
+    def test_detect_reasoning_method_from_capability(self):
+        assert detect_reasoning_method("gpt-5.2-pro") == "api"
+        assert detect_reasoning_method("openai/gpt-oss-120b") == "prompt"
+        assert detect_reasoning_method("gemma-4-moe") == "none"
+        assert detect_reasoning_method("claude-opus-4-8") == "none"
+        # Explicit override still wins.
+        assert detect_reasoning_method("gemma-4-moe", explicit_method="api") == "api"
+
+    @patch("src.core.loader.ReasoningChatOpenAI")
+    def test_gemma_enables_thinking_no_effort(self, mock_chat):
+        """gemma (binary_toggle) → chat_template_kwargs.enable_thinking=True, and
+        NO inert reasoning_effort (the bug this feature fixes)."""
+        mock_chat.return_value = MagicMock()
+        config = _make_config(
+            model="gemma-4-moe",
+            base_url="http://vllm.cluster:8080/v1",
+            reasoning_level="high",
+        )
+
+        _create_openai_llm(config, limits=None)
+
+        call_kwargs = mock_chat.call_args[1]
+        assert call_kwargs["extra_body"]["chat_template_kwargs"] == {
+            "enable_thinking": True
+        }
+        assert "reasoning_effort" not in call_kwargs.get("model_kwargs", {})
+
+    @patch("src.core.loader.ReasoningChatOpenAI")
+    def test_gemma_thinking_off_when_level_none(self, mock_chat):
+        """reasoning_level='none' on gemma → enable_thinking=False."""
+        mock_chat.return_value = MagicMock()
+        config = _make_config(
+            model="gemma-4-moe",
+            base_url="http://vllm.cluster:8080/v1",
+            reasoning_level="none",
+        )
+
+        _create_openai_llm(config, limits=None)
+
+        call_kwargs = mock_chat.call_args[1]
+        assert call_kwargs["extra_body"]["chat_template_kwargs"] == {
+            "enable_thinking": False
+        }
+
+    @patch("src.core.loader.ReasoningChatOpenAI")
+    def test_gemma_thinking_on_when_level_unset(self, mock_chat):
+        """Unset level on gemma falls back to the family default (ON), so SRW
+        gets reasoning regardless of the upstream endpoint default."""
+        mock_chat.return_value = MagicMock()
+        config = _make_config(
+            model="gemma-4-moe",
+            base_url="http://vllm.cluster:8080/v1",
+            reasoning_level=None,
+        )
+
+        _create_openai_llm(config, limits=None)
+
+        call_kwargs = mock_chat.call_args[1]
+        assert call_kwargs["extra_body"]["chat_template_kwargs"] == {
+            "enable_thinking": True
+        }
+
+    @patch("src.core.loader.ReasoningChatOpenAI")
+    def test_minimax_injects_nothing(self, mock_chat):
+        """minimax (method=none) → neither reasoning_effort nor a toggle (was an
+        inert reasoning_effort before)."""
+        mock_chat.return_value = MagicMock()
+        config = _make_config(
+            model="minimax-m2.7",
+            base_url="http://vllm.cluster:8080/v1",
+            reasoning_level="high",
+        )
+
+        _create_openai_llm(config, limits=None)
+
+        call_kwargs = mock_chat.call_args[1]
+        assert "reasoning_effort" not in call_kwargs.get("model_kwargs", {})
+        assert "chat_template_kwargs" not in call_kwargs.get("extra_body", {})
+
+    @patch("src.core.loader.ReasoningChatOpenAI")
+    def test_openrouter_effort_keeps_xhigh_unclamped(self, mock_chat):
+        """An OpenRouter-served effort family keeps xhigh (no OpenAI clamp)."""
+        mock_chat.return_value = MagicMock()
+        config = _make_config(
+            model="openrouter/z-ai/glm-5.2",
+            reasoning_level="xhigh",
+            api_key="sk-or-test",
+        )
+
+        _create_openrouter_llm(config, limits=None)
+
+        call_kwargs = mock_chat.call_args[1]
+        assert call_kwargs["extra_body"]["reasoning"] == {"effort": "xhigh"}

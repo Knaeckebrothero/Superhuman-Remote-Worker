@@ -29,6 +29,9 @@
 # 131k summarizer — docs/features/context_summarization_rework.md.
 
 default:
+  # Reasoning control per family (see docs/features/family_centered_reasoning.md).
+  # method: effort_enum | binary_toggle | token_budget | always_on | none
+  reasoning: { method: effort_enum, delivery: native, default: high, options: [low, medium, high] }
   prompts:
     systemprompt: systemprompt.txt
     systemprompt_interactive: systemprompt_interactive.txt
@@ -60,6 +63,10 @@ default:
     image_tokens: { mode: flat, flat: 1600 }
 
 minimax:
+  # M2.7 reasoning is not a level we drive (no effort param); rely on endpoint
+  # default. NOTE: may actually be a thinking toggle (vLLM minimax_m2_append_think
+  # parser) — verify before promoting to binary_toggle.
+  reasoning: { method: none }
   prompts:
     systemprompt: systemprompt_minimax.txt
     persona: persona_minimax.txt
@@ -84,6 +91,9 @@ minimax:
 # API (LangChain ChatOpenAI), so tool calls use standard parens-form
 # serialization and `default.yaml` guardrails apply.
 minimax-m3:
+  # M3 has an optional thinking toggle; rely on endpoint default for now.
+  # Candidate for binary_toggle in a later pass (verify the vLLM kwarg first).
+  reasoning: { method: none }
   prompts:
     systemprompt: systemprompt_minimax_m3.txt
     persona: persona_minimax_m3.txt
@@ -108,6 +118,7 @@ minimax-m3:
     image_tokens: { mode: flat, flat: 1600 }  # no public per-image formula — calibrate via usage
 
 o-series:
+  reasoning: { method: effort_enum, delivery: native, default: high, options: [low, medium, high] }
   settings:
     temperature: 1.0
     multimodal: true  # o3/o4-mini support image inputs
@@ -142,6 +153,8 @@ o-series:
 # would add maintenance with no benefit. Fork the phase prompts only if real V4 runs
 # show a need.
 deepseek:
+  # Served via OpenRouter → unified effort param (superset incl. xhigh→max upstream).
+  reasoning: { method: effort_enum, delivery: native, default: high, options: [none, minimal, low, medium, high, xhigh] }
   prompts:
     # Worker-path scaffold + identity
     systemprompt: systemprompt_deepseek.txt
@@ -182,6 +195,8 @@ deepseek:
 # (memory_*, curation) are NOT forked: GLM is a chat/worker model, not the
 # auxiliary model.
 glm:
+  # Served via OpenRouter → unified effort param (superset incl. xhigh→max upstream).
+  reasoning: { method: effort_enum, delivery: native, default: high, options: [none, minimal, low, medium, high, xhigh] }
   prompts:
     systemprompt: systemprompt_glm.txt
     systemprompt_interactive: systemprompt_interactive_glm.txt
@@ -196,6 +211,9 @@ glm:
     model_max_context_tokens: 1000000  # usable 1M-token window
 
 gemini:
+  # Phase 2 → token_budget (thinkingConfig.thinkingBudget; 2.5 Pro is always_on).
+  # v1: no control wired; output capture via include_thoughts stays in the factory.
+  reasoning: { method: none }
   settings:
     top_p: 0.95
     top_k: 40
@@ -208,6 +226,8 @@ gemini:
     image_tokens: { mode: flat, flat: 2304 }
 
 claude-opus:
+  # Phase 2 → token_budget (thinking.budget_tokens; min 1024; no temp/top_p/top_k).
+  reasoning: { method: none }
   settings:
     temperature: 1.0  # Anthropic: just use temperature, leave top_p/top_k at defaults
     multimodal: true  # Claude Opus 4.6 supports vision
@@ -221,6 +241,7 @@ claude-opus:
 # main model never counted images and compacted at the 128k default window.
 # Vision = 28px patches at the legacy cap (1568px edge / 1568 tok).
 claude-sonnet:
+  reasoning: { method: none }   # Phase 2 → token_budget
   settings:
     temperature: 1.0
     multimodal: true
@@ -234,6 +255,7 @@ claude-sonnet:
     pdf_render_dpi: 130
 
 claude-haiku:
+  reasoning: { method: none }   # Phase 2 → token_budget
   settings:
     temperature: 1.0
     multimodal: true
@@ -243,6 +265,8 @@ claude-haiku:
     pdf_render_dpi: 130  # legacy 1568px cap — see claude-sonnet note
 
 gpt-5:
+  # minimal (GPT-5 family) is the deferred correctness pass — clamped to low today.
+  reasoning: { method: effort_enum, delivery: native, default: high, options: [low, medium, high] }
   prompts:
     systemprompt: systemprompt_gpt_5.txt
     systemprompt_interactive: systemprompt_interactive_gpt_5.txt
@@ -272,6 +296,7 @@ gpt-5:
     image_tokens: { mode: openai_patches, patch_px: 32, budget: 10000, flat: 3000 }
 
 codex:
+  reasoning: { method: effort_enum, delivery: native, default: high, options: [low, medium, high] }
   prompts:
     systemprompt: systemprompt_gpt_5.txt
     systemprompt_interactive: systemprompt_interactive_gpt_5.txt
@@ -295,6 +320,7 @@ codex:
     image_tokens: { mode: openai_patches, patch_px: 32, budget: 10000, flat: 3000 }
 
 codex-spark:
+  reasoning: { method: effort_enum, delivery: native, default: high, options: [low, medium, high] }
   prompts:
     systemprompt: systemprompt_codex_spark.txt
     systemprompt_interactive: systemprompt_interactive_gpt_5.txt
@@ -312,6 +338,8 @@ codex-spark:
     model_max_context_tokens: 128000  # gpt-5.3-codex-spark: 128K context (distilled)
 
 gpt-oss:
+  # Effort delivered via the `Reasoning: {level}` system-prompt line (harmony), not an API param.
+  reasoning: { method: effort_enum, delivery: prompt, default: medium, options: [low, medium, high] }
   prompts:
     systemprompt: systemprompt_gpt_oss.txt
     persona: persona_gpt_oss.txt
@@ -354,6 +382,17 @@ gpt-oss:
 #    `repetition_penalty` / `frequency_penalty` below are the runtime-side
 #    mitigation.
 gemma:
+  reasoning:
+    # Gemma 4 is a hybrid thinking model — binary on/off via the vLLM chat
+    # template (`enable_thinking`), NOT an effort level. Default ON so SRW gets
+    # reasoning regardless of the upstream endpoint default (which other tenants
+    # can flip off). Verified live on k3d 2026-06-22. The previous behaviour sent
+    # an inert `reasoning_effort` the gemma4 parser ignores.
+    method: binary_toggle
+    default: "on"
+    options: ["on", "off"]
+    toggle_param: chat_template_kwargs.enable_thinking
+    toggle_map: { "on": true, "off": false }
   prompts:
     # Worker-path variants
     systemprompt: systemprompt_gemma.txt
@@ -408,6 +447,7 @@ gemma:
 # claude-sonnet row documents. Codestral is text-only but shares the block; its
 # catalog row omits the `vision` capability, so it never receives images.
 mistral:
+  reasoning: { method: none }   # Mistral has no reasoning-level control we drive
   settings:
     temperature: 0.0   # agentic/tool-use default (matches `default`/deepseek); raise toward ~0.3 for freeform chat
     multimodal: true   # Large 3 / Medium 3.5 / Small 4 take image input

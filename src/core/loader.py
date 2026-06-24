@@ -321,7 +321,13 @@ def _load_model_config_matrix_file(path: Path) -> Dict[str, Dict[str, Any]]:
                 continue
             normalized: Dict[str, Any] = {}
             for section, payload in family_block.items():
-                if section in ("prompts", "instructions", "settings", "guardrails"):
+                if section in (
+                    "prompts",
+                    "instructions",
+                    "settings",
+                    "guardrails",
+                    "reasoning",
+                ):
                     if isinstance(payload, dict):
                         normalized[section] = payload
                     else:
@@ -2476,11 +2482,16 @@ def load_uploaded_config(uploaded_config_path: Path) -> Dict[str, Any]:
 
 
 def detect_reasoning_method(model: str, explicit_method: Optional[str] = None) -> str:
-    """Determine how reasoning level is delivered to the model.
+    """Determine how the reasoning *level* is delivered to the model.
 
     - "prompt": Inject `Reasoning: {level}` in system prompt (gpt-oss via vLLM)
-    - "api": Pass as API parameter (OpenAI, OpenRouter native models)
-    - "none": Model doesn't support reasoning level control (Anthropic, Google, Groq)
+    - "api": Pass as an API parameter (effort enum / token budget)
+    - "none": No reasoning-level control we drive here (binary toggle, always-on,
+      or unsupported) — the factory handles toggles directly.
+
+    Derived from the family's ``reasoning`` block in model_config_matrix.yaml
+    (single source of truth — see docs/features/family_centered_reasoning.md).
+    ``explicit_method`` still wins for callers that pin it.
 
     Args:
         model: Model name for family detection
@@ -2492,22 +2503,14 @@ def detect_reasoning_method(model: str, explicit_method: Optional[str] = None) -
     if explicit_method:
         return explicit_method
 
-    family = family_of(model)
-
-    if family == "gpt-oss":
-        return "prompt"
-    if family in (
-        "claude-opus",
-        "claude-sonnet",
-        "claude-haiku",
-        "gemini",
-        "minimax",
-        "minimax-m3",
-        "gemma",
-    ):
-        return "none"
-    # gpt-5, gpt-4o, o-series, deepseek, glm, mistral, qwen, llama, default
-    return "api"
+    cap = reasoning_capability(model)
+    method = cap.get("method", "none")
+    if method == "effort_enum":
+        return "prompt" if cap.get("delivery") == "prompt" else "api"
+    if method == "token_budget":
+        return "api"
+    # binary_toggle, always_on, none → no prompt/effort-param delivery
+    return "none"
 
 
 def _should_use_reasoning_summary(model: str) -> bool:
@@ -2543,6 +2546,90 @@ def _clamp_reasoning_level(level: str, supported: set[str]) -> str:
         return "high"  # safe fallback
     logger.debug(f"Clamped reasoning level '{level}' -> '{clamped}' for provider")
     return clamped
+
+
+def _set_nested(d: dict, dotted: str, value: Any) -> None:
+    """Set ``d['a']['b'] = value`` for ``dotted='a.b'``, creating intermediate
+    dicts as needed (used to place e.g. chat_template_kwargs.enable_thinking
+    into a request's extra_body)."""
+    parts = dotted.split(".")
+    node = d
+    for part in parts[:-1]:
+        nxt = node.get(part)
+        if not isinstance(nxt, dict):
+            nxt = {}
+            node[part] = nxt
+        node = nxt
+    node[parts[-1]] = value
+
+
+def reasoning_capability(model: str) -> Dict[str, Any]:
+    """Return the ``reasoning`` capability block for a model's family.
+
+    Single source of truth for how a family's reasoning is controlled
+    (``method`` / ``default`` / ``options`` / wire), read from
+    ``config/model_config_matrix.yaml`` (cached). Falls through
+    family → ``default`` → ``{"method": "none"}``.
+
+    ``method`` is one of: ``effort_enum`` (effort levels — ``delivery`` =
+    ``native`` API param or ``prompt`` system-prefix), ``binary_toggle``
+    (on/off via ``toggle_param``), ``token_budget`` (Phase 2),
+    ``always_on`` (cannot disable), or ``none``.
+
+    Deployment-overlay reasoning overrides are not applied yet (v1).
+    See docs/features/family_centered_reasoning.md.
+    """
+    base_path = get_project_root() / "config" / "model_config_matrix.yaml"
+    matrix = _load_model_config_matrix_file(base_path)
+    fam = family_of(model)
+    block = (matrix.get(fam) or {}).get("reasoning")
+    if not isinstance(block, dict):
+        block = (matrix.get("default") or {}).get("reasoning")
+    return block if isinstance(block, dict) else {"method": "none"}
+
+
+def resolve_reasoning_plan(config: "LLMConfig") -> Dict[str, Any]:
+    """Resolve the effective reasoning delivery for a dispatch.
+
+    Combines the family ``reasoning`` capability with the requested
+    ``config.reasoning_level`` and returns
+    ``{"method", "value", "delivery", "cap"}``. ``value`` is the effort string
+    (effort_enum), ``"on"``/``"off"`` (binary_toggle), or ``None`` (no
+    injection). Factories translate this onto their own transport; effort
+    values are still transport-clamped by the factory.
+    """
+    cap = reasoning_capability(config.model)
+    method = cap.get("method", "none")
+    requested = config.reasoning_level
+    req_l = str(requested).lower() if requested is not None else None
+
+    if method == "binary_toggle":
+        if req_l in ("none", "off", "false"):
+            value = "off"
+        elif req_l in ("on", "true"):
+            value = "on"
+        elif req_l is None:
+            value = cap.get("default", "on")
+        else:
+            # An effort-style level (high/medium/low) on a toggle model = ON.
+            value = "on"
+        return {"method": method, "value": value, "delivery": "toggle", "cap": cap}
+
+    if method == "effort_enum":
+        # Inject only when a level is explicitly requested. The family default
+        # is applied by the upstream resolution layer, not re-applied here, so an
+        # unset level stays unset — this preserves the prior factory gate and
+        # keeps non-reasoning fallthrough models from getting an unwanted effort.
+        value = None if (req_l is None or req_l == "none") else requested
+        return {
+            "method": method,
+            "value": value,
+            "delivery": cap.get("delivery", "native"),
+            "cap": cap,
+        }
+
+    # token_budget (Phase 2), always_on, none → nothing to inject in v1.
+    return {"method": method, "value": None, "delivery": None, "cap": cap}
 
 
 def supports_parallel_tool_calls(provider: Optional[str], model: Optional[str]) -> bool:
@@ -2735,12 +2822,28 @@ def _create_openai_llm(
     if config.top_p is not None:
         llm_kwargs["top_p"] = config.top_p
 
-    # Reasoning via Chat Completions API (reasoning_effort in model_kwargs).
+    # Reasoning delivery is driven by the family's `reasoning` capability
+    # (model_config_matrix.yaml): effort_enum→reasoning_effort, binary_toggle→
+    # chat_template_kwargs (e.g. gemma's enable_thinking). Effort delivered by
+    # system prompt (gpt-oss), token_budget, always_on and none inject nothing
+    # here. See docs/features/family_centered_reasoning.md.
     reasoning_mode = "none"
-    if config.reasoning_level and config.reasoning_level != "none":
-        level = _clamp_reasoning_level(config.reasoning_level, _OPENAI_REASONING_LEVELS)
+    _rplan = resolve_reasoning_plan(config)
+    if (
+        _rplan["method"] == "effort_enum"
+        and _rplan.get("delivery") == "native"
+        and _rplan.get("value")
+    ):
+        level = _clamp_reasoning_level(_rplan["value"], _OPENAI_REASONING_LEVELS)
         model_kwargs["reasoning_effort"] = level
         reasoning_mode = f"chat_completions(effort={level})"
+    elif _rplan["method"] == "binary_toggle" and _rplan.get("value"):
+        _cap = _rplan["cap"]
+        _param = _cap.get("toggle_param", "chat_template_kwargs.enable_thinking")
+        _tmap = _cap.get("toggle_map") or {"on": True, "off": False}
+        _tval = _tmap.get(_rplan["value"], _rplan["value"] == "on")
+        _set_nested(extra_body, _param, _tval)
+        reasoning_mode = f"chat_template({_param}={_tval})"
 
     # Add timeout if specified
     if config.timeout is not None:
@@ -3069,8 +3172,10 @@ def _create_openrouter_llm(
     # keyword argument 'reasoning'). extra_body merges into the JSON body
     # without going through the typed signature.
     extra_body = {}
-    if config.reasoning_level and config.reasoning_level != "none":
-        extra_body["reasoning"] = {"effort": config.reasoning_level}
+    _rplan = resolve_reasoning_plan(config)
+    if _rplan["method"] == "effort_enum" and _rplan.get("value"):
+        # OpenRouter supports the full effort set (incl. xhigh) — no clamp.
+        extra_body["reasoning"] = {"effort": _rplan["value"]}
 
     # top_k is likewise non-standard for the typed Chat Completions signature.
     if config.top_k is not None:
@@ -3299,10 +3404,12 @@ def _create_codex_llm(
     if config.top_p is not None:
         llm_kwargs["top_p"] = config.top_p
 
-    # Reasoning via Responses API (required by Codex proxy).
+    # Reasoning via Responses API (required by Codex proxy). Codex models are
+    # effort_enum; driven through the family capability for consistency.
     reasoning_mode = "none"
-    if config.reasoning_level and config.reasoning_level != "none":
-        level = _clamp_reasoning_level(config.reasoning_level, _OPENAI_REASONING_LEVELS)
+    _rplan = resolve_reasoning_plan(config)
+    if _rplan["method"] == "effort_enum" and _rplan.get("value"):
+        level = _clamp_reasoning_level(_rplan["value"], _OPENAI_REASONING_LEVELS)
         if _should_use_reasoning_summary(model):
             llm_kwargs["reasoning"] = {
                 "effort": level,
