@@ -32,7 +32,7 @@ The original draft said "no implementation yet." That is no longer true, and the
 
 | Work item | Original status | **Current status (2026-06-24)** | Evidence |
 |---|---|---|---|
-| **Track 1** active-passive hardening (probes / `preStop` / grace / PDB) | not started | **NOT STARTED** | No `preStop`, no `terminationGracePeriodSeconds`, no orchestrator PDB anywhere in `helm/`. Probes present but untuned. |
+| **Track 1** active-passive hardening (probes / `preStop` / grace / PDB) | not started | **SHIPPED (chart); chaos test operator-pending** | `preStop` drain + `terminationGracePeriodSeconds` + `startupProbe` + tuned probes + orchestrator PDB landed in `helm/` (M0). Behavioral chaos test is operator-run on dev — see `docs/operations/orchestrator_failover.md`. |
 | **Layer 1** leader election for singleton loops | not started | **GREENFIELD — the one true unlock** | No `with_leader_lock`, no session-scoped advisory lock, no `leader_election.py`. All existing advisory locks are *xact*-scoped. |
 | **Layer 2** DB-level dispatch (`SKIP LOCKED`) | not started | **PATTERN PROVEN, dispatcher not ported** | `cron_dispatcher` is a complete, documented multi-replica-safe `SKIP LOCKED` queue. Job dispatch still uses the in-process `_dispatch_lock`. `thread_advisory_lock` already covers per-thread serialization. |
 | **Layer 3** cross-replica fan-out (`LISTEN/NOTIFY`) | not started | **TRANSPORT SHIPPED + WS problem evaporated** | `notify_channel()` helper + a reconnecting `LISTEN` loop ship for cloud-config reload. The WS half is moot: `persistent_ws_proxy` is gone (direct-to-agent-pod), stream is `thread_events` SSE. Remaining: DB-back the 2 SSE channels + drop `_pending_msgs`. |
@@ -342,12 +342,12 @@ Still nothing exotic: Postgres + NATS only. No Redis, etcd, Zookeeper, Temporal.
 
 Each phase independently shippable, ordered so each improves posture even if the next never lands.
 
-### Phase 0 — Track 1: Active-passive failover hardening — NOT STARTED
-- [ ] Tighten readiness probe + add `preStop` hook + `terminationGracePeriodSeconds` in `helm/templates/orchestrator/deployment.yaml`.
-- [ ] Add `helm/templates/orchestrator/pdb.yaml` (mirror `agent/pdb.yaml`). Document expected failover latency.
-- [ ] Move module-level singletons behind `lifespan` startup for clean SIGTERM.
-- [ ] Chaos test: delete the pod under load; measure user-visible downtime.
-- [ ] Document failover behavior in `docs/operations/orchestrator_failover.md`.
+### Phase 0 — Track 1: Active-passive failover hardening — SHIPPED (chart); chaos test operator-pending
+- [x] Tighten readiness probe + add `preStop` hook + `terminationGracePeriodSeconds` + `startupProbe` in `helm/templates/orchestrator/deployment.yaml`. (2026-06-24)
+- [x] Add `helm/templates/orchestrator/pdb.yaml` (mirror `agent/pdb.yaml`), `minAvailable: 0`. (2026-06-24)
+- [ ] Move module-level singletons behind `lifespan` startup for clean SIGTERM. **Deferred** — cosmetic; tracked as a follow-up.
+- [ ] Chaos test: delete the pod under load; measure user-visible downtime. **Operator-run on dev** — runbook ready.
+- [x] Document failover behavior in `docs/operations/orchestrator_failover.md`. (2026-06-24)
 
 ### Phase 1 — Track 2 Layer 1: Leader election — GREENFIELD
 - [ ] `orchestrator/services/leader_election.py` with `with_leader_lock(name, loop_id, run, shutdown_event)` using **session-scoped** `pg_try_advisory_lock`.
