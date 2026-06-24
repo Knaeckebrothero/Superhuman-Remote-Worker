@@ -121,6 +121,12 @@ orchestrator:
   # -- Must exceed preStopDrainSeconds + lifespan shutdown (background loops,
   # NATS drain, DB pool close).
   terminationGracePeriodSeconds: 60
+  # -- Pod Disruption Budget. At replicas:1, minAvailable MUST be 0 — 1 would
+  # block all voluntary evictions (kubectl drain), the 2026-05-16 incident mode.
+  # Flip minAvailable to 1 when replicas>=2 (M1).
+  pdb:
+    enabled: true
+    minAvailable: 0
 
 # =============================================================================
 # Agent

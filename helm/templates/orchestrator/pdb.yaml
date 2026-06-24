@@ -1,0 +1,13 @@
+{{- if .Values.orchestrator.pdb.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "srw.fullname" . }}-orchestrator-pdb
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "orchestrator") | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.orchestrator.pdb.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "srw.componentSelectorLabels" (dict "context" . "component" "orchestrator") | nindent 6 }}
+{{- end }}
