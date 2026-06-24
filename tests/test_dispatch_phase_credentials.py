@@ -476,7 +476,7 @@ class TestContextWindowInjection:
 # endpoint model whose meta.provider == "codex" must hit the endpoint directly
 # even when the gateway is enabled, while non-codex endpoint models still route
 # through the gateway.
-# See docs/issues/litellm_gateway_drops_gpt_codex_reasoning_capture.md
+# See docs/done/litellm_gateway_drops_gpt_codex_reasoning_capture.md
 # ---------------------------------------------------------------------------
 
 GATEWAY = ("http://srw-litellm:4000/v1", "sk-fleet")

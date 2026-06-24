@@ -1415,6 +1415,13 @@ async def _attach_session(
         cloud_mount_cfg=cloud_mount_cfg,
     )
 
+    # Live citation-verdict push: let the engine's background verifier broadcast
+    # pending→verified/failed so the cockpit citations panel updates in place
+    # rather than only at the next per-turn refresh. Set before the first turn
+    # (so it's wired before the lazily-built CitationEngine is first used).
+    if _session is not None and _session.tool_context is not None:
+        _session.tool_context.citation_verdict_callback = _emit_citation_verdict
+
     # Phase 2 event-log cursor init. The current epoch lives on the threads
     # row; we bump it iff the previous epoch has events (i.e. this is a
     # cold-checkpoint restart that lost the in-memory seq counter). A fresh
@@ -2519,6 +2526,32 @@ def _broadcast(method: str, params: Dict[str, Any]) -> None:
             _persist_event(epoch, seq, method, params),
             name=f"persist-event-{seq}",
         )
+
+
+def _emit_citation_verdict(citation_id: int, verification_status: str) -> None:
+    """Broadcast a citation verification verdict to the live session.
+
+    Wired onto the session's ``ToolContext`` (``citation_verdict_callback``) so
+    the CitationEngine's background verifier can push a ``pending`` →
+    ``verified``/``failed`` transition the moment it lands, instead of the
+    cockpit waiting for the next per-turn ``/citations`` refresh. The cockpit
+    patches the one citation in place (see ``citation.verdict`` in
+    persistent-chat.service). Worker jobs never set this, so the engine no-ops.
+
+    Goes through ``_broadcast`` (WS subscribers + ``thread_events`` SSE replay).
+    Not in ``_NOTIFICATION_METHODS`` — it's an in-session UI update, not a
+    cross-session notification. Fire-and-forget; never raises into the verifier.
+    """
+    try:
+        _broadcast(
+            "citation.verdict",
+            {
+                "citation_id": int(citation_id),
+                "verification_status": str(verification_status),
+            },
+        )
+    except Exception as e:
+        logger.debug("citation.verdict broadcast failed (non-fatal): %s", e)
 
 
 async def _persist_event(

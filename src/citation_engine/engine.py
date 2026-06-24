@@ -32,7 +32,7 @@ import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .models import (
     Annotation,
@@ -85,6 +85,7 @@ class CitationEngine:
         context: CitationContext | None = None,
         verify_aux: Any | None = None,
         verify_prompt: str | None = None,
+        on_verdict: Callable[[int, str], None] | None = None,
     ):
         """
         Initialize the Citation Engine.
@@ -102,6 +103,12 @@ class CitationEngine:
                 unverified (verification disabled / unavailable).
             verify_prompt: The matrix-resolved citation-verification system
                 prompt handed to ``VerifyCitationTask``.
+            on_verdict: Optional ``(citation_id, status)`` callback fired once a
+                background verification writes a real verdict (``status`` is
+                ``"verified"`` / ``"failed"``). Persistent sessions wire this to
+                a WS/SSE broadcast so the cockpit citations panel updates in
+                place; worker jobs leave it ``None`` (no live listener). Never
+                fired on an aux outage (the row stays ``pending``).
         """
         log.debug("Initializing CitationEngine (SRW-native async)...")
 
@@ -130,6 +137,10 @@ class CitationEngine:
         # holds no LLM client; cite_* schedules a background VerifyCitationTask.
         self._verify_aux = verify_aux
         self._verify_prompt = verify_prompt or ""
+        #: Optional live verdict listener (persistent sessions only). See the
+        #: ``on_verdict`` arg; fired from ``_run_verification`` after a real
+        #: verdict lands.
+        self._on_verdict = on_verdict
         #: In-flight verification tasks — kept referenced so the event loop
         #: doesn't GC them mid-flight; discarded on completion.
         self._verify_tasks: set[asyncio.Task] = set()
@@ -835,9 +846,19 @@ class CitationEngine:
         """Run one citation's verification via the auxiliary-LLM service."""
         from src.services.auxiliary import verify_and_store_citation
 
-        await verify_and_store_citation(
+        verdict = await verify_and_store_citation(
             self._verify_aux, self, citation_id, self._verify_prompt
         )
+        # Push the verdict to any live listener (persistent sessions wire this
+        # to a WS/SSE broadcast; worker jobs leave it unset). Only fires on a
+        # real verdict — an aux outage returns None and leaves the row
+        # 'pending', so we don't signal a non-existent state change.
+        if verdict is not None and self._on_verdict is not None:
+            status = "verified" if verdict.verified else "failed"
+            try:
+                self._on_verdict(citation_id, status)
+            except Exception as e:
+                log.debug("on_verdict callback failed (non-fatal): %s", e)
 
     async def await_pending_verifications(self, timeout: float = 30.0) -> None:
         """Await any in-flight verification tasks (used by the boundary reconcile).

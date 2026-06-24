@@ -2475,4 +2475,49 @@ describe('PersistentChatService — usage.updated telemetry', () => {
             expect(await service.fetchCitationSnapshotBlob(9)).toBeNull();
         });
     });
+
+    // Live verdict push: the aux verifier broadcasts a citation.verdict frame
+    // when a citation flips pending→verified/failed; the handler patches it in
+    // place so the panel updates without a per-turn refetch. Driven through
+    // _handleEvent directly (no connect) so the per-turn loadCitations effect
+    // stays dormant and can't clobber the seeded map.
+    describe('citation.verdict live patch', () => {
+        it('patches a loaded citation in place', () => {
+            const {service} = createService();
+            service.citationsByCid.set(
+                new Map([[5, {id: 5, verification_status: 'pending'} as any]]),
+            );
+            (service as any)._handleEvent({
+                method: 'citation.verdict',
+                params: {citation_id: 5, verification_status: 'verified'},
+            });
+            expect(service.citationsByCid().get(5)?.verification_status).toBe(
+                'verified',
+            );
+        });
+
+        it('is a no-op when the citation is not loaded yet', () => {
+            const {service} = createService();
+            service.citationsByCid.set(new Map());
+            (service as any)._handleEvent({
+                method: 'citation.verdict',
+                params: {citation_id: 99, verification_status: 'failed'},
+            });
+            expect(service.citationsByCid().has(99)).toBe(false);
+        });
+
+        it('ignores a malformed citation_id', () => {
+            const {service} = createService();
+            service.citationsByCid.set(
+                new Map([[5, {id: 5, verification_status: 'pending'} as any]]),
+            );
+            (service as any)._handleEvent({
+                method: 'citation.verdict',
+                params: {citation_id: 'nope', verification_status: 'verified'},
+            });
+            expect(service.citationsByCid().get(5)?.verification_status).toBe(
+                'pending',
+            );
+        });
+    });
 });
