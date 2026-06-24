@@ -138,6 +138,7 @@ context_management:
 
 memory:
   enabled: true
+  required: false                  # Interactive sessions degrade-loud (Layer 1 audit) rather than pause; kept for parity with worker config
   budget_tokens: 10000
   max_memories_per_injection: 150
   observer_interval: 5

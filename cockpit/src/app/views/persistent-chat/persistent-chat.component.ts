@@ -1248,7 +1248,7 @@ export function clearDraft(threadId: string | null): void {
             </span>
             <!-- primary: context-window fill — the actionable metric, colour-ramped -->
             @if (usageCtxPct() != null) {
-              <span class="usage-ctx">
+              <span class="usage-ctx" [title]="'chat.usage.ctxHint' | transloco">
                 <span class="usage-ctx-label">{{ 'chat.usage.ctx' | transloco }}</span>
                 <span class="usage-gauge"><span class="usage-gauge-fill" [style.width.%]="usageCtxPct()"></span></span>
                 <span class="usage-ctx-pct">{{ usageCtxPct() }}%</span>
@@ -1558,15 +1558,24 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         return n >= 1000 ? `${(n / 1000).toFixed(1)}k` : `${n}`;
     }
 
-    /** Context fill % for the usage panel gauge (null until usage known). */
+    /** Context fill % for the usage panel gauge (null until usage known).
+     *  Anchored on the auto-compaction trigger (``compactionThresholdTokens``,
+     *  the effective working-context ceiling), not the raw model window — so
+     *  100% ≈ "a compaction is about to fire" rather than an arbitrary fraction
+     *  of a window the agent never lets fill. Falls back to the model window if
+     *  the agent hasn't reported the threshold yet (older backend). */
     readonly usageCtxPct = computed(() => {
         const u = this.chat.usage();
-        if (!u || u.inputTokens == null || !u.ctxLimitTokens) return null;
-        return Math.min(100, Math.round((100 * u.inputTokens) / u.ctxLimitTokens));
+        if (!u || u.inputTokens == null) return null;
+        const denom = u.compactionThresholdTokens || u.ctxLimitTokens;
+        if (!denom) return null;
+        return Math.min(100, Math.round((100 * u.inputTokens) / denom));
     });
 
     /** Context-fill threshold level driving the gauge colour ramp
-     *  (ok → warn → danger). A null pct reads as 'ok'. */
+     *  (ok → warn → danger). Because the pct is anchored on the compaction
+     *  trigger, ``danger`` (≥90%) literally means a compaction is imminent and
+     *  ``warn`` (≥75%) that it's approaching. A null pct reads as 'ok'. */
     readonly usageCtxLevel = computed<'ok' | 'warn' | 'danger'>(() => {
         const pct = this.usageCtxPct();
         if (pct == null) return 'ok';

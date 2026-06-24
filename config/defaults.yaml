@@ -217,6 +217,7 @@ research:
 # See docs/features/memory_light.md for architecture details.
 memory:
   enabled: true                    # Opt-in per config
+  required: false                  # When true, a memory-dependent job pauses for bounded re-dispatch instead of running blind if memory/KB fail to init (self-improvement loop sets this)
   budget_tokens: 10000             # Max tokens for memory injection per LLM call
   max_memories_per_injection: 150  # Cap on number of memories injected
   observer_interval: 5             # Run observer every N turns

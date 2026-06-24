@@ -1602,6 +1602,12 @@ class MemoryConfig:
     """
 
     enabled: bool = False
+    # When True, a job/session that needs memory but whose embedding-backed
+    # stores fail to initialize must NOT run blind: the worker agent pauses for
+    # bounded re-dispatch instead of silently degrading (see
+    # docs/issues/embedding_key_missing_silently_disables_memory_and_kb.md).
+    # Default False = degrade-loud (Layer 1 audit only).
+    required: bool = False
     budget_tokens: int = 10000
     max_memories_per_injection: int = 150
     observer_interval: int = 5
@@ -1884,6 +1890,7 @@ def _parse_memory_config(data: Dict[str, Any]) -> MemoryConfig:
     )
     return MemoryConfig(
         enabled=data.get("enabled", False),
+        required=bool(data.get("required", False)),
         budget_tokens=data.get("budget_tokens", 10000),
         max_memories_per_injection=data.get("max_memories_per_injection", 150),
         observer_interval=data.get("observer_interval", 5),
