@@ -346,7 +346,7 @@ Each phase independently shippable, ordered so each improves posture even if the
 - [x] Tighten readiness probe + add `preStop` hook + `terminationGracePeriodSeconds` + `startupProbe` in `helm/templates/orchestrator/deployment.yaml`. (2026-06-24)
 - [x] Add `helm/templates/orchestrator/pdb.yaml` (mirror `agent/pdb.yaml`), `minAvailable: 0`. (2026-06-24)
 - [ ] Move module-level singletons behind `lifespan` startup for clean SIGTERM. **Deferred** — cosmetic; tracked as a follow-up.
-- [ ] Chaos test: delete the pod under load; measure user-visible downtime. **Operator-run on dev** — runbook ready.
+- [ ] Chaos test. **Local k3d mechanics verified 2026-06-24** (startupProbe no crash-loop on a ~5-min cold start, preStop 18s drain, PDB allows drain). **Live multi-node + real-traffic test deferred** to a quiet overnight window after M0 reaches dev — tracked in `docs/tests/orchestrator_m0_failover_verification.md` (runbook: `docs/operations/orchestrator_failover.md`).
 - [x] Document failover behavior in `docs/operations/orchestrator_failover.md`. (2026-06-24)
 
 ### Phase 1 — Track 2 Layer 1: Leader election — GREENFIELD
