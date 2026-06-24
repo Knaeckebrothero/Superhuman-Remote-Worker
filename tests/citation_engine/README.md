@@ -2,7 +2,7 @@
 
 Test suite for the `citation_engine` package (`../../src/citation_engine/`).
 
-After the **native SRW integration** (`docs/features/citation_engine_integration.md`),
+After the **native SRW integration** (`docs/done/citation_engine_integration.md`),
 the engine is async and Postgres-only — it runs against SRW's vector store
 (`srw_vector`) through the agent's shared `PostgresDB` pool. SQLite /
 `mode="basic"` and the engine's own embedding/LLM/DSN stacks were removed

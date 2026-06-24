@@ -172,7 +172,7 @@ instruction_files:
     enforce: false  # Active: injected at tactical phase start (where completion happens)
   # Cite-as-you-write: bound to the citation tools (not a phase) so it also fires
   # in persistent sessions, which have no phase loop. enforce=true → the agent must
-  # read it before its first citation. See docs/features/citation_engine_integration.md Phase 4.
+  # read it before its first citation. See docs/done/citation_engine_integration.md Phase 4.
   - skill: cite-as-you-write
     trigger: before_tool:cite_web
     enforce: true

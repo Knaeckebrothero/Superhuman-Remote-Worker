@@ -57,7 +57,7 @@ data:
 
   # (Citations live in the vector store — srw_vector — reached through the
   # agent's shared VECTOR_POSTGRES_* pool. No separate citation DB/role/DSN.
-  # See docs/features/citation_engine_integration.md.)
+  # See docs/done/citation_engine_integration.md.)
 
   {{- if .Values.databases.mongodb.enabled }}
   # MongoDB (retired audit backend — rendered only if explicitly re-enabled; D-5 removes this)
@@ -143,7 +143,7 @@ data:
 
   # (Citation embeddings now share SRW's EMBEDDING_* service — same 4096-dim
   # qwen3-embedding-8b model that backs memory/KB — so there is no separate
-  # CITATION_EMBEDDING_* stack. See docs/features/citation_engine_integration.md.)
+  # CITATION_EMBEDDING_* stack. See docs/done/citation_engine_integration.md.)
 
   # Codex raw-response diagnostic capture
   DEBUG_CODEX_RAW_RESPONSE: {{ "0" | quote }}

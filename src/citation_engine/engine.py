@@ -5,7 +5,7 @@ The main CitationEngine class that provides citation functionality
 for AI agents.
 
 Native Superhuman-Remote-Worker subsystem (see
-``docs/features/citation_engine_integration.md``). The engine is **async-native**
+``docs/done/citation_engine_integration.md``). The engine is **async-native**
 and runs exclusively against SRW's managed vector store (``srw_vector``) through
 the shared asyncpg pool (``src.database.postgres_db.PostgresDB``). It owns no
 database connection of its own and has no SQLite / standalone mode — the host
