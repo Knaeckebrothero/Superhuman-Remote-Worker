@@ -1,5 +1,7 @@
 # Orchestrator M0 — Active-Passive Failover Hardening Implementation Plan
 
+**✅ Status: COMPLETE (2026-06-24).** All tasks implemented and committed on `develop` (unpushed); chart + mechanics verified locally on k3d (`startupProbe` carried a ~5-min cold start with 0 restarts, `preStop` 18s drain, PDB `ALLOWED DISRUPTIONS: 1`). Step checkboxes below are ticked for history. **Outstanding:** the live multi-node + real-traffic chaos test — deferred to a quiet overnight window after M0 reaches dev — tracked in `docs/tests/orchestrator_m0_failover_verification.md`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make a single orchestrator pod's death (eviction, OOM, node drain, image roll) a fast, bounded, predictable failover — graceful connection drain, slow-migration-safe startup, and a drain-aware PodDisruptionBudget — without enabling multiple replicas.
@@ -35,7 +37,7 @@
 **Interfaces:**
 - Produces values keys consumed by the template: `orchestrator.preStopDrainSeconds` (int), `orchestrator.terminationGracePeriodSeconds` (int).
 
-- [ ] **Step 1: Write the failing test (baseline render assertion)**
+- [x] **Step 1: Write the failing test (baseline render assertion)**
 
 Run:
 ```bash
@@ -45,7 +47,7 @@ helm template srw helm/ -f helm/ci/test-values.yaml \
 ```
 Expected: `ABSENT` (none of the new fields exist yet).
 
-- [ ] **Step 2: Add the drain values to `helm/values.yaml`**
+- [x] **Step 2: Add the drain values to `helm/values.yaml`**
 
 Find (line 115):
 ```yaml
@@ -64,7 +66,7 @@ Replace with:
   terminationGracePeriodSeconds: 60
 ```
 
-- [ ] **Step 3: Add pod-level `terminationGracePeriodSeconds` to the Deployment**
+- [x] **Step 3: Add pod-level `terminationGracePeriodSeconds` to the Deployment**
 
 In `helm/templates/orchestrator/deployment.yaml`, find:
 ```yaml
@@ -76,7 +78,7 @@ Replace with:
       terminationGracePeriodSeconds: {{ .Values.orchestrator.terminationGracePeriodSeconds }}
 ```
 
-- [ ] **Step 4: Add the `preStop` hook + `startupProbe` and tune liveness/readiness**
+- [x] **Step 4: Add the `preStop` hook + `startupProbe` and tune liveness/readiness**
 
 In `helm/templates/orchestrator/deployment.yaml`, find (lines 1036-1047):
 ```yaml
@@ -123,7 +125,7 @@ Replace with:
 ```
 (The `startupProbe` gates liveness/readiness until the app is up, so their `initialDelaySeconds` are removed.)
 
-- [ ] **Step 5: Run the render assertion + lint to verify it passes**
+- [x] **Step 5: Run the render assertion + lint to verify it passes**
 
 Run:
 ```bash
@@ -134,7 +136,7 @@ helm template srw helm/ -f helm/ci/test-values.yaml \
 ```
 Expected: lint reports `0 chart(s) failed`; grep prints lines including `terminationGracePeriodSeconds: 60`, the `preStop`/`sleep 15` exec, `startupProbe`, and the three `failureThreshold` values.
 
-- [ ] **Step 6: Verify Track-2-readiness render (replicas=2) still validates**
+- [x] **Step 6: Verify Track-2-readiness render (replicas=2) still validates**
 
 Run:
 ```bash
@@ -144,7 +146,7 @@ helm template srw helm/ -f helm/ci/test-values.yaml \
 ```
 Expected: prints `replicas: 2` and `terminationGracePeriodSeconds: 45` (values plumb through cleanly).
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add helm/values.yaml helm/templates/orchestrator/deployment.yaml
@@ -165,7 +167,7 @@ git commit -m "feat(helm): orchestrator graceful drain + startupProbe + probe tu
 - Consumes: nothing from Task 1's template (independent), but appends to the same `values.yaml` orchestrator block — run after Task 1.
 - Produces values keys: `orchestrator.pdb.enabled` (bool), `orchestrator.pdb.minAvailable` (int).
 
-- [ ] **Step 1: Write the failing test (no orchestrator PDB renders yet)**
+- [x] **Step 1: Write the failing test (no orchestrator PDB renders yet)**
 
 Run:
 ```bash
@@ -173,7 +175,7 @@ helm template srw helm/ -f helm/ci/test-values.yaml | grep "orchestrator-pdb" ||
 ```
 Expected: `ABSENT`.
 
-- [ ] **Step 2: Add the PDB values to `helm/values.yaml`**
+- [x] **Step 2: Add the PDB values to `helm/values.yaml`**
 
 Find (added in Task 1):
 ```yaml
@@ -190,7 +192,7 @@ Replace with:
     minAvailable: 0
 ```
 
-- [ ] **Step 3: Create the PDB template**
+- [x] **Step 3: Create the PDB template**
 
 Create `helm/templates/orchestrator/pdb.yaml` (mirrors `helm/templates/agent/pdb.yaml`):
 ```yaml
@@ -209,7 +211,7 @@ spec:
 {{- end }}
 ```
 
-- [ ] **Step 4: Run the render assertions to verify it passes**
+- [x] **Step 4: Run the render assertions to verify it passes**
 
 Run:
 ```bash
@@ -219,7 +221,7 @@ helm template srw helm/ -f helm/ci/test-values.yaml \
 ```
 Expected: lint `0 chart(s) failed`; the second command renders a `PodDisruptionBudget` named `srw-superhuman-remote-worker-orchestrator-pdb` with `minAvailable: 0`.
 
-- [ ] **Step 5: Verify the enable/disable toggle**
+- [x] **Step 5: Verify the enable/disable toggle**
 
 Run:
 ```bash
@@ -229,7 +231,7 @@ echo "replicas2/minAvailable1 (expect 'minAvailable: 1'):"; helm template srw he
 ```
 Expected: `1`, then `0`, then `minAvailable: 1`.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add helm/values.yaml helm/templates/orchestrator/pdb.yaml
@@ -247,7 +249,7 @@ git commit -m "feat(helm): orchestrator PodDisruptionBudget (M0)" \
 
 This is documentation (the chaos test is operator-run on a live cluster — it is not executed from this workspace). The runbook uses copy-paste `kubectl` blocks, matching the runbook style in `docs/features/high_availability_setup.md`.
 
-- [ ] **Step 1: Create the runbook**
+- [x] **Step 1: Create the runbook**
 
 Create `docs/operations/orchestrator_failover.md`:
 ```markdown
@@ -327,7 +329,7 @@ kubectl $CTX uncordon "$NODE"
   `orchestrator.replicas` before M1. See `docs/features/orchestrator_ha_scaling.md`.
 ```
 
-- [ ] **Step 2: Verify the doc renders and bash blocks are well-formed**
+- [x] **Step 2: Verify the doc renders and bash blocks are well-formed**
 
 Run:
 ```bash
@@ -338,7 +340,7 @@ awk '/^```bash$/{f=1;next}/^```$/{f=0}f' docs/operations/orchestrator_failover.m
 ```
 Expected: `EXISTS`; `3`; `BASH OK`.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add docs/operations/orchestrator_failover.md
@@ -353,7 +355,7 @@ git commit -m "docs(ops): orchestrator failover behavior + chaos-test runbook (M
 **Files:**
 - Modify: `docs/features/orchestrator_ha_scaling.md` (Refresh reality-check matrix M0 row; Phase 0 checklist)
 
-- [ ] **Step 1: Update the reality-check matrix M0 row**
+- [x] **Step 1: Update the reality-check matrix M0 row**
 
 Find:
 ```markdown
@@ -364,7 +366,7 @@ Replace with:
 | **Track 1** active-passive hardening (probes / `preStop` / grace / PDB) | not started | **SHIPPED (chart); chaos test operator-pending** | `preStop` drain + `terminationGracePeriodSeconds` + `startupProbe` + tuned probes + orchestrator PDB landed in `helm/` (M0). Behavioral chaos test is operator-run on dev — see `docs/operations/orchestrator_failover.md`. |
 ```
 
-- [ ] **Step 2: Update the Phase 0 checklist**
+- [x] **Step 2: Update the Phase 0 checklist**
 
 Find:
 ```markdown
@@ -385,7 +387,7 @@ Replace with:
 - [x] Document failover behavior in `docs/operations/orchestrator_failover.md`. (2026-06-24)
 ```
 
-- [ ] **Step 3: Verify**
+- [x] **Step 3: Verify**
 
 Run:
 ```bash
@@ -394,7 +396,7 @@ grep -c "\- \[x\]" docs/features/orchestrator_ha_scaling.md
 ```
 Expected: `2` (matrix row + Phase 0 heading); at least `3` checked boxes.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add docs/features/orchestrator_ha_scaling.md
