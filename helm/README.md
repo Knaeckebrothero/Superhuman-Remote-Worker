@@ -213,7 +213,7 @@ aren't set), but the URL form is legacy and a footgun under `urlsplit`.
   is a native SRW subsystem on the vector pool, **not** a separate role or
   database (the former `srw_citations` / `citation_engine` DB was retired in
   the citation-engine native integration — see
-  `docs/features/citation_engine_integration.md`).
+  `docs/done/citation_engine_integration.md`).
 - `NEO4J_USERNAME`, `NEO4J_PASSWORD` — both live in Vault (mirroring
   the `POSTGRES_USER` / `VECTOR_POSTGRES_USER`
   pattern, so all DB credentials sit in one place). Community edition

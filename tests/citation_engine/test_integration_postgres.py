@@ -2,7 +2,7 @@
 Async PostgreSQL round-trip for the SRW-native citation engine.
 
 This is the canonical integration test for the citation engine after the native
-integration (docs/features/citation_engine_integration.md): the engine is async
+integration (docs/done/citation_engine_integration.md): the engine is async
 and runs against SRW's vector store through a ``PostgresDB`` pool. With SQLite /
 ``mode="basic"`` removed (decision D3), this Postgres round-trip is the engine's
 primary automated coverage — the fast in-process unit tests are gone.

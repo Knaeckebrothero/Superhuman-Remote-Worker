@@ -238,6 +238,117 @@ just slowly (43 calls / 1.35M tok for the spec phase so far).
 
 ---
 
+## Findings — cycle-boundary review (added 2026-06-24, round 2: 5 subagents)
+
+Run after cycle 1 completed (scholar1→critic2→developer3) and cycle 2 began
+(scholar4 `85238a88`). **Decisive result: the loop does NOT compound — cycle 2
+replays cycle 1 — and we now have the root-cause *mechanisms* (F20, F22–F24), not
+just the symptom (F11).** Counter-news: the *agents* do good work — the developer
+shipped real, test-verified code; no hallucination; no false victory. The failure
+is entirely in the coordination/accumulation plumbing.
+
+**Cross-cycle verdict (headline):** scholar4 re-proposed cycle-1's space — of its 3
+proposals, #1 = the **already-selected** "PMS-first modular monolith" (it told the
+critic to "evaluate build-vs-buy cleanly," redoing a decided question) and #3 = the
+critic's **#3-ranked** "integration hub"; only 1 is novel (~⅔ repeated). It branched
+from the empty `main` (cycle-1 code is HTTP 404 to it) and made **zero KB calls**.
+
+### Root causes of non-compounding (P1)
+
+- [ ] **F20 (P1) — KB tools are inconsistently injected across loop jobs.** Same
+  `config_name`, different toolset: the cycle-1 scholar had **45 tools incl. all
+  `kb_*`** ("knowledge base" hierarchy); the cycle-2 scholar `85238a88` (35 tools)
+  and developer `280719ed` (18 tools) had **no `kb_*`** ("memory" hierarchy) and
+  made 0 KB calls. The role that most needs to read the blackboard at cycle start
+  can't. (Same intermittency seen in job1's cold-restart runs: 35 then 45.) Fix:
+  assert `kb_*` in every loop job's resolved config at dispatch; root-cause why
+  iter-4 resolved a different toolset than iter-1.
+- [ ] **F23 (P1) — KB injection is similarity-ranked to the current todo (top-5),
+  with no pinning of decision/proposal/DoD notes.** `graph.py:1132` runs
+  `hybrid_search(query=pending_todos[0].content, match_count=5)`. So compounding
+  works only when the current task is semantically near the note you need: the
+  **developer succeeded by luck** (todo "implement PMS-first slice" matched the
+  verdict note) while **scholar4 failed** (generic "propose approaches" todo doesn't
+  match the prior *proposal* notes). Coordination is luck correlated with task
+  phrasing, not a guarantee. Fix: for loop jobs always inject the DoD + all open
+  `proposal` notes + the latest `decision` regardless of similarity, then fill the
+  rest with hybrid search.
+- [ ] **F22 (P2) — No tried/rejected ledger is ever written; ranking ≠ rejection.**
+  The critic *ranked* all 5 proposals but recorded the 4 non-selected as "useful but
+  narrower," never `rejected`/`superseded` (the KB `superseded` status exists, unused).
+  So even a KB-reading agent finds no dead-end list, and the kickoff's "don't
+  re-propose tried/rejected" guard has nothing to consult (→ the live repetition
+  above). Fix: the critic's selection must mark non-selected proposals `superseded`
+  (or write one tried/rejected note).
+- [ ] **F24 (P1) — No project-level acceptance vector → the loop can't measure
+  convergence.** Each job grades itself against a *self-authored local* DoD: the
+  developer's freeze (93%) checks only its own 4 spec ACs ("pytest collected 4,
+  passed 4"), never the project's ~10 capability areas. So every job can honestly
+  report 90%+ confidence forever while the project sits at ~1%. Fix: pin a project
+  capability checklist as a KB note, require each job to map its slice onto
+  capabilities and flip statuses, and surface "% capabilities green."
+
+### Reliability / tooling (P2–P3)
+
+- [ ] **F21 (P2) — The prompt orders tools the agent doesn't have.** scholar4's
+  system prompt still commands `kb_search`/`kb_write`/`kb_update` (10 tools) it was
+  never given → guaranteed instruction-following failure + wasted reasoning. Gate the
+  KB prompt section on tool availability (or always provide the tools, per F20).
+- [ ] **F25 (P2) — No stall/liveness detection.** A job wedged in non-terminal
+  `processing` trips **neither** the safety-net sweeper (it only recovers
+  terminal-but-not-advanced loops) **nor** the consecutive-failure cap, and the
+  cockpit shows a static "processing" badge with no age. An overnight operator can't
+  tell "working" from "hung." Fix: a processing-age stall detector + surface job
+  age/current phase.
+- [ ] **F26 (P3) — Code-job workspace lacks pytest; pip is externally-managed.** The
+  developer burned ~10–15 min building a `/tmp/pytest-venv`, and its handoff repro
+  commands point at that **ephemeral** venv (won't survive a workspace recreate → not
+  reproducible). Bake pytest / a venv policy into the code-job workspace image.
+- [ ] **F27 (P3) — Cost is unsurfaceable end-to-end for loop jobs.** Beyond F16
+  (`jobs.total_tokens_used=0`): `list_project_loop_jobs` (`postgres.py:9270`) doesn't
+  select token columns, and the cockpit `Job` model has no token field — so per-job/
+  loop cost can't reach the UI without API+model changes. Zero spend visibility for an
+  overnight run.
+- [ ] **F28 (P3) — MCP `list_job_commits` returns "No commits found"** for jobs that
+  have commits on their own `job/<id>` branch (it defaults to the `main` ref) —
+  blinding the very tooling meant to audit loop branches.
+
+### Verified healthy / good news (don't regress)
+- **Developer execution quality is high.** developer3 shipped **real, runnable,
+  test-verified code** — a correct `RoomInventory`/`Reservation` module (half-open
+  overlap rejection that preserves the existing booking), 4 pytest tests **executed
+  green** (`Exit 0, collected 4 items`), faithful spec→red→green TDD, on-scope with
+  the critic's verdict, two self-caught scope violations, honest 93% freeze. The
+  feared "execution errors are the #1 failure mode" did **not** occur. Tiny (~60 LOC)
+  and stranded (F11), but genuine working software.
+- **No hallucination.** Under zero grounding the agents *abstained* rather than invent
+  Resavio/hotel facts — the failure mode is **vacuity, not fabrication** (a ~60-LOC
+  toy where every differentiating feature is in `not_included`).
+- **No false victory.** Per-job freeze confidence is well-calibrated and scoped
+  (scholar 88%, critic 95%, developer 93%); the danger is the misleading *aggregate*
+  (3 "successful" jobs ≈ 1% of goal), not individual over-claiming.
+- **Loop API is correct after rollover.** `/loop` and `/loop/jobs` exactly match the
+  DB post-wrap (status, role=scholar cycle 2, total_jobs_run=4, remaining=27, all 4
+  jobs) — the Phase-3 cockpit backend is sound. F8 did **not** recur on the developer
+  (its 2.5h was per-call latency × 335 calls + the pytest-env fight, not preemption/
+  thrash).
+
+### Updates to earlier findings
+- **F7 (no grounding) — deepened:** the consequence is a ~40–60 LOC toy, not
+  fabrication; the 5 proposals are distinct-from-each-other but generic boilerplate
+  ("distinct ≠ tailored"); the critic's "grounded" criterion means *grounded in the
+  KB's own vocabulary* (self-referential, can't detect the data void); citations
+  [16]-[19] are real but generic PMS blogs ("citation as decoration"). Highest-leverage
+  input = **the hotel's Resavio pain-points / replacement requirements** ("better than
+  Resavio" is unfalsifiable without it).
+- **F11 — sharpened:** developer3 has **98 commits** stranded on `job/280719ed` (never
+  merged; `main` = empty "Initial commit"); job4 branched from empty `main` and 404s on
+  cycle-1 files.
+- **F15 — confirmed live:** the badge reads "scholar · job 4 of 30" — no cycle counter
+  anywhere, so an operator can't tell they're in cycle 2.
+
+---
+
 ## Notes
 
 - Most of the quality fixes (F3–F6) are edits to the single kickoff builder

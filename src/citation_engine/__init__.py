@@ -10,7 +10,7 @@ has no standalone/SQLite mode and owns no database connection of its own — the
 host's ``orchestrator/database/migrations/vector/`` owns the schema, and the
 agent injects the vector ``PostgresDB`` pool at construction.
 
-See ``docs/features/citation_engine_integration.md``.
+See ``docs/done/citation_engine_integration.md``.
 
 Usage:
     from citation_engine import CitationEngine, CitationContext

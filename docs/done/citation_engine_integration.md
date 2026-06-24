@@ -19,9 +19,10 @@ related:
   - database_architecture.md
   - no_workspace_agent_mode.md
   - main_cloud_abstraction.md
-status: phase-4-implemented
+status: done
 date: 2026-06-19
 updated: 2026-06-24
+completed: 2026-06-24
 ---
 
 # Citation Engine — Native SRW Integration
@@ -34,10 +35,20 @@ verified). It *was* still built like a standalone library — its own synchronou
 DB connection with SQLite/Postgres dual modes, its own LLM client for
 verification, its own embedding stack, and a schema duality. This document
 covers turning it into a **first-class SRW subsystem** that uses SRW's native
-infrastructure for every one of those concerns. **Phases 1–3 (plumbing) are
-implemented + k3d-verified, and Phase 4 (inline citation usage — agent cites
-inline, cockpit renders it) is now implemented + k3d-verified too** — see
-*Implementation status* below.
+infrastructure for every one of those concerns.
+
+> **✅ COMPLETE — 2026-06-24.** All planned phases plus the greenlit follow-ups
+> are implemented and k3d-verified end-to-end: **Phases 1–3** (DB collapse +
+> async; verifier → auxiliary-LLM + D4 feedback; cloud snapshot-anchor + the
+> snapshot/drift endpoints), **Phase 4** (inline `[N]` citation usage — agent
+> cites inline via a prompt mandate + the `cite-as-you-write` skill; cockpit
+> renders `[N]` + the Half-B v2 citations panel with view-original/drift),
+> **persistent-session feedback injection**, and the **live verdict push**
+> (`pending → verified/failed` over the session SSE channel). The remaining items
+> — a full real-cloud agent-job e2e, semantic chunking behind an async chunker,
+> the `oc:fileid` durable cloud link, and a tool-capable *default* session model
+> — are **deferred future work, not part of this completed integration** (see
+> *Follow-ups*). All code is uncommitted on `develop` (the author handles git).
 
 This is **orthogonal to** the existing citation docs:
 [[citation_engine_roadmap]] and [[citation_engine_rework]] describe the engine's
@@ -46,7 +57,7 @@ This is **orthogonal to** the existing citation docs:
 *plumbing*: how the engine plugs into SRW's DB, auxiliary-LLM, and cloud layers.
 The feature set and the verification approach are unchanged.
 
-## Implementation status (2026-06-20)
+## Implementation status — ✅ COMPLETE (updated 2026-06-24)
 
 | Phase | Scope | Status |
 |---|---|---|
@@ -88,8 +99,9 @@ flat-`PYTHONPATH` subpackage, **not** a pip/`pyproject` package, to match the re
 
 **Deferred follow-ons** (none are defects — all were explicitly scoped out of
 Phases 1–3): a full real-cloud agent-job e2e, semantic chunking behind an async
-chunker, and the `oc:fileid` durable cloud link (the cockpit citations view +
-persistent-session feedback injection shipped 2026-06-23/24). They're
+chunker, and the `oc:fileid` durable cloud link (the cockpit citations view, the
+live verdict push, and persistent-session feedback injection shipped
+2026-06-23/24). They're
 enumerated with rationale,
 integration points, and rough effort in *Follow-ups (deferred — not greenlit)*
 below. Per-phase detail + acceptance criteria are in *Phasing & acceptance
@@ -687,18 +699,31 @@ if one is picked up, spin it into its own issue/feature doc.
 > on-demand drift badge (`/drift`) for cloud-document citations. The auth blocker
 > is fixed via `user_can_access_job_or_thread` (the by-id `/citations/{id}`,
 > `/snapshot`, `/drift` now authorize session citations by thread ownership).
-> The only thing left of the original "notification channel" idea is live
-> `pending → verified/failed` push — today the panel refreshes per turn (the
-> existing `isWaitingForInput` effect), which covers the common case.
+> The original "notification channel" idea — live `pending → verified/failed`
+> push — is now **✅ SHIPPED + k3d-verified 2026-06-24** (see below). The
+> per-turn `isWaitingForInput` refresh remains the backstop for citations not
+> yet loaded when their verdict lands.
 
-The entire data layer + read API is ready and proven (`GET /api/citations/{id}`,
-`/api/citations/{id}/snapshot`, `/api/citations/{id}/drift`), but nothing
-surfaces it. A view would list a job's citations with verification status, render
-"view original" from `/snapshot`, and show a drift badge from `/drift`. The one
-genuinely new piece is a **notification channel** for the async
-`pending → verified/failed` transition (SSE/WS) so the UI updates without a
-reload. *Effort:* moderate (Angular view + a status stream). *Plugs into:* the
-existing cockpit data-access patterns (`ApiService` + SSE).
+#### 1a. Live verdict push — ✅ SHIPPED + k3d-verified 2026-06-24
+
+The async `pending → verified/failed` transition now pushes to the cockpit over
+the existing session event channel instead of waiting for the next per-turn
+refresh. `CitationEngine` gained an optional `on_verdict(citation_id, status)`
+callback (`src/citation_engine/engine.py`), fired from `_run_verification` after
+a *real* verdict lands (silent on an aux outage that leaves the row `pending`);
+threaded through `ToolContext.citation_verdict_callback` (worker jobs leave it
+`None`) and wired in the persistent session to `_broadcast("citation.verdict",
+…)` (`src/api/persistent_app.py`), which rides the proven `thread_events` → SSE
+replay path (same transport as `permission.resolved`). The cockpit adds a
+`case 'citation.verdict'` in `_handleEvent` (`persistent-chat.service.ts`) that
+patches the one citation in `citationsByCid` in place — a no-op if it isn't
+loaded yet, since the per-turn refresh covers that. *Tests:* 5 Python
+(`tests/citation_engine/test_verdict_callback.py`), 3 cockpit handler specs.
+**Live k3d** (Gemini session, autonomous, thread `ec0371e0`): `cite_web` →
+citation `[35]` `pending` → real aux verdict `verified` (score 0.80) → engine
+fired the callback → `thread_events` seq 22
+`{"method":"citation.verdict","params":{"citation_id":35,"verification_status":"verified"}}`
+→ the SSE `/stream` endpoint delivered that exact frame to a connected client.
 
 ### 2. Full real-cloud agent-job e2e — *the remaining verification gap*
 Everything below the agent has been exercised live; what hasn't is a **real LLM

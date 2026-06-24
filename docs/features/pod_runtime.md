@@ -282,7 +282,7 @@ def _build_job_manifest(self, job_id, config_name, image, resources, timeout):
     # NB: the citation engine is now a native SRW subsystem — it uses the shared
     # vector pool (VECTOR_POSTGRES_*) + SRW's EMBEDDING_* service, so the former
     # CITATION_DB_URL / CITATION_EMBEDDING_* keys were retired (only the verifier
-    # CITATION_LLM_* model slot remains). See citation_engine_integration.md.
+    # CITATION_LLM_* model slot remains). See docs/done/citation_engine_integration.md.
     secret_keys = [
         "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GROQ_API_KEY",
         "OPENROUTER_API_KEY", "GOOGLE_API_KEY", "TAVILY_API_KEY",
