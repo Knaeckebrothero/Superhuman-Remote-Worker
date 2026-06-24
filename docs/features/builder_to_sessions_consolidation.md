@@ -154,3 +154,12 @@ Decide when canvas v1 (steps 1–4 in `dynamic_canvas.md`) is stable.
 - **`'builder'` model-slot** — RESOLVED. Slot dropped; session/admin pickers read `groups`, not the builder list → unaffected (Admin → LLM → Defaults live-verified: 8 kinds, no builder).
 - **Default-landing swap** — RESOLVED. Chose `redirectTo: 'sessions'` so the URL becomes `/sessions` and the sidebar's Sessions item highlights.
 - **Table drop vs freeze** — RESOLVED. Dev DB held 1 session / 2 messages of leftover test data (no pilot data) → dropped via migration `0032`.
+
+## Follow-ups (post-removal)
+
+Two threads remain open to "finish what we started":
+
+1. **Canvas** — the real replacement for the builder's authoring UX, seeded by the parked machinery. See *Park strategy & canvas hand-off* + *Deferred to canvas* above. Not started.
+
+2. **Job tooling in sessions** — verified 2026-06-24. Persistent sessions already cover *"check on jobs / create them"*: `src/api/persistent_session.py` `_setup_tools()` **unconditionally** injects 8 orchestrator tools (defined in `src/tools/orchestrator/jobs.py`, which call the orchestrator REST API) — `create_worker_job`, `list_worker_jobs`, `get_worker_job`, `get_job_workspace_file`, and `approve_`/`resume_`/`cancel_`/`pause_worker_job`. These are **orthogonal to the builder** (never part of it; the builder had its own server-side set in the deleted `builder_dispatch.py`), so the removal lost nothing here.
+   - **Open (optional, additive — not a regression):** sessions get the *lifecycle* set, not the builder's deeper *read-only inspection* (job todos, diffs, commits, audit trail, source/citation lookups — the ~85 operator tools from `builder_dispatch.py`, redundant with the Cockpit Jobs / Job Review / Debug pages). To give a session agent inline inspection, expose more `get_*` tools from `jobs.py` and append them to `_ORCHESTRATOR_TOOLS` in `_setup_tools()`. Decision point: do that vs. "that's the Cockpit's job."
