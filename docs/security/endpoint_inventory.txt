@@ -76,9 +76,9 @@ DELETE /api/api-keys/{token_id}                                                 
 POST   /api/api-keys/{token_id}/rotate                                                  gated:require_approved_user
 GET    /api/auth/me                                                                     public:auth-bootstrap (Bearer-required, intentionally serves pending-approval users)
 POST   /api/citations/snapshot                                                          internal:require_internal
-GET    /api/citations/{citation_id}                                                     gated:user_can_access_any_job
-GET    /api/citations/{citation_id}/drift                                               gated:user_can_access_any_job
-GET    /api/citations/{citation_id}/snapshot                                            gated:user_can_access_any_job
+GET    /api/citations/{citation_id}                                                     gated:user_can_access_job_or_thread
+GET    /api/citations/{citation_id}/drift                                               gated:user_can_access_job_or_thread
+GET    /api/citations/{citation_id}/snapshot                                            gated:user_can_access_job_or_thread
 POST   /api/codex/callback                                                              admin:_require_admin
 DELETE /api/codex/credentials/{name}                                                    admin:_require_admin
 POST   /api/codex/login                                                                 admin:_require_admin
