@@ -11,156 +11,238 @@ aliases:
   - orchestrator scaling
   - leader election
 related:
-  - "[[unified_instance_lifecycle]]"
+  - "[[high_availability_setup]]"
   - "[[headless_persistent_sessions]]"
-  - "[[stuck_agent_recovery]]"
+  - "[[direct_session_websockets]]"
   - "[[job_auto_assign]]"
   - "[[sudo_permissions]]"
 ---
 
 # Orchestrator HA & Scaling
 
-> One orchestrator pod is a single point of failure and a single point of throughput. Today the system tolerates the failure mode — pause + re-dispatch — but it can't survive a 30-minute outage gracefully and can't scale past one CPU. This feature plans the move from `replicas: 1` to `replicas: N` in two phases: fast failover first, true horizontal scale-out second.
+> One orchestrator pod is a single point of failure and a single point of throughput. Today the system tolerates the failure mode — pause + re-dispatch — but it can't survive a multi-minute outage gracefully and can't scale past one CPU. This feature plans the move from `replicas: 1` to `replicas: N` in two phases: fast failover first, true horizontal scale-out second.
 
-**Status:** Design / brainstorm. No implementation yet.
+**Status:** Partially de-risked. Track 1 (active-passive hardening) is **unstarted**. Track 2's *coordination patterns are mostly already shipped* in narrower domains, but the **leader-election primitive that actually unblocks `replicas: 2` is not built**. See the reality-check matrix below.
 **Filed:** 2026-05-12
+**Refreshed:** 2026-06-24 — reconciled against current code (`main.py` grew ~15.5k → ~23.7k lines; deployment moved to Helm/Fleet; WS proxy removed; several coordination primitives shipped). All line references in this revision are current as of the refresh.
+
+## Refresh 2026-06-24 — reality check
+
+The original draft said "no implementation yet." That is no longer true, and the gap is lopsided. Three of the four Track-2 coordination patterns now exist as working, shipped code — just applied to narrower problems than full multi-replica. Meanwhile the cheap Track-1 win is still entirely undone, and the one new primitive that gates `replicas: 2` (leader election) is greenfield.
+
+| Work item | Original status | **Current status (2026-06-24)** | Evidence |
+|---|---|---|---|
+| **Track 1** active-passive hardening (probes / `preStop` / grace / PDB) | not started | **NOT STARTED** | No `preStop`, no `terminationGracePeriodSeconds`, no orchestrator PDB anywhere in `helm/`. Probes present but untuned. |
+| **Layer 1** leader election for singleton loops | not started | **GREENFIELD — the one true unlock** | No `with_leader_lock`, no session-scoped advisory lock, no `leader_election.py`. All existing advisory locks are *xact*-scoped. |
+| **Layer 2** DB-level dispatch (`SKIP LOCKED`) | not started | **PATTERN PROVEN, dispatcher not ported** | `cron_dispatcher` is a complete, documented multi-replica-safe `SKIP LOCKED` queue. Job dispatch still uses the in-process `_dispatch_lock`. `thread_advisory_lock` already covers per-thread serialization. |
+| **Layer 3** cross-replica fan-out (`LISTEN/NOTIFY`) | not started | **TRANSPORT SHIPPED + WS problem evaporated** | `notify_channel()` helper + a reconnecting `LISTEN` loop ship for cloud-config reload. The WS half is moot: `persistent_ws_proxy` is gone (direct-to-agent-pod), stream is `thread_events` SSE. Remaining: DB-back the 2 SSE channels + drop `_pending_msgs`. |
+| **Layer 4** NATS queue groups | not started | **GREENFIELD but trivial** | No `queue=` on any subscription. Subjects are now `orchestratorId`-scoped (separates installs, not replicas). |
+| **Data tier** prerequisite (Postgres/NATS HA) | out of scope here | **NOT STARTED** (see [[high_availability_setup]]) | NATS single-replica with clustering *explicitly disabled*; no CloudNativePG. |
+
+**The practical read:** for the open-source "scales from a mini-PC to a thousand-agent cluster" claim, the critical path is (1) ship Track 1 so a single replica survives its own eviction (~1 week, no new primitives), then (2) build the leader-election helper and wrap the loops — that alone makes `replicas: 2` *correct*, reusing the proven patterns for the rest. The scary-sounding parts (WS coordination, dispatch races) are largely already solved.
+
+## Roadmap
+
+A milestone view sequenced for the open-source release, reconciling this doc with the data-tier work in [[high_availability_setup]]. Milestones are ordered by **dependency, not calendar** — no target dates are set; sequence them against whatever the release timeline turns out to be. Each is independently shippable and leaves the system strictly better. The granular task breakdown is in the **Implementation phases** section below; the data-tier milestones live in the umbrella doc. Effort is rough one-person engineering-time, mostly-testing included.
+
+### What gates what
+
+```
+M0 Active-passive hardening ─────────────┐
+   (Track 1, stays replicas:1)           │
+                                          ├──> M2 Active-active scale-out
+M1 Leader election ──> replicas:2 SAFE ───┘    (Layers 2-4)
+   (Layer 1)          = orchestrator no
+                        longer a hard SPOF
+                              │
+M3 Data-tier HA ──────────────┴──> meaningful END-TO-END HA
+   (NATS cluster, Postgres)          + active-active at scale
+   [umbrella doc]
+```
+
+The non-obvious relationship: **M1 alone makes the orchestrator HA for failover** — run `replicas: 2`, lose one, and the load balancer plus ~30s loop-failover absorb it — *even over a single Postgres*. But the **stack** isn't HA until M3, because an HA orchestrator in front of a single-Postgres still goes dark when Postgres does. M0 and M3 can run in parallel with the M1 → M2 line.
+
+> This refines the umbrella doc's "suggested execution order," which lumped all multi-replica work into one post-data-tier "Track 2." Separating M1 (failover HA, no data-tier dependency) from M2 (scale-out, wants data-tier HA) lets the orchestrator stop being a SPOF *before* the heavier Postgres migration lands.
+
+### Milestones
+
+| # | Milestone | Unlocks | Depends on | Effort | Detail |
+|---|---|---|---|---|---|
+| **M0** | Active-passive hardening (Track 1) | Bounded, tested ~15-30s failover on eviction; backs the "survives node drain / image roll / OOM" claim. Stays `replicas: 1`. | drain discipline (umbrella doc — operational, zero-cost) | ~1 week (mostly chaos-testing) | Phase 0 |
+| **M1** | Leader election (Layer 1) | **`replicas: 2` becomes correctness-safe → orchestrator is no longer a hard SPOF.** Zero REST/SSE blackout on eviction (peers stay up); singleton loops fail over in ~30s. Works over single Postgres. | none (ship after M0 for the cheap win first) | ~3-5 days + tests | Phase 1 |
+| **M2** | Active-active scale-out (Layers 2-4) | Horizontal CPU/connection scale per orchestrator; removes residual cross-replica UX divergence + double-work. Mostly porting patterns already proven in-repo (cron `SKIP LOCKED`, `notify_channel`). | M1 | ~1-1.5 weeks | Phases 2-4 |
+| **M3** | Data-tier HA | Removes the Postgres/NATS SPOFs → meaningful end-to-end HA + headroom for active-active at scale. | independent of M0-M2 (run in parallel); **required before the "thousand-agent cluster" claim is honest** | NATS ~2-3 days; Postgres→CloudNativePG ~1-2 weeks incl. migration | [[high_availability_setup]] P1-P2 |
+| **M4** | Operational polish (Phase 5) | DB-aware probes, NOTIFY-on-insert dispatch wake; flip `orchestrator.replicas: 2`, watch a deploy cycle, declare done. | M1-M3 | ~2-3 days | Phase 5 |
+
+### The open-source release bar
+
+- **Minimum honest "HA orchestrator" claim = M0 + M1 + the NATS-cluster slice of M3.** A single replica failure is tolerated, `replicas: 2` is safe, and the coordination plane isn't a SPOF. Postgres HA can be a *documented bring-your-own posture* rather than shipped code: the chart already supports pointing at an external/managed Postgres (`databases.*.externalHost`), so "use managed/HA Postgres in production" is a legitimate OSS stance consistent with this doc's "Database HA out of scope" decision — and the cheapest path to making the claim true.
+- **Full "mini-PC → thousand-agent cluster" claim = + M2 + the CloudNativePG slice of M3.** Horizontal scale per orchestrator *and* batteries-included data-tier HA for self-hosters who don't bring their own managed Postgres.
+- **Hard blocker today:** the chart ships `replicas: 1` and that is the *only* safe value — `replicas: 2` has live correctness bugs (dispatch double-assign, IMAP double-poll) until M1. README/marketing must not imply a multi-replica orchestrator before M1 lands.
 
 ## Motivation
 
-`deployment/legacy/20-orchestrator.yaml:9` pins `replicas: 1` for the orchestrator. There is exactly one process making dispatch decisions, holding the WebSocket fan-out for every persistent session, listening on NATS, sweeping stuck jobs, expiring sudo approvals, and reconciling the agent pool. When that pod gets evicted or OOMs:
+`helm/values.yaml:95` sets `orchestrator.replicas: 1` (templated at `helm/templates/orchestrator/deployment.yaml:12`; the live deploy is the Helm chart via Fleet GitOps — `deployment/fleet.yaml`). There is exactly one process making dispatch decisions, listening on NATS, sweeping stuck jobs, expiring sudo approvals, polling IMAP, and reconciling the agent pool. When that pod gets evicted or OOMs:
 
 - Inbound REST traffic dies until Kubernetes re-rolls (15-60s on a healthy cluster, multiple minutes on a degraded one).
-- All in-flight WebSocket connections drop and the cockpit shows the "silent disconnect" failure mode tracked in `docs/issues/persistent_chat_silent_disconnect.md`.
 - Any NATS reply landing during the gap is dropped — the durable consumer is recoverable but the in-process `_pending_msgs` map is not.
 - Background sweepers don't run; orphaned-job recovery stalls.
+- Persistent-session SSE streams drop, but the agent pod keeps running and keeps writing `thread_events`; a reconnecting cockpit replays from `Last-Event-ID` after the bounce (this part already degrades gracefully — see "What already works").
 
-The system *does* survive — agents heartbeat-time-out cleanly, jobs auto-pause, persistent sessions reattach after the bounce. The user-visible damage is a multi-minute UI blackout, not data loss. But the failure mode is unnecessarily disruptive for what's structurally a stateless web service, and the single-process ceiling caps throughput when we eventually want to run more than a few hundred concurrent persistent sessions.
+The system *does* survive — agents heartbeat-time-out cleanly, jobs auto-pause, persistent sessions reattach. The user-visible damage is a multi-minute UI blackout, not data loss. But the failure mode is unnecessarily disruptive for what's structurally a stateless web service, and the single-process ceiling caps throughput when we want to run thousands of concurrent agents.
 
-This feature has two motivations stacked together:
+Two motivations stacked together:
 
-1. **High availability.** Survive a pod eviction with sub-second user-visible impact. This is the everyday case (node drain, image roll, OOM).
-2. **Horizontal scaling.** Run multiple orchestrator pods to spread CPU and connection load. This is the future case (more users, more persistent sessions, longer event-log fan-out work).
+1. **High availability.** Survive a pod eviction with sub-second user-visible impact. Everyday case (node drain, image roll, OOM).
+2. **Horizontal scaling.** Run multiple orchestrator pods to spread CPU and connection load. Future case (more users, more persistent sessions).
 
 Both want `replicas: N`. The work that gets us to `replicas: 2` is the same work that gets us to `replicas: 8`.
 
 ## What blocks `replicas: 2` today
 
-The DB layer is fine — migrations already coordinate via `pg_advisory_xact_lock` (`orchestrator/database/migrate.py:157`), Postgres handles concurrent writers, and JSONB merges use atomic SQL. The blockers are all *runtime* singletons in the orchestrator process.
+The DB layer is fine — migrations coordinate via `pg_advisory_xact_lock` (`orchestrator/database/migrate.py:157`), Postgres handles concurrent writers, and JSONB merges use atomic SQL (`merge_job_context`, `postgres.py:1402`). The blockers are *runtime* singletons in the orchestrator process. The refresh re-verified each and split them into "still a correctness bug," "UX divergence," and "already safe."
 
-### In-process locks and sets
+### Correctness blockers (must fix before `replicas: 2`)
 
-| What | Where | What breaks with 2 replicas |
+| What | Where (current) | What breaks with 2 replicas |
 |---|---|---|
-| `_dispatch_lock` (asyncio.Lock) | `orchestrator/main.py:388` | Each replica has its own lock — both can run `auto_assign_dispatcher` concurrently and assign the same `created` job to two different agents. |
-| `_pause_pending_job_ids: set[str]` | `orchestrator/main.py:391` | Pause requests in flight on replica A are invisible to replica B; B can re-preempt a job A is already pausing. |
-| `_thread_turn_locks: dict[(thread_id, turn_id), Lock]` | `orchestrator/main.py:10693` | Per-turn input serialization. Multi-tab POSTs to different replicas both win the local lock; double-turn races. |
-| `_thread_turn_inflight: dict[thread_id, int]` | `orchestrator/main.py:10694` | Same problem; the "is this turn already running" check is per-process. |
-| `_project_heal_locks: dict[project_id, Lock]` | `orchestrator/main.py:14623` | Two replicas can race on `ensure_project_folder` for the same project (mostly idempotent but logs warnings + duplicate cloud calls). |
-| `_knowledge_graph_db` (Neo4j client cache) | `orchestrator/main.py:15567` | Each replica gets its own driver. Not a correctness issue; just doubles the Neo4j connection pool. |
+| `_dispatch_lock` (asyncio.Lock) | `main.py:559`, acquired in `_try_dispatch_pending_jobs` `main.py:3733` | Each replica has its own lock; the dispatch query `get_dispatchable_jobs` (`postgres.py:2449`) has **no `FOR UPDATE SKIP LOCKED`**, so both replicas can assign the same `created` job to two agents. **The Layer-2 fix is unbuilt** (cron already demonstrates the pattern — see below). |
+| `imap_poll_loop` | `main.py:981` → `services/imap_poller.py` (`poll_once:118`, `_process_email:275`) | **Both replicas read the same mailbox.** Dedup (`message_exists_by_email_id`) is checked at the *start* of `_process_email`, and the message is marked seen only *after* the reply handler fires, with no row lock → two replicas both pass dedup and both route the email. Duplicate sudo approvals / duplicate thread replies. |
+| `delegation_timeout` handler | loop `main.py:8950`, logic `_check_delegation_timeouts` `main.py:8807` | Bare `SELECT ... WHERE status='waiting'`, no row lock/CAS before resuming the parent. Both replicas re-resume the parent (double-unblock). Child `cancel_job` is harmless; the parent resume is not. (Original draft flagged this "needs investigation" — **confirmed racy**.) |
+| `_thread_turn_locks: dict[(thread_id,turn_id), Lock]` | `main.py:15860` (helper `_ensure_thread_turn_lock` `main.py:15864`) | Per-turn input serialization. Multi-tab POSTs to different replicas both win the local lock → double-turn. The code comment at `main.py:15857` still explicitly assumes "Single-instance orchestrator." `thread_advisory_lock` does **not** cover this (it guards provisioning, not per-turn input). |
+| `_thread_turn_inflight: dict[thread_id,int]` | `main.py:15861` | Same problem; the "is this turn already running" 409 check is per-process. |
+| `_pause_pending_job_ids: set[str]` | `main.py:562` | Pause requests in flight on replica A are invisible to replica B; B can re-preempt a job A is already pausing. (Low severity.) |
+| `_over_quota_projects: frozenset[str]` | `main.py:1249`, rebound by the quota poll loop `_quota_poll_tick` `main.py:1336`, read by `is_project_over_quota` `main.py:1252` | **New since the original draft.** Only the replica running the quota poll loop has a fresh set; other replicas read a stale/empty frozenset and dispatch jobs for over-quota projects. Same class as `_thread_vm_ids`. Fixed by Layer 1 (singleton loop) + reading the gate from DB or via NOTIFY. |
+| `sudo_gate._pending_msgs: dict[req_id, nats.Msg]` | `services/sudo_gate.py:37` (set `:147`, popped `:186`/`:232`/`:290`) | **Downgraded from the original "agent waits forever."** The NATS reply subject is now persisted on the row (`sudo_approval_requests.nats_reply_subject`). Resolvers try the in-memory `respond()` fast-path first, then fall back to publishing on the persisted subject (`_nats_reply`, `sudo_gate.py:666-684`). On the wrong replica the in-memory lookup misses but the decision **still reaches the daemon** via the fallback publish. So this is a reliability/latency degradation, not a hang. Layer-3 cleanup = drop `_pending_msgs`, always publish on the subject. |
 
-### Push/pull channels with in-memory subscribers
+### UX divergence (degrades experience, no data corruption)
 
-| What | Where | What breaks |
+| What | Where (current) | What breaks |
 |---|---|---|
-| `notification_feed._user_queues: dict[user_id, list[asyncio.Queue]]` | `orchestrator/services/notification_feed.py:23` | SSE clients on replica B don't receive events emitted on replica A. Whichever replica handles the trigger event keeps the message to itself. |
-| `sudo_gate._sse_queues: list[asyncio.Queue]` | `orchestrator/services/sudo_gate.py:35` | Same problem for sudo-approval streams. |
-| `sudo_gate._pending_msgs: dict[req_id, nats.Msg]` | `orchestrator/services/sudo_gate.py:37` | A NATS reply landing on replica B can't find the original `respond()` handle stored on replica A. The agent waits forever. |
-| `persistent_ws_proxy` WS fan-out (`orchestrator/main.py:11370`) | (per-process) | The cockpit's persistent-chat WebSocket terminates on whichever replica it hit; if the agent pod's events route through a different orchestrator replica, the WS sees nothing. (Less of an issue once [[headless_persistent_sessions]] ships SSE: stream replay is from `thread_events` in Postgres, no in-process fan-out.) |
+| `notification_feed._user_queues: dict[user_id, list[Queue]]` | `services/notification_feed.py:23`; SSE endpoint `main.py:7304` | SSE clients on replica B don't receive events emitted on replica A. **New consumer:** `session.lifecycle` startup-progress events now ride this same channel (`services/session_lifecycle.py:38`), so the session-startup card stalls cross-replica too. |
+| `sudo_gate._sse_queues: list[Queue]` | `services/sudo_gate.py:35`; SSE endpoint `main.py:7521` | Same problem for the sudo-approval admin stream. |
+| `nats_bridge._thread_vm_ids: set[str]` | `services/nats_bridge.py:82` (populated `:246`, read `:437`/`:441`/`:467`/`:562`/`:567`) | Thread-vs-job routing memory; populated only on the replica that called `request_vm_create`. A VM-lifecycle message handled by a different replica mis-routes context to the jobs table instead of threads. |
+| NATS subscriptions without queue groups | `services/nats_bridge.py:163-192` (six subjects) | No `queue=` on any subscription → every replica receives every message and runs the handler. Subjects are now `orchestratorId`-scoped (`_subj`, `nats_bridge.py:98`), which separates distinct *installs*, not *replicas* of one install. |
+| Admin "reload" caches (`_experts_cache` `main.py:17763`, `_skills_cache` `main.py:18126`, `_settings_matrix_cache` `main.py:17829`) | per-process, busted via `POST .../reload` | A reload endpoint only busts the cache on the replica that served the request; other replicas serve stale catalogs until restart. Fan-out via NOTIFY (Layer 3) or they look broken at 2+. |
 
-### Background loops that would double-fire
+### Already safe (no action needed)
 
-All started in the `lifespan` handler at `orchestrator/main.py:2973`, registered around `3158-3222`:
+- **`persistent_ws_proxy` — REMOVED.** The original draft's biggest WS concern is gone. The cockpit WebSocket now terminates **directly on the agent pod** via a per-session K8s Service+Ingress (`/p/{thread_id}/ws`, URL minted at `routers/sessions.py:390`, built in `services/session_router.py`; see [[direct_session_websockets]]). The orchestrator is no longer in the WS data path, so there is no in-process WS fan-out state to coordinate. The only remaining `@app.websocket` route is the IDE proxy (`main.py:10190`).
+- **`_knowledge_graph_db` (Neo4j client cache)** `main.py:22976` — just a duplicated driver per replica. Not a correctness issue.
+- **`_project_heal_locks`** `main.py:21941` — two replicas can race `ensure_project_folder` for the same project, but the callsite re-reads `get_project` inside the lock (`main.py:22015`), so same-process doubles are caught; cross-replica is a rare, mostly-idempotent duplicate cloud call. (Track-2 Layer-2 cleans it up with a TTL column; not a `replicas: 2` blocker.)
+- **`_threads_suspending: set[str]`** `main.py:3347` — de-dupes concurrent suspend triggers; small cross-replica double-suspend window, low blast radius. Worth one line in the eventual leader-election pass.
+- **Per-service caches/locks** — `_pending_actions_cache` (5s TTL, `main.py:7100`), OpenCloud token/role caches, TTS single-flight locks, HTTP client pools. All correctly per-process.
 
-| Loop | File / line | Double-fire harm |
+### Background loops — double-fire audit (regenerated)
+
+The lifespan handler is now at `main.py:4866`; task registrations run `main.py:5191-5323` (shutdown awaits `5329-5355`), starting **27** long-lived tasks. The encouraging delta: **new loops were largely built HA-aware.**
+
+**Still double-fire (need Layer 1 leader election):**
+
+| Loop | Where | Harm |
 |---|---|---|
-| `auto_assign_dispatcher` | `main.py:2269` | Double-assigns jobs. Critical. |
-| `stale_agent_detector` | `main.py:394` | Idempotent DB writes (mark offline twice = same row), but `recover_orphaned_jobs` is racy with itself across replicas — two replicas could re-dispatch the same orphan to different agents. |
-| `agent_pool_reconciler` | `main.py:468` | Over-provisions pods (each replica thinks the pool is short by N). |
-| `lifecycle_reconciler_loop` | `main.py:497` | Double drift-detection; can double-drain. |
-| `workspace_idle_sweeper` | `main.py:574` | Double-suspend attempts. Largely idempotent but logs noise. |
-| `snapshot_gc_sweeper` | `main.py:606` | Idempotent if guarded by S3 ETag, but worth confirming. |
-| `imap_poll_loop` | `main.py:681` | **Both replicas read the same IMAP mailbox.** Each inbound email gets processed twice → duplicate sudo approvals / duplicate thread replies. |
-| `sudo_expiration_sweeper` | (registered `main.py:3163`) | Idempotent DB deletes. Safe. |
-| `thread_events` prune sweeper | (registered `main.py:3164`) | Idempotent. Safe. |
-| `delegation_timeout` handler | (registered `main.py:3172`) | Needs investigation; likely racy. |
-| `quiet_hours_digest_loop` | (registered `main.py:3171`) | Double-sends digest emails. |
-| `main_cloud_listen_task` | (registered `main.py:3222`) | Both replicas subscribe to the cloud-events stream and double-process. |
+| `auto_assign_dispatcher` | `main.py:4069` (core `:3720`) | Double-assigns jobs. **Critical.** |
+| `imap_poll_loop` | `main.py:981` / `imap_poller.py` | Duplicate email processing. **Critical.** |
+| `delegation_timeout_sweeper` | `main.py:8950` | Double parent-resume. |
+| `quiet_hours_digest_loop` | `main.py:933` (300s) | Double-sends digest emails. |
+| `stale_agent_detector` | `main.py:565` (60s) | The `UPDATE` is idempotent, but it calls `_trigger_dispatch()` → feeds the unguarded dispatcher. |
+| `agent_pool_reconciler` | `main.py:673` (60s) | Over-provisions pods / double-reaps. |
+| `lifecycle_reconciler_loop` | `main.py:702` (60s; managers `:5280-5314`) | Double drift-detect / double-drain. |
+| `thread_permission_notify_sweeper` | `main.py:16941` (30s) | Tight double-send window for permission emails (smaller IMAP-shaped race). |
 
-### NATS subscriptions
+**Idempotent / noisy-but-safe** (wrap for log clarity, not correctness): `workspace_idle_sweeper` (`main.py:779`, now reconcile-only), `snapshot_gc_sweeper` (`main.py:906`), `sudo_expiration_sweeper` (`main.py:730`), `thread_events_prune_sweeper` (`main.py:16342`), `quota_poll_loop` (`main.py:1376`, freeze writes idempotent), `litellm_sync_loop` (`litellm_gateway.py:984`), `code_server_settings_sweeper` (`main.py:818`), `ide_session_ttl_sweeper` (`main.py:754`), `attention_sleep_sweeper` (`main.py:17062`, CAS-guarded), `security_events_prune_sweeper` (`main.py:16394`), `cleanup_expired_tokens` (`main.py:5192`), `cleanup_expired_sessions` (`main.py:5195`).
 
-`nats_bridge.py` subscribes to `vm.lifecycle.status`, `agent.vm.*.register`, `agent.vm.*.heartbeat`, `agent.vm.*.status`. Without queue groups, every replica receives every message and runs the handler. The handlers are partially idempotent (DB updates) but `_thread_vm_ids: set[str]` (`nats_bridge.py:68`) diverges between replicas, breaking the thread-vs-job routing decision.
+**Already HA-safe by construction** (the proof that the patterns work in-repo):
 
-### Summary of the blast radius
+| Loop | Where | Guard |
+|---|---|---|
+| `cron_dispatcher_loop` | `services/cron_dispatcher.py:63` (claim `postgres.py:9335`) | `FOR UPDATE SKIP LOCKED`; docstring states "safe to run on multiple orchestrator replicas." |
+| `project_loop_sweeper` | `services/project_loop_sweeper.py:40` (claim `postgres.py:9295`) | Conditional-UPDATE CAS (`WHERE ... current_job_id=$2 AND status='running'`). |
+| audit `maintenance_loop` | `services/audit_partitions.py:436` | `pg_advisory_xact_lock(MAINT_LOCK_ID)` (`audit_partitions.py:167`). |
+| `workspace_metering_loop` | `services/workspace_metering.py:242` | Ledger `ON CONFLICT ... DO NOTHING` dedupe keys. |
+| `llm_usage_poll_loop` | `main.py:1414` | Same ledger dedupe key. |
 
-The dispatch double-assignment and the IMAP poll double-process are the two correctness bugs. Everything else is either idempotent (annoying but safe), or it's a "messages go to the wrong replica" issue that degrades UX without corrupting data. That asymmetry shapes the decision below.
+**Not a bug — intentional fan-out:** `main_cloud_listen_task` (`main.py:5321` → `services/cloud/reload.py:50`) is a `LISTEN/NOTIFY` config-reload task that is *meant* to run on every replica. The original draft wrongly listed it as a double-fire risk. It is the reference example of correct multi-replica behavior.
+
+## What already works (Track 1 safety, verified)
+
+These mechanics are why a single orchestrator already survives its own death without data loss — and why Track 1 is "harden + chaos-test" rather than "build."
+
+- **Job auto-pause on agent offline.** `recover_orphaned_jobs` (`postgres.py:2377-2435`) flips `processing` jobs whose agent is offline/missing back to `paused` and clears the assignment; the next dispatch picks them up. Invoked from `stale_agent_detector` (`main.py:649`). (The original draft loosely said "back to `paused`/`created`" — code sets `paused`.)
+- **Stale-agent detection.** `mark_stale_agents_offline` (`postgres.py:2350`) on a 60s loop marks agents offline after a **3-minute** heartbeat cutoff (the draft's "three heartbeats" is approximate). This is the mechanism the whole "survives a pod death" story rests on.
+- **Persistent session reattach (headless Phase 2 — SHIPPED).** The wire-level stream is written to the `thread_events` table (migration `0004_thread_events.sql`) **by the agent pod** (`src/api/persistent_app.py:2524`), not the orchestrator. The SSE replay endpoint `thread_event_stream` (`main.py:15993`) parses `Last-Event-ID` (`main.py:16017-16031`) and polls `thread_events` by `seq` (`main.py:16118-16147`) — it holds **no in-process subscriber list**. A reconnecting cockpit catches up after a bounce. (This checks off the original Layer-3 action item "confirm the SSE handler reads from DB.") One residual: the agent's `thread_events` write is best-effort fire-and-forget (`persistent_app.py:2552`), so a lost write means one missing `seq` in replay.
+- **Migration safety.** `pg_advisory_xact_lock` (`migrate.py:157`, constant `LOCK_ID`) means concurrent orchestrator startups can't double-apply migrations. Rolling `replicas: 2` is already safe at that layer.
+- **Atomic JSONB merges.** `merge_job_context` (`postgres.py:1424`) does `context = COALESCE(context,'{}'::jsonb) || $1::jsonb` in a single UPDATE; nested-key variants use `jsonb_set(...)`. Concurrent-writer-safe, as the draft claimed.
+
+## What already ships toward Track 2 (the patterns are proven)
+
+The single most important correction to the original draft: **most of the coordination machinery already exists**, applied to narrower problems. A `replicas: N` push is mostly generalizing proven code, not inventing it.
+
+| Primitive | Where | Lock scope | Maps to | Status |
+|---|---|---|---|---|
+| `thread_advisory_lock(thread_id)` | `postgres.py:2568-2586` (`pg_advisory_xact_lock`, blake2b-8 key); call sites `sessions.py:177`, `main.py:13080`, `main.py:15621`, `provision_or_assign.py:72` | xact | Layer 2 (per-thread serialization) | **Shipped.** Serializes provisioning/binding so `/prepare`, `/resume`, agent `/register` can't double-provision. Already cross-replica-correct. |
+| `FOR UPDATE SKIP LOCKED` work-queue | `cron_dispatcher.py` + `postgres.py:9335` (`fetch_next_due_cron_automation`) | xact row lock | Layer 2 (DB dispatch) | **Shipped & documented multi-replica-safe.** A complete working example of the dispatch pattern, applied to cron. Porting `auto_assign_dispatcher` is largely copying this shape. |
+| `LISTEN/NOTIFY` fan-out + `notify_channel()` helper | `services/cloud/reload.py` (loop `:50`, `fire_reload:163`); generic helper `postgres.py:8839-8856`; channel const `services/cloud/__init__.py:48` | n/a (pub/sub) | Layer 3 (cross-replica fan-out) | **Transport shipped.** Reconnecting out-of-pool LISTEN loop + a reusable, validated `notify_channel(channel, payload)`. Near-verbatim template for `notifications:<user_id>` / `sudo:<thread_id>`. |
+| Maintenance advisory locks | `audit_partitions.py:77` (`MAINT_LOCK_ID`), `migrate.py:21` (`LOCK_ID`) | xact | Layer 1 (singleton guard, partial) | **Shipped** as short DDL critical sections; both deliberately distinct (informal anti-collision). Not the long-lived *session*-scoped lease Layer 1 needs. |
+
+**The one genuinely missing primitive is Layer 1 leader election.** There is no `with_leader_lock`, no session-scoped `pg_advisory_lock`/`pg_try_advisory_lock`, no `leader_election.py`, no k8s Lease anywhere in `orchestrator/`. Every existing advisory lock is **xact-scoped** (released at COMMIT); leader election needs a **session-scoped** lock held for the loop's lifetime — a new pattern. It would build on the `migrate.py` lock template, the dedicated out-of-pool connection idiom already proven in `reload.py:82`, and the `shutdown_event` + `asyncio.wait_for` loop idiom every background loop already uses.
+
+> **Doc correctness fix:** earlier revisions referenced a constant `MIGRATION_LOCK_ID`. That identifier does not exist — the real constant is `LOCK_ID` (`migrate.py:21`).
 
 ## Decision: active-passive first, active-active as the roadmap
 
-There are two viable end-states. They differ by a lot of engineering effort.
+Unchanged, and the refresh reinforces it.
 
-**Active-passive (Track 1).** Single replica running, second replica is hot standby (or no standby; K8s replaces fast). The active pod runs every loop, holds every WS connection, owns the dispatch lock. On crash, Kubernetes spins up a replacement; the existing system mechanics (heartbeat-driven offline detection, orphan auto-pause, WS reconnect) absorb the gap. **Trade-off:** brief blackout during failover (~15-30s with tightened probes), throughput capped at one CPU.
+**Active-passive (Track 1).** Single replica running; K8s replaces it fast on crash. The existing recovery mechanics (heartbeat-driven offline detection, orphan auto-pause, SSE reconnect from `thread_events`) absorb the gap. **Trade-off:** brief blackout during failover (~15-30s with tightened probes), throughput capped at one CPU.
 
-**Active-active (Track 2).** Multiple replicas, all serving traffic. Background loops run on exactly one replica via leader election. Dispatch uses DB-level row locks. Cross-replica fan-out for SSE/WS/sudo via Postgres LISTEN/NOTIFY. NATS queue groups for one-message-one-consumer. **Trade-off:** real horizontal scale + zero-blackout failover, multi-week refactor of a dozen call sites.
+**Active-active (Track 2).** Multiple replicas, all serving traffic. Background loops run on one replica via leader election. Dispatch uses DB row locks. Cross-replica fan-out via `LISTEN/NOTIFY`. NATS queue groups for one-message-one-consumer. **Trade-off:** real horizontal scale + zero-blackout failover; but now mostly *generalizing shipped patterns* rather than the multi-week unknown the original draft assumed.
 
-**Chosen: ship Track 1, build Track 2 incrementally.** Track 1 is mostly probe tuning, a `PodDisruptionBudget`, and confirming the existing recovery paths actually work end-to-end under chaos. Track 2 lands as a sequence of independent PRs (leader election, then DB-level dispatch, then fan-out, then NATS) where each one improves correctness even before the full active-active goal is reached.
+**Chosen: ship Track 1, build Track 2 incrementally.** Track 1 is probe tuning, a `PodDisruptionBudget`, a `preStop` hook, and chaos-testing the existing recovery paths — still genuinely undone and the cheapest reliability win for the OSS release. Track 2 lands as independent PRs where each improves correctness even before full active-active.
 
-**Why not just skip to Track 2.** Track 1 captures 80% of the operational benefit (no all-day outages from a wedged pod) for 10% of the work. It also de-risks Track 2: by the time we have a working leader election and DB-level dispatch, we already have a battle-tested active-passive deployment, and flipping from `replicas: 1` to `replicas: 2` becomes a config change, not a feature.
+## Track 1 — Active-passive (P0) — NOT STARTED
 
-## Track 1 — Active-passive (P0)
+Single replica with fast, well-understood failover. Most of the work is verifying existing recovery paths under chaos. As of the refresh, **none of the deployment hardening exists.**
 
-Single replica with fast, well-understood failover. Most of the work is verifying existing recovery paths under chaos, not writing new code.
-
-### What's already working
-
-- **Job auto-pause on agent offline.** `recover_orphaned_jobs` (`postgres.py`) flips processing jobs whose agent missed three heartbeats back to `paused`. Dispatch picks them up on next loop. So a crashed orchestrator + the agents heartbeat-timing out + the new orchestrator dispatching = automatic recovery.
-- **Persistent session reattach.** [[headless_persistent_sessions]] (Phase 2) writes the wire-level event stream to `thread_events` before broadcasting. A reconnecting cockpit replays from `Last-Event-ID`. The orchestrator pod restarting drops the WS but the agent pod keeps running and keeps writing; reconnect after the bounce catches up.
-- **Migration safety.** `pg_advisory_xact_lock` (`migrate.py:157`) means concurrent orchestrator startups can't double-apply migrations. Two replicas during a rolling deploy is already safe at that layer.
-- **NATS reconnect.** `nats-py` reconnects on its own; durable consumers (where used) replay missed messages. The non-durable ones still drop messages during a bounce, but that's a Track 2 fix.
-
-### What needs to change
-
-| Change | Where | Effort |
+| Change | Where (Helm — the live path) | Effort |
 |---|---|---|
-| Tighten readiness probe to drain in-flight requests before pod termination. | `deployment/legacy/20-orchestrator.yaml:549` | 1h |
-| Add `terminationGracePeriodSeconds` + a `preStop` hook that sleeps long enough for the load balancer to deregister the endpoint. Pattern: 30s sleep, 60s grace. | same | 1h |
-| Add a `PodDisruptionBudget` with `minAvailable: 0` (since we run 1 replica, this is mostly documentation, but flips to `minAvailable: 1` for Track 2 trivially). | new file in `deployment/legacy/` | 30m |
-| Confirm liveness probe doesn't kill the pod during a long startup (migrations on a populated DB can take seconds). `initialDelaySeconds: 30` is current; verify with a populated DB. | `deployment/legacy/20-orchestrator.yaml:543` | 30m + test |
-| Move the four module-level Neo4j / DB caches behind `lifespan` startup so a SIGTERM cleanly closes them (currently they leak briefly during pod termination, which is harmless but ugly in logs). | `main.py:15567` and similar | 2h |
-| Chaos-test the failover end-to-end: `kubectl delete pod srw-orchestrator-...` while (a) a job is dispatching, (b) a sudo prompt is open, (c) a persistent session is mid-turn. Measure observable downtime. | manual / scripted | 1d |
+| Tighten readiness probe to drain in-flight requests before termination. | `helm/templates/orchestrator/deployment.yaml:1042-1047` (readiness: `/api/health:8085`, `initialDelaySeconds: 10`, `periodSeconds: 5`, no `timeout`/`failureThreshold`). | 1h |
+| Add `terminationGracePeriodSeconds` + a `preStop` hook (e.g. 30s sleep, 60s grace) so the LB deregisters the endpoint before SIGTERM. **None exists today** (no `lifecycle:` block at all). | `helm/templates/orchestrator/deployment.yaml` | 1h |
+| Add a `PodDisruptionBudget` for the orchestrator. **None exists** — mirror the existing `helm/templates/agent/pdb.yaml` pattern into a new `helm/templates/orchestrator/pdb.yaml`. `minAvailable: 0` while `replicas: 1`; flip to `1` for Track 2. | new `helm/templates/orchestrator/pdb.yaml` | 30m |
+| Verify the liveness probe doesn't kill the pod during a long startup (migrations on a populated DB). Current: `initialDelaySeconds: 30`, `periodSeconds: 10` (`deployment.yaml:1036-1041`). Note init containers (`deployment.yaml:26-56`: `wait-for-postgres`/`pgvector`/`auditdb`/`mongodb`/`gitea`/`keycloak`) already gate startup on the data tier. | same | 30m + test |
+| Move module-level singletons (`_knowledge_graph_db`, the cloud-service HTTP clients, `_ide_http_client`) behind `lifespan` startup so SIGTERM closes them cleanly. | `main.py:22976` and similar | 2h |
+| Chaos-test failover end-to-end: delete the orchestrator pod while (a) a job is dispatching, (b) a sudo prompt is open, (c) a persistent session is mid-turn. Measure observable downtime. | manual / scripted | 1d |
 
-Track 1 should land in under a week of focused work, mostly testing.
+Track 1 should land in under a week, mostly testing.
 
 ### What Track 1 explicitly does *not* fix
 
-- Per-pod connection load. One replica still holds every WebSocket; if the persistent-session count grows past a few hundred concurrent, the single pod starts to feel it.
-- IMAP double-poll if anyone ever sets `replicas: 2`. Track 1 keeps `replicas: 1` so this isn't a problem in production, but it's a foot-gun.
-- The 15-30s failover blackout. Acceptable for everyday operation; not acceptable for "zero-downtime deploy" or for users sensitive to dropped WS connections.
+- Per-pod connection load (one replica still holds every SSE stream and REST connection).
+- IMAP double-poll / dispatch double-assign if anyone sets `replicas: 2` — Track 1 keeps `replicas: 1` so it's not a production problem, but it's a foot-gun. **Do not bump replicas before Layer 1.**
+- The 15-30s failover blackout (acceptable for everyday operation, not for zero-downtime deploys).
 
 ## Track 2 — Active-active (P1, multi-phase)
 
-Three layers of work, each independently shippable. The order matters: leader election first, then DB-level coordination, then cross-replica fan-out.
+Order unchanged: leader election → DB coordination → fan-out → NATS. The refresh annotates each layer with how much is already built.
 
-### Layer 1: Leader election for singleton loops
+### Layer 1: Leader election for singleton loops — GREENFIELD (the unlock)
 
-The cheapest, most-impactful change. Most of the background loops are not stateless — they shouldn't run on every replica even if we wanted to. Wrap each loop in a leader-election guard.
+The cheapest, most-impactful change, and **the single primitive that makes `replicas: N` safe** (Open Question #7). Wrap each background loop in a leader-election guard so only one replica runs it.
 
-**Primitive: Postgres advisory locks.** Already used in `migrate.py`; no new infra. Each singleton loop holds a session-scoped advisory lock on a unique integer key for its lifetime. If the lock is taken, the loop sleeps and re-tries to acquire periodically (say every 30s). On the leader's death, its session closes, the lock releases, a follower takes over within 30s.
+**Primitive: session-scoped Postgres advisory locks.** Each singleton loop holds a session-scoped advisory lock on a unique integer key for its lifetime. If taken, the loop sleeps and re-tries (~30s). On the leader's death its session closes, the lock releases, a follower takes over within ~30s.
 
 ```python
 async def with_leader_lock(name: str, loop_id: int, run: Callable[[], Awaitable[None]],
                            shutdown_event: asyncio.Event) -> None:
     while not shutdown_event.is_set():
-        async with db_pool.acquire() as conn:
+        async with db_pool.acquire() as conn:               # dedicated conn, cf. reload.py:82
             got = await conn.fetchval("SELECT pg_try_advisory_lock($1)", loop_id)
             if got:
                 logger.info(f"[{name}] acquired leadership")
                 try:
-                    await run()  # runs until shutdown_event or conn dies
+                    await run()                              # runs until shutdown or conn dies
                 finally:
                     await conn.execute("SELECT pg_advisory_unlock($1)", loop_id)
-                    logger.info(f"[{name}] released leadership")
             else:
-                logger.debug(f"[{name}] not leader, sleeping")
                 try:
                     await asyncio.wait_for(shutdown_event.wait(), timeout=30.0)
                 except asyncio.TimeoutError:
@@ -168,230 +250,203 @@ async def with_leader_lock(name: str, loop_id: int, run: Callable[[], Awaitable[
 ```
 
 Key properties:
+- **Session-scoped** (`pg_advisory_lock`, *not* `pg_advisory_xact_lock` — note all current uses are xact-scoped, so this is a new pattern): the lock lives as long as the session. On OOM/partition it releases when Postgres reaps the dead connection.
+- **No fencing token needed** here: the loops are coarse (30-60s) and the underlying ops are idempotent (Track 1's safety carries through), so a worst-case "two leaders for 30s during a partition" is recoverable.
+- **Stable lock IDs.** Build the registry the draft asked for. Two fixed constants exist today (`LOCK_ID` = `0x5352575F4D4947` "SRW_MIG", `MAINT_LOCK_ID` = `0x5352575F41554454` "SRW_AUDT") plus the dynamic `thread_advisory_lock` hash family — collect them into one module and never collide.
 
-- **Session-scoped lock** (not transaction-scoped): the lock lives as long as the Postgres session does. If the pod is OOM-killed or network-partitioned, the lock releases when Postgres reaps the dead connection (TCP keepalive + `idle_session_timeout`).
-- **No fencing token needed** at this layer: the loops are coarse (30-60s tick rate), and the worst-case "two leaders for 30 seconds during a partition" is recoverable because the underlying DB operations are idempotent (Track 1's existing safety carries through).
-- **Stable lock IDs.** Allocate a registry of `(name, id)` pairs in a constants module; never reuse, never collide with the migration lock (`MIGRATION_LOCK_ID`).
+Loops to wrap (singletons): `auto_assign_dispatcher`, `imap_poll_loop`, `delegation_timeout_sweeper`, `quiet_hours_digest_loop`, `stale_agent_detector`, `agent_pool_reconciler`, `lifecycle_reconciler_loop`, the `_over_quota_projects` quota poll, `thread_permission_notify_sweeper`. Idempotent sweepers can be wrapped for log clarity. The already-HA-safe loops (`cron_dispatcher`, `project_loop_sweeper`, audit maintenance, metering) **must not** be wrapped — they're designed to run everywhere.
 
-Loops to wrap:
+**Alternatives considered (not chosen):** Kubernetes Lease objects (extra RBAC + client lib; advisory locks reuse infra we have and "Postgres down ⇒ orchestrator down" anyway), Redis `SET NX PX` (no Redis), etcd/Consul (extra infra). Postgres-first.
 
-- `auto_assign_dispatcher` — singleton. (Even with DB-level dispatch from Layer 2, having only one dispatcher running reduces useless DB traffic.)
-- `stale_agent_detector`, `agent_pool_reconciler`, `lifecycle_reconciler_loop` — singletons.
-- `imap_poll_loop` — singleton (closes the duplicate-email correctness bug).
-- `quiet_hours_digest_loop` — singleton.
-- `workspace_idle_sweeper`, `snapshot_gc_sweeper`, `thread_events_prune`, `sudo_expiration_sweeper` — all idempotent; wrapping is "cleanliness" not "correctness." Wrap them anyway for log clarity.
-- `delegation_timeout` handler — investigate, then wrap.
+### Layer 2: DB-level job dispatch — PATTERN PROVEN, dispatcher not ported
 
-Time-bounded loops (per-request side effects fired via `asyncio.create_task`) are *not* wrapped; they're per-request work, not background loops.
-
-**Alternatives considered (not chosen):**
-
-- **Kubernetes Lease objects.** The k8s-native pattern, used by cert-manager and similar. Pros: no Postgres dependency for leadership; survives a Postgres outage. Cons: requires RBAC plumbing, an extra k8s client library, and we'd have to thread the lease holder identity through every loop. Postgres advisory locks reuse infra we already have and "Postgres is down" implies the orchestrator is down anyway.
-- **Redis with `SET NX PX`.** Same shape as advisory locks but requires Redis, which we don't run. No-go.
-- **etcd / Consul.** Same objection: extra infra. We are Postgres-first.
-
-### Layer 2: DB-level job dispatch
-
-`_dispatch_lock` becomes unnecessary. Replace with `SELECT ... FOR UPDATE SKIP LOCKED` on the jobs query.
-
-Today's pattern (`auto_assign_dispatcher` around `main.py:2269`):
-
-```python
-async with _dispatch_lock:
-    candidates = await postgres_db.list_dispatchable_jobs()
-    for job in candidates:
-        ...
-```
-
-New pattern:
+`_dispatch_lock` becomes unnecessary. Replace the candidate scan with `SELECT ... FOR UPDATE SKIP LOCKED` — **exactly what `fetch_next_due_cron_automation` (`postgres.py:9335`) already does for cron.** Copy that shape onto `get_dispatchable_jobs` (`postgres.py:2449`):
 
 ```sql
--- inside a single transaction per dispatch attempt:
 SELECT id, ... FROM jobs
-WHERE status IN ('created', 'paused')
-  AND assigned_agent_id IS NULL
+WHERE status IN ('created','paused') AND assigned_agent_id IS NULL
 ORDER BY created_at
 FOR UPDATE SKIP LOCKED
 LIMIT 1;
--- ... match an agent, update assigned_agent_id ...
-COMMIT;
+-- match an agent, set assigned_agent_id, COMMIT
 ```
 
-`SKIP LOCKED` is the canonical Postgres pattern for distributed work queues (used by `graphile-worker`, `pgmq`, Sidekiq's Postgres adapter). Two replicas running the dispatcher will each grab a different row; neither will see the other's locked row until commit.
+- `_pause_pending_job_ids` → a `jobs.pause_requested_at` column (or `pause_requests` table); the initiator marks the row, dispatch respects the marker.
+- `_thread_turn_locks`/`_thread_turn_inflight` → either a `threads.in_flight_turn_id` column with a conditional `UPDATE ... WHERE in_flight_turn_id IS NULL RETURNING ...` (one replica gets the row → 200, the other → 409), **or** reuse the already-shipped `thread_advisory_lock` (it currently guards provisioning, not per-turn input — extend it). The advisory-lock route is less new code.
+- `_project_heal_locks` → a `projects.heal_in_progress_until` TTL column.
 
-Same pattern for `_pause_pending_job_ids`: replace with a `jobs.pause_requested_at` column or a dedicated `pause_requests` table; the pause initiator marks the row, anyone reading dispatch candidates respects the marker.
+### Layer 3: Cross-replica fan-out — TRANSPORT SHIPPED, WS half moot
 
-`_thread_turn_locks` becomes a `threads.in_flight_turn_id` column (nullable, set/cleared atomically with `UPDATE ... WHERE in_flight_turn_id IS NULL OR in_flight_turn_id = $1 RETURNING ...`). Multi-tab POST races land cleanly: one replica's UPDATE returns a row, the other's returns nothing → 409.
+The instance-local queues (`notification_feed._user_queues`, `sudo_gate._sse_queues`, `sudo_gate._pending_msgs`) need to deliver events emitted on any replica to subscribers on any replica. **The mechanism already exists** (`notify_channel()` + the `reload.py` LISTEN loop); the work is generalizing it.
 
-`_project_heal_locks` becomes a `projects.heal_in_progress_until` timestamp column with a TTL; nobody else attempts heal until the timestamp passes. Idempotent in practice but cleaner under load.
+- `notification_feed` (carries `new_message`/`reply_delivered`/`session.lifecycle`) → write to a `user_events` table, `NOTIFY notifications:<user_id>`; SSE handler reads the table on connect, then LISTENs. Generalize `run_listen_loop` from the single hard-coded `RELOAD_CHANNEL` to per-subscriber channels.
+- `sudo_gate._sse_queues` → same pattern on `sudo:<thread_id>`.
+- `sudo_gate._pending_msgs` → **mostly done.** The `nats_reply_subject` column already exists and the fallback publish already works cross-replica. Remaining: delete `_pending_msgs` and always publish on the persisted subject. (Caveat to verify first: confirm the daemon-side sudo client listens on the deterministic published subject, not a NATS auto-inbox.)
+- Persistent-session WS/SSE — **already done.** `thread_events` SSE (`main.py:15993`) is stateless on the orchestrator; the WS proxy is gone (direct-to-agent-pod). No work.
 
-### Layer 3: Cross-replica fan-out for SSE / WS / sudo
+`LISTEN/NOTIFY` scaling caveat (from [[headless_persistent_sessions]]): don't use it for high-volume streams. Fine for these channels (a few hundred sudo prompts/day, a few thousand notifications/user/day). The hot path (`thread_events`) is already DB-write + agent-pod, not orchestrator fan-out.
 
-The instance-local queues (`notification_feed._user_queues`, `sudo_gate._sse_queues`, `sudo_gate._pending_msgs`) all need to deliver events emitted on any replica to subscribers on any replica.
+### Layer 4: NATS queue groups — GREENFIELD but trivial
 
-**Primary mechanism: Postgres `LISTEN/NOTIFY` for low-volume channels.** Each instance LISTENs on `notifications:<user_id>`, `sudo:<thread_id>`, etc. When any replica needs to fan out, it NOTIFIES. Postgres delivers to all listening sessions.
-
-Important constraint, learned from [[headless_persistent_sessions]] decision log: `LISTEN/NOTIFY` does not scale to high-volume streams (Recall.ai documented the commit-serializing lock). It's fine for the channels here — at most a few hundred sudo prompts per day, a few thousand notification events per user per day. The hot path is `thread_events`, and that one already uses in-pod pub/sub via the agent pod (not the orchestrator), so it's not affected.
-
-**Stream subscribers:**
-
-- `notification_feed` — replace in-process queue with: write the event to a `user_events` table, then `NOTIFY notifications:<user_id>`. SSE handler reads from the table on connect, then LISTENs for new ids.
-- `sudo_gate._sse_queues` — same pattern.
-- `sudo_gate._pending_msgs` — the NATS reply problem. Resolution: when the agent inserts an open sudo request, store the NATS reply subject on the row (`sudo_approval_requests.nats_reply_subject`). When the request is resolved, *any* replica can publish on that subject, no need for `_pending_msgs`.
-- Persistent-session WS / SSE — already structured for this via [[headless_persistent_sessions]] Phase 2 (`thread_events` in Postgres; agent pod is source of truth). The orchestrator-side WS proxy stays a thin forwarder; no in-process state to coordinate. Action item: confirm SSE handler reads `thread_events` from DB rather than holding an in-process subscriber list (Phase 2 design says yes).
-
-### Layer 4: NATS queue groups
-
-Each subscription that today is "broadcast to every consumer" becomes a queue-group subscription so exactly one orchestrator instance receives each message.
+Each broadcast subscription in `nats_bridge.py:163-192` becomes a queue-group subscription so exactly one replica receives each message:
 
 ```python
-# Before:
-await nc.subscribe("vm.lifecycle.status", cb=handle_status)
-# After:
-await nc.subscribe("vm.lifecycle.status", queue="orchestrator", cb=handle_status)
+await nc.subscribe(self._subj("vm.lifecycle.status"), queue="orchestrator", cb=handle_status)
 ```
 
-The agent.vm.* subjects similarly join the `orchestrator` queue group. Messages that need to fan out to all replicas (rare — none identified today) explicitly skip the queue group.
-
-`_thread_vm_ids` set goes away — it was a routing optimization; now the handler looks up routing in Postgres on every message. ~5ms latency penalty per message, acceptable.
+All six subjects (`vm.lifecycle.status`, `agent.vm.*.register/heartbeat/status`, `sudo.request.>`, `session.events.>`) join the `orchestrator` queue group. `_thread_vm_ids` (`nats_bridge.py:82`) goes away — replace with a Postgres lookup per message (~5ms, acceptable). Note: the existing `orchestratorId` subject scoping is orthogonal — it separates installs; queue groups separate replicas within one install.
 
 ## Coordination primitives summary
 
-A small, opinionated set:
-
-| Need | Mechanism | Notes |
+| Need | Mechanism | Status |
 |---|---|---|
-| Singleton background loop | Postgres advisory lock (session-scoped) | Reuses migration infra; 30s failover window. |
-| Distributed job dispatch | `SELECT ... FOR UPDATE SKIP LOCKED` | Industry-standard for Postgres work queues. |
-| Per-turn / per-project serialization | DB column with conditional UPDATE | No lock service needed. |
-| Cross-replica fan-out (low volume) | Postgres `LISTEN/NOTIFY` | Don't use for `thread_events` (high volume). |
-| Cross-replica fan-out (high volume) | Already done via DB write + agent-pod pub/sub | [[headless_persistent_sessions]] Phase 2. |
-| One-message-one-consumer (NATS) | Queue groups | One-line change per subscription. |
+| Singleton background loop | Session-scoped Postgres advisory lock | **Greenfield** (xact-scoped locks exist; session-scoped is new) |
+| Distributed job dispatch | `SELECT ... FOR UPDATE SKIP LOCKED` | **Proven** (cron); port the job dispatcher |
+| Per-turn / per-thread serialization | `thread_advisory_lock` or a DB column | **Shipped** for provisioning; extend to per-turn |
+| Cross-replica fan-out (low volume) | `LISTEN/NOTIFY` + `notify_channel()` | **Transport shipped**; generalize channels |
+| Cross-replica fan-out (high volume) | DB write + agent-pod (`thread_events` SSE) | **Shipped** |
+| One-message-one-consumer (NATS) | Queue groups | **Greenfield**, one line per subscription |
 
-Notice what's not on this list: Redis, etcd, Zookeeper, Temporal. We are Postgres-and-NATS-only.
+Still nothing exotic: Postgres + NATS only. No Redis, etcd, Zookeeper, Temporal.
 
 ## What stays untouched
 
-- **The 180 REST endpoints.** All stateless requests against the DB. They work today behind a load balancer; nothing to change.
-- **Migrations.** Already concurrency-safe (`migrate.py:157`).
-- **Authentication.** Keycloak OIDC is stateless per request; MCP tokens are DB-backed. No session affinity required.
-- **JSONB atomic merges.** `merge_job_context` and similar (`orchestrator/database/postgres.py`) already handle concurrent writers via `jsonb_set() || $1::jsonb` patterns.
+- **The REST endpoints.** Stateless requests against the DB; work behind a load balancer today.
+- **Migrations.** Concurrency-safe (`migrate.py:157`).
+- **Authentication.** Keycloak OIDC stateless per request; cookie-BFF sessions and MCP tokens are DB-backed. No session affinity required.
+- **JSONB atomic merges.** Already handle concurrent writers.
+- **WebSocket routing.** Already solved by direct-to-agent-pod ingress; no sticky sessions, no orchestrator-side WS state.
 
 ## Out of scope
 
-- **Database HA.** This feature assumes Postgres is HA-managed separately (managed Postgres, Patroni, etc.). Multi-orchestrator with single-Postgres still has a single point of failure at the DB layer; that's a separate problem to solve.
-- **Sharding by tenant or user.** Premature at our scale. The system is small enough that horizontal scaling per orchestrator pod (Layer 1-4 above) is sufficient for the foreseeable future.
-- **Cross-region / multi-cluster active-active.** Single-cluster only. Multi-region would require careful thought about Postgres write coordination across regions and is well past current need.
-- **Per-replica observability isolation.** All replicas log to the same stream; identifying which replica handled a request is via the pod name in log lines. Sufficient.
-- **Worker (agent) HA.** Agents are already horizontally scaled (the auto-assign dispatcher is the load balancer for them). This feature is orchestrator-only.
-- **MCP server HA.** Bolted into the same process as the orchestrator (`orchestrator/mcp/`). If the orchestrator is HA, the MCP server is HA. No separate work.
-- **WebSocket sticky-session routing.** The headless-persistent-sessions design eliminates the need for sticky sessions on the orchestrator side. We do not add a sticky-session ingress as part of this feature.
+- **Database HA.** Assumed handled separately (CloudNativePG, etc.) — see [[high_availability_setup]] Priority 1. Multi-orchestrator over single-Postgres still has a DB SPOF.
+- **NATS HA.** Single-replica today with clustering *explicitly disabled* (`helm/templates/nats/configmap.yaml:32-33`). Matters more once orchestrator goes multi-replica — [[high_availability_setup]] Priority 2.
+- **Sharding by tenant/user.** Premature; "more identical replicas in front of one DB" suffices for the foreseeable future.
+- **Cross-region / multi-cluster.** Single-cluster only.
+- **Worker (agent) HA.** Agents are already horizontally scaled; the dispatcher is their load balancer.
+- **MCP server HA.** Separate Deployment (`helm/templates/mcp/deployment.yaml`), already scalable via `mcp.replicas`; stateless per request.
+- **vm-controller HA.** Singleton by design (NATS consumer, hardcoded `replicas: 1`); leader election would be the fix, same pattern as Layer 1.
 
 ## Open questions
 
-1. **Leader handoff during loop work.** If `auto_assign_dispatcher` is holding the lock and starts a dispatch cycle, and the pod gets SIGTERM mid-cycle, the lock releases on connection close — but the in-flight dispatch might leave partial state. The DB transaction around `SKIP LOCKED` makes this safe for dispatch specifically; verify the same for the other loops, or add explicit checkpoint logic.
-2. **Lease duration for stale-agent detection.** Today the loop runs every 60s; with 30s leader-election failover, a worst-case detection delay grows from 60s to 90s. Probably fine; worth confirming against SLO.
-3. **`LISTEN/NOTIFY` payload size limits.** Postgres caps NOTIFY payloads at 8000 bytes. We use them for IDs only, so this is fine, but document the constraint so future work doesn't grow the payload.
-4. **Probe behavior during DB outage.** Liveness probe today returns 200 if the HTTP handler runs at all. Should it require a DB ping? Track 2 makes this more sensitive: a replica that can't reach Postgres can't acquire leadership, so it should fail readiness so the load balancer routes around it.
-5. **Failover latency during deploy.** Rolling deploy with `replicas: 2` and `maxUnavailable: 0` gives zero-downtime in steady state. But during the deploy, the new replica starts up, tries to acquire leader locks held by the old replica, waits 30s, and finally takes over after the old replica drains. Acceptable; document the expected behavior.
-6. **Should the dispatcher have a tighter loop than 30s during high load?** With DB-level dispatch (Layer 2), a NOTIFY-on-job-insert can wake the dispatcher immediately. Worth a follow-up; doesn't block initial Track 2.
-7. **Active-active during a Track 2 partial roll-out.** If Layer 1 ships but Layer 2 doesn't, can we run `replicas: 2`? No — `_dispatch_lock` is still per-process. The leader-election wrap makes the dispatcher singleton, so functionally we can: only one replica's dispatcher runs at a time even with `replicas: 2`. Worth being explicit that Layer 1 alone is the unlock for `replicas: N`, with Layer 2-4 as scaling/correctness improvements.
+1. **Leader handoff mid-cycle.** A loop holding the lock that gets SIGTERM mid-cycle releases on connection close, but in-flight work may leave partial state. The `SKIP LOCKED` transaction makes dispatch safe; verify the other loops or add checkpointing.
+2. **Stale-agent detection latency.** 60s loop + 30s leader failover → worst-case detection 90s. Probably fine; confirm against SLO.
+3. **`LISTEN/NOTIFY` payload limit (8000 bytes).** We send IDs only; document so future work doesn't grow the payload.
+4. **Probe behavior during DB outage.** A replica that can't reach Postgres can't acquire leadership and should fail readiness so the LB routes around it. Track 2 should make readiness DB-aware.
+5. **Failover latency during deploy.** Rolling `replicas: 2`, `maxUnavailable: 0` → zero-downtime steady state; during deploy the new replica waits ~30s for leader locks held by the draining old replica. Acceptable; document.
+6. **Dispatcher wake latency.** With DB-level dispatch, a `NOTIFY`-on-job-insert can wake the dispatcher immediately (`_trigger_dispatch` already exists in-process). Follow-up; doesn't block Track 2.
+7. **`replicas: 2` after Layer 1 only.** **Yes** — leader election makes every loop singleton, so even at `replicas: 2` only one dispatcher/IMAP-poller runs. Layer 1 alone is the unlock; Layers 2-4 are scaling/correctness improvements. *(Confirmed still true at refresh — no leader-election code exists yet, so this remains the gating item.)*
+8. **(New) Daemon-side sudo reply subject.** Before deleting `_pending_msgs`, confirm the sudo daemon listens on the deterministic published `nats_reply_subject`, not a connection-bound `_INBOX.>` auto-inbox.
 
 ## Implementation phases
 
-Each phase is independently shippable. They're ordered so each one improves operational posture even if the next never lands.
+Each phase independently shippable, ordered so each improves posture even if the next never lands.
 
-### Phase 0 — Track 1: Active-passive failover hardening
-
-- [ ] Tighten readiness probe + add `preStop` hook + `terminationGracePeriodSeconds` in `deployment/legacy/20-orchestrator.yaml`.
-- [ ] Add `PodDisruptionBudget`. Document expected failover latency.
-- [ ] Move module-level singletons (`_knowledge_graph_db`, the various dicts) behind `lifespan` startup so SIGTERM closes them cleanly.
+### Phase 0 — Track 1: Active-passive failover hardening — NOT STARTED
+- [ ] Tighten readiness probe + add `preStop` hook + `terminationGracePeriodSeconds` in `helm/templates/orchestrator/deployment.yaml`.
+- [ ] Add `helm/templates/orchestrator/pdb.yaml` (mirror `agent/pdb.yaml`). Document expected failover latency.
+- [ ] Move module-level singletons behind `lifespan` startup for clean SIGTERM.
 - [ ] Chaos test: delete the pod under load; measure user-visible downtime.
-- [ ] Document the failover behavior in `docs/operations/orchestrator_failover.md`.
+- [ ] Document failover behavior in `docs/operations/orchestrator_failover.md`.
 
-### Phase 1 — Track 2 Layer 1: Leader election
+### Phase 1 — Track 2 Layer 1: Leader election — GREENFIELD
+- [ ] `orchestrator/services/leader_election.py` with `with_leader_lock(name, loop_id, run, shutdown_event)` using **session-scoped** `pg_try_advisory_lock`.
+- [ ] Lock-ID registry module collecting `LOCK_ID`, `MAINT_LOCK_ID`, and new loop IDs (never collide).
+- [ ] Wrap every singleton loop registered at `main.py:5191-5323`; leave the already-HA-safe loops alone.
+- [ ] Log "leader changed" at INFO.
+- [ ] Tests: two orchestrators / one DB; exactly one runs each loop; kill the leader; follower takes over within 30s.
+- [ ] **Unlock:** `replicas: 2` becomes safe here.
 
-- [ ] `orchestrator/services/leader_election.py` with `with_leader_lock(name, loop_id, run, shutdown_event)`.
-- [ ] Lock-ID registry in `orchestrator/constants.py` (or similar) — never collide with `MIGRATION_LOCK_ID`.
-- [ ] Wrap every loop registered in `lifespan` at `main.py:3158-3222`.
-- [ ] Log "leader changed" events at INFO level for observability.
-- [ ] Tests: spin up two test orchestrators against the same DB; verify exactly one runs each loop; kill the leader; verify the follower takes over within 30s.
-- [ ] **Unlock:** `replicas: 2` becomes safe at this point (background-loop correctness is preserved; in-process state divergence still exists but is per-process state that doesn't need to be coordinated).
+### Phase 2 — Track 2 Layer 2: DB-level coordination — PORT THE PROVEN PATTERN
+- [ ] Port `get_dispatchable_jobs` to `FOR UPDATE SKIP LOCKED` (model on `fetch_next_due_cron_automation`); remove `_dispatch_lock`.
+- [ ] Migration: `jobs.pause_requested_at`, `threads.in_flight_turn_id` (or extend `thread_advisory_lock`), `projects.heal_in_progress_until`.
+- [ ] Remove `_pause_pending_job_ids`, `_thread_turn_locks`, `_thread_turn_inflight`, `_project_heal_locks`, `_over_quota_projects` (read the gate from DB).
+- [ ] Tests: two replicas racing one job → one assignment; racing one turn → one 200 + one 409.
 
-### Phase 2 — Track 2 Layer 2: DB-level coordination
-
-- [ ] Replace `_dispatch_lock` + in-memory job-candidate scan with `SELECT ... FOR UPDATE SKIP LOCKED`.
-- [ ] Migration: add `jobs.pause_requested_at`, `threads.in_flight_turn_id`, `projects.heal_in_progress_until`.
-- [ ] Migration: add `sudo_approval_requests.nats_reply_subject` (Layer 3 needs this).
-- [ ] Remove `_pause_pending_job_ids`, `_thread_turn_locks`, `_thread_turn_inflight`, `_project_heal_locks`.
-- [ ] Tests: two replicas racing on the same job → exactly one assignment; two replicas racing on the same turn → one 200, one 409.
-
-### Phase 3 — Track 2 Layer 3: Cross-replica fan-out
-
-- [ ] `notification_feed` reads + LISTENs against `user_events` instead of in-process queue.
+### Phase 3 — Track 2 Layer 3: Cross-replica fan-out — GENERALIZE SHIPPED TRANSPORT
+- [ ] Generalize `run_listen_loop`/`notify_channel` to per-subscriber channels; back `notification_feed` (incl. `session.lifecycle`) with `user_events` + NOTIFY.
 - [ ] `sudo_gate._sse_queues` → DB-backed with NOTIFY.
-- [ ] `sudo_gate._pending_msgs` → NATS reply subject stored on `sudo_approval_requests`; resolution publishes from any replica.
-- [ ] Confirm SSE handler in [[headless_persistent_sessions]] Phase 2 reads `thread_events` from DB (no in-process subscriber list).
-- [ ] Tests: emit a notification on replica A; verify SSE client on replica B receives it. Open sudo on replica A; resolve via REST hitting replica B; verify the agent (NATS-bound) gets the response.
+- [ ] Delete `sudo_gate._pending_msgs`; always publish on the persisted `nats_reply_subject` (after Open Question #8).
+- [ ] (Already done: SSE reads `thread_events` from DB — no work.)
+- [ ] Tests: emit on replica A → SSE client on replica B receives; resolve sudo via REST on replica B → NATS-bound agent gets the decision.
 
-### Phase 4 — Track 2 Layer 4: NATS queue groups
-
-- [ ] Audit every `nc.subscribe(...)` in `nats_bridge.py`; add `queue="orchestrator"` where one-of-N delivery is desired.
-- [ ] Remove `_thread_vm_ids`; replace with Postgres lookup on each message.
-- [ ] Tests: two replicas connected to NATS; publish a status message; verify exactly one replica processes it.
+### Phase 4 — Track 2 Layer 4: NATS queue groups — GREENFIELD/TRIVIAL
+- [ ] Add `queue="orchestrator"` to the six subscriptions in `nats_bridge.py:163-192`.
+- [ ] Remove `_thread_vm_ids`; replace with a Postgres lookup per message.
+- [ ] Tests: two replicas on NATS; publish a status message; exactly one processes it.
 
 ### Phase 5 — Operational polish
-
-- [ ] Per-replica liveness/readiness that includes DB ping (Open Question #4).
-- [ ] Tighten dispatcher loop with NOTIFY-on-insert wake-up (Open Question #6).
-- [ ] Bump `replicas: 2` in production. Watch for a deploy cycle; declare done.
+- [ ] DB-aware liveness/readiness (Open Question #4).
+- [ ] `NOTIFY`-on-insert dispatcher wake-up (Open Question #6).
+- [ ] Bump `orchestrator.replicas: 2` in `helm/values.yaml` (or the Fleet `values-experimental.yaml` override). Watch a deploy cycle; declare done.
 
 ## ADR: alternatives considered, not adopted
 
-- **Temporal for orchestration.** Battle-tested durable execution. Same argument as [[headless_persistent_sessions]]'s ADR: requires a separate cluster + worker SDK, multi-week migration. Postgres advisory locks + `SKIP LOCKED` cover the failure modes Temporal would address (loop crash mid-cycle, partial state). Worth revisiting only if we outgrow Postgres for coordination.
-- **Kubernetes Lease API.** Cleaner conceptually (k8s-native, no Postgres dependency). Rejected because (a) we already have the Postgres dependency for everything else, so adding leases is net-positive complexity not net-negative; (b) advisory locks have lower failover latency (30s vs. lease-renewal interval, typically 15-30s anyway); (c) testing leases requires k8s integration tests, while advisory locks test cleanly with a Postgres testcontainer.
-- **Redis Sentinel / Cluster for fan-out.** Common pattern in industry. Rejected because we don't run Redis and Postgres `LISTEN/NOTIFY` is sufficient at our volume. If the orchestrator's notification load ever exceeds what `LISTEN/NOTIFY` can serve (the Recall.ai write-up estimates degradation at thousands of NOTIFY/sec under writer contention), we add Redis as a follow-up — not before.
-- **Sticky-session ingress for WebSockets.** A common quick-fix for stateful WS protocols. Unnecessary once the source-of-truth for stream events is `thread_events` in Postgres ([[headless_persistent_sessions]] Phase 2); the orchestrator-side WS proxy is then a thin DB reader, and any replica can serve any subscriber.
-- **Sharding by user / tenant.** Premature. The cleanest scaling path for our workload is "more identical replicas in front of one DB" until that ceiling actually shows up in metrics.
+- **Temporal for orchestration.** Requires a separate cluster + worker SDK, multi-week migration. Postgres advisory locks + `SKIP LOCKED` cover the failure modes; the refresh shows both are already in production for cron/provisioning. Revisit only if we outgrow Postgres for coordination.
+- **Kubernetes Lease API.** Cleaner conceptually, but we already depend on Postgres for everything; advisory locks have lower failover latency and test cleanly with a Postgres testcontainer.
+- **Redis Sentinel/Cluster for fan-out.** We don't run Redis; `LISTEN/NOTIFY` is sufficient at our volume (and already shipped). Add Redis only if NOTIFY throughput becomes a bottleneck.
+- **Sticky-session ingress for WebSockets.** Moot — the WS path is direct-to-agent-pod and the stream source-of-truth is `thread_events` ([[direct_session_websockets]], [[headless_persistent_sessions]]).
+- **`threads.in_flight_turn_id` column vs. `thread_advisory_lock`.** The shipped advisory lock already serializes per-thread provisioning; extending it to per-turn input is less new code than a new column + conditional UPDATE. Either works; lean on the shipped primitive.
 
 ## Related code
 
-- `orchestrator/main.py:388` — `_dispatch_lock`.
-- `orchestrator/main.py:391` — `_pause_pending_job_ids`.
-- `orchestrator/main.py:394-465` — `stale_agent_detector`.
-- `orchestrator/main.py:468-495` — `agent_pool_reconciler`.
-- `orchestrator/main.py:497-572` — `lifecycle_reconciler_loop`.
-- `orchestrator/main.py:574-604` — `workspace_idle_sweeper`.
-- `orchestrator/main.py:606-679` — `snapshot_gc_sweeper`.
-- `orchestrator/main.py:681-...` — `imap_poll_loop`.
-- `orchestrator/main.py:2269-...` — `auto_assign_dispatcher`.
-- `orchestrator/main.py:2973-3245` — `lifespan`; every `asyncio.create_task` registration lives here.
-- `orchestrator/main.py:10693-10694` — `_thread_turn_locks`, `_thread_turn_inflight`.
-- `orchestrator/main.py:11370` — `persistent_ws_proxy`.
-- `orchestrator/main.py:14623` — `_project_heal_locks`.
-- `orchestrator/main.py:15567-15590` — `_knowledge_graph_db` cache.
+- `orchestrator/main.py:559` — `_dispatch_lock`; acquired `main.py:3733`.
+- `orchestrator/main.py:562` — `_pause_pending_job_ids`.
+- `orchestrator/main.py:565` — `stale_agent_detector` (60s).
+- `orchestrator/main.py:673` — `agent_pool_reconciler`.
+- `orchestrator/main.py:702` — `lifecycle_reconciler_loop`.
+- `orchestrator/main.py:779` — `workspace_idle_sweeper` (reconcile-only).
+- `orchestrator/main.py:906` — `snapshot_gc_sweeper`.
+- `orchestrator/main.py:981` — `imap_poll_loop` → `services/imap_poller.py`.
+- `orchestrator/main.py:1249` — `_over_quota_projects`; quota poll `_quota_poll_tick` `main.py:1336`.
+- `orchestrator/main.py:3347` — `_threads_suspending`.
+- `orchestrator/main.py:4069` — `auto_assign_dispatcher`; core `_try_dispatch_pending_jobs` `main.py:3720`.
+- `orchestrator/main.py:4866` — `lifespan`; task registrations `main.py:5191-5323`.
+- `orchestrator/main.py:7304` / `:7521` — notification / sudo SSE endpoints.
+- `orchestrator/main.py:8807` — `_check_delegation_timeouts` (loop `:8950`).
+- `orchestrator/main.py:10190` — IDE WebSocket proxy (the only remaining `@app.websocket`).
+- `orchestrator/main.py:15860-15861` — `_thread_turn_locks`, `_thread_turn_inflight` (comment `:15857` "Single-instance orchestrator").
+- `orchestrator/main.py:15993` — `thread_event_stream` SSE (DB-backed, stateless).
+- `orchestrator/main.py:21941` — `_project_heal_locks`.
+- `orchestrator/main.py:22976` — `_knowledge_graph_db` cache.
 - `orchestrator/services/notification_feed.py:23` — `_user_queues`.
-- `orchestrator/services/sudo_gate.py:35,37` — `_sse_queues`, `_pending_msgs`.
-- `orchestrator/services/nats_bridge.py:68` — `_thread_vm_ids`.
-- `orchestrator/database/migrate.py:154-160` — existing advisory-lock pattern (template for leader election).
-- `deployment/legacy/20-orchestrator.yaml:9,543-554` — current `replicas: 1` and probe config.
+- `orchestrator/services/sudo_gate.py:35,37` — `_sse_queues`, `_pending_msgs`; fallback publish `:666-684`.
+- `orchestrator/services/nats_bridge.py:82` — `_thread_vm_ids`; subscriptions `:163-192`; subject scoping `_subj` `:98`.
+- `orchestrator/services/cron_dispatcher.py` + `postgres.py:9335` — `SKIP LOCKED` work-queue (reference example).
+- `orchestrator/services/project_loop_sweeper.py:40` + `postgres.py:9295` — CAS claim.
+- `orchestrator/services/audit_partitions.py:77,167` — `MAINT_LOCK_ID` maintenance lock.
+- `orchestrator/services/cloud/reload.py:50` + `postgres.py:8839` — `LISTEN/NOTIFY` loop + `notify_channel()` helper.
+- `orchestrator/database/postgres.py:2449` — `get_dispatchable_jobs` (no `SKIP LOCKED` yet).
+- `orchestrator/database/postgres.py:2377` — `recover_orphaned_jobs`; `:2350` `mark_stale_agents_offline`.
+- `orchestrator/database/postgres.py:1402` — `merge_job_context` (atomic JSONB).
+- `orchestrator/database/postgres.py:2568` — `thread_advisory_lock`.
+- `orchestrator/database/migrate.py:21,157` — `LOCK_ID` + advisory-lock template for leader election.
+- `src/api/persistent_app.py:2524` — agent-pod `thread_events` writer (stream source-of-truth).
+- `helm/templates/orchestrator/deployment.yaml:12` (`replicas`), `:26-56` (init containers), `:1036-1047` (probes); `helm/values.yaml:95`.
+- `helm/templates/agent/pdb.yaml` — PDB template to mirror for the orchestrator.
+- `deployment/fleet.yaml` — live deploy mechanism (Helm via Fleet; `legacy/**` ignored).
 
 ## Decision log
 
-- **2026-05-12:** Two-track plan: ship active-passive hardening (Track 1) first, then incremental active-active layers (Track 2). Track 1 captures the operational benefit at minimal engineering cost; Track 2 unblocks horizontal scale.
-- **2026-05-12:** Postgres advisory locks chosen for leader election over Kubernetes Leases. Reuses migration infra; tests cleanly with a Postgres testcontainer; lower-latency failover.
-- **2026-05-12:** `SELECT ... FOR UPDATE SKIP LOCKED` chosen for dispatch over a queue service. Postgres-native; battle-tested in the Postgres-work-queue ecosystem.
-- **2026-05-12:** Postgres `LISTEN/NOTIFY` chosen for low-volume cross-replica fan-out (notifications, sudo). The high-volume path (`thread_events`) is already DB-write + agent-pod pub/sub per [[headless_persistent_sessions]] Phase 2 — no Redis needed.
-- **2026-05-12:** NATS queue groups chosen for one-message-one-consumer delivery. One-line change per subscription.
-- **2026-05-12:** No new infra (no Redis, etcd, Zookeeper, Temporal). Postgres + NATS only.
-- **2026-05-12:** Database HA is out of scope; assumed handled by the underlying Postgres deployment.
-- **2026-05-12:** Sticky-session ingress for WebSockets is *not* required, because the stream source-of-truth moved to `thread_events` with the headless-sessions work.
+- **2026-05-12:** Two-track plan: active-passive hardening (Track 1) first, then incremental active-active layers (Track 2).
+- **2026-05-12:** Postgres advisory locks chosen for leader election over Kubernetes Leases.
+- **2026-05-12:** `SELECT ... FOR UPDATE SKIP LOCKED` chosen for dispatch over a queue service.
+- **2026-05-12:** Postgres `LISTEN/NOTIFY` chosen for low-volume cross-replica fan-out.
+- **2026-05-12:** NATS queue groups chosen for one-message-one-consumer.
+- **2026-05-12:** No new infra (Postgres + NATS only). Database HA out of scope.
+- **2026-05-12:** Sticky-session ingress not required.
+- **2026-06-24 (refresh):** Reconciled with code. Status corrected from "no implementation yet": Layer 2 (`SKIP LOCKED`) and Layer 3 (`LISTEN/NOTIFY`) patterns are **already shipped** for cron / cloud-reload; `thread_advisory_lock` covers per-thread serialization; headless Phase 2 (`thread_events` SSE) and direct-to-agent-pod WS make the entire WS-fan-out concern moot (`persistent_ws_proxy` removed).
+- **2026-06-24:** `_pending_msgs` downgraded from correctness-blocker ("agent waits forever") to reliability/latency degradation — the persisted `nats_reply_subject` fallback already delivers cross-replica.
+- **2026-06-24:** `delegation_timeout` upgraded from "needs investigation" to **confirmed racy** (double parent-resume). `_over_quota_projects` added as a new correctness blocker. `main_cloud_listen_task` removed from the double-fire list (intentional per-replica fan-out).
+- **2026-06-24:** **Leader election (Layer 1) confirmed as the single greenfield primitive and the gating item for `replicas: 2`.** Must use *session*-scoped `pg_advisory_lock` (all existing locks are xact-scoped). Stale `MIGRATION_LOCK_ID` reference corrected to `LOCK_ID`.
+- **2026-06-24:** Deployment references repointed from `deployment/legacy/` (frozen, ignored by Fleet) to `helm/` (the live path).
+- **2026-06-24:** Added the **Roadmap** section — milestone sequencing (M0-M4) across both HA docs. Separates M1 (failover HA, no data-tier dependency) from M2 (scale-out), and defines a minimum vs full OSS-release bar with external/managed Postgres as a legitimate posture for the minimum bar. Dependency-ordered, no calendar dates set.
 
 ## Sources
 
-- Postgres advisory locks: [PG docs](https://www.postgresql.org/docs/current/explicit-locking.html#ADVISORY-LOCKS), used here in the migration system (`orchestrator/database/migrate.py:157`).
-- `SELECT ... FOR UPDATE SKIP LOCKED` as the canonical distributed-queue pattern: [PG docs](https://www.postgresql.org/docs/current/sql-select.html#SQL-FOR-UPDATE-SHARE), used by [graphile-worker](https://github.com/graphile/worker), [pgmq](https://github.com/tembo-io/pgmq), and Sidekiq's [Postgres adapter](https://github.com/sidekiq/sidekiq).
-- Postgres `LISTEN/NOTIFY` scaling constraint: [Recall.ai write-up](https://www.recall.ai/blog/postgres-listen-notify-does-not-scale) (referenced in [[headless_persistent_sessions]]).
-- NATS queue groups: [NATS docs — queue subscribers](https://docs.nats.io/nats-concepts/core-nats/queue).
+- Postgres advisory locks: [PG docs](https://www.postgresql.org/docs/current/explicit-locking.html#ADVISORY-LOCKS); used in-repo at `migrate.py:157`, `audit_partitions.py:167`, `postgres.py:2584`.
+- `SELECT ... FOR UPDATE SKIP LOCKED`: [PG docs](https://www.postgresql.org/docs/current/sql-select.html#SQL-FOR-UPDATE-SHARE); used in-repo at `postgres.py:9335` (cron). Pattern also used by [graphile-worker](https://github.com/graphile/worker), [pgmq](https://github.com/tembo-io/pgmq), Sidekiq's Postgres adapter.
+- Postgres `LISTEN/NOTIFY` scaling constraint: [Recall.ai write-up](https://www.recall.ai/blog/postgres-listen-notify-does-not-scale); in-repo at `services/cloud/reload.py`.
+- NATS queue groups: [NATS docs](https://docs.nats.io/nats-concepts/core-nats/queue).
 - Kubernetes `PodDisruptionBudget`: [k8s docs](https://kubernetes.io/docs/concepts/workloads/pods/disruptions/).
-- Kubernetes Lease API (alternative considered, not chosen): [k8s docs](https://kubernetes.io/docs/concepts/architecture/leases/), used by [cert-manager](https://github.com/cert-manager/cert-manager) and similar controllers.
+- Kubernetes Lease API (considered, not chosen): [k8s docs](https://kubernetes.io/docs/concepts/architecture/leases/).
