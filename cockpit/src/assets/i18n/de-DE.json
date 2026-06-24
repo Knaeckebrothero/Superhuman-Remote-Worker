@@ -951,7 +951,25 @@
       "ideButton": "IDE",
       "ideActiveTooltip": "Arbeitsbereich in der IDE öffnen",
       "ideLoadingTooltip": "Arbeitsbereich wird gestartet...",
+      "citationsButton": "Quellen",
+      "citationsTooltip": "Quellen dieser Sitzung anzeigen",
       "disconnect": "Trennen"
+    },
+    "citations": {
+      "title": "Quellen",
+      "empty": "Noch keine Quellen. Bitte den Agenten, zu recherchieren und eine Quelle zu zitieren.",
+      "close": "Schließen",
+      "viewOriginal": "Original anzeigen",
+      "checkSource": "Quelle prüfen",
+      "checking": "Wird geprüft…",
+      "driftUnchanged": "Quelle seit Zitat unverändert",
+      "driftChanged": "Quelle seit Zitat geändert",
+      "driftUnreachable": "Live-Quelle nicht erreichbar",
+      "driftUnknown": "Änderung unbekannt",
+      "statusVerified": "Verifiziert",
+      "statusPending": "Wird verifiziert…",
+      "statusFailed": "Nicht verifiziert",
+      "statusUnknown": "Unbekannt"
     },
     "status": {
       "temp": "Temp. {{value}}",

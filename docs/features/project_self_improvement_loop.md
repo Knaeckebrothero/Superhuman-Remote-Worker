@@ -28,7 +28,7 @@ related:
 
 ## Status
 
-Design. Not built. This doc is the plan; build follows the phased roadmap below. The intent is an **experimental** v1 we can point at a small throwaway goal on k3d, then let cook overnight on a real one (MiniMax M3, ~one subscription).
+**Phases 1–3 built and k3d-verified (2026-06-23/24); uncommitted on `develop`.** Phase 4 (token-budget stop) and the Critic goal-met early-stop are deferred. The loop is usable **end-to-end from the cockpit**: create a project, set a goal, attach datasources, open the **Loop** tab, press Start. v1 remains **experimental** — the design and rationale below are the original plan; per-phase build status, the as-built deviations, and the k3d verification are in [Implementation Roadmap](#implementation-roadmap). The biggest open risk is unchanged and now sharpened by a real run: **whether the agents actually use the KB blackboard** (the gemma smoke run wrote zero KB notes — see [Open Questions](#open-questions)). Issues and optimizations found during real test runs are logged in [`loop_review.md`](../loop_review.md).
 
 ## Problem
 
@@ -283,12 +283,12 @@ Thin, because the spawned jobs already have rich detail views. The tab needs: mo
 | Job creation with project + model + config_override | Exists | `JobCreate` (`main.py:4231`); model via `config_override.llm.model` |
 | Completion-hook fan-out (where advance plugs in) | Exists | `complete_job` → `main.py:9610-9633` |
 | Auto-assign dispatch of created jobs | Exists | orchestrator dispatcher |
-| `project_loops` table + helpers | **New** | migration `0035_project_loops.sql` + `postgres.py` |
-| `_advance_project_loop` hook | **New** | `orchestrator/main.py` |
-| `build_loop_kickoff` + bare-job creation | **New** | `orchestrator/services/` |
-| Start/pause/resume/stop API | **New** | `orchestrator/routers/project_loops.py` (follow the `automations.py` router pattern) |
-| Cockpit Loop tab | **New** | `cockpit/` |
-| Safety-net sweep (optional) | **New** | mirror `cron_dispatcher.py` |
+| `project_loops` table + helpers | ✅ Built | migration `0035_project_loops.sql`; `postgres.py` (create/get/get_active/list/update + `claim_project_loop_advance` + `list_running_project_loops`) |
+| `_advance_project_loop` hook (+ `_spawn_loop_job`, `_resume_project_loop`) | ✅ Built | `orchestrator/main.py` (in the completion fan-out) |
+| `build_loop_kickoff` + bare-job creation | ✅ Built | `orchestrator/services/project_loops.py` |
+| Start/get/pause/resume/stop/jobs API | ✅ Built | `orchestrator/routers/project_loops.py` |
+| Safety-net sweeper | ✅ Built (Phase 2) | `orchestrator/services/project_loop_sweeper.py` |
+| Cockpit Loop tab | ✅ Built (Phase 3) | `cockpit/.../project-detail/project-loop.component.ts` + `api.service.ts`/`api.model.ts` + project-detail wiring |
 
 ## Implementation Roadmap
 
@@ -321,6 +321,36 @@ Phase 4 — Hardening (post-experiment, as needs surface)
 
 Phase 1 is the whole bet — once a loop rotates roles and stops cleanly from the API, the rest is wrappers. Match the project's Plan→Develop→Verify loop: verify each phase on k3d before it ships.
 
+### Build status (2026-06-24)
+
+**Phases 1–3 built and k3d-verified; uncommitted on `develop`.**
+
+| Phase | Status |
+|-------|--------|
+| 1 — headless loop | ✅ done, k3d-verified |
+| 2 — reliability (sweeper + atomic-claim advance) | ✅ done, k3d-verified |
+| 3 — cockpit Loop tab | ✅ done, k3d-verified |
+| 4 — token-budget stop · goal-met early-stop · curator pass · scholar fan-out | ⏳ deferred |
+
+### As-built deviations from the plan
+
+- **GET `/loop` returns the latest loop** (active → else most-recent terminal), not active-only, so the cockpit can show the morning-after outcome (status + stop_reason). `pause`/`resume`/`stop` still target the *active* loop.
+- **Atomic advance claim** (`claim_project_loop_advance` — a conditional `current_job_id → NULL` UPDATE) was added so the completion hook and the Phase-2 sweeper can both call `_advance_project_loop` without double-spawning. Not in the original plan; required once the sweeper existed.
+- **`_resume_project_loop`** re-runs the advance that was suppressed if the in-flight job reached a terminal state while the loop was paused.
+- **Datasources (Option A)** — `create_loop_job` explicitly links the project's datasources to each loop job (mirrors the cockpit picker; resolution stays explicit-only), giving the execution role repository continuity. Backend auto-attach for project jobs ("Option B") was considered and deferred.
+- **`run_until` in the UI** is entered as a "time limit (hours)" number → `now + hours`, avoiding a date picker while still covering "run for a week".
+- **`tried/rejected` + repetition guard** shipped inside the Phase-1 kickoff (not a separate Phase-2 item).
+- **Cockpit copy is plain English** (not transloco) except the tab label — i18n-able later; acceptable for an experimental power-user surface.
+- **Goal-met early-stop deferred** — needs a grounded agent→loop channel (a KB marker or a new agent tool); the KB path depends on agents actually using the KB, which is still unproven (see Open Questions). Budget-bound is the safe primary stop.
+
+### Verification (k3d, `gemma-4-moe`)
+
+- **Phase 1** — live run, `max_iterations=3`: scholar→critic→developer all completed, budget auto-stop (`stop_reason=budget`, `remaining_iterations` 3→2→1→0, `current_job_id` cleared); manual stop endpoint → `stop_reason=user`.
+- **Phase 2** — synthesized a wedged loop (running loop + terminal current job): the sweeper recovered it in one tick with no double-spawn; the NULL-current-job case was logged for attention, not falsely recovered.
+- **Phase 3** — `ng build` clean, 663/663 vitest pass, Playwright walkthrough: Loop tab renders native-styled, `GET /loop`→200, model picker populated, outcome banner shown, 0 console errors.
+- **Cluster-model gotcha** — a loop job's model must be keyed on the *target* cluster. k3d only has `gemma-4-moe`; `minimax/minimax-m3` exists on the dev cluster, not k3d, and wrong-model jobs insta-fail (~20s). Pick a model keyed on the cluster you run against.
+- **KB blackboard unproven** — across the gemma run the agents wrote **zero** KB notes (the tools were available; gemma is weak at tool-use). Confirming that agents actually use the KB with a capable model is the make-or-break next test (Open Questions #4).
+
 ## Resolved Design Decisions
 
 | Question | Decision | Rationale |
@@ -343,7 +373,7 @@ These are exactly the things the research **could not settle** — so our overni
 1. **Does sequential one-at-a-time actually beat parallel fan-out for this workload?** No verified claim covers continuous single-goal loops. Measure in our own harness before optimising.
 2. **How many candidate proposals, and is a separate Critic better than executor self-critique?** Candidate-count is unpinned; the one head-to-head Critic-vs-self-critique number was *refuted*. We default to a separate Critic (supported by MAST role-spec/verification gains) and treat N as a tunable.
 3. **What automated progress signal distinguishes real progress from wandering/false victory** over a multi-day run on an open-ended (non-code) goal? Unsolved in the literature; for code we lean on tests, for knowledge-work the acceptance criteria + Critic decider are our best current proxy — watch them.
-4. **How should the KB blackboard bound its own growth** over an overnight-to-multi-day run? Reflexion used a fixed window; the blackboard accumulates. Our read-bounding (hybrid top-K) + structured note kinds is a design choice to measure against context blowup and cost.
+4. **Do the agents actually use the KB blackboard — and how should it bound its growth?** The k3d smoke run (`gemma-4-moe`) wrote **zero** KB notes across a full scholar→critic→developer run — likely gemma's weak tool-use (the tools were available and the kickoff instructs their use), but it means the core coordination channel is **unverified**. This is the #1 thing a real run with a capable model must confirm; if a capable model also under-uses the KB, the levers are a harder-enforced kickoff (make a KB write the required first/last step) or a curator pass that force-records each iteration. Separately, on growth: Reflexion used a fixed window; our read-bounding (hybrid top-K) + structured note kinds is a design choice to measure against context blowup and cost.
 5. **(ours)** First real overnight target — start with a research/writing goal (cheaper, lower blast radius, no auto-merge needed) before a build goal like "build us a CMS" (which additionally needs a writable project repo + a critic-gated auto-merge policy, deferred to Phase 4).
 
 ## Risks
@@ -355,6 +385,7 @@ These are exactly the things the research **could not settle** — so our overni
 
 ## Related
 
+- [`loop_review.md`](../loop_review.md) — **living log of issues + optimizations found during real test runs** (cost, KB hygiene, grounding, role bleed); the running companion to this plan.
 - `[[verification_phase]]` — the critic verdict tools and the developer↔critic loop this generalises; loop Critic reuses the same `approve`/`return_with_feedback` stance, minus the auto-trigger.
 - `[[subagent_delegation]]` — `delegate_work`, the Phase-4 path to real Scholar proposal diversity.
 - `[[automations]]` — the generic event-trigger driver this is a turnkey, project-scoped specialisation of; shares the runaway-guard philosophy (`max_chain_depth`, the $-runaway incident).

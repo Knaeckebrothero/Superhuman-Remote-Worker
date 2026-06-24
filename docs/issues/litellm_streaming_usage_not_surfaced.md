@@ -1,63 +1,77 @@
-# LiteLLM-routed models surface no token usage → empty session usage bar
+# Session usage bar empty on gemma turns — investigated, NOT a streaming-usage gap
 
-**Status:** open · characterized, not fixed
-**Found:** 2026-06-22, during the persistent-session token-UI work.
+**Status:** closed (misdiagnosed) · 2026-06-24
+**Found:** 2026-06-22 during the persistent-session token-UI work.
+**Resolved:** 2026-06-24 — the original "LiteLLM drops usage" hypothesis below
+is **wrong**. The streaming-usage pipeline is healthy end-to-end; the empty bar
+was an *errored turn* (stale-key 401), not a missing-usage gap.
 
-## Symptom
+## TL;DR
 
-For a persistent session on a **LiteLLM-routed** model (`gemma-4-moe`,
-`base_url=http://srw-litellm:4000/v1`), the cockpit's live token bar
-(`.usage-panel`) never appears — no input/output/ctx **and** therefore no
-reasoning estimate. The turn otherwise completes normally (answer streams,
-reasoning is captured). Direct vLLM models (e.g. `gemma-4-moe-strix`) **do**
-show the bar, so it is route-specific, not a cockpit bug.
+`stream_options.include_usage` reaches the wire, `usage_metadata` comes back,
+`_execute_turn` captures it, and real turns persist correct per-turn metrics.
+There is nothing to fix in the usage plumbing. An errored turn (e.g. a 401)
+captures no usage, so the bar simply doesn't render — that's the symptom that
+was originally misread as a LiteLLM gap.
 
-## Root cause (narrowed, not closed)
+## Evidence (k3d, 2026-06-24)
 
-The bar is driven by `usage.updated` frames, emitted only when
-`persistent_graph._execute_turn` builds `turn_metrics`, which requires
-`response.usage_metadata` (or `response_metadata.token_usage`) to be populated.
-For the LiteLLM route that dict is empty, so no frame is sent.
+Probed from inside the orchestrator pod (`langchain_openai 1.3.3`,
+`/app/src/llm/reasoning_chat.py`, network to both routes):
 
-Established by curling the gateway directly (master key in Secret `srw`,
-`LITELLM_MASTER_KEY`) from the orchestrator pod:
+1. **`include_usage` is on the wire.** openai-SDK DEBUG logs show
+   `stream_options: {'include_usage': True}` on every request — for both plain
+   `ChatOpenAI` and `ReasoningChatOpenAI`. langchain's `_astream` converts
+   `stream_usage=True` → `stream_options` (base.py:1381-1383); loader sets
+   `stream_usage=True` (loader.py:2769/3123/3211).
 
-- `stream:true` **without** `stream_options` → stream ends at `data: [DONE]`
-  with **no usage chunk**.
-- `stream:true` **with** `stream_options:{include_usage:true}` → final chunk
-  carries `usage:{prompt_tokens, completion_tokens, total_tokens,
-  completion_tokens_details:{reasoning_tokens:0}}`.
+2. **The tap does NOT eat the usage chunk.** `_SSEReasoningTap.aiter_bytes`
+   (reasoning_chat.py:433-439) `yield`s every byte unchanged and only
+   *additionally* parses for reasoning. Plain `ChatOpenAI` and
+   `ReasoningChatOpenAI` return **identical** `usage_metadata`.
 
-So the LiteLLM/vLLM route **requires** `include_usage`, and SRW's turn isn't
-getting it onto the wire — even though:
+3. **Usage comes back on the actual session route.** The persistent session for
+   `gemma-4-moe` routes **direct to `https://ai.h4ll.app/v1`** (registry
+   `models.provider_kind='endpoint'` → `llm_endpoints` row `f475b8e1`,
+   `base_url=https://ai.h4ll.app/v1`). LiteLLM (`srw-litellm:4000`) is **not**
+   in the path on this cluster. With the correctly-decrypted endpoint key
+   (`security/crypto.py` AES-GCM), a streamed gemma turn returns
+   `usage_metadata = {input_tokens:21, output_tokens:20, total_tokens:41}`.
 
-- `loader.py` sets `llm_kwargs["stream_usage"] = True` (3 sites).
-- langchain_openai `_astream` (verified in installed source, lines ~1376-1383)
-  turns `stream_usage=True` into `kwargs["stream_options"]={"include_usage":True}`.
-- `ReasoningChatOpenAI.__init__` passes `**kwargs` straight to `super()`, and
-  its `_astream` override (`src/llm/reasoning_chat.py:1105`) is a pure
-  pass-through; chunk accumulation in `_execute_turn` (`:1113-1117`) sums all
-  chunks via `+`, so a usage chunk *would* aggregate if present.
+4. **Real turns persist correct metrics.** `thread_messages.metrics` for a live
+   `gemini-2.5-flash` thread holds
+   `{input_tokens:15624, output_tokens:65, reasoning_tokens:35,
+   model:'gemini-2.5-flash'}`. End-to-end capture works.
 
-**Prime suspect:** the custom httpx tap `AsyncReasoningCapturingClient`
-(`reasoning_chat.py:721`) that intercepts the raw SSE to extract reasoning may
-be dropping the final usage-only chunk before the OpenAI SDK aggregates it; or
-`include_usage` isn't reaching the wire for the custom `base_url`.
+## Why the original curl looked like a gap
 
-## Next step to close
+The 2026-06-22 curl against `srw-litellm:4000` *without* `stream_options`
+returned no usage — true of any OpenAI-compatible stream, and exactly why
+langchain sends `include_usage`. It only proved the param is required, not that
+SRW omits it. SRW sends it.
 
-1. Capture the **actual outbound request** to LiteLLM (LiteLLM request log, or a
-   one-line debug log of the payload in `reasoning_chat`) to confirm whether
-   `stream_options.include_usage` is present.
-2. If present on the wire but usage still absent in `response.usage_metadata`,
-   the tap is eating the final chunk → fix `AsyncReasoningCapturingClient` to
-   forward the usage-only chunk.
-3. If absent on the wire, force it: `model_kwargs["stream_options"] =
-   {"include_usage": True}` in `loader._create_openai_llm`.
+## Real cause of the empty bar
 
-## Relevance
+The gemma session that triggered this (`579acfce`) used **`gemma-4-moe-strix`**,
+the variant that 401s on the stale/invalid upstream key (and is now
+`enabled=false` in the registry). A 401 turn errors before
+`turn_metrics` is built → no `usage.updated` frame → no bar. Correct behavior,
+just with no friendly "turn failed" affordance.
 
-Blocks the live usage bar (and the new reasoning-token estimate) for every
-LiteLLM-routed model — i.e. the common case once models are registered through
-the gateway. The reasoning-estimate feature itself is correct and unit-tested;
-it simply can't render until a `usage.updated` frame arrives.
+## Side-finding (validates the reasoning estimate)
+
+The **direct `ai.h4ll.app` route reports no reasoning detail**
+(`output_token_details: {}`), whereas the **same model through LiteLLM** returns
+`{reasoning: 16}` (LiteLLM normalizes `completion_tokens_details`), and gemini
+reports it natively. So on the real gemma route, the shipped
+`_maybe_estimate_reasoning_tokens` estimate (context_summarization_rework.md
+§10.2) is the *only* source of a reasoning count — its intended purpose.
+
+## Residual (optional, low priority)
+
+- No usage/error affordance when a turn errors (the original confusion). A small
+  "turn failed" chip or keeping the prior turn's bar would avoid the "is it
+  broken?" read. Not a usage-plumbing bug.
+- If native reasoning counts for gemma are wanted, routing it *through* LiteLLM
+  would surface `reasoning_tokens` without the estimate — but the gateway is
+  dark on dev by design (cost-monitoring overlay), so the estimate stands.

@@ -132,6 +132,7 @@ from security.access import (  # noqa: E402
     user_can_access_datasource,
     user_can_access_ide_entity,
     user_can_access_job,
+    user_can_access_job_or_thread,
     user_visible_project_ids,
 )
 from security.credential_files import (  # noqa: E402
@@ -1508,7 +1509,18 @@ async def _inject_dispatch_credentials(
         and meta.origin in ("custom", "system", "catalog")
         and meta.endpoint_id
     ):
-        _gw = _gw_scoped
+        # Endpoint-backed models carry their agent-side factory in meta.provider
+        # (``openai`` for the OpenAI-compatible wire, ``codex`` for the Responses-
+        # API Codex proxy). Inject it so the agent builds the right factory — the
+        # endpoint branch otherwise leaves provider unset and the agent defaults
+        # to the openai factory, which forces Chat Completions and strips gpt-5.x
+        # reasoning. See docs/issues/litellm_gateway_drops_gpt_codex_reasoning_capture.md
+        if meta.provider:
+            llm_over.setdefault("provider", meta.provider)
+        # The Codex proxy speaks ONLY the Responses API; the LiteLLM gateway
+        # normalizes to Chat Completions and drops the reasoning summary, so codex
+        # models bypass the gateway and hit their endpoint directly.
+        _gw = _gw_scoped if meta.provider != "codex" else None
         if _gw is not None:
             # Endpoint-kind model + gateway enabled → route through LiteLLM so the
             # traffic is measured at the chokepoint AND the job's scoped key
@@ -3491,8 +3503,14 @@ async def _inject_model_credentials(
     ):
         # Prefer the caller's pre-resolved target (the dispatch's scoped key, 2b);
         # otherwise resolve the shared fleet key here (callers without user/project
-        # context, e.g. some hot-swap paths).
-        _gw = gateway_override or _gateway_routing_target()
+        # context, e.g. some hot-swap paths). The Codex proxy is Responses-API only
+        # and the gateway would normalize it to Chat Completions and drop reasoning,
+        # so codex models bypass the gateway and hit their endpoint directly.
+        _gw = (
+            None
+            if meta.provider == "codex"
+            else (gateway_override or _gateway_routing_target())
+        )
         if _gw is not None:
             # Route endpoint-kind phase/aux models through the gateway too, so
             # measurement covers the full chat/auxiliary surface (Slice 1) and the
@@ -12458,8 +12476,8 @@ async def get_citation_detail(request: Request, citation_id: int) -> dict[str, A
 
             result = dict(row)
             job_id = result.get("job_id")
-            if not await user_can_access_any_job(
-                caller, postgres_db, [str(job_id)] if job_id else []
+            if not await user_can_access_job_or_thread(
+                caller, postgres_db, str(job_id) if job_id else None
             ):
                 # 404 instead of 403 — don't leak that the citation exists.
                 raise HTTPException(
@@ -12534,8 +12552,8 @@ async def get_citation_snapshot(request: Request, citation_id: int) -> Response:
                 status_code=404, detail=f"Citation {citation_id} not found"
             )
         job_id = row["job_id"]
-        if not await user_can_access_any_job(
-            caller, postgres_db, [str(job_id)] if job_id else []
+        if not await user_can_access_job_or_thread(
+            caller, postgres_db, str(job_id) if job_id else None
         ):
             raise HTTPException(
                 status_code=404, detail=f"Citation {citation_id} not found"
@@ -12595,8 +12613,8 @@ async def get_citation_drift(request: Request, citation_id: int) -> dict[str, An
                 status_code=404, detail=f"Citation {citation_id} not found"
             )
         job_id = row["job_id"]
-        if not await user_can_access_any_job(
-            caller, postgres_db, [str(job_id)] if job_id else []
+        if not await user_can_access_job_or_thread(
+            caller, postgres_db, str(job_id) if job_id else None
         ):
             raise HTTPException(
                 status_code=404, detail=f"Citation {citation_id} not found"
@@ -15757,7 +15775,7 @@ async def get_thread_citations(
                        s.identifier AS source_identifier,
                        c.verification_status::text AS verification_status,
                        c.confidence::text AS confidence,
-                       c.created_at
+                       c.created_at, s.metadata
                 FROM citations c
                 JOIN sources s ON c.source_id = s.id
                 WHERE c.job_id = $1::uuid
@@ -15767,8 +15785,20 @@ async def get_thread_citations(
                 limit,
                 offset,
             )
+            citations = []
+            for r in rows:
+                d = dict(r)
+                # Cloud-document citations (cite_document with a snapshot-anchor)
+                # can offer "view original" (/snapshot) + on-view drift (/drift);
+                # web citations have neither. Surface the two flags so the cockpit
+                # only renders those controls where they apply. The raw metadata
+                # isn't returned (internal blob keys / anchor URLs).
+                cloud = _source_cloud_meta(d.pop("metadata", None))
+                d["has_cloud_anchor"] = bool(cloud)
+                d["has_snapshot"] = bool(cloud.get("snapshot_blob_key"))
+                citations.append(d)
             return {
-                "citations": [dict(r) for r in rows],
+                "citations": citations,
                 "total": total,
                 "thread_id": thread_id,
             }

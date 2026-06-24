@@ -88,6 +88,35 @@ def _factory_provider(yaml_provider: Optional[str]) -> str:
     return "openai"
 
 
+# The system-seeded Codex proxy (CLIProxyAPI) is created under this label by
+# ``ensure_codex_proxy_endpoint`` and its base_url points at the
+# ``*-codex-proxy`` service. It speaks ONLY the OpenAI *Responses* API and
+# surfaces model reasoning via ``reasoning.summary`` — which lives in the codex
+# factory (``_create_codex_llm``). Endpoint-backed rows otherwise resolve to the
+# generic ``openai`` (Chat Completions) factory, which forces
+# ``use_responses_api=False`` and never requests a reasoning summary, so gpt-5.x
+# / o-series / codex models wired to this endpoint silently lose their reasoning.
+# See docs/issues/litellm_gateway_drops_gpt_codex_reasoning_capture.md
+CODEX_PROXY_ENDPOINT_LABEL = "codex-proxy"
+
+
+def _endpoint_factory_provider(
+    base_url: Optional[str], label: Optional[str] = None
+) -> str:
+    """Pick the agent-side LLM factory for an endpoint-backed row.
+
+    Defaults to ``openai`` (the wire protocol is OpenAI-compatible) but returns
+    ``codex`` for the system Codex proxy, whose Responses-API + reasoning-summary
+    path lives in ``_create_codex_llm``. Detected by the well-known endpoint
+    identity (label ``codex-proxy`` or a ``codex-proxy`` host in the base_url).
+    """
+    if label and label.strip().lower() == CODEX_PROXY_ENDPOINT_LABEL:
+        return "codex"
+    if base_url and CODEX_PROXY_ENDPOINT_LABEL in base_url.lower():
+        return "codex"
+    return "openai"
+
+
 # Dependency injection: the orchestrator registers DB-backed lookups at
 # startup so src/core/ stays import-free of orchestrator/database/. In
 # contexts without a DB (agent process, tests), the hooks stay None and
@@ -218,15 +247,16 @@ def family_of(model_id: str, default: str = "default") -> str:
 def _endpoint_row_to_meta(row: dict[str, Any], *, origin: str) -> ModelMeta:
     """Build a ModelMeta from a user/system endpoint lookup row.
 
-    Endpoint-backed models always route through the openai factory (the
-    wire protocol is OpenAI-compatible). api_key_ref is None because the
-    key travels inline on the endpoint row — the dispatcher fetches it
-    via get_user_llm_endpoint(endpoint_id), not through
-    resolve_api_keys_for_job.
+    Endpoint-backed models route through the openai factory (the wire
+    protocol is OpenAI-compatible) — except the system Codex proxy, which
+    needs the codex factory's Responses-API + reasoning-summary path (see
+    ``_endpoint_factory_provider``). api_key_ref is None because the key
+    travels inline on the endpoint row — the dispatcher fetches it via
+    get_user_llm_endpoint(endpoint_id), not through resolve_api_keys_for_job.
     """
     return ModelMeta(
         model_id=row["model_id"],
-        provider="openai",
+        provider=_endpoint_factory_provider(row.get("base_url"), row.get("label")),
         family=row.get("family") or "default",
         display_name=row.get("display_name") or row["model_id"],
         base_url=row["base_url"],
@@ -262,7 +292,9 @@ def _catalog_row_to_meta(row: dict[str, Any]) -> ModelMeta:
     if provider_kind == "endpoint":
         return ModelMeta(
             model_id=row["model_id"],
-            provider="openai",
+            provider=_endpoint_factory_provider(
+                row.get("endpoint_base_url"), row.get("endpoint_label")
+            ),
             family=row.get("family") or "default",
             display_name=row.get("display_label") or row["model_id"],
             base_url=row.get("endpoint_base_url"),
