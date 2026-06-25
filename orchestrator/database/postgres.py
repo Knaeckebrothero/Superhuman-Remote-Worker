@@ -8136,7 +8136,9 @@ class PostgresDB:
     async def message_exists_by_email_id(self, email_message_id: str) -> bool:
         """Check if a message with this RFC822 Message-ID already exists.
 
-        Used by the IMAP poller for deduplication.
+        Used by the IMAP poller as a fast-path dedup check. NOT race-safe on
+        its own (read-then-act) — the authoritative guard is
+        ``claim_inbound_email`` below.
         """
         async with self.acquire() as conn:
             count = await conn.fetchval(
@@ -8144,6 +8146,29 @@ class PostgresDB:
                 email_message_id,
             )
         return (count or 0) > 0
+
+    async def claim_inbound_email(self, email_message_id: str) -> bool:
+        """Atomically claim an inbound email for routing (M1 — HA dedup).
+
+        Inserts the RFC822 Message-ID into ``processed_inbound_emails``;
+        returns True iff THIS call inserted it (i.e. won the claim). The imap
+        poller is leader-gated, but leader election has no fencing — during a
+        partition / Postgres failover two replicas can briefly both poll IMAP.
+        Claiming before routing means a concurrent poller in that window loses
+        the insert and skips, so an inbound reply is never injected into a job
+        twice. See migration 0037_processed_inbound_emails.sql.
+        """
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO processed_inbound_emails (email_message_id)
+                VALUES ($1)
+                ON CONFLICT (email_message_id) DO NOTHING
+                RETURNING email_message_id
+                """,
+                email_message_id,
+            )
+        return row is not None
 
     async def get_thread_email_message_id(
         self, job_id: str, thread_id: str
