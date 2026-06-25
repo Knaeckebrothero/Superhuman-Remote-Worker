@@ -33,7 +33,7 @@ The original draft said "no implementation yet." That is no longer true, and the
 | Work item | Original status | **Current status (2026-06-24)** | Evidence |
 |---|---|---|---|
 | **Track 1** active-passive hardening (probes / `preStop` / grace / PDB) | not started | **SHIPPED (chart); chaos test operator-pending** | `preStop` drain + `terminationGracePeriodSeconds` + `startupProbe` + tuned probes + orchestrator PDB landed in `helm/` (M0). Behavioral chaos test is operator-run on dev — see `docs/operations/orchestrator_failover.md`. |
-| **Layer 1** leader election for singleton loops | not started | **GREENFIELD — the one true unlock** | No `with_leader_lock`, no session-scoped advisory lock, no `leader_election.py`. All existing advisory locks are *xact*-scoped. |
+| **Layer 1** leader election for singleton loops | not started | **GREENFIELD — the one true unlock** | No `with_leader_lock`, no session-scoped advisory lock, no `leader_election.py`. All existing advisory locks are *xact*-scoped. **Design refined by research → `docs/researches/orchestrator_leader_election.md`** (single leader lock; keepalive tuning; dispatcher CAS folded into M1). |
 | **Layer 2** DB-level dispatch (`SKIP LOCKED`) | not started | **PATTERN PROVEN, dispatcher not ported** | `cron_dispatcher` is a complete, documented multi-replica-safe `SKIP LOCKED` queue. Job dispatch still uses the in-process `_dispatch_lock`. `thread_advisory_lock` already covers per-thread serialization. |
 | **Layer 3** cross-replica fan-out (`LISTEN/NOTIFY`) | not started | **TRANSPORT SHIPPED + WS problem evaporated** | `notify_channel()` helper + a reconnecting `LISTEN` loop ship for cloud-config reload. The WS half is moot: `persistent_ws_proxy` is gone (direct-to-agent-pod), stream is `thread_events` SSE. Remaining: DB-back the 2 SSE channels + drop `_pending_msgs`. |
 | **Layer 4** NATS queue groups | not started | **GREENFIELD but trivial** | No `queue=` on any subscription. Subjects are now `orchestratorId`-scoped (separates installs, not replicas). |
@@ -226,41 +226,50 @@ Order unchanged: leader election → DB coordination → fan-out → NATS. The r
 
 ### Layer 1: Leader election for singleton loops — GREENFIELD (the unlock)
 
-The cheapest, most-impactful change, and **the single primitive that makes `replicas: N` safe** (Open Question #7). Wrap each background loop in a leader-election guard so only one replica runs it.
+The cheapest, most-impactful change, and **the single primitive that makes `replicas: N` safe** (Open Question #7). Elect one leader replica that runs the singleton loops; the others stand by.
 
-**Primitive: session-scoped Postgres advisory locks.** Each singleton loop holds a session-scoped advisory lock on a unique integer key for its lifetime. If taken, the loop sleeps and re-tries (~30s). On the leader's death its session closes, the lock releases, a follower takes over within ~30s.
+> **Design refined 2026-06-25 by `docs/researches/orchestrator_leader_election.md`** (5-agent web + codebase research). Verdict unchanged (advisory lock), but four corrections are baked in below: a **single** leadership lock (not per-loop), a **dedicated non-pooled** connection, **mandatory keepalive tuning**, and "**the lock is for efficiency, not correctness**."
+
+**Primitive: a single session-scoped Postgres advisory lock per replica**, held on a **dedicated, long-lived connection** (the `reload.py` out-of-pool + reconnect-with-backoff idiom). Whoever holds `LEADER_ID` is the leader and runs *all* the singleton loops; others retry every ~5-10s (with random startup jitter). On the leader's death its Postgres session closes and the lock releases.
+
+> **Not per-loop.** An earlier sketch wrapped each loop in its own lock acquired from the shared pool — but a session lock pins a connection for life, and ~10 loops would pin ~10 of the pool's 10 connections and starve the leader's request traffic. One leadership lock = one pinned connection. (Per-loop locks, to spread loops across replicas, is an M2 optimization needing its own dedicated lock-pool.)
 
 ```python
-async def with_leader_lock(name: str, loop_id: int, run: Callable[[], Awaitable[None]],
-                           shutdown_event: asyncio.Event) -> None:
+async def run_as_leader(run_all_loops, shutdown_event: asyncio.Event) -> None:
     while not shutdown_event.is_set():
-        async with db_pool.acquire() as conn:               # dedicated conn, cf. reload.py:82
-            got = await conn.fetchval("SELECT pg_try_advisory_lock($1)", loop_id)
+        conn = await acquire_dedicated_conn()                 # NOT a txn-pooled conn; cf. reload.py:71-150
+        try:
+            got = await conn.fetchval("SELECT pg_try_advisory_lock($1)", LEADER_ID)
             if got:
-                logger.info(f"[{name}] acquired leadership")
+                logger.info("acquired leadership")
                 try:
-                    await run()                              # runs until shutdown or conn dies
+                    await run_all_loops(shutdown_event)       # runs until shutdown OR conn dies
                 finally:
-                    await conn.execute("SELECT pg_advisory_unlock($1)", loop_id)
+                    await conn.execute("SELECT pg_advisory_unlock($1)", LEADER_ID)
             else:
-                try:
-                    await asyncio.wait_for(shutdown_event.wait(), timeout=30.0)
-                except asyncio.TimeoutError:
-                    pass
+                await _sleep_or_shutdown(shutdown_event, 10.0)
+        except Exception:                                     # conn dropped → step down, reconnect, re-contend
+            logger.warning("leader connection lost; stepping down")
+        finally:
+            await release_dedicated_conn(conn)
 ```
 
-Key properties:
-- **Session-scoped** (`pg_advisory_lock`, *not* `pg_advisory_xact_lock` — note all current uses are xact-scoped, so this is a new pattern): the lock lives as long as the session. On OOM/partition it releases when Postgres reaps the dead connection.
-- **No fencing token needed** here: the loops are coarse (30-60s) and the underlying ops are idempotent (Track 1's safety carries through), so a worst-case "two leaders for 30s during a partition" is recoverable.
-- **Stable lock IDs.** Build the registry the draft asked for. Two fixed constants exist today (`LOCK_ID` = `0x5352575F4D4947` "SRW_MIG", `MAINT_LOCK_ID` = `0x5352575F41554454` "SRW_AUDT") plus the dynamic `thread_advisory_lock` hash family — collect them into one module and never collide.
+**Preconditions & properties (research-validated):**
+- **No transaction-mode connection pooler in the lock path.** Session advisory locks silently leak behind PgBouncer/pgcat/RDS-Proxy transaction pooling (the unlock lands on a different backend). **Verified: SRW connects direct asyncpg → Postgres, no pooler — safe.** Caveat: external-Postgres mode (`databases.postgres.internal: false`) could point at a pooler — add a startup self-check or a loud `values`/doc warning.
+- **Failover needs Postgres keepalive tuning — or it's ~2 hours, not ~30s.** A session lock releases only when Postgres reaps the dead backend. Clean pod shutdown (TCP FIN) releases **instantly** (rolling deploys are fine); a hard kill / partition is noticed only via TCP keepalive, whose Linux default is ~2h. **Required:** set server-side `tcp_keepalives_idle=10`, `tcp_keepalives_interval=10`, `tcp_keepalives_count=3` (→ ~40s) + `idle_session_timeout` as a backstop, on the Postgres deployment. (`client_connection_check_interval` does **not** help an idle lock-holder — common trap.)
+- **The lock is for *efficiency*, not *correctness* — there is no fencing.** Two leaders can briefly coexist (the ~40s detection window; and a Postgres primary→replica failover wipes all advisory locks instantly, since they're never WAL-logged). Correctness-critical loops must therefore be guarded **at the resource** (idempotency / CAS / `SKIP LOCKED`), not by the lock. Concretely this **pulls the dispatcher's `SKIP LOCKED` + assign-write CAS into M1** (see Layer 2), and the other non-idempotent loops get cheap resource guards (imap unique-index, digest/delegation/notify) so a brief overlap is harmless.
+- **Graceful step-down.** On lost leadership or a dead lock-connection, **stop the loops** and release in a `finally` — a cancelled asyncio task does *not* release the lock (GreptimeDB war story).
+- **Stable lock IDs.** Add `LEADER_ID` to a registry module alongside the existing packed-ASCII int64 constants (`LOCK_ID` "SRW_MIG", `MAINT_LOCK_ID` "SRW_AUDT"); session-scoped `pg_advisory_lock` is genuinely new (all current uses are xact-scoped).
 
-Loops to wrap (singletons): `auto_assign_dispatcher`, `imap_poll_loop`, `delegation_timeout_sweeper`, `quiet_hours_digest_loop`, `stale_agent_detector`, `agent_pool_reconciler`, `lifecycle_reconciler_loop`, the `_over_quota_projects` quota poll, `thread_permission_notify_sweeper`. Idempotent sweepers can be wrapped for log clarity. The already-HA-safe loops (`cron_dispatcher`, `project_loop_sweeper`, audit maintenance, metering) **must not** be wrapped — they're designed to run everywhere.
+The single leader runs: `auto_assign_dispatcher`, `imap_poll_loop`, `delegation_timeout_sweeper`, `quiet_hours_digest_loop`, `stale_agent_detector`, `agent_pool_reconciler`, `lifecycle_reconciler_loop`, the `_over_quota_projects` quota poll, `thread_permission_notify_sweeper`. The already-HA-safe loops (`cron_dispatcher`, `project_loop_sweeper`, audit maintenance, metering) and the intentional per-replica `main_cloud_listen_task` **stay outside** leadership — they run everywhere by design.
 
-**Alternatives considered (not chosen):** Kubernetes Lease objects (extra RBAC + client lib; advisory locks reuse infra we have and "Postgres down ⇒ orchestrator down" anyway), Redis `SET NX PX` (no Redis), etcd/Consul (extra infra). Postgres-first.
+**Alternatives considered (not chosen):** Kubernetes Lease — rejected, and the research sharpened why: the Python ecosystem is immature (official client does ConfigMap-only election; the Lease-support PR was closed unmerged 2025-11-21; `kopf` uses its own CRDs), it needs extra RBAC + a k8s-API dependency, and "Postgres down ⇒ orchestrator down" makes its one advantage (DB-independence) moot. Redis `SET NX PX` (no Redis), etcd/Consul (extra infra). Postgres-first.
 
-### Layer 2: DB-level job dispatch — PATTERN PROVEN, dispatcher not ported
+### Layer 2: DB-level job dispatch — the dispatcher fix moves INTO M1; the rest stays M2
 
-`_dispatch_lock` becomes unnecessary. Replace the candidate scan with `SELECT ... FOR UPDATE SKIP LOCKED` — **exactly what `fetch_next_due_cron_automation` (`postgres.py:9335`) already does for cron.** Copy that shape onto `get_dispatchable_jobs` (`postgres.py:2449`):
+> **Research correction (2026-06-25):** the dispatcher's `SKIP LOCKED` + a CAS guard is **not** optional M2 polish — it's the correctness floor for the dual-leader window (leader election has no fencing). The codebase audit found `get_dispatchable_jobs` (`postgres.py:2449`) has no `SKIP LOCKED` **and** the assign-write `UPDATE jobs SET status='processing', assigned_agent_id=$X WHERE id=$job` (`postgres.py:1029`) has **no CAS** — so two transient leaders genuinely send one job to two agents. **Do this in M1.** The column migrations below (`pause_requested_at`, `in_flight_turn_id`, `heal_in_progress_until`) stay M2.
+
+`_dispatch_lock` becomes unnecessary. Replace the candidate scan with `SELECT ... FOR UPDATE SKIP LOCKED` — **exactly what `fetch_next_due_cron_automation` (`postgres.py:9335`) already does for cron** — and add `WHERE assigned_agent_id IS NULL` (CAS) to the assign-write so a row can't be claimed twice. Copy that shape onto `get_dispatchable_jobs` (`postgres.py:2449`):
 
 ```sql
 SELECT id, ... FROM jobs
@@ -329,14 +338,16 @@ Still nothing exotic: Postgres + NATS only. No Redis, etcd, Zookeeper, Temporal.
 
 ## Open questions
 
-1. **Leader handoff mid-cycle.** A loop holding the lock that gets SIGTERM mid-cycle releases on connection close, but in-flight work may leave partial state. The `SKIP LOCKED` transaction makes dispatch safe; verify the other loops or add checkpointing.
-2. **Stale-agent detection latency.** 60s loop + 30s leader failover → worst-case detection 90s. Probably fine; confirm against SLO.
+1. **Leader handoff mid-cycle → graceful step-down.** On SIGTERM or a dropped lock-connection, the leader must *stop* the loops and release the lock in a `finally` (a cancelled asyncio task doesn't release it — GreptimeDB war story). The dispatcher's `SKIP LOCKED`+CAS makes a mid-cycle handoff safe; the other loops should commit progress transactionally. *(Research-informed.)*
+2. **Failover latency — RESOLVED (config, not design).** Clean shutdown releases the lock instantly; hard-failure detection is governed by Postgres TCP keepalives (Linux default ~2h). Tune `tcp_keepalives_*` (→ ~40s) + `idle_session_timeout` server-side. The doc's old flat "~30s" → "instant on clean shutdown, ~40s on hard failure (after tuning)."
 3. **`LISTEN/NOTIFY` payload limit (8000 bytes).** We send IDs only; document so future work doesn't grow the payload.
 4. **Probe behavior during DB outage.** A replica that can't reach Postgres can't acquire leadership and should fail readiness so the LB routes around it. Track 2 should make readiness DB-aware.
-5. **Failover latency during deploy.** Rolling `replicas: 2`, `maxUnavailable: 0` → zero-downtime steady state; during deploy the new replica waits ~30s for leader locks held by the draining old replica. Acceptable; document.
+5. **Failover latency during deploy.** Rolling `replicas: 2`, `maxUnavailable: 0` → zero-downtime steady state; a draining old leader releases the lock on clean shutdown (instant), so the new replica acquires promptly. Document.
 6. **Dispatcher wake latency.** With DB-level dispatch, a `NOTIFY`-on-job-insert can wake the dispatcher immediately (`_trigger_dispatch` already exists in-process). Follow-up; doesn't block Track 2.
-7. **`replicas: 2` after Layer 1 only.** **Yes** — leader election makes every loop singleton, so even at `replicas: 2` only one dispatcher/IMAP-poller runs. Layer 1 alone is the unlock; Layers 2-4 are scaling/correctness improvements. *(Confirmed still true at refresh — no leader-election code exists yet, so this remains the gating item.)*
-8. **(New) Daemon-side sudo reply subject.** Before deleting `_pending_msgs`, confirm the sudo daemon listens on the deterministic published `nats_reply_subject`, not a connection-bound `_INBOX.>` auto-inbox.
+7. **`replicas: 2` after Layer 1 only.** **Yes for steady state** — leader election makes the loops singleton. **But** the ~40s dual-leader partition window double-dispatches unless the dispatcher also has `SKIP LOCKED`+CAS and the other non-idempotent loops are DB-guarded — both now **folded into M1**. So the honest unlock = leader election **+ the dispatcher/loop resource-guards**.
+8. **Daemon-side sudo reply subject.** Before deleting `_pending_msgs`, confirm the sudo daemon listens on the deterministic published `nats_reply_subject`, not a connection-bound `_INBOX.>` auto-inbox.
+9. **Single leadership lock, not per-loop — RESOLVED (research).** Connection budget (pool `max_size` 10; a session lock pins a connection for life). Per-loop locks are an M2 load-spreading optimization with their own dedicated lock-pool.
+10. **External-Postgres pooler guard — (new, owed in M1).** `internal: false` could point at a transaction-mode pooler that breaks session locks. Add a startup self-check or a loud values/doc warning.
 
 ## Implementation phases
 
@@ -349,13 +360,17 @@ Each phase independently shippable, ordered so each improves posture even if the
 - [ ] Chaos test. **Local k3d mechanics verified 2026-06-24** (startupProbe no crash-loop on a ~5-min cold start, preStop 18s drain, PDB allows drain). **Live multi-node + real-traffic test deferred** to a quiet overnight window after M0 reaches dev — tracked in `docs/tests/orchestrator_m0_failover_verification.md` (runbook: `docs/operations/orchestrator_failover.md`).
 - [x] Document failover behavior in `docs/operations/orchestrator_failover.md`. (2026-06-24)
 
-### Phase 1 — Track 2 Layer 1: Leader election — GREENFIELD
-- [ ] `orchestrator/services/leader_election.py` with `with_leader_lock(name, loop_id, run, shutdown_event)` using **session-scoped** `pg_try_advisory_lock`.
-- [ ] Lock-ID registry module collecting `LOCK_ID`, `MAINT_LOCK_ID`, and new loop IDs (never collide).
-- [ ] Wrap every singleton loop registered at `main.py:5191-5323`; leave the already-HA-safe loops alone.
-- [ ] Log "leader changed" at INFO.
-- [ ] Tests: two orchestrators / one DB; exactly one runs each loop; kill the leader; follower takes over within 30s.
-- [ ] **Unlock:** `replicas: 2` becomes safe here.
+### Phase 1 — Track 2 Layer 1: Leader election — GREENFIELD (design refined by 2026-06-25 research)
+- [ ] `orchestrator/services/leader_election.py` — a **single** leadership lock (`run_as_leader`) via **session-scoped** `pg_try_advisory_lock(LEADER_ID)` on a **dedicated, reconnecting** connection (model on `reload.py:71-150`), with random startup jitter + graceful step-down (release in `finally`).
+- [ ] Lock-ID registry module: `LEADER_ID` alongside `LOCK_ID`/`MAINT_LOCK_ID` (packed-ASCII int64; never collide).
+- [ ] The elected leader starts the singleton loops registered in `lifespan` (confirm the current block at impl time); leave the already-HA-safe loops + `main_cloud_listen_task` running on all replicas.
+- [ ] **Dispatcher correctness (folded in from Layer 2):** port `get_dispatchable_jobs` to `FOR UPDATE SKIP LOCKED` + add `WHERE assigned_agent_id IS NULL` CAS to the assign-write (`postgres.py:1029`) — closes the dual-leader double-assign.
+- [ ] **Failover tuning:** set `tcp_keepalives_*` + `idle_session_timeout` on the Postgres deployment (chart values); document instant-clean / ~40s-hard.
+- [ ] **External-pooler guard:** startup self-check (or loud doc/values warning) that the DB connection isn't transaction-pooled.
+- [ ] Harden other non-idempotent loops at the resource: `UNIQUE(email_message_id)`+`ON CONFLICT` (imap), CAS on delegation resume, insert-marker-before-send (notify/digest).
+- [ ] Log "leader acquired/lost" at INFO.
+- [ ] Tests (pytest + `PostgresContainer`, base = `tests/test_audit_store.py`): two asyncpg sessions / one DB → exactly one acquires; kill the leader's connection → follower acquires within the poll interval.
+- [ ] **Unlock:** `replicas: 2` becomes safe here (with the dispatcher/loop guards above).
 
 ### Phase 2 — Track 2 Layer 2: DB-level coordination — PORT THE PROVEN PATTERN
 - [ ] Port `get_dispatchable_jobs` to `FOR UPDATE SKIP LOCKED` (model on `fetch_next_due_cron_automation`); remove `_dispatch_lock`.
@@ -441,6 +456,7 @@ Each phase independently shippable, ordered so each improves posture even if the
 - **2026-06-24:** **Leader election (Layer 1) confirmed as the single greenfield primitive and the gating item for `replicas: 2`.** Must use *session*-scoped `pg_advisory_lock` (all existing locks are xact-scoped). Stale `MIGRATION_LOCK_ID` reference corrected to `LOCK_ID`.
 - **2026-06-24:** Deployment references repointed from `deployment/legacy/` (frozen, ignored by Fleet) to `helm/` (the live path).
 - **2026-06-24:** Added the **Roadmap** section — milestone sequencing (M0-M4) across both HA docs. Separates M1 (failover HA, no data-tier dependency) from M2 (scale-out), and defines a minimum vs full OSS-release bar with external/managed Postgres as a legitimate posture for the minimum bar. Dependency-ordered, no calendar dates set.
+- **2026-06-25 (research):** Web + codebase research (`docs/researches/orchestrator_leader_election.md`, 5-agent) validated advisory lock over k8s Lease (Python Lease ecosystem immature: ConfigMap-only client, Lease PR closed unmerged) and **verified no connection pooler** (session locks safe; external-Postgres mode is the one risk). Four corrections folded into Layer 1 / M1: **single leadership lock** on a dedicated connection (not per-loop — connection budget); **mandatory Postgres TCP-keepalive tuning** (else ~2h hard-failure failover); **leader election = efficiency-not-correctness** → the dispatcher's `SKIP LOCKED` + assign-write CAS (`postgres.py:1029` has none today) moves **into M1**; **graceful step-down** (release in `finally`). New owed item: external-pooler startup guard.
 
 ## Sources
 
