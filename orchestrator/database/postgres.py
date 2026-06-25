@@ -2597,6 +2597,35 @@ class PostgresDB:
             )
             return row is not None
 
+    async def claim_delegation_resume(self, job_id: str) -> bool:
+        """Atomically transition a timed-out delegation parent waiting → paused.
+
+        Returns True iff THIS call performed the transition (clearing the
+        agent so the dispatcher re-queues it for resume). Two delegation
+        timeout sweepers in the transient dual-leader window both detect the
+        same elapsed timeout; this CAS (``WHERE status = 'waiting'``) ensures
+        exactly one re-queues the parent, so it is never resumed twice with
+        partial results. Mirrors update_job_status' assigned_agent_id → NULL.
+        """
+        try:
+            job_uuid = UUID(job_id)
+        except ValueError:
+            return False
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                UPDATE jobs
+                   SET status = 'paused',
+                       assigned_agent_id = NULL,
+                       updated_at = CURRENT_TIMESTAMP
+                 WHERE id = $1
+                   AND status = 'waiting'
+                RETURNING id
+                """,
+                job_uuid,
+            )
+            return row is not None
+
     async def get_dispatchable_jobs(self, limit: int = 20) -> List[Dict[str, Any]]:
         """Get jobs waiting for assignment, ordered by priority then creation time.
 
