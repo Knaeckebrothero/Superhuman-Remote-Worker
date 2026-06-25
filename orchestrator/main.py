@@ -4139,6 +4139,18 @@ async def _try_dispatch_pending_jobs() -> None:
                     break  # No more free agents
 
                 job_id = str(job["id"])
+                # Atomically claim the job for this agent BEFORE notifying the
+                # pod. Closes the dual-leader double-assign that leader election
+                # cannot fence (M1): two transient leaders may both scan the same
+                # candidate, but only one CAS wins — the loser skips. The claim
+                # sets status='processing'+assigned_agent_id; a failed
+                # dispatch/resume below self-heals via recover_orphaned_jobs.
+                if not await postgres_db.claim_job_for_agent(job_id, str(agent["id"])):
+                    logger.debug(
+                        "Dispatcher: job %s already claimed by another replica; skipping",
+                        job_id,
+                    )
+                    continue
                 if job["status"] == "paused":
                     success = await _resume_job_on_agent(job, agent)
                 else:
