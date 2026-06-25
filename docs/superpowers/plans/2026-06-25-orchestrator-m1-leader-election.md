@@ -1,5 +1,7 @@
 # Orchestrator M1 — Leader Election Implementation Plan
 
+**Status (2026-06-25): Tasks 1-4 SHIPPED** — committed on `develop` (unpushed), tested with PostgresContainer (testcontainers via the podman socket). `replicas: 2` is now correctness-safe: leader election (`4233ffca`), lifespan wiring + loop gating (`d8c69c95`), atomic CAS job claim (`2621376a`), Postgres keepalive tuning + pooler warning (`31349f55`). **Tasks 5 (defense-in-depth loop hardening — imap UNIQUE-index migration, delegation CAS, digest/notify guards) and 6 (two-replica verification + docs) are DEFERRED** to a focused fresh pass. Note: Task 2 used a `run_when_leader` registration-site wrapper (not the per-tick gate the tasks below describe) — see `services/leader_election.py`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make `replicas: 2+` of the orchestrator safe by running the singleton background loops on exactly one elected replica, with the correctness-critical dispatch path additionally guarded at the database.
