@@ -8721,6 +8721,49 @@ class PostgresDB:
         # result is like "UPDATE N"
         return int(result.split()[-1]) if result else 0
 
+    async def claim_pending_notifications(
+        self, user_id: str
+    ) -> List[Dict[str, Any]]:
+        """Atomically claim a user's undelivered notifications for a digest.
+
+        Stamps ``delivered_at = NOW()`` and RETURNs only the rows THIS call
+        flipped (``delivered_at`` was NULL). Two quiet-hours digest loops in
+        the transient dual-leader window therefore split the pending set
+        disjointly — in practice one claims all and the other gets none — so a
+        digest email is never sent twice. If dispatch then fails, release the
+        claim with ``unmark_notifications_delivered`` so it retries next cycle.
+        """
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                UPDATE notification_queue
+                   SET delivered_at = NOW()
+                 WHERE user_id = $1 AND delivered_at IS NULL
+                RETURNING id, user_id, job_id, thread_id, subject, message,
+                          channels, queued_at
+                """,
+                UUID(user_id),
+            )
+        return [dict(r) for r in rows]
+
+    async def unmark_notifications_delivered(self, ids: List[str]) -> int:
+        """Release a digest claim (``delivered_at`` → NULL) so the
+        notifications are retried next cycle. Used when dispatch fails after
+        ``claim_pending_notifications`` won them. Returns count updated."""
+        if not ids:
+            return 0
+        uuids = [UUID(i) for i in ids]
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE notification_queue
+                SET delivered_at = NULL
+                WHERE id = ANY($1::uuid[])
+                """,
+                uuids,
+            )
+        return int(result.split()[-1]) if result else 0
+
     async def get_users_exiting_quiet_hours(
         self,
         check_window_minutes: int = 5,

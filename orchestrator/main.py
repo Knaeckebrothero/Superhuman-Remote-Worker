@@ -954,22 +954,30 @@ async def quiet_hours_digest_loop(shutdown_event: asyncio.Event) -> None:
                 if notification_service._is_in_quiet_hours(user_settings):
                     continue
 
-                pending = await postgres_db.get_pending_notifications(user_id)
-                if not pending:
+                # Atomically claim the pending set before sending. Two digest
+                # loops in the transient dual-leader window otherwise both read
+                # the same pending rows and both send the digest; claiming
+                # (delivered_at NULL → NOW, RETURNING) lets exactly one win.
+                # Release the claim if dispatch fails so it retries next cycle.
+                claimed = await postgres_db.claim_pending_notifications(user_id)
+                if not claimed:
                     continue
 
-                await notification_service.dispatch_digest(
-                    user_id=user_id,
-                    notifications=[dict(n) for n in pending],
-                )
-
-                ids = [str(n["id"]) for n in pending]
-                await postgres_db.mark_notifications_delivered(ids)
+                try:
+                    await notification_service.dispatch_digest(
+                        user_id=user_id,
+                        notifications=[dict(n) for n in claimed],
+                    )
+                except Exception:
+                    await postgres_db.unmark_notifications_delivered(
+                        [str(n["id"]) for n in claimed]
+                    )
+                    raise
 
                 logger.info(
                     "Digest sent to user %s: %d notification(s)",
                     user_id[:8],
-                    len(pending),
+                    len(claimed),
                 )
         except Exception as e:
             logger.error(f"Quiet hours digest loop error: {e}")
