@@ -156,12 +156,11 @@ code changes that need a redeploy.
    is now tracked in its own doc,
    [`cross_pod_resume_cold_starts_checkpoint_not_replicated.md`](cross_pod_resume_cold_starts_checkpoint_not_replicated.md):
    the checkpoint is never pushed to shared storage (not even at phase
-   boundaries, contrary to the assumption above), so the real fix is to
-   replicate `checkpoint.db` to the shared workspace at snapshot time + pull it
-   back on resume, then add **snapshot-on-pause** (push the checkpoint at the
-   graceful-pause point) so a job preempted mid-phase-0 has a recovery point. A
-   **grace period** (don't preempt before a recovery point exists) is only a
-   useful complement once that replication works.
+   boundaries, contrary to the assumption above). The recommended fix
+   (probe-verified 2026-06-25) is a **shared Postgres checkpointer**
+   (`AsyncSqliteSaver` → `AsyncPostgresSaver`) so the live checkpoint is cross-pod
+   by construction; the snapshot-bridge + snapshot-on-pause approach is demoted to
+   a fallback. See that doc for the probe data and the retention requirement.
 5. **A1 — Loop-job priority/idempotency.** Make loop-job priority configurable
    (and default it above 5 for dedicated runs) so a loop isn't trivially
    preempted; keep early-phase actions idempotent (KB writes already are).

@@ -49,3 +49,24 @@ def build_postgres_url(
     if fallback_env:
         return os.getenv(fallback_env)
     return None
+
+
+def checkpointer_backend() -> str:
+    """Which LangGraph checkpointer the worker uses: ``postgres`` (shared,
+    cross-pod resume) or ``sqlite`` (legacy pod-local). Default ``sqlite`` for a
+    safe, flag-gated rollout."""
+    return os.getenv("CHECKPOINTER_BACKEND", "sqlite").strip().lower()
+
+
+def resolve_checkpoint_url() -> Optional[str]:
+    """Resolve the Postgres checkpoint DSN.
+
+    Prefers a dedicated store — a full ``CHECKPOINT_DB_URL`` DSN, then discrete
+    ``CHECKPOINT_*`` parts — and falls back to the app DB (``POSTGRES_*`` /
+    ``DATABASE_URL``). Returns ``None`` if nothing is configured.
+    """
+    return (
+        os.getenv("CHECKPOINT_DB_URL")
+        or build_postgres_url("CHECKPOINT")
+        or build_postgres_url("POSTGRES", fallback_env="DATABASE_URL")
+    )

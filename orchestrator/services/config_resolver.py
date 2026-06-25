@@ -27,6 +27,19 @@ from src.core.loader import (
     serialize_resolved_config,
 )
 
+# Prompt segments a DB/forked expert may override — one family-agnostic version
+# each (model adaptation stays in the systemprompt_<family> wrapper). persona +
+# instructions are v1 (migration 0028); strategic/tactical/summarization are
+# Part 2 (full DB-expert prompt parity). Reused to build the ``_db_prompt_keys``
+# provenance marker the render path fences on.
+_OVERLAY_PROMPT_KEYS = (
+    "persona",
+    "instructions",
+    "strategic",
+    "tactical",
+    "summarization",
+)
+
 
 def _raw_leaf_llm_keys(config_path: str) -> set:
     """llm keys explicitly set in the base config's own leaf file.
@@ -106,6 +119,13 @@ def resolve_config(
         data, prompts_override = build_expert_config(data, expert_row)
         # decision 7: mark the DB-authored persona so the render path fences it.
         data["_persona_source"] = "db"
+        # Part 2: record which prompt segments are DB-authored (untrusted) so the
+        # render path fences strategic/tactical (fence_phase_directive) and brace-
+        # escapes summarization. Only the segments actually present in the row —
+        # inherited (disk) segments stay trusted.
+        data["_db_prompt_keys"] = [
+            k for k in _OVERLAY_PROMPT_KEYS if prompts_override.get(k)
+        ]
 
     for layer in (project_overrides, db_overrides, user_settings, request_override):
         if layer:
@@ -124,11 +144,12 @@ def resolve_config(
     config = load_agent_config_from_dict(data, deployment_dir=deployment_dir)
     blob = serialize_resolved_config(config, model=config.llm.model)
 
-    # Overlay the DB expert's persona/instructions onto the resolved prompts so
-    # the frozen blob matches what the render path emits: serialize_resolved_config
-    # only sees disk + config, never the expert row's out-of-band prompts. Fenced
-    # at render via the _persona_source marker (decision 7).
-    for _k in ("persona", "instructions"):
+    # Overlay the DB expert's prompt segments onto the resolved prompts so the
+    # frozen blob matches what the render path emits: serialize_resolved_config
+    # only sees disk + config, never the expert row's out-of-band prompts. The
+    # untrusted segments are fenced at render via the _persona_source /
+    # _db_prompt_keys markers (decision 7 + Part 2).
+    for _k in _OVERLAY_PROMPT_KEYS:
         if prompts_override.get(_k):
             blob["prompts"][_k] = prompts_override[_k]
 

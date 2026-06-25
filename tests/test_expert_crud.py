@@ -13,6 +13,7 @@ from fastapi import HTTPException
 from orchestrator.main import (
     ExpertCreate,
     ExpertUpdate,
+    _bundled_expert_bundle,
     _db_expert_to_bundle_src,
     _validate_expert_fragment,
 )
@@ -66,6 +67,52 @@ def test_validate_fragment_allows_clean_config():
 def test_update_excludes_immutable_fields():
     assert "name" not in ExpertUpdate.model_fields
     assert "expert_type" not in ExpertUpdate.model_fields
+
+
+# --- Part 2: prompt-key allow-list + fork fidelity ---
+
+
+def test_expert_create_accepts_known_prompt_keys():
+    e = ExpertCreate(
+        name="coder",
+        display_name="Coder",
+        expert_type="worker",
+        prompts={
+            "persona": "p",
+            "strategic": "s",
+            "tactical": "t",
+            "summarization": "z",
+        },
+    )
+    assert e.prompts["strategic"] == "s"
+
+
+def test_expert_create_rejects_unknown_prompt_key():
+    with pytest.raises(Exception):
+        ExpertCreate(
+            name="coder",
+            display_name="Coder",
+            expert_type="worker",
+            prompts={"bogus": "x"},
+        )
+
+
+def test_expert_update_rejects_unknown_prompt_key():
+    with pytest.raises(Exception):
+        ExpertUpdate(prompts={"systemprompt": "x"})
+
+
+def test_bundled_expert_bundle_captures_all_prompt_segments():
+    """Fork fidelity: bundling a worker captures strategic/tactical/summarization,
+    not just persona+instructions (critic ships all five)."""
+    bundle = _bundled_expert_bundle("critic")
+    if bundle is None:
+        pytest.skip("critic bundled expert not found in this env")
+    prompts = bundle["prompts"]
+    assert prompts.get("strategic", "").strip()
+    assert prompts.get("tactical", "").strip()
+    assert prompts.get("summarization", "").strip()
+    assert "persona" in prompts  # still captured
 
 
 def test_update_payload_drops_unset_fields():

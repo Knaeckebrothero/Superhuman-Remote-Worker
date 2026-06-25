@@ -25,6 +25,7 @@ import aiosqlite
 import yaml
 from langchain_core.language_models import BaseChatModel
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+from langgraph.checkpoint.base import BaseCheckpointSaver
 
 from .core.loader import (
     AgentConfig,
@@ -58,6 +59,12 @@ from .tools.description_manager import (
     generate_workspace_tool_docs,
     apply_description_overrides,
 )
+from .utils.db_url import checkpointer_backend, resolve_checkpoint_url
+
+# Set True once per agent process after the Postgres checkpoint schema has been
+# ensured. AsyncPostgresSaver.setup() is idempotent, but there's no need to run
+# it on every job.
+_PG_CHECKPOINT_SCHEMA_READY = False
 
 
 class _AiosqliteConnectionWrapper:
@@ -155,8 +162,8 @@ class UniversalAgent:
         self._llm_with_tools: Optional[BaseChatModel] = None
         self._tools: Optional[List] = None
         self._graph = None
-        self._checkpointer: Optional[AsyncSqliteSaver] = None
-        self._checkpoint_conn: Optional[aiosqlite.Connection] = None
+        self._checkpointer: Optional[BaseCheckpointSaver] = None
+        self._checkpoint_conn: Optional[Any] = None
 
         # Phase-specific LLMs (created if phase overrides configured)
         self._strategic_llm: Optional[BaseChatModel] = None
@@ -753,13 +760,9 @@ class UniversalAgent:
                     return self._yield_error_state(freeze_state)
                 return freeze_state
 
-            # Create checkpointer for this job (enables resume after crash)
-            checkpoint_path = self._get_checkpoint_path(job_id)
-            self._checkpoint_conn = await aiosqlite.connect(checkpoint_path)
-            # Wrap connection to add is_alive() for langgraph-checkpoint-sqlite 3.x compatibility
-            wrapped_conn = _AiosqliteConnectionWrapper(self._checkpoint_conn)
-            self._checkpointer = AsyncSqliteSaver(wrapped_conn)
-            logger.info(f"Checkpointer initialized at {checkpoint_path}")
+            # Create checkpointer for this job (enables resume after crash, and
+            # — with CHECKPOINTER_BACKEND=postgres — cross-pod resume).
+            await self._make_checkpointer(job_id)
 
             # Create snapshot manager for phase recovery
             # Pass workspace backend so snapshots are extracted from VM to pod-local storage
@@ -953,6 +956,51 @@ class UniversalAgent:
                 # Return async generator that yields the error state
                 return self._yield_error_state(error_state)
             return error_state
+
+    async def _make_checkpointer(self, job_id: str) -> None:
+        """Create the LangGraph checkpointer for this job per CHECKPOINTER_BACKEND.
+
+        Sets self._checkpointer and self._checkpoint_conn. backend='postgres'
+        stores graph state in shared Postgres (keyed by thread_id=job_id) so a
+        resume on any pod reads it via the graph's aget_state — fixing cross-pod
+        cold-starts. Default 'sqlite' keeps the legacy pod-local checkpoint.
+        """
+        backend = checkpointer_backend()
+        if backend == "postgres":
+            from psycopg import AsyncConnection
+            from psycopg.rows import dict_row
+            from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+
+            url = resolve_checkpoint_url()
+            if not url:
+                raise RuntimeError(
+                    "CHECKPOINTER_BACKEND=postgres but no checkpoint DB URL "
+                    "configured (set CHECKPOINT_DB_URL, CHECKPOINT_*, or "
+                    "POSTGRES_*/DATABASE_URL)."
+                )
+            conn = await AsyncConnection.connect(
+                url, autocommit=True, prepare_threshold=0, row_factory=dict_row
+            )
+            self._checkpoint_conn = conn
+            self._checkpointer = AsyncPostgresSaver(conn)
+            await self._ensure_pg_checkpoint_schema()
+            logger.info("Checkpointer initialized (postgres, thread_id=%s)", job_id)
+        else:
+            checkpoint_path = self._get_checkpoint_path(job_id)
+            self._checkpoint_conn = await aiosqlite.connect(checkpoint_path)
+            # Wrap to add is_alive() for langgraph-checkpoint-sqlite 3.x.
+            wrapped_conn = _AiosqliteConnectionWrapper(self._checkpoint_conn)
+            self._checkpointer = AsyncSqliteSaver(wrapped_conn)
+            logger.info(f"Checkpointer initialized at {checkpoint_path}")
+
+    async def _ensure_pg_checkpoint_schema(self) -> None:
+        """Run AsyncPostgresSaver.setup() once per process (idempotent DDL)."""
+        global _PG_CHECKPOINT_SCHEMA_READY
+        if _PG_CHECKPOINT_SCHEMA_READY:
+            return
+        await self._checkpointer.setup()
+        _PG_CHECKPOINT_SCHEMA_READY = True
+        logger.info("Postgres checkpoint schema ensured")
 
     async def _cleanup_checkpointer(self) -> None:
         """Clean up checkpointer connection."""
