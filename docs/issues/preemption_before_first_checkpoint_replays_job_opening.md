@@ -107,7 +107,11 @@ gap until the job has finished at least one phase.
   preemptors. See
   [`critic_failure_leaves_parent_job_stuck_reviewing.md`](critic_failure_leaves_parent_job_stuck_reviewing.md).
 - **D3 — Cold-restart on early-phase cross-pod resume.** The intersection
-  described above (the agent/orchestrator side of the bug).
+  described above (the agent/orchestrator side of the bug). A later code read
+  found this is broader than "early-phase": the checkpoint is *never* replicated
+  to shared storage, so **any** cross-pod resume cold-starts, even after a phase
+  boundary. Tracked separately in
+  [`cross_pod_resume_cold_starts_checkpoint_not_replicated.md`](cross_pod_resume_cold_starts_checkpoint_not_replicated.md).
 - **A1 — Loop jobs are low priority.** Loop jobs are created at **priority 5**
   (`orchestrator/services/project_loops.py` `create_loop_job` →
   `create_job(..., priority=5)`; `postgres.py:822` default is also 5), making
@@ -148,14 +152,16 @@ code changes that need a redeploy.
    any job from the preemptor set that already failed to place in Phase 1/1.5
    this cycle, or that has been `paused`+agentless beyond a staleness threshold.
    A job that can never run is not a live priority.
-4. **D3 — Make early-phase resume survive a pod move.** Pick one (or both):
-   - **Grace period (cheapest):** do not preempt a job that has not yet reached
-     its first phase boundary — i.e., that has no recoverable snapshot. Give it
-     a checkpoint to resume from before it can be evicted.
-   - **Snapshot on pause:** when gracefully pausing, push the current
-     `checkpoint.db` to the shared workspace as a snapshot (not only at phase
-     boundaries) so a different pod's `_resume_from_snapshot` can recover the
-     in-progress phase instead of cold-starting.
+4. **D3 — Make resume survive a pod move.** This is bigger than first scoped and
+   is now tracked in its own doc,
+   [`cross_pod_resume_cold_starts_checkpoint_not_replicated.md`](cross_pod_resume_cold_starts_checkpoint_not_replicated.md):
+   the checkpoint is never pushed to shared storage (not even at phase
+   boundaries, contrary to the assumption above), so the real fix is to
+   replicate `checkpoint.db` to the shared workspace at snapshot time + pull it
+   back on resume, then add **snapshot-on-pause** (push the checkpoint at the
+   graceful-pause point) so a job preempted mid-phase-0 has a recovery point. A
+   **grace period** (don't preempt before a recovery point exists) is only a
+   useful complement once that replication works.
 5. **A1 — Loop-job priority/idempotency.** Make loop-job priority configurable
    (and default it above 5 for dedicated runs) so a loop isn't trivially
    preempted; keep early-phase actions idempotent (KB writes already are).
@@ -205,6 +211,7 @@ wasted compute + latency, not correctness.
 
 ## Related
 
+- [`cross_pod_resume_cold_starts_checkpoint_not_replicated.md`](cross_pod_resume_cold_starts_checkpoint_not_replicated.md) — the deeper defect under D3: the checkpoint is never replicated to shared storage, so any cross-pod resume cold-starts. The robust fix for this incident's restarts lives there.
 - [`critic_failure_leaves_parent_job_stuck_reviewing.md`](critic_failure_leaves_parent_job_stuck_reviewing.md) — the upstream source of the zombie preemptors.
 - [`lifecycle_session_agents_without_thread_never_drain.md`](lifecycle_session_agents_without_thread_never_drain.md) — sibling lifecycle-reaper gap.
 - `docs/features/project_self_improvement_loop.md` — the feature whose first real run surfaced this.
