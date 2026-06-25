@@ -3659,6 +3659,15 @@ def get_phase_system_prompt(
         is_strategic, resolver
     )
 
+    # Part 2: fence a DB-authored (untrusted) phase directive — brace-safe +
+    # subordinate to system/safety. Only when this segment came from a DB expert
+    # row (_db_prompt_keys); bundled/disk phase prompts stay trusted. Brace-
+    # stripping also makes the .format(phase_number=...) below a safe no-op.
+    if prompt_type_key in config.extra.get("_db_prompt_keys", ()):
+        from src.core.expert_resolution import fence_phase_directive
+
+        phase_component = fence_phase_directive(phase_component)
+
     # Render Jinja2 conditionals BEFORE .format() — Python's str.format()
     # chokes on {%..%} blocks. Jinja2 leaves single-brace placeholders untouched.
     cli_ds = config.extra.get("_cli_datasources", [])
@@ -3771,6 +3780,14 @@ def load_summarization_prompt(config: AgentConfig, model: str = "") -> str:
     # Check for pre-resolved content (from resolved_config JSONB)
     resolved = config.extra.get("_resolved_prompts", {})
     template = resolved.get("summarization") or ""
+
+    # Part 2: a DB-authored summarization prompt is untrusted user text that flows
+    # through format_map() in the summarizer (auxiliary.py) — escape its braces so
+    # stray '{'/'}' can't raise ValueError. Forgoes {conversation}/
+    # {max_summary_length} substitution (the conversation is delivered as a
+    # separate message regardless). Disk/bundled templates keep their placeholders.
+    if template and "summarization" in config.extra.get("_db_prompt_keys", ()):
+        template = template.replace("{", "{{").replace("}", "}}")
 
     if not template:
         model_family = family_of(model) if model else "default"

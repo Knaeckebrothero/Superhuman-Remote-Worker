@@ -107,6 +107,62 @@ def test_bundled_base_has_no_persona_source_marker():
     """Only DB experts are fenced — a plain base resolve carries no marker."""
     blob = resolve_config(base_config_name="persistent_defaults")
     assert "_persona_source" not in blob["agent"]
+    assert "_db_prompt_keys" not in blob["agent"]
+
+
+# --- Part 2: DB-expert phase-prompt parity ----------------------------------
+
+
+def test_expert_overlays_phase_prompts_and_marks_db_keys():
+    """A DB expert carrying strategic/tactical/summarization gets them overlaid
+    into the blob, and each overridden segment is recorded in _db_prompt_keys so
+    the render path fences the untrusted phase content."""
+    row = {
+        "expert_type": "session",
+        "name": "sess-helper",
+        "config": {"llm": {"model": "gemma-4-moe"}},
+        "prompts": {
+            "persona": "P",
+            "instructions": "I",
+            "strategic": "STRAT-SENTINEL",
+            "tactical": "TAC-SENTINEL",
+            "summarization": "SUMM-SENTINEL",
+        },
+    }
+    blob = resolve_config(
+        base_config_name="persistent_defaults",
+        expert_row=row,
+        expert_type="session",
+    )
+    assert blob["prompts"]["strategic"] == "STRAT-SENTINEL"
+    assert blob["prompts"]["tactical"] == "TAC-SENTINEL"
+    assert blob["prompts"]["summarization"] == "SUMM-SENTINEL"
+    assert set(blob["agent"]["_db_prompt_keys"]) == {
+        "persona",
+        "instructions",
+        "strategic",
+        "tactical",
+        "summarization",
+    }
+
+
+def test_inherited_phase_prompts_are_not_marked_db():
+    """An expert overriding only persona must NOT mark strategic/tactical as
+    DB-authored — those inherit the trusted disk default and stay unfenced."""
+    row = {
+        "expert_type": "session",
+        "name": "sess-helper",
+        "config": {},
+        "prompts": {"persona": "only persona"},
+    }
+    blob = resolve_config(
+        base_config_name="persistent_defaults",
+        expert_row=row,
+        expert_type="session",
+    )
+    assert blob["agent"]["_db_prompt_keys"] == ["persona"]
+    # The blob still carries a (disk-resolved) strategic — just not DB-marked.
+    assert "strategic" not in blob["agent"]["_db_prompt_keys"]
 
 
 # --- credential delivery / strip-for-persist contract -----------------------

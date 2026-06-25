@@ -93,7 +93,7 @@ from fastapi.responses import (  # noqa: E402
     StreamingResponse,
 )
 
-from pydantic import BaseModel, Field, model_validator  # noqa: E402
+from pydantic import BaseModel, Field, field_validator, model_validator  # noqa: E402
 
 from database import (  # noqa: E402
     PostgresDB,
@@ -18221,6 +18221,27 @@ async def get_expert(request: Request, expert_id: str) -> dict[str, Any]:
 # is a pure executor). The save-time hard-deny scan is the credential boundary;
 # per-user grants are Slice 2. Gated by EXPERTS_DB_ENABLED (on in dev, off prod).
 
+# Prompt segments a DB expert may carry (mirrors
+# config_resolver._OVERLAY_PROMPT_KEYS). persona+instructions are v1 (migration
+# 0028); strategic/tactical/summarization are Part 2 (full prompt parity). The DB
+# column is open JSONB, so this allow-list is the write-side guard.
+_ALLOWED_EXPERT_PROMPT_KEYS = {
+    "persona",
+    "instructions",
+    "strategic",
+    "tactical",
+    "summarization",
+}
+
+
+def _validate_expert_prompts(v: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Reject unknown keys in an expert ``prompts`` payload (defense-in-depth)."""
+    if v:
+        unknown = set(v) - _ALLOWED_EXPERT_PROMPT_KEYS
+        if unknown:
+            raise ValueError(f"Unknown prompt keys: {sorted(unknown)}")
+    return v
+
 
 class ExpertCreate(BaseModel):
     """Create a DB-backed expert (Slice 1: hard-deny validated; grants in S2)."""
@@ -18235,6 +18256,11 @@ class ExpertCreate(BaseModel):
     config: dict[str, Any] = {}
     prompts: dict[str, Any] = {}
 
+    @field_validator("prompts")
+    @classmethod
+    def _check_prompts(cls, v: dict[str, Any]) -> dict[str, Any]:
+        return _validate_expert_prompts(v)
+
 
 class ExpertUpdate(BaseModel):
     """Patch a DB expert; expert_type is immutable (decision 3) so it is absent."""
@@ -18246,6 +18272,11 @@ class ExpertUpdate(BaseModel):
     tags: list[str] | None = None
     config: dict[str, Any] | None = None
     prompts: dict[str, Any] | None = None
+
+    @field_validator("prompts")
+    @classmethod
+    def _check_prompts(cls, v: dict[str, Any] | None) -> dict[str, Any] | None:
+        return _validate_expert_prompts(v)
 
 
 class SkillInfo(BaseModel):
@@ -18557,8 +18588,18 @@ def _bundled_expert_bundle(expert_id: str) -> dict[str, Any] | None:
     raw = yaml.safe_load(config_path.read_text()) or {}
     extends = raw.pop("$extends", "defaults")
     raw.pop("connections", None)
+    # Part 2: capture all prompt segments a fork should round-trip — base
+    # (family-agnostic) files only. Disk family variants (strategic_gpt_5.txt …)
+    # stay a bundled/framework concern; the fork keeps the base, which is strictly
+    # better than the old persona+instructions-only bundle that dropped the rest.
     prompts: dict[str, Any] = {}
-    for key, fname in (("persona", "persona.txt"), ("instructions", "instructions.md")):
+    for key, fname in (
+        ("persona", "persona.txt"),
+        ("instructions", "instructions.md"),
+        ("strategic", "strategic.txt"),
+        ("tactical", "tactical.txt"),
+        ("summarization", "summarization_prompt.txt"),
+    ):
         fp = expert_dir / fname
         if fp.exists():
             prompts[key] = fp.read_text(encoding="utf-8")

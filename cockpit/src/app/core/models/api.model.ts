@@ -75,7 +75,8 @@ export interface ExpertDetail extends Expert {
   name?: string;
   owner_id?: string;
   version?: number;
-  /** Persona + instructions fragment (DB-backed experts). */
+  /** Prompt segments for DB-backed experts: persona, instructions, and (Part 2)
+   *  strategic, tactical, summarization. Empty/absent segments inherit the base. */
   prompts?: Record<string, unknown>;
 }
 

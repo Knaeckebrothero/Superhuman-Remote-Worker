@@ -929,7 +929,14 @@ class PostgresDB:
                 uuid_val,
             )
 
-        return result == "UPDATE 1"
+        cancelled = result == "UPDATE 1"
+        if cancelled:
+            # Terminal → prune the LangGraph checkpoint (no-op on sqlite backend).
+            try:
+                await self.delete_checkpoint_thread(job_id)
+            except Exception as e:
+                logger.debug("checkpoint prune skipped for %s: %s", job_id, e)
+        return cancelled
 
     async def pause_job(self, job_id: str) -> bool:
         """Pause a running job. Clears assigned_agent_id so the agent is freed.
@@ -1024,7 +1031,46 @@ class PostgresDB:
         async with self.acquire() as conn:
             result = await conn.execute(query, *values)
 
-        return result == "UPDATE 1"
+        updated = result == "UPDATE 1"
+        if updated and status in ("completed", "failed", "cancelled"):
+            # Terminal → the LangGraph checkpoint is dead; prune it. Self-gates on
+            # CHECKPOINTER_BACKEND and is non-fatal — cleanup must never break a
+            # status update.
+            try:
+                await self.delete_checkpoint_thread(job_id)
+            except Exception as e:
+                logger.debug("checkpoint prune skipped for %s: %s", job_id, e)
+        return updated
+
+    async def delete_checkpoint_thread(self, thread_id: str) -> int:
+        """Prune LangGraph checkpoint rows for a terminal job (thread_id=job_id).
+
+        No-op unless ``CHECKPOINTER_BACKEND=postgres`` (the only mode that writes
+        checkpoints to this DB). Mirrors ``AsyncPostgresSaver.adelete_thread``
+        across the 3 checkpoint tables. Non-fatal and table-existence tolerant so
+        it is safe on a sqlite-backed deployment.
+
+        Returns the number of rows deleted.
+        """
+        if os.getenv("CHECKPOINTER_BACKEND", "sqlite").strip().lower() != "postgres":
+            return 0
+        total = 0
+        async with self.acquire() as conn:
+            for table in ("checkpoint_writes", "checkpoint_blobs", "checkpoints"):
+                try:
+                    result = await conn.execute(
+                        f"DELETE FROM {table} WHERE thread_id = $1", thread_id
+                    )
+                    if isinstance(result, str) and result.startswith("DELETE "):
+                        total += int(result.split()[1])
+                except Exception as e:
+                    logger.debug(
+                        "delete_checkpoint_thread: %s skip for %s (%s)",
+                        table,
+                        thread_id,
+                        e,
+                    )
+        return total
 
     async def update_job_merge_status(
         self,
