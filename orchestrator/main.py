@@ -147,6 +147,10 @@ from routers import project_loops_router  # noqa: E402
 from routers.sessions import router as sessions_router  # noqa: E402
 from services.cron_dispatcher import cron_dispatcher_loop  # noqa: E402
 from services.project_loop_sweeper import project_loop_sweeper_loop  # noqa: E402
+from services.stale_verification_sweeper import (  # noqa: E402
+    stale_verification_sweeper_loop,
+)
+from services.dispatch_guards import preemption_blocked_reason  # noqa: E402
 from services.litellm_gateway import (  # noqa: E402
     LiteLLMClient,
     _parse_quota_policy,
@@ -4119,8 +4123,13 @@ async def _try_dispatch_pending_jobs() -> None:
                     # Agent heartbeats "ready" → _trigger_dispatch() → next
                     # cycle matches it.
 
-            # Phase 2: Preemption (non-blocking)
-            remaining = [j for j in pending_jobs if str(j["id"]) not in matched_job_ids]
+            # Phase 2: Preemption (non-blocking). D1 placeability guard: only
+            # workspace-ready jobs (dispatchable_jobs, not the full pending set)
+            # may drive preemption — pausing a running job to free an agent is
+            # pointless for a job that has no workspace to run in.
+            remaining = [
+                j for j in dispatchable_jobs if str(j["id"]) not in matched_job_ids
+            ]
             if not remaining:
                 return
 
@@ -4131,6 +4140,24 @@ async def _try_dispatch_pending_jobs() -> None:
             for pending_job in remaining:
                 pending_priority = pending_job.get("priority", 5)
                 pending_job_id = str(pending_job["id"])
+
+                # D1 Guard 2: a verification/critic subjob whose parent is
+                # already terminal can never run, so it must not preempt — even
+                # if it slipped past Guard 1 by inheriting a (now-dead) parent
+                # workspace. Costs one lookup, only for sub-jobs reaching Phase 2.
+                parent_status = None
+                parent_id = pending_job.get("parent_job_id")
+                if parent_id:
+                    parent = await postgres_db.get_job(str(parent_id))
+                    parent_status = parent.get("status") if parent else None
+                block_reason = preemption_blocked_reason(pending_job, parent_status)
+                if block_reason:
+                    logger.warning(
+                        "Preempt: skipping pending job %s — %s",
+                        pending_job_id,
+                        block_reason,
+                    )
+                    continue
 
                 # Find lowest-priority running job that can be preempted
                 for candidate in candidates:
@@ -5329,6 +5356,12 @@ async def lifespan(app: FastAPI):
             postgres_db, _shutdown_event, advance_fn=_advance_project_loop
         )
     )
+    # Reap orphaned verification (critic) subjobs that would otherwise linger as
+    # priority-10 dispatchable jobs and parasitically preempt real work. See
+    # docs/issues/preemption_before_first_checkpoint_replays_job_opening.md.
+    stale_verification_sweeper_task = asyncio.create_task(
+        stale_verification_sweeper_loop(postgres_db, _shutdown_event)
+    )
 
     # LiteLLM gateway catalog sync — registers endpoint-kind catalog models into
     # the in-chart LiteLLM proxy so agent LLM traffic can be measured (and, in
@@ -5445,6 +5478,7 @@ async def lifespan(app: FastAPI):
     await main_cloud_listen_task
     await automation_cron_task
     await project_loop_sweeper_task
+    await stale_verification_sweeper_task
     await litellm_sync_task
     await quota_poll_task
     await workspace_metering_task

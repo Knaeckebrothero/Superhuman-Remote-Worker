@@ -17,9 +17,22 @@ related:
 **Filed:** 2026-06-25, discovered while scaffolding the new `assistant` default
 session expert ([[default_expert_roster]]) and k3d-verifying that it loads.
 
-**Status:** Open. Root cause confirmed on the dev cluster. **Solution chosen
-(below) — not yet implemented.** Affects shipped experts today (notably
-`bughunter` and `designer-interactive`), not just the new `assistant`.
+**Status:** Part 1 **implemented + verified on k3d** (2026-06-25), uncommitted on
+`develop`. Resolution + blob probes confirm experts' own prompts now resolve on
+gemma (`bughunter`/`developer`/`scholar` persona+strategic+tactical flip to
+EXPERT; `assistant` blob persona fixed; `scholar@minimax` no regression); 12 unit
+tests + `ruff` green. **Gemma worker gate: PASSED** — a live k3d worker run (a
+scholar subjob on the default gemma model, with the experts' base prompts now
+active) made **84 `write_file` + 4 `run_command` + 10 `todo_complete` tool calls
+with 0 parse failures and no parser-loop**, across clean strategic→tactical phase
+transitions. The `gemma.yaml` guardrails (71 brace-form tool examples, a separate
+channel the fix doesn't touch) hold the wire format, so swapping the framework
+`*_gemma` prompts for the experts' base prompts did **not** regress tool-call
+parsing. The developer-specific run (highest risk — its `instructions.md` has 3
+Python-style examples) is expected clean for the same reason (same guardrails) and
+is in-flight to confirm. **Part 2 (content/adaptation hygiene) still deferred.**
+Original bug affected shipped experts (`bughunter`, `designer-interactive`), not
+just the new `assistant`.
 
 **Severity:** Silent correctness bug. No error, no warning — an expert's
 authored prompt is replaced by the framework's generic one, and the agent runs

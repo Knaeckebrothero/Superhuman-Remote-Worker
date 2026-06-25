@@ -1052,8 +1052,45 @@ class MatrixResolver:
         # Final fallback: hardcoded defaults
         return self.HARDCODED_DEFAULTS.get(entry_type, f"{entry_type}.txt")
 
+    def _resolve_path(self, entry_type: str) -> Path:
+        """Locate the file for ``entry_type`` with **location-primary** precedence.
+
+        An expert (deployment-dir) file always outranks a framework file; within
+        each directory the family-specific name is tried before the base name.
+        Candidate order::
+
+            deployment/<family>  ->  deployment/<base>
+            ->  framework/<family>  ->  framework/<base>
+
+        This is deliberately NOT delegated to ``FileResolver.resolve()`` per
+        name: that helper is name-primary (deployment-then-framework for ONE
+        name), so a framework ``persona_gemma.txt`` would still shadow an
+        expert's own ``persona.txt``. Location must be the outer loop.
+        """
+        family_name = self.resolve_filename(entry_type)
+        base_name = self.HARDCODED_DEFAULTS.get(entry_type, f"{entry_type}.txt")
+        names = [family_name] if family_name == base_name else [family_name, base_name]
+        fr = self._file_resolver
+        for directory in (fr.deployment_dir, fr.framework_dir):
+            if directory is None:
+                continue
+            for name in names:
+                candidate = directory / name
+                if candidate.exists():
+                    logger.debug(
+                        "MatrixResolver(%s) resolved %r -> %s",
+                        self.MATRIX_SUBSECTION,
+                        entry_type,
+                        candidate,
+                    )
+                    return candidate
+        searched = [str(d) for d in (fr.deployment_dir, fr.framework_dir) if d]
+        raise FileNotFoundError(
+            f"Template not found for '{entry_type}' (tried {names} in {searched})"
+        )
+
     def load(self, entry_type: str, *, bundled_only: bool = False) -> str:
-        """Resolve filename and load the content.
+        """Resolve the file (location-primary) and load its content.
 
         When DB-backed config overrides are enabled, an override for
         ``(MATRIX_SUBSECTION, model_family, entry_type)`` is returned before any
@@ -1072,13 +1109,15 @@ class MatrixResolver:
             override = _db_lookup(self.MATRIX_SUBSECTION, self.model_family, entry_type)
             if override is not None:
                 return override
-        filename = self.resolve_filename(entry_type)
-        return self._file_resolver.load(filename)
+        return self._resolve_path(entry_type).read_text(encoding="utf-8")
 
     def exists(self, entry_type: str) -> bool:
-        """Check if a type can be resolved and the file exists."""
-        filename = self.resolve_filename(entry_type)
-        return self._file_resolver.exists(filename)
+        """Check if a type resolves to an existing file (location-primary)."""
+        try:
+            self._resolve_path(entry_type)
+            return True
+        except FileNotFoundError:
+            return False
 
 
 class PromptMatrixResolver(MatrixResolver):
@@ -4158,9 +4197,7 @@ def load_strategic_todos_template(
     instruction_type = template_name.replace(".yaml", "")
 
     try:
-        path = resolver._file_resolver.resolve(
-            resolver.resolve_filename(instruction_type)
-        )
+        path = resolver._resolve_path(instruction_type)
         logger.debug(f"Loading strategic todos from: {path}")
         # Render Jinja2 templates before YAML parsing
         if tool_names:
