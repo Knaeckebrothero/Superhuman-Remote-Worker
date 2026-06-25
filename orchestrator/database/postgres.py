@@ -2462,6 +2462,52 @@ class PostgresDB:
             count += int(result2.split()[1])
         return count
 
+    async def cancel_stale_verification_subjobs(self, stale_hours: int = 6) -> int:
+        """Cancel orphaned critic/verification subjobs that can never progress.
+
+        A verification subjob (``context->>'verification_target'`` set) is reaped
+        when it is unassigned and either (a) its parent is already terminal, or
+        (b) it has sat agentless past ``stale_hours``. These otherwise linger as
+        priority-10 dispatchable jobs that parasitically preempt real work (and
+        hold the parent's workspace). ``reviewing`` is deliberately not a cancel
+        trigger — that is the parent a live critic is reviewing; the staleness
+        fallback clears a critic whose parent is *stuck* reviewing without
+        killing an active one.
+
+        See docs/issues/preemption_before_first_checkpoint_replays_job_opening.md
+        and critic_failure_leaves_parent_job_stuck_reviewing.md.
+
+        Args:
+            stale_hours: agentless-age fallback horizon for non-terminal parents.
+
+        Returns:
+            Number of subjobs cancelled.
+        """
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE jobs AS j
+                SET status = 'cancelled',
+                    assigned_agent_id = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                FROM jobs AS parent
+                WHERE j.parent_job_id = parent.id
+                  AND j.context->>'verification_target' IS NOT NULL
+                  AND j.status IN ('created', 'paused')
+                  AND j.assigned_agent_id IS NULL
+                  AND (
+                        parent.status IN ('completed', 'failed', 'cancelled')
+                     OR j.updated_at
+                        < CURRENT_TIMESTAMP - make_interval(hours => $1::int)
+                  )
+                """,
+                stale_hours,
+            )
+
+        if result.startswith("UPDATE "):
+            return int(result.split()[1])
+        return 0
+
     async def get_ready_agents(self) -> List[Dict[str, Any]]:
         """Get all agents with 'ready' status.
 
