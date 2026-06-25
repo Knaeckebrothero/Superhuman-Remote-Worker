@@ -20968,6 +20968,24 @@ async def list_available_models(
 
     groups = list(groups_by_key.values())
 
+    # Per-model reasoning capability (family-derived) so the Cockpit reasoning
+    # control is driven by the catalog instead of hardcoded client logic. The
+    # single source of truth is config/model_config_matrix.yaml's `reasoning`
+    # block per family. See docs/features/family_centered_reasoning.md.
+    from src.core.loader import reasoning_capability
+
+    reasoning_by_model: dict[str, dict[str, Any]] = {}
+    for group in groups:
+        for mid in group["models"]:
+            if mid in reasoning_by_model:
+                continue
+            cap = reasoning_capability(mid)
+            reasoning_by_model[mid] = {
+                "method": cap.get("method", "none"),
+                "default": cap.get("default"),
+                "options": list(cap.get("options") or []),
+            }
+
     return {
         "groups": groups,
         "auxiliary_models": auxiliary,
@@ -20976,6 +20994,7 @@ async def list_available_models(
         "tts_models": tts,
         "embedding_models": embedding,
         "configured_providers": sorted(configured_providers),
+        "reasoning_by_model": reasoning_by_model,
     }
 
 

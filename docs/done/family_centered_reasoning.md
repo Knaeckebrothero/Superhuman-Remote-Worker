@@ -18,12 +18,46 @@ aliases:
 
 # Family-Centered Reasoning Levels
 
-**Status:** **Proposed — design agreed 2026-06-22; research-refined same day; not yet
-implemented.** Refinement folded in findings from 3 codebase-mapping agents + 3
-web-research agents (provider reasoning APIs + prior art). The gemma `binary_toggle`
-behavior this formalizes was verified live on k3d 2026-06-22 (§11). Recommended path:
-backend-first slice (delivery + default + gemma toggle, k3d-verifiable), then the API +
-UI feed; token-budget control for Claude/Gemini deferred to Phase 2 (§10).
+**Status:** **✅ SHIPPED — Slices A + B implemented + k3d-verified 2026-06-24; moved to
+`done/`.** Slice A committed as `fc72dd70`; Slice B (orchestrator `/api/models` + cockpit)
+and this doc move are uncommitted on `develop` at move time. Design agreed 2026-06-22, research-refined
+the same day (3 codebase-mapping + 3 web-research agents). Intentionally deferred (§10):
+B3 catalog per-model `reasoning_level` override (precedence layer 3 — inert until an
+operator sets it); token-budget control for Claude/Gemini (Phase 2).
+
+### What shipped
+
+- **Slice A — backend delivery.** Per-family `reasoning` block in
+  `config/model_config_matrix.yaml` (16 families); new `reasoning_capability()` /
+  `resolve_reasoning_plan()` / `_set_nested()`; `detect_reasoning_method()` reimplemented
+  on the capability (hardcoded family list deleted → YAML is the source of truth);
+  OpenAI/OpenRouter/Codex factories deliver from the plan. Net behavior: gemma →
+  `chat_template_kwargs.enable_thinking` (was an inert `reasoning_effort`); gpt-oss
+  double-injection fixed; minimax inert effort stopped; effort families unchanged;
+  OpenRouter `xhigh` preserved. Resolves
+  [[reasoning_effort_injected_without_capability_guard]].
+- **Slice B — API + UI feed.** `/api/models` returns `reasoning_by_model`
+  (`{model_id: {method, default, options}}`, family-derived); `ModelService` caches it
+  (`reasoningByModel` signal + `ReasoningCapability` type); `reasoning-options.ts`
+  rewritten capability-driven (every hardcoded family/provider branch deleted) — gemma
+  flips hidden → **On/Off**, gpt-oss → Low/Med/High, `always_on` → "Always on"; both
+  consumers (`model-group`, `advanced-accordion`) read the capability via the service.
+
+### Verification (k3d, 2026-06-24)
+
+| Check | Result |
+|---|---|
+| Backend tests (`test_loader_routing` + matrix/prompt/config suites) | ✅ 387 green |
+| Cockpit specs (reasoning-options, model-group, advanced-accordion, model.service) | ✅ 69 green |
+| `ruff check`/`format` + `tsc --noEmit` | ✅ clean |
+| Deployed agent image builds gemma → `enable_thinking:True` & no `reasoning_effort`; level=none → `False`; gpt-5.5 → `reasoning_effort:high` | ✅ |
+| Live `gemma-4-moe` endpoint honors `enable_thinking` → `reasoning_content` populates; `tools=[…]` doesn't suppress | ✅ |
+| `/api/models` over the real catalog → gemma `{binary_toggle, On/Off}`, gpt-5.5 `{effort_enum, Low/Med/High}` | ✅ |
+
+Not captured: a live job-dispatch agent log (cluster agent-pool drift / zombie pods — a
+pre-existing lifecycle quirk, not this change), so the deployed image's LLM-build was
+exercised directly instead (equivalent); the Cockpit dropdown was not visually walked
+(backend contract + frontend logic both verified).
 
 ## 1. Goal
 
