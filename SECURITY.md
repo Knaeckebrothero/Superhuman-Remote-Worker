@@ -11,7 +11,7 @@ This project uses continuous deployment with SHA-based image tags — there are 
 If you discover a security vulnerability, please report it responsibly:
 
 1. **Do not open a public issue.**
-2. Use [GitHub Private Vulnerability Reporting](https://github.com/Knaeckebrothero/Uni-Projekt-Graph-RAG/security/advisories/new) to submit a report.
+2. Use [GitHub Private Vulnerability Reporting](https://github.com/Knaeckebrothero/Superhuman-Remote-Worker/security/advisories/new) to submit a report.
 3. Include:
    - A description of the vulnerability and its potential impact
    - Steps to reproduce or a proof of concept

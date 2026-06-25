@@ -28,7 +28,7 @@ load_dotenv(find_dotenv())
 if os.environ.get("LICENSE_TERMS_ACCEPTED", "").strip().lower() != "true":
     raise SystemExit(
         "License terms not accepted. Set LICENSE_TERMS_ACCEPTED=true to run. "
-        "See https://github.com/knaeckebrothero/Superhuman-Remote-Worker/blob/main/LICENSE"
+        "See https://github.com/Knaeckebrothero/Superhuman-Remote-Worker/blob/main/LICENSE"
     )
 
 # Configure application-level logging (Uvicorn only configures its own loggers).
