@@ -413,6 +413,11 @@ databases:
     # where user/password come from the Secret (POSTGRES_USER /
     # POSTGRES_PASSWORD) — never from a single bundled URL key. This avoids
     # the urlsplit/`/`-encoding footgun of ``DATABASE_URL`` in Vault.
+    # -- IMPORTANT (HA): orchestrator leader election (M1) uses a SESSION-scoped
+    # Postgres advisory lock, which silently breaks behind a TRANSACTION-mode
+    # connection pooler (PgBouncer/pgcat/RDS-Proxy in txn mode — the lock leaks
+    # and can stall autovacuum). Point externalHost at a direct or session-mode
+    # Postgres endpoint. See docs/researches/orchestrator_leader_election.md.
     externalHost: ""
     externalPort: 5432
     externalDb: "srw"
