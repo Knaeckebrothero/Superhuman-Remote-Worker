@@ -63,3 +63,41 @@ def test_bundled_code_review_skill_is_valid_and_on_topic():
     # and an explicit verdict (not a vibe-based "looks good").
     assert "Severity" in body and "Verdict" in body
     assert "request-changes" in body
+
+
+def test_bundled_project_onboarding_skill_is_valid_and_on_topic():
+    root = _SKILLS / "project-onboarding"
+    md = (root / "SKILL.md").read_text(encoding="utf-8")
+    fm, body = parse_skill_md(md)
+    name, desc = skill_identity(fm)
+    assert name == "project-onboarding"
+    # Trigger scopes to orienting in an existing body of work and disambiguates
+    # from both verify-before-done (checking your own finished work) and
+    # research-guide (investigating a question to produce findings).
+    assert "verify-before-done" in desc
+    assert "research-guide" in desc
+    # Generalized past a codebase: the body must treat a project as a datasource
+    # bundle, not assume a repo.
+    assert "datasource" in body.lower()
+    # Body carries the two load-bearing halves: the source-of-truth/provenance
+    # honesty move and an explicit termination rule (orientation must stop).
+    assert "source of truth" in body.lower()
+    assert "stop" in body.lower()
+
+
+def test_bundled_tdd_skill_is_valid_and_on_topic():
+    root = _SKILLS / "test-driven-development"
+    md = (root / "SKILL.md").read_text(encoding="utf-8")
+    fm, body = parse_skill_md(md)
+    name, desc = skill_identity(fm)
+    assert name == "test-driven-development"
+    # Trigger self-scopes to code and disambiguates from the two sibling skills
+    # whose machinery overlaps (the end gate vs. diagnosing a failure).
+    assert "verify-before-done" in desc
+    assert "systematic-debugging" in desc
+    # Body carries the evidence-backed core (small verified increments, not the
+    # coverage ritual) and the load-bearing honesty step: see the test fail first.
+    assert "fail" in body.lower()
+    assert "refactor" in body.lower()
+    # The honest boundary section — TDD is not for every task.
+    assert "skip it" in body.lower()
