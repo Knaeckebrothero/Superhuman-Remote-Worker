@@ -47,9 +47,9 @@ global:
 # -----------------------------------------------------------------------------
 image:
   orchestrator:
-    tag: sha-db61db2
+    tag: sha-6024efe
   agent:
-    tag: sha-db61db2
+    tag: sha-6024efe
   cockpit:
     tag: sha-db61db2
   mcp:
@@ -133,7 +133,6 @@ virtualWorkspace:
 # -----------------------------------------------------------------------------
 checkpointer:
   backend: "postgres"
-
 # -----------------------------------------------------------------------------
 # Databases — all internal (chart defaults), override here if you externalize
 # -----------------------------------------------------------------------------
