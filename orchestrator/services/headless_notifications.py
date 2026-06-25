@@ -226,6 +226,62 @@ async def record_notification(
         )
 
 
+async def claim_sent_notification(
+    db: Any,
+    *,
+    thread_id: str,
+    request_id: Optional[str],
+    kind: str,
+    email_to: Optional[str] = None,
+    metadata: Optional[dict[str, Any]] = None,
+) -> Optional[int]:
+    """Atomically claim the single 'sent' slot for (request_id, kind) BEFORE
+    sending (HA / M1 — dual-leader dedup).
+
+    Inserts a thread_notifications row with delivery_status='sent' guarded by
+    the partial unique index uq_tn_sent_request_kind (migration 0038). Returns
+    the new row id iff THIS call won the slot; None means a concurrent sweeper
+    in the transient dual-leader window already claimed it (is sending), so the
+    caller MUST NOT send again. Unlike record_notification this is NOT
+    best-effort — a DB error propagates so we never silently double-send.
+    """
+    async with db.acquire() as conn:
+        row = await conn.fetchrow(
+            "INSERT INTO thread_notifications "
+            "(thread_id, request_id, kind, delivery_status, email_to, metadata) "
+            "VALUES ($1, $2, $3, 'sent', $4, $5::jsonb) "
+            "ON CONFLICT (request_id, kind) WHERE delivery_status = 'sent' "
+            "DO NOTHING "
+            "RETURNING id",
+            thread_id,
+            request_id,
+            kind,
+            email_to,
+            json.dumps(metadata or {}),
+        )
+    return row["id"] if row else None
+
+
+async def downgrade_sent_claim(db: Any, claim_id: int) -> None:
+    """Downgrade a claimed 'sent' row to 'failed' when the send didn't go
+    through. Frees the unique slot and keeps the audit honest. 'failed' is
+    terminal in the sweeper query, so this won't re-dispatch — matching the
+    behaviour before claim-before-send. Best-effort."""
+    try:
+        async with db.acquire() as conn:
+            await conn.execute(
+                "UPDATE thread_notifications SET delivery_status = 'failed' "
+                "WHERE id = $1",
+                claim_id,
+            )
+    except Exception as e:
+        logger.warning(
+            "thread_notifications downgrade to 'failed' failed (id=%s): %s",
+            claim_id,
+            e,
+        )
+
+
 def _build_magic_link_url(cockpit_url: str, raw_token: str) -> str:
     """Compose the user-visible URL we embed in the email. The cockpit
     serves /magic/approve/{token} via the orchestrator proxy in
@@ -450,7 +506,23 @@ async def send_permission_pending_email(
 
     subject = f"[SRW] Approval needed: {permission_row['tool_name']}"
 
-    # 5. Dispatch via EmailService internals (private _send is fine —
+    # 5. Claim the single 'sent' slot for this (request, kind) BEFORE sending,
+    # so a concurrent sweeper in the transient dual-leader window (leader
+    # election has no fencing) cannot also send. Losing the claim means another
+    # sweeper already sent (or is sending) → skip silently. In steady state
+    # leadership is single, so this only fires during a partition / failover.
+    claim_id = await claim_sent_notification(
+        db,
+        thread_id=thread_id,
+        request_id=approval_id,
+        kind="permission_pending",
+        email_to=recipient_email,
+        metadata={"tool": permission_row["tool_name"]},
+    )
+    if claim_id is None:
+        return {"status": "skipped_dedup"}
+
+    # 6. Dispatch via EmailService internals (private _send is fine —
     # same package). We avoid send_agent_message because that template
     # is job-oriented; this notification is thread-only.
     sent_ok = False
@@ -469,14 +541,10 @@ async def send_permission_pending_email(
             e,
         )
 
+    if not sent_ok:
+        # Send failed after we claimed the slot — downgrade the audit row to
+        # 'failed' (terminal in the sweeper query, same as before this change).
+        await downgrade_sent_claim(db, claim_id)
+
     status = "sent" if sent_ok else "failed"
-    await record_notification(
-        db,
-        thread_id=thread_id,
-        request_id=approval_id,
-        kind="permission_pending",
-        delivery_status=status,
-        email_to=recipient_email,
-        metadata={"tool": permission_row["tool_name"]},
-    )
     return {"status": status, "email_to": recipient_email}
