@@ -393,6 +393,14 @@ headscale:
 # =============================================================================
 # Databases
 # =============================================================================
+# LangGraph checkpointer backend (sqlite|postgres). "postgres" stores graph
+# state in shared Postgres so a job resumes on any pod (fixes cross-pod
+# cold-starts); "sqlite" is the legacy pod-local checkpoint. Flag-gated rollout —
+# default sqlite. Docs: docs/issues/cross_pod_resume_cold_starts_checkpoint_not_replicated.md
+checkpointer:
+  # -- Worker checkpointer backend: "sqlite" (pod-local, legacy) or "postgres" (shared, cross-pod)
+  backend: "sqlite"
+
 databases:
   postgres:
     enabled: true

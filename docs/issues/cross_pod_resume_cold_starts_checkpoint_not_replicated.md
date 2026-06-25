@@ -19,7 +19,8 @@ That issue documents the *trigger* (parasitic preemption restarting a job's
 opening); this one documents the deeper, independent defect underneath it: **a
 job that resumes on a different pod has no way to recover its graph state, so it
 cold-starts — and this is true even after it has crossed a phase boundary.** The
-preemption doc's "D3 / snapshot-on-pause" fix lands here.
+preemption doc's "D3" fix lands here (recommended approach: a shared Postgres
+checkpointer — see Recommended fix).
 
 ## TL;DR
 
@@ -38,6 +39,10 @@ cold-starts from `create_initial_state` (re-reads brief, resets `phase_number`,
 empties `messages`, re-runs phase 0). The checkpoint/snapshot system effectively
 only works for **same-pod** pause→resume.
 
+**Recommended fix:** make the checkpoint shared *by construction* — swap the
+pod-local SQLite saver for `AsyncPostgresSaver` (Strategy B below). Probe-verified
+viable (2026-06-25); the snapshot-bridge approach is demoted to a fallback.
+
 ## Symptom
 
 A job that changes pods mid-run **loses its in-graph state and restarts the
@@ -53,11 +58,12 @@ resumed on three different pods (`55f440ed → d13800ec → 4830ffb1`),
 cold-starting all three times — it never once recovered state cross-pod. (Full
 incident in the preemption doc.)
 
-Inferred (post-boundary): because the snapshot directory is pod-local (see Root
-cause), a job preempted *after* completing a phase would also cold-start on a new
-pod — losing every completed phase's graph state, not just the opening. This is
-the broader blast radius and the one thing this doc flags for a confirming repro
-(see Verification).
+Confirmed (post-boundary, 2026-06-25): the snapshot directory is pod-local too
+(Root cause §2–3), so a job preempted *after* completing a phase also cold-starts
+on a new pod — losing every completed phase's graph state, not just the opening.
+Confirmed by code read (the snapshot's `checkpoint.db` is never pushed to the
+shared workspace) plus the empirical three-pod cold-start, so no flaky live
+relocation was needed (see Verification).
 
 ## Root cause
 
@@ -158,77 +164,109 @@ can **duplicate non-idempotent early side effects** (file creation, external
 calls, git commits). KB writes happen to be idempotent (upsert by slug); nothing
 guarantees that for other actions.
 
-## Proposed fix
+## Recommended fix: shared Postgres checkpointer (Strategy B)
 
-**Core: replicate the checkpoint to shared storage at snapshot time, pull it
-back at resume time.** This finishes the bridge that facts 2–3 left half-built,
-without changing the verbatim-restore logic.
+Make the checkpoint shared **by construction** — swap the pod-local
+`AsyncSqliteSaver` for `AsyncPostgresSaver` so graph state lives in shared
+Postgres. The **existing** `_resume_from_checkpoint` path then reads it on any
+pod, so cross-pod resume "just works" for *every* move (preemption, eviction,
+rolling deploy, orphan-recovery, mid-phase, pre-boundary) from the actual
+interruption point — no snapshot bridge, no snapshot-on-pause, no SFTP push/pull.
 
-1. **Write side.** Extend `create_snapshot` (and add a `create_pause_snapshot`)
-   to **push** the snapshot's `checkpoint.db` + `metadata.json` to the **shared
-   SSH workspace** via the workspace backend (`backend.write_file` / SFTP), at a
-   deterministic job+phase path (e.g.
-   `<shared-workspace>/.srw/phase_snapshots/job_<id>/phase_<n>/`). WAL-flush
-   first (already done at `phase_snapshot.py:235-247`). **Pass `thread_id=job_id`**
-   — the current `archive_phase` caller (`src/graph.py:2412-2419`) doesn't, so
-   snapshots store `thread_id=None` and lean on `discover_thread_id_from_checkpoint`.
-2. **Read side.** Extend `get_latest_snapshot` / `recover_to_phase` so that when
-   no pod-local snapshot exists, it **lists + pulls** the snapshot from the
-   shared workspace before restoring. `_resume_from_snapshot` then needs no logic
-   change — it hydrates the local snapshot dir from shared storage, then restores
-   as today.
-3. **Snapshot-on-pause** (builds on #1 — this is the preemption doc's "D3").
-   The preemption pause is a **graceful, cooperative node-boundary stop** (HTTP
-   `/job/pause` at `src/api/dual_app.py:821-837` → cooperative-stop Event → the
-   `astream` loop breaks at `src/api/dual_app.py:502-523`), so there is a real
-   code window. At `src/api/dual_app.py:519` (`reason == "pause"`, before
-   `_complete_stop`), call `create_pause_snapshot` so even a job preempted *during
-   phase 0* — before any boundary — has a cross-pod recovery point. At that point
-   `checkpoint.db` is fully persisted (the last completed node wrote it) and the
-   live SSH `WorkspaceManager` + `snapshot_manager` are still in scope.
+**Why this is the proper fix, not a patch:**
 
-### Alternatives considered
+- The pod-local SQLite saver is LangGraph's single-process/dev option; the PG
+  saver is the one built for multi-instance, relocatable runs. This uses the
+  mechanism the framework already ships — and this repo already vendors:
+  `langgraph-checkpoint-postgres` is in `requirements.txt`.
+- It's a clean, reversible seam: the graph compiles with any `BaseCheckpointSaver`
+  (`src/graph.py:4175`); the only construction site is `src/agent.py:761`
+  (`AsyncSqliteSaver(wrapped_conn)`), and the worker agent already holds a PG
+  connection (`src/agent.py:592-599`).
 
-- **(A) Shared RWX checkpoint volume** — mount a ReadWriteMany PVC for
-  `/workspace/checkpoints` so all pods see the same dir. Sidesteps push/pull but
-  needs RWX storage (NFS/CephFS) and risks sqlite corruption from concurrent
-  access (old pod finishing a node while the new pod resumes). Possible future
-  infra option, not the default.
-- **(B) Put the live checkpoint directly on the shared SSH workspace** — change
-  `get_checkpoints_path()` to the shared volume. But the checkpoint is rewritten
-  every node; sqlite-over-SFTP would be slow and fragile. This is almost
-  certainly *why* it's pod-local today: pod-local for write performance, with
-  snapshots meant as the durability bridge — except the snapshot half was never
-  wired to push the checkpoint. Rejected; the core fix keeps the performance
-  design and just completes the bridge.
-- **(C) Grace period — don't preempt before a recovery point exists.** The
-  preemption doc's stopgap. Only meaningful *after* #1+#2, because today even a
-  post-boundary snapshot doesn't bridge pods. Useful as a complementary guard
-  once the core fix lands, not a substitute.
+**What the swap entails:**
+
+1. Build an `AsyncPostgresSaver` against a shared checkpoint store and pass it to
+   the graph instead of the SQLite saver (`src/agent.py:761`); run `.setup()` once.
+2. Resume simplifies — `_resume_from_checkpoint` now reads shared state and
+   succeeds cross-pod, so the `_resume_from_snapshot` fallback +
+   `create_initial_state` cold-start become the genuine last resort
+   (corrupt/missing checkpoint), not the common cross-pod path.
+3. **Retention is mandatory** (see probe): prune checkpoints —
+   keep-latest-per-thread + delete-on-job-terminal — so the shared store doesn't
+   accumulate. SQLite never needed this because it died with the pod.
+4. **Store placement:** a *dedicated* checkpoint store, not the app DB, per the
+   split-by-workload-class principle in
+   `docs/features/database_architecture.md`, to isolate the per-node write load.
+5. Open detail: the workspace suspend→S3→restore path (for paused jobs) interacts
+   with workspace-*file* consistency, not the checkpoint — trace it when wiring
+   resume, but it does not block the checkpoint swap.
+
+### Probe results (2026-06-25 — `AsyncPostgresSaver` vs `AsyncSqliteSaver`, growing-conversation sim)
+
+Measured the two real costs of B (60 super-steps, ~4KB messages, one thread):
+
+- **Latency — a non-issue.** PG checkpoint writes are **~11ms p50 / 28ms p95 and
+  flat as state grows** (1.14× across the run). At ~3 writes/super-step that's
+  ~30ms per node — noise against multi-second LLM calls. (SQLite baseline ~0.5ms;
+  faster, but both are negligible next to inference.)
+- **Storage — the one real cost, and it's bounded.** Both savers write the *full*
+  channel state every super-step. With no compaction the probe showed worst-case
+  **quadratic** growth (~31MB on PG / ~44MB on SQLite for a 120-message thread; an
+  earlier all-identical-bytes payload compressed to 976KB on PG via TOAST — a
+  measurement artifact, not the real figure). Two things tame it in production:
+  (1) the agent **already compacts** at phase boundaries (`RemoveMessage`), so each
+  checkpoint blob is *bounded* → real growth is **linear in super-steps**, not
+  quadratic; (2) only the *count* of checkpoint versions accumulates (LangGraph
+  keeps all by default) → the retention policy above bounds it.
+
+**Verdict:** latency clears B outright; storage is a managed cost (dedicated store
++ retention), not a blocker. The probe confirmed the prediction rather than
+surprising us — the call is locked to B.
+
+### Fallbacks (only if B proves unviable)
+
+- **(A) Bridge the SQLite checkpoint** *(the original proposal)* — push
+  `checkpoint.db` + `metadata.json` to the shared SSH workspace at snapshot time
+  (extend `create_snapshot`, add a `create_pause_snapshot` at the graceful-pause
+  window `src/api/dual_app.py:519`, passing `thread_id=job_id`), and pull it back
+  on resume (`_resume_from_snapshot` hydrates the local snapshot dir first;
+  `recover_to_phase` is already a verbatim restore). Self-contained and keeps
+  SQLite as the hot path, but adds SFTP transport + atomicity (temp-write+rename)
+  + a snapshot-on-pause special case, and only covers phase-boundary +
+  graceful-pause moves — a mid-phase crash/eviction still restarts from the last
+  boundary. Keep only if the PG saver's write load proves unacceptable.
+- **(B) RWX checkpoint volume** — a ReadWriteMany PVC shared across pods. Needs
+  RWX storage (NFS/CephFS) and risks sqlite corruption under concurrent access
+  (old pod finishing a node while the new pod resumes). Not preferred.
+- **(C) Grace period — don't preempt before a recovery point exists.** A
+  complementary guard at most (and only meaningful once a fix makes recovery
+  points cross-pod), never a standalone fix.
 
 ## Verification
 
-**Confirm the blast radius first** (the post-boundary case is inferred from code,
-not yet observed):
+**Blast radius — confirmed (2026-06-25).** Two independent lines, no live
+relocation needed:
 
-1. Start a job; let it cross **≥1 phase boundary** (confirm a `phase_N/` snapshot
-   dir exists on its pod). Force a cross-pod resume (preempt it, or delete its
-   pod). Assert whether it cold-starts (look for `No phase snapshots found …
-   starting fresh` on the **new** pod and a `phase_number`/iteration reset) or
-   resumes. If it cold-starts, the post-boundary blast radius is confirmed.
-2. Inspect storage: on an agent pod, confirm `/workspace/checkpoints/` and the
-   snapshot dir are pod-local (not a shared RWX mount) via `kubectl describe pod`
-   volumes; and confirm the **shared SSH workspace** contains no `checkpoint.db`
-   / `phase_snapshots/` today.
+- *Empirical:* job `1b099a61` cold-started across three pods → the checkpoint
+  storage is provably not shared between agent pods (a shared store would have let
+  pod 2 resume pod 1's checkpoint).
+- *Code:* `create_snapshot` copies `checkpoint.db` only into the pod-local
+  snapshot dir and never pushes it to the shared workspace
+  (`src/core/phase_snapshot.py:235-278`), so a post-boundary snapshot is as
+  pod-local as the live checkpoint → post-boundary cross-pod resume cold-starts
+  too.
 
-**After the fix:**
+**After the fix (Strategy B):**
 
-3. Repeat (1): the new pod must find the pushed snapshot, pull it, and resume
-   **without** a `create_initial_state` reset — single `initialize`, monotonic
-   `iteration`, preserved `phase_number`, brief not re-read.
-4. Preempt a job **during phase 0** (snapshot-on-pause): it must resume from the
-   pause snapshot on a different pod rather than cold-starting — directly retiring
-   the preemption doc's symptom.
+1. Take a job across **≥1 phase boundary**, force a cross-pod resume (preempt, or
+   delete its pod). Assert it resumes from the shared PG checkpoint — single
+   `initialize`, monotonic `iteration`, preserved `phase_number`, brief not
+   re-read, **no** `create_initial_state` reset / `No phase snapshots found` line.
+2. Preempt a job **during phase 0** (pre-boundary): it must *also* resume from PG,
+   not cold-start — directly retiring the preemption doc's symptom.
+3. Retention holds: after a job reaches a terminal state, its checkpoints are
+   pruned from the shared store (no unbounded accumulation across jobs).
 
 ## Evidence (dev, 2026-06-24)
 
@@ -242,11 +280,17 @@ not yet observed):
   `src/core/workspace.py:89-138` (checkpoint base path pod-local);
   `src/agent.py:3010-3018` (no-snapshot cold start); `src/core/state.py:136-195`
   (cold reset).
+- Probe (2026-06-25, throwaway local `AsyncPostgresSaver` vs `AsyncSqliteSaver`,
+  60-super-step growing thread): PG checkpoint writes ~11ms p50 / 28ms p95, flat
+  as state grows (1.14×); both savers store full channel state per super-step
+  (~31MB PG / ~44MB SQLite for a 120-message thread, no compaction) → retention
+  required. Latency is an upper bound (in-cluster PG shares the agent's LAN);
+  `langgraph-checkpoint-postgres` confirmed already in `requirements.txt`.
 
 ## Related
 
 - [`preemption_before_first_checkpoint_replays_job_opening.md`](preemption_before_first_checkpoint_replays_job_opening.md)
-  — the trigger; its D3 / snapshot-on-pause fix is implemented here. D1+D2 in
+  — the trigger; its D3 fix is specified here (shared PG checkpointer). D1+D2 in
   that doc stop the *parasitic* preemption; this doc is what makes *any*
   preemption (or pod move) non-destructive.
 - `docs/features/project_self_improvement_loop.md` — the feature whose first real

@@ -53,6 +53,40 @@ export function parseConfigText(text: string): ParsedConfig {
   return {config: parsed as Record<string, unknown>};
 }
 
+/** Prompt segments the editor can author (one family-agnostic version each). */
+export interface PromptFields {
+  persona: string;
+  instructions: string;
+  strategic: string;
+  tactical: string;
+  summarization: string;
+}
+
+/**
+ * Assemble the `prompts` save payload from the editor fields. Only non-empty
+ * segments are emitted — an empty field inherits the framework default, and
+ * because the API replaces the `prompts` column wholesale, a cleared field drops
+ * its override. Strategic/tactical are worker-only (session experts don't run the
+ * phase loop), so they are excluded in session mode.
+ */
+export function buildPromptsPayload(
+  fields: PromptFields,
+  mode: 'job' | 'session',
+): Record<string, string> {
+  const out: Record<string, string> = {};
+  const add = (k: keyof PromptFields): void => {
+    if (fields[k].trim()) out[k] = fields[k];
+  };
+  add('persona');
+  add('instructions');
+  add('summarization');
+  if (mode === 'job') {
+    add('strategic');
+    add('tactical');
+  }
+  return out;
+}
+
 interface EditorForm {
   name: string;
   display_name: string;
@@ -63,6 +97,9 @@ interface EditorForm {
   expert_type: 'worker' | 'session';
   persona: string;
   instructions: string;
+  strategic: string;
+  tactical: string;
+  summarization: string;
   strategicModel: string;
   tacticalModel: string;
   sessionModel: string;
@@ -136,6 +173,38 @@ interface EditorForm {
         />
         <h2>Instructions (optional)</h2>
         <app-textarea [value]="form.instructions" [rows]="5" (valueChange)="form.instructions = $event" />
+      </section>
+
+      <section class="card">
+        <h2>Phase prompts (advanced)</h2>
+        <p class="hint">
+          Override the workflow prompts. Leave a field empty to inherit the
+          framework default. Custom strategic/tactical text is treated as
+          untrusted and stays subordinate to system rules &amp; safety.
+        </p>
+        @if (mode() === 'job') {
+          <h2>Strategic (planning)</h2>
+          <app-textarea
+            [value]="form.strategic"
+            [rows]="6"
+            (valueChange)="form.strategic = $event"
+            placeholder="Inherit framework default…"
+          />
+          <h2>Tactical (execution)</h2>
+          <app-textarea
+            [value]="form.tactical"
+            [rows]="6"
+            (valueChange)="form.tactical = $event"
+            placeholder="Inherit framework default…"
+          />
+        }
+        <h2>Summarization</h2>
+        <app-textarea
+          [value]="form.summarization"
+          [rows]="5"
+          (valueChange)="form.summarization = $event"
+          placeholder="Inherit framework default…"
+        />
       </section>
 
       <!-- Structured config: reuses the launch-flow groups. [config] = base ⊕ fragment
@@ -378,6 +447,9 @@ export class ExpertEditorComponent implements OnInit {
     expert_type: 'worker',
     persona: '',
     instructions: '',
+    strategic: '',
+    tactical: '',
+    summarization: '',
     strategicModel: '',
     tacticalModel: '',
     sessionModel: '',
@@ -435,6 +507,9 @@ export class ExpertEditorComponent implements OnInit {
       const prompts = (b['prompts'] ?? {}) as Record<string, unknown>;
       this.form.persona = (prompts['persona'] as string) ?? '';
       this.form.instructions = (prompts['instructions'] as string) ?? '';
+      this.form.strategic = (prompts['strategic'] as string) ?? '';
+      this.form.tactical = (prompts['tactical'] as string) ?? '';
+      this.form.summarization = (prompts['summarization'] as string) ?? '';
       const cfg = (b['config'] ?? {}) as Record<string, unknown>;
       // Raw flap shows only the keys the structured controls don't own.
       const {rawRemainderText} = splitExpertConfig(cfg);
@@ -495,6 +570,16 @@ export class ExpertEditorComponent implements OnInit {
     this.form.strategicModel = '';
     this.form.tacticalModel = '';
     this.form.sessionModel = '';
+    // Phase-prompt overrides are mode-specific (strategic/tactical are worker-
+    // only) — clear them so a worker→session switch on CREATE doesn't carry over.
+    this.form.strategic = '';
+    this.form.tactical = '';
+    this.form.summarization = '';
+  }
+
+  /** Assemble the prompts payload for save (see buildPromptsPayload). */
+  private buildPrompts(): Record<string, string> {
+    return buildPromptsPayload(this.form, this.mode());
   }
 
   /** Build the model-select config fragment for the current mode. */
@@ -538,7 +623,7 @@ export class ExpertEditorComponent implements OnInit {
         .map((t) => t.trim())
         .filter(Boolean),
       config,
-      prompts: {persona: this.form.persona, instructions: this.form.instructions},
+      prompts: this.buildPrompts(),
     };
     this.saving.set(true);
     const id = this.editingId();

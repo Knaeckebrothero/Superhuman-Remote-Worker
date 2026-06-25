@@ -30,6 +30,12 @@ data:
   # reader selector; agents inherit it via envFrom for the writer.
   AUDIT_BACKEND: {{ .Values.databases.audit.backend | quote }}
 
+  # Active checkpointer backend (sqlite|postgres). Worker agents read it to pick
+  # the LangGraph checkpointer (postgres = shared Postgres, cross-pod resume);
+  # the orchestrator reads it to prune checkpoints on terminal. Agents inherit
+  # via envFrom. Default sqlite for flag-gated rollout.
+  CHECKPOINTER_BACKEND: {{ .Values.checkpointer.backend | default "sqlite" | quote }}
+
   # LiteLLM gateway DB (srw_litellm) — non-secret connection parts. Composed
   # with LITELLM_POSTGRES_USER/PASSWORD (Secret) into the DATABASE_URL on the
   # LiteLLM pod. LiteLLM self-migrates this schema via Prisma (not the
