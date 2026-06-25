@@ -5,7 +5,7 @@ import {AppIconComponent} from '../../ui/icon';
 import {ModelService} from '../../core/services/model.service';
 import {SettingsService} from '../../core/services/settings.service';
 import {computeModelMismatch, ModelMismatch, readConfigPath, SettingsMode} from './agent-settings.types';
-import {getReasoningOptions} from './reasoning-options';
+import {reasoningOptionsForModel} from './reasoning-options';
 
 const STORAGE_KEYS = {
   strategic: 'default_strategic_model',
@@ -268,15 +268,24 @@ export class ModelGroupComponent {
 
   /** Reasoning options for the currently selected strategic model. */
   readonly strategicReasoningOptions = computed(() =>
-    getReasoningOptions(this.strategicModel() ?? this.resolvedStrategicModel())
+    reasoningOptionsForModel(
+      this.strategicModel() ?? this.resolvedStrategicModel(),
+      this.modelService.reasoningByModel(),
+    )
   );
   /** Reasoning options for the currently selected tactical model. */
   readonly tacticalReasoningOptions = computed(() =>
-    getReasoningOptions(this.tacticalModel() ?? this.resolvedTacticalModel())
+    reasoningOptionsForModel(
+      this.tacticalModel() ?? this.resolvedTacticalModel(),
+      this.modelService.reasoningByModel(),
+    )
   );
   /** Reasoning options for the session model. */
   readonly sessionReasoningOptions = computed(() =>
-    getReasoningOptions(this.sessionModel() ?? this.resolvedSessionModel())
+    reasoningOptionsForModel(
+      this.sessionModel() ?? this.resolvedSessionModel(),
+      this.modelService.reasoningByModel(),
+    )
   );
 
   /**

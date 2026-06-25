@@ -4,8 +4,9 @@ import {TranslocoPipe} from '@jsverse/transloco';
 import {AppIconComponent} from '../../ui/icon';
 import {AppTooltipDirective} from '../../ui/tooltip';
 import {readConfigPath, resolveMatrixForModel, SettingsMode} from './agent-settings.types';
-import {getReasoningOptions} from './reasoning-options';
+import {reasoningOptionsForModel} from './reasoning-options';
 import {UserService} from '../../core/services/user.service';
+import {ModelService} from '../../core/services/model.service';
 
 /**
  * Advanced settings tab: collapsible accordion sections for power-user settings.
@@ -929,6 +930,7 @@ export class AdvancedAccordionComponent {
 
   // --- Workspace ---
   private readonly userService = inject(UserService);
+  private readonly modelService = inject(ModelService);
   /** Whether the current user is allowed to pick the VM backend. Admins always qualify. */
   readonly canUseVm = computed(() => {
     const u = this.userService.currentUser();
@@ -1067,13 +1069,22 @@ export class AdvancedAccordionComponent {
   readonly effectiveAuxTemp = computed(() => this.auxTemperature() ?? this.resolvedAuxTemperature());
 
   readonly strategicReasoningOptions = computed(() =>
-    getReasoningOptions(this.strategicModelOverride() ?? (this.r('llm.strategic.model') ?? this.r('llm.model')) as string | null)
+    reasoningOptionsForModel(
+      this.strategicModelOverride() ?? (this.r('llm.strategic.model') ?? this.r('llm.model')) as string | null,
+      this.modelService.reasoningByModel(),
+    )
   );
   readonly tacticalReasoningOptions = computed(() =>
-    getReasoningOptions(this.tacticalModelOverride() ?? (this.r('llm.tactical.model') ?? this.r('llm.model')) as string | null)
+    reasoningOptionsForModel(
+      this.tacticalModelOverride() ?? (this.r('llm.tactical.model') ?? this.r('llm.model')) as string | null,
+      this.modelService.reasoningByModel(),
+    )
   );
   readonly sessionReasoningOptions = computed(() =>
-    getReasoningOptions(this.sessionModelOverride() ?? this.r('llm.model') as string | null)
+    reasoningOptionsForModel(
+      this.sessionModelOverride() ?? this.r('llm.model') as string | null,
+      this.modelService.reasoningByModel(),
+    )
   );
 
   readonly inferenceModifiedCount = computed(() => {
