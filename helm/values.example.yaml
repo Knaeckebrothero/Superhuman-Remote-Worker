@@ -65,6 +65,8 @@ databases:
   postgres:
     enabled: true
     internal: false
+    # HA: must be a direct/session-mode endpoint — NOT a transaction-mode pooler
+    # (PgBouncer/pgcat txn mode breaks the leader-election session advisory lock).
     externalUrl: "postgres://srw:<pw>@pg.example.com:5432/srw"
   vector:
     enabled: true
