@@ -2566,6 +2566,37 @@ class PostgresDB:
     # DISPATCHER QUERIES (Auto-Assignment)
     # =========================================================================
 
+    async def claim_job_for_agent(self, job_id: str, agent_id: str) -> bool:
+        """Atomically claim a dispatchable job for an agent (M1 — HA dispatch).
+
+        Returns True iff THIS call won the claim. The CAS predicate
+        (``assigned_agent_id IS NULL AND status IN ('created','paused')``) makes
+        the assignment safe against concurrent dispatchers and the transient
+        dual-leader window that leader election cannot fence — a job can never
+        be handed to two agents. Callers MUST claim before notifying the agent.
+        """
+        try:
+            job_uuid = UUID(job_id)
+            agent_uuid = UUID(agent_id)
+        except ValueError:
+            return False
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                UPDATE jobs
+                   SET status = 'processing',
+                       assigned_agent_id = $2,
+                       updated_at = CURRENT_TIMESTAMP
+                 WHERE id = $1
+                   AND assigned_agent_id IS NULL
+                   AND status IN ('created', 'paused')
+                RETURNING id
+                """,
+                job_uuid,
+                agent_uuid,
+            )
+            return row is not None
+
     async def get_dispatchable_jobs(self, limit: int = 20) -> List[Dict[str, Any]]:
         """Get jobs waiting for assignment, ordered by priority then creation time.
 
