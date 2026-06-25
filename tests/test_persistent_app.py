@@ -2591,6 +2591,10 @@ class TestAttachSessionCloudMount:
                 )
                 self.workspace_sync = None
                 self.postgres_conn = None
+                # Matches PersistentSession's class default; a no-op setup()
+                # never builds tools, so the live citation-verdict callback
+                # wiring at attach time is skipped.
+                self.tool_context = None
 
             async def setup(self, **kwargs):
                 return None
