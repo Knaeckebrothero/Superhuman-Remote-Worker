@@ -19,6 +19,18 @@ export interface EmbeddingModel extends HelperModel {
   dimensions?: number;
 }
 
+/**
+ * Per-model reasoning control capability, derived server-side from the model
+ * family's `reasoning` block (config/model_config_matrix.yaml). Drives the
+ * Cockpit reasoning dropdown so it can't drift from the backend.
+ * `method`: effort_enum | binary_toggle | token_budget | always_on | none.
+ */
+export interface ReasoningCapability {
+  method: string;
+  default: string | null;
+  options: string[];
+}
+
 interface ModelsResponse {
   groups: ModelGroup[];
   auxiliary_models: HelperModel[];
@@ -27,6 +39,7 @@ interface ModelsResponse {
   tts_models: HelperModel[];
   embedding_models: EmbeddingModel[];
   configured_providers: string[];
+  reasoning_by_model?: Record<string, ReasoningCapability>;
 }
 
 /**
@@ -46,6 +59,8 @@ export class ModelService {
   readonly ttsModels = signal<HelperModel[]>([]);
   readonly embeddingModels = signal<EmbeddingModel[]>([]);
   readonly providers = signal<string[]>([]);
+  /** model_id → reasoning capability (family-derived); drives the reasoning UI. */
+  readonly reasoningByModel = signal<Record<string, ReasoningCapability>>({});
   readonly loading = signal(false);
   readonly loaded = signal(false);
 
@@ -70,6 +85,7 @@ export class ModelService {
         this.ttsModels.set(resp.tts_models ?? []);
         this.embeddingModels.set(resp.embedding_models ?? []);
         this.providers.set(resp.configured_providers);
+        this.reasoningByModel.set(resp.reasoning_by_model ?? {});
         this.loading.set(false);
         this.loaded.set(true);
         this.fetchInFlight = false;
@@ -85,6 +101,7 @@ export class ModelService {
         this.ttsModels.set([]);
         this.embeddingModels.set([]);
         this.providers.set([]);
+        this.reasoningByModel.set({});
         this.loading.set(false);
         this.loaded.set(true);
         this.fetchInFlight = false;

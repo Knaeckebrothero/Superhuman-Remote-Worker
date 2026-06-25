@@ -26,6 +26,10 @@ function createComponent(overrides?: {
     whisperModels: signal([]),
     embeddingModels: signal([]),
     providers: signal([]),
+    reasoningByModel: signal<Record<string, {method: string; default: string | null; options: string[]}>>({
+      'gpt-5.4': {method: 'effort_enum', default: 'high', options: ['low', 'medium', 'high']},
+      'gemma-4-moe': {method: 'binary_toggle', default: 'on', options: ['on', 'off']},
+    }),
     loading: signal(false),
     loaded: signal(true),
     load: vi.fn(),

@@ -1,8 +1,14 @@
 # `reasoning_effort` is injected without a model-capability guard
 
-**Status**: Backlog — latent correctness bug + improper default for the
-default model. Low-risk, self-contained fix in the LLM factories. Filed
-2026-06-15.
+**Status**: ✅ **RESOLVED 2026-06-24** by the family-centered reasoning work
+(Slice A). The API reasoning injection is now capability-gated: `detect_reasoning_method`
+and the OpenAI/OpenRouter/Codex factories read each family's `reasoning` block
+(`config/model_config_matrix.yaml`) via `reasoning_capability()` /
+`resolve_reasoning_plan()`. Result: gemma/minimax no longer receive an inert
+`reasoning_effort` (gemma now sends `chat_template_kwargs.enable_thinking`), gpt-oss no
+longer double-injects (prompt-delivered only), and effort families are unchanged. Full
+design + k3d verification: [[family_centered_reasoning]] (now in `docs/done/`). Filed
+2026-06-15. The analysis below is preserved as the original problem record.
 
 ## Context
 
