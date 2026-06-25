@@ -1,6 +1,27 @@
 # Orchestrator M1 — Leader Election Implementation Plan
 
-**Status (2026-06-25): Tasks 1-4 SHIPPED** — committed on `develop` (unpushed), tested with PostgresContainer (testcontainers via the podman socket). `replicas: 2` is now correctness-safe: leader election (`4233ffca`), lifespan wiring + loop gating (`d8c69c95`), atomic CAS job claim (`2621376a`), Postgres keepalive tuning + pooler warning (`31349f55`). **Tasks 5 (defense-in-depth loop hardening — imap UNIQUE-index migration, delegation CAS, digest/notify guards) and 6 (two-replica verification + docs) are DEFERRED** to a focused fresh pass. Note: Task 2 used a `run_when_leader` registration-site wrapper (not the per-tick gate the tasks below describe) — see `services/leader_election.py`.
+## Current state — as-built (2026-06-25)
+
+**Tasks 1-4 SHIPPED** (committed on `develop`, unpushed; tested with PostgresContainer via the podman socket). **`replicas: 2` is now correctness-safe.** Tasks 5-6 remain. The per-task bodies further below are the *original* plan; where the build diverged, the as-built note in this table is authoritative.
+
+| Task | Status | Commit | As-built / deviations from the plan below |
+|---|---|---|---|
+| 1. Leader-election primitive | ✅ DONE | `4233ffca` | `database/lock_ids.py` (`LEADER_ID = 0x5352575F4C454144` "SRW_LEAD") + `services/leader_election.py` (`run_as_leader`, module-level `is_leader` event). 3 PostgresContainer tests in `tests/test_leader_election.py`. As planned. |
+| 2. Lifespan wiring + loop gating | ✅ DONE | `d8c69c95` | **Deviation:** rather than a per-tick `is_leader` gate inside each loop, added a `run_when_leader(make_coro, shutdown, poll_seconds=1.0)` wrapper (in `leader_election.py`) applied at the lifespan **registration site** — loop bodies untouched; it cancels the loop on leadership loss within ~1s. The 9 singleton loops are wrapped; `_trigger_dispatch` gated on `is_leader`. `run_when_leader` unit-tested (no Postgres). Chosen as lower-risk than editing 9 functions in the 23k-line monolith. |
+| 3. Atomic CAS job claim | ✅ DONE | `2621376a` | `PostgresDB.claim_job_for_agent` — CAS `UPDATE jobs SET status='processing', assigned_agent_id WHERE id=$1 AND assigned_agent_id IS NULL AND status IN ('created','paused') RETURNING id` (mirrors `update_job_status` uuid/`CURRENT_TIMESTAMP`). **Integrated at the dispatcher Phase-1 call site (`main.py` ~:4096, claim-before-notify, guards both dispatch + resume) — NOT inside `_dispatch_job_to_agent`** (leaves its failure handling + the manual-assign caller at `main.py:11852` untouched). `tests/test_job_claim.py` (exactly-one-wins + rejects non-dispatchable). **Ref fix:** `get_dispatchable_jobs` is at `postgres.py:2569` (plan/doc said `:2449`). **Deferred to M2:** `FOR UPDATE SKIP LOCKED` on the candidate scan — the CAS claim is the correctness guard; SKIP LOCKED is a throughput optimization, not needed for safety. |
+| 4. Keepalive tuning + pooler guard | ✅ DONE | `31349f55` | `helm/templates/databases/postgres.yaml`: `-c tcp_keepalives_idle/interval/count=10/10/3`. Pooler warning in `helm/values.yaml` + `helm/values.example.yaml`. No `values.schema.json` change needed (schema is permissive). helm render + lint verified. As planned. |
+| 5. Defense-in-depth loop hardening | ⬜ NOT STARTED | — | See Task 5 body. Key gotcha confirmed during recon: next migration is `0037`; the imap guard must **dedup existing `message_log` rows before** `CREATE UNIQUE INDEX` (it fails on dupes; current index is the non-unique partial at `0001_initial.sql:1208`), then `log_message` (`postgres.py:8067`) gets `ON CONFLICT DO NOTHING` and `imap_poller._process_email` inserts-as-claim. These loops are already leader-gated, so this only matters in the ~1s dual-leader window. |
+| 6. Two-replica verification + docs | ⬜ NOT STARTED | — | See Task 6 body. Manual k3d two-replica failover test needs M1 deployed first (push `develop`). |
+
+**Local TDD recipe** (the env needed wiring — don't rediscover it): `.venv` is Python 3.12 (matches CI) but its `pip` wrapper shebang is stale → install deps with `.venv/bin/python -m pip install <pkg>`. Run the PostgresContainer tests with:
+```
+DOCKER_HOST="unix:///run/user/$(id -u)/podman/podman.sock" TESTCONTAINERS_RYUK_DISABLED=true \
+  .venv/bin/python -m pytest tests/test_leader_election.py tests/test_job_claim.py -v
+```
+
+**To finish M1:** Task 5 → Task 6 → push `develop` → run the two-replica failover test on dev.
+
+---
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
