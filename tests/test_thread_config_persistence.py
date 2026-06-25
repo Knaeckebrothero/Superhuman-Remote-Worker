@@ -211,7 +211,8 @@ class TestCodexSessionGatewayBaseUrl:
             }
         }
         out = await main._inject_thread_dispatch_credentials(
-            stored, user_id="u"  # no project_id → fleet/master fallback, no network
+            stored,
+            user_id="u",  # no project_id → fleet/master fallback, no network
         )
         assert out["llm"]["base_url"] == CODEX_BASE_URL
         assert out["llm"]["api_key"] == CODEX_API_KEY
