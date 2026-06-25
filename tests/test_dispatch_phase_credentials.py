@@ -548,6 +548,55 @@ class TestCodexBypassesGateway:
         assert section["base_url"] == GATEWAY[0]
         assert section["api_key"] == GATEWAY[1]
 
+    @pytest.mark.asyncio
+    async def test_codex_model_replaces_stale_gateway_base_url(self, monkeypatch):
+        """A persisted / hot-swapped session section can still carry a STALE
+        LiteLLM-gateway base_url (+ its provider) from a previously
+        gateway-routed model. A codex model bypasses the gateway, so that stale
+        base_url must be REPLACED with the codex endpoint's own — otherwise the
+        codex endpoint key is sent to the gateway, which rejects any non-`sk-`
+        key (401 "LiteLLM Virtual Key expected"). The per-field ``setdefault``
+        could not correct it. Regression for
+        docs/issues/codex_session_gateway_baseurl_401.md.
+        """
+        _patch_resolve_provider(monkeypatch, provider="codex")
+        section = {
+            "model": "gpt-5.5",
+            "base_url": GATEWAY[0],  # stale gateway URL from a prior model
+            "provider": "openai",  # stale factory from the same prior model
+        }
+        await main._inject_model_credentials(
+            section=section,
+            model_id="gpt-5.5",
+            user_id="u",
+            resolved_keys={},
+            gateway_override=GATEWAY,
+        )
+        # Transport must be coherent: codex proxy + codex key + codex factory.
+        assert section["base_url"] == CODEX_BASE_URL
+        assert section["api_key"] == CODEX_API_KEY
+        assert section["provider"] == "codex"
+
+    @pytest.mark.asyncio
+    async def test_codex_model_keeps_caller_pinned_nongateway_base_url(
+        self, monkeypatch
+    ):
+        """Only a stale *gateway* base_url is replaced. A deliberately
+        caller-pinned non-gateway base_url (BYO codex endpoint) is preserved —
+        the replacement must not over-reach into the additive contract."""
+        _patch_resolve_provider(monkeypatch, provider="codex")
+        section = {"model": "gpt-5.5", "base_url": "https://byo-codex.example/v1"}
+        await main._inject_model_credentials(
+            section=section,
+            model_id="gpt-5.5",
+            user_id="u",
+            resolved_keys={},
+            gateway_override=GATEWAY,
+        )
+        assert section["base_url"] == "https://byo-codex.example/v1"
+        # api_key still resolved from the endpoint row (base_url present, key absent).
+        assert section["api_key"] == CODEX_API_KEY
+
 
 # ---------------------------------------------------------------------------
 # Embedding credential reliability (memory + KB).

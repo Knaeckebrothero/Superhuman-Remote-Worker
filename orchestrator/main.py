@@ -3557,11 +3557,8 @@ async def _inject_model_credentials(
         # context, e.g. some hot-swap paths). The Codex proxy is Responses-API only
         # and the gateway would normalize it to Chat Completions and drop reasoning,
         # so codex models bypass the gateway and hit their endpoint directly.
-        _gw = (
-            None
-            if meta.provider == "codex"
-            else (gateway_override or _gateway_routing_target())
-        )
+        _gw_target = gateway_override or _gateway_routing_target()
+        _gw = None if meta.provider == "codex" else _gw_target
         if _gw is not None:
             # Route endpoint-kind phase/aux models through the gateway too, so
             # measurement covers the full chat/auxiliary surface (Slice 1) and the
@@ -3571,6 +3568,20 @@ async def _inject_model_credentials(
             return
         endpoint_row = await postgres_db.get_user_llm_endpoint(meta.endpoint_id)
         if endpoint_row:
+            # This model bypasses the gateway (codex). A persisted / hot-swapped
+            # section can still carry a STALE LiteLLM-gateway base_url (+ its
+            # provider) from a previously gateway-routed model; per-field
+            # ``setdefault`` keeps it, so the endpoint's direct key would be sent
+            # to the gateway — which rejects any non-``sk-`` key (401 "LiteLLM
+            # Virtual Key expected"). Drop the stale gateway transport so
+            # base_url/provider/api_key repopulate coherently from the endpoint
+            # row. Scoped to the gateway URL only: a deliberately caller-pinned
+            # non-gateway base_url still wins (additive contract).
+            # See docs/issues/codex_session_gateway_baseurl_401.md.
+            if _gw_target is not None and section.get("base_url") == _gw_target[0]:
+                section.pop("base_url", None)
+                if meta.provider:
+                    section["provider"] = meta.provider
             if endpoint_row.get("base_url"):
                 section.setdefault("base_url", endpoint_row["base_url"])
             if endpoint_row.get("api_key"):
