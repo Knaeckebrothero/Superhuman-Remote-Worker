@@ -11,8 +11,8 @@ equivalents (managed Postgres, an external OIDC provider, an existing git
 server, etc.) — see [Production install](#production-install-bring-your-own).
 
 - **Chart:** `oci://ghcr.io/knaeckebrothero/charts/superhuman-remote-worker`
-- **Source:** <https://github.com/knaeckebrothero/Superhuman-Remote-Worker>
-- **License:** see [LICENSE](https://github.com/knaeckebrothero/Superhuman-Remote-Worker/blob/main/LICENSE) — you must accept the terms to install (`license.acceptTerms: true`).
+- **Source:** <https://github.com/Knaeckebrothero/Superhuman-Remote-Worker>
+- **License:** see [LICENSE](https://github.com/Knaeckebrothero/Superhuman-Remote-Worker/blob/main/LICENSE) — you must accept the terms to install (`license.acceptTerms: true`).
 
 ---
 
@@ -422,5 +422,5 @@ chart tarball.
 
 ## Support
 
-- **Issues:** <https://github.com/knaeckebrothero/Superhuman-Remote-Worker/issues>
-- **License:** [LICENSE](https://github.com/knaeckebrothero/Superhuman-Remote-Worker/blob/main/LICENSE)
+- **Issues:** <https://github.com/Knaeckebrothero/Superhuman-Remote-Worker/issues>
+- **License:** [LICENSE](https://github.com/Knaeckebrothero/Superhuman-Remote-Worker/blob/main/LICENSE)
