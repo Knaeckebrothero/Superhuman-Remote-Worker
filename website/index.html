@@ -71,7 +71,7 @@ section:first-of-type{padding-top:72px}
 
 /* hero */
 .hero-grid{display:grid;grid-template-columns:1.05fr .95fr;gap:48px;align-items:center}
-.hero h1{margin:0 0 22px}
+.hero h1{margin:0 0 22px;text-wrap:balance}
 .hero .lede{font-size:17px;color:var(--t2);max-width:54ch;margin:0 0 28px}
 .cta{display:flex;flex-wrap:wrap;gap:14px;align-items:center;margin-bottom:18px}
 .btn{display:inline-flex;align-items:center;justify-content:center;height:44px;padding:0 22px;text-decoration:none;border:1px solid var(--ac);font-family:Cinzel,Georgia,serif;text-transform:uppercase;letter-spacing:.16em;font-size:13px;font-weight:600;background:var(--ac);color:#fff;transition:background .15s ease,border-color .15s ease}
@@ -174,7 +174,8 @@ footer{padding:36px 0 56px;border-bottom:0}
  .run-grid{grid-template-columns:1fr}
  .lane.l{border-right:0;border-bottom:1px solid var(--bd)}
  section{padding:56px 0}
- .nav .links a:nth-child(3){display:none}
+ /* mobile: keep Sales (the working contact CTA); drop the Repo/Docs placeholders */
+ .nav .links a:nth-child(1),.nav .links a:nth-child(2){display:none}
 }
 @media (max-width:540px){
  .vig-grid,.steps,.grid{grid-template-columns:1fr}
@@ -207,7 +208,7 @@ footer{padding:36px 0 56px;border-bottom:0}
 <section class="hero" id="top"><div class="wrap hero-grid">
  <div class="hero-text">
   <p class="label">AI workforce platform</p>
-  <h1 class="disp">Hand off the paperwork.<br>Keep your team.</h1>
+  <h1 class="disp">Hand off the paperwork. Keep your team.</h1>
   <p class="lede">Specialist AI agents handle the research, invoice review, compliance scans, and code maintenance that drains your day. They run on your own infrastructure, audit every action, and cite every claim.</p>
   <div class="cta">
    <a class="btn" href="/cdn-cgi/l/email-protection#cdbeaca1a8be8dbeb8bda8bfa5b8a0aca3e0bfa8a0a2b9a8e0baa2bfa6a8bfe3aea2a0">Request a demo</a>
@@ -220,7 +221,7 @@ footer{padding:36px 0 56px;border-bottom:0}
    <div class="bub u">What did we decide about data retention last quarter?</div>
    <div class="bub a">
     <div class="who">scholar · 6 sources in shared drive</div>
-    Read Q1 decision logs, audit policy v3, and the March DPIA:
+    Read Q1 decision logs, audit policy v3, and <span style="white-space:nowrap">the March DPIA:</span>
     <ul>
      <li>90 days for transactional logs<sup>[1]</sup></li>
      <li>1 year for audit logs, encrypted at rest<sup>[2]</sup></li>
@@ -363,7 +364,7 @@ footer{padding:36px 0 56px;border-bottom:0}
   <rect x="350" y="68" width="180" height="32" fill="var(--s0)" stroke="var(--bd)"/>
   <text x="440" y="88" font-size="12.5" fill="var(--tx)" text-anchor="middle" font-family="ui-monospace,Menlo,monospace">orchestrator × 1</text>
   <rect x="350" y="108" width="180" height="32" fill="var(--s0)" stroke="var(--ac)" stroke-width="1.4"/>
-  <g stroke="var(--ac)" stroke-width="1" opacity="0.6">
+  <g stroke="var(--ac)" stroke-width="1.4" opacity="0.9">
    <line x1="410" y1="108" x2="410" y2="114"/>
    <line x1="470" y1="108" x2="470" y2="114"/>
    <line x1="410" y1="134" x2="410" y2="140"/>
@@ -378,7 +379,7 @@ footer{padding:36px 0 56px;border-bottom:0}
   <line x1="560" y1="140" x2="610" y2="140" stroke="var(--bd)" stroke-width="1" marker-end="url(#sc-ar)"/>
 
   <!-- Stage 3: K8s -->
-  <text x="730" y="32" font-family="Cinzel,Georgia,serif" font-weight="700" font-size="13" letter-spacing="2.5" fill="var(--tx)" text-anchor="middle">K8S FLEET</text>
+  <text x="740" y="32" font-family="Cinzel,Georgia,serif" font-weight="700" font-size="13" letter-spacing="2.5" fill="var(--tx)" text-anchor="middle">K8S FLEET</text>
   <rect x="620" y="50" width="240" height="180" fill="var(--panel)" stroke="var(--bd)"/>
   <rect x="640" y="68" width="210" height="32" fill="var(--s0)" stroke="var(--bd)"/>
   <g stroke="var(--bd)" stroke-width="1">
@@ -389,7 +390,7 @@ footer{padding:36px 0 56px;border-bottom:0}
   </g>
   <text x="740" y="88" font-size="12" fill="var(--tx)" text-anchor="middle" font-family="ui-monospace,Menlo,monospace">orch × 3 HA</text>
   <rect x="640" y="108" width="210" height="32" fill="var(--s0)" stroke="var(--ac)" stroke-width="1.4"/>
-  <g stroke="var(--ac)" stroke-width="1" opacity="0.6">
+  <g stroke="var(--ac)" stroke-width="1.4" opacity="0.9">
    <line x1="675" y1="108" x2="675" y2="114"/>
    <line x1="710" y1="108" x2="710" y2="114"/>
    <line x1="745" y1="108" x2="745" y2="114"/>
