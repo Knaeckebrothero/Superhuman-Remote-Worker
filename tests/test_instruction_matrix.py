@@ -393,6 +393,67 @@ class TestResolvedConfigSerialization:
         # Check internal fields stripped
         assert "_deployment_dir" not in result["agent"]
 
+    def test_serialize_uses_expert_base_persona_on_gemma(self, tmp_path):
+        """Blob path (the production dispatch/session path): on the default gemma
+        model, an expert shipping only persona.txt gets ITS persona in the blob,
+        not the framework persona_gemma.txt. Regression cover for
+        docs/issues/expert_prompts_shadowed_by_family_variants.md."""
+        expert_dir = tmp_path / "expert"
+        expert_dir.mkdir()
+        (expert_dir / "persona.txt").write_text("expert base persona")
+        config = AgentConfig(
+            agent_id="x", display_name="X", _deployment_dir=str(expert_dir)
+        )
+
+        with patch("src.core.loader.get_project_root", return_value=tmp_path):
+            config_dir = tmp_path / "config"
+            prompts = config_dir / "prompts"
+            prompts.mkdir(parents=True)
+            (prompts / "persona.txt").write_text("framework base persona")
+            (prompts / "persona_gemma.txt").write_text("framework gemma persona")
+            (config_dir / "model_config_matrix.yaml").write_text(
+                textwrap.dedent("""\
+                gemma:
+                  prompts:
+                    persona: persona_gemma.txt
+            """)
+            )
+            result = serialize_resolved_config(
+                config, model="RedHatAI/gemma-4-31B-it-FP8-Dynamic"
+            )
+
+        assert result["model_family"] == "gemma"
+        assert result["prompts"]["persona"] == "expert base persona"
+
+    def test_instruction_resolve_path_expert_base_beats_framework_family(
+        self, tmp_path
+    ):
+        """The strategic-todos path (load_strategic_todos_template -> _resolve_path)
+        is location-primary too: expert base yaml beats the framework family
+        variant on gemma."""
+        expert_dir = tmp_path / "expert"
+        expert_dir.mkdir()
+        (expert_dir / "strategic_todos_initial.yaml").write_text("expert todos")
+
+        with patch("src.core.loader.get_project_root", return_value=tmp_path):
+            config_dir = tmp_path / "config"
+            templates = config_dir / "templates"
+            templates.mkdir(parents=True)
+            (templates / "strategic_todos_initial.yaml").write_text("framework base")
+            (templates / "strategic_todos_initial_gemma.yaml").write_text(
+                "framework gemma"
+            )
+            (config_dir / "model_config_matrix.yaml").write_text(
+                textwrap.dedent("""\
+                gemma:
+                  instructions:
+                    strategic_todos_initial: strategic_todos_initial_gemma.yaml
+            """)
+            )
+            resolver = InstructionMatrixResolver(str(expert_dir), "gemma")
+            path = resolver._resolve_path("strategic_todos_initial")
+            assert path.read_text() == "expert todos"
+
     def test_load_config_from_resolved(self, tmp_path):
         """load_config_from_resolved reconstructs config with pre-resolved content."""
         resolved = {

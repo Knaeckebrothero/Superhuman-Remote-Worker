@@ -3,6 +3,7 @@
 import textwrap
 from unittest.mock import patch
 
+import pytest
 
 from src.core.loader import (
     AgentConfig,
@@ -544,6 +545,172 @@ class TestPromptMatrixResolverLoad:
 
             resolver = PromptMatrixResolver(model_family="default")
             assert resolver.exists("nonexistent_type") is False
+
+
+# =============================================================================
+# Location-primary resolution — regression cover for family-variant shadowing
+# (docs/issues/expert_prompts_shadowed_by_family_variants.md)
+# =============================================================================
+
+
+class TestLocationPrimaryResolution:
+    """An expert (deployment-dir) file outranks a framework file; family-specific
+    is tried before base WITHIN each dir. Order:
+    expert/<family> -> expert/<base> -> framework/<family> -> framework/<base>.
+    """
+
+    GEMMA_MATRIX = textwrap.dedent("""\
+        gemma:
+          prompts:
+            persona: persona_gemma.txt
+            strategic: strategic_gemma.txt
+            tactical: tactical_gemma.txt
+    """)
+
+    @pytest.mark.parametrize("entry_type", ["persona", "strategic", "tactical"])
+    def test_expert_base_beats_framework_family_variant(self, tmp_path, entry_type):
+        """THE bug: expert ships only <type>.txt; base matrix maps the family to
+        <type>_gemma.txt which exists in the framework dir. The expert's base
+        file must win (it never did before this fix)."""
+        expert_dir = tmp_path / "expert"
+        expert_dir.mkdir()
+        (expert_dir / f"{entry_type}.txt").write_text(f"expert base {entry_type}")
+
+        with patch("src.core.loader.get_project_root", return_value=tmp_path):
+            config_dir = tmp_path / "config"
+            prompts = config_dir / "prompts"
+            prompts.mkdir(parents=True)
+            (prompts / f"{entry_type}.txt").write_text(f"framework base {entry_type}")
+            (prompts / f"{entry_type}_gemma.txt").write_text(
+                f"framework gemma {entry_type}"
+            )
+            (config_dir / "model_config_matrix.yaml").write_text(self.GEMMA_MATRIX)
+
+            resolver = PromptMatrixResolver(
+                deployment_dir=str(expert_dir), model_family="gemma"
+            )
+            assert resolver.load(entry_type) == f"expert base {entry_type}"
+
+    def test_expert_family_variant_wins_rank1(self, tmp_path):
+        """Expert that ships its own family variant gets it (rank 1)."""
+        expert_dir = tmp_path / "expert"
+        expert_dir.mkdir()
+        (expert_dir / "persona.txt").write_text("expert base")
+        (expert_dir / "persona_gemma.txt").write_text("expert gemma")
+
+        with patch("src.core.loader.get_project_root", return_value=tmp_path):
+            config_dir = tmp_path / "config"
+            prompts = config_dir / "prompts"
+            prompts.mkdir(parents=True)
+            (prompts / "persona_gemma.txt").write_text("framework gemma")
+            (config_dir / "model_config_matrix.yaml").write_text(self.GEMMA_MATRIX)
+
+            resolver = PromptMatrixResolver(
+                deployment_dir=str(expert_dir), model_family="gemma"
+            )
+            assert resolver.load("persona") == "expert gemma"
+
+    def test_expert_empty_uses_framework_family_rank3(self, tmp_path):
+        """Expert overrides nothing -> framework family variant (rank 3)."""
+        expert_dir = tmp_path / "expert"
+        expert_dir.mkdir()
+
+        with patch("src.core.loader.get_project_root", return_value=tmp_path):
+            config_dir = tmp_path / "config"
+            prompts = config_dir / "prompts"
+            prompts.mkdir(parents=True)
+            (prompts / "persona.txt").write_text("framework base")
+            (prompts / "persona_gemma.txt").write_text("framework gemma")
+            (config_dir / "model_config_matrix.yaml").write_text(self.GEMMA_MATRIX)
+
+            resolver = PromptMatrixResolver(
+                deployment_dir=str(expert_dir), model_family="gemma"
+            )
+            assert resolver.load("persona") == "framework gemma"
+
+    def test_no_family_variant_uses_framework_base_rank4(self, tmp_path):
+        """Family with no variant -> framework base (rank 4)."""
+        with patch("src.core.loader.get_project_root", return_value=tmp_path):
+            prompts = tmp_path / "config" / "prompts"
+            prompts.mkdir(parents=True)
+            (prompts / "persona.txt").write_text("framework base")
+
+            resolver = PromptMatrixResolver(model_family="gemma")
+            assert resolver.load("persona") == "framework base"
+
+    def test_expert_matrix_remap_respected(self, tmp_path):
+        """An expert model_config_matrix override names a custom file; it's used
+        from the expert dir (proves _resolve_path consumes resolve_filename)."""
+        expert_dir = tmp_path / "expert"
+        expert_dir.mkdir()
+        (expert_dir / "custom_persona.txt").write_text("expert custom")
+        (expert_dir / "model_config_matrix.yaml").write_text(
+            textwrap.dedent("""\
+            gemma:
+              prompts:
+                persona: custom_persona.txt
+        """)
+        )
+
+        with patch("src.core.loader.get_project_root", return_value=tmp_path):
+            config_dir = tmp_path / "config"
+            prompts = config_dir / "prompts"
+            prompts.mkdir(parents=True)
+            (prompts / "persona_gemma.txt").write_text("framework gemma")
+            (config_dir / "model_config_matrix.yaml").write_text(self.GEMMA_MATRIX)
+
+            resolver = PromptMatrixResolver(
+                deployment_dir=str(expert_dir), model_family="gemma"
+            )
+            assert resolver.load("persona") == "expert custom"
+
+    def test_deployment_dir_none_is_framework_only(self, tmp_path):
+        """deployment_dir=None (sessions/admin) -> framework chain, no crash."""
+        with patch("src.core.loader.get_project_root", return_value=tmp_path):
+            config_dir = tmp_path / "config"
+            prompts = config_dir / "prompts"
+            prompts.mkdir(parents=True)
+            (prompts / "persona.txt").write_text("framework base")
+            (prompts / "persona_gemma.txt").write_text("framework gemma")
+            (config_dir / "model_config_matrix.yaml").write_text(self.GEMMA_MATRIX)
+
+            resolver = PromptMatrixResolver(model_family="gemma")
+            assert resolver.load("persona") == "framework gemma"
+
+    def test_db_override_short_circuits_before_files(self, tmp_path):
+        """A DB config override wins over any file; bundled_only bypasses it and
+        reads the expert base via location-primary resolution."""
+        expert_dir = tmp_path / "expert"
+        expert_dir.mkdir()
+        (expert_dir / "persona.txt").write_text("expert base persona")
+
+        with patch("src.core.loader.get_project_root", return_value=tmp_path):
+            (tmp_path / "config" / "prompts").mkdir(parents=True)
+            resolver = PromptMatrixResolver(
+                deployment_dir=str(expert_dir), model_family="default"
+            )
+            with patch("src.core.loader._db_lookup", return_value="DB OVERRIDE"):
+                assert resolver.load("persona") == "DB OVERRIDE"
+                assert (
+                    resolver.load("persona", bundled_only=True) == "expert base persona"
+                )
+
+    def test_exists_true_for_expert_base_on_gemma(self, tmp_path):
+        """exists() finds the expert base even when the matrix names a (missing)
+        family variant."""
+        expert_dir = tmp_path / "expert"
+        expert_dir.mkdir()
+        (expert_dir / "persona.txt").write_text("expert base")
+
+        with patch("src.core.loader.get_project_root", return_value=tmp_path):
+            config_dir = tmp_path / "config"
+            (config_dir / "prompts").mkdir(parents=True)
+            (config_dir / "model_config_matrix.yaml").write_text(self.GEMMA_MATRIX)
+
+            resolver = PromptMatrixResolver(
+                deployment_dir=str(expert_dir), model_family="gemma"
+            )
+            assert resolver.exists("persona") is True
 
 
 # =============================================================================
