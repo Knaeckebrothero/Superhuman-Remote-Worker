@@ -1,10 +1,21 @@
 # Sales page — landing-page audit (broken CTAs, missing social card, polish)
 
 **Date:** 2026-05-29
-**Status:** Open. Six independent issues; #1 and #2 affect every visitor on the live page now. #3–#7 are polish.
+**Status:** RESOLVED (2026-06-25). All issues fixed — see the resolution note below.
 **Component:** Source of truth `index.html` (SRW repo root). Deployed copy in `HomeLab/deployments_managed/srw-sales-page/10-deployment.yaml` (the `srw-sales-page-content` ConfigMap, inlined HTML at `data.index.html`). Live at https://superhuman-remote-worker.com/.
 
 > **Update (2026-06-19):** source moved to `website/index.html`; the page now ships as a CI-built nginx image (`ghcr.io/knaeckebrothero/superhuman-remote-worker-website`) rather than an inlined ConfigMap. The "re-indent into the ConfigMap" instructions below are retired — see `docs/superpowers/specs/2026-06-18-helm-config-generator-design.md` §13.
+
+> **RESOLVED (2026-06-25).** Every conversion path works and the polish landed:
+> - **#1 broken CTAs** — self-host CTAs → `/configure` (the new config generator); "Start free trial"/"See pricing" → "Request a demo"/"Talk to sales" (hosted isn't self-serve yet); Repo/Docs kept as deliberate placeholders for the planned OSS launch. (`29b17572`)
+> - **#2 og:image** — real 1200×630 PNG served as a file, plus og/twitter meta on both pages. (`85a607b1`)
+> - **#3 mobile nav** — keep Sales, drop the Repo/Docs placeholders on ≤760px. (`2520bda0`)
+> - **#4 DPIA orphan** — `white-space:nowrap` on "the March DPIA:". (`2520bda0`)
+> - **#5 scale-diagram ticks** — bumped to opacity 0.9 + stroke-width 1.4; "K8S FLEET" centered (x 730→740). (`2520bda0`)
+> - **#6 pricing** — "See pricing" → "Talk to sales". (`29b17572`)
+> - **#7 smalls** — hero `<br>` → `text-wrap:balance`; og:url/twitter:card added. Left as-is by decision: Cloudflare email obfuscation (works through CF) and a favicon raster fallback (SVG-only).
+>
+> The self-host funnel now terminates on a real, public chart (`oci://ghcr.io/knaeckebrothero/charts/superhuman-remote-worker`, v0.0.23). Generator design: `docs/superpowers/specs/2026-06-18-helm-config-generator-design.md`.
 
 ## Summary
 
