@@ -9152,9 +9152,19 @@ async def _check_delegation_timeouts() -> int:
             parent_ctx["delegation_timed_out"] = True
             await postgres_db.update_job_context(job_id, parent_ctx)
 
-            await postgres_db.update_job_status(
-                job_id, status="paused", assigned_agent_id=""
-            )
+            # Atomically re-queue the parent (waiting → paused). Under the
+            # transient dual-leader window two sweepers can both reach here for
+            # the same parent; the CAS ensures exactly one re-queues it, so the
+            # parent is never resumed twice with partial results. The loser
+            # skips the dispatch trigger. (Context is written before this flip
+            # so the dispatcher always resumes with delegation_results present.)
+            claimed = await postgres_db.claim_delegation_resume(job_id)
+            if not claimed:
+                logger.debug(
+                    f"Delegation timeout for {job_id} already handled by "
+                    f"another sweeper; skipping resume"
+                )
+                continue
             _trigger_dispatch()
 
             logger.info(
