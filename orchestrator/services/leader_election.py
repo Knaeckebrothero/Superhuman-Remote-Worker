@@ -23,7 +23,7 @@ not interpose a transaction-mode pooler (documented in helm/values.yaml).
 import asyncio
 import logging
 import random
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 logger = logging.getLogger(__name__)
 
@@ -128,3 +128,48 @@ async def run_as_leader(db: Any, lock_id: int, shutdown_event: asyncio.Event) ->
 
     is_leader.clear()
     logger.info("leader_election: shutdown")
+
+
+async def run_when_leader(
+    make_coro: Callable[[asyncio.Event], Awaitable[None]],
+    shutdown_event: asyncio.Event,
+    poll_seconds: float = 1.0,
+) -> None:
+    """Run a background loop only while this replica holds leadership.
+
+    ``make_coro(shutdown_event)`` returns the loop coroutine; it is started when
+    leadership is acquired and cancelled when leadership is lost (detected
+    within ``poll_seconds``) or on shutdown. Loop side effects must be
+    idempotent / CAS-guarded — a loop cancelled mid-tick may be retried by the
+    next leader.
+    """
+    task: asyncio.Task | None = None
+    try:
+        while not shutdown_event.is_set():
+            # Wait until we're the leader (or shutting down).
+            while not is_leader.is_set() and not shutdown_event.is_set():
+                await _sleep_or_shutdown(poll_seconds, shutdown_event)
+            if shutdown_event.is_set():
+                break
+            # Run the loop until we lose leadership / shut down / it exits.
+            task = asyncio.create_task(make_coro(shutdown_event))
+            while (
+                is_leader.is_set()
+                and not shutdown_event.is_set()
+                and not task.done()
+            ):
+                await _sleep_or_shutdown(poll_seconds, shutdown_event)
+            if not task.done():
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+            task = None
+    finally:
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
