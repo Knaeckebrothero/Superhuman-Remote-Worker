@@ -41,6 +41,19 @@ spec:
       containers:
         - name: postgres
           image: {{ .Values.databases.postgres.image }}
+          # HA (M1): tighten TCP keepalives so a dead client backend — e.g. a
+          # crashed/partitioned orchestrator holding the session-scoped leader
+          # advisory lock — is detected in ~40s instead of the ~2h OS default,
+          # bounding leader-election failover. (Server-side keepalives only
+          # affect dead-connection detection; no risk to live sessions.)
+          # See docs/researches/orchestrator_leader_election.md.
+          args:
+            - "-c"
+            - "tcp_keepalives_idle=10"
+            - "-c"
+            - "tcp_keepalives_interval=10"
+            - "-c"
+            - "tcp_keepalives_count=3"
           ports:
             - containerPort: 5432
           env:
