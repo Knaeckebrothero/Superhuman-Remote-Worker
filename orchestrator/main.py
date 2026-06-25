@@ -4264,8 +4264,15 @@ async def auto_assign_dispatcher(shutdown_event: asyncio.Event) -> None:
 
 
 def _trigger_dispatch() -> None:
-    """Fire-and-forget trigger for the dispatcher. Safe to call from any endpoint."""
-    if AUTO_ASSIGN_ENABLED:
+    """Fire-and-forget trigger for the dispatcher. Safe to call from any endpoint.
+
+    Gated on leadership (M1): only the elected leader dispatches, so a job
+    created via a REST handler on a non-leader replica is picked up by the
+    leader's periodic dispatcher loop rather than dispatched here.
+    """
+    from orchestrator.services.leader_election import is_leader
+
+    if AUTO_ASSIGN_ENABLED and is_leader.is_set():
         asyncio.create_task(_try_dispatch_pending_jobs())
 
 
@@ -5362,14 +5369,26 @@ async def lifespan(app: FastAPI):
 
     # Start background tasks
     _shutdown_event = asyncio.Event()
-    stale_detector_task = asyncio.create_task(stale_agent_detector(_shutdown_event))
+    # Leader election (M1): this replica contends for the singleton-loop
+    # leadership lock; the run_when_leader-wrapped loops below run only while
+    # this replica holds it. See services/leader_election.py.
+    from orchestrator.database.lock_ids import LEADER_ID
+    from orchestrator.services.leader_election import run_as_leader, run_when_leader
+    leader_task = asyncio.create_task(
+        run_as_leader(postgres_db, LEADER_ID, _shutdown_event)
+    )
+    stale_detector_task = asyncio.create_task(
+        run_when_leader(stale_agent_detector, _shutdown_event)
+    )
     token_cleanup_task = asyncio.create_task(
         cleanup_expired_tokens(postgres_db, _shutdown_event)
     )
     session_cleanup_task = asyncio.create_task(
         cleanup_expired_sessions(postgres_db, _shutdown_event)
     )
-    dispatcher_task = asyncio.create_task(auto_assign_dispatcher(_shutdown_event))
+    dispatcher_task = asyncio.create_task(
+        run_when_leader(auto_assign_dispatcher, _shutdown_event)
+    )
     sudo_sweeper_task = asyncio.create_task(sudo_expiration_sweeper(_shutdown_event))
     thread_events_prune_task = asyncio.create_task(
         thread_events_prune_sweeper(_shutdown_event)
@@ -5378,7 +5397,7 @@ async def lifespan(app: FastAPI):
         security_events_prune_sweeper(_shutdown_event)
     )
     headless_notify_task = asyncio.create_task(
-        thread_permission_notify_sweeper(_shutdown_event)
+        run_when_leader(thread_permission_notify_sweeper, _shutdown_event)
     )
     attention_sleep_task = asyncio.create_task(attention_sleep_sweeper(_shutdown_event))
     ide_sweeper_task = asyncio.create_task(ide_session_ttl_sweeper(_shutdown_event))
@@ -5387,12 +5406,16 @@ async def lifespan(app: FastAPI):
         code_server_settings_sweeper(_shutdown_event)
     )
     gc_sweeper_task = asyncio.create_task(snapshot_gc_sweeper(_shutdown_event))
-    imap_task = asyncio.create_task(imap_poll_loop(_shutdown_event))
-    digest_task = asyncio.create_task(quiet_hours_digest_loop(_shutdown_event))
-    delegation_timeout_task = asyncio.create_task(
-        delegation_timeout_sweeper(_shutdown_event)
+    imap_task = asyncio.create_task(run_when_leader(imap_poll_loop, _shutdown_event))
+    digest_task = asyncio.create_task(
+        run_when_leader(quiet_hours_digest_loop, _shutdown_event)
     )
-    pool_reconciler_task = asyncio.create_task(agent_pool_reconciler(_shutdown_event))
+    delegation_timeout_task = asyncio.create_task(
+        run_when_leader(delegation_timeout_sweeper, _shutdown_event)
+    )
+    pool_reconciler_task = asyncio.create_task(
+        run_when_leader(agent_pool_reconciler, _shutdown_event)
+    )
     automation_cron_task = asyncio.create_task(
         cron_dispatcher_loop(
             postgres_db, _shutdown_event, on_job_created=_trigger_dispatch
@@ -5424,7 +5447,9 @@ async def lifespan(app: FastAPI):
     # Longer-window quota stop (Slice 3): polls per-project daily usage from the
     # gateway and freezes jobs whose project crossed its quota. Self-disables with
     # the gateway (LITELLM_BASE_URL unset). See usage_monitoring_and_rate_limiting.md.
-    quota_poll_task = asyncio.create_task(quota_poll_loop(_shutdown_event, postgres_db))
+    quota_poll_task = asyncio.create_task(
+        run_when_leader(lambda se: quota_poll_loop(se, postgres_db), _shutdown_event)
+    )
 
     # Workspace compute metering (Slice 4b): materialize CLOSED workspace
     # intervals into the usage ledger + reconcile leaked opens. Self-disables
@@ -5490,7 +5515,10 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.exception("Lifecycle startup reconciliation failed (non-fatal)")
     lifecycle_reconciler_task = asyncio.create_task(
-        lifecycle_reconciler_loop(_shutdown_event, lifecycle_reconciler)
+        run_when_leader(
+            lambda se: lifecycle_reconciler_loop(se, lifecycle_reconciler),
+            _shutdown_event,
+        )
     )
 
     # Phase 4: main-cloud config LISTEN task — reacts to pg_notify when
@@ -5506,6 +5534,7 @@ async def lifespan(app: FastAPI):
 
     # Signal shutdown to background tasks
     _shutdown_event.set()
+    await leader_task
     await stale_detector_task
     await token_cleanup_task
     await session_cleanup_task

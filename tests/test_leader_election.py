@@ -73,3 +73,38 @@ async def test_run_as_leader_sets_then_clears(pg_dsn):
         await asyncio.wait_for(task, timeout=15)
     assert not leader_election.is_leader.is_set()
     await pool.close()
+
+
+@pytest.mark.asyncio
+async def test_run_when_leader_starts_and_stops_with_leadership():
+    """run_when_leader runs the wrapped loop only while is_leader is set."""
+    leader_election.is_leader.clear()
+    ticks = []
+
+    async def dummy_loop(se):
+        while not se.is_set():
+            ticks.append(1)
+            try:
+                await asyncio.wait_for(se.wait(), timeout=0.02)
+            except asyncio.TimeoutError:
+                pass
+
+    shutdown = asyncio.Event()
+    wrapper = asyncio.create_task(
+        leader_election.run_when_leader(dummy_loop, shutdown, poll_seconds=0.02)
+    )
+    try:
+        await asyncio.sleep(0.15)
+        assert ticks == [], "loop ran while not leader"
+        leader_election.is_leader.set()
+        await asyncio.sleep(0.2)
+        assert len(ticks) > 0, "loop did not run after acquiring leadership"
+        leader_election.is_leader.clear()
+        await asyncio.sleep(0.2)
+        stopped_at = len(ticks)
+        await asyncio.sleep(0.2)
+        assert len(ticks) == stopped_at, "loop kept running after losing leadership"
+    finally:
+        shutdown.set()
+        await asyncio.wait_for(wrapper, timeout=5)
+        leader_election.is_leader.clear()
