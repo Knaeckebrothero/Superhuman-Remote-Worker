@@ -135,6 +135,91 @@ class TestInjectThreadCredentials:
         assert restored["llm"]["api_key"] == API_KEY
 
 
+CODEX_ENDPOINT_ID = "44444444-4444-4444-4444-444444444444"
+CODEX_BASE_URL = "http://srw-codex-proxy:8317/v1"
+CODEX_API_KEY = "sk-codex-endpoint-test"
+GATEWAY_BASE_URL = "http://srw-litellm:4000/v1"
+
+
+@pytest.fixture
+def patched_main_codex_gateway(monkeypatch):
+    """A codex model (`gpt-5.5`) on the codex-proxy endpoint, with the LiteLLM
+    gateway ENABLED — the session a1153f56 environment. project_id is omitted in
+    the test so the scoped-key path (which would touch the gateway) is skipped
+    and routing falls back to ``_gateway_routing_target`` (no network)."""
+
+    async def fake_resolve(model_id, user_id=None, capability="chat"):
+        if model_id == "gpt-5.5":
+            return ModelMeta(
+                model_id="gpt-5.5",
+                provider="codex",
+                family="gpt-5",
+                display_name="GPT-5.5",
+                origin="catalog",
+                endpoint_id=CODEX_ENDPOINT_ID,
+            )
+        return None
+
+    async def fake_get_endpoint(endpoint_id):
+        if endpoint_id == CODEX_ENDPOINT_ID:
+            return {
+                "id": CODEX_ENDPOINT_ID,
+                "label": "codex-proxy",
+                "base_url": CODEX_BASE_URL,
+                "api_key": CODEX_API_KEY,
+            }
+        return None
+
+    monkeypatch.setattr(
+        main, "_resolve_model", AsyncMock(side_effect=fake_resolve), raising=True
+    )
+    monkeypatch.setattr(
+        main.postgres_db,
+        "get_user_llm_endpoint",
+        AsyncMock(side_effect=fake_get_endpoint),
+    )
+    monkeypatch.setattr(
+        main.postgres_db, "resolve_api_keys_for_job", AsyncMock(return_value={})
+    )
+    monkeypatch.setattr(
+        main.postgres_db,
+        "resolve_default_for_capability",
+        AsyncMock(return_value=None),
+    )
+    # Gateway enabled (chart sets these when litellm.enabled).
+    monkeypatch.setenv("LITELLM_BASE_URL", "http://srw-litellm:4000")
+    monkeypatch.setenv("LITELLM_MASTER_KEY", "sk-master-test")
+
+
+class TestCodexSessionGatewayBaseUrl:
+    """Regression for docs/issues/codex_session_gateway_baseurl_401.md."""
+
+    @pytest.mark.asyncio
+    async def test_stale_gateway_base_url_replaced_with_codex_endpoint(
+        self, patched_main_codex_gateway
+    ):
+        """The session a1153f56 bug: a stored llm override pins a codex model
+        with a STALE LiteLLM-gateway base_url (+ provider) carried over from a
+        previously gateway-routed model. Re-injection on resume must route to
+        the codex proxy with its own key — not ship the codex key to the gateway
+        (which 401s "LiteLLM Virtual Key expected. Received=…, expected sk-")."""
+        stored = {
+            "llm": {
+                "model": "gpt-5.5",
+                "base_url": GATEWAY_BASE_URL,  # stale — the bug
+                "provider": "openai",  # stale factory
+            }
+        }
+        out = await main._inject_thread_dispatch_credentials(
+            stored, user_id="u"  # no project_id → fleet/master fallback, no network
+        )
+        assert out["llm"]["base_url"] == CODEX_BASE_URL
+        assert out["llm"]["api_key"] == CODEX_API_KEY
+        assert out["llm"]["provider"] == "codex"
+        # Belt and suspenders: the codex key must NOT be paired with the gateway.
+        assert out["llm"]["base_url"] != GATEWAY_BASE_URL
+
+
 class _FakeAcquire:
     def __init__(self, conn):
         self._conn = conn
