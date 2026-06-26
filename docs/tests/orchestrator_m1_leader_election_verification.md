@@ -3,7 +3,7 @@
 **Feature:** `docs/features/orchestrator_ha_scaling.md` — Milestone M1 / Phase 1 (Track 2 Layer 1).
 **Spec / plan:** `docs/superpowers/plans/2026-06-25-orchestrator-m1-leader-election.md` (research base: `docs/researches/orchestrator_leader_election.md`).
 
-**Status (2026-06-26): Code complete; unit-verified, two-replica-verified on local k3d, AND live-verified on the dev cluster (`main`) under real traffic. `replicas: 2` is correctness-safe and now fails over gracefully. The live run caught + fixed two bugs k3d structurally couldn't (uvicorn graceful-shutdown hang; IMAP log-spam — see "Verified on the live dev cluster" below). Dev is left at `replicas: 2` to soak; the chart default stays `replicas: 1` until the soak completes (Phase 5 / M4).**
+**Status (2026-06-26): Code complete; unit-verified, two-replica-verified on local k3d, AND live-verified on the dev cluster (`main`) under real traffic. `replicas: 2` is correctness-safe and now fails over gracefully. The live run caught + fixed two bugs k3d structurally couldn't (uvicorn graceful-shutdown hang; IMAP log-spam — see "Verified on the live dev cluster" below). Dev is left at `replicas: 2` to soak; the chart default was flipped to `replicas: 2` + `pdb.minAvailable: 1` on 2026-06-26 (M4/Phase-5 declare-done — M1 complete).**
 
 > **The k3d run earned its keep:** it caught a real, deploy-blocking bug the unit tests structurally could not — the lifespan leader-election imports used the package-prefixed form (`from orchestrator.services.leader_election …`), which resolves at the repo root (so all 16 unit tests passed) but **not** in the deployed flattened `/app` image, crashing the orchestrator at startup with `ModuleNotFoundError: No module named 'orchestrator'`. Fixed by the `fix(orchestrator): use flattened-image import paths for leader-election wiring (M1)` commit — plain top-level imports matching house convention. This is exactly the runtime-wiring class of bug a two-replica deploy exists to find.
 
@@ -87,4 +87,4 @@ The graceful kill first measured **~66 s** (not k3d's ~20 s) and the dying leade
 
 ## Scope guard
 
-M1 makes `replicas: 2` **correctness-safe**; it does **not** flip the default. The chart stays `replicas: 1` until the two-replica runs above pass and the count is bumped deliberately (Phase 5 / M4). `FOR UPDATE SKIP LOCKED` on the dispatch candidate scan is a throughput optimization deferred to M2 — the per-job CAS is the safety guard and it landed in M1.
+M1 makes `replicas: 2` **correctness-safe**. The two-replica runs above passed (k3d + live dev), so the chart default was bumped deliberately to `replicas: 2` + `pdb.minAvailable: 1` on 2026-06-26 (Phase 5 / M4 declare-done — M1 complete). `FOR UPDATE SKIP LOCKED` on the dispatch candidate scan is a throughput optimization deferred to M2 — the per-job CAS is the safety guard and it landed in M1.
