@@ -92,6 +92,36 @@ _ROLE_BLOCK_DEFAULT = (
     "did and what the next agent should do."
 )
 
+# Concise verb phrases for the job *description* (the UI title + task_brief
+# "## Description"). The full protocol lives in the kickoff message; this is just
+# the scannable one-liner so a glance at the jobs list shows role + iteration +
+# goal instead of the identical multi-paragraph preamble.
+_ROLE_TASKS: dict[str, str] = {
+    "scholar": "research the domain & propose distinct improvements",
+    "critic": "select & prioritise the next improvement",
+    "developer": "implement the chosen action",
+}
+_ROLE_TASK_DEFAULT = "advance the goal"
+
+
+def _goal_snippet(goal: str, limit: int = 80) -> str:
+    """First line of the goal, collapsed + truncated for a title."""
+    snippet = " ".join(goal.split())  # collapse newlines/runs of whitespace
+    return snippet if len(snippet) <= limit else snippet[: limit - 1].rstrip() + "…"
+
+
+def build_loop_description(loop: dict[str, Any], *, role: str, iteration: int) -> str:
+    """Concise job title/task — what the agent accomplishes THIS iteration.
+
+    This becomes ``jobs.description`` (the cockpit row title and the task_brief
+    "## Description"). The full loop protocol is delivered separately as the
+    kickoff message (``build_loop_kickoff``), so the title stays legible.
+    """
+    task = _ROLE_TASKS.get(role) or _ROLE_TASK_DEFAULT.format(role=role)
+    goal = (loop.get("goal") or "").strip()
+    base = f"Loop iter {iteration} · {role.upper()}: {task}"
+    return f"{base} — toward: {_goal_snippet(goal)}" if goal else base
+
 
 def _format_budget(remaining: int | None, run_until: Any) -> str:
     """One-line budget summary for the kickoff (termination awareness)."""
@@ -107,7 +137,12 @@ def _format_budget(remaining: int | None, run_until: Any) -> str:
 
 
 def build_loop_kickoff(loop: dict[str, Any], *, role: str, iteration: int) -> str:
-    """Assemble the loop-aware kickoff prompt for one job.
+    """Assemble the loop-aware kickoff *message* for one job.
+
+    Delivered via ``context["kickoff_message"]`` (the "Opening Message" channel),
+    NOT as the job description — so the full protocol reaches the agent's
+    task_brief "## Kickoff Message" while the cockpit row title stays the concise
+    ``build_loop_description`` line.
 
     Part system-preamble, part project goal + Definition of Done, part
     role-specific task, part optional user steering. Research-tuned: anchors
@@ -198,15 +233,22 @@ async def create_loop_job(
     if model:
         config_override["llm"] = {"model": model}
 
+    # Split the synthesized prompt the way the manual create-job form does:
+    # a concise `description` (the cockpit row title + task_brief "## Description")
+    # and the full loop protocol as the kickoff message, carried through the
+    # "Opening Message" channel (context["kickoff_message"]). Both land together
+    # in the agent's task_brief.md; only the description shows as the job title.
+    description = build_loop_description(loop, role=role, iteration=iteration)
     kickoff = build_loop_kickoff(loop, role=role, iteration=iteration)
     context = {
         "loop_id": loop_id,
         "loop_role": role,
         "loop_iteration": iteration,
+        "kickoff_message": kickoff,
     }
 
     job = await db.create_job(
-        description=kickoff,
+        description=description,
         config_name=role,
         config_override=config_override,
         context=context,
