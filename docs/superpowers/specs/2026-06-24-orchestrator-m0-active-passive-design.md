@@ -1,6 +1,6 @@
 # Orchestrator M0 — Active-Passive Failover Hardening — Design Spec
 
-**Status:** Implemented & locally verified on k3d (2026-06-24). All chart/doc changes committed on `develop` (unpushed). Live multi-node + real-traffic chaos test deferred — see `docs/tests/orchestrator_m0_failover_verification.md`.
+**Status:** Implemented & locally verified on k3d (2026-06-24); pushed to `origin/develop` (2026-06-26). Live multi-node + real-traffic chaos test deferred — see `docs/tests/orchestrator_m0_failover_verification.md`.
 **Parent:** `docs/features/orchestrator_ha_scaling.md` — Milestone **M0** / **Phase 0** (Track 1). This spec is the implementation-of-record for that milestone.
 **Goal:** Make a single orchestrator pod's death (eviction, OOM, node drain, image roll) a fast, bounded, predictable failover instead of today's multi-minute, connection-severing blackout — **without** making the orchestrator multi-replica. Stays `replicas: 1`.
 **Scope:** Config-only. Helm chart changes plus an operations runbook. **No application code.**
