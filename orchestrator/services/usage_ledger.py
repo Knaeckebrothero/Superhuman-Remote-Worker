@@ -131,6 +131,10 @@ class UsageRates:
         return None
 
 
+# Dimension → the usage_events column it groups on. The allow-list is also the
+# validation guard: an unknown group_by raises rather than interpolating SQL.
+_GROUP_COLS = {"user": "user_id", "model": "resource", "project": "project_id"}
+
 # Parallel-unnest bulk insert. details rides as text[] and casts to jsonb in SQL
 # (codec-independent — no dependency on the pool having a jsonb codec). ON CONFLICT
 # on the dedupe index makes a re-polled spend log / re-emitted close a no-op.
@@ -301,6 +305,62 @@ class UsageLedger:
         ]
         total = sum(item["cost_usd"] for item in by_category)
         return {"by_category": by_category, "total_cost_usd": total}
+
+    async def query_grouped(
+        self,
+        *,
+        from_ts: datetime,
+        to_ts: datetime,
+        group_by: str,
+        owner_user_id: Optional[str] = None,
+        visible_project_ids: Optional[Sequence[str]] = None,
+        scope_project_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Aggregate quantity/cost/events grouped by (dimension, unit).
+
+        ``group_by`` ∈ {'user','model','project'} → user_id / resource / project_id.
+        Rows with a NULL group key (unattributed fleet-key LLM traffic) are excluded
+        so they don't collapse into one bogus bucket. Visibility differs from
+        ``query_usage`` on purpose: a **non-admin** (``owner_user_id`` set) is scoped
+        strictly to their OWN rows — a breakdown must not disclose other users who
+        merely share a visible project. Admins pass no owner (full fleet) or a
+        ``scope_project_id``.
+        """
+        if group_by not in _GROUP_COLS:
+            raise ValueError(f"unsupported group_by: {group_by!r}")
+        col = _GROUP_COLS[group_by]
+        if self._pool is None:
+            return []
+        clauses = ["ts >= $1", "ts < $2", f"{col} IS NOT NULL"]
+        params: List[Any] = [from_ts, to_ts]
+        if owner_user_id is not None:
+            params.append(_uuid(owner_user_id))
+            clauses.append(f"user_id = ${len(params)}")  # strict self-scope
+        elif scope_project_id is not None:
+            params.append(_uuid(scope_project_id))
+            clauses.append(f"project_id = ${len(params)}")
+        sql = (
+            f"SELECT {col} AS key, unit, SUM(quantity) AS quantity, "
+            "COALESCE(SUM(cost_usd), 0) AS cost_usd, COUNT(*) AS events "
+            f"FROM usage_events WHERE {' AND '.join(clauses)} "
+            f"GROUP BY {col}, unit ORDER BY {col}"
+        )
+        try:
+            async with self._pool.acquire() as conn:
+                rows = await conn.fetch(sql, *params)
+        except Exception:
+            logger.warning("usage grouped query failed (non-fatal)", exc_info=True)
+            return []
+        return [
+            {
+                "key": str(r["key"]),
+                "unit": r["unit"],
+                "quantity": float(r["quantity"]) if r["quantity"] is not None else 0.0,
+                "cost_usd": float(r["cost_usd"]),
+                "events": r["events"],
+            }
+            for r in rows
+        ]
 
 
 __all__ = ["UsageEvent", "UsageRates", "UsageLedger"]
