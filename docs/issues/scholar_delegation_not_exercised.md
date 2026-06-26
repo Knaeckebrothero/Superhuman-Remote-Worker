@@ -5,6 +5,27 @@
 **Component:** `config/experts/scholar/` prompts (`strategic.txt`, `todo_guide.md`, `strategic_todos_initial.yaml`). Plumbing (`delegate_work` tool, `resume_delegation_child`, orchestrator graft path) is intact and out of scope.
 **Affected model:** `gpt-5.5` (observed). Not yet checked on other families.
 
+**Update 2026-06-26:** Re-surfaced by the user, who confirms the behavior
+**predates the capability-grants system** → not grant-related (consistent with
+the toolset being granted, below). Two mechanisms discovered *after* this doc was
+written were checked and **ruled out** as causes:
+
+- **Family-variant prompt shadowing** (the Part-1 bug,
+  `docs/issues/expert_prompts_shadowed_by_family_variants.md`, fixed 2026-06-25):
+  does **not** affect scholar. Its `model_config_matrix.yaml` `default:` block
+  (present since 2026-05-01, `6f99f0d2`) pins `strategic→strategic.txt`, which
+  resolves at `MatrixResolver` Level 2 (expert default) — above the base `gemma`
+  variant at Level 3 — so scholar's own delegation-bearing `strategic.txt` wins
+  on gemma too. Verified by rendering `strategic.txt`: the delegation block's
+  presence is gated **only** by `has_tool("delegate_work")`, never by family
+  resolution (with the tool bound it renders; stripped, it vanishes).
+- **Capability grants** (migration `0030`): the affected runs predate grants;
+  the tool was bound and the guidance rendered.
+
+So the 2026-06-03 root cause stands: **behavioral — permissive ("when/consider")
+delegation wording + the project-wide direct-execution default bias.** The fix is
+in the prompts (see Options below), not the plumbing/resolution.
+
 ## Summary
 
 The scholar expert is configured to spawn subagents for parallel research via

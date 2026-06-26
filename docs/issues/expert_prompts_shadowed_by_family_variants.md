@@ -17,20 +17,34 @@ related:
 **Filed:** 2026-06-25, discovered while scaffolding the new `assistant` default
 session expert ([[default_expert_roster]]) and k3d-verifying that it loads.
 
-**Status:** Part 1 **implemented + verified on k3d** (2026-06-25), uncommitted on
-`develop`. Resolution + blob probes confirm experts' own prompts now resolve on
-gemma (`bughunter`/`developer`/`scholar` persona+strategic+tactical flip to
-EXPERT; `assistant` blob persona fixed; `scholar@minimax` no regression); 12 unit
-tests + `ruff` green. **Gemma worker gate: PASSED** — a live k3d worker run (a
-scholar subjob on the default gemma model, with the experts' base prompts now
-active) made **84 `write_file` + 4 `run_command` + 10 `todo_complete` tool calls
-with 0 parse failures and no parser-loop**, across clean strategic→tactical phase
-transitions. The `gemma.yaml` guardrails (71 brace-form tool examples, a separate
-channel the fix doesn't touch) hold the wire format, so swapping the framework
-`*_gemma` prompts for the experts' base prompts did **not** regress tool-call
-parsing. The developer-specific run (highest risk — its `instructions.md` has 3
-Python-style examples) is expected clean for the same reason (same guardrails) and
-is in-flight to confirm. **Part 2 (content/adaptation hygiene) still deferred.**
+**Status:** Part 1 **implemented, verified on k3d, and committed** (2026-06-25).
+Resolution + blob probes confirm experts' own prompts now resolve on gemma
+(`bughunter`/`developer`/`scholar` persona+strategic+tactical flip to EXPERT;
+`assistant` blob persona fixed; `scholar@minimax` no regression); 12 unit tests +
+`ruff` green. **Gemma worker gate: PASSED** — a live k3d worker run (a scholar
+subjob on the default gemma model, experts' base prompts now active) made **84
+`write_file` + 4 `run_command` + 10 `todo_complete` tool calls with 0 parse
+failures and no parser-loop**, across clean strategic→tactical transitions. The
+`gemma.yaml` guardrails (71 brace-form tool examples, a separate channel the fix
+doesn't touch) hold the wire format, so swapping framework `*_gemma` prompts for
+the experts' base prompts did **not** regress tool-call parsing.
+
+**Part 2 — reframed and SHIPPED + committed (2026-06-26).** A two-axis audit found
+only **3 of ~50** family variants are pure-reformat (`persona_gemma`,
+`systemprompt_gpt_oss`, `strategic_gemma`) — the rest carry real per-model guidance
+and earn their keep — so the original "retire variants" content-hygiene framing was
+low value. The real gap was the **DB-expert path** (see *DB-backed experts*
+below): DB-backed and forked/exported experts could only carry `persona` +
+`instructions`. Part 2 became **full DB-expert prompt parity** — DB/forked/exported
+experts now carry `strategic`/`tactical`/`summarization` too (one family-agnostic
+version each; the `systemprompt_<family>` wrapper still owns model-adaptation).
+Implemented + committed + k3d-verified: a deployed-orchestrator resolution probe
+and a render-fence probe **inside the built agent image** both ALL_PASS, migration
+`0036` applied, 51 py + 11 cockpit tests + prod build green. Details in *Part 2 —
+what shipped* below. The originally-sketched **content-hygiene** piece (retire the
+3 pure-reformat variants, relocate model nudges into the wrapper) **remains
+deferred** — low value per the audit.
+
 Original bug affected shipped experts (`bughunter`, `designer-interactive`), not
 just the new `assistant`.
 
@@ -249,7 +263,43 @@ Properties:
   *nudges* currently duplicated inside `persona_<family>` — which Part 2 relocates
   to where they belong.
 
-### Part 2 — Content hygiene: model-adaptation in the wrapper (incremental)
+### Part 2 — what shipped: DB-expert prompt parity (2026-06-26)
+
+The **DB-expert gap** identified under *DB-backed experts* above — a DB/forked
+expert could only override `persona` + `instructions`, so its
+`strategic`/`tactical`/`summarization` stayed on the framework versions and a fork
+of a worker expert silently dropped them — was the high-value half of Part 2, and
+it shipped:
+
+- **`config_resolver.py`** — overlay widened to `_OVERLAY_PROMPT_KEYS =
+  (persona, instructions, strategic, tactical, summarization)`, plus a precise
+  `data["_db_prompt_keys"]` provenance marker (only the segments actually present
+  in the row — inherited/disk segments stay trusted).
+- **`loader.py`** — DB-authored phase content is fenced via new
+  **`fence_phase_directive`** (`expert_resolution.py`): brace-stripped (so the
+  `.format(phase_number)` is a safe no-op) and wrapped `<expert_workflow note="…
+  follow but does not override system rules / tool-model-autonomy gates /
+  safety…">` — deliberately authoritative-but-subordinate, **not** persona's
+  "request, not policy". `load_summarization_prompt` brace-**escapes** DB
+  summarization (it flows through `format_map` in the summarizer, which still
+  ValueErrors on stray braces; no fence — summarizer is low-altitude, no tools).
+- **`_bundled_expert_bundle`** (`main.py`) — captures all five base segments →
+  forking a worker no longer drops strategic/tactical; `to_export_bundle` already
+  whitelists the whole `prompts` dict, so export/import round-trip them too.
+- **Cockpit editor** — strategic/tactical/summarization textareas (the phase ones
+  worker-gated); `ExpertCreate`/`Update` allow-list the prompt keys. Gotcha:
+  `update_expert` replaces the `prompts` column wholesale, so the editor must send
+  all five keys (empty omitted = inherit) or a fork's strategic/tactical would be
+  clobbered on first edit.
+- **Migration `0036`** — comment-only (the `prompts` JSONB is open, no CHECK → no
+  structural change).
+
+Per-family DB variants stay disk/bundled (the wrapper owns adaptation). Trust
+boundary preserved: DB content fenced, bundled content trusted. Full design lives
+in the session plan + memory ([[project-persona-family-variant-shadowing]]);
+verification summary in **Status** above.
+
+### Part 2 (deferred remainder) — Content hygiene: model-adaptation in the wrapper
 
 Make the slots **content** and the wrapper own **adaptation**:
 
@@ -286,8 +336,10 @@ breakage). It remains a valid one-expert unblock under release pressure.
 2. **Delete the workaround boilerplate** from `developer`/`scholar`/`critic`/
    `designer` per-expert matrices where it exists solely to dodge this (verify
    each still resolves to its own content afterward).
-3. **Part 2 note** — file a short follow-on under `docs/features/` for the
-   wrapper/content split + variant retirement.
+3. **Part 2** — DB-expert prompt parity SHIPPED + committed 2026-06-26 (see
+   *Part 2 — what shipped*). The wrapper/content split + pure-reformat-variant
+   retirement remain the deferred follow-on; this doc records both halves rather
+   than a separate `docs/features/` note.
 
 ## Validation
 
