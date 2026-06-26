@@ -46,6 +46,28 @@ from typing import Any, Dict, List, Optional, Union
 logger = logging.getLogger(__name__)
 
 
+# TTL (in loop cycles) by note_type for KB convergence — see
+# docs/features/kb_convergence_ttl_reverification.md. ``None`` = no TTL (durable
+# facts never expire on a clock; they're only retired by an explicit newer note).
+# Moving-target governance notes get a short TTL and are re-verified by the
+# knowledge-assembler aux pass when the counter runs out. Unknown types default to
+# ``None`` (conservative: never auto-expire something we don't recognise).
+KB_TTL_BY_NOTE_TYPE: Dict[str, Optional[int]] = {
+    # moving-target — expire + re-verify
+    "state": 2,
+    "goal": 3,
+    "plan": 3,
+    "question": 3,
+    # durable — no TTL
+    "decision": None,
+    "learning": None,
+    "code": None,
+    "retrospective": None,
+    "source": None,
+}
+KB_TTL_DEFAULT: Optional[int] = None
+
+
 @dataclass
 class KnowledgeRecord:
     """A single knowledge note from the search index."""
@@ -108,6 +130,16 @@ class KnowledgeStore:
         """
         self.db = db
         self.embedding_service = embedding_service
+
+    @staticmethod
+    def _ttl_for_note_type(note_type: str) -> Optional[int]:
+        """Initial TTL (loop cycles) for a new note of this type.
+
+        ``None`` = durable (no countdown). See KB_TTL_BY_NOTE_TYPE.
+        """
+        return KB_TTL_BY_NOTE_TYPE.get(
+            (note_type or "").strip().lower(), KB_TTL_DEFAULT
+        )
 
     @staticmethod
     def _content_hash(content: str) -> str:
@@ -233,18 +265,25 @@ class KnowledgeStore:
             ]
         )
 
+        # Initial TTL (loop cycles) by note_type — set only on INSERT. The
+        # ON CONFLICT branch below deliberately omits remaining_cycles so an
+        # existing note's countdown is preserved across content edits, and a
+        # status-only change (kb_update → superseded) takes the metadata-only
+        # path above which never touches it. See kb_convergence design doc.
+        ttl_value = self._ttl_for_note_type(note_type)
+
         row_id = await self.db.fetchval(
             """
             INSERT INTO knowledge_index (
                 note_id, project_id, title, note_type, status, confidence,
                 tags, keywords, job_id, phase, content, retrieval_messages,
                 embedding, search_doc, created_at, modified_at, indexed_at,
-                content_hash
+                content_hash, remaining_cycles
             ) VALUES (
                 $1, $2, $3, $4, $5, $6,
                 $7, $8, $9, $10, $11, $12,
                 $13, to_tsvector('english', $14), $15, $16, NOW(),
-                $17
+                $17, $18
             )
             ON CONFLICT (project_id, note_id) DO UPDATE SET
                 title = EXCLUDED.title,
@@ -281,6 +320,7 @@ class KnowledgeStore:
             created_at,
             modified_at,
             new_hash,
+            ttl_value,
         )
 
         logger.debug(f"Upserted knowledge index: {note_id} (content changed)")
@@ -306,6 +346,92 @@ class KnowledgeStore:
             note_id,
         )
         return result is not None
+
+    # =========================================================================
+    # TTL lifecycle — KB convergence
+    # (docs/features/kb_convergence_ttl_reverification.md)
+    # =========================================================================
+
+    async def decrement_ttl(self, project_id: uuid.UUID) -> int:
+        """Decrement the cycle TTL of every active, TTL-bearing note in a project.
+
+        Called once per loop cycle (at the developer→scholar wrap). Durable notes
+        (``remaining_cycles IS NULL``) are untouched; only moving-target notes
+        count down. A note reaching ``<= 0`` enters the stale queue
+        (:meth:`get_stale_notes`) for re-verification. Returns rows decremented.
+
+        NOTE: the orchestrator runs the equivalent UPDATE inline against the
+        vector DB at the cycle boundary (it can't safely import this module). This
+        method is the canonical agent-side / test form — keep the two in sync.
+        """
+        rows = await self.db.fetch(
+            """
+            UPDATE knowledge_index
+            SET remaining_cycles = remaining_cycles - 1
+            WHERE project_id = $1
+              AND remaining_cycles IS NOT NULL
+              AND status = 'active'
+            RETURNING id
+            """,
+            project_id,
+        )
+        return len(rows)
+
+    async def get_stale_notes(
+        self, project_id: uuid.UUID, limit: int = 50
+    ) -> List[KnowledgeRecord]:
+        """Active notes whose TTL has run out (``remaining_cycles <= 0``).
+
+        The stale queue the knowledge-assembler re-verifies. Oldest-modified
+        first, so the most-likely-stale are handled first under a limit.
+        """
+        rows = await self.db.fetch(
+            """
+            SELECT * FROM knowledge_index
+            WHERE project_id = $1
+              AND remaining_cycles <= 0
+              AND status = 'active'
+            ORDER BY modified_at ASC NULLS FIRST
+            LIMIT $2
+            """,
+            project_id,
+            limit,
+        )
+        return [KnowledgeRecord.from_row(dict(r)) for r in rows]
+
+    async def refresh_ttl(
+        self,
+        project_id: uuid.UUID,
+        notes: List[KnowledgeRecord],
+        current_cycle: Optional[int] = None,
+    ) -> int:
+        """Reset the TTL of notes that survived re-verification.
+
+        Called by the assembler runner AFTER the agent pass. Only notes still
+        ``active`` are refreshed (the WHERE clause skips any the agent superseded
+        or archived), each back to its note_type's initial TTL. Durable notes are
+        ignored. Returns the number of notes refreshed.
+        """
+        refreshed = 0
+        for note in notes:
+            ttl = self._ttl_for_note_type(note.note_type)
+            if ttl is None:
+                continue
+            rows = await self.db.fetch(
+                """
+                UPDATE knowledge_index
+                SET remaining_cycles = $1,
+                    last_verified_cycle = $2
+                WHERE project_id = $3 AND note_id = $4 AND status = 'active'
+                RETURNING id
+                """,
+                ttl,
+                current_cycle,
+                project_id,
+                note.note_id,
+            )
+            refreshed += len(rows)
+        return refreshed
 
     # =========================================================================
     # Search

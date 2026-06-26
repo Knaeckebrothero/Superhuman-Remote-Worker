@@ -2326,6 +2326,7 @@ def create_archive_phase_node(
     workspace_manager: Optional[WorkspaceManager] = None,
     memory_extraction_prompt: str = "",
     curation_prompt: str = "",
+    knowledge_assembler_prompt: str = "",
     memory_service: Optional[Any] = None,
 ) -> Callable[[UniversalAgentState], Dict[str, Any]]:
     """Create the archive_phase node.
@@ -2504,6 +2505,34 @@ def create_archive_phase_node(
                 )
             except Exception as e:
                 logger.warning(f"[{job_id}] Inline curation failed (non-fatal): {e}")
+
+        # Inline KB convergence (KB convergence / loop_review F13): re-verify the
+        # stale queue (notes whose cycle TTL ran out) and supersede/merge/archive
+        # the dead ones. Async, non-blocking — and the runner self-gates on a
+        # non-empty stale queue, so this is a cheap no-op (one indexed query) when
+        # nothing has expired (e.g. every non-loop job). Same enablement as the
+        # curation/populate pass above; the two are the KB's extractor/assembler
+        # pair, mirroring memory's ExtractMemoriesTask/AssembleMemoriesTask.
+        if (
+            tool_context
+            and tool_context.has_knowledge()
+            and config.extra.get("curator", {}).get("enabled", False)
+            and config.auxiliary.enabled
+        ):
+            try:
+                from src.services.auxiliary import assemble_and_converge_knowledge
+
+                asyncio.create_task(
+                    assemble_and_converge_knowledge(
+                        auxiliary_llm=auxiliary_llm,
+                        tool_context=tool_context,
+                        knowledge_assembler_prompt=knowledge_assembler_prompt,
+                    )
+                )
+            except Exception as e:
+                logger.warning(
+                    f"[{job_id}] Inline KB convergence failed (non-fatal): {e}"
+                )
 
         message = AIMessage(
             content=f"Phase complete. Archived todos to {archive_path}. Moving to next phase."
@@ -3953,6 +3982,9 @@ def build_phase_alternation_graph(
         config, "memory_assembler", model=aux_model
     )
     curation_prompt = load_auxiliary_prompt(config, "curation", model=aux_model)
+    knowledge_assembler_prompt = load_auxiliary_prompt(
+        config, "knowledge_assembler", model=aux_model
+    )
 
     # workspace_template is no longer used — workspace.md replaced by
     # project knowledge base + memory system. Parameter kept for backward compat.
@@ -4070,6 +4102,7 @@ def build_phase_alternation_graph(
         workspace_manager=workspace,
         memory_extraction_prompt=memory_extraction_prompt,
         curation_prompt=curation_prompt,
+        knowledge_assembler_prompt=knowledge_assembler_prompt,
         memory_service=memory_service,
     )
 
