@@ -53,7 +53,7 @@ Cluster `k3d-srw` (single node), full SRW stack via Tilt. Set `orchestrator.repl
 
 ## Still owed — the live (dev) cluster run
 
-The k3d run proves the wiring on a single node. The live multi-node cluster under real traffic is still owed:
+The k3d run proves the wiring on a single node. The live multi-node cluster under real traffic is still owed. **Procedure / checklist:** `docs/operations/orchestrator_m1_go_live.md` (the live two-replica validation + the `replicas: 2` flip + rollback).
 
 - **Live (dev) two-replica failover** — a mid-dispatch job ends `paused` then re-dispatched exactly once; the survivor's loops take over; no duplicate emails/replies during the dual-leader window; realistic failover numbers.
 - **Hard-kill path** — k3d here exercised graceful delete (clean unlock). A `--grace-period=0` kill leaves the lock held by the dead Postgres session until TCP-keepalive detection (~40 s with the `10/10/3` tuning) — worth confirming on the live cluster.
