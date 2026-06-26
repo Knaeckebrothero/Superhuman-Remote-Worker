@@ -3115,6 +3115,27 @@ async def _enforce_dispatch_grants(
         raise GrantDenied(violations)
 
 
+async def _enforce_session_create_grants(
+    fragment: dict, *, user_id: str | None, project_ids: list[str]
+) -> None:
+    """Create/update-time PEP for sessions (Layer 2): run the SAME PDP as attach
+    (``_enforce_dispatch_grants``) on the requested config and translate a denial
+    into HTTP 422 — so a never-startable config (e.g. a ``permission_mode`` above
+    the owner's ceiling) is rejected synchronously at the API instead of being
+    accepted and then failing later at provisioning with an opaque ready timeout.
+    Admin owner bypasses (inside ``_enforce_dispatch_grants``).
+    See docs/issues/session_permission_mode_grant_denied_ready_timeout.md.
+    """
+    try:
+        await _enforce_dispatch_grants(
+            fragment, runner_user_id=user_id, project_ids=project_ids
+        )
+    except GrantDenied as gd:
+        raise HTTPException(
+            status_code=422, detail=_grant_violations_detail(gd.violations)
+        ) from gd
+
+
 async def _check_vm_permission(
     user: dict | None,
     *,
@@ -14109,14 +14130,33 @@ async def agent_update_thread_config(
     """
     await require_internal(request)
     try:
+        config_override = dict(body.config_override or {})
+        thread_row = await postgres_db.get_thread(thread_id)
+
+        # Layer 2 (fail loud): a runtime config change must also fit the owner's
+        # grants — reject a denied permission_mode/model with 422 instead of
+        # persisting a config the session can't run (an API-direct or stale-UI
+        # escalation past the user's ceiling; the cockpit greys these out
+        # client-side). Ownerless/standalone threads (user_id NULL) aren't
+        # subject to a user's grants — skip. Admin owner bypasses.
+        # docs/issues/session_permission_mode_grant_denied_ready_timeout.md
+        if thread_row and thread_row.get("user_id"):
+            await _enforce_session_create_grants(
+                config_override,
+                user_id=str(thread_row["user_id"]),
+                project_ids=(
+                    [str(thread_row["project_id"])]
+                    if thread_row.get("project_id")
+                    else []
+                ),
+            )
+
         # Enrich endpoint-backed model swaps with base_url + api_key so the
         # persisted override is complete. Without this, a hot-swap to a
         # custom-endpoint model leaves the next session attach pointing at
         # the default OpenAI base.
-        config_override = dict(body.config_override or {})
         llm_section = config_override.get("llm")
         if llm_section and llm_section.get("model"):
-            thread_row = await postgres_db.get_thread(thread_id)
             if thread_row:
                 user_id = (
                     str(thread_row["user_id"]) if thread_row.get("user_id") else None
@@ -14815,6 +14855,19 @@ async def create_thread(
         # Normalize project_ids (backward compat: project_id → [project_id])
         effective_project_ids = request_body.project_ids or (
             [request_body.project_id] if request_body.project_id else []
+        )
+
+        # Layer 2 (fail loud at create): the requested config must fit the
+        # owner's capability grants. Reject a never-startable session with 422
+        # NOW — before persisting/provisioning — instead of accepting it and
+        # letting the attach pre-flight fail it later (Phase 1). Validates the
+        # user-chosen overrides (permission_mode, model, workspace.backend,
+        # tools) against the owner's grants + the session's project scope; admins
+        # bypass. docs/issues/session_permission_mode_grant_denied_ready_timeout.md
+        await _enforce_session_create_grants(
+            config_override,
+            user_id=str(user["id"]),
+            project_ids=effective_project_ids,
         )
 
         # Resolve + inject LLM / auxiliary / embedding credentials so the agent

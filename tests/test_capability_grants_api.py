@@ -92,6 +92,58 @@ async def test_enforce_dispatch_grants_allows_when_granted(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_enforce_session_create_grants_raises_422_for_denied_mode(monkeypatch):
+    # Session create/update PEP (Layer 2): a permission_mode above the owner's
+    # ceiling (default 'supervised', no grant) → 422 with the violation, so a
+    # never-startable session is rejected at the API instead of timing out at
+    # provisioning. docs/issues/session_permission_mode_grant_denied_ready_timeout.md
+    fake = AsyncMock()
+    fake.get_user = AsyncMock(return_value={"id": _UID, "is_admin": False})
+    fake.list_grants_for_scopes = AsyncMock(
+        return_value={"user": [], "project": [], "global": []}
+    )
+    monkeypatch.setattr(m, "postgres_db", fake)
+    with pytest.raises(HTTPException) as ei:
+        await m._enforce_session_create_grants(
+            {"interactive": {"permission_mode": "autonomous"}},
+            user_id=_UID,
+            project_ids=[],
+        )
+    assert ei.value.status_code == 422
+    assert "permission_mode" in str(ei.value.detail)
+    assert "autonomous" in str(ei.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_enforce_session_create_grants_admin_bypass(monkeypatch):
+    fake = AsyncMock()
+    fake.get_user = AsyncMock(return_value={"id": _UID, "is_admin": True})
+    monkeypatch.setattr(m, "postgres_db", fake)
+    # Admin owner bypasses — autonomous is fine.
+    await m._enforce_session_create_grants(
+        {"interactive": {"permission_mode": "autonomous"}},
+        user_id=_UID,
+        project_ids=[],
+    )
+
+
+@pytest.mark.asyncio
+async def test_enforce_session_create_grants_allows_within_ceiling(monkeypatch):
+    fake = AsyncMock()
+    fake.get_user = AsyncMock(return_value={"id": _UID, "is_admin": False})
+    fake.list_grants_for_scopes = AsyncMock(
+        return_value={"user": [], "project": [], "global": []}
+    )
+    monkeypatch.setattr(m, "postgres_db", fake)
+    # 'supervised' is the default ceiling → within grants → no raise.
+    await m._enforce_session_create_grants(
+        {"interactive": {"permission_mode": "supervised"}},
+        user_id=_UID,
+        project_ids=[],
+    )
+
+
+@pytest.mark.asyncio
 async def test_user_experts_kill_switch_default_enabled(monkeypatch):
     fake = AsyncMock()
     fake.get_system_setting = AsyncMock(return_value=None)  # absent row
