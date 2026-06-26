@@ -87,26 +87,60 @@ Severity: **P1** = cost/correctness-impacting · **P2** = output quality ·
   `write_file` + `git_diff`/`git_status` — the developer's job. **Fix:** scope it
   in the kickoff ("As Critic, do not modify the repo; only read, evaluate, and
   write a verdict").
-- [ ] **F5 (P2) — Definition of Done is re-invented every iteration.** Because
-  `acceptance_criteria` is empty, each job re-infers the DoD ("Definition of Done…"
-  by the scholar, "Acceptance criteria for Critic iteration 2" by the critic) — a
-  drift risk the research flagged (anchor "done" to *stable external* criteria).
-  **Fix:** have the first job establish the DoD as one pinned note that later jobs
-  must reuse, not re-create; or require acceptance criteria at loop start (see F7).
-- [ ] **F6 (P3) — `proposal` note type doesn't exist.** The scholar role says
-  "write each candidate as a `proposal` note," but the KB enum has no such type →
-  the scholar logged a "Blocker," did a fallback search, wasted a couple of calls,
-  and used `plan` instead. **Fix:** point the role text at a real type + a
-  `proposal` tag, or add `proposal` to the KB note-type enum.
+- [-] **F5 (P2 — ✂️ DESCOPED by design 2026-06-26) — Definition of Done is re-invented every
+  iteration.** Because `acceptance_criteria` is empty, each job re-infers the DoD
+  ("Definition of Done…" by the scholar, "Acceptance criteria for Critic iteration 2" by the
+  critic) — a drift risk the research flagged (anchor "done" to *stable external* criteria).
+  **Fix:** have the first job establish the DoD as one pinned note that later jobs must reuse,
+  not re-create; or require acceptance criteria at loop start (see F7).
+  **→ ✂️ DESCOPED as a *measurement* concern (2026-06-26).** A per-job re-invented DoD only
+  mattered when aggregating local DoDs into a project convergence % (F24, descoped). Without
+  that, each job's own DoD is fine. The *coordination* half — pin a stable goal so the loop
+  doesn't drift — survives but lives in **F7** (ground the loop) and **F23** (pin the decision
+  for the next agent), not as a standalone finding.
+- [x] **F6 (P3 — ✅ FIXED 2026-06-26, ×3) — invalid KB note types in the loop prompts.** The
+  scholar role says "write each candidate as a `proposal` note," but the KB enum (`NOTE_TYPES`,
+  `knowledge_graph.py:46`) has no such type → the scholar logged a "Blocker," did a fallback
+  search, wasted a couple of calls, and used `plan` instead. **Bigger than filed:** the same
+  bug hit **three** names — `proposal` (scholar), `verdict` (critic), and `definition_of_done`
+  (kickoff fallback) — none valid.
+  **→ ✅ FIXED 2026-06-26 (`project_loops.py`):** mapped each to a valid type + tag —
+  `proposal`→`plan` tagged `proposal`, `verdict`→`decision` tagged `verdict`,
+  `definition_of_done`→`goal` tagged `definition_of_done`. Bonus: aligns with the F13
+  convergence TTLs — proposals (`plan`) age out (helps F22), the verdict (`decision`) is
+  durable (helps F23). Alternative considered + deferred: first-class `proposal`/`verdict`
+  enum types (needs a migration).
 
 ### Grounding / setup
 
-- [ ] **F7 (P1) — No grounding.** The project had **0 datasources** and empty
+- [ ] **F7 (P1 → P2, ♻️ RECAST 2026-06-26) — Loop self-grounds via research; don't gate on
+  human grounding (was: "No grounding").** The project had **0 datasources** and empty
   acceptance criteria/steering — it is designing an ERP "better than Resavio" with
   no Resavio data, no hotel requirements, and no code; the agents invent
   requirements from web research. Generic output at high token cost. **Fix:** warn
   (or block) on loop start when a project has no datasources **and** no acceptance
   criteria; nudge the user to attach source material + define the DoD first.
+  **→ ♻️ RECAST (2026-06-26) — the "require grounding" fix is the anti-pattern.** The loop's
+  *purpose* is to self-ground: the scholar researches the target system (Resavio/Salesforce
+  is public — features, docs, pricing are all on the web) **and** the domain ("what a good
+  ERP needs"), the critic picks the best next action, the developer builds it, repeat —
+  improving a poor first system until it's good. If the user had to supply datasources +
+  acceptance criteria up front, they wouldn't need a loop; they'd dispatch one-shot jobs. So
+  **do not gate the loop on human grounding.** Reclassification: the ~60-LOC toy was a
+  **plumbing symptom**, not a grounding symptom — a non-compounding (F11), non-coordinating
+  (F22/F23) loop *cannot* get past iteration-1's worth of work, so it necessarily looks like
+  a toy. With F11 ✅ done and F22/F23/F13 landing, the research compounds and the system
+  improves across cycles — the loop working as designed. **Residual (downgraded to P2):**
+  ensure the *scholar role actually performs* the competitor + domain research as its first
+  move **and writes it as durable grounding notes** (so it compounds, not re-researched each
+  cycle) — a scholar-prompt + F22/F23/F13 concern, not a gate. Human-attached datasources
+  become **optional enrichment** for *private/internal* context the web can't supply (e.g.
+  "match our existing workflow"), never a precondition; a soft FYI at most, never a block.
+  **→ ✅ residual addressed in prompt 2026-06-26 (pending next-run verification):** the scholar
+  role block (`project_loops.py`) now opens with a hard "you MUST research the target/competitor
+  system + domain… record concrete, named findings as durable KB notes… anchor proposals in the
+  specifics you found, not generic boilerplate." Whether it actually self-grounds (vs. invents)
+  is verified on the next loop run.
 
 ### Lifecycle / reliability
 
@@ -118,10 +152,20 @@ Severity: **P1** = cost/correctness-impacting · **P2** = output quality ·
 
 ### Feature gaps
 
-- [ ] **F9 (P2) — No goal-met early stop.** The loop burns its full iteration
-  budget even if the goal is met. Now **more feasible**: the critic already writes
-  structured verdict notes, so parsing a verdict for a "DoD met" signal is a
+- [-] **F9 (P2 — ✂️ DESCOPED by design 2026-06-26) — No goal-met early stop.** The loop
+  burns its full iteration budget even if the goal is met. Now **more feasible**: the critic
+  already writes structured verdict notes, so parsing a verdict for a "DoD met" signal is a
   concrete path. Tracked as deferred in the implementation plan.
+  **→ ✂️ DESCOPED — design rejection, not a deferral (2026-06-26).** The loop is
+  unconditional: it stops only on the user's budget or a manual stop. "Goal met" is judged by
+  the **human at check-in**, never auto-detected — an LLM "DoD met at 90%" is precisely the
+  toy-declared-done failure we're trying to kill (F7). A sane budget is the user's
+  responsibility; a forgotten 9999-round loop is user error, not a missing feature. Only the
+  budget *unit* still needs honest naming → F15.
+  **→ enacted in code 2026-06-26 (`project_loops.py`):** the critic prompt's "If the Definition
+  of Done is genuinely and fully met… that is the goal-met stop signal" line was **removed** —
+  the unconditional design now lives in the prompt, not just this doc. The critic always
+  "selects the next most valuable improvement instead of declaring completion."
 
 ### Tooling (incidental, not loop-specific)
 
@@ -343,13 +387,32 @@ from the empty `main` (cycle-1 code is HTTP 404 to it) and made **zero KB calls*
   confirmed P2, add a **decision-driven** supersede (critic flips losers at selection, or
   the convergence pass supersedes any `proposal` older than the `decision` that selected a
   different one). If not → close as subsumed by F13.
-- [ ] **F24 (P1) — No project-level acceptance vector → the loop can't measure
-  convergence.** Each job grades itself against a *self-authored local* DoD: the
-  developer's freeze (93%) checks only its own 4 spec ACs ("pytest collected 4,
-  passed 4"), never the project's ~10 capability areas. So every job can honestly
-  report 90%+ confidence forever while the project sits at ~1%. Fix: pin a project
-  capability checklist as a KB note, require each job to map its slice onto
-  capabilities and flip statuses, and surface "% capabilities green."
+  **→ decision-driven fix ADDED to the critic prompt 2026-06-26 (`project_loops.py`), ahead of
+  the F13 wait-and-see:** the critic now must "mark every non-selected proposal `superseded`
+  (ranking is NOT rejection — flip their status)" right after writing its verdict. So the next
+  run *tests the fix* rather than re-confirming the bug — check (2) becomes "with the critic
+  explicitly superseding losers, does the next scholar still re-propose them?" Kept `[~]`
+  pending that evidence.
+- [-] **F24 (P1 — ✂️ DESCOPED by design 2026-06-26) — No project-level acceptance vector →
+  the loop can't measure convergence.** Each job grades itself against a *self-authored
+  local* DoD: the developer's freeze (93%) checks only its own 4 spec ACs ("pytest collected
+  4, passed 4"), never the project's ~10 capability areas. So every job can honestly report
+  90%+ confidence forever while the project sits at ~1%. Fix: pin a project capability
+  checklist as a KB note, require each job to map its slice onto capabilities and flip
+  statuses, and surface "% capabilities green."
+  **→ ✂️ DESCOPED (design decision 2026-06-26).** The loop is **unconditional by design** —
+  it runs until the user's iteration/token budget is spent or the user stops it; there is no
+  goal-met termination (F9). A convergence % presupposes a *fixed denominator*, but software
+  is never done (Excel didn't stop in 1985) → the target is **undefined**, not merely hard to
+  measure. The real acceptance function is the **human at check-in reading the artifact**
+  (repo + Loop tab): more reliable than any checklist %, and free because the user already
+  checks in periodically. Overshoot is bounded (~one night) on idle compute, so the cost of
+  *not* measuring is trivial. Crucially, once the loop ignores the agent's self-confidence,
+  the "90% self-grade" becomes **harmless** — nothing stops on it. The residual risk this
+  would have guarded — a night of **thrashing** (re-doing decided work / drifting off-goal) —
+  is owned by **F22/F23/F13** (make each cycle productive), which a progress meter wouldn't
+  fix anyway (it would just show "flat"). Anti-vacuity (real system vs. toy) is owned by
+  **F7**.
 
 ### Reliability / tooling (P2–P3)
 
