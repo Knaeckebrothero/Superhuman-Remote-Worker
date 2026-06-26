@@ -224,6 +224,34 @@ Measured the two real costs of B (60 super-steps, ~4KB messages, one thread):
 + retention), not a blocker. The probe confirmed the prediction rather than
 surprising us — the call is locked to B.
 
+### Live dev verification (2026-06-25, shipped behind the flag)
+
+Implemented as Strategy B (factory at `src/agent.py` gated by
+`CHECKPOINTER_BACKEND`; retention via `PostgresDB.delete_checkpoint_thread` on
+terminal in `update_job_status` + `cancel_job`; schema via the agent's `setup()`).
+Flipped to `postgres` on dev (`deployment/values-experimental.yaml`). Verified live:
+
+- **Cross-pod resume ✅ (the headline).** A real worker job (`developer`, thread
+  `1859e831…`) wrote 130+ checkpoints to PG; its agent pod was force-killed
+  mid-phase-0. The orphan-recovered job re-dispatched to a **different pod**, which
+  logged `Resuming job … with existing workspace` / `Checkpointer initialized
+  (postgres, thread_id=…)` / `Reloaded 3 strategic todos after resume`, and
+  **continued** (checkpoints kept growing; no `No phase snapshots found … starting
+  fresh`). The exact mid-phase-0 case that used to cold-start now resumes from PG.
+- **Schema auto-create ✅** — the agent's `setup()` created the 4 tables on first job.
+- **Retention partial:** non-terminal (`paused`) correctly *preserved* the rows;
+  the terminal `cancel` ran the hooked `cancel_job` but **no-op'd** — the long-lived
+  **orchestrator pod's `CHECKPOINTER_BACKEND` env was unset** (it predated the
+  ConfigMap key and wasn't restarted; agents got it fresh per job). Code is correct
+  (unit-verified); this is a deploy gap, not a logic bug.
+
+**Rollout caveat:** the flag only takes effect at pod *start*. Worker agents pick
+it up (provisioned per job); the **long-lived orchestrator must be restarted** for
+retention to engage, else it silently no-ops (agents write PG checkpoints, the
+orchestrator never prunes). Add a Stakater Reloader annotation on the orchestrator
+deployment for `srw-config` so ConfigMap flips auto-bounce it; until then,
+`kubectl rollout restart deploy/srw-orchestrator` after the flip.
+
 ### Fallbacks (only if B proves unviable)
 
 - **(A) Bridge the SQLite checkpoint** *(the original proposal)* — push
