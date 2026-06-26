@@ -1271,6 +1271,25 @@ class TestPollWorkspaceReady:
         assert client.get_thread_workspace.call_count == 1
 
     @pytest.mark.asyncio
+    async def test_propagates_grant_denied_when_flagged(self):
+        """raise_on_denied=True propagates SessionGrantDenied (a permanent grant
+        denial) instead of retrying/None, and threads the flag through to
+        get_thread_workspace. The attach lifespan catches it and exits with the
+        real reason (Phase 4). docs: session_permission_mode_grant_denied_ready_timeout.md
+        """
+        from src.api.orchestrator_client import SessionGrantDenied
+
+        client = AsyncMock()
+        client.get_thread_workspace = AsyncMock(
+            side_effect=SessionGrantDenied(
+                "permission_mode: 'autonomous' exceeds the ceiling"
+            )
+        )
+        with pytest.raises(SessionGrantDenied):
+            await _poll_workspace_ready(client, "tid", timeout=5, raise_on_denied=True)
+        client.get_thread_workspace.assert_called_once_with("tid", raise_on_denied=True)
+
+    @pytest.mark.asyncio
     async def test_returns_vm_config_when_ready(self):
         """Returns remote config when vm_status='ready' with ssh_host."""
         client = AsyncMock()
@@ -1328,7 +1347,7 @@ class TestPollWorkspaceReady:
         """Polls with sleep during intermediate statuses."""
         call_count = 0
 
-        async def _get_workspace(tid):
+        async def _get_workspace(tid, **kwargs):
             nonlocal call_count
             call_count += 1
             if call_count < 3:
