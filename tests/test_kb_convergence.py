@@ -9,6 +9,8 @@ Covers:
   - assemble_and_converge_knowledge runner: stale-queue gate, refresh bookkeeping,
     KB-unavailable guard
   - create_loop_job turns curation ON for loop jobs (competing hooks stay off)
+  - create_loop_job splits the prompt: concise description (title) + full loop
+    protocol via context["kickoff_message"] (the "Opening Message" channel)
 """
 
 import uuid
@@ -368,3 +370,46 @@ class TestLoopCurationEnabled:
         # The competing per-job hooks must stay OFF (they fight the rotation).
         assert override["verification"]["enabled"] is False
         assert override["scholar"]["enabled"] is False
+
+
+# =============================================================================
+# Loop splits the prompt: concise description (title) + kickoff message
+# =============================================================================
+
+
+class TestLoopKickoffSplit:
+    @pytest.mark.asyncio
+    async def test_create_loop_job_splits_description_and_kickoff(self):
+        from orchestrator.services.project_loops import create_loop_job
+
+        db = AsyncMock()
+        db.create_job = AsyncMock(return_value={"id": uuid.uuid4()})
+        db.list_project_datasources = AsyncMock(return_value=[])
+        loop = {
+            "id": uuid.uuid4(),
+            "project_id": uuid.uuid4(),
+            "owner_id": uuid.uuid4(),
+            "goal": "Build a Salesforce-like CRM",
+        }
+
+        await create_loop_job(db, loop, role="scholar", iteration=3)
+
+        kwargs = db.create_job.call_args.kwargs
+        description = kwargs["description"]
+        context = kwargs["context"]
+
+        # The description is the concise title — role + iteration + goal — NOT the
+        # full multi-paragraph preamble that used to be the cockpit row title.
+        assert description.startswith("Loop iter 3 · SCHOLAR")
+        assert "Build a Salesforce-like CRM" in description
+        assert "You are ONE step" not in description
+        assert len(description) < 200
+
+        # The full loop protocol rides the "Opening Message" channel so it reaches
+        # the agent's task_brief without polluting the job title.
+        kickoff = context["kickoff_message"]
+        assert "You are ONE step in a CONTINUOUS" in kickoff
+        assert "PROJECT GOAL:" in kickoff
+        # Coordination keys stay alongside it.
+        assert context["loop_role"] == "scholar"
+        assert context["loop_iteration"] == 3
