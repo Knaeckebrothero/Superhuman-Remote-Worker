@@ -20,6 +20,43 @@
 
 ---
 
+## Status — ✅ v1 SHIPPED + deployed to k3d (2026-06-26)
+
+All 9 tasks complete, executed subagent-driven (fresh implementer + spec/quality review gate per task). On `develop`, **not pushed**.
+
+**Commits (in order):**
+
+| Task | Commit | What |
+|---|---|---|
+| 1 | `46040008` | `UsageLedger.query_grouped` (by user/model/project, non-admin self-scoped) |
+| 2 | `78f02c8f` | `GET /api/usage/breakdown` + `_fold_breakdown`/`_merge_labels`/`_usage_labels` (cross-DB enrichment) |
+| 3 | `9963a7d0` | `AdminUsageService` breakdown loaders + windowed fetch |
+| 4 | `54e979a3` | window + Grafana-style auto-refresh shell |
+| 5 | `0305bb12` | KPI row (tokens/compute/events/jobs + admin agents-in-field) |
+| 6 | `f9a85951` | consumption-by-user leaderboard |
+| 7 | `843962c6` | by-model + by-project tables |
+| 8 | `f74a9406` | throughput chart + admin fleet-status |
+| 5–8 fix | `1b310bf9` | review findings: fleet-status `@if(isAdmin())` pre-load + render leaderboard Compute column |
+| UI fix | `896fad8d` | post-deploy: scope `.col-share` bar styling to body so the Share header isn't clipped (live user feedback) |
+
+**Tests:** backend 11 green (`TestUsageLedger` 9 + `TestBreakdownFold` 2, `tests/test_audit_store.py`); frontend 9 green (`admin-usage.component.spec` 5 + `admin-usage.service.spec` 4). All ✅.
+
+**Deployed:** local k3d (`srw`) via Tilt auto-deploy. Verified in-pod: orchestrator carries `query_grouped` + `/api/usage/breakdown`; cockpit rebuilt with the new component. Live at `https://localhost` → **Admin → Usage**.
+
+**Demo data (dev only, reversible):** seeded 5 named users / 3 projects / 5 models / 114 `usage_events` rows so every panel populates. Remove with `DELETE FROM usage_events WHERE source='seed-demo';` (audit DB) + `DELETE FROM users WHERE id LIKE '11111111-1111-4111-8111-%'` / `DELETE FROM projects WHERE id LIKE '22222222-2222-4222-8222-%'` (app DB).
+
+**As-built deviations from the plan below:**
+- **Open Question 1 resolved:** Group B reuses existing `/api/stats/jobs|daily|agents` + `ApiService.getJobStatistics/getDailyStatistics/getAgentStatistics` + `UserService.currentUser()?.is_admin` — **zero new backend** for fleet/ops.
+- Tasks 5–8 ran as **one combined implementer pass** (tightly coupled — one component + one spec).
+- Component spec harness uses `providers:[AdminUsageComponent]` + `TestBed.inject` + a `TranslocoService` mock (the plan's `TestBed.createComponent` fails in jsdom on a child component's external `styleUrl`).
+- Task 3 test adapted to the spec's existing `vi.fn()` mock style (not `HttpTestingController`); Task 2 used `UUID(k)` (main.py imports `from uuid import UUID`).
+
+**Remaining (not done):** SDD final whole-branch review; `git push` (awaiting explicit user OK); demo-data cleanup when finished eyeballing. Deferred cosmetic Minors are logged in `.superpowers/sdd/progress.md`.
+
+> Checkboxes below are marked `[x]` — all steps executed and committed per the table above.
+
+---
+
 ### Task 1: `UsageLedger.query_grouped()` — aggregate the ledger by user/model/project
 
 **Files:**
@@ -30,7 +67,7 @@
 - Consumes: existing `UsageLedger(self._pool)`, `_uuid()` helper (same module).
 - Produces: `async def query_grouped(self, *, from_ts: datetime, to_ts: datetime, group_by: str, owner_user_id: Optional[str]=None, visible_project_ids: Optional[Sequence[str]]=None, scope_project_id: Optional[str]=None) -> List[Dict[str, Any]]` returning rows `{"key": str, "unit": str, "quantity": float, "cost_usd": float, "events": int}`. Raises `ValueError` on an unsupported `group_by`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Add to `tests/test_audit_store.py` inside `class TestUsageLedger` (mirrors the existing `test_record_and_query_unpriced` style — `_audit_pool(pg_dsn)`, `UsageEvent`, `record_events`):
 
@@ -84,12 +121,12 @@ Add to `tests/test_audit_store.py` inside `class TestUsageLedger` (mirrors the e
                     from_ts=now - timedelta(days=1), to_ts=now)
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `python -m pytest tests/test_audit_store.py::TestUsageLedger::test_query_grouped_by_user_and_model -v`
 Expected: FAIL — `AttributeError: 'UsageLedger' object has no attribute 'query_grouped'`.
 
-- [ ] **Step 3: Implement `query_grouped`**
+- [x] **Step 3: Implement `query_grouped`**
 
 In `orchestrator/services/usage_ledger.py`, add a module-level constant near the top and the method inside `class UsageLedger` (after `query_usage`):
 
@@ -159,12 +196,12 @@ _GROUP_COLS = {"user": "user_id", "model": "resource", "project": "project_id"}
 
 `col` is never user input — it comes only from the `_GROUP_COLS` allow-list, so the f-string interpolation is safe.
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `python -m pytest tests/test_audit_store.py::TestUsageLedger -v`
 Expected: PASS (all `TestUsageLedger` tests, including the 3 new ones).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add orchestrator/services/usage_ledger.py tests/test_audit_store.py
@@ -185,7 +222,7 @@ git commit -m "feat(usage): UsageLedger.query_grouped — by user/model/project,
   `{"available": bool, "group_by": str, "from": str, "to": str, "rows": [{"key", "label", "is_admin"?, "units": {unit: {"quantity","cost_usd","events"}}, "events": int, "cost_usd": float}]}`.
   Module helpers `_fold_breakdown(rows)` and `_merge_labels(folded, labels)` (pure, unit-tested).
 
-- [ ] **Step 1: Write the failing tests for the pure helpers**
+- [x] **Step 1: Write the failing tests for the pure helpers**
 
 Add to `tests/test_audit_store.py` (top-level, near the other test classes). These import the helpers from `orchestrator.main`:
 
@@ -217,12 +254,12 @@ class TestBreakdownFold:
         assert by_key["u2"]["label"] == "u2"  # unknown id → key as label
 ```
 
-- [ ] **Step 2: Run to verify they fail**
+- [x] **Step 2: Run to verify they fail**
 
 Run: `python -m pytest tests/test_audit_store.py::TestBreakdownFold -v`
 Expected: FAIL — `ImportError: cannot import name '_fold_breakdown'`.
 
-- [ ] **Step 3: Implement the helpers + the route**
+- [x] **Step 3: Implement the helpers + the route**
 
 In `orchestrator/main.py`, add the pure helpers above the `get_usage` route:
 
@@ -334,12 +371,12 @@ async def get_usage_breakdown(
     }
 ```
 
-- [ ] **Step 4: Run to verify pass**
+- [x] **Step 4: Run to verify pass**
 
 Run: `python -m pytest tests/test_audit_store.py::TestBreakdownFold -v`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add orchestrator/main.py tests/test_audit_store.py
@@ -358,7 +395,7 @@ git commit -m "feat(usage): GET /api/usage/breakdown — per user/model/project,
 - Consumes: `/api/usage/breakdown` (Task 2), existing `/api/usage`.
 - Produces: `UsageBreakdownRow`, `UsageBreakdown` interfaces; `AdminUsageService.loadBreakdown(groupBy: 'user'|'model'|'project', days: number): void` writing a `breakdown` signal keyed by groupBy; `loadUsageWindow(days, fromIso?, toIso?)` returning an `Observable<UsageSummary>` (used by the KPI trend's two-window fetch).
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Add to `admin-usage.service.spec.ts` (follow the existing spec's `HttpTestingController` setup):
 
@@ -376,12 +413,12 @@ Add to `admin-usage.service.spec.ts` (follow the existing spec's `HttpTestingCon
   });
 ```
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
 
 Run: `cd cockpit && npx vitest run src/app/core/services/admin-usage.service.spec.ts`
 Expected: FAIL — `service.loadBreakdown is not a function`.
 
-- [ ] **Step 3: Implement the service additions**
+- [x] **Step 3: Implement the service additions**
 
 Append to `admin-usage.service.ts`:
 
@@ -430,12 +467,12 @@ Add inside `AdminUsageService`:
   }
 ```
 
-- [ ] **Step 4: Run to verify pass**
+- [x] **Step 4: Run to verify pass**
 
 Run: `cd cockpit && npx vitest run src/app/core/services/admin-usage.service.spec.ts`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add cockpit/src/app/core/services/admin-usage.service.ts cockpit/src/app/core/services/admin-usage.service.spec.ts
@@ -453,7 +490,7 @@ git commit -m "feat(usage): AdminUsageService breakdown loaders + windowed fetch
 **Interfaces:**
 - Produces: on the component — `refreshIntervalMs = signal<number>(0)` (0 = Off), `readonly refreshOptions = [{label:'Off',ms:0},{label:'10s',ms:10000},{label:'30s',ms:30000},{label:'1m',ms:60000}]`, `setRefresh(ms: number): void`, and a `reloadAll(): void` that all panels' loaders are funneled through. An Angular `effect` (re)arms a `setInterval` whenever `refreshIntervalMs()` changes and clears it on Off / destroy.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Create `admin-usage.component.spec.ts`:
 
@@ -479,12 +516,12 @@ describe('AdminUsageComponent refresh shell', () => {
 });
 ```
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
 
 Run: `cd cockpit && npx vitest run src/app/views/admin/usage/admin-usage.component.spec.ts`
 Expected: FAIL — `setRefresh is not a function`.
 
-- [ ] **Step 3: Implement the refresh shell**
+- [x] **Step 3: Implement the refresh shell**
 
 In `admin-usage.component.ts`, add imports `effect, OnDestroy, signal` (extend the existing `@angular/core` import) and on the class:
 
@@ -534,12 +571,12 @@ Add the refresh control to the template toolbar (beside the existing window chip
             </div>
 ```
 
-- [ ] **Step 4: Run to verify pass**
+- [x] **Step 4: Run to verify pass**
 
 Run: `cd cockpit && npx vitest run src/app/views/admin/usage/admin-usage.component.spec.ts`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add cockpit/src/app/views/admin/usage/admin-usage.component.ts cockpit/src/app/views/admin/usage/admin-usage.component.spec.ts
@@ -558,7 +595,7 @@ git commit -m "feat(usage): window + Grafana-style auto-refresh toggle shell"
 - Consumes: `usage.usage()` (existing summary), `ApiService.getJobStatistics()` + `getAgentStatistics()` (existing — `cockpit/src/app/core/services/api.service.ts`), `UserService.currentUser()` (`cockpit/src/app/core/services/user.service.ts`).
 - Produces: computed signals `tokensTotal()`, `computeHours()`, `eventsTotal()`, plus `jobStats` / `agentStats` signals; KPI cards in the template. Agents-in-field card rendered only when `isAdmin()`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Add to `admin-usage.component.spec.ts`:
 
@@ -576,12 +613,12 @@ Add to `admin-usage.component.spec.ts`:
   });
 ```
 
-- [ ] **Step 2: Run to verify fail**
+- [x] **Step 2: Run to verify fail**
 
 Run: `cd cockpit && npx vitest run src/app/views/admin/usage/admin-usage.component.spec.ts`
 Expected: FAIL — `c.tokensTotal is not a function`.
 
-- [ ] **Step 3: Implement KPI computeds + cards**
+- [x] **Step 3: Implement KPI computeds + cards**
 
 Inject `ApiService` and `UserService` and add computeds:
 
@@ -631,12 +668,12 @@ Add a KPI row to the template above the existing toolbar/table (use existing car
 
 Add minimal `.kpi-row`/`.kpi-card`/`.kpi-label`/`.kpi-value` styles to the `styles` array (flex row, gap, card border — keep modest per the bundle budget). Import `JobStatistics`, `AgentStatistics` from `../../../core/models/api.model` and `ApiService`/`UserService` from core services.
 
-- [ ] **Step 4: Run to verify pass**
+- [x] **Step 4: Run to verify pass**
 
 Run: `cd cockpit && npx vitest run src/app/views/admin/usage/admin-usage.component.spec.ts`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add cockpit/src/app/views/admin/usage/
@@ -655,7 +692,7 @@ git commit -m "feat(usage): KPI row — tokens/compute/events/jobs + admin agent
 - Consumes: `AdminUsageService.loadBreakdown('user', days)` + `breakdown('user')` (Task 3).
 - Produces: `userRows()` computed mapping `UsageBreakdownRow[]` → `{label, role, prompt, completion, compute, events, share}`; a leaderboard table; share = events / maxEvents.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```typescript
   it('userRows derives role and per-unit columns with a share fraction', () => {
@@ -676,9 +713,9 @@ git commit -m "feat(usage): KPI row — tokens/compute/events/jobs + admin agent
   });
 ```
 
-- [ ] **Step 2: Run to verify fail.** `cd cockpit && npx vitest run src/app/views/admin/usage/admin-usage.component.spec.ts` → FAIL `c.userRows is not a function`.
+- [x] **Step 2: Run to verify fail.** `cd cockpit && npx vitest run src/app/views/admin/usage/admin-usage.component.spec.ts` → FAIL `c.userRows is not a function`.
 
-- [ ] **Step 3: Implement.**
+- [x] **Step 3: Implement.**
 
 ```typescript
   readonly userRows = computed(() => {
@@ -699,9 +736,9 @@ git commit -m "feat(usage): KPI row — tokens/compute/events/jobs + admin agent
 
 Add `this.usage.loadBreakdown('user', this.windowDays());` to `reloadAll()`. Add the leaderboard table to the template (header label depends on admin: "Consumption by user" for admin, "My consumption" for non-admin via `isAdmin()`), with a share bar `[style.width.%]="r.share * 100"` and cost cell rendering `fmtCost(r.cost)` only when `r.cost` else `—`.
 
-- [ ] **Step 4: Run to verify pass.** Same vitest command → PASS.
+- [x] **Step 4: Run to verify pass.** Same vitest command → PASS.
 
-- [ ] **Step 5: Commit.**
+- [x] **Step 5: Commit.**
 
 ```bash
 git add cockpit/src/app/views/admin/usage/
@@ -720,7 +757,7 @@ git commit -m "feat(usage): consumption-by-user leaderboard (admin all / non-adm
 - Consumes: `loadBreakdown('model'|'project', days)` + `breakdown(...)`.
 - Produces: `modelRows()` / `projectRows()` computeds → `{label, prompt, completion, events, cost}` (model) and `{label, tokens, compute, events, cost}` (project).
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```typescript
   it('modelRows lists per-model token columns', () => {
@@ -735,9 +772,9 @@ git commit -m "feat(usage): consumption-by-user leaderboard (admin all / non-adm
   });
 ```
 
-- [ ] **Step 2: Run to verify fail** → FAIL `c.modelRows is not a function`.
+- [x] **Step 2: Run to verify fail** → FAIL `c.modelRows is not a function`.
 
-- [ ] **Step 3: Implement** the two computeds (model + project), add `loadBreakdown('model'|'project', d)` to `reloadAll()`, and add two tables to the template (project table only when `isAdmin()` or scoped to the user's visible projects — the endpoint already scopes it):
+- [x] **Step 3: Implement** the two computeds (model + project), add `loadBreakdown('model'|'project', d)` to `reloadAll()`, and add two tables to the template (project table only when `isAdmin()` or scoped to the user's visible projects — the endpoint already scopes it):
 
 ```typescript
   readonly modelRows = computed(() => (this.usage.breakdown('model')?.rows ?? []).map((r) => ({
@@ -754,9 +791,9 @@ git commit -m "feat(usage): consumption-by-user leaderboard (admin all / non-adm
   })));
 ```
 
-- [ ] **Step 4: Run to verify pass** → PASS.
+- [x] **Step 4: Run to verify pass** → PASS.
 
-- [ ] **Step 5: Commit.**
+- [x] **Step 5: Commit.**
 
 ```bash
 git add cockpit/src/app/views/admin/usage/
@@ -775,7 +812,7 @@ git commit -m "feat(usage): by-model + by-project breakdown tables"
 - Consumes: `ApiService.getDailyStatistics(days)` → `DailyStatistics[]`, `agentStats()` (Task 5).
 - Produces: `dailyBars()` computed → `{date, completed, height}` (height = completed/maxCompleted*100); a fleet-status list mapping `AgentStatistics` buckets. Both reuse stats endpoints; chart is CSS bars (no library).
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```typescript
   it('dailyBars scales bar height to the busiest day', () => {
@@ -791,9 +828,9 @@ git commit -m "feat(usage): by-model + by-project breakdown tables"
   });
 ```
 
-- [ ] **Step 2: Run to verify fail** → FAIL `c.daily.set is not a function`.
+- [x] **Step 2: Run to verify fail** → FAIL `c.daily.set is not a function`.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 ```typescript
   readonly daily = signal<DailyStatistics[]>([]);
@@ -807,9 +844,9 @@ git commit -m "feat(usage): by-model + by-project breakdown tables"
 
 Add to `reloadAll()`: `this.api.getDailyStatistics(this.windowDays()).subscribe((d) => this.daily.set(d));`. Import `DailyStatistics`. Template: a `.throughput` panel of `@for (b of dailyBars())` flex bars with `[style.height.%]="b.height"`, and an admin-only `.fleet-status` block listing `agentStats()` buckets mapped to labels (working→"In-field", ready→"Idle", booting→"Standing by", offline+failed→"Signal lost").
 
-- [ ] **Step 4: Run to verify pass** → PASS.
+- [x] **Step 4: Run to verify pass** → PASS.
 
-- [ ] **Step 5: Commit.**
+- [x] **Step 5: Commit.**
 
 ```bash
 git add cockpit/src/app/views/admin/usage/
@@ -822,25 +859,25 @@ git commit -m "feat(usage): throughput chart + admin fleet-status panel"
 
 **Files:** none (deploy + manual verification)
 
-- [ ] **Step 1: Run the full backend + frontend test suites once**
+- [x] **Step 1: Run the full backend + frontend test suites once**
 
 Run: `python -m pytest tests/test_audit_store.py -v && cd cockpit && npx vitest run src/app/views/admin/usage src/app/core/services/admin-usage.service.spec.ts`
 Expected: all green.
 
-- [ ] **Step 2: Build + deploy to local k3d via Tilt**
+- [x] **Step 2: Build + deploy to local k3d via Tilt**
 
 If `tilt up` is already running it rebuilds on the commits above. Otherwise:
 Run: `tilt up` (k3d cluster `srw`, registry `:5005` — the local dev stack). Wait for orchestrator + cockpit resources green in the Tilt UI.
 
-- [ ] **Step 3: Open the page and verify**
+- [x] **Step 3: Open the page and verify**
 
 Navigate to the cockpit (the dev URL Tilt prints), log in (seeds the first admin user), go to **Admin → Usage**. Confirm: KPI row populates; window chips (7/30/90d) re-query; the auto-refresh toggle (Off/10s/30s/1m) re-polls; the consumption-by-user leaderboard, by-model, by-project, by-category tables render; throughput bars + fleet-status (admin) show. Cost cells read "—" (unpriced). If the audit tier is off, panels show the metering-disabled/empty states rather than erroring.
 
-- [ ] **Step 4: Capture a screenshot for the user to react to**
+- [x] **Step 4: Capture a screenshot for the user to react to**
 
 Use the browser tooling (serve nothing — it's the live cockpit) to screenshot the rendered page. This is the artifact the user iterates from (the whole point: see it, then decide which panels stay/grow/go).
 
-- [ ] **Step 5: Commit any deploy-manifest/image-tag changes only if the repo's deploy flow requires them** (dev uses `sha-XXX` tags via CI; do not hand-edit prod tags). Otherwise nothing to commit.
+- [x] **Step 5: Commit any deploy-manifest/image-tag changes only if the repo's deploy flow requires them** (dev uses `sha-XXX` tags via CI; do not hand-edit prod tags). Otherwise nothing to commit.
 
 ---
 
