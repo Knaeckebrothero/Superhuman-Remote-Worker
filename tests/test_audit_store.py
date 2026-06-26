@@ -800,3 +800,30 @@ class TestWorkspaceMetering:
                 "SELECT quantity FROM usage_events WHERE unit='vcpu-hour'"
             )
             assert abs(float(q) - 12.0) < 1e-3  # 0.5 vcpu × 24h
+
+
+class TestBreakdownFold:
+    """Pure (key, unit) → per-key folding + label merge used by /api/usage/breakdown."""
+
+    def test_fold_groups_units_under_key(self):
+        from orchestrator.main import _fold_breakdown
+        rows = [
+            {"key": "u1", "unit": "prompt-token", "quantity": 100.0, "cost_usd": 0.0, "events": 2},
+            {"key": "u1", "unit": "completion-token", "quantity": 30.0, "cost_usd": 0.0, "events": 2},
+            {"key": "u2", "unit": "prompt-token", "quantity": 50.0, "cost_usd": 0.0, "events": 1},
+        ]
+        folded = _fold_breakdown(rows)
+        assert folded["u1"]["units"]["prompt-token"]["quantity"] == 100.0
+        assert folded["u1"]["events"] == 4  # summed across units
+        assert folded["u2"]["units"]["prompt-token"]["events"] == 1
+
+    def test_merge_labels_falls_back_to_key(self):
+        from orchestrator.main import _fold_breakdown, _merge_labels
+        folded = _fold_breakdown([
+            {"key": "u1", "unit": "prompt-token", "quantity": 1.0, "cost_usd": 0.0, "events": 1},
+            {"key": "u2", "unit": "prompt-token", "quantity": 1.0, "cost_usd": 0.0, "events": 1},
+        ])
+        out = _merge_labels(folded, {"u1": {"label": "Alice", "is_admin": True}})
+        by_key = {r["key"]: r for r in out}
+        assert by_key["u1"]["label"] == "Alice" and by_key["u1"]["is_admin"] is True
+        assert by_key["u2"]["label"] == "u2"  # unknown id → key as label
