@@ -11,7 +11,12 @@ import {DatePipe} from '@angular/common';
 
 import {ApiService} from '../../core/services/api.service';
 import {ModelService} from '../../core/services/model.service';
-import {Job, ProjectLoop, ProjectLoopStartRequest} from '../../core/models/api.model';
+import {
+  Expert,
+  Job,
+  ProjectLoop,
+  ProjectLoopStartRequest,
+} from '../../core/models/api.model';
 import {AppButtonComponent} from '../../ui/button';
 import {AppInputComponent} from '../../ui/input';
 import {AppSelectComponent} from '../../ui/select';
@@ -41,6 +46,30 @@ export function isLoopWindingDown(
   if (!loop) return false;
   const active = loop.status === 'running' || loop.status === 'paused';
   return !active && hasInFlightJob(jobs);
+}
+
+/**
+ * Experts eligible to fill a loop rotation slot. Loops run worker jobs; bundled
+ * experts carry no `expert_type`, and DB session experts are excluded.
+ */
+export function workerExpertsOnly<T extends {expert_type?: string}>(
+  experts: T[],
+): T[] {
+  return experts.filter((e) => !e.expert_type || e.expert_type === 'worker');
+}
+
+/**
+ * The effective rotation to send as `role_sequence`: the preset list, or the
+ * custom slots with surrounding blanks trimmed (so an unfilled custom slot can
+ * never ship and the API never sees an empty entry).
+ */
+export function buildRoleSequence(
+  mode: 'preset' | 'custom',
+  customSlots: string[],
+  presetRoles: string[],
+): string[] {
+  const seq = mode === 'custom' ? customSlots : presetRoles;
+  return seq.map((s) => s.trim()).filter(Boolean);
 }
 
 /**
@@ -151,7 +180,10 @@ export function isLoopWindingDown(
             @if (modelOptions().length === 0) {
               <p class="loop-hint">No models are configured for this project — jobs will use the project default.</p>
             }
-            <app-form-field label="Model">
+            <app-form-field
+              label="Model"
+              hint="Optional — overrides every role's model. Leave blank to use each expert's own model."
+            >
               <app-select [value]="fModel()" (changed)="fModel.set($event ?? '')">
                 <option value="">Project default</option>
                 @for (m of modelOptions(); track m) {
@@ -161,17 +193,72 @@ export function isLoopWindingDown(
             </app-form-field>
 
             <app-form-field label="Cycle" hint="Which roles rotate, one job each, repeating.">
+              <div class="loop-mode">
+                <button
+                  type="button"
+                  class="loop-mode-btn"
+                  [class.active]="fMode() === 'preset'"
+                  (click)="setMode('preset')"
+                >
+                  Preset
+                </button>
+                <button
+                  type="button"
+                  class="loop-mode-btn"
+                  [class.active]="fMode() === 'custom'"
+                  (click)="setMode('custom')"
+                >
+                  Custom
+                </button>
+              </div>
+            </app-form-field>
+
+            @if (fMode() === 'preset') {
               <app-select [value]="fPreset()" (changed)="setPreset($event)">
                 <option value="build">Build (scholar → critic → developer)</option>
                 <option value="write">Write (scholar → critic → general)</option>
                 <option value="research">Research (scholar → critic)</option>
               </app-select>
-            </app-form-field>
-            <div class="loop-seq">
-              @for (r of roleSequence(); track $index) {
-                <span class="loop-role-chip">{{ r }}</span>
+              <div class="loop-seq">
+                @for (r of roleSequence(); track $index) {
+                  <span class="loop-role-chip">{{ r }}</span>
+                }
+              </div>
+            } @else {
+              <p class="loop-hint">
+                Pick an expert per step — they rotate one job each, repeating.
+                Swap in a custom expert to change that step's model.
+              </p>
+              <div class="loop-slots">
+                @for (slot of customSlots(); track $index) {
+                  <div class="loop-slot">
+                    <span class="loop-slot-n">{{ $index + 1 }}</span>
+                    <app-select [value]="slot" (changed)="setSlot($index, $event)">
+                      <option value="">— pick an expert —</option>
+                      @for (e of workerExperts(); track e.id) {
+                        <option [value]="slug(e)">{{ e.display_name }}</option>
+                      }
+                    </app-select>
+                    <app-button
+                      variant="ghost"
+                      size="sm"
+                      [disabled]="customSlots().length <= 1"
+                      (clicked)="removeSlot($index)"
+                    >
+                      Remove
+                    </app-button>
+                  </div>
+                }
+              </div>
+              <app-button variant="secondary" size="sm" (clicked)="addSlot()">
+                Add step
+              </app-button>
+              @if (!workerExperts().length) {
+                <p class="loop-hint">
+                  No experts available — create a custom expert to pin a model.
+                </p>
               }
-            </div>
+            }
 
             <div class="loop-budget">
               <app-form-field label="Max iterations" hint="Total jobs to run (≈ this ÷ roles = cycles).">
@@ -254,6 +341,24 @@ export function isLoopWindingDown(
         font-size: 11px; padding: 2px 8px; border-radius: var(--radius-tag);
         background: var(--surface-1); color: var(--text-secondary); text-transform: capitalize;
       }
+      .loop-mode { display: flex; gap: 6px; }
+      .loop-mode-btn {
+        font-size: 12px; padding: 4px 14px; border-radius: var(--radius-control);
+        border: 1px solid var(--border-color); background: var(--surface-0);
+        color: var(--text-secondary); cursor: pointer;
+      }
+      .loop-mode-btn.active {
+        border-color: var(--accent-color); color: var(--text-primary);
+        background: color-mix(in srgb, var(--accent-color) 15%, transparent);
+      }
+      .loop-slots { display: flex; flex-direction: column; gap: 8px; margin-bottom: 8px; }
+      .loop-slot { display: flex; align-items: center; gap: 8px; }
+      .loop-slot app-select { flex: 1; min-width: 0; }
+      .loop-slot-n {
+        flex: 0 0 auto; width: 20px; height: 20px; display: flex;
+        align-items: center; justify-content: center; font-size: 11px;
+        border-radius: 50%; background: var(--surface-1); color: var(--text-muted);
+      }
       .loop-budget { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
       .loop-hint, .loop-msg { font-size: 12px; margin: 0; }
       .loop-hint { color: var(--text-muted); }
@@ -281,6 +386,12 @@ export class ProjectLoopComponent implements OnInit, OnDestroy {
   readonly fMaxHours = signal('');
   readonly fAcceptance = signal('');
   readonly fUserPrompt = signal('');
+  // Cycle builder: 'preset' uses a ready-made rotation; 'custom' lets the user
+  // pick an expert per step (each step's expert carries its own model).
+  readonly fMode = signal<'preset' | 'custom'>('preset');
+  readonly customSlots = signal<string[]>([]);
+  // Worker experts available to fill custom slots (bundled + DB worker experts).
+  readonly workerExperts = signal<Expert[]>([]);
 
   private pollHandle: ReturnType<typeof setInterval> | null = null;
 
@@ -293,7 +404,15 @@ export class ProjectLoopComponent implements OnInit, OnDestroy {
   readonly modelOptions = computed(() =>
     this.modelService.models().flatMap((g) => g.models),
   );
-  readonly roleSequence = computed(() => this.presets[this.fPreset()]);
+  // Effective rotation sent to the API: the preset list, or the custom slots
+  // with blanks trimmed (so an unfilled custom slot can never ship).
+  readonly roleSequence = computed(() =>
+    buildRoleSequence(
+      this.fMode(),
+      this.customSlots(),
+      this.presets[this.fPreset()],
+    ),
+  );
   readonly isActive = computed(() => {
     const l = this.loop();
     return !!l && (l.status === 'running' || l.status === 'paused');
@@ -320,6 +439,11 @@ export class ProjectLoopComponent implements OnInit, OnDestroy {
   ngOnInit(): void {
     const pid = this.projectId();
     if (pid) this.modelService.load(pid);
+    // Worker experts for the custom cycle builder. Loops run worker jobs;
+    // bundled experts carry no type, DB session experts are filtered out.
+    this.api.getExperts().subscribe((experts) => {
+      this.workerExperts.set(workerExpertsOnly(experts));
+    });
     this.refresh();
     // Live poll while the tab is open; cleared on destroy (tab close / nav away).
     this.pollHandle = setInterval(() => this.refresh(true), 10000);
@@ -360,6 +484,35 @@ export class ProjectLoopComponent implements OnInit, OnDestroy {
     }
   }
 
+  setMode(mode: 'preset' | 'custom'): void {
+    // Seed the custom slots from the current preset the first time in, so the
+    // user starts from a sensible rotation instead of a blank list.
+    if (mode === 'custom' && !this.customSlots().length) {
+      this.customSlots.set([...this.presets[this.fPreset()]]);
+    }
+    this.fMode.set(mode);
+  }
+
+  /** Slug to reference an expert by name in role_sequence (DB: name; bundled: id). */
+  slug(e: Expert): string {
+    return e.name ?? e.id;
+  }
+
+  setSlot(i: number, value: string | null): void {
+    const next = [...this.customSlots()];
+    next[i] = value ?? '';
+    this.customSlots.set(next);
+  }
+
+  addSlot(): void {
+    const first = this.workerExperts()[0];
+    this.customSlots.set([...this.customSlots(), first ? this.slug(first) : '']);
+  }
+
+  removeSlot(i: number): void {
+    this.customSlots.set(this.customSlots().filter((_, idx) => idx !== i));
+  }
+
   jobRole(j: Job): string {
     return j.config_name || 'job';
   }
@@ -368,6 +521,11 @@ export class ProjectLoopComponent implements OnInit, OnDestroy {
     const pid = this.projectId();
     if (!pid) return;
     this.message.set('');
+
+    if (!this.roleSequence().length) {
+      this.message.set('Add at least one expert to the cycle.');
+      return;
+    }
 
     const body: ProjectLoopStartRequest = {
       model: this.fModel() || null,

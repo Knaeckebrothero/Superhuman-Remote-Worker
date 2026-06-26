@@ -1,6 +1,11 @@
 import {describe, it, expect} from 'vitest';
 
-import {hasInFlightJob, isLoopWindingDown} from './project-loop.component';
+import {
+  buildRoleSequence,
+  hasInFlightJob,
+  isLoopWindingDown,
+  workerExpertsOnly,
+} from './project-loop.component';
 import type {Job, ProjectLoop} from '../../core/models/api.model';
 
 /**
@@ -54,5 +59,53 @@ describe('isLoopWindingDown', () => {
   it('also covers completed/failed loops with a trailing in-flight job', () => {
     expect(isLoopWindingDown(loop('completed'), [job('processing')])).toBe(true);
     expect(isLoopWindingDown(loop('failed'), [job('completed')])).toBe(false);
+  });
+});
+
+describe('workerExpertsOnly', () => {
+  it('keeps bundled experts (no expert_type)', () => {
+    expect(workerExpertsOnly([{id: 'scholar'}, {id: 'critic'}])).toHaveLength(2);
+  });
+
+  it('keeps worker experts and drops session experts', () => {
+    expect(
+      workerExpertsOnly([
+        {id: 'a', expert_type: 'worker'},
+        {id: 'b', expert_type: 'session'},
+        {id: 'c', expert_type: 'worker'},
+      ]),
+    ).toEqual([
+      {id: 'a', expert_type: 'worker'},
+      {id: 'c', expert_type: 'worker'},
+    ]);
+  });
+
+  it('is empty for empty input', () => {
+    expect(workerExpertsOnly([])).toEqual([]);
+  });
+});
+
+describe('buildRoleSequence', () => {
+  it('returns the preset roles in preset mode (ignores custom slots)', () => {
+    expect(buildRoleSequence('preset', ['ignored'], ['scholar', 'critic'])).toEqual([
+      'scholar',
+      'critic',
+    ]);
+  });
+
+  it('returns the custom slots in custom mode', () => {
+    expect(
+      buildRoleSequence('custom', ['scholar-fast', 'critic', 'developer'], ['scholar']),
+    ).toEqual(['scholar-fast', 'critic', 'developer']);
+  });
+
+  it('trims whitespace and drops blank custom slots', () => {
+    expect(
+      buildRoleSequence('custom', ['  scholar  ', '', '   ', 'critic'], []),
+    ).toEqual(['scholar', 'critic']);
+  });
+
+  it('is empty when every custom slot is blank (blocks an empty start)', () => {
+    expect(buildRoleSequence('custom', ['', '  '], ['scholar'])).toEqual([]);
   });
 });

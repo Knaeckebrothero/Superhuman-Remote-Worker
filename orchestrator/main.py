@@ -18248,7 +18248,12 @@ async def list_experts(
     global _experts_cache
     if _experts_cache is None:
         _experts_cache = _scan_experts()
-    result = [{**e.model_dump(), "source": "bundled"} for e in _experts_cache]
+    # ``name`` is the slug callers use to reference an expert by name (e.g. the
+    # project loop's role_sequence). For bundled experts the id IS the slug; for
+    # DB rows it's the separate name column (id is a UUID).
+    result = [
+        {**e.model_dump(), "source": "bundled", "name": e.id} for e in _experts_cache
+    ]
     if _is_experts_db_enabled():
         visible = await user_visible_project_ids(user, postgres_db)
         pids = [] if visible == "all" else [str(p) for p in visible]
@@ -18258,6 +18263,7 @@ async def list_experts(
         result += [
             {
                 "id": str(r["id"]),
+                "name": r["name"],
                 "display_name": r["display_name"],
                 "description": r.get("description") or "",
                 "icon": r["icon"],
