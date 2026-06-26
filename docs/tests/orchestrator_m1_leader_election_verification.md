@@ -3,7 +3,9 @@
 **Feature:** `docs/features/orchestrator_ha_scaling.md` — Milestone M1 / Phase 1 (Track 2 Layer 1).
 **Spec / plan:** `docs/superpowers/plans/2026-06-25-orchestrator-m1-leader-election.md` (research base: `docs/researches/orchestrator_leader_election.md`).
 
-**Status (2026-06-25): Code complete and unit/integration-verified. `replicas: 2` is correctness-safe. The two-replica failover run (local k3d + live cluster) is PENDING — the local k3d stack is currently cold, and the live run wants a quiet window (overnight, no one else mid-test on the cluster).**
+**Status (2026-06-26): Code complete; unit/integration-verified AND two-replica-verified on local k3d. `replicas: 2` is correctness-safe. The k3d run caught and fixed a deploy-blocking bug (see below). The live (dev) cluster run is still PENDING — it wants a quiet window (overnight, no one else mid-test on the cluster).**
+
+> **The k3d run earned its keep:** it caught a real, deploy-blocking bug the unit tests structurally could not — the lifespan leader-election imports used the package-prefixed form (`from orchestrator.services.leader_election …`), which resolves at the repo root (so all 16 unit tests passed) but **not** in the deployed flattened `/app` image, crashing the orchestrator at startup with `ModuleNotFoundError: No module named 'orchestrator'`. Fixed in `4e2a7560` (plain top-level imports, matching house convention). This is exactly the runtime-wiring class of bug a two-replica deploy exists to find.
 
 ## What M1 guarantees
 
@@ -33,18 +35,33 @@ DOCKER_HOST="unix:///run/user/$(id -u)/podman/podman.sock" TESTCONTAINERS_RYUK_D
 
 `ruff check` clean across all touched files. `python -c "import ast; ast.parse(...)"` confirms `orchestrator/main.py` parses after the surgical edits (the 23k-line monolith can't be meaningfully unit-tested for lifespan wiring — that's the two-replica test's job, below).
 
-## Still owed — the two-replica failover run
+## Verified on local k3d — two replicas (2026-06-26)
 
-The automated tests prove the **DB-level correctness primitives** (lock exclusivity + failover, every claim/CAS). What they cannot prove is the **runtime wiring** — that `lifespan` actually starts the leader task, that the 9 real loops are gated, and that a pod kill promotes the survivor. That needs a real two-replica deploy:
+Cluster `k3d-srw` (single node), full SRW stack via Tilt. Set `orchestrator.replicas: 2` + `orchestrator.pdb.minAvailable: 1` in `deployment/values-tilt.yaml`; Tilt rebuilt + rolled out the orchestrator with the M1 code baked.
 
-1. **Local k3d two-replica failover** — `orchestrator.replicas: 2` + `orchestrator.pdb.minAvailable: 1` in `deployment/values-tilt.yaml`; rebuild via Tilt. Confirm: exactly one pod logs `leader_election: acquired leadership`; `kubectl delete pod <leader>`; the survivor logs `acquired leadership` within ~one poll interval and the dispatcher/loops resume. Submit a job during the window → dispatched exactly once. _(As of this record the k3d cluster is cold — context `k3d-srw` is stale, no orchestrator pods. This is a full cold-start: `k3d` cluster up → `tilt up` (rebuilds all images with the M1 code) → readiness seeding. Run when the stack is next up.)_
-2. **Live (dev) two-replica failover** — same, on the multi-node cluster under real traffic: a mid-dispatch job ends `paused` then re-dispatched exactly once; the survivor's loops take over; no duplicate emails/replies during the ~40s dual-leader window.
+| Check | Result |
+|---|---|
+| Orchestrator **boots** with M1 code at `replicas: 2` | **PASS** (after the import fix) — both pods reach Ready with 0 restarts; before the fix both crash-looped at `from orchestrator.… import` (the bug this run caught). |
+| **Exactly one leader** | **PASS** — one pod logs `leader_election: acquired leadership (lock 6003957320051409220)` (`0x5352575F4C454144` = "SRW_LEAD"); the other does not. Postgres `pg_locks` shows exactly **one** granted advisory lock (`objid 0x4C454144`), held by the leader pod's backend (confirmed via `client_addr`). |
+| **`run_when_leader` gates the singletons** | **PASS** — the leader logs all 7 leader-gated loop starts (auto-assign dispatcher, stale-agent detector, agent-pool reconciler, lifecycle reconciler, delegation-timeout sweeper, headless permission-notify sweeper, quota poll); the follower logs **none** of them, while both run the non-gated loops (cron dispatcher, project-loop sweeper, prune sweepers, …). Exactly the intended split. |
+| **Failover on leader death** | **PASS** (×2) — `kubectl delete pod <leader>`: the advisory lock auto-releases and a surviving replica re-acquires it; never two holders. Wall-clock ~20 s, dominated by the M0 `preStopDrainSeconds: 15` drain (lock held until the leader's `finally` unlocks) + the ~10 s follower poll interval. |
+| **Graceful step-down** | **PASS** — the dying leader logs `leader_election: released leadership` (the `finally` `pg_advisory_unlock` path), so failover is a clean handoff, not a timeout. |
+| **Warm-follower loop is healthy** | **PASS** — isolated via `kubectl scale --replicas=1` (removing the competing replacement pod), the long-running follower acquired leadership ~26 s after the leader left. |
+| **Exactly-once dispatch** | **PASS (mechanism level)** — the auto-assign dispatcher runs only on the leader (above) and the per-job CAS `claim_job_for_agent` is unit-tested for exactly-one-wins. A full end-to-end job-submission demo was **not** run (needs the internal-API job path + a healthy agent pipeline; it would mostly re-demonstrate the unit-tested CAS). |
+
+**Observation (not a defect):** the freshly-booted *replacement* pod tends to win the lock over the warm follower, because its boot time (~18 s, init-containers) lands its first lock attempt right when the old leader's 15 s drain ends — a structural timing alignment, not a bug. Exactly-one-leader holds regardless. Failover speed (~20 s here) is tunable via `preStopDrainSeconds` + the leader poll interval if faster handoff is wanted.
+
+## Still owed — the live (dev) cluster run
+
+The k3d run proves the wiring on a single node. The live multi-node cluster under real traffic is still owed:
+
+- **Live (dev) two-replica failover** — a mid-dispatch job ends `paused` then re-dispatched exactly once; the survivor's loops take over; no duplicate emails/replies during the dual-leader window; realistic failover numbers.
+- **Hard-kill path** — k3d here exercised graceful delete (clean unlock). A `--grace-period=0` kill leaves the lock held by the dead Postgres session until TCP-keepalive detection (~40 s with the `10/10/3` tuning) — worth confirming on the live cluster.
 
 ### When & prerequisites
 
 - **When:** overnight / a low-usage window, coordinated so no one is mid-test on the cluster. The test deletes the leader pod.
-- **Prerequisite:** M1 deployed to the target. As of this record the M1 commits are **local-only on `develop` (unpushed)** — the live run needs a `develop` push (Fleet sync) or a manual `helm upgrade`. The local k3d run builds from the working tree (no push needed) but needs the cold stack brought up first.
-- **Keepalive note:** failover speed depends on the Postgres TCP-keepalive tuning (`tcp_keepalives_idle/interval/count = 10/10/3`, migration in `helm/templates/databases/postgres.yaml`) — a hard pod death (no clean unlock) is detected in ~40s; a clean shutdown releases the lock instantly.
+- **Prerequisite:** M1 deployed to the target. The M1 commits are **local-only on `develop` (unpushed)** — the live run needs a `develop` push (Fleet sync) or a manual `helm upgrade`.
 
 ## Scope guard
 
