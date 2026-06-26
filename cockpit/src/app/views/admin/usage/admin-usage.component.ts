@@ -109,6 +109,34 @@ import {AgentStatistics, DailyStatistics, JobStatistics} from '../../../core/mod
             </div>
           }
         </section>
+
+        @if (userRows().length > 0) {
+          <section class="admin-section">
+            <h2 class="section-title">{{ isAdmin() ? 'Consumption by user' : 'My consumption' }}</h2>
+            <div class="breakdown-table">
+              <div class="breakdown-header">
+                <span class="col-wide">User</span>
+                <span class="col-role">Role</span>
+                <span class="col-num">Prompt tok.</span>
+                <span class="col-num">Compl. tok.</span>
+                <span class="col-num">Events</span>
+                <span class="col-share">Share</span>
+                <span class="col-num">Cost</span>
+              </div>
+              @for (r of userRows(); track r.label) {
+                <div class="breakdown-row">
+                  <span class="col-wide">{{ r.label }}</span>
+                  <span class="col-role">{{ r.role }}</span>
+                  <span class="col-num">{{ fmtQty(r.prompt) }}</span>
+                  <span class="col-num">{{ fmtQty(r.completion) }}</span>
+                  <span class="col-num">{{ r.events }}</span>
+                  <span class="col-share"><span class="share-bar" [style.width.%]="r.share * 100"></span></span>
+                  <span class="col-num">{{ r.cost ? fmtCost(r.cost) : '—' }}</span>
+                </div>
+              }
+            </div>
+          </section>
+        }
       </div>
     </div>
   `,
@@ -251,6 +279,41 @@ import {AgentStatistics, DailyStatistics, JobStatistics} from '../../../core/mod
         color: var(--text-primary);
         font-variant-numeric: tabular-nums;
       }
+      .section-title {
+        font-size: 14px;
+        font-weight: 600;
+        margin: 0 0 12px 0;
+        color: var(--text-primary);
+      }
+      .breakdown-table {
+        border: 1px solid var(--border-color);
+        border-radius: var(--radius-surface);
+        overflow: hidden;
+      }
+      .breakdown-header,
+      .breakdown-row {
+        display: grid;
+        grid-template-columns: 1.4fr 70px 100px 100px 70px 80px 80px;
+        gap: 8px;
+        align-items: center;
+        padding: 8px 14px;
+        font-size: 13px;
+      }
+      .breakdown-header {
+        background: var(--surface-0);
+        font-weight: 600;
+        font-size: 12px;
+        color: var(--text-muted);
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+      }
+      .breakdown-row {
+        border-top: 1px solid var(--border-color);
+      }
+      .col-wide { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .col-role { color: var(--text-muted); font-size: 12px; }
+      .col-share { position: relative; height: 6px; background: var(--surface-0); border-radius: 3px; overflow: hidden; }
+      .share-bar { display: block; height: 100%; background: var(--accent-color); border-radius: 3px; }
     `,
   ],
 })
@@ -279,6 +342,21 @@ export class AdminUsageComponent implements OnInit, OnDestroy {
   readonly eventsTotal = computed(() =>
     (this.summary()?.by_category ?? []).reduce((s, r) => s + r.events, 0));
 
+  readonly userRows = computed(() => {
+    const rows = this.usage.breakdown('user')?.rows ?? [];
+    const max = Math.max(1, ...rows.map((r) => r.events));
+    return rows.map((r) => ({
+      label: r.label,
+      role: r.is_admin ? 'Admin' : 'User',
+      prompt: r.units['prompt-token']?.quantity ?? 0,
+      completion: r.units['completion-token']?.quantity ?? 0,
+      compute: (r.units['vcpu-hour']?.quantity ?? 0) + (r.units['gib-hour']?.quantity ?? 0),
+      events: r.events,
+      cost: r.cost_usd,
+      share: r.events / max,
+    }));
+  });
+
   readonly refreshOptions = [
     {label: 'Off', ms: 0}, {label: '10s', ms: 10000},
     {label: '30s', ms: 30000}, {label: '1m', ms: 60000},
@@ -302,6 +380,7 @@ export class AdminUsageComponent implements OnInit, OnDestroy {
     this.usage.loadUsage(d);
     this.api.getJobStatistics().subscribe((s) => this.jobStats.set(s));
     if (this.isAdmin()) this.api.getAgentStatistics().subscribe((s) => this.agentStats.set(s));
+    this.usage.loadBreakdown('user', d);
   }
 
   ngOnDestroy(): void { if (this.timer) clearInterval(this.timer); }
