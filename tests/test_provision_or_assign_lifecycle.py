@@ -57,6 +57,13 @@ def _install_fake_main(monkeypatch, **overrides) -> types.ModuleType:
     fake_provisioner.provision_agent = AsyncMock(return_value="srw-agent-s-new")
     stub.agent_provisioner = fake_provisioner
 
+    # Pre-flight capability-grant check — defaults to "no violations" so the
+    # happy-path tests proceed; the grant-denied test overrides it.
+    stub._session_grant_violations = AsyncMock(return_value=[])
+    stub._grant_violations_detail = (
+        lambda v: "config exceeds your capability grants: " + "; ".join(v)
+    )
+
     for k, v in overrides.items():
         setattr(stub, k, v)
 
@@ -227,6 +234,48 @@ async def test_no_idle_and_provision_fails_emits_failed(monkeypatch):
     assert "failed" in states
     failed_emit = next(c for c in emit_calls if c["state"] == "failed")
     assert "reason" in failed_emit and failed_emit["reason"]
+
+
+@pytest.mark.asyncio
+async def test_grant_denied_fails_fast_without_pool_or_pod(monkeypatch):
+    """A session whose resolved config exceeds the user's capability grants must
+    fail fast: emit provisioning→failed carrying the violation, and attach NO
+    pool agent / spawn NO dedicated pod. Otherwise a doomed pod boots, 403s at
+    the workspace endpoint, exits, and the cockpit polls /connection until its
+    ~5m40s ready timeout.
+    docs/issues/session_permission_mode_grant_denied_ready_timeout.md
+    """
+    fake_main = _install_fake_main(monkeypatch)
+    fake_main.postgres_db.get_thread = AsyncMock(
+        return_value={"id": "t1", "agent_id": None, "user_id": "u1"}
+    )
+    fake_main._session_grant_violations = AsyncMock(
+        return_value=["permission_mode: 'autonomous' exceeds the ceiling"]
+    )
+    # Spy that neither provisioning path is taken.
+    fake_main._find_idle_persistent_agent = AsyncMock(return_value=None)
+
+    emit_calls: list[dict] = []
+    _install_fake_lifecycle_module(monkeypatch, emit_calls)
+
+    from services.provision_or_assign import provision_or_assign
+
+    await provision_or_assign(
+        uid="u1",
+        tid="t1",
+        cfg="persistent_defaults",
+        co={},
+        pids=[],
+        ds_ids=None,
+    )
+
+    states = [c["state"] for c in emit_calls]
+    assert states == ["provisioning", "failed"], states
+    failed = next(c for c in emit_calls if c["state"] == "failed")
+    assert "capability grants" in failed["reason"]
+    assert "autonomous" in failed["reason"]
+    fake_main._find_idle_persistent_agent.assert_not_awaited()
+    fake_main.agent_provisioner.provision_agent.assert_not_awaited()
 
 
 @pytest.mark.asyncio

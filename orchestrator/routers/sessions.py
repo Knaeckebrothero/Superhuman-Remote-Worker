@@ -184,6 +184,28 @@ async def _do_prepare(
             # wait happens after the lock is released so the new pod's
             # /register can acquire it.
             if not thread.get("agent_id"):
+                # Pre-flight the capability grants BEFORE any provisioning work:
+                # a never-startable config (e.g. permission_mode above the user's
+                # ceiling) would otherwise reconcile a workspace and boot a pod
+                # that 403s at the workspace endpoint and exits, leaving the
+                # cockpit to poll /connection until its ~5m40s ready timeout. Fail
+                # fast with the real reason instead.
+                # docs/issues/session_permission_mode_grant_denied_ready_timeout.md
+                from main import (  # type: ignore
+                    _grant_violations_detail,
+                    _session_grant_violations,
+                )
+
+                _violations = await _session_grant_violations(thread)
+                if _violations:
+                    logger.warning(
+                        "Thread %s: prepare denied by capability grants: %s",
+                        thread_id,
+                        "; ".join(_violations),
+                    )
+                    _emit("failed", reason=_grant_violations_detail(_violations))
+                    return
+
                 # Re-provisioning the agent (cold start / reopen): also reconcile
                 # the session workspace. ensure_workspace's drift probe recreates
                 # a 'ready'-but-dead pod (e.g. one destroyed by a cluster
