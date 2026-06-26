@@ -8721,9 +8721,7 @@ class PostgresDB:
         # result is like "UPDATE N"
         return int(result.split()[-1]) if result else 0
 
-    async def claim_pending_notifications(
-        self, user_id: str
-    ) -> List[Dict[str, Any]]:
+    async def claim_pending_notifications(self, user_id: str) -> List[Dict[str, Any]]:
         """Atomically claim a user's undelivered notifications for a digest.
 
         Stamps ``delivered_at = NOW()`` and RETURNs only the rows THIS call
