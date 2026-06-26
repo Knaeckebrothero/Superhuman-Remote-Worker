@@ -7,6 +7,7 @@ tags:
   - cost-control
   - credentials
 related:
+  - "[[usage_dashboard]]"
   - "[[observability_and_quotas]]"
   - "[[saas_billing_and_metering]]"
   - "[[credential_broker]]"
@@ -185,7 +186,9 @@ Implemented as four independently-shippable sub-slices, **all k3d-verified**:
   compute by category/unit over a 7/30/90-day window, G5-scoped. *Verified:* prod build
   compiles the component + route + nav; 3 vitest tests. *(The `usage_daily` rollup + the
   per-day / per-user / per-job breakdowns the doc sketches are deferred — the raw indexed,
-  partition-pruned query is instant at v1 scale.)*
+  partition-pruned query is instant at v1 scale.)* **→ The richer fused dashboard those
+  breakdowns feed (fleet-monitor + per-principal consumption, quantity-first) is designed
+  in [[usage_dashboard]] (2026-06-26).**
 
 > **⚠️ v1 limitation — per-job LLM attribution.** Compute rows carry `ref_id` = job/thread,
 > but LLM rows do **not** (the gateway never sees `job_id` — it's stripped at the wire
