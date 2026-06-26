@@ -63,4 +63,15 @@ describe('AdminUsageComponent refresh shell', () => {
     expect(c.modelRows()[0].prompt).toBe(100);
     expect(c.modelRows()[0].label).toBe('gemma');
   });
+
+  it('dailyBars scales bar height to the busiest day', () => {
+    const c = TestBed.inject(AdminUsageComponent);
+    (c as any).daily.set([
+      {date: '2026-06-24', jobs_created: 0, jobs_completed: 5, jobs_failed: 0, jobs_cancelled: 0},
+      {date: '2026-06-25', jobs_created: 0, jobs_completed: 10, jobs_failed: 0, jobs_cancelled: 0},
+    ]);
+    const bars = c.dailyBars();
+    expect(bars[1].height).toBe(100);
+    expect(bars[0].height).toBe(50);
+  });
 });

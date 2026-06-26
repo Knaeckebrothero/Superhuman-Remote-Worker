@@ -185,6 +185,32 @@ import {AgentStatistics, DailyStatistics, JobStatistics} from '../../../core/mod
             </div>
           </section>
         }
+
+        @if (dailyBars().length > 0) {
+          <section class="admin-section throughput">
+            <h2 class="section-title">Job throughput</h2>
+            <div class="bar-chart">
+              @for (b of dailyBars(); track b.date) {
+                <div class="bar-col">
+                  <div class="bar-fill" [style.height.%]="b.height" [title]="b.date + ': ' + b.completed + ' completed'"></div>
+                  <span class="bar-label">{{ b.date.slice(5) }}</span>
+                </div>
+              }
+            </div>
+          </section>
+        }
+
+        @if (isAdmin() && agentStats()) {
+          <section class="admin-section fleet-status">
+            <h2 class="section-title">Fleet status</h2>
+            <div class="fleet-list">
+              <div class="fleet-item"><span class="fleet-label">In-field</span><span class="fleet-count">{{ agentStats()?.working ?? 0 }}</span></div>
+              <div class="fleet-item"><span class="fleet-label">Idle</span><span class="fleet-count">{{ agentStats()?.ready ?? 0 }}</span></div>
+              <div class="fleet-item"><span class="fleet-label">Standing by</span><span class="fleet-count">{{ agentStats()?.booting ?? 0 }}</span></div>
+              <div class="fleet-item"><span class="fleet-label">Signal lost</span><span class="fleet-count">{{ (agentStats()?.offline ?? 0) + (agentStats()?.failed ?? 0) }}</span></div>
+            </div>
+          </section>
+        }
       </div>
     </div>
   `,
@@ -364,6 +390,58 @@ import {AgentStatistics, DailyStatistics, JobStatistics} from '../../../core/mod
       .share-bar { display: block; height: 100%; background: var(--accent-color); border-radius: 3px; }
       .model-grid { grid-template-columns: 1.6fr 100px 100px 70px 80px; }
       .project-grid { grid-template-columns: 1.6fr 100px 100px 70px 80px; }
+      .bar-chart {
+        display: flex;
+        align-items: flex-end;
+        gap: 4px;
+        height: 120px;
+        padding-top: 8px;
+      }
+      .bar-col {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        height: 100%;
+        justify-content: flex-end;
+        gap: 4px;
+      }
+      .bar-fill {
+        width: 100%;
+        min-height: 2px;
+        background: var(--accent-color);
+        border-radius: 2px 2px 0 0;
+        transition: height 0.2s;
+      }
+      .bar-label {
+        font-size: 10px;
+        color: var(--text-muted);
+        white-space: nowrap;
+      }
+      .fleet-list {
+        display: flex;
+        gap: 16px;
+        flex-wrap: wrap;
+      }
+      .fleet-item {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+        min-width: 80px;
+      }
+      .fleet-label {
+        font-size: 11px;
+        color: var(--text-muted);
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.4px;
+      }
+      .fleet-count {
+        font-size: 20px;
+        font-weight: 700;
+        font-variant-numeric: tabular-nums;
+        color: var(--text-primary);
+      }
     `,
   ],
 })
@@ -391,6 +469,14 @@ export class AdminUsageComponent implements OnInit, OnDestroy {
   readonly computeHours = computed(() => this.qty('vcpu-hour') + this.qty('gib-hour'));
   readonly eventsTotal = computed(() =>
     (this.summary()?.by_category ?? []).reduce((s, r) => s + r.events, 0));
+
+  readonly daily = signal<DailyStatistics[]>([]);
+  readonly dailyBars = computed(() => {
+    const d = this.daily();
+    const max = Math.max(1, ...d.map((x) => x.jobs_completed));
+    return d.map((x) => ({date: x.date, completed: x.jobs_completed,
+      height: (x.jobs_completed / max) * 100}));
+  });
 
   readonly modelRows = computed(() => (this.usage.breakdown('model')?.rows ?? []).map((r) => ({
     label: r.label,
@@ -446,6 +532,7 @@ export class AdminUsageComponent implements OnInit, OnDestroy {
     this.usage.loadBreakdown('user', d);
     this.usage.loadBreakdown('model', d);
     this.usage.loadBreakdown('project', d);
+    this.api.getDailyStatistics(d).subscribe((stats) => this.daily.set(stats));
   }
 
   ngOnDestroy(): void { if (this.timer) clearInterval(this.timer); }
