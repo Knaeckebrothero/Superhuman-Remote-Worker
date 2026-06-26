@@ -13,6 +13,8 @@ tags:
 
 # Cross-pod resume cold-starts: the LangGraph checkpoint is never replicated to shared storage
 
+**Status:** ✅ **RESOLVED 2026-06-26** — fixed via Strategy B (shared Postgres `AsyncPostgresSaver`, flag `CHECKPOINTER_BACKEND`, worker-graph only). Code committed (`0551521d`); cross-pod resume verified live on dev (job `1859e831` killed mid-phase-0 → resumed on a different pod, no cold-start); orchestrator retention (prune-on-terminal, keep-on-non-terminal) deployed (`sha-1afb01b`) + verified live; chart default flipped `sqlite` → `postgres`. Sibling D1+D2 (placeability guard + stale-verification sweeper) shipped in [`preemption_before_first_checkpoint_replays_job_opening.md`](preemption_before_first_checkpoint_replays_job_opening.md). Design, probe results, live verification, and "operating the backend" notes below. Deferred follow-ups (non-blocking): snapshot-system slim-down, orphan-checkpoint sweeper backstop, optional dedicated store via `CHECKPOINT_DB_URL`.
+
 **Filed:** 2026-06-25, discovered while scoping the fix for
 [`preemption_before_first_checkpoint_replays_job_opening.md`](preemption_before_first_checkpoint_replays_job_opening.md).
 That issue documents the *trigger* (parasitic preemption restarting a job's
@@ -239,23 +241,44 @@ Flipped to `postgres` on dev (`deployment/values-experimental.yaml`). Verified l
   **continued** (checkpoints kept growing; no `No phase snapshots found … starting
   fresh`). The exact mid-phase-0 case that used to cold-start now resumes from PG.
 - **Schema auto-create ✅** — the agent's `setup()` created the 4 tables on first job.
-- **Retention partial:** non-terminal (`paused`) correctly *preserved* the rows;
-  the terminal `cancel` ran the hooked `cancel_job` but **no-op'd** — the
-  orchestrator's `CHECKPOINTER_BACKEND` env was empty, so `delete_checkpoint_thread`
-  self-gated to sqlite. Code is correct (unit-verified); this was a **chart-wiring
-  gap** (see below), not a logic bug.
+- **Retention ✅ (verified 2026-06-26, after the wiring fix deployed).** Non-terminal
+  jobs (`paused`/`processing`/`reviewing`) correctly *preserve* their rows. A
+  terminal transition prunes them: cancelling a disposable job (49 checkpoint rows)
+  via the hooked `cancel_job` dropped its rows across all 3 tables to **0**, while
+  the active jobs kept (and grew) theirs. With the deployed orchestrator resolving
+  `CHECKPOINTER_BACKEND=postgres`, `delete_checkpoint_thread` no longer self-gates
+  to sqlite.
 
-**Wiring bug (found + fixed 2026-06-26):** the orchestrator deployment uses
-**explicit `configMapKeyRef` env entries, not `envFrom`**. The D3-3 change added
-`CHECKPOINTER_BACKEND` only to the ConfigMap — *agents* read the whole ConfigMap
-via `envFrom` so they got it, but the *orchestrator* never did (it needs the key
-listed explicitly, like `AUDIT_BACKEND`). So a restart/Reloader would **not** have
-fixed it. Fix: add an explicit `CHECKPOINTER_BACKEND` env entry to
-`helm/templates/orchestrator/deployment.yaml` (mirroring `AUDIT_BACKEND`). Because
-it's a pod-template change, the next deploy rolls the orchestrator with the env set
-— no manual restart needed. Until that deploys, retention stays inert on dev
-(agents write PG checkpoints; the orchestrator never prunes), but cross-pod resume
-(the agent side) already works.
+**Wiring bug (found + fixed + deployed 2026-06-26):** the orchestrator deployment
+uses **explicit `configMapKeyRef` env entries, not `envFrom`**. The initial D3-3
+change added `CHECKPOINTER_BACKEND` only to the ConfigMap — *agents* read the whole
+ConfigMap via `envFrom` so they got it (cross-pod resume worked), but the
+*orchestrator* never did (it needs the key listed explicitly, like `AUDIT_BACKEND`),
+so retention silently no-op'd. A restart/Reloader would **not** have fixed it — the
+key was absent from the pod spec. Fix: an explicit `CHECKPOINTER_BACKEND` env entry
+in `helm/templates/orchestrator/deployment.yaml` (mirroring `AUDIT_BACKEND`).
+Deployed in orchestrator `sha-1afb01b`; in-pod `CHECKPOINTER_BACKEND=postgres`
+confirmed and retention verified live (above).
+
+### Status / operating the backend (2026-06-26)
+
+**Shipped; `checkpointer.backend` chart default flipped `sqlite` → `postgres`** after
+the dev soak. Both the worker agents (LangGraph saver) and the orchestrator
+(retention) now run on shared Postgres by default; persistent/interactive sessions
+are unaffected (no checkpointer — they resume from `thread_messages`).
+
+- **Where it's set:** `checkpointer.backend` in `helm/values.yaml` →
+  `CHECKPOINTER_BACKEND` ConfigMap key (agents inherit via `envFrom`; the
+  orchestrator gets it as an explicit `configMapKeyRef` env). The dev overlay
+  (`deployment/values-experimental.yaml`) also pins `postgres` (now redundant with
+  the default, kept explicit).
+- **Rollback:** set `checkpointer.backend: sqlite` and redeploy — one-line revert to
+  the legacy pod-local store. Cutover caveat both ways: in-flight jobs without a
+  checkpoint in the new backend cold-start **once**, then run on it.
+- **Storage:** bounded to currently-active jobs — the orchestrator prunes a job's
+  rows on terminal (`completed`/`failed`/`cancelled`) and keeps them while
+  non-terminal. Pre-fix terminal jobs may leave orphan rows (none expected post-fix;
+  a backstop orphan-checkpoint sweeper is a deferred follow-up).
 
 ### Fallbacks (only if B proves unviable)
 

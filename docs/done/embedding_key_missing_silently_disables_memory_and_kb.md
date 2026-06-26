@@ -286,7 +286,7 @@ were also silently keyless on the blob path before this fix (same mechanism).
 
 ## Related
 
-- [`preemption_before_first_checkpoint_replays_job_opening.md`](../issues/preemption_before_first_checkpoint_replays_job_opening.md)
+- [`preemption_before_first_checkpoint_replays_job_opening.md`](preemption_before_first_checkpoint_replays_job_opening.md)
   — same loop run (`27cabc53`). Its evidence table notes Run 1 had "KB tools
   absent" + `… > memory > …` instruction hierarchy vs Run 3's "KB tools present"
   + `… > knowledge base > …`. That "KB tools absent / `memory >`" signature is

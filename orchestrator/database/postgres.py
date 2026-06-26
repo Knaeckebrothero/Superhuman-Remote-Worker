@@ -2520,7 +2520,7 @@ class PostgresDB:
         fallback clears a critic whose parent is *stuck* reviewing without
         killing an active one.
 
-        See docs/issues/preemption_before_first_checkpoint_replays_job_opening.md
+        See docs/done/preemption_before_first_checkpoint_replays_job_opening.md
         and critic_failure_leaves_parent_job_stuck_reviewing.md.
 
         Args:

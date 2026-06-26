@@ -144,9 +144,11 @@ virtualWorkspace:
   s3:
     endpoint: "http://minio.minio.svc.cluster.local:9000"
 # -----------------------------------------------------------------------------
-# Checkpointer — shared Postgres so worker jobs resume on any pod (D3 rollout
-# soak). Stores LangGraph state in the app DB, pruned on terminal. Chart default
-# is sqlite. Docs: docs/issues/cross_pod_resume_cold_starts_checkpoint_not_replicated.md
+# Checkpointer — shared Postgres so worker jobs resume on any pod. Stores
+# LangGraph state in the app DB, pruned on terminal. This now matches the chart
+# default (postgres, flipped after the dev soak); kept explicit so the dev
+# overlay documents its own posture.
+# Docs: docs/done/cross_pod_resume_cold_starts_checkpoint_not_replicated.md
 # -----------------------------------------------------------------------------
 checkpointer:
   backend: "postgres"

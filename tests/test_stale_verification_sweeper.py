@@ -4,7 +4,7 @@ Covers the pure tick, the shutdown-aware loop, and the PostgresDB helper's
 wire-level contract (mocked connection — the SQL's runtime behavior is verified
 on the dev cluster, there is no test DB here, matching test_admin_providers_db.py
 and test_postgres_advisory_lock.py). See
-docs/issues/preemption_before_first_checkpoint_replays_job_opening.md.
+docs/done/preemption_before_first_checkpoint_replays_job_opening.md.
 """
 
 from __future__ import annotations
