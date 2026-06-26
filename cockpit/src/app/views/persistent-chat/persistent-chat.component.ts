@@ -46,6 +46,7 @@ import {ToolCardView} from '../../core/models/tool-card.model';
 import {toolCardViewFromEvent} from '../../core/tools/tool-card-adapters';
 import {ApiService, IdeSessionStatus} from '../../core/services/api.service';
 import {ModelService} from '../../core/services/model.service';
+import {CapabilitiesService} from '../../core/services/capabilities.service';
 import {I18nService} from '../../core/services/i18n.service';
 import {FileHandlingService} from '../../core/services/file-handling.service';
 import {ChatPreferencesService, type ChatTextSize, type ReadingWidth} from '../../core/services/chat-preferences.service';
@@ -537,8 +538,8 @@ export function clearDraft(threadId: string | null): void {
                         [value]="chat.permissionMode()"
                         (changed)="onPermissionModeChange($event)">
               <option value="supervised">{{ 'chat.settings.modeSupervised' | transloco }}</option>
-              <option value="auto_accept">{{ 'chat.settings.modeAutoAccept' | transloco }}</option>
-              <option value="autonomous">{{ 'chat.settings.modeAutonomous' | transloco }}</option>
+              <option value="auto_accept" [disabled]="!capabilities.allowsPermissionMode('auto_accept')">{{ 'chat.settings.modeAutoAccept' | transloco }}</option>
+              <option value="autonomous" [disabled]="!capabilities.allowsPermissionMode('autonomous')">{{ 'chat.settings.modeAutonomous' | transloco }}</option>
             </app-select>
           </div>
           <div class="settings-row">
@@ -1518,6 +1519,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     readonly chatWidthValue = computed(() => readingWidthToCss(this.chatPrefs.readingWidth()));
     readonly chatTextSizeValue = computed(() => textSizeToCss(this.chatPrefs.textSize()));
     private readonly deviceCapabilities = inject(DeviceCapabilitiesService);
+    readonly capabilities = inject(CapabilitiesService);
     private readonly voiceRecording = inject(VoiceRecordingService);
     private readonly router = inject(Router);
     private readonly toast = inject(AppToastService);
