@@ -320,7 +320,7 @@ class TestSendPermissionPendingEmail:
         #   permission row (fetchrow)            → permission_row
         #   user row (fetchrow)                  → user_row
         #   generate_magic_link_token x2 (fetchval) → "tok-row-1", "tok-row-2"
-        #   record_notification (execute)        → None
+        #   claim_sent_notification (fetchrow)   → {"id": 1}  (wins the slot)
         db = _make_db()
         db._fake_conn.fetchval = AsyncMock(
             side_effect=[
@@ -331,7 +331,7 @@ class TestSendPermissionPendingEmail:
             ]
         )
         db._fake_conn.fetchrow = AsyncMock(
-            side_effect=[thread_row, permission_row, user_row]
+            side_effect=[thread_row, permission_row, user_row, {"id": 1}]
         )
         db._fake_conn.execute = AsyncMock()
 
@@ -350,8 +350,16 @@ class TestSendPermissionPendingEmail:
         assert send_kwargs["to"] == "user@example.com"
         assert "run_command" in send_kwargs["subject"]
         assert "approve" in send_kwargs["body_html"].lower()
-        # thread_notifications.INSERT happened.
-        assert db._fake_conn.execute.await_count >= 1
+        # The 'sent' slot was claimed BEFORE sending (claim_sent_notification,
+        # INSERT ... RETURNING id via fetchrow — not execute). The claim is the
+        # 4th and final fetchrow on the happy path.
+        assert db._fake_conn.fetchrow.await_count == 4
+        claim_sql = db._fake_conn.fetchrow.await_args.args[0]
+        assert "INSERT INTO thread_notifications" in claim_sql
+        assert "delivery_status = 'sent'" in claim_sql
+        # Claim won → send succeeded → we never downgrade, so execute (only used
+        # by downgrade_sent_claim) stays untouched on the happy path.
+        db._fake_conn.execute.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_skips_when_user_has_no_email(self):
