@@ -240,17 +240,22 @@ Flipped to `postgres` on dev (`deployment/values-experimental.yaml`). Verified l
   fresh`). The exact mid-phase-0 case that used to cold-start now resumes from PG.
 - **Schema auto-create ✅** — the agent's `setup()` created the 4 tables on first job.
 - **Retention partial:** non-terminal (`paused`) correctly *preserved* the rows;
-  the terminal `cancel` ran the hooked `cancel_job` but **no-op'd** — the long-lived
-  **orchestrator pod's `CHECKPOINTER_BACKEND` env was unset** (it predated the
-  ConfigMap key and wasn't restarted; agents got it fresh per job). Code is correct
-  (unit-verified); this is a deploy gap, not a logic bug.
+  the terminal `cancel` ran the hooked `cancel_job` but **no-op'd** — the
+  orchestrator's `CHECKPOINTER_BACKEND` env was empty, so `delete_checkpoint_thread`
+  self-gated to sqlite. Code is correct (unit-verified); this was a **chart-wiring
+  gap** (see below), not a logic bug.
 
-**Rollout caveat:** the flag only takes effect at pod *start*. Worker agents pick
-it up (provisioned per job); the **long-lived orchestrator must be restarted** for
-retention to engage, else it silently no-ops (agents write PG checkpoints, the
-orchestrator never prunes). Add a Stakater Reloader annotation on the orchestrator
-deployment for `srw-config` so ConfigMap flips auto-bounce it; until then,
-`kubectl rollout restart deploy/srw-orchestrator` after the flip.
+**Wiring bug (found + fixed 2026-06-26):** the orchestrator deployment uses
+**explicit `configMapKeyRef` env entries, not `envFrom`**. The D3-3 change added
+`CHECKPOINTER_BACKEND` only to the ConfigMap — *agents* read the whole ConfigMap
+via `envFrom` so they got it, but the *orchestrator* never did (it needs the key
+listed explicitly, like `AUDIT_BACKEND`). So a restart/Reloader would **not** have
+fixed it. Fix: add an explicit `CHECKPOINTER_BACKEND` env entry to
+`helm/templates/orchestrator/deployment.yaml` (mirroring `AUDIT_BACKEND`). Because
+it's a pod-template change, the next deploy rolls the orchestrator with the env set
+— no manual restart needed. Until that deploys, retention stays inert on dev
+(agents write PG checkpoints; the orchestrator never prunes), but cross-pod resume
+(the agent side) already works.
 
 ### Fallbacks (only if B proves unviable)
 
