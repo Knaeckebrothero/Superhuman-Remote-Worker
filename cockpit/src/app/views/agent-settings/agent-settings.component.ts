@@ -70,6 +70,7 @@ type AgentSettingsTab = 'settings' | 'instructions' | 'advanced' | 'resolved';
             [mode]="mode()"
             [disabled]="disabled()"
             [showProjectMemory]="showProjectMemory()"
+            [gatedCapabilities]="gatedCapabilities()"
             (change)="onChange()"
           />
           <app-model-group
@@ -198,6 +199,11 @@ export class AgentSettingsComponent {
   config = input<Record<string, unknown>>({});
   mode = input<SettingsMode>('job');
   disabled = input(false);
+  /** Caller's resolved capability grants for control-greying; null ⇒ no gating
+   * (admin / unrestricted). Forwarded to the execution group so the New-Session
+   * + settings flows hide permission/autonomy options above the user's ceiling,
+   * the same way the expert editor greys an author's controls. */
+  gatedCapabilities = input<Record<string, unknown> | null>(null);
 
   private readonly viewport = inject(ViewportService);
   /**

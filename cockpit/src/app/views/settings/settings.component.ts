@@ -11,6 +11,7 @@ import {
   MainCloudFormState,
 } from '../../core/services/settings.service';
 import {ModelService} from '../../core/services/model.service';
+import {CapabilitiesService} from '../../core/services/capabilities.service';
 import {I18nService, SupportedLang} from '../../core/services/i18n.service';
 import {
     ApiKeyProvider,
@@ -442,14 +443,17 @@ const EXPIRY_OPTIONS = [
               />
             </app-form-field>
             <div class="form-row two-col">
-              <app-form-field [label]="'settings.persistent.permissionMode' | transloco">
+              <app-form-field
+                [label]="'settings.persistent.permissionMode' | transloco"
+                [hint]="capabilities.permissionRestricted() ? ('grants.locked.permission_mode' | transloco) : ''"
+              >
                 <app-select
                   [value]="paPermissionMode() ?? resolved().persistent_agent?.permission_mode ?? ''"
                   (changed)="onPrefChange(paPermissionMode, resolved().persistent_agent?.permission_mode, $event)"
                 >
                   <option value="supervised">{{ 'settings.persistent.permissionSupervised' | transloco }}{{ !paPermissionMode() && resolved().persistent_agent?.permission_mode === 'supervised' ? ' (' + ('common.default' | transloco) + ')' : '' }}</option>
-                  <option value="auto_accept">{{ 'settings.persistent.permissionAutoAccept' | transloco }}{{ !paPermissionMode() && resolved().persistent_agent?.permission_mode === 'auto_accept' ? ' (' + ('common.default' | transloco) + ')' : '' }}</option>
-                  <option value="autonomous">{{ 'settings.persistent.permissionAutonomous' | transloco }}{{ !paPermissionMode() && resolved().persistent_agent?.permission_mode === 'autonomous' ? ' (' + ('common.default' | transloco) + ')' : '' }}</option>
+                  <option value="auto_accept" [disabled]="!capabilities.allowsPermissionMode('auto_accept')">{{ 'settings.persistent.permissionAutoAccept' | transloco }}{{ !paPermissionMode() && resolved().persistent_agent?.permission_mode === 'auto_accept' ? ' (' + ('common.default' | transloco) + ')' : '' }}</option>
+                  <option value="autonomous" [disabled]="!capabilities.allowsPermissionMode('autonomous')">{{ 'settings.persistent.permissionAutonomous' | transloco }}{{ !paPermissionMode() && resolved().persistent_agent?.permission_mode === 'autonomous' ? ' (' + ('common.default' | transloco) + ')' : '' }}</option>
                 </app-select>
               </app-form-field>
               <app-form-field [label]="'settings.persistent.config' | transloco">
@@ -1621,6 +1625,7 @@ export class SettingsComponent implements OnInit {
   readonly userService = inject(UserService);
   readonly settingsService = inject(SettingsService);
   readonly modelService = inject(ModelService);
+  readonly capabilities = inject(CapabilitiesService);
   readonly i18n = inject(I18nService);
   readonly viewMode = inject(ViewModeService);
   private readonly apiService = inject(ApiService);
