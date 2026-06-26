@@ -12426,7 +12426,9 @@ def _fold_breakdown(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
         k = r["key"]
         o = out.setdefault(k, {"key": k, "units": {}, "events": 0, "cost_usd": 0.0})
         o["units"][r["unit"]] = {
-            "quantity": r["quantity"], "cost_usd": r["cost_usd"], "events": r["events"],
+            "quantity": r["quantity"],
+            "cost_usd": r["cost_usd"],
+            "events": r["events"],
         }
         o["events"] += r["events"]
         o["cost_usd"] += r["cost_usd"]
@@ -12444,7 +12446,9 @@ def _merge_labels(
     out: list[dict[str, Any]] = []
     for k, o in folded.items():
         meta = labels.get(k, {})
-        out.append({**o, "label": meta.get("label", k), "is_admin": meta.get("is_admin")})
+        out.append(
+            {**o, "label": meta.get("label", k), "is_admin": meta.get("is_admin")}
+        )
     out.sort(key=lambda r: r["events"], reverse=True)
     return out
 
@@ -12461,7 +12465,8 @@ async def _usage_labels(group_by: str, keys: list[str]) -> dict[str, dict[str, A
     uids = [UUID(k) for k in keys]
     if group_by == "user":
         rows = await postgres_db.fetch(
-            "SELECT id, display_name, is_admin FROM users WHERE id = ANY($1::uuid[])", uids
+            "SELECT id, display_name, is_admin FROM users WHERE id = ANY($1::uuid[])",
+            uids,
         )
         return {
             str(r["id"]): {"label": r["display_name"], "is_admin": r["is_admin"]}
@@ -12545,13 +12550,17 @@ async def get_usage_breakdown(
     try:
         now = datetime.now(timezone.utc)
         to_ts = _parse_utc_date(to_date) if to_date else now
-        from_ts = _parse_utc_date(from_date) if from_date else (to_ts - timedelta(days=days))
+        from_ts = (
+            _parse_utc_date(from_date) if from_date else (to_ts - timedelta(days=days))
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=f"invalid date: {e}") from e
     vis = await _visibility_kwargs_for_stats(user)
     try:
         rows = await usage_ledger.query_grouped(
-            from_ts=from_ts, to_ts=to_ts, group_by=group_by,
+            from_ts=from_ts,
+            to_ts=to_ts,
+            group_by=group_by,
             owner_user_id=vis.get("owner_user_id"),
             visible_project_ids=vis.get("visible_project_ids"),
             scope_project_id=vis.get("scope_project_id"),
