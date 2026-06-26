@@ -57,6 +57,23 @@ image:
   workspace:
     tag: sha-bf50bb0
 # -----------------------------------------------------------------------------
+# Orchestrator HA — M1 leader-election go-live
+# (docs/operations/orchestrator_m1_go_live.md)
+#
+# replicas:2 is correctness-safe as of M1 (leader election + the dual-leader DB
+# claim guards): the ~9 singleton background loops run only on the elected
+# replica (session-scoped Postgres advisory lock 'SRW_LEAD'), and every
+# non-idempotent path has a DB atomic-claim guard for the brief dual-leader
+# window. pdb.minAvailable flips 0 -> 1 so one orchestrator keeps serving
+# through a voluntary disruption while a single-pod node drain is still allowed.
+# The chart default stays replicas:1 (helm/values.yaml); this dev overlay opts
+# dev in first to soak before the default is bumped (Phase 5 / M4).
+# -----------------------------------------------------------------------------
+orchestrator:
+  replicas: 2
+  pdb:
+    minAvailable: 1
+# -----------------------------------------------------------------------------
 # Secrets — External Secrets Operator (Vault-backed)
 # -----------------------------------------------------------------------------
 externalSecrets:
