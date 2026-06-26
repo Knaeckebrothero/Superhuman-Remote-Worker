@@ -12415,6 +12415,64 @@ def _parse_utc_date(s: str) -> datetime:
     )
 
 
+def _fold_breakdown(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Fold flat (key, unit) aggregate rows into one object per key.
+
+    Each key carries a ``units`` map plus key-level ``events``/``cost_usd`` totals.
+    Order-preserving on first appearance of a key.
+    """
+    out: dict[str, dict[str, Any]] = {}
+    for r in rows:
+        k = r["key"]
+        o = out.setdefault(k, {"key": k, "units": {}, "events": 0, "cost_usd": 0.0})
+        o["units"][r["unit"]] = {
+            "quantity": r["quantity"], "cost_usd": r["cost_usd"], "events": r["events"],
+        }
+        o["events"] += r["events"]
+        o["cost_usd"] += r["cost_usd"]
+    return out
+
+
+def _merge_labels(
+    folded: dict[str, dict[str, Any]], labels: dict[str, dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Attach a display label (+ optional is_admin) to each folded key.
+
+    Unknown keys (deleted/aged-out referents — the ledger has no FKs) fall back to
+    the raw key as the label. Sorted by total events desc (the leaderboard order).
+    """
+    out: list[dict[str, Any]] = []
+    for k, o in folded.items():
+        meta = labels.get(k, {})
+        out.append({**o, "label": meta.get("label", k), "is_admin": meta.get("is_admin")})
+    out.sort(key=lambda r: r["events"], reverse=True)
+    return out
+
+
+async def _usage_labels(group_by: str, keys: list[str]) -> dict[str, dict[str, Any]]:
+    """Resolve display labels for breakdown keys via an app-DB lookup (cross-DB).
+
+    user → users.display_name (+ is_admin); project → projects.name; model → none
+    (the key IS the label). Robust to the audit/app DB split — a separate query,
+    merged in Python, NOT a SQL join.
+    """
+    if not keys or group_by == "model":
+        return {}
+    uids = [UUID(k) for k in keys]
+    if group_by == "user":
+        rows = await postgres_db.fetch(
+            "SELECT id, display_name, is_admin FROM users WHERE id = ANY($1::uuid[])", uids
+        )
+        return {
+            str(r["id"]): {"label": r["display_name"], "is_admin": r["is_admin"]}
+            for r in rows
+        }
+    rows = await postgres_db.fetch(
+        "SELECT id, name FROM projects WHERE id = ANY($1::uuid[])", uids
+    )
+    return {str(r["id"]): {"label": r["name"]} for r in rows}
+
+
 @app.get("/api/usage")
 async def get_usage(
     request: Request,
@@ -12463,6 +12521,52 @@ async def get_usage(
     result["from"] = from_ts.isoformat()
     result["to"] = to_ts.isoformat()
     return result
+
+
+@app.get("/api/usage/breakdown")
+async def get_usage_breakdown(
+    request: Request,
+    group_by: str = Query(..., description="user | model | project"),
+    days: int = Query(default=30, ge=1, le=365),
+    from_date: str | None = Query(default=None),
+    to_date: str | None = Query(default=None),
+) -> dict[str, Any]:
+    """Per-(user|model|project) usage breakdown over a window (G5-scoped).
+
+    Quantities by unit + key-level event/cost totals, labels enriched from the app
+    DB. Non-admins are strictly self-scoped (see query_grouped). ``available=false``
+    when the audit tier is off.
+    """
+    user = await require_approved_user(request, postgres_db)
+    if group_by not in ("user", "model", "project"):
+        raise HTTPException(status_code=400, detail=f"bad group_by: {group_by}")
+    if usage_ledger is None or not usage_ledger.is_available:
+        return {"available": False, "group_by": group_by, "rows": []}
+    try:
+        now = datetime.now(timezone.utc)
+        to_ts = _parse_utc_date(to_date) if to_date else now
+        from_ts = _parse_utc_date(from_date) if from_date else (to_ts - timedelta(days=days))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"invalid date: {e}") from e
+    vis = await _visibility_kwargs_for_stats(user)
+    try:
+        rows = await usage_ledger.query_grouped(
+            from_ts=from_ts, to_ts=to_ts, group_by=group_by,
+            owner_user_id=vis.get("owner_user_id"),
+            visible_project_ids=vis.get("visible_project_ids"),
+            scope_project_id=vis.get("scope_project_id"),
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    folded = _fold_breakdown(rows)
+    labels = await _usage_labels(group_by, list(folded.keys()))
+    return {
+        "available": True,
+        "group_by": group_by,
+        "from": from_ts.isoformat(),
+        "to": to_ts.isoformat(),
+        "rows": _merge_labels(folded, labels),
+    }
 
 
 # =============================================================================
