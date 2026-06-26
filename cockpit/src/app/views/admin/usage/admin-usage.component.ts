@@ -119,6 +119,7 @@ import {AgentStatistics, DailyStatistics, JobStatistics} from '../../../core/mod
                 <span class="col-role">Role</span>
                 <span class="col-num">Prompt tok.</span>
                 <span class="col-num">Compl. tok.</span>
+                <span class="col-num">Compute</span>
                 <span class="col-num">Events</span>
                 <span class="col-share">Share</span>
                 <span class="col-num">Cost</span>
@@ -129,6 +130,7 @@ import {AgentStatistics, DailyStatistics, JobStatistics} from '../../../core/mod
                   <span class="col-role">{{ r.role }}</span>
                   <span class="col-num">{{ fmtQty(r.prompt) }}</span>
                   <span class="col-num">{{ fmtQty(r.completion) }}</span>
+                  <span class="col-num">{{ fmtQty(r.compute) }}</span>
                   <span class="col-num">{{ r.events }}</span>
                   <span class="col-share"><span class="share-bar" [style.width.%]="r.share * 100"></span></span>
                   <span class="col-num">{{ r.cost ? fmtCost(r.cost) : '—' }}</span>
@@ -200,7 +202,7 @@ import {AgentStatistics, DailyStatistics, JobStatistics} from '../../../core/mod
           </section>
         }
 
-        @if (isAdmin() && agentStats()) {
+        @if (isAdmin()) {
           <section class="admin-section fleet-status">
             <h2 class="section-title">Fleet status</h2>
             <div class="fleet-list">
@@ -367,7 +369,7 @@ import {AgentStatistics, DailyStatistics, JobStatistics} from '../../../core/mod
       .breakdown-header,
       .breakdown-row {
         display: grid;
-        grid-template-columns: 1.4fr 70px 100px 100px 70px 80px 80px;
+        grid-template-columns: 1.4fr 70px 100px 100px 100px 70px 80px 80px;
         gap: 8px;
         align-items: center;
         padding: 8px 14px;
