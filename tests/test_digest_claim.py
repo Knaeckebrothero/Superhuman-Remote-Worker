@@ -6,6 +6,7 @@ both send the digest email. Claiming the pending set atomically
 (delivered_at NULL → NOW, RETURNING) must let exactly one loop win, so the
 digest is never sent twice. Mirrors tests/test_job_claim.py.
 """
+
 import asyncio
 from uuid import UUID
 

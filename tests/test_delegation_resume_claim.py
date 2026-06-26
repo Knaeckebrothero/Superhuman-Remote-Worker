@@ -7,6 +7,7 @@ dual-leader window two sweepers can both detect the same timeout. The CAS
 must ensure exactly one re-queues the parent, so it is never resumed twice.
 Mirrors tests/test_job_claim.py.
 """
+
 import asyncio
 from uuid import UUID
 

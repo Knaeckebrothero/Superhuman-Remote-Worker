@@ -7,6 +7,7 @@ one wins and routes the reply; the reply is never injected into a job twice.
 Mirrors tests/test_job_claim.py — a real Postgres (testcontainers) with a
 minimal processed_inbound_emails table matching migration 0037.
 """
+
 import asyncio
 
 import pytest

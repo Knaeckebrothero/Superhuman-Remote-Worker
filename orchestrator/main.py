@@ -5394,6 +5394,7 @@ async def lifespan(app: FastAPI):
     # this replica holds it. See services/leader_election.py.
     from database.lock_ids import LEADER_ID
     from services.leader_election import run_as_leader, run_when_leader
+
     leader_task = asyncio.create_task(
         run_as_leader(postgres_db, LEADER_ID, _shutdown_event)
     )
