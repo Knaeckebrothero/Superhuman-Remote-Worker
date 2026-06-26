@@ -48,6 +48,9 @@ export interface PaginationState {
  */
 export interface Expert {
   id: string;
+  /** Slug used to reference the expert by name (e.g. a loop's role_sequence).
+   *  For bundled experts this equals `id`; for DB experts it's the name column. */
+  name?: string;
   display_name: string;
   description: string;
   icon: string;

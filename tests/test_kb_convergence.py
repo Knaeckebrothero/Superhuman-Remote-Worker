@@ -413,3 +413,89 @@ class TestLoopKickoffSplit:
         # Coordination keys stay alongside it.
         assert context["loop_role"] == "scholar"
         assert context["loop_iteration"] == 3
+
+
+# =============================================================================
+# Loop resolves a custom expert NAME in the rotation → expert_id
+# =============================================================================
+
+
+class TestLoopExpertResolution:
+    """create_loop_job resolves a role NAME to a DB expert_id so a custom expert
+    in role_sequence pulls its own overlay (model/prompts/tools), mirroring the
+    automations name-resolution path. Gated on EXPERTS_DB_ENABLED; falls back to
+    the bundled config_name when the flag is off or nothing matches."""
+
+    def _db(self):
+        db = AsyncMock()
+        db.create_job = AsyncMock(return_value={"id": uuid.uuid4()})
+        db.list_project_datasources = AsyncMock(return_value=[])
+        return db
+
+    @pytest.mark.asyncio
+    async def test_resolves_db_expert_name_to_expert_id(self, monkeypatch):
+        monkeypatch.setenv("EXPERTS_DB_ENABLED", "true")
+        from orchestrator.services.project_loops import create_loop_job
+
+        owner = uuid.uuid4()
+        expert_id = uuid.uuid4()
+        db = self._db()
+        # Owner-owned visible expert named "scholar-fast" → pick_expert_by_name
+        # selects it (tier 3) → its UUID is threaded as expert_id.
+        db.list_experts_visible = AsyncMock(
+            return_value=[
+                {
+                    "id": expert_id,
+                    "name": "scholar-fast",
+                    "owner_id": owner,
+                    "is_global": False,
+                    "project_ids": [],
+                    "created_at": "2026-01-01T00:00:00",
+                }
+            ]
+        )
+        loop = {"id": uuid.uuid4(), "project_id": uuid.uuid4(), "owner_id": owner}
+
+        await create_loop_job(db, loop, role="scholar-fast", iteration=1)
+
+        kwargs = db.create_job.call_args.kwargs
+        assert kwargs["expert_id"] == str(expert_id)
+        # NAME stays in config_name (the guard-safe combo); UUID only in expert_id.
+        assert kwargs["config_name"] == "scholar-fast"
+
+    @pytest.mark.asyncio
+    async def test_unknown_role_passes_no_expert_id(self, monkeypatch):
+        monkeypatch.setenv("EXPERTS_DB_ENABLED", "true")
+        from orchestrator.services.project_loops import create_loop_job
+
+        db = self._db()
+        db.list_experts_visible = AsyncMock(return_value=[])  # no DB match
+        loop = {
+            "id": uuid.uuid4(),
+            "project_id": uuid.uuid4(),
+            "owner_id": uuid.uuid4(),
+        }
+
+        await create_loop_job(db, loop, role="developer", iteration=1)
+
+        kwargs = db.create_job.call_args.kwargs
+        assert kwargs["expert_id"] is None
+        assert kwargs["config_name"] == "developer"
+
+    @pytest.mark.asyncio
+    async def test_flag_off_skips_resolution(self, monkeypatch):
+        monkeypatch.delenv("EXPERTS_DB_ENABLED", raising=False)
+        from orchestrator.services.project_loops import create_loop_job
+
+        db = self._db()
+        db.list_experts_visible = AsyncMock(return_value=[])
+        loop = {
+            "id": uuid.uuid4(),
+            "project_id": uuid.uuid4(),
+            "owner_id": uuid.uuid4(),
+        }
+
+        await create_loop_job(db, loop, role="scholar", iteration=1)
+
+        assert db.create_job.call_args.kwargs["expert_id"] is None
+        db.list_experts_visible.assert_not_called()
