@@ -13,7 +13,7 @@ shutdown-aware loop). The DB predicate lives in
 ``PostgresDB.cancel_stale_verification_subjobs``.
 
 See:
-- docs/issues/preemption_before_first_checkpoint_replays_job_opening.md
+- docs/done/preemption_before_first_checkpoint_replays_job_opening.md
 - docs/issues/critic_failure_leaves_parent_job_stuck_reviewing.md (fix item #4)
 """
 

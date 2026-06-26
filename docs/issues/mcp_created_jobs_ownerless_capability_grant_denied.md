@@ -13,7 +13,7 @@ tags:
 # MCP-created jobs are ownerless → denied at dispatch by capability grants
 
 **Filed:** 2026-06-25, found while trying to verify the D3 cross-pod checkpointer
-([`cross_pod_resume_cold_starts_checkpoint_not_replicated.md`](cross_pod_resume_cold_starts_checkpoint_not_replicated.md))
+([`cross_pod_resume_cold_starts_checkpoint_not_replicated.md`](../done/cross_pod_resume_cold_starts_checkpoint_not_replicated.md))
 by creating a worker job through the orchestrator MCP `create_job` tool.
 
 ## Symptom
@@ -134,5 +134,5 @@ product/security call), then plumb it through. Ordered:
 - `docs/done/global_expert_management.md` — the capability-grant design
   (decisions 8, 9, 19, 21–23: deny-by-default, restrict-only, admin bypass,
   0030 grandfather).
-- [`cross_pod_resume_cold_starts_checkpoint_not_replicated.md`](cross_pod_resume_cold_starts_checkpoint_not_replicated.md)
+- [`cross_pod_resume_cold_starts_checkpoint_not_replicated.md`](../done/cross_pod_resume_cold_starts_checkpoint_not_replicated.md)
   — D3, whose live dev verification this blocked (MCP couldn't launch the test job).

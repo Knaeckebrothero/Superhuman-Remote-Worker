@@ -399,13 +399,35 @@ headscale:
 # =============================================================================
 # Databases
 # =============================================================================
-# LangGraph checkpointer backend (sqlite|postgres). "postgres" stores graph
-# state in shared Postgres so a job resumes on any pod (fixes cross-pod
-# cold-starts); "sqlite" is the legacy pod-local checkpoint. Flag-gated rollout —
-# default sqlite. Docs: docs/issues/cross_pod_resume_cold_starts_checkpoint_not_replicated.md
+# LangGraph checkpointer backend for WORKER jobs (persistent/interactive
+# sessions don't use a checkpointer — they resume from thread_messages).
+#
+#   "postgres" (default) — graph state lives in the shared app Postgres, keyed
+#     by thread_id = job_id. Any pod move (preemption, orphan-recovery, pod
+#     eviction, rolling deploy, manual pause→resume) resumes from the actual
+#     interruption point instead of cold-starting from the job opening. This is
+#     the fix for the cross-pod cold-start class of bugs. The agent creates the
+#     LangGraph tables (checkpoints / checkpoint_blobs / checkpoint_writes /
+#     checkpoint_migrations) on first run via setup(); the orchestrator prunes a
+#     job's rows when it reaches a terminal state (completed/failed/cancelled)
+#     and KEEPS them while non-terminal (paused/waiting/pending_review) so those
+#     can resume. Live checkpoint volume is therefore bounded to currently-active
+#     jobs. Requires the orchestrator to receive CHECKPOINTER_BACKEND (wired as
+#     an explicit env in helm/templates/orchestrator/deployment.yaml — it does
+#     NOT read the ConfigMap via envFrom like the agents do), otherwise retention
+#     silently no-ops.
+#
+#   "sqlite" — legacy pod-local checkpoint (/workspace/checkpoints/job_<id>.db).
+#     Lower write traffic to Postgres, but a job that relocates to another pod
+#     cold-starts. Use only if the shared-PG write load proves problematic; it's
+#     the one-line rollback (revert this value, redeploy).
+#
+# Cutover caveat: at the flip, any in-flight job still holding a sqlite-only
+# checkpoint has no PG checkpoint yet, so it cold-starts ONCE, then runs on PG.
+# Docs: docs/done/cross_pod_resume_cold_starts_checkpoint_not_replicated.md
 checkpointer:
-  # -- Worker checkpointer backend: "sqlite" (pod-local, legacy) or "postgres" (shared, cross-pod)
-  backend: "sqlite"
+  # -- Worker checkpointer backend: "postgres" (shared, cross-pod — default) or "sqlite" (pod-local, legacy)
+  backend: "postgres"
 
 databases:
   postgres:

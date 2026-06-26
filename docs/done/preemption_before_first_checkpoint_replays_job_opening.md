@@ -12,6 +12,8 @@ tags:
 
 # Preemption during a job's first phase replays the opening (job "starts over" 2–3×)
 
+**Status:** ✅ **RESOLVED 2026-06-26** — fixed via **D1** (dispatcher placeability guard: only workspace-ready jobs may preempt + skip subjobs whose parent is terminal) + **D2** (stale-verification-subjob sweeper that reaps the orphaned critic subjobs which were parasitically preempting loop jobs). Both committed + k3d-verified. The deeper cross-pod cold-start (D3) — which made the replayed opening cold-start instead of resume — is fixed separately in [`cross_pod_resume_cold_starts_checkpoint_not_replicated.md`](cross_pod_resume_cold_starts_checkpoint_not_replicated.md). Root cause + fix detail below.
+
 **Filed:** 2026-06-24, found on the first real dev-cluster run of the
 project self-improvement loop (`docs/features/project_self_improvement_loop.md`).
 
@@ -105,7 +107,7 @@ gap until the job has finished at least one phase.
   priority-10 paused `critic` jobs piled up 06-17 → 06-23 — orphaned
   verification subjobs that never got reaped. This is the upstream source of the
   preemptors. See
-  [`critic_failure_leaves_parent_job_stuck_reviewing.md`](critic_failure_leaves_parent_job_stuck_reviewing.md).
+  [`critic_failure_leaves_parent_job_stuck_reviewing.md`](../issues/critic_failure_leaves_parent_job_stuck_reviewing.md).
 - **D3 — Cold-restart on early-phase cross-pod resume.** The intersection
   described above (the agent/orchestrator side of the bug). A later code read
   found this is broader than "early-phase": the checkpoint is *never* replicated
@@ -144,7 +146,7 @@ code changes that need a redeploy.
    that fails/cancels `critic` (verification) jobs that are `paused` with no
    agent and whose parent is terminal, or that have been paused+agentless for
    more than N hours. Folds into
-   [`critic_failure_leaves_parent_job_stuck_reviewing.md`](critic_failure_leaves_parent_job_stuck_reviewing.md).
+   [`critic_failure_leaves_parent_job_stuck_reviewing.md`](../issues/critic_failure_leaves_parent_job_stuck_reviewing.md).
    Removing the zombies removes the preemptors.
 3. **D1 — Only let *placeable* jobs preempt.** In the dispatcher
    (`main.py:4033-4063`), a pending job must not preempt unless it would
@@ -211,6 +213,6 @@ wasted compute + latency, not correctness.
 ## Related
 
 - [`cross_pod_resume_cold_starts_checkpoint_not_replicated.md`](cross_pod_resume_cold_starts_checkpoint_not_replicated.md) — the deeper defect under D3: the checkpoint is never replicated to shared storage, so any cross-pod resume cold-starts. The robust fix for this incident's restarts lives there.
-- [`critic_failure_leaves_parent_job_stuck_reviewing.md`](critic_failure_leaves_parent_job_stuck_reviewing.md) — the upstream source of the zombie preemptors.
-- [`lifecycle_session_agents_without_thread_never_drain.md`](lifecycle_session_agents_without_thread_never_drain.md) — sibling lifecycle-reaper gap.
+- [`critic_failure_leaves_parent_job_stuck_reviewing.md`](../issues/critic_failure_leaves_parent_job_stuck_reviewing.md) — the upstream source of the zombie preemptors.
+- [`lifecycle_session_agents_without_thread_never_drain.md`](../issues/lifecycle_session_agents_without_thread_never_drain.md) — sibling lifecycle-reaper gap.
 - `docs/features/project_self_improvement_loop.md` — the feature whose first real run surfaced this.

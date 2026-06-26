@@ -5,7 +5,7 @@ decision logic is unit-testable without standing up the whole dispatcher (which
 is otherwise untested). The dispatcher performs the DB I/O and passes the
 resolved values in.
 
-See docs/issues/preemption_before_first_checkpoint_replays_job_opening.md.
+See docs/done/preemption_before_first_checkpoint_replays_job_opening.md.
 """
 
 from __future__ import annotations
