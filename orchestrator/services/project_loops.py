@@ -40,27 +40,38 @@ def is_loop_execution_role(role: str | None) -> bool:
 # Role-specific task blocks. Keyed by expert config name; unknown roles fall to
 # _ROLE_BLOCK_DEFAULT so the loop stays domain-agnostic (swap `developer` for a
 # `writer` / `default` execution role without code changes). Research-tuned:
-# Scholar generates diverse candidates and does NOT self-filter; Critic verifies
-# at the GOAL level against the Definition of Done (not surface checks) and owns
-# the goal-met stop signal; the executor validates its own work before "done".
+# Scholar self-grounds via research, then generates diverse candidates and does
+# NOT self-filter; Critic verifies at the GOAL level against the Definition of
+# Done (not surface checks) and always selects the next improvement (the loop is
+# unconditional — there is no goal-met stop); the executor validates its own work
+# before "done".
 _ROLE_BLOCKS: dict[str, str] = {
     "scholar": (
-        "Propose several GENUINELY DISTINCT approaches toward the goal — not "
-        "variations on one idea. Check the KB's tried/rejected record first so "
-        "you don't re-propose a dead end. Write each candidate to the KB as a "
-        "`proposal` note with a one-line thesis and why it differs from the "
-        "others. Do NOT self-filter — selecting is the Critic's job. Your output "
-        "is KB `proposal` notes, not repo commits (your working branch is "
+        "FIRST ground yourself: you MUST research the target/competitor system "
+        "and the domain with your research tools (what it actually does, what "
+        "comparable products offer, what users need) and record concrete, named "
+        "findings as durable KB notes so later iterations reuse them instead of "
+        "re-researching. THEN propose several GENUINELY DISTINCT approaches toward "
+        "the goal — not variations on one idea — each anchored in the specifics "
+        "you found, not generic boilerplate. Check the KB's tried/rejected record "
+        "first so you don't re-propose a dead end. Write each candidate to the KB "
+        "as a `plan` note tagged `proposal` (a one-line thesis and why it differs "
+        "from the others). Do NOT self-filter — selecting is the Critic's job. "
+        "Your output is proposal notes, not repo commits (your working branch is "
         "scratch and is never merged into the project)."
     ),
     "critic": (
         "Select and prioritise among the open proposals AGAINST THE DEFINITION "
         "OF DONE — not your own confidence. Verify any claimed progress at the "
         "GOAL level, not surface checks (do not approve merely because code "
-        "compiles or has no leftover TODOs). Write a `verdict` note: the single "
-        "chosen next action, explicit rationale, and how it will be checked. If "
-        "the Definition of Done is genuinely and fully met, state that "
-        "explicitly and why — that is the goal-met stop signal. Do NOT modify "
+        "compiles or has no leftover TODOs). Write a `decision` note tagged "
+        "`verdict`: the single chosen next action, explicit rationale, and how it "
+        "will be checked. Then mark every non-selected proposal `superseded` "
+        "(ranking is NOT rejection — flip their status) so the tried/rejected "
+        "record is real and nobody re-proposes a dead end. The loop is "
+        "UNCONDITIONAL — it does not stop on 'done'; if the system already meets "
+        "the bar in an area, select the next most valuable improvement instead of "
+        "declaring completion. Do NOT modify "
         "the repository — only read, evaluate, and write your verdict to the KB "
         "(your working branch is scratch and is never merged into the project)."
     ),
@@ -110,8 +121,8 @@ def build_loop_kickoff(loop: dict[str, Any], *, role: str, iteration: int) -> st
     )
     criteria = (loop.get("acceptance_criteria") or "").strip() or (
         "(no explicit acceptance criteria — infer reasonable ones from the goal "
-        "and record them in the KB as a `definition_of_done` note for later "
-        "iterations to check against)"
+        "and record them in the KB as a `goal` note tagged `definition_of_done` "
+        "for later iterations to steer by)"
     )
     budget_line = _format_budget(
         loop.get("remaining_iterations"), loop.get("run_until")
@@ -125,7 +136,8 @@ def build_loop_kickoff(loop: dict[str, Any], *, role: str, iteration: int) -> st
         "through the project knowledge base — it is your shared memory with them. "
         "READ IT FIRST; WRITE BACK what matters before you finish.",
         f"PROJECT GOAL:\n{goal}",
-        f"DEFINITION OF DONE (what 'finished' actually means):\n{criteria}",
+        "DEFINITION OF DONE — the quality bar you STEER TOWARD (the loop keeps "
+        f"improving past it; it does not stop when it's 'met'):\n{criteria}",
         f"LOOP STATUS: iteration {iteration}. {budget_line} Do NOT try to finish "
         "the whole goal in one job — make ONE solid, verifiable increment and "
         "hand off through the KB.",
