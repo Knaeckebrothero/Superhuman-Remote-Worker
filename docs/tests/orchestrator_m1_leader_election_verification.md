@@ -3,7 +3,7 @@
 **Feature:** `docs/features/orchestrator_ha_scaling.md` — Milestone M1 / Phase 1 (Track 2 Layer 1).
 **Spec / plan:** `docs/superpowers/plans/2026-06-25-orchestrator-m1-leader-election.md` (research base: `docs/researches/orchestrator_leader_election.md`).
 
-**Status (2026-06-26): Code complete; unit/integration-verified AND two-replica-verified on local k3d. `replicas: 2` is correctness-safe. The k3d run caught and fixed a deploy-blocking bug (see below). The live (dev) cluster run is still PENDING — it wants a quiet window (overnight, no one else mid-test on the cluster).**
+**Status (2026-06-26): Code complete; unit-verified, two-replica-verified on local k3d, AND live-verified on the dev cluster (`main`) under real traffic. `replicas: 2` is correctness-safe and now fails over gracefully. The live run caught + fixed two bugs k3d structurally couldn't (uvicorn graceful-shutdown hang; IMAP log-spam — see "Verified on the live dev cluster" below). Dev is left at `replicas: 2` to soak; the chart default stays `replicas: 1` until the soak completes (Phase 5 / M4).**
 
 > **The k3d run earned its keep:** it caught a real, deploy-blocking bug the unit tests structurally could not — the lifespan leader-election imports used the package-prefixed form (`from orchestrator.services.leader_election …`), which resolves at the repo root (so all 16 unit tests passed) but **not** in the deployed flattened `/app` image, crashing the orchestrator at startup with `ModuleNotFoundError: No module named 'orchestrator'`. Fixed by the `fix(orchestrator): use flattened-image import paths for leader-election wiring (M1)` commit — plain top-level imports matching house convention. This is exactly the runtime-wiring class of bug a two-replica deploy exists to find.
 
@@ -51,17 +51,39 @@ Cluster `k3d-srw` (single node), full SRW stack via Tilt. Set `orchestrator.repl
 
 **Observation (not a defect):** the freshly-booted *replacement* pod tends to win the lock over the warm follower, because its boot time (~18 s, init-containers) lands its first lock attempt right when the old leader's 15 s drain ends — a structural timing alignment, not a bug. Exactly-one-leader holds regardless. Failover speed (~20 s here) is tunable via `preStopDrainSeconds` + the leader poll interval if faster handoff is wanted.
 
-## Still owed — the live (dev) cluster run
+## Verified on the live dev cluster — two replicas (2026-06-26)
 
-The k3d run proves the wiring on a single node. The live multi-node cluster under real traffic is still owed. **Procedure / checklist:** `docs/operations/orchestrator_m1_go_live.md` (the live two-replica validation + the `replicas: 2` flip + rollback).
+Cluster `main` (Rancher, 4 nodes), namespace `superhuman-remote-worker`, under **real traffic** (an active multi-hour job + a working agent). Flipped via Fleet — a top-level `orchestrator: {replicas: 2, pdb: {minAvailable: 1}}` block added to `deployment/values-experimental.yaml` (commit `14e504f6`); Fleet applied it on the existing image within ~1 min (a values-only change triggers no rebuild). The two replicas land on different nodes (pod anti-affinity ✓). Procedure: `docs/operations/orchestrator_m1_go_live.md`.
 
-- **Live (dev) two-replica failover** — a mid-dispatch job ends `paused` then re-dispatched exactly once; the survivor's loops take over; no duplicate emails/replies during the dual-leader window; realistic failover numbers.
-- **Hard-kill path** — k3d here exercised graceful delete (clean unlock). A `--grace-period=0` kill leaves the lock held by the dead Postgres session until TCP-keepalive detection (~40 s with the `10/10/3` tuning) — worth confirming on the live cluster.
+| Check | Result |
+|---|---|
+| **Exactly one leader (live)** | **PASS** — one pod logs `acquired leadership`; `pg_locks` shows exactly one granted advisory lock, key `classid 0x5352575F` ("SRW_") + `objid 0x4C454144` ("LEAD") = `SRW_LEAD`, held by the leader's `client_addr`. |
+| **`run_when_leader` gating (live)** | **PASS** — 7 gated-loop starts on the leader, **0** on the follower. |
+| **Graceful leader kill — correctness** | **PASS** — `locks` stays ≤1 throughout (never two holders); **zero serving blackout** (95/95 health probes `200` on a 1 s poll through the failover); the in-flight job kept processing. |
+| **Hard kill (`--grace-period=0`)** | **PASS** — survivor re-acquired in **~4 s** (a clean RST on a healthy node frees the session lock immediately — *not* the ~40 s keepalive path, which only applies to node/network loss); zero blackout; job survived. |
+| **In-flight job survives failover (§4c)** | **PASS** — job `d82ede69` rode through 3 leader kills + a full image rollout, still `processing` (agent pods are separate; the orchestrator gap is well under the 3-min agent heartbeat). |
+| **PDB protects the last replica (§5)** | **PASS** — evicting the follower (eviction API via `kubectl drain --pod-selector`, **not** a node drain) is allowed, then `disruptionsAllowed` drops 1→0 so the leader is protected; the evicted pod reschedules onto another node; the leader (lock holder) is unaffected. |
 
-### When & prerequisites
+### Two bugs the live run caught (k3d couldn't — it had no long-lived connections at shutdown)
 
-- **When:** overnight / a low-usage window, coordinated so no one is mid-test on the cluster. The test deletes the leader pod.
-- **Prerequisite:** M1 deployed to the target. **M1 is pushed to `origin/develop` (2026-06-26)** — dev picks it up via Fleet GitOps sync; the live run can proceed once dev has rolled the new orchestrator image (confirm the running image carries the leader-election code, e.g. `acquired leadership` appears in a pod log).
+The graceful kill first measured **~66 s** (not k3d's ~20 s) and the dying leader never logged `released leadership`:
+
+- **Bug B — uvicorn graceful shutdown blocked indefinitely.** Its log showed `Shutting down` → `Waiting for connections to close.` and then hung: with no `--timeout-graceful-shutdown`, uvicorn waits forever for open connections (the active agent/SSE stream) to close, so lifespan teardown — and the leader-election `pg_advisory_unlock` in `run_as_leader`'s `finally` — never ran before the 60 s `terminationGracePeriodSeconds` SIGKILL. The lock then freed only via connection-drop. Correctness held throughout (one lock holder, zero blackout), but graceful failover was broken. *Ironically a hard kill (~4 s) was ~16× faster than the broken "graceful" path.*
+- **Bug A — IMAP poller log-spam.** `imap_poll_loop` returns immediately when IMAP is unconfigured, and `run_when_leader` re-invokes a returning loop every `poll_seconds` (1 s), so the leader logged `IMAP poller not started (not configured)` ~once per second.
+
+**Fix** (commit `a60c2efe`, shipped in image `sha-cb1f632`): add `--timeout-graceful-shutdown 10` to the uvicorn CMD in both orchestrator Dockerfiles; park `imap_poll_loop` on `shutdown_event` instead of returning. (CI for `a60c2efe` first failed on a pre-existing stale test, `test_headless_notifications_phase4.py::test_full_send_path`, left stale by the Task-5d claim-before-send reorder and surfaced because this was the first code change to run `test-python` since; fixed in `cb1f632b`.)
+
+### Re-verified on the fixed image (graceful kill)
+
+| Check | Result |
+|---|---|
+| **Graceful step-down restored** | **PASS** — dying leader now logs `Shutting down` → `Waiting for connections to close.` → `Waiting for application shutdown.` → **`leader_election: released leadership`** (~28 s after delete, after the 10 s connection-close cap), then terminates cleanly (no SIGKILL hang). |
+| **Clean handoff** | **PASS** — `locks` 1→0→1; survivor acquired ~33 s after the delete (15 s preStop + 10 s graceful cap + teardown + poll); never two holders; **0/90 health probes non-200**. |
+| **IMAP spam gone** | **PASS** — leader logs the "not configured" line exactly **once** (at acquisition), not 1/sec; `--timeout-graceful-shutdown 10` confirmed in the running pod's uvicorn cmdline. |
+
+**Net:** `replicas: 2` is correctness-safe **and** now fails over gracefully — **~33 s** planned (clean step-down) / **~4 s** unplanned (hard kill), **zero serving blackout** either way. Dev is left at `replicas: 2` to soak.
+
+> **Failover-speed note:** the predicted "~40 s keepalive" path is for **node/network loss** (no clean socket close), not a `kubectl delete --grace-period=0` on a healthy node (clean RST → ~4 s). True keepalive-bounded recovery would need a node kill, out of scope here. A real `kubectl drain` of an orchestrator node is **unsafe on this cluster** (the nodes also host the prod-private orchestrator + the data tier) — see the go-live runbook §5 for the surgical `--pod-selector` alternative used instead.
 
 ## Scope guard
 
