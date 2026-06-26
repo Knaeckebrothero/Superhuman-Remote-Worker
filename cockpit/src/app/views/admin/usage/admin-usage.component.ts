@@ -2,7 +2,9 @@ import {
   ChangeDetectionStrategy,
   Component,
   computed,
+  effect,
   inject,
+  OnDestroy,
   OnInit,
   signal,
 } from '@angular/core';
@@ -46,6 +48,14 @@ import {AdminUsageService} from '../../../core/services/admin-usage.service';
                   {{ d }}d
                 </button>
               }
+              <div class="refresh-control">
+                @for (o of refreshOptions; track o.ms) {
+                  <button type="button" class="filter-chip"
+                    [class.active]="refreshIntervalMs() === o.ms" (click)="setRefresh(o.ms)">
+                    {{ o.label }}
+                  </button>
+                }
+              </div>
             </div>
             <span class="total"
               >Total: {{ fmtCost(summary()?.total_cost_usd ?? 0) }}</span
@@ -197,7 +207,7 @@ import {AdminUsageService} from '../../../core/services/admin-usage.service';
     `,
   ],
 })
-export class AdminUsageComponent implements OnInit {
+export class AdminUsageComponent implements OnInit, OnDestroy {
   protected readonly usage = inject(AdminUsageService);
 
   readonly windows = [7, 30, 90] as const;
@@ -207,13 +217,37 @@ export class AdminUsageComponent implements OnInit {
   readonly rows = computed(() => this.summary()?.by_category ?? []);
   readonly hasData = computed(() => this.rows().length > 0);
 
-  ngOnInit(): void {
+  readonly refreshOptions = [
+    {label: 'Off', ms: 0}, {label: '10s', ms: 10000},
+    {label: '30s', ms: 30000}, {label: '1m', ms: 60000},
+  ] as const;
+  readonly refreshIntervalMs = signal<number>(0);
+  private timer: ReturnType<typeof setInterval> | null = null;
+
+  constructor() {
+    effect(() => {
+      const ms = this.refreshIntervalMs();
+      if (this.timer) { clearInterval(this.timer); this.timer = null; }
+      if (ms > 0) this.timer = setInterval(() => this.reloadAll(), ms);
+    });
+  }
+
+  setRefresh(ms: number): void { this.refreshIntervalMs.set(ms); }
+
+  /** Single funnel every panel's loader goes through (used by auto-refresh + window change). */
+  reloadAll(): void {
     this.usage.loadUsage(this.windowDays());
+  }
+
+  ngOnDestroy(): void { if (this.timer) clearInterval(this.timer); }
+
+  ngOnInit(): void {
+    this.reloadAll();
   }
 
   setWindow(days: number): void {
     this.windowDays.set(days);
-    this.usage.loadUsage(days);
+    this.reloadAll();
   }
 
   fmtQty(n: number): string {
