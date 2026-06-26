@@ -69,6 +69,9 @@ kubectl $CTX uncordon "$NODE"
 
 ## Notes
 
-- Sub-second failover requires `replicas: 2`, which is **not safe until M1**
-  (leader election) — dispatch double-assign + IMAP double-poll. Do not raise
-  `orchestrator.replicas` before M1. See `docs/features/orchestrator_ha_scaling.md`.
+- Sub-second failover (peers stay up, no rolling-restart blackout) requires
+  `replicas: 2`. That is now **correctness-safe** — M1 (leader election) shipped
+  on `origin/develop` and is k3d-verified. To actually turn it on, follow
+  `docs/operations/orchestrator_m1_go_live.md` (the live two-replica validation +
+  the `replicas: 2` flip). The chart still **defaults** to `replicas: 1`; don't
+  raise it via `helm/values.yaml` until that runbook passes on a live cluster.
