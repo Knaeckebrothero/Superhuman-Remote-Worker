@@ -570,20 +570,38 @@ class TestUsageLedger:
             ledger = UsageLedger(pool, UsageRates(None))
             now = datetime.now(timezone.utc)
             ua, ub, pid = uuid4(), uuid4(), uuid4()
+
             def ev(uid, model, qty, unit, sid):
-                return UsageEvent(category="llm", resource=model, quantity=qty,
-                                  unit=unit, source="litellm", source_id=sid, ts=now,
-                                  user_id=str(uid), project_id=str(pid))
-            await ledger.record_events([
-                ev(ua, "gemma", 100, "prompt-token", "a1"),
-                ev(ua, "gemma", 30, "completion-token", "a1"),
-                ev(ub, "opus", 200, "prompt-token", "b1"),
-            ])
-            window = dict(from_ts=now - timedelta(days=1), to_ts=now + timedelta(days=1))
+                return UsageEvent(
+                    category="llm",
+                    resource=model,
+                    quantity=qty,
+                    unit=unit,
+                    source="litellm",
+                    source_id=sid,
+                    ts=now,
+                    user_id=str(uid),
+                    project_id=str(pid),
+                )
+
+            await ledger.record_events(
+                [
+                    ev(ua, "gemma", 100, "prompt-token", "a1"),
+                    ev(ua, "gemma", 30, "completion-token", "a1"),
+                    ev(ub, "opus", 200, "prompt-token", "b1"),
+                ]
+            )
+            window = dict(
+                from_ts=now - timedelta(days=1), to_ts=now + timedelta(days=1)
+            )
             by_user = await ledger.query_grouped(group_by="user", **window)
             keys = {r["key"] for r in by_user}
             assert keys == {str(ua), str(ub)}
-            ua_prompt = next(r for r in by_user if r["key"] == str(ua) and r["unit"] == "prompt-token")
+            ua_prompt = next(
+                r
+                for r in by_user
+                if r["key"] == str(ua) and r["unit"] == "prompt-token"
+            )
             assert ua_prompt["quantity"] == 100.0 and ua_prompt["events"] == 1
             by_model = await ledger.query_grouped(group_by="model", **window)
             assert {r["key"] for r in by_model} == {"gemma", "opus"}
@@ -593,16 +611,31 @@ class TestUsageLedger:
             ledger = UsageLedger(pool, UsageRates(None))
             now = datetime.now(timezone.utc)
             me, other, shared = uuid4(), uuid4(), uuid4()
+
             def ev(uid, sid):
-                return UsageEvent(category="llm", resource="gemma", quantity=10,
-                                  unit="prompt-token", source="litellm", source_id=sid,
-                                  ts=now, user_id=str(uid), project_id=str(shared))
+                return UsageEvent(
+                    category="llm",
+                    resource="gemma",
+                    quantity=10,
+                    unit="prompt-token",
+                    source="litellm",
+                    source_id=sid,
+                    ts=now,
+                    user_id=str(uid),
+                    project_id=str(shared),
+                )
+
             await ledger.record_events([ev(me, "m1"), ev(other, "o1")])
-            window = dict(from_ts=now - timedelta(days=1), to_ts=now + timedelta(days=1))
+            window = dict(
+                from_ts=now - timedelta(days=1), to_ts=now + timedelta(days=1)
+            )
             # Non-admin (owner set) + a shared visible project must STILL only see self.
             rows = await ledger.query_grouped(
-                group_by="user", owner_user_id=str(me),
-                visible_project_ids=[str(shared)], **window)
+                group_by="user",
+                owner_user_id=str(me),
+                visible_project_ids=[str(shared)],
+                **window,
+            )
             assert {r["key"] for r in rows} == {str(me)}
 
     async def test_query_grouped_rejects_bad_dimension(self, pg_dsn):
@@ -610,8 +643,9 @@ class TestUsageLedger:
             ledger = UsageLedger(pool, UsageRates(None))
             now = datetime.now(timezone.utc)
             with pytest.raises(ValueError):
-                await ledger.query_grouped(group_by="evil",
-                    from_ts=now - timedelta(days=1), to_ts=now)
+                await ledger.query_grouped(
+                    group_by="evil", from_ts=now - timedelta(days=1), to_ts=now
+                )
 
     async def test_unavailable_pool_noop(self):
         # No DB needed: a ledger with no audit pool no-ops (non-load-bearing tier).
@@ -807,10 +841,29 @@ class TestBreakdownFold:
 
     def test_fold_groups_units_under_key(self):
         from orchestrator.main import _fold_breakdown
+
         rows = [
-            {"key": "u1", "unit": "prompt-token", "quantity": 100.0, "cost_usd": 0.0, "events": 2},
-            {"key": "u1", "unit": "completion-token", "quantity": 30.0, "cost_usd": 0.0, "events": 2},
-            {"key": "u2", "unit": "prompt-token", "quantity": 50.0, "cost_usd": 0.0, "events": 1},
+            {
+                "key": "u1",
+                "unit": "prompt-token",
+                "quantity": 100.0,
+                "cost_usd": 0.0,
+                "events": 2,
+            },
+            {
+                "key": "u1",
+                "unit": "completion-token",
+                "quantity": 30.0,
+                "cost_usd": 0.0,
+                "events": 2,
+            },
+            {
+                "key": "u2",
+                "unit": "prompt-token",
+                "quantity": 50.0,
+                "cost_usd": 0.0,
+                "events": 1,
+            },
         ]
         folded = _fold_breakdown(rows)
         assert folded["u1"]["units"]["prompt-token"]["quantity"] == 100.0
@@ -819,10 +872,25 @@ class TestBreakdownFold:
 
     def test_merge_labels_falls_back_to_key(self):
         from orchestrator.main import _fold_breakdown, _merge_labels
-        folded = _fold_breakdown([
-            {"key": "u1", "unit": "prompt-token", "quantity": 1.0, "cost_usd": 0.0, "events": 1},
-            {"key": "u2", "unit": "prompt-token", "quantity": 1.0, "cost_usd": 0.0, "events": 1},
-        ])
+
+        folded = _fold_breakdown(
+            [
+                {
+                    "key": "u1",
+                    "unit": "prompt-token",
+                    "quantity": 1.0,
+                    "cost_usd": 0.0,
+                    "events": 1,
+                },
+                {
+                    "key": "u2",
+                    "unit": "prompt-token",
+                    "quantity": 1.0,
+                    "cost_usd": 0.0,
+                    "events": 1,
+                },
+            ]
+        )
         out = _merge_labels(folded, {"u1": {"label": "Alice", "is_admin": True}})
         by_key = {r["key"]: r for r in out}
         assert by_key["u1"]["label"] == "Alice" and by_key["u1"]["is_admin"] is True
