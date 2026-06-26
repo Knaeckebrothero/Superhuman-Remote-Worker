@@ -137,6 +137,54 @@ import {AgentStatistics, DailyStatistics, JobStatistics} from '../../../core/mod
             </div>
           </section>
         }
+
+        @if (modelRows().length > 0) {
+          <section class="admin-section">
+            <h2 class="section-title">By model</h2>
+            <div class="breakdown-table">
+              <div class="breakdown-header model-grid">
+                <span class="col-wide">Model</span>
+                <span class="col-num">Prompt tok.</span>
+                <span class="col-num">Compl. tok.</span>
+                <span class="col-num">Events</span>
+                <span class="col-num">Cost</span>
+              </div>
+              @for (r of modelRows(); track r.label) {
+                <div class="breakdown-row model-grid">
+                  <span class="col-wide mono">{{ r.label }}</span>
+                  <span class="col-num">{{ fmtQty(r.prompt) }}</span>
+                  <span class="col-num">{{ fmtQty(r.completion) }}</span>
+                  <span class="col-num">{{ r.events }}</span>
+                  <span class="col-num">{{ r.cost ? fmtCost(r.cost) : '—' }}</span>
+                </div>
+              }
+            </div>
+          </section>
+        }
+
+        @if (projectRows().length > 0) {
+          <section class="admin-section">
+            <h2 class="section-title">By project</h2>
+            <div class="breakdown-table">
+              <div class="breakdown-header project-grid">
+                <span class="col-wide">Project</span>
+                <span class="col-num">Tokens</span>
+                <span class="col-num">Compute-hrs</span>
+                <span class="col-num">Events</span>
+                <span class="col-num">Cost</span>
+              </div>
+              @for (r of projectRows(); track r.label) {
+                <div class="breakdown-row project-grid">
+                  <span class="col-wide">{{ r.label }}</span>
+                  <span class="col-num">{{ fmtQty(r.tokens) }}</span>
+                  <span class="col-num">{{ fmtQty(r.compute) }}</span>
+                  <span class="col-num">{{ r.events }}</span>
+                  <span class="col-num">{{ r.cost ? fmtCost(r.cost) : '—' }}</span>
+                </div>
+              }
+            </div>
+          </section>
+        }
       </div>
     </div>
   `,
@@ -314,6 +362,8 @@ import {AgentStatistics, DailyStatistics, JobStatistics} from '../../../core/mod
       .col-role { color: var(--text-muted); font-size: 12px; }
       .col-share { position: relative; height: 6px; background: var(--surface-0); border-radius: 3px; overflow: hidden; }
       .share-bar { display: block; height: 100%; background: var(--accent-color); border-radius: 3px; }
+      .model-grid { grid-template-columns: 1.6fr 100px 100px 70px 80px; }
+      .project-grid { grid-template-columns: 1.6fr 100px 100px 70px 80px; }
     `,
   ],
 })
@@ -341,6 +391,19 @@ export class AdminUsageComponent implements OnInit, OnDestroy {
   readonly computeHours = computed(() => this.qty('vcpu-hour') + this.qty('gib-hour'));
   readonly eventsTotal = computed(() =>
     (this.summary()?.by_category ?? []).reduce((s, r) => s + r.events, 0));
+
+  readonly modelRows = computed(() => (this.usage.breakdown('model')?.rows ?? []).map((r) => ({
+    label: r.label,
+    prompt: r.units['prompt-token']?.quantity ?? 0,
+    completion: r.units['completion-token']?.quantity ?? 0,
+    events: r.events, cost: r.cost_usd,
+  })));
+  readonly projectRows = computed(() => (this.usage.breakdown('project')?.rows ?? []).map((r) => ({
+    label: r.label,
+    tokens: (r.units['prompt-token']?.quantity ?? 0) + (r.units['completion-token']?.quantity ?? 0),
+    compute: (r.units['vcpu-hour']?.quantity ?? 0) + (r.units['gib-hour']?.quantity ?? 0),
+    events: r.events, cost: r.cost_usd,
+  })));
 
   readonly userRows = computed(() => {
     const rows = this.usage.breakdown('user')?.rows ?? [];
@@ -381,6 +444,8 @@ export class AdminUsageComponent implements OnInit, OnDestroy {
     this.api.getJobStatistics().subscribe((s) => this.jobStats.set(s));
     if (this.isAdmin()) this.api.getAgentStatistics().subscribe((s) => this.agentStats.set(s));
     this.usage.loadBreakdown('user', d);
+    this.usage.loadBreakdown('model', d);
+    this.usage.loadBreakdown('project', d);
   }
 
   ngOnDestroy(): void { if (this.timer) clearInterval(this.timer); }
