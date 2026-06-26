@@ -40,7 +40,7 @@ def test_catalog_keys_and_defaults():
     assert CATALOG["datasource_tools"]["default"] is True
     assert CATALOG["model_selection"]["default"] is None
     assert CATALOG["autonomy_ceiling"]["default"] == "review"
-    assert CATALOG["permission_mode"]["default"] == "supervised"
+    assert CATALOG["permission_mode"]["default"] == "auto_accept"
 
 
 def test_meet_bool_enum_list():
@@ -60,7 +60,7 @@ def test_lone_user_grant_widens_past_default():
     )
     assert g["shell_tools"] is True
     assert g["vm_workspace"] is False and g["model_selection"] is None
-    assert g["autonomy_ceiling"] == "review" and g["permission_mode"] == "supervised"
+    assert g["autonomy_ceiling"] == "review" and g["permission_mode"] == "auto_accept"
 
 
 def test_project_cap_clamps_user_grant():
@@ -155,10 +155,13 @@ def test_delegation_reads_enabled_not_dict_presence():
 
 
 def test_session_permission_mode_gated():
-    # sessions use interactive.permission_mode, NOT autonomy.
+    # sessions use interactive.permission_mode, NOT autonomy. Default ceiling is
+    # auto_accept (Phase 5): supervised + auto_accept pass without a grant;
+    # autonomous (fully unattended) is gated.
     v = evaluate({"interactive": {"permission_mode": "autonomous"}}, DEFAULTS)
     assert len(v) == 1 and "permission_mode" in v[0]
     assert evaluate({"interactive": {"permission_mode": "supervised"}}, DEFAULTS) == []
+    assert evaluate({"interactive": {"permission_mode": "auto_accept"}}, DEFAULTS) == []
 
 
 def test_model_not_in_selection():

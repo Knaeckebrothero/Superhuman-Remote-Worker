@@ -30,7 +30,14 @@ CATALOG: dict[str, dict[str, Any]] = {
     },
     "permission_mode": {
         "type": "enum",
-        "default": "supervised",
+        # Default ceiling is auto_accept (raised from supervised, 2026-06-26 policy):
+        # every approved user may pick up to auto_accept without a grant — safe
+        # because agents run in isolated sandbox workspaces and shell execution is
+        # separately gated by `shell_tools`. autonomous (fully unattended) still
+        # requires an explicit permission_mode grant. A global-scope grant can
+        # restrict back to supervised if ever needed.
+        # docs/issues/session_permission_mode_grant_denied_ready_timeout.md (Phase 5).
+        "default": "auto_accept",
         "restrict_only": True,
         "order": _PERMISSION_ORDER,
     },
@@ -165,7 +172,7 @@ def evaluate(fragment: dict, grants: dict, *, is_admin: bool = False) -> list[st
         )
     if _enum_exceeds(
         inter.get("permission_mode"),
-        grants.get("permission_mode", "supervised"),
+        grants.get("permission_mode", "auto_accept"),
         _PERMISSION_ORDER,
     ):
         v.append(
