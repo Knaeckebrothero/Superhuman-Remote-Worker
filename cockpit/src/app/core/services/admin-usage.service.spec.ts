@@ -57,4 +57,23 @@ describe('AdminUsageService', () => {
     const params = http.get.mock.calls[0][1].params;
     expect(params.get('days')).toBe('90');
   });
+
+  it('loadBreakdown populates the breakdown signal by groupBy', () => {
+    const payload = {
+      available: true,
+      group_by: 'user',
+      rows: [
+        {key: 'u1', label: 'Alice', is_admin: true, events: 3, cost_usd: 0,
+         units: {'prompt-token': {quantity: 100, cost_usd: 0, events: 2}}},
+      ],
+    };
+    const http = {get: vi.fn().mockReturnValue(of(payload))};
+    const service = createService(http);
+    service.loadBreakdown('user', 30);
+    const [url, options] = http.get.mock.calls[0];
+    expect(url).toContain('/usage/breakdown');
+    expect(options.params.get('group_by')).toBe('user');
+    expect(options.params.get('days')).toBe('30');
+    expect(service.breakdown('user')?.rows[0].label).toBe('Alice');
+  });
 });

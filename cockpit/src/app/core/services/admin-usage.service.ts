@@ -23,6 +23,24 @@ export interface UsageSummary {
 
 const EMPTY: UsageSummary = {by_category: [], total_cost_usd: 0, available: false};
 
+export interface UsageUnitAgg { quantity: number; cost_usd: number; events: number; }
+export interface UsageBreakdownRow {
+  key: string;
+  label: string;
+  is_admin?: boolean | null;
+  events: number;
+  cost_usd: number;
+  units: Record<string, UsageUnitAgg>;
+}
+export interface UsageBreakdown {
+  available: boolean;
+  group_by: 'user' | 'model' | 'project';
+  from?: string;
+  to?: string;
+  rows: UsageBreakdownRow[];
+}
+export type BreakdownDim = 'user' | 'model' | 'project';
+
 /**
  * REST client for the admin Usage view (`GET /api/usage`, Slice 4). Reads the
  * usage_events ledger aggregated by (category, unit), scoped server-side to the
@@ -47,5 +65,26 @@ export class AdminUsageService {
         this.usage.set(res ?? EMPTY);
         this.loading.set(false);
       });
+  }
+
+  private readonly breakdowns = signal<Partial<Record<BreakdownDim, UsageBreakdown>>>({});
+  breakdown(dim: BreakdownDim): UsageBreakdown | null { return this.breakdowns()[dim] ?? null; }
+
+  loadBreakdown(groupBy: BreakdownDim, days = 30): void {
+    const params = new HttpParams().set('group_by', groupBy).set('days', String(days));
+    this.http
+      .get<UsageBreakdown>(`${this.baseUrl}/usage/breakdown`, {params})
+      .pipe(catchError(() => of({available: false, group_by: groupBy, rows: []} as UsageBreakdown)))
+      .subscribe((res) => this.breakdowns.update((m) => ({...m, [groupBy]: res})));
+  }
+
+  /** One-shot windowed fetch (used by the KPI trend's current-vs-previous pair). */
+  loadUsageWindow(days: number, fromIso?: string, toIso?: string) {
+    let params = new HttpParams().set('days', String(days));
+    if (fromIso) params = params.set('from_date', fromIso);
+    if (toIso) params = params.set('to_date', toIso);
+    return this.http
+      .get<UsageSummary>(`${this.baseUrl}/usage`, {params})
+      .pipe(catchError(() => of(EMPTY)));
   }
 }
