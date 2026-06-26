@@ -53,4 +53,14 @@ describe('AdminUsageComponent refresh shell', () => {
     expect(rows[0].share).toBe(1);     // max events
     expect(rows[1].share).toBe(0.5);
   });
+
+  it('modelRows lists per-model token columns', () => {
+    const c = TestBed.inject(AdminUsageComponent);
+    (c as any).usage.breakdown = (dim: string) => dim === 'model' ? ({available: true,
+      group_by: 'model', rows: [{key: 'gemma', label: 'gemma', events: 2, cost_usd: 0,
+      units: {'prompt-token': {quantity: 100, cost_usd: 0, events: 1},
+              'completion-token': {quantity: 20, cost_usd: 0, events: 1}}}]}) : null;
+    expect(c.modelRows()[0].prompt).toBe(100);
+    expect(c.modelRows()[0].label).toBe('gemma');
+  });
 });
