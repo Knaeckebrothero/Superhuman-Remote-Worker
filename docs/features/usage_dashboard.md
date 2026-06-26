@@ -28,7 +28,9 @@ aliases:
 > far richer than that page exposes. This doc designs the dashboard that
 > actually surfaces it.
 
-**Status:** Design approved 2026-06-26. Not yet implemented. v1 scope below;
+**Status:** v1 **implemented & deployed to local k3d** (2026-06-26) — as-built record
+(commits `46040008`…`896fad8d`, tests green, deviations) in the implementation plan
+`docs/superpowers/plans/2026-06-26-usage-dashboard.md`. Not pushed; SDD final review pending. v1 scope below;
 everything uncertain is a named fast-follow, decided **after** seeing the page
 rendered (the user's explicit preference: build a concrete v1, react to how it
 feels, iterate — don't over-spec the panel set upfront).
