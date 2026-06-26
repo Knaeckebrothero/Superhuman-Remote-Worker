@@ -76,4 +76,10 @@ EXPOSE 8085
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
     CMD curl -f http://localhost:${PORT}/api/health || exit 1
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8085"]
+# --timeout-graceful-shutdown caps uvicorn's wait for in-flight connections to
+# close on SIGTERM. Without it uvicorn waits indefinitely ("Waiting for
+# connections to close"); with long-lived agent/SSE connections present, the
+# lifespan shutdown — and with it the M1 leader-election advisory-unlock — never
+# runs before the 60s SIGKILL, so leadership handoff takes the full grace period
+# instead of a clean step-down. 10s leaves ample headroom under the 60s grace.
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8085", "--timeout-graceful-shutdown", "10"]
