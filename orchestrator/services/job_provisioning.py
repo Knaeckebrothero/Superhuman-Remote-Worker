@@ -24,10 +24,82 @@ Pydantic strings.
 
 from __future__ import annotations
 
+import base64
 import logging
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+
+# Job-scoped scratch + framework scaffolding that must never become part of the
+# project artifact on a loop's `main` branch. Safe to ignore everywhere: todos
+# restore from the LangGraph checkpoint (not disk), plan.md/workspace.md are read
+# only for non-blocking curation (FileNotFoundError-tolerant), and archive/ is
+# recovered from phase snapshots — not git. `skills/` (capability bundles
+# materialized into the workspace when SKILLS_DB_ENABLED) and `notes/` are
+# framework/job-scoped, not deliverables — a k3d E2E caught `skills/` leaking
+# onto main. The agent's actual code lives elsewhere (e.g. `repo/`) and is NOT
+# floored. See docs/features/loop_repo_compounding.md.
+_LOOP_MAIN_GITIGNORE = "\n".join(
+    [
+        "# Loop artifact floor — job-scoped scratch never reaches the project.",
+        "workspace.md",
+        "plan.md",
+        "todos.yaml",
+        "archive/",
+        "tools/",
+        "documents/",
+        "reference/",
+        "skills/",
+        "notes/",
+        "instructions.md",
+        "task_brief.md",
+        "output/job_frozen.json",
+        "output/job_completion.json",
+        "repos/",
+        ".env",
+        "*.key",
+        "secrets*",
+        "",
+    ]
+)
+
+
+async def _ensure_loop_main_gitignore(gitea_client: Any, repo_name: str) -> None:
+    """Seed the scratch-floor ``.gitignore`` on a loop repo's ``main`` (idempotent).
+
+    Runs before the first execution job works on ``main`` so its commits exclude
+    job-scoped scratch. Idempotent via a sentinel: if ``.gitignore`` already
+    carries the floor, do nothing. Best-effort — a failure just risks a scratch
+    file reaching ``main`` (cosmetic), never a hard error.
+    """
+    try:
+        existing = await gitea_client.get_file_bytes(
+            repo_name, ".gitignore", ref="main"
+        )
+        if existing is not None and b"todos.yaml" in existing:
+            return  # floor already present
+        if existing is None:
+            content_b64 = base64.b64encode(_LOOP_MAIN_GITIGNORE.encode("utf-8")).decode(
+                "ascii"
+            )
+            await gitea_client.change_files(
+                repo_name,
+                "main",
+                [{"path": ".gitignore", "content_b64": content_b64}],
+                message="Add loop scratch .gitignore floor",
+            )
+        else:
+            # .gitignore exists without the floor (rare — seeding runs before the
+            # workspace ever touches main). change_files is create-only, so leave
+            # it rather than clobber; logged so the gap is visible.
+            logger.warning(
+                "Loop repo %s has a .gitignore without the scratch floor; "
+                "scratch files may reach main",
+                repo_name,
+            )
+    except Exception as e:
+        logger.warning("Failed to seed loop .gitignore floor for %s: %s", repo_name, e)
 
 
 async def provision_job_repo(
@@ -36,6 +108,7 @@ async def provision_job_repo(
     gitea_client: Any,
     postgres_db: Any,
     main_cloud_router: Any,
+    work_on_main: bool = False,
 ) -> dict[str, Any]:
     """Provision a job's Gitea repo/branch, grant creator access, seed baseline.
 
@@ -118,15 +191,25 @@ async def provision_job_repo(
         repos = await postgres_db.get_project_repositories(project_id, role="jobs")
         if repos:
             jobs_repo = repos[0]
-            branch_name = f"job/{short_id}"
-            branch_ok = await gitea_client.create_branch(
-                jobs_repo["name"], branch_name, from_branch="main"
-            )
-            if not branch_ok:
-                logger.error(
-                    f"Failed to create branch '{branch_name}' in "
-                    f"'{jobs_repo['name']}' — main branch may not exist"
+            if work_on_main:
+                # Loop execution job: work directly on the shared repo's `main`
+                # so commits accumulate IN PLACE and the project artifact
+                # compounds across iterations. No per-job branch — the agent's
+                # autonomy=full commit+push lands on `main`. Seed the scratch
+                # `.gitignore` floor first so job-scoped files never reach it.
+                # See docs/features/loop_repo_compounding.md.
+                await _ensure_loop_main_gitignore(gitea_client, jobs_repo["name"])
+                branch_name = "main"
+            else:
+                branch_name = f"job/{short_id}"
+                branch_ok = await gitea_client.create_branch(
+                    jobs_repo["name"], branch_name, from_branch="main"
                 )
+                if not branch_ok:
+                    logger.error(
+                        f"Failed to create branch '{branch_name}' in "
+                        f"'{jobs_repo['name']}' — main branch may not exist"
+                    )
             await postgres_db.merge_job_context(
                 job_id_str,
                 {

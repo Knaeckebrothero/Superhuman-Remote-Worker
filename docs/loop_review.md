@@ -142,8 +142,8 @@ is sound; the *compounding* is not.
 
 ### Structural — the loop can't compound (P1)
 
-- [ ] **F11 (P1) — Iterations do NOT accumulate; every job branches from an
-  empty `main` and is never merged back.** `orchestrator/services/job_provisioning.py:121-124`
+- [x] **F11 (P1) — Iterations do NOT accumulate; every job branches from an
+  empty `main` and is never merged back.** ✅ FIXED + k3d-verified 2026-06-26 (uncommitted on `develop`). `orchestrator/services/job_provisioning.py:121-124`
   hardcodes `create_branch(..., from_branch="main")` for project/loop jobs, and
   nothing ever merges `job/<id>` → `main`. Evidence: the 3 job branches
   (`job/1b099a61`, `job/7a777bb0`, `job/280719ed`) all share merge-base = the
@@ -154,7 +154,15 @@ is sound; the *compounding* is not.
   tip, or merge each completed loop job into `main` in the advance hook. (Subjobs
   already chain correctly via `from_branch = parent.branch_name`; only top-level
   loop jobs are broken.)
-- [ ] **F12 (P1) — The developer role has no KB tools, so the real handoff
+  **→ Fixed (v1, 2026-06-26, unit + k3d-verified):** [`features/loop_repo_compounding.md`](features/loop_repo_compounding.md)
+  — the execution role works directly on `main`; its existing `autonomy=full`
+  commit+push compounds the codebase IN PLACE. Analysis roles stay on throwaway
+  branches; a `.gitignore` floor keeps scratch off `main`. No orchestrator
+  merge/PR — agent-push reuses existing machinery (rejected: orchestrator
+  squash-merge, and subjob-graft snapshots). **k3d E2E confirmed** execution-on-main
+  + in-place compounding + floor; caught + fixed a `skills/` floor leak. Artifact
+  keystone; pairs with the reasoning keystone F13/F22/F23/F24.
+- [x] **F12 (P1) — The developer role has no KB tools, so the real handoff
   channel is git, not the blackboard.** The developer's tool set is 18 tools with
   **no `kb_*`**; it made **0 KB calls** and instead read predecessors via
   `git show origin/job/<id>:notes/…` (it flagged this itself in
@@ -164,7 +172,17 @@ is sound; the *compounding* is not.
   verdict only reached the developer because it was mirrored to both git and KB.
   Fix: grant `kb_*` to the developer capability set (or auto-inject KB tools for
   loop jobs), and choose one canonical handoff channel.
-- [ ] **F13 (P1) — The KB blackboard has no supersede/dedup/contradiction; that
+  **→ Git-channel half addressed in** [`features/loop_repo_compounding.md`](features/loop_repo_compounding.md)
+  (v1: role-scoped channels via provisioning — execution→`main`, analysis→throwaway
+  branch + prompted to use the KB). ✅ **Capability half also FIXED** — a misdiagnosis: every role already inherits
+  all 10 `kb_*` from `config/defaults.yaml`, so there was nothing to grant. The tools
+  were dropped at runtime (`registry.py:518`) when a missing embedding key killed
+  `knowledge_store` init — the embedding-key bug, fixed+committed `00c47f4d`, deployed
+  dev `sha-3c1fa7a`
+  ([`done/embedding_key_missing_silently_disables_memory_and_kb.md`](done/embedding_key_missing_silently_disables_memory_and_kb.md)).
+  Behavioral confirm: the 2026-06-26 k3d loop run hit KB *retrieval* errors
+  (`tsquery stack too small`), not *init* errors → the store came up + tools present.
+- [x] **F13 (P1) — The KB blackboard has no supersede/dedup/contradiction; that
   machinery runs on the *other* store.** `knowledge_index` notes are **100%
   `active`, 0 superseded/archived**; the bi-temporal verdict/MERGE/supersede
   machinery (memory-overhaul Phase 4) fires only on `memories` (RecallStore —
@@ -173,6 +191,18 @@ is sound; the *compounding* is not.
   competes in future searches forever. Fix: route KB writes through the same
   verdict/supersede path, or at least auto-archive superseded meta notes +
   contradiction-check `verdict` notes.
+  **→ ✅ SOLVED 2026-06-26 (v1, uncommitted develop; unit + k3d E2E-verified).** The fix is
+  *not* the store-machinery route above — that framing was refined during design. The real
+  cause: the "curator" is an inline aux pass (`CurateKnowledgeTask`) that only *populates*;
+  the KB never got the *assembler* half its sibling store (`memories`) already has. v1 adds
+  **`AssembleKnowledgeTask`** — a per-cycle, stale-queue-gated convergence pass that
+  supersedes/merges/refreshes/archives notes whose `note_type`-aware **TTL** (`remaining_cycles`,
+  migration `0007`) ran out (decremented once per loop cycle-wrap). **k3d E2E**: converge
+  superseded 4 + refreshed 2 of 6 seeded stale notes → project `superseded` **0 → 4**;
+  TTL-on-write confirmed (`state`→2 / `goal`→3 / `decision`→durable). **Subsumes F22** (the
+  pass owns supersede; no critic action needed) and **de-risks F23** (injection ranks over a
+  converged set). Full design + E2E + deferred follow-ups:
+  [`features/kb_convergence_ttl_reverification.md`](features/kb_convergence_ttl_reverification.md).
 
 ### Cost — where the money actually goes (P1, quantifies F1/F2)
 
@@ -255,7 +285,7 @@ from the empty `main` (cycle-1 code is HTTP 404 to it) and made **zero KB calls*
 
 ### Root causes of non-compounding (P1)
 
-- [ ] **F20 (P1) — KB tools are inconsistently injected across loop jobs.** Same
+- [x] **F20 (P1) — KB tools are inconsistently injected across loop jobs.** Same
   `config_name`, different toolset: the cycle-1 scholar had **45 tools incl. all
   `kb_*`** ("knowledge base" hierarchy); the cycle-2 scholar `85238a88` (35 tools)
   and developer `280719ed` (18 tools) had **no `kb_*`** ("memory" hierarchy) and
@@ -263,23 +293,56 @@ from the empty `main` (cycle-1 code is HTTP 404 to it) and made **zero KB calls*
   can't. (Same intermittency seen in job1's cold-restart runs: 35 then 45.) Fix:
   assert `kb_*` in every loop job's resolved config at dispatch; root-cause why
   iter-4 resolved a different toolset than iter-1.
-- [ ] **F23 (P1) — KB injection is similarity-ranked to the current todo (top-5),
-  with no pinning of decision/proposal/DoD notes.** `graph.py:1132` runs
-  `hybrid_search(query=pending_todos[0].content, match_count=5)`. So compounding
-  works only when the current task is semantically near the note you need: the
-  **developer succeeded by luck** (todo "implement PMS-first slice" matched the
-  verdict note) while **scholar4 failed** (generic "propose approaches" todo doesn't
+  **→ ✅ FIXED (root cause).** The intermittency *was* the embedding-key bug — a blob
+  job that didn't receive `EMBEDDING_API_KEY` failed `knowledge_store` init and dropped
+  every `kb_*` at `registry.py:518`. Fixed+committed `00c47f4d`, deployed dev
+  `sha-3c1fa7a` ([`done/embedding_key_missing_silently_disables_memory_and_kb.md`](done/embedding_key_missing_silently_disables_memory_and_kb.md)).
+  The suggested dispatch-time `kb_*` assertion was NOT added (optional backstop); a
+  clean behavioral re-verify on the next loop run is the remaining confirmation.
+- [~] **F23 (P1, ⏸ DEFERRED — verification pending) — KB injection is similarity-ranked
+  to the current todo (top-5), with no pinning of decision/proposal/DoD notes.**
+  `graph.py:1132` runs `hybrid_search(query=pending_todos[0].content, match_count=5)`.
+  So compounding works only when the current task is semantically near the note you
+  need: the **developer succeeded by luck** (todo "implement PMS-first slice" matched
+  the verdict note) while **scholar4 failed** (generic "propose approaches" todo doesn't
   match the prior *proposal* notes). Coordination is luck correlated with task
-  phrasing, not a guarantee. Fix: for loop jobs always inject the DoD + all open
-  `proposal` notes + the latest `decision` regardless of similarity, then fill the
-  rest with hybrid search.
-- [ ] **F22 (P2) — No tried/rejected ledger is ever written; ranking ≠ rejection.**
+  phrasing, not a guarantee.
+  **⏸ Deferred until the next loop run collects evidence.** The defect is real for an
+  *autonomous* loop — injection is the only coordination channel (no human to say "check
+  the decision"), and similarity delivers *relevance* when the loop needs *state*: a
+  "propose approaches" todo is in the opposite vocabulary from a "decision: X" note, so
+  the load-bearing note gets buried rather than ranked. **But** the priority hinges on an
+  untested assumption — that the agent won't self-serve via manual `kb_search` — and the
+  observed run couldn't test it, because F20 (the embedding-key bug) had stripped the
+  `kb_*` tools entirely. Now that F20 is fixed, re-run and collect: (1) does the agent
+  `kb_search` on its own? (2) does the decision/goal note land in the injected context?
+  If yes to both → drop to P3 (injection is just a prime; the agent self-serves). If it
+  still re-proposes decided work → confirmed P1. Lighter fix than "inject all proposals":
+  a small always-on loop-state header (DoD + latest `decision` + "N proposals / M
+  rejected — `kb_search` to see them"), then similarity fills the rest. Notes already
+  carry `note_type` (`decision`/`goal`/`question`/`state`) + `status`, so pinning is a
+  cheap `WHERE` clause — no schema work.
+- [~] **F22 (P2, ⏸ DEFERRED — verification pending) — No tried/rejected ledger is ever
+  written; ranking ≠ rejection.**
   The critic *ranked* all 5 proposals but recorded the 4 non-selected as "useful but
   narrower," never `rejected`/`superseded` (the KB `superseded` status exists, unused).
   So even a KB-reading agent finds no dead-end list, and the kickoff's "don't
   re-propose tried/rejected" guard has nothing to consult (→ the live repetition
   above). Fix: the critic's selection must mark non-selected proposals `superseded`
   (or write one tried/rejected note).
+  **⏸ Deferred until the next loop run collects evidence.** The F13 convergence pass
+  (`AssembleKnowledgeTask`, shipped 2026-06-26) *claims* to subsume this, but only at the
+  *mechanism* level — it now owns `supersede`, triggered by **TTL expiry / newer-same-type
+  duplicate**, not by the **critic's decision**. The F13 doc's own acceptance criterion #4
+  reads "✅ MET (mechanism) … the specific critic-rejected-proposal flow isn't separately
+  exercised yet." TTL aging does not prevent the *observed* bug: a just-rejected proposal
+  keeps fresh TTL through the immediately-following cycle — exactly when scholar4
+  re-proposed the decided "PMS-first monolith." Re-run and collect: (1) do the non-selected
+  `proposal` notes get superseded/aged before the next scholar proposes? (2) does the next
+  scholar still re-propose already-decided/rejected work? If it still re-proposes →
+  confirmed P2, add a **decision-driven** supersede (critic flips losers at selection, or
+  the convergence pass supersedes any `proposal` older than the `decision` that selected a
+  different one). If not → close as subsumed by F13.
 - [ ] **F24 (P1) — No project-level acceptance vector → the loop can't measure
   convergence.** Each job grades itself against a *self-authored local* DoD: the
   developer's freeze (93%) checks only its own 4 spec ACs ("pytest collected 4,
@@ -357,7 +420,9 @@ from the empty `main` (cycle-1 code is HTTP 404 to it) and made **zero KB calls*
 - These changes affect **future** jobs only, and on the dev cluster need a
   commit + push + CI cycle to go live (unlike k3d/Tilt's live sync) — so they
   won't alter an in-flight run.
-- The full-cycle findings (F11–F19) are **not** all cheap kickoff edits: F11 is in
-  `job_provisioning.py` (branch-from / merge-back), F12 is a capability grant, F13
-  is KB-store routing — these are the structural changes that decide whether the
+- The full-cycle findings (F11–F19) are **not** all cheap kickoff edits: F11 ✅ done (execution-on-`main` in-place compounding, not branch/merge), F12 ✅
+  done (the capability-grant framing was a misdiagnosis — it was the embedding-key
+  bug `00c47f4d`), F13 ✅ done (curator-assembler / TTL re-verification, *not* the
+  KB-store-routing framing — see [`features/kb_convergence_ttl_reverification.md`](features/kb_convergence_ttl_reverification.md))
+  — these are the structural changes that decide whether the
   loop can actually compound, and they outrank the prompt-level fixes.

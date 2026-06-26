@@ -84,6 +84,24 @@ class CurationResult(BaseModel):
     summary: str = Field(description="Brief summary of what was curated")
 
 
+class KnowledgeAssemblyResult(BaseModel):
+    """Structured output for knowledge assembly / convergence (agent mode)."""
+
+    notes_refreshed: int = Field(
+        description="Stale notes confirmed still valid (kept as-is)"
+    )
+    notes_superseded: int = Field(
+        description="Stale notes retired because a newer note replaces them"
+    )
+    notes_merged: int = Field(
+        description="Duplicate/overlapping notes consolidated into one"
+    )
+    notes_archived: int = Field(
+        description="Stale notes retired because they are no longer relevant"
+    )
+    summary: str = Field(description="Brief summary of what was converged")
+
+
 class AssemblyAction(BaseModel):
     """A single TTL adjustment made by the assembler."""
 
@@ -467,6 +485,65 @@ class CurateKnowledgeTask(AuxAgentTask):
         return self._kb_tools
 
 
+class AssembleKnowledgeTask(AuxAgentTask):
+    """Re-verify stale knowledge notes and converge the KB.
+
+    Agent-mode counterpart to CurateKnowledgeTask (which only *populates*). Given
+    the stale queue — notes whose cycle TTL ran out — decide per note: keep it
+    (still valid), supersede it (a newer note replaces it), merge it (duplicate
+    of another), or archive it (no longer relevant). Convergence is applied via
+    kb_update (status=superseded/archived, or merge-then-supersede); the runner
+    resets the TTL of the survivors afterwards. Uses kb_search/kb_read/kb_update.
+
+    See docs/features/kb_convergence_ttl_reverification.md.
+    """
+
+    def __init__(
+        self,
+        stale_notes: List[str],
+        related_notes: List[str],
+        kb_tools: list,
+        prompt: str,
+    ):
+        self.stale_notes = stale_notes
+        self.related_notes = related_notes
+        self._kb_tools = kb_tools
+        self._prompt = prompt
+
+    @property
+    def system_prompt(self) -> str:
+        return self._prompt
+
+    def build_context(self) -> str:
+        parts = [
+            "## Stale notes to re-verify",
+            "Each note below has a TTL that ran out. For EACH, take exactly one "
+            "action with kb_update: keep it (still accurate — do nothing), "
+            "supersede it (a newer note replaces it → status=superseded), merge "
+            "it (duplicate/overlap → fold into one note, supersede the rest), or "
+            "archive it (no longer relevant → status=archived). Do NOT touch "
+            "notes that are not listed here.",
+            "",
+            "\n".join(self.stale_notes) if self.stale_notes else "(none)",
+        ]
+        if self.related_notes:
+            parts.extend(
+                [
+                    "",
+                    "## Other active notes (context for dedup / supersede decisions)",
+                    "\n".join(self.related_notes),
+                ]
+            )
+        return "\n".join(parts)
+
+    @property
+    def output_schema(self) -> Type[BaseModel]:
+        return KnowledgeAssemblyResult
+
+    def get_tools(self) -> list:
+        return self._kb_tools
+
+
 class AssembleMemoriesTask(AuxAgentTask):
     """Review recent conversation and curate memory TTLs.
 
@@ -526,6 +603,7 @@ _TASK_CALL_TYPES = {
     "ExtractMemoriesTask": "memory_extraction",
     "AssembleMemoriesTask": "memory_assembly",
     "CurateKnowledgeTask": "knowledge_curation",
+    "AssembleKnowledgeTask": "knowledge_assembly",
     "VerifyCitationTask": "citation_verification",
 }
 
@@ -1276,6 +1354,104 @@ async def curate_and_store_knowledge(
         auxiliary_llm.health.record_failure("knowledge_curation", e)
         logger.warning(
             "Inline curation failed (non-fatal): %s: %s", type(e).__name__, e
+        )
+        return None
+
+
+async def assemble_and_converge_knowledge(
+    auxiliary_llm: "AuxiliaryLLM",
+    tool_context: Any,
+    knowledge_assembler_prompt: str,
+    current_cycle: Optional[int] = None,
+) -> Optional["KnowledgeAssemblyResult"]:
+    """Re-verify the KB stale queue and converge it (KB convergence, F13).
+
+    Counterpart to :func:`curate_and_store_knowledge`: while curation POPULATES
+    the KB, this pass CONVERGES it — re-verifying notes whose cycle TTL ran out
+    and superseding / merging / archiving the dead ones via kb_update. **Gated on
+    a non-empty stale queue**: if nothing expired this returns immediately with no
+    aux-LLM call. Survivors (stale notes the agent left ``active``) have their TTL
+    reset by the store afterwards, so the queue drains.
+
+    See docs/features/kb_convergence_ttl_reverification.md.
+
+    Args:
+        auxiliary_llm: AuxiliaryLLM instance
+        tool_context: ToolContext with knowledge_graph and knowledge_store
+        knowledge_assembler_prompt: System prompt for the convergence pass
+        current_cycle: Loop cycle number (total_jobs_run), stamped on survivors
+
+    Returns:
+        KnowledgeAssemblyResult on success, None if KB unavailable or queue empty
+    """
+    try:
+        ks = tool_context.knowledge_store
+        kg = tool_context.knowledge_graph
+        project_id = tool_context.project_id
+
+        if not ks or not kg or not project_id:
+            return None
+
+        import uuid as _uuid
+
+        project_uuid = (
+            _uuid.UUID(project_id) if isinstance(project_id, str) else project_id
+        )
+
+        # Gate: only run when something actually expired (no LLM call otherwise).
+        stale = await ks.get_stale_notes(project_uuid)
+        if not stale:
+            return None
+
+        stale_lines = [
+            f"- {n.note_id} [{n.note_type}] {n.title}: {(n.content or '')[:300]}"
+            for n in stale
+        ]
+
+        # Other active notes give the agent context for dedup / supersede calls.
+        related_lines: List[str] = []
+        try:
+            stale_ids = {n.note_id for n in stale}
+            notes = kg.list_notes(project_id=project_id, limit=50)
+            related_lines = [
+                f"- {nn.get('id', '?')}: {nn.get('title', '?')} ({nn.get('type', '?')})"
+                for nn in notes
+                if nn.get("id") not in stale_ids
+            ]
+        except Exception as e:
+            logger.debug(f"Could not fetch related notes for assembly: {e}")
+
+        from src.tools.knowledge.knowledge_tools import create_kb_tools
+
+        kb_tools = create_kb_tools(tool_context)
+
+        task = AssembleKnowledgeTask(
+            stale_notes=stale_lines,
+            related_notes=related_lines,
+            kb_tools=kb_tools,
+            prompt=knowledge_assembler_prompt,
+        )
+
+        result = await auxiliary_llm.agent(task)
+
+        # Deterministic TTL bookkeeping: any stale note STILL active survived
+        # re-verification → reset its TTL. refresh_ttl's status filter skips the
+        # ones the agent superseded / archived, so the queue drains either way.
+        refreshed = await ks.refresh_ttl(
+            project_uuid, stale, current_cycle=current_cycle
+        )
+
+        logger.info(
+            f"Knowledge assembly: {len(stale)} stale re-verified, "
+            f"{refreshed} refreshed — {result.summary}"
+        )
+        auxiliary_llm.health.record_success("knowledge_assembly")
+        return result
+
+    except Exception as e:
+        auxiliary_llm.health.record_failure("knowledge_assembly", e)
+        logger.warning(
+            "Knowledge assembly failed (non-fatal): %s: %s", type(e).__name__, e
         )
         return None
 
