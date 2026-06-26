@@ -18,6 +18,7 @@ Design: docs/features/project_self_improvement_loop.md.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -247,14 +248,41 @@ async def create_loop_job(
         "kickoff_message": kickoff,
     }
 
+    # Resolve the role NAME to a DB expert_id when DB-backed experts are on, so a
+    # custom expert in the rotation pulls its OWN overlay (model, prompts, tools)
+    # rather than just a bundled disk config. Mirrors the automations
+    # name-resolution path (services/automations.py); falls through to the
+    # bundled config_name when nothing matches or the flag is off. The NAME stays
+    # in config_name and the UUID only ever goes in expert_id — the guard-safe
+    # combo (services/agent_provisioner.py rejects a UUID in config_name).
+    expert_id: str | None = None
+    owner_id = str(loop["owner_id"]) if loop.get("owner_id") else None
+    if os.getenv("EXPERTS_DB_ENABLED", "").lower().strip() in ("true", "1", "yes"):
+        from src.core.expert_resolution import pick_expert_by_name
+
+        pids = [project_id] if project_id else []
+        try:
+            candidates = await db.list_experts_visible(
+                user_id=owner_id, project_ids=pids
+            )
+            matches = [c for c in candidates if c.get("name") == role]
+            winner = pick_expert_by_name(matches, owner_id, set(pids))
+            if winner:
+                expert_id = str(winner["id"])
+        except Exception as e:
+            logger.warning(
+                "loop %s: expert resolution for role %s failed: %s", loop_id, role, e
+            )
+
     job = await db.create_job(
         description=description,
         config_name=role,
         config_override=config_override,
         context=context,
-        user_id=str(loop["owner_id"]) if loop.get("owner_id") else None,
+        user_id=owner_id,
         project_id=project_id,
         priority=5,
+        expert_id=expert_id,
     )
     job_id = str(job["id"])
 
