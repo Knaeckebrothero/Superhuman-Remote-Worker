@@ -300,6 +300,7 @@ async def test_do_prepare_waits_when_agent_pod_marker_in_flight(monkeypatch):
     fake_main.session_router = AsyncMock()
     fake_main.session_router.ensure_route = AsyncMock(return_value="/p/t1")
     fake_main.ensure_session_workspace = AsyncMock(return_value=None)
+    fake_main._session_grant_violations = AsyncMock(return_value=[])
     monkeypatch.setitem(sys.modules, "main", fake_main)
 
     emit_calls: list[dict] = []
@@ -385,6 +386,7 @@ async def test_do_prepare_reconciles_workspace_on_cold_start(monkeypatch):
     fake_main.session_router = AsyncMock()
     fake_main.session_router.ensure_route = AsyncMock(return_value="/p/t1")
     fake_main.ensure_session_workspace = AsyncMock(return_value=None)
+    fake_main._session_grant_violations = AsyncMock(return_value=[])
     monkeypatch.setitem(sys.modules, "main", fake_main)
 
     monkeypatch.setattr(
@@ -400,6 +402,71 @@ async def test_do_prepare_reconciles_workspace_on_cold_start(monkeypatch):
 
     fake_main.ensure_session_workspace.assert_called_once()
     assert fake_main.ensure_session_workspace.call_args.args[0] == "t1"
+
+
+@pytest.mark.asyncio
+async def test_do_prepare_grant_denied_fails_fast_without_provisioning(monkeypatch):
+    """An unbound session whose resolved config exceeds the user's capability
+    grants fails fast: emit provisioning→failed with the violation, and kick off
+    NEITHER workspace reconciliation NOR agent provisioning. Prevents the doomed
+    pod that 403s at the workspace endpoint and the cockpit's ~5m40s timeout.
+    docs/issues/session_permission_mode_grant_denied_ready_timeout.md
+    """
+    from orchestrator.routers import sessions as sessions_mod
+
+    db = AsyncMock()
+    db.get_thread.return_value = {
+        "id": "t1",
+        "user_id": "u1",
+        "agent_id": None,
+        "config_name": "persistent_defaults",
+        "metadata": {},
+    }
+    lock_cm = AsyncMock()
+    lock_cm.__aenter__.return_value = None
+    lock_cm.__aexit__.return_value = False
+    db.thread_advisory_lock = MagicMock(return_value=lock_cm)
+    monkeypatch.setattr(sessions_mod, "_get_db", lambda: db, raising=False)
+
+    provision = AsyncMock()
+    monkeypatch.setattr(
+        sessions_mod, "_provision_agent_for_thread", provision, raising=True
+    )
+
+    import sys
+
+    fake_main = MagicMock()
+    fake_main._session_grant_violations = AsyncMock(
+        return_value=["permission_mode: 'autonomous' exceeds the ceiling"]
+    )
+    fake_main._grant_violations_detail = (
+        lambda v: "config exceeds your capability grants: " + "; ".join(v)
+    )
+    fake_main.ensure_session_workspace = AsyncMock(return_value=None)
+    monkeypatch.setitem(sys.modules, "main", fake_main)
+
+    emit_calls: list[dict] = []
+
+    def _capture_emit(user_id, thread_id, state, **extra):
+        emit_calls.append(
+            {"user_id": user_id, "thread_id": thread_id, "state": state, **extra}
+        )
+
+    monkeypatch.setattr(sessions_mod, "lifecycle_emit", _capture_emit, raising=True)
+
+    await sessions_mod._do_prepare(
+        thread_id="t1",
+        user_id="u1",
+        config_name="persistent_defaults",
+        config_override=None,
+    )
+
+    states = [c["state"] for c in emit_calls]
+    assert states == ["provisioning", "failed"], states
+    failed = next(c for c in emit_calls if c["state"] == "failed")
+    assert "capability grants" in failed["reason"]
+    provision.assert_not_awaited()
+    fake_main.ensure_session_workspace.assert_not_called()
 
 
 # --------------------------------------------------------------------------- #

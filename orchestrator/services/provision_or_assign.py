@@ -50,7 +50,9 @@ async def provision_or_assign(
         _build_datasource_tool_override,
         _build_datasources_payload,
         _find_idle_persistent_agent,
+        _grant_violations_detail,
         _send_session_attach,
+        _session_grant_violations,
         agent_provisioner,
         postgres_db,
     )
@@ -90,6 +92,27 @@ async def provision_or_assign(
                 )
                 needs_binding_wait = True
             else:
+                # Pre-flight the capability grants BEFORE pool-attach or pod
+                # spawn: a never-startable config (e.g. permission_mode above the
+                # user's ceiling) would otherwise boot a dedicated pod that 403s
+                # at the workspace endpoint and exits, leaving the cockpit to poll
+                # /connection until its ~5m40s ready timeout. Fail fast with the
+                # real reason instead.
+                # docs/issues/session_permission_mode_grant_denied_ready_timeout.md
+                violations = await _session_grant_violations(cur)
+                if violations:
+                    logger.warning(
+                        "Thread %s: provisioning denied by capability grants: %s",
+                        tid,
+                        "; ".join(violations),
+                    )
+                    lifecycle_emit(
+                        uid,
+                        tid,
+                        "failed",
+                        reason=_grant_violations_detail(violations),
+                    )
+                    return
                 # Try to attach an idle dual-mode agent from the warm pool
                 # first — this is instant (no image pull or pod boot needed).
                 # _send_session_attach writes threads.agent_id via the
