@@ -37,4 +37,20 @@ describe('AdminUsageComponent refresh shell', () => {
     expect(c.tokensTotal()).toBe(125);
     expect(c.computeHours()).toBe(2);
   });
+
+  it('userRows derives role and per-unit columns with a share fraction', () => {
+    const c = TestBed.inject(AdminUsageComponent);
+    (c as any).usage.breakdown = () => ({available: true, group_by: 'user', rows: [
+      {key: 'u1', label: 'Alice', is_admin: true, events: 4, cost_usd: 0, units: {
+        'prompt-token': {quantity: 100, cost_usd: 0, events: 2},
+        'completion-token': {quantity: 30, cost_usd: 0, events: 2}}},
+      {key: 'u2', label: 'Bob', is_admin: false, events: 2, cost_usd: 0, units: {
+        'vcpu-hour': {quantity: 1.5, cost_usd: 0, events: 2}}},
+    ]});
+    const rows = c.userRows();
+    expect(rows[0].role).toBe('Admin');
+    expect(rows[0].prompt).toBe(100);
+    expect(rows[0].share).toBe(1);     // max events
+    expect(rows[1].share).toBe(0.5);
+  });
 });
