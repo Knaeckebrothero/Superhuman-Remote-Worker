@@ -999,6 +999,10 @@ async def imap_poll_loop(shutdown_event: asyncio.Event) -> None:
     """
     if not imap_poller.is_available:
         logger.info("IMAP poller not started (not configured)")
+        # Park until shutdown instead of returning: run_when_leader re-invokes a
+        # loop coroutine that returns (recreating the task every poll_seconds),
+        # so a bare return here re-logs this line ~once per second on the leader.
+        await shutdown_event.wait()
         return
 
     logger.info("IMAP poller started (interval=%ds)", imap_poller.poll_interval)
