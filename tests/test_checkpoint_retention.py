@@ -4,7 +4,7 @@
 gated on ``CHECKPOINTER_BACKEND=postgres``; ``update_job_status`` triggers it on
 terminal status only. Mocked connection (no real DB), mirroring
 tests/test_admin_providers_db.py. See
-docs/issues/cross_pod_resume_cold_starts_checkpoint_not_replicated.md.
+docs/done/cross_pod_resume_cold_starts_checkpoint_not_replicated.md.
 """
 
 from __future__ import annotations

@@ -3,7 +3,7 @@
 Covers the pure predicate ``preemption_blocked_reason``. The dispatcher itself
 (``_try_dispatch_pending_jobs`` in orchestrator/main.py) is untested, so the
 decision logic is extracted here to be verified in isolation. See
-docs/issues/preemption_before_first_checkpoint_replays_job_opening.md.
+docs/done/preemption_before_first_checkpoint_replays_job_opening.md.
 """
 
 from __future__ import annotations

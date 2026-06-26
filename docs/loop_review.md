@@ -114,7 +114,7 @@ Severity: **P1** = cost/correctness-impacting · **P2** = output quality ·
   priority job preempted the scholar during its first phase (before any checkpoint
   snapshot), so each cross-pod resume cold-restarted from `init_workspace`,
   re-running the kickoff and early KB writes. **Filed:**
-  [`issues/preemption_before_first_checkpoint_replays_job_opening.md`](issues/preemption_before_first_checkpoint_replays_job_opening.md).
+  [`done/preemption_before_first_checkpoint_replays_job_opening.md`](done/preemption_before_first_checkpoint_replays_job_opening.md).
 
 ### Feature gaps
 
@@ -226,7 +226,7 @@ preemptor fleet is **~10–11 stale priority-10 paused `critic` zombies** (06-17
 06-23); only the oldest (`e92fcfcc`) fired in this window. Both loop jobs still
 completed legitimately (confidence 0.88 / 0.95) — F8 wastes compute + latency,
 not correctness. Captured in
-[`issues/preemption_before_first_checkpoint_replays_job_opening.md`](issues/preemption_before_first_checkpoint_replays_job_opening.md).
+[`done/preemption_before_first_checkpoint_replays_job_opening.md`](done/preemption_before_first_checkpoint_replays_job_opening.md).
 
 ### Verified healthy (no action)
 Advance machinery is exactly-once and race-safe (`claim_project_loop_advance`

@@ -5455,7 +5455,7 @@ async def lifespan(app: FastAPI):
     )
     # Reap orphaned verification (critic) subjobs that would otherwise linger as
     # priority-10 dispatchable jobs and parasitically preempt real work. See
-    # docs/issues/preemption_before_first_checkpoint_replays_job_opening.md.
+    # docs/done/preemption_before_first_checkpoint_replays_job_opening.md.
     stale_verification_sweeper_task = asyncio.create_task(
         stale_verification_sweeper_loop(postgres_db, _shutdown_event)
     )

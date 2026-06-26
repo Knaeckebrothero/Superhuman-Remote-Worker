@@ -3,7 +3,7 @@
 Covers the pure env-driven helpers in ``src/utils/db_url.py`` that select the
 LangGraph checkpointer backend and resolve the Postgres checkpoint DSN — no DB or
 langgraph import needed. See
-docs/issues/cross_pod_resume_cold_starts_checkpoint_not_replicated.md.
+docs/done/cross_pod_resume_cold_starts_checkpoint_not_replicated.md.
 """
 
 from __future__ import annotations
