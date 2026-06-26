@@ -145,16 +145,32 @@ Set up the three in-flight conditions from `orchestrator_failover.md` §Chaos te
 
 ---
 
-## 5. M0 node-drain test (still owed — now at `replicas: 2`)
+## 5. PDB test — surgical, **NOT** a full node drain
 
-Run the drain test from `orchestrator_failover.md` §Drain test, now with two replicas:
+> **Do NOT `kubectl drain` a whole node on a packed cluster.** On the homelab the
+> orchestrator nodes also host the **production** orchestrator (`srw-prod-private`),
+> the data tier (`srw-postgres`/`pgvector`/`auditdb`), `nats`, the LLM inference
+> pods, and the Cloudflare tunnel — a full drain evicts *all* of them (homelab-wide
+> outage). The PDB only needs a single-pod eviction to verify, so evict **only the
+> follower** orchestrator pod and watch the budget close.
+
 ```bash
-NODE=$(kubectl $CTX -n $NS get pod $SEL -o jsonpath='{.items[0].spec.nodeName}')
-kubectl $CTX cordon "$NODE"
-kubectl $CTX drain "$NODE" --ignore-daemonsets --delete-emptydir-data --timeout=10m
-kubectl $CTX uncordon "$NODE"
+# Follower = the pod whose log has NO "acquired leadership".
+FNODE=$(kubectl $CTX -n $NS get pod <follower> -o jsonpath='{.spec.nodeName}')
+# --pod-selector evicts ONLY the orchestrator pod off that node (not its neighbours);
+# uncordon immediately so the brief cordon can't strand a critical neighbour.
+kubectl $CTX drain "$FNODE" --pod-selector='app.kubernetes.io/component=orchestrator' \
+  --ignore-daemonsets --delete-emptydir-data --disable-eviction=false --timeout=8s; \
+  kubectl $CTX uncordon "$FNODE"
+kubectl $CTX -n $NS get pdb srw-orchestrator-pdb -o jsonpath='{.status.disruptionsAllowed}{"\n"}'
 ```
-- [ ] Drain proceeds — `pdb.minAvailable: 1` permits evicting **one** of the two pods (it would have *blocked* a single-replica drain, which is exactly why M0 shipped `minAvailable: 0` and M1 raises it to 1). The evicted pod reschedules; leadership stays with the survivor or fails over cleanly.
+- [ ] The follower eviction is **accepted** (`pdb.minAvailable: 1` permits 1 disruption), then `disruptionsAllowed` drops **1 → 0** — proving the PDB now protects the remaining leader (a 2nd voluntary eviction would `429`). The evicted pod **reschedules onto another node**; the leader (advisory-lock holder) is **unaffected**.
+
+> The raw policy/v1 Eviction API (`kubectl create --raw …/pods/<pod>/eviction`) is
+> cleaner (no cordon) but **does not route through a Rancher kube-API proxy** — even
+> a raw GET returns a bogus "namespace not found". `kubectl drain --pod-selector`
+> uses the eviction API through kubectl's normal path, which Rancher *does* proxy.
+> Eviction RBAC is fine regardless (`kubectl auth can-i create pods/eviction` → yes).
 
 ---
 
