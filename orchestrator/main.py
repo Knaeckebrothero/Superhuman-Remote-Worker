@@ -1153,6 +1153,34 @@ async def _resolve_session_config(
         return None
 
 
+async def _session_grant_violations(thread: dict[str, Any]) -> list[str]:
+    """Pre-flight the capability grants for a session's resolved config.
+
+    Returns the violation messages (``[]`` = allowed, or enforcement off /
+    non-grant resolve error → fail-open, same as the attach path), running the
+    SAME PDP as attach (``_resolve_session_config`` → ``_enforce_dispatch_grants``)
+    but discarding the resolved blob. Lets the provisioning paths
+    (``provision_or_assign`` and ``routers/sessions._do_prepare``) reject a
+    never-startable session up front — emitting ``session.lifecycle: failed``
+    with the real reason — instead of spawning a dedicated agent pod that 403s at
+    the workspace endpoint and exits "to be rebound" (a permanent grant denial is
+    not recoverable by a rebind), leaving the cockpit to poll ``/connection``
+    until its ~5m40s ready timeout.
+    See docs/issues/session_permission_mode_grant_denied_ready_timeout.md.
+    """
+    metadata = thread.get("metadata") or {}
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except (json.JSONDecodeError, TypeError):
+            metadata = {}
+    try:
+        await _resolve_session_config(thread, metadata)
+        return []
+    except GrantDenied as gd:
+        return list(gd.violations)
+
+
 def _looks_like_uuid(value: Any) -> bool:
     """True if ``value`` parses as a UUID (a cockpit-conflated expert id in the
     config_name slot, which must not be treated as a config file name)."""
