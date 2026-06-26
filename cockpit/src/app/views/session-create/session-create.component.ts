@@ -6,6 +6,7 @@ import {environment} from '../../core/environment';
 import {UserService} from '../../core/services/user.service';
 import {AgentSettingsComponent} from '../../views/agent-settings/agent-settings.component';
 import {ModelService} from '../../core/services/model.service';
+import {CapabilitiesService} from '../../core/services/capabilities.service';
 import {SidebarToggleComponent} from '../../shell/sidebar-toggle/sidebar-toggle.component';
 import {TranslocoPipe} from '@jsverse/transloco';
 import {AppButtonComponent} from '../../ui/button';
@@ -131,6 +132,7 @@ interface ExpertDetail extends Expert {
           [datasources]="datasources()"
           [loadingDatasources]="loadingDatasources()"
           [loadingExpert]="loadingExpert()"
+          [gatedCapabilities]="capabilities.grants() ?? null"
         />
 
         <!-- Footer -->
@@ -290,6 +292,7 @@ export class SessionCreateComponent implements OnInit {
   private readonly router = inject(Router);
   private readonly userService = inject(UserService);
   private readonly modelService = inject(ModelService);
+  readonly capabilities = inject(CapabilitiesService);
 
   @ViewChild(AgentSettingsComponent) agentSettings!: AgentSettingsComponent;
 
