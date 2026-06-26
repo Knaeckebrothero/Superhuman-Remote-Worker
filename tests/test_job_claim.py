@@ -5,6 +5,7 @@ window) race for the same job: exactly one wins, the job is never handed to
 two agents. Uses a real Postgres (testcontainers) with a minimal ``jobs``
 table carrying the columns the CAS touches (uuid id/agent, status, updated_at).
 """
+
 import asyncio
 from uuid import UUID
 

@@ -20,6 +20,7 @@ transaction-mode pooler (PgBouncer/pgcat/RDS-Proxy txn mode) silently breaks
 session advisory locks. SRW connects direct asyncpg; external deployments must
 not interpose a transaction-mode pooler (documented in helm/values.yaml).
 """
+
 import asyncio
 import logging
 import random
@@ -61,7 +62,9 @@ async def run_as_leader(db: Any, lock_id: int, shutdown_event: asyncio.Event) ->
     backoff = _RECONNECT_MIN_SECONDS
     # Anti-thundering-herd: stagger co-booting replicas so they don't all
     # contend for the lock on the same tick.
-    await _sleep_or_shutdown(random.uniform(0.0, _STARTUP_JITTER_SECONDS), shutdown_event)
+    await _sleep_or_shutdown(
+        random.uniform(0.0, _STARTUP_JITTER_SECONDS), shutdown_event
+    )
 
     while not shutdown_event.is_set():
         conn = None
@@ -154,9 +157,7 @@ async def run_when_leader(
             # Run the loop until we lose leadership / shut down / it exits.
             task = asyncio.create_task(make_coro(shutdown_event))
             while (
-                is_leader.is_set()
-                and not shutdown_event.is_set()
-                and not task.done()
+                is_leader.is_set() and not shutdown_event.is_set() and not task.done()
             ):
                 await _sleep_or_shutdown(poll_seconds, shutdown_event)
             if not task.done():

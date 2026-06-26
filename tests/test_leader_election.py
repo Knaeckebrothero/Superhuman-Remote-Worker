@@ -4,6 +4,7 @@ Uses a real Postgres (testcontainers) because the whole point is the
 session-lifetime + auto-release-on-disconnect semantics of
 ``pg_advisory_lock`` — there is nothing meaningful to assert against a mock.
 """
+
 import asyncio
 
 import asyncpg

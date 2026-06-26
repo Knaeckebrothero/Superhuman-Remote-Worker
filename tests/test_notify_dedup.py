@@ -6,6 +6,7 @@ both send the "approval needed" email. claim_sent_notification must make the
 'sent' marker a single claimable slot per (request_id, kind) via the partial
 unique index, so exactly one sweeper sends. Mirrors tests/test_job_claim.py.
 """
+
 import asyncio
 from uuid import UUID
 
@@ -88,22 +89,34 @@ async def test_sent_claim_is_atomic_exactly_one_wins(db):
 
 @pytest.mark.asyncio
 async def test_sent_claim_rejects_already_claimed(db):
-    assert await claim_sent_notification(
-        db, thread_id=THREAD, request_id=REQ, kind="permission_pending"
-    ) is not None
-    assert await claim_sent_notification(
-        db, thread_id=THREAD, request_id=REQ, kind="permission_pending"
-    ) is None
+    assert (
+        await claim_sent_notification(
+            db, thread_id=THREAD, request_id=REQ, kind="permission_pending"
+        )
+        is not None
+    )
+    assert (
+        await claim_sent_notification(
+            db, thread_id=THREAD, request_id=REQ, kind="permission_pending"
+        )
+        is None
+    )
 
 
 @pytest.mark.asyncio
 async def test_distinct_requests_each_claim(db):
-    assert await claim_sent_notification(
-        db, thread_id=THREAD, request_id=REQ, kind="permission_pending"
-    ) is not None
-    assert await claim_sent_notification(
-        db, thread_id=THREAD, request_id=REQ2, kind="permission_pending"
-    ) is not None
+    assert (
+        await claim_sent_notification(
+            db, thread_id=THREAD, request_id=REQ, kind="permission_pending"
+        )
+        is not None
+    )
+    assert (
+        await claim_sent_notification(
+            db, thread_id=THREAD, request_id=REQ2, kind="permission_pending"
+        )
+        is not None
+    )
 
 
 @pytest.mark.asyncio
@@ -116,6 +129,9 @@ async def test_downgrade_frees_the_slot(db):
     await downgrade_sent_claim(db, claim_id)
     assert await _sent_count(db, REQ) == 0
     # The slot is reclaimable (no longer a 'sent' row blocking it).
-    assert await claim_sent_notification(
-        db, thread_id=THREAD, request_id=REQ, kind="permission_pending"
-    ) is not None
+    assert (
+        await claim_sent_notification(
+            db, thread_id=THREAD, request_id=REQ, kind="permission_pending"
+        )
+        is not None
+    )
