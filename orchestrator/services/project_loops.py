@@ -23,6 +23,20 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
+# Execution roles commit to the project's `main` branch so the artifact
+# compounds IN PLACE across iterations; analysis roles coordinate only through
+# the KB and run on a throwaway branch that is never merged. The execution slot
+# is swappable (developer / default / a future writer), so analysis is the
+# closed set and everything else is treated as execution.
+# See docs/features/loop_repo_compounding.md.
+LOOP_ANALYSIS_ROLES: frozenset[str] = frozenset({"scholar", "critic"})
+
+
+def is_loop_execution_role(role: str | None) -> bool:
+    """True if a loop role produces the project artifact (works on ``main``)."""
+    return bool(role) and role not in LOOP_ANALYSIS_ROLES
+
+
 # Role-specific task blocks. Keyed by expert config name; unknown roles fall to
 # _ROLE_BLOCK_DEFAULT so the loop stays domain-agnostic (swap `developer` for a
 # `writer` / `default` execution role without code changes). Research-tuned:
@@ -35,7 +49,9 @@ _ROLE_BLOCKS: dict[str, str] = {
         "variations on one idea. Check the KB's tried/rejected record first so "
         "you don't re-propose a dead end. Write each candidate to the KB as a "
         "`proposal` note with a one-line thesis and why it differs from the "
-        "others. Do NOT self-filter — selecting is the Critic's job."
+        "others. Do NOT self-filter — selecting is the Critic's job. Your output "
+        "is KB `proposal` notes, not repo commits (your working branch is "
+        "scratch and is never merged into the project)."
     ),
     "critic": (
         "Select and prioritise among the open proposals AGAINST THE DEFINITION "
@@ -44,14 +60,18 @@ _ROLE_BLOCKS: dict[str, str] = {
         "compiles or has no leftover TODOs). Write a `verdict` note: the single "
         "chosen next action, explicit rationale, and how it will be checked. If "
         "the Definition of Done is genuinely and fully met, state that "
-        "explicitly and why — that is the goal-met stop signal."
+        "explicitly and why — that is the goal-met stop signal. Do NOT modify "
+        "the repository — only read, evaluate, and write your verdict to the KB "
+        "(your working branch is scratch and is never merged into the project)."
     ),
     "developer": (
         "Implement the Critic's chosen action. VALIDATE YOUR OWN WORK before "
         "declaring done — run it and test it; do not rely on it merely "
-        "compiling. Commit your work to the project's attached repository so the "
-        "next iteration builds on it. Record in the KB what you shipped and any "
-        "follow-ups."
+        "compiling. You work directly on the project's `main` branch: commit "
+        "your work and it is pushed automatically when you finish, becoming the "
+        "accumulated project that the next iteration builds on (job-scoped "
+        "scratch is kept out of it for you). Record in the KB what you shipped "
+        "and any follow-ups."
     ),
 }
 
@@ -145,12 +165,16 @@ async def create_loop_job(
     project_id = str(loop["project_id"]) if loop.get("project_id") else None
 
     # Bare config: the loop is the orchestration, so disable the per-job
-    # lifecycle hooks that would otherwise fight it (a verification critic that
-    # resumes the job; a scholar pre-research that doubles the scholar role).
+    # lifecycle hooks that would otherwise fight it — a verification critic that
+    # resumes the job, and a scholar pre-research that doubles the scholar role.
+    # Curation is the exception: it is the inline KB extractor/assembler aux pass
+    # (not a competing job rotation), and it is what makes the loop's knowledge
+    # compound and converge across cycles, so the loop turns it ON.
+    # See docs/features/kb_convergence_ttl_reverification.md.
     config_override: dict[str, Any] = {
         "verification": {"enabled": False},
         "scholar": {"enabled": False},
-        "curator": {"enabled": False},
+        "curator": {"enabled": True},
         "autonomy": "full",
         # The loop coordinates ONLY through the project knowledge base + shared
         # memory, so a step that loses its embedding-backed stores must pause for

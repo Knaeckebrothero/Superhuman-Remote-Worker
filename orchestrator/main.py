@@ -9590,7 +9590,7 @@ async def _spawn_loop_job(
     failures are non-fatal (logged), matching POST /api/jobs + run-now.
     """
     from services.job_provisioning import provision_job_repo
-    from services.project_loops import create_loop_job
+    from services.project_loops import create_loop_job, is_loop_execution_role
 
     job = await create_loop_job(postgres_db, loop, role=role, iteration=iteration)
 
@@ -9600,6 +9600,10 @@ async def _spawn_loop_job(
             gitea_client=gitea_client,
             postgres_db=postgres_db,
             main_cloud_router=main_cloud_router,
+            # Execution roles work on the shared repo's `main` so the artifact
+            # compounds in place; analysis roles stay on a throwaway branch.
+            # See docs/features/loop_repo_compounding.md.
+            work_on_main=is_loop_execution_role(role),
         )
     except Exception:
         logger.exception(
@@ -9690,6 +9694,31 @@ async def _advance_project_loop(
     next_index = (int(loop.get("seq_index") or 0) + 1) % len(roles)
     next_role = roles[next_index]
     total_run = int(loop.get("total_jobs_run") or 0) + 1
+
+    # KB convergence (docs/features/kb_convergence_ttl_reverification.md, F13): a
+    # full cycle completed when the rotation wraps back to the first role. Tick
+    # the per-note cycle TTL down once here; notes that reach <= 0 become the
+    # stale queue the next job's knowledge-assembler pass re-verifies. This UPDATE
+    # mirrors KnowledgeStore.decrement_ttl — the orchestrator runs it inline
+    # against the vector DB because it can't safely import src/. Non-fatal.
+    project_id_for_ttl = loop.get("project_id")
+    if next_index == 0 and project_id_for_ttl:
+        try:
+            async with vector_db.acquire() as conn:
+                await conn.execute(
+                    """
+                    UPDATE knowledge_index
+                    SET remaining_cycles = remaining_cycles - 1
+                    WHERE project_id = $1::uuid
+                      AND remaining_cycles IS NOT NULL
+                      AND status = 'active'
+                    """,
+                    str(project_id_for_ttl),
+                )
+        except Exception:
+            logger.exception(
+                "project loop %s: KB TTL decrement failed (non-fatal)", loop_id
+            )
 
     # Reflect the decremented budget in the kickoff the next job sees.
     loop_for_spawn = dict(loop)

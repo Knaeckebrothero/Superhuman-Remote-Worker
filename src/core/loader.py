@@ -1137,6 +1137,7 @@ class PromptMatrixResolver(MatrixResolver):
         "summarization": "summarization_prompt.txt",
         "memory_extraction": "memory_extraction_prompt.txt",
         "curation": "curation_prompt.txt",
+        "knowledge_assembler": "knowledge_assembler_prompt.txt",
         "citation_verification": "citation_verification_prompt.txt",
     }
 
