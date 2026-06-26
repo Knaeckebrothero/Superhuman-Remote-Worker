@@ -4290,7 +4290,7 @@ def _trigger_dispatch() -> None:
     created via a REST handler on a non-leader replica is picked up by the
     leader's periodic dispatcher loop rather than dispatched here.
     """
-    from orchestrator.services.leader_election import is_leader
+    from services.leader_election import is_leader
 
     if AUTO_ASSIGN_ENABLED and is_leader.is_set():
         asyncio.create_task(_try_dispatch_pending_jobs())
@@ -5392,8 +5392,8 @@ async def lifespan(app: FastAPI):
     # Leader election (M1): this replica contends for the singleton-loop
     # leadership lock; the run_when_leader-wrapped loops below run only while
     # this replica holds it. See services/leader_election.py.
-    from orchestrator.database.lock_ids import LEADER_ID
-    from orchestrator.services.leader_election import run_as_leader, run_when_leader
+    from database.lock_ids import LEADER_ID
+    from services.leader_election import run_as_leader, run_when_leader
     leader_task = asyncio.create_task(
         run_as_leader(postgres_db, LEADER_ID, _shutdown_event)
     )
