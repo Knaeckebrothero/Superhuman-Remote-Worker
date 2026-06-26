@@ -32,7 +32,7 @@ M0 is pure Kubernetes pod-spec mechanics, and these aspects can only be exercise
 ### When & prerequisites
 
 - **When:** overnight / a low-usage window, coordinated so no one is mid-test on the cluster. The test deletes the orchestrator pod and drains a node — brief disruption to anyone using dev.
-- **Prerequisite:** M0 must be deployed to the target cluster first. As of this record the M0 commits are **local-only on `develop` (unpushed)** — deploy via a `develop` push (Fleet sync) or a manual `helm upgrade` on the `main` context.
+- **Prerequisite:** M0 must be deployed to the target cluster first. The M0 commits are **pushed to `origin/develop` (2026-06-26)** — dev picks them up via Fleet sync; or `helm upgrade` manually on the `main` context.
 - **Procedure & pass criteria:** follow `docs/operations/orchestrator_failover.md` (the chaos test + the drain test).
 
 ## Scope guard

@@ -5,7 +5,7 @@
 
 **Status (2026-06-26): Code complete; unit/integration-verified AND two-replica-verified on local k3d. `replicas: 2` is correctness-safe. The k3d run caught and fixed a deploy-blocking bug (see below). The live (dev) cluster run is still PENDING — it wants a quiet window (overnight, no one else mid-test on the cluster).**
 
-> **The k3d run earned its keep:** it caught a real, deploy-blocking bug the unit tests structurally could not — the lifespan leader-election imports used the package-prefixed form (`from orchestrator.services.leader_election …`), which resolves at the repo root (so all 16 unit tests passed) but **not** in the deployed flattened `/app` image, crashing the orchestrator at startup with `ModuleNotFoundError: No module named 'orchestrator'`. Fixed in `4e2a7560` (plain top-level imports, matching house convention). This is exactly the runtime-wiring class of bug a two-replica deploy exists to find.
+> **The k3d run earned its keep:** it caught a real, deploy-blocking bug the unit tests structurally could not — the lifespan leader-election imports used the package-prefixed form (`from orchestrator.services.leader_election …`), which resolves at the repo root (so all 16 unit tests passed) but **not** in the deployed flattened `/app` image, crashing the orchestrator at startup with `ModuleNotFoundError: No module named 'orchestrator'`. Fixed by the `fix(orchestrator): use flattened-image import paths for leader-election wiring (M1)` commit — plain top-level imports matching house convention. This is exactly the runtime-wiring class of bug a two-replica deploy exists to find.
 
 ## What M1 guarantees
 
@@ -61,7 +61,7 @@ The k3d run proves the wiring on a single node. The live multi-node cluster unde
 ### When & prerequisites
 
 - **When:** overnight / a low-usage window, coordinated so no one is mid-test on the cluster. The test deletes the leader pod.
-- **Prerequisite:** M1 deployed to the target. The M1 commits are **local-only on `develop` (unpushed)** — the live run needs a `develop` push (Fleet sync) or a manual `helm upgrade`.
+- **Prerequisite:** M1 deployed to the target. **M1 is pushed to `origin/develop` (2026-06-26)** — dev picks it up via Fleet GitOps sync; the live run can proceed once dev has rolled the new orchestrator image (confirm the running image carries the leader-election code, e.g. `acquired leadership` appears in a pod log).
 
 ## Scope guard
 

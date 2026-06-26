@@ -1,6 +1,6 @@
 # Orchestrator M0 — Active-Passive Failover Hardening Implementation Plan
 
-**✅ Status: COMPLETE (2026-06-24).** All tasks implemented and committed on `develop` (unpushed); chart + mechanics verified locally on k3d (`startupProbe` carried a ~5-min cold start with 0 restarts, `preStop` 18s drain, PDB `ALLOWED DISRUPTIONS: 1`). Step checkboxes below are ticked for history. **Outstanding:** the live multi-node + real-traffic chaos test — deferred to a quiet overnight window after M0 reaches dev — tracked in `docs/tests/orchestrator_m0_failover_verification.md`.
+**✅ Status: COMPLETE (2026-06-24); PUSHED to `origin/develop` (2026-06-26).** All tasks implemented and committed; chart + mechanics verified locally on k3d (`startupProbe` carried a ~5-min cold start with 0 restarts, `preStop` 18s drain, PDB `ALLOWED DISRUPTIONS: 1`). Step checkboxes below are ticked for history. **Outstanding:** the live multi-node + real-traffic chaos test — deferred to a quiet overnight window once dev has the new image — tracked in `docs/tests/orchestrator_m0_failover_verification.md`.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
