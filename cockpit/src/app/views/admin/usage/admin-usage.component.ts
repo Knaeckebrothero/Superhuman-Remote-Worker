@@ -388,7 +388,7 @@ import {AgentStatistics, DailyStatistics, JobStatistics} from '../../../core/mod
       }
       .col-wide { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
       .col-role { color: var(--text-muted); font-size: 12px; }
-      .col-share { position: relative; height: 6px; background: var(--surface-0); border-radius: 3px; overflow: hidden; }
+      .breakdown-row .col-share { position: relative; height: 6px; background: var(--surface-0); border-radius: 3px; overflow: hidden; }
       .share-bar { display: block; height: 100%; background: var(--accent-color); border-radius: 3px; }
       .model-grid { grid-template-columns: 1.6fr 100px 100px 70px 80px; }
       .project-grid { grid-template-columns: 1.6fr 100px 100px 70px 80px; }
