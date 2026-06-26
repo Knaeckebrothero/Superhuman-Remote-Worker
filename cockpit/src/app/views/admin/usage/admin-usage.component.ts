@@ -10,6 +10,9 @@ import {
 } from '@angular/core';
 import {SidebarToggleComponent} from '../../../shell/sidebar-toggle/sidebar-toggle.component';
 import {AdminUsageService} from '../../../core/services/admin-usage.service';
+import {ApiService} from '../../../core/services/api.service';
+import {UserService} from '../../../core/services/user.service';
+import {AgentStatistics, DailyStatistics, JobStatistics} from '../../../core/models/api.model';
 
 /**
  * Admin → Usage & Cost (Slice 4). Read-only surface over the usage_events
@@ -34,6 +37,21 @@ import {AdminUsageService} from '../../../core/services/admin-usage.service';
           scoped to your visibility (admins see the fleet). Costs read $0 until
           rates are configured — quantities are measured now.
         </p>
+
+        <section class="kpi-row">
+          <div class="kpi-card"><span class="kpi-label">Tokens</span>
+            <span class="kpi-value">{{ fmtQty(tokensTotal()) }}</span></div>
+          <div class="kpi-card"><span class="kpi-label">Compute-hours</span>
+            <span class="kpi-value">{{ fmtQty(computeHours()) }}</span></div>
+          <div class="kpi-card"><span class="kpi-label">Events</span>
+            <span class="kpi-value">{{ fmtQty(eventsTotal()) }}</span></div>
+          <div class="kpi-card"><span class="kpi-label">Jobs completed</span>
+            <span class="kpi-value">{{ fmtQty(jobStats()?.completed ?? 0) }}</span></div>
+          @if (isAdmin()) {
+            <div class="kpi-card"><span class="kpi-label">Agents in-field</span>
+              <span class="kpi-value">{{ agentStats()?.working ?? 0 }}</span></div>
+          }
+        </section>
 
         <section class="admin-section">
           <div class="usage-toolbar">
@@ -204,11 +222,43 @@ import {AdminUsageService} from '../../../core/services/admin-usage.service';
         padding: 20px;
         font-size: 13px;
       }
+      .kpi-row {
+        display: flex;
+        gap: 12px;
+        flex-wrap: wrap;
+        margin-bottom: 24px;
+      }
+      .kpi-card {
+        flex: 1 1 140px;
+        background: var(--panel-bg);
+        border: 1px solid var(--border-color);
+        border-radius: var(--radius-lg);
+        padding: 16px 20px;
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+      }
+      .kpi-label {
+        font-size: 11px;
+        font-weight: 600;
+        color: var(--text-muted);
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+      }
+      .kpi-value {
+        font-size: 22px;
+        font-weight: 700;
+        color: var(--text-primary);
+        font-variant-numeric: tabular-nums;
+      }
     `,
   ],
 })
 export class AdminUsageComponent implements OnInit, OnDestroy {
   protected readonly usage = inject(AdminUsageService);
+  private readonly api = inject(ApiService);
+  private readonly users = inject(UserService);
+  readonly isAdmin = computed(() => this.users.currentUser()?.is_admin === true);
 
   readonly windows = [7, 30, 90] as const;
   readonly windowDays = signal<number>(30);
@@ -216,6 +266,18 @@ export class AdminUsageComponent implements OnInit, OnDestroy {
   readonly summary = computed(() => this.usage.usage());
   readonly rows = computed(() => this.summary()?.by_category ?? []);
   readonly hasData = computed(() => this.rows().length > 0);
+
+  readonly jobStats = signal<JobStatistics | null>(null);
+  readonly agentStats = signal<AgentStatistics | null>(null);
+
+  private qty(unit: string): number {
+    return (this.summary()?.by_category ?? [])
+      .filter((r) => r.unit === unit).reduce((s, r) => s + r.quantity, 0);
+  }
+  readonly tokensTotal = computed(() => this.qty('prompt-token') + this.qty('completion-token'));
+  readonly computeHours = computed(() => this.qty('vcpu-hour') + this.qty('gib-hour'));
+  readonly eventsTotal = computed(() =>
+    (this.summary()?.by_category ?? []).reduce((s, r) => s + r.events, 0));
 
   readonly refreshOptions = [
     {label: 'Off', ms: 0}, {label: '10s', ms: 10000},
@@ -236,7 +298,10 @@ export class AdminUsageComponent implements OnInit, OnDestroy {
 
   /** Single funnel every panel's loader goes through (used by auto-refresh + window change). */
   reloadAll(): void {
-    this.usage.loadUsage(this.windowDays());
+    const d = this.windowDays();
+    this.usage.loadUsage(d);
+    this.api.getJobStatistics().subscribe((s) => this.jobStats.set(s));
+    if (this.isAdmin()) this.api.getAgentStatistics().subscribe((s) => this.agentStats.set(s));
   }
 
   ngOnDestroy(): void { if (this.timer) clearInterval(this.timer); }
