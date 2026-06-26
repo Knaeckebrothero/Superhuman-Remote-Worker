@@ -28,6 +28,17 @@ class DuplicateThreadBinding(RuntimeError):
     """
 
 
+class SessionGrantDenied(Exception):
+    """The session's resolved config exceeds the runner's capability grants —
+    the agent's workspace endpoint (``GET /api/agents/threads/{id}/workspace``)
+    returned HTTP 403. Permanent: a rebind hits the identical denial, so the
+    attach path must surface the real reason and stop, NOT misreport it as a
+    transient 'workspace not provisioned' (the 5m40s ready-timeout bug). Not a
+    RuntimeError so the pool-mode ``except RuntimeError`` attach handler doesn't
+    swallow it. See docs/issues/session_permission_mode_grant_denied_ready_timeout.md.
+    """
+
+
 class UploadedFileInfo(BaseModel):
     """Metadata for a single uploaded file."""
 
@@ -422,12 +433,21 @@ class OrchestratorClient:
             logger.error(f"Workspace upgrade request error: {e}")
             return False
 
-    async def get_thread_workspace(self, thread_id: str) -> dict | None:
+    async def get_thread_workspace(
+        self, thread_id: str, *, raise_on_denied: bool = False
+    ) -> dict | None:
         """Poll workspace container status for a thread.
 
         Returns:
             Workspace status dict {status, pod_ip, pod_name, namespace},
             or None on failure.
+
+        With ``raise_on_denied=True``, a 403 (capability-grant denial — the only
+        403 this endpoint raises; ``require_internal`` uses 401) raises
+        :class:`SessionGrantDenied` carrying the violation instead of collapsing
+        to ``None``, so the attach path can fail with the real reason rather than
+        the misleading 'No workspace container provisioned'. Other failures stay
+        ``None`` (transient — keep polling).
         """
         if not self._client:
             await self.connect()
@@ -437,7 +457,16 @@ class OrchestratorClient:
             response = await self._client.get(url)
             if response.status_code == 200:
                 return response.json()
+            if raise_on_denied and response.status_code == 403:
+                detail = "capability grants"
+                try:
+                    detail = response.json().get("detail") or detail
+                except Exception:
+                    pass
+                raise SessionGrantDenied(detail)
             return None
+        except SessionGrantDenied:
+            raise
         except Exception as e:
             logger.debug(f"Failed to get thread workspace: {e}")
             return None

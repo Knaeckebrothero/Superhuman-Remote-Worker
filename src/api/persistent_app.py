@@ -22,6 +22,7 @@ from ._session_auth import validate_session_token as _validate_session_token
 from .orchestrator_client import (
     DuplicateThreadBinding,
     OrchestratorClient,
+    SessionGrantDenied,
     create_orchestrator_client_from_env,
 )
 from .persistent_session import PersistentSession, resolve_memory_extraction_prompt
@@ -728,6 +729,34 @@ async def _exit_workspace_not_ready(thread_id: str, exc: Exception) -> NoReturn:
     os._exit(0)
 
 
+async def _exit_grant_denied(thread_id: str, exc: Exception) -> NoReturn:
+    """Handle a capability-grant denial at session attach (the workspace endpoint
+    returned 403): log the REAL reason and exit cleanly (status 0, pod Completed
+    — no K8s restart-loop). Unlike :func:`_exit_workspace_not_ready` this is NOT
+    a transient workspace problem — a rebind hits the identical denial — so we do
+    NOT claim the orchestrator will recover it. The cockpit re-surfaces the
+    reason on its next create/prepare via the grant pre-flight (Layers 1/2).
+    See docs/issues/session_permission_mode_grant_denied_ready_timeout.md.
+    """
+    logger.error(
+        "Session attach denied for thread %s by capability grants (%s) — exiting "
+        "cleanly; NOT retrying (a rebind hits the same denial). The cockpit "
+        "surfaces this on its next create/prepare grant pre-flight.",
+        thread_id,
+        exc,
+    )
+    if _orchestrator_client:
+        try:
+            _orchestrator_client.stop_heartbeat()
+            if _heartbeat_task:
+                _heartbeat_task.cancel()
+            await _orchestrator_client.deregister()
+            await _orchestrator_client.close()
+        except Exception as de:
+            logger.warning("Best-effort deregister on grant-denied exit failed: %s", de)
+    os._exit(0)
+
+
 async def _exit_duplicate_provision(thread_id: str) -> NoReturn:
     """Handle a lost provisioning race (409) during lifespan startup.
 
@@ -876,6 +905,14 @@ async def lifespan(app: FastAPI):
 
         try:
             await _attach_session(_thread_id)
+        except SessionGrantDenied as e:
+            # The session's resolved config exceeds the owner's capability grants
+            # (workspace endpoint returned 403) — e.g. a grant revoked between the
+            # orchestrator's create/provision pre-flight (Layers 1/2) and this
+            # attach. Permanent: exit with the REAL reason instead of the
+            # misleading 'workspace not provisioned' rebind path; the cockpit
+            # re-surfaces it on its next create/prepare grant pre-flight.
+            await _exit_grant_denied(_thread_id, e)
         except (WorkspaceNotReady, WorkspaceUnavailableError) as e:
             # Workspace raced us / is wedged (WorkspaceNotReady) or its pod is
             # dead/unreachable (WorkspaceUnavailableError — SSH connect exhausted
@@ -1106,7 +1143,7 @@ async def _attach_session(
     workspace_override = None
     if not is_lite_session and _orchestrator_client and _thread_id:
         workspace_override = await _poll_workspace_ready(
-            _orchestrator_client, _thread_id, timeout=120
+            _orchestrator_client, _thread_id, timeout=120, raise_on_denied=True
         )
         if workspace_override:
             logger.info(
@@ -4549,6 +4586,8 @@ async def _poll_workspace_ready(
     thread_id: str,
     timeout: int = 120,
     poll_interval: float = 2.0,
+    *,
+    raise_on_denied: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """Poll orchestrator for workspace container readiness.
 
@@ -4561,7 +4600,9 @@ async def _poll_workspace_ready(
     deadline = time.monotonic() + timeout
 
     while time.monotonic() < deadline:
-        ws = await client.get_thread_workspace(thread_id)
+        ws = await client.get_thread_workspace(
+            thread_id, raise_on_denied=raise_on_denied
+        )
         if not ws:
             return None
 

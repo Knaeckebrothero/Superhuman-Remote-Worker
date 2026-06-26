@@ -7,6 +7,7 @@ import pytest
 
 from src.api.orchestrator_client import (
     OrchestratorClient,
+    SessionGrantDenied,
     create_orchestrator_client_from_env,
     get_agent_ip,
     get_hostname,
@@ -764,6 +765,38 @@ class TestGetThreadWorkspace:
         mock_response = MagicMock()
         mock_response.status_code = 404
 
+        with patch.object(client, "_client", AsyncMock()) as mock_http:
+            mock_http.get = AsyncMock(return_value=mock_response)
+            result = await client.get_thread_workspace("tid-1")
+            assert result is None
+
+    @pytest.mark.asyncio
+    async def test_raises_session_grant_denied_on_403_when_flagged(self, client):
+        """raise_on_denied=True: a 403 (grant denial) raises SessionGrantDenied
+        carrying the violation, so the attach path surfaces the real reason
+        instead of misreporting 'no workspace provisioned' (the 5m40s bug).
+        docs: session_permission_mode_grant_denied_ready_timeout.md
+        """
+        mock_response = MagicMock()
+        mock_response.status_code = 403
+        mock_response.json.return_value = {
+            "detail": "config exceeds your capability grants: "
+            "permission_mode: 'autonomous' exceeds the ceiling"
+        }
+        with patch.object(client, "_client", AsyncMock()) as mock_http:
+            mock_http.get = AsyncMock(return_value=mock_response)
+            with pytest.raises(SessionGrantDenied) as ei:
+                await client.get_thread_workspace("tid-1", raise_on_denied=True)
+        assert "permission_mode" in str(ei.value)
+        assert "autonomous" in str(ei.value)
+
+    @pytest.mark.asyncio
+    async def test_returns_none_on_403_by_default(self, client):
+        """Without the flag a 403 stays None — the upgrade/VM pollers that share
+        get_thread_workspace must not start raising."""
+        mock_response = MagicMock()
+        mock_response.status_code = 403
+        mock_response.json.return_value = {"detail": "denied"}
         with patch.object(client, "_client", AsyncMock()) as mock_http:
             mock_http.get = AsyncMock(return_value=mock_response)
             result = await client.get_thread_workspace("tid-1")
