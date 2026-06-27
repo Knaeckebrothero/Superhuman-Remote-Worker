@@ -245,6 +245,95 @@ class TestPhaseOverrideCredentialInjection:
 
 
 # ---------------------------------------------------------------------------
+# Per-phase account model defaults were REMOVED (Layer 1).
+#
+# default_strategic_model / default_tactical_model in users.settings used to be
+# injected as llm.strategic / llm.tactical phase pins at dispatch. A phase pin
+# beats the top-level model in get_phase_config, so they silently shadowed an
+# explicit per-loop/per-job top-level model (a loop pinned to gpt-5.5 ran
+# entirely on gpt-5.3-codex-spark). Dispatch must no longer read them.
+# See docs/issues/loop_ran_codex_spark_not_selected_model_then_hung_on_cooldown.md
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def patched_main_phase_prefs(monkeypatch):
+    """User settings still carry the (removed) per-phase model defaults; the
+    registry resolves any model so an injected pin would be visible with
+    transport. If dispatch ever re-reads the keys, the assertions below fail."""
+
+    async def fake_resolve(model_id, user_id=None, capability="chat"):
+        return ModelMeta(
+            model_id=model_id,
+            provider="openai",
+            family="codex",
+            display_name=model_id,
+            origin="custom",
+            endpoint_id=CODEX_ENDPOINT_ID,
+            api_key_ref="openai",
+        )
+
+    monkeypatch.setattr(
+        main, "_resolve_model", AsyncMock(side_effect=fake_resolve), raising=True
+    )
+
+    async def fake_get_endpoint(endpoint_id):
+        return {
+            "id": CODEX_ENDPOINT_ID,
+            "label": "codex-proxy",
+            "base_url": CODEX_BASE_URL,
+            "api_key": CODEX_API_KEY,
+        }
+
+    monkeypatch.setattr(
+        main.postgres_db,
+        "get_user_llm_endpoint",
+        AsyncMock(side_effect=fake_get_endpoint),
+    )
+    monkeypatch.setattr(
+        main.postgres_db, "resolve_api_keys_for_job", AsyncMock(return_value={})
+    )
+    monkeypatch.setattr(
+        main.postgres_db,
+        "get_user_settings",
+        AsyncMock(
+            return_value={
+                "default_strategic_model": "gpt-5.3-codex-spark",
+                "default_tactical_model": "gpt-5.3-codex-spark",
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        main.postgres_db,
+        "resolve_default_for_capability",
+        AsyncMock(return_value=None),
+    )
+
+
+class TestPerPhaseAccountDefaultsRemoved:
+    @pytest.mark.asyncio
+    async def test_account_phase_defaults_do_not_shadow_explicit_model(
+        self, patched_main_phase_prefs
+    ):
+        """The loop scenario: an explicit top-level model, no phase pins on the
+        job. Account phase defaults must NOT add strategic/tactical pins."""
+        result = await main._inject_dispatch_credentials(
+            _job(), {"llm": {"model": "gpt-5.5"}}
+        )
+        assert result["llm"]["model"] == "gpt-5.5"
+        assert "strategic" not in result["llm"]
+        assert "tactical" not in result["llm"]
+
+    @pytest.mark.asyncio
+    async def test_account_phase_defaults_not_injected_on_empty_override(
+        self, patched_main_phase_prefs
+    ):
+        result = await main._inject_dispatch_credentials(_job(), {})
+        assert "strategic" not in result.get("llm", {})
+        assert "tactical" not in result.get("llm", {})
+
+
+# ---------------------------------------------------------------------------
 # System-anchored provider routing (provider_kind='system')
 #
 # A catalog row anchored to a system_api_keys provider (e.g. OpenRouter)
