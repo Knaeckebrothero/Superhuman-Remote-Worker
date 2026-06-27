@@ -1939,6 +1939,14 @@
       "tactical": "Tactical",
       "single": "Model",
       "default": "Default",
+      "defaultResolved": "Default · {{model}} ({{source}})",
+      "defaultResolvedNoSource": "Default · {{model}}",
+      "source": {
+        "expert": "from expert",
+        "account_default": "your default",
+        "system_default": "system default",
+        "project": "project default"
+      },
       "presetUnconfigured": "One or both models lack an API key",
       "providerNoKey": "{{provider}} (no API key)",
       "mismatchWindow": "These models have different context windows — they share one history, so it's capped to the smaller (~{{min}}).",

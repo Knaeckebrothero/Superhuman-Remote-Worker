@@ -18330,10 +18330,82 @@ def _load_settings_matrix(config_dir: Path) -> dict[str, Any]:
     return _settings_matrix_cache
 
 
-async def _load_expert_detail(expert_id: str) -> dict[str, Any]:
+def _effective_models_from_layers(
+    expert_llm: dict[str, Any] | None,
+    account_default: str | None,
+    system_default: str | None,
+) -> dict[str, dict[str, Any]]:
+    """Per-slot effective model + provenance for the create-form pickers.
+
+    Mirrors the dispatch precedence (most-specific wins) and the agent's
+    ``get_phase_config`` fallback (a phase pin beats the top-level model), so the
+    UI can show the model the agent will actually run when the picker is left
+    untouched. v1 layers (the project ``default_config_override`` layer is
+    deferred — it is ~always null and would need project context threaded
+    through the forms):
+
+        expert pin  ->  account default_model  ->  system registry default
+
+    ``expert_llm`` is the expert's OWN llm fragment (DB overlay or bundled leaf),
+    NOT the merged config — a bundled, model-agnostic expert has ``{}`` here and
+    so resolves to the account/system default, exactly like dispatch (the bundled
+    base's placeholder model is replaced by the default floor before the expert
+    merges).
+
+    Returns ``{slot: {"model": str|None, "source": str}}`` for slots
+    ``strategic`` / ``tactical`` / ``session``; ``source`` is one of ``expert`` /
+    ``account_default`` / ``system_default``. See Layer 3 in
+    docs/issues/loop_ran_codex_spark_not_selected_model_then_hung_on_cooldown.md.
+    """
+    llm = expert_llm or {}
+
+    def _top() -> dict[str, Any]:
+        if llm.get("model"):
+            return {"model": llm["model"], "source": "expert"}
+        if account_default:
+            return {"model": account_default, "source": "account_default"}
+        return {"model": system_default, "source": "system_default"}
+
+    top = _top()
+
+    def _phase(name: str) -> dict[str, Any]:
+        block = llm.get(name)
+        pin = block.get("model") if isinstance(block, dict) else None
+        return {"model": pin, "source": "expert"} if pin else dict(top)
+
+    return {
+        "strategic": _phase("strategic"),
+        "tactical": _phase("tactical"),
+        "session": dict(top),
+    }
+
+
+async def _compute_expert_effective_models(
+    expert_llm: dict[str, Any] | None, user_id: str | None
+) -> dict[str, dict[str, Any]]:
+    """Combine the expert's own pins with the user's account default_model and
+    the system registry chat default (``resolve_default_for_capability`` — the
+    same source dispatch uses)."""
+    account_default = None
+    if user_id:
+        settings = await postgres_db.get_user_settings(str(user_id)) or {}
+        account_default = settings.get("default_model")
+    system_default = await postgres_db.resolve_default_for_capability("chat")
+    return _effective_models_from_layers(expert_llm, account_default, system_default)
+
+
+async def _load_expert_detail(
+    expert_id: str, *, user_id: str | None = None
+) -> dict[str, Any]:
     """Load full expert detail: merged config + instructions content. DB-backed
     experts (UUID) resolve their fragment onto the expert_type base; bundled
-    experts resolve from disk as before."""
+    experts resolve from disk as before.
+
+    When ``user_id`` is provided, attaches ``effective_models`` (per-slot model +
+    provenance) so the create-form picker can show what will actually run if left
+    untouched — see Layer 3 in
+    docs/issues/loop_ran_codex_spark_not_selected_model_then_hung_on_cooldown.md.
+    """
     if _is_experts_db_enabled() and _looks_like_uuid(expert_id):
         row = await postgres_db.get_expert_by_id(expert_id)
         if not row:
@@ -18351,6 +18423,11 @@ async def _load_expert_detail(expert_id: str) -> dict[str, Any]:
         prompts = row.get("prompts") or {}
         if isinstance(prompts, str):
             prompts = json.loads(prompts)
+        effective = (
+            await _compute_expert_effective_models(cfg.get("llm") or {}, user_id)
+            if user_id
+            else None
+        )
         return {
             "id": str(row["id"]),
             "display_name": row["display_name"],
@@ -18363,6 +18440,7 @@ async def _load_expert_detail(expert_id: str) -> dict[str, Any]:
             "config": merged,
             "instructions": prompts.get("instructions"),
             "persona": prompts.get("persona"),
+            "effective_models": effective,
         }
     config_dir = _get_config_dir()
 
@@ -18376,6 +18454,9 @@ async def _load_expert_detail(expert_id: str) -> dict[str, Any]:
             defaults = {}
         merged = dict(defaults)
         expert_config_dir = config_dir
+        # The "defaults" virtual expert is model-agnostic — no expert-level model
+        # pin, so its effective model is the account/system default.
+        expert_llm_leaf: dict[str, Any] = {}
     else:
         expert_dir = config_dir / "experts" / expert_id
         config_path = expert_dir / "config.yaml"
@@ -18398,6 +18479,9 @@ async def _load_expert_detail(expert_id: str) -> dict[str, Any]:
 
         merged = _deep_merge(defaults, expert_data)
         expert_config_dir = expert_dir
+        # The expert's OWN llm fragment (leaf, pre-merge) — a model-agnostic
+        # bundled expert has `llm: {}` here and resolves to the default floor.
+        expert_llm_leaf = expert_data.get("llm") or {}
 
     # Load the raw settings_matrix for the client to resolve per-model defaults.
     # Do NOT apply it to merged — the client resolves based on the user's model selection.
@@ -18433,11 +18517,17 @@ async def _load_expert_detail(expert_id: str) -> dict[str, Any]:
     # categories that an expert disabled (e.g., scholar sets citation: []).
     defaults_tools = defaults.get("tools", {})
 
+    effective = (
+        await _compute_expert_effective_models(expert_llm_leaf, user_id)
+        if user_id
+        else None
+    )
     return {
         "config": merged,
         "instructions": instructions_content,
         "defaults_tools": defaults_tools,
         "settings_matrix": raw_matrix,
+        "effective_models": effective,
     }
 
 
@@ -18451,11 +18541,12 @@ async def get_expert(request: Request, expert_id: str) -> dict[str, Any]:
     instructions.md content, enabling the cockpit to pre-populate the job
     creation form.
     """
-    await require_approved_user(request, postgres_db)
+    user = await require_approved_user(request, postgres_db)
+    _uid = str(user["id"])
 
     # DB-backed expert (UUID): the detail payload is self-contained.
     if _is_experts_db_enabled() and _looks_like_uuid(expert_id):
-        detail = await _load_expert_detail(expert_id)
+        detail = await _load_expert_detail(expert_id, user_id=_uid)
         if not detail:
             raise HTTPException(
                 status_code=404, detail=f"Expert not found: {expert_id}"
@@ -18469,7 +18560,7 @@ async def get_expert(request: Request, expert_id: str) -> dict[str, Any]:
 
     if expert_id == "defaults":
         # "defaults" is a virtual expert representing framework defaults
-        detail = await _load_expert_detail(expert_id)
+        detail = await _load_expert_detail(expert_id, user_id=_uid)
         if not detail:
             raise HTTPException(status_code=404, detail="Defaults config not found")
         return detail
@@ -18478,7 +18569,7 @@ async def get_expert(request: Request, expert_id: str) -> dict[str, Any]:
     if not expert_info:
         raise HTTPException(status_code=404, detail=f"Expert not found: {expert_id}")
 
-    detail = await _load_expert_detail(expert_id)
+    detail = await _load_expert_detail(expert_id, user_id=_uid)
     if not detail:
         raise HTTPException(
             status_code=404, detail=f"Expert config not found: {expert_id}"

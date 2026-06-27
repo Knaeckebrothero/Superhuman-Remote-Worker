@@ -1,6 +1,6 @@
 # Resumed session shows no agent output, and supervised tool-gates that time out are reported to the LLM as "User denied"
 
-**Status:** Filed — investigation complete, root causes isolated on a live prod session; **no fix yet**. Two distinct defects, causally linked (Defect B is only *harmful* while Defect A is in effect).
+**Status:** Filed — investigation complete, root causes isolated on a live prod session; **no fix yet**. Two distinct defects, causally linked (Defect B is only *harmful* while Defect A is in effect). **Update 2026-06-27: Defect A root cause CORRECTED — the service-worker hypothesis is disproven; the real cause is `/api/sessions/{id}/connection` stuck at 425. See the "Update (2026-06-27)" section below + the 3 follow-ups to revisit.**
 **Found:** 2026-06-26, reproduced live on session `7692637b-9c60-4698-9875-b57ec34e66a6` ("Cloud storage file inspection and summary"), main cluster (`superhuman-remote-worker`), user `operator@redacted.invalid`.
 **Severity:** High. The session looks completely dead to the user (no reply, no "generating", no approval prompt) while the agent is actually healthy and working. Worse, in Supervised mode the dead stream silently converts every tool-call into a fake user-denial after a 5-minute stall, so the agent concludes the user refused and abandons real work.
 **Component:** cockpit `PersistentChatService` + Angular service worker · orchestrator SSE relay (`orchestrator/main.py` `thread_event_stream`) · agent permission gate (`src/api/persistent_app.py`, `src/persistent_graph.py`)
@@ -75,6 +75,27 @@ Turn 1 (two days earlier) worked precisely because the user *was* connected live
 **To confirm root cause:** capture the cockpit `GET …/stream` request with its cursor/epoch query param on resume and compare against `server_epoch` (=2 here); check DevTools → Application → Service Workers for a SW intercepting the stream; check whether the cockpit's `gone_beyond_horizon` handler re-attaches cursorless and renders the **in-flight pending** `permission.request`.
 
 **Proposed direction:** make the cockpit prove live-channel liveness (drive the "Connected" badge off the typed `ping` event / last-frame timestamp, not off connect success), and ensure the `gone_beyond_horizon` → REST-history-reload path also re-attaches a live tail **and** re-surfaces any currently-pending `permission.request` (REST `/messages` history does not carry the pending gate — it only lives in `thread_events`).
+
+---
+
+## Update (2026-06-27) — Defect A root cause CORRECTED + follow-ups
+
+A deeper pass (browser console + deployed-bundle inspection + a parallel codebase sweep, reproduced again on the same session over 2026-06-27 07:00–09:30) **overturned the service-worker hypothesis** for Defect A:
+
+- The deployed cockpit bundle (`main-XTVNE4ER.js`, image `sha-e0742e1`) **already excludes all three SSE streams from the service worker**: `/api/persistent/threads/{id}/stream`, `/api/notifications/events`, `/api/sudo/events` are each opened as native `EventSource` with `?ngsw-bypass=true` (verified in the deployed JS). So the SW is **not** intercepting or breaking the live streams. The "`/api/**` dataGroup breaks the SSE" line under Defect A is **disproven** for the active streams.
+- **Corrected root cause:** the session never reaches *ready*. `GET /api/sessions/{id}/connection` returned **425 fifty-two times and 200 zero times over a 4 h window** — so the cockpit never obtains a working `ws_url` and the live channel never establishes, even though the agent runs fine server-side (`POST /input` accepted, replies persisted, chat history populated). Confirmed contributors:
+  - **Provisioning thrash** — every open assigns a *new* agent (`ecd28ae1 → fb73689c → 9f9360fb`) and cold-restores a ~120 MB workspace snapshot from S3; multiple agent pods churning.
+  - **Per-session WS 504** — the `/p/{thread_id}/ws` Traefik route (per-session Ingress+Service via `SessionRouterService`) can't reach the backend during cold boot; the browser retries the WS with a stale token (`504 Gateway Timeout` in the console).
+  - **Idle re-suspend** — the workspace suspends to S3 after 30 min idle (observed 08:36:06), so the next open cold-boots all over again.
+  - **Thread never auto-ends** → it stays `status=active`/green in the sessions list the whole time (tracked as the separate "stuck active" item).
+
+### Follow-ups to revisit (do not lose these)
+
+1. **Robust service-worker carve-out (defense-in-depth).** Stream protection today is a *fragile per-URL allowlist* — only the 3 SSE streams carry `?ngsw-bypass=true`. Replace it with an `ngsw-config.json` exclusion (ngsw `dataGroups.urls` support `!`-prefixed negation) that excludes **all** live/streaming + handshake/status + binary-download endpoints, so a newly-added streaming endpoint isn't silently broken by the `/api/**` freshness cache. A new dev who adds an SSE route shouldn't have to remember the magic query param.
+2. **Stop SW-caching stateful endpoints.** These are still under the `/api/**` freshness cache (5 s timeout → serve stale, 200-entry runtime cache) and were never opted out: `GET /api/sessions/{id}/connection` (returns the `ws_url`+JWT and flips `425→200` — caching it can serve a stale `ws_url`/`425`), `/api/agents/threads/*/lifecycle`, `/api/actions/pending`, the binary downloads (`/api/uploads/*/files/*`, `/api/citations/*/snapshot`, `/api/skills/*/export`), and the IDE proxy (`/api/ide/*/proxy/*`). Mark these no-store / bypass.
+3. **Fix the real session-breaker: `/connection` stuck at 425.** Investigate why the readiness gate never flips to 200 for this thread (likely the per-session Traefik route/Service not reconciling, and/or provisioning thrash leaving the route wedged). This — not the service worker — is what makes the session look dead. Pairs with the "stuck active" / thread-never-auto-ends item.
+
+**Live-endpoint inventory backing the above (from the codebase sweep):** SSE = `/api/persistent/threads/{id}/stream`, `/api/notifications/events`, `/api/sudo/events` (all `ngsw-bypass`'d ✓); WebSocket = `/p/{thread_id}/ws` (per-session control plane) + `/api/ide/{id}/proxy/*`; binary downloads = `/api/uploads/{id}/files/*`, `/api/citations/{id}/snapshot`, `/api/skills/{id}/export`. All orchestrator endpoints live under `/api/` (so the `/api/**` rule catches every one that isn't explicitly bypassed).
 
 ---
 

@@ -1939,6 +1939,14 @@
       "tactical": "Taktisch",
       "single": "Modell",
       "default": "Standard",
+      "defaultResolved": "Standard · {{model}} ({{source}})",
+      "defaultResolvedNoSource": "Standard · {{model}}",
+      "source": {
+        "expert": "vom Experten",
+        "account_default": "dein Standard",
+        "system_default": "System-Standard",
+        "project": "Projekt-Standard"
+      },
       "presetUnconfigured": "Mindestens einem Modell fehlt ein API-Schlüssel",
       "providerNoKey": "{{provider}} (kein API-Schlüssel)",
       "mismatchWindow": "Diese Modelle haben unterschiedliche Kontextfenster — sie teilen sich einen Verlauf und werden auf das kleinere begrenzt (~{{min}}).",

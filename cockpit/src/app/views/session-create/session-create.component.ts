@@ -129,6 +129,7 @@ interface ExpertDetail extends Expert {
           [disabled]="creating()"
           [defaultsTools]="expertDetail()?.defaults_tools ?? {}"
           [settingsMatrix]="expertDetail()?.settings_matrix ?? frameworkSettingsMatrix()"
+          [effectiveModels]="expertDetail()?.effective_models ?? null"
           [datasources]="datasources()"
           [loadingDatasources]="loadingDatasources()"
           [loadingExpert]="loadingExpert()"

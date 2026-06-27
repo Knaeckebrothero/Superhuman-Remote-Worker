@@ -67,6 +67,30 @@ export interface Expert {
  * Full expert detail including merged config and instructions content.
  * Returned by GET /api/experts/{expert_id}.
  */
+/** Provenance of a slot's effective model (what runs if the picker is untouched). */
+export type EffectiveModelSource =
+  | 'expert'
+  | 'account_default'
+  | 'system_default'
+  | 'project';
+
+export interface EffectiveModelSlot {
+  model: string | null;
+  source: EffectiveModelSource;
+}
+
+/**
+ * Per-slot effective model + provenance, computed server-side with the same
+ * precedence dispatch uses. Lets the picker show the model that will actually
+ * run if the user makes no change. See Layer 3 in the issue doc
+ * loop_ran_codex_spark_not_selected_model_then_hung_on_cooldown.md.
+ */
+export interface EffectiveModels {
+  strategic: EffectiveModelSlot;
+  tactical: EffectiveModelSlot;
+  session: EffectiveModelSlot;
+}
+
 export interface ExpertDetail extends Expert {
   config: Record<string, unknown>;
   instructions: string | null;
@@ -74,6 +98,8 @@ export interface ExpertDetail extends Expert {
   defaults_tools?: Record<string, string[]>;
   /** Raw settings_matrix.yaml for client-side model-family resolution. */
   settings_matrix?: Record<string, Record<string, unknown>>;
+  /** Effective model + provenance per slot (server-resolved). */
+  effective_models?: EffectiveModels | null;
   /** DB-backed experts only — present on create/update responses + detail. */
   name?: string;
   owner_id?: string;
