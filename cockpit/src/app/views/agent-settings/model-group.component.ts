@@ -3,6 +3,7 @@ import {FormsModule} from '@angular/forms';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {AppIconComponent} from '../../ui/icon';
 import {ModelService} from '../../core/services/model.service';
+import {EffectiveModels, EffectiveModelSlot} from '../../core/models/api.model';
 import {computeModelMismatch, ModelMismatch, readConfigPath, SettingsMode} from './agent-settings.types';
 import {reasoningOptionsForModel} from './reasoning-options';
 
@@ -40,11 +41,11 @@ const STORAGE_KEYS = {
           <div class="field-control">
             <select
               class="form-input"
-              [ngModel]="strategicModel() ?? resolvedStrategicModel()"
+              [ngModel]="strategicModel()"
               (ngModelChange)="onStrategicModelChange($event)"
               [disabled]="disabled()"
             >
-              <option [ngValue]="null">{{ 'agentSettings.model.default' | transloco }}</option>
+              <option [ngValue]="null">{{ defaultLabel(effectiveStrategic(), resolvedStrategicModel()) }}</option>
               @for (group of availableModels(); track group.group) {
                 <optgroup [label]="providerLabel(group)">
                   @for (model of group.models; track model) {
@@ -65,11 +66,11 @@ const STORAGE_KEYS = {
           <div class="field-control">
             <select
               class="form-input"
-              [ngModel]="tacticalModel() ?? resolvedTacticalModel()"
+              [ngModel]="tacticalModel()"
               (ngModelChange)="onTacticalModelChange($event)"
               [disabled]="disabled()"
             >
-              <option [ngValue]="null">{{ 'agentSettings.model.default' | transloco }}</option>
+              <option [ngValue]="null">{{ defaultLabel(effectiveTactical(), resolvedTacticalModel()) }}</option>
               @for (group of availableModels(); track group.group) {
                 <optgroup [label]="providerLabel(group)">
                   @for (model of group.models; track model) {
@@ -108,11 +109,11 @@ const STORAGE_KEYS = {
           <div class="field-control">
             <select
               class="form-input"
-              [ngModel]="sessionModel() ?? resolvedSessionModel()"
+              [ngModel]="sessionModel()"
               (ngModelChange)="onSessionModelChange($event)"
               [disabled]="disabled()"
             >
-              <option [ngValue]="null">{{ 'agentSettings.model.default' | transloco }}</option>
+              <option [ngValue]="null">{{ defaultLabel(effectiveSession(), resolvedSessionModel()) }}</option>
               @for (group of availableModels(); track group.group) {
                 <optgroup [label]="providerLabel(group)">
                   @for (model of group.models; track model) {
@@ -241,6 +242,9 @@ export class ModelGroupComponent {
   disabled = input(false);
   /** Raw settings_matrix (family → window/multimodal/params) for the mismatch hint. */
   settingsMatrix = input<Record<string, Record<string, unknown>>>({});
+  /** Server-resolved effective model + provenance per slot (what runs if the
+   *  picker is left untouched). Null → fall back to the config-derived default. */
+  effectiveModels = input<EffectiveModels | null>(null);
 
   change = output<void>();
 
@@ -253,7 +257,10 @@ export class ModelGroupComponent {
   // Session mode: single model override
   readonly sessionModel = signal<string | null>(null);
 
-  // Resolved defaults
+  // Config-derived default (fallback when the server `effective_models` is
+  // absent — e.g. older API or the "defaults" virtual expert). The server value
+  // is authoritative because it includes the account/system default floor this
+  // config-only view can't see.
   readonly resolvedStrategicModel = computed(() =>
     (readConfigPath(this.config(), 'llm.strategic.model') as string)
     ?? (readConfigPath(this.config(), 'llm.model') as string)
@@ -268,27 +275,50 @@ export class ModelGroupComponent {
     (readConfigPath(this.config(), 'llm.model') as string) ?? null
   );
 
-  /** Reasoning options for the currently selected strategic model. */
+  // Server-resolved effective slot ({model, source}) or null when unavailable.
+  readonly effectiveStrategic = computed(() => this.effectiveModels()?.strategic ?? null);
+  readonly effectiveTactical = computed(() => this.effectiveModels()?.tactical ?? null);
+  readonly effectiveSession = computed(() => this.effectiveModels()?.session ?? null);
+
+  // The model actually in effect for a slot: explicit override > server
+  // effective > config-derived fallback. Drives reasoning options + mismatch.
+  readonly strategicInEffect = computed(() =>
+    this.strategicModel() ?? this.effectiveStrategic()?.model ?? this.resolvedStrategicModel(),
+  );
+  readonly tacticalInEffect = computed(() =>
+    this.tacticalModel() ?? this.effectiveTactical()?.model ?? this.resolvedTacticalModel(),
+  );
+  readonly sessionInEffect = computed(() =>
+    this.sessionModel() ?? this.effectiveSession()?.model ?? this.resolvedSessionModel(),
+  );
+
+  /** Reasoning options for the strategic model in effect. */
   readonly strategicReasoningOptions = computed(() =>
-    reasoningOptionsForModel(
-      this.strategicModel() ?? this.resolvedStrategicModel(),
-      this.modelService.reasoningByModel(),
-    )
+    reasoningOptionsForModel(this.strategicInEffect(), this.modelService.reasoningByModel()),
   );
-  /** Reasoning options for the currently selected tactical model. */
+  /** Reasoning options for the tactical model in effect. */
   readonly tacticalReasoningOptions = computed(() =>
-    reasoningOptionsForModel(
-      this.tacticalModel() ?? this.resolvedTacticalModel(),
-      this.modelService.reasoningByModel(),
-    )
+    reasoningOptionsForModel(this.tacticalInEffect(), this.modelService.reasoningByModel()),
   );
-  /** Reasoning options for the session model. */
+  /** Reasoning options for the session model in effect. */
   readonly sessionReasoningOptions = computed(() =>
-    reasoningOptionsForModel(
-      this.sessionModel() ?? this.resolvedSessionModel(),
-      this.modelService.reasoningByModel(),
-    )
+    reasoningOptionsForModel(this.sessionInEffect(), this.modelService.reasoningByModel()),
   );
+
+  /**
+   * Label for the unset "Default" option: names the model that will run if the
+   * picker is left alone, with provenance. `eff` is the server-resolved slot;
+   * `fallback` the config-derived model used when the server didn't resolve one.
+   */
+  defaultLabel(eff: EffectiveModelSlot | null, fallback: string | null): string {
+    const model = eff?.model ?? fallback;
+    if (!model) return this.transloco.translate('agentSettings.model.default');
+    if (eff?.source) {
+      const src = this.transloco.translate('agentSettings.model.source.' + eff.source);
+      return this.transloco.translate('agentSettings.model.defaultResolved', {model, source: src});
+    }
+    return this.transloco.translate('agentSettings.model.defaultResolvedNoSource', {model});
+  }
 
   /**
    * Advisory: do the two phase models' family settings differ enough to matter?
@@ -297,9 +327,11 @@ export class ModelGroupComponent {
    */
   readonly modelMismatch = computed<ModelMismatch | null>(() => {
     if (this.mode() !== 'job') return null;
-    const strat = this.strategicModel() ?? this.resolvedStrategicModel();
-    const tact = this.tacticalModel() ?? this.resolvedTacticalModel();
-    return computeModelMismatch(this.settingsMatrix(), strat, tact);
+    return computeModelMismatch(
+      this.settingsMatrix(),
+      this.strategicInEffect(),
+      this.tacticalInEffect(),
+    );
   });
 
   /** Compact token-count label, e.g. 131072 → "131k", 1050000 → "1.05M". */

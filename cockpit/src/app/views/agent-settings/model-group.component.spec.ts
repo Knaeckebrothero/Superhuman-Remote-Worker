@@ -175,6 +175,49 @@ describe('ModelGroupComponent', () => {
     });
   });
 
+  describe('effective-model default label (Layer 3)', () => {
+    // mockTransloco.translate echoes the key, so we assert which label branch
+    // (and thus which i18n key) defaultLabel selects.
+    it('uses the with-source label when a server effective model + source exist', () => {
+      const {component} = createComponent();
+      expect(
+        component.defaultLabel({model: 'gpt-5.5', source: 'account_default'}, null),
+      ).toBe('agentSettings.model.defaultResolved');
+    });
+
+    it('uses the no-source label when only a config fallback model exists', () => {
+      const {component} = createComponent();
+      expect(component.defaultLabel(null, 'gemma-4-moe')).toBe(
+        'agentSettings.model.defaultResolvedNoSource',
+      );
+    });
+
+    it('falls back to a bare "Default" when no model is resolvable', () => {
+      const {component} = createComponent();
+      expect(component.defaultLabel(null, null)).toBe('agentSettings.model.default');
+    });
+
+    it('prefers the server effective model over the config fallback', () => {
+      const {component} = createComponent();
+      expect(component.defaultLabel({model: 'eff', source: 'expert'}, 'cfg')).toBe(
+        'agentSettings.model.defaultResolved',
+      );
+    });
+  });
+
+  describe('model in effect (override > effective > config)', () => {
+    it('an explicit override wins', () => {
+      const {component} = createComponent();
+      component.strategicModel.set('chosen');
+      expect(component.strategicInEffect()).toBe('chosen');
+    });
+
+    it('is null when nothing is set (empty config, no server effective_models)', () => {
+      const {component} = createComponent();
+      expect(component.strategicInEffect()).toBeNull();
+    });
+  });
+
   describe('resetAll', () => {
     it('should clear all model overrides', () => {
       const {component} = createComponent();
