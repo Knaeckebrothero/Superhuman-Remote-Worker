@@ -59,7 +59,7 @@ function createComponent(overrides?: {
   });
 
   const component = runInInjectionContext(injector, () => new ModelGroupComponent());
-  return {component, mockModelService, mockModels};
+  return {component, mockModelService, mockModels, mockSettings};
 }
 
 
@@ -148,6 +148,30 @@ describe('ModelGroupComponent', () => {
       // In job mode, sessionModel is ignored by getOverrides
       // This tests that the signal itself works
       expect(component.sessionModel()).toBe('gpt-4o');
+    });
+  });
+
+  describe('persist (UI-only, no account write)', () => {
+    it('remembers the pick in localStorage but never PATCHes account preferences', () => {
+      const {component, mockSettings} = createComponent();
+
+      component.onStrategicModelChange('gpt-4o');
+      component.onTacticalModelChange('gpt-5.4');
+
+      // Remembered locally for next-time preselect…
+      expect(localStorage.getItem('ui.lastModel.strategic')).toBe('gpt-4o');
+      expect(localStorage.getItem('ui.lastModel.tactical')).toBe('gpt-5.4');
+      // …but NOT written to the user's global account defaults (the original bug).
+      expect(mockSettings.updatePreferences).not.toHaveBeenCalled();
+    });
+
+    it('clears the localStorage key when reset to default (null)', () => {
+      const {component} = createComponent();
+      component.onStrategicModelChange('gpt-4o');
+      expect(localStorage.getItem('ui.lastModel.strategic')).toBe('gpt-4o');
+
+      component.onStrategicModelChange(null);
+      expect(localStorage.getItem('ui.lastModel.strategic')).toBeNull();
     });
   });
 

@@ -3,14 +3,17 @@ import {FormsModule} from '@angular/forms';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {AppIconComponent} from '../../ui/icon';
 import {ModelService} from '../../core/services/model.service';
-import {SettingsService} from '../../core/services/settings.service';
 import {computeModelMismatch, ModelMismatch, readConfigPath, SettingsMode} from './agent-settings.types';
 import {reasoningOptionsForModel} from './reasoning-options';
 
+// UI-only "last selected model" preselect keys (localStorage). Deliberately NOT
+// the account-settings keys (`default_*_model`): a per-job/session control must
+// not write a global account preference. See Layer 2 in the issue doc
+// loop_ran_codex_spark_not_selected_model_then_hung_on_cooldown.md.
 const STORAGE_KEYS = {
-  strategic: 'default_strategic_model',
-  tactical: 'default_tactical_model',
-  session: 'default_session_model',
+  strategic: 'ui.lastModel.strategic',
+  tactical: 'ui.lastModel.tactical',
+  session: 'ui.lastModel.session',
 } as const;
 
 /**
@@ -225,7 +228,6 @@ const STORAGE_KEYS = {
 })
 export class ModelGroupComponent {
   private readonly modelService = inject(ModelService);
-  private readonly settingsService = inject(SettingsService);
   private readonly transloco = inject(TranslocoService);
 
   providerLabel(group: {group: string; configured: boolean}): string {
@@ -390,9 +392,12 @@ export class ModelGroupComponent {
     }
   }
 
+  // UI-only: remember the last picked model in localStorage to preselect the
+  // dropdown next time. Does NOT write account preferences — that silent global
+  // write (default_strategic_model / default_tactical_model) is what shadowed an
+  // explicit loop/job model. Account defaults are edited only on the Settings page.
   private persistModel(key: keyof typeof STORAGE_KEYS, value: string | null): void {
     const storageKey = STORAGE_KEYS[key];
-    const settingsKey = `default_${key}_model` as const;
     try {
       if (value) {
         localStorage.setItem(storageKey, value);
@@ -402,6 +407,5 @@ export class ModelGroupComponent {
     } catch {
       // localStorage may be unavailable
     }
-    this.settingsService.updatePreferences({ [settingsKey]: value ?? null }).subscribe();
   }
 }

@@ -1701,34 +1701,16 @@ async def _inject_dispatch_credentials(
                 )
                 logger.info(f"Dispatch: injected user default_model: {default_model}")
 
-        for _phase, _setting_key in (
-            ("strategic", "default_strategic_model"),
-            ("tactical", "default_tactical_model"),
-        ):
-            _phase_model = user_settings.get(_setting_key)
-            if not _phase_model:
-                continue
-            llm_block = config_override.setdefault("llm", {})
-            if _phase in llm_block and llm_block[_phase].get("model"):
-                continue
-            phase_section: dict = {}
-            await _inject_model_credentials(
-                section=phase_section,
-                model_id=_phase_model,
-                user_id=user_id_str,
-                resolved_keys=resolved_keys,
-                gateway_override=_gw_scoped,
-            )
-            if "api_key" not in phase_section and "base_url" not in phase_section:
-                logger.warning(
-                    f"Dispatch: skipping {_phase} phase pin {_phase_model} — "
-                    f"no credentials resolvable; configure the provider key "
-                    f"in system_api_keys or clear the {_setting_key} preference."
-                )
-                continue
-            phase_section["model"] = _phase_model
-            llm_block[_phase] = phase_section
-            logger.info(f"Dispatch: injected {_phase} phase pin: {_phase_model}")
+        # Per-phase account model defaults (default_strategic_model /
+        # default_tactical_model) were removed: the single top-level
+        # default_model above is the only account-level model preference. They
+        # silently shadowed an explicit per-loop/per-job top-level model (a phase
+        # pin beats the top-level in LLMConfig.get_phase_config) and were
+        # invisible/unmanageable in the UI. Explicit per-job phase pins still
+        # arrive via config_override.llm.{strategic,tactical} (the request
+        # override), credentialed by the _inject_model_credentials calls earlier
+        # in this function. See
+        # docs/issues/loop_ran_codex_spark_not_selected_model_then_hung_on_cooldown.md (Layer 1).
 
         default_autonomy = user_settings.get("default_autonomy")
         if default_autonomy and "autonomy" not in config_override:
@@ -4925,8 +4907,10 @@ class UserSettingsUpdate(BaseModel):
     default_whisper_model: str | None = None
     default_tts_model: str | None = None
     default_session_model: str | None = None
-    default_strategic_model: str | None = None
-    default_tactical_model: str | None = None
+    # NOTE: per-phase model defaults (default_strategic_model /
+    # default_tactical_model) were removed — see Layer 1 in
+    # docs/issues/loop_ran_codex_spark_not_selected_model_then_hung_on_cooldown.md.
+    # Old clients PATCHing them are ignored (BaseModel drops unknown fields).
     default_embedding_model: str | None = None
     embedding_provider: str | None = None
     # Admin "View as" preference: 'all' = fleet-wide visibility (default),
@@ -21032,12 +21016,15 @@ async def _enforce_readiness_gate() -> None:
     )
 
 
-def _resolve_preference_defaults() -> dict[str, Any]:
+async def _resolve_preference_defaults() -> dict[str, Any]:
     """Compute resolved default values for all user preference fields.
 
-    Reads framework defaults from defaults.yaml / persistent_defaults.yaml
-    and env-var defaults for helper models. This lets the UI show the actual
-    effective value instead of "Not set" / "Server default".
+    The chat/auxiliary/session model defaults come from the DB model registry
+    (``resolve_default_for_capability`` — the SAME source dispatch uses), so the
+    UI shows the model the agent will actually run, not the ``defaults.yaml``
+    placeholder. Non-model fields (autonomy, reasoning, helper-model env
+    fallbacks) still read framework defaults / env vars. This lets the UI show
+    the actual effective value instead of "Not set" / "Server default".
     """
     config_dir = _get_config_dir()
 
@@ -21061,11 +21048,18 @@ def _resolve_preference_defaults() -> dict[str, Any]:
     aux = worker_cfg.get("auxiliary", {})
     p_llm = persistent_cfg.get("llm", {})
 
+    # System chat/auxiliary defaults come from the DB model registry — the same
+    # source dispatch resolves via resolve_default_for_capability — NOT the YAML
+    # placeholder, so the displayed "default" is the model the agent will run.
+    # Fall back to the YAML model only when the registry has no capability default.
+    registry_chat = await postgres_db.resolve_default_for_capability("chat")
+    registry_aux = await postgres_db.resolve_default_for_capability("auxiliary")
+
     return {
-        "default_model": llm.get("model"),
+        "default_model": registry_chat or llm.get("model"),
         "default_autonomy": worker_cfg.get("autonomy"),
         "default_reasoning_level": llm.get("reasoning_level"),
-        "default_auxiliary_model": aux.get("model") or llm.get("model"),
+        "default_auxiliary_model": registry_aux or aux.get("model") or llm.get("model"),
         # Helper-model defaults match the env-var fallbacks in the agent code
         # (src/services/vision_helper.py, audio_helper.py, embedding_service.py)
         "default_vision_model": os.environ.get("VISION_MODEL", "gpt-4o"),
@@ -21079,7 +21073,10 @@ def _resolve_preference_defaults() -> dict[str, Any]:
         # has explicitly narrowed to their own data.
         "admin_view_mode": "all",
         "persistent_agent": {
-            "model": p_llm.get("model"),
+            # Sessions resolve their base model via the same chat-capability
+            # default (base_defaults in _resolve_session_config), so surface that
+            # — not the persistent_defaults.yaml placeholder.
+            "model": registry_chat or p_llm.get("model"),
             "permission_mode": "supervised",
             "idle_timeout_minutes": 30,
             "config_name": "",
@@ -21098,7 +21095,7 @@ async def get_user_preferences(request: Request) -> dict[str, Any]:
     """
     user = await require_approved_user(request, postgres_db)
     prefs = await postgres_db.get_user_settings(str(user["id"]))
-    prefs["_resolved"] = _resolve_preference_defaults()
+    prefs["_resolved"] = await _resolve_preference_defaults()
     return prefs
 
 
