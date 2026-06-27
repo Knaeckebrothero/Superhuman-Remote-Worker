@@ -14,6 +14,7 @@ import {AppInputComponent} from '../../ui/input';
 import {AppChipComponent} from '../../ui/chip';
 import {AppIconComponent} from '../../ui/icon';
 import {AppFormFieldComponent} from '../../ui/form-field';
+import {EffectiveModels} from '../../core/models/api.model';
 
 interface Project {
   id: string;
@@ -40,6 +41,8 @@ interface ExpertDetail extends Expert {
   instructions: string | null;
   defaults_tools?: Record<string, string[]>;
   settings_matrix?: Record<string, Record<string, unknown>>;
+  /** Effective model + provenance per slot (server-resolved). */
+  effective_models?: EffectiveModels | null;
 }
 
 /**
