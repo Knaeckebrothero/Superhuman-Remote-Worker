@@ -276,6 +276,7 @@ import {AppTooltipDirective} from '../../ui/tooltip';
             [showProjectMemory]="projectHasSharedMemory()"
             [defaultsTools]="expertDetail()?.defaults_tools ?? {}"
             [settingsMatrix]="expertDetail()?.settings_matrix ?? frameworkSettingsMatrix()"
+            [effectiveModels]="expertDetail()?.effective_models ?? null"
             [datasources]="availableDatasources()"
             [loadingDatasources]="isLoadingDatasources()"
             [loadingExpert]="isLoadingExpertDetail()"

@@ -1,5 +1,5 @@
 import {Component, computed, effect, ElementRef, inject, input, output, signal, ViewChild} from '@angular/core';
-import {Datasource} from '../../core/models/api.model';
+import {Datasource, EffectiveModels} from '../../core/models/api.model';
 import {ViewportService} from '../../core/services/viewport.service';
 import {SettingsMode} from './agent-settings.types';
 import {ExecutionGroupComponent} from './execution-group.component';
@@ -78,6 +78,7 @@ type AgentSettingsTab = 'settings' | 'instructions' | 'advanced' | 'resolved';
             [mode]="mode()"
             [disabled]="disabled()"
             [settingsMatrix]="settingsMatrix()"
+            [effectiveModels]="effectiveModels()"
             (change)="onChange()"
           />
           <app-tools-group
@@ -218,6 +219,9 @@ export class AgentSettingsComponent {
   defaultsTools = input<Record<string, string[]>>({});
   /** Raw settings_matrix for client-side model-family resolution. */
   settingsMatrix = input<Record<string, Record<string, unknown>>>({});
+  /** Server-resolved effective model + provenance per slot (forwarded to the
+   *  model picker so the unset "Default" option names what will actually run). */
+  effectiveModels = input<EffectiveModels | null>(null);
   /** Available datasources. */
   datasources = input<Datasource[]>([]);
   loadingDatasources = input(false);
