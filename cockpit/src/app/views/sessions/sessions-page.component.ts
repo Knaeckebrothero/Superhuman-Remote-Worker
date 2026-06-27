@@ -7,7 +7,6 @@ import {firstValueFrom} from 'rxjs';
 import {environment} from '../../core/environment';
 import {PersistentChatService} from '../../core/services/persistent-chat.service';
 import {ModelService} from '../../core/services/model.service';
-import {SettingsService} from '../../core/services/settings.service';
 import {AppToastService} from '../../ui/toast';
 import {ErrorMessageService} from '../../core/services/error-message.service';
 import {UserService} from '../../core/services/user.service';
@@ -519,7 +518,6 @@ export class SessionsPageComponent implements OnInit {
     private readonly toast = inject(AppToastService);
     private readonly errors = inject(ErrorMessageService);
     private readonly userService = inject(UserService);
-    private readonly settingsService = inject(SettingsService);
     readonly modelService = inject(ModelService);
     readonly chat = inject(PersistentChatService);
     private readonly transloco = inject(TranslocoService);
@@ -723,9 +721,11 @@ export class SessionsPageComponent implements OnInit {
     }
 
     private persistSessionModel(model: string): void {
+        // UI-only preselect (localStorage). Does NOT write account preferences —
+        // a per-session control must not set a global default. See Layer 2 in
+        // loop_ran_codex_spark_not_selected_model_then_hung_on_cooldown.md.
         try {
             localStorage.setItem('default_session_model', model);
         } catch { /* localStorage may be unavailable */ }
-        this.settingsService.updatePreferences({ default_session_model: model }).subscribe();
     }
 }
