@@ -248,6 +248,70 @@ def _is_codex_proxy_error(exc: BaseException) -> bool:
     return url is not None and _is_codex_proxy_url(url)
 
 
+# A 429 whose reset window exceeds this is treated as a quota COOLDOWN (fail
+# fast), not a per-minute rate limit (retry): retrying within the window is
+# futile. Anything at/under it is a normal rate limit. See Defect C in
+# docs/issues/loop_ran_codex_spark_not_selected_model_then_hung_on_cooldown.md.
+_COOLDOWN_MIN_RESET_SECONDS = 300.0
+
+# C2 circuit breaker: after this many CONSECUTIVE execute-node invocations that
+# exhaust their inner LLM retries with no progress, stop instead of letting the
+# outer graph loop re-enter execute forever (the deferred "Fix 3" from
+# docs/done/agent_infinite_retry_on_permanent_llm_errors.md).
+_LLM_ERROR_STREAK_CAP = 5
+
+
+def _cooldown_reset_seconds(exc: BaseException) -> Optional[float]:
+    """If ``exc`` is a quota/model cooldown, return its reset window in seconds.
+
+    A cooldown is a 429 whose body carries a ``model_cooldown`` code (all
+    credentials exhausted) or a long ``reset_seconds`` — a multi-day quota wall,
+    NOT a per-minute throttle. Inspects a SINGLE exception (the classifier walks
+    the ``__cause__`` chain). Returns ``None`` when it is not a cooldown.
+    """
+    code = ""
+    reset: Optional[float] = None
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        err = body.get("error") or {}
+        if isinstance(err, dict):
+            code = (err.get("code") or "").lower()
+            rs = err.get("reset_seconds")
+            if isinstance(rs, (int, float)):
+                reset = float(rs)
+    text = str(exc).lower()
+    if reset is None:
+        m = re.search(r"reset_seconds['\"]?\s*[:=]\s*([0-9.]+)", text)
+        if m:
+            reset = float(m.group(1))
+    if code == "model_cooldown" or "model_cooldown" in text:
+        return reset if reset is not None else _COOLDOWN_MIN_RESET_SECONDS
+    if reset is not None and reset > _COOLDOWN_MIN_RESET_SECONDS:
+        return reset
+    return None
+
+
+def _cooldown_detail(error: Exception) -> tuple[Optional[float], Optional[str]]:
+    """Walk the cause chain and return ``(reset_seconds, model)`` for a cooldown
+    error (for an operator-facing message), or ``(None, None)``."""
+    current: Optional[BaseException] = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        reset = _cooldown_reset_seconds(current)
+        if reset is not None:
+            model = None
+            body = getattr(current, "body", None)
+            if isinstance(body, dict):
+                err = body.get("error") or {}
+                if isinstance(err, dict):
+                    model = err.get("model")
+            return reset, model
+        nxt = getattr(current, "__cause__", None)
+        current = nxt if nxt is not current else None
+    return None, None
+
+
 def _classify_llm_error(error: Exception) -> str:
     """Classify an LLM exception as ``permanent``, ``rate_limit``, or ``transient``.
 
@@ -271,6 +335,9 @@ def _classify_llm_error(error: Exception) -> str:
     Returns one of:
 
     * ``permanent``  — short-circuit retries, mark the job failed.
+    * ``cooldown``   — a quota/model cooldown (long reset window); the caller
+      fails fast because retrying within the window is futile. See
+      :func:`_cooldown_reset_seconds`.
     * ``rate_limit`` — transient, but the caller should respect Retry-After
       via :func:`_extract_rate_limit_delay`.
     * ``transient``  — retry with the existing backoff schedule.
@@ -285,6 +352,8 @@ def _classify_llm_error(error: Exception) -> str:
         status_code = getattr(current, "status_code", None)
         if isinstance(status_code, int):
             if status_code == 429:
+                if _cooldown_reset_seconds(current) is not None:
+                    return "cooldown"
                 return "rate_limit"
             if status_code in _PERMANENT_STATUS:
                 # 400 needs to be disambiguated — Groq's tool_use_failed and
@@ -330,6 +399,8 @@ def _classify_llm_error(error: Exception) -> str:
         ):
             return "permanent"
         if cls_name == "RateLimitError":
+            if _cooldown_reset_seconds(current) is not None:
+                return "cooldown"
             return "rate_limit"
         if cls_name == "BadRequestError":
             # Same disambiguation as the 400 status branch above.
@@ -362,6 +433,8 @@ def _classify_llm_error(error: Exception) -> str:
         return "permanent"
     if "permissiondenied" in error_str:
         return "permanent"
+    if "model_cooldown" in error_str:
+        return "cooldown"
     if (
         "429" in error_str
         or "rate limit" in error_str
@@ -812,6 +885,11 @@ def create_execute_node(
 
     # Track consecutive tool_use_failed errors (mutable container for closure access)
     _tool_use_failed_streak = [0]
+    # C2 circuit breaker: consecutive execute invocations that exhausted their
+    # inner LLM retries with NO progress. Reset on any successful LLM response;
+    # trips a hard fail at _LLM_ERROR_STREAK_CAP so the outer graph loop can't
+    # spin forever on a never-recovering retriable error.
+    _llm_error_streak = [0]
     # Track consecutive response degeneration events
     _degeneration_streak = [0]
     # Track consecutive empty LLM responses (no content, no tool calls).
@@ -1383,8 +1461,9 @@ def create_execute_node(
                 )
                 latency_ms = int((time.time() - start_time) * 1000)
 
-                # Reset tool_use_failed streak on successful response
+                # Reset failure streaks on a successful LLM response.
                 _tool_use_failed_streak[0] = 0
+                _llm_error_streak[0] = 0
 
                 tool_calls_count = (
                     len(response.tool_calls)
@@ -2152,6 +2231,56 @@ def create_execute_node(
                         "should_stop": True,
                     }
 
+                if classification == "cooldown":
+                    # C1: a quota cooldown (all credentials cooling down) with a
+                    # multi-day reset — retrying within the window is futile, so
+                    # fail fast with an actionable reason instead of looping (the
+                    # gpt-5.3-codex-spark incident). Re-run after the reset, or
+                    # pin a fallback model.
+                    reset_s, cd_model = _cooldown_detail(e)
+                    when = (
+                        f"~{reset_s / 3600:.1f}h" if reset_s else "an extended period"
+                    )
+                    cd_msg = (
+                        f"Model '{cd_model or phase_model}' is in a quota cooldown "
+                        f"(all credentials cooling down); it resets in {when}. Failed "
+                        f"fast rather than retry-looping — re-run after the reset or "
+                        f"pin a different/fallback model."
+                    )
+                    logger.error(
+                        f"[{job_id}] LLM quota cooldown — failing job without retry: {e}"
+                    )
+                    if auditor:
+                        auditor.audit_step(
+                            job_id=job_id,
+                            agent_type=config.agent_id,
+                            step_type="error",
+                            node_name="execute",
+                            iteration=iteration,
+                            data={
+                                "error": {
+                                    "type": "llm_error",
+                                    "message": cd_msg[:500],
+                                    "recoverable": False,
+                                    "classification": "cooldown",
+                                    "attempts": attempt + 1,
+                                    "reset_seconds": reset_s,
+                                }
+                            },
+                            metadata=state.get("metadata"),
+                            phase=phase_str,
+                            phase_number=phase_number,
+                        )
+                    return {
+                        "error": {
+                            "message": cd_msg,
+                            "type": "llm_error",
+                            "recoverable": False,
+                        },
+                        "iteration": iteration + 1,
+                        "should_stop": True,
+                    }
+
                 retry_manager.record_failure("llm_invoke")
 
                 if retry_manager.should_retry("llm_invoke", attempt):
@@ -2200,6 +2329,53 @@ def create_execute_node(
                 logger.error(
                     f"[{job_id}] LLM error after {attempt + 1} attempts: {e}{auth_hint}"
                 )
+
+                # C2 circuit breaker: this execute invocation exhausted its inner
+                # retries. The inner attempt counter resets each invocation, but
+                # the outer graph loop re-enters execute and tries again — so
+                # count CONSECUTIVE no-progress invocations and hard-stop at the
+                # cap rather than spin forever on a never-recovering error.
+                _llm_error_streak[0] += 1
+                if _llm_error_streak[0] >= _LLM_ERROR_STREAK_CAP:
+                    cb_msg = (
+                        f"LLM call failed on {_llm_error_streak[0]} consecutive "
+                        f"iterations with no progress (last error: "
+                        f"{str(e)[:200]}{auth_hint}). Failing fast instead of "
+                        f"looping — check the model endpoint/provider/quota."
+                    )
+                    logger.error(
+                        f"[{job_id}] LLM error circuit breaker tripped after "
+                        f"{_llm_error_streak[0]} no-progress iterations: {e}"
+                    )
+                    if auditor:
+                        auditor.audit_step(
+                            job_id=job_id,
+                            agent_type=config.agent_id,
+                            step_type="error",
+                            node_name="execute",
+                            iteration=iteration,
+                            data={
+                                "error": {
+                                    "type": "llm_error",
+                                    "message": cb_msg[:500],
+                                    "recoverable": False,
+                                    "classification": "circuit_breaker",
+                                    "consecutive_failures": _llm_error_streak[0],
+                                }
+                            },
+                            metadata=state.get("metadata"),
+                            phase=phase_str,
+                            phase_number=phase_number,
+                        )
+                    return {
+                        "error": {
+                            "message": cb_msg,
+                            "type": "llm_error",
+                            "recoverable": False,
+                        },
+                        "iteration": iteration + 1,
+                        "should_stop": True,
+                    }
 
                 # Audit error
                 if auditor:

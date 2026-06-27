@@ -10,6 +10,8 @@ from unittest.mock import MagicMock
 
 from src.graph import (
     _classify_llm_error,
+    _cooldown_reset_seconds,
+    _cooldown_detail,
     _extract_rate_limit_delay,
     _extract_tool_use_failed,
     _build_tool_use_failed_feedback,
@@ -632,6 +634,73 @@ class TestClassifyLlmError:
     def test_429_is_rate_limit(self):
         err = _make_sdk_error("RateLimitError", 429)
         assert _classify_llm_error(err) == "rate_limit"
+
+    def test_429_model_cooldown_is_cooldown(self):
+        """The gpt-5.3-codex-spark incident: a 429 whose body carries a
+        model_cooldown code (all credentials cooling down) classifies as
+        'cooldown' so the caller fails fast instead of retry-looping."""
+        err = _make_sdk_error(
+            "RateLimitError",
+            429,
+            body={
+                "error": {
+                    "code": "model_cooldown",
+                    "message": "All credentials for model X are cooling down",
+                    "model": "gpt-5.3-codex-spark",
+                    "reset_seconds": 482000,
+                }
+            },
+        )
+        assert _classify_llm_error(err) == "cooldown"
+
+    def test_429_long_reset_without_code_is_cooldown(self):
+        """A long reset window (no explicit code) is still a cooldown."""
+        err = _make_sdk_error(
+            "RateLimitError", 429, body={"error": {"reset_seconds": 3600}}
+        )
+        assert _classify_llm_error(err) == "cooldown"
+
+    def test_429_short_reset_is_plain_rate_limit(self):
+        """A short reset (per-minute throttle) stays a retriable rate limit."""
+        err = _make_sdk_error(
+            "RateLimitError", 429, body={"error": {"reset_seconds": 30}}
+        )
+        assert _classify_llm_error(err) == "rate_limit"
+
+    def test_model_cooldown_string_fallback_is_cooldown(self):
+        """The stringified provider error (no SDK class/body) still classifies
+        as cooldown via the message fallback — matches the incident audit log."""
+        err = Exception(
+            "Error code: 429 - {'error': {'code': 'model_cooldown', "
+            "'reset_seconds': 482593}}"
+        )
+        assert _classify_llm_error(err) == "cooldown"
+
+    def test_cooldown_reset_seconds_helper(self):
+        err = _make_sdk_error(
+            "RateLimitError",
+            429,
+            body={"error": {"code": "model_cooldown", "reset_seconds": 482000}},
+        )
+        assert _cooldown_reset_seconds(err) == 482000.0
+        # A plain 429 with no cooldown body is not a cooldown.
+        assert _cooldown_reset_seconds(_make_sdk_error("RateLimitError", 429)) is None
+
+    def test_cooldown_detail_extracts_model_and_reset(self):
+        err = _make_sdk_error(
+            "RateLimitError",
+            429,
+            body={
+                "error": {
+                    "code": "model_cooldown",
+                    "model": "gpt-5.3-codex-spark",
+                    "reset_seconds": 482000,
+                }
+            },
+        )
+        reset, model = _cooldown_detail(err)
+        assert reset == 482000.0
+        assert model == "gpt-5.3-codex-spark"
 
     def test_503_is_transient(self):
         err = _make_sdk_error("APIStatusError", 503)
