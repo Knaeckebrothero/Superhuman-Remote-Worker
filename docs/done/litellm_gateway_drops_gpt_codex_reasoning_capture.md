@@ -204,11 +204,12 @@ reasoning so codex models stay metered **and** keep reasoning.
 > (`docs/features/route_all_models_through_litellm_gateway.md`): LiteLLM's
 > `use_responses_api: true` bridges Chat Completions ↔ the codex proxy's
 > Responses API and **preserves the reasoning summary + cost** (verified on
-> v1.90.0). P1 (`21c7022b`) registers codex with that flag; P2 (`ccb534a0`)
+> v1.90.0). P1 (`3e7b67bf`) registers codex with that flag; P2 (`3bb72235`)
 > routes it through the gateway behind the `LITELLM_GATEWAY_ROUTED_PROVIDERS`
 > canary — so the `provider == "codex"` bypass is lifted (per provider) and
-> codex is metered while keeping reasoning. k3d-verified: a `gpt-5.5` job
-> routed via the gateway with the openai factory + bridge, reasoning intact.
+> codex is metered while keeping reasoning. **Live on dev (`sha-1163fd8`):**
+> codex GPT-5.5 + gpt-5.4-mini are metered in `usage_events` ($100.79 / $15.37),
+> reasoning intact via the openai factory + gateway bridge.
 
 Tests: `tests/test_model_registry.py::TestEndpointFactoryProvider` +
 `::TestEndpointMetaProviderResolution` and

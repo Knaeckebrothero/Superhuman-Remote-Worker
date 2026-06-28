@@ -1310,6 +1310,9 @@ def _gateway_routed_providers() -> frozenset[str]:
 
     Comma-separated, lowercased (e.g. ``"google,openrouter,codex"``). Empty/unset
     → no system/codex model is forced onto the gateway (pre-Phase-2 behaviour).
+    The sentinel ``"*"`` means **every** system/codex provider routes through the
+    gateway — the end-state "single path for all LLM traffic" posture, so new
+    providers route the moment they're registered, with no per-provider edit.
     """
     raw = os.getenv("LITELLM_GATEWAY_ROUTED_PROVIDERS", "")
     return frozenset(p.strip().lower() for p in raw.split(",") if p.strip())
@@ -1336,14 +1339,19 @@ def _should_route_via_gateway(meta: Any, gw_target: tuple[str, str] | None) -> b
 
     Three gates, all required: the gateway is reachable (``gw_target`` non-None —
     also covers the Phase-0 health fallback), the model's provider is in the
-    canary allowlist, and the model is **actually registered** in the gateway.
-    The last is the fail-loud guard: a canaried-but-unregistered model routes
-    direct (with a warning) instead of 400-ing against an unknown gateway model.
+    canary allowlist (or the allowlist is the ``"*"`` wildcard = all providers),
+    and the model is **actually registered** in the gateway. The last is the
+    fail-loud guard: a canaried-but-unregistered model routes direct (with a
+    warning) instead of 400-ing against an unknown gateway model — so even ``"*"``
+    never forces an unregistered model onto the gateway.
     """
     if gw_target is None:
         return False
     provider = _gateway_canary_provider(meta)
-    if provider is None or provider not in _gateway_routed_providers():
+    if provider is None:
+        return False
+    routed = _gateway_routed_providers()
+    if "*" not in routed and provider not in routed:
         return False
     if meta.model_id not in gateway_registered_models():
         logger.warning(
