@@ -80,23 +80,33 @@ class SudoGateService:
             " ".join(argv),
         )
 
-        # Store the request with the NATS reply subject.
+        # Store the request with the NATS reply subject. This is also the claim:
+        # the NATS sudo subject fans out to every replica (no queue group), so
+        # both run this handler; _insert_request claims the request on its unique
+        # reply subject (migration 0040) and only the winner proceeds. (HA / M2-L4)
         reply_subject = msg.reply if hasattr(msg, "reply") else None
-        request_id = await self._insert_request(
-            job_id=job_id,
-            vm_name=vm_id,
-            command=command,
-            arguments=argv,
-            cwd=cwd,
-            requesting_user=user,
-            target_user=runas_user,
-            nats_reply_subject=reply_subject,
-            metadata=data,
-        )
-
-        if not request_id:
-            # DB insert failed — deny immediately.
+        try:
+            request_id = await self._insert_request(
+                job_id=job_id,
+                vm_name=vm_id,
+                command=command,
+                arguments=argv,
+                cwd=cwd,
+                requesting_user=user,
+                target_user=runas_user,
+                nats_reply_subject=reply_subject,
+                metadata=data,
+            )
+        except Exception as e:
+            # Genuine DB failure — deny so the daemon doesn't hang.
+            logger.error("Sudo request insert failed: %s", e)
             await self._nats_reply(reply_subject, False, "internal error")
+            return
+
+        if request_id is None:
+            # Lost the claim to the other replica — it owns this request; drop
+            # silently (do NOT deny: the winner responds).
+            logger.debug("Sudo request already claimed by another replica; dropping")
             return
 
         # Evaluate auto-approval rules.
