@@ -247,3 +247,54 @@ def test_unrouted_model_slots_ignores_slots_without_a_model():
 
     blob = {"agent": {"llm": {"model": "m", "base_url": "u", "strategic": {}}}}
     assert unrouted_model_slots(blob) == []
+
+
+# --- Per-model context-window override flows to derived limits (blob path) ----
+
+
+def test_request_override_context_window_drives_derived_limits():
+    """A per-model context window passed via ``request_override`` becomes the
+    limits-derivation base: it sets BOTH ``limits.model_max_context_tokens`` and
+    the 0.80x ``context_threshold_tokens``, overriding the family default.
+
+    This is the mechanism the orchestrator's ``_seed_registry_model_overrides``
+    relies on so an admin's Admin -> Models ``context_window`` survives the blob
+    dispatch path. Regression guard for
+    ``docs/issues/per_model_context_window_override_shadowed_in_blob_dispatch.md``
+    (job 19707fa1: minimax-m3 baked 1000000/800000 despite a registry cap of
+    262144). Matrix-independent: the override value itself drives the result.
+    """
+    OVERRIDE = 262144  # an admin 256k cap, distinct from the 1M family default
+    blob = resolve_config(
+        base_config_name="persistent_defaults",
+        request_override={
+            "llm": {
+                "model": "openrouter/minimax/minimax-m3",
+                "model_max_context_tokens": OVERRIDE,
+            }
+        },
+        expert_type="worker",
+    )
+    limits = blob["agent"]["limits"]
+    assert limits["model_max_context_tokens"] == OVERRIDE
+    assert limits["context_threshold_tokens"] == int(OVERRIDE * 0.80)  # 209715
+
+
+def test_no_per_model_window_falls_back_to_family_default():
+    """Without a per-model override the model resolves to the (larger) family
+    default window — proving the override, not a coincidental family match, is
+    what changed the derived limits above. The bug was exactly this default
+    silently winning on the blob path (minimax-m3 family default = 1M, so
+    compaction fired at 800k instead of the admin's ~205k)."""
+    OVERRIDE = 262144
+    blob = resolve_config(
+        base_config_name="persistent_defaults",
+        request_override={"llm": {"model": "openrouter/minimax/minimax-m3"}},
+        expert_type="worker",
+    )
+    limits = blob["agent"]["limits"]
+    # family default (1M) > the admin cap — the "compaction fires too late" bug
+    assert limits["model_max_context_tokens"] > OVERRIDE
+    assert limits["context_threshold_tokens"] == int(
+        limits["model_max_context_tokens"] * 0.80
+    )
