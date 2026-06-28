@@ -75,9 +75,15 @@ async def _row_count(gate, reply: str) -> int:
 
 async def _claim(gate, reply, user="agent"):
     return await gate._insert_request(
-        job_id=JOB, vm_name="vm1", command="rm", arguments=["-rf", "/tmp/x"],
-        cwd="/tmp", requesting_user=user, target_user="root",
-        nats_reply_subject=reply, metadata={"k": "v"},
+        job_id=JOB,
+        vm_name="vm1",
+        command="rm",
+        arguments=["-rf", "/tmp/x"],
+        cwd="/tmp",
+        requesting_user=user,
+        target_user="root",
+        nats_reply_subject=reply,
+        metadata={"k": "v"},
     )
 
 

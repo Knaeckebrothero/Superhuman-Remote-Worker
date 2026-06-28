@@ -494,7 +494,10 @@ class NatsBridge:
             # always receives the broadcast. A queue group would instead risk the
             # follower winning and the leader-gated dispatch poke below no-op'ing
             # (see the M2-L4 spec).
-            from services.leader_election import is_leader  # flattened import (M1 lesson)
+            from services.leader_election import (
+                is_leader,
+            )  # flattened import (M1 lesson)
+
             if ssh_host and is_leader.is_set():
                 asyncio.create_task(
                     self._seed_vm_ide_config(job_id, is_thread, ssh_host, ssh_port)
