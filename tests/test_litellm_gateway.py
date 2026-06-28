@@ -1087,6 +1087,90 @@ class TestMaterializeLlmUsage:
         client.get_spend_logs.assert_awaited_once_with(start_date=None)
 
 
+class TestMaterializeLlmUsageCost:
+    """Phase 3 — gateway-priced cost dimension (LiteLLM ``spend`` → cost_usd)."""
+
+    def _paid_row(self, spend, *, prompt=100, completion=20, rid="paid1"):
+        return {
+            "request_id": rid,
+            "model_group": "minimax-m3",
+            "prompt_tokens": prompt,
+            "completion_tokens": completion,
+            "startTime": "2026-06-22T06:36:47.993000Z",
+            "spend": spend,
+        }
+
+    async def _run(self, rows):
+        client = AsyncMock()
+        client.get_spend_logs.return_value = rows
+        ledger = _CaptureLedger()
+        res = await materialize_llm_usage(client, ledger)
+        return res, ledger
+
+    @pytest.mark.asyncio
+    async def test_paid_request_emits_gateway_priced_cost_row(self):
+        uid, pid = str(uuid4()), str(uuid4())
+        row = self._paid_row(0.0074541)
+        row["user"] = f"srw-user-{uid}"
+        row["team_id"] = f"srw-proj-{pid}"
+        res, ledger = await self._run([row])
+        # prompt-token + completion-token + the gateway-priced request row.
+        assert res["materialized"] == 3
+        by = {e.unit: e for e in ledger.events}
+        cost_row = by["request"]
+        assert cost_row.quantity == 1
+        assert cost_row.cost_usd == pytest.approx(0.0074541)
+        assert cost_row.rate_usd == pytest.approx(0.0074541)
+        assert cost_row.category == "llm" and cost_row.resource == "minimax-m3"
+        assert cost_row.user_id == uid and cost_row.project_id == pid
+        # Token rows stay cost-free (no per-token rate); only the request row carries
+        # cost, so SUM(cost_usd) over the request equals spend with no double-count.
+        assert by["prompt-token"].cost_usd is None
+        assert by["completion-token"].cost_usd is None
+        total = sum(e.cost_usd for e in ledger.events if e.cost_usd is not None)
+        assert total == pytest.approx(0.0074541)
+
+    @pytest.mark.asyncio
+    async def test_free_model_emits_no_cost_row(self):
+        # Homelab/unpriced model reports spend=0.0 → token rows only, no cost row.
+        res, ledger = await self._run([self._paid_row(0.0)])
+        assert res["materialized"] == 2
+        assert "request" not in {e.unit for e in ledger.events}
+
+    @pytest.mark.asyncio
+    async def test_missing_spend_emits_no_cost_row(self):
+        row = self._paid_row(0.0)
+        del row["spend"]
+        res, ledger = await self._run([row])
+        assert res["materialized"] == 2
+        assert "request" not in {e.unit for e in ledger.events}
+
+    @pytest.mark.asyncio
+    async def test_unparseable_spend_skipped_gracefully(self):
+        res, ledger = await self._run([self._paid_row("not-a-number")])
+        assert res["materialized"] == 2
+        assert "request" not in {e.unit for e in ledger.events}
+
+    @pytest.mark.asyncio
+    async def test_prompt_only_paid_still_emits_cost_row(self):
+        # A call with only prompt tokens still gets its one gateway-priced row.
+        res, ledger = await self._run([self._paid_row(0.002, completion=0)])
+        assert res["materialized"] == 2  # prompt-token + request
+        units = {e.unit for e in ledger.events}
+        assert units == {"prompt-token", "request"}
+
+    @pytest.mark.asyncio
+    async def test_cost_row_is_idempotent_on_repoll(self):
+        # The request row dedupes on (source, source_id, unit, ts) like token rows,
+        # so re-polling the same spend log never double-counts cost.
+        client = AsyncMock()
+        client.get_spend_logs.return_value = [self._paid_row(0.0074541)]
+        ledger = _CaptureLedger()
+        assert (await materialize_llm_usage(client, ledger))["materialized"] == 3
+        assert (await materialize_llm_usage(client, ledger))["materialized"] == 0
+        assert sum(1 for e in ledger.events if e.unit == "request") == 1
+
+
 class TestSpendLogsStartDate:
     def test_none_cursor_is_unbounded(self):
         # No cursor (first call / post-restart) → no start_date → full backfill.

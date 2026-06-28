@@ -19,7 +19,7 @@ related:
 
 # Route all models/providers through the LiteLLM gateway — implementation roadmap
 
-**Status:** **In progress — P0–P2 done + committed on `develop`; P3–P5 remaining.** Research-backed 2026-06-28 (6 subagents: 4 codebase traces + 2 web); empirically de-risked first (see `docs/issues/system_provider_models_bypass_gateway_unmetered.md` §§ "Empirical addendum" + "Codex-proxy follow-up" — a real LiteLLM proxy preserves reasoning + meters for every model family we run, including the Responses-API-only codex-proxy). This doc is both the implementation plan and the running status to make the gateway the **single path for all LLM traffic**.
+**Status:** **In progress — P0–P2 done + committed on `develop`; P3 done + k3d-verified (uncommitted); P4–P5 remaining.** Research-backed 2026-06-28 (6 subagents: 4 codebase traces + 2 web); empirically de-risked first (see `docs/issues/system_provider_models_bypass_gateway_unmetered.md` §§ "Empirical addendum" + "Codex-proxy follow-up" — a real LiteLLM proxy preserves reasoning + meters for every model family we run, including the Responses-API-only codex-proxy). This doc is both the implementation plan and the running status to make the gateway the **single path for all LLM traffic**.
 
 **One-line goal:** every model (minimax, gemini, gemma, gpt-5.x/codex — and any future provider) routes through `srw-litellm:4000`, so we get unified **metering + rate-limiting + quota + reasoning capture + key management** in one chokepoint, instead of the current half-in/half-bypassed state.
 
@@ -27,7 +27,8 @@ related:
 - ✅ **P0 — de-risk** (image pinned `litellm-database:v1.90.0`; gateway-down→direct dispatch fallback; `get_spend_logs` `start_date` bound) — commit `bdea2869`.
 - ✅ **P1 — register every model** (`build_desired_models` now syncs system rows + codex `use_responses_api`; per-provider `litellm_params` + `params_json["litellm"]` overrides; `_rev_for_model` re-register fix). gemini/minimax/codex each callable *through* the gateway — commit `21c7022b`.
 - ✅ **P2 — flip routing** behind a **default-off per-provider canary** (`LITELLM_GATEWAY_ROUTED_PROVIDERS`) with a registered-model fail-loud guard. Real minimax + codex jobs routed through the gateway live (dispatch log + agent `base_url=srw-litellm` + 20 `usage_events` rows) — commit `ccb534a0`.
-- ⏳ **P3 — metering completeness** (populate the NULL `usage_events.cost_usd`, the documented Gap-B §4.4) · **P4 — agent-factory collapse** · **P5 — HA**.
+- ✅ **P3 — metering completeness** — the materializer now stamps LiteLLM's authoritative per-request `spend` onto a dedicated `unit='request'` cost dimension (token rows stay cost-free; SUM == spend, no double-count), closing **Gap-B §4.4**. Live on k3d: paid models priced (minimax/gemini/codex), gemma/free stay cost-free, headline `/api/usage` total **$0 → $0.454719** — **uncommitted on develop**.
+- ⏳ **P4 — agent-factory collapse** · **P5 — HA**.
 - Full per-phase build detail + verification evidence in the **Status** callouts under each phase in §7.
 
 ---
@@ -90,6 +91,8 @@ The issue doc says "Gap B fixes itself for the paid lane." That is **true only f
 - **(preferred)** seed `usage_rates` rows for the paid models (minimax/OpenRouter, gemini/Google) — the materializer snapshots them at write time (history-immutable); leave free gemma NULL (its cost is `category='compute'`), or
 - change `materialize_llm_usage` to consume LiteLLM's computed `response_cost`/`spend` when present, falling back to `usage_rates`.
 
+> **As-built (P3, 2026-06-28).** Chose the **second** option — but cleaner than "fall back to usage_rates per token". The reasoning: LiteLLM's `spend` is a per-*request* total (tiered/cached pricing already folded in) that does **not** decompose onto a per-token `usage_rates` rate, and a per-component split is provider-specific (only OpenRouter returns `usage_object.cost_details`; gemini/codex don't). So the materializer emits the cost as its **own dimension**: alongside the prompt-token / completion-token quantity rows it appends, for `spend > 0` only, a `unit='request'`, `quantity=1`, `cost_usd=rate_usd=spend` row. Token rows stay cost-free (honest — there's no per-token rate), `SUM(cost_usd)` per request equals `spend` with no double-count, and pre-setting `cost_usd` makes `record_events` skip the (now compute-only) `usage_rates` lookup. Homelab models report `spend=0` → no cost row → cost stays absent (same inert posture). **`usage_rates` is unchanged and still prices `category='compute'`** (vcpu/gib-hour) when seeded. Code: `litellm_gateway.py` `_spend_amount` + the cost-row branch in `materialize_llm_usage`. Consumer-safe: `/api/usage` (`query_usage`) and the breakdown fold (`_fold_breakdown`) sum `cost_usd` generically, so the new unit just adds a clean `(llm, request)` line and the correct headline total.
+
 ### 4.5 The codex Responses knob — confirm before building
 We verified **`use_responses_api: true`** in `litellm_params` works end-to-end on v1.83.7/v1.89.3 (HTTP `/v1/responses` + the `/chat/completions` bridge both returned reasoning + cost). The web research flags the *documented* knobs as `mode: responses` (model_info), the `openai/responses/<model>` prefix, or global `route_all_chat_openai_to_responses` — i.e. `use_responses_api` may be an alias/older form. **Action:** on the pinned version, confirm which knob is canonical (both may work); use whichever the docs bless and keep the empirical test as the gate.
 
@@ -145,6 +148,12 @@ Routing 100% through the gateway makes it a **hard single point of failure for a
 
 **Phase 3 — Metering completeness.** Seed `usage_rates` for paid models (or switch the materializer to LiteLLM's `response_cost`). *Verify:* `usage_events.cost_usd` non-null for minimax/gemini/codex; gemma stays 0/NULL (correct).
 
+> **Status: ✅ DONE + k3d-live-verified 2026-06-28, uncommitted on `develop`** (`orchestrator/services/litellm_gateway.py` + `tests/test_litellm_gateway.py`; zero schema/migration change). Chose **gateway-priced** (not seed-`usage_rates`) — the as-built rationale is in §4.4. `materialize_llm_usage` now appends, for `spend > 0`, a `unit='request'` / `quantity=1` / `cost_usd=spend` dimension row (token rows stay cost-free; `SUM == spend`, no double-count; pre-set cost skips the empty `usage_rates` lookup). `usage_rates` is untouched and still prices `category='compute'`.
+> - **Live (k3d, auditdb `usage_events`):** a cursor-reset full backfill materialized **+40** `request` cost rows from the existing paid spend logs. Priced exactly as the gateway computed: minimax-m3 $0.169846 (34 rows), gpt-5.5/codex $0.274610 (3), gemini-3.5-flash $0.000858, codexknob-test/2 $0.002165/$0.007240. **gemma-4-moe / -strix + the zzz-test models emit NO `request` row** (spend=0 → cost absent ✓). Token rows remain `priced=0` for all models.
+> - **`/api/usage` headline** (`query_usage` aggregate): `total_cost_usd` **$0 → $0.454719**; `(llm, request)` line carries the cost, `(llm, prompt-token|completion-token)` stay $0, `(compute, *)` stay $0 (unpriced — separate future seeding).
+> - **Tests:** +6 unit (`TestMaterializeLlmUsageCost`: paid emits cost row, free/missing/unparseable spend emit none, prompt-only still priced, re-poll idempotent). Existing materializer tests unaffected (they set no `spend`). Lint + format clean.
+> - **Deferred (unchanged):** the `CustomLogger` push-callback ledger feed (still poll-based); per-job LLM attribution (gateway lacks `job_id`); seeding `usage_rates` for `category='compute'` (vcpu/gib-hour priced from pdu/power data).
+
 **Phase 4 — Agent simplification (cleanup).** Collapse to the single openai factory; relocate the gemini-3 temp floor + `parallel_tool_calls`/`include_thoughts`; demote the multi-shape reasoning tap to safety net; retire the client-side Responses path; keep a bypass lane. *Verify:* full regression incl. a tool-using gemini turn and a reasoning-heavy codex turn.
 
 **Phase 5 — HA & production hardening.** Stand up Redis/Valkey → wire `router_settings.redis_*` → scale to ≥2 replicas + PDB + HPA + probes; DB sizing (pool limit, PgBouncer, `use_redis_transaction_buffer` at scale); Prometheus `/metrics` (auth it) + alerts (`litellm_deployment_state`, budget-remaining, a drop in `/v1/models` count). Separately: close the **session quota-freeze gap** (sessions consume quota but aren't stoppable — `quota_poll_loop` freezes jobs only).
@@ -157,14 +166,14 @@ Routing 100% through the gateway makes it a **hard single point of failure for a
 - **Passthrough is NOT metered** — LiteLLM #24204 is "closed" only by a label-fix PR; the real spend fix (#24205) is **unmerged**. So **never** use passthrough routes (`/v1/messages`, `/anthropic`) for metered traffic; use `/chat/completions` + native `/responses` only. (This is why Anthropic interleaved-thinking *signatures*, if ever needed, stay a genuine exception — but SRW runs no Anthropic.)
 - **Gemini-via-LiteLLM less battle-tested** than OpenRouter in our testing — validate reasoning + usage on the `gemini/` route specifically.
 - **Codex knob** (§4.5) — confirm `use_responses_api` vs `mode: responses` on the pinned version.
-- **Cost in the SRW ledger** needs Phase 3; don't assume routing fixes it.
+- ~~**Cost in the SRW ledger** needs Phase 3; don't assume routing fixes it.~~ **Resolved (P3):** LLM `cost_usd` now comes from LiteLLM's per-request `spend` (gateway-priced `unit='request'` row), not `usage_rates`.
 - **Provider-pin / OpenRouter niceties** (`reasoning_details`, `reasoning_split`, `provider.order`) move into the gateway entry if wanted — reasoning *capture* survives without them.
 
 ## 9. Best-practices checklist (condensed, from web research)
 - Normalize everything to `/chat/completions`; native `/responses` for codex only; **avoid passthrough for metered traffic** (#24204/#24205).
 - Pin `1.90.0`; ≥ v1.86.0. Integration-test the chat↔responses bridge (known edge bugs: #21331 parallel tool-calls on index 0, #25429 empty gpt-5.4 output).
 - Reasoning: `reasoning_content` (all) + `thinking_blocks`+`signature` (Anthropic only); `reasoning_tokens` at `usage.completion_tokens_details.reasoning_tokens`. OpenRouter streaming-reasoning bug is fixed (≥ v1.63.x). Set `modify_params: true` as an Anthropic-thinking safety net (future).
-- Custom pricing for self-hosted via `model_info.input_cost_per_token` (LiteLLM view) — but remember SRW's ledger prices from `usage_rates` (§4.4).
+- Custom pricing for self-hosted via `model_info.input_cost_per_token` (LiteLLM view). As of **P3**, SRW's ledger takes **LLM** `cost_usd` from LiteLLM's per-request `spend` (so a self-hosted model with `input_cost_per_token` set in the gateway would flow through to `cost_usd` automatically); `usage_rates` now prices **compute** only (§4.4).
 - Routing: `simple-shuffle` (avoid `usage-based-routing-v2`, #16060); `num_retries`/`allowed_fails`/`cooldown_time`; cross-provider `fallbacks`.
 - HA: Redis before replicas; `database_connection_pool_limit` formula + PgBouncer; `use_redis_transaction_buffer` at 1000+ RPS; pod = 1 CPU / 4 Gi per worker.
 
