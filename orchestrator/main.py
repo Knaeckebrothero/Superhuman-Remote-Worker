@@ -156,8 +156,10 @@ from services.litellm_gateway import (  # noqa: E402
     _parse_quota_policy,
     compute_project_quota_status,
     ensure_scoped_key,
+    gateway_is_healthy,
     get_fleet_key,
     litellm_sync_loop,
+    mark_gateway_health,
     materialize_llm_usage,
 )
 from services.audit_partitions import (  # noqa: E402
@@ -1226,6 +1228,13 @@ def _gateway_routing_target() -> tuple[str, str] | None:
     base = os.getenv("LITELLM_BASE_URL", "").strip()
     if not base:
         return None
+    # Gateway-down → direct fallback (Phase 0): once a readiness probe has
+    # confirmed the gateway is unreachable, route the agent straight at the
+    # model's upstream instead of handing it a dead gateway base_url. Returning
+    # None here is exactly how callers already express "no gateway → use the
+    # endpoint's direct creds", so both dispatch injectors degrade gracefully.
+    if not gateway_is_healthy():
+        return None
     key = get_fleet_key() or os.getenv("LITELLM_MASTER_KEY", "").strip()
     if not key:
         return None
@@ -1255,7 +1264,13 @@ async def _gateway_routing_target_scoped(
     if user_id and project_id and master:
         client = LiteLLMClient(base, master)
         try:
-            if await client.is_ready():
+            # This probe also refreshes the cached health flag, so a gateway
+            # outage is detected on the very next dispatch (not just the 60s sync
+            # tick). When down, fall through to _gateway_routing_target(), which
+            # now returns None → the caller uses the model's direct upstream.
+            ready = await client.is_ready()
+            mark_gateway_health(ready)
+            if ready:
                 scoped = await ensure_scoped_key(
                     client,
                     postgres_db,
@@ -1563,7 +1578,9 @@ async def _inject_dispatch_credentials(
             llm_over.setdefault("provider", meta.provider)
         # The Codex proxy speaks ONLY the Responses API; the LiteLLM gateway
         # normalizes to Chat Completions and drops the reasoning summary, so codex
-        # models bypass the gateway and hit their endpoint directly.
+        # models bypass the gateway and hit their endpoint directly. _gw_scoped is
+        # also None when the gateway is unhealthy (Phase-0 fallback) → the same
+        # direct path below carries the job through a gateway outage.
         _gw = _gw_scoped if meta.provider != "codex" else None
         if _gw is not None:
             # Endpoint-kind model + gateway enabled → route through LiteLLM so the
@@ -1579,13 +1596,32 @@ async def _inject_dispatch_credentials(
         else:
             endpoint_row = await postgres_db.get_user_llm_endpoint(meta.endpoint_id)
             if endpoint_row:
+                # Direct path (codex, or gateway-down fallback). On resume the
+                # config_override can carry a STALE gateway base_url from a prior
+                # gateway-routed dispatch; per-field setdefault would keep it and
+                # send the endpoint's direct key to the gateway (401). Strip a
+                # gateway base_url — detected from the resolved target and env, so
+                # it fires whether the gateway is healthy-codex (_gw_scoped set)
+                # or unhealthy (_gw_scoped None) — so it repopulates from the row.
+                _gw_urls = {_gw_scoped[0]} if _gw_scoped else set()
+                _gw_base = os.getenv("LITELLM_BASE_URL", "").strip()
+                if _gw_base:
+                    _gw_urls.add(f"{_gw_base.rstrip('/')}/v1")
+                if llm_over.get("base_url") in _gw_urls:
+                    llm_over.pop("base_url", None)
+                    if meta.provider:
+                        llm_over["provider"] = meta.provider
                 if endpoint_row.get("base_url"):
                     llm_over.setdefault("base_url", endpoint_row["base_url"])
                 if endpoint_row.get("api_key"):
                     llm_over.setdefault("api_key", endpoint_row["api_key"])
+                # Gateway configured (base set) + non-codex reaching the direct
+                # path ⇒ the gateway is unhealthy and we're falling back.
+                _is_fallback = bool(_gw_base) and meta.provider != "codex"
                 logger.info(
                     f"Dispatch: routed {model_id} to {meta.origin} endpoint "
                     f"{endpoint_row.get('label') or meta.endpoint_id}"
+                    + (" (gateway-down fallback)" if _is_fallback else "")
                 )
     elif resolved_keys:
         if meta is not None and meta.api_key_ref:
@@ -3615,17 +3651,26 @@ async def _inject_model_credentials(
             return
         endpoint_row = await postgres_db.get_user_llm_endpoint(meta.endpoint_id)
         if endpoint_row:
-            # This model bypasses the gateway (codex). A persisted / hot-swapped
-            # section can still carry a STALE LiteLLM-gateway base_url (+ its
-            # provider) from a previously gateway-routed model; per-field
-            # ``setdefault`` keeps it, so the endpoint's direct key would be sent
-            # to the gateway — which rejects any non-``sk-`` key (401 "LiteLLM
-            # Virtual Key expected"). Drop the stale gateway transport so
-            # base_url/provider/api_key repopulate coherently from the endpoint
-            # row. Scoped to the gateway URL only: a deliberately caller-pinned
-            # non-gateway base_url still wins (additive contract).
+            # This model takes the direct path — either codex (always bypasses)
+            # or any endpoint model while the gateway is down (Phase-0 fallback).
+            # A persisted / hot-swapped section can still carry a STALE
+            # LiteLLM-gateway base_url (+ its provider) from a previously
+            # gateway-routed turn; per-field ``setdefault`` keeps it, so the
+            # endpoint's direct key would be sent to the gateway — which rejects
+            # any non-``sk-`` key (401 "LiteLLM Virtual Key expected"). Drop the
+            # stale gateway transport so base_url/provider/api_key repopulate
+            # coherently from the endpoint row. Detect the gateway URL from the
+            # resolved target *and* env: _gw_target[0] is None when the gateway
+            # is unhealthy (Phase-0 fallback), so fold in the env-derived prefix
+            # to cover that path too (same value in prod; the override-only test
+            # path supplies _gw_target). Scoped to the gateway URL only: a
+            # deliberately caller-pinned non-gateway base_url still wins.
             # See docs/issues/codex_session_gateway_baseurl_401.md.
-            if _gw_target is not None and section.get("base_url") == _gw_target[0]:
+            _gw_urls = {_gw_target[0]} if _gw_target else set()
+            _gw_base = os.getenv("LITELLM_BASE_URL", "").strip()
+            if _gw_base:
+                _gw_urls.add(f"{_gw_base.rstrip('/')}/v1")
+            if section.get("base_url") in _gw_urls:
                 section.pop("base_url", None)
                 if meta.provider:
                     section["provider"] = meta.provider

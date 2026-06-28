@@ -1096,8 +1096,13 @@ codexProxy:
 litellm:
   enabled: false
   # litellm-database variant pre-bakes the Prisma client so DB-mode boot
-  # doesn't need network egress to generate it. Pin to a digest for prod.
-  image: ghcr.io/berriai/litellm-database:main-stable
+  # doesn't need network egress to generate it.
+  #
+  # Pinned to an exact release (was the floating `main-stable`, which stops
+  # publishing 2026-06-30). Stay >= v1.86.0 to avoid the v3 rate-limiter
+  # regression (#28146) that 400s every key carrying an rpm/tpm limit. For prod,
+  # pin by digest: @sha256:b4b2eb22cfe218d2c46c0cfe442db0dd4262fdf4025f96b0c74abda3d379ef65
+  image: ghcr.io/berriai/litellm-database:v1.90.0
   port: 4000
   # -- Gateway replicas. >1 requires Redis for shared rate-limit counters
   # (Scaling §); v1 is single-replica with in-memory counters.
