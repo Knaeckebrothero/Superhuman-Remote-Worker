@@ -32,8 +32,8 @@ def _payload():
 @pytest.fixture
 def bridge():
     b = NatsBridge()
-    b._db = None              # _set_vm_context no-ops when _db is None
-    b._on_vm_ready = None     # skip the dispatch poke
+    b._db = None  # _set_vm_context no-ops when _db is None
+    b._on_vm_ready = None  # skip the dispatch poke
     b._thread_vm_ids = set()  # job-1 takes the job (not thread) path
     return b
 
@@ -44,7 +44,7 @@ async def test_seeds_on_leader(bridge):
     is_leader.set()
     try:
         await bridge._on_daemon_register(FakeMsg(_payload()))
-        await asyncio.sleep(0)        # let the create_task run
+        await asyncio.sleep(0)  # let the create_task run
     finally:
         is_leader.clear()
     bridge._seed_vm_ide_config.assert_called_once()
@@ -53,7 +53,7 @@ async def test_seeds_on_leader(bridge):
 @pytest.mark.asyncio
 async def test_skips_seed_on_follower(bridge):
     bridge._seed_vm_ide_config = AsyncMock()
-    is_leader.clear()                 # follower
+    is_leader.clear()  # follower
     await bridge._on_daemon_register(FakeMsg(_payload()))
     await asyncio.sleep(0)
     bridge._seed_vm_ide_config.assert_not_called()
