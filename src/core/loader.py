@@ -2801,6 +2801,38 @@ def _resolve_max_output_tokens(
     return resolved
 
 
+# Timeout must scale with the resolved output cap (§7.2). Output decode is the
+# serial bottleneck, so a generous max_tokens needs a matching wall-clock deadline
+# or a legitimate long reasoning turn dies as "timed out after 600s" instead of
+# finishing — trading length-truncation for a timeout. Scale off the resolved cap
+# at a conservative decode rate (slow providers run ~20-40 tok/s — pick the low end
+# so a slow-but-valid turn isn't killed), floored at the configured base. Bounded
+# implicitly by ABSOLUTE_MAX_OUTPUT_TOKENS (~131072/30 + 60 ≈ 74 min worst case).
+TIMEOUT_DECODE_TOKENS_PER_SEC = 30
+TIMEOUT_BASE_OVERHEAD_SECONDS = 60
+
+
+def _resolve_timeout(
+    config: LLMConfig,
+    limits: Optional[LimitsConfig] = None,
+) -> Optional[float]:
+    """Scale the per-call timeout with the resolved output cap (§7.2).
+
+    Returns None when no base timeout is configured (caller leaves the provider
+    default untouched). Otherwise ``max(base, max_tokens / decode_rate + overhead)``
+    so a large ``max_output_tokens`` turn has wall-clock room to finish while small
+    turns keep the configured base. Static at construction — the LLM is built
+    per-dispatch with the cap known, so no per-call plumbing is needed. See
+    docs/features/reasoning_aware_max_output_tokens.md §7.2.
+    """
+    base = config.timeout
+    if base is None:
+        return None
+    max_tokens = _resolve_max_output_tokens(config, limits)
+    needed = max_tokens / TIMEOUT_DECODE_TOKENS_PER_SEC + TIMEOUT_BASE_OVERHEAD_SECONDS
+    return float(round(max(float(base), needed)))
+
+
 def _create_openai_llm(
     config: LLMConfig,
     limits: Optional[LimitsConfig] = None,
@@ -2914,7 +2946,7 @@ def _create_openai_llm(
 
     # Add timeout if specified
     if config.timeout is not None:
-        llm_kwargs["timeout"] = config.timeout
+        llm_kwargs["timeout"] = _resolve_timeout(config, limits)
 
     # Only add base_url if specified
     if base_url:
@@ -2953,7 +2985,7 @@ def _create_openai_llm(
     key_info = f"{len(keys)} key(s)" if len(keys) > 1 else "1 key"
     logger.info(
         f"Created OpenAI LLM: model={config.model}, temp={config.temperature}, "
-        f"base_url={base_url or 'default'}, timeout={config.timeout}s, "
+        f"base_url={base_url or 'default'}, timeout={llm_kwargs.get('timeout')}s, "
         f"max_retries={config.max_retries}, max_context_tokens={max_context_tokens or 'default'}, "
         f"max_tokens={max_tokens}, reasoning={reasoning_mode}, keys={key_info}"
     )
@@ -2991,7 +3023,7 @@ def _create_anthropic_llm(
         llm_kwargs["top_k"] = config.top_k
 
     if config.timeout is not None:
-        llm_kwargs["timeout"] = config.timeout
+        llm_kwargs["timeout"] = _resolve_timeout(config, limits)
 
     # Anthropic requires max_tokens. Route through the shared resolver so the
     # family/per-model max_output_tokens, the compaction-aligned backstop, and
@@ -3004,7 +3036,7 @@ def _create_anthropic_llm(
 
     logger.info(
         f"Created Anthropic LLM: model={config.model}, temp={config.temperature}, "
-        f"timeout={config.timeout}s, max_retries={config.max_retries}, "
+        f"timeout={llm_kwargs.get('timeout')}s, max_retries={config.max_retries}, "
         f"max_tokens={llm_kwargs['max_tokens']}"
     )
 
@@ -3069,7 +3101,7 @@ def _create_google_llm(
 
     # Google's timeout parameter name differs
     if config.timeout is not None:
-        llm_kwargs["timeout"] = config.timeout
+        llm_kwargs["timeout"] = _resolve_timeout(config, limits)
 
     # ChatGoogleGenerativeAI uses ``max_output_tokens`` (not ``max_tokens``)
     max_tokens = _resolve_max_output_tokens(config, limits)
@@ -3098,7 +3130,7 @@ def _create_google_llm(
     logger.info(
         f"Created Google LLM: model={config.model}, "
         f"temp={llm_kwargs.get('temperature')}, "
-        f"timeout={config.timeout}s, max_output_tokens={max_tokens}, "
+        f"timeout={llm_kwargs.get('timeout')}s, max_output_tokens={max_tokens}, "
         f"thinking={thinking_mode}"
     )
 
@@ -3145,7 +3177,7 @@ def _create_groq_llm(
         llm_kwargs["model_kwargs"] = groq_model_kwargs
 
     if config.timeout is not None:
-        llm_kwargs["timeout"] = config.timeout
+        llm_kwargs["timeout"] = _resolve_timeout(config, limits)
 
     # Optional: custom base URL for Groq enterprise/proxy
     if config.base_url:
@@ -3158,7 +3190,7 @@ def _create_groq_llm(
 
     logger.info(
         f"Created Groq LLM: model={model}, temp={config.temperature}, "
-        f"timeout={config.timeout}s, max_retries={config.max_retries}, "
+        f"timeout={llm_kwargs.get('timeout')}s, max_retries={config.max_retries}, "
         f"max_tokens={max_tokens}"
     )
 
@@ -3264,7 +3296,7 @@ def _create_openrouter_llm(
         llm_kwargs["default_headers"] = default_headers
 
     if config.timeout is not None:
-        llm_kwargs["timeout"] = config.timeout
+        llm_kwargs["timeout"] = _resolve_timeout(config, limits)
 
     if model_kwargs:
         llm_kwargs["model_kwargs"] = model_kwargs
@@ -3303,7 +3335,7 @@ def _create_openrouter_llm(
     )
     logger.info(
         f"Created OpenRouter LLM: model={model}, temp={config.temperature}, "
-        f"base_url={base_url}, timeout={config.timeout}s, "
+        f"base_url={base_url}, timeout={llm_kwargs.get('timeout')}s, "
         f"max_retries={config.max_retries}, max_context_tokens={max_context_tokens or 'default'}, "
         f"max_tokens={max_tokens}, reasoning={reasoning_mode}, keys={key_info}"
     )
@@ -3360,7 +3392,7 @@ def _create_mistral_llm(
     if config.top_p is not None:
         llm_kwargs["top_p"] = config.top_p
     if config.timeout is not None:
-        llm_kwargs["timeout"] = config.timeout
+        llm_kwargs["timeout"] = _resolve_timeout(config, limits)
     if extra_body:
         llm_kwargs["extra_body"] = extra_body
 
@@ -3382,7 +3414,7 @@ def _create_mistral_llm(
 
     logger.info(
         f"Created Mistral LLM: model={model}, temp={config.temperature}, "
-        f"base_url={base_url}, timeout={config.timeout}s, "
+        f"base_url={base_url}, timeout={llm_kwargs.get('timeout')}s, "
         f"max_retries={config.max_retries}, "
         f"max_context_tokens={max_context_tokens or 'default'}, max_tokens={max_tokens}"
     )
@@ -3477,7 +3509,7 @@ def _create_codex_llm(
             reasoning_mode = f"chat_completions(effort={level})"
 
     if config.timeout is not None:
-        llm_kwargs["timeout"] = config.timeout
+        llm_kwargs["timeout"] = _resolve_timeout(config, limits)
 
     if model_kwargs:
         llm_kwargs["model_kwargs"] = model_kwargs
@@ -3504,7 +3536,7 @@ def _create_codex_llm(
     key_info = f"{len(keys)} key(s)" if len(keys) > 1 else "1 key"
     logger.info(
         f"Created Codex LLM: model={model}, temp={config.temperature}, "
-        f"base_url={base_url}, timeout={config.timeout}s, "
+        f"base_url={base_url}, timeout={llm_kwargs.get('timeout')}s, "
         f"max_retries={config.max_retries}, max_context_tokens={max_context_tokens or 'default'}, "
         f"max_tokens={max_tokens}, reasoning={reasoning_mode}, keys={key_info}"
     )
