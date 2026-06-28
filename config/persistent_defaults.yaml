@@ -20,9 +20,13 @@ llm:
   base_url: null
   timeout: 600
   max_retries: 3
-  max_output_tokens: null
+  # NOTE: do NOT declare max_output_tokens here, even as null — it is matrix-driven
+  # (per-family in config/model_config_matrix.yaml, clamped to the context window by
+  # _resolve_max_output_tokens). A base declaration enters explicit_llm_keys and
+  # SHADOWS the family value; per-job/expert overrides still win. See
+  # docs/features/reasoning_aware_max_output_tokens.md.
   # multimodal and parallel_tool_calls are set per model family
-  # in config/settings_matrix.yaml — do not set them here.
+  # in config/model_config_matrix.yaml — do not set them here.
 
 workspace:
   structure:

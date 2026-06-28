@@ -60,7 +60,7 @@ on reasoning-heavy turns — a plain re-run re-hits the same cap.
 >    **Likely resolved for free by the gateway migration** (LiteLLM re-streams
 >    with a single finish_reason chunk) — the merge defect itself is unchanged,
 >    so verify on the next minimax *session* turn through the gateway.
-> 2. **§7.4 — CONFIRMED LIVE (2026-06-28).** In the **blob dispatch path
+> 2. **§7.4 — FIXED + k3d-verified 2026-06-28** (was CONFIRMED LIVE). In the **blob dispatch path
 >    (`EXPERTS_DB_ENABLED=true`, the dev default)**, an admin's per-model
 >    `context_window` override is **shadowed by the family default.** Verified
 >    against job `19707fa1` (ran `openrouter/minimax/minimax-m3`, registry
@@ -216,17 +216,39 @@ Add `max_output_tokens` to each family's `settings:` block in
 `config/model_config_matrix.yaml`. Confirmed to flow with zero plumbing (§2). The
 Anthropic path picks it up too (`:2970`).
 
-### 5.2 Per-model override (registry)
+### 5.2 Per-model override (registry) — **IMPLEMENTED + k3d-verified 2026-06-28**
 
-Output windows are ultimately per-model. Add an optional per-model value via
-`models.params_json`, applied at dispatch with the **same mechanism** as
-`context_window` — **but with override (not `setdefault`) semantics, see §7.4**.
-Edit points: `ModelMeta` (`model_registry.py:48-62` — add field; today carries
-`context_window` but no output field), populate in the three row→meta builders
-(`_endpoint_row_to_meta:257-269`, `_catalog_row_to_meta:293-307`/`:308-319`;
-`params_json` is already fetched at `postgres.py:5999-6009`/`:6270-6272` and
-dropped at the meta layer), and inject in `_inject_dispatch_credentials`
-(`main.py:1616`) + `_inject_model_credentials` (`main.py:3584`).
+Output windows are ultimately per-model. An optional per-model value rides
+`models.params_json` (`{"max_output_tokens": N}`, no migration), applied at
+dispatch via the **same path** as `context_window` (the §7.4 fix made that path
+correct):
+
+- `ModelMeta.max_output_tokens` field (`model_registry.py`).
+- `_params_max_output_tokens(row)` extracts it from the row's parsed `params_json`
+  (dict-only — catalog rows arrive parsed via `postgres._row_to_model`; returns a
+  positive int or None). Wired into all three row→meta builders
+  (`_endpoint_row_to_meta`, both `_catalog_row_to_meta` branches).
+- Seeded into dispatch at the three sites that mirror `context_window`:
+  `_seed_registry_model_overrides` (blob path), `_inject_dispatch_credentials`
+  (legacy/resume), and the per-capability section inject (chat slot).
+
+**Mechanism (corrected — *not* "override semantics"):** the seed does
+`llm.setdefault("max_output_tokens", meta.max_output_tokens)` into
+`request_override.llm` *before* `resolve_config`. Because `request_override`'s llm
+keys enter `explicit_llm_keys`, `_apply_settings_matrix` **skips** the family value
+for that key, so the per-model value survives into the baked blob and wins; then
+`_resolve_max_output_tokens` clamps it to the §5.4 backstop. A caller-pinned
+per-job value still wins (setdefault). Same shadow-avoiding path §7.4 established
+for `context_window` and §7.5 unblocked for the family value.
+
+**k3d-verified:** baked = per-model (not family); unclamped when ≤ backstop;
+clamped to the backstop when above it; family floor when no per-model value.
+
+> **UI gap (follow-up):** the Admin → Models form has no `max_output_tokens`
+> field yet — it writes `context_window` and only a `voice` key into `params_json`.
+> So per-model output caps are **DB/API-settable today, not UI-settable**. Adding a
+> number input → `params_json.max_output_tokens` is a small cockpit follow-up
+> (`admin-models.component.ts`).
 
 ### 5.3 Resolution order
 
@@ -259,12 +281,17 @@ This guarantees post-compaction input + output ≤ context (no overflow 400s).
 `SAFETY_MARGIN` is **load-bearing** (the threshold is a *trigger* input can
 briefly overshoot before the next compaction) — do not set it to 0.
 
-Worked example (minimax, admin ctx 262,144): `backstop ≈ 0.20·262144 ≈ 52k`. So a
-64k family value clamps to ~52k — still 3× today's 16k, and the failed turn
-(12k input) had ample room. For the 1M family default: `0.20·1M = 200k`,
-unclamped. **Prerequisite:** §7.4 — the backstop only honors the admin's 256k if
-the override actually reaches `model_max_context_tokens` (it currently does not
-in the blob path).
+Worked example (minimax, admin ctx 262,144), **k3d-verified on the deployed
+artifact**: `backstop = 262144 − 209715 − 4096 = 48333`. So the 64k family value
+clamps to **48,333** — still ~3× today's 16k, and the failed turn (12k input) had
+ample room. For the 1M family default: `1M − 800k − 4k = 195,904` ⇒ the 65536
+value is **unclamped** (→ 65536). **Prerequisites (both now FIXED + k3d-verified
+2026-06-28):** §7.4 — the admin `context_window` actually reaches
+`model_max_context_tokens` (was shadowed in the blob path); §7.5 — the family
+`max_output_tokens` actually reaches `config.max_output_tokens` (the base
+`max_output_tokens: null` shadowed it). **Floor caveat:** below ~33k effective
+context the backstop hits the `MIN_FLOOR` (4096) — too small a window re-starves
+reasoning (k3d's minimax is set to ctx 32000 → 4096; see §7.5).
 
 ### 5.5 Bumped default + absolute ceiling
 
@@ -390,13 +417,17 @@ OpenRouter route:
 - Adding `reasoning:{effort:…}` via `extra_body` for providers that *do* honor it
   is a ~5-line addition to the effort_enum branch (`:2872-2879`).
 
-### 7.4 Blob-path shadowing of per-model overrides (bug; **CONFIRMED LIVE 2026-06-28**; prerequisite for §5.4)
+### 7.4 Blob-path shadowing of per-model overrides (bug; **FIXED + k3d-verified 2026-06-28**; prerequisite for §5.4)
 
-> **Tracked as its own issue:**
-> `docs/issues/per_model_context_window_override_shadowed_in_blob_dispatch.md`
-> (`[[per_model_context_window_override_shadowed_in_blob_dispatch]]`). Fix it
-> there first; this feature's per-model `max_output_tokens` override rides the
-> same corrected path. Summary retained here for context.
+> **Tracked as its own issue (RESOLVED):**
+> `docs/done/per_model_context_window_override_shadowed_in_blob_dispatch.md`
+> (`[[per_model_context_window_override_shadowed_in_blob_dispatch]]`). **Fixed**
+> via the new `_seed_registry_model_overrides` helper (`orchestrator/main.py`)
+> seeding the registry `context_window` into `request_override` *before*
+> `resolve_config` bakes the settings matrix, wired into both blob callsites
+> (worker dispatch + session attach). This feature's per-model `max_output_tokens`
+> override now rides the same corrected path (one added `ModelMeta` field +
+> `setdefault`). Summary retained here for context.
 
 **Verification:** job `19707fa1` (blob path, `EXPERTS_DB_ENABLED=true`) ran
 `openrouter/minimax/minimax-m3` whose registry `context_window` is **262144**,
@@ -431,6 +462,45 @@ doesn't re-bake the family value). The two `setdefault` sites (`main.py:1616`,
 config_resolver precedence tests. **Confirmed live** via `19707fa1`'s blob (see
 top of this section) — the fix lands per-model output overrides *and* repairs
 every admin `context_window` override in the blob path.
+
+### 7.5 Base-config `max_output_tokens: null` shadowed the family matrix value (bug; **FIXED + k3d-verified 2026-06-28**; prerequisite for §5.1)
+
+Sibling of §7.4, but at the *base-config* layer instead of the registry layer, and
+it silently made **§5.1 (T1) a no-op in both dispatch paths** until fixed.
+
+**Symptom (caught only by k3d integration, not parse-checks):** after adding
+`settings.max_output_tokens` to 12 families (§5.6), the live blob path still
+resolved `minimax-m3` to **32768** (the §5.5 default), not the family **65536**.
+The baked blob carried `agent.llm.max_output_tokens = None`.
+
+**Root cause:** both base configs declared `llm.max_output_tokens: null`
+(`config/defaults.yaml:16`, `config/persistent_defaults.yaml:23`). That key lands
+in `explicit_llm_keys` (`config_resolver.resolve_config` via `_raw_leaf_llm_keys`,
+and the agent's equivalent in `load_agent_config`), and `_apply_settings_matrix`'s
+flat-key loop **skips any key already in `expert_llm_keys`** (`loader.py:769`).
+So the family `max_output_tokens` was never written into `data["llm"]`, leaving
+`config.llm.max_output_tokens = None` → resolver falls back to the default. Unlike
+`model_max_context_tokens` — which survives because the limits-derivation has an
+explicit family-value fallback (`loader.py:783-784`) — `max_output_tokens` has
+**no fallback**, so the shadow was total.
+
+**Fix:** removed the `max_output_tokens: null` declaration from both base configs
+(replaced with a preventive comment, since re-adding it silently re-breaks the
+feature). The matrix family value now flows; a per-job/expert override still wins
+because it re-enters `explicit_llm_keys` with a *real* value (correct §5.3 order).
+
+**k3d verification (deployed orchestrator artifact, both bases):**
+`minimax-m3` → blob bakes **65536**, resolver yields **65536** (1M ctx) / **48333**
+(admin 256k) / `minimax` M2.7 → **36864** (49152 family clamped to its 204,800
+ctx backstop) / `gpt-5.5` → **65536** / `gemma` (no family value) → **22119**
+(default 32768 clamped to its 128k ctx). All correct.
+
+**Edge case surfaced (see §5.4):** k3d's `minimax-m3` registry `context_window`
+is set to **32000** — the backstop collapses output to the **4096 MIN floor**
+(`32000 − 25600 − 4096 = 2304 → floored`). The resolver is mathematically correct
+(a 32k window can't hold large input *and* large output), but a too-small admin
+window **can re-starve a reasoning model**. Below ~33k context, a reasoning model
+needs a larger window, not a larger output cap — there is no room to give.
 
 ## 8. Runaway guard
 

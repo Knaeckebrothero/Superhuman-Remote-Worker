@@ -56,6 +56,11 @@ class ModelMeta:
     base_url: Optional[str] = None
     api_key_ref: Optional[str] = None
     context_window: Optional[int] = None
+    # Per-model output cap (Admin → Models, stored in models.params_json). Seeded
+    # into dispatch the same way context_window is, then it overrides the family
+    # settings.max_output_tokens before _resolve_max_output_tokens clamps to the
+    # context backstop. See docs/features/reasoning_aware_max_output_tokens.md §5.2.
+    max_output_tokens: Optional[int] = None
     reasoning_level: Optional[str] = None
     origin: str = "catalog"
     endpoint_id: Optional[str] = None
@@ -244,6 +249,26 @@ def family_of(model_id: str, default: str = "default") -> str:
     return default
 
 
+def _params_max_output_tokens(row: dict[str, Any]) -> Optional[int]:
+    """Per-model output cap from a catalog row's ``params_json`` (Admin → Models).
+
+    Seeded into dispatch alongside ``context_window`` so it overrides the family
+    ``settings.max_output_tokens`` (then clamped to the context backstop by
+    ``_resolve_max_output_tokens``). Returns None for a missing, non-int, or
+    non-positive value (→ fall back to the family value). Catalog rows arrive with
+    ``params_json`` already parsed (``postgres._row_to_model``); an endpoint-hook
+    row that left it a raw JSON string is treated as 'no override', not parsed here.
+    """
+    pj = row.get("params_json")
+    if not isinstance(pj, dict):
+        return None
+    try:
+        ival = int(pj.get("max_output_tokens"))
+    except (TypeError, ValueError):
+        return None
+    return ival if ival > 0 else None
+
+
 def _endpoint_row_to_meta(row: dict[str, Any], *, origin: str) -> ModelMeta:
     """Build a ModelMeta from a user/system endpoint lookup row.
 
@@ -262,6 +287,7 @@ def _endpoint_row_to_meta(row: dict[str, Any], *, origin: str) -> ModelMeta:
         base_url=row["base_url"],
         api_key_ref=None,
         context_window=row.get("context_window"),
+        max_output_tokens=_params_max_output_tokens(row),
         reasoning_level=row.get("reasoning_level"),
         origin=origin,
         endpoint_id=str(row["endpoint_id"]),
@@ -300,6 +326,7 @@ def _catalog_row_to_meta(row: dict[str, Any]) -> ModelMeta:
             base_url=row.get("endpoint_base_url"),
             api_key_ref=None,
             context_window=row.get("context_window"),
+            max_output_tokens=_params_max_output_tokens(row),
             reasoning_level=row.get("reasoning_level"),
             origin="catalog",
             endpoint_id=str(row["endpoint_id"]) if row.get("endpoint_id") else None,
@@ -313,6 +340,7 @@ def _catalog_row_to_meta(row: dict[str, Any]) -> ModelMeta:
         base_url=None,
         api_key_ref=provider_ref,
         context_window=row.get("context_window"),
+        max_output_tokens=_params_max_output_tokens(row),
         reasoning_level=row.get("reasoning_level"),
         origin="catalog",
         capability=capability,

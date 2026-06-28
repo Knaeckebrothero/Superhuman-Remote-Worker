@@ -84,6 +84,7 @@ minimax:
     multimodal: false
     parallel_tool_calls: true
     model_max_context_tokens: 204800  # M2.7: 204,800 context, 131K max output
+    max_output_tokens: 49152  # reasoning headroom (resolver clamps to ctx backstop)
 
 # MiniMax M3 (released 2026-06-01) — distinct family from `minimax` (M2.7) so
 # the two coexist. M3 ships the MSA sparse-attention architecture, a 1M-token
@@ -116,6 +117,7 @@ minimax-m3:
     multimodal: true   # M3 is natively multimodal (image + video input)
     parallel_tool_calls: true  # M3 supports continuous + parallel tool calls
     model_max_context_tokens: 1000000  # M3: up to 1M context (>=512K guaranteed) via MSA
+    max_output_tokens: 65536  # reasoning headroom (resolver clamps to ctx backstop)
     image_tokens: { mode: flat, flat: 1600 }  # no public per-image formula — calibrate via usage
 
 o-series:
@@ -125,6 +127,7 @@ o-series:
     multimodal: true  # o3/o4-mini support image inputs
     parallel_tool_calls: true
     model_max_context_tokens: 200000
+    max_output_tokens: 65536  # reasoning headroom (resolver clamps to ctx backstop)
     # o1/o3 tile model: 75 base + 150/tile after 2048/768 fit. NOTE: o4-mini is
     # actually patch-based, but family_of() folds o1/o3/o4 -> "o-series"
     # (model_registry.py), so a standalone o4-mini matrix row would be dead
@@ -179,6 +182,7 @@ deepseek:
     multimodal: false  # V4 Pro + Flash are text-only
     parallel_tool_calls: false  # DeepSeek parallel tool calls remain unreliable
     model_max_context_tokens: 1000000  # V4 Pro + Flash: 1M context (was 64K on V3/R1)
+    max_output_tokens: 65536  # reasoning headroom (resolver clamps to ctx backstop)
 
 # Zhipu GLM-5.2 (released 2026-06-13) — text-only hybrid reasoning model,
 # 744B-MoE / ~40B-active, with a usable 1M-token context window, served
@@ -210,6 +214,7 @@ glm:
     multimodal: false          # text-only; vision is the separate GLM-5V-Turbo
     parallel_tool_calls: false # brand-new model — start safe, flip to true once validated
     model_max_context_tokens: 1000000  # usable 1M-token window
+    max_output_tokens: 65536  # reasoning headroom (resolver clamps to ctx backstop)
 
 gemini:
   # Phase 2 → token_budget (thinkingConfig.thinkingBudget; 2.5 Pro is always_on).
@@ -221,6 +226,7 @@ gemini:
     multimodal: true  # Gemini models are natively multimodal
     parallel_tool_calls: true
     model_max_context_tokens: 1000000
+    max_output_tokens: 65536  # thinking counts against output (always-on) — give room
     # Gemini API (ai.google.dev) bills a small flat per image (258 at MEDIUM /
     # ~1120 at Gemini-3 HIGH). 2304 = biased-high (256 + Pan&Scan upside). NOT
     # Vertex (which crop-tiles ~7x higher) — log the endpoint if that changes.
@@ -234,6 +240,7 @@ claude-opus:
     multimodal: true  # Claude Opus 4.6 supports vision
     parallel_tool_calls: true
     model_max_context_tokens: 1000000  # Opus 4.6: 1M context, 128K max output
+    max_output_tokens: 65536  # reasoning headroom (resolver clamps to ctx backstop)
     # 28px patches, Opus 4.7+/Fable5 high-res cap (2576px edge / 4784 tok max).
     image_tokens: { mode: anthropic_patches, patch_px: 28, max_edge: 2576, max_tokens: 4784, flat: 4784 }
 
@@ -248,6 +255,7 @@ claude-sonnet:
     multimodal: true
     parallel_tool_calls: true
     model_max_context_tokens: 1000000  # Sonnet 4.x: up to 1M context
+    max_output_tokens: 65536  # reasoning headroom (resolver clamps to ctx backstop)
     image_tokens: { mode: anthropic_patches, patch_px: 28, max_edge: 1568, max_tokens: 1568, flat: 1568 }
     # 1568px edge cap ⇒ the provider downscales a 150-DPI A4 anyway; render at
     # 130 (~at the cap) to stop paying for pixels the model discards. Omitting
@@ -291,6 +299,7 @@ gpt-5:
     # and the Codex proxy only supports the Responses API.
     parallel_tool_calls: false
     model_max_context_tokens: 1050000  # gpt-5.4: 1.05M, 128K max output
+    max_output_tokens: 65536  # reasoning headroom (resolver clamps to ctx backstop)
     # 32px patches. gpt-5.5 `auto`->original (budget 10000); gpt-5.4 `auto`->high
     # (2500). budget 10000 is biased-high across both; full models bill patches
     # ~1:1 (no published multiplier). A 1700x2200 page ~= 3726 tok.
@@ -317,6 +326,7 @@ codex:
     # TODO: Re-enable once langchain-ai/langchain#34660 is fixed.
     parallel_tool_calls: false
     model_max_context_tokens: 400000  # gpt-5.3-codex: 400K context, 128K max output
+    max_output_tokens: 65536  # reasoning headroom (resolver clamps to ctx backstop)
     # Same 32px-patch vision scheme as the gpt-5 family.
     image_tokens: { mode: openai_patches, patch_px: 32, budget: 10000, flat: 3000 }
 
@@ -337,6 +347,7 @@ codex-spark:
     # TODO: Re-enable once langchain-ai/langchain#34660 is fixed.
     parallel_tool_calls: false
     model_max_context_tokens: 128000  # gpt-5.3-codex-spark: 128K context (distilled)
+    max_output_tokens: 65536  # reasoning headroom (resolver clamps to ctx backstop)
 
 gpt-oss:
   # Effort delivered via the `Reasoning: {level}` system-prompt line (harmony), not an API param.
@@ -363,6 +374,7 @@ gpt-oss:
     multimodal: false  # gpt-oss-120b is text-only (MoE architecture)
     parallel_tool_calls: false  # Served via vLLM; parallel calls need provider support
     model_max_context_tokens: 131072  # True 128K context (MoE: 117B total, 5.1B active)
+    max_output_tokens: 65536  # reasoning headroom (resolver clamps to ctx backstop)
 
 # Gemma 4 has native system role, native multimodality, and strong Markdown
 # instruction following. Two integration challenges drove the variants below:
