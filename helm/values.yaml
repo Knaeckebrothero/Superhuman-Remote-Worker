@@ -1109,6 +1109,16 @@ litellm:
   replicas: 1
   # -- Expose the LiteLLM admin/usage UI (the native dashboard, decision 7).
   uiEnabled: true
+  # -- Phase 2 gateway-routing canary (docs/features/route_all_models_through_litellm_gateway.md).
+  # Provider slugs whose system/codex models route THROUGH the gateway (metered,
+  # reasoning captured) instead of hitting the provider directly. Gemma (endpoint)
+  # already routes through the gateway regardless. Empty = pre-Phase-2 behaviour
+  # (system models direct, codex bypassed). Roll out one provider at a time and
+  # verify `usage_events` + `reasoning_content` before adding the next.
+  # A model is only forced onto the gateway when the catalog sync has actually
+  # registered it (else it falls back to direct + logs a warning).
+  # Example: routedProviders: ["google", "openrouter", "codex"]
+  routedProviders: []
   # -- Aggregate upstream backstop (Slice 2a). Per-model RPM/TPM caps = the
   # upstream's real capacity, stamped on the shared fleet key so the fleet
   # aggregate can't blow the provider/subscription ceiling (a breach → 429 →

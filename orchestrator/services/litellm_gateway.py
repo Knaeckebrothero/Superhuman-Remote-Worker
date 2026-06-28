@@ -105,6 +105,27 @@ def gateway_is_healthy() -> bool:
     return _gateway_healthy
 
 
+# The set of public ``model_name``s the catalog sync has registered in the
+# gateway, republished after every successful reconcile. Phase 2's dispatch
+# canary reads it as a **fail-loud guard**: it only forces a model onto the
+# gateway when that model is actually registered — otherwise the agent would get
+# a 400 "model not found", strictly worse than the working direct path. Empty
+# until the first sync, so dispatch never routes to the gateway before it is
+# known-ready.
+_registered_models: frozenset[str] = frozenset()
+
+
+def publish_registered_models(names: Any) -> None:
+    """Record the model_names currently registered in the gateway (sync owns this)."""
+    global _registered_models
+    _registered_models = frozenset(names)
+
+
+def gateway_registered_models() -> frozenset[str]:
+    """Model_names the sync has registered in the gateway (Phase-2 routing guard)."""
+    return _registered_models
+
+
 # LiteLLM provider-route prefix for a system-provider catalog row. The catalog
 # ``provider_ref`` IS the provider slug and LiteLLM's route matches it, except
 # Google AI Studio, which LiteLLM routes as ``gemini/``. Identity for the rest
@@ -594,6 +615,9 @@ async def sync_catalog_to_gateway(
             deleted,
             len(desired),
         )
+    # Publish what the gateway now serves so the dispatch canary's fail-loud
+    # guard only routes models that are actually registered.
+    publish_registered_models(spec["model_name"] for spec in desired.values())
     return {
         "added": added,
         "replaced": replaced,

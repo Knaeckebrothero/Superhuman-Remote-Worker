@@ -157,6 +157,7 @@ from services.litellm_gateway import (  # noqa: E402
     compute_project_quota_status,
     ensure_scoped_key,
     gateway_is_healthy,
+    gateway_registered_models,
     get_fleet_key,
     litellm_sync_loop,
     mark_gateway_health,
@@ -1293,6 +1294,69 @@ async def _gateway_routing_target_scoped(
 
 
 # ---------------------------------------------------------------------------
+# Phase 2 — route system/codex models through the gateway, per-provider canary.
+#
+# Today gemma (endpoint-kind) already routes through the gateway; system models
+# (minimax/OpenRouter, gemini/Google) go direct and codex deliberately bypasses.
+# Phase 2 flips those onto the gateway too — but behind a per-provider allowlist
+# so we can canary one provider at a time. Empty allowlist = zero behaviour
+# change (the default), so this is dark until an operator opts a provider in.
+# See docs/features/route_all_models_through_litellm_gateway.md §4.2.
+# ---------------------------------------------------------------------------
+
+
+def _gateway_routed_providers() -> frozenset[str]:
+    """Provider slugs opted into gateway routing (``LITELLM_GATEWAY_ROUTED_PROVIDERS``).
+
+    Comma-separated, lowercased (e.g. ``"google,openrouter,codex"``). Empty/unset
+    → no system/codex model is forced onto the gateway (pre-Phase-2 behaviour).
+    """
+    raw = os.getenv("LITELLM_GATEWAY_ROUTED_PROVIDERS", "")
+    return frozenset(p.strip().lower() for p in raw.split(",") if p.strip())
+
+
+def _gateway_canary_provider(meta: Any) -> str | None:
+    """The canary key for a model, or None if it isn't a gateway-canary candidate.
+
+    Only **system-anchored** rows (``api_key_ref`` = provider slug) and the
+    **codex** proxy are candidates. Endpoint rows like gemma already route
+    through the gateway via the endpoint branch and are not gated by the canary.
+    """
+    if meta is None:
+        return None
+    if meta.provider == "codex":
+        return "codex"
+    if meta.endpoint_id is None and meta.api_key_ref:
+        return str(meta.api_key_ref).lower()
+    return None
+
+
+def _should_route_via_gateway(meta: Any, gw_target: tuple[str, str] | None) -> bool:
+    """True if this system/codex model should route through the gateway (Phase 2).
+
+    Three gates, all required: the gateway is reachable (``gw_target`` non-None —
+    also covers the Phase-0 health fallback), the model's provider is in the
+    canary allowlist, and the model is **actually registered** in the gateway.
+    The last is the fail-loud guard: a canaried-but-unregistered model routes
+    direct (with a warning) instead of 400-ing against an unknown gateway model.
+    """
+    if gw_target is None:
+        return False
+    provider = _gateway_canary_provider(meta)
+    if provider is None or provider not in _gateway_routed_providers():
+        return False
+    if meta.model_id not in gateway_registered_models():
+        logger.warning(
+            "Gateway canary: %s (provider %s) is opted-in but not registered in "
+            "the gateway — routing direct. Check the catalog sync / system key.",
+            meta.model_id,
+            provider,
+        )
+        return False
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Slice 3 — longer-window quota stop (orchestrator-enforced).
 #
 # LiteLLM has no native request/token daily quota (only a dollar cron budget —
@@ -1563,7 +1627,23 @@ async def _inject_dispatch_credentials(
         except UnknownModelError:
             meta = None
 
-    if (
+    if _should_route_via_gateway(meta, _gw_scoped):
+        # Phase 2 canary: a system/codex model whose provider is opted in AND
+        # registered → route through the gateway with the **openai** factory, so
+        # the agent captures reasoning as ``reasoning_content`` (system providers
+        # natively; codex via the gateway's Chat<->Responses bridge). The gateway
+        # holds the upstream/system key, so the agent's credential is the gateway
+        # virtual key — assigned (not setdefault) so a stale direct key or
+        # provider from a prior turn can't shadow it, and so the upstream key
+        # never reaches the gateway (it 401s on non-``sk-`` keys).
+        llm_over["provider"] = "openai"
+        llm_over["base_url"] = _gw_scoped[0]
+        llm_over["api_key"] = _gw_scoped[1]
+        logger.info(
+            f"Dispatch: routed {model_id} via LiteLLM gateway "
+            f"(canary {_gateway_canary_provider(meta)})"
+        )
+    elif (
         meta is not None
         and meta.origin in ("custom", "system", "catalog")
         and meta.endpoint_id
@@ -3630,17 +3710,30 @@ async def _inject_model_credentials(
     if meta is not None and meta.provider:
         section.setdefault("provider", meta.provider)
 
+    # Prefer the caller's pre-resolved target (the dispatch's scoped key, 2b);
+    # otherwise resolve the shared fleet key here (callers without user/project
+    # context, e.g. some hot-swap paths). None when the gateway is disabled or
+    # unhealthy (Phase-0 fallback).
+    _gw_target = gateway_override or _gateway_routing_target()
+
+    if _should_route_via_gateway(meta, _gw_target):
+        # Phase 2 canary (see _inject_dispatch_credentials): a canaried +
+        # registered system/codex section routes through the gateway with the
+        # openai factory + gateway virtual key, assigned so they win over a
+        # stale/direct key carried by a hot-swapped section.
+        section["provider"] = "openai"
+        section["base_url"] = _gw_target[0]
+        section["api_key"] = _gw_target[1]
+        return
+
     if (
         meta is not None
         and meta.origin in ("custom", "system", "catalog")
         and meta.endpoint_id
     ):
-        # Prefer the caller's pre-resolved target (the dispatch's scoped key, 2b);
-        # otherwise resolve the shared fleet key here (callers without user/project
-        # context, e.g. some hot-swap paths). The Codex proxy is Responses-API only
-        # and the gateway would normalize it to Chat Completions and drop reasoning,
-        # so codex models bypass the gateway and hit their endpoint directly.
-        _gw_target = gateway_override or _gateway_routing_target()
+        # The Codex proxy is Responses-API only and the gateway would normalize
+        # it to Chat Completions and drop reasoning, so non-canaried codex models
+        # bypass the gateway and hit their endpoint directly.
         _gw = None if meta.provider == "codex" else _gw_target
         if _gw is not None:
             # Route endpoint-kind phase/aux models through the gateway too, so
