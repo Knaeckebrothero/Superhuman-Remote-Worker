@@ -71,6 +71,12 @@ spec:
         - podSelector:
             matchLabels:
               {{- include "srw.componentSelectorLabels" (dict "context" . "component" "agent") | nindent 14 }}
+        {{- if .Values.pgadmin.enabled }}
+        # Optional pgAdmin UI administers all three app DBs.
+        - podSelector:
+            matchLabels:
+              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "pgadmin") | nindent 14 }}
+        {{- end }}
       ports:
         - port: 5432
           protocol: TCP
@@ -99,6 +105,12 @@ spec:
         - podSelector:
             matchLabels:
               {{- include "srw.componentSelectorLabels" (dict "context" . "component" "agent") | nindent 14 }}
+        {{- if .Values.pgadmin.enabled }}
+        # Optional pgAdmin UI administers all three app DBs.
+        - podSelector:
+            matchLabels:
+              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "pgadmin") | nindent 14 }}
+        {{- end }}
       ports:
         - port: 5432
           protocol: TCP

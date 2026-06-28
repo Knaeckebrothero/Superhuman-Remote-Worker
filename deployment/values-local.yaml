@@ -173,6 +173,10 @@ secrets:
     # the proxy's remote-management API + the orchestrator's /api/codex/* calls.
     CODEX_MANAGEMENT_KEY: "dev_codex_key"
 
+    # --- pgAdmin login (dev throwaway; chart sources PGADMIN_DEFAULT_EMAIL/PASSWORD from these) ---
+    PGADMIN_EMAIL: "admin@srw.dev"
+    PGADMIN_PASSWORD: "pgadmin-dev-pw"
+
     # --- Internal API keys ---
     MCP_INTERNAL_KEY: "dev_mcp_internal_key"
 
@@ -378,3 +382,9 @@ sessionRouter:
 # -----------------------------------------------------------------------------
 checkpointer:
   backend: "postgres"
+
+# pgAdmin — pre-registers the three SRW Postgres DBs with passwords pre-filled
+# from the Secret (preregisterDatabases default true). Login = PGADMIN_EMAIL /
+# PGADMIN_PASSWORD from secrets.values above.
+pgadmin:
+  enabled: true
