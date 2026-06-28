@@ -200,6 +200,16 @@ Tradeoff accepted for v1: codex traffic is not measured/rate-limited at the
 gateway. *Follow-up (deferred):* teach the gateway to forward `/responses` +
 reasoning so codex models stay metered **and** keep reasoning.
 
+> **RESOLVED 2026-06-28** by the gateway-migration roadmap
+> (`docs/features/route_all_models_through_litellm_gateway.md`): LiteLLM's
+> `use_responses_api: true` bridges Chat Completions ↔ the codex proxy's
+> Responses API and **preserves the reasoning summary + cost** (verified on
+> v1.90.0). P1 (`21c7022b`) registers codex with that flag; P2 (`ccb534a0`)
+> routes it through the gateway behind the `LITELLM_GATEWAY_ROUTED_PROVIDERS`
+> canary — so the `provider == "codex"` bypass is lifted (per provider) and
+> codex is metered while keeping reasoning. k3d-verified: a `gpt-5.5` job
+> routed via the gateway with the openai factory + bridge, reasoning intact.
+
 Tests: `tests/test_model_registry.py::TestEndpointFactoryProvider` +
 `::TestEndpointMetaProviderResolution` and
 `tests/test_dispatch_phase_credentials.py::TestCodexBypassesGateway` (11 new;

@@ -19,9 +19,16 @@ related:
 
 # Route all models/providers through the LiteLLM gateway — implementation roadmap
 
-**Status:** Proposed, **research-backed 2026-06-28** (6 subagents: 4 codebase traces + 2 web). Empirically de-risked first: see `docs/issues/system_provider_models_bypass_gateway_unmetered.md` §§ "Empirical addendum" + "Codex-proxy follow-up" — we proved a real LiteLLM proxy (v1.83.7 local / v1.89.3 k3d) preserves reasoning + meters for every model family we run, including the Responses-API-only codex-proxy. This doc is the implementation plan to make the gateway the **single path for all LLM traffic**.
+**Status:** **In progress — P0–P2 done + committed on `develop`; P3–P5 remaining.** Research-backed 2026-06-28 (6 subagents: 4 codebase traces + 2 web); empirically de-risked first (see `docs/issues/system_provider_models_bypass_gateway_unmetered.md` §§ "Empirical addendum" + "Codex-proxy follow-up" — a real LiteLLM proxy preserves reasoning + meters for every model family we run, including the Responses-API-only codex-proxy). This doc is both the implementation plan and the running status to make the gateway the **single path for all LLM traffic**.
 
 **One-line goal:** every model (minimax, gemini, gemma, gpt-5.x/codex — and any future provider) routes through `srw-litellm:4000`, so we get unified **metering + rate-limiting + quota + reasoning capture + key management** in one chokepoint, instead of the current half-in/half-bypassed state.
+
+**Progress — 2026-06-28, all k3d-live-verified on LiteLLM v1.90.0:**
+- ✅ **P0 — de-risk** (image pinned `litellm-database:v1.90.0`; gateway-down→direct dispatch fallback; `get_spend_logs` `start_date` bound) — commit `bdea2869`.
+- ✅ **P1 — register every model** (`build_desired_models` now syncs system rows + codex `use_responses_api`; per-provider `litellm_params` + `params_json["litellm"]` overrides; `_rev_for_model` re-register fix). gemini/minimax/codex each callable *through* the gateway — commit `21c7022b`.
+- ✅ **P2 — flip routing** behind a **default-off per-provider canary** (`LITELLM_GATEWAY_ROUTED_PROVIDERS`) with a registered-model fail-loud guard. Real minimax + codex jobs routed through the gateway live (dispatch log + agent `base_url=srw-litellm` + 20 `usage_events` rows) — commit `ccb534a0`.
+- ⏳ **P3 — metering completeness** (populate the NULL `usage_events.cost_usd`, the documented Gap-B §4.4) · **P4 — agent-factory collapse** · **P5 — HA**.
+- Full per-phase build detail + verification evidence in the **Status** callouts under each phase in §7.
 
 ---
 
@@ -30,6 +37,8 @@ related:
 Today the gateway meters only *some* models; the paid external ones (minimax/OpenRouter, gemini/Google) **bypass it entirely** and codex was **deliberately bypassed** to keep its reasoning. Both gaps are documented in `system_provider_models_bypass_gateway_unmetered.md`. We've now shown the bypasses are unnecessary: LiteLLM carries reasoning + cost for all of them. Routing everything through closes the metering gap, fixes the inverted coverage (we currently meter the *free* self-hosted lane and miss the *paid* lane), and removes per-provider drift in the agent.
 
 ## 2. Current state (what routes where)
+
+> **As-built note (post-P2).** The table below is the **original pre-implementation baseline**, kept for context — its `main.py` line numbers predate the P0–P2 edits and have shifted. What changed since: **P1** registers system + codex rows in the gateway (so "In gateway sync?" is now **Yes** for every enabled model), and **P2** adds a default-off per-provider canary (`LITELLM_GATEWAY_ROUTED_PROVIDERS`) that routes system + codex models *through* the gateway when their provider is opted in. With an empty allowlist (the default) the routing still matches this table. See the §7 **Status** callouts for the as-built behaviour.
 
 The gateway-vs-direct decision lives in **two functions** in `orchestrator/main.py`, with duplicated gate logic, and both the legacy (`config_override`) and blob (`resolved_config`) delivery paths funnel through them (so one edit covers both — `config_resolver.py:202` `inject_blob_credentials` calls the same injector):
 
@@ -100,7 +109,7 @@ Routing 100% through the gateway makes it a **hard single point of failure for a
 
 **Phase 0 — De-risk (no routing change).** Pin image + version floor; set/back-up `LITELLM_SALT_KEY`; add the gateway-down→direct dispatch fallback; harden `get_spend_logs` (start_date/pagination) and add the push callback. *Verify:* existing traffic unchanged; fallback exercised by killing the gateway pod on k3d.
 
-> **Status — 2026-06-28, mostly DONE on develop (uncommitted).**
+> **Status — 2026-06-28, DONE + committed (`bdea2869`) on `develop`. k3d-verified.**
 > - ✅ **Image pinned** `litellm-database:main-stable` → `v1.90.0` (digest `sha256:b4b2eb22…`), `helm/values.yaml` (overlays don't override → covers dev/local/prod). Helm-template-rendered.
 > - ✅ **Salt key** — already wired as a required `secretKeyRef` + verified on dev: present and **distinct from master** (Vault-backed via ESO `dataFrom: extract`, so already "backed up"). No change needed.
 > - ✅ **Gateway-down→direct fallback** — cached `_gateway_healthy` flag in `litellm_gateway.py` (`mark_gateway_health`/`gateway_is_healthy`), set by the sync loop's `is_ready()` probe **and** the per-dispatch scoped-key probe; `_gateway_routing_target()` returns None when down → both dispatch injectors fall to the endpoint's direct creds (stale-gateway-base_url cleanup made health-independent). Optimistic cold-start preserves happy-path behavior. **k3d-verified:** scaled `srw-litellm`→0, orchestrator logged `health transition: up -> down` (sync probe), then auto-recovered `down -> up` on scale-back — exactly two sync ticks apart.
@@ -110,7 +119,7 @@ Routing 100% through the gateway makes it a **hard single point of failure for a
 
 **Phase 1 — Register every model (no routing change).** Widen `build_desired_models` to system rows + codex `use_responses_api`; per-provider `litellm_params` + `params_json` overrides; fix `srw_rev` to include `models`/`system_api_keys` `updated_at`. *Verify:* gateway `/v1/models` lists minimax/gemini/codex; agents still bypass (no behavior change yet).
 
-> **Status — 2026-06-28, DONE on develop (uncommitted).** All in `orchestrator/services/litellm_gateway.py` (zero `main.py`/dispatch change → agents still bypass, as designed).
+> **Status — 2026-06-28, DONE + committed (`21c7022b`) on `develop`. k3d-verified.** All in `orchestrator/services/litellm_gateway.py` (zero `main.py`/dispatch change → agents still bypass, as designed).
 > - ✅ **Codex knob confirmed on the pinned v1.90.0** first (§4.5): registered a temp model `openai/gpt-5.5`+`use_responses_api:true` at `srw-codex-proxy`, called via the `/chat/completions` bridge → `reasoning_content` (478 chars) + reasoning_tokens + `x-litellm-response-cost`. `use_responses_api` is the right knob.
 > - ✅ **`build_desired_models` widened** — now queries `provider_kind="endpoint"` **and** `"system"`. Endpoint rows unchanged except the Codex proxy now gets `use_responses_api:true` (detected by `_is_codex_endpoint`, label/base `codex-proxy`). System rows → `_LITELLM_SYSTEM_ROUTE` prefix (`google`→`gemini/`, else identity; skip double-prefix) + decrypted `get_system_api_key(provider_ref)` + `drop_params:true` (the gemini `parallel_tool_calls` guard). `params_json["litellm"]` sub-key shallow-merges per-model overrides (zero-migration).
 > - ✅ **`srw_rev` fix** — `_rev_for_endpoint`→`_rev_for_model`, sums the catalog row + endpoint + system-key `updated_at`, so a params_json edit or key rotation re-registers (one-time re-register of existing rows applied the codex knob).
@@ -123,7 +132,7 @@ Routing 100% through the gateway makes it a **hard single point of failure for a
 
 **Phase 2 — Flip routing through the gateway.** Broaden the dispatch gate to system rows (force `provider="openai"` + gateway creds); remove the codex bypass + rework the stale-base_url cleanup; add the fail-loud unregistered-model guard. Roll out **per-provider behind a flag / weighted canary**. *Verify (k3d):* a real session/job on minimax + gemini + codex captures `reasoning_content` AND produces `usage_events` rows; `x-litellm-response-cost` present.
 
-> **Status — 2026-06-28, DONE on develop (uncommitted), k3d live-verified.** Built **default-off**: empty `LITELLM_GATEWAY_ROUTED_PROVIDERS` = zero behaviour change (gemma already gateway-routed; system direct; codex bypassed). Files: `orchestrator/main.py`, `orchestrator/services/litellm_gateway.py`, `helm/{values.yaml,templates/configmap.yaml,templates/orchestrator/deployment.yaml}`, `tests/test_dispatch_phase_credentials.py`.
+> **Status — 2026-06-28, DONE + committed (`ccb534a0`) on `develop`. k3d live-verified.** Built **default-off**: empty `LITELLM_GATEWAY_ROUTED_PROVIDERS` = zero behaviour change (gemma already gateway-routed; system direct; codex bypassed). Files: `orchestrator/main.py`, `orchestrator/services/litellm_gateway.py`, `helm/{values.yaml,templates/configmap.yaml,templates/orchestrator/deployment.yaml}`, `tests/test_dispatch_phase_credentials.py`.
 > - **Canary flag** `LITELLM_GATEWAY_ROUTED_PROVIDERS` (comma slugs `google,openrouter,codex`) → helm `litellm.routedProviders` → ConfigMap → orchestrator env. `_gateway_routed_providers()` reads it.
 > - **Decision** `_should_route_via_gateway(meta, gw)` — three AND-gates: gateway reachable (covers the P0 health fallback) · provider in the allowlist (`_gateway_canary_provider`: codex, or a system row's `api_key_ref`; gemma/endpoint rows are *not* candidates) · **model registered** (`gateway_registered_models()`, republished by the sync after each reconcile = the fail-loud guard → canaried-but-unregistered routes *direct* with a warning, never 400).
 > - **Routing flip** — prepended a canary branch to **both** injectors (`_inject_dispatch_credentials`, `_inject_model_credentials`): force `provider="openai"` + gateway base_url/key (**assigned**, not setdefault, so the upstream key never reaches the gateway and a stale hot-swap key can't shadow it). Codex bypass + the existing endpoint/direct branches stay for the non-canaried cases.
