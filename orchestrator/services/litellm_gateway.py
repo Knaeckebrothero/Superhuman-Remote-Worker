@@ -1069,8 +1069,11 @@ async def compute_project_quota_status(
 # callback), so the orchestrator polls /spend/logs and writes canonical
 # category='llm' rows — the same orchestrator-polls-the-gateway shape as the Slice
 # 3 quota read. Attribution comes from the scoped key's deterministic user/team
-# ids on each row (the api_key is hashed); token quantities are priced from
-# usage_rates like any other row (homelab models are unpriced → cost stays NULL).
+# ids on each row (the api_key is hashed). Token quantities ride unpriced
+# dimension rows (no per-token usage_rates entry); the request's dollar cost is
+# the gateway-computed ``spend``, emitted as its own ``unit='request'`` dimension
+# so SUM(cost_usd) == spend with no double-count (homelab models price at 0 → no
+# cost row, cost stays absent — same inert-until-paid posture as before).
 # ---------------------------------------------------------------------------
 
 
@@ -1105,6 +1108,23 @@ def _parse_spend_ts(value: Any) -> Optional[datetime]:
     return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
 
 
+def _spend_amount(value: Any) -> Optional[float]:
+    """Parse a spend-log ``spend`` (USD) to a float; None if absent/unparseable.
+
+    ``spend`` is LiteLLM's authoritative per-request cost (tiered/cached pricing
+    already folded in). Homelab/unpriced models report ``0.0``; paid providers
+    report a positive amount. The materializer only emits a cost row when this is
+    > 0, so a missing/blank/``None`` spend leaves the request unpriced (cost
+    absent) rather than poisoning the ledger with a 0/NaN cost.
+    """
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (ValueError, TypeError):
+        return None
+
+
 def _spend_logs_start_date(since: Optional[datetime]) -> Optional[str]:
     """Day-granular ``start_date`` for ``/spend/logs`` derived from the cursor.
 
@@ -1129,13 +1149,17 @@ async def materialize_llm_usage(
 ) -> Dict[str, Any]:
     """Pull recent spend-log rows into usage_events as ``category='llm'`` rows.
 
-    One row per token *dimension* (prompt-token + completion-token), ``resource``
-    = the model group, attributed to the SRW user/project parsed from the scoped
-    key's ids. Idempotent at the ledger (dedupe on source_id+unit+ts), so
-    re-polling the same rows is safe; ``since`` is an in-memory efficiency cursor
-    (max ``startTime`` processed) the caller threads across ticks. Rows with no
-    tokens (health checks) or no model are skipped. Returns
-    ``{"materialized", "cursor", "scanned"}``.
+    One row per token *dimension* (prompt-token + completion-token) carrying the
+    quantity, plus — for priced traffic (``spend`` > 0) — a ``unit='request'`` row
+    carrying the gateway-computed dollar ``cost_usd`` (LiteLLM's authoritative
+    per-request cost, tiered/cached pricing folded in). The token rows stay
+    cost-free (no per-token rate exists); the single cost row keeps
+    SUM(cost_usd) == spend with no double-count. ``resource`` = the model group,
+    attributed to the SRW user/project parsed from the scoped key's ids.
+    Idempotent at the ledger (dedupe on source_id+unit+ts), so re-polling the same
+    rows is safe; ``since`` is an in-memory efficiency cursor (max ``startTime``
+    processed) the caller threads across ticks. Rows with no tokens (health checks)
+    or no model are skipped. Returns ``{"materialized", "cursor", "scanned"}``.
     """
     if ledger is None or not ledger.is_available:
         return {"materialized": 0, "cursor": since, "scanned": 0}
@@ -1169,6 +1193,23 @@ async def materialize_llm_usage(
         if completion:
             events.append(
                 UsageEvent(quantity=completion, unit="completion-token", **common)
+            )
+        # Gateway-priced cost dimension. LiteLLM's ``spend`` is the authoritative
+        # per-request cost (tiered/cached pricing already folded in) and does NOT
+        # decompose onto a per-token usage_rates rate — so emit it as its own
+        # dimension rather than overloading a token row. Pre-setting cost_usd makes
+        # record_events skip the (empty, compute-only) usage_rates lookup. Only paid
+        # models carry spend > 0; homelab models price at 0 and emit no cost row.
+        cost = _spend_amount(r.get("spend"))
+        if cost is not None and cost > 0:
+            events.append(
+                UsageEvent(
+                    quantity=1,
+                    unit="request",
+                    rate_usd=cost,
+                    cost_usd=cost,
+                    **common,
+                )
             )
         if max_ts is None or ts > max_ts:
             max_ts = ts
