@@ -1122,6 +1122,13 @@ async def _resolve_session_config(
         _skills_payload = await _gather_in_scope_skills(
             user_id, [project_id] if project_id else None
         )
+        # Per-model registry overrides must reach the matrix as explicit llm
+        # keys, else the blob bakes the family window and the admin
+        # context_window cap is silently dropped (see
+        # _seed_registry_model_overrides).
+        request_override = await _seed_registry_model_overrides(
+            request_override, user_id=user_id
+        )
         resolved = resolve_config(
             base_config_name=base,
             base_defaults=base_defaults,
@@ -1584,6 +1591,55 @@ async def llm_usage_poll_loop(
     finally:
         await client.aclose()
         logger.info("LLM usage poll loop stopped")
+
+
+async def _seed_registry_model_overrides(
+    request_override: dict[str, Any] | None,
+    *,
+    user_id: str | None,
+) -> dict[str, Any] | None:
+    """Seed per-model registry values into the request override BEFORE
+    ``resolve_config`` bakes the settings matrix.
+
+    The blob dispatch path freezes ``limits`` (``model_max_context_tokens`` and
+    its derived ``context_threshold_tokens`` = ``0.80 × base``) at resolve time,
+    and the agent never re-derives them: ``load_config_from_resolved`` ->
+    ``load_agent_config_from_dict`` parses the frozen blob without re-running
+    ``_apply_settings_matrix``. So an admin's per-model ``context_window``
+    (Admin -> Models) must land in ``llm.model_max_context_tokens`` *before*
+    ``_apply_settings_matrix`` runs (``config_resolver.resolve_config``), or the
+    family default wins and the cap is silently ignored. See
+    ``docs/issues/per_model_context_window_override_shadowed_in_blob_dispatch.md``.
+
+    ``resolve_config`` is pure/synchronous (no DB), so the registry lookup
+    happens here and rides the existing ``request_override`` layer: its llm keys
+    enter ``explicit_llm_keys`` (the matrix won't clobber them) and deep-merge
+    into ``data["llm"]`` (becoming the limits-derivation base).
+
+    ``setdefault`` semantics: an explicit caller pin still wins; the family
+    default — absent from the bare override pre-resolve — loses. Returns a copy
+    with a fresh ``llm`` subdict; the input (the job's persisted
+    ``config_override``) is never mutated. The legacy path does not call
+    ``resolve_config`` and is unaffected — its ``_inject_dispatch_credentials``
+    / ``_inject_model_credentials`` setdefault stays the injection mechanism
+    there (and becomes a harmless no-op on the blob path once the value is
+    baked). Carries the future per-model ``max_output_tokens`` the same way
+    (``[[reasoning_aware_max_output_tokens]]``).
+    """
+    model_id = ((request_override or {}).get("llm") or {}).get("model")
+    if not model_id:
+        return request_override
+    try:
+        meta = await _resolve_model(model_id, user_id=user_id)
+    except UnknownModelError:
+        return request_override
+    if not (meta and meta.context_window):  # truthy guard rejects None / 0
+        return request_override
+    co = dict(request_override or {})
+    llm = dict(co.get("llm") or {})
+    llm.setdefault("model_max_context_tokens", meta.context_window)
+    co["llm"] = llm
+    return co
 
 
 async def _inject_dispatch_credentials(
@@ -2200,11 +2256,19 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
                     str(job["user_id"]) if job.get("user_id") else None,
                     [str(job["project_id"])] if job.get("project_id") else None,
                 )
+                # Per-model registry overrides (context_window; later
+                # max_output_tokens) must reach the matrix as explicit llm keys,
+                # else the blob bakes the family window and the admin cap is
+                # silently dropped (see _seed_registry_model_overrides).
+                _req_override = await _seed_registry_model_overrides(
+                    config_override,
+                    user_id=str(job["user_id"]) if job.get("user_id") else None,
+                )
                 _resolved = resolve_config(
                     base_config_name=_base_name,
                     base_defaults=_base_defaults,
                     expert_row=expert_row,
-                    request_override=config_override,
+                    request_override=_req_override,
                     expert_type="worker",
                     capture=_cap,
                     skills=_skills_payload,
