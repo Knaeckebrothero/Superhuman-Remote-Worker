@@ -327,6 +327,15 @@ llm:
 # -----------------------------------------------------------------------------
 litellm:
   enabled: true
+  # P2 canary rollout: route these system/codex providers THROUGH the gateway so
+  # their traffic is metered (cost lands in usage_events via P3). Empty/unset =
+  # chart default = off. Starting with openrouter (the paid minimax lane).
+  # ORDER MATTERS — only flip this AFTER P0–P3 is deployed here (else the
+  # orchestrator has no canary code to read it and the gateway hasn't registered
+  # the system models). PREREQ: the `openrouter` system-provider key must exist as
+  # an app-DB row (Admin → Models) so minimax registers in the gateway; an
+  # unregistered canaried model routes direct + warns (fail-loud guard), never 400s.
+  routedProviders: ["openrouter"]
 # -----------------------------------------------------------------------------
 # Session router — Direct Session WebSockets
 # (docs/features/direct_session_websockets.md)
