@@ -2745,33 +2745,60 @@ def create_llm(
         return _create_openai_llm(config, limits)
 
 
+# Output-token cap policy — see docs/features/reasoning_aware_max_output_tokens.md.
+# The legacy hard 16384 starved reasoning models (their reasoning tokens are
+# billed as output and share this budget, so a hard turn truncates mid-thought
+# with finish_reason=length and no answer). The default is raised; safety now
+# comes from the context-aware backstop + an absolute ceiling (the vllm#40080
+# runaway guard moves to the ceiling + §8 detection, not this cap).
+DEFAULT_MAX_OUTPUT_TOKENS = 32768
+ABSOLUTE_MAX_OUTPUT_TOKENS = 131072  # nothing legitimate exceeds 128k in one turn
+MIN_MAX_OUTPUT_TOKENS = 4096
+# context_threshold is a *trigger* input can briefly overshoot before the next
+# compaction; reserve a margin so input + output still fit the window (keep > 0).
+OUTPUT_SAFETY_MARGIN = 4096
+
+
 def _resolve_max_output_tokens(
     config: LLMConfig,
     limits: Optional[LimitsConfig] = None,
 ) -> int:
     """Resolve the output token cap for non-Anthropic providers.
 
-    Mirrors the safety pattern in `_create_anthropic_llm`: when the user
-    hasn't set `max_output_tokens` explicitly, derive a sensible cap from
-    the model's declared context window. Without this, vLLM/llama.cpp
-    style endpoints fall back to their server-side default (effectively
-    unbounded for most local servers), and a single runaway generation
-    (e.g. the known gemma4 + xgrammar repetition loop, vllm#40080) can
-    emit millions of tokens of repeated content and poison the next turn.
+    Reasoning tokens are billed as output and share this budget, so the cap
+    must hold reasoning *and* the answer or the model truncates mid-thought
+    (``finish_reason=length`` with empty content). Resolution order:
 
-    Resolution order:
-      1. Explicit ``config.max_output_tokens`` (user / per-job override)
-      2. ``min(16384, ctx // 4)`` when the context window is known
-      3. ``8192`` as last resort
+      1. Explicit ``config.max_output_tokens`` (per-model registry override →
+         family ``settings.max_output_tokens`` → per-job override), else
+         ``DEFAULT_MAX_OUTPUT_TOKENS``.
+      2. Clamp by a *compaction-aligned backstop* so output fits alongside
+         post-compaction input: ``effective_ctx − context_threshold − margin``
+         (``context_threshold`` ≈ ``0.80 × ctx``) ⇒ input + output ≤ ctx, and a
+         smaller admin ``context_window`` cap proportionally shrinks output.
+      3. Clamp by ``ABSOLUTE_MAX_OUTPUT_TOKENS``; the backstop never falls below
+         ``MIN_MAX_OUTPUT_TOKENS``.
     """
-    if config.max_output_tokens is not None:
-        return config.max_output_tokens
+    desired = (
+        config.max_output_tokens
+        if config.max_output_tokens is not None
+        else DEFAULT_MAX_OUTPUT_TOKENS
+    )
+    resolved = min(desired, ABSOLUTE_MAX_OUTPUT_TOKENS)
+
     ctx = config.model_max_context_tokens or (
         limits.model_max_context_tokens if limits else None
     )
     if ctx:
-        return min(16384, ctx // 4)
-    return 8192
+        threshold = (
+            getattr(limits, "context_threshold_tokens", None)
+            if limits is not None
+            else None
+        ) or int(ctx * CONTEXT_THRESHOLD_FRACTION)
+        backstop = max(MIN_MAX_OUTPUT_TOKENS, ctx - threshold - OUTPUT_SAFETY_MARGIN)
+        resolved = min(resolved, backstop)
+
+    return resolved
 
 
 def _create_openai_llm(
@@ -2966,23 +2993,12 @@ def _create_anthropic_llm(
     if config.timeout is not None:
         llm_kwargs["timeout"] = config.timeout
 
-    # Anthropic requires max_tokens - use config override or model-aware defaults
-    if config.max_output_tokens is not None:
-        llm_kwargs["max_tokens"] = config.max_output_tokens
-    else:
-        model_lower = config.model.lower()
-        if any(
-            x in model_lower for x in ("opus-4-6", "opus-4-5", "opus-4-1", "opus-4-0")
-        ):
-            llm_kwargs["max_tokens"] = 32000
-        elif any(x in model_lower for x in ("sonnet-4-5", "sonnet-4-0")):
-            llm_kwargs["max_tokens"] = 16384
-        elif config.model_max_context_tokens:
-            llm_kwargs["max_tokens"] = min(8192, config.model_max_context_tokens // 4)
-        elif limits and limits.model_max_context_tokens:
-            llm_kwargs["max_tokens"] = min(8192, limits.model_max_context_tokens // 4)
-        else:
-            llm_kwargs["max_tokens"] = 4096
+    # Anthropic requires max_tokens. Route through the shared resolver so the
+    # family/per-model max_output_tokens, the compaction-aligned backstop, and
+    # the absolute ceiling apply identically across providers (the old
+    # per-model-class ladder pre-dated the reasoning-aware policy; Anthropic
+    # families set their own max_output_tokens in the matrix).
+    llm_kwargs["max_tokens"] = _resolve_max_output_tokens(config, limits)
 
     llm = ChatAnthropic(**llm_kwargs)
 

@@ -1633,11 +1633,17 @@ async def _seed_registry_model_overrides(
         meta = await _resolve_model(model_id, user_id=user_id)
     except UnknownModelError:
         return request_override
-    if not (meta and meta.context_window):  # truthy guard rejects None / 0
-        return request_override
+    if not meta or not (meta.context_window or meta.max_output_tokens):
+        return request_override  # nothing per-model to seed (truthy rejects None/0)
     co = dict(request_override or {})
     llm = dict(co.get("llm") or {})
-    llm.setdefault("model_max_context_tokens", meta.context_window)
+    if meta.context_window:
+        llm.setdefault("model_max_context_tokens", meta.context_window)
+    if meta.max_output_tokens:
+        # Per-model output cap → enters explicit_llm_keys so the settings matrix
+        # won't re-bake the family value, then _resolve_max_output_tokens clamps
+        # it to the context backstop. Same shadow-avoiding path as context_window.
+        llm.setdefault("max_output_tokens", meta.max_output_tokens)
     co["llm"] = llm
     return co
 
@@ -1794,6 +1800,10 @@ async def _inject_dispatch_credentials(
     # base for the derived limits. Truthy guard rejects None and an explicit 0.
     if meta is not None and meta.context_window:
         llm_over.setdefault("model_max_context_tokens", meta.context_window)
+    # Per-model output cap (params_json): flat llm key, survives the agent-side
+    # settings-matrix re-run and overrides the family settings.max_output_tokens.
+    if meta is not None and meta.max_output_tokens:
+        llm_over.setdefault("max_output_tokens", meta.max_output_tokens)
 
     if resolved_keys:
         _ENV_KEY_MAP = {"vision": "VISION_API_KEY"}
@@ -3770,6 +3780,10 @@ async def _inject_model_credentials(
     # models. setdefault keeps a caller-pinned value; truthy guard skips None/0.
     if capability == "chat" and meta is not None and meta.context_window:
         section.setdefault("model_max_context_tokens", meta.context_window)
+    # Per-model output cap (chat slot — strategic/tactical reasoning models are
+    # where output truncation bites); overrides the family value, ctx-clamped.
+    if capability == "chat" and meta is not None and meta.max_output_tokens:
+        section.setdefault("max_output_tokens", meta.max_output_tokens)
 
     # Inject the agent-side factory name so the section always routes to the
     # correct LLM factory — e.g. an OpenRouter row → _create_openrouter_llm

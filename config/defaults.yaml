@@ -13,9 +13,15 @@ llm:
   base_url: null  # Set LLM_BASE_URL env var for local vLLM endpoint
   timeout: 600
   max_retries: 3
-  max_output_tokens: null  # Auto-detected per provider; override for local models if needed
+  # NOTE: do NOT declare max_output_tokens here, even as null. It is matrix-driven
+  # (per-family settings.max_output_tokens in config/model_config_matrix.yaml,
+  # clamped to the context window by _resolve_max_output_tokens). A base
+  # declaration enters explicit_llm_keys and SHADOWS the family value the same way
+  # a base model_max_context_tokens would (see
+  # docs/features/reasoning_aware_max_output_tokens.md). A per-job/expert override
+  # still wins — it re-enters explicit_llm_keys with a real value.
   # Model-specific inference params (temperature, top_p, top_k, multimodal,
-  # parallel_tool_calls) and context limits are set via config/settings_matrix.yaml
+  # parallel_tool_calls) and context limits are set via config/model_config_matrix.yaml
   # — the single source of truth for model-dependent settings.
   # Do not set model_max_context_tokens here.
 
