@@ -214,6 +214,11 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: LITELLM_QUOTA
+            - name: LITELLM_GATEWAY_ROUTED_PROVIDERS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: LITELLM_GATEWAY_ROUTED_PROVIDERS
             {{- end }}
             {{- if .Values.databases.mongodb.enabled }}
             - name: MONGODB_URL

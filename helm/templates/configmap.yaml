@@ -61,6 +61,10 @@ data:
   # freezes a project's jobs when its UTC-day usage crosses the cap.
   # JSON: { projects: { default|<id>: { requests_per_day, tokens_per_day } } }.
   LITELLM_QUOTA: {{ .Values.litellm.quota | toJson | quote }}
+  # Phase 2 gateway-routing canary: provider slugs whose system/codex models
+  # route THROUGH the gateway instead of direct (comma-separated; "" = none, the
+  # pre-Phase-2 default). e.g. "google,openrouter,codex". Roll out one at a time.
+  LITELLM_GATEWAY_ROUTED_PROVIDERS: {{ .Values.litellm.routedProviders | default list | join "," | quote }}
   {{- end }}
 
   # (Citations live in the vector store — srw_vector — reached through the
