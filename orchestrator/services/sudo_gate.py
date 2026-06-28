@@ -528,35 +528,41 @@ class SudoGateService:
         nats_reply_subject: Optional[str],
         metadata: dict,
     ) -> Optional[str]:
-        """Insert a new sudo approval request. Returns the request ID."""
+        """Claim-and-insert a sudo approval request.
+
+        Returns the new request id on success, or None when another replica
+        already claimed this request. The NATS sudo subject fans out to every
+        replica (no queue group), so both run this; the unique reply subject is
+        the per-request claim key (migration 0040 / uq_sudo_request_reply_subject).
+        Raises on a genuine DB error so the caller can deny rather than silently
+        drop — a None must mean "someone else owns it", never "the insert failed".
+        """
         if not self._db:
             return None
-        try:
-            async with self._db.acquire() as conn:
-                row = await conn.fetchrow(
-                    """
-                    INSERT INTO sudo_approval_requests
-                        (job_id, vm_name, command, arguments, working_directory,
-                         requesting_user, target_user, nats_reply_subject, metadata,
-                         expires_at)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9,
-                            NOW() + INTERVAL '300 seconds')
-                    RETURNING id
-                    """,
-                    job_id,
-                    vm_name,
-                    command,
-                    arguments,
-                    cwd,
-                    requesting_user,
-                    target_user,
-                    nats_reply_subject,
-                    json.dumps(metadata),
-                )
-            return str(row["id"]) if row else None
-        except Exception as e:
-            logger.error("Failed to insert sudo request: %s", e)
-            return None
+        async with self._db.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO sudo_approval_requests
+                    (job_id, vm_name, command, arguments, working_directory,
+                     requesting_user, target_user, nats_reply_subject, metadata,
+                     expires_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9,
+                        NOW() + INTERVAL '300 seconds')
+                ON CONFLICT (nats_reply_subject) WHERE nats_reply_subject IS NOT NULL
+                DO NOTHING
+                RETURNING id
+                """,
+                job_id,
+                vm_name,
+                command,
+                arguments,
+                cwd,
+                requesting_user,
+                target_user,
+                nats_reply_subject,
+                json.dumps(metadata),
+            )
+        return str(row["id"]) if row else None
 
     async def insert_vm_upgrade_request(
         self,
