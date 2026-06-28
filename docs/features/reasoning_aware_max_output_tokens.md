@@ -384,7 +384,7 @@ only minimax data predates the gateway migration (`a0f826d7` doubled via
 streaming; `19707fa1` clean via `ainvoke`), so the gateway-path doubling is
 unconfirmed — first organic gateway session turn settles it.*
 
-### 7.2 Timeout is a parallel ceiling
+### 7.2 Timeout is a parallel ceiling — **IMPLEMENTED + k3d-verified 2026-06-28**
 
 `LLMConfig.timeout` (`:1286`, default 600s from `config/defaults.yaml:14` +
 `persistent_defaults.yaml:21`) is applied per-provider (`:2889-2890` openai,
@@ -397,6 +397,17 @@ static case needs **no per-call plumbing**. (Per-call override is awkward — th
 httpx deadline is baked at `reasoning_chat.py:520`/`:742` — and only the deferred
 dynamic-max_output variant needs it.) `timeout` is also a flowed-through settings
 key, so per-family timeouts are config-only if wanted.
+
+**Implemented:** `_resolve_timeout(config, limits)` (`loader.py`, beside the output
+resolver) = `max(base, round(max_tokens / 30 + 60))` — a conservative 30 tok/s
+decode rate + 60s overhead, floored at the configured base, recomputed from the
+*resolved* cap so it adapts to an admin `context_window` via the same `limits`.
+Wired **value-only** into all 7 factory timeout sites (`config.timeout` →
+`_resolve_timeout(config, limits)`); the per-factory log line now prints the
+effective (scaled) timeout. k3d-verified through the real config path: minimax-m3
+65536 → **2245s**, @256k 48333 → **1671s**; small/old caps keep ~600s; the 131072
+ceiling bounds it at **~4429s** (~74 min). Per-family `timeout` overrides remain
+config-only (flowed settings key).
 
 ### 7.3 Reasoning control for minimax — corrected
 
