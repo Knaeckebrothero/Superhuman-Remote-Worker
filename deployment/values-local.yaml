@@ -257,6 +257,11 @@ litellm:
   # With {} the fleet key still mints (unlimited), so agents are off the admin
   # master key (the security half of 2a) without throttling real usage.
   backstop: {}
+  # P2 canary: per-provider routing of system/codex models THROUGH the gateway
+  # (chart default []=off). openrouter on first = the paid lane we most want
+  # metered (minimax). Mirror this in deployment/values-experimental.yaml for the
+  # dev rollout. system/codex models not listed here stay direct.
+  routedProviders: ["openrouter"]
 
 # -----------------------------------------------------------------------------
 # Codex OAuth proxy (CLIProxyAPI) — transport for gpt-5.x / Codex subscription
