@@ -269,9 +269,15 @@ class TestOnSudoRequest:
 
     @pytest.mark.asyncio
     async def test_db_insert_failure_denies_immediately(self):
-        """When DB insert fails, the request is denied via NATS reply."""
+        """When the DB insert errors, the request is denied via NATS reply.
+
+        M2-L4: a genuine insert error now raises out of _insert_request and
+        on_sudo_request denies — distinct from a lost claim (fetchrow returns
+        None under ON CONFLICT), which drops silently (see
+        test_lost_claim_drops_silently).
+        """
         svc = SudoGateService()
-        pool, conn = make_db_pool(fetchrow_return=None)
+        pool, conn = make_db_pool(fetchrow_side_effect=Exception("insert failed"))
         nc = MagicMock()
         nc.publish = AsyncMock()
         nc.flush = AsyncMock()
@@ -288,6 +294,30 @@ class TestOnSudoRequest:
         payload = json.loads(call_args[0][1].decode())
         assert payload["approved"] is False
         assert "internal error" in payload["reason"]
+
+    @pytest.mark.asyncio
+    async def test_lost_claim_drops_silently(self):
+        """A lost claim (another replica owns it) drops without denying.
+
+        M2-L4: under replicas:2 the NATS sudo subject fans out to both replicas;
+        the loser's INSERT ... ON CONFLICT DO NOTHING returns no row
+        (_insert_request -> None), so it must drop silently — NOT deny (the
+        winning replica responds).
+        """
+        svc = SudoGateService()
+        pool, conn = make_db_pool(fetchrow_return=None)
+        nc = MagicMock()
+        nc.publish = AsyncMock()
+        nc.flush = AsyncMock()
+        svc.connect(pool, nc)
+
+        data = make_sudo_request_data()
+        msg = make_nats_msg(data, reply="_INBOX.lost123")
+
+        await svc.on_sudo_request(msg)
+
+        # No reply at all — the winning replica owns the response.
+        nc.publish.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_missing_fields_use_defaults(self):
@@ -1701,25 +1731,29 @@ class TestInsertRequest:
         assert result is None
 
     @pytest.mark.asyncio
-    async def test_insert_db_error_returns_none(self):
-        """DB error during insert returns None."""
+    async def test_insert_db_error_raises(self):
+        """DB error during insert raises (M2-L4 contract).
+
+        _insert_request no longer swallows errors into None — a None must mean
+        'another replica claimed it' (ON CONFLICT), never 'the insert failed',
+        so on_sudo_request can deny on a real error instead of dropping silently.
+        """
         svc = SudoGateService()
         pool, conn = make_db_pool(fetchrow_side_effect=Exception("insert failed"))
         svc.connect(pool)
 
-        result = await svc._insert_request(
-            job_id="job-1",
-            vm_name="vm-1",
-            command="ls",
-            arguments=[],
-            cwd="/",
-            requesting_user="agent",
-            target_user="root",
-            nats_reply_subject=None,
-            metadata={},
-        )
-
-        assert result is None
+        with pytest.raises(Exception, match="insert failed"):
+            await svc._insert_request(
+                job_id="job-1",
+                vm_name="vm-1",
+                command="ls",
+                arguments=[],
+                cwd="/",
+                requesting_user="agent",
+                target_user="root",
+                nats_reply_subject=None,
+                metadata={},
+            )
 
     @pytest.mark.asyncio
     async def test_insert_null_fetchrow_returns_none(self):
