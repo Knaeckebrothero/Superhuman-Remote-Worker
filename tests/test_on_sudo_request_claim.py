@@ -25,15 +25,20 @@ class FakeMsg:
 
 def _payload():
     return {
-        "job_id": "job-1", "vm_id": "vm1", "command": "ls", "argv": ["-la"],
-        "user": "agent", "runas_user": "root", "cwd": "/",
+        "job_id": "job-1",
+        "vm_id": "vm1",
+        "command": "ls",
+        "argv": ["-la"],
+        "user": "agent",
+        "runas_user": "root",
+        "cwd": "/",
     }
 
 
 @pytest.mark.asyncio
 async def test_drops_on_lost_claim():
     g = SudoGateService()
-    g._insert_request = AsyncMock(return_value=None)      # lost the claim
+    g._insert_request = AsyncMock(return_value=None)  # lost the claim
     g._evaluate_auto_rules = AsyncMock()
     g._broadcast_sse = AsyncMock()
     g._nats_reply = AsyncMock()
@@ -43,7 +48,7 @@ async def test_drops_on_lost_claim():
 
     g._evaluate_auto_rules.assert_not_awaited()
     g._broadcast_sse.assert_not_awaited()
-    g._nats_reply.assert_not_awaited()      # NOT a denial — the winner responds
+    g._nats_reply.assert_not_awaited()  # NOT a denial — the winner responds
     assert msg.responded is None
     assert "_INBOX.x" not in g._pending_msgs
 
@@ -58,15 +63,15 @@ async def test_denies_on_db_error():
 
     await g.on_sudo_request(msg)
 
-    g._nats_reply.assert_awaited_once()     # denied so the daemon doesn't hang
-    assert g._nats_reply.await_args.args[1] is False     # approved=False
+    g._nats_reply.assert_awaited_once()  # denied so the daemon doesn't hang
+    assert g._nats_reply.await_args.args[1] is False  # approved=False
     g._evaluate_auto_rules.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_winner_with_no_automatch_broadcasts():
     g = SudoGateService()
-    g._insert_request = AsyncMock(return_value="req-1")   # won the claim
+    g._insert_request = AsyncMock(return_value="req-1")  # won the claim
     g._evaluate_auto_rules = AsyncMock(return_value=None)  # no auto-rule match
     g._broadcast_sse = AsyncMock()
     msg = FakeMsg(_payload(), reply="_INBOX.z")
