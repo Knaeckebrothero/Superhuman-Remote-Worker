@@ -51,6 +51,12 @@ cost is sourced — see below):
   via the audit-store partition machinery). **`usage_rates`** shipped as
   `migrations/app/0033` (effective-dated, **ships empty** → costs are `NULL`/$0 until an
   admin seeds rates; quantities are metered immediately).
+  > **As-built update (gateway migration P3, 2026-06-28).** LLM `cost_usd` no longer
+  > comes from `usage_rates` — the materializer now stamps LiteLLM's authoritative
+  > per-request `spend` onto a dedicated `unit='request'` row (see
+  > `route_all_models_through_litellm_gateway.md` §4.4). So **`usage_rates` now prices
+  > `category='compute'` only** (vcpu/gib-hour); the LLM-token-pricing description below
+  > is superseded for LLM rows. Live on dev: codex GPT-5.5 $100.79 metered.
 - **LLM rows — DESIGN CHANGE.** This doc sketched emitting them at the agent's
   token-capture point (`archiver.py:393`). The implementation instead **materializes them
   from the LiteLLM gateway** (poll `/spend/logs` → `category='llm'` rows). Why: the gateway

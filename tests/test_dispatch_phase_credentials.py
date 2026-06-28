@@ -907,6 +907,61 @@ class TestGatewayCanaryRouting:
         monkeypatch.setenv("LITELLM_GATEWAY_ROUTED_PROVIDERS", "google")
         assert main._should_route_via_gateway(m, GATEWAY) is False
 
+    def test_wildcard_routes_every_provider(self, monkeypatch):
+        # "*" = the end-state "single path for all LLM traffic" posture: every
+        # system/codex provider routes through the gateway, including ones never
+        # named in the list — as long as the model is registered.
+        monkeypatch.setenv("LITELLM_GATEWAY_ROUTED_PROVIDERS", "*")
+        for provider, model_id in (
+            ("openrouter", "minimax-m3"),
+            ("mistral", "mistral-large"),  # never explicitly listed
+            ("groq", "groq/llama-3.3"),
+            ("google", "gemini-3.5-flash"),
+        ):
+            publish_registered_models({model_id})
+            assert (
+                main._should_route_via_gateway(
+                    _system_meta(model_id, provider), GATEWAY
+                )
+                is True
+            )
+        # codex too
+        codex = ModelMeta(
+            model_id="gpt-5.5",
+            provider="codex",
+            family="gpt-5",
+            display_name="x",
+            endpoint_id=CODEX_ENDPOINT_ID,
+        )
+        publish_registered_models({"gpt-5.5"})
+        assert main._should_route_via_gateway(codex, GATEWAY) is True
+
+    def test_wildcard_still_honours_registered_and_health_guards(self, monkeypatch):
+        # "*" widens the provider gate only — the fail-loud (registered) and
+        # gateway-health (gw_target) guards still hold, so "*" never forces an
+        # unregistered model onto the gateway or routes when it's down.
+        monkeypatch.setenv("LITELLM_GATEWAY_ROUTED_PROVIDERS", "*")
+        m = _system_meta("mistral-large", "mistral")
+        publish_registered_models(set())  # not registered
+        assert main._should_route_via_gateway(m, GATEWAY) is False
+        publish_registered_models({"mistral-large"})
+        assert main._should_route_via_gateway(m, None) is False  # gateway down
+        assert main._should_route_via_gateway(m, GATEWAY) is True
+
+    def test_wildcard_does_not_touch_endpoint_models(self, monkeypatch):
+        # Endpoint rows (gemma) route via the endpoint branch, not the canary — "*"
+        # must not reclassify them (their canary provider is None either way).
+        monkeypatch.setenv("LITELLM_GATEWAY_ROUTED_PROVIDERS", "*")
+        gemma = ModelMeta(
+            model_id="gemma",
+            provider="openai",
+            family="gemma",
+            display_name="x",
+            endpoint_id=CODEX_ENDPOINT_ID,
+        )
+        publish_registered_models({"gemma"})
+        assert main._should_route_via_gateway(gemma, GATEWAY) is False
+
     # --- dispatch integration (section injector) ----------------------------
     @pytest.mark.asyncio
     async def test_codex_canaried_routes_via_gateway_as_openai(self, monkeypatch):
