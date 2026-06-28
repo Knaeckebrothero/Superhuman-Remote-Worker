@@ -14,7 +14,6 @@ data:
       window['env']['minioConsoleUrl'] = '{{ include "srw.urlScheme" . }}://{{ include "srw.minioHost" . }}';
       window['env']['neo4jUrl'] = '{{ include "srw.urlScheme" . }}://{{ include "srw.neo4jBrowserHost" . }}';
       window['env']['pgadminUrl'] = '{{ include "srw.urlScheme" . }}://{{ include "srw.pgadminHost" . }}';
-      window['env']['mongoExpressUrl'] = '{{ include "srw.urlScheme" . }}://{{ include "srw.mongoHost" . }}';
       window['env']['mcpUrl'] = '{{ include "srw.mcpUrl" . }}/mcp';
       window['env']['cloudUrl'] = '{{ include "srw.cloudUrl" . }}';
 
