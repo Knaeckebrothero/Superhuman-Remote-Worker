@@ -110,6 +110,17 @@ Routing 100% through the gateway makes it a **hard single point of failure for a
 
 **Phase 1 — Register every model (no routing change).** Widen `build_desired_models` to system rows + codex `use_responses_api`; per-provider `litellm_params` + `params_json` overrides; fix `srw_rev` to include `models`/`system_api_keys` `updated_at`. *Verify:* gateway `/v1/models` lists minimax/gemini/codex; agents still bypass (no behavior change yet).
 
+> **Status — 2026-06-28, DONE on develop (uncommitted).** All in `orchestrator/services/litellm_gateway.py` (zero `main.py`/dispatch change → agents still bypass, as designed).
+> - ✅ **Codex knob confirmed on the pinned v1.90.0** first (§4.5): registered a temp model `openai/gpt-5.5`+`use_responses_api:true` at `srw-codex-proxy`, called via the `/chat/completions` bridge → `reasoning_content` (478 chars) + reasoning_tokens + `x-litellm-response-cost`. `use_responses_api` is the right knob.
+> - ✅ **`build_desired_models` widened** — now queries `provider_kind="endpoint"` **and** `"system"`. Endpoint rows unchanged except the Codex proxy now gets `use_responses_api:true` (detected by `_is_codex_endpoint`, label/base `codex-proxy`). System rows → `_LITELLM_SYSTEM_ROUTE` prefix (`google`→`gemini/`, else identity; skip double-prefix) + decrypted `get_system_api_key(provider_ref)` + `drop_params:true` (the gemini `parallel_tool_calls` guard). `params_json["litellm"]` sub-key shallow-merges per-model overrides (zero-migration).
+> - ✅ **`srw_rev` fix** — `_rev_for_endpoint`→`_rev_for_model`, sums the catalog row + endpoint + system-key `updated_at`, so a params_json edit or key rotation re-registers (one-time re-register of existing rows applied the codex knob).
+> - ✅ **k3d-verified on v1.90.0 — all three provider classes called *through* the gateway:**
+>   - **codex** `gpt-5.5` re-registered with `use_responses_api=True` (non-codex endpoints correctly without it); the knob test returned reasoning_content via the bridge.
+>   - **gemini** (system/google) → `gemini/gemini-3.5-flash`+`drop_params`; live call HTTP 200, `pong`, metered (`cost=0.000858`), reasoning_tokens=93. (Row restored to disabled; reconcile cleanly de-registered it.)
+>   - **minimax** (system/openrouter, `openrouter/minimax/minimax-m3` — already-prefixed id used as-is, no double-prefix) → live call HTTP 200, metered (`cost=5.4e-05`), reasoning_content 74c + reasoning_tokens.
+>   - No sync errors throughout.
+> - Tests: +12 unit (system openrouter/google routes, no-key skip, codex flag, params_json merge, combined, rev folding). Lint clean.
+
 **Phase 2 — Flip routing through the gateway.** Broaden the dispatch gate to system rows (force `provider="openai"` + gateway creds); remove the codex bypass + rework the stale-base_url cleanup; add the fail-loud unregistered-model guard. Roll out **per-provider behind a flag / weighted canary**. *Verify (k3d):* a real session/job on minimax + gemini + codex captures `reasoning_content` AND produces `usage_events` rows; `x-litellm-response-cost` present.
 
 **Phase 3 — Metering completeness.** Seed `usage_rates` for paid models (or switch the materializer to LiteLLM's `response_cost`). *Verify:* `usage_events.cost_usd` non-null for minimax/gemini/codex; gemma stays 0/NULL (correct).

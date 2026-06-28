@@ -105,18 +105,81 @@ def gateway_is_healthy() -> bool:
     return _gateway_healthy
 
 
-def _rev_for_endpoint(endpoint: Dict[str, Any]) -> int:
-    """Revision stamp for an endpoint, from its ``updated_at``.
+# LiteLLM provider-route prefix for a system-provider catalog row. The catalog
+# ``provider_ref`` IS the provider slug and LiteLLM's route matches it, except
+# Google AI Studio, which LiteLLM routes as ``gemini/``. Identity for the rest
+# (openrouter, openai, anthropic, groq, mistral, deepseek, ...).
+_LITELLM_SYSTEM_ROUTE = {"google": "gemini"}
 
-    Editing an endpoint's base_url or api_key bumps ``updated_at``; folding that
-    into the desired ``srw_rev`` lets the reconcile detect the change and
-    re-register, even though LiteLLM masks the stored api_key on read-back.
+# The system Codex proxy endpoint speaks ONLY the Responses API; its gateway
+# deployment needs ``use_responses_api`` so LiteLLM bridges Chat Completions <->
+# Responses and preserves the reasoning summary (verified end-to-end on
+# v1.90.0). Detected by the well-known endpoint identity, mirroring
+# ``_endpoint_factory_provider`` — kept local so this orchestrator service stays
+# free of a ``src/core`` import.
+_CODEX_ENDPOINT_LABEL = "codex-proxy"
+
+
+def _is_codex_endpoint(endpoint: Dict[str, Any]) -> bool:
+    """True for the system Codex proxy endpoint (Responses-API only)."""
+    label = (endpoint.get("label") or "").strip().lower()
+    base = (endpoint.get("base_url") or "").lower()
+    return label == _CODEX_ENDPOINT_LABEL or _CODEX_ENDPOINT_LABEL in base
+
+
+def _rev_for_model(
+    model_row: Dict[str, Any],
+    *,
+    endpoint: Optional[Dict[str, Any]] = None,
+    key_updated_at: Any = None,
+) -> int:
+    """Revision stamp folding every input that should force a re-register.
+
+    Sums the second-precision ``updated_at`` of the catalog row (catches
+    params_json / family / model edits), its endpoint (base_url + key rotation,
+    for endpoint rows), and its system key (key rotation, for system rows).
+    ``updated_at`` only moves forward, so any change strictly increases the sum;
+    since LiteLLM masks the stored api_key on read-back, this stamp is how the
+    reconcile detects a credential change it otherwise couldn't see.
     """
-    updated = endpoint.get("updated_at")
-    try:
-        return int(updated.timestamp()) if updated is not None else 0
-    except (AttributeError, ValueError, OSError):
-        return 0
+    total = 0
+    sources = [model_row.get("updated_at")]
+    if endpoint is not None:
+        sources.append(endpoint.get("updated_at"))
+    if key_updated_at is not None:
+        sources.append(key_updated_at)
+    for ts in sources:
+        try:
+            if ts is not None:
+                total += int(ts.timestamp())
+        except (AttributeError, ValueError, OSError):
+            pass
+    return total
+
+
+def _finalize_desired(
+    desired: Dict[str, Dict[str, Any]],
+    row: Dict[str, Any],
+    litellm_params: Dict[str, Any],
+    rev: int,
+) -> None:
+    """Apply per-model ``params_json`` overrides and register the desired entry.
+
+    A ``params_json["litellm"]`` sub-key (admin-editable, zero-migration)
+    shallow-merges onto the structural transport params, so an operator can pin
+    e.g. ``drop_params`` / ``extra_body`` / a route override per model with no
+    code change. The public ``model_name`` equals the catalog ``model_id`` so
+    the agent's model string routes unchanged.
+    """
+    overrides = row.get("params_json")
+    if isinstance(overrides, dict) and isinstance(overrides.get("litellm"), dict):
+        litellm_params.update(overrides["litellm"])
+    owned_id = f"{OWNED_ID_PREFIX}{row['id']}"
+    desired[owned_id] = {
+        "model_name": row["model_id"],
+        "litellm_params": litellm_params,
+        "model_info": {"id": owned_id, "srw_managed": True, "srw_rev": rev},
+    }
 
 
 class LiteLLMClient:
@@ -361,19 +424,36 @@ class LiteLLMClient:
 async def build_desired_models(postgres_db: Any) -> Dict[str, Dict[str, Any]]:
     """Compute the LiteLLM deployments the catalog wants, keyed by ``model_info.id``.
 
-    Slice 1: **endpoint-kind, enabled** models only. Each maps to one
-    OpenAI-compatible LiteLLM deployment pointing at the endpoint's base_url with
-    the decrypted endpoint key. The public ``model_name`` equals the catalog
-    ``model_id`` so the agent's existing model string routes unchanged.
+    Phase 1 — register **endpoint-kind AND system-kind, enabled** models. Each
+    maps to one LiteLLM deployment whose public ``model_name`` equals the catalog
+    ``model_id`` (so the agent's model string routes unchanged once Phase 2 flips
+    dispatch):
+
+    * **endpoint** rows → ``openai/<id>`` at the endpoint base_url + key; the
+      system Codex proxy additionally gets ``use_responses_api`` (Responses-only
+      proxy — keeps the reasoning summary through the Chat<->Responses bridge).
+    * **system** rows → the LiteLLM provider route (``openrouter/<id>``,
+      ``gemini/<id>``, …) + the decrypted system key, no api_base.
+
+    Registration only: dispatch still **bypasses** system/codex models until
+    Phase 2, so this changes what the gateway *knows about*, not what agents
+    *use*.
     """
-    rows = await postgres_db.list_models(provider_kind="endpoint", enabled_only=True)
-    if not rows:
+    endpoint_rows = await postgres_db.list_models(
+        provider_kind="endpoint", enabled_only=True
+    )
+    system_rows = await postgres_db.list_models(
+        provider_kind="system", enabled_only=True
+    )
+    if not endpoint_rows and not system_rows:
         return {}
 
+    desired: Dict[str, Dict[str, Any]] = {}
+
+    # --- endpoint-kind rows: self-hosted OpenAI-compatible + the Codex proxy ---
     # Resolve each distinct endpoint once (decrypted base_url + api_key).
     endpoint_cache: Dict[str, Dict[str, Any] | None] = {}
-    desired: Dict[str, Dict[str, Any]] = {}
-    for row in rows:
+    for row in endpoint_rows:
         endpoint_id = row.get("provider_ref")
         model_id = row.get("model_id")
         if not endpoint_id or not model_id:
@@ -399,7 +479,6 @@ async def build_desired_models(postgres_db: Any) -> Dict[str, Dict[str, Any]]:
             )
             continue
 
-        owned_id = f"{OWNED_ID_PREFIX}{row['id']}"
         litellm_params: Dict[str, Any] = {
             # openai/ → OpenAI-compatible provider; LiteLLM strips the prefix and
             # sends model=<model_id> to api_base, matching what the agent's own
@@ -407,18 +486,53 @@ async def build_desired_models(postgres_db: Any) -> Dict[str, Dict[str, Any]]:
             "model": f"openai/{model_id}",
             "api_base": endpoint["base_url"],
         }
-        api_key = endpoint.get("api_key")
-        if api_key:
-            litellm_params["api_key"] = api_key
-        desired[owned_id] = {
-            "model_name": model_id,
-            "litellm_params": litellm_params,
-            "model_info": {
-                "id": owned_id,
-                "srw_managed": True,
-                "srw_rev": _rev_for_endpoint(endpoint),
-            },
+        if endpoint.get("api_key"):
+            litellm_params["api_key"] = endpoint["api_key"]
+        if _is_codex_endpoint(endpoint):
+            litellm_params["use_responses_api"] = True
+        _finalize_desired(
+            desired, row, litellm_params, _rev_for_model(row, endpoint=endpoint)
+        )
+
+    # --- system-kind rows: a direct provider reached via a system key ---
+    if system_rows:
+        # One read of the system-key updated_at map drives the rev so a key
+        # rotation (which never surfaces in the masked api_key) re-registers.
+        key_updated = {
+            k["provider"]: k.get("updated_at")
+            for k in await postgres_db.list_system_api_keys()
         }
+        for row in system_rows:
+            provider = row.get("provider_ref")
+            model_id = row.get("model_id")
+            if not provider or not model_id:
+                continue
+            api_key = await postgres_db.get_system_api_key(provider)
+            if not api_key:
+                logger.warning(
+                    "LiteLLM sync: skipping %s — no system key for provider %s",
+                    model_id,
+                    provider,
+                )
+                continue
+            route = _LITELLM_SYSTEM_ROUTE.get(provider, provider)
+            model_str = (
+                model_id if model_id.startswith(f"{route}/") else f"{route}/{model_id}"
+            )
+            litellm_params = {
+                "model": model_str,
+                "api_key": api_key,
+                # Direct providers reject params they don't support (e.g. gemini
+                # + parallel_tool_calls); drop them instead of failing the call.
+                "drop_params": True,
+            }
+            _finalize_desired(
+                desired,
+                row,
+                litellm_params,
+                _rev_for_model(row, key_updated_at=key_updated.get(provider)),
+            )
+
     return desired
 
 
