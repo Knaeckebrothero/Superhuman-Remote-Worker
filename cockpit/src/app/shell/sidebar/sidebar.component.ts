@@ -153,9 +153,6 @@ import {LegionMarkComponent} from '../../ui/legion-mark';
             <a class="section-link" [href]="pgadminUrl" target="_blank" rel="noopener">
               <span class="link-icon">&#x1F418;</span>PostgreSQL
             </a>
-            <a class="section-link" [href]="mongoExpressUrl" target="_blank" rel="noopener">
-              <span class="link-icon">&#x1F343;</span>MongoDB
-            </a>
           </div>
 
           <div class="section">
@@ -524,7 +521,6 @@ export class SidebarComponent {
   readonly dozzleUrl = environment.dozzleUrl;
   readonly neo4jUrl = environment.neo4jUrl;
   readonly pgadminUrl = environment.pgadminUrl;
-  readonly mongoExpressUrl = environment.mongoExpressUrl;
   readonly minioConsoleUrl = environment.minioConsoleUrl;
   readonly cloudUrl = environment.cloudUrl;
 

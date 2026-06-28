@@ -3,11 +3,14 @@ pgAdmin 4 — optional web UI for PostgreSQL administration.
 
 Pre-registers the three SRW application databases (app / pgvector / audit) in the
 server tree on startup so an operator only needs the pgAdmin login. On every pod
-start pgAdmin imports `servers.json` (ConfigMap below) and reads the DB passwords
-from a chmod-600 `.pgpass` that the `assemble-pgpass` initContainer materialises
-from the `srw` Secret — so no DB password is ever rendered into a manifest. pgAdmin
-has no PVC, so the import re-runs on every restart (operator edits to the tree are
-not persisted — the server list is chart-owned).
+start pgAdmin imports `servers.json` (ConfigMap below). The DB passwords come from
+a chmod-600 `.pgpass` that the `assemble-pgpass` initContainer materialises from
+the `srw` Secret (no DB password is ever rendered into a manifest); the pgAdmin
+entrypoint copies it (via PGPASS_FILE) into the login user's storage dir, and each
+server references it as PassFile "/.pgpass" — pgAdmin resolves PassFile RELATIVE
+to that storage dir, so an absolute path outside it would be dropped ("no password
+supplied"). pgAdmin has no PVC, so the import re-runs on every restart (operator
+edits to the tree are not persisted — the server list is chart-owned).
 
 Login credentials come from the Secret (keys PGADMIN_EMAIL / PGADMIN_PASSWORD by
 default — override via pgadmin.auth.*). Add them to your Vault bundle (prod: the
@@ -41,7 +44,7 @@ data:
           "MaintenanceDB": {{ include "srw.postgresDb" . | quote }},
           "Username": {{ $dbUser | quote }},
           "SSLMode": "prefer",
-          "PassFile": "/pgpass/pgpassfile"
+          "PassFile": "/.pgpass"
         },
         "2": {
           "Name": "SRW Vector DB (pgvector)",
@@ -51,7 +54,7 @@ data:
           "MaintenanceDB": {{ include "srw.vectorPostgresDb" . | quote }},
           "Username": {{ $dbUser | quote }},
           "SSLMode": "prefer",
-          "PassFile": "/pgpass/pgpassfile"
+          "PassFile": "/.pgpass"
         },
         "3": {
           "Name": "SRW Audit DB",
@@ -61,7 +64,7 @@ data:
           "MaintenanceDB": {{ include "srw.auditPostgresDb" . | quote }},
           "Username": {{ $dbUser | quote }},
           "SSLMode": "prefer",
-          "PassFile": "/pgpass/pgpassfile"
+          "PassFile": "/.pgpass"
         }
       }
     }
@@ -165,6 +168,14 @@ spec:
               value: "False"
             - name: PGADMIN_SERVER_JSON_FILE
               value: "/pgadmin4/servers.json"
+            # pgAdmin resolves a server's PassFile RELATIVE to the logged-in
+            # user's storage dir, so the file must live there (an absolute path
+            # outside it resolves to None → "no password supplied"). The
+            # entrypoint copies PGPASS_FILE into
+            # /var/lib/pgadmin/storage/<email-with-@-as-_>/.pgpass, which is
+            # what servers.json references as "/.pgpass".
+            - name: PGPASS_FILE
+              value: "/pgpass/pgpassfile"
             {{- end }}
           {{- if $prereg }}
           volumeMounts:
