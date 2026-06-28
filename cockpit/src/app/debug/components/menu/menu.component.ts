@@ -289,12 +289,6 @@ export class MenuComponent {
           icon: '🐘',
           description: 'pgAdmin database manager',
         },
-        {
-          label: 'MongoDB',
-          url: environment.mongoExpressUrl,
-          icon: '🍃',
-          description: 'Mongo Express viewer',
-        },
       ],
     },
     {

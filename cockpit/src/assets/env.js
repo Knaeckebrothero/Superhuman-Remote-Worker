@@ -6,7 +6,6 @@
   window['env']['minioConsoleUrl'] = 'http://localhost:9001';
   window['env']['neo4jUrl'] = 'http://localhost:7474';
   window['env']['pgadminUrl'] = 'http://localhost:5050';
-  window['env']['mongoExpressUrl'] = 'http://localhost:8081';
   window['env']['mcpUrl'] = 'http://localhost:8055/mcp';
   window['env']['cloudUrl'] = 'http://localhost:9200';
 
