@@ -25,6 +25,7 @@ from orchestrator.services.litellm_gateway import (
     _parse_spend_ts,
     _project_quota,
     _rev_for_endpoint,
+    _spend_logs_start_date,
     _srw_id_from,
     _team_id_for_project,
     _team_limits_for_project,
@@ -35,7 +36,9 @@ from orchestrator.services.litellm_gateway import (
     compute_scoped_key,
     ensure_fleet_key,
     ensure_scoped_key,
+    gateway_is_healthy,
     get_fleet_key,
+    mark_gateway_health,
     materialize_llm_usage,
     sync_catalog_to_gateway,
 )
@@ -925,3 +928,53 @@ class TestMaterializeLlmUsage:
         res = await materialize_llm_usage(client, None)
         assert res == {"materialized": 0, "cursor": None, "scanned": 0}
         client.get_spend_logs.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_passes_cursor_day_as_start_date(self):
+        # The cursor day (minus a 1-day margin) bounds the proxy scan so a
+        # high-rate window can't silently drop rows. First call (no cursor) must
+        # NOT bound — it backfills.
+        client = AsyncMock()
+        client.get_spend_logs.return_value = []
+        since = datetime(2026, 6, 22, 6, 36, 47, tzinfo=timezone.utc)
+        await materialize_llm_usage(client, _CaptureLedger(), since=since)
+        client.get_spend_logs.assert_awaited_once_with(start_date="2026-06-21")
+
+        client.get_spend_logs.reset_mock()
+        await materialize_llm_usage(client, _CaptureLedger())
+        client.get_spend_logs.assert_awaited_once_with(start_date=None)
+
+
+class TestSpendLogsStartDate:
+    def test_none_cursor_is_unbounded(self):
+        # No cursor (first call / post-restart) → no start_date → full backfill.
+        assert _spend_logs_start_date(None) is None
+
+    def test_cursor_maps_to_prior_day(self):
+        # Day-granular, minus a 1-day tz-safety margin; correctness preserved by
+        # the in-memory ts<=since filter + ledger dedupe.
+        since = datetime(2026, 6, 22, 0, 5, 0, tzinfo=timezone.utc)
+        assert _spend_logs_start_date(since) == "2026-06-21"
+
+
+class TestGatewayHealth:
+    """Phase-0 gateway-down→direct fallback: cached reachability flag."""
+
+    @pytest.fixture(autouse=True)
+    def _restore_health(self):
+        # Health is module-global; always leave it healthy so unrelated tests
+        # (which assume the gateway is usable) aren't poisoned by an outage flag.
+        yield
+        mark_gateway_health(True)
+
+    def test_default_is_optimistic(self):
+        # Cold start must behave as before the fallback existed: usable until a
+        # probe proves otherwise.
+        mark_gateway_health(True)
+        assert gateway_is_healthy() is True
+
+    def test_marks_down_then_recovers(self):
+        mark_gateway_health(False)
+        assert gateway_is_healthy() is False
+        mark_gateway_health(True)
+        assert gateway_is_healthy() is True

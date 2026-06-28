@@ -35,7 +35,7 @@ import json
 import logging
 import os
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -71,6 +71,38 @@ _fleet_spec_hash: str | None = None
 # key *value* is deterministic (compute_scoped_key), so nothing is persisted —
 # this cache is a pure latency optimization, safe to lose on restart.
 _scoped_ensured: Dict[tuple[str, str], str] = {}
+
+# Cached gateway reachability. Maintained by the sync loop's readiness probe and
+# by the per-dispatch scoped-key probe (both already call is_ready()); read by
+# the routing-target resolvers in main.py. When the gateway is confirmed down
+# they return None, so a dispatch degrades to the model's *direct* upstream
+# instead of being handed a dead gateway base_url — without this, a gateway blip
+# fails every job at inference (there is otherwise no gateway-down→direct path).
+# Starts optimistic so cold start matches pre-fallback behavior: it only flips to
+# the direct lane after a probe actually fails, and flips back on recovery.
+_gateway_healthy: bool = True
+
+
+def mark_gateway_health(healthy: bool) -> None:
+    """Record the latest gateway readiness-probe result (see ``_gateway_healthy``).
+
+    Logs only on transition so an outage / recovery is visible without spamming
+    every tick. Idempotent and cheap — safe to call from the sync loop and from
+    every dispatch.
+    """
+    global _gateway_healthy
+    if healthy != _gateway_healthy:
+        logger.warning(
+            "LiteLLM gateway health transition: %s -> %s",
+            "up" if _gateway_healthy else "down",
+            "up" if healthy else "down",
+        )
+    _gateway_healthy = healthy
+
+
+def gateway_is_healthy() -> bool:
+    """True unless the gateway was last probed unreachable (the fallback gate)."""
+    return _gateway_healthy
 
 
 def _rev_for_endpoint(endpoint: Dict[str, Any]) -> int:
@@ -292,7 +324,9 @@ class LiteLLMClient:
             tokens += int(metrics.get("total_tokens") or 0)
         return {"requests": requests, "tokens": tokens}
 
-    async def get_spend_logs(self) -> List[Dict[str, Any]]:
+    async def get_spend_logs(
+        self, *, start_date: str | None = None, end_date: str | None = None
+    ) -> List[Dict[str, Any]]:
         """Recent per-request spend-log rows (Slice 4c materialization source).
 
         Each row carries ``request_id``, ``model_group``, prompt/completion/total
@@ -302,9 +336,22 @@ class LiteLLMClient:
         hash, unusable for that). ``spend`` is dollar-only (0 for unpriced homelab
         models), so we materialize the *token* quantities and price them from
         usage_rates like every other ledger row.
+
+        ``start_date``/``end_date`` (``YYYY-MM-DD`` or ISO) bound the window the
+        proxy scans. **Without a ``start_date`` LiteLLM returns every log row it
+        has ever stored**, so once volume grows a single tick pulls an unbounded
+        payload and a high-rate window can silently drop the rows the
+        materializer's cursor hasn't reached yet. Passing the cursor day keeps the
+        scan bounded *and* complete (the caller re-applies the precise cursor +
+        dedupes, so a slightly-wide window only re-scans, never misses).
         """
+        params: Dict[str, str] = {}
+        if start_date:
+            params["start_date"] = start_date
+        if end_date:
+            params["end_date"] = end_date
         resp = await self._client.get(
-            f"{self._base_url}/spend/logs", headers=self._headers
+            f"{self._base_url}/spend/logs", headers=self._headers, params=params
         )
         resp.raise_for_status()
         data = resp.json()
@@ -920,6 +967,22 @@ def _parse_spend_ts(value: Any) -> Optional[datetime]:
     return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
 
 
+def _spend_logs_start_date(since: Optional[datetime]) -> Optional[str]:
+    """Day-granular ``start_date`` for ``/spend/logs`` derived from the cursor.
+
+    Bounds the proxy scan to the cursor's window instead of "all logs ever",
+    minus a one-day margin to absorb any tz skew in the proxy's date filter.
+    Correctness is unaffected: any row with ``ts > since`` necessarily falls on
+    or after ``since``'s day, and the materializer's ``ts <= since`` filter plus
+    the ledger's dedupe drop anything already processed — so the margin only
+    re-scans, never misses. ``None`` (first call / post-restart, cursor lost)
+    returns ``None`` → a one-off full scan that backfills rows logged while down.
+    """
+    if since is None:
+        return None
+    return (since - timedelta(days=1)).strftime("%Y-%m-%d")
+
+
 async def materialize_llm_usage(
     client: LiteLLMClient,
     ledger: Optional[UsageLedger],
@@ -938,7 +1001,7 @@ async def materialize_llm_usage(
     """
     if ledger is None or not ledger.is_available:
         return {"materialized": 0, "cursor": since, "scanned": 0}
-    rows = await client.get_spend_logs()
+    rows = await client.get_spend_logs(start_date=_spend_logs_start_date(since))
     events: List[UsageEvent] = []
     max_ts = since
     for r in rows:
@@ -1011,7 +1074,12 @@ async def litellm_sync_loop(
     try:
         while not shutdown_event.is_set():
             try:
-                if await client.is_ready():
+                # Health is taken from is_ready() alone — a downstream catalog/DB
+                # error must not flip the fallback gate (the gateway itself may be
+                # fine), so mark from the probe and only log sync failures.
+                ready = await client.is_ready()
+                mark_gateway_health(ready)
+                if ready:
                     await sync_catalog_to_gateway(postgres_db, client)
                     await ensure_fleet_key(client, postgres_db, master_key)
                 else:

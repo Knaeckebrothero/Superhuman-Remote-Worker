@@ -221,6 +221,33 @@ class TestCodexSessionGatewayBaseUrl:
         assert out["llm"]["base_url"] != GATEWAY_BASE_URL
 
 
+class TestGatewayHealthFallback:
+    """Phase-0 gateway-down→direct fallback: ``_gateway_routing_target`` yields
+    None once the gateway is probed unreachable, so the dispatch injectors route
+    the agent at the model's direct upstream instead of a dead gateway URL.
+    See docs/features/route_all_models_through_litellm_gateway.md §5."""
+
+    @pytest.fixture(autouse=True)
+    def _gateway_enabled(self, monkeypatch):
+        # Gateway enabled (chart sets these when litellm.enabled).
+        monkeypatch.setenv("LITELLM_BASE_URL", "http://srw-litellm:4000")
+        monkeypatch.setenv("LITELLM_MASTER_KEY", "sk-master-test")
+        yield
+        main.mark_gateway_health(True)  # never leak an outage flag to other tests
+
+    def test_healthy_returns_gateway_target(self):
+        main.mark_gateway_health(True)
+        target = main._gateway_routing_target()
+        assert target is not None
+        assert target[0] == GATEWAY_BASE_URL
+
+    def test_unhealthy_returns_none(self):
+        # A confirmed-down gateway must NOT be handed to the agent — None tells
+        # the dispatch injectors to fall back to the endpoint's direct creds.
+        main.mark_gateway_health(False)
+        assert main._gateway_routing_target() is None
+
+
 class _FakeAcquire:
     def __init__(self, conn):
         self._conn = conn
