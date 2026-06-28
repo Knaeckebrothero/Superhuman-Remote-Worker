@@ -1027,6 +1027,23 @@ workspace:
 pgadmin:
   enabled: false
   image: dpage/pgadmin4:latest
+  # -- Pre-register the three SRW application databases (app / pgvector / audit)
+  # in the pgAdmin server tree on startup, with passwords pre-filled from a
+  # chmod-600 .pgpass assembled from the Secret. With this on, an operator only
+  # needs the pgAdmin login (auth.* below) — all three DBs are ready on first
+  # login. Set false for a bare pgAdmin with no servers pre-configured.
+  preregisterDatabases: true
+  auth:
+    # -- Secret keys holding the pgAdmin login email + password. Add both to your
+    # Vault bundle (prod: the main ExternalSecret uses `dataFrom: extract`, so new
+    # properties appear automatically) or to secrets.values (chart-managed dev
+    # secret). The login email isn't strictly secret but is sourced from the
+    # Secret so the whole pgAdmin credential lives in one place.
+    emailSecretKey: PGADMIN_EMAIL
+    passwordSecretKey: PGADMIN_PASSWORD
+    # -- DB role pgAdmin connects as. MUST equal POSTGRES_USER (all three SRW
+    # databases share it). Used both in servers.json and the assembled .pgpass.
+    dbUsername: srw
   resources:
     requests:
       memory: "128Mi"
