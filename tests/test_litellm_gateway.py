@@ -24,7 +24,7 @@ from orchestrator.services.litellm_gateway import (
     _parse_rate_policy,
     _parse_spend_ts,
     _project_quota,
-    _rev_for_endpoint,
+    _rev_for_model,
     _spend_logs_start_date,
     _srw_id_from,
     _team_id_for_project,
@@ -48,37 +48,83 @@ _UPDATED = datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
 _REV = int(_UPDATED.timestamp())
 
 
-def _endpoint(base_url="https://ai.h4ll.app/v1", api_key="sk-home", updated=_UPDATED):
+def _endpoint(
+    base_url="https://ai.h4ll.app/v1",
+    api_key="sk-home",
+    updated=_UPDATED,
+    label="Local",
+):
     return {
         "id": _EP_ID,
+        "label": label,
         "base_url": base_url,
         "api_key": api_key,
         "updated_at": updated,
     }
 
 
-def _model_row(catalog_id, model_id, endpoint_id=_EP_ID):
-    return {"id": catalog_id, "provider_ref": endpoint_id, "model_id": model_id}
+def _model_row(catalog_id, model_id, endpoint_id=_EP_ID, **extra):
+    return {
+        "id": catalog_id,
+        "provider_ref": endpoint_id,
+        "model_id": model_id,
+        **extra,
+    }
 
 
-def _mock_db(model_rows, endpoint=None):
+def _system_row(catalog_id, model_id, provider, **extra):
+    """A system-kind catalog row (provider_ref carries the provider slug)."""
+    return {
+        "id": catalog_id,
+        "provider_ref": provider,
+        "model_id": model_id,
+        **extra,
+    }
+
+
+def _mock_db(
+    model_rows,
+    endpoint=None,
+    *,
+    system_rows=None,
+    system_keys=None,
+    system_key="sk-system",
+):
     db = AsyncMock()
-    db.list_models.return_value = model_rows
+
+    def _list_models(*, provider_kind=None, enabled_only=False, **kw):
+        return (system_rows or []) if provider_kind == "system" else model_rows
+
+    db.list_models.side_effect = _list_models
     db.get_user_llm_endpoint.return_value = (
         endpoint if endpoint is not None else _endpoint()
     )
+    db.list_system_api_keys.return_value = system_keys or []
+    db.get_system_api_key.return_value = system_key
     return db
 
 
-class TestRevForEndpoint:
-    def test_uses_updated_at_timestamp(self):
-        assert _rev_for_endpoint(_endpoint()) == _REV
+class TestRevForModel:
+    def test_uses_model_updated_at(self):
+        assert _rev_for_model({"updated_at": _UPDATED}) == _REV
+
+    def test_folds_endpoint_updated_at(self):
+        # Endpoint rows sum the model + endpoint stamps so an endpoint key/url
+        # rotation re-registers even when the catalog row is untouched.
+        assert _rev_for_model({}, endpoint=_endpoint()) == _REV
+        assert (
+            _rev_for_model({"updated_at": _UPDATED}, endpoint=_endpoint()) == 2 * _REV
+        )
+
+    def test_folds_system_key_updated_at(self):
+        # System rows fold the key's stamp so a key rotation re-registers.
+        assert _rev_for_model({}, key_updated_at=_UPDATED) == _REV
 
     def test_missing_updated_at_is_zero(self):
-        assert _rev_for_endpoint({"base_url": "x"}) == 0
+        assert _rev_for_model({"base_url": "x"}) == 0
 
     def test_bad_updated_at_is_zero(self):
-        assert _rev_for_endpoint({"updated_at": "not-a-datetime"}) == 0
+        assert _rev_for_model({"updated_at": "not-a-datetime"}) == 0
 
 
 class TestBuildDesiredModels:
@@ -87,10 +133,9 @@ class TestBuildDesiredModels:
         db = _mock_db([_model_row("cat-1", "gemma-4-moe-strix")])
         desired = await build_desired_models(db)
 
-        # Slice 1 only asks for endpoint-kind, enabled models.
-        db.list_models.assert_awaited_once_with(
-            provider_kind="endpoint", enabled_only=True
-        )
+        # Phase 1 queries both endpoint- and system-kind enabled models.
+        db.list_models.assert_any_await(provider_kind="endpoint", enabled_only=True)
+        db.list_models.assert_any_await(provider_kind="system", enabled_only=True)
         assert list(desired) == [f"{OWNED_ID_PREFIX}cat-1"]
         spec = desired[f"{OWNED_ID_PREFIX}cat-1"]
         assert spec["model_name"] == "gemma-4-moe-strix"
@@ -135,6 +180,103 @@ class TestBuildDesiredModels:
     async def test_no_models_returns_empty(self):
         db = _mock_db([])
         assert await build_desired_models(db) == {}
+
+
+class TestBuildDesiredModelsPhase1:
+    """Phase 1: register system rows + codex use_responses_api + params_json."""
+
+    @pytest.mark.asyncio
+    async def test_system_openrouter_row_uses_provider_route(self):
+        db = _mock_db(
+            [],  # no endpoint rows
+            system_rows=[
+                _system_row(
+                    "sys-1",
+                    "openrouter/minimax/minimax-m2",
+                    "openrouter",
+                    updated_at=_UPDATED,
+                )
+            ],
+            system_keys=[{"provider": "openrouter", "updated_at": _UPDATED}],
+            system_key="sk-or-v1-xxx",
+        )
+        spec = (await build_desired_models(db))[f"{OWNED_ID_PREFIX}sys-1"]
+        assert spec["model_name"] == "openrouter/minimax/minimax-m2"
+        # id already carries openrouter/ → not double-prefixed; no api_base.
+        assert spec["litellm_params"]["model"] == "openrouter/minimax/minimax-m2"
+        assert spec["litellm_params"]["api_key"] == "sk-or-v1-xxx"
+        assert "api_base" not in spec["litellm_params"]
+        assert spec["litellm_params"]["drop_params"] is True
+        # rev folds model + system-key updated_at (both _UPDATED here).
+        assert spec["model_info"]["srw_rev"] == 2 * _REV
+
+    @pytest.mark.asyncio
+    async def test_system_google_row_maps_to_gemini_route(self):
+        db = _mock_db(
+            [],
+            system_rows=[_system_row("sys-2", "gemini-3.5-flash", "google")],
+            system_keys=[{"provider": "google", "updated_at": _UPDATED}],
+            system_key="AQ.key",
+        )
+        spec = (await build_desired_models(db))[f"{OWNED_ID_PREFIX}sys-2"]
+        # google → gemini/ route prefix; bare id gets prefixed.
+        assert spec["litellm_params"]["model"] == "gemini/gemini-3.5-flash"
+        assert spec["litellm_params"]["api_key"] == "AQ.key"
+
+    @pytest.mark.asyncio
+    async def test_system_row_without_key_skipped(self):
+        db = _mock_db(
+            [],
+            system_rows=[_system_row("sys-3", "gemini-3.5-flash", "google")],
+            system_key=None,  # no system key configured for the provider
+        )
+        assert await build_desired_models(db) == {}
+
+    @pytest.mark.asyncio
+    async def test_codex_endpoint_gets_use_responses_api(self):
+        db = _mock_db(
+            [_model_row("cat-codex", "gpt-5.5")],
+            endpoint=_endpoint(
+                label="codex-proxy", base_url="http://srw-codex-proxy:8317/v1"
+            ),
+        )
+        spec = (await build_desired_models(db))[f"{OWNED_ID_PREFIX}cat-codex"]
+        assert spec["litellm_params"]["use_responses_api"] is True
+        assert spec["litellm_params"]["model"] == "openai/gpt-5.5"
+
+    @pytest.mark.asyncio
+    async def test_noncodex_endpoint_has_no_responses_flag(self):
+        db = _mock_db([_model_row("cat-1", "gemma-4-moe-strix")])
+        spec = (await build_desired_models(db))[f"{OWNED_ID_PREFIX}cat-1"]
+        assert "use_responses_api" not in spec["litellm_params"]
+
+    @pytest.mark.asyncio
+    async def test_params_json_litellm_override_merges(self):
+        db = _mock_db(
+            [
+                _model_row(
+                    "cat-1",
+                    "gemma-4-moe-strix",
+                    params_json={"litellm": {"rpm": 30, "drop_params": True}},
+                )
+            ],
+        )
+        params = (await build_desired_models(db))[f"{OWNED_ID_PREFIX}cat-1"][
+            "litellm_params"
+        ]
+        assert params["rpm"] == 30 and params["drop_params"] is True
+        # structural params survive the shallow merge.
+        assert params["model"] == "openai/gemma-4-moe-strix"
+
+    @pytest.mark.asyncio
+    async def test_endpoint_and_system_rows_combine(self):
+        db = _mock_db(
+            [_model_row("cat-1", "gemma-4-moe-strix")],
+            system_rows=[_system_row("sys-1", "gemini-3.5-flash", "google")],
+            system_keys=[{"provider": "google", "updated_at": _UPDATED}],
+        )
+        desired = await build_desired_models(db)
+        assert set(desired) == {f"{OWNED_ID_PREFIX}cat-1", f"{OWNED_ID_PREFIX}sys-1"}
 
 
 class TestNeedsReplace:
