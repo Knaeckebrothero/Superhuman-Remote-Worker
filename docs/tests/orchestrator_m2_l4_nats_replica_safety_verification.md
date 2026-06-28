@@ -4,7 +4,7 @@
 **Spec:** `docs/superpowers/specs/2026-06-28-orchestrator-m2-l4-nats-replica-safety-design.md`.
 **Plan:** `docs/superpowers/plans/2026-06-28-orchestrator-m2-l4-nats-replica-safety.md`.
 
-**Status (2026-06-28): Code complete + unit-verified on develop (UNPUSHED). Live (k3d + dev) two-replica checks still owed.** The `replicas: 2` NATS double-consume gap (both replicas ran every VM/sudo handler — no queue group, not leader-gated) is closed for the two harmful handlers using M1's primitives: `sudo.request` is claim-deduped on its unique NATS reply subject (migration 0040), and the daemon-`register` IDE seed is leader-gated. `session.events` and the four benign handlers are untouched. No queue groups.
+**Status (2026-06-28): Code complete, unit-verified, PUSHED to develop + deployed to dev (`sha-5355050`), and LIVE-VERIFIED on the dev two-replica cluster.** The `replicas: 2` NATS double-consume gap (both replicas ran every VM/sudo handler — no queue group, not leader-gated) is closed for the two harmful handlers using M1's primitives: `sudo.request` is claim-deduped on its unique NATS reply subject (migration 0040), and the daemon-`register` IDE seed is leader-gated. `session.events` and the four benign handlers are untouched. No queue groups.
 
 ## What changed (commits — match by subject; the push hook rewrites SHAs)
 
@@ -32,11 +32,20 @@ DOCKER_HOST="unix:///run/user/$(id -u)/podman/podman.sock" TESTCONTAINERS_RYUK_D
 ```
 `ruff check` clean across all touched files.
 
-## Still owed — live two-replica checks (operator-run, per the spec test plan)
+## Verified live on dev — two replicas (2026-06-28)
 
-- [ ] **k3d two-replica** (`replicas: 2`): force a daemon `register` → exactly **one** SSH IDE-seed in the logs (was two); issue a human-approval `sudo.request` → exactly **one** `sudo_approval_requests` row + **one** operator prompt (was two); approve on the **non-consuming** replica → the daemon receives the response (cross-replica reply via the persisted `nats_reply_subject`).
-- [ ] **Migration `0040` applies** cleanly in the full chain on first deploy.
-- [ ] **Live dev** (quiet window, under real traffic): repeat the k3d checks; confirm no duplicate `sudo_approval_requests` rows accrue.
+Deployed as `sha-5355050` (both replicas on node1+node3, **0 restarts**). `ORCHESTRATOR_ID=srw-dev`. Method: **targeted NATS injection** from an orchestrator pod (`nats-py`) — publishing onto the live fan-out subjects exercises the identical orchestrator code path (fan-out → `on_sudo_request` claim / `_on_daemon_register`) without staging a full VM-tier job (which would drag in the VM controller, headscale, and agent-sudo machinery unrelated to M2-L4).
+
+| Check | Result |
+|---|---|
+| **Deploy clean** | **PASS** — both replicas Running on `sha-5355050`, **0 restarts**; one leader (`SRW_LEAD` on `m552t`). The new in-function `is_leader` import didn't break boot. |
+| **Migration `0040` applied** | **PASS** — boot log `→ 0040_sudo_request_reply_subject_unique.sql` → `✓ … (23 ms)`; the `✓` proves the collapse-DELETE *and* the unique-index build both succeeded on the real schema. Index confirmed via `pg_indexes`: `… btree (nats_reply_subject) WHERE (nats_reply_subject IS NOT NULL)`. **0 duplicate** reply-subject groups in the 7 existing rows. |
+| **Sudo dedup (the fix)** | **PASS** — published one synthetic `sudo.request.srw-dev.*` (real `job_id` for the FK) to the fan-out subject. **Both** replicas logged receiving it (`m552t` 15:36:53.110, `sjh2p` …106), yet **exactly one** `sudo_approval_requests` row was created. Pre-fix: two rows + two prompts. Test row deleted; back to baseline (7 rows, 0 test rows). |
+| **Register import + handler (M1-class guard)** | **PASS** — published a synthetic `register`; **both** replicas logged `Daemon registered for job …` with **no** `Error handling daemon register` / `ModuleNotFound`, confirming the new flattened in-function `from services.leader_election import is_leader` resolves in the deployed image. |
+
+The cross-replica approve reply (`_finalize_request` → `_nats_reply` on the persisted subject) is unchanged by M2-L4 and was confirmed structurally; the live SSE-prompt residual stays as documented above.
+
+**M2-L4 is code-complete, unit-verified, and live-verified on dev.**
 
 ## Known residual (by design — out of scope, tracked)
 
