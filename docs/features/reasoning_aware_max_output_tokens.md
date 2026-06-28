@@ -17,15 +17,24 @@ related:
   - "[[usage_monitoring_and_rate_limiting]]"
   - "[[model_assembly]]"
   - "[[builder_to_sessions_consolidation]]"
+  - "[[per_model_context_window_override_shadowed_in_blob_dispatch]]"
 ---
 
 # Reasoning-aware max output tokens — per-family/per-model output windows + length-truncation handling
 
-**Status:** Proposed, **research-backed 2026-06-28** (6 subagents: 3 codebase
-traces, 3 web). Motivated by the minimax-m3 "empty response" investigation
-(session `a0f826d7`). Implementation-ready pending sign-off on the per-family
-numbers and two discovered prerequisite bugs (§7.1 doubled finish_reason, §7.4
-blob-path override shadowing).
+**Status:** Proposed, **research-backed + cluster-verified 2026-06-28** (6
+subagents: 3 codebase traces, 3 web; §7.4 confirmed live, see below). Motivated
+by the minimax-m3 "empty response" investigation (session `a0f826d7`).
+Implementation-ready pending sign-off on the per-family numbers.
+
+**Routing note (2026-06-28):** all models now route through the **LiteLLM
+gateway** (route-all `*` wildcard), with the direct route kept as fallback. This
+is **transport only** — the output cap is set in the loader resolver *upstream*
+of transport, so the core of this feature (§5, §5.4, §6, §7.4) is unaffected.
+The factory is unchanged (`provider_ref=openrouter` → `_create_openrouter_llm`);
+only the base_url moved to the gateway. The transport-specific observations
+(§4/§7.3 OpenRouter reasoning limits, §7.1 doubled finish_reason) are now
+*mediated by the gateway* and flagged for re-confirmation on the gateway path.
 
 **Evidence base:** session `a0f826d7-eaa6-4ae7-960a-1c9bb776b712` on the main
 cluster (`openrouter/minimax/minimax-m3`, 2026-06-28). Two turns rendered "⚠ The
@@ -46,15 +55,20 @@ on reasoning-heavy turns — a plain re-run re-hits the same cap.
 
 > **Two bugs discovered while researching this doc — both impact users today,
 > independent of this feature:**
-> 1. **§7.1** — the OpenRouter route doubles `finish_reason`/`model_name` in
->    captured metadata (`"lengthlength"`); a LangChain stream-merge defect.
-> 2. **§7.4** — in the **blob dispatch path (the dev default, the path
->    `a0f826d7` ran)**, an admin's per-model `context_window` override is
->    **shadowed by the family default**. So a model you capped to 256k in the UI
->    is very likely still running at the family's 1M window — compaction fires
->    far too late and the token-saving you intended isn't happening. Confirm on
->    the next minimax dispatch via the loader log `max_context_tokens=` (256k =
->    honored, 1000000 = shadowed).
+> 1. **§7.1** — the OpenRouter-direct route doubled `finish_reason`/`model_name`
+>    in captured metadata (`"lengthlength"`); a LangChain stream-merge defect.
+>    **Likely resolved for free by the gateway migration** (LiteLLM re-streams
+>    with a single finish_reason chunk) — the merge defect itself is unchanged,
+>    so verify on the next minimax *session* turn through the gateway.
+> 2. **§7.4 — CONFIRMED LIVE (2026-06-28).** In the **blob dispatch path
+>    (`EXPERTS_DB_ENABLED=true`, the dev default)**, an admin's per-model
+>    `context_window` override is **shadowed by the family default.** Verified
+>    against job `19707fa1` (ran `openrouter/minimax/minimax-m3`, registry
+>    `context_window=262144`): its `resolved_config` blob baked
+>    **`model_max_context_tokens: 1000000`** (family) with
+>    `context_threshold_tokens: 800000`. **So a model capped to 256k in the UI is
+>    running at the family 1M window — compaction fires at 800k not ~205k, and
+>    the token-saving is silently defeated.** Fix in §7.4.
 
 ---
 
@@ -330,6 +344,19 @@ in the §6 branch; (2) normalize `response.response_metadata` right after the me
 at `:1233`; (3) **cleanest** — capture `finish_reason` from the last per-chunk
 `chunk.response_metadata` in the `:1179` loop and never trust the merged value.
 
+**Gateway migration likely resolves this for free.** The doubling required the
+*upstream* to emit `finish_reason` on two chunks (OpenRouter-direct: final content
++ trailing usage). Routing now goes agent → **LiteLLM gateway** → OpenRouter →
+minimax, and LiteLLM re-streams with the standard single-finish_reason pattern
+(usage chunk has empty `choices`) → no concat. So §7.1 may already be moot for
+minimax on the gateway path — **verify on the next minimax *session* turn**
+(streaming; the audit `finish_reason` reads `"length"` not `"lengthlength"`).
+Regardless, build §6 on fix (3) (per-chunk read) so it's robust either way, and
+keep this fix if any provider still double-emits. *Cluster check 2026-06-28: the
+only minimax data predates the gateway migration (`a0f826d7` doubled via
+streaming; `19707fa1` clean via `ainvoke`), so the gateway-path doubling is
+unconfirmed — first organic gateway session turn settles it.*
+
 ### 7.2 Timeout is a parallel ceiling
 
 `LLMConfig.timeout` (`:1286`, default 600s from `config/defaults.yaml:14` +
@@ -363,7 +390,19 @@ OpenRouter route:
 - Adding `reasoning:{effort:…}` via `extra_body` for providers that *do* honor it
   is a ~5-line addition to the effort_enum branch (`:2872-2879`).
 
-### 7.4 Blob-path shadowing of per-model overrides (bug; prerequisite for §5.4)
+### 7.4 Blob-path shadowing of per-model overrides (bug; **CONFIRMED LIVE 2026-06-28**; prerequisite for §5.4)
+
+> **Tracked as its own issue:**
+> `docs/issues/per_model_context_window_override_shadowed_in_blob_dispatch.md`
+> (`[[per_model_context_window_override_shadowed_in_blob_dispatch]]`). Fix it
+> there first; this feature's per-model `max_output_tokens` override rides the
+> same corrected path. Summary retained here for context.
+
+**Verification:** job `19707fa1` (blob path, `EXPERTS_DB_ENABLED=true`) ran
+`openrouter/minimax/minimax-m3` whose registry `context_window` is **262144**,
+yet its persisted `resolved_config` baked **`model_max_context_tokens: 1000000`**
+(the family default) + `context_threshold_tokens: 800000`. The admin override was
+shadowed — exactly the static trace below.
 
 There are two dispatch delivery paths:
 - **Legacy** (config_name/config_override; prod, experts-DB off):
@@ -389,8 +428,9 @@ late; the token-saving intent is silently defeated); (b) a per-model
 layer (e.g. `request_override` so they sit in `explicit_llm_keys` and the matrix
 doesn't re-bake the family value). The two `setdefault` sites (`main.py:1616`,
 `:3584`) are the only `model_max_context_tokens` writers and there are no
-config_resolver precedence tests — **confirm on the cluster** (next minimax
-dispatch: loader log `max_context_tokens=` → 262144 honored vs 1000000 shadowed).
+config_resolver precedence tests. **Confirmed live** via `19707fa1`'s blob (see
+top of this section) — the fix lands per-model output overrides *and* repairs
+every admin `context_window` override in the blob path.
 
 ## 8. Runaway guard
 
@@ -452,7 +492,10 @@ Substantive fix = 1–5 together; 6 is fast-follow.
    (§5.2), with **override semantics** to dodge §7.4.
 3. **Fix blob-path override shadowing (§7.4)** — prerequisite so #1/#2 honor
    admin caps. Also independently fixes admin `context_window` overrides.
-4. **Fix doubled `finish_reason`/model_name (§7.1)** — prerequisite for #5.
+4. **Doubled `finish_reason`/model_name (§7.1)** — verify on the gateway path
+   first (likely already resolved by the route-all migration); build #5 on the
+   per-chunk read regardless, keep the normalize-fix only if a provider still
+   double-emits.
 5. **Length-aware retry/fallback** — `persistent_graph.py` + `graph.py` (§6),
    empty-vs-content branching; **scale timeout with `max_tokens`** (§7.2).
 6. **(Fast-follow)** streaming n-gram repetition detection + `repetition_detected`
@@ -467,10 +510,10 @@ Substantive fix = 1–5 together; 6 is fast-follow.
   effective ctx — family 64k + admin ctx 64k → ≈ backstop(64k); + admin ctx 1M →
   64k. Lowering a model's registry `context_window` lowers resolved max output
   (proves §5.4 + §7.4).
-- §7.4 cluster check: minimax dispatch loader log shows `max_context_tokens=262144`
-  (not 1000000).
+- §7.4: confirmed broken today (job `19707fa1` blob = 1000000 vs registry
+  262144); **after the fix** a minimax dispatch resolves `max_context_tokens=262144`.
 - §7.1: audited `finish_reason` for a minimax `length` turn reads `"length"`, not
-  `"lengthlength"`.
+  `"lengthlength"` (likely already true on the gateway path — verify).
 - A forced `length` truncation surfaces "truncated at output limit" and the
   length-aware retry recovers it (sessions **and** worker jobs).
 - `ruff check src/ orchestrator/ tests/` + relevant pytest green.
