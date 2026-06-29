@@ -50,6 +50,7 @@ def _make_manager(
     pod_list.items = pods or []
     container._core_api.list_namespaced_pod.return_value = pod_list
     container.delete_workspace = AsyncMock(return_value=True)
+    container._delete_service = AsyncMock(return_value=True)
 
     suspension = MagicMock()
     suspension.is_enabled = suspension_enabled
@@ -630,6 +631,8 @@ class TestDeleteTerminalPvc:
         container.delete_workspace_pvc.assert_awaited_once_with(
             WorkspaceOwner.job("j1")
         )
+        # The stable-DNS Service shares the PVC lifecycle — reclaimed on terminal.
+        container._delete_service.assert_awaited_once_with(WorkspaceOwner.job("j1"))
 
     @pytest.mark.asyncio
     async def test_idle_job_pvc_backed_keeps_pvc(self):
@@ -648,6 +651,8 @@ class TestDeleteTerminalPvc:
         await mgr.delete(inst, grace_s=0)
         container.delete_workspace.assert_awaited_once_with(WorkspaceOwner.job("j1"))
         container.delete_workspace_pvc.assert_not_called()
+        # Idle keeps the Service too (stable DNS persists for the resume).
+        container._delete_service.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_terminal_job_emptydir_does_not_delete_pvc(self):
@@ -760,6 +765,8 @@ class TestReapOrphans:
             n = await mgr.reap_orphans()
         assert n == 1
         container._delete_pvc.assert_awaited_once_with("pvc-workspace-jdone")
+        # The orphan's stable-DNS Service is reclaimed alongside its PVC.
+        container._delete_service.assert_awaited_once_with(WorkspaceOwner.job("jdone"))
 
     @pytest.mark.asyncio
     async def test_reaps_pvc_whose_job_row_is_gone(self):

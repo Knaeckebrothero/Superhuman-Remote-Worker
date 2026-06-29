@@ -271,6 +271,12 @@ class ContainerProvisioner:
             # the existing pod already owns its (same-named) ConfigMap.
             if created_pod is not None:
                 await self._adopt_configmap(seed_cm, created_pod)
+            # PVC-backed jobs get a stable headless Service so the agent dials a
+            # constant DNS name that survives pod recreates (reattach/recovery)
+            # instead of an ephemeral pod IP. Same gate as the PVC; lifecycle
+            # mirrors it (kept across idle reaps, deleted on terminal).
+            if pvc_name:
+                await self._create_service(owner)
             logger.info(
                 "Workspace container created: %s (%s %s)",
                 pod_name,
@@ -296,10 +302,13 @@ class ContainerProvisioner:
             # Wait for pod IP (poll until ready or timeout)
             pod_ip = await self._wait_for_ready(pod_name, timeout=120)
             if pod_ip:
-                await self._set_context(
-                    owner,
-                    {"status": "ready", "pod_ip": pod_ip, "port": 30022},
-                )
+                ready_ctx = {"status": "ready", "pod_ip": pod_ip, "port": 30022}
+                # Hand the agent the STABLE Service DNS (not the ephemeral IP) so
+                # a reattached/recovered pod is reachable at the same address.
+                # The dispatch + resume paths prefer this `host` over `pod_ip`.
+                if pvc_name:
+                    ready_ctx["host"] = self._workspace_dns(owner)
+                await self._set_context(owner, ready_ctx)
                 logger.info(
                     "Workspace container ready: %s @ %s (%s %s)",
                     pod_name,
@@ -442,6 +451,7 @@ class ContainerProvisioner:
 
         deleted = await self.delete_workspace(owner)
         await self.delete_workspace_pvc(owner)
+        await self._delete_service(owner)
         return deleted
 
     async def get_workspace_status(self, owner: WorkspaceOwner) -> Optional[dict]:
@@ -705,6 +715,86 @@ class ContainerProvisioner:
                 return True
             logger.error("Failed to delete PVC %s: %s", pvc_name, e)
             return False
+
+    async def _create_service(self, owner: WorkspaceOwner) -> bool:
+        """Create a headless Service giving the workspace a STABLE DNS name.
+
+        The pod IP changes on every recreate; the agent caches its SSH dial
+        target, so a recreated pod (PVC reattach / crash recovery) leaves the
+        agent dialing a dead IP and the job churns to fail-loud (see
+        docs/issues/workspace_reattach_ephemeral_ip_reconnect_churn.md). A
+        headless Service named after the pod gives a stable address
+        ``<pod_name>.<ns>.svc:30022`` that always resolves (selector-matched) to
+        the *current* pod — so reattach/recovery reconnects with no IP
+        propagation. Headless (clusterIP=None) keeps traffic pod->pod (no DNAT),
+        so workspace NetworkPolicies are unaffected, and DNS only resolves to a
+        Ready pod (closes the sshd-readiness gap). Idempotent — 409 = success.
+        Lifecycle mirrors the PVC: kept across idle reaps, deleted on terminal.
+        """
+        if not self._k8s_available:
+            return False
+        svc_name = owner.pod_name  # DNS: <svc_name>.<ns>.svc.cluster.local
+        manifest = {
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": {
+                "name": svc_name,
+                "namespace": self._namespace,
+                "labels": {
+                    "app": "srw-workspace",
+                    "srw/component": "workspace-svc",
+                    "srw.io/component": "agent-workspace",
+                    owner.label_key: owner.id,
+                },
+            },
+            "spec": {
+                "clusterIP": "None",  # headless → A-record to the current pod IP
+                "selector": {"app": "srw-workspace", owner.label_key: owner.id},
+                "ports": [
+                    {"name": "ssh", "port": 30022, "targetPort": 30022},
+                    {"name": "code-server", "port": 38080, "targetPort": 38080},
+                    {"name": "cdp", "port": 9222, "targetPort": 9222},
+                ],
+            },
+        }
+        try:
+            await asyncio.to_thread(
+                self._core_api.create_namespaced_service,
+                namespace=self._namespace,
+                body=manifest,
+            )
+            logger.info("Workspace Service created: %s", svc_name)
+            return True
+        except Exception as e:
+            if hasattr(e, "status") and e.status == 409:
+                logger.debug("Workspace Service already exists: %s", svc_name)
+                return True
+            logger.error("Failed to create workspace Service %s: %s", svc_name, e)
+            return False
+
+    async def _delete_service(self, owner: WorkspaceOwner) -> bool:
+        """Delete the workspace's headless Service. Idempotent — 404 = success."""
+        if not self._k8s_available:
+            return False
+        svc_name = owner.pod_name
+        try:
+            await asyncio.to_thread(
+                self._core_api.delete_namespaced_service,
+                name=svc_name,
+                namespace=self._namespace,
+            )
+            logger.info("Workspace Service deleted: %s", svc_name)
+            return True
+        except Exception as e:
+            if hasattr(e, "status") and e.status == 404:
+                logger.debug("Workspace Service already deleted: %s", svc_name)
+                return True
+            logger.error("Failed to delete workspace Service %s: %s", svc_name, e)
+            return False
+
+    def _workspace_dns(self, owner: WorkspaceOwner) -> str:
+        """Stable in-cluster DNS for the workspace's headless Service."""
+        return f"{owner.pod_name}.{self._namespace}.svc.cluster.local"
 
     def _build_workspace_labels(
         self, owner: WorkspaceOwner, network_tier: str = DEFAULT_NETWORK_TIER

@@ -1037,6 +1037,97 @@ class TestCreateWorkspacePvc:
         assert "PVC" in updates["error"]
 
 
+class TestWorkspaceService:
+    """Option 1: stable headless Service so reattach/recovery reconnects to a
+    constant DNS name instead of an ephemeral pod IP."""
+
+    @staticmethod
+    def _provisioner(pvc_enabled: bool):
+        from orchestrator.services.container_provisioner import ContainerProvisioner
+
+        p = ContainerProvisioner()
+        p._k8s_available = True
+        p._pvc_enabled = pvc_enabled
+        p._pvc_size = "10Gi"
+        p._db = MagicMock()
+        p._db.merge_workspace_container_context = AsyncMock(return_value=True)
+        p._db.merge_thread_workspace_context = AsyncMock(return_value=True)
+        p._db.execute = AsyncMock(return_value=None)
+        return p
+
+    @staticmethod
+    def _ready_ctx(p):
+        """The updates dict from the status=ready _set_context call."""
+        for call in p._db.merge_workspace_container_context.call_args_list:
+            updates = call[0][1]
+            if updates.get("status") == "ready":
+                return updates
+        return {}
+
+    @pytest.mark.asyncio
+    async def test_pvc_mode_creates_headless_service_and_sets_dns_host(self):
+        p = self._provisioner(pvc_enabled=True)
+        svc_body = {}
+        core = MagicMock()
+        core.create_namespaced_pod = MagicMock()
+        core.create_namespaced_persistent_volume_claim = MagicMock()
+        core.create_namespaced_service = lambda **kw: svc_body.update(
+            kw.get("body", {})
+        )
+        p._core_api = core
+
+        with patch.object(p, "_wait_for_ready", new_callable=AsyncMock) as w:
+            w.return_value = "10.42.0.100"
+            ok = await p.create_workspace(WorkspaceOwner.job("abcdef123456-rest"))
+
+        assert ok is True
+        # Headless Service named after the pod, selecting the workspace pod, ssh port
+        assert svc_body["metadata"]["name"] == "workspace-abcdef123456"
+        assert svc_body["spec"]["clusterIP"] == "None"
+        assert svc_body["spec"]["selector"]["srw/job-id"] == "abcdef123456-rest"
+        assert svc_body["spec"]["selector"]["app"] == "srw-workspace"
+        assert 30022 in {pp["port"] for pp in svc_body["spec"]["ports"]}
+        # The agent is handed the stable DNS, not the ephemeral IP
+        assert (
+            self._ready_ctx(p).get("host")
+            == f"workspace-abcdef123456.{p._namespace}.svc.cluster.local"
+        )
+
+    @pytest.mark.asyncio
+    async def test_disabled_creates_no_service_and_no_host(self):
+        p = self._provisioner(pvc_enabled=False)
+        core = MagicMock()
+        core.create_namespaced_pod = MagicMock()
+        core.create_namespaced_service = MagicMock()
+        p._core_api = core
+
+        with patch.object(p, "_wait_for_ready", new_callable=AsyncMock) as w:
+            w.return_value = "10.42.0.100"
+            await p.create_workspace(WorkspaceOwner.job("abcdef123456-rest"))
+
+        core.create_namespaced_service.assert_not_called()
+        # emptyDir workspaces keep the IP path (no stable host)
+        assert "host" not in self._ready_ctx(p)
+
+    @pytest.mark.asyncio
+    async def test_delete_service_idempotent_on_404(self):
+        p = self._provisioner(pvc_enabled=True)
+        core = MagicMock()
+        not_found = type("ApiErr", (Exception,), {"status": 404})()
+        core.delete_namespaced_service = MagicMock(side_effect=not_found)
+        p._core_api = core
+        assert await p._delete_service(WorkspaceOwner.job("abcdef123456-rest")) is True
+
+    @pytest.mark.asyncio
+    async def test_create_service_idempotent_on_409(self):
+        p = self._provisioner(pvc_enabled=True)
+        core = MagicMock()
+        conflict = type("ApiErr", (Exception,), {"status": 409})()
+        core.create_namespaced_service = MagicMock(side_effect=conflict)
+        p._core_api = core
+        assert await p._create_service(WorkspaceOwner.job("abcdef123456-rest")) is True
+
+
 class TestDeleteWorkspace:
     """Tests for workspace deletion."""
 
