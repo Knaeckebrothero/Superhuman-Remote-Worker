@@ -5658,8 +5658,18 @@ async def lifespan(app: FastAPI):
     headless_notify_task = asyncio.create_task(
         run_when_leader(thread_permission_notify_sweeper, _shutdown_event)
     )
-    attention_sleep_task = asyncio.create_task(attention_sleep_sweeper(_shutdown_event))
-    ide_sweeper_task = asyncio.create_task(ide_session_ttl_sweeper(_shutdown_event))
+    # Leader-gated: both snapshot/teardown idle workspaces (attention-sleep) or
+    # delete idle IDE VMs/pods (ide-sweeper) after a plain SELECT, with no
+    # per-row claim. Under replicas:2 two unguarded copies would double-snapshot
+    # to the same S3 key and race teardown against an in-flight snapshot. Gating
+    # mirrors the lifecycle reconciler, which already owns the parallel idle
+    # workspace-teardown path. See docs/tests/orchestrator_ha_background_loop_sweep.md.
+    attention_sleep_task = asyncio.create_task(
+        run_when_leader(attention_sleep_sweeper, _shutdown_event)
+    )
+    ide_sweeper_task = asyncio.create_task(
+        run_when_leader(ide_session_ttl_sweeper, _shutdown_event)
+    )
     ws_sweeper_task = asyncio.create_task(workspace_idle_sweeper(_shutdown_event))
     ide_settings_sweeper_task = asyncio.create_task(
         code_server_settings_sweeper(_shutdown_event)
