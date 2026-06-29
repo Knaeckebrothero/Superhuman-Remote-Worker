@@ -1,6 +1,7 @@
-import { Component, inject, computed, effect, signal, ElementRef, viewChild } from '@angular/core';
+import { Component, inject, computed, effect, signal, untracked } from '@angular/core';
 import { TranslocoPipe, TranslocoService } from '@jsverse/transloco';
 import { DataService } from '../../core/services/data.service';
+import { ChatTraceService } from '../../core/services/chat-trace.service';
 import { RequestService } from '../../debug/services/request.service';
 import { ChatEntry } from '../../core/models/chat.model';
 import { AppButtonComponent } from '../../ui/button';
@@ -46,7 +47,7 @@ interface ShellPane {
             size="sm"
             [ariaLabel]="'chatHistory.refresh' | transloco"
             [tooltip]="'chatHistory.refresh' | transloco"
-            (clicked)="data.refresh()"
+            (clicked)="chat.refresh()"
           >
             ↻
           </app-icon-button>
@@ -54,24 +55,24 @@ interface ShellPane {
       </div>
 
       <!-- Loading State -->
-      @if (data.isLoading()) {
+      @if (chat.loading()) {
         <div class="loading-overlay">
           <app-spinner size="lg" tone="accent" />
         </div>
       }
 
       <!-- Error State -->
-      @if (data.error()) {
+      @if (chat.error()) {
         <div class="error-state">
-          <span>{{ data.error() }}</span>
-          <app-button variant="danger" size="sm" (clicked)="data.refresh()">
+          <span>{{ chat.error() }}</span>
+          <app-button variant="danger" size="sm" (clicked)="chat.refresh()">
             {{ 'chatHistory.retry' | transloco }}
           </app-button>
         </div>
       }
 
       <!-- Empty State -->
-      @if (!data.isLoading() && !data.error() && entries().length === 0 && data.currentJobId()) {
+      @if (!chat.loading() && !chat.error() && entries().length === 0 && data.currentJobId()) {
         <div class="empty-state">
           <span class="empty-icon">&#x1F4AC;</span>
           <span>{{ 'chatHistory.empty.noHistory' | transloco }}</span>
@@ -80,7 +81,7 @@ interface ShellPane {
       }
 
       <!-- No Job Selected -->
-      @if (!data.currentJobId() && !data.isLoading()) {
+      @if (!data.currentJobId() && !chat.loading()) {
         <div class="empty-state">
           <span class="empty-icon">&#x1F50D;</span>
           <span>{{ 'chatHistory.empty.noJob' | transloco }}</span>
@@ -90,7 +91,7 @@ interface ShellPane {
 
       <!-- Chat Messages -->
       @if (entries().length > 0) {
-        <div class="chat-list" #chatList>
+        <div class="chat-list" (scroll)="onScroll($event)">
           @for (entry of entries(); track entry._id; let idx = $index) {
             <div class="chat-turn">
               <!-- Turn Header -->
@@ -224,12 +225,18 @@ interface ShellPane {
         </div>
       }
 
-      <!-- Position indicator -->
+      <!-- Position indicator + load more -->
       @if (entries().length > 0) {
         <div class="position-bar">
           <span class="position-info">
             {{ 'chatHistory.showingTurns' | transloco: {n: entries().length} }}
+            @if (chat.hasMore()) {<span class="of-total">/ {{ chat.total() }}</span>}
           </span>
+          @if (chat.loadingMore()) {
+            <app-spinner size="sm" tone="accent" />
+          } @else if (chat.hasMore()) {
+            <app-button variant="ghost" size="sm" (clicked)="chat.loadMore()">Load more</app-button>
+          }
         </div>
       }
     </div>
@@ -677,14 +684,9 @@ interface ShellPane {
 })
 export class ChatHistoryComponent {
   readonly data = inject(DataService);
+  readonly chat = inject(ChatTraceService);
   private readonly requestService = inject(RequestService);
   private readonly transloco = inject(TranslocoService);
-
-  // Reference to the chat list container for auto-scrolling
-  private readonly chatListRef = viewChild<ElementRef<HTMLDivElement>>('chatList');
-
-  // Track the previous entry count to detect when new entries are added
-  private previousEntryCount = 0;
 
   // Track selected tab per chat entry (entry._id -> pane name)
   private readonly selectedTabs = signal<Map<string, string>>(new Map());
@@ -692,8 +694,8 @@ export class ChatHistoryComponent {
   // Cache parsed shell panes to avoid re-parsing on every change detection
   private readonly parsedShellCache = new Map<string, ShellPane[]>();
 
-  // Use DataService's visible chat entries (filtered by slider position)
-  readonly entries = computed(() => this.data.visibleChatEntries());
+  // Paged chat turns from ChatTraceService (infinite scroll, no eager download).
+  readonly entries = computed(() => this.chat.rows());
 
   // Entry count display
   readonly entryCount = computed(() => {
@@ -701,23 +703,21 @@ export class ChatHistoryComponent {
   });
 
   constructor() {
-    // Effect to auto-scroll when entries change
+    // Drive the chat panel off the loaded job — the same signal the debug
+    // dashboard sets on selection (DataService.currentJobId). See
+    // docs/features/debug_audit_view_refactor.md (Phase 2c / P3).
     effect(() => {
-      const entries = this.entries();
-      const currentCount = entries.length;
-      const chatList = this.chatListRef();
-
-      // Scroll to bottom when entries are added (count increased)
-      if (chatList && currentCount > this.previousEntryCount) {
-        // Use requestAnimationFrame to ensure DOM has updated
-        requestAnimationFrame(() => {
-          const el = chatList.nativeElement;
-          el.scrollTop = el.scrollHeight;
-        });
-      }
-
-      this.previousEntryCount = currentCount;
+      const jobId = this.data.currentJobId();
+      untracked(() => this.chat.setJob(jobId));
     });
+  }
+
+  /** Near the bottom → fetch the next page (infinite scroll). */
+  onScroll(event: Event): void {
+    const el = event.target as HTMLElement;
+    if (el.scrollHeight - el.scrollTop - el.clientHeight < 320) {
+      void this.chat.loadMore();
+    }
   }
 
   phaseTone(phase: string | null | undefined): BadgeTone {

@@ -1,8 +1,6 @@
-import { Component, inject, computed, OnInit, OnDestroy } from '@angular/core';
-import { FormsModule } from '@angular/forms';
+import { Component, inject, OnInit, OnDestroy } from '@angular/core';
 import { DataService } from '../../../core/services/data.service';
 import { JobContextService } from '../../../core/services/job-context.service';
-import { AppSpinnerComponent } from '../../../ui/spinner';
 
 /**
  * Timeline scrubber component for playback control.
@@ -13,7 +11,7 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
  */
 @Component({
   selector: 'app-timeline',
-  imports: [FormsModule, AppSpinnerComponent],
+  imports: [],
   template: `
     <div class="timeline">
       <select
@@ -51,57 +49,6 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
         AUTO
       </button>
 
-      <div class="divider"></div>
-
-      <button
-        class="play-button"
-        (click)="togglePlay()"
-        [attr.aria-label]="isPlaying() ? 'Pause' : 'Play'"
-        [disabled]="!hasEntries()"
-      >
-        @if (isPlaying()) {
-          <svg viewBox="0 0 24 24" fill="currentColor">
-            <rect x="6" y="4" width="4" height="16" />
-            <rect x="14" y="4" width="4" height="16" />
-          </svg>
-        } @else {
-          <svg viewBox="0 0 24 24" fill="currentColor">
-            <polygon points="5,3 19,12 5,21" />
-          </svg>
-        }
-      </button>
-
-      <span class="time-display">{{ formattedCurrentTime() }}</span>
-
-      <div class="scrubber-container" [class.disabled]="!hasEntries()">
-        <input
-          type="range"
-          class="scrubber"
-          [min]="0"
-          [max]="data.maxIndex()"
-          [ngModel]="data.sliderIndex()"
-          (ngModelChange)="onSliderChange($event)"
-          [attr.aria-label]="'Timeline position'"
-          [disabled]="!hasEntries()"
-        />
-      </div>
-
-      <span class="time-display">{{ formattedDuration() }}</span>
-
-      <!-- Loading indicator -->
-      @if (data.isLoading()) {
-        <div class="loading-indicator">
-          <app-spinner size="sm" />
-          @if (data.loadingProgress() > 0) {
-            <span class="progress-text">{{ data.loadingProgress() }}%</span>
-          }
-        </div>
-      }
-
-      <!-- Cache indicator -->
-      @if (data.isCached() && !data.isLoading()) {
-        <span class="cache-indicator" title="Loaded from cache">&#x26A1;</span>
-      }
     </div>
   `,
   styles: [
@@ -348,28 +295,6 @@ export class TimelineComponent implements OnInit, OnDestroy {
   readonly data = inject(DataService);
   readonly jobContext = inject(JobContextService);
 
-  // Playback state (placeholder - auto-advance not implemented yet)
-  readonly isPlaying = computed(() => false);
-
-  // Whether we have entries loaded
-  readonly hasEntries = computed(() => this.data.maxIndex() > 0);
-
-  // Format current position as time from entry timestamp
-  readonly formattedCurrentTime = computed(() => {
-    const timestamp = this.data.currentTimestamp();
-    if (!timestamp) {
-      const index = this.data.sliderIndex();
-      return `#${index}`;
-    }
-    return this.formatTimestamp(timestamp);
-  });
-
-  // Format total duration / max index
-  readonly formattedDuration = computed(() => {
-    const total = this.data.totalAuditEntries();
-    return `${total} entries`;
-  });
-
   ngOnInit(): void {
     this.jobContext.loadJobs();
   }
@@ -383,20 +308,11 @@ export class TimelineComponent implements OnInit, OnDestroy {
     this.data.setCurrentJob(value || null);
   }
 
-  onSliderChange(index: number): void {
-    this.data.setSliderIndex(index);
-  }
-
   onRefresh(): void {
     this.jobContext.loadJobs();
     if (this.data.currentJobId()) {
       this.data.refresh();
     }
-  }
-
-  togglePlay(): void {
-    // Playback not implemented yet
-    // Could auto-advance slider index at a rate
   }
 
   toggleAutoRefresh(): void {
@@ -405,15 +321,5 @@ export class TimelineComponent implements OnInit, OnDestroy {
 
   truncate(text: string, maxLength: number): string {
     return text.length <= maxLength ? text : text.slice(0, maxLength) + '…';
-  }
-
-  private formatTimestamp(isoString: string): string {
-    const date = new Date(isoString);
-    return date.toLocaleTimeString(undefined, {
-      hour: '2-digit',
-      minute: '2-digit',
-      second: '2-digit',
-      hour12: false,
-    });
   }
 }
