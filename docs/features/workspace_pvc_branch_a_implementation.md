@@ -12,7 +12,7 @@ cannot leak. Verified end-to-end against the live orchestrator on k3d.
 |---|---|---|
 | **0 — the flip** | PVC-back job workspaces (flag-gated, jobs-only) | ✅ done + k3d-verified |
 | **1 — GC discipline** | terminal delete + give_up gating + backstop `reap_orphans` | ✅ done + k3d-verified |
-| **2 — crash-recovery reattach** | workspace-lost job re-dispatches → reattaches PVC → agent resumes on the files | ⚠️ **PARTIAL (2026-06-29)** — G1+G2 implemented + k3d-E2E'd. Wedge eliminated (no VM misroute), bounded fail-loud, PVC + working-tree preserved (sentinel survived). **Auto-resume BLOCKED**: recreate gives a new pod IP each cycle, the agent dials a stale IP → churns to fail-loud → `workspace_reattach_ephemeral_ip_reconnect_churn.md`. See §Phase 2 |
+| **2 — crash-recovery reattach** | workspace-lost job re-dispatches → reattaches PVC → agent resumes on the files | ⚠️ **NEAR-COMPLETE (2026-06-29)** — G1+G2 (wedge eliminated, bounded fail-loud, PVC+working-tree preserved) + **Option 1 stable-DNS Service** (commit `7fb9e9e2`) which fixes the ephemeral-IP reconnect churn. Mechanism k3d-verified: DNS stayed connectable across a recreate while the pod IP changed (`.102→.103`). **Only remaining:** the full real-job auto-resume E2E (kill a *running* job's pod → resumes not fails) → `workspace_reattach_ephemeral_ip_reconnect_churn.md` §Acceptance. See §Phase 2 |
 | **3 — prod hardening** | RWO dead-node detach-wait + S3 fallback + ResourceQuota | ⏳ pending (Longhorn-only; irrelevant on k3d/local-path) |
 | **rollout** | flag default-off in-chart; **ON in k3d dev**; dev-soak → prod flip | ⏳ pending |
 
