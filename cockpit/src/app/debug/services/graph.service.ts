@@ -1,4 +1,4 @@
-import { Injectable, inject, signal, computed, effect } from '@angular/core';
+import { Injectable, inject, signal, computed } from '@angular/core';
 import { ApiService } from '../../core/services/api.service';
 import { DataService } from '../../core/services/data.service';
 import {
@@ -36,30 +36,10 @@ export class GraphService {
   private lastSeekTime = 0;
   private lastSeekIndex = 0;
 
-  // Track previous slider index to detect global slider changes
-  private lastGlobalSliderIndex = 0;
-
   constructor() {
-    // Re-enable sync when global slider is used
-    effect(() => {
-      const sliderIndex = this.data.sliderIndex();
-      if (sliderIndex !== this.lastGlobalSliderIndex) {
-        this.lastGlobalSliderIndex = sliderIndex;
-        this.syncToGlobalTime.set(true);
-      }
-    });
-
-    // Sync graph index when global time changes
-    effect(() => {
-      if (!this.syncToGlobalTime()) return;
-      const timestamp = this.data.currentTimestamp();
-      if (!timestamp || !this.hasData()) return;
-      const index = this.findIndexAtTimestamp(timestamp);
-      // Only update if the index actually changed to avoid triggering extra renders
-      if (index !== this.currentIndex()) {
-        this.currentIndex.set(index);
-      }
-    });
+    // Graph navigation is self-contained (its own currentIndex); it no longer
+    // syncs to the removed global timeline slider. See
+    // docs/features/debug_audit_view_refactor.md (Phase 2c / P3).
   }
 
   // Computed values

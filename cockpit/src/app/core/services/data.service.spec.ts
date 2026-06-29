@@ -21,10 +21,6 @@ describe('DataService', () => {
     mockApiService = {
       getJobs: vi.fn().mockReturnValue(of([])),
       getJobVersion: vi.fn().mockReturnValue(of(null)),
-      // Bulk endpoints must NOT be called by DataService anymore.
-      getJobAuditBulk: vi.fn(),
-      getChatHistoryBulk: vi.fn(),
-      getGraphDeltasBulk: vi.fn(),
     };
 
     mockDbService = {
@@ -55,10 +51,8 @@ describe('DataService', () => {
       await service.loadJob('test-job-1');
 
       expect(service.currentJobId()).toBe('test-job-1');
-      // The OOM-prone bulk downloads are gone — the trace services fetch lazily.
-      expect(mockApiService.getJobAuditBulk).not.toHaveBeenCalled();
-      expect(mockApiService.getChatHistoryBulk).not.toHaveBeenCalled();
-      expect(mockApiService.getGraphDeltasBulk).not.toHaveBeenCalled();
+      // No eager fetching anymore — the trace services load audit/chat lazily.
+      expect(mockApiService.getJobVersion).not.toHaveBeenCalled();
     });
 
     it('loadJob is a no-op when the same job is already selected', async () => {
