@@ -2833,6 +2833,24 @@ def _resolve_timeout(
     return float(round(max(float(base), needed)))
 
 
+def _is_output_truncated(finish_reason: Any) -> bool:
+    """True when a turn hit the output-token cap (a ``length`` finish reason).
+
+    Reasoning tokens share ``max_output_tokens``, so a length-truncated turn can
+    arrive *empty* (reasoning consumed the whole budget before any answer) —
+    distinct from a generic empty response, and it must be surfaced as such
+    rather than retried blindly. Tolerant: a lower-cased substring match covers
+    provider spellings (``length`` / ``max_tokens`` / ``MAX_TOKENS``) and the
+    ``"lengthlength"`` stream-merge doubling (§7.1). Both graphs share this so the
+    detection stays consistent. See
+    docs/features/reasoning_aware_max_output_tokens.md §6.
+    """
+    if not finish_reason:
+        return False
+    fr = str(finish_reason).lower()
+    return "length" in fr or "max_tokens" in fr or "max_output" in fr
+
+
 def _create_openai_llm(
     config: LLMConfig,
     limits: Optional[LimitsConfig] = None,

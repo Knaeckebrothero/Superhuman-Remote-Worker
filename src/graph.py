@@ -76,6 +76,8 @@ from .core.loader import (
     load_summarization_prompt,
     load_auxiliary_prompt,
     get_phase_system_prompt,
+    _resolve_max_output_tokens,
+    _is_output_truncated,
 )
 from .core.model_registry import family_of
 from .core.phase import (
@@ -1533,6 +1535,51 @@ def create_execute_node(
                                 phase=phase_str,
                                 phase_number=phase_number,
                             )
+
+                # --- Output-cap truncation (finish_reason=length) — fail loud ---
+                # Reasoning tokens share max_output_tokens; a length-truncated turn
+                # with no content means reasoning consumed the entire output budget
+                # before any answer (the minimax/o-series empty-response bug). This
+                # is NOT the langchain/codex empty-AIMessage bug, so it must NOT
+                # accrue toward the unrecoverable empty-streak hard-fail below.
+                # Surface it distinctly + recoverable so the job pauses for review
+                # (raise the cap / lower reasoning / regenerate) instead of dying
+                # after 3. Tolerant substring detects the "lengthlength" merge (§7.1).
+                _finish_reason = (
+                    getattr(response, "response_metadata", None) or {}
+                ).get("finish_reason")
+                _is_length_trunc = _is_output_truncated(_finish_reason)
+                if _is_length_trunc and content_len == 0 and tool_calls_count == 0:
+                    _cap = _resolve_max_output_tokens(config.llm, config.limits)
+                    logger.error(
+                        f"[{job_id}] Output truncated at the model's limit "
+                        f"(finish_reason=length, max_output_tokens={_cap}): reasoning "
+                        f"consumed the entire output budget before answering."
+                    )
+                    return {
+                        "error": {
+                            "message": (
+                                f"The model used its entire output budget ({_cap} "
+                                "tokens) on reasoning and was cut off before producing "
+                                "an answer (finish_reason=length). Raise the model's "
+                                "output cap, lower the reasoning level, or shorten the "
+                                "prompt, then resume."
+                            ),
+                            "type": "output_truncated",
+                            "recoverable": True,
+                            "model": phase_model,
+                        },
+                        "iteration": iteration + 1,
+                    }
+                if _is_length_trunc and content_len > 0:
+                    # Truncated mid-answer: the partial is real work — keep it and
+                    # let the turn proceed, but log loudly (never a silent success).
+                    logger.warning(
+                        f"[{job_id}] Response truncated at output limit "
+                        f"(finish_reason=length, "
+                        f"max_output_tokens={_resolve_max_output_tokens(config.llm, config.limits)}, "
+                        f"{content_len} chars) — partial answer kept."
+                    )
 
                 # --- Empty response circuit breaker ---
                 # The codex proxy + langchain Responses API non-streaming path
