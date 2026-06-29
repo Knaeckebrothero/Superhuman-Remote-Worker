@@ -8,6 +8,7 @@ tags:
   - credentials
 related:
   - "[[usage_dashboard]]"
+  - "[[route_all_models_through_litellm_gateway]]"
   - "[[observability_and_quotas]]"
   - "[[saas_billing_and_metering]]"
   - "[[credential_broker]]"
@@ -32,7 +33,7 @@ aliases:
 > under provider API limits and subscription-coding-plan rate limits, so the fleet
 > stops generating constant 429 errors.
 
-**Status:** **Slices 1 + 2a committed; Slices 2b + 3 + 4 implemented + k3d-verified (2026-06-22), uncommitted on `develop`.** The feature is functionally **complete end-to-end** — measure + attribute + throttle (429) + daily quota stop + durable `usage_events` ledger (LLM tokens + workspace compute) + a Cockpit usage view. The throttle/quota/rate knobs still ship **inert** until real capacity is measured. See **Implementation status** below for what shipped, the spike findings that revised the design, and the gotchas.
+**Status:** **All slices (1, 2a, 2b, 3, 4) committed + pushed to `origin/develop` + deployed to dev** (status line corrected 2026-06-29 — the "uncommitted" claim below was stale). The feature is functionally **complete end-to-end** — measure + attribute + throttle (429) + daily quota stop + durable `usage_events` ledger (LLM tokens + workspace compute) + a Cockpit usage view (now the rich fused dashboard [[usage_dashboard]], shipped 2026-06-26). The throttle/quota/rate knobs still ship **inert** until real capacity is measured. **Two metering gaps this doc flagged are now CLOSED by the follow-on [[route_all_models_through_litellm_gateway]] (P0–P3, live on dev 2026-06-28):** (1) *coverage* — system-provider (minimax/openrouter) + codex models now route *through* the gateway and meter (gemini still bypasses, not yet canaried); (2) *LLM cost* — `usage_events.cost_usd` is now **real**, taken from LiteLLM's per-request `spend` as a `unit='request'` row (dev: codex GPT-5.5 $100.79), **not** from seeding `usage_rates` (which now prices `compute` only). See **Implementation status** below + that doc.
 **Triggered by:** Putting the system into real operation. Multiple agents call
 the same providers with **zero coordination** today — each discovers limits by
 hitting a 429 and backing off independently (`src/graph.py:177-290` classify +
@@ -52,7 +53,7 @@ markup / billing → [[saas_billing_and_metering]]; capacity-aware admission
 
 ## Implementation status (updated 2026-06-22)
 
-Built on local k3d (`k3d-srw`), uncommitted on `develop`. Driven **spike-first** —
+Built on local k3d (`k3d-srw`); since **committed + pushed to `origin/develop` + deployed to dev** (Slice commits a1f620f3 / 521bb6d9 / cdb9e947 / 37d1024e, plus the [[route_all_models_through_litellm_gateway]] follow-on). Driven **spike-first** —
 several LiteLLM assumptions in this doc were **overturned by live testing** and the
 design revised accordingly (below).
 
@@ -225,9 +226,15 @@ Implemented as four independently-shippable sub-slices, **all k3d-verified**:
   Postgres can't sub for LiteLLM's hot-path counters (Redis-hardcoded + hot-row write
   antipattern).
 
-**Next:** commit 2b + 3 + 4; set a real `backstop` + `ratePolicy` + `quota` capacity
-(measure the strix box's safe RPM / daily volume — counts are 1:1 now the `team_ids` bug is
-fixed) **and** seed `usage_rates` to turn the ledger's $0 costs into real dollars.
+**Next (updated 2026-06-29):** ~~commit 2b + 3 + 4~~ **done** — committed + pushed + deployed
+to dev. The live next step is to **turn the inert enforcement on**: set a real `backstop` +
+`ratePolicy` + `quota` capacity (measure the strix box's safe RPM / daily volume — counts are
+1:1 now the `team_ids` bug is fixed). ~~seed `usage_rates` to turn the ledger's $0 costs into
+real dollars~~ — **superseded:** LLM `cost_usd` is now real via the gateway's per-request
+`spend` ([[route_all_models_through_litellm_gateway]] P3); `usage_rates` now prices **compute**
+only (still empty → vcpu/gib-hour unpriced). Note: the per-user / per-model / per-project
+Cockpit breakdowns + the live authed-UI view (listed below as deferred) **shipped** in
+[[usage_dashboard]].
 *Deferred:* **per-job LLM attribution** (tag agent requests with `job_id` via LiteLLM
 request metadata — the gateway never sees job_id today); **VM-tier compute metering**
 (additive — the same `workspace_intervals` path); the `usage_daily` rollup + per-day /
@@ -473,7 +480,7 @@ egress surface (composes with the agent-egress NetworkPolicy work).
 ### Slice 2 — Per-user / per-project rate limits *(the headline enforcement)*
 > **2a (aggregate backstop, shared fleet key) ✅ + 2b (per-user/project, scoped keys) ✅
 > IMPLEMENTED + k3d-verified** (2a 2026-06-21, 2b 2026-06-22 — see Implementation status +
-> decision 5a). 2a is committed; 2b is uncommitted on `develop`. The mapping below is what
+> decision 5a). 2a + 2b are both committed + pushed to `origin/develop` + deployed to dev. The mapping below is what
 > shipped (project → team, user → internal user) — minus per-job keys, which 2b replaced
 > with one scoped key per (user, project) since enforcement lives on the team/user objects.
 - Admin config (ours): model → **category** map + a **RPM/TPM per category**,

@@ -31,7 +31,7 @@ aliases:
 **Status:** v1 **implemented, pushed & deployed to dev** (built/verified on local k3d
 2026-06-26; pushed to `origin/develop` + rolled out to dev via `sha-fe9c9ee` 2026-06-29) — as-built record
 (commits `46040008`…`896fad8d`, tests green, deviations) in the implementation plan
-`docs/superpowers/plans/2026-06-26-usage-dashboard.md`. SDD final whole-branch review still pending; `usage_rates` still empty (cost reads "—"); no fast-follows landed yet. v1 scope below;
+`docs/superpowers/plans/2026-06-26-usage-dashboard.md`. SDD final whole-branch review still pending; no dashboard fast-follows landed yet. **Cost note:** LLM `cost_usd` is now real (gateway-priced `unit='request'`, via [[route_all_models_through_litellm_gateway]] P3, live on dev) — cost reads "—" only for free/compute rows (`usage_rates` still empty, prices compute only). v1 scope below;
 everything uncertain is a named fast-follow, decided **after** seeing the page
 rendered (the user's explicit preference: build a concrete v1, react to how it
 feels, iterate — don't over-spec the panel set upfront).
@@ -78,13 +78,16 @@ new capture. Confirmed against the schema + both emitters:
 | **Compute** (`resource='workspace_pod'`) | ✅ | `vcpu-hour` + `gib-hour` = requested CPU/RAM × wall-clock; `details` has `cpu_millicores`, `mem_bytes`, `started_at`, `ended_at`, `tier`, `duration_h` |
 | **Job/thread** (`ref_id`) | compute ✅ / **LLM ❌** | gateway never sees `job_id` (fast-follow 3) |
 | **Provider** | ❌ | only the model name is stored — derivable via a catalog join, not a column (fast-follow 1) |
-| **Cost** (`cost_usd`) | ❌ inert | `usage_rates` ships empty → `$0`; v1 is quantity-first by design |
+| **Cost** (`cost_usd`) | LLM ✅ / compute ❌ | **Updated 2026-06-29:** LLM cost is now **real** — gateway per-request `spend` written as a `unit='request'` row ([[route_all_models_through_litellm_gateway]] P3, live on dev). Compute stays unpriced (`usage_rates` empty); free homelab LLM = `spend=0` → no cost row. |
 
 **Out of scope of the ledger entirely (do not promise):** GPU/VRAM (compute
 meter is CPU+RAM only), **actual** vs **requested** utilization (no sampling),
-agent-pod compute, VM-tier compute (container/sandbox tier only), and any model
-**not** routed through the gateway (system-direct Gemini, embeddings, whisper,
-TTS, codex are not metered).
+agent-pod compute, VM-tier compute (container/sandbox tier only), and embeddings /
+whisper / TTS (non-chat traffic). **Updated 2026-06-29 — the coverage gap narrowed:**
+**codex + system-provider (minimax/openrouter) models now route through the gateway
+and meter** ([[route_all_models_through_litellm_gateway]] P1–P2, live on dev);
+**gemini still bypasses** (not yet canaried). So "any model not routed through the
+gateway" is now a shrinking set, not the whole paid lane.
 
 ## Locked decisions
 
