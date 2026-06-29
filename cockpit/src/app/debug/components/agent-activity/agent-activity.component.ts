@@ -1,15 +1,19 @@
-import {Component, computed, effect, ElementRef, inject, signal, viewChild, viewChildren,} from '@angular/core';
-import {DataService} from '../../../core/services/data.service';
-import {RequestService} from '../../services/request.service';
-import {AuditEntry, AuditFilterCategory, AuditStepType} from '../../../core/models/audit.model';
-import {AppSpinnerComponent} from '../../../ui/spinner';
+import { Component, effect, inject, signal, untracked } from '@angular/core';
+import { AuditTraceService } from '../../../core/services/audit-trace.service';
+import { DataService } from '../../../core/services/data.service';
+import { RequestService } from '../../services/request.service';
+import { AuditEntry, AuditFilterCategory, AuditStepType } from '../../../core/models/audit.model';
+import { AppSpinnerComponent } from '../../../ui/spinner';
 
 /**
- * Agent Activity component that displays MongoDB audit trail.
- * Shows chronological agent execution steps with filtering and expandable details.
+ * Agent Activity component — the agent execution trace.
  *
- * Now uses DataService for index-based filtering instead of pagination.
- * Entries are filtered by slider position - only entries up to sliderIndex are shown.
+ * Shows chronological agent steps with server-side filtering and expandable
+ * detail. Backed by {@link AuditTraceService}: lean rows are fetched a page at a
+ * time (infinite scroll), and a step's heavy detail (tool arguments, error
+ * traceback, in-state message count) is lazy-loaded only on expand. No eager
+ * download, no IndexedDB, no slider — see
+ * docs/features/debug_audit_view_refactor.md (Phase 2).
  */
 @Component({
   selector: 'app-agent-activity',
@@ -22,44 +26,41 @@ import {AppSpinnerComponent} from '../../../ui/spinner';
         @for (filter of filters; track filter.value) {
           <button
             class="filter-btn"
-            [class.active]="data.activeFilter() === filter.value"
-            (click)="data.setFilter(filter.value)"
+            [class.active]="trace.filter() === filter.value"
+            (click)="trace.setFilter(filter.value)"
           >
             {{ filter.label }}
           </button>
         }
-        <span class="entry-count">{{ entryCount() }}</span>
+        <span class="entry-count">{{ trace.rows().length }}/{{ trace.total() }}</span>
       </div>
 
-      <!-- Loading State -->
-      @if (data.isLoading()) {
+      <!-- Loading State (first page) -->
+      @if (trace.loading()) {
         <div class="loading-overlay">
           <app-spinner size="lg" tone="accent" />
-          @if (data.loadingProgress() > 0) {
-            <span class="progress">{{ data.loadingProgress() }}%</span>
-          }
         </div>
       }
 
       <!-- Error State -->
-      @if (data.error()) {
+      @if (trace.error()) {
         <div class="error-state">
-          <span>{{ data.error() }}</span>
-          <button (click)="data.refresh()">Retry</button>
+          <span>{{ trace.error() }}</span>
+          <button (click)="trace.refresh()">Retry</button>
         </div>
       }
 
       <!-- Empty State -->
-      @if (!data.isLoading() && !data.error() && entries().length === 0 && data.currentJobId()) {
+      @if (!trace.loading() && !trace.error() && trace.rows().length === 0 && trace.jobId()) {
         <div class="empty-state">
           <span class="empty-icon">&#x1F4C4;</span>
           <span>No audit entries for this job</span>
-          <span class="empty-hint">Try selecting a different filter or moving the slider</span>
+          <span class="empty-hint">Try a different filter</span>
         </div>
       }
 
       <!-- No Job Selected -->
-      @if (!data.currentJobId() && !data.isLoading()) {
+      @if (!trace.jobId() && !trace.loading()) {
         <div class="empty-state">
           <span class="empty-icon">&#x1F50D;</span>
           <span>Select a job from the timeline bar</span>
@@ -67,19 +68,18 @@ import {AppSpinnerComponent} from '../../../ui/spinner';
         </div>
       }
 
-      <!-- Entry List -->
-      @if (entries().length > 0) {
-        <div class="entry-list" #entryList>
-          @for (entry of entries(); track entry._id; let i = $index) {
+      <!-- Entry List (infinite scroll) -->
+      @if (trace.rows().length > 0) {
+        <div class="entry-list" (scroll)="onScroll($event)">
+          @for (entry of trace.rows(); track entry._id) {
             <div
-              #entryItem
               class="entry-item"
               [class.expanded]="isExpanded(entry._id)"
               [class.phase-strategic]="entry.phase === 'strategic'"
               [class.phase-tactical]="entry.phase === 'tactical'"
               [style.border-left-color]="getStepColor(entry.step_type, entry)"
             >
-              <div class="entry-header" (click)="toggleExpanded(entry._id)">
+              <div class="entry-header" (click)="toggleExpanded(entry)">
                 <span class="step-number">#{{ entry.step_number }}</span>
                 <span class="step-badge" [style.background]="getStepColor(entry.step_type, entry)">
                   {{ getStepBadge(entry.step_type, entry) }}
@@ -96,198 +96,203 @@ import {AppSpinnerComponent} from '../../../ui/spinner';
               </div>
 
               @if (isExpanded(entry._id)) {
+                @let detail = trace.detailFor(entry);
                 <div class="entry-details">
                   <!-- Initialize Step Details -->
-                  @if (entry.step_type === 'initialize') {
-                    @if (hasWorkspace(entry)) {
+                  @if (detail.step_type === 'initialize') {
+                    @if (hasWorkspace(detail)) {
                       <div class="detail-section">
                         <span class="detail-label">Workspace:</span>
-                        <span class="detail-value">{{ getWorkspaceCreated(entry) ? 'Created' : 'Existing' }}</span>
+                        <span class="detail-value">{{ getWorkspaceCreated(detail) ? 'Created' : 'Existing' }}</span>
                       </div>
                     }
-                    @if (hasPhaseAlternation(entry)) {
+                    @if (hasPhaseAlternation(detail)) {
                       <div class="detail-section">
                         <span class="detail-label">Phase Alt:</span>
                         <span class="detail-value mono">enabled</span>
                       </div>
-                      @if (getStrategicTodosCount(entry)) {
+                      @if (getStrategicTodosCount(detail)) {
                         <div class="detail-section">
                           <span class="detail-label">Todos:</span>
-                          <span class="detail-value mono">{{ getStrategicTodosCount(entry) }} strategic todos loaded</span>
+                          <span class="detail-value mono">{{ getStrategicTodosCount(detail) }} strategic todos loaded</span>
                         </div>
                       }
-                      @if (getInstructionsLength(entry)) {
+                      @if (getInstructionsLength(detail)) {
                         <div class="detail-section">
                           <span class="detail-label">Instructions:</span>
-                          <span class="detail-value mono">{{ getInstructionsLength(entry) }} chars</span>
+                          <span class="detail-value mono">{{ getInstructionsLength(detail) }} chars</span>
                         </div>
                       }
                     }
                   }
 
                   <!-- LLM Details (combined call + response) -->
-                  @if (entry.step_type === 'llm' && entry.llm) {
-                    @if (entry.llm.model) {
+                  @if (detail.step_type === 'llm' && detail.llm) {
+                    @if (detail.llm.model) {
                       <div class="detail-section">
                         <span class="detail-label">Model:</span>
-                        <span class="detail-value mono">{{ entry.llm.model }}</span>
+                        <span class="detail-value mono">{{ detail.llm.model }}</span>
                       </div>
                     }
-                    @if (getInputMessageCount(entry)) {
+                    @if (getInputMessageCount(detail)) {
                       <div class="detail-section">
                         <span class="detail-label">Input:</span>
-                        <span class="detail-value mono">{{ getInputMessageCount(entry) }} messages</span>
+                        <span class="detail-value mono">{{ getInputMessageCount(detail) }} messages</span>
                       </div>
                     }
-                    @if (getStateMessageCount(entry)) {
+                    @if (getStateMessageCount(detail)) {
                       <div class="detail-section">
                         <span class="detail-label">Context:</span>
-                        <span class="detail-value mono">{{ getStateMessageCount(entry) }} messages in state</span>
+                        <span class="detail-value mono">{{ getStateMessageCount(detail) }} messages in state</span>
                       </div>
                     }
-                    @if (getRequestId(entry)) {
+                    @if (getRequestId(detail)) {
                       <div class="detail-section">
                         <span class="detail-label">Request:</span>
                         <span
                           class="detail-value mono request-link"
-                          (click)="onRequestIdClick(getRequestId(entry)!); $event.stopPropagation()"
+                          (click)="onRequestIdClick(getRequestId(detail)!); $event.stopPropagation()"
                           title="Click to view full request"
                         >
-                          {{ getRequestId(entry)!.slice(0, 12) }}...
+                          {{ getRequestId(detail)!.slice(0, 12) }}...
                         </span>
                       </div>
                     }
-                    @if (entry.llm.response_content_preview) {
+                    @if (detail.llm.response_content_preview) {
                       <div class="detail-section">
                         <span class="detail-label">Response:</span>
-                        <span class="detail-value response-preview">{{ entry.llm.response_content_preview }}</span>
+                        <span class="detail-value response-preview">{{ detail.llm.response_content_preview }}</span>
                       </div>
-                    } @else if (isPending(entry)) {
+                    } @else if (isPending(detail)) {
                       <div class="detail-section">
                         <span class="detail-label">Response:</span>
                         <span class="detail-value pending">Waiting for LLM response...</span>
                       </div>
                     }
-                    @if (entry.llm.tool_calls && entry.llm.tool_calls.length > 0) {
+                    @if (detail.llm.tool_calls && detail.llm.tool_calls.length > 0) {
                       <div class="detail-section">
                         <span class="detail-label">Tool Calls:</span>
                         <div class="tool-calls">
-                          @for (tc of entry.llm.tool_calls; track tc.name) {
+                          @for (tc of detail.llm.tool_calls; track tc.name) {
                             <span class="tool-chip" [style.background]="getToolColor(tc.name)">{{ tc.name }}</span>
                           }
                         </div>
                       </div>
                     }
-                    @if (getLLMMetrics(entry)) {
+                    @if (getLLMMetrics(detail)) {
                       <div class="detail-section">
                         <span class="detail-label">Output:</span>
-                        <span class="detail-value mono">{{ getOutputChars(entry) }} chars</span>
+                        <span class="detail-value mono">{{ getOutputChars(detail) }} chars</span>
                       </div>
                     }
                   }
 
                   <!-- Tool Details (combined call + result) -->
-                  @if (entry.step_type === 'tool' && entry.tool) {
+                  @if (detail.step_type === 'tool' && detail.tool) {
                     <div class="detail-section">
                       <span class="detail-label">Tool:</span>
-                      <span class="detail-value mono">{{ entry.tool.name }}</span>
+                      <span class="detail-value mono">{{ detail.tool.name }}</span>
                     </div>
-                    @if (entry.tool.arguments) {
+                    @if (detail.tool.arguments) {
                       <div class="detail-section">
                         <span class="detail-label">Arguments:</span>
-                        <pre class="detail-json">{{ formatJson(entry.tool.arguments) }}</pre>
+                        <pre class="detail-json">{{ formatJson(detail.tool.arguments) }}</pre>
+                      </div>
+                    } @else if (!isDetailLoaded(entry)) {
+                      <div class="detail-section">
+                        <span class="detail-label">Arguments:</span>
+                        <span class="detail-value pending">Loading details...</span>
                       </div>
                     }
-                    @if (entry.tool.success !== undefined && entry.tool.success !== null) {
+                    @if (detail.tool.success !== undefined && detail.tool.success !== null) {
                       <div class="detail-section">
                         <span class="detail-label">Status:</span>
-                        <span class="detail-value" [class.success]="entry.tool.success" [class.failure]="!entry.tool.success">
-                          {{ entry.tool.success ? 'Success' : 'Failed' }}
+                        <span class="detail-value" [class.success]="detail.tool.success" [class.failure]="!detail.tool.success">
+                          {{ detail.tool.success ? 'Success' : 'Failed' }}
                         </span>
                       </div>
-                    } @else if (isPending(entry)) {
+                    } @else if (isPending(detail)) {
                       <div class="detail-section">
                         <span class="detail-label">Status:</span>
                         <span class="detail-value pending">Executing...</span>
                       </div>
                     }
-                    @if (entry.tool.result_preview) {
+                    @if (detail.tool.result_preview) {
                       <div class="detail-section">
                         <span class="detail-label">Result:</span>
-                        <span class="detail-value result-preview">{{ entry.tool.result_preview }}</span>
+                        <span class="detail-value result-preview">{{ detail.tool.result_preview }}</span>
                       </div>
                     }
-                    @if (entry.tool.error) {
+                    @if (detail.tool.error) {
                       <div class="detail-section">
                         <span class="detail-label">Error:</span>
-                        <span class="detail-value error">{{ entry.tool.error }}</span>
+                        <span class="detail-value error">{{ detail.tool.error }}</span>
                       </div>
                     }
                   }
 
                   <!-- Check/Routing Details -->
-                  @if ((entry.step_type === 'check' || entry.step_type === 'routing' || entry.step_type === 'phase_complete')) {
-                    @if (getRoutingData(entry)) {
+                  @if ((detail.step_type === 'check' || detail.step_type === 'routing' || detail.step_type === 'phase_complete')) {
+                    @if (getRoutingData(detail)) {
                       <div class="detail-section">
                         <span class="detail-label">Decision:</span>
-                        <span class="detail-value mono">{{ formatJson(getRoutingData(entry)) }}</span>
+                        <span class="detail-value mono">{{ formatJson(getRoutingData(detail)) }}</span>
                       </div>
                     }
                   }
 
                   <!-- Error Details -->
-                  @if (entry.step_type === 'error' && entry.error) {
+                  @if (detail.step_type === 'error' && detail.error) {
                     <div class="detail-section">
                       <span class="detail-label">Type:</span>
-                      <span class="detail-value mono">{{ entry.error.type }}</span>
+                      <span class="detail-value mono">{{ detail.error.type }}</span>
                     </div>
                     <div class="detail-section">
                       <span class="detail-label">Message:</span>
-                      <span class="detail-value error">{{ entry.error.message }}</span>
+                      <span class="detail-value error">{{ detail.error.message }}</span>
                     </div>
-                    @if (entry.error.traceback) {
+                    @if (detail.error.traceback) {
                       <div class="detail-section">
                         <span class="detail-label">Traceback:</span>
-                        <pre class="detail-json error">{{ entry.error.traceback }}</pre>
+                        <pre class="detail-json error">{{ detail.error.traceback }}</pre>
+                      </div>
+                    } @else if (!isDetailLoaded(entry)) {
+                      <div class="detail-section">
+                        <span class="detail-label">Traceback:</span>
+                        <span class="detail-value pending">Loading details...</span>
                       </div>
                     }
                   }
 
                   <!-- Phase Info -->
-                  @if (entry.phase) {
+                  @if (detail.phase) {
                     <div class="detail-section">
                       <span class="detail-label">Phase:</span>
-                      <span class="detail-value">{{ entry.phase }}@if (entry.phase_number !== undefined) { ({{ entry.phase_number }})}</span>
+                      <span class="detail-value">{{ detail.phase }}@if (detail.phase_number !== undefined) { ({{ detail.phase_number }})}</span>
                     </div>
                   }
 
                   <!-- Iteration -->
                   <div class="detail-section">
                     <span class="detail-label">Iteration:</span>
-                    <span class="detail-value mono">{{ entry.iteration }}</span>
+                    <span class="detail-value mono">{{ detail.iteration }}</span>
                   </div>
                 </div>
               }
             </div>
           }
-        </div>
-      }
 
-      <!-- Position indicator (replaces pagination) -->
-      @if (data.totalAuditEntries() > 0) {
-        <div class="position-bar">
-          <span class="position-info">
-            Showing {{ entries().length }} of {{ data.totalAuditEntries() }} entries
-            (up to step #{{ data.sliderIndex() }})
-          </span>
-          <div class="position-controls">
-            <button class="pos-btn" (click)="data.seekToStart()" title="Jump to start">
-              &#x23EE;
+          <!-- Infinite-scroll footer -->
+          @if (trace.loadingMore()) {
+            <div class="load-more">
+              <app-spinner size="sm" tone="accent" />
+              <span>Loading more...</span>
+            </div>
+          } @else if (trace.hasMore()) {
+            <button class="load-more-btn" (click)="trace.loadMore()">
+              Load more ({{ trace.total() - trace.rows().length }} remaining)
             </button>
-            <button class="pos-btn" (click)="data.seekToEnd()" title="Jump to end">
-              &#x23ED;
-            </button>
-          </div>
+          }
         </div>
       }
     </div>
@@ -363,12 +368,6 @@ import {AppSpinnerComponent} from '../../../ui/spinner';
         justify-content: center;
         gap: 12px;
         z-index: 10;
-      }
-
-      .progress {
-        font-family: 'JetBrains Mono', monospace;
-        font-size: 12px;
-        color: var(--text-muted, #6c7086);
       }
 
       /* Error State */
@@ -591,40 +590,34 @@ import {AppSpinnerComponent} from '../../../ui/spinner';
         font-family: 'JetBrains Mono', monospace;
       }
 
-      /* Position Bar (replaces Pagination) */
-      .position-bar {
+      /* Infinite-scroll footer */
+      .load-more {
         display: flex;
         align-items: center;
-        justify-content: space-between;
-        padding: 8px 12px;
-        background: var(--surface-0, #313244);
-        border-top: 1px solid var(--border-color, #313244);
-        flex-shrink: 0;
-      }
-
-      .position-info {
+        justify-content: center;
+        gap: 8px;
+        padding: 12px;
         font-size: 12px;
         color: var(--text-muted, #6c7086);
       }
 
-      .position-controls {
-        display: flex;
-        gap: 8px;
-      }
-
-      .pos-btn {
-        padding: 4px 8px;
-        border: 1px solid var(--border-color, #313244);
+      .load-more-btn {
+        display: block;
+        width: 100%;
+        padding: 8px;
+        margin-top: 4px;
+        border: 1px solid var(--border-color, #45475a);
         border-radius: var(--radius-control);
         background: transparent;
         color: var(--text-secondary, #a6adc8);
-        font-size: 14px;
+        font-size: 11px;
+        font-family: inherit;
         cursor: pointer;
         transition: all 0.15s ease;
       }
 
-      .pos-btn:hover {
-        background: var(--panel-header-bg, #1e1e2e);
+      .load-more-btn:hover {
+        background: var(--surface-0, #313244);
         color: var(--text-primary, #cdd6f4);
       }
 
@@ -661,38 +654,21 @@ import {AppSpinnerComponent} from '../../../ui/spinner';
   ],
 })
 export class AgentActivityComponent {
-  readonly data = inject(DataService);
+  readonly trace = inject(AuditTraceService);
+  private readonly data = inject(DataService);
   private readonly requestService = inject(RequestService);
 
-  // Query all entry items for scrolling
-  readonly entryItems = viewChildren<ElementRef<HTMLElement>>('entryItem');
-
-  // Local expanded state (not part of DataService)
+  // Local expanded state (which rows are open) + which have had detail fetched.
   private readonly expandedIds = signal<Set<string>>(new Set());
-
-  // Reference to the entry list container for auto-scrolling
-  private readonly entryListRef = viewChild<ElementRef<HTMLDivElement>>('entryList');
-
-  // Track the previous entry count to detect when new entries are added
-  private previousEntryCount = 0;
+  private readonly detailLoadedIds = signal<Set<string>>(new Set());
 
   constructor() {
-    // Effect to auto-scroll when entries change
+    // Drive the trace off the loaded job. DataService.currentJobId is the signal
+    // the debug dashboard actually sets on selection (the timeline's dropdown ->
+    // data.setCurrentJob -> loadJob); jobContext.activeJobId is not populated here.
     effect(() => {
-      const entries = this.entries();
-      const currentCount = entries.length;
-      const entryList = this.entryListRef();
-
-      // Scroll to bottom when entries are added (count increased)
-      if (entryList && currentCount > this.previousEntryCount) {
-        // Use requestAnimationFrame to ensure DOM has updated
-        requestAnimationFrame(() => {
-          const el = entryList.nativeElement;
-          el.scrollTop = el.scrollHeight;
-        });
-      }
-
-      this.previousEntryCount = currentCount;
+      const jobId = this.data.currentJobId();
+      untracked(() => this.trace.setJob(jobId));
     });
   }
 
@@ -703,15 +679,13 @@ export class AgentActivityComponent {
     { label: 'Errors', value: 'errors' },
   ];
 
-  // Use DataService's visible entries (filtered by slider position and active filter)
-  readonly entries = computed(() => this.data.visibleAuditEntries());
-
-  // Entry count display
-  readonly entryCount = computed(() => {
-    const visible = this.entries().length;
-    const total = this.data.totalAuditEntries();
-    return `${visible}/${total}`;
-  });
+  /** Near the bottom → fetch the next page (infinite scroll). */
+  onScroll(event: Event): void {
+    const el = event.target as HTMLElement;
+    if (el.scrollHeight - el.scrollTop - el.clientHeight < 240) {
+      void this.trace.loadMore();
+    }
+  }
 
   // Step type color mapping (fallback for non-tool steps)
   private readonly stepColors: Record<AuditStepType, string> = {
@@ -796,7 +770,8 @@ export class AgentActivityComponent {
     error: 'ERROR',
   };
 
-  toggleExpanded(entryId: string): void {
+  toggleExpanded(entry: AuditEntry): void {
+    const entryId = entry._id;
     const current = this.expandedIds();
     const updated = new Set(current);
 
@@ -804,6 +779,10 @@ export class AgentActivityComponent {
       updated.delete(entryId);
     } else {
       updated.add(entryId);
+      // Lazy-load the heavy detail (arguments / traceback / state) on first open.
+      void this.trace.loadDetail(entry).then(() => {
+        this.detailLoadedIds.update((s) => new Set(s).add(entryId));
+      });
     }
 
     this.expandedIds.set(updated);
@@ -811,6 +790,10 @@ export class AgentActivityComponent {
 
   isExpanded(entryId: string): boolean {
     return this.expandedIds().has(entryId);
+  }
+
+  isDetailLoaded(entry: AuditEntry): boolean {
+    return this.detailLoadedIds().has(entry._id);
   }
 
   getStepColor(stepType: AuditStepType, entry?: AuditEntry): string {
@@ -926,9 +909,9 @@ export class AgentActivityComponent {
   getRoutingData(entry: AuditEntry): Record<string, unknown> | undefined {
     // Routing entries may have various fields - return any non-standard fields
     const known = new Set([
-      '_id', 'job_id', 'step_number', 'step_type', 'node_name', 'timestamp',
-      'latency_ms', 'iteration', 'phase', 'metadata', 'agent_type', 'llm',
-      'tool', 'error', 'state', 'started_at', 'completed_at'
+      '_id', 'id', 'job_id', 'step_number', 'step_type', 'node_name', 'timestamp',
+      'latency_ms', 'iteration', 'phase', 'phase_number', 'metadata', 'agent_type',
+      'llm', 'tool', 'error', 'state', 'started_at', 'completed_at',
     ]);
     const extra: Record<string, unknown> = {};
     for (const [key, value] of Object.entries(entry)) {

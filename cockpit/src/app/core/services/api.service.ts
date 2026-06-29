@@ -293,6 +293,66 @@ export class ApiService {
   }
 
   /**
+   * Lean, offset-paged audit page for the virtual-scroll trace view.
+   *
+   * Hits the same `/audit` endpoint as {@link getJobAudit} but with `lean=true`
+   * (server drops per-row metadata + heavy expand-only payload sub-keys) and
+   * offset/limit paging. Heavy detail is fetched on demand via
+   * {@link getAuditStep}. `limit` is capped server-side at 200.
+   */
+  getAuditPage(
+    jobId: string,
+    offset: number,
+    limit: number,
+    filter: AuditFilterCategory = 'all',
+  ): Observable<AuditResponse> {
+    const params = new HttpParams()
+      .set('offset', offset.toString())
+      .set('limit', limit.toString())
+      .set('filter', filter)
+      .set('lean', 'true');
+
+    return this.http
+      .get<AuditResponse>(`${this.baseUrl}/jobs/${jobId}/audit`, { params })
+      .pipe(
+        map((response) => {
+          response.entries?.forEach(normalizeAuditEntry);
+          return response;
+        }),
+        catchError((error) => {
+          console.error(`Failed to fetch audit page for job ${jobId}:`, error);
+          return of({
+            entries: [],
+            total: 0,
+            page: 1,
+            pageSize: limit,
+            hasMore: false,
+            error: error.message || 'Failed to fetch audit page',
+          });
+        }),
+      );
+  }
+
+  /**
+   * Full detail for a single audit step (heavy payload + metadata), lazy-loaded
+   * when a trace row is expanded. Returns null on failure.
+   */
+  getAuditStep(jobId: string, stepId: number | string): Observable<AuditEntry | null> {
+    return this.http
+      .get<AuditEntry>(`${this.baseUrl}/jobs/${jobId}/audit/step/${stepId}`)
+      .pipe(
+        map((entry) => {
+          if (entry) normalizeAuditEntry(entry);
+          return entry;
+        }),
+        catchError((error) => {
+          console.error(`Failed to fetch audit step ${stepId}:`, error);
+          return of(null);
+        }),
+      );
+  }
+
+  /**
    * Get a single LLM request by MongoDB document ID.
    */
   getRequest(docId: string): Observable<LLMRequest | null> {
