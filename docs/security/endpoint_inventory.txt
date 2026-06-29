@@ -114,11 +114,10 @@ PUT    /api/jobs/{job_id}/agent-release                                         
 POST   /api/jobs/{job_id}/approve                                                       gated:require_internal_or_job_access
 POST   /api/jobs/{job_id}/assign/{agent_id}                                             admin:_require_admin
 GET    /api/jobs/{job_id}/audit                                                         gated:require_job_access
-GET    /api/jobs/{job_id}/audit/bulk                                                    gated:require_job_access
+GET    /api/jobs/{job_id}/audit/step/{step_id}                                          gated:require_job_access
 GET    /api/jobs/{job_id}/audit/timerange                                               gated:require_job_access
 PUT    /api/jobs/{job_id}/cancel                                                        gated:require_internal_or_job_access
 GET    /api/jobs/{job_id}/chat                                                          gated:require_job_access
-GET    /api/jobs/{job_id}/chat/bulk                                                     gated:require_job_access
 GET    /api/jobs/{job_id}/citations                                                     gated:require_job_access
 GET    /api/jobs/{job_id}/citations/stats                                               gated:require_job_access
 POST   /api/jobs/{job_id}/complete                                                      internal:require_internal
@@ -128,7 +127,6 @@ GET    /api/jobs/{job_id}/diff/{file_path:path}                                 
 POST   /api/jobs/{job_id}/ensure-workspace-access                                       gated:require_approved_user
 POST   /api/jobs/{job_id}/export-to-shared-folder                                       gated:require_job_access
 GET    /api/jobs/{job_id}/frozen                                                        gated:require_job_access
-GET    /api/jobs/{job_id}/graph/bulk                                                    gated:require_job_access
 DELETE /api/jobs/{job_id}/ide                                                           gated:require_job_access
 GET    /api/jobs/{job_id}/ide                                                           gated:require_job_access
 POST   /api/jobs/{job_id}/ide                                                           gated:require_job_access
