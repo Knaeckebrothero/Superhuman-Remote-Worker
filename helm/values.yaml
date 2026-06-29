@@ -951,6 +951,16 @@ workspace:
   accessMode: "ReadWriteMany"
   # -- Storage class for ephemeral per-job workspace PVCs
   ephemeralStorageClass: ""
+  # -- PVC-backed job workspaces (Branch a). When true, each job workspace gets
+  # a PVC named by its job UUID so on-disk files survive pod crashes and
+  # reattach by name on recreate; the PVC is reclaimed on terminal job states
+  # (completed/failed/cancelled) and retained across suspend/restore. Sessions
+  # stay emptyDir. Default off → emptyDir (today's behavior). Mixed fleets are
+  # safe — the reaper reads each pod's actual volume mode — so this is a rolling
+  # flip, not a cutover. See docs/features/workspace_pvc_branch_a_implementation.md.
+  pvcEnabled: false
+  # -- Size of each per-job workspace PVC (only used when pvcEnabled).
+  pvcSize: "10Gi"
   # -- NetworkPolicy restricting workspace traffic. Covers BOTH container
   # workspaces and same-cluster KubeVirt VM workspaces (selector
   # srw.io/component=agent-workspace matches both). Disabling removes the

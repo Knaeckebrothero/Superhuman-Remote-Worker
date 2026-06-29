@@ -338,3 +338,41 @@ async def test_stateful_non_reapable_drifted_idle_snapshots_then_drains():
     assert mgr.order == ["snapshot", "drain"]
     assert report["vm"]["drained"] == 1
     assert report["vm"]["reaped"] == 0
+
+
+# =============================================================================
+# Once-per-tick orphan sweep hook (Branch a: backstop PVC GC)
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_reap_orphans_hook_called_once_and_recorded():
+    """A manager exposing reap_orphans() is swept once per tick; its count
+    lands in the per-kind stats."""
+    mgr = _stateful_mgr(_inst(), dirty=False)
+    mgr.reap_orphans = AsyncMock(return_value=2)
+    rec = InstanceLifecycleReconciler([mgr])
+    report = await rec.tick()
+    mgr.reap_orphans.assert_awaited_once()
+    assert report["workspace"]["orphans_reaped"] == 2
+
+
+@pytest.mark.asyncio
+async def test_reap_orphans_absent_is_skipped():
+    """A manager without the optional method must not break the tick."""
+    mgr = _stateful_mgr(_inst(), dirty=False)
+    assert not hasattr(mgr, "reap_orphans")  # spec=ReapableInstanceManager
+    rec = InstanceLifecycleReconciler([mgr])
+    report = await rec.tick()
+    assert report["workspace"]["orphans_reaped"] == 0
+
+
+@pytest.mark.asyncio
+async def test_reap_orphans_failure_does_not_break_tick():
+    """A raising orphan sweep is swallowed; the rest of the tick still reports."""
+    mgr = _stateful_mgr(_inst(), dirty=False)
+    mgr.reap_orphans = AsyncMock(side_effect=RuntimeError("boom"))
+    rec = InstanceLifecycleReconciler([mgr])
+    report = await rec.tick()
+    assert report["workspace"]["orphans_reaped"] == 0
+    assert report["workspace"]["reaped"] == 1  # clean reapable still torn down
