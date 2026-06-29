@@ -474,6 +474,11 @@ class WorkspaceInstanceManager:
                 )
             except Exception:
                 logger.exception("Failed to delete terminal PVC for %s", inst.id)
+            # The stable-DNS Service shares the PVC's lifecycle — reclaim it too.
+            try:
+                await self._provisioner._delete_service(owner)
+            except Exception:
+                logger.exception("Failed to delete terminal Service for %s", inst.id)
 
     async def reap_orphans(self) -> int:
         """Backstop GC: delete job workspace PVCs whose job is terminal or gone.
@@ -552,6 +557,12 @@ class WorkspaceInstanceManager:
                     )
             except Exception:
                 logger.exception("Orphan PVC delete failed: %s", name)
+            # Reclaim the stable-DNS Service for the same orphan (shares the PVC
+            # lifecycle). The Service name == the workspace pod name.
+            try:
+                await self._provisioner._delete_service(WorkspaceOwner.job(job_id))
+            except Exception:
+                logger.exception("Orphan Service delete failed for job %s", job_id)
         if reaped:
             logger.warning(
                 "Orphan PVC sweep reclaimed %d workspace PVC(s) — inline "
