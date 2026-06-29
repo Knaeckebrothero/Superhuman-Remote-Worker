@@ -1,6 +1,6 @@
 # Debug audit view refactor — from "download the whole job" to a windowed trace inspector
 
-**Status:** **Proposed — design + implementation roadmap.** 2026-06-29. **Slider + synchronized replay: decided — removed entirely (owner: demo-only).** The crash that motivated this is tracked + root-caused in the companion issue `docs/issues/audit_metadata_config_duplication_ooms_orchestrator.md` (the write-side OOM fix is **Phase 0** here). The key enabler: most of the server-side primitives this refactor needs **already exist** (`get_job_audit` is paged + filtered, `get_request` is lazy-detail, `iter_tool_calls` is keyset) — so this is largely a **frontend deletion + one lean projection**, not a rewrite.
+**Status:** **Proposed — design + implementation roadmap.** 2026-06-29. **Slider + synchronized replay: decided — removed entirely (owner: demo-only).** **Phase 0 ✅ committed (`7ea0d798`); Phase 1 (lean projection + `/audit/step/{id}` + `?lean=`) ✅ done + k3d-verified, uncommitted.** The crash that motivated this is tracked + root-caused in the companion issue `docs/issues/audit_metadata_config_duplication_ooms_orchestrator.md` (the write-side OOM fix is **Phase 0** here). The key enabler: most of the server-side primitives this refactor needs **already exist** (`get_job_audit` is paged + filtered, `get_request` is lazy-detail, `iter_tool_calls` is keyset) — so this is largely a **frontend deletion + one lean projection**, not a rewrite.
 **Component:** Cockpit debug dashboard (`cockpit/src/app/debug/**`, `cockpit/src/app/core/services/data.service.ts`, `indexed-db.service.ts`, `api.service.ts`) · audit read path (`orchestrator/database/audit_store.py`, `orchestrator/main.py` `/api/jobs/{id}/audit*`).
 **Related:** `docs/issues/audit_metadata_config_duplication_ooms_orchestrator.md` (P0 root cause) · memory topics `project_self_improvement_loop`, `project_loop_repo_compounding` (loop jobs run the most steps → most exposed) · `project_cross_pod_checkpointer_d3` (separate checkpoint-blob bloat).
 
@@ -116,14 +116,14 @@ What stays: the existing **lazy cross-link** — clicking a step's `request_id` 
 
 Sequenced so value lands early and risk stays low. Each phase is independently shippable and **verified locally on k3d before commit** (per `CLAUDE.md` Plan→Develop→Verify gate).
 
-### Phase 0 — Stop the bleeding (backend; ships alone) — *detailed in the companion issue*
+### Phase 0 — Stop the bleeding (backend; ships alone) — *detailed in the companion issue* ✅ committed `7ea0d798`
 
 Write-side fix from `docs/issues/audit_metadata_config_duplication_ooms_orchestrator.md`: stop persisting heavy job-level blobs (`resolved_config`, `config_override`, `datasources`, `repositories`) into per-row audit `metadata`; backfill existing partitions. This alone stops the crash and makes every job ~400× lighter, **with the current UI untouched** — so it is the immediate unblock and a hard prerequisite for nothing else (the UI refactor can proceed in parallel).
 
 - **Files:** `src/api/dual_app.py` (+ mirror `src/api/app.py`) metadata build; backfill SQL per live partition.
 - **Acceptance:** `GET /api/jobs/19707fa1/audit/bulk?limit=5000` returns < 5 MB (was ~½ GB); orchestrator RSS stays flat; no OOM; the existing dashboard opens the 6k job.
 
-### Phase 1 — Lean projection + per-step detail (backend)
+### Phase 1 — Lean projection + per-step detail (backend) ✅ done + k3d-verified (uncommitted)
 
 1. **Lean list projection** — add `_STITCH_LEAN` (or a `detail: bool = False` arg threaded through `get_job_audit`) that selects only render columns and projects a small payload (tool name/success, model, request_id, error type + truncated message, bounded previews) — **excluding** `metadata`, `tool.arguments`, `error.traceback`, `state`, full content. Keep the existing fat path as the non-default so MCP `get_audit_trail` and any other `get_job_audit` callers are unchanged.
 2. **Per-step detail endpoint** — `GET /api/jobs/{id}/audit/{step_id}` → the full stitched doc for one step (heavy is fine for a single row). Backed by a `get_audit_step(job_id, step_id)` reusing `_STITCH_CORE` with `WHERE f.id = $2`.

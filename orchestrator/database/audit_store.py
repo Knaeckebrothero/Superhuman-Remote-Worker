@@ -78,20 +78,24 @@ async def _init_connection(conn: asyncpg.Connection) -> None:
     )
 
 
-# Logical-row SELECT: number all pre rows (for step_number), overlay the latest
-# post row, and merge payloads two levels deep (jsonb || is shallow, so the
-# 'tool'/'llm' subobjects are re-merged explicitly). Callers append
-# WHERE/ORDER/OFFSET/LIMIT; $1 is always job_id.
-_STITCH_CORE = """
+# Logical-row SELECT building blocks. ``_STITCH_CORE`` numbers all pre rows (for
+# step_number), overlays the latest post row, and merges payloads two levels deep
+# (jsonb || is shallow, so the 'tool'/'llm' subobjects are re-merged explicitly).
+# ``_STITCH_LEAN`` is the list/timeline projection: identical column shape (so the
+# same ``_audit_row_to_doc`` handles both) but NULLs the boot-only ``metadata``
+# blob (never rendered) and drops the expand-only heavy payload sub-keys (tool
+# arguments, error traceback, state snapshot) so a page stays small even when a
+# step wrote a big file or a long stack trace; the detail view fetches the full
+# row via ``get_audit_step``. Composed from shared parts so the two can't drift.
+# Callers append WHERE/ORDER/OFFSET/LIMIT referencing alias ``f``; $1 is job_id.
+_STITCH_NUMBERED = """
 WITH numbered AS (
     SELECT a.*, ROW_NUMBER() OVER (ORDER BY a.id) AS step_number
     FROM agent_audit a
     WHERE a.job_id = $1::uuid AND a.event_phase = 'pre'
-)
-SELECT f.id, f.job_id, f.agent_type, f.iteration, f.step_type, f.node_name,
-       f.phase, f.phase_number, f.timestamp, f.metadata, f.step_number,
-       COALESCE(p.latency_ms, f.latency_ms) AS latency_ms,
-       (
+)"""
+
+_STITCH_MERGED_PAYLOAD = """(
          f.payload || COALESCE(p.payload, '{}'::jsonb)
          || CASE WHEN p.payload ? 'tool'
                  THEN jsonb_build_object(
@@ -101,7 +105,9 @@ SELECT f.id, f.job_id, f.agent_type, f.iteration, f.step_type, f.node_name,
                  THEN jsonb_build_object(
                      'llm', COALESCE(f.payload->'llm', '{}'::jsonb) || (p.payload->'llm'))
                  ELSE '{}'::jsonb END
-       ) AS payload
+       )"""
+
+_STITCH_FROM = """
 FROM numbered f
 LEFT JOIN LATERAL (
     SELECT post.payload, post.latency_ms
@@ -110,6 +116,21 @@ LEFT JOIN LATERAL (
     ORDER BY post.id DESC LIMIT 1
 ) p ON TRUE
 """
+
+_STITCH_CORE = f"""{_STITCH_NUMBERED}
+SELECT f.id, f.job_id, f.agent_type, f.iteration, f.step_type, f.node_name,
+       f.phase, f.phase_number, f.timestamp, f.metadata, f.step_number,
+       COALESCE(p.latency_ms, f.latency_ms) AS latency_ms,
+       {_STITCH_MERGED_PAYLOAD} AS payload
+{_STITCH_FROM}"""
+
+# List/timeline projection: no metadata, heavy expand-only sub-keys removed.
+_STITCH_LEAN = f"""{_STITCH_NUMBERED}
+SELECT f.id, f.job_id, f.agent_type, f.iteration, f.step_type, f.node_name,
+       f.phase, f.phase_number, f.timestamp, NULL::jsonb AS metadata, f.step_number,
+       COALESCE(p.latency_ms, f.latency_ms) AS latency_ms,
+       {_STITCH_MERGED_PAYLOAD} #- '{{state}}' #- '{{tool,arguments}}' #- '{{error,traceback}}' AS payload
+{_STITCH_FROM}"""
 
 
 def _audit_row_to_doc(r: asyncpg.Record) -> Dict[str, Any]:
@@ -210,6 +231,7 @@ class AuditStore:
         offset: Optional[int] = None,
         limit: Optional[int] = None,
         order: Literal["asc", "desc"] = "asc",
+        lean: bool = False,
     ) -> Dict[str, Any]:
         effective_size = limit if limit is not None else page_size
         empty = {
@@ -255,10 +277,11 @@ class AuditStore:
 
                 has_more = (effective_skip + effective_size) < total
                 order_sql = "ASC" if order == "asc" else "DESC"
+                core = _STITCH_LEAN if lean else _STITCH_CORE
 
                 if step_types:
                     sql = (
-                        _STITCH_CORE
+                        core
                         + f" WHERE f.step_type = ANY($2) ORDER BY f.id {order_sql} "
                         "OFFSET $3 LIMIT $4"
                     )
@@ -266,9 +289,7 @@ class AuditStore:
                         sql, job_id, step_types, effective_skip, effective_size
                     )
                 else:
-                    sql = (
-                        _STITCH_CORE + f" ORDER BY f.id {order_sql} OFFSET $2 LIMIT $3"
-                    )
+                    sql = core + f" ORDER BY f.id {order_sql} OFFSET $2 LIMIT $3"
                     rows = await conn.fetch(sql, job_id, effective_skip, effective_size)
 
             entries = [_audit_row_to_doc(r) for r in rows]
@@ -287,6 +308,27 @@ class AuditStore:
         except Exception as e:
             logger.warning(f"get_job_audit failed: {e}")
             return empty
+
+    async def get_audit_step(
+        self, job_id: str, step_id: int
+    ) -> Optional[Dict[str, Any]]:
+        """Full stitched doc for one audit step (by ``agent_audit.id``).
+
+        For the detail/expand view: includes the heavy payload + metadata that the
+        lean list projection drops. One row, so the size is fine. Returns ``None``
+        if the store is unavailable or ``step_id`` isn't a pre row of this job.
+        """
+        if not self._available or self._pool is None:
+            return None
+        try:
+            async with self._pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    _STITCH_CORE + " WHERE f.id = $2 LIMIT 1", job_id, int(step_id)
+                )
+            return _audit_row_to_doc(row) if row else None
+        except Exception as e:
+            logger.warning(f"get_audit_step failed: {e}")
+            return None
 
     async def get_audit_count(self, job_id: str) -> int:
         if not self._available or self._pool is None:
