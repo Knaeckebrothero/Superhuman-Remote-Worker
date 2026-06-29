@@ -280,41 +280,16 @@ export class DataService {
    */
   async loadJob(jobId: string): Promise<void> {
     if (jobId === this._currentJobId()) {
-      return; // Already loaded
+      return; // Already selected
     }
-
+    // The audit + chat streams now load lazily via their own paged trace
+    // services (AuditTraceService / ChatTraceService), driven by currentJobId;
+    // graph loads via GraphService. Nothing is eagerly downloaded here anymore —
+    // that bulk path ("/audit/bulk?limit=5000" et al.) OOM'd the orchestrator on
+    // large jobs and 504'd every stream. See
+    // docs/features/debug_audit_view_refactor.md (Phase 2c / P3).
     this._currentJobId.set(jobId);
-    this.isLoading.set(true);
-    this.loadingProgress.set(0);
     this.error.set(null);
-
-    try {
-      // Check if we have cached data
-      const metadata = await this.db.getJobMetadata(jobId);
-      const versionInfo = await firstValueFrom(this.api.getJobVersion(jobId));
-
-      const isCacheValid =
-        metadata && versionInfo && metadata.auditEntryCount === versionInfo.auditEntryCount;
-
-      if (isCacheValid) {
-        // Use cached data
-        this.isCached.set(true);
-        this.cacheMetadata.set(metadata);
-        this._maxIndex.set(metadata.auditEntryCount - 1);
-
-        // Load window at the end (most recent entries)
-        await this.loadWindow(metadata.auditEntryCount - 1);
-        this._sliderIndex.set(metadata.auditEntryCount - 1);
-      } else {
-        // Fetch from API and cache
-        this.isCached.set(false);
-        await this.fetchAndCacheJob(jobId);
-      }
-    } catch (err) {
-      this.error.set(err instanceof Error ? err.message : 'Failed to load job');
-    } finally {
-      this.isLoading.set(false);
-    }
   }
 
   /**
