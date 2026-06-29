@@ -36,7 +36,7 @@ The original draft said "no implementation yet." That is no longer true, and the
 | **Layer 1** leader election for singleton loops | not started | **M1 COMPLETE (2026-06-26) — `replicas:2` is correctness-safe, live-verified on dev, and now the chart default** | `services/leader_election.py` (single session-scoped lock + `run_when_leader`), lifespan loop-gating, dispatcher CAS claim, Postgres keepalive tuning, **and Task 5 defense-in-depth** (imap claim-table, delegation/digest/notify DB guards) — **pushed to `origin/develop` (2026-06-26)**, **16 PostgresContainer tests green**. **Two-replica failover verified on local k3d** (one leader, gated loops leader-only, failover ×2, graceful step-down) — the run also caught + fixed a deploy-blocking flattened-image import bug (`from orchestrator.…` → top-level imports). Verification: `docs/tests/orchestrator_m1_leader_election_verification.md`. **DONE 2026-06-26:** live (dev) two-replica run PASSED (graceful + hard kill, zero blackout, in-flight job survived; 2 runtime bugs found + fixed) and the chart default was flipped to `replicas: 2`. |
 | **Layer 2** DB-level dispatch (`SKIP LOCKED`) | not started | **PATTERN PROVEN, dispatcher not ported** | `cron_dispatcher` is a complete, documented multi-replica-safe `SKIP LOCKED` queue. Job dispatch still uses the in-process `_dispatch_lock`. `thread_advisory_lock` already covers per-thread serialization. |
 | **Layer 3** cross-replica fan-out (`LISTEN/NOTIFY`) | not started | **TRANSPORT SHIPPED + WS problem evaporated** | `notify_channel()` helper + a reconnecting `LISTEN` loop ship for cloud-config reload. The WS half is moot: `persistent_ws_proxy` is gone (direct-to-agent-pod), stream is `thread_events` SSE. Remaining: DB-back the 2 SSE channels + drop `_pending_msgs`. |
-| **Layer 4** NATS queue groups | not started | **GREENFIELD but trivial** | No `queue=` on any subscription. Subjects are now `orchestratorId`-scoped (separates installs, not replicas). |
+| **Layer 4** NATS handler replica-safety | not started | **SHIPPED (M2-L4, 2026-06-28) — NOT via queue groups; live-verified on dev** | Per-subject fix: `sudo.request` insert-as-claim (migration 0040) + daemon-`register` leader-gate; blanket queue groups rejected (4 of 6 subjects need fan-out). Plus the background-loop sweep (2026-06-29) → no known double-fire path under `replicas: 2`. |
 | **Data tier** prerequisite (Postgres/NATS HA) | out of scope here | **NOT STARTED** (see [[high_availability_setup]]) | NATS single-replica with clustering *explicitly disabled*; no CloudNativePG. |
 
 **The practical read:** for the open-source "scales from a mini-PC to a thousand-agent cluster" claim, the critical path is (1) ship Track 1 so a single replica survives its own eviction (~1 week, no new primitives), then (2) build the leader-election helper and wrap the loops — that alone makes `replicas: 2` *correct*, reusing the proven patterns for the rest. The scary-sounding parts (WS coordination, dispatch races) are largely already solved.
@@ -70,7 +70,7 @@ The non-obvious relationship: **M1 alone makes the orchestrator HA for failover*
 |---|---|---|---|---|---|
 | **M0** | Active-passive hardening (Track 1) | Bounded, tested ~15-30s failover on eviction; backs the "survives node drain / image roll / OOM" claim. Stays `replicas: 1`. | drain discipline (umbrella doc — operational, zero-cost) | ~1 week (mostly chaos-testing) | Phase 0 |
 | **M1** | Leader election (Layer 1) | **`replicas: 2` becomes correctness-safe → orchestrator is no longer a hard SPOF.** Zero REST/SSE blackout on eviction (peers stay up); singleton loops fail over in ~30s. Works over single Postgres. | none (ship after M0 for the cheap win first) | ~3-5 days + tests | Phase 1 |
-| **M2** | Active-active scale-out (Layers 2-4) | Horizontal CPU/connection scale per orchestrator; removes residual cross-replica UX divergence + double-work. Mostly porting patterns already proven in-repo (cron `SKIP LOCKED`, `notify_channel`). | M1 | ~1-1.5 weeks | Phases 2-4 |
+| **M2** | Active-active scale-out (Layers 2-4) | Horizontal CPU/connection scale per orchestrator; removes residual cross-replica UX divergence + double-work. Mostly porting patterns already proven in-repo (cron `SKIP LOCKED`, `notify_channel`). | M1 | ~1-1.5 weeks | Phases 2-4 (L4 + loop-sweep SHIPPED 2026-06-28/29; L2/L3 deferred) |
 | **M3** | Data-tier HA | Removes the Postgres/NATS SPOFs → meaningful end-to-end HA + headroom for active-active at scale. | independent of M0-M2 (run in parallel); **required before the "thousand-agent cluster" claim is honest** | NATS ~2-3 days; Postgres→CloudNativePG ~1-2 weeks incl. migration | [[high_availability_setup]] P1-P2 |
 | **M4** | Operational polish (Phase 5) | DB-aware probes, NOTIFY-on-insert dispatch wake; flip `orchestrator.replicas: 2`, watch a deploy cycle, declare done. | M1-M3 | ~2-3 days | Phase 5 |
 
@@ -78,7 +78,7 @@ The non-obvious relationship: **M1 alone makes the orchestrator HA for failover*
 
 - **Minimum honest "HA orchestrator" claim = M0 + M1 + the NATS-cluster slice of M3.** A single replica failure is tolerated, `replicas: 2` is safe, and the coordination plane isn't a SPOF. Postgres HA can be a *documented bring-your-own posture* rather than shipped code: the chart already supports pointing at an external/managed Postgres (`databases.*.externalHost`), so "use managed/HA Postgres in production" is a legitimate OSS stance consistent with this doc's "Database HA out of scope" decision — and the cheapest path to making the claim true.
 - **Full "mini-PC → thousand-agent cluster" claim = + M2 + the CloudNativePG slice of M3.** Horizontal scale per orchestrator *and* batteries-included data-tier HA for self-hosters who don't bring their own managed Postgres.
-- **Hard blocker — RESOLVED (M1, on `origin/develop` 2026-06-26; k3d-verified):** the chart now ships `replicas: 2` as the default (flipped 2026-06-26). The correctness bugs that made `replicas: 2` unsafe (dispatch double-assign, IMAP double-poll, and the other non-idempotent loops) are leader-gated + DB-guarded, and the two-replica election/failover wiring is verified on local k3d AND live on dev. `replicas: 2` is correctness-safe and graceful-failover-safe; the live (dev) two-replica failover run PASSED and the default count is flipped (Phase 5 / M4) — README/marketing may now imply a multi-replica orchestrator.
+- **Hard blocker — RESOLVED (M1, on `origin/develop` 2026-06-26; k3d-verified):** the chart now ships `replicas: 2` as the default (flipped 2026-06-26). The correctness bugs that made `replicas: 2` unsafe (dispatch double-assign, IMAP double-poll, and the other non-idempotent loops) are leader-gated + DB-guarded, and the two-replica election/failover wiring is verified on local k3d AND live on dev. `replicas: 2` is correctness-safe and graceful-failover-safe; the live (dev) two-replica failover run PASSED and the default count is flipped (Phase 5 / M4) — README/marketing may now imply a multi-replica orchestrator. **Update (2026-06-28/29):** M2-L4 (NATS handler replica-safety, live-verified on dev) + the systematic background-loop sweep (k3d-verified, dev deploy pending) closed the remaining NATS-fan-out and background-loop double-fire paths → **no known double-fire path remains under `replicas: 2`.**
 
 ## Motivation
 
@@ -122,7 +122,7 @@ The DB layer is fine — migrations coordinate via `pg_advisory_xact_lock` (`orc
 | `notification_feed._user_queues: dict[user_id, list[Queue]]` | `services/notification_feed.py:23`; SSE endpoint `main.py:7304` | SSE clients on replica B don't receive events emitted on replica A. **New consumer:** `session.lifecycle` startup-progress events now ride this same channel (`services/session_lifecycle.py:38`), so the session-startup card stalls cross-replica too. |
 | `sudo_gate._sse_queues: list[Queue]` | `services/sudo_gate.py:35`; SSE endpoint `main.py:7521` | Same problem for the sudo-approval admin stream. |
 | `nats_bridge._thread_vm_ids: set[str]` | `services/nats_bridge.py:82` (populated `:246`, read `:437`/`:441`/`:467`/`:562`/`:567`) | Thread-vs-job routing memory; populated only on the replica that called `request_vm_create`. A VM-lifecycle message handled by a different replica mis-routes context to the jobs table instead of threads. |
-| NATS subscriptions without queue groups | `services/nats_bridge.py:163-192` (six subjects) | No `queue=` on any subscription → every replica receives every message and runs the handler. Subjects are now `orchestratorId`-scoped (`_subj`, `nats_bridge.py:98`), which separates distinct *installs*, not *replicas* of one install. |
+| NATS subscriptions without queue groups — **RESOLVED (M2-L4, 2026-06-28)** | `services/nats_bridge.py:163-192` (six subjects) | Every replica receives every message (no `queue=`). **Fixed per-subject:** the 2 harmful handlers are deduped (`sudo.request` insert-as-claim, `register` leader-gate); the other 4 *need* fan-out. Blanket queue groups rejected — see Layer 4 / Phase 4. |
 | Admin "reload" caches (`_experts_cache` `main.py:17763`, `_skills_cache` `main.py:18126`, `_settings_matrix_cache` `main.py:17829`) | per-process, busted via `POST .../reload` | A reload endpoint only busts the cache on the replica that served the request; other replicas serve stale catalogs until restart. Fan-out via NOTIFY (Layer 3) or they look broken at 2+. |
 
 ### Already safe (no action needed)
@@ -133,11 +133,11 @@ The DB layer is fine — migrations coordinate via `pg_advisory_xact_lock` (`orc
 - **`_threads_suspending: set[str]`** `main.py:3347` — de-dupes concurrent suspend triggers; small cross-replica double-suspend window, low blast radius. Worth one line in the eventual leader-election pass.
 - **Per-service caches/locks** — `_pending_actions_cache` (5s TTL, `main.py:7100`), OpenCloud token/role caches, TTS single-flight locks, HTTP client pools. All correctly per-process.
 
-### Background loops — double-fire audit (regenerated)
+### Background loops — double-fire audit — SWEPT + CLOSED (2026-06-29)
 
-The lifespan handler is now at `main.py:4866`; task registrations run `main.py:5191-5323` (shutdown awaits `5329-5355`), starting **27** long-lived tasks. The encouraging delta: **new loops were largely built HA-aware.**
+A **systematic** replica-safety sweep of all background loops landed 2026-06-29 — full ledger + cited evidence in `docs/tests/orchestrator_ha_background_loop_sweep.md`. The lifespan starts **28** long-lived tasks; the sweep classified each as leader-gated, claim/CAS-guarded, idempotent, or fan-out-by-design. **Result: no known double-fire path remains under `replicas: 2`** (M1 + M2-L4 + this sweep). The sweep also corrected two misclassifications in the hand audit below.
 
-**Still double-fire (need Layer 1 leader election):**
+**Were double-firing → all eight leader-gated in M1 (DONE, `run_when_leader`; Task 5 also added resource-level claims as dual-leader-window defense):**
 
 | Loop | Where | Harm |
 |---|---|---|
@@ -150,7 +150,9 @@ The lifespan handler is now at `main.py:4866`; task registrations run `main.py:5
 | `lifecycle_reconciler_loop` | `main.py:702` (60s; managers `:5280-5314`) | Double drift-detect / double-drain. |
 | `thread_permission_notify_sweeper` | `main.py:16941` (30s) | Tight double-send window for permission emails (smaller IMAP-shaped race). |
 
-**Idempotent / noisy-but-safe** (wrap for log clarity, not correctness): `workspace_idle_sweeper` (`main.py:779`, now reconcile-only), `snapshot_gc_sweeper` (`main.py:906`), `sudo_expiration_sweeper` (`main.py:730`), `thread_events_prune_sweeper` (`main.py:16342`), `quota_poll_loop` (`main.py:1376`, freeze writes idempotent), `litellm_sync_loop` (`litellm_gateway.py:984`), `code_server_settings_sweeper` (`main.py:818`), `ide_session_ttl_sweeper` (`main.py:754`), `attention_sleep_sweeper` (`main.py:17062`, CAS-guarded), `security_events_prune_sweeper` (`main.py:16394`), `cleanup_expired_tokens` (`main.py:5192`), `cleanup_expired_sessions` (`main.py:5195`).
+**Sweep CORRECTION — two loops this hand audit wrongly called safe, now leader-gated (2026-06-29, k3d-verified):** `attention_sleep_sweeper` — was listed "CAS-guarded", but the CAS runs *after* `capture_vm_snapshot`+teardown; the only pre-side-effect gate is a non-atomic `ready→suspending` TOCTOU (`merge_thread_workspace_context` = bare `UPDATE … WHERE id`), so two replicas double-snapshot to the same per-thread S3 key + race teardown (**harmful** — wedged workspace via the failed-snapshot revert). `ide_session_ttl_sweeper` — was listed idempotent, but it's `SELECT idle → delete VM/pod` with no claim (wasteful + thin ABA hazard, not harmful). Both now `run_when_leader`, mirroring the lifecycle reconciler that already owns the parallel idle-teardown path.
+
+**Confirmed genuinely safe by the sweep (no gate needed):** the set-based `DELETE` prunes (`cleanup_expired_tokens`/`cleanup_expired_sessions`, `thread_events_prune_sweeper`, `security_events_prune_sweeper`); `sudo_expiration_sweeper` (claims each row `WHERE status='pending' RETURNING` before its NATS deny reply); convergent loops (`workspace_idle_sweeper` now reconcile-only, `snapshot_gc_sweeper` S3-idempotent, `litellm_sync_loop` drift-gated, `code_server_settings_sweeper` newest-wins). `quota_poll_loop` is leader-gated.
 
 **Already HA-safe by construction** (the proof that the patterns work in-repo):
 
@@ -295,9 +297,11 @@ The instance-local queues (`notification_feed._user_queues`, `sudo_gate._sse_que
 
 `LISTEN/NOTIFY` scaling caveat (from [[headless_persistent_sessions]]): don't use it for high-volume streams. Fine for these channels (a few hundred sudo prompts/day, a few thousand notifications/user/day). The hot path (`thread_events`) is already DB-write + agent-pod, not orchestrator fan-out.
 
-### Layer 4: NATS queue groups — GREENFIELD but trivial
+### Layer 4: NATS queue groups — SUPERSEDED by M2-L4 (queue groups REJECTED)
 
-Each broadcast subscription in `nats_bridge.py:163-192` becomes a queue-group subscription so exactly one replica receives each message:
+> **As-built (Phase 4, 2026-06-28): blanket queue groups were rejected.** Per-subject analysis showed 4 of the 6 subjects *need* fan-out (per-replica in-process effects) or the leader; only `sudo.request` (insert-as-claim) and daemon-`register` (leader-gate) were harmful. See Phase 4 + the M2-L4 design doc. The original queue-group sketch is kept below for context.
+
+The original plan: each broadcast subscription in `nats_bridge.py:163-192` becomes a queue-group subscription so exactly one replica receives each message:
 
 ```python
 await nc.subscribe(self._subj("vm.lifecycle.status"), queue="orchestrator", cb=handle_status)
@@ -314,7 +318,7 @@ All six subjects (`vm.lifecycle.status`, `agent.vm.*.register/heartbeat/status`,
 | Per-turn / per-thread serialization | `thread_advisory_lock` or a DB column | **Shipped** for provisioning; extend to per-turn |
 | Cross-replica fan-out (low volume) | `LISTEN/NOTIFY` + `notify_channel()` | **Transport shipped**; generalize channels |
 | Cross-replica fan-out (high volume) | DB write + agent-pod (`thread_events` SSE) | **Shipped** |
-| One-message-one-consumer (NATS) | Queue groups | **Greenfield**, one line per subscription |
+| One-message-one-consumer (NATS) | Per-subject: leader-gate (`register`) / insert-as-claim (`sudo`) — blanket queue groups **rejected** | **Shipped (M2-L4, 2026-06-28)** |
 
 Still nothing exotic: Postgres + NATS only. No Redis, etcd, Zookeeper, Temporal.
 
@@ -385,10 +389,18 @@ Each phase independently shippable, ordered so each improves posture even if the
 - [ ] (Already done: SSE reads `thread_events` from DB — no work.)
 - [ ] Tests: emit on replica A → SSE client on replica B receives; resolve sudo via REST on replica B → NATS-bound agent gets the decision.
 
-### Phase 4 — Track 2 Layer 4: NATS queue groups — GREENFIELD/TRIVIAL
-- [ ] Add `queue="orchestrator"` to the six subscriptions in `nats_bridge.py:163-192`.
-- [ ] Remove `_thread_vm_ids`; replace with a Postgres lookup per message.
-- [ ] Tests: two replicas on NATS; publish a status message; exactly one processes it.
+### Phase 4 — Track 2 Layer 4: NATS handler replica-safety — SHIPPED 2026-06-28 (NOT queue groups; plan `docs/superpowers/plans/2026-06-28-orchestrator-m2-l4-nats-replica-safety.md`, verification `docs/tests/orchestrator_m2_l4_nats_replica_safety_verification.md`, design `docs/superpowers/specs/2026-06-28-orchestrator-m2-l4-nats-replica-safety-design.md`)
+- [x] **Blanket queue groups REJECTED.** Of the six fan-out subjects only two were harmful under `replicas: 2`; the other four *need* fan-out (per-replica in-process effects) or the leader — so `queue="orchestrator"` everywhere would have *broken* delivery (register's dispatch poke is leader-gated; the sudo SSE prompt + `session.events` are per-replica). Fix = M1 primitives applied per-subject, not queue groups.
+- [x] `sudo.request` → insert-as-claim on the unique `nats_reply_subject` (migration 0040, `ON CONFLICT DO NOTHING`): exactly one replica creates the approval row + acts, the other drops; cross-replica approve already works via the persisted subject.
+- [x] daemon-`register` IDE-config seed → leader-gated (`is_leader`); the dispatch poke was already leader-gated.
+- [x] `_thread_vm_ids` **retained** (no queue groups → no per-message Postgres lookup needed).
+- [x] 9 tests green; **live-verified on dev 2026-06-28** (synthetic NATS injection: both replicas receive, exactly one row created).
+- Residual → Layer 3: the *live* sudo SSE prompt reaches only the claim-winner replica's operators (others see it via poll, not as an instant push).
+
+### Phase 4b — Background-loop replica-safety sweep — SHIPPED 2026-06-29 (record `docs/tests/orchestrator_ha_background_loop_sweep.md`)
+- [x] Systematic audit of all 28 boot loops (regenerated the "double-fire audit" section above): each leader-gated / claim-guarded / idempotent / fan-out-by-design.
+- [x] Fixed the 2 gaps the earlier hand audit misclassified as safe — `attention_sleep_sweeper` (harmful double-snapshot/teardown) + `ide_session_ttl_sweeper` (wasteful double-delete) → `run_when_leader`. `ruff` clean; **k3d two-replica verified** (leader runs both sweepers, follower neither, follower healthy via its non-gated loops). Dev deploy pending.
+- [x] **→ no known double-fire path remains under `replicas: 2`.**
 
 ### Phase 5 — Operational polish
 - [ ] DB-aware liveness/readiness (Open Question #4).
@@ -448,6 +460,8 @@ Each phase independently shippable, ordered so each improves posture even if the
 - **2026-05-12:** `SELECT ... FOR UPDATE SKIP LOCKED` chosen for dispatch over a queue service.
 - **2026-05-12:** Postgres `LISTEN/NOTIFY` chosen for low-volume cross-replica fan-out.
 - **2026-05-12:** NATS queue groups chosen for one-message-one-consumer.
+- **2026-06-28 (REVERSES the 2026-05-12 queue-group decision):** blanket NATS queue groups REJECTED (M2-L4). Per-subject analysis: 4 of 6 fan-out subjects *need* fan-out (per-replica effects) or the leader; only `sudo.request` (insert-as-claim, migration 0040) + daemon-`register` (leader-gate) were harmful — queue-grouping all six would have broken delivery. Live-verified on dev. See `docs/superpowers/specs/2026-06-28-orchestrator-m2-l4-nats-replica-safety-design.md`.
+- **2026-06-29:** systematic background-loop replica-safety sweep (all 28 boot loops) — 2 loops an earlier hand audit misclassified as safe (`attention_sleep_sweeper`, `ide_session_ttl_sweeper`) leader-gated; k3d two-replica verified. No known double-fire path remains under `replicas: 2`. See `docs/tests/orchestrator_ha_background_loop_sweep.md`.
 - **2026-05-12:** No new infra (Postgres + NATS only). Database HA out of scope.
 - **2026-05-12:** Sticky-session ingress not required.
 - **2026-06-24 (refresh):** Reconciled with code. Status corrected from "no implementation yet": Layer 2 (`SKIP LOCKED`) and Layer 3 (`LISTEN/NOTIFY`) patterns are **already shipped** for cron / cloud-reload; `thread_advisory_lock` covers per-thread serialization; headless Phase 2 (`thread_events` SSE) and direct-to-agent-pod WS make the entire WS-fan-out concern moot (`persistent_ws_proxy` removed).
