@@ -96,6 +96,39 @@ def _serialize_payload(obj: Any) -> Any:
     return obj
 
 
+# Heavy job-level blobs handed to the agent once at dispatch (it boots its config
+# from them) but, left unchecked, recorded on EVERY per-event audit/LLM row — the
+# graph stamps the whole job ``metadata`` on each step. On a long/loop job that
+# duplicates the ~127 kB ``resolved_config`` thousands of times; a later bulk
+# audit read materializes the whole pile and OOM-kills the orchestrator. These
+# already live once per job in ``jobs.resolved_config`` / ``config_override`` /
+# ``datasources`` / ``repositories``, so they must never be persisted per row.
+# See docs/issues/audit_metadata_config_duplication_ooms_orchestrator.md and
+# docs/features/debug_audit_view_refactor.md (Phase 0).
+_HEAVY_JOB_METADATA_KEYS = (
+    "resolved_config",
+    "config_override",
+    "datasources",
+    "repositories",
+)
+
+
+def _lean_job_metadata(
+    metadata: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Drop heavy boot-only job blobs before persisting per-row audit/LLM metadata.
+
+    Returns ``metadata`` unchanged (same object) when it carries none of the heavy
+    keys — the common case — otherwise a shallow copy without them. The agent boots
+    from these keys via ``self._job_metadata`` / the dispatch ``metadata`` dict,
+    never from the persisted rows, so stripping here is invisible to execution and
+    only shrinks what hits the DB.
+    """
+    if not metadata or not any(k in metadata for k in _HEAVY_JOB_METADATA_KEYS):
+        return metadata
+    return {k: v for k, v in metadata.items() if k not in _HEAVY_JOB_METADATA_KEYS}
+
+
 def _iso_utc_now() -> str:
     """Current UTC time as an ISO-8601 'Z' string (for JSONB ``completed_at``)."""
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -462,7 +495,9 @@ class LLMArchiver:
                     "latency_ms": latency_ms,
                     "request": request_data,
                     "response": response_dict,
-                    "metadata": _serialize_payload(metadata) if metadata else None,
+                    "metadata": _serialize_payload(_lean_job_metadata(metadata))
+                    if metadata
+                    else None,
                     "auxiliary_metadata": _serialize_payload(auxiliary_metadata)
                     if auxiliary_metadata
                     else None,
@@ -968,7 +1003,9 @@ class LLMArchiver:
                     "timestamp": datetime.now(timezone.utc),
                     "latency_ms": latency_ms,
                     "payload": _serialize_payload(data) if data else {},
-                    "metadata": _serialize_payload(metadata) if metadata else None,
+                    "metadata": _serialize_payload(_lean_job_metadata(metadata))
+                    if metadata
+                    else None,
                 }
                 audit_id = self._writer.insert_audit_pre(row)
                 if audit_id is not None:

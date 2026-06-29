@@ -178,6 +178,64 @@ def test_archive_error_folds_status_into_metadata(archiver, fw):
     assert row["metrics"]["output_chars"] == 0
 
 
+def test_lean_job_metadata_strips_only_heavy_keys():
+    from src.core.archiver import _lean_job_metadata
+
+    # No heavy keys → same object back (cheap identity path); None passes through.
+    light = {"description": "d", "project_id": "p"}
+    assert _lean_job_metadata(light) is light
+    assert _lean_job_metadata(None) is None
+
+    heavy = {
+        "description": "d",
+        "project_id": "p",
+        "resolved_config": {"agent": {"x": "y" * 1000}},
+        "config_override": {"a": 1},
+        "datasources": [{"id": 1}],
+        "repositories": [{"url": "r"}],
+    }
+    assert _lean_job_metadata(heavy) == {"description": "d", "project_id": "p"}
+    assert heavy["resolved_config"]  # original dict left untouched (shallow copy)
+
+
+def test_audit_step_strips_heavy_job_metadata(archiver, fw):
+    # The OOM path: the graph stamps the whole job metadata on every audit step.
+    archiver.audit_step(
+        str(uuid4()),
+        "universal",
+        "llm",
+        "process",
+        1,
+        data={"llm": {"model": "m"}},
+        metadata={
+            "description": "build it",
+            "project_id": "p1",
+            "resolved_config": {"agent": {"blob": "z" * 5000}},
+            "config_override": {"a": 1},
+            "datasources": [{"id": "d"}],
+            "repositories": [{"url": "u"}],
+        },
+    )
+    md = fw.pre_rows[-1]["metadata"]
+    assert md == {"description": "build it", "project_id": "p1"}
+    for k in ("resolved_config", "config_override", "datasources", "repositories"):
+        assert k not in md
+
+
+def test_archive_strips_heavy_job_metadata_from_llm_row(archiver, fw):
+    archiver.archive(
+        str(uuid4()),
+        "universal",
+        [HumanMessage("hi")],
+        AIMessage("yo"),
+        "gpt-x",
+        metadata={"description": "d", "resolved_config": {"big": "z" * 5000}},
+    )
+    md = fw.llm_rows[-1]["metadata"]
+    assert md == {"description": "d"}
+    assert "resolved_config" not in md
+
+
 def test_unready_writer_short_circuits(archiver, fw):
     fw.ready = False
     assert archiver.audit_step(str(uuid4()), "u", "tool", "tools", 1) is None

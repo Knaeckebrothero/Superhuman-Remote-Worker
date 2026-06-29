@@ -58,6 +58,30 @@ function hintsToCapabilities(
   return filtered.length > 0 ? [...new Set(filtered)] : ['chat', 'auxiliary'];
 }
 
+/**
+ * Low-window reasoning-starve warning for the Admin → Models form.
+ *
+ * Reasoning tokens share max_output_tokens, and the agent reserves output off the
+ * back of the window: max_output is clamped to the "backstop" =
+ * ctx - floor(0.80*ctx) - 4096 (mirrors loader.py _resolve_max_output_tokens /
+ * CONTEXT_THRESHOLD_FRACTION + OUTPUT_SAFETY_MARGIN, floored at MIN 4096). At small
+ * windows the backstop is the binding cap (the family value only caps at large
+ * windows), so a too-low window silently starves reasoning. Warn under ~16k output
+ * — the cap that originally truncated minimax mid-reasoning. Returns the warning
+ * string, or null when the window is healthy / unset.
+ * See docs/features/reasoning_aware_max_output_tokens.md §5.4.
+ */
+export function reasoningStarveWarning(ctx: number | null): string | null {
+  if (ctx == null || ctx <= 0) return null; // unset → family/default governs
+  const backstop = Math.max(4096, ctx - Math.floor(ctx * 0.8) - 4096);
+  if (backstop >= 16384) return null; // healthy output room
+  return (
+    `⚠ Low context window: per-turn output is capped at ~${backstop.toLocaleString()} ` +
+    `tokens (≈20% of the window). Reasoning shares this budget, so reasoning models ` +
+    `may truncate before answering. Raise the window for more output room.`
+  );
+}
+
 @Component({
   selector: 'app-admin-models',
   standalone: true,
@@ -647,26 +671,11 @@ export class AdminModelsComponent implements OnInit {
     return v == null ? '' : String(v);
   });
 
-  // Low-window reasoning-starve warning. Reasoning tokens share max_output_tokens,
-  // and the agent reserves output off the back of the window: max_output is clamped
-  // to the "backstop" = ctx - floor(0.80*ctx) - 4096 (mirrors loader.py
-  // _resolve_max_output_tokens / CONTEXT_THRESHOLD_FRACTION). At small windows the
-  // backstop is the binding cap (the family value only caps at large windows), so a
-  // too-low window silently starves reasoning. Warn under ~16k output — the cap that
-  // originally truncated minimax mid-reasoning. Returns the warning string, or null
-  // when the window is healthy / unset. See
-  // docs/features/reasoning_aware_max_output_tokens.md §5.4.
-  readonly contextWindowWarning = computed<string | null>(() => {
-    const ctx = this.formContextWindow();
-    if (ctx == null || ctx <= 0) return null; // unset → family/default governs
-    const backstop = Math.max(4096, ctx - Math.floor(ctx * 0.8) - 4096);
-    if (backstop >= 16384) return null; // healthy output room
-    return (
-      `⚠ Low context window: per-turn output is capped at ~${backstop.toLocaleString()} ` +
-      `tokens (≈20% of the window). Reasoning shares this budget, so reasoning models ` +
-      `may truncate before answering. Raise the window for more output room.`
-    );
-  });
+  // Low-window reasoning-starve warning — logic in the pure reasoningStarveWarning()
+  // (unit-tested in admin-models.warning.spec.ts).
+  readonly contextWindowWarning = computed<string | null>(() =>
+    reasoningStarveWarning(this.formContextWindow()),
+  );
 
   /** Voices for the current model's backend (Kokoro/OpenAI); empty when the
    *  backend isn't recognized → the form falls back to a free-text field. */

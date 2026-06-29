@@ -18,10 +18,14 @@ related:
 
 # Admin per-model `context_window` override is shadowed by the family default in the blob dispatch path
 
-**Status:** **FIXED + k3d-verified 2026-06-28** (uncommitted on `develop`).
-Found while researching `[[reasoning_aware_max_output_tokens]]`; split out because
-it is broader than that feature — it silently **broke every** admin per-model
-context-window override on the blob path. Fixed at resolve time via a new helper
+**Status:** **FIXED + k3d-verified 2026-06-28; committed `c6aad44b`, deployed
+`sha-e4cd387`.** Found while researching `[[reasoning_aware_max_output_tokens]]`;
+split out because it is broader than that feature — it silently **broke every**
+admin per-model context-window override on the blob path. **Sibling bug** at the
+*base-config* layer (`max_output_tokens: null` shadowing the matrix family value)
+is §7.5 of `[[reasoning_aware_max_output_tokens]]` — same `explicit_llm_keys`
+mechanism, fixed together; the per-model `max_output_tokens` override now rides this
+same corrected `_seed_registry_model_overrides` path. Fixed at resolve time via a new helper
 `_seed_registry_model_overrides` (`orchestrator/main.py`) seeding the registry
 `context_window` into `request_override.llm.model_max_context_tokens` *before*
 `resolve_config` bakes the settings matrix, so both the window and the derived
