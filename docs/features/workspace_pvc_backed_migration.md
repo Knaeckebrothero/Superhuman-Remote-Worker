@@ -2,6 +2,16 @@
 
 ## Status
 
+> **UPDATE 2026-06-29 — Branch (a) chosen and partially shipped.** The fork below
+> is resolved in favor of **(a) pod PVCs**, scoped to job workspaces for v1.
+> Phase 0 (the flip) + Phase 1 (GC discipline) are **built, unit-tested, and
+> k3d-E2E-verified** (uncommitted on `develop`); Phase 2 (crash-recovery reattach,
+> needs the recovery wedge-fix first) and Phase 3 (Longhorn dead-node detach +
+> ResourceQuota) remain. Full implementation record, E2E results, and gotchas:
+> [`workspace_pvc_branch_a_implementation.md`](workspace_pvc_branch_a_implementation.md).
+> Branch (b) (durable VMs) and (c) (snapshot-hardening) remain unbuilt options for
+> the VM substrate. The rest of this brief is preserved as the original analysis.
+
 Design brief — **substantially revised 2026-06-10** after verifying the live
 architecture against code and the dev cluster. The original framing ("migrate
 workspace pods to PVCs") was too narrow and rested on a wrong assumption (that
