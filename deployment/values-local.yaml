@@ -289,6 +289,13 @@ codexProxy:
 workspace:
   accessMode: "ReadWriteOnce"
   storageSize: "10Gi"
+  # k3d ships only the local-path storage class (no Longhorn). Per-job
+  # workspace PVCs (Branch a) must target it, else they hang Pending against the
+  # non-existent longhorn-ephemeral default. local-path is Delete-reclaim +
+  # WaitForFirstConsumer (binds when the pod schedules) — both fine here.
+  ephemeralStorageClass: "local-path"
+  # Branch (a) E2E: PVC-back job workspaces so files survive pod crashes.
+  pvcEnabled: true
   networkPolicy:
     # In-cluster Traefik hairpin: OpenCloud's ocdav forwards uploads (tus
     # PATCH + plain PUT bodies) to the PUBLIC data-gateway URL

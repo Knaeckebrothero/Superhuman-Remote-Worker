@@ -86,6 +86,8 @@ data:
   # Workspace
   WORKSPACE_PATH: {{ "/workspace" | quote }}
   WORKSPACE_STORAGE_CLASS: {{ .Values.workspace.ephemeralStorageClass | default "longhorn-ephemeral" | quote }}
+  WORKSPACE_PVC_ENABLED: {{ .Values.workspace.pvcEnabled | default false | quote }}
+  WORKSPACE_PVC_SIZE: {{ .Values.workspace.pvcSize | default "10Gi" | quote }}
 
   # Agent
   AGENT_CONFIG: {{ .Values.agent.config | quote }}

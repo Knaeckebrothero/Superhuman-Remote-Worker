@@ -598,6 +598,251 @@ class TestGiveUp:
         )
 
 
+def _make_pvc(name: str, job_id: str | None = None):
+    pvc = MagicMock()
+    pvc.metadata.name = name
+    pvc.metadata.labels = {"srw/job-id": job_id} if job_id else {}
+    return pvc
+
+
+# =============================================================================
+# delete() — terminal PVC reclaim (Branch a leak guard)
+# =============================================================================
+
+
+class TestDeleteTerminalPvc:
+    @pytest.mark.asyncio
+    async def test_terminal_job_pvc_backed_deletes_pvc(self):
+        mgr, container, *_ = _make_manager()
+        container.delete_workspace_pvc = AsyncMock(return_value=True)
+        inst = Instance(
+            kind="workspace",
+            id="workspace-a",
+            bound_to="j1",
+            metadata={
+                "labels": {"srw/job-id": "j1"},
+                "job_status": "completed",
+                "volume_ephemeral": False,
+            },
+        )
+        await mgr.delete(inst, grace_s=0)
+        container.delete_workspace.assert_awaited_once_with(WorkspaceOwner.job("j1"))
+        container.delete_workspace_pvc.assert_awaited_once_with(
+            WorkspaceOwner.job("j1")
+        )
+
+    @pytest.mark.asyncio
+    async def test_idle_job_pvc_backed_keeps_pvc(self):
+        mgr, container, *_ = _make_manager()
+        container.delete_workspace_pvc = AsyncMock(return_value=True)
+        inst = Instance(
+            kind="workspace",
+            id="workspace-a",
+            bound_to="j1",
+            metadata={
+                "labels": {"srw/job-id": "j1"},
+                "job_status": "paused",  # idle, NOT terminal → reattach next dispatch
+                "volume_ephemeral": False,
+            },
+        )
+        await mgr.delete(inst, grace_s=0)
+        container.delete_workspace.assert_awaited_once_with(WorkspaceOwner.job("j1"))
+        container.delete_workspace_pvc.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_terminal_job_emptydir_does_not_delete_pvc(self):
+        mgr, container, *_ = _make_manager()
+        container.delete_workspace_pvc = AsyncMock(return_value=True)
+        inst = Instance(
+            kind="workspace",
+            id="workspace-a",
+            bound_to="j1",
+            metadata={
+                "labels": {"srw/job-id": "j1"},
+                "job_status": "completed",
+                "volume_ephemeral": True,  # emptyDir → there is no PVC
+            },
+        )
+        await mgr.delete(inst, grace_s=0)
+        container.delete_workspace_pvc.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_terminal_thread_pvc_backed_uses_session_owner(self):
+        mgr, container, *_ = _make_manager()
+        container.delete_workspace_pvc = AsyncMock(return_value=True)
+        inst = Instance(
+            kind="workspace",
+            id="ws-thread-a",
+            bound_to="t1",
+            metadata={
+                "labels": {"srw/thread-id": "t1"},
+                "thread_status": "ended",
+                "volume_ephemeral": False,
+            },
+        )
+        await mgr.delete(inst, grace_s=0)
+        container.delete_workspace.assert_awaited_once_with(
+            WorkspaceOwner.session("t1")
+        )
+        container.delete_workspace_pvc.assert_awaited_once_with(
+            WorkspaceOwner.session("t1")
+        )
+
+    @pytest.mark.asyncio
+    async def test_pod_delete_failure_skips_pvc_delete(self):
+        mgr, container, *_ = _make_manager()
+        container.delete_workspace = AsyncMock(side_effect=RuntimeError("boom"))
+        container.delete_workspace_pvc = AsyncMock(return_value=True)
+        inst = Instance(
+            kind="workspace",
+            id="workspace-a",
+            bound_to="j1",
+            metadata={
+                "labels": {"srw/job-id": "j1"},
+                "job_status": "completed",
+                "volume_ephemeral": False,
+            },
+        )
+        await mgr.delete(inst, grace_s=0)
+        # If we couldn't even delete the pod, don't delete the volume.
+        container.delete_workspace_pvc.assert_not_called()
+
+
+class TestGiveUpTerminal:
+    @pytest.mark.asyncio
+    async def test_terminal_pvc_give_up_reclaims_and_does_not_recreate(self):
+        mgr, container, *_ = _make_manager()
+        container.create_workspace = AsyncMock(return_value=True)
+        container.delete_workspace_pvc = AsyncMock(return_value=True)
+        inst = Instance(
+            kind="workspace",
+            id="workspace-a",
+            bound_to="j1",
+            metadata={
+                "labels": {"srw/job-id": "j1"},
+                "job_status": "failed",  # terminal
+                "volume_ephemeral": False,
+            },
+        )
+        await mgr.give_up(inst, grace_s=0)
+        # delete() reclaimed the PVC (terminal); give_up must NOT recreate a pod.
+        container.delete_workspace_pvc.assert_awaited_once_with(
+            WorkspaceOwner.job("j1")
+        )
+        container.create_workspace.assert_not_called()
+
+
+# =============================================================================
+# reap_orphans() — backstop PVC GC
+# =============================================================================
+
+
+class TestReapOrphans:
+    @staticmethod
+    def _wire_pvcs(container, pvcs):
+        pvc_list = MagicMock()
+        pvc_list.items = pvcs
+        container._core_api.list_namespaced_persistent_volume_claim.return_value = (
+            pvc_list
+        )
+        container._delete_pvc = AsyncMock(return_value=True)
+
+    @pytest.mark.asyncio
+    async def test_reaps_terminal_job_pvc_with_no_live_pod(self):
+        mgr, container, _, _, _ = _make_manager(
+            pods=[], thread_rows={"jdone": {"status": "completed"}}
+        )
+        self._wire_pvcs(container, [_make_pvc("pvc-workspace-jdone", "jdone")])
+        with patch(
+            "orchestrator.services.lifecycle.workspace_manager.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            n = await mgr.reap_orphans()
+        assert n == 1
+        container._delete_pvc.assert_awaited_once_with("pvc-workspace-jdone")
+
+    @pytest.mark.asyncio
+    async def test_reaps_pvc_whose_job_row_is_gone(self):
+        # fetchrow returns None (no row) → genuinely gone → reap.
+        mgr, container, _, _, _ = _make_manager(pods=[], thread_rows={})
+        self._wire_pvcs(container, [_make_pvc("pvc-workspace-jgone", "jgone")])
+        with patch(
+            "orchestrator.services.lifecycle.workspace_manager.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            n = await mgr.reap_orphans()
+        assert n == 1
+        container._delete_pvc.assert_awaited_once_with("pvc-workspace-jgone")
+
+    @pytest.mark.asyncio
+    async def test_skips_active_job_pvc(self):
+        mgr, container, _, _, _ = _make_manager(
+            pods=[], thread_rows={"jrun": {"status": "processing"}}
+        )
+        self._wire_pvcs(container, [_make_pvc("pvc-workspace-jrun", "jrun")])
+        with patch(
+            "orchestrator.services.lifecycle.workspace_manager.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            n = await mgr.reap_orphans()
+        assert n == 0
+        container._delete_pvc.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_skips_pvc_with_live_pod(self):
+        # Terminal job but a pod still exists → instance path owns teardown.
+        pod = _make_pod("workspace-jlive", labels={"srw/job-id": "jlive"})
+        mgr, container, _, _, _ = _make_manager(
+            pods=[pod], thread_rows={"jlive": {"status": "completed"}}
+        )
+        self._wire_pvcs(container, [_make_pvc("pvc-workspace-jlive", "jlive")])
+        with patch(
+            "orchestrator.services.lifecycle.workspace_manager.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            n = await mgr.reap_orphans()
+        assert n == 0
+        container._delete_pvc.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_skips_unlabeled_and_foreign_pvcs(self):
+        mgr, container, _, _, _ = _make_manager(pods=[], thread_rows={})
+        self._wire_pvcs(
+            container,
+            [
+                _make_pvc("srw-workspace"),  # shared scratch PVC, no job-id label
+                _make_pvc("some-other-pvc", "jx"),  # job-id but wrong name prefix
+            ],
+        )
+        with patch(
+            "orchestrator.services.lifecycle.workspace_manager.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            n = await mgr.reap_orphans()
+        assert n == 0
+        container._delete_pvc.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_db_lookup_error_does_not_delete(self):
+        # A transient DB error must NOT masquerade as "job gone".
+        mgr, container, _, _, db = _make_manager(pods=[])
+        db.acquire = MagicMock(side_effect=RuntimeError("db down"))
+        self._wire_pvcs(container, [_make_pvc("pvc-workspace-jerr", "jerr")])
+        with patch(
+            "orchestrator.services.lifecycle.workspace_manager.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            n = await mgr.reap_orphans()
+        assert n == 0
+        container._delete_pvc.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_noop_when_k8s_unavailable(self):
+        mgr, container, _, _, _ = _make_manager(k8s_available=False)
+        n = await mgr.reap_orphans()
+        assert n == 0
+
+
 def test_pod_volume_is_ephemeral_helper():
     from orchestrator.services.lifecycle.workspace_manager import (
         _pod_volume_is_ephemeral,

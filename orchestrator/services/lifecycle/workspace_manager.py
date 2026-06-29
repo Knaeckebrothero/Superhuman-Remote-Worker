@@ -330,9 +330,11 @@ class WorkspaceInstanceManager:
         """Escape hatch: dirty + unreachable + attempts exhausted.
 
         Ephemeral storage → delete the pod (state already unrecoverable).
-        PVC-backed → recreate the pod against the same PVC so the volume
-        reattaches; the PVC is NOT deleted. (PVC arm is minimally activated
-        this spec — full restore-by-reattach lands with the migration spec.)
+        PVC-backed + non-terminal → recreate the pod against the same PVC so the
+        volume reattaches; the PVC is NOT deleted. PVC-backed + terminal → the
+        ``delete`` call below already reclaimed the PVC, so do NOT recreate
+        (recreating a pod for finished work would be pointless and would race
+        that delete). Branch (a): see workspace_pvc_branch_a_implementation.md.
         """
         bound = inst.bound_to
         if not bound:
@@ -344,7 +346,9 @@ class WorkspaceInstanceManager:
             else WorkspaceOwner.job(bound)
         )
         await self.delete(inst, grace_s)
-        if not inst.metadata.get("volume_ephemeral", True):
+        if not self._is_terminal(inst) and not inst.metadata.get(
+            "volume_ephemeral", True
+        ):
             try:
                 await self._provisioner.create_workspace(owner)
             except Exception:
@@ -442,13 +446,119 @@ class WorkspaceInstanceManager:
             logger.debug("delete skipped: no bound job/thread for %s", inst.id)
             return
         labels = inst.metadata.get("labels") or {}
+        owner = (
+            WorkspaceOwner.session(bound)
+            if "srw/thread-id" in labels
+            else WorkspaceOwner.job(bound)
+        )
         try:
-            if "srw/thread-id" in labels:
-                await self._provisioner.delete_workspace(WorkspaceOwner.session(bound))
-            else:
-                await self._provisioner.delete_workspace(WorkspaceOwner.job(bound))
+            await self._provisioner.delete_workspace(owner)
         except Exception:
             logger.exception("Failed to delete workspace pod %s", inst.id)
+            return
+        # PVC GC (Branch a leak guard): a PVC-backed workspace keeps its volume
+        # across pod recreates (suspend/restore, drift recovery, give_up
+        # reattach), so we reclaim it ONLY when the bound work is terminal —
+        # completed/failed/cancelled job, ended thread. That is the
+        # "PVC dies when the job dies" guard the emptyDir-era simplification
+        # asked for. emptyDir instances have no PVC (skip); a missing PVC is an
+        # idempotent 404. The backstop reap_orphans() sweep covers the cases
+        # this inline path can miss (pod already gone, delete failed, restart).
+        if self._is_terminal(inst) and not inst.metadata.get("volume_ephemeral", True):
+            try:
+                await self._provisioner.delete_workspace_pvc(owner)
+                logger.info(
+                    "Terminal workspace PVC reclaimed for %s %s",
+                    owner.kind,
+                    owner.id,
+                )
+            except Exception:
+                logger.exception("Failed to delete terminal PVC for %s", inst.id)
+
+    async def reap_orphans(self) -> int:
+        """Backstop GC: delete job workspace PVCs whose job is terminal or gone.
+
+        The inline terminal delete (``delete()``) handles the common path, but a
+        PVC can outlive its pod — the pod was already gone when teardown ran, the
+        inline delete failed, or the orchestrator restarted mid-teardown. Such a
+        PVC never surfaces as a live ``Instance`` (it has no pod), so the
+        reconciler's per-instance reap can't see it. This once-per-tick sweep
+        lists job workspace PVCs directly and deletes any whose owning job is
+        terminal (completed/failed/cancelled) or no longer exists, AND that has
+        no live pod. emptyDir fleets have no such PVCs → no-op. Runs regardless
+        of ``WORKSPACE_PVC_ENABLED`` so a rollback (flag flipped off) still
+        drains leftover PVCs as their jobs finish.
+
+        Returns the number of PVCs deleted.
+        """
+        if not self._provisioner_ready() or self._db is None:
+            return 0
+        core = self._provisioner._core_api
+        ns = self._provisioner._namespace
+        try:
+            pvcs = await asyncio.to_thread(
+                core.list_namespaced_persistent_volume_claim,
+                namespace=ns,
+                label_selector=self._label_selector,
+            )
+        except Exception:
+            logger.exception("Orphan PVC sweep: list failed")
+            return 0
+        items = list(getattr(pvcs, "items", []) or [])
+        if not items:
+            return 0
+        # One pod list → the set of job ids that still have a live workspace
+        # pod. Never reap a PVC out from under a running pod; the instance path
+        # tears down pod+PVC together for those.
+        live_job_ids = {
+            (p.metadata.labels or {}).get("srw/job-id") for p in await self._list_pods()
+        }
+        live_job_ids.discard(None)
+        reaped = 0
+        for pvc in items:
+            name = pvc.metadata.name
+            job_id = (pvc.metadata.labels or {}).get("srw/job-id")
+            # v1 scope: job workspace PVCs only (pvc-workspace-*). Skip the
+            # shared agent scratch PVC, session PVCs, and anything unlabeled.
+            if not job_id or not name.startswith("pvc-workspace-"):
+                continue
+            if job_id in live_job_ids:
+                continue
+            # Resolve existence/status with a DIRECT query that separates the
+            # three cases — a transient DB error must NOT look like "job gone"
+            # and trigger a wrong delete. row present → use status; no row →
+            # genuinely gone (reap); query raised → unknown (skip).
+            try:
+                async with self._db.acquire() as conn:
+                    row = await conn.fetchrow(
+                        "SELECT status FROM jobs WHERE id = $1::uuid", job_id
+                    )
+            except Exception:
+                logger.exception(
+                    "Orphan PVC sweep: job lookup failed for %s — skipping", job_id
+                )
+                continue
+            status = row["status"] if row else None
+            if row is not None and status not in _TERMINAL_JOB_STATUSES:
+                continue  # job still active → keep its volume
+            try:
+                if await self._provisioner._delete_pvc(name):
+                    reaped += 1
+                    logger.info(
+                        "Orphan workspace PVC reaped: %s (job=%s status=%s)",
+                        name,
+                        job_id,
+                        status or "gone",
+                    )
+            except Exception:
+                logger.exception("Orphan PVC delete failed: %s", name)
+        if reaped:
+            logger.warning(
+                "Orphan PVC sweep reclaimed %d workspace PVC(s) — inline "
+                "terminal-delete missed them (pod gone / delete failed / restart)",
+                reaped,
+            )
+        return reaped
 
     # -------------------------------------------------------------------------
     # Internals

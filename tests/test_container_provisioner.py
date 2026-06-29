@@ -931,6 +931,112 @@ class TestCreateWorkspace:
         assert "API error" in last_call_updates["error"]
 
 
+class TestCreateWorkspacePvc:
+    """Branch (a): PVC-backed job workspaces (WORKSPACE_PVC_ENABLED)."""
+
+    @staticmethod
+    def _provisioner(pvc_enabled: bool):
+        from orchestrator.services.container_provisioner import ContainerProvisioner
+
+        p = ContainerProvisioner()
+        p._k8s_available = True
+        p._pvc_enabled = pvc_enabled
+        p._pvc_size = "10Gi"
+        p._db = MagicMock()
+        p._db.merge_workspace_container_context = AsyncMock(return_value=True)
+        p._db.merge_thread_workspace_context = AsyncMock(return_value=True)
+        p._db.execute = AsyncMock(return_value=None)
+        return p
+
+    @staticmethod
+    def _capture_core(pod_body: dict, pvc_body: dict | None = None):
+        core = MagicMock()
+        core.create_namespaced_pod = lambda **kw: pod_body.update(kw.get("body", {}))
+        if pvc_body is not None:
+            core.create_namespaced_persistent_volume_claim = (
+                lambda **kw: pvc_body.update(kw.get("body", {}))
+            )
+        return core
+
+    @pytest.mark.asyncio
+    async def test_pvc_mode_creates_and_mounts_pvc_for_job(self):
+        p = self._provisioner(pvc_enabled=True)
+        pod_body, pvc_body = {}, {}
+        p._core_api = self._capture_core(pod_body, pvc_body)
+
+        with patch.object(p, "_wait_for_ready", new_callable=AsyncMock) as w:
+            w.return_value = "10.42.0.100"
+            result = await p.create_workspace(
+                WorkspaceOwner.job("abcdef123456-rest-uuid")
+            )
+
+        assert result is True
+        # Deterministic UUID-keyed PVC name + owner label + RWO access mode
+        assert pvc_body["metadata"]["name"] == "pvc-workspace-abcdef123456"
+        assert pvc_body["metadata"]["labels"]["srw/job-id"] == "abcdef123456-rest-uuid"
+        assert pvc_body["spec"]["accessModes"] == ["ReadWriteOnce"]
+        # The pod mounts the PVC, not an emptyDir
+        vols = {v["name"]: v for v in pod_body["spec"]["volumes"]}
+        assert (
+            vols["workspace-data"]["persistentVolumeClaim"]["claimName"]
+            == "pvc-workspace-abcdef123456"
+        )
+        assert "emptyDir" not in vols["workspace-data"]
+
+    @pytest.mark.asyncio
+    async def test_disabled_uses_emptydir_and_creates_no_pvc(self):
+        p = self._provisioner(pvc_enabled=False)
+        pod_body = {}
+        core = self._capture_core(pod_body)
+        core.create_namespaced_persistent_volume_claim = MagicMock()
+        p._core_api = core
+
+        with patch.object(p, "_wait_for_ready", new_callable=AsyncMock) as w:
+            w.return_value = "10.42.0.100"
+            await p.create_workspace(WorkspaceOwner.job("abcdef123456-rest"))
+
+        core.create_namespaced_persistent_volume_claim.assert_not_called()
+        vols = {v["name"]: v for v in pod_body["spec"]["volumes"]}
+        assert "emptyDir" in vols["workspace-data"]
+        assert "persistentVolumeClaim" not in vols["workspace-data"]
+
+    @pytest.mark.asyncio
+    async def test_pvc_mode_skips_sessions_v1_scope(self):
+        p = self._provisioner(pvc_enabled=True)
+        pod_body = {}
+        core = self._capture_core(pod_body)
+        core.create_namespaced_persistent_volume_claim = MagicMock()
+        p._core_api = core
+
+        with patch.object(p, "_wait_for_ready", new_callable=AsyncMock) as w:
+            w.return_value = "10.42.0.100"
+            await p.create_workspace(WorkspaceOwner.session("thread-abc-123456"))
+
+        # v1: sessions stay emptyDir even with the flag on (brain is in Postgres)
+        core.create_namespaced_persistent_volume_claim.assert_not_called()
+        vols = {v["name"]: v for v in pod_body["spec"]["volumes"]}
+        assert "emptyDir" in vols["workspace-data"]
+
+    @pytest.mark.asyncio
+    async def test_pvc_create_failure_aborts_before_pod(self):
+        p = self._provisioner(pvc_enabled=True)
+        core = MagicMock()
+        core.create_namespaced_pod = MagicMock()
+        core.create_namespaced_persistent_volume_claim = MagicMock(
+            side_effect=Exception("PVC API down")
+        )
+        p._core_api = core
+
+        result = await p.create_workspace(WorkspaceOwner.job("abcdef123456-rest"))
+
+        assert result is False
+        # No pod (or ConfigMap) provisioned once the prerequisite PVC failed
+        core.create_namespaced_pod.assert_not_called()
+        updates = p._db.merge_workspace_container_context.call_args_list[-1][0][1]
+        assert updates["status"] == "failed"
+        assert "PVC" in updates["error"]
+
+
 class TestDeleteWorkspace:
     """Tests for workspace deletion."""
 

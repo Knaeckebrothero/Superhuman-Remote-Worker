@@ -124,6 +124,7 @@ class InstanceLifecycleReconciler:
                 "reaped": 0,
                 "reap_attempts": 0,
                 "reap_forced": 0,
+                "orphans_reaped": 0,
             }
             try:
                 expected = await manager.expected_versions()
@@ -228,6 +229,19 @@ class InstanceLifecycleReconciler:
                         await self._reap(manager, inst, stats)
                     except Exception:
                         logger.exception("Reap failed for kind=%s id=%s", kind, inst.id)
+
+            # Once-per-tick orphan sweep — optional manager capability for
+            # detached resources that never surface as a live Instance (e.g. a
+            # workspace PVC whose pod is already gone). Managers without the
+            # method are unaffected; guarded like the other optional hooks
+            # (cf. ensure_workspace's workspace_pod_live probe).
+            reap_orphans = getattr(manager, "reap_orphans", None)
+            if reap_orphans is not None:
+                try:
+                    stats["orphans_reaped"] = await reap_orphans()
+                except Exception:
+                    logger.exception("Orphan sweep failed for kind=%s", kind)
+
             report[kind] = stats
             if any(v for k, v in stats.items() if k != "listed"):
                 logger.info(
