@@ -1,338 +1,346 @@
-# Branch (a) — PVC-backed workspace pods: implementation plan
+# Branch (a) — PVC-backed workspace pods: implementation record
 
-## Status
+## Status (2026-06-29)
 
-**Decision: LOCKED — Branch (a) chosen, scoped to job (worker/loop) pods for v1.**
-This is the concrete implementation plan for the "pod PVC" fork of
-[`workspace_pvc_backed_migration.md`](workspace_pvc_backed_migration.md). That
-doc keeps all three forks open; this one commits to (a) and specifies the exact
-wiring. Sessions and VMs (branch b) are explicit non-goals for v1 (see §10).
+**Phase 0 + Phase 1 are BUILT, unit-tested, and k3d-E2E-verified. Uncommitted on
+`develop`.** This delivers the *durability + self-cleanup* half: a job workspace
+gets a PVC named by its UUID, files survive a pod crash (reattach by name), and
+the PVC is reclaimed when the job goes terminal — with a backstop sweep so it
+cannot leak. Verified end-to-end against the live orchestrator on k3d.
 
-**One-line summary:** give each job workspace a PVC named after its job UUID,
-mount it at `/home/agent-host`, reattach it by name on any pod recreate, and
-delete it when the job reaches a terminal state. The Postgres LangGraph
-checkpoint (cross-pod, already live) carries the reasoning state; the PVC carries
-the files; on a crash the new pod reattaches the volume and resumes the
-checkpoint — coherent by construction, no snapshot/restore dance.
-
-## The mental-model correction that shapes the whole plan
-
-The fear that "a volume randomly attaches to the wrong workspace" is **not a real
-failure mode here, and never was.** Workspace pods are **standalone single pods**
-created by the orchestrator (`restartPolicy: Never`), not ReplicaSet/Deployment
-members. The PVC name is **deterministic and owner-keyed**:
-
-- `WorkspaceOwner.pod_name` = `workspace-<job-uuid[:12]>` (`workspace_lifecycle.py:32-34`)
-- `delete_workspace_pvc` already names PVCs `pvc-workspace-<id[:12]>` /
-  `pvc-ws-thread-<id[:12]>` (`container_provisioner.py:356-358`)
-
-The name **is** the binding. A fresh job gets a fresh UUID → a fresh PVC. A
-recreated pod for the *same* job recomputes the *same* name → reattaches the
-*same* volume. Two different jobs can never collide because they never share a
-UUID. Cross-attach is impossible by construction; no "guard against wrong attach"
-needs building.
-
-**The actual problem that got PVCs removed in `c182aefb` (Workspace
-Simplification) was orphan cleanup leaks** — PVCs/PVs surviving teardown. So the
-guard we must build is not "prevent wrong attach," it is **"guarantee the PVC
-dies when the job dies."** That reframes the entire effort around *GC discipline*,
-not *attach safety*. Everything in §Phase 1 below is that guard.
-
-## What already exists (dormant) — reuse, don't rebuild
-
-The earlier passes left the PVC machinery in the tree, gated off. Verified
-present in current `develop`:
-
-| Capability | Location | State |
+| Phase | Scope | State |
 |---|---|---|
-| RWO PVC create, idempotent 409-reuse, `labels` arg, `longhorn-ephemeral` (Delete-reclaim) | `container_provisioner._create_pvc` `:603-648` | ✅ built |
-| PVC delete, idempotent 404 | `container_provisioner._delete_pvc` `:650-668` | ✅ built |
-| Deterministic owner→PVC-name delete | `container_provisioner.delete_workspace_pvc` `:348-359` | ✅ built |
-| Pod manifest PVC-vs-emptyDir branch on `pvc_name` | `container_provisioner._build_pod_manifest` `:1087-1096` | ✅ built |
-| Graceful teardown = snapshot + delete pod + **delete PVC** | `container_provisioner.release_workspace` `:361-406` | ✅ built, wired into main.py terminal paths `:1457/:3514/:3549` |
-| Reaper reads each pod's **actual** volume mode | `workspace_manager._pod_volume_is_ephemeral` `:66-80`, surfaced as `volume_ephemeral` in `list_instances` `:134` | ✅ built — **mixed fleet reconciles correctly** |
-| Reaper terminal-action predicate ("PVC → recreate-keep-PVC") | `workspace_manager.is_state_ephemeral` `:259-267` | ✅ built |
-| Reaper `give_up` PVC arm = delete pod + recreate against same PVC (reattach) | `workspace_manager.give_up` `:329-351` | ✅ built, "minimally activated" |
-| Drift recovery: `ready` + dead pod → recreate | `workspace_lifecycle.ensure_workspace` `:108-118` + `container_provisioner.workspace_pod_live` `:450` | ✅ built — **becomes reattach-on-recreate for free** |
-| Helm storage-class plumbing | `helm/templates/configmap.yaml:88` ← `workspace.ephemeralStorageClass`; `_storage_class` default `longhorn-ephemeral` `:76-77` | ✅ built |
+| **0 — the flip** | PVC-back job workspaces (flag-gated, jobs-only) | ✅ done + k3d-verified |
+| **1 — GC discipline** | terminal delete + give_up gating + backstop `reap_orphans` | ✅ done + k3d-verified |
+| **2 — crash-recovery reattach** | workspace-lost job re-dispatches → reattaches PVC → agent resumes on the files | ⏳ **NEXT** — needs **two** changes in the recovery/agent-resume path (G1 wedge-fix + G2 backend-aware resume gate), both in the separate session; PVC substrate is ready underneath |
+| **3 — prod hardening** | RWO dead-node detach-wait + S3 fallback + ResourceQuota | ⏳ pending (Longhorn-only; irrelevant on k3d/local-path) |
+| **rollout** | flag default-off in-chart; **ON in k3d dev**; dev-soak → prod flip | ⏳ pending |
 
-**The single reason no job is PVC-backed today:** `create_workspace` calls
-`_build_pod_manifest` **without** `pvc_name` (`:214-224`, comment `:212`
-"emptyDir by default"). That one omission forces every pod to emptyDir, which
-leaves every other dormant branch above unexercised.
+**Decision: LOCKED — Branch (a), scoped to job (worker/loop) pods for v1.** This
+is the chosen fork of [`workspace_pvc_backed_migration.md`](workspace_pvc_backed_migration.md).
+Sessions and VMs (branch b) are explicit non-goals for v1 (§Non-goals).
 
-## What's missing — the deltas to build
+**One-line model:** PVC named by job UUID, mounted at `/home/agent-host`,
+reattached by name on any recreate, deleted when the job is terminal. The
+Postgres LangGraph checkpoint (cross-pod, already live) carries reasoning state;
+the PVC carries the files; on a crash the new pod reattaches the volume and
+resumes the checkpoint — coherent by construction, no snapshot/restore dance.
 
-1. **The flip:** `create_workspace` must, when enabled for a job, compute the
-   deterministic PVC name, create-or-reuse the PVC, and pass `pvc_name` into the
-   manifest. (Phase 0)
-2. **Terminal GC (the leak guard):** the **reconciler reap path** deletes the pod
-   but not the PVC. `WorkspaceInstanceManager.delete()` (`:437-451`) →
-   `delete_workspace` (`:299-346`) leaves the volume. A terminal reap of a
-   PVC-backed job orphans the PVC. (Phase 1)
-3. **Backstop PVC reaper:** an age/ownership sweep that deletes PVCs whose bound
-   job is terminal-or-gone, for the cases the inline delete missed (pod already
-   gone, delete failed, orchestrator restart mid-teardown). (Phase 1)
-4. **Recovery coupling:** the `workspace_unavailable` handler must stop poisoning
-   pod jobs into the VM arm so the recovered pod actually reaches the reattach
-   path. This is the **Tier-1 fix already specified** in
-   [`loop_job_workspace_lost_wedged_in_recovery.md`](../issues/loop_job_workspace_lost_wedged_in_recovery.md)
-   — a hard prerequisite, not new work owned here. (Phase 2, depends on Tier-1)
-5. **RWO dead-node robustness:** reattach needs the volume to detach from the old
-   (possibly dead) node first. Add a bounded detach-wait + S3-restore fallback on
-   a healthy node. (Phase 3)
-6. **Capacity guard:** a `ResourceQuota` ceiling so a PVC leak or runaway can't
-   exhaust Longhorn. (Phase 3)
+---
 
-## The flag
+## Implementation record — what was actually built (Phase 0 + 1)
 
-Follow the existing `os.environ` convention in `ContainerProvisioner.__init__`
-(alongside `_storage_class` at `:76`):
+### Phase 0 — the flip (create path)
 
-```python
-# Branch (a): PVC-backed job workspaces. Default off → emptyDir (today's
-# behavior). Scoped to jobs in v1; sessions rehydrate from Postgres and stay
-# emptyDir until a follow-on.
-self._pvc_enabled: bool = _env_bool("WORKSPACE_PVC_ENABLED", default=False)
-self._pvc_size: str = os.environ.get("WORKSPACE_PVC_SIZE", "10Gi")
-```
+- **Flags** (`container_provisioner.py:88-89`): `WORKSPACE_PVC_ENABLED`
+  (default `False`, via the existing `_env_flag` helper) + `WORKSPACE_PVC_SIZE`
+  (default `10Gi`).
+- **`create_workspace`** (`container_provisioner.py:222-248`): when
+  `_pvc_enabled and owner.kind == "job"`, compute `pvc-workspace-<id[:12]>`,
+  `_create_pvc(...)` with owner label `{srw/job-id: <uuid>}`, **fail-closed**
+  (PVC create fails → set `status=failed`, return False), then pass `pvc_name`
+  into `_build_pod_manifest` (PVC-vs-emptyDir branch already existed,
+  `:1129`). **Created BEFORE the seed ConfigMap** so a PVC failure leaves
+  nothing to clean up (the prerequisite resource).
+- Sessions stay emptyDir (gated on `owner.kind == "job"`); one-line lift later.
 
-Helm: add `workspace.pvcEnabled: false` + `workspace.pvcSize: "10Gi"` to
-`values.yaml` (next to `ephemeralStorageClass` at `:953`), emit
-`WORKSPACE_PVC_ENABLED` / `WORKSPACE_PVC_SIZE` in `configmap.yaml` (next to
-`WORKSPACE_STORAGE_CLASS` at `:88`). `_storage_class` stays `longhorn-ephemeral`
-(Delete reclaim) — **do not** point per-workspace PVCs at a Retain class; Delete
-reclaim is what prevents the orphan-PV class even if a PVC delete is missed.
+### Phase 1 — GC discipline (the leak guard)
 
-Scope decision: v1 gates on `owner.kind == "job"`. Sessions keep emptyDir (their
-"brain" is in Postgres; marginal benefit is files-only and lower-urgency). The
-gate is one `and owner.kind == "job"` — trivial to lift to sessions later behind
-the same flag.
+- **1a. Inline terminal delete** (`workspace_manager.py:441` `delete()`,
+  reclaim at `:467-471`): after deleting the pod, if `_is_terminal(inst)` **and**
+  not `volume_ephemeral`, call `delete_workspace_pvc(owner)`. Logs
+  `Terminal workspace PVC reclaimed for <kind> <id>`. Idle/suspend reaps keep the
+  PVC (reattach next dispatch); emptyDir reaps skip it. Pod-delete failure
+  short-circuits before touching the volume.
+- **1b. `give_up` gating** (`workspace_manager.py:329`, gate at `:349`): only
+  recreate-and-reattach when **not terminal** and PVC-backed, so it can't race
+  1a's terminal delete.
+- **1c. Backstop `reap_orphans`** (`workspace_manager.py:478`, log `:548`): lists
+  PVCs by `srw.io/component=agent-workspace`, filters to name `pvc-workspace-*`
+  with an `srw/job-id` label, and deletes any whose job is **terminal or gone**
+  **and** has no live pod. Uses a **3-way DB lookup** (`SELECT status ... WHERE
+  id=$1::uuid`): row present → use status; no row → genuinely gone (reap); query
+  raised / malformed-uuid label → unknown (skip, never reap). Wired as a
+  once-per-tick `getattr(manager, "reap_orphans", None)` hook in
+  `reconciler.tick()` (`reconciler.py:238-241`) with an `orphans_reaped` stat
+  (`:127`). Emits a WARN with the orphan count when it reaps (alerting hook).
 
-## Phase 0 — The flip (create path) · ~30 lines · the whole user-visible win
+### Helm
 
-In `container_provisioner.create_workspace` (`:172-297`), between the seed-config
-block (`:208-210`) and the `_build_pod_manifest` call (`:214`):
+- `configmap.yaml:89-90` — emits `WORKSPACE_PVC_ENABLED` / `WORKSPACE_PVC_SIZE`.
+- `values.yaml:961-963` — `workspace.pvcEnabled: false` + `pvcSize: "10Gi"`
+  (plus the pre-existing `ephemeralStorageClass`, `:953`).
+- **`orchestrator/deployment.yaml:244-253`** — maps `WORKSPACE_PVC_ENABLED` /
+  `WORKSPACE_PVC_SIZE` from the configmap to env. **This was NOT in the original
+  plan and is essential** — see Gotcha #1.
 
-```python
-pvc_name = None
-if self._pvc_enabled and owner.kind == "job":
-    pvc_name = f"pvc-workspace-{owner.id[:12]}"   # same key delete_workspace_pvc uses
-    ok = await self._create_pvc(
-        pvc_name,
-        size=self._pvc_size,
-        labels={owner.label_key: owner.id, "srw.io/component": "agent-workspace"},
-    )
-    if not ok:
-        await self._set_context(owner, {"status": "failed", "error": "PVC create failed"})
-        return False
-```
+### Tests (all green: 294 lifecycle tests, ruff clean)
 
-…then pass `pvc_name=pvc_name` into the existing `_build_pod_manifest(...)` call
-(`:214-224`). The manifest branch at `:1087-1096` already does the rest.
+- `tests/test_container_provisioner.py` → `TestCreateWorkspacePvc` (4): PVC
+  create+mount for jobs; emptyDir when disabled; session-skip (v1 scope);
+  fail-closed before pod on PVC error.
+- `tests/test_lifecycle_workspace_manager.py` → `TestDeleteTerminalPvc` (5),
+  `TestGiveUpTerminal` (1), `TestReapOrphans` (7, incl. the DB-error-≠-gone
+  safety case).
+- `tests/test_lifecycle_reconciler_reap.py` → 3 hook tests (called+recorded /
+  absent-skipped / failure-tolerant).
+- Fixed 2 pre-existing exact-stats-dict assertions for the new `orphans_reaped`
+  key (`test_lifecycle_skeleton.py`, `test_lifecycle_agent_manager.py`).
 
-**Why this is nearly the entire feature:** with the PVC named by job UUID and
-`_create_pvc` idempotent (409-reuse), **every recreate reattaches automatically**:
-- `ensure_workspace` drift path (`ready` + dead pod → `_create`, `:116-117`) →
-  `create_workspace` → same `pvc_name` → 409 reuse → **files reattach**.
-- Blank `_create` path (`deleted`/`None` status, `:94-96`) → same.
-- Reaper `give_up` PVC arm (`:347-349`) → `create_workspace(owner)` → same.
-
-No new resume logic is needed for the happy path — deterministic naming + 409
-reuse *is* the resume logic. Stamp the owner label on the PVC (above) so the
-backstop reaper (Phase 1) and any human can resolve ownership; it doubles as a
-belt-and-suspenders identity check before any reattach.
-
-## Phase 1 — GC discipline (the actual guard) · the leak fix
-
-### 1a. Inline terminal delete
-
-`WorkspaceInstanceManager.delete()` (`workspace_manager.py:437-451`) must also
-delete the PVC **when the bound work is terminal** — and only then:
-
-```python
-async def delete(self, inst, grace_s):
-    ...
-    owner = WorkspaceOwner.session(bound) if "srw/thread-id" in labels else WorkspaceOwner.job(bound)
-    await self._provisioner.delete_workspace(owner)
-    if self._is_terminal(inst) and not inst.metadata.get("volume_ephemeral", True):
-        await self._provisioner.delete_workspace_pvc(owner)   # idempotent 404
-```
-
-Gating on `_is_terminal` (`:220-229`, = completed/failed/cancelled job, ended
-thread) is the crux:
-- **Terminal reap** → delete pod **and** PVC (work is done; reclaim storage).
-- **Idle/suspend reap** (paused/pending_review/reviewing) → delete pod, **keep
-  PVC** (the job will re-dispatch and reattach).
-- **`give_up` reattach** → keep PVC (it recreates against it).
-
-### 1b. Fix the `give_up` × terminal interaction
-
-`give_up` (`:329-351`) currently recreates a pod for any non-ephemeral instance.
-For a *terminal* instance that's pointless (and would race 1a's PVC delete). Gate
-the recreate on non-terminal:
-
-```python
-await self.delete(inst, grace_s)          # 1a deletes the PVC if terminal
-if not self._is_terminal(inst) and not inst.metadata.get("volume_ephemeral", True):
-    await self._provisioner.create_workspace(owner)   # idle recovery only — reattach
-```
-
-### 1c. Backstop PVC reaper
-
-A periodic sweep (extend the existing lifecycle reconciler tick, or a sibling to
-the workspace idle sweeper) that lists PVCs by label and deletes orphans:
+### Files touched (uncommitted on `develop`)
 
 ```
-list PVCs where srw.io/component=agent-workspace
-for each: owner = label srw/job-id  → fetch job
-          delete PVC if: job row gone, OR job status in {completed, failed, cancelled}
-                         AND no live pod named workspace-<id[:12]>
+orchestrator/services/container_provisioner.py        flags + create_workspace flip + docstring
+orchestrator/services/lifecycle/workspace_manager.py  delete() terminal GC + give_up gate + reap_orphans()
+orchestrator/services/lifecycle/reconciler.py         once-per-tick orphan-sweep hook + stat
+helm/templates/configmap.yaml                         WORKSPACE_PVC_ENABLED/SIZE keys
+helm/templates/orchestrator/deployment.yaml           map those keys → orchestrator env  (Gotcha #1)
+helm/values.yaml                                       workspace.pvcEnabled / pvcSize
+tests/test_container_provisioner.py                   TestCreateWorkspacePvc
+tests/test_lifecycle_workspace_manager.py             TestDeleteTerminalPvc / GiveUpTerminal / ReapOrphans
+tests/test_lifecycle_reconciler_reap.py               orphan-sweep hook tests
+tests/test_lifecycle_skeleton.py, test_lifecycle_agent_manager.py   orphans_reaped stat-dict fix
+deployment/values-local.yaml                           (gitignored) ephemeralStorageClass: local-path + pvcEnabled: true
 ```
 
-This catches: pod deleted before the inline path ran, inline delete failed, or
-the orchestrator restarted mid-teardown. With `reclaimPolicy=Delete` the
-underlying PV (and Longhorn replicas) vanish with the PVC. Log a WARN with the
-orphan count each sweep so log-based alerting can fire if GC ever regresses.
+---
 
-**Net of Phase 1:** a PVC exists exactly as long as its job is non-terminal, with
-two independent reclaimers (inline + backstop) and Delete-reclaim as the floor.
-That is the leak guard the 2026-04 simplification asked for, made explicit.
+## k3d E2E results — all 5 passed (live orchestrator, 2026-06-29)
 
-## Phase 2 — Wire PVC reattach into crash recovery (depends on Tier-1)
+Driven through the running orchestrator (confirmed `reap_orphans` present,
+`pvc_enabled=True`); the GC paths were exercised by the **actual reconciler loop**
+on the leader replica, not mocks.
 
-A PVC alone does **not** fix the recovery *wedge* — that's a control-flow bug.
-Today the `workspace_unavailable` handler (`main.py:10118-10161`) stamps
-`vm.requested=True` on a **pod** job, routing it through the VM arm so it never
-reaches `ensure_workspace` / the pod reattach path (full trace in
-[`loop_job_workspace_lost_wedged_in_recovery.md`](../issues/loop_job_workspace_lost_wedged_in_recovery.md)).
+1. **Create + mount** — PVC `Bound` (10Gi RWO local-path), pod Running, mounts
+   `/home/agent-host` as `persistentVolumeClaim` (not emptyDir), `srw/job-id`
+   label stamped. ✅
+2. **Reattach survives pod kill (keystone)** — wrote a sentinel → force-deleted
+   the pod → recreated → sentinel survived on the new pod. ✅
+3. **Terminal GC** — direct teardown reclaimed pod+PVC+PV (no orphan). Live
+   reconciler then proved it: log `Terminal workspace PVC reclaimed for job …
+   (workspace_manager.py:471)` + `PVC deleted` + pod/PVC/PV gone. ✅
+4. **Backstop `reap_orphans`** — orphan PVC (no pod, no job row) swept by the live
+   reaper: `Orphan workspace PVC reaped … status=gone` + tick
+   `{… 'orphans_reaped': 1}`. ✅
+5. **Mixed fleet** — the pre-existing emptyDir session pod was untouched (still
+   emptyDir, no PVC ever created — v1 jobs-only honored); reaper handled both
+   kinds; zero PVCs leaked at the end. ✅
 
-**Prerequisite (owned by that issue's Tier-1, lands first, independent of PVCs):**
-branch on backend before stamping; for pod jobs re-dispatch through the pod arm;
-bounded retries → fail-loud terminal; clear `recovering` on the pod path.
+---
 
-**What this plan adds once Tier-1 is in:** nothing new in code — the PVC makes the
-already-correct pod recovery path *non-blank*. After Tier-1, a workspace-lost pod
-job re-dispatches through `ensure_workspace`, which recreates the pod, which
-reattaches the PVC. This **supersedes the Tier-2 fork** in both recovery docs:
+## Gotchas discovered during k3d verification (read before prod)
 
-- Replaces **Option A (snapshot-restore)** — no S3 tar/extract on the hot path;
-  reattach is a volume mount.
-- Replaces **Option B (blank + checkpoint)** — the workspace is *not* blank; the
-  files are on the PVC.
+1. **Orchestrator env is `configMapKeyRef`, not `envFrom`.** New configmap keys
+   do **not** reach the orchestrator unless explicitly mapped in
+   `orchestrator/deployment.yaml`. The orchestrator runs *both* the dispatcher's
+   `create_workspace` and the lifecycle reaper, so it must see
+   `WORKSPACE_PVC_ENABLED`. (Same trap as the cross-pod-checkpointer flag.) Fixed
+   here; **carry this pattern to any future workspace flag.**
+2. **Storage class must exist on the target cluster.** Default is
+   `longhorn-ephemeral` (Delete-reclaim) for prod. k3d ships only `local-path`,
+   so `deployment/values-local.yaml` sets `workspace.ephemeralStorageClass:
+   local-path`. A missing class → PVCs hang `Pending` forever (no error).
+3. **`tilt trigger srw` does a full helm uninstall/reinstall + image rebuild**
+   (~6 min). Data PVCs survive (`helm.sh/resource-policy: keep`), so it's
+   recoverable, but for a **config-only** change prefer patching the configmap +
+   `kubectl set env deploy/srw-orchestrator --from=configmap/srw-config
+   --keys=…` over triggering the whole helm resource.
+4. **local-path = hostPath bind-mount → no RWO detach dance.** Reattach on a
+   single node is instant. The dead-node stale-`VolumeAttachment` problem is a
+   **Longhorn/networked-storage** concern → that's exactly Phase 3, and it does
+   not reproduce on k3d.
+5. **PVC delete is not instant (~40s on local-path).** The `pvc-protection`
+   finalizer waits for full pod termination + the provisioner cleans the hostpath.
+   The backstop is idempotent (404-safe), so a slow delete is harmless — but
+   don't assert "gone" within a tight window.
+6. **`reap_orphans` only acts on valid-UUID labels.** The `::uuid` cast makes a
+   malformed `srw/job-id` label safely skipped (never reaped); a valid UUID with
+   no `jobs` row is treated as "gone" → reaped. All real PVCs carry a valid UUID.
+7. **Reconciler runs on the leader only.** With 2 orchestrator replicas, only the
+   leader ticks the reconciler / runs `reap_orphans` — grep the leader's logs
+   when verifying.
 
-**The coherence question the snapshot path forced — dissolved.** Option A had to
-reconcile "snapshot taken at phase-boundary may be older than the checkpoint."
-With reattach, the disk reflects on-disk state at the instant the pod died, and
-the Postgres checkpoint reflects the last completed super-step — both "as of the
-crash." They are strictly *more* coherent than any periodic snapshot. Residual
-(call it out, don't over-engineer): disk and PG checkpoint are two stores, so a
-tool write that didn't fsync before a hard kill can lag the checkpoint by one
-step — the same tolerance the agent already has mid-run (it re-reads / re-clones).
-Keep the existing re-clone gates; no new coherence guard required for v1.
+---
 
-Keep the S3 snapshot as the **cross-node / DR** layer (see Phase 3) — PVC is the
-fast same-cluster path, snapshot is the backstop. "Both wins," per the brief.
+## Phase 2 — crash-recovery reattach (NEXT)
 
-## Phase 3 — Robustness & capacity
+**Goal:** a job whose workspace pod dies mid-run re-dispatches, recreates the
+pod, **reattaches its PVC**, and resumes from the Postgres checkpoint with its
+files intact — no data loss, no manual intervention.
 
-- **RWO dead-node detach:** when the old pod's node is dead, K8s holds a stale
-  `VolumeAttachment` and the new pod's mount blocks. Add a bounded wait in the
-  recreate path; on timeout, fall back to S3-restore onto a healthy node (Longhorn
-  `auto-salvage` + the 2nd replica means the *data* survives a node loss; only the
-  *attach* needs forcing). This is the one place "just reattach" isn't literally
-  instant — node-alive pod-restart is clean; node-death needs this fallback.
+> **CORRECTION (2026-06-29, from a code-level resume-path investigation):** an
+> earlier draft of this section claimed Phase 2 was "verification only / nothing
+> in code." **That was wrong.** The PVC substrate (Phase 0/1) is necessary but
+> **not sufficient** — with the resume path as it stands today, the agent
+> **actively wipes the reattached PVC** on resume (trace in G2 below). Phase 2
+> needs **two** changes, *both* in the recovery / agent-resume path, and **both
+> are untestable until the wedge-fix (G1) lands**. The PVC half is the foundation
+> they sit on; it does not deliver job durability on its own.
+
+### G1 — control-flow wedge-fix (prerequisite; separate session)
+
+The `workspace_unavailable` handler (`main.py:10118-10161`) today
+**unconditionally stamps `ctx["vm"]={requested:True,recovering:True}` on pod-backed
+jobs** → routes them into the VM arm → **wedged in `paused` forever**, never
+reaching `ensure_workspace`/the pod arm where a recreate (and thus reattach)
+happens. Full trace + the ~40-60-line Tier-1 fix in
+[`loop_job_workspace_lost_wedged_in_recovery.md`](../issues/loop_job_workspace_lost_wedged_in_recovery.md).
+**Until G1 lands, a crashed pod job never reaches a recreate, so reattach is
+unreachable regardless of PVCs.** Also: the recovery re-dispatch **must set
+`resume=True`** (checkpoint resume) — a fresh dispatch (`resume=False`) hits
+`initialize()` and `rm -rf`s the workspace (see G2).
+
+### G2 — backend-aware resume detection (the gate that makes reattach *usable*)
+
+Even once G1 re-dispatches a pod job through the pod arm, the **agent's resume
+gates are keyed on the agent-pod-LOCAL path, not the remote workspace**, so they
+don't see the reattached PVC and end up clobbering it:
+
+- `WorkspaceManager.path` is a local `pathlib.Path` (`core/workspace.py:243-245`);
+  `.path.exists()` checks the **harness-pod-local** fs. The reattached PVC lives
+  on the **remote** workspace pod, reached via `backend.exists()` / `backend.root`
+  (`core/backends/remote.py:459/160`).
+- Resume flow in `agent.py`:
+  - `:1836` `if resume and not path.exists() and git_remote_url:` → for a remote
+    backend `path.exists()` is **False**, so this **pod-handoff clone from Gitea
+    fires** — but `git clone` into the non-empty reattached dir **fails** → falls
+    through (`:1868`).
+  - `:1873` `if resume and path.exists():` (the **non-destructive** branch that
+    reuses existing files) → **never fires** for a remote backend (local path
+    False).
+  - `:1916` fresh `initialize()` → `core/workspace.py:295/313`
+    **`rm -rf {backend.root}/*`** on the **remote** workspace → **the reattached
+    working tree is wiped** and replaced with the last-pushed Gitea state.
+
+  Net: reattach is **defeated** — the agent discards the volume it just got back.
+
+**The fix:** make the resume detection **backend-aware** — gate on
+`backend.exists(<marker>)` (remote), not `path.exists()` (local). When the
+reattached remote workspace is present, take the **non-destructive resume branch**
+(`:1873`-style: re-init the git-manager handle + todo manager, ensure remote +
+branch, **no `rm -rf`, no clone**). This is the *inverse* of what the issue doc's
+**Tier-2 Option B** proposed ("force a fresh clone into the blanked box"): under
+PVC reattach (Option C) we **detect and preserve** the workspace instead of
+re-cloning it. Touches `agent.py:1835-1920` (and mirror the same gate in
+`api/persistent_session.py:346/421` only if/when sessions opt into PVCs — v1
+non-goal). **Risk:** changes resume behavior for *all* jobs, so it must land + be
+tested with G1 in place via the real recovery E2E — not blind.
+
+### Verification (the gate; needs G1 + G2)
+
+- E2E (test-plan step 7): reproduce the `19707fa1` shape on k3d — kill a
+  PVC-backed job's workspace pod mid-run → assert it re-dispatches through the pod
+  arm (not VM), recreates the pod, **reattaches the PVC**, the agent takes the
+  non-destructive resume branch (no `rm -rf`), resumes from checkpoint, and the
+  un-pushed working tree is intact.
+- Coherence: disk + Postgres checkpoint are both "as of the crash"; the disk may
+  lag the checkpoint by ≤1 unfsynced super-step. With G2 (preserve, don't clobber)
+  this is the same tolerance the agent already has mid-run — **no new coherence
+  guard for v1**.
+
+### Ownership note
+
+G1 is squarely the recovery session's (control-flow). G2 lives in the same
+agent-resume code the recovery session's Tier-2 already touches
+(`agent.py:1835-1889`), so it should be **coordinated with that session** rather
+than landed blind from here — both are untestable without G1, and editing the
+resume path from two sessions will collide.
+
+**This supersedes the Tier-2 fork** in both recovery docs: PVC reattach (+ G2)
+replaces both *Option A (snapshot-restore)* (no S3 tar/extract on the hot path)
+and *Option B (blank + checkpoint)* (the workspace is not blank). The never-restored
+job S3 snapshot becomes **DR-only** (kept, not removed).
+
+---
+
+## Phase 3 — prod hardening (pending; Longhorn-only)
+
+- **RWO dead-node detach** (does NOT reproduce on k3d/local-path — Gotcha #4):
+  when the old pod's node is dead, K8s holds a stale `VolumeAttachment` and the
+  new pod's mount blocks. Add a bounded detach-wait in the recreate path; on
+  timeout, fall back to S3-restore onto a healthy node (Longhorn `auto-salvage` +
+  2nd replica means the *data* survives a node loss; only the *attach* needs
+  forcing).
 - **Capacity guard:** a `ResourceQuota` on `requests.storage` (~1 Ti) in the
-  workspace namespace — a runaway/leak ceiling well under the ~4.2 TB fleet
-  (10Gi × 2 replicas ≈ 210 concurrent before exhaustion; see brief §Cluster
-  facts). Pairs with the backstop reaper.
+  workspace namespace — runaway/leak ceiling under the ~4.2 TB fleet (10Gi × 2
+  replicas ≈ 210 concurrent). Pairs with the backstop reaper.
 
-## Identity & labels (the user's explicit "proper guard")
+---
 
-Deterministic naming already prevents cross-attach. The *added* identity surface
-is for **GC safety and observability**, not attach safety:
+## Rollout status
 
-- PVC carries `srw/job-id: <uuid>` + `srw.io/component: agent-workspace` (Phase 0).
-- Pod already carries `srw/job-id` (`_build_workspace_labels` `:670-683`).
-- Backstop reaper resolves PVC→owner→job-status via the label (Phase 1c).
-- Optional belt-and-suspenders: before a `give_up` reattach, assert the PVC's
-  `srw/job-id` label equals the owner id. With UUID naming this can never
-  mismatch; it's a cheap invariant that turns a "can't happen" into a logged
-  assertion.
+- ✅ Flag default-off in-chart (zero behavior change on merge).
+- ✅ **ON in k3d dev** (`values-local.yaml`), E2E gate steps 1-6 passed.
+- ⏳ Commit + push Phase 0/1 to `develop`.
+- ⏳ Dev soak — watch orphan-PVC WARN count + storage capacity.
+- ⏳ Prod flip — only after dev soak shows zero orphan growth across a full
+  create→reap→GC cycle. **Mixed fleet is safe and is the rollout mechanism** (the
+  reaper reads each pod's actual volume mode), so there is no big-bang cutover;
+  rollback = flip the flag off (new pods revert to emptyDir, existing PVC pods
+  finish and GC normally). No data migration either way.
 
-## Test plan
+---
 
-**Unit (pytest, `tests/` — uses `FilesystemTestBackend`, mock k8s):**
-- `create_workspace` flag-on + `owner.kind=job` → `_create_pvc` called, `pvc_name`
-  threaded to `_build_pod_manifest`; flag-off → emptyDir, no `_create_pvc`
-  (assert today's behavior preserved).
-- `create_workspace` flag-on + `owner.kind=session` → emptyDir (v1 scope).
-- `WorkspaceInstanceManager.delete()`: terminal + PVC-backed → `delete_workspace_pvc`
-  called; idle + PVC-backed → not called; terminal + emptyDir → not called.
-- `give_up`: terminal → no recreate; idle + PVC → recreate; idle + emptyDir → no
-  recreate.
-- backstop reaper: selects only terminal/gone-owner PVCs; skips PVCs with a live
-  pod / non-terminal job.
+## Test plan status
 
-**k3d e2e (the gate — `Plan → Develop → Verify`):**
-1. Flip `workspace.pvcEnabled=true` in `values-local.yaml`, `helm upgrade`.
-2. Create a job → assert `pvc-workspace-<id>` `Bound`, pod mounts it at
-   `/home/agent-host`.
-3. **Reattach:** write a sentinel file in `/home/agent-host`, `kubectl delete pod
-   workspace-<id>` (simulate crash, node alive) → `ensure_workspace` drift-recreates
-   → assert sentinel survives on the new pod.
-4. **Terminal GC:** cancel/complete the job → assert PVC deleted (no orphan),
-   PV/Longhorn replicas gone (Delete reclaim).
-5. **Backstop:** delete a pod out-of-band + mark its job cancelled so the inline
-   path is skipped → assert the backstop sweep deletes the PVC.
-6. **Mixed fleet:** with one emptyDir job pod (flag was off) and one PVC job pod
-   coexisting, run the reaper → assert emptyDir pod gets delete-tombstone, PVC pod
-   gets reattach/GC per status (proves `_pod_volume_is_ephemeral` reconciles both).
-7. **Recovery (after Tier-1):** reproduce the `19707fa1` shape — kill the workspace
-   pod mid-run → assert the job re-dispatches through the pod arm (not VM),
-   reattaches the PVC, resumes from checkpoint, files intact.
+**Unit — ✅ done** (see Implementation record): create-flip on/off/session,
+delete() terminal-vs-idle-vs-emptyDir, give_up gating, reap_orphans selection +
+DB-error safety, reconciler hook.
 
-## Rollout
+**k3d E2E — steps 1-6 ✅ done** (see results above). Step 7 is Phase 2:
+7. **Recovery (Phase 2, after wedge-fix):** reproduce `19707fa1` — kill the
+   workspace pod mid-run → assert re-dispatch through the pod arm (not VM),
+   PVC reattach, checkpoint resume, files intact.
 
-- Ship flag **default off** — zero behavior change on merge.
-- Flip on in `values-local` (k3d) → run the e2e gate above.
-- Flip on `develop`/dev → soak; watch orphan-PVC WARN count + Longhorn capacity.
-- **Mixed fleet is safe and is the rollout mechanism** — the reaper reads each
-  pod's actual volume mode, so there is no big-bang cutover. New pods are PVC,
-  in-flight emptyDir pods drain naturally.
-- **Rollback** = flip the flag off. New pods revert to emptyDir; existing PVC pods
-  finish and GC normally. No data migration either direction.
-- Prod flip only after dev soak shows zero orphan growth across a full
-  create→reap→GC cycle.
+---
+
+## Background — why this shape (kept for reviewers)
+
+**Cross-attach is impossible by construction; the real risk is leaks.** Workspace
+pods are standalone single pods (`restartPolicy: Never`), not ReplicaSet members,
+and PVC names are deterministic + owner-keyed (`pvc-workspace-<uuid[:12]>`). The
+name *is* the binding: fresh job → fresh UUID → fresh PVC; same-job recreate →
+same name → reattach; two jobs never collide. The problem that got PVCs ripped
+out in `c182aefb` (Workspace Simplification) was **orphan cleanup leaks** — so the
+whole of Phase 1 is the "PVC dies when the job dies" guard, not attach safety.
+
+**~90% was already plumbed, dormant.** `_create_pvc` (RWO, 409-reuse),
+`_delete_pvc` (404-safe), `delete_workspace_pvc`, the `_build_pod_manifest`
+PVC branch, the reaper's volume-mode read (`_pod_volume_is_ephemeral` →
+`volume_ephemeral`), `is_state_ephemeral`, the `give_up` reattach arm, and the
+`ensure_workspace` drift-recreate probe all pre-existed. The only reason no job
+was PVC-backed was `create_workspace` never passing `pvc_name`. Phase 0 was that
+one wiring; Phase 1 closed the GC gap on the reconciler reap path.
+
+---
 
 ## Risks & mitigations
 
-| Risk | Mitigation |
-|---|---|
-| Orphan PVC/PV leak (the 2026-04 regression) | Delete reclaim + inline terminal delete + backstop reaper + WARN-on-orphan alerting + ResourceQuota ceiling |
-| RWO mount blocks on dead-node stale VolumeAttachment | Bounded detach-wait + S3-restore fallback on healthy node (Phase 3); S3 snapshot retained as DR |
-| PVC bind latency on create (seconds) | Acceptable; Longhorn binds fast; only on first-create, not reattach. Measure in e2e step 2 |
-| Disk↔checkpoint single-step skew on hard kill | Documented residual; existing re-clone/re-read gates tolerate it; strictly better than snapshot. Not a v1 blocker |
-| Longhorn capacity exhaustion | ResourceQuota (~1 Ti) + backstop reaper keeps the working set bounded |
+| Risk | Mitigation | Status |
+|---|---|---|
+| Orphan PVC/PV leak (the 2026-04 regression) | Delete-reclaim + inline terminal delete + backstop reaper + WARN-on-orphan + ResourceQuota | inline+backstop ✅; ResourceQuota = Phase 3 |
+| RWO mount blocks on dead-node stale VolumeAttachment | bounded detach-wait + S3 fallback | Phase 3 (Longhorn-only) |
+| PVC bind latency on create | acceptable; only first-create, not reattach | observed fine on k3d |
+| Disk↔checkpoint ≤1-step skew on hard kill | documented residual; existing re-clone/re-read gates tolerate it | Phase 2 verify; no new guard for v1 |
+| Capacity exhaustion | ResourceQuota + backstop reaper | Phase 3 |
 
 ## Non-goals (v1)
 
 - **Sessions** — stay emptyDir (brain in Postgres). One-line gate lift later.
 - **VMs (branch b)** — different substrate (KubeVirt CDI DataVolume); separate
   effort. See [`workspace_pvc_backed_migration.md`](workspace_pvc_backed_migration.md) §Branch (b).
-- **Removing the S3 snapshot path** — kept as cross-node/DR backstop, not removed.
-- **Collapsing the duplicated PVC plumbing** in `persistent_provisioner` vs
-  `container_provisioner` — only relevant once sessions opt in.
+- **Removing the S3 snapshot path** — kept as cross-node/DR backstop.
+- **Collapsing duplicated PVC plumbing** (`persistent_provisioner` vs
+  `container_provisioner`) — only relevant once sessions opt in.
 
 ## Coupling — keep these docs in lockstep
 
 - [`loop_job_workspace_lost_wedged_in_recovery.md`](../issues/loop_job_workspace_lost_wedged_in_recovery.md)
-  — **Tier-1 is a prerequisite** (Phase 2). Record "PVC reattach" as the chosen
-  Tier-2 direction there, superseding its Option A/B fork.
+  — **wedge-fix (Tier-1) is the Phase 2 prerequisite** (separate session). Record
+  "PVC reattach" as the chosen Tier-2 direction there.
 - [`snapshot_restore_dead_for_jobs.md`](../issues/snapshot_restore_dead_for_jobs.md)
-  — same Tier-2 decision. With PVC reattach as the recovery path, the
-  never-restored job snapshot becomes **DR-only**; record that its Option A/B is
-  resolved by this plan (and that job snapshots stay as the cross-node backstop,
-  not removed).
+  — same Tier-2 decision; with PVC reattach the never-restored job snapshot
+  becomes DR-only (kept, not removed).
 - [`workspace_pvc_backed_migration.md`](workspace_pvc_backed_migration.md) — the
-  open-fork brief; mark Branch (a) as the decided direction pointing here.
+  open-fork brief; Branch (a) is the decided direction, Phase 0/1 shipped per this
+  doc.
