@@ -2154,9 +2154,12 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
                 f"(host={vm_ctx['ssh_host']}:{vm_ctx.get('ssh_port', 22)})"
             )
 
-        # Inject workspace container config if job has a ready container
+        # Inject workspace container config if job has a ready container.
+        # Prefer the stable Service DNS (`host`) over the ephemeral `pod_ip` so a
+        # reattached/recovered pod is reachable at a constant address (see
+        # docs/issues/workspace_reattach_ephemeral_ip_reconnect_churn.md).
         container_ctx = _get_container_context(job)
-        container_host = container_ctx.get("pod_ip") or container_ctx.get("host")
+        container_host = container_ctx.get("host") or container_ctx.get("pod_ip")
         if container_ctx.get("status") == "ready" and container_host:
             config_override = config_override or {}
             ws = config_override.setdefault("workspace", {})
@@ -2532,6 +2535,29 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
             logger.info(
                 f"Resume dispatch: injected VM workspace config for job {job_id} "
                 f"(host={vm_ctx['ssh_host']}:{vm_ctx.get('ssh_port', 22)})"
+            )
+
+        # Inject sandbox (container) workspace host on resume. The dispatch path
+        # persisted the original pod's address into config_override; after a
+        # recreate (PVC reattach / crash recovery) that host is STALE, so we must
+        # OVERRIDE it with the current endpoint — preferring the stable Service
+        # DNS (`host`) over the ephemeral `pod_ip`. Without this, a recovered job
+        # dials a dead IP and churns to fail-loud
+        # (docs/issues/workspace_reattach_ephemeral_ip_reconnect_churn.md).
+        container_ctx = _get_container_context(job)
+        container_host = container_ctx.get("host") or container_ctx.get("pod_ip")
+        if container_ctx.get("status") == "ready" and container_host:
+            config_override = config_override or {}
+            ws = config_override.setdefault("workspace", {})
+            ws["backend"] = "sandbox"
+            remote = ws.setdefault("remote", {})
+            remote["host"] = container_host  # override the stale persisted host
+            remote["port"] = container_ctx.get("port", 22)
+            logger.info(
+                "Resume dispatch: injected container host for job %s (host=%s:%s)",
+                job_id,
+                container_host,
+                container_ctx.get("port", 22),
             )
 
         # Re-inject lite workspace config on resume. Mounts + credentials are
