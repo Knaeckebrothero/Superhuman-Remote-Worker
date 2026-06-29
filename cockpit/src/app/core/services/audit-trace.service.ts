@@ -28,6 +28,10 @@ export class AuditTraceService {
   private readonly _filter = signal<AuditFilterCategory>('all');
   readonly filter = this._filter.asReadonly();
 
+  /** Row order: 'asc' = oldest first (chronological), 'desc' = newest first. */
+  private readonly _order = signal<'asc' | 'desc'>('asc');
+  readonly order = this._order.asReadonly();
+
   /** Lean rows loaded so far, in order (oldest first). */
   private readonly _rows = signal<AuditEntry[]>([]);
   readonly rows = this._rows.asReadonly();
@@ -63,6 +67,18 @@ export class AuditTraceService {
     await this.reload();
   }
 
+  /** Change the sort order (server-side) and reload from the top. */
+  async setOrder(order: 'asc' | 'desc'): Promise<void> {
+    if (order === this._order()) return;
+    this._order.set(order);
+    await this.reload();
+  }
+
+  /** Flip oldest-first ⇄ newest-first. */
+  toggleOrder(): Promise<void> {
+    return this.setOrder(this._order() === 'asc' ? 'desc' : 'asc');
+  }
+
   /** Re-fetch from scratch (job change, filter change, manual refresh). */
   async reload(): Promise<void> {
     const token = ++this.epoch;
@@ -77,7 +93,7 @@ export class AuditTraceService {
     this.loading.set(true);
     try {
       const resp = await firstValueFrom(
-        this.api.getAuditPage(jobId, 0, this.PAGE_SIZE, this._filter()),
+        this.api.getAuditPage(jobId, 0, this.PAGE_SIZE, this._filter(), this._order()),
       );
       if (token !== this.epoch) return; // superseded by a newer job/filter
       if (resp.error) this.error.set(resp.error);
@@ -103,7 +119,7 @@ export class AuditTraceService {
     this.loadingMore.set(true);
     try {
       const resp = await firstValueFrom(
-        this.api.getAuditPage(jobId, offset, this.PAGE_SIZE, this._filter()),
+        this.api.getAuditPage(jobId, offset, this.PAGE_SIZE, this._filter(), this._order()),
       );
       if (token !== this.epoch) return; // job/filter changed mid-flight
       if (resp.entries.length > 0) {

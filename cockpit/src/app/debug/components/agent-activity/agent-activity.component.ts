@@ -32,6 +32,13 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
             {{ filter.label }}
           </button>
         }
+        <button
+          class="sort-btn"
+          (click)="trace.toggleOrder()"
+          [title]="trace.order() === 'asc' ? 'Oldest first — click to show newest first' : 'Newest first — click to show oldest first'"
+        >
+          {{ trace.order() === 'asc' ? '↑ Oldest' : '↓ Newest' }}
+        </button>
         <span class="entry-count">{{ trace.rows().length }}/{{ trace.total() }}</span>
       </div>
 
@@ -345,6 +352,24 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
         background: var(--accent-color, #cba6f7);
         color: var(--on-accent, var(--timeline-bg, #11111b));
         border-color: var(--accent-color, #cba6f7);
+      }
+
+      .sort-btn {
+        padding: 5px 10px;
+        border: 1px solid var(--border-color, #45475a);
+        border-radius: var(--radius-control);
+        background: transparent;
+        color: var(--text-secondary, #a6adc8);
+        font-size: 11px;
+        font-family: inherit;
+        cursor: pointer;
+        transition: all 0.15s ease;
+        white-space: nowrap;
+      }
+
+      .sort-btn:hover {
+        background: var(--surface-0, #313244);
+        color: var(--text-primary, #cdd6f4);
       }
 
       .entry-count {
