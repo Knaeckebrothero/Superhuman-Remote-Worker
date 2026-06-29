@@ -10870,6 +10870,7 @@ async def get_job_audit(
     limit: Optional[int] = Query(default=None, ge=1, le=200),
     order: Literal["asc", "desc"] = Query(default="asc"),
     filter: FilterCategory = Query(default="all"),
+    lean: bool = Query(default=False),
 ) -> dict[str, Any]:
     """Get paginated audit entries for a job from MongoDB.
 
@@ -10909,9 +10910,31 @@ async def get_job_audit(
             offset=offset,
             limit=limit,
             order=order,
+            lean=lean,
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/api/jobs/{job_id}/audit/step/{step_id}")
+async def get_audit_step(request: Request, job_id: str, step_id: int) -> dict[str, Any]:
+    """Full detail for a single audit step (heavy payload + metadata).
+
+    The lean list projection (``/audit?lean=true``) omits per-row arguments,
+    tracebacks, state, and metadata; the debug UI fetches them on demand here when
+    a row is expanded. The distinct ``/step/`` segment avoids colliding with the
+    ``/audit/bulk`` and ``/audit/timerange`` routes.
+    """
+    await require_job_access(request, postgres_db, job_id)
+    if not audit_reader.is_available:
+        raise HTTPException(status_code=503, detail="Audit store not available")
+    try:
+        doc = await audit_reader.get_audit_step(job_id, step_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    if doc is None:
+        raise HTTPException(status_code=404, detail=f"Audit step '{step_id}' not found")
+    return doc
 
 
 @app.get("/api/requests/{doc_id}")
