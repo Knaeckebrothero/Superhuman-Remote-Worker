@@ -395,114 +395,6 @@ class AuditStore:
             logger.warning(f"get_audit_time_range failed: {e}")
             return None
 
-    async def get_job_audit_bulk(
-        self, job_id: str, offset: int = 0, limit: int = 5000
-    ) -> Dict[str, Any]:
-        limit = min(limit, 5000)
-        empty = {
-            "entries": [],
-            "total": 0,
-            "offset": offset,
-            "limit": limit,
-            "hasMore": False,
-        }
-        if not self._available or self._pool is None:
-            return empty
-        try:
-            async with self._pool.acquire() as conn:
-                total = await conn.fetchval(
-                    "SELECT count(*) FROM agent_audit WHERE job_id=$1::uuid "
-                    "AND event_phase='pre'",
-                    job_id,
-                )
-                total = total or 0
-                rows = await conn.fetch(
-                    _STITCH_CORE + " ORDER BY f.id ASC OFFSET $2 LIMIT $3",
-                    job_id,
-                    offset,
-                    limit,
-                )
-            entries = []
-            for r in rows:
-                doc = _audit_row_to_doc(r)
-                doc["timestamp"] = _to_iso_utc(doc["timestamp"])
-                entries.append(doc)
-            return {
-                "entries": entries,
-                "total": total,
-                "offset": offset,
-                "limit": limit,
-                "hasMore": (offset + limit) < total,
-            }
-        except Exception as e:
-            logger.warning(f"get_job_audit_bulk failed: {e}")
-            return empty
-
-    async def get_graph_deltas_bulk(
-        self, job_id: str, offset: int = 0, limit: int = 5000
-    ) -> Dict[str, Any]:
-        limit = min(limit, 5000)
-        empty = {
-            "deltas": [],
-            "total": 0,
-            "offset": offset,
-            "limit": limit,
-            "hasMore": False,
-        }
-        if not self._available or self._pool is None:
-            return empty
-        try:
-            async with self._pool.acquire() as conn:
-                total = await conn.fetchval(
-                    "SELECT count(*) FROM agent_audit WHERE job_id=$1::uuid "
-                    "AND event_phase='pre' AND step_type='tool' "
-                    "AND payload->'tool'->>'name' = ANY($2)",
-                    job_id,
-                    GRAPH_TOOL_NAMES,
-                )
-                total = total or 0
-                rows = await conn.fetch(
-                    """
-                    WITH numbered AS (
-                        SELECT a.*, ROW_NUMBER() OVER (ORDER BY a.id) AS step_number
-                        FROM agent_audit a
-                        WHERE a.job_id = $1::uuid AND a.event_phase = 'pre'
-                    )
-                    SELECT f.id, f.timestamp, f.step_number,
-                           f.payload->'tool'->'arguments'->>'query' AS cypher_query
-                    FROM numbered f
-                    WHERE f.step_type = 'tool'
-                      AND f.payload->'tool'->>'name' = ANY($2)
-                    ORDER BY f.id ASC OFFSET $3 LIMIT $4
-                    """,
-                    job_id,
-                    GRAPH_TOOL_NAMES,
-                    offset,
-                    limit,
-                )
-            deltas = []
-            for i, r in enumerate(rows):
-                ts = r["timestamp"]
-                deltas.append(
-                    {
-                        "toolCallIndex": offset + i,
-                        "timestamp": _to_iso_utc(ts) if ts else None,
-                        "cypherQuery": r["cypher_query"] or "",
-                        "toolCallId": str(r["id"]),
-                        "stepNumber": r["step_number"],
-                    }
-                )
-            return {
-                "deltas": deltas,
-                "total": total,
-                "offset": offset,
-                "limit": limit,
-                "hasMore": (offset + limit) < total,
-            }
-        except Exception as e:
-            logger.warning(f"get_graph_deltas_bulk failed: {e}")
-            return empty
-
     async def iter_tool_calls(self, job_id: str) -> AsyncIterator[Dict[str, Any]]:
         """Stream stitched tool-step docs (replaces the raw graph_routes cursor).
 
@@ -535,13 +427,27 @@ class AuditStore:
     # -- chat_history reads -------------------------------------------------
 
     async def get_chat_history(
-        self, job_id: str, page: int = 1, page_size: int = 50
+        self,
+        job_id: str,
+        page: int = 1,
+        page_size: int = 50,
+        offset: Optional[int] = None,
+        limit: Optional[int] = None,
     ) -> Dict[str, Any]:
+        """Paginated chat turns.
+
+        Supports offset/limit (REST-style) or page/pageSize (legacy); offset/limit
+        wins when both are provided. Mirrors ``get_job_audit`` so a single endpoint
+        can serve both styles and the response echoes both.
+        """
+        effective_size = limit if limit is not None else page_size
         empty = {
             "entries": [],
             "total": 0,
             "page": max(1, page),
-            "pageSize": page_size,
+            "pageSize": effective_size,
+            "offset": offset if offset is not None else 0,
+            "limit": effective_size,
             "hasMore": False,
         }
         if not self._available or self._pool is None:
@@ -552,67 +458,37 @@ class AuditStore:
                     "SELECT count(*) FROM chat_history WHERE job_id=$1::uuid", job_id
                 )
                 total = total or 0
-                if page == -1:
-                    page = max(1, math.ceil(total / page_size)) if page_size else 1
-                skip = (page - 1) * page_size
+                if offset is not None:
+                    effective_skip = offset
+                else:
+                    if page == -1:
+                        page = (
+                            max(1, math.ceil(total / effective_size))
+                            if effective_size
+                            else 1
+                        )
+                    effective_skip = (page - 1) * effective_size
                 rows = await conn.fetch(
                     "SELECT * FROM chat_history WHERE job_id=$1::uuid "
                     "ORDER BY timestamp, id OFFSET $2 LIMIT $3",
                     job_id,
-                    skip,
-                    page_size,
+                    effective_skip,
+                    effective_size,
                 )
+            response_page = (
+                (effective_skip // effective_size) + 1 if effective_size else 1
+            )
             return {
                 "entries": [self._chat_row_to_doc(r) for r in rows],
                 "total": total,
-                "page": page,
-                "pageSize": page_size,
-                "hasMore": (skip + page_size) < total,
+                "page": response_page,
+                "pageSize": effective_size,
+                "offset": effective_skip,
+                "limit": effective_size,
+                "hasMore": (effective_skip + effective_size) < total,
             }
         except Exception as e:
             logger.warning(f"get_chat_history failed: {e}")
-            return empty
-
-    async def get_chat_history_bulk(
-        self, job_id: str, offset: int = 0, limit: int = 5000
-    ) -> Dict[str, Any]:
-        limit = min(limit, 5000)
-        empty = {
-            "entries": [],
-            "total": 0,
-            "offset": offset,
-            "limit": limit,
-            "hasMore": False,
-        }
-        if not self._available or self._pool is None:
-            return empty
-        try:
-            async with self._pool.acquire() as conn:
-                total = await conn.fetchval(
-                    "SELECT count(*) FROM chat_history WHERE job_id=$1::uuid", job_id
-                )
-                total = total or 0
-                rows = await conn.fetch(
-                    "SELECT * FROM chat_history WHERE job_id=$1::uuid "
-                    "ORDER BY timestamp, id OFFSET $2 LIMIT $3",
-                    job_id,
-                    offset,
-                    limit,
-                )
-            entries = []
-            for r in rows:
-                doc = self._chat_row_to_doc(r)
-                doc["timestamp"] = _to_iso_utc(doc["timestamp"])
-                entries.append(doc)
-            return {
-                "entries": entries,
-                "total": total,
-                "offset": offset,
-                "limit": limit,
-                "hasMore": (offset + limit) < total,
-            }
-        except Exception as e:
-            logger.warning(f"get_chat_history_bulk failed: {e}")
             return empty
 
     @staticmethod

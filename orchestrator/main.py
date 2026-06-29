@@ -10923,7 +10923,7 @@ async def get_audit_step(request: Request, job_id: str, step_id: int) -> dict[st
     The lean list projection (``/audit?lean=true``) omits per-row arguments,
     tracebacks, state, and metadata; the debug UI fetches them on demand here when
     a row is expanded. The distinct ``/step/`` segment avoids colliding with the
-    ``/audit/bulk`` and ``/audit/timerange`` routes.
+    ``/audit/timerange`` route.
     """
     await require_job_access(request, postgres_db, job_id)
     if not audit_reader.is_available:
@@ -10995,6 +10995,8 @@ async def get_job_chat_history(
     job_id: str,
     page: int = Query(default=1, ge=-1),
     page_size: int = Query(default=50, ge=1, le=200, alias="pageSize"),
+    offset: Optional[int] = Query(default=None, ge=0),
+    limit: Optional[int] = Query(default=None, ge=1, le=200),
 ) -> dict[str, Any]:
     """Get paginated chat history for a job.
 
@@ -11002,17 +11004,27 @@ async def get_job_chat_history(
     Each entry contains the input message(s) that triggered an LLM response
     and the response itself.
 
+    Two pagination styles are supported (mirrors ``/audit``):
+        - offset/limit (REST-style): ?offset=50&limit=50
+        - page/pageSize (legacy):    ?page=2&pageSize=50
+    If both are provided, offset/limit wins. The response echoes both styles.
+
     Query params:
+        offset: Entries to skip (overrides page if set)
+        limit: Max entries to return, max 200 (overrides pageSize if set)
         page: Page number (1-indexed). Use -1 to request the last page.
         pageSize: Number of entries per page (max 200)
     """
     await require_job_access(request, postgres_db, job_id)
+    effective_size = limit if limit is not None else page_size
     if not audit_reader.is_available:
         return {
             "entries": [],
             "total": 0,
             "page": page,
-            "pageSize": page_size,
+            "pageSize": effective_size,
+            "offset": offset if offset is not None else 0,
+            "limit": effective_size,
             "hasMore": False,
             "error": "MongoDB not available",
         }
@@ -11022,6 +11034,8 @@ async def get_job_chat_history(
             job_id=job_id,
             page=page,
             page_size=page_size,
+            offset=offset,
+            limit=limit,
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
@@ -11854,115 +11868,16 @@ async def get_archived_todos(
 # =============================================================================
 
 
-@app.get("/api/jobs/{job_id}/audit/bulk")
-async def get_job_audit_bulk(
-    request: Request,
-    job_id: str,
-    offset: int = Query(default=0, ge=0),
-    limit: int = Query(default=5000, ge=1, le=5000),
-) -> dict[str, Any]:
-    """Get bulk audit entries for caching in IndexedDB.
-
-    Uses offset/limit instead of page/pageSize for efficient bulk fetching.
-    Returns up to 5000 entries per request.
-
-    Query params:
-        offset: Number of entries to skip (default 0)
-        limit: Maximum entries to return (max 5000)
-    """
-    await require_job_access(request, postgres_db, job_id)
-    if not audit_reader.is_available:
-        return {
-            "entries": [],
-            "total": 0,
-            "offset": offset,
-            "limit": limit,
-            "hasMore": False,
-            "error": "MongoDB not available",
-        }
-
-    try:
-        return await audit_reader.get_job_audit_bulk(
-            job_id=job_id,
-            offset=offset,
-            limit=limit,
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) from e
-
-
-@app.get("/api/jobs/{job_id}/chat/bulk")
-async def get_job_chat_bulk(
-    request: Request,
-    job_id: str,
-    offset: int = Query(default=0, ge=0),
-    limit: int = Query(default=5000, ge=1, le=5000),
-) -> dict[str, Any]:
-    """Get bulk chat history entries for caching in IndexedDB.
-
-    Uses offset/limit for efficient bulk fetching.
-    Returns up to 5000 entries per request.
-
-    Query params:
-        offset: Number of entries to skip (default 0)
-        limit: Maximum entries to return (max 5000)
-    """
-    await require_job_access(request, postgres_db, job_id)
-    if not audit_reader.is_available:
-        return {
-            "entries": [],
-            "total": 0,
-            "offset": offset,
-            "limit": limit,
-            "hasMore": False,
-            "error": "MongoDB not available",
-        }
-
-    try:
-        return await audit_reader.get_chat_history_bulk(
-            job_id=job_id,
-            offset=offset,
-            limit=limit,
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) from e
-
-
-@app.get("/api/jobs/{job_id}/graph/bulk")
-async def get_job_graph_bulk(
-    request: Request,
-    job_id: str,
-    offset: int = Query(default=0, ge=0),
-    limit: int = Query(default=5000, ge=1, le=5000),
-) -> dict[str, Any]:
-    """Get bulk graph deltas (execute_cypher_query tool calls) for caching.
-
-    Returns raw graph operation data without computed snapshots.
-    Use /api/graph/changes/{job_id} for full graph timeline with snapshots.
-
-    Query params:
-        offset: Number of deltas to skip (default 0)
-        limit: Maximum deltas to return (max 5000)
-    """
-    await require_job_access(request, postgres_db, job_id)
-    if not audit_reader.is_available:
-        return {
-            "deltas": [],
-            "total": 0,
-            "offset": offset,
-            "limit": limit,
-            "hasMore": False,
-            "error": "MongoDB not available",
-        }
-
-    try:
-        return await audit_reader.get_graph_deltas_bulk(
-            job_id=job_id,
-            offset=offset,
-            limit=limit,
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) from e
+# NOTE: the former bulk audit/chat/graph endpoints
+# (GET /api/jobs/{id}/{audit,chat,graph}/bulk, limit up to 5000) were removed.
+# They materialized whole-job histories — including per-row metadata
+# (resolved_config, ~127 kB/row) that nothing rendered — and OOM'd the
+# orchestrator on large jobs. Consumers now page the lean endpoints instead:
+# GET /api/jobs/{id}/audit?lean=true&offset=&limit= (per-step detail via
+# /audit/step/{id}), GET /api/jobs/{id}/chat?offset=&limit=, and
+# GET /api/graph/changes/{id} for the graph timeline. See
+# docs/features/debug_audit_view_refactor.md and
+# docs/issues/audit_metadata_config_duplication_ooms_orchestrator.md.
 
 
 @app.get("/api/jobs/{job_id}/version")
