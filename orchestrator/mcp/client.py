@@ -517,21 +517,35 @@ class AsyncCockpitClient:
         self,
         job_id: str,
         offset: int = 0,
-        limit: int = 500,
+        limit: int = 200,
+        filter_category: FilterCategory = "all",
     ) -> dict[str, Any]:
-        """Get bulk audit entries for a job (offset/limit based).
+        """Get a chunk of audit entries via offset/limit (lean projection).
+
+        Routes through the standard ``/audit`` endpoint with ``lean=true`` so
+        the heavy per-row payload (resolved_config metadata, tool arguments,
+        state, tracebacks) is dropped server-side — tool *results* are still
+        included. The former ``/audit/bulk`` route was removed for OOMing the
+        orchestrator on large jobs.
 
         Args:
             job_id: Job UUID
             offset: Number of entries to skip
-            limit: Maximum entries to return (up to 500 for MCP)
+            limit: Maximum entries to return (capped at 200)
+            filter_category: Filter type (all, messages, tools, errors)
 
         Returns:
             Dict with entries, total, offset, limit, hasMore
         """
+        limit = min(limit, 200)
         resp = await self._client.get(
-            f"/api/jobs/{job_id}/audit/bulk",
-            params={"offset": offset, "limit": limit},
+            f"/api/jobs/{job_id}/audit",
+            params={
+                "offset": offset,
+                "limit": limit,
+                "lean": "true",
+                "filter": filter_category,
+            },
         )
         resp.raise_for_status()
         return resp.json()
@@ -584,20 +598,25 @@ class AsyncCockpitClient:
         self,
         job_id: str,
         offset: int = 0,
-        limit: int = 500,
+        limit: int = 200,
     ) -> dict[str, Any]:
-        """Get bulk chat history entries for a job (offset/limit based).
+        """Get a chunk of chat turns via offset/limit.
+
+        Routes through the standard ``/chat`` endpoint (which now accepts
+        offset/limit, mirroring ``/audit``). The former ``/chat/bulk`` route
+        was removed alongside the other bulk endpoints.
 
         Args:
             job_id: Job UUID
             offset: Number of entries to skip
-            limit: Maximum entries to return (up to 500 for MCP)
+            limit: Maximum entries to return (capped at 200)
 
         Returns:
             Dict with entries, total, offset, limit, hasMore
         """
+        limit = min(limit, 200)
         resp = await self._client.get(
-            f"/api/jobs/{job_id}/chat/bulk",
+            f"/api/jobs/{job_id}/chat",
             params={"offset": offset, "limit": limit},
         )
         resp.raise_for_status()

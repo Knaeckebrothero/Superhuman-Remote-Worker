@@ -912,3 +912,74 @@ class TestMcpAuthFallback:
             with pytest.raises(HTTPException) as exc_info:
                 await get_current_user(mock_request, mock_db)
             assert exc_info.value.status_code == 401
+
+
+class TestAsyncCockpitClientAuditChatBulk:
+    """The MCP bulk readers now page the lean ``/audit`` + ``/chat`` endpoints.
+
+    The dedicated ``/audit/bulk`` + ``/chat/bulk`` routes were removed (they
+    materialized whole-job histories incl. heavy per-row metadata and OOM'd the
+    orchestrator). These tests pin the new request shapes so a regression can't
+    silently re-point them at the dead routes or drop the lean projection.
+    """
+
+    @pytest.fixture
+    def client(self):
+        from mcp.client import AsyncCockpitClient
+
+        return AsyncCockpitClient(base_url="http://localhost:8085")
+
+    @pytest.mark.asyncio
+    async def test_get_audit_bulk_uses_lean_audit_endpoint(self, client):
+        """audit bulk -> GET /audit?lean=true with offset/limit + filter."""
+        resp = _mock_response(
+            {"entries": [], "total": 0, "offset": 0, "limit": 200, "hasMore": False}
+        )
+        with patch.object(client._client, "get", AsyncMock(return_value=resp)) as mock:
+            await client.get_audit_bulk(job_id="job-1", offset=20, limit=100)
+
+            url = mock.call_args[0][0]
+            params = mock.call_args[1]["params"]
+            assert url == "/api/jobs/job-1/audit"
+            assert params["lean"] == "true"
+            assert params["offset"] == 20
+            assert params["limit"] == 100
+            assert params["filter"] == "all"
+
+    @pytest.mark.asyncio
+    async def test_get_audit_bulk_passes_filter(self, client):
+        """The filter category must reach the endpoint (it was dropped before)."""
+        resp = _mock_response({"entries": [], "total": 0, "hasMore": False})
+        with patch.object(client._client, "get", AsyncMock(return_value=resp)) as mock:
+            await client.get_audit_bulk(job_id="job-1", filter_category="errors")
+            assert mock.call_args[1]["params"]["filter"] == "errors"
+
+    @pytest.mark.asyncio
+    async def test_get_audit_bulk_caps_limit_at_200(self, client):
+        """The lean endpoint rejects limit>200, so the client must clamp."""
+        resp = _mock_response({"entries": [], "total": 0, "hasMore": False})
+        with patch.object(client._client, "get", AsyncMock(return_value=resp)) as mock:
+            await client.get_audit_bulk(job_id="job-1", limit=5000)
+            assert mock.call_args[1]["params"]["limit"] == 200
+
+    @pytest.mark.asyncio
+    async def test_get_chat_bulk_uses_chat_endpoint(self, client):
+        """chat bulk -> GET /chat with offset/limit (no /chat/bulk)."""
+        resp = _mock_response(
+            {"entries": [], "total": 0, "offset": 0, "limit": 200, "hasMore": False}
+        )
+        with patch.object(client._client, "get", AsyncMock(return_value=resp)) as mock:
+            await client.get_chat_bulk(job_id="job-1", offset=10, limit=50)
+
+            url = mock.call_args[0][0]
+            params = mock.call_args[1]["params"]
+            assert url == "/api/jobs/job-1/chat"
+            assert params["offset"] == 10
+            assert params["limit"] == 50
+
+    @pytest.mark.asyncio
+    async def test_get_chat_bulk_caps_limit_at_200(self, client):
+        resp = _mock_response({"entries": [], "total": 0, "hasMore": False})
+        with patch.object(client._client, "get", AsyncMock(return_value=resp)) as mock:
+            await client.get_chat_bulk(job_id="job-1", limit=5000)
+            assert mock.call_args[1]["params"]["limit"] == 200

@@ -211,18 +211,20 @@ async def get_audit_trail(
 async def get_audit_bulk(
     job_id: str,
     offset: int = 0,
-    limit: int = 500,
+    limit: int = 200,
     filter: Literal["all", "messages", "tools", "errors"] = "all",
 ) -> str:
-    """Get bulk audit entries using offset/limit pagination.
+    """Get audit entries in chunks using offset/limit pagination.
 
-    Better than page-based audit trail for scanning large histories.
-    Supports up to 500 entries per request.
+    Better than page-based audit trail for scanning large histories. Returns a
+    lean projection: LLM messages, tool calls with their results, and errors.
+    Per-call tool arguments and full tracebacks are omitted to keep large scans
+    cheap. Supports up to 200 entries per request.
 
     Args:
         job_id: Job UUID to get audit for
         offset: Number of entries to skip (default: 0)
-        limit: Maximum entries to return (max 500, default 500)
+        limit: Maximum entries to return (max 200, default 200)
         filter: Filter category (all, messages, tools, errors)
 
     Returns:
@@ -230,14 +232,15 @@ async def get_audit_bulk(
     """
     if limit < 1:
         limit = 1
-    elif limit > 500:
-        limit = 500
+    elif limit > 200:
+        limit = 200
 
     client = _get_client()
     data = await client.get_audit_bulk(
         job_id=job_id,
         offset=offset,
         limit=limit,
+        filter_category=filter,
     )
     return fmt.format_audit_bulk(data)
 
@@ -279,25 +282,25 @@ async def get_chat_history(
 async def get_chat_bulk(
     job_id: str,
     offset: int = 0,
-    limit: int = 500,
+    limit: int = 200,
 ) -> str:
-    """Get bulk chat history using offset/limit pagination.
+    """Get chat history in chunks using offset/limit pagination.
 
     Better than page-based chat history for scanning large conversations.
-    Supports up to 500 entries per request.
+    Supports up to 200 entries per request.
 
     Args:
         job_id: Job UUID to get chat history for
         offset: Number of entries to skip (default: 0)
-        limit: Maximum entries to return (max 500, default 500)
+        limit: Maximum entries to return (max 200, default 200)
 
     Returns:
         Formatted chat turns with offset metadata
     """
     if limit < 1:
         limit = 1
-    elif limit > 500:
-        limit = 500
+    elif limit > 200:
+        limit = 200
 
     client = _get_client()
     data = await client.get_chat_bulk(
