@@ -62,32 +62,10 @@ import {
 import {ThreadUploadResponse, UploadInfo, UploadResponse} from '../models/file.model';
 import {AuditEntry, AuditFilterCategory, AuditResponse, JobSummary,} from '../models/audit.model';
 import {LLMRequest} from '../../debug/request.model';
-import {GraphChangeResponse, GraphDelta} from '../../debug/graph.model';
+import {GraphChangeResponse} from '../../debug/graph.model';
 import {ChatEntry, ChatHistoryResponse} from '../models/chat.model';
 import {PendingActionCounts, ThreadDetail} from '../models/action.model';
 import {environment} from '../environment';
-
-/**
- * Response for bulk audit endpoint.
- */
-export interface BulkAuditResponse {
-  entries: AuditEntry[];
-  total: number;
-  offset: number;
-  limit: number;
-  hasMore: boolean;
-}
-
-/**
- * Response for bulk chat endpoint.
- */
-export interface BulkChatResponse {
-  entries: ChatEntry[];
-  total: number;
-  offset: number;
-  limit: number;
-  hasMore: boolean;
-}
 
 /**
  * Audit-store id normalization (transitional). The store is migrating
@@ -116,17 +94,6 @@ function normalizeChatEntry(e: ChatEntry): ChatEntry {
 function normalizeLLMRequest(r: LLMRequest): LLMRequest {
   r._id = String(r.id ?? r._id ?? '');
   return r;
-}
-
-/**
- * Response for bulk graph changes endpoint.
- */
-export interface BulkGraphResponse {
-  deltas: GraphDelta[];
-  total: number;
-  offset: number;
-  limit: number;
-  hasMore: boolean;
 }
 
 /**
@@ -429,101 +396,6 @@ export class ApiService {
             pageSize: 50,
             hasMore: false,
             error: error.message || 'Failed to fetch chat history',
-          });
-        }),
-      );
-  }
-
-  // ===== Bulk Fetch Endpoints for Caching =====
-
-  /**
-   * Get bulk audit entries for caching in IndexedDB.
-   * Returns large batches (up to 5000 entries) for efficient caching.
-   */
-  getJobAuditBulk(
-    jobId: string,
-    offset: number = 0,
-    limit: number = 5000,
-  ): Observable<BulkAuditResponse> {
-    const params = new HttpParams()
-      .set('offset', offset.toString())
-      .set('limit', limit.toString());
-
-    return this.http
-      .get<BulkAuditResponse>(`${this.baseUrl}/jobs/${jobId}/audit/bulk`, { params })
-      .pipe(
-        map((response) => {
-          response.entries?.forEach(normalizeAuditEntry);
-          return response;
-        }),
-        catchError((error) => {
-          console.error(`Failed to fetch bulk audit for job ${jobId}:`, error);
-          return of({
-            entries: [],
-            total: 0,
-            offset,
-            limit,
-            hasMore: false,
-          });
-        }),
-      );
-  }
-
-  /**
-   * Get bulk chat entries for caching in IndexedDB.
-   */
-  getChatHistoryBulk(
-    jobId: string,
-    offset: number = 0,
-    limit: number = 5000,
-  ): Observable<BulkChatResponse> {
-    const params = new HttpParams()
-      .set('offset', offset.toString())
-      .set('limit', limit.toString());
-
-    return this.http
-      .get<BulkChatResponse>(`${this.baseUrl}/jobs/${jobId}/chat/bulk`, { params })
-      .pipe(
-        map((response) => {
-          response.entries?.forEach(normalizeChatEntry);
-          return response;
-        }),
-        catchError((error) => {
-          console.error(`Failed to fetch bulk chat for job ${jobId}:`, error);
-          return of({
-            entries: [],
-            total: 0,
-            offset,
-            limit,
-            hasMore: false,
-          });
-        }),
-      );
-  }
-
-  /**
-   * Get bulk graph deltas for caching in IndexedDB.
-   */
-  getGraphDeltasBulk(
-    jobId: string,
-    offset: number = 0,
-    limit: number = 5000,
-  ): Observable<BulkGraphResponse> {
-    const params = new HttpParams()
-      .set('offset', offset.toString())
-      .set('limit', limit.toString());
-
-    return this.http
-      .get<BulkGraphResponse>(`${this.baseUrl}/jobs/${jobId}/graph/bulk`, { params })
-      .pipe(
-        catchError((error) => {
-          console.error(`Failed to fetch bulk graph deltas for job ${jobId}:`, error);
-          return of({
-            deltas: [],
-            total: 0,
-            offset,
-            limit,
-            hasMore: false,
           });
         }),
       );
