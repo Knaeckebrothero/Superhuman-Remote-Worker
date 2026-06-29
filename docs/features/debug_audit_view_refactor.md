@@ -1,8 +1,46 @@
 # Debug audit view refactor — from "download the whole job" to a windowed trace inspector
 
-**Status:** **Proposed — design + implementation roadmap.** 2026-06-29. **Slider + synchronized replay: decided — removed entirely (owner: demo-only).** **Phase 0 ✅ committed (`7ea0d798`); Phase 1 (lean projection + `/audit/step/{id}` + `?lean=`) ✅ done + k3d-verified, uncommitted.** The crash that motivated this is tracked + root-caused in the companion issue `docs/issues/audit_metadata_config_duplication_ooms_orchestrator.md` (the write-side OOM fix is **Phase 0** here). The key enabler: most of the server-side primitives this refactor needs **already exist** (`get_job_audit` is paged + filtered, `get_request` is lazy-detail, `iter_tool_calls` is keyset) — so this is largely a **frontend deletion + one lean projection**, not a rewrite.
+**Status:** **Implemented + k3d/browser-verified.** 2026-06-29. P0 committed (`7ea0d798`); P1 + the Agent-Activity refactor (P2) pushed + **deployed to dev**; **chat + graph migration + slider removal + dead-code sweep + a sort toggle done + verified, uncommitted on `develop`.** Current as-built state is in **§0 below**; the original design + roadmap (§§1–10) are kept for context with deviations annotated. Slider + synchronized replay: **removed entirely** (owner: demo-only). The crash that motivated this is root-caused in the companion issue `docs/issues/audit_metadata_config_duplication_ooms_orchestrator.md` (the write-side OOM fix is **Phase 0**). The enabler: most server-side primitives already existed (`get_job_audit` paged+filtered, `get_request` lazy-detail, `iter_tool_calls` keyset) — so this was largely **frontend deletion + one lean projection**, not a rewrite.
 **Component:** Cockpit debug dashboard (`cockpit/src/app/debug/**`, `cockpit/src/app/core/services/data.service.ts`, `indexed-db.service.ts`, `api.service.ts`) · audit read path (`orchestrator/database/audit_store.py`, `orchestrator/main.py` `/api/jobs/{id}/audit*`).
 **Related:** `docs/issues/audit_metadata_config_duplication_ooms_orchestrator.md` (P0 root cause) · memory topics `project_self_improvement_loop`, `project_loop_repo_compounding` (loop jobs run the most steps → most exposed) · `project_cross_pod_checkpointer_d3` (separate checkpoint-blob bloat).
+
+---
+
+## 0. Implementation status (as built — 2026-06-29)
+
+Functionally **complete and verified** (k3d build + 716 cockpit tests + live browser via Playwright). Two deliberate deviations from the original plan:
+
+- **Infinite scroll, not CDK virtual scroll.** `@angular/cdk-experimental` (autosize, needed for variable-height *expandable* rows) isn't installed. Rather than add an experimental dep or split detail into a separate pane, each panel uses paged **infinite scroll** (fetch the next page near the bottom). It still kills the eager download and renders incrementally; strict viewport virtualization stays a future option if very large jobs strain the DOM.
+- **Driven off `DataService.currentJobId`, not `jobContext.activeJobId`.** The debug dashboard's job dropdown sets `currentJobId` (via `setCurrentJob`) but never populates `activeJobId` — caught live via Playwright: the panel sat empty because the effect watched the wrong signal.
+
+### Done + verified
+
+| Area | What landed |
+|---|---|
+| **P0** (backend) | config blobs stripped from per-row audit metadata; committed `7ea0d798`, deployed to dev. *Backfill of existing rows run on **local k3d only**, NOT dev/prod (see Remaining).* |
+| **P1** (backend) | `_STITCH_LEAN` + `lean=` flag on `get_job_audit`; `get_audit_step` + `GET /api/jobs/{id}/audit/step/{step_id}`. Stitch composed from shared parts so CORE/LEAN can't drift. MCP fat path unchanged. |
+| **P2 API** | `ApiService.getAuditPage(…, order)` (lean, offset-paged) + `getAuditStep`. |
+| **P2 frontend** | new **`AuditTraceService`** (paged infinite-scroll + lazy per-step detail + server-side filter + asc/desc order); **`agent-activity.component`** rewritten onto it. Pushed + deployed to dev. |
+| **P3 chat** | new **`ChatTraceService`** (paged `/chat`); **`chat-history.component`** rewritten onto it (infinite scroll, decoupled from the slider). |
+| **P3 graph** | `GraphService` already loaded independently (`getGraphChanges`); removed its now-inert slider-sync effects. |
+| **2c — kill the OOM** | `DataService.loadJob` gutted → **no `/*/bulk` eager download**; `DataService` slimmed to a job-selection holder. |
+| **2c — slider** | removed from `timeline.component` (scrubber/play/time/loading/cache); timeline = job dropdown + refresh + AUTO. |
+| **Sort toggle** (new, beyond plan) | asc⇄desc order toggle on Agent Activity (backend `order=` already existed) → newest-first lands you on the end of a job. |
+| **Dead-code sweep** | removed `fetchAndCacheJob`/`loadWindow` + all slider/window signals from `DataService`; `getJobAuditBulk`/`getChatHistoryBulk`/`getGraphDeltasBulk` + `Bulk*Response` from `ApiService`; graph slider-sync. `data.service.spec` rewritten. **716/716 tests pass.** |
+
+**Browser-verified (697-step job):** selecting a job issues only `/audit?…lean=true` + `/chat?page` (**no `/*/bulk`**); Agent 100/697, Chat 100/160; expand → `/audit/step/{id}` fills heavy args; filter re-queries server-side (errors→0, tools→159); sort → `order=desc` shows #697 first; slider gone; **0 console errors**.
+
+### Remaining (deferred; none blocking)
+
+- **MCP `get_audit_bulk` still hits `/audit/bulk`** (`mcp/server.py`). Until it's migrated to the lean/paged path, the **backend `/*/bulk` endpoints + `get_*_bulk` store methods stay** — so §7-P3 step 3 and §8's *backend* deletions are **not yet done**. Migrating MCP closes the last OOM-prone read path and lets the bulk endpoints go.
+- **Dev/prod metadata backfill not run** — existing `19707fa1` rows still carry fat metadata, so the *old* `/audit/bulk` path (MCP, or any un-migrated caller) can still OOM on dev. The new lean UI path is immune (strips at read time).
+- **`IndexedDbService`** audit/chat/graph cache methods are now dead (no callers) but the Dexie DB still serves session `thread*` tables — trimming wants a schema-version bump. Low value.
+- **Live tail** (§7-P3 step 2) — auto-refresh now just reloads the job list; per-stream keyset tail / follow-mode is future work.
+- Unused timeline CSS (`.scrubber`/`.play-button`/…) — cosmetic.
+
+### Files (uncommitted on `develop`, atop the deployed P0–P2)
+
+New: `cockpit/src/app/core/services/{audit-trace,chat-trace}.service.ts`. Changed: `api.service.ts`, `data.service.ts` (+ `.spec`), `agent-activity.component.ts`, `chat-history.component.ts`, `timeline.component.ts`, `graph.service.ts`, `orchestrator/database/audit_store.py`, `orchestrator/main.py`.
 
 ---
 
@@ -69,7 +107,7 @@ A post-hoc (and live-tail) execution-trace inspector — same family as a CI log
 |---|---|---|
 | Fetch | eager: all audit+chat+graph before first render | lazy: fetch the visible range on demand |
 | Row payload | fat (~130 kB: metadata + full payload) | lean (~hundreds of bytes); heavy detail on click |
-| Render | 1000-row client window driven by a global slider | virtualized viewport (~30 visible rows) via Angular CDK |
+| Render | 1000-row client window driven by a global slider | incremental paged **infinite scroll** (as built — CDK virtual scroll deferred, §0) |
 | Filter | client-side over downloaded data | server-side pushdown (already supported) |
 | Live job | re-download everything every 15 s | keyset tail — append only `after_id` |
 | Storage | Dexie cache + schema-versioning + invalidation tax | none for debug streams (optional slim cache later) |
@@ -91,7 +129,7 @@ A post-hoc (and live-tail) execution-trace inspector — same family as a CI log
 
 | # | Decision | Choice | Rationale |
 |---|---|---|---|
-| 1 | Navigation metaphor | **Remove all sliders** (global `timeline.component.ts:77` + graph-timeline's own `:103`); virtual scroll + "jump to start/end/step N" + filter tabs + phase markers on the scrollbar | Demo-only widget; nobody uses it; debug-scoped, safe to delete. |
+| 1 | Navigation metaphor | **Remove all sliders** (global `timeline.component.ts:77` + graph-timeline's own `:103`); infinite scroll (as built — not CDK, §0) + filter tabs + an asc/desc **sort toggle** + phase markers | Demo-only widget; nobody uses it; debug-scoped, safe to delete. |
 | 2 | Synchronized replay | **Removed entirely — not replaced** (owner: demo-only). Independent panels; the `request_id`→Request Viewer cross-link stays (lazy detail, not replay). | No real consumer; the replay windowing is what drives the eager load. |
 | 3 | IndexedDB for debug streams | **Drop** `auditEntries`/`chatEntries`/`graphDeltas`/`jobMetadata` tables | A workaround for fat eager downloads; with lean server paging it's pure complexity (schema v4, `clearJob` dance, the chat id-shape cutover bug noted at `data.service.ts:521`). **Keep `threadCursors`/`threadMessages`** (sessions). Re-add a slim cache only if repeat-open latency annoys. |
 | 4 | Paging model | **Offset** for v1 (finished jobs); **keyset** (`after_id`) for the live-tail path | Offset is simplest and `get_job_audit` already does it; offset drifts as rows append, so live tail needs keyset. |
@@ -132,7 +170,7 @@ Write-side fix from `docs/issues/audit_metadata_config_duplication_ooms_orchestr
 - **Files:** `orchestrator/database/audit_store.py`, `orchestrator/main.py` (new detail route; `lean=` on the `/audit` route).
 - **Acceptance:** lean rows average < 1 KB; `/audit/{step_id}` returns one full step; `get_audit_trail` MCP output byte-identical to before (fat path intact); 5000 lean rows < ~2 MB.
 
-### Phase 2 — Agent Activity → virtual scroll (frontend; the core refactor)
+### Phase 2 — Agent Activity → virtual scroll (frontend; the core refactor) ✅ built + deployed to dev (as **infinite scroll**, not CDK — see §0)
 
 1. Build a paging **CDK `cdk-virtual-scroll-viewport`** for Agent Activity backed by a `DataSource` that range-fetches lean rows from `/api/jobs/{id}/audit?offset&limit&filter` with a small in-memory LRU of pages (no IndexedDB).
 2. Filter tabs → server re-query (drop `FILTER_STEP_TYPES` client filtering); tab badges from `get_audit_counts`.
@@ -143,7 +181,7 @@ Write-side fix from `docs/issues/audit_metadata_config_duplication_ooms_orchestr
 - **Files:** `data.service.ts`, `agent-activity.component.ts`, `timeline.component.ts`, `api.service.ts`, `indexed-db.service.ts`; new virtual-scroll datasource.
 - **Acceptance (k3d, DevTools network open):** opening the 6,386-step job renders the first screen in < 1 s and issues **no 5000-row request** — only small range fetches as you scroll; switching filters re-queries server-side; resident audit entries bounded to the viewport+overscan (not 1000+); slider gone; `simple/` mobile layout + `/chat-history` route still build and run.
 
-### Phase 3 — Graph + chat + live tail + dead-code removal
+### Phase 3 — Graph + chat + live tail + dead-code removal ✅ chat/graph migration + slider removal + frontend dead-code sweep done (see §0); ⏳ live-tail + backend `/*/bulk` removal deferred (MCP still uses bulk)
 
 1. Apply the same lean+virtualized pattern to **graph** (`graph-timeline`) and **chat** (`/chat-history` route) streams; stop full-loading them in `loadWindow` (`:616-624`); **remove graph-timeline's own slider** (`:103-110`) and decouple both panels from the shared `sliderIndex`/`currentTimestamp`. *(Per §6 scope guard, this secondary-panel decoupling may split to a follow-up feature if heavy.)*
 2. **Live tail:** replace `autoRefreshTick`'s `clearJob` + `loadJob` (`data.service.ts:482`) with a keyset poll (or SSE off the existing events infra) that fetches only `after_id` and **appends**; add follow-mode ("stick to bottom").
