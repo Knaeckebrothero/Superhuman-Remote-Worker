@@ -212,6 +212,108 @@ async def test_logical_row_stitch(seeded):
         await s.disconnect()
 
 
+async def test_lean_projection_drops_metadata_and_heavy_subkeys(seeded):
+    # Seed fat rows: boot metadata + heavy tool `arguments`/`state`, and a long
+    # error traceback. The lean projection must strip all of these.
+    now = datetime.now(timezone.utc)
+    iso = now.isoformat().replace("+00:00", "Z")
+    w = SyncAuditWriter(seeded["dsn"])
+    w.insert_audit_pre(
+        {
+            "job_id": seeded["job"],
+            "agent_type": "u",
+            "iteration": 9,
+            "step_type": "tool",
+            "node_name": "tools",
+            "phase": "tactical",
+            "phase_number": 2,
+            "timestamp": now,
+            "latency_ms": None,
+            "payload": {
+                "tool": {
+                    "name": "write_file",
+                    "arguments": {"path": "/big", "content": "A" * 5000},
+                },
+                "state": {"message_count": 7},
+                "started_at": iso,
+            },
+            "metadata": {
+                "description": "d",
+                "project_id": "p",
+                "resolved_config": {"blob": "Z" * 5000},
+            },
+        }
+    )
+    w.insert_audit_pre(
+        {
+            "job_id": seeded["job"],
+            "agent_type": "u",
+            "iteration": 9,
+            "step_type": "error",
+            "node_name": "execute",
+            "phase": None,
+            "phase_number": None,
+            "timestamp": now,
+            "latency_ms": None,
+            "payload": {
+                "error": {"type": "Boom", "message": "kaboom", "traceback": "T" * 3000}
+            },
+            "metadata": None,
+        }
+    )
+    w.close()
+
+    s = await _store(seeded["dsn"])
+    try:
+        fat = await s.get_job_audit(seeded["job"], lean=False)
+        lean = await s.get_job_audit(seeded["job"], lean=True)
+        assert fat["total"] == lean["total"]  # same logical rows either way
+
+        def pick(res, key, val):
+            return next(
+                e
+                for e in res["entries"]
+                if e.get(key, {}).get("name" if key == "tool" else "type") == val
+            )
+
+        wf_fat = pick(fat, "tool", "write_file")
+        wf_lean = pick(lean, "tool", "write_file")
+        err_lean = pick(lean, "error", "Boom")
+
+        # Fat keeps boot metadata + heavy sub-keys.
+        assert wf_fat["metadata"]["resolved_config"]
+        assert wf_fat["tool"]["arguments"]["content"]
+        assert wf_fat["state"]["message_count"] == 7
+
+        # Lean drops metadata entirely + the expand-only heavy sub-keys, but keeps
+        # the render fields (tool name, step_number, timestamp).
+        assert "metadata" not in wf_lean
+        assert "arguments" not in wf_lean["tool"]
+        assert "state" not in wf_lean
+        assert wf_lean["tool"]["name"] == "write_file"
+        assert wf_lean["step_number"] == wf_fat["step_number"]
+        # Error traceback stripped; type/message (rendered) kept.
+        assert "traceback" not in err_lean["error"]
+        assert err_lean["error"]["message"] == "kaboom"
+    finally:
+        await s.disconnect()
+
+
+async def test_get_audit_step_returns_full_row(seeded):
+    s = await _store(seeded["dsn"])
+    try:
+        listing = await s.get_job_audit(seeded["job"])
+        first = listing["entries"][0]
+        detail = await s.get_audit_step(seeded["job"], first["id"])
+        assert detail is not None
+        assert detail["id"] == first["id"]
+        assert detail["step_number"] == first["step_number"]
+        # Unknown id → None (not an exception).
+        assert await s.get_audit_step(seeded["job"], 999999999) is None
+    finally:
+        await s.disconnect()
+
+
 async def test_step_number_global_under_filter(seeded):
     s = await _store(seeded["dsn"])
     try:
