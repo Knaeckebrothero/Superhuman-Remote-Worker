@@ -52,9 +52,13 @@ def _env_flag(name: str, default: bool) -> bool:
 class ContainerProvisioner:
     """Workspace container provisioner using Kubernetes CoreV1Api.
 
-    Creates per-job pods with SSH server + code-server. Workspace data is
-    stored on PVCs so it survives pod crashes. PVCs are deleted on final
-    cleanup (job completion/cancellation) but retained during suspension.
+    Creates per-job pods with SSH server + code-server. Workspace storage is
+    ``emptyDir`` by default (dies with the pod). When ``WORKSPACE_PVC_ENABLED``
+    is set, job workspaces are PVC-backed (Branch a): the volume is named after
+    the job UUID, survives pod crashes, and reattaches by that deterministic
+    name on recreate. PVCs are reclaimed when the job reaches a terminal state
+    (completed/failed/cancelled) and retained across suspend/restore and crash
+    recovery. See docs/features/workspace_pvc_branch_a_implementation.md.
     """
 
     def __init__(self):
@@ -76,6 +80,13 @@ class ContainerProvisioner:
         self._storage_class: str = os.environ.get(
             "WORKSPACE_STORAGE_CLASS", "longhorn-ephemeral"
         )
+        # Branch (a): PVC-backed job workspaces. Default off → emptyDir (today's
+        # behavior). Scoped to jobs in v1; sessions rehydrate from Postgres and
+        # stay emptyDir. The PVC name is deterministic on the job UUID, so a
+        # recreated pod reattaches the same volume; GC happens on terminal job
+        # states. See docs/features/workspace_pvc_branch_a_implementation.md.
+        self._pvc_enabled: bool = _env_flag("WORKSPACE_PVC_ENABLED", False)
+        self._pvc_size: str = os.environ.get("WORKSPACE_PVC_SIZE", "10Gi")
         # rclone-backed cloud workspaces are the default container path. They
         # need FUSE inside the workspace pod because the agent shell runs there.
         self._fuse_enabled: bool = _env_flag("WORKSPACE_FUSE_ENABLED", True)
@@ -200,6 +211,35 @@ class ContainerProvisioner:
             owner.id, kind=owner.network_tier_kind
         )
 
+        # Workspace storage (Branch a): PVC-backed for jobs when
+        # WORKSPACE_PVC_ENABLED — the volume is named by the job UUID, survives
+        # pod crashes, and reattaches by that deterministic name on recreate
+        # (drift recovery, suspend/restore, give_up all funnel back through
+        # create_workspace, so 409-reuse here IS the resume path). Otherwise
+        # emptyDir — storage dies with the pod; isolation is the pod boundary.
+        # Created BEFORE the seed ConfigMap so a PVC failure leaves nothing to
+        # clean up — it is the provisioning prerequisite.
+        pvc_name: Optional[str] = None
+        if self._pvc_enabled and owner.kind == "job":
+            pvc_name = f"pvc-workspace-{owner.id[:12]}"
+            created = await self._create_pvc(
+                pvc_name,
+                size=self._pvc_size,
+                # Owner label lets the backstop reaper resolve PVC → job and
+                # is a belt-and-suspenders identity check before any reattach.
+                labels={owner.label_key: owner.id},
+            )
+            if not created:
+                logger.error(
+                    "Workspace PVC create failed for %s %s — aborting provision",
+                    owner.kind,
+                    owner.id,
+                )
+                await self._set_context(
+                    owner, {"status": "failed", "error": "PVC creation failed"}
+                )
+                return False
+
         # Seed the user's saved code-server config (theme/keybindings/snippets)
         # into the pod before it starts. Best-effort — never blocks provisioning.
         seed_files = await self._resolve_ide_seed_files(owner)
@@ -209,8 +249,6 @@ class ContainerProvisioner:
             pod_name, seed_files, seed_exts, needs_state=seed_needs_state
         )
 
-        # emptyDir by default — storage dies with the pod, no cleanup needed.
-        # Each job/session gets a fresh container; isolation is the pod boundary.
         pod_manifest = self._build_pod_manifest(
             pod_name=pod_name,
             owner=owner,
@@ -220,6 +258,7 @@ class ContainerProvisioner:
             cpu_limit=cpu_limit,
             memory_limit=memory_limit,
             network_tier=network_tier,
+            pvc_name=pvc_name,
             seed_configmap=seed_cm,
         )
 

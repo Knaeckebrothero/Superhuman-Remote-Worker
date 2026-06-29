@@ -237,6 +237,20 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: WORKSPACE_STORAGE_CLASS
+            # Branch (a): PVC-backed job workspaces. The orchestrator runs both
+            # the dispatcher's create_workspace and the lifecycle reaper, so it
+            # must see these. The deployment maps configmap keys explicitly
+            # (not envFrom), so new keys need an entry here to reach the pod.
+            - name: WORKSPACE_PVC_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: WORKSPACE_PVC_ENABLED
+            - name: WORKSPACE_PVC_SIZE
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: WORKSPACE_PVC_SIZE
             # Gitea
             - name: GITEA_URL
               valueFrom:
