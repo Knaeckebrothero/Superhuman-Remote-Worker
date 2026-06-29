@@ -22,7 +22,7 @@
 
 ## Status — ✅ v1 SHIPPED + deployed to k3d (2026-06-26)
 
-All 9 tasks complete, executed subagent-driven (fresh implementer + spec/quality review gate per task). On `develop`, **not pushed**.
+All 9 tasks complete, executed subagent-driven (fresh implementer + spec/quality review gate per task). On `develop`, **pushed to `origin/develop` + deployed to dev** (rolled out via `sha-fe9c9ee` on 2026-06-29; later dev deploys include it). Built/verified on local k3d 2026-06-26.
 
 **Commits (in order):**
 
@@ -41,7 +41,7 @@ All 9 tasks complete, executed subagent-driven (fresh implementer + spec/quality
 
 **Tests:** backend 11 green (`TestUsageLedger` 9 + `TestBreakdownFold` 2, `tests/test_audit_store.py`); frontend 9 green (`admin-usage.component.spec` 5 + `admin-usage.service.spec` 4). All ✅.
 
-**Deployed:** local k3d (`srw`) via Tilt auto-deploy. Verified in-pod: orchestrator carries `query_grouped` + `/api/usage/breakdown`; cockpit rebuilt with the new component. Live at `https://localhost` → **Admin → Usage**.
+**Deployed:** **dev cluster** (pushed to `origin/develop`, rolled out via `sha-fe9c9ee` on 2026-06-29) — and originally local k3d (`srw`) via Tilt (2026-06-26). Verified in-pod: orchestrator carries `query_grouped` + `/api/usage/breakdown`; cockpit rebuilt with the new component. Local view was `https://localhost` → **Admin → Usage**.
 
 **Demo data (dev only, reversible):** seeded 5 named users / 3 projects / 5 models / 114 `usage_events` rows so every panel populates. Remove with `DELETE FROM usage_events WHERE source='seed-demo';` (audit DB) + `DELETE FROM users WHERE id LIKE '11111111-1111-4111-8111-%'` / `DELETE FROM projects WHERE id LIKE '22222222-2222-4222-8222-%'` (app DB).
 
@@ -51,7 +51,9 @@ All 9 tasks complete, executed subagent-driven (fresh implementer + spec/quality
 - Component spec harness uses `providers:[AdminUsageComponent]` + `TestBed.inject` + a `TranslocoService` mock (the plan's `TestBed.createComponent` fails in jsdom on a child component's external `styleUrl`).
 - Task 3 test adapted to the spec's existing `vi.fn()` mock style (not `HttpTestingController`); Task 2 used `UUID(k)` (main.py imports `from uuid import UUID`).
 
-**Remaining (not done):** SDD final whole-branch review; `git push` (awaiting explicit user OK); demo-data cleanup when finished eyeballing. Deferred cosmetic Minors are logged in `.superpowers/sdd/progress.md`.
+**Remaining (not done):** SDD final whole-branch review; demo-data cleanup on dev when finished eyeballing (`source='seed-demo'` + the demo users/projects). Deferred cosmetic Minors are logged in `.superpowers/sdd/progress.md`. *(Push + dev deploy: done 2026-06-29.)*
+
+**Fast-follows status (as of 2026-06-29):** none of the dashboard fast-follows have landed yet (by-provider, Export CSV, per-job LLM, Edit-Rates+$, live RPM/TPM, sparklines). `usage_rates` is still empty → ledger cost stays "—". Adjacent gateway work *has* moved separately (a priced-cost dimension on the LiteLLM spend log `27d026ac`, Phase-2 system/codex gateway routing) — tracked in `route_all_models_through_litellm_gateway.md`, not here; it doesn't write `usage_events`, so the dashboard's quantity-first framing is unchanged.
 
 > Checkboxes below are marked `[x]` — all steps executed and committed per the table above.
 
