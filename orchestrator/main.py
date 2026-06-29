@@ -10115,9 +10115,106 @@ async def complete_job(
             except Exception as e:
                 logger.warning(f"Failed to clear queued_replies for {job_id}: {e}")
 
-        # 0. VM recovery: if workspace became unavailable, re-provision and re-queue
+        # 0. Workspace-unavailable recovery: the agent's remote workspace went
+        #    unreachable mid-run. Recover by BACKEND TYPE — a pod-backed job must
+        #    not be routed into the VM arm (that was the wedge in
+        #    docs/issues/loop_job_workspace_lost_wedged_in_recovery.md).
         error = result.get("error") or {}
         if isinstance(error, dict) and error.get("type") == "workspace_unavailable":
+            # Decide on the ORIGINAL job (before any stamp): a pod/sandbox job has
+            # no vm.requested, so _job_needs_vm is False and it recovers via PVC
+            # reattach; only a true VM job takes the legacy VM path below.
+            if not _job_needs_vm(job):
+                # --- G1: pod (sandbox/PVC) recovery -------------------------------
+                # Re-dispatch through the POD arm: ensure_workspace → _create →
+                # create_workspace 409-reuses the deterministic PVC (= reattach),
+                # and the agent resumes from the Postgres checkpoint on the intact
+                # files (G2 keeps it from wiping them). Bounded: at the cap, fail
+                # LOUD instead of looping back into the same (likely OOM) grave.
+                # See docs/features/workspace_pvc_branch_a_implementation.md (G1).
+                container_ctx = _get_container_context(job)
+                attempts = int(container_ctx.get("recovery_attempts") or 0) + 1
+                cap = int(os.environ.get("WORKSPACE_RECOVERY_MAX_ATTEMPTS", "3"))
+                if attempts > cap:
+                    logger.error(
+                        f"Job {job_id}: workspace recovery exhausted after "
+                        f"{cap} attempts — failing loud"
+                    )
+                    await postgres_db.update_job_status(
+                        job_id,
+                        status="failed",
+                        error_message=(
+                            f"workspace unavailable; recovery exhausted after "
+                            f"{cap} attempts: {error.get('message') or ''}"
+                        ).strip(),
+                        freeze_data={
+                            "freeze_type": "workspace_unavailable",
+                            "recovery_attempts": attempts,
+                            "detail": error.get("message"),
+                        },
+                    )
+                    return {
+                        "status": "handled",
+                        "job_id": job_id,
+                        "new_status": "failed",
+                        "actions": [
+                            f"workspace recovery exhausted after {cap} "
+                            f"attempts — failed loud"
+                        ],
+                    }
+                logger.warning(
+                    f"Job {job_id}: workspace unavailable — pod recovery "
+                    f"attempt {attempts}/{cap} (PVC reattach)"
+                )
+                # Invalidate the stale container so the re-dispatch RECREATES it
+                # (and reattaches the PVC) instead of reusing the dead pod:
+                #   * status="deleted" — `_job_needs_sandbox` returns False while
+                #     status=="ready", short-circuiting before ensure_workspace's
+                #     drift probe; and delete_workspace's 404/"already deleted"
+                #     branch does NOT set the status, so we must set it here.
+                #   * pod_ip=None — drop the dead IP the resume path would dial.
+                # Also record the attempt + the discriminating SSH cause (the
+                # message was previously dropped — see
+                # agent_workspace_pod_resource_headroom.md §instrumentation).
+                await postgres_db.merge_workspace_container_context(
+                    job_id,
+                    {
+                        "status": "deleted",
+                        "pod_ip": None,
+                        "recovery_attempts": attempts,
+                        "previous_error": error.get("message")
+                        or "workspace_unavailable",
+                    },
+                )
+                # Delete the dead pod so create_workspace does not ADOPT the Failed
+                # tombstone (restartPolicy:Never → not "terminating"). The PVC is
+                # retained (delete_workspace never touches it) and reattaches by
+                # name on recreate.
+                try:
+                    await container_provisioner.delete_workspace(
+                        WorkspaceOwner.job(job_id)
+                    )
+                except Exception:
+                    logger.exception(
+                        f"Job {job_id}: error deleting dead workspace pod "
+                        f"(continuing to re-dispatch)"
+                    )
+                # pause_job clears the agent + flips to paused (→ resume=True on
+                # re-dispatch). Gate the dispatch on the processing→paused
+                # transition so a duplicate completion can't double-dispatch.
+                if await postgres_db.pause_job(job_id):
+                    _trigger_dispatch()
+                return {
+                    "status": "handled",
+                    "job_id": job_id,
+                    "new_status": "paused",
+                    "actions": [
+                        f"workspace recovery: dead pod deleted (PVC kept), "
+                        f"re-dispatch for reattach (attempt {attempts}/{cap})"
+                    ],
+                }
+
+            # --- VM recovery (legacy path, unchanged) -------------------------
             # Guard: skip if recovery is already in progress (prevents double-dispatch loop)
             vm_ctx = _get_vm_context(job)
             if vm_ctx and vm_ctx.get("recovering"):
