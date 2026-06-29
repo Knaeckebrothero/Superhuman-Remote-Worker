@@ -319,7 +319,36 @@ Numbers are starting points — the §5.4 backstop clamps each to the effective
 context, and cost is bounded (loosely — see §9) by the quota system, so erring
 generous is safe.
 
-## 6. Length-aware retry / fallback
+## 6. Length-aware fail-loud surfacing — **IMPLEMENTED + verified 2026-06-29**
+
+> **Decision (2026-06-29):** policy **A** (keep family caps at 65,536; reasoning
+> shares the *output* budget, not the 1M context — see §5) **+ fail loud, no
+> active retry-rebuild.** A rewind/regenerate button is the recovery UX, so an
+> output-cap truncation is **surfaced** for the user/operator to act on rather
+> than auto-retried. This drops the fragile mid-turn `create_llm`/re-bind from
+> both execution paths. Implemented behavior:
+>
+> - **Detection (shared, §7.1):** `_is_output_truncated(finish_reason)` in
+>   `loader.py` — tolerant lower-cased substring (`length`/`max_tokens`/the
+>   `"lengthlength"` merge). Both graphs read a **clean** `finish_reason`:
+>   `persistent_graph` captures it **per-chunk** in the stream loop (the merged
+>   chunk doubles it); `graph` reads `response.response_metadata` (ainvoke, no
+>   doubling). Unit-tested (`tests/test_graph_helpers.py::TestIsOutputTruncated`).
+> - **Session** (`persistent_graph._execute_turn`): empty+length → a distinct
+>   *"⚠ used its entire output budget (N tokens) on reasoning … rewind/regenerate,
+>   lower reasoning, or raise the cap"* (persisted via the empty-content
+>   writeback), **not** the misleading "empty response", and **not** the
+>   codex-stop ainvoke retry (which would re-truncate). content+length → the
+>   partial is kept with a *"⚠ truncated at output limit (N)"* notice appended.
+> - **Worker** (`graph.execute`): empty+length+no-tools returns a **recoverable**
+>   `output_truncated` error **before** the empty-streak check, so the job pauses
+>   for review instead of accruing toward the `recoverable:False` hard-fail.
+>   content+length logs loudly + keeps the partial.
+> - **N** = `_resolve_max_output_tokens(config.llm, config.limits)`, so it reflects
+>   the effective (admin-/backstop-clamped) cap.
+>
+> The active-retry design below is **deferred** (kept for reference if a future
+> auto-retry is wanted).
 
 Once the cap is generous, hitting the ceiling is rare; for the rare case handle
 it **fluently** and **length-aware** (a plain re-run re-hits the cap — the
@@ -351,7 +380,7 @@ existing `stop`+empty reasoning retry at `persistent_graph.py:1552` cannot fix
 
 ## 7. Prerequisites & interactions
 
-### 7.1 Doubled `finish_reason` / model-name (bug; blocker for §6)
+### 7.1 Doubled `finish_reason` / model-name (bug; **detection handled via tolerant substring + per-chunk read, §6**)
 
 Root cause is a **LangChain stream-merge defect**, not SRW's audit writers (they
 pass metadata through verbatim: `archiver.py:152-154`, `session_components.py:78`,

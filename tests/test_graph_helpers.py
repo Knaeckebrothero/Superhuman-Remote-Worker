@@ -19,6 +19,7 @@ from src.graph import (
     _extract_markdown_content,
     _check_empty_response_streak,
     _check_no_tool_call_streak,
+    _is_output_truncated,
 )
 
 
@@ -872,3 +873,42 @@ class TestClassifyLlmError:
         outer = Exception("LangChain wrapper")
         outer.__cause__ = inner
         assert _classify_llm_error(outer) == "auth_unavailable"
+
+
+# =============================================================================
+# _is_output_truncated  (reasoning-aware output caps, §6/§7.1)
+# =============================================================================
+
+
+class TestIsOutputTruncated:
+    """The shared finish_reason=length predicate both graphs use to tell an
+    output-cap truncation apart from a generic empty response."""
+
+    def test_plain_length(self):
+        assert _is_output_truncated("length") is True
+
+    def test_doubled_lengthlength_from_stream_merge(self):
+        # OpenRouter-direct concatenates finish_reason across two chunks (§7.1).
+        assert _is_output_truncated("lengthlength") is True
+
+    def test_provider_spelling_variants(self):
+        assert _is_output_truncated("MAX_TOKENS") is True
+        assert _is_output_truncated("max_tokens") is True
+        assert _is_output_truncated("max_output_tokens") is True
+
+    def test_stop_is_not_truncation(self):
+        # The codex-proxy empty-stop bug is finish_reason=stop — must NOT be
+        # treated as a length truncation (it has its own retry path).
+        assert _is_output_truncated("stop") is False
+
+    def test_tool_calls_is_not_truncation(self):
+        assert _is_output_truncated("tool_calls") is False
+
+    def test_none_and_empty(self):
+        assert _is_output_truncated(None) is False
+        assert _is_output_truncated("") is False
+
+    def test_non_string_is_safe(self):
+        # Defensive: a non-string finish_reason must not raise.
+        assert _is_output_truncated(0) is False
+        assert _is_output_truncated(["length"]) is True  # str(list) contains it
