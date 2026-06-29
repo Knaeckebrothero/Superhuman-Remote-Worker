@@ -305,11 +305,13 @@ export class ApiService {
     offset: number,
     limit: number,
     filter: AuditFilterCategory = 'all',
+    order: 'asc' | 'desc' = 'asc',
   ): Observable<AuditResponse> {
     const params = new HttpParams()
       .set('offset', offset.toString())
       .set('limit', limit.toString())
       .set('filter', filter)
+      .set('order', order)
       .set('lean', 'true');
 
     return this.http
