@@ -1154,6 +1154,11 @@ async def _execute_turn(
             try:
                 # Try astream for token-by-token streaming
                 chunks = []
+                # Clean per-chunk finish_reason: the merged response doubles it to
+                # "lengthlength" on OpenRouter-direct (§7.1), so keep the last
+                # non-empty per-chunk value. Defined before astream so the
+                # ainvoke-fallback path leaves it None → falls back to merged meta.
+                stream_finish_reason: Any = None
                 # Holds the interrupt mode ("hard"|"graceful") if the loop
                 # below broke early; None otherwise. Legacy bool callbacks
                 # land as True here and are treated as "graceful".
@@ -1177,6 +1182,9 @@ async def _execute_turn(
                     if _stream_status == "stop":
                         break
                     chunks.append(chunk)
+                    _chunk_meta = getattr(chunk, "response_metadata", None) or {}
+                    if _chunk_meta.get("finish_reason"):
+                        stream_finish_reason = _chunk_meta["finish_reason"]
                     # Extract and stream text content
                     if hasattr(chunk, "content") and chunk.content:
                         content = chunk.content
@@ -1527,6 +1535,20 @@ async def _execute_turn(
                 error="Empty LLM response",
             )
 
+        # Output-cap truncation detection: reasoning shares max_output_tokens, so
+        # a finish_reason=length turn means the budget was exhausted. Prefer the
+        # clean per-chunk value; tolerant substring covers the "lengthlength"
+        # merge (§7.1). Resolve the cap once for the surfaced messages below.
+        from src.core.loader import _is_output_truncated, _resolve_max_output_tokens
+
+        _finish_reason = stream_finish_reason or meta.get("finish_reason")
+        _is_length = _is_output_truncated(_finish_reason)
+        _output_cap = (
+            _resolve_max_output_tokens(config.llm, config.limits)
+            if _is_length
+            else None
+        )
+
         # Detect streaming that produced no visible content and no tool calls
         if not response_content and (
             not hasattr(response, "tool_calls") or not response.tool_calls
@@ -1548,6 +1570,22 @@ async def _execute_turn(
             if refusal:
                 logger.warning("Model refusal: %s", refusal)
                 response_content = f"⚠ The model declined to respond: {refusal}"
+                await callbacks.on_token(response_content)
+            elif _is_length:
+                # Reasoning consumed the entire output budget before any answer
+                # (reasoning shares max_output_tokens). Fail loud — a plain retry
+                # re-truncates; let the user rewind/regenerate or raise the cap.
+                logger.warning(
+                    "Output truncated (finish_reason=length, cap=%s): "
+                    "reasoning-only, no answer",
+                    _output_cap,
+                )
+                response_content = (
+                    f"⚠ The model used its entire output budget ({_output_cap} "
+                    "tokens) on reasoning and was cut off before answering. "
+                    "Rewind/regenerate, lower the reasoning level, or raise the "
+                    "model's output cap."
+                )
                 await callbacks.on_token(response_content)
             elif getattr(llm_with_tools, "reasoning", None):
                 # Bounded auto-retry for reasoning/codex models. A gpt-5.x turn
@@ -1656,6 +1694,21 @@ async def _execute_turn(
             and _visible_content_len(response.content) == 0
         ):
             response.content = response_content
+
+        # Output-cap truncation WITH visible content (truncated mid-answer): the
+        # partial is real work — keep it, but surface the cut on the PERSISTED
+        # message so the turn isn't silently treated as complete. The empty-content
+        # writeback above won't fire here; append to string content directly (rare
+        # block/list content streams the notice live but isn't mutated).
+        if _is_length and _visible_content_len(response.content) > 0:
+            _trunc_notice = (
+                f"\n\n⚠ Output truncated at the model's limit ({_output_cap} "
+                "tokens). Rewind/regenerate or raise the model's output cap to "
+                "continue."
+            )
+            if isinstance(response.content, str):
+                response.content += _trunc_notice
+            await callbacks.on_token(_trunc_notice)
 
         # Add AI response to message history
         messages.append(response)
