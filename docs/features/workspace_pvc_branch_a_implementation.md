@@ -12,7 +12,7 @@ cannot leak. Verified end-to-end against the live orchestrator on k3d.
 |---|---|---|
 | **0 — the flip** | PVC-back job workspaces (flag-gated, jobs-only) | ✅ done + k3d-verified |
 | **1 — GC discipline** | terminal delete + give_up gating + backstop `reap_orphans` | ✅ done + k3d-verified |
-| **2 — crash-recovery reattach** | workspace-lost job re-dispatches → reattaches PVC → agent resumes on the files | 🔨 **CODE LANDED (2026-06-29), E2E pending** — G1 (`complete_job` handler, `main.py:10118`) + G2 (`agent.py` resume gate) implemented; ruff clean, 199 regression tests green. The k3d recovery E2E (step 7) is the remaining gate. See §Phase 2 below |
+| **2 — crash-recovery reattach** | workspace-lost job re-dispatches → reattaches PVC → agent resumes on the files | ⚠️ **PARTIAL (2026-06-29)** — G1+G2 implemented + k3d-E2E'd. Wedge eliminated (no VM misroute), bounded fail-loud, PVC + working-tree preserved (sentinel survived). **Auto-resume BLOCKED**: recreate gives a new pod IP each cycle, the agent dials a stale IP → churns to fail-loud → `workspace_reattach_ephemeral_ip_reconnect_churn.md`. See §Phase 2 |
 | **3 — prod hardening** | RWO dead-node detach-wait + S3 fallback + ResourceQuota | ⏳ pending (Longhorn-only; irrelevant on k3d/local-path) |
 | **rollout** | flag default-off in-chart; **ON in k3d dev**; dev-soak → prod flip | ⏳ pending |
 
@@ -162,7 +162,7 @@ on the leader replica, not mocks.
 
 ---
 
-## Phase 2 — crash-recovery reattach (NEXT)
+## Phase 2 — crash-recovery reattach (IMPLEMENTED + E2E'd 2026-06-29 — PARTIAL)
 
 **Goal:** a job whose workspace pod dies mid-run re-dispatches, recreates the
 pod, **reattaches its PVC**, and resumes from the Postgres checkpoint with its
@@ -177,18 +177,65 @@ files intact — no data loss, no manual intervention.
 > are untestable until the wedge-fix (G1) lands**. The PVC half is the foundation
 > they sit on; it does not deliver job durability on its own.
 
-### G1 — control-flow wedge-fix (prerequisite; separate session)
+### Implementation + E2E result (2026-06-29)
 
-The `workspace_unavailable` handler (`main.py:10118-10161`) today
-**unconditionally stamps `ctx["vm"]={requested:True,recovering:True}` on pod-backed
-jobs** → routes them into the VM arm → **wedged in `paused` forever**, never
+**G1 + G2 are implemented, deployed to k3d, and E2E-tested.** Net result: **the
+wedge is eliminated and workspace data is preserved, but auto-resume does NOT
+yet complete** — a deeper ephemeral-IP reconnect race (filed separately) makes
+recovery fail-loud after the cap instead of resuming.
+
+| Aspect | Result |
+|---|---|
+| G1 routing — pod jobs recover via PVC reattach, never the VM arm | ✅ verified (`vm.requested` null every cycle) |
+| G1 bounded cap → fail-loud (no forever-wedge) | ✅ verified (terminal `failed` at cap, clean `freeze_data`) |
+| PVC survives pod kill + reattaches by name | ✅ verified (same PV across every recreate) |
+| Working tree preserved (untracked sentinel survives) | ✅ verified (sentinel intact across recreates) |
+| **Agent reconnects → G2 preserve branch runs → job resumes** | ❌ **blocked** — see "the blocker" below |
+
+**Bug found + fixed by the E2E (would have shipped blind):** G1 first relied on
+`delete_workspace` to set `workspace_container.status="deleted"`, but its
+404/"already deleted" branch — the *always-taken* path, since the pod is already
+gone — does **not** set the status. The stale `status="ready"` made
+`_job_needs_sandbox` return False (`main.py:3157`), so the resume reused the dead
+pod IP in an infinite loop (`recovery_attempts` 1/3 → 2/3 → 3/3 on the same dead
+IP). **Fixed:** the handler now explicitly merges
+`{"status":"deleted","pod_ip":None}` so the dispatcher recreates + reattaches.
+
+**The blocker (new issue):** the recreate gives the pod a **new ephemeral IP**
+each cycle (`.79 → .88 → .93 → .95` observed); the resuming agent dials a
+**stale IP** from a prior cycle → can't connect → reports `workspace_unavailable`
+→ another recovery → another new IP → churns to the cap → **fail-loud**. G2's
+preserve branch never gets exercised (no agent ever SSH-connects to the
+reattached pod). Filed:
+[`workspace_reattach_ephemeral_ip_reconnect_churn.md`](../issues/workspace_reattach_ephemeral_ip_reconnect_churn.md).
+**Net today:** "wedge forever" → "fail cleanly in ~5 min with the PVC data
+intact" (a strict improvement), but not seamless resume. The proper fix is a
+**stable workspace address** (headless Service / DNS so recreate → same address).
+
+**E2E record:** k3d, fresh scholar job `d65d93d3`, `WORKSPACE_PVC_ENABLED=true`,
+`CHECKPOINTER_BACKEND=postgres`, agent image with G2 (`tilt-fb1597…`). Planted an
+untracked `E2E_SENTINEL.txt`, force-deleted the workspace pod mid-run → G1 logged
+`pod recovery attempt 1/3 (PVC reattach)`, PVC stayed `Bound`, new pods reattached
+the same PV, the sentinel survived every cycle; the agent dialed stale `.88` while
+the pod was at `.95` → cap → `failed` with `recovery exhausted after 3 attempts`.
+(An earlier run on the developer→scholar subjob first revealed the stale-`ready`
+loop bug, which was fixed before this run.)
+
+### G1 — control-flow wedge-fix (IMPLEMENTED — `main.py:10118`)
+
+The `workspace_unavailable` handler previously
+**unconditionally stamped `ctx["vm"]={requested:True,recovering:True}` on pod-backed
+jobs** → routed them into the VM arm → **wedged in `paused` forever**, never
 reaching `ensure_workspace`/the pod arm where a recreate (and thus reattach)
-happens. Full trace + the ~40-60-line Tier-1 fix in
+happens. Full trace in
 [`loop_job_workspace_lost_wedged_in_recovery.md`](../issues/loop_job_workspace_lost_wedged_in_recovery.md).
-**Until G1 lands, a crashed pod job never reaches a recreate, so reattach is
-unreachable regardless of PVCs.** Also: the recovery re-dispatch **must set
-`resume=True`** (checkpoint resume) — a fresh dispatch (`resume=False`) hits
-`initialize()` and `rm -rf`s the workspace (see G2).
+**Shipped fix:** branch on backend (`_job_needs_vm` on the original job); pod jobs
+record a bounded `recovery_attempts`, **explicitly invalidate the stale container
+(`status="deleted"`, `pod_ip=None`)**, delete the dead pod (best-effort), and
+re-dispatch through the pod arm; at the cap they **fail loud** (`update_job_status`
+`failed` + `freeze_data`). The re-dispatch is a `resume` (the job is paused →
+checkpoint resume), **not** a fresh dispatch (which would hit `initialize()`'s
+`rm -rf`, see G2).
 
 ### G2 — backend-aware resume detection (the gate that makes reattach *usable*)
 
@@ -226,17 +273,18 @@ re-cloning it. Touches `agent.py:1835-1920` (and mirror the same gate in
 non-goal). **Risk:** changes resume behavior for *all* jobs, so it must land + be
 tested with G1 in place via the real recovery E2E — not blind.
 
-### Verification (the gate; needs G1 + G2)
+### Verification — RAN 2026-06-29 (PARTIAL pass)
 
-- E2E (test-plan step 7): reproduce the `19707fa1` shape on k3d — kill a
-  PVC-backed job's workspace pod mid-run → assert it re-dispatches through the pod
-  arm (not VM), recreates the pod, **reattaches the PVC**, the agent takes the
-  non-destructive resume branch (no `rm -rf`), resumes from checkpoint, and the
-  un-pushed working tree is intact.
+- E2E (test-plan step 7) was executed on k3d (see "Implementation + E2E result"
+  above). **Passed:** pod-arm routing (not VM), recreate, PVC reattach (same PV),
+  un-pushed working tree preserved (sentinel survived), bounded fail-loud.
+  **Did not pass:** the agent never reconnects to the recreated pod (stale
+  ephemeral IP), so it never reaches G2's preserve branch and the job fail-louds
+  instead of resuming → `workspace_reattach_ephemeral_ip_reconnect_churn.md`.
 - Coherence: disk + Postgres checkpoint are both "as of the crash"; the disk may
   lag the checkpoint by ≤1 unfsynced super-step. With G2 (preserve, don't clobber)
   this is the same tolerance the agent already has mid-run — **no new coherence
-  guard for v1**.
+  guard for v1**. (Not yet exercised live — gated behind the reconnect fix.)
 
 ### Ownership note
 
@@ -287,10 +335,15 @@ job S3 snapshot becomes **DR-only** (kept, not removed).
 delete() terminal-vs-idle-vs-emptyDir, give_up gating, reap_orphans selection +
 DB-error safety, reconciler hook.
 
-**k3d E2E — steps 1-6 ✅ done** (see results above). Step 7 is Phase 2:
-7. **Recovery (Phase 2, after wedge-fix):** reproduce `19707fa1` — kill the
-   workspace pod mid-run → assert re-dispatch through the pod arm (not VM),
-   PVC reattach, checkpoint resume, files intact.
+**k3d E2E — steps 1-6 ✅ done** (see results above). Step 7 (Phase 2) **RAN
+2026-06-29 — PARTIAL**:
+7. **Recovery (Phase 2):** reproduced the `19707fa1` shape (job `d65d93d3`) — kill
+   the workspace pod mid-run → ✅ re-dispatch through the pod arm (not VM), ✅ PVC
+   reattach (same PV), ✅ working tree preserved (sentinel survived), ✅ bounded
+   fail-loud; ❌ checkpoint resume — the agent can't reconnect (stale ephemeral IP)
+   so it fail-louds instead of resuming →
+   `workspace_reattach_ephemeral_ip_reconnect_churn.md`. Re-run after that fix to
+   close step 7.
 
 ---
 
