@@ -1832,6 +1832,70 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             except Exception as e:
                 logger.warning(f"VM workspace seeding failed: {e}")
 
+        # G2: reattached remote workspace (PVC reattach on crash-recovery). The
+        # working tree already lives on the REMOTE backend root, so the
+        # local-path gates below would miss it and clone/initialize() would
+        # `rm -rf {backend.root}/*` (core/workspace.py:295/313) — wiping the
+        # volume we just got back. Detect a real working tree on the backend
+        # (`.git`; a fresh/empty PVC has none, so first dispatch still
+        # initializes) and PRESERVE it: attach a git handle to the existing repo
+        # — no clone, no rm -rf — then resume on the intact files. Gated on
+        # `resume`, so any content present belongs to THIS job's continuation
+        # (PVCs are owner-keyed by UUID).
+        # See docs/features/workspace_pvc_branch_a_implementation.md (G2 / Phase 2).
+        _reattached = False
+        if (
+            resume
+            and workspace_backend
+            and getattr(workspace_backend, "supports_shell", False)
+        ):
+            try:
+                _reattached = workspace_backend.exists(".git")
+            except Exception as e:
+                logger.warning(f"Reattach probe failed for job {job_id}: {e}")
+                _reattached = False
+        if _reattached:
+            logger.info(
+                f"Reattached workspace detected for job {job_id} — preserving "
+                f"existing files (no clone, no re-init)"
+            )
+            if _git_versioning and self._workspace_manager.git_manager is None:
+                from .managers.git_manager import GitManager
+
+                # Attach a handle to the existing remote repo. No clone (the dir
+                # is non-empty); the repo's own git config persists on the PVC.
+                git_mgr = GitManager(
+                    self._workspace_manager.path, backend=workspace_backend
+                )
+                self._workspace_manager._git_manager = git_mgr
+                self._workspace_manager._initialized = True
+                if metadata.get("git_remote_url"):
+                    git_mgr.add_remote("origin", metadata["git_remote_url"])
+                if metadata.get("branch_name"):
+                    try:
+                        if git_mgr.current_branch() != metadata["branch_name"]:
+                            git_mgr.checkout_branch(metadata["branch_name"])
+                    except Exception as e:
+                        logger.warning(f"Reattach: branch ensure failed: {e}")
+            # instructions.md lives on the PVC; only rewrite if it vanished.
+            try:
+                if not workspace_backend.exists("instructions.md"):
+                    self._workspace_manager.write_file(
+                        "instructions.md",
+                        load_instructions(self.config, model=self.config.llm.model),
+                    )
+            except Exception as e:
+                logger.warning(f"Reattach: instructions ensure failed: {e}")
+            self._todo_manager = TodoManager(
+                workspace=self._workspace_manager,
+                model_name=self.config.llm.model,
+            )
+            logger.debug(
+                f"Resumed job {job_id} on reattached workspace at "
+                f"{workspace_backend.root}"
+            )
+            return metadata or {}
+
         # Pod handoff: clone workspace from Gitea if resuming on a new pod
         if (
             resume

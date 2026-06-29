@@ -12,7 +12,7 @@ cannot leak. Verified end-to-end against the live orchestrator on k3d.
 |---|---|---|
 | **0 — the flip** | PVC-back job workspaces (flag-gated, jobs-only) | ✅ done + k3d-verified |
 | **1 — GC discipline** | terminal delete + give_up gating + backstop `reap_orphans` | ✅ done + k3d-verified |
-| **2 — crash-recovery reattach** | workspace-lost job re-dispatches → reattaches PVC → agent resumes on the files | ⏳ **NEXT** — needs **two** changes in the recovery/agent-resume path (G1 wedge-fix + G2 backend-aware resume gate), both in the separate session; PVC substrate is ready underneath |
+| **2 — crash-recovery reattach** | workspace-lost job re-dispatches → reattaches PVC → agent resumes on the files | 🔨 **CODE LANDED (2026-06-29), E2E pending** — G1 (`complete_job` handler, `main.py:10118`) + G2 (`agent.py` resume gate) implemented; ruff clean, 199 regression tests green. The k3d recovery E2E (step 7) is the remaining gate. See §Phase 2 below |
 | **3 — prod hardening** | RWO dead-node detach-wait + S3 fallback + ResourceQuota | ⏳ pending (Longhorn-only; irrelevant on k3d/local-path) |
 | **rollout** | flag default-off in-chart; **ON in k3d dev**; dev-soak → prod flip | ⏳ pending |
 
