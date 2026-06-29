@@ -22,10 +22,32 @@ related:
 
 # Reasoning-aware max output tokens — per-family/per-model output windows + length-truncation handling
 
-**Status:** Proposed, **research-backed + cluster-verified 2026-06-28** (6
-subagents: 3 codebase traces, 3 web; §7.4 confirmed live, see below). Motivated
-by the minimax-m3 "empty response" investigation (session `a0f826d7`).
-Implementation-ready pending sign-off on the per-family numbers.
+**Status:** **IMPLEMENTED + live-verified on k3d 2026-06-29.** Motivated by the
+minimax-m3 "empty response" investigation (session `a0f826d7`). Shipped in parts
+(see §10): per-family/per-model output caps (§5.1/§5.2), the context-aware resolver
+(§5.4/§5.5), a `max_tokens`-scaled timeout (§7.2), length-aware **fail-loud**
+surfacing in both graphs (§6), and a low-window Admin→Models warning (§5.7). Two
+prerequisite shadow bugs were fixed en route (§7.4 per-model `context_window`,
+§7.5 base-config `max_output_tokens: null`).
+
+**Decision (2026-06-29):** **policy A** — keep family caps at 65,536; reasoning
+shares the *output* budget (`max_output_tokens`), **not** the context window — plus
+**fail loud, no auto-retry** (a rewind/regenerate button is the recovery UX, so a
+truncation is surfaced for the user/operator rather than rebuilt-and-retried).
+
+**Commit / deploy state (2026-06-29):**
+- T1 caps + §7.5 fix + T2 resolver + T3 per-model → committed `f1f3c350`; deployed `sha-e4cd387`.
+- T4 timeout → committed `e4cd3876`; deployed `sha-e4cd387`.
+- T5 length-aware surfacing → committed `b1c13e56` (not yet in a deploy tag).
+- T8 low-window warning (cockpit) → on `develop`, uncommitted at time of writing.
+
+**Live k3d verification (2026-06-29):** resolver + timeout + the
+`_is_output_truncated` helper confirmed in the deployed orchestrator pod
+(minimax-m3 → `max_tokens` 65536, timeout 2245 s; admin-256k → 48333). §6 confirmed
+**end-to-end in a real minimax-m3 session**: a 32000-token window (→ 4096 cap) +
+a long-answer prompt rendered + persisted *"⚠ Output truncated at the model's limit
+(4096 tokens)"* (usage bar OUTPUT 4.1k). §5.7 warning rendered in the real
+Admin→Models form (32000 → warns; 262144 → clear).
 
 **Routing note (2026-06-28):** all models now route through the **LiteLLM
 gateway** (route-all `*` wildcard), with the direct route kept as fallback. This
@@ -210,11 +232,18 @@ don't trust auto-resolution.**
 
 ## 5. Design
 
-### 5.1 `max_output_tokens` as a family setting
+### 5.1 `max_output_tokens` as a family setting — **IMPLEMENTED + k3d-verified 2026-06-28**
 
-Add `max_output_tokens` to each family's `settings:` block in
-`config/model_config_matrix.yaml`. Confirmed to flow with zero plumbing (§2). The
-Anthropic path picks it up too (`:2970`).
+`max_output_tokens` added to each reasoning family's `settings:` block in
+`config/model_config_matrix.yaml` (12 families — minimax-m3 / o-series / deepseek /
+glm / gemini / gpt-5 / codex / codex-spark / gpt-oss / claude-opus / claude-sonnet =
+65536, `minimax` M2.7 = 49152; non-reasoning families keep the §5.5 default). The
+Anthropic path picks it up too (unified through the resolver). **It did NOT flow
+with "zero plumbing" as first assumed** — the base configs pinned
+`max_output_tokens: null`, which entered `explicit_llm_keys` and shadowed the matrix
+value in *both* dispatch paths; that had to be removed first (§7.5). With the shadow
+gone, the family value reaches `config.max_output_tokens` and the resolver clamps it
+to the context window (§5.4).
 
 ### 5.2 Per-model override (registry) — **IMPLEMENTED + k3d-verified 2026-06-28**
 
@@ -319,6 +348,21 @@ Numbers are starting points — the §5.4 backstop clamps each to the effective
 context, and cost is bounded (loosely — see §9) by the quota system, so erring
 generous is safe.
 
+### 5.7 Low-window warning (Admin → Models) — **IMPLEMENTED + k3d-verified 2026-06-29**
+
+Output is reserved off the *back* of the context window (§5.4 backstop ≈ 20% of
+ctx), so an admin who sets a model's `context_window` too low silently starves
+reasoning — below ~102k ctx the backstop falls under 16,384 (the cap that
+originally truncated minimax). The Admin → Models form now warns. A pure
+`reasoningStarveWarning(ctx)` (`cockpit/src/app/views/admin/models/admin-models.component.ts`,
+unit-tested in `admin-models.warning.spec.ts`) computes the backstop
+(`ctx − floor(0.80·ctx) − 4096`, floored at 4096) and, when it drops under 16,384,
+renders *"⚠ Low context window: per-turn output is capped at ~N tokens (≈20% of the
+window). Reasoning shares this budget…"* — mirroring the agent's
+`_resolve_max_output_tokens` exactly. **Live-verified** in the real form: ctx 32000
+→ warns (~4,096); ctx 262144 → clear. (A *higher* output floor isn't safe — it could
+exceed the backstop and overflow the window; raising the window is the fix.)
+
 ## 6. Length-aware fail-loud surfacing — **IMPLEMENTED + verified 2026-06-29**
 
 > **Decision (2026-06-29):** policy **A** (keep family caps at 65,536; reasoning
@@ -346,6 +390,17 @@ generous is safe.
 >   content+length logs loudly + keeps the partial.
 > - **N** = `_resolve_max_output_tokens(config.llm, config.limits)`, so it reflects
 >   the effective (admin-/backstop-clamped) cap.
+>
+> **Live k3d verification (2026-06-29):** a real `openrouter/minimax/minimax-m3`
+> session at a 32000-token window (→ 4096 cap) with a long-answer prompt rendered +
+> persisted *"⚠ Output truncated at the model's limit (4096 tokens). Rewind/regenerate
+> or raise the model's output cap to continue."* (usage bar OUTPUT 4.1k = the cap; the
+> agent pod was confirmed running the committed graph code). This exercised the
+> **session content+length** branch + the shared clean-`finish_reason` detection
+> end-to-end. The **empty+length** message and the **worker** recoverable-freeze were
+> *not* separately triggered live (minimax wrote a real answer — 589 reasoning vs 4.1k
+> output — so it didn't burn the whole budget on reasoning); they reuse the same
+> live-verified detection + cap resolution and are covered by the unit tests + review.
 >
 > The active-retry design below is **deferred** (kept for reference if a future
 > auto-retry is wanted).
@@ -589,56 +644,78 @@ the timeout (§7.2). That's consistent with "quota catches daily abuse," but the
 design must not lean on it as a per-turn guard — and **sessions have no quota
 coverage at all**, which is worth a separate follow-up.
 
-## 10. Implementation plan (change set)
+## 10. Implementation plan (change set) — **DONE (1–5 + warning); 6 deferred**
 
-Substantive fix = 1–5 together; 6 is fast-follow.
+Shipped — commit hashes in the Status block at the top of this doc:
 
-1. **`max_output_tokens` family setting + resolution** — values in
-   `config/model_config_matrix.yaml` (§5.6); rewrite
-   `loader.py:_resolve_max_output_tokens` (order §5.3, backstop §5.4, default +
-   absolute ceiling §5.5); bump the Anthropic ladder (`:2977-2985`). No
-   settings-merge change needed (§2).
-2. **Per-model override** — registry field + builders + dispatch injection
-   (§5.2), with **override semantics** to dodge §7.4.
-3. **Fix blob-path override shadowing (§7.4)** — prerequisite so #1/#2 honor
-   admin caps. Also independently fixes admin `context_window` overrides.
-4. **Doubled `finish_reason`/model_name (§7.1)** — verify on the gateway path
-   first (likely already resolved by the route-all migration); build #5 on the
-   per-chunk read regardless, keep the normalize-fix only if a provider still
-   double-emits.
-5. **Length-aware retry/fallback** — `persistent_graph.py` + `graph.py` (§6),
-   empty-vs-content branching; **scale timeout with `max_tokens`** (§7.2).
-6. **(Fast-follow)** streaming n-gram repetition detection + `repetition_detected`
-   finish reason (§8); minimax `extra_body` hardening (`reasoning_split`,
-   provider pin) (§7.3); session quota coverage (§9).
+1. ✅ **Family setting + resolver** (T1+T2) — `max_output_tokens` per reasoning
+   family in `config/model_config_matrix.yaml` (§5.1/§5.6); rewrote
+   `_resolve_max_output_tokens` (order §5.3, backstop §5.4, default + ceiling §5.5);
+   Anthropic path unified through it. **Required removing the base-config null
+   shadow first (§7.5).** `f1f3c350`.
+2. ✅ **Per-model override** (T3) — `ModelMeta.max_output_tokens` +
+   `_params_max_output_tokens` + 3 dispatch-injection sites (§5.2). **Mechanism
+   corrected:** `setdefault` into `request_override` (so it joins
+   `explicit_llm_keys`), *not* the "override semantics" first proposed — the §7.4
+   fix made that path correct. `f1f3c350`.
+3. ✅ **Blob-path shadow fixes** — §7.4 per-model `context_window` (`c6aad44b`) +
+   §7.5 base-config `max_output_tokens: null` (`f1f3c350`). Prerequisites for 1/2.
+4. ✅ **Clean `finish_reason`** (§7.1) — shared `_is_output_truncated` (tolerant
+   substring + per-chunk read); doubling handled regardless of the gateway. `b1c13e56`.
+5. ✅ **Length-aware FAIL-LOUD** (T5, §6 — *not* auto-retry, per decision A) in
+   `persistent_graph.py` + `graph.py`; **timeout scaled with `max_tokens`** (T4,
+   §7.2, `e4cd3876`). T5 `b1c13e56`. **Plus §5.7 low-window warning** (T8, cockpit —
+   on `develop`, uncommitted at time of writing).
+6. ⏳ **(Fast-follow — deferred, see §12)** streaming repetition detection +
+   `repetition_detected` (§8); minimax `extra_body` hardening (§7.3); session quota
+   coverage (§9).
 
-## 11. Acceptance criteria / verification
+## 11. Acceptance criteria / verification — **MET (live-verified on k3d 2026-06-29)**
 
-- Re-create the `a0f826d7` naming task ("focus on old languages" synthesis) on
-  k3d/dev; the previously-truncating turn completes with a non-empty answer.
-- Unit: `_resolve_max_output_tokens` returns the family value clamped by the
-  effective ctx — family 64k + admin ctx 64k → ≈ backstop(64k); + admin ctx 1M →
-  64k. Lowering a model's registry `context_window` lowers resolved max output
-  (proves §5.4 + §7.4).
-- §7.4: confirmed broken today (job `19707fa1` blob = 1000000 vs registry
-  262144); **after the fix** a minimax dispatch resolves `max_context_tokens=262144`.
-- §7.1: audited `finish_reason` for a minimax `length` turn reads `"length"`, not
-  `"lengthlength"` (likely already true on the gateway path — verify).
-- A forced `length` truncation surfaces "truncated at output limit" and the
-  length-aware retry recovers it (sessions **and** worker jobs).
-- `ruff check src/ orchestrator/ tests/` + relevant pytest green.
+- ✅ **Forced `length` truncation is surfaced, not silent** — live in a real
+  minimax-m3 session (32000 window → 4096 cap): rendered + persisted *"⚠ Output
+  truncated at the model's limit (4096 tokens)…"* (usage bar OUTPUT 4.1k). The old
+  "empty response" failure mode is now a clear, actionable message. (The exact
+  `a0f826d7` "old languages" prompt wasn't re-run; an equivalent forced truncation
+  was.) The empty+length message + the **worker** recoverable-freeze weren't
+  separately triggered live — same live-verified detection + unit coverage (§6).
+- ✅ **Resolver clamping** — unit 8/8 + deployed-pod: minimax-m3 → 65536 (1M ctx) /
+  48333 (admin 256k) / 4096 (admin 32k floor). Lowering registry `context_window`
+  lowers resolved output (proves §5.4 + §7.4 + §7.5).
+- ✅ **§7.4 / §5.2** — was broken (job `19707fa1` blob 1000000 vs registry 262144);
+  after the fix a minimax dispatch bakes `model_max_context_tokens=262144`, and the
+  per-model `max_output_tokens` override wins (20/20, in-pod).
+- ✅ **§7.1** — detection is tolerant (`"length" in "lengthlength"`), so the doubling
+  can't break it; both graphs also read a clean per-chunk/ainvoke value.
+- ✅ **Timeout scales (§7.2)** — minimax-m3 65536 → 2245 s; deployed-pod verified.
+- ✅ **§5.7 warning** — rendered live in Admin → Models (ctx 32000 warns; 262144
+  clear); `reasoningStarveWarning` unit-tested (vitest 5/5).
+- ✅ **Lint + tests** — `ruff check` + `ruff format` clean; 423 Python tests +
+  `TestIsOutputTruncated` (7) green; cockpit production build green.
 
 ## 12. Deferred
 
+- **Active retry-rebuild** (§6) — superseded by fail-loud (decision A); kept in §6
+  for reference if a future auto-retry is wanted.
+- **Live trigger of the empty+length message + the worker recoverable-freeze** —
+  both reuse the now-live-verified shared detection + cap resolution and are
+  unit-tested, but weren't separately reproduced live (minimax wrote a real answer
+  rather than burning the whole budget on reasoning).
+- **Per-model `max_output_tokens` UI field** — DB/API-settable via `params_json`
+  today (§5.2), but the Admin → Models form has no input for it
+  (`admin-models.component.ts` writes `context_window` + a `voice` key only). The
+  §5.7 warning is the only output-related UI affordance so far.
 - Per-turn **dynamic** max_output (`effective_ctx − live_input − margin`) — more
-  precise than the static backstop; needs per-call `max_tokens` override.
+  precise than the static backstop; needs a per-call `max_tokens` override.
 - Route minimax to the **native MiniMax endpoint** for real reasoning control
-  (Anthropic-compat `budget_tokens` / OpenAI-compat `thinking:disabled`) — the
-  only way to disable/budget minimax reasoning (§4/§7.3).
-- OpenRouter **provider pinning** + `reasoning_split` hardening surfaced in the
-  Admin → Models UI (§4/§7.3); per-model max-output field in the editor.
-- Session-scoped **quota coverage** (§9 — sessions are currently uncovered).
-- `reasoning:{effort}` via `extra_body` for providers that honor it (§7.3).
+  (Anthropic-compat `budget_tokens` / OpenAI-compat `thinking:disabled`) — the only
+  way to disable/budget minimax reasoning (§4/§7.3).
+- OpenRouter **provider pinning** + `reasoning_split` hardening in the Admin → Models
+  UI (§4/§7.3).
+- Session-scoped **quota coverage** (§9 — sessions are currently uncovered);
+  `reasoning:{effort}` via `extra_body` for providers that honor it (§7.3).
+- **§7.1 gateway-path doubling** — moot for *detection* (tolerant substring), but the
+  exact audit-value form on the gateway path is unconfirmed live.
 
 ## 13. Sources
 
