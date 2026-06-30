@@ -1,6 +1,6 @@
 # IDE-settings sweeper serially SSH-probes stale, never-evicted workspace endpoints
 
-**Status:** Filed + diagnosed (2026-06-27, during the loop-job `19707fa1` OOM investigation; promoted out of a sub-note in `audit_metadata_config_duplication_ooms_orchestrator.md`). **Not yet fixed.** The IDE-settings background sweeper rebuilds its worklist from a query that selects workspace records purely on a stale JSONB `status`, with no parent-job/thread-status or pod-liveness filter, and nothing clears that status when a session ends or a pod dies — so dead records accumulate forever and the sweeper serially SSH-dials each one every cycle ("No route to host", ~3 s apiece), on every replica.
+**Status:** Filed + diagnosed (2026-06-27, during the loop-job `19707fa1` OOM investigation; promoted out of a sub-note in `audit_metadata_config_duplication_ooms_orchestrator.md`). **Not yet fixed — but live-verified on k3d 2026-06-30** (27 leaked records actively probed across both replicas; see § Live k3d verification). The IDE-settings background sweeper rebuilds its worklist from a query that selects workspace records purely on a stale JSONB `status`, with no parent-job/thread-status or pod-liveness filter, and nothing clears that status when a session ends or a pod dies — so dead records accumulate forever and the sweeper serially SSH-dials each one every cycle ("No route to host", ~3 s apiece), on every replica.
 
 **Found:** 2026-06-27. Surfaced on the **main cluster** (ns `superhuman-remote-worker`) while investigating job `19707fa1`'s orchestrator OOM — the logs were full of serial `10.42.x.x:30022` "No route to host" probes against long-dead workspace endpoints. Independent of (and not a cause of) that OOM.
 
@@ -45,6 +45,17 @@ Net: ended sessions and dead-pod records keep `status='ready'` + a stale `pod_ip
 ## Same stale-pod-IP family as workspace-recovery
 
 `resolve_ssh_target` (`ide_settings.py:225-252`) builds the SSH target from the stored context, preferring `workspace_container.pod_ip` (`:236-242`) — a **raw pod IP** (`10.42.x.x` = the k3d pod CIDR). When a pod is recreated the IP moves, so even a record for a still-wanted session goes stale. This is the same ephemeral-pod-IP churn fixed for workspace-recovery via a **stable headless Service** (`workspace_manager.py:477-481`) — but this path dials the raw stored IP, not the Service DNS, so a record both **goes stale** and is **never auto-corrected**.
+
+## Live k3d verification (2026-06-30)
+
+Reproduced in the wild on the k3d dev cluster (`k3d-srw` / `srw`, **2 orchestrator replicas**) — no fixture needed; 22–32 h of normal session/job churn had already produced the leak.
+
+- **Worklist contains 27 dead records.** Running the exact `list_active_ide_workspaces` predicate against the live DB returned **16 `ended` threads + 9 `cancelled` + 2 `failed` jobs**, every one still `workspace_container.status='ready'` with a stale `pod_ip` — while only **2** workspace pods actually existed in the cluster. Among them: job `d65d93d3` (failed) pinned at `10.42.0.95` and `5d2f4dcd` (cancelled) at `10.42.0.79` — the exact jobs+IPs from the workspace-recovery E2Es, never evicted.
+- **The sweeper serially dials every one.** Orchestrator logs (`ide_settings.py:380`) show a single sweep cycle SSH-probing **~25 dead endpoints back-to-back at ~3 s intervals** (`rc=255`, "No route to host" / "Connection refused") — **~75 s of wall-time per cycle** spent dialing addresses that will never answer. Each probed IP matches a row from the worklist query (`.176, .249, .20, .175, .95, .18, .22, .241, .251, .242, .244, .114, .155, .160, .235, .118, .3, .145, .158, .120, .108, .15, .226, .163`).
+- **Not leader-gated — both replicas do it.** The same `ide_settings` probe sweep appears independently in *both* orchestrator pods' logs (fix option 3 confirmed): the dead set is re-dialed once per replica per cycle.
+- **Amplifier confirmed.** The snapshot capture path (`snapshot_service.py:430`) independently SSH-tars the same terminal entities (`d65d93d3`, `3f20dc68`) **every ~60 s** — the same no-eviction root cause feeding a second subsystem. (It currently fails earlier on a *separate* `/run/secrets/vm-ssh-key` 0444 "bad permissions" error — an unrelated key-mode bug worth its own look.)
+
+Net: the defect is real and live; eviction at the worklist source (fix option 1) is the highest-leverage fix.
 
 ## Fix options (ranked; not implemented)
 
