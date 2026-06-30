@@ -162,6 +162,7 @@ _No bundled dependency ships a NOTICE file._
 | [cli-cursor](https://www.npmjs.com/package/cli-cursor) | 5.0.0 | MIT | ALLOW |
 | [cli-spinners](https://www.npmjs.com/package/cli-spinners) | 3.4.0 | MIT | ALLOW |
 | [clipboard](https://www.npmjs.com/package/clipboard) | 2.0.11 | MIT | ALLOW |
+| [commander](https://www.npmjs.com/package/commander) | 8.3.0 | MIT | ALLOW |
 | [content-disposition](https://www.npmjs.com/package/content-disposition) | 1.1.0 | MIT | ALLOW |
 | [content-type](https://www.npmjs.com/package/content-type) | 1.0.5 | MIT | ALLOW |
 | [cookie](https://www.npmjs.com/package/cookie) | 0.7.2 | MIT | ALLOW |
@@ -216,6 +217,7 @@ _No bundled dependency ships a NOTICE file._
 | [json-parse-even-better-errors](https://www.npmjs.com/package/json-parse-even-better-errors) | 2.3.1 | MIT | ALLOW |
 | [json-schema-traverse](https://www.npmjs.com/package/json-schema-traverse) | 1.0.0 | MIT | ALLOW |
 | [jsonc-parser](https://www.npmjs.com/package/jsonc-parser) | 3.3.1 | MIT | ALLOW |
+| [katex](https://www.npmjs.com/package/katex) | 0.16.47 | MIT | ALLOW |
 | [layout-base](https://www.npmjs.com/package/layout-base) | 2.0.1 | MIT | ALLOW |
 | [lines-and-columns](https://www.npmjs.com/package/lines-and-columns) | 1.2.4 | MIT | ALLOW |
 | [log-symbols](https://www.npmjs.com/package/log-symbols) | 7.0.1 | MIT | ALLOW |
