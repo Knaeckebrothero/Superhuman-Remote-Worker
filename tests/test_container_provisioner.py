@@ -1036,6 +1036,38 @@ class TestCreateWorkspacePvc:
         assert updates["status"] == "failed"
         assert "PVC" in updates["error"]
 
+    @pytest.mark.asyncio
+    async def test_pvc_quota_403_fails_closed_with_capacity_log(self, caplog):
+        # Capacity guard (Phase 3a): a ResourceQuota rejection surfaces as a 403.
+        # It must fail closed (no pod, no emptyDir fallback — capacity exhaustion
+        # never silently drops durability) AND log a distinct capacity-exceeded
+        # line so an operator/alert can tell "fleet at capacity" from a genuine
+        # infra failure (which logs the generic "Failed to create PVC").
+        import logging
+
+        p = self._provisioner(pvc_enabled=True)
+
+        class _QuotaExc(Exception):
+            status = 403
+            body = "exceeded quota: srw-workspace-storage, requested: ..."
+
+        core = MagicMock()
+        core.create_namespaced_pod = MagicMock()
+        core.create_namespaced_persistent_volume_claim = MagicMock(
+            side_effect=_QuotaExc()
+        )
+        p._core_api = core
+
+        with caplog.at_level(logging.ERROR):
+            result = await p.create_workspace(WorkspaceOwner.job("abcdef123456-rest"))
+
+        assert result is False
+        core.create_namespaced_pod.assert_not_called()
+        updates = p._db.merge_workspace_container_context.call_args_list[-1][0][1]
+        assert updates["status"] == "failed"
+        # Distinct, greppable capacity signal (not the generic "Failed to create")
+        assert "capacity quota exceeded" in caplog.text.lower()
+
 
 class TestWorkspaceService:
     """Option 1: stable headless Service so reattach/recovery reconnects to a
