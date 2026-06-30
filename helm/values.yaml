@@ -529,7 +529,7 @@ databases:
         memory: "512Mi"
         cpu: "200m"
   # Dedicated Postgres for the LiteLLM gateway (usage monitoring + rate
-  # limiting — docs/features/usage_monitoring_and_rate_limiting.md). LiteLLM
+  # limiting — docs/done/usage_monitoring_and_rate_limiting.md). LiteLLM
   # OWNS and self-migrates this schema via Prisma on startup (LiteLLM_* tables:
   # virtual keys, teams, users, spend logs) — NOT the orchestrator migration
   # runner. DB mode is required: it's what unlocks virtual keys, per-user/team
@@ -1099,7 +1099,7 @@ codexProxy:
 # =============================================================================
 # LiteLLM Gateway — central proxy all agent LLM traffic traverses for usage
 # monitoring + rate limiting. Slice 1 = RPM/TPM visibility (no enforcement).
-# See docs/features/usage_monitoring_and_rate_limiting.md. Requires
+# See docs/done/usage_monitoring_and_rate_limiting.md. Requires
 # databases.litellm (DB mode) for virtual keys + the spend/usage dashboard.
 # Default-off chart-wide; the dev/experimental overlay enables it.
 # =============================================================================

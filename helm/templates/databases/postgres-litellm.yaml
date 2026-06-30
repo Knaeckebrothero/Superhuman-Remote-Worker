@@ -2,7 +2,7 @@
 # LiteLLM Gateway Database (srw-litellmdb) — the LLM-usage control plane.
 #
 # Dedicated PostgreSQL instance backing the in-chart LiteLLM proxy (usage
-# monitoring + rate limiting — docs/features/usage_monitoring_and_rate_limiting.md).
+# monitoring + rate limiting — docs/done/usage_monitoring_and_rate_limiting.md).
 # LiteLLM OWNS this database: it creates and self-migrates its LiteLLM_* tables
 # (virtual keys, teams, internal users, spend logs) via Prisma on startup. The
 # orchestrator's migration runner does NOT touch it. DB mode is required — it is

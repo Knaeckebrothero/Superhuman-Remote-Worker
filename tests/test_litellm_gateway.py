@@ -2,7 +2,7 @@
 
 Covers the pure reconcile logic + the catalog→desired-model mapping without a
 live gateway: a mock postgres_db supplies endpoint models, a mock LiteLLMClient
-records the admin calls. See docs/features/usage_monitoring_and_rate_limiting.md.
+records the admin calls. See docs/done/usage_monitoring_and_rate_limiting.md.
 """
 
 from datetime import datetime, timezone
