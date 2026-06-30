@@ -306,7 +306,7 @@ llm:
         capability: chat
 # -----------------------------------------------------------------------------
 # LiteLLM gateway — usage monitoring + rate limiting
-# (docs/features/usage_monitoring_and_rate_limiting.md)
+# (docs/done/usage_monitoring_and_rate_limiting.md)
 #
 # All agent LLM traffic routes through this in-cluster proxy (port 4000). DB
 # mode (databases.litellm above) unlocks virtual keys + the spend/usage
