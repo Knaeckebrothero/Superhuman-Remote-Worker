@@ -7,6 +7,7 @@ such as workspace managers, database connections, and configuration.
 import asyncio
 import hashlib
 import logging
+import os
 import re
 from collections import deque
 from dataclasses import dataclass, field
@@ -417,7 +418,26 @@ class ToolContext:
         metadata = {"cloud": cloud_metadata} if cloud_metadata else None
 
         engine = self.get_citation_engine()
-        source = await engine.add_doc_source(file_path, name=name, metadata=metadata)
+        # The engine does local filesystem I/O (os.path.exists / fitz.open / open).
+        # On a remote workspace backend the file lives on the workspace pod, not on
+        # this agent host, so materialize a local copy first — mirroring the read
+        # tools (workspace.local_copy in files.py / filesystem.py). A path that is
+        # already present locally (e.g. the agent-side auto-register glob) is passed
+        # through unchanged.
+        if self.workspace_manager is not None and not os.path.exists(file_path):
+            # local_copy resolves relative to the workspace root; the backend
+            # rejects absolute/leading-slash paths, so normalize first.
+            rel = file_path.lstrip("/")
+            with self.workspace_manager.local_copy(rel) as local_path:
+                source = await engine.add_doc_source(
+                    str(local_path),
+                    name=name or os.path.basename(file_path),
+                    metadata=metadata,
+                )
+        else:
+            source = await engine.add_doc_source(
+                file_path, name=name, metadata=metadata
+            )
         self._source_registry[file_path] = source.id
         return source.id
 
