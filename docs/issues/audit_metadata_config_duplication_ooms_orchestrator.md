@@ -119,9 +119,9 @@ The data at rest is not the problem. Wikipedia's 100 GB is *compressed text on d
 - Close the Cockpit tab polling the job/loop view (removes the trigger).
 - Optionally bump the orchestrator memory limit to stabilize the control plane while #1/#2 land.
 
-## Secondary finding (not the OOM)
+## Secondary finding (not the OOM) — now its own issue
 
-The `ide_settings` sync (`orchestrator/services/ide_settings.py:380`) serially SSH-probes dozens of **stale workspace endpoints** (`10.42.x.x:30022`, "No route to host", ~3 s timeout each) — dead IDE-session records that are never evicted. Wastes a connection/loop continuously. Evict dead records (or parallelize with short timeouts). Cleanup debt; unrelated to the OOM.
+The `ide_settings` sync serially SSH-probes dozens of stale, never-evicted workspace endpoints (`10.42.x.x:30022`, "No route to host", ~3 s each) — cleanup debt, unrelated to this OOM. **Promoted to its own issue:** `ide_settings_sweeper_probes_stale_workspace_endpoints.md`.
 
 ## Verification commands (reproduce the measurements)
 
