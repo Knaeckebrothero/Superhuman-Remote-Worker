@@ -271,6 +271,7 @@ GET    /api/tables/{table_name}                                                 
 GET    /api/tables/{table_name}/schema                                                  admin:_require_admin
 GET    /api/usage                                                                       gated:require_approved_user
 GET    /api/usage/breakdown                                                             gated:require_approved_user
+GET    /api/usage/timeseries                                                            gated:require_approved_user
 GET    /api/users                                                                       gated:require_approved_user
 POST   /api/users                                                                       admin:_require_admin
 GET    /api/users/me/capabilities                                                       gated:require_approved_user
