@@ -4,7 +4,7 @@ import {ActivatedRoute, Router} from '@angular/router';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {ApiService} from '../../core/services/api.service';
 import {ModelService} from '../../core/services/model.service';
-import type {ExpertCreateRequest, ExpertUpdateRequest, GrantCatalog} from '../../core/models/api.model';
+import type {EffectiveModels, ExpertCreateRequest, ExpertUpdateRequest, GrantCatalog} from '../../core/models/api.model';
 import {AppButtonComponent} from '../../ui/button';
 import {AppInputComponent} from '../../ui/input';
 import {AppTextareaComponent} from '../../ui/textarea';
@@ -18,6 +18,7 @@ import {AdvancedAccordionComponent} from '../agent-settings/advanced-accordion.c
 import {deepMergeConfig} from '../agent-settings/config-merge';
 import {assembleExpertConfig, splitExpertConfig} from './expert-config';
 import {isModelAllowed} from '../agent-settings/capability-gates';
+import {defaultModelOptionLabel} from '../agent-settings/agent-settings.types';
 
 /** Derive a valid expert slug (^[a-z][a-z0-9_-]*$) from a display name. */
 export function slugify(s: string): string {
@@ -227,7 +228,7 @@ interface EditorForm {
         @if (mode() === 'job') {
           <label class="ml">Strategic model
             <select class="model-select" [disabled]="isModelGated()" [ngModel]="form.strategicModel" (ngModelChange)="form.strategicModel = $event">
-              <option [ngValue]="''">(base default)</option>
+              <option [ngValue]="''">{{ baseDefaultLabel('strategic') }}</option>
               @for (g of models(); track g.group) {
                 <optgroup [label]="g.group">
                   @for (m of g.models; track m) { <option [ngValue]="m" [disabled]="!modelAllowed(m)">{{ m }}</option> }
@@ -237,7 +238,7 @@ interface EditorForm {
           </label>
           <label class="ml">Tactical model
             <select class="model-select" [disabled]="isModelGated()" [ngModel]="form.tacticalModel" (ngModelChange)="form.tacticalModel = $event">
-              <option [ngValue]="''">(base default)</option>
+              <option [ngValue]="''">{{ baseDefaultLabel('tactical') }}</option>
               @for (g of models(); track g.group) {
                 <optgroup [label]="g.group">
                   @for (m of g.models; track m) { <option [ngValue]="m" [disabled]="!modelAllowed(m)">{{ m }}</option> }
@@ -248,7 +249,7 @@ interface EditorForm {
         } @else {
           <label class="ml">Model
             <select class="model-select" [disabled]="isModelGated()" [ngModel]="form.sessionModel" (ngModelChange)="form.sessionModel = $event">
-              <option [ngValue]="''">(base default)</option>
+              <option [ngValue]="''">{{ baseDefaultLabel('session') }}</option>
               @for (g of models(); track g.group) {
                 <optgroup [label]="g.group">
                   @for (m of g.models; track m) { <option [ngValue]="m" [disabled]="!modelAllowed(m)">{{ m }}</option> }
@@ -416,6 +417,10 @@ export class ExpertEditorComponent implements OnInit {
 
   // Async-loaded context.
   frameworkDefaults = signal<Record<string, unknown>>({});
+  // Server-resolved effective models for the framework base — surfaces the model
+  // each unpinned slot inherits, so the "(base default)" option names it instead
+  // of being an opaque "default".
+  frameworkEffectiveModels = signal<EffectiveModels | null>(null);
   defaultsTools = signal<Record<string, string[]>>({});
   settingsMatrix = signal<Record<string, Record<string, unknown>>>({});
   /** The expert's stored config fragment (the save baseline). {} on create. */
@@ -436,6 +441,12 @@ export class ExpertEditorComponent implements OnInit {
     return g != null && Array.isArray((g as Record<string, unknown>)['model_selection']);
   });
   modelAllowed = (id: string): boolean => isModelAllowed(this.capabilities() ?? null, id);
+
+  /** "(base default)" option label, naming the model the unpinned slot inherits
+   *  from the framework base (account/system chat pin) when known. */
+  baseDefaultLabel(slot: 'strategic' | 'tactical' | 'session'): string {
+    return defaultModelOptionLabel('Base default', this.frameworkEffectiveModels()?.[slot]?.model);
+  }
 
   form: EditorForm = {
     name: '',
@@ -489,6 +500,7 @@ export class ExpertEditorComponent implements OnInit {
       this.frameworkDefaults.set((d?.config as Record<string, unknown>) ?? {});
       this.defaultsTools.set(d?.defaults_tools ?? {});
       this.settingsMatrix.set(d?.settings_matrix ?? {});
+      this.frameworkEffectiveModels.set(d?.effective_models ?? null);
     });
 
     const id = this.route.snapshot.paramMap.get('id');

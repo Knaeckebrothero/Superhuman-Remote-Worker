@@ -1,10 +1,11 @@
-import {Component, effect, inject, OnInit, signal, ViewChild} from '@angular/core';
+import {Component, computed, effect, inject, OnInit, signal, ViewChild} from '@angular/core';
 import {Router} from '@angular/router';
 import {HttpClient} from '@angular/common/http';
 import {firstValueFrom} from 'rxjs';
 import {environment} from '../../core/environment';
 import {UserService} from '../../core/services/user.service';
 import {AgentSettingsComponent} from '../../views/agent-settings/agent-settings.component';
+import {resolveEffectiveModels} from '../../views/agent-settings/agent-settings.types';
 import {ModelService} from '../../core/services/model.service';
 import {CapabilitiesService} from '../../core/services/capabilities.service';
 import {SidebarToggleComponent} from '../../shell/sidebar-toggle/sidebar-toggle.component';
@@ -132,7 +133,7 @@ interface ExpertDetail extends Expert {
           [disabled]="creating()"
           [defaultsTools]="expertDetail()?.defaults_tools ?? {}"
           [settingsMatrix]="expertDetail()?.settings_matrix ?? frameworkSettingsMatrix()"
-          [effectiveModels]="expertDetail()?.effective_models ?? null"
+          [effectiveModels]="resolvedEffectiveModels()"
           [datasources]="datasources()"
           [loadingDatasources]="loadingDatasources()"
           [loadingExpert]="loadingExpert()"
@@ -181,10 +182,19 @@ interface ExpertDetail extends Expert {
     .form-container {
       flex: 1;
       overflow: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
       padding: 20px;
       max-width: var(--content-max-width);
       width: 100%;
       margin: 0 auto;
+    }
+    /* The settings block is a solid bordered panel; without this it butts
+       flush against the expert card grid and the cards look like they tuck
+       under it. The gap above gives every section consistent separation. */
+    app-agent-settings {
+      display: block;
     }
     .field-hint {
       display: block;
@@ -262,7 +272,6 @@ interface ExpertDetail extends Expert {
       display: flex;
       justify-content: flex-end;
       gap: 10px;
-      margin-top: 24px;
       padding-top: 16px;
       border-top: 1px solid var(--border-color, var(--surface-0));
     }
@@ -309,6 +318,13 @@ export class SessionCreateComponent implements OnInit {
   readonly expertDetail = signal<ExpertDetail | null>(null);
   readonly frameworkDefaults = signal<Record<string, unknown> | null>(null);
   readonly frameworkSettingsMatrix = signal<Record<string, Record<string, unknown>>>({});
+  // Server-resolved effective models for the framework "defaults" expert — the
+  // floor used when no expert is selected, so the model picker's "Default"
+  // option shows the resolved chat pin instead of the config-literal placeholder.
+  readonly frameworkEffectiveModels = signal<EffectiveModels | null>(null);
+  readonly resolvedEffectiveModels = computed(() =>
+    resolveEffectiveModels(this.expertDetail()?.effective_models, this.frameworkEffectiveModels()),
+  );
   readonly loadingExperts = signal(false);
   readonly loadingExpert = signal(false);
   readonly datasources = signal<any[]>([]);
@@ -329,6 +345,7 @@ export class SessionCreateComponent implements OnInit {
       next: (d) => {
         if (d?.config) this.frameworkDefaults.set(d.config);
         if (d?.settings_matrix) this.frameworkSettingsMatrix.set(d.settings_matrix);
+        if (d?.effective_models) this.frameworkEffectiveModels.set(d.effective_models);
       },
     });
   }

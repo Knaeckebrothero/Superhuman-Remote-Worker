@@ -1,7 +1,11 @@
 import {inject, Injectable, signal} from '@angular/core';
-import {HttpClient, HttpParams} from '@angular/common/http';
+import {HttpClient, HttpContext, HttpParams} from '@angular/common/http';
 import {catchError, of} from 'rxjs';
 import {environment} from '../environment';
+import {VIEW_AS_OVERRIDE} from '../interceptors/view-as.interceptor';
+
+/** Page-level visibility override forwarded to the view-as interceptor. */
+export type UsageScope = 'all' | 'mine' | null;
 
 /** One (category, unit) usage aggregate row from `/api/usage`. */
 export interface UsageCategoryRow {
@@ -41,6 +45,26 @@ export interface UsageBreakdown {
 }
 export type BreakdownDim = 'user' | 'model' | 'project';
 
+/** One daily bucket within a usage time series. */
+export interface UsageTsPoint { day: string; tokens: number; cost_usd: number; events: number; }
+/** One series (a single user/model/project) of the stacked usage-over-time chart. */
+export interface UsageSeries {
+  key: string;
+  label: string;
+  is_admin?: boolean | null;
+  events: number;
+  points: UsageTsPoint[];
+}
+/** Response of `GET /api/usage/timeseries` — sorted day axis + per-key series. */
+export interface UsageTimeseries {
+  available: boolean;
+  group_by: BreakdownDim;
+  from?: string;
+  to?: string;
+  days: string[];
+  series: UsageSeries[];
+}
+
 /**
  * REST client for the admin Usage view (`GET /api/usage`, Slice 4). Reads the
  * usage_events ledger aggregated by (category, unit), scoped server-side to the
@@ -55,11 +79,16 @@ export class AdminUsageService {
   readonly usage = signal<UsageSummary | null>(null);
   readonly loading = signal(false);
 
-  loadUsage(days = 30): void {
+  /** HttpContext carrying the page-level scope override for the view-as interceptor. */
+  private scopeCtx(scope: UsageScope): HttpContext {
+    return new HttpContext().set(VIEW_AS_OVERRIDE, scope);
+  }
+
+  loadUsage(days = 30, scope: UsageScope = null): void {
     this.loading.set(true);
     const params = new HttpParams().set('days', String(days));
     this.http
-      .get<UsageSummary>(`${this.baseUrl}/usage`, {params})
+      .get<UsageSummary>(`${this.baseUrl}/usage`, {params, context: this.scopeCtx(scope)})
       .pipe(catchError(() => of(EMPTY)))
       .subscribe((res) => {
         this.usage.set(res ?? EMPTY);
@@ -70,12 +99,24 @@ export class AdminUsageService {
   private readonly breakdowns = signal<Partial<Record<BreakdownDim, UsageBreakdown>>>({});
   breakdown(dim: BreakdownDim): UsageBreakdown | null { return this.breakdowns()[dim] ?? null; }
 
-  loadBreakdown(groupBy: BreakdownDim, days = 30): void {
+  loadBreakdown(groupBy: BreakdownDim, days = 30, scope: UsageScope = null): void {
     const params = new HttpParams().set('group_by', groupBy).set('days', String(days));
     this.http
-      .get<UsageBreakdown>(`${this.baseUrl}/usage/breakdown`, {params})
+      .get<UsageBreakdown>(`${this.baseUrl}/usage/breakdown`, {params, context: this.scopeCtx(scope)})
       .pipe(catchError(() => of({available: false, group_by: groupBy, rows: []} as UsageBreakdown)))
       .subscribe((res) => this.breakdowns.update((m) => ({...m, [groupBy]: res})));
+  }
+
+  private readonly timeseriesSig = signal<Partial<Record<BreakdownDim, UsageTimeseries>>>({});
+  timeseries(dim: BreakdownDim): UsageTimeseries | null { return this.timeseriesSig()[dim] ?? null; }
+
+  loadTimeseries(groupBy: BreakdownDim, days = 30, scope: UsageScope = null): void {
+    const params = new HttpParams().set('group_by', groupBy).set('days', String(days));
+    this.http
+      .get<UsageTimeseries>(`${this.baseUrl}/usage/timeseries`, {params, context: this.scopeCtx(scope)})
+      .pipe(catchError(() =>
+        of({available: false, group_by: groupBy, days: [], series: []} as UsageTimeseries)))
+      .subscribe((res) => this.timeseriesSig.update((m) => ({...m, [groupBy]: res})));
   }
 
   /** One-shot windowed fetch (used by the KPI trend's current-vs-previous pair). */

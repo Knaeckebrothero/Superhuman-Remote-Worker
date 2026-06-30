@@ -1,11 +1,16 @@
 import {describe, expect, it, vi} from 'vitest';
 import {Injector, runInInjectionContext, signal} from '@angular/core';
-import {HttpRequest, HttpResponse} from '@angular/common/http';
+import {HttpContext, HttpRequest, HttpResponse} from '@angular/common/http';
 import {of} from 'rxjs';
 import {UserService} from '../services/user.service';
 import {ViewModeService} from '../services/view-mode.service';
 import {environment} from '../environment';
-import {VIEW_AS_HEADER, VIEW_AS_USER, viewAsInterceptor} from './view-as.interceptor';
+import {
+  VIEW_AS_HEADER,
+  VIEW_AS_OVERRIDE,
+  VIEW_AS_USER,
+  viewAsInterceptor,
+} from './view-as.interceptor';
 import {User} from '../models/api.model';
 
 /**
@@ -117,5 +122,34 @@ describe('viewAsInterceptor', () => {
     const fwd = next.mock.calls[0]![0] as HttpRequest<unknown>;
     expect(fwd.headers.get('X-CSRF')).toBe('1');
     expect(fwd.headers.get(VIEW_AS_HEADER)).toBe(VIEW_AS_USER);
+  });
+
+  const ctxReq = (override: 'all' | 'mine') =>
+    new HttpRequest('GET', `${environment.apiUrl}/usage`, null, {
+      context: new HttpContext().set(VIEW_AS_OVERRIDE, override),
+    });
+
+  it("override 'all' suppresses the header even when the global toggle is 'me'", () => {
+    const {run, next} = setup({user: ADMIN_USER, viewMode: 'me'});
+    run(ctxReq('all')).subscribe();
+
+    const fwd = next.mock.calls[0]![0] as HttpRequest<unknown>;
+    expect(fwd.headers.has(VIEW_AS_HEADER)).toBe(false);
+  });
+
+  it("override 'mine' adds the header for an admin even when the global toggle is 'all'", () => {
+    const {run, next} = setup({user: ADMIN_USER, viewMode: 'all'});
+    run(ctxReq('mine')).subscribe();
+
+    const fwd = next.mock.calls[0]![0] as HttpRequest<unknown>;
+    expect(fwd.headers.get(VIEW_AS_HEADER)).toBe(VIEW_AS_USER);
+  });
+
+  it("override 'mine' is a no-op for a non-admin (no header)", () => {
+    const {run, next} = setup({user: REGULAR_USER, viewMode: 'all'});
+    run(ctxReq('mine')).subscribe();
+
+    const fwd = next.mock.calls[0]![0] as HttpRequest<unknown>;
+    expect(fwd.headers.has(VIEW_AS_HEADER)).toBe(false);
   });
 });
