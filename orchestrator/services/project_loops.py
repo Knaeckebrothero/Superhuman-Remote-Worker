@@ -234,6 +234,15 @@ async def create_loop_job(
     if model:
         config_override["llm"] = {"model": model}
 
+    # Per-loop workspace tier override (mirrors `model`). When set, every job
+    # the loop spawns boots on this backend — e.g. `vm` gives every role a root
+    # VM instead of the default sandbox container. The dispatcher reads
+    # config_override.workspace.backend (main._job_needs_vm / _job_needs_sandbox)
+    # to decide provisioning; VM sizing falls back to its 8c/16Gi default.
+    workspace_backend = loop.get("workspace_backend")
+    if workspace_backend:
+        config_override["workspace"] = {"backend": workspace_backend}
+
     # Split the synthesized prompt the way the manual create-job form does:
     # a concise `description` (the cockpit row title + task_brief "## Description")
     # and the full loop protocol as the kickoff message, carried through the

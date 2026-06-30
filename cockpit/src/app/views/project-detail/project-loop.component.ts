@@ -123,6 +123,7 @@ export function buildRoleSequence(
               </div>
               <div class="loop-meta">
                 <div><span class="k">Model</span><span class="v">{{ l.model || 'project default' }}</span></div>
+                <div><span class="k">Workspace</span><span class="v">{{ l.workspace_backend === 'vm' ? 'VM (root)' : (l.workspace_backend || 'sandbox') }}</span></div>
                 <div><span class="k">Sequence</span><span class="v">{{ l.role_sequence.join(' → ') }}</span></div>
                 @if (l.remaining_iterations !== null) {
                   <div><span class="k">Iterations left</span><span class="v">{{ l.remaining_iterations }}</span></div>
@@ -189,6 +190,16 @@ export function buildRoleSequence(
                 @for (m of modelOptions(); track m) {
                   <option [value]="m">{{ m }}</option>
                 }
+              </app-select>
+            </app-form-field>
+
+            <app-form-field
+              label="Workspace"
+              hint="Where every role runs. Sandbox is a lightweight container; VM gives root + sudo (heavier, slower to boot)."
+            >
+              <app-select [value]="fBackend()" (changed)="fBackend.set($event ?? '')">
+                <option value="">Sandbox container (default)</option>
+                <option value="vm">Virtual machine — root + sudo</option>
               </app-select>
             </app-form-field>
 
@@ -381,6 +392,8 @@ export class ProjectLoopComponent implements OnInit, OnDestroy {
 
   // Start-form state
   readonly fModel = signal('');
+  // Per-loop workspace tier for every job: '' = default sandbox, 'vm' = root VM.
+  readonly fBackend = signal('');
   readonly fPreset = signal<LoopPreset>('build');
   readonly fMaxIterations = signal('30');
   readonly fMaxHours = signal('');
@@ -529,6 +542,7 @@ export class ProjectLoopComponent implements OnInit, OnDestroy {
 
     const body: ProjectLoopStartRequest = {
       model: this.fModel() || null,
+      workspace_backend: this.fBackend() || null,
       role_sequence: this.roleSequence(),
       acceptance_criteria: this.fAcceptance().trim() || null,
       user_prompt: this.fUserPrompt().trim() || null,
