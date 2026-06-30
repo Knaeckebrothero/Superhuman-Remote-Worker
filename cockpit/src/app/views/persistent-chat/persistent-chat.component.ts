@@ -63,6 +63,7 @@ import {AppSelectComponent} from '../../ui/select';
 import {AppIconComponent} from '../../ui/icon';
 import {AppDialogComponent} from '../../ui/dialog';
 import {AppToolCardComponent} from '../../ui/tool-card';
+import {AppInlineEditableTextComponent} from '../../ui/inline-editable-text';
 import {AppToastService} from '../../ui/toast';
 import {ErrorMessageService} from '../../core/services/error-message.service';
 
@@ -430,6 +431,7 @@ export function clearDraft(threadId: string | null): void {
         AppIconComponent,
         AppDialogComponent,
         AppToolCardComponent,
+        AppInlineEditableTextComponent,
         CitationsPanelComponent,
     ],
     template: `
@@ -454,7 +456,18 @@ export function clearDraft(threadId: string | null): void {
             <app-icon size="md" class="back-icon">arrow_back</app-icon>
           </a>
           <app-icon size="md" class="header-icon">smart_toy</app-icon>
-          <span class="header-title">{{ chat.sessionTitle() || ('chat.defaultTitle' | transloco) }}</span>
+          <span class="header-title">
+            @if (chat.threadId(); as tid) {
+              <app-inline-editable-text
+                [value]="chat.sessionTitle() || ('chat.defaultTitle' | transloco)"
+                [clickToEdit]="true"
+                [ariaLabel]="'common.rename' | transloco"
+                (save)="onRenameSession(tid, $event)"
+              />
+            } @else {
+              {{ chat.sessionTitle() || ('chat.defaultTitle' | transloco) }}
+            }
+          </span>
           @if (chat.threadId(); as tid) {
             <span class="header-session-id" title="Session ID">{{ tid.slice(0, 8) }}</span>
           }
@@ -2732,6 +2745,14 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
             this.toast.danger(this.errors.translate(e, 'errors.sessions.endFailed'));
         } finally {
             this.router.navigate(['/sessions']);
+        }
+    }
+
+    async onRenameSession(threadId: string, title: string): Promise<void> {
+        try {
+            await this.chat.renameThread(threadId, title);
+        } catch (e) {
+            this.toast.danger(this.errors.translate(e, 'errors.sessions.renameFailed'));
         }
     }
 

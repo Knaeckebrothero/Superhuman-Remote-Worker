@@ -12,6 +12,7 @@ import {AppSpinnerComponent} from '../../ui/spinner';
 import {AppButtonComponent} from '../../ui/button';
 import {AppIconButtonComponent} from '../../ui/icon-button';
 import {AppInputComponent} from '../../ui/input';
+import {AppInlineEditableTextComponent} from '../../ui/inline-editable-text';
 import {AppTextareaComponent} from '../../ui/textarea';
 import {AppSelectComponent} from '../../ui/select';
 import {AppCheckboxComponent} from '../../ui/checkbox';
@@ -48,6 +49,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
     AppButtonComponent,
     AppIconButtonComponent,
     AppInputComponent,
+    AppInlineEditableTextComponent,
     AppTextareaComponent,
     AppSelectComponent,
     AppCheckboxComponent,
@@ -78,7 +80,14 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
             <app-icon size="sm">arrow_back</app-icon>
           </app-icon-button>
           <div class="header-info">
-            <h1 class="page-title">{{ proj.name }}</h1>
+            <h1 class="page-title">
+              <app-inline-editable-text
+                [value]="proj.name"
+                [clickToEdit]="true"
+                [ariaLabel]="'common.rename' | transloco"
+                (save)="onRenameProject($event)"
+              />
+            </h1>
             <div class="header-badges">
               @if (proj.is_default) {
                 <app-badge tone="accent" size="xs" [uppercase]="true">
@@ -1879,6 +1888,26 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
         if (res) this.api.getProject(this.projectId).subscribe((p) => this.project.set(p));
       },
       error: () => this.isSavingSettings.set(false),
+    });
+  }
+
+  onRenameProject(name: string): void {
+    const p = this.project();
+    if (!p || !name || name === p.name) return;
+    const previous = p.name;
+    // Optimistic: reflect the new name immediately, revert if the PATCH fails.
+    this.project.set({...p, name});
+    this.api.updateProject(this.projectId, {name}).subscribe({
+      next: (res) => {
+        if (!res) {
+          const cur = this.project();
+          if (cur) this.project.set({...cur, name: previous});
+        }
+      },
+      error: () => {
+        const cur = this.project();
+        if (cur) this.project.set({...cur, name: previous});
+      },
     });
   }
 

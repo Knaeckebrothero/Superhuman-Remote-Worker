@@ -61,6 +61,7 @@
     "delete": "Löschen",
     "cancel": "Abbrechen",
     "edit": "Bearbeiten",
+    "rename": "Umbenennen",
     "copy": "Kopieren",
     "copied": "Kopiert",
     "never": "Nie",
@@ -2143,7 +2144,8 @@
       "resumeFailed": "Sitzung konnte nicht fortgesetzt werden.",
       "endFailed": "Sitzung konnte nicht beendet werden.",
       "deleteFailed": "Sitzung konnte nicht gelöscht werden.",
-      "createFailed": "Sitzung konnte nicht erstellt werden."
+      "createFailed": "Sitzung konnte nicht erstellt werden.",
+      "renameFailed": "Sitzung konnte nicht umbenannt werden."
     }
   },
   "toasts": {

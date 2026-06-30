@@ -112,6 +112,7 @@ function createService(opts: {
     const mockHttp: any = {
         get: vi.fn().mockReturnValue(of({messages: [], total: 0})),
         post: vi.fn().mockReturnValue(of({})),
+        patch: vi.fn().mockReturnValue(of({status: 'updated'})),
         delete: vi.fn().mockReturnValue(of({})),
     };
 
@@ -2522,5 +2523,31 @@ describe('PersistentChatService — usage.updated telemetry', () => {
                 'pending',
             );
         });
+    });
+});
+
+describe('PersistentChatService — renameThread', () => {
+    it('issues a PATCH to the thread with the new title', async () => {
+        const {service, mockHttp} = createService();
+        await service.renameThread('thread-1', 'New name');
+        expect(mockHttp.patch).toHaveBeenCalledWith(
+            expect.stringContaining('/persistent/threads/thread-1'),
+            {title: 'New name'},
+        );
+    });
+
+    it('updates sessionTitle when renaming the active thread', async () => {
+        const {service} = createService();
+        service.threadId.set('thread-1');
+        await service.renameThread('thread-1', 'New name');
+        expect(service.sessionTitle()).toBe('New name');
+    });
+
+    it('leaves sessionTitle untouched when renaming a different thread', async () => {
+        const {service} = createService();
+        service.threadId.set('thread-active');
+        service.sessionTitle.set('Active title');
+        await service.renameThread('thread-other', 'Other name');
+        expect(service.sessionTitle()).toBe('Active title');
     });
 });

@@ -2888,6 +2888,20 @@ class PostgresDB:
                 status,
             )
 
+    async def update_thread_title(self, thread_id: str, title: str) -> None:
+        """Set a thread's display title (user rename).
+
+        Deliberately does NOT touch last_activity: a rename is metadata, not
+        conversational activity, and bumping it would re-sort the
+        recency-ordered session list.
+        """
+        async with self.acquire() as conn:
+            await conn.execute(
+                "UPDATE threads SET title = $2 WHERE id = $1",
+                thread_id,
+                title,
+            )
+
     async def update_thread_main_cloud(
         self,
         thread_id: str,
