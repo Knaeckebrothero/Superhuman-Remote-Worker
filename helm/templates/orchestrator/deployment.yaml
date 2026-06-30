@@ -251,6 +251,16 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: WORKSPACE_PVC_SIZE
+            - name: WORKSPACE_REATTACH_READY_TIMEOUT
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: WORKSPACE_REATTACH_READY_TIMEOUT
+            - name: WORKSPACE_REATTACH_FRESH_FALLBACK
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: WORKSPACE_REATTACH_FRESH_FALLBACK
             # Gitea
             - name: GITEA_URL
               valueFrom:
