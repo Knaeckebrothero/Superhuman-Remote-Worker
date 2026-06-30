@@ -961,6 +961,18 @@ workspace:
   pvcEnabled: false
   # -- Size of each per-job workspace PVC (only used when pvcEnabled).
   pvcSize: "10Gi"
+  # -- Single-replica node-loss fallback (Phase 3b). Extended ready-wait (s) for a
+  # PVC REATTACH: a transient node reboot (the replica's node returning) recovers
+  # within this window without discarding data; past it, a still-wedged reattach
+  # whose holdup is a volume-attach failure means the lone replica's node is gone
+  # → the PVC is discarded and the job recovers onto a fresh volume (agent clones
+  # from Gitea + resumes the checkpoint; unpushed files are lost). Only relevant
+  # for networked single-replica storage (longhorn-ephemeral); harmless elsewhere.
+  reattachReadyTimeout: 180
+  # -- Kill-switch for the discard-and-recover fallback above (the only data-
+  # destructive recovery path). false → a wedged reattach stays in recovery until
+  # the node returns or the recovery cap fails it loud, never discarding.
+  freshFallback: true
   # -- Capacity guard for PVC-backed job workspaces (Phase 3a). Renders a
   # namespaced ResourceQuota keyed on `ephemeralStorageClass` that caps BOTH the
   # total storage and the count of concurrent workspace PVCs of that class. At
