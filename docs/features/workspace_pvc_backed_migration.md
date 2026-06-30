@@ -2,12 +2,14 @@
 
 ## Status
 
-> **UPDATE 2026-06-29 — Branch (a) chosen and partially shipped.** The fork below
-> is resolved in favor of **(a) pod PVCs**, scoped to job workspaces for v1.
-> Phase 0 (the flip) + Phase 1 (GC discipline) are **built, unit-tested, and
-> k3d-E2E-verified** (uncommitted on `develop`); Phase 2 (crash-recovery reattach,
-> needs the recovery wedge-fix first) and Phase 3 (Longhorn dead-node detach +
-> ResourceQuota) remain. Full implementation record, E2E results, and gotchas:
+> **UPDATE 2026-06-30 — Branch (a) chosen and substantially shipped.** The fork
+> below is resolved in favor of **(a) pod PVCs**, scoped to job workspaces for v1.
+> **Phases 0 (the flip), 1 (GC discipline), 2 (crash-recovery auto-resume), and
+> 3a (capacity-guard ResourceQuota) are built, unit-tested, k3d-E2E-verified, and
+> committed on `develop`** (latest `45eee2b1`). Only **Phase 3b** (Longhorn
+> multi-node dead-node detach + S3 fallback — does not reproduce on single-node
+> k3d) and the **prod flip** remain. Full implementation record, E2E results, the
+> storage-substrate matrix, and gotchas:
 > [`workspace_pvc_branch_a_implementation.md`](workspace_pvc_branch_a_implementation.md).
 > Branch (b) (durable VMs) and (c) (snapshot-hardening) remain unbuilt options for
 > the VM substrate. The rest of this brief is preserved as the original analysis.

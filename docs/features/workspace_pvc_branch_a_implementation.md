@@ -1,12 +1,18 @@
 # Branch (a) — PVC-backed workspace pods: implementation record
 
-## Status (2026-06-29)
+## Status (2026-06-30)
 
-**Phase 0 + Phase 1 are BUILT, unit-tested, and k3d-E2E-verified. Uncommitted on
-`develop`.** This delivers the *durability + self-cleanup* half: a job workspace
-gets a PVC named by its UUID, files survive a pod crash (reattach by name), and
-the PVC is reclaimed when the job goes terminal — with a backstop sweep so it
-cannot leak. Verified end-to-end against the live orchestrator on k3d.
+**Phases 0, 1, 2, and 3a are BUILT, unit-tested, k3d-E2E-verified, and committed
+on `develop`** (latest `45eee2b1`). The PVC feature is functionally complete for
+single-node/local-path and prod/Longhorn alike: a job workspace gets a PVC named
+by its UUID, files survive a pod crash (reattach by name), a crashed job
+**auto-resumes** on the reattached volume from its Postgres checkpoint (reached
+at a stable headless-Service DNS address), the PVC is reclaimed when the job goes
+terminal (with a backstop sweep so it cannot leak), and a per-class
+`ResourceQuota` caps fleet storage with a fail-closed clear-error. **Only Phase
+3b** (Longhorn multi-node dead-node detach) **and the prod flip remain** — 3b
+does not reproduce on single-node k3d and is validated on the homelab. Flag is
+default-off in-chart (zero behavior change on merge); ON in k3d dev.
 
 | Phase | Scope | State |
 |---|---|---|
@@ -88,7 +94,12 @@ resumes the checkpoint — coherent by construction, no snapshot/restore dance.
 - Fixed 2 pre-existing exact-stats-dict assertions for the new `orphans_reaped`
   key (`test_lifecycle_skeleton.py`, `test_lifecycle_agent_manager.py`).
 
-### Files touched (uncommitted on `develop`)
+### Files touched — Phase 0 + 1 (committed on `develop`)
+
+> Phase 2 (Option 1) files: `container_provisioner.py` (headless Service) +
+> `main.py` (dispatch/resume host injection), commit `7fb9e9e2`. Phase 3a files:
+> `workspace-resourcequota.yaml` + `values.yaml` + `container_provisioner.py`
+> 403 branch, commit `45eee2b1`. See §Phase 2 / §Phase 3a.
 
 ```
 orchestrator/services/container_provisioner.py        flags + create_workspace flip + docstring
@@ -163,7 +174,7 @@ on the leader replica, not mocks.
 
 ---
 
-## Phase 2 — crash-recovery reattach (IMPLEMENTED + E2E'd 2026-06-29 — PARTIAL)
+## Phase 2 — crash-recovery reattach (COMPLETE + full-E2E-verified 2026-06-29)
 
 **Goal:** a job whose workspace pod dies mid-run re-dispatches, recreates the
 pod, **reattaches its PVC**, and resumes from the Postgres checkpoint with its
@@ -180,10 +191,13 @@ files intact — no data loss, no manual intervention.
 
 ### Implementation + E2E result (2026-06-29)
 
-**G1 + G2 are implemented, deployed to k3d, and E2E-tested.** Net result: **the
-wedge is eliminated and workspace data is preserved, but auto-resume does NOT
-yet complete** — a deeper ephemeral-IP reconnect race (filed separately) makes
-recovery fail-loud after the cap instead of resuming.
+**G1 + G2 + Option 1 are implemented, deployed to k3d, and E2E-tested — Phase 2
+is COMPLETE.** G1+G2 eliminated the recovery wedge and preserved workspace data;
+the remaining ephemeral-IP reconnect race was then fixed by **Option 1 (a stable
+headless Service)**, and a full real-job E2E now **auto-resumes** end-to-end. The
+record below is kept as the implementation history: the first E2E (job
+`d65d93d3`) reached PARTIAL (data preserved, but fail-loud) and surfaced the
+reconnect race; Option 1 closed it, proven by a second E2E (job `b4025433`).
 
 | Aspect | Result |
 |---|---|
@@ -191,7 +205,7 @@ recovery fail-loud after the cap instead of resuming.
 | G1 bounded cap → fail-loud (no forever-wedge) | ✅ verified (terminal `failed` at cap, clean `freeze_data`) |
 | PVC survives pod kill + reattaches by name | ✅ verified (same PV across every recreate) |
 | Working tree preserved (untracked sentinel survives) | ✅ verified (sentinel intact across recreates) |
-| **Agent reconnects → G2 preserve branch runs → job resumes** | ❌ **blocked** — see "the blocker" below |
+| **Agent reconnects → G2 preserve branch runs → job resumes** | ✅ via **Option 1** stable headless Service (E2E `b4025433` resumed from checkpoint; the first E2E `d65d93d3` hit the now-fixed ephemeral-IP race) |
 
 **Bug found + fixed by the E2E (would have shipped blind):** G1 first relied on
 `delete_workspace` to set `workspace_container.status="deleted"`, but its
@@ -202,16 +216,21 @@ pod IP in an infinite loop (`recovery_attempts` 1/3 → 2/3 → 3/3 on the same 
 IP). **Fixed:** the handler now explicitly merges
 `{"status":"deleted","pod_ip":None}` so the dispatcher recreates + reattaches.
 
-**The blocker (new issue):** the recreate gives the pod a **new ephemeral IP**
-each cycle (`.79 → .88 → .93 → .95` observed); the resuming agent dials a
-**stale IP** from a prior cycle → can't connect → reports `workspace_unavailable`
-→ another recovery → another new IP → churns to the cap → **fail-loud**. G2's
-preserve branch never gets exercised (no agent ever SSH-connects to the
-reattached pod). Filed:
+**The blocker (FIXED via Option 1):** the recreate gave the pod a **new ephemeral
+IP** each cycle (`.79 → .88 → .93 → .95` observed); the resuming agent dialed a
+**stale IP** from a prior cycle → couldn't connect → reported
+`workspace_unavailable` → another recovery → another new IP → churned to the cap
+→ **fail-loud**. G2's preserve branch never got exercised (no agent ever
+SSH-connected to the reattached pod). Filed + **resolved**:
 [`workspace_reattach_ephemeral_ip_reconnect_churn.md`](../issues/workspace_reattach_ephemeral_ip_reconnect_churn.md).
-**Net today:** "wedge forever" → "fail cleanly in ~5 min with the PVC data
-intact" (a strict improvement), but not seamless resume. The proper fix is a
-**stable workspace address** (headless Service / DNS so recreate → same address).
+**Fix (committed `7fb9e9e2`):** each PVC-backed workspace now gets a **stable
+headless Service** (`workspace-<id>.<ns>.svc:30022`) the agent dials instead of
+the ephemeral pod IP; the dispatch **and** resume paths inject this DNS `host`
+(resume previously injected no container host at all — the real root cause).
+Recreate → same address → the agent reconnects, G2's preserve branch runs, the
+job resumes. **Verified:** full real-job E2E (job `b4025433`) auto-resumed from
+the Postgres checkpoint with the un-pushed sentinel intact, job back to
+`processing`, recovery cap untouched.
 
 **E2E record:** k3d, fresh scholar job `d65d93d3`, `WORKSPACE_PVC_ENABLED=true`,
 `CHECKPOINTER_BACKEND=postgres`, agent image with G2 (`tilt-fb1597…`). Planted an
@@ -274,18 +293,21 @@ re-cloning it. Touches `agent.py:1835-1920` (and mirror the same gate in
 non-goal). **Risk:** changes resume behavior for *all* jobs, so it must land + be
 tested with G1 in place via the real recovery E2E — not blind.
 
-### Verification — RAN 2026-06-29 (PARTIAL pass)
+### Verification — full pass (2026-06-29, after Option 1)
 
-- E2E (test-plan step 7) was executed on k3d (see "Implementation + E2E result"
-  above). **Passed:** pod-arm routing (not VM), recreate, PVC reattach (same PV),
-  un-pushed working tree preserved (sentinel survived), bounded fail-loud.
-  **Did not pass:** the agent never reconnects to the recreated pod (stale
-  ephemeral IP), so it never reaches G2's preserve branch and the job fail-louds
-  instead of resuming → `workspace_reattach_ephemeral_ip_reconnect_churn.md`.
+- E2E (test-plan step 7) executed on k3d in two rounds. **Round 1** (job
+  `d65d93d3`, pre-Option-1): pod-arm routing (not VM), recreate, PVC reattach
+  (same PV), un-pushed working tree preserved (sentinel survived), bounded
+  fail-loud all ✅; checkpoint **resume blocked** by the stale-ephemeral-IP race.
+  **Round 2** (job `b4025433`, post-Option-1): the same mid-run pod kill now
+  **auto-resumes** — the new pod reattaches the PVC + the same stable DNS, the
+  agent reconnects, G2's preserve branch runs (no `rm -rf`), and the job resumes
+  from the Postgres checkpoint with the sentinel intact, back to `processing`,
+  recovery cap untouched. ✅
 - Coherence: disk + Postgres checkpoint are both "as of the crash"; the disk may
   lag the checkpoint by ≤1 unfsynced super-step. With G2 (preserve, don't clobber)
   this is the same tolerance the agent already has mid-run — **no new coherence
-  guard for v1**. (Not yet exercised live — gated behind the reconnect fix.)
+  guard for v1**.
 
 ### Ownership note
 
@@ -413,8 +435,8 @@ hard-enforce the 10Gi). Everything else already works.
 ## Rollout status
 
 - ✅ Flag default-off in-chart (zero behavior change on merge).
-- ✅ **ON in k3d dev** (`values-local.yaml`), E2E gate steps 1-6 passed.
-- ⏳ Commit + push Phase 0/1 to `develop`.
+- ✅ **ON in k3d dev** (`values-local.yaml`), E2E gate steps 1-7 passed.
+- ✅ Phase 0/1/2/3a committed to `develop` (latest `45eee2b1`).
 - ⏳ Dev soak — watch orphan-PVC WARN count + storage capacity.
 - ⏳ Prod flip — only after dev soak shows zero orphan growth across a full
   create→reap→GC cycle. **Mixed fleet is safe and is the rollout mechanism** (the
@@ -430,15 +452,23 @@ hard-enforce the 10Gi). Everything else already works.
 delete() terminal-vs-idle-vs-emptyDir, give_up gating, reap_orphans selection +
 DB-error safety, reconciler hook.
 
-**k3d E2E — steps 1-6 ✅ done** (see results above). Step 7 (Phase 2) **RAN
-2026-06-29 — PARTIAL**:
-7. **Recovery (Phase 2):** reproduced the `19707fa1` shape (job `d65d93d3`) — kill
-   the workspace pod mid-run → ✅ re-dispatch through the pod arm (not VM), ✅ PVC
-   reattach (same PV), ✅ working tree preserved (sentinel survived), ✅ bounded
-   fail-loud; ❌ checkpoint resume — the agent can't reconnect (stale ephemeral IP)
-   so it fail-louds instead of resuming →
-   `workspace_reattach_ephemeral_ip_reconnect_churn.md`. Re-run after that fix to
-   close step 7.
+**k3d E2E — steps 1-7 ✅ done** (see results above). Step 7 (Phase 2) **CLOSED
+2026-06-29 after Option 1**:
+7. **Recovery (Phase 2):** reproduced the `19707fa1` shape — kill the workspace
+   pod mid-run → ✅ re-dispatch through the pod arm (not VM), ✅ PVC reattach (same
+   PV), ✅ working tree preserved (sentinel survived), ✅ bounded fail-loud. Round 1
+   (`d65d93d3`) exposed the stale-ephemeral-IP race; **Round 2 (`b4025433`, post-
+   Option-1) ✅ auto-resumed** from the checkpoint (agent reconnects via the stable
+   DNS → G2 preserve → `processing`). Step 7 closed.
+
+**k3d E2E — Phase 3a (capacity guard) ✅ done 2026-06-30** (non-disruptive,
+throwaway dedicated storage class): the rendered `ResourceQuota` enforces on
+**both** count (`maxCount=1` → 2nd PVC `403`) and storage (`maxStorage=1Gi` → 2nd
+1Gi PVC `403`); a WaitForFirstConsumer `Pending` PVC consumes quota at admission
+(`used=1` while Pending — matches the create-PVC-then-pod order); the rejection
+is the `403` `_create_pvc` catches → fail-closed + capacity log. Unit:
+`test_pvc_quota_403_fails_closed_with_capacity_log`. 81 provisioner + 88
+lifecycle tests pass; ruff + `helm lint` clean.
 
 ---
 
@@ -491,5 +521,5 @@ one wiring; Phase 1 closed the GC gap on the reconciler reap path.
   — same Tier-2 decision; with PVC reattach the never-restored job snapshot
   becomes DR-only (kept, not removed).
 - [`workspace_pvc_backed_migration.md`](workspace_pvc_backed_migration.md) — the
-  open-fork brief; Branch (a) is the decided direction, Phase 0/1 shipped per this
-  doc.
+  open-fork brief; Branch (a) is the decided direction, Phases 0/1/2/3a shipped
+  per this doc.
