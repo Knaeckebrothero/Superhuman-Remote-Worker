@@ -1,5 +1,11 @@
 import {describe, it, expect} from 'vitest';
-import {computeModelMismatch, detectModelFamily} from './agent-settings.types';
+import {
+  computeModelMismatch,
+  defaultModelOptionLabel,
+  detectModelFamily,
+  resolveEffectiveModels,
+} from './agent-settings.types';
+import type {EffectiveModels} from '../../core/models/api.model';
 
 describe('detectModelFamily — GLM', () => {
   it('maps GLM-5.2 IDs to the glm family across transports', () => {
@@ -73,5 +79,50 @@ describe('computeModelMismatch', () => {
     expect(computeModelMismatch(M, null, 'gpt-5.5')).toBeNull();
     expect(computeModelMismatch(M, 'gpt-5.5', null)).toBeNull();
     expect(computeModelMismatch({}, 'gpt-5.5', 'gemma')).toBeNull();
+  });
+});
+
+describe('resolveEffectiveModels', () => {
+  const expert: EffectiveModels = {
+    strategic: {model: 'gpt-5.5', source: 'expert'},
+    tactical: {model: 'gpt-5.5', source: 'expert'},
+    session: {model: 'gpt-5.5', source: 'expert'},
+  };
+  const framework: EffectiveModels = {
+    strategic: {model: 'gemma-4-31b', source: 'system_default'},
+    tactical: {model: 'gemma-4-31b', source: 'system_default'},
+    session: {model: 'gemma-4-31b', source: 'system_default'},
+  };
+
+  it('prefers the selected expert resolution when present', () => {
+    expect(resolveEffectiveModels(expert, framework)).toBe(expert);
+  });
+
+  it('falls back to the framework default resolution when no expert is selected', () => {
+    // Regression: the no-expert create path. Without the fallback the picker's
+    // "Default" option drops to the config-literal llm.model (the hardcoded YAML
+    // placeholder, RedHatAI/gemma-4-31B-it-FP8-Dynamic) instead of the resolved
+    // system chat pin. null (no expert) and undefined (older API) both fall back.
+    expect(resolveEffectiveModels(null, framework)).toBe(framework);
+    expect(resolveEffectiveModels(undefined, framework)).toBe(framework);
+  });
+
+  it('returns null when neither expert nor framework resolution is available', () => {
+    expect(resolveEffectiveModels(null, null)).toBeNull();
+  });
+});
+
+describe('defaultModelOptionLabel', () => {
+  it('appends the resolved model to the inherit-marker prefix', () => {
+    expect(defaultModelOptionLabel('Base default', 'gemma-4-31b')).toBe('Base default · gemma-4-31b');
+    expect(defaultModelOptionLabel('Project default', 'gpt-5.5')).toBe('Project default · gpt-5.5');
+  });
+
+  it('shows the bare prefix when no model is resolved yet (null/undefined/empty)', () => {
+    // The picker hasn't loaded the framework default yet, or there is no catalog
+    // row — fall back to the plain marker instead of a dangling separator.
+    expect(defaultModelOptionLabel('Base default', null)).toBe('Base default');
+    expect(defaultModelOptionLabel('Base default', undefined)).toBe('Base default');
+    expect(defaultModelOptionLabel('Project default', '')).toBe('Project default');
   });
 });

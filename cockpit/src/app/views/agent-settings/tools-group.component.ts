@@ -10,6 +10,14 @@ import {
     ToolCategoryMeta,
 } from './agent-settings.types';
 
+/** True when every selectable category key is enabled (none in the disabled set). */
+export function allToolCategoriesSelected(
+  selectableKeys: string[],
+  disabledCategories: Set<string>,
+): boolean {
+  return selectableKeys.length > 0 && selectableKeys.every(k => !disabledCategories.has(k));
+}
+
 /**
  * Tool category toggles.
  * Session mode shows additional categories (knowledge, git).
@@ -21,7 +29,15 @@ import {
   imports: [FormsModule, TranslocoPipe, AppIconComponent],
   template: `
     <div class="settings-group">
-      <div class="group-label">{{ 'agentSettings.tools.group' | transloco }}</div>
+      <div class="group-header">
+        <span class="group-label">{{ 'agentSettings.tools.group' | transloco }}</span>
+        <button
+          type="button"
+          class="select-all-btn"
+          (click)="toggleAll()"
+          [disabled]="disabled() || selectableCategories().length === 0"
+        >{{ (allSelected() ? 'agentSettings.common.deselectAll' : 'agentSettings.common.selectAll') | transloco }}</button>
+      </div>
       <div class="tool-toggles">
         @for (cat of categories(); track cat.key) {
           <label
@@ -85,15 +101,41 @@ import {
     .settings-group {
       margin-bottom: 20px;
     }
+    .group-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      margin-bottom: 12px;
+      padding-bottom: 6px;
+      border-bottom: 1px solid var(--border-color, var(--surface-0));
+    }
     .group-label {
       font-size: 11px;
       font-weight: 600;
       text-transform: uppercase;
       letter-spacing: 0.5px;
       color: var(--text-muted, #6c7086);
-      margin-bottom: 12px;
-      padding-bottom: 6px;
-      border-bottom: 1px solid var(--border-color, var(--surface-0));
+    }
+    .select-all-btn {
+      flex-shrink: 0;
+      background: none;
+      border: none;
+      padding: 0;
+      cursor: pointer;
+      font-family: inherit;
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: var(--accent-color, var(--accent-color));
+    }
+    .select-all-btn:hover:not(:disabled) {
+      text-decoration: underline;
+    }
+    .select-all-btn:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
     }
     .tool-toggles {
       display: flex;
@@ -239,6 +281,19 @@ export class ToolsGroupComponent {
     this.mode() === 'session' ? SESSION_TOOL_CATEGORIES : JOB_TOOL_CATEGORIES
   );
 
+  /** Categories the user can actually toggle (not grant-blocked). */
+  readonly selectableCategories = computed<ToolCategoryMeta[]>(() =>
+    this.categories().filter(cat => !this.isCategoryBlocked(cat.key))
+  );
+
+  /** True when every selectable category is currently enabled. */
+  readonly allSelected = computed(() =>
+    allToolCategoriesSelected(
+      this.selectableCategories().map(cat => cat.key),
+      this.disabledCategories(),
+    )
+  );
+
   readonly modifiedCount = computed(() => {
     let count = 0;
     for (const cat of this.categories()) {
@@ -273,6 +328,22 @@ export class ToolsGroupComponent {
         next.delete(key);
       } else {
         next.add(key);
+      }
+      return next;
+    });
+    this.change.emit();
+  }
+
+  /** Enable every selectable category, or disable them all if already all on.
+   *  Grant-blocked categories are left untouched (they can't be toggled). */
+  toggleAll(): void {
+    const keys = this.selectableCategories().map(cat => cat.key);
+    const selectAll = !allToolCategoriesSelected(keys, this.disabledCategories());
+    this.disabledCategories.update(current => {
+      const next = new Set(current);
+      for (const key of keys) {
+        if (selectAll) next.delete(key);
+        else next.add(key);
       }
       return next;
     });

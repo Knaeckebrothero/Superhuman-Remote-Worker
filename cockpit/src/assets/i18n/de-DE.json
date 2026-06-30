@@ -1835,7 +1835,9 @@
   "agentSettings": {
     "common": {
       "resetToDefault": "Auf Standard zurücksetzen",
-      "noApiKey": "kein API-Schlüssel"
+      "noApiKey": "kein API-Schlüssel",
+      "selectAll": "Alle auswählen",
+      "deselectAll": "Alle abwählen"
     },
     "datasources": {
       "group": "Datenquellen",
@@ -1939,7 +1941,7 @@
       "tactical": "Taktisch",
       "single": "Modell",
       "default": "Standard",
-      "defaultResolved": "Standard · {{model}} ({{source}})",
+      "defaultResolved": "{{model}} ({{source}})",
       "defaultResolvedNoSource": "Standard · {{model}}",
       "source": {
         "expert": "vom Experten",

@@ -1,6 +1,7 @@
 import {describe, expect, it} from 'vitest';
 import {
   activeDatasourceIds,
+  allDatasourcesSelected,
   datasourceSetKey,
   isRepositoryDatasource,
   selectedDatasourceIds,
@@ -79,5 +80,36 @@ describe('datasources-group selection logic', () => {
     expect(isRepositoryDatasource('repository')).toBe(true);
     expect(isRepositoryDatasource('Repository')).toBe(true);
     expect(isRepositoryDatasource('postgresql')).toBe(false);
+  });
+});
+
+describe('datasources-group select-all state', () => {
+  it('is true by default (untouched ⇒ all eligible selected)', () => {
+    const ds = [makeDs('a', 'postgresql'), makeDs('b', 'webdav')];
+    expect(allDatasourcesSelected(ds, null, false)).toBe(true);
+  });
+
+  it('is false when one is opted out', () => {
+    const ds = [makeDs('a', 'postgresql'), makeDs('b', 'webdav')];
+    const selection = {key: datasourceSetKey(ds), ids: new Set(['a'])};
+    expect(allDatasourcesSelected(ds, selection, false)).toBe(false);
+  });
+
+  it('is false when nothing is selected', () => {
+    const ds = [makeDs('a', 'postgresql'), makeDs('b', 'webdav')];
+    const selection = {key: datasourceSetKey(ds), ids: new Set<string>()};
+    expect(allDatasourcesSelected(ds, selection, false)).toBe(false);
+  });
+
+  it('ignores lite-excluded repository sources (all toggleable selected ⇒ true)', () => {
+    const ds = [makeDs('repo', 'repository'), makeDs('pg', 'postgresql')];
+    // repo is excluded under a lite backend, so "all selected" only considers pg.
+    const selection = {key: datasourceSetKey(ds), ids: new Set(['pg'])};
+    expect(allDatasourcesSelected(ds, selection, true)).toBe(true);
+  });
+
+  it('is false when there are no selectable datasources', () => {
+    const ds = [makeDs('repo', 'repository')];
+    expect(allDatasourcesSelected(ds, null, true)).toBe(false);
   });
 });

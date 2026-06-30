@@ -4,10 +4,10 @@ import {ApiService} from '../../core/services/api.service';
 import {FileHandlingService} from '../../core/services/file-handling.service';
 import {JobArtifactService} from '../../core/services/job-artifact.service';
 import {UserService} from '../../core/services/user.service';
-import {Datasource, Expert, ExpertDetail, JobCreateRequest, Project} from '../../core/models/api.model';
+import {Datasource, EffectiveModels, Expert, ExpertDetail, JobCreateRequest, Project} from '../../core/models/api.model';
 import {FilePreview, UploadStatus} from '../../core/models/file.model';
 import {AgentSettingsComponent} from '../agent-settings/agent-settings.component';
-import {PRIORITY_LEVELS} from '../agent-settings/agent-settings.types';
+import {PRIORITY_LEVELS, resolveEffectiveModels} from '../agent-settings/agent-settings.types';
 import {ModelService} from '../../core/services/model.service';
 import {TranslocoPipe} from '@jsverse/transloco';
 import {AppButtonComponent} from '../../ui/button';
@@ -276,7 +276,7 @@ import {AppTooltipDirective} from '../../ui/tooltip';
             [showProjectMemory]="projectHasSharedMemory()"
             [defaultsTools]="expertDetail()?.defaults_tools ?? {}"
             [settingsMatrix]="expertDetail()?.settings_matrix ?? frameworkSettingsMatrix()"
-            [effectiveModels]="expertDetail()?.effective_models ?? null"
+            [effectiveModels]="resolvedEffectiveModels()"
             [datasources]="availableDatasources()"
             [loadingDatasources]="isLoadingDatasources()"
             [loadingExpert]="isLoadingExpertDetail()"
@@ -1189,6 +1189,13 @@ export class JobCreateComponent implements OnInit {
 
   readonly frameworkDefaults = signal<Record<string, unknown> | null>(null);
   readonly frameworkSettingsMatrix = signal<Record<string, Record<string, unknown>>>({});
+  // Server-resolved effective models for the framework "defaults" expert — the
+  // floor used when no expert is selected, so the model picker's "Default"
+  // option shows the resolved chat pin instead of the config-literal placeholder.
+  readonly frameworkEffectiveModels = signal<EffectiveModels | null>(null);
+  readonly resolvedEffectiveModels = computed(() =>
+    resolveEffectiveModels(this.expertDetail()?.effective_models, this.frameworkEffectiveModels()),
+  );
   readonly projectHasSharedMemory = computed(() => {
     const pid = this.selectedProjectId();
     if (!pid) return false;
@@ -1213,6 +1220,7 @@ export class JobCreateComponent implements OnInit {
     this.api.getExpertDetail('defaults').subscribe((d) => {
       if (d?.config) this.frameworkDefaults.set(d.config);
       if (d?.settings_matrix) this.frameworkSettingsMatrix.set(d.settings_matrix);
+      if (d?.effective_models) this.frameworkEffectiveModels.set(d.effective_models);
     });
   }
 

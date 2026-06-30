@@ -185,7 +185,7 @@ export function buildRoleSequence(
               hint="Optional — overrides every role's model. Leave blank to use each expert's own model."
             >
               <app-select [value]="fModel()" (changed)="fModel.set($event ?? '')">
-                <option value="">Project default</option>
+                <option value="">Don't overwrite expert defaults</option>
                 @for (m of modelOptions(); track m) {
                   <option [value]="m">{{ m }}</option>
                 }

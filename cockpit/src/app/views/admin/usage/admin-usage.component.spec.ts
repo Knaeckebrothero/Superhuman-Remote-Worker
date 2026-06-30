@@ -74,4 +74,80 @@ describe('AdminUsageComponent refresh shell', () => {
     expect(bars[1].height).toBe(100);
     expect(bars[0].height).toBe(50);
   });
+
+  it('chart() builds stacked columns, legend and grand total for the active dim+metric', () => {
+    const c = TestBed.inject(AdminUsageComponent);
+    (c as any).usage.timeseries = (dim: string) => dim === 'model' ? ({
+      available: true, group_by: 'model', days: ['2026-06-01', '2026-06-02'],
+      series: [
+        {key: 'opus', label: 'Opus', events: 3, points: [
+          {day: '2026-06-01', tokens: 100, cost_usd: 0, events: 2},
+          {day: '2026-06-02', tokens: 60, cost_usd: 0, events: 1}]},
+        {key: 'gemma', label: 'gemma', events: 1, points: [
+          {day: '2026-06-01', tokens: 40, cost_usd: 0, events: 1}]},
+      ],
+    }) : null;
+    const chart = c.chart()!;
+    expect(chart).not.toBeNull();
+    expect(chart.grandTotal).toBe(200); // tokens: 100+60+40
+    expect(chart.grandLabel).toBe('200');
+    expect(chart.legend.map((l) => l.key)).toEqual(['opus', 'gemma']); // by total desc
+    expect(chart.bars.length).toBe(3); // day1: opus+gemma, day2: opus
+  });
+
+  it('chart() retotals when the metric toggles to events', () => {
+    const c = TestBed.inject(AdminUsageComponent);
+    (c as any).usage.timeseries = () => ({
+      available: true, group_by: 'model', days: ['2026-06-01'],
+      series: [{key: 'opus', label: 'Opus', events: 2, points: [
+        {day: '2026-06-01', tokens: 100, cost_usd: 0, events: 2}]}],
+    });
+    c.tsMetric.set('events');
+    expect(c.chart()!.grandTotal).toBe(2);
+  });
+
+  it('donut() emits one segment per legend entry, offsets accumulating', () => {
+    const c = TestBed.inject(AdminUsageComponent);
+    (c as any).usage.timeseries = () => ({
+      available: true, group_by: 'model', days: ['2026-06-01'],
+      series: [
+        {key: 'a', label: 'A', events: 1, points: [{day: '2026-06-01', tokens: 75, cost_usd: 0, events: 1}]},
+        {key: 'b', label: 'B', events: 1, points: [{day: '2026-06-01', tokens: 25, cost_usd: 0, events: 1}]},
+      ],
+    });
+    const segs = c.donut();
+    expect(segs.length).toBe(2);
+    expect(segs[0].offset).toBe(0);
+    expect(segs[1].offset).toBeLessThan(0); // advanced by A's 75% arc
+  });
+
+  it('chart() is null when the window has no series', () => {
+    const c = TestBed.inject(AdminUsageComponent);
+    (c as any).usage.timeseries = () => ({available: true, group_by: 'model', days: [], series: []});
+    expect(c.chart()).toBeNull();
+  });
+
+  it('scopeOverride reflects admin + the All-data switch', () => {
+    const c = TestBed.inject(AdminUsageComponent);
+    (c as any).users.currentUser.set({id: 'a1', is_admin: true});
+    c.viewAllData.set(true);
+    expect(c.scopeOverride()).toBe('all');
+    c.viewAllData.set(false);
+    expect(c.scopeOverride()).toBe('mine');
+  });
+
+  it('scopeOverride is null for non-admins (already self-scoped)', () => {
+    const c = TestBed.inject(AdminUsageComponent);
+    (c as any).users.currentUser.set({id: 'u1', is_admin: false});
+    c.viewAllData.set(false);
+    expect(c.scopeOverride()).toBeNull();
+  });
+
+  it('setViewAllData flips the signal and persists per-user to localStorage', () => {
+    const c = TestBed.inject(AdminUsageComponent);
+    (c as any).users.currentUser.set({id: 'a1', is_admin: true});
+    c.setViewAllData({target: {checked: false}} as unknown as Event);
+    expect(c.viewAllData()).toBe(false);
+    expect(localStorage.getItem('srw.usageViewAll.a1')).toBe('false');
+  });
 });

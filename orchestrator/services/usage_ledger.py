@@ -362,5 +362,65 @@ class UsageLedger:
             for r in rows
         ]
 
+    async def query_timeseries(
+        self,
+        *,
+        from_ts: datetime,
+        to_ts: datetime,
+        group_by: str,
+        owner_user_id: Optional[str] = None,
+        visible_project_ids: Optional[Sequence[str]] = None,
+        scope_project_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Daily-bucketed usage grouped by (UTC day, dimension).
+
+        Like ``query_grouped`` but adds a ``date_trunc('day', ts)`` bucket so the
+        caller can draw a stacked usage-over-time chart. Each row carries the three
+        dimension-agnostic metrics — ``tokens`` (prompt+completion summed), the
+        priced ``cost_usd``, and ``events`` — for one (day, key). The day is
+        truncated in UTC (``ts AT TIME ZONE 'UTC'``) so buckets don't drift with the
+        DB session timezone. NULL group keys are excluded and visibility (G5) is
+        identical to ``query_grouped`` — a non-admin is scoped strictly to self.
+        """
+        if group_by not in _GROUP_COLS:
+            raise ValueError(f"unsupported group_by: {group_by!r}")
+        col = _GROUP_COLS[group_by]
+        if self._pool is None:
+            return []
+        clauses = ["ts >= $1", "ts < $2", f"{col} IS NOT NULL"]
+        params: List[Any] = [from_ts, to_ts]
+        if owner_user_id is not None:
+            params.append(_uuid(owner_user_id))
+            clauses.append(f"user_id = ${len(params)}")  # strict self-scope
+        elif scope_project_id is not None:
+            params.append(_uuid(scope_project_id))
+            clauses.append(f"project_id = ${len(params)}")
+        sql = (
+            "SELECT date_trunc('day', ts AT TIME ZONE 'UTC') AS day, "
+            f"{col} AS key, "
+            "COALESCE(SUM(quantity) FILTER "
+            "(WHERE unit IN ('prompt-token', 'completion-token')), 0) AS tokens, "
+            "COALESCE(SUM(cost_usd), 0) AS cost_usd, COUNT(*) AS events "
+            f"FROM usage_events WHERE {' AND '.join(clauses)} "
+            f"GROUP BY date_trunc('day', ts AT TIME ZONE 'UTC'), {col} "
+            "ORDER BY date_trunc('day', ts AT TIME ZONE 'UTC')"
+        )
+        try:
+            async with self._pool.acquire() as conn:
+                rows = await conn.fetch(sql, *params)
+        except Exception:
+            logger.warning("usage timeseries query failed (non-fatal)", exc_info=True)
+            return []
+        return [
+            {
+                "day": r["day"].date().isoformat(),
+                "key": str(r["key"]),
+                "tokens": float(r["tokens"]) if r["tokens"] is not None else 0.0,
+                "cost_usd": float(r["cost_usd"]),
+                "events": r["events"],
+            }
+            for r in rows
+        ]
+
 
 __all__ = ["UsageEvent", "UsageRates", "UsageLedger"]
