@@ -251,18 +251,26 @@ def create_source_tools(context: ToolContext) -> List[Any]:
                     await context.snapshot_cloud_source_bytes(
                         resolved_path, cloud_anchor
                     )
+                # Pass the workspace-relative path (not the resolved one): the
+                # engine reads files locally, but on a remote workspace backend
+                # the file lives on the workspace pod, so registration must
+                # materialize it via local_copy (handled in
+                # get_or_register_doc_source). resolved_path stays for the local
+                # cloud-anchor lookup/snapshot above.
                 source_id = await context.get_or_register_doc_source(
-                    resolved_path,
+                    document_path,
                     name=Path(document_path).name,
                     cloud_metadata=cloud_anchor,
                 )
             except FileNotFoundError:
                 return f"Error: Document not found at {document_path}"
             except Exception as e:
+                # Registration failed for a real reason (extraction, embedding,
+                # remote fetch, …) — the engine IS available, so report the
+                # actual error instead of the misleading "not available" stub.
                 logger.warning(f"Could not register document source: {e}")
-                citation_id = f"CIT-{uuid.uuid4().hex[:8].upper()}"
-                return _format_stub_document_citation(
-                    citation_id, document_path, page, section, text
+                return (
+                    f"Error: could not register document source '{document_path}': {e}"
                 )
 
             # Build locator dict
@@ -370,11 +378,11 @@ Similarity Score: {similarity}
                     url, name=title
                 )
             except Exception as e:
+                # Registration failed for a real reason — the engine IS
+                # available, so report the actual error instead of the
+                # misleading "not available" stub.
                 logger.warning(f"Could not register web source: {e}")
-                citation_id = f"CIT-{uuid.uuid4().hex[:8].upper()}"
-                return _format_stub_web_citation(
-                    citation_id, url, title, accessed_date, text
-                )
+                return f"Error: could not register web source '{url}': {e}"
 
             # Persist web content to disk (idempotent — no-op if already saved by research tools)
             if text:
