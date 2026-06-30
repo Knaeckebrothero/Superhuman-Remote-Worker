@@ -83,3 +83,9 @@ non-root (conflicts with Tilt's `/app` sync).
 - [x] Diagnosed + verified empirically (2026-06-22)
 - [x] Misleading chart comment corrected (`deployment.yaml`, `vm-ssh-key` volume)
 - [ ] Dev fix (stage-copy to `0600`) — **deferred**; prod unaffected, low priority
+- Re-confirmed still live on k3d 2026-06-30 while verifying
+  `ide_settings_sweeper_probes_stale_workspace_endpoints.md`. The snapshot and
+  `ide_settings` sweeps share a *no-eviction* root cause — both keep dialing
+  ended/terminal workspaces that are never evicted — so this ERROR burst is
+  amplified by that leak. Evicting dead records (the ide_settings fix) shrinks
+  the burst even while this dev key-perms fix stays deferred.
