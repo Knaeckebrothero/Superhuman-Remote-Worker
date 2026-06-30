@@ -87,6 +87,20 @@ class ContainerProvisioner:
         # states. See docs/features/workspace_pvc_branch_a_implementation.md.
         self._pvc_enabled: bool = _env_flag("WORKSPACE_PVC_ENABLED", False)
         self._pvc_size: str = os.environ.get("WORKSPACE_PVC_SIZE", "10Gi")
+        # Single-replica node-loss fallback (Phase 3b). A REATTACH gets this
+        # longer ready-wait so a transient node reboot (the replica's node coming
+        # back) recovers without discarding data; past it, a still-wedged reattach
+        # whose holdup is a volume-attach failure means the lone replica's node is
+        # gone — discard the PVC and recover onto a fresh volume (the agent then
+        # clones from Gitea + resumes the checkpoint; unpushed files are lost).
+        # `_fresh_fallback_enabled` is the kill-switch (the discard is the only
+        # data-destructive recovery path, so keep it disablable).
+        self._reattach_ready_timeout: int = int(
+            os.environ.get("WORKSPACE_REATTACH_READY_TIMEOUT", "180")
+        )
+        self._fresh_fallback_enabled: bool = _env_flag(
+            "WORKSPACE_REATTACH_FRESH_FALLBACK", True
+        )
         # rclone-backed cloud workspaces are the default container path. They
         # need FUSE inside the workspace pod because the agent shell runs there.
         self._fuse_enabled: bool = _env_flag("WORKSPACE_FUSE_ENABLED", True)
@@ -188,6 +202,7 @@ class ContainerProvisioner:
         cpu_limit: str = "2000m",
         memory_limit: str = "4Gi",
         image: Optional[str] = None,
+        fresh: bool = False,
     ) -> bool:
         """Create a workspace container for a job or persistent thread.
 
@@ -198,6 +213,9 @@ class ContainerProvisioner:
             cpu_limit: CPU limit.
             memory_limit: Memory limit.
             image: Workspace image override (defaults to WORKSPACE_IMAGE env).
+            fresh: Single-replica node-loss recovery (Phase 3b) — force a clean
+                empty PVC by deleting any existing (wedged) one first, instead of
+                reattaching it. Set only by the internal fallback below.
 
         Returns:
             True if pod creation succeeded, False otherwise.
@@ -220,16 +238,23 @@ class ContainerProvisioner:
         # Created BEFORE the seed ConfigMap so a PVC failure leaves nothing to
         # clean up — it is the provisioning prerequisite.
         pvc_name: Optional[str] = None
+        pvc_reattach = False
         if self._pvc_enabled and owner.kind == "job":
             pvc_name = f"pvc-workspace-{owner.id[:12]}"
-            created = await self._create_pvc(
+            # Fresh recovery (Phase 3b single-replica fallback): the prior reattach
+            # was wedged because the PVC's only replica is on a dead node. Delete
+            # the stuck PVC (and wait for it to release) so the create below makes
+            # a brand-new empty volume under the same deterministic name.
+            if fresh:
+                await self._delete_pvc_and_wait(pvc_name)
+            pvc_status = await self._create_pvc(
                 pvc_name,
                 size=self._pvc_size,
                 # Owner label lets the backstop reaper resolve PVC → job and
                 # is a belt-and-suspenders identity check before any reattach.
                 labels={owner.label_key: owner.id},
             )
-            if not created:
+            if not pvc_status:
                 logger.error(
                     "Workspace PVC create failed for %s %s — aborting provision",
                     owner.kind,
@@ -239,6 +264,11 @@ class ContainerProvisioner:
                     owner, {"status": "failed", "error": "PVC creation failed"}
                 )
                 return False
+            # "reused" (409) = an EXISTING volume reattached — the only case where
+            # the single-replica node-loss wedge can occur. `fresh` recreates a NEW
+            # volume, so it is never itself a reattach (prevents the fallback below
+            # from re-firing → no recursion).
+            pvc_reattach = pvc_status == "reused" and not fresh
 
         # Seed the user's saved code-server config (theme/keybindings/snippets)
         # into the pod before it starts. Best-effort — never blocks provisioning.
@@ -299,8 +329,11 @@ class ContainerProvisioner:
                 self._db, owner, tier="sandbox", cpu=cpu, memory=memory
             )
 
-            # Wait for pod IP (poll until ready or timeout)
-            pod_ip = await self._wait_for_ready(pod_name, timeout=120)
+            # Wait for pod IP. A reattach gets the longer window so a transient
+            # node reboot recovers without discarding data; a fresh create keeps
+            # the standard 120s.
+            ready_timeout = self._reattach_ready_timeout if pvc_reattach else 120
+            pod_ip = await self._wait_for_ready(pod_name, timeout=ready_timeout)
             if pod_ip:
                 ready_ctx = {"status": "ready", "pod_ip": pod_ip, "port": 30022}
                 # Hand the agent the STABLE Service DNS (not the ephemeral IP) so
@@ -319,6 +352,47 @@ class ContainerProvisioner:
                 # Stream license/globalStorage state in (Phase B); fire-and-forget
                 # so it never blocks provisioning. No-ops when S3 is unavailable.
                 asyncio.create_task(self._seed_workspace_state(owner, pod_ip))
+            elif (
+                pvc_reattach
+                and self._fresh_fallback_enabled
+                and await self._pod_volume_attach_failing(pod_name)
+            ):
+                # Single-replica node-loss fallback (Phase 3b): the reattached
+                # volume can't attach here and won't until the dead node holding
+                # its lone replica returns. Discard the wedged PVC and recover onto
+                # a FRESH empty volume — the agent then clones from Gitea and
+                # resumes the Postgres checkpoint (unpushed working-tree files are
+                # lost: the accepted cost of single-replica + node loss). Recurses
+                # once with fresh=True, which creates a NEW volume (not a reattach),
+                # so this branch cannot re-fire.
+                logger.warning(
+                    "Workspace %s reattach wedged — volume unattachable (likely a "
+                    "dead node holding the single replica). Discarding the PVC and "
+                    "recovering onto a fresh volume; unpushed files are lost (%s %s)",
+                    pod_name,
+                    owner.kind,
+                    owner.id,
+                )
+                try:
+                    await self.delete_workspace(owner)
+                except Exception:
+                    logger.exception(
+                        "Error deleting wedged pod before fresh recovery (%s)",
+                        pod_name,
+                    )
+                fresh_ok = await self.create_workspace(
+                    owner,
+                    cpu=cpu,
+                    memory=memory,
+                    cpu_limit=cpu_limit,
+                    memory_limit=memory_limit,
+                    image=image,
+                    fresh=True,
+                )
+                # Record that the working tree was reset (observability for the
+                # dispatch/UI: this resume starts from the last push, not the disk).
+                await self._set_context(owner, {"workspace_reset": True})
+                return fresh_ok
             else:
                 logger.warning(
                     "Workspace container created but not ready within timeout: %s (%s %s)",
@@ -651,10 +725,14 @@ class ContainerProvisioner:
 
     async def _create_pvc(
         self, pvc_name: str, size: str = "10Gi", labels: Optional[dict] = None
-    ) -> bool:
-        """Create a PVC for workspace data. Idempotent — 409 treated as success."""
+    ) -> Optional[str]:
+        """Create a PVC for workspace data. Idempotent.
+
+        Returns ``"created"`` for a new volume, ``"reused"`` if the PVC already
+        existed (409 — i.e. a reattach), or ``None`` on failure.
+        """
         if not self._k8s_available:
-            return False
+            return None
 
         pvc_labels = {
             "app": "srw-workspace",
@@ -688,11 +766,11 @@ class ContainerProvisioner:
             logger.info(
                 "PVC created: %s (storageClass=%s)", pvc_name, self._storage_class
             )
-            return True
+            return "created"
         except Exception as e:
             if hasattr(e, "status") and e.status == 409:
                 logger.debug("PVC already exists: %s", pvc_name)
-                return True
+                return "reused"
             # A 403 here is the workspace capacity guard (Phase 3a): the
             # orchestrator SA is allowed to create PVCs, so the only Forbidden
             # it hits is a ResourceQuota "exceeded quota" rejection. Surface it
@@ -707,9 +785,9 @@ class ContainerProvisioner:
                     pvc_name,
                     getattr(e, "body", e),
                 )
-                return False
+                return None
             logger.error("Failed to create PVC %s: %s", pvc_name, e)
-            return False
+            return None
 
     async def _delete_pvc(self, pvc_name: str) -> bool:
         """Delete a PVC. Idempotent — 404 treated as success."""
@@ -730,6 +808,66 @@ class ContainerProvisioner:
                 return True
             logger.error("Failed to delete PVC %s: %s", pvc_name, e)
             return False
+
+    async def _delete_pvc_and_wait(self, pvc_name: str, timeout: int = 90) -> None:
+        """Delete a PVC and wait (bounded) for it to fully release.
+
+        The single-replica fallback recreates a fresh PVC under the SAME
+        deterministic name, so the old (wedged) one must be gone first — else the
+        create 409-reuses the dead volume. Best-effort: on timeout we proceed
+        anyway (the recreate's 409 path is still safe, just not fresh).
+        """
+        if not self._k8s_available:
+            return
+        await self._delete_pvc(pvc_name)
+        deadline = asyncio.get_event_loop().time() + timeout
+        while asyncio.get_event_loop().time() < deadline:
+            try:
+                await asyncio.to_thread(
+                    self._core_api.read_namespaced_persistent_volume_claim,
+                    name=pvc_name,
+                    namespace=self._namespace,
+                )
+            except Exception as e:
+                if hasattr(e, "status") and e.status == 404:
+                    return  # fully released
+            await asyncio.sleep(2)
+        logger.warning(
+            "PVC %s still present after %ss — proceeding with fresh recovery anyway",
+            pvc_name,
+            timeout,
+        )
+
+    async def _pod_volume_attach_failing(self, pod_name: str) -> bool:
+        """True if the pod is wedged on a PVC volume that won't attach/mount.
+
+        The single-replica node-loss fallback uses this to CONFIRM — before
+        discarding a PVC (the only data-destructive recovery path) — that the
+        holdup really is the volume (its lone replica on a dead node), not an
+        unrelated stall (image pull, resource pressure, scheduling). Substrate-
+        generic: matches the Kubernetes attach/mount failure events rather than
+        any Longhorn-specific state, so it also covers Ceph / EBS / etc.
+        """
+        if not self._k8s_available:
+            return False
+        try:
+            events = await asyncio.to_thread(
+                self._core_api.list_namespaced_event,
+                namespace=self._namespace,
+                field_selector=f"involvedObject.name={pod_name}",
+            )
+        except Exception:
+            logger.exception("Could not read events for pod %s", pod_name)
+            return False
+        for ev in getattr(events, "items", None) or []:
+            reason = getattr(ev, "reason", "") or ""
+            message = (getattr(ev, "message", "") or "").lower()
+            if (
+                reason in ("FailedAttachVolume", "FailedMount")
+                or "multi-attach" in message
+            ):
+                return True
+        return False
 
     async def _create_service(self, owner: WorkspaceOwner) -> bool:
         """Create a headless Service giving the workspace a STABLE DNS name.

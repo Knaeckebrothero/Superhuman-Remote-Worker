@@ -2,16 +2,19 @@
 
 ## Status (2026-06-30)
 
-**Phases 0, 1, 2, and 3a are BUILT, unit-tested, k3d-E2E-verified, and committed
-on `develop`** (latest `45eee2b1`). The PVC feature is functionally complete for
+**Phases 0, 1, 2, and 3a are BUILT, unit/k3d-E2E-verified, and committed on
+`develop`** (latest `45eee2b1`); **the 3b node-loss fallback is also built and
+unit-verified** (uncommitted). The PVC feature is functionally complete for
 single-node/local-path and prod/Longhorn alike: a job workspace gets a PVC named
 by its UUID, files survive a pod crash (reattach by name), a crashed job
 **auto-resumes** on the reattached volume from its Postgres checkpoint (reached
 at a stable headless-Service DNS address), the PVC is reclaimed when the job goes
 terminal (with a backstop sweep so it cannot leak), and a per-class
-`ResourceQuota` caps fleet storage with a fail-closed clear-error. **Only Phase
-3b** (Longhorn multi-node dead-node detach) **and the prod flip remain** — 3b
-does not reproduce on single-node k3d and is validated on the homelab. Flag is
+`ResourceQuota` caps fleet storage with a fail-closed clear-error. **What remains:
+homelab validation of 3b** (the real stuck-attach can't be triggered on
+single-node k3d) **and the prod flip.** A live finding reframed 3b — the workspace
+class is single-replica, so node-loss recovery is a *discard → fresh volume →
+Gitea/checkpoint resume* fallback, not the originally-planned detach-wait. Flag is
 default-off in-chart (zero behavior change on merge); ON in k3d dev.
 
 | Phase | Scope | State |
@@ -20,7 +23,7 @@ default-off in-chart (zero behavior change on merge); ON in k3d dev.
 | **1 — GC discipline** | terminal delete + give_up gating + backstop `reap_orphans` | ✅ done + k3d-verified |
 | **2 — crash-recovery reattach** | workspace-lost job re-dispatches → reattaches PVC → agent resumes on the files | ✅ **COMPLETE + full-E2E-verified (2026-06-29)** — G1+G2 (wedge eliminated, bounded fail-loud, working-tree preserved) + **Option 1 stable-DNS Service** (commit `7fb9e9e2`) fixing the ephemeral-IP churn. **Full real-job E2E PASSED** (job `b4025433`): killed a running job's pod → re-dispatched via pod arm (`vm.requested` null) → new pod reattached PVC + same DNS → agent resumed from checkpoint, sentinel survived, job back to `processing` not failed. Minor non-blocking follow-up: ~2.7 min reconnect-loop delay before recovery triggers → `workspace_reattach_ephemeral_ip_reconnect_churn.md`. See §Phase 2 |
 | **3a — capacity guard** | per-class `ResourceQuota` on the ephemeral storage class (caps total storage **and** PVC count) + fail-closed clear-error on 403 | ✅ **done + k3d-verified (2026-06-30)** — **universal** (every substrate); helm-configurable, default off. See §Phase 3a |
-| **3b — dead-node hardening** | RWO dead-node detach-wait + S3 fallback | ⏳ pending — **Longhorn/multi-node only**; does NOT reproduce on single-node local-path. Validate on homelab, not this k3d. See §Phase 3b |
+| **3b — node-loss fallback** | single-replica reattach-wedge → discard PVC → fresh volume → Gitea/checkpoint resume (extended reattach wait + kill-switch; triple-gated discard) | ✅ **BUILT + unit-verified (2026-06-30)** — live finding: `longhorn-ephemeral` is single-replica, so it's a fresh-volume fallback, **not** detach-wait. Homelab node-loss validation deferred (can't trigger the real stuck-attach on single-node k3d). See §Phase 3b |
 | **rollout** | flag default-off in-chart; **ON in k3d dev**; dev-soak → prod flip | ⏳ pending |
 
 **Decision: LOCKED — Branch (a), scoped to job (worker/loop) pods for v1.** This
@@ -391,21 +394,66 @@ exceeded." Threading a capacity reason into the job context would need a richer
 `_create_pvc` return; left for later since the operator signal (log/alert) is
 the one that matters for a capacity event and fail-closed is already safe.
 
-### Phase 3b — dead-node RWO detach-wait + S3 fallback (pending; Longhorn/multi-node only)
+### Phase 3b — single-replica node-loss fallback (BUILT 2026-06-30; homelab validation pending)
 
-Does **not** reproduce on this k3d (Gotcha #4: single node = nowhere to fail
-over; `local-path` = hostPath bind-mount = no `VolumeAttachment` detach dance).
-On **multi-node networked-RWO** (Longhorn/Ceph/cloud-EBS) when the old pod's
-node dies, K8s holds a stale `VolumeAttachment` on the dead node and the new
-pod's mount **blocks** until it's force-detached (the *data* survives via
-Longhorn replicas + `auto-salvage`; only the *attach* hangs). Plan: a bounded
-detach-wait in the recreate path; on timeout, fall back to S3-restore onto a
-healthy node. This is **substrate-specific hardening for the prod/homelab
-Longhorn config** — validate on the homelab (real multi-node Longhorn) or a
-purpose-built multi-node-k3d + Longhorn rig, not this single-node k3d. Folds in
-the ~2.7 min reconnect-loop follow-up
-([`workspace_reattach_ephemeral_ip_reconnect_churn.md`](../issues/workspace_reattach_ephemeral_ip_reconnect_churn.md)),
-since on a node death the agent-reconnect and volume-detach latencies stack.
+> **Live finding that reframed this (2026-06-30, on the homelab `main` cluster):**
+> the workspace class `longhorn-ephemeral` is **`numberOfReplicas: 1`** (single
+> replica, chosen deliberately to save space). So the original "detach-wait"
+> premise — *"Longhorn replicas + auto-salvage mean the data survives a node loss;
+> only the attach needs forcing"* — is **false for our config.** With one replica,
+> a node loss = the volume's only replica is gone: a **transient outage**
+> (reboot/maintenance, disk intact) makes it unavailable until the node returns; a
+> **permanent loss** destroys the workspace data. There is no surviving replica to
+> "detach-wait" for — so 3b is **not** detach-wait.
+
+**The PVC is a fast-recovery cache, not the durability layer.** Durability is
+already triple-layered: Postgres checkpoint (reasoning, replicated) + Gitea
+(pushed code) + S3 snapshot (DR). The PVC exists to make the *common* failure — a
+pod crash on a healthy node — reattach instantly (Phase 2). So single-replica is
+the right default; node-loss recovery rides the layers we already have.
+
+**What was built (the fallback, `container_provisioner.py` `create_workspace`):**
+when a PVC **reattach** can't bring the pod ready within an extended window
+(`WORKSPACE_REATTACH_READY_TIMEOUT`, default 180 s — long enough that a transient
+node reboot reattaches with **no** data loss) **and** the holdup is confirmed to
+be a volume-attach failure (`_pod_volume_attach_failing` — matches the K8s
+`FailedAttachVolume`/`FailedMount`/Multi-Attach events, substrate-generic), the
+provisioner **discards the wedged PVC and recreates a fresh empty one** under the
+same deterministic name; the pod comes up and the agent **clones from Gitea +
+resumes the Postgres checkpoint** onto it (the existing pre-G2 path — **no agent
+or G1 edit**). Only *unpushed* working-tree files are lost (bounded; loop jobs
+push often). The discard is **triple-gated** — reattach-only
+(`_create_pvc` returned `"reused"`, never an initial create), volume-failure-
+confirmed, and behind a kill-switch (`WORKSPACE_REATTACH_FRESH_FALLBACK`, default
+on) — because it is the only data-destructive recovery path. It recurses once with
+`fresh=True` (which creates a new volume, not a reattach), so it cannot re-fire.
+
+**Why this beats detach-wait:** it's the *same* recovery a single-node /
+local-path operator needs (they can't replicate either), so one path serves every
+substrate. The S3 snapshot stays DR-only; reviving its (vestigial) restore path to
+also recover *unpushed* files is a future enhancement, not required.
+
+**Tests** (`tests/test_container_provisioner.py`): fresh-fallback happy path + the
+three false-discard guards (volume-OK-not-discarded, initial-create-never-
+discards, kill-switch-off) + the `_create_pvc` status and `_pod_volume_attach_failing`
+contracts. 87 provisioner + 88 lifecycle pass; ruff + `helm lint` clean. Knobs
+wired through configmap → orchestrator env → `values.yaml`
+(`workspace.reattachReadyTimeout` / `workspace.freshFallback`).
+
+**Homelab validation (deferred — needs a real node loss):** enable PVC mode in ns
+`superhuman-remote-worker` (`WORKSPACE_PVC_ENABLED` is currently `false` there) and
+ungracefully lose the node holding a job's workspace replica; assert the job
+discards → fresh PVC → clones + resumes, and that a *fast* reboot (< timeout)
+reattaches without discarding. Mechanism in hand (privileged `nsenter` pod +
+self-recovering `systemd-run` timer; no SSH to the nodes). Single-node k3d cannot
+trigger the real stuck-attach — the discard logic is unit-covered; the *trigger*
+is homelab-only.
+
+**HA alternative (deferred to a "proper deployment"):** bump `longhorn-ephemeral`
+to ≥2 replicas → workspaces *survive* a single node loss (no fallback, no lost
+unpushed work) at 2× workspace storage, multi-node only; then the classic
+detach-wait becomes the relevant mechanism. Out of scope for v1 per the
+cost/space tradeoff.
 
 ---
 

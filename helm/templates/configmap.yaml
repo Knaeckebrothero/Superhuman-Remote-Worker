@@ -88,6 +88,11 @@ data:
   WORKSPACE_STORAGE_CLASS: {{ .Values.workspace.ephemeralStorageClass | default "longhorn-ephemeral" | quote }}
   WORKSPACE_PVC_ENABLED: {{ .Values.workspace.pvcEnabled | default false | quote }}
   WORKSPACE_PVC_SIZE: {{ .Values.workspace.pvcSize | default "10Gi" | quote }}
+  # Single-replica node-loss fallback (Phase 3b): extended reattach ready-wait
+  # (gives a transient node reboot time to recover before discarding) + the
+  # data-destructive discard kill-switch.
+  WORKSPACE_REATTACH_READY_TIMEOUT: {{ .Values.workspace.reattachReadyTimeout | default 180 | quote }}
+  WORKSPACE_REATTACH_FRESH_FALLBACK: {{ .Values.workspace.freshFallback | default true | quote }}
 
   # Agent
   AGENT_CONFIG: {{ .Values.agent.config | quote }}

@@ -1068,6 +1068,144 @@ class TestCreateWorkspacePvc:
         # Distinct, greppable capacity signal (not the generic "Failed to create")
         assert "capacity quota exceeded" in caplog.text.lower()
 
+    @pytest.mark.asyncio
+    async def test_create_pvc_returns_status_created_reused_none(self):
+        # The recreate path keys the single-replica fallback on this: "reused"
+        # (409) = a reattach (can wedge on a dead node), "created" = fresh.
+        p = self._provisioner(pvc_enabled=True)
+
+        class _Exc(Exception):
+            def __init__(self, status):
+                self.status = status
+
+        p._core_api = MagicMock()
+        p._core_api.create_namespaced_persistent_volume_claim = MagicMock()
+        assert await p._create_pvc("pvc-x") == "created"
+        p._core_api.create_namespaced_persistent_volume_claim = MagicMock(
+            side_effect=_Exc(409)
+        )
+        assert await p._create_pvc("pvc-x") == "reused"
+        p._core_api.create_namespaced_persistent_volume_claim = MagicMock(
+            side_effect=_Exc(403)
+        )
+        assert await p._create_pvc("pvc-x") is None
+        p._core_api.create_namespaced_persistent_volume_claim = MagicMock(
+            side_effect=_Exc(500)
+        )
+        assert await p._create_pvc("pvc-x") is None
+
+    @pytest.mark.asyncio
+    async def test_pod_volume_attach_failing_matches_attach_events(self):
+        p = self._provisioner(pvc_enabled=True)
+        p._core_api = MagicMock()
+
+        def _events(reason="", message=""):
+            ev = MagicMock()
+            ev.reason, ev.message = reason, message
+            res = MagicMock()
+            res.items = [ev]
+            return res
+
+        p._core_api.list_namespaced_event = MagicMock(
+            return_value=_events(reason="FailedAttachVolume")
+        )
+        assert await p._pod_volume_attach_failing("pod-x") is True
+        p._core_api.list_namespaced_event = MagicMock(
+            return_value=_events(message="Multi-Attach error for volume pvc-...")
+        )
+        assert await p._pod_volume_attach_failing("pod-x") is True
+        # An unrelated event must NOT look like a volume failure (no false discard)
+        p._core_api.list_namespaced_event = MagicMock(
+            return_value=_events(reason="Scheduled")
+        )
+        assert await p._pod_volume_attach_failing("pod-x") is False
+
+    @pytest.mark.asyncio
+    async def test_reattach_wedged_on_dead_node_falls_back_to_fresh_pvc(self):
+        # Single-replica node-loss fallback (Phase 3b): a reattach (409) whose
+        # volume can't attach (lone replica on a dead node) is DISCARDED and
+        # recovered onto a fresh empty PVC, so the agent clone+checkpoint-resumes.
+        p = self._provisioner(pvc_enabled=True)
+        pod_body = {}
+        p._core_api = self._capture_core(pod_body)
+        p._create_pvc = AsyncMock(side_effect=["reused", "created"])  # reattach→fresh
+        p._delete_pvc_and_wait = AsyncMock()
+        p.delete_workspace = AsyncMock(return_value=True)
+        p._pod_volume_attach_failing = AsyncMock(return_value=True)
+
+        with patch.object(p, "_wait_for_ready", new_callable=AsyncMock) as w:
+            w.side_effect = [None, "10.42.0.5"]  # wedged reattach, then fresh ready
+            result = await p.create_workspace(WorkspaceOwner.job("abcdef123456-rest"))
+
+        assert result is True
+        assert p._create_pvc.await_count == 2  # reattach attempt + fresh recreate
+        p._delete_pvc_and_wait.assert_awaited_once()  # discarded the dead volume
+        p.delete_workspace.assert_awaited_once()  # tore down the wedged pod
+        merges = [
+            c[0][1] for c in p._db.merge_workspace_container_context.call_args_list
+        ]
+        assert any(m.get("workspace_reset") for m in merges)  # observability flag
+        assert any(m.get("status") == "ready" for m in merges)  # fresh pod came up
+
+    @pytest.mark.asyncio
+    async def test_reattach_not_ready_but_volume_ok_does_not_discard(self):
+        # Guard: a slow/odd reattach that is NOT a volume-attach failure must keep
+        # the existing PVC (status=creating), never discard data.
+        p = self._provisioner(pvc_enabled=True)
+        p._core_api = self._capture_core({})
+        p._create_pvc = AsyncMock(return_value="reused")
+        p._delete_pvc_and_wait = AsyncMock()
+        p.delete_workspace = AsyncMock(return_value=True)
+        p._pod_volume_attach_failing = AsyncMock(return_value=False)
+
+        with patch.object(p, "_wait_for_ready", new_callable=AsyncMock) as w:
+            w.return_value = None
+            result = await p.create_workspace(WorkspaceOwner.job("abcdef123456-rest"))
+
+        assert result is True
+        p._delete_pvc_and_wait.assert_not_awaited()
+        p.delete_workspace.assert_not_awaited()
+        assert p._create_pvc.await_count == 1  # no fresh recreate
+        merges = [
+            c[0][1] for c in p._db.merge_workspace_container_context.call_args_list
+        ]
+        assert any(m.get("status") == "creating" for m in merges)
+
+    @pytest.mark.asyncio
+    async def test_fresh_create_timeout_never_discards(self):
+        # A first-time create ("created", not a reattach) that times out must
+        # NEVER hit the fallback — there is no prior data to preserve/discard.
+        p = self._provisioner(pvc_enabled=True)
+        p._core_api = self._capture_core({})
+        p._create_pvc = AsyncMock(return_value="created")
+        p._pod_volume_attach_failing = AsyncMock(return_value=True)
+        p._delete_pvc_and_wait = AsyncMock()
+
+        with patch.object(p, "_wait_for_ready", new_callable=AsyncMock) as w:
+            w.return_value = None
+            await p.create_workspace(WorkspaceOwner.job("abcdef123456-rest"))
+
+        p._pod_volume_attach_failing.assert_not_awaited()  # gated off (not reattach)
+        p._delete_pvc_and_wait.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_fallback_kill_switch_disables_discard(self):
+        # WORKSPACE_REATTACH_FRESH_FALLBACK=false → pure reattach-or-creating,
+        # never discards (operator kill-switch for the data-destructive path).
+        p = self._provisioner(pvc_enabled=True)
+        p._fresh_fallback_enabled = False
+        p._core_api = self._capture_core({})
+        p._create_pvc = AsyncMock(return_value="reused")
+        p._pod_volume_attach_failing = AsyncMock(return_value=True)
+        p._delete_pvc_and_wait = AsyncMock()
+
+        with patch.object(p, "_wait_for_ready", new_callable=AsyncMock) as w:
+            w.return_value = None
+            await p.create_workspace(WorkspaceOwner.job("abcdef123456-rest"))
+
+        p._pod_volume_attach_failing.assert_not_awaited()  # short-circuited by flag
+        p._delete_pvc_and_wait.assert_not_awaited()
+
 
 class TestWorkspaceService:
     """Option 1: stable headless Service so reattach/recovery reconnects to a
