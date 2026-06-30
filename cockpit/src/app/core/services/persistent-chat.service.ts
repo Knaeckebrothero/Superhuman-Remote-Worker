@@ -634,6 +634,24 @@ export class PersistentChatService {
     }
 
     /**
+     * Rename a session (persistent thread). Persists the new title via PATCH and,
+     * if the renamed thread is the one currently open, updates the live title
+     * signal so the header reflects it immediately. Callers update their own
+     * list state optimistically and revert on the rejected promise.
+     */
+    async renameThread(threadId: string, title: string): Promise<void> {
+        await firstValueFrom(
+            this.http.patch(
+                `${environment.apiUrl}/persistent/threads/${threadId}`,
+                {title},
+            ),
+        );
+        if (this.threadId() === threadId) {
+            this.sessionTitle.set(title);
+        }
+    }
+
+    /**
      * Load message history from REST endpoint and rehydrate as Turns.
      *
      * Server returns flat HistoryMessage rows (one per agent iteration); we

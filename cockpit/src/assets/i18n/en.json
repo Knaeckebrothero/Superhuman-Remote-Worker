@@ -61,6 +61,7 @@
     "delete": "Delete",
     "cancel": "Cancel",
     "edit": "Edit",
+    "rename": "Rename",
     "copy": "Copy",
     "copied": "Copied",
     "never": "Never",
@@ -2143,7 +2144,8 @@
       "resumeFailed": "Couldn't resume the session.",
       "endFailed": "Couldn't end the session.",
       "deleteFailed": "Couldn't delete the session.",
-      "createFailed": "Couldn't create the session."
+      "createFailed": "Couldn't create the session.",
+      "renameFailed": "Couldn't rename the session."
     }
   },
   "toasts": {
