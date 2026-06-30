@@ -447,7 +447,11 @@ discards → fresh PVC → clones + resumes, and that a *fast* reboot (< timeout
 reattaches without discarding. Mechanism in hand (privileged `nsenter` pod +
 self-recovering `systemd-run` timer; no SSH to the nodes). Single-node k3d cannot
 trigger the real stuck-attach — the discard logic is unit-covered; the *trigger*
-is homelab-only.
+is homelab-only. **Runbook:**
+[`tests/workspace_pvc_node_loss_validation.md`](../../tests/workspace_pvc_node_loss_validation.md)
+(scenarios, the kubectl-only self-recovering node-outage mechanism, data-safety
+gate, assertions). PVC mode is now **ON** on the homelab
+(`values-experimental.yaml`, `workspace.pvcEnabled: true`) for this soak.
 
 **HA alternative (deferred to a "proper deployment"):** bump `longhorn-ephemeral`
 to ≥2 replicas → workspaces *survive* a single node loss (no fallback, no lost
