@@ -215,6 +215,15 @@ agent:
 # manual override, not policy default.
 # -----------------------------------------------------------------------------
 workspace:
+  # PVC-backed job workspaces (Branch a) — ON for the homelab soak/validation.
+  # Gives durable reattach + crash-recovery auto-resume + the single-replica
+  # node-loss fallback. ephemeralStorageClass defaults to longhorn-ephemeral
+  # (present on this cluster, single replica). Rollback = set false (new pods
+  # revert to emptyDir; existing PVC pods finish + GC normally — mixed fleet is
+  # safe). Capacity guard (resourceQuota) intentionally left default-off for the
+  # soak. Node-loss validation runbook: tests/workspace_pvc_node_loss_validation.md.
+  # Design: docs/features/workspace_pvc_branch_a_implementation.md.
+  pvcEnabled: true
   networkPolicy:
     operatorHomeAllowedEmail: ""
 # -----------------------------------------------------------------------------
