@@ -2,6 +2,8 @@
  * Shared types for the agent settings component tree.
  */
 
+import type {EffectiveModels} from '../../core/models/api.model';
+
 export type SettingsMode = 'job' | 'session';
 
 /** Tool category metadata for toggle display. */
@@ -208,4 +210,32 @@ export function computeModelMismatch(
   const prominent = window !== null && Math.max(sWin as number, tWin as number) > 2 * window.min;
 
   return {prominent, window, multimodal: multimodalDiffers};
+}
+
+/**
+ * Pick the server-resolved effective-models payload the model picker should show
+ * for its "Default" option: the selected expert's resolution when present, else
+ * the framework defaults' resolution (the no-expert create path). Without the
+ * framework fallback the picker drops to the config-literal `llm.model` — the
+ * hardcoded YAML placeholder (`RedHatAI/gemma-4-31B-it-FP8-Dynamic`) — instead of
+ * the resolved system chat pin. `undefined` (older API, no `effective_models`)
+ * falls back the same as `null` (no expert selected).
+ */
+export function resolveEffectiveModels(
+  expertModels: EffectiveModels | null | undefined,
+  frameworkModels: EffectiveModels | null,
+): EffectiveModels | null {
+  return expertModels ?? frameworkModels ?? null;
+}
+
+/**
+ * Label for a model picker's "inherit the default" option, revealing the model
+ * that default currently resolves to. `prefix` is the inherit-marker ("Base
+ * default", "Project default"); when a resolved `model` is known it is appended
+ * ("Base default · gemma-4-31b") so the option isn't an opaque "default". Falls
+ * back to the bare prefix when nothing is resolved yet (picker still loading, or
+ * no catalog row), avoiding a dangling separator.
+ */
+export function defaultModelOptionLabel(prefix: string, model: string | null | undefined): string {
+  return model ? `${prefix} · ${model}` : prefix;
 }

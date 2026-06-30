@@ -647,6 +647,53 @@ class TestUsageLedger:
                     group_by="evil", from_ts=now - timedelta(days=1), to_ts=now
                 )
 
+    async def test_query_timeseries_buckets_by_day_and_key(self, pg_dsn):
+        async with _audit_pool(pg_dsn) as pool:
+            ledger = UsageLedger(pool, UsageRates(None))
+            # Days 15/16 of the current month are always inside the bootstrapped
+            # current-month partition — no month-boundary flake.
+            base = datetime.now(timezone.utc).replace(
+                day=15, hour=12, minute=0, second=0, microsecond=0
+            )
+            d_a, d_b = base, base + timedelta(days=1)
+            uid, pid = uuid4(), uuid4()
+
+            def ev(model, qty, unit, sid, ts):
+                return UsageEvent(
+                    category="llm",
+                    resource=model,
+                    quantity=qty,
+                    unit=unit,
+                    source="litellm",
+                    source_id=sid,
+                    ts=ts,
+                    user_id=str(uid),
+                    project_id=str(pid),
+                )
+
+            await ledger.record_events(
+                [
+                    ev("opus", 100, "prompt-token", "b1", d_b),
+                    ev("opus", 20, "completion-token", "b2", d_b),
+                    ev("opus", 40, "prompt-token", "a1", d_a),
+                    ev("opus", 2, "vcpu-hour", "a2", d_a),  # compute → not a token
+                    ev("gemma", 10, "prompt-token", "a3", d_a),
+                ]
+            )
+            window = dict(from_ts=base - timedelta(days=2), to_ts=base + timedelta(days=2))
+            rows = await ledger.query_timeseries(group_by="model", **window)
+            by = {(r["day"], r["key"]): r for r in rows}
+            day_a, day_b = d_a.date().isoformat(), d_b.date().isoformat()
+            # tokens = prompt + completion summed; rows ascend by day
+            assert by[(day_b, "opus")]["tokens"] == 120.0
+            assert by[(day_b, "opus")]["events"] == 2
+            assert by[(day_a, "opus")]["tokens"] == 40.0  # vcpu-hour excluded from tokens
+            assert by[(day_a, "opus")]["events"] == 2  # but still counted as an event
+            assert by[(day_a, "gemma")]["tokens"] == 10.0
+            assert [r["day"] for r in rows] == sorted(r["day"] for r in rows)
+            with pytest.raises(ValueError):
+                await ledger.query_timeseries(group_by="evil", **window)
+
     async def test_unavailable_pool_noop(self):
         # No DB needed: a ledger with no audit pool no-ops (non-load-bearing tier).
         ledger = UsageLedger(None, UsageRates(None))
@@ -895,3 +942,21 @@ class TestBreakdownFold:
         by_key = {r["key"]: r for r in out}
         assert by_key["u1"]["label"] == "Alice" and by_key["u1"]["is_admin"] is True
         assert by_key["u2"]["label"] == "u2"  # unknown id → key as label
+
+    def test_build_timeseries_pivots_and_orders(self):
+        from orchestrator.main import _build_timeseries
+
+        rows = [
+            {"day": "2026-06-01", "key": "opus", "tokens": 100.0, "cost_usd": 0.0, "events": 1},
+            {"day": "2026-06-02", "key": "opus", "tokens": 50.0, "cost_usd": 0.0, "events": 1},
+            {"day": "2026-06-01", "key": "gemma", "tokens": 10.0, "cost_usd": 0.0, "events": 3},
+        ]
+        out = _build_timeseries(rows, {"opus": {"label": "Opus 4"}})
+        assert out["days"] == ["2026-06-01", "2026-06-02"]  # sorted union of buckets
+        # gemma leads despite fewer tokens — series order is total events desc (3 > 2)
+        assert [s["key"] for s in out["series"]] == ["gemma", "opus"]
+        opus = next(s for s in out["series"] if s["key"] == "opus")
+        assert opus["events"] == 2 and len(opus["points"]) == 2
+        assert opus["label"] == "Opus 4"  # label map applied
+        gemma = next(s for s in out["series"] if s["key"] == "gemma")
+        assert gemma["label"] == "gemma"  # unknown key → raw key as label

@@ -45,6 +45,20 @@ export function selectedDatasourceIds(
     .map(d => d.id);
 }
 
+/** True when every selectable datasource (i.e. not lite-excluded) is selected. */
+export function allDatasourcesSelected(
+  datasources: Datasource[],
+  selection: DatasourceSelection,
+  isLiteBackend: boolean,
+): boolean {
+  const selectable = datasources.filter(
+    d => !(isLiteBackend && isRepositoryDatasource(d.type)),
+  );
+  if (selectable.length === 0) return false;
+  const active = activeDatasourceIds(datasources, selection);
+  return selectable.every(d => active.has(d.id));
+}
+
 /**
  * Datasource checkbox list. Hidden entirely when no datasources are available.
  */
@@ -55,7 +69,15 @@ export function selectedDatasourceIds(
   template: `
     @if (!loading() && datasources().length > 0) {
       <div class="settings-group">
-        <div class="group-label">{{ 'agentSettings.datasources.group' | transloco }}</div>
+        <div class="group-header">
+          <span class="group-label">{{ 'agentSettings.datasources.group' | transloco }}</span>
+          <button
+            type="button"
+            class="select-all-btn"
+            (click)="toggleAll()"
+            [disabled]="disabled() || selectableDatasources().length === 0"
+          >{{ (allSelected() ? 'agentSettings.common.deselectAll' : 'agentSettings.common.selectAll') | transloco }}</button>
+        </div>
         <div class="ds-picker">
           @for (ds of datasources(); track ds.id) {
             <label
@@ -85,7 +107,9 @@ export function selectedDatasourceIds(
       </div>
     } @else if (loading()) {
       <div class="settings-group">
-        <div class="group-label">{{ 'agentSettings.datasources.group' | transloco }}</div>
+        <div class="group-header">
+          <span class="group-label">{{ 'agentSettings.datasources.group' | transloco }}</span>
+        </div>
         <div class="ds-loading">
           <app-spinner size="sm" />
 
@@ -98,15 +122,41 @@ export function selectedDatasourceIds(
     .settings-group {
       margin-bottom: 20px;
     }
+    .group-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      margin-bottom: 12px;
+      padding-bottom: 6px;
+      border-bottom: 1px solid var(--border-color, var(--surface-0));
+    }
     .group-label {
       font-size: 11px;
       font-weight: 600;
       text-transform: uppercase;
       letter-spacing: 0.5px;
       color: var(--text-muted, var(--text-muted));
-      margin-bottom: 12px;
-      padding-bottom: 6px;
-      border-bottom: 1px solid var(--border-color, var(--surface-0));
+    }
+    .select-all-btn {
+      flex-shrink: 0;
+      background: none;
+      border: none;
+      padding: 0;
+      cursor: pointer;
+      font-family: inherit;
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: var(--accent-color, var(--accent-color));
+    }
+    .select-all-btn:hover:not(:disabled) {
+      text-decoration: underline;
+    }
+    .select-all-btn:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
     }
     .ds-picker {
       display: flex;
@@ -205,6 +255,16 @@ export class DatasourcesGroupComponent {
 
   readonly modifiedCount = computed(() => this.getSelectedIds().length);
 
+  /** Datasources the user can actually toggle (not lite-excluded). */
+  readonly selectableDatasources = computed<Datasource[]>(() =>
+    this.datasources().filter(ds => !this.isLiteExcluded(ds))
+  );
+
+  /** True when every selectable datasource is currently checked. */
+  readonly allSelected = computed(() =>
+    allDatasourcesSelected(this.datasources(), this.selection(), this.isLiteBackend())
+  );
+
   /** A repository datasource can't be used under a lite backend. */
   isLiteExcluded(ds: Datasource): boolean {
     return this.isLiteBackend() && isRepositoryDatasource(ds.type);
@@ -225,6 +285,18 @@ export class DatasourcesGroupComponent {
       next.add(id);
     }
     this.selection.set({key: datasourceSetKey(this.datasources()), ids: next});
+    this.change.emit();
+  }
+
+  /** Check every selectable datasource, or clear them all if already all on. */
+  toggleAll(): void {
+    const selectAll = !allDatasourcesSelected(
+      this.datasources(), this.selection(), this.isLiteBackend(),
+    );
+    const ids = selectAll
+      ? new Set(this.selectableDatasources().map(d => d.id))
+      : new Set<string>();
+    this.selection.set({key: datasourceSetKey(this.datasources()), ids});
     this.change.emit();
   }
 

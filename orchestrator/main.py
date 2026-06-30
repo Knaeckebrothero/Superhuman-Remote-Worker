@@ -12786,6 +12786,43 @@ async def _usage_labels(group_by: str, keys: list[str]) -> dict[str, dict[str, A
     return {str(r["id"]): {"label": r["name"]} for r in rows}
 
 
+def _build_timeseries(
+    rows: list[dict[str, Any]], labels: dict[str, dict[str, Any]]
+) -> dict[str, Any]:
+    """Pivot flat (day, key, metrics) rows into a day axis + per-key series.
+
+    ``days`` is the sorted union of all buckets; each series carries only the days
+    it has activity (sparse — the client zero-fills gaps). Series are ordered by
+    total events desc so the busiest key stacks first and leads the legend, matching
+    ``_merge_labels``. Unknown keys fall back to the raw key as their label.
+    """
+    days = sorted({r["day"] for r in rows})
+    series: dict[str, dict[str, Any]] = {}
+    for r in rows:
+        k = r["key"]
+        s = series.setdefault(
+            k,
+            {
+                "key": k,
+                "label": labels.get(k, {}).get("label", k),
+                "is_admin": labels.get(k, {}).get("is_admin"),
+                "events": 0,
+                "points": [],
+            },
+        )
+        s["points"].append(
+            {
+                "day": r["day"],
+                "tokens": r["tokens"],
+                "cost_usd": r["cost_usd"],
+                "events": r["events"],
+            }
+        )
+        s["events"] += r["events"]
+    ordered = sorted(series.values(), key=lambda s: s["events"], reverse=True)
+    return {"days": days, "series": ordered}
+
+
 @app.get("/api/usage")
 async def get_usage(
     request: Request,
@@ -12883,6 +12920,57 @@ async def get_usage_breakdown(
         "from": from_ts.isoformat(),
         "to": to_ts.isoformat(),
         "rows": _merge_labels(folded, labels),
+    }
+
+
+@app.get("/api/usage/timeseries")
+async def get_usage_timeseries(
+    request: Request,
+    group_by: str = Query(..., description="user | model | project"),
+    days: int = Query(default=30, ge=1, le=365),
+    from_date: str | None = Query(default=None),
+    to_date: str | None = Query(default=None),
+) -> dict[str, Any]:
+    """Daily-bucketed usage time series grouped by user|model|project (G5-scoped).
+
+    Powers the dashboard's stacked usage-over-time chart. Returns a sorted ``days``
+    axis and one ``series`` per key, each carrying per-day {day, tokens, cost_usd,
+    events} points (days a key had no activity are omitted, not zero-filled — the
+    client fills gaps). Labels are enriched from the app DB; non-admins are strictly
+    self-scoped (see query_timeseries). ``available=false`` when metering is off.
+    """
+    user = await require_approved_user(request, postgres_db)
+    if group_by not in ("user", "model", "project"):
+        raise HTTPException(status_code=400, detail=f"bad group_by: {group_by}")
+    if usage_ledger is None or not usage_ledger.is_available:
+        return {"available": False, "group_by": group_by, "days": [], "series": []}
+    try:
+        now = datetime.now(timezone.utc)
+        to_ts = _parse_utc_date(to_date) if to_date else now
+        from_ts = (
+            _parse_utc_date(from_date) if from_date else (to_ts - timedelta(days=days))
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"invalid date: {e}") from e
+    vis = await _visibility_kwargs_for_stats(user)
+    try:
+        rows = await usage_ledger.query_timeseries(
+            from_ts=from_ts,
+            to_ts=to_ts,
+            group_by=group_by,
+            owner_user_id=vis.get("owner_user_id"),
+            visible_project_ids=vis.get("visible_project_ids"),
+            scope_project_id=vis.get("scope_project_id"),
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    labels = await _usage_labels(group_by, sorted({r["key"] for r in rows}))
+    return {
+        "available": True,
+        "group_by": group_by,
+        "from": from_ts.isoformat(),
+        "to": to_ts.isoformat(),
+        **_build_timeseries(rows, labels),
     }
 
 

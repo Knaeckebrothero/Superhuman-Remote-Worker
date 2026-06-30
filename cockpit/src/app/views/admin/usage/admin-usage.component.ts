@@ -9,7 +9,7 @@ import {
   signal,
 } from '@angular/core';
 import {SidebarToggleComponent} from '../../../shell/sidebar-toggle/sidebar-toggle.component';
-import {AdminUsageService} from '../../../core/services/admin-usage.service';
+import {AdminUsageService, BreakdownDim, UsageTsPoint} from '../../../core/services/admin-usage.service';
 import {ApiService} from '../../../core/services/api.service';
 import {UserService} from '../../../core/services/user.service';
 import {AgentStatistics, DailyStatistics, JobStatistics} from '../../../core/models/api.model';
@@ -31,11 +31,33 @@ import {AgentStatistics, DailyStatistics, JobStatistics} from '../../../core/mod
         <div class="page-header">
           <app-sidebar-toggle />
           <h1 class="page-title">Usage &amp; Cost</h1>
+          <div class="page-controls">
+            <div class="seg">
+              @for (d of windows; track d) {
+                <button type="button" class="seg-btn"
+                  [class.active]="windowDays() === d" (click)="setWindow(d)">{{ d }}d</button>
+              }
+            </div>
+            <div class="seg">
+              @for (o of refreshOptions; track o.ms) {
+                <button type="button" class="seg-btn"
+                  [class.active]="refreshIntervalMs() === o.ms" (click)="setRefresh(o.ms)">{{ o.label }}</button>
+              }
+            </div>
+            @if (isAdmin()) {
+              <label class="scope-switch" [class.on]="viewAllData()" [title]="scopeHint()">
+                <input type="checkbox" [checked]="viewAllData()" (change)="setViewAllData($event)" />
+                <span class="switch-track"><span class="switch-thumb"></span></span>
+                <span class="switch-label">All data</span>
+              </label>
+            }
+          </div>
         </div>
         <p class="page-desc">
           LLM tokens and workspace compute, metered from the usage ledger and
-          scoped to your visibility (admins see the fleet). Costs read $0 until
-          rates are configured — quantities are measured now.
+          scoped to your visibility — admins see the fleet, or flip
+          <em>All data</em> off to view just their own. Costs read $0 until rates
+          are configured — quantities are measured now.
         </p>
 
         <section class="kpi-row">
@@ -54,30 +76,77 @@ import {AgentStatistics, DailyStatistics, JobStatistics} from '../../../core/mod
         </section>
 
         <section class="admin-section">
-          <div class="usage-toolbar">
-            <div class="filters">
-              @for (d of windows; track d) {
-                <button
-                  type="button"
-                  class="filter-chip"
-                  [class.active]="windowDays() === d"
-                  (click)="setWindow(d)"
-                >
-                  {{ d }}d
-                </button>
-              }
-              <div class="refresh-control">
-                @for (o of refreshOptions; track o.ms) {
-                  <button type="button" class="filter-chip"
-                    [class.active]="refreshIntervalMs() === o.ms" (click)="setRefresh(o.ms)">
-                    {{ o.label }}
-                  </button>
+          <div class="explorer-head">
+            <h2 class="section-title">Usage over time</h2>
+            <div class="explorer-toggles">
+              <div class="seg">
+                @for (d of tsDims; track d.key) {
+                  <button type="button" class="seg-btn" [class.active]="tsDim() === d.key"
+                    (click)="tsDim.set(d.key)">{{ d.label }}</button>
+                }
+              </div>
+              <div class="seg">
+                @for (m of tsMetrics; track m.key) {
+                  <button type="button" class="seg-btn" [class.active]="tsMetric() === m.key"
+                    (click)="tsMetric.set(m.key)">{{ m.label }}</button>
                 }
               </div>
             </div>
-            <span class="total"
-              >Total: {{ fmtCost(summary()?.total_cost_usd ?? 0) }}</span
-            >
+          </div>
+
+          @if (chart(); as c) {
+            <div class="explorer-body">
+              <div class="ts-chart">
+                <svg class="ts-svg" viewBox="0 0 720 180" preserveAspectRatio="none">
+                  @for (g of c.grid; track g) {
+                    <line class="grid-line" x1="0" [attr.y1]="g" x2="720" [attr.y2]="g" />
+                  }
+                  @for (b of c.bars; track $index) {
+                    <rect [attr.x]="b.x" [attr.y]="b.y" [attr.width]="b.w" [attr.height]="b.h"
+                      [attr.fill]="b.color"><title>{{ b.title }}</title></rect>
+                  }
+                </svg>
+                <div class="ts-xaxis">
+                  @for (l of c.xLabels; track l.text) {
+                    <span class="ts-xlabel" [style.left.%]="l.pct">{{ l.text }}</span>
+                  }
+                </div>
+              </div>
+              <div class="ts-side">
+                <div class="donut-wrap">
+                  <svg class="donut-svg" viewBox="0 0 120 120">
+                    @for (s of donut(); track s.key) {
+                      <circle cx="60" cy="60" r="50" fill="none" [attr.stroke]="s.color"
+                        stroke-width="16" [attr.stroke-dasharray]="s.dash"
+                        [attr.stroke-dashoffset]="s.offset"
+                        transform="rotate(-90 60 60)"><title>{{ s.title }}</title></circle>
+                    }
+                  </svg>
+                  <div class="donut-center">
+                    <span class="donut-total">{{ c.grandLabel }}</span>
+                    <span class="donut-cap">{{ metricLabel() }}</span>
+                  </div>
+                </div>
+                <ul class="legend">
+                  @for (l of c.legend; track l.key) {
+                    <li class="legend-item">
+                      <span class="swatch" [style.background]="l.color"></span>
+                      <span class="lg-label">{{ l.label }}</span>
+                      <span class="lg-val">{{ fmtMetric(l.total) }}</span>
+                    </li>
+                  }
+                </ul>
+              </div>
+            </div>
+          } @else {
+            <p class="empty-state">No time-series usage in this window.</p>
+          }
+        </section>
+
+        <section class="admin-section">
+          <div class="section-head">
+            <h2 class="section-title">By category</h2>
+            <span class="total">Total: {{ fmtCost(summary()?.total_cost_usd ?? 0) }}</span>
           </div>
 
           @if (usage.loading()) {
@@ -233,7 +302,73 @@ import {AgentStatistics, DailyStatistics, JobStatistics} from '../../../core/mod
         display: flex;
         align-items: center;
         gap: 12px;
+        flex-wrap: wrap;
         margin-bottom: 8px;
+      }
+      .page-controls {
+        margin-left: auto;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        flex-wrap: wrap;
+        justify-content: flex-end;
+      }
+      .scope-switch {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        cursor: pointer;
+        user-select: none;
+        font-size: 12px;
+        font-weight: 600;
+        color: var(--text-muted);
+      }
+      .scope-switch input {
+        position: absolute;
+        opacity: 0;
+        width: 0;
+        height: 0;
+      }
+      .switch-track {
+        position: relative;
+        width: 34px;
+        height: 18px;
+        border-radius: 999px;
+        background: var(--surface-0);
+        border: 1px solid var(--border-color);
+        transition: background 0.15s, border-color 0.15s;
+        flex: 0 0 auto;
+      }
+      .switch-thumb {
+        position: absolute;
+        top: 1px;
+        left: 1px;
+        width: 14px;
+        height: 14px;
+        border-radius: 50%;
+        background: var(--text-muted);
+        transition: transform 0.15s, background 0.15s;
+      }
+      .scope-switch.on .switch-track {
+        background: var(--accent-color);
+        border-color: var(--accent-color);
+      }
+      .scope-switch.on .switch-thumb {
+        transform: translateX(16px);
+        background: var(--on-accent);
+      }
+      .scope-switch.on .switch-label {
+        color: var(--text-primary);
+      }
+      .section-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        margin-bottom: 12px;
+      }
+      .section-head .section-title {
+        margin: 0;
       }
       .page-title {
         font-size: 24px;
@@ -251,32 +386,6 @@ import {AgentStatistics, DailyStatistics, JobStatistics} from '../../../core/mod
         border-radius: var(--radius-lg);
         padding: 24px;
         margin-bottom: 24px;
-      }
-      .usage-toolbar {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        gap: 12px;
-        margin-bottom: 16px;
-      }
-      .filters {
-        display: inline-flex;
-        gap: 6px;
-      }
-      .filter-chip {
-        border: 1px solid var(--border-color);
-        background: var(--surface-0);
-        color: var(--text-muted);
-        border-radius: var(--radius-surface);
-        padding: 4px 12px;
-        font-size: 12px;
-        font-weight: 500;
-        cursor: pointer;
-      }
-      .filter-chip.active {
-        background: var(--accent-color);
-        color: var(--on-accent);
-        border-color: var(--accent-color);
       }
       .total {
         font-size: 13px;
@@ -444,6 +553,150 @@ import {AgentStatistics, DailyStatistics, JobStatistics} from '../../../core/mod
         font-variant-numeric: tabular-nums;
         color: var(--text-primary);
       }
+      .explorer-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        flex-wrap: wrap;
+        margin-bottom: 16px;
+      }
+      .explorer-toggles {
+        display: inline-flex;
+        gap: 8px;
+      }
+      .seg {
+        display: inline-flex;
+        border: 1px solid var(--border-color);
+        border-radius: var(--radius-surface);
+        overflow: hidden;
+      }
+      .seg-btn {
+        border: 0;
+        border-right: 1px solid var(--border-color);
+        background: var(--surface-0);
+        color: var(--text-muted);
+        padding: 4px 12px;
+        font-size: 12px;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      .seg-btn:last-child {
+        border-right: 0;
+      }
+      .seg-btn.active {
+        background: var(--accent-color);
+        color: var(--on-accent);
+      }
+      .explorer-body {
+        display: flex;
+        gap: 24px;
+        align-items: stretch;
+        flex-wrap: wrap;
+      }
+      .ts-chart {
+        flex: 1 1 360px;
+        min-width: 0;
+        display: flex;
+        flex-direction: column;
+      }
+      .ts-svg {
+        width: 100%;
+        height: 200px;
+        display: block;
+      }
+      .grid-line {
+        stroke: var(--border-color);
+        stroke-width: 1;
+        opacity: 0.5;
+      }
+      .ts-svg rect {
+        transition: opacity 0.15s;
+      }
+      .ts-svg rect:hover {
+        opacity: 0.82;
+      }
+      .ts-xaxis {
+        position: relative;
+        height: 14px;
+        margin-top: 6px;
+      }
+      .ts-xlabel {
+        position: absolute;
+        transform: translateX(-50%);
+        font-size: 10px;
+        color: var(--text-muted);
+        white-space: nowrap;
+      }
+      .ts-side {
+        flex: 0 0 200px;
+        display: flex;
+        flex-direction: column;
+        gap: 16px;
+      }
+      .donut-wrap {
+        position: relative;
+        width: 140px;
+        height: 140px;
+        align-self: center;
+      }
+      .donut-svg {
+        width: 140px;
+        height: 140px;
+        display: block;
+      }
+      .donut-center {
+        position: absolute;
+        inset: 0;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        pointer-events: none;
+      }
+      .donut-total {
+        font-size: 18px;
+        font-weight: 700;
+        color: var(--text-primary);
+        font-variant-numeric: tabular-nums;
+      }
+      .donut-cap {
+        font-size: 10px;
+        color: var(--text-muted);
+        text-transform: uppercase;
+        letter-spacing: 0.4px;
+      }
+      .legend {
+        list-style: none;
+        margin: 0;
+        padding: 0;
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+      }
+      .legend-item {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 12px;
+      }
+      .swatch {
+        width: 10px;
+        height: 10px;
+        border-radius: 2px;
+        flex: 0 0 auto;
+      }
+      .lg-label {
+        flex: 1;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        color: var(--text-primary);
+      }
+      .lg-val {
+        color: var(--text-muted);
+        font-variant-numeric: tabular-nums;
+      }
     `,
   ],
 })
@@ -508,6 +761,205 @@ export class AdminUsageComponent implements OnInit, OnDestroy {
     }));
   });
 
+  // ---- Usage-over-time explorer (stacked timeline + composition donut) ----
+  readonly tsDims = [
+    {key: 'model', label: 'Model'},
+    {key: 'user', label: 'User'},
+    {key: 'project', label: 'Project'},
+  ] as const;
+  readonly tsMetrics = [
+    {key: 'tokens', label: 'Tokens'},
+    {key: 'cost', label: 'Cost'},
+    {key: 'events', label: 'Events'},
+  ] as const;
+  readonly tsDim = signal<BreakdownDim>('model');
+  readonly tsMetric = signal<'tokens' | 'cost' | 'events'>('tokens');
+  private readonly PALETTE = ['#6366f1', '#22d3ee', '#f59e0b', '#ef4444', '#10b981', '#a855f7'];
+  private readonly OTHER_COLOR = '#64748b';
+  private readonly TOP_N = 6;
+
+  /** Builds stacked-bar geometry (viewBox 720×180), legend and totals for the
+   * selected dimension + metric. Top-N series keep distinct colors; the rest roll
+   * into a single "Other" band. Returns null when the window has no series. */
+  readonly chart = computed(() => {
+    const ts = this.usage.timeseries(this.tsDim());
+    const days = ts?.days ?? [];
+    const rawSeries = ts?.series ?? [];
+    if (!days.length || !rawSeries.length) return null;
+
+    const metric = this.tsMetric();
+    const val = (p: UsageTsPoint) =>
+      metric === 'tokens' ? p.tokens : metric === 'cost' ? p.cost_usd : p.events;
+
+    const totals = rawSeries
+      .map((s) => ({s, total: s.points.reduce((a, p) => a + val(p), 0)}))
+      .sort((a, b) => b.total - a.total);
+    const top = totals.slice(0, this.TOP_N);
+    const rest = totals.slice(this.TOP_N);
+
+    const legend = top.map((t, i) => ({
+      key: t.s.key,
+      label: t.s.label,
+      color: this.PALETTE[i % this.PALETTE.length],
+      total: t.total,
+    }));
+    if (rest.length) {
+      legend.push({
+        key: '__other__',
+        label: `Other (${rest.length})`,
+        color: this.OTHER_COLOR,
+        total: rest.reduce((a, t) => a + t.total, 0),
+      });
+    }
+    const grandTotal = legend.reduce((a, l) => a + l.total, 0);
+
+    const colorOf = new Map(legend.map((l) => [l.key, l.color]));
+    const labelOf = new Map(legend.map((l) => [l.key, l.label]));
+    const topByDay = top.map((t) => {
+      const m = new Map<string, number>();
+      for (const p of t.s.points) m.set(p.day, val(p));
+      return {key: t.s.key, m};
+    });
+    const restByDay = new Map<string, number>();
+    for (const t of rest) {
+      for (const p of t.s.points) restByDay.set(p.day, (restByDay.get(p.day) ?? 0) + val(p));
+    }
+
+    const columns = days.map((day) => {
+      const segs: {key: string; value: number}[] = [];
+      let total = 0;
+      for (const tb of topByDay) {
+        const v = tb.m.get(day) ?? 0;
+        if (v > 0) {
+          segs.push({key: tb.key, value: v});
+          total += v;
+        }
+      }
+      const ov = restByDay.get(day) ?? 0;
+      if (ov > 0) {
+        segs.push({key: '__other__', value: ov});
+        total += ov;
+      }
+      return {day, segs, total};
+    });
+    const maxTotal = Math.max(1, ...columns.map((c) => c.total));
+
+    const W = 720;
+    const H = 180;
+    const colW = W / days.length;
+    const gap = days.length > 45 ? 0.5 : days.length > 20 ? 1.5 : 3;
+    const barW = Math.max(1, colW - gap);
+    const bars: {x: number; y: number; w: number; h: number; color: string; title: string}[] = [];
+    columns.forEach((c, ci) => {
+      const x = ci * colW + (colW - barW) / 2;
+      let yTop = H;
+      for (const seg of c.segs) {
+        const h = (seg.value / maxTotal) * H;
+        yTop -= h;
+        bars.push({
+          x,
+          y: yTop,
+          w: barW,
+          h,
+          color: colorOf.get(seg.key) ?? this.OTHER_COLOR,
+          title: `${c.day} · ${labelOf.get(seg.key) ?? seg.key}: ${this.fmtMetric(seg.value)}`,
+        });
+      }
+    });
+
+    const want = Math.min(6, days.length);
+    const step = (days.length - 1) / Math.max(1, want - 1);
+    const xLabels: {pct: number; text: string}[] = [];
+    const seen = new Set<number>();
+    for (let i = 0; i < want; i++) {
+      const idx = Math.round(i * step);
+      if (seen.has(idx)) continue;
+      seen.add(idx);
+      xLabels.push({pct: ((idx + 0.5) / days.length) * 100, text: days[idx].slice(5)});
+    }
+    const grid = [0.25, 0.5, 0.75].map((f) => f * H);
+
+    return {bars, xLabels, grid, legend, grandTotal, grandLabel: this.fmtShort(grandTotal)};
+  });
+
+  /** Composition donut segments (stroke-dasharray technique) sharing chart()'s legend. */
+  readonly donut = computed(() => {
+    const c = this.chart();
+    if (!c || c.grandTotal <= 0) return [];
+    const C = 2 * Math.PI * 50;
+    let off = 0;
+    return c.legend
+      .filter((l) => l.total > 0)
+      .map((l) => {
+        const frac = l.total / c.grandTotal;
+        const seg = {
+          key: l.key,
+          color: l.color,
+          dash: `${frac * C} ${C - frac * C}`,
+          offset: off ? -off : 0,
+          title: `${l.label}: ${(frac * 100).toFixed(1)}%`,
+        };
+        off += frac * C;
+        return seg;
+      });
+  });
+
+  metricLabel(): string {
+    return this.tsMetrics.find((m) => m.key === this.tsMetric())?.label ?? '';
+  }
+
+  fmtMetric(n: number): string {
+    return this.tsMetric() === 'cost' ? this.fmtCost(n) : this.fmtQty(n);
+  }
+
+  fmtShort(n: number): string {
+    if (this.tsMetric() === 'cost') return this.fmtCost(n);
+    const a = Math.abs(n);
+    if (a >= 1e9) return (n / 1e9).toFixed(1) + 'B';
+    if (a >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+    if (a >= 1e3) return (n / 1e3).toFixed(1) + 'k';
+    return String(Math.round(n));
+  }
+
+  // ---- Page-level scope override (admin "All data" switch) ----
+  // Reuses the global view-as header (see view-as.interceptor): 'all' suppresses
+  // it (fleet view), 'mine' forces it (self) — so this page can override the
+  // admin's global "view as me" mode WITHOUT a backend change. Persisted per-user
+  // in localStorage so the choice sticks. Non-admins are always self-scoped → null.
+  private readonly SCOPE_KEY = 'srw.usageViewAll';
+  readonly viewAllData = signal<boolean>(this.loadViewAllPref());
+  readonly scopeOverride = computed<'all' | 'mine' | null>(() =>
+    this.isAdmin() ? (this.viewAllData() ? 'all' : 'mine') : null,
+  );
+
+  private scopeStorageKey(): string {
+    const uid = this.users.currentUserId();
+    return uid ? `${this.SCOPE_KEY}.${uid}` : this.SCOPE_KEY;
+  }
+  private loadViewAllPref(): boolean {
+    try {
+      const v = localStorage.getItem(this.scopeStorageKey());
+      return v === null ? true : v === 'true'; // default: view all (fleet)
+    } catch {
+      return true;
+    }
+  }
+  setViewAllData(ev: Event): void {
+    const on = (ev.target as HTMLInputElement).checked;
+    this.viewAllData.set(on);
+    try {
+      localStorage.setItem(this.scopeStorageKey(), String(on));
+    } catch {
+      /* localStorage unavailable — choice holds for this session only */
+    }
+    this.reloadAll();
+  }
+  scopeHint(): string {
+    return this.viewAllData()
+      ? 'Showing all usage — overrides your global view-as-me mode on this page'
+      : 'Showing only your own usage on this page';
+  }
+
   readonly refreshOptions = [
     {label: 'Off', ms: 0}, {label: '10s', ms: 10000},
     {label: '30s', ms: 30000}, {label: '1m', ms: 60000},
@@ -528,12 +980,16 @@ export class AdminUsageComponent implements OnInit, OnDestroy {
   /** Single funnel every panel's loader goes through (used by auto-refresh + window change). */
   reloadAll(): void {
     const d = this.windowDays();
-    this.usage.loadUsage(d);
+    const scope = this.scopeOverride();
+    this.usage.loadUsage(d, scope);
     this.api.getJobStatistics().subscribe((s) => this.jobStats.set(s));
     if (this.isAdmin()) this.api.getAgentStatistics().subscribe((s) => this.agentStats.set(s));
-    this.usage.loadBreakdown('user', d);
-    this.usage.loadBreakdown('model', d);
-    this.usage.loadBreakdown('project', d);
+    this.usage.loadBreakdown('user', d, scope);
+    this.usage.loadBreakdown('model', d, scope);
+    this.usage.loadBreakdown('project', d, scope);
+    this.usage.loadTimeseries('user', d, scope);
+    this.usage.loadTimeseries('model', d, scope);
+    this.usage.loadTimeseries('project', d, scope);
     this.api.getDailyStatistics(d).subscribe((stats) => this.daily.set(stats));
   }
 
