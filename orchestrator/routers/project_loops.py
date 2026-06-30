@@ -29,6 +29,12 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/projects", tags=["Project Loops"])
 
+# Workspace tiers a loop may pin for every spawned job. Mirrors the validated
+# set in migration 0041 and the backends the dispatcher understands. `vm` is the
+# headline case; lite tiers are accepted but conflict with a repository
+# datasource at dispatch (the loop usually attaches one).
+_LOOP_WORKSPACE_BACKENDS = frozenset({"sandbox", "vm", "virtual", "none"})
+
 
 class ProjectLoopStart(BaseModel):
     """Request body for ``POST /api/projects/{project_id}/loop``.
@@ -46,6 +52,9 @@ class ProjectLoopStart(BaseModel):
     user_prompt: str | None = Field(None, max_length=8000)
     goal_override: str | None = Field(None, max_length=8000)
     max_consecutive_failures: int = Field(3, ge=1, le=50)
+    # Optional per-loop workspace tier for every spawned job (mirrors `model`).
+    # Blank/None = default sandbox; "vm" gives every role a root VM.
+    workspace_backend: str | None = Field(None, max_length=20)
 
 
 @router.post("/{project_id}/loop", status_code=status.HTTP_201_CREATED)
@@ -87,6 +96,25 @@ async def start_project_loop(
             detail="role_sequence must be a non-empty list of expert config names.",
         )
 
+    # Workspace tier override (mirrors `model`). Normalise blank → None; reject
+    # unknown tiers up front. If `vm`, enforce the same VM permission the
+    # dispatcher would (kill-switch + can_use_vm) so a doomed loop fails loud at
+    # start instead of every spawned job dying at dispatch.
+    workspace_backend = (body.workspace_backend or "").strip().lower() or None
+    if (
+        workspace_backend is not None
+        and workspace_backend not in _LOOP_WORKSPACE_BACKENDS
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="workspace_backend must be one of "
+            f"{sorted(_LOOP_WORKSPACE_BACKENDS)}.",
+        )
+    if workspace_backend == "vm":
+        from main import _check_vm_permission  # late import: avoid circular
+
+        await _check_vm_permission(caller, job_needs_vm=True)
+
     if await postgres_db.get_active_project_loop(project_id):
         raise HTTPException(
             status_code=409,
@@ -109,6 +137,7 @@ async def start_project_loop(
         max_iterations=body.max_iterations,
         run_until=run_until,
         max_consecutive_failures=body.max_consecutive_failures,
+        workspace_backend=workspace_backend,
     )
 
     # Spawn the first job and point the loop at it. If the first spawn fails,

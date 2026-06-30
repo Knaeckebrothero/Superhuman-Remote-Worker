@@ -9360,12 +9360,15 @@ class PostgresDB:
         max_iterations: int | None = None,
         run_until: datetime | None = None,
         max_consecutive_failures: int = 3,
+        workspace_backend: str | None = None,
     ) -> Dict[str, Any]:
         """Insert a project_loop control row in 'running' status.
 
         ``remaining_iterations`` is seeded from ``max_iterations``. At least one
         of ``max_iterations`` / ``run_until`` must be set (DB CHECK enforces it
         too). The caller (router) validates the budget before calling.
+        ``workspace_backend`` (optional) is the per-loop workspace tier override
+        injected into every spawned job's config_override (mirrors ``model``).
         """
         roles = role_sequence or ["scholar", "critic", "developer"]
         async with self.acquire() as conn:
@@ -9376,14 +9379,14 @@ class PostgresDB:
                     goal, acceptance_criteria, user_prompt, model,
                     role_sequence, seq_index,
                     max_iterations, remaining_iterations, run_until,
-                    max_consecutive_failures
+                    max_consecutive_failures, workspace_backend
                 )
                 VALUES (
                     $1, $2, 'running',
                     $3, $4, $5, $6,
                     $7::jsonb, 0,
                     $8, $8, $9,
-                    $10
+                    $10, $11
                 )
                 RETURNING *
                 """,
@@ -9397,6 +9400,7 @@ class PostgresDB:
                 max_iterations,
                 run_until,
                 max_consecutive_failures,
+                workspace_backend,
             )
         return self._project_loop_row_to_dict(row)
 
@@ -9465,6 +9469,7 @@ class PostgresDB:
             "remaining_iterations",
             "run_until",
             "max_consecutive_failures",
+            "workspace_backend",
             "current_job_id",
             "total_jobs_run",
             "consecutive_failures",
