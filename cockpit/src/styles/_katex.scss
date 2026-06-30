@@ -1,0 +1,16 @@
+// Global presentation tweaks for KaTeX-rendered math inside <markdown> (chat).
+// The KaTeX stylesheet itself ships via angular.json `styles`; this only governs
+// how a rendered equation sits in the chat column. Math colour already inherits
+// the surrounding text via `currentColor`, so the dark theme needs no override.
+
+.katex-display {
+    // Wide display math (\frac stacks, long aligned blocks) would otherwise grow
+    // the chat column or overflow the viewport — let one equation scroll instead.
+    overflow-x: auto;
+    overflow-y: hidden;
+    // Tighten KaTeX's default 1em block margin so display math doesn't open an
+    // oversized gap between chat paragraphs.
+    margin: 0.5em 0;
+    // Reserve room for the horizontal scrollbar so it never clips the formula.
+    padding-bottom: 0.25em;
+}

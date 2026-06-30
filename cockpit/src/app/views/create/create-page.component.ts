@@ -34,7 +34,7 @@ import { JobCreateComponent } from './job-create.component';
         flex-shrink: 0;
       }
 
-      .page-toggle:empty {
+      .page-toggle:not(:has(.sidebar-toggle)) {
         display: none;
       }
 
