@@ -680,14 +680,18 @@ class TestUsageLedger:
                     ev("gemma", 10, "prompt-token", "a3", d_a),
                 ]
             )
-            window = dict(from_ts=base - timedelta(days=2), to_ts=base + timedelta(days=2))
+            window = dict(
+                from_ts=base - timedelta(days=2), to_ts=base + timedelta(days=2)
+            )
             rows = await ledger.query_timeseries(group_by="model", **window)
             by = {(r["day"], r["key"]): r for r in rows}
             day_a, day_b = d_a.date().isoformat(), d_b.date().isoformat()
             # tokens = prompt + completion summed; rows ascend by day
             assert by[(day_b, "opus")]["tokens"] == 120.0
             assert by[(day_b, "opus")]["events"] == 2
-            assert by[(day_a, "opus")]["tokens"] == 40.0  # vcpu-hour excluded from tokens
+            assert (
+                by[(day_a, "opus")]["tokens"] == 40.0
+            )  # vcpu-hour excluded from tokens
             assert by[(day_a, "opus")]["events"] == 2  # but still counted as an event
             assert by[(day_a, "gemma")]["tokens"] == 10.0
             assert [r["day"] for r in rows] == sorted(r["day"] for r in rows)
@@ -947,9 +951,27 @@ class TestBreakdownFold:
         from orchestrator.main import _build_timeseries
 
         rows = [
-            {"day": "2026-06-01", "key": "opus", "tokens": 100.0, "cost_usd": 0.0, "events": 1},
-            {"day": "2026-06-02", "key": "opus", "tokens": 50.0, "cost_usd": 0.0, "events": 1},
-            {"day": "2026-06-01", "key": "gemma", "tokens": 10.0, "cost_usd": 0.0, "events": 3},
+            {
+                "day": "2026-06-01",
+                "key": "opus",
+                "tokens": 100.0,
+                "cost_usd": 0.0,
+                "events": 1,
+            },
+            {
+                "day": "2026-06-02",
+                "key": "opus",
+                "tokens": 50.0,
+                "cost_usd": 0.0,
+                "events": 1,
+            },
+            {
+                "day": "2026-06-01",
+                "key": "gemma",
+                "tokens": 10.0,
+                "cost_usd": 0.0,
+                "events": 3,
+            },
         ]
         out = _build_timeseries(rows, {"opus": {"label": "Opus 4"}})
         assert out["days"] == ["2026-06-01", "2026-06-02"]  # sorted union of buckets
