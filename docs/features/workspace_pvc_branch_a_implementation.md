@@ -13,7 +13,8 @@ cannot leak. Verified end-to-end against the live orchestrator on k3d.
 | **0 — the flip** | PVC-back job workspaces (flag-gated, jobs-only) | ✅ done + k3d-verified |
 | **1 — GC discipline** | terminal delete + give_up gating + backstop `reap_orphans` | ✅ done + k3d-verified |
 | **2 — crash-recovery reattach** | workspace-lost job re-dispatches → reattaches PVC → agent resumes on the files | ✅ **COMPLETE + full-E2E-verified (2026-06-29)** — G1+G2 (wedge eliminated, bounded fail-loud, working-tree preserved) + **Option 1 stable-DNS Service** (commit `7fb9e9e2`) fixing the ephemeral-IP churn. **Full real-job E2E PASSED** (job `b4025433`): killed a running job's pod → re-dispatched via pod arm (`vm.requested` null) → new pod reattached PVC + same DNS → agent resumed from checkpoint, sentinel survived, job back to `processing` not failed. Minor non-blocking follow-up: ~2.7 min reconnect-loop delay before recovery triggers → `workspace_reattach_ephemeral_ip_reconnect_churn.md`. See §Phase 2 |
-| **3 — prod hardening** | RWO dead-node detach-wait + S3 fallback + ResourceQuota | ⏳ pending (Longhorn-only; irrelevant on k3d/local-path) |
+| **3a — capacity guard** | per-class `ResourceQuota` on the ephemeral storage class (caps total storage **and** PVC count) + fail-closed clear-error on 403 | ✅ **done + k3d-verified (2026-06-30)** — **universal** (every substrate); helm-configurable, default off. See §Phase 3a |
+| **3b — dead-node hardening** | RWO dead-node detach-wait + S3 fallback | ⏳ pending — **Longhorn/multi-node only**; does NOT reproduce on single-node local-path. Validate on homelab, not this k3d. See §Phase 3b |
 | **rollout** | flag default-off in-chart; **ON in k3d dev**; dev-soak → prod flip | ⏳ pending |
 
 **Decision: LOCKED — Branch (a), scoped to job (worker/loop) pods for v1.** This
@@ -301,17 +302,111 @@ job S3 snapshot becomes **DR-only** (kept, not removed).
 
 ---
 
-## Phase 3 — prod hardening (pending; Longhorn-only)
+## Phase 3 — split by storage substrate
 
-- **RWO dead-node detach** (does NOT reproduce on k3d/local-path — Gotcha #4):
-  when the old pod's node is dead, K8s holds a stale `VolumeAttachment` and the
-  new pod's mount blocks. Add a bounded detach-wait in the recreate path; on
-  timeout, fall back to S3-restore onto a healthy node (Longhorn `auto-salvage` +
-  2nd replica means the *data* survives a node loss; only the *attach* needs
-  forcing).
-- **Capacity guard:** a `ResourceQuota` on `requests.storage` (~1 Ti) in the
-  workspace namespace — runaway/leak ceiling under the ~4.2 TB fleet (10Gi × 2
-  replicas ≈ 210 concurrent). Pairs with the backstop reaper.
+Phase 3 is **two independent things**, and which one an operator needs is
+decided by their storage substrate — not by deployment size. Treating them as
+one "prod hardening" block was the wrong framing.
+
+| Item | Who needs it | Reproduces on this k3d? | State |
+|---|---|---|---|
+| **3a — capacity guard** | **everyone** (local-path, Longhorn, cloud) | ✅ yes | ✅ done + verified |
+| **3b — dead-node RWO detach-wait + S3 fallback** | **only** multi-node + networked-RWO (Longhorn/Ceph/EBS) | ❌ no (single node = no failover target, hostPath = no detach dance) | ⏳ pending → homelab |
+
+### Phase 3a — capacity guard (DONE + k3d-verified 2026-06-30)
+
+A namespaced **`ResourceQuota` keyed on the *ephemeral* workspace storage
+class** that caps **both** the total storage and the count of concurrent
+workspace PVCs of that class. When the cap is hit, `_create_pvc` gets a **403**,
+fails closed (no pod, no emptyDir fallback — capacity exhaustion must never
+silently drop durability), and logs a **distinct** `Workspace capacity quota
+exceeded …` line so an operator/alert can tell "fleet at capacity" from a real
+infra failure (which logs the generic `Failed to create PVC`).
+
+**Why per-storage-class, not namespace-wide `requests.storage`:** a namespace
+quota would conflate workspace PVCs with the platform's own ~15 data PVCs
+(Postgres, Mongo, Neo4j, Gitea, OpenCloud, …), forcing the operator to track a
+moving platform baseline. A per-class quota bounds *workspace* storage in
+isolation — **but only if `ephemeralStorageClass` is dedicated to workspaces.**
+On prod `longhorn-ephemeral` already is. On single-node/local-path the platform
+*and* workspaces share `local-path` by default, so a local-path operator who
+wants the quota should create a **dedicated local-path-backed class** (same
+`rancher.io/local-path` provisioner, distinct name) and point
+`ephemeralStorageClass` at it. (Without a dedicated class the quota still works
+but also counts platform PVCs — usually not what you want.)
+
+**Implementation:**
+- `helm/templates/workspace-resourcequota.yaml` — renders the quota only when
+  `workspace.pvcEnabled && workspace.resourceQuota.enabled`; `required`-guards a
+  non-empty `ephemeralStorageClass` (a quota can't key on an empty class).
+- `helm/values.yaml` — `workspace.resourceQuota.{enabled:false, maxStorage:200Gi,
+  maxCount:20}`. No configmap/env wiring needed — the quota is a pure apiserver
+  object; the orchestrator only ever *sees* the resulting 403.
+- `container_provisioner.py` `_create_pvc` — a `403` branch logs the distinct
+  capacity error and returns `False` (the existing fail-closed in
+  `create_workspace` then aborts before the pod). `409` (reattach) and other
+  errors are unchanged.
+
+**k3d verification (2026-06-30, non-disruptive — throwaway dedicated class, never
+touched the shared orchestrator):**
+- `helm template` renders correct per-class resource names
+  (`<class>.storageclass.storage.k8s.io/requests.storage` + `…/persistentvolumeclaims`);
+  renders nothing when disabled; errors with the `required` message when the
+  class is empty.
+- **Count cap (maxCount=1):** PVC #1 created and **`Pending` under
+  WaitForFirstConsumer yet already `used=1`** (proves a PVC consumes quota at
+  admission, *before* a pod schedules — exactly the orchestrator's create-PVC-
+  then-pod order); PVC #2 → `403 Forbidden: exceeded quota …
+  persistentvolumeclaims=1, used=1, limited=1`.
+- **Storage cap (maxStorage=1Gi):** PVC #1 (1Gi) fills it; PVC #2 →
+  `403 Forbidden: exceeded quota … requests.storage=1Gi, used=1Gi, limited=1Gi`.
+- Unit: `test_pvc_quota_403_fails_closed_with_capacity_log` (403 → `False`, no
+  pod, `status=failed`, capacity log fires).
+
+**Deferred nicety (non-blocking):** the *job-facing* error is still the generic
+"PVC creation failed"; only the orchestrator *log* says "capacity quota
+exceeded." Threading a capacity reason into the job context would need a richer
+`_create_pvc` return; left for later since the operator signal (log/alert) is
+the one that matters for a capacity event and fail-closed is already safe.
+
+### Phase 3b — dead-node RWO detach-wait + S3 fallback (pending; Longhorn/multi-node only)
+
+Does **not** reproduce on this k3d (Gotcha #4: single node = nowhere to fail
+over; `local-path` = hostPath bind-mount = no `VolumeAttachment` detach dance).
+On **multi-node networked-RWO** (Longhorn/Ceph/cloud-EBS) when the old pod's
+node dies, K8s holds a stale `VolumeAttachment` on the dead node and the new
+pod's mount **blocks** until it's force-detached (the *data* survives via
+Longhorn replicas + `auto-salvage`; only the *attach* hangs). Plan: a bounded
+detach-wait in the recreate path; on timeout, fall back to S3-restore onto a
+healthy node. This is **substrate-specific hardening for the prod/homelab
+Longhorn config** — validate on the homelab (real multi-node Longhorn) or a
+purpose-built multi-node-k3d + Longhorn rig, not this single-node k3d. Folds in
+the ~2.7 min reconnect-loop follow-up
+([`workspace_reattach_ephemeral_ip_reconnect_churn.md`](../issues/workspace_reattach_ephemeral_ip_reconnect_churn.md)),
+since on a node death the agent-reconnect and volume-detach latencies stack.
+
+---
+
+## Storage substrate matrix (read before choosing a deployment)
+
+The PVC feature (Phase 0/1/2) was proven on single-node `local-path` k3d, so a
+**single-server / local-path "big server" deployment is a first-class, fully
+working target today** — it does **not** need Phase 3b. What differs by
+substrate is durability and capacity semantics:
+
+| Property | `local-path` (single node / k3s) | `longhorn-ephemeral` (prod/homelab, multi-node) |
+|---|---|---|
+| Reattach after pod crash | ✅ instant (hostPath bind-mount) | ✅ (networked RWO) |
+| Node **reboot/maintenance** | ✅ data persists on disk → pods restart → PVCs reattach → jobs auto-recover (G1) | ✅ |
+| Node **permanent loss** | ❌ no replication → PVC data gone → **S3 snapshot is the only DR** | ✅ survives (replicas + `auto-salvage`); 3b forces the stale attach |
+| Per-volume **size enforcement** | ⚠️ `pvcSize` is a *hint* on a hostPath dir — a runaway workspace can overfill the node disk | ✅ enforced (block device) |
+| Capacity guard (3a) | ✅ works (use a dedicated local-path class to isolate) — but pair with **disk monitoring**, since the quota caps *requests*, not *bytes written* | ✅ works (dedicated class already) |
+| Phase 3b (dead-node detach) | n/a (no failover target) | required |
+
+**Takeaways for a local-path single-server operator:** put local-path on a big
+fast disk; rely on the S3 snapshot as your DR (no replicas to save you); enable
+3a with a dedicated workspace class **and** watch disk usage (hostPath doesn't
+hard-enforce the 10Gi). Everything else already works.
 
 ---
 
@@ -371,11 +466,12 @@ one wiring; Phase 1 closed the GC gap on the reconciler reap path.
 
 | Risk | Mitigation | Status |
 |---|---|---|
-| Orphan PVC/PV leak (the 2026-04 regression) | Delete-reclaim + inline terminal delete + backstop reaper + WARN-on-orphan + ResourceQuota | inline+backstop ✅; ResourceQuota = Phase 3 |
-| RWO mount blocks on dead-node stale VolumeAttachment | bounded detach-wait + S3 fallback | Phase 3 (Longhorn-only) |
+| Orphan PVC/PV leak (the 2026-04 regression) | Delete-reclaim + inline terminal delete + backstop reaper + WARN-on-orphan + ResourceQuota | inline+backstop ✅; ResourceQuota = Phase 3a ✅ |
+| RWO mount blocks on dead-node stale VolumeAttachment | bounded detach-wait + S3 fallback | Phase 3b (Longhorn/multi-node only) |
 | PVC bind latency on create | acceptable; only first-create, not reattach | observed fine on k3d |
 | Disk↔checkpoint ≤1-step skew on hard kill | documented residual; existing re-clone/re-read gates tolerate it | Phase 2 verify; no new guard for v1 |
-| Capacity exhaustion | ResourceQuota + backstop reaper | Phase 3 |
+| Capacity exhaustion | per-class ResourceQuota (caps storage+count) + fail-closed + backstop reaper | Phase 3a ✅ (k3d-verified) |
+| local-path has no replication / no hard size enforcement | S3 snapshot = DR; dedicated class + disk monitoring | documented (§Storage substrate matrix) |
 
 ## Non-goals (v1)
 
