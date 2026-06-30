@@ -2,9 +2,8 @@
 
 ## Status (2026-06-30)
 
-**Phases 0, 1, 2, and 3a are BUILT, unit/k3d-E2E-verified, and committed on
-`develop`** (latest `45eee2b1`); **the 3b node-loss fallback is also built and
-unit-verified** (uncommitted). The PVC feature is functionally complete for
+**Phases 0, 1, 2, 3a, and 3b are BUILT, unit/k3d-E2E-verified, and committed on
+`develop`** (latest `a9485f21`; Phase 3b code is `868bfd32`). The PVC feature is functionally complete for
 single-node/local-path and prod/Longhorn alike: a job workspace gets a PVC named
 by its UUID, files survive a pod crash (reattach by name), a crashed job
 **auto-resumes** on the reattached volume from its Postgres checkpoint (reached
@@ -15,7 +14,8 @@ homelab validation of 3b** (the real stuck-attach can't be triggered on
 single-node k3d) **and the prod flip.** A live finding reframed 3b — the workspace
 class is single-replica, so node-loss recovery is a *discard → fresh volume →
 Gitea/checkpoint resume* fallback, not the originally-planned detach-wait. Flag is
-default-off in-chart (zero behavior change on merge); ON in k3d dev.
+default-off in-chart (zero behavior change on merge); **ON in k3d dev and on the
+homelab soak** (ns `superhuman-remote-worker`, enabled in `a9485f21`).
 
 | Phase | Scope | State |
 |---|---|---|
@@ -23,8 +23,8 @@ default-off in-chart (zero behavior change on merge); ON in k3d dev.
 | **1 — GC discipline** | terminal delete + give_up gating + backstop `reap_orphans` | ✅ done + k3d-verified |
 | **2 — crash-recovery reattach** | workspace-lost job re-dispatches → reattaches PVC → agent resumes on the files | ✅ **COMPLETE + full-E2E-verified (2026-06-29)** — G1+G2 (wedge eliminated, bounded fail-loud, working-tree preserved) + **Option 1 stable-DNS Service** (commit `7fb9e9e2`) fixing the ephemeral-IP churn. **Full real-job E2E PASSED** (job `b4025433`): killed a running job's pod → re-dispatched via pod arm (`vm.requested` null) → new pod reattached PVC + same DNS → agent resumed from checkpoint, sentinel survived, job back to `processing` not failed. Minor non-blocking follow-up: ~2.7 min reconnect-loop delay before recovery triggers → `workspace_reattach_ephemeral_ip_reconnect_churn.md`. See §Phase 2 |
 | **3a — capacity guard** | per-class `ResourceQuota` on the ephemeral storage class (caps total storage **and** PVC count) + fail-closed clear-error on 403 | ✅ **done + k3d-verified (2026-06-30)** — **universal** (every substrate); helm-configurable, default off. See §Phase 3a |
-| **3b — node-loss fallback** | single-replica reattach-wedge → discard PVC → fresh volume → Gitea/checkpoint resume (extended reattach wait + kill-switch; triple-gated discard) | ✅ **BUILT + unit-verified (2026-06-30)** — live finding: `longhorn-ephemeral` is single-replica, so it's a fresh-volume fallback, **not** detach-wait. Homelab node-loss validation deferred (can't trigger the real stuck-attach on single-node k3d). See §Phase 3b |
-| **rollout** | flag default-off in-chart; **ON in k3d dev**; dev-soak → prod flip | ⏳ pending |
+| **3b — node-loss fallback** | single-replica reattach-wedge → discard PVC → fresh volume → Gitea/checkpoint resume (extended reattach wait + kill-switch; triple-gated discard) | ✅ **BUILT + committed (`868bfd32`, 2026-06-30)** — live finding: `longhorn-ephemeral` is single-replica, so it's a fresh-volume fallback, **not** detach-wait. Homelab PVC soak now **ON** (`a9485f21`); real node-loss validation pending (single-node k3d can't trigger the stuck-attach — runbook `tests/workspace_pvc_node_loss_validation.md`). See §Phase 3b |
+| **rollout** | flag default-off in-chart; **ON in k3d dev + homelab soak**; soak → prod flip | 🔄 **homelab soak in progress** (`a9485f21`) |
 
 **Decision: LOCKED — Branch (a), scoped to job (worker/loop) pods for v1.** This
 is the chosen fork of [`workspace_pvc_backed_migration.md`](workspace_pvc_backed_migration.md).
@@ -102,7 +102,12 @@ resumes the checkpoint — coherent by construction, no snapshot/restore dance.
 > Phase 2 (Option 1) files: `container_provisioner.py` (headless Service) +
 > `main.py` (dispatch/resume host injection), commit `7fb9e9e2`. Phase 3a files:
 > `workspace-resourcequota.yaml` + `values.yaml` + `container_provisioner.py`
-> 403 branch, commit `45eee2b1`. See §Phase 2 / §Phase 3a.
+> 403 branch, commit `45eee2b1`. Phase 3b files: `container_provisioner.py`
+> (extended reattach wait + `_pod_volume_attach_failing` + triple-gated fresh
+> fallback) + `configmap.yaml`/`deployment.yaml`/`values.yaml` knobs, commit
+> `868bfd32`; homelab soak enable (`values-experimental.yaml`) + node-loss runbook
+> (`tests/workspace_pvc_node_loss_validation.md`), commit `a9485f21`.
+> See §Phase 2 / §Phase 3a / §Phase 3b.
 
 ```
 orchestrator/services/container_provisioner.py        flags + create_workspace flip + docstring
@@ -336,7 +341,7 @@ one "prod hardening" block was the wrong framing.
 | Item | Who needs it | Reproduces on this k3d? | State |
 |---|---|---|---|
 | **3a — capacity guard** | **everyone** (local-path, Longhorn, cloud) | ✅ yes | ✅ done + verified |
-| **3b — dead-node RWO detach-wait + S3 fallback** | **only** multi-node + networked-RWO (Longhorn/Ceph/EBS) | ❌ no (single node = no failover target, hostPath = no detach dance) | ⏳ pending → homelab |
+| **3b — single-replica node-loss → discard PVC → fresh-volume resume** (reframed from "detach-wait") | **only** multi-node + networked-RWO (Longhorn/Ceph/EBS) | ❌ no (single node = no failover target, hostPath = no detach dance) | ✅ built + committed (`868bfd32`); homelab soak ON, real node-loss validation pending |
 
 ### Phase 3a — capacity guard (DONE + k3d-verified 2026-06-30)
 
@@ -394,7 +399,7 @@ exceeded." Threading a capacity reason into the job context would need a richer
 `_create_pvc` return; left for later since the operator signal (log/alert) is
 the one that matters for a capacity event and fail-closed is already safe.
 
-### Phase 3b — single-replica node-loss fallback (BUILT 2026-06-30; homelab validation pending)
+### Phase 3b — single-replica node-loss fallback (BUILT + committed `868bfd32` 2026-06-30; homelab soak ON, real node-loss validation pending)
 
 > **Live finding that reframed this (2026-06-30, on the homelab `main` cluster):**
 > the workspace class `longhorn-ephemeral` is **`numberOfReplicas: 1`** (single
@@ -488,9 +493,13 @@ hard-enforce the 10Gi). Everything else already works.
 
 - ✅ Flag default-off in-chart (zero behavior change on merge).
 - ✅ **ON in k3d dev** (`values-local.yaml`), E2E gate steps 1-7 passed.
-- ✅ Phase 0/1/2/3a committed to `develop` (latest `45eee2b1`).
-- ⏳ Dev soak — watch orphan-PVC WARN count + storage capacity.
-- ⏳ Prod flip — only after dev soak shows zero orphan growth across a full
+- ✅ Phase 0/1/2/3a/**3b** committed to `develop` (latest `a9485f21`; 3b code `868bfd32`).
+- 🔄 **Homelab soak STARTED** (`a9485f21`) — PVC mode enabled in ns
+  `superhuman-remote-worker`. Watch orphan-PVC WARN count + storage capacity, and
+  run the 3b node-loss validation (runbook
+  `tests/workspace_pvc_node_loss_validation.md`) — the real stuck-attach can only
+  be triggered here, not on single-node k3d.
+- ⏳ Prod flip — only after the homelab soak shows zero orphan growth across a full
   create→reap→GC cycle. **Mixed fleet is safe and is the rollout mechanism** (the
   reaper reads each pod's actual volume mode), so there is no big-bang cutover;
   rollback = flip the flag off (new pods revert to emptyDir, existing PVC pods
@@ -549,7 +558,7 @@ one wiring; Phase 1 closed the GC gap on the reconciler reap path.
 | Risk | Mitigation | Status |
 |---|---|---|
 | Orphan PVC/PV leak (the 2026-04 regression) | Delete-reclaim + inline terminal delete + backstop reaper + WARN-on-orphan + ResourceQuota | inline+backstop ✅; ResourceQuota = Phase 3a ✅ |
-| RWO mount blocks on dead-node stale VolumeAttachment | bounded detach-wait + S3 fallback | Phase 3b (Longhorn/multi-node only) |
+| Single-replica node loss wedges the RWO reattach | extended reattach wait → discard wedged PVC → fresh volume → Gitea/checkpoint resume (triple-gated + kill-switch) | Phase 3b ✅ built+committed (`868bfd32`); homelab node-loss validation pending |
 | PVC bind latency on create | acceptable; only first-create, not reattach | observed fine on k3d |
 | Disk↔checkpoint ≤1-step skew on hard kill | documented residual; existing re-clone/re-read gates tolerate it | Phase 2 verify; no new guard for v1 |
 | Capacity exhaustion | per-class ResourceQuota (caps storage+count) + fail-closed + backstop reaper | Phase 3a ✅ (k3d-verified) |
