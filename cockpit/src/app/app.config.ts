@@ -9,6 +9,7 @@ import {authInterceptor} from './core/interceptors/auth.interceptor';
 import {viewAsInterceptor} from './core/interceptors/view-as.interceptor';
 import {MARKED_EXTENSIONS, MARKED_OPTIONS, provideMarkdown} from 'ngx-markdown';
 import {citationExtension} from './core/markdown/citation-extension';
+import {mathExtension} from './core/markdown/math-extension';
 import {SessionService} from './core/services/session.service';
 import {UserService} from './core/services/user.service';
 import {SettingsService} from './core/services/settings.service';
@@ -104,6 +105,12 @@ export const appConfig: ApplicationConfig = {
           provide: MARKED_EXTENSIONS,
           multi: true,
           useValue: citationExtension(),
+        },
+        {
+          // Protect LaTeX math from markdown mangling before the KaTeX pass.
+          provide: MARKED_EXTENSIONS,
+          multi: true,
+          useValue: mathExtension(),
         },
       ],
     }),

@@ -35,6 +35,18 @@ self-registration broken." Discussing it reframed the problem: registration *wor
 — what's missing is the **admission step** after it, and the current mechanism makes
 admission a manual per-user chore in the Keycloak console.
 
+> **Counterpart — the admin *privilege tier* deliberately stays in Keycloak (2026-06-30).**
+> Admission (business state) moved into the app DB; the symmetric decision for the
+> admin tier went the other way, recorded here for completeness. `users.is_admin`
+> is derived from the Keycloak `admin` realm role and reconciled onto the row on
+> every request (`orchestrator/security/auth.py`) — so admin is **granted in
+> Keycloak, not the app**. The cockpit **Admin → Users** page therefore shows the
+> Admin flag **read-only**; the former write toggle silently no-op'd (the DB write
+> was clobbered on the user's next request) and was removed. Grant/revoke via the
+> realm role: `kcadm.sh add-roles -r <realm> --uusername <name> --rolename admin`
+> (realm `srw` on dev, `home` on prod-private); the user picks it up on their next
+> token refresh / re-login.
+
 ---
 
 ## How admission works today (what led us here)

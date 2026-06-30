@@ -1220,7 +1220,7 @@ def _gateway_routing_target() -> tuple[str, str] | None:
     chart only populates it when ``litellm.enabled``). When set, **endpoint-kind**
     models are pointed here instead of straight at their upstream, so all of their
     traffic is measured at the one chokepoint (Slice 1). See
-    docs/features/usage_monitoring_and_rate_limiting.md.
+    docs/done/usage_monitoring_and_rate_limiting.md.
 
     The ``/v1`` suffix matches what the agent's OpenAI factory expects (direct
     endpoint base_urls carry it too); the orchestrator's admin/health client uses
@@ -1380,7 +1380,7 @@ def _should_route_via_gateway(meta: Any, gw_target: tuple[str, str] | None) -> b
 # jobs (pause + workspace release) AND blocks the dispatcher from re-dispatching
 # them. The two enforcement points share one in-memory set, owned by the poll
 # loop. Per-project only for v1 (the per-user activity read is unreliable); daily
-# UTC window (rolling deferred). See docs/features/usage_monitoring_and_rate_limiting.md.
+# UTC window (rolling deferred). See docs/done/usage_monitoring_and_rate_limiting.md.
 # ---------------------------------------------------------------------------
 
 # Projects currently frozen for crossing their daily quota. Rebound (not mutated)
@@ -5714,7 +5714,7 @@ async def lifespan(app: FastAPI):
     # the in-chart LiteLLM proxy so agent LLM traffic can be measured (and, in
     # later slices, rate-limited). Self-disables when LITELLM_BASE_URL is unset
     # (i.e. litellm.enabled=false), so it's a no-op on deployments without the
-    # gateway. See docs/features/usage_monitoring_and_rate_limiting.md.
+    # gateway. See docs/done/usage_monitoring_and_rate_limiting.md.
     litellm_sync_task = asyncio.create_task(
         litellm_sync_loop(_shutdown_event, postgres_db)
     )

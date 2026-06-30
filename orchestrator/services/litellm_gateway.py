@@ -2,7 +2,7 @@
 
 The gateway (an in-chart LiteLLM proxy) is the single chokepoint all agent LLM
 traffic traverses, so it can *measure* aggregate RPM/TPM and, later, *throttle*
-it (see docs/features/usage_monitoring_and_rate_limiting.md). LiteLLM only knows
+it (see docs/done/usage_monitoring_and_rate_limiting.md). LiteLLM only knows
 which upstreams exist if something registers them; on this deployment the model
 catalog is admin-curated and lives **encrypted in the app DB**, with no Secret
 copy. So the orchestrator owns the sync: it reads the catalog, decrypts each
