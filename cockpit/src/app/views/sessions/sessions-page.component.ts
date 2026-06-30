@@ -259,7 +259,7 @@ interface Project {
       flex-shrink: 0;
     }
 
-    .page-toggle:empty {
+    .page-toggle:not(:has(.sidebar-toggle)) {
       display: none;
     }
 

@@ -5,7 +5,9 @@ import {User, VmWorkspacesSetting} from '../models/api.model';
 import {environment} from '../environment';
 
 export interface AdminUserPatch {
-  is_admin?: boolean;
+  // Admin status is owned by the Keycloak `admin` realm role and is not
+  // settable via the app (it would be reconciled away on the user's next
+  // request). The cockpit users page shows it read-only.
   can_use_vm?: boolean;
   is_approved?: boolean;
 }

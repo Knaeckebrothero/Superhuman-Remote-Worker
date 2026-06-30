@@ -61,7 +61,8 @@
             ],
             "styles": [
               "src/styles.scss",
-              "node_modules/prismjs/plugins/line-numbers/prism-line-numbers.css"
+              "node_modules/prismjs/plugins/line-numbers/prism-line-numbers.css",
+              "node_modules/katex/dist/katex.min.css"
             ],
             "scripts": [
               "node_modules/clipboard/dist/clipboard.min.js",
@@ -75,7 +76,9 @@
               "node_modules/prismjs/components/prism-yaml.min.js",
               "node_modules/prismjs/components/prism-markdown.min.js",
               "node_modules/prismjs/components/prism-sql.min.js",
-              "node_modules/prismjs/plugins/line-numbers/prism-line-numbers.min.js"
+              "node_modules/prismjs/plugins/line-numbers/prism-line-numbers.min.js",
+              "node_modules/katex/dist/katex.min.js",
+              "node_modules/katex/dist/contrib/auto-render.min.js"
             ],
             "outputMode": "static",
             "ssr": false,

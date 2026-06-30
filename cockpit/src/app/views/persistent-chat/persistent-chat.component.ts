@@ -22,6 +22,7 @@ import {Router, RouterLink} from '@angular/router';
 import {firstValueFrom, Subscription} from 'rxjs';
 import {MarkdownComponent} from 'ngx-markdown';
 import {CitationRefDirective} from '../../core/markdown/citation-ref.directive';
+import {KATEX_OPTIONS} from '../../core/markdown/katex-options';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {ChatAttachment, PermissionRequest, PersistentChatService, RunningToolInfo, ToolCallInfo,} from '../../core/services/persistent-chat.service';
 import {
@@ -699,7 +700,7 @@ export function clearDraft(threadId: string | null): void {
             </span>
           </summary>
           <div class="thinking-content">
-            <markdown appCitationRef [data]="event.content"></markdown>
+            <markdown appCitationRef katex [katexOptions]="katexOptions" [data]="event.content"></markdown>
           </div>
         </details>
       </ng-template>
@@ -753,7 +754,7 @@ export function clearDraft(threadId: string | null): void {
                        class (its base styles are benign; the bubble styling is gated on
                        .message-user/.message-assistant, which this isn't). -->
                   <div class="compaction-summary-body message-body">
-                    <markdown [data]="turn.summary"></markdown>
+                    <markdown katex [katexOptions]="katexOptions" [data]="turn.summary"></markdown>
                   </div>
                 </details>
               }
@@ -848,7 +849,7 @@ export function clearDraft(threadId: string | null): void {
                     @let answer = finalAnswer(turn);
                     @if (answer) {
                       <div class="event-text turn-final-answer">
-                        <markdown appCitationRef [data]="answer"></markdown>
+                        <markdown appCitationRef katex [katexOptions]="katexOptions" [data]="answer"></markdown>
                       </div>
                     } @else {
                       <span class="turn-headline">{{ collapsedHeadline(turn) }}</span>
@@ -890,7 +891,7 @@ export function clearDraft(threadId: string | null): void {
                           }
                           @case ('text') {
                             <div class="event-text">
-                              <markdown appCitationRef [data]="group.event.content"></markdown>
+                              <markdown appCitationRef katex [katexOptions]="katexOptions" [data]="group.event.content"></markdown>
                             </div>
                           }
                           @case ('compaction') {
@@ -906,7 +907,7 @@ export function clearDraft(threadId: string | null): void {
                               <details class="compaction-summary">
                                 <summary>{{ 'chat.compaction.viewSummary' | transloco }}</summary>
                                 <div class="compaction-summary-body message-body">
-                                  <markdown [data]="group.event.summary"></markdown>
+                                  <markdown katex [katexOptions]="katexOptions" [data]="group.event.summary"></markdown>
                                 </div>
                               </details>
                             }
@@ -1538,6 +1539,10 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     private readonly toast = inject(AppToastService);
     private readonly errors = inject(ErrorMessageService);
     private readonly injector = inject(Injector);
+
+    /** KaTeX auto-render options for the assistant-text `<markdown>` blocks —
+     *  see katex-options.ts (inline `$…$` enabled, streaming-safe). */
+    protected readonly katexOptions = KATEX_OPTIONS;
 
     /**
      * The running-command card to show on (re)attach (or null). Surfaces the

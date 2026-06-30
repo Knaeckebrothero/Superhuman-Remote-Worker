@@ -68,20 +68,21 @@ class TestAdminVmRoutesRegistered:
 
 
 class TestAdminUserUpdate:
-    def test_accepts_partial_is_admin_only(self):
-        body = AdminUserUpdate(is_admin=True)
-        assert body.is_admin is True
-        assert body.can_use_vm is None
+    def test_is_admin_is_not_a_settable_field(self):
+        # Admin is owned by the Keycloak `admin` realm role and reconciled onto
+        # users.is_admin per request; the app must not offer a write path that
+        # would be silently clobbered. So is_admin is intentionally not a field.
+        assert "is_admin" not in AdminUserUpdate.model_fields
 
     def test_accepts_partial_can_use_vm_only(self):
         body = AdminUserUpdate(can_use_vm=True)
         assert body.can_use_vm is True
-        assert body.is_admin is None
+        assert body.is_approved is None
 
     def test_accepts_empty_body(self):
         body = AdminUserUpdate()
-        assert body.is_admin is None
         assert body.can_use_vm is None
+        assert body.is_approved is None
 
 
 # ---------------------------------------------------------------------------

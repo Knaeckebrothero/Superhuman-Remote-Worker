@@ -4822,9 +4822,15 @@ class UserUpdate(BaseModel):
 
 
 class AdminUserUpdate(BaseModel):
-    """Admin-only update body for toggling privileged user flags."""
+    """Admin-only update body for toggling privileged user flags.
 
-    is_admin: bool | None = None
+    Admin status is intentionally NOT settable here. It is derived from the
+    Keycloak ``admin`` realm role and reconciled onto ``users.is_admin`` on
+    every request (orchestrator/security/auth.py) — a write here would be
+    silently clobbered on the user's next request. Admin is therefore granted
+    in Keycloak, not the app; the cockpit users page shows it read-only.
+    """
+
     can_use_vm: bool | None = None
     is_approved: bool | None = None
 
@@ -22861,19 +22867,14 @@ async def admin_patch_user(
 ) -> dict[str, str]:
     """Toggle privileged user flags (admin-only).
 
-    Accepts partial updates of ``is_admin``, ``can_use_vm`` and
-    ``is_approved``. Setting ``is_approved=True`` admits the user and stamps
-    ``approved_at``/``approved_by``; setting it False is suspension — the flag
-    flips off (effective on the user's next request) while ``approved_at`` is
-    kept as history. Refuses to let an admin clear their own ``is_admin``
-    flag — lockout prevention.
+    Accepts partial updates of ``can_use_vm`` and ``is_approved``. Setting
+    ``is_approved=True`` admits the user and stamps ``approved_at``/
+    ``approved_by``; setting it False is suspension — the flag flips off
+    (effective on the user's next request) while ``approved_at`` is kept as
+    history. Admin status is NOT settable here — it is owned by the Keycloak
+    ``admin`` realm role (see ``AdminUserUpdate``).
     """
     admin = await _require_admin(request)
-    if body.is_admin is False and str(admin.get("id")) == user_id:
-        raise HTTPException(
-            status_code=400,
-            detail="Admins cannot clear their own is_admin flag",
-        )
     approved_at = None
     approved_by = None
     if body.is_approved is True:
@@ -22881,7 +22882,6 @@ async def admin_patch_user(
         approved_by = str(admin.get("id"))
     success = await postgres_db.update_user(
         user_id=user_id,
-        is_admin=body.is_admin,
         can_use_vm=body.can_use_vm,
         is_approved=body.is_approved,
         approved_at=approved_at,
