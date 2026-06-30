@@ -15,6 +15,7 @@ These are pure-unit (no Postgres / no model); the metadata DB round-trip is
 asserted in tests/citation_engine/test_integration_postgres.py.
 """
 
+from contextlib import contextmanager
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -200,4 +201,76 @@ async def test_get_or_register_doc_source_no_anchor_passes_none():
 
     mock_engine.add_doc_source.assert_awaited_once_with(
         "/ws/documents/plain.txt", name=None, metadata=None
+    )
+
+
+# ---------------------------------------------------------------------------
+# Remote-workspace materialization (regression: "stub mode" on sessions)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_or_register_doc_source_materializes_remote_file(tmp_path):
+    """A workspace path that is not present on the agent's local fs (remote
+    backend) must be downloaded via ``workspace.local_copy`` before the engine —
+    which does local ``os.path.exists``/``fitz.open`` I/O — registers it.
+
+    Regression for the persistent-session bug where every ``cite_document`` fell
+    back to stub mode because the file lived on a separate workspace pod.
+    """
+    local_pdf = tmp_path / "x.pdf"
+    local_pdf.write_bytes(b"%PDF-1.7 fake")
+
+    @contextmanager
+    def fake_local_copy(rel):
+        # Must receive a workspace-RELATIVE path (leading slash stripped), the
+        # only form the backend's resolve_path accepts.
+        assert rel == "cloud/compliance/x.pdf"
+        yield local_pdf
+
+    ws = MagicMock()
+    ws.local_copy = MagicMock(side_effect=fake_local_copy)
+
+    ctx = ToolContext()
+    ctx.workspace_manager = ws
+    mock_engine = MagicMock()
+    mock_source = MagicMock()
+    mock_source.id = 3
+    mock_engine.add_doc_source = AsyncMock(return_value=mock_source)
+    ctx.citation_engine = mock_engine
+
+    sid = await ctx.get_or_register_doc_source("/cloud/compliance/x.pdf", name="x.pdf")
+
+    assert sid == 3
+    ws.local_copy.assert_called_once_with("cloud/compliance/x.pdf")
+    # The engine must receive the LOCAL materialized path, not the
+    # remote/escaping one it cannot open.
+    called_path = mock_engine.add_doc_source.call_args.args[0]
+    assert called_path == str(local_pdf)
+
+
+@pytest.mark.asyncio
+async def test_get_or_register_doc_source_local_path_passes_through(tmp_path):
+    """A path already present on the local fs (e.g. the agent.py background
+    auto-register over a local docs dir) is registered directly — no download."""
+    local_doc = tmp_path / "report.pdf"
+    local_doc.write_bytes(b"%PDF-1.7 fake")
+
+    ws = MagicMock()
+    ws.local_copy = MagicMock()  # must NOT be called for an already-local path
+
+    ctx = ToolContext()
+    ctx.workspace_manager = ws
+    mock_engine = MagicMock()
+    mock_source = MagicMock()
+    mock_source.id = 5
+    mock_engine.add_doc_source = AsyncMock(return_value=mock_source)
+    ctx.citation_engine = mock_engine
+
+    sid = await ctx.get_or_register_doc_source(str(local_doc), name="report.pdf")
+
+    assert sid == 5
+    ws.local_copy.assert_not_called()
+    mock_engine.add_doc_source.assert_awaited_once_with(
+        str(local_doc), name="report.pdf", metadata=None
     )
