@@ -54,6 +54,7 @@
     "cytoscape-fcose": "^2.2.0",
     "dexie": "^4.2.1",
     "express": "^5.1.0",
+    "katex": "^0.16.47",
     "marked": "^17.0.3",
     "monaco-editor": "^0.55.1",
     "ngx-markdown": "^21.1.0",

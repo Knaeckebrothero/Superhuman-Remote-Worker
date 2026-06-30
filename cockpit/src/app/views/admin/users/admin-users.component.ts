@@ -1,7 +1,6 @@
 import {ChangeDetectionStrategy, Component, computed, effect, inject, OnInit, signal} from '@angular/core';
 import {SidebarToggleComponent} from '../../../shell/sidebar-toggle/sidebar-toggle.component';
 import {AdminUsersService} from '../../../core/services/admin-users.service';
-import {UserService} from '../../../core/services/user.service';
 import {NotificationService} from '../../../core/services/notification.service';
 import {User} from '../../../core/models/api.model';
 import {AppCheckboxComponent} from '../../../ui/checkbox';
@@ -129,10 +128,9 @@ import {AppBadgeComponent} from '../../../ui/badge';
                     <app-checkbox
                       size="sm"
                       [checked]="!!u.is_admin"
-                      [disabled]="isSelf(u)"
+                      [disabled]="true"
                       [ariaLabel]="'Admin: ' + u.display_name"
-                      [title]="isSelf(u) ? 'You cannot clear your own admin flag' : ''"
-                      (changed)="toggleAdmin(u, $event)"
+                      [title]="'Admin role is managed in Keycloak'"
                     />
                   </span>
                   <span class="col-flag">
@@ -380,10 +378,7 @@ import {AppBadgeComponent} from '../../../ui/badge';
 })
 export class AdminUsersComponent implements OnInit {
   protected readonly admin = inject(AdminUsersService);
-  private readonly users = inject(UserService);
   private readonly notifications = inject(NotificationService);
-
-  readonly selfId = computed(() => this.users.currentUser()?.id ?? null);
 
   /** Refresh the table live when a user_registered SSE frame arrives. */
   private readonly _onUserRegistered = effect(() => {
@@ -411,10 +406,6 @@ export class AdminUsersComponent implements OnInit {
   ngOnInit(): void {
     this.admin.loadUsers();
     this.admin.loadVmWorkspaces();
-  }
-
-  isSelf(u: User): boolean {
-    return u.id === this.selfId();
   }
 
   isSelected(u: User): boolean {
@@ -449,16 +440,6 @@ export class AdminUsersComponent implements OnInit {
   setKillSwitch(enabled: boolean): void {
     this.admin.setVmWorkspacesEnabled(enabled).subscribe({
       error: () => this.admin.loadVmWorkspaces(),
-    });
-  }
-
-  toggleAdmin(u: User, checked: boolean): void {
-    if (this.isSelf(u) && !checked) {
-      this.admin.loadUsers();
-      return;
-    }
-    this.admin.patchUser(u.id, {is_admin: checked}).subscribe({
-      error: () => this.admin.loadUsers(),
     });
   }
 
