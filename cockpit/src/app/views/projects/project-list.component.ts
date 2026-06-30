@@ -7,11 +7,12 @@ import {Project} from '../../core/models/api.model';
 import {SidebarToggleComponent} from '../../shell/sidebar-toggle/sidebar-toggle.component';
 import {TranslocoPipe} from '@jsverse/transloco';
 import {AppSpinnerComponent} from '../../ui/spinner';
+import {AppInlineEditableTextComponent} from '../../ui/inline-editable-text';
 import {ViewportService} from '../../core/services/viewport.service';
 @Component({
   selector: 'app-project-list-page',
   standalone: true,
-  imports: [SidebarToggleComponent, TranslocoPipe, AppSpinnerComponent],
+  imports: [SidebarToggleComponent, TranslocoPipe, AppSpinnerComponent, AppInlineEditableTextComponent],
   template: `
     <div class="page-container">
       <!-- Header -->
@@ -97,7 +98,13 @@ import {ViewportService} from '../../core/services/viewport.service';
           @for (project of projects(); track project.id) {
             <div class="project-card" (click)="openProject(project.id)">
               <div class="card-header">
-                <span class="card-name">{{ project.name }}</span>
+                <span class="card-name">
+                  <app-inline-editable-text
+                    [value]="project.name"
+                    [ariaLabel]="'common.rename' | transloco"
+                    (save)="onRenameProject(project, $event)"
+                  />
+                </span>
                 <div class="card-badges">
                   @if (project.is_default) {
                     <span class="badge badge-personal">{{ 'projects.badgePersonal' | transloco }}</span>
@@ -374,6 +381,29 @@ export class ProjectListPageComponent implements OnInit {
 
   openProject(id: string): void {
     this.router.navigate(['/projects', id]);
+  }
+
+  onRenameProject(project: Project, name: string): void {
+    if (!name || name === project.name) return;
+    const previous = project.name;
+    // Optimistic: update the card immediately, revert if the PATCH fails.
+    this.projects.update((list) =>
+      list.map((p) => (p.id === project.id ? {...p, name} : p)),
+    );
+    this.api.updateProject(project.id, {name}).subscribe({
+      next: (res) => {
+        if (!res) {
+          this.projects.update((list) =>
+            list.map((p) => (p.id === project.id ? {...p, name: previous} : p)),
+          );
+        }
+      },
+      error: () => {
+        this.projects.update((list) =>
+          list.map((p) => (p.id === project.id ? {...p, name: previous} : p)),
+        );
+      },
+    });
   }
 
   truncate(text: string, max: number): string {

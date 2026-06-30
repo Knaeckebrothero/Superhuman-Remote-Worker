@@ -15335,6 +15335,12 @@ class ThreadCreateRequest(BaseModel):
     )
 
 
+class ThreadUpdateRequest(BaseModel):
+    """Request body for updating a persistent thread's mutable metadata."""
+
+    title: str | None = Field(None, description="New session title")
+
+
 @app.post("/api/persistent/threads")
 async def create_thread(
     request_body: ThreadCreateRequest, request: Request
@@ -16222,6 +16228,28 @@ async def get_thread(thread_id: str, request: Request) -> dict[str, Any]:
         if m.get("mount_kind") == "project" and m.get("source_ref")
     ]
     return result
+
+
+@app.patch("/api/persistent/threads/{thread_id}")
+async def update_thread(
+    thread_id: str, body: ThreadUpdateRequest, request: Request
+) -> dict[str, str]:
+    """Rename a persistent thread (auth: owner only).
+
+    The title was previously settable only at creation and auto-generated
+    once by the LLM after the first turn; this lets the user rename a session
+    inline from the Cockpit. A user-chosen title naturally blocks the
+    auto-titler, which only overwrites empty / "Untitled Session" / "Local
+    Session" titles (src/api/persistent_app.py).
+    """
+    user, thread = await require_thread_owner(request, postgres_db, thread_id)
+    title = (body.title or "").strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="Title cannot be empty")
+    if len(title) > 200:
+        raise HTTPException(status_code=400, detail="Title too long (max 200)")
+    await postgres_db.update_thread_title(thread_id, title)
+    return {"status": "updated", "title": title}
 
 
 async def _thread_turn_in_flight(thread: dict) -> bool:

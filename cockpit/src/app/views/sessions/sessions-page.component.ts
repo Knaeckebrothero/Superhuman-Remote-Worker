@@ -18,6 +18,7 @@ import {AppDialogComponent} from '../../ui/dialog';
 import {AppIconButtonComponent} from '../../ui/icon-button';
 import {AppTabBarComponent, AppTabComponent} from '../../ui/tab-bar';
 import {AppInputComponent} from '../../ui/input';
+import {AppInlineEditableTextComponent} from '../../ui/inline-editable-text';
 import {AppSelectComponent} from '../../ui/select';
 import {AppChipComponent} from '../../ui/chip';
 import {AppIconComponent} from '../../ui/icon';
@@ -44,6 +45,7 @@ interface Project {
         AppTabBarComponent,
         AppTabComponent,
         AppInputComponent,
+        AppInlineEditableTextComponent,
         AppSelectComponent,
         AppChipComponent,
         AppIconComponent,
@@ -166,7 +168,13 @@ interface Project {
             <div class="session-card" [class.ended]="thread.status === 'ended'">
               <div class="session-heading" (click)="openSession(thread)">
                 <span class="session-status-dot" [class]="thread.status"></span>
-                <span class="session-title">{{ thread.title || ('sessions.untitledSession' | transloco) }}</span>
+                <span class="session-title">
+                  <app-inline-editable-text
+                    [value]="thread.title || ('sessions.untitledSession' | transloco)"
+                    [ariaLabel]="'common.rename' | transloco"
+                    (save)="onRenameThread(thread, $event)"
+                  />
+                </span>
               </div>
               <div class="session-meta" (click)="openSession(thread)">
                 <span class="session-id" title="Session ID">{{ thread.id.slice(0, 8) }}</span>
@@ -619,6 +627,22 @@ export class SessionsPageComponent implements OnInit {
         // Navigate immediately to chat view with spinner, create thread in background
         this.router.navigate(['/sessions', '_creating'], {state: {createBody: body}});
         this.creating.set(false);
+    }
+
+    async onRenameThread(thread: Thread, title: string): Promise<void> {
+        const previous = thread.title;
+        // Optimistic: update the card immediately, revert if the PATCH fails.
+        this.threads.update((list) =>
+            list.map((t) => (t.id === thread.id ? {...t, title} : t)),
+        );
+        try {
+            await this.chat.renameThread(thread.id, title);
+        } catch (e) {
+            this.threads.update((list) =>
+                list.map((t) => (t.id === thread.id ? {...t, title: previous} : t)),
+            );
+            this.toast.danger(this.errors.translate(e, 'errors.sessions.renameFailed'));
+        }
     }
 
     /**
