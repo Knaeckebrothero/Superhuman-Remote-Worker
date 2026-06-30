@@ -693,6 +693,21 @@ class ContainerProvisioner:
             if hasattr(e, "status") and e.status == 409:
                 logger.debug("PVC already exists: %s", pvc_name)
                 return True
+            # A 403 here is the workspace capacity guard (Phase 3a): the
+            # orchestrator SA is allowed to create PVCs, so the only Forbidden
+            # it hits is a ResourceQuota "exceeded quota" rejection. Surface it
+            # distinctly so an operator/alert can tell "fleet at capacity" from a
+            # genuine infra failure. The caller still fails closed (no emptyDir
+            # fallback) — capacity exhaustion must not silently drop durability.
+            if hasattr(e, "status") and e.status == 403:
+                logger.error(
+                    "Workspace capacity quota exceeded — PVC %s rejected by "
+                    "ResourceQuota; raise workspace.resourceQuota.maxStorage/"
+                    "maxCount or wait for jobs to free PVCs: %s",
+                    pvc_name,
+                    getattr(e, "body", e),
+                )
+                return False
             logger.error("Failed to create PVC %s: %s", pvc_name, e)
             return False
 
