@@ -45,7 +45,17 @@ export class AdminUsersService {
   patchUser(userId: string, body: AdminUserPatch): Observable<{status: string}> {
     return this.http
       .patch<{status: string}>(`${this.baseUrl}/admin/users/${userId}`, body)
-      .pipe(tap(() => this.loadUsers()));
+      // Update just the changed row in place instead of refetching the whole
+      // list. A full reload (loadUsers) replaces the array and re-renders every
+      // row, which is what made the list visibly "jump" on a single toggle.
+      // Callers (e.g. toggleVm) reload on error to fall back to server truth.
+      .pipe(
+        tap(() =>
+          this.users.update((rows) =>
+            rows.map((u) => (u.id === userId ? {...u, ...body} : u)),
+          ),
+        ),
+      );
   }
 
   /**
