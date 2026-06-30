@@ -780,6 +780,8 @@ export interface ProjectLoop {
   acceptance_criteria: string | null;
   user_prompt: string | null;
   model: string | null;
+  /** Per-loop workspace tier for every spawned job (null = default sandbox). */
+  workspace_backend: string | null;
   role_sequence: string[];
   seq_index: number;
   max_iterations: number | null;
@@ -798,6 +800,8 @@ export interface ProjectLoop {
 /** Request body for starting a project loop (POST /projects/{id}/loop). */
 export interface ProjectLoopStartRequest {
   model?: string | null;
+  /** Workspace tier for every spawned job: 'sandbox' | 'vm' | 'virtual' | 'none'. */
+  workspace_backend?: string | null;
   role_sequence?: string[] | null;
   max_iterations?: number | null;
   run_until?: string | null;

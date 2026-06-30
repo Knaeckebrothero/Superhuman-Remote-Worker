@@ -1,0 +1,80 @@
+"""Unit tests for the project self-improvement loop service.
+
+Focus: ``create_loop_job`` builds the right per-job ``config_override`` — the
+"bare" lifecycle flags plus the per-loop ``model`` and ``workspace_backend``
+overrides (the latter mirrors the former; it pins every spawned job's workspace
+tier so e.g. a loop can run all of its roles on a VM).
+"""
+
+from __future__ import annotations
+
+from unittest.mock import AsyncMock
+
+import pytest
+
+from services.project_loops import create_loop_job
+
+
+def _loop(**over):
+    base = {
+        "id": "11111111-1111-1111-1111-111111111111",
+        "project_id": None,  # None → skip datasource linking in create_loop_job
+        "owner_id": None,
+        "goal": "Build a thing",
+        "acceptance_criteria": None,
+        "user_prompt": None,
+        "model": None,
+        "remaining_iterations": 5,
+        "run_until": None,
+        "workspace_backend": None,
+    }
+    base.update(over)
+    return base
+
+
+def _db():
+    db = AsyncMock()
+    db.create_job = AsyncMock(return_value={"id": "job-1"})
+    # Keep the optional resolution paths inert regardless of EXPERTS_DB_ENABLED.
+    db.list_experts_visible = AsyncMock(return_value=[])
+    db.list_project_datasources = AsyncMock(return_value=[])
+    return db
+
+
+def _config_override(db):
+    return db.create_job.call_args.kwargs["config_override"]
+
+
+@pytest.mark.asyncio
+async def test_workspace_backend_injected_when_set():
+    db = _db()
+    await create_loop_job(
+        db, _loop(workspace_backend="vm"), role="developer", iteration=2
+    )
+    assert _config_override(db)["workspace"] == {"backend": "vm"}
+
+
+@pytest.mark.asyncio
+async def test_no_workspace_key_when_backend_unset():
+    db = _db()
+    await create_loop_job(db, _loop(), role="scholar", iteration=1)
+    assert "workspace" not in _config_override(db)
+
+
+@pytest.mark.asyncio
+async def test_model_and_backend_coexist_with_bare_invariants():
+    db = _db()
+    await create_loop_job(
+        db,
+        _loop(model="openrouter/minimax/minimax-m3", workspace_backend="vm"),
+        role="developer",
+        iteration=3,
+    )
+    co = _config_override(db)
+    assert co["llm"] == {"model": "openrouter/minimax/minimax-m3"}
+    assert co["workspace"] == {"backend": "vm"}
+    # The override must not clobber the loop's "bare" lifecycle invariants.
+    assert co["verification"] == {"enabled": False}
+    assert co["scholar"] == {"enabled": False}
+    assert co["autonomy"] == "full"
+    assert co["memory"] == {"required": True}
