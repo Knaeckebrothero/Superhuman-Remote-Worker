@@ -44,7 +44,7 @@ describe('AdminUsersService', () => {
     expect(service.users()[1].is_approved).toBe(false);
   });
 
-  it('PATCHes is_approved (suspension) and refreshes the list', () => {
+  it('PATCHes a flag and updates the row in place (no full reload)', () => {
     const http = {
       get: vi.fn().mockReturnValue(of([])),
       patch: vi.fn().mockReturnValue(of({status: 'updated'})),
@@ -53,12 +53,20 @@ describe('AdminUsersService', () => {
       delete: vi.fn(),
     };
     const {service} = createService(http);
+    service.users.set([
+      {id: 'u-1', display_name: 'A', is_approved: true},
+      {id: 'u-2', display_name: 'B', is_approved: true},
+    ] as User[]);
     service.patchUser('u-1', {is_approved: false}).subscribe();
     expect(http.patch).toHaveBeenCalledWith(
       expect.stringContaining('/admin/users/u-1'),
       {is_approved: false},
     );
-    expect(http.get).toHaveBeenCalled(); // tap reloads
+    // No full reload: the changed row is patched in place so the list does not
+    // re-fetch and visibly "jump"; only the targeted row changes.
+    expect(http.get).not.toHaveBeenCalled();
+    expect(service.users()[0].is_approved).toBe(false);
+    expect(service.users()[1].is_approved).toBe(true);
   });
 
   it('POSTs bulk approval to /admin/users/approve with user_ids and reloads', () => {
