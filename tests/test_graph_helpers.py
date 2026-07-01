@@ -677,6 +677,53 @@ class TestClassifyLlmError:
         )
         assert _classify_llm_error(err) == "cooldown"
 
+    def test_429_insufficient_quota_is_quota_exhausted(self):
+        """OpenAI's insufficient_quota billing wall (a 429) must fail fast, not
+        pause for hours on the outage backoff path — no wait fixes a spend cap.
+        See docs/features/llm_outage_pause_and_backoff_redispatch.md."""
+        err = _make_sdk_error(
+            "RateLimitError",
+            429,
+            body={
+                "error": {
+                    "code": "insufficient_quota",
+                    "type": "insufficient_quota",
+                    "message": "You exceeded your current quota, please check "
+                    "your plan and billing details.",
+                }
+            },
+        )
+        assert _classify_llm_error(err) == "quota_exhausted"
+
+    def test_insufficient_quota_precedence_over_rate_limit(self):
+        """A 429 carrying insufficient_quota is quota_exhausted, not the
+        retriable rate_limit a bare 429 would otherwise be."""
+        err = _make_sdk_error(
+            "RateLimitError", 429, body={"error": {"type": "insufficient_quota"}}
+        )
+        assert _classify_llm_error(err) == "quota_exhausted"
+
+    def test_insufficient_quota_string_fallback(self):
+        """Stringified provider error (no SDK class/body) still detected."""
+        err = Exception(
+            "Error code: 429 - {'error': {'type': 'insufficient_quota', "
+            "'message': 'You exceeded your current quota'}}"
+        )
+        assert _classify_llm_error(err) == "quota_exhausted"
+
+    def test_google_resource_exhausted_stays_rate_limit(self):
+        """Google's RESOURCE_EXHAUSTED doubles as a per-minute rate-limit signal,
+        so it must NOT be treated as a billing wall — that would wrongly fail-fast
+        a recoverable rate limit. Stays rate_limit."""
+        err = _make_sdk_error(
+            "RateLimitError",
+            429,
+            body={
+                "error": {"status": "RESOURCE_EXHAUSTED", "message": "Quota exceeded"}
+            },
+        )
+        assert _classify_llm_error(err) == "rate_limit"
+
     def test_cooldown_reset_seconds_helper(self):
         err = _make_sdk_error(
             "RateLimitError",

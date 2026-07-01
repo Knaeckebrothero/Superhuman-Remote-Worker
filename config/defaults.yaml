@@ -12,7 +12,12 @@ llm:
   reasoning_method: null  # Auto-detect from model name (prompt/api/none)
   base_url: null  # Set LLM_BASE_URL env var for local vLLM endpoint
   timeout: 600
-  max_retries: 3
+  # Single-layer retries: the worker graph's retry_manager (limits.llm_inproc_retries,
+  # Tier 1) is the ONE retry authority for the main LLM call. Provider-SDK retries
+  # here would multiply with the graph loop (and the LiteLLM gateway) and burn the
+  # Tier-2 outage budget 2–10× too fast. See
+  # docs/features/llm_outage_pause_and_backoff_redispatch.md §Hard preconditions.
+  max_retries: 0
   # NOTE: do NOT declare max_output_tokens here, even as null. It is matrix-driven
   # (per-family settings.max_output_tokens in config/model_config_matrix.yaml,
   # clamped to the context window by _resolve_max_output_tokens). A base
@@ -194,6 +199,11 @@ limits:
   # are set via config/settings_matrix.yaml — do not set them here.
   message_count_threshold: 300
   tool_retry_count: 3
+  # Tier-1 in-process LLM retries for a transient outage before the worker
+  # freezes the job for pause+backoff re-dispatch (Tier 2). 5 → 1+2+4+8+16s
+  # ≈ 31s of hot-context coverage for a short blip, avoiding a re-dispatch.
+  # See docs/features/llm_outage_pause_and_backoff_redispatch.md.
+  llm_inproc_retries: 5
   response_validation:
     enabled: true
     max_content_length: 50000   # chars, flag if exceeded with no tool calls

@@ -101,6 +101,7 @@ from .managers import TodoManager, TodoStatus, PlanManager, MemoryManager
 from .services.guardrails import format_nudge
 from .services.image_content import extract_image_tags, make_multimodal_user_message
 from .tools.context import ToolContext
+from .utils.db_url import checkpointer_backend
 
 logger = logging.getLogger(__name__)
 
@@ -314,6 +315,31 @@ def _cooldown_detail(error: Exception) -> tuple[Optional[float], Optional[str]]:
     return None, None
 
 
+def _is_insufficient_quota(exc: BaseException) -> bool:
+    """True if ``exc`` is an OpenAI-style ``insufficient_quota`` billing error.
+
+    This is the 429 that means "you exceeded your current quota / check your
+    plan and billing" — a spend wall, NOT a per-minute throttle. No wait fixes
+    it, so the classifier routes it to fail-fast (``quota_exhausted``) rather
+    than pausing the job for hours (llm_outage_pause_and_backoff_redispatch.md).
+    Distinct from the ordinary ``rate_limit_exceeded`` 429. Inspects a SINGLE
+    exception (the classifier walks the ``__cause__`` chain).
+
+    Google's ``RESOURCE_EXHAUSTED`` is deliberately NOT matched here — it doubles
+    as an ordinary per-minute quota/rate-limit signal, so treating it as a
+    billing wall would wrongly fail-fast a recoverable rate limit.
+    """
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        err = body.get("error") or {}
+        if isinstance(err, dict):
+            code = (err.get("code") or "").lower()
+            etype = (err.get("type") or "").lower()
+            if code == "insufficient_quota" or etype == "insufficient_quota":
+                return True
+    return "insufficient_quota" in str(exc).lower()
+
+
 def _classify_llm_error(error: Exception) -> str:
     """Classify an LLM exception as ``permanent``, ``rate_limit``, or ``transient``.
 
@@ -337,6 +363,9 @@ def _classify_llm_error(error: Exception) -> str:
     Returns one of:
 
     * ``permanent``  — short-circuit retries, mark the job failed.
+    * ``quota_exhausted`` — an OpenAI ``insufficient_quota`` billing wall (a
+      429 that no wait fixes); fail fast like ``permanent`` rather than pausing
+      the job for hours. See :func:`_is_insufficient_quota`.
     * ``cooldown``   — a quota/model cooldown (long reset window); the caller
       fails fast because retrying within the window is futile. See
       :func:`_cooldown_reset_seconds`.
@@ -354,6 +383,8 @@ def _classify_llm_error(error: Exception) -> str:
         status_code = getattr(current, "status_code", None)
         if isinstance(status_code, int):
             if status_code == 429:
+                if _is_insufficient_quota(current):
+                    return "quota_exhausted"
                 if _cooldown_reset_seconds(current) is not None:
                     return "cooldown"
                 return "rate_limit"
@@ -401,6 +432,8 @@ def _classify_llm_error(error: Exception) -> str:
         ):
             return "permanent"
         if cls_name == "RateLimitError":
+            if _is_insufficient_quota(current):
+                return "quota_exhausted"
             if _cooldown_reset_seconds(current) is not None:
                 return "cooldown"
             return "rate_limit"
@@ -437,6 +470,8 @@ def _classify_llm_error(error: Exception) -> str:
         return "permanent"
     if "model_cooldown" in error_str:
         return "cooldown"
+    if "insufficient_quota" in error_str:
+        return "quota_exhausted"
     if (
         "429" in error_str
         or "rate limit" in error_str
@@ -2300,6 +2335,52 @@ def create_execute_node(
                         "should_stop": True,
                     }
 
+                if classification == "quota_exhausted":
+                    # An OpenAI insufficient_quota billing wall (a 429 that no
+                    # wait fixes). Fail fast with an actionable reason instead of
+                    # pausing the job for hours on the outage backoff path — a
+                    # spend cap needs an operator, not a retry.
+                    # llm_outage_pause_and_backoff_redispatch.md §Error taxonomy.
+                    qe_msg = (
+                        f"Model '{phase_model}' returned insufficient_quota — the "
+                        f"provider account/key is out of quota or over its spend "
+                        f"cap. Failed fast rather than retry-looping; top up "
+                        f"billing or switch to a different provider/key, then re-run."
+                    )
+                    logger.error(
+                        f"[{job_id}] LLM quota exhausted (insufficient_quota) — "
+                        f"failing job without retry: {e}"
+                    )
+                    if auditor:
+                        auditor.audit_step(
+                            job_id=job_id,
+                            agent_type=config.agent_id,
+                            step_type="error",
+                            node_name="execute",
+                            iteration=iteration,
+                            data={
+                                "error": {
+                                    "type": "llm_error",
+                                    "message": qe_msg[:500],
+                                    "recoverable": False,
+                                    "classification": "quota_exhausted",
+                                    "attempts": attempt + 1,
+                                }
+                            },
+                            metadata=state.get("metadata"),
+                            phase=phase_str,
+                            phase_number=phase_number,
+                        )
+                    return {
+                        "error": {
+                            "message": qe_msg,
+                            "type": "llm_error",
+                            "recoverable": False,
+                        },
+                        "iteration": iteration + 1,
+                        "should_stop": True,
+                    }
+
                 if classification == "cooldown":
                     # C1: a quota cooldown (all credentials cooling down) with a
                     # multi-day reset — retrying within the window is futile, so
@@ -2398,6 +2479,69 @@ def create_execute_node(
                 logger.error(
                     f"[{job_id}] LLM error after {attempt + 1} attempts: {e}{auth_hint}"
                 )
+
+                # Tier 2: a transient LLM outage (connection refused, 5xx, 529,
+                # sustained per-minute 429, or a Codex/OAuth token blip) exhausted
+                # the in-process retries. Rather than counting toward the circuit
+                # breaker and failing the job, FREEZE it for pause + backoff
+                # re-dispatch so an overnight loop survives a multi-minute/hour
+                # provider outage and resumes from its checkpoint when the endpoint
+                # recovers. No ``error`` key — that would short-circuit
+                # determine_job_status straight to ``failed`` (completion.py). The
+                # freeze point is side-effect-clean: the LLM call failed, so no
+                # ``tools`` node ran and there is nothing to duplicate on resume.
+                #
+                # Gated on the shared Postgres checkpointer — the only backend
+                # where cross-pod resume is side-effect-safe. On pod-local sqlite
+                # the feature no-ops to today's fail-fast (the circuit breaker
+                # below). Only the retriable classes reach here — permanent /
+                # quota_exhausted / cooldown already returned above.
+                # docs/features/llm_outage_pause_and_backoff_redispatch.md
+                if (
+                    classification in ("transient", "rate_limit", "auth_unavailable")
+                    and checkpointer_backend() == "postgres"
+                ):
+                    outage_freeze: Dict[str, Any] = {
+                        "freeze_type": "llm_unavailable",
+                        "classification": classification,
+                        "error_summary": (str(e)[:500] + auth_hint),
+                        "model": phase_model,
+                    }
+                    retry_after = _extract_rate_limit_delay(e)
+                    if retry_after is not None:
+                        outage_freeze["retry_after_seconds"] = retry_after
+                    logger.warning(
+                        f"[{job_id}] LLM endpoint unavailable ({classification}) "
+                        f"after {attempt + 1} in-process attempts — freezing for "
+                        f"pause+backoff re-dispatch (resumes from checkpoint on "
+                        f"recovery): {e}"
+                    )
+                    if auditor:
+                        auditor.audit_step(
+                            job_id=job_id,
+                            agent_type=config.agent_id,
+                            step_type="warning",
+                            node_name="execute",
+                            iteration=iteration,
+                            data={
+                                "error": {
+                                    "type": "llm_error",
+                                    "message": (str(e)[:500] + auth_hint),
+                                    "recoverable": True,
+                                    "classification": classification,
+                                    "action": "pause_backoff_redispatch",
+                                    "attempts": attempt + 1,
+                                }
+                            },
+                            metadata=state.get("metadata"),
+                            phase=phase_str,
+                            phase_number=phase_number,
+                        )
+                    return {
+                        "freeze_data": outage_freeze,
+                        "should_stop": True,
+                        "iteration": iteration + 1,
+                    }
 
                 # C2 circuit breaker: this execute invocation exhausted its inner
                 # retries. The inner attempt counter resets each invocation, but
@@ -4209,8 +4353,9 @@ def build_phase_alternation_graph(
 
     context_mgr.set_progress_callback(_log_compaction_progress)
 
-    # Create retry manager for LLM call retries
-    retry_manager = ToolRetryManager(max_retries=config.limits.tool_retry_count)
+    # Create retry manager for LLM call retries (Tier-1 in-process fast retries;
+    # exhaustion triggers the Tier-2 pause+backoff freeze in the execute node).
+    retry_manager = ToolRetryManager(max_retries=config.limits.llm_inproc_retries)
 
     # Load summarization prompt (use summarization model for matrix resolution)
     summarization_config = config.llm.get_phase_config("summarization")

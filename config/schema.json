@@ -440,6 +440,12 @@
           "default": 3,
           "description": "Number of retries for failed tool calls"
         },
+        "llm_inproc_retries": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 5,
+          "description": "Tier-1 in-process LLM-invoke retries before the worker freezes the job for pause+backoff re-dispatch (llm_outage_pause_and_backoff_redispatch.md)"
+        },
         "response_validation": {
           "type": "object",
           "description": "LLM response degeneration validation settings",
