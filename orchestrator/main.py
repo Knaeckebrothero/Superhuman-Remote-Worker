@@ -161,8 +161,9 @@ from services.litellm_gateway import (  # noqa: E402
     get_fleet_key,
     litellm_sync_loop,
     mark_gateway_health,
-    materialize_llm_usage,
 )
+from services.audit_usage import materialize_llm_usage_from_audit  # noqa: E402
+from services.openrouter_pricing import llm_pricing_sync_loop  # noqa: E402
 from services.audit_partitions import (  # noqa: E402
     maintenance_loop as audit_maintenance_loop,
 )
@@ -1555,33 +1556,54 @@ async def llm_usage_poll_loop(
     *,
     interval: float = 120.0,
 ) -> None:
-    """Background loop: materialize the LiteLLM spend log into usage_events (4c).
+    """Background loop: materialize the audit trail into usage_events (LLM cost).
 
-    No-op when the gateway is unconfigured or the ledger is unavailable. The
-    spend-log scan is idempotent at the ledger (dedupe on request_id+unit+ts), so
-    re-polling is safe; an in-memory cursor (max startTime processed) keeps each
-    tick to only the new rows. Never raises into the lifespan.
+    In-process replacement for the LiteLLM spend-log poll now that the gateway is
+    being removed (docs/issues/remove_litellm_proxy_and_gateway_concept.md, P1).
+    Reads new ``llm_requests`` rows via ``materialize_llm_usage_from_audit`` and
+    prices them from ``usage_rates`` (seeded by ``llm_pricing_sync_loop``) — no
+    proxy in the path. Idempotent at the ledger; never raises into the lifespan.
+
+    Forward-only: the cursor anchors at the current max ``llm_requests.timestamp``
+    on startup, so re-pointing from the litellm-spend source to the audit source
+    never re-meters already-metered history under ``source='audit'`` (backfilling
+    a disable-gap is a separate, deliberate op — a lower initial anchor). The
+    cursor is a timestamp, NOT an id: ``llm_requests.id`` is not monotonic with
+    time (the audit sequence has been reset — a max-id anchor would silently miss
+    the active low-id band). No-op when the ledger or either pool is unavailable.
     """
-    base_url = os.getenv("LITELLM_BASE_URL", "").strip()
-    master_key = os.getenv("LITELLM_MASTER_KEY", "").strip()
-    if not base_url or not master_key:
-        logger.info("LLM usage poll loop disabled (gateway not configured)")
-        return
     if usage_ledger is None or not usage_ledger.is_available:
         logger.info("LLM usage poll loop disabled (usage ledger unavailable)")
         return
+    if audit_db is None or audit_db.pool is None or postgres_db.pool is None:
+        logger.info("LLM usage poll loop disabled (audit/app pool unavailable)")
+        return
 
-    client = LiteLLMClient(base_url, master_key)
-    cursor = None
-    logger.info("LLM usage poll loop starting (interval=%ss)", interval)
+    # Forward-only anchor: start after the newest existing row (by timestamp, the
+    # monotonic key) so re-pointing the source doesn't double-count calls the
+    # litellm poll already metered. Falls back to wall-clock now when empty.
+    cursor = datetime.now(timezone.utc)
+    try:
+        async with audit_db.pool.acquire() as conn:
+            newest = await conn.fetchval("SELECT max(timestamp) FROM llm_requests")
+        if newest is not None:
+            cursor = newest
+    except Exception:
+        logger.warning(
+            "LLM usage anchor query failed; starting from now", exc_info=True
+        )
+    logger.info(
+        "LLM usage poll loop starting (audit source, anchor ts=%s, interval=%ss)",
+        cursor,
+        interval,
+    )
     try:
         while not shutdown_event.is_set():
             try:
-                if await client.is_ready():
-                    res = await materialize_llm_usage(
-                        client, usage_ledger, since=cursor
-                    )
-                    cursor = res.get("cursor") or cursor
+                res = await materialize_llm_usage_from_audit(
+                    audit_db.pool, postgres_db.pool, usage_ledger, since_ts=cursor
+                )
+                cursor = res.get("cursor") or cursor
             except Exception:
                 logger.exception("LLM usage poll tick failed (non-fatal)")
             try:
@@ -1589,7 +1611,6 @@ async def llm_usage_poll_loop(
             except asyncio.TimeoutError:
                 pass
     finally:
-        await client.aclose()
         logger.info("LLM usage poll loop stopped")
 
 
@@ -5719,6 +5740,17 @@ async def lifespan(app: FastAPI):
         litellm_sync_loop(_shutdown_event, postgres_db)
     )
 
+    # LLM $/token pricing sync: seed usage_rates from OpenRouter × the model
+    # catalog (params_json.pricing_id) so record_events can cost the audit-
+    # sourced token rows. Replaces the gateway's per-request spend as the cost
+    # source (remove_litellm_proxy_and_gateway_concept.md, P1 Slice 1). Slow
+    # (6h) + change-only; no-op without the app pool.
+    pricing_sync_task = asyncio.create_task(
+        llm_pricing_sync_loop(
+            _shutdown_event, postgres_db.pool, postgres_db.list_models
+        )
+    )
+
     # Longer-window quota stop (Slice 3): polls per-project daily usage from the
     # gateway and freezes jobs whose project crossed its quota. Self-disables with
     # the gateway (LITELLM_BASE_URL unset). See usage_monitoring_and_rate_limiting.md.
@@ -5833,6 +5865,7 @@ async def lifespan(app: FastAPI):
     await project_loop_sweeper_task
     await stale_verification_sweeper_task
     await litellm_sync_task
+    await pricing_sync_task
     await quota_poll_task
     await workspace_metering_task
     await llm_usage_task

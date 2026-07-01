@@ -30,14 +30,18 @@ for session rows. Resolved against the app-DB ``jobs`` / ``threads`` tables to
 ``user_id`` / ``project_id`` (soft — a deleted job's tokens still meter, just
 unattributed) and carried as ``ref_kind`` / ``ref_id`` for per-job/thread cost.
 
-Cursor: ``llm_requests.id`` is a single-sequence, append-only BIGINT — a gap-free
-integer cursor. To dodge the assign-before-commit reorder window (id ``N+1``
-visible before id ``N`` commits), the cursor only advances over a *contiguous*
-run of rows older than ``min_age_s``; the first too-fresh row stops the tick (its
-id, and everything after it, waits for a later tick). Idempotent regardless — the
-ledger dedupes on ``(source, source_id, unit, ts)`` with ``source_id`` = the row
-id — so a re-scan never double-counts. ``source='audit'`` keeps these rows in a
-distinct idempotency namespace from the retired ``source='litellm'`` rows.
+Cursor: keyed on ``timestamp``, NOT ``id``. ``llm_requests.id`` is a BIGSERIAL but
+NOT monotonic with insertion time in practice — the audit sequence has been reset
+(verified live: a frozen high-id band coexists with an active band whose ids climb
+from a low value), so a recent row can carry an id far below an older row's. A
+max-id anchor would then silently meter nothing. ``timestamp`` (``now()`` at
+write) is monotonic with insertion, so it's the safe cursor; ``id`` stays the
+unique dedupe ``source_id`` (the bands don't overlap). The cursor only advances
+over a *contiguous* run of rows older than ``min_age_s`` (the first too-fresh row
+halts the tick) to dodge the assign-before-commit visibility window. Idempotent
+regardless — the ledger dedupes on ``(source='audit', source_id, unit, ts)`` — so
+a re-scan never double-counts. ``source='audit'`` keeps these rows in a distinct
+idempotency namespace from the retired ``source='litellm'`` rows.
 """
 
 from __future__ import annotations
@@ -57,14 +61,18 @@ logger = logging.getLogger(__name__)
 _SESSION_AGENT_TYPE = "persistent"
 
 _DEFAULT_BATCH = 1000
-# Aging window (seconds) a row must clear before its id may advance the cursor —
-# see the module docstring's "assign-before-commit" note.
+# Aging window (seconds) a row must clear before its timestamp may advance the
+# cursor — see the module docstring's "assign-before-commit" note.
 _DEFAULT_MIN_AGE_S = 60.0
+# ``since_ts=None`` floor → materialize from the beginning (full backfill).
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 # Pull the token counts server-side as TEXT (``->>``), independent of any jsonb
 # codec on the read pool. The fallback order per dimension is applied in Python
 # (:func:`_first_int`): worker's metrics.token_usage first, then session's
 # metadata.*_tokens. metrics is NOT NULL DEFAULT '{}'; metadata may be NULL.
+# Ordered by (timestamp, id): timestamp is the monotonic cursor, id the stable
+# tiebreak within a timestamp.
 _SELECT_SQL = """
 SELECT id, job_id, agent_type, call_type, model, timestamp,
        metrics->'token_usage'->>'prompt_tokens'     AS m_prompt,
@@ -75,8 +83,8 @@ SELECT id, job_id, agent_type, call_type, model, timestamp,
        metadata->>'input_tokens'                    AS md_input,
        metadata->>'output_tokens'                   AS md_output
 FROM llm_requests
-WHERE id > $1
-ORDER BY id
+WHERE timestamp > $1
+ORDER BY timestamp, id
 LIMIT $2
 """
 
@@ -140,19 +148,20 @@ async def materialize_llm_usage_from_audit(
     app_pool: Optional[asyncpg.Pool],
     ledger: Optional[UsageLedger],
     *,
-    since_id: int = 0,
+    since_ts: Optional[datetime] = None,
     batch_limit: int = _DEFAULT_BATCH,
     min_age_s: float = _DEFAULT_MIN_AGE_S,
     now: Optional[datetime] = None,
 ) -> dict[str, Any]:
-    """Materialize ``llm_requests`` rows above ``since_id`` into ``usage_events``.
+    """Materialize ``llm_requests`` rows after ``since_ts`` into ``usage_events``.
 
     Emits cost-free ``prompt-token`` / ``completion-token`` rows (the ledger
     prices them from ``usage_rates``), attributed to the row's user/project.
     Advances the cursor only over a contiguous run of rows older than
-    ``min_age_s`` (see module docstring). Returns
-    ``{"materialized", "cursor", "scanned"}``. Non-fatal: no-ops (cursor
-    unchanged) when any pool or the ledger is unavailable.
+    ``min_age_s`` (see module docstring). ``since_ts=None`` materializes from the
+    beginning. Returns ``{"materialized", "cursor", "scanned"}`` where ``cursor``
+    is a timestamp. Non-fatal: no-ops (cursor unchanged) when any pool or the
+    ledger is unavailable.
     """
     if (
         audit_pool is None
@@ -160,24 +169,25 @@ async def materialize_llm_usage_from_audit(
         or ledger is None
         or not ledger.is_available
     ):
-        return {"materialized": 0, "cursor": since_id, "scanned": 0}
+        return {"materialized": 0, "cursor": since_ts, "scanned": 0}
 
     async with audit_pool.acquire() as conn:
-        rows = await conn.fetch(_SELECT_SQL, since_id, batch_limit)
+        rows = await conn.fetch(_SELECT_SQL, since_ts or _EPOCH, batch_limit)
     if not rows:
-        return {"materialized": 0, "cursor": since_id, "scanned": 0}
+        return {"materialized": 0, "cursor": since_ts, "scanned": 0}
 
     cutoff = (now or datetime.now(timezone.utc)) - timedelta(seconds=min_age_s)
 
     # Contiguous aged prefix: stop at the first row newer than the cutoff so the
-    # cursor never advances past a lower id that may still be mid-commit.
+    # cursor never advances past a timestamp that may still have a mid-commit
+    # sibling not yet visible.
     aged = []
     for r in rows:
         if r["timestamp"] > cutoff:
             break
         aged.append(r)
     if not aged:
-        return {"materialized": 0, "cursor": since_id, "scanned": len(rows)}
+        return {"materialized": 0, "cursor": since_ts, "scanned": len(rows)}
 
     job_ids = {
         r["job_id"] for r in aged if (r["agent_type"] or "") != _SESSION_AGENT_TYPE
@@ -188,9 +198,9 @@ async def materialize_llm_usage_from_audit(
     owners = await _resolve_owners(app_pool, job_ids, thread_ids)
 
     events: list[UsageEvent] = []
-    new_cursor = since_id
+    new_cursor = since_ts
     for r in aged:
-        new_cursor = r["id"]  # advance over every aged row, priced or not
+        new_cursor = r["timestamp"]  # advance over every aged row, priced or not
         prompt = _first_int(r["m_prompt"], r["m_input"], r["md_input"])
         completion = _first_int(r["m_completion"], r["m_output"], r["md_output"])
         if not prompt and not completion:
