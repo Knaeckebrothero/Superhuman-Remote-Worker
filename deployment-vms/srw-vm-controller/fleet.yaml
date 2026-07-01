@@ -50,6 +50,12 @@ helm:
         tag: "sha-fc2df34"
     vmController:
       defaultVmImage: "ghcr.io/knaeckebrothero/superhuman-remote-worker-agent-vm-base:sha-7ae23f7"
+      # Golden-image boot acceleration: import the VM base image ONCE into a
+      # per-digest golden PVC, then clone per-VM rootdisks from it (CDI
+      # host-assisted on local-path) instead of a ~10-min GHCR registry
+      # import per VM. See docs/features/vm_golden_image_boot_acceleration.md.
+      goldenImage:
+        enabled: true
 dependsOn: []
 # Cluster targeting handled by the dedicated GitRepo
 # (HomeLab/rancher_cluster/fleet-gitrepo-srw-vms.yaml) whose spec.targets
