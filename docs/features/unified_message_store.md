@@ -6,6 +6,25 @@ records the current state, why the obvious move ("merge the two tables") is
 wrong, the two real directions, and the open questions. Nothing here is
 committed; treat it as the seed for a future design call.
 
+**Corrections (2026-07-01, from the database-roadmap research sweep —
+supersede the claims below where they conflict):**
+1. **The two stores DO overlap; sessions DO write `chat_history`.** Since
+   commit `986117f1` (2026-06-12 — predating this doc), every session turn's
+   main-LLM audit (`_loop_archive_llm_call`, `src/api/persistent_app.py:3303`)
+   cascades through `archiver.archive(call_type='main')` into
+   `_archive_chat_entry` with no agent-type guard → a `chat_history` row per
+   session turn, keyed by thread_id. The rows are written-but-never-read by
+   the session UI, but the "sessions don't write chat_history at all"
+   existence-proof framing below (lines ~58-80) is wrong.
+2. **The "0019 normalized-components shape" is dormant, not implemented.**
+   The 0019 columns are never written (no `save_thread_message` caller
+   passes them), never read (the display query omits them), and the intended
+   builder `src/llm/session_components.py` has zero production callers.
+   Direction A must *wire* the canonical shape, not merely adopt it.
+3. Minor: the 90/365-day retention windows cited below are declared but not
+   enforced (`retire_partitions` is a stub) — see `database_roadmap.md`
+   Phase 6.
+
 **Origin:** 2026-06-21 schema-optimization conversation, following the
 database-architecture review. The convergence itself is already named (but
 deferred) in `database_architecture.md` ("one message store") and listed as a
