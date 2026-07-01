@@ -14,9 +14,11 @@ import httpx
 import pytest
 
 from orchestrator.services.openrouter_pricing import (
+    _catalog_pricing_pairs,
     _price,
     _pricing_id_for,
     fetch_openrouter_prices,
+    sync_catalog_llm_rates,
     sync_llm_rates,
 )
 
@@ -208,3 +210,61 @@ class TestSyncLlmRates:
     @pytest.mark.asyncio
     async def test_no_pool_is_noop(self):
         assert await sync_llm_rates(None, [("gpt-5.5", "openai/gpt-5.5")]) == 0
+
+
+# --- catalog wiring ---------------------------------------------------------
+
+
+class TestCatalogPairs:
+    def test_extracts_model_id_and_pricing_id(self):
+        rows = [
+            {"model_id": "gpt-5.5", "params_json": {"pricing_id": "openai/gpt-5.5"}},
+            {"model_id": "gemma-4-moe", "params_json": {"pricing_id": ""}},
+            {"model_id": "codex", "params_json": None},  # no params → pricing_id None
+            {"model_id": "", "params_json": {}},  # empty model_id skipped
+            {"params_json": {"pricing_id": "x"}},  # no model_id skipped
+        ]
+        assert _catalog_pricing_pairs(rows) == [
+            ("gpt-5.5", "openai/gpt-5.5"),
+            ("gemma-4-moe", ""),
+            ("codex", None),
+        ]
+
+
+class TestSyncCatalogLlmRates:
+    _TS = datetime(2026, 7, 1, tzinfo=timezone.utc)
+    _PRICES = {"openai/gpt-5.5": (Decimal("0.000005"), Decimal("0.00003"))}
+
+    @pytest.mark.asyncio
+    async def test_enumerates_catalog_and_seeds(self):
+        conn = FakeConn()
+
+        async def list_models():
+            return [
+                {
+                    "model_id": "gpt-5.5",
+                    "params_json": {"pricing_id": "openai/gpt-5.5"},
+                },
+                {"model_id": "gemma-4-moe", "params_json": {"pricing_id": ""}},  # skip
+            ]
+
+        n = await sync_catalog_llm_rates(
+            FakePool(conn), list_models, prices=self._PRICES, now=self._TS
+        )
+        assert n == 2  # gpt-5.5 prompt + completion; gemma unpriced
+        assert ("gpt-5.5", "prompt-token", Decimal("0.000005")) in conn.inserts
+        assert not any(r == "gemma-4-moe" for r, *_ in conn.inserts)
+
+    @pytest.mark.asyncio
+    async def test_no_pool_is_noop(self):
+        async def list_models():
+            raise AssertionError("should not be called when pool is None")
+
+        assert await sync_catalog_llm_rates(None, list_models) == 0
+
+    @pytest.mark.asyncio
+    async def test_catalog_list_failure_is_nonfatal(self):
+        async def list_models():
+            raise RuntimeError("db down")
+
+        assert await sync_catalog_llm_rates(FakePool(FakeConn()), list_models) == 0
