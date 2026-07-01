@@ -127,16 +127,23 @@ class FakeContextMgr:
     comparisons on these values (the B1 mock-config lesson).
     """
 
-    def __init__(self, ensure_hook=None) -> None:
+    def __init__(self, ensure_hook=None, should_summarize=False) -> None:
         self.config = SimpleNamespace(
             compaction_threshold_tokens=100_000,
             summarization_threshold_tokens=100_000,
+            keep_recent_messages=10,
         )
         self._state = SimpleNamespace(summaries=[])
         self._ensure_hook = ensure_hook
+        self._should_summarize = should_summarize
 
     def set_current_phase(self, phase: str) -> None:
         pass
+
+    def should_summarize(self, messages) -> bool:
+        # The pre_compaction emit gates on this; off by default so these
+        # wiring tests stay focused on the read/write + compaction-capture path.
+        return self._should_summarize
 
     def get_token_count(self, messages: List[Any]) -> int:
         return 10
@@ -186,6 +193,7 @@ class TestPipelineDefaults:
         assert m.pipeline.writers == [
             "interval_extractor",
             "phase_boundary_extractor",
+            "pre_compaction_extractor",
             "memory_assembler",
             "compaction_memory",
             "queued_memory",
@@ -197,6 +205,7 @@ class TestPipelineDefaults:
         assert m.pipeline.retrievers == ["recall_two_tier", "kb_notes"]
         assert m.pipeline.writers == [
             "persistent_interval_extractor",
+            "pre_compaction_extractor",
             "teardown_extractor",
         ]
 
@@ -304,6 +313,24 @@ class TestWorkerConstruction:
         # GATE B: ingestion is on in the defaults, so the verdict service
         # attaches to the store during construction.
         assert getattr(marker_store, "ingestion_verdict", None) is not None
+
+    def test_exposes_memory_service_on_graph(self, worker_config, workspace_manager):
+        """The run loop drains in-flight captures via this handle (OQ-C)."""
+        worker_config.memory.manager_enabled = True
+        ctx = ToolContext(workspace_manager=workspace_manager)
+        ctx.recall_store = SimpleNamespace()
+        mgr = RecordingManager()
+        with patch("src.services.memory.MemoryManager.from_config", return_value=mgr):
+            graph = self._build(worker_config, workspace_manager, ctx)
+        assert getattr(graph, "_srw_memory_service", None) is mgr
+
+    def test_flag_off_exposes_none(self, worker_config, workspace_manager):
+        worker_config.memory.manager_enabled = False
+        ctx = ToolContext(workspace_manager=workspace_manager)
+        ctx.recall_store = SimpleNamespace()
+        graph = self._build(worker_config, workspace_manager, ctx)
+        # Attribute present (so getattr in the run loop is a no-op), value None.
+        assert getattr(graph, "_srw_memory_service", "MISSING") is None
 
     def test_flag_off_never_constructs(self, worker_config, workspace_manager):
         worker_config.memory.manager_enabled = False  # rollback-lever state
@@ -760,7 +787,8 @@ class TestPersistentTurnWiring:
             llm_with_tools=llm,
             tool_map={},
             context_manager=AsyncMock(
-                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m),
+                should_summarize=lambda *a, **k: False,  # sync gate, pre_compaction off
             ),
             messages=messages,
             callbacks=_persistent_callbacks(),
@@ -822,7 +850,8 @@ class TestPersistentTurnWiring:
             llm_with_tools=llm,
             tool_map={},
             context_manager=AsyncMock(
-                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m),
+                should_summarize=lambda *a, **k: False,  # sync gate, pre_compaction off
             ),
             messages=messages,
             callbacks=_persistent_callbacks(),

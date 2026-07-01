@@ -1016,6 +1016,24 @@ async def _execute_turn(
         # the worst offender for parking the turn (a hung endpoint can hold it
         # for the full auxiliary timeout), so a hard "stop" must be able to
         # tear it down at once.
+        # Memory extraction before compaction (persistent): if this call is about
+        # to summarize, snapshot the slice ensure_within_limits will evict and
+        # mine it for durable memories before the lossy summary replaces it
+        # (docs/features/memory_extraction_before_compaction.md). Fire-and-forget
+        # so compaction latency is unchanged; no phase concept in a session →
+        # phase=0 (matches the turn_end capture).
+        if memory_service is not None and context_manager.should_summarize(messages):
+            from .services.memory import CaptureEvent
+
+            keep_recent = context_manager.config.keep_recent_messages
+            evicted = (
+                list(messages[:-keep_recent]) if keep_recent > 0 else list(messages)
+            )
+            if evicted:
+                memory_service.capture_nowait(
+                    CaptureEvent(kind="pre_compaction", messages=evicted, phase=0)
+                )
+
         pre_compact_len = len(messages)
         compaction_runs_before = getattr(context_manager, "compaction_runs", 0)
         bounded, compact_interrupted = await _await_or_hard_interrupt(

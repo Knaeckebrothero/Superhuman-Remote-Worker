@@ -27,135 +27,26 @@ agents log).
 import asyncio
 import logging
 import math
-from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
+from src.core.chunk_planner import (
+    DEFAULT_AUX_WINDOW,
+    SCHEMA_OVERHEAD_TOKENS,
+    Chunk,
+    ChunkPlan,
+    ChunkPlanner,
+    SummarizationFailed,
+    count_text_tokens,
+)
+
 logger = logging.getLogger(__name__)
-
-try:
-    import tiktoken
-
-    TIKTOKEN_AVAILABLE = True
-except ImportError:  # pragma: no cover - environment dependent
-    TIKTOKEN_AVAILABLE = False
-
-# Fraction of the summarizer's window usable after safety margin. Covers
-# tokenizer disagreement between our counter and the endpoint's, message
-# framing overhead, and provider-side additions.
-SAFETY_MARGIN = 0.85
-
-# Fixed allowance for the structured-output schema the SDK appends to the
-# request (tool/JSON-schema definition for ConversationSummary).
-SCHEMA_OVERHEAD_TOKENS = 2_000
 
 # Retry policy per fold call — rides out transient aux-endpoint failures
 # (503 flap, ReadTimeout) without falling back to a different algorithm.
 MAX_ATTEMPTS = 3
 BACKOFF_SECONDS = (5.0, 15.0)  # sleep after attempt 1, attempt 2
 
-# Conservative chars-per-token used only when tiktoken is unavailable.
-# 3.5 overestimates token counts for typical English/code, which errs toward
-# smaller (safer) chunks.
-_FALLBACK_CHARS_PER_TOKEN = 3.5
-
-# Reserved tokens per split piece: the "[part i/j …]" marker plus
-# tokenizer-boundary inflation from cutting mid-token.
-_SPLIT_MARKER_RESERVE_TOKENS = 64
-
-# Floor when the auxiliary window is unknown: matches the historical
-# conservative default base (see LimitsConfig.model_max_context_tokens).
-DEFAULT_AUX_WINDOW = 100_000
-
 ProgressCallback = Callable[[str, Dict[str, Any]], Awaitable[None]]
-
-
-class SummarizationFailed(Exception):
-    """Summarization could not produce a summary; callers keep raw history.
-
-    ``reason`` is machine-readable and lands in the ``compaction.failed``
-    event: ``aux_unavailable`` (retries exhausted), ``aux_overflow``
-    (a planned call still overflowed — a plan bug, never retried),
-    ``aux_window_too_small`` (window can't fit prompt + output budget).
-    """
-
-    def __init__(
-        self,
-        reason: str,
-        message: str = "",
-        pass_index: int = 0,
-        n_passes: int = 0,
-    ):
-        self.reason = reason
-        self.pass_index = pass_index
-        self.n_passes = n_passes
-        super().__init__(message or reason)
-
-
-@dataclass
-class ChunkSpec:
-    """One fold pass: a contiguous slice of formatted conversation parts."""
-
-    index: int  # 1-based pass number
-    first_part: int  # 1-based ordinal of the first conversation part
-    last_part: int  # 1-based ordinal of the last conversation part
-    text: str
-    tokens: int
-
-
-@dataclass
-class SummarizationPlan:
-    """Deterministic chunking plan computed before any LLM call."""
-
-    chunks: List[ChunkSpec] = field(default_factory=list)
-    total_tokens: int = 0
-    chunk_budget: int = 0
-    aux_window: int = 0
-
-    @property
-    def n_passes(self) -> int:
-        return len(self.chunks)
-
-    def describe(self) -> List[Dict[str, int]]:
-        """Compact plan representation for the ``compaction.started`` event."""
-        return [
-            {
-                "pass": c.index,
-                "first_msg": c.first_part,
-                "last_msg": c.last_part,
-                "tokens": c.tokens,
-            }
-            for c in self.chunks
-        ]
-
-
-_ENCODING_CACHE: Dict[str, Any] = {}
-
-
-def count_text_tokens(text: str, model: Optional[str] = None) -> int:
-    """Count tokens in a plain string with tiktoken, conservative fallback.
-
-    The summarization *plan* must use real token counts: the historical
-    ``len(text) // 4`` estimate let a 951k-token conversation slip past a
-    943k gate (it under-counts), straight into a 131k summarizer.
-    """
-    if not text:
-        return 0
-    if TIKTOKEN_AVAILABLE:
-        key = model or "_default"
-        encoding = _ENCODING_CACHE.get(key)
-        if encoding is None:
-            try:
-                encoding = tiktoken.encoding_for_model(model) if model else None
-            except (KeyError, ValueError):
-                encoding = None
-            if encoding is None:
-                encoding = tiktoken.get_encoding("cl100k_base")
-            _ENCODING_CACHE[key] = encoding
-        try:
-            return len(encoding.encode(text, disallowed_special=()))
-        except Exception:  # pragma: no cover - defensive
-            pass
-    return math.ceil(len(text) / _FALLBACK_CHARS_PER_TOKEN)
 
 
 def format_structured_summary(result: Any) -> str:
@@ -297,6 +188,21 @@ class SummarizationEngine:
         self.output_budget = max(1_000, math.ceil(max_summary_length / 3))
         self._overhead = self._measure_overhead()
 
+        # The fold subtracts the output budget twice — once for the model's
+        # output, once because the rolling summary rides along every chunk — so
+        # both reserves are ``output_budget``. No overlap: sequential coherence
+        # covers chunk seams. These arguments make the planner byte-for-byte
+        # identical to the pre-extraction packer.
+        self._planner = ChunkPlanner(
+            self.aux_window,
+            overhead_tokens=self._overhead,
+            output_reserve=self.output_budget,
+            carry_reserve=self.output_budget,
+            overlap_ratio=0.0,
+            token_counter=self._token_counter,
+            counting_model=self.counting_model,
+        )
+
     # ------------------------------------------------------------------
     # Budget + plan
     # ------------------------------------------------------------------
@@ -324,99 +230,21 @@ class SummarizationEngine:
 
     @property
     def chunk_budget(self) -> int:
-        """Max input tokens of conversation text per fold call.
+        """Max input tokens of conversation text per fold call (delegated)."""
+        return self._planner.chunk_budget
 
-        ``safe_input`` leaves room for prompt overhead and the model's output;
-        the running summary (bounded by ``output_budget``) rides along with
-        every chunk, so it is subtracted once more.
-        """
-        safe_input = (
-            math.floor(self.aux_window * SAFETY_MARGIN)
-            - self._overhead
-            - self.output_budget
-        )
-        return safe_input - self.output_budget
+    def plan(self, formatted_parts: List[str]) -> ChunkPlan:
+        """Pack formatted conversation parts into within-budget fold chunks.
 
-    def plan(self, formatted_parts: List[str]) -> SummarizationPlan:
-        """Pack formatted conversation parts into within-budget chunks.
-
-        Pure and deterministic — no LLM calls. Oversized single parts (one
-        giant tool result) are hard-split so no chunk can exceed the budget.
+        Thin delegator to the shared :class:`ChunkPlanner` (pure, deterministic,
+        no LLM calls). Oversized single parts are hard-split so no chunk exceeds
+        the budget.
 
         Raises:
             SummarizationFailed: ``aux_window_too_small`` when the window
-                cannot fit even the prompt + output budget.
+                cannot fit even the prompt + reserves.
         """
-        budget = self.chunk_budget
-        if budget < 1_000:
-            raise SummarizationFailed(
-                "aux_window_too_small",
-                f"Auxiliary window {self.aux_window} cannot fit prompt overhead "
-                f"({self._overhead}) + output budget ({self.output_budget})",
-            )
-
-        # Expand oversized parts into sub-parts that each fit the budget.
-        expanded: List[tuple] = []  # (part_ordinal, text, tokens)
-        for ordinal, part in enumerate(formatted_parts, start=1):
-            tokens = self._count(part)
-            if tokens <= budget:
-                expanded.append((ordinal, part, tokens))
-                continue
-            # Size pieces against a reduced budget so the marker prefix and
-            # mid-token cut inflation can't push a piece over the real budget.
-            effective = max(budget - _SPLIT_MARKER_RESERVE_TOKENS, 1)
-            n_pieces = math.ceil(tokens / effective)
-            # Split by chars proportionally; re-measure each piece.
-            piece_chars = math.ceil(len(part) / n_pieces)
-            for i in range(n_pieces):
-                piece = part[i * piece_chars : (i + 1) * piece_chars]
-                if not piece:
-                    continue
-                marked = f"[part {i + 1}/{n_pieces} of an oversized message]\n{piece}"
-                expanded.append((ordinal, marked, self._count(marked)))
-
-        chunks: List[ChunkSpec] = []
-        current_parts: List[str] = []
-        current_tokens = 0
-        current_first: Optional[int] = None
-        current_last: Optional[int] = None
-        total_tokens = 0
-
-        def _flush() -> None:
-            nonlocal current_parts, current_tokens, current_first, current_last
-            if not current_parts:
-                return
-            chunks.append(
-                ChunkSpec(
-                    index=len(chunks) + 1,
-                    first_part=current_first or 1,
-                    last_part=current_last or (current_first or 1),
-                    text="\n".join(current_parts),
-                    tokens=current_tokens,
-                )
-            )
-            current_parts = []
-            current_tokens = 0
-            current_first = None
-            current_last = None
-
-        for ordinal, text, tokens in expanded:
-            total_tokens += tokens
-            if current_tokens + tokens > budget and current_parts:
-                _flush()
-            if current_first is None:
-                current_first = ordinal
-            current_last = ordinal
-            current_parts.append(text)
-            current_tokens += tokens
-        _flush()
-
-        return SummarizationPlan(
-            chunks=chunks,
-            total_tokens=total_tokens,
-            chunk_budget=budget,
-            aux_window=self.aux_window,
-        )
+        return self._planner.plan(formatted_parts)
 
     # ------------------------------------------------------------------
     # Fold loop
@@ -424,7 +252,7 @@ class SummarizationEngine:
 
     async def run(
         self,
-        plan: SummarizationPlan,
+        plan: ChunkPlan,
         *,
         seed_summary: Optional[str] = None,
         focus: Optional[str] = None,
@@ -467,7 +295,7 @@ class SummarizationEngine:
         return summary or ""
 
     async def _call_with_retries(
-        self, fold_text: str, plan: SummarizationPlan, chunk: ChunkSpec
+        self, fold_text: str, plan: ChunkPlan, chunk: Chunk
     ) -> str:
         last_error: Optional[BaseException] = None
         for attempt in range(1, MAX_ATTEMPTS + 1):
@@ -528,8 +356,8 @@ class SummarizationEngine:
 
     async def _emit_progress(
         self,
-        plan: SummarizationPlan,
-        chunk: ChunkSpec,
+        plan: ChunkPlan,
+        chunk: Chunk,
         *,
         attempt: int,
         out_tokens: Optional[int],

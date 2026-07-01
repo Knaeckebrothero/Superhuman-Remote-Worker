@@ -509,6 +509,76 @@ class TestIngestionVerdict:
         mock_db.fetchrow.assert_awaited()
 
 
+class TestPreInsertDedupRecheck:
+    """Slice 0 — the dual-trigger dedup race guard in _store_with_verdict (§4.7).
+
+    Every ADD terminal re-runs find_similar_many at ``recheck_threshold`` right
+    before inserting, reusing the candidate embedding. A twin that a concurrent
+    writer committed *between* the first check and the insert bumps instead of
+    inserting a duplicate; a non-racing write sees the same state twice and
+    behaves exactly as before. Driven by ``mock_db.fetch.side_effect`` = the
+    [first-lookup, re-check] result pair.
+    """
+
+    @pytest.mark.asyncio
+    async def test_racing_twin_bumps_instead_of_inserting(self, store, mock_db):
+        """A twin committed between the cost-guard check and the insert → bump."""
+        twin = _neighbour_row(content="same fact", sim=0.95)
+        store.ingestion_verdict = _FakeVerdictService(_FakeVerdict("ADD"))
+        # 1st find_similar_many (cost guard): nothing close → straight-ADD path.
+        # 2nd find_similar_many (pre-insert re-check): a twin has appeared.
+        mock_db.fetch.side_effect = [[], [twin]]
+
+        result = await store.store(content="same fact", importance=0.8)
+
+        assert result == twin["id"]  # bumped the twin
+        mock_db.fetchval.assert_not_awaited()  # never inserted a duplicate
+        mock_db.execute.assert_awaited()  # bump UPDATE ran
+
+    @pytest.mark.asyncio
+    async def test_non_racing_write_inserts_normally(self, store, mock_db):
+        """No twin appears between the checks → ordinary ADD, unchanged behaviour."""
+        store.ingestion_verdict = _FakeVerdictService(_FakeVerdict("ADD"))
+        mock_db.fetch.side_effect = [[], []]  # empty both times
+        new_id = uuid.uuid4()
+        mock_db.fetchval.return_value = new_id
+
+        result = await store.store(content="genuinely new", importance=0.8)
+
+        assert result == new_id
+        mock_db.fetchval.assert_awaited_once()  # inserted once
+
+    @pytest.mark.asyncio
+    async def test_recheck_excludes_already_adjudicated_neighbour(self, store, mock_db):
+        """A ≥0.9 neighbour the verdict already cleared for ADD must not be re-bumped."""
+        neighbour = _neighbour_row(content="close but distinct", sim=0.93)
+        store.ingestion_verdict = _FakeVerdictService(_FakeVerdict("ADD"))
+        # Same high-similarity neighbour on both the first lookup and the
+        # re-check: it is in the adjudicated (excluded) set, so no bump — the
+        # explicit ADD verdict stands.
+        mock_db.fetch.side_effect = [[neighbour], [neighbour]]
+        new_id = uuid.uuid4()
+        mock_db.fetchval.return_value = new_id
+
+        result = await store.store(content="close but distinct v2", importance=0.8)
+
+        assert result == new_id
+        mock_db.fetchval.assert_awaited_once()  # ADD honoured, not downgraded
+
+    @pytest.mark.asyncio
+    async def test_recheck_lookup_failure_falls_back_to_add(self, store, mock_db):
+        """A failed re-check SELECT must not lose the write — proceed with ADD."""
+        store.ingestion_verdict = _FakeVerdictService(_FakeVerdict("ADD"))
+        mock_db.fetch.side_effect = [[], RuntimeError("db blip")]
+        new_id = uuid.uuid4()
+        mock_db.fetchval.return_value = new_id
+
+        result = await store.store(content="new despite blip", importance=0.8)
+
+        assert result == new_id
+        mock_db.fetchval.assert_awaited_once()
+
+
 class TestFindSimilarManyAndSupersede:
     """The two new write-path primitives."""
 

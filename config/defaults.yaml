@@ -255,6 +255,7 @@ memory:
     writers:
       - interval_extractor           # Worker in-loop observer (modulo gate)
       - phase_boundary_extractor     # Extraction at archive_phase
+      - pre_compaction_extractor     # Chunked extraction of the evicted slice before compaction
       - memory_assembler             # TTL curation every assembler_interval turns
       - compaction_memory            # Store compaction summaries
       - queued_memory                # Flush todo_complete-queued memories
