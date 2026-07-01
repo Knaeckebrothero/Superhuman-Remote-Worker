@@ -1577,6 +1577,19 @@ vmController:
   # -- CDI DataVolume storage class + size for the VM root disk.
   vmStorageClass: local-path
   vmDiskSize: 20Gi
+  # -- Golden-image boot acceleration
+  # (docs/features/vm_golden_image_boot_acceleration.md). Import the base image
+  # once into a shared golden PVC per digest; clone each VM root disk from it
+  # (host-assisted local copy on local-path) instead of a per-VM registry
+  # import. Off = byte-for-byte the current registry-per-VM behaviour.
+  goldenImage:
+    enabled: false
+    # Golden PVC size; empty → vmDiskSize (keeps the clone target >= source).
+    diskSize: ""
+    gc:
+      enabled: true
+      keep: 3            # keep the N newest image digests
+      minAgeMinutes: 30  # don't GC a golden younger than this
   # -- SSH public key injected into the VM's authorized_keys (cloud-init).
   # The matching private key lives in the chart's vm-ssh-key secret and is
   # mounted into orchestrator/agent pods. Required for HTTP/lifecycle mode

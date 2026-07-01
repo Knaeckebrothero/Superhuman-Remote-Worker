@@ -22062,6 +22062,151 @@ async def codex_models(request: Request) -> dict[str, Any]:
     return {"models": models}
 
 
+# ChatGPT backend usage endpoint — the authoritative Codex subscription
+# rate-limit windows (5h + weekly), the same source the codex CLI's /status
+# polls. Not exposed by the proxy (it 404s /wham/usage), so the orchestrator
+# fetches it directly with the account's OAuth token.
+CODEX_WHAM_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
+
+
+def _decode_jwt_claims(token: str) -> dict[str, Any]:
+    """Best-effort decode of a JWT payload (no signature check — we only read
+    the non-secret account-scoping claim from a token we already hold)."""
+    import base64
+
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        return json.loads(base64.urlsafe_b64decode(payload))
+    except Exception:
+        return {}
+
+
+def _chatgpt_account_id(auth_file: dict[str, Any]) -> Optional[str]:
+    """Pull the ChatGPT account id from a downloaded codex auth file's id_token
+    (``https://api.openai.com/auth.chatgpt_account_id``). wham/usage wants it in
+    the ``ChatGPT-Account-Id`` header."""
+    claims = _decode_jwt_claims(auth_file.get("id_token", "") or "")
+    auth = claims.get("https://api.openai.com/auth", {}) or {}
+    return auth.get("chatgpt_account_id") or claims.get("chatgpt_account_id")
+
+
+def _codex_usage_window(w: Any) -> Optional[dict[str, Any]]:
+    """Normalize a wham/usage rate-limit window to the cockpit's shape."""
+    if not isinstance(w, dict):
+        return None
+    return {
+        "used_percent": w.get("used_percent"),
+        "window_seconds": w.get("limit_window_seconds"),
+        "reset_after_seconds": w.get("reset_after_seconds"),
+        "reset_at": w.get("reset_at"),
+    }
+
+
+async def _fetch_codex_usage() -> Optional[dict[str, Any]]:
+    """Fetch Codex subscription rate-limit windows from the ChatGPT backend.
+
+    Path: management API ``auth-files`` → pick the active account → download its
+    token → call ChatGPT ``wham/usage`` with ``Bearer`` + ``ChatGPT-Account-Id``.
+    The OAuth token never leaves the orchestrator (only the aggregate percentages
+    reach the UI). Returns ``None`` (→ endpoint degrades to ``available: false``)
+    when the proxy is unreachable, no account is active, or the backend call
+    fails — including the case where the orchestrator lacks chatgpt.com egress.
+    """
+    try:
+        auth_resp = await _codex_proxy_request("GET", "/v0/management/auth-files")
+        files = auth_resp.json()
+    except HTTPException:
+        return None
+    accounts = files if isinstance(files, list) else files.get("files", [])
+    active = next(
+        (
+            a
+            for a in accounts
+            if str(a.get("disabled")).lower() != "true"
+            and str(a.get("unavailable")).lower() != "true"
+        ),
+        None,
+    )
+    name = (active or {}).get("name") or (active or {}).get("id")
+    if not name:
+        return None
+
+    try:
+        dl = await _codex_proxy_request(
+            "GET", "/v0/management/auth-files/download", params={"name": name}
+        )
+        token_file = dl.json()
+    except HTTPException:
+        return None
+    access_token = token_file.get("access_token")
+    if not access_token:
+        return None
+    account_id = _chatgpt_account_id(token_file)
+
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "User-Agent": "srw-codex-usage/1.0",
+    }
+    if account_id:
+        headers["ChatGPT-Account-Id"] = account_id
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(CODEX_WHAM_USAGE_URL, headers=headers)
+        if resp.status_code >= 400:
+            logger.warning("codex wham/usage returned HTTP %s", resp.status_code)
+            return None
+        data = resp.json()
+    except Exception:
+        logger.warning("codex wham/usage fetch failed (non-fatal)", exc_info=True)
+        return None
+
+    rl = data.get("rate_limit") or {}
+    per_model = [
+        {
+            "name": extra.get("limit_name"),
+            "primary": _codex_usage_window(
+                (extra.get("rate_limit") or {}).get("primary_window")
+            ),
+            "secondary": _codex_usage_window(
+                (extra.get("rate_limit") or {}).get("secondary_window")
+            ),
+        }
+        for extra in (data.get("additional_rate_limits") or [])
+    ]
+    credits = data.get("credits") or {}
+    return {
+        "account": data.get("email"),
+        "plan_type": data.get("plan_type"),
+        "limit_reached": bool(rl.get("limit_reached")),
+        "primary": _codex_usage_window(rl.get("primary_window")),
+        "secondary": _codex_usage_window(rl.get("secondary_window")),
+        "per_model": per_model,
+        "credits": {
+            "has_credits": bool(credits.get("has_credits")),
+            "unlimited": bool(credits.get("unlimited")),
+            "balance": credits.get("balance"),
+        }
+        if credits
+        else None,
+    }
+
+
+@app.get("/api/codex/usage")
+async def codex_usage(request: Request) -> dict[str, Any]:
+    """Codex subscription usage/limits (admin-only): the ChatGPT 5-hour + weekly
+    rate-limit windows behind the codex proxy, for the cockpit capacity bars.
+
+    Non-fatal: returns ``{"available": false}`` when the proxy is disabled/down,
+    no account is connected, or the ChatGPT backend call fails.
+    """
+    await _require_admin(request)
+    usage = await _fetch_codex_usage()
+    if usage is None:
+        return {"available": False}
+    return {"available": True, **usage}
+
+
 @app.post("/api/codex/login")
 async def codex_login(request: Request) -> dict[str, Any]:
     """Initiate Codex OAuth login flow (admin-only).

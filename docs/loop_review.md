@@ -4,6 +4,11 @@ A living log of issues, rough edges, and optimizations found while running the
 **project self-improvement loop** on real test runs. Companion to the design +
 implementation plan: [`features/project_self_improvement_loop.md`](features/project_self_improvement_loop.md).
 
+Related concept: [`features/loop_parallel_execution.md`](features/loop_parallel_execution.md) weighs an optional
+parallel/pipelined execution mode; its "is speed even the bottleneck?" question is answered by the
+cost/latency findings logged here (e.g. Run 1's prompt-token-dominated critic — parallelism cuts
+wall-clock, not token cost).
+
 Anything big enough to need its own write-up gets a `docs/issues/` doc and is
 linked from here; everything else — the small stuff and the tuning ideas —
 lives here so it doesn't get lost between runs.

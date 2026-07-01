@@ -713,6 +713,14 @@
       "submitting": "Wird gesendet…",
       "completeLogin": "Anmeldung abschließen",
       "portForwardHint": "Wenn kubectl port-forward aktiv ist, wird die Anmeldung automatisch abgeschlossen.",
+      "usage": {
+        "title": "Nutzungslimits",
+        "session": "Aktuelle Sitzung",
+        "weekly": "Wochenlimit",
+        "resetsIn": "Zurücksetzung in {{time}}",
+        "limitReached": "Limit erreicht",
+        "disclaimer": "Der Proxy stellt keine Nutzungsdaten bereit: ChatGPT erfasst über den Proxy geleitete Anfragen als 'zusätzliche Nutzung' außerhalb dieser Fenster, daher spiegeln diese Balken die Proxy-Nutzung noch nicht wider."
+      },
       "errors": {
         "urlMissingParams": "Der URL fehlen erforderliche Parameter. Bitte fügen Sie die vollständige URL aus der Adressleiste Ihres Browsers ein.",
         "invalidUrl": "Ungültige URL. Bitte fügen Sie die vollständige URL aus der Adressleiste Ihres Browsers ein.",

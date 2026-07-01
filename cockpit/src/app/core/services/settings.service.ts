@@ -5,6 +5,7 @@ import {
   ApiKeyEntry,
   ApiKeySetRequest,
   CodexStatus,
+  CodexUsage,
   LlmEndpoint,
   LlmEndpointCreateRequest,
   LlmEndpointTestResult,
@@ -140,6 +141,14 @@ export class SettingsService {
     return this.http
       .get<{ models: string[] }>(`${this.baseUrl}/codex/models`)
       .pipe(catchError(() => of({ models: [] })));
+  }
+
+  /** Codex subscription 5h + weekly rate-limit windows (admin-only). Degrades to
+   * `available: false` on any error so the card just hides the bars. */
+  getCodexUsage(): Observable<CodexUsage> {
+    return this.http
+      .get<CodexUsage>(`${this.baseUrl}/codex/usage`)
+      .pipe(catchError(() => of({ available: false } as CodexUsage)));
   }
 
   startCodexLogin(): Observable<{ auth_url: string; state: string }> {

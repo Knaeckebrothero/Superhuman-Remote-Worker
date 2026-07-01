@@ -24,11 +24,14 @@ See docs/features/vm_backend.md (Phase 3) and docs/features/nats.md.
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
+import re
 import signal
 import sys
+from datetime import datetime, timezone
 
 import yaml
 
@@ -66,6 +69,28 @@ DEFAULT_MEMORY = os.environ.get("DEFAULT_MEMORY", "4Gi")
 VM_STORAGE_CLASS = os.environ.get("VM_STORAGE_CLASS", "local-path")
 VM_DISK_SIZE = os.environ.get("VM_DISK_SIZE", "20Gi")
 
+# Golden-image boot acceleration
+# (docs/features/vm_golden_image_boot_acceleration.md). When enabled, the base
+# image is imported ONCE into a standalone "golden" DataVolume/PVC per image
+# digest, and each VM's root disk is a CDI clone of it (host-assisted local copy
+# on local-path) instead of a per-VM registry import. Off by default →
+# byte-for-byte the legacy registry-per-VM behaviour.
+VM_GOLDEN_IMAGE_ENABLED = os.environ.get(
+    "VM_GOLDEN_IMAGE_ENABLED", "false"
+).strip().lower() in ("1", "true", "yes")
+# Golden PVC size; falls back to VM_DISK_SIZE so the clone target (also
+# VM_DISK_SIZE) is never smaller than its source.
+VM_GOLDEN_DISK_SIZE = os.environ.get("VM_GOLDEN_DISK_SIZE", "").strip() or VM_DISK_SIZE
+# Bounded wait for a golden import/clone to reach Succeeded (mirrors the agent's
+# VM_UPGRADE_POLL_TIMEOUT=900 cold-import budget).
+VM_GOLDEN_POLL_TIMEOUT = int(os.environ.get("VM_GOLDEN_POLL_TIMEOUT", "900"))
+VM_GOLDEN_GC_ENABLED = os.environ.get(
+    "VM_GOLDEN_GC_ENABLED", "true"
+).strip().lower() in ("1", "true", "yes")
+# Keep the N newest golden digests; GC older ones (mirrors CDI's importsToKeep).
+VM_GOLDEN_KEEP = int(os.environ.get("VM_GOLDEN_KEEP", "3"))
+VM_GOLDEN_GC_MIN_AGE_MINUTES = int(os.environ.get("VM_GOLDEN_GC_MIN_AGE_MINUTES", "30"))
+
 # Transport selection: nats | http | both. Defaults to nats so existing
 # deployment-vms/ Fleet bundles keep working without overrides.
 TRANSPORT = os.environ.get("TRANSPORT", "nats").lower()
@@ -76,6 +101,11 @@ LISTEN_PORT = int(os.environ.get("LISTEN_PORT", "8080"))
 KUBEVIRT_GROUP = "kubevirt.io"
 KUBEVIRT_VERSION = "v1"
 KUBEVIRT_PLURAL = "virtualmachines"
+
+# CDI (Containerized Data Importer) API coordinates — golden DataVolumes
+CDI_GROUP = "cdi.kubevirt.io"
+CDI_VERSION = "v1beta1"
+CDI_PLURAL = "datavolumes"
 
 
 class VMController:
@@ -204,8 +234,26 @@ class VMController:
                     job_id,
                 )
 
+        # Golden-image acceleration: import the base image once into a shared
+        # golden PVC and clone the rootdisk from it, instead of a per-VM registry
+        # import. Runs on EVERY create (incl. crash-recovery re-dispatch). Any
+        # failure leaves golden_name None → the rendered manifest keeps its
+        # registry source (byte-for-byte legacy behaviour + fallback).
+        image = job_config.get("vm_image") or DEFAULT_VM_IMAGE
+        golden_name = None
+        if VM_GOLDEN_IMAGE_ENABLED:
+            try:
+                golden_name = await self._ensure_golden(image)
+            except Exception:
+                log.exception(
+                    "golden ensure failed for job %s — falling back to registry",
+                    job_id,
+                )
+
         manifest = self.render_template(job_config, tailscale_auth_key)
         vm_name = manifest["metadata"]["name"]
+        if golden_name:
+            self._apply_clone_source(manifest, golden_name)
 
         max_retries = 12  # ~60s total
         for attempt in range(max_retries + 1):
@@ -237,6 +285,13 @@ class VMController:
                 raise
 
         log.info("VM created: %s (job %s)", vm_name, job_id)
+
+        # Best-effort GC of stale goldens from previous image digests. Never the
+        # current image's golden, one a live VM references (in-flight clone), or
+        # one younger than the min age. Fire-and-forget so it can't delay create.
+        if VM_GOLDEN_IMAGE_ENABLED and VM_GOLDEN_GC_ENABLED and golden_name:
+            asyncio.create_task(self._gc_goldens_safe(image))
+
         return {
             "job_id": job_id,
             "status": "created",
@@ -293,6 +348,236 @@ class VMController:
             "phase": status.get("printableStatus", "Unknown"),
             "created": status.get("created", False),
         }
+
+    # =========================================================================
+    # Golden-image cloning
+    # (docs/features/vm_golden_image_boot_acceleration.md)
+    #
+    # All K8s calls go through asyncio.to_thread — the kubernetes client is
+    # synchronous and a blocking poll here would stall every other NATS/HTTP
+    # handler on the event loop.
+    # =========================================================================
+
+    async def _get_dv(self, name: str) -> dict | None:
+        """GET a CDI DataVolume by name; None on 404."""
+        from kubernetes.client.exceptions import ApiException
+
+        try:
+            return await asyncio.to_thread(
+                self.k8s_client.get_namespaced_custom_object,
+                group=CDI_GROUP,
+                version=CDI_VERSION,
+                namespace=VM_NAMESPACE,
+                plural=CDI_PLURAL,
+                name=name,
+            )
+        except ApiException as e:
+            if e.status == 404:
+                return None
+            raise
+
+    async def _delete_dv(self, name: str) -> None:
+        """DELETE a CDI DataVolume (its PVC cascades); 404 is success."""
+        from kubernetes.client.exceptions import ApiException
+
+        try:
+            await asyncio.to_thread(
+                self.k8s_client.delete_namespaced_custom_object,
+                group=CDI_GROUP,
+                version=CDI_VERSION,
+                namespace=VM_NAMESPACE,
+                plural=CDI_PLURAL,
+                name=name,
+            )
+        except ApiException as e:
+            if e.status != 404:
+                raise
+
+    async def _wait_dv_succeeded(self, name: str) -> bool:
+        """Poll a DataVolume until phase Succeeded (True); Failed/timeout → False."""
+        deadline = asyncio.get_running_loop().time() + VM_GOLDEN_POLL_TIMEOUT
+        while asyncio.get_running_loop().time() < deadline:
+            dv = await self._get_dv(name)
+            phase = ((dv or {}).get("status") or {}).get("phase", "")
+            if phase == "Succeeded":
+                return True
+            if phase == "Failed":
+                return False
+            await asyncio.sleep(5)
+        log.warning(
+            "golden %s did not reach Succeeded within %ds", name, VM_GOLDEN_POLL_TIMEOUT
+        )
+        return False
+
+    def _golden_dv_manifest(self, name: str, image: str) -> dict:
+        """Build a standalone golden DataVolume that imports ``image`` once.
+
+        Uses the explicit ``spec.pvc`` form with accessModes + volumeMode set —
+        local-path has no StorageProfile, so the size-only ``spec.storage``
+        inference form fails validation. ``bind.immediate`` forces populate on
+        WaitForFirstConsumer storage (the golden is never VM-mounted, so nothing
+        else would trigger it); ``deleteAfterCompletion:false`` keeps the DV
+        object as our reuse handle after CDI would otherwise GC it post-import.
+        """
+        return {
+            "apiVersion": f"{CDI_GROUP}/{CDI_VERSION}",
+            "kind": "DataVolume",
+            "metadata": {
+                "name": name,
+                "namespace": VM_NAMESPACE,
+                "labels": {
+                    "srw.io/golden-image": name.rsplit("-", 1)[-1],
+                    "srw.io/vm-image": _label_safe(image),
+                },
+                "annotations": {
+                    "cdi.kubevirt.io/storage.bind.immediate.requested": "true",
+                    "cdi.kubevirt.io/storage.deleteAfterCompletion": "false",
+                    "srw.io/vm-image-ref": image,
+                },
+            },
+            "spec": {
+                "source": {"registry": {"url": f"docker://{image}"}},
+                "pvc": {
+                    "accessModes": ["ReadWriteOnce"],
+                    "volumeMode": "Filesystem",
+                    "storageClassName": VM_STORAGE_CLASS,
+                    "resources": {"requests": {"storage": VM_GOLDEN_DISK_SIZE}},
+                },
+            },
+        }
+
+    async def _ensure_golden(self, image: str) -> str | None:
+        """Ensure a Succeeded golden DataVolume for ``image``; return its name,
+        or None so the caller falls back to the legacy registry source.
+
+        Idempotent + concurrency-safe: the Kubernetes create-409 is the lock, so
+        parallel creates converge on one import. Called on EVERY create path,
+        including crash-recovery re-dispatch.
+        """
+        from kubernetes.client.exceptions import ApiException
+
+        name = _golden_name(image)
+        dv = await self._get_dv(name)
+        phase = ((dv or {}).get("status") or {}).get("phase", "")
+
+        if dv and phase == "Succeeded":
+            return name
+        if dv and phase == "Failed":
+            log.warning("golden %s is Failed — recreating", name)
+            await self._delete_dv(name)
+            dv = None
+        if dv is not None:
+            # Importing / Pending / CloneScheduled / "" — already being built.
+            return name if await self._wait_dv_succeeded(name) else None
+
+        # Absent → create (409 = another create won the race; both then wait).
+        try:
+            await asyncio.to_thread(
+                self.k8s_client.create_namespaced_custom_object,
+                group=CDI_GROUP,
+                version=CDI_VERSION,
+                namespace=VM_NAMESPACE,
+                plural=CDI_PLURAL,
+                body=self._golden_dv_manifest(name, image),
+            )
+            log.info("golden %s: importing %s (once)", name, image)
+        except ApiException as e:
+            if e.status != 409:
+                log.warning("golden %s create failed: %s", name, e)
+                return None
+        return name if await self._wait_dv_succeeded(name) else None
+
+    def _apply_clone_source(self, manifest: dict, golden_name: str) -> None:
+        """Mutate a rendered VM manifest so its rootdisk clones the golden PVC
+        instead of importing from the registry. Same namespace → no ``namespace``
+        key (avoids cross-namespace clone RBAC). Keeps the clone target
+        WaitForFirstConsumer (NO bind.immediate) so it binds on the VM's node.
+        """
+        dv_spec = manifest["spec"]["dataVolumeTemplates"][0]["spec"]
+        dv_spec["source"] = {"pvc": {"name": golden_name}}
+        # Clone target must match the golden's Filesystem volumeMode.
+        dv_spec.setdefault("storage", {})["volumeMode"] = "Filesystem"
+
+    async def _gc_goldens_safe(self, image: str) -> None:
+        """Non-fatal wrapper around _gc_goldens for fire-and-forget scheduling."""
+        try:
+            await self._gc_goldens(image)
+        except Exception:
+            log.exception("golden GC pass failed")
+
+    async def _gc_goldens(self, current_image: str) -> None:
+        """Delete stale golden DataVolumes, keeping the newest N digests. Never
+        touch the current image's golden, one a live VM still references (its
+        in-flight clone reads the source pod), or one younger than the min age.
+        Deletes the DataVolume only — its PVC cascades (the controller has no
+        CoreV1Api / PVC permissions by design).
+        """
+        from kubernetes.client.exceptions import ApiException
+
+        try:
+            resp = await asyncio.to_thread(
+                self.k8s_client.list_namespaced_custom_object,
+                group=CDI_GROUP,
+                version=CDI_VERSION,
+                namespace=VM_NAMESPACE,
+                plural=CDI_PLURAL,
+                label_selector="srw.io/golden-image",
+            )
+        except ApiException as e:
+            log.debug("golden GC list failed: %s", e)
+            return
+        goldens = resp.get("items", [])
+        if len(goldens) <= VM_GOLDEN_KEEP:
+            return
+
+        # In-use = any golden a live VM's rootdisk was cloned from.
+        in_use: set[str] = set()
+        try:
+            vms = await asyncio.to_thread(
+                self.k8s_client.list_namespaced_custom_object,
+                group=KUBEVIRT_GROUP,
+                version=KUBEVIRT_VERSION,
+                namespace=VM_NAMESPACE,
+                plural=KUBEVIRT_PLURAL,
+            )
+        except ApiException as e:
+            log.debug("golden GC VM list failed — skipping GC this pass: %s", e)
+            return
+        for vm in vms.get("items", []):
+            for dvt in vm.get("spec", {}).get("dataVolumeTemplates", []):
+                pvc = (dvt.get("spec", {}).get("source", {}) or {}).get("pvc")
+                if pvc and pvc.get("name"):
+                    in_use.add(pvc["name"])
+
+        current = _golden_name(current_image)
+        goldens.sort(
+            key=lambda g: g.get("metadata", {}).get("creationTimestamp", ""),
+            reverse=True,
+        )
+        for g in goldens[VM_GOLDEN_KEEP:]:
+            name = g.get("metadata", {}).get("name", "")
+            if not name or name == current or name in in_use:
+                continue
+            if _age_minutes(g) < VM_GOLDEN_GC_MIN_AGE_MINUTES:
+                continue
+            try:
+                await self._delete_dv(name)
+                log.info("golden GC: deleted stale %s", name)
+            except Exception as e:
+                log.warning("golden GC: delete %s failed: %s", name, e)
+
+    async def _prewarm_golden(self) -> None:
+        """Best-effort: import the default image's golden before the first job,
+        so the first VM doesn't pay the one-time import on its critical path.
+        """
+        try:
+            name = await self._ensure_golden(DEFAULT_VM_IMAGE)
+            if name:
+                log.info("golden pre-warm ready: %s", name)
+            else:
+                log.warning("golden pre-warm did not complete (non-fatal)")
+        except Exception:
+            log.exception("golden pre-warm failed (non-fatal)")
 
     # =========================================================================
     # NATS transport
@@ -466,6 +751,11 @@ class VMController:
         self.init_k8s()
         await self.headscale.init()
 
+        # Pre-warm the default image's golden so the first job doesn't pay the
+        # one-time import on its critical path (best-effort, non-blocking).
+        if VM_GOLDEN_IMAGE_ENABLED:
+            asyncio.create_task(self._prewarm_golden())
+
         if TRANSPORT in ("nats", "both"):
             if not ORCHESTRATOR_ID:
                 log.error(
@@ -515,6 +805,33 @@ def _safe_job_id(data: bytes) -> str:
         return json.loads(data.decode()).get("job_id", "unknown")
     except Exception:
         return "unknown"
+
+
+def _golden_name(image: str) -> str:
+    """Deterministic, DNS-safe golden PVC name from an image ref (content-keyed
+    on the full ref so a new base-image sha yields a new golden)."""
+    digest = hashlib.sha256(image.encode()).hexdigest()[:12]
+    return f"agent-vm-golden-{digest}"
+
+
+def _label_safe(image: str) -> str:
+    """Sanitize an image ref into a <=63-char Kubernetes label value."""
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", image)
+    return safe[-63:].strip("_.-") or "unknown"
+
+
+def _age_minutes(obj: dict) -> float:
+    """Age in minutes of a K8s object from its creationTimestamp; 0 if unknown."""
+    ts = obj.get("metadata", {}).get("creationTimestamp")
+    if not ts:
+        return 0.0
+    try:
+        created = datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=timezone.utc
+        )
+    except (ValueError, TypeError):
+        return 0.0
+    return (datetime.now(timezone.utc) - created).total_seconds() / 60.0
 
 
 def main():

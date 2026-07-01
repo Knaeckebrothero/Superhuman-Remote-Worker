@@ -631,6 +631,38 @@ export interface CodexStatus {
   model_count: number;
 }
 
+/** One Codex rate-limit window (5-hour or weekly), from ChatGPT `wham/usage`. */
+export interface CodexUsageWindow {
+  used_percent: number | null;
+  window_seconds: number | null;
+  reset_after_seconds: number | null;
+  reset_at: number | null;
+}
+
+/**
+ * Codex subscription usage / rate-limit windows (admin-only), fetched from the
+ * ChatGPT backend via the codex proxy. Powers the capacity bars in
+ * Settings → Codex. `available: false` when the proxy is down, no account is
+ * connected, or the backend is unreachable (the OAuth token stays server-side —
+ * only these aggregates cross to the UI).
+ */
+export interface CodexUsage {
+  available: boolean;
+  account?: string | null;
+  plan_type?: string | null;
+  limit_reached?: boolean;
+  /** 5-hour rolling "session" window. */
+  primary?: CodexUsageWindow | null;
+  /** 7-day "weekly" window. */
+  secondary?: CodexUsageWindow | null;
+  per_model?: {
+    name: string;
+    primary: CodexUsageWindow | null;
+    secondary: CodexUsageWindow | null;
+  }[];
+  credits?: { has_credits: boolean; unlimited: boolean; balance?: string | null } | null;
+}
+
 /**
  * Communication delivery preferences (Phase 3 Live Communication).
  */
