@@ -53,6 +53,18 @@ spec:
               value: {{ .Values.vmController.vmStorageClass | quote }}
             - name: VM_DISK_SIZE
               value: {{ .Values.vmController.vmDiskSize | quote }}
+            # Golden-image boot acceleration
+            # (docs/features/vm_golden_image_boot_acceleration.md)
+            - name: VM_GOLDEN_IMAGE_ENABLED
+              value: {{ .Values.vmController.goldenImage.enabled | default false | quote }}
+            - name: VM_GOLDEN_DISK_SIZE
+              value: {{ .Values.vmController.goldenImage.diskSize | default .Values.vmController.vmDiskSize | quote }}
+            - name: VM_GOLDEN_GC_ENABLED
+              value: {{ .Values.vmController.goldenImage.gc.enabled | default true | quote }}
+            - name: VM_GOLDEN_KEEP
+              value: {{ .Values.vmController.goldenImage.gc.keep | default 3 | quote }}
+            - name: VM_GOLDEN_GC_MIN_AGE_MINUTES
+              value: {{ .Values.vmController.goldenImage.gc.minAgeMinutes | default 30 | quote }}
             - name: HEADSCALE_URL
               value: {{ .Values.headscale.url | quote }}
             - name: HEADSCALE_API_KEY

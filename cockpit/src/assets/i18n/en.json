@@ -713,6 +713,14 @@
       "submitting": "Submitting...",
       "completeLogin": "Complete Login",
       "portForwardHint": "If you have kubectl port-forward active, login will complete automatically.",
+      "usage": {
+        "title": "Usage limits",
+        "session": "Current session",
+        "weekly": "Weekly limit",
+        "resetsIn": "Resets in {{time}}",
+        "limitReached": "Limit reached",
+        "disclaimer": "The proxy doesn't expose usage: ChatGPT meters proxy-routed requests as 'extra usage' outside these windows, so these bars don't reflect usage through the proxy yet."
+      },
       "errors": {
         "urlMissingParams": "URL is missing required parameters. Please paste the complete URL from your browser address bar.",
         "invalidUrl": "Invalid URL. Please paste the complete URL from your browser address bar.",

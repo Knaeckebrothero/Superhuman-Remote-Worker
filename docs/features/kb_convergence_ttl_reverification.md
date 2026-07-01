@@ -15,6 +15,7 @@ aliases:
 related:
   - "[[project_self_improvement_loop]]"
   - "[[loop_repo_compounding]]"
+  - "[[loop_parallel_execution]]"
   - "[[project_knowledge_base]]"
   - "[[agent_memory_overhaul]]"
   - "[[auxiliary]]"

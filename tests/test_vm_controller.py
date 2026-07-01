@@ -1642,3 +1642,233 @@ class TestModuleConstants:
         from vm.controller.controller import NATS_URL
 
         assert "nats://" in NATS_URL
+
+
+# =============================================================================
+# Tests: golden-image cloning
+# (docs/features/vm_golden_image_boot_acceleration.md)
+# =============================================================================
+
+from vm.controller.controller import _golden_name  # noqa: E402
+
+
+class TestGoldenName:
+    """Deterministic, content-keyed golden PVC names."""
+
+    def test_deterministic_and_prefixed(self):
+        n = _golden_name("ghcr.io/x/agent-vm-base:sha-abc")
+        assert n == _golden_name("ghcr.io/x/agent-vm-base:sha-abc")
+        assert n.startswith("agent-vm-golden-")
+        assert len(n) == len("agent-vm-golden-") + 12
+
+    def test_differs_per_image_digest(self):
+        assert _golden_name("img:sha-a") != _golden_name("img:sha-b")
+
+
+class TestApplyCloneSource:
+    """Rendered VM manifest → rootdisk clones the golden PVC instead of import."""
+
+    def test_swaps_registry_for_pvc_clone(self, controller):
+        manifest = controller.render_template(SAMPLE_JOB_CONFIG, "")
+        controller._apply_clone_source(manifest, "agent-vm-golden-deadbeef")
+        dv = manifest["spec"]["dataVolumeTemplates"][0]["spec"]
+        assert dv["source"] == {"pvc": {"name": "agent-vm-golden-deadbeef"}}
+        assert "registry" not in dv["source"]
+        # same namespace → no namespace key (avoids cross-ns clone RBAC)
+        assert "namespace" not in dv["source"]["pvc"]
+        # clone target must match the golden's Filesystem volumeMode
+        assert dv["storage"]["volumeMode"] == "Filesystem"
+
+
+class TestEnsureGolden:
+    """The golden ensure state machine, against the CDI DataVolume resource."""
+
+    @staticmethod
+    def _get(c):
+        return c.k8s_client.get_namespaced_custom_object
+
+    @staticmethod
+    def _create(c):
+        return c.k8s_client.create_namespaced_custom_object
+
+    @pytest.mark.asyncio
+    async def test_succeeded_fast_path_no_create(self, controller):
+        self._get(controller).return_value = {"status": {"phase": "Succeeded"}}
+        name = await controller._ensure_golden("img:sha-a")
+        assert name == _golden_name("img:sha-a")
+        self._create(controller).assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_absent_creates_then_waits_succeeded(self, controller):
+        self._get(controller).side_effect = [
+            _FakeApiException(status=404),
+            {"status": {"phase": "Succeeded"}},
+        ]
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            name = await controller._ensure_golden("img:sha-a")
+        assert name == _golden_name("img:sha-a")
+        create = self._create(controller)
+        create.assert_called_once()
+        kwargs = create.call_args.kwargs
+        assert kwargs["group"] == "cdi.kubevirt.io"
+        assert kwargs["version"] == "v1beta1"
+        assert kwargs["plural"] == "datavolumes"
+        # golden manifest: explicit spec.pvc + Filesystem + bind-immediate + keep-handle
+        body = kwargs["body"]
+        assert body["spec"]["pvc"]["volumeMode"] == "Filesystem"
+        assert body["spec"]["pvc"]["accessModes"] == ["ReadWriteOnce"]
+        ann = body["metadata"]["annotations"]
+        assert ann["cdi.kubevirt.io/storage.bind.immediate.requested"] == "true"
+        assert ann["cdi.kubevirt.io/storage.deleteAfterCompletion"] == "false"
+
+    @pytest.mark.asyncio
+    async def test_failed_golden_is_recreated(self, controller):
+        self._get(controller).side_effect = [
+            {"status": {"phase": "Failed"}},
+            {"status": {"phase": "Succeeded"}},
+        ]
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            name = await controller._ensure_golden("img:sha-a")
+        assert name == _golden_name("img:sha-a")
+        controller.k8s_client.delete_namespaced_custom_object.assert_called_once()
+        self._create(controller).assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_importing_waits_without_creating(self, controller):
+        self._get(controller).side_effect = [
+            {"status": {"phase": "ImportInProgress"}},
+            {"status": {"phase": "Succeeded"}},
+        ]
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            name = await controller._ensure_golden("img:sha-a")
+        assert name == _golden_name("img:sha-a")
+        self._create(controller).assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_create_409_is_the_lock_then_waits(self, controller):
+        self._get(controller).side_effect = [
+            _FakeApiException(status=404),
+            {"status": {"phase": "Succeeded"}},
+        ]
+        self._create(controller).side_effect = _FakeApiException(status=409)
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            name = await controller._ensure_golden("img:sha-a")
+        assert name == _golden_name("img:sha-a")
+
+    @pytest.mark.asyncio
+    async def test_create_failure_returns_none_for_fallback(self, controller):
+        self._get(controller).side_effect = [_FakeApiException(status=404)]
+        self._create(controller).side_effect = _FakeApiException(status=500)
+        name = await controller._ensure_golden("img:sha-a")
+        assert name is None
+
+
+class TestGcGoldens:
+    """Keep the newest N; never GC the current, in-use, or too-young goldens."""
+
+    @pytest.mark.asyncio
+    async def test_keeps_newest_skips_current_and_in_use(self, controller):
+        imgs = {k: f"img:sha-{k}" for k in ("new", "b", "c", "old")}
+        ts = {
+            "new": "2026-01-04T00:00:00Z",
+            "b": "2026-01-03T00:00:00Z",
+            "c": "2026-01-02T00:00:00Z",
+            "old": "2026-01-01T00:00:00Z",
+        }
+        goldens = {
+            "items": [
+                {
+                    "metadata": {
+                        "name": _golden_name(imgs[k]),
+                        "creationTimestamp": ts[k],
+                        "labels": {"srw.io/golden-image": "x"},
+                    }
+                }
+                for k in ("new", "b", "c", "old")
+            ]
+        }
+        vms = {
+            "items": [
+                {
+                    "spec": {
+                        "dataVolumeTemplates": [
+                            {
+                                "spec": {
+                                    "source": {"pvc": {"name": _golden_name(imgs["b"])}}
+                                }
+                            }
+                        ]
+                    }
+                }
+            ]
+        }
+        controller.k8s_client.list_namespaced_custom_object.side_effect = [goldens, vms]
+        with (
+            patch("vm.controller.controller.VM_GOLDEN_KEEP", 1),
+            patch("vm.controller.controller.VM_GOLDEN_GC_MIN_AGE_MINUTES", 0),
+        ):
+            await controller._gc_goldens(imgs["c"])  # current image = c
+        deletes = controller.k8s_client.delete_namespaced_custom_object
+        # keep newest 1 (new); b is in-use, c is current → only old is GC'd.
+        deleted = [call.kwargs["name"] for call in deletes.call_args_list]
+        assert deleted == [_golden_name(imgs["old"])]
+
+    @pytest.mark.asyncio
+    async def test_noop_when_at_or_below_keep(self, controller):
+        goldens = {
+            "items": [
+                {
+                    "metadata": {
+                        "name": "g1",
+                        "creationTimestamp": "2026-01-01T00:00:00Z",
+                    }
+                }
+            ]
+        }
+        controller.k8s_client.list_namespaced_custom_object.side_effect = [goldens]
+        with patch("vm.controller.controller.VM_GOLDEN_KEEP", 3):
+            await controller._gc_goldens("img:sha-a")
+        controller.k8s_client.delete_namespaced_custom_object.assert_not_called()
+
+
+class TestDoCreateGoldenIntegration:
+    """_do_create wires the clone in when enabled; byte-identical when off."""
+
+    @pytest.mark.asyncio
+    async def test_enabled_applies_clone_source(self, controller):
+        controller._ensure_golden = AsyncMock(
+            return_value="agent-vm-golden-abc123def456"
+        )
+        with (
+            patch("vm.controller.controller.VM_GOLDEN_IMAGE_ENABLED", True),
+            patch("vm.controller.controller.VM_GOLDEN_GC_ENABLED", False),
+        ):
+            await controller._do_create(SAMPLE_JOB_CONFIG)
+        body = controller.k8s_client.create_namespaced_custom_object.call_args.kwargs[
+            "body"
+        ]
+        src = body["spec"]["dataVolumeTemplates"][0]["spec"]["source"]
+        assert src == {"pvc": {"name": "agent-vm-golden-abc123def456"}}
+
+    @pytest.mark.asyncio
+    async def test_disabled_keeps_registry_source(self, controller):
+        with patch("vm.controller.controller.VM_GOLDEN_IMAGE_ENABLED", False):
+            await controller._do_create(SAMPLE_JOB_CONFIG)
+        body = controller.k8s_client.create_namespaced_custom_object.call_args.kwargs[
+            "body"
+        ]
+        src = body["spec"]["dataVolumeTemplates"][0]["spec"]["source"]
+        assert "registry" in src
+        assert "pvc" not in src
+
+    @pytest.mark.asyncio
+    async def test_golden_failure_falls_back_to_registry(self, controller):
+        controller._ensure_golden = AsyncMock(return_value=None)
+        with patch("vm.controller.controller.VM_GOLDEN_IMAGE_ENABLED", True):
+            await controller._do_create(SAMPLE_JOB_CONFIG)
+        body = controller.k8s_client.create_namespaced_custom_object.call_args.kwargs[
+            "body"
+        ]
+        src = body["spec"]["dataVolumeTemplates"][0]["spec"]["source"]
+        assert "registry" in src
+        assert "pvc" not in src

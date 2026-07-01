@@ -131,6 +131,8 @@ Run **N Scholars in parallel** → one Critic picks among all N proposals → on
 
 Always worth stating. Parent Open Question #1 is unmeasured: we don't yet *know* sequential is the bottleneck. The honest first move may be to **measure a real sequential run** (per-role durations, % of turn spent in the serial execution stage) and only then decide whether any of A–C clears its complexity bar. The [loop_review.md](../loop_review.md) findings (F-series, through F28) suggest the current headline problems are **compounding/quality** (non-compounding artifact, KB under-use), not wall-clock — speed may be optimizing the wrong axis right now.
 
+Concretely, the first real dev run ([loop_review.md](../loop_review.md) Run 1 — loop `27cabc53`, `gpt-5.5`, an ERP build goal) was **cost-dominated, not latency-dominated**: the Critic burned **~3.5M tokens (98% prompt)** merely to *select* among five proposals. That points at prompt/token cost as the live bottleneck — and **parallelism does nothing for token cost**: it runs the same tokens, just concurrently, at ~3× instantaneous spend (worse against the gateway RPM/quota limits). If cost — not wall-clock — is what hurts, none of A–C helps, and the lever is prompt-size / KB-hygiene work instead.
+
 ### Comparison
 
 | | A — Pipeline chain | B — Independent tracks | C — Stage fan-out | D — Sequential |
