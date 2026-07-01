@@ -3,8 +3,12 @@
 Covers token extraction from both homes (worker ``metrics.token_usage`` vs
 session ``metadata.*_tokens``), the Anthropic-wire input/output fallback,
 user/project attribution (jobs vs threads), the reasoning-not-double-counted
-rule, and the contiguous-aging cursor guard — all against fake asyncpg pools and
-a capturing ledger (no network / DB).
+rule, and the timestamp-cursor + contiguous-aging guard — all against fake
+asyncpg pools and a capturing ledger (no network / DB).
+
+The cursor is a ``timestamp`` (not ``id``): ``llm_requests.id`` is not monotonic
+with insertion time once the audit sequence has been reset, so these tests order
+and advance on ``timestamp`` and keep ``id`` only as the unique dedupe key.
 """
 
 from __future__ import annotations
@@ -24,8 +28,10 @@ PROJ = uuid.uuid4()
 JOB = uuid.uuid4()
 THREAD = uuid.uuid4()
 
-TS = datetime(2026, 7, 1, 12, 0, tzinfo=timezone.utc)
-NOW = datetime(2026, 7, 1, 12, 5, tzinfo=timezone.utc)  # 5 min after TS
+T0 = datetime(2026, 7, 1, 12, 0, tzinfo=timezone.utc)
+T1 = datetime(2026, 7, 1, 12, 1, tzinfo=timezone.utc)
+T2 = datetime(2026, 7, 1, 12, 2, tzinfo=timezone.utc)
+NOW = datetime(2026, 7, 1, 12, 5, tzinfo=timezone.utc)  # 5 min after T0
 
 
 def _row(
@@ -35,7 +41,7 @@ def _row(
     agent_type="scholar",
     call_type="main",
     model="minimax-m3",
-    ts=TS,
+    ts=T0,
     m_prompt=None,
     m_input=None,
     m_completion=None,
@@ -67,10 +73,13 @@ def _row(
 
 class AuditConn:
     def __init__(self, rows):
-        self.rows = sorted(rows, key=lambda r: r["id"])
+        self.rows = list(rows)
 
-    async def fetch(self, _sql, since_id, limit):
-        return [r for r in self.rows if r["id"] > since_id][:limit]
+    async def fetch(self, _sql, since_ts, limit):
+        # Mirror: WHERE timestamp > $1 ORDER BY timestamp, id LIMIT $2
+        out = [r for r in self.rows if r["timestamp"] > since_ts]
+        out.sort(key=lambda r: (r["timestamp"], r["id"]))
+        return out[:limit]
 
 
 class AppConn:
@@ -144,13 +153,13 @@ class TestFirstInt:
 class TestMaterialize:
     @pytest.mark.asyncio
     async def test_worker_row_emits_both_token_dimensions(self):
-        audit = FakePool(AuditConn([_row(1, m_prompt="100", m_completion="40")]))
+        audit = FakePool(AuditConn([_row(1, ts=T0, m_prompt="100", m_completion="40")]))
         app = FakePool(AppConn(jobs={JOB: (USER, PROJ)}))
         ledger = FakeLedger()
         res = await materialize_llm_usage_from_audit(
-            audit, app, ledger, since_id=0, min_age_s=0, now=NOW
+            audit, app, ledger, since_ts=None, min_age_s=0, now=NOW
         )
-        assert res == {"materialized": 2, "cursor": 1, "scanned": 1}
+        assert res == {"materialized": 2, "cursor": T0, "scanned": 1}
         by_unit = {e.unit: e for e in ledger.events}
         assert by_unit["prompt-token"].quantity == 100
         assert by_unit["completion-token"].quantity == 40
@@ -214,8 +223,8 @@ class TestMaterialize:
         audit = FakePool(
             AuditConn(
                 [
-                    _row(7, m_prompt="0", m_completion="0"),  # nothing to meter
-                    _row(8, m_prompt="10", m_completion="5"),
+                    _row(7, ts=T0, m_prompt="0", m_completion="0"),  # nothing to meter
+                    _row(8, ts=T1, m_prompt="10", m_completion="5"),
                 ]
             )
         )
@@ -224,18 +233,19 @@ class TestMaterialize:
         res = await materialize_llm_usage_from_audit(
             audit, app, ledger, min_age_s=0, now=NOW
         )
-        assert res["cursor"] == 8  # advanced past the empty row 7
+        assert res["cursor"] == T1  # advanced past the empty row's timestamp
         assert res["materialized"] == 2  # only row 8's two dimensions
 
     @pytest.mark.asyncio
     async def test_fresh_row_halts_contiguous_advance(self):
-        cutoff_fresh = NOW - timedelta(seconds=30)  # newer than cutoff (min_age 60)
+        fresh = NOW - timedelta(seconds=30)  # newer than cutoff (min_age 60)
+        # id deliberately non-monotonic with ts to prove the cursor is ts-keyed.
         audit = FakePool(
             AuditConn(
                 [
-                    _row(1, ts=TS, m_prompt="10", m_completion="5"),  # aged
-                    _row(2, ts=cutoff_fresh, m_prompt="10", m_completion="5"),  # fresh
-                    _row(3, ts=TS, m_prompt="10", m_completion="5"),  # aged, behind gap
+                    _row(999, ts=T0, m_prompt="10", m_completion="5"),  # aged
+                    _row(2, ts=fresh, m_prompt="10", m_completion="5"),  # fresh → halt
+                    _row(1, ts=NOW, m_prompt="10", m_completion="5"),  # fresher
                 ]
             )
         )
@@ -244,8 +254,8 @@ class TestMaterialize:
         res = await materialize_llm_usage_from_audit(
             audit, app, ledger, min_age_s=60, now=NOW
         )
-        assert res["cursor"] == 1  # stopped at the fresh row; never jumped to 3
-        assert res["materialized"] == 2  # only row 1 metered
+        assert res["cursor"] == T0  # stopped at the first fresh row
+        assert res["materialized"] == 2  # only the aged row metered
         assert res["scanned"] == 3
 
     @pytest.mark.asyncio
@@ -262,22 +272,22 @@ class TestMaterialize:
         assert e.ref_id == str(JOB)  # ref still recorded
 
     @pytest.mark.asyncio
-    async def test_since_id_filters_processed_rows(self):
+    async def test_since_ts_filters_processed_rows(self):
         audit = FakePool(
             AuditConn(
                 [
-                    _row(1, m_prompt="9", m_completion="9"),
-                    _row(2, m_prompt="10", m_completion="5"),
+                    _row(1, ts=T0, m_prompt="9", m_completion="9"),
+                    _row(2, ts=T1, m_prompt="10", m_completion="5"),
                 ]
             )
         )
         app = FakePool(AppConn(jobs={JOB: (USER, PROJ)}))
         ledger = FakeLedger()
         res = await materialize_llm_usage_from_audit(
-            audit, app, ledger, since_id=1, min_age_s=0, now=NOW
+            audit, app, ledger, since_ts=T0, min_age_s=0, now=NOW
         )
-        assert res["scanned"] == 1  # row 1 already below the cursor
-        assert res["cursor"] == 2
+        assert res["scanned"] == 1  # T0 row is at/below the cursor
+        assert res["cursor"] == T1
         assert res["materialized"] == 2
 
     @pytest.mark.asyncio
@@ -285,30 +295,30 @@ class TestMaterialize:
         audit = FakePool(AuditConn([]))
         app = FakePool(AppConn())
         res = await materialize_llm_usage_from_audit(
-            audit, app, FakeLedger(), since_id=42, min_age_s=0, now=NOW
+            audit, app, FakeLedger(), since_ts=T2, min_age_s=0, now=NOW
         )
-        assert res == {"materialized": 0, "cursor": 42, "scanned": 0}
+        assert res == {"materialized": 0, "cursor": T2, "scanned": 0}
 
     @pytest.mark.asyncio
     async def test_unavailable_pools_or_ledger_are_noops(self):
         good_audit = FakePool(AuditConn([_row(1, m_prompt="1", m_completion="1")]))
         good_app = FakePool(AppConn(jobs={JOB: (USER, PROJ)}))
-        noop = {"materialized": 0, "cursor": 9, "scanned": 0}
+        noop = {"materialized": 0, "cursor": T2, "scanned": 0}
         assert (
             await materialize_llm_usage_from_audit(
-                None, good_app, FakeLedger(), since_id=9
+                None, good_app, FakeLedger(), since_ts=T2
             )
             == noop
         )
         assert (
             await materialize_llm_usage_from_audit(
-                good_audit, None, FakeLedger(), since_id=9
+                good_audit, None, FakeLedger(), since_ts=T2
             )
             == noop
         )
         assert (
             await materialize_llm_usage_from_audit(
-                good_audit, good_app, FakeLedger(available=False), since_id=9
+                good_audit, good_app, FakeLedger(available=False), since_ts=T2
             )
             == noop
         )

@@ -27,10 +27,11 @@ and no-op) — same graceful-degradation posture as the rest of the metering tie
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
-from typing import Any, Iterable, Optional
+from typing import Any, Awaitable, Callable, Iterable, Optional
 
 import asyncpg
 import httpx
@@ -175,4 +176,88 @@ async def sync_llm_rates(
     return inserted
 
 
-__all__ = ["fetch_openrouter_prices", "sync_llm_rates", "OPENROUTER_MODELS_URL"]
+def _catalog_pricing_pairs(
+    models: Iterable[dict],
+) -> list[tuple[str, Optional[str]]]:
+    """``(model_id, params_json.pricing_id)`` pairs from model-catalog rows.
+
+    ``model_id`` is the string dispatched to the provider — exactly what lands in
+    ``llm_requests.model`` / ``usage_events.resource`` — so a rate seeded under it
+    is what ``record_events`` matches. ``pricing_id`` (admin-set in ``params_json``,
+    Admin → Models) names the OpenRouter id to price against; absent → heuristic
+    (see :func:`_pricing_id_for`), ``""`` → explicitly unpriced (self-hosted).
+    """
+    pairs: list[tuple[str, Optional[str]]] = []
+    for m in models:
+        mid = m.get("model_id")
+        if not mid:
+            continue
+        params = m.get("params_json") or {}
+        pairs.append((str(mid), params.get("pricing_id")))
+    return pairs
+
+
+async def sync_catalog_llm_rates(
+    app_pool: Optional[asyncpg.Pool],
+    list_models: Callable[[], Awaitable[list[dict]]],
+    *,
+    prices: Optional[dict[str, tuple[Decimal, Decimal]]] = None,
+    now: Optional[datetime] = None,
+) -> int:
+    """Seed ``usage_rates`` from the model catalog × OpenRouter. Rows inserted.
+
+    ``list_models`` returns catalog rows (``PostgresDB.list_models``). ALL rows
+    are enumerated (not just enabled) — a disabled model can still carry historical
+    or ongoing recorded usage that needs a rate (e.g. a system-scoped provider row
+    whose ``model_id`` matches the recorded string). Non-fatal.
+    """
+    if app_pool is None:
+        return 0
+    try:
+        models = await list_models()
+    except Exception:
+        logger.warning("catalog list for pricing failed (non-fatal)", exc_info=True)
+        return 0
+    return await sync_llm_rates(
+        app_pool, _catalog_pricing_pairs(models), prices=prices, now=now
+    )
+
+
+async def llm_pricing_sync_loop(
+    shutdown_event: asyncio.Event,
+    app_pool: Optional[asyncpg.Pool],
+    list_models: Callable[[], Awaitable[list[dict]]],
+    *,
+    interval: float = 21600.0,
+) -> None:
+    """Background loop: refresh ``usage_rates`` from OpenRouter × catalog.
+
+    Syncs once on entry then every ``interval`` s (default 6 h — public prices
+    move slowly, and the sync is change-only so an unchanged run is nearly free).
+    Non-fatal per tick; no-op when the app pool is absent.
+    """
+    if app_pool is None:
+        logger.info("LLM pricing sync loop disabled (app pool unavailable)")
+        return
+    logger.info("LLM pricing sync loop starting (interval=%ss)", interval)
+    try:
+        while not shutdown_event.is_set():
+            try:
+                await sync_catalog_llm_rates(app_pool, list_models)
+            except Exception:
+                logger.exception("LLM pricing sync tick failed (non-fatal)")
+            try:
+                await asyncio.wait_for(shutdown_event.wait(), timeout=interval)
+            except asyncio.TimeoutError:
+                pass
+    finally:
+        logger.info("LLM pricing sync loop stopped")
+
+
+__all__ = [
+    "fetch_openrouter_prices",
+    "sync_llm_rates",
+    "sync_catalog_llm_rates",
+    "llm_pricing_sync_loop",
+    "OPENROUTER_MODELS_URL",
+]
