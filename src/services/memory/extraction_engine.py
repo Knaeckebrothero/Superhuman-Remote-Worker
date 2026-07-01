@@ -1,6 +1,6 @@
 """Chunked, full-coverage memory extraction at the compaction boundary.
 
-Design: docs/features/memory_extraction_before_compaction.md (Slice 2).
+Design: docs/done/memory_extraction_before_compaction.md (Slice 2).
 
 The async interval extractor (``extract_and_store_memories``) tail-caps its
 input to the newest 40 messages — exactly the ones a compaction *keeps*. When a

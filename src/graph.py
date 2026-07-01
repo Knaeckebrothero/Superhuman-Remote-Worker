@@ -989,7 +989,7 @@ def create_execute_node(
         # Memory extraction before compaction: if this call is about to trigger a
         # summary, snapshot the slice ensure_within_limits will evict and mine it
         # for durable memories BEFORE the lossy summary replaces it
-        # (docs/features/memory_extraction_before_compaction.md). Fire-and-forget
+        # (docs/done/memory_extraction_before_compaction.md). Fire-and-forget
         # over the snapshot so compaction latency is unchanged; the gate is
         # evaluated under the same lowered thresholds ensure_within_limits uses.
         if memory_service is not None and context_mgr.should_summarize(messages):
@@ -4454,7 +4454,7 @@ def build_phase_alternation_graph(
     # Expose the memory seam on the compiled graph so the worker run loop can
     # drain in-flight capture_nowait tasks (the chunked pre_compaction
     # extraction) at job-end before the process moves on — OQ-C,
-    # docs/features/memory_extraction_before_compaction.md §8. The builder's
+    # docs/done/memory_extraction_before_compaction.md §8. The builder's
     # return type is pinned (deprecated wrapper + multiple callers), so the
     # manager rides on the graph object rather than the signature. None when the
     # manager cutover flag is off.
