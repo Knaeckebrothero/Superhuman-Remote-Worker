@@ -5709,6 +5709,13 @@ async def lifespan(app: FastAPI):
     delegation_timeout_task = asyncio.create_task(
         run_when_leader(delegation_timeout_sweeper, _shutdown_event)
     )
+    # Re-dispatch worker jobs paused for a transient LLM outage once their
+    # backoff timer is due (fail-loud past the give-up ceiling). Leader-gated —
+    # per-row CAS + run_when_leader keep N replicas from double-dispatching.
+    # docs/features/llm_outage_pause_and_backoff_redispatch.md
+    llm_outage_task = asyncio.create_task(
+        run_when_leader(llm_outage_redispatch_sweeper, _shutdown_event)
+    )
     pool_reconciler_task = asyncio.create_task(
         run_when_leader(agent_pool_reconciler, _shutdown_event)
     )
@@ -5858,6 +5865,7 @@ async def lifespan(app: FastAPI):
     await imap_task
     await digest_task
     await delegation_timeout_task
+    await llm_outage_task
     await pool_reconciler_task
     await lifecycle_reconciler_task
     await main_cloud_listen_task
@@ -7272,6 +7280,24 @@ def _format_freeze_notification(
             f"**Tool calls this phase:** {tool_calls}\n"
             f"**Reason:** {reason}\n\n"
             f"**Description:** {description}"
+        )
+
+    elif freeze_type == "llm_unavailable":
+        classification = freeze_data.get("classification", "unknown")
+        model = freeze_data.get("model", "?")
+        summary = freeze_data.get("error_summary") or "LLM endpoint unavailable"
+        attempt = freeze_data.get("attempt", "?")
+        subject = f"Job {short_id} FAILED — LLM endpoint unavailable (gave up)"
+        message_md = (
+            f"**Job `{short_id}`** (`{config_name}`) was paused and retried on a "
+            f"backoff while the LLM endpoint was unavailable, but hit the give-up "
+            f"ceiling and has **failed**.\n\n"
+            f"**Model:** `{model}`\n"
+            f"**Classification:** `{classification}`\n"
+            f"**Attempts:** {attempt}\n"
+            f"**Last error:** {str(summary)[:300]}\n\n"
+            f"**Description:** {description}\n\n"
+            f"Check the model endpoint/provider (Admin → Models), then re-run."
         )
 
     else:
@@ -9493,6 +9519,111 @@ async def delegation_timeout_sweeper(shutdown_event: asyncio.Event) -> None:
     logger.info("Delegation timeout sweeper stopped")
 
 
+async def _llm_outage_sweep_once() -> tuple[int, int]:
+    """One outage-sweeper tick — re-dispatch due jobs, fail-loud any past the
+    ceiling. Returns ``(redispatched, failed)``. Extracted from the loop so it
+    is unit-testable with a mocked ``postgres_db``.
+
+    Health gate: if the gateway is the metered LLM path (enabled) and is
+    currently unhealthy, skip the whole tick — re-dispatching now would re-hit a
+    dead gateway, fail instantly, and burn the backoff budget. Deferring leaves
+    ``next_retry_at`` as-is, so jobs re-arm on the next healthy tick WITHOUT
+    advancing their attempt counter (circuit-breaker Half-Open). v1 gates at
+    fleet granularity (gateway up/down), which also defers the minority of
+    direct-routed jobs during a gateway outage — harmless (one deferred cycle,
+    counter untouched); per-job routing precision is deferred.
+    """
+    from services.completion import _parse_context, evaluate_llm_outage
+
+    health_gate = (os.getenv("LLM_OUTAGE_HEALTH_GATE") or "true").strip().lower() != (
+        "false"
+    )
+    gateway_enabled = bool((os.getenv("LITELLM_BASE_URL") or "").strip())
+    if health_gate and gateway_enabled and not gateway_is_healthy():
+        logger.info(
+            "LLM-outage sweeper: gateway unhealthy — deferring re-dispatch this "
+            "tick (attempt counters unchanged)"
+        )
+        return (0, 0)
+
+    due = await postgres_db.list_due_llm_outage_jobs(limit=50)
+    if not due:
+        return (0, 0)
+
+    now = datetime.now(timezone.utc)
+    redispatched = 0
+    failed = 0
+    for job in due:
+        job_id = str(job["id"])
+        ev = evaluate_llm_outage(_parse_context(job), now)
+        if ev["over_ceiling"]:
+            # Backstop (defense-in-depth with the /complete ceiling check): a job
+            # whose next_retry_at landed past the ceiling — fail-loud instead of a
+            # doomed final re-dispatch. The project-loop safety net advances the loop.
+            reason = (
+                f"LLM endpoint unavailable past the give-up ceiling "
+                f"({ev['ceiling_reason']}, {ev['attempt']} attempts) — failed by "
+                f"the outage sweeper. Check the model endpoint/provider "
+                f"(Admin → Models)."
+            )
+            if await postgres_db.fail_llm_outage_job(job_id, reason):
+                failed += 1
+                logger.error(f"LLM-outage sweeper: job {job_id} FAILED — {reason}")
+                fd = job.get("freeze_data")
+                if isinstance(fd, str):
+                    try:
+                        fd = json.loads(fd)
+                    except (ValueError, TypeError):
+                        fd = {}
+                try:
+                    await _notify_operator_freeze(
+                        job, job_id, "llm_unavailable", fd or {}
+                    )
+                except Exception as e:
+                    logger.warning(f"give-up alert failed for {job_id}: {e}")
+            continue
+        if await postgres_db.claim_llm_outage_redispatch(job_id):
+            redispatched += 1
+
+    if redispatched:
+        _trigger_dispatch()
+    if redispatched or failed:
+        logger.info(
+            "LLM-outage sweeper: re-dispatched %d, failed %d (of %d due)",
+            redispatched,
+            failed,
+            len(due),
+        )
+    return (redispatched, failed)
+
+
+async def llm_outage_redispatch_sweeper(shutdown_event: asyncio.Event) -> None:
+    """Re-dispatch worker jobs paused for a transient LLM outage once their
+    backoff timer is due; fail-loud any past the give-up ceiling.
+
+    Leader-gated (``run_when_leader``) + per-row CAS (``claim_llm_outage_redispatch``)
+    so N replicas can't double-dispatch. The per-tick body is
+    :func:`_llm_outage_sweep_once`.
+    docs/features/llm_outage_pause_and_backoff_redispatch.md
+    """
+    try:
+        tick = float((os.getenv("LLM_OUTAGE_SWEEP_SECONDS") or "").strip() or 30)
+    except (ValueError, TypeError):
+        tick = 30.0
+    logger.info("LLM-outage re-dispatch sweeper started (tick=%.0fs)", tick)
+    while not shutdown_event.is_set():
+        try:
+            await asyncio.wait_for(shutdown_event.wait(), timeout=tick)
+            break  # shutdown requested
+        except asyncio.TimeoutError:
+            pass  # tick elapsed — run the sweep
+        try:
+            await _llm_outage_sweep_once()
+        except Exception as e:
+            logger.error(f"LLM-outage re-dispatch sweeper error: {e}", exc_info=True)
+    logger.info("LLM-outage re-dispatch sweeper stopped")
+
+
 async def _handle_critic_verdict_on_complete(
     job: dict[str, Any],
     actions: list[str],
@@ -10366,6 +10497,88 @@ async def complete_job(
                     )
                     job["status"] = "paused"
                     new_status = None  # generic write + loop-advance must not re-handle
+
+        # 1·llm. LLM-outage pause + backoff re-dispatch. determine_job_status has
+        # already made the pause-vs-fail call (paused under the 24h/attempts
+        # ceiling, failed at it). On a PAUSE: atomically advance the attempt
+        # counter, compute the Full-Jittered next_retry_at, persist it into
+        # freeze_data, and free the agent via pause_job — but do NOT
+        # _trigger_dispatch(): the outage sweeper owns re-dispatch when the timer
+        # is due (freeze_data IS NULL would block the dispatcher anyway). On a
+        # terminal FAIL (ceiling tripped): alert the operator (dead-letter +
+        # alert, not silent give-up); the generic write below sets status=failed
+        # and the loop-advance hook counts it once.
+        # docs/features/llm_outage_pause_and_backoff_redispatch.md
+        _lfd = result.get("freeze_data")
+        if isinstance(_lfd, str):
+            try:
+                _lfd = json.loads(_lfd)
+            except (ValueError, TypeError):
+                _lfd = {}
+        if isinstance(_lfd, dict) and _lfd.get("freeze_type") == "llm_unavailable":
+            if new_status == "paused":
+                from services.completion import (
+                    LLM_OUTAGE_RESET_WINDOW_SECONDS,
+                    llm_outage_backoff_seconds,
+                )
+
+                _now = datetime.now(timezone.utc)
+                _adv = await postgres_db.increment_job_llm_outage_attempt(
+                    job_id,
+                    now=_now,
+                    reset_window_seconds=LLM_OUTAGE_RESET_WINDOW_SECONDS,
+                )
+                _attempt = _adv["attempt"]
+                _ra = _lfd.get("retry_after_seconds")
+                try:
+                    _ra = float(_ra) if _ra is not None else None
+                except (ValueError, TypeError):
+                    _ra = None
+                _delay = llm_outage_backoff_seconds(_attempt, retry_after_seconds=_ra)
+                _next = _now + timedelta(seconds=_delay)
+                # Persist next_retry_at + attempt INTO freeze_data so the sweeper's
+                # due-query + CAS can find and gate on it (overwrites the agent's
+                # freeze_data written earlier in this handler).
+                _out_fd = dict(_lfd)
+                _out_fd["next_retry_at"] = _next.isoformat()
+                _out_fd["attempt"] = _attempt
+                try:
+                    async with postgres_db.acquire() as conn:
+                        await conn.execute(
+                            "UPDATE jobs SET freeze_data = $1::jsonb WHERE id = $2::uuid",
+                            json.dumps(_out_fd),
+                            job_id,
+                        )
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to write llm_outage next_retry_at for {job_id}: {e}"
+                    )
+                if await postgres_db.pause_job(job_id):
+                    actions.append(
+                        f"llm_unavailable: paused for backoff re-dispatch "
+                        f"(attempt {_attempt}, next retry in {_delay:.0f}s)"
+                    )
+                    logger.warning(
+                        f"Job {job_id} paused for LLM outage — attempt {_attempt}, "
+                        f"next_retry_at={_next.isoformat()} "
+                        f"(classification={_lfd.get('classification')}, "
+                        f"model={_lfd.get('model')})"
+                    )
+                    job["status"] = "paused"
+                    # No _trigger_dispatch() — the outage sweeper re-dispatches.
+                    new_status = None  # generic write + loop-advance must not re-handle
+            elif new_status == "failed":
+                logger.error(
+                    f"Job {job_id} FAILED after LLM-outage give-up ceiling: "
+                    f"{error_message}"
+                )
+                try:
+                    await _notify_operator_freeze(job, job_id, "llm_unavailable", _lfd)
+                    actions.append("operator alerted (llm_unavailable give-up)")
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to send llm_unavailable give-up alert for {job_id}: {e}"
+                    )
 
         # 1a. Mode A diff capture (job_cloud_export.md §3.3). If this is a
         # project-attached job that received a baseline at dispatch, see

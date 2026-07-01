@@ -1504,6 +1504,96 @@ class PostgresDB:
             new_count = await conn.fetchval(query, uuid_val)
         return int(new_count) if new_count is not None else 0
 
+    async def increment_job_llm_outage_attempt(
+        self, job_id: str, *, now: datetime, reset_window_seconds: int
+    ) -> Dict[str, Any]:
+        """Atomically advance ``context.llm_outage`` for an ``llm_unavailable`` pause.
+
+        Row-locks the job (``SELECT ... FOR UPDATE``) so a duplicate/racing
+        ``/complete`` for the same paused job can't both read the old attempt and
+        stall the counter — the same hazard :meth:`increment_job_memory_retry`
+        guards, but the conditional auto-reset makes a single-statement increment
+        awkward, so this serializes instead. Applies the reset (gap since
+        ``last_failed_at`` > ``reset_window_seconds`` → counter + duration ceiling
+        restart), increments ``attempt``, and stamps ``first``/``last_failed_at``
+        (ISO-8601 UTC). Mirrors :func:`services.completion.evaluate_llm_outage`.
+
+        Returns ``{"attempt": int, "first_failed_at": str|None, "reset": bool}``;
+        ``attempt=0`` on a missing/invalid job (caller treats as no-op).
+        See docs/features/llm_outage_pause_and_backoff_redispatch.md.
+        """
+        import json as json_module
+
+        try:
+            uuid_val = UUID(job_id)
+        except ValueError:
+            return {"attempt": 0, "first_failed_at": None, "reset": False}
+
+        def _parse(v: Any) -> Optional[datetime]:
+            if not isinstance(v, str) or not v:
+                return None
+            try:
+                dt = datetime.fromisoformat(v.replace("Z", "+00:00"))
+            except (ValueError, TypeError):
+                return None
+            return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
+
+        now_utc = now.astimezone(timezone.utc)
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    "SELECT context FROM jobs WHERE id = $1 FOR UPDATE", uuid_val
+                )
+                if row is None:
+                    return {"attempt": 0, "first_failed_at": None, "reset": False}
+                ctx = row["context"]
+                if isinstance(ctx, str):
+                    try:
+                        ctx = json_module.loads(ctx)
+                    except (ValueError, TypeError):
+                        ctx = {}
+                ctx = ctx if isinstance(ctx, dict) else {}
+                outage = ctx.get("llm_outage")
+                outage = outage if isinstance(outage, dict) else {}
+
+                attempt = int(outage.get("attempt", 0) or 0)
+                first_dt = _parse(outage.get("first_failed_at"))
+                last_dt = _parse(outage.get("last_failed_at"))
+                reset = (
+                    last_dt is not None
+                    and (now_utc - last_dt).total_seconds() > reset_window_seconds
+                )
+                if reset:
+                    attempt = 0
+                    first_dt = None
+                if first_dt is None:
+                    first_dt = now_utc
+                attempt += 1
+
+                new_outage = {
+                    "attempt": attempt,
+                    "first_failed_at": first_dt.isoformat(),
+                    "last_failed_at": now_utc.isoformat(),
+                }
+                await conn.execute(
+                    """
+                    UPDATE jobs
+                       SET context = jsonb_set(
+                               COALESCE(context, '{}'::jsonb),
+                               '{llm_outage}', $2::jsonb
+                           ),
+                           updated_at = CURRENT_TIMESTAMP
+                     WHERE id = $1
+                    """,
+                    uuid_val,
+                    json_module.dumps(new_outage),
+                )
+        return {
+            "attempt": attempt,
+            "first_failed_at": new_outage["first_failed_at"],
+            "reset": reset,
+        }
+
     async def merge_vm_context(self, job_id: str, vm_updates: Dict[str, Any]) -> bool:
         """Atomically merge updates into context.vm without touching other keys.
 
@@ -2623,6 +2713,95 @@ class PostgresDB:
                 RETURNING id
                 """,
                 job_uuid,
+            )
+            return row is not None
+
+    async def list_due_llm_outage_jobs(self, limit: int = 50) -> List[Dict[str, Any]]:
+        """Paused ``llm_unavailable`` jobs whose backoff timer is due for re-dispatch.
+
+        Read by the outage sweeper each tick: ``status='paused'``, agent freed,
+        and a ``freeze_data.next_retry_at`` that has arrived. Oldest-due first so
+        a backlog drains fairly. See
+        docs/features/llm_outage_pause_and_backoff_redispatch.md.
+        """
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, config_name, context, freeze_data, user_id, project_id
+                FROM jobs
+                WHERE status = 'paused'
+                  AND assigned_agent_id IS NULL
+                  AND freeze_data->>'freeze_type' = 'llm_unavailable'
+                  AND freeze_data ? 'next_retry_at'
+                  AND (freeze_data->>'next_retry_at')::timestamptz <= now()
+                ORDER BY (freeze_data->>'next_retry_at')::timestamptz ASC
+                LIMIT $1
+                """,
+                limit,
+            )
+        return [dict(row) for row in rows]
+
+    async def claim_llm_outage_redispatch(self, job_id: str) -> bool:
+        """Atomically clear an ``llm_unavailable`` freeze so the dispatcher re-queues it.
+
+        CAS guarded on ``status='paused'`` + ``freeze_type`` + ``next_retry_at``
+        due, so exactly one sweeper wins even in a transient dual-leader window
+        (belt-and-suspenders with ``run_when_leader``). Sets ``freeze_data=NULL``
+        (``get_dispatchable_jobs`` requires ``freeze_data IS NULL``) and re-asserts
+        ``assigned_agent_id=NULL``. ``context.llm_outage`` is untouched, so the
+        attempt counter survives the resume. Returns True iff THIS call cleared it.
+        See docs/features/llm_outage_pause_and_backoff_redispatch.md.
+        """
+        try:
+            uuid_val = UUID(job_id)
+        except ValueError:
+            return False
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                UPDATE jobs
+                   SET freeze_data = NULL,
+                       assigned_agent_id = NULL,
+                       updated_at = CURRENT_TIMESTAMP
+                 WHERE id = $1
+                   AND status = 'paused'
+                   AND freeze_data->>'freeze_type' = 'llm_unavailable'
+                   AND (freeze_data->>'next_retry_at')::timestamptz <= now()
+                RETURNING id
+                """,
+                uuid_val,
+            )
+            return row is not None
+
+    async def fail_llm_outage_job(self, job_id: str, reason: str) -> bool:
+        """Terminally fail a paused ``llm_unavailable`` job past its give-up ceiling.
+
+        CAS guarded (``status='paused'`` + ``freeze_type``) so the sweeper
+        backstop and a racing ``/complete`` can't double-fail — the loop counts
+        it exactly once (the project-loop safety net advances it). Records the
+        reason + stamps ``completed_at``; leaves ``freeze_data`` for the audit
+        trail (a ``failed`` job is never re-dispatched). Returns True iff THIS
+        call failed it. See docs/features/llm_outage_pause_and_backoff_redispatch.md.
+        """
+        try:
+            uuid_val = UUID(job_id)
+        except ValueError:
+            return False
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                UPDATE jobs
+                   SET status = 'failed',
+                       error_message = $2,
+                       completed_at = NOW(),
+                       updated_at = CURRENT_TIMESTAMP
+                 WHERE id = $1
+                   AND status = 'paused'
+                   AND freeze_data->>'freeze_type' = 'llm_unavailable'
+                RETURNING id
+                """,
+                uuid_val,
+                reason,
             )
             return row is not None
 
