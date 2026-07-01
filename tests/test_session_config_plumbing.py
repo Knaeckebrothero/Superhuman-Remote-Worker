@@ -186,6 +186,7 @@ class TestLoadExpertConfig:
         cfg = _load_expert_config("persistent_defaults")
         assert cfg.memory.pipeline.writers == [
             "persistent_interval_extractor",
+            "pre_compaction_extractor",
             "teardown_extractor",
         ]
 
