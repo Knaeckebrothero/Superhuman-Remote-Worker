@@ -1,6 +1,8 @@
 # LLM Router / Gateway Comparison — LiteLLM and Alternatives
 
 **Status:** Decision doc / evaluation · **Date:** 2026-07-01 · **Owner:** platform
+> **Outcome (2026-07-01):** the decision landed on **none of these** — we're **removing the gateway/proxy concept entirely** and metering in-process (`docs/issues/remove_litellm_proxy_and_gateway_concept.md`). This doc remains the **evaluation record + the shortlist to revisit** *if* enterprise-grade org governance (SSO/RBAC/audit/self-serve customer keys) ever forces a gateway back — in which case **Kong** (most battle-tested) or **agentgateway** (lightest), never LiteLLM.
+
 **Trigger:** the in-cluster LiteLLM gateway (`srw-litellm`, v1.90.0, DB mode) OOM-crashloops on the homelab cluster (Python memory leak in its DB-mode background jobs — it exceeds its 2 Gi limit and is OOMKilled *even at idle*, ~110 restarts/15 h), which takes down agent/loop jobs with `Connection error.` See `project_litellm_oom_crashloop_blocks_loop` memory + the litellm limitation docs.
 
 > **This is not a feature gap.** A prior evaluation (`docs/issues/system_provider_models_bypass_gateway_unmetered.md:143`) explicitly concluded *"no replacement gateway warranted — LiteLLM does what SRW needs."* We are re-opening the question on **reliability** grounds, plus a long tail of documented LiteLLM sharp edges. So the bar for a replacement is: **do the same job on a runtime that doesn't fall over**, and ideally clear the deferred features we couldn't get from LiteLLM.
