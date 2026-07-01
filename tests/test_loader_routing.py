@@ -537,6 +537,23 @@ class TestCodexLLMCreation:
         call_kwargs = mock_chat.call_args[1]
         assert call_kwargs["api_key"] == "sk-key1"
 
+    @patch("src.core.loader.ReasoningChatOpenAI")
+    def test_top_k_not_forwarded(self, mock_chat):
+        """top_k must NOT be forwarded — the Codex proxy speaks ONLY the
+        Responses API, which rejects top_k with 400 'Unsupported parameter:
+        top_k'. A stale top_k from a prior family (e.g. gemma's 64 carried
+        onto a session switch to gpt-5.5/codex) must be dropped here: the
+        codex lane bypasses the LiteLLM gateway (main.py:1734), so it never
+        gets the gateway's drop_params safety net and must self-sanitize."""
+        mock_chat.return_value = MagicMock()
+        config = _make_config(model="codex/gpt-5.5", top_k=64)
+
+        _create_codex_llm(config, limits=None)
+
+        call_kwargs = mock_chat.call_args[1]
+        assert "top_k" not in call_kwargs.get("extra_body", {})
+        assert "top_k" not in call_kwargs.get("model_kwargs", {})
+
 
 class TestSupportsParallelToolCalls:
     """`parallel_tool_calls` is an OpenAI Chat Completions kwarg — it must be
