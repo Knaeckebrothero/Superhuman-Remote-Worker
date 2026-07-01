@@ -1,6 +1,6 @@
 """MemoryExtractionEngine — chunked, full-coverage extraction (Slice 2).
 
-Proves the properties the design (docs/features/memory_extraction_before_compaction.md
+Proves the properties the design (docs/done/memory_extraction_before_compaction.md
 §6 Slice 2) hangs on: a large history is chunk-planned (not 40-capped), memories
 come from the *oldest* messages the single-shot path would have dropped, the
 overlap region doesn't double-store facts (in-memory dedup), and a failing chunk
