@@ -251,7 +251,11 @@ databases:
 # LiteLLM gateway — usage monitoring + rate limiting (Slice 1: RPM visibility)
 # -----------------------------------------------------------------------------
 litellm:
-  enabled: true
+  # DISABLED 2026-07-01: gateway is being removed (docs/issues/remove_litellm_proxy_and_gateway_concept.md).
+  # Its chat->Responses bridge dropped codex/gpt-5.x reasoning on the streaming
+  # session path; codex now bypasses direct (codex factory + reasoning.summary),
+  # metering via the in-process audit->usage_events pipeline. Matches homelab P0.
+  enabled: false
   # No rate cap yet — set per-model upstream capacity here once known/measured:
   #   backstop: { gemma-4-moe-strix: { rpm: 60 }, "*": { rpm: 120 } }
   # With {} the fleet key still mints (unlimited), so agents are off the admin
@@ -261,7 +265,7 @@ litellm:
   # default []=off). "*" = route EVERY system/codex provider (the end-state
   # "single path for all LLM traffic" posture) — new providers route the moment
   # they're registered, no per-provider edit. Or list slugs, e.g. ["openrouter"].
-  routedProviders: ["*"]
+  routedProviders: []   # was ["*"] — gateway disabled, nothing routes through it
 
 # -----------------------------------------------------------------------------
 # Codex OAuth proxy (CLIProxyAPI) — transport for gpt-5.x / Codex subscription
