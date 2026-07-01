@@ -9,10 +9,12 @@ tiered by value-vs-effort and tagged with evidence, effort (S/M/L), and risk.
 **Origin:** 2026-06-22 database-optimization sweep. Absorbs and extends the
 open-items backlog in `../issues/db_schema_hygiene.md` (mapping at the end).
 
-**Companion docs:** `database_architecture.md` (the store/tier rules every fix
-here must respect), `../issues/db_schema_hygiene.md` (origin of the drift +
-dead-code items), `unified_message_store.md` (the `chat_history` ↔
-`thread_messages` convergence — referenced under Deferred, still undecided),
+**Companion docs:** `database_roadmap.md` (**the sequencing + live status
+authority — statuses update there, not here**), `database_architecture.md`
+(the store/tier rules every fix here must respect),
+`../issues/db_schema_hygiene.md` (origin of the drift + dead-code items),
+`unified_message_store.md` (the `chat_history` ↔ `thread_messages`
+convergence — referenced under Deferred, still undecided),
 `observability_and_quotas.md` + `postgres_audit_store_implementation.md` (the
 metering/audit tier these findings probe).
 
@@ -53,7 +55,7 @@ rules; this plan stays within them (it does **not** propose merging stores).
 | QW-1 | `GET /api/jobs` audit-count N+1 → existing `get_audit_counts()` — ✅ done | Quick win | S | Low |
 | QW-2 | `REQUIRED_TABLES` live false-warning + stale entries | Quick win | S | None |
 | QW-3 | Drop two redundant indexes (`threads`, `thread_messages`) | Quick win | S | Low |
-| QW-4 | MongoDB removal step 1 — disable + Postgres-only reader | Quick win | S | Low |
+| QW-4 | MongoDB removal step 1 — disable + Postgres-only reader — ✅ done | Quick win | S | Low |
 | QW-5 | Delete dead password-auth methods (+ drop columns) | Quick win | S | Low |
 | QW-6 | `capability_grant_audit` write-only table (drop or wire) | Quick win | S | Low |
 | HF-1 | Generated current-schema artifact (drift root-cause fix) | Harder | M | Low |
@@ -99,8 +101,14 @@ The vector equivalent lists runner-owned `schema_migrations`.
 - `thread_messages`: `idx_thread_messages_thread` (0001, `(thread_id)`) is a prefix-subset of `idx_thread_messages_thread_turn_created` (0020) and `idx_thread_messages_thread_seq` (0023) — drop it.
 - **Fix:** two small `DROP INDEX` migrations (`.notx.sql`, `CONCURRENTLY`). Confirm no index-name-specific code first. Evidence: `0001_initial.sql:861,897`, `0012_threads_user_id_index.notx.sql`.
 
-### QW-4 · MongoDB removal, step 1 — disable + make Postgres the only reader
-Post-cutover Mongo is already unreachable in the default `backend: postgres`
+### QW-4 · MongoDB removal, step 1 — disable + make Postgres the only reader — ✅ done
+**Shipped ~2026-06-23; verified in code 2026-07-01:** helm `databases.mongodb`
+retired/off by default, `audit_reader` bound to the Postgres store
+(`main.py:304`), and `AUDIT_BACKEND=mongodb` now fails loud at startup
+(`main.py:5387`). Step 2 (code deletion) is D-5, sequenced in
+`database_roadmap.md` Phase 3 — the soak condition is met.
+
+Original finding: post-cutover Mongo is already unreachable in the default `backend: postgres`
 config (no dual-write; `connect()` is failure-tolerant so disabling can't break
 boot). All four audit invariants verified intact (append-only `agent_audit`, no
 GIN-on-payload, no cross-table FK, single-write-per-flag).
@@ -167,7 +175,7 @@ pressure `max_connections` as replicas + the LiteLLM DB are added.
 - `GET /api/persistent/threads` — per-thread `list_thread_mounts` (capped at 50). Batch with `WHERE thread_id = ANY($1)`. Evidence: `main.py:14729,14742`.
 
 ### HF-7 · Thread-read fat queries
-- Cursorless thread-open (`get_thread_messages_history(limit=None)`) loads the **entire** transcript with all 15 columns incl. `provider_raw`/6 JSONB, plus an unconditional full-scan `SELECT COUNT(*)` for a UI counter. Make the COUNT conditional/first-page-only; default to a server-side newest-N load. Evidence: `main.py:15505,15564`, `postgres.py:3134`.
+- Cursorless thread-open (`get_thread_messages_history(limit=None)`) loads the **entire** transcript with all 15 columns incl. `provider_raw`/6 JSONB, plus an unconditional full-scan `SELECT COUNT(*)` for a UI counter. Make the COUNT conditional/first-page-only; default to a server-side newest-N load. Evidence: `main.py:15505,15564`, `postgres.py:3134`. **Correction (2026-07-01): the display query selects 9 columns (no `provider_raw`); the 15-column load is the agent resume query (third bullet). The COUNT feeds a `total` the cockpit never reads. See `database_roadmap.md` Phase 5.**
 - Display queries order by `created_at, turn_number, id` — no matching index (leading col of the composite is `turn_number`), forcing a Sort of wide rows. Switch to the tie-free `seq` keyset (already the resume cursor). Evidence: `postgres.py:3160,3207`.
 - Resume SELECTs all 15 wide columns for up to 1000 rows; trim to what `_db_rows_to_lc_messages` consumes (verify first). Evidence: `src/database/postgres_db.py:386-393`.
 
@@ -196,6 +204,11 @@ enforcement-only), `usage_events` (canonical), and the still-written
 `llm_requests.metrics.token_usage`. The first two are a clean intentional
 two-tier design; `llm_requests` is the transitional overlap — and it's the
 **only one carrying `job_id`** (the per-job LLM-cost attribution gap).
+**Correction (2026-07-01): stale.** `usage_events` now carries per-job/thread
+attribution (`ref_kind`/`ref_id`/`user_id`/`project_id`, written by the live
+audit-sourced usage poll — `orchestrator/services/audit_usage.py:219-236`,
+wired `main.py:1554-1605`). Per-job cost is unblocked; see
+`database_roadmap.md` gate G3 for the shrunken decision.
 - **Decision:** converge `llm_requests` token data into `usage_events` (adding job attribution there), or keep `llm_requests` as the per-job audit record and accept the overlap. Relates to D-6. Evidence: `archiver.py:443`, `persistent_graph.py:1294`, `observability_and_quotas.md:286`.
 
 ### D-4 · Messaging trio — owner or drop
@@ -212,7 +225,10 @@ sequenced after a Postgres-only soak.** Once QW-4 has soaked, delete the Mongo
 surface entirely:
 - **Code:** `src/database/mongo_db.py`, `orchestrator/database/mongodb.py` (~1060 lines), the archiver Mongo branches (`src/core/archiver.py`), and the now-dead `AUDIT_BACKEND` / `audit_reader` mongodb selection logic.
 - **Chart:** the `databases.mongodb` block + StatefulSet/NetworkPolicy template, `mongo-express` (UI + ingress), and the `MONGODB_URL` env/configmap/secret keys.
-- **Deps/tests:** `pymongo` from requirements, any Mongo-specific tests.
+- **Deps/tests:** any Mongo-specific tests. **Correction (2026-07-01): `pymongo`
+  stays in requirements** — the mongodb *datasource* type (customer-attached
+  Mongo DBs) imports it (`main.py:12822`); only the audit-Mongo surface is
+  removed.
 - **Docs:** make `database_architecture.md`'s "MongoDB disappears at audit-store cutover" literally true; drop Mongo from the store inventory (here, the README, CLAUDE.md).
 - **Keep** the `audit_reader` abstraction (the extension seam — see Decisions re-add rule).
 
