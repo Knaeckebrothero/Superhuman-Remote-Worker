@@ -27,6 +27,7 @@ from langchain_core.messages import BaseMessage
 CaptureKind = Literal[
     "turn_end",
     "phase_boundary",
+    "pre_compaction",
     "compaction",
     "session_end",
     "idle_archive",
@@ -34,10 +35,14 @@ CaptureKind = Literal[
 ]
 
 #: All valid CaptureEvent kinds — writers subscribe to a subset of these.
+#: ``pre_compaction`` fires *before* ``ensure_within_limits`` evicts messages —
+#: it snapshots the about-to-be-dropped slice for chunked memory extraction,
+#: distinct from ``compaction`` which records the (post-hoc) summary blob.
 CAPTURE_KINDS: frozenset = frozenset(
     (
         "turn_end",
         "phase_boundary",
+        "pre_compaction",
         "compaction",
         "session_end",
         "idle_archive",

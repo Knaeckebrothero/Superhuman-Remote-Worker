@@ -1103,6 +1103,25 @@ class UniversalAgent:
 
             self._jobs_processed += 1
         finally:
+            # Drain in-flight memory captures (the fire-and-forget pre_compaction
+            # extraction scheduled via capture_nowait) BEFORE tearing down
+            # connections, so a compaction on the last LLM call before freeze
+            # still persists. Bounded by the aux call timeout — a hung endpoint
+            # must never wedge job completion (OQ-C,
+            # memory_extraction_before_compaction.md §8).
+            mgr = getattr(self._graph, "_srw_memory_service", None)
+            if mgr is not None:
+                try:
+                    aux_timeout = getattr(self._auxiliary_llm, "timeout", None)
+                    drained = await mgr.drain_background(timeout=aux_timeout or 60.0)
+                    if drained:
+                        logger.info(
+                            f"[{self._current_job_id}] Drained {drained} in-flight "
+                            f"memory task(s) at job-end"
+                        )
+                except Exception as e:
+                    logger.debug(f"Memory drain at job-end failed (non-fatal): {e}")
+
             # Clean up after streaming completes (or errors)
             self._current_job_id = None
             self._cleanup_shell_manager()
