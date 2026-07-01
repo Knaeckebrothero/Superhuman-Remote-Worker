@@ -668,6 +668,7 @@ class TestArms:
         config = build_agent_config(arm)
         assert config.memory.pipeline.writers == [
             "persistent_interval_extractor",
+            "pre_compaction_extractor",
             "teardown_extractor",
         ]
 
