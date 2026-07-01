@@ -210,6 +210,127 @@ class TestSummarizationPlanner:
 
 
 # =============================================================================
+# Tests for the extracted ChunkPlanner (Slice 1)
+# =============================================================================
+
+
+class TestChunkPlannerParity:
+    """SummarizationEngine.plan now delegates to the shared ChunkPlanner. The
+    extraction refactor must not move a single chunk boundary (byte parity),
+    and the load-bearing double-subtraction of the output budget must survive.
+    """
+
+    def test_engine_delegates_byte_identically(self, mock_llm):
+        import math
+
+        from src.core.chunk_planner import ChunkPlanner
+
+        engine = make_engine(mock_llm)
+        # A standalone planner built from the same authority as the engine's
+        # internal one (two reserves = output_budget, no overlap).
+        planner = ChunkPlanner(
+            engine.aux_window,
+            overhead_tokens=engine._overhead,
+            output_reserve=engine.output_budget,
+            carry_reserve=engine.output_budget,
+            overlap_ratio=0.0,
+            token_counter=char_counter,
+        )
+        budget = engine.chunk_budget
+        cases = [
+            [],
+            ["short message 1", "short message 2"],
+            [f"part {i}: " + "x" * 4000 for i in range(30)],  # multi-chunk
+            ["x" * (budget * 4 * 3)],  # oversized single part → hard split
+        ]
+        for parts in cases:
+            assert planner.chunk_budget == engine.chunk_budget
+            assert planner.plan(parts).describe() == engine.plan(parts).describe()
+            assert math.isclose(
+                planner.plan(parts).total_tokens, engine.plan(parts).total_tokens
+            )
+
+    def test_budget_subtracts_output_budget_twice(self, mock_llm):
+        """The fold carries the rolling summary, so output_budget is reserved
+        twice. Pin it — a regression that drops the second subtraction would
+        silently oversize every fold chunk (the 5dbb5770-class failure)."""
+        import math
+
+        from src.core.chunk_planner import SAFETY_MARGIN
+
+        engine = make_engine(mock_llm)
+        expected = (
+            math.floor(engine.aux_window * SAFETY_MARGIN)
+            - engine._overhead
+            - 2 * engine.output_budget
+        )
+        assert engine.chunk_budget == expected
+
+
+class TestChunkPlannerOverlap:
+    """overlap_ratio > 0 (extraction-only): adjacent chunks share a whole-part
+    seed so a fact straddling a boundary lands in two chunks, yet no chunk ever
+    exceeds the budget and every part is still covered."""
+
+    def _planner(self, overlap_ratio):
+        from src.core.chunk_planner import ChunkPlanner
+
+        # Window comfortably above the 1_000-token planning floor.
+        return ChunkPlanner(
+            12_000,
+            overhead_tokens=0,
+            output_reserve=0,
+            carry_reserve=0,
+            overlap_ratio=overlap_ratio,
+            token_counter=char_counter,
+        )
+
+    def _parts(self, planner, n=12, frac=5):
+        # Each part ~ budget/frac tokens (char_counter = len // 4).
+        part_tokens = planner.chunk_budget // frac
+        return ["x" * (part_tokens * 4) for _ in range(n)]
+
+    def test_no_overlap_has_contiguous_disjoint_ranges(self):
+        planner = self._planner(0.0)
+        plan = planner.plan(self._parts(planner))
+        assert plan.n_passes >= 2
+        for cur, nxt in zip(plan.chunks, plan.chunks[1:]):
+            assert nxt.first_part == cur.last_part + 1  # hard boundary
+
+    def test_overlap_ranges_intersect_and_stay_in_budget(self):
+        planner = self._planner(0.3)
+        budget = planner.chunk_budget
+        parts = self._parts(planner)
+        plan = planner.plan(parts)
+
+        assert plan.n_passes >= 2
+        # No chunk exceeds the real budget despite the prepended seed.
+        assert all(c.tokens <= budget for c in plan.chunks)
+        # At least one adjacent pair shares a part (ranges intersect).
+        assert any(
+            nxt.first_part <= cur.last_part
+            for cur, nxt in zip(plan.chunks, plan.chunks[1:])
+        )
+        # Every part is still covered — overlap adds, never drops.
+        covered = set()
+        for c in plan.chunks:
+            covered.update(range(c.first_part, c.last_part + 1))
+        assert covered == set(range(1, len(parts) + 1))
+
+    def test_overlap_terminates_with_parts_larger_than_seed(self):
+        # Parts bigger than the overlap allowance must not loop or drop content
+        # (the seed is empty for those, packing just proceeds normally).
+        planner = self._planner(0.3)
+        parts = self._parts(planner, n=6, frac=2)  # ~budget/2 each > overlap
+        plan = planner.plan(parts)
+        assert plan.n_passes >= 2
+        covered = set()
+        for c in plan.chunks:
+            covered.update(range(c.first_part, c.last_part + 1))
+        assert covered == set(range(1, len(parts) + 1))
+
+
+# =============================================================================
 # Tests for the rolling fold (SummarizationEngine.run)
 # =============================================================================
 

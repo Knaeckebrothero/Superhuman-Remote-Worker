@@ -287,6 +287,14 @@ class RecallStore:
         # memory.extraction.write_gate: false drops it (completeness over
         # precision — relevance is gated at retrieval instead).
         self.write_gate = True
+        # Pre-insert dedup re-check threshold (memory-extraction Slice 0). The
+        # verdict path re-runs the neighbour lookup at this high cosine floor
+        # immediately before an ADD insert; a twin that appeared *since* the
+        # first check (the dual-trigger race, §4.7) downgrades the ADD to a
+        # NOOP+bump. High by design — only a near-identical concurrent write
+        # should collapse; genuinely distinct neighbours the verdict already
+        # cleared for ADD must not be re-bumped.
+        self.recheck_threshold = 0.9
 
         if config is not None:
             self.dedup_threshold = getattr(config, "dedup_threshold", 0.85)
@@ -299,6 +307,7 @@ class RecallStore:
                 config, "retrieval_importance_floor", 0.4
             )
             self.default_ttl = getattr(config, "default_ttl", 10)
+            self.recheck_threshold = getattr(config, "recheck_threshold", 0.9)
             _ext = getattr(config, "extraction", None)
             if _ext is not None:
                 self.write_gate = getattr(_ext, "write_gate", True)
@@ -601,6 +610,28 @@ class RecallStore:
                 retrieval_messages=retrieval_messages,
             )
 
+        async def _add_guarded(exclude):
+            """ADD terminal with a pre-insert dedup re-check (§4.7 race guard).
+
+            Between the first neighbour lookup and this insert, a concurrent
+            writer (the async interval extractor vs this boundary flush) can
+            commit the same fact, so both find no dup and both ADD. Re-run the
+            lookup at ``recheck_threshold`` immediately before inserting, reusing
+            the already-computed embedding (a cheap SELECT, no re-embed). A twin
+            that appeared *since* the first check — i.e. one not in ``exclude``,
+            the set of neighbours the verdict already cleared for ADD — bumps
+            instead of inserting. Excluding the adjudicated set keeps the guard
+            from second-guessing an explicit ADD verdict, so a non-racing write
+            sees the same state twice and behaves exactly as before.
+            """
+            twin = await self._recheck_twin(embedding, exclude)
+            if twin is not None:
+                self._audit_verdict("NOOP", [twin.id], None, "recheck-twin")
+                return await self._bump_existing(
+                    twin.id, importance, remaining_turns, source, twin.similarity
+                )
+            return await _add()
+
         try:
             similar = await self.find_similar_many(
                 embedding, k=svc.top_k, min_similarity=svc.review_floor
@@ -611,11 +642,14 @@ class RecallStore:
                 type(e).__name__,
                 e,
             )
-            return await _add()
+            return await _add_guarded(frozenset())
 
-        # Cost guard: nothing close enough to adjudicate → new fact, just ADD.
+        existing_ids = {r.id for r in similar}
+
+        # Cost guard: nothing close enough to adjudicate → new fact, just ADD
+        # (still race-guarded: a concurrent identical write may have committed).
         if not similar:
-            return await _add()
+            return await _add_guarded(existing_ids)
 
         verdict = await svc.adjudicate(
             content=content,
@@ -646,7 +680,7 @@ class RecallStore:
                 # than guess a row to retire — wrongly retiring loses a fact,
                 # keeping both only costs a (downstream-gated) duplicate.
                 self._audit_verdict("ADD", [], None, f"{action}-without-targets→ADD")
-                return await _add()
+                return await _add_guarded(existing_ids)
             if action == "MERGE":
                 merged = (getattr(verdict, "merged_content", None) or "").strip()
                 if merged and merged != content:
@@ -675,9 +709,38 @@ class RecallStore:
                 self._audit_verdict(action, retire, new_id, reason)
             return new_id
 
-        # ADD and any unrecognized action → conservative ADD.
+        # ADD and any unrecognized action → conservative ADD (race-guarded).
         self._audit_verdict("ADD", [], None, reason)
-        return await _add()
+        return await _add_guarded(existing_ids)
+
+    async def _recheck_twin(self, embedding, exclude):
+        """Re-run the neighbour lookup just before an ADD insert (§4.7 race guard).
+
+        Reuses ``embedding`` (no re-embed) to find the closest currently-valid
+        neighbour at or above ``recheck_threshold`` whose id is **not** in
+        ``exclude`` (the neighbours the verdict already adjudicated). A hit is a
+        twin that a concurrent writer committed since the first check; the caller
+        bumps it instead of inserting a duplicate. Best-effort — a lookup failure
+        returns ``None`` so the ADD still proceeds (never lose a write to the
+        guard).
+        """
+        try:
+            neighbours = await self.find_similar_many(
+                embedding,
+                k=len(exclude) + 1,
+                min_similarity=self.recheck_threshold,
+            )
+        except Exception as e:
+            logger.debug(
+                "Pre-insert dedup re-check failed (%s: %s); proceeding with ADD",
+                type(e).__name__,
+                e,
+            )
+            return None
+        for rec in neighbours:
+            if rec.id not in exclude:
+                return rec
+        return None
 
     def _audit_verdict(self, action, target_ids, new_id, reason):
         """Audit an ingestion verdict (no-op without an archiver)."""

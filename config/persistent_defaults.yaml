@@ -170,6 +170,7 @@ memory:
       - bounded                      # cap the survivors at max_items
     writers:
       - persistent_interval_extractor  # In-loop observer (elapsed gate)
+      - pre_compaction_extractor       # Chunked extraction of the evicted slice before compaction
       - teardown_extractor             # Final extraction on session end / idle archive
   # Phase-3+4 production-candidate stack, flipped on for the dev rollout
   # (GATE B — docs/features/agent_memory_overhaul.md). Harness-measured:

@@ -13,8 +13,9 @@ exception type and recorded in AssembleStats.errors. Loud degradation,
 never silent.
 """
 
+import asyncio
 import logging
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Optional, Set, Tuple
 
 from .registry import resolve_memory_plugin
 from .types import (
@@ -54,6 +55,10 @@ class MemoryManager:
         self._policies = policies or []
         self._writers = writers or []
         self._extensions = extensions or []
+        #: Strong refs to detached capture() tasks (capture_nowait). Without
+        #: this the event loop only holds a weak ref and a long-running task
+        #: (the chunked pre_compaction extraction) can be GC'd mid-flight.
+        self._bg_tasks: Set[asyncio.Task] = set()
 
     # ------------------------------------------------------------------
     # Binding
@@ -274,6 +279,45 @@ class MemoryManager:
                     type(e).__name__,
                     e,
                 )
+
+    def capture_nowait(self, event: CaptureEvent) -> "asyncio.Task":
+        """Fire ``capture(event)`` as a ref-held detached task.
+
+        The graphs use this for the ``pre_compaction`` snapshot so a compaction
+        proceeds immediately while the chunked extraction runs behind it. The
+        task is kept in ``self._bg_tasks`` (and removed on completion) so the
+        event loop can't GC a long-running extraction mid-flight — the bare
+        ``create_task(capture(...))`` at the legacy call sites holds no ref.
+        """
+        task = asyncio.create_task(self.capture(event))
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+        return task
+
+    async def drain_background(self, timeout: Optional[float] = None) -> int:
+        """Await in-flight ``capture_nowait`` tasks; returns how many were pending.
+
+        Called at worker job-end (OQ-C) so a ``pre_compaction`` extraction
+        scheduled just before the job freezes gets a chance to persist. Bounded
+        by ``timeout`` — a hung aux endpoint must not wedge job completion; on
+        timeout the still-running tasks stay detached (best-effort) and the job
+        proceeds. ``capture()`` never raises, so gathering is always clean.
+        """
+        pending = [t for t in self._bg_tasks if not t.done()]
+        if not pending:
+            return 0
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*pending, return_exceptions=True), timeout=timeout
+            )
+        except (asyncio.TimeoutError, TimeoutError):
+            logger.warning(
+                "drain_background: %d memory task(s) still running after %ss; "
+                "leaving detached",
+                sum(1 for t in pending if not t.done()),
+                timeout,
+            )
+        return len(pending)
 
     # ------------------------------------------------------------------
     # Model-facing extensions

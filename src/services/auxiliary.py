@@ -266,6 +266,33 @@ class ExtractMemoriesTask(AuxTask):
         return ExtractedMemories
 
 
+class TextExtractMemoriesTask(AuxTask):
+    """Extract memories from a *pre-formatted* conversation chunk.
+
+    Text-input twin of :class:`ExtractMemoriesTask` (mirrors how
+    :class:`SummarizeTask` takes ``conversation_text`` rather than raw
+    messages). ``build_context()`` passes the already chunk-planned text
+    straight through, so ``MemoryExtractionEngine`` feeds planner chunks
+    directly — no 40-message cap, no re-formatting. Same prompt and
+    ``ExtractedMemories`` schema as the message-input task.
+    """
+
+    def __init__(self, conversation_text: str, prompt: str):
+        self.conversation_text = conversation_text
+        self._prompt = prompt
+
+    @property
+    def system_prompt(self) -> str:
+        return self._prompt
+
+    def build_context(self) -> str:
+        return self.conversation_text
+
+    @property
+    def output_schema(self) -> Type[BaseModel]:
+        return ExtractedMemories
+
+
 class IngestionVerdictTask(AuxTask):
     """Adjudicate a candidate memory against its nearest neighbours.
 

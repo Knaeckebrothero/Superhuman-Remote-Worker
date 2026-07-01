@@ -173,6 +173,44 @@ class PhaseBoundaryExtractor:
         )
 
 
+class PreCompactionExtractor:
+    """Chunked, full-coverage extraction of the about-to-be-evicted slice.
+
+    memory-extraction-before-compaction feature (not a legacy transplant). The
+    emit snapshots ``messages[:-keep_recent]`` and fires this *before*
+    ``ensure_within_limits`` replaces the detail with a lossy summary. Unlike
+    the interval / phase-boundary extractors it does NOT call the 40-capped
+    ``extract_and_store_memories`` — it runs ``MemoryExtractionEngine`` over the
+    whole snapshot, so the *oldest* (evicted) messages are mined, not the newest
+    ones compaction keeps. Gated like the other worker extractors (aux enabled +
+    ``extract_memories`` task; persistent config also enables that task).
+    ``MemoryManager.capture`` isolates writer exceptions, so a failed run can't
+    break the compaction that scheduled it. The engine is built per event so a
+    persistent session's re-resolved ``extraction_prompt`` (B1) is honoured.
+    """
+
+    event_kinds: FrozenSet[str] = frozenset({"pre_compaction"})
+
+    def __init__(self, runtime: MemoryRuntime) -> None:
+        self.runtime = runtime
+
+    async def on_event(self, event: CaptureEvent) -> None:
+        runtime = self.runtime
+        if runtime.recall_store is None or not event.messages:
+            return
+        if not _aux_task_enabled(runtime, "extract_memories"):
+            return
+
+        from src.services.memory.extraction_engine import MemoryExtractionEngine
+
+        engine = MemoryExtractionEngine(
+            auxiliary=runtime.auxiliary_llm,
+            recall_store=runtime.recall_store,
+            extraction_prompt=runtime.extraction_prompt or "",
+        )
+        await engine.run(event.messages, phase=event.phase)
+
+
 class TeardownExtractor:
     """Final extraction on session end / idle archive
     (persistent_app.py _handle_archive + _handle_idle_archive).
@@ -333,6 +371,15 @@ def _build_persistent_interval_extractor(
 )
 def _build_phase_boundary_extractor(runtime: MemoryRuntime) -> PhaseBoundaryExtractor:
     return PhaseBoundaryExtractor(runtime)
+
+
+@register_memory_plugin(
+    "writer",
+    "pre_compaction_extractor",
+    description="Chunked full-coverage extraction of the evicted slice before compaction",
+)
+def _build_pre_compaction_extractor(runtime: MemoryRuntime) -> PreCompactionExtractor:
+    return PreCompactionExtractor(runtime)
 
 
 @register_memory_plugin(

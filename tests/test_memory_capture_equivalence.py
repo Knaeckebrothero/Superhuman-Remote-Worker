@@ -43,6 +43,7 @@ from src.services.memory.plugins.legacy_writers import (
     MemoryAssembler,
     PersistentIntervalExtractor,
     PhaseBoundaryExtractor,
+    PreCompactionExtractor,
     QueuedMemoryWriter,
     TeardownExtractor,
     WorkerIntervalExtractor,
@@ -584,6 +585,7 @@ class TestRegistrationAndDispatch:
             "interval_extractor",
             "persistent_interval_extractor",
             "phase_boundary_extractor",
+            "pre_compaction_extractor",
             "teardown_extractor",
             "memory_assembler",
             "compaction_memory",
@@ -629,3 +631,129 @@ class TestRegistrationAndDispatch:
         manager = MemoryManager.from_config(cfg, runtime)
         # must not raise
         await manager.capture(turn_event(5, make_messages()))
+
+
+# ---------------------------------------------------------------------------
+# pre_compaction extractor writer (memory-extraction-before-compaction, Slice 3)
+# ---------------------------------------------------------------------------
+
+
+class _EngineSpy:
+    """Stand-in for MemoryExtractionEngine — records construction + run()."""
+
+    instances: list = []
+
+    def __init__(self, *, auxiliary=None, recall_store=None, extraction_prompt=None):
+        self.auxiliary = auxiliary
+        self.recall_store = recall_store
+        self.extraction_prompt = extraction_prompt
+        self.run = AsyncMock(return_value=2)
+        _EngineSpy.instances.append(self)
+
+
+@pytest.fixture
+def engine_spy(monkeypatch):
+    import src.services.memory.extraction_engine as ee
+
+    _EngineSpy.instances = []
+    monkeypatch.setattr(ee, "MemoryExtractionEngine", _EngineSpy)
+    return _EngineSpy
+
+
+def precompact_event(messages, phase=2):
+    return CaptureEvent(kind="pre_compaction", messages=messages, phase=phase)
+
+
+class TestPreCompactionExtractorWriter:
+    """The writer runs MemoryExtractionEngine (NOT the 40-capped
+    extract_and_store_memories) over the snapshot, gated like the worker
+    extractors."""
+
+    @pytest.mark.asyncio
+    async def test_runs_engine_over_snapshot(self, engine_spy):
+        writer = PreCompactionExtractor(make_runtime())
+        msgs = make_messages()
+        await writer.on_event(precompact_event(msgs, phase=4))
+
+        assert len(engine_spy.instances) == 1
+        eng = engine_spy.instances[0]
+        assert eng.recall_store == "store"
+        assert eng.auxiliary == "aux-llm"
+        assert eng.extraction_prompt == EXTRACTION_PROMPT
+        eng.run.assert_awaited_once()
+        args, kwargs = eng.run.await_args
+        assert args[0] is msgs  # full snapshot, no 40-cap
+        assert kwargs["phase"] == 4
+
+    @pytest.mark.asyncio
+    async def test_uses_engine_not_legacy_helper(self, engine_spy, extract_spy):
+        await PreCompactionExtractor(make_runtime()).on_event(
+            precompact_event(make_messages())
+        )
+        # Must bypass the tail-capped helper entirely.
+        extract_spy.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_gated_by_task_flag(self, engine_spy):
+        await PreCompactionExtractor(make_runtime(extract_enabled=False)).on_event(
+            precompact_event(make_messages())
+        )
+        assert engine_spy.instances == []
+
+    @pytest.mark.asyncio
+    async def test_gated_by_aux_disabled(self, engine_spy):
+        await PreCompactionExtractor(make_runtime(aux_enabled=False)).on_event(
+            precompact_event(make_messages())
+        )
+        assert engine_spy.instances == []
+
+    @pytest.mark.asyncio
+    async def test_no_store_skips(self, engine_spy):
+        await PreCompactionExtractor(make_runtime(recall_store=None)).on_event(
+            precompact_event(make_messages())
+        )
+        assert engine_spy.instances == []
+
+    @pytest.mark.asyncio
+    async def test_empty_snapshot_skips(self, engine_spy):
+        await PreCompactionExtractor(make_runtime()).on_event(precompact_event([]))
+        assert engine_spy.instances == []
+
+    @pytest.mark.asyncio
+    async def test_manager_capture_routes_pre_compaction(self, engine_spy):
+        runtime = make_runtime()
+        manager = MemoryManager(
+            runtime,
+            writers=[("pre_compaction_extractor", PreCompactionExtractor(runtime))],
+        )
+        await manager.capture(precompact_event(make_messages(), phase=1))
+        assert len(engine_spy.instances) == 1
+        # a non-matching kind does not dispatch to this writer
+        _EngineSpy.instances = []
+        await manager.capture(turn_event(3, make_messages()))
+        assert engine_spy.instances == []
+
+
+class TestCaptureNowaitAndDrain:
+    """capture_nowait holds a ref to the detached task; drain_background awaits
+    the in-flight set (OQ-C, bounded)."""
+
+    @pytest.mark.asyncio
+    async def test_capture_nowait_holds_ref_and_runs(self, engine_spy):
+        runtime = make_runtime()
+        manager = MemoryManager(
+            runtime,
+            writers=[("pre_compaction_extractor", PreCompactionExtractor(runtime))],
+        )
+        task = manager.capture_nowait(precompact_event(make_messages()))
+        assert task in manager._bg_tasks  # strong ref held while running
+        drained = await manager.drain_background(timeout=5.0)
+        assert drained == 1
+        assert engine_spy.instances  # the detached capture actually ran
+        assert task.done()
+        assert task not in manager._bg_tasks  # done-callback cleaned up
+
+    @pytest.mark.asyncio
+    async def test_drain_background_empty_is_zero(self):
+        manager = MemoryManager(make_runtime(), writers=[])
+        assert await manager.drain_background(timeout=1.0) == 0
