@@ -1,12 +1,16 @@
 # VM Golden-Image Boot Acceleration
 
-**Status:** Proposed + refined 2026-07-01 after a 5-subagent investigation
-(3 codebase traces + 2 web/best-practice sweeps). **Implemented 2026-07-01
-(uncommitted on develop), unit-verified, flag OFF by default. Not yet deployed
-or soaked** — the real clone-boot timing can only be verified on the dev + vm
-clusters (k3d has no KubeVirt/CDI). Decision **(A)** chosen (see below).
-**Motivation:** the loop VM override (`project_self_improvement_loop.md`) is
-impractical because every loop VM cold-boots in ~10 min.
+**Status: DONE — live-verified on the dev vm cluster 2026-07-01.** Implemented
+in `5cb48aad`/`a4d031dd` (unit-verified, 106/106), enabled via `5efb6ccf`
+(`vmController.goldenImage.enabled: true` in the dev Fleet overlay
+`deployment-vms/srw-vm-controller/fleet.yaml`). Measured end-to-end with probe
+job `ef7dcd2c`: **job → agent-processing-on-VM ~5m20s vs ~12 min baseline
+(~2.3×)**, per-VM GHCR pull eliminated. See "Live verification results" at the
+end. Prod vm-controller (`srw-prod-vm`, v0.0.21) remains flag-off. Design
+originally refined 2026-07-01 via a 5-subagent investigation (3 codebase traces
++ 2 web/best-practice sweeps); decision **(A)** chosen (see below).
+**Motivation:** the loop VM override (`project_self_improvement_loop.md`) was
+impractical because every loop VM cold-booted in ~10 min.
 
 ## Problem
 
@@ -372,3 +376,55 @@ alternatives. Primary external sources: KubeVirt CDI docs (clone-datavolume,
 smart-clone, efficient-cloning, storageprofile, waitforfirstconsumer-storage-
 handling, RBAC), the KubeVirt "VM Image Usage Patterns" + "Building golden images
 with Packer" guides, and OpenEBS/TopoLVM storage docs.
+
+## Live verification results (2026-07-01, dev vm cluster)
+
+Enabled via `5efb6ccf`; Fleet synced in 34 s. Probe job `ef7dcd2c` (throwaway,
+`config_override: {workspace: {backend: vm}, scholar/verification disabled}`).
+
+**Prewarm (once per digest):** `_prewarm_golden` fired at controller startup →
+golden DV `agent-vm-golden-58a046a8c6f3` imported `agent-vm-base:sha-7ae23f7`
+in ~12 min — **including one importer crash-restart mid-import** (progress
+reset 75%→24%, CDI retried). That flakiness used to hit every VM boot; now it
+lands once, off the hot path. PVC bound immediately (`bind.immediate` beat the
+WFFC deadlock as designed).
+
+**Probe boot timeline:**
+
+| Event | Wall clock | Δ from job create |
+|---|---|---|
+| Job created | 20:24:36 | 0 |
+| Controller received NATS create; golden Succeeded fast-path; VM created | 20:24:40 | +4 s |
+| Rootdisk DV `CloneScheduled` (not `ImportScheduled`) | 20:24:48 | +12 s |
+| `CloneInProgress` | 20:25:09 | +33 s |
+| Rootdisk `Succeeded` + **VMI Running** | 20:28:36 | **+4m00s** |
+| VM booted, tailnet joined, `vm_status=ready`, agent heartbeating (job `processing`) | ~20:29:59 | **~+5m20s** |
+
+**Teardown:** cancel → full cascade (VM+VMI+DV+PVC+Headscale node) gone in
+~12 s; **golden survived**; job stayed `cancelled`, agent freed.
+
+**Acceptance criteria scorecard:**
+
+1. ~~<90 s~~ → **measured 4m00s to VMI Running / ~5m20s to agent-working**
+   (vs ~12 min baseline, ~2.3×). The aspirational 30–90 s assumed a cheap
+   clone; on local-path the host-assisted **full copy of the 20 Gi volume
+   (~3m27s @ ~100 MB/s SATA)** dominates. Mechanism 100 % verified: rootdisk
+   DV `source.pvc = agent-vm-golden-…`, PVC `cloneType: copy`,
+   `cloneFallbackReason: "In tree storage class does not support
+   snapshot/clone"` — no per-VM GHCR pull. **Accepted** (single SATA SSD,
+   10-year-old host; TopoLVM is the path to true seconds if ever needed).
+2. Import once per digest ✅ — probe hit the golden `Succeeded` fast-path, no
+   second import. (Concurrent-create 409 race live-untested; unit-covered.)
+3. Image-bump → new golden + GC keep-3: not yet live-exercised (needs a
+   `defaultVmImage` bump); unit-covered. Will self-exercise on the next bump.
+4. Fallback: not live-exercised (golden stayed healthy); unit-covered.
+   Flag-off = byte-identical **was** live-verified (controller ran 4 h dormant
+   on the new image, zero restarts, before the flip).
+5. Crash-recovery with cloned rootdisks: cancel-cascade verified clean;
+   delete-mid-run → recreate not explicitly exercised (discard-disk model
+   reads no PVC provenance, so no mechanism for it to differ).
+6. No cross-namespace clone RBAC ✅ — clone ran with namespace-local Role.
+
+**Residual (not blocking):** TopoLVM/CoW upgrade if clone time ever matters;
+prod flip (deliberate, later); criteria 3–5's live-exercise happens naturally
+in operation.
