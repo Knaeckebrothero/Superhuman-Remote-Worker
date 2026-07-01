@@ -16,6 +16,7 @@ import {I18nService, SupportedLang} from '../../core/services/i18n.service';
 import {
     ApiKeyProvider,
     CodexStatus,
+    CodexUsage,
     CommunicationSettings,
     LlmEndpointTestResult,
     McpTokenCreateResponse,
@@ -813,6 +814,50 @@ const EXPIRY_OPTIONS = [
               </div>
             }
 
+            <!-- Subscription usage capacity (5-hour session + weekly windows) -->
+            @if (codexUsage().available && (codexUsage().primary || codexUsage().secondary)) {
+              <div class="codex-usage">
+                <h3 class="form-title">
+                  {{ 'settings.codex.usage.title' | transloco }}
+                  @if (codexUsage().plan_type) {
+                    <span class="codex-usage-plan">{{ codexUsage().plan_type }}</span>
+                  }
+                  @if (codexUsage().limit_reached) {
+                    <span class="codex-usage-limit">{{ 'settings.codex.usage.limitReached' | transloco }}</span>
+                  }
+                </h3>
+                @if (codexUsage().primary; as w) {
+                  <div class="codex-usage-row">
+                    <div class="codex-usage-meta">
+                      <span class="codex-usage-name">{{ 'settings.codex.usage.session' | transloco }}</span>
+                      @if (w.reset_after_seconds) {
+                        <span class="codex-usage-reset">{{ 'settings.codex.usage.resetsIn' | transloco: { time: formatReset(w.reset_after_seconds) } }}</span>
+                      }
+                    </div>
+                    <div class="codex-usage-track">
+                      <div class="codex-usage-fill" [class]="usageLevel(w.used_percent)" [style.width.%]="clampPct(w.used_percent)"></div>
+                    </div>
+                    <span class="codex-usage-pct">{{ w.used_percent ?? 0 }}%</span>
+                  </div>
+                }
+                @if (codexUsage().secondary; as w) {
+                  <div class="codex-usage-row">
+                    <div class="codex-usage-meta">
+                      <span class="codex-usage-name">{{ 'settings.codex.usage.weekly' | transloco }}</span>
+                      @if (w.reset_after_seconds) {
+                        <span class="codex-usage-reset">{{ 'settings.codex.usage.resetsIn' | transloco: { time: formatReset(w.reset_after_seconds) } }}</span>
+                      }
+                    </div>
+                    <div class="codex-usage-track">
+                      <div class="codex-usage-fill" [class]="usageLevel(w.used_percent)" [style.width.%]="clampPct(w.used_percent)"></div>
+                    </div>
+                    <span class="codex-usage-pct">{{ w.used_percent ?? 0 }}%</span>
+                  </div>
+                }
+                <p class="codex-usage-note">{{ 'settings.codex.usage.disclaimer' | transloco }}</p>
+              </div>
+            }
+
             <!-- Models -->
             @if (codexModels().length > 0) {
               <div class="codex-models">
@@ -1497,6 +1542,77 @@ const EXPIRY_OPTIONS = [
       color: var(--text-secondary);
     }
 
+    .codex-usage {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      margin-bottom: 16px;
+    }
+
+    .codex-usage-plan {
+      margin-left: 8px;
+      font-size: 12px;
+      font-weight: 500;
+      color: var(--text-secondary);
+      text-transform: none;
+    }
+
+    .codex-usage-limit {
+      margin-left: 8px;
+      font-size: 12px;
+      color: var(--danger);
+    }
+
+    .codex-usage-row {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .codex-usage-meta {
+      display: flex;
+      flex-direction: column;
+      min-width: 132px;
+    }
+
+    .codex-usage-name { font-size: 13px; color: var(--text-primary); }
+    .codex-usage-reset { font-size: 11px; color: var(--text-secondary); }
+
+    .codex-usage-track {
+      flex: 1;
+      height: 8px;
+      border-radius: 4px;
+      background: var(--surface-0);
+      border: 1px solid var(--border-color);
+      overflow: hidden;
+    }
+
+    .codex-usage-fill {
+      height: 100%;
+      border-radius: 4px;
+      transition: width 0.3s ease;
+    }
+
+    .codex-usage-fill.ok { background: var(--accent-color); }
+    .codex-usage-fill.warn { background: #e6a23c; }
+    .codex-usage-fill.crit { background: var(--danger); }
+
+    .codex-usage-pct {
+      min-width: 42px;
+      text-align: right;
+      font-size: 12px;
+      font-variant-numeric: tabular-nums;
+      color: var(--text-secondary);
+    }
+
+    .codex-usage-note {
+      margin: 4px 0 0;
+      font-size: 11px;
+      line-height: 1.45;
+      font-style: italic;
+      color: var(--text-secondary);
+    }
+
     /* Codex callback paste flow */
     .codex-callback-help {
       margin-top: 16px;
@@ -1721,6 +1837,7 @@ export class SettingsComponent implements OnInit {
   // Codex proxy state (admin-only)
   readonly codexStatus = signal<CodexStatus>({ connected: false, reachable: false, accounts: [], model_count: 0 });
   readonly codexModels = signal<string[]>([]);
+  readonly codexUsage = signal<CodexUsage>({ available: false });
   readonly codexLoading = signal(false);
   readonly codexConnecting = signal(false);
   readonly codexCallbackUrl = signal('');
@@ -2252,6 +2369,32 @@ export class SettingsComponent implements OnInit {
     this.settingsService.getCodexModels().subscribe((res) => {
       this.codexModels.set(res.models);
     });
+    this.settingsService.getCodexUsage().subscribe((usage) => {
+      this.codexUsage.set(usage);
+    });
+  }
+
+  /** Clamp a used-percent to [0, 100] for the bar width (null → 0). */
+  clampPct(p: number | null | undefined): number {
+    return Math.max(0, Math.min(100, typeof p === 'number' ? p : 0));
+  }
+
+  /** Bar colour band by fill: ok (blue) < 70 ≤ warn (amber) < 90 ≤ crit (red). */
+  usageLevel(p: number | null | undefined): 'ok' | 'warn' | 'crit' {
+    const n = typeof p === 'number' ? p : 0;
+    if (n >= 90) return 'crit';
+    if (n >= 70) return 'warn';
+    return 'ok';
+  }
+
+  /** Human "2h 32m" / "3d 4h" / "12m" for a reset countdown (seconds). */
+  formatReset(seconds: number | null | undefined): string {
+    if (!seconds || seconds <= 0) return '';
+    const h = Math.floor(seconds / 3600);
+    const m = Math.floor((seconds % 3600) / 60);
+    if (h >= 24) return `${Math.floor(h / 24)}d ${h % 24}h`;
+    if (h >= 1) return `${h}h ${m}m`;
+    return `${m}m`;
   }
 
   connectCodexAccount(): void {

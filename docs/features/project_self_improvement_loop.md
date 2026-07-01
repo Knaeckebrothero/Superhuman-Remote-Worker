@@ -13,6 +13,7 @@ aliases:
   - self-improvement cycle
   - innovation cycle (productized)
 related:
+  - "[[loop_parallel_execution]]"
   - "[[verification_phase]]"
   - "[[subagent_delegation]]"
   - "[[feature_development_pipeline]]"
@@ -357,10 +358,10 @@ Phase 1 is the whole bet — once a loop rotates roles and stops cleanly from th
 |----------|----------|-----------|
 | Driver: generic event-automation vs. dedicated controller | **Dedicated** `project_loops` + advance hook | Turnkey one-button UX; far more controllable for an experiment; doesn't block the generic v0.5 event system later |
 | How advance fires | **Completion hook**, not polling | The orchestrator already fans out on terminal jobs; "job done → advance" is ~50 lines beside existing hooks |
-| Concurrency | **One job at a time** | Deterministic KB hand-off; fits a single subscription's agent budget; one bad job can't fork chaos |
+| Concurrency | **One job at a time** (v1) | Deterministic KB hand-off; fits a single subscription's agent budget; one bad job can't fork chaos. An **optional parallel mode** (pipeline / independent tracks / stage fan-out) is explored — not decided — in [`loop_parallel_execution.md`](loop_parallel_execution.md). |
 | Iteration counting | **Per job** | Matches "job finishes → iterations−1"; role = `sequence[total % len]` |
 | Execution role | **Configurable** (`developer` default; `default`/`writer` for prose) | Makes it a general autonomous-project engine, not a coding toy |
-| Scholar breadth | **One scholar proposes N distinct approaches**, not N scholars | Fresh-context parallel scholars duplicate; real diversity via prompt now, `delegate_work` later |
+| Scholar breadth | **One scholar proposes N distinct approaches**, not N scholars | Fresh-context parallel scholars duplicate; real diversity via prompt now, `delegate_work` later — preferred over orchestrator-level N-scholar fan-out ([`loop_parallel_execution.md`](loop_parallel_execution.md) Option C) |
 | Loop jobs & lifecycle hooks | **Run bare** (verification/scholar/curator off) | The loop is the orchestration; auto-hooks would fight it |
 | "Done" signal | **External acceptance criteria + Critic decider**, never self-grade | Research: self-evaluation of progress is near-random (AI Scientist 100%-novel) |
 | Unbounded loops | **Forbidden** — CHECK requires iterations or deadline | Hard floor under runaway; the $-runaway incidents are the cautionary tale |
@@ -370,7 +371,7 @@ Phase 1 is the whole bet — once a loop rotates roles and stops cleanly from th
 
 These are exactly the things the research **could not settle** — so our overnight runs are the experiment that answers them:
 
-1. **Does sequential one-at-a-time actually beat parallel fan-out for this workload?** No verified claim covers continuous single-goal loops. Measure in our own harness before optimising.
+1. **Does sequential one-at-a-time actually beat parallel fan-out for this workload?** No verified claim covers continuous single-goal loops. Measure in our own harness before optimising. → The full design space for an **optional parallel mode** (pipeline the chain vs. independent tracks vs. stage fan-out), the KB-generation prerequisite that any same-turn concurrency needs, and the developer-bound payoff ceiling are worked through in [`loop_parallel_execution.md`](loop_parallel_execution.md) (concept — nothing decided).
 2. **How many candidate proposals, and is a separate Critic better than executor self-critique?** Candidate-count is unpinned; the one head-to-head Critic-vs-self-critique number was *refuted*. We default to a separate Critic (supported by MAST role-spec/verification gains) and treat N as a tunable.
 3. **What automated progress signal distinguishes real progress from wandering/false victory** over a multi-day run on an open-ended (non-code) goal? Unsolved in the literature; for code we lean on tests, for knowledge-work the acceptance criteria + Critic decider are our best current proxy — watch them.
 4. **Do the agents actually use the KB blackboard — and how should it bound its growth?** The k3d smoke run (`gemma-4-moe`) wrote **zero** KB notes across a full scholar→critic→developer run — likely gemma's weak tool-use (the tools were available and the kickoff instructs their use), but it means the core coordination channel is **unverified**. This is the #1 thing a real run with a capable model must confirm; if a capable model also under-uses the KB, the levers are a harder-enforced kickoff (make a KB write the required first/last step) or a curator pass that force-records each iteration. Separately, on growth: Reflexion used a fixed window; our read-bounding (hybrid top-K) + structured note kinds is a design choice to measure against context blowup and cost.
@@ -386,6 +387,7 @@ These are exactly the things the research **could not settle** — so our overni
 ## Related
 
 - [`loop_review.md`](../loop_review.md) — **living log of issues + optimizations found during real test runs** (cost, KB hygiene, grounding, role bleed); the running companion to this plan.
+- [`loop_parallel_execution.md`](loop_parallel_execution.md) — **concept** paper exploring an optional parallel/pipelined execution mode (the design space behind [Open Question #1](#open-questions)): the four options, the KB-generation-stamping prerequisite, and the developer-bound payoff ceiling. Nothing decided; expands the **Concurrency** resolved-decision above.
 - `[[verification_phase]]` — the critic verdict tools and the developer↔critic loop this generalises; loop Critic reuses the same `approve`/`return_with_feedback` stance, minus the auto-trigger.
 - `[[subagent_delegation]]` — `delegate_work`, the Phase-4 path to real Scholar proposal diversity.
 - `[[automations]]` — the generic event-trigger driver this is a turnkey, project-scoped specialisation of; shares the runaway-guard philosophy (`max_chain_depth`, the $-runaway incident).

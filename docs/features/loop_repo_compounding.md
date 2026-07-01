@@ -12,6 +12,7 @@ aliases:
   - in-place compounding
 related:
   - "[[project_self_improvement_loop]]"
+  - "[[loop_parallel_execution]]"
   - "[[repo_resolution]]"
   - "[[projects]]"
   - "[[project_knowledge_base]]"
