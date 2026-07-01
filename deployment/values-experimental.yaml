@@ -335,7 +335,14 @@ llm:
 # port-forward svc/srw-litellm 4000:4000 → http://localhost:4000/ui (master key).
 # -----------------------------------------------------------------------------
 litellm:
-  enabled: true
+  # DISABLED 2026-07-01: the gateway OOM-crashloops on litellm's DB-mode
+  # budget-reset leak (GH #13210) — balloons past the 2Gi limit in ~70s,
+  # 113 restarts/15h, blocking the loop. Off = LITELLM_BASE_URL unset, so all
+  # models route DIRECT (unmetered but working) via the gateway_is_healthy()→None
+  # fallback; the litellm DB stays up (databases.litellm) so registered models +
+  # spend history survive. Re-enable with general_settings.disable_reset_budget:
+  # true (chart change) to get a metered gateway that doesn't leak.
+  enabled: false
   # P2 canary rollout: route these system/codex providers THROUGH the gateway so
   # their traffic is metered (cost lands in usage_events via P3). Empty/unset =
   # chart default = off. Starting with openrouter (the paid minimax lane).
@@ -344,7 +351,7 @@ litellm:
   # the system models). PREREQ: the `openrouter` system-provider key must exist as
   # an app-DB row (Admin → Models) so minimax registers in the gateway; an
   # unregistered canaried model routes direct + warns (fail-loud guard), never 400s.
-  routedProviders: ["openrouter"]
+  routedProviders: []   # gateway disabled — nothing to route through it
 # -----------------------------------------------------------------------------
 # Session router — Direct Session WebSockets
 # (docs/features/direct_session_websockets.md)
