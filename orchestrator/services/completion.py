@@ -14,8 +14,11 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import random
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import yaml
 
@@ -253,6 +256,159 @@ def is_job_completion_freeze(job: dict[str, Any]) -> bool:
 MEMORY_RETRY_CAP = 2
 
 
+# ---------------------------------------------------------------------------
+# LLM-outage pause + backoff re-dispatch
+# (docs/features/llm_outage_pause_and_backoff_redispatch.md)
+#
+# A transient LLM outage exhausts the worker's Tier-1 in-process retries and
+# freezes the job (freeze_type=llm_unavailable). Rather than fail it, the
+# orchestrator pauses it and an outage sweeper re-dispatches it on an
+# exponential, Full-Jittered backoff so an overnight loop survives a
+# multi-minute/hour provider outage and resumes from its checkpoint. Two
+# ceilings guarantee a broken config can't park an iteration forever.
+# ---------------------------------------------------------------------------
+
+
+def _env_int(name: str, default: int) -> int:
+    """Read an int from env with a fallback (blank/garbage → default)."""
+    try:
+        return int((os.getenv(name) or "").strip() or default)
+    except (ValueError, TypeError):
+        return default
+
+
+# 24h continuous-outage duration ceiling (primary; the Temporal
+# scheduleToCloseTimeout model). After this the job fails loudly.
+LLM_OUTAGE_CEILING_SECONDS = _env_int("LLM_OUTAGE_CEILING_SECONDS", 86_400)
+# Attempts backstop — defends against pathological fast re-fail loops whose
+# short Full-Jitter draws could rack up attempts without much wall-clock.
+LLM_OUTAGE_MAX_ATTEMPTS = _env_int("LLM_OUTAGE_MAX_ATTEMPTS", 60)
+# Gap since the last failure that resets the attempt counter + duration ceiling
+# (the job ran fine in between → treat the next failure as a brand-new outage).
+# MUST exceed LLM_OUTAGE_BACKOFF_CAP_SECONDS: during a single sustained outage,
+# consecutive failures are ~one backoff apart (up to the 60-min cap), so a
+# window <= the cap would misread that idle backoff wait as "ran fine" and
+# spuriously reset first_failed_at every long cycle — letting a 24h outage park
+# a loop forever. 2h > 1h cap leaves headroom while still resetting on a genuine
+# multi-hour productive stretch between unrelated outages.
+LLM_OUTAGE_RESET_WINDOW_SECONDS = _env_int("LLM_OUTAGE_RESET_WINDOW_SECONDS", 7_200)
+# Backoff envelope: min(cap, base * 2**(attempt-1)), coefficient 2.
+LLM_OUTAGE_BACKOFF_BASE_SECONDS = _env_int("LLM_OUTAGE_BACKOFF_BASE_SECONDS", 30)
+LLM_OUTAGE_BACKOFF_CAP_SECONDS = _env_int("LLM_OUTAGE_BACKOFF_CAP_SECONDS", 3_600)
+# Jitter strategy: "full" (uniform[0, envelope], the thundering-herd default) or
+# "equal" (envelope/2 + uniform[0, envelope/2], a >=50% floor).
+LLM_OUTAGE_JITTER = (os.getenv("LLM_OUTAGE_JITTER") or "full").strip().lower() or "full"
+
+
+def _parse_context(job: dict[str, Any]) -> dict[str, Any]:
+    """Parse the job's ``context`` JSONB (handles str or dict)."""
+    ctx = job.get("context")
+    if isinstance(ctx, str):
+        try:
+            ctx = json.loads(ctx)
+        except (json.JSONDecodeError, ValueError):
+            return {}
+    return ctx if isinstance(ctx, dict) else {}
+
+
+def _parse_ts(value: Any) -> datetime | None:
+    """Parse an ISO-8601 timestamp string into an aware UTC datetime, or None."""
+    if not value or not isinstance(value, str):
+        return None
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+    return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
+
+
+def evaluate_llm_outage(ctx: dict[str, Any], now: datetime) -> dict[str, Any]:
+    """Decide an ``llm_unavailable`` freeze: apply the auto-reset + give-up ceiling.
+
+    Pure function of the job's parsed ``context`` and an aware UTC ``now`` — no
+    I/O — so the ``/complete`` handler and the sweeper backstop reach the same
+    verdict. Returns the post-reset, PRE-increment outage state:
+
+    * ``attempt``          — pauses so far for THIS outage (0 after a reset)
+    * ``first_failed_at``  — outage start (``now`` on a fresh/reset outage)
+    * ``elapsed_seconds``  — outage duration so far
+    * ``reset``            — the 30-min gap reset fired
+    * ``over_ceiling``     — the duration OR attempts ceiling has tripped
+    * ``ceiling_reason``   — ``"duration"`` | ``"attempts"`` | ``None``
+    """
+    outage = ctx.get("llm_outage")
+    outage = outage if isinstance(outage, dict) else {}
+    attempt = int(outage.get("attempt", 0) or 0)
+    first_failed_at = _parse_ts(outage.get("first_failed_at"))
+    last_failed_at = _parse_ts(outage.get("last_failed_at"))
+
+    reset = (
+        last_failed_at is not None
+        and (now - last_failed_at).total_seconds() > LLM_OUTAGE_RESET_WINDOW_SECONDS
+    )
+    if reset:
+        attempt = 0
+        first_failed_at = None
+    if first_failed_at is None:
+        first_failed_at = now
+
+    elapsed = (now - first_failed_at).total_seconds()
+    ceiling_reason: str | None = None
+    if elapsed >= LLM_OUTAGE_CEILING_SECONDS:
+        ceiling_reason = "duration"
+    elif attempt >= LLM_OUTAGE_MAX_ATTEMPTS:
+        ceiling_reason = "attempts"
+
+    return {
+        "attempt": attempt,
+        "first_failed_at": first_failed_at,
+        "elapsed_seconds": elapsed,
+        "reset": reset,
+        "over_ceiling": ceiling_reason is not None,
+        "ceiling_reason": ceiling_reason,
+    }
+
+
+def llm_outage_backoff_seconds(
+    attempt: int,
+    *,
+    base: int | None = None,
+    cap: int | None = None,
+    jitter: str | None = None,
+    retry_after_seconds: float | None = None,
+    rng: Callable[[float, float], float] | None = None,
+) -> float:
+    """Seconds to wait before the next re-dispatch for outage ``attempt`` (1-indexed).
+
+    Deterministic envelope ``min(cap, base * 2**(attempt-1))`` (coefficient 2 —
+    the universal default), then jitter:
+
+    * ``full``  — ``uniform(0, envelope)`` (AWS Full Jitter; flattens a
+      fleet-wide thundering herd across the whole window)
+    * ``equal`` — ``envelope/2 + uniform(0, envelope/2)`` (>=50% floor)
+
+    A server-directed ``retry_after_seconds`` (Retry-After /
+    ``anthropic-ratelimit-*-reset``) floors the result. ``rng`` is injectable
+    (signature ``uniform(a, b)``) for deterministic tests.
+    """
+    base = LLM_OUTAGE_BACKOFF_BASE_SECONDS if base is None else base
+    cap = LLM_OUTAGE_BACKOFF_CAP_SECONDS if cap is None else cap
+    jitter = (LLM_OUTAGE_JITTER if jitter is None else jitter).lower()
+    _uniform = rng or random.uniform
+
+    n = max(1, int(attempt))
+    # Cap the exponent so an absurd attempt can't overflow the shift (the
+    # envelope caps the value anyway).
+    envelope = min(float(cap), float(base) * (2 ** min(n - 1, 30)))
+    if jitter == "equal":
+        delay = envelope / 2 + _uniform(0, envelope / 2)
+    else:  # full jitter (default)
+        delay = _uniform(0, envelope)
+    if retry_after_seconds is not None:
+        delay = max(delay, float(retry_after_seconds))
+    return delay
+
+
 def determine_job_status(
     job: dict[str, Any],
     result: dict[str, Any],
@@ -363,6 +519,38 @@ def determine_job_status(
             f"{reason} Still unavailable after {retries} re-dispatch attempt(s) "
             f"— check the embedding model/endpoint (Admin → Models).",
         )
+    if freeze_type == "llm_unavailable":
+        # A transient LLM outage exhausted the worker's Tier-1 in-process
+        # retries. Pause (non-terminal) so the outage sweeper re-dispatches the
+        # SAME job on a backoff and it resumes from its checkpoint when the
+        # endpoint recovers. After the 24h duration ceiling (or the attempts
+        # backstop) fail loudly — a broken config must not park an overnight
+        # loop iteration forever. The /complete handler owns the increment +
+        # next_retry_at; here we only make the pause-vs-fail call.
+        # docs/features/llm_outage_pause_and_backoff_redispatch.md
+        ev = evaluate_llm_outage(_parse_context(job), datetime.now(timezone.utc))
+        if ev["over_ceiling"]:
+            summary = (
+                fd.get("error_summary")
+                or fd.get("reason")
+                or "LLM endpoint unavailable"
+            )
+            model = fd.get("model")
+            if ev["ceiling_reason"] == "duration":
+                detail = (
+                    f"still unavailable after ~{LLM_OUTAGE_CEILING_SECONDS / 3600:.0f}h "
+                    f"of continuous outage"
+                )
+            else:
+                detail = f"still unavailable after {ev['attempt']} re-dispatch attempts"
+            return (
+                "failed",
+                f"LLM endpoint unavailable — {detail}. Giving up. Last error: "
+                f"{str(summary)[:200]}"
+                + (f" (model '{model}')" if model else "")
+                + ". Check the model endpoint/provider (Admin → Models).",
+            )
+        return ("paused", None)
     return ("pending_review", None)
 
 

@@ -1,6 +1,6 @@
 # LLM-outage resilience: pause + backoff re-dispatch (don't fail the job)
 
-Status: **DESIGN — research-validated, decisions locked, ready to implement**
+Status: **IMPLEMENTED + k3d E2E VERIFIED — unit-tested + lint-clean, uncommitted on `develop`**
 Date: 2026-07-01
 Scope: worker/loop jobs (the LangGraph worker in `src/graph.py`). Persistent
 interactive sessions are out of scope for v1 (§Non-goals).
@@ -64,10 +64,15 @@ These are not optional — the safety argument depends on them.
    calls, git commits)." Postgres is already the Helm chart default (same doc, :265);
    gate the feature on it and no-op (fall back to today's fail-fast) on sqlite.
 2. **Single-layer retries.** Retries multiply across layers — LiteLLM gateway ×
-   provider SDK (`max_retries`, currently `1` at `src/agent.py:492,554`) × the worker
-   loop → up to 64×/243× amplification (Google SRE; AWS Builders' Library). Set the
-   provider SDK `max_retries=0` and the gateway's retries to 0 so the **worker is the
-   single retry layer**; otherwise the 24h budget is consumed 2–10× too fast. `[R]`
+   provider SDK (`max_retries`) × the worker loop → up to 64×/243× amplification
+   (Google SRE; AWS Builders' Library). **Implemented:** the *main worker LLM*'s SDK
+   retries are the multiplier that matters (it runs inside the graph retry loop), and
+   its `max_retries` comes from `config.llm.max_retries` (`config/defaults.yaml`) — now
+   **`0`**, so the graph's `retry_manager` (`limits.llm_inproc_retries`, Tier 1) is the
+   single retry layer. (The aux/citation clients at `src/agent.py:492,554` stay at `1`
+   — they run *outside* the worker loop, so they aren't the amplifier; the earlier plan
+   to zero those was a mis-target.) Gateway `num_retries=0` remains a deployment-side
+   follow-up (LiteLLM proxy config), noted in §Deferred. `[R]`
 
 ## Design — two tiers, split at the re-dispatch cold-start cost (~30–60s)
 
@@ -273,7 +278,8 @@ an outage anyway → they no-op. No consequential re-execution. `[R]`
    `llm_unavailable` freeze (above) *instead of* the circuit-breaker `error` return
    (:2439). Leave `permanent`/`cooldown` returns as `error`. Add the new
    `quota_exhausted` fail-fast class in `_classify_llm_error` (:317).
-2. **`src/agent.py:492,554`** — set provider SDK `max_retries=0` (single-layer retries).
+2. **`config/defaults.yaml` `llm.max_retries: 0`** — the main worker LLM's SDK retries
+   (single-layer retries; the aux/citation clients at `src/agent.py:492,554` stay at `1`).
 3. **`orchestrator/services/completion.py`, after the memory block ~:345/:365** — add
    `if freeze_type == "llm_unavailable":` → `("paused", None)` under ceiling,
    `("failed", <msg>)` at ceiling (read `context.llm_outage`).
@@ -297,7 +303,7 @@ an outage anyway → they no-op. No consequential re-execution. `[R]`
 | `llm_outage_jitter` | `full` | `full` \| `equal` |
 | `llm_outage_ceiling_seconds` | 86400 | 24-h duration ceiling (primary) |
 | `llm_outage_max_attempts` | 60 | attempts backstop |
-| `llm_outage_reset_window_seconds` | 1800 | gap that resets the attempt counter |
+| `llm_outage_reset_window_seconds` | 7200 | gap that resets the attempt counter — **must exceed the backoff cap** (see below) |
 | `LLM_OUTAGE_SWEEP_SECONDS` | 30 | sweeper tick |
 | `llm_outage_health_gate` | `true` | skip re-dispatch while gateway probe red |
 
@@ -316,7 +322,10 @@ an outage anyway → they no-op. No consequential re-execution. `[R]`
    (`insufficient_quota`) **fail fast** — never paused.
 6. A paused-for-outage loop iteration does **not** advance the loop or burn the failure
    budget; a 24h pause is not reaped.
-7. Two outages >30 min apart start fresh (attempt counter resets).
+7. Two genuinely separate outages (a multi-hour productive gap between them, i.e.
+   longer than `reset_window` > the backoff cap) start fresh (attempt counter +
+   duration ceiling reset); a long *backoff wait* within one sustained outage does
+   **not** reset.
 8. With `CHECKPOINTER_BACKEND=sqlite`, the feature no-ops to today's fail-fast (no unsafe
    cold-start re-dispatch).
 9. Concurrent sweeps / duplicate `/complete` cannot double-dispatch (CAS + leader gate)
@@ -343,10 +352,100 @@ an outage anyway → they no-op. No consequential re-execution. `[R]`
 - **Locked 2026-07-01:** health-gating ships in **v1**; jitter is **Full**. (The two
   are coupled — Full Jitter's short early draws are safe because the health gate blocks
   wasted re-hits into a still-down gateway.)
+- **Reset window must exceed the backoff cap (found during implementation).** The
+  auto-reset compares `now − last_failed_at` to the reset window. But during Tier-2
+  backoff, the gap between *consecutive failures* IS the backoff wait (up to the 60-min
+  cap) — the job was parked, not running fine. A window ≤ the cap (the original 30-min
+  value) would misread that idle wait as "ran fine" and spuriously reset `first_failed_at`
+  every long cycle → **both ceilings would restart forever and a sustained outage could
+  park a loop indefinitely** (the exact thing the ceiling prevents). Fixed by defaulting
+  `reset_window = 7200s` (2h > 1h cap); the invariant is asserted in a unit test.
+- **Health gate is fleet-granular in v1.** The sweeper defers *all* due jobs when the
+  gateway is enabled + unhealthy (not per-job routing). A direct-routed job in a
+  gateway-enabled fleet is thus deferred one cycle during a gateway outage — harmless
+  (counter untouched). Per-job routing precision (a `via_gateway` flag stamped at freeze
+  time) is deferred.
+- **Sweeper ceiling backstop → loop advance via the safety net.** When the sweeper
+  fail-loud's a job past the ceiling (rare; the common ceiling path is `/complete`), it
+  sets `status=failed` directly. The existing `project_loop_sweeper` safety net ("terminal
+  without advance") rotates the loop on its next tick, so no loop-advance coupling is
+  added to the outage sweeper.
 - **Latent side-finding (not blocking):** the exhaustive trace found **no code clears
   `freeze_data` for the `memory_unavailable`/`version_upgrade` paths**, so their
   "immediate re-dispatch" appears gated shut by their own retained `freeze_data`. Our
   sweeper avoids this by explicitly clearing. Worth a separate bug check on those paths.
+
+## Implementation notes (2026-07-01)
+
+Built on `develop`, uncommitted. Files touched:
+
+- **`src/graph.py`** — `_is_insufficient_quota` helper + `quota_exhausted` class in
+  `_classify_llm_error`; `quota_exhausted` fail-fast branch; the `llm_unavailable` freeze
+  at Tier-1 exhaustion (gated on `checkpointer_backend()=="postgres"`); `retry_manager`
+  now uses `limits.llm_inproc_retries`.
+- **`config/defaults.yaml`** (`llm.max_retries: 0`, `limits.llm_inproc_retries: 5`),
+  **`src/core/loader.py`** (`LimitsConfig.llm_inproc_retries` + both population sites),
+  **`config/schema.json`**.
+- **`orchestrator/services/completion.py`** — env-tunable constants, `_parse_context` /
+  `_parse_ts`, `evaluate_llm_outage` (reset + ceiling), `llm_outage_backoff_seconds`
+  (Full/Equal jitter + Retry-After floor), and the `llm_unavailable` branch in
+  `determine_job_status`.
+- **`orchestrator/database/postgres.py`** — `increment_job_llm_outage_attempt`
+  (row-locked atomic, applies reset), `list_due_llm_outage_jobs`,
+  `claim_llm_outage_redispatch` (CAS clear), `fail_llm_outage_job` (terminal CAS).
+- **`orchestrator/main.py`** — `/complete` `llm_unavailable` branch (park + next_retry_at,
+  no `_trigger_dispatch`; operator alert on terminal fail), `llm_unavailable` case in
+  `_format_freeze_notification`, `_llm_outage_sweep_once` + `llm_outage_redispatch_sweeper`
+  + lifespan registration under `run_when_leader` + shutdown await.
+- **Tests** — `tests/test_llm_outage_resilience.py` (evaluate/backoff/determine),
+  `tests/test_llm_outage_sweeper.py` (sweep tick: due/CAS/ceiling/health-gate), plus
+  `quota_exhausted` cases in `tests/test_graph_helpers.py::TestClassifyLlmError`. All green;
+  `ruff check`/`format` clean tree-wide.
+
+### k3d E2E result (2026-07-01) ✅
+
+Ran an **isolated** outage (a `developer` worker job pinned via `config_override.llm`
+to a dead endpoint `http://127.0.0.1:9/v1` — the `_inject_model_credentials`
+base_url+api_key early-return keeps it, so only this job is affected; no need to stop
+the shared gateway). Observed on the freshly-rebuilt cluster:
+
+- **Tier 1:** `LLM error (attempt 1/5 … 5/5)` with `1.1 → 2.2 → 4.2 → 8.7 → 16.6s`
+  backoff against `Connection error.`, then the freeze at 6 in-process attempts:
+  `LLM endpoint unavailable (transient) … freezing for pause+backoff re-dispatch`.
+- **Pause (not fail):** job → `paused`, `freeze_type=llm_unavailable`, `attempt=1`,
+  `next_retry_at` set (~25s, within the attempt-1 Full-Jitter [0,30s] envelope), agent
+  freed. `Job … paused for LLM outage — attempt 1, next_retry_at=… (classification=transient)`.
+- **Sweeper re-dispatch:** leader replica logged `LLM-outage sweeper: re-dispatched 1,
+  failed 0 (of 1 due)`; `freeze_data` CAS-cleared → job resumed to `processing` with
+  **`attempt` persisted** in `context.llm_outage`.
+- **Escalation:** second cycle → `attempt=2`, longer `next_retry_at` (attempt-2 [0,60s]
+  envelope). Backoff grows, counter persists across re-dispatches.
+- **Health gate:** correctly inert — `LITELLM_BASE_URL` empty on this cluster (all-direct
+  fleet), so no deferral.
+- **Loud-fail ceiling:** forcing `attempt=60` (the backstop) → sweeper failed it:
+  status `failed`, `error_message="LLM endpoint unavailable past the give-up ceiling
+  (attempts, 60 attempts) — … Check the model endpoint/provider (Admin → Models)."` +
+  **operator alert** (`Freeze notification sent … (llm_unavailable)`), `re-dispatched 0,
+  failed 1`.
+
+Not exercised live (low-risk, unit-covered): resume-to-**completion** on a *recovering*
+endpoint (this cluster had no configured real model to switch to; the re-dispatch→resume
+mechanism itself is proven — each cycle graceful-resumes the paused job from its
+checkpoint and re-attempts, rather than cold-starting), and the direct `quota_exhausted`
+fail-fast (same classifier path, unit-tested).
+
+**Finding — subjobs bypass outage handling.** The auto-spawned **scholar** subjob emitted
+`freeze_type=llm_unavailable` correctly (agent code fires for subjobs too), but
+`determine_job_status`'s subjob branch (`parent_job_id is not None`,
+`completion.py`) short-circuits to `pending_review` **before** the `llm_unavailable`
+check — so scholar/critic subjobs get no pause/backoff, they surface as `pending_review`
+to the parent. Acceptable for v1 (scoped to top-level worker/loop jobs; a real outage
+pauses the parent anyway), but a **loop caveat**: if a loop role is modeled as a subjob
+it won't get outage resilience. Tracked as a follow-up (route retriable `llm_unavailable`
+before the subjob branch, or pause the subjob and let the parent inherit).
+
+Remaining: commit + push (and, if desired, a resume-to-completion demo once a real model
+endpoint is configured on k3d).
 
 ## Deferred
 

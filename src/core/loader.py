@@ -1452,6 +1452,9 @@ class LimitsConfig:
     message_count_threshold: int = 200
     message_count_min_tokens: int = 40000  # 100_000 * 0.40
     tool_retry_count: int = 3
+    # Tier-1 in-process LLM-invoke retries before the worker freezes the job for
+    # pause+backoff re-dispatch (llm_outage_pause_and_backoff_redispatch.md).
+    llm_inproc_retries: int = 5
     model_max_context_tokens: int = 100000
     # Per-family image-token estimator config (matrix settings.image_tokens),
     # routed through limits (not llm — LLMConfig's closed constructor drops
@@ -2138,6 +2141,7 @@ def load_agent_config(
         message_count_threshold=limits_data.get("message_count_threshold", 200),
         message_count_min_tokens=limits_data.get("message_count_min_tokens", 40000),
         tool_retry_count=limits_data.get("tool_retry_count", 3),
+        llm_inproc_retries=limits_data.get("llm_inproc_retries", 5),
         model_max_context_tokens=limits_data.get("model_max_context_tokens", 100000),
         image_tokens=limits_data.get("image_tokens"),
         pdf_render_dpi=limits_data.get("pdf_render_dpi"),
@@ -2341,6 +2345,7 @@ def load_agent_config_from_dict(
         message_count_threshold=limits_data.get("message_count_threshold", 200),
         message_count_min_tokens=limits_data.get("message_count_min_tokens", 40000),
         tool_retry_count=limits_data.get("tool_retry_count", 3),
+        llm_inproc_retries=limits_data.get("llm_inproc_retries", 5),
         model_max_context_tokens=limits_data.get("model_max_context_tokens", 100000),
         image_tokens=limits_data.get("image_tokens"),
         pdf_render_dpi=limits_data.get("pdf_render_dpi"),
