@@ -1019,7 +1019,7 @@ async def _execute_turn(
         # Memory extraction before compaction (persistent): if this call is about
         # to summarize, snapshot the slice ensure_within_limits will evict and
         # mine it for durable memories before the lossy summary replaces it
-        # (docs/features/memory_extraction_before_compaction.md). Fire-and-forget
+        # (docs/done/memory_extraction_before_compaction.md). Fire-and-forget
         # so compaction latency is unchanged; no phase concept in a session →
         # phase=0 (matches the turn_end capture).
         if memory_service is not None and context_manager.should_summarize(messages):

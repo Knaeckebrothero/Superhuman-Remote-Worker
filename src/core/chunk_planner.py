@@ -1,7 +1,7 @@
 """Pure, deterministic chunk planner shared by summarization and extraction.
 
 Factored out of ``SummarizationEngine``
-(docs/features/memory_extraction_before_compaction.md, Slice 1). It sizes
+(docs/done/memory_extraction_before_compaction.md, Slice 1). It sizes
 formatted conversation parts into within-budget chunks for an auxiliary model's
 window — no LLM calls, no I/O. Two callers, two budget shapes, one algorithm:
 
