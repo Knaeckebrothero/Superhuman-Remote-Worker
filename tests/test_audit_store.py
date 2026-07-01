@@ -741,6 +741,40 @@ async def _create_intervals_table(pool) -> None:
     )
 
 
+async def _ensure_prev_month_partition(pool) -> None:
+    """Attach usage_events' *previous*-month partition on the test DB.
+
+    The 0002 bootstrap creates only the current month + N+2 lookahead (the
+    forward-only contract owned by audit_partitions). A leaked-interval
+    reconcile, though, stamps its event at ``now() - orphan_after_h`` (up to
+    24h back), which on the first day of a month lands in the previous month —
+    a partition a freshly-migrated DB lacks, so the insert would 23514 and the
+    ledger would drop the row. A long-running DB always already has this
+    partition (retention is deferred); create it here so the reconcile test is
+    deterministic regardless of the calendar date. Mirrors the migration's own
+    bootstrap DO block (UTC month boundaries), shifted one month back.
+    """
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("SET LOCAL timezone = 'UTC'")
+            await conn.execute(
+                """
+                DO $$
+                DECLARE
+                    m    DATE := (date_trunc('month', now())
+                                  - interval '1 month')::date;
+                    part TEXT := 'usage_events_p' || to_char(m, 'YYYY_MM');
+                BEGIN
+                    EXECUTE format(
+                        'CREATE TABLE IF NOT EXISTS %I PARTITION OF usage_events '
+                        'FOR VALUES FROM (%L) TO (%L)',
+                        part, m, (m + interval '1 month')::date
+                    );
+                END $$;
+                """
+            )
+
+
 def _owner(kind: str, oid) -> SimpleNamespace:
     return SimpleNamespace(kind=kind, id=str(oid))
 
@@ -856,6 +890,11 @@ class TestWorkspaceMetering:
     async def test_reconcile_closes_leaked_open(self, pg_dsn):
         async with _audit_pool(pg_dsn) as pool:
             await _create_intervals_table(pool)
+            # The reconcile stamps its event at now()-24h; on the first day of a
+            # month that falls into the previous month, which the migration's
+            # forward-only bootstrap doesn't create. Attach it so the assertion
+            # below is calendar-independent (see _ensure_prev_month_partition).
+            await _ensure_prev_month_partition(pool)
             owner = _owner("job", uuid4())
             await workspace_metering.open_interval(
                 pool, owner, tier="sandbox", cpu="500m", memory="1Gi"
