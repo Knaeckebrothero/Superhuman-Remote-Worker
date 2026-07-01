@@ -47,11 +47,11 @@ global:
 # -----------------------------------------------------------------------------
 image:
   orchestrator:
-    tag: sha-1ba2298
+    tag: sha-fc2df34
   agent:
-    tag: sha-5d90a94
+    tag: sha-fc2df34
   cockpit:
-    tag: sha-1ba2298
+    tag: sha-fc2df34
   mcp:
     tag: sha-46c4075
   workspace:
@@ -351,7 +351,7 @@ litellm:
   # the system models). PREREQ: the `openrouter` system-provider key must exist as
   # an app-DB row (Admin → Models) so minimax registers in the gateway; an
   # unregistered canaried model routes direct + warns (fail-loud guard), never 400s.
-  routedProviders: []   # gateway disabled — nothing to route through it
+  routedProviders: [] # gateway disabled — nothing to route through it
 # -----------------------------------------------------------------------------
 # Session router — Direct Session WebSockets
 # (docs/features/direct_session_websockets.md)
