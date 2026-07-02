@@ -1,7 +1,7 @@
 """Tests for the user management system.
 
 Covers:
-- PostgresDB user operations (CRUD, is_admin, upsert_default_user)
+- PostgresDB user operations (CRUD, is_admin)
 - PostgresDB MCP token operations (create, list, revoke, verify, cleanup)
 - Init seeding (_seed_admin_mcp_token)
 - The _user_dict helper, schema and config-file sanity checks
@@ -34,8 +34,6 @@ def _make_user(
     default_project_id=None,
     is_admin=False,
     created_at=None,
-    password_hash=None,
-    email_verified=False,
 ):
     """Build a fake user dict matching PostgresDB.get_user() output."""
     return {
@@ -46,8 +44,6 @@ def _make_user(
         "default_project_id": default_project_id or uuid4(),
         "is_admin": is_admin,
         "created_at": created_at or datetime.now(timezone.utc),
-        "password_hash": password_hash,
-        "email_verified": email_verified,
     }
 
 
@@ -148,27 +144,6 @@ class TestPostgresDBUserOps:
         result = await db.get_user_by_email("bob@test.com")
         assert result is not None
         assert result["is_admin"] is False
-
-    @pytest.mark.asyncio
-    async def test_get_user_by_email_with_auth_includes_is_admin(self):
-        db = self._make_db()
-        row = {
-            "id": uuid4(),
-            "display_name": "Carol",
-            "avatar_color": "#89b4fa",
-            "email": "carol@test.com",
-            "default_project_id": uuid4(),
-            "is_admin": True,
-            "created_at": datetime.now(timezone.utc),
-            "password_hash": "$argon2...",
-            "email_verified": True,
-        }
-        self._mock_conn(db, fetchrow_return=row)
-
-        result = await db.get_user_by_email_with_auth("carol@test.com")
-        assert result is not None
-        assert result["is_admin"] is True
-        assert result["password_hash"] == "$argon2..."
 
     @pytest.mark.asyncio
     async def test_list_users_includes_is_admin(self):
@@ -545,162 +520,6 @@ class TestAppSideAdmission:
         email.send_system_notification.assert_not_called()
 
 
-class TestUpsertDefaultUser:
-    """Tests for PostgresDB.upsert_default_user with is_admin support."""
-
-    def _make_db(self):
-        with patch.dict("os.environ", {"DATABASE_URL": "postgresql://test"}):
-            from database import PostgresDB
-
-            db = PostgresDB()
-        db._pool = MagicMock()
-        return db
-
-    def _mock_conn(self, db):
-        conn = AsyncMock()
-        cm = AsyncMock()
-        cm.__aenter__ = AsyncMock(return_value=conn)
-        cm.__aexit__ = AsyncMock(return_value=False)
-        db.acquire = MagicMock(return_value=cm)
-        return conn
-
-    @pytest.mark.asyncio
-    async def test_creates_new_user_with_is_admin(self):
-        db = self._make_db()
-        conn = self._mock_conn(db)
-
-        new_row = {
-            "id": uuid4(),
-            "display_name": "Admin",
-            "avatar_color": "#f38ba8",
-            "email": "admin@test.com",
-            "is_admin": True,
-            "created_at": datetime.now(timezone.utc),
-        }
-        # First fetchrow (check existing) returns None, second (INSERT) returns new_row
-        conn.fetchrow = AsyncMock(side_effect=[None, new_row])
-
-        result = await db.upsert_default_user(
-            display_name="Admin",
-            avatar_color="#f38ba8",
-            email="admin@test.com",
-            is_admin=True,
-        )
-
-        assert result["is_admin"] is True
-        assert result["display_name"] == "Admin"
-        # Verify INSERT was called (second fetchrow)
-        assert conn.fetchrow.call_count == 2
-
-    @pytest.mark.asyncio
-    async def test_creates_new_user_with_password(self):
-        db = self._make_db()
-        conn = self._mock_conn(db)
-
-        new_row = {
-            "id": uuid4(),
-            "display_name": "Admin",
-            "avatar_color": "#f38ba8",
-            "email": "admin@test.com",
-            "is_admin": True,
-            "created_at": datetime.now(timezone.utc),
-        }
-        conn.fetchrow = AsyncMock(side_effect=[None, new_row])
-
-        result = await db.upsert_default_user(
-            display_name="Admin",
-            email="admin@test.com",
-            is_admin=True,
-            password_hash="$argon2id$...",
-            email_verified=True,
-        )
-
-        assert result["is_admin"] is True
-        # Verify INSERT query includes password_hash and email_verified
-        insert_call = conn.fetchrow.call_args_list[1]
-        query = insert_call[0][0]
-        assert "password_hash" in query
-        assert "email_verified" in query
-
-    @pytest.mark.asyncio
-    async def test_existing_user_updates_is_admin(self):
-        db = self._make_db()
-        conn = self._mock_conn(db)
-
-        existing = {
-            "id": uuid4(),
-            "display_name": "Admin",
-            "avatar_color": "#f38ba8",
-            "email": "admin@test.com",
-            "is_admin": False,
-            "created_at": datetime.now(timezone.utc),
-        }
-        conn.fetchrow = AsyncMock(return_value=existing)
-
-        result = await db.upsert_default_user(
-            display_name="Admin",
-            email="admin@test.com",
-            is_admin=True,  # Changed from False to True
-        )
-
-        assert result["is_admin"] is True
-        # Verify UPDATE was called
-        conn.execute.assert_called_once()
-        update_query = conn.execute.call_args[0][0]
-        assert "is_admin" in update_query
-
-    @pytest.mark.asyncio
-    async def test_existing_user_no_changes_skips_update(self):
-        db = self._make_db()
-        conn = self._mock_conn(db)
-
-        existing = {
-            "id": uuid4(),
-            "display_name": "Default",
-            "avatar_color": "#89b4fa",
-            "email": "default@cockpit.local",
-            "is_admin": False,
-            "created_at": datetime.now(timezone.utc),
-        }
-        conn.fetchrow = AsyncMock(return_value=existing)
-
-        result = await db.upsert_default_user(
-            display_name="Default",
-            email="default@cockpit.local",
-            is_admin=False,
-        )
-
-        # No update needed — email already set, is_admin unchanged
-        conn.execute.assert_not_called()
-        assert result["is_admin"] is False
-
-    @pytest.mark.asyncio
-    async def test_existing_user_updates_email_when_null(self):
-        db = self._make_db()
-        conn = self._mock_conn(db)
-
-        existing = {
-            "id": uuid4(),
-            "display_name": "Default",
-            "avatar_color": "#89b4fa",
-            "email": None,
-            "is_admin": False,
-            "created_at": datetime.now(timezone.utc),
-        }
-        conn.fetchrow = AsyncMock(return_value=existing)
-
-        result = await db.upsert_default_user(
-            display_name="Default",
-            email="new@test.com",
-            is_admin=False,
-        )
-
-        conn.execute.assert_called_once()
-        update_query = conn.execute.call_args[0][0]
-        assert "email" in update_query
-        assert result["email"] == "new@test.com"
-
-
 # ============================================================================
 # PostgresDB MCP Token Tests
 # ============================================================================
@@ -966,18 +785,6 @@ class TestSchemaContainsIsAdmin:
             content = f.read()
 
         assert "CREATE TABLE IF NOT EXISTS mcp_tokens" in content
-
-    def test_is_admin_migration_after_email_verified(self):
-        """is_admin migration should come after email_verified migration."""
-        schema_path = os.path.join(
-            os.path.dirname(__file__), "..", "orchestrator", "database", "schema.sql"
-        )
-        with open(schema_path) as f:
-            content = f.read()
-
-        email_verified_pos = content.index("email_verified BOOLEAN")
-        is_admin_pos = content.index("is_admin BOOLEAN")
-        assert is_admin_pos > email_verified_pos
 
 
 # ============================================================================

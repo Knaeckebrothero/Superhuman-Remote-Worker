@@ -23116,7 +23116,6 @@ class GrantSet(BaseModel):
     """Request body for setting a capability grant."""
 
     value_json: Any
-    reason: str | None = None
 
 
 def _validate_grant_value(key: str, value: Any) -> None:
@@ -23163,7 +23162,7 @@ async def list_grants_endpoint(
 async def set_grant_endpoint(
     scope_kind: str, scope_id: str, key: str, body: GrantSet, request: Request
 ) -> dict:
-    """Set/update one capability grant (audited). Admin-only."""
+    """Set/update one capability grant. Admin-only."""
     admin = await _require_admin(request)
     from src.core.capability_grants import CATALOG
 
@@ -23177,7 +23176,6 @@ async def set_grant_endpoint(
             key=key,
             value_json=body.value_json,
             actor=str(admin["id"]),
-            reason=body.reason,
         )
     }
 
@@ -23186,8 +23184,8 @@ async def set_grant_endpoint(
 async def delete_grant_endpoint(
     scope_kind: str, scope_id: str, key: str, request: Request
 ) -> dict:
-    """Revoke one capability grant (audited). Admin-only."""
-    admin = await _require_admin(request)
+    """Revoke one capability grant. Admin-only."""
+    await _require_admin(request)
     if scope_kind not in ("user", "project", "global"):
         raise HTTPException(status_code=400, detail="bad scope_kind")
     return {
@@ -23195,7 +23193,6 @@ async def delete_grant_endpoint(
             scope_kind=scope_kind,
             scope_id=(None if scope_kind == "global" else scope_id),
             key=key,
-            actor=str(admin["id"]),
         )
     }
 

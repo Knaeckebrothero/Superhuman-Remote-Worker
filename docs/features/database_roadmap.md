@@ -53,12 +53,12 @@ The research sweep materially corrected four premises:
 
 | Phase | Scope | Effort | Depends on | Status |
 |---|---|---|---|---|
-| 1 | Mechanical quick wins — QW-2, QW-3, QW-5, QW-6 | ~1 day | G1 (QW-6 slice only, default: drop) | todo |
+| 1 | Mechanical quick wins — QW-2, QW-3, QW-5, QW-6 | ~1 day | — (G1 decided: drop) | implemented 2026-07-02 (uncommitted); full pytest + migrate-from-zero verified; k3d boot check pending |
 | 2 | HF-1 generated schema artifact (keystone) | ~1 day | — | todo |
 | 3 | D-5 Mongo code deletion | ~1–2 days | QW-4 soak ✅ (done, >1 week) | todo |
 | 4 | HF-3 atomic context writes (correctness) | ~1–2 days | — | todo |
 | 5 | Perf batch — HF-5, HF-4, HF-6, HF-7, HF-2 | ~3–4 days | — (HF-2 last) | todo |
-| 6 | Retention becomes real — D-1 + D-2 bundled | ~2–3 days | go/no-go (recommend: build; scope shrank) | todo |
+| 6 | Usage rollup + no-deletion policy — D-1 build, D-2 closed by policy | ~1–2 days | — (decided 2026-07-02) | todo |
 | 7 | Unification, direction A (one message model) | L (grew: 0019 is unbuilt) | Phases 1–5; G4 for direction B | gated |
 
 Phases 1–4 ≈ one focused week; 1–6 ≈ two and a half. Phases 2 and 3 are
@@ -101,6 +101,21 @@ Pure debt paydown; no design questions except the QW-6 default.
 migrations apply from zero and on an existing dev DB; full pytest green;
 grep-clean for dropped methods/table; `EXPLAIN` on `threads WHERE user_id=…`
 still index-backed via `idx_threads_user`.
+
+**Status (2026-07-02): implemented, uncommitted.** Migrations 0042–0045
+(one statement per `.notx.sql` — the runner executes each file as a single
+simple-query message, so multi-statement CONCURRENTLY files would fail in an
+implicit transaction). QW-6 went end-to-end: with the audit table gone, the
+audit-only `reason`/`actor` plumbing was removed from `set_grant`/
+`delete_grant`, `GrantSet`, and the cockpit "Reason (optional)" field (it
+would otherwise silently discard admin input). Verified: full suite 7518
+passed / 19 skipped (one pre-existing live-DB test needs localhost:5432, not
+ours); cockpit 778 tests + prod build green; **migrate-from-zero on a
+scratch pgvector:pg15**: all 45 migrations apply, `password_hash`/
+`email_verified`/`capability_grant_audit`/both duplicate indexes gone,
+`idx_threads_user` + the 0020/0023 composites + `capability_grants` intact.
+Pending: k3d boot-log check (no `Missing tables` warning) on next cluster
+deploy.
 
 ## Phase 2 — HF-1: generated current-schema artifact (the keystone)
 
@@ -192,13 +207,15 @@ lines, and the archiver's Mongo code is ~half that file, not 3 lines).
   package exports (`orchestrator/database/__init__.py:44,57-58`,
   `src/database/__init__.py:41,47`); ~9 user-facing `"MongoDB not
   available"` strings in audit endpoints (`main.py:6135,11260,…,18646`).
-- **Defaults footgun (must fix):** the *writer* still defaults
-  `AUDIT_BACKEND="mongodb"` (`archiver.py:290`) while the reader defaults
-  postgres — any env without the var set writes down the Mongo path. Flip to
-  `"postgres"` (or delete the branch entirely).
-- **Tombstone:** today `AUDIT_BACKEND=mongodb` logs a **warning** and serves
-  Postgres (`main.py:5387-5392`) — it does not raise. Keep at least the
-  warning; upgrading to a hard error is optional.
+- **The `AUDIT_BACKEND` selector dies entirely (decided 2026-07-02: "strip
+  all mentions").** Postgres is the only backend, so the flag is dead
+  config: delete the reader tombstone branch (`main.py:5387-5392`), the
+  archiver's `from_env` backend branch (incl. its `"mongodb"` default at
+  `archiver.py:290` — the local-dev footgun), and the `AUDIT_BACKEND`
+  env/configmap/values plumbing (`values.yaml:487-492`, `configmap.yaml:
+  29-31`, `deployment.yaml:174-178`). No tombstone: an env var nobody reads
+  is noise, not UX. Keep the `audit_reader` code seam (abstraction, not a
+  flag).
 - **Helm/compose:** `templates/databases/mongodb.yaml`,
   `optional/mongo-express.yaml`, the internal-mongo NetworkPolicy + ingress
   slices (`databases/network-policies.yaml:145-171`, `ingress.yaml:450,480`),
@@ -224,14 +241,15 @@ lines, and the archiver's Mongo code is ~half that file, not 3 lines).
   mongodb *datasource* feature (`src/tools/mongodb/`, registry entries,
   `main.py:12415,12577,12647,12820-12827,24447`, MCP ds-type list,
   `orchestrator/init.py:701,738-746` seed) and the `audit_reader` seam.
-- **Pre-cutover history:** default **skip** the
-  `scripts/import_mongo_audit_backup.py` backfill; record the call before
-  any homelab Mongo PVC is reclaimed.
+- **Pre-cutover history: decided 2026-07-02 — skip the backfill** ("we
+  don't need it anymore"). Delete `scripts/import_mongo_audit_backup.py`
+  with the rest; the homelab Mongo PVC can be reclaimed.
 
-**Acceptance:** `grep -ri mongo src/ orchestrator/ helm/` returns only the
-datasource carve-out + the tombstone; `helm template` renders no Mongo
-resources on defaults; archiver default backend is postgres; fresh k3d
-install green through the smoke path; docs updated.
+**Acceptance:** `grep -ri mongo src/ orchestrator/ helm/` returns **only**
+the datasource carve-out (no tombstone, no selector, no stale docstrings);
+`helm template` renders no Mongo resources on defaults; the archiver has no
+backend branch; fresh k3d install green through the smoke path; docs
+updated.
 
 ## Phase 4 — HF-3: atomic `jobs.context` writes (the correctness fix)
 
@@ -425,45 +443,47 @@ Ordered cheapest/safest first; HF-2 last (touches the resume contract).
 dispatcher's actual call — `main.py:4152`); call-count assertions for HF-6;
 session smoke + resume tests + k3d kill-mid-turn drill for HF-7/HF-2.
 
-## Phase 6 — Retention becomes real (D-1 + D-2 as one work package)
+## Phase 6 — Usage rollup + the no-deletion policy (D-1 build; D-2 closed by policy)
 
-**Recommendation: build — and the scope shrank.** `retire_partitions`
-(`services/audit_partitions.py:252-275`) is a stub whose surroundings are
-already built: signature (retention matrix + grace days), the
-`maintenance_pass` call site (`:417`, 6h loop + jitter, lifespan-gated),
-per-parent advisory lock id, `partition_status` already computing
-`awaiting_drop` + `detach_pending`, and a FINALIZE alarm
-(`_emit_alarms:401-407`). Phase 6 = one function body + the rollup + tests.
+**Decided 2026-07-02: automatic data deletion is rejected as policy, not
+deferred as work.** Nothing in the product deletes operational data on a
+timer. Rationale (owner call): storage is abundant (homelab: 8TB NVMe +
+12TB SATA SSD + 96TB HDD; ~32TB S3 backup on Garage even with erasure
+coding), text is cheap, and audit history is worth more than the disk it
+sits on. Deletion is always **manual and export-first** (detach → export to
+a DWH/data-lake → only then remove from prod). Revisit only when SaaS/GDPR
+makes deletion a compliance requirement.
 
-**Retention loop design (researched; PG16 store, asyncpg):**
+What this changes versus the researched retention plan:
 
-1. Single-flight via the existing `MAINT_LOCK_ID` advisory lock
-   (`pg_try_advisory_lock`, skip-if-held — replicas:2 safe).
-2. **Heal first**: `FINALIZE` any `pg_inherits.inhdetachpending` straggler —
-   an interrupted `DETACH CONCURRENTLY` wedges all further detaches on that
-   parent (max one pending per table) until finalized.
-3. Candidates from **bounds, not names**: parse
-   `pg_get_expr(relpartbound, oid)`; retire only when the *entire* range is
-   past cutoff (`PARENTS` matrix: llm_requests 90 / agent_audit 90 /
-   chat_history 365 / usage_events 365). Never the last child, never the
-   partition covering now(); alarm if a DEFAULT partition ever appears
-   (it disables DETACH CONCURRENTLY outright).
-4. `DETACH PARTITION … CONCURRENTLY` on a **bare connection, no transaction
-   wrapper** (two-transaction protocol; asyncpg autocommit is fine, any
-   `conn.transaction()` context breaks it), `statement_timeout` ~5min, cap
-   2–3 per run. On timeout/cancel: stop; next run's step 2 heals.
-5. **Grace then drop**: detached tables are standalone (`awaiting_drop` in
-   `partition_status` already detects them) — drop after `GRACE_DAYS`
-   (module has 3; fine) with no parent lock at all. The auto-added CHECK
-   constraint makes emergency re-ATTACH validation-free.
-6. **`usage_events` is fenced**: its partitions additionally require
-   `upper_bound <= rollup watermark` — never drop raw rows that haven't
-   rolled up. (The matrix already lists it at 365d; a naive wiring would
-   eventually drop unrolled billing-adjacent data.)
-7. Ship the first release **log-only** (plan without acting); flip a config
-   flag to enact. Alert if no successful pass in >48h.
+- **`retire_partitions` stays a stub — permanently, by policy.** Re-document
+  the module docstring + `maintenance_pass` comment (`audit_partitions.py:
+  252-275, 417`) and the `PARENTS` "retention matrix" as *no-auto-deletion
+  policy*, not "deferred (PR-1 lean cut)". The retention-window numbers stop
+  being promises.
+- **The manual-path recipe is preserved here** for when export-first removal
+  is ever wanted (it was researched and is sound): heal any
+  `pg_inherits.inhdetachpending` straggler with `FINALIZE` first, pick
+  candidates from `pg_get_expr(relpartbound, oid)` bounds (never names,
+  never the last child, never the now() partition, alarm on any DEFAULT
+  partition), `DETACH PARTITION … CONCURRENTLY` on a bare no-transaction
+  connection, export the standalone table, then drop it (no parent lock).
+- Partition **creation, ANALYZE, lookahead alarms, and `partition_status`**
+  all stay — monthly partitions still buy query pruning and are the natural
+  unit for a future manual export. Add per-parent **size reporting** to
+  `partition_status` (`pg_total_relation_size` per parent) so growth is
+  *visible* instead of managed; alert thresholds can come later.
+- The `usage_events`-fenced-by-rollup-watermark trap is moot (nothing
+  drops), but keep the fence as a code comment next to `PARENTS` so a future
+  SaaS-era retention implementer inherits the warning.
+- **Doc corrections become the D-2 deliverable**: `database_architecture.md`
+  (the 90/90/365d retention promises + the "retention-dropped" store
+  characterization), the audit migration headers, `observability_and_quotas.md`,
+  and the `audit_partitions.py` docstrings all get the policy stated instead
+  of unenforced windows.
 
-**Rollup design (researched):** `usage_daily` + a `rollup_state` watermark
+**Rollup design (researched; confirmed build — "aggregation on top to speed
+up queries" is exactly the approved shape):** `usage_daily` + a `rollup_state` watermark
 row, both in the **app DB** (watermark and upsert commit in one transaction
 — the cross-DB exactly-once trick). Daily task + startup catch-up:
 re-aggregate from `last_closed_day` (inclusive — 1-day overlap re-closes the
@@ -489,13 +509,14 @@ llm_pricing_sync_loop` auto-seeds effective-dated LLM rates.
 
 **Test seeds:** generalize the private `_ensure_prev_month_partition`
 (`tests/test_audit_store.py:744-777`, usage_events-only, previous-month-only)
-into an N-months-back/any-parent helper for retention time-travel drills.
+into an N-months-back/any-parent helper — now for rollup catch-up drills
+(seed backdated events → catch-up rolls them up correctly).
 
-**Acceptance:** seeded old partitions detach → grace → drop on k3d;
-interrupted-detach heals on the next pass; `usage_events` retirement blocked
-below the watermark; `usage_daily` reconciles with raw aggregation on a
-seeded window; architecture doc contains no phantom-table claims. Until this
-lands, don't cite "Postgres gives us retention" in Mongo-exit messaging.
+**Acceptance:** `usage_daily` reconciles with raw aggregation on a seeded
+window including a backdated month; `/api/usage` serves the rollup for
+closed days and raw for today; `retire_partitions` carries the policy
+docstring; `partition_status` reports per-parent sizes; architecture doc
+contains no phantom-table claims and no unenforced retention promises.
 
 ## Phase 7 — Unification track (direction A; B stays gated)
 
@@ -546,15 +567,21 @@ recorded and implemented.
 
 ---
 
-## Decision gates
+## Decision gates — ALL DECIDED 2026-07-02 (owner call; kept as the record)
 
-| Gate | Question | Options | Recommendation | Needed by |
-|---|---|---|---|---|
-| **G1** | `capability_grant_audit`: drop or wire a reader? | drop table + INSERTs / build admin audit view | **Drop** (no consumer in sight; grants re-derivable) | Phase 1 |
-| **G2** | Messaging trio (`message_log`, `external_contacts`, `notification_queue`) — owner or drop? (D-4) | keep + name owner / freeze as-is / drop poller + 3 tables + ~15 methods + endpoints | **Keep or freeze** — the M1 hardening just invested here (0037 insert-as-claim IMAP dedup, 0038 notification-sent unique); make the implicit "keep" explicit | Before the next feature touches email |
-| **G3** | Token-ledger consolidation (D-3) — **premise corrected**: `usage_events` already carries `ref_kind`/`ref_id`/user/project per LLM row via the live audit-sourced poll (`audit_usage.py:219-236`, wired `main.py:1554-1605`); per-job cost is unblocked TODAY | retire the `llm_requests.metrics.token_usage` overlap / keep both documented | **Shrunk decision**: keep `llm_requests` as the request-level audit record; treat `usage_events` as the sole cost ledger; drop the token-overlap question to opportunistic cleanup | No deadline |
-| **G4** | Unification direction B (jobs adopt `thread_messages`)? | go / stay on A | **Stay on A** until a product driver names itself (worker resume, loop observability). Note A grew (0019 unbuilt) — B's substrate cost went up accordingly | Before any job↔thread model work |
-| **Phase 6 go/no-go** | Build rollup + retention, or document raw-aggregation as reality? | build / document-only | **Build** — scope shrank (retire is one function body; scaffolding + monitoring exist) | Before scheduling Phase 6 |
+| Gate | Question | Decision |
+|---|---|---|
+| **G1** | `capability_grant_audit`: drop or wire a reader? | **Drop** — table + both INSERTs go (Phase 1 / QW-6). Grants are re-derivable current state; re-add on a concrete compliance ask. |
+| **G2** | Messaging trio / email subsystem (D-4) — owner or drop? | **Keep, owned.** Notifications, permission requests, and the AI ask-questions flow are on the feature list — the trio + IMAP poller are product surface, not an experiment. The M1 hardening (0037/0038) stands. |
+| **G3** | Token-ledger consolidation (D-3) | **Closed — keep both.** `llm_requests` = request-level audit record; `usage_events` = the cost ledger (already job-attributed via `audit_usage.py:219-236`). Token overlap accepted; no consolidation work. |
+| **G4** | Unification direction B (jobs adopt `thread_messages`)? | **Deferred** — stay on A; revisit when a product driver (worker resume, loop observability) is concrete. |
+| **Phase 6 go/no-go** | Build retention + rollup, or document-only? | **Superseded by the no-deletion policy**: build the rollup (D-1); close retention (D-2) as policy, never as a timer. See Phase 6. |
+
+Smaller defaults confirmed the same day: skip the pre-cutover Mongo backfill
+("we don't need it anymore"); strip **all** Mongo mentions incl. the
+`AUDIT_BACKEND` selector (Phase 3); QW-5 full clean cut, `jobs.context`
+NOT-NULL hardening, and deferring `synchronous_commit=off` to measurement
+all ride as previously proposed.
 
 ## Opportunistic / at-scale (no phase)
 
@@ -640,14 +667,16 @@ Full per-claim URL lists live in the 11 research briefs (session transcript,
   CI-enforced artifacts; every install path (helm, compose, init.py) derives
   from migrations or generated artifacts — frozen snapshots can no longer
   mislead.
-- One audit backend (Postgres) end to end — reader, writer default, chart —
-  with the Mongo surface reduced to the datasource feature + a tombstone.
+- One audit backend (Postgres) end to end — no selector flag, no tombstone —
+  with the Mongo surface reduced to the datasource connector feature only.
 - No lost-update races on `jobs.context`: every write is a single atomic
   statement, fused where status must flip in the same statement, with the
   drain/pop ordering fixed.
 - The four hottest paths (dispatch poll, datasource list, thread open,
   session persist) are index-backed / batched / O(1)-query, verified by
   EXPLAIN or call-count assertions.
-- Retention and rollups actually run (log-only → enacted), `usage_events`
-  fenced by the rollup watermark; every table in the architecture doc
-  exists, and every existing table has a reader or a dropped-by migration.
+- The usage rollup runs and serves `/api/usage` for closed days; the
+  no-deletion policy is stated wherever retention used to be promised;
+  partition sizes are visible in `partition_status`; every table in the
+  architecture doc exists, and every existing table has a reader or a
+  dropped-by migration.

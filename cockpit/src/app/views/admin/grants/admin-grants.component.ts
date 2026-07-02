@@ -62,10 +62,6 @@ const INHERIT = '__inherit__';
                 </select>
               </label>
             }
-            <label class="reason">Reason (optional)
-              <input type="text" [ngModel]="reason()" (ngModelChange)="reason.set($event)"
-                     placeholder="audit note" />
-            </label>
           </div>
 
           @if (scopeReady()) {
@@ -126,7 +122,6 @@ const INHERIT = '__inherit__';
       padding: 0.35rem 0.5rem; background: var(--surface-0); color: var(--text-primary);
       border: 1px solid var(--border-color); border-radius: var(--radius-surface);
     }
-    .reason { flex: 1; min-width: 12rem; }
     .grid { width: 100%; border-collapse: collapse; }
     .grid th, .grid td { text-align: left; padding: 0.5rem; border-bottom: 1px solid var(--border-color); color: var(--text-primary); }
     .grid .muted, .muted { color: var(--text-muted); }
@@ -138,7 +133,6 @@ const INHERIT = '__inherit__';
          the User/Project <select> intrinsic width so a long name can't overflow). */
       .scope-bar { flex-direction: column; gap: 0.75rem; }
       .scope-bar select, .scope-bar input { width: 100%; box-sizing: border-box; }
-      .reason { flex: none; min-width: 0; }
 
       /* Grants grid -> one card per capability (a fixed 3-col table can't fit a
          phone; this restores full-width controls and removes the h-scroll). */
@@ -163,7 +157,6 @@ export class AdminGrantsComponent implements OnInit {
 
   scopeKind = signal<ScopeKind>('user');
   scopeId = signal<string | null>(null);
-  reason = signal('');
   listDraft = signal('');
   projects = signal<{id: string; name: string}[]>([]);
   error = signal('');
@@ -223,7 +216,7 @@ export class AdminGrantsComponent implements OnInit {
       this.svc.deleteGrant(this.scopeKind(), this.scopeId(), key).subscribe(done);
     } else {
       const v: unknown = this.spec(key).type === 'bool' ? raw === 'true' : raw;
-      this.svc.setGrant(this.scopeKind(), this.scopeId(), key, v, this.reason() || undefined).subscribe(done);
+      this.svc.setGrant(this.scopeKind(), this.scopeId(), key, v).subscribe(done);
     }
   }
 
@@ -237,7 +230,7 @@ export class AdminGrantsComponent implements OnInit {
     if (ids.length === 0) {
       this.svc.deleteGrant(this.scopeKind(), this.scopeId(), key).subscribe(done);
     } else {
-      this.svc.setGrant(this.scopeKind(), this.scopeId(), key, ids, this.reason() || undefined).subscribe(done);
+      this.svc.setGrant(this.scopeKind(), this.scopeId(), key, ids).subscribe(done);
     }
   }
 

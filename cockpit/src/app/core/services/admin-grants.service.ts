@@ -38,12 +38,10 @@ export class AdminGrantsService {
     scopeId: string | null,
     key: string,
     valueJson: unknown,
-    reason?: string,
   ): Observable<unknown> {
     const sid = scopeKind === 'global' ? 'global' : scopeId;
     return this.http.put(`${this.baseUrl}/admin/grants/${scopeKind}/${sid}/${key}`, {
       value_json: valueJson,
-      reason: reason ?? null,
     });
   }
 
