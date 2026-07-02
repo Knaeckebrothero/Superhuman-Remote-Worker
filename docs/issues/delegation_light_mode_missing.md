@@ -3,11 +3,12 @@
 **Date:** 2026-06-18
 **Status:** Open. Enhancement / design gap, **not** a regression — the existing
 heavyweight delegation path works as designed. This documents a missing
-*alternative* mode. **Decision proposed 2026-07-02** (scholar-driven) — see
-"Decision — Scholar-driven throwaway readers" at the end of this doc. Citation
-handling resolved (subagents inherit the citation tool and cite normally).
-Remaining fork: runtime (in-process vs stripped child job) — recommendation
-recorded, awaiting user confirmation.
+*alternative* mode.
+**Update 2026-07-02:** a light ReAct subagent tool (approach ~2, agent-as-tool with mid-tier child models) is **in progress** in a parallel session.
+**Decision proposed 2026-07-02** (scholar-driven) — see "Decision — Scholar-driven throwaway readers" at the end of this doc.
+Citation handling resolved (subagents inherit the citation tool and cite normally).
+Remaining fork: runtime (in-process vs stripped child job) — recommendation recorded, awaiting user confirmation.
+Note before calling this done: the heavy path has **never been invoked in production — 0 delegation children all-time** — so shipping the tool is only half the work; the adoption side (prompt/todo-scaffold wiring so models actually use it) is tracked in `subagents_never_used.md`.
 **Component:** `src/tools/delegation/delegate_work.py`, `src/graph.py` (worker
 state machine), `src/api/orchestrator_client.py` (`create_delegation_job`),
 `docs/features/subagent_delegation.md` (design doc that chose the heavyweight

@@ -880,7 +880,8 @@
       "colActions": "Aktionen",
       "yes": "Ja",
       "no": "Nein",
-      "remove": "Entfernen"
+      "remove": "Entfernen",
+      "protected": "Geschützt"
     },
     "experts": {
       "loading": "Experten werden geladen...",

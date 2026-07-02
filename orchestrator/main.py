@@ -113,12 +113,15 @@ from security.auth import (  # noqa: E402
     ensure_user_provisioned,
 )
 from security.access import (  # noqa: E402
+    externalize_gitea_url,
     is_internal_call,
     log_security_event,
     mcp_scope_project_id,
     redact_config_override,
     redact_datasource,
     redact_datasources,
+    redact_repositories,
+    redact_repository,
     require_datasource_access,
     require_datasource_owner,
     require_internal,
@@ -2162,6 +2165,18 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
             config_override = config_override or {}
             ws = config_override.setdefault("workspace", {})
             ws["backend"] = "vm"
+            # F29: VMs are tailnet nodes and can't resolve the cluster-internal
+            # Gitea host (GITEA_INTERNAL_URL, e.g. srw-gitea:3000). Left as-is,
+            # GitManager.clone fails and silently falls back to `git init`
+            # (src/core/workspace.py:362-372,412-418), so every push is a
+            # swallowed warning and the agent's work never lands on main. Rewrite
+            # clone + repo URLs to the ingress-routable GITEA_URL (creds
+            # preserved so the agent can still push). Pod/sandbox backends resolve
+            # the internal host fine, so this rewrite is scoped to the VM branch.
+            git_remote_url = externalize_gitea_url(git_remote_url)
+            for _repo in repositories_payload or []:
+                if _repo.get("repo_url"):
+                    _repo["repo_url"] = externalize_gitea_url(_repo["repo_url"])
             remote = ws.setdefault("remote", {})
             remote.setdefault("host", vm_ctx["ssh_host"])
             remote.setdefault("port", vm_ctx.get("ssh_port", 22))
@@ -10026,6 +10041,25 @@ async def _spawn_loop_job(
             job.get("id"),
         )
 
+    # No-op compounding guard (F29/F40), capture half: for execution roles that
+    # commit directly to `main`, record the repo's `main` HEAD *before* the job
+    # runs so `_advance_project_loop` can tell whether the completed job actually
+    # landed anything. This is the loop's only artifact-integrity signal — no
+    # agent role can see `main` (critics run in fresh workspaces; a destroyed
+    # developer's "SHIPPED" retro stays active in the KB). Best-effort; a Gitea
+    # hiccup here must never block dispatch.
+    if is_loop_execution_role(role) and job.get("repo_name"):
+        try:
+            head = await gitea_client.get_commits(job["repo_name"], sha="main", limit=1)
+            await postgres_db.merge_job_context(
+                str(job["id"]), {"pre_main_sha": (head[0]["sha"] if head else None)}
+            )
+        except Exception:
+            logger.exception(
+                "project loop %s: no-op guard pre-HEAD capture failed (non-fatal)",
+                loop.get("id"),
+            )
+
     try:
         _trigger_dispatch()
     except Exception:
@@ -10077,6 +10111,49 @@ async def _advance_project_loop(
     failed = bool(result.get("error")) or job.get("status") == "failed"
     consecutive = (int(loop.get("consecutive_failures") or 0) + 1) if failed else 0
     last_error = (result.get("error") or "job failed") if failed else None
+
+    # No-op compounding guard (F29/F40), check half: did this execution job move
+    # `main`? Compare the pre-run HEAD (captured at spawn) with `main` now. A
+    # COMPLETED execution job that left HEAD unchanged landed nothing — the
+    # run-5/6 silent-loss signature (main sat at one SHA for the whole night
+    # while developers rebuilt in disconnected local gits). Flag it loudly and
+    # record merge_status; this is the only integrity check the loop has.
+    # Best-effort; never blocks the advance.
+    if not failed:
+        try:
+            from services.project_loops import is_loop_execution_role
+
+            completed_role = (ctx or {}).get("loop_role")
+            if is_loop_execution_role(completed_role) and job.get("repo_name"):
+                head = await gitea_client.get_commits(
+                    job["repo_name"], sha="main", limit=1
+                )
+                post_sha = head[0]["sha"] if head else None
+                pre_sha = (ctx or {}).get("pre_main_sha")
+                if post_sha and pre_sha and post_sha == pre_sha:
+                    await postgres_db.update_job_merge_status(
+                        str(job["id"]), merge_status="no-op"
+                    )
+                    logger.error(
+                        "project loop %s: execution job %s COMPLETED but `main` did "
+                        "not advance (HEAD still %s) — artifacts likely lost (F29 "
+                        "family); flagged merge_status=no-op",
+                        loop_id,
+                        str(job["id"])[:8],
+                        post_sha[:8],
+                    )
+                    actions.append(
+                        f"project loop {str(loop_id)[:8]}: execution job "
+                        f"{str(job['id'])[:8]} produced NO main advance (no-op)"
+                    )
+                elif post_sha:
+                    await postgres_db.update_job_merge_status(
+                        str(job["id"]), merge_status="advanced"
+                    )
+        except Exception:
+            logger.exception(
+                "project loop %s: no-op compounding guard failed (non-fatal)", loop_id
+            )
 
     remaining = loop.get("remaining_iterations")
     next_remaining = (remaining - 1) if remaining is not None else None
@@ -23955,7 +24032,11 @@ async def list_project_repositories(
 ) -> list[dict[str, Any]]:
     """List repositories attached to a project."""
     await require_project_member(request, postgres_db, project_id)
-    return await postgres_db.get_project_repositories(project_id, role=role)
+    rows = await postgres_db.get_project_repositories(project_id, role=role)
+    # A/C: strip embedded Gitea credentials and rewrite the internal host to the
+    # ingress-routable one before the row leaves the orchestrator (see
+    # redact_repositories / externalize_gitea_url).
+    return redact_repositories(rows)
 
 
 @app.post("/api/projects/{project_id}/repositories")
@@ -23978,7 +24059,7 @@ async def add_project_repository(
         is_managed = True
 
     try:
-        return await postgres_db.add_project_repository(
+        created = await postgres_db.add_project_repository(
             project_id=project_id,
             name=body.name,
             repo_url=repo_url,
@@ -23989,6 +24070,9 @@ async def add_project_repository(
             branch=body.branch,
             clone_path=body.clone_path,
         )
+        # A/C: the created row echoes back the credentialed internal repo_url —
+        # redact it just like the list endpoint before returning to the client.
+        return redact_repository(created)
     except Exception as e:
         # If we created a managed repo but DB insert failed, clean up
         if is_managed and repo_url:

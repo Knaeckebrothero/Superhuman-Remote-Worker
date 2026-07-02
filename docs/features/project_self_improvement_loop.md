@@ -13,6 +13,7 @@ aliases:
   - self-improvement cycle
   - innovation cycle (productized)
 related:
+  - "[[loop_optimization]]"
   - "[[loop_parallel_execution]]"
   - "[[verification_phase]]"
   - "[[subagent_delegation]]"
@@ -387,6 +388,7 @@ These are exactly the things the research **could not settle** — so our overni
 ## Related
 
 - [`loop_review.md`](../loop_review.md) — **living log of issues + optimizations found during real test runs** (cost, KB hygiene, grounding, role bleed); the running companion to this plan.
+- [`loop_optimization.md`](loop_optimization.md) — **the consolidated optimization plan** (2026-07-01) from auditing runs 2–5: reliability tier (stall watchdog, no-op compounding guard, preflight, VM fence) before cost tier (per-role expert models, analysis phase caps, cache, accounting); registers F29–F34.
 - [`loop_parallel_execution.md`](loop_parallel_execution.md) — **concept** paper exploring an optional parallel/pipelined execution mode (the design space behind [Open Question #1](#open-questions)): the four options, the KB-generation-stamping prerequisite, and the developer-bound payoff ceiling. Nothing decided; expands the **Concurrency** resolved-decision above.
 - `[[verification_phase]]` — the critic verdict tools and the developer↔critic loop this generalises; loop Critic reuses the same `approve`/`return_with_feedback` stance, minus the auto-trigger.
 - `[[subagent_delegation]]` — `delegate_work`, the Phase-4 path to real Scholar proposal diversity.
