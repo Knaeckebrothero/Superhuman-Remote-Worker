@@ -147,6 +147,13 @@ class ToolContext:
     _job_metadata: Dict[str, Any] = field(
         default_factory=dict
     )  # job_id, project_id, priority, config_name, repo_name
+    _resolved_tool_names: List[str] = field(
+        default_factory=list
+    )  # Parent's actually-loaded tool names, stashed post-load so the light
+    # spawn_subagent backend can build a reader inheriting them (minus the
+    # delegation category). Empty until _setup_job_tools finishes loading.
+    _limits: Optional[Any] = None  # Parent LimitsConfig — used to build the
+    # light-subagent reader LLM (create_llm(subagent_cfg, limits=...)).
 
     def __post_init__(self):
         """Validate context after initialization."""

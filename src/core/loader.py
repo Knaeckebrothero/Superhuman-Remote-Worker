@@ -1254,7 +1254,9 @@ class LLMConfig:
     """LLM configuration with optional phase-specific overrides.
 
     Base fields define the default model. Phase-specific overrides (strategic,
-    tactical, summarization) can specify different models/providers for each phase.
+    tactical, summarization, subagent) can specify different models/providers.
+    strategic/tactical/summarization drive the main graph's phases; `subagent`
+    is the model tier for throwaway light subagents (spawn_subagent).
 
     Example:
         llm:
@@ -1268,6 +1270,8 @@ class LLMConfig:
           summarization:
             model: gpt-4o
             provider: openai
+          subagent:
+            model: claude-haiku-4-5-20251001  # cheap throwaway readers
     """
 
     model: str = "gpt-4o"
@@ -1298,6 +1302,13 @@ class LLMConfig:
     strategic: Optional[PhaseLLMOverride] = None
     tactical: Optional[PhaseLLMOverride] = None
     summarization: Optional[PhaseLLMOverride] = None
+    # Model tier for throwaway light subagents spawned via `spawn_subagent`
+    # (delegation.mode: light). Lets a top-tier parent spawn a mid-tier reader
+    # (e.g. opus → sonnet, gpt-5.5 → gpt-5-mini). Resolved lazily by the light
+    # backend via get_phase_config("subagent"); NOT built by the main graph, so
+    # it is intentionally excluded from has_phase_overrides(). Falls back to the
+    # tactical tier (then base) when unset.
+    subagent: Optional[PhaseLLMOverride] = None
 
     def get_phase_config(self, phase: str) -> "LLMConfig":
         """Get effective LLM config for a specific phase.
@@ -1859,6 +1870,7 @@ def _parse_llm_config(llm_data: Dict[str, Any]) -> LLMConfig:
         strategic=_parse_phase_override(llm_data.get("strategic")),
         tactical=_parse_phase_override(llm_data.get("tactical")),
         summarization=_parse_phase_override(llm_data.get("summarization")),
+        subagent=_parse_phase_override(llm_data.get("subagent")),
     )
 
 
