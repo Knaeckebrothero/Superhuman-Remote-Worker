@@ -186,7 +186,6 @@ ALLOWED_TABLES = frozenset(
 # Required tables that must exist for the orchestrator to function
 REQUIRED_TABLES = [
     "users",
-    "sessions",
     "projects",
     "project_members",
     "project_repositories",
@@ -208,7 +207,6 @@ VECTOR_REQUIRED_TABLES = [
     "source_annotations",
     "source_tags",
     "source_embeddings",
-    "schema_migrations",
 ]
 
 # Column type mapping from PostgreSQL types to frontend-friendly types
@@ -4581,112 +4579,6 @@ class PostgresDB:
         return _datasource_row_to_dict(row)
 
     # =========================================================================
-    # User Auth Fields (password, email verification)
-    # =========================================================================
-
-    async def get_user_by_email_with_auth(self, email: str) -> Dict[str, Any] | None:
-        """Get a user by email including auth fields (password_hash, email_verified)."""
-        async with self.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                SELECT id, display_name, avatar_color, email, default_project_id,
-                       created_at, password_hash, email_verified, is_admin
-                FROM users
-                WHERE LOWER(email) = LOWER($1)
-                """,
-                email,
-            )
-        return dict(row) if row else None
-
-    async def set_user_password(self, user_id: str, password_hash: str) -> bool:
-        """Set or update a user's password hash."""
-        user_uuid = UUID(user_id) if isinstance(user_id, str) else user_id
-        async with self.acquire() as conn:
-            result = await conn.execute(
-                "UPDATE users SET password_hash = $1 WHERE id = $2",
-                password_hash,
-                user_uuid,
-            )
-        return result == "UPDATE 1"
-
-    async def set_email_verified(self, user_id: str) -> bool:
-        """Mark a user's email as verified."""
-        user_uuid = UUID(user_id) if isinstance(user_id, str) else user_id
-        async with self.acquire() as conn:
-            result = await conn.execute(
-                "UPDATE users SET email_verified = TRUE WHERE id = $1",
-                user_uuid,
-            )
-        return result == "UPDATE 1"
-
-    async def create_user_with_password(
-        self,
-        display_name: str,
-        email: str,
-        password_hash: str,
-        avatar_color: str = "#89b4fa",
-    ) -> tuple[Dict[str, Any], Dict[str, Any]]:
-        """Create a user with password (unverified) and their default project atomically."""
-        async with self.acquire() as conn:
-            async with conn.transaction():
-                # Create project first
-                project_row = await conn.fetchrow(
-                    """
-                    INSERT INTO projects (name, description, is_default)
-                    VALUES ($1, $2, TRUE)
-                    RETURNING id, name, description, goal, status, is_default,
-                              default_config_name, default_config_override,
-                              main_cloud_backend, main_cloud_folder_handle,
-                              created_at, updated_at
-                    """,
-                    f"{display_name}'s Workspace",
-                    f"Default workspace for {display_name}",
-                )
-
-                # Create user with password_hash and email_verified=FALSE
-                user_row = await conn.fetchrow(
-                    """
-                    INSERT INTO users (display_name, avatar_color, email,
-                                       default_project_id, password_hash, email_verified)
-                    VALUES ($1, $2, $3, $4, $5, FALSE)
-                    RETURNING id, display_name, avatar_color, email,
-                              default_project_id, created_at
-                    """,
-                    display_name,
-                    avatar_color,
-                    email,
-                    project_row["id"],
-                    password_hash,
-                )
-
-                # Add user as project owner
-                await conn.execute(
-                    """
-                    INSERT INTO project_members (project_id, user_id, role)
-                    VALUES ($1, $2, 'owner')
-                    """,
-                    project_row["id"],
-                    user_row["id"],
-                )
-
-        return dict(user_row), dict(project_row)
-
-    async def migrate_existing_users_verified(self) -> None:
-        """Mark existing users without a password as email_verified.
-
-        Called during init to ensure existing users aren't locked out.
-        """
-        async with self.acquire() as conn:
-            result = await conn.execute(
-                """
-                UPDATE users SET email_verified = TRUE
-                WHERE email_verified = FALSE AND password_hash IS NULL
-                """
-            )
-            if result != "UPDATE 0":
-                logger.info(f"Migrated existing users to verified: {result}")
-
-    # =========================================================================
     # AUTH TOKEN OPERATIONS  (consolidated mcp_tokens + PATs — see
     # docs/features/auth_bff_and_api_tokens.md §3)
     #
@@ -7365,89 +7257,6 @@ class PostgresDB:
 
         return result == "DELETE 1"
 
-    async def upsert_default_user(
-        self,
-        display_name: str,
-        avatar_color: str = "#89b4fa",
-        email: str | None = None,
-        is_admin: bool = False,
-        password_hash: str | None = None,
-        email_verified: bool = False,
-    ) -> Dict[str, Any]:
-        """Create a default user if one with the same display_name doesn't exist.
-
-        Used during init seeding. If the user exists, updates email (if NULL)
-        and is_admin (if changed). Supports optional password and email_verified
-        for production-mode admin seeding.
-
-        Args:
-            display_name: User's display name
-            avatar_color: Hex color for avatar dot
-            email: Optional email address
-            is_admin: Whether this user is an admin
-            password_hash: Pre-hashed password (for production mode admin)
-            email_verified: Whether email is verified
-
-        Returns:
-            Existing or newly created user dict
-        """
-        async with self.acquire() as conn:
-            # Check if user with this name already exists
-            existing = await conn.fetchrow(
-                "SELECT id, display_name, avatar_color, email, is_admin, created_at FROM users WHERE display_name = $1",
-                display_name,
-            )
-            if existing:
-                updates = []
-                params = []
-                idx = 1
-                # Update email if provided and different
-                if email and email != existing.get("email"):
-                    updates.append(f"email = ${idx}")
-                    params.append(email)
-                    idx += 1
-                # Update is_admin if changed
-                if is_admin != existing["is_admin"]:
-                    updates.append(f"is_admin = ${idx}")
-                    params.append(is_admin)
-                    idx += 1
-                # Update password_hash if provided
-                if password_hash:
-                    updates.append(f"password_hash = ${idx}")
-                    params.append(password_hash)
-                    idx += 1
-                    updates.append(f"email_verified = ${idx}")
-                    params.append(email_verified)
-                    idx += 1
-                if updates:
-                    params.append(existing["id"])
-                    await conn.execute(
-                        f"UPDATE users SET {', '.join(updates)} WHERE id = ${idx}",
-                        *params,
-                    )
-                result = {**dict(existing), "is_admin": is_admin}
-                if email and existing["email"] is None:
-                    result["email"] = email
-                return result
-
-            # Create new user
-            row = await conn.fetchrow(
-                """
-                INSERT INTO users (display_name, avatar_color, email, is_admin,
-                                   password_hash, email_verified)
-                VALUES ($1, $2, $3, $4, $5, $6)
-                RETURNING id, display_name, avatar_color, email, is_admin, created_at
-                """,
-                display_name,
-                avatar_color,
-                email,
-                is_admin,
-                password_hash,
-                email_verified,
-            )
-
-        return dict(row)
-
     async def get_admin_user(self) -> Dict[str, Any] | None:
         """Get the first admin user."""
         async with self.acquire() as conn:
@@ -8222,12 +8031,6 @@ class PostgresDB:
 
         await run_migrations(self._pool, self._migrations_dir)
         logger.info("Applied migrations from %s", self._migrations_dir)
-
-        # Data migration only applies to the app DB. This predates the
-        # numbered-migrations system and will be folded into a real
-        # migration file the next time it gets touched.
-        if self._migrations_dir == MIGRATIONS_APP_DIR:
-            await self.migrate_existing_users_verified()
 
         return True
 
@@ -9081,51 +8884,28 @@ class PostgresDB:
         key: str,
         value_json: Any,
         actor: str | None,
-        reason: str | None = None,
     ) -> dict:
-        """Upsert one grant + audit row, one transaction. prev value_json is a JSON
-        string from asyncpg — pass straight to the $::jsonb cast (don't re-dumps)."""
+        """Upsert one grant row (idempotent); granted_by records the acting admin."""
         async with self.acquire() as conn:
-            async with conn.transaction():
-                prev = await conn.fetchrow(
-                    "SELECT value_json FROM capability_grants WHERE scope_kind=$1 "
-                    "AND scope_id IS NOT DISTINCT FROM $2 AND key=$3",
-                    scope_kind,
-                    UUID(scope_id) if scope_id else None,
-                    key,
-                )
-                row = await conn.fetchrow(
-                    """
-                    INSERT INTO capability_grants (scope_kind, scope_id, key, value_json, granted_by)
-                    VALUES ($1, $2, $3, $4::jsonb, $5)
-                    ON CONFLICT (scope_kind, scope_id, key) DO UPDATE
-                        SET value_json = EXCLUDED.value_json, granted_by = EXCLUDED.granted_by,
-                            updated_at = NOW()
-                    RETURNING *
-                    """,
-                    scope_kind,
-                    UUID(scope_id) if scope_id else None,
-                    key,
-                    json.dumps(value_json),
-                    UUID(actor) if actor else None,
-                )
-                await conn.execute(
-                    "INSERT INTO capability_grant_audit "
-                    "(actor, scope_kind, scope_id, key, old_value, new_value, action, reason) "
-                    "VALUES ($1,$2,$3,$4,$5::jsonb,$6::jsonb,$7,$8)",
-                    UUID(actor) if actor else None,
-                    scope_kind,
-                    UUID(scope_id) if scope_id else None,
-                    key,
-                    prev["value_json"] if prev else None,  # already a JSON string
-                    json.dumps(value_json),
-                    "update" if prev else "set",
-                    reason,
-                )
-                d = dict(row)
-                if isinstance(d.get("value_json"), str):
-                    d["value_json"] = json.loads(d["value_json"])
-                return d
+            row = await conn.fetchrow(
+                """
+                INSERT INTO capability_grants (scope_kind, scope_id, key, value_json, granted_by)
+                VALUES ($1, $2, $3, $4::jsonb, $5)
+                ON CONFLICT (scope_kind, scope_id, key) DO UPDATE
+                    SET value_json = EXCLUDED.value_json, granted_by = EXCLUDED.granted_by,
+                        updated_at = NOW()
+                RETURNING *
+                """,
+                scope_kind,
+                UUID(scope_id) if scope_id else None,
+                key,
+                json.dumps(value_json),
+                UUID(actor) if actor else None,
+            )
+            d = dict(row)
+            if isinstance(d.get("value_json"), str):
+                d["value_json"] = json.loads(d["value_json"])
+            return d
 
     async def delete_grant(
         self,
@@ -9133,32 +8913,16 @@ class PostgresDB:
         scope_kind: str,
         scope_id: str | None,
         key: str,
-        actor: str | None,
-        reason: str | None = None,
     ) -> bool:
         async with self.acquire() as conn:
-            async with conn.transaction():
-                prev = await conn.fetchrow(
-                    "DELETE FROM capability_grants WHERE scope_kind=$1 "
-                    "AND scope_id IS NOT DISTINCT FROM $2 AND key=$3 RETURNING value_json",
-                    scope_kind,
-                    UUID(scope_id) if scope_id else None,
-                    key,
-                )
-                if prev is None:
-                    return False
-                await conn.execute(
-                    "INSERT INTO capability_grant_audit "
-                    "(actor, scope_kind, scope_id, key, old_value, new_value, action, reason) "
-                    "VALUES ($1,$2,$3,$4,$5::jsonb,NULL,'revoke',$6)",
-                    UUID(actor) if actor else None,
-                    scope_kind,
-                    UUID(scope_id) if scope_id else None,
-                    key,
-                    prev["value_json"],
-                    reason,
-                )
-                return True
+            prev = await conn.fetchrow(
+                "DELETE FROM capability_grants WHERE scope_kind=$1 "
+                "AND scope_id IS NOT DISTINCT FROM $2 AND key=$3 RETURNING value_json",
+                scope_kind,
+                UUID(scope_id) if scope_id else None,
+                key,
+            )
+            return prev is not None
 
     async def delete_grants_for_scope(
         self, conn, *, scope_kind: str, scope_id: str
