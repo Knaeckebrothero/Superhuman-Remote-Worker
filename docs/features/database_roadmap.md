@@ -53,7 +53,7 @@ The research sweep materially corrected four premises:
 
 | Phase | Scope | Effort | Depends on | Status |
 |---|---|---|---|---|
-| 1 | Mechanical quick wins — QW-2, QW-3, QW-5, QW-6 | ~1 day | — (G1 decided: drop) | implemented 2026-07-02 (uncommitted); full pytest + migrate-from-zero verified; k3d boot check pending |
+| 1 | Mechanical quick wins — QW-2, QW-3, QW-5, QW-6 | ~1 day | — (G1 decided: drop) | ✅ done `ed68f610` (2026-07-02); full pytest + migrate-from-zero verified; k3d boot check pending |
 | 2 | HF-1 generated schema artifact (keystone) | ~1 day | — | todo |
 | 3 | D-5 Mongo code deletion | ~1–2 days | QW-4 soak ✅ (done, >1 week) | todo |
 | 4 | HF-3 atomic context writes (correctness) | ~1–2 days | — | todo |
@@ -102,7 +102,8 @@ migrations apply from zero and on an existing dev DB; full pytest green;
 grep-clean for dropped methods/table; `EXPLAIN` on `threads WHERE user_id=…`
 still index-backed via `idx_threads_user`.
 
-**Status (2026-07-02): implemented, uncommitted.** Migrations 0042–0045
+**Status (2026-07-02): ✅ shipped — commit `ed68f610` on develop (not yet
+pushed).** Migrations 0042–0045
 (one statement per `.notx.sql` — the runner executes each file as a single
 simple-query message, so multi-statement CONCURRENTLY files would fail in an
 implicit transaction). QW-6 went end-to-end: with the audit table gone, the

@@ -138,6 +138,10 @@
         "summarization": {
           "$ref": "#/$defs/llmPhaseOverride",
           "description": "LLM overrides for context summarization. Can use different model for compacting conversation history."
+        },
+        "subagent": {
+          "$ref": "#/$defs/llmPhaseOverride",
+          "description": "LLM overrides for throwaway light subagents spawned via spawn_subagent (delegation.mode: light). Lets a top-tier parent spawn a mid-tier reader (e.g. opus → sonnet). Falls back to the tactical tier, then base, when unset."
         }
       }
     },
@@ -759,6 +763,47 @@
           },
           "default": [],
           "description": "Which expert configs children can use (empty array = any config allowed)"
+        },
+        "mode": {
+          "type": "string",
+          "enum": ["heavy", "light"],
+          "default": "heavy",
+          "description": "Backend for the shared spawn_subagent tool. 'heavy' = full child jobs (delegate_work path: worktree + dispatch + parent freeze + merge); 'light' = throwaway in-process ReAct readers that return a string with no freeze/merge. The agent-facing name and schema are identical; the backend is operator-selected."
+        },
+        "light": {
+          "type": "object",
+          "description": "Light-backend knobs (used only when mode is 'light'). Throwaway readers that read sources and return a distilled string; per-reader git worktree, discarded never merged. The reader MODEL is set via llm.subagent (a first-class tier alongside strategic/tactical), not here.",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": true,
+              "description": "Whether the light backend is available when mode is 'light'"
+            },
+            "max_iterations": {
+              "type": "integer",
+              "default": 10,
+              "minimum": 1,
+              "description": "Per-reader ReAct loop iteration cap"
+            },
+            "max_tokens": {
+              "type": "integer",
+              "default": 40000,
+              "minimum": 1000,
+              "description": "Per-reader token budget"
+            },
+            "max_parallel": {
+              "type": "integer",
+              "default": 3,
+              "minimum": 1,
+              "description": "Maximum concurrent readers per turn"
+            },
+            "allow_writes": {
+              "type": "boolean",
+              "default": false,
+              "description": "Whether readers may write to their worktree (default read-and-distill only)"
+            }
+          },
+          "additionalProperties": false
         }
       },
       "additionalProperties": false
