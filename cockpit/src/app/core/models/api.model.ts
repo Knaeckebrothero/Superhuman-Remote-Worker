@@ -505,6 +505,10 @@ export interface CatalogModel {
   capabilities: CatalogCapability[];
   family: string;
   context_window: number | null;
+  /** Effective window: explicit `context_window` when set, else the family default. Read-only, computed server-side. */
+  resolved_context_window: number;
+  /** Whether `resolved_context_window` came from the explicit cap or the inherited family default. */
+  context_window_source: 'explicit' | 'family_default';
   reasoning_level: string | null;
   params_json: Record<string, unknown> | null;
   enabled: boolean;

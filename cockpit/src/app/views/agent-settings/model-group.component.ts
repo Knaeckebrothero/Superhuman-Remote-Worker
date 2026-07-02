@@ -6,6 +6,7 @@ import {ModelService} from '../../core/services/model.service';
 import {EffectiveModels, EffectiveModelSlot} from '../../core/models/api.model';
 import {computeModelMismatch, ModelMismatch, readConfigPath, SettingsMode} from './agent-settings.types';
 import {reasoningOptionsForModel} from './reasoning-options';
+import {formatTokens} from '../../core/util/format-tokens';
 
 // UI-only "last selected model" preselect keys (localStorage). Deliberately NOT
 // the account-settings keys (`default_*_model`): a per-job/session control must
@@ -334,15 +335,8 @@ export class ModelGroupComponent {
     );
   });
 
-  /** Compact token-count label, e.g. 131072 → "131k", 1050000 → "1.05M". */
-  fmtTokens(n: number): string {
-    if (n >= 1_000_000) {
-      const m = n / 1_000_000;
-      return (Number.isInteger(m) ? String(m) : m.toFixed(2).replace(/\.?0+$/, '')) + 'M';
-    }
-    if (n >= 1000) return Math.round(n / 1000) + 'k';
-    return String(n);
-  }
+  /** Compact token-count label (shared util), e.g. 131072 → "131k". */
+  readonly fmtTokens = formatTokens;
 
   readonly modifiedCount = computed(() => {
     let count = 0;

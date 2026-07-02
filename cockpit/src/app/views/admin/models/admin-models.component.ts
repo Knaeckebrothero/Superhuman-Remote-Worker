@@ -18,6 +18,7 @@ import {AppSelectComponent} from '../../../ui/select';
 import {AppCheckboxComponent} from '../../../ui/checkbox';
 import {AppFormFieldComponent} from '../../../ui/form-field';
 import {AppBadgeComponent} from '../../../ui/badge';
+import {formatTokens, parseTokens} from '../../../core/util/format-tokens';
 
 interface ProviderOption {
   kind: CatalogProviderKind;
@@ -123,6 +124,7 @@ export function reasoningStarveWarning(ctx: number | null): string | null {
                     <span class="col-id">Model ID</span>
                     <span class="col-capability">Capabilities</span>
                     <span class="col-family">Family</span>
+                    <span class="col-context">Context</span>
                     <span class="col-enabled">Enabled</span>
                     <span class="col-actions"></span>
                   </div>
@@ -138,6 +140,11 @@ export function reasoningStarveWarning(ctx: number | null): string | null {
                         </span>
                       </span>
                       <span class="col-family">{{ m.family }}</span>
+                      <span
+                        class="col-context"
+                        [class.muted]="m.context_window_source === 'family_default'"
+                        [title]="m.context_window_source === 'family_default' ? 'Family default' : 'Explicit per-model cap'"
+                      >{{ fmtTokens(m.resolved_context_window) }}</span>
                       <span class="col-enabled">
                         <app-checkbox
                           size="sm"
@@ -312,11 +319,18 @@ export function reasoningStarveWarning(ctx: number | null): string | null {
               </app-form-field>
               <app-form-field label="Context window (optional)">
                 <app-input
-                  type="number"
+                  type="text"
+                  list="ctx-window-presets"
                   [value]="formContextWindowText()"
+                  [placeholder]="contextWindowPlaceholder()"
                   [disabled]="creating()"
                   (changed)="onContextWindowChange($event)"
                 />
+                <datalist id="ctx-window-presets">
+                  @for (p of contextWindowPresets; track p.tokens) {
+                    <option [value]="p.label" [label]="p.tokens"></option>
+                  }
+                </datalist>
                 @if (contextWindowWarning(); as warn) {
                   <small
                     class="field-hint field-hint--warn"
@@ -424,7 +438,7 @@ export function reasoningStarveWarning(ctx: number | null): string | null {
     .model-header,
     .model-row {
       display: grid;
-      grid-template-columns: 1.4fr 2fr 160px 100px 70px 260px;
+      grid-template-columns: 1.4fr 2fr 160px 100px 100px 70px 260px;
       gap: 8px;
       align-items: center;
       padding: 8px 12px;
@@ -555,12 +569,12 @@ export function reasoningStarveWarning(ctx: number | null): string | null {
       color: var(--danger);
     }
     @media (max-width: 720px) {
-      /* The catalog table is a 6-column grid
-         (1.4fr 2fr 160px 100px 70px 260px = 590px of fixed columns alone), so
-         at phone widths Family / Enabled / Test / Delete fall off the right
-         edge and the host's overflow:auto quietly hides them. Collapse each
-         row into a stacked card so every field and control stays on-screen.
-         Desktop (>720px) keeps the table grid untouched. */
+      /* The catalog table is a 7-column grid (1.4fr 2fr 160px 100px 100px 70px
+         260px = 690px of fixed columns alone), so at phone widths Family /
+         Context / Enabled / Test / Delete fall off the right edge and the
+         host's overflow:auto quietly hides them. Collapse each row into a
+         stacked card so every field and control stays on-screen. Desktop
+         (>720px) keeps the table grid untouched. */
       .model-header {
         display: none;
       }
@@ -620,9 +634,19 @@ export function reasoningStarveWarning(ctx: number | null): string | null {
         content: 'Family: ';
         color: var(--text-muted);
       }
-      .col-actions {
+      .col-context {
         grid-column: 1 / -1;
         grid-row: 4;
+        font-size: 12px;
+        white-space: nowrap;
+      }
+      .col-context::before {
+        content: 'Context: ';
+        color: var(--text-muted);
+      }
+      .col-actions {
+        grid-column: 1 / -1;
+        grid-row: 5;
         margin-top: 2px;
       }
       /* Stack the cramped two-up form rows (two ~137px fields side-by-side). */
@@ -641,6 +665,8 @@ export class AdminModelsComponent implements OnInit {
   private readonly discoverPaneRef = viewChild<ElementRef<HTMLElement>>('discoverPane');
 
   readonly capabilities: CatalogCapability[] = CATALOG_CAPABILITIES;
+  /** Shared compact token formatter for the "Context" column. */
+  readonly fmtTokens = formatTokens;
   readonly creating = signal(false);
   readonly testing = signal<string | null>(null);
   readonly testResults = signal<Record<string, CatalogModelTestResult>>({});
@@ -655,6 +681,21 @@ export class AdminModelsComponent implements OnInit {
   readonly formDisplayLabel = signal('');
   readonly formFamily = signal('default');
   readonly formContextWindow = signal<number | null>(null);
+  /**
+   * Preset context-window options for the combobox datalist, ascending. Values
+   * are ×1024 (binary) — how context windows are actually sized (128k =
+   * 131072) — and the hybrid formatTokens() renders them back to these exact
+   * labels. Each option shows the label (e.g. "128k") prominently with the raw
+   * token count beneath; the field still accepts any custom value typed in.
+   */
+  readonly contextWindowPresets: {label: string; tokens: number}[] = [
+    {label: '64k', tokens: 65_536},
+    {label: '128k', tokens: 131_072},
+    {label: '256k', tokens: 262_144},
+    {label: '384k', tokens: 393_216},
+    {label: '512k', tokens: 524_288},
+    {label: '1M', tokens: 1_048_576},
+  ];
   // Optional TTS voice (e.g. Kokoro af_heart, OpenAI alloy) — persisted into
   // the catalog row's params_json and read by the TTS service. Only sent when
   // the tts capability is selected.
@@ -669,6 +710,15 @@ export class AdminModelsComponent implements OnInit {
   readonly formContextWindowText = computed(() => {
     const v = this.formContextWindow();
     return v == null ? '' : String(v);
+  });
+
+  // Grey hint = the selected family's default window (from the config matrix).
+  // Shown while the field is empty; leaving it empty means "inherit this
+  // default" (context_window stays null), so we surface it without pinning it
+  // as an explicit value.
+  readonly contextWindowPlaceholder = computed(() => {
+    const def = this.models.familyDefaults()[this.formFamily()];
+    return def ? `Family default: ${formatTokens(def)}` : 'e.g. 128k or 131072';
   });
 
   // Low-window reasoning-starve warning — logic in the pure reasoningStarveWarning()
@@ -854,12 +904,8 @@ export class AdminModelsComponent implements OnInit {
   }
 
   onContextWindowChange(text: string): void {
-    if (text === '' || text == null) {
-      this.formContextWindow.set(null);
-      return;
-    }
-    const n = Number(text);
-    this.formContextWindow.set(Number.isFinite(n) ? n : null);
+    // Accepts preset labels ("128k"/"1M", ×1024) and raw custom numbers.
+    this.formContextWindow.set(parseTokens(text));
   }
 
   /** Voice dropdown change: a real voice sets formVoice directly; the

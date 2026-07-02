@@ -21413,6 +21413,9 @@ def _serialize_catalog_model(row: dict[str, Any]) -> dict[str, Any]:
     Single-column source of truth: only the ``capabilities`` array is on
     the wire. Cockpit clients have been migrated to the array form.
     """
+    from src.core.loader import bundled_settings_for_family
+
+    explicit_window = row.get("context_window")
     return {
         "id": str(row["id"]),
         "provider_kind": row["provider_kind"],
@@ -21421,7 +21424,13 @@ def _serialize_catalog_model(row: dict[str, Any]) -> dict[str, Any]:
         "display_label": row["display_label"],
         "capabilities": list(row.get("capabilities") or []),
         "family": row["family"],
-        "context_window": row.get("context_window"),
+        "context_window": explicit_window,
+        # Effective window for the Admin → Models "Context" column: the explicit
+        # per-model cap when set, else the family default from the config matrix
+        # (bundled_settings_for_family merges default ⊕ family; unknown → 128000).
+        "resolved_context_window": explicit_window
+        or bundled_settings_for_family(row["family"], "model_max_context_tokens"),
+        "context_window_source": "explicit" if explicit_window else "family_default",
         "reasoning_level": row.get("reasoning_level"),
         "params_json": row.get("params_json"),
         "enabled": row.get("enabled", True),
@@ -21705,16 +21714,24 @@ async def admin_test_catalog_model(request: Request, catalog_id: str) -> dict[st
 
 
 @app.get("/api/admin/families")
-async def admin_list_families(request: Request) -> dict[str, list[str]]:
-    """Return the family keys defined in ``model_config_matrix.yaml``.
+async def admin_list_families(request: Request) -> dict[str, Any]:
+    """Return the family keys defined in ``model_config_matrix.yaml`` plus each
+    family's default context window.
 
-    Powers the family dropdown on the *Admin → Models* form so adding a
-    family in the YAML doesn't require a frontend rebuild.
+    Powers the family dropdown on the *Admin → Models* form (so adding a family
+    in the YAML doesn't require a frontend rebuild) and the context-window
+    field's "family default" placeholder.
     """
+    from src.core.loader import bundled_settings_for_family
+
     await _require_admin(request)
     matrix = _load_settings_matrix(_get_config_dir())
     families = sorted(k for k in matrix.keys() if isinstance(k, str))
-    return {"families": families}
+    defaults = {
+        fam: bundled_settings_for_family(fam, "model_max_context_tokens")
+        for fam in families
+    }
+    return {"families": families, "defaults": defaults}
 
 
 @app.get("/api/admin/families/detect")

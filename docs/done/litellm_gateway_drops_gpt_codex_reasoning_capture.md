@@ -3,7 +3,7 @@
 **Status:** **RESOLVED 2026-06-24** (develop, uncommitted) · root cause isolated + empirically confirmed on dev · fix implemented + **k3d-verified end-to-end** (live gpt-5.5 session renders + persists reasoning again). See "Fix" below.
 **Found:** 2026-06-24, investigating "we don't see the reasoning of gpt models in the job debug chat or in the sessions chat anymore"
 **Component:** `src/llm/reasoning_chat.py` capture · `src/core/loader.py` factory selection · `src/core/model_registry.py` endpoint→meta · `orchestrator/main.py` dispatch gateway reroute · LiteLLM gateway · Codex proxy (CLIProxyAPI v7.2.27)
-**Related:** [[session_empty_response_gpt5_codex_stop]] (same `agent → LiteLLM → codex-proxy` family, different symptom) · [[litellm_streaming_usage_not_surfaced]] (same route, usage-bar variant) · [[langchain_responses_api_streaming]] (Responses-API fragility) · [[reasoning_effort_injected_without_capability_guard]]
+**Related:** [[reasoning_capture_regressions_on_routing_and_factory_changes]] (**the class-level doc — this is the canonical instance of that recurring pattern**; the "daily capture check" deferred below is proposed there as a standing guard) · [[session_empty_response_gpt5_codex_stop]] (same `agent → LiteLLM → codex-proxy` family, different symptom) · [[litellm_streaming_usage_not_surfaced]] (same route, usage-bar variant) · [[langchain_responses_api_streaming]] (Responses-API fragility) · [[reasoning_effort_injected_without_capability_guard]]
 
 ## Symptom
 

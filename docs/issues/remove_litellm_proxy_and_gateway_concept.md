@@ -17,6 +17,7 @@
 - `docs/features/credential_broker.md` — the temporal-key idea (deferred; → Keycloak JWTs).
 - `docs/features/usage_dashboard.md`, `docs/features/observability_and_quotas.md` — the usage view + deferred per-job cost attribution.
 - `docs/done/litellm_gateway_drops_gpt_codex_reasoning_capture.md` — why codex already bypasses the gateway.
+- `docs/issues/reasoning_capture_regressions_on_routing_and_factory_changes.md` — the recurring class of "routing change silently drops reasoning"; this removal is the fix-direction (codex bypasses entirely), and that doc proposes encoding the bypass as a guard so a stray `routedProviders` can't silently reintroduce the drop (as it did on k3d 2026-07-01).
 - `docs/issues/system_provider_models_bypass_gateway_unmetered.md`, `docs/issues/codex_session_gateway_baseurl_401.md`, `docs/issues/litellm_reranker_model_unregistered.md` — the LiteLLM sharp-edge rap sheet.
 - Memory: `project_litellm_oom_crashloop_blocks_loop`, `reference_usage_view_gateway_metering_routing`.
 

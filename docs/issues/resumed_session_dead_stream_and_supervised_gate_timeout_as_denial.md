@@ -1,10 +1,10 @@
 # Resumed session shows no agent output, and supervised tool-gates that time out are reported to the LLM as "User denied"
 
-**Status:** Filed — investigation complete, root causes isolated on a live prod session; **no fix yet**. Two distinct defects, causally linked (Defect B is only *harmful* while Defect A is in effect). **Update 2026-06-27: Defect A root cause CORRECTED — the service-worker hypothesis is disproven; the real cause is `/api/sessions/{id}/connection` stuck at 425. See the "Update (2026-06-27)" section below + the 3 follow-ups to revisit.**
+**Status:** Filed — investigation complete, root causes isolated on a live prod session; **no fix yet**. Two distinct defects, causally linked (Defect B is only *harmful* while Defect A is in effect). **Update 2026-06-27: Defect A root cause CORRECTED — the service-worker hypothesis is disproven; the real cause is `/api/sessions/{id}/connection` stuck at 425. See the "Update (2026-06-27)" section below + the 3 follow-ups to revisit.** **Further update 2026-07-02: Defect A deep cause CONFIRMED — session-attach starvation (the bound agent was blocked ~10 min by a stuck `gpt-5.3-codex-spark` cooldown job); see "Update (2026-07-02)" below.**
 **Found:** 2026-06-26, reproduced live on session `7692637b-9c60-4698-9875-b57ec34e66a6` ("Cloud storage file inspection and summary"), main cluster (`superhuman-remote-worker`), user `operator@redacted.invalid`.
 **Severity:** High. The session looks completely dead to the user (no reply, no "generating", no approval prompt) while the agent is actually healthy and working. Worse, in Supervised mode the dead stream silently converts every tool-call into a fake user-denial after a 5-minute stall, so the agent concludes the user refused and abandons real work.
 **Component:** cockpit `PersistentChatService` + Angular service worker · orchestrator SSE relay (`orchestrator/main.py` `thread_event_stream`) · agent permission gate (`src/api/persistent_app.py`, `src/persistent_graph.py`)
-**Related:** `session_silent_failure_audit.md` · `persistent_session_idle_expiry_message_swallow.md` · `persistent_session_swallowed_sends_and_truncated_history.md` · `cockpit_session_startup_timers_transient_sse.md` · `persistent_session_empty_chunk_history_corruption.md` · memory topics `project_session_epoch_duplicate_render`, `project_session_message_swallow_investigation` · README "Service Worker hijack of WebSocket handshakes" troubleshooting note
+**Related:** `session_silent_failure_audit.md` · `persistent_session_idle_expiry_message_swallow.md` · `persistent_session_swallowed_sends_and_truncated_history.md` · `cockpit_session_startup_timers_transient_sse.md` · `persistent_session_empty_chunk_history_corruption.md` · memory topics `project_session_epoch_duplicate_render`, `project_session_message_swallow_investigation` · README "Service Worker hijack of WebSocket handshakes" troubleshooting note · `loop_ran_codex_spark_not_selected_model_then_hung_on_cooldown.md` (the job-side hang that starved this session's agent — same agent `90e7445b`, same job `8bf2be7e`) · `persistent_thread_lifecycle.md` (the "stuck active" / thread-auto-end item) · `agent_workspace_pod_resource_headroom.md`
 
 ---
 
@@ -96,6 +96,39 @@ A deeper pass (browser console + deployed-bundle inspection + a parallel codebas
 3. **Fix the real session-breaker: `/connection` stuck at 425.** Investigate why the readiness gate never flips to 200 for this thread (likely the per-session Traefik route/Service not reconciling, and/or provisioning thrash leaving the route wedged). This — not the service worker — is what makes the session look dead. Pairs with the "stuck active" / thread-never-auto-ends item.
 
 **Live-endpoint inventory backing the above (from the codebase sweep):** SSE = `/api/persistent/threads/{id}/stream`, `/api/notifications/events`, `/api/sudo/events` (all `ngsw-bypass`'d ✓); WebSocket = `/p/{thread_id}/ws` (per-session control plane) + `/api/ide/{id}/proxy/*`; binary downloads = `/api/uploads/{id}/files/*`, `/api/citations/{id}/snapshot`, `/api/skills/{id}/export`. All orchestrator endpoints live under `/api/` (so the `/api/**` rule catches every one that isn't explicitly bypassed).
+
+---
+
+## Update (2026-07-02) — Defect A deep root cause CONFIRMED: session-attach starvation
+
+Tracing the live pods pinned the exact mechanism behind the `/connection` 425 storm (this **supersedes the "likely per-session route not reconciling" guess** in follow-up 3 of the 2026-06-27 section):
+
+**One gate produces both the 425 and the WS 504.** `GET /api/sessions/{id}/connection` (`orchestrator/routers/sessions.py:336`) returns `200`+`ws_url` only once `probe_ready` passes — the bound agent's `/ready` returns `{"ready":true}` ("Session ready"), i.e. `_session_ready()` passed (session attached + LLM tools wired + loop queue initialized; `session_lifecycle.py:77-95`). It raises `425` on three paths: no `agent_id` (`:358`), bound agent gone/`offline` → self-heal clears the binding (`:370`), or `probe_ready` fails (`:390`). Crucially, **`ensure_route()` — which creates the per-session `/p/{id}` Service+Ingress for the WebSocket — is only called *after* `probe_ready` passes (`:400`)**. So until the agent finishes attaching, the browser gets **both** the `425` (no `ws_url`) **and** the WS `504` (no route). One gate, two symptoms — which is why "no generating" + WS-504 + 425-storm always appeared together.
+
+**Confirmed trigger: the bound agent was starved by a stuck worker job.** The pod bound to this thread (`90e7445b` / `srw-agent-j-e60281e2`, `/ready` currently "Session ready") spent ~10 min unable to attach because it was churning worker job `8bf2be7e`, stuck on a 429 `model_cooldown` for `gpt-5.3-codex-spark` (~130 h reset), burning 90 s × 4 backoff cycles repeatedly (09:13–09:22). Only once that job gave up did the attach run:
+
+```
+09:22:35  job 8bf2be7e — "LLM error after 4 attempts" (429 model_cooldown, gave up)
+09:23:18  POST /session/attach 200
+09:23:24  Restored 121 messages … "Session attached … events_epoch=5"
+09:23:27  WebSocket /p/7692637b/ws [accepted] … connection open   ← live channel finally UP
+```
+
+This is the **session-side symptom of the job-side hang** analysed in `loop_ran_codex_spark_not_selected_model_then_hung_on_cooldown.md` — **same agent `90e7445b`, same job `8bf2be7e`**. That doc's **Defect C (multi-day-cooldown fail-fast + consecutive-failure circuit breaker) is implemented (2026-06-27)**, which removes the ~10-min hold; but the session-side fragility below is independent and still open.
+
+**Amplifiers (independent of the codex trigger):**
+- **Timeout mismatch** — the cockpit's `_pollConnectionUntilReady` waits ~180 s, but attach under contention / cold-restore takes minutes → it gives up and sits on "Booting agent runtime."
+- **Cold restore every open** — a ~120 MB workspace snapshot is restored from S3 on each open (no warm-keep), adding minutes to attach.
+- **Binding thrash** — across opens the thread was reassigned `ecd28ae1 → fb73689c → 9f9360fb → 90e7445b`; the `/connection` self-heal (`:368-370`) clears the binding on any transient `offline`, restarting the attach clock.
+
+### Follow-ups (session-side; the codex trigger is handled separately)
+
+1. **Don't gate a session attach behind a busy/doomed agent.** A session bound to (or thrashing onto) an agent churning a stuck job never converges. Sessions should land on a free agent, or the stuck job should be preemptible. Open question: why a session-bound pod was running worker job `8bf2be7e` at all — dual-mode contention vs assigned-to-busy vs thrash landing on a busy pod.
+2. **Multi-day model-cooldown fail-fast** — ✅ addressed by `loop_ran_codex_spark_not_selected_model_then_hung_on_cooldown.md` Defect C (C1 cooldown-aware fail-fast + C2 circuit breaker). Keeps a quota-tripped model from holding an agent for days.
+3. **Close the ready-timeout mismatch.** Either speed up attach (warm-keep the workspace instead of cold-restoring 120 MB per open) or surface honest state ("agent busy — still attaching, Nm elapsed") instead of a silent "Booting agent runtime" past 180 s.
+4. **Stop the binding thrash** — the self-heal clearing the binding on a transient `offline` (`sessions.py:368-370`) causes re-provision churn that resets the attach clock.
+
+The "stuck active" / thread-never-auto-ends item is tracked separately in `persistent_thread_lifecycle.md`.
 
 ---
 
