@@ -26,6 +26,17 @@ So the 2026-06-03 root cause stands: **behavioral — permissive ("when/consider
 delegation wording + the project-wide direct-execution default bias.** The fix is
 in the prompts (see Options below), not the plumbing/resolution.
 
+**Update 2026-07-02:** Option (3)'s cross-model diagnostic is now **answered**, and
+the finding is wider than this doc's title: loop run 6 (`7ca259e2`, MiniMax-M3)
+reproduced the behavior across 5 scholars AND 5 critics (playbook rendered in
+~50-55% of their calls, tool in 100% of menus, 0 invocations in 788 turns), and the
+all-time count of delegation children on dev is **zero**
+(`jobs.creation_order IS NOT NULL` → 0 rows since the feature shipped 2026-03-23).
+Both families decline → structural, not model-dependent. Superseded as working doc
+by **`subagents_never_used.md`** (consolidates evidence + adoption plan for the new
+light subagent tool being built 2026-07-02); this doc remains the detailed gpt-5.5
+trace record.
+
 ## Summary
 
 The scholar expert is configured to spawn subagents for parallel research via

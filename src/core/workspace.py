@@ -413,9 +413,20 @@ class WorkspaceManager:
             jobs_repo["repo_url"], self._workspace_path, backend=self._backend
         )
         if not git_mgr:
-            logger.warning("Failed to clone jobs repo, falling back to standard init")
-            self.initialize()
-            return
+            # F29 hardening: do NOT silently git-init here. A project job whose
+            # jobs repo won't clone is disconnected from `main`; proceeding would
+            # rebuild from scratch in a throwaway local git and lose every push
+            # on teardown — the exact run-5/6 failure, invisible because it was a
+            # warning. Fail loud instead: the raise propagates to agent._run's
+            # job-error handler (status=failed), so the loop advance counts it and
+            # rotates on rather than burning a night on work that can't land.
+            # (repo name only in the message — repo_url carries credentials.)
+            repo_name = jobs_repo.get("name", "<unknown>")
+            raise RuntimeError(
+                f"Failed to clone project jobs repo '{repo_name}' — refusing to "
+                "fall back to a disconnected git init (work would be lost on "
+                "teardown). Check jobs-repo URL reachability from this backend."
+            )
 
         self._git_manager = git_mgr
         logger.info(f"Cloned jobs repo as workspace root: {self._workspace_path}")

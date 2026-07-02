@@ -596,9 +596,16 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                         <td>{{ (repo.read_only ? 'projectDetail.repos.yes' : 'projectDetail.repos.no') | transloco }}</td>
                         <td>{{ (repo.is_managed ? 'projectDetail.repos.yes' : 'projectDetail.repos.no') | transloco }}</td>
                         <td>
-                          <app-button variant="danger" size="sm" (clicked)="removeRepo(repo.id)">
-                            {{ 'projectDetail.repos.remove' | transloco }}
-                          </app-button>
+                          <!-- The jobs repo is the project's own repo; the API
+                               rejects removing it (400). Don't offer a button
+                               that can only fail. -->
+                          @if (repo.role !== 'jobs') {
+                            <app-button variant="danger" size="sm" (clicked)="removeRepo(repo.id)">
+                              {{ 'projectDetail.repos.remove' | transloco }}
+                            </app-button>
+                          } @else {
+                            <span class="text-muted">{{ 'projectDetail.repos.protected' | transloco }}</span>
+                          }
                         </td>
                       </tr>
                     }
