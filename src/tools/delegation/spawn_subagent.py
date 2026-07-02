@@ -92,11 +92,14 @@ SPAWN_SUBAGENT_METADATA: Dict[str, Dict[str, Any]] = {
         "description": (
             "Spawn one throwaway subagent to perform a focused, self-contained "
             "subtask (for example: read a cluster of sources and return a "
-            "distilled summary) and return its result as text. To run subagents "
-            "in parallel, call this tool multiple times in a SINGLE turn — one "
-            "call per subtask. Each subagent starts with a FRESH context and "
-            "cannot see this conversation, so 'task_description' must be fully "
-            "self-contained. Do not delegate trivial work you can do yourself."
+            "distilled summary) and return its result as text. Cheap and "
+            "non-blocking: the subagent runs inline with its own fresh context "
+            "and returns its result directly — delegating the reading keeps "
+            "your own context small. To run subagents in parallel, call this "
+            "tool multiple times in a SINGLE turn — one call per subtask. Each "
+            "subagent cannot see this conversation, so 'task_description' must "
+            "be fully self-contained. Do not delegate trivial work you can do "
+            "yourself."
         ),
         "category": "delegation",
         "short_description": (

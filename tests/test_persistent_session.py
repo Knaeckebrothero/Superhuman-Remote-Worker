@@ -48,6 +48,11 @@ def _make_config(**overrides):
     cfg.agent_id = "test-agent"
     cfg.instruction_files = []
     cfg.tools = MagicMock()
+    # Real dataclass, not a MagicMock: _setup_tools passes it through
+    # dataclasses.asdict() to inject delegation settings into tool_config.
+    from src.core.loader import DelegationConfig
+
+    cfg.delegation = overrides.get("delegation", DelegationConfig())
     return cfg
 
 
