@@ -387,6 +387,35 @@ class TestCreateModelJsonbHandling:
         assert result["params_json"] == {"top_p": 0.9}
 
 
+class TestSerializeCatalogModelContextWindow:
+    """`_serialize_catalog_model` surfaces the resolved context window + source
+    for the Admin → Models "Context" column: the explicit per-model cap when
+    set, else the family default from the model config matrix."""
+
+    def test_explicit_context_window_is_reported_as_explicit(self):
+        out = main._serialize_catalog_model(_row(context_window=262144))
+        assert out["context_window"] == 262144
+        assert out["resolved_context_window"] == 262144
+        assert out["context_window_source"] == "explicit"
+
+    def test_unset_falls_back_to_family_default(self):
+        # claude-opus family default is 1,000,000 (config/model_config_matrix.yaml).
+        out = main._serialize_catalog_model(
+            _row(context_window=None, family="claude-opus")
+        )
+        assert out["context_window"] is None
+        assert out["resolved_context_window"] == 1_000_000
+        assert out["context_window_source"] == "family_default"
+
+    def test_unknown_family_falls_back_to_default_128k(self):
+        # Unknown family → the `default` block's model_max_context_tokens (128000).
+        out = main._serialize_catalog_model(
+            _row(context_window=None, family="totally-unknown-family")
+        )
+        assert out["resolved_context_window"] == 128000
+        assert out["context_window_source"] == "family_default"
+
+
 class TestListModelsFilters:
     @pytest.mark.asyncio
     async def test_no_filters_emits_bare_select(self):
