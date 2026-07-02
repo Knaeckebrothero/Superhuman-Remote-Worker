@@ -29,6 +29,18 @@ llm:
   # parallel_tool_calls) and context limits are set via config/model_config_matrix.yaml
   # — the single source of truth for model-dependent settings.
   # Do not set model_max_context_tokens here.
+  #
+  # Per-phase model tiers (optional, set per-expert or per-job — same override
+  # path for all of them):
+  #   strategic:     planning phases  (usually the most capable model)
+  #   tactical:      execution phases (faster/cheaper)
+  #   summarization: context compaction
+  #   subagent:      throwaway light subagents (spawn_subagent, delegation.mode:
+  #                  light) — lets a top-tier parent spawn a mid-tier reader,
+  #                  e.g. opus → sonnet, gpt-5.5 → gpt-5-mini. Falls back to the
+  #                  tactical tier, then base, when unset. Example:
+  #     subagent:
+  #       model: claude-haiku-4-5-20251001
 
 workspace:
   structure:
@@ -353,6 +365,23 @@ delegation:
   default_timeout: 7200      # Default timeout per delegation in seconds (2h)
   max_timeout: 14400          # Maximum allowed timeout (4h)
   allowed_configs: []        # Which configs children can use (empty = any)
+  # Backend for the shared `spawn_subagent` tool. The agent-facing name and
+  # schema are identical either way — the backend is operator-selected, not the
+  # model's choice:
+  #   heavy — full child jobs (the delegate_work path): worktree + dispatch +
+  #           parent freeze/checkpoint/wake + squash-merge.
+  #   light — throwaway in-process ReAct readers that read sources and return a
+  #           string; per-reader worktree, discarded never merged, no freeze.
+  mode: heavy
+  # Light-backend knobs (used only when mode: light). The reader MODEL is set
+  # via the `llm.subagent` tier (see the llm: block above), not here — so a
+  # top-tier parent can spawn a mid-tier reader (opus → sonnet, gpt → gpt-mini).
+  light:
+    enabled: true
+    max_iterations: 10       # Per-reader ReAct loop cap
+    max_tokens: 40000        # Per-reader token budget
+    max_parallel: 3          # Max concurrent readers per turn
+    allow_writes: false      # Readers read-and-distill by default (no merge)
 
 # Autonomy level — controls when the agent pauses for human review
 # full | review | partial | guided | dependent

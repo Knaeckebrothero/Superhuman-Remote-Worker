@@ -2643,6 +2643,14 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             loaded_tool_names, tools_dir, tools=self._tools, write_fn=_write_tool_doc
         )
 
+        # Stash the resolved tool list + limits so the light spawn_subagent
+        # backend can build a reader that inherits the parent's tools (minus the
+        # delegation category) and the reader LLM. Read at spawn time — the
+        # spawn_subagent factory already ran during load_tools() above but its
+        # closure reads these lazily. (context is self._tool_context here.)
+        context._resolved_tool_names = loaded_tool_names
+        context._limits = self.config.limits
+
         # Deploy instruction files with Jinja2 rendering (after tools loaded)
         self._deploy_instruction_files(loaded_tool_names)
 
