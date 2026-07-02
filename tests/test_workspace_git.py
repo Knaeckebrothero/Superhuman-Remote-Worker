@@ -73,6 +73,38 @@ class TestWorkspaceGitInitialization:
 
         assert ws.git_manager is None
 
+    def test_project_jobs_clone_failure_raises_not_silent_init(
+        self, temp_base, monkeypatch
+    ):
+        """F29 hardening: a failed jobs-repo clone must RAISE (so the job fails
+        loudly and the loop advance counts it), NOT silently `git init` a
+        disconnected workspace — that path rebuilt from scratch and lost every
+        push on teardown in loop runs 5 & 6.
+        """
+        # Simulate an unreachable/broken clone (e.g. the F29 URL problem).
+        monkeypatch.setattr(GitManager, "clone", lambda *a, **k: None)
+        ws = WorkspaceManager(
+            job_id="test-job",
+            config=WorkspaceManagerConfig(
+                structure=["archive/"],
+                git_versioning=True,
+                repositories=[
+                    {
+                        "role": "jobs",
+                        "name": "proj-jobs",
+                        "repo_url": "http://srw-gitea:3000/x/proj-jobs.git",
+                    }
+                ],
+            ),
+            base_path=temp_base,
+            backend=FilesystemTestBackend(temp_base),
+        )
+        with pytest.raises(RuntimeError, match="Failed to clone project jobs repo"):
+            ws.initialize_project_workspace()
+        # Must NOT have silently fallen back to a local git init.
+        assert ws.git_manager is None
+        assert ws._initialized is False
+
     def test_git_directory_created(self, temp_base):
         """Test that .git directory is created."""
         ws = WorkspaceManager(

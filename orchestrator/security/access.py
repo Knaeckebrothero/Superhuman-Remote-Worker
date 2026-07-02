@@ -715,6 +715,94 @@ def redact_datasources(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [redact_datasource(row) for row in rows]
 
 
+# =============================================================================
+# Project repository URLs — strip embedded credentials, rewrite internal host
+# =============================================================================
+
+
+def externalize_gitea_url(url: str | None) -> str | None:
+    """Rewrite a cluster-internal Gitea URL to its externally-reachable form.
+
+    Project ``repo_url``\\ s are minted from ``GITEA_INTERNAL_URL`` (e.g.
+    ``http://srw-gitea:3000``) so in-cluster workspace pods can reach the host.
+    That address is unroutable from a VM (a tailnet node) or a browser — which
+    is both the F29 clone/push failure *and* the reason the Repos tab shows an
+    unusable link. Swap the internal host[:port]+scheme for ``GITEA_URL`` (the
+    ingress address), preserving any embedded ``user:pass@`` credentials and the
+    path so the result is still a working clone URL.
+
+    No-op when the URL doesn't point at the internal host, or when either env
+    var is unset or already equal — so external repos and dev setups (where the
+    two collapse to one address) pass through untouched.
+    """
+    if not url:
+        return url
+    internal = os.environ.get("GITEA_INTERNAL_URL", "").rstrip("/")
+    external = os.environ.get("GITEA_URL", "").rstrip("/")
+    if not internal or not external or internal == external:
+        return url
+
+    from urllib.parse import urlparse, urlunparse
+
+    int_p = urlparse(internal)
+    ext_p = urlparse(external)
+    u = urlparse(url)
+    if not int_p.hostname or not ext_p.hostname:
+        return url
+    # Only rewrite URLs that actually target the internal Gitea host; leave
+    # user-supplied external source repos (github.com, ...) alone.
+    if u.hostname != int_p.hostname:
+        return url
+
+    creds = ""
+    if u.username:
+        creds = u.username + (f":{u.password}" if u.password else "") + "@"
+    netloc = f"{creds}{ext_p.hostname}"
+    if ext_p.port:
+        netloc += f":{ext_p.port}"
+    return urlunparse(u._replace(scheme=ext_p.scheme or u.scheme, netloc=netloc))
+
+
+def redact_repository(repo: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy of a project-repository row safe to return over REST.
+
+    Two problems with the raw row, both visible on the Repos tab:
+
+    * ``repo_url`` embeds the shared Gitea admin ``user:password@`` — a
+      credential leak to every project *member* (the endpoint is member-gated,
+      not owner-gated). Same F3 policy datasources already follow: credentials
+      never leave the orchestrator over REST.
+    * the host is the internal ``srw-gitea:3000``, unusable from a browser.
+
+    Externalize the host, then strip any userinfo, so the displayed URL is both
+    safe and clickable. Drop the ``credentials`` blob too if present.
+    """
+    if not repo:
+        return repo
+    out = dict(repo)
+    out.pop("credentials", None)
+    raw = out.get("repo_url")
+    if raw:
+        ext = externalize_gitea_url(raw)
+        # Strip userinfo unconditionally — even when externalization was a no-op
+        # (dev single-URL setups, external repos), credentials must not be sent.
+        from urllib.parse import urlparse, urlunparse
+
+        p = urlparse(ext)
+        if p.username or p.password:
+            netloc = p.hostname or ""
+            if p.port:
+                netloc += f":{p.port}"
+            ext = urlunparse(p._replace(netloc=netloc))
+        out["repo_url"] = ext
+    return out
+
+
+def redact_repositories(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """List variant of :func:`redact_repository`."""
+    return [redact_repository(row) for row in rows]
+
+
 # Key names (case-insensitive) whose VALUE is always a credential. The suffix
 # match covers the ``env_keys`` block (EMBEDDING_API_KEY, OPENROUTER_API_KEY,
 # VISION_API_KEY, WHISPER_API_KEY, TTS_API_KEY, CITATION_LLM_API_KEY, ...).
