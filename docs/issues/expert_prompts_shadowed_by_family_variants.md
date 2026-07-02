@@ -339,7 +339,12 @@ breakage). It remains a valid one-expert unblock under release pressure.
 3. **Part 2** — DB-expert prompt parity SHIPPED + committed 2026-06-26 (see
    *Part 2 — what shipped*). The wrapper/content split + pure-reformat-variant
    retirement remain the deferred follow-on; this doc records both halves rather
-   than a separate `docs/features/` note.
+   than a separate `docs/features/` note. The **session analog** — letting DB
+   session experts customize the interactive system prompt (Part 2 covered only
+   the *worker* strategic/tactical case) — is deferred and filed separately as
+   `docs/issues/session_db_experts_cannot_customize_interactive_prompt.md`
+   (architectural finding: the interactive wrapper has no content slot, so it's a
+   small *feature*, not an overlay-widen).
 
 ## Validation
 

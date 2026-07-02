@@ -34,14 +34,19 @@ pipeline (audit `llm_requests` → `usage_events`, built + k3d-verified in
 [[remove_litellm_proxy_and_gateway_concept]] P1) must be committed and cut over on
 the homelab — it is this feature's entire data plane.
 
-**Driver (concrete):** run project loops ([[project_self_improvement_loop]]) on a
-**MiniMax Token Plan** (subscription; Plus/Max/Ultra tiers, quota deducted by
-actual resource consumption over a **5-hour rolling window plus a weekly window**,
-account-global across all MiniMax models). An uncoordinated fleet of loop agents
-burns the window blind and hits provider lockout mid-iteration. Secondary drivers:
-per-user / per-project / per-model limits have never actually been enforced in SRW;
-limit policy has never lived anywhere an admin can touch; and nothing alerts when
-metering or a subscription plan silently degrades.
+**Driver (concrete):** run the fleet — project loops
+([[project_self_improvement_loop]]) first — on a **portfolio of flat-rate
+subscription plans** instead of pay-per-token. The portfolio (2026-07-01, ~$440/mo):
+Anthropic Claude Max **$200**, OpenAI **$100** (the codex-proxy's plan), MiniMax
+Token Plan **Ultra $120**, Google **$20**, plus z.ai GLM Coding Plan **Max
+(~$160)** under consideration. Every one of these enforces **rolling-window
+quotas** (typically 5-hour + weekly), account-global — an uncoordinated fleet
+burns a window blind and hits provider lockout mid-iteration. The **MiniMax plan
+is the first lane** (loops run MiniMax today); the design must be portfolio-shaped
+from day one (§3.2). Secondary drivers: per-user / per-project / per-model limits
+have never actually been enforced in SRW; limit policy has never lived anywhere an
+admin can touch; and nothing alerts when metering or a subscription plan silently
+degrades.
 
 **Explicitly NOT this doc:** dollar budget caps / wallets / markup
 (→ [[saas_billing_and_metering]]); any proxy or gateway on the request path
@@ -149,7 +154,28 @@ policy (env JSON → later rate_policies table)     usage_events
   tail (rows younger than `min_age_s`) to shave a minute off reaction time —
   decide at build whether the complexity pays.
 
-### 3.2 The MiniMax plan lane
+### 3.2 Subscription-plan lanes — the portfolio
+
+Each plan is **one `account`-scope policy on one credential row**. The engine
+(§3.1) is plan-agnostic; what differs per plan is the lane (how SRW reaches it),
+the window semantics, and whether the provider exposes a usage read:
+
+| Plan | Windows | SRW lane today | Plan-usage read | Notes |
+|---|---|---|---|---|
+| **MiniMax Token Plan Ultra ($120)** | 5 h rolling + weekly, consumption-deducted | ❌ **new lane = Phase 0.** Today MiniMax rides OpenRouter pay-per-token; the plan key is a *direct* MiniMax credential | `GET /v1/token_plan/remains` (probe — auth caveat below) | The driving lane; detail below |
+| **OpenAI $100** (ChatGPT/Codex sub) | 5 h + weekly (`wham/usage`) | ✅ **live** — codex-proxy (CLIProxyAPI) Responses lane | capacity bars shipped 2026-07-01 | **Quirk (verified):** proxied traffic bills as ChatGPT "extra usage" and does *not* consume the plan windows (bars read ~0%) — so the binding constraint here isn't the window at all; **verify what "extra usage" actually costs/limits** before adding a quota policy |
+| **Anthropic Claude Max ($200)** | 5 h rolling + weekly | ❌ **no Anthropic lane exists in SRW** (catalog has none) | Claude usage surfaces (probe) | CLIProxyAPI — the same binary as the codex-proxy — supports Claude-subscription OAuth, so the lane is the proven proxy pattern, **not** a new architecture; Anthropic wire format / thinking-signature caveats apply (route-all research). Biggest untapped capacity in the portfolio |
+| **z.ai GLM Coding Plan Max (~$160, considering)** | ~1,600 prompts/5 h + ~8,000/wk; **time-of-day multipliers** (GLM-5.2 draws 3× peak / 2× off-peak) | ❌ new lane — z.ai exposes an OpenAI-compatible coding-plan endpoint → slots in exactly like MiniMax | quota query (probe) | The multipliers mean self-accounted "requests" must be weighted by time-of-day (or calibrated to the worst case) — the one plan where a raw request count materially misestimates |
+| **Google $20** (consumer AI plan) | consumer-surface limits | ⚠️ current gemini lane uses an **API key** (pay-per-token / free tier) — a consumer plan is likely **not reachable** via plain API key; the plausible bridge is Gemini-CLI OAuth via CLIProxyAPI (verify) | ? | Lowest value; investigate last or leave as-is |
+
+Portfolio consequences for the engine: **nothing new is required in the core**
+(N plans = N `account` policies), but pacing headroom matters more (several plans
+are also consumed by the user's own IDE/desktop use outside SRW — decision 9), and
+exhaustion behavior gets a better option than "wait": **rotate to another plan
+with window headroom** (open question 3 / §8 — deferred, but the portfolio is why
+it exists).
+
+**The MiniMax lane (Phase 0) in detail:**
 
 - **Routing:** the plan key is a MiniMax-direct credential (OpenAI-compatible
   endpoint on the MiniMax platform — pin the exact base URL at build), a normal
@@ -293,20 +319,30 @@ plan-lockout error pauses (not fails) the job with `resume_at` set.
 
 ## 7. Open questions
 
-1. **Which Token Plan tier** (Plus/Max/Ultra) — sets the Phase-1 cap numbers; and
-   does the plan key already exist as a catalog row, or is purchase pending?
+1. ~~Which Token Plan tier~~ → **ANSWERED 2026-07-01: the portfolio in §3.2**
+   (MiniMax = Ultra $120; plus Anthropic Max $200, OpenAI $100, Google $20, z.ai
+   GLM Max under consideration). Remaining sub-questions: does the MiniMax plan
+   key already exist as a catalog row; is the z.ai purchase happening; and in
+   what order do the non-MiniMax lanes get built (recommendation: MiniMax P0 →
+   Claude Max next — biggest idle capacity — → z.ai if purchased → Google last).
 2. **`token_plan/remains` auth** — does it accept the plan API key on the current
    hosts (the M2-era issue said cookie-only)? Empirical Phase-0 probe.
-3. **Exhaustion fallback** — freeze-until-reset (v1 choice) vs auto-fallback of
-   *new* dispatches to the OpenRouter pay-per-token MiniMax lane. Fallback keeps
-   the loop moving at token cost but adds routing complexity + surprise spend;
-   revisit after observing how often the window actually exhausts under pacing.
+3. **Exhaustion behavior beyond freeze** — v1 freezes until the window frees. The
+   portfolio opens a better option: **rotate new dispatches to another plan with
+   headroom** (MiniMax window gone → loop continues on GLM or Claude), with
+   pay-per-token OpenRouter as the last resort. That is capacity-aware model
+   selection — a real feature (per-loop/per-job model becomes a *policy outcome*,
+   not a fixed setting) — deferred to §8; revisit once ≥2 plan lanes exist and
+   pacing data shows how often windows actually exhaust.
 4. **Does the strix box need coordinated per-minute smoothing at all**, or do its
    own 429s + agent backoff suffice? Decides whether Phase-4 admission control
    ever gets pulled forward.
-5. **Token-vs-"resource consumption" calibration** — MiniMax deducts plan quota
-   by opaque "actual resource consumption", not raw tokens; the first plan-scoped
-   cap numbers are estimates to calibrate against `remains` / observed lockouts.
+5. **Self-accounting calibration per plan** — MiniMax deducts by opaque "actual
+   resource consumption", not raw tokens; z.ai applies 3×/2× time-of-day
+   multipliers; ChatGPT counts proxied traffic as "extra usage" outside the
+   windows entirely. Each lane's first cap numbers are estimates to calibrate
+   against the provider's own read / observed lockouts — conservative (worst-case
+   multiplier) until calibrated.
 
 ## 8. Deferred (parked, not lost)
 
@@ -315,7 +351,15 @@ plan-lockout error pauses (not fails) the job with `resume_at` set.
   full design in the predecessor doc's Deferred §). It plugs into the dispatcher,
   not a proxy, so it composes with this doc unchanged if a shared upstream ever
   needs coordinated burst control.
-- **Exhaustion fallback lane** (open question 3).
+- **Portfolio rotation / capacity-aware model selection** (open question 3) —
+  dispatcher picks the model/lane by plan-window headroom: drain flat-rate
+  capacity across the portfolio before touching pay-per-token; freeze only when
+  every lane is dry. Needs ≥2 plan lanes + Phase-1 window accounting first; the
+  per-loop model override is the natural actuation point.
+- **New plan lanes beyond MiniMax** — Claude Max via CLIProxyAPI's Claude-OAuth
+  support (the codex-proxy pattern; Anthropic-wire caveats), z.ai GLM
+  coding-plan endpoint (MiniMax-shaped), Google consumer-plan bridge (unclear —
+  verify it's reachable at all).
 - **Session hard-stop** (§6).
 - **Per-key BYOK limits** — a user's own provider key as an `account`-scope row
   (the mechanism already fits; just policy rows).
@@ -355,7 +399,13 @@ that enforces is the process that dispatches.
 - Enforcement-primitive provenance (freeze path, dispatcher gate, slow-vs-stop):
   `docs/done/usage_monitoring_and_rate_limiting.md`.
 - MiniMax Token Plan mechanics (tiers, 5 h + weekly windows, consumption-based
-  deduction, exhaustion options): platform.minimax.io Token-Plan FAQ/overview
-  (fetched 2026-07-01); `remains` endpoint + auth caveat: MiniMax-AI/MiniMax-M2
-  GitHub issue #88; third-party plan write-ups (Kilo Code, Flowith) for the
-  coding-plan-era prompt-quota framing.
+  deduction, exhaustion options): platform.minimax.io Token-Plan FAQ/overview +
+  pricing pages (fetched 2026-07-01/02 — Starter $10/1,500 req per 5 h, Plus
+  $20/4,500, Max $50/15,000, **Ultra $120**, Highspeed variants above);
+  `remains` endpoint + auth caveat: MiniMax-AI/MiniMax-M2 GitHub issue #88;
+  third-party plan write-ups (Kilo Code, Flowith, BuyGLM/mclist tier tables).
+- z.ai GLM Coding Plan (Max ≈ $160/mo, ~1,600 prompts/5 h + ~8,000/wk, GLM-5.2/
+  GLM-5-Turbo/GLM-4.7 only, 3× peak / 2× off-peak quota multipliers, OpenAI-
+  compatible coding-plan endpoint): z.ai subscribe/devpack FAQ + third-party
+  guides (fetched 2026-07-02).
+- Subscription portfolio (which plans, prices): user, 2026-07-01.
