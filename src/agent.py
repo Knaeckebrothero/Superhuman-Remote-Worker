@@ -17,6 +17,7 @@ import logging
 import os
 import time
 import zipfile
+from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
@@ -2404,6 +2405,12 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             "model_max_context_tokens": self.config.limits.model_max_context_tokens,
             # Per-family page-render DPI (None -> renderer default 150).
             "pdf_render_dpi": getattr(self.config.limits, "pdf_render_dpi", None),
+            # Delegation tools read their settings from this plain dict
+            # (delegate_work's enabled/timeout checks, spawn_subagent's
+            # mode/light backend selection). "delegation" is a parsed/known
+            # config field, so it is NOT part of config.extra — inject the
+            # typed config back in explicitly or the tools see an empty dict.
+            "delegation": asdict(self.config.delegation),
         }
         # Build job metadata for delegation tool access
         job_metadata = {

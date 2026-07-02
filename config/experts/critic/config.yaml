@@ -15,6 +15,13 @@ tags:
   - quality
   - gating
 
+# Light subagent delegation: throwaway in-process evidence gatherers via
+# spawn_subagent. Verification fan-out is the driving use case — subagents
+# gather evidence, the critic renders the verdict. Reader model = llm.subagent
+# tier (falls back to llm.tactical).
+delegation:
+  mode: light
+
 workspace:
   structure:
     - archive/
@@ -49,8 +56,7 @@ tools:
     - git_status
     - git_tags
   delegation:
-    - delegate_work
-    - resume_delegation_child
+    - spawn_subagent
   # SQL injected when system datasource attached (for querying job data)
   sql: []
   # Not needed

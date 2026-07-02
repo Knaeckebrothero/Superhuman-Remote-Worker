@@ -664,17 +664,72 @@ Goal: reader LLM spend is not invisible.
 - **Verify:** a light fan-out → N readers' calls appear under the parent job in
   both tables.
 
-### Phase 5 — Scholar enablement + prompts
-Goal: scholar uses it, correctly (iterative fan-out).
-- `config/experts/scholar/config.yaml`: `delegation.mode: light`; add
-  `spawn_subagent` to `tools.delegation`.
-- `strategic.txt:30-60` + `todo_guide.md` "Delegated Parallel Research Phase":
-  add a `has_tool("spawn_subagent")` light variant — "delegate the *reading*, you
-  author the synthesis"; teach **iterative fan-out** ("emit one `spawn_subagent`
-  call per source-cluster in one turn"); combat serial collapse (GLM defaults
-  sequential) + over-delegation. Keep heavy batch guidance behind
-  `has_tool("delegate_work")`.
-- **Verify:** prompt renders for a light scholar; render check (not just logic).
+### Phase 5 — Adoption engineering (scholar + critic + loop)  ✅ DONE 2026-07-02
+
+**Scope upgraded** mid-build by [[subagents_never_used]] (fleet-wide audit:
+0 all-time `delegate_work` invocations despite 100% tool availability and
+rendered playbooks, both gpt-5.5 and MiniMax — prompts alone achieve nothing).
+User decisions: mandatory *decision* at the planning point (not mandatory
+delegation), remove `delegate_work` from scholar+critic entirely (no competing
+instructions), full scope incl. critic + loop role blocks.
+
+What shipped (all Jinja gates on `has_tool("spawn_subagent")`; delegate_work
+prose fully removed from both experts — zero mentions left in either config
+dir):
+- **Configs:** scholar + critic `config.yaml`: `delegation.mode: light`;
+  `tools.delegation: [spawn_subagent]` (delegate_work +
+  resume_delegation_child dropped — 0 all-time invocations = nothing lost).
+- **The keystone — todo scaffold** (`strategic_todos_initial.yaml`,
+  unconditional text since scholar always grants the tool): PLAN todo (id 3)
+  now requires a **fan-out decision per phase row** in plan.md's phase table —
+  "fan-out (N subagents)" or "sequential: <reason>", default fan-out when 2+
+  independent threads; completion criteria extended. CREATE todo (id 5) nudges
+  fan-out-todo-first. Rationale: the decision point is `next_phase_todos`, and
+  later phases follow plan.md — recording the decision there makes it durable
+  past phase 0.
+- **Strategic prompts** (scholar + critic, base **and** `_minimax` forks kept
+  in sync — MiniMax is the loop driver): default-with-exception wording
+  ("fanning out is the DEFAULT... sequential is the exception and needs a
+  reason"), light semantics (returns a string, runs inline, fresh context,
+  nothing suspends/merges), iterative fan-out (N calls in ONE turn), shared
+  citation library note, parent-authors-synthesis / verdict-never-delegated.
+- **Tactical prompts** (all 4 files): new short gated reminder block — the
+  need becomes visible mid-work (doc mechanism #4, wrong-phase salience).
+- **`todo_guide.md`:** §5 retargeted to "Fan-Out Research Phase" (subagents
+  return STRINGS, don't write files; you author artifacts), numbering gate +
+  quick-reference row flipped to `spawn_subagent`.
+- **Loop `_ROLE_BLOCKS`** (`orchestrator/services/project_loops.py`): one
+  fan-out sentence each for scholar (keep your context for synthesis) and
+  critic (the verdict stays yours) — highest-salience task text loop roles see.
+- **Tool description:** added "cheap and non-blocking... your own context
+  stays small" framing (doc rec #4).
+
+**REAL BUG found + fixed by the render check** (Phase 3's tests had masked it
+by passing `context.config` dicts directly): `"delegation"` is a *known*
+config field, so it's stripped from `config.extra` — and `tool_config` in
+`agent.py` (+ `persistent_session.py`) is built from `extra`, so
+`create_spawn_subagent_tools` saw **no `delegation` key at all** → silently
+fell back to the heavy stub even with `mode: light` configured. Bonus: the
+same gap means `delegate_work`'s call-time `enabled` check could NEVER pass —
+had any model ever invoked it, it would have errored "delegation is not
+enabled" (the 0-invocation stat hid a second, deeper layer of brokenness).
+Fix: `DelegationConfig` gains `mode` + `light` fields (both parse sites);
+`agent.py` + `persistent_session.py` inject `asdict(config.delegation)` into
+`tool_config`. Regression-pinned in
+`tests/test_spawn_subagent.py::TestDelegationConfigPlumbing` (real expert
+configs → factory dispatches the light backend end-to-end).
+
+- **Verified:** render-check script (49 checks: configs resolve light w/ knobs
+  inherited; all 8 prompt files render fan-out guidance when granted / hide it
+  when not; no stale delegate_work prose anywhere; no deterrent suspend
+  vocabulary; seeded todos parse through the real loader with the fan-out
+  decision present; todo_guide numbering flips 5↔6). 121 tests across the
+  feature suite + project_loops; ruff clean.
+
+### Phase 5b — post-k3d adoption measurement (queries from [[subagents_never_used]])
+- Menu presence + invocation counts via audit DB; healthy trace shape = parent
+  prompt size FLAT while N `call_type='subagent'` bursts appear. Heavy-path
+  children stay 0.
 
 ### Phase 6 — k3d end-to-end (the CLAUDE.md gate)
 - Scholar session/job whose phase fans out readers over several sources.

@@ -359,3 +359,63 @@ class TestMeteredLLM:
         assert rows[0]["job_id"] == "parent-job"
         assert rows[0]["call_type"] == "subagent"
         assert rows[0]["model"] == "base"  # ctx has no subagent tier → base fallback
+
+
+# --- config plumbing (Phase 5 regression) ------------------------------------
+
+
+class TestDelegationConfigPlumbing:
+    """`delegation` is a parsed/known config field, so it is NOT in config.extra.
+
+    agent.py therefore injects `asdict(config.delegation)` into tool_config
+    explicitly. Before that injection existed, the factory saw no `delegation`
+    key at all and silently fell back to the heavy stub even for mode: light
+    experts (and delegate_work's call-time `enabled` check could never pass).
+    These tests pin the whole chain on the real expert configs.
+    """
+
+    @staticmethod
+    def _load(expert):
+        from src.core.loader import load_agent_config, resolve_config_path
+
+        path, deployment_dir = resolve_config_path(expert)
+        return load_agent_config(path, deployment_dir)
+
+    def test_defaults_stay_heavy(self):
+        cfg = self._load("defaults")
+        assert cfg.delegation.mode == "heavy"
+
+    @pytest.mark.parametrize("expert", ["scholar", "critic"])
+    def test_expert_resolves_light_with_spawn_subagent_grant(self, expert):
+        cfg = self._load(expert)
+        assert cfg.delegation.mode == "light"
+        # light knobs deep-merge in from defaults under the expert's override
+        assert cfg.delegation.light.get("max_parallel") == 3
+        assert cfg.tools.delegation == ["spawn_subagent"]
+
+    @pytest.mark.parametrize("expert", ["scholar", "critic"])
+    def test_delegation_absent_from_extra(self, expert):
+        # The premise for the explicit tool_config injection: known fields are
+        # stripped from extra. If this flips, the injection becomes redundant
+        # (harmless) — update agent.py/persistent_session.py accordingly.
+        cfg = self._load(expert)
+        assert "delegation" not in cfg.extra
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("expert", ["scholar", "critic"])
+    async def test_agent_tool_config_dispatches_light_backend(self, expert):
+        """Reproduce agent.py's tool_config construction end-to-end."""
+        from dataclasses import asdict
+
+        cfg = self._load(expert)
+        tool_config = {
+            **cfg.extra,
+            "agent_id": cfg.agent_id,
+            "delegation": asdict(cfg.delegation),
+        }
+        ctx = ToolContext(config=tool_config)
+        (tool,) = create_spawn_subagent_tools(ctx)
+        reply = await tool.coroutine(task_description="")
+        # Light backend validates input; heavy stub errors about delegate_work.
+        assert "task_description is required" in reply
+        assert "delegate_work" not in reply
