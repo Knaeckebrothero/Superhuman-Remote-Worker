@@ -177,6 +177,30 @@ databases:
   neo4j:
     browser:
       enabled: true
+    # Bolt exposure so the Browser SPA can actually run queries, not just load
+    # the page. The SPA (served over Traefik/HTTPS at neo4j.superhuman-remote-
+    # worker.com) opens a wss Bolt connection back to the advertised host
+    # bolt-neo4j.superhuman-remote-worker.com:7688 — which needs:
+    #   - boltTls: a cert-manager cert so the connection is wss (an https page
+    #     can't open an insecure ws), issued via cloudflare-dns-issuer (DNS-01).
+    #   - loadBalancer: puts Bolt on a home MetalLB IP (10.0.51.33). Traefik
+    #     HTTP ingress can't carry Bolt, so it needs its own L4 endpoint.
+    #   - externalTrafficPolicy: Local + allowedClientCIDRs: opens 7688 in the
+    #     srw-neo4j NetworkPolicy to the LAN only (the policy otherwise limits
+    #     Bolt to orchestrator/agent). Local preserves the client IP so the
+    #     ipBlock matches; Bolt stays auth-gated on top.
+    # Requires a MikroTik DNS entry:
+    #   bolt-neo4j.superhuman-remote-worker.com -> 10.0.51.33
+    # (today that name wrongly resolves to prod-private's Bolt LB at .32).
+    boltTls:
+      enabled: true
+      issuerName: cloudflare-dns-issuer
+    loadBalancer:
+      enabled: true
+      ip: "10.0.51.33"
+      externalTrafficPolicy: Local
+      allowedClientCIDRs:
+        - "192.168.178.0/24"
 # Other DBs stay internal (chart defaults). Externalize here if needed:
 #   postgres:
 #     externalUrl: ""

@@ -639,6 +639,20 @@ databases:
       # `metallb.universe.tf/ip-address-pool` annotation. Leave empty to use
       # MetalLB's default pool selection.
       ipAddressPool: ""
+      # -- externalTrafficPolicy for the Bolt LoadBalancer. Empty = Kubernetes
+      # default (Cluster, which SNATs the client to a node IP). Set to "Local"
+      # to preserve the real client source IP — REQUIRED when scoping Bolt with
+      # allowedClientCIDRs below, since the srw-neo4j NetworkPolicy matches on
+      # that client IP. (In a routed homelab there is no NAT between LAN and
+      # MetalLB, so Local surfaces the actual LAN address at the pod.)
+      externalTrafficPolicy: ""
+      # -- Client CIDRs permitted to reach Bolt (7688) through the LoadBalancer.
+      # Each renders an ipBlock allow-rule in the srw-neo4j NetworkPolicy, which
+      # otherwise limits Bolt to the orchestrator/agent pods — without this the
+      # Browser SPA's Bolt WebSocket is dropped. Bolt is authenticated, so this
+      # gates *reachability*, not access. Empty = no carve-out. Requires
+      # externalTrafficPolicy: Local (above) so the source IP is the real client.
+      allowedClientCIDRs: []
     # -- JVM heap and OS-level page cache. Neo4j 5 auto-detects from the cgroup
     #    limit and routinely overshoots, refusing to start with "Invalid memory
     #    configuration - exceeds physical memory". Pin both explicitly. Together

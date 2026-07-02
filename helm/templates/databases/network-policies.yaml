@@ -217,6 +217,22 @@ spec:
         - port: 7474
           protocol: TCP
     {{- end }}
+    {{- if and .Values.databases.neo4j.loadBalancer.enabled .Values.databases.neo4j.loadBalancer.allowedClientCIDRs }}
+    # Bolt (7688) reached from the LAN via the MetalLB LoadBalancer, so the
+    # Neo4j Browser SPA (served over Traefik/HTTPS) can open its wss connection
+    # back to the advertised Bolt address. Scoped to the configured client
+    # CIDRs; relies on the Bolt LB running externalTrafficPolicy: Local so the
+    # pod sees the real client source IP. Bolt is authenticated — this gates
+    # reachability, not access.
+    - from:
+        {{- range .Values.databases.neo4j.loadBalancer.allowedClientCIDRs }}
+        - ipBlock:
+            cidr: {{ . | quote }}
+        {{- end }}
+      ports:
+        - port: 7688
+          protocol: TCP
+    {{- end }}
 ---
 {{- end }}
 
