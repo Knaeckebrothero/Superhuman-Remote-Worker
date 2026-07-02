@@ -201,6 +201,22 @@ spec:
         - port: 7688
           protocol: TCP
         # Bolt also listens on 7687 in some configs; current chart pins 7688.
+    {{- if .Values.databases.neo4j.browser.enabled }}
+    # Neo4j Browser UI reached through the Traefik ingress (home-network LB
+    # only; the browser host is deliberately kept out of the Cloudflare tunnel).
+    # Only the HTTP port is opened to Traefik — Bolt (7688) stays restricted to
+    # the orchestrator/agent pods above.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: traefik
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: traefik
+      ports:
+        - port: 7474
+          protocol: TCP
+    {{- end }}
 ---
 {{- end }}
 

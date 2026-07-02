@@ -163,6 +163,20 @@ databases:
   # virtual keys, per-user/team limits, and the spend/usage dashboard.
   litellm:
     enabled: true
+  # Neo4j graph-DB browser UI. Exposed via the chart's Traefik ingress
+  # (neo4j.superhuman-remote-worker.com -> srw-neo4j:7474, TLS via
+  # cloudflare-dns-issuer) on the home-network Traefik LB (10.0.51.11) ONLY —
+  # deliberately kept OUT of the Cloudflare tunnel so the graph DB is reachable
+  # from the LAN, not the public internet. Two coupled requirements:
+  #   1. The srw-neo4j NetworkPolicy gains a `traefik`-namespace ingress
+  #      carve-out for :7474 (helm/templates/databases/network-policies.yaml),
+  #      because unlike pgAdmin/Mongo the neo4j pod is behind a NetworkPolicy.
+  #   2. A split-horizon MikroTik DNS entry
+  #      `neo4j.superhuman-remote-worker.com -> 10.0.51.11` is required — the
+  #      public .com domain otherwise resolves to Cloudflare on the LAN.
+  neo4j:
+    browser:
+      enabled: true
 # Other DBs stay internal (chart defaults). Externalize here if needed:
 #   postgres:
 #     externalUrl: ""
