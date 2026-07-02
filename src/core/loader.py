@@ -1773,6 +1773,14 @@ class DelegationConfig:
     default_timeout: int = 7200  # 2 hours
     max_timeout: int = 14400  # 4 hours
     allowed_configs: List[str] = field(default_factory=list)  # empty = any
+    # Backend for the shared `spawn_subagent` tool: "heavy" (full child jobs)
+    # or "light" (throwaway in-process readers). Operator-selected, not the
+    # model's choice.
+    mode: str = "heavy"
+    # Light-backend knobs (max_iterations, max_tokens, max_parallel,
+    # allow_writes). Kept as a plain dict — the light factory reads it with
+    # .get() defaults, so unknown/missing keys are fine.
+    light: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -2208,6 +2216,8 @@ def load_agent_config(
         default_timeout=delegation_data.get("default_timeout", 7200),
         max_timeout=delegation_data.get("max_timeout", 14400),
         allowed_configs=delegation_data.get("allowed_configs", []),
+        mode=delegation_data.get("mode", "heavy"),
+        light=delegation_data.get("light", {}) or {},
     )
 
     # Parse autonomy level
@@ -2412,6 +2422,8 @@ def load_agent_config_from_dict(
         default_timeout=delegation_data.get("default_timeout", 7200),
         max_timeout=delegation_data.get("max_timeout", 14400),
         allowed_configs=delegation_data.get("allowed_configs", []),
+        mode=delegation_data.get("mode", "heavy"),
+        light=delegation_data.get("light", {}) or {},
     )
 
     # Parse autonomy level

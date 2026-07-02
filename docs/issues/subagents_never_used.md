@@ -23,13 +23,16 @@ related:
 # Subagent delegation is never used — 0 invocations fleet-wide, all-time, despite rendered instructions
 
 **Date:** 2026-07-02
-**Status:** Open — **consolidation/working doc for a dedicated fix session.** Absorbs and
-supersedes the evidence in [[scholar_delegation_not_exercised]] (2026-06-03, one gpt-5.5
-job) with fleet-wide audit data; sibling of [[delegation_light_mode_missing]] (the
-tool-shape gap). **A light ReAct subagent tool is being built in a parallel session
-(2026-07-02)** — this doc's job is to make sure that tool actually gets *used*, because
-the evidence below shows tool availability + prompt instructions achieve exactly nothing
-on their own.
+**Status:** **FIX IMPLEMENTED 2026-07-02** (uncommitted, develop) — adoption package
+shipped as Phase 5 of [[delegation_light_mode_missing]]; see "Fix session record" below
+for the recommendation-by-recommendation mapping and a **sixth mechanism** discovered
+during verification. Remaining: k3d e2e (Phase 6) + post-deploy adoption measurement
+with the queries below. Absorbs and supersedes the evidence in
+[[scholar_delegation_not_exercised]] (2026-06-03, one gpt-5.5 job) with fleet-wide audit
+data; sibling of [[delegation_light_mode_missing]] (the tool-shape gap). The light ReAct
+subagent tool this doc assumed was built in the same session (Phases 0–4) — this doc's
+job was to make sure that tool actually gets *used*, because the evidence below shows
+tool availability + prompt instructions achieve exactly nothing on their own.
 **Component:** `src/tools/delegation/delegate_work.py` (tool + framing),
 `config/experts/scholar/` + `config/experts/critic/` prompts and todo scaffolds,
 `orchestrator/services/project_loops.py` (`_ROLE_BLOCKS`, loop kickoff).
@@ -151,6 +154,50 @@ prose:
    workspace-mutating parallel implementation (its actual design goal); retarget the
    research/verification playbooks in scholar/critic prompts at the light tool. Don't
    leave two competing delegation instructions in the same prompt.
+
+## Fix session record (2026-07-02)
+
+User decisions: **mandatory explicit decision** at the planning point (not mandatory
+delegation — avoids garbage fan-out on non-separable tasks), **remove `delegate_work`
+from scholar + critic** entirely (0 all-time invocations = nothing lost; one tool, one
+playbook), **full scope** (scholar + critic + loop role blocks).
+
+Recommendation → what shipped:
+
+1. **Todo scaffold** ✅ — `strategic_todos_initial.yaml` PLAN todo now requires a
+   fan-out decision per phase row in plan.md ("fan-out (N subagents)" or
+   "sequential: <reason>", fan-out the default for 2+ independent threads); the
+   decision lands in plan.md, which later `next_phase_todos` calls follow — durable
+   past phase 0. CREATE todo nudges fan-out-todo-first.
+2. **Loop `_ROLE_BLOCKS`** ✅ — one fan-out sentence each for scholar + critic in
+   `orchestrator/services/project_loops.py`.
+3. **Default-with-exception wording** ✅ — scholar + critic `strategic*.txt`, both
+   forks in sync; all `delegate_work` prose removed (zero mentions left in either
+   expert dir).
+4. **Cheap/non-blocking framing** ✅ — tool description: "runs inline with its own
+   fresh context and returns its result directly — delegating the reading keeps your
+   own context small". No suspend/timeout vocabulary anywhere (render-checked).
+5. **Tactical-phase salience** ✅ — short gated reminder block in all 4 tactical
+   prompt files (tool was already bound in tactical; now the guidance is too).
+6. **Bound + attributed** ✅ — was already built in Phases 2–4 (read-leaning toolset,
+   iteration/token caps, `call_type='subagent'` under the parent job).
+7. **Heavy-path prose fate** ✅ — resolved by removal: scholar/critic grant only
+   `spawn_subagent` (`delegation.mode: light`); `delegate_work` remains available to
+   other experts and converges under the spawn_subagent name as a fast-follow.
+
+**Mechanism #6, found during verification** (would have silently defeated the entire
+fix): `"delegation"` is a parsed/known config field, so it is stripped from
+`config.extra` — and `tool_config` (what tools see as `context.config`) is built from
+`extra` in `agent.py`/`persistent_session.py`. `create_spawn_subagent_tools` therefore
+saw no `delegation` key → defaulted to the heavy stub even with `mode: light`
+configured. Worse: `delegate_work`'s call-time check
+`config.get("delegation", {}).get("enabled", False)` could **never** pass in a real
+agent — had any model ever called it, it would have errored "delegation is not enabled
+in this agent's config". The 0-invocation evidence concealed that the feature was
+doubly broken: never chosen, and non-functional if chosen. Fixed by adding
+`mode`/`light` to `DelegationConfig` and injecting `asdict(config.delegation)` into
+both `tool_config` sites; regression-pinned in
+`tests/test_spawn_subagent.py::TestDelegationConfigPlumbing`.
 
 ## How to measure adoption (post-fix verification)
 

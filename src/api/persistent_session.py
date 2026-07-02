@@ -11,6 +11,7 @@ import asyncio
 import logging
 import os
 import time
+from dataclasses import asdict as _dc_asdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -596,6 +597,10 @@ class PersistentSession:
             "model_max_context_tokens": self.config.limits.model_max_context_tokens,
             # Per-family page-render DPI (None -> renderer default 150).
             "pdf_render_dpi": getattr(self.config.limits, "pdf_render_dpi", None),
+            # Delegation tools read their settings from this plain dict —
+            # "delegation" is a parsed/known config field, so it is NOT part
+            # of config.extra (mirrors agent.py's worker tool_config).
+            "delegation": _dc_asdict(self.config.delegation),
             "cloud_mount": {
                 "active": bool(
                     self.cloud_mount_manager and self.cloud_mount_manager.active
