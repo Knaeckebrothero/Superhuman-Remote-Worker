@@ -3,7 +3,11 @@
 **Date:** 2026-06-18
 **Status:** Open. Enhancement / design gap, **not** a regression — the existing
 heavyweight delegation path works as designed. This documents a missing
-*alternative* mode.
+*alternative* mode. **Decision proposed 2026-07-02** (scholar-driven) — see
+"Decision — Scholar-driven throwaway readers" at the end of this doc. Citation
+handling resolved (subagents inherit the citation tool and cite normally).
+Remaining fork: runtime (in-process vs stripped child job) — recommendation
+recorded, awaiting user confirmation.
 **Component:** `src/tools/delegation/delegate_work.py`, `src/graph.py` (worker
 state machine), `src/api/orchestrator_client.py` (`create_delegation_job`),
 `docs/features/subagent_delegation.md` (design doc that chose the heavyweight
@@ -169,3 +173,164 @@ and "isolated but cheap" points at (3).
   `docs/issues/subjob_worktree_sharing.md`,
   `docs/done/subjob_merge_clobbers_parent_deliverables.md`. Naming precedent for
   "light": `docs/features/memory_light.md`.
+
+---
+
+## Decision — Scholar-driven throwaway readers (proposed 2026-07-02)
+
+**Driving use case (settles the mechanism).** The scholar expert needs cheap,
+disposable subagents that "read a bunch of sources and return a result" — N
+parallel readers, each fetching/reading a subset of sources, distilling, and
+handing back a string the scholar synthesizes. This is the
+**parallel-read-and-distill fan-out**, not an "ask one focused subagent" call
+and not workspace-mutating decomposition. It points squarely at **approach #2
+(agent-as-tool), run as a bounded concurrent fan-out.**
+
+**What "light" actually removes — the merge, not the worktree.** The expensive,
+slow part of `delegate_work` for this use case is **review + squash-merge + the
+parent's freeze → checkpoint → wake round-trip**, not the worktree. Keep the
+worktrees: they are cheap (shared git object store) and they isolate parallel
+readers' scratch files so N concurrent readers don't collide. But the readers
+are **throwaway — they return a result string and their worktree is discarded,
+never merged.** Citations don't need the merge either: subagents inherit
+`cite_web`/`cite_document` and write to the shared **CitationEngine DB
+(job-scoped, verified, persistent)** (`src/tools/citation/sources.py:334`), with
+web content archived by source-id. So the whole review/merge apparatus is pure
+tax; the worktree stays purely as lightweight isolation.
+
+### Chosen shape
+
+- **New tool `delegate_light`** in `src/tools/delegation/` — same `delegation`
+  registry category; `delegate_work` stays untouched. Opt-in per expert via the
+  existing `tools.delegation` YAML list (which is *already* a per-agent toggle).
+  A cockpit "delegation mode: off / light / heavy / both" switch over that same
+  list is a **later** pass, not v1. Heavy and light are **not** mutually
+  exclusive at the model level — an expert can hold both and the model picks;
+  the tool descriptions steer it.
+- **Async tool, fan-out native.** Signature roughly
+  `delegate_light(tasks: list[str], context: str = "") -> str` (a single task is
+  just a length-1 fan-out). Make it a **coroutine tool** so the sub-loops
+  `await` the LLM in the parent's own event loop and run concurrently via
+  `asyncio.gather` — *avoid* `delegate_work`'s `ThreadPoolExecutor` +
+  `asyncio.run` nesting hack (`delegate_work.py:255`).
+- **Bounded ReAct, no graph.** Each reader is a capped `execute ↔ tools` loop —
+  **not** a second `graph.py` instance. No strategic/tactical alternation, no
+  todos, no archiver, no checkpoint. Caps: `max_iterations`, `max_tokens`.
+- **Throwaway worktree per reader.** Each reader gets its own git worktree
+  (`.worktrees/light_N`) via the existing `GitManager` worktree methods — cheap
+  isolation + scratch space so parallel readers don't collide. The worktree is
+  **discarded on return, never merged.**
+- **Inherit the full parent tool set (minus delegation).** The reader's tools are
+  the parent's — citation, web, read, **and shell** — rebound to its worktree via
+  the existing tool factory. Only `delegate_work`/`delegate_light` are excluded
+  (no grandchildren). Shell stays: most reader shell use is ephemeral CLI (`curl`
+  an API, query a DB, `grep`/`jq`) that binds no ports, and dropping it would gut
+  capability. Each reader gets its own tmux session (keyed to its worktree) + the
+  existing port-range awareness block (`_build_subagent_env_block`,
+  `delegate_work.py:54`), so the rare server-start case is steered by prompt, not
+  policed. Teardown kills the session (reaping any lingering process) and discards
+  the worktree.
+- **Fresh context.** New message list (scoped preamble + shared `context` +
+  task); the parent's history is **not** passed down — same LLM-level isolation
+  the heavy path gets from a fresh pod.
+- **Return-as-string, parent stays author.** Readers hand back distilled
+  findings inline; the **scholar** writes the `output/ideas/NNN.md` artifacts and
+  synthesis. This is the flow shift from today's "readers write files → parent
+  merges" to "readers return → parent authors."
+- **No suspend.** The tool blocks-and-returns like any other tool call — no
+  `request_freeze()`, no `waiting` status, no orchestrator round-trip.
+- **Smaller model as a configurable subagent default.** A cheaper model for
+  throwaway readers, set the way `max_depth` is today — a `delegation.*` knob
+  (see config below), falling back to a tactical default if unset.
+
+Config (layered under the existing `delegation:` block, nothing else moves):
+
+```yaml
+delegation:
+  enabled: true
+  max_depth: 1
+  # ... existing heavy-path knobs ...
+  light:
+    enabled: true
+    model: null              # cheaper tactical fallback if unset
+    max_iterations: 10
+    max_tokens: 40000
+    max_parallel: 3
+    allow_writes: false
+tools:
+  delegation:
+    - delegate_work          # heavy, unchanged
+    - delegate_light         # NEW
+    - resume_delegation_child
+```
+
+### RESOLVED — citations just work
+
+Subagents inherit the parent's `cite_web`/`cite_document` and cite normally into
+the shared job-scoped CitationEngine DB as they read. No special contract, no
+provenance round-trip. Per-reader worktrees remove the earlier concurrency worry
+about scratch-file collisions; the citation DB handles concurrent inserts.
+
+### OPEN FORK — runtime (recommendation recorded, awaiting confirmation)
+
+Where do the throwaway readers run? Both keep worktrees + inherited tools + the
+small model; they differ only in execution substrate.
+
+- **(A) In-process on the parent's pod** *(recommended)* — the parent spins up N
+  bounded ReAct loops, each with a worktree + tool set rebound to it, `gather`s
+  them, collects the result strings. No dispatch, no 30 s cooldown, no
+  freeze/wake — genuinely light. Reuses the tool factory + `GitManager` worktree
+  methods; the parallel mini-agent loop is the new code. Each reader gets its own
+  tmux session (the heavy path already runs per-child tmux, so this is proven),
+  so inheriting shell is not a blocker.
+- **(B) Stripped-down child jobs** — reuse `delegate_work`'s worktree +
+  child-job creation, but the child runs a reduced ReAct graph on the small
+  model and its result is auto-collected without review/merge. Reuses the most
+  existing code, but **re-inherits orchestrator dispatch + 30 s cooldown +
+  freeze/wake latency** — the very overhead this feature exists to escape. So
+  "lighter," not "light."
+
+Recommendation: **(A)**. (B)'s reuse advantage is undercut by dragging back the
+latency that motivated a light mode at all.
+
+### Cross-cutting requirements (independent of the fork)
+
+1. **No nesting.** Light readers must not receive `delegate_work` *or*
+   `delegate_light` — exclude both from the sub-loop tool set (grandchildren are
+   out of scope, same as heavy `max_depth: 1`).
+2. **Metering / observability — a v1 requirement, not a follow-up.** A heavy
+   child is a job row: it shows in the jobs UI and its tokens land in
+   `usage_events`. A light reader is invisible by those means. Its LLM calls
+   **must** route through the same audit + usage-metering path and fold into the
+   parent job's usage, or it becomes an unmetered spend leak — exactly the class
+   of gap flagged around gateway metering
+   ([[reference_usage_view_gateway_metering_routing]]). Given the rate-limiting
+   v2 work in flight, wire this from the start.
+3. **Concurrency.** Per-reader worktrees isolate scratch-file writes, so parallel
+   readers don't collide on the filesystem, and the CitationEngine DB handles
+   concurrent inserts. Remaining check (if runtime (A)): confirm the parent's
+   event loop cleanly runs `max_parallel` reader loops + their tool calls under
+   one pod; bound it with `max_parallel` + the token cap.
+
+### Scholar prompt / config changes this entails
+
+- `config/experts/scholar/config.yaml`: add `delegate_light` to
+  `tools.delegation`.
+- `config/experts/scholar/strategic.txt:30-60` and `todo_guide.md` "Delegated
+  Parallel Research Phase": add a light-mode variant — "delegate the *reading*,
+  you do the *writing/synthesis*" — distinct from the existing heavy
+  "readers write files → you merge" guidance. Gate on `has_tool("delegate_light")`.
+
+### Build outline (files touched)
+
+- **New:** `src/tools/delegation/delegate_light.py` (bounded async ReAct
+  harness + tool factory), metadata entry in
+  `DELEGATION_TOOLS_METADATA`.
+- **Modify:** `src/tools/registry.py` (register — the `delegation` category
+  loader at :544 already iterates the factory's tools, so mainly the metadata),
+  `config/defaults.yaml` (add `delegation.light` block + schema entry in
+  `config/schema.json`), `config/experts/scholar/{config.yaml,strategic.txt,
+  todo_guide.md}`, and the metering hook (route sub-loop LLM calls through the
+  existing audit/usage path).
+- **Reuses (no change):** the parent's bound LLM + `ToolContext` with live tools;
+  CitationEngine + `cite_web` (already async, DB-backed, job-scoped).
