@@ -190,7 +190,13 @@ them**. `/api/usage` aggregates raw `usage_events` on every call; the enforcing
 quota is env-driven (`LITELLM_QUOTA`), not a table.
 - **Decision:** build the `usage_daily` rollup (the doc-mandated Cockpit surface + the safety precondition for D-2 retention), or correct the architecture doc/comments to reflect raw-event aggregation as reality. Evidence: grep returns docs/comments only; `usage_ledger.py:239-303`, `audit_partitions.py:56-60`.
 
-### D-2 · Audit retention is a no-op stub
+### D-2 · Audit retention is a no-op stub — ✅ closed by policy 2026-07-02
+**Decision: no automatic data deletion, ever (owner call).** Storage is
+abundant; deletion is manual and export-first only; revisit at SaaS/GDPR.
+The stub stays a stub by design; docs get corrected instead of retention
+getting wired. See `database_roadmap.md` Phase 6.
+
+Original finding:
 `retire_partitions()` is a documented no-op ("PR-1 lean cut") — the 90/90/365d
 retention promised by the architecture doc + migration headers is **not
 enforced**; partitions accumulate forever for all four audit parents. Creation /
@@ -211,7 +217,9 @@ wired `main.py:1554-1605`). Per-job cost is unblocked; see
 `database_roadmap.md` gate G3 for the shrunken decision.
 - **Decision:** converge `llm_requests` token data into `usage_events` (adding job attribution there), or keep `llm_requests` as the per-job audit record and accept the overlap. Relates to D-6. Evidence: `archiver.py:443`, `persistent_graph.py:1294`, `observability_and_quotas.md:286`.
 
-### D-4 · Messaging trio — owner or drop
+### D-4 · Messaging trio — owner or drop — ✅ decided 2026-07-02: keep, owned
+Notifications, permission requests, and the AI ask-questions flow are on the
+product feature list; the subsystem is kept and owned. Original finding:
 `message_log` / `external_contacts` / `notification_queue` are still written
 only by the IMAP-poller path, **but** have live read endpoints
 (`/api/projects/{id}/contacts`, `/api/notifications/{id}`) — so not
