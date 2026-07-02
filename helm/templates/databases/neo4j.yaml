@@ -217,6 +217,11 @@ metadata:
     {{- end }}
 spec:
   type: LoadBalancer
+  {{- with .Values.databases.neo4j.loadBalancer.externalTrafficPolicy }}
+  # Local preserves the real client source IP so the srw-neo4j NetworkPolicy's
+  # allowedClientCIDRs ipBlock can match it (Cluster would SNAT it to a node IP).
+  externalTrafficPolicy: {{ . }}
+  {{- end }}
   ports:
     - name: bolt
       port: 7688
