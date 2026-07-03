@@ -65,8 +65,8 @@ rules; this plan stays within them (it does **not** propose merging stores).
 | HF-5 | Per-store connection-pool env overrides | Harder | S | Low |
 | HF-6 | Remaining N+1s (`/api/datasources`, threads mounts) | Harder | M | Low |
 | HF-7 | Thread-read fat queries (cursorless load, COUNT, sort) | Harder | M | Med |
-| D-1 | Phantom `usage_daily` / `quota_limits` — build or document | Deferred/decision | — | — |
-| D-2 | Audit retention (`retire_partitions` no-op) — wire or accept | Deferred/decision | M | — |
+| D-1 | Phantom `usage_daily` / `quota_limits` — build or document | ✅ built (P6 D-1 `8f1470e7`) | — | — |
+| D-2 | Audit retention (`retire_partitions` no-op) — wire or accept | ✅ policy no-op (P6 D-2 `851b6b7c`) | M | — |
 | D-3 | Token-ledger consolidation (`llm_requests` vs `usage_events`) | Deferred/decision | L | — |
 | D-4 | Messaging trio — owner or drop (product call) | Deferred/decision | — | — |
 | D-5 | MongoDB removal step 2 — delete all Mongo code/chart/deps (after soak) | Committed | M | Low |
@@ -183,7 +183,15 @@ pressure `max_connections` as replicas + the LiteLLM DB are added.
 
 ## Tier 3 — Deferred / needs a decision
 
-### D-1 · Phantom `usage_daily` / `quota_limits` tables
+### D-1 · Phantom `usage_daily` / `quota_limits` tables — ✅ `usage_daily` built (Phase 6 D-1, `8f1470e7`, 2026-07-03)
+`usage_daily` + `rollup_state` now exist (`migrations/app/0047`), maintained by
+`services/usage_rollup.py` (cross-DB aggregate + watermark, full-replace upsert);
+`/api/usage` serves the rollup for closed days + raw for the open tail. Per-job
+cost (`ref_id`) stays on the raw ledger — deliberately not a rollup dim.
+`quota_limits` stays **UNBUILT** — corrected to "planned" (rate-limiting v2) in
+the architecture + observability docs, not a phantom "exists" claim. See
+`database_roadmap.md` Phase 6. Original finding below.
+
 Both are referenced as existing app-DB tables in `database_architecture.md` and
 4+ code comments, but **no migration creates them and nothing reads/writes
 them**. `/api/usage` aggregates raw `usage_events` on every call; the enforcing
@@ -193,8 +201,13 @@ quota is env-driven (`LITELLM_QUOTA`), not a table.
 ### D-2 · Audit retention is a no-op stub — ✅ closed by policy 2026-07-02
 **Decision: no automatic data deletion, ever (owner call).** Storage is
 abundant; deletion is manual and export-first only; revisit at SaaS/GDPR.
-The stub stays a stub by design; docs get corrected instead of retention
-getting wired. See `database_roadmap.md` Phase 6.
+**Implemented Phase 6 D-2 (`851b6b7c`, 2026-07-03):** `retire_partitions` is now
+a PERMANENT policy no-op (was framed "PR-1 lean cut") carrying the manual
+DETACH-CONCURRENTLY export-first recipe + returning `{"policy":
+"no-auto-deletion"}`; `partition_status` reports per-parent `total_bytes` so
+growth is visible; the 90/90/365d + "retention-dropped" claims were swept from
+the architecture + observability docs and the `audit_partitions.py` docstrings.
+See `database_roadmap.md` Phase 6.
 
 Original finding:
 `retire_partitions()` is a documented no-op ("PR-1 lean cut") — the 90/90/365d
