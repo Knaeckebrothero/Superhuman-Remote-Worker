@@ -14,9 +14,9 @@ See docs/features/project_knowledge_base.md for full architecture.
 
 import asyncio
 import logging
+import re
 import uuid
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from langchain_core.tools import tool
@@ -125,6 +125,141 @@ def _get_project_ids(context: ToolContext) -> List[str]:
     return context.project_ids
 
 
+# =============================================================================
+# OKF markdown serialization (slice 1 — files-canonical dual-write)
+# See docs/features/okf_knowledge_base.md §7, §11.
+# =============================================================================
+
+
+def _derive_description(content: str) -> str:
+    """One-sentence description from a note body (OKF progressive disclosure).
+
+    Skips heading lines; takes the first sentence of the first prose line,
+    capped at 200 chars. Slice 1 has no ``description`` input on most write
+    paths, but every OKF note's frontmatter should still carry one — the whole
+    economy of ``index.md`` files runs on it (§7).
+    """
+    for line in (content or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        match = re.match(r"(.+?[.!?])(\s|$)", line)
+        desc = match.group(1) if match else line
+        return desc[:200].strip()
+    return ""
+
+
+def _yaml_quote(value: str) -> str:
+    """Quote a free-text YAML scalar, escaping quotes and collapsing newlines."""
+    flat = " ".join(str(value).splitlines()).replace('"', '\\"')
+    return f'"{flat}"'
+
+
+def _render_note_md(note: Dict[str, Any]) -> str:
+    """Serialize a note dict to an OKF/markdown document (pure function).
+
+    OKF conventions (docs/features/okf_knowledge_base.md §7): ``type`` +
+    ``description`` frontmatter, standard **markdown** links (never wikilinks)
+    for the emergent graph, in-note ``author``/``job``/``branch`` provenance
+    (squash-merge erases git authorship). Optional fields are omitted when
+    absent. Shared by ``kb_write``/``kb_update`` dual-write and ``kb_export``.
+
+    Expected keys (all optional except ``id``/``type``): ``id``, ``type``,
+    ``title``, ``description``, ``content``, ``tags``, ``keywords``,
+    ``confidence``, ``status``, ``author``, ``job``, ``branch``, ``created``,
+    ``modified``, ``superseded_by``, ``relationships`` ([{type, target}]).
+    """
+    note_id = note.get("id", "unknown")
+    content = note.get("content", "") or ""
+    description = note.get("description") or _derive_description(content)
+
+    fm: List[str] = ["---", f"id: {note_id}", f"type: {note.get('type', 'unknown')}"]
+    if description:
+        fm.append(f"description: {_yaml_quote(description)}")
+    if note.get("tags"):
+        fm.append(f"tags: [{', '.join(note['tags'])}]")
+    if note.get("keywords"):
+        fm.append(f"keywords: [{', '.join(note['keywords'])}]")
+    if note.get("confidence"):
+        fm.append(f"confidence: {note['confidence']}")
+    fm.append(f"status: {note.get('status', 'active')}")
+    # Provenance (§7) — origin binding that git authorship can't carry.
+    if note.get("author"):
+        fm.append(f"author: {note['author']}")
+    if note.get("job"):
+        fm.append(f"job: {note['job']}")
+    if note.get("branch"):
+        fm.append(f"branch: {note['branch']}")
+    if note.get("created"):
+        fm.append(f"created: {note['created']}")
+    if note.get("modified"):
+        fm.append(f"modified: {note['modified']}")
+    if note.get("superseded_by"):
+        fm.append(f"superseded_by: {note['superseded_by']}")
+    fm.append("---")
+    fm.append("")
+
+    body: List[str] = [f"# {note.get('title') or note_id}", "", content]
+
+    # Relationships as standard markdown links, grouped by type (§7).
+    rels = note.get("relationships") or []
+    if rels:
+        body.extend(["", "## Relationships"])
+        by_type: Dict[str, List[str]] = {}
+        for r in rels:
+            rt = r.get("type", "REFERENCES")
+            by_type.setdefault(rt, []).append(r.get("target", "?"))
+        for rel_type, targets in by_type.items():
+            links = ", ".join(f"[{t}]({t}.md)" for t in targets)
+            body.append(f"**{rel_type}:** {links}")
+
+    return "\n".join(fm) + "\n".join(body) + "\n"
+
+
+def _note_provenance(context: ToolContext) -> Dict[str, Optional[str]]:
+    """Resolve in-note provenance (author role, job, git branch) from context."""
+    author: Optional[str] = None
+    meta = getattr(context, "_job_metadata", None)
+    if isinstance(meta, dict):
+        author = meta.get("config_name")
+    if not author:
+        try:
+            author = context.config.get("agent_id")
+        except Exception:
+            author = None
+    branch: Optional[str] = None
+    try:
+        branch = context.workspace_manager.git_manager.current_branch()
+    except Exception:
+        branch = None
+    return {"author": author, "job": context.job_id, "branch": branch}
+
+
+def _dual_write_note(context: ToolContext, slug: str, note: Dict[str, Any]) -> None:
+    """Materialize a note as flat ``knowledge/<slug>.md`` on the workspace.
+
+    Slice 1 of the files-canonical KB. Guarded on ``has_git()`` (stricter than
+    ``has_workspace()``: persistent sessions, repo-less projects and lite tiers
+    keep their DB-only write) — skip + log otherwise, never fall back to local
+    I/O (that writes to the ephemeral agent host, invisible to the workspace
+    pod's clone; the citation-engine stub-mode bug and ``kb_export``'s old
+    local-``Path`` fallback are the cautionary tales). Non-fatal, mirroring the
+    pgvector write-through: a failed file write must never fail the tool.
+    """
+    if not context.has_git():
+        return
+    try:
+        enriched = dict(note)
+        for key, value in _note_provenance(context).items():
+            if value:
+                enriched[key] = value
+        context.workspace_manager.write_file(
+            f"knowledge/{slug}.md", _render_note_md(enriched)
+        )
+    except Exception as e:
+        logger.warning(f"knowledge/ dual-write failed for {slug}: {e}")
+
+
 def create_kb_tools(context: ToolContext) -> List[Any]:
     """Create knowledge base tools with injected context.
 
@@ -168,6 +303,7 @@ def create_kb_tools(context: ToolContext) -> List[Any]:
         title: str,
         type: str,
         content: str,
+        description: Optional[str] = None,
         tags: Optional[List[str]] = None,
         keywords: Optional[List[str]] = None,
         confidence: Optional[str] = None,
@@ -176,14 +312,19 @@ def create_kb_tools(context: ToolContext) -> List[Any]:
     ) -> str:
         """Create a new knowledge note in the project knowledge base.
 
-        Write-through: creates the note in Neo4j (source of truth) AND upserts
-        into pgvector search index in a single call. The note is immediately
+        Write-through: creates the note in Neo4j (source of truth), upserts into
+        the pgvector search index, AND materializes the note as an OKF markdown
+        file at ``knowledge/<slug>.md`` on the workspace (delivered to the repo's
+        ``main`` by the normal commit/merge flow). The note is immediately
         available for search and graph queries.
 
         Args:
             title: Note title (generates the slug ID, e.g. "chose-jwt-over-oauth")
             type: Note type — one of: goal, plan, decision, learning, code, source, question, state, retrospective
             content: Full markdown body of the note
+            description: One-sentence summary for progressive-disclosure indexes.
+                         Strongly recommended; derived from the content's first
+                         sentence when omitted.
             tags: List of tag names (e.g. ["authentication", "security"])
             keywords: List of keyword strings for search
             confidence: Confidence level — high, medium, or low
@@ -237,6 +378,24 @@ def create_kb_tools(context: ToolContext) -> List[Any]:
             except Exception as e:
                 logger.warning(f"pgvector write-through failed for {slug}: {e}")
                 # Note exists in Neo4j — pgvector can be rebuilt
+
+            # Files-canonical dual-write (slice 1): materialize knowledge/<slug>.md.
+            _dual_write_note(
+                context,
+                slug,
+                {
+                    "id": slug,
+                    "type": type,
+                    "title": title,
+                    "description": description,
+                    "content": content,
+                    "tags": tags,
+                    "keywords": keywords,
+                    "confidence": confidence,
+                    "status": "active",
+                    "relationships": links or [],
+                },
+            )
 
             link_info = ""
             if links:
@@ -299,6 +458,26 @@ def create_kb_tools(context: ToolContext) -> List[Any]:
             try:
                 full_note = kg.read_note(project_id, note)
                 if full_note:
+                    # Files-canonical dual-write (slice 1) — before the
+                    # disposable-index upsert, so the canonical file lands even
+                    # if the pgvector write fails.
+                    _dual_write_note(
+                        context,
+                        note,
+                        {
+                            "id": note,
+                            "type": full_note.get("type", "learning"),
+                            "title": full_note.get("title", note),
+                            "description": full_note.get("description"),
+                            "content": full_note.get("content", ""),
+                            "tags": full_note.get("tags", []),
+                            "keywords": full_note.get("keywords", []),
+                            "confidence": full_note.get("confidence"),
+                            "status": full_note.get("status", "active"),
+                            "superseded_by": full_note.get("superseded_by"),
+                            "relationships": full_note.get("relationships", []),
+                        },
+                    )
                     _run_async(
                         ks.upsert_note(
                             note_id=note,
@@ -705,10 +884,11 @@ def create_kb_tools(context: ToolContext) -> List[Any]:
 
     @tool
     def kb_export(path: str) -> str:
-        """Export the project knowledge base as Obsidian-compatible markdown files.
+        """Export the project knowledge base as OKF/markdown files.
 
         Dumps all notes from Neo4j as .md files with YAML frontmatter and
-        [[wikilinks]] for relationships. One-way export for human browsing.
+        standard markdown links for relationships (OKF convention). Requires a
+        workspace backend; one-way export for human browsing or migration.
 
         Args:
             path: Directory path to write the export files
@@ -729,68 +909,25 @@ def create_kb_tools(context: ToolContext) -> List[Any]:
             if not notes:
                 return "Knowledge base is empty — nothing to export."
 
-            # Ensure export directory exists via workspace backend
+            # A workspace backend is required: never write to the local agent
+            # host (ephemeral, invisible to the workspace pod's clone). Uses the
+            # shared OKF serializer (markdown links, provenance) — same output
+            # as the kb_write/kb_update dual-write.
+            if workspace is None:
+                return (
+                    "Error: kb_export requires a workspace backend; refusing to "
+                    "write to the local agent host (invisible to the workspace)."
+                )
+
             export_rel = path.rstrip("/")
-            if workspace is not None:
-                workspace.create_directory(export_rel)
+            workspace.create_directory(export_rel)
 
             exported = 0
             for note in notes:
                 note_id = note.get("id", "unknown")
-                filename = f"{note_id}.md"
-
-                # Build YAML frontmatter
-                fm_lines = ["---"]
-                fm_lines.append(f"id: {note_id}")
-                fm_lines.append(f"type: {note.get('type', 'unknown')}")
-                if note.get("tags"):
-                    fm_lines.append(f"tags: [{', '.join(note['tags'])}]")
-                if note.get("keywords"):
-                    fm_lines.append(f"keywords: [{', '.join(note['keywords'])}]")
-                if note.get("confidence"):
-                    fm_lines.append(f"confidence: {note['confidence']}")
-                fm_lines.append(f"status: {note.get('status', 'active')}")
-                if note.get("job_id"):
-                    fm_lines.append(f"job_id: {note['job_id']}")
-                if note.get("phase") is not None:
-                    fm_lines.append(f"phase: {note['phase']}")
-                if note.get("created"):
-                    fm_lines.append(f"created: {note['created']}")
-                if note.get("modified"):
-                    fm_lines.append(f"modified: {note['modified']}")
-                fm_lines.append("---")
-                fm_lines.append("")
-
-                # Title and content
-                title = note.get("title", note_id)
-                content = note.get("content", "")
-
-                body_lines = [f"# {title}", "", content]
-
-                # Relationships as wikilinks
-                rels = note.get("relationships", [])
-                if rels:
-                    body_lines.extend(["", "## Relationships"])
-                    # Group by type
-                    by_type: Dict[str, List[str]] = {}
-                    for r in rels:
-                        rt = r.get("type", "REFERENCES")
-                        by_type.setdefault(rt, []).append(r.get("target", "?"))
-                    for rel_type, targets in by_type.items():
-                        links = ", ".join(f"[[{t}]]" for t in targets)
-                        body_lines.append(f"**{rel_type}:** {links}")
-
-                file_content = "\n".join(fm_lines) + "\n".join(body_lines) + "\n"
-                file_rel = f"{export_rel}/{filename}"
-
-                if workspace is not None:
-                    workspace.write_file(file_rel, file_content)
-                else:
-                    # Fallback: no workspace, write locally
-                    local_path = Path(file_rel)
-                    local_path.parent.mkdir(parents=True, exist_ok=True)
-                    local_path.write_text(file_content)
-
+                workspace.write_file(
+                    f"{export_rel}/{note_id}.md", _render_note_md(note)
+                )
                 exported += 1
 
             return (
