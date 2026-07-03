@@ -532,6 +532,7 @@ async def run_persistent_loop(
     tool_context: Optional[Any] = None,
     initial_turn_count: int = 0,
     get_current_tools: Optional[Callable[[], tuple]] = None,
+    get_current_context: Optional[Callable[[], tuple]] = None,
     memory_extraction_prompt: str = "",
     memory_service: Optional[Any] = None,
 ) -> None:
@@ -616,6 +617,14 @@ async def run_persistent_loop(
             new_llm, new_tools = get_current_tools()
             llm_with_tools = new_llm
             tool_map = {tool.name: tool for tool in new_tools}
+        # Same for the session-held context manager, config, and auxiliary —
+        # the loop captured them by value at task creation, so a hot-swap that
+        # REPLACES the session objects (aux rebuild, future manager rebuilds)
+        # or updates config-derived values (CTX-gauge window, limits) is
+        # invisible without this re-read. The manager itself is additionally
+        # updated in place (update_limits) so mid-turn references stay fresh.
+        if get_current_context:
+            context_manager, config, auxiliary_llm = get_current_context()
 
         turn_count += 1
         turn_id = turn_count

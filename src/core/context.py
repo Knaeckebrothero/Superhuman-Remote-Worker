@@ -653,6 +653,25 @@ class ContextManager:
         # duplicate-banner bug, 2026-06-12).
         self.compaction_runs: int = 0
 
+    def update_limits(self, config: ContextConfig, model: str) -> None:
+        """Rebind thresholds + token counter to a new model's window, in place.
+
+        Called on a session model hot-swap. Mutating (rather than rebuilding)
+        keeps every reference the running loop captured valid and preserves
+        accumulated state — critically ``_state.last_provider_input_tokens``,
+        so a downswitch to a smaller-window model sees the real context size
+        and compacts on the very next turn instead of resending an oversized
+        history until the model returns empty responses. See
+        docs/done/session_model_switch_stale_context_manager_empty_response.md.
+        """
+        self.config = config
+        image_config = getattr(config, "image_tokens", None)
+        self._default_counter = get_token_counter(model, image_config)
+        # Sessions use only the default counter (no phase counters); rebind the
+        # active pointer unless a worker phase counter is currently selected.
+        if self.token_counter not in self._phase_counters.values():
+            self.token_counter = self._default_counter
+
     def set_current_phase(self, phase: str) -> None:
         """Switch token counter to the appropriate phase-specific model.
 

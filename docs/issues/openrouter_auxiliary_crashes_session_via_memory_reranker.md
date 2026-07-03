@@ -26,7 +26,7 @@ reranker crash. Regression gate passed. (The OpenRouter-aux crash → boots case
 k3d model to reproduce and is covered by unit tests.)
 (any session whose auxiliary model routes through OpenRouter never boots — agent pod
 crashes on startup, workspace is released, UI hangs forever on "Booting agent runtime")
-**Related:** `docs/issues/minimax_m3_think_tag_reasoning_leak_post_gateway.md` (the
+**Related:** `docs/done/minimax_m3_think_tag_reasoning_leak_post_gateway.md` (the
 investigation that triggered this — switching the aux to OpenRouter-minimax to A/B the
 reasoning leak is what surfaced the crash), `docs/features/agent_memory_overhaul.md`
 (reranker = overhaul Phase 3 / GATE B)
