@@ -30,7 +30,7 @@ For the impatient. Full reference is [The Migration System](#the-migration-syste
 2. **Create the file** as `migrations/<app|vector>/NNNN_short_snake_case_description.sql`. Use `.notx.sql` instead of `.sql` if and only if the migration uses a statement that can't run inside a transaction (e.g. `CREATE INDEX CONCURRENTLY`, `VACUUM`, `ALTER SYSTEM`).
 3. **Start from the [migration template](#migration-file-template)**: header block, `BEGIN;`/`COMMIT;`, `SET LOCAL` timeouts, lock-retry loop for any `ALTER TABLE`. Idempotent DDL (`IF EXISTS` / `IF NOT EXISTS`) as defense-in-depth.
 4. **Test locally** against a clone of the test DB: `pg_dump <test_db> | pg_restore -d local_scratch_db`, then `psql local_scratch_db -f migrations/<db>/NNNN_*.sql`. Watch the timing.
-5. **Push.** CI runs Squawk + a dry-run on `postgres:16` + a duplicate-prefix check. Review the squawk findings before merging.
+5. **Push.** CI runs Squawk (on the migrations *you* changed) + a from-zero dry-run on `pgvector/pgvector:pg15` + the schema-artifact drift gate + a duplicate-prefix check. Review any squawk findings before merging.
 6. **Deploy.** The orchestrator picks the file up at startup, applies it under the advisory lock, records it in `schema_migrations`. No further action needed.
 
 If you're making a **breaking change** (rename, type change, drop, NOT NULL on existing data, normalize, …): stop. Read [The Expand-Contract Pattern](#the-expand-contract-pattern) and split it across releases. The runner doesn't save you from a migration that breaks the running code.
@@ -292,15 +292,7 @@ Regardless of framework, add **Squawk** to CI. It's a static analyzer for Postgr
 - Column drops without verification
 - `ALTER COLUMN TYPE` without the dual-column pattern
 
-The `.github/workflows/db-migrations.yml` job already wires this in alongside `.squawk.toml` at the repo root:
-
-```yaml
-- uses: sbdchd/squawk-action@v2
-  with:
-    pattern: "orchestrator/database/migrations/**/*.sql"
-    config:  ".squawk.toml"
-    fail-on-violations: true
-```
+The `.github/workflows/db-migrations.yml` job wires this in alongside `.squawk.toml` at the repo root. It lints **only the migrations a push/PR adds or modifies** (`git diff --diff-filter=AM` against the base), never the frozen already-applied history — those files can't be edited (the runner's checksum guard rejects drift), so re-linting them would only pile up unactionable findings and keep the job permanently red. See [§Testing & CI](#testing--ci) for the active rule set and mechanics.
 
 ### Recommendation
 
@@ -651,73 +643,28 @@ Migration PRs run through a fixed gate before merge.
 
 **1. Static lint via [Squawk](https://github.com/sbdchd/squawk).**
 
-Squawk catches the high-impact lock and breakage rules. Enable as errors:
-`require-concurrent-index-creation`, `ban-concurrent-index-creation-in-transaction`, `constraint-missing-not-valid`, `adding-not-nullable-field`, `adding-field-with-default`, `changing-column-type`, `disallowed-unique-constraint`, `adding-foreign-key-constraint`, `require-timeout-settings`, `renaming-column`, `renaming-table`, `ban-drop-column`, `ban-drop-table`.
+Squawk catches the high-impact lock and breakage rules (non-concurrent index creation, missing `NOT VALID`, unsafe constraint/FK adds, drops, renames, column-type changes). The active set is everything `.squawk.toml` doesn't exclude. Two categories are excluded there:
 
-Disable the stylistic ones (`prefer-bigint-over-int`, `prefer-text-field`) — too noisy.
+- **Stylistic** (`prefer-bigint-over-int`, `prefer-text-field`) — too noisy.
+- **`require-timeout-settings`** — unsatisfiable for our runner. `.notx.sql` files (CREATE/DROP INDEX CONCURRENTLY) must be a *single* statement, so a `SET lock_timeout` / `SET statement_timeout` can't precede the operation in-file. Timeout safety is a deploy-model concern instead (serialized, advisory-locked runner; moderate table sizes).
+
+`ban-drop-table` / `ban-drop-column` stay enabled as a deliberate-destructive-op guard; acknowledge a genuine intentional drop with an inline `-- squawk-ignore ban-drop-column` on the statement.
+
+Crucially, the job lints **only the migrations changed by the push/PR** (not the whole tree) and runs the pinned squawk binary directly — applied migrations are frozen (checksum guard), so re-linting them would keep CI permanently red on findings nobody can act on.
 
 **2. Dry-run against an ephemeral DB.**
 
-CI spins up a fresh `postgres:16` service container, applies all migrations from scratch, and runs a smoke test (health endpoint plus a representative read). Catches migrations that pass Squawk but fail at runtime — most commonly mismatched constraint names or column references.
+CI spins up a fresh `pgvector/pgvector:pg15` service container (the prod major for the app + vector DBs), applies every migration from zero, and rolls the transactional pass back. Catches migrations that pass Squawk but fail at runtime — most commonly mismatched constraint names or column references. (`.notx.sql` files are skipped under `--dry-run`; the artifact gate below applies them for real.)
 
 **3. Uniqueness check.**
 
 CI fails if two migration files share a `NNNN_` prefix.
 
-```yaml
-# .github/workflows/db-migrations.yml
-name: db-migrations
-on:
-  pull_request:
-    paths: ['orchestrator/database/migrations/**.sql']
+The live workflow (`.github/workflows/db-migrations.yml`) is the source of truth — it carries these jobs with inline rationale, so this doc no longer duplicates the YAML. It triggers on both `push` (develop/main) and `pull_request`, path-filtered to the migrations, the runner, the schema artifacts, `scripts/schema-snapshot.sh`, and `.squawk.toml`.
 
-jobs:
-  squawk:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: sbdchd/squawk-action@v2
-        with:
-          pattern: "orchestrator/database/migrations/**/*.sql"
-          version: "latest"
-          fail_on_violations: true
+**4. Schema-artifact drift gate (built).**
 
-  dry-run:
-    runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_PASSWORD: ci
-        ports: ['5432:5432']
-        options: >-
-          --health-cmd="pg_isready" --health-interval=5s
-          --health-timeout=3s --health-retries=10
-    steps:
-      - uses: actions/checkout@v4
-      - run: pip install asyncpg
-      - run: python -m orchestrator.database.migrate --dry-run
-        env:
-          DATABASE_URL: postgresql://postgres:ci@localhost:5432/postgres
-
-  uniqueness:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: No duplicate migration prefixes
-        run: |
-          set -euo pipefail
-          for d in orchestrator/database/migrations/*/; do
-            if ls "$d"*.sql >/dev/null 2>&1; then
-              dupes=$(ls "$d"*.sql | xargs -n1 basename | awk -F_ '{print $1}' | sort | uniq -d)
-              if [ -n "$dupes" ]; then echo "duplicate prefix(es) in $d: $dupes"; exit 1; fi
-            fi
-          done
-```
-
-**4. Drift detection (deferred).**
-
-Once stable on the new system, add a nightly job that runs `pg_dump --schema-only` from prod and compares to a checked-in snapshot generated by running all migrations against a fresh DB. Fail on non-empty diff. [Atlas's `atlas schema diff`](https://atlasgo.io/declarative/diff) is the polished tool if hand-rolling becomes painful.
+`scripts/schema-snapshot.sh` replays every migration from zero into throwaway prod-major containers (app/vector `pgvector/pgvector:pg15`, audit `postgres:16`), dumps `--schema-only`, and normalizes; the result is committed as `orchestrator/database/*_current.sql`. CI regenerates and fails on any diff from what's committed — so a migration can't land without regenerating the schema of record, and a hand-edited artifact is caught too. **Still deferred:** a nightly job comparing the *production* schema to the artifacts, to catch out-of-band manual changes to prod. [Atlas's `atlas schema diff`](https://atlasgo.io/declarative/diff) is the polished tool if hand-rolling that becomes painful.
 
 **5. pgTAP assertions (optional, per migration).**
 

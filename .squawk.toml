@@ -13,6 +13,15 @@ pg_version = "16.0"
 excluded_rules = [
     "prefer-bigint-over-int",
     "prefer-text-field",
+    # Unsatisfiable for our runner model. `.notx.sql` migrations
+    # (CREATE/DROP INDEX CONCURRENTLY) must be a SINGLE statement: the runner
+    # sends each file as one simple-query, so a multi-statement file would put
+    # CONCURRENTLY inside an implicit transaction and fail. That makes it
+    # impossible to precede the op with `SET lock_timeout` / `SET
+    # statement_timeout` in-file. Timeout safety is instead a deploy-model
+    # concern (serialized, advisory-locked runner; moderate table sizes).
+    # Revisit if we ever alter hot, high-volume tables online.
+    "require-timeout-settings",
 ]
 
 # Files excluded from lint coverage. Two categories:
