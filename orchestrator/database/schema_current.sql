@@ -2175,6 +2175,13 @@ CREATE INDEX idx_jobs_diff_status_pending ON public.jobs USING btree (id) WHERE 
 
 
 --
+-- Name: idx_jobs_dispatchable; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_jobs_dispatchable ON public.jobs USING btree (priority DESC, created_at) WHERE ((assigned_agent_id IS NULL) AND (freeze_data IS NULL) AND ((status)::text = ANY ((ARRAY['created'::character varying, 'paused'::character varying])::text[])));
+
+
+--
 -- Name: idx_jobs_parent_job_id; Type: INDEX; Schema: public; Owner: -
 --
 
