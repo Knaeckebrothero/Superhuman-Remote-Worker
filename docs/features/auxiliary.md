@@ -204,6 +204,14 @@ Accepts an optional `summarization_prompt` override (rendered from the config's 
 
 Replaces the curator subjob. Runs inline via `curate_and_store_knowledge()` in `archive_phase`.
 
+> **Refactor planned (2026-07-03):** this task stopped at "one ungated extract-and-write
+> pass" and is the entry point of the KB noise findings (F33/F38 in [[loop_review]]).
+> Next shape: mirror the memory auxiliaries' pipeline ([[agent_memory_overhaul]]) —
+> extraction → ingestion-verdict gate (add/update/supersede/discard vs. nearest
+> neighbors) before any `kb_write`, gardener verbs (`kb_lint`/`kb_index`/dedup/TTL) as
+> the tool surface, `src/services/knowledge/` package shape. See
+> [[okf_knowledge_base]] §3.
+
 ```python
 class CurationResult(BaseModel):
     notes_created: int
