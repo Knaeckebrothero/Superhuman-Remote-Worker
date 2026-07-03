@@ -1,4 +1,4 @@
-import {Component, computed, effect, ElementRef, inject, input, output, signal, ViewChild} from '@angular/core';
+import {Component, computed, effect, ElementRef, inject, input, output, signal, viewChild, ViewChild} from '@angular/core';
 import {Datasource, EffectiveModels} from '../../core/models/api.model';
 import {ViewportService} from '../../core/services/viewport.service';
 import {SettingsMode} from './agent-settings.types';
@@ -79,6 +79,7 @@ type AgentSettingsTab = 'settings' | 'instructions' | 'advanced' | 'resolved';
             [disabled]="disabled()"
             [settingsMatrix]="settingsMatrix()"
             [effectiveModels]="effectiveModels()"
+            [showSubagent]="delegationEnabled()"
             (change)="onChange()"
           />
           <app-tools-group
@@ -240,6 +241,18 @@ export class AgentSettingsComponent {
   @ViewChild(InstructionsTabComponent) instructionsTab?: InstructionsTabComponent;
   @ViewChild(AdvancedAccordionComponent) advancedAccordion?: AdvancedAccordionComponent;
   @ViewChild('tabContent') private tabContentEl?: ElementRef<HTMLElement>;
+
+  /** Signal-based mirror of {@link toolsGroup} — a plain @ViewChild isn't
+   *  reactive, so gating the Subagent model picker on the live Delegation
+   *  toggle needs this to re-run the computed when the toggle (or the query
+   *  itself) resolves. */
+  private readonly toolsGroupQuery = viewChild(ToolsGroupComponent);
+  /** The Subagent (delegation reader) model only applies when the Delegation
+   *  tool is enabled — hide its picker otherwise. Shown until the view resolves
+   *  (delegation defaults on for the experts that use it). */
+  readonly delegationEnabled = computed(() =>
+    this.toolsGroupQuery()?.isCategoryEnabled('delegation') ?? true,
+  );
 
   readonly activeTab = signal<AgentSettingsTab>('settings');
 

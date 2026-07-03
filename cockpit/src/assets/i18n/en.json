@@ -1949,6 +1949,7 @@
       "preset": "Preset",
       "strategic": "Strategic",
       "tactical": "Tactical",
+      "subagent": "Subagent",
       "single": "Model",
       "default": "Default",
       "defaultResolved": "{{model}} ({{source}})",
