@@ -1,7 +1,14 @@
 # MiniMax-M3 reasoning arrives as mangled `<think>` content after gateway removal
 
-**Status:** investigated 2026-07-03 (homelab evidence) · **Severity:** high (every MiniMax
-turn renders broken; titles corrupted; live sessions show duplicated text)
+**Status:** FIX IMPLEMENTED + VERIFIED 2026-07-03 (uncommitted, develop) — family
+`settings.extra_body` passthrough (loader + matrix `reasoning_split: true` for
+`minimax`/`minimax-m3`), verified by unit tests, a live wire test through
+`create_llm` (clean content + captured reasoning), and a fresh k3d MiniMax
+session. Contaminated titles repaired on k3d + homelab. Remaining follow-ups:
+per-model `params_json.extra_body` escape hatch, `reasoning_details` history
+replay for interleaved-thinking quality in loops.
+Investigated 2026-07-03 (homelab evidence) · confirmed provider-side by raw
+wire probe + OpenRouter A/B (see "Wire probe verdict" below).
 **Related:** `docs/issues/remove_litellm_proxy_and_gateway_concept.md`,
 `docs/issues/session_model_switch_stale_context_manager_empty_response.md`
 
@@ -50,6 +57,79 @@ turn renders broken; titles corrupted; live sessions show duplicated text)
   have no reasoning at all (19–53 completion tokens, pure tool calls). M3 only
   emits thinking when it "decides" to, so many turns look fine.
 
+## Wire probe verdict (2026-07-03): it's MiniMax's API format, not our endpoint handling
+
+Raw `httpx` POST from the orchestrator pod straight to `https://api.minimax.io/v1/chat/completions`
+(key decrypted from `llm_endpoints`, no SRW LLM code in the path), title-style prompt:
+
+- **Non-streaming**: `message` keys are `['audio_content', 'content', 'name', 'role']` —
+  **no `reasoning_content`, no `reasoning`, nothing structured**. The reasoning arrives
+  only as `<think>…` inside `content` (1815 chars), even though
+  `usage.completion_tokens_details.reasoning_tokens: 165` is counted separately.
+  This is the path title generation uses (`ainvoke`) → there is literally nothing to
+  capture; the leak is unavoidable without client-side tag parsing.
+- **Streaming**: delta keys are `['content', 'reasoning', 'role']` and **every reasoning
+  fragment is delivered twice** — identical text in `delta.reasoning` AND in
+  `delta.content` (content additionally carrying the `<think>` wrapper). Our SSE tap
+  correctly captures `delta.reasoning` (→ thinking frames); the duplicated content
+  deltas are what the token stream renders. This is the interleaved duplication seen
+  in the cockpit, confirmed on the wire.
+- **OpenRouter A/B (user test, k3d)**: same model via OpenRouter
+  (`openrouter/minimax/minimax-m3`) → clean title "Rare Earth Metal Price Inquiry"
+  (thread `e0ae3b75`); via MiniMax direct → leaky `<think>` title (thread `6a7b2a6c`).
+  OpenRouter normalizes: strips tags from content, populates `reasoning`.
+
+## THE FIX (web-verified + probe-verified 2026-07-03): send `reasoning_split: true`
+
+MiniMax's official OpenAI-compatible API docs
+(https://platform.minimax.io/docs/api-reference/text-openai-api) document a
+**`reasoning_split`** request parameter (applies to M3/M2.7/M2.5/M2.1/M2):
+
+- **omitted/false (default)**: thinking arrives inside `content` wrapped in
+  `<think>` tags — the leak is their *documented default*, deliberate so that
+  clients replaying raw content preserve interleaved thinking across tool turns.
+- **true**: thinking is separated into `reasoning_content` + `reasoning_details`;
+  content stays clean. `reasoning_split` only controls formatting, not whether
+  the model thinks (`thinking: {"type": "adaptive"|"disabled"}` controls that).
+
+Probe from the orchestrator pod with `"reasoning_split": true` confirms:
+
+- non-streaming: message keys gain `reasoning_content` + `reasoning_details`,
+  `content` = pure answer;
+- streaming: delta keys `['content', 'reasoning_content', 'reasoning_details',
+  'role']` — reasoning only in structured fields, **no duplication**;
+- tool-call turn: clean content + `tool_calls`, reasoning separate — and the
+  **doubled `</think>` disappears** (without split it reproduces
+  deterministically on tool-call turns: `'<think>\n…\n</think>\n\n</think>'`).
+
+Both fields are already parsed by `_extract_reasoning_from_response` /
+`_extract_reasoning_from_delta` in `src/llm/reasoning_chat.py`, so the fix is:
+**inject `reasoning_split: true` (extra_body) for minimax-family models** —
+e.g. via `config/model_config_matrix.yaml` family params or the model catalog
+`params_json`.
+
+Ecosystem context: the default format bites other agents too — qwen-code
+(QwenLM/qwen-code#3387: "OpenAI-compatible MiniMax responses leak `<think>`
+blocks into visible output"), opencode (anomalyco/opencode#3555), and
+MiniMax-AI/MiniMax-M2#105 ("SSE streaming — thinking tags mixed in content",
+open, no maintainer response). Genuinely MiniMax-side bugs regardless of mode:
+the doubled `</think>` in no-split tool turns, the no-split streaming
+double-delivery (`delta.reasoning` + tagged `delta.content`), and eaten spaces
+at segment boundaries ("Ishould", "tounderstand") which persist even in split
+reasoning text (cosmetic there).
+
+**Implementation caveat — history replay:** MiniMax docs require the complete
+assistant response (including thinking) to be replayed within a tool-call turn
+for interleaved-thinking performance: with split on, that means passing
+`reasoning_details`/`reasoning_content` back on assistant history messages (or
+accepting the quality hit, as OpenRouter-routed usage does today unless clients
+replay `reasoning_details`). Decide per surface: loops/worker (quality matters,
+long tool chains) vs aux/title (irrelevant — one-shot).
+
+Routing MiniMax through OpenRouter also works (normalizes to `reasoning`
+field; verified by A/B), but the loops run on the MiniMax **Token Plan**
+(coding-plan pricing, direct API only), so the parameter fix is the real one.
+
 ## Root cause (our side)
 
 The LiteLLM gateway used to normalize MiniMax's think-tag format into
@@ -67,30 +147,20 @@ codebase has **no `<think>`-tag handling anywhere**:
   `response.content.strip()[:100]` — verbatim aux output, blind mid-word
   truncation → reasoning becomes the title.
 
-## Fix proposal (layered)
+## Fix proposal (revised after `reasoning_split` discovery)
 
-1. **Wire-layer normalization** (primary): add a `strip_think_tags(text) ->
-   (clean_text, reasoning)` helper in `src/llm/` and apply it in
-   `ReasoningChatOpenAI._post_process_result` for the non-streaming path:
-   move think-block text into `additional_kwargs["reasoning_content"]`
-   (append to any structured capture, dedupe if identical), drop orphan
-   `</think>` remnants. This also cleans what gets replayed in history and
-   what the archiver persists.
-2. **Streaming path**: content deltas can split tags across chunks. Options:
-   (a) small state machine filtering the content token stream when the model
-   family is flagged think-tag-emitting; (b) minimum viable: post-merge
-   sanitation of the final message before persistence + suppress content
-   deltas while the accumulated content is inside an unclosed `<think>`.
-   Since MiniMax double-delivers (structured deltas + tagged content), simply
-   *dropping* think-tagged content spans loses nothing — the sink already
-   streams the reasoning live.
-3. **Aux hygiene**: use the same helper in `_generate_title` (and any other
-   aux consumers — memory extraction, observer prompts) before using aux
-   output; for titles, prefer text after the last `</think>`, and truncate on
-   word boundary.
-4. **Config gate**: a `content_think_tags: true` flag on the `minimax` family
-   in `config/model_config_matrix.yaml` to scope the parser (harmless if
-   applied globally — the tags have no legitimate use in content).
+1. **Primary: `reasoning_split: true` for minimax-family requests** (see "THE
+   FIX" above) — one extra_body param; existing capture layer handles the
+   split fields. Wire it through the family params in
+   `config/model_config_matrix.yaml` / catalog `params_json`, main + auxiliary
+   paths.
+2. **Defense-in-depth: `strip_think_tags(text) -> (clean_text, reasoning)`**
+   helper in `src/llm/`, applied in `ReasoningChatOpenAI._post_process_result`
+   — covers any other provider/self-hosted model that emits tags in content
+   (vLLM without a reasoning parser, future models), and MiniMax regressions.
+3. **Aux hygiene**: apply the helper in `_generate_title` (and other aux
+   consumers) before using aux output; truncate titles on word boundary.
+4. **History replay decision** for interleaved thinking (see caveat above).
 5. **Repair pass**: `UPDATE threads SET title = 'Untitled Session' WHERE title
    LIKE '<think>%'` (or regenerate) for the contaminated rows.
 

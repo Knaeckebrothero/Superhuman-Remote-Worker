@@ -538,7 +538,13 @@ def resolve_model_settings(
 # Inference params that are family-bound and must be resolved per phase model
 # (NOT inherited from the base/primary slot). multimodal is handled separately
 # because it is reconciled to the AND across phases, not taken per-family.
-_PHASE_PARAM_KEYS = ("temperature", "top_p", "top_k", "parallel_tool_calls")
+_PHASE_PARAM_KEYS = (
+    "temperature",
+    "top_p",
+    "top_k",
+    "parallel_tool_calls",
+    "extra_body",
+)
 
 
 def resolve_phase_model_budget(
@@ -1248,6 +1254,9 @@ class PhaseLLMOverride:
     parallel_tool_calls: Optional[bool] = None
     max_output_tokens: Optional[int] = None
     model_max_context_tokens: Optional[int] = None
+    # Provider-specific request-body params (merged into the factory's
+    # extra_body; family settings-matrix `extra_body` resolves here per phase).
+    extra_body: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -1298,6 +1307,11 @@ class LLMConfig:
     model_max_context_tokens: Optional[int] = (
         None  # Per-model context window limit (falls back to limits.model_max_context_tokens)
     )
+    # Provider-specific request-body params merged into the request's
+    # extra_body (e.g. MiniMax `reasoning_split`). Populated from the family
+    # settings matrix (`settings.extra_body`) or explicit config; declared
+    # values win over factory-computed extra_body entries.
+    extra_body: Optional[Dict[str, Any]] = None
 
     # Phase-specific overrides (optional)
     strategic: Optional[PhaseLLMOverride] = None
@@ -1365,6 +1379,9 @@ class LLMConfig:
             model_max_context_tokens=override.model_max_context_tokens
             if override.model_max_context_tokens is not None
             else self.model_max_context_tokens,
+            extra_body=override.extra_body
+            if override.extra_body is not None
+            else self.extra_body,
             # Phase overrides not inherited to resolved config
             strategic=None,
             tactical=None,
@@ -1867,6 +1884,7 @@ def _parse_phase_override(data: Optional[Dict[str, Any]]) -> Optional[PhaseLLMOv
         parallel_tool_calls=data.get("parallel_tool_calls"),
         max_output_tokens=data.get("max_output_tokens"),
         model_max_context_tokens=data.get("model_max_context_tokens"),
+        extra_body=data.get("extra_body"),
     )
 
 
@@ -1895,6 +1913,7 @@ def _parse_llm_config(llm_data: Dict[str, Any]) -> LLMConfig:
         parallel_tool_calls=llm_data.get("parallel_tool_calls", False),
         max_output_tokens=llm_data.get("max_output_tokens"),
         model_max_context_tokens=llm_data.get("model_max_context_tokens"),
+        extra_body=llm_data.get("extra_body"),
         # Phase-specific overrides
         strategic=_parse_phase_override(llm_data.get("strategic")),
         tactical=_parse_phase_override(llm_data.get("tactical")),
@@ -3029,6 +3048,13 @@ def _create_openai_llm(
         _set_nested(extra_body, _param, _tval)
         reasoning_mode = f"chat_template({_param}={_tval})"
 
+    # Declared provider params (family settings-matrix `extra_body`, e.g.
+    # MiniMax `reasoning_split: true` so thinking arrives in reasoning_content/
+    # reasoning_details instead of `<think>` tags inside content). Merged last:
+    # declared values win over factory-computed entries.
+    if config.extra_body:
+        extra_body = deep_merge(extra_body, config.extra_body)
+
     # Add timeout if specified
     if config.timeout is not None:
         llm_kwargs["timeout"] = _resolve_timeout(config, limits)
@@ -3353,6 +3379,13 @@ def _create_openrouter_llm(
     # top_k is likewise non-standard for the typed Chat Completions signature.
     if config.top_k is not None:
         extra_body["top_k"] = config.top_k
+
+    # Declared provider params (family settings-matrix `extra_body`) — same
+    # merge as the openai factory. OpenRouter passes unknown params through to
+    # the underlying provider (verified harmless for e.g. MiniMax
+    # `reasoning_split`; OpenRouter normalizes reasoning either way).
+    if config.extra_body:
+        extra_body = deep_merge(extra_body, config.extra_body)
 
     # Build kwargs for ReasoningChatOpenAI
     llm_kwargs = {
