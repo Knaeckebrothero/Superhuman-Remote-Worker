@@ -488,7 +488,7 @@ class TestGraftSubjobOutput:
                 }.get(j)
             )
             db.update_job_merge_status = AsyncMock()
-            db.update_job_context = AsyncMock()
+            db.merge_job_context = AsyncMock()
 
             result = await orch_main._graft_subjob_output("sub-uuid-1234abcd")
 
@@ -534,7 +534,7 @@ class TestGraftSubjobOutput:
                 }.get(j)
             )
             db.update_job_merge_status = AsyncMock()
-            db.update_job_context = AsyncMock()
+            db.merge_job_context = AsyncMock()
 
             result = await orch_main._graft_subjob_output("sub-uuid-1234abcd")
 
@@ -557,7 +557,7 @@ class TestGraftSubjobOutput:
                 }.get(j)
             )
             db.update_job_merge_status = AsyncMock()
-            db.update_job_context = AsyncMock()
+            db.merge_job_context = AsyncMock()
 
             result = await orch_main._graft_subjob_output("sub-uuid-1234abcd")
 
@@ -582,7 +582,7 @@ class TestGraftSubjobOutput:
                 }.get(j)
             )
             db.update_job_merge_status = AsyncMock()
-            db.update_job_context = AsyncMock()
+            db.merge_job_context = AsyncMock()
 
             result = await orch_main._graft_subjob_output("sub-uuid-1234abcd")
 
@@ -611,7 +611,7 @@ class TestGraftSubjobOutput:
                 }.get(j)
             )
             db.update_job_merge_status = AsyncMock()
-            db.update_job_context = AsyncMock()
+            db.merge_job_context = AsyncMock()
 
             result = await orch_main._graft_subjob_output("sub-uuid-1234abcd")
 
@@ -620,7 +620,7 @@ class TestGraftSubjobOutput:
         assert result["output_path"] == "outputs/001-scholar-sub-uuid"
         # No second ordinal folder created; context not rewritten.
         assert not any(k.startswith("outputs/002-") for k in fake.trees["main"])
-        db.update_job_context.assert_not_called()
+        db.merge_job_context.assert_not_called()
 
 
 class TestCompletionGraftWiring:
@@ -690,7 +690,7 @@ class TestScholarOutputPointer:
             db.get_job = AsyncMock(
                 side_effect=lambda j: {"sch-1": scholar_fresh, "par-1": parent}.get(j)
             )
-            db.update_job_context = AsyncMock(side_effect=upd_ctx)
+            db.merge_job_context = AsyncMock(side_effect=upd_ctx)
             db.update_job_status = AsyncMock()
             with patch(f"{MODULE}._trigger_dispatch"):
                 await orch_main._handle_scholar_completion(scholar_in_memory, [])
@@ -738,7 +738,7 @@ class TestDelegationOutputPathPopulation:
             db.all_delegation_children_terminal = AsyncMock(return_value=True)
             db.get_job = AsyncMock(side_effect=lambda j: {"par-1": parent}.get(j))
             db.get_delegation_children = AsyncMock(return_value=children)
-            db.update_job_context = AsyncMock(side_effect=upd_ctx)
+            db.merge_job_context = AsyncMock(side_effect=upd_ctx)
             db.update_job_status = AsyncMock()
             with patch(f"{MODULE}._trigger_dispatch"):
                 await orch_main._handle_delegation_child_completion(job, [])

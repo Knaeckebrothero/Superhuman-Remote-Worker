@@ -507,9 +507,7 @@ async def _graft_subjob_output(job_id: str) -> dict[str, Any] | None:
         return {"status": "error", "reason": "write-failed"}
 
     await postgres_db.update_job_merge_status(job_id, merge_status="grafted")
-    new_ctx = dict(ctx)
-    new_ctx["graft_output_path"] = dest
-    await postgres_db.update_job_context(job_id, new_ctx)
+    await postgres_db.merge_job_context(job_id, {"graft_output_path": dest})
 
     logger.info(
         f"Grafted subjob {short_id}/{config_name} output ({len(files)} files) "
@@ -2621,7 +2619,10 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
                 )
                 return False
 
-        # Extract queued feedback (stored by resume endpoint when no agent was available)
+        # Extract queued feedback (stored by the resume endpoint when no agent
+        # was available). The pop only mutates this local copy — the DB keys are
+        # dropped AFTER the agent accepts (below), so a rejected resume no longer
+        # permanently loses the feedback/delegation payload.
         job_context = job.get("context") or {}
         if isinstance(job_context, str):
             job_context = json.loads(job_context)
@@ -2640,14 +2641,6 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
             resume_payload["feedback"] = queued_feedback
         if delegation_results:
             resume_payload["delegation_results"] = delegation_results
-        # Clean up consumed context keys so they're not re-injected on retry
-        if queued_feedback or delegation_results:
-            async with postgres_db.acquire() as conn:
-                await conn.execute(
-                    "UPDATE jobs SET context = $1::jsonb WHERE id = $2::uuid",
-                    json.dumps(job_context),
-                    job_id,
-                )
 
         agent_url = f"http://{agent['pod_ip']}:{agent['pod_port']}/job/resume"
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -2661,6 +2654,20 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
                 f"Dispatch: agent {agent_id} rejected resume for job {job_id}: {response.text}"
             )
             return False
+
+        # Agent accepted — now atomically drop the keys we consumed so a future
+        # resume won't re-inject them. `context - text[]` (not a full-dict
+        # rewrite) preserves any concurrent merge into other context keys.
+        consumed_keys = [
+            key
+            for key, value in (
+                ("queued_feedback", queued_feedback),
+                ("delegation_results", delegation_results),
+            )
+            if value
+        ]
+        if consumed_keys:
+            await postgres_db.delete_job_context_keys(job_id, consumed_keys)
 
         # Update job status and assign to agent
         await postgres_db.update_job_status(
@@ -7480,23 +7487,18 @@ async def _route_inbound_reply(
         except Exception as e:
             logger.warning("LLM triage failed, falling through to queue: %s", e)
 
-    # Default: queue for next strategic phase
-    job_context = job.get("context") or {}
-    if isinstance(job_context, str):
-        try:
-            job_context = json.loads(job_context)
-        except json.JSONDecodeError:
-            job_context = {}
-    queued_replies = job_context.get("queued_replies", [])
-    queued_replies.append(
+    # Default: queue for next strategic phase. Atomic array append so two
+    # concurrent inbound replies both land — the old read-modify-write full-dict
+    # rewrite lost one of a racing pair (its RMW window spans the LLM triage
+    # call above).
+    await postgres_db.append_queued_reply(
+        job_id,
         {
             "thread_id": thread_id,
             "message": message,
             "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
+        },
     )
-    job_context["queued_replies"] = queued_replies
-    await postgres_db.update_job_context(job_id, job_context)
 
     # Broadcast reply_delivered to cockpit SSE
     try:
@@ -8399,19 +8401,9 @@ async def resume_job(
             """
             feedback = request.feedback if request else None
             if feedback:
-                ctx = job.get("context") or {}
-                if isinstance(ctx, str):
-                    try:
-                        ctx = json.loads(ctx)
-                    except json.JSONDecodeError:
-                        ctx = {}
-                ctx["queued_feedback"] = feedback
-                async with postgres_db.acquire() as conn:
-                    await conn.execute(
-                        "UPDATE jobs SET context = $1::jsonb WHERE id = $2::uuid",
-                        json.dumps(ctx),
-                        job_id,
-                    )
+                await postgres_db.merge_job_context(
+                    job_id, {"queued_feedback": feedback}
+                )
             async with postgres_db.acquire() as conn:
                 await conn.execute(
                     "UPDATE jobs SET status = 'paused', assigned_agent_id = NULL, "
@@ -8858,32 +8850,33 @@ async def upgrade_job_to_vm(request: Request, job_id: str) -> dict[str, Any]:
                 detail="VM provisioner is not available. Cannot upgrade to VM.",
             )
 
-        # 4. Set context.vm.requested = true
-        job_context = job.get("context") or {}
-        if isinstance(job_context, str):
-            try:
-                job_context = json.loads(job_context)
-            except json.JSONDecodeError:
-                job_context = {}
-
-        vm_ctx = job_context.setdefault("vm", {})
-        vm_ctx["requested"] = True
-        vm_ctx["upgrade_from"] = "container"
-        vm_ctx["upgrade_command"] = frozen_data.get("command", "")
+        # 4. Build the VM-request delta — merged into context.vm below so any
+        #    existing vm siblings are preserved.
+        vm_updates = {
+            "requested": True,
+            "upgrade_from": "container",
+            "upgrade_command": frozen_data.get("command", ""),
+        }
 
         # 5. Remove freeze file from local workspace
         local_frozen = workspace_service.base_path / "output" / "job_frozen.json"
         if local_frozen.exists():
             local_frozen.unlink()
 
-        # 6. Update DB: clear freeze, set status to paused (dispatchable),
-        #    unassign agent so dispatcher can re-dispatch
+        # 6. Update DB in ONE statement: merge the VM keys into context.vm, clear
+        #    freeze, set status to paused (dispatchable), unassign agent. Fused so
+        #    the context is visible the instant the status flips — a split would
+        #    open a dispatch window on half-written context.
         async with postgres_db.acquire() as conn:
             await conn.execute(
-                "UPDATE jobs SET context = $1::jsonb, status = 'paused', "
-                "freeze_data = NULL, assigned_agent_id = NULL, "
-                "updated_at = CURRENT_TIMESTAMP WHERE id = $2::uuid",
-                json.dumps(job_context),
+                "UPDATE jobs SET context = jsonb_set("
+                "        COALESCE(context, '{}'::jsonb), '{vm}', "
+                "        COALESCE(context->'vm', '{}'::jsonb) || $1::jsonb"
+                "    ), "
+                "    status = 'paused', freeze_data = NULL, "
+                "    assigned_agent_id = NULL, updated_at = CURRENT_TIMESTAMP "
+                "WHERE id = $2::uuid",
+                json.dumps(vm_updates),
                 job_id,
             )
 
@@ -8927,20 +8920,15 @@ async def _internal_resume_job(job_id: str, feedback: str) -> None:
         logger.warning(f"_internal_resume_job: job {job_id} not found")
         return
 
-    # Store feedback in context
-    job_context = job.get("context") or {}
-    if isinstance(job_context, str):
-        try:
-            job_context = json.loads(job_context)
-        except json.JSONDecodeError:
-            job_context = {}
-    job_context["queued_feedback"] = feedback
+    # Store feedback in context and flip to paused in ONE statement: the || merge
+    # keeps concurrent context keys, and fusing keeps the queued feedback visible
+    # the instant the job becomes dispatchable.
     async with postgres_db.acquire() as conn:
         await conn.execute(
-            "UPDATE jobs SET context = $1::jsonb, status = 'paused', "
-            "assigned_agent_id = NULL, updated_at = CURRENT_TIMESTAMP "
-            "WHERE id = $2::uuid",
-            json.dumps(job_context),
+            "UPDATE jobs SET context = COALESCE(context, '{}'::jsonb) || $1::jsonb, "
+            "status = 'paused', assigned_agent_id = NULL, "
+            "updated_at = CURRENT_TIMESTAMP WHERE id = $2::uuid",
+            json.dumps({"queued_feedback": feedback}),
             job_id,
         )
     logger.info(f"Queued job {job_id} for auto-dispatch with feedback")
@@ -9121,9 +9109,9 @@ async def _spawn_scholar_subjob(
                     parent_context = {}
             git_remote_url = parent_context.get("git_remote_url", "")
 
-            scholar_ctx = dict(scholar_context)
-            scholar_ctx["git_remote_url"] = git_remote_url
-            await postgres_db.update_job_context(scholar_job_id, scholar_ctx)
+            await postgres_db.merge_job_context(
+                scholar_job_id, {"git_remote_url": git_remote_url}
+            )
 
             # Set worktree_path if subjob inherits a workspace backend
             worktree_path = None
@@ -9193,17 +9181,10 @@ async def _handle_scholar_completion(
         )
         return
 
-    # Inject scholar metadata into parent context
-    parent_ctx = parent.get("context") or {}
-    if isinstance(parent_ctx, str):
-        try:
-            parent_ctx = json.loads(parent_ctx)
-        except (json.JSONDecodeError, ValueError):
-            parent_ctx = {}
-    parent_ctx = dict(parent_ctx)
-
+    # Inject scholar metadata into the parent context as a delta merge (only the
+    # keys this handler owns) so a concurrent sibling/critic write isn't clobbered.
     if is_failure:
-        parent_ctx["scholar_failed"] = True
+        ctx_delta: dict[str, Any] = {"scholar_failed": True}
         logger.warning(
             f"Scholar {job_id} {job_status} — unblocking parent {target_id} without research"
         )
@@ -9211,7 +9192,6 @@ async def _handle_scholar_completion(
             f"scholar {job_id} {job_status}, parent {target_id} unblocked (no research)"
         )
     else:
-        parent_ctx["scholar_completed"] = True
         # The graft (run earlier in complete_job) wrote graft_output_path to the
         # scholar's DB context; the in-memory `job` here predates that write, so
         # re-fetch to read the freshly-grafted outputs/ path (None if no output).
@@ -9222,11 +9202,14 @@ async def _handle_scholar_completion(
                 fresh_ctx = json.loads(fresh_ctx)
             except (json.JSONDecodeError, ValueError):
                 fresh_ctx = {}
-        parent_ctx["scholar_output_dir"] = (fresh_ctx or {}).get("graft_output_path")
+        ctx_delta = {
+            "scholar_completed": True,
+            "scholar_output_dir": (fresh_ctx or {}).get("graft_output_path"),
+        }
         logger.info(f"Scholar {job_id} completed — unblocking parent {target_id}")
         actions.append(f"scholar {job_id} completed, parent {target_id} unblocked")
 
-    await postgres_db.update_job_context(target_id, parent_ctx)
+    await postgres_db.merge_job_context(target_id, ctx_delta)
     await postgres_db.update_job_status(
         target_id, status="created", assigned_agent_id=""
     )
@@ -9318,17 +9301,12 @@ async def _handle_delegation_child_completion(
             }
         )
 
-    # Store results in parent context for resume injection
-    parent_ctx = parent.get("context") or {}
-    if isinstance(parent_ctx, str):
-        try:
-            parent_ctx = json.loads(parent_ctx)
-        except (json.JSONDecodeError, ValueError):
-            parent_ctx = {}
-    parent_ctx = dict(parent_ctx)
-    parent_ctx["delegation_results"] = child_results
-
-    await postgres_db.update_job_context(target_id, parent_ctx)
+    # Store results in the parent context for resume injection. Whole-key merge —
+    # a bounded rebuild from DB children, so a concurrent sibling writer is a
+    # harmless duplicate write, never a lost update.
+    await postgres_db.merge_job_context(
+        target_id, {"delegation_results": child_results}
+    )
 
     # Unblock parent: waiting → paused (dispatcher picks it up via /job/resume,
     # preserving checkpoint state from before delegation).
@@ -9460,20 +9438,17 @@ async def _check_delegation_timeouts() -> int:
                     }
                 )
 
-            parent_ctx = {}
-            raw_ctx = row.get("context")
-            if raw_ctx:
-                if isinstance(raw_ctx, str):
-                    try:
-                        parent_ctx = json.loads(raw_ctx)
-                    except (json.JSONDecodeError, ValueError):
-                        parent_ctx = {}
-                else:
-                    parent_ctx = dict(raw_ctx)
-
-            parent_ctx["delegation_results"] = child_results
-            parent_ctx["delegation_timed_out"] = True
-            await postgres_db.update_job_context(job_id, parent_ctx)
+            # Whole-key merge (bounded rebuild from DB children) — same contract
+            # as the sibling completion writer; concurrent writers are harmless
+            # duplicates. Written before the status flip below so the dispatcher
+            # always resumes with delegation_results present.
+            await postgres_db.merge_job_context(
+                job_id,
+                {
+                    "delegation_results": child_results,
+                    "delegation_timed_out": True,
+                },
+            )
 
             # Atomically re-queue the parent (waiting → paused). Under the
             # transient dual-leader window two sweepers can both reach here for
@@ -9804,27 +9779,20 @@ async def _trigger_verification_on_complete(
     if critic_row:
         # Subsequent round: resume existing critic
         critic_id = str(critic_row["id"])
-        ctx_raw = critic_row.get("context")
-        if isinstance(ctx_raw, str):
-            try:
-                critic_context = json.loads(ctx_raw)
-            except (json.JSONDecodeError, ValueError):
-                critic_context = {}
-        else:
-            critic_context = ctx_raw or {}
 
-        new_round = critic_context.get("verification_round", 0) + 1
-        critic_context["verification_round"] = new_round
-        critic_context["deliverables"] = freeze_data.get("deliverables", [])
-        critic_context["summary"] = freeze_data.get("summary", "")
-        critic_context["confidence"] = freeze_data.get("confidence", 0)
-
-        async with postgres_db.acquire() as conn:
-            await conn.execute(
-                "UPDATE jobs SET context = $1::jsonb WHERE id = $2::uuid",
-                json.dumps(critic_context),
-                critic_id,
-            )
+        # Atomic round increment (mirrors increment_job_memory_retry) so racing
+        # completion handlers can't both read the same round and stall the
+        # counter. The freeze snapshot is a separate whole-key merge — no
+        # cross-key invariant ties it to the counter.
+        new_round = await postgres_db.increment_job_verification_round(critic_id)
+        await postgres_db.merge_job_context(
+            critic_id,
+            {
+                "deliverables": freeze_data.get("deliverables", []),
+                "summary": freeze_data.get("summary", ""),
+                "confidence": freeze_data.get("confidence", 0),
+            },
+        )
 
         logger.info(
             f"Resuming existing critic {critic_id} for job {job_id} (round {new_round})"
@@ -9949,9 +9917,9 @@ async def _trigger_verification_on_complete(
                         parent_context = {}
                 git_remote_url = parent_context.get("git_remote_url", "")
 
-                critic_ctx = dict(context)
-                critic_ctx["git_remote_url"] = git_remote_url
-                await postgres_db.update_job_context(critic_job_id, critic_ctx)
+                await postgres_db.merge_job_context(
+                    critic_job_id, {"git_remote_url": git_remote_url}
+                )
 
                 # Set worktree_path if subjob inherits a workspace backend
                 worktree_path = None
@@ -10521,16 +10489,19 @@ async def complete_job(
             logger.warning(
                 f"Job {job_id}: workspace unavailable — attempting VM recovery"
             )
-            # Set recovering flag *before* issuing delete to prevent re-entry
-            ctx = job.get("context") or {}
-            if isinstance(ctx, str):
-                ctx = json.loads(ctx)
-            ctx["vm"] = {
-                "requested": True,
-                "recovering": True,
-                "previous_error": "workspace_unavailable",
-            }
-            await postgres_db.update_job_context(job_id, ctx)
+            # Set recovering flag *before* issuing delete to prevent re-entry.
+            # Replace context.vm wholesale (recovery intentionally resets the vm
+            # object) via a top-level merge that preserves other context keys.
+            await postgres_db.merge_job_context(
+                job_id,
+                {
+                    "vm": {
+                        "requested": True,
+                        "recovering": True,
+                        "previous_error": "workspace_unavailable",
+                    }
+                },
+            )
 
             # Delete the old (crashed) VM
             if vm_ctx and vm_ctx.get("status") not in ("deleted", "deleting"):

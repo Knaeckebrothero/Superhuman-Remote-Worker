@@ -1386,31 +1386,6 @@ class PostgresDB:
 
         return [dict(row) for row in rows]
 
-    async def update_job_context(self, job_id: str, context: Dict[str, Any]) -> bool:
-        """Update the context JSONB column for a job.
-
-        Args:
-            job_id: Job UUID as string
-            context: New context dictionary
-
-        Returns:
-            True if updated, False if not found
-        """
-        import json as json_module
-
-        try:
-            uuid_val = UUID(job_id)
-        except ValueError:
-            return False
-
-        query = (
-            "UPDATE jobs SET context = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2"
-        )
-        async with self.acquire() as conn:
-            result = await conn.execute(query, json_module.dumps(context), uuid_val)
-
-        return result == "UPDATE 1"
-
     async def store_resolved_config(
         self, job_id: str, resolved_config: Dict[str, Any]
     ) -> bool:
@@ -1446,8 +1421,11 @@ class PostgresDB:
     async def merge_job_context(self, job_id: str, updates: Dict[str, Any]) -> bool:
         """Atomically merge updates into the job's context JSONB column.
 
-        Uses PostgreSQL's || operator for a top-level merge, avoiding the
-        read-modify-write race in update_job_context().
+        Uses PostgreSQL's || operator for a top-level merge — a single atomic
+        statement, immune to the read-modify-write lost-update race (a
+        concurrent merge into *other* keys is never clobbered). ``updates`` must
+        be a JSON object; ``|| $1`` only object-merges when both operands are
+        objects.
 
         Args:
             job_id: Job UUID as string
@@ -1471,6 +1449,81 @@ class PostgresDB:
         )
         async with self.acquire() as conn:
             result = await conn.execute(query, json_module.dumps(updates), uuid_val)
+
+        return result == "UPDATE 1"
+
+    async def delete_job_context_keys(self, job_id: str, keys: List[str]) -> bool:
+        """Atomically remove one or more top-level keys from ``jobs.context``.
+
+        Single-statement ``context - $1::text[]`` so a concurrent merge into
+        other keys is preserved (unlike a read-modify-write full-dict rewrite).
+        Removing an absent key is a no-op. Used to drain consumed keys such as
+        ``queued_feedback``/``delegation_results`` after an agent accepts a
+        resume.
+
+        Args:
+            job_id: Job UUID as string
+            keys: Top-level context keys to delete
+
+        Returns:
+            True if the row was updated, False if not found / id invalid / no keys
+        """
+        if not keys:
+            return False
+
+        try:
+            uuid_val = UUID(job_id)
+        except ValueError:
+            return False
+
+        query = (
+            "UPDATE jobs "
+            "SET context = COALESCE(context, '{}'::jsonb) - $1::text[], "
+            "    updated_at = CURRENT_TIMESTAMP "
+            "WHERE id = $2"
+        )
+        async with self.acquire() as conn:
+            result = await conn.execute(query, list(keys), uuid_val)
+
+        return result == "UPDATE 1"
+
+    async def append_queued_reply(self, job_id: str, reply: Dict[str, Any]) -> bool:
+        """Atomically append one reply object to ``context.queued_replies``.
+
+        Single-statement ``jsonb_set(..., arr || $1)`` so two concurrent inbound
+        replies both land (the old read-modify-write full-dict rewrite lost one
+        of a racing pair — its RMW window spanned an LLM triage call). Creates
+        the array when the key is absent; the ``COALESCE`` guards a NULL column.
+        Appending an object to an array yields the object as one element.
+        Validated on PG 15.17 (NULL column + missing key). See HF-3 in
+        docs/features/database_roadmap.md.
+
+        Args:
+            job_id: Job UUID as string
+            reply: Reply object to append (thread_id/message/timestamp)
+
+        Returns:
+            True if updated, False if not found / id invalid
+        """
+        import json as json_module
+
+        try:
+            uuid_val = UUID(job_id)
+        except ValueError:
+            return False
+
+        query = (
+            "UPDATE jobs "
+            "SET context = jsonb_set("
+            "        COALESCE(context, '{}'::jsonb), "
+            "        '{queued_replies}', "
+            "        COALESCE(context->'queued_replies', '[]'::jsonb) || $1::jsonb"
+            "    ), "
+            "    updated_at = CURRENT_TIMESTAMP "
+            "WHERE id = $2"
+        )
+        async with self.acquire() as conn:
+            result = await conn.execute(query, json_module.dumps(reply), uuid_val)
 
         return result == "UPDATE 1"
 
@@ -1501,6 +1554,33 @@ class PostgresDB:
         async with self.acquire() as conn:
             new_count = await conn.fetchval(query, uuid_val)
         return int(new_count) if new_count is not None else 0
+
+    async def increment_job_verification_round(self, job_id: str) -> int:
+        """Atomically increment ``context.verification_round`` and return it.
+
+        Single-statement read-and-increment (mirrors
+        :meth:`increment_job_memory_retry`) so racing completion handlers for the
+        same critic can't both read the same round and stall the counter.
+        Returns the new round, or 0 if the job was not found / id was invalid.
+        """
+        try:
+            uuid_val = UUID(job_id)
+        except ValueError:
+            return 0
+
+        query = (
+            "UPDATE jobs "
+            "SET context = jsonb_set("
+            "        COALESCE(context, '{}'::jsonb), '{verification_round}', "
+            "        to_jsonb(COALESCE((context->>'verification_round')::int, 0) + 1)"
+            "    ), "
+            "    updated_at = CURRENT_TIMESTAMP "
+            "WHERE id = $1 "
+            "RETURNING (context->>'verification_round')::int"
+        )
+        async with self.acquire() as conn:
+            new_round = await conn.fetchval(query, uuid_val)
+        return int(new_round) if new_round is not None else 0
 
     async def increment_job_llm_outage_attempt(
         self, job_id: str, *, now: datetime, reset_window_seconds: int
