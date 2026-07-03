@@ -16,7 +16,7 @@ import re
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Optional, Any, List, Dict
+from typing import Optional, Any, List, Dict, Tuple
 
 try:
     import asyncpg
@@ -607,6 +607,98 @@ class PostgresDB:
                 turn_number,
             )
         return {"id": str(row["id"]), "seq": row["seq"]}
+
+    async def save_thread_messages(
+        self, thread_id: str, messages: List[Dict[str, Any]]
+    ) -> None:
+        """Batch-upsert a turn's messages: one pipelined ``executemany`` + a
+        single ``threads`` bump.
+
+        Replaces the turn-complete reconcile's row-by-row ``save_thread_message``
+        loop (~2 round-trips per message) with 2 round-trips for the whole turn.
+        Each dict carries the same fields as :meth:`save_thread_message`'s kwargs;
+        a stable ``id`` makes the upsert land on the incremental row via
+        ``ON CONFLICT (id)``, and ``seq`` is preserved (assigned once on first
+        insert). No ``RETURNING`` — the reconcile never reads ``seq`` back, and
+        ``executemany`` discards results anyway.
+
+        The upsert runs inside a transaction so the whole turn reconciles
+        atomically. This batches ONLY the reconcile; the incremental mid-turn
+        persists still go through :meth:`save_thread_message` one at a time (the
+        crash-durability path). A no-op on an empty list.
+        """
+        if not messages:
+            return
+
+        def _dj(value: Any) -> Optional[str]:
+            return json.dumps(value) if value is not None else None
+
+        args: List[Tuple] = []
+        max_turn = 0
+        for m in messages:
+            turn_number = m.get("turn_number")
+            max_turn = max(max_turn, turn_number or 0)
+            args.append(
+                (
+                    _coerce_row_id(m.get("id")),
+                    thread_id,
+                    m["role"],
+                    m.get("content"),
+                    _dj(m.get("tool_calls")),
+                    turn_number,
+                    _dj(m.get("metrics")),
+                    m.get("tool_call_id"),
+                    m.get("thinking"),
+                    _dj(m.get("reasoning")),
+                    _dj(m.get("tool_results")),
+                    m.get("provider"),
+                    _dj(m.get("provider_raw")),
+                    _dj(m.get("additional_kwargs")),
+                    _dj(m.get("response_metadata")),
+                )
+            )
+
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                # Same upsert as save_thread_message, minus RETURNING. Each
+                # execution's ON CONFLICT is independent (executemany runs N
+                # separate commands), so distinct-id rows never collide.
+                await conn.executemany(
+                    """
+                    INSERT INTO thread_messages
+                        (id, thread_id, role, content, tool_calls, turn_number,
+                         metrics, tool_call_id, thinking,
+                         reasoning, tool_results, provider, provider_raw,
+                         additional_kwargs, response_metadata)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                            $13, $14, $15)
+                    ON CONFLICT (id) DO UPDATE SET
+                        content           = EXCLUDED.content,
+                        tool_calls        = EXCLUDED.tool_calls,
+                        turn_number       = EXCLUDED.turn_number,
+                        metrics           = EXCLUDED.metrics,
+                        tool_call_id      = EXCLUDED.tool_call_id,
+                        thinking          = EXCLUDED.thinking,
+                        reasoning         = EXCLUDED.reasoning,
+                        tool_results      = EXCLUDED.tool_results,
+                        provider          = EXCLUDED.provider,
+                        provider_raw      = EXCLUDED.provider_raw,
+                        additional_kwargs = EXCLUDED.additional_kwargs,
+                        response_metadata = EXCLUDED.response_metadata
+                    """,
+                    args,
+                )
+                # One activity/turn bump for the whole batch (was per-message).
+                await conn.execute(
+                    """
+                    UPDATE threads
+                    SET last_activity = CURRENT_TIMESTAMP,
+                        total_turns   = GREATEST(total_turns, COALESCE($2, 0))
+                    WHERE id = $1
+                    """,
+                    thread_id,
+                    max_turn,
+                )
 
     # =========================================================================
     # SYNC WRAPPERS (for scripts and other sync contexts)
