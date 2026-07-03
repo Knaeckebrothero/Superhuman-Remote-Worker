@@ -85,6 +85,14 @@ minimax:
     parallel_tool_calls: true
     model_max_context_tokens: 204800  # M2.7: 204,800 context, 131K max output
     max_output_tokens: 49152  # reasoning headroom (resolver clamps to ctx backstop)
+    # MiniMax's OpenAI-compatible API defaults to thinking inside `content`
+    # wrapped in <think> tags (+ a stray extra `</think>` on tool-call turns).
+    # reasoning_split moves it to reasoning_content/reasoning_details — fields
+    # the reasoning capture layer already parses. Harmless via OpenRouter
+    # (normalizes either way). See
+    # docs/issues/minimax_m3_think_tag_reasoning_leak_post_gateway.md
+    extra_body:
+      reasoning_split: true
 
 # MiniMax M3 (released 2026-06-01) — distinct family from `minimax` (M2.7) so
 # the two coexist. M3 ships the MSA sparse-attention architecture, a 1M-token
@@ -119,6 +127,12 @@ minimax-m3:
     model_max_context_tokens: 1000000  # M3: up to 1M context (>=512K guaranteed) via MSA
     max_output_tokens: 65536  # reasoning headroom (resolver clamps to ctx backstop)
     image_tokens: { mode: flat, flat: 1600 }  # no public per-image formula — calibrate via usage
+    # Same as the `minimax` family: without reasoning_split MiniMax's direct
+    # API returns thinking as <think> tags inside `content` (leaky titles,
+    # duplicated streaming text, stray double closer on tool-call turns).
+    # See docs/issues/minimax_m3_think_tag_reasoning_leak_post_gateway.md
+    extra_body:
+      reasoning_split: true
 
 o-series:
   reasoning: { method: effort_enum, delivery: native, default: high, options: [low, medium, high] }

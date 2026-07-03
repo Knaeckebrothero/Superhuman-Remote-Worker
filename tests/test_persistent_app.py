@@ -1173,12 +1173,12 @@ class TestGenerateTitle:
             AIMessage(content=[{"type": "image_url", "image_url": {"url": "x"}}]),
         ]
         mock_llm = MagicMock()
-        mock_llm.llm = AsyncMock()
+        mock_llm.ainvoke = AsyncMock()
 
         result = await _generate_title(messages, mock_llm)
         assert result is None
         # No extractable text -> short-circuits before invoking the model.
-        mock_llm.llm.ainvoke.assert_not_called()
+        mock_llm.ainvoke.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_samples_first_10_messages(self):
@@ -1187,13 +1187,12 @@ class TestGenerateTitle:
         mock_response = MagicMock()
         mock_response.content = "Test Title"
         mock_llm = MagicMock()
-        mock_llm.llm = AsyncMock()
-        mock_llm.llm.ainvoke.return_value = mock_response
+        mock_llm.ainvoke = AsyncMock(return_value=mock_response)
 
         await _generate_title(messages, mock_llm)
 
         # The HumanMessage passed should only contain messages 0-9
-        call_args = mock_llm.llm.ainvoke.call_args[0][0]
+        call_args = mock_llm.ainvoke.call_args[0][0]
         human_text = call_args[1].content  # second message is HumanMessage
         assert "msg 9" in human_text
         assert "msg 10" not in human_text
@@ -1205,12 +1204,11 @@ class TestGenerateTitle:
         mock_response = MagicMock()
         mock_response.content = "Title"
         mock_llm = MagicMock()
-        mock_llm.llm = AsyncMock()
-        mock_llm.llm.ainvoke.return_value = mock_response
+        mock_llm.ainvoke = AsyncMock(return_value=mock_response)
 
         await _generate_title([long_msg], mock_llm)
 
-        call_args = mock_llm.llm.ainvoke.call_args[0][0]
+        call_args = mock_llm.ainvoke.call_args[0][0]
         human_text = call_args[1].content
         assert len(human_text) <= 200
 
@@ -1220,8 +1218,7 @@ class TestGenerateTitle:
         mock_response = MagicMock()
         mock_response.content = "  " + "A" * 150 + "  "
         mock_llm = MagicMock()
-        mock_llm.llm = AsyncMock()
-        mock_llm.llm.ainvoke.return_value = mock_response
+        mock_llm.ainvoke = AsyncMock(return_value=mock_response)
 
         result = await _generate_title(
             [HumanMessage(content="hi")],
@@ -1237,8 +1234,7 @@ class TestGenerateTitle:
         mock_response = MagicMock()
         mock_response.content = ""
         mock_llm = MagicMock()
-        mock_llm.llm = AsyncMock()
-        mock_llm.llm.ainvoke.return_value = mock_response
+        mock_llm.ainvoke = AsyncMock(return_value=mock_response)
 
         result = await _generate_title(
             [HumanMessage(content="hi")],
@@ -1251,8 +1247,7 @@ class TestGenerateTitle:
     async def test_exception_returns_none(self):
         """Exception during title generation returns None."""
         mock_llm = MagicMock()
-        mock_llm.llm = AsyncMock()
-        mock_llm.llm.ainvoke.side_effect = RuntimeError("LLM error")
+        mock_llm.ainvoke = AsyncMock(side_effect=RuntimeError("LLM error"))
 
         result = await _generate_title(
             [HumanMessage(content="hi")],

@@ -33,6 +33,7 @@ def _make_config(**overrides):
     config.streaming = overrides.get("streaming", False)
     config.max_output_tokens = overrides.get("max_output_tokens", None)
     config.model_max_context_tokens = overrides.get("model_max_context_tokens", None)
+    config.extra_body = overrides.get("extra_body", None)
     return config
 
 
@@ -696,3 +697,62 @@ class TestFamilyCenteredReasoning:
 
         call_kwargs = mock_chat.call_args[1]
         assert call_kwargs["extra_body"]["reasoning"] == {"effort": "xhigh"}
+
+
+# =============================================================================
+# Declared provider params (config.extra_body → request extra_body)
+# =============================================================================
+
+
+class TestDeclaredExtraBody:
+    """Family settings-matrix `extra_body` (e.g. MiniMax `reasoning_split`)
+    must reach the request body via the factory extra_body merge."""
+
+    @patch("src.core.loader.ReasoningChatOpenAI")
+    def test_openai_factory_forwards_declared_extra_body(self, mock_chat):
+        mock_chat.return_value = MagicMock()
+        config = _make_config(
+            model="MiniMax-M3",
+            base_url="https://api.minimax.io/v1",
+            extra_body={"reasoning_split": True},
+        )
+
+        _create_openai_llm(config, limits=None)
+
+        call_kwargs = mock_chat.call_args[1]
+        assert call_kwargs["extra_body"]["reasoning_split"] is True
+
+    @patch("src.core.loader.ReasoningChatOpenAI")
+    def test_declared_merges_over_computed_without_clobbering(self, mock_chat):
+        """Declared values deep-merge over factory-computed entries (gemma's
+        enable_thinking toggle) while sibling computed keys survive."""
+        mock_chat.return_value = MagicMock()
+        config = _make_config(
+            model="gemma-4-moe",
+            base_url="http://vllm.cluster:8080/v1",
+            reasoning_level="high",
+            top_k=40,
+            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+        )
+
+        _create_openai_llm(config, limits=None)
+
+        call_kwargs = mock_chat.call_args[1]
+        assert call_kwargs["extra_body"]["chat_template_kwargs"] == {
+            "enable_thinking": False
+        }
+        assert call_kwargs["extra_body"]["top_k"] == 40
+
+    @patch("src.core.loader.ReasoningChatOpenAI")
+    def test_openrouter_factory_forwards_declared_extra_body(self, mock_chat):
+        mock_chat.return_value = MagicMock()
+        config = _make_config(
+            model="openrouter/minimax/minimax-m3",
+            api_key="sk-or-test",
+            extra_body={"reasoning_split": True},
+        )
+
+        _create_openrouter_llm(config, limits=None)
+
+        call_kwargs = mock_chat.call_args[1]
+        assert call_kwargs["extra_body"]["reasoning_split"] is True

@@ -1019,3 +1019,54 @@ class TestContextWindowBaseResolution:
         assert config.limits.model_max_context_tokens == 32000
         assert config.limits.context_threshold_tokens == 25600  # 32000 * 0.80
         assert config.limits.message_count_min_tokens == 12800  # 32000 * 0.40
+
+
+# =============================================================================
+# extra_body passthrough (MiniMax reasoning_split fix)
+# =============================================================================
+
+
+class TestExtraBodyPassthrough:
+    """Family `settings.extra_body` must survive matrix apply + config parse so
+    the LLM factories can merge it into the request body. Guards the MiniMax
+    reasoning_split fix (docs/issues/minimax_m3_think_tag_reasoning_leak_post_gateway.md)."""
+
+    def test_minimax_families_declare_reasoning_split(self):
+        for model in ("minimax-m2.7", "MiniMax-M3"):
+            settings = loader.resolve_model_settings(model)
+            assert settings.get("extra_body") == {"reasoning_split": True}, model
+
+    def test_apply_matrix_writes_extra_body_to_llm(self):
+        data = {"llm": {"model": "MiniMax-M3"}}
+        _apply_settings_matrix(data, expert_llm_keys={"model"})
+        assert data["llm"]["extra_body"] == {"reasoning_split": True}
+
+    def test_parse_llm_config_keeps_extra_body(self):
+        cfg = _parse_llm_config(
+            {"model": "MiniMax-M3", "extra_body": {"reasoning_split": True}}
+        )
+        assert cfg.extra_body == {"reasoning_split": True}
+
+    def test_phase_override_carries_extra_body(self):
+        base = _parse_llm_config(
+            {
+                "model": "gpt-5.5",
+                "tactical": {
+                    "model": "MiniMax-M3",
+                    "extra_body": {"reasoning_split": True},
+                },
+            }
+        )
+        assert base.extra_body is None
+        tactical = base.get_phase_config("tactical")
+        assert tactical.extra_body == {"reasoning_split": True}
+
+    def test_phase_budget_resolves_extra_body_per_family(self):
+        """A tactical MiniMax override on a non-MiniMax base picks up the
+        family extra_body via _PHASE_PARAM_KEYS."""
+        budget = loader.resolve_phase_model_budget(
+            base_model="gpt-5.5",
+            strategic_override=None,
+            tactical_override=PhaseLLMOverride(model="MiniMax-M3"),
+        )
+        assert budget["params"]["tactical"]["extra_body"] == {"reasoning_split": True}

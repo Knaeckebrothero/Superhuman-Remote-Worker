@@ -1423,6 +1423,7 @@ async def _attach_session(
             top_p=model_settings.get("top_p"),
             top_k=model_settings.get("top_k"),
             model_max_context_tokens=model_settings.get("model_max_context_tokens"),
+            extra_body=model_settings.get("extra_body"),
             max_retries=1,
         )
         aux_inner = create_llm(aux_llm_config, effective_config.limits)
@@ -4382,6 +4383,7 @@ async def _handle_config_update(ws: WebSocket, config_override: Dict[str, Any]) 
                 top_p=model_settings.get("top_p"),
                 top_k=model_settings.get("top_k"),
                 model_max_context_tokens=model_settings.get("model_max_context_tokens"),
+                extra_body=model_settings.get("extra_body"),
                 max_retries=1,
             )
             aux_inner = create_llm(aux_llm_config, new_config.limits)
