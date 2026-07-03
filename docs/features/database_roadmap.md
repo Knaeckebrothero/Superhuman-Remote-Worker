@@ -50,7 +50,13 @@ services — keeping only the Mongo *datasource* connector. `helm template`
 renders no Mongo resources; the audit trail is served entirely by the Postgres
 `srw-auditdb`.
 
-Remaining work is Phases 4–7. The research sweep's four premise corrections
+Phase 4 (HF-3) then made every `jobs.context` write atomic — all 13 racy
+read-modify-write sites now use single-statement SQL (`merge_job_context`
+deltas, a `jsonb_set` array-append for `queued_replies`, a `context - text[]`
+key-drain, and a `verification_round` counter), `update_job_context` is
+deleted, and the two status-fused writers keep their flip in one statement.
+
+Remaining work is Phases 5–7. The research sweep's four premise corrections
 still shape them:
 
 1. **HF-3 undercounted**: 13 racy `jobs.context` writers, not 8 — five raw
@@ -73,8 +79,8 @@ still shape them:
 |---|---|---|---|---|
 | 1 | Mechanical quick wins — QW-2, QW-3, QW-5, QW-6 | ~1 day | — (G1 decided: drop) | ✅ done `6343852c` — pushed + deployed on develop; migrate-from-zero + full suite verified |
 | 2 | HF-1 generated schema artifact (keystone) | ~1 day | — | ✅ done — 2a `be0540b4` (script + 3 artifacts + CI gate) + 2b (init.py vector→migrations, compose initdb dropped) |
-| 3 | D-5 Mongo code deletion | ~1–2 days | QW-4 soak ✅ (done, >1 week) | todo |
-| 4 | HF-3 atomic context writes (correctness) | ~1–2 days | — | todo |
+| 3 | D-5 Mongo code deletion | ~1–2 days | QW-4 soak ✅ (done, >1 week) | ✅ done `f1b06621` |
+| 4 | HF-3 atomic context writes (correctness) | ~1–2 days | — | ✅ done `c09cc73c` — 13 racy writers atomic; `update_job_context` deleted; 21 real-PG tests |
 | 5 | Perf batch — HF-5, HF-4, HF-6, HF-7, HF-2 | ~3–4 days | — (HF-2 last) | todo |
 | 6 | Usage rollup + no-deletion policy — D-1 build, D-2 closed by policy | ~1–2 days | — (decided 2026-07-02) | todo |
 | 7 | Unification, direction A (one message model) | L (grew: 0019 is unbuilt) | Phases 1–5; G4 for direction B | gated |
@@ -429,6 +435,45 @@ test (two concurrent appends → both present) is greenfield.
 **Acceptance:** no full-dict context writes anywhere (`update_job_context`
 deleted); fused status+context sites remain single statements; pop-after-
 accept ordering fixed; concurrency test green; job-lifecycle tests green.
+
+**✅ DONE — develop 2026-07-03 (`c09cc73c`, explicit-staged away from the
+parallel `docs/issues/*` subagent-forensics work live in the shared tree).**
+All 13 racy writers converted; `PostgresDB.update_job_context` deleted. Three
+new atomic helpers mirror the existing `merge_job_context` /
+`increment_job_memory_retry` pattern: `append_queued_reply`
+(`jsonb_set(COALESCE(context,'{}'), '{queued_replies}', COALESCE(…,'[]') || $1)`),
+`delete_job_context_keys` (`context - $1::text[]`), and
+`increment_job_verification_round` (`jsonb_set` counter). Site map: the 8
+`update_job_context` callers became `merge_job_context` **deltas** (graft
+`graft_output_path`; scholar+critic subjob `git_remote_url` — safe because both
+subjobs are created with their context already persisted, so a delta merge drops
+nothing; scholar-completion `scholar_completed`/`_output_dir` or `scholar_failed`;
+the two `delegation_results` rebuild writers; the VM-recovery arm that
+intentionally *replaces* `context.vm` via a top-level merge). `_route_inbound_reply`
+→ `append_queued_reply` (the headline race — its RMW window spans an LLM triage
+call). `upgrade_job_to_vm` (vm-preserving `jsonb_set` merge) and
+`_internal_resume_job` (top-level `||` merge) keep their `status='paused'` + resets
+**fused in one statement** (a split opens a dispatch window). Critic-resume
+`verification_round` → atomic increment + a separate snapshot merge
+(`deliverables`/`summary`/`confidence` — no cross-key invariant ties them to the
+counter). `_resume_job_on_agent` pop-after-accept: the
+`queued_feedback`/`delegation_results` drain moved to **after** the agent accepts,
+as an atomic `context - text[]` — fixes the pre-existing data-loss bug where a
+rejected resume permanently lost the payload, and it no longer clobbers concurrent
+merges into other keys. **Tests:** `test_per_job_repo` mocks renamed to
+`merge_job_context` (the captured deltas still carry every asserted key);
+`test_vm_upgrade_endpoint`'s local replay updated to the vm-merge semantics + a
+sibling-preservation guard; **new `tests/test_atomic_job_context.py`** runs the
+helpers + the two literal fused statements against a real Postgres
+(testcontainers, pg15) — 21 tests incl. concurrency proofs (8 racing appends all
+land, 10 racing increments end at exactly 10, 8 distinct-key merges all survive;
+NULL-column + missing-key + str-vs-UUID contract covered). Affected
+dispatch/resume/completion/delegation/vm-upgrade/critic-loop suites green
+(172 + 281 across two batches); `ruff` clean. Type contract preserved — every
+helper site passes `str` job ids (the raw→helper conversions at the pop/queue/
+critic-round sites verified; the rest inherited `update_job_context`'s `str`-only
+coercion). **Next = Phase 5 perf batch (HF-5 pools → HF-4 partial index → HF-6
+N+1s → HF-7 thread-read diet → HF-2 session write path).**
 
 ## Phase 5 — Perf batch (HF-5 → HF-4 → HF-6 → HF-7 → HF-2)
 
