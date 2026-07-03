@@ -1726,6 +1726,11 @@ class AuxiliaryConfig:
     model: Optional[str] = None  # null = use main LLM
     base_url: Optional[str] = None  # null = use main LLM endpoint
     api_key: Optional[str] = None  # null = use provider env var
+    # Provider slug ("openrouter", "openai", "anthropic", ...). null = let
+    # create_llm auto-detect (openrouter/ prefix) or fall back to openai. Must
+    # be threaded through to create_llm or an OpenRouter aux misroutes to
+    # api.openai.com (docs/issues/openrouter_auxiliary_misrouted_to_openai.md).
+    provider: Optional[str] = None
     temperature: float = 0.0
     max_iterations: int = 15  # Cap for agent mode loops
     timeout: float = 120.0  # Seconds per LLM call (quick interactive tasks)
@@ -2041,6 +2046,7 @@ def _parse_auxiliary_config(data: Dict[str, Any]) -> AuxiliaryConfig:
         model=data.get("model"),
         base_url=data.get("base_url"),
         api_key=data.get("api_key"),
+        provider=data.get("provider"),
         temperature=data.get("temperature", 0.0),
         max_iterations=data.get("max_iterations", 15),
         timeout=data.get("timeout", 120.0),
@@ -2775,7 +2781,20 @@ def create_llm(
     # endpoint, which is every endpoint case post-chunk-6 (the legacy
     # YAML fallback that distinguished ``anthropic``/``google``/``groq``
     # native is gone; the dispatcher now sets ``provider`` explicitly).
-    provider = config.provider.lower() if config.provider else "openai"
+    if config.provider:
+        provider = config.provider.lower()
+    elif config.model and config.model.lower().startswith("openrouter/"):
+        # Safety net for paths that build an LLMConfig from a model string
+        # without threading ``provider`` (notably the auxiliary rebuilds in
+        # agent.py / persistent_app.py). OpenRouter is the only provider whose
+        # base_url is resolved *from* the provider rather than stored in config,
+        # so a dropped provider silently misroutes its ``sk-or-v1`` key to
+        # api.openai.com → 401. Honour the documented "auto-detect if None"
+        # contract for the one prefix that needs it. See
+        # docs/issues/openrouter_auxiliary_misrouted_to_openai.md.
+        provider = "openrouter"
+    else:
+        provider = "openai"
 
     if provider == "anthropic":
         return _create_anthropic_llm(config, limits)
