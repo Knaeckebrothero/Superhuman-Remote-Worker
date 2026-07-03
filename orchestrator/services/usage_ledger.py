@@ -11,9 +11,11 @@ Design: ``docs/features/observability_and_quotas.md`` ("The spine: one usage
 ledger" + "The rate table"). Two pieces:
 
 - :class:`UsageRates` — effective-dated $/unit resolver over the app-DB
-  ``usage_rates`` table. Ships inert (empty table) → returns ``None`` (unpriced),
-  so quantities are metered immediately and ``cost_usd`` fills in only once an
-  admin seeds rates.
+  ``usage_rates`` table. LLM rates (prompt/completion-token) are auto-seeded from
+  OpenRouter's catalog by ``openrouter_pricing.llm_pricing_sync_loop``; compute
+  rates (vcpu/gib-hour) are still unseeded. An unpriced (category, resource, unit)
+  resolves to ``None`` → the quantity is metered immediately and ``cost_usd``
+  stays NULL until a rate exists.
 - :class:`UsageLedger` — bulk idempotent INSERT into ``usage_events`` (ON CONFLICT
   on the at-least-once dedupe key) with the rate snapshotted onto each row, plus
   the visibility-scoped aggregate read.
@@ -79,11 +81,12 @@ class UsageEvent:
 class UsageRates:
     """Effective-dated rate resolver over the app-DB ``usage_rates`` table.
 
-    The table is small admin config → cache all rows in memory with a short TTL
-    and resolve the newest ``effective_from <= ts`` in Python (specific resource
-    first, then the ``'*'`` category default). Returns ``None`` when unpriced (the
-    v1 default — table ships empty), so the event's quantity is metered and its
-    cost stays NULL.
+    The table is small config → cache all rows in memory with a short TTL and
+    resolve the newest ``effective_from <= ts`` in Python (specific resource
+    first, then the ``'*'`` category default). LLM rates are auto-seeded from
+    OpenRouter (``openrouter_pricing``); compute rates are not yet seeded, so an
+    unpriced (category, resource, unit) resolves to ``None`` and the event's
+    quantity is metered with cost NULL.
     """
 
     def __init__(self, app_pool: Optional[asyncpg.Pool], *, ttl_s: float = 300.0):

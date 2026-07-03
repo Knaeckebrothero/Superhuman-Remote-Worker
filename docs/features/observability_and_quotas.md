@@ -49,14 +49,15 @@ cost is sourced — see below):
 - **`usage_events`** — shipped verbatim from this doc's schema as
   `migrations/audit/0002_usage_events.sql` (monthly-partitioned on `ts` in `srw-auditdb`,
   via the audit-store partition machinery). **`usage_rates`** shipped as
-  `migrations/app/0033` (effective-dated, **ships empty** → costs are `NULL`/$0 until an
-  admin seeds rates; quantities are metered immediately).
-  > **As-built update (gateway migration P3, 2026-06-28).** LLM `cost_usd` no longer
-  > comes from `usage_rates` — the materializer now stamps LiteLLM's authoritative
-  > per-request `spend` onto a dedicated `unit='request'` row (see
-  > `route_all_models_through_litellm_gateway.md` §4.4). So **`usage_rates` now prices
-  > `category='compute'` only** (vcpu/gib-hour); the LLM-token-pricing description below
-  > is superseded for LLM rows. Live on dev: codex GPT-5.5 $100.79 metered.
+  `migrations/app/0033` (effective-dated $/unit rates).
+  > **As-built update (gateway removed, `remove_litellm_proxy_and_gateway_concept.md` P1;
+  > rollup added Phase 6, 2026-07-03).** The LiteLLM gateway is gone. LLM cost is
+  > priced from `usage_rates` again, whose **LLM rates (prompt/completion-token) are
+  > now auto-seeded** from OpenRouter's catalog by
+  > `openrouter_pricing.llm_pricing_sync_loop` — not admin-seeded, not empty.
+  > Compute rates (vcpu/gib-hour) stay unseeded, so those rows meter quantity with
+  > `cost_usd` NULL until a rate exists; an unpriced (category, resource, unit)
+  > resolves to no rate and the quantity still meters immediately.
 - **LLM rows — DESIGN CHANGE.** This doc sketched emitting them at the agent's
   token-capture point (`archiver.py:393`). The implementation instead **materializes them
   from the LiteLLM gateway** (poll `/spend/logs` → `category='llm'` rows). Why: the gateway
@@ -134,18 +135,21 @@ usage_events  -- monthly range-partitioned on ts (audit-store partition machiner
   at read time.)
 - An **orchestrator-timer rollup** (plain SQL over recent partitions; same
   pattern as the audit store's maintenance loop) maintains
-  `usage_daily(user_id, project_id, category, day, tokens|quantity, cost_usd)` —
-  cheap to read; raw events retained per auditdb retention, droppable once
-  rolled up. *(Amended 2026-06-11 — was TimescaleDB continuous aggregates.)*
+  `usage_daily(day, user_id, project_id, category, resource, unit, quantity,
+  cost_usd, events)` in the app DB — **BUILT** (`migrations/app/0047`,
+  `services/usage_rollup.py`; watermarked by `rollup_state`). Cheap to read; the
+  raw events are the rollup SOURCE and are **never auto-deleted** (no-auto-deletion
+  policy — manual export-first only). *(Amended 2026-07-03 — built; dims are the
+  full superset; retention → no-deletion policy. Was TimescaleDB caggs, 2026-06-11.)*
 
 ### Where it lives, and the cross-DB join
 
 | Data | Store | Why |
 |---|---|---|
-| `usage_events` (high volume, time-series) | **`srw-auditdb`** (in-chart observability store) | Keeps the firehose off the control plane, ships with the product, reuses the audit store's pool/partition/retention machinery. *(Amended 2026-06-11 — was `analytics` TimescaleDB; see `database_architecture.md`.)* |
-| `usage_daily` rollup mirror (small, joinable) | **App DB** | The Cockpit dashboard must join usage with user/job/project names. Mirror the daily continuous-aggregate into the app DB so the product reads **one** DB; raw high-res events stay in analytics. |
-| `usage_rates` (config) | **App DB** | Small relational config; admin-editable. Fits the [[config_matrix_db_overrides]] DB-override pattern. |
-| `quota_limits` (config) | **App DB** | Same. |
+| `usage_events` (high volume, time-series) | **`srw-auditdb`** (in-chart observability store) | Keeps the firehose off the control plane, ships with the product, reuses the audit store's pool/partition machinery (retention is a no-auto-deletion policy). *(Amended 2026-06-11 — was `analytics` TimescaleDB; see `database_architecture.md`.)* |
+| `usage_daily` rollup mirror (small, joinable) | **App DB** | The Cockpit dashboard must join usage with user/job/project names. The rollup task (`services/usage_rollup.py`) full-replace upserts closed days here + advances the `rollup_state` watermark; `/api/usage` serves it for closed days, raw `usage_events` for the open tail. |
+| `usage_rates` (config) | **App DB** | Small relational config; LLM rates auto-seeded from OpenRouter (`openrouter_pricing`), compute rates admin-settable. Fits the [[config_matrix_db_overrides]] DB-override pattern. |
+| `quota_limits` (config) | **App DB** | **Planned, not built** — the rate-limiting v2 concern (`rate_limiting_and_plan_quotas.md`), scope-polymorphic `(scope_kind, scope_id, period, limit_usd, …)`. |
 
 New wiring required: **none beyond the audit-store foundation** *(amended
 2026-06-11)* — the orchestrator's auditdb pool, the `migrations/audit/` family,
@@ -235,7 +239,7 @@ the polished dashboard is its own slice.
 
 ### Slice 4 — Cost surfacing (Cockpit, product surface)
 - Admin "Usage & Cost" view: per-user/project/day, broken down by category (LLM / compute / query / storage). Reuses the G5 visibility model already on the stats endpoints (`/api/stats/*`, `main.py:9855+`).
-- Per-job cost line on the existing job detail/list (from `usage_daily` / per-`ref_id` rollup).
+- Per-job cost line on the existing job detail/list — from **raw `usage_events` per `ref_id`** (indexed by `usage_events_ref_idx`), NOT `usage_daily` (`ref_id` is deliberately not a rollup dim; `/api/usage?ref_id=…` serves it).
 - **Bonus value today:** even with zero external users this answers "which of *my* jobs/models/sessions burn my budget."
 
 ### Slice 5 — Soft quotas (alert, do not block)
