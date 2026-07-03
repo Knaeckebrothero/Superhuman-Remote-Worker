@@ -25,7 +25,11 @@ from .orchestrator_client import (
     SessionGrantDenied,
     create_orchestrator_client_from_env,
 )
-from .persistent_session import PersistentSession, resolve_memory_extraction_prompt
+from .persistent_session import (
+    MemoryUnavailableError,
+    PersistentSession,
+    resolve_memory_extraction_prompt,
+)
 from ..tools.registry import TOOL_REGISTRY
 from ..core.archiver import inflight_tool_call
 from ..core.context import extract_summary_text, repair_tool_pairing
@@ -757,6 +761,40 @@ async def _exit_grant_denied(thread_id: str, exc: Exception) -> NoReturn:
     os._exit(0)
 
 
+async def _exit_memory_unavailable(thread_id: str, exc: Exception) -> NoReturn:
+    """Handle a required-memory setup failure at session attach: a configured
+    memory component (embedding-backed store or a plugin whose transport won't
+    resolve — e.g. the reranker endpoint) could not be set up.
+
+    Like :func:`_exit_grant_denied` this is a deterministic config failure, NOT
+    a transient workspace problem — a rebind hits the identical failure — so we
+    exit cleanly (status 0, pod Completed, no K8s restart-loop) rather than
+    crash-looping. The cockpit re-surfaces the reason on its next create/prepare
+    via the orchestrator's endpoint pre-flight (which validates the same roles
+    before spawning a pod). See
+    docs/issues/openrouter_auxiliary_crashes_session_via_memory_reranker.md.
+    """
+    logger.error(
+        "Session attach failed for thread %s — required memory unavailable (%s) "
+        "— exiting cleanly; NOT retrying (a rebind hits the same failure). The "
+        "cockpit surfaces this on its next create/prepare endpoint pre-flight.",
+        thread_id,
+        exc,
+    )
+    if _orchestrator_client:
+        try:
+            _orchestrator_client.stop_heartbeat()
+            if _heartbeat_task:
+                _heartbeat_task.cancel()
+            await _orchestrator_client.deregister()
+            await _orchestrator_client.close()
+        except Exception as de:
+            logger.warning(
+                "Best-effort deregister on memory-unavailable exit failed: %s", de
+            )
+    os._exit(0)
+
+
 async def _exit_duplicate_provision(thread_id: str) -> NoReturn:
     """Handle a lost provisioning race (409) during lifespan startup.
 
@@ -913,6 +951,14 @@ async def lifespan(app: FastAPI):
             # misleading 'workspace not provisioned' rebind path; the cockpit
             # re-surfaces it on its next create/prepare grant pre-flight.
             await _exit_grant_denied(_thread_id, e)
+        except MemoryUnavailableError as e:
+            # A configured/required memory component couldn't be set up (store
+            # init or a plugin transport that won't resolve — e.g. the reranker
+            # endpoint). Deterministic config failure: exit cleanly with the REAL
+            # reason instead of crashing (which triggered a workspace-release +
+            # crash-loop retry). The cockpit re-surfaces it via the orchestrator
+            # endpoint pre-flight.
+            await _exit_memory_unavailable(_thread_id, e)
         except (WorkspaceNotReady, WorkspaceUnavailableError) as e:
             # Workspace raced us / is wedged (WorkspaceNotReady) or its pod is
             # dead/unreachable (WorkspaceUnavailableError — SSH connect exhausted
@@ -1972,6 +2018,20 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
                     "thread_id": thread_id,
                     "sessions_served": _sessions_served,
                 }
+            )
+        except MemoryUnavailableError as e:
+            # Deterministic config failure — a configured/required memory
+            # component can't resolve its transport. Return 422 (not 500) so the
+            # orchestrator treats it as permanent and does NOT retry into an
+            # identical failure. The endpoint pre-flight should catch this before
+            # dispatch; this is the pool-mode backstop.
+            logger.error(
+                "Required memory unavailable attaching thread %s (pool mode): %s",
+                thread_id,
+                e,
+            )
+            return JSONResponse(
+                {"error": str(e), "reason": "memory_unavailable"}, status_code=422
             )
         except Exception as e:
             logger.exception(f"Failed to attach session for thread {thread_id}")

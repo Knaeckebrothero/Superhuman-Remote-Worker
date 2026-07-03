@@ -209,15 +209,16 @@ class TestPipelineDefaults:
             "teardown_extractor",
         ]
 
-    def test_configured_names_bind(self, worker_config, persistent_config):
+    def test_configured_names_bind(self, worker_config, persistent_config, monkeypatch):
         """Registry/YAML drift guard: every shipped name must resolve.
 
         Includes the GATE-B stack now in the defaults (scorers [reranker],
         policies [gate, bounded]) — their factories read runtime.memory_config,
         so bind with the config attached.
         """
-        # The reranker rides the auxiliary endpoint's transport (base_url/key),
+        # The reranker rides the EMBEDDING endpoint's transport (EMBEDDING_BASE_URL),
         # injected at dispatch in production — stub it here so bind resolves.
+        monkeypatch.setenv("EMBEDDING_BASE_URL", "https://embed.test/v1")
         aux_transport = SimpleNamespace(base_url="https://aux.test/v1", api_key="k")
         for cfg in (worker_config, persistent_config):
             manager = MemoryManager.from_config(

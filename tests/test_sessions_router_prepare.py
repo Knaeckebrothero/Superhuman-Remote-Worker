@@ -301,6 +301,7 @@ async def test_do_prepare_waits_when_agent_pod_marker_in_flight(monkeypatch):
     fake_main.session_router.ensure_route = AsyncMock(return_value="/p/t1")
     fake_main.ensure_session_workspace = AsyncMock(return_value=None)
     fake_main._session_grant_violations = AsyncMock(return_value=[])
+    fake_main._session_endpoint_violations = AsyncMock(return_value=[])
     monkeypatch.setitem(sys.modules, "main", fake_main)
 
     emit_calls: list[dict] = []
@@ -387,6 +388,7 @@ async def test_do_prepare_reconciles_workspace_on_cold_start(monkeypatch):
     fake_main.session_router.ensure_route = AsyncMock(return_value="/p/t1")
     fake_main.ensure_session_workspace = AsyncMock(return_value=None)
     fake_main._session_grant_violations = AsyncMock(return_value=[])
+    fake_main._session_endpoint_violations = AsyncMock(return_value=[])
     monkeypatch.setitem(sys.modules, "main", fake_main)
 
     monkeypatch.setattr(

@@ -40,6 +40,13 @@ def _make_config(**overrides):
     cfg.llm.multimodal = True
     cfg.llm.parallel_tool_calls = overrides.get("parallel_tool_calls", False)
     cfg.memory.enabled = overrides.get("memory_enabled", False)
+    # Explicit non-required defaults: a MagicMock leaves these truthy, which
+    # would make the "configured ⇒ required" gate in _setup_memory fire and
+    # turn every store-init failure into a MemoryUnavailableError.
+    cfg.memory.required = overrides.get("memory_required", False)
+    cfg.memory.manager_enabled = overrides.get("manager_enabled", False)
+    cfg.memory.pipeline.scorers = overrides.get("memory_scorers", [])
+    cfg.memory.pipeline.retrievers = overrides.get("memory_retrievers", [])
     cfg.memory.observer_interval = 5
     cfg.context_management.keep_recent_tool_results = 10
     cfg.context_management.keep_recent_messages = 50
@@ -1194,6 +1201,115 @@ class TestSetupMemory:
         ):
             # Should not raise
             session._setup_memory(postgres_conn=MagicMock(), vector_conn=MagicMock())
+
+    def test_required_recall_store_failure_raises(self):
+        """memory.required + RecallStore init failure → MemoryUnavailableError
+        (fail loud, don't run the session half-working). Regression for
+        docs/issues/openrouter_auxiliary_crashes_session_via_memory_reranker.md.
+        """
+        from src.api.persistent_session import MemoryUnavailableError
+
+        cfg = _make_config(memory_enabled=True, memory_required=True)
+        session = _make_session(config=cfg)
+        session.tool_context = MagicMock()
+        session.project_ids = [str(uuid.uuid4())]
+
+        with patch.dict(
+            "sys.modules",
+            {
+                "src.services.embedding_service": MagicMock(
+                    get_embedding_service=MagicMock(
+                        side_effect=RuntimeError("embedding endpoint down")
+                    ),
+                ),
+                "src.services.knowledge_store": MagicMock(
+                    KnowledgeStore=MagicMock(return_value=MagicMock())
+                ),
+            },
+        ):
+            with pytest.raises(MemoryUnavailableError, match="RecallStore"):
+                session._setup_memory(
+                    postgres_conn=MagicMock(), vector_conn=MagicMock()
+                )
+
+    def test_configured_pipeline_makes_memory_required(self):
+        """A configured pipeline (scorers present) implies required even when
+        memory.required is False: a store failure must fail loud."""
+        from src.api.persistent_session import MemoryUnavailableError
+
+        cfg = _make_config(
+            memory_enabled=True,
+            memory_required=False,
+            manager_enabled=True,
+            memory_scorers=["reranker"],
+        )
+        session = _make_session(config=cfg)
+        session.tool_context = MagicMock()
+        session.project_ids = [str(uuid.uuid4())]
+
+        with patch.dict(
+            "sys.modules",
+            {
+                "src.services.embedding_service": MagicMock(
+                    get_embedding_service=MagicMock(
+                        side_effect=RuntimeError("embedding endpoint down")
+                    ),
+                ),
+                "src.services.knowledge_store": MagicMock(
+                    KnowledgeStore=MagicMock(return_value=MagicMock())
+                ),
+            },
+        ):
+            with pytest.raises(MemoryUnavailableError):
+                session._setup_memory(
+                    postgres_conn=MagicMock(), vector_conn=MagicMock()
+                )
+
+    def test_pipeline_bind_failure_raises_memory_unavailable(self):
+        """A plugin factory that can't resolve its transport (e.g. the reranker
+        endpoint) fails the session loud, not a raw crash."""
+        from src.api.persistent_session import MemoryUnavailableError
+
+        cfg = _make_config(
+            memory_enabled=True,
+            manager_enabled=True,
+            memory_scorers=["reranker"],
+        )
+        session = _make_session(config=cfg)
+        session.tool_context = MagicMock()
+        session.project_ids = [str(uuid.uuid4())]
+
+        with (
+            # create_task needs a running loop; no-op it so the RecallStore path
+            # succeeds cleanly and we actually reach the bind (not the store gate).
+            patch("asyncio.create_task", MagicMock()),
+            patch.dict(
+                "sys.modules",
+                {
+                    "src.services.embedding_service": MagicMock(
+                        get_embedding_service=MagicMock(return_value=MagicMock())
+                    ),
+                    "src.services.recall_store": MagicMock(
+                        RecallStore=MagicMock(return_value=MagicMock())
+                    ),
+                    "src.services.knowledge_store": MagicMock(
+                        KnowledgeStore=MagicMock(return_value=MagicMock())
+                    ),
+                    "src.services.memory": MagicMock(
+                        MemoryManager=MagicMock(
+                            from_config=MagicMock(
+                                side_effect=ValueError("reranker needs a base_url")
+                            )
+                        ),
+                        MemoryRuntime=MagicMock(),
+                    ),
+                },
+            ),
+        ):
+            with pytest.raises(MemoryUnavailableError, match="reranker"):
+                session._setup_memory(
+                    postgres_conn=MagicMock(), vector_conn=MagicMock()
+                )
 
 
 # ---------------------------------------------------------------------------

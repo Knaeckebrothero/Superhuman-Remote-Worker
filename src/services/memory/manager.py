@@ -25,6 +25,7 @@ from .types import (
     CaptureEvent,
     InjectionBlock,
     MemoryPayload,
+    MemoryPipelineError,
     MemoryRuntime,
     Scored,
     _StopWatch,
@@ -122,10 +123,15 @@ class MemoryManager:
 
         Order-preserving by default: with no scorers/policies bound, items
         flow through in retriever order (the legacy stores already return
-        ranked results). Stage failures are contained per plugin — a
-        failing scorer/policy passes items through unchanged, a failing
-        retriever contributes nothing — and recorded in stats.errors.
-        Never raises.
+        ranked results). Retriever/policy failures are contained per plugin — a
+        failing retriever contributes nothing, a failing policy passes items
+        through unchanged — and recorded in stats.errors.
+
+        Scorer failures are NOT contained: a configured scorer (the reranker) is
+        required, so its runtime failure raises ``MemoryPipelineError`` rather
+        than silently serving legacy order behind the user's back ("configured ⇒
+        required" — the caller fails the turn loud). See
+        docs/issues/openrouter_auxiliary_crashes_session_via_memory_reranker.md.
         """
         watch = _StopWatch()
         stats = AssembleStats()
@@ -151,7 +157,14 @@ class MemoryManager:
                 try:
                     items = await scorer.score(req, items)
                 except Exception as e:
+                    # Configured scorer (reranker) is required — fail loud, do
+                    # NOT degrade to legacy order silently. Escapes the kernel
+                    # backstop below via MemoryPipelineError.
                     self._record_failure(stats, "scorer", name, e)
+                    raise MemoryPipelineError(
+                        f"required memory scorer '{name}' failed at runtime: "
+                        f"{type(e).__name__}: {e}"
+                    ) from e
 
             for name, policy in self._policies:
                 try:
@@ -167,8 +180,12 @@ class MemoryManager:
             stats.latency_ms = watch.elapsed_ms()
             return MemoryPayload(blocks=blocks, stats=stats)
 
+        except MemoryPipelineError:
+            # Required-stage failure — propagate past the kernel backstop so the
+            # caller fails the turn loud rather than serving half-working memory.
+            raise
         except Exception as e:
-            # Kernel bug backstop — memory must never kill a turn.
+            # Kernel bug backstop — a genuine kernel bug must never kill a turn.
             self._record_failure(stats, "assemble", "kernel", e)
             stats.latency_ms = watch.elapsed_ms()
             return MemoryPayload(blocks=[], stats=stats)

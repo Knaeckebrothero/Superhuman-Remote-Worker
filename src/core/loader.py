@@ -1533,15 +1533,17 @@ class RerankerConfig:
     """memory.reranker — options for the 'reranker' scorer (overhaul Phase 3).
 
     Only consulted when ``reranker`` appears in ``memory.pipeline.scorers``.
-    ``base_url``/``api_key`` default to the auxiliary endpoint at bind time
-    (the same router serves the ``/rerank`` route), so production needs no
-    extra credential plumbing — the reranker rides the auxiliary key the
-    orchestrator injects at dispatch.
+    ``base_url``/``api_key`` default to the **embedding** endpoint at bind time
+    (``EMBEDDING_BASE_URL``/``EMBEDDING_API_KEY`` — the same router serves the
+    ``qwen3-reranker-8b`` ``/rerank`` route and ``qwen3-embedding-8b``), so
+    production needs no extra credential plumbing. It does NOT ride the
+    auxiliary model (that coupling crashed startup on OpenRouter auxiliaries;
+    see docs/issues/openrouter_auxiliary_crashes_session_via_memory_reranker.md).
     """
 
     model: str = "qwen3-reranker-8b"
-    base_url: Optional[str] = None  # null = auxiliary.base_url
-    api_key: Optional[str] = None  # null = auxiliary.api_key
+    base_url: Optional[str] = None  # null = EMBEDDING_BASE_URL
+    api_key: Optional[str] = None  # null = EMBEDDING_API_KEY
     top_k: int = 64  # rerank at most this many candidates per assemble
     timeout: float = 10.0  # seconds per rerank call
     # Keep TTL-pinned items (the recency working set) ahead of the
