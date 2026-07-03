@@ -117,8 +117,12 @@ up (never used).
 formal A/B + perf gate (G3) was not run as a separate phase — validation was
 component tests (writer 14/14, reader 40/40 against real `postgres:16`) + the k3d
 in-cluster write+read e2e + the dev cutover checks above. Auto-retention
-(`retire_partitions`) ships as a deferred no-op stub; partitions accumulate until
-a later retention pass. The deferred Dockerfile `postgresql-client` + `init.py`
+(`retire_partitions`) is a **permanent no-op by policy** — no-auto-deletion (owner
+call 2026-07-02: deletion is manual + export-first; `database_roadmap.md` Phase 6
+D-2). Partitions accumulate on purpose; `partition_status` now reports per-parent
+`total_bytes` so growth is visible instead of managed, and the raw ledger feeds
+the app-DB `usage_daily` rollup (`migrations/app/0047`). The deferred Dockerfile
+`postgresql-client` + `init.py`
 `pg_dump` backup were dropped (backup was already dead code; the orchestrator
 talks to auditdb via asyncpg).
 
@@ -214,10 +218,10 @@ Read pool lives in the orchestrator (AuditStore, min1/max5); write pool lives in
 *Rationale:* The write contract proves the orchestrator process contains zero audit writes (grep-verified) — a throughput write pool there would serve nobody. The writer runs where the writes are: each agent pod.
 
 **D19 — Partition management**
-Hand-rolled module (orchestrator/services/audit_partitions.py): advisory-locked catalog-diff creation with CREATE(LIKE INCLUDING ALL)+CHECK+ATTACH, N+2 monthly lookahead, DETACH CONCURRENTLY → 3-day grace → DROP with FINALIZE recovery, parent ANALYZE cadence, lookahead/23514/detach-pending alarms; 6h ± 30min-jitter lifespan task. Reverses the design doc's pg_partman resolution.
+Hand-rolled module (orchestrator/services/audit_partitions.py): advisory-locked catalog-diff creation with CREATE(LIKE INCLUDING ALL)+CHECK+ATTACH, N+2 monthly lookahead, parent ANALYZE cadence, per-parent size reporting, lookahead/23514/detach-pending alarms; 6h ± 30min-jitter lifespan task. Reverses the design doc's pg_partman resolution. *(The DETACH CONCURRENTLY → grace → DROP retire path is a permanent policy no-op — no-auto-deletion, Phase 6 D-2; it survives only as the documented manual export-first recipe in `retire_partitions`.)*
 *Rationale:* The chart's stock postgres images don't ship pg_partman, and an extension + its BGW/cron config is heavier than ~200 LoC for 3 tables at monthly cadence; every mechanism is research-verified and was live-tested (ATTACH path, reloptions, bound introspection, 23514). The doc's own fallback ('if the team prefers extension-freedom, take the hand-rolled path with the full spec') is what this delivers. Steady state ≈ 21 attached partitions — two orders of magnitude below planner limits.
 
-**D20 — Retention granularity**
+**D20 — Retention granularity** *(superseded — no-auto-deletion policy, Phase 6 D-2, 2026-07-02: nothing is retired automatically. The granularity below applies only to a future MANUAL export-first drop, if ever.)*
 Whole-month retention: a partition is retired when its UPPER bound is older than the window, so effective retention is 90–120d / 365–396d.
 *Rationale:* Partition-drop retention only works at partition granularity; erring on the keep side is the only safe direction for an audit trail. Documented so nobody files 'rows older than 90d still visible' as a bug.
 
