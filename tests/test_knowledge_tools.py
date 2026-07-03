@@ -811,9 +811,7 @@ class TestRenderNoteMd:
     def test_emits_frontmatter_fences_and_required_keys(self):
         from src.tools.knowledge.knowledge_tools import _render_note_md
 
-        md = _render_note_md(
-            {"id": "chose-jwt", "type": "decision", "content": "body"}
-        )
+        md = _render_note_md({"id": "chose-jwt", "type": "decision", "content": "body"})
         assert md.startswith("---\n")
         assert "\n---\n" in md  # closing fence
         assert "id: chose-jwt" in md
@@ -894,7 +892,10 @@ class TestRenderNoteMd:
             }
         )
         assert "[[auth-design]]" not in md  # no wikilinks
-        assert "**SUPPORTS:** [auth-design](auth-design.md), [token-plan](token-plan.md)" in md
+        assert (
+            "**SUPPORTS:** [auth-design](auth-design.md), [token-plan](token-plan.md)"
+            in md
+        )
         assert "**REFERENCES:** [rfc-7519](rfc-7519.md)" in md
 
     def test_emits_provenance_when_present(self):
