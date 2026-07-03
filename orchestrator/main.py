@@ -19114,7 +19114,7 @@ def _effective_models_from_layers(
     merges).
 
     Returns ``{slot: {"model": str|None, "source": str}}`` for slots
-    ``strategic`` / ``tactical`` / ``session``; ``source`` is one of ``expert`` /
+    ``strategic`` / ``tactical`` / ``subagent`` / ``session``; ``source`` is one of ``expert`` /
     ``account_default`` / ``system_default``. See Layer 3 in
     docs/issues/loop_ran_codex_spark_not_selected_model_then_hung_on_cooldown.md.
     """
@@ -19134,9 +19134,18 @@ def _effective_models_from_layers(
         pin = block.get("model") if isinstance(block, dict) else None
         return {"model": pin, "source": "expert"} if pin else dict(top)
 
+    def _phase_inherit(name: str, parent: str) -> dict[str, Any]:
+        """Like ``_phase`` but an unpinned slot inherits a sibling phase's pin
+        before the top-level model — mirrors the agent's ``subagent -> tactical
+        -> base`` reader-model fallback (``_resolve_subagent_config``)."""
+        block = llm.get(name)
+        pin = block.get("model") if isinstance(block, dict) else None
+        return {"model": pin, "source": "expert"} if pin else _phase(parent)
+
     return {
         "strategic": _phase("strategic"),
         "tactical": _phase("tactical"),
+        "subagent": _phase_inherit("subagent", "tactical"),
         "session": dict(top),
     }
 

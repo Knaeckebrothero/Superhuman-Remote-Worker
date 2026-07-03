@@ -15,6 +15,7 @@ import {formatTokens} from '../../core/util/format-tokens';
 const STORAGE_KEYS = {
   strategic: 'ui.lastModel.strategic',
   tactical: 'ui.lastModel.tactical',
+  subagent: 'ui.lastModel.subagent',
   session: 'ui.lastModel.session',
 } as const;
 
@@ -99,6 +100,36 @@ const STORAGE_KEYS = {
               }
               @if (mm.multimodal) {
                 <div>{{ 'agentSettings.model.mismatchMultimodal' | transloco }}</div>
+              }
+            </div>
+          </div>
+        }
+
+        @if (showSubagent()) {
+          <!-- Subagent Model — the reader model spawn_subagent delegates to.
+               Runs in fresh reader windows (separate from strategic/tactical's
+               shared history), so it's outside the mismatch advisory above.
+               Resolves subagent → tactical → base, mirroring the agent. -->
+          <div class="field-row" [class.modified]="subagentModel() !== null">
+            <label class="field-label">{{ 'agentSettings.model.subagent' | transloco }}</label>
+            <div class="field-control">
+              <select
+                class="form-input"
+                [ngModel]="subagentModel()"
+                (ngModelChange)="onSubagentModelChange($event)"
+                [disabled]="disabled()"
+              >
+                <option [ngValue]="null">{{ defaultLabel(effectiveSubagent(), resolvedSubagentModel()) }}</option>
+                @for (group of availableModels(); track group.group) {
+                  <optgroup [label]="providerLabel(group)">
+                    @for (model of group.models; track model) {
+                      <option [value]="model">{{ model }}</option>
+                    }
+                  </optgroup>
+                }
+              </select>
+              @if (subagentModel() !== null) {
+                <button type="button" class="reset-btn" (click)="onSubagentModelChange(null)" [title]="'agentSettings.common.resetToDefault' | transloco"><app-icon size="xs">close</app-icon></button>
               }
             </div>
           </div>
@@ -246,6 +277,10 @@ export class ModelGroupComponent {
   /** Server-resolved effective model + provenance per slot (what runs if the
    *  picker is left untouched). Null → fall back to the config-derived default. */
   effectiveModels = input<EffectiveModels | null>(null);
+  /** Whether to show the Subagent (delegation reader) model picker. The parent
+   *  gates this on the Delegation tool being enabled; defaults to shown so the
+   *  component works standalone. */
+  showSubagent = input(true);
 
   change = output<void>();
 
@@ -254,6 +289,7 @@ export class ModelGroupComponent {
   // Job mode: per-phase overrides
   readonly strategicModel = signal<string | null>(null);
   readonly tacticalModel = signal<string | null>(null);
+  readonly subagentModel = signal<string | null>(null);
 
   // Session mode: single model override
   readonly sessionModel = signal<string | null>(null);
@@ -272,6 +308,14 @@ export class ModelGroupComponent {
     ?? (readConfigPath(this.config(), 'llm.model') as string)
     ?? null
   );
+  // Reader model: subagent pin → tactical pin → base, mirroring the agent's
+  // _resolve_subagent_config fallback and the server effective-model slot.
+  readonly resolvedSubagentModel = computed(() =>
+    (readConfigPath(this.config(), 'llm.subagent.model') as string)
+    ?? (readConfigPath(this.config(), 'llm.tactical.model') as string)
+    ?? (readConfigPath(this.config(), 'llm.model') as string)
+    ?? null
+  );
   readonly resolvedSessionModel = computed(() =>
     (readConfigPath(this.config(), 'llm.model') as string) ?? null
   );
@@ -279,6 +323,7 @@ export class ModelGroupComponent {
   // Server-resolved effective slot ({model, source}) or null when unavailable.
   readonly effectiveStrategic = computed(() => this.effectiveModels()?.strategic ?? null);
   readonly effectiveTactical = computed(() => this.effectiveModels()?.tactical ?? null);
+  readonly effectiveSubagent = computed(() => this.effectiveModels()?.subagent ?? null);
   readonly effectiveSession = computed(() => this.effectiveModels()?.session ?? null);
 
   // The model actually in effect for a slot: explicit override > server
@@ -343,6 +388,7 @@ export class ModelGroupComponent {
     if (this.mode() === 'job') {
       if (this.strategicModel() !== null) count++;
       if (this.tacticalModel() !== null) count++;
+      if (this.subagentModel() !== null) count++;
     } else {
       if (this.sessionModel() !== null) count++;
     }
@@ -363,6 +409,13 @@ export class ModelGroupComponent {
     this.change.emit();
   }
 
+  onSubagentModelChange(value: string | null): void {
+    const resolved = value === this.resolvedSubagentModel() ? null : value;
+    this.subagentModel.set(resolved);
+    this.persistModel('subagent', resolved);
+    this.change.emit();
+  }
+
   onSessionModelChange(value: string | null): void {
     const resolved = value === this.resolvedSessionModel() ? null : value;
     this.sessionModel.set(resolved);
@@ -379,6 +432,8 @@ export class ModelGroupComponent {
       if (sm) llm['strategic'] = { ...(llm['strategic'] as any ?? {}), model: sm };
       const tm = this.tacticalModel();
       if (tm) llm['tactical'] = { ...(llm['tactical'] as any ?? {}), model: tm };
+      const subm = this.subagentModel();
+      if (subm) llm['subagent'] = { ...(llm['subagent'] as any ?? {}), model: subm };
     } else {
       const m = this.sessionModel();
       if (m) llm['model'] = m;
@@ -390,6 +445,7 @@ export class ModelGroupComponent {
   resetAll(): void {
     this.strategicModel.set(null);
     this.tacticalModel.set(null);
+    this.subagentModel.set(null);
     this.sessionModel.set(null);
   }
 
@@ -399,6 +455,7 @@ export class ModelGroupComponent {
     const llm = config['llm'] as Record<string, unknown> | undefined;
     const strat = llm?.['strategic'] as Record<string, unknown> | undefined;
     const tact = llm?.['tactical'] as Record<string, unknown> | undefined;
+    const sub = llm?.['subagent'] as Record<string, unknown> | undefined;
     const baseModel = (llm?.['model'] as string) ?? null;
 
     this.strategicModel.set(
@@ -406,6 +463,11 @@ export class ModelGroupComponent {
     );
     this.tacticalModel.set(
       tact?.['model'] || baseModel ? null : this.loadSavedModel('tactical'),
+    );
+    // Subagent inherits the tactical pin, so a tactical (or base) model is also
+    // "already resolved" — don't preselect a saved subagent model in that case.
+    this.subagentModel.set(
+      sub?.['model'] || tact?.['model'] || baseModel ? null : this.loadSavedModel('subagent'),
     );
     this.sessionModel.set(baseModel ? null : this.loadSavedModel('session'));
   }
