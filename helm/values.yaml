@@ -108,6 +108,32 @@ orchestrator:
       cpu: "500m"
   # -- Auto-assign jobs to idle agents
   autoAssignEnabled: "true"
+  # -- Per-store asyncpg connection pool sizing for the orchestrator's own
+  # pools (control-plane app DB, pgvector, audit trail). The orchestrator does
+  # NOT envFrom the shared ConfigMap, so these are wired as explicit env in
+  # orchestrator/deployment.yaml — the ConfigMap's POSTGRES_*_CONNECTIONS carry
+  # the small AGENT-pod sizing (agent.dbPool) and must not reach the
+  # orchestrator. These match the code defaults; override only to tune.
+  # Budget per server: sum(maxes across replicas + agents) <= max_connections
+  # - 3 reserved - ~10 headroom. At the defaults (replicas=2,
+  # agent.pool.maxAgents=10, agent.dbPool.app.max=3), per server:
+  #   app    : 2*10 (orch) + 10*3 (agents) = 50   (fits default max_connections=100)
+  #   vector : 2*5  + 10*3 = 40
+  #   audit  : 2*4  + (agents keep the code default) = 8
+  # Scaling to ~30 agents pushes app to 2*10 + 30*3 = 110 -> raise Postgres
+  # max_connections, trim agent.dbPool.app.max, or front the app DB with
+  # pgbouncer (transaction mode; the advisory-lock migration runner + LISTEN
+  # users stay on direct connections).
+  dbPool:
+    app:
+      min: "2"
+      max: "10"
+    vector:
+      min: "1"
+      max: "5"
+    audit:
+      min: "1"
+      max: "4"
   # -- Budget (seconds) for the WS proxy to wait for the agent's /ready
   # endpoint to flip true. Must outlast the agent's own workspace SSH poll
   # (120s) plus margin for cold workspace image pulls (~130s observed).
@@ -212,13 +238,26 @@ agent:
     #       - protocol: TCP
     #         port: 8000
     extraEgress: []
-  # -- Agent pool sizing (AgentProvisioner)
+  # -- Agent pool sizing (AgentProvisioner) — this is the agent COUNT, not DB
+  # connections (see dbPool below).
   pool:
     maxAgents: "10"
     minAgents: "2"
     buffer: "1"
     reservedSessionSlots: "2"
     reservedJobSlots: "2"
+  # -- Per-agent asyncpg connection pool sizing (app DB). Provisioned agent pods
+  # inherit these via envFrom on the shared ConfigMap as POSTGRES_MIN/MAX_
+  # CONNECTIONS. Kept small: the connection multiplier is agent COUNT, so this
+  # bounds the fleet's total footprint on the app DB (maxAgents * app.max). The
+  # agent's vector pool shares the same POSTGRES_* env, so one knob bounds both
+  # its app and vector pools. asyncpg's default max_inactive_connection_lifetime
+  # (300s) sheds idle connections between jobs. The orchestrator sizes its own
+  # (larger) pools separately (orchestrator.dbPool) and never sees these values.
+  dbPool:
+    app:
+      min: "1"
+      max: "3"
 
 # =============================================================================
 # Cockpit (Angular frontend)

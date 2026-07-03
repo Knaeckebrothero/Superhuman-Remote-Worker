@@ -166,6 +166,24 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: AUDIT_POSTGRES_DB
+            # Per-store asyncpg pool sizing. Explicit env (the orchestrator does
+            # NOT envFrom the shared ConfigMap), sourced from orchestrator.dbPool
+            # so the control/vector/audit pools size independently. These are
+            # deliberately NOT the ConfigMap's POSTGRES_*_CONNECTIONS keys —
+            # those carry the small AGENT-pod sizing (agent.dbPool) that must not
+            # reach the orchestrator.
+            - name: POSTGRES_MIN_CONNECTIONS
+              value: {{ .Values.orchestrator.dbPool.app.min | quote }}
+            - name: POSTGRES_MAX_CONNECTIONS
+              value: {{ .Values.orchestrator.dbPool.app.max | quote }}
+            - name: VECTOR_POSTGRES_MIN_CONNECTIONS
+              value: {{ .Values.orchestrator.dbPool.vector.min | quote }}
+            - name: VECTOR_POSTGRES_MAX_CONNECTIONS
+              value: {{ .Values.orchestrator.dbPool.vector.max | quote }}
+            - name: AUDIT_POSTGRES_MIN_CONNECTIONS
+              value: {{ .Values.orchestrator.dbPool.audit.min | quote }}
+            - name: AUDIT_POSTGRES_MAX_CONNECTIONS
+              value: {{ .Values.orchestrator.dbPool.audit.max | quote }}
             # Checkpointer backend (sqlite|postgres). The orchestrator reads it to
             # prune LangGraph checkpoints on terminal jobs; it uses explicit env
             # (not envFrom), so the ConfigMap key must be referenced here too
