@@ -1,16 +1,23 @@
 # MiniMax-M3 reasoning arrives as mangled `<think>` content after gateway removal
 
-**Status:** FIX IMPLEMENTED + VERIFIED 2026-07-03 (uncommitted, develop) — family
+**Status:** ✅ DONE — fix committed `33232103` (develop, 2026-07-03). Family
 `settings.extra_body` passthrough (loader + matrix `reasoning_split: true` for
 `minimax`/`minimax-m3`), verified by unit tests, a live wire test through
 `create_llm` (clean content + captured reasoning), and a fresh k3d MiniMax
-session. Contaminated titles repaired on k3d + homelab. Remaining follow-ups:
-per-model `params_json.extra_body` escape hatch, `reasoning_details` history
-replay for interleaved-thinking quality in loops.
-Investigated 2026-07-03 (homelab evidence) · confirmed provider-side by raw
-wire probe + OpenRouter A/B (see "Wire probe verdict" below).
+session (user-confirmed clean title). Contaminated titles repaired on k3d +
+homelab. Investigated 2026-07-03 (homelab evidence) · confirmed provider-side
+by raw wire probe + OpenRouter A/B (see "Wire probe verdict" below).
+
+**Deferred follow-ups (separate, not blocking the fix):**
+- Per-model `params_json.extra_body` escape hatch (layer 2) — the family-level
+  fix here covers minimax; a per-model override in the Admin catalog would let
+  a user attach provider params to any model whose family detection misses.
+- `reasoning_details` history replay for interleaved-thinking quality in the
+  loops — MiniMax's docs want the reasoning replayed within tool-call turns;
+  we currently drop it (fine for aux/titles, possibly a quality cost for long
+  loop tool chains — measure before building).
 **Related:** `docs/issues/remove_litellm_proxy_and_gateway_concept.md`,
-`docs/issues/session_model_switch_stale_context_manager_empty_response.md`
+`docs/done/session_model_switch_stale_context_manager_empty_response.md`
 
 ## Symptoms (three surfaces, one cause)
 

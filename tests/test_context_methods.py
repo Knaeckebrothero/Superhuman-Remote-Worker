@@ -638,3 +638,50 @@ class TestTrimMessages:
         messages = [HumanMessage(content=f"msg {i}") for i in range(10)]
         mgr.trim_messages(messages, keep_recent=3)
         assert mgr.state.total_messages_trimmed > 0
+
+
+# =============================================================================
+# update_limits — in-place threshold rebind on model hot-swap
+# =============================================================================
+
+
+class TestUpdateLimits:
+    """Model hot-swap rebinds thresholds on the EXISTING manager, preserving
+    accumulated state (docs/issues/
+    session_model_switch_stale_context_manager_empty_response.md)."""
+
+    def test_thresholds_swap_and_state_survives(self):
+        mgr = ContextManager(
+            config=ContextConfig(
+                compaction_threshold_tokens=840_000,
+                summarization_threshold_tokens=840_000,
+                model_max_context_tokens=1_050_000,
+            ),
+            model="gpt-5.5",
+        )
+        # The repro: ~125.7k history anchored from real provider usage on the
+        # big-window model — under its 840k threshold, so no compaction.
+        mgr.record_provider_usage(125_700)
+        mgr.compaction_runs = 3
+        assert mgr.should_summarize([]) is False
+
+        new_cfg = ContextConfig(
+            compaction_threshold_tokens=102_400,
+            summarization_threshold_tokens=102_400,
+            model_max_context_tokens=128_000,
+        )
+        mgr.update_limits(new_cfg, "gpt-5.3-codex-spark")
+
+        assert mgr.config is new_cfg
+        # State survives the swap: the provider anchor makes the very next
+        # should_summarize see the real context size against the new window.
+        assert mgr._state.last_provider_input_tokens == 125_700
+        assert mgr.compaction_runs == 3
+        assert mgr.should_summarize([]) is True
+
+    def test_counter_rebound_to_new_model(self):
+        mgr = ContextManager(config=ContextConfig(), model="gpt-4")
+        old_counter = mgr.token_counter
+        mgr.update_limits(ContextConfig(), "gpt-5.3-codex-spark")
+        assert mgr.token_counter is mgr._default_counter
+        assert mgr.token_counter is not old_counter

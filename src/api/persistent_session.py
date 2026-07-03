@@ -851,6 +851,29 @@ class PersistentSession:
                 logger.warning(f"Failed to restore {cp['path']}: {e}")
         return restored
 
+    def _build_context_config(self) -> ContextConfig:
+        """Derive the ContextConfig from the CURRENT config's limits.
+
+        Shared by initial construction and hot-swap refresh so both always
+        agree on how thresholds derive from ``config.limits``.
+        """
+        ctx = self.config.context_management
+        lim = self.config.limits
+        return ContextConfig(
+            compaction_threshold_tokens=lim.context_threshold_tokens,
+            summarization_threshold_tokens=lim.context_threshold_tokens,
+            message_count_threshold=lim.message_count_threshold,
+            message_count_min_tokens=lim.message_count_min_tokens,
+            keep_recent_tool_results=ctx.keep_recent_tool_results,
+            keep_recent_messages=ctx.keep_recent_messages,
+            # Safety-layer constant (model-aware; see loader fractions).
+            # Summarization budgets are computed at call time from the
+            # aux model's window (src/core/summarizer.py).
+            model_max_context_tokens=lim.model_max_context_tokens,
+            # Per-family image-token estimator (matrix settings.image_tokens).
+            image_tokens=lim.image_tokens,
+        )
+
     def _setup_context_manager(self) -> None:
         """Create context manager for token counting and compaction.
 
@@ -862,27 +885,28 @@ class PersistentSession:
         ``LimitsConfig`` defaults equal the ``ContextConfig`` defaults, so this
         is a no-op when the derivation didn't fire (no regression).
         """
-        ctx = self.config.context_management
-        lim = self.config.limits
         self.context_manager = ContextManager(
-            config=ContextConfig(
-                compaction_threshold_tokens=lim.context_threshold_tokens,
-                summarization_threshold_tokens=lim.context_threshold_tokens,
-                message_count_threshold=lim.message_count_threshold,
-                message_count_min_tokens=lim.message_count_min_tokens,
-                keep_recent_tool_results=ctx.keep_recent_tool_results,
-                keep_recent_messages=ctx.keep_recent_messages,
-                # Safety-layer constant (model-aware; see loader fractions).
-                # Summarization budgets are computed at call time from the
-                # aux model's window (src/core/summarizer.py).
-                model_max_context_tokens=lim.model_max_context_tokens,
-                # Per-family image-token estimator (matrix settings.image_tokens).
-                image_tokens=lim.image_tokens,
-            ),
+            config=self._build_context_config(),
             model=self.config.llm.model or "gpt-4",
             summarization_call_timeout=(
                 self.config.auxiliary.summarization_call_timeout
             ),
+        )
+
+    def refresh_context_limits(self) -> None:
+        """Re-derive context thresholds after a config/model hot-swap.
+
+        Updates the EXISTING ContextManager in place (``update_limits``) so the
+        running loop's captured reference stays valid and the provider-usage
+        anchor survives — a downswitch to a smaller-window model then compacts
+        on the next turn instead of dead-ending in empty responses. See
+        docs/done/session_model_switch_stale_context_manager_empty_response.md.
+        """
+        if getattr(self, "context_manager", None) is None:
+            return
+        self.context_manager.update_limits(
+            self._build_context_config(),
+            self.config.llm.model or "gpt-4",
         )
 
     def _setup_shell_manager(self) -> None:
