@@ -87,7 +87,7 @@ secrets:
     # lands in the `srw` Secret and every agent pod picks it up via envFrom
     # (agent_provisioner.py). Get a key at https://app.tavily.com, paste it
     # below, then `helm upgrade`. See docs/api_key_resolution.md.
-    TAVILY_API_KEY: "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"
+    TAVILY_API_KEY: "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"
 
     # --- App DBs ---
     POSTGRES_USER: "srw"

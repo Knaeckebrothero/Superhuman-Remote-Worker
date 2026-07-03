@@ -486,6 +486,7 @@ class UniversalAgent:
                 model=aux_config.model,
                 base_url=aux_config.base_url,
                 api_key=aux_config.api_key,
+                provider=aux_config.provider,
                 temperature=aux_config.temperature,
                 top_p=model_settings.get("top_p"),
                 top_k=model_settings.get("top_k"),
@@ -494,6 +495,10 @@ class UniversalAgent:
             )
             aux_llm = create_llm(aux_llm_config, limits=limits)
             aux_window = aux_llm_config.model_max_context_tokens or main_window
+            # Drop-in fallback for a dead/unreachable dedicated aux model: the
+            # summarization LLM (main working model). Keeps compaction + memory
+            # alive instead of crashing the job when the aux endpoint fails.
+            aux_fallback = self._summarization_llm
             logger.info(
                 f"Created auxiliary LLM: {aux_config.model}"
                 f" (settings matrix: top_p={aux_llm_config.top_p},"
@@ -504,6 +509,8 @@ class UniversalAgent:
             # Reuse summarization LLM (which is already the best fallback chain)
             aux_llm = self._summarization_llm
             aux_window = main_window
+            # aux already IS the main model — nothing to fall back to.
+            aux_fallback = None
             logger.info("AuxiliaryLLM: reusing summarization LLM")
 
         self._auxiliary_llm = AuxiliaryLLM(
@@ -511,6 +518,7 @@ class UniversalAgent:
             max_iterations=aux_config.max_iterations,
             timeout=aux_config.timeout,
             max_context_tokens=aux_window,
+            fallback_llm=aux_fallback,
         )
 
     def _initialize_citation_verifier(self, limits) -> None:

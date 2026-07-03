@@ -773,6 +773,15 @@ class AuxHealth:
         self._tasks: Dict[str, _TaskHealth] = {}
         self._consecutive_failures = 0
         self._degraded = False
+        #: Reachability of the *dedicated* aux model, tracked by the fallback
+        #: wrapper independently of the caller-driven per-task health. A
+        #: fallback call succeeds (so the caller records success and clears
+        #: ``_degraded``), yet the aux model itself is still down — this flag
+        #: stays False so the heartbeat keeps ``aux_degraded`` lit until an
+        #: actual aux-model call succeeds.
+        self._aux_reachable = True
+        self._last_fallback_task: Optional[str] = None
+        self._last_fallback_error: Optional[str] = None
 
     def _task(self, task: str) -> _TaskHealth:
         t = self._tasks.get(task)
@@ -827,15 +836,53 @@ class AuxHealth:
                 t.last_error,
             )
 
+    def mark_aux_unreachable(self, task: str, exc: BaseException) -> None:
+        """The dedicated aux model failed a call; the caller is falling back to
+        the main model. Tracks aux-model reachability separately from the
+        per-task success/failure counters so a fallback *success* can't mask
+        that the aux model is down. Logs loud on the reachable→unreachable edge
+        (the per-call LOUD log lives in ``_ainvoke_fallback``)."""
+        self._last_fallback_task = task
+        self._last_fallback_error = f"{type(exc).__name__}: {str(exc)[:200]}"
+        if self._aux_reachable:
+            self._aux_reachable = False
+            logger.error(
+                "AUXILIARY MODEL UNREACHABLE: model=%s — running background + "
+                "compaction tasks on the main-model fallback until it recovers "
+                "(latest failing task '%s': %s).",
+                self.model,
+                task,
+                self._last_fallback_error,
+            )
+
+    def mark_aux_reachable(self) -> None:
+        """A call on the dedicated aux model succeeded — clear fallback state.
+        Logs loud only on the unreachable→reachable edge."""
+        if not self._aux_reachable:
+            self._aux_reachable = True
+            self._last_fallback_task = None
+            self._last_fallback_error = None
+            logger.error(
+                "AUXILIARY MODEL REACHABLE AGAIN: model=%s — resuming aux tasks "
+                "on the dedicated model (was on main-model fallback).",
+                self.model,
+            )
+
+    @property
+    def aux_reachable(self) -> bool:
+        return self._aux_reachable
+
     @property
     def degraded(self) -> bool:
-        return self._degraded
+        return self._degraded or not self._aux_reachable
 
     def snapshot(self) -> Dict[str, Any]:
         """JSON-serializable health summary for status endpoints."""
         return {
             "model": self.model,
-            "degraded": self._degraded,
+            "degraded": self.degraded,
+            "on_fallback": not self._aux_reachable,
+            "last_fallback_error": self._last_fallback_error,
             "consecutive_failures": self._consecutive_failures,
             "tasks": {
                 name: {
@@ -873,7 +920,9 @@ class AuxHealth:
             if t.consecutive_failures > 0
         }
         return {
-            "degraded": self._degraded,
+            "degraded": self.degraded,
+            "on_fallback": not self._aux_reachable,
+            "last_fallback_error": self._last_fallback_error,
             "consecutive_failures": self._consecutive_failures,
             "model": self.model,
             "failing_tasks": failing,
@@ -922,8 +971,20 @@ class AuxiliaryLLM:
         job_id: Optional[str] = None,
         agent_type: Optional[str] = None,
         max_context_tokens: Optional[int] = None,
+        fallback_llm: Optional[BaseChatModel] = None,
     ):
         self.llm = llm
+        #: Drop-in fallback for a dead/unreachable *dedicated* aux model —
+        #: normally the main session/worker model, which is always present and
+        #: working (it serves the turns). When the aux model fails a call, the
+        #: task retries here so the session keeps running instead of crashing on
+        #: the next compaction. None when the aux model already IS the main model
+        #: (no separate fallback to fall back to). See
+        #: docs/issues/openrouter_auxiliary_misrouted_to_openai.md.
+        self.fallback_llm = fallback_llm if fallback_llm is not llm else None
+        self._fallback_model_name = (
+            _get_model_name(self.fallback_llm) if self.fallback_llm else None
+        )
         self.max_iterations = max_iterations
         self.timeout = timeout
         self.max_context_tokens = max_context_tokens
@@ -944,6 +1005,77 @@ class AuxiliaryLLM:
         self._job_id = job_id
         self._agent_type = agent_type
 
+    async def _ainvoke_fallback(
+        self,
+        build_runnable,
+        invoke_arg,
+        *,
+        task_name: str,
+        timeout: Optional[float] = None,
+    ):
+        """Invoke ``build_runnable(llm).ainvoke(invoke_arg)`` on the dedicated aux
+        model; on failure, retry once on the main-model fallback.
+
+        ``build_runnable`` maps an LLM to the runnable to invoke (identity for a
+        raw ``ainvoke``, ``.with_structured_output(...)`` for chain mode,
+        ``.bind_tools(...)`` for a single agent turn) — so the exact same
+        fallback wraps every aux call shape.
+
+        Semantics (the calibrated "fail loud" contract):
+          - Aux model succeeds → normal return; aux marked reachable.
+          - Aux model fails + a fallback exists → LOUD error, retry on the main
+            model, return its result. Never silent: ``mark_aux_unreachable``
+            lights the heartbeat ``aux_degraded`` flag.
+          - Aux model fails + no fallback (aux IS the main model), OR the
+            fallback ALSO fails → raise. The caller then fails the turn/session
+            (compaction → ``SummarizationFailed('aux_unavailable')``) rather
+            than limping with half a context.
+        """
+        _timeout = timeout if timeout is not None else self.timeout
+        try:
+            result = await asyncio.wait_for(
+                build_runnable(self.llm).ainvoke(invoke_arg), timeout=_timeout
+            )
+            self.health.mark_aux_reachable()
+            return result
+        except Exception as primary_exc:
+            if self.fallback_llm is None:
+                raise
+            logger.error(
+                "AUXILIARY FALLING BACK TO MAIN MODEL: aux model '%s' failed on "
+                "task '%s' (%s: %s) — retrying on main model '%s'. The dedicated "
+                "auxiliary model is unreachable; background + compaction tasks "
+                "run on the main model (slower/pricier) until it recovers.",
+                self.health.model,
+                task_name,
+                type(primary_exc).__name__,
+                str(primary_exc)[:200],
+                self._fallback_model_name,
+            )
+            self.health.mark_aux_unreachable(task_name, primary_exc)
+            return await asyncio.wait_for(
+                build_runnable(self.fallback_llm).ainvoke(invoke_arg),
+                timeout=_timeout,
+            )
+
+    async def ainvoke(
+        self,
+        messages: List[BaseMessage],
+        *,
+        task_name: str = "raw_invoke",
+        timeout: Optional[float] = None,
+    ):
+        """Raw (unstructured) aux call with main-model fallback.
+
+        For call sites that used to reach past the wrapper into
+        ``auxiliary_llm.llm.ainvoke(...)`` directly (e.g. session title
+        generation). Routes through :meth:`_ainvoke_fallback` so those calls get
+        the same fallback + loud-degrade behaviour as chain/agent.
+        """
+        return await self._ainvoke_fallback(
+            lambda llm: llm, messages, task_name=task_name, timeout=timeout
+        )
+
     async def chain(self, task: AuxTask, timeout: Optional[float] = None) -> BaseModel:
         """Single LLM call: system prompt + context -> structured output.
 
@@ -962,9 +1094,6 @@ class AuxiliaryLLM:
         Raises:
             asyncio.TimeoutError: If the LLM call exceeds timeout
         """
-        structured_llm = self.llm.with_structured_output(
-            task.output_schema, include_raw=True
-        )
         messages = [
             SystemMessage(content=task.system_prompt),
             HumanMessage(content=task.build_context()),
@@ -990,8 +1119,12 @@ class AuxiliaryLLM:
 
         start = time.monotonic()
         raw_result = await self._invoke_aux(
-            asyncio.wait_for(
-                structured_llm.ainvoke(messages),
+            self._ainvoke_fallback(
+                lambda llm: llm.with_structured_output(
+                    task.output_schema, include_raw=True
+                ),
+                messages,
+                task_name=task.__class__.__name__,
                 timeout=timeout if timeout is not None else self.timeout,
             ),
             task=task,
@@ -1032,7 +1165,6 @@ class AuxiliaryLLM:
         from src.services.guardrails import apply_guardrails_to_tools
 
         tools = apply_guardrails_to_tools(tools, model=_get_model_name(self.llm))
-        llm_with_tools = self.llm.bind_tools(tools)
         tool_map = {t.name: t for t in tools}
 
         messages: List[BaseMessage] = [
@@ -1044,8 +1176,10 @@ class AuxiliaryLLM:
         tool_calls_made = 0
         for iteration in range(self.max_iterations):
             response = await self._invoke_aux(
-                asyncio.wait_for(
-                    llm_with_tools.ainvoke(messages),
+                self._ainvoke_fallback(
+                    lambda llm: llm.bind_tools(tools),
+                    messages,
+                    task_name=task.__class__.__name__,
                     timeout=self.timeout,
                 ),
                 task=task,
@@ -1092,9 +1226,6 @@ class AuxiliaryLLM:
         )
 
         # Final structured-output call to get the result
-        structured_llm = self.llm.with_structured_output(
-            task.output_schema, include_raw=True
-        )
         messages.append(
             HumanMessage(
                 content="Summarize what you accomplished in the required output format."
@@ -1102,8 +1233,12 @@ class AuxiliaryLLM:
         )
 
         raw_result = await self._invoke_aux(
-            asyncio.wait_for(
-                structured_llm.ainvoke(messages),
+            self._ainvoke_fallback(
+                lambda llm: llm.with_structured_output(
+                    task.output_schema, include_raw=True
+                ),
+                messages,
+                task_name=task.__class__.__name__,
                 timeout=self.timeout,
             ),
             task=task,
