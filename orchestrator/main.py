@@ -113,6 +113,7 @@ from security.auth import (  # noqa: E402
 )
 from security.access import (  # noqa: E402
     externalize_gitea_url,
+    filter_visible_datasources,
     is_internal_call,
     log_security_event,
     mcp_scope_project_id,
@@ -12654,10 +12655,9 @@ async def list_datasources(
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
-    visible: list[dict[str, Any]] = []
-    for ds in rows:
-        if await user_can_access_datasource(user, postgres_db, ds):
-            visible.append(ds)
+    # Batch the visibility filter: one project-link fetch + one membership
+    # resolution for the whole page (was a per-row N x (1 + M) fan-out).
+    visible = await filter_visible_datasources(user, postgres_db, rows)
     return redact_datasources(visible)
 
 
@@ -16110,13 +16110,16 @@ async def list_threads(
             project_id=project_id,
             status=status,
         )
+        # Phase 2: default-project threads have no legacy session folder, so the
+        # cloud-button URL comes from the project_default mount row. Fetch every
+        # thread's mounts in one query (was a per-thread N+1).
+        mounts_by_thread = await postgres_db.list_thread_mounts_bulk(
+            [str(t["id"]) for t in threads]
+        )
         for t in threads:
-            # Phase 2: default-project threads have no legacy session folder,
-            # so the cloud-button URL has to come from the project_default
-            # mount row instead. Per-thread mounts lookup is N+1 but the
-            # list endpoint is bounded by the user's own thread count.
-            mount_rows = await postgres_db.list_thread_mounts(str(t["id"]))
-            t["cloud_session_url"] = _resolve_cloud_session_url(t, mount_rows)
+            t["cloud_session_url"] = _resolve_cloud_session_url(
+                t, mounts_by_thread.get(str(t["id"]), [])
+            )
         return {"threads": [_redact_thread_metadata(t) for t in threads]}
     except HTTPException:
         raise
