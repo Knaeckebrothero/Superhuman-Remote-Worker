@@ -86,7 +86,7 @@ GET    /api/codex/login/poll                                                    
 GET    /api/codex/models                                                                admin:_require_admin
 GET    /api/codex/status                                                                admin:_require_admin
 GET    /api/codex/usage                                                                 admin:_require_admin
-GET    /api/datasources                                                                 gated:user_can_access_datasource
+GET    /api/datasources                                                                 gated:require_approved_user
 POST   /api/datasources                                                                 gated:require_approved_user
 GET    /api/datasources/eligible                                                        gated:require_project_member
 POST   /api/datasources/ssh-keys/generate                                               gated:require_approved_user
