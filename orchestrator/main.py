@@ -10174,9 +10174,7 @@ async def _advance_project_loop(
             error=last_error,
         )
     except Exception:
-        logger.exception(
-            "project loop %s: retro write failed (non-fatal)", loop_id
-        )
+        logger.exception("project loop %s: retro write failed (non-fatal)", loop_id)
 
     remaining = loop.get("remaining_iterations")
     next_remaining = (remaining - 1) if remaining is not None else None

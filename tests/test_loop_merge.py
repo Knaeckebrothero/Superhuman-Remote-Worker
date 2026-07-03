@@ -174,12 +174,17 @@ class TestWriteLoopRetro:
         job = _job(freeze_data=json.dumps({"notes": "String-typed freeze notes."}))
 
         ok = await write_loop_retro(
-            g, job, ctx={"loop_role": "critic", "loop_iteration": 3},
-            merge_status="empty", merged_sha=None,
+            g,
+            job,
+            ctx={"loop_role": "critic", "loop_iteration": 3},
+            merge_status="empty",
+            merged_sha=None,
         )
 
         assert ok is True
-        text = base64.b64decode(g.change_files.await_args.args[2][0]["content_b64"]).decode()
+        text = base64.b64decode(
+            g.change_files.await_args.args[2][0]["content_b64"]
+        ).decode()
         assert "String-typed freeze notes." in text
         assert '{"notes"' not in text
 
@@ -198,7 +203,9 @@ class TestWriteLoopRetro:
         )
 
         assert ok is True
-        text = base64.b64decode(g.change_files.await_args.args[2][0]["content_b64"]).decode()
+        text = base64.b64decode(
+            g.change_files.await_args.args[2][0]["content_b64"]
+        ).decode()
         assert "status: failed" in text
         assert "agent crash-looped" in text
         assert "(none recorded)" in text  # no freeze_data notes
@@ -217,7 +224,10 @@ class TestWriteLoopRetro:
         g = _make_gitea()
         g.change_files = AsyncMock(return_value=False)
         ok = await write_loop_retro(
-            g, _job(), ctx={"loop_iteration": 1}, merge_status="merged",
+            g,
+            _job(),
+            ctx={"loop_iteration": 1},
+            merge_status="merged",
             merged_sha=None,
         )
         assert ok is False
