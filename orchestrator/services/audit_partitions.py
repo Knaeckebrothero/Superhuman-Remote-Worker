@@ -16,14 +16,18 @@ missing-partition insert fails loudly with SQLSTATE ``23514``.
 
 Design: ``docs/features/postgres_audit_store_implementation.md`` §4.
 
-**Lean-cut scope (PR 1):** creation + ANALYZE + status/alarms are live.
-Auto-retention (``retire_partitions``: DETACH CONCURRENTLY → grace → DROP) is
-deliberately deferred — at the thesis/dev data scale we will not approach the
-90/365-day windows for many months, and the detach/drop protocol is the
-fiddliest, highest-blast-radius part of the module (it must run *outside* a
-transaction on a dedicated connection, and warrants its own retention drill).
-``retire_partitions`` is a documented stub below; re-enabling retention is a
-single-function implementation plus wiring it into ``maintenance_pass``.
+**No-auto-deletion policy (owner decision 2026-07-02):** creation + ANALYZE +
+status/alarms + per-parent size reporting are live; **automatic retention is
+rejected as policy, not deferred as work**. Nothing here deletes operational
+data on a timer. Storage is abundant and audit history is worth more than the
+disk it sits on, so deletion — if ever wanted — is always MANUAL and
+export-first (detach → export to a data lake → only then drop).
+``retire_partitions`` is a permanent, documented no-op that carries the manual
+DETACH-CONCURRENTLY recipe for that day; the ``PARENTS`` windows below are
+reference values, not enforced promises. Monthly partitions still earn their
+keep (query pruning + the natural unit for a future manual export). Revisit only
+if SaaS/GDPR makes deletion a compliance requirement. Design:
+``docs/features/database_roadmap.md`` Phase 6 (D-2).
 
 **Hard boundaries** (true regardless of the lean cut):
 - No DEFAULT partition, ever — it silently parks misrouted rows, then blocks
@@ -47,15 +51,20 @@ import asyncpg
 
 logger = logging.getLogger(__name__)
 
-# table -> retention days (retention itself is deferred in PR 1; the windows are
-# kept here so status/alarms and the future retire path share one source).
+# table -> REFERENCE retention window (days). NOT enforced — the no-auto-deletion
+# policy means nothing drops on a timer (see module docstring + retire_partitions).
+# The dict's KEYS are the load-bearing parent list (creation/ANALYZE/status iterate
+# it); the day VALUES survive only as documentation + the fence a future manual /
+# SaaS-era retention would honour, never as a promise.
 PARENTS: dict[str, int] = {
     "llm_requests": 90,
     "agent_audit": 90,
     "chat_history": 365,
     # Usage-metering ledger (migrations/audit/0002). Billing substrate, so a
-    # longer window than the agent trace; raw rows are droppable once rolled up
-    # to the app-DB usage_daily mirror. (Retention is still deferred below.)
+    # longer reference window than the agent trace. Raw rows are the rollup
+    # SOURCE: usage_daily (app-DB, migrations/app/0047) mirrors them, so IF the
+    # no-deletion policy is ever lifted, raw usage_events may only be dropped for
+    # days already past the rollup_state watermark (else /api/usage loses history).
     "usage_events": 365,
 }
 
@@ -255,24 +264,32 @@ async def retire_partitions(
     retention: dict[str, int] = PARENTS,
     grace_days: int = GRACE_DAYS,
 ) -> dict:
-    """DEFERRED in PR 1 (lean cut) — no-op.
+    """Permanent no-op — automatic retention is rejected by POLICY, not deferred.
 
-    The full protocol (spec: implementation package §4) detaches partitions whose
-    upper bound is older than the retention window via ``DETACH PARTITION ...
-    CONCURRENTLY``, waits ``grace_days``, then DROPs the standalone table. It must
-    run on a dedicated connection *outside* any transaction (DETACH CONCURRENTLY
-    commits internally), guarded by a session-scoped ``pg_try_advisory_lock``,
-    strictly serial per parent (at most one pending-detach per table), and
-    FINALIZE any partition stuck mid-detach before new work.
+    Owner decision 2026-07-02 (``docs/features/database_roadmap.md`` Phase 6 /
+    D-2): nothing deletes operational data on a timer. Deletion, if ever wanted,
+    is MANUAL and export-first. This function stays as the home for the manual
+    recipe rather than being wired into ``maintenance_pass``.
 
-    Re-enable by implementing that here and calling it from ``maintenance_pass``;
-    add the retention drill (backdated partition → detach → finalize → drop) to
-    the test suite at the same time.
+    **Manual export-first recipe** (for a SaaS/GDPR future, run by an operator on
+    a dedicated no-transaction connection, one parent at a time):
+      1. FINALIZE any partition stuck ``inhdetachpending`` first
+         (``ALTER TABLE <parent> DETACH PARTITION <part> FINALIZE``).
+      2. Pick candidates from ``pg_get_expr(relpartbound, oid)`` BOUNDS — never
+         names, never the newest child, never the current-month partition; alarm
+         on any DEFAULT partition (there must be none).
+      3. ``DETACH PARTITION ... CONCURRENTLY`` (commits internally; needs a bare,
+         no-transaction connection + a session ``pg_try_advisory_lock``).
+      4. Export the now-standalone table to the data lake.
+      5. Only then DROP it (no parent lock held).
+
+    ``usage_events`` carries the extra fence in ``PARENTS``: only drop days already
+    past the ``rollup_state`` watermark.
     """
     logger.debug(
-        "audit_partitions: retention deferred (PR 1 lean cut); partitions accumulate"
+        "audit_partitions: retention is a permanent no-op (no-auto-deletion policy)"
     )
-    return {"detached": [], "dropped": [], "deferred": True}
+    return {"detached": [], "dropped": [], "policy": "no-auto-deletion"}
 
 
 async def analyze_parents(
@@ -315,7 +332,8 @@ async def analyze_parents(
 async def partition_status(pool: asyncpg.Pool) -> dict:
     """Per-parent health snapshot. Pure reads, no locks — safe for the health
     payload. ``days_until_unpartitioned`` is the control metric for the
-    lookahead alarms.
+    lookahead alarms; ``total_bytes`` (whole-tree on-disk size) makes growth
+    visible under the no-auto-deletion policy.
     """
     now = datetime.now(timezone.utc)
     status: dict[str, dict] = {}
@@ -357,6 +375,20 @@ async def partition_status(pool: asyncpg.Pool) -> dict:
                 """,
                 parent,
             )
+            # Whole-tree size (heap + indexes + TOAST, summed over every child —
+            # the partitioned parent itself stores nothing). Growth is *visible*
+            # here instead of managed: with retention disabled by policy these
+            # tables only grow, so a size trend is the signal a future manual
+            # export is warranted. Alert thresholds can come later.
+            total_bytes = await conn.fetchval(
+                """
+                SELECT COALESCE(SUM(pg_total_relation_size(i.inhrelid)), 0)
+                FROM pg_inherits i
+                JOIN pg_class p ON p.oid = i.inhparent
+                WHERE p.relname = $1
+                """,
+                parent,
+            )
 
             status[parent] = {
                 "attached": len(attached),
@@ -369,6 +401,7 @@ async def partition_status(pool: asyncpg.Pool) -> dict:
                 "detach_pending": detach_pending,
                 "awaiting_drop": int(awaiting_drop or 0),
                 "last_parent_analyze": last_analyze,
+                "total_bytes": int(total_bytes or 0),
             }
 
     return status
@@ -408,13 +441,13 @@ def _emit_alarms(status: dict) -> None:
 
 
 async def maintenance_pass(pool: asyncpg.Pool) -> dict:
-    """One full pass: ensure -> (retire: deferred) -> analyze -> status + alarm.
+    """One full pass: ensure -> (retire: policy no-op) -> analyze -> status + alarm.
 
     Emits a structured ``audit_partitions.pass_ok`` heartbeat; its absence is
     itself the signal that maintenance has stopped running.
     """
     created = await ensure_partitions(pool)
-    retired = await retire_partitions(pool)  # no-op in the lean cut
+    retired = await retire_partitions(pool)  # permanent no-op (no-auto-deletion policy)
     analyzed = await analyze_parents(pool, force=bool(created))
     status = await partition_status(pool)
     _emit_alarms(status)
@@ -423,7 +456,7 @@ async def maintenance_pass(pool: asyncpg.Pool) -> dict:
         "audit_partitions.pass_ok created=%s analyzed=%s retire=%s",
         created,
         analyzed,
-        "deferred" if retired.get("deferred") else retired,
+        retired.get("policy", retired),
     )
     return {
         "created": created,
