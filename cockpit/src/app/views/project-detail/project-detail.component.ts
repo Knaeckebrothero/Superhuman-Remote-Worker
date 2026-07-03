@@ -1108,6 +1108,8 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
     .merge-conflict { background: var(--danger-tint); color: var(--danger); }
     .merge-skipped { background: var(--surface-0); color: var(--text-muted); }
     .merge-pending { background: var(--warning-tint); color: var(--warning); }
+    .merge-empty { background: var(--warning-tint); color: var(--warning); }
+    .merge-merge-failed { background: var(--danger-tint); color: var(--danger); }
 
     /* Role badges */
     .role-badge {

@@ -108,7 +108,7 @@ async def provision_job_repo(
     gitea_client: Any,
     postgres_db: Any,
     main_cloud_router: Any,
-    work_on_main: bool = False,
+    loop_floor: bool = False,
 ) -> dict[str, Any]:
     """Provision a job's Gitea repo/branch, grant creator access, seed baseline.
 
@@ -191,25 +191,21 @@ async def provision_job_repo(
         repos = await postgres_db.get_project_repositories(project_id, role="jobs")
         if repos:
             jobs_repo = repos[0]
-            if work_on_main:
-                # Loop execution job: work directly on the shared repo's `main`
-                # so commits accumulate IN PLACE and the project artifact
-                # compounds across iterations. No per-job branch — the agent's
-                # autonomy=full commit+push lands on `main`. Seed the scratch
-                # `.gitignore` floor first so job-scoped files never reach it.
-                # See docs/features/loop_repo_compounding.md.
+            if loop_floor:
+                # Loop job (any role): seed the scratch `.gitignore` floor on
+                # `main` so the branch cut below inherits it and the job's
+                # completion squash-merge contains only contribution.
+                # See docs/features/loop_repo_compounding_v2.md.
                 await _ensure_loop_main_gitignore(gitea_client, jobs_repo["name"])
-                branch_name = "main"
-            else:
-                branch_name = f"job/{short_id}"
-                branch_ok = await gitea_client.create_branch(
-                    jobs_repo["name"], branch_name, from_branch="main"
+            branch_name = f"job/{short_id}"
+            branch_ok = await gitea_client.create_branch(
+                jobs_repo["name"], branch_name, from_branch="main"
+            )
+            if not branch_ok:
+                logger.error(
+                    f"Failed to create branch '{branch_name}' in "
+                    f"'{jobs_repo['name']}' — main branch may not exist"
                 )
-                if not branch_ok:
-                    logger.error(
-                        f"Failed to create branch '{branch_name}' in "
-                        f"'{jobs_repo['name']}' — main branch may not exist"
-                    )
             await postgres_db.merge_job_context(
                 job_id_str,
                 {

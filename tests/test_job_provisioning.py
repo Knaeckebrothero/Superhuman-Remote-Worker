@@ -41,7 +41,7 @@ def _make_gitea(*, initialized: bool = True) -> MagicMock:
     )
     g.create_branch = AsyncMock(return_value=True)
     g.grant_user_repo_access = AsyncMock(return_value=True)
-    # Loop execution-on-main path (work_on_main=True): no .gitignore yet → seed.
+    # Loop floor path (loop_floor=True): no .gitignore on main yet → seed.
     g.get_file_bytes = AsyncMock(return_value=None)
     g.change_files = AsyncMock(return_value=True)
     return g
@@ -339,10 +339,11 @@ class TestProvisionJobRepo:
         g.grant_user_repo_access.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_loop_execution_job_works_on_main(self, patched_seed) -> None:
-        """A loop execution job (work_on_main=True) commits to `main` directly:
-        no per-job branch, and the scratch .gitignore floor is seeded so the
-        agent's autonomy=full push compounds the project artifact in place."""
+    async def test_loop_job_seeds_floor_and_branches(self, patched_seed) -> None:
+        """v2: EVERY loop job (loop_floor=True) gets its own job/<id> branch —
+        the execution-on-main asymmetry is gone — and the scratch .gitignore
+        floor is seeded on `main` first so the branch inherits it and the
+        completion squash-merge contains only contribution."""
         g = _make_gitea()
         db = _make_db(
             user=_creator(),
@@ -365,12 +366,14 @@ class TestProvisionJobRepo:
             gitea_client=g,
             postgres_db=db,
             main_cloud_router=MagicMock(),
-            work_on_main=True,
+            loop_floor=True,
         )
 
-        # Works on main — no per-job branch created.
-        g.create_branch.assert_not_called()
-        assert row["branch_name"] == "main"
+        # Per-job branch — even for the execution role.
+        g.create_branch.assert_awaited_once_with(
+            "project-1a387b4d-jobs", "job/abcdef12", from_branch="main"
+        )
+        assert row["branch_name"] == "job/abcdef12"
         assert row["repo_name"] == "project-1a387b4d-jobs"
         # Floor seeded: no .gitignore existed → change_files writes it to main.
         g.change_files.assert_awaited_once()
@@ -414,16 +417,17 @@ class TestProvisionJobRepo:
             gitea_client=g,
             postgres_db=db,
             main_cloud_router=MagicMock(),
-            work_on_main=True,
+            loop_floor=True,
         )
 
         g.change_files.assert_not_called()  # floor already present
-        assert row["branch_name"] == "main"
+        g.create_branch.assert_awaited_once()  # branch still created
 
     @pytest.mark.asyncio
-    async def test_loop_analysis_job_keeps_branch(self, patched_seed) -> None:
-        """work_on_main=False (analysis role) keeps per-job-branch behaviour and
-        never touches `main`'s .gitignore."""
+    async def test_loop_analysis_job_also_seeds_floor(self, patched_seed) -> None:
+        """v2: analysis roles are loop jobs like any other — floor seeded,
+        branch created. (Under v1 they missed the floor when no execution job
+        had run first.)"""
         g = _make_gitea()
         db = _make_db(
             user=_creator(),
@@ -444,19 +448,52 @@ class TestProvisionJobRepo:
             gitea_client=g,
             postgres_db=db,
             main_cloud_router=MagicMock(),
-            work_on_main=False,
+            loop_floor=True,
         )
 
         g.create_branch.assert_awaited_once_with(
             "p-jobs", "job/abcdef12", from_branch="main"
         )
         assert row["branch_name"] == "job/abcdef12"
+        g.change_files.assert_awaited_once()  # floor seeded for analysis too
+
+    @pytest.mark.asyncio
+    async def test_non_loop_project_job_never_touches_floor(
+        self, patched_seed
+    ) -> None:
+        """Default (loop_floor=False): ordinary project jobs branch as before
+        and never write `main`'s .gitignore."""
+        g = _make_gitea()
+        db = _make_db(
+            user=_creator(),
+            project_repos=[{"name": "p-jobs", "repo_url": "http://x/y.git"}],
+            project={"main_cloud_folder_handle": None},
+        )
+        row = {
+            "id": uuid.UUID("abcdef12-0000-0000-0000-000000000000"),
+            "parent_job_id": None,
+            "project_id": uuid.uuid4(),
+            "user_id": uuid.uuid4(),
+            "config_name": "default",
+        }
+
+        await provision_job_repo(
+            job_row=row,
+            gitea_client=g,
+            postgres_db=db,
+            main_cloud_router=MagicMock(),
+        )
+
+        g.create_branch.assert_awaited_once_with(
+            "p-jobs", "job/abcdef12", from_branch="main"
+        )
         g.change_files.assert_not_called()
 
 
 class TestIsLoopExecutionRole:
-    """The role → branch policy: execution roles work on `main`, analysis on a
-    throwaway branch. Unknown/empty roles default to non-execution (safe)."""
+    """Role classification. Under v2 every loop role branches identically;
+    execution-ness now only decides prompt content and how loudly an `empty`
+    merge is flagged. Unknown/empty roles default to non-execution (safe)."""
 
     def test_analysis_roles_are_not_execution(self) -> None:
         from services.project_loops import is_loop_execution_role
