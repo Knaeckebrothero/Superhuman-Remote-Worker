@@ -1655,3 +1655,52 @@ class TestCleanup:
 
         # Should not raise
         await session.cleanup()
+
+
+# ---------------------------------------------------------------------------
+# 2.7b refresh_context_limits()
+# ---------------------------------------------------------------------------
+
+
+class TestRefreshContextLimits:
+    """A model hot-swap must re-derive compaction thresholds IN PLACE on the
+    existing manager — the running loop holds a reference to it, and the
+    provider-usage anchor must survive so a downswitch compacts on the next
+    turn (docs/issues/session_model_switch_stale_context_manager_empty_response.md)."""
+
+    def _cfg_with_limits(self, model, base):
+        cfg = _make_config(model=model)
+        cfg.limits.context_threshold_tokens = int(base * 0.80)
+        cfg.limits.message_count_threshold = 200
+        cfg.limits.message_count_min_tokens = int(base * 0.40)
+        cfg.limits.model_max_context_tokens = base
+        cfg.limits.image_tokens = None
+        cfg.auxiliary.summarization_call_timeout = 240.0
+        return cfg
+
+    def test_downswitch_rebinds_thresholds_in_place(self):
+        session = _make_session(config=self._cfg_with_limits("gpt-5.5", 1_050_000))
+        session._setup_context_manager()
+        manager = session.context_manager
+        assert manager.config.summarization_threshold_tokens == 840_000
+
+        # The repro: ~125.7k of real usage recorded while on gpt-5.5.
+        manager.record_provider_usage(125_700)
+        assert manager.should_summarize([]) is False
+
+        session.config = self._cfg_with_limits("gpt-5.3-codex-spark", 128_000)
+        session.refresh_context_limits()
+
+        # Same object — the loop's captured reference stays valid...
+        assert session.context_manager is manager
+        # ...with the new model's thresholds...
+        assert manager.config.summarization_threshold_tokens == 102_400
+        assert manager.config.model_max_context_tokens == 128_000
+        # ...and the surviving anchor now triggers compaction immediately.
+        assert manager.should_summarize([]) is True
+
+    def test_noop_without_manager(self):
+        """Refresh before setup must not raise (manager not built yet)."""
+        session = _make_session(config=self._cfg_with_limits("gpt-5.5", 1_050_000))
+        assert session.context_manager is None
+        session.refresh_context_limits()

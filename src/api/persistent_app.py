@@ -369,6 +369,11 @@ def _ensure_persistent_loop_started(
                     _session.llm_with_tools,
                     _session.tools,
                 ),
+                get_current_context=lambda: (
+                    _session.context_manager,
+                    _session.config,
+                    _session.auxiliary_llm,
+                ),
                 memory_extraction_prompt=_session.memory_extraction_prompt,
                 memory_service=_session.memory_service,
             ),
@@ -4361,6 +4366,14 @@ async def _handle_config_update(ws: WebSocket, config_override: Dict[str, Any]) 
             )
         else:
             _session.config = new_config
+
+        # Re-derive the compaction thresholds from the NEW config, in place.
+        # Without this the ContextManager keeps the session-start model's
+        # window after a model switch — a downswitch (e.g. gpt-5.5 → codex
+        # spark) then never compacts and every turn dead-ends in "empty
+        # response" once the history exceeds the new model's window. See
+        # docs/done/session_model_switch_stale_context_manager_empty_response.md.
+        _session.refresh_context_limits()
 
         # Rebuild auxiliary LLM if auxiliary settings changed. Symmetric to
         # the chat-side rebuild — the boot-time singleton on _agent doesn't
