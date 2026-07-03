@@ -23,17 +23,27 @@ partially stale — code drifted). `main.py` always means `orchestrator/main.py`
 - `unified_message_store.md` — the Phase 7 design seed. **Two of its load-
   bearing claims are now known false** (see its Corrections block + Phase 7).
 
-## Where we stand (verified against code 2026-07-01)
+## Where we stand (updated 2026-07-03; premises re-verified against code 2026-07-01)
 
-Of the plan's 18 items, **2 are done** (QW-1 batched audit counts `0c3ba669`;
-QW-4 Mongo disable + Postgres-only reader). The drift HF-1 targets has grown:
-**41 app / 7 vector / 2 audit** migration files vs frozen snapshots — and the
-frozen snapshots are **still load-bearing** in two install paths
-(docker-compose initdb mounts them; `python init.py` applies
-`vector_schema.sql` instead of migrations and never initializes the audit DB
-at all — `orchestrator/init.py:324-329`).
+**Phases 1 and 2 are done and on `develop`.** The mechanical debt (QW-1
+`0c3ba669`, QW-4, and QW-2/3/5/6 in Phase 1 `6343852c`) and the drift keystone
+HF-1 are shipped. The drift HF-1 targeted — **45 app / 7 vector / 2 audit**
+migration files that had silently diverged from the frozen snapshots — is now
+structurally prevented: `scripts/schema-snapshot.sh` regenerates committed
+`*_current.sql` artifacts from a from-zero replay and CI fails on any drift
+(Phase 2a, `be0540b4`; the artifact gate is verified green in CI). The two
+install paths that still trusted the frozen snapshots were cut to the migration
+chain in Phase 2b (`02599a5f`): `python init.py`'s vector path now runs
+`apply_migrations()` (it had been loading the stale `vector_schema.sql`, which
+left the vector DB missing halfvec/HNSW), and the docker-compose initdb mounts
+were dropped in favour of the orchestrator's startup migrations. The frozen
+`schema.sql`/`vector_schema.sql` remain only as test fixtures. Migration CI was
+un-stuck in the same arc — the perpetually-red `squawk` job now lints only the
+migrations a push changes rather than re-litigating the whole frozen history
+(`9cae3180`).
 
-The research sweep materially corrected four premises:
+Remaining work is Phases 3–7. The research sweep's four premise corrections
+still shape them:
 
 1. **HF-3 undercounted**: 13 racy `jobs.context` writers, not 8 — five raw
    `SET context = $1::jsonb` statements bypass `update_job_context` with the
