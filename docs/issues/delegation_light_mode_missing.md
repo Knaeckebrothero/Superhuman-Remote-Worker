@@ -17,6 +17,14 @@ onto the shared iterative schema. **Sequencing: light-first** — v1 ships light
 mode for scholar under the shared name; heavy-backend convergence is a marked
 fast-follow.
 Note before calling this done: the heavy path has **never been invoked in production — 0 delegation children all-time** — so shipping the tool is only half the work; the adoption side (prompt/todo-scaffold wiring so models actually use it) is tracked in `subagents_never_used.md`.
+**Update 2026-07-03:** Phases 0–6 **shipped + deployed** (`e65d5e32`, deploy `a4596376`); the
+subagent model **picker** and the **developer exploration fan-out** (T1.3) are also committed
+(`523ec4b2`, `ebc6e4ba`), and the cluster-wide reader default is captured in
+`docs/features/subagent_default_model.md`. **T1.2 cost measured** ([[loop_subagent_forensics]] §7):
+adoption proven & metered; the raw-token target (35.8M→10–15M) did not land on n=3 (subagents
+2.5–5% of spend; parent still ~180k avg), **but** cache is ~35%, steps are bounded to ~300 (no
+runaways), and reads parallelize for speed — token-cost tuning deferred to ~100-job scale. Heavy
+`delegate_work` → `spawn_subagent` convergence remains the marked fast-follow.
 **Component:** `src/tools/delegation/delegate_work.py`, `src/graph.py` (worker
 state machine), `src/api/orchestrator_client.py` (`create_delegation_job`),
 `docs/features/subagent_delegation.md` (design doc that chose the heavyweight
