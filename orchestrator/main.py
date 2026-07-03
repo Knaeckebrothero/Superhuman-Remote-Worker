@@ -17009,6 +17009,8 @@ async def get_thread_messages_history(
             after=after_dt,
             limit=capped_limit,
         )
+        # A cursor window carries no cheap true total; no consumer reads it here.
+        total = len(messages)
     else:
         messages = await postgres_db.get_thread_messages_history(
             thread_id=thread_id,
@@ -17017,8 +17019,16 @@ async def get_thread_messages_history(
         )
         # Legacy paged read: a full page implies there may be more.
         has_more = capped_limit is not None and len(messages) == capped_limit
+        # `total` is otherwise unread (the cockpit uses only `.messages`,
+        # persistent-chat.service.ts:748; the MCP tool doesn't read it). Skip the
+        # per-open COUNT(*): a full load (no limit) returns the whole thread so
+        # len(messages) IS the total; charge the COUNT only for the explicit
+        # limit/offset paged read where a paginating client may want it.
+        if capped_limit is None:
+            total = len(messages)
+        else:
+            total = await postgres_db.get_thread_message_count(thread_id)
 
-    total = await postgres_db.get_thread_message_count(thread_id)
     return {
         "messages": messages,
         "total": total,
