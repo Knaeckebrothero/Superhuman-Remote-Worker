@@ -701,7 +701,7 @@ class TestRestoreFromCheckpoint:
 class TestSaveTurnAiMessages:
     @pytest.mark.asyncio
     async def test_collects_messages_after_last_human(self):
-        """Walks backwards from end, stops at HumanMessage."""
+        """Walks backwards from end, stops at HumanMessage; batches the turn."""
         client = AsyncMock()
         messages = [
             SystemMessage(content="sys"),
@@ -712,12 +712,17 @@ class TestSaveTurnAiMessages:
 
         await _save_turn_ai_messages(client, "tid", messages, 1)
 
-        # Should save AIMessage and ToolMessage (2 messages after last HumanMessage)
-        assert client.save_thread_message.call_count == 2
+        # HF-2: one batched upsert carrying the 2 messages after the last
+        # HumanMessage (was 2 serial save_thread_message calls).
+        client.save_thread_messages.assert_awaited_once()
+        client.save_thread_message.assert_not_called()
+        thread_id, rows = client.save_thread_messages.call_args[0]
+        assert thread_id == "tid"
+        assert [r["role"] for r in rows] == ["ai", "tool"]
 
     @pytest.mark.asyncio
     async def test_collects_all_when_no_human_message(self):
-        """If no HumanMessage, all messages are collected."""
+        """If no HumanMessage, all messages are collected into one batch."""
         client = AsyncMock()
         messages = [
             SystemMessage(content="sys"),
@@ -726,11 +731,13 @@ class TestSaveTurnAiMessages:
 
         await _save_turn_ai_messages(client, "tid", messages, 0)
 
-        assert client.save_thread_message.call_count == 2
+        client.save_thread_messages.assert_awaited_once()
+        _, rows = client.save_thread_messages.call_args[0]
+        assert len(rows) == 2
 
     @pytest.mark.asyncio
     async def test_tool_calls_extracted(self):
-        """Tool calls extracted as list of {name, args, id} dicts."""
+        """Tool calls extracted as list of {name, args, id} dicts in the batch."""
         client = AsyncMock()
         ai_msg = AIMessage(
             content="",
@@ -740,13 +747,14 @@ class TestSaveTurnAiMessages:
 
         await _save_turn_ai_messages(client, "tid", messages, 1)
 
-        call_kwargs = client.save_thread_message.call_args[1]
-        assert call_kwargs["tool_calls"] is not None
-        assert call_kwargs["tool_calls"][0]["name"] == "search"
+        _, rows = client.save_thread_messages.call_args[0]
+        ai_row = next(r for r in rows if r["role"] == "ai")
+        assert ai_row["tool_calls"] is not None
+        assert ai_row["tool_calls"][0]["name"] == "search"
 
     @pytest.mark.asyncio
     async def test_anthropic_list_content_normalized(self):
-        """Anthropic list-of-dicts content joined into string."""
+        """Anthropic list-of-dicts content joined into string in the batch row."""
         client = AsyncMock()
         ai_msg = AIMessage(
             content=[
@@ -758,15 +766,16 @@ class TestSaveTurnAiMessages:
 
         await _save_turn_ai_messages(client, "tid", messages, 1)
 
-        call_kwargs = client.save_thread_message.call_args[1]
-        assert "Hello" in call_kwargs["content"]
-        assert "world" in call_kwargs["content"]
+        _, rows = client.save_thread_messages.call_args[0]
+        ai_row = next(r for r in rows if r["role"] == "ai")
+        assert "Hello" in ai_row["content"]
+        assert "world" in ai_row["content"]
 
     @pytest.mark.asyncio
     async def test_exception_does_not_propagate(self):
         """Outer exception caught and logged."""
         client = AsyncMock()
-        client.save_thread_message.side_effect = RuntimeError("db error")
+        client.save_thread_messages.side_effect = RuntimeError("db error")
         messages = [HumanMessage(content="hi"), AIMessage(content="reply")]
 
         # Should not raise

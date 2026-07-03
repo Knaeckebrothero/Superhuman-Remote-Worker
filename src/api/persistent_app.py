@@ -3984,24 +3984,23 @@ _ROLE_MAP = {
 }
 
 
-async def _persist_one_message(
-    client: Any,
-    thread_id: str,
+def _serialize_message_row(
     msg: Any,
     turn_number: int,
     *,
     metrics: dict | None = None,
     tool_decisions: Optional[Dict[str, str]] = None,
-) -> None:
-    """Serialize one LangChain message to a ``thread_messages`` row and upsert it.
+) -> Dict[str, Any]:
+    """Serialize one LangChain message to a ``thread_messages`` row dict.
 
-    The single serialization point shared by the **incremental** path (persist
-    each message the instant the loop produces it) and the **turn-complete
-    reconciliation** pass. Both pass the message's stable id, so they converge on
-    one row (``ON CONFLICT (id)``): the incremental write lands the content the
-    moment it exists (crash durability); reconciliation re-runs with the
-    turn-level ``metrics`` and approval ``tool_decisions`` and updates the same
-    row. ``seq`` is assigned once on first insert and preserved across the
+    The single serialization point shared by the **incremental** path
+    (:func:`_persist_one_message`, persist each message the instant the loop
+    produces it) and the **turn-complete reconciliation** batch
+    (:func:`_save_turn_ai_messages`). Both carry the message's stable id, so they
+    converge on one row (``ON CONFLICT (id)``): the incremental write lands the
+    content the moment it exists (crash durability); reconciliation re-runs with
+    the turn-level ``metrics`` and approval ``tool_decisions`` and updates the
+    same row. ``seq`` is assigned once on first insert and preserved across the
     update, so it stays a stable cursor.
     """
     raw_type = getattr(msg, "type", "unknown")
@@ -4031,17 +4030,33 @@ async def _persist_one_message(
         )
     # Attach metrics only to AI messages (not tool results)
     msg_metrics = metrics if role == "ai" else None
-    await client.save_thread_message(
-        thread_id=thread_id,
-        role=role,
-        content=content,
-        tool_calls=tc,
-        turn_number=turn_number,
-        metrics=msg_metrics,
-        tool_call_id=tool_call_id,
-        thinking=thinking,
-        id=getattr(msg, "id", None),
+    return {
+        "id": getattr(msg, "id", None),
+        "role": role,
+        "content": content,
+        "tool_calls": tc,
+        "turn_number": turn_number,
+        "metrics": msg_metrics,
+        "tool_call_id": tool_call_id,
+        "thinking": thinking,
+    }
+
+
+async def _persist_one_message(
+    client: Any,
+    thread_id: str,
+    msg: Any,
+    turn_number: int,
+    *,
+    metrics: dict | None = None,
+    tool_decisions: Optional[Dict[str, str]] = None,
+) -> None:
+    """Upsert one serialized message row (the incremental mid-turn durability
+    path). Shares the serializer with the turn-complete reconcile."""
+    row = _serialize_message_row(
+        msg, turn_number, metrics=metrics, tool_decisions=tool_decisions
     )
+    await client.save_thread_message(thread_id=thread_id, **row)
 
 
 async def _save_turn_ai_messages(
@@ -4073,19 +4088,24 @@ async def _save_turn_ai_messages(
                 break
             to_save.append(msg)
         to_save.reverse()
+        if not to_save:
+            return
 
-        # Reconcile each message: re-upsert via the shared serializer, now with
-        # turn-level metrics + approval decisions. Incremental writes already
-        # landed the content mid-turn; this updates the same rows (stable id).
-        for msg in to_save:
-            await _persist_one_message(
-                client,
-                thread_id,
-                msg,
-                turn_number,
-                metrics=metrics,
-                tool_decisions=tool_decisions,
+        # Reconcile the whole turn in ONE batched upsert (was a serial
+        # save_thread_message per message — ~2 round-trips each). Re-upserts
+        # ALL turn rows via the shared serializer, now with turn-level metrics +
+        # approval decisions: incremental writes already landed the content
+        # mid-turn, this updates the same rows (stable id, ON CONFLICT). Saving
+        # every row (not just AI) keeps the reconcile the durability backstop for
+        # any incremental write that was dropped mid-turn (_loop_persist_message
+        # is best-effort).
+        rows = [
+            _serialize_message_row(
+                msg, turn_number, metrics=metrics, tool_decisions=tool_decisions
             )
+            for msg in to_save
+        ]
+        await client.save_thread_messages(thread_id, rows)
     except Exception as e:
         logger.warning(f"Failed to save turn messages (non-fatal): {e}")
 
