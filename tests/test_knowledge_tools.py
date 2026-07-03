@@ -842,7 +842,7 @@ class TestKbLint:
         ws, _ = _fake_kb_workspace(
             {
                 "knowledge/n1.md": (
-                    "---\nid: n1\ntype: decision\ndescription: \"d\"\n---\n\n"
+                    '---\nid: n1\ntype: decision\ndescription: "d"\n---\n\n'
                     "# N1\n\nSee [ghost](ghost.md).\n"
                 ),
             }
@@ -856,7 +856,7 @@ class TestKbLint:
         ctx = _make_context()
         ctx.has_workspace.return_value = True
         ws, _ = _fake_kb_workspace(
-            {"docs/a.md": "---\nid: a\ntype: note\ndescription: \"d\"\n---\n\n# A\n"}
+            {"docs/a.md": '---\nid: a\ntype: note\ndescription: "d"\n---\n\n# A\n'}
         )
         ctx.workspace_manager = ws
         tools, _ = _make_tools(ctx)
@@ -878,7 +878,7 @@ class TestKbIndex:
         ws, writes = _fake_kb_workspace(
             {
                 "knowledge/chose-jwt.md": (
-                    "---\nid: chose-jwt\ntype: decision\ndescription: \"We chose JWT.\"\n"
+                    '---\nid: chose-jwt\ntype: decision\ndescription: "We chose JWT."\n'
                     "---\n\n# Chose JWT\n\nbody\n"
                 ),
             }
@@ -898,7 +898,7 @@ class TestKbIndex:
         ws, writes = _fake_kb_workspace(
             {
                 "knowledge/good.md": (
-                    "---\nid: good\ntype: learning\ndescription: \"d\"\n---\n\n# Good\n"
+                    '---\nid: good\ntype: learning\ndescription: "d"\n---\n\n# Good\n'
                 ),
                 "knowledge/index.md": "# Index\n\n(reserved, not a note)\n",
                 "knowledge/broken.md": "---\nnot: : yaml\n---\nbody",
@@ -1296,9 +1296,7 @@ class TestKbWriteVerdictGate:
         kg = MagicMock()
         kg.create_note.return_value = "new-slug"
         ks = _GateStore(neighbours=[])
-        tools, _ = _gated_tools(
-            kg, ks, KnowledgeVerdict(action="ADD", reason="new")
-        )
+        tools, _ = _gated_tools(kg, ks, KnowledgeVerdict(action="ADD", reason="new"))
         result = self._write(tools)
         assert "Created" in result
         kg.create_note.assert_called_once()
@@ -1307,9 +1305,7 @@ class TestKbWriteVerdictGate:
         kg = MagicMock()
         # neighbour content hashes to the candidate's content → content-hash prefilter
         ks = _GateStore(neighbours=[_kb_neighbour("dup-note", "some content")])
-        tools, _ = _gated_tools(
-            kg, ks, KnowledgeVerdict(action="ADD", reason="unused")
-        )
+        tools, _ = _gated_tools(kg, ks, KnowledgeVerdict(action="ADD", reason="unused"))
         result = self._write(tools, content="some content")
         assert "DISCARD" in result
         assert "dup-note" in result
@@ -1319,7 +1315,9 @@ class TestKbWriteVerdictGate:
         kg = MagicMock()
         kg.update_note.return_value = True
         kg.read_note.return_value = {
-            "type": "decision", "title": "Old", "content": "new content",
+            "type": "decision",
+            "title": "Old",
+            "content": "new content",
             "status": "active",
         }
         ks = _GateStore(neighbours=[_kb_neighbour("old-note", "different old text")])
@@ -1336,11 +1334,15 @@ class TestKbWriteVerdictGate:
         kg.create_note.return_value = "new-slug"
         kg.update_note.return_value = True
         kg.read_note.return_value = {
-            "type": "decision", "title": "Old", "content": "old", "status": "superseded",
+            "type": "decision",
+            "title": "Old",
+            "content": "old",
+            "status": "superseded",
         }
         ks = _GateStore(neighbours=[_kb_neighbour("stale-note", "different old text")])
         tools, _ = _gated_tools(
-            kg, ks,
+            kg,
+            ks,
             KnowledgeVerdict(action="SUPERSEDE", target_indices=[1], reason="replaced"),
         )
         result = self._write(tools, content="fresh content")

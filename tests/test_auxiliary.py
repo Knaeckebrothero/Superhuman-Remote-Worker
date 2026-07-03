@@ -311,7 +311,9 @@ class TestCurateKnowledgeTask:
 # =============================================================================
 
 
-_TEST_VERDICT_PROMPT = "You adjudicate knowledge notes. Return ADD/UPDATE/SUPERSEDE/DISCARD."
+_TEST_VERDICT_PROMPT = (
+    "You adjudicate knowledge notes. Return ADD/UPDATE/SUPERSEDE/DISCARD."
+)
 
 
 class TestKnowledgeVerdict:
