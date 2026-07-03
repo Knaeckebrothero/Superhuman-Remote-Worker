@@ -1220,3 +1220,153 @@ class TestKbUpdateDualWrite:
                 {"note": "n1", "content": "x"},
             )
         assert "Updated" in result
+
+
+# =============================================================================
+# kb_write ingestion verdict gate (slice 2 PR2)
+# =============================================================================
+
+import hashlib as _hashlib  # noqa: E402
+from types import SimpleNamespace  # noqa: E402
+
+from src.services.auxiliary import KnowledgeVerdict  # noqa: E402
+from src.services.knowledge.ingestion import KnowledgeVerdictService  # noqa: E402
+
+
+class _GateAux:
+    """Aux stub whose chain() returns a fixed KnowledgeVerdict."""
+
+    def __init__(self, verdict):
+        self._verdict = verdict
+
+    async def chain(self, task, timeout=None):
+        return self._verdict
+
+
+class _GateStore:
+    """KnowledgeStore stub for the gate: async embed + find_similar_many + upsert."""
+
+    def __init__(self, neighbours):
+        self._neighbours = neighbours
+        self.embedding_service = SimpleNamespace(embed=self._embed)
+        self.upsert_note = AsyncMock(return_value=uuid.uuid4())
+
+    async def _embed(self, text):
+        return [0.1, 0.2, 0.3]
+
+    async def find_similar_many(self, project_id, embedding, k=5, min_similarity=0.6):
+        return self._neighbours
+
+
+def _kb_neighbour(note_id, content, title="N"):
+    return SimpleNamespace(
+        note_id=note_id,
+        content=content,
+        title=title,
+        similarity=0.85,
+        created_at=None,
+        content_hash=_hashlib.sha256(content.encode()).hexdigest(),
+    )
+
+
+def _gated_tools(kg, ks, verdict, prompt="ADJUDICATE"):
+    """Build kb tools with a real verdict service (asyncio NOT mocked)."""
+    ctx = MagicMock()
+    ctx.project_id = str(uuid.uuid4())
+    ctx.project_ids = [ctx.project_id]
+    ctx.job_id = str(uuid.uuid4())
+    ctx.config = {"current_phase": 1}
+    ctx.knowledge_graph = kg
+    ctx.knowledge_store = ks
+    ctx.has_git.return_value = False  # skip dual-write for isolation
+    service = KnowledgeVerdictService(
+        _GateAux(verdict), SimpleNamespace(verdict_top_k=5, review_floor=0.6)
+    )
+    tools = create_kb_tools(ctx, verdict_service=service, verdict_prompt=prompt)
+    return tools, ctx
+
+
+class TestKbWriteVerdictGate:
+    def _write(self, tools, **kw):
+        args = {"title": "New Note", "type": "decision", "content": "some content"}
+        args.update(kw)
+        return _invoke(_get_tool(tools, "kb_write"), args)
+
+    def test_add_when_no_neighbours(self):
+        kg = MagicMock()
+        kg.create_note.return_value = "new-slug"
+        ks = _GateStore(neighbours=[])
+        tools, _ = _gated_tools(
+            kg, ks, KnowledgeVerdict(action="ADD", reason="new")
+        )
+        result = self._write(tools)
+        assert "Created" in result
+        kg.create_note.assert_called_once()
+
+    def test_discard_exact_duplicate_skips_write(self):
+        kg = MagicMock()
+        # neighbour content hashes to the candidate's content → content-hash prefilter
+        ks = _GateStore(neighbours=[_kb_neighbour("dup-note", "some content")])
+        tools, _ = _gated_tools(
+            kg, ks, KnowledgeVerdict(action="ADD", reason="unused")
+        )
+        result = self._write(tools, content="some content")
+        assert "DISCARD" in result
+        assert "dup-note" in result
+        kg.create_note.assert_not_called()
+
+    def test_update_redirects_edit_onto_target(self):
+        kg = MagicMock()
+        kg.update_note.return_value = True
+        kg.read_note.return_value = {
+            "type": "decision", "title": "Old", "content": "new content",
+            "status": "active",
+        }
+        ks = _GateStore(neighbours=[_kb_neighbour("old-note", "different old text")])
+        tools, _ = _gated_tools(
+            kg, ks, KnowledgeVerdict(action="UPDATE", target_indices=[1], reason="fix")
+        )
+        result = self._write(tools, content="new content")
+        assert "Updated" in result and "old-note" in result
+        kg.create_note.assert_not_called()
+        kg.update_note.assert_called_once()
+
+    def test_supersede_creates_then_retires_target(self):
+        kg = MagicMock()
+        kg.create_note.return_value = "new-slug"
+        kg.update_note.return_value = True
+        kg.read_note.return_value = {
+            "type": "decision", "title": "Old", "content": "old", "status": "superseded",
+        }
+        ks = _GateStore(neighbours=[_kb_neighbour("stale-note", "different old text")])
+        tools, _ = _gated_tools(
+            kg, ks,
+            KnowledgeVerdict(action="SUPERSEDE", target_indices=[1], reason="replaced"),
+        )
+        result = self._write(tools, content="fresh content")
+        assert "Created" in result and "superseded" in result
+        kg.create_note.assert_called_once()
+        # retire call: status=superseded on the stale note
+        retire_kwargs = kg.update_note.call_args.kwargs
+        assert retire_kwargs.get("status") == "superseded"
+        assert retire_kwargs.get("note_id") == "stale-note"
+
+    def test_no_service_writes_ungated(self):
+        # Sanity: the default (no verdict service) path is unchanged.
+        kg = MagicMock()
+        kg.create_note.return_value = "slug"
+        ks = _GateStore(neighbours=[_kb_neighbour("x", "some content")])
+        ctx = MagicMock()
+        ctx.project_id = str(uuid.uuid4())
+        ctx.job_id = str(uuid.uuid4())
+        ctx.config = {"current_phase": 1}
+        ctx.knowledge_graph = kg
+        ctx.knowledge_store = ks
+        ctx.has_git.return_value = False
+        tools = create_kb_tools(ctx)  # no verdict service
+        result = _invoke(
+            _get_tool(tools, "kb_write"),
+            {"title": "N", "type": "decision", "content": "some content"},
+        )
+        assert "Created" in result
+        kg.create_note.assert_called_once()
