@@ -1138,6 +1138,7 @@ class PromptMatrixResolver(MatrixResolver):
         "memory_extraction": "memory_extraction_prompt.txt",
         "curation": "curation_prompt.txt",
         "knowledge_assembler": "knowledge_assembler_prompt.txt",
+        "knowledge_verdict": "knowledge_verdict_prompt.txt",
         "citation_verification": "citation_verification_prompt.txt",
     }
 
@@ -1692,9 +1693,22 @@ class MemoryConfig:
 
 @dataclass
 class AuxiliaryTaskConfig:
-    """Per-task configuration overrides for auxiliary tasks."""
+    """Per-task configuration overrides for auxiliary tasks.
+
+    ``verdict``/``verdict_top_k``/``review_floor`` are the knowledge-ingestion
+    verdict gate (OKF KB slice 2 PR2) — used only by ``curate_knowledge``. They
+    mirror ``memory.ingestion``: when ``verdict`` is on, each curation candidate
+    is adjudicated against its top-``verdict_top_k`` neighbours (fetched via
+    ``KnowledgeStore.find_similar_many``) before a ``kb_write``/``kb_update``,
+    and the LLM is consulted only when a neighbour scores at/above
+    ``review_floor`` similarity (the cost guard). Default off — a measured
+    opt-in like ``memory.ingestion.enabled``.
+    """
 
     enabled: bool = True
+    verdict: bool = False
+    verdict_top_k: int = 5
+    review_floor: float = 0.6
 
 
 @dataclass
@@ -2003,6 +2017,9 @@ def _parse_auxiliary_config(data: Dict[str, Any]) -> AuxiliaryConfig:
         if isinstance(task_conf, dict):
             tasks[task_name] = AuxiliaryTaskConfig(
                 enabled=task_conf.get("enabled", True),
+                verdict=bool(task_conf.get("verdict", False)),
+                verdict_top_k=int(task_conf.get("verdict_top_k", 5)),
+                review_floor=float(task_conf.get("review_floor", 0.6)),
             )
         else:
             tasks[task_name] = AuxiliaryTaskConfig(enabled=bool(task_conf))

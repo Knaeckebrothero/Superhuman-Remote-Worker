@@ -2716,6 +2716,7 @@ def create_archive_phase_node(
     memory_extraction_prompt: str = "",
     curation_prompt: str = "",
     knowledge_assembler_prompt: str = "",
+    knowledge_verdict_prompt: str = "",
     memory_service: Optional[Any] = None,
 ) -> Callable[[UniversalAgentState], Dict[str, Any]]:
     """Create the archive_phase node.
@@ -2882,6 +2883,18 @@ def create_archive_phase_node(
                     phase_context_parts.append(f"Archive: {archive_path}")
                 phase_context_parts.extend(curation_todo_summaries)
                 curation_phase_data = "\n".join(phase_context_parts)
+                # Build the ingestion verdict gate if curate_knowledge.verdict is
+                # on (OKF KB slice 2 PR2) — otherwise None and the curator writes
+                # ungated, exactly as before. Prompt is resolved at build time and
+                # handed to the gate per curation event (kb_write → gate_candidate).
+                from src.services.knowledge.ingestion import (
+                    build_knowledge_verdict_service,
+                )
+
+                verdict_service = build_knowledge_verdict_service(
+                    auxiliary_llm,
+                    config.auxiliary.tasks.get("curate_knowledge"),
+                )
                 asyncio.create_task(
                     curate_and_store_knowledge(
                         auxiliary_llm=auxiliary_llm,
@@ -2890,6 +2903,8 @@ def create_archive_phase_node(
                         workspace_md=ws_md or "",
                         plan_md=plan_md_content or "",
                         curation_prompt=curation_prompt,
+                        verdict_service=verdict_service,
+                        verdict_prompt=knowledge_verdict_prompt,
                     )
                 )
             except Exception as e:
@@ -4375,6 +4390,9 @@ def build_phase_alternation_graph(
     knowledge_assembler_prompt = load_auxiliary_prompt(
         config, "knowledge_assembler", model=aux_model
     )
+    knowledge_verdict_prompt = load_auxiliary_prompt(
+        config, "knowledge_verdict", model=aux_model
+    )
 
     # workspace_template is no longer used — workspace.md replaced by
     # project knowledge base + memory system. Parameter kept for backward compat.
@@ -4493,6 +4511,7 @@ def build_phase_alternation_graph(
         memory_extraction_prompt=memory_extraction_prompt,
         curation_prompt=curation_prompt,
         knowledge_assembler_prompt=knowledge_assembler_prompt,
+        knowledge_verdict_prompt=knowledge_verdict_prompt,
         memory_service=memory_service,
     )
 

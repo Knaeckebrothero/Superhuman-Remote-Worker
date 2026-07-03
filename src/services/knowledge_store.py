@@ -492,6 +492,48 @@ class KnowledgeStore:
 
         return [KnowledgeRecord.from_row(dict(row)) for row in rows]
 
+    async def find_similar_many(
+        self,
+        project_id: uuid.UUID,
+        embedding: Union[List[float], str],
+        k: int = 5,
+        min_similarity: float = 0.6,
+    ) -> List[KnowledgeRecord]:
+        """Return the top-``k`` active neighbours above ``min_similarity``.
+
+        The KB analog of ``RecallStore.find_similar_many`` — the neighbour fetch
+        that feeds the ingestion verdict (slice 2 PR2). Only ``status = 'active'``
+        rows are candidates: a verdict never compares a new note against an
+        already superseded/archived one. Each returned record carries a transient
+        ``.similarity`` (cosine, closest first) for the verdict prompt; an empty
+        list is the cost-guard signal (no neighbour above the floor → straight
+        ADD, no LLM call).
+        """
+        embedding_vec = self._prepare_embedding(embedding)
+        rows = await self.db.fetch(
+            """
+            SELECT *, 1 - (embedding <=> $1) AS similarity
+            FROM knowledge_index
+            WHERE project_id = $2
+              AND embedding IS NOT NULL
+              AND status = 'active'
+              AND 1 - (embedding <=> $1) >= $3
+            ORDER BY similarity DESC
+            LIMIT $4
+            """,
+            embedding_vec,
+            project_id,
+            min_similarity,
+            k,
+        )
+        records: List[KnowledgeRecord] = []
+        for row in rows:
+            row_dict = dict(row)
+            rec = KnowledgeRecord.from_row(row_dict)
+            rec.similarity = row_dict.get("similarity")
+            records.append(rec)
+        return records
+
     async def get_summary(
         self,
         project_id: Optional[uuid.UUID] = None,

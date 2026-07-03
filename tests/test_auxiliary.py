@@ -21,6 +21,8 @@ from src.services.auxiliary import (
     ExtractedMemory,
     ExtractMemoriesTask,
     CurationResult,
+    KnowledgeVerdict,
+    KnowledgeVerdictTask,
     _format_messages_for_extraction,
     _get_message_role,
 )
@@ -150,6 +152,34 @@ class TestAuxiliaryConfigParsing:
         assert config.auxiliary.tasks["extract_memories"].enabled is True
         assert config.auxiliary.tasks["curate_knowledge"].enabled is True
 
+    def test_curator_verdict_defaults_off(self):
+        # The KB ingestion verdict gate is a measured opt-in (mirrors
+        # memory.ingestion.enabled) — off by default with the memory knob values.
+        config = _parse_auxiliary_config({})
+        ck = config.tasks["curate_knowledge"]
+        assert ck.verdict is False
+        assert ck.verdict_top_k == 5
+        assert ck.review_floor == 0.6
+
+    def test_curator_verdict_knobs_parse(self):
+        config = _parse_auxiliary_config(
+            {
+                "tasks": {
+                    "curate_knowledge": {
+                        "enabled": True,
+                        "verdict": True,
+                        "verdict_top_k": 8,
+                        "review_floor": 0.72,
+                    }
+                }
+            }
+        )
+        ck = config.tasks["curate_knowledge"]
+        assert ck.enabled is True
+        assert ck.verdict is True
+        assert ck.verdict_top_k == 8
+        assert ck.review_floor == 0.72
+
 
 # =============================================================================
 # ExtractMemoriesTask
@@ -274,6 +304,71 @@ class TestCurateKnowledgeTask:
             prompt=_TEST_CURATION_PROMPT,
         )
         assert task.get_tools() is mock_tools
+
+
+# =============================================================================
+# KnowledgeVerdict + KnowledgeVerdictTask (OKF KB slice 2 PR2)
+# =============================================================================
+
+
+_TEST_VERDICT_PROMPT = "You adjudicate knowledge notes. Return ADD/UPDATE/SUPERSEDE/DISCARD."
+
+
+class TestKnowledgeVerdict:
+    """The verdict schema — the KB analog of IngestionVerdict."""
+
+    def test_add_needs_no_targets(self):
+        v = KnowledgeVerdict(action="ADD", reason="new")
+        assert v.action == "ADD"
+        assert v.target_indices == []
+
+    def test_supersede_carries_targets(self):
+        v = KnowledgeVerdict(action="SUPERSEDE", target_indices=[1, 2], reason="stale")
+        assert v.action == "SUPERSEDE"
+        assert v.target_indices == [1, 2]
+
+
+class TestKnowledgeVerdictTask:
+    """Chain-mode task that formats the candidate + neighbours for the adjudicator."""
+
+    def test_system_prompt_is_event_time_prompt(self):
+        task = KnowledgeVerdictTask(
+            candidate_content="c", neighbours=[], prompt=_TEST_VERDICT_PROMPT
+        )
+        assert task.system_prompt == _TEST_VERDICT_PROMPT
+
+    def test_output_schema(self):
+        task = KnowledgeVerdictTask(
+            candidate_content="c", neighbours=[], prompt=_TEST_VERDICT_PROMPT
+        )
+        assert task.output_schema is KnowledgeVerdict
+
+    def test_build_context_numbers_neighbours_with_similarity_and_title(self):
+        task = KnowledgeVerdictTask(
+            candidate_content="We now use RS256, not HS256.",
+            neighbours=[
+                {"content": "Auth uses HS256.", "similarity": 0.88, "title": "Auth"},
+            ],
+            prompt=_TEST_VERDICT_PROMPT,
+        )
+        ctx = task.build_context()
+        assert "We now use RS256" in ctx
+        assert "Auth uses HS256." in ctx
+        assert "similarity 0.88" in ctx
+        assert "Auth" in ctx
+        assert "[1]" in ctx
+        # instruction lists the four KB verbs
+        assert "ADD" in ctx and "SUPERSEDE" in ctx and "DISCARD" in ctx
+
+    def test_build_context_omits_similarity_when_absent(self):
+        task = KnowledgeVerdictTask(
+            candidate_content="c",
+            neighbours=[{"content": "n1"}],
+            prompt=_TEST_VERDICT_PROMPT,
+        )
+        ctx = task.build_context()
+        assert "similarity" not in ctx
+        assert "[1]" in ctx and "n1" in ctx
 
 
 # =============================================================================
