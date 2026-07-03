@@ -194,7 +194,6 @@ podman-compose up -d
 This starts:
 - **PostgreSQL** — Job tracking and data storage (+ SSO databases for Keycloak/Nextcloud)
 - **PostgreSQL (Vector)** — Citations, embeddings, knowledge index (pgvector)
-- **MongoDB** — LLM request logging and audit trail
 - **Neo4j** — Graph database for project knowledge base
 - **Keycloak** — SSO identity provider (OIDC for all services)
 - **Gitea** — Git server for agent workspace repositories (Keycloak OIDC login)
@@ -207,7 +206,7 @@ This starts:
 - **Cockpit** — Web UI for job management and monitoring
 - **NATS** — Messaging for VM lifecycle and agent communication
 - **MinIO** — S3-compatible object storage for VM snapshots and IDE sessions
-- **pgAdmin / mongo-express** — Database admin UIs
+- **pgAdmin** — Database admin UI
 - **Dozzle** — Container log viewer
 
 ### 4. Access Services
@@ -646,8 +645,8 @@ pytest tests/ --cov=src                    # With coverage
        │           │           │           │
        ▼           ▼           ▼           ▼
  ┌───────────┐ ┌───────────┐ ┌───────────┐ ┌───────────┐
- │ PostgreSQL│ │  MongoDB  │ │   Neo4j   │ │Datasources│
- │ (system)  │ │ (logging) │ │(knowledge)│ │ (per-job) │
+ │ PostgreSQL│ │  AuditDB  │ │   Neo4j   │ │Datasources│
+ │ (system)  │ │  (audit)  │ │(knowledge)│ │ (per-job) │
  └───────────┘ └───────────┘ └───────────┘ └───────────┘
 ```
 
@@ -720,5 +719,5 @@ Licensed under the [Functional Source License, Version 1.1 (FSL-1.1-ALv2)](LICEN
 Third-party components bundled into our images (and their upstream NOTICE
 obligations) are inventoried in [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).
 Server images the Helm chart pulls from public registries (Neo4j, PostgreSQL,
-MongoDB, …) arrive under their own upstream licenses and are not redistributed by
+…) arrive under their own upstream licenses and are not redistributed by
 this project.

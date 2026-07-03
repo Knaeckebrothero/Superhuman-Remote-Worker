@@ -16,9 +16,6 @@ headscale:
 pgadmin:
   enabled: true
 
-mongoExpress:
-  enabled: true
-
 dozzle:
   enabled: true
 

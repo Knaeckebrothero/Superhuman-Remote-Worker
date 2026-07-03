@@ -13,7 +13,7 @@ backend owning and cleaning up its own tmpdir. It does **not** violate the
 agent-driven can touch it — there are no file tools over it, and durable
 outputs in ``none`` mode are ``freeze_data``, KB writes, and datasource writes.
 Scratch state is disposable by design (the LangGraph checkpoint already lives
-on agent-local disk; phase archives are mirrored to the MongoDB audit trail).
+on agent-local disk; phase archives are mirrored to the Postgres audit trail).
 
 ``supports_shell`` is False and there is no ``$HOME`` concept, so shell, git,
 and repository-datasource clones are unavailable by construction (§7).

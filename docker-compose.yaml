@@ -88,20 +88,6 @@ services:
       retries: 5
     restart: unless-stopped
 
-  mongodb:
-    image: docker.io/library/mongo:7
-    container_name: srw-mongodb
-    environment:
-      MONGO_INITDB_DATABASE: srw_logs
-    volumes:
-      - mongodb_data:/data/db
-    healthcheck:
-      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    restart: unless-stopped
-
   neo4j:
     image: docker.io/library/neo4j:5
     container_name: srw-neo4j
@@ -306,7 +292,6 @@ services:
       # Core databases
       DATABASE_URL: postgresql://${POSTGRES_USER:-srw}:${POSTGRES_PASSWORD:-srw_password}@postgres:5432/${POSTGRES_DB:-srw}
       VECTOR_DB_URL: postgresql://${VECTOR_POSTGRES_USER:-srw}:${VECTOR_POSTGRES_PASSWORD:-srw_password}@postgres-vector:5432/${VECTOR_POSTGRES_DB:-srw_vector}
-      MONGODB_URL: mongodb://mongodb:27017/srw_logs
       WORKSPACE_PATH: /workspace
       # Gitea
       GITEA_URL: http://gitea:3000
@@ -408,8 +393,6 @@ services:
         condition: service_healthy
       postgres-vector:
         condition: service_healthy
-      mongodb:
-        condition: service_healthy
       gitea:
         condition: service_healthy
     healthcheck:
@@ -427,7 +410,6 @@ services:
       # Core databases
       DATABASE_URL: postgresql://${POSTGRES_USER:-srw}:${POSTGRES_PASSWORD:-srw_password}@postgres:5432/${POSTGRES_DB:-srw}
       VECTOR_DB_URL: postgresql://${VECTOR_POSTGRES_USER:-srw}:${VECTOR_POSTGRES_PASSWORD:-srw_password}@postgres-vector:5432/${VECTOR_POSTGRES_DB:-srw_vector}
-      MONGODB_URL: mongodb://mongodb:27017/srw_logs
       ORCHESTRATOR_URL: http://orchestrator:8085
       WORKSPACE_PATH: /workspace
       # LLM routing
@@ -754,24 +736,6 @@ services:
       retries: 5
     restart: unless-stopped
 
-  mongo-express:
-    image: docker.io/library/mongo-express:latest
-    container_name: srw-mongo-express
-    environment:
-      ME_CONFIG_MONGODB_SERVER: mongodb
-      ME_CONFIG_BASICAUTH: "false"
-    ports:
-      - "${MONGO_EXPRESS_PORT:-8081}:8081"
-    depends_on:
-      mongodb:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8081/"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    restart: unless-stopped
-
   # ---------------------------------------------------------------------------
   # Codex OAuth Proxy (optional — for codex/* models via ChatGPT subscription)
   # ---------------------------------------------------------------------------
@@ -830,8 +794,6 @@ volumes:
     name: srw_postgres_keycloak_data
   postgres_vector_data:
     name: srw_postgres_vector_data
-  mongodb_data:
-    name: srw_mongodb_data
   neo4j_data:
     name: srw_neo4j_data
   nats_data:

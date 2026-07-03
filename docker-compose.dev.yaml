@@ -27,10 +27,10 @@
 # the production remote backend path.
 #
 # Start only databases (no workspaces):
-#   podman-compose -f docker-compose.dev.yaml up -d postgres postgres-vector mongodb
+#   podman-compose -f docker-compose.dev.yaml up -d postgres postgres-vector
 #
 # Start databases + MCP:
-#   podman-compose -f docker-compose.dev.yaml up -d postgres postgres-vector mongodb mcp
+#   podman-compose -f docker-compose.dev.yaml up -d postgres postgres-vector mcp
 #
 # Start Codex OAuth proxy (for codex/* models via ChatGPT subscription):
 #   podman-compose -f docker-compose.dev.yaml up -d codex-proxy
@@ -95,21 +95,6 @@ services:
       timeout: 5s
       retries: 5
 
-  mongodb:
-    image: docker.io/library/mongo:7
-    container_name: srw-mongodb
-    environment:
-      MONGO_INITDB_DATABASE: srw_logs
-    volumes:
-      - mongodb_dev_data:/data/db
-    ports:
-      - "${MONGODB_PORT:-27017}:27017"
-    healthcheck:
-      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
   pgadmin:
     image: docker.io/dpage/pgadmin4:latest
     container_name: srw-pgadmin
@@ -140,19 +125,6 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-
-  mongo-express:
-    image: docker.io/library/mongo-express:latest
-    container_name: srw-mongo-express
-    environment:
-      ME_CONFIG_MONGODB_SERVER: mongodb
-      ME_CONFIG_BASICAUTH: "false"
-    ports:
-      - "${MONGO_EXPRESS_PORT:-8081}:8081"
-    depends_on:
-      mongodb:
-        condition: service_healthy
-    restart: unless-stopped
 
   nats:
     image: docker.io/nats:2.10-alpine
@@ -628,8 +600,6 @@ volumes:
     name: srw_postgres_keycloak_dev_data
   postgres_vector_dev_data:
     name: srw_postgres_vector_dev_data
-  mongodb_dev_data:
-    name: srw_mongodb_dev_data
   neo4j_dev_data:
     name: srw_neo4j_dev_data
   nats_dev_data:

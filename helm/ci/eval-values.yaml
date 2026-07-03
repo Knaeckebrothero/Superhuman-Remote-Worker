@@ -36,8 +36,6 @@ vmController:
 # No home-cluster admin UIs / mesh on a minimal box.
 pgadmin:
   enabled: false
-mongoExpress:
-  enabled: false
 dozzle:
   enabled: false
 codexProxy:

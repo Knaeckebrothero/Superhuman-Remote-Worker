@@ -1,4 +1,4 @@
-"""LLM Request Archiver & Agent Auditor - stores LLM requests and agent steps in MongoDB.
+"""LLM Request Archiver & Agent Auditor - stores LLM requests and agent steps in the Postgres audit store.
 
 This module provides functionality to archive all LLM interactions and agent steps for:
 - Debugging and troubleshooting
@@ -38,7 +38,6 @@ Usage:
 """
 
 import logging
-import os
 import uuid
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence
@@ -57,28 +56,12 @@ if TYPE_CHECKING:
     from src.database.audit_writer import SyncAuditWriter
 
 
-def _serialize_for_mongo(obj: Any) -> Any:
-    """Recursively serialize objects for MongoDB storage.
-
-    Converts uuid.UUID objects to strings since pymongo requires explicit
-    UUID representation configuration otherwise.
-    """
-    if isinstance(obj, uuid.UUID):
-        return str(obj)
-    elif isinstance(obj, dict):
-        return {k: _serialize_for_mongo(v) for k, v in obj.items()}
-    elif isinstance(obj, (list, tuple)):
-        return [_serialize_for_mongo(item) for item in obj]
-    return obj
-
-
 def _serialize_payload(obj: Any) -> Any:
     """Serialize objects for JSONB storage in the Postgres audit store.
 
-    Like :func:`_serialize_for_mongo` (UUID -> str) but also converts
-    ``datetime`` -> UTC ISO-8601 string with a ``Z`` suffix (microsecond
-    precision, matching the wire output the Mongo path produced), since JSONB
-    has no native datetime type.
+    Converts ``uuid.UUID`` -> str and ``datetime`` -> UTC ISO-8601 string with
+    a ``Z`` suffix (microsecond precision), since JSONB has no native UUID or
+    datetime type.
     """
     if isinstance(obj, uuid.UUID):
         return str(obj)
@@ -226,7 +209,7 @@ def inflight_tool_call(messages: Sequence[BaseMessage]) -> Optional[Dict[str, An
 
 
 class LLMArchiver:
-    """Archives LLM requests and responses to MongoDB.
+    """Archives LLM requests and responses to the Postgres audit store.
 
     Provides:
     - Request/response storage with full message history
@@ -236,168 +219,42 @@ class LLMArchiver:
 
     def __init__(
         self,
-        mongodb_url: Optional[str] = None,
-        database_name: str = "srw_logs",
-        collection_name: str = "llm_requests",
-        audit_collection_name: str = "agent_audit",
         writer: Optional["SyncAuditWriter"] = None,
     ):
-        """Initialize the archiver.
+        """Initialize the archiver over the Postgres audit backend.
 
         Args:
-            mongodb_url: MongoDB connection string (Mongo backend only)
-            database_name: Database name (Mongo backend only)
-            collection_name: Collection for LLM requests (Mongo backend only)
-            audit_collection_name: Collection for agent audit trail (Mongo only)
-            writer: A :class:`SyncAuditWriter` selects the Postgres backend; when
-                set, the Mongo fields are unused and pymongo is never imported.
+            writer: A :class:`SyncAuditWriter` bound to the audit DB. When
+                ``None`` the archiver is inert — ``_ensure_connected`` fails
+                and every write no-ops.
         """
-        self._is_postgres = writer is not None
         self._writer = writer
-
-        # Mongo state (unused in Postgres mode).
-        self._mongodb_url = mongodb_url
-        self._database_name = database_name
-        self._collection_name = collection_name
-        self._audit_collection_name = audit_collection_name
-        self._mongo_db = None
-        self._collection = None
-        self._audit_collection = None
-        self._chat_history_collection = None
-        self._connected = False
-        self._connection_attempted = False
-        self._step_counters: Dict[str, int] = {}  # Per-job step counters
-
-        if not self._is_postgres:
-            # Import here to avoid circular imports (and to skip pymongo entirely
-            # on the Postgres path).
-            from src.database.mongo_db import MongoDB
-
-            self._mongo_db = MongoDB(url=mongodb_url) if mongodb_url else None
 
     @classmethod
     def from_env(cls) -> Optional["LLMArchiver"]:
         """Create archiver from environment variables.
 
-        ``AUDIT_BACKEND`` (default ``mongodb``) selects the backend:
-        - ``postgres`` -> :class:`SyncAuditWriter` gated on ``AUDIT_POSTGRES_*``
-          / ``AUDIT_DB_URL``
-        - ``mongodb``  -> the legacy Mongo archiver gated on ``MONGODB_URL``
-
-        Returns an archiver if the selected backend is configured, else None
-        (so ``get_archiver()`` is None and all guarded call sites no-op).
+        The Postgres audit store is the only backend: gated on the
+        ``AUDIT_POSTGRES_*`` / ``AUDIT_DB_URL`` config consumed by
+        :meth:`SyncAuditWriter.from_env`. Returns an archiver when the audit
+        DB is configured, else ``None`` (so ``get_archiver()`` is ``None`` and
+        all guarded call sites no-op).
         """
-        backend = os.getenv("AUDIT_BACKEND", "mongodb").strip().lower()
+        from src.database.audit_writer import SyncAuditWriter
 
-        if backend == "postgres":
-            from src.database.audit_writer import SyncAuditWriter
-
-            writer = SyncAuditWriter.from_env()
-            if writer is None:
-                logger.debug(
-                    "AUDIT_BACKEND=postgres but audit DB unconfigured; "
-                    "LLM archiving disabled"
-                )
-                return None
-            return cls(writer=writer)
-
-        # Default: MongoDB backend.
-        mongodb_url = os.getenv("MONGODB_URL")
-        if not mongodb_url:
-            logger.debug("MONGODB_URL not set, LLM archiving disabled")
+        writer = SyncAuditWriter.from_env()
+        if writer is None:
+            logger.debug("Audit DB unconfigured; LLM archiving disabled")
             return None
-
-        # Extract database name from URL if present
-        # Format: mongodb://host:port/database_name
-        db_name = "srw_logs"
-        if "/" in mongodb_url:
-            url_path = mongodb_url.split("/")[-1]
-            if url_path and "?" not in url_path:
-                db_name = url_path
-            elif "?" in url_path:
-                db_name = url_path.split("?")[0] or "srw_logs"
-
-        return cls(mongodb_url=mongodb_url, database_name=db_name)
+        return cls(writer=writer)
 
     def _ensure_connected(self) -> bool:
-        """Ensure the active backend is ready to write.
+        """Ensure the Postgres audit backend is ready to write.
 
         Returns:
-            True if connected, False otherwise.
+            True if the writer is configured and ready, False otherwise.
         """
-        if self._is_postgres:
-            return self._writer is not None and self._writer.ensure_ready()
-
-        if self._connected:
-            return True
-
-        if self._connection_attempted:
-            return False
-
-        if not self._mongo_db:
-            return False
-
-        self._connection_attempted = True
-
-        try:
-            # MongoDB class has lazy connection - access db property to trigger connection
-            if self._mongo_db.db is None:
-                logger.warning("MongoDB connection not available")
-                return False
-
-            # Get collections from the underlying database
-            self._collection = self._mongo_db.db[self._collection_name]
-            self._audit_collection = self._mongo_db.db[self._audit_collection_name]
-            self._chat_history_collection = self._mongo_db.db["chat_history"]
-            self._connected = True
-
-            # Create compound index for call_type-filtered queries
-            try:
-                self._collection.create_index(
-                    [("job_id", 1), ("call_type", 1), ("timestamp", 1)],
-                    background=True,
-                )
-            except Exception as e:
-                logger.debug(f"Index creation skipped (may already exist): {e}")
-
-            logger.info(f"LLM Archiver connected to MongoDB: {self._database_name}")
-            return True
-
-        except Exception as e:
-            logger.warning(f"Failed to connect to MongoDB: {e}")
-            return False
-
-    def _get_next_step_number(self, job_id: str) -> int:
-        """Get the next step number for a job.
-
-        On first access for a given job_id, queries MongoDB for the current
-        max step_number so that resumed jobs continue numbering sequentially
-        instead of restarting from 1.
-
-        Args:
-            job_id: Job identifier
-
-        Returns:
-            Next sequential step number for this job.
-        """
-        if job_id not in self._step_counters:
-            # Resume from existing max step_number in MongoDB
-            if self._audit_collection is not None:
-                try:
-                    max_doc = self._audit_collection.find_one(
-                        {"job_id": job_id},
-                        sort=[("step_number", -1)],
-                        projection={"step_number": 1},
-                    )
-                    self._step_counters[job_id] = (
-                        max_doc["step_number"] if max_doc else 0
-                    )
-                except Exception:
-                    self._step_counters[job_id] = 0
-            else:
-                self._step_counters[job_id] = 0
-        self._step_counters[job_id] += 1
-        return self._step_counters[job_id]
+        return self._writer is not None and self._writer.ensure_ready()
 
     def _truncate_string(self, s: str, max_length: int = 500) -> str:
         """Truncate a string to max_length with ellipsis indicator."""
@@ -484,77 +341,31 @@ class LLMArchiver:
             tool_str = f"{tool_count} tools" if tool_count > 0 else "no tools"
             type_str = f" | type={call_type}" if call_type != "main" else ""
 
-            if self._is_postgres:
-                row = {
-                    "job_id": job_id,
-                    "agent_type": agent_type,
-                    "call_type": call_type,
-                    "model": model,
-                    "iteration": iteration,
-                    "timestamp": datetime.now(timezone.utc),
-                    "latency_ms": latency_ms,
-                    "request": request_data,
-                    "response": response_dict,
-                    "metadata": _serialize_payload(_lean_job_metadata(metadata))
-                    if metadata
-                    else None,
-                    "auxiliary_metadata": _serialize_payload(auxiliary_metadata)
-                    if auxiliary_metadata
-                    else None,
-                    "metrics": metrics,
-                }
-                request_id = self._writer.insert_llm_request(row)
-                if request_id is None:
-                    return None
-                logger.info(
-                    f"[LLM] {request_id} | job={job_id[:8]}... | {iter_str} | "
-                    f"{latency_str} | {tool_str}{type_str}"
-                )
-                if call_type == "main":
-                    self._archive_chat_entry(
-                        job_id=job_id,
-                        agent_type=agent_type,
-                        messages=messages,
-                        response=response,
-                        model=model,
-                        latency_ms=latency_ms,
-                        iteration=iteration,
-                        request_id=request_id,
-                        phase=phase,
-                        phase_number=phase_number,
-                    )
-                return request_id
-
-            # ---- MongoDB backend ----
-            doc = {
+            row = {
                 "job_id": job_id,
                 "agent_type": agent_type,
-                "timestamp": datetime.now(timezone.utc),
-                "model": model,
                 "call_type": call_type,
+                "model": model,
+                "iteration": iteration,
+                "timestamp": datetime.now(timezone.utc),
+                "latency_ms": latency_ms,
                 "request": request_data,
                 "response": response_dict,
+                "metadata": _serialize_payload(_lean_job_metadata(metadata))
+                if metadata
+                else None,
+                "auxiliary_metadata": _serialize_payload(auxiliary_metadata)
+                if auxiliary_metadata
+                else None,
+                "metrics": metrics,
             }
-            if latency_ms is not None:
-                doc["latency_ms"] = latency_ms
-            if iteration is not None:
-                doc["iteration"] = iteration
-            if metadata:
-                doc["metadata"] = _serialize_for_mongo(metadata)
-            if auxiliary_metadata:
-                doc["auxiliary_metadata"] = _serialize_for_mongo(auxiliary_metadata)
-            doc["metrics"] = metrics
-
-            result = self._collection.insert_one(doc)
-            doc_id = str(result.inserted_id)
-
+            request_id = self._writer.insert_llm_request(row)
+            if request_id is None:
+                return None
             logger.info(
-                f"[LLM] {doc_id[-8:]} | job={job_id[:8]}... | {iter_str} | "
+                f"[LLM] {request_id} | job={job_id[:8]}... | {iter_str} | "
                 f"{latency_str} | {tool_str}{type_str}"
             )
-
-            # Only write to chat_history for main loop calls — auxiliary calls
-            # aren't part of the agent's conversational flow
             if call_type == "main":
                 self._archive_chat_entry(
                     job_id=job_id,
@@ -564,12 +375,11 @@ class LLMArchiver:
                     model=model,
                     latency_ms=latency_ms,
                     iteration=iteration,
-                    request_id=doc_id,
+                    request_id=request_id,
                     phase=phase,
                     phase_number=phase_number,
                 )
-
-            return doc_id
+            return request_id
 
         except Exception as e:
             logger.warning(f"Failed to archive LLM request: {e}")
@@ -617,169 +427,39 @@ class LLMArchiver:
             }
             type_str = f" | type={call_type}" if call_type != "main" else ""
 
-            if self._is_postgres:
-                # llm_requests has no status/error columns and response is
-                # NOT NULL: fold the error into metadata and store an empty
-                # response so a failed (usually auxiliary) call stays queryable.
-                row = {
-                    "job_id": job_id,
-                    "agent_type": agent_type,
-                    "call_type": call_type,
-                    "model": model,
-                    "iteration": None,
-                    "timestamp": datetime.now(timezone.utc),
-                    "latency_ms": latency_ms,
-                    "request": request_data,
-                    "response": {},
-                    "metadata": {
-                        "status": "error",
-                        "error": {"type": error_type, "message": error[:2000]},
-                    },
-                    "auxiliary_metadata": _serialize_payload(auxiliary_metadata)
-                    if auxiliary_metadata
-                    else None,
-                    "metrics": metrics,
-                }
-                request_id = self._writer.insert_llm_request(row)
-                if request_id is not None:
-                    logger.warning(
-                        f"[LLM-ERR] {request_id} | job={job_id[:8]}... | "
-                        f"{error_type}: {error[:120]}{type_str}"
-                    )
-                return request_id
-
-            # ---- MongoDB backend ----
-            doc = {
+            # llm_requests has no status/error columns and response is
+            # NOT NULL: fold the error into metadata and store an empty
+            # response so a failed (usually auxiliary) call stays queryable.
+            row = {
                 "job_id": job_id,
                 "agent_type": agent_type,
-                "timestamp": datetime.now(timezone.utc),
-                "model": model,
                 "call_type": call_type,
-                "status": "error",
-                "error": {"type": error_type, "message": error[:2000]},
+                "model": model,
+                "iteration": None,
+                "timestamp": datetime.now(timezone.utc),
+                "latency_ms": latency_ms,
                 "request": request_data,
-                "response": None,
+                "response": {},
+                "metadata": {
+                    "status": "error",
+                    "error": {"type": error_type, "message": error[:2000]},
+                },
+                "auxiliary_metadata": _serialize_payload(auxiliary_metadata)
+                if auxiliary_metadata
+                else None,
+                "metrics": metrics,
             }
-            if latency_ms is not None:
-                doc["latency_ms"] = latency_ms
-            if auxiliary_metadata:
-                doc["auxiliary_metadata"] = _serialize_for_mongo(auxiliary_metadata)
-            doc["metrics"] = metrics
-
-            result = self._collection.insert_one(doc)
-            doc_id = str(result.inserted_id)
-            logger.warning(
-                f"[LLM-ERR] {doc_id[-8:]} | job={job_id[:8]}... | "
-                f"{error_type}: {error[:120]}{type_str}"
-            )
-            return doc_id
+            request_id = self._writer.insert_llm_request(row)
+            if request_id is not None:
+                logger.warning(
+                    f"[LLM-ERR] {request_id} | job={job_id[:8]}... | "
+                    f"{error_type}: {error[:120]}{type_str}"
+                )
+            return request_id
 
         except Exception as e:
             logger.warning(f"Failed to archive LLM error: {e}")
             return None
-
-    def get_conversation(
-        self,
-        job_id: str,
-        agent_type: Optional[str] = None,
-        limit: int = 100,
-        call_type: Optional[str] = "main",
-    ) -> List[Dict[str, Any]]:
-        """Get conversation history for a job.
-
-        Args:
-            job_id: Job identifier
-            agent_type: Optional filter by agent type
-            limit: Maximum number of records to return
-            call_type: Filter by call type. Defaults to "main".
-                       Pass None to include all call types.
-
-        Returns:
-            List of archived requests, sorted by timestamp ascending.
-        """
-        if not self._ensure_connected():
-            return []
-
-        try:
-            query: Dict[str, Any] = {"job_id": job_id}
-            if agent_type:
-                query["agent_type"] = agent_type
-            if call_type is not None:
-                query["call_type"] = call_type
-
-            cursor = self._collection.find(query).sort("timestamp", 1).limit(limit)
-            return list(cursor)
-
-        except Exception as e:
-            logger.warning(f"Failed to query conversation: {e}")
-            return []
-
-    def get_job_stats(self, job_id: str) -> Dict[str, Any]:
-        """Get statistics for a job's LLM usage.
-
-        Args:
-            job_id: Job identifier
-
-        Returns:
-            Dict with usage statistics including breakdown by call_type.
-        """
-        if not self._ensure_connected():
-            return {}
-
-        try:
-            # Overall totals
-            pipeline = [
-                {"$match": {"job_id": job_id}},
-                {
-                    "$group": {
-                        "_id": "$job_id",
-                        "total_requests": {"$sum": 1},
-                        "total_input_chars": {"$sum": "$metrics.input_chars"},
-                        "total_output_chars": {"$sum": "$metrics.output_chars"},
-                        "total_tool_calls": {"$sum": "$metrics.tool_calls"},
-                        "avg_latency_ms": {"$avg": "$latency_ms"},
-                        "first_request": {"$min": "$timestamp"},
-                        "last_request": {"$max": "$timestamp"},
-                        "models_used": {"$addToSet": "$model"},
-                    }
-                },
-            ]
-
-            results = list(self._collection.aggregate(pipeline))
-            if not results:
-                return {}
-
-            stats = results[0]
-            stats.pop("_id", None)
-
-            # Breakdown by call_type
-            type_pipeline = [
-                {"$match": {"job_id": job_id}},
-                {
-                    "$group": {
-                        "_id": "$call_type",
-                        "count": {"$sum": 1},
-                        "input_chars": {"$sum": "$metrics.input_chars"},
-                        "output_chars": {"$sum": "$metrics.output_chars"},
-                    }
-                },
-            ]
-
-            type_results = list(self._collection.aggregate(type_pipeline))
-            stats["by_call_type"] = {
-                r["_id"]: {
-                    "count": r["count"],
-                    "input_chars": r["input_chars"],
-                    "output_chars": r["output_chars"],
-                }
-                for r in type_results
-            }
-
-            return stats
-
-        except Exception as e:
-            logger.warning(f"Failed to get job stats: {e}")
-            return {}
 
     def _archive_chat_entry(
         self,
@@ -876,83 +556,26 @@ class LLMArchiver:
                         ),
                     }
 
-            if self._is_postgres:
-                self._writer.insert_chat_entry(
-                    {
-                        "job_id": job_id,
-                        "agent_type": agent_type,
-                        "iteration": iteration,
-                        "model": model,
-                        "timestamp": datetime.now(timezone.utc),
-                        "latency_ms": latency_ms,
-                        "phase": phase,
-                        "phase_number": phase_number,
-                        "request_id": request_id,
-                        "inputs": new_inputs,
-                        "response": response_data,
-                        "reasoning": reasoning,
-                    }
-                )
-                logger.debug(f"[CHAT] Archived chat entry for job {job_id[:8]}...")
-                return
-
-            # ---- MongoDB backend ----
-            if self._chat_history_collection is None:
-                return
-
-            doc: Dict[str, Any] = {
-                "job_id": job_id,
-                "agent_type": agent_type,
-                "timestamp": datetime.now(timezone.utc),
-                "iteration": iteration,
-                "model": model,
-                "latency_ms": latency_ms,
-                "inputs": new_inputs,
-                "response": response_data,
-                "request_id": request_id,
-            }
-
-            if phase:
-                doc["phase"] = phase
-            if phase_number is not None:
-                doc["phase_number"] = phase_number
-            if reasoning:
-                doc["reasoning"] = reasoning
-
-            self._chat_history_collection.insert_one(doc)
+            self._writer.insert_chat_entry(
+                {
+                    "job_id": job_id,
+                    "agent_type": agent_type,
+                    "iteration": iteration,
+                    "model": model,
+                    "timestamp": datetime.now(timezone.utc),
+                    "latency_ms": latency_ms,
+                    "phase": phase,
+                    "phase_number": phase_number,
+                    "request_id": request_id,
+                    "inputs": new_inputs,
+                    "response": response_data,
+                    "reasoning": reasoning,
+                }
+            )
             logger.debug(f"[CHAT] Archived chat entry for job {job_id[:8]}...")
 
         except Exception as e:
             logger.warning(f"Failed to archive chat entry: {e}")
-
-    def get_recent_requests(
-        self,
-        limit: int = 50,
-        agent_type: Optional[str] = None,
-    ) -> List[Dict[str, Any]]:
-        """Get most recent LLM requests across all jobs.
-
-        Args:
-            limit: Maximum number of records
-            agent_type: Optional filter by agent type
-
-        Returns:
-            List of recent requests, newest first.
-        """
-        if not self._ensure_connected():
-            return []
-
-        try:
-            query = {}
-            if agent_type:
-                query["agent_type"] = agent_type
-
-            cursor = self._collection.find(query).sort("timestamp", -1).limit(limit)
-            return list(cursor)
-
-        except Exception as e:
-            logger.warning(f"Failed to get recent requests: {e}")
-            return []
 
     # =========================================================================
     # Agent Audit Methods - Complete execution history tracking
@@ -991,67 +614,28 @@ class LLMArchiver:
             return None
 
         try:
-            if self._is_postgres:
-                row = {
-                    "job_id": job_id,
-                    "agent_type": agent_type,
-                    "iteration": iteration,
-                    "step_type": step_type,
-                    "node_name": node_name,
-                    "phase": phase,
-                    "phase_number": phase_number,
-                    "timestamp": datetime.now(timezone.utc),
-                    "latency_ms": latency_ms,
-                    "payload": _serialize_payload(data) if data else {},
-                    "metadata": _serialize_payload(_lean_job_metadata(metadata))
-                    if metadata
-                    else None,
-                }
-                audit_id = self._writer.insert_audit_pre(row)
-                if audit_id is not None:
-                    logger.debug(
-                        f"[AUDIT] {audit_id} | job={job_id[:8]}... | "
-                        f"iter={iteration} | {step_type}"
-                    )
-                return audit_id
-
-            # ---- MongoDB backend ----
-            step_number = self._get_next_step_number(job_id)
-
-            doc = {
+            row = {
                 "job_id": job_id,
                 "agent_type": agent_type,
                 "iteration": iteration,
-                "step_number": step_number,
                 "step_type": step_type,
                 "node_name": node_name,
+                "phase": phase,
+                "phase_number": phase_number,
                 "timestamp": datetime.now(timezone.utc),
+                "latency_ms": latency_ms,
+                "payload": _serialize_payload(data) if data else {},
+                "metadata": _serialize_payload(_lean_job_metadata(metadata))
+                if metadata
+                else None,
             }
-
-            # Add phase info if provided
-            if phase is not None:
-                doc["phase"] = phase
-            if phase_number is not None:
-                doc["phase_number"] = phase_number
-
-            if latency_ms is not None:
-                doc["latency_ms"] = latency_ms
-
-            if metadata:
-                doc["metadata"] = _serialize_for_mongo(metadata)
-
-            # Merge step-specific data
-            if data:
-                doc.update(_serialize_for_mongo(data))
-
-            result = self._audit_collection.insert_one(doc)
-            doc_id = str(result.inserted_id)
-
-            logger.debug(
-                f"[AUDIT] {doc_id[-8:]} | job={job_id[:8]}... | "
-                f"iter={iteration} | step={step_number} | {step_type}"
-            )
-            return doc_id
+            audit_id = self._writer.insert_audit_pre(row)
+            if audit_id is not None:
+                logger.debug(
+                    f"[AUDIT] {audit_id} | job={job_id[:8]}... | "
+                    f"iter={iteration} | {step_type}"
+                )
+            return audit_id
 
         except Exception as e:
             logger.warning(f"Failed to audit step: {e}")
@@ -1146,44 +730,17 @@ class LLMArchiver:
             return False
 
         try:
-            if self._is_postgres:
-                payload = {
-                    "tool": {
-                        "result_preview": self._truncate_string(result, 500),
-                        "result_size_bytes": len(result) if result else 0,
-                        "success": success,
-                    },
-                    "completed_at": _iso_utc_now(),
-                }
-                if error:
-                    payload["tool"]["error"] = self._truncate_string(error, 500)
-                return self._writer.insert_audit_post(audit_doc_id, payload, latency_ms)
-
-            # ---- MongoDB backend ----
-            from bson import ObjectId
-
-            update_data = {
-                "tool.result_preview": self._truncate_string(result, 500),
-                "tool.result_size_bytes": len(result) if result else 0,
-                "tool.success": success,
-                "completed_at": datetime.now(timezone.utc),
-                "latency_ms": latency_ms,
+            payload = {
+                "tool": {
+                    "result_preview": self._truncate_string(result, 500),
+                    "result_size_bytes": len(result) if result else 0,
+                    "success": success,
+                },
+                "completed_at": _iso_utc_now(),
             }
             if error:
-                update_data["tool.error"] = self._truncate_string(error, 500)
-
-            result_obj = self._audit_collection.update_one(
-                {"_id": ObjectId(audit_doc_id)}, {"$set": update_data}
-            )
-
-            if result_obj.modified_count > 0:
-                logger.debug(f"[AUDIT] Updated tool result: {audit_doc_id[-8:]}")
-                return True
-            else:
-                logger.warning(
-                    f"[AUDIT] No document updated for tool result: {audit_doc_id}"
-                )
-                return False
+                payload["tool"]["error"] = self._truncate_string(error, 500)
+            return self._writer.insert_audit_post(audit_doc_id, payload, latency_ms)
 
         except Exception as e:
             logger.warning(f"Failed to update tool result: {e}")
@@ -1271,162 +828,30 @@ class LLMArchiver:
             return False
 
         try:
-            if self._is_postgres:
-                payload = {
-                    "llm": {
-                        "request_id": request_id,
-                        "response_content_preview": response_preview,
-                        "tool_calls": tool_calls,
-                        "metrics": {
-                            "output_chars": output_chars,
-                            "tool_call_count": len(tool_calls) if tool_calls else 0,
-                        },
+            payload = {
+                "llm": {
+                    "request_id": request_id,
+                    "response_content_preview": response_preview,
+                    "tool_calls": tool_calls,
+                    "metrics": {
+                        "output_chars": output_chars,
+                        "tool_call_count": len(tool_calls) if tool_calls else 0,
                     },
-                    "completed_at": _iso_utc_now(),
-                }
-                return self._writer.insert_audit_post(
-                    audit_doc_id, payload, latency_ms, request_id=request_id
-                )
-
-            # ---- MongoDB backend ----
-            from bson import ObjectId
-
-            update_data = {
-                "llm.request_id": request_id,
-                "llm.response_content_preview": response_preview,
-                "llm.tool_calls": tool_calls,
-                "llm.metrics": {
-                    "output_chars": output_chars,
-                    "tool_call_count": len(tool_calls) if tool_calls else 0,
                 },
-                "completed_at": datetime.now(timezone.utc),
-                "latency_ms": latency_ms,
+                "completed_at": _iso_utc_now(),
             }
-
-            result = self._audit_collection.update_one(
-                {"_id": ObjectId(audit_doc_id)}, {"$set": update_data}
+            return self._writer.insert_audit_post(
+                audit_doc_id, payload, latency_ms, request_id=request_id
             )
-
-            if result.modified_count > 0:
-                logger.debug(f"[AUDIT] Updated LLM response: {audit_doc_id[-8:]}")
-                return True
-            else:
-                logger.warning(
-                    f"[AUDIT] No document updated for LLM response: {audit_doc_id}"
-                )
-                return False
 
         except Exception as e:
             logger.warning(f"Failed to update LLM response: {e}")
             return False
 
-    def get_job_audit_trail(
-        self,
-        job_id: str,
-        step_type: Optional[str] = None,
-        limit: int = 1000,
-    ) -> List[Dict[str, Any]]:
-        """Get complete audit trail for a job.
-
-        Args:
-            job_id: Job identifier
-            step_type: Optional filter by step type
-            limit: Maximum number of records
-
-        Returns:
-            List of audit records, sorted by step_number ascending.
-        """
-        if not self._ensure_connected():
-            return []
-
-        try:
-            query = {"job_id": job_id}
-            if step_type:
-                query["step_type"] = step_type
-
-            cursor = (
-                self._audit_collection.find(query).sort("step_number", 1).limit(limit)
-            )
-            return list(cursor)
-
-        except Exception as e:
-            logger.warning(f"Failed to get audit trail: {e}")
-            return []
-
-    def get_audit_stats(self, job_id: str) -> Dict[str, Any]:
-        """Get audit statistics for a job.
-
-        Args:
-            job_id: Job identifier
-
-        Returns:
-            Dict with audit statistics by step type.
-        """
-        if not self._ensure_connected():
-            return {}
-
-        try:
-            pipeline = [
-                {"$match": {"job_id": job_id}},
-                {
-                    "$group": {
-                        "_id": "$step_type",
-                        "count": {"$sum": 1},
-                        "avg_latency_ms": {"$avg": "$latency_ms"},
-                        "total_latency_ms": {"$sum": "$latency_ms"},
-                    }
-                },
-            ]
-
-            results = list(self._audit_collection.aggregate(pipeline))
-
-            stats = {
-                "total_steps": 0,
-                "by_step_type": {},
-            }
-            for r in results:
-                step_type = r["_id"]
-                stats["by_step_type"][step_type] = {
-                    "count": r["count"],
-                    "avg_latency_ms": r.get("avg_latency_ms"),
-                    "total_latency_ms": r.get("total_latency_ms"),
-                }
-                stats["total_steps"] += r["count"]
-
-            # Also get first/last timestamps
-            time_pipeline = [
-                {"$match": {"job_id": job_id}},
-                {
-                    "$group": {
-                        "_id": None,
-                        "first_step": {"$min": "$timestamp"},
-                        "last_step": {"$max": "$timestamp"},
-                        "max_iteration": {"$max": "$iteration"},
-                    }
-                },
-            ]
-            time_results = list(self._audit_collection.aggregate(time_pipeline))
-            if time_results:
-                stats["first_step"] = time_results[0].get("first_step")
-                stats["last_step"] = time_results[0].get("last_step")
-                stats["max_iteration"] = time_results[0].get("max_iteration")
-
-            return stats
-
-        except Exception as e:
-            logger.warning(f"Failed to get audit stats: {e}")
-            return {}
-
     def close(self):
-        """Close the active backend's connection."""
-        if self._is_postgres:
-            if self._writer is not None:
-                self._writer.close()
-            return
-        if self._mongo_db:
-            self._mongo_db.close()
-            self._connected = False
-            logger.debug("LLM Archiver connection closed")
+        """Close the audit backend's connection."""
+        if self._writer is not None:
+            self._writer.close()
 
 
 # Singleton instance for convenience
@@ -1437,7 +862,7 @@ def get_archiver() -> Optional[LLMArchiver]:
     """Get or create the default LLM archiver instance.
 
     Returns:
-        LLMArchiver instance if MongoDB is configured, None otherwise.
+        LLMArchiver instance if the audit DB is configured, None otherwise.
     """
     global _default_archiver
     if _default_archiver is None:

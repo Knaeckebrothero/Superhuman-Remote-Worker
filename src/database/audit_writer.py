@@ -10,14 +10,14 @@ between the pre and post phases). asyncpg is async-only, so this class owns a
 and exposes blocking, thread-safe facade methods that marshal coroutines onto
 that loop via ``run_coroutine_threadsafe(...).result(timeout=...)``.
 
-Blocking the caller for one INSERT round-trip is exact parity with the pymongo
-behavior this replaces (same latency class), so no call site changes.
+Blocking the caller for one INSERT round-trip keeps the same latency class as
+the fire-and-forget write it replaces, so no call site changes.
 
 Design: ``docs/features/postgres_audit_store_implementation.md`` §5. Counterpart
 reader is ``orchestrator/database/audit_store.py`` (PR 3); the schema is
 ``migrations/audit/0001_initial.sql``.
 
-Error contract (parity with the Mongo path):
+Error contract:
 - One-shot connect gate: the first failure to stand up the loop/pool (5 s
   timeout) **permanently disables** writing for the process — mirrors the
   archiver's old ``_connection_attempted`` latch.
@@ -44,8 +44,8 @@ import asyncpg
 
 logger = logging.getLogger(__name__)
 
-# Pool/loop startup must not hang the first write indefinitely; mirrors the
-# Mongo serverSelectionTimeoutMS=5000 one-shot connect budget.
+# Pool/loop startup must not hang the first write indefinitely; a bounded
+# one-shot connect budget.
 _CONNECT_TIMEOUT_S = 5.0
 # Per-write budget. Generous vs a single-row INSERT but bounded so a wedged
 # backend can't pin a caller forever (it blocks the event loop on the hot path).
@@ -116,8 +116,7 @@ RETURNING id
 
 # Derives job_id + descriptive columns from the pre row (the update_* callers
 # carry only the pre row's id, not job_id). Inserts 0 rows when the pre row is
-# missing → "INSERT 0 0", which the facade maps to False (Mongo modified_count
-# parity).
+# missing → "INSERT 0 0", which the facade maps to False (no row updated).
 _SQL_INSERT_AUDIT_POST = """
 INSERT INTO agent_audit (job_id, agent_type, iteration, step_type, node_name,
                          phase, phase_number, event_phase, pre_id, request_id,
@@ -161,7 +160,7 @@ class SyncAuditWriter:
     def from_env(cls) -> Optional["SyncAuditWriter"]:
         """Return a writer if the audit DSN is configured, else ``None``.
 
-        Replaces the archiver's old ``MONGODB_URL`` gate: ``None`` here means
+        When the audit DSN is unconfigured, ``None`` here means
         ``get_archiver()`` returns ``None`` and all guarded call sites no-op
         (so unconfigured-under-pytest stays DB-free).
         """
@@ -316,7 +315,7 @@ class SyncAuditWriter:
         latency_ms: Optional[int],
         request_id: Optional[int] = None,
     ) -> bool:
-        # pre_id=None mirrors Mongo's ObjectId(None) raising into the swallow:
+        # pre_id=None means there is no pre row to update:
         # no DB touch, False.
         if pre_id is None:
             return False

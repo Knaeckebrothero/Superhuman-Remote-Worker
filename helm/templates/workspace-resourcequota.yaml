@@ -8,7 +8,7 @@ the job fails closed with a distinct "workspace capacity quota exceeded" log
 line (no silent emptyDir fallback).
 
 Keyed per-storage-class (not namespace-wide) so it bounds *workspace* storage
-without conflating it with the platform's own data PVCs (Postgres, Mongo, …).
+without conflating it with the platform's own data PVCs (Postgres, …).
 That isolation only holds when `ephemeralStorageClass` is DEDICATED to
 workspaces: on prod `longhorn-ephemeral` already is; on single-node/local-path
 create a dedicated local-path-backed class (same provisioner, distinct name)

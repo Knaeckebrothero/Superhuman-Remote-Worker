@@ -26,9 +26,6 @@ data:
   AUDIT_POSTGRES_HOST: {{ include "srw.auditPostgresHost" . | quote }}
   AUDIT_POSTGRES_PORT: {{ include "srw.auditPostgresPort" . | quote }}
   AUDIT_POSTGRES_DB: {{ include "srw.auditPostgresDb" . | quote }}
-  # Active audit backend (mongodb|postgres): the orchestrator reads it for the
-  # reader selector; agents inherit it via envFrom for the writer.
-  AUDIT_BACKEND: {{ .Values.databases.audit.backend | quote }}
 
   # Active checkpointer backend (sqlite|postgres). Worker agents read it to pick
   # the LangGraph checkpointer (postgres = shared Postgres, cross-pod resume);
@@ -70,11 +67,6 @@ data:
   # (Citations live in the vector store — srw_vector — reached through the
   # agent's shared VECTOR_POSTGRES_* pool. No separate citation DB/role/DSN.
   # See docs/done/citation_engine_integration.md.)
-
-  {{- if .Values.databases.mongodb.enabled }}
-  # MongoDB (retired audit backend — rendered only if explicitly re-enabled; D-5 removes this)
-  MONGODB_URL: {{ include "srw.mongodbUrl" . | quote }}
-  {{- end }}
 
   # Gitea
   GITEA_URL: {{ include "srw.gitUrl" . | quote }}

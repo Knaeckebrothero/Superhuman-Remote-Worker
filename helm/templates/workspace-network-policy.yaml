@@ -165,14 +165,6 @@ spec:
       ports:
         - protocol: TCP
           port: 7688
-    # MongoDB (for datasource shell tools)
-    - to:
-        - podSelector:
-            matchLabels:
-              {{- include "srw.componentSelectorLabels" (dict "context" $ "component" "mongodb") | nindent 14 }}
-      ports:
-        - protocol: TCP
-          port: 27017
     {{- with $.Values.workspace.networkPolicy.extraEgress }}
     # Deployment-specific extra egress from the values overlay — e.g. local
     # k3d's in-cluster Traefik hairpin for the OpenCloud tus data gateway.

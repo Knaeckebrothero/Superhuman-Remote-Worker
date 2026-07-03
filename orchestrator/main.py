@@ -97,7 +97,6 @@ from pydantic import BaseModel, Field, field_validator, model_validator  # noqa:
 
 from database import (  # noqa: E402
     PostgresDB,
-    MongoDB,
     AuditStore,
     ALLOWED_TABLES,
     FilterCategory,
@@ -261,10 +260,6 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 postgres_db = PostgresDB()
-# Retired audit backend — unused at runtime after QW-4 (the Mongo reader + boot
-# calls were removed). The object, class, and import are deleted in D-5.
-# See docs/features/database_optimization_plan.md.
-mongodb = MongoDB()
 gitea_client = GiteaClient()
 keycloak_groups = KeycloakGroupSync()
 main_cloud_router = MainCloudRouter(build_backend())
@@ -284,13 +279,12 @@ vector_db = PostgresDB(
     migrations_dir=MIGRATIONS_VECTOR_DIR,
 )
 
-# Audit DB — observability-tier instance that replaces the MongoDB collections
+# Audit DB — observability-tier instance holding the audit trail
 # (llm_requests / agent_audit / chat_history). Unlike the vector DB this is
 # NON-load-bearing: when its credentials are absent (AUDIT_POSTGRES_* unset /
 # databases.audit.enabled=false) the orchestrator runs without it — no
-# migrations, no partition maintenance — exactly as it tolerates MongoDB being
-# unavailable. Stood up behind the AUDIT_BACKEND flag; nothing reads or writes
-# it until the writer/reader land (PR 2/3). Hence: skip silently, never raise.
+# migrations, no partition maintenance — reads and writes degrade gracefully.
+# Hence: skip silently, never raise.
 _audit_url = _build_pg_url("AUDIT_POSTGRES", fallback_env="AUDIT_DB_URL")
 audit_db = (
     PostgresDB(connection_string=_audit_url, migrations_dir=MIGRATIONS_AUDIT_DIR)
@@ -298,11 +292,10 @@ audit_db = (
     else None
 )
 
-# Audit READS: the cockpit-facing read backend. Served exclusively by the
-# Postgres AuditStore — the legacy Mongo reader was retired
-# (docs/features/database_optimization_plan.md QW-4/D-5). AuditStore is
-# null-safe: is_available stays False (the read endpoints' degraded shapes,
-# never a crash) until connect() runs on a real DSN in the lifespan.
+# Audit READS: the cockpit-facing read backend, served by the Postgres
+# AuditStore. AuditStore is null-safe: is_available stays False (the read
+# endpoints' degraded shapes, never a crash) until connect() runs on a real
+# DSN in the lifespan.
 audit_store = AuditStore(_audit_url)
 audit_reader = audit_store
 
@@ -5379,7 +5372,7 @@ async def lifespan(app: FastAPI):
     if audit_db is None:
         logger.info(
             "Audit DB disabled (AUDIT_POSTGRES_* unset) — Postgres audit store "
-            "inactive; archiving continues via MongoDB / no-op."
+            "inactive; audit writes and reads no-op until it is configured."
         )
     else:
         try:
@@ -5394,17 +5387,10 @@ async def lifespan(app: FastAPI):
     # Audit reads are served by the Postgres AuditStore (audit_reader is bound to
     # it at construction). Connect its read pool when the tier is present; a
     # connect failure leaves is_available=False -> the endpoints' degraded shapes,
-    # never fatal (non-load-bearing tier). The legacy Mongo reader was retired
-    # (docs/features/database_optimization_plan.md QW-4/D-5).
+    # never fatal (non-load-bearing tier).
     if audit_db is not None:
         await audit_store.connect()
         logger.info("Audit reads served by Postgres AuditStore")
-    if os.getenv("AUDIT_BACKEND", "postgres").strip().lower() == "mongodb":
-        logger.warning(
-            "AUDIT_BACKEND=mongodb is no longer supported — MongoDB was removed; "
-            "serving audit reads from Postgres. Drop databases.audit.backend / the "
-            "AUDIT_BACKEND override."
-        )
 
     # Apply pending migrations on each DB. Each PostgresDB instance is
     # bound to its migrations directory at construction time; the runner
@@ -6147,7 +6133,7 @@ async def list_jobs(
           is rejected (403). Self-query (``?user_id=<self>``) is allowed but
           redundant — the visibility OR-clause already covers it.
 
-    Returns jobs enriched with audit_count from MongoDB if available.
+    Returns jobs enriched with audit_count from the audit store if available.
     """
     user = await require_approved_user(request, postgres_db)
     is_admin = bool(user.get("is_admin"))
@@ -11355,7 +11341,7 @@ async def get_job_audit(
     filter: FilterCategory = Query(default="all"),
     lean: bool = Query(default=False),
 ) -> dict[str, Any]:
-    """Get paginated audit entries for a job from MongoDB.
+    """Get paginated audit entries for a job from the audit store.
 
     Two pagination styles are supported; use whichever you prefer:
         - offset/limit (REST-style): ?offset=50&limit=50
@@ -11381,7 +11367,7 @@ async def get_job_audit(
             "offset": offset if offset is not None else 0,
             "limit": effective_size,
             "hasMore": False,
-            "error": "MongoDB not available",
+            "error": "Audit store not available",
         }
 
     try:
@@ -11422,7 +11408,7 @@ async def get_audit_step(request: Request, job_id: str, step_id: int) -> dict[st
 
 @app.get("/api/requests/{doc_id}")
 async def get_request(request: Request, doc_id: str) -> dict[str, Any]:
-    """Get a single LLM request by MongoDB document ID.
+    """Get a single LLM request by its audit-store request ID.
 
     Gated by the caller's access to the request's underlying job — admins
     pass; otherwise the embedded `job_id` is run through `require_job_access`.
@@ -11431,7 +11417,7 @@ async def get_request(request: Request, doc_id: str) -> dict[str, Any]:
     if not audit_reader.is_available:
         raise HTTPException(
             status_code=503,
-            detail="MongoDB not available",
+            detail="Audit store not available",
         )
 
     try:
@@ -11460,7 +11446,7 @@ async def get_audit_time_range(request: Request, job_id: str) -> dict[str, str] 
     """Get first and last timestamps for job audit entries.
 
     Returns:
-        Dict with 'start' and 'end' ISO timestamps, or null if no entries/MongoDB unavailable
+        Dict with 'start' and 'end' ISO timestamps, or null if no entries / audit store unavailable
     """
     await require_job_access(request, postgres_db, job_id)
     if not audit_reader.is_available:
@@ -11509,7 +11495,7 @@ async def get_job_chat_history(
             "offset": offset if offset is not None else 0,
             "limit": effective_size,
             "hasMore": False,
-            "error": "MongoDB not available",
+            "error": "Audit store not available",
         }
 
     try:
@@ -12372,7 +12358,7 @@ async def get_job_version(request: Request, job_id: str) -> dict[str, Any] | Non
 
     Returns:
         Dict with version, auditEntryCount, chatEntryCount, graphDeltaCount, lastUpdate
-        Returns null if job has no audit data or MongoDB unavailable
+        Returns null if job has no audit data or the audit store is unavailable
     """
     await require_job_access(request, postgres_db, job_id)
     if not audit_reader.is_available:
@@ -18741,7 +18727,7 @@ async def get_job_llm_requests(
     """
     await require_job_access(request, postgres_db, job_id)
     if not audit_reader.is_available:
-        raise HTTPException(status_code=503, detail="MongoDB not available")
+        raise HTTPException(status_code=503, detail="Audit store not available")
 
     try:
         UUID(job_id)
