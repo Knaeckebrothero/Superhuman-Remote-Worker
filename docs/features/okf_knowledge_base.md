@@ -19,12 +19,19 @@ related:
   - "[[repo_datasource]]"
   - "[[loop_repo_compounding_v2]]"
   - "[[kb_convergence_ttl_reverification]]"
+  - "[[auxiliary]]"
+  - "[[agent_memory_overhaul]]"
 ---
 
 # OKF Knowledge Base — Files-Canonical KB as a Datasource
 
-**Status:** DRAFT — proposed architecture, not yet scheduled. Origin: design discussion
-2026-07-03, building on the substrate findings in [[knowledge_base_substrate_decision]].
+**Status:** DRAFT, delivery pipeline LIVE — origin: design discussion 2026-07-03,
+building on the substrate findings in [[knowledge_base_substrate_decision]].
+[[loop_repo_compounding_v2]] shipped the same day, which changes this doc's footing: the
+squash-merge flow, the post-merge hook point, and `retros/` (orchestrator-written notes
+with OKF frontmatter, `type: retro`) are **in production**. Anything an agent writes
+under `knowledge/` on its job branch already reaches `main` with zero further
+orchestrator work — the loop is a ready delivery pipeline waiting for the notes.
 
 ## TL;DR
 
@@ -103,6 +110,24 @@ vault (417 files, 203 without frontmatter, a tag taxonomy frozen at "48 document
 analyzed") is the existence proof that an LLM *authoring* markdown does not keep a vault
 coherent; only a loop that *runs* does.
 
+> **Curator refactoring (2026-07-03): make it a proper auxiliary, modeled on the memory
+> auxiliaries.** The subjob→auxiliary migration already happened ([[auxiliary]]:
+> `CurateKnowledgeTask`, agent-mode, fired from `archive_phase`) — but it stopped at
+> "one ungated task": extract from phase artifacts, `kb_write`, done. The memory side
+> ([[agent_memory_overhaul]]) evolved the same starting point into a **pipeline**:
+> extraction → **ingestion verdict** — each candidate is compared against its nearest
+> existing entries and an auxiliary decides *add / update / supersede / discard*
+> (`IngestionVerdictService`, `src/services/memory/`) — with event-driven triggers and
+> config-driven prompts read at event time. The curator's ungated write path is precisely
+> where F33/F38 noise enters (reconstructed deliverables, double-written proposals,
+> immortal learning/retro notes). The refactor: mirror the memory pipeline for KB writes
+> (curation candidates pass a verdict gate against `search_knowledge` neighbors before
+> any `kb_write`/`kb_update`), give the curator the gardener verbs (`kb_lint`,
+> `kb_index`, dedup, TTL sweep) as its tool surface, and hang it on the same event points
+> the memory auxiliaries use (archive phase; post-merge once slice 3's index exists).
+> Same package shape as `src/services/memory/` — a `src/services/knowledge/` service
+> package, not more logic inside the task class.
+
 ## 4. The core commitment — the index is a cache, never a source of truth
 
 **Postgres is a disposable index over git.** Files are canonical; the index is rebuildable
@@ -148,7 +173,8 @@ Design:
 - **Staleness detection is O(1)**: compare `indexed_commit` to the branch HEAD SHA.
 - **Triggers** (cheap enough to be aggressive): Gitea push webhook → reindex job; job-start
   check (SHA compare, catch-up reindex before the agent reads); the loop's post-merge hook
-  ([[loop_repo_compounding_v2]]). Between triggers, reads-of-truth can always hit files.
+  — now a concrete call site: `_advance_project_loop` directly after
+  `merge_loop_job_branch` returns `merged` ([[loop_repo_compounding_v2]], implemented). Between triggers, reads-of-truth can always hit files.
 - **Force-push / history rewrite**: if `indexed_commit` is no longer an ancestor of HEAD
   (merge-base check), fall back to full rebuild — safe because the index is disposable.
 - **Interrupted reindex self-heals**: per-row `blob_sha` makes re-runs skip already-current
@@ -191,10 +217,14 @@ Reads need no tools: the KB is a cloned directory in the workspace.
 |---|---|---|
 | **Full** (default) | OKF repo + Postgres index | Nothing — this doc. |
 | **Lite** | OKF repo only | `search_knowledge`/`kb_query` unavailable (or degrade to grep); writes still tool-validated; lint still runs. Zero-infra / air-gapped / human-primary vaults. |
-| **Graph** (opt-in) | + Neo4j | Reserved for a genuinely graph-shaped workload (citation network). Per [[knowledge_base_substrate_decision]] §8: only with the router + text-to-Cypher scaffolding investment. |
+| **Graph** (opt-in) | + Neo4j | Neo4j as a **second derived index** beside Postgres — rebuilt from the repo, one-way sync off the same commit watermark (§5), disposable. Buys graph-backed `kb_related`/`kb_provenance`/`kb_contradictions` (multi-hop traversal); with it off, those degrade to 1-hop link-table queries on the index. Reserved for a genuinely graph-shaped workload (citation network); per [[knowledge_base_substrate_decision]] §8: only with the router + text-to-Cypher scaffolding investment. |
 
 This resolves §8 of the substrate doc for the KB workload: **no** — no graph investment
-for KBs; Neo4j goes dormant there.
+for KBs; Neo4j goes dormant there. The hard rule (resolved 2026-07-03): **Neo4j is never
+canonical again, not even in the Graph tier.** Enabling it adds a derived view; it never
+replaces the markdowns. A DB-canonical KB cannot serve a vault that humans edit in
+Obsidian and foreign agents clone — letting Neo4j be truth again would reintroduce
+exactly the split-brain this design exists to kill.
 
 ## 9. Migration & compatibility
 
@@ -206,7 +236,26 @@ for KBs; Neo4j goes dormant there.
 3. **RecallStore semantics carry over**: supersede/TTL/verification state lives in
    frontmatter (`status`, `remaining_cycles`, `last_verified_cycle` — fixing the F39 gap)
    and is *indexed* for filtering; the bi-temporal columns are optional index-side parity.
-4. **Neo4j**: dormant for KBs; helm switch retained (Graph tier).
+4. **Neo4j coexistence & decommission (audited 2026-07-03)** — side-by-side is the plan,
+   not an option; there is no cutover day:
+   - **Migration risk is edges-only.** `kb_write` already dual-writes the full note body
+     into pgvector `knowledge_index` (`src/tools/knowledge/knowledge_tools.py:203-236`,
+     Neo4j-first then upsert) — the only data living *solely* in Neo4j is the
+     relationship edge set, and the exporter serializes exactly that (grouped wikilinks).
+     The chart's Neo4j PVC is `keep`-policy; disabling the StatefulSet destroys nothing.
+   - **The helm toggle exists but is a trap today**: `databases.neo4j.enabled: false` is
+     supported (`helm/templates/databases/neo4j.yaml:1`), but `create_kb_tools`
+     hard-raises without a graph and the registry then skips the entire knowledge
+     category (`src/tools/registry.py:516-520`) — an agent on a Neo4j-less deployment
+     silently loses every `kb_*` tool. **Slice 3 is what makes the existing toggle
+     real.**
+   - **Per-deployment, at leisure**: slices 1–2 don't touch Neo4j; slice 3 flips
+     retrieval to the index; slice 4 migrates pre-existing notes. Each deployment
+     disables Neo4j whenever *its* projects are migrated — or never (Graph tier).
+   - **Untouched by all of this**: the `neo4j` *datasource type* and its
+     `cypher_query`/`cypher_execute` tools (users' own graph DBs at whatever URL they
+     provide — no in-cluster instance needed), and every other subsystem — citations and
+     memory are already pgvector. The system KB is the in-cluster Neo4j's only workload.
 
 ## 10. Concurrency & limits (honest costs)
 
@@ -220,34 +269,61 @@ for KBs; Neo4j goes dormant there.
   notes). This is not a planet-scale design and doesn't try to be.
 - **Embedding cost** is the only real reindex cost and is gated on content-blob change.
 
-## 11. Slices (independently shippable)
+## 11. Slices (independently shippable — reordered 2026-07-03 after v2 shipped)
 
-1. **OKF write/lint toolset over any cloned repo** — no schema, no new datasource type;
-   immediately useful against today's `repository` datasources (point it at a vault — or
-   at this repo's `docs/`).
-2. **Postgres index + query tools** — Appendix B schema + watermark/incremental sync +
-   `search_knowledge` backend swap.
-3. **KB datasource type + auto-attach as project KB** — the unification; Neo4j export
-   migration; curator-as-gardener.
-4. **Loop integration** — [[loop_repo_compounding_v2]] consumes the KB as its blackboard;
-   retro collection + backlog conventions.
-
-Slice 1 alone already dogfoods: the maintenance utilities are exactly what our own
-`docs/` vault needs.
+0. **Loop delivery pipeline** — DONE via [[loop_repo_compounding_v2]]: per-job branches,
+   squash-merge to `main`, post-merge hook point, `retros/` as the first OKF note family.
+1. **Dual-write** (the strangler-fig first step): `kb_write`/`kb_update` additionally
+   materialize each note as `knowledge/<type>/<slug>.md` in the workspace — **via the
+   workspace backend, never local I/O** (files live on the remote workspace pod/VM; the
+   citation engine's stub-mode bug is the cautionary tale). The DB stays the retrieval
+   substrate; the v2 merge delivers the files to `main`. Agent-side only, no schema, no
+   orchestrator change. An overnight loop run is the natural E2E.
+2. **OKF lint/gardener toolset + curator-as-proper-auxiliary** — `kb_lint`/`kb_index`;
+   useful against today's `repository` datasources (point it at a vault — or this repo's
+   `docs/`). Includes the curator refactor (§3 note): verdict-gated writes mirroring the
+   memory ingestion pipeline, gardener verbs as its tool surface, `src/services/knowledge/`
+   package shape.
+3. **Postgres index + query tools + retrieval cutover** — Appendix B schema +
+   watermark/incremental sync; `search_knowledge` backend swap; DB write path retired
+   (files become canonical, completing the strangler fig).
+4. **KB datasource type + auto-attach as project KB** — the unification; Neo4j export
+   migration for pre-existing notes. Mechanics (audited 2026-07-03 — most of the
+   substrate is already live):
+   - **Clone plumbing exists**: `repository` datasources are cloned to `repos/<name>/`
+     on the workspace backend at dispatch (`src/core/datasource_setup.py:659`). The KB
+     type adds only the OKF binding (`kb_*` tools take the root), index provisioning +
+     watermark reindex, and gardener coverage.
+   - **Org-wide vaults are nearly free**: `datasources.is_global` already means
+     "visible to all users" and `list_eligible_datasources` already returns
+     owned + global + project-linked — an org wiki is a KB datasource with
+     `is_global: true`. No new sharing machinery.
+   - **Lite/backend tiers**: repository datasources currently *reject* shell-less
+     workspace backends; a KB datasource should instead degrade to query-only
+     (index-backed `search_knowledge`/`kb_query`, no clone, no filesystem reads).
 
 ## Open questions
 
 - **Datasource shape**: new `kb` type vs. `repository` + `format: okf` flag. Leaning new
   type (UX + tool-gating clarity), sharing the repository clone/credential plumbing.
-- **Where the default project KB lives**: its own auto-provisioned repo (cleaner sharing,
-  attachable elsewhere later) vs. a `knowledge/` folder in the jobs repo ([[obsidian]] v1;
-  fewer repos). Leaning own repo — "KB = a datasource" stays uniform, and the jobs repo
-  keeps its [[loop_repo_compounding_v2]] coordination role without entangling the two.
-- **Merge gate**: should `kb_lint` failures block a squash-merge to a KB's `main`, or
-  merge-then-flag? (Blocking punishes agents for pre-existing vault debt; leaning
-  merge-then-flag with the gardener sweeping.)
+- **Org-vault write policy**: `is_global` solves *visibility*, not authorship. Leaning:
+  global KB datasources are read-only by default except owner/admin (the `read_only`
+  flag exists on the project link table, but a global KB reachable via the job picker
+  without a project link needs its own answer). Decide when slice 4 lands.
+- **Where the default project KB lives** — RESOLVED 2026-07-03 by v2 shipping: the jobs
+  repo is already the coordination repo and `retros/` already lives on its `main`, so the
+  default project KB is `knowledge/` in the jobs repo. The general shape: **a KB root =
+  a (repo, path-prefix) pair** — the toolset takes a root, so standalone KB-datasource
+  repos (root = repo top level) are the same thing to every tool. No entangling: the KB
+  is *content* on the coordination repo, not a coupling to it.
+- **Merge gate** — RESOLVED: merge-then-flag, matching v2's implemented merge-failure
+  posture (flag + continue; loss visible, never silent). The gardener sweeps.
 - **Embedding locality**: index/embeddings per-KB or shared pgvector tables with
   `kb_id` scoping (leaning shared tables, consistent with current pgvector usage).
+- **Note volume**: dual-write makes today's KB noise (F33/F38 — 374 notes in one run-6
+  night) *visible* as files on `main`. That's a feature (you can finally see and prune
+  it), but expect a fat `knowledge/` tree until the gardener (slice 2) ships. Loop jobs
+  run bare (no curator), so loop-night volume is agent-authored only.
 
 ## Related
 
