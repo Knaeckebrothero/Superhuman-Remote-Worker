@@ -570,7 +570,7 @@ def format_graph_changes(changes: dict[str, Any]) -> str:
 
 
 def format_llm_request(request: dict[str, Any]) -> str:
-    """Format LLM request/response from MongoDB llm_requests document."""
+    """Format LLM request/response from an llm_requests row."""
     lines = [f"LLM Request: {request.get('id', request.get('_id', 'unknown'))}\n"]
 
     lines.append(f"Job: {request.get('job_id', 'N/A')}")

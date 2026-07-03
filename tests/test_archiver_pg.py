@@ -242,10 +242,8 @@ def test_unready_writer_short_circuits(archiver, fw):
     assert fw.pre_rows == []
 
 
-def test_from_env_backend_gating(monkeypatch):
+def test_from_env_gating(monkeypatch):
     for k in (
-        "AUDIT_BACKEND",
-        "MONGODB_URL",
         "AUDIT_DB_URL",
         "AUDIT_POSTGRES_USER",
         "AUDIT_POSTGRES_PASSWORD",
@@ -253,19 +251,16 @@ def test_from_env_backend_gating(monkeypatch):
         "AUDIT_POSTGRES_DB",
     ):
         monkeypatch.delenv(k, raising=False)
-    # Default backend is mongo; no MONGODB_URL -> disabled.
+    # No audit DB configured -> archiving disabled.
     assert LLMArchiver.from_env() is None
-    # Postgres backend selected but no credentials -> disabled.
-    monkeypatch.setenv("AUDIT_BACKEND", "postgres")
-    assert LLMArchiver.from_env() is None
-    # Postgres backend with a DSN -> a Postgres-mode archiver (no connection yet).
+    # A DSN -> an archiver bound to the Postgres audit store (no connection yet).
     monkeypatch.setenv("AUDIT_DB_URL", "postgresql://u:p@localhost:5599/db")
     arch = LLMArchiver.from_env()
-    assert arch is not None and arch._is_postgres is True
+    assert arch is not None and arch._writer is not None
 
 
-def test_postgres_mode_does_not_import_pymongo(fw):
-    # Constructing with a writer must not require/instantiate the Mongo client.
+def test_writer_only_construction(fw):
+    # The Postgres audit store is the only backend: the archiver binds to the
+    # injected writer and carries no Mongo state.
     arch = LLMArchiver(writer=fw)
-    assert arch._is_postgres is True
-    assert arch._mongo_db is None
+    assert arch._writer is fw

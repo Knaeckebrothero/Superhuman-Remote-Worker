@@ -79,10 +79,6 @@ databases:
     internal: false
     # JDBC URL — password still comes from KC_DB_PASSWORD in the secret.
     externalUrl: "jdbc:postgresql://kc-pg.example.com:5432/keycloak?user=keycloak"
-  mongodb:
-    enabled: true
-    internal: false
-    externalUrl: "mongodb://srw:<pw>@mongo.example.com:27017/srw_logs"
   neo4j:
     # Neo4j is optional. Disable unless you use the project knowledge graph.
     enabled: false
@@ -124,8 +120,6 @@ s3:
 headscale:
   enabled: false
 pgadmin:
-  enabled: false
-mongoExpress:
   enabled: false
 dozzle:
   enabled: false

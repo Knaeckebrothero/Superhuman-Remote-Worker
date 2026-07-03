@@ -4,7 +4,6 @@
 This module provides database initialization functionality for:
 - PostgreSQL App DB (jobs, agents, requirements, datasources, builder)
 - PostgreSQL Vector DB (citations, sources, memories, knowledge_index)
-- MongoDB (LLM request archiving, optional)
 
 Can be used standalone or imported by the root init.py.
 
@@ -16,7 +15,6 @@ Usage:
     python -m orchestrator.init --force-reset
 
     # Skip specific databases
-    python -m orchestrator.init --skip-mongodb
     python -m orchestrator.init --skip-postgres
 
     # Verify connectivity only
@@ -1454,287 +1452,6 @@ def verify_neo4j() -> dict:
 
 
 # =============================================================================
-# MongoDB Initialization
-# =============================================================================
-
-
-def get_mongodb_url() -> Optional[str]:
-    """Get MongoDB URL from environment."""
-    return os.getenv("MONGODB_URL")
-
-
-def _parse_mongodb_url(url: str) -> dict:
-    """Parse MongoDB URL into components for mongodump/mongorestore."""
-    parsed = urlparse(url)
-    return {
-        "host": parsed.hostname or "localhost",
-        "port": str(parsed.port or 27017),
-        "database": parsed.path.lstrip("/").split("?")[0] or "srw_logs",
-        "username": parsed.username,
-        "password": parsed.password,
-    }
-
-
-async def init_mongodb(force_reset: bool = False) -> bool:
-    """Initialize MongoDB collections and indexes.
-
-    MongoDB is optional - returns True if not configured.
-
-    Args:
-        force_reset: If True, clear all collections before reinitializing.
-
-    Returns:
-        True if initialization successful or MongoDB not configured.
-    """
-    mongo_url = get_mongodb_url()
-    if not mongo_url:
-        logger.info("  MongoDB not configured (MONGODB_URL not set)")
-        logger.info("  Skipping MongoDB initialization (optional component)")
-        return True
-
-    try:
-        from pymongo import MongoClient
-    except ImportError:
-        logger.info("  pymongo not installed (MongoDB is optional)")
-        return True
-
-    try:
-        client = MongoClient(mongo_url, serverSelectionTimeoutMS=5000)
-        client.server_info()  # Test connection
-        logger.info("  Connected to MongoDB")
-    except Exception as e:
-        logger.warning(f"  Could not connect to MongoDB: {e}")
-        logger.info("  MongoDB is optional - continuing without it")
-        return True
-
-    try:
-        # Parse database name from URL
-        db_name = mongo_url.split("/")[-1].split("?")[0]
-        if not db_name:
-            db_name = "srw_logs"
-
-        db = client[db_name]
-
-        # Show current state
-        total_docs = sum(db[c].count_documents({}) for c in db.list_collection_names())
-        logger.info(f"  Current state: {total_docs} documents")
-
-        # Clear if requested
-        if force_reset and total_docs > 0:
-            logger.info("  Clearing database...")
-            for collection_name in db.list_collection_names():
-                result = db[collection_name].delete_many({})
-                logger.info(
-                    f"    Deleted {result.deleted_count} documents from {collection_name}"
-                )
-
-        # Create collections and indexes
-        logger.info("  Configuring collections and indexes...")
-        _create_mongodb_indexes(db)
-
-        # Show final state
-        collections = db.list_collection_names()
-        logger.info(f"  Collections: {list(collections)}")
-
-        return True
-
-    except Exception as e:
-        logger.warning(f"  MongoDB initialization error: {e}")
-        return True  # Don't fail the whole init
-
-    finally:
-        client.close()
-
-
-def _create_mongodb_indexes(db) -> None:
-    """Create MongoDB collections and indexes.
-
-    Iterates the same declarations the runtime ``MongoDB.ensure_indexes()``
-    consumes — single source of truth lives in
-    ``orchestrator/database/mongodb.py:MONGODB_INDEX_DECLARATIONS``. Two
-    paths exist because this function runs with sync ``pymongo`` from the
-    one-shot init CLI while the runtime path uses async ``motor``; the
-    declarations themselves are plain data.
-
-    Index creation failures are raised — silent WARNINGs were the
-    proximate cause of the 2026-05-12 outage (six of seven ``agent_audit``
-    indexes had quietly never materialised). If init runs at all, it must
-    leave behind a fully-indexed DB or fail visibly. The runtime helper
-    in ``mongodb.py`` provides the belt-and-braces idempotent reassert on
-    every orchestrator startup.
-    """
-    from database.mongodb import MONGODB_INDEX_DECLARATIONS
-
-    failed: list[str] = []
-    for collection_name, indexes in MONGODB_INDEX_DECLARATIONS:
-        logger.info(f"  Configuring {collection_name} collection...")
-        coll = db[collection_name]
-        for keys, index_name in indexes:
-            try:
-                coll.create_index(keys, name=index_name)
-                logger.info(f"    Created index: {index_name}")
-            except Exception as e:
-                qualified = f"{collection_name}.{index_name}"
-                failed.append(qualified)
-                logger.error(f"    FAILED to create {qualified} ({keys!r}): {e}")
-    if failed:
-        raise RuntimeError(
-            f"MongoDB index creation failed for {len(failed)} index(es): "
-            f"{failed}. Per-job queries on these collections will COLLSCAN "
-            f"until this is resolved."
-        )
-
-
-async def verify_mongodb() -> dict:
-    """Verify MongoDB connectivity.
-
-    Returns:
-        Dict with 'connected', 'collections', and any error info.
-    """
-    mongo_url = get_mongodb_url()
-    if not mongo_url:
-        return {"connected": False, "configured": False}
-
-    try:
-        from pymongo import MongoClient
-    except ImportError:
-        return {"connected": False, "error": "pymongo not installed"}
-
-    try:
-        client = MongoClient(mongo_url, serverSelectionTimeoutMS=2000)
-        client.server_info()
-
-        db_name = mongo_url.split("/")[-1].split("?")[0] or "srw_logs"
-        db = client[db_name]
-        collections = db.list_collection_names()
-
-        client.close()
-        return {
-            "connected": True,
-            "configured": True,
-            "collections": collections,
-        }
-    except Exception as e:
-        return {"connected": False, "configured": True, "error": str(e)}
-
-
-def backup_mongodb(backup_dir: Path) -> bool:
-    """Backup MongoDB using mongodump.
-
-    Args:
-        backup_dir: Path to write the backup directory.
-
-    Returns:
-        True if successful, False otherwise.
-    """
-    mongo_url = get_mongodb_url()
-    if not mongo_url:
-        logger.info("  MongoDB not configured (MONGODB_URL not set)")
-        return True
-
-    params = _parse_mongodb_url(mongo_url)
-
-    cmd = [
-        "mongodump",
-        "--host",
-        params["host"],
-        "--port",
-        params["port"],
-        "--db",
-        params["database"],
-        "--out",
-        str(backup_dir),
-    ]
-
-    if params["username"] and params["password"]:
-        cmd.extend(["--username", params["username"]])
-        cmd.extend(["--password", params["password"]])
-        cmd.extend(["--authenticationDatabase", "admin"])
-
-    logger.info(f"  Running mongodump for database: {params['database']}")
-
-    try:
-        subprocess.run(cmd, capture_output=True, text=True, check=True)
-        logger.info(f"  Backup created: {backup_dir}")
-        return True
-    except subprocess.CalledProcessError as e:
-        logger.error(f"  mongodump failed: {e.stderr}")
-        return False
-    except FileNotFoundError:
-        logger.error("  mongodump not found. Is MongoDB tools installed?")
-        return False
-
-
-def restore_mongodb(backup_dir: Path) -> bool:
-    """Restore MongoDB from mongodump backup.
-
-    Args:
-        backup_dir: Path to the backup directory.
-
-    Returns:
-        True if successful, False otherwise.
-    """
-    mongo_url = get_mongodb_url()
-    if not mongo_url:
-        logger.info("  MongoDB not configured (MONGODB_URL not set)")
-        return True
-
-    params = _parse_mongodb_url(mongo_url)
-
-    # Find the database directory in backup
-    db_backup_dir = backup_dir / params["database"]
-    if not db_backup_dir.exists():
-        subdirs = [d for d in backup_dir.iterdir() if d.is_dir()]
-        if subdirs:
-            db_backup_dir = subdirs[0]
-        else:
-            logger.warning(f"  No MongoDB backup data found in: {backup_dir}")
-            return True
-
-    # Clear existing data
-    logger.info(f"  Clearing database: {params['database']}")
-    try:
-        from pymongo import MongoClient
-
-        client = MongoClient(mongo_url, serverSelectionTimeoutMS=5000)
-        db = client[params["database"]]
-        for collection_name in db.list_collection_names():
-            db[collection_name].delete_many({})
-        client.close()
-    except Exception as e:
-        logger.warning(f"  Could not clear database: {e}")
-
-    cmd = [
-        "mongorestore",
-        "--host",
-        params["host"],
-        "--port",
-        params["port"],
-        "--db",
-        params["database"],
-        "--drop",
-        str(db_backup_dir),
-    ]
-
-    if params["username"] and params["password"]:
-        cmd.extend(["--username", params["username"]])
-        cmd.extend(["--password", params["password"]])
-        cmd.extend(["--authenticationDatabase", "admin"])
-
-    logger.info(f"  Running mongorestore for database: {params['database']}")
-
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0 and "error" in result.stderr.lower():
-            logger.warning(f"  mongorestore warnings: {result.stderr[:200]}")
-        logger.info(f"  Restore completed from: {backup_dir}")
-        return True
-    except FileNotFoundError:
-        logger.error("  mongorestore not found. Is MongoDB tools installed?")
-        return False
-
-
-# =============================================================================
 # Uploads Directory Management
 # =============================================================================
 
@@ -1862,14 +1579,12 @@ def restore_uploads(backup_dir: Path) -> bool:
 async def init_databases(
     force_reset: bool = False,
     skip_postgres: bool = False,
-    skip_mongodb: bool = False,
 ) -> bool:
     """Initialize all databases.
 
     Args:
         force_reset: If True, drop and recreate all data.
         skip_postgres: Skip PostgreSQL initialization.
-        skip_mongodb: Skip MongoDB initialization.
 
     Returns:
         True if all enabled databases initialized successfully.
@@ -1882,13 +1597,6 @@ async def init_databases(
         if not await init_postgres(force_reset):
             success = False
             logger.error("PostgreSQL initialization failed")
-
-    if not skip_mongodb:
-        logger.info("")
-        logger.info("Initializing MongoDB...")
-        if not await init_mongodb(force_reset):
-            # MongoDB failures are non-fatal
-            logger.warning("MongoDB initialization had issues")
 
     # Vector DB (memories + knowledge_index) — skip if not configured
     if not skip_postgres:
@@ -1909,13 +1617,11 @@ async def init_databases(
 
 async def verify_databases(
     skip_postgres: bool = False,
-    skip_mongodb: bool = False,
 ) -> dict:
     """Verify all database connections.
 
     Args:
         skip_postgres: Skip PostgreSQL verification.
-        skip_mongodb: Skip MongoDB verification.
 
     Returns:
         Dict with status for each database.
@@ -1925,9 +1631,6 @@ async def verify_databases(
     if not skip_postgres:
         result["postgres"] = await verify_postgres()
         result["vector_db"] = await verify_vector_db()
-
-    if not skip_mongodb:
-        result["mongodb"] = await verify_mongodb()
 
     result["neo4j"] = verify_neo4j()
 
@@ -1951,14 +1654,6 @@ def backup_databases(backup_dir: Path) -> dict:
     result["postgres"] = {
         "file": "postgres.dump",
         "success": backup_postgres(postgres_file),
-    }
-
-    # Backup MongoDB
-    mongodb_dir = backup_dir / "mongodb"
-    mongodb_dir.mkdir(exist_ok=True)
-    result["mongodb"] = {
-        "directory": "mongodb",
-        "success": backup_mongodb(mongodb_dir),
     }
 
     return result
@@ -1986,17 +1681,6 @@ def restore_databases(backup_dir: Path) -> dict:
         logger.info("  No PostgreSQL backup found")
         result["postgres"] = {"success": True, "skipped": True}
 
-    # Restore MongoDB
-    mongodb_dir = backup_dir / "mongodb"
-    if mongodb_dir.exists() and any(mongodb_dir.iterdir()):
-        result["mongodb"] = {
-            "directory": "mongodb",
-            "success": restore_mongodb(mongodb_dir),
-        }
-    else:
-        logger.info("  No MongoDB backup found")
-        result["mongodb"] = {"success": True, "skipped": True}
-
     return result
 
 
@@ -2014,7 +1698,6 @@ def parse_args() -> argparse.Namespace:
 Examples:
   python -m orchestrator.init                     # Initialize databases
   python -m orchestrator.init --force-reset       # Reset and reinitialize
-  python -m orchestrator.init --skip-mongodb      # Skip MongoDB
   python -m orchestrator.init --verify            # Just verify connectivity
   python -m orchestrator.init --backup ./backup   # Create backup
   python -m orchestrator.init --restore ./backup  # Restore from backup
@@ -2029,11 +1712,6 @@ Examples:
         "--skip-postgres",
         action="store_true",
         help="Skip PostgreSQL initialization",
-    )
-    parser.add_argument(
-        "--skip-mongodb",
-        action="store_true",
-        help="Skip MongoDB initialization",
     )
     parser.add_argument(
         "--verify",
@@ -2069,7 +1747,7 @@ async def main_async(args: argparse.Namespace) -> int:
         logger.info("=" * 60)
         logger.info("")
 
-        result = await verify_databases(args.skip_postgres, args.skip_mongodb)
+        result = await verify_databases(args.skip_postgres)
 
         if "postgres" in result:
             pg = result["postgres"]
@@ -2080,19 +1758,6 @@ async def main_async(args: argparse.Namespace) -> int:
             else:
                 logger.warning(
                     f"PostgreSQL: not connected ({pg.get('error', 'unknown error')})"
-                )
-
-        if "mongodb" in result:
-            mg = result["mongodb"]
-            if not mg.get("configured"):
-                logger.info("MongoDB: not configured (optional)")
-            elif mg.get("connected"):
-                logger.info(
-                    f"MongoDB: connected (collections: {mg.get('collections', [])})"
-                )
-            else:
-                logger.warning(
-                    f"MongoDB: not connected ({mg.get('error', 'unknown error')})"
                 )
 
         return 0
@@ -2143,7 +1808,6 @@ async def main_async(args: argparse.Namespace) -> int:
     success = await init_databases(
         force_reset=args.force_reset,
         skip_postgres=args.skip_postgres,
-        skip_mongodb=args.skip_mongodb,
     )
 
     logger.info("")

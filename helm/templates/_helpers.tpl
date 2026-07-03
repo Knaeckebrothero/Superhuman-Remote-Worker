@@ -405,10 +405,6 @@ they're consumed only as ingress hosts and as window.env.* deep-links.
 {{- include "srw.host" (dict "context" . "key" "pgadmin" "default" "pgadmin") }}
 {{- end }}
 
-{{- define "srw.mongoHost" -}}
-{{- include "srw.host" (dict "context" . "key" "mongo" "default" "mongo") }}
-{{- end }}
-
 {{- define "srw.dozzleHost" -}}
 {{- include "srw.host" (dict "context" . "key" "dozzle" "default" "dozzle") }}
 {{- end }}
@@ -523,17 +519,6 @@ srw_litellm
 {{- else -}}
 {{- .Values.databases.litellm.externalDb | default "srw_litellm" -}}
 {{- end -}}
-{{- end }}
-
-{{/*
-MongoDB URL — supports external mode (no auth in current setup, so URL is non-secret).
-*/}}
-{{- define "srw.mongodbUrl" -}}
-{{- if .Values.databases.mongodb.internal }}
-{{- printf "mongodb://%s-mongodb:27017/srw_logs" (include "srw.fullname" .) }}
-{{- else }}
-{{- required "databases.mongodb.externalUrl is required when databases.mongodb.internal=false" .Values.databases.mongodb.externalUrl }}
-{{- end }}
 {{- end }}
 
 {{/*

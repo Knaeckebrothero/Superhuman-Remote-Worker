@@ -45,11 +45,11 @@ def _patch_caller_and_db(user: dict, db):
     return stack
 
 
-def _patch_mongo_unavailable():
+def _patch_audit_unavailable():
     """Make ``main.audit_reader.is_available`` False so list_jobs skips enrichment."""
-    fake_mongo = MagicMock()
-    fake_mongo.is_available = False
-    return patch("main.audit_reader", fake_mongo)
+    fake_reader = MagicMock()
+    fake_reader.is_available = False
+    return patch("main.audit_reader", fake_reader)
 
 
 def _scoped(user: dict, scope: str) -> dict:
@@ -75,7 +75,7 @@ class TestListJobs:
 
         fake_db.get_visible_jobs = AsyncMock(return_value=[])
         fake_db.get_jobs = AsyncMock(return_value=[])
-        with _patch_caller_and_db(user_a, fake_db), _patch_mongo_unavailable():
+        with _patch_caller_and_db(user_a, fake_db), _patch_audit_unavailable():
             await list_jobs(fake_request, status=None, user_id=None, limit=100)
 
         fake_db.get_visible_jobs.assert_awaited_once()
@@ -96,7 +96,7 @@ class TestListJobs:
         # Strip user_a's project memberships.
         fake_db.get_projects_for_user = AsyncMock(return_value=[])
         fake_db.get_visible_jobs = AsyncMock(return_value=[])
-        with _patch_caller_and_db(user_a, fake_db), _patch_mongo_unavailable():
+        with _patch_caller_and_db(user_a, fake_db), _patch_audit_unavailable():
             await list_jobs(fake_request, status=None, user_id=None, limit=100)
 
         kwargs = fake_db.get_visible_jobs.call_args.kwargs
@@ -111,7 +111,7 @@ class TestListJobs:
 
         fake_db.get_jobs = AsyncMock(return_value=[])
         fake_db.get_visible_jobs = AsyncMock(return_value=[])
-        with _patch_caller_and_db(user_admin, fake_db), _patch_mongo_unavailable():
+        with _patch_caller_and_db(user_admin, fake_db), _patch_audit_unavailable():
             await list_jobs(fake_request, status=None, user_id=None, limit=100)
 
         fake_db.get_jobs.assert_awaited_once()
@@ -127,7 +127,7 @@ class TestListJobs:
         from main import list_jobs
 
         fake_db.get_jobs = AsyncMock(return_value=[])
-        with _patch_caller_and_db(user_admin, fake_db), _patch_mongo_unavailable():
+        with _patch_caller_and_db(user_admin, fake_db), _patch_audit_unavailable():
             await list_jobs(
                 fake_request, status=None, user_id=str(user_a["id"]), limit=100
             )
@@ -141,7 +141,7 @@ class TestListJobs:
     ):
         from main import list_jobs
 
-        with _patch_caller_and_db(user_a, fake_db), _patch_mongo_unavailable():
+        with _patch_caller_and_db(user_a, fake_db), _patch_audit_unavailable():
             with pytest.raises(HTTPException) as exc:
                 await list_jobs(
                     fake_request, status=None, user_id=str(user_b["id"]), limit=100
@@ -154,7 +154,7 @@ class TestListJobs:
         from main import list_jobs
 
         fake_db.get_visible_jobs = AsyncMock(return_value=[])
-        with _patch_caller_and_db(user_a, fake_db), _patch_mongo_unavailable():
+        with _patch_caller_and_db(user_a, fake_db), _patch_audit_unavailable():
             await list_jobs(
                 fake_request, status=None, user_id=str(user_a["id"]), limit=100
             )
@@ -166,7 +166,7 @@ class TestListJobs:
         from main import list_jobs
 
         fake_db.get_visible_jobs = AsyncMock(return_value=[])
-        with _patch_caller_and_db(user_a, fake_db), _patch_mongo_unavailable():
+        with _patch_caller_and_db(user_a, fake_db), _patch_audit_unavailable():
             await list_jobs(fake_request, status="completed", user_id=None, limit=50)
 
         kwargs = fake_db.get_visible_jobs.call_args.kwargs
@@ -182,7 +182,7 @@ class TestListJobs:
 
         scoped = _scoped(user_admin, f"project:{project_a['id']}")
         fake_db.get_jobs = AsyncMock(return_value=[])
-        with _patch_caller_and_db(scoped, fake_db), _patch_mongo_unavailable():
+        with _patch_caller_and_db(scoped, fake_db), _patch_audit_unavailable():
             await list_jobs(fake_request, status=None, user_id=None, limit=100)
 
         kwargs = fake_db.get_jobs.call_args.kwargs
@@ -196,7 +196,7 @@ class TestListJobs:
 
         scoped = _scoped(user_a, f"project:{project_a['id']}")
         fake_db.get_visible_jobs = AsyncMock(return_value=[])
-        with _patch_caller_and_db(scoped, fake_db), _patch_mongo_unavailable():
+        with _patch_caller_and_db(scoped, fake_db), _patch_audit_unavailable():
             await list_jobs(fake_request, status=None, user_id=None, limit=100)
 
         kwargs = fake_db.get_visible_jobs.call_args.kwargs
@@ -215,7 +215,7 @@ class TestListJobs:
                 AsyncMock(side_effect=HTTPException(status_code=401)),
             ),
             patch("main.postgres_db", fake_db),
-            _patch_mongo_unavailable(),
+            _patch_audit_unavailable(),
         ):
             with pytest.raises(HTTPException) as exc:
                 await list_jobs(fake_request, status=None, user_id=None, limit=100)
@@ -234,9 +234,9 @@ class TestGetJob:
     async def test_owner_passes(self, user_a, job_a, fake_db, fake_request):
         from main import get_job
 
-        with _patch_caller_and_db(user_a, fake_db), _patch_mongo_unavailable():
+        with _patch_caller_and_db(user_a, fake_db), _patch_audit_unavailable():
             result = await get_job(fake_request, str(job_a["id"]))
-        # The handler enriches with audit_count=None when mongo unavailable
+        # The handler enriches with audit_count=None when the audit store is unavailable
         assert result["id"] == job_a["id"]
         assert "audit_count" in result
 
@@ -244,7 +244,7 @@ class TestGetJob:
     async def test_cross_user_403(self, user_b, job_a, fake_db, fake_request):
         from main import get_job
 
-        with _patch_caller_and_db(user_b, fake_db), _patch_mongo_unavailable():
+        with _patch_caller_and_db(user_b, fake_db), _patch_audit_unavailable():
             with pytest.raises(HTTPException) as exc:
                 await get_job(fake_request, str(job_a["id"]))
         assert exc.value.status_code == 403
@@ -253,7 +253,7 @@ class TestGetJob:
     async def test_missing_404(self, user_a, fake_db, fake_request):
         from main import get_job
 
-        with _patch_caller_and_db(user_a, fake_db), _patch_mongo_unavailable():
+        with _patch_caller_and_db(user_a, fake_db), _patch_audit_unavailable():
             with pytest.raises(HTTPException) as exc:
                 await get_job(fake_request, "00000000-0000-0000-0000-000000000999")
         assert exc.value.status_code == 404
@@ -262,7 +262,7 @@ class TestGetJob:
     async def test_admin_bypass(self, user_admin, job_a, fake_db, fake_request):
         from main import get_job
 
-        with _patch_caller_and_db(user_admin, fake_db), _patch_mongo_unavailable():
+        with _patch_caller_and_db(user_admin, fake_db), _patch_audit_unavailable():
             result = await get_job(fake_request, str(job_a["id"]))
         assert result["id"] == job_a["id"]
 
@@ -283,7 +283,7 @@ class TestGetJob:
             return None
 
         fake_db.get_user_role_in_project = AsyncMock(side_effect=member_lookup)
-        with _patch_caller_and_db(user_b, fake_db), _patch_mongo_unavailable():
+        with _patch_caller_and_db(user_b, fake_db), _patch_audit_unavailable():
             result = await get_job(fake_request, str(job_a["id"]))
         assert result["id"] == job_a["id"]
 
@@ -295,7 +295,7 @@ class TestGetJob:
         from main import get_job
 
         scoped = _scoped(user_admin, f"project:{project_b['id']}")
-        with _patch_caller_and_db(scoped, fake_db), _patch_mongo_unavailable():
+        with _patch_caller_and_db(scoped, fake_db), _patch_audit_unavailable():
             with pytest.raises(HTTPException) as exc:
                 await get_job(fake_request, str(job_a["id"]))
         assert exc.value.status_code == 403
@@ -306,7 +306,7 @@ class TestGetJob:
 # =============================================================================
 #
 # Picks one endpoint per backend so we prove the gate is wired everywhere:
-#   MongoDB-backed   → get_job_audit, get_job_llm_requests
+#   audit store (PG) → get_job_audit, get_job_llm_requests
 #   workspace svc    → get_job_workspace, get_workspace_file
 #   gitea (repo)     → list_repo_contents, get_repo_file
 #   vector_db (PG)   → list_job_citations, list_job_memories,
@@ -340,7 +340,7 @@ class TestGatedReadEndpoints:
 
         with (
             _patch_caller_and_db(user_b, fake_db),
-            patch("main.audit_reader", _make_dud("mongodb")),
+            patch("main.audit_reader", _make_dud("audit_reader")),
         ):
             with pytest.raises(HTTPException) as exc:
                 await get_job_audit(fake_request, str(job_a["id"]))
@@ -354,7 +354,7 @@ class TestGatedReadEndpoints:
 
         with (
             _patch_caller_and_db(user_b, fake_db),
-            patch("main.audit_reader", _make_dud("mongodb")),
+            patch("main.audit_reader", _make_dud("audit_reader")),
         ):
             with pytest.raises(HTTPException) as exc:
                 await get_job_llm_requests(fake_request, str(job_a["id"]))
@@ -576,7 +576,7 @@ class TestGatedReadEndpoints:
 
         with (
             _patch_caller_and_db(user_b, fake_db),
-            patch("main.audit_reader", _make_dud("mongodb")),
+            patch("main.audit_reader", _make_dud("audit_reader")),
         ):
             with pytest.raises(HTTPException) as exc:
                 await get_job_version(fake_request, str(job_a["id"]))
@@ -604,20 +604,20 @@ class TestGatedReadEndpoints:
 
 class TestGatedReadEndpointsHappyPath:
     @pytest.mark.asyncio
-    async def test_get_job_audit_owner_reaches_mongo(
+    async def test_get_job_audit_owner_reaches_audit_store(
         self, user_a, job_a, fake_db, fake_request
     ):
         from main import get_job_audit
 
-        fake_mongo = MagicMock()
-        fake_mongo.is_available = True
-        fake_mongo.get_job_audit = AsyncMock(return_value={"entries": [], "total": 0})
+        fake_reader = MagicMock()
+        fake_reader.is_available = True
+        fake_reader.get_job_audit = AsyncMock(return_value={"entries": [], "total": 0})
         with (
             _patch_caller_and_db(user_a, fake_db),
-            patch("main.audit_reader", fake_mongo),
+            patch("main.audit_reader", fake_reader),
         ):
             await get_job_audit(fake_request, str(job_a["id"]))
-        fake_mongo.get_job_audit.assert_awaited_once()
+        fake_reader.get_job_audit.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_get_job_workspace_owner_reaches_service(

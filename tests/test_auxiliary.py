@@ -728,20 +728,31 @@ class TestAuxErrorArchiving:
 
 
 class TestArchiveError:
+    class _FakeWriter:
+        """Captures the row the Postgres archiver builds (mirrors test_archiver_pg)."""
+
+        def __init__(self, ready=True, request_id="deadbeef"):
+            self.ready = ready
+            self.request_id = request_id
+            self.rows = []
+
+        def ensure_ready(self):
+            return self.ready
+
+        def insert_llm_request(self, row):
+            self.rows.append(row)
+            return self.request_id
+
     def _archiver(self, connected=True, inserted_id="deadbeef"):
         from src.core.archiver import LLMArchiver
 
-        archiver = LLMArchiver(mongodb_url="")  # no eager connection
-        archiver._ensure_connected = MagicMock(return_value=connected)
-        archiver._collection = MagicMock()
-        archiver._collection.insert_one.return_value = MagicMock(
-            inserted_id=inserted_id
+        return LLMArchiver(
+            writer=self._FakeWriter(ready=connected, request_id=inserted_id)
         )
-        return archiver
 
     def test_writes_error_document(self):
         archiver = self._archiver()
-        doc_id = archiver.archive_error(
+        request_id = archiver.archive_error(
             job_id="job-1",
             agent_type="scholar",
             messages=[HumanMessage(content="hello")],
@@ -752,15 +763,17 @@ class TestArchiveError:
             call_type="memory_extraction",
             auxiliary_metadata={"task_class": "ExtractMemoriesTask"},
         )
-        assert doc_id == "deadbeef"
-        doc = archiver._collection.insert_one.call_args[0][0]
-        assert doc["status"] == "error"
-        assert doc["call_type"] == "memory_extraction"
-        assert doc["error"]["type"] == "ConnectionError"
-        assert "503" in doc["error"]["message"]
-        assert doc["response"] is None
-        assert doc["model"] == "gemma-4-moe"
-        assert doc["request"]["message_count"] == 1
+        assert request_id == "deadbeef"
+        row = archiver._writer.rows[0]
+        # The Postgres schema folds the error into metadata and stores an empty
+        # response (response is NOT NULL) so a failed call stays queryable.
+        assert row["metadata"]["status"] == "error"
+        assert row["call_type"] == "memory_extraction"
+        assert row["metadata"]["error"]["type"] == "ConnectionError"
+        assert "503" in row["metadata"]["error"]["message"]
+        assert row["response"] == {}
+        assert row["model"] == "gemma-4-moe"
+        assert row["request"]["message_count"] == 1
 
     def test_noop_when_disconnected(self):
         archiver = self._archiver(connected=False)
@@ -773,4 +786,4 @@ class TestArchiveError:
             error_type="E",
         )
         assert out is None
-        archiver._collection.insert_one.assert_not_called()
+        assert archiver._writer.rows == []
