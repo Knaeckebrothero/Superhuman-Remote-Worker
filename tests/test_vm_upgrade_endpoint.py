@@ -157,12 +157,21 @@ def _simulate_upgrade(
     if not vm_available:
         raise RuntimeError("VM provisioner is not available")
 
-    # Mutate context
+    # Merge the VM-request delta into context.vm. The real endpoint does this in
+    # ONE fused SQL statement:
+    #   context = jsonb_set(COALESCE(context,'{}'), '{vm}',
+    #                       COALESCE(context->'vm','{}') || $1)
+    # i.e. it MERGES into context.vm (preserving vm siblings + other keys),
+    # rather than replacing the whole vm object. Mirror that merge here.
+    vm_updates = {
+        "requested": True,
+        "upgrade_from": "container",
+        "upgrade_command": frozen_data.get("command", ""),
+    }
     job_context = dict(job.get("context") or {})
-    vm_ctx = job_context.setdefault("vm", {})
-    vm_ctx["requested"] = True
-    vm_ctx["upgrade_from"] = "container"
-    vm_ctx["upgrade_command"] = frozen_data.get("command", "")
+    merged_vm = dict(job_context.get("vm") or {})
+    merged_vm.update(vm_updates)
+    job_context["vm"] = merged_vm
 
     # Remove local freeze file
     local_frozen = workspace_base / "output" / "job_frozen.json"
@@ -271,6 +280,21 @@ class TestUpgradeToVm:
         assert updated_ctx["vm"]["requested"] is True
         assert updated_ctx["some_other_key"] == "preserved"
         assert updated_ctx["workspace_container"]["status"] == "ready"
+
+    def test_upgrade_preserves_existing_vm_siblings(self, tmp_path):
+        """The fused vm-merge keeps pre-existing context.vm siblings — it merges
+        into context.vm (COALESCE(context->'vm') || $1) rather than replacing the
+        whole vm object. Guards HF-3: a naive vm-replace would drop these keys."""
+        freeze_data = make_vm_upgrade_freeze()
+        job = make_job(
+            freeze_data=freeze_data,
+            context={"vm": {"golden_image": "srw-base-v3", "requested": False}},
+        )
+
+        _, updated_ctx = _simulate_upgrade(job, tmp_path)
+
+        assert updated_ctx["vm"]["requested"] is True  # overwritten by the merge
+        assert updated_ctx["vm"]["golden_image"] == "srw-base-v3"  # sibling kept
 
     def test_upgrade_with_reviewing_status(self, tmp_path):
         """Upgrade also works for jobs in 'reviewing' status."""
