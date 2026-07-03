@@ -86,11 +86,13 @@ describe('resolveEffectiveModels', () => {
   const expert: EffectiveModels = {
     strategic: {model: 'gpt-5.5', source: 'expert'},
     tactical: {model: 'gpt-5.5', source: 'expert'},
+    subagent: {model: 'gpt-5.5', source: 'expert'},
     session: {model: 'gpt-5.5', source: 'expert'},
   };
   const framework: EffectiveModels = {
     strategic: {model: 'gemma-4-31b', source: 'system_default'},
     tactical: {model: 'gemma-4-31b', source: 'system_default'},
+    subagent: {model: 'gemma-4-31b', source: 'system_default'},
     session: {model: 'gemma-4-31b', source: 'system_default'},
   };
 

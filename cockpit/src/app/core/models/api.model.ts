@@ -88,6 +88,9 @@ export interface EffectiveModelSlot {
 export interface EffectiveModels {
   strategic: EffectiveModelSlot;
   tactical: EffectiveModelSlot;
+  /** Reader model for spawn_subagent delegation. Resolves subagent → tactical →
+   *  base server-side, mirroring the agent's reader-model fallback. */
+  subagent: EffectiveModelSlot;
   session: EffectiveModelSlot;
 }
 

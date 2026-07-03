@@ -103,6 +103,7 @@ interface EditorForm {
   summarization: string;
   strategicModel: string;
   tacticalModel: string;
+  subagentModel: string;
   sessionModel: string;
   configText: string;
 }
@@ -239,6 +240,16 @@ interface EditorForm {
           <label class="ml">Tactical model
             <select class="model-select" [disabled]="isModelGated()" [ngModel]="form.tacticalModel" (ngModelChange)="form.tacticalModel = $event">
               <option [ngValue]="''">{{ baseDefaultLabel('tactical') }}</option>
+              @for (g of models(); track g.group) {
+                <optgroup [label]="g.group">
+                  @for (m of g.models; track m) { <option [ngValue]="m" [disabled]="!modelAllowed(m)">{{ m }}</option> }
+                </optgroup>
+              }
+            </select>
+          </label>
+          <label class="ml">Subagent model
+            <select class="model-select" [disabled]="isModelGated()" [ngModel]="form.subagentModel" (ngModelChange)="form.subagentModel = $event">
+              <option [ngValue]="''">{{ baseDefaultLabel('subagent') }}</option>
               @for (g of models(); track g.group) {
                 <optgroup [label]="g.group">
                   @for (m of g.models; track m) { <option [ngValue]="m" [disabled]="!modelAllowed(m)">{{ m }}</option> }
@@ -444,7 +455,7 @@ export class ExpertEditorComponent implements OnInit {
 
   /** "(base default)" option label, naming the model the unpinned slot inherits
    *  from the framework base (account/system chat pin) when known. */
-  baseDefaultLabel(slot: 'strategic' | 'tactical' | 'session'): string {
+  baseDefaultLabel(slot: 'strategic' | 'tactical' | 'subagent' | 'session'): string {
     return defaultModelOptionLabel('Base default', this.frameworkEffectiveModels()?.[slot]?.model);
   }
 
@@ -463,6 +474,7 @@ export class ExpertEditorComponent implements OnInit {
     summarization: '',
     strategicModel: '',
     tacticalModel: '',
+    subagentModel: '',
     sessionModel: '',
     configText: '',
   };
@@ -535,9 +547,11 @@ export class ExpertEditorComponent implements OnInit {
     const llm = (frag['llm'] ?? {}) as Record<string, unknown>;
     const strat = (llm['strategic'] ?? {}) as Record<string, unknown>;
     const tact = (llm['tactical'] ?? {}) as Record<string, unknown>;
+    const sub = (llm['subagent'] ?? {}) as Record<string, unknown>;
     const baseModel = (llm['model'] as string) ?? '';
     this.form.strategicModel = (strat['model'] as string) ?? baseModel ?? '';
     this.form.tacticalModel = (tact['model'] as string) ?? baseModel ?? '';
+    this.form.subagentModel = (sub['model'] as string) ?? baseModel ?? '';
     this.form.sessionModel = baseModel;
 
     this.toolsGroup()?.prefillFromConfig(frag);
@@ -581,6 +595,7 @@ export class ExpertEditorComponent implements OnInit {
     this.advancedGroup()?.resetAll();
     this.form.strategicModel = '';
     this.form.tacticalModel = '';
+    this.form.subagentModel = '';
     this.form.sessionModel = '';
     // Phase-prompt overrides are mode-specific (strategic/tactical are worker-
     // only) — clear them so a worker→session switch on CREATE doesn't carry over.
@@ -600,6 +615,7 @@ export class ExpertEditorComponent implements OnInit {
     if (this.mode() === 'job') {
       if (this.form.strategicModel) llm['strategic'] = {model: this.form.strategicModel};
       if (this.form.tacticalModel) llm['tactical'] = {model: this.form.tacticalModel};
+      if (this.form.subagentModel) llm['subagent'] = {model: this.form.subagentModel};
     } else if (this.form.sessionModel) {
       llm['model'] = this.form.sessionModel;
     }

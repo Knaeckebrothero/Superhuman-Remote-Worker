@@ -281,4 +281,57 @@ describe('ModelGroupComponent', () => {
       expect(Array.isArray(options)).toBe(true);
     });
   });
+
+  describe('subagent (delegation reader) model', () => {
+    it('starts null and is counted in job-mode modifiedCount', () => {
+      const {component} = createComponent();
+      expect(component.subagentModel()).toBeNull();
+      expect(component.modifiedCount()).toBe(0);
+
+      component.subagentModel.set('gpt-4o');
+      expect(component.modifiedCount()).toBe(1);
+    });
+
+    it('emits an llm.subagent.model override alongside the phase models', () => {
+      const {component} = createComponent();
+      component.strategicModel.set('claude-opus-4-6');
+      component.subagentModel.set('gpt-4o');
+      expect(component.getOverrides()).toEqual({
+        llm: {strategic: {model: 'claude-opus-4-6'}, subagent: {model: 'gpt-4o'}},
+      });
+    });
+
+    it('remembers the pick under its own localStorage key, never account prefs', () => {
+      const {component, mockSettings} = createComponent();
+      component.onSubagentModelChange('gpt-4o');
+      expect(localStorage.getItem('ui.lastModel.subagent')).toBe('gpt-4o');
+      expect(mockSettings.updatePreferences).not.toHaveBeenCalled();
+    });
+
+    it('does not treat a config subagent pin as a user override', () => {
+      const {component} = createComponent();
+      component.prefillFromConfig({llm: {subagent: {model: 'reader-model'}}});
+      expect(component.subagentModel()).toBeNull();
+      expect(component.getOverrides()).toEqual({});
+    });
+
+    it('does not preselect a saved model when tactical is pinned (subagent inherits it)', () => {
+      localStorage.setItem('ui.lastModel.subagent', 'saved-model');
+      const {component} = createComponent();
+      component.prefillFromConfig({llm: {tactical: {model: 'tactical-model'}}});
+      expect(component.subagentModel()).toBeNull();
+    });
+
+    it('is cleared by resetAll', () => {
+      const {component} = createComponent();
+      component.subagentModel.set('gpt-4o');
+      component.resetAll();
+      expect(component.subagentModel()).toBeNull();
+    });
+
+    it('is shown by default for standalone use', () => {
+      const {component} = createComponent();
+      expect(component.showSubagent()).toBe(true);
+    });
+  });
 });
