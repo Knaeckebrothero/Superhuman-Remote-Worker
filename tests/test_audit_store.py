@@ -333,24 +333,45 @@ class TestAuditPartitions:
                 assert s["detach_pending"] == 0
                 assert s["awaiting_drop"] == 0
                 assert s["last_parent_analyze"] is not None  # migration ANALYZEd
+                # Per-parent on-disk size is reported (whole tree; a fresh
+                # bootstrap already carries empty-index metapages, so > 0).
+                assert isinstance(s["total_bytes"], int)
+                assert s["total_bytes"] >= 0
                 # Fresh bootstrap sits comfortably above the critical alarm floor.
                 assert (
                     s["days_until_unpartitioned"]
                     > audit_partitions._LOOKAHEAD_CRIT_DAYS
                 )
 
+    async def test_partition_status_size_grows_with_rows(self, pg_dsn):
+        async with _audit_pool(pg_dsn) as pool:
+            before = (await audit_partitions.partition_status(pool))["usage_events"][
+                "total_bytes"
+            ]
+            # One raw insert allocates the current-month partition's first heap
+            # page → the whole-tree size must strictly grow.
+            await pool.execute(
+                "INSERT INTO usage_events "
+                "(ts, category, resource, quantity, unit, source, source_id) "
+                "VALUES (now(), 'llm', 'm', 1, 'prompt-token', 'test', 's-size-1')"
+            )
+            after = (await audit_partitions.partition_status(pool))["usage_events"][
+                "total_bytes"
+            ]
+            assert after > before
+
     async def test_analyze_parents_force(self, pg_dsn):
         async with _audit_pool(pg_dsn) as pool:
             analyzed = await audit_partitions.analyze_parents(pool, force=True)
             assert sorted(analyzed) == sorted(PARENTS)
 
-    async def test_retire_partitions_is_deferred_noop(self, pg_dsn):
+    async def test_retire_partitions_is_policy_noop(self, pg_dsn):
         async with _audit_pool(pg_dsn) as pool:
             before = {p: await _children(pool, p) for p in PARENTS}
             result = await audit_partitions.retire_partitions(pool)
-            assert result.get("deferred") is True
+            # No-auto-deletion policy — permanent no-op, not "deferred".
+            assert result.get("policy") == "no-auto-deletion"
             assert result["detached"] == [] and result["dropped"] == []
-            # Nothing detached or dropped.
             for parent in PARENTS:
                 assert await _children(pool, parent) == before[parent]
 
@@ -358,7 +379,7 @@ class TestAuditPartitions:
         async with _audit_pool(pg_dsn) as pool:
             result = await audit_partitions.maintenance_pass(pool)
             assert set(result) == {"created", "analyzed", "retired", "status"}
-            assert result["retired"].get("deferred") is True
+            assert result["retired"].get("policy") == "no-auto-deletion"
             assert set(result["status"]) == set(PARENTS)
 
 
@@ -741,32 +762,34 @@ async def _create_intervals_table(pool) -> None:
     )
 
 
-async def _ensure_prev_month_partition(pool) -> None:
-    """Attach usage_events' *previous*-month partition on the test DB.
+async def _ensure_month_partition(
+    pool, *, parent: str = "usage_events", months_back: int = 1
+) -> None:
+    """Attach ``parent``'s partition ``months_back`` UTC months in the past.
 
-    The 0002 bootstrap creates only the current month + N+2 lookahead (the
-    forward-only contract owned by audit_partitions). A leaked-interval
-    reconcile, though, stamps its event at ``now() - orphan_after_h`` (up to
-    24h back), which on the first day of a month lands in the previous month —
-    a partition a freshly-migrated DB lacks, so the insert would 23514 and the
-    ledger would drop the row. A long-running DB always already has this
-    partition (retention is deferred); create it here so the reconcile test is
+    The 0001/0002 bootstraps create only the current month + N+2 lookahead (the
+    forward-only contract owned by audit_partitions), and retention is a no-op by
+    policy so a long-running DB always already has older months. Two kinds of test
+    need a BACKDATED partition to exist so the insert doesn't 23514 and drop the
+    row: a leaked-interval reconcile stamps its event at ``now() - orphan_after_h``
+    (up to 24h back → previous month on the 1st), and the rollup catch-up drill
+    seeds events several months back. Create them here so the test is
     deterministic regardless of the calendar date. Mirrors the migration's own
-    bootstrap DO block (UTC month boundaries), shifted one month back.
+    bootstrap DO block (UTC month boundaries), shifted ``months_back`` back.
     """
     async with pool.acquire() as conn:
         async with conn.transaction():
             await conn.execute("SET LOCAL timezone = 'UTC'")
             await conn.execute(
-                """
+                f"""
                 DO $$
                 DECLARE
                     m    DATE := (date_trunc('month', now())
-                                  - interval '1 month')::date;
-                    part TEXT := 'usage_events_p' || to_char(m, 'YYYY_MM');
+                                  - interval '{int(months_back)} month')::date;
+                    part TEXT := '{parent}_p' || to_char(m, 'YYYY_MM');
                 BEGIN
                     EXECUTE format(
-                        'CREATE TABLE IF NOT EXISTS %I PARTITION OF usage_events '
+                        'CREATE TABLE IF NOT EXISTS %I PARTITION OF {parent} '
                         'FOR VALUES FROM (%L) TO (%L)',
                         part, m, (m + interval '1 month')::date
                     );
@@ -893,8 +916,8 @@ class TestWorkspaceMetering:
             # The reconcile stamps its event at now()-24h; on the first day of a
             # month that falls into the previous month, which the migration's
             # forward-only bootstrap doesn't create. Attach it so the assertion
-            # below is calendar-independent (see _ensure_prev_month_partition).
-            await _ensure_prev_month_partition(pool)
+            # below is calendar-independent (see _ensure_month_partition).
+            await _ensure_month_partition(pool)
             owner = _owner("job", uuid4())
             await workspace_metering.open_interval(
                 pool, owner, tier="sandbox", cpu="500m", memory="1Gi"

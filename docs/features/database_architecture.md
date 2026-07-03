@@ -33,9 +33,9 @@ database** (the CloudNativePG-recommended shape).
 
 | Store (server) | Image | Contents | Character |
 |---|---|---|---|
-| `srw-postgres` | `postgres:15` | Control plane: users, jobs, agents, threads + `thread_messages`, projects, datasources, tokens, automations, approvals, settings, `usage_rates`, `quota_limits`, `usage_daily` rollups | Load-bearing OLTP. PITR-forever class. First in line for HA (CloudNativePG track). |
+| `srw-postgres` | `postgres:15` | Control plane: users, jobs, agents, threads + `thread_messages`, projects, datasources, tokens, automations, approvals, settings, `usage_rates`, `usage_daily` rollup + `rollup_state` watermark (Phase 6). (`quota_limits` is planned — rate-limiting v2 — not yet built.) | Load-bearing OLTP. PITR-forever class. First in line for HA (CloudNativePG track). |
 | `srw-pgvector` | `pgvector/pgvector:pg15` | Semantic: sources, embeddings, memories, citations, knowledge index | Extension-coupled; latency-sensitive reads; rebuildable in principle. Memory-overhaul work (HNSW/halfvec) lands here. |
-| `srw-auditdb` | `postgres:15` (or 16, see package) | Observability tier: `agent_audit`, `llm_requests`, `chat_history` (90/90/365d retention) **+ `usage_events` metering ledger** | Append-only, monthly-partitioned, retention-dropped, `synchronous_commit=off` class. Non-load-bearing: product flow survives its outage. |
+| `srw-auditdb` | `postgres:15` (or 16, see package) | Observability tier: `agent_audit`, `llm_requests`, `chat_history` **+ `usage_events` metering ledger** | Append-only, monthly-partitioned, **no-auto-deletion** (retention is manual + export-first — policy, not a timer), `synchronous_commit=off` class. Non-load-bearing: product flow survives its outage. |
 | `srw-keycloakdb` | `postgres:15` | Keycloak's own schema | Vendor-owned. Untouched. |
 | Neo4j | neo4j | Project knowledge graph | Pending the "earning its keep" verdict — metering's `category='query', resource='neo4j'` rows are the instrumentation that answers it. |
 | Homelab `analytics` (TimescaleDB/Spilo) | Spilo | pdu-scraper power data, ops analytics, $/vcpu-hour rate calibration | **Not part of the product.** Inputs to `usage_rates`, never the ledger of record. |
@@ -64,8 +64,9 @@ A concern gets its **own server** only when at least one of these forces it:
    one supply-chain blob. One specialized image per specialized server,
    vanilla everywhere else.
 3. **Backup / retention / restore profile** — PITR is per-server. The control
-   plane wants point-in-time-forever; audit wants partition-drop retention and
-   can tolerate ~600ms loss windows; embeddings are re-derivable. Mixing
+   plane wants point-in-time-forever; audit is append-only + no-auto-deletion
+   (manual export-first) and can tolerate ~600ms loss windows; embeddings are
+   re-derivable. Mixing
    profiles on one server means restoring one concern rewinds the others, and
    backup/restore time scales with the firehose rather than the crown jewels.
 
@@ -90,11 +91,11 @@ architecture doesn't change; the topology does.
 
 ## TimescaleDB position
 
-Usage metering's specialization is "append-only time-series with retention and
-rollups" — which **plain Postgres satisfies**: the audit store's validated
-partition machinery (monthly partitions, retention drops, lookahead alarms)
-plus an orchestrator-timer rollup into app-DB `usage_daily` covers every v1
-requirement. TimescaleDB would add columnar compression (~10x) and continuous
+Usage metering's specialization is "append-only time-series with rollups" —
+which **plain Postgres satisfies**: the audit store's validated partition
+machinery (monthly partitions, lookahead alarms, per-parent size reporting)
+plus an orchestrator-timer rollup into app-DB `usage_daily` (built — Phase 6)
+covers every v1 requirement. TimescaleDB would add columnar compression (~10x) and continuous
 aggregates, at the cost of another non-vanilla image and a licensing check —
 its Community features (compression, caggs) are TSL-licensed: fine for
 internal SaaS use, but redistribution inside the customer-install chart needs
@@ -104,9 +105,9 @@ class of question).
 **Decision: plain PG now. Named upgrade trigger:** adopt TimescaleDB for
 `srw-auditdb` only when usage-dashboard rollup latency hurts or audit disk
 cost materially matters — and run the TSL redistribution analysis before it
-enters the chart. The swap is deliberately cheap: the store is
-retention-bounded and non-load-bearing, the schema/adapter don't care about
-the engine, and at 90-day retention "migrate" can mean "start fresh".
+enters the chart. The swap is deliberately cheap: the store is append-only and
+non-load-bearing, the schema/adapter don't care about the engine, and the raw
+rows re-materialize from `llm_requests` if a fresh start is ever wanted.
 
 ## Industry grounding (researched 2026-06-11)
 
