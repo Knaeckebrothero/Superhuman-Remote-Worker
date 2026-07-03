@@ -66,6 +66,14 @@ def _invoke(tool_func, args):
     return tool_func.invoke(args)
 
 
+def _capture_workspace():
+    """A mock workspace_manager that records write_file(path, content) calls."""
+    ws = MagicMock()
+    writes: dict = {}
+    ws.write_file.side_effect = lambda rel, content: writes.__setitem__(rel, content)
+    return ws, writes
+
+
 # =============================================================================
 # 13.1: KNOWLEDGE_TOOLS_METADATA registry
 # =============================================================================
@@ -710,10 +718,23 @@ class TestKbExport:
         result = _invoke(_get_tool(tools, "kb_export"), {"path": "/tmp/export"})
         assert "empty" in result
 
-    def test_creates_directory_and_writes_files(self, tmp_path):
+    def test_error_when_no_workspace(self):
+        # The local-Path fallback (agent host, invisible to the pod) is gone:
+        # kb_export now requires a workspace backend.
         tools, ctx = _make_tools()
         ctx.has_workspace.return_value = False
-        export_dir = str(tmp_path / "kb_export")
+        ctx.knowledge_graph.get_all_notes_for_export.return_value = [
+            {"id": "n1", "type": "decision", "status": "active", "content": "x"},
+        ]
+        result = _invoke(_get_tool(tools, "kb_export"), {"path": "exports/kb"})
+        assert "Error" in result
+        assert "workspace" in result
+
+    def test_creates_directory_and_writes_files(self):
+        tools, ctx = _make_tools()
+        ctx.has_workspace.return_value = True
+        ws, writes = _capture_workspace()
+        ctx.workspace_manager = ws
         ctx.knowledge_graph.get_all_notes_for_export.return_value = [
             {
                 "id": "chose-jwt",
@@ -728,25 +749,23 @@ class TestKbExport:
             },
         ]
 
-        result = _invoke(_get_tool(tools, "kb_export"), {"path": export_dir})
+        result = _invoke(_get_tool(tools, "kb_export"), {"path": "exports/kb"})
         assert "1 note" in result
 
-        # Verify file exists
-        exported = tmp_path / "kb_export" / "chose-jwt.md"
-        assert exported.exists()
-
-        content = exported.read_text()
+        content = writes["exports/kb/chose-jwt.md"]
         assert "---" in content  # frontmatter
         assert "id: chose-jwt" in content
         assert "type: decision" in content
         assert "tags:" in content
         assert "# Chose JWT" in content
-        assert "[[auth-design]]" in content
+        assert "[auth-design](auth-design.md)" in content  # markdown link
+        assert "[[auth-design]]" not in content  # not a wikilink
 
-    def test_groups_relationships_by_type(self, tmp_path):
+    def test_groups_relationships_by_type(self):
         tools, ctx = _make_tools()
-        ctx.has_workspace.return_value = False
-        export_dir = str(tmp_path / "kb_export2")
+        ctx.has_workspace.return_value = True
+        ws, writes = _capture_workspace()
+        ctx.workspace_manager = ws
         ctx.knowledge_graph.get_all_notes_for_export.return_value = [
             {
                 "id": "n1",
@@ -762,13 +781,11 @@ class TestKbExport:
             },
         ]
 
-        _invoke(_get_tool(tools, "kb_export"), {"path": export_dir})
-        content = (tmp_path / "kb_export2" / "n1.md").read_text()
+        _invoke(_get_tool(tools, "kb_export"), {"path": "exports/kb2"})
+        content = writes["exports/kb2/n1.md"]
         assert "## Relationships" in content
-        assert "**SUPPORTS:**" in content
-        assert "[[a]]" in content
-        assert "[[b]]" in content
-        assert "**REFERENCES:**" in content
+        assert "**SUPPORTS:** [a](a.md), [b](b.md)" in content
+        assert "**REFERENCES:** [c](c.md)" in content
 
     def test_returns_summary_with_count(self, tmp_path):
         tools, ctx = _make_tools()
@@ -781,3 +798,300 @@ class TestKbExport:
         result = _invoke(_get_tool(tools, "kb_export"), {"path": export_dir})
         assert "2 note(s)" in result
         assert export_dir in result
+
+
+# =============================================================================
+# Slice 1: _render_note_md (pure OKF serializer)
+# =============================================================================
+
+
+class TestRenderNoteMd:
+    """Tests for the pure OKF markdown serializer (_render_note_md)."""
+
+    def test_emits_frontmatter_fences_and_required_keys(self):
+        from src.tools.knowledge.knowledge_tools import _render_note_md
+
+        md = _render_note_md(
+            {"id": "chose-jwt", "type": "decision", "content": "body"}
+        )
+        assert md.startswith("---\n")
+        assert "\n---\n" in md  # closing fence
+        assert "id: chose-jwt" in md
+        assert "type: decision" in md
+        assert "status: active" in md  # defaults to active
+
+    def test_title_and_body(self):
+        from src.tools.knowledge.knowledge_tools import _render_note_md
+
+        md = _render_note_md(
+            {
+                "id": "n1",
+                "type": "learning",
+                "title": "My Note",
+                "content": "The full body.",
+            }
+        )
+        assert "# My Note" in md
+        assert "The full body." in md
+
+    def test_title_falls_back_to_id(self):
+        from src.tools.knowledge.knowledge_tools import _render_note_md
+
+        md = _render_note_md({"id": "abc-slug", "type": "learning", "content": "x"})
+        assert "# abc-slug" in md
+
+    def test_derives_description_from_content_first_sentence(self):
+        from src.tools.knowledge.knowledge_tools import _render_note_md
+
+        md = _render_note_md(
+            {
+                "id": "n1",
+                "type": "decision",
+                "content": "We chose JWT because it is stateless. More detail here.",
+            }
+        )
+        assert 'description: "We chose JWT because it is stateless."' in md
+
+    def test_explicit_description_wins_and_is_quoted(self):
+        from src.tools.knowledge.knowledge_tools import _render_note_md
+
+        md = _render_note_md(
+            {
+                "id": "n1",
+                "type": "decision",
+                "description": "A one: liner",
+                "content": "Body sentence.",
+            }
+        )
+        assert 'description: "A one: liner"' in md
+
+    def test_description_escapes_double_quotes(self):
+        from src.tools.knowledge.knowledge_tools import _render_note_md
+
+        md = _render_note_md(
+            {
+                "id": "n1",
+                "type": "decision",
+                "description": 'has "quotes"',
+                "content": "b",
+            }
+        )
+        assert 'description: "has \\"quotes\\""' in md
+
+    def test_emits_markdown_links_not_wikilinks(self):
+        from src.tools.knowledge.knowledge_tools import _render_note_md
+
+        md = _render_note_md(
+            {
+                "id": "n1",
+                "type": "decision",
+                "content": "b",
+                "relationships": [
+                    {"type": "SUPPORTS", "target": "auth-design"},
+                    {"type": "SUPPORTS", "target": "token-plan"},
+                    {"type": "REFERENCES", "target": "rfc-7519"},
+                ],
+            }
+        )
+        assert "[[auth-design]]" not in md  # no wikilinks
+        assert "**SUPPORTS:** [auth-design](auth-design.md), [token-plan](token-plan.md)" in md
+        assert "**REFERENCES:** [rfc-7519](rfc-7519.md)" in md
+
+    def test_emits_provenance_when_present(self):
+        from src.tools.knowledge.knowledge_tools import _render_note_md
+
+        md = _render_note_md(
+            {
+                "id": "n1",
+                "type": "decision",
+                "content": "b",
+                "author": "developer",
+                "job": "job-123",
+                "branch": "job/abc",
+            }
+        )
+        assert "author: developer" in md
+        assert "job: job-123" in md
+        assert "branch: job/abc" in md
+
+    def test_omits_optional_fields_when_absent(self):
+        from src.tools.knowledge.knowledge_tools import _render_note_md
+
+        md = _render_note_md({"id": "n1", "type": "decision", "content": "b"})
+        assert "confidence:" not in md
+        assert "author:" not in md
+        assert "branch:" not in md
+        assert "superseded_by:" not in md
+
+    def test_emits_tags_keywords_confidence_and_superseded_by(self):
+        from src.tools.knowledge.knowledge_tools import _render_note_md
+
+        md = _render_note_md(
+            {
+                "id": "n1",
+                "type": "decision",
+                "content": "b",
+                "tags": ["auth", "security"],
+                "keywords": ["jwt"],
+                "confidence": "high",
+                "status": "superseded",
+                "superseded_by": "new-note",
+            }
+        )
+        assert "tags: [auth, security]" in md
+        assert "keywords: [jwt]" in md
+        assert "confidence: high" in md
+        assert "status: superseded" in md
+        assert "superseded_by: new-note" in md
+
+
+# =============================================================================
+# Slice 1: kb_write / kb_update dual-write to knowledge/<slug>.md
+# =============================================================================
+
+
+def _make_git_context(**kwargs):
+    """Context whose has_git() is True and whose workspace records writes."""
+    ctx = _make_context(**kwargs)
+    ctx.has_git.return_value = True
+    ctx._job_metadata = {"config_name": "developer"}
+    ctx.workspace_manager = MagicMock()
+    ctx.workspace_manager.git_manager.current_branch.return_value = "job/abc"
+    return ctx
+
+
+class TestKbWriteDualWrite:
+    """Slice 1: kb_write materializes knowledge/<slug>.md via the workspace."""
+
+    def test_writes_flat_knowledge_file_when_git_active(self):
+        ctx = _make_git_context()
+        ctx.knowledge_graph.create_note.return_value = "chose-jwt"
+        ctx.knowledge_store.upsert_note = AsyncMock(return_value=uuid.uuid4())
+        tools, _ = _make_tools(ctx)
+
+        with patch("src.tools.knowledge.knowledge_tools.asyncio"):
+            _invoke(
+                _get_tool(tools, "kb_write"),
+                {"title": "Chose JWT", "type": "decision", "content": "We chose JWT."},
+            )
+
+        ctx.workspace_manager.write_file.assert_called_once()
+        path_arg, content_arg = ctx.workspace_manager.write_file.call_args[0]
+        assert path_arg == "knowledge/chose-jwt.md"
+        assert "id: chose-jwt" in content_arg
+        assert "author: developer" in content_arg
+        assert "branch: job/abc" in content_arg
+
+    def test_no_file_write_when_git_inactive(self):
+        ctx = _make_git_context()
+        ctx.has_git.return_value = False
+        ctx.knowledge_graph.create_note.return_value = "n1"
+        ctx.knowledge_store.upsert_note = AsyncMock(return_value=uuid.uuid4())
+        tools, _ = _make_tools(ctx)
+
+        with patch("src.tools.knowledge.knowledge_tools.asyncio"):
+            result = _invoke(
+                _get_tool(tools, "kb_write"),
+                {"title": "T", "type": "decision", "content": "x"},
+            )
+        ctx.workspace_manager.write_file.assert_not_called()
+        assert "n1" in result  # still succeeds
+
+    def test_file_write_failure_is_nonfatal(self):
+        ctx = _make_git_context()
+        ctx.knowledge_graph.create_note.return_value = "n1"
+        ctx.knowledge_store.upsert_note = AsyncMock(return_value=uuid.uuid4())
+        ctx.workspace_manager.write_file.side_effect = OSError("disk full")
+        tools, _ = _make_tools(ctx)
+
+        with patch("src.tools.knowledge.knowledge_tools.asyncio"):
+            result = _invoke(
+                _get_tool(tools, "kb_write"),
+                {"title": "T", "type": "decision", "content": "x"},
+            )
+        assert "n1" in result  # dual-write failure never fails the tool
+
+    def test_passes_description_arg_into_frontmatter(self):
+        ctx = _make_git_context()
+        ctx.knowledge_graph.create_note.return_value = "n1"
+        ctx.knowledge_store.upsert_note = AsyncMock(return_value=uuid.uuid4())
+        tools, _ = _make_tools(ctx)
+
+        with patch("src.tools.knowledge.knowledge_tools.asyncio"):
+            _invoke(
+                _get_tool(tools, "kb_write"),
+                {
+                    "title": "T",
+                    "type": "decision",
+                    "content": "x",
+                    "description": "A crisp summary.",
+                },
+            )
+        _, content_arg = ctx.workspace_manager.write_file.call_args[0]
+        assert 'description: "A crisp summary."' in content_arg
+
+
+class TestKbUpdateDualWrite:
+    """Slice 1: kb_update re-materializes knowledge/<slug>.md via the workspace."""
+
+    def test_rewrites_knowledge_file_on_update(self):
+        ctx = _make_git_context()
+        ctx.knowledge_graph.update_note.return_value = True
+        ctx.knowledge_graph.read_note.return_value = {
+            "id": "n1",
+            "title": "T",
+            "type": "decision",
+            "content": "updated body",
+            "status": "active",
+            "relationships": [{"type": "SUPPORTS", "target": "a"}],
+        }
+        tools, _ = _make_tools(ctx)
+
+        with patch("src.tools.knowledge.knowledge_tools.asyncio"):
+            _invoke(
+                _get_tool(tools, "kb_update"),
+                {"note": "n1", "content": "updated body"},
+            )
+
+        ctx.workspace_manager.write_file.assert_called_once()
+        path_arg, content_arg = ctx.workspace_manager.write_file.call_args[0]
+        assert path_arg == "knowledge/n1.md"
+        assert "updated body" in content_arg
+        assert "[a](a.md)" in content_arg
+
+    def test_no_file_write_when_git_inactive(self):
+        ctx = _make_git_context()
+        ctx.has_git.return_value = False
+        ctx.knowledge_graph.update_note.return_value = True
+        ctx.knowledge_graph.read_note.return_value = {
+            "id": "n1",
+            "title": "T",
+            "content": "x",
+        }
+        tools, _ = _make_tools(ctx)
+
+        with patch("src.tools.knowledge.knowledge_tools.asyncio"):
+            result = _invoke(
+                _get_tool(tools, "kb_update"),
+                {"note": "n1", "content": "x"},
+            )
+        ctx.workspace_manager.write_file.assert_not_called()
+        assert "Updated" in result
+
+    def test_file_write_failure_is_nonfatal(self):
+        ctx = _make_git_context()
+        ctx.knowledge_graph.update_note.return_value = True
+        ctx.knowledge_graph.read_note.return_value = {
+            "id": "n1",
+            "title": "T",
+            "content": "x",
+        }
+        ctx.workspace_manager.write_file.side_effect = OSError("disk full")
+        tools, _ = _make_tools(ctx)
+
+        with patch("src.tools.knowledge.knowledge_tools.asyncio"):
+            result = _invoke(
+                _get_tool(tools, "kb_update"),
+                {"note": "n1", "content": "x"},
+            )
+        assert "Updated" in result
