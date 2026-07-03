@@ -56,7 +56,18 @@ deltas, a `jsonb_set` array-append for `queued_replies`, a `context - text[]`
 key-drain, and a `verification_round` counter), `update_job_context` is
 deleted, and the two status-fused writers keep their flip in one statement.
 
-Remaining work is Phases 5–7. The research sweep's four premise corrections
+Phase 5 (the perf batch) is done on `develop` — all five HF items shipped as
+independent commits: **HF-5** per-store pools (`f6e283cd`), **HF-4** dispatcher
+partial index (`f2a83b1f`), **HF-6** the two list-endpoint N+1s (`408ceb83`),
+**HF-7** thread-read diet (`ff6d5068`), **HF-2** the session turn-reconcile
+batch (`3a916848`). Two HF-7 sub-parts were deliberately *deferred, not done*
+(rationale in the Phase 5 block): defaulting thread-open to newest-N (needs a
+coordinated cockpit `?before=` backfill — a server-only change strands older
+messages on an uncached open) and switching the display `ORDER BY` to the
+`(thread_id, seq)` keyset (marginal on a bounded single-thread Sort; `seq` is
+only heap-approximate for pre-0023 rows).
+
+Remaining work is Phases 6–7. The research sweep's four premise corrections
 still shape them:
 
 1. **HF-3 undercounted**: 13 racy `jobs.context` writers, not 8 — five raw
@@ -81,7 +92,7 @@ still shape them:
 | 2 | HF-1 generated schema artifact (keystone) | ~1 day | — | ✅ done — 2a `be0540b4` (script + 3 artifacts + CI gate) + 2b (init.py vector→migrations, compose initdb dropped) |
 | 3 | D-5 Mongo code deletion | ~1–2 days | QW-4 soak ✅ (done, >1 week) | ✅ done `f1b06621` |
 | 4 | HF-3 atomic context writes (correctness) | ~1–2 days | — | ✅ done `c09cc73c` — 13 racy writers atomic; `update_job_context` deleted; 21 real-PG tests |
-| 5 | Perf batch — HF-5, HF-4, HF-6, HF-7, HF-2 | ~3–4 days | — (HF-2 last) | todo |
+| 5 | Perf batch — HF-5, HF-4, HF-6, HF-7, HF-2 | ~3–4 days | — (HF-2 last) | ✅ done — HF-5 `f6e283cd`, HF-4 `f2a83b1f`, HF-6 `408ceb83`, HF-7 `ff6d5068`, HF-2 `3a916848`; 2 HF-7 sub-parts deferred (newest-N default + seq keyset — need cockpit coordination / marginal) |
 | 6 | Usage rollup + no-deletion policy — D-1 build, D-2 closed by policy | ~1–2 days | — (decided 2026-07-02) | todo |
 | 7 | Unification, direction A (one message model) | L (grew: 0019 is unbuilt) | Phases 1–5; G4 for direction B | gated |
 
@@ -584,6 +595,76 @@ Ordered cheapest/safest first; HF-2 last (touches the resume contract).
 **Acceptance (batch-wide):** EXPLAIN before/after for HF-4 (LIMIT 50, the
 dispatcher's actual call — `main.py:4152`); call-count assertions for HF-6;
 session smoke + resume tests + k3d kill-mid-turn drill for HF-7/HF-2.
+
+**✅ DONE — develop 2026-07-03, five independent commits (line refs below
+drifted; re-verified at build time).**
+
+- **HF-5 (`f6e283cd`)** — `PostgresDB.__init__` gained `env_prefix` +
+  per-store `default_min/max_connections`; the vector/audit instances stopped
+  silently inheriting `POSTGRES_MIN/MAX_CONNECTIONS` (they now read
+  `VECTOR_POSTGRES_*` 1/5, `AUDIT_POSTGRES_*` 1/4; control stays 2/10) and
+  never fall through to asyncpg's own min-10 default. Chart: the orchestrator
+  (explicit env, not `envFrom`) sizes its own pools from `orchestrator.dbPool`;
+  agent pods (which DO `envFrom`) get the small `agent.dbPool.app` (1/3) via the
+  ConfigMap `POSTGRES_*_CONNECTIONS` — the agent's vector pool shares that env,
+  so one knob bounds both. values document the per-server budget + pgbouncer
+  escape hatch. 7 construction-time unit tests (defaults / env-override /
+  store-isolation regression); `helm template` renders the six orchestrator env
+  vars + the ConfigMap agent values at the expected sizes.
+- **HF-4 (`f2a83b1f`)** — `0046_jobs_dispatchable_partial_idx.notx.sql`:
+  `CREATE INDEX CONCURRENTLY idx_jobs_dispatchable ON jobs (priority DESC,
+  created_at ASC) WHERE assigned_agent_id IS NULL AND freeze_data IS NULL AND
+  status IN ('created','paused')`. EXPLAIN before/after (LIMIT 50, ~8k
+  non-dispatchable + 40 dispatchable rows) confirmed the outer scan flips from
+  Seq Scan + Sort → `Index Scan using idx_jobs_dispatchable`, Sort eliminated
+  (the residual cloud-baseline filter + recursive cascade `NOT EXISTS` stay as
+  post-index work, as predicted). `get_dispatchable_jobs` carries a docstring +
+  inline comment: statuses MUST stay literal (`status = ANY($1)` disables the
+  index). New `test_get_dispatchable_jobs.py` applies the migration DDL to a
+  real pg and asserts the dispatchable set + ordering across every WHERE branch
+  (the cascade case also pins that a bare paused job is dispatchable while it
+  blocks its own children).
+- **HF-6 (`408ceb83`)** — `GET /api/datasources` per-row
+  `user_can_access_datasource` (an `N × (1 + M)` fan-out) → new
+  `security.access.filter_visible_datasources`: resolve caller visibility once
+  (`user_visible_project_ids`) + one `list_datasource_projects_bulk`
+  (`datasource_id = ANY($1)`), intersect in Python, unscoped admins
+  short-circuit before any link fetch. `GET /api/persistent/threads` per-thread
+  `list_thread_mounts` → one `list_thread_mounts_bulk` (`thread_id = ANY($1)`).
+  Correctness across admin/creator/member/none/scoped + call-count assertions
+  that the per-row methods are never touched; `conftest.fake_db` gained the bulk
+  method so the existing endpoint gates stay green unchanged.
+- **HF-7 (`ff6d5068`)** — the thread-history endpoint's unconditional
+  `get_thread_message_count` (a second scan feeding a `total` field NO consumer
+  reads — cockpit uses only `.messages`, MCP doesn't read it) is now first-page-
+  only: a full load / cursor window sets `total = len(messages)` for free; the
+  COUNT is charged only for the explicit limit/offset paged read. The agent
+  resume reader trimmed its 15-column SELECT → the 5 fields resume actually
+  consumes (role/content/tool_calls/tool_call_id + turn_number), dropping the
+  large resume-unused JSONB (reasoning/tool_results/provider_raw/… — the
+  never-read "0019 component shape"). **Deferred, not done:** (a) defaulting
+  thread-open to server-side newest-N — the cockpit has no `?before=` backfill
+  (only `?after=` catch-up), so a server-only newest-N strands older messages on
+  an uncached open (the documented "only first message shows" bug); needs a
+  coordinated cockpit change. (b) switching the display `ORDER BY` to the
+  `(thread_id, seq)` keyset — the Sort is over one bounded thread (negligible)
+  and `seq` is only heap-approximate (≈, not =, `created_at`) for pre-0023
+  backfilled rows, so changing user-visible order isn't worth it; the cursor
+  method also keys on `created_at`, so a seq swap there would need a contract
+  change.
+- **HF-2 (`3a916848`)** — the turn-complete reconcile
+  (`_save_turn_ai_messages`) re-saved each message with a serial
+  `save_thread_message`; now one pipelined `save_thread_messages` (asyncpg
+  `executemany` of the same `ON CONFLICT (id) DO UPDATE`, minus RETURNING, +
+  one `threads` bump, in a transaction). `seq` is preserved across the upsert
+  (real-PG test proves it — the resume cursor stays stable), and the reconcile
+  re-saves ALL turn rows (the durability backstop for dropped incremental
+  writes, so tool rows are NOT skipped despite the plan's "skippable" note —
+  skipping would break recovery). The incremental mid-turn persists are
+  unchanged; a shared `_serialize_message_row` single-sources the LangChain→row
+  serialization. The count-assertion tests were rewritten to the batched shape.
+  No automated mid-turn-kill drill (deferred to k3d, per the persistence-slices
+  doc). Whole batch: 490 tests green across the touched suites; `ruff` clean.
 
 ## Phase 6 — Usage rollup + the no-deletion policy (D-1 build; D-2 closed by policy)
 
