@@ -164,6 +164,42 @@ class IngestionVerdict(BaseModel):
     reason: str = Field(description="One-line justification for the verdict")
 
 
+class KnowledgeVerdict(BaseModel):
+    """Structured output for the knowledge ingestion verdict (OKF KB slice 2 PR2).
+
+    The KB analog of :class:`IngestionVerdict`. The adjudicator compares a
+    curation candidate note against its nearest currently-active KB neighbours
+    and decides what to do with it *before* any ``kb_write``/``kb_update`` —
+    this is the gate that stops the F33/F38 curator noise (reconstructed
+    deliverables, double-written proposals, immortal learning/retro notes).
+    ``target_indices`` are 1-based positions in the numbered neighbour list
+    shown to the model (NOT note ids — echoing slugs is error-prone); the
+    curator maps them back to notes.
+    """
+
+    action: str = Field(
+        description=(
+            "One of: ADD (genuinely new knowledge — write the candidate, touch "
+            "nothing), DISCARD (already captured by a neighbour, or not worth "
+            "keeping — drop the candidate, write nothing), UPDATE (the candidate "
+            "is the SAME note with a changed/corrected value — edit the single "
+            "neighbour in target_indices in place, keeping its id), SUPERSEDE "
+            "(the candidate replaces one or more stale neighbours — write the "
+            "candidate as a new note and retire the neighbours in target_indices)."
+        )
+    )
+    target_indices: List[int] = Field(
+        default_factory=list,
+        description=(
+            "1-based indices of the neighbour notes this verdict acts on. "
+            "Exactly one for UPDATE (the note to edit) and DISCARD (the note the "
+            "candidate duplicates); one or more for SUPERSEDE (the notes to "
+            "retire). Empty for ADD."
+        ),
+    )
+    reason: str = Field(description="One-line justification for the verdict")
+
+
 class CitationVerdict(BaseModel):
     """Structured verdict for citation verification (citation engine Phase 2).
 
@@ -337,6 +373,59 @@ class IngestionVerdictTask(AuxTask):
     @property
     def output_schema(self) -> Type[BaseModel]:
         return IngestionVerdict
+
+
+class KnowledgeVerdictTask(AuxTask):
+    """Adjudicate a curation candidate note against its nearest KB neighbours.
+
+    Chain-mode task (OKF KB slice 2 PR2) — one structured-output adjudication
+    like :class:`IngestionVerdictTask`, NOT another agent loop. ``neighbours``
+    is the ordered list shown to the model — each item a dict with ``content``
+    and optional ``similarity`` / ``title`` / ``age`` annotations; the 1-based
+    display index is the position in this list.
+
+    Unlike the memory verdict (whose prompt is loaded once at attach time), the
+    ``prompt`` is passed in at **event time** — the curator resolves it from the
+    prompt matrix so ``config.update`` is honoured in persistent sessions.
+    """
+
+    def __init__(
+        self,
+        candidate_content: str,
+        neighbours: List[Dict[str, Any]],
+        prompt: str,
+    ):
+        self.candidate_content = candidate_content
+        self.neighbours = neighbours
+        self._prompt = prompt
+
+    @property
+    def system_prompt(self) -> str:
+        return self._prompt
+
+    def build_context(self) -> str:
+        lines = ["NEW candidate knowledge note:", self.candidate_content, ""]
+        lines.append("Existing similar notes (currently active):")
+        for i, n in enumerate(self.neighbours, start=1):
+            meta_parts = []
+            if n.get("similarity") is not None:
+                meta_parts.append(f"similarity {float(n['similarity']):.2f}")
+            if n.get("title"):
+                meta_parts.append(str(n["title"]))
+            if n.get("age"):
+                meta_parts.append(str(n["age"]))
+            meta = f" ({', '.join(meta_parts)})" if meta_parts else ""
+            lines.append(f"[{i}]{meta} {n.get('content', '')}")
+        lines.append("")
+        lines.append(
+            "Decide ADD / UPDATE / SUPERSEDE / DISCARD. For UPDATE/SUPERSEDE/"
+            "DISCARD put the relevant [n] numbers in target_indices."
+        )
+        return "\n".join(lines)
+
+    @property
+    def output_schema(self) -> Type[BaseModel]:
+        return KnowledgeVerdict
 
 
 class VerifyCitationTask(AuxTask):
@@ -1318,6 +1407,8 @@ async def curate_and_store_knowledge(
     workspace_md: str,
     plan_md: str,
     curation_prompt: str,
+    verdict_service: Any = None,
+    verdict_prompt: Optional[str] = None,
 ) -> Optional["CurationResult"]:
     """Run inline knowledge curation via AuxiliaryLLM agent mode.
 
@@ -1354,10 +1445,16 @@ async def curate_and_store_knowledge(
         except Exception as e:
             logger.debug(f"Could not fetch existing notes: {e}")
 
-        # Create KB tools for the curation agent
+        # Create KB tools for the curation agent. When the verdict gate is wired
+        # (curate_knowledge.verdict enabled), kb_write routes each candidate
+        # through the ingestion verdict before writing (OKF KB slice 2 PR2).
         from src.tools.knowledge.knowledge_tools import create_kb_tools
 
-        kb_tools = create_kb_tools(tool_context)
+        kb_tools = create_kb_tools(
+            tool_context,
+            verdict_service=verdict_service,
+            verdict_prompt=verdict_prompt,
+        )
 
         task = CurateKnowledgeTask(
             phase_data=phase_data,

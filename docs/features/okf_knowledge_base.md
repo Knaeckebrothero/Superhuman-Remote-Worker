@@ -25,9 +25,10 @@ related:
 
 # OKF Knowledge Base — Files-Canonical KB as a Datasource
 
-**Status:** DRAFT (implementation-ready); **slice 1 (dual-write) IMPLEMENTED
-2026-07-03** — uncommitted on `develop`, TDD-built, 223 green across the knowledge
-suites, ruff clean (§11). Origin: design discussion 2026-07-03, building on the
+**Status:** DRAFT (implementation-ready); **slice 1 (dual-write) + slice 2 PR1
+(gardener tools) COMMITTED on `develop`; slice 2 PR2 (curator verdict gate)
+IMPLEMENTED 2026-07-03, uncommitted** — all TDD-built, ruff clean, 233 green across
+the knowledge suites (§11). Origin: design discussion 2026-07-03, building on the
 substrate findings in [[knowledge_base_substrate_decision]]; refined the same day by a
 six-agent research sweep (three codebase audits, three web — sources in §12).
 [[loop_repo_compounding_v2]] shipped the same day, which changes this doc's footing: the
@@ -435,14 +436,41 @@ exactly the split-brain this design exists to kill.
    The DB stays the retrieval substrate; the v2 merge delivers the files to `main`.
    Agent-side only, no schema, no orchestrator change. **E2E = an overnight loop run**;
    no index reads these files yet (slice 3), so zero retrieval blast radius.
-2. **OKF lint/gardener toolset + curator-as-proper-auxiliary** — `kb_lint`/`kb_index`
-   (rule set + index shape now specified in §7); useful against today's `repository`
-   datasources (point it at a vault — or this repo's `docs/`). Includes the curator
-   refactor (§3 note: chain-mode verdict gate with content-hash pre-filter, gardener
-   verbs, `src/services/knowledge/` mirroring `src/services/memory/`'s
-   manager/types/protocols/registry/ingestion/plugins layout — the full
-   memory→knowledge mirror map with target filenames is in the 2026-07-03 code audit;
-   `KnowledgeStore` needs a `find_similar_many` analog for the neighbour fetch).
+2. **OKF lint/gardener toolset + curator-as-proper-auxiliary** — split into two PRs.
+   - **PR1 — gardener tools ✅ COMMITTED 2026-07-03** (`d0125805`). Pure engine in
+     `src/tools/knowledge/gardener.py` (no workspace/DB, reusable against any vault):
+     `parse_note_md` (inverse of slice-1 `_render_note_md`), `lint_kb → LintReport`
+     (9 deterministic rules: missing-frontmatter, invalid-yaml, missing-required-key,
+     invalid-id, duplicate-id, dead-link, broken-supersede, orphan, missing-title —
+     reserved `index.md`/`log.md` exempt), `render_index_md` (OKF §6 index: `## <type>`
+     groups, gen-markers preserve human sections, loud 200-line/25 KB truncation). Two
+     thin `@tool` wrappers `kb_lint`/`kb_index` (12 KB tools now). Deferred to PR2: the
+     embedding-backed near-duplicate rule + the network dead-external-URL sweep.
+   - **PR2 — curator verdict gate ✅ IMPLEMENTED 2026-07-03** (uncommitted; strict TDD).
+     The §3 refactor, as built:
+     - **`KnowledgeStore.find_similar_many(project_id, embedding, k, min_similarity)`** —
+       the neighbour fetch (active-only, `<=>` cosine, transient `.similarity`); the KB
+       analog of `RecallStore.find_similar_many`. Empty result = the cost guard.
+     - **`KnowledgeVerdict` / `KnowledgeVerdictTask`** (`auxiliary.py`) — chain-mode
+       adjudication (one structured call, not an agent loop) returning
+       ADD / UPDATE / SUPERSEDE / DISCARD + 1-based `target_indices`; prompt passed at
+       **event time**, mirroring `IngestionVerdict`.
+     - **`src/services/knowledge/ingestion.py`** (mirrors `src/services/memory/`):
+       `KnowledgeVerdictService.adjudicate` (cost guard → straight ADD on no neighbour;
+       **content-hash pre-filter** → DISCARD exact dups before the LLM; conservative-ADD
+       fallback on aux error/wrong-shape), `gate_candidate` (embed → `find_similar_many`
+       → adjudicate → resolve `target_indices` to notes), `build_knowledge_verdict_service`.
+     - **Gate seam**: `create_kb_tools(context, verdict_service=?, verdict_prompt=?)` —
+       only the curator passes them, so loop/worker agents write **ungated** as before
+       ("loop jobs run bare"). `kb_write` routes: DISCARD skips, UPDATE redirects the edit
+       onto the duplicate, SUPERSEDE creates then retires the stale note(s)
+       (`status=superseded` + `SUPERSEDED_BY`), ADD/any gate error → normal create.
+       `kb_update`'s body factored into a shared `_update_existing` helper.
+     - **Config**: `auxiliary.tasks.curate_knowledge.{verdict,verdict_top_k,review_floor}`
+       — **default OFF** (measured opt-in, like `memory.ingestion.enabled`). Prompt
+       `config/prompts/knowledge_verdict_prompt.txt`; wired through `archive_phase`.
+     - **E2E = an overnight loop run** with the knob on (the async gate is validated by
+       real-execution unit tests, but tuning the verdict wants live slice-1 KB volume).
 3. **Postgres index + query tools + retrieval cutover** — the §5/§5.1 spec: tree-diff
    watermark reindex, chunk rows, `embedding_version` + `pipeline_version`, migration
    `vector/0008`; `search_knowledge` backend swap (the RRF functions gain `kb_id`);

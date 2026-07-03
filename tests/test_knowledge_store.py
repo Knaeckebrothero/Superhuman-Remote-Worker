@@ -462,6 +462,71 @@ class TestHybridSearch:
 
 
 # =============================================================================
+# find_similar_many() — neighbour fetch for the ingestion verdict (slice 2 PR2)
+# =============================================================================
+
+
+class TestFindSimilarMany:
+    """Tests for find_similar_many() — the KB analog of RecallStore's version."""
+
+    @pytest.mark.asyncio
+    async def test_returns_records_with_similarity(self):
+        store, mock_db, _ = _make_store()
+        mock_db.fetch.return_value = [
+            {"note_id": "n1", "title": "A", "content": "body", "similarity": 0.91},
+        ]
+
+        result = await store.find_similar_many(
+            project_id=uuid.uuid4(), embedding=[0.1, 0.2, 0.3]
+        )
+        assert len(result) == 1
+        assert isinstance(result[0], KnowledgeRecord)
+        assert result[0].note_id == "n1"
+        assert result[0].similarity == 0.91
+
+    @pytest.mark.asyncio
+    async def test_query_scopes_to_project_active_and_floor(self):
+        store, mock_db, _ = _make_store()
+        mock_db.fetch.return_value = []
+        pid = uuid.uuid4()
+
+        await store.find_similar_many(
+            project_id=pid, embedding=[0.1, 0.2, 0.3], k=7, min_similarity=0.75
+        )
+        sql = mock_db.fetch.call_args[0][0]
+        args = mock_db.fetch.call_args[0][1:]
+        assert "project_id" in sql
+        assert "status = 'active'" in sql
+        assert "embedding <=>" in sql
+        # args: embedding, project_id, min_similarity, k
+        assert args[1] == pid
+        assert args[2] == 0.75
+        assert args[3] == 7
+
+    @pytest.mark.asyncio
+    async def test_empty_when_no_neighbours(self):
+        store, mock_db, _ = _make_store()
+        mock_db.fetch.return_value = []
+
+        result = await store.find_similar_many(
+            project_id=uuid.uuid4(), embedding=[0.1, 0.2, 0.3]
+        )
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_accepts_string_embedding(self):
+        # Legacy string embeddings must be normalized (mirrors _prepare_embedding).
+        store, mock_db, _ = _make_store()
+        mock_db.fetch.return_value = []
+
+        await store.find_similar_many(
+            project_id=uuid.uuid4(), embedding="[0.1,0.2,0.3]"
+        )
+        passed = mock_db.fetch.call_args[0][1]
+        assert passed == [0.1, 0.2, 0.3]
+
+
+# =============================================================================
 # 11.8: get_summary()
 # =============================================================================
 

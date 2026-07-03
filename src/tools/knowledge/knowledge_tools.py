@@ -284,11 +284,21 @@ def _dual_write_note(context: ToolContext, slug: str, note: Dict[str, Any]) -> N
         logger.warning(f"knowledge/ dual-write failed for {slug}: {e}")
 
 
-def create_kb_tools(context: ToolContext) -> List[Any]:
+def create_kb_tools(
+    context: ToolContext,
+    verdict_service: Any = None,
+    verdict_prompt: Optional[str] = None,
+) -> List[Any]:
     """Create knowledge base tools with injected context.
 
     Args:
         context: ToolContext with knowledge_graph and knowledge_store
+        verdict_service: Optional KnowledgeVerdictService (OKF KB slice 2 PR2).
+            When present (only the curator passes it), ``kb_write`` routes each
+            candidate through the ingestion verdict gate before writing —
+            ADD / UPDATE / SUPERSEDE / DISCARD. Every other caller (loop/worker
+            agents) omits it and writes ungated, exactly as before.
+        verdict_prompt: The verdict system prompt, resolved at event time.
 
     Returns:
         List of LangChain tool functions
@@ -322,119 +332,7 @@ def create_kb_tools(context: ToolContext) -> List[Any]:
     # Write Tools
     # =========================================================================
 
-    @tool
-    def kb_write(
-        title: str,
-        type: str,
-        content: str,
-        description: Optional[str] = None,
-        tags: Optional[List[str]] = None,
-        keywords: Optional[List[str]] = None,
-        confidence: Optional[str] = None,
-        links: Optional[List[dict]] = None,
-        retrieval_messages: Optional[List[str]] = None,
-    ) -> str:
-        """Create a new knowledge note in the project knowledge base.
-
-        Write-through: creates the note in Neo4j (source of truth), upserts into
-        the pgvector search index, AND materializes the note as an OKF markdown
-        file at ``knowledge/<slug>.md`` on the workspace (delivered to the repo's
-        ``main`` by the normal commit/merge flow). The note is immediately
-        available for search and graph queries.
-
-        Args:
-            title: Note title (generates the slug ID, e.g. "chose-jwt-over-oauth")
-            type: Note type — one of: goal, plan, decision, learning, code, source, question, state, retrospective
-            content: Full markdown body of the note
-            description: One-sentence summary for progressive-disclosure indexes.
-                         Strongly recommended; derived from the content's first
-                         sentence when omitted.
-            tags: List of tag names (e.g. ["authentication", "security"])
-            keywords: List of keyword strings for search
-            confidence: Confidence level — high, medium, or low
-            links: Relationships to other notes — list of {"target": "note-slug", "type": "RELATIONSHIP_TYPE"}.
-                   Types: REFERENCES, DERIVED_FROM, SUPPORTS, CONTRADICTS, ANSWERS, DEPENDS_ON, SUPERSEDES, IMPLEMENTS
-            retrieval_messages: Synthetic queries describing when this note should be retrieved
-                               (e.g. ["What auth approach should I use?", "Why JWT over OAuth?"])
-
-        Returns:
-            Confirmation with the note's slug ID, or error message
-        """
-        project_id = _get_project_id(context)
-        if not project_id:
-            return "Error: No project_id available. Knowledge tools require a project context."
-
-        try:
-            slug = kg.create_note(
-                project_id=project_id,
-                title=title,
-                note_type=type,
-                content=content,
-                tags=tags,
-                keywords=keywords,
-                confidence=confidence,
-                job_id=context.job_id,
-                phase=context.config.get("current_phase"),
-                retrieval_messages=retrieval_messages,
-                links=links,
-            )
-
-            # Write-through to pgvector
-            now = datetime.now(timezone.utc)
-            try:
-                _run_async(
-                    ks.upsert_note(
-                        note_id=slug,
-                        project_id=uuid.UUID(project_id),
-                        title=title,
-                        note_type=type,
-                        content=content,
-                        tags=tags,
-                        keywords=keywords,
-                        confidence=confidence,
-                        job_id=uuid.UUID(context.job_id) if context.job_id else None,
-                        phase=context.config.get("current_phase"),
-                        retrieval_messages=retrieval_messages,
-                        created_at=now,
-                        modified_at=now,
-                    )
-                )
-            except Exception as e:
-                logger.warning(f"pgvector write-through failed for {slug}: {e}")
-                # Note exists in Neo4j — pgvector can be rebuilt
-
-            # Files-canonical dual-write (slice 1): materialize knowledge/<slug>.md.
-            _dual_write_note(
-                context,
-                slug,
-                {
-                    "id": slug,
-                    "type": type,
-                    "title": title,
-                    "description": description,
-                    "content": content,
-                    "tags": tags,
-                    "keywords": keywords,
-                    "confidence": confidence,
-                    "status": "active",
-                    "relationships": links or [],
-                },
-            )
-
-            link_info = ""
-            if links:
-                link_info = f", {len(links)} link(s)"
-
-            return f"Created knowledge note: **{slug}** (type={type}{link_info})"
-
-        except ValueError as e:
-            return f"Error: {e}"
-        except Exception as e:
-            logger.error(f"kb_write failed: {e}")
-            return f"Error creating knowledge note: {e}"
-
-    @tool
-    def kb_update(
+    def _update_existing(
         note: str,
         content: Optional[str] = None,
         append: Optional[str] = None,
@@ -443,21 +341,10 @@ def create_kb_tools(context: ToolContext) -> List[Any]:
         add_tags: Optional[List[str]] = None,
         add_links: Optional[List[dict]] = None,
     ) -> str:
-        """Update an existing knowledge note.
+        """Update an existing note: Neo4j + OKF dual-write + pgvector write-through.
 
-        Write-through: updates both Neo4j and pgvector search index.
-
-        Args:
-            note: Note slug ID (e.g. "chose-jwt-over-oauth")
-            content: Replace the entire content (mutually exclusive with append)
-            append: Append text to existing content (mutually exclusive with content)
-            status: New status — active, resolved, superseded, or archived
-            confidence: New confidence level — high, medium, or low
-            add_tags: Additional tags to add
-            add_links: Additional relationships — list of {"target": "slug", "type": "RELATIONSHIP_TYPE"}
-
-        Returns:
-            Confirmation or error message
+        Shared by the ``kb_update`` tool and the verdict gate's UPDATE/SUPERSEDE
+        routing, so both apply an edit the same way.
         """
         project_id = _get_project_id(context)
         if not project_id:
@@ -545,6 +432,214 @@ def create_kb_tools(context: ToolContext) -> List[Any]:
         except Exception as e:
             logger.error(f"kb_update failed: {e}")
             return f"Error updating note: {e}"
+
+    @tool
+    def kb_write(
+        title: str,
+        type: str,
+        content: str,
+        description: Optional[str] = None,
+        tags: Optional[List[str]] = None,
+        keywords: Optional[List[str]] = None,
+        confidence: Optional[str] = None,
+        links: Optional[List[dict]] = None,
+        retrieval_messages: Optional[List[str]] = None,
+    ) -> str:
+        """Create a new knowledge note in the project knowledge base.
+
+        Write-through: creates the note in Neo4j (source of truth), upserts into
+        the pgvector search index, AND materializes the note as an OKF markdown
+        file at ``knowledge/<slug>.md`` on the workspace (delivered to the repo's
+        ``main`` by the normal commit/merge flow). The note is immediately
+        available for search and graph queries.
+
+        Args:
+            title: Note title (generates the slug ID, e.g. "chose-jwt-over-oauth")
+            type: Note type — one of: goal, plan, decision, learning, code, source, question, state, retrospective
+            content: Full markdown body of the note
+            description: One-sentence summary for progressive-disclosure indexes.
+                         Strongly recommended; derived from the content's first
+                         sentence when omitted.
+            tags: List of tag names (e.g. ["authentication", "security"])
+            keywords: List of keyword strings for search
+            confidence: Confidence level — high, medium, or low
+            links: Relationships to other notes — list of {"target": "note-slug", "type": "RELATIONSHIP_TYPE"}.
+                   Types: REFERENCES, DERIVED_FROM, SUPPORTS, CONTRADICTS, ANSWERS, DEPENDS_ON, SUPERSEDES, IMPLEMENTS
+            retrieval_messages: Synthetic queries describing when this note should be retrieved
+                               (e.g. ["What auth approach should I use?", "Why JWT over OAuth?"])
+
+        Returns:
+            Confirmation with the note's slug ID, or error message
+        """
+        project_id = _get_project_id(context)
+        if not project_id:
+            return "Error: No project_id available. Knowledge tools require a project context."
+
+        # Ingestion verdict gate (slice 2 PR2) — only when the curator wired a
+        # service. Adjudicate the candidate against its nearest active notes
+        # before writing: DISCARD skips, UPDATE redirects the edit onto the
+        # duplicate, SUPERSEDE writes then retires the stale note(s), ADD (or any
+        # non-fatal gate error) falls through to a normal create.
+        supersede_targets: List[Any] = []
+        if verdict_service is not None and verdict_prompt:
+            try:
+                from src.services.knowledge.ingestion import gate_candidate
+
+                decision = _run_async(
+                    gate_candidate(
+                        verdict_service,
+                        ks,
+                        uuid.UUID(project_id),
+                        content=content,
+                        prompt=verdict_prompt,
+                    )
+                )
+                action = decision.verdict.action
+                if action == "DISCARD":
+                    dup = (
+                        f" (duplicate of {decision.targets[0].note_id})"
+                        if decision.targets
+                        else ""
+                    )
+                    return (
+                        f"Skipped note '{title}' — verdict DISCARD{dup}: "
+                        f"{decision.verdict.reason}"
+                    )
+                if action == "UPDATE" and decision.targets:
+                    return _update_existing(
+                        decision.targets[0].note_id, content=content
+                    )
+                if action == "SUPERSEDE" and decision.targets:
+                    supersede_targets = decision.targets
+            except Exception as e:
+                logger.warning(
+                    f"knowledge verdict gate failed (non-fatal, writing ungated): {e}"
+                )
+
+        try:
+            slug = kg.create_note(
+                project_id=project_id,
+                title=title,
+                note_type=type,
+                content=content,
+                tags=tags,
+                keywords=keywords,
+                confidence=confidence,
+                job_id=context.job_id,
+                phase=context.config.get("current_phase"),
+                retrieval_messages=retrieval_messages,
+                links=links,
+            )
+
+            # Write-through to pgvector
+            now = datetime.now(timezone.utc)
+            try:
+                _run_async(
+                    ks.upsert_note(
+                        note_id=slug,
+                        project_id=uuid.UUID(project_id),
+                        title=title,
+                        note_type=type,
+                        content=content,
+                        tags=tags,
+                        keywords=keywords,
+                        confidence=confidence,
+                        job_id=uuid.UUID(context.job_id) if context.job_id else None,
+                        phase=context.config.get("current_phase"),
+                        retrieval_messages=retrieval_messages,
+                        created_at=now,
+                        modified_at=now,
+                    )
+                )
+            except Exception as e:
+                logger.warning(f"pgvector write-through failed for {slug}: {e}")
+                # Note exists in Neo4j — pgvector can be rebuilt
+
+            # Files-canonical dual-write (slice 1): materialize knowledge/<slug>.md.
+            _dual_write_note(
+                context,
+                slug,
+                {
+                    "id": slug,
+                    "type": type,
+                    "title": title,
+                    "description": description,
+                    "content": content,
+                    "tags": tags,
+                    "keywords": keywords,
+                    "confidence": confidence,
+                    "status": "active",
+                    "relationships": links or [],
+                },
+            )
+
+            # Verdict SUPERSEDE: retire the stale note(s) the candidate replaces,
+            # pointing them at the new note (status=superseded + SUPERSEDED_BY).
+            if supersede_targets:
+                retired = []
+                for t in supersede_targets:
+                    try:
+                        _update_existing(
+                            t.note_id,
+                            status="superseded",
+                            add_links=[{"target": slug, "type": "SUPERSEDED_BY"}],
+                        )
+                        retired.append(t.note_id)
+                    except Exception as e:
+                        logger.warning(f"supersede retire failed for {t.note_id}: {e}")
+                if retired:
+                    return (
+                        f"Created knowledge note: **{slug}** (type={type}) — "
+                        f"superseded {', '.join(retired)}"
+                    )
+
+            link_info = ""
+            if links:
+                link_info = f", {len(links)} link(s)"
+
+            return f"Created knowledge note: **{slug}** (type={type}{link_info})"
+
+        except ValueError as e:
+            return f"Error: {e}"
+        except Exception as e:
+            logger.error(f"kb_write failed: {e}")
+            return f"Error creating knowledge note: {e}"
+
+    @tool
+    def kb_update(
+        note: str,
+        content: Optional[str] = None,
+        append: Optional[str] = None,
+        status: Optional[str] = None,
+        confidence: Optional[str] = None,
+        add_tags: Optional[List[str]] = None,
+        add_links: Optional[List[dict]] = None,
+    ) -> str:
+        """Update an existing knowledge note.
+
+        Write-through: updates both Neo4j and pgvector search index.
+
+        Args:
+            note: Note slug ID (e.g. "chose-jwt-over-oauth")
+            content: Replace the entire content (mutually exclusive with append)
+            append: Append text to existing content (mutually exclusive with content)
+            status: New status — active, resolved, superseded, or archived
+            confidence: New confidence level — high, medium, or low
+            add_tags: Additional tags to add
+            add_links: Additional relationships — list of {"target": "slug", "type": "RELATIONSHIP_TYPE"}
+
+        Returns:
+            Confirmation or error message
+        """
+        return _update_existing(
+            note,
+            content=content,
+            append=append,
+            status=status,
+            confidence=confidence,
+            add_tags=add_tags,
+            add_links=add_links,
+        )
 
     # =========================================================================
     # Read Tools
