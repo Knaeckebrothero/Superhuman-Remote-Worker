@@ -289,9 +289,8 @@ async def _read_head_commit(
 
     Uses Gitea's ``GET /branches/{branch}`` endpoint, which reliably
     returns the head commit regardless of branch name (including names
-    containing ``/`` like ``job/abc123``). ``get_commits`` would NOT
-    work here — its ``git/commits`` endpoint is for specific commit
-    SHAs, not branch lookups, and returns 404 for branch names.
+    containing ``/`` like ``job/abc123``) — the precise single-branch
+    lookup, vs. ``get_commits`` which lists a page of history.
     """
     return await gitea_client.get_branch_head_sha(repo_name, branch or "main")
 
