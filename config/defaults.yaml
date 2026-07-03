@@ -289,7 +289,7 @@ memory:
   # the legacy two-tier read + cosine-dedup write stay in place behind these
   # flags, so this is a one-edit revert.
   reranker:
-    model: qwen3-reranker-8b         # rides the auxiliary endpoint (no extra credential plumbing)
+    model: qwen3-reranker-8b         # rides the embedding endpoint EMBEDDING_BASE_URL (same qwen3 router; no extra credential plumbing)
     top_k: 512                       # cover the candidate set; any tail past this fails the gate open, bounded backstops it
     keep_pinned_first: false         # ~95% of project corpora freeze TTL-pinned — let the reranker rank them too
     timeout: 10                      # live-latency cap (eval used 60 for cold-batch throughput); a slow rerank degrades to legacy order, contained

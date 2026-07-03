@@ -1214,6 +1214,72 @@ async def _session_grant_violations(thread: dict[str, Any]) -> list[str]:
         return list(gd.violations)
 
 
+async def _session_endpoint_violations(thread: dict[str, Any]) -> list[str]:
+    """Pre-flight the model-role transports for a session's resolved config.
+
+    Returns per-role reasons (``[]`` = every configured role has a usable
+    transport, or experts off / resolve error → fail-open, same as the attach
+    path). Runs the SAME resolve+inject as attach (``_resolve_session_config``,
+    which credential-injects the delivery blob) and then checks each configured
+    role (primary llm, auxiliary, embedding) against the loader's raise
+    conditions (``src/core/transport_resolution``). The reranker rides the
+    embedding endpoint, so validating embedding covers it.
+
+    Lets ``provision_or_assign`` / ``routers/sessions._do_prepare`` reject a
+    never-startable session up front — emitting ``session.lifecycle: failed``
+    with the real reason — instead of spawning a pod that crashes at agent
+    startup (e.g. the memory reranker with no reachable endpoint), releasing the
+    workspace, and hanging the cockpit on ``/connection`` until its ready
+    timeout. See docs/issues/openrouter_auxiliary_crashes_session_via_memory_reranker.md.
+    """
+    metadata = thread.get("metadata") or {}
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except (json.JSONDecodeError, TypeError):
+            metadata = {}
+    try:
+        delivered = await _resolve_session_config(thread, metadata)
+    except GrantDenied:
+        # The grant pre-flight owns this rejection; don't double-report.
+        return []
+    except Exception:
+        # Resolve failure → agent falls back to config_name (fail-open), same as
+        # _session_grant_violations.
+        return []
+    if not delivered:
+        return []  # experts disabled → no injection → nothing to validate
+
+    from src.core.transport_resolution import (
+        embedding_role_violation,
+        llm_role_violation,
+    )
+
+    agent_blob = delivered.get("agent") or {}
+    env_keys = agent_blob.get("env_keys") or {}
+    # The orchestrator injects some provider keys into env_keys (e.g.
+    # OPENROUTER_API_KEY) rather than onto the role section; combine both so the
+    # key check matches what the agent's loader will actually see.
+    combined_env = dict(os.environ)
+    combined_env.update({k: v for k, v in env_keys.items() if v is not None})
+
+    violations: list[str] = []
+    for role in ("llm", "auxiliary"):
+        section = agent_blob.get(role)
+        if isinstance(section, dict):
+            reason = llm_role_violation(role, section, env=combined_env)
+            if reason:
+                violations.append(reason)
+    emb_reason = embedding_role_violation(env_keys)
+    if emb_reason:
+        violations.append(emb_reason)
+    return violations
+
+
+def _endpoint_violations_detail(violations: list[str]) -> str:
+    return "session cannot start — unusable model transport: " + "; ".join(violations)
+
+
 def _looks_like_uuid(value: Any) -> bool:
     """True if ``value`` parses as a UUID (a cockpit-conflated expert id in the
     config_name slot, which must not be treated as a config file name)."""

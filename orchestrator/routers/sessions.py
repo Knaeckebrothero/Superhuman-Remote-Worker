@@ -192,7 +192,9 @@ async def _do_prepare(
                 # fast with the real reason instead.
                 # docs/issues/session_permission_mode_grant_denied_ready_timeout.md
                 from main import (  # type: ignore
+                    _endpoint_violations_detail,
                     _grant_violations_detail,
+                    _session_endpoint_violations,
                     _session_grant_violations,
                 )
 
@@ -204,6 +206,23 @@ async def _do_prepare(
                         "; ".join(_violations),
                     )
                     _emit("failed", reason=_grant_violations_detail(_violations))
+                    return
+
+                # Same fail-fast for unusable model-role transports (e.g. the
+                # memory reranker with no reachable embedding endpoint) — reject
+                # before reconciling a workspace + booting a doomed pod.
+                # docs/issues/openrouter_auxiliary_crashes_session_via_memory_reranker.md
+                _ep_violations = await _session_endpoint_violations(thread)
+                if _ep_violations:
+                    logger.warning(
+                        "Thread %s: prepare denied by unusable transport: %s",
+                        thread_id,
+                        "; ".join(_ep_violations),
+                    )
+                    _emit(
+                        "failed",
+                        reason=_endpoint_violations_detail(_ep_violations),
+                    )
                     return
 
                 # Re-provisioning the agent (cold start / reopen): also reconcile

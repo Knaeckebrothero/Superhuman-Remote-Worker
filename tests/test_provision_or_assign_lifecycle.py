@@ -63,6 +63,12 @@ def _install_fake_main(monkeypatch, **overrides) -> types.ModuleType:
     stub._grant_violations_detail = (
         lambda v: "config exceeds your capability grants: " + "; ".join(v)
     )
+    # Pre-flight model-role transport check — same default; the endpoint-denied
+    # test overrides it.
+    stub._session_endpoint_violations = AsyncMock(return_value=[])
+    stub._endpoint_violations_detail = (
+        lambda v: "session cannot start — unusable model transport: " + "; ".join(v)
+    )
 
     for k, v in overrides.items():
         setattr(stub, k, v)
@@ -276,6 +282,72 @@ async def test_grant_denied_fails_fast_without_pool_or_pod(monkeypatch):
     assert "autonomous" in failed["reason"]
     fake_main._find_idle_persistent_agent.assert_not_awaited()
     fake_main.agent_provisioner.provision_agent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_endpoint_denied_fails_fast_without_pool_or_pod(monkeypatch):
+    """A session whose resolved config has an unusable model transport (e.g. the
+    memory reranker riding an unreachable embedding endpoint) must fail fast:
+    emit provisioning→failed with the real reason, spawn NO pod. Otherwise the
+    agent crashes at startup, the workspace is released, and the cockpit hangs
+    on /connection.
+    docs/issues/openrouter_auxiliary_crashes_session_via_memory_reranker.md
+    """
+    fake_main = _install_fake_main(monkeypatch)
+    fake_main.postgres_db.get_thread = AsyncMock(
+        return_value={"id": "t1", "agent_id": None, "user_id": "u1"}
+    )
+    fake_main._session_endpoint_violations = AsyncMock(
+        return_value=[
+            "embedding model 'qwen3-embedding-8b' (local) resolved but no "
+            "EMBEDDING_BASE_URL — memory, KB, and the reranker cannot reach the "
+            "embedding endpoint"
+        ]
+    )
+    fake_main._find_idle_persistent_agent = AsyncMock(return_value=None)
+
+    emit_calls: list[dict] = []
+    _install_fake_lifecycle_module(monkeypatch, emit_calls)
+
+    from services.provision_or_assign import provision_or_assign
+
+    await provision_or_assign(
+        uid="u1",
+        tid="t1",
+        cfg="persistent_defaults",
+        co={},
+        pids=[],
+        ds_ids=None,
+    )
+
+    states = [c["state"] for c in emit_calls]
+    assert states == ["provisioning", "failed"], states
+    failed = next(c for c in emit_calls if c["state"] == "failed")
+    assert "unusable model transport" in failed["reason"]
+    assert "reranker" in failed["reason"]
+    fake_main._find_idle_persistent_agent.assert_not_awaited()
+    fake_main.agent_provisioner.provision_agent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_grant_ok_but_endpoint_check_runs(monkeypatch):
+    """The endpoint pre-flight runs even when grants pass (it's a second gate)."""
+    fake_main = _install_fake_main(monkeypatch)
+    fake_main.postgres_db.get_thread = AsyncMock(
+        return_value={"id": "t1", "agent_id": None, "user_id": "u1"}
+    )
+    fake_main._find_idle_persistent_agent = AsyncMock(return_value=None)
+
+    emit_calls: list[dict] = []
+    _install_fake_lifecycle_module(monkeypatch, emit_calls)
+
+    from services.provision_or_assign import provision_or_assign
+
+    await provision_or_assign(
+        uid="u1", tid="t1", cfg="persistent_defaults", co={}, pids=[], ds_ids=None
+    )
+
+    fake_main._session_endpoint_violations.assert_awaited_once()
 
 
 @pytest.mark.asyncio

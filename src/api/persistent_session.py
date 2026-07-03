@@ -38,6 +38,21 @@ from ..tools.description_manager import apply_description_overrides
 logger = logging.getLogger(__name__)
 
 
+class MemoryUnavailableError(RuntimeError):
+    """A configured (required) memory component could not be set up.
+
+    Raised during session setup when the memory pipeline is configured but its
+    embedding-backed stores failed to initialize, or a plugin factory could not
+    resolve its transport (e.g. reranker with no reachable endpoint). Treated
+    like the worker path's ``memory.required`` freeze: the session must NOT run
+    half-working (silently without memory/reranking) — it fails loud. The
+    lifespan handler exits the pod cleanly (status 0, no crash-loop) and the
+    cockpit re-surfaces the reason via the orchestrator's create/prepare
+    pre-flight. See
+    docs/issues/openrouter_auxiliary_crashes_session_via_memory_reranker.md.
+    """
+
+
 def resolve_memory_extraction_prompt(config: AgentConfig) -> str:
     """Load the memory-extraction prompt through the prompt matrix.
 
@@ -912,9 +927,23 @@ class PersistentSession:
         postgres_conn: Optional[Any],
         vector_conn: Optional[Any],
     ) -> None:
-        """Initialize RecallStore and KnowledgeStore if enabled."""
+        """Initialize RecallStore and KnowledgeStore if enabled.
+
+        Raises MemoryUnavailableError when a *configured* (required) memory
+        component can't be set up — a store that won't init or a plugin whose
+        transport won't resolve. "Configured ⇒ required": if the manager
+        pipeline is on (or memory.required is set) the session must fail loud
+        rather than run half-working. See
+        docs/issues/openrouter_auxiliary_crashes_session_via_memory_reranker.md.
+        """
         if not vector_conn:
             return
+
+        # Degradation flags — mirror the worker path (src/agent.py). A store
+        # that fails to init flips its flag; the required-gate below turns that
+        # into a loud MemoryUnavailableError instead of a silent half-session.
+        self._memory_degraded = False
+        self._kb_degraded = False
 
         # RecallStore (memory injection/extraction)
         if self.config.memory.enabled:
@@ -965,6 +994,7 @@ class PersistentSession:
                     f"Failed to initialize RecallStore (non-fatal): {e} "
                     f"[embedding_provider={_provider}]"
                 )
+                self._memory_degraded = True
 
         # KnowledgeStore (knowledge injection, project-scoped)
         # Skip if already initialized by _setup_knowledge() (for tool loading)
@@ -999,38 +1029,77 @@ class PersistentSession:
                     f"Failed to initialize KnowledgeStore (non-fatal): {e} "
                     f"[embedding_provider={os.environ.get('EMBEDDING_PROVIDER', 'local')}]"
                 )
+                self._kb_degraded = True
+
+        # Configured ⇒ required. If the manager pipeline is on (or
+        # memory.required is set), a store that failed to init must not run the
+        # session blind — fail loud, exactly like the worker path's
+        # memory.required freeze (src/agent.py). The lifespan handler turns this
+        # into a clean pod exit + a cockpit-surfaced reason via the orchestrator
+        # pre-flight (no crash-loop).
+        _pipeline = getattr(self.config.memory, "pipeline", None)
+        _memory_required = self.config.memory.required or (
+            self.config.memory.manager_enabled
+            and bool(
+                getattr(_pipeline, "scorers", None)
+                or getattr(_pipeline, "retrievers", None)
+            )
+        )
+        if _memory_required and self._memory_degraded:
+            raise MemoryUnavailableError(
+                "memory is required for this session but the embedding-backed "
+                "RecallStore failed to initialize "
+                f"(EMBEDDING_BASE_URL={os.environ.get('EMBEDDING_BASE_URL', 'unset')}, "
+                f"EMBEDDING_MODEL={os.environ.get('EMBEDDING_MODEL', 'unset')}). "
+                "Check the embedding model/endpoint (Admin → Models)."
+            )
+        if _memory_required and self.project_ids and self._kb_degraded:
+            raise MemoryUnavailableError(
+                "memory is required for this session but the project KnowledgeStore "
+                "failed to initialize — the embedding endpoint is unavailable "
+                f"(EMBEDDING_BASE_URL={os.environ.get('EMBEDDING_BASE_URL', 'unset')})."
+            )
 
         # MemoryManager seam (memory overhaul Phase 1, behind
         # memory.manager.enabled). Constructed after both stores so the
         # retriever factories bind real handles; the writers read
         # auxiliary_llm/extraction_prompt from the runtime at event time,
         # which is what lets the config.update handler hot-swap them
-        # (persistent_app.py keeps runtime in lockstep). Bind failures
-        # (unknown plugin name) raise — a misconfigured cutover fails at
-        # session setup, not silently mid-turn. Sessions without a
-        # vector_conn return above and keep the legacy (no-op) paths.
+        # (persistent_app.py keeps runtime in lockstep). A configured pipeline
+        # is required — a bind failure (unknown plugin name, or a plugin whose
+        # transport won't resolve, e.g. the reranker endpoint) fails the session
+        # loud rather than silently mid-turn. Sessions without a vector_conn
+        # return above and keep the legacy (no-op) paths.
         if self.config.memory.manager_enabled:
             from src.services.memory import MemoryManager as MemorySeamManager
             from src.services.memory import MemoryRuntime
 
-            self.memory_service = MemorySeamManager.from_config(
-                self.config.memory,
-                MemoryRuntime(
-                    recall_store=self.recall_store,
-                    knowledge_store=self.knowledge_store,
-                    auxiliary_llm=self.auxiliary_llm,
-                    memory_config=self.config.memory,
-                    auxiliary_config=self.config.auxiliary,
-                    extraction_prompt=self.memory_extraction_prompt,
-                    assembler_prompt=None,  # persistent mode has no assembler
-                    job_id=self.thread_id,
-                    project_id=self.project_id,
-                    project_ids=list(self.project_ids),
-                    # The legacy persistent path bounds each store call at
-                    # 5 s (_RETRIEVAL_TIMEOUT in persistent_graph.py).
-                    retrieval_timeout=5.0,
-                ),
-            )
+            try:
+                self.memory_service = MemorySeamManager.from_config(
+                    self.config.memory,
+                    MemoryRuntime(
+                        recall_store=self.recall_store,
+                        knowledge_store=self.knowledge_store,
+                        auxiliary_llm=self.auxiliary_llm,
+                        memory_config=self.config.memory,
+                        auxiliary_config=self.config.auxiliary,
+                        extraction_prompt=self.memory_extraction_prompt,
+                        assembler_prompt=None,  # persistent mode has no assembler
+                        job_id=self.thread_id,
+                        project_id=self.project_id,
+                        project_ids=list(self.project_ids),
+                        # The legacy persistent path bounds each store call at
+                        # 5 s (_RETRIEVAL_TIMEOUT in persistent_graph.py).
+                        retrieval_timeout=5.0,
+                    ),
+                )
+            except Exception as e:
+                raise MemoryUnavailableError(
+                    "memory pipeline failed to bind: "
+                    f"{type(e).__name__}: {e}. A configured memory plugin could "
+                    "not resolve its transport (e.g. the reranker endpoint). Fix "
+                    "the config or drop the plugin from memory.pipeline."
+                ) from e
 
         # Ingestion verdicts + bi-temporal supersede (overhaul Phase 4). Wired
         # onto the store independently of the manager cutover — a write-path

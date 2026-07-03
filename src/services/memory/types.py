@@ -20,6 +20,21 @@ from typing import Any, Dict, List, Literal, Optional
 
 from langchain_core.messages import BaseMessage
 
+
+class MemoryPipelineError(RuntimeError):
+    """A *configured, required* pipeline stage failed at runtime and must NOT be
+    silently degraded.
+
+    "Configured ⇒ required": if the reranker (scorer) is in the pipeline, a
+    session that assembled it must not fall back to legacy order behind the
+    user's back. This error escapes ``assemble``'s per-plugin containment and
+    the kernel backstop so the caller fails the turn loud rather than serving a
+    half-working memory context. Retriever/policy stages keep containment (a
+    transient DB blip yields fewer candidates, not a half-working session). See
+    docs/issues/openrouter_auxiliary_crashes_session_via_memory_reranker.md.
+    """
+
+
 # ---------------------------------------------------------------------------
 # Capture (write side)
 # ---------------------------------------------------------------------------
@@ -194,8 +209,10 @@ class AssembleStats:
     tokens_injected: int = 0
     blocks: int = 0
     latency_ms: float = 0.0
-    #: Contained plugin failures, as "stage:name: ExcType: message" strings —
-    #: assemble never raises, but it never fails silently either.
+    #: Plugin failures, as "stage:name: ExcType: message" strings. Retriever/
+    #: policy failures are contained here (assemble continues); a required
+    #: scorer failure is recorded here too but then re-raised as
+    #: MemoryPipelineError (assemble never fails silently).
     errors: List[str] = field(default_factory=list)
     extra: Dict[str, Any] = field(default_factory=dict)
 

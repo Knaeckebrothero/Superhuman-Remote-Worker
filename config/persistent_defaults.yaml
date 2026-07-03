@@ -178,7 +178,7 @@ memory:
   # ROLLBACK: scorers/policies back to [] + ingestion.enabled false (the
   # legacy two-tier read + cosine-dedup write stay in place behind the flags).
   reranker:
-    model: qwen3-reranker-8b         # rides the auxiliary endpoint (no extra credential plumbing)
+    model: qwen3-reranker-8b         # rides the embedding endpoint EMBEDDING_BASE_URL (same qwen3 router; no extra credential plumbing)
     top_k: 512                       # cover the candidate set; tail past this fails the gate open, bounded backstops it
     keep_pinned_first: false         # ~95% of project corpora freeze TTL-pinned — let the reranker rank them too
     timeout: 10                      # live-latency cap (eval used 60 for cold-batch throughput); slow rerank degrades to legacy order, contained
