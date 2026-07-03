@@ -10,6 +10,7 @@ related:
   - "[[database_architecture]]"
   - "[[agent_memory_overhaul]]"
   - "[[no_workspace_agent_mode]]"
+  - "[[okf_knowledge_base]]"
 ---
 
 # Knowledge Base Substrate: OKF vs Postgres vs Neo4j — Findings & Decision
@@ -278,6 +279,12 @@ index (fixes the §4 index-budget problem in both `docs/` and the KB).
 > **Is there a multi-hop / global-sensemaking / citation-graph query class on the near
 > roadmap, frequent enough to justify building the routing + text-to-Cypher scaffolding
 > agents need to actually exploit a graph?**
+
+> **Follow-up (2026-07-03):** [[okf_knowledge_base]] proposes answering this **NO for the
+> KB workload** (Neo4j dormant there; citation network stays the open case) — and flips
+> this doc's default tier to files-canonical (OKF repo as source of truth, Postgres as a
+> disposable git-watermarked index), because KB-as-*datasource* (org wikis, human-edited
+> vaults) forces file-first anyway.
 
 - **If YES** — keep Neo4j central as the opt-in tier *and* build the scaffolding; the
   literature says it'll pay on that query class. The citation network is the leading

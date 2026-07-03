@@ -1,4 +1,4 @@
-"""Unit test for GiteaClient.change_files (batch multi-file single commit)."""
+"""Unit tests for GiteaClient.change_files and get_commits."""
 
 import os
 import sys
@@ -56,4 +56,49 @@ async def test_change_files_posts_batch_create_payload():
             "path": "outputs/001-scholar-abcd1234/b.bin",
             "content": "Yg==",
         },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_get_commits_uses_repo_commits_endpoint():
+    """Regression: `/git/commits` only resolves commit SHAs and 404s on branch
+    names (silently returning None), which made the loop no-op guard skip
+    every check. The listing endpoint is `/commits`, which accepts branches.
+    """
+    gc = gitea_mod.GiteaClient.__new__(gitea_mod.GiteaClient)  # bypass __init__
+    gc._initialized = True
+    gc._url = "http://gitea"
+    gc._user = "srw"
+
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.json = MagicMock(
+        return_value=[
+            {
+                "sha": "abc123",
+                "commit": {
+                    "message": "feat: thing",
+                    "author": {"name": "dev", "date": "2026-07-03T00:00:00Z"},
+                },
+            }
+        ]
+    )
+    client = MagicMock()
+    client.get = AsyncMock(return_value=resp)
+    gc._get_client = MagicMock(return_value=client)
+
+    commits = await gc.get_commits("job-parent12", sha="main", limit=1)
+
+    url = client.get.await_args.args[0]
+    params = client.get.await_args.kwargs["params"]
+    assert url == "http://gitea/api/v1/repos/srw/job-parent12/commits"
+    assert "git/commits" not in url
+    assert params["sha"] == "main"
+    assert commits == [
+        {
+            "sha": "abc123",
+            "message": "feat: thing",
+            "author": "dev",
+            "date": "2026-07-03T00:00:00Z",
+        }
     ]
