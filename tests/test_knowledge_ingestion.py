@@ -47,9 +47,7 @@ def _neighbour(content="old fact", sim=0.8, title="Old", created=None, chash=Non
 
 
 def _cfg(verdict=True, top_k=5, floor=0.6):
-    return SimpleNamespace(
-        verdict=verdict, verdict_top_k=top_k, review_floor=floor
-    )
+    return SimpleNamespace(verdict=verdict, verdict_top_k=top_k, review_floor=floor)
 
 
 _PROMPT = "Adjudicate the note."
@@ -131,9 +129,7 @@ class _FakeStore:
 
     def __init__(self, neighbours):
         self._neighbours = neighbours
-        self.embedding_service = SimpleNamespace(
-            embed=self._embed
-        )
+        self.embedding_service = SimpleNamespace(embed=self._embed)
         self.calls = {}
 
     async def _embed(self, text):

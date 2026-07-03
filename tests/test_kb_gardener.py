@@ -71,14 +71,16 @@ class TestLintKb:
         from src.tools.knowledge.gardener import lint_kb
 
         text = (
-            "---\nid: n1\ntype: decision\ndescription: \"A note.\"\n---\n\n"
+            '---\nid: n1\ntype: decision\ndescription: "A note."\n---\n\n'
             "# N1\n\nBody linking to [n2](n2.md).\n"
         )
         text2 = (
-            "---\nid: n2\ntype: learning\ndescription: \"Another.\"\n---\n\n"
+            '---\nid: n2\ntype: learning\ndescription: "Another."\n---\n\n'
             "# N2\n\nLinks back to [n1](n1.md).\n"
         )
-        report = lint_kb([_note("knowledge/n1.md", text), _note("knowledge/n2.md", text2)])
+        report = lint_kb(
+            [_note("knowledge/n1.md", text), _note("knowledge/n2.md", text2)]
+        )
         assert report.errors == []
 
     def test_missing_frontmatter(self):
@@ -106,24 +108,22 @@ class TestLintKb:
     def test_invalid_id_format(self):
         from src.tools.knowledge.gardener import lint_kb
 
-        text = "---\nid: Not A Slug\ntype: decision\ndescription: \"d\"\n---\n\n# X\n"
+        text = '---\nid: Not A Slug\ntype: decision\ndescription: "d"\n---\n\n# X\n'
         report = lint_kb([_note("knowledge/x.md", text)])
         assert "invalid-id" in _rules(report)
 
     def test_duplicate_id(self):
         from src.tools.knowledge.gardener import lint_kb
 
-        text = "---\nid: dup\ntype: decision\ndescription: \"d\"\n---\n\n# X\n"
-        report = lint_kb(
-            [_note("knowledge/a.md", text), _note("knowledge/b.md", text)]
-        )
+        text = '---\nid: dup\ntype: decision\ndescription: "d"\n---\n\n# X\n'
+        report = lint_kb([_note("knowledge/a.md", text), _note("knowledge/b.md", text)])
         assert "duplicate-id" in _rules(report)
 
     def test_dead_link(self):
         from src.tools.knowledge.gardener import lint_kb
 
         text = (
-            "---\nid: n1\ntype: decision\ndescription: \"d\"\n---\n\n"
+            '---\nid: n1\ntype: decision\ndescription: "d"\n---\n\n'
             "# N1\n\nSee [ghost](ghost.md).\n"
         )
         report = lint_kb([_note("knowledge/n1.md", text)])
@@ -133,7 +133,7 @@ class TestLintKb:
         from src.tools.knowledge.gardener import lint_kb
 
         text = (
-            "---\nid: n1\ntype: decision\ndescription: \"d\"\n---\n\n"
+            '---\nid: n1\ntype: decision\ndescription: "d"\n---\n\n'
             "# N1\n\nSee [docs](https://example.com/page).\n"
         )
         report = lint_kb([_note("knowledge/n1.md", text)])
@@ -143,7 +143,7 @@ class TestLintKb:
         from src.tools.knowledge.gardener import lint_kb
 
         text = (
-            "---\nid: n1\ntype: decision\ndescription: \"d\"\n"
+            '---\nid: n1\ntype: decision\ndescription: "d"\n'
             "superseded_by: nowhere\n---\n\n# N1\n"
         )
         report = lint_kb([_note("knowledge/n1.md", text)])
@@ -152,10 +152,12 @@ class TestLintKb:
     def test_orphan_warning(self):
         from src.tools.knowledge.gardener import lint_kb
 
-        text = "---\nid: lonely\ntype: learning\ndescription: \"d\"\n---\n\n# Lonely\n\nno links\n"
+        text = '---\nid: lonely\ntype: learning\ndescription: "d"\n---\n\n# Lonely\n\nno links\n'
         report = lint_kb([_note("knowledge/lonely.md", text)])
         assert "orphan" in _rules(report)
-        assert all(f.severity == "warning" for f in report.findings if f.rule == "orphan")
+        assert all(
+            f.severity == "warning" for f in report.findings if f.rule == "orphan"
+        )
 
     def test_index_note_not_orphan(self):
         from src.tools.knowledge.gardener import lint_kb
@@ -167,7 +169,7 @@ class TestLintKb:
     def test_missing_title_warning(self):
         from src.tools.knowledge.gardener import lint_kb
 
-        text = "---\nid: n1\ntype: decision\ndescription: \"d\"\n---\n\nno heading here\n"
+        text = '---\nid: n1\ntype: decision\ndescription: "d"\n---\n\nno heading here\n'
         report = lint_kb([_note("knowledge/n1.md", text)])
         assert "missing-title" in _rules(report)
 
@@ -191,10 +193,18 @@ class TestRenderIndexMd:
 
         out = render_index_md(
             [
-                {"id": "chose-jwt", "title": "Chose JWT", "type": "decision",
-                 "description": "We chose JWT."},
-                {"id": "a-lesson", "title": "A Lesson", "type": "learning",
-                 "description": "Learned it."},
+                {
+                    "id": "chose-jwt",
+                    "title": "Chose JWT",
+                    "type": "decision",
+                    "description": "We chose JWT.",
+                },
+                {
+                    "id": "a-lesson",
+                    "title": "A Lesson",
+                    "type": "learning",
+                    "description": "Learned it.",
+                },
             ]
         )
         assert "## decision" in out
