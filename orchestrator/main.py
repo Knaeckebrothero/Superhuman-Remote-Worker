@@ -172,6 +172,7 @@ from services.audit_partitions import (  # noqa: E402
 )
 from services import workspace_metering  # noqa: E402
 from services.usage_ledger import UsageLedger, UsageRates  # noqa: E402
+from services.usage_rollup import UsageRollup, usage_rollup_loop  # noqa: E402
 from services.workspace import workspace_service  # noqa: E402
 from services.gitea import GiteaClient  # noqa: E402
 from services.keycloak_admin import KeycloakGroupSync  # noqa: E402
@@ -313,6 +314,11 @@ audit_reader = audit_store
 # app pools and the usage_rates migration are ready; None until then (and on
 # deployments without the audit tier — metering disabled, non-load-bearing).
 usage_ledger: UsageLedger | None = None
+# Rollup writer + rollup-aware read surface over usage_ledger. Built alongside
+# usage_ledger once both pools are ready; None until then (and without the audit
+# tier). The 3 /api/usage endpoints read through it (rollup for closed days, raw
+# for the tail); a daily leader-only pass maintains the app-DB usage_daily mirror.
+usage_rollup: UsageRollup | None = None
 
 
 async def _workspace_metering_attribution(
@@ -5437,6 +5443,16 @@ async def lifespan(app: FastAPI):
         audit_db.pool if (audit_db is not None and audit_ready) else None,
         UsageRates(postgres_db.pool),
     )
+    # Rollup over the ledger (Phase 6 / D-1): aggregates the auditdb usage_events
+    # firehose into the app-DB usage_daily mirror (+ rollup_state watermark) and
+    # serves /api/usage from it for closed days, raw for the open tail. Same
+    # availability posture as the ledger (needs both pools).
+    global usage_rollup
+    usage_rollup = UsageRollup(
+        audit_db.pool if (audit_db is not None and audit_ready) else None,
+        postgres_db.pool,
+        usage_ledger,
+    )
 
     # Encrypt any legacy plaintext datasource credentials. Idempotent — once
     # all rows are v1 ciphertexts this is a fast no-op. Lives in lifespan
@@ -5800,6 +5816,14 @@ async def lifespan(app: FastAPI):
     # ledger is absent.
     llm_usage_task = asyncio.create_task(llm_usage_poll_loop(_shutdown_event))
 
+    # Usage rollup (Phase 6 / D-1): re-aggregate closed days from the auditdb
+    # usage_events firehose into the app-DB usage_daily mirror + advance the
+    # rollup_state watermark. Leader-only (the upsert is idempotent, but there's
+    # no value in every replica re-aggregating); self-disables without both pools.
+    usage_rollup_task = asyncio.create_task(
+        run_when_leader(lambda se: usage_rollup_loop(se, usage_rollup), _shutdown_event)
+    )
+
     # Audit-store partition maintenance (creation + ANALYZE + lookahead alarms;
     # retention deferred — see services/audit_partitions.py). Only when the
     # audit DB is configured; otherwise the store is inactive and there is
@@ -5895,6 +5919,7 @@ async def lifespan(app: FastAPI):
     await quota_poll_task
     await workspace_metering_task
     await llm_usage_task
+    await usage_rollup_task
     if audit_maintenance_task is not None:
         await audit_maintenance_task
 
@@ -13173,14 +13198,28 @@ async def get_usage(
         raise HTTPException(status_code=400, detail=f"invalid date: {e}") from e
     vis = await _visibility_kwargs_for_stats(user)
     try:
-        result = await usage_ledger.query_usage(
-            from_ts=from_ts,
-            to_ts=to_ts,
-            owner_user_id=vis.get("owner_user_id"),
-            visible_project_ids=vis.get("visible_project_ids"),
-            scope_project_id=vis.get("scope_project_id"),
-            ref_id=ref_id,
-        )
+        # Read through the rollup (closed days from usage_daily, raw for the open
+        # tail); ref_id per-job cost is not a rollup dim → it goes straight to raw
+        # inside usage_rollup.usage. Fall back to the raw ledger if the rollup
+        # singleton is absent (test/degraded).
+        if usage_rollup is not None:
+            result = await usage_rollup.usage(
+                from_ts=from_ts,
+                to_ts=to_ts,
+                owner_user_id=vis.get("owner_user_id"),
+                visible_project_ids=vis.get("visible_project_ids"),
+                scope_project_id=vis.get("scope_project_id"),
+                ref_id=ref_id,
+            )
+        else:
+            result = await usage_ledger.query_usage(
+                from_ts=from_ts,
+                to_ts=to_ts,
+                owner_user_id=vis.get("owner_user_id"),
+                visible_project_ids=vis.get("visible_project_ids"),
+                scope_project_id=vis.get("scope_project_id"),
+                ref_id=ref_id,
+            )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
     result["available"] = True
@@ -13218,7 +13257,12 @@ async def get_usage_breakdown(
         raise HTTPException(status_code=400, detail=f"invalid date: {e}") from e
     vis = await _visibility_kwargs_for_stats(user)
     try:
-        rows = await usage_ledger.query_grouped(
+        reader = (
+            usage_rollup.breakdown
+            if usage_rollup is not None
+            else (usage_ledger.query_grouped)
+        )
+        rows = await reader(
             from_ts=from_ts,
             to_ts=to_ts,
             group_by=group_by,
@@ -13270,7 +13314,12 @@ async def get_usage_timeseries(
         raise HTTPException(status_code=400, detail=f"invalid date: {e}") from e
     vis = await _visibility_kwargs_for_stats(user)
     try:
-        rows = await usage_ledger.query_timeseries(
+        reader = (
+            usage_rollup.timeseries
+            if usage_rollup is not None
+            else (usage_ledger.query_timeseries)
+        )
+        rows = await reader(
             from_ts=from_ts,
             to_ts=to_ts,
             group_by=group_by,
