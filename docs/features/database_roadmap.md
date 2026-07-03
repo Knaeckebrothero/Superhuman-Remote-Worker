@@ -53,8 +53,8 @@ The research sweep materially corrected four premises:
 
 | Phase | Scope | Effort | Depends on | Status |
 |---|---|---|---|---|
-| 1 | Mechanical quick wins — QW-2, QW-3, QW-5, QW-6 | ~1 day | — (G1 decided: drop) | ✅ done `ed68f610` (2026-07-02); full pytest + migrate-from-zero verified; k3d boot check pending |
-| 2 | HF-1 generated schema artifact (keystone) | ~1 day | — | todo |
+| 1 | Mechanical quick wins — QW-2, QW-3, QW-5, QW-6 | ~1 day | — (G1 decided: drop) | ✅ done `6343852c` — pushed + deployed on develop; migrate-from-zero + full suite verified |
+| 2 | HF-1 generated schema artifact (keystone) | ~1 day | — | ✅ 2a shipped — script + 3 artifacts + CI gate; 2b (init.py/compose repoint) deferred |
 | 3 | D-5 Mongo code deletion | ~1–2 days | QW-4 soak ✅ (done, >1 week) | todo |
 | 4 | HF-3 atomic context writes (correctness) | ~1–2 days | — | todo |
 | 5 | Perf batch — HF-5, HF-4, HF-6, HF-7, HF-2 | ~3–4 days | — (HF-2 last) | todo |
@@ -102,8 +102,9 @@ migrations apply from zero and on an existing dev DB; full pytest green;
 grep-clean for dropped methods/table; `EXPLAIN` on `threads WHERE user_id=…`
 still index-backed via `idx_threads_user`.
 
-**Status (2026-07-02): ✅ shipped — commit `ed68f610` on develop (not yet
-pushed).** Migrations 0042–0045
+**Status: ✅ shipped — commit `6343852c` on develop** (rebased from local
+`ed68f610`, now an orphan reflog entry; pushed + deployed — deploy commits sit
+on top, so 0042–0045 have already run on the dev cluster). Migrations 0042–0045
 (one statement per `.notx.sql` — the runner executes each file as a single
 simple-query message, so multi-statement CONCURRENTLY files would fail in an
 implicit transaction). QW-6 went end-to-end: with the audit table gone, the
@@ -186,6 +187,31 @@ headers + runtime-table list; CI fails on migration-without-regeneration
 (prove once with a deliberate miss) **and** on hand-edited artifacts;
 `init.py` vector path applies migrations; QW-2-class staleness structurally
 impossible.
+
+**Status (2a shipped 2026-07-03 on develop):**
+`scripts/schema-snapshot.sh` generates all three `*_current.sql` artifacts
+(app 3239 / vector 1187 / audit 1451 lines) — byte-deterministic (verified via
+`--check`), Phase 1 end-state reflected, signatures captured (vector
+halfvec×14 / HNSW×3 / `vector(4096)`; audit 4 partitioned parents). Each is
+dumped inside a prod-major container (app/vector pg15, audit pg16) with the
+random `\restrict` token (CVE-2025-8714) + version-header lines stripped for
+determinism. CI: a new `artifact` job in `db-migrations.yml` does a REAL
+from-zero apply (incl. the `.notx.sql` CONCURRENTLY files, which the existing
+`--dry-run` skips) across all three families — audit coverage is net-new — and
+freshness-gates via `git add -A … && git diff --cached --quiet`; the existing
+`dry-run` job's wrong-major pg16→pg15 was corrected in passing. One deliberate
+deviation from the flag set above: kept `COMMENT ON` (dropped `--no-comments`)
+so comment-only migrations (e.g. 0036) still show up as drift.
+
+**Deferred to Phase 2b (not started):** the `init.py` vector→`apply_migrations`
+switch and the compose initdb repoint. A pg_dump `--schema-only` artifact seeds
+no `schema_migrations` rows (nor does the frozen `schema.sql`), so mounting one
+at initdb and then running `apply_migrations()` would re-apply 0001→ against
+already-existing tables. This needs a deliberate design choice —
+runner-from-zero (drop the initdb snapshot mounts entirely, per the end-state
+principle) vs artifact-plus-seed-the-ledger — with compose/k3d verification. The
+three committed artifacts + CI gate already make drift detectable, which is the
+keystone; the self-updating install paths are the follow-up.
 
 ## Phase 3 — D-5: Mongo code deletion
 
