@@ -25,15 +25,17 @@ related:
 
 # OKF Knowledge Base — Files-Canonical KB as a Datasource
 
-**Status:** DRAFT (implementation-ready), delivery pipeline LIVE — origin: design
-discussion 2026-07-03, building on the substrate findings in
-[[knowledge_base_substrate_decision]]; refined the same day by a six-agent research
-sweep (three codebase audits, three web — sources in §12).
+**Status:** DRAFT (implementation-ready); **slice 1 (dual-write) IMPLEMENTED
+2026-07-03** — uncommitted on `develop`, TDD-built, 223 green across the knowledge
+suites, ruff clean (§11). Origin: design discussion 2026-07-03, building on the
+substrate findings in [[knowledge_base_substrate_decision]]; refined the same day by a
+six-agent research sweep (three codebase audits, three web — sources in §12).
 [[loop_repo_compounding_v2]] shipped the same day, which changes this doc's footing: the
 squash-merge flow, the post-merge hook point, and `retros/` (orchestrator-written notes
 with OKF frontmatter, `type: retro`) are **in production**. Anything an agent writes
 under `knowledge/` on its job branch already reaches `main` with zero further
-orchestrator work — the loop is a ready delivery pipeline waiting for the notes.
+orchestrator work — the loop is a ready delivery pipeline, and slice 1 now writes the
+notes into it.
 
 ## TL;DR
 
@@ -399,32 +401,40 @@ exactly the split-brain this design exists to kill.
 
 0. **Loop delivery pipeline** — DONE via [[loop_repo_compounding_v2]]: per-job branches,
    squash-merge to `main`, post-merge hook point, `retros/` as the first OKF note family.
-1. **Dual-write** (the strangler-fig first step): `kb_write`/`kb_update` additionally
-   materialize each note as **flat `knowledge/<slug>.md`** — flat resolved 2026-07-03:
-   link targets become derivable from the slug alone (markdown links need no index
+1. **Dual-write** — ✅ **IMPLEMENTED 2026-07-03** (uncommitted on `develop`; strict
+   TDD, +19 tests / 223 green across the knowledge suites, ruff clean). The
+   strangler-fig first step: `kb_write`/`kb_update` additionally materialize each note
+   as **flat `knowledge/<slug>.md`** on the workspace backend — flat resolved
+   2026-07-03: link targets derivable from the slug alone (markdown links need no index
    lookup in a slice with no index), a type change never forces a file move, and the
-   prior art says navigation belongs to index/MOC notes, not folder taxonomies
-   (`type` stays frontmatter + a `kb_index` grouping). Written **via the workspace
-   backend, never local I/O** — files live on the remote workspace pod/VM; the citation
-   engine's stub-mode bug is the cautionary tale, and `kb_export`'s own local-`Path`
-   fallback (`knowledge_tools.py:788-792`) is the same bug (writes to the agent host,
-   invisible to the pod's clone — fix it while factoring). Build notes (code-audited):
-   - Factor `kb_export`'s serializer body (`knowledge_tools.py:742-783`) into a pure
-     `_render_note_md(note) -> str`; upgrade it per §7 — markdown links, required
-     `description`, provenance fields (`author`/`job`/`branch`).
-   - Callers have the data in hand: `kb_write`'s `links` arg is already
-     `[{type, target}]` (link text = slug; no extra query); `kb_update` re-reads the
-     full note incl. relationships with titles at `:300`.
-   - Guard on `context.has_git()` (stricter than `has_workspace()`), **skip + log** —
-     persistent sessions, repo-less projects, and lite tiers keep their DB write; never
-     fall back to local I/O. Failure is non-fatal, like the existing pgvector block.
+   prior art says navigation belongs to index/MOC notes not folder taxonomies (`type`
+   stays frontmatter + a `kb_index` grouping). As built
+   (`src/tools/knowledge/knowledge_tools.py`):
+   - **`_render_note_md(note) -> str`** — one pure OKF serializer, factored out of
+     `kb_export` and shared by all three write paths; emits `type` + `description`
+     frontmatter, **standard markdown links** (never wikilinks), in-note provenance
+     (`author`/`job`/`branch`), optional fields only when present.
+   - **`_dual_write_note(context, slug, note)`** — guarded on `context.has_git()`
+     (stricter than `has_workspace()`: persistent sessions, repo-less projects and lite
+     tiers keep their DB-only write → skip + log), **non-fatal** exactly like the
+     pgvector write-through, **never local I/O**. Provenance from `_note_provenance`
+     (`_job_metadata['config_name']` → `agent_id`; branch via
+     `git_manager.current_branch()`).
+   - `kb_write` gained an optional `description` arg; `kb_update` dual-writes **before**
+     the pgvector upsert so the canonical file lands even if the disposable index write
+     fails.
+   - **`kb_export`'s local-`Path` fallback removed** (the "writes to the ephemeral agent
+     host, invisible to the pod's clone" bug — same family as the citation stub-mode
+     bug): it now requires a workspace and reuses `_render_note_md`.
+   - **One deliberate deviation from §7**: `description` is *derived* (first sentence of
+     the body) when omitted, **not rejected** — the hard required-key gate moves to
+     slice-2 `kb_lint` (which gates agent writes), so tonight's loop can't break on a
+     missing one-liner. Frontmatter always carries a `description` either way.
    - Delivery is free: phase/todo/completion commits `git add -A`
      (`git_manager.py:205`), and neither `.gitignore` floor lists `knowledge/`.
-   - Tests mirror `tests/test_knowledge_tools.py` `TestKbExport` (serializer output) +
-     the pgvector non-fatality pattern (`:197-212`).
    The DB stays the retrieval substrate; the v2 merge delivers the files to `main`.
-   Agent-side only, no schema, no orchestrator change. An overnight loop run is the
-   natural E2E.
+   Agent-side only, no schema, no orchestrator change. **E2E = an overnight loop run**;
+   no index reads these files yet (slice 3), so zero retrieval blast radius.
 2. **OKF lint/gardener toolset + curator-as-proper-auxiliary** — `kb_lint`/`kb_index`
    (rule set + index shape now specified in §7); useful against today's `repository`
    datasources (point it at a vault — or this repo's `docs/`). Includes the curator
