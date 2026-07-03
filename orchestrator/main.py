@@ -10019,7 +10019,7 @@ async def _spawn_loop_job(
     failures are non-fatal (logged), matching POST /api/jobs + run-now.
     """
     from services.job_provisioning import provision_job_repo
-    from services.project_loops import create_loop_job, is_loop_execution_role
+    from services.project_loops import create_loop_job
 
     job = await create_loop_job(postgres_db, loop, role=role, iteration=iteration)
 
@@ -10029,10 +10029,9 @@ async def _spawn_loop_job(
             gitea_client=gitea_client,
             postgres_db=postgres_db,
             main_cloud_router=main_cloud_router,
-            # Execution roles work on the shared repo's `main` so the artifact
-            # compounds in place; analysis roles stay on a throwaway branch.
-            # See docs/features/loop_repo_compounding.md.
-            work_on_main=is_loop_execution_role(role),
+            # Every loop role branches; the floor keeps scratch out of the
+            # completion squash-merge. See docs/features/loop_repo_compounding_v2.md.
+            loop_floor=True,
         )
     except Exception:
         logger.exception(
@@ -10040,36 +10039,6 @@ async def _spawn_loop_job(
             loop.get("id"),
             job.get("id"),
         )
-
-    # No-op compounding guard (F29/F40), capture half: for execution roles that
-    # commit directly to `main`, record the repo's `main` HEAD *before* the job
-    # runs so `_advance_project_loop` can tell whether the completed job actually
-    # landed anything. This is the loop's only artifact-integrity signal — no
-    # agent role can see `main` (critics run in fresh workspaces; a destroyed
-    # developer's "SHIPPED" retro stays active in the KB). Best-effort; a Gitea
-    # hiccup here must never block dispatch.
-    if is_loop_execution_role(role) and job.get("repo_name"):
-        try:
-            # get_branch_head_sha, not get_commits: branch HEAD lookup is what
-            # `/branches/{branch}` is for, and a None here must be loud — the
-            # guard is worthless if it can skip silently.
-            pre_sha = await gitea_client.get_branch_head_sha(job["repo_name"], "main")
-            if pre_sha is None:
-                logger.warning(
-                    "project loop %s: no-op guard could not read `main` HEAD on "
-                    "%s at spawn — integrity check for job %s will be skipped",
-                    loop.get("id"),
-                    job["repo_name"],
-                    str(job["id"])[:8],
-                )
-            await postgres_db.merge_job_context(
-                str(job["id"]), {"pre_main_sha": pre_sha}
-            )
-        except Exception:
-            logger.exception(
-                "project loop %s: no-op guard pre-HEAD capture failed (non-fatal)",
-                loop.get("id"),
-            )
 
     try:
         _trigger_dispatch()
@@ -10123,55 +10092,91 @@ async def _advance_project_loop(
     consecutive = (int(loop.get("consecutive_failures") or 0) + 1) if failed else 0
     last_error = (result.get("error") or "job failed") if failed else None
 
-    # No-op compounding guard (F29/F40), check half: did this execution job move
-    # `main`? Compare the pre-run HEAD (captured at spawn) with `main` now. A
-    # COMPLETED execution job that left HEAD unchanged landed nothing — the
-    # run-5/6 silent-loss signature (main sat at one SHA for the whole night
-    # while developers rebuilt in disconnected local gits). Flag it loudly and
-    # record merge_status; this is the only integrity check the loop has.
-    # Best-effort; never blocks the advance.
+    # Loop v2 completion merge: squash the job's branch onto `main` (one clean
+    # commit per job; the branch is kept as the audit log) and record the
+    # LITERAL outcome — merged/empty/merge-failed/skipped. This replaces the v1
+    # SHA-compare no-op guard: the merge step *knows* what landed instead of
+    # inferring it. An `empty` from an execution role is the run-5/6
+    # silent-loss signature (F29 family) and is flagged loudly; `merge-failed`
+    # is flag-and-continue (visible, never silent — the loop still advances).
+    # See docs/features/loop_repo_compounding_v2.md. Best-effort; never blocks
+    # the advance.
+    from services.project_loops import (
+        is_loop_execution_role,
+        merge_loop_job_branch,
+        write_loop_retro,
+    )
+
+    merge_status, merged_sha = "skipped", None
     if not failed:
         try:
-            from services.project_loops import is_loop_execution_role
-
-            completed_role = (ctx or {}).get("loop_role")
-            if is_loop_execution_role(completed_role) and job.get("repo_name"):
-                post_sha = await gitea_client.get_branch_head_sha(
-                    job["repo_name"], "main"
-                )
-                if post_sha is None:
-                    logger.warning(
-                        "project loop %s: no-op guard could not read `main` HEAD "
-                        "on %s — integrity check for job %s skipped",
-                        loop_id,
-                        job["repo_name"],
-                        str(job["id"])[:8],
-                    )
-                pre_sha = (ctx or {}).get("pre_main_sha")
-                if post_sha and pre_sha and post_sha == pre_sha:
-                    await postgres_db.update_job_merge_status(
-                        str(job["id"]), merge_status="no-op"
-                    )
-                    logger.error(
-                        "project loop %s: execution job %s COMPLETED but `main` did "
-                        "not advance (HEAD still %s) — artifacts likely lost (F29 "
-                        "family); flagged merge_status=no-op",
-                        loop_id,
-                        str(job["id"])[:8],
-                        post_sha[:8],
-                    )
-                    actions.append(
-                        f"project loop {str(loop_id)[:8]}: execution job "
-                        f"{str(job['id'])[:8]} produced NO main advance (no-op)"
-                    )
-                elif post_sha:
-                    await postgres_db.update_job_merge_status(
-                        str(job["id"]), merge_status="advanced"
-                    )
+            merge_status, merged_sha = await merge_loop_job_branch(gitea_client, job)
         except Exception:
             logger.exception(
-                "project loop %s: no-op compounding guard failed (non-fatal)", loop_id
+                "project loop %s: completion squash-merge raised (non-fatal)", loop_id
             )
+            merge_status = "merge-failed"
+        completed_role = (ctx or {}).get("loop_role")
+        if merge_status != "skipped":
+            try:
+                await postgres_db.update_job_merge_status(
+                    str(job["id"]), merge_status=merge_status
+                )
+            except Exception:
+                logger.exception(
+                    "project loop %s: recording merge_status=%s failed (non-fatal)",
+                    loop_id,
+                    merge_status,
+                )
+        if merge_status == "merged":
+            logger.info(
+                "project loop %s: job %s squash-merged to main (%s)",
+                loop_id,
+                str(job["id"])[:8],
+                (merged_sha or "")[:8],
+            )
+        elif merge_status == "empty" and is_loop_execution_role(completed_role):
+            logger.error(
+                "project loop %s: execution job %s COMPLETED but its branch has "
+                "no commits — nothing landed on `main` (F29 family); flagged "
+                "merge_status=empty",
+                loop_id,
+                str(job["id"])[:8],
+            )
+            actions.append(
+                f"project loop {str(loop_id)[:8]}: execution job "
+                f"{str(job['id'])[:8]} landed NOTHING (merge_status=empty)"
+            )
+        elif merge_status == "merge-failed":
+            logger.error(
+                "project loop %s: squash-merge of job %s branch %s FAILED — "
+                "contribution NOT on `main` (branch preserved); loop continues",
+                loop_id,
+                str(job["id"])[:8],
+                job.get("branch_name"),
+            )
+            actions.append(
+                f"project loop {str(loop_id)[:8]}: job {str(job['id'])[:8]} "
+                f"merge FAILED (contribution stranded on {job.get('branch_name')})"
+            )
+
+    # Retro collection (F40): record the outcome — mechanical merge truth plus
+    # the agent's own freeze_data notes — as retros/NNN-<role>-<jobid8>.md on
+    # `main`. Written for failed jobs too. Best-effort.
+    try:
+        await write_loop_retro(
+            gitea_client,
+            job,
+            ctx=ctx or {},
+            merge_status=merge_status,
+            merged_sha=merged_sha,
+            failed=failed,
+            error=last_error,
+        )
+    except Exception:
+        logger.exception(
+            "project loop %s: retro write failed (non-fatal)", loop_id
+        )
 
     remaining = loop.get("remaining_iterations")
     next_remaining = (remaining - 1) if remaining is not None else None
