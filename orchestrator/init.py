@@ -270,7 +270,11 @@ async def init_vector_db(force_reset: bool = False) -> bool:
         return False
 
     try:
-        from orchestrator.database.postgres import PostgresDB, VECTOR_REQUIRED_TABLES
+        from orchestrator.database.postgres import (
+            MIGRATIONS_VECTOR_DIR,
+            PostgresDB,
+            VECTOR_REQUIRED_TABLES,
+        )
     except ImportError as e:
         logger.error(f"  Could not import PostgresDB: {e}")
         return False
@@ -278,7 +282,7 @@ async def init_vector_db(force_reset: bool = False) -> bool:
     db_name = vector_url.split("/")[-1].split("?")[0]
     logger.info(f"  Database: {db_name}")
 
-    db = PostgresDB(vector_url)
+    db = PostgresDB(vector_url, migrations_dir=MIGRATIONS_VECTOR_DIR)
 
     try:
         # Create database if it doesn't exist
@@ -293,43 +297,15 @@ async def init_vector_db(force_reset: bool = False) -> bool:
 
         if force_reset:
             logger.info("  Resetting vector schema (dropping all tables)...")
-            async with db.acquire() as conn:
-                await conn.execute("DROP TABLE IF EXISTS source_embeddings CASCADE")
-                await conn.execute("DROP TABLE IF EXISTS source_tags CASCADE")
-                await conn.execute("DROP TABLE IF EXISTS source_annotations CASCADE")
-                await conn.execute("DROP TABLE IF EXISTS citations CASCADE")
-                await conn.execute("DROP TABLE IF EXISTS job_sources CASCADE")
-                await conn.execute("DROP TABLE IF EXISTS sources CASCADE")
-                await conn.execute("DROP TABLE IF EXISTS schema_migrations CASCADE")
-                await conn.execute(
-                    "DROP TABLE IF EXISTS memory_retrieval_messages CASCADE"
-                )
-                await conn.execute("DROP TABLE IF EXISTS memories CASCADE")
-                await conn.execute("DROP TABLE IF EXISTS knowledge_index CASCADE")
-                await conn.execute(
-                    "DROP FUNCTION IF EXISTS memory_hybrid_search CASCADE"
-                )
-                await conn.execute(
-                    "DROP FUNCTION IF EXISTS memory_project_hybrid_search CASCADE"
-                )
-                await conn.execute(
-                    "DROP FUNCTION IF EXISTS knowledge_hybrid_search CASCADE"
-                )
-                await conn.execute("DROP TYPE IF EXISTS source_type CASCADE")
-                await conn.execute("DROP TYPE IF EXISTS confidence_level CASCADE")
-                await conn.execute("DROP TYPE IF EXISTS extraction_method CASCADE")
-                await conn.execute("DROP TYPE IF EXISTS verification_status CASCADE")
-
-        # Apply vector schema
-        vector_schema_file = Path(__file__).parent / "database" / "vector_schema.sql"
-        if vector_schema_file.exists():
-            schema_sql = vector_schema_file.read_text()
-            async with db.acquire() as conn:
-                await conn.execute(schema_sql)
-            logger.info("  Applied vector_schema.sql")
+            await db.reset_schema()
         else:
-            logger.error(f"  vector_schema.sql not found at {vector_schema_file}")
-            return False
+            # Apply the vector migration chain from zero. The runner is
+            # idempotent and records schema_migrations; this replaces the frozen
+            # vector_schema.sql, which drifted from the migrations and left the
+            # vector DB missing halfvec/HNSW/bitemporal/TTL objects. (The frozen
+            # file stays in the tree — tests still load it directly.)
+            await db.apply_migrations()
+        logger.info("  Vector migrations applied")
 
         # Verify tables
         logger.info("  Verifying vector tables:")

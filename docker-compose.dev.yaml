@@ -50,7 +50,9 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-srw}
     volumes:
       - postgres_dev_data:/var/lib/postgresql/data
-      - ./orchestrator/database/schema.sql:/docker-entrypoint-initdb.d/001_schema.sql:Z
+      # App schema is built from the migration chain (orchestrator startup +
+      # `python init.py`), not an initdb snapshot — the frozen schema.sql
+      # drifted from migrations. See docs/features/database_roadmap.md Phase 2b.
     ports:
       - "${POSTGRES_PORT:-5432}:5432"
     healthcheck:
@@ -83,7 +85,8 @@ services:
       POSTGRES_DB: ${VECTOR_POSTGRES_DB:-srw_vector}
     volumes:
       - postgres_vector_dev_data:/var/lib/postgresql/data
-      - ./orchestrator/database/vector_schema.sql:/docker-entrypoint-initdb.d/001_vector_schema.sql:Z
+      # Vector schema is built from the migration chain, not an initdb snapshot.
+      # See docs/features/database_roadmap.md Phase 2b.
     ports:
       - "${VECTOR_POSTGRES_PORT:-5433}:5432"
     healthcheck:
