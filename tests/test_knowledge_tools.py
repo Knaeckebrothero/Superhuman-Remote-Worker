@@ -74,6 +74,30 @@ def _capture_workspace():
     return ws, writes
 
 
+def _fake_kb_workspace(files: dict):
+    """Workspace mock backed by an in-memory {rel_path: text} map.
+
+    list_files returns root-relative *.md paths (matching the real backends),
+    read_file/exists read the map, write_file records + updates it.
+    """
+    ws = MagicMock()
+    writes: dict = {}
+
+    def _list(root, pattern="*"):
+        prefix = root.rstrip("/") + "/"
+        return sorted(p for p in files if p.startswith(prefix) and p.endswith(".md"))
+
+    def _write(rel, content):
+        writes[rel] = content
+        files[rel] = content
+
+    ws.list_files.side_effect = _list
+    ws.read_file.side_effect = lambda p: files[p]
+    ws.exists.side_effect = lambda p: p in files
+    ws.write_file.side_effect = _write
+    return ws, writes
+
+
 # =============================================================================
 # 13.1: KNOWLEDGE_TOOLS_METADATA registry
 # =============================================================================
@@ -82,8 +106,8 @@ def _capture_workspace():
 class TestMetadataRegistry:
     """Tests for KNOWLEDGE_TOOLS_METADATA."""
 
-    def test_contains_exactly_10_tools(self):
-        assert len(KNOWLEDGE_TOOLS_METADATA) == 10
+    def test_contains_exactly_12_tools(self):
+        assert len(KNOWLEDGE_TOOLS_METADATA) == 12
 
     def test_expected_tool_names(self):
         expected = {
@@ -97,6 +121,8 @@ class TestMetadataRegistry:
             "kb_provenance",
             "kb_unanswered",
             "kb_export",
+            "kb_lint",
+            "kb_index",
         }
         assert set(KNOWLEDGE_TOOLS_METADATA.keys()) == expected
 
@@ -135,9 +161,9 @@ class TestCreateKbTools:
                 ma.get_running_loop.side_effect = RuntimeError
                 create_kb_tools(ctx)
 
-    def test_returns_list_of_10_tools(self):
+    def test_returns_list_of_12_tools(self):
         tools, _ = _make_tools()
-        assert len(tools) == 10
+        assert len(tools) == 12
 
 
 # =============================================================================
@@ -786,6 +812,104 @@ class TestKbExport:
         assert "## Relationships" in content
         assert "**SUPPORTS:** [a](a.md), [b](b.md)" in content
         assert "**REFERENCES:** [c](c.md)" in content
+
+
+# =============================================================================
+# Slice 2 PR1: kb_lint / kb_index gardener tools
+# =============================================================================
+
+
+class TestKbLint:
+    def test_error_when_no_workspace(self):
+        ctx = _make_context()
+        ctx.has_workspace.return_value = False
+        tools, _ = _make_tools(ctx)
+        result = _invoke(_get_tool(tools, "kb_lint"), {})
+        assert "Error" in result
+
+    def test_no_notes_found(self):
+        ctx = _make_context()
+        ctx.has_workspace.return_value = True
+        ws, _ = _fake_kb_workspace({})
+        ctx.workspace_manager = ws
+        tools, _ = _make_tools(ctx)
+        result = _invoke(_get_tool(tools, "kb_lint"), {})
+        assert "No markdown notes" in result
+
+    def test_reports_dead_link_finding(self):
+        ctx = _make_context()
+        ctx.has_workspace.return_value = True
+        ws, _ = _fake_kb_workspace(
+            {
+                "knowledge/n1.md": (
+                    "---\nid: n1\ntype: decision\ndescription: \"d\"\n---\n\n"
+                    "# N1\n\nSee [ghost](ghost.md).\n"
+                ),
+            }
+        )
+        ctx.workspace_manager = ws
+        tools, _ = _make_tools(ctx)
+        result = _invoke(_get_tool(tools, "kb_lint"), {})
+        assert "dead-link" in result
+
+    def test_respects_path_arg(self):
+        ctx = _make_context()
+        ctx.has_workspace.return_value = True
+        ws, _ = _fake_kb_workspace(
+            {"docs/a.md": "---\nid: a\ntype: note\ndescription: \"d\"\n---\n\n# A\n"}
+        )
+        ctx.workspace_manager = ws
+        tools, _ = _make_tools(ctx)
+        _invoke(_get_tool(tools, "kb_lint"), {"path": "docs"})
+        ws.list_files.assert_called_with("docs", "*.md")
+
+
+class TestKbIndex:
+    def test_error_when_no_workspace(self):
+        ctx = _make_context()
+        ctx.has_workspace.return_value = False
+        tools, _ = _make_tools(ctx)
+        result = _invoke(_get_tool(tools, "kb_index"), {})
+        assert "Error" in result
+
+    def test_writes_index_grouped_by_type(self):
+        ctx = _make_context()
+        ctx.has_workspace.return_value = True
+        ws, writes = _fake_kb_workspace(
+            {
+                "knowledge/chose-jwt.md": (
+                    "---\nid: chose-jwt\ntype: decision\ndescription: \"We chose JWT.\"\n"
+                    "---\n\n# Chose JWT\n\nbody\n"
+                ),
+            }
+        )
+        ctx.workspace_manager = ws
+        tools, _ = _make_tools(ctx)
+        result = _invoke(_get_tool(tools, "kb_index"), {})
+        assert "knowledge/index.md" in writes
+        content = writes["knowledge/index.md"]
+        assert "## decision" in content
+        assert "[Chose JWT](chose-jwt.md)" in content
+        assert "1 note" in result
+
+    def test_skips_reserved_and_malformed(self):
+        ctx = _make_context()
+        ctx.has_workspace.return_value = True
+        ws, writes = _fake_kb_workspace(
+            {
+                "knowledge/good.md": (
+                    "---\nid: good\ntype: learning\ndescription: \"d\"\n---\n\n# Good\n"
+                ),
+                "knowledge/index.md": "# Index\n\n(reserved, not a note)\n",
+                "knowledge/broken.md": "---\nnot: : yaml\n---\nbody",
+            }
+        )
+        ctx.workspace_manager = ws
+        tools, _ = _make_tools(ctx)
+        result = _invoke(_get_tool(tools, "kb_index"), {})
+        content = writes["knowledge/index.md"]
+        assert "[Good](good.md)" in content
+        assert "1 note" in result  # index.md + broken.md excluded
 
     def test_returns_summary_with_count(self, tmp_path):
         tools, ctx = _make_tools()
