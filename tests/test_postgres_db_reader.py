@@ -4,44 +4,52 @@ from src.database.postgres_db import PostgresDB
 
 
 @pytest.mark.asyncio
-async def test_history_includes_components_and_tool_link():
+async def test_history_projects_only_resume_fields():
+    """HF-7 thread-read diet: the resume reader returns exactly what the resume
+    consumers use — role/content/tool_calls/tool_call_id/turn_number — and does
+    NOT fetch the resume-unused component columns (thinking/reasoning/
+    tool_results/provider*/response_metadata/additional_kwargs/metrics/id/
+    created_at). Those are never read on resume; the rebuilt AIMessage doesn't
+    carry them."""
     db = PostgresDB.__new__(PostgresDB)  # bypass __init__/connection
     db.fetch = AsyncMock(
         return_value=[
             {
-                "id": "11111111-1111-1111-1111-111111111111",
-                "role": "ai",
-                "content": "hi",
+                "role": "tool",
+                "content": "result",
                 "tool_calls": None,
-                "turn_number": 1,
-                "metrics": None,
-                "tool_call_id": None,
-                "thinking": "legacy reasoning",
-                "reasoning": None,
-                "tool_results": None,
-                "provider": "openai-chat",
-                "provider_raw": None,
-                "additional_kwargs": None,
-                "response_metadata": None,
-                "created_at": None,
+                "tool_call_id": "call_1",
+                "turn_number": 2,
             }
         ]
     )
     rows = await db.get_thread_messages_history("t1")
-    row = rows[0]
-    for key in (
-        "tool_call_id",
-        "thinking",
+    assert rows[0] == {
+        "role": "tool",
+        "content": "result",
+        "tool_calls": None,
+        "tool_call_id": "call_1",
+        "turn_number": 2,
+    }
+    # The tool-result link survives (so _db_rows_to_lc_messages need not fall
+    # back to positional pairing).
+    assert rows[0]["tool_call_id"] == "call_1"
+    # The SELECT projection must not re-introduce the resume-unused over-fetch.
+    # (created_at legitimately stays in the ORDER BY, so scope the check to the
+    # projection clause between SELECT and FROM.)
+    sql = " ".join(db.fetch.call_args[0][0].split())
+    projection = sql.split("FROM")[0]
+    for dropped in (
         "reasoning",
         "tool_results",
-        "provider",
         "provider_raw",
-        "additional_kwargs",
         "response_metadata",
+        "additional_kwargs",
+        "thinking",
+        "metrics",
+        "created_at",
     ):
-        assert key in row, f"reader dropped {key}"
-    assert row["provider"] == "openai-chat"
-    assert row["thinking"] == "legacy reasoning"
+        assert dropped not in projection, f"resume reader must not fetch {dropped}"
 
 
 @pytest.mark.asyncio
@@ -214,7 +222,9 @@ async def test_checkpoint_surfaces_boundary_seq():
 
 
 def _full_row(mid, turn):
-    """A thread_messages row with every column the reader maps."""
+    """A thread_messages row carrying every DB column (the reader now projects
+    only a subset; the extra keys are ignored, and are kept here to prove the
+    reader tolerates a full row)."""
     return {
         "id": mid,
         "role": "ai",
@@ -247,7 +257,11 @@ async def test_newest_first_selects_seq_desc_and_returns_chronological():
     sql = " ".join(db.fetch.call_args[0][0].split())
     assert "ORDER BY seq DESC" in sql, "newest_first must select by seq DESC"
     assert "LIMIT" in sql, "the floor must cap the row count"
-    assert [r["id"] for r in rows] == ["n1", "n2", "n3"], "result must be chronological"
+    # Identify rows by a projected field (id is no longer returned): _full_row
+    # sets content=f"c{mid}", so chronological order is c-n1, c-n2, c-n3.
+    assert [r["content"] for r in rows] == ["cn1", "cn2", "cn3"], (
+        "result must be chronological"
+    )
 
 
 @pytest.mark.asyncio
