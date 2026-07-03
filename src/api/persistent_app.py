@@ -1418,6 +1418,7 @@ async def _attach_session(
             model=aux_cfg.model,
             base_url=aux_cfg.base_url,
             api_key=aux_cfg.api_key,
+            provider=aux_cfg.provider,
             temperature=aux_cfg.temperature,
             top_p=model_settings.get("top_p"),
             top_k=model_settings.get("top_k"),
@@ -1430,6 +1431,11 @@ async def _attach_session(
             max_iterations=aux_cfg.max_iterations,
             timeout=aux_cfg.timeout,
             max_context_tokens=model_settings.get("model_max_context_tokens"),
+            # Drop-in fallback to the main session model when the dedicated aux
+            # model is unreachable — keeps compaction/memory/titles alive instead
+            # of crashing the session. See
+            # docs/issues/openrouter_auxiliary_misrouted_to_openai.md.
+            fallback_llm=llm,
         )
         logger.info(
             "Auxiliary override applied: model=%s, base_url=%s",
@@ -4371,6 +4377,7 @@ async def _handle_config_update(ws: WebSocket, config_override: Dict[str, Any]) 
                 model=aux_cfg.model,
                 base_url=aux_cfg.base_url,
                 api_key=aux_cfg.api_key,
+                provider=aux_cfg.provider,
                 temperature=aux_cfg.temperature,
                 top_p=model_settings.get("top_p"),
                 top_k=model_settings.get("top_k"),
@@ -4383,6 +4390,9 @@ async def _handle_config_update(ws: WebSocket, config_override: Dict[str, Any]) 
                 max_iterations=aux_cfg.max_iterations,
                 timeout=aux_cfg.timeout,
                 max_context_tokens=model_settings.get("model_max_context_tokens"),
+                # Fall back to the (possibly just-rebuilt) main session model when
+                # the dedicated aux model is unreachable.
+                fallback_llm=_session._llm,
             )
             logger.info(
                 "Auxiliary hot-swapped: model=%s, base_url=%s",
@@ -5137,14 +5147,19 @@ async def _generate_title(messages: List[Any], auxiliary_llm: Any) -> Optional[s
             )
             return None
 
-        response = await auxiliary_llm.llm.ainvoke(
+        # Route through AuxiliaryLLM.ainvoke (not .llm.ainvoke) so title
+        # generation gets the same main-model fallback as every other aux task —
+        # a dead dedicated aux model yields a title on the main model instead of
+        # a silent "Untitled Session".
+        response = await auxiliary_llm.ainvoke(
             [
                 SM(
                     content="Generate a short title (5-8 words) for this conversation. "
                     "Return ONLY the title, no quotes or punctuation."
                 ),
                 HM(content="\n".join(sample)),
-            ]
+            ],
+            task_name="title_generation",
         )
         auxiliary_llm.health.record_success("title_generation")
         text = getattr(response, "content", None) or ""
