@@ -383,11 +383,16 @@ class PostgresDB:
         when there's no usable summary/boundary; it is a floor, not the
         mechanism. The caller logs when ``len(result) == limit`` (trimmed).
         """
+        # HF-7 thread-read diet: the resume consumers read only
+        # role/content/tool_calls/tool_call_id (_db_rows_to_lc_messages) and
+        # turn_number (the turn_count restore in _restore_session_messages). The
+        # other 10 columns — including the large JSONB reasoning/tool_results/
+        # provider_raw/response_metadata/additional_kwargs — were fetched on
+        # every resume and never read (the rebuilt AIMessage doesn't carry them).
+        # Select only what resume consumes. The seq / turn_number / created_at
+        # ORDER BYs below don't require the column in the projection.
         query = """
-            SELECT id, role, content, tool_calls, turn_number, metrics,
-                   tool_call_id, thinking, reasoning, tool_results,
-                   provider, provider_raw, additional_kwargs, response_metadata,
-                   created_at
+            SELECT role, content, tool_calls, tool_call_id, turn_number
             FROM thread_messages
             WHERE thread_id = $1
               AND role NOT IN ('summary', 'error')
@@ -423,31 +428,11 @@ class PostgresDB:
         for row in rows:
             result.append(
                 {
-                    "id": str(row["id"]),
                     "role": row["role"],
                     "content": row["content"],
                     "tool_calls": _j(row["tool_calls"]) if row["tool_calls"] else None,
-                    "turn_number": row["turn_number"],
-                    "metrics": _j(row["metrics"]) if row["metrics"] else None,
                     "tool_call_id": row["tool_call_id"],
-                    "thinking": row["thinking"],
-                    "reasoning": _j(row["reasoning"]) if row["reasoning"] else None,
-                    "tool_results": _j(row["tool_results"])
-                    if row["tool_results"]
-                    else None,
-                    "provider": row["provider"],
-                    "provider_raw": _j(row["provider_raw"])
-                    if row["provider_raw"]
-                    else None,
-                    "additional_kwargs": _j(row["additional_kwargs"])
-                    if row["additional_kwargs"]
-                    else None,
-                    "response_metadata": _j(row["response_metadata"])
-                    if row["response_metadata"]
-                    else None,
-                    "created_at": row["created_at"].isoformat()
-                    if row["created_at"]
-                    else None,
+                    "turn_number": row["turn_number"],
                 }
             )
         if newest_first:
