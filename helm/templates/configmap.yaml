@@ -27,6 +27,16 @@ data:
   AUDIT_POSTGRES_PORT: {{ include "srw.auditPostgresPort" . | quote }}
   AUDIT_POSTGRES_DB: {{ include "srw.auditPostgresDb" . | quote }}
 
+  # App-DB asyncpg pool sizing for provisioned agent pods, which inherit this
+  # ConfigMap via envFrom. Kept SMALL on purpose: the connection multiplier is
+  # agent COUNT (maxAgents), so a fat per-agent pool exhausts the app DB's
+  # max_connections. The agent's vector pool reads the same POSTGRES_* env, so
+  # this one knob bounds both. The ORCHESTRATOR does NOT envFrom this ConfigMap
+  # — it sizes its own (larger) control/vector/audit pools via explicit env in
+  # orchestrator/deployment.yaml, so these agent-scale values never reach it.
+  POSTGRES_MIN_CONNECTIONS: {{ .Values.agent.dbPool.app.min | quote }}
+  POSTGRES_MAX_CONNECTIONS: {{ .Values.agent.dbPool.app.max | quote }}
+
   # Active checkpointer backend (sqlite|postgres). Worker agents read it to pick
   # the LangGraph checkpointer (postgres = shared Postgres, cross-pod resume);
   # the orchestrator reads it to prune checkpoints on terminal. Agents inherit

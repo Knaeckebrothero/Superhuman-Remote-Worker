@@ -276,17 +276,32 @@ class PostgresDB:
         max_connections: int = None,
         command_timeout: float = None,
         migrations_dir: Optional[Path] = None,
+        env_prefix: str = "POSTGRES",
+        default_min_connections: int = 2,
+        default_max_connections: int = 10,
     ):
         """Initialize PostgreSQL database manager.
 
         Args:
             connection_string: PostgreSQL connection URL. Falls back to DATABASE_URL env var.
-            min_connections: Minimum pool size (default: 2)
-            max_connections: Maximum pool size (default: 10)
+            min_connections: Minimum pool size. Falls back to
+                ``{env_prefix}_MIN_CONNECTIONS`` then ``default_min_connections``.
+            max_connections: Maximum pool size. Falls back to
+                ``{env_prefix}_MAX_CONNECTIONS`` then ``default_max_connections``.
             command_timeout: Query timeout in seconds (default: 60.0)
             migrations_dir: Directory of NNNN_*.sql migrations applied by
                 ``apply_migrations``. Defaults to ``migrations/app/``; the
                 vector instance overrides this to ``migrations/vector/``.
+            env_prefix: Env-var prefix for this store's pool + DSN
+                (``POSTGRES`` control plane, ``VECTOR_POSTGRES``,
+                ``AUDIT_POSTGRES``). Each store reads its OWN
+                ``{env_prefix}_MIN/MAX_CONNECTIONS`` so the vector/audit pools no
+                longer silently inherit the control-plane ``POSTGRES_*`` sizing.
+            default_min_connections: Baked-in min when the env var is unset
+                (control 2, vector 1, audit 1) — never falls through to
+                asyncpg's own ``create_pool`` default (min 10).
+            default_max_connections: Baked-in max when the env var is unset
+                (control 10, vector 5, audit 4).
 
         Raises:
             ImportError: If asyncpg is not installed
@@ -301,17 +316,17 @@ class PostgresDB:
         self._connection_string = (
             connection_string
             or build_postgres_url(
-                "POSTGRES",
+                env_prefix,
                 fallback_env="DATABASE_URL",
             )
             or "postgresql://srw:srw_password@localhost:5432/srw"
         )
 
         self._min_connections = min_connections or int(
-            os.getenv("POSTGRES_MIN_CONNECTIONS", "2")
+            os.getenv(f"{env_prefix}_MIN_CONNECTIONS", str(default_min_connections))
         )
         self._max_connections = max_connections or int(
-            os.getenv("POSTGRES_MAX_CONNECTIONS", "10")
+            os.getenv(f"{env_prefix}_MAX_CONNECTIONS", str(default_max_connections))
         )
         self._command_timeout = command_timeout or 60.0
 
