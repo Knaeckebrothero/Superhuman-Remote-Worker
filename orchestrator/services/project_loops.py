@@ -97,7 +97,12 @@ _ROLE_BLOCKS: dict[str, str] = {
     "developer": (
         "Implement the Critic's chosen action. VALIDATE YOUR OWN WORK before "
         "declaring done — run it and test it; do not rely on it merely "
-        "compiling. You work on your own branch of the project repository; "
+        "compiling. Fan the UNDERSTANDING out, not the writing: use subagents "
+        "(multiple spawn_subagent calls in one turn) to explore unfamiliar code "
+        "areas and look things up (docs, APIs, errors) in parallel, but write "
+        "every production change yourself — subagent-driven coding fragments the "
+        "one thing that needs a coherent head. You work on your own branch of "
+        "the project repository; "
         "your commits push there automatically, and when you finish the "
         "orchestrator squash-merges your net contribution onto `main` — that "
         "merge IS the project the next iteration builds on (job-scoped scratch "
