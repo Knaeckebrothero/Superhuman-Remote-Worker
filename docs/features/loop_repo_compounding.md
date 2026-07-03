@@ -23,7 +23,14 @@ related:
 
 How the **project self-improvement loop** ([[project_self_improvement_loop]]) accumulates its *artifact* across iterations. It is a deliberate, **loop-scoped exception** to the per-job-repo decision in [[repo_resolution]]: for loop jobs, the project's shared repository `main` becomes the living deliverable, and each **execution** iteration works directly on `main` and pushes — so its code compounds *in place*.
 
-> **Status:** IMPLEMENTED (v1), 2026-06-26, uncommitted on `develop`. Unit-verified (`tests/test_job_provisioning.py`, 15 passing) **and k3d-verified** (real developer loop run — see [k3d E2E results](#k3d-e2e-results-2026-06-26)). Fixes [[loop_review]] **F11** and the git half of **F12**. The E2E confirmed the keystone and caught one floor gap (`skills/`), now fixed. Deferred fast-follows listed at the end.
+> **Status:** SUPERSEDED by [[loop_repo_compounding_v2]] (accepted 2026-07-03) — per-job
+> branches for ALL roles + orchestrator squash-merge onto `main`; the two-layer reframe
+> and the `.gitignore` floor survive intact. Historical status: IMPLEMENTED (v1),
+> 2026-06-26. Unit-verified (`tests/test_job_provisioning.py`, 15 passing) **and
+> k3d-verified** (real developer loop run — see [k3d E2E results](#k3d-e2e-results-2026-06-26)).
+> Fixed [[loop_review]] **F11** and the git half of **F12**; live-proven in run 7
+> (2026-07-03, post-F29-fix) — the same run that demonstrated the costs (main bloat,
+> discarded analysis output, heuristic integrity) that motivated v2.
 >
 > **Successor proposed (2026-07-03):** [[loop_repo_compounding_v2]] — per-job branches for *all* roles + orchestrator squash-merge + jobs-repo-as-coordination-repo. Addresses Open Q5 (`main` bloat, confirmed live in run 7), the analysis-output loss, and replaces the SHA-compare no-op guard with a literal merge outcome. This v1 model stays live in code until v2 ships.
 

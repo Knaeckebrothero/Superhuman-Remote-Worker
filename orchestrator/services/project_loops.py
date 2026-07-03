@@ -17,24 +17,30 @@ Design: docs/features/project_self_improvement_loop.md.
 
 from __future__ import annotations
 
+import base64
+import json
 import logging
 import os
+from datetime import UTC, datetime
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
 
-# Execution roles commit to the project's `main` branch so the artifact
-# compounds IN PLACE across iterations; analysis roles coordinate only through
-# the KB and run on a throwaway branch that is never merged. The execution slot
-# is swappable (developer / default / a future writer), so analysis is the
-# closed set and everything else is treated as execution.
-# See docs/features/loop_repo_compounding.md.
+# Every loop role works on its own `job/<id>` branch; on completion the
+# orchestrator squash-merges its net contribution onto `main` (one commit per
+# job, branch kept as the audit log). Execution roles are the ones whose merge
+# is EXPECTED to be non-empty — an `empty` merge from them is the F29-family
+# lost-work signal; analysis roles coordinate through the KB, so `empty` is
+# normal for them (until the KB is file-based). The execution slot is swappable
+# (developer / default / a future writer), so analysis is the closed set and
+# everything else is treated as execution.
+# See docs/features/loop_repo_compounding_v2.md.
 LOOP_ANALYSIS_ROLES: frozenset[str] = frozenset({"scholar", "critic"})
 
 
 def is_loop_execution_role(role: str | None) -> bool:
-    """True if a loop role produces the project artifact (works on ``main``)."""
+    """True if a loop role produces the project artifact (merge must land)."""
     return bool(role) and role not in LOOP_ANALYSIS_ROLES
 
 
@@ -61,8 +67,10 @@ _ROLE_BLOCKS: dict[str, str] = {
         "first so you don't re-propose a dead end. Write each candidate to the KB "
         "as a `plan` note tagged `proposal` (a one-line thesis and why it differs "
         "from the others). Do NOT self-filter — selecting is the Critic's job. "
-        "Your output is proposal notes, not repo commits (your working branch is "
-        "scratch and is never merged into the project)."
+        "Your output is proposal notes, not repo commits. You work on your own "
+        "branch; anything you deliberately leave in the working tree is "
+        "squash-merged into the project when you finish, so keep it clean — "
+        "research scratch belongs in the KB, not the repo."
     ),
     "critic": (
         "Select and prioritise among the open proposals AGAINST THE DEFINITION "
@@ -79,17 +87,22 @@ _ROLE_BLOCKS: dict[str, str] = {
         "UNCONDITIONAL — it does not stop on 'done'; if the system already meets "
         "the bar in an area, select the next most valuable improvement instead of "
         "declaring completion. Do NOT modify "
-        "the repository — only read, evaluate, and write your verdict to the KB "
-        "(your working branch is scratch and is never merged into the project)."
+        "the repository — only read, evaluate, and write your verdict to the KB. "
+        "You work on your own branch; anything you deliberately leave in the "
+        "working tree is squash-merged into the project when you finish, so "
+        "leave it untouched. Check `retros/` on the repo for the mechanical "
+        "record of what previous jobs actually landed (merge status per "
+        "iteration) — trust it over KB self-reports."
     ),
     "developer": (
         "Implement the Critic's chosen action. VALIDATE YOUR OWN WORK before "
         "declaring done — run it and test it; do not rely on it merely "
-        "compiling. You work directly on the project's `main` branch: commit "
-        "your work and it is pushed automatically when you finish, becoming the "
-        "accumulated project that the next iteration builds on (job-scoped "
-        "scratch is kept out of it for you). Record in the KB what you shipped "
-        "and any follow-ups."
+        "compiling. You work on your own branch of the project repository; "
+        "your commits push there automatically, and when you finish the "
+        "orchestrator squash-merges your net contribution onto `main` — that "
+        "merge IS the project the next iteration builds on (job-scoped scratch "
+        "is kept out of it for you; partial work is safe on your branch). "
+        "Record in the KB what you shipped and any follow-ups."
     ),
 }
 
@@ -331,3 +344,147 @@ async def create_loop_job(
         iteration,
     )
     return job
+
+
+async def merge_loop_job_branch(
+    gitea_client: Any, job: dict[str, Any]
+) -> tuple[str, str | None]:
+    """Squash-merge a completed loop job's branch into ``main``.
+
+    One clean commit per job lands on ``main``; the ``job/<id>`` branch is
+    KEPT as the per-iteration audit log. The returned status is literal —
+    the loop's artifact-integrity signal (replaces the v1 SHA-compare no-op
+    guard, which inferred what this step *knows*):
+
+    - ``merged``       — squash commit created; second element is its SHA.
+    - ``empty``        — branch has no commits vs ``main``: the job landed
+                         nothing (F29-family signal for execution roles;
+                         expected for analysis roles while the KB is a DB).
+    - ``merge-failed`` — compare/PR/merge errored. Sequential loops are
+                         conflict-free by construction, so this is loud-flag
+                         territory, never silent.
+    - ``skipped``      — nothing to merge structurally: no repo, or a v1-era
+                         job that worked directly on ``main`` (its push
+                         already landed) completing after the v2 deploy.
+
+    Design: docs/features/loop_repo_compounding_v2.md.
+    """
+    repo_name = job.get("repo_name")
+    branch = job.get("branch_name")
+    if not repo_name or not branch or branch == "main":
+        return "skipped", None
+
+    compare = await gitea_client.get_compare(repo_name, "main", branch)
+    if compare is None:
+        return "merge-failed", None
+    if not compare.get("total_commits"):
+        return "empty", None
+
+    job_id = str(job.get("id"))
+    title = (job.get("description") or "").splitlines()[0].strip()[:200] or (
+        f"Loop job {job_id[:8]}"
+    )
+    pr = await gitea_client.create_pr(
+        repo_name,
+        title=title,
+        head=branch,
+        base="main",
+        body=f"job: {job_id}\nbranch: {branch}",
+    )
+    if not pr:
+        return "merge-failed", None
+    merged = await gitea_client.merge_pr(
+        repo_name,
+        pr["number"],
+        merge_strategy="squash",
+        # The branch is the audit log — never deleted on merge.
+        delete_branch_after_merge=False,
+    )
+    if not merged:
+        return "merge-failed", None
+    sha = await gitea_client.get_branch_head_sha(repo_name, "main")
+    return "merged", sha
+
+
+_RETRO_NOTES_LIMIT = 6000
+
+
+async def write_loop_retro(
+    gitea_client: Any,
+    job: dict[str, Any],
+    *,
+    ctx: dict[str, Any],
+    merge_status: str,
+    merged_sha: str | None,
+    failed: bool = False,
+    error: str | None = None,
+) -> bool:
+    """Record a loop job's outcome as ``retros/NNN-<role>-<jobid8>.md`` on ``main``.
+
+    Orchestrator-written AFTER the merge outcome is known, so the retro
+    carries mechanical truth (merge status + SHA) next to the agent's own
+    ``freeze_data`` completion notes — critics read this instead of trusting
+    KB self-reports from destroyed workspaces (F40). Best-effort: failures
+    must never block the loop advance.
+    """
+    repo_name = job.get("repo_name")
+    if not repo_name:
+        return False
+
+    job_id = str(job.get("id"))
+    role = ctx.get("loop_role") or job.get("config_name") or "unknown"
+    try:
+        iteration = int(ctx.get("loop_iteration") or 0)
+    except (TypeError, ValueError):
+        iteration = 0
+
+    freeze = job.get("freeze_data")
+    if isinstance(freeze, str):
+        try:
+            freeze = json.loads(freeze)
+        except (json.JSONDecodeError, ValueError):
+            freeze = {"notes": freeze}
+    notes = (freeze or {}).get("notes") or "(none recorded)"
+    if len(notes) > _RETRO_NOTES_LIMIT:
+        notes = notes[:_RETRO_NOTES_LIMIT] + "\n\n[truncated]"
+
+    description = (job.get("description") or "").splitlines()[0].strip()
+    lines = [
+        "---",
+        "type: retro",
+        f"iteration: {iteration}",
+        f"role: {role}",
+        f"job: {job_id}",
+        f"branch: {job.get('branch_name') or '~'}",
+        f"status: {'failed' if failed else 'completed'}",
+        f"merge_status: {merge_status}",
+        f"merge_sha: {merged_sha or '~'}",
+        f"created: {datetime.now(UTC).isoformat(timespec='seconds')}",
+        "---",
+        "",
+        f"# Loop iter {iteration} · {role}",
+        "",
+        description,
+        "",
+        "## Agent completion notes",
+        "",
+        notes,
+    ]
+    if failed and error:
+        lines += ["", "## Error", "", str(error)[:2000]]
+    content = "\n".join(lines) + "\n"
+
+    path = f"retros/{iteration:03d}-{role}-{job_id[:8]}.md"
+    return bool(
+        await gitea_client.change_files(
+            repo_name,
+            "main",
+            [
+                {
+                    "path": path,
+                    "content_b64": base64.b64encode(content.encode()).decode(),
+                }
+            ],
+            message=f"retro: iter {iteration:03d} {role} ({job_id[:8]}) — {merge_status}",
+        )
+    )

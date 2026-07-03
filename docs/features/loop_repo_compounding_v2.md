@@ -22,9 +22,25 @@ related:
 
 # Loop Repo Compounding v2 — Per-Job Branches, Orchestrator Squash-Merge, Jobs Repo as Coordination Repo
 
-**Status:** DRAFT — proposed successor to [[loop_repo_compounding]] (v1). v1 stays live in
-code until this ships; **do not churn the model while the current run era is proving the
-F29 fix bundle.** Origin: design discussion 2026-07-03, prompted by live run-7 evidence.
+**Status:** ACCEPTED 2026-07-03, implementation in progress (same day) — successor to
+[[loop_repo_compounding]] (v1). Origin: design discussion 2026-07-03, prompted by live
+run-7 evidence. The original "wait for the run era to conclude" sequencing was overridden
+deliberately: the live run-7 loop is kept running across the v1→v2 deploy to exercise
+mid-loop redeploy semantics (in-flight v1 jobs complete with `merge_status=skipped`).
+
+**Decisions (2026-07-03):**
+- **Retros ship now, orchestrator-generated** — written from `freeze_data` + the literal
+  merge outcome after each advance (agent-written was rejected: stochastic, and a
+  destroyed developer's self-report is exactly the F40 failure mode).
+- **Branch protection deferred** — agents authenticate as the same shared admin user the
+  orchestrator uses, and the orchestrator writes `main` directly via the contents API
+  (floor, retros); protection is vacuous-or-blocking until a separate bot-user credential
+  model exists.
+- **Merge failure = flag + continue** — `merge_status=merge-failed`, ERROR log + actions
+  entry; the loop advances (loss is visible, never silent — the F29 lesson). Not counted
+  toward `consecutive_failures` for now.
+- **Artifact-repo merges (slice e) deferred** — no attached-repo coverage in tonight's
+  test run.
 
 ## TL;DR
 
@@ -110,14 +126,16 @@ the squash contains only contribution.
 
 ### The retro collection (F40 killer)
 
-Every job's final act (or the orchestrator's, from `freeze_data`) is a standardized
-retro note — `retros/NNN-<role>-<jobid8>.md` — with OKF frontmatter: iteration, role,
-job id, what was attempted, what landed, links to the KB decision/proposal notes it
-executed. Because it merges *with* the contribution:
+After each advance the **orchestrator** writes a standardized retro note —
+`retros/NNN-<role>-<jobid8>.md` — directly to `main` (contents API), with OKF
+frontmatter (iteration, role, job id, branch, `merge_status`, merge SHA) and the agent's
+own `freeze_data` completion notes as the body. Written for failed jobs too (recording
+the failure). Because the orchestrator writes it *after* the merge outcome is known:
 
-- A retro on `main` is **backed by a real merge** — critics read `retros/` + `git log
-  main` instead of trusting KB self-reports from destroyed workspaces.
-- `merge_status=empty` + a retro claiming shipped work = the contradiction is mechanical.
+- A retro on `main` is **backed by the actual merge outcome** — critics read `retros/`
+  + `git log main` instead of trusting KB self-reports from destroyed workspaces.
+- `merge_status=empty` recorded *in* a retro whose body claims shipped work = the
+  contradiction is mechanical and sits in one file.
 
 ### `merge_status` semantics (per role)
 
@@ -125,7 +143,8 @@ executed. Because it merges *with* the contribution:
 |---|---|
 | `merged` | Squash produced a non-empty commit on `main`. Expected for every role once the KB is file-based (retro at minimum). |
 | `empty` | Job completed but its branch has no net diff vs `main`. For a developer: the F29-family red flag, surfaced in the advance hook exactly where the v1 no-op guard fires today. For analysis roles under a DB KB: expected-ok (until [[okf_knowledge_base]] lands, then also a flag). |
-| `merge-failed` | Squash errored (conflict — sequential loop shouldn't see one; treat as loud failure, don't advance silently). |
+| `merge-failed` | Squash errored (conflict — sequential loop shouldn't see one). Flag loudly (ERROR + actions), loop continues; the loss is visible in the MERGE column. |
+| `skipped` | Legacy: job provisioned under v1 with `branch_name=main` completed after the v2 deploy — its push already landed; nothing to merge. |
 
 This retires the SHA-compare no-op guard: keep its `_advance_project_loop` placement and
 logging shape, replace its heuristic with the merge call's actual outcome.
@@ -149,15 +168,17 @@ defines contribution vs. scratch at commit time.
 
 ## Sequencing
 
-1. **Not before the current run era concludes.** The F29 bundle + fixed no-op guard need
-   the overnight-run soak they were built for; v2 replaces the guard, so let the guard
-   first tell us what runs 7+ actually do.
+1. **Shipping 2026-07-03** (sequencing gate overridden — see Status): slices (a)–(c) in
+   one pass, live-verified on local k3d, deployed to dev the same day; a fresh project +
+   loop starts on the new model that night. The run-7 loop deliberately rides across the
+   deploy to exercise mid-loop upgrade semantics.
 2. **v2 is independent of [[okf_knowledge_base]]** (works with today's DB KB — analysis
    merges are just usually `empty` + a retro) but is *designed for* it; the retro
-   collection is the first file-based-KB convention and can ship with v2 alone.
+   collection is the first file-based-KB convention and ships with v2 alone.
 3. Implementation slices: (a) provisioning: all roles branch; (b) advance hook:
    squash-merge + literal `merge_status` (+ retire the SHA guard); (c) retros;
-   (d) branch protection on `main`; (e) artifact-repo merge via `repo_merge_statuses`.
+   (d) branch protection on `main` — **deferred** (shared-admin-user conflict, see
+   Decisions); (e) artifact-repo merge via `repo_merge_statuses` — **deferred**.
 
 ## Open questions
 
