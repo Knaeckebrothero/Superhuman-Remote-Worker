@@ -875,6 +875,24 @@ COMMENT ON COLUMN public.projects.network_tier IS 'Workspace pod-network egress 
 
 
 --
+-- Name: rollup_state; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.rollup_state (
+    name text NOT NULL,
+    last_closed_day date,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: TABLE rollup_state; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.rollup_state IS 'Rollup watermarks — one row per named rollup (e.g. usage_daily). last_closed_day = newest UTC day fully rolled up (NULL = never run). Advanced atomically with the rollup upsert (cross-DB exactly-once).';
+
+
+--
 -- Name: schema_migrations; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -1461,6 +1479,31 @@ COMMENT ON COLUMN public.threads.extend_count IS 'Number of magic-link extend-wi
 
 
 --
+-- Name: usage_daily; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.usage_daily (
+    day date NOT NULL,
+    user_id uuid,
+    project_id uuid,
+    category text NOT NULL,
+    resource text NOT NULL,
+    unit text NOT NULL,
+    quantity numeric NOT NULL,
+    cost_usd numeric DEFAULT 0 NOT NULL,
+    events bigint NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: TABLE usage_daily; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.usage_daily IS 'Daily pre-aggregated usage rollup (app-DB read model). Mirrors the auditdb usage_events ledger summed per UTC day x (user, project, category, resource, unit). /api/usage serves this for CLOSED days (day <= rollup_state watermark) and the raw ledger for the open tail. Maintained by services/usage_rollup.py via full-replace upserts — never hand-written. Per-job cost stays on raw usage_events (ref_id is not a dim here).';
+
+
+--
 -- Name: usage_rates; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -1797,6 +1840,14 @@ ALTER TABLE ONLY public.projects
 
 ALTER TABLE ONLY public.config_overrides
     ADD CONSTRAINT prompt_overrides_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: rollup_state rollup_state_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.rollup_state
+    ADD CONSTRAINT rollup_state_pkey PRIMARY KEY (name);
 
 
 --
@@ -2704,6 +2755,20 @@ COMMENT ON INDEX public.uq_tn_sent_request_kind IS 'At most one delivery_status=
 --
 
 CREATE UNIQUE INDEX uq_user_api_keys_provider ON public.user_api_keys USING btree (user_id, provider);
+
+
+--
+-- Name: usage_daily_dims_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX usage_daily_dims_idx ON public.usage_daily USING btree (day, user_id, project_id, category, resource, unit) NULLS NOT DISTINCT;
+
+
+--
+-- Name: usage_daily_user_day_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX usage_daily_user_day_idx ON public.usage_daily USING btree (user_id, day);
 
 
 --
