@@ -150,9 +150,7 @@ async def gate_candidate(
         content=content, neighbours=neighbours, prompt=prompt
     )
     targets = [
-        neighbours[i - 1]
-        for i in verdict.target_indices
-        if 1 <= i <= len(neighbours)
+        neighbours[i - 1] for i in verdict.target_indices if 1 <= i <= len(neighbours)
     ]
     return GateDecision(verdict=verdict, targets=targets)
 

@@ -191,7 +191,9 @@ def lint_kb(notes: List[Dict[str, str]]) -> LintReport:
         for target in p["out_links"]:
             if target not in known_slugs:
                 report.findings.append(
-                    Finding("dead-link", ERROR, path, f"link target '{target}' not found")
+                    Finding(
+                        "dead-link", ERROR, path, f"link target '{target}' not found"
+                    )
                 )
 
         if reserved:
@@ -214,14 +216,19 @@ def lint_kb(notes: List[Dict[str, str]]) -> LintReport:
             if not fm.get(key):
                 report.findings.append(
                     Finding(
-                        "missing-required-key", ERROR, path, f"missing required key '{key}'"
+                        "missing-required-key",
+                        ERROR,
+                        path,
+                        f"missing required key '{key}'",
                     )
                 )
 
         note_id = fm.get("id")
         if note_id and not _ID_RE.match(str(note_id)):
             report.findings.append(
-                Finding("invalid-id", ERROR, path, f"id '{note_id}' is not a valid slug")
+                Finding(
+                    "invalid-id", ERROR, path, f"id '{note_id}' is not a valid slug"
+                )
             )
 
         sup = fm.get("superseded_by")
@@ -247,7 +254,9 @@ def lint_kb(notes: List[Dict[str, str]]) -> LintReport:
             )
             if not has_out and not has_in:
                 report.findings.append(
-                    Finding("orphan", WARNING, path, "note has no inbound or outbound links")
+                    Finding(
+                        "orphan", WARNING, path, "note has no inbound or outbound links"
+                    )
                 )
 
     # Duplicate ids (global).
