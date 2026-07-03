@@ -69,12 +69,15 @@ markdown/OKF files, a relational DB, or a graph DB?**
 ### What OKF actually is (so we don't strawman it)
 
 A directory of markdown files, **one file = one concept**, file path = identity. YAML
-frontmatter with exactly **one required field: `type`**; reserved optionals
-`title/description/resource/tags/timestamp`. Concepts cross-link with **standard markdown
-links**, so the directory is an emergent graph. Optional `index.md` (progressive
-disclosure) and `log.md` (change history). The whole spec "fits on a page." Its bet is
-**interop** ("every team that adopts it makes every other team's agents smarter"), not
-technical novelty — and codifying the constraints that keep a vault from drifting.
+frontmatter with exactly **one required field: `type`**; *recommended* optionals
+`title/description/resource/tags/timestamp` (correction 2026-07-03 against the fetched
+spec: these are "recommended", not "reserved" — the reserved things are the **filenames**
+`index.md`/`log.md`). Concepts cross-link with **standard markdown links**, so the
+directory is an emergent graph. Optional `index.md` (progressive disclosure) and `log.md`
+(change history). "Fits on a page" is the announcement blog's line — the spec itself is
+~450 lines. Its bet is **interop** ("every team that adopts it makes every other team's
+agents smarter"), not technical novelty — and codifying the constraints that keep a
+vault from drifting.
 
 ---
 

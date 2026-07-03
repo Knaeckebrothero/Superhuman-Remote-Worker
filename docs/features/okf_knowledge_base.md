@@ -25,8 +25,10 @@ related:
 
 # OKF Knowledge Base — Files-Canonical KB as a Datasource
 
-**Status:** DRAFT, delivery pipeline LIVE — origin: design discussion 2026-07-03,
-building on the substrate findings in [[knowledge_base_substrate_decision]].
+**Status:** DRAFT (implementation-ready), delivery pipeline LIVE — origin: design
+discussion 2026-07-03, building on the substrate findings in
+[[knowledge_base_substrate_decision]]; refined the same day by a six-agent research
+sweep (three codebase audits, three web — sources in §12).
 [[loop_repo_compounding_v2]] shipped the same day, which changes this doc's footing: the
 squash-merge flow, the post-merge hook point, and `retros/` (orchestrator-written notes
 with OKF frontmatter, `type: retro`) are **in production**. Anything an agent writes
@@ -48,8 +50,8 @@ orchestrator work — the loop is a ready delivery pipeline waiting for the note
   through the index; maintenance is a background gardener, because a year of running our
   own `docs/` vault proved the format does not self-maintain.
 - **Sync is one-way and incremental**: the index stores the commit SHA it was built from;
-  `git diff` against HEAD yields exactly the changed notes (git's object model already *is*
-  the Merkle tree you'd otherwise build). No bidirectional sync, ever.
+  a git tree-diff against HEAD yields exactly the changed notes (git's object model
+  already *is* the Merkle tree you'd otherwise build). No bidirectional sync, ever.
 - This answers [[knowledge_base_substrate_decision]] §8 for the KB workload: **no graph
   scaffolding; Neo4j goes dormant for KBs** (the citation network remains the separate
   open case). It flips the substrate doc's default from "Postgres-canonical ⇄ OKF export"
@@ -127,6 +129,18 @@ coherent; only a loop that *runs* does.
 > the memory auxiliaries use (archive phase; post-merge once slice 3's index exists).
 > Same package shape as `src/services/memory/` — a `src/services/knowledge/` service
 > package, not more logic inside the task class.
+>
+> Refinements from the code audit + field research (2026-07-03): the gate is a
+> **chain-mode** call (one structured-output adjudication like `IngestionVerdictTask` —
+> not another agent loop), with memory's **cost guard** (no neighbour above the
+> similarity floor → straight add, zero LLM calls) plus a **content-hash pre-filter**
+> (cognee's pattern) so unchanged candidates never reach the LLM; degrade to
+> conservative-add on aux failure; the verdict prompt is read **at event time** (the
+> runtime-field pattern — not memory's attach-time `load_prompt`, which can't honour
+> `config.update` in persistent sessions). Economics caveat from the field: mem0
+> retreated from verdict-gating to add-only in 2026 because gating fails at
+> chat-message volume — it doesn't at curated-note volume, and add-only's
+> "contradictions never reconciled" is exactly what we're preventing.
 
 ## 4. The core commitment — the index is a cache, never a source of truth
 
@@ -146,6 +160,9 @@ What this buys:
   `WHERE NOT IN` → the index.
 - **The degenerate failure case is "rebuild the cache."** Index corruption, schema
   migration, force-push — all resolve to a full reindex from HEAD.
+- **No index-only state** (SilverBullet's shipped invariant, adopted as a design rule):
+  anything the index knows must be derivable from the repo. The bi-temporal columns are
+  the one watched case — they stay "index-side parity," never a second truth.
 
 **Why file-first rather than the substrate doc's DB-first default:** datasource KBs force
 it. An org wiki that humans edit in Obsidian and foreign agents clone cannot be an "export
@@ -161,24 +178,95 @@ level-by-level tree hashing you would otherwise build.** Tree object SHAs are re
 folder hashes; the commit SHA is the root hash; `git diff --name-status A..B` is "compare
 roots, descend only into changed subtrees," maintained by git on every push.
 
-Design:
+Design (mechanism corrected 2026-07-03 after the code audit — see §12):
 
 - The index stores **one watermark per KB: `indexed_commit`** (plus `blob_sha` per note
-  row for idempotency and embedding gating).
-- **Reindex** = `git diff --name-status indexed_commit..HEAD` (Gitea `get_compare` API —
-  already on `GiteaClient`) → upsert added/modified notes, delete removed ones, re-embed
-  only rows whose blob SHA changed → advance the watermark. Cost is **O(changed files)**,
-  never O(vault): a 10k-document org vault with 500 changed notes touches 500 files and
-  re-embeds only the content-changed subset.
-- **Staleness detection is O(1)**: compare `indexed_commit` to the branch HEAD SHA.
-- **Triggers** (cheap enough to be aggressive): Gitea push webhook → reindex job; job-start
-  check (SHA compare, catch-up reindex before the agent reads); the loop's post-merge hook
-  — now a concrete call site: `_advance_project_loop` directly after
-  `merge_loop_job_branch` returns `merged` ([[loop_repo_compounding_v2]], implemented). Between triggers, reads-of-truth can always hit files.
-- **Force-push / history rewrite**: if `indexed_commit` is no longer an ancestor of HEAD
-  (merge-base check), fall back to full rebuild — safe because the index is disposable.
+  row for idempotency and embedding gating), alongside a **`pipeline_version`** (config
+  hash: embedding model + chunker version + path-prefix). A watermark is valid only if
+  `indexed_commit` is an ancestor of HEAD **and** `pipeline_version` matches — a changed
+  embedding model or chunker silently invalidates every row, so it must force a full
+  rebuild (Zoekt rebuilds on repo-metadata change for exactly this reason).
+- **Reindex = tree diff, NOT the compare API.** Gitea's `get_compare` drops the `files[]`
+  array (`gitea.py:841-889` keeps only commits) and Gitea 1.22's compare endpoint 404s
+  on raw SHAs — the original "`git diff --name-status` via `get_compare`" plan does not
+  work. The production-proven mechanism already exists: `_diff_files_by_tree`
+  (`orchestrator/services/job_cloud_baseline.py:327-376`) builds `{path: blob_sha}` maps
+  from `list_tree` at two refs and set-diffs them into added/modified/deleted (modified
+  = blob-SHA inequality — the re-embed gate for free). Generalize its path-prefix filter
+  to the KB root; upsert added/modified (bodies via `get_file_content(ref=HEAD)`),
+  delete removed, re-embed only changed blobs, advance the watermark. Cost is
+  **O(tree listing + changed files)**: a 10k-document org vault with 500 changed notes
+  fetches and re-embeds only the 500.
+- **Renames**: the tree diff reports a rename as delete+add, but the stable frontmatter
+  `id` (§6) re-matches them — same id reappearing on a new path ⇒ update `path` on the
+  existing row and **skip re-embedding** when the blob is unchanged. Process deletions
+  before additions inside one transaction so a rename can't collide on the id
+  uniqueness constraint.
+- **Staleness detection is O(1)**: compare `indexed_commit` to the branch HEAD SHA
+  (`get_branch_head_sha`). Query results are honestly *as-of the watermark* — expose
+  `indexed_commit` in `kb_query`/`search_knowledge` responses so agents can see
+  staleness themselves; reads-of-truth always hit files (org-roam has shipped this exact
+  posture since 2020).
+- **Triggers**: the loop's post-merge hook — concrete call site `_advance_project_loop`
+  directly after `merge_loop_job_branch` returns `merged` (`orchestrator/main.py:10095`,
+  a `vector_db` handle already in scope there for TTL decrement); job-start catch-up
+  check (SHA compare before the agent reads); a leader-gated periodic sweeper (the
+  `run_when_leader` + tick shape of `stale_verification_sweeper.py`). A Gitea push
+  webhook would be entirely new plumbing (no `create_hook` client support, no receiver
+  endpoint exists anywhere) — defer it; the three triggers above cover every write path
+  we control, and human out-of-band pushes are caught by the sweeper.
+- **Force-push / history rewrite / pipeline change**: watermark invalid → full rebuild —
+  safe because the index is disposable (`rebuild_from_notes`,
+  `knowledge_store.py:559-613`, is the existing full-rebuild primitive; re-point its
+  source from Neo4j to the git tree). Ship an operator-facing **`kb reindex --full`**
+  escape hatch in v1 — GitLab's identical watermark design needed exactly this in
+  production, and their troubleshooting docs show it gets used.
 - **Interrupted reindex self-heals**: per-row `blob_sha` makes re-runs skip already-current
   rows; the watermark only advances at the end.
+
+### 5.1 Index internals (slice-3 spec, research-refined)
+
+- **Chunk-granular rows**: a note-level row (`kb_id`, `id`, `path`, `blob_sha`, full
+  frontmatter columns) plus chunk rows (`note_row`, `chunk_ix`, `heading_path`,
+  `embedding`, `embedding_version`). Heading-aware splitting at a ~400–512-token target,
+  merging sibling sections up to target, 10–15 % overlap only when forced to split
+  mid-section; short notes stay single-chunk naturally — the common case, and the
+  correct outcome. Semantic chunking benchmarks *worse* than structural; skip it.
+  Anthropic-style contextual retrieval: skip for v1 (notes are short and self-titled;
+  revisit as opt-in for the >1k-token minority).
+- **Embed text = breadcrumb + chunk**: prepend title, `type`, tags, and the heading path
+  as natural text (never raw YAML) — the highest-ROI cheap trick in the 2025-26
+  literature (15–25-pt QA-accuracy gains reported; Khoj ships exactly this).
+- **`embedding_version` per embedded row from day one** (model id + dims + chunker
+  version); retrieval filters `WHERE embedding_version = current`. Mixed-model vectors
+  cause silent "index drift" — great results on fresh rows, garbage on stale ones, no
+  error anywhere. No blue-green machinery needed: the index is disposable, so model
+  migration = bump version → per-KB rebuild → the filter flips per KB atomically. A full
+  10⁵-note rebuild costs $0.50–$3.25 in embeddings — rebuild-on-doubt is economically
+  free. Batch embedding API for full rebuilds, synchronous calls for incrementals (wire
+  the existing-but-unused `embed_batch`, `embedding_service.py:146` — today's upsert
+  embeds one call per note).
+- **Retrieval stack**: reuse `knowledge_hybrid_search`
+  (`vector_schema_current.sql:147-222` — RRF over dense halfvec + tsvector + recency,
+  weights 0.6/0.3/0.1) with `kb_id` threading; `rrf_k` 50→60 (the literature standard)
+  is a tunable, not a rewrite. Plain tsvector for the sparse arm — SPLADE needs GPU
+  inference for inconsistent gains; if lexical quality ever disappoints, ParadeDB
+  `pg_search` (real BM25) is a drop-in index swap that changes no schema. pgvector HNSW
+  at stock `m=16, ef_construction=64` — comfortable to ~5M vectors; don't tune before
+  measuring. `search_knowledge` over-fetches ~50 fused candidates and returns 15–20,
+  with a no-op reranker slot between fusion and return (a hosted/local reranker wires in
+  later as a `rerank: true` precision mode — the single biggest post-hybrid quality
+  lever, but agents can grep-and-read after search, so it's phase-2).
+- **Schema delta** (migration `vector/0008_*`, following the `0006`/`0007` ALTER
+  precedents): `knowledge_index` gains `kb_id`, `path` (UNIQUE `(kb_id, path)`),
+  `blob_sha`, `superseded_by` + `invalidated_at` (**required, not optional** — the
+  supersede edge lives only in Neo4j today, so retiring the Neo4j write path without
+  this column loses the chain), `embedding_version`; plus the chunk table and
+  `kb_index_watermark(kb_id PK, repo_name, branch, indexed_commit, pipeline_version,
+  updated_at)`. Dead links are stored as rows (target = NULL) so `kb_lint`'s dead-link
+  check is a query, not a re-scan. Preserve the default search filter `status='active'`
+  exactly as-is across the cutover (it is *stricter* than "not superseded" — it also
+  excludes resolved/archived).
 
 ## 6. Note identity — the one deliberate OKF deviation
 
@@ -195,6 +283,30 @@ neither path nor id.
 This is frontmatter-only (OKF tolerates extra fields), and it is the price of making
 supersede/provenance chains survive reorganization.
 
+Field validation (2026-07-03): this deviation is the **most strongly validated choice in
+the design**. org-roam v2 made stable ids mandatory and *deleted net code* (−3k LOC —
+the path-maintenance machinery disappeared); Dendron ran frontmatter `id` in production
+for years; and the OKF spec itself has **no rename/alias mechanism at all** (its only
+mitigation is "consumers MUST tolerate broken links"), so the id fills a real hole.
+Obsidian's no-id stance works only because one app monopolizes writes and mass-rewrites
+links on rename — false in any multi-writer vault. Three rules the prior art adds:
+
+- **Resolution order**: exact path → id mapping → basename shortest-path. A link that
+  resolves by none is *dead*; one that basename-matches more than one note is
+  *ambiguous* (Foam's distinction) — two separate lint states. Humans editing in
+  Obsidian will get links auto-rewritten on rename; agents' links survive via the id —
+  the resolver must accept both worlds.
+- **Rename is a tool verb** (`kb_update` with `move`): keep the id, update the mapping,
+  refuse destination collisions (Dendron's refactor semantics). Human renames arrive as
+  out-of-band edits; the gardener's `doctor --fix` pass backfills ids on human-created
+  notes from the path slug.
+- **Auto-maintained frontmatter writes only on material change** (Dendron's scar:
+  auto-`updated` timestamps dirtied git on every open-and-save, causing merge conflicts
+  in shared vaults until patched in v0.48). Applies directly to `modified`, TTL
+  counters, and `last_verified_cycle` — a gardener that stamps rows it didn't materially
+  change floods the tree-diff reindex with no-op work and generates conflicts against
+  human editors.
+
 ## 7. Toolset
 
 Signature-stable evolution of the existing tools where possible (the substrate doc's
@@ -202,14 +314,16 @@ Signature-stable evolution of the existing tools where possible (the substrate d
 
 | Tool | Op | Notes |
 |---|---|---|
-| `kb_write` | write | Creates a note: validates frontmatter (OKF `type` required), enforces id uniqueness, resolves links, writes `.md` + updates index + embedding in one step, commits. |
-| `kb_update` | write | Edit + supersede semantics (`status: superseded`, `superseded_by`), bi-temporal columns in the index if wanted (RecallStore parity). |
-| `search_knowledge` | query | Semantic + lexical over the index (pgvector), status-filtered by default. Unchanged signature. |
+| `kb_write` | write | Creates a note: validates frontmatter (OKF `type` required; **`description` required** — one sentence; the whole progressive-disclosure economy of index files runs on it, and 203/417 of our own `docs/` files prove backfilling is what never happens), enforces id uniqueness, resolves links, writes `.md` + updates index + embedding in one step, commits. Emits **standard markdown links, not wikilinks** — OKF's emergent graph is body markdown links only; wikilinks are accepted on read (humans will write them) and normalized by lint. Stamps **provenance frontmatter** (`author` role, `job`, `branch`) — squash-merge erases git authorship, so provenance must live in the note itself. |
+| `kb_update` | write | Edit + supersede semantics (`status: superseded`, `superseded_by`, **`invalidated_at`** — Graphiti-style "when it stopped being true", matching RecallStore's existing `valid_to`); supersession is also mirrored as a body link ("Superseded by [x](x.md)") so the chain is a graph edge for standard OKF consumers, not just our index. `move` = the rename verb (§6). |
+| `search_knowledge` | query | Hybrid over the index — the existing RRF function with `kb_id` scoping (§5.1: over-fetch ~50 → return 15–20, empty reranker slot, response carries `indexed_commit`, optional 1-hop link expansion — "GraphRAG-lite" via linked-note titles/snippets). Signature unchanged. |
 | `kb_query` | query | Structured: by type/tag/status, backlinks, unanswered questions, contradictions — the Appendix B SQL surface. |
-| `kb_lint` | maintenance | Orphans, dead links, missing/invalid frontmatter, duplicate-id and near-duplicate-content candidates. Gardener/curator-facing; also runnable as a merge gate. |
-| `kb_index` | maintenance | Regenerate hierarchical `index.md` per directory (OKF progressive disclosure — fixes the flat-index budget blowout seen in both `docs/` and MEMORY.md). |
+| `kb_lint` | maintenance | The 13-rule starter set the ecosystems converged on (obsidian-linter/Foam/lychee — §12). **Error tier**: YAML validity + required keys (`id`, `type`, `description`); id uniqueness/format; dead links; ambiguous links; property-type violations against a KB-level type manifest (Obsidian types.json pattern — types declared per key KB-wide); supersede-chain integrity (target exists, not itself superseded). **Warning tier**: orphans (index/MOC notes excluded); duplicate keys/array values; heading structure; tag-taxonomy drift; near-duplicate content candidates (embedding-backed — our genuine addition); stale TTL/`last_verified_cycle`; dead external URLs (scheduled sweep, network-bound). Blocking gate for **agent** writes only — never for human merges (every ecosystem that hard-gated prose shed users). |
+| `kb_index` | maintenance | Regenerate hierarchical `index.md` per directory in **OKF §6 shape** (no frontmatter — `index.md` is a reserved *filename*, which is also how generated indexes are excluded from embedding/orphan logic; heading-grouped `[Title](url) - description` bullets sourced from target frontmatter; bundle-root index carries `okf_version: "0.1"`), under a hard budget (~200 lines / 25 KB per file — Claude Code's memory-index budget). Human-authored heading sections survive regeneration (Zoottelkeeper's protected-sections pattern); never touches a file that isn't an `index.md`. |
 
-Reads need no tools: the KB is a cloned directory in the workspace.
+Reads need no tools: the KB is a cloned directory in the workspace. (Optional gardener
+verb, cheap: emit OKF `log.md` from `git log main` — spec-native, newest-first change
+history that survives shallow clones.)
 
 ## 8. Tiers — one toolset, one knob
 
@@ -229,8 +343,10 @@ exactly the split-brain this design exists to kill.
 ## 9. Migration & compatibility
 
 1. **Export once**: `get_all_notes_for_export` (the ~half-built Obsidian export) becomes
-   the one-time Neo4j → OKF migration per project: wikilinks stay, add `type:` + `id:`
-   frontmatter, write into the project's KB repo, initial index build.
+   the one-time Neo4j → OKF migration per project: relationship edges become **standard
+   markdown links** (not wikilinks — corrected 2026-07-03, see §7: OKF's emergent graph
+   is body markdown links only), add `type:` + `id:` + `description` frontmatter, write
+   into the project's KB repo, initial index build.
 2. **Tool cutover**: `kb_write`/`search_knowledge` signatures survive; the backend swaps.
    The curator gains the maintenance verbs.
 3. **RecallStore semantics carry over**: supersede/TTL/verification state lives in
@@ -268,25 +384,61 @@ exactly the split-brain this design exists to kill.
 - **Scale ceiling**: files + O(changed) reindex comfortably cover org-wiki scale (10⁴–10⁵
   notes). This is not a planet-scale design and doesn't try to be.
 - **Embedding cost** is the only real reindex cost and is gated on content-blob change.
+- **Conflicts are loud, in-band**: on merge conflict or lint-detected out-of-band
+  damage, the gardener writes a visible artifact into the KB itself (a `type: conflict`
+  note / gardener report), not just a log line — the ecosystem lesson (Obsidian Sync's
+  top complaint) is that users forgive automated merging but not *silent* merging.
+- **Laundering rule** (TMA-NM, arXiv:2606.24322): trusted writers must not restate
+  untrusted claims as fact — write-time origin binding is provably necessary; content
+  inspection isn't enough. Retros and gardener notes *cite* agent claims
+  (job/branch/commit) rather than repeating them plainly; the `merge_status`-backed
+  retro format already mostly does this — it's now a rule for every
+  orchestrator-written note.
 
 ## 11. Slices (independently shippable — reordered 2026-07-03 after v2 shipped)
 
 0. **Loop delivery pipeline** — DONE via [[loop_repo_compounding_v2]]: per-job branches,
    squash-merge to `main`, post-merge hook point, `retros/` as the first OKF note family.
 1. **Dual-write** (the strangler-fig first step): `kb_write`/`kb_update` additionally
-   materialize each note as `knowledge/<type>/<slug>.md` in the workspace — **via the
-   workspace backend, never local I/O** (files live on the remote workspace pod/VM; the
-   citation engine's stub-mode bug is the cautionary tale). The DB stays the retrieval
-   substrate; the v2 merge delivers the files to `main`. Agent-side only, no schema, no
-   orchestrator change. An overnight loop run is the natural E2E.
-2. **OKF lint/gardener toolset + curator-as-proper-auxiliary** — `kb_lint`/`kb_index`;
-   useful against today's `repository` datasources (point it at a vault — or this repo's
-   `docs/`). Includes the curator refactor (§3 note): verdict-gated writes mirroring the
-   memory ingestion pipeline, gardener verbs as its tool surface, `src/services/knowledge/`
-   package shape.
-3. **Postgres index + query tools + retrieval cutover** — Appendix B schema +
-   watermark/incremental sync; `search_knowledge` backend swap; DB write path retired
-   (files become canonical, completing the strangler fig).
+   materialize each note as **flat `knowledge/<slug>.md`** — flat resolved 2026-07-03:
+   link targets become derivable from the slug alone (markdown links need no index
+   lookup in a slice with no index), a type change never forces a file move, and the
+   prior art says navigation belongs to index/MOC notes, not folder taxonomies
+   (`type` stays frontmatter + a `kb_index` grouping). Written **via the workspace
+   backend, never local I/O** — files live on the remote workspace pod/VM; the citation
+   engine's stub-mode bug is the cautionary tale, and `kb_export`'s own local-`Path`
+   fallback (`knowledge_tools.py:788-792`) is the same bug (writes to the agent host,
+   invisible to the pod's clone — fix it while factoring). Build notes (code-audited):
+   - Factor `kb_export`'s serializer body (`knowledge_tools.py:742-783`) into a pure
+     `_render_note_md(note) -> str`; upgrade it per §7 — markdown links, required
+     `description`, provenance fields (`author`/`job`/`branch`).
+   - Callers have the data in hand: `kb_write`'s `links` arg is already
+     `[{type, target}]` (link text = slug; no extra query); `kb_update` re-reads the
+     full note incl. relationships with titles at `:300`.
+   - Guard on `context.has_git()` (stricter than `has_workspace()`), **skip + log** —
+     persistent sessions, repo-less projects, and lite tiers keep their DB write; never
+     fall back to local I/O. Failure is non-fatal, like the existing pgvector block.
+   - Delivery is free: phase/todo/completion commits `git add -A`
+     (`git_manager.py:205`), and neither `.gitignore` floor lists `knowledge/`.
+   - Tests mirror `tests/test_knowledge_tools.py` `TestKbExport` (serializer output) +
+     the pgvector non-fatality pattern (`:197-212`).
+   The DB stays the retrieval substrate; the v2 merge delivers the files to `main`.
+   Agent-side only, no schema, no orchestrator change. An overnight loop run is the
+   natural E2E.
+2. **OKF lint/gardener toolset + curator-as-proper-auxiliary** — `kb_lint`/`kb_index`
+   (rule set + index shape now specified in §7); useful against today's `repository`
+   datasources (point it at a vault — or this repo's `docs/`). Includes the curator
+   refactor (§3 note: chain-mode verdict gate with content-hash pre-filter, gardener
+   verbs, `src/services/knowledge/` mirroring `src/services/memory/`'s
+   manager/types/protocols/registry/ingestion/plugins layout — the full
+   memory→knowledge mirror map with target filenames is in the 2026-07-03 code audit;
+   `KnowledgeStore` needs a `find_similar_many` analog for the neighbour fetch).
+3. **Postgres index + query tools + retrieval cutover** — the §5/§5.1 spec: tree-diff
+   watermark reindex, chunk rows, `embedding_version` + `pipeline_version`, migration
+   `vector/0008`; `search_knowledge` backend swap (the RRF functions gain `kb_id`);
+   post-merge + job-start + leader-gated-sweeper triggers; `kb reindex --full`. DB write
+   path retired (files become canonical, completing the strangler fig). **This slice is
+   also what makes the existing `databases.neo4j.enabled` toggle real** (§9.4).
 4. **KB datasource type + auto-attach as project KB** — the unification; Neo4j export
    migration for pre-existing notes. Mechanics (audited 2026-07-03 — most of the
    substrate is already live):
@@ -300,7 +452,22 @@ exactly the split-brain this design exists to kill.
      `is_global: true`. No new sharing machinery.
    - **Lite/backend tiers**: repository datasources currently *reject* shell-less
      workspace backends; a KB datasource should instead degrade to query-only
-     (index-backed `search_knowledge`/`kb_query`, no clone, no filesystem reads).
+     (index-backed `search_knowledge`/`kb_query`, no clone, no filesystem reads). Four
+     enforcement sites, all keyed on `type=="repository"` (`main.py:2238, 2605, 6410,
+     6479`) — `kb` must branch there, not reuse `_repository_datasource_names` naively.
+   - **Schema gap (the one real migration)**: `datasources` has no config/extra column —
+     add a nullable `config JSONB` for path-prefix / OKF flag / tier. Do NOT overload
+     `credentials` (withheld for managed types), and keep `kb` OUT of `managed_types`
+     (`main.py:12480`) or the clone loses its auth.
+   - **Auto-attach hook**: `_ensure_project_cloud_resources` already auto-provisions a
+     per-project WebDAV datasource at project creation — the project KB follows that
+     precedent (create `type="kb"` pointing at the jobs-repo URL, prefix `knowledge/`,
+     then `link_datasource_to_project`). Per-project write policy lives on the existing
+     `project_datasources.read_only`.
+   - Cockpit touchpoints: type option/optgroup + filter chip
+     (`datasource-list.component.ts:136-150, 1345-1356`), the `=== 'repository'`
+     form-field conditionals (URL/branch/auth reused), icon/colour maps, and the
+     lite-disable exemption in `datasources-group.component.ts`.
 
 ## Open questions
 
@@ -318,12 +485,64 @@ exactly the split-brain this design exists to kill.
   is *content* on the coordination repo, not a coupling to it.
 - **Merge gate** — RESOLVED: merge-then-flag, matching v2's implemented merge-failure
   posture (flag + continue; loss visible, never silent). The gardener sweeps.
-- **Embedding locality**: index/embeddings per-KB or shared pgvector tables with
-  `kb_id` scoping (leaning shared tables, consistent with current pgvector usage).
+- **Embedding locality** — RESOLVED 2026-07-03: shared pgvector tables with `kb_id`
+  scoping (the code audit confirms it's consistent with current usage; the RRF
+  functions take the scope as a parameter).
 - **Note volume**: dual-write makes today's KB noise (F33/F38 — 374 notes in one run-6
   night) *visible* as files on `main`. That's a feature (you can finally see and prune
   it), but expect a fat `knowledge/` tree until the gardener (slice 2) ships. Loop jobs
   run bare (no curator), so loop-night volume is agent-authored only.
+
+## 12. Research basis (2026-07-03)
+
+Six-agent sweep (three codebase audits, three web); findings are folded into the
+sections above. The load-bearing sources:
+
+- **OKF is Google Cloud's spec** — v0.1 Draft, published 2026-06-12, Apache-2.0
+  (github.com/GoogleCloudPlatform/knowledge-catalog, `okf/SPEC.md`; lineage from
+  Karpathy's LLM-wiki gist). One required frontmatter field (`type`, deliberately
+  free-form), and an explicit extension clause ("consumers SHOULD NOT reject documents
+  with unrecognized fields") — every extra field we add is spec-legal. The spec has
+  **no rename/alias mechanism**, so our frontmatter `id` fills a real hole with private
+  semantics. Binding consequences adopted here: body links are **standard markdown
+  links** (the emergent graph — wikilinks appear nowhere in the spec), `index.md` has a
+  mandated shape (no frontmatter; heading-grouped `[Title](url) - description` bullets),
+  and the *reserved* things are the filenames `index.md`/`log.md` (the optional fields
+  are "recommended"). Ecosystem: reference agent + visualizer in-repo, third-party
+  validator (okf.site/validator) and conformance suite.
+- **The architecture is org-roam v2** (mandatory stable ids + a disposable SQLite cache
+  over plain files, stable since 2021; the id move *deleted* ~3k net LOC —
+  blog.jethro.dev/posts/org_roam_v2) **and Khoj** (heading-aware chunks + pgvector +
+  content-hash gating — a production near-isomorph of §5.1). **Logseq's retreat from
+  files-canonical** was driven by block-granular real-time collaboration — orthogonal to
+  note-files + tool-mediated writes + git-as-sync; their still-unfinished bidirectional
+  DB⇄MD sync promise is evidence *for* §4's ban, not against files-canonical.
+  SilverBullet thrives on the same invariant we adopted ("the truth remains in the
+  markdown… flushed at any time and rebuilt").
+- **Watermark indexing is GitLab's shipped design** (per-project last-commit SHA +
+  incremental diff + the escape-hatch full reindex their troubleshooting docs show gets
+  used); blob-SHA dedup is GitHub Blackbird's; force-push→rebuild *and*
+  rebuild-on-config-change are Zoekt's. Dataview→Datacore is the counterexample we
+  avoid (non-persistent index → startup rescans + stale renders).
+- **Neo4j-dormant matches the 2026 GraphRAG consensus**: graph structure pays only on
+  multi-hop/relational query classes (suggested adoption bar: >15 % of traffic), and our
+  link graph is *explicit* — we skip GraphRAG's dominant cost (LLM entity extraction)
+  entirely. "Agent follows backlinks" is the literature's recommended low-commitment
+  alternative, which the 1-hop link table + a file-reading agent already implements.
+- **Agent-memory field (2026)**: Letta's MemFS (git-backed markdown memory projection)
+  is convergent evolution; **mem0's April-2026 retreat** from verdict-gating to add-only
+  (docs.mem0.ai/migration/oss-v2-to-v3) is the economics caveat that doesn't apply at
+  curated-note volume; Zep/Graphiti's bi-temporal edge invalidation
+  (arXiv:2501.13956) is where `invalidated_at` comes from; TMA-NM (arXiv:2606.24322)
+  supplies §10's laundering rule. **Nobody in the field combines verdict-gated ingestion
+  with a markdown-git-canonical store — that combination is ours.**
+- **Portability verdict**: markdown+frontmatter is the consensus for knowledge
+  interchange (vendor memory APIs are the lock-in anti-pattern — mem0 export is a lossy
+  JSON summary; Zep's migration guide is "re-ingest raw messages"). The checklist our
+  format already satisfies: CommonMark links by path, OKF-recommended fields, stable
+  ids, in-note provenance, relative-path attachments, §6-shaped indexes, **no embeddings
+  in the repo** (they never travel; importers re-embed — the disposable-index principle
+  guarantees this).
 
 ## Related
 
