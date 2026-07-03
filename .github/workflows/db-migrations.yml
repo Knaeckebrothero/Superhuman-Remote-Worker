@@ -19,12 +19,16 @@ on:
     paths:
       - 'orchestrator/database/migrations/**.sql'
       - 'orchestrator/database/migrate.py'
+      - 'orchestrator/database/*_current.sql'
+      - 'scripts/schema-snapshot.sh'
       - '.github/workflows/db-migrations.yml'
       - '.squawk.toml'
   pull_request:
     paths:
       - 'orchestrator/database/migrations/**.sql'
       - 'orchestrator/database/migrate.py'
+      - 'orchestrator/database/*_current.sql'
+      - 'scripts/schema-snapshot.sh'
       - '.github/workflows/db-migrations.yml'
       - '.squawk.toml'
   workflow_dispatch:
@@ -83,16 +87,19 @@ jobs:
           fail-on-violations: true
 
   dry-run:
-    name: dry-run on pgvector/pgvector:pg16
+    name: dry-run on pgvector/pgvector:pg15
     runs-on: ubuntu-latest
     timeout-minutes: 10
     services:
-      # pgvector/pgvector:pg16 is the canonical "Postgres 16 + pgvector"
-      # build. The vector DB's 0001_initial.sql declares vector(4096) on
-      # source_embeddings, so the stock postgres:16 image fails on
-      # CREATE EXTENSION vector. This image bundles the extension.
+      # pgvector/pgvector:pg15 matches the PROD major for the app + vector DBs
+      # (helm/values.yaml pins both to pg15). pg_dump/DDL behaviour is
+      # major-sensitive, so the gate must run the same major prod does. The
+      # vector DB's 0001_initial.sql declares vector(4096) on source_embeddings,
+      # so the stock postgres:15 image fails on CREATE EXTENSION vector; this
+      # image bundles the extension. (The audit DB is postgres:16 in prod and
+      # is covered by the `artifact` job below, which pins each family's major.)
       postgres:
-        image: pgvector/pgvector:pg16
+        image: pgvector/pgvector:pg15
         env:
           POSTGRES_PASSWORD: ci
           POSTGRES_USER: ci
@@ -140,6 +147,45 @@ jobs:
           python -m database.migrate \
             --dir database/migrations/vector \
             --dry-run
+
+  artifact:
+    # The keystone drift gate (HF-1): regenerate the canonical *_current.sql
+    # schema artifacts by replaying every migration from zero and fail if they
+    # differ from what's committed. Unlike `dry-run`, this does a REAL apply
+    # (so the .notx.sql CONCURRENTLY files execute), covers ALL THREE families
+    # including audit (net-new — no audit dry-run exists), and pins each
+    # family's prod major. See docs/features/database_roadmap.md Phase 2.
+    name: schema artifacts fresh
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      # The migration runner (driven from the host by schema-snapshot.sh) needs
+      # asyncpg; cryptography comes in transitively via security.crypto (AESGCM)
+      # when database/__init__.py loads postgres.py.
+      - run: pip install --quiet asyncpg cryptography
+      # Docker is preinstalled on ubuntu-latest; the script auto-detects it and
+      # spins up one throwaway container per family (pgvector:pg15 x2,
+      # postgres:16), migrates from zero, and dumps inside the container.
+      - name: Regenerate schema artifacts
+        run: scripts/schema-snapshot.sh
+      # Fail if regeneration changed anything: a migration altered the schema
+      # without the author re-running the snapshot, or an artifact was
+      # hand-edited (regeneration overwrites hand edits -> diff). `git add -A`
+      # first so a brand-new artifact (untracked) is caught too, not just edits.
+      - name: Fail on stale or hand-edited artifacts
+        run: |
+          git add -A orchestrator/database/*_current.sql
+          if git diff --cached --quiet -- orchestrator/database/*_current.sql; then
+            echo "Schema artifacts are up to date."
+          else
+            echo "::error::Schema artifacts are stale or hand-edited. Regenerate with: scripts/schema-snapshot.sh && git add -A orchestrator/database/*_current.sql, then commit."
+            git --no-pager diff --cached -- orchestrator/database/*_current.sql
+            exit 1
+          fi
 
   uniqueness:
     name: unique NNNN_ prefixes
