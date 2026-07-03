@@ -20,6 +20,18 @@ tags:
 llm:
   reasoning_level: high
 
+# Subagent delegation — light in-process subagents for parallel EXPLORATION,
+# research, and prototyping/experiments. They inherit the full toolset (including
+# writes) so they can run tests/spikes; the guardrail that the *production*
+# implementation stays single-threaded and yours is by PROMPT, not tool-stripping
+# (allow_writes stays true — we monitor rather than lock down). Reader MODEL comes
+# from the llm.subagent tier (falls back to llm.tactical; per-job override via
+# config_override.llm.subagent).
+delegation:
+  mode: light
+  light:
+    allow_writes: true
+
 workspace:
   structure:
     - archive/
@@ -50,7 +62,20 @@ tools:
     - git_diff
     - git_status
     - git_tags
+  # Websearch — a coder must be able to look things up (docs, APIs, error
+  # messages). browser_direct (step-by-step Chromium) is inherited from defaults.
+  research:
+    - web_search
+    - extract_webpage
+    - crawl_website
+    - map_website
+    - browse_website
+    - download_from_website
+    - research_topic
+  # Light subagent delegation via spawn_subagent (replaces the inherited heavy
+  # delegate_work / resume_delegation_child grant from defaults).
+  delegation:
+    - spawn_subagent
   # Disable unused tool categories
-  research: []
   citation: []
   graph: []
