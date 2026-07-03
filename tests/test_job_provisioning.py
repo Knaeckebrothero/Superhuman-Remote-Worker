@@ -458,9 +458,7 @@ class TestProvisionJobRepo:
         g.change_files.assert_awaited_once()  # floor seeded for analysis too
 
     @pytest.mark.asyncio
-    async def test_non_loop_project_job_never_touches_floor(
-        self, patched_seed
-    ) -> None:
+    async def test_non_loop_project_job_never_touches_floor(self, patched_seed) -> None:
         """Default (loop_floor=False): ordinary project jobs branch as before
         and never write `main`'s .gitignore."""
         g = _make_gitea()
