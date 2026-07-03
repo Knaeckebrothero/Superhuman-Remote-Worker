@@ -67,7 +67,14 @@ messages on an uncached open) and switching the display `ORDER BY` to the
 `(thread_id, seq)` keyset (marginal on a bounded single-thread Sort; `seq` is
 only heap-approximate for pre-0023 rows).
 
-Remaining work is Phases 6–7. The research sweep's four premise corrections
+Phase 6 (usage rollup + no-deletion policy) is done on `develop` — D-1
+(`8f1470e7`) builds the `usage_daily` mirror + `rollup_state` watermark and the
+cross-DB rollup that `/api/usage` now reads (closed days from the rollup, raw for
+the open tail); D-2 (`851b6b7c`) makes `retire_partitions` a permanent policy
+no-op, adds per-parent size reporting, and sweeps the phantom `usage_daily` /
+`quota_limits` and stale `usage_rates` framing out of the docs.
+
+Remaining work is Phase 7. The research sweep's four premise corrections
 still shape them:
 
 1. **HF-3 undercounted**: 13 racy `jobs.context` writers, not 8 — five raw
@@ -93,7 +100,7 @@ still shape them:
 | 3 | D-5 Mongo code deletion | ~1–2 days | QW-4 soak ✅ (done, >1 week) | ✅ done `f1b06621` |
 | 4 | HF-3 atomic context writes (correctness) | ~1–2 days | — | ✅ done `c09cc73c` — 13 racy writers atomic; `update_job_context` deleted; 21 real-PG tests |
 | 5 | Perf batch — HF-5, HF-4, HF-6, HF-7, HF-2 | ~3–4 days | — (HF-2 last) | ✅ done — HF-5 `f6e283cd`, HF-4 `f2a83b1f`, HF-6 `408ceb83`, HF-7 `ff6d5068`, HF-2 `3a916848`; 2 HF-7 sub-parts deferred (newest-N default + seq keyset — need cockpit coordination / marginal) |
-| 6 | Usage rollup + no-deletion policy — D-1 build, D-2 closed by policy | ~1–2 days | — (decided 2026-07-02) | todo |
+| 6 | Usage rollup + no-deletion policy — D-1 build, D-2 closed by policy | ~1–2 days | — (decided 2026-07-02) | ✅ done — D-1 `8f1470e7` (usage_daily + rollup_state + usage_rollup.py + 3 endpoints), D-2 `851b6b7c` (retire=policy no-op, partition size, phantom/usage_rates doc sweep) |
 | 7 | Unification, direction A (one message model) | L (grew: 0019 is unbuilt) | Phases 1–5; G4 for direction B | gated |
 
 Phases 1–4 ≈ one focused week; 1–6 ≈ two and a half. Phases 2 and 3 are
@@ -740,6 +747,74 @@ window including a backdated month; `/api/usage` serves the rollup for
 closed days and raw for today; `retire_partitions` carries the policy
 docstring; `partition_status` reports per-parent sizes; architecture doc
 contains no phantom-table claims and no unenforced retention promises.
+
+**✅ DONE — develop 2026-07-03, two commits (D-1 `8f1470e7`, D-2 `851b6b7c`;
+line refs re-verified at build time).**
+
+- **D-1 rollup (`8f1470e7`):** `migrations/app/0047` creates `usage_daily`
+  `(day, user_id, project_id, category, resource, unit → quantity, cost_usd,
+  events)` + a `rollup_state` watermark row, both app-DB. The dims are the
+  superset that lets all three endpoints project from one table; `user_id`/
+  `project_id` are nullable with a **`NULLS NOT DISTINCT` unique index** so the
+  unattributed (fleet-key) bucket upserts in place instead of inserting a fresh
+  NULL-dim duplicate every pass. `services/usage_rollup.py::UsageRollup.run_pass`
+  aggregates a trailing window of the auditdb `usage_events` (partition-pruned)
+  and **full-replace upserts + advances the watermark in one app-DB
+  transaction** — the cross-DB exactly-once trick (audit rows are read, never
+  locked). The three serving methods split `[from_ts, to_ts)` into whole closed
+  days (read from `usage_daily`) + raw partials, so the merged result equals a
+  pure-raw aggregation. `main.py` builds it beside the ledger, runs a
+  **leader-only** ~6h loop, and retargets the 3 `/api/usage` endpoints through
+  it. Real-PG tests prove reconcile-over-a-backdated-month, watermark advance,
+  idempotency, late-arrival catch-up, NULL-dim single-bucket, and serving
+  equivalence vs raw (incl. the mid-day low-partial + `ref_id` bypass); 23 pass.
+- **Three deviations from this sketch (all strictly more correct / simpler):**
+  1. **Always re-close a 7-day trailing window** each pass instead of a "1-day
+     overlap + a separate weekly wide catch-up." Re-aggregating 7 days is
+     negligible under partition pruning, so one mechanism subsumes both the
+     boundary-day overlap and the late-arrival net; the `trailing_days` param
+     still allows a wide manual catch-up (tested to 90 days).
+  2. **`usage_daily` holds only *closed* days**, not "through today." Today is
+     always served raw, so writing a throwaway partial-today row buys nothing;
+     the closed-only invariant makes `usage_daily` reconcile with raw at every
+     instant (the acceptance test).
+  3. **The serving split serves the low-boundary partial day raw too**, not just
+     "today." A `days=30` call gives a mid-day `from_ts`, and a day-granular
+     rollup can't sub-divide that first day — so the split reads the partial
+     `[from_ts, next-midnight)` from the raw ledger, whole closed days from the
+     rollup, and the open tail from raw. `_split_window` is unit-tested for every
+     boundary case.
+- **D-2 policy + sweep (`851b6b7c`):** `retire_partitions` is a **permanent
+  no-op** carrying the manual DETACH-CONCURRENTLY export-first recipe (returns
+  `{"policy": "no-auto-deletion"}`), the module docstring + `maintenance_pass` +
+  the `PARENTS` comments restate the policy (day values are reference-only), and
+  the `usage_events → usage_daily` watermark fence is kept for a future SaaS-era
+  implementer. `partition_status` gains per-parent `total_bytes`
+  (`pg_total_relation_size` over the whole tree). `usage_ledger.py`'s
+  `usage_rates` docstrings corrected (LLM rates auto-seeded from OpenRouter by
+  `llm_pricing_sync_loop`, compute unseeded). `database_architecture.md`: the
+  phantom `quota_limits` dropped from the store inventory (marked planned —
+  rate-limiting v2), `usage_daily`/`rollup_state` marked built, and the
+  90/90/365 + "retention-dropped" / "partition-drop retention" claims replaced
+  with the no-auto-deletion policy. `observability_and_quotas.md`: rollup marked
+  built + watermarked, `usage_rates` auto-seeded, `quota_limits` planned-not-
+  built, per-job cost pinned to the raw ledger by `ref_id` (not a rollup dim),
+  retention promises removed.
+- **Scope notes:** (a) The **frozen audit migration headers** (`audit/0002`,
+  `audit/0001`) are NOT edited — they are checksum-guarded (editing trips the
+  runner) and the Phase 2a drift gate forbids hand-editing the generated
+  artifact, so the policy lives in `audit_partitions.py` + the design docs
+  instead (same constraint Phase 3 hit for the Mongo `COMMENT`s). The
+  `audit/0002` `usage_daily` mentions are now *accurate* anyway (the table
+  exists). (b) `docs/done/global_expert_management.md`'s `quota_limits` mentions
+  are left as-is — they are accurate design cross-refs to the now-corrected
+  authority, not existence claims. (c) `observability_and_quotas.md`'s
+  forward-looking slice-plan bullets were left as intent; only the authoritative
+  store-inventory table + as-built notes were corrected. **`quota_limits` stays
+  unbuilt** — it is the rate-limiting-v2 concern, out of Phase 6 scope. Verified:
+  23 rollup + 48 audit-store tests green, `ruff` clean, `schema-snapshot.sh
+  --check app` green (0047 → `usage_daily`/`rollup_state` only), `orchestrator.main`
+  imports. **Next = Phase 7 (unification; 0019 unbuilt).**
 
 ## Phase 7 — Unification track (direction A; B stays gated)
 
