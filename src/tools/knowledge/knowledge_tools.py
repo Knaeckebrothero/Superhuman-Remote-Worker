@@ -22,6 +22,13 @@ from typing import Any, Dict, List, Optional
 from langchain_core.tools import tool
 
 from ..context import ToolContext
+from .gardener import (
+    is_reserved,
+    lint_kb,
+    note_title,
+    parse_note_md,
+    render_index_md,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -107,9 +114,26 @@ KNOWLEDGE_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
     "kb_export": {
         "module": "knowledge.knowledge_tools",
         "function": "kb_export",
-        "description": "Export knowledge base as Obsidian-compatible markdown files",
+        "description": "Export knowledge base as OKF/markdown files",
         "category": "knowledge",
-        "short_description": "Export knowledge base to Obsidian .md files.",
+        "short_description": "Export knowledge base to OKF .md files.",
+        "phases": ["strategic", "tactical"],
+    },
+    # Maintenance / gardener (slice 2)
+    "kb_lint": {
+        "module": "knowledge.knowledge_tools",
+        "function": "kb_lint",
+        "description": "Lint an OKF knowledge base for structural/link/id issues",
+        "category": "knowledge",
+        "short_description": "Lint the knowledge base (frontmatter, links, ids).",
+        "phases": ["strategic", "tactical"],
+    },
+    "kb_index": {
+        "module": "knowledge.knowledge_tools",
+        "function": "kb_index",
+        "description": "Regenerate the OKF index.md for a knowledge base",
+        "category": "knowledge",
+        "short_description": "Regenerate index.md (grouped links by type).",
         "phases": ["strategic", "tactical"],
     },
 }
@@ -940,6 +964,105 @@ def create_kb_tools(context: ToolContext) -> List[Any]:
             return f"Error exporting knowledge base: {e}"
 
     # =========================================================================
+    # Maintenance / gardener tools (slice 2)
+    # =========================================================================
+
+    @tool
+    def kb_lint(path: str = "knowledge") -> str:
+        """Lint an OKF knowledge base for structural, id and link issues.
+
+        Reads every `*.md` note under `path` and checks frontmatter validity,
+        required keys (id/type/description), id format/uniqueness, dead and
+        broken-supersede links, orphans and missing titles. Read-only — returns
+        a report; it never edits notes. Point it at the project KB
+        (`knowledge/`), a repository datasource, or any markdown vault.
+
+        Args:
+            path: Directory to lint (default "knowledge").
+
+        Returns:
+            A markdown lint report (errors then warnings), or a status message.
+        """
+        if not context.has_workspace():
+            return "Error: kb_lint requires a workspace backend to read notes."
+        ws = context.workspace_manager
+        root = path.rstrip("/") or "knowledge"
+        try:
+            entries = ws.list_files(root, "*.md")
+        except Exception as e:
+            return f"Error listing `{root}/`: {e}"
+
+        notes: List[Dict[str, str]] = []
+        for rel in entries:
+            if rel.endswith("/"):
+                continue
+            try:
+                notes.append({"path": rel, "text": ws.read_file(rel)})
+            except Exception as e:
+                logger.warning(f"kb_lint: could not read {rel}: {e}")
+        if not notes:
+            return f"No markdown notes found under `{root}/`."
+        return lint_kb(notes).format_markdown()
+
+    @tool
+    def kb_index(path: str = "knowledge") -> str:
+        """Regenerate the OKF `index.md` for a knowledge base.
+
+        Reads every `*.md` note under `path`, groups them by `type`, and writes
+        a heading-grouped `[Title](slug.md) - description` index to
+        `<path>/index.md` (OKF §6 shape, no frontmatter). Content outside the
+        auto-generated markers is preserved, so human-authored sections survive.
+        Malformed and reserved files (index.md/log.md) are skipped.
+
+        Args:
+            path: Directory to index (default "knowledge").
+
+        Returns:
+            A status message naming the file written and note count.
+        """
+        if not context.has_workspace():
+            return "Error: kb_index requires a workspace backend."
+        ws = context.workspace_manager
+        root = path.rstrip("/") or "knowledge"
+        try:
+            entries = ws.list_files(root, "*.md")
+        except Exception as e:
+            return f"Error listing `{root}/`: {e}"
+
+        metas: List[Dict[str, Any]] = []
+        for rel in entries:
+            if rel.endswith("/") or is_reserved(rel):
+                continue
+            try:
+                fm, body = parse_note_md(ws.read_file(rel))
+            except Exception as e:
+                # Malformed YAML (ValueError) or an unreadable file — kb_lint
+                # surfaces the former; skip it for indexing either way.
+                logger.warning(f"kb_index: skipping {rel}: {e}")
+                continue
+            note_id = fm.get("id") if fm else None
+            if not note_id:
+                continue  # unindexable (kb_lint reports the missing id)
+            metas.append(
+                {
+                    "id": note_id,
+                    "type": fm.get("type") or "misc",
+                    "description": fm.get("description"),
+                    "title": note_title(body) or note_id,
+                }
+            )
+        if not metas:
+            return f"No indexable notes found under `{root}/`."
+
+        index_rel = f"{root}/index.md"
+        existing = ws.read_file(index_rel) if ws.exists(index_rel) else None
+        try:
+            ws.write_file(index_rel, render_index_md(metas, existing=existing))
+        except Exception as e:
+            return f"Error writing `{index_rel}`: {e}"
+        return f"Regenerated `{index_rel}` from {len(metas)} note(s)."
+
+    # =========================================================================
     # Return all tools
     # =========================================================================
 
@@ -954,4 +1077,6 @@ def create_kb_tools(context: ToolContext) -> List[Any]:
         kb_provenance,
         kb_unanswered,
         kb_export,
+        kb_lint,
+        kb_index,
     ]
