@@ -884,6 +884,67 @@ async def user_can_access_datasource(
     return False
 
 
+async def filter_visible_datasources(
+    user: dict[str, Any], db, rows: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Batch equivalent of :func:`user_can_access_datasource` for list views.
+
+    Resolves the caller's visible projects ONCE (:func:`user_visible_project_ids`)
+    and fetches every datasource→project link in a single query, replacing the
+    per-row ``N × (1 + M)`` ``list_datasource_projects`` +
+    ``get_user_role_in_project`` fan-out. Preserves the single-row semantics
+    exactly:
+
+    * admin (unscoped) → all rows;
+    * creator → own rows (unscoped only — creator access does NOT survive a
+      ``project:<uuid>`` token scope);
+    * member → rows linked to a project the caller can see;
+    * project-scoped token → rows linked to the scoped project the caller sees.
+
+    Membership is sourced from the same ``project_members`` table as the per-row
+    path (via ``user_visible_project_ids`` → ``get_projects_for_user``), so the
+    visible set matches ``get_user_role_in_project`` truthiness.
+    """
+    if not rows:
+        return []
+    scope_pid = _scope_project_id(user)
+    visible = await user_visible_project_ids(user, db)
+    if scope_pid is None and visible == "all":
+        # Unscoped admin sees every row regardless of project links — skip the
+        # link fetch entirely.
+        return list(rows)
+    links = await db.list_datasource_projects_bulk([str(ds["id"]) for ds in rows])
+
+    def _linked(ds: dict[str, Any]) -> set[UUID]:
+        out: set[UUID] = set()
+        for pid in links.get(str(ds["id"]), ()):
+            try:
+                out.add(UUID(str(pid)))
+            except (ValueError, TypeError):
+                continue
+        return out
+
+    result: list[dict[str, Any]] = []
+    for ds in rows:
+        linked = _linked(ds)
+        if scope_pid is not None:
+            # user_visible_project_ids collapses admin+scope to {scope_pid}, so
+            # `visible` is always a set here (never "all"). Creator access does
+            # not survive a scope mismatch — the link + visibility are required.
+            if scope_pid in linked and scope_pid in visible:
+                result.append(ds)
+            continue
+        if visible == "all":  # admin, unscoped
+            result.append(ds)
+            continue
+        if str(ds.get("created_by") or "") == str(user["id"]):
+            result.append(ds)
+            continue
+        if linked & visible:  # member of any linked project
+            result.append(ds)
+    return result
+
+
 async def require_datasource_access(
     request: Request, db, datasource_id: str
 ) -> tuple[dict[str, Any], dict[str, Any]]:

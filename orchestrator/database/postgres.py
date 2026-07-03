@@ -3287,6 +3287,43 @@ class PostgresDB:
             )
         return [dict(row) for row in rows]
 
+    async def list_thread_mounts_bulk(
+        self, thread_ids: list[str]
+    ) -> Dict[str, list[Dict[str, Any]]]:
+        """All mounts for each thread, in ONE query, ordered by ``target_path``.
+
+        Batched form of :meth:`list_thread_mounts` for the thread-list endpoint
+        — replaces the per-thread N+1 with a single ``thread_id = ANY($1)``
+        fetch. Returns ``{thread_id: [mount_row, ...]}``; threads with no mounts
+        are absent. Invalid UUIDs are skipped.
+        """
+        valid: list[UUID] = []
+        for t in thread_ids:
+            try:
+                valid.append(UUID(str(t)))
+            except (ValueError, TypeError):
+                continue
+        if not valid:
+            return {}
+
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, thread_id, mount_kind, target_path,
+                       source_kind, source_ref,
+                       backend_id, cloud_handle, webdav_url,
+                       target_user_sub, created_at
+                FROM thread_mounts
+                WHERE thread_id = ANY($1::uuid[])
+                ORDER BY thread_id, target_path
+                """,
+                valid,
+            )
+        out: Dict[str, list[Dict[str, Any]]] = {}
+        for row in rows:
+            out.setdefault(str(row["thread_id"]), []).append(dict(row))
+        return out
+
     async def remove_thread_mount(self, mount_id: str) -> bool:
         """Delete a single mount by id. Returns True if a row was removed."""
         async with self.acquire() as conn:
@@ -4476,6 +4513,39 @@ class PostgresDB:
             )
 
         return [str(row["project_id"]) for row in rows]
+
+    async def list_datasource_projects_bulk(
+        self, datasource_ids: List[str]
+    ) -> Dict[str, List[str]]:
+        """Project IDs linked to each datasource, in ONE query.
+
+        Batched form of :meth:`list_datasource_projects` for the list-view
+        visibility filter — replaces the per-row N+1 with a single
+        ``datasource_id = ANY($1)`` fetch. Returns
+        ``{datasource_id: [project_id, ...]}`` with an entry only for
+        datasources that have at least one link; unlinked ids are simply absent.
+        Invalid UUIDs are skipped.
+        """
+        valid: List[UUID] = []
+        for d in datasource_ids:
+            try:
+                valid.append(UUID(str(d)))
+            except (ValueError, TypeError):
+                continue
+        if not valid:
+            return {}
+
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT datasource_id, project_id FROM project_datasources "
+                "WHERE datasource_id = ANY($1::uuid[])",
+                valid,
+            )
+
+        out: Dict[str, List[str]] = {}
+        for row in rows:
+            out.setdefault(str(row["datasource_id"]), []).append(str(row["project_id"]))
+        return out
 
     async def backfill_encrypt_datasource_credentials(self) -> Dict[str, int]:
         """One-shot migration: encrypt any plaintext ``credentials`` JSONB values.

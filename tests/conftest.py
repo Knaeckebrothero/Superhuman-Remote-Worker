@@ -279,6 +279,16 @@ def fake_db(
     async def list_datasource_projects(dsid):
         return [str(pid) for pid in datasource_projects.get(_to_uuid(dsid), [])]
 
+    async def list_datasource_projects_bulk(dsids):
+        # Batched form: {datasource_id: [project_id, ...]}, entries only for
+        # linked datasources. Keys mirror the caller's str(ds["id"]) inputs.
+        out: dict[str, list[str]] = {}
+        for dsid in dsids:
+            pids = datasource_projects.get(_to_uuid(dsid), [])
+            if pids:
+                out[str(dsid)] = [str(pid) for pid in pids]
+        return out
+
     async def list_datasources(job_id=None, ds_type=None, limit=100):
         return list(datasources.values())
 
@@ -290,6 +300,9 @@ def fake_db(
     db.get_projects_for_user = AsyncMock(side_effect=get_projects_for_user)
     db.get_datasource = AsyncMock(side_effect=get_datasource)
     db.list_datasource_projects = AsyncMock(side_effect=list_datasource_projects)
+    db.list_datasource_projects_bulk = AsyncMock(
+        side_effect=list_datasource_projects_bulk
+    )
     db.list_datasources = AsyncMock(side_effect=list_datasources)
     return db
 
