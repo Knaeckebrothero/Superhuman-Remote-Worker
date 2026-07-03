@@ -49,9 +49,11 @@ async def provision_or_assign(
     from main import (  # noqa: E402  (late import — see module docstring)
         _build_datasource_tool_override,
         _build_datasources_payload,
+        _endpoint_violations_detail,
         _find_idle_persistent_agent,
         _grant_violations_detail,
         _send_session_attach,
+        _session_endpoint_violations,
         _session_grant_violations,
         agent_provisioner,
         postgres_db,
@@ -111,6 +113,27 @@ async def provision_or_assign(
                         tid,
                         "failed",
                         reason=_grant_violations_detail(violations),
+                    )
+                    return
+                # Pre-flight the model-role transports too: a configured role
+                # with no reachable endpoint (e.g. the memory reranker riding an
+                # unresolvable embedding endpoint, or a raising-provider chat
+                # model with no key) crashes the agent at startup, releases the
+                # workspace, and hangs the cockpit exactly like a grant denial.
+                # Fail fast with the real reason instead of spawning a doomed pod.
+                # docs/issues/openrouter_auxiliary_crashes_session_via_memory_reranker.md
+                endpoint_violations = await _session_endpoint_violations(cur)
+                if endpoint_violations:
+                    logger.warning(
+                        "Thread %s: provisioning denied by unusable transport: %s",
+                        tid,
+                        "; ".join(endpoint_violations),
+                    )
+                    lifecycle_emit(
+                        uid,
+                        tid,
+                        "failed",
+                        reason=_endpoint_violations_detail(endpoint_violations),
                     )
                     return
                 # Try to attach an idle dual-mode agent from the warm pool

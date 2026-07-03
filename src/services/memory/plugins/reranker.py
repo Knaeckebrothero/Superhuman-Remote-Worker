@@ -1,10 +1,15 @@
 """Reranker scorer (memory overhaul Phase 3, slice 2).
 
 Reorders memory candidates by query relevance via an external rerank
-endpoint (Cohere-shaped ``POST {base_url}/rerank`` — served for
-qwen3-reranker-8b by the same router as the auxiliary model, so the
-plugin defaults to the auxiliary transport and needs no extra
-credential plumbing).
+endpoint (Cohere-shaped ``POST {base_url}/rerank``). ``qwen3-reranker-8b``
+is served by the same router as the *embedding* model
+(``qwen3-embedding-8b``), so the plugin defaults to the **embedding**
+transport (``EMBEDDING_BASE_URL``/``EMBEDDING_API_KEY``) and needs no extra
+credential plumbing. It deliberately does NOT ride the auxiliary model: the
+auxiliary is a freely-swapped chat model that may be OpenRouter-direct (no
+explicit ``base_url``) or a provider that serves no ``/rerank`` route —
+coupling to it crashed session startup and silently no-op'd reranking. See
+``docs/issues/openrouter_auxiliary_crashes_session_via_memory_reranker.md``.
 
 Motivated by the Phase-2 baseline finding: hybrid retrieval surfaces
 the evidence memory at ~rank 13 of ~122 injected items on the seam arm
@@ -20,12 +25,16 @@ Scope discipline:
   bounded-core policy's job, not the scorer's.
 - At most ``memory.reranker.top_k`` candidates go to the endpoint; the
   remainder keeps its original (hybrid) order behind the reranked head.
-- Any transport/shape failure raises — the manager's per-plugin
-  containment passes items through unchanged and records the error in
-  ``AssembleStats.errors``. The scorer never partially reorders.
+- Any transport/shape failure raises. The scorer never partially
+  reorders, and the manager does NOT contain a scorer failure — a
+  configured reranker is required, so the failure propagates as
+  ``MemoryPipelineError`` and the caller fails the turn loud rather
+  than silently serving legacy order (records the error in
+  ``AssembleStats.errors`` on the way out).
 """
 
 import logging
+import os
 from typing import Any, List, Optional, Tuple
 
 from src.services.memory.registry import register_memory_plugin
@@ -53,7 +62,10 @@ class RerankerScorer:
         client: Optional[Any] = None,
     ) -> None:
         if not base_url:
-            raise ValueError("reranker needs a base_url (or an auxiliary base_url)")
+            raise ValueError(
+                "reranker needs a base_url: set memory.reranker.base_url or "
+                "EMBEDDING_BASE_URL (the reranker rides the embedding endpoint)"
+            )
         self.model = model
         self.endpoint = base_url.rstrip("/") + "/rerank"
         self.api_key = api_key
@@ -129,16 +141,19 @@ class RerankerScorer:
     "scorer",
     "reranker",
     description="Cross-encoder rerank of memory candidates against the "
-    "query (Cohere-shaped /rerank route; defaults to the auxiliary "
+    "query (Cohere-shaped /rerank route; defaults to the embedding "
     "endpoint's transport)",
 )
 def _build_reranker(runtime: Any) -> RerankerScorer:
     cfg = getattr(runtime.memory_config, "reranker", None)
-    aux = runtime.auxiliary_config
     if cfg is None:
         raise ValueError("memory.reranker config section missing")
-    base_url = cfg.base_url or getattr(aux, "base_url", None)
-    api_key = cfg.api_key or getattr(aux, "api_key", None)
+    # Ride the embedding endpoint, not the auxiliary: qwen3-reranker-8b and
+    # qwen3-embedding-8b are the same family on the same router, the embedding
+    # transport is always injected at dispatch, and it never depends on which
+    # chat model the user picked as their auxiliary. Explicit config wins.
+    base_url = cfg.base_url or os.environ.get("EMBEDDING_BASE_URL")
+    api_key = cfg.api_key or os.environ.get("EMBEDDING_API_KEY")
     return RerankerScorer(
         model=cfg.model,
         base_url=base_url,

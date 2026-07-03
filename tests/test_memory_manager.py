@@ -329,16 +329,18 @@ class TestAssemble:
         assert payload.stats.blocks == 1
 
     @pytest.mark.asyncio
-    async def test_scorer_failure_passes_items_through(self):
+    async def test_scorer_failure_hard_fails(self):
+        from src.services.memory import MemoryPipelineError
+
         manager = MemoryManager(
             MemoryRuntime(),
             retrievers=[("r", FakeRetriever([make_candidate()]))],
             scorers=[("broken", FakeScorer(error=RuntimeError("nope")))],
         )
-        payload = await manager.assemble(AssembleRequest(query_text="q"))
-        # containment skips the stage without dropping items
-        assert payload.stats.injected_total == 1
-        assert payload.stats.errors == ["scorer:broken: RuntimeError: nope"]
+        # A configured scorer is required — its failure raises rather than
+        # silently degrading to legacy order.
+        with pytest.raises(MemoryPipelineError, match="broken"):
+            await manager.assemble(AssembleRequest(query_text="q"))
 
     @pytest.mark.asyncio
     async def test_policy_filters_items(self):
@@ -680,7 +682,12 @@ class TestRerankerScorer:
         assert client.calls == []
 
     @pytest.mark.asyncio
-    async def test_manager_containment_on_scorer_failure(self):
+    async def test_manager_hard_fails_on_scorer_failure(self):
+        # A configured scorer (reranker) is REQUIRED: a runtime failure raises
+        # MemoryPipelineError (fails the turn loud) rather than silently
+        # degrading to legacy order. Regression for
+        # docs/issues/openrouter_auxiliary_crashes_session_via_memory_reranker.md.
+        from src.services.memory import MemoryPipelineError
         from src.services.memory.plugins.reranker import RerankerScorer
 
         scorer = RerankerScorer(
@@ -699,25 +706,91 @@ class TestRerankerScorer:
             ],
             scorers=[("reranker", scorer)],
         )
-        payload = await manager.assemble(AssembleRequest(query_text="q"))
-        # items pass through unchanged; the failure is recorded, not raised
-        assert payload.stats.errors and "reranker" in payload.stats.errors[0]
-        assert payload.stats.injected_total == 2
+        with pytest.raises(MemoryPipelineError, match="reranker"):
+            await manager.assemble(AssembleRequest(query_text="q"))
 
-    def test_factory_defaults_to_auxiliary_transport(self):
+    @pytest.mark.asyncio
+    async def test_manager_contains_retriever_failure(self):
+        # Retriever failures are still contained (fewer candidates, not a dead
+        # turn) — only the required scorer stage hard-fails.
+        class _BoomRetriever:
+            async def retrieve(self, req):
+                raise RuntimeError("db blip")
+
+        manager = MemoryManager(
+            MemoryRuntime(),
+            retrievers=[("recall", _BoomRetriever())],
+        )
+        payload = await manager.assemble(AssembleRequest(query_text="q"))
+        assert payload.stats.errors and "recall" in payload.stats.errors[0]
+
+    def test_factory_defaults_to_embedding_transport(self, monkeypatch):
+        # The reranker rides the EMBEDDING endpoint, never the auxiliary — even
+        # when the aux has a perfectly good base_url. Regression guard for
+        # docs/issues/openrouter_auxiliary_crashes_session_via_memory_reranker.md.
         from src.services.memory.plugins.reranker import _build_reranker
         from src.core.loader import RerankerConfig
 
+        monkeypatch.setenv("EMBEDDING_BASE_URL", "https://ai.h4ll.app/v1")
+        monkeypatch.setenv("EMBEDDING_API_KEY", "embed-key")
         runtime = MemoryRuntime(
             memory_config=SimpleNamespace(reranker=RerankerConfig()),
+            # aux has a usable endpoint, but it must be ignored
             auxiliary_config=SimpleNamespace(
                 base_url="https://aux/v1", api_key="aux-key"
             ),
         )
         scorer = _build_reranker(runtime)
-        assert scorer.endpoint == "https://aux/v1/rerank"
-        assert scorer.api_key == "aux-key"
+        assert scorer.endpoint == "https://ai.h4ll.app/v1/rerank"
+        assert scorer.api_key == "embed-key"
         assert scorer.top_k == 64
+
+    def test_factory_explicit_base_url_wins(self, monkeypatch):
+        from src.services.memory.plugins.reranker import _build_reranker
+        from src.core.loader import RerankerConfig
+
+        monkeypatch.setenv("EMBEDDING_BASE_URL", "https://ai.h4ll.app/v1")
+        runtime = MemoryRuntime(
+            memory_config=SimpleNamespace(
+                reranker=RerankerConfig(
+                    base_url="https://explicit/v1", api_key="explicit-key"
+                )
+            ),
+            auxiliary_config=SimpleNamespace(base_url="https://aux/v1"),
+        )
+        scorer = _build_reranker(runtime)
+        assert scorer.endpoint == "https://explicit/v1/rerank"
+        assert scorer.api_key == "explicit-key"
+
+    def test_factory_openrouter_aux_no_longer_crashes(self, monkeypatch):
+        # The original bug: aux = OpenRouter-direct (no base_url). Previously
+        # this raised at construction and killed agent startup. With the
+        # embedding fallback it builds cleanly and ignores the aux entirely.
+        from src.services.memory.plugins.reranker import _build_reranker
+        from src.core.loader import RerankerConfig
+
+        monkeypatch.setenv("EMBEDDING_BASE_URL", "https://ai.h4ll.app/v1")
+        runtime = MemoryRuntime(
+            memory_config=SimpleNamespace(reranker=RerankerConfig()),
+            auxiliary_config=SimpleNamespace(base_url=None, api_key=None),
+        )
+        scorer = _build_reranker(runtime)
+        assert scorer.endpoint == "https://ai.h4ll.app/v1/rerank"
+
+    def test_factory_no_endpoint_anywhere_raises(self, monkeypatch):
+        # Genuinely unserviceable (no explicit base_url, no EMBEDDING_BASE_URL):
+        # still a hard error at the plugin layer — the orchestrator pre-flight
+        # (Part 3) catches this before a pod ever spawns.
+        from src.services.memory.plugins.reranker import _build_reranker
+        from src.core.loader import RerankerConfig
+
+        monkeypatch.delenv("EMBEDDING_BASE_URL", raising=False)
+        runtime = MemoryRuntime(
+            memory_config=SimpleNamespace(reranker=RerankerConfig()),
+            auxiliary_config=SimpleNamespace(base_url=None, api_key=None),
+        )
+        with pytest.raises(ValueError, match="base_url"):
+            _build_reranker(runtime)
 
     def test_parse_reranker_config(self):
         cfg = _parse_memory_config(
