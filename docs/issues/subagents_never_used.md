@@ -23,11 +23,14 @@ related:
 # Subagent delegation is never used — 0 invocations fleet-wide, all-time, despite rendered instructions
 
 **Date:** 2026-07-02
-**Status:** **FIX IMPLEMENTED 2026-07-02** (uncommitted, develop) — adoption package
+**Status:** **FIX SHIPPED + DEPLOYED** (`e65d5e32`, deploy `a4596376`) — adoption package
 shipped as Phase 5 of [[delegation_light_mode_missing]]; see "Fix session record" below
 for the recommendation-by-recommendation mapping and a **sixth mechanism** discovered
-during verification. Remaining: k3d e2e (Phase 6) + post-deploy adoption measurement
-with the queries below. Absorbs and supersedes the evidence in
+during verification. **Phase 6 satisfied by production forensics** + **T1.2 cost measured
+2026-07-03** ([[loop_subagent_forensics]] §7): adoption proven & metered; raw-token target
+(35.8M→10–15M) not hit on n=3, **but** cache ~35% + steps bounded ~300 (no runaways) +
+parallel-read speed = the real early win — token-cost tuning deferred to ~100-job scale
+(see the sized note below). Absorbs and supersedes the evidence in
 [[scholar_delegation_not_exercised]] (2026-06-03, one gpt-5.5 job) with fleet-wide audit
 data; sibling of [[delegation_light_mode_missing]] (the tool-shape gap). The light ReAct
 subagent tool this doc assumed was built in the same session (Phases 0–4) — this doc's
@@ -116,6 +119,15 @@ delegation means never carrying it):
   (no role can currently see artifact truth).
 - Developer pre-edit exploration would have caught the run-6 duplication
   (dev #10 re-implementing existing code).
+
+> **Measured 2026-07-03 (T1.2, [[loop_subagent_forensics]] §7) — the 10–15M resizing was
+> optimistic.** On the first post-adoption loop (n=3), subagents are only 2.5–5% of spend and
+> the parent prompt still climbs to ~180k avg (scholar iter-13 = 45.2M total, *above* the 35.8M
+> baseline). Fan-out alone does not cut raw tokens. BUT the operational win is real and elsewhere:
+> cache is now **~35%** (not 4%), jobs land at **~300 steps (no runaways, vs 600–900)**, and reads
+> parallelize for speed. Raw-token optimization (compress-return, arg-trim, fewer parent turns) is
+> **deferred to ~100 stacked jobs** so the hurdles show empirically. Adoption + topology validated;
+> cost tuning is a later-at-scale task.
 
 Full run-6 numbers: [[loop_run6_deep_dive_forensics]] §2; lever priorities:
 [[loop_optimization]] Tier 2.

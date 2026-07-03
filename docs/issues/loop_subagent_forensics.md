@@ -54,9 +54,12 @@ deployed:
 - `a4596376` — *"deploy: update image tags to sha-e65d5e3"*
 
 The jobs analyzed below **are** the production evidence that [[subagents_never_used]] §"How to
-measure adoption" asked for. **Adoption is demonstrated.** What is still genuinely owed is the
-*quantitative cost measurement* (Phase 5b) — not the feature. The status lines in both sibling
-docs should be updated.
+measure adoption" asked for. **Adoption is demonstrated.** The *quantitative cost measurement*
+(Phase 5b) that was owed here is now **done — see §7** (measured 2026-07-03). Headline: adoption
+proven & metered, topology validated; the raw-token target (35.8M→10–15M) did **not** land on
+n=3, but real-world signal (cache ~35%, jobs bounded to ~300 steps with no runaways, parallel-read
+speed) says the early win is speed + boundedness — token-cost tuning is rightly deferred to scale.
+The status lines in both sibling docs are updated to match.
 
 ---
 
@@ -217,7 +220,7 @@ SRW is closer to best practice than the "delegation never fires" history implied
 | # | Change | Effort | Impact | Where |
 |---|---|---|---|---|
 | T1.1 | **Route readers to the cheaper `llm.subagent` tier** — set the config value for scholar + critic (and defaults). Tier + fallback already built; **config-only, no code**. The Opus-lead/Sonnet-reader cost split — the single biggest lever — and MiniMax is a documented false economy (F31). | low | high | `config/experts/{scholar,critic}/config.yaml`, `config/defaults.yaml` `llm.subagent` |
-| T1.2 | **Run the Phase-5b cost measurement** — before/after token spend incl. `call_type='subagent'` rows; baseline scholar #10 = 35.8M, target 10–15M. Adoption is proven; the *cost* payoff is the one claim still unmeasured. | medium | high | audit DB `llm_requests`; orchestrator `audit_usage` materializer |
+| ~~T1.2~~ ✅ | **Phase-5b cost measurement — DONE 2026-07-03 (§7).** Measured: scholar iter-13 45.2M / critic 12.7M / developer 52.7M+ (parent ~180k avg, subagents 2.5–5% of spend). Raw-token target (35.8M→10–15M) not hit on n=3 — but cache ~35%, steps bounded ~300 (no runaways), speed win. Token-cost tuning deferred to ~100-job scale. | medium | high | audit DB `llm_requests` |
 | T1.3 | **Enable read-only light fan-out for the DEVELOPER** — `mode: light`, `spawn_subagent`, `allow_writes: false`. Parallel code/context *reads*, single-threaded writes (Cognition's thesis). Closes the zero-fan-out role without touching the deferred heavy/merge path. Mirror the scholar/critic `_ROLE_BLOCKS` sentence + todo-scaffold decision. | medium | high | `config/experts/developer/config.yaml`, `orchestrator/services/project_loops.py` `_ROLE_BLOCKS`, developer `strategic_todos_initial.yaml` |
 
 ### Tier 2 — efficiency (low effort, medium impact)
@@ -262,10 +265,14 @@ SRW is closer to best practice than the "delegation never fires" history implied
 ## 5. Risks / caveats to weigh
 
 - **Delegation compounds with, but does not replace, the loop's cache/cost bugs** — F35 tool-arg
-  bloat (47–53% of peak prompt) and F37 prefix instability (cache capped at 4–11%). Selling
-  fan-out as *the* cost fix while cache stays at 4–11% will under-deliver on the 35.8M→10–15M
-  target; T2.4 partially mitigates, but the cache/prefix fixes are separate work
-  ([[loop_optimization]] Tier 2).
+  bloat (47–53% of peak prompt) and F37 prefix instability. **Update 2026-07-03: prefix cache is
+  now ~35%** (MiniMax dashboard, recent days), not the 4–11% snapshot this bullet assumed — the F37
+  lever is already substantially realized, so the gross token totals in §7 overstate billed-fresh
+  cost. The measurement (§7) confirms fan-out alone doesn't cut raw tokens (subagents 2.5–5% of
+  spend; parent still ~180k avg), so the 35.8M→10–15M target stays gated on T2.4 compress-return +
+  F35 arg-trim + fewer parent turns — **deferred to ~100-job scale** so the hurdles show
+  empirically. What fan-out *did* buy immediately: bounded ~300-step horizons (no runaways) +
+  parallel-read speed ([[loop_optimization]] Tier 2).
 - **Parallel-reads over a single locked SSH `RemoteBackend` is unmeasured under real load** — only
   LLM/web parallelize; fs/git/shell ops serialize behind the backend lock. If paramiko channels
   serialize badly at `max_parallel`, widening fan-out may disappoint until measured; the escalation
@@ -304,6 +311,49 @@ direct scouting). ~733k subagent tokens, 134 tool uses, ~510s wall.
 
 **Jobs analyzed:** scholar `df0f519a-…`, critic `58ebf879-…`, developer `6dc25a0d-…` (dev cluster,
 loop 4, iters 13/14/15, MiniMax-M3, 2026-07-03).
+
+---
+
+## 7. Phase-5b measurement — result (2026-07-03, DB-verified)
+
+Ran T1.2 against the three jobs above via the audit DB (`llm_requests`, per-row token usage;
+`iter=?` rows = `call_type='subagent'`/aux, `iter=N` = parent main-loop). Numbers are DB-verified
+and arithmetic-consistent.
+
+| job (loop 4, MiniMax-M3) | rows | total | parent | p-calls | p-avg | subagent | sub % | peak | parent prompt first10→last10 |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| scholar iter-13 · 5 sub · ✅ | 290 | **45.2M** | 42.7M | 237 | 180k | 2.26M | 5.0% | 411k | 27k → 121k |
+| critic iter-14 · 4 sub · ✅ | 80 | **12.7M** | 12.3M | 68 | 181k | 0.32M | 2.5% | 274k | 43k → 269k |
+| developer iter-15 · 0 sub · ⏳ live | 307 | **52.7M+** | 52.6M | 307 | 171k | 0 | 0% | 262k | 36k → 165k |
+| *baseline* run-6 scholar #10 · 0 sub | *169* | *35.8M* | *35.8M* | *169* | *212k* | — | — | — | *(212k climb)* |
+
+**What the raw totals say:** the naive "35.8M → 10–15M via fan-out alone" did **not** materialize
+on n=3. Subagents are only 2.5–5% of spend; the parent context is 95%+, and its per-call prompt is
+~171–181k across all three roles **whether or not** they fan out, climbing 4.5–6× within each job.
+On raw tokens, fan-out did not shrink the parent.
+
+**What the operational signal says (rebalances the above — 2026-07-03, MiniMax dashboard + loop
+step counts):**
+
+- **Prefix cache is ~35% over recent days**, not the 4–11% snapshot §5 assumed. The F37 lever is
+  already substantially realized, so effective *fresh*-token cost sits well below the raw prompt
+  totals in the table — the 45.2M/52.7M figures are gross, not billed-fresh.
+- **No runaways: jobs land at ~300 steps, not the pre-adoption 600–900.** Fan-out is buying
+  **horizon-boundedness + wall-clock speed** (parallel isolated reads) even where it doesn't cut
+  raw tokens — a structural win the token totals don't capture.
+- **n=3, feature days-old, a handful of jobs.** Not enough to fix a cost ceiling.
+
+**Verdict (revised).** Adoption is healthy and metered; the topology is validated (§0–3); cache and
+step-boundedness are already good. Fan-out's value shows up as **speed + no-runaway + isolation**,
+not (yet) as a raw-token cut — and that's fine this early. **Token-cost optimization (T2.4
+compress-return, F35 arg-trim, fewer parent turns; T1.1 cheaper reader is a ~5% / quality lever,
+not the cost fix) is deferred to a data-rich point — revisit once ~100 research jobs are stacked**
+so the real hurdles show empirically rather than over-fitting three runs. The 35.8M→10–15M sizing
+in [[subagents_never_used]] over-attributed the win to fan-out; corrected here and there.
+
+*Method: kubectl to the dev cluster is Rancher-unauth (403), so measured via MCP `list_llm_requests`
+pagination + deterministic re-parse; the developer job was still processing at capture (52.7M is a
+floor). Raw per-row captures retained out-of-tree.*
 
 ---
 
