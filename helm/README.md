@@ -2,7 +2,7 @@
 
 A self-improving AI agent system: Orchestrator (FastAPI) coordinates jobs,
 Agents (LangGraph) execute them in isolated workspaces, Cockpit (Angular)
-provides the web UI. Backed by PostgreSQL, pgvector, MongoDB, and (optionally)
+provides the web UI. Backed by PostgreSQL, pgvector, and (optionally)
 Neo4j.
 
 This chart deploys the full stack to a Kubernetes cluster. Internal databases
@@ -28,12 +28,12 @@ server, etc.) — see [Production install](#production-install-bring-your-own).
 | `databases.postgres` | Application database (jobs, users, projects) | internal or external |
 | `databases.vector` | pgvector for embeddings, citations, memories | internal or external |
 | `databases.keycloak` | Dedicated Postgres for the bundled Keycloak (only relevant when `keycloak.internal: true`) | internal or external |
-| `databases.mongodb` | Audit trail (optional but recommended) | internal or external |
+| `databases.audit` | Audit trail — LLM/agent/chat traces (optional but recommended) | internal or external |
 | `databases.neo4j` | Project knowledge graph (optional). `edition: community` (default) or `enterprise` (set `acceptLicense` to `"yes"` for Startup Program / commercial, or `"eval"` for non-production). | internal or external |
 | `keycloak` | OIDC provider | internal or external |
 | `gitea` | Git server for agent code workspaces | internal or external |
 | `opencloud` / `nextcloud` | Cloud storage backend | one or external |
-| `pgadmin`, `mongoExpress`, `dozzle` | Admin UIs (off by default) | `*.enabled` |
+| `pgadmin`, `dozzle` | Admin UIs (off by default) | `*.enabled` |
 | `reloader` | Watches Secret/ConfigMap changes, triggers rolling restarts | `reloader.enabled` |
 | `vmController` | KubeVirt VM lifecycle controller (HTTP or NATS transport) | `vmController.enabled` |
 
@@ -51,14 +51,14 @@ server, etc.) — see [Production install](#production-install-bring-your-own).
 Optional but recommended:
 - **External Secrets Operator** + a backing store (Vault, AWS Secrets Manager, etc.) — see `externalSecrets.*`
 - **An OIDC IdP** if you don't want the bundled Keycloak (Azure AD, Google Workspace, Okta, etc.)
-- **Managed databases** for production (any standard Postgres 14+ for app + pgvector, MongoDB 6+, Neo4j 5+)
+- **Managed databases** for production (any standard Postgres 14+ for app + pgvector + audit, Neo4j 5+)
 
 ---
 
 ## Quick start (evaluation, single command)
 
 For a self-contained evaluation install with everything in-cluster (Postgres,
-MongoDB, Neo4j, Keycloak, Gitea, OpenCloud all bundled):
+Neo4j, Keycloak, Gitea, OpenCloud all bundled):
 
 ```bash
 helm install srw oci://ghcr.io/knaeckebrothero/charts/superhuman-remote-worker \
@@ -94,7 +94,7 @@ Edit at minimum:
 - `license.acceptTerms` → `true`
 - `global.domain` → your base hostname
 - `secrets.existingSecret` → name of a Secret you create yourself (see below)
-- `databases.*.externalUrl` → connection strings for managed Postgres, vector, MongoDB
+- `databases.*.externalUrl` → connection strings for managed Postgres, vector
 - `keycloak.externalIssuerUrl` → your IdP issuer URL
 - `gitea.internal: false` + `*.externalUrl` → your git server URLs
 - `cloud.externalBackend` + `cloud.externalUrl` → your cloud storage endpoint
@@ -120,7 +120,7 @@ ConfigMap entry, the cockpit deep-link, and the Keycloak gitea-client
 redirect URI. TLS Secret names stay tied to the release name, so two
 SRW installs in the same cluster never collide on cert storage. See
 `global.hostnames` in `values.yaml` for the full key list (cockpit, api,
-auth, git, cloud, mcp, neo4j, neo4jBolt, pgadmin, mongo, dozzle, headscale,
+auth, git, cloud, mcp, neo4j, neo4jBolt, pgadmin, dozzle, headscale,
 minio).
 
 Pre-create the secret with all required keys (see [Secret schema](#secret-schema)):

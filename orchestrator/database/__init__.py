@@ -2,14 +2,14 @@
 
 Provides core database classes for the orchestrator:
 - PostgresDB: Async PostgreSQL with connection pooling
-- MongoDB: Async MongoDB for audit queries (optional)
+- AuditStore: Async Postgres reader for the audit trail
 
 This is the canonical database layer. All database operations should go
 through these classes rather than creating separate connection pools.
 
 Example:
     ```python
-    from orchestrator.database import PostgresDB, MongoDB, ALLOWED_TABLES, SCHEMA_FILE
+    from orchestrator.database import PostgresDB, ALLOWED_TABLES, SCHEMA_FILE
 
     # PostgreSQL (async)
     db = PostgresDB()
@@ -24,10 +24,10 @@ Example:
     job = await db.create_job(description="Extract requirements")
     await db.register_agent(config_name="creator", pod_ip="10.0.0.1")
 
-    # MongoDB (optional, async)
-    mongo = MongoDB()
-    await mongo.connect()
-    audit = await mongo.get_job_audit("abc-123", page=1, page_size=50)
+    # Audit reads (async)
+    audit = AuditStore(audit_db_url)
+    await audit.connect()
+    trail = await audit.get_job_audit("abc-123", page=1, page_size=50)
     ```
 """
 
@@ -41,8 +41,7 @@ from .postgres import (
     MIGRATIONS_AUDIT_DIR,
     REQUIRED_TABLES,
 )
-from .mongodb import MongoDB, FILTER_MAPPINGS, FilterCategory
-from .audit_store import AuditStore
+from .audit_store import AuditStore, FILTER_MAPPINGS, FilterCategory
 
 __all__ = [
     # PostgreSQL
@@ -54,10 +53,8 @@ __all__ = [
     "MIGRATIONS_VECTOR_DIR",
     "MIGRATIONS_AUDIT_DIR",
     "REQUIRED_TABLES",
-    # MongoDB
-    "MongoDB",
+    # Postgres audit store (reader + filter helpers)
+    "AuditStore",
     "FILTER_MAPPINGS",
     "FilterCategory",
-    # Postgres audit store (reader)
-    "AuditStore",
 ]

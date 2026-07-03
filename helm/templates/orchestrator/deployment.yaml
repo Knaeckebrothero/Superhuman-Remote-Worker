@@ -40,11 +40,6 @@ spec:
           image: busybox:1.36
           command: ["sh", "-c", "until nc -z {{ include "srw.fullname" . }}-auditdb 5432; do sleep 2; done"]
         {{- end }}
-        {{- if and .Values.databases.mongodb.enabled .Values.databases.mongodb.internal }}
-        - name: wait-for-mongodb
-          image: busybox:1.36
-          command: ["sh", "-c", "until nc -z {{ include "srw.fullname" . }}-mongodb 27017; do sleep 2; done"]
-        {{- end }}
         {{- if and .Values.gitea.enabled .Values.gitea.internal }}
         - name: wait-for-gitea
           image: busybox:1.36
@@ -171,11 +166,6 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: AUDIT_POSTGRES_DB
-            - name: AUDIT_BACKEND
-              valueFrom:
-                configMapKeyRef:
-                  name: {{ include "srw.configMapName" . }}
-                  key: AUDIT_BACKEND
             # Checkpointer backend (sqlite|postgres). The orchestrator reads it to
             # prune LangGraph checkpoints on terminal jobs; it uses explicit env
             # (not envFrom), so the ConfigMap key must be referenced here too
@@ -219,13 +209,6 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: LITELLM_GATEWAY_ROUTED_PROVIDERS
-            {{- end }}
-            {{- if .Values.databases.mongodb.enabled }}
-            - name: MONGODB_URL
-              valueFrom:
-                configMapKeyRef:
-                  name: {{ include "srw.configMapName" . }}
-                  key: MONGODB_URL
             {{- end }}
             - name: WORKSPACE_PATH
               valueFrom:
@@ -969,7 +952,7 @@ spec:
             # Chart-standard labels for dynamically-provisioned agent pods.
             # The chart's database NetworkPolicies match on these labels;
             # without them, dynamic agent pods are blocked from reaching
-            # postgres/pgvector/mongodb/neo4j.
+            # postgres/pgvector/neo4j.
             - name: AGENT_LABEL_NAME
               value: {{ include "srw.name" . | quote }}
             - name: AGENT_LABEL_INSTANCE

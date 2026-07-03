@@ -348,13 +348,13 @@ async def get_graph_changes(job_id: str) -> str:
 
 @mcp.tool
 async def get_llm_request(doc_id: str) -> str:
-    """Get full LLM request/response by MongoDB document ID.
+    """Get full LLM request/response by its audit-store request ID.
 
     Returns complete message history, model response, and token usage.
     Use document IDs from audit trail entries.
 
     Args:
-        doc_id: MongoDB ObjectId (24 hex characters)
+        doc_id: Audit-store request ID (string)
 
     Returns:
         Formatted LLM request with messages and response
@@ -1650,18 +1650,18 @@ async def get_audit_timerange(job_id: str) -> str:
     """Get the first and last timestamps for a job's audit entries.
 
     Quick way to see when a job started and when it last had activity.
-    Requires MongoDB to be available.
+    Requires the audit store to be available.
 
     Args:
         job_id: Job UUID to get time range for
 
     Returns:
-        Start and end timestamps, or error if MongoDB unavailable
+        Start and end timestamps, or error if the audit store is unavailable
     """
     client = _get_client()
     data = await client.get_audit_time_range(job_id)
     if data is None:
-        return f"No audit time range available for job {job_id} (MongoDB may be unavailable)."
+        return f"No audit time range available for job {job_id} (audit store may be unavailable)."
     start = data.get("start", "unknown")
     end = data.get("end", "unknown")
     return f"Audit time range for job {job_id}:\n  Start: {start}\n  End:   {end}"

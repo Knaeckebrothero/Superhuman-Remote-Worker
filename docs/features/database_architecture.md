@@ -35,13 +35,12 @@ database** (the CloudNativePG-recommended shape).
 |---|---|---|---|
 | `srw-postgres` | `postgres:15` | Control plane: users, jobs, agents, threads + `thread_messages`, projects, datasources, tokens, automations, approvals, settings, `usage_rates`, `quota_limits`, `usage_daily` rollups | Load-bearing OLTP. PITR-forever class. First in line for HA (CloudNativePG track). |
 | `srw-pgvector` | `pgvector/pgvector:pg15` | Semantic: sources, embeddings, memories, citations, knowledge index | Extension-coupled; latency-sensitive reads; rebuildable in principle. Memory-overhaul work (HNSW/halfvec) lands here. |
-| `srw-auditdb` *(new — the Mongo replacement)* | `postgres:15` (or 16, see package) | Observability tier: `agent_audit`, `llm_requests`, `chat_history` (90/90/365d retention) **+ `usage_events` metering ledger** | Append-only, monthly-partitioned, retention-dropped, `synchronous_commit=off` class. Non-load-bearing: product flow survives its outage. |
+| `srw-auditdb` | `postgres:15` (or 16, see package) | Observability tier: `agent_audit`, `llm_requests`, `chat_history` (90/90/365d retention) **+ `usage_events` metering ledger** | Append-only, monthly-partitioned, retention-dropped, `synchronous_commit=off` class. Non-load-bearing: product flow survives its outage. |
 | `srw-keycloakdb` | `postgres:15` | Keycloak's own schema | Vendor-owned. Untouched. |
 | Neo4j | neo4j | Project knowledge graph | Pending the "earning its keep" verdict — metering's `category='query', resource='neo4j'` rows are the instrumentation that answers it. |
 | Homelab `analytics` (TimescaleDB/Spilo) | Spilo | pdu-scraper power data, ops analytics, $/vcpu-hour rate calibration | **Not part of the product.** Inputs to `usage_rates`, never the ledger of record. |
 
-MongoDB disappears at audit-store cutover. Gitea/OpenCloud/NATS own their own
-storage and are out of scope here.
+Gitea/OpenCloud/NATS own their own storage and are out of scope here.
 
 ## The rules (forcing functions)
 
@@ -99,7 +98,7 @@ requirement. TimescaleDB would add columnar compression (~10x) and continuous
 aggregates, at the cost of another non-vanilla image and a licensing check —
 its Community features (compression, caggs) are TSL-licensed: fine for
 internal SaaS use, but redistribution inside the customer-install chart needs
-the licensing-doc treatment first (we are exiting Mongo over exactly this
+the licensing-doc treatment first (we exited Mongo over exactly this
 class of question).
 
 **Decision: plain PG now. Named upgrade trigger:** adopt TimescaleDB for

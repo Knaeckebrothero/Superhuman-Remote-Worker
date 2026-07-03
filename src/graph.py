@@ -3749,7 +3749,7 @@ def create_audited_tool_node(
     """Create a tool node with audit logging, stuck detection, and tool masking.
 
     This wraps LangGraph's ToolNode to add:
-    - MongoDB audit logging for tool calls and results
+    - Postgres audit logging for tool calls and results
     - Fingerprint-based loop detection → tool masking
     - Progress-based stuck detection → diagnostic messages → freeze
     - Category failure tracking → category-wide masking

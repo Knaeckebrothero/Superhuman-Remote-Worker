@@ -257,10 +257,10 @@ class CockpitClient:
     # =========================================================================
 
     def get_llm_request(self, doc_id: str) -> dict[str, Any]:
-        """Get a single LLM request by MongoDB document ID.
+        """Get a single LLM request by its audit-store request ID.
 
         Args:
-            doc_id: MongoDB ObjectId as string (24 hex characters)
+            doc_id: Audit-store request ID (string)
 
         Returns:
             Full LLM request document with messages and response
@@ -713,10 +713,10 @@ class AsyncCockpitClient:
 
     @_create_retry_decorator()
     async def get_llm_request(self, doc_id: str) -> dict[str, Any]:
-        """Get a single LLM request by MongoDB document ID.
+        """Get a single LLM request by its audit-store request ID.
 
         Args:
-            doc_id: MongoDB ObjectId as string (24 hex characters)
+            doc_id: Audit-store request ID (string)
 
         Returns:
             Full LLM request document with messages and response

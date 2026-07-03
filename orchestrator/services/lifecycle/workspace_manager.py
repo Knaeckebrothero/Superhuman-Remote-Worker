@@ -235,8 +235,8 @@ class WorkspaceInstanceManager:
         at last snapshot (``last_snapshot_turns``). Zero turns, or turns equal
         to the snapshot, means clean.
 
-        Jobs: no monotonic turn counter exists in Postgres (audit count is in
-        Mongo — deliberately not consulted here). Conservative: a terminal job
+        Jobs: no monotonic turn counter exists in the app DB (audit count is in
+        the audit store — deliberately not consulted here). Conservative: a terminal job
         with an existing snapshot is clean (it got a completion capture);
         otherwise dirty (attempt a snapshot; the escape hatch bounds the
         unreachable case).

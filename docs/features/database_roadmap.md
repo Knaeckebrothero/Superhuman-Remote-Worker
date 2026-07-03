@@ -25,7 +25,7 @@ partially stale — code drifted). `main.py` always means `orchestrator/main.py`
 
 ## Where we stand (updated 2026-07-03; premises re-verified against code 2026-07-01)
 
-**Phases 1 and 2 are done and on `develop`.** The mechanical debt (QW-1
+**Phases 1, 2, and 3 are done on `develop`.** The mechanical debt (QW-1
 `0c3ba669`, QW-4, and QW-2/3/5/6 in Phase 1 `6343852c`) and the drift keystone
 HF-1 are shipped. The drift HF-1 targeted — **45 app / 7 vector / 2 audit**
 migration files that had silently diverged from the frozen snapshots — is now
@@ -42,7 +42,15 @@ un-stuck in the same arc — the perpetually-red `squawk` job now lints only the
 migrations a push changes rather than re-litigating the whole frozen history
 (`9cae3180`).
 
-Remaining work is Phases 3–7. The research sweep's four premise corrections
+Phase 3 (D-5) then stripped the retired MongoDB audit backend wholesale — the
+two audit modules, the archiver's dual-backend split (now Postgres-only, the
+`AUDIT_BACKEND` selector gone), the `init.py` Mongo family, the Helm
+StatefulSet / mongo-express / NetworkPolicy / values plumbing, and the compose
+services — keeping only the Mongo *datasource* connector. `helm template`
+renders no Mongo resources; the audit trail is served entirely by the Postgres
+`srw-auditdb`.
+
+Remaining work is Phases 4–7. The research sweep's four premise corrections
 still shape them:
 
 1. **HF-3 undercounted**: 13 racy `jobs.context` writers, not 8 — five raw
@@ -304,6 +312,41 @@ the datasource carve-out (no tombstone, no selector, no stale docstrings);
 `helm template` renders no Mongo resources on defaults; the archiver has no
 backend branch; fresh k3d install green through the smoke path; docs
 updated.
+
+**✅ DONE — develop 2026-07-03** (explicit-staged away from the parallel
+`config/experts/developer` + `project_loops.py` work live in the shared tree).
+Deleted `orchestrator/database/mongodb.py` (878) + `src/database/mongo_db.py`
+(338) + `scripts/import_mongo_audit_backup.py`; re-pointed
+`FILTER_MAPPINGS`/`FilterCategory` to `audit_store` in the DB package
+`__init__`. Archiver is now Postgres-only: dropped `_serialize_for_mongo`, the
+Mongo constructor state + `_ensure_connected` arm + `from_env` `AUDIT_BACKEND`
+branch (whose default was the local-dev footgun `mongodb`) + the `_mongo` arm of
+all six write methods + the five dead pure-Mongo read methods. `init.py` lost
+the whole `get/_parse/init/_create_indexes/verify/backup/restore_mongodb` family
++ `--skip-mongodb` + call sites (the datasource seed stays). `main.py` lost the
+dead `mongodb = MongoDB()` global + import + the `AUDIT_BACKEND=mongodb`
+tombstone; the "MongoDB not available" audit strings became "Audit store not
+available". Helm: deleted `mongodb.yaml` + `mongo-express.yaml`, cut the
+`databases.mongodb` / `mongoExpress` / `hosts.mongo` values, the
+`AUDIT_BACKEND`/`MONGODB_URL` configmap+deployment env, the
+`srw.mongodbUrl`/`srw.mongoHost` helpers, the Mongo + mongo-express
+NetworkPolicy + ingress, and the two "datasource"-commented egress rules that
+selected the now-gone internal pod; **`helm template` on defaults + all three CI
+overlays renders 0 Mongo / 0 `AUDIT_BACKEND`, audit DB intact.** All three
+compose files lost the mongo + mongo-express services/volumes/env. Tests:
+deleted `test_llm_requests_filter.py`, repointed `test_audit_pagination`'s
+contract onto `AuditStore.get_job_audit`, rewrote `test_auxiliary`'s
+`TestArchiveError` onto a fake Postgres writer, stripped `TestMongoDB` from
+`test_database_phase1`, de-staled `test_job_access`/`test_audio_helper`/
+`test_archiver_pg`. 340+ pytest green, `ruff` clean, imports resolve (`MongoDB`
+symbol gone from both packages). **Acceptance-grep caveat:** the frozen,
+checksum-guarded migrations (`app/0001_initial.sql`, `audit/0001_initial.sql`),
+the frozen `schema.sql`, and the *generated* `audit_schema_current.sql` retain
+Mongo-parity `COMMENT`s by design — they document the audit wire contract's
+origin and are uneditable (touching an applied migration trips the runner
+checksum; hand-editing the artifact fails the Phase 2a drift gate). Everything
+else the grep returns is the datasource carve-out. Pending: reclaim the homelab
+Mongo PVC + a fresh-k3d smoke walk.
 
 ## Phase 4 — HF-3: atomic `jobs.context` writes (the correctness fix)
 

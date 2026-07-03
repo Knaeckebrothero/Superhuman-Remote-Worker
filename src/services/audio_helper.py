@@ -12,7 +12,7 @@ segment by segment, and concatenated. The caller never sees the chunking.
 Follows the same pattern as VisionHelper:
 - Configurable via environment variables
 - Sync wrappers for use with sync tool signatures
-- Fire-and-forget archiving to MongoDB
+- Fire-and-forget archiving to the Postgres audit store
 - Module-level singleton via get_audio_helper()
 """
 

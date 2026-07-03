@@ -11,7 +11,7 @@ from fastapi import APIRouter, HTTPException, Request
 
 from security.access import require_job_access
 
-# Active audit reader (Mongo or the Postgres AuditStore) + the app DB, set from
+# Active audit reader (the Postgres AuditStore) + the app DB, set from
 # main.py's lifespan. The reader exposes iter_tool_calls(job_id); both qualify.
 _audit_reader: Any = None
 _postgres_db: Any = None
@@ -143,7 +143,7 @@ async def _get_all_tool_calls(job_id: str) -> list[dict[str, Any]]:
     """Get all tool-step entries for a job (step_number order).
 
     Backend-agnostic: the active reader's ``iter_tool_calls`` yields the stitched
-    tool docs (Mongo or Postgres), which the cypher parser consumes unchanged.
+    tool docs (Postgres), which the cypher parser consumes unchanged.
     """
     reader = get_audit_reader()
     if reader is None or not reader.is_available:

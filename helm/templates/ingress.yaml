@@ -8,7 +8,6 @@
 {{- $mcpHost     := include "srw.urlHost" (include "srw.mcpUrl" .) -}}
 {{- $neo4jHost   := include "srw.neo4jBrowserHost" . -}}
 {{- $pgadminHost := include "srw.pgadminHost" . -}}
-{{- $mongoHost   := include "srw.mongoHost" . -}}
 {{- $dozzleHost  := include "srw.dozzleHost" . -}}
 # Cockpit web UI
 apiVersion: networking.k8s.io/v1
@@ -438,48 +437,6 @@ spec:
                 name: {{ $fullName }}-pgadmin
                 port:
                   number: 5050
----
-{{- end }}
-{{- if .Values.mongoExpress.enabled }}
-# Mongo Express (MongoDB admin UI)
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: {{ $fullName }}-mongo-ingress
-  labels:
-    {{- include "srw.componentLabels" (dict "context" . "component" "mongo-express") | nindent 4 }}
-  annotations:
-    {{- if and .Values.ingress.tls.enabled .Values.ingress.tls.issuerName }}
-    cert-manager.io/cluster-issuer: {{ .Values.ingress.tls.issuerName }}
-    {{- end }}
-    {{- if .Values.ingress.tls.enabled }}
-    traefik.ingress.kubernetes.io/router.entrypoints: websecure
-    traefik.ingress.kubernetes.io/router.tls: "true"
-    {{- else }}
-    traefik.ingress.kubernetes.io/router.entrypoints: web
-    {{- end }}
-    {{- with .Values.ingress.annotations }}
-    {{- toYaml . | nindent 4 }}
-    {{- end }}
-spec:
-  ingressClassName: {{ .Values.ingress.className }}
-  {{- if .Values.ingress.tls.enabled }}
-  tls:
-    - hosts:
-        - {{ $mongoHost }}
-      secretName: {{ $fullName }}-mongo-tls
-  {{- end }}
-  rules:
-    - host: {{ $mongoHost }}
-      http:
-        paths:
-          - path: /
-            pathType: Prefix
-            backend:
-              service:
-                name: {{ $fullName }}-mongo-express
-                port:
-                  number: 8081
 ---
 {{- end }}
 {{- if .Values.mcp.enabled }}

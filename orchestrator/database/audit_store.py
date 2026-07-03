@@ -1,24 +1,23 @@
 """Async reader for the Postgres audit store (the cockpit-facing surface).
 
 Counterpart to the agent's :class:`~src.database.audit_writer.SyncAuditWriter`.
-Reproduces the wire shapes of the legacy ``orchestrator/database/mongodb.py``
-reader exactly, so ``main.py`` swaps ``mongodb`` -> ``audit`` with no endpoint or
-cockpit changes beyond the mechanical ``_id``(str) -> ``id``(int) rename.
+Emits the exact wire shape the audit endpoints and cockpit consume, so the read
+path stays fixed and endpoint/cockpit code is unchanged.
 
 Design: ``docs/features/postgres_audit_store_implementation.md`` §5. The two
 load-bearing translations:
 - **Logical-row stitch (D3):** ``agent_audit`` is append-only (pre row at
   dispatch, post row at completion). Every read returns ONE row per ``pre`` row
   with the latest ``post`` merged in via ``LEFT JOIN LATERAL`` + a two-level
-  ``jsonb`` merge, so counts / ``step_number`` / wire shape match Mongo and the
+  ``jsonb`` merge, so counts / ``step_number`` / wire shape stay stable and the
   cockpit needs no collapse logic.
 - **step_number (D10):** synthesized with ``ROW_NUMBER()`` over ALL pre rows of
-  the job, *then* filtered — Mongo docs keep their global step_number under a
-  ``FilterCategory``, so numbering the filtered subset would be wrong.
+  the job, *then* filtered — the wire contract exposes a global step_number
+  under a ``FilterCategory``, so numbering the filtered subset would be wrong.
 
-Degraded behavior mirrors the Mongo reader: ``is_available`` is startup-latched
-(connect/disconnect only); runtime DB loss surfaces as exceptions -> 500s; the
-per-endpoint degraded shapes live in ``main.py`` and stay verbatim.
+Degraded behavior: ``is_available`` is startup-latched (connect/disconnect
+only); runtime DB loss surfaces as exceptions -> 500s; the per-endpoint degraded
+shapes live in ``main.py`` and stay verbatim.
 """
 
 from __future__ import annotations
@@ -38,7 +37,7 @@ logger = logging.getLogger(__name__)
 
 
 def _to_iso_utc(timestamp: Any) -> str:
-    """Datetime -> ISO string with a UTC 'Z' suffix (ported from mongodb.py).
+    """Datetime -> ISO string with a UTC 'Z' suffix.
 
     Naive datetimes are assumed UTC (isoformat + 'Z', microseconds); tz-aware
     values (what asyncpg returns) are converted to UTC and rendered to
@@ -54,7 +53,7 @@ def _to_iso_utc(timestamp: Any) -> str:
     return str(timestamp)
 
 
-# Filter category -> step_types (ported from mongodb.py).
+# Filter category -> step_types.
 FILTER_MAPPINGS: Dict[str, List[str]] = {
     "all": [],
     "messages": ["llm"],
@@ -134,11 +133,11 @@ SELECT f.id, f.job_id, f.agent_type, f.iteration, f.step_type, f.node_name,
 
 
 def _audit_row_to_doc(r: asyncpg.Record) -> Dict[str, Any]:
-    """Stitched agent_audit row -> wire doc (Mongo parity).
+    """Stitched agent_audit row -> wire doc.
 
-    The merged ``payload`` is splatted over the row LAST, reproducing Mongo's
-    ``doc.update(data)`` — including the documented ``phase_complete`` quirk
-    where ``payload.phase`` (an object) shadows the ``phase`` column.
+    The merged ``payload`` is splatted over the row LAST (a dict ``update``) —
+    including the documented ``phase_complete`` quirk where ``payload.phase``
+    (an object) shadows the ``phase`` column.
     ``event_phase`` / ``pre_id`` / the hard ``request_id`` are never on the wire.
     """
     doc: Dict[str, Any] = {
@@ -177,7 +176,7 @@ class AuditStore:
 
     @property
     def is_available(self) -> bool:
-        """Startup-latched (parity with MongoDB.is_available)."""
+        """Startup-latched (connect/disconnect only)."""
         return self._available
 
     @property
@@ -493,7 +492,7 @@ class AuditStore:
 
     @staticmethod
     def _chat_row_to_doc(r: asyncpg.Record) -> Dict[str, Any]:
-        # Mongo always wrote iteration/latency_ms (even None); phase/phase_number/
+        # The wire contract always includes iteration/latency_ms (even None); phase/phase_number/
         # reasoning are conditional.
         doc: Dict[str, Any] = {
             "id": r["id"],
@@ -648,11 +647,11 @@ class AuditStore:
     # -- cache-invalidation version ----------------------------------------
 
     async def get_job_version(self, job_id: str) -> Optional[Dict[str, Any]]:
-        """Single race-free statement (replaces 4 sequential Mongo queries).
+        """Single race-free statement (replaces 4 sequential queries).
 
         Exposed counts are logical (pre rows); the hash gains a 4th component
         (raw row count incl. post rows) so in-place result arrivals invalidate
-        the cockpit cache — the staleness hole Mongo's $set had.
+        the cockpit cache — closing an in-place-update staleness hole.
         """
         if not self._available or self._pool is None:
             return None

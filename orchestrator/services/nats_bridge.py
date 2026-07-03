@@ -6,7 +6,7 @@ to status updates from the VM Controller and Management Daemon.
 
 NATS is fully optional. When NATS_URL is not configured or nats-py is not
 installed, all operations gracefully return False/None and the system works
-identically without it (same pattern as MongoDB in database/mongodb.py).
+identically without it (the same optional-dependency pattern used elsewhere).
 
 Subjects published:
   vm.lifecycle.create.{oid}         Request VM creation
@@ -52,7 +52,7 @@ logger = logging.getLogger(__name__)
 class NatsBridge:
     """Optional NATS bridge for VM lifecycle management.
 
-    Follows the MongoDB graceful degradation pattern: if NATS_URL is not
+    Follows the same optional-dependency graceful degradation pattern: if NATS_URL is not
     configured or nats-py is not installed, all operations are no-ops.
     """
 

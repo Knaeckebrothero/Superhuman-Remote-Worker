@@ -1,13 +1,13 @@
 """Tests for Phase 1 database refactoring.
 
-Tests the new PostgresDB, Neo4jDB, and MongoDB classes.
+Tests the new PostgresDB and Neo4jDB classes.
 """
 
 from unittest.mock import patch
 
 import pytest
 
-from src.database import PostgresDB, Neo4jDB, MongoDB
+from src.database import PostgresDB, Neo4jDB
 
 
 class TestPostgresDB:
@@ -94,55 +94,6 @@ class TestNeo4jDB:
         assert not db.is_connected
 
 
-class TestMongoDB:
-    """Test MongoDB class."""
-
-    def test_init_without_url_uses_env(self):
-        """Test that MongoDB reads from environment."""
-        with patch.dict("os.environ", {"MONGODB_URL": "mongodb://test"}):
-            db = MongoDB()
-            assert db._url == "mongodb://test"
-            assert not db.is_connected
-
-    def test_init_without_url_logs_info(self):
-        """Test MongoDB handles missing URL gracefully."""
-        with patch.dict("os.environ", {}, clear=True):
-            import os
-
-            os.environ.pop("MONGODB_URL", None)
-            db = MongoDB()
-            assert db._url is None
-            assert not db.is_connected
-
-    def test_archive_returns_none_when_not_connected(self, monkeypatch):
-        """Test that archive operations return None when unavailable."""
-        monkeypatch.delenv("MONGODB_URL", raising=False)
-        db = MongoDB(url=None)
-
-        result = db.archive_llm_request(
-            job_id="test", agent_type="creator", messages=[], response={}, model="gpt-4"
-        )
-        assert result is None
-
-    def test_audit_returns_none_when_not_connected(self, monkeypatch):
-        """Test that audit operations return None when unavailable."""
-        monkeypatch.delenv("MONGODB_URL", raising=False)
-        db = MongoDB(url=None)
-
-        result = db.audit_tool_call(
-            job_id="test", agent_type="creator", tool_name="test_tool", inputs={}
-        )
-        assert result is None
-
-    def test_get_trail_returns_empty_when_not_connected(self, monkeypatch):
-        """Test that get operations return empty list when unavailable."""
-        monkeypatch.delenv("MONGODB_URL", raising=False)
-        db = MongoDB(url=None)
-
-        result = db.get_job_audit_trail("test")
-        assert result == []
-
-
 class TestDependencyInjection:
     """Test that instances can be created and injected."""
 
@@ -156,11 +107,6 @@ class TestDependencyInjection:
         """Test Neo4jDB instance creation."""
         db = Neo4jDB(uri="bolt://test", username="neo4j", password="test")
         assert isinstance(db, Neo4jDB)
-
-    def test_mongo_instance_creation(self):
-        """Test MongoDB instance creation."""
-        db = MongoDB()
-        assert isinstance(db, MongoDB)
 
 
 class TestBackwardCompatibility:
