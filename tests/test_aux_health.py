@@ -95,6 +95,8 @@ class TestAuxHeartbeatSummary:
             "consecutive_failures": 0,
             "model": "gemma-4-moe",
             "failing_tasks": {},
+            "on_fallback": False,
+            "last_fallback_error": None,
         }
 
     def test_degraded_lists_only_failing_tasks(self):

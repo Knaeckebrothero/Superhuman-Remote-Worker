@@ -491,6 +491,7 @@ class UniversalAgent:
                 top_p=model_settings.get("top_p"),
                 top_k=model_settings.get("top_k"),
                 model_max_context_tokens=model_settings.get("model_max_context_tokens"),
+                extra_body=model_settings.get("extra_body"),
                 max_retries=1,
             )
             aux_llm = create_llm(aux_llm_config, limits=limits)
@@ -560,6 +561,7 @@ class UniversalAgent:
                 top_p=model_settings.get("top_p"),
                 top_k=model_settings.get("top_k"),
                 model_max_context_tokens=model_settings.get("model_max_context_tokens"),
+                extra_body=model_settings.get("extra_body"),
                 max_retries=1,
             )
             try:
