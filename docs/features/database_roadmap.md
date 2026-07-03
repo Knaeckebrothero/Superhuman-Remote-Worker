@@ -54,7 +54,7 @@ The research sweep materially corrected four premises:
 | Phase | Scope | Effort | Depends on | Status |
 |---|---|---|---|---|
 | 1 | Mechanical quick wins — QW-2, QW-3, QW-5, QW-6 | ~1 day | — (G1 decided: drop) | ✅ done `6343852c` — pushed + deployed on develop; migrate-from-zero + full suite verified |
-| 2 | HF-1 generated schema artifact (keystone) | ~1 day | — | ✅ 2a shipped — script + 3 artifacts + CI gate; 2b (init.py/compose repoint) deferred |
+| 2 | HF-1 generated schema artifact (keystone) | ~1 day | — | ✅ done — 2a `be0540b4` (script + 3 artifacts + CI gate) + 2b (init.py vector→migrations, compose initdb dropped) |
 | 3 | D-5 Mongo code deletion | ~1–2 days | QW-4 soak ✅ (done, >1 week) | todo |
 | 4 | HF-3 atomic context writes (correctness) | ~1–2 days | — | todo |
 | 5 | Perf batch — HF-5, HF-4, HF-6, HF-7, HF-2 | ~3–4 days | — (HF-2 last) | todo |
@@ -203,15 +203,32 @@ freshness-gates via `git add -A … && git diff --cached --quiet`; the existing
 deviation from the flag set above: kept `COMMENT ON` (dropped `--no-comments`)
 so comment-only migrations (e.g. 0036) still show up as drift.
 
-**Deferred to Phase 2b (not started):** the `init.py` vector→`apply_migrations`
-switch and the compose initdb repoint. A pg_dump `--schema-only` artifact seeds
-no `schema_migrations` rows (nor does the frozen `schema.sql`), so mounting one
-at initdb and then running `apply_migrations()` would re-apply 0001→ against
-already-existing tables. This needs a deliberate design choice —
-runner-from-zero (drop the initdb snapshot mounts entirely, per the end-state
-principle) vs artifact-plus-seed-the-ledger — with compose/k3d verification. The
-three committed artifacts + CI gate already make drift detectable, which is the
-keystone; the self-updating install paths are the follow-up.
+**2b done (2026-07-03, runner-from-zero):** `init.py`'s `init_vector_db` now
+builds the vector schema from the migration chain — `PostgresDB(url,
+migrations_dir=MIGRATIONS_VECTOR_DIR).apply_migrations()`, and `reset_schema()`
+on `--force-reset` (mirrors the app path) — instead of loading the frozen
+`vector_schema.sql`, which had drifted to **0 halfvec/HNSW refs** vs the
+migration-built schema's 14. The six stale initdb snapshot mounts were dropped
+from all three `docker-compose*.yaml`: schema now comes from the orchestrator's
+startup `apply_migrations()` (already run for all three DBs at `main.py:5414-16`)
+and `python init.py`, matching k8s (which never used initdb —
+`helm/.../postgres-vector.yaml`).
+
+**Design chosen: runner-from-zero, NOT artifact+seed** — the orchestrator
+already migrates every DB on startup, so the initdb mount was redundant, and a
+pg_dump `--schema-only` artifact seeds no `schema_migrations` rows (which the
+seed-the-ledger alternative would have to synthesize). **The frozen
+`schema.sql`/`vector_schema.sql` files STAY** — tests (`test_recall_store`,
+`test_user_management`, `test_schema_*`) load them directly; only their
+init/deploy uses were removed. (This supersedes this doc's earlier "point
+compose initdb at the generated artifacts" note — that path collides with the
+`schema_migrations` ledger; runner-from-zero is cleaner.)
+
+Verified: modified `init_vector_db` on a scratch `pgvector:pg15` →
+`schema_migrations=7` (the full vector chain, tracked) on both fresh and
+`--force-reset`; 33 init-importing tests pass; ruff clean; all three compose
+files parse. Remaining smoke (non-blocking): a full `podman-compose up` +
+`init.py` on an empty volume, when convenient.
 
 ## Phase 3 — D-5: Mongo code deletion
 
