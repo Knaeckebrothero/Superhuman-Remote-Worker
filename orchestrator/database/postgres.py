@@ -2910,6 +2910,11 @@ class PostgresDB:
 
         Returns:
             List of job dicts ordered by priority DESC, created_at ASC
+
+        Index contract: the WHERE terms below match the partial index
+        idx_jobs_dispatchable (0046_jobs_dispatchable_partial_idx). Keep the
+        statuses LITERAL — rewriting to ``status = ANY($1)`` makes the predicate
+        non-immutable at plan time and permanently disables that index.
         """
         async with self.acquire() as conn:
             rows = await conn.fetch(
@@ -2919,6 +2924,9 @@ class PostgresDB:
                        j.project_id, j.parent_job_id, j.priority,
                        j.branch_name, j.context, j.created_at
                 FROM jobs j
+                -- These three terms are the partial index idx_jobs_dispatchable
+                -- (0046). Statuses MUST stay literal (see docstring); the
+                -- ORDER BY priority DESC, created_at ASC is the index key.
                 WHERE j.status IN ('created', 'paused')
                   AND j.assigned_agent_id IS NULL
                   AND j.freeze_data IS NULL
