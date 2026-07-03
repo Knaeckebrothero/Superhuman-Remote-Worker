@@ -10050,9 +10050,20 @@ async def _spawn_loop_job(
     # hiccup here must never block dispatch.
     if is_loop_execution_role(role) and job.get("repo_name"):
         try:
-            head = await gitea_client.get_commits(job["repo_name"], sha="main", limit=1)
+            # get_branch_head_sha, not get_commits: branch HEAD lookup is what
+            # `/branches/{branch}` is for, and a None here must be loud — the
+            # guard is worthless if it can skip silently.
+            pre_sha = await gitea_client.get_branch_head_sha(job["repo_name"], "main")
+            if pre_sha is None:
+                logger.warning(
+                    "project loop %s: no-op guard could not read `main` HEAD on "
+                    "%s at spawn — integrity check for job %s will be skipped",
+                    loop.get("id"),
+                    job["repo_name"],
+                    str(job["id"])[:8],
+                )
             await postgres_db.merge_job_context(
-                str(job["id"]), {"pre_main_sha": (head[0]["sha"] if head else None)}
+                str(job["id"]), {"pre_main_sha": pre_sha}
             )
         except Exception:
             logger.exception(
@@ -10125,10 +10136,17 @@ async def _advance_project_loop(
 
             completed_role = (ctx or {}).get("loop_role")
             if is_loop_execution_role(completed_role) and job.get("repo_name"):
-                head = await gitea_client.get_commits(
-                    job["repo_name"], sha="main", limit=1
+                post_sha = await gitea_client.get_branch_head_sha(
+                    job["repo_name"], "main"
                 )
-                post_sha = head[0]["sha"] if head else None
+                if post_sha is None:
+                    logger.warning(
+                        "project loop %s: no-op guard could not read `main` HEAD "
+                        "on %s — integrity check for job %s skipped",
+                        loop_id,
+                        job["repo_name"],
+                        str(job["id"])[:8],
+                    )
                 pre_sha = (ctx or {}).get("pre_main_sha")
                 if post_sha and pre_sha and post_sha == pre_sha:
                     await postgres_db.update_job_merge_status(

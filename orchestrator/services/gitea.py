@@ -799,9 +799,20 @@ class GiteaClient:
         client = self._get_client()
 
         try:
+            # NOTE: this must be `/commits`, not `/git/commits` — the latter
+            # only resolves specific commit SHAs and 404s on branch names.
             resp = await client.get(
-                f"{self._url}/api/v1/repos/{self._user}/{repo_name}/git/commits",
-                params={"sha": sha, "page": page, "limit": limit},
+                f"{self._url}/api/v1/repos/{self._user}/{repo_name}/commits",
+                params={
+                    "sha": sha,
+                    "page": page,
+                    "limit": limit,
+                    # Skip per-commit diff stats / signature checks — callers
+                    # only read sha, message, author, date.
+                    "stat": "false",
+                    "verification": "false",
+                    "files": "false",
+                },
             )
             if resp.status_code == 404:
                 return None
