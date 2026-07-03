@@ -277,6 +277,9 @@ if not _vector_url:
 vector_db = PostgresDB(
     connection_string=_vector_url,
     migrations_dir=MIGRATIONS_VECTOR_DIR,
+    env_prefix="VECTOR_POSTGRES",
+    default_min_connections=1,
+    default_max_connections=5,
 )
 
 # Audit DB — observability-tier instance holding the audit trail
@@ -287,7 +290,13 @@ vector_db = PostgresDB(
 # Hence: skip silently, never raise.
 _audit_url = _build_pg_url("AUDIT_POSTGRES", fallback_env="AUDIT_DB_URL")
 audit_db = (
-    PostgresDB(connection_string=_audit_url, migrations_dir=MIGRATIONS_AUDIT_DIR)
+    PostgresDB(
+        connection_string=_audit_url,
+        migrations_dir=MIGRATIONS_AUDIT_DIR,
+        env_prefix="AUDIT_POSTGRES",
+        default_min_connections=1,
+        default_max_connections=4,
+    )
     if _audit_url
     else None
 )
