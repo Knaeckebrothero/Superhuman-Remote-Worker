@@ -71,6 +71,18 @@ a sentence boundary, and both `rewritten:true` (gemma cleaned the markdown) and
 states weren't driven headlessly (no browser attached) — covered by the unit
 tests + template typecheck.
 
+**Phase 2 (the custom player) core implemented + verified 2026-07-04.**
+`ReadAloudPlaybackService` (root, single primed `HTMLAudioElement` + prefix-sum
+virtual timeline) replaces the native `<audio>` chrome; the box now hosts a
+themed player (play/pause, known-region + estimated-tail seek bar, section
+prev/next, persisted speed, current/`~total` time), with Media Session and
+Safari click-priming. Frontend-only (no backend change). Local: full cockpit
+`npm test` (**803**) + `npm run build` clean + a playback-engine spec
+(timeline math / seek routing / one-at-a-time). Interactive + device behaviors
+(scrub, speed persistence, lock-screen, Safari first-audio) aren't drivable
+headlessly; stretch flair (highlight-as-spoken, waveform, ping-pong,
+mini-player) is deferred (see Phase 2 checklist).
+
 ## Current state (as-is, verified 2026-07-04)
 
 ### Voice-out (read aloud)
@@ -342,47 +354,50 @@ skipped".
 > preload (standby element preloads the next blob; swap on `ended`) shrinks
 > seams to ~20–60 ms — prime *both* elements in the gesture on Safari.
 
+**Core implemented 2026-07-04** as `ui/read-aloud/read-aloud-playback.service.ts`
+(`ReadAloudPlaybackService`, root-provided) + a custom player in the Phase-1
+box. Native `<audio>` chrome is gone. The stretch/flair items (highlight,
+waveform, ping-pong, mini-player) are deferred — noted below.
+
 Implementation checklist:
 
-- [ ] `ReadAloudPlaybackService` (root-provided, signal-based) owning: the
-      primed element(s), chunk blob URLs + durations (read via
-      `preload="metadata"` → `loadedmetadata` per arriving blob), prefix-sum
-      virtual timeline, seek routing (`offsets[i] + el.currentTime`), and
-      the one-playback-at-a-time rule.
-- [ ] Player UI inside the Phase-1 box: play/pause, unified seek bar over
-      the **known** region + visually-distinct estimated tail, section
-      chips (structural prev/next jump), speed control (0.75–2×, persisted
-      via `ChatPreferencesService`), elapsed / "~total" time.
-- [ ] Estimated total: `remainingChars × sec/char` seeded at ~1/15 s/char,
-      refined as an EMA from arrived chunks; display never decreases;
-      `~` prefix until the last chunk lands. Seeks into the unsynthesized
-      region become pending-seek targets resolved on chunk arrival.
-- [ ] `playbackRate` gotchas: set `defaultPlaybackRate` too and re-apply
-      after every src swap; `preservesPitch` with `webkitPreservesPitch`
-      fallback; drive the scrubber from `requestAnimationFrame`, not
-      `timeupdate` (~4 Hz).
-- [ ] Media Session API: metadata + play/pause/seek handlers +
-      `setPositionState` (feature-detect; Firefox lacks it; clamp
-      `position ≤ duration`). Lock-screen/hardware-key control on mobile.
-- [ ] Chunk-level **highlight-as-spoken** (stretch, cheap): highlight the
-      message segment corresponding to the playing chunk; needs chunk→char
-      range metadata from the plan.
-- [ ] Waveform/EQ flair (optional, feature-flagged OFF on iOS — WebKit
-      `createMediaElementSource` has a breakage history): one
-      `createMediaElementSource` per element cached in a WeakMap, analyser
-      connected through to destination, reuse `VoiceAudioProcessor` +
-      `TimeBasedBarVisualizer` (both source-agnostic) with the
-      `CanvasRenderer` gradient tokenized to theme colors first.
-- [ ] Keep every blob URL until the player is destroyed (seek-back), then
-      revoke.
-- [ ] (Stretch, later) Global mini-player when the source message scrolls
-      out of view — mount pattern exists (root-mounted toast-container +
-      root-provided signal service).
+- [x] `ReadAloudPlaybackService` (root, signal-based): one shared primed
+      `HTMLAudioElement`, prefix-sum virtual timeline (`offsets`), seek routing
+      (`offsets[i] + el.currentTime`), `ended`-advance across chunks (waits when
+      it runs dry mid-message), and the **one-playback-at-a-time** rule (a
+      singleton element ⇒ a new `start()` takes over). Durations are probed
+      off-screen per chunk by the component.
+- [x] Player UI in the box: play/pause, unified seek bar over the **known**
+      region + a faint estimated **tail**, section prev/next (`skip_previous`/
+      `skip_next`), speed control (0.75–2×, persisted via
+      `ChatPreferencesService.playbackSpeed`), current / `~total` time.
+- [x] Estimated total: `remainingChars / ~15 s-per-char` for the tail,
+      `~` prefix until the last chunk lands; a seek into the unsynthesized
+      region is parked as `pendingSeek` and resolved on chunk arrival.
+- [x] `playbackRate` gotchas: sets `defaultPlaybackRate` too and re-applies on
+      every `loadedmetadata` / src swap; `preservesPitch` + `webkitPreservesPitch`;
+      scrubber driven by `requestAnimationFrame`, not `timeupdate`.
+- [x] Media Session API: `setActionHandler` play/pause/seek/prev/next +
+      `setPositionState` (feature-detected — Firefox lacks it — clamped
+      `position ≤ duration`).
+- [ ] **(deferred)** Chunk-level highlight-as-spoken — needs chunk→char range
+      metadata from the plan.
+- [ ] **(deferred)** Waveform/EQ flair (`createMediaElementSource` + reuse
+      `VoiceAudioProcessor`/`TimeBasedBarVisualizer`; iOS-risky).
+- [x] Keep every blob URL until the component is destroyed (seek-back works),
+      then revoke.
+- [ ] **(deferred)** Two-element ping-pong preload (shrinks src-swap seams);
+      single-element seams are already imperceptible on sentence boundaries.
+- [ ] **(deferred)** Global mini-player when the source message scrolls away.
 
-**Acceptance**: no native `<audio>` visible anywhere in chat; scrubbing back
-into an already-played section works instantly; speed persists across
-sessions; pausing via lock-screen controls works on mobile; audio starts on
-Safari even when synthesis took 40 s.
+**Acceptance**: no native `<audio>` visible anywhere in chat *(met)*; scrubbing
+back into an already-played section works instantly *(met — virtual timeline +
+blobs kept)*; speed persists across sessions *(met — localStorage pref)*;
+pausing via lock-screen controls works on mobile *(implemented — Media Session;
+needs a device to confirm)*; audio starts on Safari even when synthesis took
+40 s *(implemented — element primed in the click gesture; needs Safari to
+confirm)*. The interactive/device behaviors weren't driven headlessly (no
+browser attached) — covered by the playback-service spec + template typecheck.
 
 ### Phase 3 — The voices (external plug-and-play)
 

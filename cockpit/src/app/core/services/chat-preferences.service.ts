@@ -5,6 +5,7 @@ const REASONING_EXPANDED_KEY = 'cockpit:chat:reasoningExpanded';
 const TOOL_CALLS_EXPANDED_KEY = 'cockpit:chat:toolCallsExpanded';
 const READING_WIDTH_KEY = 'cockpit:chat:readingWidth';
 const TEXT_SIZE_KEY = 'cockpit:chat:textSize';
+const PLAYBACK_SPEED_KEY = 'cockpit:chat:playbackSpeed';
 
 /** Reading-column width preset for the chat transcript. */
 export type ReadingWidth = 'comfortable' | 'wide' | 'full';
@@ -13,6 +14,10 @@ export const READING_WIDTHS: readonly ReadingWidth[] = ['comfortable', 'wide', '
 /** Prose text-size preset for the chat transcript. */
 export type ChatTextSize = 'small' | 'medium' | 'large';
 export const CHAT_TEXT_SIZES: readonly ChatTextSize[] = ['small', 'medium', 'large'];
+
+/** Read-aloud playback speed preset (stored as a string enum via readEnum). */
+export type PlaybackSpeed = '0.75' | '1' | '1.25' | '1.5' | '2';
+export const PLAYBACK_SPEEDS: readonly PlaybackSpeed[] = ['0.75', '1', '1.25', '1.5', '2'];
 
 /**
  * Device-local display preferences for the persistent-chat view.
@@ -87,6 +92,21 @@ export class ChatPreferencesService {
   setTextSize(size: ChatTextSize): void {
     this.textSize.set(size);
     this.writeString(TEXT_SIZE_KEY, size);
+  }
+
+  /**
+   * Read-aloud playback speed. Defaults to `1` (normal). The custom player's
+   * speed control cycles through {@link PLAYBACK_SPEEDS}; the choice persists
+   * per device (the single most-requested TTS control industry-wide).
+   */
+  readonly playbackSpeed = signal<PlaybackSpeed>(
+    this.readEnum(PLAYBACK_SPEED_KEY, PLAYBACK_SPEEDS, '1'),
+  );
+
+  /** Set the playback speed and persist it for this device. */
+  setPlaybackSpeed(speed: PlaybackSpeed): void {
+    this.playbackSpeed.set(speed);
+    this.writeString(PLAYBACK_SPEED_KEY, speed);
   }
 
   /** Read a stored value, returning the fallback unless it's a known member. */

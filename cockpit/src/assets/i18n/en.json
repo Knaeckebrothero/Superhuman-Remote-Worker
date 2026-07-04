@@ -1161,7 +1161,11 @@
       "retryPart": "Retry part {{part}}",
       "autoRetry": "Audio server didn't respond — retrying (attempt {{attempt}} of {{max}})…",
       "hardFail": "Audio generation failed after {{part}} of {{total}} parts. Your finished parts are kept.",
-      "keepReading": "You can keep reading the text above."
+      "keepReading": "You can keep reading the text above.",
+      "pause": "Pause",
+      "prevPart": "Previous section",
+      "nextPart": "Next section",
+      "speed": "Playback speed"
     },
     "code": {
       "expandHint": "Click to expand",
