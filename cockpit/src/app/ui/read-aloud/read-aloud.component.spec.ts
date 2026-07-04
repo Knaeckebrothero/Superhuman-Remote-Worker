@@ -30,7 +30,12 @@ function create(ttsAvailable: boolean | null = true): AppReadAloudComponent {
       },
       {
         provide: ReadAloudPlaybackService,
-        useValue: {isActive: () => false, stopIfActive: vi.fn(), prime: vi.fn()},
+        useValue: {
+          isActive: () => false,
+          stopIfActive: vi.fn(),
+          prime: vi.fn(),
+          markComplete: vi.fn(),
+        },
       },
     ],
   });

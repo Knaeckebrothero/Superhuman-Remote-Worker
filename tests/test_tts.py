@@ -906,3 +906,340 @@ class TestVoiceCapabilitiesEndpoint:
         ):
             result = await main.voice_capabilities(MagicMock())
         assert result == {"tts": False, "stt": True}
+
+
+# ---------------------------------------------------------------------------
+# Markdown-strip fallback: a timed-out/absent rewrite must still read cleanly
+# (no "asterisk asterisk", no table pipes).
+# ---------------------------------------------------------------------------
+
+
+class TestStripMarkdownForSpeech:
+    def test_strips_emphasis_and_headers(self):
+        from services.tts import _strip_markdown_for_speech
+
+        out = _strip_markdown_for_speech("# Title\n\nThis is **bold** and *italic*.")
+        assert "*" not in out
+        assert "#" not in out
+        assert "bold" in out and "italic" in out
+
+    def test_links_become_text_images_dropped(self):
+        from services.tts import _strip_markdown_for_speech
+
+        out = _strip_markdown_for_speech("See [the docs](http://x) and ![alt](y.png).")
+        assert "the docs" in out
+        assert "http://x" not in out and "y.png" not in out and "alt" not in out
+
+    def test_table_becomes_sentences_no_pipes(self):
+        from services.tts import _strip_markdown_for_speech
+
+        md = "| Metal | Price |\n| --- | --- |\n| Neodymium | 155 |\n| Terbium | 1103 |"
+        out = _strip_markdown_for_speech(md)
+        assert "|" not in out
+        assert "Neodymium, 155." in out
+        assert "Terbium, 1103." in out
+        assert "---" not in out
+
+    def test_code_fence_becomes_placeholder(self):
+        from services.tts import _strip_markdown_for_speech
+
+        out = _strip_markdown_for_speech(
+            "Before\n\n```python\nprint('hi')\n```\n\nAfter"
+        )
+        assert "```" not in out and "print" not in out
+        assert "code snippet" in out
+        assert "Before" in out and "After" in out
+
+    def test_preserves_snake_case_identifiers(self):
+        from services.tts import _strip_markdown_for_speech
+
+        # Single underscores (identifiers) must survive — only emphasis is stripped.
+        assert "user_id" in _strip_markdown_for_speech("The user_id column is a key.")
+
+
+# ---------------------------------------------------------------------------
+# Streaming chunk plan: sentinel parsing + stream_tts_chunks generator.
+# ---------------------------------------------------------------------------
+
+
+class TestDrainSentinels:
+    def test_no_sentinel_all_remainder(self):
+        from services.tts import _drain_sentinels
+
+        assert _drain_sentinels("partial text") == ([], "partial text")
+
+    def test_splits_complete_chunks_keeps_tail(self):
+        from services.tts import _drain_sentinels
+
+        chunks, rem = _drain_sentinels("First.[[BREAK]]Second.[[BREAK]]Third")
+        assert chunks == ["First.", "Second."]
+        assert rem == "Third"
+
+    def test_partial_sentinel_stays_in_remainder(self):
+        from services.tts import _drain_sentinels
+
+        chunks, rem = _drain_sentinels("First.[[BR")
+        assert chunks == []
+        assert rem == "First.[[BR"
+
+
+class _FakeStream:
+    """Async-iterable OpenAI streaming double: yields content-delta events for
+    each string in ``pieces``, then a final usage-only event."""
+
+    def __init__(self, pieces, usage=None):
+        self._events = [
+            MagicMock(choices=[MagicMock(delta=MagicMock(content=p))], usage=None)
+            for p in pieces
+        ]
+        self._events.append(MagicMock(choices=[], usage=usage))
+
+    def __aiter__(self):
+        self._it = iter(self._events)
+        return self
+
+    async def __anext__(self):
+        try:
+            return next(self._it)
+        except StopIteration:
+            raise StopAsyncIteration
+
+
+def _mock_openai_stream(pieces, usage=None):
+    """(class, client) whose chat.completions.create(stream=True) yields ``pieces``."""
+    client = MagicMock()
+    client.chat.completions.create = AsyncMock(return_value=_FakeStream(pieces, usage))
+    client.close = AsyncMock()
+    return MagicMock(return_value=client), client
+
+
+async def _collect(agen):
+    return [ev async for ev in agen]
+
+
+class TestStreamTtsChunks:
+    @pytest.mark.asyncio
+    async def test_unavailable_without_tts_model(self):
+        from services.tts import stream_tts_chunks
+
+        with patch("services.tts._resolve_capability_credentials", _caps(tts=None)):
+            events = await _collect(
+                stream_tts_chunks(content="hello", user_id="u1", postgres_db=_mock_db())
+            )
+        assert events == [{"type": "unavailable"}]
+
+    @pytest.mark.asyncio
+    async def test_streams_chunks_split_on_sentinel(self):
+        from services.tts import stream_tts_chunks
+
+        # Deltas deliberately split a sentinel across the boundary.
+        cls, _ = _mock_openai_stream(
+            ["First chunk.[[BR", "EAK]]Second chunk.[[BREAK]]Third chunk."]
+        )
+        with (
+            patch("services.tts.AsyncOpenAI", cls),
+            patch("services.tts._resolve_capability_credentials", _caps()),
+        ):
+            events = await _collect(
+                stream_tts_chunks(
+                    content="some **markdown** message",
+                    user_id="u1",
+                    postgres_db=_mock_db(),
+                )
+            )
+        chunks = [e for e in events if e["type"] == "chunk"]
+        assert [c["text"] for c in chunks] == [
+            "First chunk.",
+            "Second chunk.",
+            "Third chunk.",
+        ]
+        assert all(c["rewritten"] is True for c in chunks)
+        assert events[-1] == {"type": "done", "total": 3, "rewritten": True}
+
+    @pytest.mark.asyncio
+    async def test_size_flush_without_sentinel(self):
+        """The real-world case: the model rewrites well but ignores the sentinel
+        and streams one blob. The parser must still chunk incrementally by size at
+        sentence boundaries — a short first chunk, then target-sized chunks."""
+        from services.tts import TTS_FIRST_CHUNK_TARGET, stream_tts_chunks
+
+        pieces = [f"This is sentence number {i}. " for i in range(120)]  # ~3.3k chars
+        cls, _ = _mock_openai_stream(pieces)
+        with (
+            patch("services.tts.AsyncOpenAI", cls),
+            patch("services.tts._resolve_capability_credentials", _caps()),
+        ):
+            events = await _collect(
+                stream_tts_chunks(content="long", user_id="u1", postgres_db=_mock_db())
+            )
+        chunks = [e for e in events if e["type"] == "chunk"]
+        assert len(chunks) >= 2  # chunked despite no sentinel
+        assert len(chunks[0]["text"]) <= TTS_FIRST_CHUNK_TARGET  # short first chunk
+        assert chunks[0]["text"].endswith(".")  # cut at a sentence boundary
+        assert all(c["rewritten"] is True for c in chunks)
+
+    @pytest.mark.asyncio
+    async def test_fallback_without_aux_strips_markdown(self):
+        from services.tts import stream_tts_chunks
+
+        with patch("services.tts._resolve_capability_credentials", _caps(aux=None)):
+            events = await _collect(
+                stream_tts_chunks(
+                    content="Here is **bold** text with a | pipe | table.",
+                    user_id="u1",
+                    postgres_db=_mock_db(),
+                )
+            )
+        chunks = [e for e in events if e["type"] == "chunk"]
+        assert chunks and all(c["rewritten"] is False for c in chunks)
+        joined = " ".join(c["text"] for c in chunks)
+        assert "*" not in joined and "|" not in joined
+        assert events[-1]["type"] == "done" and events[-1]["rewritten"] is False
+
+    @pytest.mark.asyncio
+    async def test_empty_stream_falls_back(self):
+        from services.tts import stream_tts_chunks
+
+        cls, _ = _mock_openai_stream([""])  # model produced nothing usable
+        with (
+            patch("services.tts.AsyncOpenAI", cls),
+            patch("services.tts._resolve_capability_credentials", _caps()),
+        ):
+            events = await _collect(
+                stream_tts_chunks(
+                    content="short message", user_id="u1", postgres_db=_mock_db()
+                )
+            )
+        chunks = [e for e in events if e["type"] == "chunk"]
+        assert [c["text"] for c in chunks] == ["short message"]
+        assert all(c["rewritten"] is False for c in chunks)
+
+    @pytest.mark.asyncio
+    async def test_meters_stream_usage(self):
+        from services.tts import stream_tts_chunks
+
+        usage = MagicMock(prompt_tokens=11, completion_tokens=22)
+        cls, _ = _mock_openai_stream(["One.[[BREAK]]Two."], usage=usage)
+        led = _mock_ledger()
+        with (
+            patch("services.tts.AsyncOpenAI", cls),
+            patch("services.tts._resolve_capability_credentials", _caps()),
+        ):
+            await _collect(
+                stream_tts_chunks(
+                    content="hi",
+                    user_id="u1",
+                    postgres_db=_mock_db(),
+                    ledger=led,
+                    ref_id="t1",
+                )
+            )
+        led.record_events.assert_awaited()
+        (events,), _ = led.record_events.call_args
+        assert {e.unit for e in events} == {"prompt-token", "completion-token"}
+        assert all(e.details["stage"] == "chunk-stream" for e in events)
+
+
+class TestPlanRawMode:
+    @pytest.mark.asyncio
+    async def test_reformulate_false_skips_aux_and_strips_markdown(self):
+        from services.tts import plan_tts_chunks
+
+        cls, _ = _mock_openai_chat('["should not be used"]')
+        with (
+            patch("services.tts.AsyncOpenAI", cls),
+            patch("services.tts._resolve_capability_credentials", _caps()),
+        ):
+            result = await plan_tts_chunks(
+                content="This is **bold** and has a | table | row.",
+                user_id="u1",
+                postgres_db=_mock_db(),
+                reformulate=False,
+            )
+        cls.assert_not_called()  # aux LLM never invoked in raw mode
+        assert result["rewritten"] is False
+        joined = " ".join(result["chunks"])
+        assert "*" not in joined and "|" not in joined
+
+
+class TestTtsPlanStreamEndpoint:
+    def test_route_is_registered(self):
+        from main import app
+
+        routes = {
+            (m, getattr(r, "path", ""))
+            for r in app.routes
+            for m in (getattr(r, "methods", None) or set())
+        }
+        assert (
+            "POST",
+            "/api/persistent/threads/{thread_id}/tts/plan/stream",
+        ) in routes
+
+    @pytest.mark.asyncio
+    async def test_emits_sse_frames(self):
+        """The handler must wrap the service generator into the house SSE wire
+        format: a kickstart comment, `event: chunk` frames, then `event: done`."""
+        import main
+
+        async def _fake_stream(**_):
+            yield {"type": "chunk", "index": 0, "text": "Hello.", "rewritten": True}
+            yield {"type": "chunk", "index": 1, "text": "World.", "rewritten": True}
+            yield {"type": "done", "total": 2, "rewritten": True}
+
+        with (
+            patch.object(
+                main,
+                "require_thread_owner",
+                AsyncMock(return_value=({"id": "u1"}, {"id": "t1"})),
+            ),
+            patch("services.tts.stream_tts_chunks", _fake_stream),
+        ):
+            resp = await main.stream_thread_message_tts_plan(
+                thread_id="t1", request=MagicMock(), body={"content": "hi"}
+            )
+            assert resp.media_type == "text/event-stream"
+            frames = "".join([chunk async for chunk in resp.body_iterator])
+
+        assert frames.startswith(": open")  # kickstart comment
+        assert frames.count("event: chunk") == 2
+        assert '"index": 0' in frames and '"text": "Hello."' in frames
+        assert "event: done" in frames and '"total": 2' in frames
+
+    @pytest.mark.asyncio
+    async def test_maps_unavailable_event(self):
+        import main
+
+        async def _fake_stream(**_):
+            yield {"type": "unavailable"}
+
+        with (
+            patch.object(
+                main,
+                "require_thread_owner",
+                AsyncMock(return_value=({"id": "u1"}, {"id": "t1"})),
+            ),
+            patch("services.tts.stream_tts_chunks", _fake_stream),
+        ):
+            resp = await main.stream_thread_message_tts_plan(
+                thread_id="t1", request=MagicMock(), body={"content": "hi"}
+            )
+            frames = "".join([chunk async for chunk in resp.body_iterator])
+        assert "event: unavailable" in frames
+        assert "event: chunk" not in frames
+
+    @pytest.mark.asyncio
+    async def test_400_on_empty_content(self):
+        import main
+        from fastapi import HTTPException
+
+        with patch.object(
+            main,
+            "require_thread_owner",
+            AsyncMock(return_value=({"id": "u1"}, {"id": "t1"})),
+        ):
+            with pytest.raises(HTTPException) as exc:
+                await main.stream_thread_message_tts_plan(
+                    thread_id="t1", request=MagicMock(), body={"content": "  "}
+                )
+        assert exc.value.status_code == 400
