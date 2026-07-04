@@ -10935,6 +10935,52 @@ async def complete_job(
                             f"Failed to stash/clear freeze on paused job {job_id}: {e}"
                         )
 
+                    # Progress-aware drain backstop (defense-in-depth for the
+                    # version_upgrade drain livelock,
+                    # docs/issues/version_upgrade_drain_livelock.md). Detects a
+                    # re-dispatch loop that is NOT advancing (freeze phase_number
+                    # stuck) and alerts, rather than letting it churn invisibly.
+                    # Pure decision in services.completion; I/O stays here.
+                    try:
+                        from services.completion import auto_continue_drain_update
+
+                        ctx = job.get("context") or {}
+                        if isinstance(ctx, str):
+                            ctx = json.loads(ctx)
+                        cap = int(os.environ.get("AUTO_CONTINUE_DRAIN_ALERT_CAP", "10"))
+                        drains, last_phase, should_alert = auto_continue_drain_update(
+                            ctx or {}, fd_row, cap=cap
+                        )
+                        await postgres_db.merge_job_context(
+                            job_id,
+                            {
+                                "auto_continue_drains": drains,
+                                "auto_continue_last_phase": last_phase,
+                            },
+                        )
+                        if should_alert:
+                            logger.error(
+                                f"Job {job_id}: {drains} consecutive "
+                                f"{fd_row.get('freeze_type')} re-dispatches with NO "
+                                f"phase progress (stuck at phase {last_phase}) — the "
+                                f"agent-side resume-clear may be failing; alerting "
+                                f"operator."
+                            )
+                            try:
+                                await _notify_operator_freeze(
+                                    job, job_id, fd_row.get("freeze_type"), fd_row
+                                )
+                            except Exception as _ne:
+                                logger.warning(
+                                    f"Failed to alert on drain-stall for "
+                                    f"{job_id}: {_ne}"
+                                )
+                    except Exception as e:
+                        logger.warning(
+                            f"Failed to update auto-continue drain counter for "
+                            f"{job_id}: {e}"
+                        )
+
             # Set completed_at for terminal statuses
             if new_status == "completed":
                 try:

@@ -67,6 +67,27 @@ from .utils.db_url import checkpointer_backend, resolve_checkpoint_url
 # it on every job.
 _PG_CHECKPOINT_SCHEMA_READY = False
 
+# Freeze types that mean "pause, then auto-continue the SAME job" — mirrors the
+# orchestrator's AUTO_REDISPATCH_FREEZE_TYPES plus llm_unavailable (which the
+# outage sweeper re-dispatches). Each of these freezes inside the graph with
+# should_stop=True, so the run reaches END and the checkpoint persists
+# should_stop=True. On a graceful resume with no feedback/delegation, that
+# persisted flag must be cleared BEFORE ainvoke — otherwise ainvoke(None) on an
+# ended thread runs zero nodes and returns the terminal frozen state, wedging the
+# job in an invisible re-freeze loop. See
+# docs/issues/version_upgrade_drain_livelock.md. Human-review stops
+# (budget_exceeded → pending_review, genuine completions) are intentionally NOT
+# in this set, so they stay stopped.
+_AUTO_CONTINUE_FREEZE_TYPES = frozenset(
+    {
+        "version_upgrade",
+        "llm_unavailable",
+        "memory_unavailable",
+        "kb_unavailable",
+        "workspace_upgrade_required",
+    }
+)
+
 
 class _AiosqliteConnectionWrapper:
     """Wrapper for aiosqlite.Connection that adds is_alive() method.
@@ -919,6 +940,57 @@ class UniversalAgent:
                     f"Injected delegation results into graph state "
                     f"({len(delegation_results)} children)"
                 )
+
+            # Auto-continue resume (version_upgrade / llm_unavailable / memory /
+            # workspace-upgrade): a graceful re-dispatch with NO feedback and NO
+            # delegation. The prior in-graph freeze persisted should_stop=True +
+            # freeze_data in the checkpoint and the run reached END. ainvoke(None)
+            # on an ended thread with should_stop=True runs ZERO nodes and returns
+            # the terminal frozen state — so restore_todo_state (which clears the
+            # stop flags on resume) never runs and the job re-freezes forever with
+            # no progress. Clear the terminal stop flags here (mirroring the
+            # feedback/delegation paths above, as_node="__start__") so
+            # route_entry → restore_todo_state → execute re-enters and the job
+            # resumes from its checkpoint. Scoped to auto-continue freeze types so
+            # human-review stops are untouched.
+            # See docs/issues/version_upgrade_drain_livelock.md.
+            if (
+                resume
+                and graph_input is None
+                and not feedback
+                and not delegation_results
+            ):
+                try:
+                    snapshot = await self._graph.aget_state(thread_config)
+                    values = snapshot.values or {}
+                    frozen = values.get("freeze_data") or {}
+                    freeze_type = (
+                        frozen.get("freeze_type") if isinstance(frozen, dict) else None
+                    )
+                    if (
+                        values.get("should_stop")
+                        and freeze_type in _AUTO_CONTINUE_FREEZE_TYPES
+                    ):
+                        await self._graph.aupdate_state(
+                            thread_config,
+                            {
+                                "should_stop": False,
+                                "goal_achieved": False,
+                                "is_final_phase": False,
+                                "freeze_data": None,
+                            },
+                            as_node="__start__",
+                        )
+                        logger.info(
+                            f"[{job_id}] Auto-continue resume ({freeze_type}) — "
+                            f"cleared terminal stop flags so the graph re-enters "
+                            f"and resumes from its checkpoint"
+                        )
+                except Exception as e:
+                    logger.warning(
+                        f"[{job_id}] Failed to clear stop flags on auto-continue "
+                        f"resume (job may re-freeze without progress): {e}"
+                    )
 
             if stream:
                 # For streaming, cleanup happens inside the generator
