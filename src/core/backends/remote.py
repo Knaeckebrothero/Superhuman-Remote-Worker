@@ -271,25 +271,19 @@ class RemoteBackend(WorkspaceBackend):
         return transport is not None and transport.is_active()
 
     def _ensure_connected(self) -> None:
-        """Reconnect with backoff if the SSH connection is dead."""
+        """Reconnect if the SSH connection is dead.
+
+        connect() owns the ENTIRE retry budget (attempts, backoff, cause
+        classification). This method must NOT wrap it in a second retry loop —
+        the nested loops multiplied the budget to max_retries² and turned a
+        dead-workspace call into a ~15-min stall.
+        See docs/issues/agent_fast_freeze_on_dead_workspace.md.
+        """
         if self.is_connected():
             return
-
         logger.warning(f"SSH connection to {self._host} lost, reconnecting...")
-        backoff = 1.0
-        for attempt in range(1, self._max_retries + 1):
-            try:
-                self.connect()
-                logger.info(f"Reconnected to {self._host} on attempt {attempt}")
-                return
-            except WorkspaceUnavailableError:
-                if attempt == self._max_retries:
-                    raise
-                logger.warning(
-                    f"Reconnect attempt {attempt} failed, retrying in {backoff}s"
-                )
-                time.sleep(backoff)
-                backoff = min(backoff * 2, 10.0)
+        self.connect()
+        logger.info(f"Reconnected to {self._host}")
 
     def _exec(self, command: str, timeout: int = 30) -> str:
         """Execute a command via SSH and return stdout.
