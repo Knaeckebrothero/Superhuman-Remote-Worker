@@ -1161,7 +1161,11 @@
       "retryPart": "Teil {{part}} erneut",
       "autoRetry": "Audio-Server hat nicht geantwortet — erneuter Versuch ({{attempt}} von {{max}})…",
       "hardFail": "Audioerzeugung nach {{part}} von {{total}} Teilen fehlgeschlagen. Fertige Teile bleiben erhalten.",
-      "keepReading": "Du kannst den Text oben weiterlesen."
+      "keepReading": "Du kannst den Text oben weiterlesen.",
+      "pause": "Pause",
+      "prevPart": "Vorheriger Abschnitt",
+      "nextPart": "Nächster Abschnitt",
+      "speed": "Wiedergabegeschwindigkeit"
     },
     "code": {
       "expandHint": "Klicken zum Ausklappen",
