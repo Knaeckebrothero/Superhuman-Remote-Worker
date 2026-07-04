@@ -145,35 +145,121 @@
   }
 }
 
-/* ===== Players (native <audio>, Phase 2 replaces) ===== */
-.ra-players {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  margin-top: 6px;
+/* ===== Custom themed player (single virtual-timeline element) ===== */
+.ra-player {
+  margin-top: 8px;
 }
 
-.ra-player-row {
+.ra-transport {
   display: flex;
   align-items: center;
   gap: 8px;
 }
 
-/* color-scheme:dark renders the native controls to fit the theme. */
-.ra-audio {
-  color-scheme: dark;
-  flex: 0 1 320px;
-  height: 32px;
+.ra-ctrl {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  background: transparent;
+  border: none;
+  border-radius: 50%;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition:
+    background 0.15s ease,
+    color 0.15s ease;
 }
 
-.ra-part {
-  font-size: 17px;
+.ra-ctrl:hover:not(:disabled) {
+  background: var(--surface-1);
+  color: var(--text-primary);
+}
+
+.ra-ctrl:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.ra-ctrl--play {
+  width: 34px;
+  height: 34px;
+  color: var(--accent-color);
+}
+
+.ra-ctrl--sm {
+  width: 26px;
+  height: 26px;
+}
+
+/* Seek bar: a track whose *synthesized* region is opaque and whose estimated
+   tail is faint, with the played portion filled to the accent and a thumb. */
+.ra-seek {
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 60px;
+  height: 6px;
+  border-radius: 3px;
+  background: var(--surface-2, var(--surface-1));
+  cursor: pointer;
+}
+
+.ra-seek-known {
+  position: absolute;
+  inset: 0 auto 0 0;
+  height: 100%;
+  border-radius: 3px;
+  background: var(--surface-1);
+  opacity: 0.9;
+}
+
+.ra-seek-fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  height: 100%;
+  border-radius: 3px;
+  background: var(--accent-color);
+}
+
+.ra-seek-thumb {
+  position: absolute;
+  top: 50%;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--accent-color);
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+}
+
+.ra-time {
+  flex: none;
+  font-size: 16px;
   color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
   white-space: nowrap;
+}
+
+.ra-speed {
+  flex: none;
+  min-width: 40px;
+  padding: 2px 6px;
+  font-size: 16px;
+  color: var(--text-secondary);
+  background: transparent;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-control);
+  cursor: pointer;
+}
+
+.ra-speed:hover {
+  color: var(--text-primary);
+  border-color: var(--accent-color);
 }
 
 /* Autoplay-blocked prompt. */
 .ra-tap-to-play {
+  margin-bottom: 6px;
   display: inline-flex;
   align-items: center;
   gap: 6px;

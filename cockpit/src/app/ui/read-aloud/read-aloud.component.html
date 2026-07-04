@@ -103,37 +103,72 @@
       }
     }
 
-    <!-- Players: one native <audio> per synthesized section (Phase 2 swaps in
-         the custom themed player). -->
+    <!-- Custom themed player (single virtual-timeline element; no native chrome). -->
     @if (hasAudio()) {
-      <div class="ra-players">
-        @if (playBlocked() !== undefined) {
-          <button type="button" class="ra-tap-to-play" (click)="resumeBlockedPlayback()">
+      <div class="ra-player">
+        @if (playBlocked()) {
+          <button type="button" class="ra-tap-to-play" (click)="togglePlayback()">
             <app-icon size="sm">play_arrow</app-icon>
             <span>{{ 'chat.tts.tapToPlay' | transloco }}</span>
           </button>
         }
-        @for (chunk of chunks(); track $index) {
-          @if (chunkUrls()[$index]; as url) {
-            <div class="ra-player-row">
-              <audio
-                #raAudio
-                class="ra-audio"
-                controls
-                preload="metadata"
-                [attr.data-ra-index]="$index"
-                [src]="url"
-                (loadedmetadata)="onPlayerReady($event, $index)"
-                (play)="onPlayerPlay($event)"
-                (pause)="onPlayerPause()"
-                (ended)="onChunkEnded($index)"
-              ></audio>
-              @if (chunks().length > 1) {
-                <span class="ra-part">{{ 'chat.tts.part' | transloco:{ current: $index + 1, total: chunks().length } }}</span>
-              }
-            </div>
+        <div class="ra-transport">
+          <button
+            type="button"
+            class="ra-ctrl ra-ctrl--play"
+            [title]="(playing() ? 'chat.tts.pause' : 'chat.tts.play') | transloco"
+            (click)="togglePlayback()"
+          >
+            <app-icon size="md">{{ playing() ? 'pause' : 'play_arrow' }}</app-icon>
+          </button>
+
+          @if (total() > 1) {
+            <button
+              type="button"
+              class="ra-ctrl ra-ctrl--sm"
+              [disabled]="!isPlaybackActive()"
+              [title]="'chat.tts.prevPart' | transloco"
+              (click)="prevPart()"
+            >
+              <app-icon size="sm">skip_previous</app-icon>
+            </button>
           }
-        }
+
+          <div
+            class="ra-seek"
+            role="slider"
+            [attr.aria-valuenow]="currentLabel()"
+            [attr.aria-valuetext]="currentLabel() + ' / ' + totalLabel()"
+            (click)="onSeek($event)"
+          >
+            <div class="ra-seek-known" [style.width.%]="knownFrac() * 100"></div>
+            <div class="ra-seek-fill" [style.width.%]="progressFrac() * 100"></div>
+            <div class="ra-seek-thumb" [style.left.%]="progressFrac() * 100"></div>
+          </div>
+
+          @if (total() > 1) {
+            <button
+              type="button"
+              class="ra-ctrl ra-ctrl--sm"
+              [disabled]="!isPlaybackActive()"
+              [title]="'chat.tts.nextPart' | transloco"
+              (click)="nextPart()"
+            >
+              <app-icon size="sm">skip_next</app-icon>
+            </button>
+          }
+
+          <span class="ra-time">{{ currentLabel() }} / {{ totalLabel() }}</span>
+
+          <button
+            type="button"
+            class="ra-speed"
+            [title]="'chat.tts.speed' | transloco"
+            (click)="cycleSpeed()"
+          >
+            {{ speedLabel() }}
+          </button>
+        </div>
       </div>
     }
 
