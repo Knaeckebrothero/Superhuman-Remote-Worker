@@ -5,9 +5,12 @@ credentials via the shared per-user resolver, then calls an OpenAI-compatible
 ``audio.transcriptions`` endpoint. Language is **auto-detected** (no hint sent)
 so mixed-language speakers transcribe correctly.
 
-Returns ``None`` when no STT model is configured (→ the endpoint answers 204,
-the "feature off" signal) or when the transcription call fails — non-fatal,
-exactly like TTS. No caching: every recording is unique.
+Returns ``None`` **only** when no STT model is configured (→ the endpoint
+answers 204, the "feature off" signal). When a model *is* configured but the
+transcription fails (missing key, upstream error, timeout on a long clip), it
+raises :class:`TranscriptionError` so the endpoint answers ``502`` — a failure
+must read as an honest error, not as "feature off" (Phase 0's broken ≠ off
+rule; mirrors ``tts.TtsSynthesisError``). No caching: every recording is unique.
 """
 
 from __future__ import annotations
@@ -25,6 +28,25 @@ from services.capability_credentials import resolve_capability_credentials
 from services.usage_ledger import UsageEvent, UsageLedger
 
 logger = logging.getLogger(__name__)
+
+
+class TranscriptionError(RuntimeError):
+    """Raised when an STT model *is* configured but transcription fails, so the
+    endpoint can answer ``502`` instead of the ``204`` "feature off" signal."""
+
+
+# Long dictations need headroom: a 12-min opus clip is a few MB and can take a
+# while to transcribe. Scale the client timeout with the payload size (bounded)
+# rather than a flat 60 s that would spuriously kill a long-but-valid clip.
+_STT_TIMEOUT_MIN = 120.0
+_STT_TIMEOUT_MAX = 600.0
+_STT_TIMEOUT_BYTES_PER_SEC = 15000.0
+
+
+def _stt_timeout(size_bytes: int) -> float:
+    return max(
+        _STT_TIMEOUT_MIN, min(_STT_TIMEOUT_MAX, size_bytes / _STT_TIMEOUT_BYTES_PER_SEC)
+    )
 
 
 def _extract_transcript(result: object) -> str:
@@ -63,14 +85,16 @@ async def transcribe_thread_audio(
     filename: str,
     user_id: str,
     postgres_db,
-    timeout: float = 60.0,
     ledger: Optional[UsageLedger] = None,
     ref_id: Optional[str] = None,
     project_id: Optional[str] = None,
 ) -> Optional[str]:
-    """Transcribe recorded audio to text. ``None`` when STT is unavailable.
+    """Transcribe recorded audio to text.
 
-    Model + credential resolution mirrors the TTS path: user setting
+    Returns the transcript (possibly ``""`` for silence) on success, ``None``
+    when no STT model is configured (→ 204), and raises
+    :class:`TranscriptionError` when a configured model fails (→ 502). Model +
+    credential resolution mirrors the TTS path: user setting
     (``default_whisper_model``) > system default for the ``whisper``
     capability, then the model's endpoint/provider key.
     """
@@ -102,9 +126,16 @@ async def transcribe_thread_audio(
             model,
             base_url,
         )
-        return None
+        raise TranscriptionError(f"No API key for STT model {model}")
 
-    client = AsyncOpenAI(api_key=api_key, base_url=base_url, timeout=timeout)
+    # max_retries=0 (fail fast, honest error not a multi-minute backoff) + a
+    # size-scaled timeout so long-but-valid clips aren't spuriously killed.
+    client = AsyncOpenAI(
+        api_key=api_key,
+        base_url=base_url,
+        timeout=_stt_timeout(len(audio_bytes)),
+        max_retries=0,
+    )
     try:
         # The OpenAI SDK infers the audio format from the filename extension,
         # so pass a (name, fileobj) tuple carrying the real extension (.webm).
@@ -117,14 +148,16 @@ async def transcribe_thread_audio(
             model=model,
             file=file_tuple,
         )
-    except Exception:
+    except Exception as exc:
         logger.exception(
             "Transcription failed (stage=transcribe model=%s base_url=%s bytes=%d)",
             model,
             base_url,
             len(audio_bytes),
         )
-        return None
+        # A configured model that failed is "broken", not "off" — raise so the
+        # endpoint answers 502 and the composer surfaces an honest error.
+        raise TranscriptionError(f"Transcription failed for model {model}") from exc
     finally:
         await client.close()
 
@@ -155,4 +188,7 @@ async def transcribe_thread_audio(
         except Exception:
             logger.debug("STT usage metering failed (non-fatal)", exc_info=True)
 
-    return _extract_transcript(result) or None
+    # Return the transcript verbatim — an empty string (silence) is a valid
+    # success, distinct from the ``None`` "no model configured" signal, so it
+    # must not collapse to a 204.
+    return _extract_transcript(result)

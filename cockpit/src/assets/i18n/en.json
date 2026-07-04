@@ -1130,6 +1130,7 @@
       "recordVoice": "Hold to record voice message",
       "recordingStop": "Stop recording",
       "recordingCancel": "Cancel recording",
+      "recordingCapWarning": "Recording stops soon",
       "remove": "Remove",
       "send": "Send",
       "stop": "Stop",

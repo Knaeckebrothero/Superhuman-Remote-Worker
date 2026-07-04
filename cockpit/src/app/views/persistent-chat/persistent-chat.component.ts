@@ -1277,10 +1277,13 @@ export function clearDraft(threadId: string | null): void {
                 <app-icon size="sm">close</app-icon>
               </button>
               <canvas #waveformCanvas class="recording-canvas" width="600" height="56"></canvas>
-              <span class="recording-time">
+              <span class="recording-time" [class.near-cap]="recordingNearCap()">
                 <span class="recording-dot"></span>
-                {{ recordingDuration() }}s
+                {{ recordingDurationLabel() }}
               </span>
+              @if (recordingNearCap()) {
+                <span class="recording-cap-warning">{{ 'chat.composer.recordingCapWarning' | transloco }}</span>
+              }
               <button
                 type="button"
                 class="recording-btn confirm"
@@ -1540,6 +1543,23 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     readonly isRecording = signal(false);
     readonly recordingDuration = signal(0);
     readonly isTranscribing = signal(false);
+    // Hard cap on a single dictation (20 min). Generous enough for the "10+ min
+    // voice message" case, while bounding memory + staying well under the 25 MB
+    // backend cap (opus ≈ 0.3 MB/min ⇒ ~6 MB). The recording service is handed
+    // this but doesn't enforce it, so we auto-stop here (below).
+    private readonly maxRecordingSeconds = 1200;
+    private capStopTriggered = false;
+    /** True in the last minute before the cap → show a "stops soon" warning. */
+    readonly recordingNearCap = computed(
+        () =>
+            this.isRecording() &&
+            this.recordingDuration() >= this.maxRecordingSeconds - 60,
+    );
+    /** Recording elapsed as m:ss (raw seconds reads badly near the 20-min cap). */
+    readonly recordingDurationLabel = computed(() => {
+        const s = this.recordingDuration();
+        return `${Math.floor(s / 60)}:${(s % 60).toString().padStart(2, '0')}`;
+    });
     readonly imagePreviewUrl = signal<string | null>(null);
     readonly imagePreviewName = signal<string>('');
     // Drag-and-drop overlay state. dragEnterCount handles the
@@ -1911,6 +1931,18 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         this.recordingStateSub = this.voiceRecording.getRecordingState().subscribe((state) => {
             this.isRecording.set(state.isRecording);
             this.recordingDuration.set(state.duration);
+            // Enforce the cap the service is handed but doesn't itself apply:
+            // stop once at the limit so a long dictation ends cleanly (and stays
+            // under the 25 MB backend cap) instead of growing unbounded.
+            if (
+                state.isRecording &&
+                state.duration >= this.maxRecordingSeconds &&
+                !this.capStopTriggered
+            ) {
+                this.capStopTriggered = true;
+                void this.stopRecording();
+            }
+            if (!state.isRecording) this.capStopTriggered = false;
         });
     }
 
@@ -2056,9 +2088,10 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     /** Begin a hold-to-record voice message session. */
     async startRecording(): Promise<void> {
         if (this.isRecording()) return;
+        this.capStopTriggered = false;
         const config: RecordingConfig = {
             isHoldToRecord: true,
-            maxDuration: 600,
+            maxDuration: this.maxRecordingSeconds,
             audioConstraints: {
                 echoCancellation: true,
                 noiseSuppression: true,
