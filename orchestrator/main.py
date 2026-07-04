@@ -10772,6 +10772,27 @@ async def complete_job(
             actions.append(f"status -> {new_status}")
             logger.info(f"Job {job_id} status set to '{new_status}'")
 
+            # 'paused' means unassigned + dispatchable (pause_job semantics), but
+            # the freeze→paused paths (version_upgrade drain, vm/workspace
+            # upgrade, memory_unavailable) land here with the dying agent still
+            # attached — and the dispatcher only picks up paused jobs with
+            # assigned_agent_id IS NULL, so without this clear they wedge until
+            # gc_offline_agents' 24h FK cascade frees them.
+            if new_status == "paused" and job.get("assigned_agent_id"):
+                try:
+                    async with postgres_db.acquire() as conn:
+                        await conn.execute(
+                            "UPDATE jobs SET assigned_agent_id = NULL "
+                            "WHERE id = $1::uuid",
+                            job_id,
+                        )
+                    job["assigned_agent_id"] = None
+                    actions.append("cleared agent on paused job (re-dispatchable)")
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to clear agent on paused job {job_id}: {e}"
+                    )
+
             # Set completed_at for terminal statuses
             if new_status == "completed":
                 try:
