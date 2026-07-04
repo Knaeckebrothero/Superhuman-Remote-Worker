@@ -4293,8 +4293,13 @@ async def _try_dispatch_pending_jobs() -> None:
                         )
                         continue
                     vm_ctx = _get_vm_context(job)
-                    if not vm_ctx.get("status"):
-                        # VM needed but not provisioned yet
+                    vm_status = vm_ctx.get("status")
+                    if not vm_status or vm_status == "deleted":
+                        # VM needed but absent — never provisioned, or torn down
+                        # while the job was parked ('deleted': the deploy-drain /
+                        # pause path releases the VM; work survives in the pushed
+                        # branch + checkpoint). Without re-provisioning here a
+                        # paused VM job waits forever on a VM nothing will create.
                         if not vm_provisioner.is_available:
                             # VM explicitly requested but no provisioner — fail
                             logger.error(
@@ -4337,7 +4342,18 @@ async def _try_dispatch_pending_jobs() -> None:
                                 job_id,
                             )
                         continue  # Skip this job — wait for VM to register
-                    elif vm_ctx.get("status") not in ("ready",):
+                    elif vm_status == "failed":
+                        # Provisioning failed terminally — do NOT hot-retry every
+                        # tick (shared VM cluster); park visibly instead of the
+                        # old silent skip.
+                        logger.warning(
+                            "Dispatcher: job %s parked — VM provisioning failed "
+                            "(%s); clear context.vm to retry",
+                            job_id,
+                            vm_ctx.get("error") or "no error recorded",
+                        )
+                        continue
+                    elif vm_status != "ready":
                         # VM is provisioning/creating — skip, wait
                         continue
                     # else: VM is ready, proceed with dispatch
@@ -10790,6 +10806,46 @@ async def complete_job(
                     actions.append("cleared agent on paused job (re-dispatchable)")
                 except Exception as e:
                     logger.warning(f"Failed to clear agent on paused job {job_id}: {e}")
+
+            # Auto-redispatch pauses must ALSO shed the row-level freeze blob:
+            # get_dispatchable_jobs requires ``freeze_data IS NULL`` (partial
+            # index, 0046), so a kept freeze makes the paused job invisible to
+            # the dispatcher forever. Stash it in context for observability —
+            # resume state itself lives in the checkpoint + pushed branch, not
+            # here. Pauses awaiting explicit action (vm_upgrade_required,
+            # user-feedback freezes) keep their freeze_data untouched.
+            if new_status == "paused":
+                from services.completion import AUTO_REDISPATCH_FREEZE_TYPES
+
+                fd_row = job.get("freeze_data")
+                if isinstance(fd_row, str):
+                    try:
+                        fd_row = json.loads(fd_row)
+                    except (json.JSONDecodeError, ValueError):
+                        fd_row = None
+                if (
+                    isinstance(fd_row, dict)
+                    and fd_row.get("freeze_type") in AUTO_REDISPATCH_FREEZE_TYPES
+                ):
+                    try:
+                        await postgres_db.merge_job_context(
+                            job_id, {"last_freeze_data": fd_row}
+                        )
+                        async with postgres_db.acquire() as conn:
+                            await conn.execute(
+                                "UPDATE jobs SET freeze_data = NULL "
+                                "WHERE id = $1::uuid",
+                                job_id,
+                            )
+                        job["freeze_data"] = None
+                        actions.append(
+                            "freeze stashed to context (auto-redispatch)"
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"Failed to stash/clear freeze on paused job "
+                            f"{job_id}: {e}"
+                        )
 
             # Set completed_at for terminal statuses
             if new_status == "completed":
