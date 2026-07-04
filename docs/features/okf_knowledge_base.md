@@ -25,10 +25,16 @@ related:
 
 # OKF Knowledge Base — Files-Canonical KB as a Datasource
 
-**Status:** DRAFT (implementation-ready); **slice 1 (dual-write) + slice 2 PR1
-(gardener tools) COMMITTED on `develop`; slice 2 PR2 (curator verdict gate)
-IMPLEMENTED 2026-07-03, uncommitted** — all TDD-built, ruff clean, 233 green across
-the knowledge suites (§11). Origin: design discussion 2026-07-03, building on the
+**Status:** SHIPPING; **slice 1 (dual-write, `68fc0603`) + slice 2
+PR1 (gardener tools, `d0125805`) + slice 2 PR2 (curator verdict gate, `16105a96`) all
+COMMITTED, pushed and DEPLOYED to dev** (image `sha-16105a9` 2026-07-03, superseded by
+`sha-0b71ff3` the same evening) — all TDD-built, ruff clean, 233 green across the
+knowledge suites (§11). **Slice 1 is LIVE-VERIFIED at production scale** — the first
+overnight loop run on the new image produced 151 interlinked OKF files on the loop
+repo's `main` (§11.1). Slice 2 PR2 remains **inert** (`curator.enabled` +
+`curate_knowledge.verdict` both default off); enabling it is a config flip,
+deliberately deferred to a scoped test run — §11.1's observed duplication is the
+corpus it will be tuned against. Origin: design discussion 2026-07-03, building on the
 substrate findings in [[knowledge_base_substrate_decision]]; refined the same day by a
 six-agent research sweep (three codebase audits, three web — sources in §12).
 [[loop_repo_compounding_v2]] shipped the same day, which changes this doc's footing: the
@@ -402,7 +408,7 @@ exactly the split-brain this design exists to kill.
 
 0. **Loop delivery pipeline** — DONE via [[loop_repo_compounding_v2]]: per-job branches,
    squash-merge to `main`, post-merge hook point, `retros/` as the first OKF note family.
-1. **Dual-write** — ✅ **IMPLEMENTED 2026-07-03** (uncommitted on `develop`; strict
+1. **Dual-write** — ✅ **COMMITTED 2026-07-03** (`68fc0603`, on `develop`; strict
    TDD, +19 tests / 223 green across the knowledge suites, ruff clean). The
    strangler-fig first step: `kb_write`/`kb_update` additionally materialize each note
    as **flat `knowledge/<slug>.md`** on the workspace backend — flat resolved
@@ -434,8 +440,10 @@ exactly the split-brain this design exists to kill.
    - Delivery is free: phase/todo/completion commits `git add -A`
      (`git_manager.py:205`), and neither `.gitignore` floor lists `knowledge/`.
    The DB stays the retrieval substrate; the v2 merge delivers the files to `main`.
-   Agent-side only, no schema, no orchestrator change. **E2E = an overnight loop run**;
-   no index reads these files yet (slice 3), so zero retrieval blast radius.
+   Agent-side only, no schema, no orchestrator change. **E2E ✅ DELIVERED 2026-07-04**:
+   the first overnight loop run on the deployed image wrote 151 OKF files to the loop
+   repo's `main` — evidence and findings in §11.1. No index reads these files yet
+   (slice 3), so zero retrieval blast radius.
 2. **OKF lint/gardener toolset + curator-as-proper-auxiliary** — split into two PRs.
    - **PR1 — gardener tools ✅ COMMITTED 2026-07-03** (`d0125805`). Pure engine in
      `src/tools/knowledge/gardener.py` (no workspace/DB, reusable against any vault):
@@ -446,8 +454,10 @@ exactly the split-brain this design exists to kill.
      groups, gen-markers preserve human sections, loud 200-line/25 KB truncation). Two
      thin `@tool` wrappers `kb_lint`/`kb_index` (12 KB tools now). Deferred to PR2: the
      embedding-backed near-duplicate rule + the network dead-external-URL sweep.
-   - **PR2 — curator verdict gate ✅ IMPLEMENTED 2026-07-03** (uncommitted; strict TDD).
-     The §3 refactor, as built:
+   - **PR2 — curator verdict gate ✅ COMMITTED 2026-07-03** (`16105a96`, on `develop`;
+     strict TDD, 233 green across the knowledge suites, ruff clean). Ships **inert**
+     (both knobs default off) — a deliberate config-flip-and-deploy step, deferred to a
+     scoped test run (§3 note on the loop-vs-curator seam). The §3 refactor, as built:
      - **`KnowledgeStore.find_similar_many(project_id, embedding, k, min_similarity)`** —
        the neighbour fetch (active-only, `<=>` cosine, transient `.similarity`); the KB
        analog of `RecallStore.find_similar_many`. Empty result = the cost guard.
@@ -468,9 +478,26 @@ exactly the split-brain this design exists to kill.
        `kb_update`'s body factored into a shared `_update_existing` helper.
      - **Config**: `auxiliary.tasks.curate_knowledge.{verdict,verdict_top_k,review_floor}`
        — **default OFF** (measured opt-in, like `memory.ingestion.enabled`). Prompt
-       `config/prompts/knowledge_verdict_prompt.txt`; wired through `archive_phase`.
-     - **E2E = an overnight loop run** with the knob on (the async gate is validated by
-       real-execution unit tests, but tuning the verdict wants live slice-1 KB volume).
+       `config/prompts/knowledge_verdict_prompt.txt`; wired through `archive_phase` via
+       `create_archive_phase_node(knowledge_verdict_prompt=…)`.
+     - **E2E = an overnight loop run** with `curator.enabled` + `verdict` both on (the
+       async gate is validated by real-execution unit tests, but tuning the verdict wants
+       live slice-1 KB volume). **Enablement deferred** (2026-07-03 decision): flip on a
+       **scoped test project**, not loop-wide — because of the seam below.
+     - **Two seam caveats to weigh before enabling** (design §3 / §11 open questions):
+       (a) the gate only reconciles the **curator's** writes; loop agents `kb_write`
+       directly and stay ungated ("loop jobs run bare"), so the F33/F38 *agent-authored*
+       noise is untouched until the curator itself is the writer — enabling the curator is
+       a loop-wide behaviour + cost change. (b) DISCARD/UPDATE/SUPERSEDE only fire once
+       `find_similar_many` has neighbours in the pgvector index, so a run from a sparse
+       index is mostly ADD until volume accumulates.
+     - **Deferred polish** (not blocking, noted for the resume): UPDATE carries only the
+       candidate's `content` onto the target (drops title/type — the target keeps its
+       identity); the new SUPERSEDE note gets the reverse `SUPERSEDED_BY` edge but not a
+       forward `SUPERSEDES` link; the curator prompt has the gardener verbs in its tool
+       surface but isn't *directed* to run a lint/index pass. Still owed from slice-2's
+       four pieces: the `kb_lint` embedding-backed **near-duplicate** rule (overlaps the
+       verdict gate) and the network **dead-external-URL** sweep.
 3. **Postgres index + query tools + retrieval cutover** — the §5/§5.1 spec: tree-diff
    watermark reindex, chunk rows, `embedding_version` + `pipeline_version`, migration
    `vector/0008`; `search_knowledge` backend swap (the RRF functions gain `kb_id`);
@@ -507,6 +534,65 @@ exactly the split-brain this design exists to kill.
      form-field conditionals (URL/branch/auth reused), icon/colour maps, and the
      lite-disable exemption in `datasources-group.component.ts`.
 
+### 11.1 First production night (2026-07-04) — run-8 evidence
+
+The first loop run on the deployed image (project `68137e29` "Better Resavio", 4 jobs
+scholar→critic→developer→scholar, 21:38Z–05:37Z, image `sha-0b71ff3`, all completed
+clean, all four `retros/` written with `merge_status: merged`). What it proved, and what
+it exposed — this section is the worklist for the **optimization phase**.
+
+**Proved:**
+
+- **Dual-write works at scale.** 151 OKF files under `knowledge/` on `main` from one
+  night. Spot-checked format: frontmatter correct (`type`, `description`, tags,
+  confidence, provenance `author`/`job`/`branch`), standard markdown links throughout.
+- **The files ARE the graph — the design's central bet, confirmed empirically.**
+  Opening `knowledge/` in Obsidian renders a densely connected note-to-note topology:
+  hubs are the load-bearing notes (proposals, the critic verdict, evidence anchors),
+  clusters follow iterations/roles — structure the agents *authored* via markdown
+  links. Contrast: the app-wide Neo4j graph (all projects, all jobs, all time) contains
+  **292 relationships total, every one of them `TAGGED` (190) or `HAS_KEYWORD` (102) —
+  zero note→note edges**. The "graph database" was an inverted index rendered as
+  disconnected tag-starbursts; four jobs of OKF files produced more relational
+  structure than the entire Neo4j corpus. This hardens §9.4 and the TL;DR stance:
+  Neo4j is at best a *derived view* over the vault (slice 3), and retiring it for KBs
+  outright is now a live option. It also makes the vault itself a demo-able
+  deliverable: "every project produces a browsable, interlinked Obsidian vault."
+- The historical failure mode has inverted: knowledge used to be *disconnected*
+  (existence problem); it is now *overconnected* (tuning problem). The remaining work
+  is pruning, not plumbing.
+
+**Exposed (= the gate/gardener's tuning corpus, in priority order):**
+
+1. **Slug-collision twins** — at least 5 pairs of same-title notes where `kb_write`
+   minted a hash-suffixed sibling (`…-aa73e2.md`, `…-dafaa2.md`, `…-e556f3.md`,
+   `…-8cf359.md`, `…-9639cc.md`) instead of updating. Exactly the UPDATE/DISCARD
+   verdict path of PR2; the collision-suffix branch in `kb_write` should arguably
+   *route to the gate even when the gate is otherwise off* — a same-slug write is a
+   free, embedding-less duplicate signal. First target for the scoped gate test.
+2. **Curator note bloat** — auto-curated "learning"/"retrospective" dumps up to
+   **131 KB per note**; pgvector rows grew 374→648 in one night, still dominated by
+   learning (224) + retrospective (149). Candidates: a note-size lint rule
+   (loud-flag above ~15 KB, mirroring `render_index_md`'s loud-truncation posture) and
+   curator-prompt direction toward distillation (the deferred "gardening direction"
+   polish from PR2).
+3. **Double-H1 serializer bug** — `_render_note_md` emits `# <slug>` and the body
+   begins with the same H1 → every rendered note carries its title twice.
+   Small fix in the renderer (skip the heading when the body already starts with one)
+   + a `kb_lint` rule so hand-authored notes are covered.
+4. **Numbering chaos persists** (loop F34) — one night produced self-labels iter-3,
+   iteration-4, iteration-27, loop-10 and loop-16. Not an OKF problem to *solve*, but
+   the vault inherits it in slugs; `retros/` NNN is the authoritative counter and
+   curator/lint guidance should push notes to reference it.
+
+**Sequencing consequence:** the scoped gate test (flip `curator.enabled` +
+`curate_knowledge.verdict` on a test project) moves ahead of everything else — the
+corpus to tune against now exists. Success criterion from the graph, not just the row
+counts: **hubs survive, the twin/fuzz thins out** — the graph should get *sharper*,
+not merely smaller. The `kb_lint` near-duplicate rule (still owed from slice 2) gets
+tuned against the same corpus. Slice 3 follows unchanged; its Neo4j question now has
+an evidence-backed answer.
+
 ## Open questions
 
 - **Datasource shape**: new `kb` type vs. `repository` + `format: okf` flag. Leaning new
@@ -530,6 +616,8 @@ exactly the split-brain this design exists to kill.
   night) *visible* as files on `main`. That's a feature (you can finally see and prune
   it), but expect a fat `knowledge/` tree until the gardener (slice 2) ships. Loop jobs
   run bare (no curator), so loop-night volume is agent-authored only.
+  **CONFIRMED 2026-07-04 (§11.1)**: 151 files in one night, slug-collision twins and
+  131 KB dumps included — visible, prunable, and now the gate's tuning corpus.
 
 ## 12. Research basis (2026-07-03)
 
