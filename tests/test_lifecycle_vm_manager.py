@@ -33,6 +33,7 @@ def _make_manager(
     is_available: bool = True,
     snapshot_available: bool = True,
     suspension_enabled: bool = True,
+    shared_child_exists: bool = False,
 ):
     provisioner = MagicMock()
     provisioner.is_available = is_available
@@ -54,6 +55,8 @@ def _make_manager(
 
     # Two-call pattern: first fetch is jobs, second is threads.
     conn.fetch = AsyncMock(side_effect=[job_rows or [], thread_rows or []])
+    # Backs the live-shared-child EXISTS query (_live_shared_child_exists).
+    conn.fetchval = AsyncMock(return_value=shared_child_exists)
     ctx = AsyncMock()
     ctx.__aenter__ = AsyncMock(return_value=conn)
     ctx.__aexit__ = AsyncMock(return_value=False)
@@ -298,6 +301,92 @@ class TestListInstances:
 
 
 # =============================================================================
+# Live-shared-child reap guard (durable fix, parity with WorkspaceInstanceManager)
+# =============================================================================
+
+
+class TestLiveSharedChildGuard:
+    @staticmethod
+    def _conn(db):
+        return db.acquire.return_value.__aenter__.return_value
+
+    @pytest.mark.asyncio
+    async def test_reviewing_vm_with_shared_child_flagged_not_reapable(self):
+        # A 'reviewing' parent whose live VM is shared by a critic: the EXISTS
+        # query returns true → has_live_shared_child → not reapable.
+        job = {
+            "id": "parent1",
+            "status": "reviewing",
+            "context": {"vm": {"status": "ready", "ssh_host": "10.0.0.42"}},
+        }
+        mgr, *_ = _make_manager(job_rows=[job], shared_child_exists=True)
+        (inst,) = await mgr.list_instances()
+        assert inst.metadata["has_live_shared_child"] is True
+        assert await mgr.is_reapable(inst) is False
+        assert await mgr.is_idle(inst) is False
+
+    @pytest.mark.asyncio
+    async def test_reviewing_vm_without_shared_child_is_reapable(self):
+        job = {
+            "id": "parent1",
+            "status": "reviewing",
+            "context": {"vm": {"status": "ready", "ssh_host": "10.0.0.42"}},
+        }
+        mgr, *_ = _make_manager(job_rows=[job], shared_child_exists=False)
+        (inst,) = await mgr.list_instances()
+        assert inst.metadata["has_live_shared_child"] is False
+        assert await mgr.is_reapable(inst) is True
+
+    @pytest.mark.asyncio
+    async def test_processing_vm_skips_shared_child_query(self):
+        # 'processing' is not reapable → the guard is moot → don't spend a query.
+        job = {
+            "id": "run1",
+            "status": "processing",
+            "context": {"vm": {"status": "ready", "ssh_host": "10.0.0.42"}},
+        }
+        mgr, _, _, _, db = _make_manager(job_rows=[job])
+        (inst,) = await mgr.list_instances()
+        assert "has_live_shared_child" not in inst.metadata
+        self._conn(db).fetchval.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_thread_vm_skips_shared_child_query(self):
+        # Threads have no critic subjobs — the guard only applies to job VMs.
+        thread = {
+            "id": "t1",
+            "status": "ended",
+            "metadata": {"vm": {"status": "ready", "ssh_host": "10.0.0.9"}},
+        }
+        mgr, _, _, _, db = _make_manager(thread_rows=[thread])
+        (inst,) = await mgr.list_instances()
+        assert "has_live_shared_child" not in inst.metadata
+        self._conn(db).fetchval.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_query_passes_parent_id_and_native_id(self):
+        mgr, _, _, _, db = _make_manager(shared_child_exists=True)
+        assert await mgr._live_shared_child_exists("parent1", "vm-abc") is True
+        conn = self._conn(db)
+        conn.fetchval.assert_awaited_once()
+        args = conn.fetchval.await_args.args
+        assert args[1] == "parent1"
+        assert args[2] == "vm-abc"
+
+    @pytest.mark.asyncio
+    async def test_query_false_without_native_id(self):
+        mgr, _, _, _, db = _make_manager(shared_child_exists=True)
+        assert await mgr._live_shared_child_exists("parent1", None) is False
+        self._conn(db).fetchval.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_query_fails_safe_on_db_error(self):
+        mgr, _, _, _, db = _make_manager()
+        db.acquire = MagicMock(side_effect=RuntimeError("db down"))
+        assert await mgr._live_shared_child_exists("parent1", "vm-abc") is True
+
+
+# =============================================================================
 # is_healthy / is_idle
 # =============================================================================
 
@@ -333,12 +422,24 @@ class TestIsIdle:
         assert await mgr.is_idle(inst) is True
 
     @pytest.mark.asyncio
-    async def test_reviewing_job_is_idle(self):
-        # Mirrors the workspace manager: 'reviewing' parks the VM just like
-        # 'pending_review' (critic reviews out-of-band), so it is suspendable.
+    async def test_reviewing_without_live_child_is_idle(self):
+        # Parity with the workspace manager: 'reviewing' is back in the idle set,
+        # guarded by has_live_shared_child. With no live critic sharing the VM,
+        # a review-state parent is idle.
         mgr, *_ = _make_manager()
         inst = Instance(kind="vm", id="x", metadata={"job_status": "reviewing"})
         assert await mgr.is_idle(inst) is True
+
+    @pytest.mark.asyncio
+    async def test_status_with_live_shared_child_is_not_idle(self):
+        # The guard: a VM shared by a live critic must not be drained.
+        mgr, *_ = _make_manager()
+        inst = Instance(
+            kind="vm",
+            id="x",
+            metadata={"job_status": "paused", "has_live_shared_child": True},
+        )
+        assert await mgr.is_idle(inst) is False
 
     @pytest.mark.asyncio
     async def test_processing_job_is_not_idle(self):
@@ -519,10 +620,30 @@ class TestIsReapable:
         assert await mgr.is_reapable(inst) is True
 
     @pytest.mark.asyncio
-    async def test_reviewing_job_is_reapable(self):
+    async def test_reviewing_without_live_child_is_reapable(self):
+        # Parity: once no critic shares the VM, a review-state parent's VM is
+        # reapable like 'pending_review'.
         mgr, *_ = _make_manager()
         inst = Instance(kind="vm", id="x", metadata={"job_status": "reviewing"})
         assert await mgr.is_reapable(inst) is True
+
+    @pytest.mark.asyncio
+    async def test_status_with_live_shared_child_is_not_reapable(self):
+        # Regression (VM tier, the P0 bug): a VM shared by a non-terminal critic
+        # must NOT be reaped, whatever the parent's own status — reaping strands
+        # the critic's SSH. See docs/issues/reviewing_parent_pod_reaped_under_critic.md.
+        mgr, *_ = _make_manager()
+        for status in ("reviewing", "pending_review", "paused"):
+            inst = Instance(
+                kind="vm",
+                id="x",
+                metadata={
+                    "job_status": status,
+                    "job_dispatchable": False,
+                    "has_live_shared_child": True,
+                },
+            )
+            assert await mgr.is_reapable(inst) is False, status
 
     @pytest.mark.asyncio
     async def test_processing_job_not_reapable(self):
