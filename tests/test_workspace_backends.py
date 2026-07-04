@@ -330,6 +330,20 @@ class TestRemoteBackendEnsureConnected:
             with pytest.raises(WorkspaceUnavailableError):
                 backend._ensure_connected()
 
+    def test_ensure_connected_does_not_multiply_retry_budget(self, remote_backend):
+        """_ensure_connected must not wrap connect()'s own retry loop in a second
+        loop — a dead host should cost max_retries attempts, not max_retries²."""
+        backend, mock_ssh, mock_sftp = remote_backend  # fixture: max_retries=2
+        backend._ssh = None  # force is_connected() False → reconnect path
+        mock_ssh.connect.side_effect = socket.error("host down")
+
+        with patch("time.sleep"):
+            with pytest.raises(WorkspaceUnavailableError):
+                backend._ensure_connected()
+
+        # max_retries=2 → 2 attempts. The nested bug produced 2*2 = 4.
+        assert mock_ssh.connect.call_count == 2
+
 
 class TestRemoteBackendPathResolution:
     """Tests for RemoteBackend._resolve() and resolve_path()."""
