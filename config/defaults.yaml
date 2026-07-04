@@ -327,6 +327,7 @@ auxiliary:
       enabled: true
     curate_knowledge:
       enabled: true
+      verdict: true          # OKF KB slice 2 PR2 — adjudicate each curator write (ADD/UPDATE/SUPERSEDE/DISCARD) against existing notes before it lands. Fires only where the curator runs (loops); cost-guarded to neighbours >= review_floor. See docs/features/okf_knowledge_base.md §11.1.
     assemble_memories:
       enabled: true
     # Citation verification (citation engine Phase 2): cite_* returns 'pending'
