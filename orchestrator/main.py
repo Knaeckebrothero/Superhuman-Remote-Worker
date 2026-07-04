@@ -10789,9 +10789,7 @@ async def complete_job(
                     job["assigned_agent_id"] = None
                     actions.append("cleared agent on paused job (re-dispatchable)")
                 except Exception as e:
-                    logger.warning(
-                        f"Failed to clear agent on paused job {job_id}: {e}"
-                    )
+                    logger.warning(f"Failed to clear agent on paused job {job_id}: {e}")
 
             # Set completed_at for terminal statuses
             if new_status == "completed":
