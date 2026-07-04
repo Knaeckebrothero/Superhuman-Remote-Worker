@@ -14,7 +14,7 @@
 } @else {
   <!-- The status box: appears in place the instant Read is clicked and morphs
        through the stages into the player, all in the same slot. -->
-  <div class="ra-box">
+  <div class="ra-box" [attr.data-phase]="phase()">
     <div class="ra-head">
       <app-icon size="sm" class="ra-head-icon">graphic_eq</app-icon>
       <span class="ra-head-title">{{ 'chat.tts.play' | transloco }}</span>
@@ -29,10 +29,6 @@
         </button>
       }
     </div>
-
-    @if (!rewritten() && (phase() === 'generating' || phase() === 'done')) {
-      <div class="ra-note">{{ 'chat.tts.rewritingSkipped' | transloco }}</div>
-    }
 
     <!-- Status line — one honest indicator per phase. -->
     @switch (phase()) {
@@ -181,15 +177,24 @@
       </div>
     }
 
-    <!-- Spoken version: only when the rewrite actually differs from the message. -->
-    @if (showSpoken()) {
-      <details class="ra-spoken">
-        <summary class="ra-spoken-summary">
-          <app-icon size="sm">graphic_eq</app-icon>
-          <span>{{ 'chat.tts.spokenVersion' | transloco }}</span>
-        </summary>
-        <div class="ra-spoken-text">{{ spokenText() }}</div>
-      </details>
+    <!-- Footer — a quiet transparency caption. When the rewrite was skipped we
+         say we're reading the original; when it differs, we offer the spoken
+         version. The two are mutually exclusive. -->
+    @if ((!rewritten() && (phase() === 'generating' || phase() === 'done')) || showSpoken()) {
+      <div class="ra-foot">
+        @if (!rewritten() && (phase() === 'generating' || phase() === 'done')) {
+          <span class="ra-note">{{ 'chat.tts.rewritingSkipped' | transloco }}</span>
+        }
+        @if (showSpoken()) {
+          <details class="ra-spoken">
+            <summary class="ra-spoken-summary">
+              <app-icon size="sm">graphic_eq</app-icon>
+              <span>{{ 'chat.tts.spokenVersion' | transloco }}</span>
+            </summary>
+            <div class="ra-spoken-text">{{ spokenText() }}</div>
+          </details>
+        }
+      </div>
     }
   </div>
 }
