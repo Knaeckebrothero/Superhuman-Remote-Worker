@@ -24,13 +24,17 @@ import re
 import uuid
 from collections import OrderedDict
 from datetime import datetime, timezone
+from functools import lru_cache
+from pathlib import Path
 from typing import Any, Optional
 
+import yaml
 from openai import AsyncOpenAI
 
 from services.capability_credentials import (
     resolve_capability_credentials as _resolve_capability_credentials,
 )
+from services.family_matcher import detect_family
 from services.usage_ledger import UsageEvent, UsageLedger
 
 logger = logging.getLogger(__name__)
@@ -69,6 +73,77 @@ DEFAULT_VOICE_DE = "nova"
 # Heuristic: skip the formulation LLM for short or markdown-free text.
 _FORMULATION_MIN_LEN = 60
 _MARKDOWN_HINTS = ("**", "```", "|", "# ", "## ", "### ", "- ", "* ", "1.", "[", "](")
+
+
+# --- Auxiliary-LLM reasoning control ----------------------------------------
+# The rewrite / chunk-planning stages call the user's *auxiliary* model, which
+# for the homelab default (`gemma-4-moe`) is a hybrid *thinking* model. Left
+# unset, the request inherits the endpoint's default thinking mode — and when
+# that's ON the model reasons over the whole message before emitting its first
+# rewritten token. That pre-token thinking pass is the dominant cost of
+# time-to-first-audio (observed 4–45 s).
+#
+# These stages are mechanical (strip markdown, split at natural boundaries) —
+# there is nothing to reason about — so we force thinking OFF whenever the aux
+# family exposes a binary thinking toggle (gemma via vLLM's
+# `chat_template_kwargs.enable_thinking`). We deliberately do NOT send the toggle
+# to families without one: `chat_template_kwargs` is a vLLM extension a plain
+# OpenAI endpoint rejects with a 400, which would knock the rewrite out entirely.
+# The knob's single source of truth is the family's `reasoning` block in
+# config/model_config_matrix.yaml — the same block the agent path reads (it
+# forces thinking *on* there; here we force it *off*).
+def _find_repo_root() -> Path:
+    """Walk up from this file to the directory containing ``config/``."""
+    anchor = Path(__file__).resolve().parent
+    for _ in range(5):
+        if (anchor / "config" / "model_config_matrix.yaml").is_file():
+            return anchor
+        anchor = anchor.parent
+    return Path.cwd()  # Docker WORKDIR /app fallback
+
+
+@lru_cache(maxsize=1)
+def _model_config_matrix() -> dict:
+    path = _find_repo_root() / "config" / "model_config_matrix.yaml"
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = yaml.safe_load(fh) or {}
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        logger.warning("Could not load model_config_matrix.yaml at %s", path)
+        return {}
+
+
+def _set_nested(d: dict, dotted: str, value: Any) -> None:
+    """Set ``d['a']['b'] = value`` for ``dotted='a.b'``, creating dicts."""
+    node = d
+    parts = dotted.split(".")
+    for part in parts[:-1]:
+        nxt = node.get(part)
+        if not isinstance(nxt, dict):
+            nxt = {}
+            node[part] = nxt
+        node = nxt
+    node[parts[-1]] = value
+
+
+def _aux_reasoning_off_body(model: str) -> dict:
+    """``extra_body`` that disables thinking for a hybrid-thinking aux family,
+    or ``{}`` for families without a binary thinking toggle (so we never send an
+    unsupported ``chat_template_kwargs`` to a non-vLLM endpoint). Empty is a safe
+    no-op when passed to ``chat.completions.create``."""
+    if not model:
+        return {}
+    fam = detect_family(model).family
+    cap = (_model_config_matrix().get(fam) or {}).get("reasoning")
+    if not isinstance(cap, dict) or cap.get("method") != "binary_toggle":
+        return {}
+    param = cap.get("toggle_param", "chat_template_kwargs.enable_thinking")
+    tmap = cap.get("toggle_map") or {"on": True, "off": False}
+    body: dict = {}
+    _set_nested(body, param, tmap.get("off", False))
+    return body
+
 
 FORMULATION_SYSTEM_PROMPT = """You rewrite text so it sounds natural when read aloud by a text-to-speech engine.
 
@@ -386,6 +461,7 @@ async def _formulate_for_speech(
                 {"role": "user", "content": text},
             ],
             temperature=0.3,
+            extra_body=_aux_reasoning_off_body(model),
         )
         rewritten = (response.choices[0].message.content or "").strip()
         if _metering_enabled(ledger):
@@ -847,6 +923,7 @@ async def _resplit_oversized(
                         {"role": "user", "content": chunk},
                     ],
                     temperature=0.3,
+                    extra_body=_aux_reasoning_off_body(model),
                 )
                 sub = _parse_chunk_array(response.choices[0].message.content or "")
                 result.extend(sub if sub else [chunk])
@@ -889,6 +966,7 @@ async def _llm_clean_and_chunk(
                 {"role": "user", "content": text},
             ],
             temperature=0.3,
+            extra_body=_aux_reasoning_off_body(model),
         )
         if _metering_enabled(ledger):
             # Meter tokens even when the plan is truncated/unparseable below —
@@ -1147,6 +1225,7 @@ async def stream_tts_chunks(
             temperature=0.3,
             stream=True,
             stream_options={"include_usage": True},
+            extra_body=_aux_reasoning_off_body(aux_model),
         )
         stream_iter = stream.__aiter__()
         while True:
