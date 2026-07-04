@@ -83,6 +83,19 @@ Safari click-priming. Frontend-only (no backend change). Local: full cockpit
 headlessly; stretch flair (highlight-as-spoken, waveform, ping-pong,
 mini-player) is deferred (see Phase 2 checklist).
 
+**Phase 3 (external voices) v1 implemented + verified 2026-07-04.** The OpenAI
+`gpt-4o-mini-tts` lane: `instructions` style-prompt passthrough,
+content-language voice selection (`_detect_language` EN/DE + per-language
+`voices` map), and a user `default_tts_voice` setting with a Settings →
+"Read-aloud voice" picker. Local: cockpit `npm test` (803) + build clean;
+backend `pytest` (**61**). Live k3d smoke: EN→`alloy`, DE→`nova` (attempted —
+Kokoro has no German voice, the honest 502 that gpt-4o-mini-tts fixes), and a
+`default_tts_voice=af_heart` set via the settings API won the next synthesis.
+Vendor wow-lane adapters (ElevenLabs/Hume/MiniMax) + streaming are deferred to
+the ear bake-off (need a chosen vendor + keys); dropping `gpt-4o-mini-tts` in as
+the TTS default (Admin → Providers, needs an OpenAI key) is the one remaining
+user action to light up the external lane in dev.
+
 ## Current state (as-is, verified 2026-07-04)
 
 ### Voice-out (read aloud)
@@ -419,35 +432,37 @@ Provider landscape (researched 2026-07):
 | **Inworld TTS-1.5** | Value outlier | $5–10/1M chars, top of quality arenas, 15 langs incl. DE/FR; adapter |
 | ~~Groq~~ | **Disqualified** | playai-tts deprecated 2025-12; replacement (Orpheus) is English-only |
 
-- [ ] **Step 1 (config-only)**: add `gpt-4o-mini-tts` in Admin → Providers,
-      set as TTS default. Validates the whole UX with zero code.
-- [ ] **`instructions` passthrough**: one param in `_synthesize_speech` +
-      `params_json.instructions` on the catalog row — unlocks style prompts
-      on the OpenAI lane and is the persona hook for Phase 5.
-- [ ] **Provider adapter seam in `tts.py`**: dispatch on
-      `params_json.provider` (the `provider_kind` column is a transport
-      enum — system|endpoint — not a vendor field; `params_json` is the
-      idiomatic bag). Adapters follow the `RerankerScorer` httpx pattern
-      (`src/services/memory/plugins/reranker.py`: injectable client,
-      bearer auth, vendor JSON) — ~50 lines each. First adapter chosen by
-      ear: ElevenLabs vs Hume vs MiniMax bake-off on real messages.
-- [ ] **Content-language detection**: the plan LLM returns a language tag
-      with the rewritten text; voice resolution uses it instead of the UI
-      language. Per-language voice mapping becomes config, not hardcoded
-      `alloy`/`nova`.
-- [ ] **User-facing voice picker (thin v1)**: `default_tts_voice` in user
-      settings (`UserSettingsUpdate` + `_resolve_voice` priority above
-      `params_json.voice`); dropdown fed by the configured backend's voice
-      list. Personas & per-thread override are Phase 5.
-- [ ] **(Optional) streaming synthesis**: installed SDK (openai 2.31.0)
-      already supports `audio.speech.with_streaming_response`; with a fast
-      external provider, per-chunk latency drops to ~1 s and the "first
-      chunk" wait nearly vanishes. Also viable: synthesize 2–3 chunks
-      concurrently on fast backends (the sequential loop exists for the CPU
-      backend's sake). Backend SSE status streaming is possible if ever
-      needed (hand-rolled `StreamingResponse` + `: open` kickstart
-      precedent at `main.py:8058`), but client-side stage knowledge makes
-      it unnecessary for v1.
+**v1 implemented 2026-07-04** (the OpenAI `gpt-4o-mini-tts` lane, backend +
+settings picker). The vendor wow-lane adapters + streaming are deferred to
+the ear bake-off (they need a chosen vendor + keys).
+
+- [ ] **Step 1 (config-only, needs an OpenAI key + admin)**: add
+      `gpt-4o-mini-tts` in Admin → Providers, set as TTS default. Everything
+      below is wired for it; this is the remaining user action to make the
+      external lane live in dev.
+- [x] **`instructions` passthrough**: `_synthesize_speech(..., instructions=)`
+      passed through only when set (tts-1/Kokoro reject it), resolved from the
+      catalog `params_json.instructions` — the style-prompt hook for
+      gpt-4o-mini-tts and Phase 5 personas. (Unit-verified; needs a
+      gpt-4o-mini-tts backend to exercise live.)
+- [x] **Content-language detection**: `_detect_language` (EN/DE heuristic —
+      umlauts + German function words) picks the voice from the *content*, not
+      the UI language; per-language `params_json.voices` map + built-in default.
+      *(Live-smoke: EN→`alloy`, DE→`nova` (attempted; Kokoro has no German
+      voice → the honest 502 — exactly what gpt-4o-mini-tts fixes). A fuller
+      LLM-tag detector is future work.)*
+- [x] **User-facing voice picker**: `default_tts_voice` user setting
+      (`UserSettingsUpdate` + `_pick_voice` priority: user → catalog `voice` →
+      catalog `voices[lang]` → default) + a Settings → "Read-aloud voice"
+      dropdown (fed by `voicesForModelId`, free-text fallback for unknown
+      backends). *(Live-smoke: set `af_heart` via the settings API → the next
+      synthesis used it, beating the content-language default.)*
+- [ ] **(deferred — ear bake-off + keys)** Provider adapter seam in `tts.py`
+      (dispatch on `params_json.provider`; `RerankerScorer` httpx pattern,
+      ~50 lines each) for ElevenLabs / Hume / MiniMax.
+- [ ] **(deferred)** Streaming synthesis
+      (`audio.speech.with_streaming_response`) / concurrent-chunk synthesis on
+      fast backends.
 
 **Acceptance**: a German message is read in a German-capable voice without
 touching settings; the user can pick a distinctly non-Dave voice in

@@ -283,6 +283,157 @@ class TestGenerateMessageTts:
 
 
 # ---------------------------------------------------------------------------
+# Phase 3: content-language voice selection, user voice choice, instructions
+# ---------------------------------------------------------------------------
+
+
+class TestVoiceSelectionAndInstructions:
+    def test_detect_language_english(self):
+        from services.tts import _detect_language
+
+        assert _detect_language("This is a plain English sentence about a cat.") == "en"
+
+    def test_detect_language_german_umlaut(self):
+        from services.tts import _detect_language
+
+        assert _detect_language("Größe und Qualität sind wichtig.") == "de"
+
+    def test_detect_language_german_function_words(self):
+        from services.tts import _detect_language
+
+        assert (
+            _detect_language("Der Test ist nicht fertig und das ist ein Problem.")
+            == "de"
+        )
+
+    @pytest.mark.asyncio
+    async def test_voice_follows_content_language_not_request_hint(self):
+        """A German message uses the German default voice even when the request's
+        language hint says 'en' (voice follows content, fixing defect 5)."""
+        from services.tts import DEFAULT_VOICE_DE, generate_message_tts
+
+        cls, client = _mock_openai(speech=b"AUDIO")
+        with (
+            patch("services.tts.AsyncOpenAI", cls),
+            patch(
+                "services.tts._resolve_capability_credentials",
+                AsyncMock(return_value=("gpt-4o-mini-tts", None, "sk-key")),
+            ),
+        ):
+            await generate_message_tts(
+                content="Das ist ein deutscher Satz mit Umlauten: schön und gut.",
+                language="en",
+                reformulate=False,
+                user_id="u1",
+                postgres_db=_mock_db(),
+            )
+        assert client.audio.speech.create.call_args.kwargs["voice"] == DEFAULT_VOICE_DE
+
+    @pytest.mark.asyncio
+    async def test_user_default_voice_overrides_catalog(self):
+        from services.tts import generate_message_tts
+
+        cls, client = _mock_openai(speech=b"AUDIO")
+        db = _mock_db()
+        db.get_user_settings = AsyncMock(return_value={"default_tts_voice": "shimmer"})
+        db.resolve_catalog_model = AsyncMock(
+            return_value={"params_json": {"voice": "af_heart"}}
+        )
+        with (
+            patch("services.tts.AsyncOpenAI", cls),
+            patch(
+                "services.tts._resolve_capability_credentials",
+                AsyncMock(return_value=("kokoro", None, "sk-key")),
+            ),
+        ):
+            await generate_message_tts(
+                content="short clean text",
+                language="en",
+                reformulate=False,
+                user_id="u1",
+                postgres_db=db,
+            )
+        assert client.audio.speech.create.call_args.kwargs["voice"] == "shimmer"
+
+    @pytest.mark.asyncio
+    async def test_per_language_voice_map(self):
+        from services.tts import generate_message_tts
+
+        cls, client = _mock_openai(speech=b"AUDIO")
+        db = _mock_db()
+        db.resolve_catalog_model = AsyncMock(
+            return_value={"params_json": {"voices": {"en": "alloy", "de": "onyx"}}}
+        )
+        with (
+            patch("services.tts.AsyncOpenAI", cls),
+            patch(
+                "services.tts._resolve_capability_credentials",
+                AsyncMock(return_value=("gpt-4o-mini-tts", None, "sk-key")),
+            ),
+        ):
+            await generate_message_tts(
+                content="Der Satz ist auf Deutsch und schön.",
+                language="en",
+                reformulate=False,
+                user_id="u1",
+                postgres_db=db,
+            )
+        assert client.audio.speech.create.call_args.kwargs["voice"] == "onyx"
+
+    @pytest.mark.asyncio
+    async def test_instructions_passed_through_when_set(self):
+        from services.tts import generate_message_tts
+
+        cls, client = _mock_openai(speech=b"AUDIO")
+        db = _mock_db()
+        db.resolve_catalog_model = AsyncMock(
+            return_value={
+                "params_json": {"voice": "sage", "instructions": "warm and unhurried"}
+            }
+        )
+        with (
+            patch("services.tts.AsyncOpenAI", cls),
+            patch(
+                "services.tts._resolve_capability_credentials",
+                AsyncMock(return_value=("gpt-4o-mini-tts", None, "sk-key")),
+            ),
+        ):
+            await generate_message_tts(
+                content="short clean text",
+                language="en",
+                reformulate=False,
+                user_id="u1",
+                postgres_db=db,
+            )
+        kwargs = client.audio.speech.create.call_args.kwargs
+        assert kwargs["voice"] == "sage"
+        assert kwargs["instructions"] == "warm and unhurried"
+
+    @pytest.mark.asyncio
+    async def test_no_instructions_kwarg_when_unset(self):
+        """tts-1 / Kokoro reject an `instructions` param, so it must be omitted
+        entirely (not sent as None) when no catalog instructions are set."""
+        from services.tts import generate_message_tts
+
+        cls, client = _mock_openai(speech=b"AUDIO")
+        with (
+            patch("services.tts.AsyncOpenAI", cls),
+            patch(
+                "services.tts._resolve_capability_credentials",
+                AsyncMock(return_value=("tts-1", None, "sk-key")),
+            ),
+        ):
+            await generate_message_tts(
+                content="short clean text",
+                language="en",
+                reformulate=False,
+                user_id="u1",
+                postgres_db=_mock_db(),
+            )
+        assert "instructions" not in client.audio.speech.create.call_args.kwargs
+
+
+# ---------------------------------------------------------------------------
 # Endpoint: POST /api/persistent/threads/{thread_id}/tts
 # ---------------------------------------------------------------------------
 

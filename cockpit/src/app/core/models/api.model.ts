@@ -574,6 +574,7 @@ export interface ResolvedDefaults {
   default_auxiliary_model?: string;
   default_vision_model?: string;
   default_whisper_model?: string;
+  default_tts_model?: string;
   default_embedding_model?: string;
   embedding_provider?: string;
   persistent_agent?: {
@@ -594,6 +595,9 @@ export interface UserSettings {
   default_auxiliary_model?: string | null;
   default_vision_model?: string | null;
   default_whisper_model?: string | null;
+  default_tts_model?: string | null;
+  /** User's chosen read-aloud voice (overrides the admin/per-language default). */
+  default_tts_voice?: string | null;
   default_session_model?: string | null;
   default_embedding_model?: string | null;
   embedding_provider?: string | null;

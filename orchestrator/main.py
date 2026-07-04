@@ -5387,6 +5387,7 @@ class UserSettingsUpdate(BaseModel):
     default_vision_model: str | None = None
     default_whisper_model: str | None = None
     default_tts_model: str | None = None
+    default_tts_voice: str | None = None
     default_session_model: str | None = None
     # NOTE: per-phase model defaults (default_strategic_model /
     # default_tactical_model) were removed — see Layer 1 in
