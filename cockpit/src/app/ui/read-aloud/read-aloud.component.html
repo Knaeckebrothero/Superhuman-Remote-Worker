@@ -1,0 +1,151 @@
+@if (phase() === 'idle') {
+  <!-- The read button (Phase 0 disabled-with-reason when TTS is unconfigured). -->
+  <div class="ra-actions">
+    <button
+      type="button"
+      class="ra-btn"
+      [disabled]="unavailable()"
+      [title]="(unavailable() ? 'chat.tts.notConfigured' : 'chat.tts.play') | transloco"
+      (click)="start()"
+    >
+      <app-icon size="md">{{ unavailable() ? 'volume_off' : 'volume_up' }}</app-icon>
+    </button>
+  </div>
+} @else {
+  <!-- The status box: appears in place the instant Read is clicked and morphs
+       through the stages into the player, all in the same slot. -->
+  <div class="ra-box">
+    <div class="ra-head">
+      <app-icon size="sm" class="ra-head-icon">graphic_eq</app-icon>
+      <span class="ra-head-title">{{ 'chat.tts.play' | transloco }}</span>
+      @if (isActive()) {
+        <button
+          type="button"
+          class="ra-cancel"
+          [title]="'chat.tts.cancel' | transloco"
+          (click)="cancel()"
+        >
+          <app-icon size="sm">close</app-icon>
+        </button>
+      }
+    </div>
+
+    @if (!rewritten() && (phase() === 'generating' || phase() === 'done')) {
+      <div class="ra-note">{{ 'chat.tts.rewritingSkipped' | transloco }}</div>
+    }
+
+    <!-- Status line — one honest indicator per phase. -->
+    @switch (phase()) {
+      @case ('rewriting') {
+        <div class="ra-status">
+          <span class="ra-spinner"></span>
+          <span class="ra-status-text">
+            {{ rewriteKey() | transloco }}@if (showElapsed()) { · {{ elapsed() }}s }
+          </span>
+        </div>
+        <div class="ra-hint">{{ 'chat.tts.expectation' | transloco }}</div>
+      }
+      @case ('generating') {
+        @if (retryInfo(); as r) {
+          <div class="ra-status">
+            <span class="ra-spinner"></span>
+            <span class="ra-status-text">{{ 'chat.tts.autoRetry' | transloco:{ attempt: r.attempt, max: 3 } }}</span>
+          </div>
+        } @else if (partError() !== null) {
+          <div class="ra-status ra-status--error">
+            <span class="ra-status-text">{{ 'chat.tts.partFailed' | transloco:{ part: partError()! + 1, total: total() } }}</span>
+            <button type="button" class="ra-link" (click)="retryPart(partError()!)">
+              {{ 'chat.tts.retryPart' | transloco:{ part: partError()! + 1 } }}
+            </button>
+          </div>
+        } @else {
+          <div class="ra-status">
+            <span class="ra-spinner"></span>
+            <span class="ra-status-text">
+              @if (playing()) {
+                {{ 'chat.tts.playingGenerating' | transloco:{ current: synthIndex() + 1, total: total() } }}
+              } @else {
+                {{ 'chat.tts.generatingPart' | transloco:{ current: synthIndex() + 1, total: total() } }}
+              }
+            </span>
+          </div>
+        }
+      }
+      @case ('done') {
+        <div class="ra-status ra-status--done">
+          <app-icon size="sm">check_circle</app-icon>
+          <span class="ra-status-text">
+            {{ 'chat.tts.ready' | transloco:{ parts: total() } }}@if (durationLabel()) { · {{ durationLabel() }} }
+          </span>
+        </div>
+      }
+      @case ('cancelled') {
+        <div class="ra-status">
+          <span class="ra-status-text">{{ 'chat.tts.cancelled' | transloco:{ parts: keptParts() } }}</span>
+          <button type="button" class="ra-link" (click)="restart()">{{ 'chat.tts.play' | transloco }}</button>
+        </div>
+      }
+      @case ('error') {
+        <div class="ra-status ra-status--error">
+          <app-icon size="sm">error_outline</app-icon>
+          <span class="ra-status-text">
+            @if (hardError() === 'rewrite') {
+              {{ 'chat.tts.rewriteFailed' | transloco }}
+            } @else {
+              {{ 'chat.tts.hardFail' | transloco:{ part: synthIndex() + 1, total: total() } }}
+            }
+          </span>
+          <button type="button" class="ra-link" (click)="restart()">{{ 'chat.tts.tryAgain' | transloco }}</button>
+        </div>
+        @if (hardError() === 'synthesis') {
+          <div class="ra-hint">{{ 'chat.tts.keepReading' | transloco }}</div>
+        }
+      }
+    }
+
+    <!-- Players: one native <audio> per synthesized section (Phase 2 swaps in
+         the custom themed player). -->
+    @if (hasAudio()) {
+      <div class="ra-players">
+        @if (playBlocked() !== undefined) {
+          <button type="button" class="ra-tap-to-play" (click)="resumeBlockedPlayback()">
+            <app-icon size="sm">play_arrow</app-icon>
+            <span>{{ 'chat.tts.tapToPlay' | transloco }}</span>
+          </button>
+        }
+        @for (chunk of chunks(); track $index) {
+          @if (chunkUrls()[$index]; as url) {
+            <div class="ra-player-row">
+              <audio
+                #raAudio
+                class="ra-audio"
+                controls
+                preload="metadata"
+                [attr.data-ra-index]="$index"
+                [src]="url"
+                (loadedmetadata)="onPlayerReady($event, $index)"
+                (play)="onPlayerPlay($event)"
+                (pause)="onPlayerPause()"
+                (ended)="onChunkEnded($index)"
+              ></audio>
+              @if (chunks().length > 1) {
+                <span class="ra-part">{{ 'chat.tts.part' | transloco:{ current: $index + 1, total: chunks().length } }}</span>
+              }
+            </div>
+          }
+        }
+      </div>
+    }
+
+    <!-- Spoken version: only when the rewrite actually differs from the message. -->
+    @if (showSpoken()) {
+      <details class="ra-spoken">
+        <summary class="ra-spoken-summary">
+          <app-icon size="sm">graphic_eq</app-icon>
+          <span>{{ 'chat.tts.spokenVersion' | transloco }}</span>
+        </summary>
+        <div class="ra-spoken-text">{{ spokenText() }}</div>
+      </details>
+    }
+  </div>
+}

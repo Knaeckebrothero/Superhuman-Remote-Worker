@@ -455,7 +455,8 @@ class TestPlanTtsChunks:
                 user_id="u1",
                 postgres_db=_mock_db(),
             )
-        assert result == ["First chunk.", "Second chunk."]
+        assert result["chunks"] == ["First chunk.", "Second chunk."]
+        assert result["rewritten"] is True
 
     @pytest.mark.asyncio
     async def test_falls_back_to_deterministic_without_aux(self):
@@ -466,8 +467,10 @@ class TestPlanTtsChunks:
             result = await plan_tts_chunks(
                 content=long_text, user_id="u1", postgres_db=_mock_db()
             )
-        assert result is not None and len(result) > 1
-        assert all(len(c) <= TTS_CHUNK_LIMIT for c in result)
+        assert result is not None and len(result["chunks"]) > 1
+        assert all(len(c) <= TTS_CHUNK_LIMIT for c in result["chunks"])
+        # No aux model ran → deterministic split of raw markdown.
+        assert result["rewritten"] is False
 
     @pytest.mark.asyncio
     async def test_falls_back_when_llm_unparseable(self):
@@ -481,7 +484,9 @@ class TestPlanTtsChunks:
             result = await plan_tts_chunks(
                 content="short message", user_id="u1", postgres_db=_mock_db()
             )
-        assert result == ["short message"]
+        assert result["chunks"] == ["short message"]
+        # LLM ran but couldn't deliver → fell back → not a real rewrite.
+        assert result["rewritten"] is False
 
     @pytest.mark.asyncio
     async def test_truncated_llm_output_falls_back(self):
@@ -495,7 +500,28 @@ class TestPlanTtsChunks:
             result = await plan_tts_chunks(
                 content="short message", user_id="u1", postgres_db=_mock_db()
             )
-        assert result == ["short message"]
+        assert result["chunks"] == ["short message"]
+        assert result["rewritten"] is False
+
+    @pytest.mark.asyncio
+    async def test_first_chunk_is_shortened_for_fast_ttfa(self):
+        from services.tts import TTS_FIRST_CHUNK_TARGET, plan_tts_chunks
+
+        # A single long paragraph of many sentences the LLM returns as one chunk;
+        # the planner must split off a short first chunk for fast time-to-first-audio.
+        one_big = " ".join(f"This is sentence number {i}." for i in range(80))
+        cls, _ = _mock_openai_chat(json.dumps([one_big]))
+        with (
+            patch("services.tts.AsyncOpenAI", cls),
+            patch("services.tts._resolve_capability_credentials", _caps()),
+        ):
+            result = await plan_tts_chunks(
+                content=one_big, user_id="u1", postgres_db=_mock_db()
+            )
+        assert len(result["chunks"]) >= 2
+        assert len(result["chunks"][0]) <= TTS_FIRST_CHUNK_TARGET
+        # Split at a sentence boundary — no mid-sentence cut.
+        assert result["chunks"][0].endswith(".")
 
 
 # ---------------------------------------------------------------------------
@@ -526,14 +552,22 @@ class TestTtsPlanEndpoint:
             ),
             patch(
                 "services.tts.plan_tts_chunks",
-                AsyncMock(return_value=["chunk one", "chunk two"]),
+                AsyncMock(
+                    return_value={
+                        "chunks": ["chunk one", "chunk two"],
+                        "rewritten": True,
+                    }
+                ),
             ),
         ):
             resp = await main.plan_thread_message_tts(
                 thread_id="t1", request=MagicMock(), body={"content": "long message"}
             )
         assert resp.status_code == 200
-        assert json.loads(resp.body) == {"chunks": ["chunk one", "chunk two"]}
+        assert json.loads(resp.body) == {
+            "chunks": ["chunk one", "chunk two"],
+            "rewritten": True,
+        }
 
     @pytest.mark.asyncio
     async def test_204_when_not_configured(self):

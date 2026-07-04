@@ -1,0 +1,214 @@
+:host {
+  display: block;
+}
+
+/* ===== Read button (idle) ===== */
+.ra-actions {
+  display: flex;
+  gap: 4px;
+  margin-top: 6px;
+}
+
+/* The read-aloud control is a primary affordance — large and fully visible. */
+.ra-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  height: 44px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius-control);
+  color: var(--text-muted);
+  cursor: pointer;
+  transition:
+    background 0.15s ease,
+    color 0.15s ease,
+    border-color 0.15s ease;
+}
+
+.ra-btn:hover:not(:disabled) {
+  background: var(--surface-0);
+  color: var(--text-primary);
+  border-color: var(--border-color, var(--surface-0));
+}
+
+.ra-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+/* ===== Status box (active + terminal) ===== */
+.ra-box {
+  margin-top: 6px;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-surface);
+  background: var(--surface-0);
+  padding: 8px 10px;
+  max-width: 480px;
+}
+
+.ra-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-secondary);
+}
+
+.ra-head-icon {
+  color: var(--accent-color);
+}
+
+.ra-head-title {
+  font-size: 18px;
+  font-weight: 600;
+}
+
+.ra-cancel {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-control);
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.ra-cancel:hover {
+  background: var(--surface-1);
+  color: var(--text-primary);
+}
+
+.ra-note {
+  margin-top: 4px;
+  font-size: 17px;
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+/* ===== Status line ===== */
+.ra-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+  font-size: 18px;
+  color: var(--text-secondary);
+}
+
+.ra-status-text {
+  min-width: 0;
+}
+
+.ra-status--error {
+  color: var(--danger, #c44);
+}
+
+.ra-status--done {
+  color: var(--text-secondary);
+}
+
+.ra-hint {
+  margin-top: 3px;
+  font-size: 16px;
+  color: var(--text-muted);
+}
+
+/* A text-button "Retry part N" / "Try again" / restart affordance. */
+.ra-link {
+  background: transparent;
+  border: none;
+  padding: 0;
+  color: var(--accent-color);
+  font: inherit;
+  cursor: pointer;
+  text-decoration: underline;
+}
+
+.ra-spinner {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  border: 2px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: ra-spin 0.8s linear infinite;
+}
+
+@keyframes ra-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* ===== Players (native <audio>, Phase 2 replaces) ===== */
+.ra-players {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.ra-player-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* color-scheme:dark renders the native controls to fit the theme. */
+.ra-audio {
+  color-scheme: dark;
+  flex: 0 1 320px;
+  height: 32px;
+}
+
+.ra-part {
+  font-size: 17px;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+/* Autoplay-blocked prompt. */
+.ra-tap-to-play {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  font-size: 18px;
+  color: var(--accent-color);
+  background: transparent;
+  border: 1px solid var(--accent-color);
+  border-radius: var(--radius-surface);
+  cursor: pointer;
+}
+
+/* ===== Spoken-version disclosure ===== */
+.ra-spoken {
+  margin-top: 8px;
+}
+
+.ra-spoken-summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 17px;
+  color: var(--text-muted);
+  cursor: pointer;
+  list-style: none;
+}
+
+.ra-spoken-summary::-webkit-details-marker {
+  display: none;
+}
+
+.ra-spoken-text {
+  margin-top: 6px;
+  padding-left: 4px;
+  font-size: 18px;
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+}

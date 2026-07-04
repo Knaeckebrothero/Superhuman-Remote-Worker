@@ -59,6 +59,18 @@ the disabled-button state and tap-to-play prompt — both covered by the unit
 tests + the verified availability payload; and STT `stt-request` metering, which
 rides the same now-proven ledger path.
 
+**Phase 1 (the box) implemented + verified 2026-07-04.** Extracted read-aloud
+into `ui/read-aloud/AppReadAloudComponent`; the status box ticks through the
+staged microcopy with elapsed counter, cancel, per-part retry, auto-retry, and
+the honest "rewriting skipped" note. Local: full cockpit `npm test` (795) +
+`npm run build` clean (**SCSS budget warning gone** — defect 7) + a new
+component spec; backend `pytest` (53). Live k3d smoke of the `/tts/plan`
+contract: `{chunks, rewritten}` returned, first chunk 468 chars (≤500) split at
+a sentence boundary, and both `rewritten:true` (gemma cleaned the markdown) and
+`rewritten:false` (deterministic fallback) branches confirmed. The box's visual
+states weren't driven headlessly (no browser attached) — covered by the unit
+tests + template typecheck.
+
 ## Current state (as-is, verified 2026-07-04)
 
 ### Voice-out (read aloud)
@@ -247,41 +259,43 @@ Rules, ranked by impact on perceived reliability:
 
 ### Phase 1 — The box (transparency)
 
+**Implemented 2026-07-04** as `cockpit/src/app/ui/read-aloud/`
+(`AppReadAloudComponent`) — a standalone OnPush widget that owns the whole
+read-aloud lifecycle for one message. All the TTS state/methods were extracted
+out of `persistent-chat.component.*` into it, which also relieved the
+over-budget stylesheet (defect 7 — the SCSS budget warning is gone). Playback
+still uses native `<audio>` elements; the custom player is Phase 2.
+
 One status box appears in the message the moment **Read** is clicked and
 lives through the whole lifecycle; the player materializes *inside the same
 box* when the first chunk is ready.
 
-- [ ] New standalone component (see §Cockpit integration): instant-ack line
-      → **Rewriting text for speech → Preparing audio (M parts) → Generating
-      audio (part N of M) → Player**, with expectation-setting copy on the
-      slow stage. The near-instant chunk-split step gets **no stage of its
-      own** (a 200 ms label reads as churn) — it's the moment M becomes
-      known and the indicator turns count-determinate. The client already
-      drives every stage, so this is almost pure frontend.
-- [ ] Elapsed-seconds counter appears after ~10 s inside any one stage;
-      abnormally long → an explained-wait line ("the language model is
-      responding slowly…"), never "almost done". One coarse expectation
-      line ("usually ~30 s–2 min"), no countdowns.
-- [ ] ✕ **cancel at every stage**; cancelling keeps already-synthesized
-      parts playable ("Read-aloud cancelled — 2 parts kept").
-- [ ] Plan returns `{chunks, language, rewritten}` (annotated `/tts/plan`) —
-      language feeds Phase 3 detection; **make chunk 1 short (~500 chars)**
-      in the chunking prompt + deterministic splitter to minimize
-      time-to-first-audio.
-- [ ] Per-stage error states with unit-level retry: earlier parts stay
-      playable, "Retry part 3" regenerates one chunk (caches make earlier
-      stages free). Bounded visible auto-retry for transient chunk failures
-      ("retrying — attempt 2 of 3"), then hard-fail with state preserved.
-- [ ] Surface formulation-skipped: with no auxiliary model configured (or an
-      aux failure), the plan silently falls back to a deterministic split of
-      the **raw markdown**. The box must say "rewriting skipped" instead of
-      pretending it cleaned up.
-- [ ] Keep the "Spoken version" disclosure, moved inside the box (collapsed;
-      don't stream the rewritten text past the user).
-- [ ] Generation is non-blocking: the box keeps progressing if the user
-      scrolls away or keeps chatting; once playing, the status demotes to a
-      quiet single line ("Playing · generating part 3 of 5…"), and on
-      completion becomes "Ready · 5 parts · 3:12".
+- [x] New standalone component: instant-ack (`Preparing to read aloud…`) →
+      `Rewriting text for speech…` → players + `Generating audio — part N of
+      M…`. The near-instant chunk-split gets **no stage of its own** — it's the
+      moment M becomes known and the part-count turns determinate.
+- [x] Elapsed-seconds counter appears after 10 s in the rewrite stage; ≥25 s
+      swaps to an explained-wait line (`Still rewriting — the language model is
+      responding slowly…`), never "almost done"; one coarse expectation line
+      (`Usually ~30 s–2 min…`), no countdowns.
+- [x] ✕ **cancel at every stage** (`cancel()`); cancelling keeps
+      already-synthesized parts (`Read-aloud cancelled — N parts kept`), or
+      returns to the button when nothing was synthesized yet.
+- [x] Plan returns `{chunks, rewritten}` (annotated `/tts/plan`);
+      **chunk 1 kept short (~500 chars)** via `_shorten_first_chunk` +
+      a chunking-prompt hint. *(Content-`language` detection stays Phase 3.)*
+- [x] Per-stage errors with unit-level retry: earlier parts stay playable,
+      `Retry part N` regenerates one chunk then resumes the chain; bounded
+      visible auto-retry (`retrying (attempt 2 of 3)…`), then hard-fail with
+      state preserved + `Try again`.
+- [x] Formulation-skipped surfaced: `rewritten:false` → the box shows
+      `Rewriting skipped — reading the original text.` instead of pretending
+      it cleaned up.
+- [x] "Spoken version" disclosure moved inside the box (collapsed; only when
+      the rewrite differs from the original).
+- [x] Non-blocking: the box keeps progressing if the user scrolls away; once
+      playing it demotes to a quiet line (`Playing · generating part N of M…`)
+      and on completion becomes `Ready · M parts · m:ss`.
 
 **Microcopy spec** (from the verified progress-UX brief; EN — DE mirrors in
 `de-DE.json`):

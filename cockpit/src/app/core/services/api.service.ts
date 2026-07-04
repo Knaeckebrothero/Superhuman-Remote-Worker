@@ -965,15 +965,17 @@ export class ApiService {
 
   /**
    * Plan a (possibly long) message into ordered, speakable chunks for
-   * sequential synthesis + playback. Returns the chunk texts, `'unavailable'`
-   * (204 — no TTS model configured), or `null` on error.
+   * sequential synthesis + playback. Returns `{chunks, rewritten}` — `rewritten`
+   * is `false` when the auxiliary LLM was unavailable and the raw markdown was
+   * split deterministically, so the UI can say "rewriting skipped". Returns
+   * `'unavailable'` (204 — no TTS model configured), or `null` on error.
    */
   planTTS(
     threadId: string,
     content: string,
-  ): Observable<string[] | 'unavailable' | null> {
+  ): Observable<{chunks: string[]; rewritten: boolean} | 'unavailable' | null> {
     return this.http
-      .post<{chunks: string[]}>(
+      .post<{chunks: string[]; rewritten: boolean}>(
         `${this.baseUrl}/persistent/threads/${threadId}/tts/plan`,
         {content},
         {observe: 'response'},
@@ -982,7 +984,7 @@ export class ApiService {
         map((resp) =>
           resp.status === 204 || !resp.body
             ? ('unavailable' as const)
-            : (resp.body.chunks ?? []),
+            : {chunks: resp.body.chunks ?? [], rewritten: resp.body.rewritten ?? false},
         ),
         catchError((error) => {
           console.error(`Failed to plan TTS for thread ${threadId}:`, error);
