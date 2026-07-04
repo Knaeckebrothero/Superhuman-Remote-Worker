@@ -11,6 +11,7 @@ import logging
 from typing import Any, Dict, List
 
 from langchain_core.tools import tool
+from src.core.workspace_backend import WorkspaceUnavailableError
 
 from ..context import ToolContext
 from ...services.cloud_mount.guardrails import (
@@ -293,6 +294,8 @@ def create_filesystem_tools(context: ToolContext) -> List[Any]:
 
         except ValueError as e:
             return f"Error: {str(e)}"
+        except WorkspaceUnavailableError:
+            raise
         except Exception as e:
             logger.error(f"list_files error for {path}: {e}")
             return f"Error listing files: {str(e)}"
@@ -319,6 +322,8 @@ def create_filesystem_tools(context: ToolContext) -> List[Any]:
 
         except ValueError as e:
             return f"Error: {str(e)}"
+        except WorkspaceUnavailableError:
+            raise
         except Exception as e:
             logger.error(f"delete_file error for {path}: {e}")
             return f"Error deleting: {str(e)}"
@@ -385,6 +390,8 @@ def create_filesystem_tools(context: ToolContext) -> List[Any]:
 
         except ValueError as e:
             return f"Error: {str(e)}"
+        except WorkspaceUnavailableError:
+            raise
         except Exception as e:
             logger.error(f"search_files error: {e}")
             return f"Error searching: {str(e)}"
@@ -411,6 +418,8 @@ def create_filesystem_tools(context: ToolContext) -> List[Any]:
 
         except ValueError as e:
             return f"Error: {str(e)}"
+        except WorkspaceUnavailableError:
+            raise
         except Exception as e:
             logger.error(f"file_exists error for {path}: {e}")
             return f"Error: {str(e)}"
@@ -437,6 +446,8 @@ def create_filesystem_tools(context: ToolContext) -> List[Any]:
             return f"Error: Source not found: {source}"
         except ValueError as e:
             return f"Error: {str(e)}"
+        except WorkspaceUnavailableError:
+            raise
         except Exception as e:
             logger.error(f"move_file error for {source} -> {dest}: {e}")
             return f"Error moving file: {str(e)}"
@@ -476,6 +487,8 @@ def create_filesystem_tools(context: ToolContext) -> List[Any]:
             return f"Error: File not found: {path}"
         except ValueError as e:
             return f"Error: {str(e)}"
+        except WorkspaceUnavailableError:
+            raise
         except Exception as e:
             logger.error(f"rename_file error for {path} -> {new_name}: {e}")
             return f"Error renaming file: {str(e)}"
@@ -502,6 +515,8 @@ def create_filesystem_tools(context: ToolContext) -> List[Any]:
             return f"Error: Source not found: {source}"
         except ValueError as e:
             return f"Error: {str(e)}"
+        except WorkspaceUnavailableError:
+            raise
         except Exception as e:
             logger.error(f"copy_file error for {source} -> {dest}: {e}")
             return f"Error copying file: {str(e)}"
@@ -583,6 +598,8 @@ def create_filesystem_tools(context: ToolContext) -> List[Any]:
 
                     return "\n".join(lines)
 
+                except WorkspaceUnavailableError:
+                    raise
                 except Exception as e:
                     logger.error(f"PDF info error for {path}: {e}")
                     return f"Error getting PDF info: {str(e)}"
@@ -611,6 +628,8 @@ def create_filesystem_tools(context: ToolContext) -> List[Any]:
 
         except ValueError as e:
             return f"Error: {str(e)}"
+        except WorkspaceUnavailableError:
+            raise
         except Exception as e:
             logger.error(f"get_document_info error for {path}: {e}")
             return f"Error: {str(e)}"
@@ -633,6 +652,8 @@ def create_filesystem_tools(context: ToolContext) -> List[Any]:
 
         except ValueError as e:
             return f"Error: {str(e)}"
+        except WorkspaceUnavailableError:
+            raise
         except Exception as e:
             logger.error(f"create_directory error for {path}: {e}")
             return f"Error creating directory: {str(e)}"
@@ -660,6 +681,8 @@ def create_filesystem_tools(context: ToolContext) -> List[Any]:
 
         except ValueError as e:
             return f"Error: {str(e)}"
+        except WorkspaceUnavailableError:
+            raise
         except Exception as e:
             logger.error(f"delete_directory error for {path}: {e}")
             return f"Error deleting directory: {str(e)}"
