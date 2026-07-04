@@ -8,6 +8,7 @@ Requires: paramiko (pip install paramiko)
 See docs/features/vm_backend.md for the full design.
 """
 
+import errno
 import fnmatch
 import logging
 import posixpath
@@ -47,6 +48,29 @@ logger = logging.getLogger(__name__)
 # Stall/timeout constants, interactive-prompt patterns and message templates
 # are shared from shell_manager (imported above) to keep the local and remote
 # shell backends in lock-step.
+
+# Connect-failure buckets → how many attempts each is worth.
+_AMBIGUOUS_RETRY_CAP = 2
+_GONE_ERRNOS = {errno.EHOSTUNREACH, errno.ENETUNREACH, errno.ENETDOWN}
+
+
+def _classify_connect_error(e: Exception) -> str:
+    """Bucket an SSH connect failure to size the retry budget.
+
+    'gone'      → the workspace host is destroyed (DNS won't resolve / no route);
+                  retrying is pointless, fail fast.
+    'booting'   → host is up but sshd is not listening yet (ECONNREFUSED);
+                  this is the boot window the retries exist for.
+    'ambiguous' → timeout / protocol / unknown; retry briefly then give up.
+    """
+    if isinstance(e, socket.gaierror):
+        return "gone"
+    if isinstance(e, ConnectionRefusedError):
+        return "booting"
+    if isinstance(e, OSError) and e.errno in _GONE_ERRNOS:
+        return "gone"
+    return "ambiguous"
+
 
 # Tab name validation
 TAB_NAME_PATTERN = re.compile(r"^[a-z0-9-]{1,20}$")
@@ -197,9 +221,11 @@ class RemoteBackend(WorkspaceBackend):
     def connect(self) -> None:
         """Establish SSH connection and SFTP channel.
 
-        Retries up to ``_max_retries`` times with exponential backoff to
-        tolerate the window between daemon registration (NATS) and SSHD
-        readiness inside the VM.
+        Retries to tolerate the window between daemon registration (NATS) and
+        SSHD readiness, but classifies the failure (``_classify_connect_error``)
+        so a workspace that is *gone* (DNS won't resolve / no route) fails fast
+        instead of burning the full boot-window budget.
+        See docs/issues/agent_fast_freeze_on_dead_workspace.md.
         """
         connect_kwargs = {
             "hostname": self._host,
@@ -211,24 +237,36 @@ class RemoteBackend(WorkspaceBackend):
             connect_kwargs["key_filename"] = self._key_path
 
         backoff = 2.0
-        for attempt in range(1, self._max_retries + 1):
+        attempt = 0
+        while True:
+            attempt += 1
             self._ssh = paramiko.SSHClient()
             self._ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
             try:
                 self._ssh.connect(**connect_kwargs)
                 break
             except (paramiko.SSHException, socket.error, OSError) as e:
-                if attempt == self._max_retries:
+                bucket = _classify_connect_error(e)
+                if bucket == "gone":
+                    effective_max = 1
+                elif bucket == "ambiguous":
+                    effective_max = min(self._max_retries, _AMBIGUOUS_RETRY_CAP)
+                else:  # booting
+                    effective_max = self._max_retries
+                if attempt >= effective_max:
                     raise WorkspaceUnavailableError(
-                        f"Failed to connect to VM {self._host}:{self._port} "
-                        f"after {self._max_retries} attempts: {e}"
+                        f"Failed to connect to workspace "
+                        f"{self._host}:{self._port} after {attempt} attempt(s) "
+                        f"[{bucket}]: {e}"
                     ) from e
                 logger.warning(
-                    "SSH connect attempt %d/%d to %s:%d failed (%s), retrying in %.0fs",
+                    "SSH connect attempt %d/%d to %s:%d failed [%s] (%s), "
+                    "retrying in %.0fs",
                     attempt,
-                    self._max_retries,
+                    effective_max,
                     self._host,
                     self._port,
+                    bucket,
                     e,
                     backoff,
                 )
@@ -236,7 +274,7 @@ class RemoteBackend(WorkspaceBackend):
                 backoff = min(backoff * 2, 15.0)
 
         self._sftp = self._ssh.open_sftp()
-        logger.info(f"Connected to VM {self._host}:{self._port}")
+        logger.info(f"Connected to workspace {self._host}:{self._port}")
 
     def disconnect(self) -> None:
         """Close SSH/SFTP connections and kill remote tmux session."""
@@ -262,7 +300,7 @@ class RemoteBackend(WorkspaceBackend):
                 pass
             self._ssh = None
 
-        logger.info(f"Disconnected from VM {self._host}")
+        logger.info(f"Disconnected from workspace {self._host}")
 
     def is_connected(self) -> bool:
         if self._ssh is None:
