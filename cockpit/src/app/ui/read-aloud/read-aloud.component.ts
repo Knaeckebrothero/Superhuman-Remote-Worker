@@ -132,6 +132,14 @@ export class AppReadAloudComponent implements OnDestroy {
     private cancelRequested = false;
     private elapsedTimer: ReturnType<typeof setInterval> | null = null;
     private readonly blobUrls = new Set<string>();
+    /** Aborts the in-flight rewrite SSE stream (cancel / bailout / destroy). */
+    private streamAbort: AbortController | null = null;
+    /** True once the chunk list is final (stream `done`, error tail, or fallback)
+     *  — tells the synthesis worker to stop waiting for more chunks. */
+    private streamComplete = false;
+    /** Set while the "read it as-is" bailout takes over, so `start()`'s aborted
+     *  stream loop exits silently instead of surfacing an error. */
+    private bailedOut = false;
 
     // ===== Generation lifecycle =====
 
@@ -167,6 +175,70 @@ export class AppReadAloudComponent implements OnDestroy {
             return;
         }
 
+        // Stream the rewrite: consume chunks as the aux LLM emits them, and start
+        // synthesizing chunk 0 the instant it lands (rather than awaiting the whole
+        // plan). The synthesis worker runs concurrently, draining `chunks` as it
+        // grows and settling into 'done' once the stream is complete.
+        const controller = new AbortController();
+        this.streamAbort = controller;
+        let firstChunkSeen = false;
+        let synthStarted = false;
+        let rewrittenFlag = true;
+        try {
+            for await (const ev of this.api.streamTTSPlan(threadId, text, controller.signal)) {
+                if (this.cancelRequested || this.bailedOut) return;
+                if (ev.type === 'unavailable') {
+                    this.stopElapsed();
+                    this.phase.set('idle');
+                    return;
+                }
+                if (ev.type === 'chunk') {
+                    this.chunks.update((c) => [...c, ev.text]);
+                    if (ev.rewritten === false) rewrittenFlag = false;
+                    this.rewritten.set(rewrittenFlag);
+                    if (!firstChunkSeen) {
+                        firstChunkSeen = true;
+                        this.stopElapsed();
+                        this.phase.set('generating');
+                    }
+                    if (!synthStarted) {
+                        synthStarted = true;
+                        void this.runSynthesis(0);
+                    }
+                } else if (ev.type === 'done') {
+                    rewrittenFlag = ev.rewritten;
+                    this.rewritten.set(rewrittenFlag);
+                    this.streamComplete = true;
+                } else if (ev.type === 'error') {
+                    // Nothing produced yet → try the buffered plan as a safety net
+                    // (transient SSE hiccup); mid-stream → keep what we have.
+                    if (!firstChunkSeen) {
+                        await this.planFallback(threadId, text);
+                        return;
+                    }
+                    this.streamComplete = true;
+                }
+            }
+        } catch {
+            if (this.cancelRequested || this.bailedOut) return;
+            if (!firstChunkSeen) {
+                await this.planFallback(threadId, text);
+                return;
+            }
+        }
+        // Loop ended (with or without an explicit `done`) — the chunk list is now
+        // final so the synthesis worker can finish and settle into 'done'.
+        this.streamComplete = true;
+        if (!firstChunkSeen && !this.cancelRequested && !this.bailedOut) {
+            // Stream closed without ever yielding a chunk → nothing to read.
+            this.stopElapsed();
+            this.phase.set('idle');
+        }
+    }
+
+    /** Buffered-plan safety net when the stream fails before producing anything
+     *  (used by `start()` on an early stream error). */
+    private async planFallback(threadId: string, text: string): Promise<void> {
         let plan: {chunks: string[]; rewritten: boolean} | 'unavailable' | null;
         try {
             plan = await firstValueFrom(this.api.planTTS(threadId, text));
@@ -174,8 +246,7 @@ export class AppReadAloudComponent implements OnDestroy {
             plan = null;
         }
         this.stopElapsed();
-        if (this.cancelRequested) return;
-
+        if (this.cancelRequested || this.bailedOut) return;
         if (plan === 'unavailable') {
             this.phase.set('idle');
             return;
@@ -189,17 +260,27 @@ export class AppReadAloudComponent implements OnDestroy {
             this.phase.set('idle');
             return;
         }
-
         this.chunks.set(plan.chunks);
         this.rewritten.set(plan.rewritten);
+        this.streamComplete = true;
         this.phase.set('generating');
         await this.runSynthesis(0);
     }
 
+    /** Synthesis worker: drains the (growing) chunk queue in order, synthesizing +
+     *  handing each part to playback. Waits for the next chunk while the rewrite
+     *  stream is still producing; stops once `streamComplete` and the queue is
+     *  drained. Runs concurrently with the streaming loop in `start()`. */
     private async runSynthesis(startAt: number): Promise<void> {
-        const chunks = this.chunks();
-        for (let i = startAt; i < chunks.length; i++) {
+        for (let i = startAt; ; i++) {
+            // Wait for chunk `i` to arrive (stream still trickling) or for the
+            // stream to finish with no more chunks.
+            while (i >= this.chunks().length && !this.streamComplete) {
+                if (this.cancelRequested) return;
+                await this.delay(100);
+            }
             if (this.cancelRequested) return;
+            if (i >= this.chunks().length) break; // stream done, queue drained
             this.synthIndex.set(i);
             const part = await this.synthChunk(i);
             if (this.cancelRequested) return;
@@ -216,6 +297,9 @@ export class AppReadAloudComponent implements OnDestroy {
             this.pushToPlayback(i === 0);
         }
         this.partError.set(null);
+        // Every chunk synthesized and the stream is done → tell playback the
+        // timeline is final (collapses the estimated tail; rescues a park-at-end).
+        this.playback.markComplete(this.id);
         this.phase.set('done');
     }
 
@@ -226,7 +310,10 @@ export class AppReadAloudComponent implements OnDestroy {
         const remainingChars = this.chunks()
             .slice(parts.length)
             .reduce((a, c) => a + c.length, 0);
-        const complete = parts.length === this.chunks().length;
+        // "complete" only once the rewrite stream is done AND every received chunk
+        // is synthesized — otherwise the engine would collapse the estimated tail
+        // and stop at the first chunk while more are still streaming in.
+        const complete = this.streamComplete && parts.length === this.chunks().length;
         if (isFirst) {
             this.playback.start(this.id, parts, {remainingChars, complete});
         } else {
@@ -299,6 +386,7 @@ export class AppReadAloudComponent implements OnDestroy {
 
     cancel(): void {
         this.cancelRequested = true;
+        this.streamAbort?.abort();
         this.stopElapsed();
         this.playback.stopIfActive(this.id);
         const kept = this.ready().length;
@@ -329,8 +417,52 @@ export class AppReadAloudComponent implements OnDestroy {
         this.phase.set('idle');
     }
 
+    /** "Skip the rewrite — read it as-is." The escape hatch for when the rewrite
+     *  is slow to even start: abort the stream and synthesize the markdown-
+     *  stripped raw text instead. Only meaningful while still waiting for the
+     *  first chunk (`rewriting`); once audio is flowing there's nothing to skip. */
+    async bailout(): Promise<void> {
+        if (this.phase() !== 'rewriting') return;
+        this.bailedOut = true;
+        this.streamAbort?.abort();
+        this.stopElapsed();
+
+        const threadId = this.threadId();
+        const text = (this.content() ?? '').trim();
+        if (!threadId || !text) {
+            this.failStart('empty');
+            return;
+        }
+        let plan: {chunks: string[]; rewritten: boolean} | 'unavailable' | null;
+        try {
+            plan = await firstValueFrom(this.api.planTTS(threadId, text, {reformulate: false}));
+        } catch {
+            plan = null;
+        }
+        if (this.cancelRequested) return;
+        if (plan === 'unavailable') {
+            this.phase.set('idle');
+            return;
+        }
+        if (!plan || !plan.chunks.length) {
+            this.hardError.set('rewrite');
+            this.phase.set('error');
+            return;
+        }
+        this.chunks.set(plan.chunks);
+        this.rewritten.set(false);
+        this.streamComplete = true;
+        this.bailedOut = false; // handoff complete; let synthesis run
+        this.phase.set('generating');
+        await this.runSynthesis(0);
+    }
+
     private reset(): void {
         this.cancelRequested = false;
+        this.streamAbort?.abort();
+        this.streamAbort = null;
+        this.streamComplete = false;
+        this.bailedOut = false;
         this.playback.stopIfActive(this.id);
         this.revokeBlobs();
         this.chunks.set([]);
@@ -346,6 +478,7 @@ export class AppReadAloudComponent implements OnDestroy {
 
     ngOnDestroy(): void {
         this.cancelRequested = true;
+        this.streamAbort?.abort();
         this.stopElapsed();
         this.playback.stopIfActive(this.id);
         this.revokeBlobs();
@@ -363,7 +496,7 @@ export class AppReadAloudComponent implements OnDestroy {
                 .reduce((a, c) => a + c.length, 0);
             this.playback.start(this.id, this.ready(), {
                 remainingChars,
-                complete: this.ready().length === this.chunks().length,
+                complete: this.streamComplete && this.ready().length === this.chunks().length,
             });
         }
     }

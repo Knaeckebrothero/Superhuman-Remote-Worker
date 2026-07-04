@@ -16,6 +16,7 @@ clicking Play twice on the same message doesn't re-bill.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
@@ -116,6 +117,44 @@ Chunking rules:
 
 Return ONLY a JSON array of strings (the chunks, in order), e.g. ["first chunk", "second chunk"]. No preamble, no commentary, no markdown fences."""
 
+# Streaming chunk plan. The auxiliary LLM streams the *cleaned* text token by
+# token; the client synthesizes + plays chunk 1 while the rest still generate
+# (time-to-first-audio ≈ first-chunk latency, not whole-message latency). This is
+# what retires the old "one 30 s+ call that times out" failure mode: there is no
+# single long call, only a trickle bounded by a per-token idle timeout.
+#
+# CHUNKING IS DONE HERE, NOT BY THE MODEL. Measured behaviour: gemma-4-moe (and
+# likely other local models) reliably *rewrites* but ignores an instruction to
+# emit an explicit chunk separator — so we can't depend on one. Instead we flush
+# a chunk whenever the streamed buffer crosses the size target at a natural
+# sentence/paragraph boundary. The sentinel below is honoured as a *bonus*
+# boundary when a model does emit it, but nothing depends on it.
+TTS_CHUNK_SENTINEL = "[[BREAK]]"
+# Two-tier stream timeout. Before the FIRST token, be patient — first-token
+# latency on a loaded/cold homelab endpoint is highly variable (measured 4–45 s)
+# and the user has explicitly said they'll wait for a good rewrite (and can hit
+# the "read it as-is" bailout in the UI if they won't). Once tokens are FLOWING,
+# a long gap really does mean a dead connection, so tighten up. Neither is a
+# total-request cap — a long message that keeps trickling is fine.
+_STREAM_FIRST_TOKEN_TIMEOUT = 120.0
+_STREAM_IDLE_TIMEOUT = 30.0
+# Generous overall ceiling so a totally stuck (but not idle) connection still dies.
+_STREAM_MAX_TOTAL = 600.0
+
+CHUNKING_STREAM_SYSTEM_PROMPT = """You rewrite text so it sounds natural read aloud by a text-to-speech engine, streaming the rewritten text as you go.
+
+Rules:
+1. Strip ALL markdown (asterisks, headers, code fences, link syntax).
+2. Convert tables to descriptive sentences — never read tables cell-by-cell.
+3. For code blocks: briefly describe what the code does in one sentence; never read syntax.
+4. Convert bullet lists to flowing prose with words like "first", "next", "also".
+5. Drop URLs (or say "a link").
+6. Preserve the meaning, tone, technical terms, proper names, and ORDER. Do not summarize or omit content.
+7. Keep numbers in a readable form.
+8. Separate distinct sections or ideas with a blank line so the reader can pause naturally.
+
+Output ONLY the rewritten spoken text, streamed as you go. No JSON, no markdown, no preamble, no commentary, no numbering."""
+
 
 def _hash_key(*parts: str) -> str:
     """Stable cache key from any string parts."""
@@ -170,19 +209,19 @@ async def _record_usage(
         logger.debug("voice usage metering failed (non-fatal)", exc_info=True)
 
 
-def _llm_token_events(
-    response: Any,
+def _token_events_from_usage(
+    usage: Any,
     *,
     model: str,
     stage: str,
     user_id: Optional[str],
     ref_id: Optional[str],
 ) -> list[UsageEvent]:
-    """Prompt/completion-token ``UsageEvent``s from an OpenAI-compatible chat
-    response — ``[]`` when the endpoint returned no usage (many local servers
-    omit it). Emitted under ``source='orchestrator'`` so they don't collide with
-    the LiteLLM materializer's namespace and stay attributable to the TTS aux."""
-    usage = getattr(response, "usage", None)
+    """Prompt/completion-token ``UsageEvent``s from an OpenAI-compatible ``usage``
+    object — ``[]`` when it's ``None`` (many local servers omit usage). Emitted
+    under ``source='orchestrator'`` so they don't collide with the LiteLLM
+    materializer's namespace and stay attributable to the TTS aux. Shared by the
+    buffered (``response.usage``) and streaming (final-chunk ``usage``) paths."""
     if usage is None:
         return []
     common = dict(
@@ -210,6 +249,24 @@ def _llm_token_events(
             )
         )
     return events
+
+
+def _llm_token_events(
+    response: Any,
+    *,
+    model: str,
+    stage: str,
+    user_id: Optional[str],
+    ref_id: Optional[str],
+) -> list[UsageEvent]:
+    """Token ``UsageEvent``s from a buffered chat response (``response.usage``)."""
+    return _token_events_from_usage(
+        getattr(response, "usage", None),
+        model=model,
+        stage=stage,
+        user_id=user_id,
+        ref_id=ref_id,
+    )
 
 
 def _voice_for_language(language: str) -> str:
@@ -554,6 +611,84 @@ async def generate_message_tts(
 # ---------------------------------------------------------------------------
 
 
+def _strip_markdown_for_speech(text: str) -> str:
+    """Local, dependency-free markdown → speakable-text cleanup for the fallback
+    path (no aux LLM, or the aux failed). It doesn't *rewrite* prose the way the
+    LLM does — it just stops the TTS engine from literally reading "asterisk
+    asterisk", table pipes, and header hashes. Conservative on purpose: it leaves
+    single underscores (snake_case identifiers) and ordinary punctuation alone.
+    """
+    if not text:
+        return ""
+    t = text
+    # Fenced code → a short spoken placeholder (never read code or backticks aloud).
+    t = re.sub(r"```[\s\S]*?```", " (code snippet) ", t)
+    t = re.sub(r"~~~[\s\S]*?~~~", " (code snippet) ", t)
+    # Images ![alt](url) → drop; links [text](url) → text; inline `code` → code.
+    t = re.sub(r"!\[[^\]]*\]\([^)]*\)", " ", t)
+    t = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", t)
+    t = re.sub(r"`([^`]*)`", r"\1", t)
+
+    # Line-oriented cleanup: tables → "cell, cell." sentences, and strip leading
+    # header / quote / list markers.
+    out_lines: list[str] = []
+    for line in t.split("\n"):
+        s = line.strip()
+        is_table_row = s.startswith("|") or (
+            s.count("|") >= 2 and bool(re.search(r"\S\s*\|\s*\S", s))
+        )
+        if is_table_row:
+            # Drop the |---|:--| separator rows entirely.
+            if re.fullmatch(r"\|?[\s:|-]+\|?", s):
+                continue
+            cells = [c.strip() for c in s.strip().strip("|").split("|")]
+            cells = [c for c in cells if c]
+            if cells:
+                out_lines.append(", ".join(cells) + ".")
+            continue
+        line = re.sub(r"^\s{0,3}#{1,6}\s*", "", line)  # headers
+        line = re.sub(r"^\s{0,3}>\s?", "", line)  # blockquotes
+        line = re.sub(r"^\s*[-*+]\s+", "", line)  # bullets
+        line = re.sub(r"^\s*\d+[.)]\s+", "", line)  # ordered list
+        if re.fullmatch(r"\s*([-*_])\1{2,}\s*", line):  # horizontal rule
+            continue
+        out_lines.append(line)
+    t = "\n".join(out_lines)
+
+    # Emphasis markers (the "asterisk asterisk" complaint) and stray pipes.
+    t = re.sub(r"\*+", "", t)
+    t = t.replace("~~", "").replace("__", "").replace("|", " ")
+    # Tidy whitespace.
+    t = re.sub(r"[ \t]{2,}", " ", t)
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    return t.strip()
+
+
+def _clean_stream_chunk(text: str) -> str:
+    """Trim one streamed chunk, defensively removing any stray sentinel or code
+    fence the model tucked in (drain already split on full sentinels)."""
+    if not text:
+        return ""
+    t = text.replace(TTS_CHUNK_SENTINEL, " ").strip()
+    if t.startswith("```"):
+        t = re.sub(r"^```[a-zA-Z]*\n?", "", t)
+        t = re.sub(r"\n?```$", "", t).strip()
+    return t
+
+
+def _drain_sentinels(buffer: str) -> tuple[list[str], str]:
+    """Split an accumulating stream ``buffer`` on the chunk sentinel. Returns
+    ``(complete_chunks, remainder)`` — the pieces before each sentinel (trimmed,
+    empties dropped) and the still-accumulating tail after the last sentinel. A
+    partial sentinel split across deltas stays in the remainder until complete."""
+    if TTS_CHUNK_SENTINEL not in buffer:
+        return [], buffer
+    parts = buffer.split(TTS_CHUNK_SENTINEL)
+    remainder = parts.pop()
+    chunks = [p.strip() for p in parts]
+    return [c for c in chunks if c], remainder
+
+
 def _split_text_into_chunks(text: str, limit: int = TTS_CHUNK_LIMIT) -> list[str]:
     """Deterministically pack ``text`` into ``<=limit``-char chunks, breaking at
     paragraph then sentence boundaries. The fallback when the LLM can't chunk
@@ -806,22 +941,28 @@ async def plan_tts_chunks(
     ledger: Optional[UsageLedger] = None,
     ref_id: Optional[str] = None,
     project_id: Optional[str] = None,
+    reformulate: bool = True,
 ) -> Optional[dict]:
     """Clean ``content`` for speech and split it into ordered ``<=4096``-char
     chunks at natural breakpoints, for sequential synthesis + playback.
 
     Returns ``{"chunks": [...], "rewritten": bool}`` — ``rewritten`` is ``True``
     only when the auxiliary LLM actually cleaned the text; ``False`` when the
-    deterministic splitter ran the raw markdown (no aux model, or the LLM
-    failed), so the UI can honestly say "rewriting skipped" instead of implying
-    it tidied the text. The first chunk is kept short for fast time-to-first-
-    audio. Returns ``None`` when no TTS model is configured (the endpoint maps
-    this to ``204``); otherwise ``chunks`` always has at least one entry.
+    deterministic splitter ran the (markdown-stripped) raw text — no aux model,
+    the LLM failed, or ``reformulate=False`` (the client's "read it as-is"
+    bailout) — so the UI can honestly say "rewriting skipped". Even in that
+    fallback the markdown is stripped so the TTS engine never reads "asterisk
+    asterisk" or table pipes aloud. The first chunk is kept short for fast
+    time-to-first-audio. Returns ``None`` when no TTS model is configured (the
+    endpoint maps this to ``204``); otherwise ``chunks`` always has ≥1 entry.
+
+    This is the buffered planner (one round trip, all chunks at once). See
+    :func:`stream_tts_chunks` for the streaming variant the UI prefers.
     """
     if not content or not content.strip():
         return None
 
-    cache_key = _hash_key("plan", content)
+    cache_key = _hash_key("plan", "reform" if reformulate else "raw", content)
     async with _plan_lock:
         cached = _cache_get(_plan_cache, cache_key)
     if cached is not None:
@@ -848,33 +989,37 @@ async def plan_tts_chunks(
 
     chunks: Optional[list[str]] = None
     rewritten = False
-    aux_creds = await _resolve_capability_credentials(
-        capability="auxiliary",
-        user_settings=user_settings,
-        user_id=user_id,
-        resolved_keys=resolved_keys,
-        postgres_db=postgres_db,
-    )
-    if aux_creds is not None:
-        aux_model, aux_base_url, aux_api_key = aux_creds
-        chunks = await _llm_clean_and_chunk(
-            content,
-            model=aux_model,
-            base_url=aux_base_url,
-            api_key=aux_api_key,
-            ledger=ledger,
+    if reformulate:
+        aux_creds = await _resolve_capability_credentials(
+            capability="auxiliary",
+            user_settings=user_settings,
             user_id=user_id,
-            ref_id=ref_id,
+            resolved_keys=resolved_keys,
+            postgres_db=postgres_db,
         )
-        # rewritten iff the LLM actually produced the chunks (not the fallback).
-        rewritten = chunks is not None
+        if aux_creds is not None:
+            aux_model, aux_base_url, aux_api_key = aux_creds
+            chunks = await _llm_clean_and_chunk(
+                content,
+                model=aux_model,
+                base_url=aux_base_url,
+                api_key=aux_api_key,
+                ledger=ledger,
+                user_id=user_id,
+                ref_id=ref_id,
+            )
+            # rewritten iff the LLM actually produced the chunks (not fallback).
+            rewritten = chunks is not None
 
-    # Fallback: deterministic split of the raw content (no cleanup, but always
-    # playable) when there's no aux model or the LLM couldn't deliver. Pack to
-    # the synthesis-sized target, not the 4096 ceiling, so each chunk stays
-    # fast to synthesize.
+    # Fallback: deterministic split of the *markdown-stripped* content — no LLM
+    # cleanup, but always playable and free of "asterisk asterisk". Runs when
+    # there's no aux model, the LLM couldn't deliver, or reformulate=False (the
+    # UI bailout). Pack to the synthesis-sized target, not the 4096 ceiling, so
+    # each chunk stays fast to synthesize.
     if not chunks:
-        chunks = _split_text_into_chunks(content, TTS_CHUNK_TARGET)
+        chunks = _split_text_into_chunks(
+            _strip_markdown_for_speech(content), TTS_CHUNK_TARGET
+        )
 
     # Short first chunk → fast time-to-first-audio (later chunks generate while
     # chunk 1 plays). Applied to both the LLM and deterministic paths.
@@ -883,9 +1028,242 @@ async def plan_tts_chunks(
     # Hard gate: nothing over the ceiling reaches synthesis.
     chunks = _enforce_chunk_limit(chunks)
     if not chunks:
-        chunks = _split_text_into_chunks(content, TTS_CHUNK_TARGET) or [content.strip()]
+        chunks = _split_text_into_chunks(
+            _strip_markdown_for_speech(content), TTS_CHUNK_TARGET
+        ) or [content.strip()]
 
     result = {"chunks": chunks, "rewritten": rewritten}
     async with _plan_lock:
         _cache_put(_plan_cache, cache_key, result, _PLAN_CACHE_MAX)
     return {"chunks": list(chunks), "rewritten": rewritten}
+
+
+def _emit_pieces(text: str) -> list[str]:
+    """Clean one about-to-be-yielded chunk (strip stray sentinel/fences) and
+    hard-gate to the 4096 ceiling. Sizing is done by the streaming flush loop
+    (which cuts at the target), so this only guards the ceiling as a backstop."""
+    text = _clean_stream_chunk(text)
+    if not text:
+        return []
+    return _enforce_chunk_limit([text])
+
+
+async def stream_tts_chunks(
+    *,
+    content: str,
+    user_id: str,
+    postgres_db,
+    ledger: Optional[UsageLedger] = None,
+    ref_id: Optional[str] = None,
+    project_id: Optional[str] = None,
+):
+    """Streaming counterpart of :func:`plan_tts_chunks`: an async generator that
+    yields each speakable chunk the *moment* it's ready, so the client can
+    synthesize + start playing chunk 1 while the rest still generate. This is
+    what retires the timeout failure mode — there is no single long call to time
+    out, only a trickle bounded by a per-token idle timeout (not a total cap), so
+    a long rewrite of complex content is fine.
+
+    Yields event dicts:
+      ``{"type": "unavailable"}``                         — no TTS model configured
+      ``{"type": "chunk", "index", "text", "rewritten"}`` — one ready chunk
+      ``{"type": "done", "total", "rewritten"}``          — terminal
+
+    ``rewritten`` is ``True`` while the aux LLM is producing the chunks, ``False``
+    on the deterministic (markdown-stripped) fallback used when there's no aux
+    model or the stream fails/stalls before producing anything usable. A
+    mid-stream failure keeps the chunks already delivered (partial read) and ends
+    with ``done``.
+    """
+    if not content or not content.strip():
+        yield {"type": "done", "total": 0, "rewritten": False}
+        return
+
+    user_settings = await postgres_db.get_user_settings(user_id) or {}
+    resolved_keys = await postgres_db.resolve_api_keys_for_job(
+        user_id=user_id, project_id=None
+    )
+
+    tts_creds = await _resolve_capability_credentials(
+        capability="tts",
+        user_settings=user_settings,
+        user_id=user_id,
+        resolved_keys=resolved_keys,
+        postgres_db=postgres_db,
+    )
+    if tts_creds is None:
+        logger.info(
+            "No TTS model configured for user %s; cannot stream chunks", user_id
+        )
+        yield {"type": "unavailable"}
+        return
+
+    aux_creds = await _resolve_capability_credentials(
+        capability="auxiliary",
+        user_settings=user_settings,
+        user_id=user_id,
+        resolved_keys=resolved_keys,
+        postgres_db=postgres_db,
+    )
+
+    def _fallback_chunks() -> list[str]:
+        chunks = _split_text_into_chunks(
+            _strip_markdown_for_speech(content), TTS_CHUNK_TARGET
+        )
+        chunks = _enforce_chunk_limit(_shorten_first_chunk(chunks))
+        return chunks or [_strip_markdown_for_speech(content) or content.strip()]
+
+    index = 0
+
+    # No aux model (or no key) → deterministic markdown-stripped split, streamed
+    # out as-is. Still incremental for the client, just not LLM-rewritten.
+    aux_key = aux_creds[2] if aux_creds else None
+    if not aux_creds or not aux_key:
+        for c in _fallback_chunks():
+            yield {"type": "chunk", "index": index, "text": c, "rewritten": False}
+            index += 1
+        yield {"type": "done", "total": index, "rewritten": False}
+        return
+
+    aux_model, aux_base_url, aux_api_key = aux_creds
+    client = AsyncOpenAI(
+        api_key=aux_api_key,
+        base_url=aux_base_url,
+        timeout=_STREAM_MAX_TOTAL,
+        max_retries=0,
+    )
+    buffer = ""
+    produced_any = False
+    got_content = False
+    usage_obj: Any = None
+    stalled = False
+    try:
+        stream = await client.chat.completions.create(
+            model=aux_model,
+            messages=[
+                {"role": "system", "content": CHUNKING_STREAM_SYSTEM_PROMPT},
+                {"role": "user", "content": content},
+            ],
+            temperature=0.3,
+            stream=True,
+            stream_options={"include_usage": True},
+        )
+        stream_iter = stream.__aiter__()
+        while True:
+            # Patient before the first content token, tight once flowing.
+            gap_timeout = (
+                _STREAM_IDLE_TIMEOUT if got_content else _STREAM_FIRST_TOKEN_TIMEOUT
+            )
+            try:
+                event = await asyncio.wait_for(
+                    stream_iter.__anext__(), timeout=gap_timeout
+                )
+            except StopAsyncIteration:
+                break
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "TTS chunk stream timeout after %.0fs (stage=chunk-stream "
+                    "model=%s base_url=%s got_content=%s produced=%s)",
+                    gap_timeout,
+                    aux_model,
+                    aux_base_url,
+                    got_content,
+                    produced_any,
+                )
+                stalled = True
+                break
+
+            u = getattr(event, "usage", None)
+            if u is not None:
+                usage_obj = u
+            choices = getattr(event, "choices", None)
+            if not choices:
+                continue
+            delta = getattr(choices[0], "delta", None)
+            piece = getattr(delta, "content", None) if delta is not None else None
+            if not piece:
+                continue
+            got_content = True
+            buffer += piece
+
+            # (1) Honour an explicit sentinel boundary if the model emitted one
+            #     (bonus — most local models don't; see the module note).
+            ready, buffer = _drain_sentinels(buffer)
+            for chunk_text in ready:
+                for pe in _emit_pieces(chunk_text):
+                    produced_any = True
+                    yield {
+                        "type": "chunk",
+                        "index": index,
+                        "text": pe,
+                        "rewritten": True,
+                    }
+                    index += 1
+
+            # (2) Size-based flush — the real incremental mechanism. Whenever the
+            #     buffer crosses the target, cut at the latest natural sentence/
+            #     paragraph boundary under it and emit. The first chunk uses the
+            #     smaller first-chunk target for fast time-to-first-audio.
+            while len(buffer) >= (
+                TTS_FIRST_CHUNK_TARGET if index == 0 else TTS_CHUNK_TARGET
+            ):
+                target = TTS_FIRST_CHUNK_TARGET if index == 0 else TTS_CHUNK_TARGET
+                head, tail = _split_once_under(buffer, target)
+                if tail:
+                    buffer = tail
+                elif len(buffer) >= TTS_CHUNK_LIMIT:
+                    # A run this long with no boundary — hard-cut at the ceiling.
+                    head, buffer = buffer[:TTS_CHUNK_LIMIT], buffer[TTS_CHUNK_LIMIT:]
+                else:
+                    break  # no boundary yet; wait for more tokens
+                for pe in _emit_pieces(head):
+                    produced_any = True
+                    yield {
+                        "type": "chunk",
+                        "index": index,
+                        "text": pe,
+                        "rewritten": True,
+                    }
+                    index += 1
+
+        # Flush the trailing remainder (the final chunk), unless we bailed on an
+        # idle stall mid-message (the buffer is partial then).
+        if not stalled:
+            for pe in _emit_pieces(buffer):
+                produced_any = True
+                yield {"type": "chunk", "index": index, "text": pe, "rewritten": True}
+                index += 1
+    except Exception:
+        logger.exception(
+            "TTS chunk-stream failed (stage=chunk-stream model=%s base_url=%s "
+            "produced=%s); falling back to deterministic split",
+            aux_model,
+            aux_base_url,
+            produced_any,
+        )
+    finally:
+        if usage_obj is not None and _metering_enabled(ledger):
+            await _record_usage(
+                ledger,
+                _token_events_from_usage(
+                    usage_obj,
+                    model=aux_model,
+                    stage="chunk-stream",
+                    user_id=user_id,
+                    ref_id=ref_id,
+                ),
+            )
+        with contextlib.suppress(Exception):
+            await client.close()
+
+    if produced_any:
+        yield {"type": "done", "total": index, "rewritten": True}
+        return
+
+    # The stream produced nothing usable (never connected, errored early, stalled
+    # before a chunk, or returned only whitespace) → deterministic fallback so the
+    # button never dead-ends.
+    for c in _fallback_chunks():
+        yield {"type": "chunk", "index": index, "text": c, "rewritten": False}
+        index += 1
+    yield {"type": "done", "total": index, "rewritten": False}

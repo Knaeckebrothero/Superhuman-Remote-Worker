@@ -135,6 +135,34 @@ describe('ReadAloudPlaybackService — one playback at a time', () => {
     expect(svc.parts().length).toBe(1); // unchanged
   });
 
+  it('markComplete collapses the estimated tail to the real total', () => {
+    const svc = make();
+    svc.start('msg-A', parts([10]), {remainingChars: 300, complete: false});
+    expect(svc.estimatedTotal()).toBe(30); // 10 known + 300/15 estimated
+    svc.markComplete('msg-A');
+    expect(svc.complete()).toBe(true);
+    expect(svc.estimatedTotal()).toBe(10); // tail gone
+  });
+
+  it('markComplete rescues a session parked at the end (last chunk arrived while streaming)', () => {
+    const svc = make();
+    svc.start('msg-A', parts([5, 8]), {remainingChars: 0, complete: false});
+    // Simulate the element having run out at the end of the last synthesized part.
+    (svc as unknown as {awaitingPart: number}).awaitingPart = 2; // == parts.length
+    svc.playing.set(true);
+    svc.markComplete('msg-A');
+    expect(svc.playing()).toBe(false);
+    expect(svc.index()).toBe(1); // settled on the last part
+    expect(svc.positionInPart()).toBe(8); // at its end
+  });
+
+  it('markComplete ignores a non-active session', () => {
+    const svc = make();
+    svc.start('msg-A', parts([5]), {remainingChars: 100, complete: false});
+    svc.markComplete('msg-OTHER');
+    expect(svc.complete()).toBe(false);
+  });
+
   it('stopIfActive clears only the active session', () => {
     const svc = make();
     svc.start('msg-A', parts([5]), {remainingChars: 0, complete: true});

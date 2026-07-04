@@ -33,6 +33,30 @@ related:
 
 ## Status
 
+> ## ✅ Phases 0–4 COMPLETE — only Phase 5 remains (deferred)
+>
+> As of **2026-07-04**, every first-party phase (0 → 4) is implemented, tested,
+> k3d-smoke-verified, and committed. Read-aloud is now a reliable, transparent,
+> themed, honest experience, and dictation fails loud instead of silent. The
+> **only** phase left is **Phase 5 — custom fine-tuned voices & personas**
+> (big-sister / Cyclops / Skynet), which is *deliberately* deferred to the
+> self-improvement loop agent; its full pipeline is recorded in §Phase 5.
+>
+> | Phase | Scope | State |
+> |---|---|---|
+> | 0 | Honesty (kill silent-204), diagnosable logging, usage metering | ✅ done |
+> | 1 | Transparency box (staged status, cancel, retry, "rewriting skipped") | ✅ done |
+> | 2 | Custom themed player (single virtual-timeline element, no native chrome) | ✅ done (stretch flair deferred) |
+> | 3 | External voices v1 (content-language, `instructions`, user voice picker) | ✅ done (vendor adapters = ear bake-off) |
+> | 4 | STT hardening (failure → honest 502, long-clip timeout, recording cap) | ✅ done |
+> | 5 | Custom fine-tuned voices & personas | ⏳ deferred → loop agent |
+>
+> **Owner-gated follow-ups (not gaps):** push the branch; light up
+> `gpt-4o-mini-tts` (Admin → Providers + an OpenAI key) to make German actually
+> *speak* and unlock style prompts; run the vendor ear bake-off
+> (ElevenLabs / Hume / MiniMax) for wow-lane voices; optional P2 stretch flair
+> (highlight-as-spoken, waveform, ping-pong preload, scroll-away mini-player).
+
 **Design refined 2026-07-04 after a 6-agent research pass** (product UX
 patterns, provider landscape, browser audio engineering, progress-UX
 research, cockpit + orchestrator integration maps). Phase 0 framework
@@ -70,6 +94,65 @@ a sentence boundary, and both `rewritten:true` (gemma cleaned the markdown) and
 `rewritten:false` (deterministic fallback) branches confirmed. The box's visual
 states weren't driven headlessly (no browser attached) — covered by the unit
 tests + template typecheck.
+
+**Phase 1 transparency hardening 2026-07-04** (field bug, fixed + live on k3d):
+`start()` validated *before* rendering anything (`if (!threadId ||
+!text.trim() || unavailable) return`), so a failed guard — or an
+`undefined.trim()` throw on a reconstructed turn — was a **silent no-op**,
+violating the core "acknowledge the click in <100 ms" rule (reproduced live:
+Read did nothing on an ended session). Fix: flip `phase` to the box as the
+*first* line of the handler, before any validation / reset / priming; read
+inputs defensively (`(content() ?? '').trim()`); and turn every start-time
+failure into a visible honest state — `nothingToRead` / `noSession` /
+`notConfigured` (with **Dismiss**), transient plan/synth failures keep **Try
+again**. The box is now self-describing. (Verified: cockpit `npm test` 805 +
+build clean; ng-serve recompiled + reloaded on k3d.)
+
+**Streaming rewrite implemented + verified 2026-07-04** (the reliability fix
+that retires the planner timeout). Root cause of the field report ("rewrite
+failed"): the buffered `/tts/plan` made **one** aux-LLM call that rewrote +
+chunked the *whole* message; on a long message that call blew the 30 s timeout
+(confirmed in the orchestrator log: `openai.APITimeoutError` → deterministic
+fallback → `rewritten:false`, i.e. "rewriting skipped"). Fix: a streaming SSE
+planner —
+- **`POST …/tts/plan/stream`** (`main.py`) wraps a new async generator
+  `stream_tts_chunks` (`services/tts.py`) into `event: chunk` / `done` /
+  `unavailable` SSE frames. Client consumes it via `ApiService.streamTTSPlan`
+  (raw `fetch` + `getReader()`, cookie + `X-CSRF`, `ngsw-bypass`) and
+  synthesizes each chunk the instant it lands (component's `runSynthesis` became
+  a growing-queue worker running concurrently with the stream). Time-to-first-
+  audio ≈ first-chunk latency, not whole-message latency — no single long call
+  to time out.
+- **Chunking is done server-side by size, NOT by the model.** Measured live:
+  `gemma-4-moe` rewrites cleanly but **ignores** an instruction to emit a chunk
+  separator (0 sentinels in output). So the parser flushes a chunk whenever the
+  streamed buffer crosses the size target at a natural sentence/paragraph
+  boundary; the `[[BREAK]]` sentinel is honoured as a *bonus* boundary when
+  present but nothing depends on it. This was the key pivot from the naïve
+  "ask the model to delimit" design.
+- **Two-tier timeout**: patient before the first token (`120 s` — measured
+  first-token latency on the loaded homelab endpoint swings 4–45 s and the user
+  said they'll wait), tight between tokens once flowing (`30 s`). Neither is a
+  total cap.
+- **Char-strip fallback** (`_strip_markdown_for_speech`): when there's no aux
+  model, the stream fails/stalls before any chunk, or the user bails, the raw
+  text is markdown-stripped (bold/headers/links/tables→sentences/code-fence→
+  placeholder) before splitting, so the TTS engine never reads "asterisk
+  asterisk" or table pipes. Also applied to the buffered `/tts/plan` fallback.
+- **"Read it as-is" bailout**: a button in the rewriting box (`reformulate:false`
+  → instant markdown-stripped split) for when the user won't wait for a slow
+  first token.
+- Residual UX cost: **first-token latency** (an infra property of the homelab
+  endpoint, 4–45 s observed) — streaming can't shrink it, but the visible box +
+  elapsed counter + bailout make the wait honest and escapable.
+
+Verified: backend `pytest tests/test_tts.py` (**63**, incl. size-flush without
+sentinel, char-strip, SSE-frame emission, raw mode); frontend `npm test`
+read-aloud + api specs (36) + `tsc` clean; `stream_tts_chunks` run live against
+the real `gemma-4-moe` (clean incremental chunks, sentence-boundary cuts,
+markdown stripped, numbers spoken as words); the SSE route is live on k3d (401
+auth-gated, not 404). **Not yet exercised in a browser** (SSE consumption +
+incremental playback) — needs a click on the k3d cockpit.
 
 **Phase 2 (the custom player) core implemented + verified 2026-07-04.**
 `ReadAloudPlaybackService` (root, single primed `HTMLAudioElement` + prefix-sum
