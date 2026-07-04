@@ -28,6 +28,7 @@ The VM endpoints and lifecycle hooks in main.py use this provisioner exclusively
 import asyncio
 import logging
 import os
+import time
 from typing import Any, Optional
 
 import httpx
@@ -270,6 +271,14 @@ class VMProvisioner:
         Returns:
             True if the request was accepted, False otherwise.
         """
+        # A (re)provisioned VM must start with a CLEAN reap counter and no stale
+        # SSH endpoint. context.vm is *merged* (not replaced) across provisions,
+        # so a prior incarnation's snapshot_attempts — which reaches the reaper's
+        # max and makes attempts_exhausted instantly true, force-deleting the new
+        # VM on its first tick — and its dead ssh_host would otherwise leak into
+        # this fresh VM. provisioned_at anchors the dispatcher's provisioning
+        # timeout. Runs before backend dispatch so every transport inherits it.
+        await self._set_vm_context(job_id, self._fresh_provision_ctx())
         if nats_bridge.is_available:
             return await nats_bridge.request_vm_create(
                 job_id=job_id,
@@ -723,6 +732,23 @@ class VMProvisioner:
     # Helpers
     # =========================================================================
 
+    @staticmethod
+    def _fresh_provision_ctx() -> dict:
+        """Reap-counter/endpoint reset + provision timestamp for a new VM.
+
+        Merged into context.vm at the start of every (re)provision so the new
+        incarnation does not inherit the previous one's snapshot_attempts (which
+        would make the lifecycle reaper's attempts_exhausted instantly true) or a
+        dead ssh_host. ``provisioned_at`` (epoch seconds) anchors the dispatcher's
+        provisioning-timeout escalation.
+        """
+        return {
+            "snapshot_attempts": 0,
+            "ssh_host": None,
+            "ssh_port": None,
+            "provisioned_at": time.time(),
+        }
+
     async def _set_vm_context(self, job_id: str, updates: dict) -> None:
         """Atomically merge updates into the job's context.vm key."""
         if not self._db:
@@ -754,6 +780,9 @@ class VMProvisioner:
         Returns:
             True if the request was accepted, False otherwise.
         """
+        # See create_vm: reset the reap counter / stale endpoint and stamp
+        # provisioned_at before backend dispatch (thread-scoped context).
+        await self._set_thread_vm_context(thread_id, self._fresh_provision_ctx())
         if nats_bridge.is_available:
             return await nats_bridge.request_vm_create(
                 job_id=thread_id,
