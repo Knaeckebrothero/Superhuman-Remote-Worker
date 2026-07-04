@@ -4434,8 +4434,7 @@ async def _try_dispatch_pending_jobs() -> None:
                             await vm_provisioner.delete_vm(job_id)
                         except Exception:
                             logger.exception(
-                                "Dispatcher: failed to delete timed-out VM "
-                                "for job %s",
+                                "Dispatcher: failed to delete timed-out VM for job %s",
                                 job_id,
                             )
                         continue
