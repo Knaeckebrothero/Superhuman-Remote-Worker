@@ -1506,6 +1506,13 @@
         min-width: 50px;
       }
 
+      .recording-time.near-cap { color: var(--warning); }
+
+      .recording-cap-warning {
+        font-size: 12px;
+        color: var(--warning);
+      }
+
       .recording-dot {
         width: 8px;
         height: 8px;

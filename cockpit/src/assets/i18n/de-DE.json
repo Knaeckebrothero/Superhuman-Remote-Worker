@@ -1130,6 +1130,7 @@
       "recordVoice": "Halten zum Aufnehmen",
       "recordingStop": "Aufnahme stoppen",
       "recordingCancel": "Aufnahme abbrechen",
+      "recordingCapWarning": "Aufnahme endet bald",
       "remove": "Entfernen",
       "send": "Senden",
       "stop": "Stoppen",

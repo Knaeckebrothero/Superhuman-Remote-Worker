@@ -18930,12 +18930,13 @@ async def transcribe_thread_audio_endpoint(
     via the user's configured Whisper model, with auto-detected language.
 
     Returns:
-        ``{"text": "..."}`` on success. ``204 No Content`` when no STT model is
-        configured for the user (or transcription failed) — the cockpit then
-        just attaches the audio. ``400`` for empty audio; ``413`` when the clip
-        exceeds 25 MB (Whisper's hard limit).
+        ``{"text": "..."}`` on success (``text`` may be ``""`` for silence).
+        ``204 No Content`` **only** when no STT model is configured (the cockpit
+        attaches the audio silently). ``502`` when a configured model fails, so
+        the composer shows an honest error rather than a silent no-op. ``400``
+        for empty audio; ``413`` when the clip exceeds 25 MB (Whisper's limit).
     """
-    from services.transcribe import transcribe_thread_audio
+    from services.transcribe import TranscriptionError, transcribe_thread_audio
 
     user, thread = await require_thread_owner(request, postgres_db, thread_id)
 
@@ -18945,17 +18946,21 @@ async def transcribe_thread_audio_endpoint(
     if len(data) > 25 * 1024 * 1024:
         raise HTTPException(status_code=413, detail="Audio too large (max 25 MB)")
 
-    text = await transcribe_thread_audio(
-        audio_bytes=data,
-        filename=audio.filename or "voice.webm",
-        user_id=str(user["id"]),
-        postgres_db=postgres_db,
-        ledger=usage_ledger,
-        ref_id=thread_id,
-    )
+    try:
+        text = await transcribe_thread_audio(
+            audio_bytes=data,
+            filename=audio.filename or "voice.webm",
+            user_id=str(user["id"]),
+            postgres_db=postgres_db,
+            ledger=usage_ledger,
+            ref_id=thread_id,
+        )
+    except TranscriptionError as exc:
+        raise HTTPException(status_code=502, detail="Transcription failed") from exc
+
     if text is None:
-        # 204: STT disabled / not configured, or transcription failed. The
-        # cockpit treats this as "attach audio only" rather than an error.
+        # 204: no STT model configured. The cockpit treats this as "attach
+        # audio only" rather than an error.
         return Response(status_code=204)
     return JSONResponse({"text": text})
 
