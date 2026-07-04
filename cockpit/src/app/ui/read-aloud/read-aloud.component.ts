@@ -73,7 +73,9 @@ export class AppReadAloudComponent implements OnDestroy {
     readonly partError = signal<number | null>(null);
     readonly retryInfo = signal<{index: number; attempt: number} | null>(null);
     readonly keptParts = signal(0);
-    readonly hardError = signal<'rewrite' | 'synthesis' | null>(null);
+    readonly hardError = signal<
+        'rewrite' | 'synthesis' | 'empty' | 'no-thread' | 'unavailable' | null
+    >(null);
 
     readonly unavailable = computed(() => this.voiceCaps.tts() === false);
     readonly total = computed(() => this.chunks().length);
@@ -134,18 +136,36 @@ export class AppReadAloudComponent implements OnDestroy {
     // ===== Generation lifecycle =====
 
     async start(): Promise<void> {
-        const threadId = this.threadId();
-        const text = this.content();
-        if (!threadId || !text.trim() || this.unavailable()) return;
+        // Already running → keep the current box rather than restarting.
         if (this.phase() === 'rewriting' || this.phase() === 'generating') return;
 
-        // Prime the shared audio element *inside the click gesture* so the first
-        // programmatic play() after the async plan isn't blocked (Safari).
+        // Acknowledge the click IMMEDIATELY, in place — flip to the box BEFORE
+        // anything that could throw (validation, reset, priming), so hitting Read
+        // ALWAYS shows something. This is the core transparency guarantee; every
+        // failure below becomes a visible, honest state, never a silent return.
+        this.phase.set('rewriting');
+        this.reset();
+        this.startElapsed();
+        // Prime the shared audio element inside the gesture so the first play()
+        // after the async plan isn't blocked on Safari (guarded internally).
         this.playback.prime();
 
-        this.reset();
-        this.phase.set('rewriting');
-        this.startElapsed();
+        // Read inputs defensively (a message with no final text ⇒ undefined).
+        const threadId = this.threadId();
+        const text = (this.content() ?? '').trim();
+
+        if (this.unavailable()) {
+            this.failStart('unavailable');
+            return;
+        }
+        if (!text) {
+            this.failStart('empty');
+            return;
+        }
+        if (!threadId) {
+            this.failStart('no-thread');
+            return;
+        }
 
         let plan: {chunks: string[]; rewritten: boolean} | 'unavailable' | null;
         try {
@@ -292,6 +312,21 @@ export class AppReadAloudComponent implements OnDestroy {
 
     restart(): void {
         this.start();
+    }
+
+    /** Turn the just-opened box into an honest error state (never a silent
+     *  no-op). Called from start() when there's nothing to read, no session
+     *  scope, or TTS is off. */
+    private failStart(kind: 'unavailable' | 'empty' | 'no-thread'): void {
+        this.stopElapsed();
+        this.hardError.set(kind);
+        this.phase.set('error');
+    }
+
+    /** Dismiss a non-retryable error box back to the Read button. */
+    dismiss(): void {
+        this.stopElapsed();
+        this.phase.set('idle');
     }
 
     private reset(): void {

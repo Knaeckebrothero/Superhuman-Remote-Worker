@@ -89,13 +89,19 @@
         <div class="ra-status ra-status--error">
           <app-icon size="sm">error_outline</app-icon>
           <span class="ra-status-text">
-            @if (hardError() === 'rewrite') {
-              {{ 'chat.tts.rewriteFailed' | transloco }}
-            } @else {
-              {{ 'chat.tts.hardFail' | transloco:{ part: synthIndex() + 1, total: total() } }}
+            @switch (hardError()) {
+              @case ('rewrite') { {{ 'chat.tts.rewriteFailed' | transloco }} }
+              @case ('empty') { {{ 'chat.tts.nothingToRead' | transloco }} }
+              @case ('no-thread') { {{ 'chat.tts.noSession' | transloco }} }
+              @case ('unavailable') { {{ 'chat.tts.notConfigured' | transloco }} }
+              @default { {{ 'chat.tts.hardFail' | transloco:{ part: synthIndex() + 1, total: total() } }} }
             }
           </span>
-          <button type="button" class="ra-link" (click)="restart()">{{ 'chat.tts.tryAgain' | transloco }}</button>
+          @if (hardError() === 'rewrite' || hardError() === 'synthesis') {
+            <button type="button" class="ra-link" (click)="restart()">{{ 'chat.tts.tryAgain' | transloco }}</button>
+          } @else {
+            <button type="button" class="ra-link" (click)="dismiss()">{{ 'chat.tts.dismiss' | transloco }}</button>
+          }
         </div>
         @if (hardError() === 'synthesis') {
           <div class="ra-hint">{{ 'chat.tts.keepReading' | transloco }}</div>
