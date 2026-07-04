@@ -176,13 +176,25 @@ class KnowledgeGraphDB:
         if not slug:
             slug = f"note-{secrets.token_hex(4)}"
 
-        # Check for slug collision and append suffix if needed
+        # Check for slug collision and append a suffix if needed. The suffix is
+        # a deterministic content hash (not a random token) so identical
+        # re-writes converge to the same slug instead of forking a fresh note
+        # every time — the run-8 twin-file problem (docs/features §11.1).
         existing = self._db.execute_query(
             "MATCH (n:Note {project_id: $pid, id: $id}) RETURN n.id",
             {"pid": project_id, "id": slug},
         )
         if existing:
-            slug = f"{slug}-{secrets.token_hex(3)}"
+            digest = hashlib.sha256(content.encode()).hexdigest()[:6]
+            slug = f"{slug}-{digest}"
+            # Idempotent: if the suffixed slug is already present (same title +
+            # content written before), return it rather than duplicating a node.
+            dup = self._db.execute_query(
+                "MATCH (n:Note {project_id: $pid, id: $id}) RETURN n.id",
+                {"pid": project_id, "id": slug},
+            )
+            if dup:
+                return slug
 
         now = datetime.now(timezone.utc).isoformat()
 

@@ -244,6 +244,20 @@ def lint_kb(notes: List[Dict[str, str]]) -> LintReport:
                 Finding("missing-title", WARNING, path, "body has no markdown heading")
             )
 
+        # Duplicate H1: the same top-level heading text repeated (the run-8
+        # double-title defect, docs §11.1 — and any hand-authored equivalent).
+        h1s = [t.strip() for t in _H1_RE.findall(p["body"])]
+        dupes = sorted({t for t in h1s if h1s.count(t) > 1})
+        if dupes:
+            report.findings.append(
+                Finding(
+                    "duplicate-h1",
+                    WARNING,
+                    path,
+                    f"repeated H1 heading(s): {', '.join(dupes)}",
+                )
+            )
+
         # Orphan: no resolvable outbound and no inbound links. Navigational
         # notes (index/moc) are never orphans.
         note_type = str(fm.get("type", "")).lower()

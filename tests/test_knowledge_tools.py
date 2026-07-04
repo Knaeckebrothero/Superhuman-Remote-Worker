@@ -962,6 +962,53 @@ class TestRenderNoteMd:
         md = _render_note_md({"id": "abc-slug", "type": "learning", "content": "x"})
         assert "# abc-slug" in md
 
+    def test_no_double_h1_when_content_starts_with_same_h1(self):
+        # Run-8 nit (docs §11.1): the serializer prepended `# {title}` even when
+        # the body already opened with the same H1 → every note's title twice.
+        from src.tools.knowledge.knowledge_tools import _render_note_md
+
+        md = _render_note_md(
+            {
+                "id": "n1",
+                "type": "learning",
+                "title": "My Note",
+                "content": "# My Note\n\nThe body.",
+            }
+        )
+        lines = md.splitlines()
+        assert lines.count("# My Note") == 1  # heading emitted exactly once
+        assert "The body." in md
+
+    def test_content_own_h1_suppresses_prepended_title(self):
+        from src.tools.knowledge.knowledge_tools import _render_note_md
+
+        md = _render_note_md(
+            {
+                "id": "n1",
+                "type": "learning",
+                "title": "Slug Title",
+                "content": "# Different Heading\n\nBody.",
+            }
+        )
+        lines = md.splitlines()
+        assert "# Slug Title" not in lines  # not prepended
+        assert "# Different Heading" in lines  # body's own H1 stands
+
+    def test_h2_leading_content_still_gets_title(self):
+        # An H2 opener is not a title — the H1 title should still be prepended.
+        from src.tools.knowledge.knowledge_tools import _render_note_md
+
+        md = _render_note_md(
+            {
+                "id": "n1",
+                "type": "learning",
+                "title": "Real Title",
+                "content": "## A subsection\n\nBody.",
+            }
+        )
+        lines = md.splitlines()
+        assert "# Real Title" in lines
+
     def test_derives_description_from_content_first_sentence(self):
         from src.tools.knowledge.knowledge_tools import _render_note_md
 
@@ -1314,12 +1361,19 @@ class TestKbWriteVerdictGate:
     def test_update_redirects_edit_onto_target(self):
         kg = MagicMock()
         kg.update_note.return_value = True
-        kg.read_note.return_value = {
-            "type": "decision",
-            "title": "Old",
-            "content": "new content",
-            "status": "active",
-        }
+        # Faithful mock: the candidate slug ("new-note") does NOT pre-exist, so
+        # the exact-dup pre-check is skipped and the gate runs; the UPDATE
+        # target ("old-note") re-reads the dict inside _update_existing.
+        kg.read_note.side_effect = lambda pid, nid: (
+            {
+                "type": "decision",
+                "title": "Old",
+                "content": "new content",
+                "status": "active",
+            }
+            if nid == "old-note"
+            else None
+        )
         ks = _GateStore(neighbours=[_kb_neighbour("old-note", "different old text")])
         tools, _ = _gated_tools(
             kg, ks, KnowledgeVerdict(action="UPDATE", target_indices=[1], reason="fix")
@@ -1372,3 +1426,64 @@ class TestKbWriteVerdictGate:
         )
         assert "Created" in result
         kg.create_note.assert_called_once()
+
+
+class TestKbWriteSlugDedup:
+    """Exact-content slug-collision no-op (Step 1 hardening, docs §11.1).
+
+    A same-title write whose body is byte-identical to the existing note is a
+    pure no-op for every writer (loop agents included) — it must skip the gate
+    and the create entirely, killing the run-8 twin-file duplication at source.
+    """
+
+    def test_exact_duplicate_content_is_noop(self):
+        tools, ctx = _make_tools()
+        kg = ctx.knowledge_graph
+        kg.read_note.return_value = {
+            "content": "body",
+            "type": "decision",
+            "title": "Test",
+        }
+        with patch("src.tools.knowledge.knowledge_tools.asyncio"):
+            result = _invoke(
+                _get_tool(tools, "kb_write"),
+                {"title": "Test", "type": "decision", "content": "body"},
+            )
+        kg.create_note.assert_not_called()
+        assert "test" in result.lower()  # references the existing slug
+        assert (
+            "exist" in result.lower()
+            or "no-op" in result.lower()
+            or "no change" in result.lower()
+        )
+
+    def test_different_content_same_title_still_creates(self):
+        tools, ctx = _make_tools()
+        kg = ctx.knowledge_graph
+        kg.read_note.return_value = {
+            "content": "OLD body",
+            "type": "decision",
+            "title": "Test",
+        }
+        kg.create_note.return_value = "test-abc123"
+        ctx.knowledge_store.upsert_note = AsyncMock(return_value=uuid.uuid4())
+        with patch("src.tools.knowledge.knowledge_tools.asyncio"):
+            _invoke(
+                _get_tool(tools, "kb_write"),
+                {"title": "Test", "type": "decision", "content": "NEW body"},
+            )
+        kg.create_note.assert_called_once()
+
+    def test_no_collision_creates_normally(self):
+        tools, ctx = _make_tools()
+        kg = ctx.knowledge_graph
+        kg.read_note.return_value = None
+        kg.create_note.return_value = "fresh-slug"
+        ctx.knowledge_store.upsert_note = AsyncMock(return_value=uuid.uuid4())
+        with patch("src.tools.knowledge.knowledge_tools.asyncio"):
+            result = _invoke(
+                _get_tool(tools, "kb_write"),
+                {"title": "Fresh", "type": "learning", "content": "x"},
+            )
+        kg.create_note.assert_called_once()
+        assert "fresh-slug" in result
