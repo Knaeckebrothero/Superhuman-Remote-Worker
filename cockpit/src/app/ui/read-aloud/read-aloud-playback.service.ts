@@ -164,6 +164,27 @@ export class ReadAloudPlaybackService {
         }
     }
 
+    /** Mark the active session's chunk list final (the rewrite stream finished and
+     *  every chunk is synthesized) so the estimated tail collapses to the real
+     *  total. Also rescues the race where the last chunk was appended while the
+     *  stream was still open (`complete:false`): playback would then park at the
+     *  end waiting for a chunk that never comes — settle it into the ended state. */
+    markComplete(id: string): void {
+        if (this.activeId() !== id) return;
+        this.complete.set(true);
+        this.remainingChars.set(0);
+        if (this.awaitingPart >= 0 && this.awaitingPart >= this.parts().length) {
+            this.awaitingPart = -1;
+            this.playing.set(false);
+            this.stopRaf();
+            const last = this.parts().length - 1;
+            if (last >= 0) {
+                this.index.set(last);
+                this.positionInPart.set(this.parts()[last]?.duration ?? 0);
+            }
+        }
+    }
+
     /** Stop + clear the session iff `id` is the active one (component destroy). */
     stopIfActive(id: string): void {
         if (this.activeId() !== id) return;
@@ -243,10 +264,13 @@ export class ReadAloudPlaybackService {
             this.blocked.set(false);
             this.startRaf();
         });
-        el.addEventListener('pause', () => {
-            this.playing.set(false);
-            this.stopRaf();
-        });
+        // Deliberately NO 'pause' event listener. Swapping `src` between chunks
+        // makes the browser fire a spurious 'pause'; treating it as a real pause
+        // here used to cancel the scrubber's rAF — and on a play-before-pause
+        // event race the restart no-op'd (rafId still set) and the pause then
+        // killed the loop for good, freezing the progress bar for the rest of
+        // playback. Pausing is owned explicitly by pauseEl()/onEnded() instead,
+        // which manage both the rAF and the `playing`/position state.
         el.addEventListener('loadedmetadata', () => this.applyRate());
         this.el = el;
         return el;
@@ -281,6 +305,10 @@ export class ReadAloudPlaybackService {
         } catch {
             /* jsdom / detached element */
         }
+        // Own the pause explicitly (there is no 'pause' event listener) so a real
+        // pause stops the scrubber, while a chunk-transition src-swap doesn't.
+        this.playing.set(false);
+        this.stopRaf();
     }
 
     private onEnded(): void {

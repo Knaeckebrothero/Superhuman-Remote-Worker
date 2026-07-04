@@ -18881,6 +18881,9 @@ async def plan_thread_message_tts(
 
     Body:
         ``content`` (str, required) — the message text to read aloud.
+        ``reformulate`` (bool, default true) — when ``false``, skip the auxiliary
+        LLM and return the markdown-stripped deterministic split immediately (the
+        UI's "read it as-is" bailout).
 
     Returns:
         JSON ``{"chunks": [str, ...], "rewritten": bool}`` — ``chunks`` has one
@@ -18898,6 +18901,7 @@ async def plan_thread_message_tts(
     content = (body.get("content") or "").strip()
     if not content:
         raise HTTPException(status_code=400, detail="Missing 'content' in request body")
+    reformulate = bool(body.get("reformulate", True))
 
     try:
         plan = await plan_tts_chunks(
@@ -18906,6 +18910,7 @@ async def plan_thread_message_tts(
             postgres_db=postgres_db,
             ledger=usage_ledger,
             ref_id=thread_id,
+            reformulate=reformulate,
         )
     except Exception as exc:
         logger.exception("TTS chunk planning failed for thread %s", thread_id)
@@ -18914,6 +18919,92 @@ async def plan_thread_message_tts(
     if plan is None:
         return Response(status_code=204)
     return JSONResponse({"chunks": plan["chunks"], "rewritten": plan["rewritten"]})
+
+
+@app.post("/api/persistent/threads/{thread_id}/tts/plan/stream")
+async def stream_thread_message_tts_plan(
+    thread_id: str,
+    request: Request,
+    body: dict[str, Any] = Body(...),
+) -> StreamingResponse:
+    """Streaming (SSE) counterpart of ``/tts/plan``: emit each speakable chunk the
+    moment the auxiliary LLM produces it, so the client synthesizes + starts
+    playing chunk 1 while the rest still generate. This is the read-aloud path the
+    UI prefers — it makes time-to-first-audio ≈ first-chunk latency (~seconds)
+    instead of whole-message latency, which is what retired the 30 s planner
+    timeout.
+
+    Body: ``content`` (str, required).
+
+    Wire (``text/event-stream``):
+        ``event: chunk`` → ``{"index", "text", "rewritten"}`` per ready chunk
+        ``event: done``  → ``{"total", "rewritten"}`` (terminal)
+        ``event: unavailable`` → ``{}`` when no TTS model is configured (the
+            client treats this like ``/tts/plan``'s ``204``)
+        ``event: error`` → ``{"message"}`` on an unexpected stream failure
+    """
+    from services.tts import stream_tts_chunks
+
+    user, thread = await require_thread_owner(request, postgres_db, thread_id)
+
+    content = (body.get("content") or "").strip()
+    if not content:
+        raise HTTPException(status_code=400, detail="Missing 'content' in request body")
+    user_id = str(user["id"])
+
+    async def event_stream():
+        # Kickstart comment: fires the reader immediately and defeats proxy idle
+        # buffering (mirrors the other SSE routes).
+        yield ": open\n\n"
+        try:
+            async for ev in stream_tts_chunks(
+                content=content,
+                user_id=user_id,
+                postgres_db=postgres_db,
+                ledger=usage_ledger,
+                ref_id=thread_id,
+            ):
+                etype = ev.get("type")
+                if etype == "unavailable":
+                    yield "event: unavailable\ndata: {}\n\n"
+                    return
+                if etype == "chunk":
+                    yield (
+                        "event: chunk\ndata: "
+                        + json.dumps(
+                            {
+                                "index": ev["index"],
+                                "text": ev["text"],
+                                "rewritten": ev["rewritten"],
+                            }
+                        )
+                        + "\n\n"
+                    )
+                elif etype == "done":
+                    yield (
+                        "event: done\ndata: "
+                        + json.dumps(
+                            {
+                                "total": ev.get("total", 0),
+                                "rewritten": ev.get("rewritten", False),
+                            }
+                        )
+                        + "\n\n"
+                    )
+                    return
+        except Exception:
+            logger.exception("TTS plan stream failed for thread %s", thread_id)
+            yield 'event: error\ndata: {"message": "stream failed"}\n\n'
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.post("/api/persistent/threads/{thread_id}/transcribe")

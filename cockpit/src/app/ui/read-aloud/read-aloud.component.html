@@ -44,6 +44,9 @@
           </span>
         </div>
         <div class="ra-hint">{{ 'chat.tts.expectation' | transloco }}</div>
+        <button type="button" class="ra-link" (click)="bailout()">
+          {{ 'chat.tts.readAsIs' | transloco }}
+        </button>
       }
       @case ('generating') {
         @if (retryInfo(); as r) {

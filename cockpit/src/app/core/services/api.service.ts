@@ -973,11 +973,16 @@ export class ApiService {
   planTTS(
     threadId: string,
     content: string,
+    options: {reformulate?: boolean} = {},
   ): Observable<{chunks: string[]; rewritten: boolean} | 'unavailable' | null> {
+    // `reformulate: false` is the "read it as-is" bailout — skip the aux LLM and
+    // get the markdown-stripped deterministic split immediately.
+    const body: {content: string; reformulate?: boolean} = {content};
+    if (options.reformulate === false) body.reformulate = false;
     return this.http
       .post<{chunks: string[]; rewritten: boolean}>(
         `${this.baseUrl}/persistent/threads/${threadId}/tts/plan`,
-        {content},
+        body,
         {observe: 'response'},
       )
       .pipe(
@@ -991,6 +996,109 @@ export class ApiService {
           return of(null);
         }),
       );
+  }
+
+  /**
+   * Stream the read-aloud chunk plan over SSE, yielding each speakable chunk the
+   * moment the auxiliary LLM produces it — so the caller can synthesize + start
+   * playing chunk 1 while the rest still generate (time-to-first-audio ≈
+   * first-chunk latency, not whole-message latency). Consumed with `for await`.
+   *
+   * Uses a raw `fetch` (not HttpClient) because the endpoint streams and the body
+   * is a POST; it therefore replicates what `authInterceptor` does — cookie auth
+   * via `credentials: 'include'` plus the `X-CSRF` header — and bypasses the
+   * service worker (`ngsw-bypass`) so the never-ending stream isn't cached.
+   * Pass an `AbortSignal` to cancel (used by the component's cancel/bailout).
+   */
+  async *streamTTSPlan(
+    threadId: string,
+    content: string,
+    signal?: AbortSignal,
+  ): AsyncGenerator<
+    | {type: 'chunk'; index: number; text: string; rewritten: boolean}
+    | {type: 'done'; total: number; rewritten: boolean}
+    | {type: 'unavailable'}
+    | {type: 'error'; message: string}
+  > {
+    const url =
+      `${this.baseUrl}/persistent/threads/${threadId}/tts/plan/stream` +
+      `?ngsw-bypass=true`;
+    let response: Response;
+    try {
+      response = await fetch(url, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json', 'X-CSRF': '1'},
+        body: JSON.stringify({content}),
+        credentials: 'include',
+        signal,
+      });
+    } catch (error) {
+      yield {type: 'error', message: `${error}`};
+      return;
+    }
+    if (!response.ok || !response.body) {
+      yield {type: 'error', message: `HTTP ${response.status}`};
+      return;
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let currentEvent = '';
+    try {
+      while (true) {
+        const {done, value} = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, {stream: true});
+        const lines = buffer.split('\n');
+        buffer = lines.pop() ?? ''; // keep the incomplete trailing line
+        for (const line of lines) {
+          if (line.startsWith('event: ')) {
+            currentEvent = line.slice(7).trim();
+          } else if (line.startsWith('data: ')) {
+            let data: {
+              index?: number;
+              text?: string;
+              rewritten?: boolean;
+              total?: number;
+              message?: string;
+            } = {};
+            try {
+              data = JSON.parse(line.slice(6));
+            } catch {
+              data = {};
+            }
+            if (currentEvent === 'chunk') {
+              yield {
+                type: 'chunk',
+                index: data.index ?? 0,
+                text: data.text ?? '',
+                rewritten: data.rewritten ?? false,
+              };
+            } else if (currentEvent === 'done') {
+              yield {
+                type: 'done',
+                total: data.total ?? 0,
+                rewritten: data.rewritten ?? false,
+              };
+            } else if (currentEvent === 'unavailable') {
+              yield {type: 'unavailable'};
+            } else if (currentEvent === 'error') {
+              yield {type: 'error', message: data.message ?? 'stream error'};
+            }
+            currentEvent = '';
+          } else if (line.trim() === '') {
+            currentEvent = ''; // event boundary; `: comment` lines are ignored
+          }
+        }
+      }
+    } finally {
+      try {
+        reader.releaseLock();
+      } catch {
+        /* stream already errored/closed */
+      }
+    }
   }
 
   /** Decode a base64 string into a typed Blob (used for TTS MP3 payloads). */
