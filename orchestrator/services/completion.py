@@ -275,6 +275,42 @@ AUTO_REDISPATCH_FREEZE_TYPES: frozenset[str] = frozenset(
 )
 
 
+def auto_continue_drain_update(
+    context: dict[str, Any], freeze_data: dict[str, Any], *, cap: int
+) -> tuple[int, Any, bool]:
+    """Progress-aware drain counter for auto-continue re-dispatches (backstop).
+
+    Defense-in-depth for the version_upgrade drain livelock
+    (docs/issues/version_upgrade_drain_livelock.md). The agent-side resume-clear
+    (src/agent.py) guarantees a re-dispatched auto-continue job re-enters the
+    graph and advances a phase each cycle, so a subsequent re-freeze carries a
+    NEW ``phase_number``. If the freeze ``phase_number`` STOPS changing across
+    re-dispatches, that guarantee has broken and the job is spinning with no
+    progress — which this counter detects so the caller can alert loudly.
+
+    Pure decision logic (the caller performs the context write + the alert I/O),
+    mirroring the ``dispatch_guards`` extraction pattern.
+
+    Args:
+        context: the job's ``context`` dict (reads prior counter + last phase).
+        freeze_data: the freeze blob being processed (reads ``phase_number``).
+        cap: alert threshold — ``should_alert`` is True once drains reach it.
+
+    Returns:
+        ``(drains, last_phase, should_alert)`` — the new consecutive-no-progress
+        count, the phase to remember, and whether to alert. A changed or absent
+        ``phase_number`` resets the count to 0 (progress / no signal).
+    """
+    cur_phase = freeze_data.get("phase_number")
+    last_phase = context.get("auto_continue_last_phase")
+    drains = int(context.get("auto_continue_drains", 0) or 0)
+    if cur_phase is not None and cur_phase == last_phase:
+        drains += 1
+    else:
+        drains = 0
+    return drains, cur_phase, drains >= cap
+
+
 # ---------------------------------------------------------------------------
 # LLM-outage pause + backoff re-dispatch
 # (docs/features/llm_outage_pause_and_backoff_redispatch.md)

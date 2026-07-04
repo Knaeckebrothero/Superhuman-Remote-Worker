@@ -430,3 +430,201 @@ class TestVersionUpgradeFreeze:
             assert status == expected, (
                 f"freeze_type={ftype} → {status}, expected {expected}"
             )
+
+
+# =============================================================================
+# Auto-continue resume-clear — the version_upgrade drain livelock + its fix
+# (docs/issues/version_upgrade_drain_livelock.md)
+#
+# Reproduces the LangGraph semantics at the heart of the bug: a graph that ends
+# with should_stop=True persists that in the checkpoint, and invoke(None) on the
+# ended thread runs ZERO nodes and returns the terminal frozen state — so the
+# in-graph "clear stop flags on resume" node never runs and the job re-freezes
+# forever. The fix (clear the flags via update_state(as_node="__start__") before
+# invoke) makes the graph re-enter and progress. These guard the exact mechanism
+# src/agent.py depends on, on the installed LangGraph version.
+# =============================================================================
+
+
+def _build_drain_graph():
+    """Minimal graph mirroring route_entry → restore → execute → transition →
+    check, compiled with a checkpointer. ``flags['drain']`` models the
+    process-local drain intent; ``ran`` records node execution order."""
+    from typing import TypedDict
+
+    from langgraph.checkpoint.memory import MemorySaver
+    from langgraph.graph import END, START, StateGraph
+
+    flags = {"drain": True}
+    ran: list[str] = []
+
+    class S(TypedDict, total=False):
+        initialized: bool
+        should_stop: bool
+        goal_achieved: bool
+        work_done: int
+        freeze_data: dict
+
+    # Node/router functions are left unannotated on purpose: LangGraph's branch
+    # schema inference runs get_type_hints() on routers, which can't resolve a
+    # function-local TypedDict. The state schema comes from StateGraph(S).
+    def route_entry(state):
+        return "restore" if state.get("initialized") else "init"
+
+    def init(state):
+        ran.append("init")
+        return {"initialized": True}
+
+    def restore(state):
+        ran.append("restore")
+        return {"should_stop": False, "goal_achieved": False}  # graph.py:3531
+
+    def execute(state):
+        ran.append("execute")  # audit proxy: real work happened
+        return {"work_done": state.get("work_done", 0) + 1}
+
+    def handle_transition(state):
+        ran.append("handle_transition")
+        if flags["drain"]:  # _is_drain_requested()
+            return {
+                "should_stop": True,
+                "freeze_data": {"freeze_type": "version_upgrade", "phase_number": 3},
+            }
+        return {}
+
+    def check_goal(state):
+        ran.append("check_goal")
+        return {}
+
+    def route_after_check(state):
+        # END on a freeze, or once the toy "goal" (3 phases) is reached.
+        if state.get("should_stop") or state.get("work_done", 0) >= 3:
+            return "__end__"
+        return "execute"
+
+    g = StateGraph(S)
+    for name, fn in [
+        ("init", init),
+        ("restore", restore),
+        ("execute", execute),
+        ("handle_transition", handle_transition),
+        ("check_goal", check_goal),
+    ]:
+        g.add_node(name, fn)
+    g.add_conditional_edges(START, route_entry, {"init": "init", "restore": "restore"})
+    g.add_edge("init", "execute")
+    g.add_edge("restore", "execute")
+    g.add_edge("execute", "handle_transition")
+    g.add_edge("handle_transition", "check_goal")
+    g.add_conditional_edges(
+        "check_goal", route_after_check, {"execute": "execute", "__end__": END}
+    )
+    return g.compile(checkpointer=MemorySaver()), flags, ran
+
+
+class TestAutoContinueResumeClear:
+    def test_reinvoke_on_ended_stop_checkpoint_runs_no_nodes(self):
+        # The BUG: invoke(None) on a thread that ended with should_stop=True runs
+        # zero nodes and returns the terminal frozen state — no progress.
+        app, flags, ran = _build_drain_graph()
+        cfg = {"configurable": {"thread_id": "t"}, "recursion_limit": 50}
+        s1 = app.invoke(
+            {"initialized": False, "should_stop": False, "work_done": 0}, cfg
+        )
+        assert s1["should_stop"] is True
+        assert s1["work_done"] == 1
+        ran.clear()
+        s2 = app.invoke(None, cfg)  # what agent.py did on a plain graceful resume
+        assert ran == [], "expected zero nodes to run on re-invoke of ended thread"
+        assert s2["work_done"] == 1, "no forward progress (the livelock)"
+        assert s2["should_stop"] is True
+
+    def test_clearing_stop_flags_reenters_and_progresses(self):
+        # The FIX: clear the terminal stop flags via update_state(as_node=__start__)
+        # before invoke(None) → the graph re-enters and advances one phase.
+        app, flags, ran = _build_drain_graph()
+        cfg = {"configurable": {"thread_id": "t"}, "recursion_limit": 50}
+        app.invoke({"initialized": False, "should_stop": False, "work_done": 0}, cfg)
+        app.update_state(
+            cfg,
+            {
+                "should_stop": False,
+                "goal_achieved": False,
+                "is_final_phase": False,
+                "freeze_data": None,
+            },
+            as_node="__start__",
+        )
+        ran.clear()
+        s2 = app.invoke(None, cfg)  # drain still on → one phase, then re-freeze
+        assert "execute" in ran, "graph must re-enter and run execute"
+        assert s2["work_done"] == 2, "exactly one phase of forward progress"
+
+    def test_fix_runs_to_completion_once_drain_clears(self):
+        # With the image settled (drain gone), the cleared resume runs the phase
+        # and does NOT re-freeze — the job proceeds normally.
+        app, flags, ran = _build_drain_graph()
+        cfg = {"configurable": {"thread_id": "t"}, "recursion_limit": 50}
+        app.invoke({"initialized": False, "should_stop": False, "work_done": 0}, cfg)
+        flags["drain"] = False  # image settled, reconciler no longer draining
+        app.update_state(
+            cfg,
+            {"should_stop": False, "goal_achieved": False, "freeze_data": None},
+            as_node="__start__",
+        )
+        s2 = app.invoke(None, cfg)
+        assert s2["work_done"] >= 2
+        assert s2.get("should_stop") is not True or s2.get("freeze_data") is None
+
+
+class TestAutoContinueDrainBackstop:
+    """Pure progress-aware drain counter (services.completion)."""
+
+    def _update(self, ctx, freeze, cap=10):
+        from orchestrator.services.completion import auto_continue_drain_update
+
+        return auto_continue_drain_update(ctx, freeze, cap=cap)
+
+    def test_same_phase_increments(self):
+        ctx = {"auto_continue_drains": 2, "auto_continue_last_phase": 3}
+        drains, last, alert = self._update(ctx, {"phase_number": 3})
+        assert (drains, last, alert) == (3, 3, False)
+
+    def test_advancing_phase_resets(self):
+        # The happy path once the resume-clear fix works: phase advances → reset.
+        ctx = {"auto_continue_drains": 5, "auto_continue_last_phase": 3}
+        drains, last, alert = self._update(ctx, {"phase_number": 4})
+        assert (drains, last, alert) == (0, 4, False)
+
+    def test_absent_phase_number_is_no_signal(self):
+        # llm_unavailable etc. carry no phase_number → never trips (has its own
+        # ceiling elsewhere).
+        ctx = {"auto_continue_drains": 9, "auto_continue_last_phase": 3}
+        drains, last, alert = self._update(ctx, {"freeze_type": "llm_unavailable"})
+        assert (drains, last, alert) == (0, None, False)
+
+    def test_alerts_at_cap(self):
+        ctx = {"auto_continue_drains": 9, "auto_continue_last_phase": 3}
+        drains, _, alert = self._update(ctx, {"phase_number": 3}, cap=10)
+        assert drains == 10 and alert is True
+
+    def test_first_drain_from_empty_context(self):
+        drains, last, alert = self._update({}, {"phase_number": 3})
+        assert (drains, last, alert) == (0, 3, False)
+
+
+class TestAutoContinueFreezeTypeScope:
+    def test_auto_continue_set_covers_redispatch_types_only(self):
+        from src.agent import _AUTO_CONTINUE_FREEZE_TYPES
+
+        for ft in (
+            "version_upgrade",
+            "llm_unavailable",
+            "memory_unavailable",
+            "kb_unavailable",
+            "workspace_upgrade_required",
+        ):
+            assert ft in _AUTO_CONTINUE_FREEZE_TYPES
+        # Human-review / terminal stops must NOT be auto-cleared on resume.
+        for ft in ("budget_exceeded", "job_complete", "vm_upgrade_required"):
+            assert ft not in _AUTO_CONTINUE_FREEZE_TYPES
