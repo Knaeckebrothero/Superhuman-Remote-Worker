@@ -777,6 +777,74 @@ class TestCreateVm:
 
 
 # =============================================================================
+# Test: fresh-provision reset (C — reap counter / stale endpoint hygiene)
+# =============================================================================
+
+
+class TestFreshProvisionReset:
+    """Every (re)provision must reset snapshot_attempts + drop the stale
+    ssh_host and stamp provisioned_at. context.vm is *merged* across provisions,
+    so without this a prior incarnation's snapshot_attempts (which reaches the
+    reaper's max and force-deletes the new VM on its first tick) and dead
+    ssh_host would leak into the fresh VM.
+    """
+
+    def test_fresh_provision_ctx_shape(self):
+        from orchestrator.services.vm_provisioner import VMProvisioner
+
+        ctx = VMProvisioner._fresh_provision_ctx()
+        assert ctx["snapshot_attempts"] == 0
+        assert ctx["ssh_host"] is None
+        assert ctx["ssh_port"] is None
+        assert isinstance(ctx["provisioned_at"], float)
+
+    @pytest.mark.asyncio
+    async def test_create_vm_nats_resets_before_dispatch(
+        self, provisioner_with_nats, mock_nats_bridge, mock_db
+    ):
+        await provisioner_with_nats.create_vm(job_id="reset-nats")
+        # First context write is the reset — before nats_bridge writes
+        # 'provisioning' — so it can't clobber the live provisioning status.
+        first = mock_db.merge_vm_context.await_args_list[0]
+        assert first[0][0] == "reset-nats"
+        ctx = first[0][1]
+        assert ctx["snapshot_attempts"] == 0
+        assert ctx["ssh_host"] is None
+        assert "provisioned_at" in ctx
+
+    @pytest.mark.asyncio
+    async def test_create_vm_direct_resets(self, provisioner_with_k8s, mock_db):
+        with patch("orchestrator.services.vm_provisioner.nats_bridge") as nb:
+            nb.is_available = False
+            await provisioner_with_k8s.create_vm(job_id="reset-direct")
+        reset = [
+            c
+            for c in mock_db.merge_vm_context.await_args_list
+            if c[0][1].get("snapshot_attempts") == 0
+        ]
+        assert len(reset) == 1
+        assert reset[0][0][1]["ssh_host"] is None
+        assert "provisioned_at" in reset[0][0][1]
+
+    @pytest.mark.asyncio
+    async def test_create_thread_vm_resets(self, mock_nats_bridge, mock_db):
+        mock_db.merge_thread_vm_context = AsyncMock()
+        with patch(
+            "orchestrator.services.vm_provisioner.nats_bridge", mock_nats_bridge
+        ):
+            mock_nats_bridge.is_available = True
+            from orchestrator.services.vm_provisioner import VMProvisioner
+
+            prov = VMProvisioner()
+            prov._db = mock_db
+            await prov.create_thread_vm(thread_id="reset-thread")
+        first = mock_db.merge_thread_vm_context.await_args_list[0]
+        assert first[0][0] == "reset-thread"
+        assert first[0][1]["snapshot_attempts"] == 0
+        assert first[0][1]["ssh_host"] is None
+
+
+# =============================================================================
 # Test: delete_vm()
 # =============================================================================
 

@@ -153,7 +153,15 @@ from services.project_loop_sweeper import project_loop_sweeper_loop  # noqa: E40
 from services.stale_verification_sweeper import (  # noqa: E402
     stale_verification_sweeper_loop,
 )
-from services.dispatch_guards import preemption_blocked_reason  # noqa: E402
+from services.dispatch_guards import (  # noqa: E402
+    VM_PARK_EXHAUSTED,
+    VM_PARKED,
+    VM_PROVISION,
+    VM_RECYCLE,
+    VM_WAIT,
+    preemption_blocked_reason,
+    vm_provisioning_decision,
+)
 from services.litellm_gateway import (  # noqa: E402
     LiteLLMClient,
     _parse_quota_policy,
@@ -4294,11 +4302,53 @@ async def _try_dispatch_pending_jobs() -> None:
                         continue
                     vm_ctx = _get_vm_context(job)
                     vm_status = vm_ctx.get("status")
-                    if not vm_status or vm_status == "deleted":
-                        # VM needed but absent — never provisioned, or torn down
-                        # while the job was parked ('deleted': the deploy-drain /
-                        # pause path releases the VM; work survives in the pushed
-                        # branch + checkpoint). Without re-provisioning here a
+                    # Bounded provisioning retries. A VM that never reaches 'ready'
+                    # (real infra failure) must park after N attempts instead of
+                    # re-provisioning forever against the shared VM cluster. The
+                    # counter is monotonic in context.vm and reset to 0 once the VM
+                    # boots (VM_READY below), so it survives the async controller
+                    # status callbacks that a status-based park cannot. Decision
+                    # logic is extracted + unit-tested in dispatch_guards.
+                    provision_attempts = int(vm_ctx.get("provision_attempts") or 0)
+                    max_provision_attempts = int(
+                        os.environ.get("VM_PROVISION_MAX_ATTEMPTS", "3")
+                    )
+                    timeout_s = int(os.environ.get("VM_PROVISION_TIMEOUT_S", "600"))
+                    vm_decision = vm_provisioning_decision(
+                        vm_ctx,
+                        provision_attempts=provision_attempts,
+                        max_provision_attempts=max_provision_attempts,
+                        now=time.time(),
+                        timeout_s=timeout_s,
+                    )
+                    if vm_decision == VM_PARK_EXHAUSTED:
+                        # Retries used up — park visibly. 'failed' is terminal for
+                        # the dispatcher (VM_PARKED) and skipped by the reconciler
+                        # (_PARKED_VM_STATUSES), so the park holds.
+                        logger.warning(
+                            "Dispatcher: job %s VM provisioning exhausted "
+                            "(%d/%d attempts) — parking; clear context.vm to retry",
+                            job_id,
+                            provision_attempts,
+                            max_provision_attempts,
+                        )
+                        await postgres_db.merge_vm_context(
+                            job_id,
+                            {
+                                "status": "failed",
+                                "error": (
+                                    f"provisioning exhausted after "
+                                    f"{provision_attempts} attempts "
+                                    f"(never reached 'ready')"
+                                ),
+                            },
+                        )
+                        continue
+                    if vm_decision == VM_PROVISION:
+                        # VM needed but absent — never provisioned, torn down while
+                        # parked ('deleted': deploy-drain / crash recovery release
+                        # it; work survives in the pushed branch + checkpoint), or
+                        # recycled by the timeout. Without re-provisioning here a
                         # paused VM job waits forever on a VM nothing will create.
                         if not vm_provisioner.is_available:
                             # VM explicitly requested but no provisioner — fail
@@ -4332,9 +4382,20 @@ async def _try_dispatch_pending_jobs() -> None:
                             description=job.get("description", ""),
                         )
                         if ok:
-                            logger.info(
-                                "Dispatcher: auto-provisioned VM for job %s",
+                            # Count the attempt so a VM that never boots parks
+                            # after max_provision_attempts. create_vm stamped a
+                            # fresh provisioned_at; the timeout recycles this
+                            # attempt if it stalls.
+                            await postgres_db.merge_vm_context(
                                 job_id,
+                                {"provision_attempts": provision_attempts + 1},
+                            )
+                            logger.info(
+                                "Dispatcher: auto-provisioned VM for job %s "
+                                "(attempt %d/%d)",
+                                job_id,
+                                provision_attempts + 1,
+                                max_provision_attempts,
                             )
                         else:
                             logger.warning(
@@ -4342,10 +4403,9 @@ async def _try_dispatch_pending_jobs() -> None:
                                 job_id,
                             )
                         continue  # Skip this job — wait for VM to register
-                    elif vm_status == "failed":
+                    if vm_decision == VM_PARKED:
                         # Provisioning failed terminally — do NOT hot-retry every
-                        # tick (shared VM cluster); park visibly instead of the
-                        # old silent skip.
+                        # tick (shared VM cluster); park visibly.
                         logger.warning(
                             "Dispatcher: job %s parked — VM provisioning failed "
                             "(%s); clear context.vm to retry",
@@ -4353,10 +4413,42 @@ async def _try_dispatch_pending_jobs() -> None:
                             vm_ctx.get("error") or "no error recorded",
                         )
                         continue
-                    elif vm_status != "ready":
-                        # VM is provisioning/creating — skip, wait
+                    if vm_decision == VM_RECYCLE:
+                        # Stuck short of 'ready' past the budget — tear it down so
+                        # the next tick re-provisions (VM_PROVISION) or parks
+                        # (VM_PARK_EXHAUSTED). With the reconciler now handing off
+                        # provisioning VMs (is_reapable=False for dispatchable jobs)
+                        # nothing else would time it out.
+                        elapsed = int(time.time() - float(vm_ctx["provisioned_at"]))
+                        logger.warning(
+                            "Dispatcher: job %s VM stuck in '%s' for %ss "
+                            "(> %ss budget) — recycling (attempt %d/%d)",
+                            job_id,
+                            vm_status,
+                            elapsed,
+                            timeout_s,
+                            provision_attempts,
+                            max_provision_attempts,
+                        )
+                        try:
+                            await vm_provisioner.delete_vm(job_id)
+                        except Exception:
+                            logger.exception(
+                                "Dispatcher: failed to delete timed-out VM "
+                                "for job %s",
+                                job_id,
+                            )
                         continue
-                    # else: VM is ready, proceed with dispatch
+                    if vm_decision == VM_WAIT:
+                        # Provisioning / creating / deleting in flight — wait.
+                        continue
+                    # VM_READY: proceed with dispatch.
+                    if provision_attempts:
+                        # VM booted — clear the retry budget so a later
+                        # re-provision (crash recovery) starts fresh.
+                        await postgres_db.merge_vm_context(
+                            job_id, {"provision_attempts": 0}
+                        )
                     logger.info("Dispatcher: job %s using VM workspace", job_id)
                 elif _job_needs_sandbox(job):
                     container_ctx = _get_container_context(job)

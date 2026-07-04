@@ -59,6 +59,14 @@ _REAPABLE_THREAD_STATUSES = _IDLE_THREAD_STATUSES | _TERMINAL_THREAD_STATUSES
 # ensure_workspace on the next dispatch: recreate or restore.)
 _TORN_DOWN_VM_STATUSES = frozenset({"deleting", "deleted", "suspended"})
 
+# 'failed' is exclusively a *provisioning* failure (the only three writers of
+# vm_status='failed' are create_vm exception paths — there is no runtime-failed
+# source). The dispatcher deliberately PARKS a 'failed' VM ("do NOT hot-retry
+# every tick (shared VM cluster)"), so the reconciler must stay off it: reaping
+# it (is_healthy=False → force-delete → status 'deleted') would flip it back to
+# the dispatcher's re-provision branch and churn. Skip like torn-down.
+_PARKED_VM_STATUSES = frozenset({"failed"})
+
 
 def expected_vm_shas() -> set[str]:
     """SHAs from the configured default VM image tag.
@@ -134,10 +142,12 @@ class VMInstanceManager:
         return instances
 
     async def is_healthy(self, inst: Instance) -> bool:
-        # VMs report status in their own context. ``failed`` is the
-        # crash signal; ``suspended`` means already drained (don't
-        # delete again). Anything else (creating/ready/restoring) is
-        # treated as healthy.
+        # VMs report status in their own context. ``failed`` (a provisioning
+        # failure) is now filtered out in _row_to_instance (_PARKED_VM_STATUSES)
+        # so the dispatcher can hold it parked without the reconciler force-
+        # deleting it — this branch is kept as defense-in-depth in case a failed
+        # VM ever reaches here. ``suspended`` means already drained. Anything
+        # else (provisioning/created/ready/restoring) is treated as healthy.
         status = inst.metadata.get("vm_status")
         if status == "failed":
             return False
@@ -159,7 +169,21 @@ class VMInstanceManager:
     # -------------------------------------------------------------------------
 
     async def is_reapable(self, inst: Instance) -> bool:
-        """True when the bound work no longer needs the VM (idle ∪ terminal)."""
+        """True when the bound work no longer needs the VM (idle ∪ terminal).
+
+        A *dispatchable* job (created/paused, unassigned, freeze-free) is not
+        idle — it is MID-RESUME, owned by the dispatcher, which is actively
+        (re)provisioning or about to claim its VM. Reaping such a VM fought the
+        dispatcher head-on: a version_upgrade drain leaves the VM 'ready', the
+        dispatcher re-claims on resume, but the reconciler saw 'paused' and tore
+        it down first — create→reap→create churn against the shared VM cluster,
+        and a needless ~3-min disk re-clone on every resume. Hand off: the
+        dispatcher owns bring-up; the reaper only reclaims genuinely idle VMs
+        (pending_review / waiting_for_reply / a paused-but-still-frozen job) and
+        terminal ones. Mirrors get_dispatchable_jobs' predicate exactly.
+        """
+        if inst.metadata.get("job_dispatchable"):
+            return False
         job_status = inst.metadata.get("job_status")
         thread_status = inst.metadata.get("thread_status")
         if job_status:
@@ -362,7 +386,9 @@ class VMInstanceManager:
             async with self._db.acquire() as conn:
                 job_rows = await conn.fetch(
                     """
-                    SELECT id, status, context
+                    SELECT id, status, context,
+                           (assigned_agent_id IS NULL) AS unassigned,
+                           (freeze_data IS NULL) AS freeze_free
                     FROM jobs
                     WHERE context->'vm' IS NOT NULL
                       AND context->'vm' <> '{}'::jsonb
@@ -385,11 +411,20 @@ class VMInstanceManager:
             vm_ctx = _coerce_jsonb(ctx.get("vm"))
             if not vm_ctx:
                 continue
+            # Mirror get_dispatchable_jobs: created/paused + unassigned +
+            # freeze-free == the dispatcher owns this VM's bring-up. Carried to
+            # is_reapable so the reaper hands off a resuming VM (see there).
+            dispatchable = (
+                r.get("status") in ("created", "paused")
+                and bool(r.get("unassigned"))
+                and bool(r.get("freeze_free"))
+            )
             rows.append(
                 {
                     "scope": "job",
                     "bound_id": str(r["id"]),
                     "owner_status": r.get("status"),
+                    "job_dispatchable": dispatchable,
                     "vm_ctx": vm_ctx,
                     "snapshot_status": _coerce_jsonb(ctx.get("snapshot")).get("status"),
                 }
@@ -415,10 +450,12 @@ class VMInstanceManager:
         scope = row["scope"]
         bound_id = row["bound_id"]
         vm_ctx = row["vm_ctx"]
-        # Already torn down / restorable-on-demand → not a live instance the
-        # reconciler should act on. Skip so reap/drift/crash don't loop on a
-        # VM whose teardown is already in flight (see _TORN_DOWN_VM_STATUSES).
-        if vm_ctx.get("status") in _TORN_DOWN_VM_STATUSES:
+        # Already torn down / restorable-on-demand, or parked after a
+        # provisioning failure → not a live instance the reconciler should act
+        # on. Skip so reap/drift/crash don't loop on a VM whose teardown is
+        # already in flight (_TORN_DOWN_VM_STATUSES) or that the dispatcher is
+        # deliberately holding parked (_PARKED_VM_STATUSES).
+        if vm_ctx.get("status") in _TORN_DOWN_VM_STATUSES | _PARKED_VM_STATUSES:
             return None
         # Identity: prefer a backend-native id when present, otherwise
         # synthesize one from scope+bound_id so the reconciler can
@@ -441,6 +478,7 @@ class VMInstanceManager:
         }
         if scope == "job":
             metadata["job_status"] = row.get("owner_status")
+            metadata["job_dispatchable"] = bool(row.get("job_dispatchable"))
         else:
             metadata["thread_status"] = row.get("owner_status")
             metadata["total_turns"] = row.get("total_turns") or 0
