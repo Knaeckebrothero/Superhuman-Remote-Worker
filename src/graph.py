@@ -95,6 +95,7 @@ from .core.toolcall_recovery import (
     strip_tool_call_markup,
 )
 from .core.workspace import WorkspaceManager
+from .core.workspace_backend import WorkspaceUnavailableError
 from .llm.exceptions import ContextOverflowError
 from .llm.response_guards import is_degenerate_response
 from .managers import TodoManager, TodoStatus, PlanManager, MemoryManager
@@ -115,6 +116,27 @@ RECOVERABLE_TOOLCALL_FAMILIES = {"gemma"}
 # =============================================================================
 # HELPER FUNCTIONS
 # =============================================================================
+
+
+# Mirrors langgraph.prebuilt.tool_node.TOOL_CALL_ERROR_TEMPLATE — the string
+# handle_tool_errors=True produced. Inlined to avoid coupling to a private const.
+_TOOL_CALL_ERROR_TEMPLATE = "Error: {error}\n Please fix your mistakes."
+
+
+def _handle_tool_errors_reraise_workspace(e: Exception) -> str:
+    """ToolNode error handler.
+
+    Re-raise WorkspaceUnavailableError so a dead-workspace tool call propagates
+    out of the graph → src/agent.py's isinstance check → a recoverable
+    ``workspace_unavailable`` freeze. Every other exception is stringified exactly
+    as handle_tool_errors=True did, so the model can fix its own mistakes.
+    Annotating ``e: Exception`` makes ToolNode._infer_handled_types route ALL
+    exceptions here (giving us the chance to re-raise ours).
+    See docs/issues/agent_fast_freeze_on_dead_workspace.md.
+    """
+    if isinstance(e, WorkspaceUnavailableError):
+        raise e
+    return _TOOL_CALL_ERROR_TEMPLATE.format(error=repr(e))
 
 
 def _extract_rate_limit_delay(error: Exception) -> Optional[float]:
@@ -3782,7 +3804,9 @@ def create_audited_tool_node(
     Returns:
         A callable node function with audit logging
     """
-    tool_node = ToolNode(tools, handle_tool_errors=True)
+    tool_node = ToolNode(
+        tools, handle_tool_errors=_handle_tool_errors_reraise_workspace
+    )
 
     # Loop detection state: track recent tool calls as (name, args_hash) tuples
     import hashlib
@@ -4054,19 +4078,10 @@ def create_audited_tool_node(
                         + format_nudge("loop_warning_suffix", model=config.llm.model)
                     )
 
-        # Check for workspace unavailable errors (VM connection lost).
-        # ToolNode catches all exceptions and turns them into error messages,
-        # but WorkspaceUnavailableError should propagate for VM recovery.
-        if "messages" in result:
-            for msg in result["messages"]:
-                if isinstance(msg, ToolMessage) and msg.content:
-                    if "WorkspaceUnavailableError" in msg.content:
-                        from .core.workspace_backend import WorkspaceUnavailableError
-
-                        raise WorkspaceUnavailableError(
-                            f"VM workspace connection lost during tool execution: "
-                            f"{msg.content[:300]}"
-                        )
+        # Workspace-unavailable errors now propagate by TYPE: the ToolNode error
+        # handler (_handle_tool_errors_reraise_workspace) re-raises
+        # WorkspaceUnavailableError out of tool_node.ainvoke, so it bubbles to
+        # agent.py's isinstance check. No substring watchdog needed.
 
         # Multimodal image delivery: image-bearing tools embed base64 in a
         # `<image_data>` / `<page_image>` tag inside the result string.
