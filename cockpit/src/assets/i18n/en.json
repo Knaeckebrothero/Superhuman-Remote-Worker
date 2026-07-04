@@ -1132,7 +1132,8 @@
       "micDenied": "Microphone permission denied",
       "micError": "Could not start recording",
       "transcribing": "Transcribing audio…",
-      "transcribeError": "Couldn't transcribe — audio attached as-is"
+      "transcribeError": "Couldn't transcribe — audio attached as-is",
+      "sttNotConfigured": "Voice input isn't set up yet"
     },
     "tts": {
       "play": "Read aloud",
@@ -1142,7 +1143,9 @@
       "spokenVersion": "Spoken version",
       "part": "Part {{current}} of {{total}}",
       "preparing": "Preparing audio…",
-      "generatingPart": "Generating part {{current}} of {{total}}…"
+      "generatingPart": "Generating part {{current}} of {{total}}…",
+      "notConfigured": "Read aloud isn't set up yet",
+      "tapToPlay": "Tap to play"
     },
     "code": {
       "expandHint": "Click to expand",

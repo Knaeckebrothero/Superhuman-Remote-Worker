@@ -1688,6 +1688,20 @@
         white-space: nowrap;
       }
 
+      /* Autoplay-blocked prompt — a compact accented "tap to play" affordance
+         shown when the browser refused to start a section on its own. */
+      .tts-tap-to-play {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        padding: 4px 10px;
+        font-size: 18px;
+        color: var(--accent-color);
+        border: 1px solid var(--accent-color);
+        border-radius: var(--radius-surface);
+        cursor: pointer;
+      }
+
       /* "Generating part N…" (synthesizing) + "Preparing…" (planning) rows. */
       .tts-prep,
       .tts-status {

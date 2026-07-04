@@ -39,7 +39,25 @@ research, cockpit + orchestrator integration maps). Phase 0 framework
 questions answered; player architecture decided (§Phase 2). Phase 5 (custom
 voices / personas) is **explicitly deferred** and earmarked for the
 self-improvement loop agent; its pipeline design is recorded here so the
-agent has the full plan. Nothing implemented yet.
+agent has the full plan.
+
+**Phase 0 implemented 2026-07-04** (honesty + diagnosability + metering; see
+the checklist below for per-item status). Verified locally: `pytest
+tests/test_tts.py tests/test_transcribe.py` (52 passed), `ruff check`, cockpit
+`npm run build` (clean, no budget warning) + full `npm test` (788) + the new
+`voice-capabilities.service.spec.ts`.
+
+**Live-cluster smoke (k3d, Tilt) 2026-07-04 — PASS.** `GET
+/api/voice/capabilities` → `200 {tts:true, stt:true}` (kokoro + whisper-large-v3
+configured). A real read-aloud on a `test`-owned thread (gemma chunk-plan + a
+genuine ~207 KB kokoro MP3) wrote three `usage_events` rows to `srw_audit`:
+`tts`/`tts-character` (qty 183), and `llm`/`prompt-token` + `completion-token`
+(357/972, `source='orchestrator'`, `details.via='tts'`, `stage='chunk-plan'`) —
+the metering gap is closed end-to-end, not just in unit tests. Not smoke-tested
+on-cluster (both capabilities are configured / no interactive browser attached):
+the disabled-button state and tap-to-play prompt — both covered by the unit
+tests + the verified availability payload; and STT `stt-request` metering, which
+rides the same now-proven ledger path.
 
 ## Current state (as-is, verified 2026-07-04)
 
@@ -201,24 +219,31 @@ Rules, ranked by impact on perceived reliability:
 
 - [x] Verify TTS needs no agent pod / works for offline sessions →
       **confirmed, orchestrator-only** (see above). Document only, no code.
-- [ ] **Kill the silent 204**: cockpit learns TTS/STT availability up front
-      (flag on thread load or `/api/users/me` settings payload) → button
-      renders disabled with a "TTS not configured" tooltip instead of a dead
-      click. Same for the mic button.
-- [ ] **Fix the activation trap** (also the autoplay-block surfacing): prime
-      ONE persistent `Audio` element synchronously in the click handler
-      (silent play + catch; `touchend` on iOS) and reuse it for every chunk;
-      always `.catch()` `play()` and flip to a visible "tap to play" state
-      instead of swallowing. This is a prerequisite for Phase 2 but the
-      catch-and-show half can ship immediately.
-- [ ] **Close the metering gap**: add a usage/audit hook to
-      `generate_message_tts` / `plan_tts_chunks` / `transcribe_thread_audio`
-      (the direct-SDK path bypasses `usage_events` entirely — synthesis AND
-      the aux formulation calls are invisible today). Follows the
-      agent-side `audio_helper.py` archiving precedent; feeds rate-limiting
-      v2's ledger.
-- [ ] Structured failure logging for TTS/STT (which stage failed, which
-      model/endpoint) so the next "it didn't work" report is diagnosable.
+- [x] **Kill the silent 204**: new `GET /api/voice/capabilities` reports
+      `{tts, stt}` (a model *resolves* — user setting or system default);
+      `VoiceCapabilitiesService` (root, fetch-once, **fails open**) feeds
+      `ttsUnavailable()` / `sttUnavailable()`. Read-aloud button renders
+      disabled with a `volume_off` glyph + "not set up" tooltip; the mic button
+      the same. Only *positively-known* unavailability disables — null/true
+      stays enabled and the 204/502 path is still the backstop.
+- [x] **Autoplay-block surfacing** (the catch-and-show half of the activation
+      trap): `play()` rejections are no longer swallowed — a blocked section
+      sets `playBlocked` and shows an accented **Tap to play** affordance
+      (`resumeBlockedPlayback` re-arms from the fresh gesture; a successful
+      play clears it). ⏳ The full fix — priming ONE persistent `Audio` element
+      in the click handler and reusing it for every chunk — is **Phase 2** (it
+      replaces the per-chunk native `<audio>` elements wholesale).
+- [x] **Close the metering gap**: `generate_message_tts` /
+      `plan_tts_chunks` / `transcribe_thread_audio` now emit `UsageEvent`s to
+      the `UsageLedger` (TTS → `tts-character`, aux formulation/chunking →
+      `prompt-token`/`completion-token` under `source='orchestrator'`, STT →
+      `stt-request`). **Non-load-bearing**: gated on `ledger.is_available`, all
+      writes swallow errors, STT metering sits *outside* the transcribe try so
+      it can never drop a transcript. Feeds rate-limiting v2's ledger.
+- [x] Structured failure logging for TTS/STT: every warn/exception now names
+      the `stage=` (formulate | chunk-plan | synthesize | transcribe), the
+      `model=`, and the `base_url=` (never the key) so the next "it didn't
+      work" report is diagnosable from the log alone.
 
 ### Phase 1 — The box (transparency)
 

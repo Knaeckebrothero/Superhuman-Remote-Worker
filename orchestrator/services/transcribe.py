@@ -15,11 +15,14 @@ from __future__ import annotations
 import io
 import json
 import logging
+import uuid
+from datetime import datetime, timezone
 from typing import Optional
 
 from openai import AsyncOpenAI
 
 from services.capability_credentials import resolve_capability_credentials
+from services.usage_ledger import UsageEvent, UsageLedger
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +64,9 @@ async def transcribe_thread_audio(
     user_id: str,
     postgres_db,
     timeout: float = 60.0,
+    ledger: Optional[UsageLedger] = None,
+    ref_id: Optional[str] = None,
+    project_id: Optional[str] = None,
 ) -> Optional[str]:
     """Transcribe recorded audio to text. ``None`` when STT is unavailable.
 
@@ -91,7 +97,11 @@ async def transcribe_thread_audio(
     model, base_url, api_key = creds
 
     if not api_key:
-        logger.warning("Transcription aborted: no API key for model %s", model)
+        logger.warning(
+            "Transcription aborted: no API key (stage=transcribe model=%s base_url=%s)",
+            model,
+            base_url,
+        )
         return None
 
     client = AsyncOpenAI(api_key=api_key, base_url=base_url, timeout=timeout)
@@ -108,9 +118,41 @@ async def transcribe_thread_audio(
             file=file_tuple,
         )
     except Exception:
-        logger.exception("Transcription failed for model %s", model)
+        logger.exception(
+            "Transcription failed (stage=transcribe model=%s base_url=%s bytes=%d)",
+            model,
+            base_url,
+            len(audio_bytes),
+        )
         return None
     finally:
         await client.close()
+
+    # Usage metering (rate-limiting v2) — non-load-bearing and OUTSIDE the
+    # transcribe try, so a ledger hiccup can never drop a good transcript. STT
+    # is metered per request (duration isn't known server-side without decoding);
+    # the audio size rides in details as a cost proxy.
+    if ledger is not None and getattr(ledger, "is_available", False):
+        try:
+            await ledger.record_events(
+                [
+                    UsageEvent(
+                        category="stt",
+                        resource=model,
+                        quantity=1,
+                        unit="stt-request",
+                        source="orchestrator",
+                        source_id=uuid.uuid4().hex,
+                        ts=datetime.now(timezone.utc),
+                        user_id=user_id,
+                        project_id=project_id,
+                        ref_kind="thread",
+                        ref_id=ref_id,
+                        details={"bytes": len(audio_bytes)},
+                    )
+                ]
+            )
+        except Exception:
+            logger.debug("STT usage metering failed (non-fatal)", exc_info=True)
 
     return _extract_transcript(result) or None
