@@ -2642,7 +2642,9 @@ class PostgresDB:
           and a new agent took the same id)
 
         Sets them to 'paused' with cleared assigned_agent_id so the
-        dispatcher can reassign them.
+        dispatcher can reassign them. Also clears stale assignments on
+        'waiting' jobs (status kept) and on already-'paused' jobs (which the
+        dispatcher ignores while an agent id is attached).
 
         Returns:
             Number of jobs recovered
@@ -2684,11 +2686,31 @@ class PostgresDB:
                 """
             )
 
+            # And on paused jobs: the dispatcher only resumes paused jobs with
+            # assigned_agent_id IS NULL, so a paused job still pointing at an
+            # offline agent (e.g. a freeze→paused path that didn't clear the
+            # assignment) is un-dispatchable until the 24h agent GC's FK
+            # cascade — sweep it free here instead.
+            result3 = await conn.execute(
+                """
+                UPDATE jobs
+                SET assigned_agent_id = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE status = 'paused'
+                  AND assigned_agent_id IS NOT NULL
+                  AND assigned_agent_id IN (
+                      SELECT id FROM agents WHERE status = 'offline'
+                  )
+                """
+            )
+
         count = 0
         if result.startswith("UPDATE "):
             count += int(result.split()[1])
         if result2.startswith("UPDATE "):
             count += int(result2.split()[1])
+        if result3.startswith("UPDATE "):
+            count += int(result3.split()[1])
         return count
 
     async def cancel_stale_verification_subjobs(self, stale_hours: int = 6) -> int:
