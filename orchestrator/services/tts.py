@@ -53,7 +53,7 @@ _PLAN_CACHE_MAX = 100
 
 _audio_cache: "OrderedDict[str, bytes]" = OrderedDict()
 _formulation_cache: "OrderedDict[str, str]" = OrderedDict()
-_plan_cache: "OrderedDict[str, list[str]]" = OrderedDict()
+_plan_cache: "OrderedDict[str, dict]" = OrderedDict()
 _audio_lock = asyncio.Lock()
 _formulation_lock = asyncio.Lock()
 _plan_lock = asyncio.Lock()
@@ -91,6 +91,11 @@ Return ONLY the rewritten text, no preamble, no commentary."""
 # (Faster backends could use a larger target; backend-aware sizing is a TODO.)
 TTS_CHUNK_LIMIT = 4096
 TTS_CHUNK_TARGET = 1500
+# The first chunk gates when the *first* audio is heard, so keep it small — a
+# short chunk 1 synthesizes fast and playback can start while the rest generate
+# (time-to-first-audio beats any progress bar). Enforced deterministically by
+# _shorten_first_chunk regardless of what the LLM returns.
+TTS_FIRST_CHUNK_TARGET = 500
 
 CHUNKING_SYSTEM_PROMPT = f"""You rewrite text so it sounds natural read aloud by a text-to-speech engine, AND split it into ordered chunks for sequential synthesis.
 
@@ -106,7 +111,8 @@ Rewrite rules:
 Chunking rules:
 8. Split the rewritten text into chunks of at most {TTS_CHUNK_TARGET} characters each (hard ceiling {TTS_CHUNK_LIMIT}).
 9. Break ONLY at natural stopping points — the end of a section, paragraph, or complete thought — so each chunk ends on a natural pause and the audio never sounds cut off mid-idea. Never split mid-sentence.
-10. Short input is a single chunk; long input becomes as many chunks as needed, in order.
+10. Make the FIRST chunk short — about {TTS_FIRST_CHUNK_TARGET} characters — so audio can start quickly; the remaining chunks may run up to the {TTS_CHUNK_TARGET}-character target.
+11. Short input is a single chunk; long input becomes as many chunks as needed, in order.
 
 Return ONLY a JSON array of strings (the chunks, in order), e.g. ["first chunk", "second chunk"]. No preamble, no commentary, no markdown fences."""
 
@@ -536,6 +542,44 @@ def _split_text_into_chunks(text: str, limit: int = TTS_CHUNK_LIMIT) -> list[str
     return chunks
 
 
+def _split_once_under(text: str, target: int) -> tuple[str, str]:
+    """Split ``text`` once at the latest natural boundary at/under ``target``
+    chars — a sentence end preferred, then a paragraph break. Returns
+    ``(head, tail)``; ``tail`` is empty when no clean boundary exists under
+    ``target`` (never breaks mid-sentence, so a single over-long opening
+    sentence is left whole)."""
+    if len(text) <= target:
+        return text, ""
+    window = text[:target]
+    sentence_ends = list(re.finditer(r"[.!?](?:\s|$)", window))
+    if sentence_ends:
+        cut = sentence_ends[-1].end()
+        head, tail = text[:cut].strip(), text[cut:].strip()
+        if head and tail:
+            return head, tail
+    nl = window.rfind("\n")
+    if nl > 0:
+        head, tail = text[:nl].strip(), text[nl:].strip()
+        if head and tail:
+            return head, tail
+    return text, ""
+
+
+def _shorten_first_chunk(
+    chunks: list[str], target: int = TTS_FIRST_CHUNK_TARGET
+) -> list[str]:
+    """Keep the FIRST chunk small (~``target`` chars) so chunk 1 synthesizes fast
+    and playback starts sooner while later chunks generate. Splits only at a
+    natural boundary; a first chunk already under ``target`` (or an unsplittable
+    long opening sentence) is left untouched."""
+    if not chunks:
+        return chunks
+    head, tail = _split_once_under(chunks[0], target)
+    if tail:
+        return [head, tail, *chunks[1:]]
+    return chunks
+
+
 def _enforce_chunk_limit(chunks: list[str], limit: int = TTS_CHUNK_LIMIT) -> list[str]:
     """Hard guarantee that every chunk is ``<= limit``. Any oversized chunk is
     deterministically re-split — the last resort after the LLM had its chance."""
@@ -703,13 +747,17 @@ async def plan_tts_chunks(
     ledger: Optional[UsageLedger] = None,
     ref_id: Optional[str] = None,
     project_id: Optional[str] = None,
-) -> Optional[list[str]]:
+) -> Optional[dict]:
     """Clean ``content`` for speech and split it into ordered ``<=4096``-char
     chunks at natural breakpoints, for sequential synthesis + playback.
 
-    Returns ``None`` when no TTS model is configured (the endpoint maps this to
-    ``204``). Otherwise always returns at least one chunk — the deterministic
-    splitter guarantees it even when the LLM is unavailable or fails.
+    Returns ``{"chunks": [...], "rewritten": bool}`` — ``rewritten`` is ``True``
+    only when the auxiliary LLM actually cleaned the text; ``False`` when the
+    deterministic splitter ran the raw markdown (no aux model, or the LLM
+    failed), so the UI can honestly say "rewriting skipped" instead of implying
+    it tidied the text. The first chunk is kept short for fast time-to-first-
+    audio. Returns ``None`` when no TTS model is configured (the endpoint maps
+    this to ``204``); otherwise ``chunks`` always has at least one entry.
     """
     if not content or not content.strip():
         return None
@@ -719,7 +767,7 @@ async def plan_tts_chunks(
         cached = _cache_get(_plan_cache, cache_key)
     if cached is not None:
         logger.debug("TTS chunk-plan cache hit")
-        return list(cached)
+        return {"chunks": list(cached["chunks"]), "rewritten": cached["rewritten"]}
 
     user_settings = await postgres_db.get_user_settings(user_id) or {}
     resolved_keys = await postgres_db.resolve_api_keys_for_job(
@@ -740,6 +788,7 @@ async def plan_tts_chunks(
         return None
 
     chunks: Optional[list[str]] = None
+    rewritten = False
     aux_creds = await _resolve_capability_credentials(
         capability="auxiliary",
         user_settings=user_settings,
@@ -758,6 +807,8 @@ async def plan_tts_chunks(
             user_id=user_id,
             ref_id=ref_id,
         )
+        # rewritten iff the LLM actually produced the chunks (not the fallback).
+        rewritten = chunks is not None
 
     # Fallback: deterministic split of the raw content (no cleanup, but always
     # playable) when there's no aux model or the LLM couldn't deliver. Pack to
@@ -766,11 +817,16 @@ async def plan_tts_chunks(
     if not chunks:
         chunks = _split_text_into_chunks(content, TTS_CHUNK_TARGET)
 
+    # Short first chunk → fast time-to-first-audio (later chunks generate while
+    # chunk 1 plays). Applied to both the LLM and deterministic paths.
+    chunks = _shorten_first_chunk(chunks)
+
     # Hard gate: nothing over the ceiling reaches synthesis.
     chunks = _enforce_chunk_limit(chunks)
     if not chunks:
         chunks = _split_text_into_chunks(content, TTS_CHUNK_TARGET) or [content.strip()]
 
+    result = {"chunks": chunks, "rewritten": rewritten}
     async with _plan_lock:
-        _cache_put(_plan_cache, cache_key, list(chunks), _PLAN_CACHE_MAX)
-    return chunks
+        _cache_put(_plan_cache, cache_key, result, _PLAN_CACHE_MAX)
+    return {"chunks": list(chunks), "rewritten": rewritten}

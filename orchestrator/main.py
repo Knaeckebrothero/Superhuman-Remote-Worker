@@ -18882,8 +18882,11 @@ async def plan_thread_message_tts(
         ``content`` (str, required) — the message text to read aloud.
 
     Returns:
-        JSON ``{"chunks": [str, ...]}`` — one entry for a short message, several
-        (each ≤ 4096 chars, split at natural breakpoints) for a long one.
+        JSON ``{"chunks": [str, ...], "rewritten": bool}`` — ``chunks`` has one
+        entry for a short message, several (each ≤ 4096 chars, split at natural
+        breakpoints, first one kept short) for a long one; ``rewritten`` is
+        ``False`` when the auxiliary LLM was unavailable and the raw markdown was
+        split deterministically, so the UI can say "rewriting skipped".
         ``204`` when no TTS model is configured. ``502`` only on an unexpected
         planner error (the planner has deterministic fallbacks, so this is rare).
     """
@@ -18896,7 +18899,7 @@ async def plan_thread_message_tts(
         raise HTTPException(status_code=400, detail="Missing 'content' in request body")
 
     try:
-        chunks = await plan_tts_chunks(
+        plan = await plan_tts_chunks(
             content=content,
             user_id=str(user["id"]),
             postgres_db=postgres_db,
@@ -18907,9 +18910,9 @@ async def plan_thread_message_tts(
         logger.exception("TTS chunk planning failed for thread %s", thread_id)
         raise HTTPException(status_code=502, detail="TTS planning failed") from exc
 
-    if chunks is None:
+    if plan is None:
         return Response(status_code=204)
-    return JSONResponse({"chunks": chunks})
+    return JSONResponse({"chunks": plan["chunks"], "rewritten": plan["rewritten"]})
 
 
 @app.post("/api/persistent/threads/{thread_id}/transcribe")
