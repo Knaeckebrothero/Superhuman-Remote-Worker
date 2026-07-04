@@ -10838,13 +10838,10 @@ async def complete_job(
                                 job_id,
                             )
                         job["freeze_data"] = None
-                        actions.append(
-                            "freeze stashed to context (auto-redispatch)"
-                        )
+                        actions.append("freeze stashed to context (auto-redispatch)")
                     except Exception as e:
                         logger.warning(
-                            f"Failed to stash/clear freeze on paused job "
-                            f"{job_id}: {e}"
+                            f"Failed to stash/clear freeze on paused job {job_id}: {e}"
                         )
 
             # Set completed_at for terminal statuses
