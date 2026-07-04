@@ -14,6 +14,7 @@ import pytest
 
 from orchestrator.services.lifecycle import (
     Instance,
+    InstanceLifecycleReconciler,
     ReapableInstanceManager,
     StatefulInstanceManager,
     VMInstanceManager,
@@ -229,6 +230,72 @@ class TestListInstances:
         ids = [i.bound_to for i in instances]
         assert ids == ["j-ready"]
 
+    @pytest.mark.asyncio
+    async def test_skips_failed_provisioning_vm(self):
+        # 'failed' is a provisioning failure the dispatcher parks (does NOT
+        # hot-retry). It must not surface to the reconciler, else is_healthy=False
+        # force-deletes it → 'deleted' → dispatcher re-provisions → churn.
+        jobs = [
+            {
+                "id": "j-failed",
+                "status": "paused",
+                "context": {"vm": {"status": "failed", "error": "timeout"}},
+            },
+            {
+                "id": "j-ready",
+                "status": "paused",
+                "context": {"vm": {"status": "ready", "ssh_host": "10.0.0.9"}},
+            },
+        ]
+        mgr, *_ = _make_manager(job_rows=jobs)
+        instances = await mgr.list_instances()
+        assert [i.bound_to for i in instances] == ["j-ready"]
+
+    @pytest.mark.asyncio
+    async def test_dispatchable_flag_from_row(self):
+        # A paused, unassigned, freeze-free job → the dispatcher owns its VM's
+        # bring-up. _fetch_vm_rows mirrors get_dispatchable_jobs and stamps
+        # job_dispatchable so is_reapable can hand off.
+        job = {
+            "id": "j-resuming",
+            "status": "paused",
+            "unassigned": True,
+            "freeze_free": True,
+            "context": {"vm": {"status": "created"}},
+        }
+        mgr, *_ = _make_manager(job_rows=[job])
+        inst = (await mgr.list_instances())[0]
+        assert inst.metadata["job_dispatchable"] is True
+
+    @pytest.mark.asyncio
+    async def test_not_dispatchable_when_assigned_or_frozen_or_wrong_status(self):
+        jobs = [
+            {  # assigned → dispatcher does not own it
+                "id": "j-assigned",
+                "status": "paused",
+                "unassigned": False,
+                "freeze_free": True,
+                "context": {"vm": {"status": "created"}},
+            },
+            {  # still frozen → genuinely parked, reap allowed
+                "id": "j-frozen",
+                "status": "paused",
+                "unassigned": True,
+                "freeze_free": False,
+                "context": {"vm": {"status": "created"}},
+            },
+            {  # pending_review is idle-suspendable, NOT dispatchable
+                "id": "j-review",
+                "status": "pending_review",
+                "unassigned": True,
+                "freeze_free": True,
+                "context": {"vm": {"status": "ready", "ssh_host": "10.0.0.1"}},
+            },
+        ]
+        mgr, *_ = _make_manager(job_rows=jobs)
+        instances = await mgr.list_instances()
+        assert all(i.metadata["job_dispatchable"] is False for i in instances)
+
 
 # =============================================================================
 # is_healthy / is_idle
@@ -411,8 +478,44 @@ class TestIsReapable:
 
     @pytest.mark.asyncio
     async def test_paused_job_is_reapable(self):
+        # A paused job with no dispatchable hint (e.g. still frozen / assigned)
+        # is genuinely parked → its VM is reclaimable (idle-suspension).
         mgr, *_ = _make_manager()
         inst = Instance(kind="vm", id="x", metadata={"job_status": "paused"})
+        assert await mgr.is_reapable(inst) is True
+
+    @pytest.mark.asyncio
+    async def test_dispatchable_paused_job_not_reapable(self):
+        # The fix: a paused job the dispatcher is resuming (dispatchable) must
+        # NOT have its VM reaped, or the reaper fights the dispatcher — the
+        # create→reap→create churn against the shared VM cluster.
+        mgr, *_ = _make_manager()
+        inst = Instance(
+            kind="vm",
+            id="x",
+            metadata={"job_status": "paused", "job_dispatchable": True},
+        )
+        assert await mgr.is_reapable(inst) is False
+
+    @pytest.mark.asyncio
+    async def test_dispatchable_created_job_not_reapable(self):
+        mgr, *_ = _make_manager()
+        inst = Instance(
+            kind="vm",
+            id="x",
+            metadata={"job_status": "created", "job_dispatchable": True},
+        )
+        assert await mgr.is_reapable(inst) is False
+
+    @pytest.mark.asyncio
+    async def test_non_dispatchable_paused_job_still_reapable(self):
+        # Explicit false (assigned or frozen) → idle-suspension still applies.
+        mgr, *_ = _make_manager()
+        inst = Instance(
+            kind="vm",
+            id="x",
+            metadata={"job_status": "paused", "job_dispatchable": False},
+        )
         assert await mgr.is_reapable(inst) is True
 
     @pytest.mark.asyncio
@@ -624,3 +727,65 @@ class TestSnapshotResetsAttempts:
         ref = await mgr.snapshot(inst)
         assert ref == "j1"
         db.merge_vm_context.assert_awaited_with("j1", {"snapshot_attempts": 0})
+
+
+# =============================================================================
+# End-to-end churn regression: the dispatcher-vs-reconciler fight
+# =============================================================================
+
+
+class TestChurnRegression:
+    """A dispatchable-paused job's provisioning VM must survive a full
+    reconciler tick.
+
+    The deployed churn: a version_upgrade drain parks the job 'paused'; the
+    dispatcher re-provisions its VM (status 'created', disk cloning ~3 min);
+    the reconciler saw paused→reapable + dirty + unreachable + a stale
+    snapshot_attempts already at the max → give_up force-deleted it on the very
+    first tick → dispatcher re-provisions → create→reap→create against the
+    shared VM cluster. The fix (is_reapable False for dispatchable jobs) hands
+    the VM to the dispatcher.
+    """
+
+    @pytest.mark.asyncio
+    async def test_dispatchable_provisioning_vm_survives_tick(self):
+        job = {
+            "id": "j-churn",
+            "status": "paused",
+            "unassigned": True,
+            "freeze_free": True,
+            # snapshot_attempts already exhausted from prior churn cycles — the
+            # exact state that made give_up fire on the first tick pre-fix.
+            "context": {"vm": {"status": "created", "snapshot_attempts": 5}},
+        }
+        mgr, provisioner, *_ = _make_manager(job_rows=[job])
+        rec = InstanceLifecycleReconciler([mgr])
+        report = await rec.tick()
+        provisioner.delete_vm.assert_not_called()
+        assert report["vm"]["reaped"] == 0
+        assert report["vm"]["reap_forced"] == 0
+
+    @pytest.mark.asyncio
+    async def test_non_dispatchable_paused_vm_still_reaped(self, monkeypatch):
+        # Control: a paused job still frozen (freeze_free=False) is genuinely
+        # parked, NOT resuming — idle-suspension still reclaims its VM.
+        monkeypatch.setenv("WORKSPACE_SNAPSHOT_MAX_ATTEMPTS", "5")
+        job = {
+            "id": "j-idle",
+            "status": "paused",
+            "unassigned": True,
+            "freeze_free": False,
+            "context": {
+                "vm": {
+                    "status": "ready",
+                    "ssh_host": "10.0.0.1",
+                    "snapshot_attempts": 5,
+                }
+            },
+        }
+        mgr, provisioner, *_ = _make_manager(job_rows=[job])
+        mgr._tcp_probe = AsyncMock(return_value=False)  # unreachable, no real socket
+        rec = InstanceLifecycleReconciler([mgr])
+        report = await rec.tick()
+        provisioner.delete_vm.assert_awaited_once_with("j-idle")
+        assert report["vm"]["reap_forced"] == 1
