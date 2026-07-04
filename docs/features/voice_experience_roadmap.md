@@ -96,6 +96,17 @@ the ear bake-off (need a chosen vendor + keys); dropping `gpt-4o-mini-tts` in as
 the TTS default (Admin → Providers, needs an OpenAI key) is the one remaining
 user action to light up the external lane in dev.
 
+**Phase 4 (STT hardening) implemented + verified 2026-07-04.** Fixed the
+honesty gap (transcription failure returned `204` = "off"): new
+`TranscriptionError` → `502`; size-scaled STT timeout + `max_retries=0` for long
+clips; the 20-min recording cap is now enforced (auto-stop) with a soft "stops
+soon" warning + m:ss elapsed. Local: cockpit `npm test` (803) + build clean;
+backend `pytest` (**64**). Live k3d smoke: garbage audio → `502` (was a silent
+204), and a real kokoro→whisper round-trip → `200` with an accurate transcript
+plus an `stt-request` ledger row (also confirming Phase 0's STT metering live
+for the first time). Only first-party code phase left is nothing —
+**Phase 5 (custom voices/personas) is the deferred loop-agent project.**
+
 ## Current state (as-is, verified 2026-07-04)
 
 ### Voice-out (read aloud)
@@ -472,19 +483,34 @@ external lane < 5 s for a typical message.
 
 ### Phase 4 — Voice-in hardening (STT)
 
-- [ ] **Long-recording test**: 10+ min dictation end-to-end. Size is fine
-      (opus ≈ 0.2–0.5 MB/min vs the 25 MB cap) but backend latency/timeout
-      behavior is unverified.
-- [ ] Recording UX: live duration display + soft cap warning near the limit
-      (client currently has **no** duration cap or display).
-- [ ] If long clips are slow: chunked transcription server-side (split on
-      silence, transcribe sequentially, concatenate) behind the same
-      endpoint.
-- [ ] Verify the 204-vs-error split matches Phase 0's honesty rules
-      (broken ≠ off).
+**Implemented + verified 2026-07-04.** The core was a honesty gap: the backend
+returned `204` for *both* "no STT model" and "transcription failed", so a real
+failure read as "feature off" and the composer swallowed it silently.
+
+- [x] **Backend hardened for long clips**: `transcribe_thread_audio` now uses a
+      **size-scaled timeout** (`_stt_timeout`, 120 s–600 s by payload size)
+      instead of a flat 60 s that would kill a long-but-valid clip, plus
+      `max_retries=0` (fail fast, no multi-minute backoff).
+- [x] **Recording UX**: the 20-min cap the service was handed is now actually
+      enforced (auto-stop in the state subscription; generous enough for "10+
+      min" while staying under the 25 MB backend cap), a **soft "Recording
+      stops soon" warning** in the last minute, and the elapsed time now shows
+      as **m:ss** (raw seconds read badly near 20 min).
+- [x] **204-vs-error honesty**: new `TranscriptionError` → the endpoint answers
+      **502** when a configured model fails (mirrors `TtsSynthesisError`); an
+      empty transcript is a `""` success, not a `204`. The cockpit already maps
+      502 → the `transcribeError` notice. *(Live-smoke: garbage audio → 502
+      `{"detail":"Transcription failed"}` (was a silent 204); a real
+      TTS→STT round-trip → 200 with an accurate transcript + an `stt-request`
+      ledger row.)*
+- [ ] **(deferred, conditional)** Chunked server-side transcription (split on
+      silence) — only needed if long clips prove slow; the size-scaled timeout
+      covers the common case.
 
 **Acceptance**: a 12-minute rambling voice memo comes back as text without
-the UI looking frozen, or fails with an honest message.
+the UI looking frozen *(backend hardened — size-scaled timeout; real
+device recording needs a mic to confirm end-to-end)*, or **fails with an
+honest message** *(met — 502 → composer error, live-verified)*.
 
 ### Phase 5 — Custom voices & personas (DEFERRED — loop-agent project)
 
