@@ -2704,6 +2704,30 @@ class PostgresDB:
                 """
             )
 
+            # Paused jobs parked for AUTO-redispatch must also shed their
+            # row-level freeze blob — get_dispatchable_jobs requires
+            # ``freeze_data IS NULL``, so a kept freeze hides the job from the
+            # dispatcher forever. Stash it in context.last_freeze_data (state
+            # continuity lives in the checkpoint + pushed branch). Covers rows
+            # paused by pre-fix code crossing a deploy; /complete now does the
+            # same at the source (services/completion.py
+            # AUTO_REDISPATCH_FREEZE_TYPES — keep the two lists in sync).
+            result4 = await conn.execute(
+                """
+                UPDATE jobs
+                SET freeze_data = NULL,
+                    context = COALESCE(context, '{}'::jsonb)
+                              || jsonb_build_object('last_freeze_data', freeze_data),
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE status = 'paused'
+                  AND assigned_agent_id IS NULL
+                  AND freeze_data->>'freeze_type' IN (
+                      'version_upgrade', 'memory_unavailable',
+                      'kb_unavailable', 'workspace_upgrade_required'
+                  )
+                """
+            )
+
         count = 0
         if result.startswith("UPDATE "):
             count += int(result.split()[1])
@@ -2711,6 +2735,8 @@ class PostgresDB:
             count += int(result2.split()[1])
         if result3.startswith("UPDATE "):
             count += int(result3.split()[1])
+        if result4.startswith("UPDATE "):
+            count += int(result4.split()[1])
         return count
 
     async def cancel_stale_verification_subjobs(self, stale_hours: int = 6) -> int:
