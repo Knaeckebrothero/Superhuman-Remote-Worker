@@ -4,9 +4,11 @@ RemoteBackend operates over SSH/SFTP via paramiko. The tests mock paramiko
 entirely to avoid requiring SSH infrastructure.
 """
 
+import errno
 import io
 import socket
 import stat as stat_module
+from contextlib import contextmanager
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -212,6 +214,67 @@ class TestRemoteBackendConnect:
 
         # max_retries = 2, so 2 attempts
         assert mock_ssh.connect.call_count == 2
+
+
+class TestRemoteBackendConnectClassification:
+    """connect() classifies the failure cause and sizes the retry budget."""
+
+    @contextmanager
+    def _scenario(self, side_effect, retries):
+        """Yield (backend, mock_ssh) with paramiko.SSHClient AND time.sleep
+        patched for the whole scope — connect() must run while paramiko is
+        mocked, or it dials a real host (5s network timeout)."""
+        mock_ssh = MagicMock()
+        mock_ssh.open_sftp.return_value = MagicMock()
+        mock_ssh.connect.side_effect = side_effect
+        with patch("paramiko.SSHClient", return_value=mock_ssh), patch("time.sleep"):
+            backend = RemoteBackend(
+                host="10.0.0.42",
+                workspace_path="/ws",
+                connect_timeout=5,
+                max_retries=retries,
+            )
+            yield backend, mock_ssh
+
+    def test_gone_dns_fails_fast_no_retry(self):
+        """gaierror (NXDOMAIN) = pod gone → raise on the first attempt."""
+        err = socket.gaierror(socket.EAI_NONAME, "Name or service not known")
+        with self._scenario(err, 5) as (backend, mock_ssh):
+            with pytest.raises(WorkspaceUnavailableError):
+                backend.connect()
+            assert mock_ssh.connect.call_count == 1
+
+    def test_no_route_fails_fast(self):
+        """OSError EHOSTUNREACH = no route → gone → fail fast."""
+        err = OSError(errno.EHOSTUNREACH, "No route to host")
+        with self._scenario(err, 5) as (backend, mock_ssh):
+            with pytest.raises(WorkspaceUnavailableError):
+                backend.connect()
+            assert mock_ssh.connect.call_count == 1
+
+    def test_connection_refused_uses_full_boot_budget(self):
+        """ECONNREFUSED = sshd booting → keep the full max_retries budget."""
+        err = ConnectionRefusedError(errno.ECONNREFUSED, "Connection refused")
+        with self._scenario(err, 5) as (backend, mock_ssh):
+            with pytest.raises(WorkspaceUnavailableError):
+                backend.connect()
+            assert mock_ssh.connect.call_count == 5
+
+    def test_timeout_capped_at_two(self):
+        """Ambiguous (timeout) → short cap, not the full budget."""
+        with self._scenario(socket.timeout("timed out"), 5) as (backend, mock_ssh):
+            with pytest.raises(WorkspaceUnavailableError):
+                backend.connect()
+            assert mock_ssh.connect.call_count == 2
+
+    def test_message_says_workspace_not_vm(self):
+        """Renamed error string: 'workspace', never 'VM'."""
+        err = socket.gaierror(socket.EAI_NONAME, "Name or service not known")
+        with self._scenario(err, 1) as (backend, mock_ssh):
+            with pytest.raises(WorkspaceUnavailableError) as exc:
+                backend.connect()
+        assert "workspace" in str(exc.value)
+        assert "VM" not in str(exc.value)
 
 
 class TestRemoteBackendDisconnect:
