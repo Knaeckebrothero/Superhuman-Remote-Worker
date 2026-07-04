@@ -65,6 +65,7 @@ import {AppSelectComponent} from '../../ui/select';
 import {AppIconComponent} from '../../ui/icon';
 import {AppDialogComponent} from '../../ui/dialog';
 import {AppToolCardComponent} from '../../ui/tool-card';
+import {AppReadAloudComponent} from '../../ui/read-aloud';
 import {AppInlineEditableTextComponent} from '../../ui/inline-editable-text';
 import {AppToastService} from '../../ui/toast';
 import {ErrorMessageService} from '../../core/services/error-message.service';
@@ -72,29 +73,6 @@ import {ErrorMessageService} from '../../core/services/error-message.service';
 interface SlashCommand {
     command: string;
     descriptionKey: string;
-}
-
-interface TtsMessageState {
-    isGenerating: boolean;
-    error: boolean;
-    /** The spoken (rewritten) text read aloud — all chunks joined — shown in
-     *  the collapsible "Spoken version" when it differs from the message. */
-    text?: string;
-    // Each section is its own player. A long message plans into ordered chunks;
-    // we synthesize them in sequence, render a player as each becomes ready, and
-    // auto-advance between them while keeping every section individually replayable.
-    chunks?: string[];
-    /** Blob URL per chunk, filled as each is synthesized (undefined until then). */
-    chunkUrls?: (string | undefined)[];
-    /** Index currently being synthesized (drives the "Generating part N" status). */
-    synthIndex?: number;
-    /** Index that should start playing the moment its player is available — set
-     *  when the previous section ends before the next has finished synthesizing. */
-    playPending?: number;
-    /** Index whose autoplay the browser blocked (transient user-activation
-     *  expired, or Safari per-element activation). Surfaces a "tap to play"
-     *  prompt instead of silently doing nothing. */
-    playBlocked?: number;
 }
 
 interface Suggestion {
@@ -438,6 +416,7 @@ export function clearDraft(threadId: string | null): void {
         AppIconComponent,
         AppDialogComponent,
         AppToolCardComponent,
+        AppReadAloudComponent,
         AppInlineEditableTextComponent,
         CitationsPanelComponent,
     ],
@@ -808,8 +787,6 @@ export function clearDraft(threadId: string | null): void {
               @let counts = turnEventCounts(turn);
               @let last = lastTextEvent(turn);
               @let streaming = turn.status === 'streaming';
-              @let ttsKey = 'turn:' + turn.id;
-              @let ttsS = ttsStateFor(ttsKey);
               <div class="message message-assistant turn-bubble"
                    [class.historical]="turn.historical"
                    [class.streaming]="streaming"
@@ -932,95 +909,10 @@ export function clearDraft(threadId: string | null): void {
                     }
                   }
 
-                  <!-- Read aloud: the button generates speech; once generated it
-                       is replaced by a native <audio> player, with the spoken
-                       (markdown-stripped) text in a collapsible panel below. -->
+                  <!-- Read aloud (Phase 1): the button, staged status box, and
+                       players are all owned by <app-read-aloud>. -->
                   @if (last && !streaming) {
-                    @if (!ttsS.chunks) {
-                      @if (ttsS.isGenerating) {
-                        <!-- Planning: spinner + status, before any section exists. -->
-                        <div class="tts-prep">
-                          <span class="action-spinner-sm"></span>
-                          <span class="tts-status-text">{{ 'chat.tts.preparing' | transloco }}</span>
-                        </div>
-                      } @else {
-                        <!-- The read button (or an error to retry). -->
-                        <div class="message-actions">
-                          <button
-                            type="button"
-                            class="msg-action-btn tts-btn"
-                            [class.is-error]="ttsS.error && !ttsUnavailable()"
-                            [disabled]="ttsUnavailable()"
-                            [title]="(ttsUnavailable() ? 'chat.tts.notConfigured' : ttsS.error ? 'chat.tts.error' : 'chat.tts.play') | transloco"
-                            (click)="toggleTts(ttsKey, last.content)"
-                          >
-                            @if (ttsUnavailable()) {
-                              <app-icon size="md">volume_off</app-icon>
-                            } @else if (ttsS.error) {
-                              <app-icon size="md">error_outline</app-icon>
-                            } @else {
-                              <app-icon size="md">volume_up</app-icon>
-                            }
-                          </button>
-                        </div>
-                      }
-                    } @else {
-                      <!-- One player per section, each appearing as it's ready,
-                           with a spinner + "Generating part N" trailing below. -->
-                      <div class="tts-players">
-                        @if (ttsS.playBlocked !== undefined) {
-                          <!-- Autoplay blocked by the browser — surface it as a
-                               tap-to-play instead of looking stuck. -->
-                          <button
-                            type="button"
-                            class="tts-tap-to-play"
-                            (click)="resumeBlockedPlayback(ttsKey)"
-                          >
-                            <app-icon size="sm">play_arrow</app-icon>
-                            <span>{{ 'chat.tts.tapToPlay' | transloco }}</span>
-                          </button>
-                        }
-                        @for (chunk of ttsS.chunks; track $index) {
-                          @if (ttsS.chunkUrls?.[$index]; as url) {
-                            <div class="tts-player-row">
-                              <audio
-                                #ttsAudioEl
-                                class="tts-player"
-                                controls
-                                preload="metadata"
-                                [attr.data-tts-key]="ttsKey"
-                                [attr.data-tts-index]="$index"
-                                [src]="url"
-                                (loadedmetadata)="onPlayerReady($event, ttsKey, $index)"
-                                (play)="onPlayerPlay($event)"
-                                (ended)="onChunkEnded(ttsKey, $index)"
-                              ></audio>
-                              @if (ttsS.chunks.length > 1) {
-                                <span class="tts-part">{{ 'chat.tts.part' | transloco:{ current: $index + 1, total: ttsS.chunks.length } }}</span>
-                              }
-                            </div>
-                          }
-                        }
-                        @if (ttsS.isGenerating) {
-                          <div class="tts-status">
-                            <span class="action-spinner-sm"></span>
-                            <span class="tts-status-text">{{ 'chat.tts.generatingPart' | transloco:{ current: (ttsS.synthIndex ?? 0) + 1, total: ttsS.chunks.length } }}</span>
-                          </div>
-                        }
-                      </div>
-                    }
-                    <!-- Spoken version: only shown when formulation actually
-                         rewrote the text (otherwise it would just mirror the
-                         message bubble). Collapsed by default, like reasoning. -->
-                    @if (ttsS.chunks && ttsS.text && ttsS.text.trim() !== last.content.trim()) {
-                      <details class="thinking-block tts-spoken">
-                        <summary class="thinking-header">
-                          <app-icon size="sm" class="thinking-icon">graphic_eq</app-icon>
-                          <span class="thinking-label">{{ 'chat.tts.spokenVersion' | transloco }}</span>
-                        </summary>
-                        <div class="thinking-content tts-spoken-text">{{ ttsS.text }}</div>
-                      </details>
-                    }
+                    <app-read-aloud [content]="last.content" [threadId]="chat.threadId()" />
                   }
                 </div>
               </div>
@@ -1660,21 +1552,10 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     private capabilitiesSub?: Subscription;
     private recordingStateSub?: Subscription;
 
-    // Per-turn TTS state. Keyed by a stable string ("turn:<id>") so playback
-    // state survives across re-renders even if the turn list is reordered.
-    readonly ttsState = signal<Record<string, TtsMessageState>>({});
-    // Read-aloud / dictation availability. Only *positively-known* unavailability
-    // disables a control (fail-open: null/true ⇒ leave it enabled). Kills the
-    // silent-204 "read doesn't work" dead click — the button greys out with a
-    // "not configured" tooltip instead.
-    readonly ttsUnavailable = computed(() => this.voiceCaps.tts() === false);
+    // Dictation availability for the mic button. Only *positively-known*
+    // unavailability disables it (fail-open: null/true ⇒ leave it enabled).
+    // Read-aloud availability + playback now live in <app-read-aloud>.
     readonly sttUnavailable = computed(() => this.voiceCaps.stt() === false);
-    // The native <audio> players (one per generated turn). Used to pause the
-    // others when one starts — browsers happily play several at once otherwise.
-    @ViewChildren('ttsAudioEl')
-    private ttsPlayers?: QueryList<ElementRef<HTMLAudioElement>>;
-    // Tracks blob URLs we've created so we can revoke them on destroy.
-    private readonly ttsBlobUrls = new Set<string>();
 
     // Slash command autocomplete
     readonly showSlashMenu = signal(false);
@@ -2054,10 +1935,6 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         if (this.isRecording()) {
             this.voiceRecording.cancelRecording();
         }
-        // Free TTS blob URLs. The native <audio> elements are torn down with
-        // the component's DOM, which stops any in-flight playback.
-        this.ttsBlobUrls.forEach((url) => URL.revokeObjectURL(url));
-        this.ttsBlobUrls.clear();
     }
 
     autoResizeInput(): void {
@@ -2332,182 +2209,6 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         overlay.onclick = (e) => {
             if (e.target === overlay) cleanup();
         };
-    }
-
-    // ===== TTS playback =====
-
-    /** Read state for a given turn key (always returns a defaulted object). */
-    ttsStateFor(key: string): TtsMessageState {
-        return this.ttsState()[key] ?? {isGenerating: false, error: false};
-    }
-
-    /** Mutate state for one turn key. */
-    private setTtsState(key: string, patch: Partial<TtsMessageState>): void {
-        this.ttsState.update((cur) => ({
-            ...cur,
-            [key]: {...this.ttsStateFor(key), ...patch},
-        }));
-    }
-
-    /**
-     * Read an assistant turn's final text aloud. Plans the message into ordered
-     * chunks (server cleans + splits at natural breakpoints), then synthesizes
-     * them in sequence — rendering a player as each section becomes ready and
-     * auto-advancing between them. Every section stays individually playable, so
-     * you can scrub back and forth afterwards.
-     */
-    async toggleTts(key: string, content: string): Promise<void> {
-        const threadId = this.chat.threadId();
-        if (!threadId || !content.trim()) return;
-        const state = this.ttsStateFor(key);
-        if (state.isGenerating || state.chunks) return; // already running or done
-
-        this.setTtsState(key, {isGenerating: true, error: false});
-        let plan;
-        try {
-            plan = await firstValueFrom(this.api.planTTS(threadId, content));
-        } catch (e) {
-            console.error('TTS plan threw', e);
-            this.setTtsState(key, {isGenerating: false, error: true});
-            return;
-        }
-        // 'unavailable' (204) = no TTS model configured → stay silent, no error.
-        // null = a real failure → show the error state.
-        if (plan === null || plan === 'unavailable') {
-            this.setTtsState(key, {isGenerating: false, error: plan === null});
-            return;
-        }
-        if (plan.length === 0) {
-            this.setTtsState(key, {isGenerating: false});
-            return;
-        }
-        this.setTtsState(key, {
-            chunks: plan,
-            chunkUrls: new Array(plan.length),
-            text: plan.join('\n\n'),
-            playPending: 0, // the first section autoplays once it loads
-        });
-        // Synthesize sections in order; each renders as it's ready and the
-        // first autoplays. A later failure just stops the chain (earlier
-        // sections stay playable); the first failing is a hard error.
-        for (let i = 0; i < plan.length; i++) {
-            this.setTtsState(key, {synthIndex: i});
-            const url = await this.synthTtsChunk(key, threadId, i);
-            if (!url) {
-                if (i === 0) {
-                    // Nothing playable — reset to the read/error button to retry.
-                    this.setTtsState(key, {
-                        isGenerating: false,
-                        error: true,
-                        chunks: undefined,
-                        chunkUrls: undefined,
-                        text: undefined,
-                        synthIndex: undefined,
-                        playPending: undefined,
-                    });
-                } else {
-                    // Earlier sections stay playable; just stop the chain here.
-                    this.setTtsState(key, {isGenerating: false, synthIndex: undefined});
-                }
-                return;
-            }
-        }
-        this.setTtsState(key, {isGenerating: false, synthIndex: undefined});
-    }
-
-    /** Synthesize chunk `i` (already cleaned by the plan, reformulate=false),
-     *  store + return its blob URL, or null on failure. */
-    private async synthTtsChunk(
-        key: string,
-        threadId: string,
-        i: number,
-    ): Promise<string | null> {
-        const chunks = this.ttsStateFor(key).chunks;
-        if (!chunks || i < 0 || i >= chunks.length) return null;
-        const cached = this.ttsStateFor(key).chunkUrls?.[i];
-        if (cached) return cached;
-        const lang = this.i18n.activeLang().startsWith('de') ? 'de' : 'en';
-        let res;
-        try {
-            res = await firstValueFrom(
-                this.api.generateTTS(threadId, chunks[i], {language: lang, reformulate: false}),
-            );
-        } catch (e) {
-            console.error('TTS chunk synth threw', e);
-            return null;
-        }
-        if (res === null || res === 'unavailable') return null;
-        const url = URL.createObjectURL(res.audio);
-        this.ttsBlobUrls.add(url);
-        const urls = (this.ttsStateFor(key).chunkUrls ?? []).slice();
-        urls[i] = url;
-        this.setTtsState(key, {chunkUrls: urls});
-        return url;
-    }
-
-    /** Locate a turn's section player by index (data-attrs on each <audio>). */
-    private findTtsPlayer(key: string, index: number): HTMLAudioElement | null {
-        const ref = this.ttsPlayers?.find(
-            (r) =>
-                r.nativeElement.dataset['ttsKey'] === key &&
-                r.nativeElement.dataset['ttsIndex'] === String(index),
-        );
-        return ref?.nativeElement ?? null;
-    }
-
-    /**
-     * A section's player loaded. Autoplay it only if it's the one we're waiting
-     * for (the first section, or the one queued after the previous ended) — so
-     * sections synthesized in the background don't all start at once.
-     */
-    onPlayerReady(event: Event, key: string, index: number): void {
-        if (this.ttsStateFor(key).playPending !== index) return;
-        this.setTtsState(key, {playPending: undefined});
-        (event.target as HTMLAudioElement).play().catch(() => {
-            // Autoplay blocked (transient activation expired / Safari per-element
-            // gesture). Don't swallow it — surface a "tap to play" prompt.
-            this.setTtsState(key, {playBlocked: index});
-        });
-    }
-
-    /** Auto-advance: when a section ends, play the next one — or queue it if it
-     *  isn't synthesized yet (onPlayerReady picks it up when it loads). */
-    onChunkEnded(key: string, index: number): void {
-        const total = this.ttsStateFor(key).chunks?.length ?? 0;
-        const next = index + 1;
-        if (next >= total) return; // whole message played
-        const el = this.findTtsPlayer(key, next);
-        if (el) {
-            el.play().catch(() => this.setTtsState(key, {playBlocked: next}));
-        } else {
-            this.setTtsState(key, {playPending: next});
-        }
-    }
-
-    /** Pause every other player when one starts — one voice at a time. A
-     *  successful play also means the browser isn't blocking, so clear any
-     *  "tap to play" prompt for that turn. */
-    onPlayerPlay(event: Event): void {
-        const active = event.target as HTMLAudioElement;
-        const key = active.dataset['ttsKey'];
-        if (key && this.ttsStateFor(key).playBlocked !== undefined) {
-            this.setTtsState(key, {playBlocked: undefined});
-        }
-        this.ttsPlayers?.forEach((ref) => {
-            const el = ref.nativeElement;
-            if (el !== active && !el.paused) el.pause();
-        });
-    }
-
-    /** Resume the section whose autoplay the browser blocked, from this user
-     *  gesture (which grants fresh activation). Re-arms the prompt if it still
-     *  refuses. */
-    resumeBlockedPlayback(key: string): void {
-        const index = this.ttsStateFor(key).playBlocked;
-        if (index === undefined) return;
-        this.setTtsState(key, {playBlocked: undefined});
-        const el = this.findTtsPlayer(key, index);
-        el?.play().catch(() => this.setTtsState(key, {playBlocked: index}));
     }
 
     // ===== Drag-and-drop file handling =====

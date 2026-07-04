@@ -152,15 +152,22 @@ describe('ApiService.planTTS', () => {
 
   afterEach(() => httpMock.verify());
 
-  it('POSTs the content and returns the chunk array', async () => {
+  it('POSTs the content and returns the chunks + rewritten flag', async () => {
     const pending = firstValueFrom(api.planTTS('thread-1', 'a long message'));
     const req = httpMock.expectOne((r) =>
       r.url.endsWith('/persistent/threads/thread-1/tts/plan'),
     );
     expect(req.request.method).toBe('POST');
     expect(req.request.body.content).toBe('a long message');
-    req.flush({chunks: ['part one', 'part two']});
-    expect(await pending).toEqual(['part one', 'part two']);
+    req.flush({chunks: ['part one', 'part two'], rewritten: true});
+    expect(await pending).toEqual({chunks: ['part one', 'part two'], rewritten: true});
+  });
+
+  it('defaults rewritten to false when the field is absent', async () => {
+    const pending = firstValueFrom(api.planTTS('t', 'x'));
+    const req = httpMock.expectOne((r) => r.url.endsWith('/tts/plan'));
+    req.flush({chunks: ['only part']});
+    expect(await pending).toEqual({chunks: ['only part'], rewritten: false});
   });
 
   it('maps a 204 response to "unavailable"', async () => {
