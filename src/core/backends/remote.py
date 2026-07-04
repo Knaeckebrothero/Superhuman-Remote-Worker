@@ -927,7 +927,7 @@ class RemoteBackend(WorkspaceBackend):
                 try:
                     all_lines = self._tmux_capture(tab_name)
                 except WorkspaceUnavailableError:
-                    return f"SSH connection lost during command execution: {command}"
+                    raise
 
                 # Find sentinel output line
                 sentinel_line_idx = None
