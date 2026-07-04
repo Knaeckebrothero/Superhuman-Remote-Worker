@@ -567,3 +567,157 @@ class TestTtsPlanEndpoint:
                     thread_id="t1", request=MagicMock(), body={"content": ""}
                 )
         assert exc.value.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# Usage metering (rate-limiting v2): the direct-SDK path must feed usage_events.
+# ---------------------------------------------------------------------------
+
+
+def _mock_ledger(*, available=True):
+    """A UsageLedger double that records events into an AsyncMock."""
+    led = MagicMock()
+    led.is_available = available
+    led.record_events = AsyncMock(return_value=1)
+    return led
+
+
+class TestTtsMetering:
+    @pytest.mark.asyncio
+    async def test_records_tts_character_event(self):
+        from services.tts import generate_message_tts
+
+        cls, _ = _mock_openai(speech=b"AUDIO")
+        led = _mock_ledger()
+        with (
+            patch("services.tts.AsyncOpenAI", cls),
+            patch(
+                "services.tts._resolve_capability_credentials",
+                AsyncMock(return_value=("kokoro", None, "sk-key")),
+            ),
+        ):
+            result = await generate_message_tts(
+                content="hello there",
+                language="en",
+                reformulate=False,
+                user_id="u1",
+                postgres_db=_mock_db(),
+                ledger=led,
+                ref_id="t1",
+            )
+        assert result is not None
+        led.record_events.assert_awaited_once()
+        (events,), _ = led.record_events.call_args
+        assert len(events) == 1
+        ev = events[0]
+        assert ev.category == "tts"
+        assert ev.unit == "tts-character"
+        assert ev.quantity == len("hello there")
+        assert ev.resource == "kokoro"
+        assert ev.user_id == "u1"
+        assert ev.ref_id == "t1"
+        assert ev.ref_kind == "thread"
+
+    @pytest.mark.asyncio
+    async def test_no_write_when_ledger_unavailable(self):
+        from services.tts import generate_message_tts
+
+        cls, _ = _mock_openai(speech=b"AUDIO")
+        led = _mock_ledger(available=False)
+        with (
+            patch("services.tts.AsyncOpenAI", cls),
+            patch(
+                "services.tts._resolve_capability_credentials",
+                AsyncMock(return_value=("kokoro", None, "sk-key")),
+            ),
+        ):
+            result = await generate_message_tts(
+                content="hello there",
+                language="en",
+                reformulate=False,
+                user_id="u1",
+                postgres_db=_mock_db(),
+                ledger=led,
+                ref_id="t1",
+            )
+        assert result is not None
+        led.record_events.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_metering_failure_is_non_fatal(self):
+        from services.tts import generate_message_tts
+
+        cls, _ = _mock_openai(speech=b"AUDIO")
+        led = _mock_ledger()
+        led.record_events = AsyncMock(side_effect=RuntimeError("audit down"))
+        with (
+            patch("services.tts.AsyncOpenAI", cls),
+            patch(
+                "services.tts._resolve_capability_credentials",
+                AsyncMock(return_value=("kokoro", None, "sk-key")),
+            ),
+        ):
+            result = await generate_message_tts(
+                content="hello there",
+                language="en",
+                reformulate=False,
+                user_id="u1",
+                postgres_db=_mock_db(),
+                ledger=led,
+                ref_id="t1",
+            )
+        # A ledger hiccup must never break playback.
+        assert result == ("hello there", b"AUDIO")
+
+
+# ---------------------------------------------------------------------------
+# Endpoint: GET /api/voice/capabilities (kills the silent 204 up front)
+# ---------------------------------------------------------------------------
+
+
+class TestVoiceCapabilitiesEndpoint:
+    def test_route_is_registered(self):
+        from main import app
+
+        routes = {
+            (m, getattr(r, "path", ""))
+            for r in app.routes
+            for m in (getattr(r, "methods", None) or set())
+        }
+        assert ("GET", "/api/voice/capabilities") in routes
+
+    @pytest.mark.asyncio
+    async def test_available_from_user_setting(self):
+        import main
+
+        db = MagicMock()
+        db.get_user_settings = AsyncMock(return_value={"default_tts_model": "kokoro"})
+        db.resolve_default_for_capability = AsyncMock(return_value=None)
+        with (
+            patch.object(
+                main, "require_approved_user", AsyncMock(return_value={"id": "u1"})
+            ),
+            patch.object(main, "postgres_db", db),
+        ):
+            result = await main.voice_capabilities(MagicMock())
+        assert result == {"tts": True, "stt": False}
+
+    @pytest.mark.asyncio
+    async def test_available_from_system_default(self):
+        import main
+
+        db = MagicMock()
+        db.get_user_settings = AsyncMock(return_value={})
+
+        async def _resolve(cap):
+            return "whisper-1" if cap == "whisper" else None
+
+        db.resolve_default_for_capability = AsyncMock(side_effect=_resolve)
+        with (
+            patch.object(
+                main, "require_approved_user", AsyncMock(return_value={"id": "u1"})
+            ),
+            patch.object(main, "postgres_db", db),
+        ):
+            result = await main.voice_capabilities(MagicMock())
+        assert result == {"tts": False, "stt": True}

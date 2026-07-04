@@ -20,7 +20,9 @@ import hashlib
 import json
 import logging
 import re
+import uuid
 from collections import OrderedDict
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 from openai import AsyncOpenAI
@@ -28,6 +30,7 @@ from openai import AsyncOpenAI
 from services.capability_credentials import (
     resolve_capability_credentials as _resolve_capability_credentials,
 )
+from services.usage_ledger import UsageEvent, UsageLedger
 
 logger = logging.getLogger(__name__)
 
@@ -131,6 +134,78 @@ def _cache_put(cache: OrderedDict, key: str, value: Any, max_size: int) -> None:
         cache.popitem(last=False)
 
 
+# ---------------------------------------------------------------------------
+# Usage metering (rate-limiting v2). Read-aloud calls resolved endpoints
+# directly (no gateway), so synthesis AND the auxiliary formulation/chunking
+# LLM calls are invisible to ``usage_events`` unless we emit here. Metering is
+# **non-load-bearing**: a missing ledger (audit pool absent) or a write error
+# never affects playback. Gated on ``_metering_enabled`` so the hot path skips
+# all work — and the mocked ``response.usage`` in unit tests is never touched —
+# when no ledger is wired (ledger is ``None`` for every direct-call test).
+# ---------------------------------------------------------------------------
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _metering_enabled(ledger: Optional[UsageLedger]) -> bool:
+    return ledger is not None and getattr(ledger, "is_available", False)
+
+
+async def _record_usage(
+    ledger: Optional[UsageLedger], events: list[UsageEvent]
+) -> None:
+    if not events:
+        return
+    try:
+        await ledger.record_events(events)
+    except Exception:
+        logger.debug("voice usage metering failed (non-fatal)", exc_info=True)
+
+
+def _llm_token_events(
+    response: Any,
+    *,
+    model: str,
+    stage: str,
+    user_id: Optional[str],
+    ref_id: Optional[str],
+) -> list[UsageEvent]:
+    """Prompt/completion-token ``UsageEvent``s from an OpenAI-compatible chat
+    response — ``[]`` when the endpoint returned no usage (many local servers
+    omit it). Emitted under ``source='orchestrator'`` so they don't collide with
+    the LiteLLM materializer's namespace and stay attributable to the TTS aux."""
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return []
+    common = dict(
+        category="llm",
+        resource=model,
+        source="orchestrator",
+        source_id=uuid.uuid4().hex,
+        ts=_now(),
+        user_id=user_id,
+        ref_kind="thread",
+        ref_id=ref_id,
+        details={"via": "tts", "stage": stage},
+    )
+    events: list[UsageEvent] = []
+    prompt_tokens = getattr(usage, "prompt_tokens", None)
+    completion_tokens = getattr(usage, "completion_tokens", None)
+    if prompt_tokens:
+        events.append(
+            UsageEvent(quantity=int(prompt_tokens), unit="prompt-token", **common)
+        )
+    if completion_tokens:
+        events.append(
+            UsageEvent(
+                quantity=int(completion_tokens), unit="completion-token", **common
+            )
+        )
+    return events
+
+
 def _voice_for_language(language: str) -> str:
     if language and language.lower().startswith("de"):
         return DEFAULT_VOICE_DE
@@ -172,6 +247,9 @@ async def _formulate_for_speech(
     base_url: Optional[str],
     api_key: Optional[str],
     timeout: float = 30.0,
+    ledger: Optional[UsageLedger] = None,
+    user_id: Optional[str] = None,
+    ref_id: Optional[str] = None,
 ) -> str:
     """Run the auxiliary LLM to rewrite ``text`` for natural speech."""
     cache_key = _hash_key(model, text)
@@ -182,7 +260,11 @@ async def _formulate_for_speech(
         return cached
 
     if not api_key:
-        logger.warning("Formulation skipped: no API key for model %s", model)
+        logger.warning(
+            "TTS formulation skipped: no API key (stage=formulate model=%s base_url=%s)",
+            model,
+            base_url,
+        )
         return text
 
     # max_retries=0: a down/erroring endpoint must fail in seconds, not retry
@@ -201,8 +283,24 @@ async def _formulate_for_speech(
             temperature=0.3,
         )
         rewritten = (response.choices[0].message.content or "").strip()
+        if _metering_enabled(ledger):
+            await _record_usage(
+                ledger,
+                _llm_token_events(
+                    response,
+                    model=model,
+                    stage="formulate",
+                    user_id=user_id,
+                    ref_id=ref_id,
+                ),
+            )
     except Exception:
-        logger.exception("TTS formulation LLM call failed; falling back to raw text")
+        logger.exception(
+            "TTS formulation LLM call failed (stage=formulate model=%s base_url=%s); "
+            "falling back to raw text",
+            model,
+            base_url,
+        )
         return text
     finally:
         await client.close()
@@ -232,7 +330,11 @@ async def _synthesize_speech(
     chunk or a loaded backend rather than a spurious failure.
     """
     if not api_key:
-        logger.warning("TTS synthesis aborted: no API key for model %s", model)
+        logger.warning(
+            "TTS synthesis aborted: no API key (stage=synthesize model=%s base_url=%s)",
+            model,
+            base_url,
+        )
         return None
 
     # max_retries=0: a down/erroring endpoint must fail in seconds, not retry
@@ -250,7 +352,13 @@ async def _synthesize_speech(
         )
         return response.content
     except Exception:
-        logger.exception("TTS synthesis failed for model %s", model)
+        logger.exception(
+            "TTS synthesis failed (stage=synthesize model=%s base_url=%s voice=%s chars=%d)",
+            model,
+            base_url,
+            voice,
+            len(text),
+        )
         return None
     finally:
         await client.close()
@@ -263,6 +371,9 @@ async def generate_message_tts(
     reformulate: bool,
     user_id: str,
     postgres_db,
+    ledger: Optional[UsageLedger] = None,
+    ref_id: Optional[str] = None,
+    project_id: Optional[str] = None,
 ) -> Optional[tuple[str, bytes]]:
     """End-to-end: formulate (optional) → synthesize → ``(spoken_text, mp3)``.
 
@@ -315,6 +426,9 @@ async def generate_message_tts(
                 model=aux_model,
                 base_url=aux_base_url,
                 api_key=aux_api_key,
+                ledger=ledger,
+                user_id=user_id,
+                ref_id=ref_id,
             )
         else:
             logger.debug(
@@ -344,6 +458,26 @@ async def generate_message_tts(
         raise TtsSynthesisError(f"TTS synthesis failed for model {tts_model}")
     async with _audio_lock:
         _cache_put(_audio_cache, audio_key, audio, _AUDIO_CACHE_MAX)
+    if _metering_enabled(ledger):
+        await _record_usage(
+            ledger,
+            [
+                UsageEvent(
+                    category="tts",
+                    resource=tts_model,
+                    quantity=len(speech_input),
+                    unit="tts-character",
+                    source="orchestrator",
+                    source_id=uuid.uuid4().hex,
+                    ts=_now(),
+                    user_id=user_id,
+                    project_id=project_id,
+                    ref_kind="thread",
+                    ref_id=ref_id,
+                    details={"voice": voice},
+                )
+            ],
+        )
     return speech_input, audio
 
 
@@ -493,6 +627,9 @@ async def _llm_clean_and_chunk(
     base_url: Optional[str],
     api_key: Optional[str],
     timeout: float = 30.0,
+    ledger: Optional[UsageLedger] = None,
+    user_id: Optional[str] = None,
+    ref_id: Optional[str] = None,
 ) -> Optional[list[str]]:
     """LLM cleanup + natural chunking → ordered chunk list, or ``None`` to signal
     the caller should fall back to deterministic splitting.
@@ -515,16 +652,35 @@ async def _llm_clean_and_chunk(
             ],
             temperature=0.3,
         )
+        if _metering_enabled(ledger):
+            # Meter tokens even when the plan is truncated/unparseable below —
+            # the tokens were still consumed.
+            await _record_usage(
+                ledger,
+                _llm_token_events(
+                    response,
+                    model=model,
+                    stage="chunk-plan",
+                    user_id=user_id,
+                    ref_id=ref_id,
+                ),
+            )
         choice = response.choices[0]
         if getattr(choice, "finish_reason", None) == "length":
             logger.warning(
-                "TTS chunk plan truncated (max tokens); using deterministic split"
+                "TTS chunk plan truncated (max tokens; stage=chunk-plan model=%s "
+                "base_url=%s); using deterministic split",
+                model,
+                base_url,
             )
             return None
         chunks = _parse_chunk_array(choice.message.content or "")
     except Exception:
         logger.exception(
-            "TTS chunk-planning LLM call failed; using deterministic split"
+            "TTS chunk-planning LLM call failed (stage=chunk-plan model=%s "
+            "base_url=%s); using deterministic split",
+            model,
+            base_url,
         )
         return None
     finally:
@@ -544,6 +700,9 @@ async def plan_tts_chunks(
     content: str,
     user_id: str,
     postgres_db,
+    ledger: Optional[UsageLedger] = None,
+    ref_id: Optional[str] = None,
+    project_id: Optional[str] = None,
 ) -> Optional[list[str]]:
     """Clean ``content`` for speech and split it into ordered ``<=4096``-char
     chunks at natural breakpoints, for sequential synthesis + playback.
@@ -591,7 +750,13 @@ async def plan_tts_chunks(
     if aux_creds is not None:
         aux_model, aux_base_url, aux_api_key = aux_creds
         chunks = await _llm_clean_and_chunk(
-            content, model=aux_model, base_url=aux_base_url, api_key=aux_api_key
+            content,
+            model=aux_model,
+            base_url=aux_base_url,
+            api_key=aux_api_key,
+            ledger=ledger,
+            user_id=user_id,
+            ref_id=ref_id,
         )
 
     # Fallback: deterministic split of the raw content (no cleanup, but always

@@ -18849,6 +18849,8 @@ async def synthesize_thread_message_tts(
             reformulate=reformulate,
             user_id=str(user["id"]),
             postgres_db=postgres_db,
+            ledger=usage_ledger,
+            ref_id=thread_id,
         )
     except TtsSynthesisError as exc:
         raise HTTPException(status_code=502, detail="Speech synthesis failed") from exc
@@ -18895,7 +18897,11 @@ async def plan_thread_message_tts(
 
     try:
         chunks = await plan_tts_chunks(
-            content=content, user_id=str(user["id"]), postgres_db=postgres_db
+            content=content,
+            user_id=str(user["id"]),
+            postgres_db=postgres_db,
+            ledger=usage_ledger,
+            ref_id=thread_id,
         )
     except Exception as exc:
         logger.exception("TTS chunk planning failed for thread %s", thread_id)
@@ -18940,12 +18946,42 @@ async def transcribe_thread_audio_endpoint(
         filename=audio.filename or "voice.webm",
         user_id=str(user["id"]),
         postgres_db=postgres_db,
+        ledger=usage_ledger,
+        ref_id=thread_id,
     )
     if text is None:
         # 204: STT disabled / not configured, or transcription failed. The
         # cockpit treats this as "attach audio only" rather than an error.
         return Response(status_code=204)
     return JSONResponse({"text": text})
+
+
+@app.get("/api/voice/capabilities")
+async def voice_capabilities(request: Request) -> dict:
+    """Whether the caller has a usable TTS / STT model configured.
+
+    Lets the cockpit render the read-aloud and mic buttons disabled-with-reason
+    up front instead of a dead click that silently answers ``204``
+    (the "students said read doesn't work" report). "Available" means a model
+    *resolves* — the user's ``default_<cap>_model`` setting or the system
+    default for the capability; a configured-but-broken endpoint still reports
+    available and surfaces a real error (``502``) on use, which is the honest
+    signal we want. Mirrors the resolution the TTS/STT services perform, minus
+    the key/endpoint lookup (cheap, and a missing key is a real error, not
+    "off").
+    """
+    user = await require_approved_user(request, postgres_db)
+    settings = await postgres_db.get_user_settings(str(user["id"])) or {}
+
+    async def _has(capability: str, setting_key: str) -> bool:
+        if settings.get(setting_key):
+            return True
+        return bool(await postgres_db.resolve_default_for_capability(capability))
+
+    return {
+        "tts": await _has("tts", "default_tts_model"),
+        "stt": await _has("whisper", "default_whisper_model"),
+    }
 
 
 @app.get("/api/jobs/{job_id}/logs")

@@ -52,6 +52,7 @@ import {I18nService} from '../../core/services/i18n.service';
 import {FileHandlingService} from '../../core/services/file-handling.service';
 import {ChatPreferencesService, type ChatTextSize, type ReadingWidth} from '../../core/services/chat-preferences.service';
 import {DeviceCapabilitiesService} from '../../core/services/device-capabilities.service';
+import {VoiceCapabilitiesService} from '../../core/services/voice-capabilities.service';
 import {VoiceRecordingService} from '../../core/services/voice-recording.service';
 import {FilePreview, FileType} from '../../core/models/file.model';
 import {RecordingConfig} from '../../core/models/recording.model';
@@ -90,6 +91,10 @@ interface TtsMessageState {
     /** Index that should start playing the moment its player is available — set
      *  when the previous section ends before the next has finished synthesizing. */
     playPending?: number;
+    /** Index whose autoplay the browser blocked (transient user-activation
+     *  expired, or Safari per-element activation). Surfaces a "tap to play"
+     *  prompt instead of silently doing nothing. */
+    playBlocked?: number;
 }
 
 interface Suggestion {
@@ -944,11 +949,14 @@ export function clearDraft(threadId: string | null): void {
                           <button
                             type="button"
                             class="msg-action-btn tts-btn"
-                            [class.is-error]="ttsS.error"
-                            [title]="(ttsS.error ? 'chat.tts.error' : 'chat.tts.play') | transloco"
+                            [class.is-error]="ttsS.error && !ttsUnavailable()"
+                            [disabled]="ttsUnavailable()"
+                            [title]="(ttsUnavailable() ? 'chat.tts.notConfigured' : ttsS.error ? 'chat.tts.error' : 'chat.tts.play') | transloco"
                             (click)="toggleTts(ttsKey, last.content)"
                           >
-                            @if (ttsS.error) {
+                            @if (ttsUnavailable()) {
+                              <app-icon size="md">volume_off</app-icon>
+                            } @else if (ttsS.error) {
                               <app-icon size="md">error_outline</app-icon>
                             } @else {
                               <app-icon size="md">volume_up</app-icon>
@@ -960,6 +968,18 @@ export function clearDraft(threadId: string | null): void {
                       <!-- One player per section, each appearing as it's ready,
                            with a spinner + "Generating part N" trailing below. -->
                       <div class="tts-players">
+                        @if (ttsS.playBlocked !== undefined) {
+                          <!-- Autoplay blocked by the browser — surface it as a
+                               tap-to-play instead of looking stuck. -->
+                          <button
+                            type="button"
+                            class="tts-tap-to-play"
+                            (click)="resumeBlockedPlayback(ttsKey)"
+                          >
+                            <app-icon size="sm">play_arrow</app-icon>
+                            <span>{{ 'chat.tts.tapToPlay' | transloco }}</span>
+                          </button>
+                        }
                         @for (chunk of ttsS.chunks; track $index) {
                           @if (ttsS.chunkUrls?.[$index]; as url) {
                             <div class="tts-player-row">
@@ -1454,8 +1474,8 @@ export function clearDraft(threadId: string | null): void {
               <button
                 type="button"
                 class="ctrl mic"
-                [disabled]="!chat.isConnected() || isTranscribing()"
-                [title]="'chat.composer.recordVoice' | transloco"
+                [disabled]="!chat.isConnected() || isTranscribing() || sttUnavailable()"
+                [title]="(sttUnavailable() ? 'chat.composer.sttNotConfigured' : 'chat.composer.recordVoice') | transloco"
                 (click)="startRecording()"
               >
                 <app-icon size="sm" class="ctrl-icon">mic</app-icon>
@@ -1535,6 +1555,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     readonly chatTextSizeValue = computed(() => textSizeToCss(this.chatPrefs.textSize()));
     private readonly deviceCapabilities = inject(DeviceCapabilitiesService);
     readonly capabilities = inject(CapabilitiesService);
+    readonly voiceCaps = inject(VoiceCapabilitiesService);
     private readonly voiceRecording = inject(VoiceRecordingService);
     private readonly router = inject(Router);
     private readonly toast = inject(AppToastService);
@@ -1642,6 +1663,12 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     // Per-turn TTS state. Keyed by a stable string ("turn:<id>") so playback
     // state survives across re-renders even if the turn list is reordered.
     readonly ttsState = signal<Record<string, TtsMessageState>>({});
+    // Read-aloud / dictation availability. Only *positively-known* unavailability
+    // disables a control (fail-open: null/true ⇒ leave it enabled). Kills the
+    // silent-204 "read doesn't work" dead click — the button greys out with a
+    // "not configured" tooltip instead.
+    readonly ttsUnavailable = computed(() => this.voiceCaps.tts() === false);
+    readonly sttUnavailable = computed(() => this.voiceCaps.stt() === false);
     // The native <audio> players (one per generated turn). Used to pause the
     // others when one starts — browsers happily play several at once otherwise.
     @ViewChildren('ttsAudioEl')
@@ -2437,7 +2464,9 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         if (this.ttsStateFor(key).playPending !== index) return;
         this.setTtsState(key, {playPending: undefined});
         (event.target as HTMLAudioElement).play().catch(() => {
-            /* autoplay blocked — native controls remain available */
+            // Autoplay blocked (transient activation expired / Safari per-element
+            // gesture). Don't swallow it — surface a "tap to play" prompt.
+            this.setTtsState(key, {playBlocked: index});
         });
     }
 
@@ -2449,19 +2478,36 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         if (next >= total) return; // whole message played
         const el = this.findTtsPlayer(key, next);
         if (el) {
-            el.play().catch(() => {});
+            el.play().catch(() => this.setTtsState(key, {playBlocked: next}));
         } else {
             this.setTtsState(key, {playPending: next});
         }
     }
 
-    /** Pause every other player when one starts — one voice at a time. */
+    /** Pause every other player when one starts — one voice at a time. A
+     *  successful play also means the browser isn't blocking, so clear any
+     *  "tap to play" prompt for that turn. */
     onPlayerPlay(event: Event): void {
         const active = event.target as HTMLAudioElement;
+        const key = active.dataset['ttsKey'];
+        if (key && this.ttsStateFor(key).playBlocked !== undefined) {
+            this.setTtsState(key, {playBlocked: undefined});
+        }
         this.ttsPlayers?.forEach((ref) => {
             const el = ref.nativeElement;
             if (el !== active && !el.paused) el.pause();
         });
+    }
+
+    /** Resume the section whose autoplay the browser blocked, from this user
+     *  gesture (which grants fresh activation). Re-arms the prompt if it still
+     *  refuses. */
+    resumeBlockedPlayback(key: string): void {
+        const index = this.ttsStateFor(key).playBlocked;
+        if (index === undefined) return;
+        this.setTtsState(key, {playBlocked: undefined});
+        const el = this.findTtsPlayer(key, index);
+        el?.play().catch(() => this.setTtsState(key, {playBlocked: index}));
     }
 
     // ===== Drag-and-drop file handling =====
