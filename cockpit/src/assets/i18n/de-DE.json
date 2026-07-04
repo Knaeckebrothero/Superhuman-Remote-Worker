@@ -498,6 +498,13 @@
       "desc": "Ihre bevorzugte Oberflächensprache. Änderungen werden sofort angewendet.",
       "label": "Oberflächensprache"
     },
+    "voice": {
+      "title": "Vorlese-Stimme",
+      "desc": "Die Stimme, mit der eine Assistenten-Nachricht vorgelesen wird. Gilt ab sofort für jedes Vorlesen.",
+      "label": "Stimme",
+      "auto": "Standard (automatisch)",
+      "customPlaceholder": "Stimmen-ID"
+    },
     "dataVisibility": {
       "title": "Datensichtbarkeit",
       "desc": "Admins sehen standardmäßig die Daten aller Benutzer. Wechseln Sie zu „Nur eigene Daten“, um wie ein normaler Benutzer zu arbeiten. Die Auswahl wird in Ihrem Konto gespeichert und gilt überall.",

@@ -218,24 +218,66 @@ def _voice_for_language(language: str) -> str:
     return DEFAULT_VOICE_EN
 
 
-async def _resolve_voice(model_id: str, language: str, postgres_db) -> str:
-    """Voice for ``model_id``: the catalog row's ``params_json.voice`` (set in
-    Admin → Providers) when present, else the per-language default.
+# Cheap EN/DE content-language sniff (the app supports en + de-DE). It exists
+# only so German text stops being read aloud in an English voice; a fuller
+# detector is future work. Umlauts/ß are the strong signal; a few common German
+# function words catch umlaut-free German.
+_GERMAN_HINT_CHARS = frozenset("äöüßÄÖÜ")
+_GERMAN_HINT_WORDS = frozenset(
+    "der die das und ist nicht ein eine mit auf für sich dass werden wird auch "
+    "dem den von zu im ich du wir ihr sie oder aber wenn weil".split()
+)
 
-    Different TTS backends expose different voice catalogs (Kokoro ``af_*``,
-    Piper, OpenAI ``alloy``/``nova``), so the voice can't be one hardcoded name.
-    Reads the ``models`` catalog row; system/custom-endpoint models (no catalog
-    row) fall back to the language default. Any lookup error is non-fatal.
-    """
+
+def _detect_language(text: str) -> str:
+    """Best-effort content language for voice selection: ``'de'`` or ``'en'``."""
+    if not text:
+        return "en"
+    if any(c in _GERMAN_HINT_CHARS for c in text):
+        return "de"
+    words = re.findall(r"[a-zA-Zäöüß]+", text.lower())
+    if not words:
+        return "en"
+    hits = sum(1 for w in words if w in _GERMAN_HINT_WORDS)
+    return "de" if hits >= max(2, len(words) // 20) else "en"
+
+
+async def _resolve_tts_params(model_id: str, postgres_db) -> dict:
+    """The catalog row's ``params_json`` for a TTS model (``voice`` /
+    per-language ``voices`` / ``instructions`` / ``provider``), or ``{}`` when
+    there's no catalog row or the lookup fails (both non-fatal)."""
     try:
         row = await postgres_db.resolve_catalog_model(model_id, capability="tts")
         params = (row or {}).get("params_json")
         if isinstance(params, dict):
-            voice = (params.get("voice") or "").strip()
-            if voice:
-                return voice
+            return params
     except Exception:
-        logger.debug("Could not read params_json voice for %s; using default", model_id)
+        logger.debug("Could not read params_json for TTS model %s", model_id)
+    return {}
+
+
+def _pick_voice(params: dict, language: str, user_voice: Optional[str]) -> str:
+    """Voice resolution priority (docs/features/voice_experience_roadmap.md):
+    explicit user choice (``default_tts_voice``) → admin single ``voice`` →
+    admin per-language ``voices`` map → built-in per-language default.
+
+    Different backends expose different voice names (Kokoro ``af_*``, OpenAI
+    ``alloy``/``nova``), so there is no one hardcoded name — the per-language map
+    lets one TTS model serve both languages with a language-appropriate voice.
+    """
+    if user_voice:
+        return user_voice
+    single = (params.get("voice") or "").strip()
+    if single:
+        return single
+    voices = params.get("voices")
+    if isinstance(voices, dict):
+        base = language.split("-")[0] if language else ""
+        for key in (language, base):
+            if key:
+                v = (voices.get(key) or "").strip()
+                if v:
+                    return v
     return _voice_for_language(language)
 
 
@@ -328,12 +370,18 @@ async def _synthesize_speech(
     base_url: Optional[str],
     api_key: Optional[str],
     timeout: float = 120.0,
+    instructions: Optional[str] = None,
 ) -> Optional[bytes]:
     """Call the TTS endpoint and return MP3 bytes.
 
     Timeout is generous (120 s) because a CPU TTS model synthesizes at
     ~real-time: a ~1500-char chunk is ~40 s, and we want headroom for a slower
     chunk or a loaded backend rather than a spurious failure.
+
+    ``instructions`` is a free-text style prompt (e.g. "warm, unhurried") passed
+    through to instruction-capable models like OpenAI ``gpt-4o-mini-tts`` — the
+    persona hook for Phase 5. Only sent when set, since ``tts-1``/Kokoro reject
+    the param.
     """
     if not api_key:
         logger.warning(
@@ -349,12 +397,14 @@ async def _synthesize_speech(
     client = AsyncOpenAI(
         api_key=api_key, base_url=base_url, timeout=timeout, max_retries=0
     )
+    extra = {"instructions": instructions} if instructions else {}
     try:
         response = await client.audio.speech.create(
             model=model,
             voice=voice,
             input=text,
             response_format="mp3",
+            **extra,
         )
         return response.content
     except Exception:
@@ -414,7 +464,15 @@ async def generate_message_tts(
         logger.info("No TTS model configured for user %s", user_id)
         return None
     tts_model, tts_base_url, tts_api_key = tts_creds
-    voice = await _resolve_voice(tts_model, language, postgres_db)
+    # Voice picked from the *content's* language (not the UI language) with the
+    # user's explicit choice and admin per-language map layered on; ``language``
+    # from the request is a fallback hint only. ``instructions`` is the style
+    # prompt for instruction-capable models (gpt-4o-mini-tts).
+    tts_params = await _resolve_tts_params(tts_model, postgres_db)
+    detected_language = _detect_language(content) or language
+    user_voice = (user_settings.get("default_tts_voice") or "").strip() or None
+    voice = _pick_voice(tts_params, detected_language, user_voice)
+    instructions = (tts_params.get("instructions") or "").strip() or None
 
     speech_input = content
     if reformulate and _needs_formulation(content):
@@ -442,7 +500,7 @@ async def generate_message_tts(
                 "synthesizing raw content"
             )
 
-    audio_key = _hash_key(tts_model, voice, speech_input)
+    audio_key = _hash_key(tts_model, voice, instructions or "", speech_input)
     async with _audio_lock:
         cached = _cache_get(_audio_cache, audio_key)
     if cached is not None:
@@ -455,6 +513,7 @@ async def generate_message_tts(
         voice=voice,
         base_url=tts_base_url,
         api_key=tts_api_key,
+        instructions=instructions,
     )
     if not audio:
         # Model is configured but synthesis produced nothing (missing key,
